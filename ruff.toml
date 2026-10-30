@@ -1,0 +1,6 @@
+line-length = 120
+target-version = "py311"
+
+[lint.per-file-ignores]
+# planted values are built at run time on purpose, so the test file passes the gate
+"tests/test_pii_gate.py" = ["FLY002"]

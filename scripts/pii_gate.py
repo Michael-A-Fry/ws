@@ -3,7 +3,7 @@
 
     pii_gate.py [FILE ...]      check these files (prek passes the staged ones)
     pii_gate.py --tracked       check every tracked file
-    pii_gate.py --history       check every added line and commit message in the whole history
+    pii_gate.py --history       check every added line and commit message reachable from HEAD
 
 The denylist is private and never committed: one term per line (# comments allowed), read from the environment
 variable WS_PII_DENYLIST (CI: a repo secret) or the file named by WS_PII_DENYLIST_FILE (default
@@ -93,9 +93,9 @@ def file_lines(path: Path):
 
 
 def history_chunks():
-    """Yield (commit, [(n, line)]) for every commit message and every added line in the history."""
+    """Yield (commit, [(n, line)]) for every message and added line reachable from HEAD (other branches are theirs)."""
     out = subprocess.run(
-        ["git", "log", "--all", "-p", "--no-color", "--format=@@COMMIT %H%n%B@@ENDMSG"],
+        ["git", "log", "-p", "--no-color", "--format=@@COMMIT %H%n%B@@ENDMSG"],
         capture_output=True,
         text=True,
         errors="replace",
@@ -110,7 +110,7 @@ def history_chunks():
         elif raw == "@@ENDMSG":
             in_msg = False
         elif in_msg or (raw.startswith("+") and not raw.startswith("+++")):
-            lines.append((len(lines) + 1, raw))
+            lines.append((len(lines) + 1, raw if in_msg else raw[1:]))
     if commit:
         yield commit, lines
 

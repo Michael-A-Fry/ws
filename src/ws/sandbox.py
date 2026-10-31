@@ -593,7 +593,12 @@ def writable_folders(pol: policy.Policy, runner: str, project: str, tmp: str, ex
 XDG_HOMES = (("XDG_DATA_HOME", "data", True), ("XDG_STATE_HOME", "state", False), ("XDG_CACHE_HOME", "cache", True))
 # The files in the runner's real data folder that a walled run needs to be signed in, copied in at each start.
 SEED = {"opencode": ("auth.json", "mcp-auth.json")}
-_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
+def _dir_flags() -> int:
+    """open() flags for a folder that is never reached through a link. In a function: native Windows has neither
+    O_DIRECTORY nor O_NOFOLLOW, and `ws` (doctor included) must still import there; the wall itself is POSIX only."""
+    return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 
 
 def project_key(project: str) -> str:
@@ -607,7 +612,7 @@ def _subdir(parent_fd: int, name: str) -> int:
     session can write inside the private folders, so a link it plants must not be followed by the launcher (it is
     removed and the folder made again)."""
     try:
-        return os.open(name, _DIR_FLAGS, dir_fd=parent_fd)
+        return os.open(name, _dir_flags(), dir_fd=parent_fd)
     except FileNotFoundError:
         pass
     except OSError:
@@ -615,7 +620,7 @@ def _subdir(parent_fd: int, name: str) -> int:
             raise
         os.unlink(name, dir_fd=parent_fd)  # a planted link is removed itself, not followed
     os.mkdir(name, 0o700, dir_fd=parent_fd)
-    return os.open(name, _DIR_FLAGS, dir_fd=parent_fd)
+    return os.open(name, _dir_flags(), dir_fd=parent_fd)
 
 
 def _unlink(dir_fd: int, name: str) -> None:
@@ -684,7 +689,7 @@ def private_homes(home: Path, runner: str, pol: policy.Policy, env: dict, projec
         if not per_project:
             out[var] = str(folder)
             continue
-        top = os.open(folder, _DIR_FLAGS)
+        top = os.open(folder, _dir_flags())
         try:
             fd = _subdir(top, key)
             try:

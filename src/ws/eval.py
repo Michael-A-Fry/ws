@@ -234,10 +234,15 @@ def _files(d: dict, key: str, where: str) -> dict:
 
 def _no_collisions(paths: list[str], where: str) -> None:
     """No path may be a folder that another path sits in (`x` and `x/y`): writing one would fail or replace the other."""
-    folders = {"/".join(p.split("/")[:i]) for p in paths for i in range(1, len(p.split("/")))}
-    for p in paths:
-        if p in folders:
+    keys = {p: p.casefold() for p in paths}  # a case-folding disk (macOS) makes "X" and "x/y" meet
+    folders = {"/".join(k.split("/")[:i]) for k in keys.values() for i in range(1, len(k.split("/")))}
+    for p, k in keys.items():
+        if k in folders:
             raise TaskError(f"{where}: {p!r} is both a file and a folder that another file sits in")
+    by_key: dict[str, str] = {}
+    for p, k in keys.items():
+        if by_key.setdefault(k, p) != p:
+            raise TaskError(f"{where}: {p!r} and {by_key[k]!r} differ only in case, which some disks treat as one file")
 
 
 def _grader(g, where: str) -> dict:
@@ -367,14 +372,36 @@ def dumps_task(task: Task) -> str:
 # ---- the starter set ----------------------------------------------------------------------------------------------
 # Synthetic: invented files and numbers, nothing real, nothing personal. A person's own set comes from `ws eval harvest`.
 
+EXIT_UNPROTECTED = 97  # what a checker exits with when it could not make its own memory unreadable (see CHECK_PRELUDE)
+
 # What every hidden checker starts with. ws writes a per-trial random line to the checker's stdin; the checker reads it
 # first, runs the agent's code only in a child process (which has no stdin, so no nonce), checks what the child printed,
 # and prints the nonce back last. A grade needs that line on stdout as well as exit 0, so agent code that exits early
 # (`os._exit(0)`) or prints "ok" cannot pass: it never held the nonce.
 CHECK_PRELUDE = """\
-import json, subprocess, sys
+import ctypes, json, subprocess, sys
 
-nonce = sys.stdin.readline().strip()
+
+def protect():
+    # The nonce will live in this process's memory, so no other process may read it: not /proc/PID/mem, not
+    # process_vm_readv. Linux: PR_SET_DUMPABLE 0. macOS: PT_DENY_ATTACH. Anything else, or a failure: exit 97, and ws
+    # fails the grade with that reason.
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        if sys.platform.startswith("linux"):
+            ok = libc.prctl(4, 0, 0, 0, 0) == 0
+        elif sys.platform == "darwin":
+            ok = libc.ptrace(31, 0, 0, 0) == 0
+        else:
+            ok = False
+    except Exception:
+        ok = False
+    if not ok:
+        sys.exit(97)
+
+
+protect()
+nonce = sys.stdin.readline().strip()  # only after protect(); the child that runs agent code never gets it
 
 
 def agent(setup, expr):
@@ -779,6 +806,12 @@ def _grade_command(g: dict, folder: Path, nonce: str) -> Verdict:
         for fd in wrapped.pass_fds:
             with contextlib.suppress(OSError):
                 os.close(fd)
+    if p.returncode == EXIT_UNPROTECTED:
+        return Verdict(
+            "command", False,
+            "the checker could not make its memory unreadable to other processes (prctl or ptrace failed or is "
+            "missing here), so the nonce could not be kept safe: not trusted",
+        )  # fmt: skip
     if p.returncode != 0:
         last = (p.stderr.strip().splitlines() or [""])[-1][:200]
         return Verdict("command", False, f"exit {p.returncode}: {last}".rstrip(": "))
@@ -794,10 +827,29 @@ def _grade_contains(g: dict, folder: Path) -> Verdict:
     return _presence("file_contains", g, found, f"{g['path']} contains {want!r}")
 
 
+REGEX_TIMEOUT_S = 5.0
+_MATCH = "import json, re, sys; d = json.load(sys.stdin); print(int(re.search(d['p'], d['t'], d['f']) is not None))"
+
+
 def _grade_regex(g: dict, folder: Path) -> Verdict:
+    """The match runs in a child Python with a wall-clock limit. A thread cannot be stopped and `re` cannot be
+    interrupted, so a pattern that backtracks without end (`(a+)+$` on a long line of a's) would hang ws; a child can be
+    killed. Capping the input more tightly would not make a bad pattern safe, only a small one."""
     flags = re.MULTILINE | (re.IGNORECASE if g.get("ignore_case") else 0)
-    found = re.search(g["pattern"], _read_text(folder, g["path"]), flags) is not None
-    return _presence("regex", g, found, f"{g['path']} matches /{g['pattern']}/")
+    what = f"{g['path']} matches /{g['pattern']}/"
+    payload = json.dumps({"p": g["pattern"], "t": _read_text(folder, g["path"]), "f": int(flags)})
+    try:
+        p = subprocess.run(
+            [sys.executable, "-I", "-c", _MATCH], input=payload, capture_output=True, text=True, check=False,
+            timeout=REGEX_TIMEOUT_S, env={},
+        )  # fmt: skip
+    except subprocess.TimeoutExpired:
+        return Verdict("regex", False, f"{what}: the match took over {REGEX_TIMEOUT_S:g} s and was stopped")
+    except OSError as e:
+        return Verdict("regex", False, f"{what}: could not run the match ({_why(e)})")
+    if p.returncode != 0 or p.stdout.strip() not in ("0", "1"):
+        return Verdict("regex", False, f"{what}: the match failed to run")
+    return _presence("regex", g, p.stdout.strip() == "1", what)
 
 
 def _presence(kind: str, g: dict, found: bool, what: str) -> Verdict:
@@ -979,16 +1031,44 @@ def task_hash(task: Task) -> str:
     return hashlib.sha256(dumps_task(task).encode()).hexdigest()[:16]
 
 
+def job_hash(job: jobs.Job, env: dict | None = None) -> str:
+    """A short fingerprint of the job as it runs: its file's text and the prompt it loaded (a `prompt_file` job's prompt
+    is not in the file), so results from before an edit to the job are not mixed with results after."""
+    path = jobs.jobs_dir(env) / f"{job.name}.toml"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        text = ""
+    return hashlib.sha256(f"{text}\n--prompt--\n{job.prompt}".encode()).hexdigest()[:16]
+
+
 def run_trial(task: Task, trial: int, arm: str, job: jobs.Job, batch: str, keep: bool = False) -> dict:
     """One trial through `ws run`: set up a fresh folder, run the job with the task's prompt, then grade and write the
     result. The run record is on disk before grading starts (run.run_job calls the hook after writing it), so a SIGTERM
     during grading still leaves the record, and this function still leaves a result line saying grading was cut short.
-    The record's `eval.pass` stays null: the graded outcome is the result line."""
+    The record's `eval.pass` stays null: the graded outcome is the result line. The temporary folder is removed on every
+    path except a trial that ran and did not pass (or `keep`), whose folder stays for you to look at."""
     env = os.environ
     log = runrecord.runs_path(env)
     # Not under $WS_HOME: the gate's sandbox denies shell writes there, and a trial has to be able to write its answer.
     folder = Path(tempfile.mkdtemp(prefix=f"ws-eval-{task.id}-{trial}-")).resolve()
-    write_files(folder, task.setup_files)
+    kept = False
+    try:
+        try:
+            write_files(folder, task.setup_files)
+        except OSError as e:
+            raise WsError(
+                "bad_config", f"task {task.id}: its setup files cannot be written ({_why(e)})", "fix the task file"
+            ) from e
+        result = _trial_in(task, trial, arm, job, batch, folder, log, env)
+        kept = keep or not result["pass"]
+        return result
+    finally:
+        if not kept:
+            shutil.rmtree(folder, ignore_errors=True)
+
+
+def _trial_in(task: Task, trial: int, arm: str, job: jobs.Job, batch: str, folder: Path, log: Path, env) -> dict:
     state: dict = {"rec": None, "verdicts": [], "passed": False, "note": None}
 
     def hook(rec: dict) -> None:  # called with the record after it has been written
@@ -1018,14 +1098,12 @@ def run_trial(task: Task, trial: int, arm: str, job: jobs.Job, batch: str, keep:
         result = {
             "schema": SCHEMA_VERSION, "ts": runrecord.iso(datetime.now(UTC)), "batch": batch, "task": task.id,
             "task_hash": task_hash(task), "family": task.family, "kind": task.kind, "trial": trial, "arm": arm,
-            "job": job.name, "run_id": rec["run_id"] if rec else None,
+            "job": job.name, "job_hash": job_hash(job, env), "run_id": rec["run_id"] if rec else None,
             "status": rec["status"] if rec else ("refused" if code == 3 else "error"),
             "pass": bool(state["passed"] and not state["note"]),
             "grade": [dataclasses.asdict(v) for v in state["verdicts"]], "note": state["note"], "folder": str(folder),
         }  # fmt: skip
         append_jsonl(results_path(env), result)
-    if result["pass"] and not keep:
-        shutil.rmtree(folder, ignore_errors=True)
     return result
 
 
@@ -1200,6 +1278,13 @@ def compare_arms(arm_a: str, arm_b: str, results: list[dict], runs: dict, rating
     """Two arms, paired at task level (see `evalstats.paired_tasks`: McNemar needs independent pairs, and the trials of
     one task are not). The task counts and the trial counts behind them are both in the result."""
     pt = evalstats.paired_tasks(_arm_results(results, arm_a), _arm_results(results, arm_b))
+    if pt["uneven"]:
+        task, na, nb = pt["uneven"][0]
+        raise WsError(
+            "refused",
+            f"task {task} has {na} trials under {arm_a} and {nb} under {arm_b}, so its pass/fail is not comparable",
+            "run both arms with the same --trials, then compare",
+        )
     ra, rb = pt["used_a"], pt["used_b"]
     n, a_only, b_only = pt["tasks"], pt["a_only"], pt["b_only"]
     down_a, rated_a = _down_rate(ra, ratings)

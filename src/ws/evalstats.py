@@ -378,15 +378,17 @@ def paired_tasks(a: list[dict], b: list[dict]) -> dict:
     `dropped`, never hidden.
 
     Returns tasks (the n of the test), trials_a and trials_b (the trials behind it), both, a_only, b_only, neither (task
-    counts), dropped, and used_a / used_b (the results that were used)."""
+    counts), dropped, uneven (tasks whose two arms ran different numbers of trials: the caller must refuse), and used_a /
+    used_b (the results that were used)."""
+    uneven: list[tuple] = []
     dropped = {"other_job": 0, "other_task_text": 0, "task_text_differs": 0}
 
     def usable(rs: list[dict]) -> dict[str, dict]:
         rs = sorted(rs, key=lambda x: str(x.get("ts")))
         if not rs:
             return {}
-        job = rs[-1].get("job")
-        kept = [r for r in rs if r.get("job") == job]
+        job = (rs[-1].get("job"), rs[-1].get("job_hash"))  # the job file as it was edited, not only its name
+        kept = [r for r in rs if (r.get("job"), r.get("job_hash")) == job]
         dropped["other_job"] += len(rs) - len(kept)
         latest_hash: dict = {}
         for r in kept:
@@ -408,6 +410,8 @@ def paired_tasks(a: list[dict], b: list[dict]) -> dict:
         if ua[task]["hash"] != ub[task]["hash"]:
             dropped["task_text_differs"] += 1
             continue
+        if len(ua[task]["trials"]) != len(ub[task]["trials"]):
+            uneven.append((task, len(ua[task]["trials"]), len(ub[task]["trials"])))
         passed = []
         for side in (ua[task], ub[task]):
             outcomes = list(side["trials"].values())
@@ -423,7 +427,7 @@ def paired_tasks(a: list[dict], b: list[dict]) -> dict:
         neither += not pa and not pb
     return {
         "tasks": both + a_only + b_only + neither, "trials_a": trials_a, "trials_b": trials_b, "both": both,
-        "a_only": a_only, "b_only": b_only, "neither": neither, "dropped": dropped, "used_a": used_a,
+        "a_only": a_only, "b_only": b_only, "neither": neither, "dropped": dropped, "uneven": uneven, "used_a": used_a,
         "used_b": used_b,
     }  # fmt: skip
 

@@ -240,3 +240,22 @@ def test_command_graders_are_refused_up_front_when_there_is_no_wall(rig, capsys,
     assert code == 0 and "would be refused" in out  # a plan says so without failing
     code, out, _ = ws(capsys, "eval", "run", "--task", "starter-csv-total", "--job", "daily", "--trials", "1")
     assert code == 0 and "1 of 1 trials passed" in out  # file graders need no wall
+
+
+def test_a_setup_that_cannot_be_written_leaves_no_temp_folder(rig, capsys, monkeypatch):
+    def broken(folder, files):
+        raise OSError(17, "File exists")
+
+    monkeypatch.setattr(ws_eval, "write_files", broken)
+    code, _, err = ws(capsys, "eval", "run", "--task", "starter-csv-total", "--job", "daily", "--trials", "1")
+    assert code == 1 and "setup files cannot be written" in err
+    assert list(Path(tempfile.gettempdir()).glob("ws-eval-*")) == [] and rig.records() == []
+
+
+def test_a_passed_trial_leaves_no_folder_and_a_failed_one_does(rig, capsys):
+    ws(capsys, "eval", "run", "--task", "starter-csv-total", "--job", "daily", "--trials", "1")
+    assert list(Path(tempfile.gettempdir()).glob("ws-eval-*")) == []
+    rig.mode("wrong")
+    ws(capsys, "eval", "run", "--task", "starter-csv-total", "--job", "daily", "--trials", "1")
+    assert len(list(Path(tempfile.gettempdir()).glob("ws-eval-*"))) == 1
+    assert len(rig.results()[-1]["job_hash"]) == 16

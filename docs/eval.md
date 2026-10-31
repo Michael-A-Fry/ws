@@ -70,8 +70,16 @@ imports:
 ```toml
 [hidden.files]
 "check.py" = '''
-import json, subprocess, sys
-nonce = sys.stdin.readline().strip()          # first: before any agent code runs
+import ctypes, json, subprocess, sys
+if sys.platform.startswith("linux"):           # first: nobody else may read this process's memory
+    ok = ctypes.CDLL(None).prctl(4, 0, 0, 0, 0) == 0     # PR_SET_DUMPABLE = 0
+elif sys.platform == "darwin":
+    ok = ctypes.CDLL(None).ptrace(31, 0, 0, 0) == 0      # PT_DENY_ATTACH
+else:
+    ok = False
+if not ok:
+    sys.exit(97)                               # ws fails the grade with that reason
+nonce = sys.stdin.readline().strip()           # only then read the nonce, before any agent code runs
 code = "from fizzbuzz import fizzbuzz; import json; print(json.dumps(fizzbuzz(15)))"
 r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=30,
                    stdin=subprocess.DEVNULL)   # agent code only ever runs in a child
@@ -85,9 +93,23 @@ type = "command"
 command = "{python} -I check.py"
 ```
 
-The child has no stdin, so it never sees the nonce. How strong that is depends on the kernel's rules about one process
-reading another's memory; a checker that prints the nonce before it has checked anything defeats it. The starter
+The child has no stdin and no environment variable with the nonce, so it never sees it. The nonce does sit in the
+checker's memory, and inside the wall a child could read `/proc/<parent>/mem` (the wall's seccomp filter allows `ptrace`
+and `process_vm_readv`, and `ptrace_scope` is often 0). That is why the checker first makes itself non-dumpable
+(`PR_SET_DUMPABLE`, or `PT_DENY_ATTACH` on macOS) and exits 97 if it cannot, which ws reports as "could not make its
+memory unreadable" and fails the grade (a platform with neither call fails closed). A test checks that a child cannot
+read the nonce on Linux. A checker that prints the nonce before it has checked anything defeats the scheme. The starter
 tasks that use a command grader follow this pattern (see `CHECK_PRELUDE` in `src/ws/eval.py`).
+
+Regex graders run the match in a child Python with a 5 s limit and kill it on overrun (a thread cannot be stopped and `re`
+cannot be interrupted, so a pattern like `(a+)+$` would otherwise hang ws).
+
+Known limits of the grader's wall:
+
+- It has the same network and read access as the runner's wall (it is the same `ws.sandbox` wall), so it gives the agent's
+  code nothing it did not already have in the trial; it does not close the network.
+- `$WS_HOME/approvals/pending` and `$WS_HOME/sessions` stay writable inside it. That is by design and harmless: a forged
+  pending record grants nothing (see `ws.approvals`).
 
 ## Run
 
@@ -137,9 +159,11 @@ ws eval compare base tighter [--look 1|2]
 Pairs at task level and runs an exact two-sided McNemar test on the tasks where the arms differ. Trials of one task
 share a prompt and a grader, so they are not independent draws; counting them as pairs would overstate the evidence. For
 each arm and task, a task passes when more than half of its trials do (a tie, like 1 of 2, fails). Only results from the
-job each arm ran last, and from the version of the task (its hash) it ran last, are used, and a task whose text differs
+job each arm ran last (its name and the hash of its file and prompt), and from the version of the task (its hash) it
+ran last, are used, and a task whose text differs
 between the two arms is not paired; the output says how many results were left out. It prints the tasks and the trials
-behind them side by side.
+behind them side by side. If the two arms ran different numbers of trials of a task, the comparison is refused (and uses
+no look): run both arms with the same `--trials`.
 
 A win needs 6 of 6, 8 of 9, 9 of 10 or 10 of 12 discordant tasks. A gap under 3 points is noise. The rule is success
 first, then a quality veto (the arm with the worse thumbs-down rate by 3 points or more cannot win, but only once each

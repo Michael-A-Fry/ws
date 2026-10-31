@@ -830,3 +830,101 @@ def test_arm_names_with_a_bar_are_not_confused(box, capsys):
     for _ in range(2):
         assert ws(capsys, "eval", "compare", "a|b", "c")[0] == 0
     assert ws(capsys, "eval", "compare", "a", "b|c")[0] == 0  # a different pair: its own two looks
+
+
+# ---- the nonce cannot be read by a child, and the other round-2 hardening ----------------------------------------------
+
+ATTACK = """
+import json, os, re, sys
+
+ppid = os.getppid()
+hits = set()
+try:
+    mem = open(f"/proc/{ppid}/mem", "rb", 0)
+    for line in open(f"/proc/{ppid}/maps").read().splitlines():
+        span, perms = line.split()[:2]
+        if "r" not in perms or "w" not in perms:
+            continue
+        lo, hi = (int(x, 16) for x in span.split("-"))
+        try:
+            mem.seek(lo)
+            hits.update(m.decode() for m in re.findall(rb"[0-9a-f]{32}", mem.read(hi - lo)))
+        except (OSError, ValueError, OverflowError):
+            continue
+except OSError:
+    pass
+print(json.dumps(sorted(hits)))
+"""
+
+
+def attack_task(prelude: str, expect_found: bool) -> ws_eval.Task:
+    """A checker that lets a child try to read the checker's memory for the nonce. It prints the nonce (so the grade
+    passes) only if the child's result is the one expected."""
+    check = (
+        prelude
+        + f"r = subprocess.run([sys.executable, '-c', {ATTACK!r}], capture_output=True, text=True, stdin=subprocess.DEVNULL)\n"
+        + f"assert (nonce in json.loads(r.stdout or '[]')) is {expect_found}, r.stdout[:200]\n"
+        + "print(nonce)\n"
+    )
+    return ws_eval.Task(
+        id="attack", family="coding", kind="capability", prompt="p", hidden_files={"check.py": check},
+        graders=({"type": "command", "command": "{python} -I check.py"},),
+    )  # fmt: skip
+
+
+def grade_in_wall(folder, task) -> bool:
+    ws_eval.write_files(folder, task.hidden_files)
+    (v,) = ws_eval.grade(task, folder)
+    return v.ok
+
+
+@pytest.mark.skipif(not Path("/proc/self/mem").exists(), reason="needs /proc")
+def test_a_child_of_the_checker_cannot_read_the_nonce_from_its_memory(real_wall, tmp_path):
+    unprotected = ws_eval.CHECK_PRELUDE.replace("\nprotect()\n", "\n")
+    assert unprotected != ws_eval.CHECK_PRELUDE
+    control = tmp_path / "control"
+    control.mkdir()
+    if not grade_in_wall(control, attack_task(unprotected, expect_found=True)):
+        pytest.skip("this machine does not let a child read the checker's memory anyway")
+    guarded = tmp_path / "guarded"
+    guarded.mkdir()
+    assert grade_in_wall(guarded, attack_task(ws_eval.CHECK_PRELUDE, expect_found=False))
+
+
+def test_a_checker_that_cannot_protect_itself_fails_with_that_reason(tmp_path, passthrough_wall):
+    broken = ws_eval.CHECK_PRELUDE.replace("\nprotect()\n", "\nsys.exit(97)\n")
+    task = attack_task(broken, expect_found=False)
+    ws_eval.write_files(tmp_path, task.hidden_files)
+    (v,) = ws_eval.grade(task, tmp_path)
+    assert not v.ok and "memory unreadable" in v.detail and ws_eval.EXIT_UNPROTECTED == 97
+
+
+def test_a_pattern_that_backtracks_for_ever_is_stopped(tmp_path, monkeypatch):
+    monkeypatch.setattr(ws_eval, "REGEX_TIMEOUT_S", 0.5)
+    files = {"a.txt": "a" * 60 + "b"}
+    v = graded(tmp_path, {"type": "regex", "path": "a.txt", "pattern": "(a+)+$"}, files)
+    assert not v.ok and "was stopped" in v.detail
+
+
+def test_a_case_only_difference_in_setup_paths_is_a_collision():
+    for extra in (
+        '[setup.files]\n"Data" = "a"\n"data/y" = "b"\n',
+        '[setup.files]\n"Data.txt" = "a"\n"data.TXT" = "b"\n',
+    ):
+        with pytest.raises(ws_eval.TaskError, match="folder|differ only in case"):
+            ws_eval.parse_task(task_text() + extra, "f", "t1")
+
+
+def test_results_from_before_an_edit_to_the_job_file_are_left_out():
+    old = [{**r, "job_hash": "edit1"} for r in rows("A", "x", [False] * 3)]
+    new = [{**r, "job_hash": "edit2"} for r in rows("A", "x", [True] * 3, start=10)]
+    pt = evalstats.paired_tasks(old + new, rows("B", "x", [False] * 3, start=20))
+    assert pt["a_only"] == 1 and pt["dropped"]["other_job"] == 3
+
+
+def test_a_compare_where_the_arms_ran_different_numbers_of_trials_is_refused(box, capsys):
+    for r in [*rows("A", "x", [True] * 3), *rows("B", "x", [False] * 2, start=5)]:
+        ws_eval.append_jsonl(ws_eval.results_path(), r)
+    code, _, err = ws(capsys, "eval", "compare", "A", "B")
+    assert code == 1 and "3 trials under A and 2 under B" in err and "same --trials" in err
+    assert not ws_eval.looks_path().exists()  # a refusal does not use up a look

@@ -3,14 +3,15 @@
 All notable changes to ws are written here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the version numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-The release workflow reads the section whose heading matches the tag (`## [0.1.0]` for `v0.1.0`) and uses it as the
+The release workflow reads the section whose heading matches the tag (`## [0.1.1]` for `v0.1.1`) and uses it as the
 body of the GitHub release.
 
 ## [Unreleased]
 
-## [0.1.0] - 2026-11-01
+## [0.1.1] - 2026-11-01
 
-The first thin tag: phases 0 to 5 of the plan, installed from the signed release.
+The first thin tag: phases 0 to 5 of the plan, installed from the signed release. It replaces 0.1.0, which was
+withdrawn on the day it was published; 0.1.0 isn't available from GitHub or PyPI.
 
 ### Added
 
@@ -70,5 +71,5 @@ The first thin tag: phases 0 to 5 of the plan, installed from the signed release
 - The lab VM cell of the install test hasn't run yet.
 - PyPI publishing waits on a trusted publisher being set up; until then the GitHub release is the install route.
 
-[Unreleased]: https://github.com/Michael-A-Fry/ws/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/Michael-A-Fry/ws/commits/v0.1.0
+[Unreleased]: https://github.com/Michael-A-Fry/ws/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/Michael-A-Fry/ws/commits/v0.1.1

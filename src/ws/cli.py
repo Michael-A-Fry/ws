@@ -7,7 +7,7 @@ import json
 import sys
 from pathlib import Path
 
-from ws import __version__, doctor, gate, mcp_server, memory, notes, osinfo
+from ws import __version__, broker, doctor, gate, mcp_server, memory, notes, osinfo, secrets
 from ws.profile import ProfileError, load, profile_path, write_if_changed
 
 YES = {"y", "yes", "true", "1", "on"}
@@ -130,6 +130,8 @@ def build_parser() -> argparse.ArgumentParser:
     i.set_defaults(func=cmd_init)
 
     gate.register(sub)
+    secrets.register(sub)
+    broker.register(sub)
     notes.register(sub)
     memory.register(sub)
     mcp_server.register(sub)

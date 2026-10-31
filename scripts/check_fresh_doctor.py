@@ -7,12 +7,13 @@ With --native-windows the platform check must fail with the WSL2 fix instead (th
 import json
 import os
 import sys
+from pathlib import Path
 
 from ws.doctor import ROLES
 
 
 def main(argv: list[str]) -> int:
-    report, code = json.loads(open(argv[0], encoding="utf-8").read()), int(argv[1])
+    report, code = json.loads(Path(argv[0]).read_text(encoding="utf-8")), int(argv[1])
     native_windows = "--native-windows" in argv[2:]
     checks = {c["id"]: c for c in report["checks"]}
     problems = []

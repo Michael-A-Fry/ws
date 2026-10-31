@@ -71,7 +71,7 @@ jobs:
           uv run --locked python scripts/check_fresh_doctor.py /tmp/doctor.json "$code"
 
   windows-native:
-    name: doctor (windows-2025, native: points at WSL2)
+    name: doctor (windows-2025 native, points at WSL2)
     runs-on: windows-2025
     timeout-minutes: 15
     defaults:

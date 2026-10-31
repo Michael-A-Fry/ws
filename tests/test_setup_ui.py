@@ -764,7 +764,8 @@ def test_sigterm_in_raw_mode_restores_the_terminal_and_cancels(box):
             assert not termios.tcgetattr(slave)[3] & termios.ICANON  # single-key mode while it runs
             os.kill(os.getpid(), signal.SIGTERM)
             time.sleep(0.2)
-        assert termios.tcgetattr(slave)[3] == before  # put back
+        kernel = getattr(termios, "PENDIN", 0)  # macOS sets PENDIN itself; it is not ours to restore
+        assert termios.tcgetattr(slave)[3] & ~kernel == before & ~kernel  # put back
         assert out.getvalue().startswith(inline.HIDE) and out.getvalue().endswith(inline.SHOW)
         assert signal.getsignal(signal.SIGTERM) in (signal.SIG_DFL, signal.default_int_handler) or callable(
             signal.getsignal(signal.SIGTERM)

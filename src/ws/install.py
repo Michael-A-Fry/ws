@@ -19,6 +19,7 @@ import hashlib
 import json
 import math
 import os
+import shutil
 import stat
 import sys
 import tempfile
@@ -548,6 +549,7 @@ def uninstall(env=None, keep_data: bool = True, dry_run: bool = False, deactivat
             out.removed.append(p)
             if not dry_run:
                 p.unlink()
+    _remove_work_root(env, out, dry_run)
     mpath = manifest_path(env)
     gone = {*out.removed, mpath}
     if not dry_run and mpath.is_file():
@@ -564,6 +566,26 @@ def uninstall(env=None, keep_data: bool = True, dry_run: bool = False, deactivat
         else:
             out.not_empty.append(d)
     return out
+
+
+def _remove_work_root(env: dict, out: Removal, dry_run: bool) -> None:
+    """`$XDG_STATE_HOME/ws`, where `ws run` puts the working folder of a job with no `cwd`, is made by ws without a
+    manifest entry; it goes with the uninstall. A link there, or one that is not ours, is left and listed."""
+    from ws import run
+
+    root = run.work_root(env)
+    if not os.path.lexists(root):
+        return
+    try:
+        st = root.lstat()
+    except OSError:
+        return
+    if root.is_symlink() or not root.is_dir() or st.st_uid != os.getuid():
+        out.refused.append(root)
+        return
+    out.removed.append(root)
+    if not dry_run:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def _removable(d: Path, gone: set[Path], dry_run: bool) -> bool:

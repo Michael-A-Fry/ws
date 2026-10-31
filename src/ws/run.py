@@ -25,6 +25,8 @@ The job may also declare `green`, what its verification covers; the record carri
 
 A job with no `cwd` runs in a fresh empty folder, `$XDG_STATE_HOME/ws/work/<run_id>` (default `~/.local/state/...`).
 It is outside `$WS_HOME` on purpose: the wall makes `$WS_HOME` read-only, so a folder there could not be written to.
+Each folder on the way is made private (0700) and checked before use: not a link, ours, and not writable by anyone
+else, so another user cannot plant one to steer the run. `ws uninstall` removes `$XDG_STATE_HOME/ws`.
 
 Exit: 0 ok, 1 the runner failed or timed out, 2 the job could not be read (a record is written when the job name is
 safe), 3 refused.
@@ -39,6 +41,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -187,16 +190,55 @@ def _child_env(home: Path, extra: dict[str, str]) -> dict[str, str]:
     return env
 
 
-def default_cwd(home: Path, run_id: str, env: dict[str, str] | None = None) -> Path:
-    """The folder a job with no `cwd` runs in: `<state dir>/ws/work/<run_id>`, never inside `home` (`$WS_HOME`), which
-    the wall makes read-only for the runner. A `$WS_HOME` that holds the state dir too falls back to the temp dir."""
+def work_root(env: dict[str, str] | None = None) -> Path:
+    """`$XDG_STATE_HOME/ws` (default `~/.local/state/ws`): the only thing ws keeps there, the work folders of jobs with no
+    `cwd`. `ws uninstall` removes it."""
     env = os.environ if env is None else env
     state = env.get("XDG_STATE_HOME")
-    base = Path(state) if state and os.path.isabs(state) else Path.home() / ".local" / "state"
-    folder = base / "ws" / "work" / run_id
-    if folder.is_relative_to(home):
-        folder = Path(tempfile.gettempdir()) / f"ws-work-{os.getuid()}" / run_id
-    return folder
+    if state and os.path.isabs(state):
+        base = Path(state)
+    else:
+        base = (Path(env["HOME"]) if env.get("HOME") else Path.home()) / ".local" / "state"
+    return base / "ws"
+
+
+def default_cwd(home: Path, run_id: str, env: dict[str, str] | None = None) -> Path | None:
+    """The folder a job with no `cwd` runs in: `<work root>/work/<run_id>`, never inside `home` (`$WS_HOME`), which the
+    wall makes read-only for the runner. None when the work root would sit inside `home`: `_make_default_cwd` then makes
+    a private folder under the temp dir. Pure: it makes nothing."""
+    folder = work_root(env) / "work" / run_id
+    return None if folder.is_relative_to(home) else folder
+
+
+def _check_private(folder: Path) -> None:
+    """Refuse a folder that is a link, is not ours, or that group or others can write to (lstat: a link is not followed)."""
+    st = os.lstat(folder)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o022:
+        raise WsError(
+            "unsafe_folder",
+            f"{folder} is not a private folder of yours (a link, someone else's, or writable by others)",
+            f"look at it, and remove or fix it, or set XDG_STATE_HOME to a folder of your own: `ls -ld {folder}`",
+        )
+
+
+def _make_default_cwd(planned: Path | None) -> Path:
+    """Make the default working folder. Every folder ws owns on the way (`ws`, `ws/work`) is made 0700 if missing and
+    checked either way; the last one must be new (mkdir without exist_ok), so a run never starts in a folder someone
+    else prepared. The state dir above them is the person's own and is only created if missing."""
+    if planned is None:
+        return Path(tempfile.mkdtemp(prefix="ws-work-"))  # private (0700) and unpredictable
+    planned.parent.parent.parent.mkdir(parents=True, exist_ok=True)
+    for folder in (planned.parent.parent, planned.parent):
+        with contextlib.suppress(FileExistsError):
+            os.mkdir(folder, 0o700)
+        _check_private(folder)
+    try:
+        os.mkdir(planned, 0o700)
+    except FileExistsError as e:
+        raise WsError(
+            "unsafe_folder", f"{planned} already exists, so ws will not run in it", f"remove it: `rm -r {planned}`"
+        ) from e
+    return planned
 
 
 def _find_exe(name: str, env: dict[str, str]) -> str | None:
@@ -480,7 +522,7 @@ def _run(args: argparse.Namespace, job: jobs.Job | None = None, fields: dict | N
     if args.dry_run:
         plan = {
             "job": job.name, "runner": job.runner, "argv": argv, "prompt_via": "stdin" if stdin else "argv",
-            "cwd": str(cwd), "timeout_s": job.timeout_s, "env": sorted(child_env),
+            "cwd": str(cwd or "<a private folder under the temp dir>"), "timeout_s": job.timeout_s, "env": sorted(child_env),
             "secrets": [{"name": s.name, "host": s.host} for s in job.secrets], "policy": rec["policy"],
             "month_spend_usd": round(spend, 6), "monthly_cap_usd": _budget(prof)[0], "would_refuse": reason,
         }  # fmt: skip
@@ -508,7 +550,7 @@ def _execute(
     try:
         run_dir.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         run_dir.mkdir(mode=0o700)
-        cwd.mkdir(mode=0o700, parents=True, exist_ok=True)  # a job's own cwd exists already
+        cwd = cwd if job.cwd else _make_default_cwd(cwd)  # a job's own cwd exists already
         rec["cwd"] = str(cwd)
         policy_file = policy.policy_path().absolute()
         files = adapter.generate(pol, selfcmd.argv(), run_dir / "gate", policy_file)

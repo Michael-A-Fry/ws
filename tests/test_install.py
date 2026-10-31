@@ -514,3 +514,29 @@ def test_a_profile_whose_notes_folder_is_your_home_is_one_clear_error(box, capsy
     code, _, err = run(capsys, "uninstall", "--yes")
     assert code == 0 and "Traceback" not in err
     assert run(capsys, "module", "list")[0] == 0
+
+
+def test_uninstall_removes_the_work_folders_of_jobs_with_no_cwd(box, capsys, monkeypatch):
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    notes = box / "Notes"
+    assert run(capsys, "install", *FULL, "--notes", str(notes))[0] == 0
+    work = box / ".local" / "state" / "ws" / "work" / "run1"
+    work.mkdir(parents=True)
+    (work / "hello.txt").write_text("hello", encoding="utf-8")
+    code = run(capsys, "uninstall", "--dry-run")[0]
+    assert code == 0 and work.is_dir()  # a dry run removes nothing
+    code = run(capsys, "uninstall", "--yes")[0]
+    assert code == 0 and not (box / ".local" / "state" / "ws").exists()
+    assert (box / ".local" / "state").is_dir()  # the person's own state dir stays
+
+
+def test_uninstall_leaves_a_linked_work_root_alone(box, capsys, monkeypatch):
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    assert run(capsys, "install", *FULL, "--notes", str(box / "Notes"))[0] == 0
+    elsewhere = box / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "keep.txt").write_text("keep", encoding="utf-8")
+    (box / ".local" / "state").mkdir(parents=True)
+    (box / ".local" / "state" / "ws").symlink_to(elsewhere)
+    assert run(capsys, "uninstall", "--yes")[0] == 0
+    assert (elsewhere / "keep.txt").is_file()

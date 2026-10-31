@@ -25,6 +25,7 @@ import pytest
 
 from ws import broker, cli, doctor, jobs, osinfo, policy, run, runrecord
 from ws.adapters import claude_code, opencode
+from ws.output import WsError
 from ws.profile import dumps
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -671,13 +672,68 @@ def test_the_default_cwd_is_outside_ws_home_so_the_wall_leaves_it_writable(ws, t
     assert Path(ws.records()[1]["cwd"]) == state / "ws" / "work" / ws.records()[1]["run_id"]
 
 
-def test_a_ws_home_that_holds_the_state_folder_falls_back_to_the_temp_dir(tmp_path, monkeypatch):
+def test_a_ws_home_that_holds_the_state_folder_gets_a_private_unpredictable_temp_folder(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "h"))
     monkeypatch.delenv("XDG_STATE_HOME", raising=False)
-    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path / "tmp"))
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     home = tmp_path / "h" / ".local" / "state" / "ws"
-    got = run.default_cwd(home, "r1")
-    assert not got.is_relative_to(home) and got.name == "r1" and got.is_relative_to(tmp_path / "tmp")
+    assert run.default_cwd(home, "r1") is None  # pure: it plans, it makes nothing
+    a, b = run._make_default_cwd(None), run._make_default_cwd(None)
+    assert a != b and a.parent == tmp_path and a.name.startswith("ws-work-") and a.name != "ws-work-"
+    assert stat.S_IMODE(a.stat().st_mode) == 0o700
+
+
+def planned(tmp_path: Path) -> Path:
+    return tmp_path / "state" / "ws" / "work" / "run1"
+
+
+def test_the_default_cwd_is_made_with_private_parents_and_must_be_new(tmp_path):
+    leaf = run._make_default_cwd(planned(tmp_path))
+    assert leaf.is_dir()
+    for folder in (leaf, leaf.parent, leaf.parent.parent):
+        assert stat.S_IMODE(folder.stat().st_mode) == 0o700
+    with pytest.raises(WsError) as e:  # a folder someone prepared under that name is never reused
+        run._make_default_cwd(leaf)
+    assert e.value.kind == "unsafe_folder"
+
+
+def test_a_symlinked_parent_of_the_default_cwd_is_refused(tmp_path):
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (tmp_path / "state").mkdir()
+    (tmp_path / "state" / "ws").symlink_to(elsewhere)
+    with pytest.raises(WsError) as e:
+        run._make_default_cwd(planned(tmp_path))
+    assert e.value.kind == "unsafe_folder"
+    assert list(elsewhere.iterdir()) == []  # nothing was made behind the link
+
+
+def test_a_parent_owned_by_someone_else_or_open_to_others_is_refused(tmp_path, monkeypatch):
+    leaf = run._make_default_cwd(planned(tmp_path))
+    work = leaf.parent
+    other = planned(tmp_path).with_name("run2")
+    monkeypatch.setattr(os, "getuid", lambda: os.stat(work).st_uid + 1)  # as if the folder were someone else's
+    with pytest.raises(WsError) as e:
+        run._make_default_cwd(other)
+    assert e.value.kind == "unsafe_folder"
+    monkeypatch.undo()
+    work.chmod(0o770)  # writable by the group
+    with pytest.raises(WsError) as e:
+        run._make_default_cwd(other)
+    assert e.value.kind == "unsafe_folder"
+    work.chmod(0o707)  # writable by others
+    with pytest.raises(WsError):
+        run._make_default_cwd(other)
+
+
+def test_a_run_whose_work_folder_parent_is_a_link_ends_as_an_error_record(ws, tmp_path):
+    state = tmp_path / "userhome" / ".local" / "state"
+    state.mkdir(parents=True)
+    (state / "ws").symlink_to(tmp_path)
+    ws.job()
+    assert cli.main(["run", "daily"]) == 1
+    (rec,) = ws.records()
+    assert rec["status"] == "error" and "not a private folder" in rec["error"]
 
 
 def test_a_job_with_its_own_cwd_runs_there(ws, tmp_path):

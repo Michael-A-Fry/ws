@@ -18,16 +18,34 @@ copied where it fits (the points below); Claude Code, which has the same engine 
 
 Decisions, and why:
   * A write allow-list, not a deny-list. Root is read-only; writable are the project folder (where the runner is started;
-    never the home folder or above it), a private tmp the launcher makes and points TMPDIR at, the runner's own state
-    and cache folders (OpenCode: the `opencode` folders under XDG data, state and cache; found by running it read-only
-    and adding what it needed), `allow_write` from the policy and `--allow-write`. A deny-list left everything else
+    never the home folder or above it), a private tmp the launcher makes and points TMPDIR at, the runner's own private
+    state folders (next point), `allow_write` from the policy and `--allow-write`. A deny-list left everything else
     writable: `~/.bashrc`, `~/.local/bin`, `~/.config/systemd/user` and ws's own installed source, each of which runs
     outside the wall at the next shell or the next hook. ws's own files (`$WS_HOME`, the policy, the generated folder)
-    are read-only by default and stay so even where one sits inside the project. The project's `.git/hooks`,
-    `.git/config`, `.claude` and `.opencode` are read-only inside it (Claude Code's sandbox protects the same). The
-    price: a program that writes a hard-coded path outside those (not TMPDIR) fails; the policy's `allow_write` is how
-    a person lets one through. A read-only mount is enforced by the kernel for every process in the sandbox, including the
-    runner's own tool and plugin code, which a path rule in the runner's config is not.
+    are read-only by default and stay so even where one sits inside the project. The price: a program that writes a
+    hard-coded path outside those (not TMPDIR) fails; the policy's `allow_write` is how a person lets one through. A
+    read-only mount is enforced by the kernel for every process in the sandbox, including the runner's own tool and
+    plugin code, which a path rule in the runner's config is not.
+  * The runner's own state is private to the wall. OpenCode keeps programs in its XDG data and cache folders (`bin/rg`,
+    `node_modules/.bin` plugins, language servers) and runs them later; if the wall let it write the person's real
+    ones, a session could plant one that runs outside the wall at the next unwalled start (the P1 the third cold review
+    found). So a walled run gets XDG_DATA_HOME, XDG_STATE_HOME and XDG_CACHE_HOME of its own under
+    `$WS_HOME/wall/<runner>/` (`private_homes`): kept between walled runs, never read by an unwalled one. The person's
+    real folders stay visible and read-only. The runner's sign-in files are copied across at each start, unless a
+    deny_read rule hides them. `ws uninstall` takes the folder with `$WS_HOME`.
+  * The project's own config is the second half of that class: the folders and files a runner or git LOADS at start
+    (`PROJECT_LOCKED`, `git_facts`, `submodule_repos`; the table of what and why is tests/e2e/test_wall_loadpaths.py).
+    They are read-only whether or not they exist. A path that exists is bound read-only onto itself; one that does not
+    is made by the launcher first (an empty folder, or an empty valid config file) and removed after the run, because
+    bubblewrap can only bind what is there; a launcher that is killed leaves them behind, empty. Every folder between
+    the project and a locked path is bound onto itself too (`Plan.ancestors`): a locked path is a mount point, but
+    `mv .git .git2` moves the folder above it, and rename(2) refuses a mount point. Git's own routes are read from
+    `git config --list --show-origin`: the `core.hooksPath` folder when it is in the project (a husky or `.githooks`
+    folder), config files pulled in with `[include]`, and the submodule repositories' hooks and config. A locked path
+    that is a symbolic link is refused, since a link in a writable folder can be deleted and replaced. Not closed: a
+    repository the session itself creates (`git init` has to keep working; the launcher says so when it ends), a
+    submodule added during the session, and config in a sub-folder of the project (read only when the runner is started
+    there).
   * A protected path reached through a symbolic link the session could replace is refused, with the real path in the
     message. A read-only bind holds the real path; delete a link in a writable folder and plant a folder under its name,
     and the hook's fixed --policy path reads the plant. (Links in folders the user cannot write are fine.)
@@ -70,9 +88,11 @@ Decisions, and why:
   * No `--unshare-net`: the runner needs the model's API, local or remote. Host filtering is Claude Code's sandbox proxy
     only (policy `allow_hosts`); here the network is as today. That is a limit, written in ws.policy's docstring.
   * macOS: `sandbox-exec` with a generated profile, `(allow default)` then `(deny file-write*)` over the protected paths
-    and `(deny file-read*)` over the hidden ones, then the two writable holes re-allowed (the last matching rule wins),
-    and `(deny network-outbound (remote unix-socket))`. Seatbelt matches paths, not mount points, so a renamed ancestor
-    does not help an attacker there. sandbox-exec is deprecated by Apple but still ships and is what Claude Code and Codex
+    and `(deny file-read*)` over the hidden ones, then the two writable holes and the runner's private folders
+    re-allowed (the last matching rule wins), the project's locked paths denied again, and
+    `(deny network-outbound (remote unix-socket))`. Seatbelt matches paths, not mount points, so a renamed ancestor of a
+    protected path does not help an attacker there; a renamed ancestor of a locked project path does (`mv .git .git2`,
+    plant in `.git2/hooks`, `mv .git2 .git`), so those folders get a `literal` deny of their own. sandbox-exec is deprecated by Apple but still ships and is what Claude Code and Codex
     use. The profile text is unit tested; no CI job runs it, so the unix-socket rule in particular is unverified.
 """
 
@@ -197,14 +217,18 @@ def seccomp_program(machine: str | None = None) -> bytes:
 class Plan:
     """What the wall does to the filesystem, in the order it is applied (a later mount wins over an earlier one):
     everything read-only; then the allow-list writable; then ws's own files read-only again; then the two holes the
-    gate needs writable; then the project's own config read-only again; then the hidden paths made empty."""
+    gate needs writable, and the runner's private folders; then the project's own config read-only again; then the
+    hidden paths made empty."""
 
     home: Path
     protect: tuple[str, ...] = ()  # read-only, with `home`, even where they sit inside a writable folder
     hidden: tuple[str, ...] = ()  # deny_read paths, made empty
     sockets: tuple[str, ...] = ()  # socket folders, made empty
-    writable: tuple[str, ...] = ()  # the allow-list: project, private tmp, the runner's state, policy allow_write
+    writable: tuple[str, ...] = ()  # the allow-list: project, private tmp, policy allow_write
     locked: tuple[str, ...] = ()  # inside a writable folder but read-only (the project's .git/hooks, .claude, ...)
+    homes: tuple[
+        str, ...
+    ] = ()  # the runner's private XDG folders: writable, though they sit inside ws's read-only home
 
     def read_only(self) -> list[str]:
         return list(dict.fromkeys(os.path.realpath(p) for p in [self.home, *self.protect]))
@@ -214,6 +238,9 @@ class Plan:
 
     def roots(self) -> list[str]:
         return list(dict.fromkeys(os.path.realpath(p) for p in self.writable))
+
+    def private(self) -> list[str]:
+        return [os.path.realpath(h) for h in self.homes]
 
     def symlinked(self) -> str | None:
         """A protected path (as given) that is reached through a link the session could replace, or None. A read-only bind
@@ -227,13 +254,14 @@ class Plan:
         return None
 
     def ancestors(self) -> list[str]:
-        """Folders inside a writable folder and above a read-only path, outermost first. A read-only bind holds the path
-        it covers, not the folders above it: `mv ~/.config ~/.config2; mkdir -p ~/.config/ws; echo x > ~/.config/ws/policy.toml`
-        plants a policy where the hook's fixed path points. rename(2) refuses a mount point (EBUSY), so each such folder
-        is bound onto itself (read-write: it already was)."""
+        """Folders inside a writable folder and above a read-only or locked path, outermost first. A read-only bind holds
+        the path it covers, not the folders above it: `mv ~/.config ~/.config2; mkdir -p ~/.config/ws; echo x >
+        ~/.config/ws/policy.toml` plants a policy where the hook's fixed path points, and in the project `mv .git .git2`
+        takes the hooks and the config with it. rename(2) refuses a mount point (EBUSY), so each such folder is bound
+        onto itself (read-write: it already was). A locked path is a mount point itself, so it needs no more."""
         roots = self.roots()
         out: list[str] = []
-        for p in self.read_only():
+        for p in [*self.read_only(), *(os.path.realpath(q) for q in self.locked)]:
             for a in reversed(Path(p).parents):
                 s = str(a)
                 if s not in out and any(r in map(str, a.parents) for r in roots):
@@ -258,6 +286,9 @@ def bwrap_argv(argv: list[str], plan: Plan, tty: bool, seccomp_fd: int) -> list[
     for p in plan.holes():
         if os.path.lexists(p):
             out += ["--bind", p, p]
+    for p in plan.private():  # the runner's own state: bound over ws's read-only home, like the holes
+        if os.path.isdir(p):
+            out += ["--bind", p, p]
     for p in plan.locked:
         if os.path.lexists(p):
             out += ["--ro-bind", p, p]
@@ -266,20 +297,29 @@ def bwrap_argv(argv: list[str], plan: Plan, tty: bool, seccomp_fd: int) -> list[
     return [*out, "--", *argv]
 
 
+def _locked_above(plan: Plan, folder: str) -> bool:
+    return any(os.path.realpath(q).startswith(folder + "/") for q in plan.locked)
+
+
 def _sbpl(path: str) -> str:
     return '"' + str(Path(path).resolve()).replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 def sandbox_exec_profile(plan: Plan) -> str:
     """The macOS profile, the same allow-list: deny every write, allow the writable folders (and /dev), deny ws's own
-    files again, allow the two holes, deny the project's config again. Paths are resolved first: /var is /private/var
-    there, and the profile matches real paths. Seatbelt matches paths, not mount points, so a renamed ancestor does not
-    help an attacker there."""
+    files again, allow the two holes and the runner's private folders, deny the project's config again. Paths are
+    resolved first: /var is /private/var there, and the profile matches real paths. Seatbelt matches paths, not mount
+    points, so a renamed ancestor of a read-only path does not help an attacker. The ancestors of a locked path are the
+    exception: `mv .git .git2; echo x > .git2/hooks/h; mv .git2 .git` writes at a path no rule names and then renames it
+    into place, so each such folder gets a `literal` deny, which stops a rename of the folder itself but not a write
+    to a file below it."""
     lines = ["(version 1)", "(allow default)", "(deny file-write*)", '(allow file-write* (subpath "/dev"))']
     lines += [f"(allow file-write* (subpath {_sbpl(p)}))" for p in plan.roots()]
     lines += [f"(deny file-write* (subpath {_sbpl(p)}))" for p in plan.read_only()]
     lines += [f"(allow file-write* (subpath {_sbpl(p)}))" for p in plan.holes()]
+    lines += [f"(allow file-write* (subpath {_sbpl(p)}))" for p in plan.private()]
     lines += [f"(deny file-write* (subpath {_sbpl(p)}))" for p in plan.locked]
+    lines += [f"(deny file-write* (literal {_sbpl(p)}))" for p in plan.ancestors() if _locked_above(plan, p)]
     for p in (*plan.sockets, *plan.hidden):
         kind = "literal" if os.path.isfile(p) else "subpath"
         lines.append(f"(deny file-read* ({kind} {_sbpl(p)}))")
@@ -301,6 +341,7 @@ def wrap(
     *,
     writable: list[str] = (),
     locked: list[str] = (),
+    homes: list[str] = (),
     system: str | None = None,
     which=shutil.which,
     probe=None,
@@ -318,6 +359,7 @@ def wrap(
         tuple(socket_dirs(env)),
         tuple(writable),
         tuple(locked),
+        tuple(homes),
     )
     link = plan.symlinked()
     if link:
@@ -371,13 +413,33 @@ def _bwrap_starts() -> bool:
 
 # --- ws gate launch ------------------------------------------------------------------------------------------------
 
-# Inside the project folder, ws's own read-only list: what Claude Code's sandbox also always protects. A hook or config
-# written here runs outside the wall at the next `git commit` or the next start of the runner.
-PROJECT_LOCKED = (".git/hooks", ".git/config", ".claude", ".opencode")
+# Inside the project folder, ws's own read-only list: everything a runner or git loads or runs at start that a session
+# could plant, and that would then run outside the wall (at the next `git commit`, the next start of the runner).
+# Built from the runners' and git's own documentation and checked by tests/e2e/test_wall_loadpaths.py, which has the
+# table and says how to add a runner. (path, what a missing one is made into so it cannot be created: a folder, a file
+# with this text, or None for nothing.) CLAUDE.md, AGENTS.md and the skill and rule text are content, not code: they
+# stay writable.
+DIR = "dir"
+PROJECT_LOCKED = (
+    (".git/hooks", DIR),
+    (".git/config", None),
+    (".git/config.worktree", ""),
+    (".claude", DIR),
+    (".opencode", DIR),
+    (".mcp.json", '{"mcpServers": {}}\n'),
+    ("opencode.json", "{}\n"),
+    ("opencode.jsonc", "{}\n"),
+    ("tui.json", "{}\n"),
+    ("tui.jsonc", "{}\n"),
+)
+NEW_REPO_NOTE = (
+    "ws: this session created a git repository here. Its hooks and config were writable inside the wall: read "
+    ".git/hooks and .git/config before you run git in this folder outside it."
+)
 
 
-def launch_env(env: dict, tmp: str | None = None) -> dict:
-    return {**env, ENV_MARKER: "1", **({"TMPDIR": tmp} if tmp else {})}
+def launch_env(env: dict, tmp: str | None = None, homes: dict | None = None) -> dict:
+    return {**env, ENV_MARKER: "1", **({"TMPDIR": tmp} if tmp else {}), **(homes or {})}
 
 
 def expand(path: str, env: dict) -> str:
@@ -416,16 +478,10 @@ def protected(policy_file: Path, runner: str, extra: list[str] | None = None, en
 
 
 def writable_folders(pol: policy.Policy, runner: str, project: str, tmp: str, extra: list[str], env: dict) -> list[str]:
-    """The allow-list: the project, the private tmp, the runner's own state and cache folders (made if missing, since
-    bubblewrap cannot bind what is not there), `allow_write` from the policy and --allow-write. A listed folder that does
-    not exist is skipped, except the runner's own."""
+    """The allow-list: the project, the private tmp, `allow_write` from the policy and --allow-write. A listed folder
+    that does not exist is skipped. The runner's own state is not here: it gets private folders (`private_homes`)."""
+    getattr(adapters.get(runner), "wall_prepare", lambda _env: None)(env)
     out = [project, tmp]
-    adapter = adapters.get(runner)
-    getattr(adapter, "wall_prepare", lambda _env: None)(env)
-    state = getattr(adapter, "wall_writable", None)
-    for p in state(env) if state else []:
-        Path(p).mkdir(parents=True, exist_ok=True)
-        out.append(p)
     for p in [*policy.sandbox_write_paths(pol), *extra]:
         real = os.path.realpath(expand(posixpath.normpath(p), env))
         if _home_or_above(real, env):
@@ -437,8 +493,201 @@ def writable_folders(pol: policy.Policy, runner: str, project: str, tmp: str, ex
     return [p for p in dict.fromkeys(out) if os.path.isdir(p)]
 
 
-def project_locked(project: str) -> list[str]:
-    return [str(Path(project) / rel) for rel in PROJECT_LOCKED if os.path.lexists(Path(project) / rel)]
+# --- the runner's own state --------------------------------------------------------------------------------------
+
+# XDG variable -> the folder under `$WS_HOME/wall/<runner>/` that stands in for it.
+XDG_HOMES = (("XDG_DATA_HOME", "data"), ("XDG_STATE_HOME", "state"), ("XDG_CACHE_HOME", "cache"))
+# The files in the runner's real data folder that a walled run needs to be signed in, copied in at each start.
+SEED = {"opencode": ("auth.json", "mcp-auth.json")}
+
+
+def private_homes(home: Path, runner: str, pol: policy.Policy, env: dict) -> dict[str, str]:
+    """XDG data, state and cache folders for a walled run of `runner`, as {variable: folder}; {} for a runner that keeps
+    no state of its own (one without `wall_writable` in its adapter, which is the marker).
+
+    Why private. OpenCode keeps programs in the XDG cache and data folders (`bin/rg`, `node_modules/.bin` plugins,
+    language servers) and runs them later, and the walled run has to write there. If it wrote the person's real
+    folders, whatever a session planted would run outside the wall at the next unwalled start. So the walled run gets
+    its own, under `$WS_HOME/wall/<runner>/`, which no unwalled run is pointed at; the real ones stay visible and
+    read-only. Why under `$WS_HOME` and not the private tmp: the session history and the model cache are worth keeping
+    between runs, and `ws uninstall` removes `$WS_HOME`. They are made 0700, and a `.gitignore` of `*` keeps them out of
+    a synced `$WS_HOME`. What is lost: a sign-in is copied from the real data folder at each start (a token the run
+    refreshes is not carried back), and one the policy hides with deny_read is not copied."""
+    if not hasattr(adapters.get(runner), "wall_writable"):
+        return {}
+    base = home / "wall"
+    base.mkdir(parents=True, exist_ok=True)
+    base.chmod(0o700)
+    if not (base / ".gitignore").exists():
+        (base / ".gitignore").write_text("*\n", encoding="utf-8")
+    out: dict[str, str] = {}
+    for var, kind in XDG_HOMES:
+        folder = base / runner / kind
+        folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+        out[var] = os.path.realpath(folder)
+    real_data = Path(env.get("XDG_DATA_HOME") or f"{env.get('HOME') or Path.home()}/.local/share") / runner
+    hidden = hidden_paths(pol, env)
+    for name in SEED.get(runner, ()):
+        src, dest = real_data / name, Path(out["XDG_DATA_HOME"]) / runner / name
+        real = os.path.realpath(src)
+        if src.is_file() and not any(real == h or _inside(real, h) for h in hidden):
+            dest.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            new = dest.with_name(dest.name + ".new")
+            new.write_bytes(src.read_bytes())
+            new.chmod(0o600)
+            new.replace(dest)
+        else:
+            dest.unlink(missing_ok=True)
+    return out
+
+
+# --- the project's own config -------------------------------------------------------------------------------------
+
+
+def _inside(path: str, folder: str) -> bool:
+    return path.startswith(folder.rstrip("/") + "/")
+
+
+def git_facts(project: str) -> tuple[str | None, list[str]]:
+    """What git, started in `project`, would load that is not under `.git`: the folder named by core.hooksPath and the
+    config files (an `[include]` of a file in the project). Both are code to git: a hook runs at the next commit, and
+    a config sets `core.fsmonitor`, an alias or a credential helper. Read with `git config`, which runs nothing. Empty
+    where git is missing, this is not a repository, or git takes longer than 10 seconds."""
+
+    def git(*args: str) -> str | None:
+        try:
+            r = subprocess.run(
+                ["git", "-C", project, *args],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+                stdin=subprocess.DEVNULL,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return r.stdout if r.returncode == 0 else None
+
+    top, listing = git("rev-parse", "--show-toplevel"), git("config", "--list", "--show-origin", "-z")
+    if not top or listing is None:
+        return None, []
+    top, parts = top.strip(), listing.split("\0")
+    files, hooks = [], None
+    for origin, entry in zip(parts[0::2], parts[1::2], strict=False):  # origin NUL "key" NL "value" NUL
+        key, _, value = entry.partition("\n")
+        here = os.path.realpath(os.path.join(top, origin[5:])) if origin.startswith("file:") else None
+        if here:
+            files.append(here)
+        if key == "include.path" or (key.startswith("includeif.") and key.endswith(".path")):
+            # relative to the including file; named even if it is not there (yet) or its condition is false
+            files.append(os.path.realpath(os.path.join(os.path.dirname(here or top), expand(value, os.environ))))
+        if key == "core.hookspath":
+            hooks = os.path.realpath(os.path.join(top, expand(value, os.environ)))
+    real = os.path.realpath(project)
+    mine = [f for f in dict.fromkeys(files) if _inside(f, real) and not os.path.isdir(f)]
+    return (hooks if hooks and _inside(hooks, real) else None), mine
+
+
+def submodule_repos(git_dir: Path) -> list[str]:
+    """The hooks folders and config files of the submodule repositories under `.git/modules`, which git runs and reads
+    like the project's own. Ones the session adds later are not seen (a known limit)."""
+    out: list[str] = []
+    for here, dirs, files in os.walk(git_dir / "modules"):
+        if "HEAD" in files:  # a repository: its hooks and config, then only its own `modules` below
+            out += [str(Path(here) / "hooks")] if "hooks" in dirs else []
+            out += [str(Path(here) / "config")] if "config" in files else []
+            dirs[:] = [d for d in dirs if d == "modules"]
+    return out
+
+
+def lock_wanted(project: str) -> list[tuple[str, str | None]]:
+    """(path, placeholder) for everything in the project the wall locks: `PROJECT_LOCKED`, what git is set up to load
+    (`git_facts`) and the submodule repositories. The placeholder is what a missing path is made into (`DIR`, the text
+    of a file, or None to leave it missing)."""
+    root = Path(project)
+    git_dir = root / ".git"
+    out: list[tuple[str, str | None]] = []
+    for rel, fill in PROJECT_LOCKED:
+        if rel.startswith(".git/") and not git_dir.is_dir():
+            continue  # a worktree's `.git` is a file (locked below); with no repository there is nothing to hold
+        out.append((str(root / rel), fill))
+    if git_dir.is_file():  # a linked worktree or submodule: the pointer to its real git folder must not be swapped
+        out.append((str(git_dir), None))
+    hooks, config = git_facts(project)
+    out += [(f, "") for f in config]  # a config file that is missing is made empty
+    if hooks and hooks != os.path.realpath(project):
+        out.append((hooks, DIR))
+    if git_dir.is_dir():
+        out += [(p, None) for p in submodule_repos(git_dir)]
+    first: dict[str, str | None] = {}
+    for path, fill in out:
+        first.setdefault(path, fill)
+    return list(first.items())
+
+
+def lock_project(project: str) -> tuple[list[str], list[tuple[str, str]]]:
+    """(locked, created): the paths for the wall to hold read-only, and the placeholders made so a missing one cannot be
+    created inside the wall. bubblewrap can only bind what is there, and a read-only bind of a folder or file that is
+    in the way is what stops `mkdir .claude` and `echo '{...}' > .mcp.json`. They are made here, by the launcher, before
+    the wall, and removed by `unlock_project` after it (only if still what was made); a launcher that is killed leaves
+    them behind, empty. Raises SandboxError for a locked path that is a symbolic link: it could be deleted and replaced
+    by a real folder, which no bind prevents."""
+    locked: list[str] = []
+    created: list[tuple[str, str]] = []
+    wanted = lock_wanted(project)
+    for path, _ in wanted:  # all of them first, so a refusal leaves nothing made
+        if os.path.islink(path):
+            raise SandboxError(
+                f"{path} -> {os.path.realpath(path)}: a project config path that is a symbolic link could be deleted "
+                "and replaced by a real one inside the wall. Replace the link with the real folder or file"
+            )
+    for path, fill in wanted:
+        if fill is not None and not os.path.lexists(path):
+            try:
+                if fill == DIR:
+                    for q in reversed([path, *(str(a) for a in Path(path).parents if _inside(str(a), project))]):
+                        if not os.path.lexists(q):
+                            os.mkdir(q)
+                            created.append((q, DIR))
+                else:
+                    Path(path).write_text(fill, encoding="utf-8")
+                    created.append((path, fill))
+            except OSError:
+                continue  # a project folder we cannot write to: nothing can be planted there either
+        if os.path.lexists(path):
+            locked.append(path)
+        for name, text in project_files(project, path).items():
+            f = Path(path) / name
+            if not os.path.lexists(f):
+                try:
+                    f.write_text(text, encoding="utf-8")
+                    created.append((str(f), text))
+                except OSError:
+                    pass
+    return locked, created
+
+
+def project_files(project: str, path: str) -> dict[str, str]:
+    """Files a runner writes into a locked folder at start and will not run without (EROFS), so the launcher makes them
+    first, outside the wall, with the text the runner writes. OpenCode keeps a `.gitignore` in every config folder,
+    `.opencode` of the project included (the same as `adapters.opencode.wall_prepare` does for the global one)."""
+    if os.path.relpath(path, project) == ".opencode" and os.path.isdir(path):
+        runner = adapters.get("opencode")
+        return {runner.IGNORE: runner.IGNORE_TEXT}
+    return {}
+
+
+def unlock_project(created: list[tuple[str, str]]) -> None:
+    """Remove the placeholders `lock_project` made, newest first. A folder with anything in it, or a file that is no
+    longer the text that was written, is left alone."""
+    for path, fill in reversed(created):
+        try:
+            if fill == DIR:
+                os.rmdir(path)
+            elif Path(path).read_text(encoding="utf-8") == fill:
+                os.unlink(path)
+        except OSError:
+            pass
 
 
 def run_with_broker(cmd: list[str], env: dict, pass_fds: tuple[int, ...], root: Path) -> int:
@@ -489,18 +738,27 @@ def cmd_launch(args: argparse.Namespace) -> int:
             return 127
         return 0  # exec does not return; this is for a test that replaces it. --no-sandbox never reaches the wall code
     tmp = tempfile.mkdtemp(prefix="ws-wall-")  # the wall's /tmp: the rest of the disk is read-only
+    created: list[tuple[str, str]] = []
+    project = ""
+    had_git = True
     try:
         project = project_folder(os.getcwd(), env)
+        had_git = os.path.lexists(Path(project) / ".git")
+        homes = private_homes(home, args.runner, pol, env)
+        locked, created = lock_project(project)
         wrapped = wrap(
             argv,
             pol,
             home,
             protected(policy_file, args.runner, args.protect),
             writable=writable_folders(pol, args.runner, project, tmp, args.allow_write or [], env),
-            locked=project_locked(project),
+            locked=locked,
+            homes=list(homes.values()),
             tty=sys.stdin.isatty(),
         )
-        return run_with_broker(wrapped.argv, launch_env(dict(os.environ), tmp), wrapped.pass_fds, approvals_dir(home))
+        return run_with_broker(
+            wrapped.argv, launch_env(dict(os.environ), tmp, homes), wrapped.pass_fds, approvals_dir(home)
+        )
     except SandboxError as e:
         raise WsError(
             "refused", f"refusing to start {args.runner} without its wall: {e}", "or `--no-sandbox`, which has none"
@@ -509,6 +767,9 @@ def cmd_launch(args: argparse.Namespace) -> int:
         print(f"ws: could not start {shlex.join(argv[:1])}: {e}", file=sys.stderr)
         return 127
     finally:
+        unlock_project(created)
+        if project and not had_git and os.path.lexists(Path(project) / ".git"):
+            print(NEW_REPO_NOTE, file=sys.stderr)
         shutil.rmtree(tmp, ignore_errors=True)
 
 

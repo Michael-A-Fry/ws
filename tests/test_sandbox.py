@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import os
 import struct
+import subprocess
 import sys
 from pathlib import Path
 
@@ -213,7 +214,7 @@ def test_the_project_folder_is_never_the_home_folder_or_above(tmp_path, home):
     assert sandbox.project_folder(str(home / "code" / "x"), env).endswith("/code/x")
 
 
-def test_the_allow_list_is_project_tmp_the_runners_folders_and_the_policy_extras(tmp_path, home):
+def test_the_allow_list_is_project_tmp_and_the_policy_extras_not_the_runners_real_folders(tmp_path, home):
     proj, tmp, extra = tmp_path / "proj", tmp_path / "tmp", home / "extra"
     for d in (proj, tmp, extra):
         d.mkdir(parents=True)
@@ -221,22 +222,188 @@ def test_the_allow_list_is_project_tmp_the_runners_folders_and_the_policy_extras
     env = {"HOME": str(home), "XDG_CACHE_HOME": str(tmp_path / "cache")}
     got = sandbox.writable_folders(pol, "opencode", str(proj), str(tmp), [str(tmp)], env)
     assert got[:2] == [str(proj), str(tmp)]
-    assert str(home / ".local" / "share" / "opencode") in got and str(tmp_path / "cache" / "opencode") in got
     assert str(extra) in got and str(tmp) in got  # --allow-write
-    assert not any(p.endswith(("missing", "nope")) for p in got)  # a folder that is not there is skipped
+    assert not any(p.endswith(("missing", "nope", "opencode")) for p in got)  # nothing the runner writes at home
     assert (home / ".config" / "opencode" / ".gitignore").is_file()  # what OpenCode would have made at start
 
 
-def test_the_projects_own_config_is_locked_when_it_exists(tmp_path):
+def test_a_runner_with_state_gets_private_xdg_folders_under_ws_home(tmp_path, home, wshome):
+    env = {"HOME": str(home), "XDG_DATA_HOME": str(tmp_path / "data")}
+    got = sandbox.private_homes(wshome, "opencode", POLICY, env)
+    base = wshome.resolve() / "wall" / "opencode"
+    assert got == {
+        "XDG_DATA_HOME": f"{base}/data",
+        "XDG_STATE_HOME": f"{base}/state",
+        "XDG_CACHE_HOME": f"{base}/cache",
+    }
+    assert all(os.path.isdir(p) for p in got.values()) and (wshome / "wall" / ".gitignore").read_text() == "*\n"
+    assert (wshome / "wall").stat().st_mode & 0o077 == 0
+    assert sandbox.private_homes(wshome, "claude-code", POLICY, env) == {}  # no wall_writable: nothing of its own
+
+
+def test_the_sign_in_is_copied_in_each_start_removed_when_gone_and_not_when_hidden(tmp_path, home, wshome):
+    real = home / ".local" / "share" / "opencode"
+    real.mkdir(parents=True)
+    (real / "auth.json").write_text("one")
+    env = {"HOME": str(home)}
+    seeded = Path(sandbox.private_homes(wshome, "opencode", POLICY, env)["XDG_DATA_HOME"]) / "opencode" / "auth.json"
+    assert seeded.read_text() == "one" and seeded.stat().st_mode & 0o777 == 0o600
+    (real / "auth.json").write_text("two")
+    sandbox.private_homes(wshome, "opencode", POLICY, env)
+    assert seeded.read_text() == "two"
+    hide = policy.loads('[gate]\ndeny_read = ["~/.local/share/opencode/**"]\n')
+    sandbox.private_homes(wshome, "opencode", hide, env)
+    assert not seeded.exists()  # deny_read wins over the convenience
+    sandbox.private_homes(wshome, "opencode", POLICY, env)
+    assert seeded.exists()
+    (real / "auth.json").unlink()
+    sandbox.private_homes(wshome, "opencode", POLICY, env)
+    assert not seeded.exists()
+
+
+def test_the_private_folders_are_bound_after_ws_home_and_allowed_on_macos(tmp_path, home, wshome):
+    (wshome / "policy.toml").write_text("")
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    priv = sandbox.private_homes(wshome, "opencode", POLICY, {"HOME": str(home)})
+    text = " ".join(wrapped(home, wshome, writable=[str(proj)], homes=list(priv.values())).argv)
+    ro, cache = f"--ro-bind {wshome.resolve()} {wshome.resolve()}", priv["XDG_CACHE_HOME"]
+    assert text.index(ro) < text.index(f"--bind {cache} {cache}")
+    prof = wrapped(home, wshome, system="darwin", which=which("sandbox-exec"), homes=list(priv.values())).argv[2]
+    assert prof.index(f'(deny file-write* (subpath "{wshome.resolve()}"))') < prof.index(
+        f'(allow file-write* (subpath "{cache}"))'
+    )
+
+
+def make_project(root: Path, *rel: str) -> Path:
+    for r in rel:
+        p = root / r
+        if r.endswith("/"):
+            p.mkdir(parents=True, exist_ok=True)
+        else:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("")
+    return root
+
+
+def repo(root: Path) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q", str(root)], check=True, capture_output=True)
+    return root
+
+
+def set_config(root: Path, key: str, value: str) -> None:
+    subprocess.run(["git", "-C", str(root), "config", key, value], check=True, capture_output=True)
+
+
+def test_the_projects_own_config_is_locked_when_it_exists_and_made_when_missing(tmp_path):
+    proj = make_project(tmp_path / "p", ".git/hooks/", ".git/config", ".claude/", "opencode.json")
+    locked, created = sandbox.lock_project(str(proj))
+    names = sorted(str(Path(p).relative_to(proj)) for p in locked)
+    assert {".git/hooks", ".git/config", ".claude", "opencode.json"} <= set(names)
+    assert ".git" not in names  # the folder itself is held by being an ancestor (see Plan.ancestors)
+    # what was missing was made: a folder, or a file with valid empty text; what was there was left alone
+    assert (proj / ".opencode").is_dir() and (proj / ".mcp.json").read_text() == '{"mcpServers": {}}\n'
+    assert (proj / ".opencode" / opencode.IGNORE).read_text() == opencode.IGNORE_TEXT  # what OpenCode writes at start
+    assert (proj / "opencode.json").read_text() == ""
+    made = sorted(str(Path(p).relative_to(proj)) for p, _ in created)
+    assert ".claude" not in made and "opencode.json" not in made
+    assert ".opencode" in made and ".git/config.worktree" in made
+    sandbox.unlock_project(created)
+    assert not (proj / ".opencode").exists() and not (proj / ".mcp.json").exists()
+    assert (proj / ".claude").is_dir() and (proj / "opencode.json").exists()
+
+
+def test_a_project_without_a_repository_leaves_git_alone_and_a_git_file_is_locked_itself(tmp_path):
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    locked, created = sandbox.lock_project(str(bare))
+    assert not any(".git" in Path(p).parts for p in [*locked, *(c for c, _ in created)])  # `git init` must keep working
+    sandbox.unlock_project(created)
+    assert list(bare.iterdir()) == []
+    pointer = tmp_path / "wt"
+    pointer.mkdir()
+    (pointer / ".git").write_text("gitdir: ../elsewhere\n")
+    locked, created = sandbox.lock_project(str(pointer))
+    assert str(pointer / ".git") in locked and not any(p.endswith((".git/hooks", ".git/config")) for p in locked)
+    sandbox.unlock_project(created)
+
+
+def test_a_folder_the_session_filled_is_not_removed_after_the_run(tmp_path):
     proj = tmp_path / "p"
-    (proj / ".git" / "hooks").mkdir(parents=True)
-    (proj / ".git" / "config").write_text("")
-    (proj / ".claude").mkdir()
-    assert sandbox.project_locked(str(proj)) == [
-        str(proj / ".git" / "hooks"),
-        str(proj / ".git" / "config"),
-        str(proj / ".claude"),
-    ]
+    proj.mkdir()
+    _, created = sandbox.lock_project(str(proj))
+    (proj / ".opencode" / "kept").write_text("x")  # as if a path were allowed to write
+    (proj / "opencode.json").write_text("changed")
+    sandbox.unlock_project(created)
+    assert (proj / ".opencode" / "kept").exists() and (proj / "opencode.json").read_text() == "changed"
+    assert not (proj / ".claude").exists()
+
+
+@pytest.mark.parametrize("name", [".claude", ".opencode", "opencode.json", ".mcp.json", ".git/hooks"])
+def test_a_locked_path_that_is_a_symbolic_link_is_refused(tmp_path, name):
+    proj = make_project(tmp_path / "p", ".git/config")
+    target = tmp_path / "real"
+    target.mkdir()
+    link = proj / name
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(target)
+    with pytest.raises(sandbox.SandboxError, match="symbolic link"):
+        sandbox.lock_project(str(proj))
+    assert link.is_symlink()  # nothing was changed on the way to refusing
+
+
+def test_git_facts_finds_the_hooks_folder_and_the_config_files_inside_the_project(tmp_path):
+    proj = repo(tmp_path / "p")
+    (proj / "local.gitconfig").write_text("[core]\n")
+    set_config(proj, "core.hooksPath", ".githooks")
+    set_config(proj, "include.path", "../local.gitconfig")
+    set_config(proj, "includeIf.gitdir:/x/.path", "../later.cfg")
+    hooks, files = sandbox.git_facts(str(proj))
+    real = proj.resolve()
+    assert hooks == f"{real}/.githooks"
+    assert f"{real}/local.gitconfig" in files and f"{real}/.git/config" in files
+    assert f"{real}/later.cfg" in files  # named though it is not there and its condition is false
+    set_config(proj, "core.hooksPath", str(tmp_path / "outside"))
+    assert sandbox.git_facts(str(proj))[0] is None  # a hooks folder outside the project is read-only already
+    assert sandbox.git_facts(str(tmp_path)) == (None, [])  # not a repository
+
+
+def test_the_hooks_folder_and_includes_are_made_if_missing_and_removed_after(tmp_path):
+    proj = repo(tmp_path / "p")
+    set_config(proj, "core.hooksPath", ".husky/_")
+    set_config(proj, "include.path", "../local.gitconfig")
+    locked, created = sandbox.lock_project(str(proj))
+    assert str(proj.resolve() / ".husky" / "_") in locked and str(proj.resolve() / "local.gitconfig") in locked
+    sandbox.unlock_project(created)
+    assert not (proj / ".husky").exists() and not (proj / "local.gitconfig").exists()
+
+
+def test_submodule_repositories_are_found_with_their_nested_ones(tmp_path):
+    git_dir = tmp_path / ".git"
+    for rel in ("modules/a", "modules/a/modules/b", "modules/x/y"):
+        (git_dir / rel / "hooks").mkdir(parents=True)
+        (git_dir / rel / "HEAD").write_text("")
+        (git_dir / rel / "config").write_text("")
+    (git_dir / "modules" / "a" / "objects").mkdir()
+    got = sandbox.submodule_repos(git_dir)
+    for rel in ("a", "a/modules/b", "x/y"):
+        assert str(git_dir / "modules" / rel / "hooks") in got and str(git_dir / "modules" / rel / "config") in got
+
+
+def test_the_folders_above_a_locked_path_are_mount_points_so_they_cannot_be_renamed(tmp_path):
+    proj = make_project(tmp_path / "p", ".git/hooks/", ".git/config", ".husky/_/")
+    hooks, config, husky = (str(proj / ".git" / "hooks"), str(proj / ".git" / "config"), str(proj / ".husky" / "_"))
+    plan = sandbox.Plan(tmp_path / "wshome", writable=(str(proj),), locked=(hooks, config, husky))
+    real = proj.resolve()
+    assert plan.ancestors() == [f"{real}/.git", f"{real}/.husky"]  # not the project (bound already), not .git/hooks
+    text = " ".join(sandbox.bwrap_argv(["x"], plan, False, 9))
+    assert text.index(f"--bind {real}/.git {real}/.git") < text.index(f"--ro-bind {real}/.git/hooks")
+    assert text.index(f"--bind {real}/.husky {real}/.husky") < text.index(f"--ro-bind {real}/.husky/_")
+    prof = sandbox.sandbox_exec_profile(plan)
+    assert f'(deny file-write* (literal "{real}/.git"))' in prof
+    assert f'(deny file-write* (literal "{real}/.husky"))' in prof
+    assert f'(literal "{real}"))' not in prof and f'(deny file-write* (subpath "{real}/.git/hooks"))' in prof
 
 
 def test_allow_write_in_the_policy_is_checked_and_reaches_the_claude_settings(tmp_path):
@@ -331,6 +498,22 @@ def test_launch_wraps_the_runner_marks_the_session_and_keeps_the_broker_beside_i
     argv, e, root = env[0]
     assert argv == ["wall", "opencode", "run"] and e["WS_GATED_SESSION"] == "1"
     assert root == wshome.absolute() / "approvals"
+
+
+def test_launch_gives_the_runner_private_xdg_folders_and_locks_the_project(env, monkeypatch, wshome, tmp_path):
+    seen = {}
+    monkeypatch.setattr(sandbox, "wrap", lambda argv, *a, **k: seen.update(k) or sandbox.Wrapped(["wall", *argv]))
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    monkeypatch.chdir(proj)
+    assert cli.main(["gate", "launch", "--runner", "opencode", "--", "opencode"]) == 0
+    _, e, _ = env[0]
+    base = wshome.resolve() / "wall" / "opencode"
+    assert e["XDG_DATA_HOME"] == f"{base}/data" and e["XDG_STATE_HOME"] == f"{base}/state"
+    assert e["XDG_CACHE_HOME"] == f"{base}/cache"
+    assert set(seen["homes"]) == {f"{base}/data", f"{base}/state", f"{base}/cache"}
+    assert str(proj.resolve() / ".claude") in seen["locked"]  # the placeholder was there for the wall to hold
+    assert not (proj / ".claude").exists()  # and is gone once the run has ended
 
 
 def test_launch_fails_closed_when_the_wall_cannot_be_built(env, monkeypatch, capsys):

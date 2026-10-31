@@ -75,6 +75,7 @@ CASES: dict[str, list[str]] = {
     "approve": ["approve", "--list"],
     "config": ["config"],
     "status": ["status"],
+    "version": ["version"],
     "eval.run": ["eval", "run", "--set", "starter", "--dry-run"],
     "eval.report": ["eval", "report"],
     "eval.compare": ["eval", "compare", "a", "b"],

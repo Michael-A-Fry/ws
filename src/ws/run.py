@@ -17,6 +17,12 @@ own timeout and turns allow, so keep `timeout_s` and `max_turns` tight. A run wh
 counts at the person's own fallback ([roles.budget] fallback_usd_per_mtok, else unknown_run_usd), so spend is
 never undercounted. ws ships no prices.
 
+One recovery per known failure: a small table (`RECOVERIES`) names the failures ws can mend, each typed by the
+exception class that reports it, never by its message. Today that is the broker not answering when a secret is leased:
+ws starts a per-user broker once (or, for a broker it does not own, waits and asks again once). Each try is written to
+the record's `recovered` list as {kind, action, ok}; if the failure comes back, the run ends as an error and says so.
+The job may also declare `green`, what its verification covers; the record carries it.
+
 Exit: 0 ok, 1 the runner failed or timed out, 2 the job could not be read (a record is written when the job name is
 safe), 3 refused.
 """
@@ -37,7 +43,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-from ws import __version__, adapters, broker, gate, jobs, output, policy, runrecord
+from ws import __version__, adapters, broker, gate, jobs, jsonl, output, policy, runrecord, selfcmd
 from ws import secrets as wsecrets
 from ws.output import WsError
 from ws.profile import ProfileError, load, profile_path, ws_home
@@ -47,6 +53,8 @@ PASS_ENV = ("PATH", "HOME", "LANG", "TZ", "TERM")
 EXIT_FAILED, EXIT_BAD_JOB, EXIT_REFUSED = 1, 2, 3
 OUTPUT_CAP = 32 * 1024 * 1024  # bytes kept of each of stdout and stderr; the rest is read and dropped
 TERM_GRACE_S = 3.0  # how long a runner has to stop after SIGTERM before its whole group gets SIGKILL
+BROKER_START_S = 5.0  # how long a broker ws just started has to answer
+RECOVERY_WAIT_S = 2.0  # how long to wait before asking a broker ws does not own a second time
 _PLAN_LEASE = broker.Lease(lease="plan", base_url="http://127.0.0.1:0/l/PLAN", header="x-api-key", expires_at="")
 
 
@@ -80,6 +88,77 @@ def _budget(prof: dict) -> tuple[float | None, float | None, float | None]:
     roles = prof.get("roles") if isinstance(prof.get("roles"), dict) else {}
     cfg = roles.get("budget") if isinstance(roles.get("budget"), dict) else {}
     return _number(cfg, "monthly_cap_usd"), _number(cfg, "unknown_run_usd"), _number(cfg, "fallback_usd_per_mtok")
+
+
+def _start_broker(sock: Path) -> bool:
+    """Start a per-user broker on `sock` (it clears a stale socket file itself) and wait for it to answer.
+
+    It runs isolated (`selfcmd.argv`), in ws's home and with the runner's scrubbed environment plus WS_HOME, never the
+    project folder's `ws/`. It is left running on purpose, so the next run finds it, in its own session; its stderr goes
+    to `logs/broker-start.log`. Started from a systemd oneshot unit (a timer's job), the unit's kill mode ends it with
+    the unit; that is fine, the next run starts it again."""
+    home = ws_home().absolute()
+    try:
+        logs = home / "logs"
+        logs.mkdir(mode=0o700, parents=True, exist_ok=True)
+        err_fd = os.open(logs / "broker-start.log", os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            subprocess.Popen(
+                [*selfcmd.argv(), "broker", "serve", "--socket", str(sock)],
+                env=_child_env(home, {}), cwd=home,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=err_fd, start_new_session=True,
+            )  # fmt: skip
+        finally:
+            os.close(err_fd)
+    except OSError:
+        return False
+    deadline = time.monotonic() + BROKER_START_S
+    while time.monotonic() < deadline:
+        try:
+            broker.status(sock, timeout=1.0)
+            return True
+        except broker.BrokerError:
+            time.sleep(0.1)
+    return False
+
+
+def _mend_broker(sock: Path, err: broker.BrokerUnavailable) -> tuple[str, bool]:
+    """(what ws did, whether the broker answers now). Only a broker that is not running (no socket file, or nothing
+    listening on it), on a socket in this user's own run folder, is one ws may start. Any other trouble (a timeout, no
+    permission, a bad reply) or any other socket (the walled service, one the profile names) is not ws's to start, so it
+    waits and looks again."""
+    if err.not_running and sock == ws_home().absolute() / "run" / "broker.sock":
+        return "started the broker", _start_broker(sock)
+    time.sleep(RECOVERY_WAIT_S)
+    try:
+        broker.status(sock, timeout=2.0)
+    except broker.BrokerError:
+        return "waited and asked again", False
+    return "waited and asked again", True
+
+
+# The known failures ws mends once, keyed by the exception class that reports each (a subclass counts): (kind, what to do
+# about it, given the socket and the exception). A new
+# row is a typed error that something in ws already raises, and a fix that is safe to try without asking.
+RECOVERIES = {broker.BrokerUnavailable: ("broker_unavailable", _mend_broker)}
+
+
+def _lease(s: jobs.SecretUse, sock: Path, rec: dict) -> broker.Lease:
+    """Lease one secret. A failure in `RECOVERIES` is mended once per run and the lease asked for again; a second
+    failure (or a failed fix) is raised as it is, and the run ends as an error."""
+    try:
+        return broker.request(s.name, s.purpose, s.host, socket=sock)
+    except tuple(RECOVERIES) as e:
+        if isinstance(e, broker.SocketPathTooLong):
+            raise  # nothing to mend: starting or waiting for a broker does not shorten the path
+        kind, mend = next(v for k, v in RECOVERIES.items() if isinstance(e, k))
+        if any(r["kind"] == kind for r in rec["recovered"]):
+            raise
+        action, ok = mend(sock, e)
+        rec["recovered"].append({"kind": kind, "action": action, "ok": ok})
+        if not ok:
+            raise
+    return broker.request(s.name, s.purpose, s.host, socket=sock)
 
 
 def _rule_label(v: policy.Verdict) -> str:
@@ -213,6 +292,7 @@ def _base_record(job: jobs.Job, run_id: str, started: datetime, pol: policy.Poli
         policy={"dial": pol.dial, "rule_of_two": _rule_label(verdict)},
         ws_version=__version__,
         allow_unpriced=job.allow_unpriced,
+        green=job.green,
     )
 
 
@@ -233,13 +313,33 @@ def _refusal(prof: dict, verdict: policy.Verdict, spend: float, job: jobs.Job, a
 
 
 def _append(log: Path, rec: dict) -> bool:
-    """Write the record. False (after saying why) when the log cannot be written."""
+    """Write the record. A log that cannot be written (its lock held, the disk full) gets the record in the fallback
+    file instead, with a warning, and that counts as written: the spend is in `runs.fallback.jsonl`, which `read` and
+    the cap check include. False (after saying why) only when the fallback fails too."""
     try:
-        runrecord.append(log, rec)
+        where = runrecord.append(log, rec)
     except OSError as e:
         print(f"ws: could not write the record to {log}: {e.strerror or type(e).__name__}", file=sys.stderr)
         return False
+    if where != log:
+        print(f"ws: {log.name} could not be written; the record is in {where} (`ws runs` lists it)", file=sys.stderr)
     return True
+
+
+def _lock_reason(log: Path) -> str | None:
+    """Why a run must be refused because the log's lock is held, else None. A session can leave a process holding the
+    lock it can read; a run that went ahead would then be recorded only in the fallback, so it is refused instead."""
+    try:
+        runrecord.probe(log)
+    except jsonl.LockTimeout:
+        lock = log.with_name(log.name + ".lock")
+        return (
+            f"another process is holding the lock on the run log ({lock}), so this run could not be recorded; "
+            f"`fuser {lock}` or `lsof {lock}` shows which, stop it and run again"
+        )
+    except OSError:
+        return None  # a log that cannot be opened at all is reported by the read below
+    return None
 
 
 def _refuse(rec: dict, reason: str, path: Path) -> int:
@@ -271,6 +371,7 @@ def _bad_job(name: str, message: str, log: Path, job: jobs.Job | None = None, re
         error=_short(message, []),
         ws_version=__version__,
         allow_unpriced=bool(job and job.allow_unpriced),
+        green=job.green if job else None,
     )
     if _append(log, rec):
         print(f"ws: recorded as {rec['run_id']}", file=sys.stderr)
@@ -337,13 +438,18 @@ def _run(args: argparse.Namespace) -> int:
     if not stdin:
         argv = [*argv, "--", job.prompt]
     _, unknown_run_usd, fallback_usd_per_mtok = _budget(prof)
+    lock_reason = _lock_reason(log)  # first: a lock held by another process would stall the read below as well
     try:
-        spend = runrecord.month_spend(runrecord.read(log), started, unknown_run_usd, fallback_usd_per_mtok)
+        spend = (
+            0.0
+            if lock_reason
+            else runrecord.month_spend(runrecord.read(log), started, unknown_run_usd, fallback_usd_per_mtok)
+        )
     except OSError as e:
         print(f"ws: cannot read {log}: {e.strerror or type(e).__name__}", file=sys.stderr)
         return EXIT_FAILED
     verdict = policy.rule_of_two(pol, list(job.sources), job.name, shell=getattr(adapter, "HAS_SHELL", True))
-    reason = _refusal(prof, verdict, spend, job, adapter)
+    reason = lock_reason or _refusal(prof, verdict, spend, job, adapter)
     rec = _base_record(job, run_id, started, pol, verdict)
     child_env = _child_env(home, extra)
     if args.dry_run:
@@ -378,10 +484,10 @@ def _execute(job, adapter, pol, rec: dict, run_dir: Path, cwd: Path, log: Path, 
         cwd.mkdir(parents=True, exist_ok=True)
         rec["cwd"] = str(cwd)
         policy_file = policy.policy_path().absolute()
-        files = adapter.generate(pol, [sys.executable, "-m", "ws"], run_dir / "gate", policy_file)
+        files = adapter.generate(pol, selfcmd.argv(), run_dir / "gate", policy_file)
         gate.write_files(run_dir / "gate", files)
         for s in job.secrets:
-            leases.append(broker.request(s.name, s.purpose, s.host, socket=sock))
+            leases.append(_lease(s, sock, rec))
             rec["secrets_used"].append({"name": s.name, "host": s.host})
         argv, extra = adapter.build_command(job, run_dir, leases[0] if leases else None)
         child_env = _child_env(ws_home().absolute(), extra)
@@ -412,7 +518,9 @@ def _execute(job, adapter, pol, rec: dict, run_dir: Path, cwd: Path, log: Path, 
     except broker.BrokerRefused as e:
         rec.update(status="refused", error=_short(f"broker refused the secret: {e}", leases))
     except broker.BrokerUnavailable as e:
-        rec.update(status="error", error=_short(str(e), leases))
+        tried = f" (ws already {rec['recovered'][-1]['action']}, once)" if rec["recovered"] else ""
+        rec.update(status="error", error=_short(f"{e}{tried}; {broker._hint(e)}", leases, 300))
+
     except Exception as e:  # noqa: BLE001 (whatever went wrong, the run still gets its record)
         rec.update(status="error", error=_short(f"{type(e).__name__}: {e}", leases))
     finally:
@@ -450,6 +558,13 @@ def cmd_runs(args: argparse.Namespace) -> int:
         recs = runrecord.read(log)[-args.last :]
     except OSError as e:
         raise WsError("io", f"cannot read {log}: {e.strerror or type(e).__name__}", exit_code=EXIT_FAILED) from e
+    pending = runrecord.fallback_count(log)
+    if pending:
+        print(
+            f"ws: {pending} record(s) are in {runrecord.fallback_path(log)}: the run log could not be written when they "
+            "finished (another process held its lock). They count towards the cap; look into what held the lock.",
+            file=sys.stderr,
+        )
     if args.json:
         output.result(recs)
         return 0

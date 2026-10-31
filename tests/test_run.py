@@ -9,6 +9,7 @@ from __future__ import annotations
 import _thread
 import json
 import os
+import shutil
 import signal
 import stat
 import subprocess
@@ -85,9 +86,14 @@ class Leases:
         self.requested: list[tuple] = []
         self.released: list[str] = []
         self.refuse: broker.BrokerError | None = None
+        self.unavailable_times = 0  # the next N requests find no broker
+        self.not_running = True  # ... and it is really not running (not a timeout, a permission error or a bad reply)
 
     def request(self, name, purpose, host, socket=None, ttl_s=None):
         self.requested.append((name, purpose, host))
+        if self.unavailable_times > 0:
+            self.unavailable_times -= 1
+            raise broker.BrokerUnavailable("no broker answering", not_running=self.not_running)
         if self.refuse:
             raise self.refuse
         return broker.Lease(
@@ -135,6 +141,9 @@ def ws(tmp_path, monkeypatch):
     monkeypatch.delenv("WS_BROKER_SOCKET", raising=False)
     monkeypatch.setattr(broker, "request", w.leases.request)
     monkeypatch.setattr(broker, "release", w.leases.release)
+    w.started = []  # sockets ws was asked to start a broker on
+    monkeypatch.setattr(run, "_start_broker", lambda sock: w.started.append(sock) or False)  # never a real broker
+    monkeypatch.setattr(run, "RECOVERY_WAIT_S", 0)
     w.cap(20)
     return w
 
@@ -343,6 +352,202 @@ def test_no_broker_is_an_error_not_a_refusal(ws):
     ws.job()
     assert cli.main(["run", "daily"]) == 1
     assert valid(ws.records()[0])["status"] == "error"
+
+
+# --- one recovery per known failure ------------------------------------------------------------------------------
+
+
+def test_a_broker_that_is_down_is_started_once_and_the_lease_asked_for_again(ws, monkeypatch):
+    ws.leases.unavailable_times = 1
+    monkeypatch.setattr(run, "_start_broker", lambda sock: ws.started.append(sock) or True)
+    ws.job()
+    assert cli.main(["run", "daily"]) == 0
+    (rec,) = ws.records()
+    valid(rec)
+    assert rec["status"] == "ok" and rec["secrets_used"] == [{"name": "anthropic", "host": "api.anthropic.com"}]
+    assert rec["recovered"] == [{"kind": "broker_unavailable", "action": "started the broker", "ok": True}]
+    assert ws.started == [ws.home.absolute() / "run" / "broker.sock"]
+    assert len(ws.leases.requested) == 2 and ws.leases.released == ["lease2"]
+
+
+def test_a_broker_that_will_not_start_ends_the_run_with_the_typed_error_and_its_hint(ws, capsys):
+    ws.leases.unavailable_times = 5
+    ws.job()
+    assert cli.main(["run", "daily"]) == 1
+    (rec,) = ws.records()
+    valid(rec)
+    assert rec["status"] == "error" and "no broker answering" in rec["error"] and "ws doctor" in rec["error"]
+    assert rec["recovered"] == [{"kind": "broker_unavailable", "action": "started the broker", "ok": False}]
+    assert len(ws.leases.requested) == 1  # it did not ask again after a fix that failed
+    assert not (ws.home / "fake-saw.json").exists()  # the runner never started
+    assert "ws doctor" in capsys.readouterr().err
+
+
+def test_a_failure_that_comes_back_after_the_fix_is_tried_only_once(ws, monkeypatch):
+    ws.leases.unavailable_times = 5
+    monkeypatch.setattr(run, "_start_broker", lambda sock: ws.started.append(sock) or True)
+    ws.job()
+    assert cli.main(["run", "daily"]) == 1
+    (rec,) = ws.records()
+    valid(rec)
+    assert rec["status"] == "error" and "already started the broker, once" in rec["error"]
+    assert rec["recovered"] == [{"kind": "broker_unavailable", "action": "started the broker", "ok": True}]
+    assert len(ws.leases.requested) == 2 and len(ws.started) == 1
+
+
+def test_a_broker_ws_does_not_own_is_waited_for_not_started(ws, monkeypatch, tmp_path):
+    monkeypatch.setenv("WS_BROKER_SOCKET", str(tmp_path / "elsewhere.sock"))
+    monkeypatch.setattr(broker, "status", lambda socket=None, timeout=3.0: {"leases": 0})  # it is up again
+    ws.leases.unavailable_times = 1
+    ws.job()
+    assert cli.main(["run", "daily"]) == 0
+    (rec,) = ws.records()
+    assert rec["recovered"] == [{"kind": "broker_unavailable", "action": "waited and asked again", "ok": True}]
+    assert ws.started == []
+
+
+def test_a_broker_that_is_there_but_not_answering_properly_is_never_started_over(ws, monkeypatch):
+    """A timeout, a permission error or a bad reply is not "not running": starting a second broker would not help."""
+    ws.leases.unavailable_times = 1
+    ws.leases.not_running = False
+    monkeypatch.setattr(broker, "status", lambda socket=None, timeout=3.0: {"leases": 0})
+    ws.job()
+    assert cli.main(["run", "daily"]) == 0
+    (rec,) = ws.records()
+    assert rec["recovered"] == [{"kind": "broker_unavailable", "action": "waited and asked again", "ok": True}]
+    assert ws.started == []
+
+
+def test_a_subclass_of_a_known_failure_is_mended_too(ws, monkeypatch):
+    class Slow(broker.BrokerUnavailable):
+        pass
+
+    real = ws.leases.request
+
+    def request(*a, **kw):
+        if not ws.leases.requested:
+            ws.leases.requested.append(("anthropic", "run", "api.anthropic.com"))
+            raise Slow("slow", not_running=True)
+        return real(*a, **kw)
+
+    monkeypatch.setattr(broker, "request", request)
+    monkeypatch.setattr(run, "_start_broker", lambda sock: ws.started.append(sock) or True)
+    ws.job()
+    assert cli.main(["run", "daily"]) == 0
+    assert ws.records()[0]["recovered"][0]["kind"] == "broker_unavailable" and len(ws.started) == 1
+
+
+def test_the_broker_client_says_when_nothing_is_running_and_when_it_is_something_else(request):
+    import socket as pysocket
+    import tempfile
+    import threading
+
+    short = Path(tempfile.mkdtemp(prefix="wsb", dir="/tmp"))  # a Unix socket path tops out near 100 characters
+    request.addfinalizer(lambda: shutil.rmtree(short, ignore_errors=True))
+    tmp_path = short
+    missing = tmp_path / "none.sock"
+    with pytest.raises(broker.BrokerUnavailable) as e:
+        broker.status(missing)
+    assert e.value.not_running is True  # no socket file
+
+    stale = tmp_path / "stale.sock"
+    s = pysocket.socket(pysocket.AF_UNIX)
+    s.bind(str(stale))
+    s.close()  # the file is left behind with nothing listening
+    with pytest.raises(broker.BrokerUnavailable) as e:
+        broker.status(stale)
+    assert e.value.not_running is True
+
+    live = tmp_path / "live.sock"
+    srv = pysocket.socket(pysocket.AF_UNIX)
+    srv.bind(str(live))
+    srv.listen(4)
+    replies = [b"not json\n", None]  # a bad reply, then silence
+
+    def serve():
+        for reply in replies:
+            conn, _ = srv.accept()
+            conn.recv(4096)
+            if reply:
+                conn.sendall(reply)
+            else:
+                threading.Event().wait(1.0)
+            conn.close()
+
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    with pytest.raises(broker.BrokerUnavailable) as e:
+        broker.status(live, timeout=2.0)
+    assert e.value.not_running is False  # it answered, badly
+    with pytest.raises(broker.BrokerUnavailable) as e:
+        broker.status(live, timeout=0.2)
+    assert e.value.not_running is False  # a timeout
+    t.join(timeout=5)
+    srv.close()
+
+
+def test_a_refusal_is_not_a_known_failure(ws):
+    ws.leases.refuse = broker.BrokerRefused("host_not_allowed", "no")
+    ws.job()
+    assert cli.main(["run", "daily"]) == 3
+    assert ws.records()[0]["recovered"] == [] and ws.started == []
+
+
+def test_the_table_is_keyed_by_exception_class_not_message():
+    assert all(isinstance(k, type) and issubclass(k, Exception) for k in run.RECOVERIES)
+    assert broker.BrokerUnavailable in run.RECOVERIES
+
+
+# --- green levels ------------------------------------------------------------------------------------------------
+
+
+def test_the_job_declares_what_its_verification_covers_and_the_record_says_so(ws):
+    ws.job(extra='green = "package"')
+    assert cli.main(["run", "daily"]) == 0
+    assert valid(ws.records()[0])["green"] == "package"
+
+
+def test_green_is_null_when_the_job_says_nothing_and_a_refusal_keeps_it(ws):
+    ws.job()
+    cli.main(["run", "daily"])
+    assert valid(ws.records()[0])["green"] is None
+    ws.cap(0.0001)
+    ws.job(name="other", extra='green = "full"')
+    cli.main(["run", "other"])
+    assert valid(ws.records()[-1])["green"] == "full"
+
+
+def test_a_bad_green_level_is_a_bad_job_with_a_record(ws, capsys):
+    ws.job(extra='green = "great"')
+    assert cli.main(["run", "daily"]) == 2
+    assert "green must be one of targeted, package, full, merge_ready" in capsys.readouterr().err
+    assert valid(ws.records()[0])["green"] is None
+
+
+def test_the_schema_knows_the_levels_the_job_file_and_the_record_share():
+    assert jobs.GREEN_LEVELS == runrecord.GREEN_LEVELS
+    levels = runrecord.schema()["properties"]["green"]["enum"]
+    assert levels == [*runrecord.GREEN_LEVELS, None]
+    assert not VALIDATOR.is_valid({**runrecord.new(), "green": "great"})
+
+
+def test_the_log_rotates_and_ws_runs_and_the_budget_read_across_the_files(ws, monkeypatch, capsys):
+    from ws import jsonl
+
+    ws.job()
+    for _ in range(4):
+        assert cli.main(["run", "daily"]) == 0
+        capsys.readouterr()
+    line = len(ws.log.read_text(encoding="utf-8").splitlines()[0]) + 1
+    monkeypatch.setattr(jsonl, "DEFAULT_MAX_BYTES", line * 2 + 10)
+    monkeypatch.setattr(jsonl, "DEFAULT_KEEP", 1)
+    for _ in range(4):
+        assert cli.main(["run", "daily"]) == 0
+        capsys.readouterr()
+    assert (ws.log.parent / "runs.jsonl.1").exists()
+    assert len(ws.records()) == 8, "this month's records are kept past the limit, so the spend is never undercounted"
+    assert cli.main(["--json", "runs", "--last", "8"]) == 0
+    assert len(json.loads(capsys.readouterr().out)["data"]) == 8
 
 
 # --- how a run can end -------------------------------------------------------------------------------------------
@@ -1021,3 +1226,142 @@ def test_the_schema_as_json_is_a_valid_schema_and_matches():
     text = runrecord.schema_json()
     jsonschema.Draft202012Validator.check_schema(json.loads(text))
     assert json.loads(text) == runrecord.schema()
+
+
+# --- a lock held to stall the log must not hide spend ------------------------------------------------------------
+
+HOLD = (
+    "import fcntl, os, sys\n"
+    "os.makedirs(os.path.dirname(sys.argv[1]), exist_ok=True)\n"
+    "fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)\n"
+    "fcntl.flock(fd, fcntl.LOCK_SH if sys.argv[2] == 'shared' else fcntl.LOCK_EX)\n"
+    "print('held', flush=True)\n"
+    "sys.stdin.read()\n"
+)
+
+
+@pytest.fixture
+def lock_held(ws, monkeypatch):
+    """Another process (as a session's background process could) holds the run log's lock until the test ends."""
+    from ws import jsonl
+
+    monkeypatch.setattr(jsonl, "LOCK_TIMEOUT_S", 0.3)
+    procs = []
+
+    def hold(mode: str) -> None:
+        lock = str(ws.log.parent / "runs.jsonl.lock")
+        p = subprocess.Popen(
+            [sys.executable, "-I", "-c", HOLD, lock, mode],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+        )  # fmt: skip
+        procs.append(p)
+        assert p.stdout.readline().strip() == "held"
+
+    yield hold
+    for p in procs:
+        p.stdin.close()
+        p.wait(timeout=30)
+        p.stdout.close()
+
+
+@pytest.mark.parametrize("mode", ["shared", "exclusive"])
+def test_a_lock_held_by_another_process_refuses_the_run_and_the_refusal_is_still_recorded(ws, lock_held, capsys, mode):
+    ws.job()
+    lock_held(mode)
+    assert cli.main(["run", "daily"]) == 3
+    err = capsys.readouterr().err
+    lock = str(ws.log.parent / "runs.jsonl.lock")
+    assert "holding the lock" in err and lock in err and "fuser" in err and "lsof" in err
+    assert not (ws.home / "fake-saw.json").exists(), "the runner started although the run could not be recorded"
+    assert not ws.log.exists() or ws.log.read_text() == ""  # nothing could go into the locked log
+    fb = runrecord.fallback_path(ws.log)
+    (rec,) = [json.loads(line) for line in fb.read_text().splitlines()]
+    assert valid(rec)["status"] == "refused" and "lock" in rec["error"]
+    if mode == "shared":  # an exclusive holder would stall this read too, which is why the run was refused
+        assert [r["run_id"] for r in ws.records()] == [rec["run_id"]]  # read() includes the fallback
+
+
+def test_a_dry_run_with_the_lock_held_says_it_would_refuse_and_writes_nothing(ws, lock_held, capsys):
+    ws.job()
+    lock_held("shared")
+    assert cli.main(["run", "daily", "--dry-run"]) == 3
+    assert "holding the lock" in json.loads(capsys.readouterr().out)["would_refuse"]
+    assert not runrecord.fallback_path(ws.log).exists()
+
+
+def test_a_probe_with_no_lock_file_yet_writes_nothing(ws, capsys):
+    ws.job()
+    assert cli.main(["run", "daily", "--dry-run"]) == 0
+    assert not (ws.home / "logs").exists()
+
+
+def test_a_record_that_cannot_be_written_goes_to_the_fallback_and_still_counts_towards_the_cap(ws, monkeypatch, capsys):
+    from ws import jsonl
+
+    real = jsonl.append
+
+    def broken(*a, **kw):
+        raise jsonl.LockTimeout("runs.jsonl.lock has been locked for 10 s by another process")
+
+    ws.job()
+    monkeypatch.setattr(jsonl, "append", broken)
+    assert cli.main(["run", "daily"]) == 0  # the run itself was fine, and its record is safe
+    err = capsys.readouterr().err
+    assert "runs.fallback.jsonl" in err
+    (rec,) = [json.loads(line) for line in runrecord.fallback_path(ws.log).read_text().splitlines()]
+    assert valid(rec)["status"] == "ok" and rec["cost_usd"] == 0.00021
+    monkeypatch.setattr(jsonl, "append", real)
+    assert not ws.log.exists()
+    spend = runrecord.month_spend(ws.records(), datetime.now(UTC))
+    assert spend == pytest.approx(0.00021)
+    ws.cap(0.0001)  # below what that one run cost: the next run must be refused on the strength of the fallback alone
+    assert cli.main(["run", "daily"]) == 3
+    assert "monthly cap" in capsys.readouterr().err
+
+
+def test_ws_runs_says_when_records_are_waiting_in_the_fallback(ws, monkeypatch, capsys):
+    from ws import jsonl
+
+    ws.job()
+    monkeypatch.setattr(jsonl, "append", lambda *a, **kw: (_ for _ in ()).throw(OSError("full")))
+    assert cli.main(["run", "daily"]) == 0
+    capsys.readouterr()
+    assert cli.main(["runs"]) == 0
+    out = capsys.readouterr()
+    assert "1 record(s) are in" in out.err and "runs.fallback.jsonl" in out.err
+    assert "daily" in out.out
+
+
+def test_both_the_log_and_the_fallback_failing_is_a_failed_run_with_a_message(ws, monkeypatch, capsys):
+    from ws import jsonl
+
+    def boom(*a, **kw):
+        raise OSError("disk full")
+
+    ws.job()
+    monkeypatch.setattr(jsonl, "append", boom)
+    monkeypatch.setattr(jsonl, "append_plain", boom)
+    assert cli.main(["run", "daily"]) == 1
+    assert "could not write the record" in capsys.readouterr().err
+
+
+def test_a_socket_path_that_is_too_long_is_its_own_typed_case_with_a_hint(tmp_path, capsys):
+    long = tmp_path / ("d" * 120) / "broker.sock"
+    with pytest.raises(broker.SocketPathTooLong) as e:
+        broker.status(long)
+    assert isinstance(e.value, broker.BrokerUnavailable) and e.value.not_running is False
+    assert str(broker.UNIX_PATH_MAX - 1) in str(e.value) and "WS_BROKER_SOCKET" in e.value.hint
+    with pytest.raises(broker.SocketPathTooLong):
+        broker.Broker(long, tmp_path / "secrets.toml", None)._bind_unix()
+    assert cli.main(["broker", "status", "--socket", str(long)]) == 1
+    err = capsys.readouterr().err
+    assert "limit is" in err and "shorter WS_HOME" in err
+
+
+def test_a_run_whose_socket_path_is_too_long_ends_with_the_hint_and_tries_no_recovery(ws, monkeypatch, tmp_path):
+    monkeypatch.setenv("WS_BROKER_SOCKET", str(tmp_path / ("d" * 120) / "b.sock"))
+    monkeypatch.setattr(broker, "request", lambda *a, **kw: broker.check_socket_path(os.environ["WS_BROKER_SOCKET"]))
+    ws.job()
+    assert cli.main(["run", "daily"]) == 1
+    (rec,) = ws.records()
+    assert rec["recovered"] == [] and "shorter WS_HOME" in rec["error"] and ws.started == []

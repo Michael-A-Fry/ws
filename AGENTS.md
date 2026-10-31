@@ -50,6 +50,7 @@ LICENSES/         third-party licence texts (see NOTICE)
 | `globals.py` | `ws globals`: what ws installs globally stays global |
 | `install.py` | `ws install` and `ws uninstall`: one setup engine that the terminal command and the setup... |
 | `jobs.py` | Job files: `$WS_HOME/jobs/<name>.toml`, one headless job each, run with `ws run <name>` |
+| `jsonl.py` | Bounded JSONL logs: one line per record, rotated at a size, with any one string field capped |
 | `mcp_server.py` | `ws mcp serve`: a small MCP server over stdio, so any runner can search and add to memory and... |
 | `memory.py` | Memory module: Markdown files with front matter in a git repo, plus a rebuildable SQLite FTS5 index |
 | `modules.py` | Plugins (the modules in the code): the parts of ws you can switch on or off |
@@ -66,10 +67,12 @@ LICENSES/         third-party licence texts (see NOTICE)
 | `runschema.py` | The JSON Schema (draft 2020-12) of a run record, as a Python dict: `ws secret wall` copies only... |
 | `sandbox.py` | The sandbox as the real wall: `ws gate launch --runner R -- argv` starts a runner inside an... |
 | `secrets.py` | The secrets registry and store, and `ws secret` |
+| `selfcmd.py` | How ws starts itself with this Python: `python -I -m ws`, so a folder named `ws/` in the working... |
 | `session.py` | `ws session`: tell a long-running session once when ws has been updated under it |
 | `setup_ui/` | `ws setup`: the first-run and re-run setup, inline in your terminal (default) or in a page in... |
 | `skills/` | The skills ws ships (`align`, `checkpoint`, `taste-gate`, `dataviz`) and how they get onto a machine |
 | `status.py` | `ws status`: for each runner, every rules, skill, hook and MCP file it will load here, with... |
+| `testing/` | Test support that ships with ws: the mock model provider and its scenarios |
 | `usage.py` | The Console usage check: can ws read the provider's own usage report, the billing truth... |
 
 <!-- code-map:end -->

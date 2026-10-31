@@ -440,7 +440,7 @@ def _report(rec: dict, log: Path) -> None:
     if rec["output_truncated"]:
         print(f"ws: the runner's output was cut at {OUTPUT_CAP // (1024 * 1024)} MiB", file=sys.stderr)
     print(f"ws: record in {log}" + (f"; transcript {rec['transcript_path']}" if rec["transcript_path"] else ""))
-    print(f"rate: ws rate {rec['run_id']} up | down")
+    print(f"ws: rate: ws rate {rec['run_id']} up | down")
 
 
 def cmd_runs(args: argparse.Namespace) -> int:

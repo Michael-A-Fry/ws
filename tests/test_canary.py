@@ -299,7 +299,49 @@ def test_offline_doctor_points_to_the_command_instead_of_running_it(box):
     c = ws101(box, network=False)
     assert c.status == "ok" and "changed since last seen (claude-code 2.0.0, was 1.0.0): run `ws canary`" in c.detail
     assert lines(box) == []
+    # not remembered, so the note stays until a canary passes
+    assert "run `ws canary`" in ws101(box, network=False).detail
+    assert "run `ws canary`" in ws101(box, network=False).detail
+    assert json.loads((box / ".ws" / "versions.json").read_text())["runners"]["claude-code"]["version"] == "1.0.0"
+
+
+def test_ws_canary_passing_is_what_remembers_the_new_version(box, capsys, monkeypatch):
+    fake(box, "claude", "1.0.0")
+    profile(box)
+    ws101(box, network=False)
+    fake(box, "claude", "2.0.0")
+    assert "run `ws canary`" in ws101(box, network=False).detail
+    with monkeypatch.context() as broken:
+        broken.setattr(claude_code, "generate", lambda *a, **k: {"settings.json": "{"})
+        assert run(capsys, "canary")[0] == 1
+    assert "run `ws canary`" in ws101(box, network=False).detail  # a failing canary remembers nothing
+    assert run(capsys, "canary")[0] == 0
+    versions = json.loads((box / ".ws" / "versions.json").read_text())
+    assert versions["runners"]["claude-code"]["version"] == "2.0.0"
     assert "changed" not in ws101(box, network=False).detail
+
+
+def test_canary_jsonl_is_private_and_versions_json_leaves_no_temp_file(box, capsys, monkeypatch):
+    fake(box, "claude", "1.0.0")
+    assert run(capsys, "canary", "--runner", "claude-code")[0] == 0
+    assert oct((box / ".ws" / "canary.jsonl").stat().st_mode & 0o777) == "0o600"
+    canary.observe(dict(os.environ), "claude-code", "3.0.0", "m")
+    assert sorted(p.name for p in (box / ".ws").iterdir()) == ["canary.jsonl", "versions.json"]
+    names = []
+    real = os.replace
+    monkeypatch.setattr(os, "replace", lambda a, b: (names.append(os.path.basename(a)), real(a, b))[1])
+    canary.observe(dict(os.environ), "claude-code", "3.1.0", "m")
+    canary.observe(dict(os.environ), "claude-code", "3.2.0", "m")
+    assert len(set(names)) == 2 and all(n != "versions.json.tmp" for n in names)
+
+
+def test_a_failed_write_of_versions_json_cleans_up_its_temp_file(box, monkeypatch):
+    def boom(a, b):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(os, "replace", boom)
+    canary.observe(dict(os.environ), "claude-code", "1.0.0", "m")  # does not raise
+    assert list((box / ".ws").iterdir()) == []
 
 
 def test_a_failing_canary_fails_ws101_and_is_run_again_next_time(box, monkeypatch):

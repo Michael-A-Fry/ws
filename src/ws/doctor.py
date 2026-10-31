@@ -88,14 +88,11 @@ def _version_change(adapter: str, version: str, detail: str, env, network: bool)
         canary.observe(env, adapter, version or None, model)
         return OK, detail
     seen = f"changed since last seen ({'; '.join(changes)})"
-    if not network:
-        canary.observe(env, adapter, version or None, model)
+    if not network:  # not remembered: this note stays until a canary passes (`ws canary` does that too)
         return OK, f"{detail}; {seen}: run `ws canary`"
-    result = canary.run_canary([adapter], env, model)
+    result = canary.run_canary([adapter], env, model)  # a pass remembers the new version
     if result["ok"]:
-        canary.observe(env, adapter, version or None, model)
         return OK, f"{detail}; {seen}: canary passed"
-    # not remembered: the next doctor runs the canary again until it passes
     return FAIL, f"{detail}; {seen}: canary failed: {'; '.join(canary.failures(result))}"
 
 

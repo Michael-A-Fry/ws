@@ -124,6 +124,6 @@ def test_ws_run_ends_its_hand_back_with_the_one_tap_line(box, capsys, monkeypatc
     assert code == 0, out_text
     (rec,) = runrecord.read(runrecord.runs_path(os.environ))
     lines = out_text.rstrip("\n").splitlines()
-    assert lines[-1] == f"rate: ws rate {rec['run_id']} up | down"
+    assert lines[-1] == f"ws: rate: ws rate {rec['run_id']} up | down"
     assert run(capsys, "rate", "last", "up")[0] == 0
     assert ratings(box)[0]["run_id"] == rec["run_id"]

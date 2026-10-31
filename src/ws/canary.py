@@ -11,8 +11,9 @@ Per runner:
   run_record   a run record still validates against `runschema` (stdlib check, so no extra dependency)
 
 `ws doctor` records the last version it saw of each runner, and the default model id, in `$WS_HOME/versions.json`.
-When one changes it says so in WS101 and runs this. ws never forces an update: people update when they update, and
-this is how ws finds out whether it still works after they did.
+When one changes it says so in WS101 and runs this (or, with --offline, points here). A change is remembered only when
+a canary passes, whether doctor or `ws canary` ran it, so the note stays until then. ws never forces an update: people
+update when they update, and this is how ws finds out whether it still works after they did.
 """
 
 from __future__ import annotations
@@ -31,8 +32,14 @@ from pathlib import Path
 from ws import __version__, adapters, gate, policy, runrecord
 from ws.profile import ProfileError, load, profile_path
 
+try:  # not on native Windows; ws runs there only through WSL2, but the module must still import
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None  # type: ignore[assignment]
+
 SCHEMA_VERSION = 1
 PASS, FAIL, SKIP = "pass", "fail", "skip"
+NO_VERSION = "ran (it printed no version)"
 DENIED = "git push --force origin main"  # in the default deny list; a plain `git push` is not
 ALLOWED = "ls"
 
@@ -92,12 +99,34 @@ def observe(env, runner: str, version: str | None, model: str | None, record: bo
     text = json.dumps(doc, indent=2) + "\n"
     try:
         if not path.is_file() or path.read_text(encoding="utf-8") != text:
-            tmp = path.with_suffix(".json.tmp")
-            tmp.write_text(text, encoding="utf-8")
-            os.replace(tmp, path)
+            _replace(path, text)
     except OSError:
         pass  # doctor reports; a record it cannot keep is not a reason to fail it
     return changes
+
+
+def _replace(path: Path, text: str) -> None:
+    """Write beside the target under a unique name, then rename over it: two doctors at once never share a temp file."""
+    fd, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(name, path)
+    except BaseException:
+        Path(name).unlink(missing_ok=True)
+        raise
+
+
+def _append_line(path: Path, line: dict) -> None:
+    """One write() on an O_APPEND fd under an flock, 0600: the same way runs.jsonl and ratings.jsonl are written."""
+    data = (json.dumps(line, separators=(",", ":")) + "\n").encode()
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        if fcntl is not None:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        os.write(fd, data)
+    finally:
+        os.close(fd)
 
 
 # ---- a small JSON Schema check (the subset runschema uses) -----------------------------------------------------------
@@ -164,7 +193,7 @@ def check_version(adapter, env) -> tuple[str, str]:
     version = run.exe_version(exe, dict(env))
     if version is None:
         return FAIL, f"`{adapter.EXE} --version` did not run"
-    return PASS, version or "ran (it printed no version)"
+    return PASS, version or NO_VERSION
 
 
 def _hook(runner: str, payload: dict, policy_file: Path, home: Path, env) -> int:
@@ -253,7 +282,9 @@ def canary_runner(runner: str, env, work: Path) -> dict:
         "run_record": check_run_record(work),
     }
     return {
-        "version": checks["version"][1] if checks["version"][0] == PASS else None,
+        "version": checks["version"][1]
+        if checks["version"][0] == PASS and checks["version"][1] != NO_VERSION
+        else None,
         "ok": all(s != FAIL for s, _ in checks.values()),
         "checks": {k: s for k, (s, _) in checks.items()},
         "details": {k: d for k, (s, d) in checks.items()},
@@ -261,7 +292,9 @@ def canary_runner(runner: str, env, work: Path) -> dict:
 
 
 def run_canary(runners: list[str], env=None, model: str | None = None) -> dict:
-    """Run the checks for each runner and append one line to canary.jsonl (when ws's home exists). Returns the line."""
+    """Run the checks for each runner and append one line to canary.jsonl (when ws's home exists). A runner that passes
+    has its version (and the default model) remembered in versions.json, so a change is reported until a canary passes.
+    Returns the line."""
     env = os.environ if env is None else env
     results = {}
     with tempfile.TemporaryDirectory(prefix="ws-canary-") as tmp:
@@ -277,11 +310,13 @@ def run_canary(runners: list[str], env=None, model: str | None = None) -> dict:
         "model": model,
         "runners": {r: {k: v for k, v in res.items() if k != "details"} for r, res in results.items()},
     }
+    for r, res in results.items():  # a passing canary is what makes a new version the one ws remembers
+        if res["ok"]:
+            observe(env, r, res["version"], model)
     home = _home(env)
     if home and home.is_dir():
         try:
-            with open(home / "canary.jsonl", "a", encoding="utf-8") as fh:
-                fh.write(json.dumps(line, separators=(",", ":")) + "\n")
+            _append_line(home / "canary.jsonl", line)
         except OSError:
             pass
     return {**line, "details": {r: res["details"] for r, res in results.items()}}

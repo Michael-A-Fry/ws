@@ -4,7 +4,7 @@
 
 Each rating is one line appended to `$WS_HOME/ratings.jsonl`: run id, UTC time, `up` or `down`, an optional note and
 `who` ("person"). Rating the same run again adds a line; the latest one for a run is the one that counts. `ws run`
-prints the matching `rate:` line after its hand-back.
+prints the matching `ws: rate:` line after its hand-back.
 
 Only the person rates. The file sits in ws's home with the other control files, which a session may not write, so an
 agent cannot mark its own work. The id must be one `ws run` recorded in `runs.jsonl`.

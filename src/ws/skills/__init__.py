@@ -8,7 +8,12 @@ The install goes through the same `install.plan/apply` steps as everything else,
 `ws uninstall` removes it. A skill the person already has under that name is never touched: ws reports it and moves on.
 That includes one a runner reads from another runner's folder (OpenCode reads `~/.claude/skills` and `~/.agents/skills`).
 
-    ws skills [list] [--json]      each shipped skill, per runner: installed by ws, yours (kept), or not installed
+    ws skills [list] [--json]      each shipped skill, per runner: installed by ws, yours (kept), removed by you, or not
+                                   installed
+    ws skills add NAME             put a skill back that you removed (or add one that is not installed yet)
+
+A skill ws installed and you then deleted stays deleted: ws takes that as your choice, says so on `ws install`, and
+only `ws skills add NAME` brings it back.
 """
 
 from __future__ import annotations
@@ -36,7 +41,7 @@ class Item:
     name: str
     runner: str
     path: Path  # where ws would put it: <skills folder>/<name>
-    action: str  # "install" (new or ws's own) | "yours" (kept) | "shared" (the runner already reads one elsewhere)
+    action: str  # "install" (new or ws's own) | "yours" (kept) | "shared" (read elsewhere) | "removed" (by the person)
     note: str = ""
 
 
@@ -86,8 +91,12 @@ def items(runners: list[str], env, entries: dict[str, dict] | None = None) -> li
         elsewhere = _also_reads(runner, env)
         for name in SKILLS:
             target = own / name
-            if _ours(target, entries) and target.is_dir():
+            if _ours(target, entries) and (target / FILE).is_file():
                 out.append(Item(name, runner, target, "install", "installed by ws"))
+            elif _ours(target, entries):  # ws made it, and it has gone since: that was the person's doing
+                out.append(
+                    Item(name, runner, target, "removed", f"you removed it: `ws skills add {name}` brings it back")
+                )
             elif target.exists() or target.is_symlink():
                 out.append(Item(name, runner, target, "yours", f"you already have {target}: ws left it"))
             elif other := next((d / name for d in elsewhere if (d / name).exists()), None):
@@ -97,11 +106,12 @@ def items(runners: list[str], env, entries: dict[str, dict] | None = None) -> li
     return out
 
 
-def steps(runner: str, env) -> list[Step]:
-    """The install steps for one runner: a folder and a SKILL.md per skill that is new or already ws's own."""
+def steps(runner: str, env, add: str | None = None) -> list[Step]:
+    """The install steps for one runner: a folder and a SKILL.md per skill that is new or already ws's own. A skill
+    the person removed is left out, unless it is the one named in `add`."""
     out: list[Step] = []
     for it in items([runner], env):
-        if it.action == "install":
+        if it.action == "install" or (it.action == "removed" and it.name == add):
             out.append(Step(it.path, "dir", None, f"the {it.name} skill for {runner}", root=True))
             out.append(Step(it.path / FILE, "file", SKILLS[it.name], f"the {it.name} skill for {runner}"))
     return out
@@ -110,6 +120,13 @@ def steps(runner: str, env) -> list[Step]:
 def runners_for(runner: str, env) -> list[str]:
     """The profile's runner, else every runner found on this machine."""
     return [runner] if runner in adapters.all_adapters() else installed_runners(env)
+
+
+def notices(runner: str, env) -> list[str]:
+    """One line per skill the person removed, for `ws install` to print (ws leaves it out each time)."""
+    return [
+        f"{it.name} ({it.runner}): {it.note}" for it in items(runners_for(runner, env), env) if it.action == "removed"
+    ]
 
 
 # ---- the command -----------------------------------------------------------------------------------------------------
@@ -130,10 +147,36 @@ def cmd_list(args: argparse.Namespace) -> int:
         print("ws: no runner found to put skills in; set one with `ws install --runner claude-code|opencode`")
         return 0
     for r in rows:
-        state = {"install": r.note, "yours": "yours, kept", "shared": "yours, read from elsewhere"}[r.action]
+        state = {
+            "install": r.note,
+            "yours": "yours, kept",
+            "shared": "yours, read from elsewhere",
+            "removed": "removed by you",
+        }[r.action]
         print(f"{r.name:<12} {r.runner:<12} {state}")
         if r.action != "install":
             print(f"{'':12} {'':12} {r.note}")
+    return 0
+
+
+def cmd_add(args: argparse.Namespace) -> int:
+    env = os.environ
+    try:
+        runner = install.answers_from_profile(env).runner
+        runners = runners_for(runner, env)
+        if not runners:
+            print("ws: no runner found to put skills in; set one with `ws install --runner claude-code|opencode`")
+            return 1
+        for r in runners:
+            (it,) = (i for i in items([r], env) if i.name == args.name)
+            if it.action in ("yours", "shared"):
+                print(f"ws: {it.note}")
+                continue
+            result = install.apply(steps(r, env, add=args.name))
+            print(f"ws: {args.name} for {r}: {result.summary()}")
+    except (install.InstallError, OSError) as e:
+        print(f"ws: {e}", file=sys.stderr)
+        return 1
     return 0
 
 
@@ -143,4 +186,7 @@ def register(sub) -> None:
     ls = ss.add_parser("list", help="each skill, per runner")
     ls.add_argument("--json", action="store_true")
     ls.set_defaults(func=cmd_list)
+    add = ss.add_parser("add", help="put a skill back (one you removed), or add one that is not installed yet")
+    add.add_argument("name", choices=list(SKILLS))
+    add.set_defaults(func=cmd_add)
     s.set_defaults(func=cmd_list, json=False)

@@ -4,8 +4,9 @@ default; the rest are opt-in and not built yet, so switching one on only records
 Each is a small adapter: what it is, whether it is on by default, the profile tables it owns, the folders it needs and
 the regions it is for. `ws plugin list|add|remove` goes through the same install.plan/apply as `ws install`, so it is
 idempotent too. (`ws module` still works as a hidden alias.) A plugin made for one region, such as `finance` for NZ,
-will not switch on in another: the region is `[machine] region` in the profile, else a guess from the time zone and
-locale.
+will not switch on in another. The region is `[machine] region` in the profile (`ws plugin add NAME --region CC` sets
+it), else the country of the time zone. A locale alone is only a hint (a UTC server often has a US one): it warns and
+carries on. If neither says, nothing is refused.
 """
 
 from __future__ import annotations
@@ -13,13 +14,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
 
 from ws import install
 from ws.install import Answers, InstallError, Step
-from ws.profile import ProfileError, load, profile_path
+from ws.profile import ProfileError, load, profile_path, write_if_changed
 
 NOT_BUILT = "not built yet"
 
@@ -135,8 +137,11 @@ def _zone_name(env) -> str | None:
         return None
 
 
+_POSIX_NZ = re.compile(r"^NZ[SD]T[-+]?\d")  # a POSIX $TZ such as NZST-12NZDT,M9.5.0,M4.1.0/3
+
+
 def _zone_country(zone: str) -> str | None:
-    if zone in _NZ_ZONES:
+    if zone in _NZ_ZONES or _POSIX_NZ.match(zone):
         return "NZ"
     try:
         for line in ZONE_TAB.read_text(encoding="utf-8").splitlines():
@@ -148,12 +153,15 @@ def _zone_country(zone: str) -> str | None:
     return None
 
 
-def guess_region(env) -> str | None:
-    """The country this machine looks to be in: its time zone first, else the country of its locale (en_NZ -> NZ).
-    None when neither says (UTC with a plain C locale). A guess only: `[machine] region` in the profile overrides it."""
+def zone_region(env) -> str | None:
+    """The country of this machine's time zone (Pacific/Auckland, or a POSIX NZST-12NZDT, -> NZ); None for UTC and any
+    zone that belongs to no country."""
     zone = _zone_name(env)
-    if zone and (cc := _zone_country(zone)):
-        return cc
+    return _zone_country(zone) if zone else None
+
+
+def locale_region(env) -> str | None:
+    """The country of this machine's locale (en_NZ -> NZ). Only a hint: a UTC server often has a US locale."""
     for key in ("LC_ALL", "LC_MESSAGES", "LANG"):
         locale = (env.get(key) or "").split(".")[0].split("@")[0]
         if len(locale) == 5 and locale[2] == "_" and locale[3:].isalpha():
@@ -161,8 +169,9 @@ def guess_region(env) -> str | None:
     return None
 
 
-def region_of(env) -> tuple[str | None, str]:
-    """(country code or None, where it came from: 'profile' or 'guess')."""
+def region_of(env) -> tuple[str | None, str | None]:
+    """(country code, where it came from): 'profile' ([machine] region), 'zone' (the time zone) or 'locale', else
+    (None, None). The first two are firm enough to refuse on; a locale is only a hint."""
     try:
         machine = (load(profile_path(env)) or {}).get("machine")
     except ProfileError:
@@ -170,22 +179,41 @@ def region_of(env) -> tuple[str | None, str]:
     r = machine.get("region") if isinstance(machine, dict) else None
     if isinstance(r, str) and r.strip():
         return r.strip().upper(), "profile"
-    return guess_region(env), "guess"
+    if cc := zone_region(env):
+        return cc, "zone"
+    if cc := locale_region(env):
+        return cc, "locale"
+    return None, None
 
 
-def _wrong_region(m: Module) -> str | None:
-    """One plain line when this machine is known to be outside the plugin's regions; None otherwise (including when the
-    region cannot be told: ws will not refuse on a guess it could not make)."""
+def _region_check(m: Module, region: str | None = None) -> tuple[str | None, str | None]:
+    """(refusal, warning), each one plain line or None. A plugin made for other regions is refused when the person's
+    profile (or `--region`) or this machine's time zone puts them elsewhere; a locale alone only warns, and an unknown
+    region says nothing: ws will not refuse on a guess."""
     if not m.region:
-        return None
-    here, source = region_of(os.environ)
+        return None, None
+    here, source = (region, "profile") if region else region_of(os.environ)
     if here is None or here in m.region:
-        return None
-    where = "your profile says" if source == "profile" else "this machine looks to be in"
-    return (
-        f"{m.name} is for {'/'.join(m.region)} only and {where} {here}; "
-        "if that is wrong, set `region` under [machine] in your profile"
-    )
+        return None, None
+    want = "/".join(m.region)
+    fix = f"if that is wrong, run `ws plugin add {m.name} --region {m.region[0]}`"
+    if source == "locale":
+        return (
+            None,
+            f"{m.name} is for {want} only and your locale says {here}, which is only a guess; carrying on ({fix})",
+        )
+    where = "you said" if region else "your profile says" if source == "profile" else "this machine's time zone is in"
+    return f"{m.name} is for {want} only and {where} {here}; {fix}", None
+
+
+def _set_region(region: str) -> bool:
+    """Write [machine] region to the profile. True if the file changed."""
+    path = profile_path()
+    prof = load(path) or {}
+    machine = prof.get("machine")
+    machine = dict(machine) if isinstance(machine, dict) else {}
+    machine["region"] = region
+    return write_if_changed(path, {**prof, "machine": machine})
 
 
 # ---- the commands ----------------------------------------------------------------------------------------------------
@@ -219,15 +247,24 @@ def cmd_list(args: argparse.Namespace) -> int:
     return 0
 
 
-def _change(name: str, turn_on: bool) -> int:
+def _change(name: str, turn_on: bool, region: str | None = None) -> int:
     if name not in REGISTRY:
         print(f"ws: unknown plugin {name!r}; known: {', '.join(REGISTRY)}", file=sys.stderr)
         return 1
+    if region is not None and not re.fullmatch(r"[A-Za-z]{2}", region):
+        print(f"ws: --region takes a two-letter country code such as NZ, not {region!r}", file=sys.stderr)
+        return 1
+    region = region.upper() if region else None
     try:
         if not install.profile_path().is_file():
             raise InstallError("no profile yet: run `ws install` first")
-        if turn_on and (why := _wrong_region(REGISTRY[name])):
-            raise InstallError(why)
+        refusal, warning = _region_check(REGISTRY[name], region) if turn_on else (None, None)
+        if refusal:
+            raise InstallError(refusal)
+        if warning:
+            print(f"ws: {warning}", file=sys.stderr)
+        if region and _set_region(region):
+            print(f"ws: region set to {region} in your profile")
         answers = install.answers_from_profile(os.environ)
         modules = answers.modules | {name} if turn_on else answers.modules - {name}
         result = install.apply(install.plan(replace(answers, modules=modules)))
@@ -241,7 +278,7 @@ def _change(name: str, turn_on: bool) -> int:
 
 
 def cmd_add(args: argparse.Namespace) -> int:
-    return _change(args.name, True)
+    return _change(args.name, True, args.region)
 
 
 def cmd_remove(args: argparse.Namespace) -> int:
@@ -259,4 +296,6 @@ def register(sub) -> None:
         for name, fn, text in (("add", cmd_add, "switch a plugin on"), ("remove", cmd_remove, "switch a plugin off")):
             p = ms.add_parser(name, help=text)
             p.add_argument("name", metavar="NAME")
+            if name == "add":
+                p.add_argument("--region", metavar="CC", help="your country (two letters); kept in [machine] region")
             p.set_defaults(func=fn)

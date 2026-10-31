@@ -236,3 +236,75 @@ def test_an_edited_manifest_cannot_point_uninstall_at_your_other_files(box, caps
     mpath.write_text(json.dumps(manifest))
     code, out, _ = run(capsys, "uninstall", "--yes")
     assert code == 0 and other.read_text() == "{}\n" and "outside the folders ws manages" in out
+
+
+# ---- a skill you removed stays removed ----------------------------------------------------------------------------------
+
+
+def remove_skill(box, name):
+    d = box / ".claude" / "skills" / name
+    for f in d.iterdir():
+        f.unlink()
+    d.rmdir()
+
+
+def test_a_skill_you_deleted_is_not_recreated_and_is_reported(box, capsys):
+    assert install(capsys, box, "--runner", "claude-code")[0] == 0
+    remove_skill(box, "dataviz")
+    for _ in range(2):  # every run: left out, and said so
+        code, out, _ = install(capsys, box, "--runner", "claude-code")
+        assert code == 0 and "0 changes" in out
+        assert "dataviz (claude-code): you removed it" in out and "ws skills add dataviz" in out
+        assert not (box / ".claude" / "skills" / "dataviz").exists()
+    assert "align" not in out  # the ones still there are not mentioned
+    code, out, _ = run(capsys, "skills", "list")
+    assert code == 0 and "removed by you" in out
+
+
+def test_deleting_only_the_skill_file_counts_as_removing_it(box, capsys):
+    assert install(capsys, box, "--runner", "claude-code")[0] == 0
+    (box / ".claude" / "skills" / "align" / "SKILL.md").unlink()
+    code, out, _ = install(capsys, box, "--runner", "claude-code")
+    assert code == 0 and "align (claude-code): you removed it" in out
+    assert not (box / ".claude" / "skills" / "align" / "SKILL.md").exists()
+
+
+def test_a_plugin_command_does_not_bring_a_removed_skill_back_either(box, capsys):
+    assert install(capsys, box, "--runner", "claude-code")[0] == 0
+    remove_skill(box, "checkpoint")
+    assert run(capsys, "plugin", "add", "calendar")[0] == 0
+    assert not (box / ".claude" / "skills" / "checkpoint").exists()
+
+
+def test_skills_add_brings_a_removed_skill_back_and_uninstall_still_removes_it(box, capsys):
+    pre = snapshot(box)
+    assert install(capsys, box, "--runner", "claude-code")[0] == 0
+    remove_skill(box, "dataviz")
+    code, out, _ = run(capsys, "skills", "add", "dataviz")
+    assert code == 0 and "dataviz for claude-code: 2 created" in out
+    assert (box / ".claude" / "skills" / "dataviz" / "SKILL.md").read_text() == skills.SKILLS["dataviz"]
+    code, out, _ = install(capsys, box, "--runner", "claude-code")
+    assert code == 0 and "0 changes" in out and "you removed it" not in out
+    assert run(capsys, "uninstall", "--yes")[0] == 0
+    assert snapshot(box) == pre
+
+
+def test_skills_add_never_overwrites_one_you_have_and_needs_a_runner(box, capsys):
+    code, out, _ = run(capsys, "skills", "add", "align")
+    assert code == 1 and "no runner found" in out
+    mine = box / ".claude" / "skills" / "align"
+    mine.mkdir(parents=True)
+    (mine / "SKILL.md").write_text("mine\n")
+    assert install(capsys, box, "--runner", "claude-code")[0] == 0
+    code, out, _ = run(capsys, "skills", "add", "align")
+    assert code == 0 and "you already have" in out and (mine / "SKILL.md").read_text() == "mine\n"
+    with pytest.raises(SystemExit):
+        cli.main(["skills", "add", "nope"])
+
+
+def test_skills_add_installs_one_that_was_never_installed(box, capsys):
+    assert install(capsys, box, "--runner", "claude-code", "--module", "calendar")[0] == 0
+    assert run(capsys, "plugin", "remove", "skills")[0] == 0
+    remove_skill(box, "align")  # ws made it, so it is "removed" even with the plugin off
+    assert run(capsys, "skills", "add", "align")[0] == 0
+    assert (box / ".claude" / "skills" / "align" / "SKILL.md").is_file()

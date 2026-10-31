@@ -17,7 +17,9 @@ def box(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("WS_HOME", str(home / ".ws"))
     monkeypatch.chdir(home)
-    monkeypatch.setattr(modules, "guess_region", lambda env: "NZ")  # the machine running the tests is not the test
+    # the machine running the tests is not the test: it is in NZ unless a test says otherwise
+    monkeypatch.setattr(modules, "zone_region", lambda env: "NZ")
+    monkeypatch.setattr(modules, "locale_region", lambda env: None)
     return home
 
 
@@ -128,54 +130,117 @@ def test_only_finance_has_a_region():
 
 def test_finance_refuses_outside_nz_with_one_plain_line(box, capsys, monkeypatch):
     assert run(capsys, "install", "--yes", "--notes", str(box / "Notes"))[0] == 0
-    monkeypatch.setattr(modules, "guess_region", lambda env: "US")
+    monkeypatch.setattr(modules, "zone_region", lambda env: "US")
     before = (box / ".ws" / "profile.toml").read_text()
     code, out, err = run(capsys, "plugin", "add", "finance")
     assert code == 1 and not out
-    assert err.count("\n") == 1 and "finance is for NZ only" in err and "US" in err and "[machine]" in err
+    assert err.count("\n") == 1 and "finance is for NZ only" in err and "time zone is in US" in err
+    assert "ws plugin add finance --region NZ" in err
     assert (box / ".ws" / "profile.toml").read_text() == before
     assert run(capsys, "plugin", "add", "calendar")[0] == 0  # a plugin with no region is not affected
     assert run(capsys, "plugin", "remove", "finance")[0] == 0  # switching off is always allowed
 
 
-def test_the_profile_region_beats_the_guess(box, capsys, monkeypatch):
+def test_the_profile_region_beats_the_time_zone(box, capsys, monkeypatch):
     assert run(capsys, "install", "--yes", "--notes", str(box / "Notes"))[0] == 0
     p = box / ".ws" / "profile.toml"
-    monkeypatch.setattr(modules, "guess_region", lambda env: "US")
+    monkeypatch.setattr(modules, "zone_region", lambda env: "US")
     p.write_text(p.read_text().replace("\n[machine]\n", '\n[machine]\nregion = "nz"\n', 1))
     assert run(capsys, "plugin", "add", "finance")[0] == 0
     p.write_text(p.read_text().replace('region = "nz"', 'region = "AU"'))
-    monkeypatch.setattr(modules, "guess_region", lambda env: "NZ")
-    code, _, err = run(capsys, "plugin", "remove", "finance")
-    assert code == 0
+    monkeypatch.setattr(modules, "zone_region", lambda env: "NZ")
+    assert run(capsys, "plugin", "remove", "finance")[0] == 0
     code, _, err = run(capsys, "plugin", "add", "finance")
     assert code == 1 and "your profile says AU" in err
 
 
+def test_region_flag_writes_the_profile_and_lets_finance_on(box, capsys, monkeypatch):
+    assert run(capsys, "install", "--yes", "--notes", str(box / "Notes"))[0] == 0
+    monkeypatch.setattr(modules, "zone_region", lambda env: "US")
+    assert run(capsys, "plugin", "add", "finance")[0] == 1
+    code, out, _ = run(capsys, "plugin", "add", "finance", "--region", "nz")
+    assert code == 0 and "region set to NZ" in out
+    assert profile(box)["machine"]["region"] == "NZ" and profile(box)["modules"]["finance"] is True
+    assert profile(box)["machine"]["notes"] == str(box / "Notes")  # the rest of [machine] is kept
+    assert run(capsys, "plugin", "add", "finance")[0] == 0  # remembered: no flag needed now
+
+
+def test_region_flag_that_does_not_fit_is_refused_and_writes_nothing(box, capsys, monkeypatch):
+    assert run(capsys, "install", "--yes", "--notes", str(box / "Notes"))[0] == 0
+    before = (box / ".ws" / "profile.toml").read_text()
+    code, _, err = run(capsys, "plugin", "add", "finance", "--region", "AU")
+    assert code == 1 and "you said AU" in err
+    code, _, err = run(capsys, "plugin", "add", "finance", "--region", "Aotearoa")
+    assert code == 1 and "two-letter" in err
+    assert (box / ".ws" / "profile.toml").read_text() == before
+
+
 def test_an_unknown_region_does_not_refuse(box, capsys, monkeypatch):
     assert run(capsys, "install", "--yes", "--notes", str(box / "Notes"))[0] == 0
-    monkeypatch.setattr(modules, "guess_region", lambda env: None)
+    monkeypatch.setattr(modules, "zone_region", lambda env: None)
     assert run(capsys, "plugin", "add", "finance")[0] == 0
+
+
+def test_a_utc_server_with_a_us_locale_is_warned_not_refused(box, capsys, monkeypatch):
+    assert run(capsys, "install", "--yes", "--notes", str(box / "Notes"))[0] == 0
+    monkeypatch.undo()  # drop the fixture's NZ time zone: use the real guess on a planted environment
+    monkeypatch.setenv("HOME", str(box))
+    monkeypatch.setenv("WS_HOME", str(box / ".ws"))
+    monkeypatch.setenv("TZ", "UTC")
+    monkeypatch.setenv("LANG", "en_US.UTF-8")
+    monkeypatch.delenv("LC_ALL", raising=False)
+    monkeypatch.delenv("LC_MESSAGES", raising=False)
+    monkeypatch.setattr(modules, "ZONE_TAB", box / "no-zone.tab")
+    code, out, err = run(capsys, "plugin", "add", "finance")
+    assert code == 0 and "finance is on" in out
+    assert "your locale says US" in err and "only a guess" in err and "--region NZ" in err
+
+
+def test_the_region_comes_from_the_profile_then_the_zone_then_the_locale(box, monkeypatch):
+    monkeypatch.undo()
+    monkeypatch.setattr(modules, "ZONE_TAB", box / "no-zone.tab")
+    env = {"TZ": "Pacific/Auckland", "LANG": "en_US.UTF-8", "WS_HOME": str(box / ".ws"), "HOME": str(box)}
+    assert modules.region_of(env) == ("NZ", "zone")
+    assert modules.region_of({**env, "TZ": "UTC"}) == ("US", "locale")
+    assert modules.region_of({**env, "TZ": "UTC", "LANG": "C"}) == (None, None)
+    (box / ".ws").mkdir(exist_ok=True)
+    (box / ".ws" / "profile.toml").write_text('[machine]\nregion = "au"\n')
+    assert modules.region_of(env) == ("AU", "profile")
+
+
+@pytest.mark.parametrize(
+    ("tz", "want"),
+    [
+        ("Pacific/Auckland", "NZ"),
+        (":Pacific/Chatham", "NZ"),
+        ("NZ", "NZ"),
+        ("NZST-12NZDT", "NZ"),
+        ("NZST-12NZDT,M9.5.0,M4.1.0/3", "NZ"),
+        ("UTC", None),
+        ("Etc/UTC", None),
+        ("EST5EDT", None),
+    ],
+)
+def test_the_zone_region(tz, want, tmp_path, monkeypatch):
+    monkeypatch.setattr(modules, "ZONE_TAB", tmp_path / "no-zone.tab")
+    assert modules.zone_region({"TZ": tz}) == want
 
 
 @pytest.mark.parametrize(
     ("env", "want"),
     [
-        ({"TZ": "Pacific/Auckland"}, "NZ"),
-        ({"TZ": ":Pacific/Chatham"}, "NZ"),
-        ({"TZ": "UTC", "LANG": "en_NZ.UTF-8"}, "NZ"),
-        ({"TZ": "UTC", "LC_ALL": "en_AU.UTF-8", "LANG": "en_NZ.UTF-8"}, "AU"),
-        ({"TZ": "UTC", "LANG": "C.UTF-8"}, None),
-        ({"TZ": "UTC"}, None),
+        ({"LANG": "en_NZ.UTF-8"}, "NZ"),
+        ({"LC_ALL": "en_AU.UTF-8", "LANG": "en_NZ.UTF-8"}, "AU"),
+        ({"LANG": "C.UTF-8"}, None),
+        ({}, None),
     ],
 )
-def test_the_region_guess(env, want, tmp_path, monkeypatch):
-    monkeypatch.setattr(modules, "ZONE_TAB", tmp_path / "no-zone.tab")
-    assert modules.guess_region(env) == want
+def test_the_locale_region(env, want):
+    assert modules.locale_region(env) == want
 
 
 def test_the_zone_table_gives_other_countries(tmp_path, monkeypatch):
     tab = tmp_path / "zone.tab"
     tab.write_text("# comment\nUS\t+404251-0740023\tAmerica/New_York\tEastern\nNZ\t-3652+17446\tPacific/Auckland\n")
     monkeypatch.setattr(modules, "ZONE_TAB", tab)
-    assert modules.guess_region({"TZ": "America/New_York"}) == "US"
+    assert modules.zone_region({"TZ": "America/New_York"}) == "US"

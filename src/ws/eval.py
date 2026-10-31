@@ -37,6 +37,11 @@ judge_model`); the judge call itself is not built yet, so for now a rubric task 
 `compare` pairs at task level, not trial level (`evalstats.paired_tasks`): a task passes for an arm when most of its
 trials do, a tie fails, and results count only from the job and the task text (hash) each arm used last.
 
+`report` and `compare` count a trial that never started a run (`evalstats.is_setup_error`: status "error" with no run
+record, or a record with no exit code) apart: it is in no metric and no pair, and is listed per arm with its task and
+trial. A run that started and then failed or timed out is an ordinary failure. The result line carries no marker for this;
+it is worked out from the result and the run log, so results written before this change are sorted the same way.
+
 Harvest never approves anything. It writes each proposal to `$WS_HOME/eval/proposed/` with `approved = false`,
 `review_required = true`, the source run id, where the prompt came from and a placeholder rubric grader (so it cannot run
 until you give it a real one), all or none. `approve` shows the prompt and asks you (`--yes` for scripts). Prompts that
@@ -1236,13 +1241,26 @@ def metrics_for(env: dict, results, runs, ratings, all_runs, days: int, k: int |
     return {key: {"label": labels[key], **m} for key, m in computed.items()}
 
 
+def _setup_line(block: dict) -> str:
+    """The one line that says how many trials were left out for never starting, and which."""
+    if not block["count"]:
+        return ""
+    parts = [
+        f"{arm}: {e['count']} ({', '.join(str(t['task']) + '#' + str(t['trial']) for t in e['trials'])})"
+        for arm, e in block["by_arm"].items()
+    ]
+    return f"setup errors, not counted above ({block['count']} trials that never started a run): " + "; ".join(parts)
+
+
 def cmd_report(args: argparse.Namespace) -> int:
     env = os.environ
     since = parse_since(args.since)
-    results, runs, ratings, all_runs = _scope(env, args.arm, since)
+    everything, runs, ratings, all_runs = _scope(env, args.arm, since)
+    results, setup = evalstats.split_setup_errors(everything, runs)
+    setup_errors = evalstats.setup_error_report(setup)
     days = max(1, since.days)
     overall = metrics_for(env, results, runs, ratings, all_runs, days, args.k)
-    arms = sorted({str(r.get("arm")) for r in results})
+    arms = sorted({str(r.get("arm")) for r in everything})
     by_arm = {}
     if len(arms) > 1:
         for a in arms:
@@ -1250,7 +1268,10 @@ def cmd_report(args: argparse.Namespace) -> int:
                 env, [r for r in results if r.get("arm") == a], runs, ratings, all_runs, days, args.k
             )
     if args.json:
-        output.result({"since": args.since, "trials": len(results), "arms": arms, "metrics": overall, "by_arm": by_arm})
+        output.result({
+            "since": args.since, "trials": len(results), "arms": arms, "metrics": overall, "by_arm": by_arm,
+            "setup_errors": setup_errors,
+        })  # fmt: skip
         return 0
     print(f"ws eval report: {len(results)} trials in the last {args.since}; arms: {', '.join(arms) or 'none yet'}")
     for title, block in [("all arms" if by_arm else "", overall), *by_arm.items()]:
@@ -1258,6 +1279,8 @@ def cmd_report(args: argparse.Namespace) -> int:
             print(f"-- {title}")
         for i, m in enumerate(block.values(), 1):
             print(f"{i:>2}. {m['label']}: {m['display']}")
+    if setup:
+        print(_setup_line(setup_errors))
     return 0
 
 
@@ -1277,7 +1300,20 @@ def _down_rate(results: list[dict], ratings: dict[str, str]) -> tuple[float | No
 def compare_arms(arm_a: str, arm_b: str, results: list[dict], runs: dict, ratings: dict) -> dict:
     """Two arms, paired at task level (see `evalstats.paired_tasks`: McNemar needs independent pairs, and the trials of
     one task are not). The task counts and the trial counts behind them are both in the result."""
-    pt = evalstats.paired_tasks(_arm_results(results, arm_a), _arm_results(results, arm_b))
+    counted, setup = evalstats.split_setup_errors(results, runs)
+    ra0, rb0 = _arm_results(counted, arm_a), _arm_results(counted, arm_b)
+
+    def key(r: dict) -> tuple:
+        return r.get("task"), r.get("trial")
+
+    # A trial that never started in one arm is dropped from the other arm too (same task, same trial number), unless
+    # that arm has a counted result for it: the pairs stay even and the arm that ran is not marked down for it.
+    lost_a = {key(r) for r in _arm_results(setup, arm_a)} - {key(r) for r in ra0}
+    lost_b = {key(r) for r in _arm_results(setup, arm_b)} - {key(r) for r in rb0}
+    pt = evalstats.paired_tasks(
+        [r for r in ra0 if key(r) not in lost_b],
+        [r for r in rb0 if key(r) not in lost_a],
+    )
     if pt["uneven"]:
         task, na, nb = pt["uneven"][0]
         raise WsError(
@@ -1303,6 +1339,7 @@ def compare_arms(arm_a: str, arm_b: str, results: list[dict], runs: dict, rating
     return {
         "arm_a": arm_a, "arm_b": arm_b, **stats, "winner": winner, "why": verdict["why"],
         "quality": evalstats.quality_note(stats),
+        "setup_errors": evalstats.setup_error_report([r for r in setup if r.get("arm") in (arm_a, arm_b)]),
     }  # fmt: skip
 
 
@@ -1333,6 +1370,9 @@ def _show_compare(c: dict, look: int, replay: bool) -> None:
         print(
             f"  {name}: {'not measured' if v is None else (f'{v * 100:.1f}%' if key.startswith('down') else f'{v:,.0f}')}"
         )
+    setup = c.get("setup_errors")  # absent from looks stored before this was counted
+    if setup and setup["count"]:
+        print(f"  {_setup_line(setup)}")
     if c.get("quality"):
         print(f"  quality: {c['quality']}")
     print(f"  {'winner ' + c['winner'] if c['winner'] else 'no winner'}: {c['why']}")

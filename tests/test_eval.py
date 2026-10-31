@@ -932,3 +932,88 @@ def test_a_compare_where_the_arms_ran_different_numbers_of_trials_is_refused(box
     code, _, err = ws(capsys, "eval", "compare", "A", "B")
     assert code == 1 and "3 trials under A and 2 under B" in err and "same --trials" in err
     assert not ws_eval.looks_path().exists()  # a refusal does not use up a look
+
+
+# ---- trials that never started ------------------------------------------------------------------------------------
+
+
+def never_launched(run_id) -> dict:
+    return {**run_rec(run_id, status="error"), "exit_code": None}
+
+
+def test_only_an_error_that_never_launched_the_runner_is_a_setup_error():
+    runs = {
+        rid(1): run_rec(rid(1), status="error"),  # started, exited 1
+        rid(2): never_launched(rid(2)),  # the runner was not on PATH
+        rid(3): run_rec(rid(3), status="timeout"),
+        rid(4): run_rec(rid(4)),
+    }
+    is_setup = evalstats.is_setup_error
+    assert is_setup(result(None, "t", 1, "A", False, status="error"), runs)  # no run record at all
+    assert is_setup(result(rid(2), "t", 1, "A", False, status="error"), runs)
+    assert not is_setup(result(rid(1), "t", 1, "A", False, status="error"), runs)
+    assert not is_setup(result(rid(3), "t", 1, "A", False, status="timeout"), runs)
+    assert not is_setup(result(rid(4), "t", 1, "A", True), runs)
+    assert not is_setup(result(None, "t", 1, "A", False, status="refused"), runs)
+    assert not is_setup(result(rid(9), "t", 1, "A", False, status="error"), runs)  # record gone: cannot tell
+
+
+def plant_with_setup_errors() -> None:
+    """A: four trials of one task, two of them never started. B: four trials, one started and failed."""
+    runs = {1: run_rec(rid(1)), 2: run_rec(rid(2)), 3: never_launched(rid(3)), 5: run_rec(rid(5)),
+            6: run_rec(rid(6), status="error"), 7: run_rec(rid(7)), 8: run_rec(rid(8))}  # fmt: skip
+    planted = [
+        (1, "A", True, "ok"), (2, "A", True, "ok"), (3, "A", False, "error"), (4, "A", False, "error"),
+        (1, "B", True, "ok"), (2, "B", False, "error"), (3, "B", True, "ok"), (4, "B", False, "ok"),
+    ]  # fmt: skip
+    for i, (trial, arm, passed, status) in enumerate(planted, 1):
+        if i in runs:
+            runrecord.append(runrecord.runs_path(os.environ), runs[i])
+        ws_eval.append_jsonl(
+            ws_eval.results_path(),
+            result(rid(i) if i in runs else None, "t", trial, arm, passed, status=status, ts=datetime.now(UTC)),
+        )
+
+
+def test_the_report_counts_setup_errors_apart_and_out_of_every_metric(box, capsys):
+    plant_with_setup_errors()
+    code, out, _ = ws(capsys, "eval", "report", "--json")
+    data = json.loads(out)["data"]
+    assert code == 0 and data["trials"] == 6  # 8 results, 2 that never started
+    assert data["metrics"]["success_rate"]["n"] == 6
+    assert data["by_arm"]["A"]["success_rate"]["value"] == 1.0  # 2 of 2: the setup errors are not failures
+    assert data["by_arm"]["B"]["success_rate"]["value"] == 0.5  # a started run that failed still counts
+    assert data["arms"] == ["A", "B"]
+    se = data["setup_errors"]
+    assert se["count"] == 2 and set(se["by_arm"]) == {"A"} and se["by_arm"]["A"]["count"] == 2
+    assert [(t["task"], t["trial"]) for t in se["by_arm"]["A"]["trials"]] == [("t", 3), ("t", 4)]
+    _, text, _ = ws(capsys, "eval", "report")
+    assert "6 trials" in text
+    assert "setup errors, not counted above (2 trials that never started a run): A: 2 (t#3, t#4)" in text
+
+
+def test_a_report_with_no_setup_errors_has_an_empty_block_and_no_line(box, capsys):
+    plant(box, rows_for(1, 0))
+    _, out, _ = ws(capsys, "eval", "report", "--json")
+    assert json.loads(out)["data"]["setup_errors"] == {"count": 0, "by_arm": {}}
+    assert "setup errors" not in ws(capsys, "eval", "report")[1]
+
+
+def test_compare_leaves_a_trial_that_never_started_out_of_both_arms(box, capsys):
+    # three trials each; A's trial 3 never started. Without the rule A would have 2 trials against B's 3: refused.
+    planted = [
+        (1, "A", True, "ok"), (2, "A", True, "ok"), (3, "A", False, "error"),
+        (1, "B", False, "ok"), (2, "B", False, "ok"), (3, "B", True, "ok"),
+    ]  # fmt: skip
+    for i, (trial, arm, passed, status) in enumerate(planted, 1):
+        runrecord.append(runrecord.runs_path(os.environ), never_launched(rid(i)) if i == 3 else run_rec(rid(i)))
+        ws_eval.append_jsonl(
+            ws_eval.results_path(), result(rid(i), "t", trial, arm, passed, status=status, ts=datetime.now(UTC))
+        )
+    code, out, _ = ws(capsys, "eval", "compare", "A", "B", "--json")
+    c = json.loads(out)["data"]
+    assert code == 0 and (c["trials_a"], c["trials_b"]) == (2, 2)  # B's trial 3 left out with A's
+    assert (c["a_only"], c["b_only"]) == (1, 0)
+    assert c["setup_errors"]["count"] == 1 and c["setup_errors"]["by_arm"]["A"]["trials"][0]["trial"] == 3
+    _, text, _ = ws(capsys, "eval", "compare", "A", "B", "--look", "1")
+    assert "setup errors" in text and "A: 1 (t#3)" in text

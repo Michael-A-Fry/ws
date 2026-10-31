@@ -46,6 +46,7 @@ Every command accepts `--json` (one JSON envelope on standard output) and `-C PA
 | Task | Command | Guide |
 |---|---|---|
 | Store a key | `ws secret set` | [Store a secret](how-to/store-a-secret.md) |
+| Store a key from an env file | `ws secret import` | [Store a secret](how-to/store-a-secret.md) |
 | List names, hosts and state | `ws secret list` | [Store a secret](how-to/store-a-secret.md) |
 | Remove a stored value | `ws secret rm` | [Store a secret](how-to/store-a-secret.md) |
 | Move the store behind its own user | `ws secret wall` | [Store a secret](how-to/store-a-secret.md) |

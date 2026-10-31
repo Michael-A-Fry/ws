@@ -176,6 +176,21 @@ ws secret set [-h] name
 |---|---|
 | `name` | A name registered in `secrets.toml`. |
 
+### `ws secret import`
+
+Store a value for a registered name from an env file (VAR=value).
+
+```text
+ws secret import [-h] --from-env PATH [--var VAR] [--delete-source] name
+```
+
+| Argument | Meaning |
+|---|---|
+| `name` | A name registered in `secrets.toml`. |
+| `--from-env PATH` | The env file to read; required. |
+| `--var VAR` | Which variable, when the file has several lines. |
+| `--delete-source` | Remove the env file after the value is stored. |
+
 ### `ws secret list`
 
 Names, hosts, set/unset and owner; never values.
@@ -218,7 +233,7 @@ ws broker serve [-h] [--socket PATH] [--group GROUP] [--port PORT] [--lease-ttl 
 
 | Argument | Meaning |
 |---|---|
-| `--socket PATH` | Default $WS_HOME/run/broker.sock. |
+| `--socket PATH` | Default $WS_BROKER_SOCKET, else [roles.secrets] socket in the profile, else $WS_HOME/run/broker.sock. |
 | `--group GROUP` | Also serve members of this group (socket folder becomes 0750). |
 | `--port PORT` | Lease proxy port on 127.0.0.1 (default: any free one). |
 | `--lease-ttl SECONDS` | Longest lease (default 3600). |

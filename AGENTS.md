@@ -39,6 +39,7 @@ LICENSES/         third-party licence texts (see NOTICE)
 | Where (under `src/ws/`) | What it is |
 |---|---|
 | `adapters/` | Runner adapters: one module per runner |
+| `approvals.py` | Bound, single-use approvals: how a call the policy marks `ask_commands` gets a human's yes, once |
 | `broker.py` | The secrets broker: a small process that is not an LLM and holds the store, so agents never see... |
 | `canary.py` | `ws canary`: a few small checks that a runner's update did not break what ws relies on |
 | `cli.py` | The `ws` command |
@@ -62,8 +63,10 @@ LICENSES/         third-party licence texts (see NOTICE)
 | `run.py` | `ws run JOB`: every headless job goes through here and leaves one complete record in `runs.jsonl` |
 | `runrecord.py` | The run record: one JSON line per headless job in `$WS_HOME/logs/runs.jsonl`, the same shape for... |
 | `runschema.py` | The JSON Schema (draft 2020-12) of a run record, as a Python dict: `ws secret wall` copies only... |
+| `sandbox.py` | The sandbox as the real wall: `ws gate launch --runner R -- argv` starts a runner inside an... |
 | `secrets.py` | The secrets registry and store, and `ws secret` |
 | `session.py` | `ws session`: tell a long-running session once when ws has been updated under it |
+| `setup_ui/` | `ws setup`: the first-run and re-run setup, inline in your terminal (default) or in a page in... |
 | `skills/` | The skills ws ships (`align`, `checkpoint`, `taste-gate`, `dataviz`) and how they get onto a machine |
 | `usage.py` | The Console usage check: can ws read the provider's own usage report, the billing truth... |
 

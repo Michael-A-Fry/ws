@@ -123,7 +123,7 @@ uv run --locked pytest -q            # the whole suite (tests/e2e skips without 
 uvx prek run --all-files             # gitleaks, ruff, typos, rumdl, actionlint, shellcheck, PII gate, globals, code map
 uv run --locked ws doctor --offline  # the installed tool checking itself; exit 1 for unconfigured roles is expected
 python3 scripts/gen_code_map.py      # regenerate the code map above after changing a module docstring
-python3 scripts/check_docs_integrity.py --allow-missing scripts/docs_pending.txt  # links, anchors, policy files
+python3 scripts/check_docs_integrity.py  # links, anchors, policy files
 git config core.hooksPath .github/hooks  # once: prek and the suite before each push (WS_SKIP_PREPUSH=1 skips, logged)
 bash install.sh --dry-run            # what the installer would do, without installing
 ```

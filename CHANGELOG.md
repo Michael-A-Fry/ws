@@ -48,26 +48,26 @@ The first thin tag: phases 0 to 5 of the plan, installed from the signed release
 
 - Secret scanning, push protection, a PII gate over every file and the full history, and signed commits on `main`.
 - Actions are pinned by commit SHA; tools are pinned at versions at least seven days old; `uv.lock` holds the rest.
-- The gate fails closed: a payload it cannot read, a policy it cannot load or a rule it cannot parse is a deny.
+- The gate fails closed: a payload it can't read, a policy it can't load or a rule it can't parse is a deny.
 - Agents never see a secret value: the broker injects it at the allowed host, and `ws secret wall` puts the store behind
   a separate user.
-- A tag or release asset cannot be changed after the release (immutable releases, protected `v*` tags).
+- A tag or release asset can't be changed after the release (immutable releases, protected `v*` tags).
 
 ### Known limits
 
-- The matcher cannot see every shell trick; the sandbox is the real wall, and the limits of each are listed in
+- The matcher can't see every shell trick; the sandbox is the real wall, and the limits of each are listed in
   `src/ws/policy.py`.
 - A repo that a session creates with `git init`, submodules added mid-session and `sub/.claude` config are reported
   after the run, not blocked.
 - `/proc/PID/mem` of the runner is readable inside the wall when `ptrace_scope` is 0 and the runner has no
   non-dumpable shim (Claude Code); `ws doctor` warns (WS007).
-- The macOS wall profile and the eval checker's `PT_DENY_ATTACH` are not tested in CI.
+- The macOS wall profile and the eval checker's `PT_DENY_ATTACH` aren't tested in CI.
 - A session that holds the runs log lock blocks every `ws run` (it fails closed and names the lock).
-- The end-to-end tests do not exercise `ws run`'s own broker start, a real provider's certificate chain or a real model.
+- The end-to-end tests don't exercise `ws run`'s own broker start, a real provider's certificate chain or a real model.
 - Harvest checks secret names and shapes, not values; the notify cap counts ws's own sends only; sops-age is named but
-  the broker does not read it yet.
-- The model-judged (rubric) grader is not built.
-- The lab VM cell of the install test has not run yet.
+  the broker doesn't read it yet.
+- The model-judged (rubric) grader isn't built.
+- The lab VM cell of the install test hasn't run yet.
 - PyPI publishing waits on a trusted publisher being set up; until then the GitHub release is the install route.
 
 [Unreleased]: https://github.com/Michael-A-Fry/ws/compare/v0.1.0...HEAD

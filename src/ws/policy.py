@@ -37,9 +37,11 @@ claude-code adapter writes), which acts on what a process does, not on what its 
     `commondir` and the worktree pointer files, the submodule repositories, the `core.hooksPath` folder when it is in the
     project and `[include]`d config files are read-only whether or not they exist yet (a missing one is made for the run
     and removed after, by the last session out of the project). `mv .git .git2` and `mv .claude x` are refused. Claude
-    Code has the same list in its own sandbox `denyWrite` (absolute paths of the project the settings are made in, which
-    stops an interpreter) and in its Edit deny rules (`**/NAME`, any project and any depth, which stop the Edit and Write
-    tools and a shell redirect it can read). The seccomp filter refuses ptrace, process_vm_readv and process_vm_writev.
+    Code has the same list: its Edit deny rules (`**/NAME`, any project and any depth) stop the Edit and Write tools and
+    a shell redirect it can read, and `ws gate launch --runner claude-code -- claude` adds this project's absolute paths
+    to its sandbox `denyWrite`, which is what stops an interpreter (started with plain `claude --settings`, only the Edit
+    rules hold). The seccomp filter refuses ptrace, process_vm_readv and process_vm_writev; the OpenCode shim marks the
+    runner non-dumpable, which closes /proc/PID/mem for it.
     After every walled run the launcher compares the project with how it was and reports, never deleting, a new or
     changed git folder, runner or tool config, or auto-loaded program at any depth (stderr, and
     `$WS_HOME/logs/wall-report.jsonl`): that covers what the lists cannot name.
@@ -60,9 +62,9 @@ claude-code adapter writes), which acts on what a process does, not on what its 
     must keep working inside the wall, so its hooks and config are writable), a submodule added during the session, and
     config in a sub-folder of the project (`sub/.claude/settings.json` is read only when a runner is started in `sub`;
     the Claude Code Edit rules reach it, the OpenCode wall does not): the end-of-run report names all three, but only
-    after the fact. /proc/PID/mem of the runner is readable from a walled child of the same user (no system call to
-    filter; pinned by a test), so a session can still read or patch the memory of the runner that started it. The Claude
-    Code kernel layer needs the settings made from the project folder; elsewhere only its Edit rules hold. CLAUDE.md,
+    after the fact. /proc/PID/mem and ptrace of a runner that does not mark itself non-dumpable, on a host whose Yama
+    ptrace_scope is 0 or absent, stay open to a walled child of the same user (`ws doctor` WARNs, WS007, with the sysctl
+    fix; the launcher prints a line). CLAUDE.md,
     AGENTS.md and `.gitmodules` are content and stay writable. A sign-in the walled OpenCode refreshes is not carried back
     to the real data folder (it is copied in at each start). A killed launcher leaves empty placeholders until the next
     launch in that project.

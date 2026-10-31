@@ -53,13 +53,25 @@ Decisions, and why:
     SIGTERM (and SIGINT when there is no terminal) stop the runner and leave through the same path.
   * The end-of-run report, because a list of paths is always one path short. After the runner exits, outside the wall,
     the launcher compares a bounded scan of the project taken before it started with one taken after (8 seconds and
-    300000 entries, then it says where it stopped): a new or changed `.git` at any depth (non-sample hooks, config keys
-    beyond a stock `git init`, submodules), any runner or tool config at any depth (`.claude`, `.opencode`, `.mcp.json`,
-    `opencode.json(c)`, `tui.json(c)`, `.vscode/settings.json|tasks.json`, `mise.toml`, `.pre-commit-config.yaml`,
-    `.envrc`), and the auto-loaded files of `.venv` and `node_modules/.bin`. It prints to stderr and appends a line to
-    `$WS_HOME/logs/wall-report.jsonl`, and removes nothing. This is what covers a runner started later in a sub-folder
-    (`sub/.claude`), a repository the session creates with `git init` (which has to keep working), and a submodule added
-    during the session.
+    300000 entries; a scan that stops says INCOMPLETE on the first line of the report, and then the list is a lower
+    bound): a new or changed `.git` at any depth (non-sample hooks, config keys beyond a stock `git init`, submodules),
+    any runner or tool config at any depth (`.claude`, `.opencode`, `.mcp.json`, `opencode.json(c)`, `tui.json(c)`,
+    `.vscode/settings.json|tasks.json`, `mise.toml`, `.pre-commit-config.yaml`, `.envrc`), the auto-loaded files of a
+    `.venv`, `venv` or `env` (`bin/*`, `*.pth`, `site-packages/*.py`), `node_modules` (each `.bin` link and the file it
+    resolves to inside the project, and the folder time of each package), and new `.pyc` files. Walled Python writes its
+    bytecode to the private tmp (PYTHONPYCACHEPREFIX), so a `.pyc` in the project is not the wall's doing. It prints to
+    stderr and appends a line to `$WS_HOME/logs/wall-report.jsonl` (ws.jsonl), and removes nothing. This is what covers
+    a runner started later in a sub-folder (`sub/.claude`), a repository the session creates with `git init` (which has
+    to keep working), and a submodule added during the session. It runs as the person on a tree the session wrote, so
+    it trusts nothing in it: every entry is lstat'd first, a link is reported as a link (its target text) and never read
+    through (a planted `sub/.git` that links to a `deny_read` file would otherwise be copied into a log the next session
+    reads), only regular files are opened (O_NOFOLLOW | O_NONBLOCK, a size cap, the time budget checked while reading; a
+    FIFO named `.mcp.json` or a link to /dev/zero cannot hang it), and git is never run on it.
+  * Claude Code has no bubblewrap wall, so `ws gate launch --runner claude-code -- claude` makes its own sandbox
+    project-specific: it adds the locked set of THIS project (git folders resolved as above) to `denyWrite` in a copy of
+    the generated settings under `$WS_HOME/gate/claude-code/projects/`, starts `claude --settings` with it, and writes the
+    same end-of-run report. The shared settings carry the Edit deny rules (`**/NAME`) only, because a sandbox path has no
+    project-relative spelling in a `--settings` file. See ws.adapters.claude_code.
   * A protected path reached through a symbolic link the session could replace is refused, with the real path in the
     message. A read-only bind holds the real path; delete a link in a writable folder and plant a folder under its name,
     and the hook's fixed --policy path reads the plant. (Links in folders the user cannot write are fine.)
@@ -88,9 +100,14 @@ Decisions, and why:
     person's processes, and `/proc/PID/root/...` of one is a path to every file as that process sees it, around every
     bind here. A process left behind dies with the launcher.
   * Other processes' memory. The filter also refuses ptrace, process_vm_readv and process_vm_writev: with Yama's
-    ptrace_scope at 0 a shell child of the runner could attach to it and patch the in-process gate plugin. Not closed:
-    /proc/PID/mem of the runner (same user, dumpable), which a system-call filter cannot see. The macOS profile has no
-    rule for this: the Seatbelt syntax could not be checked on a Mac, and a wrong rule would stop the profile loading.
+    ptrace_scope at 0 a shell child of the runner could attach to it and patch the in-process gate plugin. /proc/PID/mem
+    is the same reach by file, which no system-call filter can refuse, so the OpenCode shim calls prctl(PR_SET_DUMPABLE,
+    0) on its own process through the Bun FFI it already uses: a non-dumpable process is refused for /proc/PID/mem and
+    ptrace unless the caller has CAP_SYS_PTRACE, which the wall drops (tested against the real runner). Exec makes a
+    child dumpable again, so only the runner is hardened. Where the shim cannot load, or for a runner without one, the
+    gap is open on a host whose ptrace_scope is 0 or absent: `ws doctor` WARNs (WS007, with the sysctl line) and the
+    launcher prints one line. The macOS profile has no rule for this: the Seatbelt syntax could not be checked on a Mac,
+    and a wrong rule would stop the profile loading.
   * The terminal. The filter refuses the TIOCSTI and TIOCLINUX ioctls (typing into the person's shell; kernel 6.1 has no
     sysctl for it). `--new-session` (no controlling terminal) as well when stdin is not a terminal; an interactive runner
     keeps its terminal for Ctrl-C and window size.
@@ -119,6 +136,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import glob
 import hashlib
 import json
@@ -141,7 +159,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
 
-from ws import adapters, approvals, policy
+from ws import adapters, approvals, jsonl, policy
 from ws.approvals import ENV_MARKER, FD_ENV, approvals_dir
 from ws.output import WsError
 from ws.profile import ws_home
@@ -497,7 +515,25 @@ def claude_denied() -> list[str]:
 
 
 def launch_env(env: dict, tmp: str | None = None, homes: dict | None = None) -> dict:
-    return {**env, ENV_MARKER: "1", **({"TMPDIR": tmp} if tmp else {}), **(homes or {})}
+    """The runner's environment. In the wall, TMPDIR is the private tmp and so is Python's bytecode cache
+    (PYTHONPYCACHEPREFIX): a `.pyc` written into the project by a walled `python` would be loaded by the next unwalled
+    one, and the report would have to look for them."""
+    walled = {"TMPDIR": tmp, "PYTHONPYCACHEPREFIX": f"{tmp}/pycache"} if tmp else {}
+    return {**env, ENV_MARKER: "1", **walled, **(homes or {})}
+
+
+def ptrace_scope(path: str = "/proc/sys/kernel/yama/ptrace_scope") -> int | None:
+    """Yama's ptrace_scope, or None where the kernel has none (a process can then read a same-user process's memory)."""
+    try:
+        return int(Path(path).read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+PTRACE_NOTE = (
+    "ws: note: this host's ptrace_scope is 0 (or absent): a process in the wall can read the runner's memory through "
+    "/proc/PID/mem unless the runner marks itself undumpable (the OpenCode shim does). `ws doctor` WS007 has the fix."
+)
 
 
 def expand(path: str, env: dict) -> str:
@@ -700,6 +736,8 @@ def git_facts(project: str) -> GitFacts:
         return r.stdout if r.returncode == 0 else None
 
     real = os.path.realpath(project)
+    if os.path.islink(os.path.join(real, ".git")):
+        return GitFacts(None, [], [])  # never run git on a linked `.git`; lock_project refuses it
     dirs = [os.path.join(real, ".git")] if os.path.isdir(os.path.join(real, ".git")) else []
     where = git("rev-parse", "--show-toplevel", "--absolute-git-dir", "--git-common-dir")
     listing = git("config", "--list", "--show-origin", "-z")
@@ -901,6 +939,12 @@ def leave_project(home: Path, project: str) -> list[str]:
 # file anywhere in the project (a runner started in a sub-folder reads that folder's own `.claude`, `opencode.json`...),
 # and the auto-loaded files of a virtual environment or `node_modules`. It reports and never deletes: it cannot tell a
 # planted hook from one the person asked for.
+#
+# It runs as the person, outside the wall, on a tree the session wrote, so it trusts nothing in it. It looks at every
+# entry with lstat first. A link is reported as a link (its target text, at most) and never read through: a planted
+# `sub/.git` that links to a file `deny_read` hides would otherwise be copied by the launcher into a log the next session
+# can read. Only regular files are opened, with O_NOFOLLOW | O_NONBLOCK (a FIFO named `.mcp.json` would hang a plain
+# open), after an fstat, with a size cap and the scan's time budget checked while reading. git is never run on it.
 REPORT_NAMES = (
     ".claude",
     ".opencode",
@@ -915,6 +959,15 @@ REPORT_NAMES = (
     ".envrc",
 )
 REPORT_VSCODE = ("settings.json", "tasks.json")  # in a `.vscode` folder
+VENV_DIRS = (".venv", "venv", "env")
+VENV_AUTO = (  # what a virtual environment runs without being asked
+    "bin/*",
+    "Scripts/*",
+    "lib*/python*/site-packages/*.pth",
+    "lib*/python*/site-packages/*.py",
+    "Lib/site-packages/*.pth",
+    "Lib/site-packages/*.py",
+)
 STOCK_CONFIG = {
     "core.repositoryformatversion",
     "core.filemode",
@@ -924,19 +977,76 @@ STOCK_CONFIG = {
     "core.precomposeunicode",
     "core.symlinks",
 }
-VENV_AUTO = ("bin/*", "Scripts/*", "lib*/python*/site-packages/*.pth", "Lib/site-packages/*.pth")  # in a `.venv`
 SCAN_ENTRIES, SCAN_SECONDS = 300_000, 8.0  # the scan stops at either, and says so
+READ_CAP = 2 * 1024 * 1024  # a file bigger than this is reported by its size, not read
+PACKAGES_CAP = 5000  # the packages of one node_modules whose folder time is checked
+PYC_SHOWN = 5  # new .pyc files named in a report; the rest are counted
 
 
-def _digest(path: str) -> str:
-    h = hashlib.sha256()
+class _Out(Exception):
+    """The scan's time or entry budget ran out."""
+
+
+def _kind(path: str) -> str:
+    """link | dir | file | other (a FIFO, a socket, a device), by lstat: never through a link."""
     try:
-        with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(1 << 20), b""):
-                h.update(chunk)
+        mode = os.lstat(path).st_mode
     except OSError:
-        return "unreadable"
-    return h.hexdigest()[:16]
+        return "gone"
+    return "link" if stat.S_ISLNK(mode) else "dir" if stat.S_ISDIR(mode) else "file" if stat.S_ISREG(mode) else "other"
+
+
+def _link_print(path: str) -> dict:
+    try:
+        return {"link": os.readlink(path)[:200]}
+    except OSError:
+        return {"link": "?"}
+
+
+def _open_regular(path: str) -> tuple[int | None, str]:
+    """(fd, "") for a regular file opened without following a link or blocking, else (None, why)."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError as e:
+        return None, "a link" if e.errno == errno.ELOOP else "unreadable"
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            return None, "not a regular file"
+    except OSError:
+        os.close(fd)
+        return None, "unreadable"
+    return fd, ""
+
+
+def _read(path: str, deadline: float, clock, cap: int = READ_CAP) -> tuple[bytes | None, str]:
+    """(content, "") of a regular file of at most `cap` bytes, else (None, why). Raises _Out past the deadline."""
+    fd, why = _open_regular(path)
+    if fd is None:
+        return None, why
+    try:
+        size = os.fstat(fd).st_size
+        if size > cap:
+            return None, f"too big: {size}"
+        chunks, got = [], 0
+        while got < size:
+            if clock() > deadline:
+                raise _Out
+            chunk = os.read(fd, min(1 << 16, size - got))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            got += len(chunk)
+        return b"".join(chunks), ""
+    except OSError:
+        return None, "unreadable"
+    finally:
+        os.close(fd)
+
+
+def _digest(path: str, deadline: float, clock) -> str:
+    data, why = _read(path, deadline, clock)
+    return hashlib.sha256(data).hexdigest()[:16] if data is not None else f"!{why}"
 
 
 def _stat_print(path: str) -> str:
@@ -947,15 +1057,17 @@ def _stat_print(path: str) -> str:
     return f"{st.st_size}:{st.st_mtime_ns}"
 
 
-def _tree_print(folder: str) -> str:
-    """One print for a folder and everything under it: names, sizes and times (not contents), links not followed."""
+def _tree_print(folder: str, deadline: float, clock) -> str:
+    """One print for a folder and everything under it: names, sizes and times (not contents); links are named, never
+    followed."""
     h = hashlib.sha256()
     for here, dirs, files in os.walk(folder):
+        if clock() > deadline:
+            raise _Out
         dirs.sort()
-        for name in sorted(files):
-            h.update(
-                f"{os.path.relpath(os.path.join(here, name), folder)}:{_stat_print(os.path.join(here, name))}\n".encode()
-            )
+        for name in sorted([*files, *(d for d in dirs if _kind(os.path.join(here, d)) == "link")]):
+            p = os.path.join(here, name)
+            h.update(f"{os.path.relpath(p, folder)}:{_stat_print(p)}:{os.path.islink(p)}\n".encode())
     return h.hexdigest()[:16]
 
 
@@ -973,30 +1085,28 @@ def _config_keys(text: str) -> list[str]:
     return sorted(set(out))
 
 
-def _git_print(git_dir: str, skip_set: set[str]) -> dict:
-    """What matters about a git folder: hooks that are not samples, config keys beyond a stock `git init`, the config's
-    digest, and the submodule repositories."""
-    hooks = {}
-    try:
-        for name in sorted(os.listdir(os.path.join(git_dir, "hooks"))):
+def _git_print(git_dir: str, skip_set: set[str], deadline: float, clock) -> dict:
+    """What matters about a git folder (a real folder: the caller has checked it is not a link): hooks that are not
+    samples, config keys beyond a stock `git init`, the config's digest, and the submodule repositories."""
+    hooks: dict[str, str] = {}
+    hooks_dir = os.path.join(git_dir, "hooks")
+    if _kind(hooks_dir) == "dir":
+        for name in sorted(os.listdir(hooks_dir)):
             if not name.endswith(".sample"):
-                hooks[name] = _digest(os.path.join(git_dir, "hooks", name))
-    except OSError:
-        pass
-    try:
-        text = Path(git_dir, "config").read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        text = ""
-    modules = (
-        sorted(os.listdir(os.path.join(git_dir, "modules"))) if os.path.isdir(os.path.join(git_dir, "modules")) else []
-    )
+                hooks[name] = _digest(os.path.join(hooks_dir, name), deadline, clock)
+    elif _kind(hooks_dir) != "gone":
+        hooks["(hooks is not a folder)"] = _kind(hooks_dir)
+    text, _ = _read(os.path.join(git_dir, "config"), deadline, clock)
+    modules_dir = os.path.join(git_dir, "modules")
     pointer = os.path.join(git_dir, "commondir")
     return {
         "hooks": hooks,
-        "extra_config": [k for k in _config_keys(text) if k not in STOCK_CONFIG],
-        "config": _digest(os.path.join(git_dir, "config")),
-        "modules": modules,
-        "pointers": _digest(pointer) if os.path.exists(pointer) and os.path.realpath(pointer) not in skip_set else "",
+        "extra_config": [k for k in _config_keys((text or b"").decode("utf-8", "replace")) if k not in STOCK_CONFIG],
+        "config": _digest(os.path.join(git_dir, "config"), deadline, clock),
+        "modules": sorted(os.listdir(modules_dir)) if _kind(modules_dir) == "dir" else [],
+        "pointers": _digest(pointer, deadline, clock)
+        if _kind(pointer) != "gone" and os.path.realpath(pointer) not in skip_set
+        else "",
     }
 
 
@@ -1004,58 +1114,132 @@ def scan_project(
     project: str, skip: tuple[str, ...] = (), clock=time.monotonic
 ) -> tuple[dict[str, object], str | None]:
     """({key: print}, note): what is in the project that a person's next command could run. Keys are `git:REL` (a git
-    folder or `.git` file, at any depth), `config:REL` (a `REPORT_NAMES` entry or a `.vscode` settings or tasks file) and
-    `auto:REL` (`.venv/bin/*`, `.venv/**/*.pth`, `node_modules/.bin/*`). `skip` is paths not to look at (the placeholders
-    of another session). Bounded: `SCAN_ENTRIES` entries or `SCAN_SECONDS` seconds, then it stops and the note says where."""
+    folder or `.git` file, at any depth), `config:REL` (a `REPORT_NAMES` entry or a `.vscode` settings or tasks file),
+    `auto:REL` (a virtual environment's `bin/*`, `*.pth` and `site-packages/*.py`; `node_modules/.bin/*` with what each
+    link resolves to inside the project; the folder time of each package) and `pyc:REL` (compiled Python files). `skip`
+    is paths not to look at (the placeholders of another session). Bounded: `SCAN_ENTRIES` entries or `SCAN_SECONDS`
+    seconds, then it stops and the note says where. See the comment above for how entries are looked at."""
     found: dict[str, object] = {}
-    seen, start, note = 0, clock(), None
+    seen, start, where = 0, clock(), "."
+    deadline = start + SCAN_SECONDS
     skip_set = {os.path.realpath(p) for p in skip}
+    real = os.path.realpath(project)
 
     def add(prefix: str, path: str, value) -> None:
-        if os.path.realpath(path) not in skip_set:
+        if os.path.realpath(os.path.dirname(path)) + "/" + os.path.basename(path) not in skip_set:
             found[f"{prefix}:{os.path.relpath(path, project)}"] = value
 
-    for here, dirs, files in os.walk(project):
-        seen += len(dirs) + len(files)
-        if seen > SCAN_ENTRIES or clock() - start > SCAN_SECONDS:
-            note = (
-                f"the scan stopped after {seen} entries in {clock() - start:.1f}s, at {os.path.relpath(here, project)}"
+    def folder(prefix: str, path: str, build) -> None:
+        kind = _kind(path)
+        if kind == "link":
+            add(prefix, path, _link_print(path))
+        elif kind == "dir":
+            value = build(path)
+            if value is not None:  # a builder that adds its own entries returns None
+                add(prefix, path, value)
+        elif kind != "gone":
+            add(prefix, path, {"special": kind})
+
+    def regular(prefix: str, path: str, build) -> None:
+        kind = _kind(path)
+        if kind == "link":
+            add(prefix, path, _link_print(path))
+        elif kind == "file":
+            add(prefix, path, build(path))
+        elif kind != "gone":
+            add(prefix, path, {"special": kind})
+
+    def node_modules(path: str) -> None:
+        bin_dir = os.path.join(path, ".bin")
+        if _kind(bin_dir) == "dir":
+            for name in sorted(os.listdir(bin_dir)):
+                p = os.path.join(bin_dir, name)
+                if _kind(p) == "link":  # the target text, and the file it resolves to if that is in the project
+                    target = os.path.realpath(p)
+                    inside = target.startswith(real + "/")
+                    add(
+                        "auto",
+                        p,
+                        {"link": os.readlink(p)[:200], "resolved": _stat_print(target) if inside else "outside"},
+                    )
+                else:
+                    add("auto", p, _stat_print(p))
+        try:
+            packages = sorted(os.listdir(path))[:PACKAGES_CAP]
+        except OSError:
+            return
+        for name in packages:
+            if name.startswith("."):
+                continue  # .bin (done above), .cache, .package-lock.json
+            p = os.path.join(path, name)
+            subs = (
+                [os.path.join(p, s) for s in sorted(os.listdir(p))[:PACKAGES_CAP]]
+                if name.startswith("@") and _kind(p) == "dir"
+                else [p]
             )
-            break
-        keep = []
-        for d in dirs:
-            p = os.path.join(here, d)
-            if d == ".git":
-                add("git", p, _git_print(p, skip_set))
-            elif d in REPORT_NAMES:
-                add("config", p, _tree_print(p))
-            elif d == ".vscode":
-                for name in REPORT_VSCODE:
-                    if os.path.isfile(os.path.join(p, name)):
-                        add("config", os.path.join(p, name), _digest(os.path.join(p, name)))
-            elif d == "node_modules":
-                for f in sorted(glob.glob(os.path.join(p, ".bin", "*"))):
-                    add("auto", f, _stat_print(f))
-            elif d == ".venv":
-                autos = [f for pat in VENV_AUTO for f in glob.glob(os.path.join(p, pat))]
-                for f in sorted(autos):
-                    add("auto", f, _stat_print(f))
-            else:
-                keep.append(d)
-        dirs[:] = keep
-        for f in files:
-            p = os.path.join(here, f)
-            if f == ".git":
-                add("git", p, {"pointer": Path(p).read_text(encoding="utf-8", errors="replace")[:200]})
-            elif f in REPORT_NAMES:
-                add("config", p, _digest(p))
-    return found, note
+            for q in subs:
+                if _kind(q) == "dir":
+                    add("auto", q, f"{_stat_print(q)}|{_stat_print(os.path.join(q, 'package.json'))}")
+
+    def venv(path: str) -> None:
+        for pattern in VENV_AUTO:
+            for f in sorted(glob.glob(os.path.join(path, pattern))):
+                if not os.path.realpath(os.path.dirname(f)).startswith(real + "/"):
+                    continue  # reached through a link that leaves the project: not even its names are listed
+                add("auto", f, _link_print(f) if _kind(f) == "link" else _stat_print(f))
+
+    def pycache(path: str) -> None:
+        for name in sorted(os.listdir(path)):
+            if name.endswith(".pyc"):
+                add("pyc", os.path.join(path, name), _stat_print(os.path.join(path, name)))
+
+    try:
+        for here, dirs, files in os.walk(project):
+            seen += len(dirs) + len(files)
+            where = os.path.relpath(here, project)
+            if seen > SCAN_ENTRIES or clock() > deadline:
+                raise _Out
+            keep = []
+            for d in dirs:
+                p = os.path.join(here, d)
+                if d == ".git":
+                    folder("git", p, lambda q: _git_print(q, skip_set, deadline, clock))
+                elif d in REPORT_NAMES:
+                    folder("config", p, lambda q: _tree_print(q, deadline, clock))
+                elif d == ".vscode":
+                    if _kind(p) == "dir":
+                        for name in REPORT_VSCODE:
+                            regular("config", os.path.join(p, name), lambda q: _digest(q, deadline, clock))
+                    else:
+                        folder("config", p, lambda q: "")
+                elif d == "node_modules" or d in VENV_DIRS:
+                    folder("auto", p, node_modules if d == "node_modules" else venv)
+                elif d == "__pycache__":
+                    if _kind(p) == "dir":
+                        pycache(p)
+                else:
+                    keep.append(d)
+            dirs[:] = keep
+            for f in files:
+                p = os.path.join(here, f)
+                if f == ".git":
+                    regular(
+                        "git",
+                        p,
+                        lambda q: {"pointer": (_read(q, deadline, clock, 200)[0] or b"").decode("utf-8", "replace")},
+                    )
+                elif f in REPORT_NAMES:
+                    regular("config", p, lambda q: _digest(q, deadline, clock))
+        return found, None
+    except _Out:
+        return found, f"INCOMPLETE: the scan stopped after {seen} entries in {clock() - start:.1f}s, at {where}"
 
 
 def compare_scans(before: dict, after: dict, complete: bool = True) -> list[dict]:
     """The findings: every key in `after` that is new or has a different print. Removed ones are not findings. If the
-    first scan was cut short, a key it did not reach cannot be called new: only changes are reported then."""
-    out = []
+    first scan was cut short, a key it did not reach cannot be called new: only changes are reported then. New `.pyc`
+    files are named up to `PYC_SHOWN`, then counted."""
+    out, pyc = [], []
     for key in sorted(after):
         change = (
             "new"
@@ -1064,20 +1248,38 @@ def compare_scans(before: dict, after: dict, complete: bool = True) -> list[dict
             if key in before and before[key] != after[key]
             else None
         )
-        if change:
-            kind, _, rel = key.partition(":")
-            detail = after[key] if kind == "git" else ""
-            out.append({"kind": kind, "path": rel, "change": change, "detail": detail})
-    return out
+        if not change:
+            continue
+        kind, _, rel = key.partition(":")
+        item = {
+            "kind": kind,
+            "path": rel,
+            "change": change,
+            "detail": after[key] if isinstance(after[key], dict) else "",
+        }
+        (pyc if kind == "pyc" else out).append(item)
+    if len(pyc) > PYC_SHOWN:
+        pyc = [
+            *pyc[:PYC_SHOWN],
+            {"kind": "pyc", "path": f"... and {len(pyc) - PYC_SHOWN} more", "change": "new", "detail": ""},
+        ]
+    return [*out, *pyc]
 
 
 def describe(finding: dict) -> str:
-    what = {"git": "a git folder", "config": "a runner or tool config", "auto": "an auto-loaded program"}[
-        finding["kind"]
-    ]
+    what = {
+        "git": "a git folder",
+        "config": "a runner or tool config",
+        "auto": "an auto-loaded program",
+        "pyc": "a compiled Python file",
+    }[finding["kind"]]
     line = f"{finding['change']} {what}: {finding['path']}"
     d = finding["detail"]
-    if isinstance(d, dict) and d.get("pointer") is None:
+    if isinstance(d, dict) and "link" in d:
+        line += f" (a link to {d['link']})"
+    elif isinstance(d, dict) and "special" in d:
+        line += f" (not a regular file: {d['special']})"
+    elif isinstance(d, dict) and "hooks" in d:
         extra = [f"hooks: {', '.join(d['hooks'])}"] if d["hooks"] else []
         extra += [f"config keys beyond a stock init: {', '.join(d['extra_config'])}"] if d["extra_config"] else []
         extra += [f"submodules: {', '.join(d['modules'])}"] if d["modules"] else []
@@ -1088,28 +1290,29 @@ def describe(finding: dict) -> str:
 def report_run(
     home: Path, project: str, runner: str, before: dict, after: dict, notes: list[str], complete: bool = True
 ) -> list[dict]:
-    """Print what the session left (stderr), and append one JSON line to `$WS_HOME/logs/wall-report.jsonl`. Nothing is
-    printed or written when there is nothing to say. Never removes anything."""
+    """Print what the session left (stderr), and append one JSON line to `$WS_HOME/logs/wall-report.jsonl` (ws.jsonl:
+    bounded, rotated, link-safe). Nothing is printed or written when there is nothing to say. A scan that stopped says
+    INCOMPLETE on the first line: what is listed is then a lower bound. Never removes anything."""
     findings = compare_scans(before, after, complete)
     if not findings and not notes:
         return []
-    lines = [f"ws: wall report for {project}: the session left what you may run next, outside the wall:"]
+    stopped = any(n.startswith("INCOMPLETE") for n in notes)
+    head = f"ws: wall report for {project}" + (" - INCOMPLETE, so this list is a lower bound:" if stopped else ":")
+    lines = [head, "  the session left what you may run next, outside the wall:"] if findings else [head]
     lines += [f"  {describe(f)}" for f in findings]
     lines += [f"  note: {n}" for n in notes]
     lines.append("  Read these before you run git, a runner or a build here. ws removed nothing.")
     print("\n".join(lines), file=sys.stderr)
     try:
-        log = home / "logs" / "wall-report.jsonl"
-        log.parent.mkdir(parents=True, exist_ok=True)
         record = {
             "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "project": project,
             "runner": runner,
+            "incomplete": stopped,
             "findings": findings,
             "notes": notes,
         }
-        with open(log, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record) + "\n")
+        jsonl.append(home / "logs" / "wall-report.jsonl", record)
     except OSError:
         pass  # the stderr lines are the report; a log that cannot be written is not worth failing the run for
     return findings
@@ -1125,16 +1328,77 @@ def run_with_broker(cmd: list[str], env: dict, pass_fds: tuple[int, ...], root: 
     for fd in pass_fds:
         os.close(fd)
     threading.Thread(target=approvals.serve_claims, args=(mine, root), daemon=True).start()
+    _forward_signals(proc)
+    return _wait(proc)
+
+
+def _forward_signals(proc: subprocess.Popen) -> None:
     stop = [signal.SIGTERM, signal.SIGHUP]
     if not sys.stdin.isatty():  # at a terminal Ctrl-C reaches the runner itself, and the runner decides
         stop.append(signal.SIGINT)
     for sig in stop:
         signal.signal(sig, lambda *_: proc.terminate())  # the launcher stays up to tidy after the runner has gone
+
+
+def _wait(proc: subprocess.Popen) -> int:
     while True:
         try:
             return proc.wait()
         except KeyboardInterrupt:  # Ctrl-C reaches the runner too; the runner decides
             continue
+
+
+def run_plain(cmd: list[str], env: dict) -> int:
+    """Start `cmd` as it is (Claude Code has its own sandbox: nothing to wrap) and stay beside it, to tidy up after."""
+    proc = subprocess.Popen(cmd, env=env)
+    _forward_signals(proc)
+    return _wait(proc)
+
+
+def launch_claude(args: argparse.Namespace, argv: list[str], home: Path, env: dict) -> int:
+    """`ws gate launch --runner claude-code -- claude ...`: Claude Code's own sandbox, with settings made for THIS
+    project at the start of the session. The shared settings (`ws gate generate`, `ws install`) are made once for every
+    project, and a sandbox path has no project-relative spelling in a `--settings` file, so they carry the Edit rules but
+    no project paths. Here the project is known: the locked set (ws.sandbox PROJECT_LOCKED, GIT_LOCKED, the git folders
+    git resolves) is added to `denyWrite` in a copy under `$WS_HOME/gate/claude-code/projects/`, and `claude --settings`
+    is started with it. No bubblewrap: Claude Code's sandbox is the wall. The end-of-run report is the launcher's, as
+    for OpenCode."""
+    from ws.adapters import claude_code
+
+    out = home / "gate" / "claude-code"
+    base = out / claude_code.FILE
+    if not base.is_file():
+        raise WsError(
+            "not_found",
+            f"no generated Claude Code settings at {base}",
+            f"run `ws gate generate --runner claude-code --out {out}` (or `ws setup`) first",
+        )
+    try:
+        project = project_folder(os.getcwd(), env)
+    except SandboxError as e:
+        raise WsError("refused", f"refusing to start claude-code: {e}", "start it from a project folder") from e
+    target = out / "projects" / f"{project_key(project)}.json"
+    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if target.is_symlink():
+        target.unlink()
+    target.write_text(claude_code.for_project(base.read_text(encoding="utf-8"), project), encoding="utf-8")
+    cmd = [argv[0], "--settings", str(target), *argv[1:]]
+    before, note = scan_project(project)
+    notes = [note] if note else []
+    old = _exit_on_hangup()
+    try:
+        return run_plain(cmd, env)
+    except OSError as e:
+        print(f"ws: could not start {shlex.join(argv[:1])}: {e}", file=sys.stderr)
+        return 127
+    finally:
+        try:
+            after, note = scan_project(project)
+            report_run(home, project, "claude-code", before, after, [*notes, *([note] if note else [])], not notes)
+        except OSError as e:
+            print(f"ws: could not write the wall report: {e}", file=sys.stderr)
+        for sig, handler in old.items():
+            signal.signal(sig, handler)
 
 
 def cmd_launch(args: argparse.Namespace) -> int:
@@ -1145,12 +1409,6 @@ def cmd_launch(args: argparse.Namespace) -> int:
         raise WsError(
             "usage", "give the runner's command after --", "e.g. `ws gate launch --runner opencode -- opencode`"
         )
-    if args.runner == "claude-code":
-        raise WsError(
-            "unsupported",
-            "Claude Code has its own sandbox, so there is nothing to wrap",
-            "`ws gate generate --runner claude-code` already writes it into the settings: start claude with `--settings`",
-        )
     policy_file = Path(args.policy).expanduser().absolute() if args.policy else policy.policy_path()
     try:
         pol = policy.load(policy_file)
@@ -1158,6 +1416,8 @@ def cmd_launch(args: argparse.Namespace) -> int:
         raise WsError("bad_config", str(e), f"fix {policy_file}") from e
     home = ws_home().absolute()  # whatever --policy says, the gate keeps its approvals and sessions here
     env = launch_env(dict(os.environ))
+    if args.runner == "claude-code" and not args.no_sandbox:
+        return launch_claude(args, argv, home, env)
     if args.no_sandbox:
         print(NO_SANDBOX_NOTE.format(runner=args.runner), file=sys.stderr)
         try:
@@ -1166,6 +1426,8 @@ def cmd_launch(args: argparse.Namespace) -> int:
             print(f"ws: could not start {shlex.join(argv[:1])}: {e}", file=sys.stderr)
             return 127
         return 0  # exec does not return; this is for a test that replaces it. --no-sandbox never reaches the wall code
+    if ptrace_scope() in (0, None) and sys.platform == "linux":
+        print(PTRACE_NOTE, file=sys.stderr)
     tmp = tempfile.mkdtemp(prefix="ws-wall-")  # the wall's /tmp: the rest of the disk is read-only
     project, entered, before, notes = "", False, {}, []
     old = _exit_on_hangup()

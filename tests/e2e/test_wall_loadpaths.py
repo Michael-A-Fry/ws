@@ -35,6 +35,7 @@ import json
 import signal
 import stat
 import subprocess
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -586,7 +587,7 @@ def claude_world(tmp_path, monkeypatch, name: str, setup: str) -> Path:
     root = world(tmp_path, name, setup)
     monkeypatch.setenv("WS_HOME", str(root / "wshome"))
     monkeypatch.setenv("HOME", str(root / "home"))
-    monkeypatch.chdir(root / "work")  # the settings name the project they are made in (see claude_code.sandbox_block)
+    monkeypatch.chdir(tmp_path)  # not the project: the shared settings are made somewhere else
     return root
 
 
@@ -602,13 +603,34 @@ def claude_try(root: Path, call, layers: tuple[str, ...]) -> Path:
             del conf[layer]
     settings.write_text(json.dumps(conf))
     with AnthropicStub([call]) as stub:
-        proc = gr.claude_run(root, stub, settings, False, root / "work")
+        if "sandbox" in layers:  # the way a person starts it: the settings are made for this project at the start
+            proc = claude_via_launcher(root, stub)
+        else:
+            proc = gr.claude_run(root, stub, settings, False, root / "work")
     assert stub.tool_results(), f"the runner never reported the call back\n{gr.where(proc)}"
     return root / "work"
 
 
+def claude_via_launcher(root: Path, stub) -> subprocess.CompletedProcess:
+    """`ws gate launch --runner claude-code -- claude -p ...` against the stub model, as gr.claude_run starts claude."""
+    env = gr.base_env(root)
+    env.update(
+        ANTHROPIC_BASE_URL=stub.url,
+        ANTHROPIC_API_KEY="sk-ant-" + "stub" * 8,  # fake, built at run time
+        CLAUDE_CONFIG_DIR=str(root / "claude-config"),
+        CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1",
+        DISABLE_AUTOUPDATER="1",
+    )
+    cmd = [sys.executable, "-m", "ws", "gate", "launch", "--runner", "claude-code", "--", gr.runner_bin("claude")]
+    cmd += ["-p", "run the command", "--allowedTools", "Bash,Read,Write,Edit,Grep,Glob"]
+    cmd += ["--model", "claude-sonnet-4-5", "--no-session-persistence", "--setting-sources", "user"]
+    return gr.run(cmd, env, root / "work")
+
+
 @pytest.mark.parametrize("name", CLAUDE_BASH)
 def test_claude_codes_sandbox_holds_the_project_config_too(tmp_path, monkeypatch, name):
+    """Started with `ws gate launch --runner claude-code`: the settings carry THIS project's paths, whatever folder
+    `ws install` or `ws gate generate` ran in (the tests run them in a different one)."""
     setup, command, where = CLAUDE_BASH[name]
     call = Call("Bash", {"command": f"{command}; touch {RAN}"})
     walled = claude_try(claude_world(tmp_path, monkeypatch, "walled", setup), call, ("sandbox",))
@@ -894,3 +916,91 @@ def test_proc_pid_mem_of_the_parent_is_still_reachable_a_known_limit(tmp_path):
     change which closes it (a runner started non-dumpable, say) is noticed and ws.policy's limits are updated."""
     seen, _ = probe(tmp_path, "walled")
     assert seen["procmem"] == "read"
+
+
+def test_started_without_the_launcher_claude_codes_interpreter_is_not_held_but_the_edit_rules_are(
+    tmp_path, monkeypatch
+):
+    """What the docs say: plain `claude --settings shared.json` has no project paths in denyWrite."""
+    root = claude_world(tmp_path, monkeypatch, "plain", GIT)
+    settings = gr.generate(root, "claude-code") / "settings.json"
+    conf = json.loads(settings.read_text())
+    del conf["hooks"], conf["permissions"]
+    settings.write_text(json.dumps(conf))
+    call = Call("Bash", {"command": py_write(".opencode/plugins/x.js")})
+    with AnthropicStub([call]) as stub:
+        gr.claude_run(root, stub, settings, False, root / "work")
+    assert has(".opencode")(root / "work", root), (
+        "if this now fails the shared settings hold the project: update the docs"
+    )
+
+
+# --- the report does not read through what the session planted ------------------------------------------------------------
+
+
+def test_the_report_does_not_copy_a_denied_file_through_a_planted_link_and_a_fifo_does_not_hang_it(tmp_path):
+    root = world(tmp_path, "w", "mkdir -p ../home/.ssh && echo CANARY-KEY-MATERIAL > ../home/.ssh/id_rsa")
+    plant = (
+        "mkdir -p sub sub2 && ln -s $HOME/.ssh/id_rsa sub/.git && ln -s $HOME/.ssh sub2/.git && mkfifo sub/.mcp.json "
+        "&& ln -s /dev/zero sub/opencode.json && echo hidden > /dev/null"
+    )
+    proc = run(root, plant)  # the run's own timeout is the hang check
+    assert "CANARY-KEY-MATERIAL" not in proc.stderr
+    assert (root / "work" / "sub" / ".git").is_symlink()
+    assert "a link to" in proc.stderr and "not a regular file" in proc.stderr, proc.stderr
+    log = (root / "wshome" / "logs" / "wall-report.jsonl").read_text()
+    assert "CANARY-KEY-MATERIAL" not in log and "id_rsa" in log  # the link's own text, nothing read through it
+    again = run(root, "true")  # the pre-run scan meets the same entries
+    assert "CANARY" not in again.stderr
+
+
+# --- OpenCode marks itself undumpable: its memory is not readable from a shell command it starts ---------------------------
+
+ANCESTORS = """
+import os
+out = []
+pid = os.getppid()
+while pid > 1:
+    try:
+        comm = open(f"/proc/{pid}/comm").read().strip()
+        ppid = int(open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()[1])
+    except OSError:
+        break
+    try:
+        start = next(l.split("-")[0] for l in open(f"/proc/{pid}/maps") if "r-" in l.split()[1])
+        fd = os.open(f"/proc/{pid}/mem", os.O_RDONLY)
+        os.pread(fd, 8, int(start, 16))
+        out.append(f"{comm}=read")
+    except OSError as e:
+        out.append(f"{comm}=errno{e.errno}")
+    pid = ppid
+print("ANCESTORS", " ".join(out))
+"""
+
+
+def opencode_reads(tmp_path: Path, name: str, keep_shim: bool) -> list[str]:
+    root = world(tmp_path, name, "")
+    (root / "work" / "ancestors.py").write_text(ANCESTORS)
+    out = gr.generate(root, "opencode")
+    if not keep_shim:
+        (out / "plugins" / "ws-gate.js").unlink()
+    conf = json.loads((out / "opencode.json").read_text())
+    del conf["permission"]
+    (out / "opencode.json").write_text(json.dumps(conf))
+    call = Call("bash", {"command": "python3 ancestors.py", "description": "look"})
+    with OpenAIStub([call]) as stub:
+        gr.opencode_run(root, stub, out, root / "work", wrap=[*sb.WALL, "--"])
+    seen = " ".join(stub.tool_results())
+    assert "ANCESTORS" in seen, seen
+    return seen.split("ANCESTORS", 1)[1].split()
+
+
+def test_opencode_is_not_readable_through_proc_mem_from_its_shell_commands_with_the_shim_only(tmp_path):
+    if not yama_allows():
+        pytest.skip("ptrace_scope is above 0 on this host: a child cannot read its parent whatever the shim does")
+    with_shim = opencode_reads(tmp_path, "shim", True)
+    without = opencode_reads(tmp_path, "noshim", False)
+    mine = [r for r in with_shim if r.split("=")[0].lower().startswith(("opencode", ".opencode", "bun"))]
+    assert mine and all("=errno" in r for r in mine), f"the runner is readable with the shim: {with_shim}"
+    control = [r for r in without if r.split("=")[0].lower().startswith(("opencode", ".opencode", "bun"))]
+    assert control and any(r.endswith("=read") for r in control), f"control: without the shim it must be: {without}"

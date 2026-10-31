@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import struct
 import subprocess
 import sys
@@ -13,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from ws import approvals, cli, jobs, policy, sandbox
+from ws import approvals, cli, jobs, jsonl, policy, sandbox
 from ws.adapters import claude_code, opencode
 
 POLICY = policy.loads(
@@ -553,10 +554,57 @@ def test_no_sandbox_starts_bare_and_says_what_it_gives_up(env, capsys, monkeypat
     assert env[0][0] == ["opencode"] and env[0][1]["WS_GATED_SESSION"] == "1"
 
 
-def test_launch_needs_a_command_and_does_not_wrap_claude_code(env, capsys):
+def test_launch_needs_a_command(env):
     assert cli.main(["gate", "launch", "--runner", "opencode"]) == 1
+    assert env == []
+
+
+def claude_launch_setup(env, monkeypatch, tmp_path, wshome, name: str) -> Path:
+    """Generated settings in $WS_HOME as `ws install` leaves them, and a project folder to start from."""
+    out = wshome / "gate" / "claude-code"
+    for rel, text in claude_code.generate(policy.loads(""), ["ws"], out, wshome / "policy.toml").items():
+        (out / rel).parent.mkdir(parents=True, exist_ok=True)
+        (out / rel).write_text(text)
+    proj = tmp_path / name
+    proj.mkdir()
+    monkeypatch.chdir(proj)
+    monkeypatch.setattr(sandbox, "run_plain", lambda cmd, e: env.append((cmd, e)) or 0)
+    return proj
+
+
+def test_claude_code_is_started_with_settings_made_for_this_project_and_no_wrap(env, monkeypatch, tmp_path, wshome):
+    one = claude_launch_setup(env, monkeypatch, tmp_path, wshome, "one")
+    assert cli.main(["gate", "launch", "--runner", "claude-code", "--", "claude", "--model", "m"]) == 0
+    cmd, e = env[0]
+    assert cmd[0] == "claude" and cmd[1] == "--settings" and cmd[3:] == ["--model", "m"]  # no bwrap in front
+    conf = json.loads(Path(cmd[2]).read_text())
+    deny = conf["sandbox"]["filesystem"]["denyWrite"]
+    for rel in sandbox.claude_denied():
+        assert f"{one.resolve()}/{rel}" in deny
+    assert conf["permissions"]["deny"] and conf["hooks"] and e["WS_GATED_SESSION"] == "1"
+    two = tmp_path / "two"
+    two.mkdir()
+    monkeypatch.chdir(two)
+    env.clear()
+    assert cli.main(["gate", "launch", "--runner", "claude-code", "--", "claude"]) == 0
+    second = json.loads(Path(env[0][0][2]).read_text())["sandbox"]["filesystem"]["denyWrite"]
+    assert f"{two.resolve()}/.opencode" in second and f"{one.resolve()}/.opencode" not in second
+    assert Path(cmd[2]) != Path(env[0][0][2])  # one settings file per project
+    shared = json.loads((wshome / "gate" / "claude-code" / claude_code.FILE).read_text())
+    assert not any(
+        str(one.resolve()) in p or str(two.resolve()) in p for p in shared["sandbox"]["filesystem"]["denyWrite"]
+    )
+
+
+def test_claude_code_needs_generated_settings_and_a_project_folder(env, monkeypatch, tmp_path, wshome, capsys):
+    monkeypatch.chdir(tmp_path)
     assert cli.main(["gate", "launch", "--runner", "claude-code", "--", "claude"]) == 1
-    assert "own sandbox" in capsys.readouterr().err and env == []
+    assert "gate generate" in capsys.readouterr().err and env == []
+    claude_launch_setup(env, monkeypatch, tmp_path, wshome, "p")
+    (tmp_path / "home").mkdir(exist_ok=True)
+    monkeypatch.chdir(tmp_path / "home")  # the home folder is never a project
+    assert cli.main(["gate", "launch", "--runner", "claude-code", "--", "claude"]) == 1
+    assert "project folder" in capsys.readouterr().err and env == []
 
 
 def test_the_whole_generated_folder_and_both_control_folders_are_protected(env, monkeypatch, tmp_path, wshome):
@@ -838,25 +886,20 @@ def test_every_git_folder_in_the_project_is_locked_with_its_pointers(tmp_path):
         assert f"{real}/realgit/worktrees/wt/{name}" in wanted
 
 
-def test_the_claude_code_settings_carry_the_same_project_lock(tmp_path, monkeypatch):
+def test_the_shared_claude_code_settings_hold_the_edit_rules_and_no_project_paths(tmp_path, monkeypatch):
     proj = tmp_path / "proj"
     proj.mkdir()
-    monkeypatch.chdir(proj)
+    monkeypatch.chdir(proj)  # where it is made no longer matters: nothing about the folder is baked in
     out = tmp_path / "gate"
     files = claude_code.generate(policy.loads(""), ["ws"], out, tmp_path / "policy.toml")
     conf = json.loads(files[claude_code.FILE])
     deny, edit = conf["sandbox"]["filesystem"]["denyWrite"], conf["permissions"]["deny"]
     for rel in sandbox.claude_denied():  # the Edit rules are project-independent and reach sub-folders
         assert f"Edit(**/{rel})" in edit and f"Edit(**/{rel}/**)" in edit
-        assert f"{proj.resolve()}/{rel}" in deny  # the kernel layer names the project the settings are made in
+    assert not any(str(proj.resolve()) in p for p in deny)
     wanted = {".claude", ".opencode", ".mcp.json", "opencode.json", ".git/hooks", ".git/config", ".git/commondir"}
     assert wanted <= set(sandbox.claude_denied())
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    (tmp_path / "home").mkdir()
-    monkeypatch.chdir(tmp_path / "home")  # the home folder is never a project: no project paths, the Edit rules hold
-    bare = json.loads(claude_code.generate(policy.loads(""), ["ws"], out, tmp_path / "policy.toml")[claude_code.FILE])
-    assert not any(p.endswith("/.claude") for p in bare["sandbox"]["filesystem"]["denyWrite"])
-    assert "Edit(**/.claude/**)" in bare["permissions"]["deny"]
+    assert "ws gate launch --runner claude-code -- claude" in claude_code.launch_hint(str(out))
 
 
 def test_only_the_last_launcher_out_takes_the_placeholders_down_and_a_dead_one_is_cleaned_after(tmp_path, wshome):
@@ -915,6 +958,7 @@ def test_scan_and_compare_find_new_and_changed_things_and_skip_the_placeholders(
         (".vscode/tasks.json", "new"),
         (".venv/lib/python3.12/site-packages/x.pth", "new"),
         ("node_modules/.bin/tool", "new"),
+        ("node_modules/pkg", "new"),
     }
     git = found[("nested/.git", "changed")]["detail"]
     assert list(git["hooks"]) == ["pre-commit"] and git["extra_config"] == ["alias.zz", "core.fsmonitor"]
@@ -946,3 +990,143 @@ def test_a_launcher_with_nothing_to_say_prints_and_writes_nothing(tmp_path, wsho
     assert got and ".claude" in err and "note: a note" in err and "removed nothing" in err
     line = json.loads((wshome / "logs" / "wall-report.jsonl").read_text())
     assert line["project"] == "/p" and line["findings"][0]["path"] == ".claude" and line["notes"] == ["a note"]
+
+
+# --- the report does not trust the tree it reads ----------------------------------------------------------------------------
+
+
+def test_the_scan_never_reads_through_a_link_and_a_fifo_does_not_hang_it(tmp_path):
+    secret = tmp_path / "secret.txt"
+    secret.write_text("TOP-SECRET-" + "x" * 300)  # the kind of file deny_read hides
+    real_git = tmp_path / "elsewhere" / ".git"
+    (real_git / "hooks").mkdir(parents=True)
+    (real_git / "hooks" / "pre-commit").write_text("#!/bin/sh\n")
+    (real_git / "config").write_text("[alias]\n\tleak = !echo LEAKED\n")
+    proj = tmp_path / "p"
+    for d in ("a", "b", "c"):
+        (proj / d).mkdir(parents=True)
+    (proj / "a" / ".git").symlink_to(secret)  # a link to a file
+    (proj / "b" / ".git").symlink_to(real_git)  # a link to a folder with hooks and a config
+    os.mkfifo(proj / "c" / ".mcp.json")  # opening this for reading would block forever
+    (proj / "c" / "opencode.json").symlink_to("/dev/zero")  # reading this never ends
+    (proj / "c" / ".claude").symlink_to(tmp_path / "elsewhere")
+    (proj / "c" / "mise.toml").write_text("x" * (sandbox.READ_CAP + 1))  # too big to read
+    alarm = signal.alarm(20)  # a hang fails the test, not the run
+    try:
+        found, note = sandbox.scan_project(str(proj))
+    finally:
+        signal.alarm(0)
+        assert alarm == 0
+    text = json.dumps(found)
+    assert "TOP-SECRET" not in text and "LEAKED" not in text and "pre-commit" not in text  # nothing read through
+    assert found["git:a/.git"] == {"link": str(secret)} and found["git:b/.git"] == {"link": str(real_git)}
+    assert found["config:c/.mcp.json"] == {"special": "other"}
+    assert found["config:c/opencode.json"] == {"link": "/dev/zero"}
+    assert found["config:c/.claude"] == {"link": str(tmp_path / "elsewhere")}
+    assert found["config:c/mise.toml"] == "!too big: 2097153" and note is None
+    # and what it reports says so
+    line = sandbox.describe({"kind": "git", "path": "a/.git", "change": "new", "detail": found["git:a/.git"]})
+    assert line == f"new a git folder: a/.git (a link to {secret})"
+    assert "not a regular file" in sandbox.describe(
+        {"kind": "config", "path": "c/.mcp.json", "change": "new", "detail": {"special": "other"}}
+    )
+
+
+def test_a_read_stops_at_the_time_budget(tmp_path):
+    f = tmp_path / "big"
+    f.write_bytes(b"x" * 100_000)
+    ticks = iter([0.0, 5.0, 10.0, 15.0, 20.0, 25.0])
+    with pytest.raises(sandbox._Out):
+        sandbox._read(str(f), 1.0, lambda: next(ticks))
+
+
+def test_a_node_modules_bin_link_is_reported_by_what_it_resolves_to_inside_the_project(tmp_path):
+    proj = tmp_path / "p"
+    pkg = proj / "node_modules" / "tool" / "bin"
+    pkg.mkdir(parents=True)
+    (pkg / "run.js").write_text("a")
+    (proj / "node_modules" / ".bin").mkdir()
+    (proj / "node_modules" / ".bin" / "run").symlink_to("../tool/bin/run.js")
+    (proj / "node_modules" / ".bin" / "out").symlink_to(tmp_path / "outside-file")
+    before, _ = sandbox.scan_project(str(proj))
+    assert before["auto:node_modules/.bin/out"]["resolved"] == "outside"  # not even a stat of what is outside
+    (pkg / "run.js").write_text("changed, and longer")  # the link itself is untouched
+    after, _ = sandbox.scan_project(str(proj))
+    changed = {f["path"] for f in sandbox.compare_scans(before, after)}
+    assert "node_modules/.bin/run" in changed and "node_modules/.bin/out" not in changed
+
+
+def test_venvs_named_venv_and_env_site_packages_py_files_and_new_pyc_files_are_reported(tmp_path):
+    proj = tmp_path / "p"
+    site = proj / "venv" / "lib" / "python3.12" / "site-packages"
+    site.mkdir(parents=True)
+    (proj / "env" / "bin").mkdir(parents=True)
+    (proj / "pkg" / "__pycache__").mkdir(parents=True)
+    before, _ = sandbox.scan_project(str(proj))
+    (site / "sitecustomize.py").write_text("import os")
+    (proj / "env" / "bin" / "python-evil").write_text("x")
+    for i in range(8):
+        (proj / "pkg" / "__pycache__" / f"m{i}.cpython-312.pyc").write_bytes(b"\0")
+    found = sandbox.compare_scans(before, sandbox.scan_project(str(proj))[0])
+    paths = {f["path"] for f in found}
+    assert "venv/lib/python3.12/site-packages/sitecustomize.py" in paths and "env/bin/python-evil" in paths
+    pyc = [f for f in found if f["kind"] == "pyc"]
+    assert len(pyc) == sandbox.PYC_SHOWN + 1 and "3 more" in pyc[-1]["path"]  # five named, the rest counted
+
+
+def test_a_stopped_scan_is_a_loud_incomplete_header(tmp_path, wshome, capsys):
+    note = "INCOMPLETE: the scan stopped after 10 entries in 0.0s, at d3"
+    sandbox.report_run(wshome, "/p", "opencode", {}, {"config:.claude": "h"}, [note], complete=False)
+    err = capsys.readouterr().err
+    assert err.splitlines()[0].startswith("ws: wall report for /p - INCOMPLETE") and note in err
+    assert json.loads((wshome / "logs" / "wall-report.jsonl").read_text())["incomplete"] is True
+
+
+def test_the_report_log_goes_through_ws_jsonl(tmp_path, wshome):
+    for i in range(2):
+        sandbox.report_run(wshome, "/p", "opencode", {}, {f"config:x{i}": "h"}, [])
+    assert [r["findings"][0]["path"] for r in jsonl.read(wshome / "logs" / "wall-report.jsonl")] == ["x0", "x1"]
+    assert (wshome / "logs" / "wall-report.jsonl.lock").exists()  # the lock file ws.jsonl keeps
+
+
+def test_git_is_never_run_on_a_linked_dot_git(tmp_path, monkeypatch):
+    proj = tmp_path / "p"
+    proj.mkdir()
+    (proj / ".git").symlink_to(tmp_path)
+    ran = []
+    monkeypatch.setattr(sandbox.subprocess, "run", lambda *a, **k: ran.append(a) or None)
+    assert sandbox.git_facts(str(proj)) == sandbox.GitFacts(None, [], [])
+    assert ran == []
+    with pytest.raises(sandbox.SandboxError, match="symbolic link"):
+        sandbox.lock_project(str(proj))
+
+
+def test_walled_python_writes_its_bytecode_to_the_private_tmp_and_the_host_is_told_about_ptrace(tmp_path, monkeypatch):
+    e = sandbox.launch_env({"A": "1"}, "/tmp/ws-wall-x")
+    assert e["PYTHONPYCACHEPREFIX"] == "/tmp/ws-wall-x/pycache" and e["TMPDIR"] == "/tmp/ws-wall-x"
+    assert "PYTHONPYCACHEPREFIX" not in sandbox.launch_env({"A": "1"})  # --no-sandbox is left as it was
+    f = tmp_path / "scope"
+    assert sandbox.ptrace_scope(str(f)) is None  # no Yama
+    f.write_text("0\n")
+    assert sandbox.ptrace_scope(str(f)) == 0
+    f.write_text("1\n")
+    assert sandbox.ptrace_scope(str(f)) == 1
+
+
+def test_doctor_warns_when_ptrace_scope_is_zero_or_absent_and_gives_the_fix(tmp_path, monkeypatch):
+    from ws import doctor, osinfo
+
+    linux = osinfo.OSInfo(kind="linux", release="6", arch="x86_64", scheduler="systemd", supported=True)
+    for scope, status in ((0, "warn"), (None, "warn"), (1, "ok"), (2, "ok")):
+        monkeypatch.setattr(sandbox, "ptrace_scope", lambda scope=scope: scope)
+        c = doctor._ptrace_check(linux)
+        assert (c.id, c.status) == ("WS007", status)
+        assert (status == "warn") == ("kernel.yama.ptrace_scope = 1" in c.fix and "/etc/sysctl.d" in c.fix)
+    mac = osinfo.OSInfo(kind="macos", release="14", arch="arm64", scheduler="launchd", supported=True)
+    assert doctor._ptrace_check(mac).status == "ok"
+    assert doctor.WARN not in doctor.BAD  # a warning never fails the doctor
+
+
+def test_the_opencode_shim_marks_the_runner_undumpable():
+    shim = opencode.generate(policy.loads(""), ["ws"], Path("/x/out"), Path("/x/policy.toml"))[opencode.PLUGIN]
+    assert "prctl" in shim and "symbols.prctl(4, 0, 0, 0, 0)" in shim and "await undumpable()" in shim

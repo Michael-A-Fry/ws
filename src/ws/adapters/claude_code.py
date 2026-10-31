@@ -16,13 +16,16 @@ confines every shell command Claude runs, whatever program it starts:
   * the project's own config is held too (ws.sandbox PROJECT_LOCKED and GIT_LOCKED: `.claude`, `.opencode`, `.mcp.json`,
     `opencode.json(c)`, `tui.json(c)`, `.git/hooks`, `.git/config`, `.git/commondir`, `.git/worktrees`, `.git/modules`), so a
     session cannot plant a plugin or hook that runs at the next start outside the sandbox. Two layers, because the settings
-    are one file for every project and a sandbox path has no project-relative spelling here (`./x` means `~/.claude/x` in
+    file is one for every project and a sandbox path has no project-relative spelling here (`./x` means `~/.claude/x` in
     a `--settings` file; tried on 2.1.308): the Edit deny rules say `**/x`, which is project-independent, covers a
     sub-folder's own config as well, and stops the Edit and Write tools and a shell redirect Claude can read; and
-    `denyWrite` names the absolute paths of the project the settings are made in (the folder `ws gate generate` runs in,
-    git folders resolved as the OpenCode wall does), which is what stops an interpreter. So generate from the project, or
-    again for each project; where the settings were made elsewhere, only the Edit rules hold. Claude Code asks before it
-    writes `.claude` whatever the settings say. No launcher, so no end-of-run report for Claude Code.
+    `denyWrite` names the absolute paths of the project, which is what stops an interpreter. Those are added when the
+    session starts: **start a walled Claude Code session with `ws gate launch --runner claude-code -- claude`** (from the
+    project folder). It writes a copy of these settings with the project's paths (git folders resolved as the OpenCode
+    wall does) to `projects/` beside them, starts `claude --settings` with it, and reports afterwards what the session
+    left. Started with plain `claude --settings .../settings.json`, only the Edit rules hold: an interpreter in Bash can
+    still write `.opencode`, `opencode.json` and `.git/commondir` (Claude Code's sandbox already denies `.git/hooks` and
+    `.git/config` itself). Claude Code asks before it writes `.claude` whatever the settings say.
   * `filesystem.allowWrite`: the policy's allow_write, if it names any. Claude Code's own default (the project folder
     and its tmp; nothing else) is already an allow-list.
   * `filesystem.denyRead`: the deny_read rules that name a folder or file (ws.policy.sandbox_read_paths).
@@ -91,11 +94,8 @@ def _path(path: str) -> str:
 
 def sandbox_block(policy: Policy, out: Path, policy_file: Path) -> dict:
     """The `sandbox` settings: see the module docstring for what each key is for."""
-    from ws import sandbox  # here, not at the top: ws.sandbox imports the adapters
-
     home = str(Path(policy_file).parent)
-    project = sandbox.claude_denied_paths(os.getcwd())  # the project the settings are made in: see the docstring
-    fs: dict = {"denyWrite": list(dict.fromkeys([home, *protected_paths(out, policy_file), *project]))}
+    fs: dict = {"denyWrite": list(dict.fromkeys([home, *protected_paths(out, policy_file)]))}
     if policy.gate.deny_read:
         fs["denyRead"] = sandbox_read_paths(policy)
     if policy.gate.allow_write:  # Claude Code already allows its project folder and tmp; these are the person's extras
@@ -165,6 +165,17 @@ def _widens_sandbox(conf) -> str | None:
     return None
 
 
+def for_project(settings: str, project: str) -> str:
+    """The generated settings text with the project's locked paths added to the sandbox `denyWrite`, absolute: what
+    `ws gate launch --runner claude-code` starts claude with. The shared settings cannot hold them (see the docstring)."""
+    from ws import sandbox  # here, not at the top: ws.sandbox imports the adapters
+
+    conf = json.loads(settings)
+    fs = conf.setdefault("sandbox", {}).setdefault("filesystem", {})
+    fs["denyWrite"] = list(dict.fromkeys([*fs.get("denyWrite", []), *sandbox.claude_denied_paths(project)]))
+    return json.dumps(conf, indent=2) + "\n"
+
+
 def generate(policy: Policy, ws_cmd: list[str], out: Path, policy_file: Path) -> dict[str, str]:
     deny = [f"Bash({p})" for p in native_patterns(policy)]
     deny += [f"Read({_path(p)})" for p in policy.gate.deny_read]
@@ -229,7 +240,10 @@ def _optional(d: dict, key: str) -> str | None:
 
 
 def launch_hint(out: str) -> str:
-    return f"start Claude Code with: claude --settings {shlex.quote(out)}/{FILE}"
+    return (
+        "start Claude Code with: ws gate launch --runner claude-code -- claude "
+        f"(settings for the project; the shared file is {shlex.quote(out)}/{FILE})"
+    )
 
 
 # --- ws run: the command line, and the result read back as a run record --------------------------------------------

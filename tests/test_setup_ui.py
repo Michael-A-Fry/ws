@@ -868,3 +868,41 @@ def test_setup_never_writes_dial_act(box, capsys):
     # and no code path in setup sets a dial at all
     src = "".join(p.read_text() for p in Path(inline.__file__).parent.glob("*.py"))
     assert not re.search(r"\bdial\b", src)
+
+
+@posix_only
+def test_a_sigterm_while_installing_is_noted_and_the_summary_says_what_was_written(box, monkeypatch):
+    import pty
+    import signal
+
+    master, slave = pty.openpty()
+    real = flow.run_install
+
+    def term_then_install(*a, **k):
+        os.kill(os.getpid(), signal.SIGTERM)  # lands while the install is writing
+        return real(*a, **k)
+
+    monkeypatch.setattr(flow, "run_install", term_then_install)
+    try:
+        facts = flow.gather(os.environ, region="NZ")
+        out = io.StringIO()
+        keys = iter(ALL_ENTER)
+        with inline.Terminal(slave, out) as term:
+            wiz = inline.Wizard(
+                facts,
+                flow.choices_from(facts, cap=20),
+                out,
+                lambda: next(keys),
+                sleep=lambda _: None,
+                color=False,
+                live=False,
+                terminal=term,
+            )
+            code = wiz.run()
+        text = out.getvalue()
+        assert code == 130 and term.pending
+        assert "Done" in text and "Nothing was written" not in text  # what was written is reported, not denied
+        assert (box / ".ws" / "profile.toml").is_file()
+    finally:
+        os.close(master)
+        os.close(slave)

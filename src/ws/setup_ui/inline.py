@@ -228,9 +228,11 @@ class Wizard:
         color: bool = True,
         live: bool = True,
         interactive: bool = True,
+        terminal: Terminal | None = None,
     ) -> None:
         self.facts, self.c, self.out, self.key, self.sleep = facts, choices, out, key, sleep
         self._cols, self.live, self.interactive = cols, live, interactive
+        self.terminal = terminal
         self.a = Ansi(color)
         self.shown = 0  # lines of the live block currently on screen
         self.out_lines = 0  # lines printed so far that stay on the screen
@@ -570,6 +572,8 @@ class Wizard:
             self.draw(block())
 
         self.draw(block())
+        if self.terminal:
+            self.terminal.hold = True  # from here a SIGTERM is only noted: the summary below says what was written
         try:
             outcome = flow.run_install(facts, self.c, pv.steps, on_step)
         except (KeyboardInterrupt, Cancelled):
@@ -597,6 +601,8 @@ class Wizard:
         lines += [a.dim(f"  {n}") for n in outcome.notes]
         lines += ["", command_line(a, "Next", flow.next_commands(facts, self.c)), ""]
         self.print(lines)
+        if self.terminal and self.terminal.pending:  # asked to stop while it was writing: it finished, and said so
+            return 130
         return 0
 
     def fail(self, message: str, hint: str) -> None:
@@ -621,6 +627,8 @@ class Terminal:
         self.fd, self.out = fd, out
         self.old = termios.tcgetattr(fd)
         self._saved: dict[int, object] = {}
+        self.hold = False  # set while the install writes: a SIGTERM is then recorded, not raised
+        self.pending = False
 
     def enter(self) -> None:
         import tty
@@ -646,6 +654,9 @@ class Terminal:
         self.enter()
 
     def _on_end(self, signum, frame) -> None:  # SIGTERM, SIGHUP
+        if self.hold:  # a handler must not re-enter a half-finished write to the screen, nor stop the install half way
+            self.pending = True
+            return
         raise Cancelled
 
     def __enter__(self) -> Self:
@@ -744,8 +755,16 @@ def run(facts: flow.Facts, choices: flow.Choices, *, yes: bool = False, out: IO[
         )  # fmt: skip
         return wiz.run()
     fd = sys.stdin.fileno()
-    with Terminal(fd, out):
-        wiz = Wizard(facts, choices, out, Keys(fd).read, cols=lambda: shutil.get_terminal_size().columns, color=color)
+    with Terminal(fd, out) as term:
+        wiz = Wizard(
+            facts,
+            choices,
+            out,
+            Keys(fd).read,
+            cols=lambda: shutil.get_terminal_size().columns,
+            color=color,
+            terminal=term,
+        )
         try:
             return wiz.run()
         except KeyboardInterrupt:

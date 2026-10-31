@@ -1,0 +1,145 @@
+"""The JSON Schema (draft 2020-12) of a run record, as a Python dict: `ws secret wall` copies only .py files, so the
+schema lives here rather than in a .json file. `runrecord.schema_json()` gives the JSON text; the tests validate
+records against it with `jsonschema`."""
+
+from __future__ import annotations
+
+SCHEMA: dict = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "https://github.com/Michael-A-Fry/ws/schemas/run-record.schema.json",
+    "title": "ws run record",
+    "description": "One line of runs.jsonl: what one headless job did, whichever runner ran it. Unknown values are null, never missing.",
+    "type": "object",
+    "additionalProperties": False,
+    "required": [
+        "schema",
+        "run_id",
+        "job",
+        "runner",
+        "runner_version",
+        "exe_path",
+        "model_requested",
+        "models_used",
+        "started_at",
+        "ended_at",
+        "duration_ms",
+        "duration_api_ms",
+        "exit_code",
+        "status",
+        "error",
+        "session_id",
+        "transcript_path",
+        "tokens",
+        "cost_usd",
+        "cost_basis",
+        "num_turns",
+        "cwd",
+        "policy",
+        "secrets_used",
+        "ws_version",
+        "output_truncated",
+        "allow_unpriced",
+    ],
+    "properties": {
+        "schema": {"const": 1},
+        "run_id": {
+            "description": "Sortable: UTC start time, then six random hex digits.",
+            "type": "string",
+            "pattern": "^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}$",
+        },
+        "job": {"type": "string", "pattern": "^[A-Za-z0-9_-]+$"},
+        "runner": {
+            "description": "Null only for a job file that could not be read.",
+            "type": ["string", "null"],
+            "minLength": 1,
+        },
+        "runner_version": {"type": ["string", "null"]},
+        "exe_path": {
+            "description": "The runner executable ws started, as resolved on PATH.",
+            "type": ["string", "null"],
+        },
+        "model_requested": {"type": ["string", "null"]},
+        "models_used": {
+            "description": "Per model the runner reported (or the requested model when the runner does not name one).",
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["model", "input", "output", "cache_creation", "cache_read", "cost_usd"],
+                "properties": {
+                    "model": {"type": "string", "minLength": 1},
+                    "input": {"type": ["integer", "null"], "minimum": 0},
+                    "output": {"type": ["integer", "null"], "minimum": 0},
+                    "cache_creation": {"type": ["integer", "null"], "minimum": 0},
+                    "cache_read": {"type": ["integer", "null"], "minimum": 0},
+                    "cost_usd": {"type": ["number", "null"], "minimum": 0},
+                },
+            },
+        },
+        "started_at": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T.*Z$"},
+        "ended_at": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T.*Z$"},
+        "duration_ms": {"type": ["integer", "null"], "minimum": 0},
+        "duration_api_ms": {"type": ["integer", "null"], "minimum": 0},
+        "exit_code": {
+            "description": "The runner's exit code; null when it never ran or was killed.",
+            "type": ["integer", "null"],
+        },
+        "status": {"enum": ["ok", "error", "timeout", "refused"]},
+        "error": {
+            "description": "Short, and never a secret or a lease URL.",
+            "type": ["string", "null"],
+            "maxLength": 300,
+        },
+        "session_id": {"type": ["string", "null"]},
+        "transcript_path": {
+            "description": "Where the runner keeps the full transcript: a file for Claude Code, the session database for OpenCode.",
+            "type": ["string", "null"],
+        },
+        "tokens": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["input", "output", "cache_creation", "cache_read"],
+            "properties": {
+                "input": {"type": ["integer", "null"], "minimum": 0},
+                "output": {"type": ["integer", "null"], "minimum": 0},
+                "cache_creation": {"type": ["integer", "null"], "minimum": 0},
+                "cache_read": {"type": ["integer", "null"], "minimum": 0},
+            },
+        },
+        "cost_usd": {"type": ["number", "null"], "minimum": 0},
+        "cost_basis": {
+            "description": "How cost_usd was worked out: 'list' (the runner's list-price estimate), 'runner' (the runner's own figure), 'mixed', or 'unpriced' (tokens but no price, so cost is null).",
+            "type": ["string", "null"],
+        },
+        "num_turns": {"type": ["integer", "null"], "minimum": 0},
+        "cwd": {"type": ["string", "null"]},
+        "policy": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["dial", "rule_of_two"],
+            "properties": {
+                "dial": {"type": ["string", "null"]},
+                "rule_of_two": {"type": ["string", "null"], "pattern": "^(ok|refused|exception:[A-Za-z0-9_-]+)$"},
+            },
+        },
+        "secrets_used": {
+            "description": "Names and hosts only.",
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["name", "host"],
+                "properties": {"name": {"type": "string"}, "host": {"type": "string"}},
+            },
+        },
+        "ws_version": {"type": "string"},
+        "output_truncated": {
+            "description": "True when the runner printed more than the output cap and the saved stdout.txt or stderr.txt stops short.",
+            "type": "boolean",
+        },
+        "allow_unpriced": {
+            "description": "The job set allow_unpriced: it ran although its cost could not be known in advance.",
+            "type": "boolean",
+        },
+    },
+}

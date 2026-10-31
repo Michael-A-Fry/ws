@@ -72,6 +72,30 @@ jobs:
           WS_E2E_REQUIRE: "1" # a missing runner fails the job instead of skipping
         run: uv run --locked pytest -q tests/e2e/test_gate_runners.py
 
+  # Phase 3 pass test (row 3): a job's run record is complete against its schema on both runners. Same stub model, plus
+  # a real broker lease to a stub upstream; no paid provider.
+  run-e2e:
+    name: run record e2e (ubuntu-24.04, stub model)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: "0.13.1"
+          enable-cache: true
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+      - name: install the runners (versions released at least 7 days before pinning, 31 Oct 2026)
+        run: npm install --global @anthropic-ai/claude-code@2.1.308 opencode-ai@1.19.4
+      - name: the run record validates and is complete on Claude Code (bare) and OpenCode
+        env:
+          WS_E2E_REQUIRE: "1" # a missing runner fails the job instead of skipping
+        run: uv run --locked pytest -q tests/e2e/test_run_record.py
+
   # Phase 3 pass test: no secret is readable by the agent user (ws-dev), yet its lease request gets a proxied call
   # whose upstream sees the injected header. The wall is built by running the commands `ws secret wall` prints (this
   # runner has passwordless sudo and systemd), then the pass test runs against that result.

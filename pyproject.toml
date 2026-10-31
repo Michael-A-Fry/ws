@@ -24,7 +24,7 @@ Source = "https://github.com/Michael-A-Fry/ws"
 ws = "ws.cli:main"
 
 [dependency-groups]
-dev = ["pytest==8.4.2"]
+dev = ["jsonschema==4.26.0", "pytest==8.4.2"]
 
 [build-system]
 requires = ["uv_build>=0.13,<0.14"]

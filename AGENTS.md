@@ -77,6 +77,7 @@ LICENSES/         third-party licence texts (see NOTICE)
 | `status.py` | `ws status`: for each runner, every rules, skill, hook and MCP file it will load here, with... |
 | `testing/` | Test support that ships with ws: the mock model provider and its scenarios |
 | `usage.py` | The Console usage check: can ws read the provider's own usage report, the billing truth... |
+| `version.py` | `ws version`: which build is this, where did it come from, and where is it installed |
 
 <!-- code-map:end -->
 

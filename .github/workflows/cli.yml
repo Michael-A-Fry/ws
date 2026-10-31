@@ -52,6 +52,23 @@ jobs:
           export WS_HOME="$RUNNER_TEMP/wshome"
           set +e; uv run --locked ws doctor --json > "$RUNNER_TEMP/doctor.json"; code=$?; set -e
           uv run --locked python scripts/check_fresh_doctor.py "$RUNNER_TEMP/doctor.json" "$code"
+      # A pull request is checked out as a merge commit, so the expected sha is the checkout's own HEAD; on a push or the
+      # nightly run that is GITHUB_SHA as well, and the step says so if it is not.
+      - name: ws version --json reports the commit this job checked out
+        run: |
+          expected="$(git rev-parse HEAD)"
+          if [ "$GITHUB_EVENT_NAME" != "pull_request" ] && [ "$GITHUB_SHA" != "$expected" ]; then
+            echo "::error::checked out $expected but GITHUB_SHA is $GITHUB_SHA"; exit 1
+          fi
+          export WS_HOME="$RUNNER_TEMP/wshome"
+          uv run --locked ws version --json > "$RUNNER_TEMP/version.json"
+          uv run --locked python - "$RUNNER_TEMP/version.json" "$expected" <<'PY'
+          import json, sys
+          data = json.load(open(sys.argv[1]))["data"]
+          print(data)
+          assert data["git_sha"] == sys.argv[2], f"ws version says {data['git_sha']}, expected {sys.argv[2]}"
+          assert data["install_source"] == "checkout", data["install_source"]
+          PY
 
   gate-e2e:
     name: gate e2e (ubuntu-24.04, stub model)

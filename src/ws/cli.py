@@ -32,6 +32,7 @@ from ws import (
     setup_ui,
     skills,
     status,
+    version,
 )
 from ws import eval as ws_eval
 from ws import globals as ws_globals
@@ -268,6 +269,7 @@ def build_parser() -> argparse.ArgumentParser:
     config_cmd.register(sub)
     status.register(sub)
     ws_eval.register(sub)
+    version.register(sub)
     return p
 
 

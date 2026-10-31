@@ -5,3 +5,5 @@ __pycache__/
 .rumdl_cache/
 *.egg-info/
 dist/
+# written by the release workflow just before `uv build` (src/ws/version.py reads it)
+src/ws/_build.py

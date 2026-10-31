@@ -44,7 +44,7 @@ def docstring(path: Path) -> str:
 def rows() -> list[tuple[str, str]]:
     found = [(f"`{p.name}`", docstring(p)) for p in PKG.glob("*.py") if p.name not in _SKIP]
     found += [(f"`{p.name}/`", docstring(p / "__init__.py")) for p in PKG.iterdir() if (p / "__init__.py").is_file()]
-    return sorted(found, key=lambda r: r[0].strip("`").rstrip("/"))
+    return sorted(found, key=lambda r: (r[0].strip("`").rstrip("/"), r[0]))
 
 
 def render() -> str:

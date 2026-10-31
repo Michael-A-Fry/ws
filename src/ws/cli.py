@@ -244,7 +244,7 @@ def build_parser() -> argparse.ArgumentParser:
     i.add_argument("--notes", metavar="PATH", help="your notes folder (default ~/Notes)")
     i.add_argument("--create-notes", action="store_true", help="create the notes folder if it is missing")
     i.add_argument("-y", "--yes", action="store_true", help="take the defaults for anything not given; no prompts")
-    i.set_defaults(func=cmd_init)
+    i.set_defaults(func=cmd_init, raw=lambda a: not a.yes and sys.stdin.isatty())  # it asks the questions
 
     gate.register(sub)
     secrets.register(sub)

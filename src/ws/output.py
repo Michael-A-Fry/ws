@@ -12,8 +12,8 @@ unavailable, io, unsupported, failed.
 
 `--json` (or `WS_OUTPUT=json`) is global: it works before or after the command, on every command. A command with
 structured data calls `result(data)`; one that only prints prose gets its text wrapped as `{"output": ...}`; one that
-speaks a protocol on stdout (the MCP server, the gate hook) sets `raw` and keeps its own stdout, but its errors are still
-the envelope. Text mode prints `ws: <message>` then `hint: <hint>` to stderr. The shape follows claw-code's error
+speaks a protocol on stdout (the MCP server, the gate hook) or asks a person a question (`ws approve`) sets `raw`: it
+keeps its own stdout and stdin, and its errors are text on stderr, since the runner or the person reads those. Text mode prints `ws: <message>` then `hint: <hint>` to stderr. The shape follows claw-code's error
 envelope (MIT; https://github.com/ultraworkers/claw-code, rusty-claude-cli main.rs), except that the kind is typed.
 """
 
@@ -160,8 +160,14 @@ def dispatch(args, kind: str, want_json: bool) -> int:
     """Run `args.func(args)`. In JSON mode the command's prints are captured so that stdout is exactly one envelope."""
     global _sink, _kind, _emitted
     args.json = want_json or bool(getattr(args, "json", False))
-    if not args.json or _raw(args):
+    if not args.json:
         return args.func(args)
+    if _raw(args):
+        try:
+            return args.func(args)
+        except WsError as e:  # a hook or a prompt: the person or the runner reads stderr, never an envelope
+            print(error_text(e), file=sys.stderr)
+            return e.exit_code
     _kind, _emitted = kind, False
     real = sys.stdout
     out, err = io.StringIO(), io.StringIO()

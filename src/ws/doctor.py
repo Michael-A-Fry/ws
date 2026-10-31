@@ -214,21 +214,18 @@ def run_checks(osi: OSInfo, profile_file: Path, env: dict | None = None, network
     except Exception as e:  # noqa: BLE001 (a broken check must report, not crash the whole doctor)
         status, detail, fix = FAIL, f"check crashed ({type(e).__name__})", ""
     checks.append(Check("WS005", "globals", status, detail, fix))
-    bad_jobs = jobs.problems(env)
-    if bad_jobs:
-        names = ", ".join(bad_jobs)
-        first = next(iter(bad_jobs.values()))
-        checks.append(
-            Check(
-                "WS006",
-                "jobs",
-                FAIL,
-                f"{len(bad_jobs)} job file(s) ws would refuse ({names}): {first}",
-                "fix or remove that job file; the other jobs still run",
-            )
-        )
+    try:
+        bad_jobs = jobs.problems(env)
+    except Exception as e:  # noqa: BLE001 (a broken check must report, not crash the whole doctor)
+        checks.append(Check("WS006", "jobs", FAIL, f"check crashed ({type(e).__name__})"))
     else:
-        checks.append(Check("WS006", "jobs", OK, "every job file loads"))
+        if bad_jobs:
+            first = next(iter(bad_jobs.values()))
+            detail = f"{len(bad_jobs)} job file(s) ws would refuse ({', '.join(bad_jobs)}): {first}"
+            fix = "fix or remove that job file; the other jobs still run"
+            checks.append(Check("WS006", "jobs", FAIL, detail, fix))
+        else:
+            checks.append(Check("WS006", "jobs", OK, "every job file loads"))
     roles = prof.get("roles") if isinstance(prof.get("roles"), dict) else {}
     for r in ROLES:
         cfg = roles.get(r.name)

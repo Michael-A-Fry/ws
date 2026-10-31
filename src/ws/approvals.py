@@ -412,4 +412,4 @@ def register(sub) -> None:
     p.add_argument("id", nargs="?", help="the id the gate printed (8 or more hex digits)")
     p.add_argument("--list", action="store_true", help="show what is waiting for approval")
     p.add_argument("--yes", action="store_true", help="do not ask to confirm (still needs a terminal)")
-    p.set_defaults(func=cmd_approve)
+    p.set_defaults(func=cmd_approve, raw=lambda a: not a.list)  # it asks a person to confirm: the prompt must be seen

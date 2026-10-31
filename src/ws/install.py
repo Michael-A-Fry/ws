@@ -733,4 +733,6 @@ def register(sub) -> None:
     u = sub.add_parser("uninstall", help="remove what ws installed; your notes and memory are kept")
     u.add_argument("--dry-run", action="store_true", help="show what would be removed")
     u.add_argument("-y", "--yes", action="store_true", help="no prompt")
-    u.set_defaults(func=cmd_uninstall)
+    u.set_defaults(
+        func=cmd_uninstall, raw=lambda a: not (a.dry_run or a.yes)
+    )  # it may ask first: the prompt must be seen

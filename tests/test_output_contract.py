@@ -159,13 +159,66 @@ def test_json_after_dashes_is_the_commands_own(box, capsys):
 
 
 @pytest.mark.parametrize("kind", sorted(RAW))
-def test_raw_commands_still_give_their_errors_as_the_envelope(box, capsys, kind):
-    if kind in ("gate.launch",):
-        code, out, _ = run(capsys, "gate", "launch", "--runner", "opencode", "--json")
-        env = envelope(out)
-        assert code == 1 and env["status"] == "error" and env["error_kind"] == "usage" and env["hint"]
+def test_raw_commands_are_listed_with_a_reason(kind):
+    assert RAW[kind]
+
+
+def test_raw_commands_give_their_errors_as_text_on_stderr(box, capsys, monkeypatch):
+    code, out, err = run(capsys, "gate", "launch", "--runner", "opencode", "--json")
+    assert code == 1 and out == "" and err.splitlines()[0].startswith("ws: give the runner's command")
+    assert "hint:" in err
+    monkeypatch.setenv("WS_OUTPUT", "json")
+    monkeypatch.setattr(
+        sys, "stdin", io.StringIO("not json")
+    )  # a payload the hook cannot read: denied, reason on stderr
+    code, out, err = run(capsys, "gate", "check", "--runner", "claude-code")
+    assert code == 2 and out == "" and "blocked" in err
+
+
+class Tty(io.StringIO):
+    def isatty(self):
+        return True
+
+
+@pytest.mark.parametrize("mode", ["flag", "env"])
+def test_a_prompt_is_seen_under_json_and_the_answer_is_honoured(box, capsys, monkeypatch, mode):
+    monkeypatch.setattr(sys, "stdin", Tty("n\n"))
+    argv = ["uninstall"]
+    if mode == "env":
+        monkeypatch.setenv("WS_OUTPUT", "json")
     else:
-        assert RAW[kind]  # a reason is written down
+        argv.append("--json")
+    code, out, _ = run(capsys, *argv)
+    assert code == 1 and "Remove what ws installed? [y/N]" in out  # not swallowed into an envelope
+    monkeypatch.setattr(sys, "stdin", Tty("n\n"))
+    code, out, _ = run(capsys, "init", "--json", "--create-notes")
+    assert "Does this machine stay on all the time?" in out and '"schema": "ws.cli/1"' not in out.split("\n")[0]
+
+
+def test_every_command_that_can_prompt_keeps_the_terminal():
+    parser = cli.build_parser()
+    ns = parser.parse_args(["approve", "abcdef12"])
+    assert output._raw(ns) is True
+    assert output._raw(parser.parse_args(["approve", "--list"])) is False
+    assert output._raw(parser.parse_args(["uninstall"])) is True
+    assert output._raw(parser.parse_args(["uninstall", "--dry-run"])) is False
+    assert output._raw(parser.parse_args(["uninstall", "--yes"])) is False
+    assert output._raw(parser.parse_args(["init", "--yes"])) is False
+
+
+def test_the_fresh_doctor_script_reads_the_envelope(box, capsys, tmp_path):
+    import subprocess
+
+    _, out, _ = run(capsys, "doctor", "--json")
+    report = tmp_path / "doctor.json"
+    report.write_text(out)
+    script = Path(__file__).resolve().parent.parent / "scripts" / "check_fresh_doctor.py"
+    ok = subprocess.run([sys.executable, str(script), str(report), "1"], capture_output=True, text=True, check=False)
+    assert ok.returncode == 0, ok.stderr + ok.stdout
+    bare = tmp_path / "bare.json"  # the pre-envelope shape must not pass
+    bare.write_text(json.dumps(json.loads(out)["data"]))
+    old = subprocess.run([sys.executable, str(script), str(bare), "1"], capture_output=True, text=True, check=False)
+    assert old.returncode != 0
 
 
 def test_a_typed_error_has_kind_message_hint_and_exit_code(box, capsys):

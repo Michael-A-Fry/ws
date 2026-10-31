@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# ws local pre-push gate: the hooks and the test suite that CI runs, before the push leaves your machine.
+#
+# Adapted from the claw-code pre-push hook (https://github.com/ultraworkers/claw-code, .github/hooks/pre-push).
+# Copyright (c) 2026 UltraWorkers and Claw Code contributors, MIT License.
+#
+# Turn it on once:
+#   git config core.hooksPath .github/hooks
+#
+# Skip it for one push with WS_SKIP_PREPUSH=1. The skip is logged to .git/ws-prepush-skips.log, never silent.
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null)"
+cd "$repo_root"
+
+if [[ "${WS_SKIP_PREPUSH:-}" == "1" ]]; then
+  log="$(git rev-parse --git-path ws-prepush-skips.log)"
+  printf '%s skipped pre-push on %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(git rev-parse --abbrev-ref HEAD)" >>"$log"
+  echo "pre-push: WS_SKIP_PREPUSH=1 set; skipping the checks (logged to $log)" >&2
+  exit 0
+fi
+
+echo "pre-push: uvx prek run --all-files" >&2
+uvx prek run --all-files >&2
+
+echo "pre-push: uv run --locked pytest -q" >&2
+uv run --locked pytest -q >&2

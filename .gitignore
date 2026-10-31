@@ -7,3 +7,5 @@ __pycache__/
 dist/
 # written by the release workflow just before `uv build` (src/ws/version.py reads it)
 src/ws/_build.py
+# the Vale style package that `vale sync` downloads (.vale.ini)
+.github/vale/Microsoft/

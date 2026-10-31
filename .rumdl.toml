@@ -1,2 +1,6 @@
 [global]
 line-length = 120
+
+# Relative links are checked by scripts/check_docs_integrity.py, which also checks anchors and knows the pending list.
+[MD057]
+enabled = false

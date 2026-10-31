@@ -1,0 +1,21 @@
+name: Feature request
+description: Tell us the problem you have. You do not need a solution.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do, and what gets in the way today? Describe the task, not the feature.
+    validations:
+      required: true
+  - type: textarea
+    id: workaround
+    attributes:
+      label: What you do today
+      description: Any workaround, and what it costs you.
+  - type: textarea
+    id: idea
+    attributes:
+      label: An idea for a solution (optional)
+      description: We treat this as one option, not the requirement.

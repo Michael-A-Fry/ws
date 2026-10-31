@@ -7,7 +7,23 @@ import json
 import sys
 from pathlib import Path
 
-from ws import __version__, broker, doctor, gate, mcp_server, memory, notes, osinfo, run, secrets, session
+from ws import (
+    __version__,
+    broker,
+    devices,
+    doctor,
+    gate,
+    install,
+    mcp_server,
+    memory,
+    modules,
+    notes,
+    notesdetect,
+    osinfo,
+    run,
+    secrets,
+    session,
+)
 from ws import globals as ws_globals
 from ws.profile import ProfileError, load, profile_path, write_if_changed
 
@@ -75,7 +91,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         notes = (
             args.notes
             if args.notes is not None
-            else _ask("Your notes folder?", machine.get("notes") or "~/Notes", interactive)
+            else _ask("Your notes folder?", machine.get("notes") or notesdetect.suggest()[0], interactive)
         )
     except (ValueError, EOFError) as e:
         print(f"ws: {e}", file=sys.stderr)
@@ -139,6 +155,9 @@ def build_parser() -> argparse.ArgumentParser:
     run.register(sub)
     ws_globals.register(sub)
     session.register(sub)
+    install.register(sub)
+    modules.register(sub)
+    devices.register(sub)
     return p
 
 

@@ -29,14 +29,9 @@ import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
-from ws import __version__, adapters, gate, output, policy, runrecord
+from ws import __version__, adapters, gate, jsonl, output, policy, runrecord
 from ws.output import WsError
 from ws.profile import ProfileError, load, profile_path
-
-try:  # not on native Windows; ws runs there only through WSL2, but the module must still import
-    import fcntl
-except ImportError:  # pragma: no cover
-    fcntl = None  # type: ignore[assignment]
 
 SCHEMA_VERSION = 1
 PASS, FAIL, SKIP = "pass", "fail", "skip"
@@ -119,15 +114,8 @@ def _replace(path: Path, text: str) -> None:
 
 
 def _append_line(path: Path, line: dict) -> None:
-    """One write() on an O_APPEND fd under an flock, 0600: the same way runs.jsonl and ratings.jsonl are written."""
-    data = (json.dumps(line, separators=(",", ":")) + "\n").encode()
-    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-    try:
-        if fcntl is not None:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-        os.write(fd, data)
-    finally:
-        os.close(fd)
+    """One line through `ws.jsonl`: locked, 0600, rotated at 5 MB."""
+    jsonl.append(path, line)
 
 
 # ---- a small JSON Schema check (the subset runschema uses) -----------------------------------------------------------

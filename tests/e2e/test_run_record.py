@@ -141,11 +141,12 @@ def test_claude_code_bare_record_is_complete(rig):
         rig.start(host_of(stub), "anthropic", "x-api-key")
         rig.job(
             "claude-job", "claude-code", "claude-sonnet-4-5", host_of(stub), "anthropic",
-            f'exe = {json.dumps(exe)}\nallowed_tools = ["Bash"]',
+            f'exe = {json.dumps(exe)}\nallowed_tools = ["Bash"]', top='green = "targeted"',
         )  # fmt: skip
         assert cli.main(["run", "claude-job"]) == 0
         (rec,) = rig.records()
         check_complete(rec, may_be_null={"error"})
+        assert rec["green"] == "targeted" and rec["recovered"] == [] and rec["schema"] == 2
         assert rec["runner"] == "claude-code" and rec["model_requested"] == "claude-sonnet-4-5"
         assert rec["models_used"][0]["model"] == "claude-sonnet-4-5"
         assert rec["cost_usd"] > 0 and rec["cost_basis"] and rec["duration_api_ms"] is not None
@@ -166,13 +167,14 @@ def test_opencode_record_is_complete(rig):
             f"exe = {json.dumps(exe)}\noffline = true\n"
             'provider = { npm = "@ai-sdk/openai-compatible", name = "stub", models = { m = { name = "m" } } }\n'
             f"env = {{ XDG_CACHE_HOME = {json.dumps(cache)} }}",
-            top="allow_unpriced = true",  # a stub model has no price; without this ws refuses the job
+            top="allow_unpriced = true\ngreen = \"package\"",  # a stub model has no price; without this ws refuses
         )  # fmt: skip
         assert cli.main(["run", "oc-job"]) == 0
         (rec,) = rig.records()
         # the stub has no price list, so OpenCode reports no cost; the stream has no API time and no model name
         check_complete(rec, may_be_null={"error", "duration_api_ms", "cost_usd"})
         assert rec["runner"] == "opencode" and rec["cost_basis"] == "unpriced" and rec["allow_unpriced"] is True
+        assert rec["green"] == "package"
         assert rec["models_used"][0]["model"] == "stub/m"  # filled in from the request: the stream does not name it
         assert rec["num_turns"] == 2 and rec["session_id"].startswith("ses_")
         assert rec["transcript_path"].endswith("opencode.db") and str(rig.user) in rec["transcript_path"]

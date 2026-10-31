@@ -326,7 +326,8 @@ def test_canary_jsonl_is_private_and_versions_json_leaves_no_temp_file(box, caps
     assert run(capsys, "canary", "--runner", "claude-code")[0] == 0
     assert oct((box / ".ws" / "canary.jsonl").stat().st_mode & 0o777) == "0o600"
     canary.observe(dict(os.environ), "claude-code", "3.0.0", "m")
-    assert sorted(p.name for p in (box / ".ws").iterdir()) == ["canary.jsonl", "versions.json"]
+    # the lock file is the one extra file ws.jsonl keeps beside the log; no temp file is left behind
+    assert sorted(p.name for p in (box / ".ws").iterdir()) == ["canary.jsonl", "canary.jsonl.lock", "versions.json"]
     names = []
     real = os.replace
     monkeypatch.setattr(os, "replace", lambda a, b: (names.append(os.path.basename(a)), real(a, b))[1])

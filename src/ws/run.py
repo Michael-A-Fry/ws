@@ -17,6 +17,12 @@ own timeout and turns allow, so keep `timeout_s` and `max_turns` tight. A run wh
 counts at the person's own fallback ([roles.budget] fallback_usd_per_mtok, else unknown_run_usd), so spend is
 never undercounted. ws ships no prices.
 
+One recovery per known failure: a small table (`RECOVERIES`) names the failures ws can mend, each typed by the
+exception class that reports it, never by its message. Today that is the broker not answering when a secret is leased:
+ws starts a per-user broker once (or, for a broker it does not own, waits and asks again once). Each try is written to
+the record's `recovered` list as {kind, action, ok}; if the failure comes back, the run ends as an error and says so.
+The job may also declare `green`, what its verification covers; the record carries it.
+
 Exit: 0 ok, 1 the runner failed or timed out, 2 the job could not be read (a record is written when the job name is
 safe), 3 refused.
 """
@@ -47,6 +53,8 @@ PASS_ENV = ("PATH", "HOME", "LANG", "TZ", "TERM")
 EXIT_FAILED, EXIT_BAD_JOB, EXIT_REFUSED = 1, 2, 3
 OUTPUT_CAP = 32 * 1024 * 1024  # bytes kept of each of stdout and stderr; the rest is read and dropped
 TERM_GRACE_S = 3.0  # how long a runner has to stop after SIGTERM before its whole group gets SIGKILL
+BROKER_START_S = 5.0  # how long a broker ws just started has to answer
+RECOVERY_WAIT_S = 2.0  # how long to wait before asking a broker ws does not own a second time
 _PLAN_LEASE = broker.Lease(lease="plan", base_url="http://127.0.0.1:0/l/PLAN", header="x-api-key", expires_at="")
 
 
@@ -80,6 +88,59 @@ def _budget(prof: dict) -> tuple[float | None, float | None, float | None]:
     roles = prof.get("roles") if isinstance(prof.get("roles"), dict) else {}
     cfg = roles.get("budget") if isinstance(roles.get("budget"), dict) else {}
     return _number(cfg, "monthly_cap_usd"), _number(cfg, "unknown_run_usd"), _number(cfg, "fallback_usd_per_mtok")
+
+
+def _start_broker(sock: Path) -> bool:
+    """Start a per-user broker on `sock` (it clears a stale socket file itself) and wait for it to answer."""
+    try:
+        subprocess.Popen(  # left running on purpose: the next run finds it
+            [sys.executable, "-m", "ws", "broker", "serve", "--socket", str(sock)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+        )  # fmt: skip
+    except OSError:
+        return False
+    deadline = time.monotonic() + BROKER_START_S
+    while time.monotonic() < deadline:
+        try:
+            broker.status(sock, timeout=1.0)
+            return True
+        except broker.BrokerError:
+            time.sleep(0.1)
+    return False
+
+
+def _mend_broker(sock: Path) -> tuple[str, bool]:
+    """(what ws did, whether the broker answers now). A socket in this user's own run folder is a broker ws may start;
+    any other (the walled service, a socket the profile names) is not ws's to start, so it waits and looks again."""
+    if sock == ws_home().absolute() / "run" / "broker.sock":
+        return "started the broker", _start_broker(sock)
+    time.sleep(RECOVERY_WAIT_S)
+    try:
+        broker.status(sock, timeout=2.0)
+    except broker.BrokerError:
+        return "waited and asked again", False
+    return "waited and asked again", True
+
+
+# The known failures ws mends once, keyed by the exception class that reports each: (kind, what to do about it). A new
+# row is a typed error that something in ws already raises, and a fix that is safe to try without asking.
+RECOVERIES = {broker.BrokerUnavailable: ("broker_unavailable", _mend_broker)}
+
+
+def _lease(s: jobs.SecretUse, sock: Path, rec: dict) -> broker.Lease:
+    """Lease one secret. A failure in `RECOVERIES` is mended once per run and the lease asked for again; a second
+    failure (or a failed fix) is raised as it is, and the run ends as an error."""
+    try:
+        return broker.request(s.name, s.purpose, s.host, socket=sock)
+    except tuple(RECOVERIES) as e:
+        kind, mend = RECOVERIES[type(e)]
+        if any(r["kind"] == kind for r in rec["recovered"]):
+            raise
+        action, ok = mend(sock)
+        rec["recovered"].append({"kind": kind, "action": action, "ok": ok})
+        if not ok:
+            raise
+    return broker.request(s.name, s.purpose, s.host, socket=sock)
 
 
 def _rule_label(v: policy.Verdict) -> str:
@@ -213,6 +274,7 @@ def _base_record(job: jobs.Job, run_id: str, started: datetime, pol: policy.Poli
         policy={"dial": pol.dial, "rule_of_two": _rule_label(verdict)},
         ws_version=__version__,
         allow_unpriced=job.allow_unpriced,
+        green=job.green,
     )
 
 
@@ -271,6 +333,7 @@ def _bad_job(name: str, message: str, log: Path, job: jobs.Job | None = None, re
         error=_short(message, []),
         ws_version=__version__,
         allow_unpriced=bool(job and job.allow_unpriced),
+        green=job.green if job else None,
     )
     if _append(log, rec):
         print(f"ws: recorded as {rec['run_id']}", file=sys.stderr)
@@ -381,7 +444,7 @@ def _execute(job, adapter, pol, rec: dict, run_dir: Path, cwd: Path, log: Path, 
         files = adapter.generate(pol, [sys.executable, "-m", "ws"], run_dir / "gate", policy_file)
         gate.write_files(run_dir / "gate", files)
         for s in job.secrets:
-            leases.append(broker.request(s.name, s.purpose, s.host, socket=sock))
+            leases.append(_lease(s, sock, rec))
             rec["secrets_used"].append({"name": s.name, "host": s.host})
         argv, extra = adapter.build_command(job, run_dir, leases[0] if leases else None)
         child_env = _child_env(ws_home().absolute(), extra)
@@ -412,7 +475,9 @@ def _execute(job, adapter, pol, rec: dict, run_dir: Path, cwd: Path, log: Path, 
     except broker.BrokerRefused as e:
         rec.update(status="refused", error=_short(f"broker refused the secret: {e}", leases))
     except broker.BrokerUnavailable as e:
-        rec.update(status="error", error=_short(str(e), leases))
+        tried = f" (ws already {rec['recovered'][-1]['action']}, once)" if rec["recovered"] else ""
+        rec.update(status="error", error=_short(f"{e}{tried}; is the broker running? `ws doctor` checks", leases, 300))
+
     except Exception as e:  # noqa: BLE001 (whatever went wrong, the run still gets its record)
         rec.update(status="error", error=_short(f"{type(e).__name__}: {e}", leases))
     finally:

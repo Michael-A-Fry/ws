@@ -29,6 +29,7 @@ import pytest
 
 from e2e.stubs import AnthropicStub, Call, OpenAIStub
 from ws import cli
+from ws.testing import scenarios
 
 REQUIRE = os.environ.get("WS_E2E_REQUIRE") == "1"
 TIMEOUT = 180
@@ -105,6 +106,20 @@ def where(proc) -> str:
     return f"rc={proc.returncode}\nstdout={proc.stdout[-800:]}\nstderr={proc.stderr[-800:]}"
 
 
+def scenario(name: str, runner: str, work) -> tuple[list[Call], dict]:
+    """The stub's script and the expected outcome of a shared scenario (tests/scenarios.json, ws.testing.scenarios)."""
+    s = scenarios.get(name)
+    return s.calls_for(runner, work=str(work)), s.expectation(work=str(work))
+
+
+def assert_paths(expect: dict, proc=None) -> None:
+    """The files the scenario says must (or must not) exist afterwards."""
+    for path in expect.get("present", []):
+        assert Path(path).exists(), f"{path} was not made" + (f"\n{where(proc)}" if proc else "")
+    for path in expect.get("absent", []):
+        assert not Path(path).exists(), f"{path} was made: the call ran"
+
+
 def assert_all_blocked(stub, proc, calls: int = 1) -> None:
     """The runner reported every scripted call back to the model, and each result says it was blocked."""
     results = stub.tool_results()
@@ -164,9 +179,10 @@ def claude_go(tmp_path, work, layer: str, calls: list[Call]):
 
 @pytest.mark.parametrize("layer", ["native", "hook"])
 def test_claude_code_blocks_a_denied_command(tmp_path, work, layer):
-    stub, proc, _ = claude_go(tmp_path, work, layer, [Call("Bash", {"command": denied_command(work)})])
-    assert_all_blocked(stub, proc)
-    assert not (work / "DENIED").exists(), "the denied command ran"
+    calls, expect = scenario("denied_command", "claude-code", work)
+    stub, proc, _ = claude_go(tmp_path, work, layer, calls)
+    assert_all_blocked(stub, proc, calls=expect["tool_results"])
+    assert_paths(expect)
 
 
 @pytest.mark.parametrize("layer", ["native", "hook"])
@@ -201,9 +217,10 @@ def test_claude_code_cannot_write_its_own_gate(tmp_path, work, layer):
 
 @pytest.mark.parametrize("layer", ["native", "hook"])
 def test_claude_code_still_writes_elsewhere(tmp_path, work, layer):
-    target = work / "ok.txt"
-    stub, proc, _ = claude_go(tmp_path, work, layer, [Call("Edit", EDIT_NEW | {"file_path": str(target)})])
-    assert target.exists(), f"control write failed: {stub.tool_results()}\n{where(proc)}"
+    calls, expect = scenario("first_task", "claude-code", work)
+    stub, proc, _ = claude_go(tmp_path, work, layer, calls)
+    assert_paths(expect, proc)
+    assert len(stub.tool_results()) == expect["tool_results"]
 
 
 # --- OpenCode ----------------------------------------------------------------------------------------------------
@@ -277,10 +294,10 @@ def opencode_go(tmp_path, work, layer: str, calls: list[Call]):
 
 @pytest.mark.parametrize("layer", ["native", "shim"])
 def test_opencode_blocks_a_denied_command(tmp_path, work, layer):
-    call = Call("bash", {"command": denied_command(work), "description": "run it"})
-    stub, proc = opencode_go(tmp_path, work, layer, [call])
-    assert_all_blocked(stub, proc)
-    assert not (work / "DENIED").exists(), "the denied command ran"
+    calls, expect = scenario("denied_command", "opencode", work)
+    stub, proc = opencode_go(tmp_path, work, layer, calls)
+    assert_all_blocked(stub, proc, calls=expect["tool_results"])
+    assert_paths(expect)
 
 
 @pytest.mark.parametrize("layer", ["native", "shim"])
@@ -316,6 +333,7 @@ def test_opencode_cannot_write_its_own_gate(tmp_path, work, layer):
 
 @pytest.mark.parametrize("layer", ["native", "shim"])
 def test_opencode_still_writes_elsewhere(tmp_path, work, layer):
-    target = work / "ok.txt"
-    stub, proc = opencode_go(tmp_path, work, layer, [Call("write", {"filePath": str(target), "content": "x"})])
-    assert target.exists(), f"control write failed: {stub.tool_results()}\n{where(proc)}"
+    calls, expect = scenario("first_task", "opencode", work)
+    stub, proc = opencode_go(tmp_path, work, layer, calls)
+    assert_paths(expect, proc)
+    assert len(stub.tool_results()) == expect["tool_results"]

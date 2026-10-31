@@ -1,0 +1,130 @@
+{
+  "schema": 1,
+  "scenarios": {
+    "denied_command": {
+      "description": "The model asks for a command the default policy denies (it would also make a marker file). The gate blocks it and the marker never appears.",
+      "calls": [
+        {
+          "tool": {
+            "claude-code": "Bash",
+            "opencode": "bash"
+          },
+          "args": {
+            "claude-code": {
+              "command": "touch ${work}/DENIED && git push --force nowhere main"
+            },
+            "opencode": {
+              "command": "touch ${work}/DENIED && git push --force nowhere main",
+              "description": "run it"
+            }
+          }
+        }
+      ],
+      "expect": {
+        "outcome": "blocked",
+        "tool_results": 1,
+        "absent": [
+          "${work}/DENIED"
+        ]
+      }
+    },
+    "approved_command": {
+      "description": "A command the policy lets through once approved (or allows outright). It runs, and the marker appears.",
+      "calls": [
+        {
+          "tool": {
+            "claude-code": "Bash",
+            "opencode": "bash"
+          },
+          "args": {
+            "claude-code": {
+              "command": "touch ${work}/ALLOWED && git status"
+            },
+            "opencode": {
+              "command": "touch ${work}/ALLOWED && git status",
+              "description": "run it"
+            }
+          }
+        }
+      ],
+      "expect": {
+        "outcome": "executed",
+        "tool_results": 1,
+        "present": [
+          "${work}/ALLOWED"
+        ]
+      }
+    },
+    "broker_lease": {
+      "description": "A harmless command under a `ws run` with a leased key. The stub sees the real key the broker injects, the runner only a placeholder, and the lease is released.",
+      "calls": [
+        {
+          "tool": {
+            "claude-code": "Bash",
+            "opencode": "bash"
+          },
+          "args": {
+            "claude-code": {
+              "command": "echo hi"
+            },
+            "opencode": {
+              "command": "echo hi",
+              "description": "run it"
+            }
+          }
+        }
+      ],
+      "expect": {
+        "outcome": "executed",
+        "tool_results": 1
+      }
+    },
+    "budget_refusal": {
+      "description": "The month's spend is at the cap. ws refuses the run (exit 3) before the runner starts, so the stub is never called.",
+      "calls": [],
+      "expect": {
+        "outcome": "refused",
+        "stub_requests": 0
+      }
+    },
+    "first_task": {
+      "description": "The harmless first task the install-to-first-task timing uses: one call that writes a file in the project, then the model finishes.",
+      "calls": [
+        {
+          "tool": {
+            "claude-code": "Edit",
+            "opencode": "write"
+          },
+          "args": {
+            "claude-code": {
+              "file_path": "${work}/hello.txt",
+              "old_string": "",
+              "new_string": "hello"
+            },
+            "opencode": {
+              "filePath": "${work}/hello.txt",
+              "content": "hello"
+            }
+          }
+        }
+      ],
+      "final_text": "I wrote hello.txt.",
+      "expect": {
+        "outcome": "executed",
+        "tool_results": 1,
+        "present": [
+          "${work}/hello.txt"
+        ]
+      }
+    },
+    "plain_text": {
+      "description": "The model answers in text and calls no tool.",
+      "calls": [],
+      "final_text": "ok, done",
+      "expect": {
+        "outcome": "text_only",
+        "tool_results": 0
+      }
+    }
+  }
+}

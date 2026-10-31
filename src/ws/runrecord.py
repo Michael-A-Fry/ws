@@ -1,13 +1,16 @@
 """The run record: one JSON line per headless job in `$WS_HOME/logs/runs.jsonl`, the same shape for every runner.
 
 The shape is `runschema.SCHEMA` (JSON Schema 2020-12, a Python dict so the package stays .py files only). Every key is always
-present; a value ws could not learn is null. Appends are one `write()` on an O_APPEND fd under an flock, so two jobs
-finishing together never interleave, and the file is 0600.
+present; a value ws could not learn is null. Appends go through `ws.jsonl`: one `write()` under a lock, so two jobs
+finishing together never interleave; the file is 0600, rotated at 5 MB (three old files, more while they hold a record
+from this month) and no string field is longer than 16 KiB. `read` and `ws runs` read across the old files.
+
+Schema 2 added `green` (what the job's verification covers) and `recovered` (the automatic recoveries `ws run` tried).
+Lines written under schema 1 stay in the log and read as they are; callers use `.get` for the two new keys.
 """
 
 from __future__ import annotations
 
-import contextlib
 import copy
 import json
 import math
@@ -15,15 +18,11 @@ import os
 from datetime import UTC, datetime
 from pathlib import Path
 
+from ws import jsonl
 from ws.profile import ws_home
 from ws.runschema import SCHEMA
 
-try:  # not on native Windows; ws runs there only through WSL2, but the module must still import
-    import fcntl
-except ImportError:  # pragma: no cover
-    fcntl = None  # type: ignore[assignment]
-
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 KEYS = (
     "schema",
     "run_id",
@@ -52,7 +51,10 @@ KEYS = (
     "ws_version",
     "output_truncated",
     "allow_unpriced",
+    "green",
+    "recovered",
 )
+GREEN_LEVELS = ("targeted", "package", "full", "merge_ready")
 TOKEN_KEYS = ("input", "output", "cache_creation", "cache_read")
 STATUSES = ("ok", "error", "timeout", "refused")
 
@@ -95,6 +97,7 @@ def new(**fields) -> dict:
         policy={"dial": None, "rule_of_two": None},
         output_truncated=False,
         allow_unpriced=False,
+        recovered=[],
     )
     unknown = set(fields) - set(KEYS)
     if unknown:
@@ -103,37 +106,23 @@ def new(**fields) -> dict:
     return rec
 
 
-def append(path: Path, rec: dict) -> None:
+def _this_month(rec: dict) -> bool:
+    """A record that counts against this month's cap: rotation keeps any file that holds one."""
+    return str(rec.get("started_at", "")).startswith(f"{datetime.now(UTC):%Y-%m}")
+
+
+def append(path: Path, rec: dict, **limits) -> None:
+    """Add a record (see `ws.jsonl.append` for the lock, rotation and field cap; `limits` overrides its sizes)."""
     missing = [k for k in KEYS if k not in rec]
     if missing:
         raise ValueError(f"run record is missing {', '.join(missing)}")
-    line = (json.dumps(rec, ensure_ascii=True, separators=(",", ":")) + "\n").encode()
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-    try:
-        st = os.fstat(fd)
-        if st.st_mode & 0o077 and st.st_uid == os.geteuid():  # made earlier with a wider mode
-            os.fchmod(fd, 0o600)
-        if fcntl is not None:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-        os.write(fd, line)
-    finally:
-        os.close(fd)  # closing also drops the lock
+    jsonl.append(path, rec, keep_if=_this_month, **limits)
 
 
 def read(path: Path) -> list[dict]:
-    """Every record, oldest first. A line that is not a JSON object is skipped, so one bad write never hides the rest.
-    A missing file is no records; one that exists but cannot be read raises OSError."""
-    if not path.exists():
-        return []
-    out = []
-    with path.open(encoding="utf-8", errors="replace") as fh:
-        for line in fh:
-            with contextlib.suppress(ValueError):
-                rec = json.loads(line)
-                if isinstance(rec, dict):
-                    out.append(rec)
-    return out
+    """Every record, oldest first, across the rotated files. A line that is not a JSON object is skipped, so one bad
+    write never hides the rest. No log is no records; one that exists but cannot be read raises OSError."""
+    return jsonl.read(path)
 
 
 # What a run counts against the cap when the runner did not say what it cost. ws ships no prices (they go stale), so

@@ -85,9 +85,13 @@ class Leases:
         self.requested: list[tuple] = []
         self.released: list[str] = []
         self.refuse: broker.BrokerError | None = None
+        self.unavailable_times = 0  # the next N requests find no broker
 
     def request(self, name, purpose, host, socket=None, ttl_s=None):
         self.requested.append((name, purpose, host))
+        if self.unavailable_times > 0:
+            self.unavailable_times -= 1
+            raise broker.BrokerUnavailable("no broker answering")
         if self.refuse:
             raise self.refuse
         return broker.Lease(
@@ -135,6 +139,9 @@ def ws(tmp_path, monkeypatch):
     monkeypatch.delenv("WS_BROKER_SOCKET", raising=False)
     monkeypatch.setattr(broker, "request", w.leases.request)
     monkeypatch.setattr(broker, "release", w.leases.release)
+    w.started = []  # sockets ws was asked to start a broker on
+    monkeypatch.setattr(run, "_start_broker", lambda sock: w.started.append(sock) or False)  # never a real broker
+    monkeypatch.setattr(run, "RECOVERY_WAIT_S", 0)
     w.cap(20)
     return w
 
@@ -343,6 +350,122 @@ def test_no_broker_is_an_error_not_a_refusal(ws):
     ws.job()
     assert cli.main(["run", "daily"]) == 1
     assert valid(ws.records()[0])["status"] == "error"
+
+
+# --- one recovery per known failure ------------------------------------------------------------------------------
+
+
+def test_a_broker_that_is_down_is_started_once_and_the_lease_asked_for_again(ws, monkeypatch):
+    ws.leases.unavailable_times = 1
+    monkeypatch.setattr(run, "_start_broker", lambda sock: ws.started.append(sock) or True)
+    ws.job()
+    assert cli.main(["run", "daily"]) == 0
+    (rec,) = ws.records()
+    valid(rec)
+    assert rec["status"] == "ok" and rec["secrets_used"] == [{"name": "anthropic", "host": "api.anthropic.com"}]
+    assert rec["recovered"] == [{"kind": "broker_unavailable", "action": "started the broker", "ok": True}]
+    assert ws.started == [ws.home.absolute() / "run" / "broker.sock"]
+    assert len(ws.leases.requested) == 2 and ws.leases.released == ["lease2"]
+
+
+def test_a_broker_that_will_not_start_ends_the_run_with_the_typed_error_and_its_hint(ws, capsys):
+    ws.leases.unavailable_times = 5
+    ws.job()
+    assert cli.main(["run", "daily"]) == 1
+    (rec,) = ws.records()
+    valid(rec)
+    assert rec["status"] == "error" and "no broker answering" in rec["error"] and "ws doctor" in rec["error"]
+    assert rec["recovered"] == [{"kind": "broker_unavailable", "action": "started the broker", "ok": False}]
+    assert len(ws.leases.requested) == 1  # it did not ask again after a fix that failed
+    assert not (ws.home / "fake-saw.json").exists()  # the runner never started
+    assert "ws doctor" in capsys.readouterr().err
+
+
+def test_a_failure_that_comes_back_after_the_fix_is_tried_only_once(ws, monkeypatch):
+    ws.leases.unavailable_times = 5
+    monkeypatch.setattr(run, "_start_broker", lambda sock: ws.started.append(sock) or True)
+    ws.job()
+    assert cli.main(["run", "daily"]) == 1
+    (rec,) = ws.records()
+    valid(rec)
+    assert rec["status"] == "error" and "already started the broker, once" in rec["error"]
+    assert rec["recovered"] == [{"kind": "broker_unavailable", "action": "started the broker", "ok": True}]
+    assert len(ws.leases.requested) == 2 and len(ws.started) == 1
+
+
+def test_a_broker_ws_does_not_own_is_waited_for_not_started(ws, monkeypatch, tmp_path):
+    monkeypatch.setenv("WS_BROKER_SOCKET", str(tmp_path / "elsewhere.sock"))
+    monkeypatch.setattr(broker, "status", lambda socket=None, timeout=3.0: {"leases": 0})  # it is up again
+    ws.leases.unavailable_times = 1
+    ws.job()
+    assert cli.main(["run", "daily"]) == 0
+    (rec,) = ws.records()
+    assert rec["recovered"] == [{"kind": "broker_unavailable", "action": "waited and asked again", "ok": True}]
+    assert ws.started == []
+
+
+def test_a_refusal_is_not_a_known_failure(ws):
+    ws.leases.refuse = broker.BrokerRefused("host_not_allowed", "no")
+    ws.job()
+    assert cli.main(["run", "daily"]) == 3
+    assert ws.records()[0]["recovered"] == [] and ws.started == []
+
+
+def test_the_table_is_keyed_by_exception_class_not_message():
+    assert all(isinstance(k, type) and issubclass(k, Exception) for k in run.RECOVERIES)
+    assert broker.BrokerUnavailable in run.RECOVERIES
+
+
+# --- green levels ------------------------------------------------------------------------------------------------
+
+
+def test_the_job_declares_what_its_verification_covers_and_the_record_says_so(ws):
+    ws.job(extra='green = "package"')
+    assert cli.main(["run", "daily"]) == 0
+    assert valid(ws.records()[0])["green"] == "package"
+
+
+def test_green_is_null_when_the_job_says_nothing_and_a_refusal_keeps_it(ws):
+    ws.job()
+    cli.main(["run", "daily"])
+    assert valid(ws.records()[0])["green"] is None
+    ws.cap(0.0001)
+    ws.job(name="other", extra='green = "full"')
+    cli.main(["run", "other"])
+    assert valid(ws.records()[-1])["green"] == "full"
+
+
+def test_a_bad_green_level_is_a_bad_job_with_a_record(ws, capsys):
+    ws.job(extra='green = "great"')
+    assert cli.main(["run", "daily"]) == 2
+    assert "green must be one of targeted, package, full, merge_ready" in capsys.readouterr().err
+    assert valid(ws.records()[0])["green"] is None
+
+
+def test_the_schema_knows_the_levels_the_job_file_and_the_record_share():
+    assert jobs.GREEN_LEVELS == runrecord.GREEN_LEVELS
+    levels = runrecord.schema()["properties"]["green"]["enum"]
+    assert levels == [*runrecord.GREEN_LEVELS, None]
+    assert not VALIDATOR.is_valid({**runrecord.new(), "green": "great"})
+
+
+def test_the_log_rotates_and_ws_runs_and_the_budget_read_across_the_files(ws, monkeypatch, capsys):
+    from ws import jsonl
+
+    ws.job()
+    for _ in range(4):
+        assert cli.main(["run", "daily"]) == 0
+        capsys.readouterr()
+    line = len(ws.log.read_text(encoding="utf-8").splitlines()[0]) + 1
+    monkeypatch.setattr(jsonl, "DEFAULT_MAX_BYTES", line * 2 + 10)
+    monkeypatch.setattr(jsonl, "DEFAULT_KEEP", 1)
+    for _ in range(4):
+        assert cli.main(["run", "daily"]) == 0
+        capsys.readouterr()
+    assert (ws.log.parent / "runs.jsonl.1").exists()
+    assert len(ws.records()) == 8, "this month's records are kept past the limit, so the spend is never undercounted"
+    assert cli.main(["--json", "runs", "--last", "8"]) == 0
+    assert len(json.loads(capsys.readouterr().out)["data"]) == 8
 
 
 # --- how a run can end -------------------------------------------------------------------------------------------

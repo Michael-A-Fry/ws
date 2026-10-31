@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import getpass
+import hashlib
 import json
 import os
 import re
@@ -409,9 +410,69 @@ def trusted_python() -> tuple[str | None, str]:
     return None, "; ".join(why) or "no python3 found in /usr/bin or /usr/local/bin"
 
 
+PY_FLAGS = "-P -s"  # no current folder and no user site on sys.path: a planted ./ws/ is never imported
+CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def launcher_script(py: str, lib: str = WALL_LIB) -> str:
+    """The root-owned launcher. It leaves the caller's folder first, so nothing there can shadow the installed ws."""
+    return f'#!/bin/sh\ncd /\nPYTHONPATH={lib} PYTHONDONTWRITEBYTECODE=1 exec {py} {PY_FLAGS} -m ws "$@"\n'
+
+
+def tree_digest(pkg_dir: Path) -> str:
+    """sha256 over the sorted `sha256sum` lines of every regular file below pkg_dir (not __pycache__), the same value
+    the wall script computes on the root-owned snapshot, so the two can be compared. Raises SecretsError on a symlink,
+    a special file or a file that is not .py."""
+    lines = []
+    for dirpath, dirs, files in os.walk(pkg_dir):
+        dirs[:] = [d for d in dirs if d != "__pycache__"]
+        for n in [*dirs, *files]:
+            q = Path(dirpath) / n
+            if q.is_symlink() or not (q.is_dir() or q.is_file()):
+                raise SecretsError(f"{q} is a symlink or special file; the copy of ws would not be a plain snapshot")
+        for n in files:
+            q = Path(dirpath) / n
+            if not n.endswith(".py"):
+                raise SecretsError(f"{q} is not a .py file; the copy of ws would not be a plain snapshot")
+            rel = "./" + q.relative_to(pkg_dir).as_posix()
+            lines.append((rel.encode(), hashlib.sha256(q.read_bytes()).hexdigest()))
+    lines.sort()
+    text = "".join(f"{h}  {rel.decode()}\n" for rel, h in lines)
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def git_revision(pkg_dir: Path) -> str:
+    """Where this copy of ws came from, for the person to compare with GitHub."""
+    try:
+        head = subprocess.run(
+            ["git", "-C", str(pkg_dir), "rev-parse", "HEAD"], capture_output=True, text=True, check=False, timeout=10
+        )
+        if head.returncode != 0:
+            return "not a git checkout (compare the tree digest with a signed release instead)"
+        dirty = subprocess.run(
+            ["git", "-C", str(pkg_dir), "status", "--porcelain", "--", str(pkg_dir)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        state = "with uncommitted changes" if dirty.stdout.strip() else "clean"
+        return f"git commit {head.stdout.strip()} ({state})"
+    except (OSError, subprocess.SubprocessError):
+        return "unknown (git did not answer)"
+
+
 def wall_commands(user: str, registry: Path, old_store: Path, py: str, pkg_dir: Path, names: list[str]) -> str:
-    """The one-time sudo steps that move the store to its own system user. Every path from the user's side is quoted."""
+    """The one-time sudo steps that move the store to its own system user. Every path from the user's side is quoted.
+
+    Trust on first use: the root-owned copy of ws is a snapshot of `pkg_dir` taken when the script runs. The script
+    prints the git commit and a tree digest so the person can compare them with GitHub, and stops if the files it
+    copies do not match the digest printed here. It cannot prove the checkout is the real ws: installing from a signed
+    release tag (phase T) is what closes that gap. Until then this trusts the checkout at the moment of install.
+    """
     q = shlex.quote
+    digest = tree_digest(pkg_dir)
+    source = git_revision(pkg_dir)
     unit = f"""[Unit]
 Description=ws secrets broker
 After=network.target
@@ -433,27 +494,53 @@ ReadWritePaths={WALL_HOME}
 
 [Install]
 WantedBy=multi-user.target"""
-    launcher = f'#!/bin/sh\nPYTHONPATH={WALL_LIB} PYTHONDONTWRITEBYTECODE=1 exec {py} -s -m ws "$@"'
-    rotate = "\n".join(f"{wall_hint('set', n)}" for n in names)
-    return f"""# One-time setup. Secrets move to the system user {WALL_USER}, and the broker runs as it, from a copy of ws that only
+    rotate = "\n".join(wall_hint("set", n) for n in names)
+    return f"""#!/bin/bash
+# One-time setup. Secrets move to the system user {WALL_USER}, and the broker runs as it, from a copy of ws that only
 # root can change (so nothing running as {user} can edit the code that holds the keys). Needs sudo and systemd.
-# Read first: the registry below is copied as is, and it decides which hosts each key may be sent to.
+# Save this as a file and run it with `bash`: it stops at the first step that fails, so do not paste it into a shell.
+set -euo pipefail
+
+# WHAT THIS TRUSTS. The copy of ws below is whatever {q(str(pkg_dir))} holds at the moment you run it.
+#   source:      {source}
+#   tree sha256: {digest}
+# Compare the commit with GitHub. The script stops if the files it copies do not match that digest. It cannot prove the
+# checkout is the real ws: installing from a signed release tag (not built yet) is what closes that. Until then you are
+# trusting this checkout at the moment of install.
+# Also read the registry first: it is copied as is, and it decides which hosts each key may be sent to.
 #   {q(str(registry))}
+
+# ws: one snapshot taken by root without following links, checked, then moved into place. The system Python runs it.
+sudo install -d -o root -g root -m 0755 /opt/ws /opt/ws/bin {WALL_LIB}
+STAGE=$(sudo mktemp -d /opt/ws/.stage.XXXXXX)
+trap 'sudo rm -rf "$STAGE"' EXIT
+sudo cp -RP --no-preserve=all -- {q(str(pkg_dir))} "$STAGE/ws"
+sudo find "$STAGE/ws" -name __pycache__ -type d -prune -exec rm -rf {{}} +
+if [ -n "$(sudo find "$STAGE" -mindepth 1 ! -type f ! -type d -print -quit)" ]; then
+  echo "ws: the snapshot has a symlink or special file; nothing installed" >&2; exit 1
+fi
+if [ -n "$(sudo find "$STAGE/ws" -type f ! -name '*.py' -print -quit)" ]; then
+  echo "ws: the snapshot has a file that is not .py; nothing installed" >&2; exit 1
+fi
+sudo chown -R root:root "$STAGE"
+sudo chmod -R u=rwX,go=rX "$STAGE"
+DIGEST=$(cd "$STAGE/ws" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum | sha256sum | cut -d' ' -f1)
+if [ "$DIGEST" != {digest} ]; then
+  echo "ws: the source changed since this was printed (tree sha256 $DIGEST); nothing installed" >&2; exit 1
+fi
+echo "ws: installing ws tree sha256 $DIGEST"
+sudo rm -rf {WALL_LIB}/ws
+sudo mv "$STAGE/ws" {WALL_LIB}/ws
+sudo tee {WALL_BIN} >/dev/null <<'EOF-LAUNCHER'
+{launcher_script(py).rstrip()}
+EOF-LAUNCHER
+sudo chown root:root {WALL_BIN}
+sudo chmod 0755 {WALL_BIN}
 
 sudo groupadd --system --force {WALL_GROUP}
 id {WALL_USER} >/dev/null 2>&1 || sudo useradd --system --home-dir {WALL_HOME} --no-create-home --shell /usr/sbin/nologin {WALL_USER}
 sudo usermod -aG {WALL_GROUP} {WALL_USER}
 sudo usermod -aG {WALL_GROUP} {q(user)}
-
-# ws, copied (regular .py files only) into a root-owned place, and a launcher that uses the system Python
-sudo install -d -o root -g root -m 0755 /opt/ws /opt/ws/bin {WALL_LIB}
-sudo rm -rf {WALL_LIB}/ws
-(cd {q(str(pkg_dir.parent))} && find ws -type f -name '*.py' -exec sudo install -D -o root -g root -m 0644 {{}} {WALL_LIB}/{{}} \\;)
-sudo tee {WALL_BIN} >/dev/null <<'EOF-LAUNCHER'
-{launcher}
-EOF-LAUNCHER
-sudo chown root:root {WALL_BIN}
-sudo chmod 0755 {WALL_BIN}
 
 # the store and logs belong to {WALL_USER}; the registry belongs to root so neither the broker nor an agent can add a host
 sudo install -d -o {WALL_USER} -g {WALL_USER} -m 0700 {WALL_HOME} {WALL_HOME}/secrets {WALL_HOME}/logs
@@ -476,7 +563,8 @@ sudo systemctl enable --now ws-broker
 #   store = "{WALL_HOME}/secrets"
 #   socket = "{WALL_SOCKET}"
 # Registry changes later: review the file, then run the `install -o root` line above again.
-# Check it: ws doctor  (WS104 should be ok, not warn)"""
+# Check it: ws doctor  (WS104 should be ok, not warn)
+"""
 
 
 def cmd_wall(args: argparse.Namespace) -> int:
@@ -505,14 +593,22 @@ def cmd_wall(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
+        pkg_dir = Path(__file__).resolve().parent
+        registry, old_store = registry_path(), store_dir()
+        for p in (registry, old_store, pkg_dir):
+            if CONTROL_RE.search(str(p)):
+                print(
+                    "ws: a path has a line break or control character in it; refusing to print commands for it",
+                    file=sys.stderr,
+                )
+                return 1
         try:
-            names = sorted(load_registry(registry_path()))
+            names = sorted(load_registry(registry))
+            text = wall_commands(pwd.getpwuid(os.getuid()).pw_name, registry, old_store, py, pkg_dir, names)
         except SecretsError as e:
             print(f"ws: {e}", file=sys.stderr)
             return 1
-        user = pwd.getpwuid(os.getuid()).pw_name
-        pkg_dir = Path(__file__).resolve().parent
-        print(wall_commands(user, registry_path(), store_dir(), py, pkg_dir, names))
+        print(text, end="")
         return 0
     why = {
         "macos": "macOS needs a _ws-broker user and a launchd job; that is not built yet",

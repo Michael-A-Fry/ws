@@ -196,6 +196,14 @@ def test_the_agent_user_cannot_change_the_code_the_broker_runs(wall):
         assert r.returncode != 0 and "Permission denied" in r.stderr, argv
 
 
+def test_a_planted_ws_package_in_the_agent_users_folder_is_not_imported(wall):
+    planted = wall["dev"] / "planted"
+    setup = f"mkdir -p {planted}/ws && : > {planted}/ws/__init__.py && echo 'print(\"PLANTED RAN\")' > {planted}/ws/__main__.py"
+    assert as_user(DEV_USER, "sh", "-c", setup).returncode == 0
+    r = as_user(DEV_USER, "sh", "-c", f"cd {planted} && exec {WALL_BIN} --version")
+    assert r.returncode == 0 and r.stdout.startswith("ws ") and "PLANTED" not in r.stdout + r.stderr
+
+
 def test_ws_secret_as_the_agent_user_reads_and_changes_nothing(wall):
     r = ws_as_dev(wall, "secret", "list")
     assert r.returncode == 0 and "unknown" in r.stdout and "another user" in r.stdout

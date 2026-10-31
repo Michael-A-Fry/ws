@@ -4,6 +4,7 @@ upstream is a stub on 127.0.0.1 (WS_BROKER_TEST_HTTP_UPSTREAM allows plain http 
 
 from __future__ import annotations
 
+import contextlib
 import http.client
 import json
 import os
@@ -777,5 +778,86 @@ def test_there_is_no_environment_switch_for_plain_http(base, stub, monkeypatch):
     try:
         assert e.call()[0] == 502
         assert stub.seen == []
+    finally:
+        e.broker.stop()
+
+
+def test_a_request_that_trickles_in_is_cut_at_the_deadline(base, stub, monkeypatch):
+    monkeypatch.setattr(broker, "REQUEST_DEADLINE_S", 0.5)
+    e = Env(base, stub)
+    e.write_registry()
+    e.store.write("anthropic", VALUE)
+    e.start()
+    try:
+        lease = e.lease()
+        hostport, _, prefix = lease.base_url.removeprefix("http://").partition("/")
+        host, _, port = hostport.partition(":")
+        c = socket.create_connection((host, int(port)), timeout=10)
+        c.sendall(f"POST /{prefix}/v1/x HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\nab".encode())
+        t0 = time.monotonic()
+        for _ in range(8):  # one byte at a time: every read succeeds, so only the whole-request deadline can stop it
+            time.sleep(0.2)
+            try:
+                c.sendall(b"x")
+            except OSError:
+                break
+        assert time.monotonic() - t0 < 5
+        c.settimeout(2)
+        with contextlib.suppress(OSError):
+            c.recv(100)  # cut: whatever the client sees, nothing was forwarded
+        assert stub.seen == []
+        c.close()
+        # a prompt request still works with the same short deadline
+        assert e.call(lease=e.lease())[0] == 200
+    finally:
+        e.broker.stop()
+
+
+def test_a_slow_reply_is_not_cut_by_the_request_deadline(base, stub, monkeypatch):
+    monkeypatch.setattr(broker, "REQUEST_DEADLINE_S", 0.5)
+    e = Env(base, stub)
+    e.write_registry()
+    e.store.write("anthropic", VALUE)
+    e.start()
+    try:
+        lease = e.lease()
+        hostport, _, prefix = lease.base_url.removeprefix("http://").partition("/")
+        c = http.client.HTTPConnection(hostport, timeout=10)
+        c.request("GET", f"/{prefix}/sse")
+        r = c.getresponse()
+        assert r.read1(100) == b"data: one\n\n"
+        time.sleep(1.0)  # past the request deadline: the reply is still streaming
+        stub.go.set()
+        assert r.read() == b"data: two\n\n"
+        c.close()
+    finally:
+        stub.go.set()
+        e.broker.stop()
+
+
+def test_a_connection_with_no_room_does_not_hold_up_the_accept_loop(base, stub, monkeypatch):
+    monkeypatch.setattr(broker, "MAX_CONNECTIONS", 1)
+    e = Env(base, stub)
+    e.write_registry()
+    e.start()
+    try:
+        held = socket.socket(socket.AF_UNIX)
+        held.connect(str(e.sock))  # takes the one slot
+        for _ in range(100):
+            if e.broker._slots._value == 0:
+                break
+            time.sleep(0.05)
+        silent = socket.socket(socket.AF_UNIX)
+        silent.connect(str(e.sock))  # no room, and it never sends: its busy reply waits up to a second for it
+        time.sleep(0.2)
+        held.close()
+        for _ in range(100):
+            if e.broker._slots._value == 1:
+                break
+            time.sleep(0.05)
+        t0 = time.monotonic()
+        assert broker.status(e.sock)["problems"] is not None
+        assert time.monotonic() - t0 < 0.7  # it used to wait out the silent one
+        silent.close()
     finally:
         e.broker.stop()

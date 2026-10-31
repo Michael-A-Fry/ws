@@ -6,6 +6,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import stat
 from pathlib import Path
 
@@ -238,7 +239,8 @@ def test_wall_prints_the_sudo_steps_on_linux(home, capsys, monkeypatch):
         "install -o root",
         "ExecStart=/opt/ws/bin/ws",  # the broker runs the root-owned copy, never the user's ws
         "install -d -o root -g root -m 0755 /opt/ws",
-        "find ws -type f -name '*.py'",  # regular files only
+        "cp -RP --no-preserve=all",  # one snapshot by root, links not followed
+        "set -euo pipefail",
     ):
         assert want in out
     assert str(home / "secrets.toml") in out and VALUE not in out
@@ -250,7 +252,10 @@ def test_wall_never_moves_old_values_and_says_to_rotate_them(home, capsys, monke
     linux_wall(monkeypatch)
     code, out, _ = run(capsys, "secret", "wall")
     assert code == 0 and VALUE not in out
-    assert "mv " not in out and "sh -c" not in out and "chown -R" not in out
+    old = str(home / "secrets")
+    named = re.compile(re.escape(old) + r"(?![\w.])")  # the folder itself, not secrets.toml beside it
+    assert [ln for ln in out.splitlines() if named.search(ln) and not ln.startswith("#")] == []  # only in comments
+    assert "sh -c" not in out
     assert "readable by everything that ran as" in out and "revoke the old one" in out
     for name in ("anthropic", "github"):  # one paste command per registered name, with the broker user's WS_HOME
         assert f"sudo -u ws-broker env WS_HOME=/var/lib/ws-broker /opt/ws/bin/ws secret set {name}" in out
@@ -270,8 +275,8 @@ def test_wall_quotes_every_path_from_the_users_side(tmp_path, capsys, monkeypatc
     assert shlex.quote(str(evil / "secrets.toml")) in out
     assert shlex.quote(str(evil / "secrets")) in out
     assert str(evil / "secrets.toml") not in out.replace(shlex.quote(str(evil / "secrets.toml")), "")
-    pkg_parent = str(Path(wsecrets.__file__).resolve().parent.parent)
-    assert f"(cd {shlex.quote(pkg_parent)} && find ws" in out
+    pkg = str(Path(wsecrets.__file__).resolve().parent)
+    assert f"cp -RP --no-preserve=all -- {shlex.quote(pkg)} " in out
 
 
 def test_wall_takes_the_user_from_the_account_database_not_the_environment(home, capsys, monkeypatch):
@@ -472,3 +477,106 @@ def test_socket_comes_from_env_then_profile_then_home(home):
     assert wsecrets.socket_path({"WS_HOME": str(home)}, cfg) == Path("/somewhere/b.sock")
     assert wsecrets.socket_path({"WS_HOME": str(home), "WS_BROKER_SOCKET": "/e/b.sock"}, cfg) == Path("/e/b.sock")
     assert wsecrets.socket_path({"WS_HOME": str(home)}, {}) == home / "run" / "broker.sock"
+
+
+# ---- the root-owned copy: launcher, snapshot, digest
+
+
+def test_wall_script_stops_on_failure_and_swallows_no_exit_code(home, capsys, monkeypatch):
+    registry(home, GOOD)
+    linux_wall(monkeypatch)
+    code, out, _ = run(capsys, "secret", "wall")
+    assert code == 0 and out.startswith("#!/bin/bash\n") and "\nset -euo pipefail\n" in out
+    assert "\\;" not in out  # no `-exec ... \\;`, which would hide a failed install
+    assert "install -D" not in out and "find ws" not in out  # no per-file copy from the user's tree
+    # the checks run on the root-owned snapshot, before it is moved into place
+    order = [
+        out.index(x)
+        for x in ("cp -RP", "! -type f ! -type d", "! -name '*.py'", "chown -R root:root", "DIGEST=", 'mv "$STAGE/ws"')
+    ]
+    assert order == sorted(order)
+
+
+def test_wall_prints_the_commit_and_tree_digest_and_says_what_it_trusts(home, capsys, monkeypatch):
+    registry(home, GOOD)
+    linux_wall(monkeypatch)
+    pkg = Path(wsecrets.__file__).resolve().parent
+    code, out, _ = run(capsys, "secret", "wall")
+    assert code == 0
+    digest = wsecrets.tree_digest(pkg)
+    assert f"tree sha256: {digest}" in out and f'if [ "$DIGEST" != {digest} ]' in out
+    assert "source:" in out and "git commit " in out or "not a git checkout" in out
+    assert "trusting this checkout at the moment of install" in out and "signed release tag" in out
+
+
+def test_tree_digest_matches_what_the_script_computes_in_the_shell(tmp_path):
+    import subprocess
+
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "b.py").write_text("b = 1\n")
+    (tmp_path / "A.py").write_text("a = 1\n")
+    (tmp_path / "sub" / "c.py").write_text("c = 1\n")
+    (tmp_path / "__pycache__").mkdir()
+    (tmp_path / "__pycache__" / "x.pyc").write_bytes(b"\0")
+    shell = (
+        "find . -name __pycache__ -type d -prune -o -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum"
+        " | sha256sum | cut -d' ' -f1"
+    )
+    out = subprocess.run(["bash", "-c", shell], cwd=tmp_path, capture_output=True, text=True, check=True).stdout.strip()
+    assert wsecrets.tree_digest(tmp_path) == out
+
+
+def test_tree_digest_refuses_links_and_other_files(tmp_path):
+    (tmp_path / "a.py").write_text("a = 1\n")
+    (tmp_path / "link.py").symlink_to(tmp_path / "a.py")
+    with pytest.raises(wsecrets.SecretsError, match="symlink"):
+        wsecrets.tree_digest(tmp_path)
+    (tmp_path / "link.py").unlink()
+    (tmp_path / "data.txt").write_text("x")
+    with pytest.raises(wsecrets.SecretsError, match="not a .py"):
+        wsecrets.tree_digest(tmp_path)
+
+
+def test_launcher_leaves_the_callers_folder_first_and_never_imports_a_planted_ws(tmp_path):
+    import shutil
+    import subprocess
+    import sys
+
+    lib = tmp_path / "lib"
+    shutil.copytree(Path(wsecrets.__file__).resolve().parent, lib / "ws", ignore=shutil.ignore_patterns("__pycache__"))
+    planted = tmp_path / "cwd"
+    (planted / "ws").mkdir(parents=True)
+    (planted / "ws" / "__init__.py").write_text("")
+    (planted / "ws" / "__main__.py").write_text("print('PLANTED RAN')\n")
+    script = tmp_path / "ws-launcher"
+    script.write_text(wsecrets.launcher_script(sys.executable, str(lib)))
+    script.chmod(0o755)
+    assert "\ncd /\n" in script.read_text() and f" {wsecrets.PY_FLAGS} -m ws " in script.read_text()
+    r = subprocess.run([str(script), "--version"], cwd=planted, capture_output=True, text=True, check=False)
+    assert r.returncode == 0 and "PLANTED" not in r.stdout + r.stderr and r.stdout.startswith("ws ")
+    # and without the `cd /`: the interpreter flags alone keep the current folder off the path
+    env = {**os.environ, "PYTHONPATH": str(lib)}
+    cmd = [sys.executable, *wsecrets.PY_FLAGS.split(), "-m", "ws", "--version"]
+    r = subprocess.run(cmd, cwd=planted, env=env, capture_output=True, text=True, check=False)
+    assert r.returncode == 0 and "PLANTED" not in r.stdout + r.stderr and r.stdout.startswith("ws ")
+    # sanity: a plain `python -m ws` from that folder does import the planted package
+    r = subprocess.run([sys.executable, "-m", "ws"], cwd=planted, env=env, capture_output=True, text=True, check=False)
+    assert "PLANTED RAN" in r.stdout
+
+
+@pytest.mark.parametrize("which", ["registry", "store"])
+def test_wall_refuses_paths_with_control_characters(tmp_path, capsys, monkeypatch, which):
+    bad = tmp_path / "a\nsudo rm -rf x"
+    bad.mkdir()
+    registry(bad, GOOD)
+    linux_wall(monkeypatch)
+    if which == "registry":
+        monkeypatch.setenv("WS_HOME", str(bad))
+    else:
+        good = tmp_path / "ok"
+        good.mkdir()
+        registry(good, GOOD)
+        monkeypatch.setenv("WS_HOME", str(good))
+        monkeypatch.setattr(wsecrets, "store_dir", lambda *a, **k: bad / "s")
+    code, out, err = run(capsys, "secret", "wall")
+    assert code == 1 and out == "" and "control character" in err

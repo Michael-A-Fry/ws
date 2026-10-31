@@ -68,6 +68,8 @@ MAX_LINE = 65536
 MAX_BODY = 64 * 1024 * 1024
 UPSTREAM_TIMEOUT_S = 300
 MAX_PROXY_CONNECTIONS = 64
+REQUEST_DEADLINE_S = 120.0  # headers and body of one proxied request, however slowly they trickle in
+MAX_REJECTING = 32
 
 # headers that can carry a credential: dropped from the tool's request before the real one is added
 STRIP_REQUEST = {
@@ -626,6 +628,30 @@ def _read_line(conn: socket.socket, buf: bytes, deadline: float) -> tuple[bytes 
     return line, rest
 
 
+_REJECTING = threading.BoundedSemaphore(MAX_REJECTING)
+
+
+def _reject_async(server: socketserver.BaseServer, request: socket.socket, payload: bytes) -> None:
+    """Answer a connection we have no room for, without holding up the accept loop: the reply is written from a short
+    thread (it reads what the client sent first, because closing on unread data can reset the reply away). If even
+    those threads are all busy the connection is just closed."""
+    if not _REJECTING.acquire(blocking=False):
+        server.shutdown_request(request)
+        return
+
+    def reply() -> None:
+        try:
+            with contextlib.suppress(OSError):
+                request.settimeout(1)
+                request.recv(MAX_LINE)
+                request.sendall(payload)
+        finally:
+            server.shutdown_request(request)
+            _REJECTING.release()
+
+    threading.Thread(target=reply, daemon=True, name="ws-broker-reject").start()
+
+
 def _unix_server(broker: Broker) -> socketserver.BaseServer:
     """Built on demand: socketserver has no Unix server on native Windows, and the module must still import there."""
 
@@ -639,13 +665,7 @@ def _unix_server(broker: Broker) -> socketserver.BaseServer:
 
         def process_request(self, request, client_address):
             if not self.broker._slots.acquire(blocking=False):
-                with contextlib.suppress(OSError):
-                    request.settimeout(1)
-                    request.recv(
-                        MAX_LINE
-                    )  # read what the client sent first: closing on unread data can reset the reply away
-                    request.sendall(json.dumps(_refuse("busy", "too many connections")).encode() + b"\n")
-                self.shutdown_request(request)
+                _reject_async(self, request, json.dumps(_refuse("busy", "too many connections")).encode() + b"\n")
                 return
             super().process_request(request, client_address)
 
@@ -676,11 +696,9 @@ class _ProxyServer(ThreadingHTTPServer):
 
     def process_request(self, request, client_address):
         if not self._slots.acquire(blocking=False):
-            with contextlib.suppress(OSError):
-                request.settimeout(1)
-                request.recv(MAX_LINE)
-                request.sendall(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-            self.shutdown_request(request)
+            _reject_async(
+                self, request, b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
             return
         super().process_request(request, client_address)
 
@@ -707,6 +725,21 @@ class _ProxyHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):  # the default writes the path, which holds the lease token
         pass
 
+    def handle_one_request(self):
+        # The per-read timeout above is reset by every byte, so a client sending one byte a minute would hold a slot
+        # for ever. This cuts the connection if the whole request has not arrived by the deadline.
+        self._deadline = threading.Timer(REQUEST_DEADLINE_S, self._cut)
+        self._deadline.daemon = True
+        self._deadline.start()
+        try:
+            super().handle_one_request()
+        finally:
+            self._deadline.cancel()
+
+    def _cut(self) -> None:
+        with contextlib.suppress(OSError):
+            self.connection.shutdown(socket.SHUT_RDWR)
+
     def do_GET(self):
         self._forward()
 
@@ -726,6 +759,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             header, value = b.credential(grant)
             target = (m.group(2) or "/") + (f"?{query}" if query else "")
             body = self._read_body()
+            self._deadline.cancel()  # the request is in; the reply may take as long as the model does
             headers = self._clean_headers(header)
             headers[header] = value
             headers["Host"] = grant.host

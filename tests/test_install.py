@@ -435,3 +435,64 @@ def test_doctor_is_happy_with_what_install_wrote(box, capsys):
     checks = {c["id"]: c["status"] for c in json.loads(out)["checks"]}
     assert checks["WS003"] == checks["WS004"] == checks["WS106"] == "ok"
     assert checks["WS105"] in ("ok", "warn")  # memory exists; `ws memory init` makes it a git repo
+
+
+def test_roots_written_into_the_manifest_cannot_authorise_anything(box, capsys):
+    assert run(capsys, "install", "--yes", "--notes", str(box / "Notes"))[0] == 0
+    key = box / ".ssh" / "id_rsa"
+    key.parent.mkdir()
+    key.write_text("private")
+    tamper((key, "file"), roots=[str(box / ".ssh"), str(box / ".ws")])
+    code, out, _ = run(capsys, "uninstall", "--yes")
+    assert code == 0 and key.read_text() == "private"
+    assert "outside the folders ws manages" in out and str(key) in out
+
+
+def test_uninstall_acts_in_the_notes_folder_the_profile_names_now(box, capsys):
+    assert run(capsys, "install", "--yes", "--notes", str(box / "Notes"))[0] == 0
+    assert run(capsys, "install", "--yes", "--notes", str(box / "Other"))[0] == 0
+    code, _, _ = run(capsys, "uninstall", "--yes")
+    assert code == 0 and not (box / "Other").exists()
+    assert (box / "Notes" / "_inbox").is_dir()  # the old folder is no longer one ws manages, so it is left
+
+
+def test_a_failing_manifest_save_does_not_mask_the_first_error(box, capsys, monkeypatch):
+    real = install._write_atomic
+
+    def flaky(path, data):
+        if path.name == "profile.toml":
+            raise OSError("profile write failed")
+        if path.name == install.MANIFEST:
+            raise OSError("manifest write failed")
+        real(path, data)
+
+    monkeypatch.setattr(install, "_write_atomic", flaky)
+    code, _, err = run(capsys, "install", "--yes", "--notes", str(box / "Notes"))
+    assert code == 1 and "profile write failed" in err and "manifest write failed" not in err
+
+
+def test_a_temp_file_is_cleaned_up_on_any_exception(box, monkeypatch):
+    target = box / "f.txt"
+
+    def interrupted(src, dst):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(install.os, "replace", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        install._write_atomic(target, b"x")
+    assert list(box.iterdir()) == []
+
+
+@pytest.mark.parametrize("where", ["machine", "roles"])
+def test_a_profile_whose_notes_folder_is_your_home_is_one_clear_error(box, capsys, where):
+    prof = box / ".ws" / "profile.toml"
+    prof.parent.mkdir()
+    prof.write_text('[machine]\nnotes = "~"\n' if where == "machine" else '[roles.notes]\npath = "~"\n')
+    pre = snapshot(box)
+    for argv in (["install", "--yes"], ["install", "--dry-run"], ["install", "--yes", "--json"]):
+        code, _, err = run(capsys, *argv)
+        assert code == 1 and "too broad" in err and "Traceback" not in err and len(err.strip().splitlines()) == 1
+    assert snapshot(box) == pre
+    code, _, err = run(capsys, "uninstall", "--yes")
+    assert code == 0 and "Traceback" not in err
+    assert run(capsys, "module", "list")[0] == 0

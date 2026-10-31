@@ -300,7 +300,7 @@ def _write_atomic(path: Path, data: bytes) -> None:
             os.fsync(f.fileno())
         os.chmod(tmp, mode)
         os.replace(tmp, path)
-    except OSError:
+    except BaseException:  # including Ctrl-C: never leave a temp file behind
         tmp.unlink(missing_ok=True)
         raise
 
@@ -358,6 +358,16 @@ def _root_problem(root: Path, env) -> str | None:
     return None
 
 
+def _save_manifest(env, entries: dict[str, dict], roots: set[str]) -> None:
+    path = manifest_path(env)
+    for parent in _missing_ancestors(path, set()):  # steps outside ws's home: its home may not exist yet
+        parent.mkdir()
+        entries[str(parent)] = {"path": str(parent), "kind": "dir", "sha256": None, "created_by_ws": True}
+    text = _manifest_text(entries, roots)
+    if not path.is_file() or path.read_text(encoding="utf-8") != text:
+        _write_atomic(path, text.encode("utf-8"))
+
+
 def apply(steps: list[Step], env=None, dry_run: bool = False) -> Result:
     """Write what differs. Records every path ws creates in the manifest, even when a later step fails. A file ws
     changes but did not create is recorded with created_by_ws false so uninstall knows to leave it; a generated file
@@ -371,6 +381,7 @@ def apply(steps: list[Step], env=None, dry_run: bool = False) -> Result:
             raise InstallError(problem)
     roots |= {str(r) for r in new_roots}
     virtual: set[Path] = set()
+    done = False
     try:
         for step in steps:
             action = classify(step, entries, virtual)
@@ -401,19 +412,34 @@ def apply(steps: list[Step], env=None, dry_run: bool = False) -> Result:
                 result.notes.append(f"{step.path} had your edits: ws kept your values and rewrote it")
             _write_atomic(step.path, data)
             entries[key] = {"path": key, "kind": "file", "sha256": sha256(data), "created_by_ws": ours}
+        done = True
     finally:
         if not dry_run and entries:
-            path, text = manifest_path(env), _manifest_text(entries, roots)
-            for parent in _missing_ancestors(path, set()):  # steps outside ws's home: its home may not exist yet
-                parent.mkdir()
-                entries[str(parent)] = {"path": str(parent), "kind": "dir", "sha256": None, "created_by_ws": True}
-                text = _manifest_text(entries, roots)
-            if not path.is_file() or path.read_text(encoding="utf-8") != text:
-                _write_atomic(path, text.encode("utf-8"))
+            try:
+                _save_manifest(env, entries, roots)
+            except OSError:
+                if done:  # a step already failed: that is the error worth reporting, not this one
+                    raise
     return result
 
 
 # ---- uninstall -------------------------------------------------------------------------------------------------------
+
+
+def current_roots(env) -> list[Path]:
+    """The folders uninstall may act in, worked out now from $WS_HOME and the profile's notes and memory folders.
+    Never from the manifest, which is the file an attacker would edit."""
+    roots = [Path(os.path.abspath(ws_home(env)))]
+    try:
+        roles = _load_profile(env).get("roles")
+    except InstallError:
+        roles = None
+    for name in ("notes", "memory"):
+        cfg = roles.get(name) if isinstance(roles, dict) else None
+        p = cfg.get("path") if isinstance(cfg, dict) else None
+        if isinstance(p, str) and p:
+            roots.append(expand(p, env))
+    return [r for r in dict.fromkeys(roots) if not _root_problem(r, env)]
 
 
 def _inside(path: Path, roots: list[Path]) -> bool:
@@ -444,11 +470,9 @@ def uninstall(env=None, keep_data: bool = True, dry_run: bool = False) -> Remova
     if not keep_data:
         raise InstallError("deleting your notes and memory is not built: ws only removes what it made")
     env = os.environ if env is None else env
-    entries, recorded = _read_manifest(env)
+    entries, _ = _read_manifest(env)  # the manifest's own `roots` are information only: they widen nothing
     out = Removal()
-    roots = [Path(os.path.normpath(r)) for r in recorded if Path(r).is_absolute()]
-    roots = [r for r in roots if not _root_problem(r, env)]
-    roots.append(Path(os.path.abspath(ws_home(env))))  # the one root that does not come from the manifest
+    roots = current_roots(env)
     mine = []
     for e in entries.values():
         if _may_touch(e, roots):

@@ -495,6 +495,16 @@ def cmd_wall(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
+        where = Path(WALL_LIB)
+        while not where.exists():
+            where = where.parent
+        if (bad := untrusted_reason(where)) is not None:
+            print(
+                f"ws: the copy of ws would go under {where}, which others can change: {bad}.\n"
+                f"    Fix that first (for example `sudo chown root:root {where} && sudo chmod go-w {where}`), then run this again.",
+                file=sys.stderr,
+            )
+            return 1
         try:
             names = sorted(load_registry(registry_path()))
         except SecretsError as e:

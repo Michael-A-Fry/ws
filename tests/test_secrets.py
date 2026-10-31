@@ -214,7 +214,11 @@ def test_list_says_when_the_store_belongs_to_someone_else(home, capsys, monkeypa
     assert code == 0 and "unknown" in out and "another user" in out
 
 
-def linux_wall(monkeypatch, python=("/usr/bin/python3", "")):
+def linux_wall(monkeypatch, python=("/usr/bin/python3", ""), root_ok=True):
+    if os.getuid() == 0:
+        pytest.skip("the wall refuses to be printed as root")
+    if root_ok:  # /opt is not ours to judge on a test machine
+        monkeypatch.setattr(wsecrets, "untrusted_reason", lambda *a, **k: None)
     monkeypatch.setattr(osinfo, "detect", lambda: osinfo.OSInfo("linux", "ubuntu 24.04", "x86_64", "systemd", True))
     monkeypatch.setattr(wsecrets, "trusted_python", lambda: python)
 
@@ -290,7 +294,7 @@ def test_wall_refuses_without_a_root_owned_python_and_prints_no_commands(home, c
 
 
 def test_wall_refuses_to_run_as_root(home, capsys, monkeypatch):
-    linux_wall(monkeypatch)
+    monkeypatch.setattr(osinfo, "detect", lambda: osinfo.OSInfo("linux", "ubuntu 24.04", "x86_64", "systemd", True))
     monkeypatch.setattr(os, "getuid", lambda: 0)
     code, out, err = run(capsys, "secret", "wall")
     assert code == 1 and out == "" and "normal user" in err
@@ -312,6 +316,16 @@ def fake_ownership(monkeypatch, uid=0, strip=0o022):
 
     monkeypatch.setattr(Path, "stat", wrap(real_stat))
     monkeypatch.setattr(Path, "lstat", wrap(real_lstat))
+
+
+def test_wall_refuses_when_the_install_folder_can_be_changed_by_others(home, capsys, monkeypatch):
+    registry(home, GOOD)
+    linux_wall(monkeypatch, root_ok=False)
+    monkeypatch.setattr(
+        wsecrets, "untrusted_reason", lambda path, tree=False: "/opt can be written by users other than root"
+    )
+    code, out, err = run(capsys, "secret", "wall")
+    assert code == 1 and out == "" and "others can change" in err and "chmod go-w" in err
 
 
 def test_untrusted_reason_names_the_owner_and_the_writable_folder(tmp_path):

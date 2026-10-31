@@ -61,6 +61,8 @@ jobs:
         run: uv sync --locked
       - name: run the commands `ws secret wall` prints
         run: |
+          # GitHub's runner image leaves /opt writable by everyone; the wall refuses to install under such a folder
+          sudo chmod go-w /opt
           export WS_HOME="$RUNNER_TEMP/wshome"
           mkdir -p "$WS_HOME"
           printf '[anthropic]\nhosts = ["api.anthropic.com"]\npurposes = ["run"]\n' > "$WS_HOME/secrets.toml"

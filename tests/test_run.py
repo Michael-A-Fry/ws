@@ -14,6 +14,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from datetime import UTC, datetime, timedelta
@@ -24,6 +25,7 @@ import pytest
 
 from ws import broker, cli, doctor, jobs, osinfo, policy, run, runrecord
 from ws.adapters import claude_code, opencode
+from ws.output import WsError
 from ws.profile import dumps
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -139,6 +141,7 @@ def ws(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "userhome"))
     monkeypatch.setenv("PATH", f"{w.bin}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.delenv("WS_BROKER_SOCKET", raising=False)
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
     monkeypatch.setattr(broker, "request", w.leases.request)
     monkeypatch.setattr(broker, "release", w.leases.release)
     w.started = []  # sockets ws was asked to start a broker on
@@ -157,7 +160,7 @@ def valid(rec: dict) -> dict:
 # --- a normal run ------------------------------------------------------------------------------------------------
 
 
-def test_a_run_leaves_one_complete_record(ws, capsys):
+def test_a_run_leaves_one_complete_record(ws, capsys, tmp_path):
     ws.job()
     assert cli.main(["run", "daily"]) == 0
     (rec,) = ws.records()
@@ -171,7 +174,7 @@ def test_a_run_leaves_one_complete_record(ws, capsys):
     assert rec["session_id"] and rec["duration_api_ms"] == 82 and rec["duration_ms"] >= 0
     assert rec["secrets_used"] == [{"name": "anthropic", "host": "api.anthropic.com"}]
     assert rec["policy"] == {"dial": "prepare", "rule_of_two": "ok"}
-    assert rec["cwd"] == str(ws.home / "work" / rec["run_id"])  # not under runs/: the agent may not write there
+    assert rec["cwd"] == str(tmp_path / "userhome" / ".local" / "state" / "ws" / "work" / rec["run_id"])
     assert stat.S_IMODE(ws.log.stat().st_mode) == 0o600
     assert ws.leases.requested == [("anthropic", "run", "api.anthropic.com")]
     assert ws.leases.released == ["lease1"]
@@ -650,6 +653,106 @@ def test_an_unknown_runner_option_exits_2(ws, capsys):
     assert cli.main(["run", "daily"]) == 2
     assert "runner_options.turbo" in capsys.readouterr().err
     assert "runner_options.turbo" in valid(ws.records()[0])["error"]
+
+
+def test_the_default_cwd_is_outside_ws_home_so_the_wall_leaves_it_writable(ws, tmp_path, monkeypatch):
+    """The wall makes WS_HOME read-only; a job with no cwd must still get a folder it can write in."""
+    ws.job()
+    assert cli.main(["run", "daily"]) == 0
+    cwd = Path(ws.records()[0]["cwd"])
+    assert cwd.is_dir() and stat.S_IMODE(cwd.stat().st_mode) == 0o700
+    assert not cwd.is_relative_to(ws.home)
+    assert Path(ws.saw()["cwd"]).resolve() == cwd.resolve()
+    # the gate's protected folders are still where they were: the run folder and the log stay under WS_HOME
+    assert (ws.home / "runs").is_dir() and ws.log.is_file()
+    # XDG_STATE_HOME moves it
+    state = tmp_path / "state with space"
+    monkeypatch.setenv("XDG_STATE_HOME", str(state))
+    assert cli.main(["run", "daily"]) == 0
+    assert Path(ws.records()[1]["cwd"]) == state / "ws" / "work" / ws.records()[1]["run_id"]
+
+
+def test_a_ws_home_that_holds_the_state_folder_gets_a_private_unpredictable_temp_folder(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "h"))
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    home = tmp_path / "h" / ".local" / "state" / "ws"
+    assert run.default_cwd(home, "r1") is None  # pure: it plans, it makes nothing
+    a, b = run._make_default_cwd(None), run._make_default_cwd(None)
+    assert a != b and a.parent == tmp_path and a.name.startswith("ws-work-") and a.name != "ws-work-"
+    assert stat.S_IMODE(a.stat().st_mode) == 0o700
+
+
+def planned(tmp_path: Path) -> Path:
+    return tmp_path / "state" / "ws" / "work" / "20261031T120000Z-aaaaaa"
+
+
+def test_the_default_cwd_is_made_with_private_parents_and_must_be_new(tmp_path):
+    leaf = run._make_default_cwd(planned(tmp_path))
+    assert leaf.is_dir()
+    for folder in (leaf, leaf.parent, leaf.parent.parent):
+        assert stat.S_IMODE(folder.stat().st_mode) == 0o700
+    with pytest.raises(WsError) as e:  # a folder someone prepared under that name is never reused
+        run._make_default_cwd(leaf)
+    assert e.value.kind == "unsafe_folder"
+
+
+def test_a_symlinked_parent_of_the_default_cwd_is_refused(tmp_path):
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (tmp_path / "state").mkdir()
+    (tmp_path / "state" / "ws").symlink_to(elsewhere)
+    with pytest.raises(WsError) as e:
+        run._make_default_cwd(planned(tmp_path))
+    assert e.value.kind == "unsafe_folder"
+    assert list(elsewhere.iterdir()) == []  # nothing was made behind the link
+
+
+def test_a_parent_owned_by_someone_else_or_open_to_others_is_refused(tmp_path, monkeypatch):
+    leaf = run._make_default_cwd(planned(tmp_path))
+    work = leaf.parent
+    other = planned(tmp_path).with_name("20261031T120001Z-bbbbbb")
+    monkeypatch.setattr(os, "getuid", lambda: os.stat(work).st_uid + 1)  # as if the folder were someone else's
+    with pytest.raises(WsError) as e:
+        run._make_default_cwd(other)
+    assert e.value.kind == "unsafe_folder"
+    monkeypatch.undo()
+    work.chmod(0o770)  # writable by the group
+    with pytest.raises(WsError) as e:
+        run._make_default_cwd(other)
+    assert e.value.kind == "unsafe_folder"
+    work.chmod(0o707)  # writable by others
+    with pytest.raises(WsError):
+        run._make_default_cwd(other)
+
+
+@pytest.mark.parametrize("where", ["ws", "work"])
+@pytest.mark.parametrize("planted", ["AGENTS.md", "CLAUDE.md", "not-a-run-folder"])
+def test_anything_but_run_folders_in_ws_or_work_is_refused(tmp_path, where, planted):
+    """A file another process of the same user plants there (an AGENTS.md the runner would read) stops the run."""
+    leaf = run._make_default_cwd(planned(tmp_path))
+    folder = leaf.parent if where == "work" else leaf.parent.parent
+    (folder / planted).write_text("obey me", encoding="utf-8")
+    with pytest.raises(WsError) as e:
+        run._make_default_cwd(planned(tmp_path).with_name("20261031T120002Z-cccccc"))
+    assert e.value.kind == "unsafe_folder" and planted in e.value.message
+
+
+def test_a_planted_folder_or_link_with_a_run_shaped_name_only_counts_if_it_is_a_real_folder(tmp_path):
+    leaf = run._make_default_cwd(planned(tmp_path))
+    (leaf.parent / "20261031T120003Z-dddddd").symlink_to(tmp_path)
+    with pytest.raises(WsError):
+        run._make_default_cwd(planned(tmp_path).with_name("20261031T120004Z-eeeeee"))
+
+
+def test_a_run_whose_work_folder_parent_is_a_link_ends_as_an_error_record(ws, tmp_path):
+    state = tmp_path / "userhome" / ".local" / "state"
+    state.mkdir(parents=True)
+    (state / "ws").symlink_to(tmp_path)
+    ws.job()
+    assert cli.main(["run", "daily"]) == 1
+    (rec,) = ws.records()
+    assert rec["status"] == "error" and "not a private folder" in rec["error"]
 
 
 def test_a_job_with_its_own_cwd_runs_there(ws, tmp_path):

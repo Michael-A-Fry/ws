@@ -7,7 +7,9 @@ from __future__ import annotations
 import copy
 import json
 import os
+import shutil
 import signal
+import ssl
 import subprocess
 import sys
 import urllib.request
@@ -161,3 +163,54 @@ def test_an_unknown_scenario_on_the_command_line_exits_2_naming_the_known_ones()
         capture_output=True, text=True, env=env, timeout=30, check=False,
     )  # fmt: skip
     assert p.returncode == 2 and "first_task" in p.stderr and p.stdout == ""
+
+
+CERT_CNF = """[req]
+distinguished_name = dn
+x509_extensions = v3
+prompt = no
+[dn]
+CN = 127.0.0.1
+[v3]
+basicConstraints = critical,CA:TRUE
+keyUsage = critical,keyCertSign,digitalSignature,keyEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = IP:127.0.0.1
+"""
+
+
+@pytest.mark.skipif(shutil.which("openssl") is None, reason="needs the openssl command")
+def test_the_module_serves_https_with_a_certificate_and_key(tmp_path):
+    (tmp_path / "c.cnf").write_text(CERT_CNF, encoding="utf-8")
+    cert, key = tmp_path / "c.pem", tmp_path / "k.pem"
+    subprocess.run(
+        ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(key), "-out", str(cert),
+         "-days", "2", "-config", str(tmp_path / "c.cnf")],
+        check=True, capture_output=True, timeout=60,
+    )  # fmt: skip
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)}
+    p = subprocess.Popen(
+        [sys.executable, "-m", "ws.testing.mockprovider", "--scenario", "first_task", "--tls-cert", str(cert),
+         "--tls-key", str(key)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+    )  # fmt: skip
+    try:
+        line = p.stdout.readline().strip()
+        assert line.startswith("MOCK_ANTHROPIC_BASE_URL=https://127.0.0.1:"), line
+        ctx = ssl.create_default_context(cafile=str(cert))  # trusted by file, and the IP is in the certificate
+        with urllib.request.urlopen(line.split("=", 1)[1] + "/v1/models", timeout=10, context=ctx) as r:
+            assert r.status == 200
+    finally:
+        p.send_signal(signal.SIGTERM)
+        assert p.wait(timeout=30) == 0
+        p.stdout.close()
+        p.stderr.close()
+
+
+def test_a_certificate_without_a_key_is_a_usage_error():
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)}
+    p = subprocess.run(
+        [sys.executable, "-m", "ws.testing.mockprovider", "--scenario", "first_task", "--tls-cert", "c.pem"],
+        capture_output=True, text=True, env=env, timeout=30, check=False,
+    )  # fmt: skip
+    assert p.returncode == 2 and "go together" in p.stderr

@@ -548,6 +548,7 @@ def uninstall(env=None, keep_data: bool = True, dry_run: bool = False, deactivat
             out.removed.append(p)
             if not dry_run:
                 p.unlink()
+    _remove_work_root(env, out, dry_run)
     mpath = manifest_path(env)
     gone = {*out.removed, mpath}
     if not dry_run and mpath.is_file():
@@ -564,6 +565,47 @@ def uninstall(env=None, keep_data: bool = True, dry_run: bool = False, deactivat
         else:
             out.not_empty.append(d)
     return out
+
+
+def _remove_work_root(env: dict, out: Removal, dry_run: bool) -> None:
+    """`$XDG_STATE_HOME/ws`, where `ws run` puts the working folder of a job with no `cwd`, is made by ws without a
+    manifest entry. What a job wrote there is the person's, so only the empty run folders go, then `work/` and `ws/`
+    when nothing is left in them; a run folder with files in it is left and listed. A link there, or a folder that is
+    not ours, is left and listed too."""
+    from ws import run
+
+    root = run.work_root(env)
+    if not os.path.lexists(root):
+        return
+    if root.is_symlink() or not root.is_dir() or root.lstat().st_uid != os.getuid():
+        out.refused.append(root)
+        return
+    gone: set[Path] = set()
+
+    def drop(d: Path) -> None:
+        try:
+            if not dry_run:
+                d.rmdir()
+        except OSError as e:
+            out.problems.append(f"could not remove {d}: {e.strerror or type(e).__name__}")
+            return
+        out.removed.append(d)
+        gone.add(d)
+
+    work = root / "work"
+    if work.is_dir() and not work.is_symlink():
+        for folder in sorted(work.iterdir()):
+            if folder.is_symlink() or not folder.is_dir() or any(folder.iterdir()):
+                out.not_empty.append(folder)  # what a job wrote: the person's
+            else:
+                drop(folder)
+    for d in (work, root):
+        if d.is_symlink() or not d.is_dir():
+            continue
+        if all(c in gone for c in d.iterdir()):
+            drop(d)
+        elif not any(c in out.not_empty for c in d.iterdir()):
+            out.not_empty.append(d)  # something else of yours is in it
 
 
 def _removable(d: Path, gone: set[Path], dry_run: bool) -> bool:

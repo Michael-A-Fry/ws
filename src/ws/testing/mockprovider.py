@@ -4,8 +4,10 @@ It is a package module (it was `tests/e2e/stubs.py`, which now re-exports it) so
 one fake provider. Run it alone to serve a named scenario from `ws.testing.scenarios` until it is killed:
 
     python -m ws.testing.mockprovider --scenario first_task [--provider anthropic|openai] [--work DIR]
+                                      [--tls-cert FILE --tls-key FILE]
 
-Its first stdout line, flushed, is `MOCK_ANTHROPIC_BASE_URL=http://127.0.0.1:PORT` (or `MOCK_OPENAI_BASE_URL=...`), the
+With a certificate and key it serves https (the lab and CI runs use that, so the broker's real TLS path to the
+upstream is exercised). Its first stdout line, flushed, is `MOCK_ANTHROPIC_BASE_URL=http://127.0.0.1:PORT` (or `MOCK_OPENAI_BASE_URL=...`), the
 way claw-code's mock service announces itself; point the runner's base URL there.
 
 Two servers on 127.0.0.1 (random port), stdlib only:
@@ -37,6 +39,7 @@ import argparse
 import json
 import os
 import signal
+import ssl
 import sys
 import threading
 from dataclasses import dataclass, field
@@ -65,9 +68,11 @@ class _Stub:
         self._lock = threading.Lock()
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
+        self._scheme = "http"
 
     # -- life cycle
-    def start(self) -> Self:
+    def start(self, tls: tuple[str, str] | None = None) -> Self:
+        """Start serving on 127.0.0.1; `tls` is (certificate file, key file) to serve https instead of http."""
         stub = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -110,6 +115,11 @@ class _Stub:
                 self.wfile.write(data)
 
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        if tls:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(*tls)
+            self._server.socket = ctx.wrap_socket(self._server.socket, server_side=True)
+            self._scheme = "https"
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
         return self
@@ -129,7 +139,7 @@ class _Stub:
 
     @property
     def url(self) -> str:
-        return f"http://127.0.0.1:{self._server.server_address[1]}"
+        return f"{self._scheme}://127.0.0.1:{self._server.server_address[1]}"
 
     # -- what the script does
     def next_call(self, offered: list[str], results_seen: int) -> Call | None:
@@ -313,7 +323,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--provider", choices=sorted(PROVIDER_VARS), default="anthropic")
     p.add_argument("--work", metavar="DIR", default=os.getcwd(), help="what ${work} means in the scenario's paths")
     p.add_argument("--scenarios", metavar="FILE", help="a scenarios file (default: $WS_MOCK_SCENARIOS, else built in)")
+    p.add_argument("--tls-cert", metavar="FILE", help="serve https with this certificate (needs --tls-key)")
+    p.add_argument("--tls-key", metavar="FILE", help="the certificate's private key")
     args = p.parse_args(argv)
+    if bool(args.tls_cert) != bool(args.tls_key):
+        p.error("--tls-cert and --tls-key go together")
     try:
         stub = for_scenario(args.scenario, args.provider, args.scenarios, work=args.work)
     except scenarios.ScenarioError as e:
@@ -322,9 +336,12 @@ def main(argv: list[str] | None = None) -> int:
     stopping = threading.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda *_: stopping.set())
-    with stub:
+    stub.start((args.tls_cert, args.tls_key) if args.tls_cert else None)
+    try:
         print(f"{PROVIDER_VARS[args.provider]}={stub.url}", flush=True)
         stopping.wait()
+    finally:
+        stub.stop()
     return 0
 
 

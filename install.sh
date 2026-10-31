@@ -89,6 +89,8 @@ GitHub. While no release tag exists yet it installs the main branch and says so.
 Options:
   --version TAG   Install that release tag (for example --version vX.Y.Z) instead of the latest.
   --pypi          Install ${PACKAGE} from PyPI instead of GitHub.
+  --from PATH     Install from a checkout of ws on this machine (a folder with pyproject.toml), not GitHub. For the
+                  end-to-end timing script and for trying a change; no tag lookup, no git needed.
   --no-verify     Skip the smoke test (ws --version, ws doctor --offline).
   --dry-run       Run the preflight and print what would be installed; change nothing.
   -h, --help      Show this help text and exit.
@@ -244,7 +246,7 @@ find_ws() {
 # ---------------------------------------------------------------------------
 
 main() {
-    local tag="" tag_given="0" from_pypi="0" dry_run="0" skip_verify="${WS_SKIP_VERIFY:-0}"
+    local tag="" tag_given="0" from_pypi="0" from_path="" dry_run="0" skip_verify="${WS_SKIP_VERIFY:-0}"
 
     while [ "$#" -gt 0 ]; do
         case "$1" in
@@ -260,6 +262,15 @@ main() {
                 ;;
             --pypi)
                 from_pypi="1"
+                ;;
+            --from)
+                if [ "$#" -ge 2 ] && [ -n "$2" ]; then
+                    from_path="$2"
+                    shift
+                else
+                    error "--from needs the folder of a ws checkout, for example --from ."
+                    exit 2
+                fi
                 ;;
             --no-verify)
                 skip_verify="1"
@@ -292,6 +303,18 @@ main() {
             error "--version and --pypi do not go together: a tag is a GitHub thing"
             exit 2
         fi
+    fi
+
+    if [ -n "${from_path}" ]; then
+        if [ "${tag_given}" = "1" ] || [ "${from_pypi}" = "1" ]; then
+            error "--from does not go with --version or --pypi: it installs the checkout as it is"
+            exit 2
+        fi
+        if [ ! -f "${from_path}/pyproject.toml" ]; then
+            error "--from ${from_path}: no pyproject.toml there, so it is not a ws checkout"
+            exit 2
+        fi
+        from_path="$(cd "${from_path}" && pwd)"
     fi
 
     # shellcheck disable=SC2154  # rc is set inside the trap string, when it fires
@@ -384,7 +407,7 @@ main() {
         fi
     fi
 
-    if [ "${from_pypi}" = "0" ] && ! require_cmd git; then
+    if [ "${from_pypi}" = "0" ] && [ -z "${from_path}" ] && ! require_cmd git; then
         error "installing from GitHub needs git, which is not on PATH (or use --pypi)"
         missing="1"
     fi
@@ -402,6 +425,9 @@ main() {
     if [ "${from_pypi}" = "1" ]; then
         install_src="${PACKAGE}"
         info "source: PyPI (${PACKAGE})"
+    elif [ -n "${from_path}" ]; then
+        install_src="${from_path}"
+        info "source: checkout at ${install_src}"
     else
         if [ "${tag_given}" = "0" ]; then
             if ! tag="$(latest_tag)"; then
@@ -419,11 +445,17 @@ main() {
         info "source: ${install_src}"
     fi
 
+    # A checkout changes under the same version number, so uv must not serve it from its cache of built wheels.
+    local uv_flags="--force"
+    if [ -n "${from_path}" ]; then
+        uv_flags="--force --reinstall"
+    fi
+
     local path_fix uninstall_cmd
     if [ "${INSTALLER}" = "uv" ]; then
         path_fix="uv tool update-shell"
         uninstall_cmd="uv tool uninstall ${PACKAGE}"
-        info "running: uv tool install --force ${install_src}"
+        info "running: uv tool install ${uv_flags} ${install_src}"
     else
         path_fix="pipx ensurepath"
         uninstall_cmd="pipx uninstall ${PACKAGE}"
@@ -435,7 +467,8 @@ main() {
     else
         # The installers get no stdin: a child that reads it would eat the rest of a script piped into bash.
         if [ "${INSTALLER}" = "uv" ]; then
-            uv tool install --force "${install_src}" </dev/null
+            # shellcheck disable=SC2086  # the flags are words on purpose
+            uv tool install ${uv_flags} "${install_src}" </dev/null
         else
             pipx install --python "${PYTHON_BIN}" --force "${install_src}" </dev/null
         fi

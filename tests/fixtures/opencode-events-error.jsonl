@@ -1,0 +1,1 @@
+{"type":"error","timestamp":1793416796788,"sessionID":"ses_e70086b60ffeoSnfJo6pGn6Tn9","error":{"name":"APIError","data":{"message":"Cannot connect to API: ECONNREFUSED: Unable to connect. Is the computer able to access the url?","isRetryable":true,"metadata":{"url":"http://127.0.0.1:9/v1/chat/completions"}}}}

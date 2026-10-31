@@ -1,6 +1,8 @@
 # Phase 2 pass test on three OSs: on a fresh machine `ws doctor` exits non-zero listing every role unconfigured.
 # Phase 3 pass test (gate-e2e): a denied command is blocked on both runners, against a stub model, no paid provider.
 # Phase 4 (gate-e2e): the sandbox wall stops the bypasses the matcher cannot see; the OpenCode session nudge fires.
+# Phase 5 (matrix-e2e, wsl, windows-native): the person's path, timed on every cell (install -> first task -> uninstall,
+# scripts/e2e_first_task.sh), and a credential-free smoke with no provider key set. The lab VM cell is lab.yml.
 # Nightly, and on pull requests that touch the CLI. Not a required check: a slow or flaky runner never blocks a PR.
 name: cli
 on:
@@ -10,6 +12,7 @@ on:
       - "tests/**"
       - "scripts/check_fresh_doctor.py"
       - "install.sh"
+      - "scripts/e2e_first_task.sh"
       - "pyproject.toml"
       - "uv.lock"
       - ".github/workflows/cli.yml"
@@ -165,6 +168,60 @@ jobs:
           WS_E2E_REQUIRE: "1"
         run: uv run --locked pytest -q -rs tests/e2e/test_secret_wall.py
 
+  # Phase 5 pass test (row 5): one timed run of install -> doctor -> setup -> first task -> rate -> uninstall, against the
+  # mock provider (no network model, no real key), on a throw-away HOME and a WS_HOME with a space in its path. The
+  # timing file is the artifact; the summary line goes to the job summary. /bin/bash is bash 3.2 on macOS.
+  matrix-e2e:
+    name: first task e2e (${{ matrix.os }}, mock model)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-26]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: "0.13.1"
+          enable-cache: true
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+      - name: credential-free smoke (no provider key set, WS_HOME with a space)
+        env:
+          WS_SMOKE_CMD: uv run --locked ws
+          WS_E2E_CELL: ${{ matrix.os }}
+        run: /bin/bash scripts/e2e_first_task.sh --smoke
+      # Pinned in tests/e2e/runners/package-lock.json, as in gate-e2e.
+      - name: install the runners
+        working-directory: tests/e2e/runners
+        run: |
+          npm ci --ignore-scripts
+          node node_modules/opencode-ai/postinstall.mjs
+          node node_modules/@anthropic-ai/claude-code/install.cjs
+          echo "$PWD/node_modules/.bin" >> "$GITHUB_PATH"
+      # Claude Code's sandbox needs bubblewrap and socat on Linux (and macOS has its own); see gate-e2e for why the sysctl.
+      - name: install the sandbox tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bubblewrap socat
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: first task, timed
+        env:
+          WS_E2E_CELL: ${{ matrix.os }}
+          WS_E2E_OUT: ${{ github.workspace }}/e2e-timing.json
+        run: /bin/bash scripts/e2e_first_task.sh
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-timing-${{ matrix.os }}
+          path: e2e-timing.json
+          if-no-files-found: warn
+
   wsl:
     name: doctor (windows-2025, WSL2 Ubuntu-24.04)
     runs-on: windows-2025
@@ -176,7 +233,7 @@ jobs:
       - uses: Vampire/setup-wsl@4c48163d9f981914dd8caa0fc335fe19cca5bff4 # v7.2.0
         with:
           distribution: Ubuntu-24.04
-          additional-packages: curl ca-certificates
+          additional-packages: curl ca-certificates nodejs npm bubblewrap socat
       - name: tests and fresh doctor inside WSL2
         shell: wsl-bash {0}
         run: |
@@ -192,6 +249,34 @@ jobs:
           export WS_HOME="$HOME/wshome"
           set +e; uv run --locked ws doctor --json > /tmp/doctor.json; code=$?; set -e
           uv run --locked python scripts/check_fresh_doctor.py /tmp/doctor.json "$code"
+      - name: credential-free smoke inside WSL2
+        shell: wsl-bash {0}
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          cd "$HOME/ws"
+          WS_SMOKE_CMD="uv run --locked ws" WS_E2E_CELL=wsl2-ubuntu-24.04 /bin/bash scripts/e2e_first_task.sh --smoke
+      # The timing file goes back to the Windows workspace (WSLENV translates the two paths) so it can be uploaded.
+      - name: first task, timed, inside WSL2
+        shell: wsl-bash {0}
+        env:
+          WSLENV: GITHUB_WORKSPACE/p:GITHUB_STEP_SUMMARY/p
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          cd "$HOME/ws/tests/e2e/runners"
+          npm ci --ignore-scripts
+          node node_modules/opencode-ai/postinstall.mjs
+          node node_modules/@anthropic-ai/claude-code/install.cjs
+          export PATH="$PWD/node_modules/.bin:$PATH"
+          cd "$HOME/ws"
+          WS_E2E_CELL=wsl2-ubuntu-24.04 WS_E2E_OUT="$GITHUB_WORKSPACE/e2e-timing.json" /bin/bash scripts/e2e_first_task.sh
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-timing-wsl2
+          path: e2e-timing.json
+          if-no-files-found: warn
 
   windows-native:
     name: doctor (windows-2025 native, points at WSL2)
@@ -213,3 +298,8 @@ jobs:
           export WS_HOME="$RUNNER_TEMP/wshome"
           set +e; uv run --locked ws doctor --json > "$RUNNER_TEMP/doctor.json"; code=$?; set -e
           uv run --locked python scripts/check_fresh_doctor.py "$RUNNER_TEMP/doctor.json" "$code" --native-windows
+      - name: credential-free smoke (no provider key set, WS_HOME with a space)
+        env:
+          WS_SMOKE_CMD: uv run --locked ws
+          WS_E2E_CELL: windows-2025-native
+        run: bash scripts/e2e_first_task.sh --smoke

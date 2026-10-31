@@ -1,0 +1,4 @@
+# The one custom runner label: the lab VM in lab.yml (docs/lab.md).
+self-hosted-runner:
+  labels:
+    - ws-lab

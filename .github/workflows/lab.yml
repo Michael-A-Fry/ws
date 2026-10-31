@@ -1,0 +1,58 @@
+# The lab VM cell (ADR 0011, Tier 1): the same timed first-task run as the other cells, on a self-hosted runner in the
+# lab. It runs on a release tag or by hand, and NEVER on a pull request: a fork's pull request must not be able to
+# reach a machine on the lab network. Do not add pull_request or pull_request_target here; tests/test_workflows.py
+# fails the build if someone does.
+#
+# This workflow resets nothing itself. The lab VM is reset from its clean snapshot by the host before each job (the
+# runner is registered --ephemeral, so it takes one job and goes), which is what makes "a fresh machine" true. docs/lab.md
+# has the reset and the runner registration. Until a runner with the label `ws-lab` exists, the job just queues.
+name: lab
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: lab
+  cancel-in-progress: false
+jobs:
+  first-task:
+    name: first task e2e (lab VM, mock model)
+    runs-on: [self-hosted, ws-lab]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: "0.13.1"
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+      # Pinned in tests/e2e/runners/package-lock.json, as in cli.yml. The image already has bubblewrap and socat
+      # (docs/lab.md), so no apt step: the runner user has no sudo.
+      - name: install the runners
+        working-directory: tests/e2e/runners
+        run: |
+          npm ci --ignore-scripts
+          node node_modules/opencode-ai/postinstall.mjs
+          node node_modules/@anthropic-ai/claude-code/install.cjs
+          echo "$PWD/node_modules/.bin" >> "$GITHUB_PATH"
+      - name: credential-free smoke (no provider key set, WS_HOME with a space)
+        env:
+          WS_SMOKE_CMD: uv run --locked ws
+          WS_E2E_CELL: lab
+        run: bash scripts/e2e_first_task.sh --smoke
+      - name: first task, timed
+        env:
+          WS_E2E_CELL: lab
+          WS_E2E_OUT: ${{ github.workspace }}/e2e-timing.json
+        run: bash scripts/e2e_first_task.sh
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-timing-lab
+          path: e2e-timing.json
+          if-no-files-found: warn

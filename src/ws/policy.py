@@ -4,7 +4,9 @@ that cover what a runner's native rules cannot.
 
 Stdlib only. Three jobs:
   * load and validate the file (PolicyError names the bad key);
-  * `is_denied_command` / `is_denied_read`: the one matcher every hook and shim calls;
+  * `is_denied_command` / `is_denied_read` / `is_denied_search`: the one matcher every hook and shim calls. It is the
+    second layer (the runner's own deny rules are the first, a sandbox the real wall): it catches the plausible
+    retries, not every spelling a shell allows;
   * `rule_of_two`: refuse a session that holds untrusted input, private data and a way out at the same time.
 """
 
@@ -13,8 +15,8 @@ from __future__ import annotations
 import os
 import posixpath
 import re
-import shlex
 import tomllib
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -62,6 +64,7 @@ class Gate:
 class RuleException:
     name: str
     job: str
+    sources: tuple[str, ...]
     reason: str
 
 
@@ -97,9 +100,11 @@ _SHELLS = ("sh", "bash", "zsh", "dash")
 def default_deny_commands() -> list[str]:
     """The built-in deny list. `*` matches anything; `\\*` is a literal star. Flags are normalised before matching
     (see _canon_tokens), so `rm -rf` here also covers `rm -fr`, `rm -r -f` and `rm -Rf`."""
-    out = ["rm -* /", "rm -* /\\*", "rm -* ~", "rm -* ~/\\*"]
+    out = ["rm -* /", "rm -* /\\*", "rm -* ~", "rm -* ~/\\*", "rm -* /home", "rm -* /Users"]
     out += [f"rm -* /{d}*" for d in _SYSTEM_DIRS]
-    out += ["git push*--force*", "git push* -f*", "mkfs*", "dd * of=/dev/*"]
+    # A forcing push in any spelling (-f, -uf, +refspec, --force-with-lease), with or without git's global options.
+    out += ["git push*--force*", "git push* -f*", "git -* push*--force*", "git -* push* -f*"]
+    out += ["mkfs*", "dd*of=/dev/*"]
     # A shell reading its script from stdin is the end of `curl ... | sh` (and of `echo ... | sh`). Written as a
     # plain command so the runner's own deny list, which splits pipes, catches it too.
     for s in _SHELLS:
@@ -160,10 +165,16 @@ deny_read = ["~/.ssh/**", "~/.gnupg/**", "~/.aws/credentials"]
 # Neutral tool names to switch off: {", ".join(KNOWN_TOOLS)}. An allowed web tool counts as a way out (leg C).
 deny_tools = []
 
-# Named Rule of Two exceptions: a job that may break the rule, and why.
+# Rule of Two, leg C (a way out): besides a source's outward acts and the web tools above, the SHELL counts as a way
+# out while any of curl, wget, nc, ssh, scp, python -c ... is not in deny_commands. To close it, deny the lot
+# (for example "curl*", "wget*", "nc *", "ssh *", "scp *", "python* -c*"); there is no half measure.
+
+# Named Rule of Two exceptions: a job that may break the rule, for these sources only, and why. The job and every
+# source the session reads must match, or the exception does not apply.
 # [[exceptions]]
 # name = "morning-digest"
 # job = "digest"
+# sources = ["mail", "notes"]
 # reason = "reads mail, writes only to me"
 """
 
@@ -173,6 +184,18 @@ deny_tools = []
 
 def policy_path(env: dict | None = None) -> Path:
     return ws_home(env) / "policy.toml"
+
+
+# What an agent must never rewrite under $WS_HOME: its own policy, profile, secrets, jobs, release, and the run
+# records. (Reading logs/runs.jsonl stays allowed; only writes are denied.) Generated gate folders are added by the
+# caller, since they can sit anywhere.
+CONTROL_NAMES = ("profile.toml", "policy.toml", "secrets.toml", "jobs", "release", "runs", "logs")
+
+
+def control_paths(home: Path) -> list[str]:
+    """ws's own control files under a ws home, as absolute paths (files and folders alike; a path covers what is
+    under it)."""
+    return [str(Path(home).expanduser().absolute() / n) for n in CONTROL_NAMES]
 
 
 def _table(d, where: str, allowed: set[str]) -> dict:
@@ -257,13 +280,21 @@ def loads(text: str) -> Policy:
     exceptions: list[RuleException] = []
     for i, e in enumerate(ex_raw, 1):
         where = f"[[exceptions]] #{i} "
-        e = _table(e, where.strip(), {"name", "job", "reason"})
+        e = _table(e, where.strip(), {"name", "job", "sources", "reason"})
         for k in ("name", "job", "reason"):
             if not isinstance(e.get(k), str) or not e[k].strip():
                 raise PolicyError(f"{where}{k} is required (text)")
+        if "sources" not in e:
+            raise PolicyError(f"{where}sources is required (the sources this exception covers)")
+        covered = _strings(e, "sources", where)
+        if not covered:
+            raise PolicyError(f"{where}sources must name at least one source")
+        for name in covered:
+            if name not in sources:
+                raise PolicyError(f"{where}sources: unknown source {name!r}")
         if any(x.name == e["name"] for x in exceptions):
             raise PolicyError(f"{where}name {e['name']!r} is used twice")
-        exceptions.append(RuleException(e["name"], e["job"], e["reason"]))
+        exceptions.append(RuleException(e["name"], e["job"], covered, e["reason"]))
     return Policy(schema, dial, interrupts, sources, gate, tuple(exceptions))
 
 
@@ -289,10 +320,17 @@ def load(path: Path | None = None) -> Policy:
 # --- Rule of Two -------------------------------------------------------------------------------------------------
 
 
-def rule_of_two(policy: Policy, sources: list[str], job: str | None = None) -> Verdict:
+def shell_ways_out(policy: Policy) -> list[str]:
+    """The network commands the policy does not deny: each is a way for a shell to send data out."""
+    return [p.split()[0] for p in NET_PROBES if is_denied_command(policy, p) is None]
+
+
+def rule_of_two(policy: Policy, sources: list[str], job: str | None = None, shell: bool = True) -> Verdict:
     """May a session read `sources` and run `job`? Refused when it would hold untrusted input AND private data AND a
-    way out. A way out is an outward act of a source in mode "act" (only when the dial is not "prepare") or an
-    allowed egress tool (web_fetch, web_search). A named exception for the job lifts the refusal."""
+    way out. A way out is an outward act of a source in mode "act" (only when the dial is not "prepare"), an allowed
+    egress tool (web_fetch, web_search), or, when the session has a shell (`shell`, default yes), a network command
+    the policy does not deny (see shell_ways_out). A named exception lifts the refusal when its job matches and
+    every source the session reads is one it names."""
     for name in sources:
         src = policy.sources.get(name)
         if src is None:
@@ -304,6 +342,8 @@ def rule_of_two(policy: Policy, sources: list[str], job: str | None = None) -> V
     sensitive = [s.name for s in held if s.sensitive]
     ways_out = [f"{s.name}:{a}" for s in held if s.mode == "act" and policy.dial != "prepare" for a in s.outward]
     ways_out += [t for t in EGRESS_TOOLS if t not in policy.gate.deny_tools]
+    if shell and (open_cmds := shell_ways_out(policy)):
+        ways_out.append(f"shell:{'/'.join(dict.fromkeys(open_cmds))}")
     if not (untrusted and sensitive and ways_out):
         return Verdict("ok")
     why = (
@@ -311,21 +351,28 @@ def rule_of_two(policy: Policy, sources: list[str], job: str | None = None) -> V
         f"({', '.join(ways_out)}) together"
     )
     for e in policy.exceptions:
-        if job is not None and e.job == job:
+        if job is not None and e.job == job and set(sources) <= set(e.sources):
             return Verdict("exception", f"{why}; allowed by exception {e.name!r}: {e.reason}", e.name)
     return Verdict("refused", f"Rule of Two: {why}")
 
 
 # --- the matcher -------------------------------------------------------------------------------------------------
+#
+# The matcher is the SECOND layer. The first is each runner's own deny rules (generated from this policy), and the
+# real wall is a sandbox, which comes later. A shell line can always be spelled in a way a text matcher misses
+# (variables, interpreters, encoded payloads), so this does not try to be complete: it catches the plausible ways a
+# model retries a blocked command (other flags, a wrapper, a pipe, a nested shell, a different path spelling). What it
+# cannot judge it denies or leaves to the layers either side.
 
 _ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _FLAGS = re.compile(r"^-[A-Za-z]+$")
-_KEYWORDS = {"if", "then", "else", "elif", "do", "while", "until", "!", "{", "}", "time", "coproc"}
-# wrapper -> options that take a following argument
+_VAR = re.compile(r"\$\{(\w+)\}|\$(\w+)")
+_KEYWORDS = {"if", "then", "else", "elif", "do", "while", "until", "!", "{", "}", "coproc"}
+# wrapper -> short options that take the next word; _LONG_ARG: long options that do
 _WRAPPERS = {
     "sudo": {"-u", "-g", "-h", "-p", "-C", "-D", "-R", "-T", "-U"},
     "doas": {"-u", "-C"},
-    "env": {"-u", "-C", "-S"},
+    "env": {"-u", "-C"},
     "command": set(),
     "builtin": set(),
     "exec": {"-a"},
@@ -333,14 +380,81 @@ _WRAPPERS = {
     "nice": {"-n"},
     "ionice": {"-c", "-n", "-p"},
     "setsid": set(),
-    "stdbuf": set(),
+    "stdbuf": {"-i", "-o", "-e"},
     "timeout": {"-s", "-k"},
+    "time": set(),
+    "watch": {"-n"},
+    "xargs": {"-I", "-n", "-P", "-d", "-E", "-s", "-L", "-a", "-J"},
+    "busybox": set(),
 }
-_SHELL_NAMES = {"sh", "bash", "zsh", "dash", "ksh", "fish"}
+_LONG_ARG = {"timeout": {"--signal", "--kill-after"}, "sudo": {"--user", "--group", "--host", "--prompt"}}
+_SHELL_NAMES = {"sh", "bash", "zsh", "dash", "ksh", "fish", "ash", "csh", "tcsh"}
+_GIT_ARG_OPTS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env"}
+# Commands whose operands are each judged on their own: `rm -rf / /tmp` is a delete of `/`.
+_OPERAND_CMDS = {"rm", "rmdir", "shred", "unlink", "chmod", "chown", "chgrp", "mv"}
+_ALWAYS_RECURSIVE = {"tar", "find", "zip", "rsync", "tree", "du", "7z", "bsdtar", "cpio"}
+# Commands that write to every operand / only to the last one (or -t DIR).
+_WRITE_ALL = {"tee", "mv", "rm", "rmdir", "truncate", "chmod", "chown", "chgrp", "touch", "shred", "unlink", "patch"}
+_WRITE_LAST = {"cp", "install", "ln", "rsync", "scp"}
+_INTERP = re.compile(r"^(python[0-9.]*|perl|ruby|node|php)$")
+_PROCSUB = "/dev/fd/63"  # what `<(...)` becomes
+# Probes for "can the shell reach the network": a policy that denies all of them closes the shell as a way out.
+NET_PROBES = (
+    "curl http://example.com",
+    "wget http://example.com",
+    "nc example.com 80",
+    "ncat example.com 80",
+    "ssh example.com",
+    "scp a example.com:b",
+    "sftp example.com",
+    "ftp example.com",
+    "telnet example.com 80",
+    "socat - TCP:example.com:80",
+    "python3 -c x",
+    "python -c x",
+    "node -e x",
+    "perl -e x",
+    "ruby -e x",
+)
+
+
+@dataclass
+class _Ctx:
+    """What earlier parts of the same command line did: the folder (cd), variables, and paths ws protects."""
+
+    cwd: str
+    protect: tuple[str, ...] = ()
+    vars: dict[str, str] | None = None
+
+    def fork(self) -> _Ctx:
+        return _Ctx(self.cwd, self.protect, dict(self.vars or {}))
 
 
 def _home() -> str:
     return os.environ.get("HOME") or str(Path.home())
+
+
+def _cwd() -> str:
+    try:
+        return os.getcwd()
+    except OSError:
+        return "/"
+
+
+def _expand(path: str) -> str:
+    """~, ~user, $HOME and ${HOME} to a real prefix."""
+    home = _home().rstrip("/")
+    for pre in ("${HOME}", "$HOME", "~"):
+        if path == pre or path.startswith(pre + "/"):
+            return home + path[len(pre) :]
+    return os.path.expanduser(path) if path.startswith("~") else path
+
+
+def _abs(path: str, cwd: str) -> str:
+    p = _expand(path)
+    if not p.startswith("/"):
+        p = posixpath.join(cwd, p)
+    return posixpath.normpath(re.sub(r"^/{2,}", "/", p))
 
 
 def _canon_path(tok: str) -> str:
@@ -395,48 +509,141 @@ def _merge_flags(tokens: list[str]) -> list[str]:
     return [cmd, "-" + "".join(sorted(letters)), *tokens[rest_at:]]
 
 
-def _strip_wrappers(tokens: list[str]) -> list[str]:
-    """Drop leading keywords, VAR=value, and exec wrappers (sudo, env, timeout, nice ...): what is left is the command
-    that really runs."""
-    while tokens:
-        w = tokens[0]
+def _git_normal(toks: list[str]) -> list[str]:
+    """Drop git's global options (`-C dir`, `-c k=v`, `--git-dir=...`) so the subcommand is where a rule expects it;
+    spell any forcing or destroying push (`-f`, `-uf`, `+refspec`, `:ref`, `--mirror`, `--delete`) as `--force`."""
+    i = 1
+    while i < len(toks) and toks[i].startswith("-"):
+        i += 2 if toks[i] in _GIT_ARG_OPTS else 1
+    toks = ["git", *toks[i:]]
+    forcing = len(toks) > 1 and toks[1] == "push" and "--force" not in toks
+    if forcing and any(
+        re.fullmatch(r"-[A-Za-z]*f[A-Za-z]*", t)
+        or t.startswith(("+", ":"))
+        or ":+" in t
+        or t in ("--mirror", "--delete")
+        for t in toks[2:]
+    ):
+        toks.append("--force")
+    return toks
+
+
+def _lex(seg: str) -> tuple[list[str], list[tuple[str, str]]]:
+    """Split one shell segment into words (quotes and escapes resolved) and redirections [(op, target)]. A
+    redirection glued to a word (`/>/dev/null`, `<~/.ssh/id`, `2>&1`) is split off it."""
+    words: list[str] = []
+    redirs: list[tuple[str, str]] = []
+    n, i = len(seg), 0
+
+    def word(i: int) -> tuple[str, int]:
+        buf: list[str] = []
+        while i < n:
+            c = seg[i]
+            if c in " \t\r\n<>":
+                break
+            if c == "\\" and i + 1 < n:
+                buf.append(seg[i + 1])
+                i += 2
+            elif c == "'":
+                j = seg.find("'", i + 1)
+                j = n if j < 0 else j
+                buf.append(seg[i + 1 : j])
+                i = j + 1
+            elif c == '"':
+                i += 1
+                while i < n and seg[i] != '"':
+                    if seg[i] == "\\" and i + 1 < n and seg[i + 1] in '"\\$`':
+                        i += 1
+                    buf.append(seg[i])
+                    i += 1
+                i += 1
+            elif seg.startswith("$(", i):
+                j = _close_paren(seg, i + 2)
+                buf.append(seg[i : j + 1])
+                i = j + 1
+            else:
+                buf.append(c)
+                i += 1
+        return "".join(buf), i
+
+    while i < n:
+        c = seg[i]
+        if c in " \t\r\n":
+            i += 1
+        elif c in "<>":
+            for op in ("<<<", "<<-", "<<", "<&", "<>", "<", ">>", ">|", ">&", ">"):
+                if seg.startswith(op, i) and op[0] == c:
+                    break
+            i += len(op)
+            while i < n and seg[i] in " \t":
+                i += 1
+            target, i = word(i)
+            if op.endswith("&") and (target.isdigit() or target == "-"):
+                continue  # 2>&1, <&-
+            redirs.append((op, target))
+        else:
+            start = i
+            w, i = word(i)
+            glued_fd = w.isdigit() and i < n and seg[i] in "<>"
+            if not (glued_fd or (w == "&" and seg[i : i + 1] == ">") or (i == start)):
+                words.append(w)
+    return words, redirs
+
+
+def _strip_wrappers(words: list[str]) -> tuple[list[str], set[str]]:
+    """Drop leading keywords, VAR=value and exec wrappers (sudo, env, timeout, nice, xargs, busybox ...): what is left
+    is the command that really runs. Also returns the wrappers it removed."""
+    toks, seen = list(words), set()
+    while toks:
+        w = toks[0]
         if w in _KEYWORDS or _ASSIGN.match(w):
-            tokens = tokens[1:]
+            toks = toks[1:]
             continue
         if w.startswith("/") and "/" in w[1:]:
-            w = tokens[0] = posixpath.basename(w)  # /usr/bin/rm -> rm
+            w = toks[0] = posixpath.basename(w)  # /usr/bin/rm -> rm
         if w not in _WRAPPERS:
             break
-        arg_opts, i = _WRAPPERS[w], 1
-        while i < len(tokens):
-            t = tokens[i]
-            if t in arg_opts:
+        seen.add(w)
+        arg_opts, i, resplit = _WRAPPERS[w], 1, None
+        while i < len(toks):
+            t = toks[i]
+            if t == "--":
+                i += 1
+                break
+            if w == "env" and t in ("-S", "--split-string"):
+                resplit = toks[i + 1] if i + 1 < len(toks) else ""
                 i += 2
-            elif t.startswith("-") and len(t) > 1 or (w == "env" and _ASSIGN.match(t)):
+                break
+            if t.startswith("--"):
+                i += 2 if t in _LONG_ARG.get(w, ()) else 1
+            elif t.startswith("-") and len(t) > 1:
+                i += 2 if "-" + t[-1] in arg_opts else 1  # `-u root`, and the `u` of `-iu root`
+            elif w == "env" and _ASSIGN.match(t):
                 i += 1
             else:
                 break
-        if w == "timeout" and i < len(tokens):
+        if w == "timeout" and i < len(toks):
             i += 1  # the duration
-        tokens = tokens[i:]
-    return tokens
-
-
-def _tokens(seg: str) -> list[str]:
-    try:
-        return shlex.split(seg)
-    except ValueError:
-        return seg.split()
+        toks = (_lex(resplit)[0] if resplit else []) + toks[i:]
+    return toks, seen
 
 
 def _canon_tokens(tokens: list[str]) -> list[str]:
-    tokens = _merge_flags(_strip_wrappers(tokens))
+    if tokens and tokens[0] == "git":
+        tokens = _git_normal(tokens)
+    tokens = _merge_flags(tokens)
     return [_canon_path(t) if _is_pathlike(t) else t for t in tokens]
+
+
+def _prep(cmd: str) -> str:
+    """Line continuations joined, full-width characters folded, ${IFS} read as the space it is."""
+    cmd = unicodedata.normalize("NFKC", cmd).replace("\\\n", "")
+    return re.sub(r"\$\{IFS\}|\$IFS\b", " ", cmd)
 
 
 def _scan(cmd: str) -> tuple[list[list[str]], list[str]]:
     """Split a shell command line. Returns (pipelines, inner): each pipeline is a list of segments (split on |, |&),
-    pipelines are split on ; && || & newline ( ); inner holds the text of $(...) and backticks, which run too."""
+    pipelines are split on ; && || & newline ( ); inner holds the text of $(...), backticks and <(...), which run too."""
     pipelines: list[list[str]] = []
     inner: list[str] = []
     segs: list[str] = []
@@ -491,6 +698,12 @@ def _scan(cmd: str) -> tuple[list[list[str]], list[str]]:
             buf.append(cmd[i : j + 1])
             i = j + 1
             continue
+        elif c in "<>" and cmd.startswith("(", i + 1):  # process substitution: a file name to the outer command
+            j = _close_paren(cmd, i + 2)
+            inner.append(cmd[i + 2 : j])
+            buf.append(" " + _PROCSUB + " " if c == "<" else " /dev/null ")
+            i = j + 1
+            continue
         elif c in ";\n()":
             end_pipeline()
         elif c == "&":
@@ -500,6 +713,8 @@ def _scan(cmd: str) -> tuple[list[list[str]], list[str]]:
                 end_pipeline()
                 if cmd[i + 1 : i + 2] == "&":
                     i += 1
+        elif c == "|" and i > 0 and cmd[i - 1] == ">":  # >| (clobber redirect)
+            buf.append(c)
         elif c == "|":
             if cmd[i + 1 : i + 2] == "|":
                 end_pipeline()
@@ -537,47 +752,283 @@ def _close_paren(cmd: str, i: int) -> int:
     return len(cmd)
 
 
-def _nested_scripts(tokens: list[str]) -> list[str]:
-    """The script text a command hands to a shell: `bash -c '...'`, `eval ...`."""
-    if not tokens:
-        return []
-    if tokens[0] == "eval":
-        return [" ".join(tokens[1:])]
-    if tokens[0] in _SHELL_NAMES:
-        for i, t in enumerate(tokens[1:], 1):
-            if _FLAGS.match(t) and "c" in t[1:]:
-                return [tokens[i + 1]] if i + 1 < len(tokens) else []
-            if not t.startswith("-"):
-                break
-    return []
+def _args(toks: list[str]) -> tuple[list[str], list[str]]:
+    """(flags, operands) of a command: anything starting with '-' is a flag until a bare `--`."""
+    flags, operands, after = [], [], False
+    for t in toks[1:]:
+        if after:
+            operands.append(t)
+        elif t == "--":
+            after = True
+        elif t.startswith("-") and len(t) > 1:
+            flags.append(t)
+        else:
+            operands.append(t)
+    return flags, operands
 
 
-def _candidates(cmd: str, depth: int = 0) -> tuple[list[str], list[list[str]]]:
-    """Every command string to test, and the token lists behind them. Each segment appears raw (whitespace
-    normalised) and canonical; each pipeline also appears as one string, segments joined with ' | '."""
+def _cluster(flags: list[str], letter: str) -> bool:
+    """Is `letter` in any single-dash flag group (`-c`, `-lc`, `-ec`)?"""
+    return any(f[0] == "-" and f[1:2] != "-" and letter in f[1:] for f in flags)
+
+
+# --- paths: deny_read, protected files ----------------------------------------------------------------------------
+
+
+def _glob_regex_path(pattern: str) -> re.Pattern:
+    out, i = [], 0
+    while i < len(pattern):
+        c = pattern[i]
+        if pattern.startswith("**/", i):
+            out.append("(?:.*/)?")
+            i += 3
+            continue
+        if pattern.startswith("**", i):
+            out.append(".*")
+            i += 2
+            continue
+        if c == "*":
+            out.append("[^/]*")
+        elif c == "?":
+            out.append("[^/]")
+        elif c == "[" and (j := pattern.find("]", i + 2)) > 0:
+            body = pattern[i + 1 : j]
+            out.append("[" + ("^" + body[1:] if body[0] == "!" else body) + "]")
+            i = j
+        else:
+            out.append(re.escape(c))
+        i += 1
+    return re.compile("".join(out) + r"\Z", re.DOTALL)
+
+
+def _path_regex(pattern: str) -> re.Pattern:
+    """gitignore-style path glob: `**` crosses folders, `*` stays in one, a bare name matches at any depth."""
+    pattern = _expand(pattern)
+    if not pattern.startswith("/"):
+        pattern = "**/" + pattern.removeprefix("./")
+    return _glob_regex_path(pattern)
+
+
+def _rule_root(rule: str) -> str | None:
+    """The folder (or file) a deny_read rule is about: `~/.ssh/**` -> ~/.ssh, `~/.aws/credentials` as it is."""
+    p = _expand(rule)
+    if not p.startswith("/"):
+        return None
+    parts = []
+    for seg in p.split("/"):
+        if re.search(r"[*?\[]", seg):
+            break
+        parts.append(seg)
+    return posixpath.normpath("/".join(parts) or "/")
+
+
+def _glob_reaches(policy: Policy, token_abs: str) -> str | None:
+    """Could this glob (`~/.s*/id_rsa`) name something a deny_read rule covers? Tried against the rule's folder and a
+    few names a secrets folder holds."""
+    rx = _glob_regex_path(token_abs)
+    for rule in policy.gate.deny_read:
+        root = _rule_root(rule)
+        if root is None:
+            continue
+        samples = [root] + [f"{root}/{x}" for x in ("id_rsa", "id_ed25519", "credentials", "key", "x")]
+        if any(rx.match(s) for s in samples):
+            return rule
+    return None
+
+
+def _read_hit(policy: Policy, path: str, cwd: str, recursive: bool = False, folder: bool = True) -> str | None:
+    """The deny_read rule a path falls under, or None. With `folder`, naming the denied folder itself counts; with
+    `recursive`, so does a folder above it (`grep -r x ~` reads `~/.ssh` too)."""
+    if not policy.gate.deny_read or not path:
+        return None
+    p = _abs(path, cwd)
+    if re.search(r"[*?\[]", p):
+        return _glob_reaches(policy, p)
+    forms = {p}
+    try:
+        forms.add(os.path.realpath(p))  # a symlink into a denied folder is still that folder
+    except OSError:
+        pass
+    for rule in policy.gate.deny_read:
+        rx, root = _path_regex(rule), _rule_root(rule)
+        for f in forms:
+            if rx.match(f):
+                return rule
+            if root is None:
+                continue
+            if folder and f == root:
+                return rule
+            if recursive and (f == "/" or root.startswith(f + "/")):
+                return rule
+    return None
+
+
+def _under(paths: tuple[str, ...], path: str, cwd: str) -> str | None:
+    p = _abs(path, cwd)
+    forms = {p, os.path.realpath(p)}
+    for q in paths:
+        qa = _abs(q, cwd)
+        for target in {qa, os.path.realpath(qa)}:
+            if any(f == target or f.startswith(target + "/") for f in forms):
+                return q
+    return None
+
+
+# --- one command line ---------------------------------------------------------------------------------------------
+
+
+def _expand_vars(seg: str, ctx: _Ctx) -> str:
+    known = ctx.vars or {}
+    return _VAR.sub(lambda m: known.get(m.group(1) or m.group(2), m.group(0)), seg) if known else seg
+
+
+def _walk(policy: Policy, cmd: str, ctx: _Ctx, depth: int, cands: list[str]) -> str | None:
+    """Look at every part of a command line. Fills `cands` with the strings the deny globs are tried on and returns
+    the reason at once for the checks that are not globs (pipe into a shell, denied paths, protected files)."""
     if depth > _MAX_DEPTH:
         raise ValueError("command nests too deeply to check")
-    pipelines, inner = _scan(cmd)
-    cands: list[str] = []
-    toks: list[list[str]] = []
-    nested = list(inner)
+    pipelines, inner = _scan(_prep(cmd))
+    nested: list[str] = list(inner)
     for segs in pipelines:
         canon_segs = []
-        for seg in segs:
-            raw = _tokens(seg)
-            cands.append(" ".join(seg.split()))
-            ct = _canon_tokens(raw)
-            toks.append(ct)
-            canon_segs.append(" ".join(ct))
-            nested += _nested_scripts(_strip_wrappers(raw))
-        cands += canon_segs
+        for idx, seg in enumerate(segs):
+            reason, canon, more = _segment(policy, seg, ctx, idx > 0, cands)
+            if reason:
+                return reason
+            canon_segs.append(canon)
+            nested += more
         if len(canon_segs) > 1:
             cands.append(" | ".join(canon_segs))
     for script in nested:
-        c, t = _candidates(script, depth + 1)
-        cands += c
-        toks += t
-    return cands, toks
+        reason = _walk(policy, script, ctx.fork(), depth + 1, cands)
+        if reason:
+            return reason
+    return None
+
+
+def _segment(policy: Policy, seg: str, ctx: _Ctx, in_pipe: bool, cands: list[str]) -> tuple[str | None, str, list[str]]:
+    cands.append(" ".join(seg.split()))
+    words, redirs = _lex(_expand_vars(seg, ctx))
+    if not words and not redirs:
+        return None, "", []
+    if words and all(_ASSIGN.match(w) for w in words):  # X=/ ; later $X
+        ctx.vars = {**(ctx.vars or {}), **dict(w.split("=", 1) for w in words)}
+    elif len(words) > 3 and words[0] == "for" and words[2] == "in":  # for i in /; do ... $i
+        ctx.vars = {**(ctx.vars or {}), words[1]: words[3]}
+    toks, wrappers = _strip_wrappers(words)
+    canon = _canon_tokens(toks)
+    line = " ".join(canon)
+    if line:
+        cands.append(line)
+    cmd = canon[0] if canon else ""
+    flags, operands = _args(canon)
+    nested: list[str] = []
+
+    if cmd in ("cd", "pushd"):
+        ctx.cwd = _abs(operands[0] if operands else "~", ctx.cwd)
+    if cmd == "eval":
+        nested.append(" ".join(toks[1:]))
+    if cmd in _SHELL_NAMES:
+        reason, nested = _shell(toks, canon, flags, operands, redirs, in_pipe)
+        if reason:
+            return reason, line, []
+    if in_pipe and _INTERP.match(cmd) and operands in ([], ["-"]) and not any(_cluster(flags, c) for c in "cemp"):
+        return "an interpreter is reading its program from a pipe", line, []
+    if cmd in ("source", ".") and _PROCSUB in operands:
+        return "a script is being sourced from a process substitution", line, []
+    if cmd in _OPERAND_CMDS:
+        cands += [" ".join([cmd, *flags, op]) for op in operands[:64]]
+    if cmd == "find":
+        cands += _find_deletes(canon)
+    if (
+        "xargs" in wrappers
+        and cmd == "rm"
+        and (_cluster(flags, "r") or _cluster(flags, "R"))
+        and all(o == "{}" for o in operands)
+        and any(p.startswith("rm ") for p in policy.gate.deny_commands)
+    ):
+        return "recursive rm fed by xargs: the operands cannot be seen, and rm is on the deny list", line, []
+
+    # Paths this command names: operands, --opt=value, redirect targets.
+    named = [*operands, *(f.split("=", 1)[1] for f in flags if "=" in f), *(t for _, t in redirs if t)]
+    recursive = (
+        cmd in _ALWAYS_RECURSIVE
+        or _cluster(flags, "r")
+        or _cluster(flags, "R")
+        or "--recursive" in flags
+        or "--archive" in flags
+        or (cmd in ("cp", "rsync") and _cluster(flags, "a"))
+    )
+    for p in named:
+        rule = _read_hit(policy, p, ctx.cwd, recursive=recursive)
+        if rule:
+            return f"command names a path denied by deny_read rule {rule!r}", line, nested
+    if ctx.protect:
+        for p in _written(cmd, flags, operands, redirs, canon):
+            hit = _under(ctx.protect, p, ctx.cwd)
+            if hit:
+                return f"command writes to {hit}, which ws protects (policy and generated gate)", line, nested
+    return None, line, nested
+
+
+def _shell(toks, canon, flags, operands, redirs, in_pipe):
+    """A shell interpreter: returns (reason, nested scripts). Denied when it is fed its script on stdin from a pipe
+    or here-document, or from a process substitution; `bash script.sh` and `bash -c '...'` are fine (the -c text is
+    checked on its own)."""
+    here = any(op in ("<<<", "<<", "<<-") for op, _ in redirs)
+    nested = [t for op, t in redirs if op == "<<<"]
+    if _PROCSUB in operands:
+        return "a shell is reading its script from a process substitution", nested
+    if _cluster(flags, "c"):
+        if operands and operands[0].lstrip().startswith(("$(", "`")):
+            return "a shell is running text another command produces", nested
+        if operands:
+            return None, [*nested, operands[0]]
+        stdin = True
+    else:
+        first = operands[0] if operands else None
+        stdin = (
+            _cluster(flags, "s")
+            or first is None
+            or first in ("-", "/dev/stdin")
+            or first.startswith(("/dev/fd/", "/proc/self/fd/"))
+        )
+    if stdin and (in_pipe or here):
+        return "a shell is reading its script from a pipe or here-document", nested
+    return None, nested
+
+
+def _find_deletes(canon: list[str]) -> list[str]:
+    """`find P -delete` and `find P -exec rm ...` as the `rm -rf P` they amount to."""
+    rest = canon[1:]
+    deleting = "-delete" in rest or any(
+        rest[i] in ("-exec", "-execdir") and rest[i + 1 : i + 2] == ["rm"] for i in range(len(rest))
+    )
+    if not deleting:
+        return []
+    starts = []
+    for t in rest:
+        if t.startswith(("-", "(", "!", ",")):
+            break
+        starts.append(t)
+    return [f"rm -fr {p}" for p in (starts or ["."])]
+
+
+def _written(cmd, flags, operands, redirs, canon) -> list[str]:
+    """Paths this command writes (or removes): redirect targets, and operands of the commands that write."""
+    out = [t for op, t in redirs if op.startswith(">") or op == "<>"]
+    if cmd in _WRITE_ALL:
+        out += operands
+    elif cmd in _WRITE_LAST:
+        out += operands[-1:] + [f.split("=", 1)[1] for f in flags if f.startswith("--target-directory=")]
+        out += [canon[i + 1] for i, t in enumerate(canon[:-1]) if t == "-t"]
+    elif cmd in ("sed", "perl", "ruby") and any(
+        f.startswith("--in-place") or re.match(r"^-[A-Za-z]*i", f) for f in flags
+    ):
+        out += operands
+    elif cmd == "dd":
+        out += [o[3:] for o in operands if o.startswith("of=")]
+    return out
 
 
 def _glob_regex(pattern: str) -> re.Pattern:
@@ -603,78 +1054,51 @@ def _canon_pattern(pattern: str) -> str:
     return " ".join(toks)
 
 
-def is_denied_command(policy: Policy, command: str) -> str | None:
+def is_denied_command(
+    policy: Policy, command: str, *, protect: tuple[str, ...] = (), cwd: str | None = None
+) -> str | None:
     """None if the command may run, else the reason. Every shell segment is checked (split on ; && || | & newline,
-    $(...), backticks, `bash -c`), after stripping sudo/env/timeout wrappers and normalising flags and paths. Also
-    denies a segment that names a deny_read path. Raises on input it cannot judge: callers treat that as a deny."""
+    $(...), backticks, <(...), `bash -c`), after stripping sudo/env/timeout/xargs wrappers and normalising flags,
+    paths, git's global options, `cd` and simple `VAR=value`. Also denied: a shell fed its script by a pipe or
+    here-document, a path under deny_read (or the folder itself, or a folder above it used recursively, or a glob
+    that reaches it), and a write to a `protect` path (ws's own policy and generated gate files). Raises on input
+    it cannot judge: callers treat that as a deny. This is the second layer; see the note above."""
     if not isinstance(command, str):
         raise TypeError("command must be text")
-    cands, toks = _candidates(command)
+    cands: list[str] = []
+    reason = _walk(policy, command, _Ctx(cwd or _cwd(), tuple(protect)), 0, cands)
+    if reason:
+        return reason
     for pat in policy.gate.deny_commands:
         rx = _glob_regex(_canon_pattern(pat))
         if any(rx.match(c) for c in cands):
             return f"command matches deny_commands rule {pat!r}"
-    for t in (x for ts in toks for x in ts):
-        for part in (t, t.split("=", 1)[-1]):
-            if _is_pathlike(part) and (rule := _read_rule(policy, part)):
-                return f"command names a path denied by deny_read rule {rule!r}"
     return None
 
 
-def _path_regex(pattern: str) -> re.Pattern:
-    """gitignore-style path glob: `**` crosses folders, `*` stays in one, a bare name matches at any depth."""
-    pattern = _expand(pattern)
-    if not pattern.startswith("/"):
-        pattern = "**/" + pattern.removeprefix("./")
-    out, i = [], 0
-    while i < len(pattern):
-        if pattern.startswith("**/", i):
-            out.append("(?:.*/)?")
-            i += 3
-        elif pattern.startswith("**", i):
-            out.append(".*")
-            i += 2
-        elif pattern[i] == "*":
-            out.append("[^/]*")
-            i += 1
-        elif pattern[i] == "?":
-            out.append("[^/]")
-            i += 1
-        else:
-            out.append(re.escape(pattern[i]))
-            i += 1
-    return re.compile("".join(out) + r"\Z", re.DOTALL)
-
-
-def _expand(path: str) -> str:
-    home = _home().rstrip("/")
-    for pre in ("${HOME}", "$HOME", "~"):
-        if path == pre or path.startswith(pre + "/"):
-            return home + path[len(pre) :]
-    return path
-
-
-def _read_rule(policy: Policy, path: str) -> str | None:
-    p = _expand(path)
-    forms = {posixpath.normpath(p) if p.startswith("/") else p}
-    if p.startswith("/") and "*" not in p:
-        forms.add(os.path.realpath(p))  # a symlink into a denied folder is still that folder
-    elif not p.startswith("/") and "*" not in p:
-        forms.add(os.path.realpath(p))
-        forms.add(os.path.abspath(p))
-    for rule in policy.gate.deny_read:
-        rx = _path_regex(rule)
-        if any(rx.match(f) for f in forms):
-            return rule
-    return None
-
-
-def is_denied_read(policy: Policy, path: str) -> str | None:
-    """None if the path may be read, else the reason."""
+def is_denied_read(policy: Policy, path: str, *, cwd: str | None = None) -> str | None:
+    """None if the path (a file a tool wants to read) may be read, else the reason."""
     if not isinstance(path, str) or not path:
         raise TypeError("path must be non-empty text")
-    rule = _read_rule(policy, path)
+    rule = _read_hit(policy, path, cwd or _cwd(), folder=False)
     return f"path matches deny_read rule {rule!r}" if rule else None
+
+
+def is_denied_search(policy: Policy, path: str, *, cwd: str | None = None) -> str | None:
+    """None if a tool may search under `path` (grep, glob, list), else the reason: the path is a denied folder, is
+    under one, or is a folder above one."""
+    if not isinstance(path, str) or not path:
+        raise TypeError("path must be non-empty text")
+    rule = _read_hit(policy, path, cwd or _cwd(), recursive=True)
+    return f"search of {path!r} reaches deny_read rule {rule!r}" if rule else None
+
+
+def is_protected_write(protect: tuple[str, ...], path: str, *, cwd: str | None = None) -> str | None:
+    """None if a tool may write `path`, else the reason: it is one of ws's own files."""
+    if not isinstance(path, str) or not path:
+        raise TypeError("path must be non-empty text")
+    hit = _under(tuple(protect), path, cwd or _cwd())
+    return f"{hit} is protected: it is ws's own policy or generated gate" if hit else None
 
 
 # A pattern with these can never match one subcommand in a runner that splits the line before it matches, and no runner

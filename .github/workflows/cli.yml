@@ -58,8 +58,15 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24"
-      - name: install the runners (versions released at least 7 days before pinning, 31 Oct 2026)
-        run: npm install --global @anthropic-ai/claude-code@2.1.308 opencode-ai@1.19.4
+      # Pinned in tests/e2e/runners/package-lock.json (versions released at least 7 days before pinning, 31 Oct 2026).
+      # No install scripts run, except the two each runner needs to unpack its own native binary.
+      - name: install the runners
+        working-directory: tests/e2e/runners
+        run: |
+          npm ci --ignore-scripts
+          node node_modules/opencode-ai/postinstall.mjs
+          node node_modules/@anthropic-ai/claude-code/install.cjs
+          echo "$PWD/node_modules/.bin" >> "$GITHUB_PATH"
       - name: a denied command is blocked on Claude Code (deny list, hook) and OpenCode (deny list, shim)
         env:
           WS_E2E_REQUIRE: "1" # a missing runner fails the job instead of skipping

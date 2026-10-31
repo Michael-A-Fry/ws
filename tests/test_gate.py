@@ -35,10 +35,10 @@ def generate(runner, out, *extra):
     return cli.main(["gate", "generate", "--runner", runner, "--out", str(out), *extra])
 
 
-def check(monkeypatch, capsys, runner, payload) -> tuple[int, str]:
+def check(monkeypatch, capsys, runner, payload, *extra) -> tuple[int, str]:
     raw = payload if isinstance(payload, str) else json.dumps(payload)
     monkeypatch.setattr(sys, "stdin", io.StringIO(raw))
-    code = cli.main(["gate", "check", "--runner", runner])
+    code = cli.main(["gate", "check", "--runner", runner, *extra])
     return code, capsys.readouterr().err
 
 
@@ -86,8 +86,27 @@ def test_claude_code_settings(home, tmp_path, capsys):
     assert "Read(~/.ssh/**)" in deny
     assert not any("\\*" in d for d in deny)  # no runner has a literal star: those rules are hook-only
     hook = conf["hooks"]["PreToolUse"][0]
-    assert hook["matcher"] == "Bash"
-    assert hook["hooks"][0]["command"] == "uv run ws gate check --runner claude-code || exit 2"
+    assert hook["matcher"].split("|") == [
+        "Bash",
+        "Read",
+        "Grep",
+        "Glob",
+        "WebFetch",
+        "WebSearch",
+        "Edit",
+        "Write",
+        "MultiEdit",
+        "NotebookEdit",
+    ]
+    policy_file = (home / "wshome" / "policy.toml").resolve()
+    # absolute paths: the hook reads this policy wherever the runner starts, and protects this folder
+    assert hook["hooks"][0]["command"] == (
+        f"uv run ws gate check --runner claude-code --policy {policy_file} --protect {out.resolve()} || exit 2"
+    )
+    assert f"Edit(/{policy_file})" in deny and f"Edit(/{out.resolve()}/**)" in deny  # a session cannot edit its gate
+    wshome = (home / "wshome").resolve()
+    for name in policy.CONTROL_NAMES:  # nor the rest of ws's control files, nor its run records
+        assert f"Edit(/{wshome / name})" in deny and f"Edit(/{wshome / name}/**)" in deny, name
 
 
 def test_claude_code_rule_syntax_for_paths_and_tools(home, tmp_path):
@@ -97,7 +116,9 @@ def test_claude_code_rule_syntax_for_paths_and_tools(home, tmp_path):
     out = tmp_path / "out"
     assert generate("claude-code", out) == 0
     deny = json.loads((out / "settings.json").read_text())["permissions"]["deny"]
-    assert deny == ["Read(//etc/shadow)", "Read(~/x/**)", "Read(.env)", "WebFetch", "WebSearch"]
+    assert deny[:3] == ["Read(//etc/shadow)", "Read(~/x/**)", "Read(.env)"]
+    assert deny[-2:] == ["WebFetch", "WebSearch"]
+    assert all(d.startswith("Edit(//") for d in deny[3:-2]) and len(deny[3:-2]) == 2 * (len(policy.CONTROL_NAMES) + 1)
 
 
 def test_opencode_config_and_shim(home, tmp_path):
@@ -111,11 +132,18 @@ def test_opencode_config_and_shim(home, tmp_path):
     perm = conf["permission"]
     assert next(iter(perm["bash"])) == "*" and perm["bash"]["*"] == "allow"  # last match wins: the catch-all is first
     assert perm["bash"]["make deploy"] == "deny" and perm["bash"]["rm -fr /x"] == "deny"
-    assert perm["read"] == {"*": "allow", "~/.ssh/**": "deny"}
+    rules = {"*": "allow", "~/.ssh/**": "deny", "**/.ssh/**": "deny"}  # the second is how OpenCode sees a path
+    assert perm["read"] == perm["grep"] == perm["glob"] == perm["list"] == rules
+    wshome = (home / "wshome").resolve()
+    assert perm["edit"]["*"] == "allow" and next(iter(perm["edit"])) == "*"
+    for path in (out.resolve(), *(wshome / n for n in policy.CONTROL_NAMES)):
+        assert perm["edit"][str(path)] == perm["edit"][f"{path}/**"] == "deny", path
     assert perm["webfetch"] == "deny" and "websearch" not in perm
     shim = (out / "plugins" / "ws-gate.js").read_text()
-    assert "__WS_CMD__" not in shim
-    assert 'const WS = ["/opt/my ws/bin/ws"]' in shim
+    assert "__CHECK__" not in shim
+    argv = json.loads(shim.split("const CHECK = ")[1].split("\n")[0])
+    assert argv[:4] == ["/opt/my ws/bin/ws", "gate", "check", "--runner"] and argv[4] == "opencode"
+    assert argv[5:] == ["--policy", str((home / "wshome" / "policy.toml").resolve()), "--protect", str(out.resolve())]
     assert "tool.execute.before" in shim and "throw new Error" in shim
 
 
@@ -222,7 +250,7 @@ def test_check_fails_closed_on_a_broken_policy_and_on_a_crash(home, monkeypatch,
     assert check(monkeypatch, capsys, "claude-code", bash("ls"))[0] == 2
     write_policy(home, "")
 
-    def boom(*a):
+    def boom(*a, **kw):
         raise RuntimeError("matcher bug")
 
     monkeypatch.setattr(policy, "is_denied_command", boom)
@@ -234,6 +262,98 @@ def test_check_never_echoes_the_command_it_blocked(home, monkeypatch, capsys):
     secret = "tok_" + "x1y2z3" * 3  # built at run time
     code, err = check(monkeypatch, capsys, "claude-code", bash(f"{PUSH} {secret}"))
     assert code == 2 and secret not in err
+
+
+def test_check_covers_every_tool_the_claude_hook_matches(home, monkeypatch, capsys):
+    ssh = str(home / "home" / ".ssh")
+    cases = {
+        2: [
+            ("Grep", {"pattern": "x", "path": ssh}),
+            ("Grep", {"pattern": "x", "path": "~/.ssh"}),
+            ("Glob", {"pattern": "*", "path": "~/.ssh"}),
+            ("Glob", {"pattern": "~/.ssh/*"}),
+            ("Glob", {"pattern": "/**/id_rsa", "path": "/"}),
+            ("Read", {"file_path": ssh + "/id_rsa"}),
+        ],
+        0: [
+            ("Grep", {"pattern": "x"}),
+            ("Grep", {"pattern": "x", "path": "src"}),
+            ("Glob", {"pattern": "**/*.py"}),
+            ("Glob", {"pattern": "*.md", "path": str(home / "home" / "proj")}),
+            ("Read", {"file_path": str(home / "notes.txt")}),
+        ],
+    }
+    for want, calls in cases.items():
+        for name, inp in calls:
+            code, err = check(monkeypatch, capsys, "claude-code", {"tool_name": name, "tool_input": inp})
+            assert code == want, (name, inp, err)
+
+
+def test_check_protects_ws_own_files_from_edit_tools_and_the_shell(home, monkeypatch, capsys):
+    policy_file = home / "wshome" / "policy.toml"
+    gate_dir = home / "gate-out"
+    extra = ("--protect", str(gate_dir))
+    for name, key in (
+        ("Edit", "file_path"),
+        ("Write", "file_path"),
+        ("MultiEdit", "file_path"),
+        ("NotebookEdit", "notebook_path"),
+    ):
+        for target in (policy_file, gate_dir / "settings.json", gate_dir / "plugins" / "ws-gate.js"):
+            code, err = check(
+                monkeypatch, capsys, "claude-code", {"tool_name": name, "tool_input": {key: str(target)}}, *extra
+            )
+            assert code == 2 and "protected" in err, (name, target)
+        other = {"tool_name": name, "tool_input": {key: str(home / "project" / "a.py")}}
+        assert check(monkeypatch, capsys, "claude-code", other, *extra)[0] == 0
+    for tool in ("edit", "write", "multiedit"):
+        payload = {"tool": tool, "args": {"filePath": str(policy_file)}}
+        assert check(monkeypatch, capsys, "opencode", payload, *extra)[0] == 2
+        payload = {"tool": tool, "args": {"filePath": str(home / "project" / "a.py")}}
+        assert check(monkeypatch, capsys, "opencode", payload, *extra)[0] == 0
+    for name in policy.CONTROL_NAMES:  # profile, secrets, jobs, release, runs, logs: not for the agent to write
+        target = home / "wshome" / name / "x.toml"
+        assert (
+            check(monkeypatch, capsys, "claude-code", {"tool_name": "Write", "tool_input": {"file_path": str(target)}})[
+                0
+            ]
+            == 2
+        )
+        assert check(monkeypatch, capsys, "claude-code", bash(f"echo x >> {target}"))[0] == 2
+        assert check(monkeypatch, capsys, "opencode", {"tool": "write", "args": {"filePath": str(target)}})[0] == 2
+    # the run record may be read, only writing is denied
+    runs = home / "wshome" / "logs" / "runs.jsonl"
+    assert (
+        check(monkeypatch, capsys, "claude-code", {"tool_name": "Read", "tool_input": {"file_path": str(runs)}})[0] == 0
+    )
+    assert check(monkeypatch, capsys, "claude-code", bash(f"tail -n 5 {runs}"))[0] == 0
+    assert check(monkeypatch, capsys, "claude-code", bash(f"echo x >> {runs}"))[0] == 2
+    code, err = check(monkeypatch, capsys, "claude-code", bash(f"echo x > {policy_file}"), *extra)
+    assert code == 2 and "protects" in err
+    code, err = check(
+        monkeypatch,
+        capsys,
+        "opencode",
+        {"tool": "bash", "args": {"command": f"sed -i s/a/b/ {gate_dir}/opencode.json"}},
+        *extra,
+    )
+    assert code == 2
+    assert check(monkeypatch, capsys, "claude-code", bash(f"cat {policy_file}"), *extra)[0] == 0
+    # --policy names the file that is protected, not just the default one
+    other = home / "elsewhere.toml"
+    write_policy(home, "")
+    other.write_text("")
+    payload = {"tool_name": "Edit", "tool_input": {"file_path": str(other)}}
+    assert check(monkeypatch, capsys, "claude-code", payload, "--policy", str(other))[0] == 2
+
+
+def test_check_opencode_search_tools(home, monkeypatch, capsys):
+    ssh = str(home / "home" / ".ssh")
+    for tool in ("grep", "glob", "list"):
+        assert check(monkeypatch, capsys, "opencode", {"tool": tool, "args": {"path": ssh, "pattern": "x"}})[0] == 2
+        assert check(monkeypatch, capsys, "opencode", {"tool": tool, "args": {"path": "src", "pattern": "x"}})[0] == 0
+        assert check(monkeypatch, capsys, "opencode", {"tool": tool, "args": {"pattern": "x"}})[0] == 0
+    assert check(monkeypatch, capsys, "opencode", {"tool": "grep", "args": {"path": 5}})[0] == 2  # cannot read: deny
 
 
 # --- the hook command as the runner runs it ----------------------------------------------------------------------

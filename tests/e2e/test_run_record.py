@@ -111,7 +111,7 @@ def host_of(stub) -> str:
 def check_complete(rec: dict, may_be_null: set[str]) -> None:
     errors = [f"{list(e.path)}: {e.message}" for e in VALIDATOR.iter_errors(rec)]
     assert not errors, errors
-    nulls = {k for k, v in rec.items() if v is None}
+    nulls = {k for k, v in rec.items() if v is None} - {"eval"}  # null unless `ws eval run` made the record
     assert nulls == may_be_null, f"null fields differ: {sorted(nulls)} (expected {sorted(may_be_null)})"
     t = rec["tokens"]
     assert all(isinstance(t[k], int) for k in t), t

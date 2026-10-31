@@ -53,6 +53,7 @@ KEYS = (
     "allow_unpriced",
     "green",
     "recovered",
+    "eval",
 )
 GREEN_LEVELS = ("targeted", "package", "full", "merge_ready")
 TOKEN_KEYS = ("input", "output", "cache_creation", "cache_read")

@@ -22,7 +22,12 @@ def box(tmp_path, monkeypatch):
 
 @pytest.fixture
 def env(box):
-    return {"HOME": str(box), "WS_HOME": str(box / ".ws"), "PATH": "/usr/bin:/bin"}
+    return {
+        "HOME": str(box),
+        "WS_HOME": str(box / ".ws"),
+        "PATH": "/usr/bin:/bin",
+        "TZ": "UTC",
+    }  # the zone is pinned: CI is UTC, a laptop is not
 
 
 @pytest.fixture

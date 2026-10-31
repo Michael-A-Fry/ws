@@ -157,7 +157,16 @@ def test_systemd_steps_install_and_uninstall(box, write_job, env, linux):
     assert not list((box / ".ws" / "jobs" / "units").glob("ws-*"))
     assert len([p for p in removed.removed if p.name.startswith("ws-")]) == 4
     # the links systemctl made outside $WS_HOME are undone before the files go
-    assert fake.calls[0] == ["systemctl", "--user", "disable", "--now", "ws-backup.timer", "ws-daily.timer"]
+    assert fake.calls[0] == [
+        "systemctl",
+        "--user",
+        "disable",
+        "--now",
+        "ws-backup.timer",
+        "ws-backup.service",
+        "ws-daily.timer",
+        "ws-daily.service",
+    ]
     assert removed.problems == []
 
 
@@ -181,7 +190,7 @@ def test_deactivate_units_picks_the_adapter_by_file(box, env):
     fake = Fake()
     paths = [units / "ws-a.service", units / "ws-a.timer", units / "ws.job.b.plist", box / "elsewhere" / "ws-c.timer"]
     roles.deactivate_units(paths, env, fake)
-    assert ["systemctl", "--user", "disable", "--now", "ws-a.timer"] in fake.calls
+    assert ["systemctl", "--user", "disable", "--now", "ws-a.timer", "ws-a.service"] in fake.calls
     assert any(c[:2] == ["launchctl", "bootout"] and c[2].endswith("/ws.job.b") for c in fake.calls)
     assert not any("ws-c.timer" in c for c in fake.calls)
 
@@ -215,7 +224,7 @@ def test_systemd_deactivate_argv(env):
     fake = Fake()
     assert systemd.deactivate(["a", "b"], env, fake) == []
     assert fake.calls == [
-        ["systemctl", "--user", "disable", "--now", "ws-a.timer", "ws-b.timer"],
+        ["systemctl", "--user", "disable", "--now", "ws-a.timer", "ws-a.service", "ws-b.timer", "ws-b.service"],
         ["systemctl", "--user", "daemon-reload"],
     ]
     assert systemd.deactivate([], env, fake) == [] and len(fake.calls) == 2
@@ -346,7 +355,7 @@ def test_cli_list_dry_run_apply_remove(box, write_job, env, linux, capsys, monke
     fake.calls.clear()
     code, out, _ = run(capsys, "schedule", "remove", "daily")
     assert code == 0 and "removed 2 unit file(s)" in out
-    assert fake.calls[0] == ["systemctl", "--user", "disable", "--now", "ws-daily.timer"]
+    assert fake.calls[0] == ["systemctl", "--user", "disable", "--now", "ws-daily.timer", "ws-daily.service"]
     assert not list((box / ".ws" / "jobs" / "units").glob("ws-*"))
     manifest = (box / ".ws" / "install-manifest.json").read_text()
     assert "ws-daily" not in manifest  # ws removed them itself, so uninstall need not look for them
@@ -370,7 +379,7 @@ def test_a_job_whose_schedule_is_gone_loses_its_timer(box, write_job, env, linux
     assert (box / ".ws" / "jobs" / "units" / "ws-daily.timer").exists()
     code, out, _ = run(capsys, "schedule", "apply")
     assert code == 0 and "stopped daily" in out
-    assert fake.calls[0] == ["systemctl", "--user", "disable", "--now", "ws-daily.timer"]
+    assert fake.calls[0] == ["systemctl", "--user", "disable", "--now", "ws-daily.timer", "ws-daily.service"]
     enable = next(c for c in fake.calls if "enable" in c)
     assert enable[-1:] == ["ws-other.timer"]  # only the job that still has a schedule is switched on
     link = next(c for c in fake.calls if "link" in c)

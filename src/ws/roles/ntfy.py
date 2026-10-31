@@ -5,12 +5,17 @@
     url = "https://ntfy.example.org/my-topic"     the topic URL (https only); its host is the one the broker allows
     token = "ntfy"                                optional: the secret's name in secrets.toml (host = the URL's host)
 
-The interruption cap is part of the design. The numbers come from `[interrupts]` in policy.toml (1 digest and 3 pushes
-a day unless you changed them) and are counted in `$WS_HOME/logs/notify-count.json`: `logs` is a control path, so a
-session cannot write the counter. The day is the date in the profile's time zone (`[machine] timezone`, or `timezone`
-in `[roles.notify]`; UTC if neither is set). A day is never counted down: if the stored date is later than today's
-(the clock or the zone moved back), the stored day keeps counting, so changing zone does not reset the count. A push
-over the cap is refused, not queued, and says so. `ws notify test` sends a push and counts as one.
+The interruption cap governs ws's own sends, and only those. The numbers come from `[interrupts]` in policy.toml (1
+digest and 3 pushes a day unless you changed them) and are counted in `$WS_HOME/logs/notify-count.json`: `logs` is a
+control path, so a session cannot write the counter. It is not a wall: a session that runs ws with a `WS_HOME` of its
+own gets a fresh counter, and one that can reach the topic (no token) can post to it directly. Counting notify leases
+in the broker would close that and is a known gap.
+
+The day is the date in `timezone` of `[roles.notify]`, else `[machine] timezone`, else the zone ws detects for the
+machine (`$TZ`, `/etc/localtime`), else UTC. A day is never counted down: if the stored date is later than today's
+(the clock or the zone moved back), the stored day keeps counting, so changing zone does not reset the count. A date
+more than 2 days ahead is taken as a clock that jumped forward and is reset, so pushes do not stay frozen until then.
+A push over the cap is refused, not queued, and says so. `ws notify test` sends a push and counts as one.
 With a token, the send goes through a broker lease (the broker adds the Authorization header; ws never reads the
 token); without one it is a plain request to the topic.
 """
@@ -29,13 +34,14 @@ from datetime import UTC, date, datetime, tzinfo
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from ws import broker, policy
+from ws import broker, modules, policy
 from ws import secrets as wsecrets
 from ws.profile import ProfileError, load, profile_path, ws_home
 from ws.roles import FAIL, OK, WARN
 
 ROLE, NAME = "notify", "ntfy"
 KINDS = ("push", "digest")
+MAX_AHEAD_DAYS = 2  # a stored date further ahead than this is a clock that jumped, not a zone change
 NOUN = {"push": "pushes", "digest": "digest"}
 COUNT_FILE = "logs/notify-count.json"
 MAX_MESSAGE = 4000
@@ -95,7 +101,9 @@ def caps(env) -> dict[str, int]:
 
 
 def zone(cfg: dict, env) -> tzinfo:
-    """The time zone whose date counts as 'today': [roles.notify] timezone, else [machine] timezone, else UTC."""
+    """The time zone whose date counts as 'today': [roles.notify] timezone, else [machine] timezone, else the zone
+    ws detects for this machine, else UTC. A name written in the profile that is not a zone is an error; a detected one
+    that ZoneInfo cannot read is skipped."""
     name = cfg.get("timezone")
     if name is None:
         try:
@@ -103,7 +111,13 @@ def zone(cfg: dict, env) -> tzinfo:
         except ProfileError:
             machine = None
         name = machine.get("timezone") if isinstance(machine, dict) else None
-    if name is None or name == "UTC":
+    if name is None:
+        detected = modules._zone_name(env)
+        try:
+            return ZoneInfo(detected) if detected and detected != "UTC" else UTC
+        except (ValueError, OSError, KeyError):
+            return UTC
+    if name == "UTC":
         return UTC
     try:
         if not isinstance(name, str):
@@ -122,12 +136,16 @@ def _fresh(day: str) -> dict:
 
 
 def read_counts(env, day: str) -> dict:
-    """The counts to use for `day`. A missing or damaged file is a fresh day. A stored date after `day` wins: the count
-    never goes back to zero because the date moved back."""
+    """The counts to use for `day`. A missing or damaged file is a fresh day. A stored date after `day` wins, so the count
+    never goes back to zero because the date moved back; but one more than MAX_AHEAD_DAYS ahead is a clock that jumped
+    forward, and starts the day afresh."""
     try:
         d = json.loads(counter_path(env).read_text(encoding="utf-8"))
         stored = date.fromisoformat(d["date"]).isoformat()
-        if all(isinstance(d.get(k), int) and not isinstance(d[k], bool) and d[k] >= 0 for k in KINDS) and stored >= day:
+        ahead = (date.fromisoformat(stored) - date.fromisoformat(day)).days
+        if all(isinstance(d.get(k), int) and not isinstance(d[k], bool) and d[k] >= 0 for k in KINDS) and (
+            0 <= ahead <= MAX_AHEAD_DAYS
+        ):
             return {"date": stored, "push": d["push"], "digest": d["digest"]}
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         pass

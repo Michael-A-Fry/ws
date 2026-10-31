@@ -7,8 +7,8 @@ The service runs `ws run <name>` (or the job's `command`, for example `ws backup
 never fires, so the "stays on?" answer is not needed here.
 
 The files live in `$WS_HOME/jobs/units/`. `activate` runs `systemctl --user link` on them, which puts one symlink per
-file in `~/.config/systemd/user` (outside $WS_HOME), then enables the timers. `deactivate` (`disable --now`) takes the
-timers and those links away again; `ws schedule remove`, `ws schedule apply` for a job whose schedule is gone, and
+file in `~/.config/systemd/user` (outside $WS_HOME), then enables the timers. `deactivate` (`disable --now`, for the
+timers and the services) takes those links away again, so none is left dangling; `ws schedule remove`, `ws schedule apply` for a job whose schedule is gone, and
 `ws uninstall` all call it. Both go through an injectable runner, so tests check the argv and never call systemctl.
 """
 
@@ -152,7 +152,13 @@ def deactivate(names: list[str], env, runner=None) -> list[str]:
     runner = runner or _schedule.run_cmd
     problems = []
     for argv in (
-        ["systemctl", "--user", "disable", "--now", *(f"{PREFIX}{n}.timer" for n in names)],
+        [
+            "systemctl",
+            "--user",
+            "disable",
+            "--now",
+            *(f"{PREFIX}{n}{ext}" for n in names for ext in (".timer", ".service")),
+        ],
         ["systemctl", "--user", "daemon-reload"],
     ):
         code, out = runner(argv)

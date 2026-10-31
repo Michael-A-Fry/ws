@@ -295,3 +295,30 @@ def test_cli_refuses_when_notify_is_not_ntfy(box, write_profile, capsys):
     write_profile({"roles": {"notify": {"adapter": "none"}}})
     assert cli.main(["notify", "test"]) == 1
     assert 'adapter = "ntfy"' in capsys.readouterr().err
+
+
+def test_a_clock_that_jumped_far_ahead_does_not_freeze_pushes(env):
+    s = Sender()
+    write_counter(env, "2026-03-06", push=3)  # 2 days ahead: could still be a zone or a skewed clock, so it counts
+    with pytest.raises(ntfy.CapReached):
+        ntfy.send(CFG, env, "m", now=NOON, sender=s)
+    write_counter(env, "2026-03-07", push=3)  # 3 days ahead: a clock that was wrong, not a zone
+    assert ntfy.send(CFG, env, "m", now=NOON, sender=s) == "sent: 1 of 3 pushes today"
+    assert json.loads(ntfy.counter_path(env).read_text())["date"] == "2026-03-04"
+
+
+@needs_tzdata
+def test_the_day_defaults_to_the_zone_ws_detects_for_the_machine(env):
+    late = datetime(2026, 3, 4, 23, 30, tzinfo=UTC)
+    assert ntfy.today(ntfy.zone(CFG, {**env, "TZ": "Pacific/Auckland"}), late) == "2026-03-05"
+    assert ntfy.today(ntfy.zone(CFG, {**env, "TZ": "UTC"}), late) == "2026-03-04"
+    assert (
+        ntfy.today(ntfy.zone(CFG, {**env, "TZ": "NZST-12NZDT,M9.5.0,M4.1.0/3"}), late) == "2026-03-04"
+    )  # no name: UTC
+
+
+@needs_tzdata
+def test_a_profile_zone_beats_the_detected_one(env, write_profile):
+    late = datetime(2026, 3, 4, 23, 30, tzinfo=UTC)
+    write_profile({"machine": {"timezone": "UTC"}})
+    assert ntfy.today(ntfy.zone(CFG, {**env, "TZ": "Pacific/Auckland"}), late) == "2026-03-04"

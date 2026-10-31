@@ -3,7 +3,7 @@
 # pull_request_target here; tests/test_workflows.py fails the build if someone does.
 #
 # Leaving the trigger out is NOT what protects the runner: a fork's pull request can bring its own workflow file with
-# `runs-on: [self-hosted, ws-lab]`. What protects it is in docs/lab.md: a single-use runner on a VM that is reset after
+# `runs-on: [self-hosted, ws-lab]`. What protects it is in docs/reference/lab.md: a single-use runner on a VM that is reset after
 # every job, the repository's approval rule for outside contributors' workflow runs, and the tag ruleset. The first
 # step below is a last check inside the job, not the defence.
 #
@@ -52,7 +52,7 @@ jobs:
         with:
           node-version: "24"
       # Pinned in tests/e2e/runners/package-lock.json, as in cli.yml. The image already has bubblewrap and socat
-      # (docs/lab.md), so no apt step: the runner user has no sudo.
+      # (docs/reference/lab.md), so no apt step: the runner user has no sudo.
       - name: install the runners
         working-directory: tests/e2e/runners
         run: |

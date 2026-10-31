@@ -272,6 +272,33 @@ def load(name: str, env: dict | None = None) -> Job:
     return loads(name, text, folder, where=str(path))
 
 
+def problems(env: dict | None = None) -> dict[str, str]:
+    """name -> what is wrong, for each job file that `ws run` would refuse. A bad job never stops the others: this
+    lists it (doctor does), and `load` still gives every good job. An unusable jobs folder is one entry, "(folder)"."""
+    folder = jobs_dir(env)
+    if not folder.is_dir():
+        return {}
+    try:
+        check_private(folder)
+    except JobError as e:
+        return {"(folder)": str(e)}
+    bad: dict[str, str] = {}
+    for path in sorted(folder.glob("*.toml")):
+        if not NAME.match(path.stem):
+            continue
+        try:
+            check_private(path)
+            text = path.read_text(encoding="utf-8")
+            d = tomllib.loads(text)
+            if _command(d, str(path)):  # a schedule-only job: `ws run` refuses it, the timer needs a good schedule
+                parse_schedule(_string(d, "schedule", str(path)) or "", f"{path}: schedule")
+            else:
+                loads(path.stem, text, folder, str(path))
+        except (JobError, OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
+            bad[path.stem] = str(e)
+    return bad
+
+
 def scheduled(env: dict | None = None) -> list[Scheduled]:
     """Every job file with a `schedule`, checked the way `ws run` checks it. A missing jobs folder is no jobs; a bad
     file raises JobError (a timer must never run what `ws run` would refuse)."""

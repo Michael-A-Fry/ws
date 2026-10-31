@@ -217,7 +217,7 @@ def test_ws_secret_as_the_agent_user_reads_and_changes_nothing(wall):
 
 def test_doctor_ws104_is_ok_for_the_agent_user(wall):
     r = ws_as_dev(wall, "doctor", "--json", "--offline")
-    checks = {c["id"]: c for c in json.loads(r.stdout)["checks"]}
+    checks = {c["id"]: c for c in json.loads(r.stdout)["data"]["checks"]}
     assert checks["WS104"]["status"] == "ok", checks["WS104"]["detail"]  # includes: the broker's code is root-only
     assert VALUE not in r.stdout + r.stderr
 

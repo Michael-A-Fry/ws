@@ -51,7 +51,7 @@ def test_registry_defaults():
 
 def test_list_before_install_shows_the_defaults(box, capsys):
     code, out, _ = run(capsys, "module", "list", "--json")
-    rows = {r["name"]: r for r in json.loads(out)}
+    rows = {r["name"]: r for r in json.loads(out)["data"]}
     assert code == 0
     assert rows["memory"]["on"] and rows["notes"]["on"] and not rows["finance"]["on"]
     code, out, _ = run(capsys, "module", "list")
@@ -74,7 +74,7 @@ def test_adding_a_stub_records_the_choice_and_is_idempotent(box, capsys):
     code, out, _ = run(capsys, "module", "add", "finance")
     assert code == 0 and "0 changes" in out
     code, out, _ = run(capsys, "module", "list", "--json")
-    assert {r["name"]: r["on"] for r in json.loads(out)}["finance"] is True
+    assert {r["name"]: r["on"] for r in json.loads(out)["data"]}["finance"] is True
 
 
 def test_removing_notes_drops_its_role_and_keeps_the_folder(box, capsys):
@@ -117,7 +117,7 @@ def test_a_module_with_no_modules_table_counts_as_the_defaults(box, capsys):
 def test_plugin_is_the_command_and_module_still_works_but_is_hidden(box, capsys):
     assert run(capsys, "install", "--yes", "--notes", str(box / "Notes"))[0] == 0
     code, out, _ = run(capsys, "plugin", "list", "--json")
-    assert code == 0 and {r["name"] for r in json.loads(out)} == set(modules.REGISTRY)
+    assert code == 0 and {r["name"] for r in json.loads(out)["data"]} == set(modules.REGISTRY)
     assert run(capsys, "plugin", "add", "calendar")[0] == 0 and profile(box)["modules"]["calendar"] is True
     assert run(capsys, "module", "remove", "calendar")[0] == 0 and profile(box)["modules"]["calendar"] is False
     help_text = cli.build_parser().format_help()

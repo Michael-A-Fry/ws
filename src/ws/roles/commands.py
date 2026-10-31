@@ -10,11 +10,11 @@ Each reads its adapter's settings from `[roles.<role>]` of the profile. Messages
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
 
-from ws import install, jobs, osinfo
+from ws import install, jobs, osinfo, output
+from ws.output import WsError
 from ws.profile import ProfileError, load, profile_path
 from ws.roles import _schedule, ntfy, restic
 
@@ -38,8 +38,7 @@ def _notify(fn) -> int:
     try:
         print(f"ws: {fn(_role('notify', 'ntfy'))}")
     except (ValueError, ntfy.NotifyError) as e:
-        print(f"ws: {e}", file=sys.stderr)
-        return 1
+        raise WsError("failed", str(e)) from e
     return 0
 
 
@@ -58,8 +57,12 @@ def cmd_notify_status(args: argparse.Namespace) -> int:
         cap = ntfy.caps(env)
         counts = ntfy.read_counts(env, ntfy.today(ntfy.zone(cfg, env)))
     except (ValueError, ntfy.NotifyError) as e:
-        print(f"ws: {e}", file=sys.stderr)
-        return 1
+        raise WsError("failed", str(e)) from e
+    if args.json:
+        output.result(
+            {"push": counts["push"], "push_cap": cap["push"], "digest": counts["digest"], "digest_cap": cap["digest"]}
+        )
+        return 0
     print(f"ws: today {counts['push']} of {cap['push']} pushes, {counts['digest']} of {cap['digest']} digest")
     return 0
 
@@ -75,14 +78,12 @@ def _backup(fn) -> int:
             raise restic.BackupError('[roles.backup] needs adapter = "restic"')
         result = fn(cfg, env)
     except (restic.BackupError, ValueError) as e:
-        print(f"ws: {e}", file=sys.stderr)
-        return 1
+        raise WsError("failed", str(e)) from e
     if isinstance(result, restic.Verified):
-        print(
-            f"ws: {'verified' if result.ok else 'NOT verified'}: {result.detail}",
-            file=None if result.ok else sys.stderr,
-        )
-        return 0 if result.ok else 1
+        if not result.ok:
+            raise WsError("failed", f"NOT verified: {result.detail}", "run `ws backup run`, then verify again")
+        print(f"ws: verified: {result.detail}")
+        return 0
     print(f"ws: {result}")
     return 0
 
@@ -126,10 +127,9 @@ def cmd_schedule_list(args: argparse.Namespace) -> int:
             for j in _schedule.scheduled(os.environ)
         ]
     except ValueError as e:
-        print(f"ws: {e}", file=sys.stderr)
-        return 1
+        raise WsError("failed", str(e)) from e
     if args.json:
-        print(json.dumps(rows, indent=2))
+        output.result(rows)
     else:
         for r in rows:
             print(f"{r['job']:<20} {r['when']:<18} {r['runs']}")
@@ -164,8 +164,7 @@ def cmd_schedule_apply(args: argparse.Namespace) -> int:
             problems += _drop(sched, env, stale)[1]
             problems += sched.activate(env)
     except (ValueError, install.InstallError, OSError) as e:
-        print(f"ws: {e}", file=sys.stderr)
-        return 1
+        raise WsError("failed", str(e)) from e
     for p in problems:
         print(f"ws: {p}", file=sys.stderr)
     tail = f"; {'would stop' if args.dry_run else 'stopped'} {', '.join(stale)} (no schedule now)" if stale else ""
@@ -181,8 +180,7 @@ def cmd_schedule_remove(args: argparse.Namespace) -> int:
             raise ValueError("a job name is letters, digits, - and _")
         gone, problems = _drop(_scheduler(osinfo.detect()), env, [args.job])
     except (ValueError, install.InstallError, OSError) as e:
-        print(f"ws: {e}", file=sys.stderr)
-        return 1
+        raise WsError("failed", str(e)) from e
     for p in problems:
         print(f"ws: {p}", file=sys.stderr)
     print(f"ws: removed {gone} unit file(s) for {args.job}")
@@ -214,7 +212,6 @@ def register(sub) -> None:
     s = sub.add_parser("schedule", help="timers (systemd or launchd) for the job files that have a schedule")
     ss = s.add_subparsers(dest="schedule_command", required=True)
     p = ss.add_parser("list", help="the scheduled jobs")
-    p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_schedule_list)
     p = ss.add_parser("apply", help="write the unit files and switch the timers on; run again and it reports 0 changes")
     p.add_argument("--dry-run", action="store_true", help="show what would change; write and run nothing")

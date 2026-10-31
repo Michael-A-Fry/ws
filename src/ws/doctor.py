@@ -1,6 +1,6 @@
 """`ws doctor`: one line per check, each with a stable ID. Exit 0 only when nothing is failing or unconfigured.
 
-IDs never change meaning once released: WS0xx are the machine and profile, WS1xx are the roles (one per role).
+IDs never change meaning once released: WS0xx are the machine, profile and jobs, WS1xx are the roles (one per role).
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from ws import __version__, canary, roles, usage
+from ws import __version__, canary, jobs, roles, usage
 from ws import globals as ws_globals
 from ws.osinfo import OSInfo
 from ws.profile import ProfileError, load, profile_path
@@ -214,6 +214,18 @@ def run_checks(osi: OSInfo, profile_file: Path, env: dict | None = None, network
     except Exception as e:  # noqa: BLE001 (a broken check must report, not crash the whole doctor)
         status, detail, fix = FAIL, f"check crashed ({type(e).__name__})", ""
     checks.append(Check("WS005", "globals", status, detail, fix))
+    try:
+        bad_jobs = jobs.problems(env)
+    except Exception as e:  # noqa: BLE001 (a broken check must report, not crash the whole doctor)
+        checks.append(Check("WS006", "jobs", FAIL, f"check crashed ({type(e).__name__})"))
+    else:
+        if bad_jobs:
+            first = next(iter(bad_jobs.values()))
+            detail = f"{len(bad_jobs)} job file(s) ws would refuse ({', '.join(bad_jobs)}): {first}"
+            fix = "fix or remove that job file; the other jobs still run"
+            checks.append(Check("WS006", "jobs", FAIL, detail, fix))
+        else:
+            checks.append(Check("WS006", "jobs", OK, "every job file loads"))
     roles = prof.get("roles") if isinstance(prof.get("roles"), dict) else {}
     for r in ROLES:
         cfg = roles.get(r.name)

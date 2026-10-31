@@ -45,8 +45,9 @@ from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from ws import __version__
+from ws import __version__, output
 from ws import secrets as wsecrets
+from ws.output import WsError
 from ws.profile import ws_home
 
 CODES = (
@@ -900,8 +901,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         signal.signal(signal.SIGINT, lambda *_: broker.request_stop())
         broker.start()
     except (BrokerError, wsecrets.SecretsError, OSError) as e:
-        print(f"ws: {e}", file=sys.stderr)
-        return 1
+        raise WsError("unavailable", str(e)) from e
     print(f"ws broker: socket {broker.socket_path}, leases on 127.0.0.1:{broker.port}", file=sys.stderr, flush=True)
     broker._stopped.wait()
     return 0
@@ -911,21 +911,25 @@ def cmd_request(args: argparse.Namespace) -> int:
     try:
         lease = request(args.name, args.purpose, args.host, socket=args.socket, ttl_s=args.ttl)
     except BrokerRefused as e:
-        print(f"ws: {e}", file=sys.stderr)
-        return 1
+        raise WsError("refused", str(e)) from e
     except BrokerUnavailable as e:
-        print(f"ws: {e}", file=sys.stderr)
-        return 1
-    print(json.dumps(lease.__dict__))
+        raise WsError("unavailable", str(e), "is the broker running? `ws doctor` checks") from e
+    if args.json:
+        output.result(lease.__dict__)
+    else:
+        print(json.dumps(lease.__dict__))
     return 0
 
 
 def cmd_status(args: argparse.Namespace) -> int:
     try:
-        print(json.dumps(status(args.socket), indent=2))
+        info = status(args.socket)
     except BrokerError as e:
-        print(f"ws: {e}", file=sys.stderr)
-        return 1
+        raise WsError("unavailable", str(e), "is the broker running? `ws doctor` checks") from e
+    if args.json:
+        output.result(info)
+    else:
+        print(json.dumps(info, indent=2))
     return 0
 
 
@@ -939,7 +943,7 @@ def register(sub) -> None:
     p.add_argument(
         "--lease-ttl", type=float, default=DEFAULT_TTL_S, metavar="SECONDS", help="longest lease (default 3600)"
     )
-    p.set_defaults(func=cmd_serve)
+    p.set_defaults(func=cmd_serve, raw=True)  # it stays up until stopped
     p = bsub.add_parser("request", help="ask for a lease and print it as JSON (for scripts)")
     p.add_argument("name")
     p.add_argument("--purpose", required=True)

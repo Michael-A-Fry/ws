@@ -96,6 +96,7 @@ from pathlib import Path
 
 from ws import adapters, approvals, policy
 from ws.approvals import ENV_MARKER, FD_ENV, approvals_dir
+from ws.output import WsError
 from ws.profile import ws_home
 
 INSTALL = {
@@ -463,24 +464,20 @@ def cmd_launch(args: argparse.Namespace) -> int:
     if argv[:1] == ["--"]:
         argv = argv[1:]
     if not argv:
-        print(
-            "ws: give the runner's command after --, e.g. `ws gate launch --runner opencode -- opencode`",
-            file=sys.stderr,
+        raise WsError(
+            "usage", "give the runner's command after --", "e.g. `ws gate launch --runner opencode -- opencode`"
         )
-        return 1
     if args.runner == "claude-code":
-        print(
-            "ws: Claude Code has its own sandbox: `ws gate generate --runner claude-code` already writes it into the "
-            "settings, so start claude with `--settings` as the hint says; there is nothing to wrap",
-            file=sys.stderr,
+        raise WsError(
+            "unsupported",
+            "Claude Code has its own sandbox, so there is nothing to wrap",
+            "`ws gate generate --runner claude-code` already writes it into the settings: start claude with `--settings`",
         )
-        return 1
     policy_file = Path(args.policy).expanduser().absolute() if args.policy else policy.policy_path()
     try:
         pol = policy.load(policy_file)
     except policy.PolicyError as e:
-        print(f"ws: {e}", file=sys.stderr)
-        return 1
+        raise WsError("bad_config", str(e), f"fix {policy_file}") from e
     home = ws_home().absolute()  # whatever --policy says, the gate keeps its approvals and sessions here
     env = launch_env(dict(os.environ))
     if args.no_sandbox:
@@ -505,11 +502,9 @@ def cmd_launch(args: argparse.Namespace) -> int:
         )
         return run_with_broker(wrapped.argv, launch_env(dict(os.environ), tmp), wrapped.pass_fds, approvals_dir(home))
     except SandboxError as e:
-        print(
-            f"ws: refusing to start {args.runner} without its wall: {e}\n(or `--no-sandbox`, which has none)",
-            file=sys.stderr,
-        )
-        return 1
+        raise WsError(
+            "refused", f"refusing to start {args.runner} without its wall: {e}", "or `--no-sandbox`, which has none"
+        ) from e
     except OSError as e:
         print(f"ws: could not start {shlex.join(argv[:1])}: {e}", file=sys.stderr)
         return 127
@@ -533,4 +528,4 @@ def add_launch(gs, names: list[str]) -> None:
     )
     p.add_argument("--no-sandbox", action="store_true", help="start the runner with no wall (says what that gives up)")
     p.add_argument("argv", nargs=argparse.REMAINDER, help="-- then the runner's command line")
-    p.set_defaults(func=cmd_launch)
+    p.set_defaults(func=cmd_launch, raw=True)  # it hands the terminal to the runner

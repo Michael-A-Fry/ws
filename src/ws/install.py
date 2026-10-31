@@ -23,6 +23,7 @@ import stat
 import sys
 import tempfile
 import tomllib
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -392,10 +393,13 @@ def _save_manifest(env, entries: dict[str, dict], roots: set[str]) -> None:
         _write_atomic(path, text.encode("utf-8"))
 
 
-def apply(steps: list[Step], env=None, dry_run: bool = False) -> Result:
+def apply(
+    steps: list[Step], env=None, dry_run: bool = False, progress: Callable[[Step, str], None] | None = None
+) -> Result:
     """Write what differs. Records every path ws creates in the manifest, even when a later step fails. A file ws
     changes but did not create is recorded with created_by_ws false so uninstall knows to leave it; a generated file
-    you edited is left and reported."""
+    you edited is left and reported. `progress(step, action)` is called after each step is done (action is created,
+    changed, unchanged or edited), so a setup screen can show it; it changes nothing about what is written."""
     env = os.environ if env is None else env
     result = Result()
     entries, roots = _read_manifest(env)
@@ -411,6 +415,8 @@ def apply(steps: list[Step], env=None, dry_run: bool = False) -> Result:
             action = classify(step, entries, virtual)
             getattr(result, action).append(step.path)
             if action in ("unchanged", "edited"):
+                if progress and not dry_run:
+                    progress(step, action)
                 continue
             missing = _missing_ancestors(step.path, virtual)
             virtual.update(missing)
@@ -425,6 +431,8 @@ def apply(steps: list[Step], env=None, dry_run: bool = False) -> Result:
             if step.kind == "dir":
                 step.path.mkdir()
                 entries[key] = {"path": key, "kind": "dir", "sha256": None, "created_by_ws": True}
+                if progress:
+                    progress(step, action)
                 continue
             data = (step.content or "").encode("utf-8")
             entry = entries.get(key)
@@ -436,6 +444,8 @@ def apply(steps: list[Step], env=None, dry_run: bool = False) -> Result:
                 result.notes.append(f"{step.path} had your edits: ws kept your values and rewrote it")
             _write_atomic(step.path, data)
             entries[key] = {"path": key, "kind": "file", "sha256": sha256(data), "created_by_ws": ours}
+            if progress:
+                progress(step, action)
         done = True
     finally:
         if not dry_run and entries:

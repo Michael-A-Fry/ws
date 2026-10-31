@@ -59,3 +59,29 @@ def test_allow_file_skips_a_false_positive(tmp_path):
     v = ".".join(["10", "1", "2", "3"])
     (tmp_path / "r" / ".pii-allow").write_text("version " + v.replace(".", r"\.") + "\n")
     assert run(tmp_path, f"version {v} of the tool\n").returncode == 0
+
+
+def test_history_reads_a_message_without_a_final_newline(tmp_path):
+    """GitHub squash merges end the message without a newline; the diff after it must still be read as diff."""
+    repo = tmp_path / "h"
+    repo.mkdir()
+    git = ["git", "-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false"]
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    v = ".".join(["10", "4", "5", "6"])
+    (repo / ".pii-allow").write_text("^    net = " + v.replace(".", r"\.") + "$\n")
+    (repo / "f.py").write_text(f"    net = {v}\n")
+    subprocess.run([*git, "add", "."], cwd=repo, check=True)
+    tree = subprocess.run([*git, "write-tree"], cwd=repo, capture_output=True, text=True, check=True).stdout.strip()
+    sha = subprocess.run(
+        [*git, "commit-tree", tree], cwd=repo, input="squash (#1)", capture_output=True, text=True, check=True
+    ).stdout.strip()
+    subprocess.run([*git, "update-ref", "HEAD", sha], cwd=repo, check=True)
+    body = subprocess.run(
+        ["git", "cat-file", "commit", sha], check=True, cwd=repo, capture_output=True, text=True
+    ).stdout
+    assert not body.endswith("\n")
+    env = {**os.environ, "WS_PII_DENYLIST": NAME}
+    r = subprocess.run(
+        [sys.executable, str(GATE), "--history"], check=False, cwd=repo, env=env, capture_output=True, text=True
+    )
+    assert r.returncode == 0, r.stdout

@@ -2,34 +2,32 @@
 
 ## What and why
 
-<!-- What does this change, and what problem does it solve? Link the issue. -->
+<!-- What changes, which problem it fixes, and a link to the issue (for example "Closes #123"). -->
 
 ## Commands run
 
-<!-- List each command with its exit code. For example:
-     uv run --locked pytest -q            exit 0
-     uvx prek run --all-files             exit 0
-     python3 scripts/check_docs_integrity.py   exit 0 -->
+<!-- Each command you ran, with its exit code. For example:
+- `uv run --locked pytest -q`: exit 0
+- `uvx prek run --all-files`: exit 0
+- `python3 scripts/check_docs_integrity.py`: exit 0
+-->
 
 ## Known gaps
 
-<!-- What did you not run or not cover, and why? Write "none" if there are none. -->
+<!-- What you didn't run or didn't cover, and why. Write "none" if there's nothing. -->
 
 ## Compatibility risk
 
-Does this change any of these? Tick each one that it does and say how.
+<!-- Tick everything this change may touch. The rules are in AGENTS.md under "Conventions". -->
 
-- [ ] JSON output (an envelope, a field, an exit code)
-- [ ] `policy.toml` (a key, a default, what a value means)
+- [ ] JSON output (envelope, a field or an exit code)
+- [ ] `policy.toml` (a key, its default or its meaning)
 - [ ] An adapter (a runner or a role)
-- [ ] A doctor ID (never reuse or change one; add a new ID)
+- [ ] A doctor ID (never reuse or change one; add a new one)
 
 ## Checklist
 
-- [ ] Docs updated for any changed command, flag, JSON field or policy key
+- [ ] Docs are updated for any changed command, flag, JSON field or policy key
 - [ ] Commits are signed, with one author each
-- [ ] No secrets, private hosts, IPs, e-mail addresses or names
-- [ ] I did not merge or close any issue or pull request from automation
-
-<!-- Structure adapted from the claw-code pull request template (https://github.com/ultraworkers/claw-code),
-     Copyright (c) 2026 UltraWorkers and Claw Code contributors, MIT License. -->
+- [ ] No secrets, private hosts, IP addresses, e-mail addresses or names
+- [ ] Automation didn't merge or close any issue or pull request

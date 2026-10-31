@@ -1,32 +1,30 @@
 # Support
 
-Structure adapted from the claw-code SUPPORT.md (<https://github.com/ultraworkers/claw-code>), Copyright (c) 2026
-UltraWorkers and Claw Code contributors, MIT License.
-
-Use the lightest option that fits.
+Pick the lightest channel that fits.
 
 | You want to | Go to |
 |---|---|
-| Learn a task | [Usage](docs/usage.md) or the [documentation map](docs/README.md) |
-| Fix an install or a doctor failure | [Troubleshoot ws](docs/how-to/troubleshoot.md) |
-| Report a bug | [Open a bug report](https://github.com/Michael-A-Fry/ws/issues/new?template=bug.yml) |
-| Suggest a feature | [Open a feature request](https://github.com/Michael-A-Fry/ws/issues/new?template=feature.yml) |
-| Ask a question | [Open an issue](https://github.com/Michael-A-Fry/ws/issues/new/choose). GitHub Discussions isn't turned on. |
-| Report a vulnerability | [SECURITY.md](SECURITY.md). Don't open a public issue. |
+| Learn a task | [Usage](docs/usage.md), or the [documentation map](docs/README.md) |
+| Fix an install or a doctor failure | [Troubleshoot](docs/how-to/troubleshoot.md) |
+| Report a bug | [Bug report form](https://github.com/Michael-A-Fry/ws/issues/new?template=bug.yml) |
+| Suggest a feature | [Feature request form](https://github.com/Michael-A-Fry/ws/issues/new?template=feature.yml) |
+| Ask a question | [Open an issue](https://github.com/Michael-A-Fry/ws/issues/new/choose); GitHub Discussions isn't turned on |
+| Report a vulnerability | [SECURITY.md](SECURITY.md), never a public issue |
 
 ## What to include
 
-Paste the output of these two commands:
+Run these two and paste the output:
 
 ```sh
 ws version --json
 ws doctor --json
 ```
 
-Also include the OS and shell, the command you ran, what you expected and what happened. Remove API keys, bearer
-tokens, private prompts, session transcripts and any path that gives away something private before you share output.
-ws never prints a secret value, but a command you wrote might.
+Then add your OS and shell, the command you ran, what you expected and what happened instead.
 
-## Response
+Scrub API keys, bearer tokens, private prompts, transcripts and paths that reveal who or where you are. ws never prints
+a secret value, but a command of your own might.
+
+## How fast
 
 ws has one maintainer. Replies take days, not hours.

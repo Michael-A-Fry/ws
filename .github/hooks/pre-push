@@ -1,22 +1,16 @@
 #!/usr/bin/env bash
-# ws local pre-push gate: the hooks and the test suite that CI runs, before the push leaves your machine.
-#
-# Adapted from the claw-code pre-push hook (https://github.com/ultraworkers/claw-code, .github/hooks/pre-push).
-# Copyright (c) 2026 UltraWorkers and Claw Code contributors, MIT License.
-#
-# Turn it on once:
-#   git config core.hooksPath .github/hooks
-#
-# Skip it for one push with WS_SKIP_PREPUSH=1. The skip is logged to .git/ws-prepush-skips.log, never silent.
+# Runs the checks CI runs, on your machine, before a push leaves it.
+# Turn it on once per clone:  git config core.hooksPath .github/hooks
+# Skip it for one push:       WS_SKIP_PREPUSH=1 git push
+# A skip is never silent: it adds a line to .git/ws-prepush-skips.log (the log of the worktree's git dir).
 set -euo pipefail
 
-repo_root="$(git rev-parse --show-toplevel 2>/dev/null)"
-cd "$repo_root"
+cd "$(git rev-parse --show-toplevel)"
 
 if [[ "${WS_SKIP_PREPUSH:-}" == "1" ]]; then
   log="$(git rev-parse --git-path ws-prepush-skips.log)"
   printf '%s skipped pre-push on %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(git rev-parse --abbrev-ref HEAD)" >>"$log"
-  echo "pre-push: WS_SKIP_PREPUSH=1 set; skipping the checks (logged to $log)" >&2
+  echo "pre-push: skipped because WS_SKIP_PREPUSH=1 (logged in $log)" >&2
   exit 0
 fi
 

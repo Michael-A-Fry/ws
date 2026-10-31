@@ -1,7 +1,6 @@
 # AGENTS.md: ws
 
-Read by any coding agent (Claude Code, OpenCode, Codex and others) working in this repo. The shape follows claw-code's
-AGENTS.md (MIT; see NOTICE). Humans: start with README.md.
+Read by any coding agent (Claude Code, OpenCode, Codex and others) working in this repo. Humans: start with README.md.
 
 ## Overview
 
@@ -18,7 +17,6 @@ tests/            pytest; tests/e2e/ needs real runners and skips without them
 scripts/          repo checks run by prek and CI (PII gate, fresh-doctor check, docs integrity, this code map)
 .github/          CI workflows, issue forms, the PR template, the opt-in pre-push hook; .vale.ini sets the prose lint
 install.sh        the installer people run first (pipx or uv)
-LICENSES/         third-party licence texts (see NOTICE)
 ```
 
 ## Where to look

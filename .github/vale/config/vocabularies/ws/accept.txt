@@ -1,7 +1,6 @@
 ws
 OpenCode
 Claude
-claw-code
 bwrap
 seccomp
 restic

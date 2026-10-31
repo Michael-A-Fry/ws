@@ -116,4 +116,3 @@ ws is pre-1.0. Commands, JSON output and `policy.toml` keys can still change bet
 ## Licence
 
 ws is [Apache-2.0](LICENSE). Contributions need the [CLA](CLA.md), signed through a bot on your first pull request.
-Code adapted from claw-code (MIT) is listed in [NOTICE](NOTICE).

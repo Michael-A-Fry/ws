@@ -23,6 +23,27 @@ MATCHER = "Bash|Read|Grep|Glob|WebFetch|WebSearch|Edit|Write|MultiEdit|NotebookE
 _TOOLS = {"web_fetch": "WebFetch", "web_search": "WebSearch"}
 _NEUTRAL = {v: k for k, v in _TOOLS.items()}
 
+# Where this runner keeps what ws installs globally, and where a repo may shadow it (read by ws.globals).
+# kinds: sub-folder -> how a name is taken: "dir" the folder name, "name" the file name, "stem" the name without extension.
+GLOBALS = {
+    "user_dir": "~/.claude",
+    "user_dir_env": "CLAUDE_CONFIG_DIR",
+    "project_dir": ".claude",
+    "kinds": {"skills": "dir", "agents": "name", "workflows": "stem", "hooks": "name"},
+}
+
+
+def session_hooks(ws_cmd: list[str]) -> dict:
+    """SessionStart records the release; UserPromptSubmit prints the one-line nudge (its stdout reaches the model).
+    `|| true`: this is advice, and an exit 2 from UserPromptSubmit would block the user's prompt."""
+    base = shlex.join(ws_cmd)
+
+    def hook(sub: str) -> list[dict]:
+        cmd = f"{base} session {sub} --runner {NAME} || true"
+        return [{"hooks": [{"type": "command", "command": cmd}]}]
+
+    return {"SessionStart": hook("start"), "UserPromptSubmit": hook("nudge")}
+
 
 def _path(path: str) -> str:
     """Claude's path syntax: `~/x` is home, `//x` is an absolute path, anything else is cwd-relative gitignore."""
@@ -40,6 +61,7 @@ def generate(policy: Policy, ws_cmd: list[str], out: Path, policy_file: Path) ->
         "permissions": {"deny": list(dict.fromkeys(deny))},
         "hooks": {"PreToolUse": [{"matcher": MATCHER, "hooks": [{"type": "command", "command": hook}]}]},
     }
+    settings["hooks"].update(session_hooks(ws_cmd))
     return {FILE: json.dumps(settings, indent=2) + "\n"}
 
 

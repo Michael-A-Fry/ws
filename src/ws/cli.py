@@ -33,6 +33,7 @@ from ws import (
     skills,
     status,
 )
+from ws import eval as ws_eval
 from ws import globals as ws_globals
 from ws.output import WsError
 from ws.profile import ProfileError, load, profile_path, write_if_changed
@@ -266,6 +267,7 @@ def build_parser() -> argparse.ArgumentParser:
     setup_ui.register(sub)
     config_cmd.register(sub)
     status.register(sub)
+    ws_eval.register(sub)
     return p
 
 

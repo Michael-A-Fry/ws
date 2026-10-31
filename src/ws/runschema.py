@@ -41,6 +41,7 @@ SCHEMA: dict = {
         "allow_unpriced",
         "green",
         "recovered",
+        "eval",
     ],
     "properties": {
         "schema": {
@@ -162,6 +163,18 @@ SCHEMA: dict = {
                     "action": {"type": "string", "minLength": 1},
                     "ok": {"type": "boolean"},
                 },
+            },
+        },
+        "eval": {
+            "description": "Set only on a trial of `ws eval run`: the task, the trial number and the arm. `pass` is null here: the record is written before grading, and the graded outcome is in eval/results.jsonl.",
+            "type": ["object", "null"],
+            "additionalProperties": False,
+            "required": ["task", "trial", "arm", "pass"],
+            "properties": {
+                "task": {"type": "string"},
+                "trial": {"type": "integer", "minimum": 1},
+                "arm": {"type": "string"},
+                "pass": {"type": ["boolean", "null"]},
             },
         },
     },

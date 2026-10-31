@@ -1,0 +1,41 @@
+# The required check `ci`: Linux, under 5 minutes. Actions pinned by commit SHA (version in the comment).
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions: read-all
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  ci:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      WS_PII_DENYLIST: ${{ secrets.WS_PII_DENYLIST }}
+      # fork pull requests get no secrets: the built-in rules still run, the denylist runs again on merge
+      WS_PII_DENYLIST_OPTIONAL: ${{ github.event.pull_request.head.repo.fork && '1' || '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      - name: gitleaks over the full history
+        run: |
+          v=8.30.1; sum=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+          curl -sSfL -o /tmp/gl.tgz "https://github.com/gitleaks/gitleaks/releases/download/v$v/gitleaks_${v}_linux_x64.tar.gz"
+          echo "$sum  /tmp/gl.tgz" | sha256sum -c -
+          tar -xzf /tmp/gl.tgz -C /tmp gitleaks
+          /tmp/gitleaks git --redact --exit-code 1 --no-banner --log-opts="HEAD" .  # HEAD only: other branches are theirs
+      - name: PII gate over the full history
+        run: python3 scripts/pii_gate.py --history
+      - name: hooks (ruff, typos, rumdl, PII gate on every tracked file)
+        uses: j178/prek-action@44924fe9ef4a6f88253c4b6b1bf11c689d3ce53d # v3.1.0
+        env:
+          SKIP: gitleaks # the step above scans the whole history, not just the tree
+        with:
+          prek-version: 0.5.7
+      - name: tests
+        run: uv run --no-project --with pytest==8.4.2 python -m pytest -q tests

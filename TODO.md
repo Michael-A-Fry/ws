@@ -113,6 +113,6 @@
 - [x] Restore drill 2 against the restic adapter: pass (AI_Workspace docs/plan/restore-drill-2026-11-01-restic.md)
 - [ ] Exit-arm run: OpenCode + a non-Claude model on `ws eval run --set starter` (waits on the key paste)
 - [ ] PyPI trusted publisher for `ws-aitoolkit` (Michael's login); until then the GitHub release is the install route
-- [ ] Triage labels (needs-repro, duplicate, out-of-scope, accepted) as GitHub labels
+- [x] Triage labels (needs-repro, duplicate, out-of-scope, accepted) as GitHub labels
 - [ ] Pass test: fresh install from the tag on CI (3 OS) and lab, twice, each followed by `scripts/e2e_first_task.sh`
 - [ ] Tag `v0.1.0` after Michael's go on the release notes (CHANGELOG date set first: the workflow refuses "unreleased")

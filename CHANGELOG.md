@@ -8,7 +8,7 @@ body of the GitHub release.
 
 ## [Unreleased]
 
-## [0.1.0] - unreleased
+## [0.1.0] - 2026-11-01
 
 The first thin tag: phases 0 to 5 of the plan, installed from the signed release.
 

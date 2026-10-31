@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import signal
 import stat
 import subprocess
@@ -915,7 +916,7 @@ def test_proc_pid_mem_of_the_parent_is_still_reachable_a_known_limit(tmp_path):
     drops the capability that would let a non-dumpable target be read, but the runner is dumpable. Pinned here so that a
     change which closes it (a runner started non-dumpable, say) is noticed and ws.policy's limits are updated."""
     seen, _ = probe(tmp_path, "walled")
-    if yama_allows():  # ptrace_scope 0 (or no Yama): the known limit
+    if yama_allows() or os.geteuid() == 0:  # ptrace_scope 0, no Yama, or root (CI's WSL2): the known limit
         assert seen["procmem"] == "read"
     else:  # ptrace_scope 1 or more (CI's Ubuntu): a child cannot read its parent, which is the good outcome
         assert seen["procmem"].startswith("errno"), seen

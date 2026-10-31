@@ -100,7 +100,7 @@ def ready(box: Box, *tags: str) -> None:
 def test_help_prints_usage_and_exits_0(box: Box):
     r = box.run("--help")
     assert r.returncode == 0
-    for flag in ("--version", "--pypi", "--no-verify", "--dry-run", "--help"):
+    for flag in ("--version", "--pypi", "--from", "--no-verify", "--dry-run", "--help"):
         assert flag in r.stdout
     assert "curl -fsSL" in r.stdout and "| bash -s --" in r.stdout
     assert box.calls() == []
@@ -134,6 +134,31 @@ def test_unknown_argument_exits_2_with_usage(box: Box):
 def test_bad_version_exits_2(box: Box, args: tuple[str, ...]):
     assert box.run(*args).returncode == 2
     assert box.calls() == []
+
+
+def test_from_installs_a_checkout_without_asking_git(box: Box, tmp_path: Path):
+    checkout = tmp_path / "checkout with space"
+    checkout.mkdir()
+    (checkout / "pyproject.toml").write_text("[project]\nname = 'x'\n", encoding="utf-8")
+    box.python()
+    box.uv()
+    box.ws()  # no git stub at all: a checkout needs neither git nor a tag lookup
+    r = box.run("--from", str(checkout))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert f"uv tool install --force {checkout.resolve()}" in box.calls()
+    assert not any(c.startswith("git") for c in box.calls())
+
+
+@pytest.mark.parametrize("extra", [(), ("--pypi",), ("--version", "v1.0.0")])
+def test_from_refuses_a_folder_that_is_not_ws_and_clashing_options(box: Box, tmp_path: Path, extra: tuple[str, ...]):
+    ready(box, "v0.1.0")
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    if extra:  # a real checkout, so the clash with the other option is what is refused
+        (folder / "pyproject.toml").write_text("", encoding="utf-8")
+    assert box.run("--from", str(folder), *extra).returncode == 2
+    assert box.run("--from").returncode == 2
+    assert not any(c.startswith("uv tool") for c in box.calls())
 
 
 def test_dry_run_installs_the_latest_release_tag_and_changes_nothing(box: Box):

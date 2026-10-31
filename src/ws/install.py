@@ -27,7 +27,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from ws import __version__, adapters, notesdetect, osinfo, policy
+from ws import __version__, adapters, notesdetect, osinfo, output, policy
+from ws.output import WsError
 from ws.profile import ProfileError, dumps, load, profile_path, ws_home
 
 MANIFEST = "install-manifest.json"
@@ -618,6 +619,24 @@ def _rows(steps: list[Step], result: Result) -> list[dict]:
     return [{"path": str(s.path), "kind": s.kind, "what": s.what, "action": action[s.path]} for s in steps]
 
 
+def artifacts(steps: list[Step], result: Result, dry_run: bool) -> dict:
+    """Each path with one status, the words claw-code's `init` uses: created, updated, skipped (already as wanted),
+    deferred (a dry run: it would be created or updated), left (you changed it, so ws left it)."""
+    status = {}
+    for name, paths in (
+        ("deferred" if dry_run else "created", result.created),
+        ("deferred" if dry_run else "updated", result.changed),
+        ("skipped", result.unchanged),
+        ("left", result.edited),
+    ):
+        status.update(dict.fromkeys(paths, name))
+    rows = [{"path": str(s.path), "status": status[s.path], "kind": s.kind, "what": s.what} for s in steps]
+    lists = {
+        k: [r["path"] for r in rows if r["status"] == k] for k in ("created", "updated", "skipped", "deferred", "left")
+    }
+    return {**lists, "artifacts": rows}
+
+
 def cmd_install(args: argparse.Namespace) -> int:
     try:
         answers = answers_from_args(args, os.environ)
@@ -635,11 +654,19 @@ def cmd_install(args: argparse.Namespace) -> int:
 
             result.notes += skills.notices(answers.runner, os.environ)
     except (InstallError, OSError) as e:
-        print(f"ws: {e}", file=sys.stderr)
-        return 1
+        raise WsError("failed", str(e)) from e
     if args.json:
         counts = {k: len(getattr(result, k)) for k in ("created", "changed", "unchanged", "edited")}
-        print(json.dumps({**counts, "dry_run": args.dry_run, "steps": _rows(steps, result)}, indent=2))
+        output.result(
+            {
+                **artifacts(steps, result, args.dry_run),
+                "counts": counts,
+                "dry_run": args.dry_run,
+                "steps": _rows(steps, result),
+                "notes": result.notes,
+                "first": "ws doctor",
+            }
+        )
         return 0
     if args.dry_run:
         for row in _rows(steps, result):
@@ -651,22 +678,30 @@ def cmd_install(args: argparse.Namespace) -> int:
         print(f"ws: {note}")
     print(f"ws: {'dry run: ' if args.dry_run else ''}{result.summary()}")
     if result.changes and not args.dry_run:
-        print("next: `ws doctor` lists what is still to set up")
+        print("first: `ws doctor` lists what is still to set up")
     return 0
 
 
 def cmd_uninstall(args: argparse.Namespace) -> int:
     if not args.dry_run and not args.yes and not sys.stdin.isatty():
-        print("ws: uninstall removes files: pass --yes (or --dry-run to see what it would do)", file=sys.stderr)
-        return 2
+        raise WsError("usage", "uninstall removes files", "pass --yes (or --dry-run to see what it would do)", 2)
     try:
         if not args.dry_run and not args.yes and input("Remove what ws installed? [y/N]: ").strip().lower() != "y":
             print("ws: nothing changed")
             return 1
         r = uninstall(os.environ, dry_run=args.dry_run)
     except (InstallError, OSError) as e:
-        print(f"ws: {e}", file=sys.stderr)
-        return 1
+        raise WsError("failed", str(e)) from e
+    if args.json:
+        output.result(
+            {
+                "dry_run": args.dry_run,
+                "removed": [str(p) for p in r.removed],
+                "left": [str(p) for p in (*r.edited, *r.not_empty, *r.not_ours, *r.refused)],
+                "problems": list(r.problems),
+            }
+        )
+        return 0
     for p in r.edited:
         print(f"you changed it, so ws left it: {p}")
     for p in r.not_empty:
@@ -693,10 +728,11 @@ def register(sub) -> None:
     i.add_argument("--cap", type=float, metavar="USD", help="your own monthly spend cap")
     i.add_argument("-y", "--yes", action="store_true", help="no prompts")
     i.add_argument("--dry-run", action="store_true", help="show what would change; write nothing")
-    i.add_argument("--json", action="store_true", help="machine-readable result")
     i.set_defaults(func=cmd_install)
 
     u = sub.add_parser("uninstall", help="remove what ws installed; your notes and memory are kept")
     u.add_argument("--dry-run", action="store_true", help="show what would be removed")
     u.add_argument("-y", "--yes", action="store_true", help="no prompt")
-    u.set_defaults(func=cmd_uninstall)
+    u.set_defaults(
+        func=cmd_uninstall, raw=lambda a: not (a.dry_run or a.yes)
+    )  # it may ask first: the prompt must be seen

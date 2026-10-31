@@ -340,7 +340,7 @@ def test_cli_list_dry_run_apply_remove(box, write_job, env, linux, capsys, monke
     monkeypatch.setattr(_schedule, "run_cmd", fake)
     write_job("daily", AI_JOB)
     code, out, _ = run(capsys, "schedule", "list", "--json")
-    assert code == 0 and json.loads(out) == [{"job": "daily", "when": "daily 03:30", "runs": "ws run daily"}]
+    assert code == 0 and json.loads(out)["data"] == [{"job": "daily", "when": "daily 03:30", "runs": "ws run daily"}]
 
     code, out, _ = run(capsys, "schedule", "apply", "--dry-run")
     assert code == 0 and "dry run" in out and fake.calls == []

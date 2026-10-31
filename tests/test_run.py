@@ -481,7 +481,7 @@ def test_ws_runs_shows_the_last_records(ws, capsys):
         cli.main(["run", "daily"])
     capsys.readouterr()
     assert cli.main(["runs", "--last", "1", "--json"]) == 0
-    shown = json.loads(capsys.readouterr().out)
+    shown = json.loads(capsys.readouterr().out)["data"]
     assert len(shown) == 1 and shown[0] == ws.records()[-1]
     assert cli.main(["runs", "--last", "2"]) == 0
     lines = capsys.readouterr().out.strip().splitlines()
@@ -491,8 +491,8 @@ def test_ws_runs_shows_the_last_records(ws, capsys):
 def test_ws_runs_with_no_log_says_so(ws, capsys):
     assert cli.main(["runs"]) == 0
     assert "no runs yet" in capsys.readouterr().out
-    with pytest.raises(SystemExit):
-        cli.main(["runs", "--last", "0"])
+    assert cli.main(["runs", "--last", "0"]) == 2
+    assert "must be 1 or more" in capsys.readouterr().err
 
 
 # --- the record itself ----------------------------------------------------------------------------------------------

@@ -37,8 +37,9 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-from ws import __version__, adapters, broker, gate, jobs, policy, runrecord
+from ws import __version__, adapters, broker, gate, jobs, output, policy, runrecord
 from ws import secrets as wsecrets
+from ws.output import WsError
 from ws.profile import ProfileError, load, profile_path, ws_home
 
 # The only variables the runner inherits from ws. Anything else it needs is set by the adapter or the job file.
@@ -448,10 +449,9 @@ def cmd_runs(args: argparse.Namespace) -> int:
     try:
         recs = runrecord.read(log)[-args.last :]
     except OSError as e:
-        print(f"ws: cannot read {log}: {e.strerror or type(e).__name__}", file=sys.stderr)
-        return EXIT_FAILED
+        raise WsError("io", f"cannot read {log}: {e.strerror or type(e).__name__}", exit_code=EXIT_FAILED) from e
     if args.json:
-        print(json.dumps(recs, indent=2))
+        output.result(recs)
         return 0
     if not recs:
         print("ws: no runs yet")
@@ -484,5 +484,4 @@ def register(sub) -> None:
     r.set_defaults(func=cmd_run)
     s = sub.add_parser("runs", help="show the last records of `ws run`")
     s.add_argument("--last", type=_positive, default=10, metavar="N", help="how many (default 10)")
-    s.add_argument("--json", action="store_true", help="the records as a JSON array")
     s.set_defaults(func=cmd_runs)

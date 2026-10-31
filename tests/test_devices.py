@@ -5,10 +5,12 @@ from __future__ import annotations
 import argparse
 import json
 import subprocess
+import sys
 
 import pytest
 
-from ws import cli, devices
+from ws import cli, devices, output
+from ws.output import WsError
 
 HOST = "node1.example.com"
 
@@ -19,7 +21,11 @@ def status(**kw) -> str:
 
 
 def add(capsys, run, which=lambda _: "/usr/bin/tailscale", name=None):
-    code = devices.cmd_add(argparse.Namespace(name=name), run=run, which=which)
+    try:
+        code = devices.cmd_add(argparse.Namespace(name=name, json=False), run=run, which=which)
+    except WsError as e:  # what cli.main does with it
+        print(output.error_text(e), file=sys.stderr)
+        code = e.exit_code
     out = capsys.readouterr()
     return code, out.out, out.err
 

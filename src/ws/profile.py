@@ -14,6 +14,10 @@ HEADER = (
 )
 _BARE_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
 
+# A key that was renamed: old dotted key -> the dotted key that replaces it. `ws config` warns on the old one. Empty
+# until a key is renamed; the loader that renames it must still accept the old spelling for a release.
+DEPRECATED: dict[str, str] = {}
+
 
 class ProfileError(Exception):
     pass
@@ -36,6 +40,26 @@ def load(path: Path) -> dict | None:
         return tomllib.loads(path.read_text(encoding="utf-8"))
     except (tomllib.TOMLDecodeError, UnicodeDecodeError) as e:
         raise ProfileError(f"{path}: {e}") from e
+
+
+def flat_keys(doc: dict, prefix: str = "") -> list[str]:
+    """Every dotted key that holds a value (a table is walked, not listed), sorted."""
+    out: list[str] = []
+    for k, v in doc.items():
+        name = f"{prefix}{k}"
+        if isinstance(v, dict) and v:
+            out += flat_keys(v, name + ".")
+        else:
+            out.append(name)
+    return sorted(out)
+
+
+def deprecated_in(doc: dict, table: dict[str, str]) -> list[tuple[str, str]]:
+    """(old key, replacement) for each key of `doc` that `table` says was renamed."""
+    keys = set(flat_keys(doc))
+    return [
+        (old, new) for old, new in sorted(table.items()) if old in keys or any(k.startswith(old + ".") for k in keys)
+    ]
 
 
 def _key(k: str) -> str:

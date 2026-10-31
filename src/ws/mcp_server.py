@@ -261,4 +261,4 @@ def register(sub) -> None:
     m = sub.add_parser("mcp", help="MCP server so any runner can use ws")
     ms = m.add_subparsers(dest="mcp_command", required=True)
     s = ms.add_parser("serve", help="serve memory_search, memory_add and note_capture over stdio")
-    s.set_defaults(func=cmd_serve)
+    s.set_defaults(func=cmd_serve, raw=True)  # stdout is the MCP protocol

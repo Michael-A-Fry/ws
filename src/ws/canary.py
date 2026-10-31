@@ -29,7 +29,8 @@ import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
-from ws import __version__, adapters, gate, policy, runrecord
+from ws import __version__, adapters, gate, output, policy, runrecord
+from ws.output import WsError
 from ws.profile import ProfileError, load, profile_path
 
 try:  # not on native Windows; ws runs there only through WSL2, but the module must still import
@@ -359,14 +360,13 @@ def cmd_canary(args: argparse.Namespace) -> int:
     env = os.environ
     runners = pick_runners(args.runner, env)
     if not runners:
-        print("ws: no runner to check: name one with --runner, or put claude or opencode on PATH", file=sys.stderr)
-        return 1
+        raise WsError("not_found", "no runner to check", "name one with --runner, or put claude or opencode on PATH")
     roles = _profile(env).get("roles")
     cfg = roles.get("model") if isinstance(roles, dict) else None
     model = cfg.get("default") if isinstance(cfg, dict) and isinstance(cfg.get("default"), str) else None
     result = run_canary(runners, env, model)
     if args.json:
-        print(json.dumps(result, indent=2))
+        output.result(result, status=output.OK if result["ok"] else output.ATTENTION)
     else:
         for r, res in result["runners"].items():
             print(f"{r}  {'ok' if res['ok'] else 'FAILED'}  {res['version'] or 'version unknown'}")
@@ -382,5 +382,4 @@ def register(sub) -> None:
         description="Small checks, no paid model. Each run adds one line to $WS_HOME/canary.jsonl. Exit 1 on a failure.",
     )
     c.add_argument("--runner", choices=list(adapters.all_adapters()), help="default: the profile's runner")
-    c.add_argument("--json", action="store_true", help="the result as JSON")
     c.set_defaults(func=cmd_canary)

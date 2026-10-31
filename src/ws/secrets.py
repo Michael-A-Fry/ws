@@ -17,7 +17,6 @@ import argparse
 import contextlib
 import getpass
 import hashlib
-import json
 import os
 import re
 import shlex
@@ -28,7 +27,8 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ws import osinfo
+from ws import osinfo, output
+from ws.output import WsError
 from ws.profile import ProfileError, load, profile_path, ws_home
 
 NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
@@ -304,24 +304,25 @@ def cmd_set(args: argparse.Namespace) -> int:
     try:
         reg = load_registry(registry_path())
         if args.name not in reg:
-            print(
-                f"ws: {args.name!r} is not in {registry_path()}; add it with its hosts first, e.g.\n"
-                f'    [{args.name}]\n    hosts = ["api.example.com"]\n    header = "x-api-key"',
-                file=sys.stderr,
+            raise WsError(
+                "not_found",
+                f"{args.name!r} is not in {registry_path()}",
+                f'add it with its hosts first, e.g.\n    [{args.name}]\n    hosts = ["api.example.com"]\n    header = "x-api-key"',
+                2,
             )
-            return 2
         value = check_value(_read_value(args.name))
         Store(store_dir()).write(args.name, value)
     except (SecretsError, EOFError) as e:
-        print(f"ws: {e}", file=sys.stderr)
-        return 1
-    except PermissionError:
-        print(
-            f"ws: the store {store_dir()} belongs to another user. Set it as that user: "
-            f"`{wall_hint('set', args.name)}`",
-            file=sys.stderr,
-        )
-        return 1
+        raise WsError("failed", str(e) or "no value given", "see `ws help secret`") from e
+    except PermissionError as e:
+        raise WsError(
+            "refused",
+            f"the store {store_dir()} belongs to another user",
+            f"set it as that user: `{wall_hint('set', args.name)}`",
+        ) from e
+    if args.json:
+        output.result({"name": args.name, "set": True})
+        return 0
     print(f"ws: set {args.name}")
     return 0
 
@@ -330,10 +331,9 @@ def cmd_list(args: argparse.Namespace) -> int:
     try:
         rows, note = _rows(None)
     except SecretsError as e:
-        print(f"ws: {e}", file=sys.stderr)
-        return 1
+        raise WsError("bad_config", str(e), f"fix {registry_path()}") from e
     if args.json:
-        print(json.dumps({"secrets": rows, "note": note}, indent=2))
+        output.result({"secrets": rows, "note": note})
         return 0
     if not rows:
         print(f"ws: nothing registered in {registry_path()}")
@@ -352,11 +352,12 @@ def cmd_rm(args: argparse.Namespace) -> int:
     try:
         gone = Store(store_dir()).delete(args.name)
     except SecretsError as e:
-        print(f"ws: {e}", file=sys.stderr)
-        return 1
-    except PermissionError:
-        print(f"ws: the store belongs to another user: `{wall_hint('rm', args.name)}`", file=sys.stderr)
-        return 1
+        raise WsError("failed", str(e)) from e
+    except PermissionError as e:
+        raise WsError("refused", "the store belongs to another user", f"`{wall_hint('rm', args.name)}`") from e
+    if args.json:
+        output.result({"name": args.name, "removed": gone})
+        return 0
     print(f"ws: removed {args.name}" if gone else f"ws: {args.name} was not set (0 changes)")
     return 0
 
@@ -573,52 +574,46 @@ def cmd_wall(args: argparse.Namespace) -> int:
         import pwd
 
         if os.getuid() == 0:
-            print("ws: run this as your normal user, not root: it says which user to put in the group", file=sys.stderr)
-            return 1
+            raise WsError("refused", "run this as your normal user, not root", "it says which user to put in the group")
         py, why = trusted_python()
         if py is None:
-            print(
-                f"ws: the broker must run on a Python that only root can change, and there is none: {why}.\n"
-                "    Install the system python3 (3.11 or newer), e.g. `sudo apt install python3`, then run this again.",
-                file=sys.stderr,
+            raise WsError(
+                "unavailable",
+                f"the broker must run on a Python that only root can change, and there is none: {why}",
+                "install the system python3 (3.11 or newer), e.g. `sudo apt install python3`, then run this again",
             )
-            return 1
         where = Path(WALL_LIB)
         while not where.exists():
             where = where.parent
         if (bad := untrusted_reason(where)) is not None:
-            print(
-                f"ws: the copy of ws would go under {where}, which others can change: {bad}.\n"
-                f"    Fix that first (for example `sudo chown root:root {where} && sudo chmod go-w {where}`), then run this again.",
-                file=sys.stderr,
+            raise WsError(
+                "refused",
+                f"the copy of ws would go under {where}, which others can change: {bad}",
+                f"fix that first (for example `sudo chown root:root {where} && sudo chmod go-w {where}`), then run this again",
             )
-            return 1
         pkg_dir = Path(__file__).resolve().parent
         registry, old_store = registry_path(), store_dir()
         for p in (registry, old_store, pkg_dir):
             if CONTROL_RE.search(str(p)):
-                print(
-                    "ws: a path has a line break or control character in it; refusing to print commands for it",
-                    file=sys.stderr,
+                raise WsError(
+                    "bad_input",
+                    "a path has a line break or control character in it; refusing to print commands for it",
+                    "move or rename that folder",
                 )
-                return 1
         try:
             names = sorted(load_registry(registry))
             text = wall_commands(pwd.getpwuid(os.getuid()).pw_name, registry, old_store, py, pkg_dir, names)
         except SecretsError as e:
-            print(f"ws: {e}", file=sys.stderr)
-            return 1
+            raise WsError("bad_config", str(e), f"fix {registry}") from e
         print(text, end="")
         return 0
     why = {
         "macos": "macOS needs a _ws-broker user and a launchd job; that is not built yet",
         "wsl": "WSL2 is not supported for the wall yet (it needs systemd enabled in the distro; a Windows-side user is not built)",
     }.get(osi.kind, "the wall needs Linux with systemd; not built for this machine yet")
-    print(f"ws: {why}", file=sys.stderr)
-    print(
-        "ws: until then the store is protected only by file modes, and `ws doctor` WS104 stays at warn", file=sys.stderr
+    raise WsError(
+        "unsupported", why, "until then the store is protected only by file modes, and `ws doctor` WS104 stays at warn"
     )
-    return 1
 
 
 def register(sub) -> None:
@@ -628,7 +623,6 @@ def register(sub) -> None:
     p.add_argument("name")
     p.set_defaults(func=cmd_set)
     p = ssub.add_parser("list", help="names, hosts, set/unset and owner; never values")
-    p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_list)
     p = ssub.add_parser("rm", help="remove a stored value")
     p.add_argument("name")

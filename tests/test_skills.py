@@ -182,7 +182,7 @@ def test_opencode_does_not_get_a_copy_of_what_it_already_reads_from_claude(box, 
     assert not (box / ".config" / "opencode" / "skills" / "dataviz").exists()
     assert (box / ".config" / "opencode" / "skills" / "align" / "SKILL.md").is_file()
     _code, out, _ = run(capsys, "skills", "list", "--json")
-    rows = {(r["name"], r["runner"]): r for r in json.loads(out)}
+    rows = {(r["name"], r["runner"]): r for r in json.loads(out)["data"]}
     assert rows[("dataviz", "opencode")]["action"] == "shared"
     assert rows[("align", "opencode")]["action"] == "install"
     assert install(capsys, box, "--runner", "opencode")[1].count("0 changes") == 1
@@ -290,16 +290,15 @@ def test_skills_add_brings_a_removed_skill_back_and_uninstall_still_removes_it(b
 
 
 def test_skills_add_never_overwrites_one_you_have_and_needs_a_runner(box, capsys):
-    code, out, _ = run(capsys, "skills", "add", "align")
-    assert code == 1 and "no runner found" in out
+    code, _, err = run(capsys, "skills", "add", "align")
+    assert code == 1 and "no runner found" in err
     mine = box / ".claude" / "skills" / "align"
     mine.mkdir(parents=True)
     (mine / "SKILL.md").write_text("mine\n")
     assert install(capsys, box, "--runner", "claude-code")[0] == 0
     code, out, _ = run(capsys, "skills", "add", "align")
     assert code == 0 and "you already have" in out and (mine / "SKILL.md").read_text() == "mine\n"
-    with pytest.raises(SystemExit):
-        cli.main(["skills", "add", "nope"])
+    assert cli.main(["skills", "add", "nope"]) == 2
 
 
 def test_skills_add_installs_one_that_was_never_installed(box, capsys):

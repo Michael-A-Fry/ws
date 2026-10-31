@@ -13,12 +13,9 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from ws import frontmatter
+from ws import frontmatter, output
+from ws.output import WsError  # re-exported: memory and the MCP server import it from here
 from ws.profile import ProfileError, load, profile_path
-
-
-class WsError(Exception):
-    """A problem the person can fix; the message is safe to print."""
 
 
 def role_path(role: str, env: dict | None = None) -> Path:
@@ -27,12 +24,12 @@ def role_path(role: str, env: dict | None = None) -> Path:
     try:
         prof = load(pf) or {}
     except ProfileError as e:
-        raise WsError(str(e)) from e
+        raise WsError("bad_config", str(e), f"fix or remove {pf}") from e
     roles = prof.get("roles")
     cfg = roles.get(role) if isinstance(roles, dict) else None
     p = cfg.get("path") if isinstance(cfg, dict) else None
     if not isinstance(p, str) or not p:
-        raise WsError(f"no [roles.{role}] path in {pf} (run `ws doctor`)")
+        raise WsError("not_found", f"no [roles.{role}] path in {pf}", "run `ws doctor`")
     return Path(p).expanduser().resolve()  # absolute, so index keys do not depend on the current directory
 
 
@@ -68,7 +65,7 @@ def write_new(directory: Path, stem: str, content: str) -> Path:
         except FileExistsError:
             continue
         return path
-    raise WsError(f"too many files called {stem} in {directory}")
+    raise WsError("failed", f"too many files called {stem} in {directory}")
 
 
 def capture(
@@ -82,9 +79,9 @@ def capture(
     """Write one note into root/_inbox and return its path."""
     text = text.strip()
     if not text:
-        raise WsError("nothing to note: the text is empty")
+        raise WsError("bad_input", "nothing to note: the text is empty", "give some text, or `-` to read it from stdin")
     if not root.is_dir():
-        raise WsError(f"{root} is not a folder (run `ws init --create-notes`)")
+        raise WsError("not_found", f"{root} is not a folder", "run `ws init --create-notes`")
     now = now if now is not None and now.tzinfo is not None else (now or datetime.now()).astimezone()
     meta: dict = {"id": str(uuid.uuid4()), "created": now.replace(microsecond=0), "type": "note"}
     if title and title.strip():
@@ -94,7 +91,7 @@ def capture(
     try:
         return write_new(root / "_inbox", stem, frontmatter.dumps(meta, text))
     except OSError as e:
-        raise WsError(f"could not write to {root / '_inbox'}: {e.strerror or type(e).__name__}") from e
+        raise WsError("io", f"could not write to {root / '_inbox'}: {e.strerror or type(e).__name__}") from e
 
 
 def read_text(parts: list[str]) -> str:
@@ -105,13 +102,12 @@ def read_text(parts: list[str]) -> str:
 
 
 def cmd_note(args: argparse.Namespace) -> int:
-    try:
-        if not args.text:
-            raise WsError("nothing to note: give some text, or `-` to read it from stdin")
-        path = capture(read_text(args.text), role_path("notes"), args.title, args.tag)
-    except WsError as e:
-        print(f"ws: {e}", file=sys.stderr)
-        return 1
+    if not args.text:
+        raise WsError("bad_input", "nothing to note: give some text", "or `-` to read it from stdin")
+    path = capture(read_text(args.text), role_path("notes"), args.title, args.tag)
+    if args.json:
+        output.result({"path": str(path)})
+        return 0
     print(path)
     return 0
 

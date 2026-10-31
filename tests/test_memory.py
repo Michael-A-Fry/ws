@@ -91,8 +91,9 @@ def test_add_never_overwrites_and_each_kind_has_its_folder(mem):
 
 
 def test_add_refuses_bad_input_and_a_folder_that_is_not_a_repo(home):
-    with pytest.raises(notes.WsError, match="memory init"):
+    with pytest.raises(notes.WsError, match="not a git repo") as e:
         memory.add("x")
+    assert e.value.kind == "not_found" and "memory init" in e.value.hint
     memory.init(home / "mem")
     with pytest.raises(notes.WsError, match="kind"):
         memory.add("x", kind="secret")
@@ -111,7 +112,7 @@ def test_cli_add_and_search_with_a_source_column(home, mem, capsys):
     assert sorted(ln.split()[0] for ln in lines) == ["memory", "notes"]
     assert "[tea]" in out
     assert cli.main(["memory", "search", "tea", "--json", "--limit", "1"]) == 0
-    data = json.loads(capsys.readouterr().out)
+    data = json.loads(capsys.readouterr().out)["data"]
     assert len(data) == 1 and set(data[0]) == {"source", "path", "title", "snippet", "score"}
 
 

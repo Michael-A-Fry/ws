@@ -25,7 +25,7 @@ def home(tmp_path, monkeypatch):
 
 def doctor_json(capsys, *extra) -> tuple[int, dict]:
     code = cli.main(["doctor", "--json", *extra])
-    return code, json.loads(capsys.readouterr().out)
+    return code, json.loads(capsys.readouterr().out)["data"]
 
 
 def by_id(rep: dict) -> dict:

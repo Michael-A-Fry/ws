@@ -10,8 +10,10 @@ import argparse
 import json
 import shutil
 import subprocess
-import sys
 from collections.abc import Callable
+
+from ws import output
+from ws.output import WsError
 
 INSTALL_URL = "https://tailscale.com/download"
 INSTALL_WS = "uv tool install ws-aitoolkit"
@@ -58,8 +60,10 @@ def cmd_add(args: argparse.Namespace, run: Runner = _run, which: Callable[[str],
     try:
         server = tailscale_name(run, which)
     except DeviceError as e:
-        print(f"ws: {e}", file=sys.stderr)
-        return 1
+        raise WsError("unavailable", str(e), "start Tailscale and sign in, then run `ws device add` again") from e
+    if args.json:
+        output.result({"server": server, "join": join_line(server)})
+        return 0
     label = f" {args.name}" if args.name else " the new machine"
     print(f"On{label}, run:")
     print(f"  {join_line(server)}")

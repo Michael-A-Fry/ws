@@ -280,10 +280,23 @@ def test_plan_is_pure_and_dry_run_writes_nothing(box, capsys):
 
 def test_json_result_counts(box, capsys):
     code, out, _ = run(capsys, "install", "--yes", "--json", "--notes", str(box / "Notes"))
-    first = json.loads(out)
-    assert code == 0 and first["created"] > 0 and first["changed"] == 0 and first["dry_run"] is False
-    second = json.loads(run(capsys, "install", "--yes", "--json", "--notes", str(box / "Notes"))[1])
-    assert second["created"] == second["changed"] == 0 and second["unchanged"] == len(second["steps"])
+    first = json.loads(out)["data"]
+    counts = first["counts"]
+    assert code == 0 and counts["created"] > 0 and counts["changed"] == 0 and first["dry_run"] is False
+    assert first["first"] == "ws doctor" and len(first["created"]) == counts["created"]
+    second = json.loads(run(capsys, "install", "--yes", "--json", "--notes", str(box / "Notes"))[1])["data"]
+    assert second["counts"]["created"] == second["counts"]["changed"] == 0
+    assert second["counts"]["unchanged"] == len(second["steps"]) == len(second["skipped"])
+    assert {a["status"] for a in second["artifacts"]} == {"skipped"}
+
+
+def test_install_json_artefact_statuses(box, capsys):
+    notes = str(box / "Notes")
+    dry = json.loads(run(capsys, "install", "--dry-run", "--json", "--notes", notes)[1])["data"]
+    assert dry["deferred"] and not dry["created"] and not dry["updated"]
+    done = json.loads(run(capsys, "install", "--yes", "--json", "--notes", notes)[1])["data"]
+    assert done["created"] and not done["deferred"]
+    assert {a["status"] for a in done["artifacts"]} <= {"created", "updated", "skipped", "left"}
 
 
 def test_profile_gets_the_answers_and_keeps_what_was_there(box, capsys):
@@ -433,7 +446,7 @@ def test_a_manifest_that_is_not_ours_stops_everything(box, capsys):
 def test_doctor_is_happy_with_what_install_wrote(box, capsys):
     assert run(capsys, "install", "--yes", "--notes", str(box / "Notes"))[0] == 0
     _, out, _ = run(capsys, "doctor", "--json", "--offline")
-    checks = {c["id"]: c["status"] for c in json.loads(out)["checks"]}
+    checks = {c["id"]: c["status"] for c in json.loads(out)["data"]["checks"]}
     assert checks["WS003"] == checks["WS004"] == checks["WS106"] == "ok"
     assert checks["WS105"] in ("ok", "warn")  # memory exists; `ws memory init` makes it a git repo
 
@@ -490,9 +503,13 @@ def test_a_profile_whose_notes_folder_is_your_home_is_one_clear_error(box, capsy
     prof.parent.mkdir()
     prof.write_text('[machine]\nnotes = "~"\n' if where == "machine" else '[roles.notes]\npath = "~"\n')
     pre = snapshot(box)
-    for argv in (["install", "--yes"], ["install", "--dry-run"], ["install", "--yes", "--json"]):
+    for argv in (["install", "--yes"], ["install", "--dry-run"]):
         code, _, err = run(capsys, *argv)
         assert code == 1 and "too broad" in err and "Traceback" not in err and len(err.strip().splitlines()) == 1
+    code, out, err = run(capsys, "install", "--yes", "--json")  # the same error, as the envelope on stdout
+    env = json.loads(out)
+    assert code == 1 and not err and env["status"] == "error" and env["error_kind"] == "failed"
+    assert "too broad" in env["message"]
     assert snapshot(box) == pre
     code, _, err = run(capsys, "uninstall", "--yes")
     assert code == 0 and "Traceback" not in err

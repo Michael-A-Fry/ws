@@ -23,6 +23,7 @@ from typing import IO, Self
 
 from ws import __version__, install
 from ws.install import InstallError
+from ws.output import WsError
 from ws.setup_ui import flow
 from ws.setup_ui.brand import (
     AMBER,
@@ -743,12 +744,10 @@ def run(facts: flow.Facts, choices: flow.Choices, *, yes: bool = False, out: IO[
     out = out or sys.stdout
     color = wants_color(out, facts.env)
     if not facts.osi.supported:
-        print("ws: native Windows is not supported; install WSL2 and run ws inside it", file=sys.stderr)
-        return 1
+        raise WsError("unsupported", "native Windows is not supported", "install WSL2 and run ws inside it")
     if yes or not (sys.stdin.isatty() and out.isatty()):
         if not yes:
-            print("ws: setup needs a terminal; pass --yes to take the defaults, or use --web", file=sys.stderr)
-            return 1
+            raise WsError("usage", "setup needs a terminal", "pass --yes to take the defaults, or use --web")
         wiz = Wizard(
             facts, choices, out, lambda: "enter", sleep=lambda _: None, cols=shutil.get_terminal_size().columns,
             color=color, live=False, interactive=False,

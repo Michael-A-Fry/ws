@@ -177,9 +177,8 @@ def test_generate_reports_a_broken_policy_and_an_unknown_runner(home, tmp_path, 
     write_policy(home, "dial = 3\n")
     assert generate("claude-code", tmp_path / "out") == 1
     assert "dial" in capsys.readouterr().err
-    with pytest.raises(SystemExit) as e:
-        generate("emacs", tmp_path / "out")
-    assert e.value.code == 2
+    assert generate("emacs", tmp_path / "out") == 2
+    assert "emacs" in capsys.readouterr().err
 
 
 def test_a_runner_is_one_module(home):

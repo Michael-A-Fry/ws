@@ -191,4 +191,4 @@ def register(sub) -> None:
         p = ss.add_parser(name, help=text)
         p.add_argument("--session-id", metavar="ID", help="the session id (default: session_id in the hook JSON)")
         p.add_argument("--runner", default="unknown", help="which runner is calling (recorded)")
-        p.set_defaults(func=fn)
+        p.set_defaults(func=fn, raw=True)  # hook entries: the runner reads their stdout

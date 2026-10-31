@@ -19,15 +19,14 @@ only `ws skills add NAME` brings it back.
 from __future__ import annotations
 
 import argparse
-import json
 import os
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from ws import adapters, install
+from ws import adapters, install, output
 from ws import globals as ws_globals
 from ws.install import Step
+from ws.output import WsError
 from ws.skills import align, checkpoint, dataviz, taste_gate
 
 SKILLS: dict[str, str] = {m.NAME: m.TEXT for m in (align, checkpoint, taste_gate, dataviz)}
@@ -138,10 +137,9 @@ def cmd_list(args: argparse.Namespace) -> int:
         runner = install.answers_from_profile(env).runner
         rows = items(runners_for(runner, env), env)
     except install.InstallError as e:
-        print(f"ws: {e}", file=sys.stderr)
-        return 1
+        raise WsError("bad_config", str(e), "run `ws doctor`") from e
     if args.json:
-        print(json.dumps([{**vars(r), "path": str(r.path)} for r in rows], indent=2))
+        output.result([{**vars(r), "path": str(r.path)} for r in rows])
         return 0
     if not rows:
         print("ws: no runner found to put skills in; set one with `ws install --runner claude-code|opencode`")
@@ -165,8 +163,11 @@ def cmd_add(args: argparse.Namespace) -> int:
         runner = install.answers_from_profile(env).runner
         runners = runners_for(runner, env)
         if not runners:
-            print("ws: no runner found to put skills in; set one with `ws install --runner claude-code|opencode`")
-            return 1
+            raise WsError(
+                "not_found",
+                "no runner found to put skills in",
+                "set one with `ws install --runner claude-code|opencode`",
+            )
         for r in runners:
             (it,) = (i for i in items([r], env) if i.name == args.name)
             if it.action in ("yours", "shared"):
@@ -175,8 +176,7 @@ def cmd_add(args: argparse.Namespace) -> int:
             result = install.apply(steps(r, env, add=args.name))
             print(f"ws: {args.name} for {r}: {result.summary()}")
     except (install.InstallError, OSError) as e:
-        print(f"ws: {e}", file=sys.stderr)
-        return 1
+        raise WsError("failed", str(e)) from e
     return 0
 
 
@@ -184,7 +184,6 @@ def register(sub) -> None:
     s = sub.add_parser("skills", help="the skills ws ships, and where they are installed")
     ss = s.add_subparsers(dest="skills_command")
     ls = ss.add_parser("list", help="each skill, per runner")
-    ls.add_argument("--json", action="store_true")
     ls.set_defaults(func=cmd_list)
     add = ss.add_parser("add", help="put a skill back (one you removed), or add one that is not installed yet")
     add.add_argument("name", choices=list(SKILLS))

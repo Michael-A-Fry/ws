@@ -439,6 +439,9 @@ def current_roots(env) -> list[Path]:
         p = cfg.get("path") if isinstance(cfg, dict) else None
         if isinstance(p, str) and p:
             roots.append(expand(p, env))
+    from ws import skills  # the folders of the skills ws ships, in each runner's skills folder
+
+    roots += skills.roots(env)
     return [r for r in dict.fromkeys(roots) if not _root_problem(r, env)]
 
 

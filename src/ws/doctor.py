@@ -12,11 +12,11 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from ws import __version__, broker, usage
+from ws import __version__, broker, canary, usage
 from ws import globals as ws_globals
 from ws import secrets as wsecrets
 from ws.osinfo import OSInfo
-from ws.profile import ProfileError, load
+from ws.profile import ProfileError, load, profile_path
 
 OK, WARN, FAIL, UNCONFIGURED = "ok", "warn", "fail", "unconfigured"
 BAD = (FAIL, UNCONFIGURED)
@@ -65,7 +65,38 @@ def _runner(cfg, osi, env, network):
     version = run.exe_version(exe, dict(env))
     if version is None:
         return FAIL, f"{a} found at {exe} but `{RUNNERS[a]} --version` did not run"
-    return OK, f"{a} {version} at {exe}" if version else f"{a} at {exe} (it printed no version)"
+    detail = f"{a} {version} at {exe}" if version else f"{a} at {exe} (it printed no version)"
+    return _version_change(a, version, detail, env, network)
+
+
+def _default_model(env) -> str | None:
+    try:
+        roles = (load(profile_path(env)) or {}).get("roles")
+    except ProfileError:
+        return None
+    cfg = roles.get("model") if isinstance(roles, dict) else None
+    m = cfg.get("default") if isinstance(cfg, dict) else None
+    return m if isinstance(m, str) and m else None
+
+
+def _version_change(adapter: str, version: str, detail: str, env, network: bool) -> tuple[str, str]:
+    """Remember the runner version and default model in versions.json. If either changed since the last look, say so and
+    run the canary (or point to `ws canary` when offline). ws never forces an update; this just notices one."""
+    model = _default_model(env)
+    changes = canary.observe(env, adapter, version or None, model, record=False)
+    if not changes:
+        canary.observe(env, adapter, version or None, model)
+        return OK, detail
+    seen = f"changed since last seen ({'; '.join(changes)})"
+    if not network:
+        canary.observe(env, adapter, version or None, model)
+        return OK, f"{detail}; {seen}: run `ws canary`"
+    result = canary.run_canary([adapter], env, model)
+    if result["ok"]:
+        canary.observe(env, adapter, version or None, model)
+        return OK, f"{detail}; {seen}: canary passed"
+    # not remembered: the next doctor runs the canary again until it passes
+    return FAIL, f"{detail}; {seen}: canary failed: {'; '.join(canary.failures(result))}"
 
 
 def _model(cfg, osi, env, network):

@@ -1,1 +1,2 @@
 [default.extend-words]
+edn = "edn"  # the Logseq config file extension

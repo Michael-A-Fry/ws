@@ -3,6 +3,7 @@ and the source run, never copy a prompt that looks like it holds a secret, and n
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import stat
@@ -90,6 +91,7 @@ def test_a_proposal_is_unapproved_linked_to_its_run_and_cannot_run_yet(box, caps
     assert doc["prompt"] == "summarise the inbox" and doc["reason"] == "failed"
     assert doc["timeout_s"] == 120 and doc["max_turns"] == 7 and doc["id"] == path.stem
     assert [g["type"] for g in doc["grader"]] == ["rubric"]
+    assert doc["review_required"] is True and "job file failed.toml as it is now" in doc["prompt_source"]
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     ws_eval.parse_task(path.read_text(encoding="utf-8"), str(path), path.stem)  # it reads back as a valid task
     # harvest alone approves nothing: your tasks folder is untouched, and the proposal is not a task you can run
@@ -142,6 +144,9 @@ def test_a_prompt_that_names_a_registered_secret_is_not_copied(box, capsys):
         "the key is " + "A" * 44,
         "-----BEGIN RSA PRIVATE KEY-----",
         "post to http://127.0.0.1:9/l/" + "T" * 43,
+        "clone https://deploy:" + "s3cret-value" + "@git.example.invalid/repo.git",
+        "the password: x",
+        "key " + "Abc123/" * 5 + "Zz9+",
     ],
 )
 def test_a_prompt_that_looks_like_a_secret_is_not_copied(box, capsys, prompt):
@@ -181,12 +186,12 @@ def test_approve_moves_a_proposal_into_your_tasks(box, capsys):
     run("failed", 1, "error")
     ws(capsys, "eval", "harvest")
     (path,) = proposals()
-    code, out, _ = ws(capsys, "eval", "approve", path.stem)
+    code, out, _ = ws(capsys, "eval", "approve", path.stem, "--yes")
     assert code == 0 and "still a rubric" in out
     assert not path.exists()
     approved = ws_eval.tasks_dir() / path.name
     doc = tomllib.loads(approved.read_text(encoding="utf-8"))
-    assert doc["approved"] is True and doc["source_job"] == "failed"
+    assert doc["approved"] is True and doc["review_required"] is False and doc["source_job"] == "failed"
     assert stat.S_IMODE(approved.stat().st_mode) == 0o600
     # it is a task now, but with only a rubric grader it still cannot run
     code, _, err = ws(capsys, "eval", "run", "--task", path.stem, "--dry-run")
@@ -200,7 +205,7 @@ def test_approve_will_not_overwrite_a_task(box, capsys):
     (path,) = proposals()
     ws_eval.tasks_dir().mkdir(parents=True)
     (ws_eval.tasks_dir() / path.name).write_text("mine", encoding="utf-8")
-    code, _, err = ws(capsys, "eval", "approve", path.stem)
+    code, _, err = ws(capsys, "eval", "approve", path.stem, "--yes")
     assert code == 1 and "already exists" in err and path.exists()
 
 
@@ -210,7 +215,7 @@ def test_approve_checks_the_edited_file_whole(box, capsys):
     ws(capsys, "eval", "harvest")
     (path,) = proposals()
     path.write_text(path.read_text(encoding="utf-8") + "\nsurprise = 1\n", encoding="utf-8")
-    code, _, err = ws(capsys, "eval", "approve", path.stem)
+    code, _, err = ws(capsys, "eval", "approve", path.stem, "--yes")
     assert code == 1 and "unknown key" in err and path.exists() and not ws_eval.tasks_dir().exists()
 
 
@@ -222,7 +227,7 @@ def test_a_person_can_edit_in_a_real_grader_and_then_run_it(box, capsys):
     task = ws_eval.parse_task(path.read_text(encoding="utf-8"), "x", path.stem)
     fixed = ws_eval.Task(**{**task.__dict__, "graders": ({"type": "file_contains", "path": "out.txt", "text": "ok"},)})
     path.write_text(ws_eval.dumps_task(fixed), encoding="utf-8")
-    assert ws(capsys, "eval", "approve", path.stem)[0] == 0
+    assert ws(capsys, "eval", "approve", path.stem, "--yes")[0] == 0
     code, out, _ = ws(capsys, "eval", "run", "--task", path.stem, "--dry-run")
     assert code == 0 and "3 runs" in out
 
@@ -245,3 +250,97 @@ def test_approve_and_reject_name_what_is_missing_and_refuse_odd_ids(box, capsys,
     assert code == 1 and "no proposal" in err
     code, _, _ = ws(capsys, "eval", cmd, "../tasks/x")
     assert code == 2
+
+
+def one_proposal(box, capsys, prompt="summarise the inbox"):
+    job(box, "failed", prompt)
+    run("failed", 1, "error")
+    ws(capsys, "eval", "harvest")
+    (path,) = proposals()
+    return path
+
+
+def test_a_long_path_or_word_is_not_taken_for_a_base64_key():
+    assert ws_eval.secret_reason("look in /usr/local/share/applications/something/else/entirely", os.environ) is None
+
+
+def test_harvest_says_what_its_secret_check_does_and_does_not_cover(box, capsys):
+    job(box, "failed")
+    run("failed", 1, "error")
+    _, out, _ = ws(capsys, "eval", "harvest", "--json")
+    assert "not against secret values" in json.loads(out)["data"]["secret_check"]
+    job(box, "failed2")
+    run("failed2", 2, "error")
+    _, _, err = ws(capsys, "eval", "harvest")
+    assert "not against secret values" in err
+
+
+def test_approve_shows_the_prompt_and_asks_in_a_terminal(box, capsys, monkeypatch):
+    path = one_proposal(box, capsys, "summarise the inbox for Monday")
+    monkeypatch.setattr("sys.stdin", type("Tty", (), {"isatty": lambda self: True})())
+    asked = []
+    monkeypatch.setattr("builtins.input", lambda q: asked.append(q) or "n")
+    code, out, _ = ws(capsys, "eval", "approve", path.stem)
+    assert code == 1 and "summarise the inbox for Monday" in out and "not approved" in out and path.exists()
+    assert asked and not ws_eval.tasks_dir().exists()
+    monkeypatch.setattr("builtins.input", lambda q: "y")
+    code, out, _ = ws(capsys, "eval", "approve", path.stem)
+    assert code == 0 and not path.exists() and (ws_eval.tasks_dir() / path.name).is_file()
+
+
+def test_approve_without_a_terminal_or_yes_is_refused(box, capsys):
+    path = one_proposal(box, capsys)
+    code, _, err = ws(capsys, "eval", "approve", path.stem)  # stdin is not a terminal under pytest
+    assert code == 1 and "confirmation" in err and "--yes" in err and path.exists()
+    code, _, err = ws(capsys, "eval", "approve", path.stem, "--json")
+    assert code == 1 and path.exists()
+
+
+def test_a_task_that_still_needs_review_does_not_run(box, capsys):
+    ws_eval.tasks_dir().mkdir(parents=True)
+    task = next(t for t in ws_eval.starter_tasks() if t.id == "starter-csv-total")
+    held = dataclasses.replace(task, review_required=True)
+    (ws_eval.tasks_dir() / "starter-csv-total.toml").write_text(ws_eval.dumps_task(held), encoding="utf-8")
+    code, _, err = ws(capsys, "eval", "run", "--task", "starter-csv-total", "--dry-run")
+    assert code == 1 and "not approved yet" in err
+
+
+def test_a_malformed_run_id_stops_the_harvest_and_writes_nothing(box, capsys):
+    job(box, "good")
+    job(box, "bad")
+    run("good", 1, "error")
+    rec = run("bad", 2, "error", ago=timedelta(minutes=5))
+    log = runrecord.runs_path(os.environ)
+    log.write_text(log.read_text().replace(rec["run_id"], "../../etc/passwd"), encoding="utf-8")
+    code, _, err = ws(capsys, "eval", "harvest")
+    assert code == 1 and "malformed run_id" in err and proposals() == []
+
+
+def test_proposals_are_all_or_nothing(box, capsys, monkeypatch):
+    for n, name in enumerate(("a", "b", "c"), 1):
+        job(box, name)
+        run(name, n, "error")
+    real = ws_eval.write_private
+    calls = []
+
+    def flaky(path, text, exclusive=False):
+        calls.append(path)
+        if len(calls) == 3:
+            raise OSError(28, "No space left on device")
+        real(path, text, exclusive)
+
+    monkeypatch.setattr(ws_eval, "write_private", flaky)
+    code, _, err = ws(capsys, "eval", "harvest")
+    assert code == 1 and "none were kept" in err and len(calls) == 3
+    assert proposals() == []
+    monkeypatch.setattr(ws_eval, "write_private", real)
+    ws(capsys, "eval", "harvest")
+    assert len(proposals()) == 3
+
+
+def test_a_proposal_that_is_not_a_valid_task_is_a_ws_error(box, capsys, monkeypatch):
+    job(box, "failed")
+    run("failed", 1, "error")
+    monkeypatch.setattr(ws_eval, "PLACEHOLDER_RUBRIC", "")  # an empty rubric is not a valid grader
+    code, _, err = ws(capsys, "eval", "harvest")
+    assert code == 1 and "not a valid task" in err and proposals() == []

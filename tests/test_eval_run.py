@@ -13,7 +13,7 @@ from pathlib import Path
 import jsonschema
 import pytest
 
-from ws import cli, runrecord
+from ws import cli, runrecord, sandbox
 from ws import eval as ws_eval
 from ws.profile import dumps
 
@@ -32,7 +32,9 @@ with open(os.path.join(home, "saw.jsonl"), "a") as f:
     f.write(json.dumps({{"cwd": os.getcwd(), "files": sorted(os.listdir("."))}}) + "\\n")
 if "food category" in prompt:
     json.dump({{"food_total": 40 if mode != "wrong" else 41}}, open("answer.json", "w"))
-if "fizzbuzz" in prompt and mode not in ("wrong", "tamper"):
+if "fizzbuzz" in prompt and mode == "forge":
+    open("fizzbuzz.py", "w").write("import os\\nos._exit(0)\\n")
+elif "fizzbuzz" in prompt and mode not in ("wrong", "tamper"):
     open("fizzbuzz.py", "w").write(
         "def fizzbuzz(n):\\n"
         "    return ['FizzBuzz' if i % 15 == 0 else 'Fizz' if i % 3 == 0 else 'Buzz' if i % 5 == 0 else str(i)"
@@ -86,6 +88,7 @@ def rig(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "userhome"))
     monkeypatch.setenv("PATH", f"{exe.parent}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.delenv("WS_BROKER_SOCKET", raising=False)
+    monkeypatch.setattr(ws_eval, "_wall", lambda argv, folder: sandbox.Wrapped(list(argv)))  # no bubblewrap needed here
     (tmp_path / "tmp").mkdir()
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "tmp"))  # trial folders land here, not in /tmp
     r.mode("good")
@@ -103,7 +106,8 @@ def test_three_trials_leave_three_records_and_three_results(rig, capsys):
     assert code == 0 and "3 of 3 trials passed" in out
     recs = rig.records()
     assert [r["eval"] for r in recs] == [
-        {"task": "starter-csv-total", "trial": n, "arm": "base", "pass": True} for n in (1, 2, 3)
+        {"task": "starter-csv-total", "trial": n, "arm": "base", "pass": None}
+        for n in (1, 2, 3)  # graded after the write
     ]
     for r in recs:
         assert not list(VALIDATOR.iter_errors(r)), r
@@ -113,6 +117,7 @@ def test_three_trials_leave_three_records_and_three_results(rig, capsys):
         (n, True, recs[n - 1]["run_id"]) for n in (1, 2, 3)
     ]
     assert results[0]["grade"][0]["ok"] is True and results[0]["family"] == "life-admin"
+    assert results[0]["job"] == "daily" and len(results[0]["task_hash"]) == 16
 
 
 def test_the_trial_runs_in_a_fresh_folder_holding_the_setup_files(rig, capsys):
@@ -140,7 +145,7 @@ def test_a_wrong_answer_fails_and_its_folder_is_kept(rig, capsys):
     assert code == 0 and "0 of 1 trials passed" in out
     (r,) = rig.results()
     assert r["pass"] is False and r["status"] == "ok" and "differs" in r["grade"][0]["detail"]
-    assert rig.records()[0]["eval"]["pass"] is False
+    assert rig.records()[0]["eval"]["pass"] is None  # the record comes first; the verdict is in the result line
     assert (Path(r["folder"]) / "answer.json").is_file()
 
 
@@ -157,7 +162,6 @@ def test_a_runner_that_fails_is_a_failed_trial_not_graded(rig, capsys):
     assert code == 0
     (r,) = rig.results()
     assert r["status"] == "error" and r["pass"] is False and r["grade"] == []
-    assert rig.records()[0]["eval"]["pass"] is False
 
 
 def test_hidden_files_arrive_after_the_run_and_cannot_be_forged(rig, capsys):
@@ -202,3 +206,37 @@ def test_a_task_of_yours_is_run_from_the_tasks_folder(rig, capsys):
     )
     code, out, _ = ws(capsys, "eval", "run", "--set", "mine", "--job", "daily", "--trials", "1")
     assert code == 0 and "1 of 1 trials passed" in out
+
+
+def test_agent_code_that_exits_zero_early_fails_the_grade(rig, capsys):
+    rig.mode("forge")
+    ws(capsys, "eval", "run", "--task", "starter-fizzbuzz", "--job", "daily", "--trials", "1")
+    (r,) = rig.results()
+    assert r["status"] == "ok" and r["pass"] is False and r["grade"][0]["ok"] is False
+
+
+def test_a_signal_during_grading_leaves_the_record_and_a_result(rig, capsys, monkeypatch):
+    def killed(task, folder, nonce=None):
+        raise SystemExit(143)
+
+    monkeypatch.setattr(ws_eval, "grade", killed)
+    with pytest.raises(SystemExit):
+        cli.main(["eval", "run", "--task", "starter-csv-total", "--job", "daily", "--trials", "1"])
+    (rec,) = rig.records()  # the record was written before grading began
+    assert rec["status"] == "ok" and rec["eval"]["task"] == "starter-csv-total"
+    (r,) = rig.results()
+    assert r["run_id"] == rec["run_id"] and r["pass"] is False and r["note"] == "grading was cut short"
+
+
+def test_command_graders_are_refused_up_front_when_there_is_no_wall(rig, capsys, monkeypatch):
+    def none(argv, folder):
+        raise ws_eval.WallUnavailable("bubblewrap is not installed")
+
+    monkeypatch.setattr(ws_eval, "_wall", none)
+    code, _, err = ws(capsys, "eval", "run", "--task", "starter-fizzbuzz", "--job", "daily")
+    assert code == 1 and "inside ws's wall" in err and "hint:" in err
+    assert rig.records() == [] and rig.results() == []  # nothing started, nothing spent
+    code, out, _ = ws(capsys, "eval", "run", "--task", "starter-fizzbuzz", "--dry-run")
+    assert code == 0 and "would be refused" in out  # a plan says so without failing
+    code, out, _ = ws(capsys, "eval", "run", "--task", "starter-csv-total", "--job", "daily", "--trials", "1")
+    assert code == 0 and "1 of 1 trials passed" in out  # file graders need no wall

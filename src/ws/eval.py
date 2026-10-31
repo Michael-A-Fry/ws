@@ -17,19 +17,32 @@ files.
 Each trial is one `ws run`, by the same code path (`run.run_job`): a fresh temporary folder holds the task's setup
 files (not under `$WS_HOME`, where the sandbox denies the agent's shell writes), the job named by `--job` is the arm
 under test (its runner, model, options and secrets; the task replaces only its prompt, folder, timeout and turn limit),
-and the run record carries `eval: {task, trial, arm, pass}`. A trial passes only if the run finished `ok` and every
-grader passed; the task's hidden files are written after the run and before grading, so the agent cannot tamper with a
-checker. A failed trial's folder is kept for you to look at. Results also go to `$WS_HOME/eval/results.jsonl`.
+and the run record carries `eval: {task, trial, arm, pass}`. The record is written before grading, with `pass` null; the
+graded outcome is the line in `$WS_HOME/eval/results.jsonl` (with the task's hash and the job), so a signal during
+grading still leaves the record, and a result line saying grading was cut short. A trial passes only if the run finished
+`ok` and every grader passed. The task's hidden files are written after the run and before grading, over whatever is at
+those paths. A failed trial's folder is kept for you to look at.
 
-Graders: `command` (exit 0, run in the task folder; `{python}` stands for this Python), `file_contains`,
-`json_path_equals`, `regex`. A `rubric` grader (judged by a model) can be declared but is refused at run time unless
-the profile names a judge model (`[eval] judge_model`); the judge call itself is not built yet, so for now a rubric
-task is always skipped.
+Graders: `command`, `file_contains`, `json_path_equals`, `regex` (files are read only if regular, at most 1 MiB). A
+`command` grader runs code the agent wrote, so it runs inside ws's own wall (`ws.sandbox.wrap`: disk read-only, the trial
+folder included, no Unix sockets) or not at all: with no sandbox on the machine `ws eval run` refuses a task set that has
+one (typed error with the install hint), and there is no unsandboxed fallback. The wall does not close the network. A
+command passes only if it exits 0 AND prints the trial's nonce: ws sends a random line on the command's stdin, and the
+checker must read it first, run the agent's code only in a child process (which has no stdin), and print the nonce last.
+Agent code that exits early (`os._exit(0)`) or prints "ok" never held it. Start the checker with `python -I` so the
+agent cannot shadow a module it imports. The starter checkers show the pattern (`CHECK_PRELUDE`). A `rubric` grader
+(judged by a model) can be declared but is refused at run time unless the profile names a judge model (`[eval]
+judge_model`); the judge call itself is not built yet, so for now a rubric task is always skipped.
 
-Harvest never approves anything. It writes each proposal to `$WS_HOME/eval/proposed/` with `approved = false`, the source
-run id and a placeholder rubric grader (so it cannot run until you give it a real one). Prompts that look like they hold
-a secret are not proposed: ws has no prompt scrubber, so it refuses a prompt that names a registered secret or looks
-like a key, token or password. Read each proposal before you approve it; FIU or client data in a prompt is for you to
+`compare` pairs at task level, not trial level (`evalstats.paired_tasks`): a task passes for an arm when most of its
+trials do, a tie fails, and results count only from the job and the task text (hash) each arm used last.
+
+Harvest never approves anything. It writes each proposal to `$WS_HOME/eval/proposed/` with `approved = false`,
+`review_required = true`, the source run id, where the prompt came from and a placeholder rubric grader (so it cannot run
+until you give it a real one), all or none. `approve` shows the prompt and asks you (`--yes` for scripts). Prompts that
+look like they hold a secret are not proposed: ws has no prompt scrubber, so it refuses a prompt that names a registered
+secret, or looks like a key, token, password or URL with a password. It checks names and shapes, not secret values (ws
+cannot read the store safely). Read each proposal before you approve it; FIU or client data in a prompt is for you to
 catch.
 """
 
@@ -38,11 +51,13 @@ from __future__ import annotations
 import argparse
 import contextlib
 import dataclasses
+import hashlib
 import json
 import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -50,8 +65,9 @@ import tomllib
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from secrets import token_hex
 
-from ws import evalstats, jobs, output, rating, run, runrecord
+from ws import evalstats, jobs, output, policy, rating, run, runrecord, sandbox
 from ws import secrets as wsecrets
 from ws.output import WsError
 from ws.profile import ProfileError, load, profile_path, ws_home
@@ -69,9 +85,11 @@ DEFAULT_TRIALS, MAX_TRIALS = 3, 5
 DEFAULT_TIMEOUT_S, MAX_TIMEOUT_S = 300, 3600
 MAX_PROMPT, MAX_FILE, MAX_FILES = 20_000, 64 * 1024, 20
 READ_CAP = 1024 * 1024  # bytes of a graded file that are read
+MAX_PATTERN = 500  # characters of a regex grader's pattern
+MAX_CHECK_OUTPUT = 64 * 1024  # bytes of a command grader's output that are looked at
 TASK_KEYS = {
     "id", "family", "kind", "prompt", "trials", "timeout_s", "max_turns", "setup", "hidden", "grader", "repo", "files",
-    "approved", "source_run", "source_job", "reason",
+    "approved", "source_run", "source_job", "reason", "review_required", "prompt_source",
 }  # fmt: skip
 GRADER_KEYS = {
     "command": ({"command"}, {"timeout_s"}),
@@ -139,6 +157,8 @@ class Task:
     source_run: str | None = None
     source_job: str | None = None
     reason: str | None = None
+    review_required: bool | None = None
+    prompt_source: str | None = None
 
     def needs_judge(self) -> bool:
         return any(g["type"] == "rubric" for g in self.graders)
@@ -147,7 +167,8 @@ class Task:
         d: dict = {"id": self.id, "family": self.family, "kind": self.kind, "prompt": self.prompt}
         d["trials"], d["timeout_s"] = self.trials, self.timeout_s
         for key, v in (("max_turns", self.max_turns), ("repo", self.repo), ("approved", self.approved),
-                       ("source_run", self.source_run), ("source_job", self.source_job), ("reason", self.reason)):  # fmt: skip
+                       ("source_run", self.source_run), ("source_job", self.source_job), ("reason", self.reason),
+                       ("review_required", self.review_required), ("prompt_source", self.prompt_source)):  # fmt: skip
             if v is not None:
                 d[key] = v
         if self.files:
@@ -216,6 +237,14 @@ def _files(d: dict, key: str, where: str) -> dict:
     return dict(files)
 
 
+def _no_collisions(paths: list[str], where: str) -> None:
+    """No path may be a folder that another path sits in (`x` and `x/y`): writing one would fail or replace the other."""
+    folders = {"/".join(p.split("/")[:i]) for p in paths for i in range(1, len(p.split("/")))}
+    for p in paths:
+        if p in folders:
+            raise TaskError(f"{where}: {p!r} is both a file and a folder that another file sits in")
+
+
 def _grader(g, where: str) -> dict:
     if not isinstance(g, dict) or g.get("type") not in GRADER_KEYS:
         raise TaskError(f"{where}: type must be one of: {', '.join(GRADER_KEYS)}")
@@ -245,6 +274,8 @@ def _grader(g, where: str) -> dict:
         _number(out, "timeout_s", where, GRADER_TIMEOUT_S, MAX_GRADER_TIMEOUT_S)
     if g["type"] == "regex":
         try:
+            if len(out["pattern"]) > MAX_PATTERN:
+                raise TaskError(f"{where}: pattern is longer than {MAX_PATTERN} characters")
             re.compile(out["pattern"])
         except re.error as e:
             raise TaskError(f"{where}: pattern is not a regular expression ({e})") from e
@@ -280,6 +311,8 @@ def parse_task(text: str, where: str, expect_id: str | None = None) -> Task:
         raise TaskError(f"{where}: files must be a list of paths in the repo")
     for f in files:
         safe_rel(f, where, "files")
+    setup, hidden = _files(d, "setup", where), _files(d, "hidden", where)
+    _no_collisions([*setup, *hidden], where)
     return Task(
         id=tid,
         family=family,
@@ -288,8 +321,8 @@ def parse_task(text: str, where: str, expect_id: str | None = None) -> Task:
         trials=_number(d, "trials", where, DEFAULT_TRIALS, MAX_TRIALS, integer=True),
         timeout_s=_number(d, "timeout_s", where, DEFAULT_TIMEOUT_S, MAX_TIMEOUT_S),
         max_turns=_number(d, "max_turns", where, None, 1000, integer=True),
-        setup_files=_files(d, "setup", where),
-        hidden_files=_files(d, "hidden", where),
+        setup_files=setup,
+        hidden_files=hidden,
         graders=tuple(_grader(g, f"{where}: grader #{i}") for i, g in enumerate(raw_graders, 1)),
         repo=_str(d, "repo", where, required=False, limit=500),
         files=tuple(files),
@@ -297,6 +330,8 @@ def parse_task(text: str, where: str, expect_id: str | None = None) -> Task:
         source_run=_str(d, "source_run", where, required=False),
         source_job=_str(d, "source_job", where, required=False),
         reason=_str(d, "reason", where, required=False),
+        review_required=_bool(d, "review_required", where) if "review_required" in d else None,
+        prompt_source=_str(d, "prompt_source", where, required=False),
     )
 
 
@@ -337,6 +372,23 @@ def dumps_task(task: Task) -> str:
 # ---- the starter set ----------------------------------------------------------------------------------------------
 # Synthetic: invented files and numbers, nothing real, nothing personal. A person's own set comes from `ws eval harvest`.
 
+# What every hidden checker starts with. ws writes a per-trial random line to the checker's stdin; the checker reads it
+# first, runs the agent's code only in a child process (which has no stdin, so no nonce), checks what the child printed,
+# and prints the nonce back last. A grade needs that line on stdout as well as exit 0, so agent code that exits early
+# (`os._exit(0)`) or prints "ok" cannot pass: it never held the nonce.
+CHECK_PRELUDE = """\
+import json, subprocess, sys
+
+nonce = sys.stdin.readline().strip()
+
+
+def agent(setup, expr):
+    code = f"{setup}\\nimport json\\nprint(json.dumps({expr}))"
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+    assert r.returncode == 0, r.stderr[-300:]
+    return json.loads(r.stdout.splitlines()[-1])
+"""
+
 STARTER: dict[str, str] = {
     "starter-fizzbuzz": """\
 id = "starter-fizzbuzz"
@@ -348,14 +400,15 @@ timeout_s = 300
 
 [hidden.files]
 "check.py" = '''
-from fizzbuzz import fizzbuzz
-r = fizzbuzz(15)
+@PRELUDE@
+r = agent("from fizzbuzz import fizzbuzz", "fizzbuzz(15)")
 assert len(r) == 15 and r[0] == "1" and r[2] == "Fizz" and r[4] == "Buzz" and r[14] == "FizzBuzz", r
+print(nonce)
 '''
 
 [[grader]]
 type = "command"
-command = "{python} check.py"
+command = "{python} -I check.py"
 """,
     "starter-fix-mean": """\
 id = "starter-fix-mean"
@@ -373,13 +426,14 @@ def mean(values):
 
 [hidden.files]
 "check.py" = '''
-from stats import mean
-assert mean([1, 2, 3]) == 2 and mean([5]) == 5 and mean([]) == 0.0
+@PRELUDE@
+assert agent("from stats import mean", "[mean([1, 2, 3]), mean([5]), mean([])]") == [2, 5, 0.0]
+print(nonce)
 '''
 
 [[grader]]
 type = "command"
-command = "{python} check.py"
+command = "{python} -I check.py"
 """,
     "starter-rename-variable": """\
 id = "starter-rename-variable"
@@ -401,6 +455,13 @@ def greet():
     return "hi " + usr_nm
 '''
 
+[hidden.files]
+"check.py" = '''
+@PRELUDE@
+assert agent("import app", "app.greet()") == "hi ada"
+print(nonce)
+'''
+
 [[grader]]
 type = "file_contains"
 path = "config.py"
@@ -420,7 +481,7 @@ negate = true
 
 [[grader]]
 type = "command"
-command = '''{python} -c "import app; assert app.greet() == 'hi ada'"'''
+command = "{python} -I check.py"
 """,
     "starter-csv-total": """\
 id = "starter-csv-total"
@@ -481,13 +542,15 @@ We will leverage our synergies to operationalise a paradigm shift in how the tea
 
 [hidden.files]
 "check.py" = '''
+@PRELUDE@
 words = open("plain.md").read().split()
 assert 0 < len(words) <= 30, len(words)
+print(nonce)
 '''
 
 [[grader]]
 type = "command"
-command = "{python} check.py"
+command = "{python} -I check.py"
 
 [[grader]]
 type = "file_contains"
@@ -523,14 +586,16 @@ timeout_s = 300
 
 [hidden.files]
 "check.py" = '''
+@PRELUDE@
 lines = open("msg.txt").read().splitlines()
 assert lines and 0 < len(lines[0]) <= 50, lines[:1]
 assert len(lines) >= 3 and lines[1] == "" and lines[2].strip(), lines
+print(nonce)
 '''
 
 [[grader]]
 type = "command"
-command = "{python} check.py"
+command = "{python} -I check.py"
 """,
     "starter-cheapest-plan": """\
 id = "starter-cheapest-plan"
@@ -564,7 +629,10 @@ equals = 12
 
 
 def starter_tasks() -> list[Task]:
-    return [parse_task(text, f"starter task {tid}", tid) for tid, text in STARTER.items()]
+    return [
+        parse_task(text.replace("@PRELUDE@\n", CHECK_PRELUDE), f"starter task {tid}", tid)
+        for tid, text in STARTER.items()
+    ]
 
 
 # ---- loading tasks ------------------------------------------------------------------------------------------------
@@ -644,30 +712,84 @@ def _inside(folder: Path, rel: str) -> Path:
 
 
 def _read_text(folder: Path, rel: str) -> str:
+    """At most READ_CAP bytes of a regular file inside the folder. A device, pipe or socket is refused before it is read
+    (opening a pipe would wait for ever), and the file is opened without following a link at the last step."""
     p = _inside(folder, rel)
-    with p.open("rb") as fh:
-        return fh.read(READ_CAP).decode("utf-8", errors="replace")
+    if not stat.S_ISREG(os.stat(p).st_mode):  # before opening: opening a pipe for reading waits for a writer
+        raise OSError(f"{rel} is not a regular file")
+    fd = os.open(p, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"{rel} is not a regular file")
+        with os.fdopen(fd, "rb", closefd=False) as fh:
+            return fh.read(READ_CAP).decode("utf-8", errors="replace")
+    finally:
+        os.close(fd)
 
 
-def _grade_command(g: dict, folder: Path) -> Verdict:
+class WallUnavailable(Exception):
+    """The sandbox that a command grader needs cannot be built here."""
+
+
+def _wall(argv: list[str], folder: Path) -> sandbox.Wrapped:
+    """`argv` inside ws's own wall (ws.sandbox.wrap): the whole disk read-only, nothing writable, the trial folder
+    included, and Unix sockets shut. The wall does not close the network on its own (no `unshare-net` in its public API),
+    so a grader that must not reach the network is a limit to know about. Raises WallUnavailable; there is no unsandboxed
+    fallback."""
+    try:
+        pol = policy.load()
+        return sandbox.wrap(argv, pol, ws_home().absolute(), [str(policy.policy_path().absolute())])
+    except (sandbox.SandboxError, policy.PolicyError) as e:
+        raise WallUnavailable(str(e)) from e
+
+
+def require_wall() -> None:
+    """Raise WsError (typed, with the install hint) unless command graders can run in the wall on this machine."""
+    try:
+        wrapped = _wall(["true"], Path(tempfile.gettempdir()))
+    except WallUnavailable as e:
+        raise WsError(
+            "unsupported",
+            f"a command grader runs agent-written code, so it must run inside ws's wall, and that is not available: {e}",
+            "install the sandbox (bubblewrap on Linux; sandbox-exec ships with macOS), or use only file_contains, "
+            "regex and json_path_equals graders",
+        ) from e
+    for fd in wrapped.pass_fds:
+        os.close(fd)
+
+
+def _grade_command(g: dict, folder: Path, nonce: str) -> Verdict:
+    """Run the command in the wall, the folder read-only, with the nonce on its stdin. It passes only if it exits 0 AND
+    prints the nonce as a line of its own output: agent code that ends the checker early, or prints its own "ok", never
+    held the nonce. (A checker must read the nonce first and run the agent's code in a child with no stdin.)"""
     cmd = g["command"]
     argv = shlex.split(cmd) if isinstance(cmd, str) else list(cmd)
     argv = [sys.executable if a == "{python}" else a for a in argv]
     env = {k: os.environ[k] for k in ("PATH", "LANG", "TZ") if k in os.environ}
-    env["HOME"] = str(folder)  # not the real one; and no provider key is passed on
+    env.update(HOME=str(folder), PYTHONDONTWRITEBYTECODE="1")  # the real home is not passed; the folder is read-only
+    try:
+        wrapped = _wall(argv, folder)
+    except WallUnavailable as e:
+        return Verdict("command", False, f"not run: no wall to run it in ({e})")
     try:
         p = subprocess.run(
-            argv, cwd=folder, env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL, check=False,
-            timeout=g.get("timeout_s", GRADER_TIMEOUT_S),
+            wrapped.argv, cwd=folder, env=env, capture_output=True, text=True, input=nonce + "\n", check=False,
+            pass_fds=wrapped.pass_fds, timeout=g.get("timeout_s", GRADER_TIMEOUT_S),
         )  # fmt: skip
     except subprocess.TimeoutExpired:
         return Verdict("command", False, "timed out")
     except OSError as e:
         return Verdict("command", False, f"could not start: {_why(e)}")
-    if p.returncode == 0:
-        return Verdict("command", True, "exit 0")
-    last = (p.stderr.strip().splitlines() or [""])[-1][:200]
-    return Verdict("command", False, f"exit {p.returncode}: {last}".rstrip(": "))
+    finally:
+        for fd in wrapped.pass_fds:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+    if p.returncode != 0:
+        last = (p.stderr.strip().splitlines() or [""])[-1][:200]
+        return Verdict("command", False, f"exit {p.returncode}: {last}".rstrip(": "))
+    if nonce not in p.stdout[:MAX_CHECK_OUTPUT].splitlines():
+        return Verdict("command", False, "exit 0 but the checker did not print the nonce, so the exit is not trusted")
+    return Verdict("command", True, "exit 0 and the nonce")
 
 
 def _grade_contains(g: dict, folder: Path) -> Verdict:
@@ -725,32 +847,36 @@ def _grade_json(g: dict, folder: Path) -> Verdict:
     )
 
 
-def grade(task: Task, folder: Path) -> list[Verdict]:
-    """Run every grader of the task over the folder. A grader that cannot read its file fails; it never raises."""
-    graders = {"command": _grade_command, "file_contains": _grade_contains, "regex": _grade_regex,
-               "json_path_equals": _grade_json}  # fmt: skip
+def grade(task: Task, folder: Path, nonce: str | None = None) -> list[Verdict]:
+    """Run every grader of the task over the folder. A grader that cannot read its file fails; it never raises. `nonce`
+    is the trial's random line for command graders (a fresh one if none is given)."""
+    nonce = nonce or token_hex(16)
+    graders = {"file_contains": _grade_contains, "regex": _grade_regex, "json_path_equals": _grade_json}
     out = []
     for g in task.graders:
         if g["type"] == "rubric":
             out.append(Verdict("rubric", False, "a rubric grader is not run (the judge call is not built)"))
             continue
         try:
-            out.append(graders[g["type"]](g, folder))
+            out.append(_grade_command(g, folder, nonce) if g["type"] == "command" else graders[g["type"]](g, folder))
         except OSError as e:
             out.append(Verdict(g["type"], False, f"cannot read {g.get('path', '')}: {_why(e)}"))
     return out
 
 
 def write_files(folder: Path, files: dict) -> None:
-    """Write task files into the folder. Raises OSError for a destination that leaves it (a planted symlink)."""
+    """Write task files into the folder. Raises OSError for a destination that leaves it (a planted symlink). Whatever is
+    already at a destination is removed first, so a hard link the agent made to another file is not written through."""
     base = folder.resolve()
     for rel, content in files.items():
         dest = base / rel
-        if dest.is_symlink():
-            dest.unlink()
         dest.parent.mkdir(parents=True, exist_ok=True)
         if not dest.parent.resolve().is_relative_to(base):
             raise OSError(f"{rel} leaves the task folder")
+        if dest.is_dir() and not dest.is_symlink():
+            raise OSError(f"{rel} is a folder")
+        if os.path.lexists(dest):  # a link, or a hard link to a file elsewhere: replace it, never write through it
+            dest.unlink()
         dest.write_text(content, encoding="utf-8")
 
 
@@ -830,7 +956,7 @@ def make_plan(
     judge = judge_model(prof)
     for t in tasks:
         reason = None
-        if t.approved is False:
+        if t.approved is False or t.review_required is True:
             reason = "not approved yet (`ws eval approve`)"
         elif t.needs_judge():
             reason = (
@@ -863,26 +989,36 @@ def _find_record(log: Path, before: int, task: str, trial: int, arm: str) -> dic
     return None
 
 
+def task_hash(task: Task) -> str:
+    """A short fingerprint of the task as it is (its canonical text), so results of an edited task are never mixed with
+    results of the old one."""
+    return hashlib.sha256(dumps_task(task).encode()).hexdigest()[:16]
+
+
 def run_trial(task: Task, trial: int, arm: str, job: jobs.Job, batch: str, keep: bool = False) -> dict:
-    """One trial through `ws run`: set up a fresh folder, run the job with the task's prompt, grade, write the result."""
+    """One trial through `ws run`: set up a fresh folder, run the job with the task's prompt, then grade and write the
+    result. The run record is on disk before grading starts (run.run_job calls the hook after writing it), so a SIGTERM
+    during grading still leaves the record, and this function still leaves a result line saying grading was cut short.
+    The record's `eval.pass` stays null: the graded outcome is the result line."""
     env = os.environ
     log = runrecord.runs_path(env)
     # Not under $WS_HOME: the gate's sandbox denies shell writes there, and a trial has to be able to write its answer.
     folder = Path(tempfile.mkdtemp(prefix=f"ws-eval-{task.id}-{trial}-")).resolve()
     write_files(folder, task.setup_files)
-    verdicts: list[Verdict] = []
+    state: dict = {"rec": None, "verdicts": [], "passed": False, "note": None}
 
-    def hook(rec: dict) -> None:  # called with the finished record, before it is written
-        verdicts.clear()
-        passed = False
-        if rec.get("status") == "ok":
-            try:
-                write_files(folder, task.hidden_files)
-                verdicts.extend(grade(task, folder))
-                passed = bool(verdicts) and all(v.ok for v in verdicts)
-            except OSError as e:
-                verdicts.append(Verdict("setup", False, _why(e)))
-        rec["eval"]["pass"] = passed
+    def hook(rec: dict) -> None:  # called with the record after it has been written
+        state["rec"] = rec
+        if rec.get("status") != "ok":
+            return
+        state["note"] = "grading was cut short"
+        try:
+            write_files(folder, task.hidden_files)
+            state["verdicts"] = grade(task, folder, token_hex(16))
+            state["passed"] = bool(state["verdicts"]) and all(v.ok for v in state["verdicts"])
+        except OSError as e:
+            state["verdicts"] = [Verdict("setup", False, _why(e))]
+        state["note"] = None
 
     trial_job = dataclasses.replace(
         job, prompt=task.prompt, cwd=str(folder), timeout_s=task.timeout_s,
@@ -890,19 +1026,31 @@ def run_trial(task: Task, trial: int, arm: str, job: jobs.Job, batch: str, keep:
     )  # fmt: skip
     before = len(runrecord.read(log)) if log.exists() else 0
     marker = {"eval": {"task": task.id, "trial": trial, "arm": arm, "pass": None}}
-    code = run.run_job(argparse.Namespace(job=job.name, dry_run=False), trial_job, marker, hook)
-    rec = _find_record(log, before, task.id, trial, arm)
-    passed = bool(rec and (rec.get("eval") or {}).get("pass") is True)
-    result = {
-        "schema": SCHEMA_VERSION, "ts": runrecord.iso(datetime.now(UTC)), "batch": batch, "task": task.id,
-        "family": task.family, "kind": task.kind, "trial": trial, "arm": arm, "job": job.name,
-        "run_id": rec["run_id"] if rec else None, "status": rec["status"] if rec else ("refused" if code == 3 else "error"),
-        "pass": passed, "grade": [dataclasses.asdict(v) for v in verdicts], "folder": str(folder),
-    }  # fmt: skip
-    append_jsonl(results_path(env), result)
-    if passed and not keep:
+    code = None
+    try:
+        code = run.run_job(argparse.Namespace(job=job.name, dry_run=False), trial_job, marker, hook)
+    finally:  # also on SIGTERM: whatever got as far as a record gets a result line
+        rec = state["rec"] or _find_record(log, before, task.id, trial, arm)
+        result = {
+            "schema": SCHEMA_VERSION, "ts": runrecord.iso(datetime.now(UTC)), "batch": batch, "task": task.id,
+            "task_hash": task_hash(task), "family": task.family, "kind": task.kind, "trial": trial, "arm": arm,
+            "job": job.name, "run_id": rec["run_id"] if rec else None,
+            "status": rec["status"] if rec else ("refused" if code == 3 else "error"),
+            "pass": bool(state["passed"] and not state["note"]),
+            "grade": [dataclasses.asdict(v) for v in state["verdicts"]], "note": state["note"], "folder": str(folder),
+        }  # fmt: skip
+        append_jsonl(results_path(env), result)
+    if result["pass"] and not keep:
         shutil.rmtree(folder, ignore_errors=True)
     return result
+
+
+def _wall_state() -> str:
+    try:
+        require_wall()
+    except WsError as e:
+        return f"would be refused: {e.message}"
+    return "run inside the wall, the trial folder read-only"
 
 
 def _plan_text(label: str, arm: str, job_name: str | None, runs, skipped) -> str:
@@ -939,18 +1087,24 @@ def cmd_run(args: argparse.Namespace) -> int:
         )
     arm = args.arm or args.job or "default"
     total = sum(n for _, n in runs)
+    needs_wall = any(g["type"] == "command" for t, _ in runs for g in t.graders)
+    if needs_wall and not args.dry_run:
+        require_wall()
     plan = {
         "set": label, "arm": arm, "job": args.job, "runs": total, "dry_run": args.dry_run,
         "tasks": [{"task": t.id, "family": t.family, "kind": t.kind, "trials": n, "timeout_s": t.timeout_s,
                    "graders": [g["type"] for g in t.graders]} for t, n in runs],
         "skipped": skipped,
         "note": "each run is one headless `ws run`; the monthly cap is checked before each, not during it",
+        "command_graders": _wall_state() if needs_wall else "none",
     }  # fmt: skip
     if args.dry_run:
         if args.json:
             output.result(plan)
         else:
             print(_plan_text(label, arm, args.job, runs, skipped))
+            if needs_wall:
+                print(f"command graders: {plan['command_graders']}")
             print(f"{total} runs; this was a plan: nothing started, nothing spent")
         return 0
     return _execute(args, runs, skipped, arm, job, plan)
@@ -1052,27 +1206,35 @@ def _arm_results(results: list[dict], arm: str) -> list[dict]:
     return [r for r in results if r.get("arm") == arm]
 
 
-def _down_rate(results: list[dict], ratings: dict[str, str]) -> float | None:
+def _down_rate(results: list[dict], ratings: dict[str, str]) -> tuple[float | None, int]:
+    """(thumbs-down share, how many ratings it rests on) for the trials of these results."""
     rated = [ratings[str(r["run_id"])] for r in results if r.get("run_id") and str(r["run_id"]) in ratings]
-    return rated.count("down") / len(rated) if rated else None
+    return (rated.count("down") / len(rated) if rated else None), len(rated)
 
 
 def compare_arms(arm_a: str, arm_b: str, results: list[dict], runs: dict, ratings: dict) -> dict:
-    ra, rb = _arm_results(results, arm_a), _arm_results(results, arm_b)
-    both, a_only, b_only, neither = evalstats.paired(ra, rb)
-    pairs = both + a_only + b_only + neither
-    gap = (a_only - b_only) / pairs * 100 if pairs else 0.0
+    """Two arms, paired at task level (see `evalstats.paired_tasks`: McNemar needs independent pairs, and the trials of
+    one task are not). The task counts and the trial counts behind them are both in the result."""
+    pt = evalstats.paired_tasks(_arm_results(results, arm_a), _arm_results(results, arm_b))
+    ra, rb = pt["used_a"], pt["used_b"]
+    n, a_only, b_only = pt["tasks"], pt["a_only"], pt["b_only"]
+    down_a, rated_a = _down_rate(ra, ratings)
+    down_b, rated_b = _down_rate(rb, ratings)
     stats = {
-        "pairs": pairs, "both_pass": both, "a_only": a_only, "b_only": b_only, "both_fail": neither,
-        "gap_points": gap, "p": evalstats.mcnemar_p(a_only, b_only),
-        "pass_rate_a": (both + a_only) / pairs if pairs else None, "pass_rate_b": (both + b_only) / pairs if pairs else None,
-        "down_a": _down_rate(ra, ratings), "down_b": _down_rate(rb, ratings),
+        "pairs": n, "tasks": n, "trials_a": pt["trials_a"], "trials_b": pt["trials_b"], "both_pass": pt["both"],
+        "a_only": a_only, "b_only": b_only, "both_fail": pt["neither"], "dropped": pt["dropped"],
+        "gap_points": (a_only - b_only) / n * 100 if n else 0.0, "p": evalstats.mcnemar_p(a_only, b_only),
+        "pass_rate_a": (pt["both"] + a_only) / n if n else None, "pass_rate_b": (pt["both"] + b_only) / n if n else None,
+        "down_a": down_a, "down_b": down_b, "rated_a": rated_a, "rated_b": rated_b,
         "tokens_a": evalstats.tokens_per_solved(ra, runs), "tokens_b": evalstats.tokens_per_solved(rb, runs),
         "wins_needed": evalstats.wins_needed(a_only + b_only),
     }  # fmt: skip
     verdict = evalstats.decide(stats)
     winner = {"A": arm_a, "B": arm_b}.get(verdict["winner"])
-    return {"arm_a": arm_a, "arm_b": arm_b, **stats, "winner": winner, "why": verdict["why"]}
+    return {
+        "arm_a": arm_a, "arm_b": arm_b, **stats, "winner": winner, "why": verdict["why"],
+        "quality": evalstats.quality_note(stats),
+    }  # fmt: skip
 
 
 def _show_compare(c: dict, look: int, replay: bool) -> None:
@@ -1081,9 +1243,20 @@ def _show_compare(c: dict, look: int, replay: bool) -> None:
     )
     ra, rb = c["pass_rate_a"], c["pass_rate_b"]
     if ra is not None and rb is not None:
-        print(f"  paired trials {c['pairs']}: A passes {ra * 100:.1f}%, B passes {rb * 100:.1f}%")
+        print(
+            f"  paired tasks {c['tasks']} (from {c['trials_a']} trials of A, {c['trials_b']} of B): "
+            f"A passes {ra * 100:.1f}%, B passes {rb * 100:.1f}% (a task passes when most of its trials do)"
+        )
+    d = c["dropped"]
+    left_out = sum(d.values())
+    if left_out:
+        print(
+            f"  left out: {d['other_job']} results from an earlier job, {d['other_task_text']} from an earlier "
+            f"version of a task, {d['task_text_differs']} tasks whose text differs between the arms"
+        )
     print(
-        f"  A only {c['a_only']}, B only {c['b_only']}, both {c['both_pass']}, neither {c['both_fail']}; exact McNemar p={c['p']:.4f}"
+        f"  A only {c['a_only']}, B only {c['b_only']}, both {c['both_pass']}, neither {c['both_fail']}; "
+        f"exact McNemar p={c['p']:.4f}"
     )
     for key, name in (("down_a", "thumbs-down rate A"), ("down_b", "thumbs-down rate B"),
                       ("tokens_a", "tokens per solved A"), ("tokens_b", "tokens per solved B")):  # fmt: skip
@@ -1091,6 +1264,8 @@ def _show_compare(c: dict, look: int, replay: bool) -> None:
         print(
             f"  {name}: {'not measured' if v is None else (f'{v * 100:.1f}%' if key.startswith('down') else f'{v:,.0f}')}"
         )
+    if c.get("quality"):
+        print(f"  quality: {c['quality']}")
     print(f"  {'winner ' + c['winner'] if c['winner'] else 'no winner'}: {c['why']}")
 
 
@@ -1101,7 +1276,7 @@ def cmd_compare(args: argparse.Namespace) -> int:
         raise WsError(
             "usage", "compare two different arms", "an A/A run is two runs of the same job under two arm names", 2
         )
-    pair = "|".join(sorted((a, b)))
+    pair = sorted((a, b))  # stored as a JSON array, so no arm name can be confused with a separator
     stored = [x for x in read_jsonl(looks_path(env)) if x.get("pair") == pair]
     used = len(stored)
     if args.look is not None:
@@ -1128,7 +1303,7 @@ def cmd_compare(args: argparse.Namespace) -> int:
     if c["pairs"] == 0:
         raise WsError(
             "not_found",
-            f"no trials of the same task and trial number in both {a} and {b}",
+            f"no task that both {a} and {b} ran, in the same version of the task and on one job each",
             "run both arms on the same tasks first",
         )
     append_jsonl(
@@ -1154,21 +1329,31 @@ SECRET_PATTERNS = (
     re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{16,}", re.IGNORECASE),
     re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\."),
     re.compile(r"/l/[A-Za-z0-9_-]{20,}"),  # a broker lease URL
-    re.compile(r"\b(?:api[_-]?key|secret|token|passw(?:or)?d|passwd)\b\s*[:=]\s*\S{8,}", re.IGNORECASE),
+    re.compile(r"\b(?:api[_-]?key|secret|token)\b\s*[:=]\s*\S{8,}", re.IGNORECASE),
+    re.compile(r"\b(?:passw(?:or)?d|passwd|pwd|passphrase)\b\s*[:=]", re.IGNORECASE),
+    re.compile(r"\b[a-z][a-z0-9+.-]*://[^/\s:@]+:[^/\s@]+@", re.IGNORECASE),  # scheme://user:password@host
     re.compile(r"\b[A-Za-z0-9_-]{40,}\b"),
 )
+BASE64ISH = re.compile(r"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{32,}={0,2}(?![A-Za-z0-9+/=])")
+RUN_ID = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}$")
+SECRET_CHECK = "prompts were checked against the names in your secrets registry and for the shapes of keys, tokens and passwords; not against secret values, which ws cannot read safely"
 
 
 def secret_reason(text: str, env: dict) -> str | None:
     """Why `text` may not be copied into a task, or None. ws has no prompt scrubber, so this refuses: a registered
-    secret's name, or anything shaped like a key, token, password or private key. Raises SecretsError if the registry
-    cannot be read (then nothing is checked, and nothing is proposed)."""
+    secret's name, or anything shaped like a key, token, password, URL with a password or private key. It does not check
+    secret values: the store belongs to the broker, and the registry has no check that avoids reading them (SECRET_CHECK
+    says so in the output). Raises SecretsError if the registry cannot be read (then nothing is proposed)."""
     for name in wsecrets.load_registry(wsecrets.registry_path(env)):
         if re.search(rf"(?<![A-Za-z0-9_-]){re.escape(name)}(?![A-Za-z0-9_-])", text, re.IGNORECASE):
             return f"names the registered secret {name!r}"
     for pat in SECRET_PATTERNS:
         if pat.search(text):
             return "looks like it holds a key, token or password"
+    for m in BASE64ISH.finditer(text):  # mixed case and a digit, so a plain long path or word is not caught
+        t = m.group(0)
+        if any(c.isdigit() for c in t) and any(c.islower() for c in t) and any(c.isupper() for c in t):
+            return "has a long base64-like string in it"
     return None
 
 
@@ -1220,16 +1405,32 @@ def _already(env: dict) -> tuple[set[str], set[str]]:
 
 
 def propose(rec: dict, reasons: list[str], job: jobs.Job) -> Task:
+    """A proposal for a run. The run record keeps no prompt, so the prompt is the job file's as it is now, and the
+    proposal says so (`prompt_source`): the job may have changed since the run."""
     return Task(
         id=f"harvest-{rec['run_id']}", family="work-style", kind="capability", prompt=job.prompt, trials=DEFAULT_TRIALS,
         timeout_s=min(job.timeout_s, MAX_TIMEOUT_S), max_turns=job.max_turns,
         graders=({"type": "rubric", "rubric": PLACEHOLDER_RUBRIC},), approved=False,
-        source_run=rec["run_id"], source_job=rec["job"], reason=", ".join(reasons),
+        source_run=rec["run_id"], source_job=rec["job"], reason=", ".join(reasons), review_required=True,
+        prompt_source=f"the job file {rec['job']}.toml as it is now (run records keep no prompt)",
     )  # fmt: skip
 
 
+def _check_run_id(rec: dict) -> str:
+    rid = rec.get("run_id")
+    if not isinstance(rid, str) or not RUN_ID.match(rid):
+        raise WsError(
+            "bad_config",
+            f"a run record worth a task has a malformed run_id ({str(rid)[:40]!r})",
+            f"fix or remove that line of {runrecord.runs_path()}; nothing was proposed",
+        )
+    return rid
+
+
 def harvest(env: dict, since: timedelta, now: datetime | None = None) -> tuple[list[dict], list[dict]]:
-    """Write a proposal for each job with a run worth a task. Returns (proposals, skipped with the reason)."""
+    """Write a proposal for each job with a run worth a task. Returns (proposals, skipped with the reason). All or
+    nothing: every proposal is checked as a task file first, and if one cannot be written the others are removed again.
+    A malformed run id or a proposal that is not a valid task raises WsError."""
     now = now or datetime.now(UTC)
     try:
         runs = runrecord.read(runrecord.runs_path(env))
@@ -1237,19 +1438,18 @@ def harvest(env: dict, since: timedelta, now: datetime | None = None) -> tuple[l
         raise WsError("io", f"cannot read the run log: {e.strerror or type(e).__name__}") from e
     found = candidates(runs, rating.latest(rating.read(rating.ratings_path(env))), now - since)
     seen_runs, seen_jobs = _already(env)
-    proposals, skipped = [], []
+    proposals, skipped, files = [], [], []
     for name, (rec, reasons) in sorted(found.items()):
-        if rec["run_id"] in seen_runs or name in seen_jobs:
+        rid = _check_run_id(rec)
+        if rid in seen_runs or name in seen_jobs:
             continue
         try:
             job = jobs.load(name, env)
         except jobs.JobError as e:
-            skipped.append(
-                {"job": name, "run": rec["run_id"], "reason": f"the job file cannot be used: {str(e)[:120]}"}
-            )
+            skipped.append({"job": name, "run": rid, "reason": f"the job file cannot be used: {str(e)[:120]}"})
             continue
         if len(job.prompt) > MAX_PROMPT:
-            skipped.append({"job": name, "run": rec["run_id"], "reason": "the prompt is too long for a task"})
+            skipped.append({"job": name, "run": rid, "reason": "the prompt is too long for a task"})
             continue
         try:
             why = secret_reason(job.prompt, env)
@@ -1260,23 +1460,39 @@ def harvest(env: dict, since: timedelta, now: datetime | None = None) -> tuple[l
                 "fix the registry; nothing was proposed",
             ) from e
         if why:
-            skipped.append({"job": name, "run": rec["run_id"], "reason": f"the prompt {why}; not copied"})
+            skipped.append({"job": name, "run": rid, "reason": f"the prompt {why}; not copied"})
             continue
         task = propose(rec, reasons, job)
         path = proposed_dir(env) / f"{task.id}.toml"
         text = dumps_task(task)
-        parse_task(text, str(path), task.id)  # what is written must read back
-        write_private(path, text, exclusive=True)
-        proposals.append(
-            {"task": task.id, "job": name, "source_run": rec["run_id"], "reasons": reasons, "path": str(path)}
-        )
+        try:
+            parse_task(text, str(path), task.id)  # what is written must read back
+        except TaskError as e:
+            raise WsError(
+                "bad_config", f"the proposal for job {name} is not a valid task: {e}", "nothing was proposed"
+            ) from e
+        files.append((path, text))
+        proposals.append({"task": task.id, "job": name, "source_run": rid, "reasons": reasons, "path": str(path)})
+    written: list[Path] = []
+    try:
+        for path, text in files:
+            write_private(path, text, exclusive=True)
+            written.append(path)
+    except OSError as e:
+        for path in written:
+            path.unlink(missing_ok=True)
+        raise WsError(
+            "io", f"could not write the proposals ({_why(e)}); none were kept", f"check {proposed_dir(env)}"
+        ) from e
     return proposals, skipped
 
 
 def cmd_harvest(args: argparse.Namespace) -> int:
     proposals, skipped = harvest(os.environ, parse_since(args.since))
     if args.json:
-        output.result({"proposed": proposals, "skipped": skipped, "folder": str(proposed_dir())})
+        output.result(
+            {"proposed": proposals, "skipped": skipped, "folder": str(proposed_dir()), "secret_check": SECRET_CHECK}
+        )
         return 0
     for p in proposals:
         print(f"proposed {p['task']}  job {p['job']}  ({', '.join(p['reasons'])})")
@@ -1287,6 +1503,7 @@ def cmd_harvest(args: argparse.Namespace) -> int:
         print("ws: read one, give it a real grader, then `ws eval approve ID` (or `ws eval reject ID`)")
     else:
         print(f"ws: nothing new to propose from the last {args.since}")
+    print(f"ws: note: {SECRET_CHECK}", file=sys.stderr)
     return 0
 
 
@@ -1299,6 +1516,27 @@ def _proposal(env: dict, task_id: str) -> Path:
     return p
 
 
+def _confirm(task: Task, args: argparse.Namespace) -> bool:
+    """Show what is being approved and ask the person. `--yes` is for scripts; with `--json` or no terminal there is no one
+    to ask, so it is refused without it. Returns False when the person says no."""
+    if not args.json:
+        print(f"ws: proposal {task.id} (job {task.source_job}, run {task.source_run}; {task.reason})")
+        print(f"ws: prompt from {task.prompt_source or 'an unknown source'}:")
+        print(task.prompt)
+    if args.yes:
+        return True
+    if args.json or not sys.stdin.isatty():
+        raise WsError(
+            "refused",
+            "approving needs your confirmation, and there is no terminal to ask on",
+            "run `ws eval approve ID` in a terminal, or pass --yes after reading the proposal",
+        )
+    try:
+        return input("Approve this task? [y/N] ").strip().lower() in ("y", "yes")
+    except EOFError:
+        return False
+
+
 def cmd_approve(args: argparse.Namespace) -> int:
     env = os.environ
     src = _proposal(env, args.id)
@@ -1309,17 +1547,21 @@ def cmd_approve(args: argparse.Namespace) -> int:
     dest = tasks_dir(env) / f"{task.id}.toml"
     if dest.exists():
         raise WsError("refused", f"{dest} already exists", "approve under another id, or remove that file")
-    approved = dataclasses.replace(task, approved=True)
+    if not _confirm(task, args):
+        print(f"ws: not approved; {task.id} stays in {src}")
+        return 1
+    approved = dataclasses.replace(task, approved=True, review_required=False)
     write_private(dest, dumps_task(approved), exclusive=True)
     src.unlink()
     placeholder = approved.needs_judge()
     if args.json:
-        output.result({"task": task.id, "path": str(dest), "needs_grader": placeholder})
+        output.result({"task": task.id, "path": str(dest), "needs_grader": placeholder, "prompt": task.prompt})
         return 0
     print(f"ws: approved {task.id}; it is now {dest}")
     if placeholder:
         print(
-            "ws: its grader is still a rubric, which does not run yet: edit it to a command, file_contains, json_path_equals or regex grader"
+            "ws: its grader is still a rubric, which does not run yet: edit it to a command, file_contains, "
+            "json_path_equals or regex grader"
         )
     return 0
 
@@ -1382,8 +1624,9 @@ def register(sub) -> None:
     h.add_argument("--since", default="30d", metavar="SPAN", help="how far back (default 30d)")
     h.set_defaults(func=cmd_harvest)
 
-    a = esub.add_parser("approve", help="move a proposal into your tasks")
+    a = esub.add_parser("approve", help="show a proposal's prompt, ask, and move it into your tasks")
     a.add_argument("id")
+    a.add_argument("--yes", action="store_true", help="do not ask (for scripts); you have read the proposal")
     a.set_defaults(func=cmd_approve)
     x = esub.add_parser("reject", help="set a proposal aside so harvest does not offer it again")
     x.add_argument("id")

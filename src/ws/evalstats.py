@@ -364,35 +364,82 @@ def compute(
 # ---- comparing two arms -------------------------------------------------------------------------------------------
 
 
-def paired(a: list[dict], b: list[dict]) -> tuple[int, int, int, int]:
-    """(both passed, A only, B only, both failed) over the (task, trial) pairs that both arms ran. The latest result
-    of a pair counts."""
+MIN_RATED = 5  # thumbs a quality flag needs, per arm, before it can veto anything
 
-    def latest(rs: list[dict]) -> dict[tuple, bool]:
-        out: dict[tuple, bool] = {}
-        for r in sorted(rs, key=lambda x: str(x.get("ts"))):
-            out[(r.get("task"), r.get("trial"))] = r.get("pass") is True
-        return out
 
-    la, lb = latest(a), latest(b)
-    both = a_only = b_only = neither = 0
-    for key in la.keys() & lb.keys():
-        pa, pb = la[key], lb[key]
+def paired_tasks(a: list[dict], b: list[dict]) -> dict:
+    """Pair two arms at task level, which is what McNemar's independence needs: trials of one task share a prompt, a
+    setup and a grader, so they are not independent draws, and counting them as pairs inflates the evidence.
+
+    The rule: for each task and arm, the latest result of each trial number counts; the task is *passed* if more than half
+    of those trials passed (a tie, such as 1 of 2, is a fail). Only tasks both arms ran are paired, and only on matching
+    versions: an arm's results count only if they come from the job it ran last, and from the task text it ran last
+    (`task_hash`); a task whose text differs between the two arms is left out. Whatever is left out is counted in
+    `dropped`, never hidden.
+
+    Returns tasks (the n of the test), trials_a and trials_b (the trials behind it), both, a_only, b_only, neither (task
+    counts), dropped, and used_a / used_b (the results that were used)."""
+    dropped = {"other_job": 0, "other_task_text": 0, "task_text_differs": 0}
+
+    def usable(rs: list[dict]) -> dict[str, dict]:
+        rs = sorted(rs, key=lambda x: str(x.get("ts")))
+        if not rs:
+            return {}
+        job = rs[-1].get("job")
+        kept = [r for r in rs if r.get("job") == job]
+        dropped["other_job"] += len(rs) - len(kept)
+        latest_hash: dict = {}
+        for r in kept:
+            latest_hash[r.get("task")] = r.get("task_hash")
+        same = [r for r in kept if r.get("task_hash") == latest_hash[r.get("task")]]
+        dropped["other_task_text"] += len(kept) - len(same)
+        by_task: dict[str, dict] = {}
+        for r in same:
+            t = by_task.setdefault(str(r.get("task")), {"hash": r.get("task_hash"), "trials": {}, "results": []})
+            t["results"].append(r)
+            t["trials"][r.get("trial")] = r.get("pass") is True  # sorted by time: the latest of a trial number wins
+        return by_task
+
+    ua, ub = usable(a), usable(b)
+    both = a_only = b_only = neither = trials_a = trials_b = 0
+    used_a: list[dict] = []
+    used_b: list[dict] = []
+    for task in ua.keys() & ub.keys():
+        if ua[task]["hash"] != ub[task]["hash"]:
+            dropped["task_text_differs"] += 1
+            continue
+        passed = []
+        for side in (ua[task], ub[task]):
+            outcomes = list(side["trials"].values())
+            passed.append(sum(outcomes) * 2 > len(outcomes))
+        used_a += ua[task]["results"]
+        used_b += ub[task]["results"]
+        trials_a += len(ua[task]["trials"])
+        trials_b += len(ub[task]["trials"])
+        pa, pb = passed
         both += pa and pb
         a_only += pa and not pb
         b_only += pb and not pa
         neither += not pa and not pb
-    return both, a_only, b_only, neither
+    return {
+        "tasks": both + a_only + b_only + neither, "trials_a": trials_a, "trials_b": trials_b, "both": both,
+        "a_only": a_only, "b_only": b_only, "neither": neither, "dropped": dropped, "used_a": used_a,
+        "used_b": used_b,
+    }  # fmt: skip
 
 
 def decide(stats: dict) -> dict:
     """The decision rule over a comparison's numbers: success first (exact McNemar, a gap under 3 points is noise), a
     quality veto, then tokens among equals. Returns {"winner": "A"|"B"|None, "why": text}.
 
-    `stats` has: pairs, a_only, b_only, gap_points (A minus B), p, down_a, down_b (thumbs-down rates or None), tokens_a,
-    tokens_b (per solved task or None)."""
+    `stats` has: pairs (paired tasks), a_only, b_only, gap_points (A minus B), p, down_a, down_b (thumbs-down rates or
+    None), rated_a, rated_b (how many ratings behind them), tokens_a, tokens_b (per solved task or None). A quality
+    flag with fewer than MIN_RATED ratings on either arm cannot veto."""
     if stats["pairs"] == 0:
-        return {"winner": None, "why": "no paired trials: both arms need the same tasks and trial numbers"}
+        return {
+            "winner": None,
+            "why": "no paired tasks: both arms need the same tasks, in the same version, on one job",
+        }
     discordant = stats["a_only"] + stats["b_only"]
     gap = stats["gap_points"]
     significant = abs(gap) >= NOISE_POINTS and stats["p"] < ALPHA
@@ -423,9 +470,17 @@ def decide(stats: dict) -> dict:
     return {"winner": lean, "why": f"equal on success ({gap_text}); {lean} uses fewer tokens per solved task"}
 
 
+def quality_note(stats: dict) -> str | None:
+    """Why the quality flag could not be used, or None when it could (or when nobody rated anything)."""
+    ra, rb = stats.get("rated_a", 0), stats.get("rated_b", 0)
+    if ra >= MIN_RATED and rb >= MIN_RATED:
+        return None
+    return f"too few ratings to veto (A {ra}, B {rb}; {MIN_RATED} needed on each arm)"
+
+
 def _veto(stats: dict) -> str | None:
-    """The arm whose thumbs-down rate is worse by NOISE_POINTS or more, if both have ratings."""
+    """The arm whose thumbs-down rate is worse by NOISE_POINTS or more, once both arms have MIN_RATED ratings."""
     da, db = stats["down_a"], stats["down_b"]
-    if da is None or db is None or abs(da - db) * 100 < NOISE_POINTS:
+    if quality_note(stats) or da is None or db is None or abs(da - db) * 100 < NOISE_POINTS:
         return None
     return "A" if da > db else "B"

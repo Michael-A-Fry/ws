@@ -166,7 +166,7 @@ SCHEMA: dict = {
             },
         },
         "eval": {
-            "description": "Set only on a trial of `ws eval run`: the task, the trial number, the arm and whether the grader passed it (null when never graded).",
+            "description": "Set only on a trial of `ws eval run`: the task, the trial number and the arm. `pass` is null here: the record is written before grading, and the graded outcome is in eval/results.jsonl.",
             "type": ["object", "null"],
             "additionalProperties": False,
             "required": ["task", "trial", "arm", "pass"],

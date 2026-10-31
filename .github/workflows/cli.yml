@@ -42,6 +42,45 @@ jobs:
           set +e; uv run --locked ws doctor --json > "$RUNNER_TEMP/doctor.json"; code=$?; set -e
           uv run --locked python scripts/check_fresh_doctor.py "$RUNNER_TEMP/doctor.json" "$code"
 
+  # Phase 3 pass test: no secret is readable by the agent user (ws-dev), yet its lease request gets a proxied call
+  # whose upstream sees the injected header. The wall is built by running the commands `ws secret wall` prints (this
+  # runner has passwordless sudo and systemd), then the pass test runs against that result.
+  secret-wall:
+    name: secret wall (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: "0.13.1"
+          enable-cache: true
+      - name: install
+        run: uv sync --locked
+      - name: run the commands `ws secret wall` prints
+        run: |
+          # GitHub's runner image leaves /opt writable by everyone; the wall refuses to install under such a folder
+          sudo chmod go-w /opt
+          export WS_HOME="$RUNNER_TEMP/wshome"
+          mkdir -p "$WS_HOME"
+          printf '[anthropic]\nhosts = ["api.anthropic.com"]\npurposes = ["run"]\n' > "$WS_HOME/secrets.toml"
+          uv run --locked ws secret wall > "$RUNNER_TEMP/wall.sh"
+          cat "$RUNNER_TEMP/wall.sh"
+          # the printed "secret set" lines ask a person to paste a new key; there is nobody to ask here
+          grep -v ' secret set ' "$RUNNER_TEMP/wall.sh" > "$RUNNER_TEMP/wall-run.sh"
+          bash -euo pipefail "$RUNNER_TEMP/wall-run.sh"
+          systemctl is-active ws-broker
+      - name: add the agent user and an outsider
+        run: |
+          sudo useradd --create-home --shell /bin/bash --groups ws-clients ws-dev
+          sudo useradd --create-home --shell /bin/bash ws-other
+      - name: the pass test
+        env:
+          WS_E2E_REQUIRE: "1"
+        run: uv run --locked pytest -q -rs tests/e2e/test_secret_wall.py
+
   wsl:
     name: doctor (windows-2025, WSL2 Ubuntu-24.04)
     runs-on: windows-2025

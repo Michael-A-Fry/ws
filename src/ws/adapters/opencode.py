@@ -16,9 +16,11 @@ OPENCODE_CONFIG_DIR is searched for `plugins/`, which is where the shim sits.
 from __future__ import annotations
 
 import json
+import math
 import shlex
 from pathlib import Path
 
+from ws import jobs
 from ws.adapters import Call, check_argv, protected_paths
 from ws.adapters.opencode_plugin import SOURCE
 from ws.policy import Policy, native_patterns
@@ -120,3 +122,122 @@ def _text(d: dict, key: str) -> str:
 def launch_hint(out: str) -> str:
     q = shlex.quote(out)
     return f'start OpenCode with: OPENCODE_CONFIG_CONTENT="$(cat {q}/{CONFIG})" OPENCODE_CONFIG_DIR={q} opencode'
+
+
+# --- ws run: the command line, and the event stream read back as a run record --------------------------------------
+
+EXE = "opencode"
+PLACEHOLDER_KEY = "ws-lease-placeholder"  # the runner holds this; the broker swaps in the real key on the way out
+OPTIONS = {"exe", "env", "provider", "base_path", "offline"}
+PROMPT_VIA_STDIN = True  # `opencode run` reads the message from stdin when none is given (checked on 1.19.4)
+
+
+def priced(job) -> bool:
+    """Can OpenCode price this job's model? Its built-in providers come with prices; a provider block in the job
+    does only if every model in it carries a `cost`. Otherwise OpenCode reports 0, which is not free."""
+    block = job.runner_options.get("provider")
+    if not isinstance(block, dict) or not block:
+        return True
+    models = block.get("models")
+    return (
+        isinstance(models, dict) and bool(models) and all(isinstance(m, dict) and "cost" in m for m in models.values())
+    )
+
+
+def build_command(job, run_dir: Path, lease) -> tuple[list[str], dict[str, str]]:
+    """(argv, env) for `opencode run --format json`. The generated gate config in run_dir/gate is passed as the inline
+    config (OPENCODE_CONFIG_CONTENT, which beats a project's own opencode.json) with OPENCODE_CONFIG_DIR as the plugin
+    folder. The lease (if any) becomes the provider's baseURL plus runner_options.base_path (default /v1), with a
+    placeholder key, added to that inline config. runner_options.provider is merged into the provider block, for a
+    provider OpenCode does not know (npm, name, models). Raises ValueError naming the key that is wrong."""
+    jobs.check_options(job, OPTIONS)
+    exe = jobs.option(job, "exe", str, EXE)
+    provider_id, slash, _ = job.model.partition("/")
+    if not slash or not provider_id:
+        raise ValueError("model must be provider/model for opencode, e.g. anthropic/claude-haiku-4-5")
+    if job.max_turns is not None:
+        raise ValueError("max_turns: opencode run has no turn limit; remove it or use claude-code")
+    extra = jobs.option(job, "provider", dict, {})
+    base_path = jobs.option(job, "base_path", str, "/v1")
+    offline = jobs.option(job, "offline", bool, False)
+    out = Path(run_dir) / "gate"
+    argv = [exe, "run", "--model", job.model, "--format", "json"]
+    env = jobs.extra_env(job)  # first: what ws sets below always wins
+    env.update(OPENCODE_CONFIG_DIR=str(out), OPENCODE_DISABLE_AUTOUPDATE="true")
+    if offline:  # no model-list fetch or language-server download: for a stub or an air-gapped machine
+        env.update(OPENCODE_DISABLE_MODELS_FETCH="true", OPENCODE_DISABLE_LSP_DOWNLOAD="true")
+    gate_file = out / CONFIG
+    config = json.loads(gate_file.read_text(encoding="utf-8")) if gate_file.is_file() else {}
+    if lease is not None or extra:
+        block = json.loads(json.dumps(extra))  # a copy: the job's own table is not touched
+        options = block.setdefault("options", {})
+        if not isinstance(options, dict):
+            raise ValueError("runner_options.provider.options must be a table")
+        if lease is not None:
+            options.update(baseURL=lease.base_url + base_path, apiKey=PLACEHOLDER_KEY)
+        config["provider"] = {**(config.get("provider") or {}), provider_id: block}
+    env["OPENCODE_CONFIG_CONTENT"] = json.dumps(config)
+    return argv, env
+
+
+def parse_result(stdout: str, stderr: str, exit_code: int | None) -> dict:
+    """The part of a run record that the `--format json` event stream can fill. Never raises. The stream does not
+    name the model, so `models_used` has one entry with model None for the caller to fill with the requested model."""
+    session = error = None
+    steps = 0
+    sums = {"input": None, "output": None, "cache_creation": None, "cache_read": None}
+    cost = None
+
+    def add(key: str, v) -> None:
+        if isinstance(v, int) and not isinstance(v, bool) and v >= 0:
+            sums[key] = (sums[key] or 0) + v
+
+    for line in stdout.splitlines():
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        if session is None and isinstance(ev.get("sessionID"), str):
+            session = ev["sessionID"]
+        if ev.get("type") == "error":
+            e = ev.get("error") if isinstance(ev.get("error"), dict) else {}
+            data = e.get("data") if isinstance(e.get("data"), dict) else {}
+            error = str(data.get("message") or e.get("name") or "opencode reported an error")
+        part = ev.get("part") if isinstance(ev.get("part"), dict) else {}
+        if ev.get("type") == "step_finish":
+            steps += 1
+            tok = part.get("tokens") if isinstance(part.get("tokens"), dict) else {}
+            cache = tok.get("cache") if isinstance(tok.get("cache"), dict) else {}
+            add("input", tok.get("input"))
+            add("output", tok.get("output"))
+            add("cache_creation", cache.get("write"))
+            add("cache_read", cache.get("read"))
+            c = part.get("cost")
+            if isinstance(c, (int, float)) and not isinstance(c, bool) and math.isfinite(c) and c >= 0:
+                cost = (cost or 0.0) + c
+    counted = any(v is not None for v in sums.values())
+    # OpenCode reports cost 0 for a model it has no price for, so a zero beside real tokens is "unknown", not free.
+    unpriced = counted and not cost
+    if not steps:
+        cost = None
+    return {
+        "session_id": session,
+        "models_used": [{"model": None, **sums, "cost_usd": None if unpriced else cost}] if steps else [],
+        "tokens": sums,
+        "cost_usd": None if unpriced or not steps else cost,
+        "cost_basis": None if not steps else "unpriced" if unpriced else "runner",
+        "num_turns": steps if steps else None,
+        "error": error,
+    }
+
+
+def transcript_path(session_id: str | None, cwd: str, env: dict[str, str]) -> str | None:
+    """OpenCode 1.19 keeps every session in one SQLite file, `<XDG_DATA_HOME or ~/.local/share>/opencode/opencode.db`;
+    the session id says which rows are this run's. None when the file is not there."""
+    if not session_id:
+        return None
+    data = env.get("XDG_DATA_HOME") or str(Path(env.get("HOME", "~")) / ".local" / "share")
+    db = Path(data).expanduser() / "opencode" / "opencode.db"
+    return str(db) if db.is_file() else None

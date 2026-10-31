@@ -58,7 +58,14 @@ def _runner(cfg, osi, env, network):
     if bad:
         return bad
     exe = shutil.which(RUNNERS[a], path=env.get("PATH"))
-    return (OK, f"{a} found at {exe}") if exe else (FAIL, f"{a} selected but `{RUNNERS[a]}` is not on PATH")
+    if not exe:
+        return FAIL, f"{a} selected but `{RUNNERS[a]}` is not on PATH"
+    from ws import run  # reports the version only: ws never manages a runner's updates
+
+    version = run.exe_version(exe, dict(env))
+    if version is None:
+        return FAIL, f"{a} found at {exe} but `{RUNNERS[a]} --version` did not run"
+    return OK, f"{a} {version} at {exe}" if version else f"{a} at {exe} (it printed no version)"
 
 
 def _model(cfg, osi, env, network):

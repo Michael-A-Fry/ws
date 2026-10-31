@@ -26,15 +26,24 @@
 
 ## Phase 2b (globals stay global, #178)
 
-- [ ] Shadowed-globals check: `ws doctor` WS005 + a prek hook in `ci`; a repo copy of a global skill, agent, workflow
+- [x] Shadowed-globals check: `ws doctor` WS005 + a prek hook in `ci`; a repo copy of a global skill, agent, workflow
   or hook fails unless listed in `.ws/overrides.toml` with a reason; listed overrides are reported
-- [ ] Stale-session nudge: a session records its ws release; after a newer one it gets one line, once
-- [ ] Pass test: a planted shadow fails; a listed override passes and is reported; an old-release session is nudged once
+- [x] Stale-session nudge: a session records its ws release; after a newer one it gets one line, once
+- [x] Pass test: a planted shadow fails; a listed override passes and is reported; an old-release session is nudged once
+  (tests/test_globals.py, tests/test_session.py; PR #10)
 
 ## Phase 3 (core)
 
-- [ ] Policy schema, generated gate (Claude Code + OpenCode), broker, `ws run` + `runs.jsonl`
+- [x] Policy schema + generated gate for Claude Code and OpenCode (PR #9): native deny lists, a fail-closed hook and an
+  OpenCode shim; self-protection of `$WS_HOME`; Rule of Two with named exceptions; known matcher limits in policy.py
+- [x] Secrets store + broker (PR #8): per-run leases to a reverse proxy that injects at the allowed host; `ws secret wall`
+  moves the store to its own user with a root-owned copy of ws
+- [x] `ws run` + `runs.jsonl` (PR #11): scrubbed env, broker leases, budget cap, Rule of Two, one record per run
 - [x] Memory + Notes modules: front matter, `ws note`, `ws memory` (git + FTS5 index), `ws mcp serve`; WS105/WS106
-- [ ] Denied command blocked on both runners; a run record complete; no secret readable by `ws-dev`
+- [x] Pass tests in CI (`cli.yml`): `gate e2e` (denied command blocked on Claude Code and OpenCode, stub model),
+  `run record e2e` (record complete against the schema, both runners), `secret wall` (no secret readable by `ws-dev`)
+- [ ] Secrets wall on Michael's machine: at the phase 6 cut-over (`ws secret wall`, one sudo script, re-paste keys)
+- [ ] Trust on first use of the root-owned /opt/ws copy: closes at phase T (install from the signed tag)
+- [ ] Sandbox as the real wall behind the command matcher (phase 4); bound single-use approvals (phase 4)
 - [x] WS110 usage: off (Michael: "leave it off"); `adapter = "none"`, spend comes from `runs.jsonl`
 - [x] CLA signed by Michael (`license/cla` passes on PR #6)

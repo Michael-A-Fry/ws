@@ -13,6 +13,8 @@ confines every shell command Claude runs, whatever program it starts:
     sandbox stops cannot be re-run outside it. Nothing is "approved" past the wall: what must leave it, a person runs.
   * `filesystem.denyWrite`: `$WS_HOME` (the folder the policy sits in) and every protected path. It beats any allowWrite
     a project adds, so a project's own settings cannot reopen it.
+  * `filesystem.allowWrite`: the policy's allow_write, if it names any. Claude Code's own default (the project folder
+    and its tmp; nothing else) is already an allow-list.
   * `filesystem.denyRead`: the deny_read rules that name a folder or file (ws.policy.sandbox_read_paths).
   * `network.allowedDomains`: the policy's allow_hosts, only when the policy names some. Without them the sandbox
     asks (interactive) or refuses (`-p`) for a host it has not been told about.
@@ -40,8 +42,9 @@ from pathlib import Path
 
 from ws import jobs
 from ws.adapters import Call, check_argv, protected_paths
-from ws.approvals import ENV_MARKER
-from ws.policy import Policy, native_patterns, sandbox_read_paths
+from ws.approvals import ENV_MARKER, ApprovalError
+from ws.approvals import _read_regular as read_regular
+from ws.policy import Policy, native_patterns, sandbox_read_paths, sandbox_write_paths
 
 NAME = "claude-code"
 FILE = "settings.json"
@@ -82,6 +85,8 @@ def sandbox_block(policy: Policy, out: Path, policy_file: Path) -> dict:
     fs: dict = {"denyWrite": list(dict.fromkeys([home, *protected_paths(out, policy_file)]))}
     if policy.gate.deny_read:
         fs["denyRead"] = sandbox_read_paths(policy)
+    if policy.gate.allow_write:  # Claude Code already allows its project folder and tmp; these are the person's extras
+        fs["allowWrite"] = sandbox_write_paths(policy)
     block: dict = {
         "enabled": True,
         "autoAllowBashIfSandboxed": False,
@@ -95,26 +100,29 @@ def sandbox_block(policy: Policy, out: Path, policy_file: Path) -> dict:
 
 
 def preflight(payload: dict) -> str | None:
-    """A reason to deny every call from this folder: a project or local `.claude/settings*.json`, in the session folder or
-    any folder above it, that turns the sandbox off or opens it up (see the module docstring). A file that does not
-    parse is ignored, as Claude Code ignores it; one that cannot be read is a deny."""
-    cwd = payload.get("cwd")
-    if not isinstance(cwd, str) or not cwd.startswith("/"):
+    """A reason to deny every call from this project: a `.claude/settings.json` or `settings.local.json`, in the project
+    folder or any folder above it, that turns the sandbox off or opens it up (see the module docstring). The project
+    folder is CLAUDE_PROJECT_DIR (set for hooks; Claude reads project settings from there, wherever the session has since
+    changed to), else the payload's cwd. A file that does not parse is ignored, as Claude Code ignores it. A settings
+    file that is not a plain file (a link, a FIFO), is too big or cannot be read is a deny: it is read without following a
+    link and without blocking, because a hook that hangs fails open (only exit 2 blocks)."""
+    project = os.environ.get("CLAUDE_PROJECT_DIR") or payload.get("cwd")
+    if not isinstance(project, str) or not project.startswith("/"):
         return None
     home = Path(os.environ.get("HOME") or Path.home())
-    for d in [Path(cwd), *Path(cwd).parents]:
+    for d in [Path(project), *Path(project).parents]:
         if d == home:  # ~/.claude/settings.json is the person's own (user scope), not a project's
             continue
         for name in ("settings.json", "settings.local.json"):
             f = d / ".claude" / name
-            try:
-                conf = json.loads(f.read_text(encoding="utf-8"))
-            except FileNotFoundError:
+            if not os.path.lexists(f):
                 continue
+            try:
+                conf = json.loads(read_regular(f, 1 << 20))
+            except ApprovalError as e:
+                return f"{f} is not a plain readable settings file ({e}); blocked to be safe"
             except ValueError:
                 continue
-            except OSError as e:
-                return f"{f} could not be read ({type(e).__name__}); blocked to be safe"
             key = _widens_sandbox(conf)
             if key:
                 return (

@@ -17,15 +17,24 @@ say "network as today". It is a 0.0.x research preview, and a Node dependency to
 copied where it fits (the points below); Claude Code, which has the same engine built in, keeps using its own.
 
 Decisions, and why:
-  * Write wall, not a read-only root. The runner has to work: it writes its project, its caches, /tmp. So the view of the
-    machine is "as today" (a bind of `/`), with ro-bind layered over `$WS_HOME` and every protected path (the policy,
-    the generated gate folder, ws's control files). A read-only mount is enforced by the kernel for every process in
-    the sandbox, including the runner's own tool and plugin code, which a path rule in the runner's config is not.
-  * Every ancestor that the session could rename is made a mount point. A read-only bind holds the path it covers, not
-    the folders above it: `mv ~/.config ~/.config2; mkdir -p ~/.config/ws; echo x > ~/.config/ws/policy.toml` plants a
-    policy where the hook's fixed path points. rename(2) refuses a mount point (EBUSY), so each ancestor of a protected
-    path whose own parent the user can write is bound onto itself first. The same wall holds for a protected path
-    outside `$WS_HOME` (a generated folder elsewhere). Nothing is refused: the binds cost nothing and change no access.
+  * A write allow-list, not a deny-list. Root is read-only; writable are the project folder (where the runner is started;
+    never the home folder or above it), a private tmp the launcher makes and points TMPDIR at, the runner's own state
+    and cache folders (OpenCode: the `opencode` folders under XDG data, state and cache; found by running it read-only
+    and adding what it needed), `allow_write` from the policy and `--allow-write`. A deny-list left everything else
+    writable: `~/.bashrc`, `~/.local/bin`, `~/.config/systemd/user` and ws's own installed source, each of which runs
+    outside the wall at the next shell or the next hook. ws's own files (`$WS_HOME`, the policy, the generated folder)
+    are read-only by default and stay so even where one sits inside the project. The project's `.git/hooks`,
+    `.git/config`, `.claude` and `.opencode` are read-only inside it (Claude Code's sandbox protects the same). The
+    price: a program that writes a hard-coded path outside those (not TMPDIR) fails; the policy's `allow_write` is how
+    a person lets one through. A read-only mount is enforced by the kernel for every process in the sandbox, including the
+    runner's own tool and plugin code, which a path rule in the runner's config is not.
+  * A protected path reached through a symbolic link the session could replace is refused, with the real path in the
+    message. A read-only bind holds the real path; delete a link in a writable folder and plant a folder under its name,
+    and the hook's fixed --policy path reads the plant. (Links in folders the user cannot write are fine.)
+  * Every ancestor of a protected path that is inside a writable folder is made a mount point. A read-only bind holds
+    the path it covers, not the folders above it: `mv ~/.config ~/.config2; mkdir -p ~/.config/ws; echo x >
+    ~/.config/ws/policy.toml` plants a policy where the hook's fixed path points. rename(2) refuses a mount point
+    (EBUSY), so each such ancestor is bound onto itself. Nothing is refused: the binds cost nothing and change no access.
   * Two holes in that, on purpose: `$WS_HOME/approvals/pending` and `$WS_HOME/sessions` stay writable. The gate hook and
     the session nudge run inside the wall (the plugin lives in the runner's process) and must be able to record a
     pending approval and a release marker. Neither grants anything: see ws.approvals for why a forged pending record is
@@ -79,6 +88,7 @@ import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -183,44 +193,72 @@ def seccomp_program(machine: str | None = None) -> bytes:
 
 @dataclass(frozen=True)
 class Plan:
-    """What the wall does to the filesystem, in the order it is applied (a later mount wins over an earlier one)."""
+    """What the wall does to the filesystem, in the order it is applied (a later mount wins over an earlier one):
+    everything read-only; then the allow-list writable; then ws's own files read-only again; then the two holes the
+    gate needs writable; then the project's own config read-only again; then the hidden paths made empty."""
 
     home: Path
-    protect: tuple[str, ...] = ()  # read-only, with `home`
+    protect: tuple[str, ...] = ()  # read-only, with `home`, even where they sit inside a writable folder
     hidden: tuple[str, ...] = ()  # deny_read paths, made empty
     sockets: tuple[str, ...] = ()  # socket folders, made empty
+    writable: tuple[str, ...] = ()  # the allow-list: project, private tmp, the runner's state, policy allow_write
+    locked: tuple[str, ...] = ()  # inside a writable folder but read-only (the project's .git/hooks, .claude, ...)
 
     def read_only(self) -> list[str]:
         return list(dict.fromkeys(os.path.realpath(p) for p in [self.home, *self.protect]))
 
-    def writable(self) -> list[str]:
+    def holes(self) -> list[str]:
         return [os.path.realpath(h) for h in writable_holes(self.home)]
 
+    def roots(self) -> list[str]:
+        return list(dict.fromkeys(os.path.realpath(p) for p in self.writable))
+
+    def symlinked(self) -> str | None:
+        """A protected path (as given) that is reached through a link the session could replace, or None. A read-only bind
+        holds the real path; delete a link in a writable folder and plant a folder under its name, and the hook's fixed
+        --policy path reads the plant. A link whose own folder the user cannot write cannot be replaced, so it is fine."""
+        for raw in [self.home, *self.protect]:
+            p = Path(os.path.abspath(raw))
+            for q in [p, *p.parents]:
+                if q != Path("/") and q.is_symlink() and os.access(q.parent, os.W_OK | os.X_OK):
+                    return f"{q} -> {os.path.realpath(q)}"
+        return None
+
     def ancestors(self) -> list[str]:
-        """Folders above a read-only path that the user could rename, outermost first (see the module docstring)."""
+        """Folders inside a writable folder and above a read-only path, outermost first. A read-only bind holds the path
+        it covers, not the folders above it: `mv ~/.config ~/.config2; mkdir -p ~/.config/ws; echo x > ~/.config/ws/policy.toml`
+        plants a policy where the hook's fixed path points. rename(2) refuses a mount point (EBUSY), so each such folder
+        is bound onto itself (read-write: it already was)."""
+        roots = self.roots()
         out: list[str] = []
         for p in self.read_only():
             for a in reversed(Path(p).parents):
                 s = str(a)
-                if s != "/" and s not in out and os.access(os.path.dirname(s), os.W_OK | os.X_OK):
+                if s not in out and any(r in map(str, a.parents) for r in roots):
                     out.append(s)
         return out
 
 
 def bwrap_argv(argv: list[str], plan: Plan, tty: bool, seccomp_fd: int) -> list[str]:
-    out = ["bwrap", "--bind", "/", "/", "--dev-bind", "/dev", "/dev", "--proc", "/proc"]
+    out = ["bwrap", "--ro-bind", "/", "/", "--dev-bind", "/dev", "/dev", "--proc", "/proc"]
     out += ["--unshare-pid", "--unshare-ipc", "--die-with-parent", "--seccomp", str(seccomp_fd)]
     if not tty:
         out.append("--new-session")
-    for p in plan.ancestors():  # first: a bind taken later would cover what is mounted under it
+    for p in plan.roots():
+        if os.path.isdir(p):  # bubblewrap cannot bind what is not there
+            out += ["--bind", p, p]
+    for p in plan.ancestors():  # after the writable folders, before the read-only mounts that hang under them
         if os.path.isdir(p):
             out += ["--bind", p, p]
     for p in plan.read_only():
-        if os.path.lexists(p):  # bubblewrap cannot bind what is not there
+        if os.path.lexists(p):
             out += ["--ro-bind", p, p]
-    for p in plan.writable():
+    for p in plan.holes():
         if os.path.lexists(p):
             out += ["--bind", p, p]
+    for p in plan.locked:
+        if os.path.lexists(p):
+            out += ["--ro-bind", p, p]
     for p in (*plan.sockets, *plan.hidden):
         out += ["--ro-bind", "/dev/null", p] if os.path.isfile(p) else ["--tmpfs", p]
     return [*out, "--", *argv]
@@ -231,10 +269,15 @@ def _sbpl(path: str) -> str:
 
 
 def sandbox_exec_profile(plan: Plan) -> str:
-    """The macOS profile. Paths are resolved first: /var is /private/var there, and the profile matches real paths."""
-    lines = ["(version 1)", "(allow default)"]
+    """The macOS profile, the same allow-list: deny every write, allow the writable folders (and /dev), deny ws's own
+    files again, allow the two holes, deny the project's config again. Paths are resolved first: /var is /private/var
+    there, and the profile matches real paths. Seatbelt matches paths, not mount points, so a renamed ancestor does not
+    help an attacker there."""
+    lines = ["(version 1)", "(allow default)", "(deny file-write*)", '(allow file-write* (subpath "/dev"))']
+    lines += [f"(allow file-write* (subpath {_sbpl(p)}))" for p in plan.roots()]
     lines += [f"(deny file-write* (subpath {_sbpl(p)}))" for p in plan.read_only()]
-    lines += [f"(allow file-write* (subpath {_sbpl(p)}))" for p in plan.writable()]
+    lines += [f"(allow file-write* (subpath {_sbpl(p)}))" for p in plan.holes()]
+    lines += [f"(deny file-write* (subpath {_sbpl(p)}))" for p in plan.locked]
     for p in (*plan.sockets, *plan.hidden):
         kind = "literal" if os.path.isfile(p) else "subpath"
         lines.append(f"(deny file-read* ({kind} {_sbpl(p)}))")
@@ -254,6 +297,8 @@ def wrap(
     home: Path,
     protect: list[str],
     *,
+    writable: list[str] = (),
+    locked: list[str] = (),
     system: str | None = None,
     which=shutil.which,
     probe=None,
@@ -264,7 +309,20 @@ def wrap(
     """`argv` inside the sandbox for this OS, with the descriptors that must stay open for it. Raises SandboxError (with
     the install line) when it cannot be built."""
     system = system or _system()
-    plan = Plan(home, tuple(protect), tuple(hidden_paths(pol, env)), tuple(socket_dirs(env)))
+    plan = Plan(
+        home,
+        tuple(protect),
+        tuple(hidden_paths(pol, env)),
+        tuple(socket_dirs(env)),
+        tuple(writable),
+        tuple(locked),
+    )
+    link = plan.symlinked()
+    if link:
+        raise SandboxError(
+            f"{link}: a protected path is reached through a symbolic link that the session could delete and replace, "
+            "and the wall can only hold the real path. Point WS_HOME (and --policy) at the real folder"
+        )
     if system == "linux":
         if not which("bwrap"):
             raise SandboxError(f"bubblewrap (bwrap) is not installed; {INSTALL['linux']}")
@@ -311,14 +369,37 @@ def _bwrap_starts() -> bool:
 
 # --- ws gate launch ------------------------------------------------------------------------------------------------
 
+# Inside the project folder, ws's own read-only list: what Claude Code's sandbox also always protects. A hook or config
+# written here runs outside the wall at the next `git commit` or the next start of the runner.
+PROJECT_LOCKED = (".git/hooks", ".git/config", ".claude", ".opencode")
 
-def launch_env(env: dict) -> dict:
-    return {**env, ENV_MARKER: "1"}
+
+def launch_env(env: dict, tmp: str | None = None) -> dict:
+    return {**env, ENV_MARKER: "1", **({"TMPDIR": tmp} if tmp else {})}
+
+
+def expand(path: str, env: dict) -> str:
+    home = env.get("HOME") or str(Path.home())
+    return home + path[1:] if path == "~" or path.startswith("~/") else path
+
+
+def project_folder(cwd: str, env: dict) -> str:
+    """The folder the wall leaves writable: where the runner is started. Not the home folder or anything above it: that
+    would put `~/.bashrc`, `~/.local/bin` and the ws install itself in reach, which is what the allow-list is for."""
+    real = os.path.realpath(cwd)
+    home = os.path.realpath(env.get("HOME") or str(Path.home()))
+    if real == "/" or real == home or home.startswith(real + "/"):
+        raise SandboxError(
+            f"{cwd} is your home folder or above it: start the runner from a project folder, so the wall can leave only "
+            "that writable (everything in the home folder, shell start-up files included, would be writable otherwise)"
+        )
+    return real
 
 
 def protected(policy_file: Path, runner: str, extra: list[str] | None = None, env: dict | None = None) -> list[str]:
     """Everything the wall makes read-only besides `$WS_HOME` itself: the policy (wherever --policy put it), the control
-    files of both its folder and `$WS_HOME`, anything named with --protect, and the generated config folder."""
+    files of both its folder and `$WS_HOME`, anything named with --protect, and the generated config folder. With the
+    allow-list most of this is read-only already; it matters where one of these sits inside a writable folder."""
     env = os.environ if env is None else env
     out = [str(policy_file), *policy.control_paths(policy_file.parent), *policy.control_paths(ws_home(env))]
     out += [str(Path(p).expanduser().absolute()) for p in extra or []]
@@ -326,6 +407,26 @@ def protected(policy_file: Path, runner: str, extra: list[str] | None = None, en
     if config_dir:  # the generated folder the runner was told to use
         out.append(str(Path(config_dir).expanduser().absolute()))
     return list(dict.fromkeys(out))
+
+
+def writable_folders(pol: policy.Policy, runner: str, project: str, tmp: str, extra: list[str], env: dict) -> list[str]:
+    """The allow-list: the project, the private tmp, the runner's own state and cache folders (made if missing, since
+    bubblewrap cannot bind what is not there), `allow_write` from the policy and --allow-write. A listed folder that does
+    not exist is skipped, except the runner's own."""
+    out = [project, tmp]
+    adapter = adapters.get(runner)
+    getattr(adapter, "wall_prepare", lambda _env: None)(env)
+    state = getattr(adapter, "wall_writable", None)
+    for p in state(env) if state else []:
+        Path(p).mkdir(parents=True, exist_ok=True)
+        out.append(p)
+    for p in [*policy.sandbox_write_paths(pol), *extra]:
+        out.append(expand(p, env))
+    return [p for p in dict.fromkeys(out) if os.path.isdir(p)]
+
+
+def project_locked(project: str) -> list[str]:
+    return [str(Path(project) / rel) for rel in PROJECT_LOCKED if os.path.lexists(Path(project) / rel)]
 
 
 def run_with_broker(cmd: list[str], env: dict, pass_fds: tuple[int, ...], root: Path) -> int:
@@ -378,19 +479,30 @@ def cmd_launch(args: argparse.Namespace) -> int:
         except OSError as e:
             print(f"ws: could not start {shlex.join(argv[:1])}: {e}", file=sys.stderr)
             return 127
+    tmp = tempfile.mkdtemp(prefix="ws-wall-")  # the wall's /tmp: the rest of the disk is read-only
     try:
-        wrapped = wrap(argv, pol, home, protected(policy_file, args.runner, args.protect), tty=sys.stdin.isatty())
+        project = project_folder(os.getcwd(), env)
+        wrapped = wrap(
+            argv,
+            pol,
+            home,
+            protected(policy_file, args.runner, args.protect),
+            writable=writable_folders(pol, args.runner, project, tmp, args.allow_write or [], env),
+            locked=project_locked(project),
+            tty=sys.stdin.isatty(),
+        )
+        return run_with_broker(wrapped.argv, launch_env(dict(os.environ), tmp), wrapped.pass_fds, approvals_dir(home))
     except SandboxError as e:
         print(
             f"ws: refusing to start {args.runner} without its wall: {e}\n(or `--no-sandbox`, which has none)",
             file=sys.stderr,
         )
         return 1
-    try:
-        return run_with_broker(wrapped.argv, env, wrapped.pass_fds, approvals_dir(home))
     except OSError as e:
-        print(f"ws: could not start {shlex.join(wrapped.argv[:1])}: {e}", file=sys.stderr)
+        print(f"ws: could not start {shlex.join(argv[:1])}: {e}", file=sys.stderr)
         return 127
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def add_launch(gs, names: list[str]) -> None:
@@ -401,6 +513,12 @@ def add_launch(gs, names: list[str]) -> None:
     p.add_argument("--runner", required=True, choices=names)
     p.add_argument("--policy", metavar="FILE", help="policy file (default $WS_HOME/policy.toml)")
     p.add_argument("--protect", action="append", metavar="PATH", help="another file or folder to make read-only")
+    p.add_argument(
+        "--allow-write",
+        action="append",
+        metavar="DIR",
+        help="another folder the session may write (besides the project)",
+    )
     p.add_argument("--no-sandbox", action="store_true", help="start the runner with no wall (says what that gives up)")
     p.add_argument("argv", nargs=argparse.REMAINDER, help="-- then the runner's command line")
     p.set_defaults(func=cmd_launch)

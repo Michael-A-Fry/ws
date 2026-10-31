@@ -23,18 +23,26 @@ claude-code adapter writes), which acts on what a process does, not on what its 
     generated sandbox-exec profile, which CI does not run. Also closed and tested (tests/e2e/test_wall_escapes.py): a
     daemon on a host Unix socket (tmux, screen, systemd-run --user, docker), the host's process list, typing into the
     person's terminal (TIOCSTI), renaming a folder above a protected one, a plugin or agent planted in the OpenCode
-    config folder, and a repo's `.claude/settings.json` that opens Claude Code's sandbox.
+    config folder, a repo's `.claude/settings.json` that opens Claude Code's sandbox, and any write outside the project,
+    TMPDIR and the runner's own folders (`~/.bashrc`, `~/.local/bin`, systemd user units, ws's installed source).
   * still open: a `deny_commands` rule is not enforced inside an interpreter (`python3 -c 'os.system("git push -f")'`
     pushes; only the sandbox's file rules apply to it). Reading is denied only for deny_read paths that exist when the
     runner starts and have no wildcard below their first folder. OpenCode's `patch` tool is not a shell command, so it
     is not sandboxed: its native `edit` rules are all that stop it. A runner started without the wrapper
     (`ws gate launch --no-sandbox`) has no wall at all, and the command says so.
-  * not closed: a protected path outside $WS_HOME that does not exist when the runner starts (a --policy file
-    that was never written) can be created there; a `deny_read` rule with a wildcard in the middle is matcher-only; Claude
+  * not closed: a protected path that sits inside the project folder or an `allow_write` folder and does not exist when
+    the runner starts (a --policy file never written) can be created; a program that writes a hard-coded path outside
+    the project, TMPDIR and the runner's own folders fails (the wall is a write allow-list; `allow_write` lets one
+    through), and so does `git config` or a git hook in the project (`.git/hooks` and `.git/config` are read-only);
+    `ws gate launch` refuses a protected path behind a symbolic link the session could replace, and a start from the
+    home folder or above; the macOS sandbox-exec profile (including its Unix-socket rule) is not run in CI and is
+    unit-tested as text only; a `deny_read` rule with a wildcard in the middle is matcher-only; Claude
     Code's own sandbox covers its Bash tool, not its Read/Edit tools (permission rules and the hook cover those); an
     interactive Claude session can still be started in a folder whose project settings open the sandbox, and the hook
-    then denies every call there rather than reconfiguring it; Anthropic's sandbox-runtime was evaluated and not
-    adopted (see ws.sandbox).
+    then denies every call there rather than reconfiguring it; the approval socket's close-on-exec mark needs Bun's
+    FFI, and where that is missing the descriptor stays open in children (Bun's own child spawning does not pass it on;
+    the worst a child can do with it is waste an approval); Anthropic's sandbox-runtime was evaluated and not adopted
+    (see ws.sandbox).
   * `allow_hosts` limits the network on Claude Code only (its sandbox proxy filters by host). The OpenCode wall does not
     filter the network: bubblewrap can only cut it off whole, which would cut off the model too.
 A call the policy lets through only with a human's say-so is `ask_commands`: see ws.approvals.
@@ -91,6 +99,7 @@ class Gate:
     deny_tools: tuple[str, ...] = ()
     ask_commands: tuple[str, ...] = ()  # run only with a single-use approval from a human (ws.approvals)
     allow_hosts: tuple[str, ...] = ()  # empty = the policy says nothing about the network
+    allow_write: tuple[str, ...] = ()  # folders besides the project a sandboxed session may write (`~/x` or `/x`)
 
 
 @dataclass(frozen=True)
@@ -204,6 +213,10 @@ ask_commands = []
 # Hosts a session's shell may reach, for runners whose sandbox filters the network (Claude Code). Empty = no limit
 # from the policy. Example: ["api.anthropic.com", "github.com", "*.npmjs.org"].
 allow_hosts = []
+# Folders a sandboxed session may write besides the project folder it starts in (and the runner's own state and cache
+# folders, which ws knows). Everything else is read-only inside the wall. Absolute or `~/`, no wildcards. Example:
+# ["~/.npm", "~/.cache/uv"].
+allow_write = []
 
 # Rule of Two, leg C (a way out): besides a source's outward acts and the web tools above, the SHELL counts as a way
 # out while any of curl, wget, nc, ssh, scp, python -c ... is not in deny_commands. To close it, deny the lot
@@ -317,7 +330,9 @@ def loads(text: str) -> Policy:
         )
 
     g = _table(
-        raw.get("gate", {}), "[gate]", {"deny_commands", "deny_read", "deny_tools", "ask_commands", "allow_hosts"}
+        raw.get("gate", {}),
+        "[gate]",
+        {"deny_commands", "deny_read", "deny_tools", "ask_commands", "allow_hosts", "allow_write"},
     )
     gate = Gate(
         _strings(g, "deny_commands", "[gate] "),
@@ -325,7 +340,13 @@ def loads(text: str) -> Policy:
         _strings(g, "deny_tools", "[gate] "),
         _strings(g, "ask_commands", "[gate] "),
         _strings(g, "allow_hosts", "[gate] "),
+        _strings(g, "allow_write", "[gate] "),
     )
+    for w in gate.allow_write:
+        if not w.startswith(("~/", "$HOME/", "${HOME}/", "/")) or w in ("/", "~/") or re.search(r"[*?\[]", w):
+            raise PolicyError(
+                f"[gate] allow_write: {w!r} must be a folder, absolute or under ~/, with no wildcard, not /"
+            )
     for h in gate.allow_hosts:
         if not _HOST.match(h):
             raise PolicyError(f"[gate] allow_hosts: {h!r} is not a host (a name, `*.name` or an IP, optional :port)")
@@ -1270,6 +1291,17 @@ def needs_approval(policy: Policy, command: str, *, cwd: str | None = None) -> b
     cands: list[str] = []
     _walk(policy, command, _Ctx(cwd or _cwd()), 0, cands)
     return any(_glob_regex(_canon_pattern(pat)).match(c) for pat in policy.gate.ask_commands for c in cands)
+
+
+def sandbox_write_paths(policy: Policy) -> list[str]:
+    """The allow_write folders, `~/x` or `/x` as written (`$HOME` spelled `~`), normalised."""
+    out = []
+    for w in policy.gate.allow_write:
+        for pre in ("${HOME}", "$HOME"):
+            if w.startswith(pre + "/"):
+                w = "~" + w[len(pre) :]
+        out.append(posixpath.normpath(w))
+    return list(dict.fromkeys(out))
 
 
 def sandbox_read_paths(policy: Policy) -> list[str]:

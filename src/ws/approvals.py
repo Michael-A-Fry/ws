@@ -71,6 +71,7 @@ ENV_MARKER = "WS_GATED_SESSION"  # set in a gated session's env; `ws approve` re
 _SHORT = 12  # hex digits of the id shown to a person
 _ID = re.compile(r"^[0-9a-f]{8,64}$")
 _FULL = re.compile(r"^[0-9a-f]{64}$")
+_NONCE = re.compile(r"^[A-Za-z0-9-]{8,64}$")
 FD_ENV = "WS_APPROVAL_FD"  # the inherited claim socket, set by `ws gate launch` inside the OpenCode wall
 _SKEW = 60  # seconds a record's clock may run ahead before it counts as tampered
 
@@ -152,9 +153,9 @@ def _parse(text: str, ident: str, now: float) -> tuple[Bound, dict]:
     return bound, rec
 
 
-def _read_regular(path: Path) -> str:
-    """A record's text. Opened without following a link and without blocking, and refused unless it is a regular
-    file: `pending/` is writable from the wall, and a FIFO there would hang the reader."""
+def _read_regular(path: Path, limit: int = 65536) -> str:
+    """A file's text (at most `limit` bytes; more is an error). Opened without following a link and without blocking, and
+    refused unless it is a regular file: `pending/` is writable from the wall, and a FIFO there would hang the reader."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError as e:
@@ -163,7 +164,10 @@ def _read_regular(path: Path) -> str:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise ApprovalError("not a regular file")
         with os.fdopen(fd, "r", encoding="utf-8", closefd=False) as f:
-            return f.read(65536)
+            text = f.read(limit + 1)
+        if len(text) > limit:
+            raise ApprovalError("too large")
+        return text
     except (OSError, UnicodeDecodeError) as e:
         raise ApprovalError(f"unreadable ({type(e).__name__})") from e
     finally:
@@ -270,26 +274,30 @@ def require(root: Path, bound: Bound, now: float | None = None, consume: bool = 
 
 
 def serve_claims(sock: socket.socket, root: Path) -> None:
-    """The launcher's side of the claim socket, outside the wall: `claim <64 hex>` -> `ok` or `no <why>`. Runs until the
-    runner closes its end."""
+    """The launcher's side of the claim socket, outside the wall: `claim <64 hex> <nonce>` -> `ok <nonce>` or
+    `no <nonce> <why>`. The nonce is the runner's, fresh per request, so it can tell its own answer from a stale one.
+    Runs until the runner closes its end."""
     with sock, sock.makefile("rw", encoding="utf-8", newline="\n") as f:
         for line in f:
             parts = line.split()
-            if len(parts) == 2 and parts[0] == "claim" and _FULL.match(parts[1]):
+            if len(parts) == 3 and parts[0] == "claim" and _FULL.match(parts[1]) and _NONCE.match(parts[2]):
                 why = consume_id(Path(root), parts[1], time.time())
-                f.write("ok\n" if why is None else f"no {why}\n")
+                f.write(f"ok {parts[2]}\n" if why is None else f"no {parts[2]} {why}\n")
             else:
-                f.write("no bad request\n")
+                f.write("no - bad request\n")
             f.flush()
 
 
 def claim(sock: socket.socket, ident: str) -> str | None:
     """The runner's side (used by tests; the OpenCode shim does the same in JavaScript). None = granted and used."""
+    nonce = secrets.token_hex(8)
     f = sock.makefile("rw", encoding="utf-8", newline="\n")
-    f.write(f"claim {ident}\n")
+    f.write(f"claim {ident} {nonce}\n")
     f.flush()
     answer = f.readline().strip()
-    return None if answer == "ok" else answer.removeprefix("no ") or "no answer"
+    if answer == f"ok {nonce}":
+        return None
+    return answer.removeprefix(f"no {nonce} ") if answer.startswith(f"no {nonce}") else answer or "no answer"
 
 
 # --- the person's side ---------------------------------------------------------------------------------------------

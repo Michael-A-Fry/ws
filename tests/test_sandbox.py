@@ -133,42 +133,119 @@ def wrapped(home, wshome, **kw) -> sandbox.Wrapped:
     )
 
 
-def test_bwrap_binds_ws_home_read_only_then_reopens_the_two_holes_then_hides_reads(home, wshome):
+def test_bwrap_is_a_write_allow_list_with_ws_files_read_only_inside_it(home, wshome, tmp_path):
     (wshome / "policy.toml").write_text("")
-    w = wrapped(home, wshome)
+    proj, tmp = tmp_path / "proj", tmp_path / "tmp"
+    for d in (proj, tmp, proj / ".git" / "hooks"):
+        d.mkdir(parents=True)
+    w = wrapped(home, wshome, writable=[str(proj), str(tmp)], locked=[str(proj / ".git" / "hooks")])
     argv = w.argv
-    assert argv[:4] == ["bwrap", "--bind", "/", "/"] and argv[-3:] == ["--", "opencode", "run"]
+    assert argv[:4] == ["bwrap", "--ro-bind", "/", "/"] and argv[-3:] == ["--", "opencode", "run"]  # root is read-only
     text = " ".join(argv)
     real = wshome.resolve()
-    ro, rw = f"--ro-bind {real} {real}", f"--bind {real}/approvals/pending {real}/approvals/pending"
-    assert ro in text and rw in text and f"--bind {real}/sessions {real}/sessions" in text
-    assert f"--ro-bind {real}/policy.toml {real}/policy.toml" in text
-    assert text.index(ro) < text.index(rw)  # the hole is cut after the read-only mount, or it would be covered
+    rw_proj = f"--bind {proj.resolve()} {proj.resolve()}"
+    ro, hole = f"--ro-bind {real} {real}", f"--bind {real}/approvals/pending {real}/approvals/pending"
+    lock = f"--ro-bind {proj.resolve()}/.git/hooks"
+    assert rw_proj in text and f"--bind {tmp.resolve()} {tmp.resolve()}" in text
+    assert text.index(rw_proj) < text.index(ro) < text.index(hole) < text.index(lock)
+    assert f"--bind {real}/sessions {real}/sessions" in text and f"--ro-bind {real}/policy.toml" in text
     assert f"--tmpfs {home.resolve()}/.ssh" in text and f"--ro-bind /dev/null {home.resolve()}/.aws/credentials" in text
     assert "--dev-bind /dev /dev" in text and "--die-with-parent" in argv
     assert "--unshare-pid" in argv and "--unshare-ipc" in argv and "--proc /proc" in text
     assert "--new-session" in argv  # no terminal: the escape through the controlling terminal is shut
     assert "--unshare-net" not in argv  # the runner needs the model's API
     assert "granted" not in text  # the folder that holds grants is never reopened
-    # the filter goes in by an inherited descriptor, and that descriptor is kept open for the launch
+    assert (
+        str(home.resolve()) not in rw_proj and f"--bind {home.resolve()} " not in text
+    )  # the home folder is not on it
     fd = int(argv[argv.index("--seccomp") + 1])
     assert w.pass_fds == (fd,) and os.get_inheritable(fd)
     assert os.read(fd, 4096) == sandbox.seccomp_program("x86_64")
     os.close(fd)
 
 
-def test_every_renamable_ancestor_of_a_protected_path_becomes_a_mount_point_first(tmp_path):
-    deep = tmp_path / "cfg" / "ws"
+def test_an_ancestor_inside_a_writable_folder_becomes_a_mount_point_after_it_and_before_the_read_only_mount(tmp_path):
+    proj = tmp_path / "proj"
+    deep = proj / "cfg" / "ws"
     deep.mkdir(parents=True)
-    plan = sandbox.Plan(deep, ())
-    ancestors = plan.ancestors()
-    assert str(tmp_path.resolve() / "cfg") in ancestors and "/" not in ancestors
-    assert ancestors == sorted(ancestors, key=len)  # outermost first
+    plan = sandbox.Plan(deep, (), writable=(str(proj),))
+    assert plan.ancestors() == [str(proj.resolve() / "cfg")]  # not proj itself (it is bound already), not above it
     argv = sandbox.bwrap_argv(["x"], plan, False, 9)
-    first_ro = argv.index("--ro-bind")
-    assert argv.index(f"{tmp_path.resolve() / 'cfg'}") < first_ro  # bound onto itself before the read-only mount
-    # a folder whose parent the user cannot write cannot be renamed, so it is left alone
-    assert "/usr" not in ancestors and "/tmp" not in ancestors
+    cfg = str(proj.resolve() / "cfg")
+    assert argv.index(cfg) > argv.index(str(proj.resolve())) and argv.index(cfg) < argv.index("--ro-bind", 4)
+    # outside every writable folder everything is read-only already: nothing to bind
+    assert sandbox.Plan(deep, (), writable=(str(tmp_path / "elsewhere"),)).ancestors() == []
+
+
+def test_a_protected_path_behind_a_replaceable_symlink_is_refused(tmp_path, home, wshome):
+    real = tmp_path / "data" / "ws"
+    real.mkdir(parents=True)
+    link = tmp_path / "ws-link"
+    link.symlink_to(real)
+    assert str(real) in sandbox.Plan(link).symlinked()
+    assert sandbox.Plan(real).symlinked() is None
+    with pytest.raises(sandbox.SandboxError, match="symbolic link") as e:
+        sandbox.wrap(
+            ["x"], POLICY, link, [], system="linux", which=which("bwrap"), probe=lambda: True, machine="x86_64"
+        )
+    assert str(real) in str(e.value)
+    # a link whose own folder the user cannot write cannot be replaced: left alone
+    assert sandbox.Plan(real / "..").symlinked() is None
+
+
+def test_a_link_in_an_unwritable_folder_is_fine(tmp_path, monkeypatch):
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    monkeypatch.setattr(sandbox.os, "access", lambda path, mode: False)
+    assert sandbox.Plan(link).symlinked() is None
+
+
+def test_the_project_folder_is_never_the_home_folder_or_above(tmp_path, home):
+    env = {"HOME": str(home)}
+    for bad in (str(home), str(tmp_path), "/"):
+        with pytest.raises(sandbox.SandboxError, match="project folder"):
+            sandbox.project_folder(bad, env)
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    assert sandbox.project_folder(str(proj), env) == str(proj.resolve())
+    assert sandbox.project_folder(str(home / "code" / "x"), env).endswith("/code/x")
+
+
+def test_the_allow_list_is_project_tmp_the_runners_folders_and_the_policy_extras(tmp_path, home):
+    proj, tmp, extra = tmp_path / "proj", tmp_path / "tmp", home / "extra"
+    for d in (proj, tmp, extra):
+        d.mkdir(parents=True)
+    pol = policy.loads(f'[gate]\nallow_write = ["~/extra", "~/missing", "{tmp_path}/nope"]\n')
+    env = {"HOME": str(home), "XDG_CACHE_HOME": str(tmp_path / "cache")}
+    got = sandbox.writable_folders(pol, "opencode", str(proj), str(tmp), [str(tmp_path)], env)
+    assert got[:2] == [str(proj), str(tmp)]
+    assert str(home / ".local" / "share" / "opencode") in got and str(tmp_path / "cache" / "opencode") in got
+    assert str(extra) in got and str(tmp_path) in got  # --allow-write
+    assert not any(p.endswith(("missing", "nope")) for p in got)  # a folder that is not there is skipped
+    assert (home / ".config" / "opencode" / ".gitignore").is_file()  # what OpenCode would have made at start
+
+
+def test_the_projects_own_config_is_locked_when_it_exists(tmp_path):
+    proj = tmp_path / "p"
+    (proj / ".git" / "hooks").mkdir(parents=True)
+    (proj / ".git" / "config").write_text("")
+    (proj / ".claude").mkdir()
+    assert sandbox.project_locked(str(proj)) == [
+        str(proj / ".git" / "hooks"),
+        str(proj / ".git" / "config"),
+        str(proj / ".claude"),
+    ]
+
+
+def test_allow_write_in_the_policy_is_checked_and_reaches_the_claude_settings(tmp_path):
+    for bad in ('"relative"', '"/"', '"~/"', '"~/x*"', '"/a/b?"'):
+        with pytest.raises(policy.PolicyError, match="allow_write"):
+            policy.loads(f"[gate]\nallow_write = [{bad}]\n")
+    s = claude_settings(tmp_path, '[gate]\nallow_write = ["~/.npm", "$HOME/.cache/uv"]\n')
+    assert s["sandbox"]["filesystem"]["allowWrite"] == ["~/.npm", "~/.cache/uv"]
+    assert "allowWrite" not in claude_settings(tmp_path)["sandbox"]["filesystem"]
 
 
 def test_an_interactive_runner_keeps_its_terminal(home, wshome):
@@ -214,10 +291,12 @@ def test_macos_profile_denies_writes_to_ws_and_reads_of_the_hidden_paths(home, w
     assert argv[:2] == ["sandbox-exec", "-p"] and argv[3:] == ["opencode", "run"] and w.pass_fds == ()
     prof = argv[2]
     real = str(wshome.resolve())
-    assert "(allow default)" in prof and f'(deny file-write* (subpath "{real}"))' in prof
+    assert "(allow default)" in prof and "\n(deny file-write*)\n" in prof  # every write refused first
+    assert f'(deny file-write* (subpath "{real}"))' in prof
     assert f'(deny file-read* (subpath "{home.resolve()}/.ssh"))' in prof
     assert f'(deny file-read* (literal "{home.resolve()}/.aws/credentials"))' in prof
     assert "(deny network-outbound (remote unix-socket))" in prof
+    assert prof.index("(deny file-write*)") < prof.index('(allow file-write* (subpath "/dev"))')
     assert prof.index(f'(deny file-write* (subpath "{real}"))') < prof.index(
         f'(allow file-write* (subpath "{real}/approvals/pending"))'
     )
@@ -304,8 +383,8 @@ CLAIMER = (
     "import os, socket, sys\n"
     "s = socket.socket(fileno=int(os.environ['WS_APPROVAL_FD']))\n"
     "f = s.makefile('rw', newline='\\n')\n"
-    "f.write('claim ' + sys.argv[1] + '\\n'); f.flush()\n"
-    "sys.exit(0 if f.readline().strip() == 'ok' else 3)\n"
+    "f.write('claim ' + sys.argv[1] + ' ' + sys.argv[2] + '\\n'); f.flush()\n"
+    "sys.exit(0 if f.readline().strip() == 'ok ' + sys.argv[2] else 3)\n"
 )
 
 
@@ -314,16 +393,44 @@ def test_a_runner_in_the_wall_can_claim_a_grant_once_through_the_launcher(tmp_pa
     bound = approvals.Bound("opencode", "command", "terraform apply", "/w", "s1")
     approvals.require(root, bound)
     approvals.grant(root, bound.digest()[:12])
-    cmd = [sys.executable, "-c", CLAIMER, bound.digest()]
+    cmd = [sys.executable, "-c", CLAIMER, bound.digest(), "nonce-12345678"]
     assert sandbox.run_with_broker(cmd, dict(os.environ), (), root) == 0
     assert sandbox.run_with_broker(cmd, dict(os.environ), (), root) == 3  # used up
     assert not (root / "granted" / f"{bound.digest()}.json").exists()
 
 
+def test_the_answer_echoes_the_nonce_and_a_claim_without_one_is_refused(tmp_path):
+    import socket as _socket
+
+    root = tmp_path / "approvals"
+    bound = approvals.Bound("opencode", "command", "terraform apply", "/w", "s1")
+    approvals.require(root, bound)
+    approvals.grant(root, bound.digest()[:12])
+    mine, theirs = _socket.socketpair()
+    import threading
+
+    threading.Thread(target=approvals.serve_claims, args=(mine, root), daemon=True).start()
+    f = theirs.makefile("rw", newline="\n")
+    f.write(f"claim {bound.digest()}\n")  # no nonce
+    f.flush()
+    assert f.readline().startswith("no - bad request")
+    assert approvals.claim(theirs, bound.digest()) is None  # the right form: used, and the answer matched its nonce
+    assert approvals.claim(theirs, bound.digest()) == approvals._NONE
+    theirs.close()
+
+
 def test_a_forged_claim_for_nothing_is_refused(tmp_path):
     root = tmp_path / "approvals"
-    assert sandbox.run_with_broker([sys.executable, "-c", CLAIMER, "0" * 64], dict(os.environ), (), root) == 3
-    assert sandbox.run_with_broker([sys.executable, "-c", CLAIMER, "not-an-id"], dict(os.environ), (), root) == 3
+    assert (
+        sandbox.run_with_broker([sys.executable, "-c", CLAIMER, "0" * 64, "nonce-12345678"], dict(os.environ), (), root)
+        == 3
+    )
+    assert (
+        sandbox.run_with_broker(
+            [sys.executable, "-c", CLAIMER, "not-an-id", "nonce-12345678"], dict(os.environ), (), root
+        )
+        == 3
+    )
 
 
 # --- the Claude Code sandbox block --------------------------------------------------------------------------------
@@ -415,6 +522,34 @@ def test_harmless_project_settings_and_the_users_own_settings_are_fine(tmp_path,
     assert claude_code.preflight({"cwd": str(user)}) is None  # user scope is the person's own
 
 
+def test_a_settings_file_that_is_a_fifo_or_a_link_is_a_deny_and_does_not_hang(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    d = tmp_path / "proj"
+    (d / ".claude").mkdir(parents=True)
+    os.mkfifo(d / ".claude" / "settings.json")
+    why = claude_code.preflight({"cwd": str(d)})  # a blocking read would hang here forever
+    assert why and "not a plain readable settings file" in why and "blocked to be safe" in why
+    (d / ".claude" / "settings.json").unlink()
+    target = tmp_path / "elsewhere.json"
+    target.write_text("{}")
+    (d / ".claude" / "settings.json").symlink_to(target)
+    assert "not a plain readable settings file" in claude_code.preflight({"cwd": str(d)})
+    (d / ".claude" / "settings.json").unlink()
+    (d / ".claude" / "settings.json").write_text(" " * (2 << 20))  # too big to be settings
+    assert "too large" in claude_code.preflight({"cwd": str(d)})
+
+
+def test_the_project_dir_the_hook_is_given_wins_over_the_cwd(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    bad = project(tmp_path, "settings.json", {"sandbox": {"excludedCommands": ["x"]}})
+    other = tmp_path / "other"
+    other.mkdir()
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(bad))
+    assert claude_code.preflight({"cwd": str(other)})  # the session has since moved; the project is still the project
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(other))
+    assert claude_code.preflight({"cwd": str(bad)}) is None
+
+
 def test_the_gate_check_applies_the_preflight(tmp_path, monkeypatch):
     from ws import gate
 
@@ -439,7 +574,9 @@ def test_the_opencode_shim_sends_the_session_and_resolved_workdir_and_can_claim(
     shim = files[opencode.PLUGIN]
     assert "session_id: input.sessionID" in shim
     assert 'resolve(directory ?? process.cwd(), output.args?.workdir ?? ".")' in shim  # bash runs in args.workdir
-    assert "r.status === 4" in shim and "WS_APPROVAL_FD" in shim and "claim ${id}" in shim
+    assert "r.status === 4" in shim and "WS_APPROVAL_FD" in shim and "claim ${id} ${nonce}" in shim
+    assert "randomUUID()" in shim and "ok ${nonce}" in shim  # a fresh nonce per request, echoed in the answer
+    assert "bun:ffi" in shim and "fcntl" in shim  # the descriptor is marked close-on-exec
     assert "ws gate launch --runner opencode -- opencode" in opencode.launch_hint(str(tmp_path))
 
 

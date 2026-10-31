@@ -108,6 +108,13 @@ jobs:
           node-version: "24"
       - name: install the runners (versions released at least 7 days before pinning, 31 Oct 2026)
         run: npm install --global @anthropic-ai/claude-code@2.1.308 opencode-ai@1.19.4
+      # The generated Claude Code settings turn its sandbox on with failIfUnavailable, so `ws run` on claude needs the
+      # same tools as the gate job (a run ends in error without them: that is the fail-closed behaviour, not a bug).
+      - name: install the sandbox tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bubblewrap socat
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: the run record validates and is complete on Claude Code (bare) and OpenCode
         env:
           WS_E2E_REQUIRE: "1" # a missing runner fails the job instead of skipping

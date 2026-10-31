@@ -25,6 +25,7 @@ import socket
 import subprocess
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -54,8 +55,12 @@ def launch(tmp_path, script: str, *flags: str, env: dict | None = None, cwd=None
     e = gr.base_env(tmp_path)
     e.update(env or {})
     cmd = [*sb.WALL, *flags, "--", "bash", "-c", script]
+    project = (
+        cwd or tmp_path / "work"
+    )  # the wall leaves the folder it starts in writable, so not the home folder or above
+    project.mkdir(exist_ok=True)
     return subprocess.run(
-        cmd, env=e, cwd=cwd or tmp_path, capture_output=True, text=True, timeout=120, check=False, stdin=stdin
+        cmd, env=e, cwd=project, capture_output=True, text=True, timeout=120, check=False, stdin=stdin
     )
 
 
@@ -224,18 +229,42 @@ def test_the_wall_refuses_tiocsti_on_the_persons_terminal(tmp_path, wshome):
 # --- parent rename -------------------------------------------------------------------------------------------------
 
 
-def test_a_protected_folders_parent_cannot_be_renamed_and_replaced(tmp_path):
-    cfg = tmp_path / "cfg"
+@pytest.mark.parametrize("inside_project", [True, False])
+def test_a_protected_folders_parent_cannot_be_renamed_and_replaced(tmp_path, inside_project):
+    """Inside the project folder the parent is made a mount point (EBUSY); outside it everything is read-only anyway."""
+    base = tmp_path / "work" if inside_project else tmp_path / "away"
+    cfg = base / "cfg"
     home = cfg / "ws"
     home.mkdir(parents=True)
     (home / "policy.toml").write_text(policy.default_toml())
     env = {"WS_HOME": str(home)}
-    script = f"mv {cfg} {tmp_path / 'cfg2'}; mkdir -p {home}; echo pwned > {home}/policy.toml"
+    script = f"mv {cfg} {base / 'cfg2'}; mkdir -p {home}; echo pwned > {home}/policy.toml"
     walled = launch(tmp_path, script, env=env)
     assert (home / "policy.toml").read_text() == policy.default_toml(), walled.stderr
-    assert not (tmp_path / "cfg2").exists() and "busy" in walled.stderr.lower(), walled.stderr
+    assert not (base / "cfg2").exists(), walled.stderr
+    assert ("busy" if inside_project else "read-only") in walled.stderr.lower(), walled.stderr
     launch(tmp_path, script, "--no-sandbox", env=env)
-    assert (tmp_path / "cfg2").exists(), "control: with no wall the rename works"
+    assert (base / "cfg2").exists(), "control: with no wall the rename works"
+
+
+def test_a_protected_path_behind_a_replaceable_symlink_is_refused(tmp_path):
+    """`~/.ws -> /data/ws`: the bind lands on the target, the link stays writable, and deleting it plants a policy where
+    the hook's fixed path points. The launch refuses, and names the real path."""
+    real = tmp_path / "data" / "ws"
+    real.mkdir(parents=True)
+    (real / "policy.toml").write_text(policy.default_toml())
+    link = tmp_path / "work" / "ws-link"
+    (tmp_path / "work").mkdir()
+    link.symlink_to(real)
+    walled = launch(tmp_path, "echo started", env={"WS_HOME": str(link)})
+    assert "started" not in walled.stdout and "symbolic link" in walled.stderr and str(real) in walled.stderr
+    bare = launch(
+        tmp_path,
+        f"rm {link}; mkdir {link}; echo pwned > {link}/policy.toml",
+        "--no-sandbox",
+        env={"WS_HOME": str(link)},
+    )
+    assert (link / "policy.toml").read_text() == "pwned\n", bare.stderr  # control: the attack works without the wall
 
 
 def test_a_generated_folder_outside_ws_home_is_held_too(tmp_path, wshome):
@@ -246,6 +275,83 @@ def test_a_generated_folder_outside_ws_home_is_held_too(tmp_path, wshome):
     script = f"mv {tmp_path / 'elsewhere'} {tmp_path / 'gone'}; mkdir -p {out}; echo '{{}}' > {out}/opencode.json"
     walled = launch(tmp_path, script, env=env)
     assert not (tmp_path / "gone").exists(), walled.stderr
+
+
+# --- the write allow-list --------------------------------------------------------------------------------------------
+
+
+OUTSIDE = [
+    "~/.bashrc",
+    "~/.profile",
+    "~/.local/bin/evil",
+    "~/.config/systemd/user/evil.service",
+    "~/.config/opencode/plugins/evil.js",
+    "{package}/evil.py",
+    "{work}/.git/hooks/pre-commit",
+    "{work}/.git/config",
+    "{work}/.claude/settings.json",
+    "{work}/.opencode/plugins/evil.js",
+]
+
+
+@pytest.mark.parametrize("target", OUTSIDE)
+def test_the_wall_writes_only_the_project_and_the_runners_own_folders(tmp_path, wshome, target):
+    """Everything not on the allow-list is read-only: shell start-up files, ~/.local/bin, systemd user units, ws's own
+    installed source, and inside the project the git hooks and the runner's config."""
+    import ws
+
+    work = tmp_path / "work"
+    work.mkdir()
+    for d in (".gi" + "t/hooks", ".claude", ".opencode/plugins"):
+        (work / d).mkdir(parents=True)
+    (work / ".git" / "config").write_text("[core]\n")
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    (home / ".bashrc").write_text("# mine\n")
+    for d in (".local/bin", ".config/systemd/user", ".config/opencode/plugins"):
+        (home / d).mkdir(parents=True, exist_ok=True)
+    path = (
+        target.replace("~", str(home)).replace("{work}", str(work)).replace("{package}", str(Path(ws.__file__).parent))
+    )
+    script = f"echo planted >> {path}"
+    walled = launch(tmp_path, script)
+    assert "planted" not in (Path(path).read_text() if Path(path).exists() else ""), walled.stderr
+    assert "read-only" in walled.stderr.lower() or "not permitted" in walled.stderr.lower(), walled.stderr
+    launch(tmp_path, script, "--no-sandbox")
+    try:
+        assert "planted" in Path(path).read_text(), "control: with no wall the append works"
+    finally:
+        if path.endswith("evil.py"):  # in the real package folder: do not leave it there
+            Path(path).unlink(missing_ok=True)
+
+
+def test_normal_work_in_the_project_and_the_private_tmp_still_works(tmp_path, wshome):
+    work = tmp_path / "work"
+    work.mkdir()
+    script = (
+        "echo a > a.txt && mkdir -p sub && echo b > sub/b.txt && mv a.txt c.txt && rm sub/b.txt "
+        '&& f=$(mktemp) && echo t > $f && echo "$TMPDIR" > tmpdir.txt && git init -q . && git add c.txt'
+    )
+    walled = launch(tmp_path, script)
+    assert (work / "c.txt").read_text() == "a\n" and not (work / "sub" / "b.txt").exists(), walled.stderr
+    assert (work / "tmpdir.txt").read_text().strip().startswith("/tmp/ws-wall-"), walled.stderr
+    assert not Path((work / "tmpdir.txt").read_text().strip()).exists()  # the private tmp is gone after the run
+
+
+def test_the_home_folder_or_above_is_not_a_project_folder(tmp_path, wshome):
+    walled = launch(tmp_path, "touch x", cwd=tmp_path / "home")
+    assert "project folder" in walled.stderr and not (tmp_path / "home" / "x").exists()
+    assert "project folder" in launch(tmp_path, "touch x", cwd=tmp_path).stderr
+
+
+def test_allow_write_adds_a_folder(tmp_path, wshome):
+    extra = tmp_path / "extra"
+    extra.mkdir()
+    script = f"echo ok > {extra}/f"
+    launch(tmp_path, script)
+    assert not (extra / "f").exists()
+    launch(tmp_path, script, "--allow-write", str(extra))
+    assert (extra / "f").read_text() == "ok\n"
 
 
 # --- the generated OpenCode folder ---------------------------------------------------------------------------------
@@ -380,3 +486,29 @@ def test_the_hook_denies_a_folder_whose_settings_open_the_sandbox(tmp_path, wsho
     stub, _, _ = gr.claude_go(tmp_path, work, "hook", [Call("Bash", {"command": f"touch {work / 'CONTROL'}"})])
     assert not (work / "CONTROL").exists(), "the command ran from a folder with sandbox-opening settings"
     assert any("excludedCommands" in r for r in stub.tool_results()), stub.tool_results()
+
+
+def test_the_approval_descriptor_is_not_inherited_by_the_models_shell_commands(tmp_path, wshome, work):
+    """The shim marks WS_APPROVAL_FD close-on-exec when the plugin loads (bun:ffi), so `bash` and everything it starts
+    holds no socket to the launcher. With the plugin and the permission rules on, in the wall."""
+    out = gr.generate(tmp_path, "opencode")
+    call = Call("bash", {"command": "ls -l /proc/self/fd > " + str(work / "fds.txt"), "description": "x"})
+    with OpenAIStub([call]) as stub:
+        proc = gr.opencode_run(tmp_path, stub, out, work, wrap=[*sb.WALL, "--"])
+    fds = (work / "fds.txt").read_text()
+    inherited = [ln for ln in fds.splitlines() if "socket:" in ln and int(ln.split(" -> ")[0].split()[-1]) >= 3]
+    assert not inherited, f"a shell command inherited the claim socket:\n{fds}\n{gr.where(proc)}"
+
+
+def test_a_settings_file_that_is_a_link_to_a_fifo_does_not_hang_the_hook(tmp_path, wshome, work):
+    """A committed `.claude/settings.json` symlinked to a FIFO would block the hook's read until it timed out, and a hook
+    failure other than exit 2 lets the call through. It is a deny, fast."""
+    (work / ".claude").mkdir()
+    fifo = tmp_path / "fifo"
+    os.mkfifo(fifo)
+    (work / ".claude" / "settings.json").symlink_to(fifo)
+    start = time.time()
+    stub, _, _ = gr.claude_go(tmp_path, work, "hook", [Call("Bash", {"command": f"touch {work / 'CONTROL'}"})])
+    assert time.time() - start < 90
+    assert not (work / "CONTROL").exists()
+    assert any("not a plain readable settings file" in r for r in stub.tool_results()), stub.tool_results()

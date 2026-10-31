@@ -37,8 +37,36 @@ _TOOLS = {"web_fetch": "webfetch", "web_search": "websearch"}
 # For ws.sandbox: the env var that names the generated folder. The whole folder is read-only in the wall (OpenCode loads
 # plugin/, tool/, agent/, command/ and opencode.jsonc from it, so a planted file there would outlive the session).
 CONFIG_DIR_ENV = "OPENCODE_CONFIG_DIR"
+
+
 # OpenCode writes this file into its config folder at start and will not run if it cannot (1.19.4). Written here at
 # generate time, with the content OpenCode writes, so the folder can stay read-only; it needs no node_modules.
+def wall_writable(env: dict) -> list[str]:
+    """The folders OpenCode itself writes (its database and logs, key-value state, model and package cache), which the
+    wall leaves writable besides the project: the `opencode` folder under XDG data, state and cache."""
+    home = env.get("HOME") or str(Path.home())
+    return [
+        f"{env.get(var) or f'{home}/{default}'}/opencode"
+        for var, default in (
+            ("XDG_DATA_HOME", ".local/share"),
+            ("XDG_STATE_HOME", ".local/state"),
+            ("XDG_CACHE_HOME", ".cache"),
+        )
+    ]
+
+
+def wall_prepare(env: dict) -> None:
+    """What OpenCode makes at start in its global config folder, and fails (EROFS) if it cannot: the folder and its
+    `.gitignore` (it keeps one in every config folder). Done by the launcher, outside the wall, where the folder is
+    writable; inside it stays read-only, so a session cannot plant a global plugin."""
+    home = env.get("HOME") or str(Path.home())
+    folder = Path(f"{env.get('XDG_CONFIG_HOME') or f'{home}/.config'}/opencode")
+    folder.mkdir(parents=True, exist_ok=True)
+    ignore = folder / IGNORE
+    if not ignore.exists():
+        ignore.write_text(IGNORE_TEXT, encoding="utf-8")
+
+
 IGNORE = ".gitignore"
 IGNORE_TEXT = "node_modules\npackage.json\npackage-lock.json\nbun.lock\n.gitignore"
 _NEUTRAL = {v: k for k, v in _TOOLS.items()}

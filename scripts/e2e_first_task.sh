@@ -195,7 +195,32 @@ PY
 
 list_home() { find "$HOME" \( -type f -o -type l -o -type d \) | sed "s|^$HOME|~|" | sort; }
 
-do_install() { bash "$SRC/install.sh" --from "$SRC"; }
+# WS_E2E_INSTALL=release installs the published release the way a person does: install.sh with no --from (the latest
+# release, checked against its .sha256 and cosign bundle), or WS_E2E_TAG for that tag; WS_E2E_EXPECT names the tag the
+# install must report (default WS_E2E_TAG). Then `ws version --json` must say
+# it came from the release, at that version. The default installs this checkout (--from).
+do_install() {
+    if [ "${WS_E2E_INSTALL:-checkout}" != "release" ]; then
+        bash "$SRC/install.sh" --from "$SRC"
+        return
+    fi
+    if [ -n "${WS_E2E_TAG:-}" ]; then
+        bash "$SRC/install.sh" --version "$WS_E2E_TAG" || return 1
+    else
+        bash "$SRC/install.sh" || return 1
+    fi
+    local vj
+    vj="$(ws version --json)" || return 1
+    printf '%s\n' "$vj"
+    WS_VJ="$vj" python3 - "${WS_E2E_EXPECT:-${WS_E2E_TAG:-}}" <<'PY2'
+import json, os, sys
+d = json.loads(os.environ["WS_VJ"])["data"]
+assert d["install_source"] == "release", d
+assert d["dirty"] is False, d
+if sys.argv[1]:
+    assert "v" + d["version"] == sys.argv[1], d
+PY2
+}
 
 find_python() {
     # the interpreter ws was installed with: the first line of the `ws` script

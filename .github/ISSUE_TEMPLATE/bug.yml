@@ -1,0 +1,48 @@
+name: Bug report
+description: Something does not work the way the docs say it should.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Do not paste API keys, tokens, private prompts or session transcripts.
+        For a security problem, use [private reporting](https://github.com/Michael-A-Fry/ws/security/advisories/new) instead.
+  - type: textarea
+    id: version
+    attributes:
+      label: ws version
+      description: The output of `ws version --json`.
+      render: json
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: ws doctor
+      description: The output of `ws doctor --json`.
+      render: json
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The commands you ran, in order, and the OS and shell you ran them in.
+      placeholder: |
+        1. ws init
+        2. ws ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened
+      description: Include the exact message and exit code.
+    validations:
+      required: true

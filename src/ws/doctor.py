@@ -106,12 +106,41 @@ def _secrets(cfg, osi, env, network):
     return OK, f"ws-secret: store owned by {wsecrets.owner_name(owner)}, broker answering"
 
 
-def _dir_role(cfg, osi, env, network):
+def _folder(cfg: dict) -> tuple[Path | None, tuple[str, str] | None]:
     p = cfg.get("path")
     if not isinstance(p, str) or not p:
-        return FAIL, "no path set"
+        return None, (FAIL, "no path set")
     d = Path(p).expanduser()
-    return (OK, f"{d}") if d.is_dir() else (FAIL, f"{d} is not a folder")
+    return (d, None) if d.is_dir() else (None, (FAIL, f"{d} is not a folder"))
+
+
+def _memory(cfg, osi, env, network):
+    from ws import memory
+
+    d, bad = _folder(cfg)
+    if bad:
+        p = cfg.get("path")
+        missing = isinstance(p, str) and p and not Path(p).expanduser().exists()
+        return (bad[0], f"{bad[1]}: `ws memory init` makes it") if missing else bad
+    if not memory.is_repo(d):
+        return WARN, f"{d} is not in git: run `ws memory init`"
+    built, detail = memory.check_index(d)
+    return (OK, f"{d}: git repo; {detail}") if built else (FAIL, f"{d}: {detail}")
+
+
+def _notes(cfg, osi, env, network):
+    d, bad = _folder(cfg)
+    if bad:
+        return bad
+    inbox = d / "_inbox"
+    if inbox.exists():
+        if not inbox.is_dir():
+            return FAIL, f"{inbox} exists but is not a folder"
+        if not os.access(inbox, os.W_OK | os.X_OK):
+            return FAIL, f"{inbox} is not writable"
+    elif not os.access(d, os.W_OK | os.X_OK):
+        return FAIL, f"{d} is not writable, so ws cannot make _inbox"
+    return OK, f"{d}"
 
 
 def _scheduler(cfg, osi, env, network):
@@ -153,8 +182,8 @@ ROLES = (
     Role("WS102", "model", "the model each job uses by default", 'default = "<model id>"', _model),
     Role("WS103", "budget", "your own monthly spend cap", "monthly_cap_usd = 20", _budget),
     Role("WS104", "secrets", "where keys live; agents never see them", 'adapter = "ws-secret"', _secrets),
-    Role("WS105", "memory", "the Markdown folder ws remembers in", 'path = "~/ws-memory"', _dir_role),
-    Role("WS106", "notes", "your notes folder (any app)", 'path = "~/Notes"', _dir_role),
+    Role("WS105", "memory", "the Markdown folder ws remembers in", 'path = "~/ws-memory"', _memory),
+    Role("WS106", "notes", "your notes folder (any app)", 'path = "~/Notes"', _notes),
     Role("WS107", "scheduler", "runs jobs on a timer", 'adapter = "systemd"', _scheduler),
     Role("WS108", "notify", "how ws reaches you", 'adapter = "none"', _notify),
     Role("WS109", "backup", "proves your files can come back", 'adapter = "restic"', _backup),

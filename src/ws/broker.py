@@ -641,6 +641,9 @@ def _unix_server(broker: Broker) -> socketserver.BaseServer:
             if not self.broker._slots.acquire(blocking=False):
                 with contextlib.suppress(OSError):
                     request.settimeout(1)
+                    request.recv(
+                        MAX_LINE
+                    )  # read what the client sent first: closing on unread data can reset the reply away
                     request.sendall(json.dumps(_refuse("busy", "too many connections")).encode() + b"\n")
                 self.shutdown_request(request)
                 return
@@ -675,6 +678,7 @@ class _ProxyServer(ThreadingHTTPServer):
         if not self._slots.acquire(blocking=False):
             with contextlib.suppress(OSError):
                 request.settimeout(1)
+                request.recv(MAX_LINE)
                 request.sendall(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
             self.shutdown_request(request)
             return

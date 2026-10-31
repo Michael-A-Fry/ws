@@ -12,7 +12,7 @@ ws is pre-1.0. Fixes go into the latest release and `main`. Older releases aren'
 Don't open a public issue for a vulnerability. Use GitHub's private vulnerability reporting instead:
 
 1. Open the [Security tab](https://github.com/Michael-A-Fry/ws/security) of the repository.
-2. Choose "Report a vulnerability". The [direct link](https://github.com/Michael-A-Fry/ws/security/advisories/new)
+2. Choose **Report a vulnerability**. The [direct link](https://github.com/Michael-A-Fry/ws/security/advisories/new)
    opens the same form.
 3. Fill it in with the details below and submit it.
 

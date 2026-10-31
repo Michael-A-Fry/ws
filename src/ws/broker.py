@@ -348,7 +348,8 @@ class Broker:
         allow_plain_http: bool = False,
     ):
         env = os.environ if env is None else env
-        sock = Path(socket_file).expanduser() if socket_file else ws_home(env) / "run" / "broker.sock"
+        # --socket wins; else what clients use: $WS_BROKER_SOCKET, [roles.secrets] socket, $WS_HOME/run/broker.sock
+        sock = Path(socket_file).expanduser() if socket_file else wsecrets.socket_path(env)
         return cls(
             sock,
             wsecrets.registry_path(env),
@@ -978,7 +979,11 @@ def register(sub) -> None:
     b = sub.add_parser("broker", help="the secrets broker: agents ask it to use a key and never see the value")
     bsub = b.add_subparsers(dest="broker_command", required=True)
     p = bsub.add_parser("serve", help="run the broker (a Unix socket and a loopback lease proxy)")
-    p.add_argument("--socket", metavar="PATH", help="default $WS_HOME/run/broker.sock")
+    p.add_argument(
+        "--socket",
+        metavar="PATH",
+        help="default $WS_BROKER_SOCKET, else [roles.secrets] socket in the profile, else $WS_HOME/run/broker.sock",
+    )
     p.add_argument("--group", metavar="GROUP", help="also serve members of this group (socket folder becomes 0750)")
     p.add_argument("--port", type=int, default=0, help="lease proxy port on 127.0.0.1 (default: any free one)")
     p.add_argument(

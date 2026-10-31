@@ -214,9 +214,14 @@ def test_list_says_when_the_store_belongs_to_someone_else(home, capsys, monkeypa
     assert code == 0 and "unknown" in out and "another user" in out
 
 
+def linux_wall(monkeypatch, python=("/usr/bin/python3", "")):
+    monkeypatch.setattr(osinfo, "detect", lambda: osinfo.OSInfo("linux", "ubuntu 24.04", "x86_64", "systemd", True))
+    monkeypatch.setattr(wsecrets, "trusted_python", lambda: python)
+
+
 def test_wall_prints_the_sudo_steps_on_linux(home, capsys, monkeypatch):
     registry(home, GOOD)
-    monkeypatch.setattr(osinfo, "detect", lambda: osinfo.OSInfo("linux", "ubuntu 24.04", "x86_64", "systemd", True))
+    linux_wall(monkeypatch)
     code, out, _ = run(capsys, "secret", "wall")
     assert code == 0
     for want in (
@@ -227,9 +232,127 @@ def test_wall_prints_the_sudo_steps_on_linux(home, capsys, monkeypatch):
         "broker serve",
         "0700",
         "install -o root",
+        "ExecStart=/opt/ws/bin/ws",  # the broker runs the root-owned copy, never the user's ws
+        "install -d -o root -g root -m 0755 /opt/ws",
+        "find ws -type f -name '*.py'",  # regular files only
     ):
         assert want in out
     assert str(home / "secrets.toml") in out and VALUE not in out
+
+
+def test_wall_never_moves_old_values_and_says_to_rotate_them(home, capsys, monkeypatch):
+    registry(home, GOOD)
+    wsecrets.Store(home / "secrets").write("anthropic", VALUE)
+    linux_wall(monkeypatch)
+    code, out, _ = run(capsys, "secret", "wall")
+    assert code == 0 and VALUE not in out
+    assert "mv " not in out and "sh -c" not in out and "chown -R" not in out
+    assert "readable by everything that ran as" in out and "revoke the old one" in out
+    for name in ("anthropic", "github"):  # one paste command per registered name, with the broker user's WS_HOME
+        assert f"sudo -u ws-broker env WS_HOME=/var/lib/ws-broker /opt/ws/bin/ws secret set {name}" in out
+    assert f"rm -r {home / 'secrets'}" in out
+
+
+def test_wall_quotes_every_path_from_the_users_side(tmp_path, capsys, monkeypatch):
+    import shlex
+
+    evil = tmp_path / "a b;$(touch x)'q"
+    evil.mkdir()
+    monkeypatch.setenv("WS_HOME", str(evil))
+    registry(evil, GOOD)
+    linux_wall(monkeypatch)
+    code, out, _ = run(capsys, "secret", "wall")
+    assert code == 0
+    assert shlex.quote(str(evil / "secrets.toml")) in out
+    assert shlex.quote(str(evil / "secrets")) in out
+    assert str(evil / "secrets.toml") not in out.replace(shlex.quote(str(evil / "secrets.toml")), "")
+    pkg_parent = str(Path(wsecrets.__file__).resolve().parent.parent)
+    assert f"(cd {shlex.quote(pkg_parent)} && find ws" in out
+
+
+def test_wall_takes_the_user_from_the_account_database_not_the_environment(home, capsys, monkeypatch):
+    import pwd
+
+    registry(home, GOOD)
+    linux_wall(monkeypatch)
+    monkeypatch.setenv("USER", "someone-else")
+    monkeypatch.setenv("LOGNAME", "someone-else")
+    code, out, _ = run(capsys, "secret", "wall")
+    me = pwd.getpwuid(os.getuid()).pw_name
+    assert code == 0 and f"usermod -aG ws-clients {me}" in out and "someone-else" not in out
+
+
+def test_wall_refuses_without_a_root_owned_python_and_prints_no_commands(home, capsys, monkeypatch):
+    registry(home, GOOD)
+    linux_wall(monkeypatch, python=(None, "/usr/bin is not root's"))
+    code, out, err = run(capsys, "secret", "wall")
+    assert code == 1 and out == "" and "only root can change" in err and "/usr/bin is not root's" in err
+
+
+def test_wall_refuses_to_run_as_root(home, capsys, monkeypatch):
+    linux_wall(monkeypatch)
+    monkeypatch.setattr(os, "getuid", lambda: 0)
+    code, out, err = run(capsys, "secret", "wall")
+    assert code == 1 and out == "" and "normal user" in err
+
+
+def fake_ownership(monkeypatch, uid=0, strip=0o022):
+    """Make every stat look root-owned (and optionally not group/other-writable), so the root-only check can be tested."""
+    real_stat, real_lstat = Path.stat, Path.lstat
+
+    def wrap(fn):
+        def inner(self, *a, **k):
+            st = fn(self, *a, **k)
+            f = list(st)
+            f[4] = uid
+            f[0] = st.st_mode & ~strip
+            return os.stat_result(f)
+
+        return inner
+
+    monkeypatch.setattr(Path, "stat", wrap(real_stat))
+    monkeypatch.setattr(Path, "lstat", wrap(real_lstat))
+
+
+def test_untrusted_reason_names_the_owner_and_the_writable_folder(tmp_path):
+    if os.geteuid() == 0:
+        pytest.skip("running as root")
+    assert "not root" in wsecrets.untrusted_reason(tmp_path)
+
+
+def test_untrusted_reason_passes_a_root_owned_closed_tree(tmp_path, monkeypatch):
+    (tmp_path / "ws").mkdir()
+    (tmp_path / "ws" / "a.py").write_text("x = 1\n")
+    fake_ownership(monkeypatch)
+    assert wsecrets.untrusted_reason(tmp_path / "ws", tree=True) is None
+
+
+def test_untrusted_reason_catches_group_writable_and_symlinks(tmp_path, monkeypatch):
+    (tmp_path / "ws").mkdir()
+    (tmp_path / "ws" / "a.py").write_text("x = 1\n")
+    fake_ownership(
+        monkeypatch, strip=0
+    )  # root-owned, modes as they are on disk (a tmp folder is writable by its owner only)
+    tmp_path.chmod(0o775)
+    assert "other than root" in wsecrets.untrusted_reason(tmp_path / "ws")
+    tmp_path.chmod(0o755)
+    (tmp_path / "ws" / "link.py").symlink_to(tmp_path / "ws" / "a.py")
+    fake_ownership(monkeypatch)
+    assert "symlink" in wsecrets.untrusted_reason(tmp_path / "ws", tree=True)
+
+
+def test_set_and_rm_hints_keep_ws_home(home, capsys, monkeypatch):
+    registry(home, GOOD)
+
+    def deny(self, *a):
+        raise PermissionError
+
+    monkeypatch.setattr(wsecrets.Store, "write", deny)
+    monkeypatch.setattr(wsecrets.Store, "delete", deny)
+    code, _, err = run(capsys, "secret", "set", "anthropic", stdin=VALUE, monkeypatch=monkeypatch)
+    assert code == 1 and "sudo -u ws-broker env WS_HOME=/var/lib/ws-broker /opt/ws/bin/ws secret set anthropic" in err
+    code, _, err = run(capsys, "secret", "rm", "anthropic")
+    assert code == 1 and "sudo -u ws-broker env WS_HOME=/var/lib/ws-broker /opt/ws/bin/ws secret rm anthropic" in err
 
 
 @pytest.mark.parametrize("kind", ["macos", "wsl"])
@@ -311,9 +434,16 @@ def test_ws104_ok_when_the_store_is_another_users_and_the_broker_answers(home, m
         raise PermissionError
 
     monkeypatch.setattr(wsecrets, "health", walled)
-    monkeypatch.setattr(broker, "status", lambda sock, **k: {"problems": [], "store_owner_uid": os.geteuid() + 1})
+    answer = {"problems": [], "store_owner_uid": os.geteuid() + 1, "code_problem": ""}
+    monkeypatch.setattr(broker, "status", lambda sock, **k: answer)
     status, detail = ws104(home)
     assert status == "ok" and "broker answering" in detail
+    # a walled store is not enough if the broker runs code that another user can edit
+    answer = {**answer, "code_problem": "/home/x/ws is owned by x, not root"}
+    status, detail = ws104(home)
+    assert status == "warn" and "not locked down" in detail and "owned by x" in detail
+    answer = {k: v for k, v in answer.items() if k != "code_problem"}
+    assert ws104(home)[0] == "warn"
     monkeypatch.setattr(
         broker, "status", lambda sock, **k: {"problems": ["x mode is 0644, not 0600"], "store_owner_uid": 5}
     )

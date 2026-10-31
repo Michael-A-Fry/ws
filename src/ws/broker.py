@@ -67,7 +67,7 @@ CONN_DEADLINE_S = 30.0
 MAX_LINE = 65536
 MAX_BODY = 64 * 1024 * 1024
 UPSTREAM_TIMEOUT_S = 300
-TEST_HTTP_ENV = "WS_BROKER_TEST_HTTP_UPSTREAM"
+MAX_PROXY_CONNECTIONS = 64
 
 # headers that can carry a credential: dropped from the tool's request before the real one is added
 STRIP_REQUEST = {
@@ -91,6 +91,7 @@ HOP_BY_HOP = {
     "content-length",
     "expect",
 }
+CHUNK_SIZE_RE = re.compile(rb"^[0-9a-fA-F]{1,8}$")
 TOKEN_RE = re.compile(r"^/l/([A-Za-z0-9_-]{43})(/.*)?$")
 
 
@@ -278,6 +279,7 @@ class Broker:
         max_ttl_s: float = DEFAULT_TTL_S,
         port: int = 0,
         clock=time.time,
+        allow_plain_http: bool = False,
     ):
         self.socket_path = Path(socket_path)
         self.registry = registry
@@ -286,6 +288,7 @@ class Broker:
         self.audit = Audit(log_path)
         self.max_ttl_s = max_ttl_s
         self.clock = clock
+        self.allow_plain_http = allow_plain_http  # tests only: http to 127.0.0.1; the command line has no switch for it
         self.own_uid = os.geteuid()
         self._port = port
         self._grants: dict[str, _Grant] = {}  # sha256(token) -> grant
@@ -296,7 +299,15 @@ class Broker:
         self._stopped = threading.Event()
 
     @classmethod
-    def from_env(cls, socket_file: str | None, group: str | None, port: int, ttl: float, env: dict | None = None):
+    def from_env(
+        cls,
+        socket_file: str | None,
+        group: str | None,
+        port: int,
+        ttl: float,
+        env: dict | None = None,
+        allow_plain_http: bool = False,
+    ):
         env = os.environ if env is None else env
         sock = Path(socket_file).expanduser() if socket_file else ws_home(env) / "run" / "broker.sock"
         return cls(
@@ -307,6 +318,7 @@ class Broker:
             log_path=ws_home(env) / "logs" / "broker.jsonl",
             max_ttl_s=ttl,
             port=port,
+            allow_plain_http=allow_plain_http,
         )
 
     # -- lifecycle
@@ -363,13 +375,17 @@ class Broker:
             d.mkdir(mode=want, parents=True)
             d.chmod(want)  # past the umask
         st = d.stat()
-        if st.st_uid == self.own_uid and gid is not None and st.st_gid != gid:
+        # a folder that was already there is never chmod-ed (it might be a home folder): it must already be right
+        if st.st_uid != self.own_uid:
+            raise BrokerError(f"{d} must belong to the broker's user, or someone else could swap the socket")
+        if gid is not None and st.st_gid != gid:
             os.chown(d, -1, gid)
-        # a folder that was already there is never chmod-ed (it might be a home folder): it must already be private
         if self.group and st.st_mode & 0o050 != 0o050:
             raise BrokerError(f"{d} must be readable and enterable by group {self.group} (mode 0750)")
-        if st.st_mode & 0o007 or (not self.group and st.st_mode & 0o077):
-            raise BrokerError(f"{d} is open to other users; use a private folder for the socket (mode 0700)")
+        if st.st_mode & (0o027 if self.group else 0o077):
+            raise BrokerError(
+                f"{d} can be changed or entered by other users; use a private folder (0700, or 0750 with a group)"
+            )
         self._clear_stale_socket()
         old = os.umask(0o117 if self.group else 0o177)
         try:
@@ -540,6 +556,7 @@ class Broker:
             "leases": n,
             "store_owner_uid": owner,
             "problems": problems,
+            "code_problem": code_problem(),
         }
 
     def _purge(self, now: float) -> None:
@@ -575,6 +592,12 @@ class Broker:
         except wsecrets.SecretsError as e:
             raise _HttpError(503, "store_unreadable") from e
         return entry.header, entry.format.replace("{value}", value)
+
+
+def code_problem() -> str:
+    """Why the code this broker runs could be edited by a non-root user ("" if it cannot). Walled brokers must be clean."""
+    pkg = Path(__file__).resolve().parent
+    return wsecrets.untrusted_reason(sys.executable) or wsecrets.untrusted_reason(pkg, tree=True) or ""
 
 
 def _key(token: str) -> str:
@@ -645,7 +668,23 @@ class _ProxyServer(ThreadingHTTPServer):
 
     def __init__(self, addr, handler, broker: Broker):
         self.broker = broker
+        self._slots = threading.BoundedSemaphore(MAX_PROXY_CONNECTIONS)
         super().__init__(addr, handler)
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            with contextlib.suppress(OSError):
+                request.settimeout(1)
+                request.sendall(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            self.shutdown_request(request)
+            return
+        super().process_request(request, client_address)
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
 
     def server_bind(self):
         # HTTPServer.server_bind asks DNS for the host's full name, which can stall for many seconds (seen on macOS)
@@ -714,32 +753,47 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         return out
 
     def _read_body(self) -> bytes | None:
+        """The request body, or None if it has none. A bad size or a short body is a 400, never a truncated forward."""
+        if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+            out = bytearray()
+            while True:
+                line = self.rfile.readline(1024)
+                if not line.endswith(b"\n"):
+                    raise _HttpError(400, "bad_request")
+                size_text = line.split(b";")[0].strip()
+                if not CHUNK_SIZE_RE.match(size_text):
+                    raise _HttpError(400, "bad_request")
+                size = int(size_text, 16)
+                if size == 0:
+                    while (trailer := self.rfile.readline(1024)) not in (b"\r\n", b"\n"):
+                        if not trailer.endswith(b"\n"):
+                            raise _HttpError(400, "bad_request")
+                    return bytes(out)
+                if len(out) + size > MAX_BODY:
+                    raise _HttpError(413, "too_large")
+                data = self.rfile.read(size)
+                if len(data) != size or self.rfile.read(2) != b"\r\n":
+                    raise _HttpError(400, "bad_request")
+                out += data
+        cl = self.headers.get("Content-Length")
+        if cl is None:
+            return None
         try:
-            if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
-                out = bytearray()
-                while True:
-                    size = int((self.rfile.readline(1024).split(b";")[0].strip() or b"0"), 16)
-                    if size == 0:
-                        while self.rfile.readline(1024) not in (b"\r\n", b"\n", b""):
-                            pass
-                        return bytes(out)
-                    out += self.rfile.read(size)
-                    self.rfile.read(2)
-                    if len(out) > MAX_BODY:
-                        raise _HttpError(413, "too_large")
-            cl = self.headers.get("Content-Length")
-            if cl is None:
-                return None
             n = int(cl)
         except ValueError as e:
             raise _HttpError(400, "bad_request") from e
-        if n < 0 or n > MAX_BODY:
+        if n < 0:
+            raise _HttpError(400, "bad_request")
+        if n > MAX_BODY:
             raise _HttpError(413, "too_large")
-        return self.rfile.read(n)
+        data = self.rfile.read(n)
+        if len(data) != n:
+            raise _HttpError(400, "bad_request")
+        return data
 
     def _relay(self, grant: _Grant, target: str, body: bytes | None, headers: dict[str, str]) -> tuple[int, int]:
         hostname, _, port = grant.host.partition(":")
-        plain = os.environ.get(TEST_HTTP_ENV) == "1" and hostname == "127.0.0.1"
+        plain = self.server.broker.allow_plain_http and hostname == "127.0.0.1"
         if plain:
             conn: http.client.HTTPConnection = http.client.HTTPConnection(
                 hostname, int(port or 80), timeout=UPSTREAM_TIMEOUT_S

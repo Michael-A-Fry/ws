@@ -19,8 +19,9 @@ import getpass
 import json
 import os
 import re
-import shutil
+import shlex
 import stat
+import subprocess
 import sys
 import tomllib
 from dataclasses import dataclass, field
@@ -37,6 +38,9 @@ WALL_USER = "ws-broker"
 WALL_GROUP = "ws-clients"
 WALL_HOME = "/var/lib/ws-broker"
 WALL_SOCKET = "/run/ws-broker/broker.sock"
+WALL_BIN = "/opt/ws/bin/ws"  # a root-owned launcher: the broker never runs code a normal user can write
+WALL_LIB = "/opt/ws/lib"
+SAFE_PATH = re.compile(r"^[A-Za-z0-9_./+-]+$")
 
 
 class SecretsError(Exception):
@@ -313,7 +317,7 @@ def cmd_set(args: argparse.Namespace) -> int:
     except PermissionError:
         print(
             f"ws: the store {store_dir()} belongs to another user. Set it as that user: "
-            f"`sudo -u {WALL_USER} ws secret set {args.name}`",
+            f"`{wall_hint('set', args.name)}`",
             file=sys.stderr,
         )
         return 1
@@ -350,14 +354,64 @@ def cmd_rm(args: argparse.Namespace) -> int:
         print(f"ws: {e}", file=sys.stderr)
         return 1
     except PermissionError:
-        print(f"ws: the store belongs to another user: `sudo -u {WALL_USER} ws secret rm {args.name}`", file=sys.stderr)
+        print(f"ws: the store belongs to another user: `{wall_hint('rm', args.name)}`", file=sys.stderr)
         return 1
     print(f"ws: removed {args.name}" if gone else f"ws: {args.name} was not set (0 changes)")
     return 0
 
 
-def wall_commands(user: str, registry: Path, store: Path, ws_exe: str) -> str:
-    """The one-time sudo steps that move the store to its own system user."""
+def wall_hint(verb: str, name: str) -> str:
+    """The command that changes the walled store: as the broker user, with its WS_HOME (sudo drops the environment)."""
+    return f"sudo -u {WALL_USER} env WS_HOME={WALL_HOME} {WALL_BIN} secret {verb} {shlex.quote(name)}"
+
+
+def untrusted_reason(path: str | Path, tree: bool = False) -> str | None:
+    """Why code at `path` could be changed by a non-root user, or None. Every parent of the real path must be owned by
+    root and not writable by group or others; with `tree`, so must every file and folder below it (no symlinks)."""
+    real = Path(os.path.realpath(path))
+    try:
+        for q in [real, *real.parents]:
+            st = q.stat()
+            if st.st_uid != 0:
+                return f"{q} is owned by {owner_name(st.st_uid)}, not root"
+            if st.st_mode & 0o022:
+                return f"{q} can be written by users other than root"
+        if tree and real.is_dir():
+            for dirpath, dirs, files in os.walk(real):
+                for n in [*dirs, *files]:
+                    q = Path(dirpath) / n
+                    st = q.lstat()
+                    if stat.S_ISLNK(st.st_mode):
+                        return f"{q} is a symlink"
+                    if st.st_uid != 0 or st.st_mode & 0o022:
+                        return f"{q} is not root-owned and closed to others"
+    except OSError as e:
+        return f"{real}: {type(e).__name__}"
+    return None
+
+
+def trusted_python() -> tuple[str | None, str]:
+    """A Python 3.11+ that only root can change, as (path, "") or (None, why not)."""
+    why = []
+    for cand in ("/usr/bin/python3", "/usr/local/bin/python3"):
+        real = os.path.realpath(cand)
+        if not os.path.isfile(real):
+            continue
+        bad = untrusted_reason(real) or (None if SAFE_PATH.match(real) else f"{real} has unusual characters")
+        if bad:
+            why.append(bad)
+            continue
+        ok = subprocess.run([real, "-c", "import sys; sys.exit(sys.version_info < (3, 11))"], check=False)
+        if ok.returncode == 0:
+            # keep the stable name (python3 survives a package update; python3.12 does not) if its folder is root's too
+            return (cand if untrusted_reason(os.path.dirname(cand)) is None else real), ""
+        why.append(f"{real} is older than Python 3.11")
+    return None, "; ".join(why) or "no python3 found in /usr/bin or /usr/local/bin"
+
+
+def wall_commands(user: str, registry: Path, old_store: Path, py: str, pkg_dir: Path, names: list[str]) -> str:
+    """The one-time sudo steps that move the store to its own system user. Every path from the user's side is quoted."""
+    q = shlex.quote
     unit = f"""[Unit]
 Description=ws secrets broker
 After=network.target
@@ -365,52 +419,90 @@ After=network.target
 [Service]
 User={WALL_USER}
 Group={WALL_USER}
+WorkingDirectory=/
 Environment=WS_HOME={WALL_HOME}
-ExecStart={ws_exe} broker serve --socket {WALL_SOCKET} --group {WALL_GROUP}
+ExecStart={WALL_BIN} broker serve --socket {WALL_SOCKET} --group {WALL_GROUP}
 RuntimeDirectory=ws-broker
 RuntimeDirectoryMode=0750
 Restart=on-failure
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
+ProtectHome=true
 ReadWritePaths={WALL_HOME}
 
 [Install]
 WantedBy=multi-user.target"""
-    return f"""# One-time setup: the secrets move to the system user {WALL_USER}; the broker runs as it. After this, {user} and
-# anything {user} runs (agents included) cannot read a value. They can ask the broker to use one, at its allowed hosts.
-# Needs sudo and systemd. {ws_exe} must be runnable by {WALL_USER}: if it sits under a home folder, install ws system-wide first.
+    launcher = f'#!/bin/sh\nPYTHONPATH={WALL_LIB} PYTHONDONTWRITEBYTECODE=1 exec {py} -s -m ws "$@"'
+    rotate = "\n".join(f"{wall_hint('set', n)}" for n in names)
+    return f"""# One-time setup. Secrets move to the system user {WALL_USER}, and the broker runs as it, from a copy of ws that only
+# root can change (so nothing running as {user} can edit the code that holds the keys). Needs sudo and systemd.
+# Read first: the registry below is copied as is, and it decides which hosts each key may be sent to.
+#   {q(str(registry))}
 
 sudo groupadd --system --force {WALL_GROUP}
-sudo useradd --system --home-dir {WALL_HOME} --shell /usr/sbin/nologin --create-home --groups {WALL_GROUP} {WALL_USER} \\
-  || sudo usermod -aG {WALL_GROUP} {WALL_USER}
-sudo usermod -aG {WALL_GROUP} {user}
+id {WALL_USER} >/dev/null 2>&1 || sudo useradd --system --home-dir {WALL_HOME} --no-create-home --shell /usr/sbin/nologin {WALL_USER}
+sudo usermod -aG {WALL_GROUP} {WALL_USER}
+sudo usermod -aG {WALL_GROUP} {q(user)}
+
+# ws, copied (regular .py files only) into a root-owned place, and a launcher that uses the system Python
+sudo install -d -o root -g root -m 0755 /opt/ws /opt/ws/bin {WALL_LIB}
+sudo rm -rf {WALL_LIB}/ws
+(cd {q(str(pkg_dir.parent))} && find ws -type f -name '*.py' -exec sudo install -D -o root -g root -m 0644 {{}} {WALL_LIB}/{{}} \\;)
+sudo tee {WALL_BIN} >/dev/null <<'EOF-LAUNCHER'
+{launcher}
+EOF-LAUNCHER
+sudo chown root:root {WALL_BIN}
+sudo chmod 0755 {WALL_BIN}
+
+# the store and logs belong to {WALL_USER}; the registry belongs to root so neither the broker nor an agent can add a host
 sudo install -d -o {WALL_USER} -g {WALL_USER} -m 0700 {WALL_HOME} {WALL_HOME}/secrets {WALL_HOME}/logs
-# the registry is owned by root so neither the broker nor an agent can add a host to it
-sudo install -o root -g root -m 0644 {registry} {WALL_HOME}/secrets.toml
-# move values you already set (skip if there are none), then re-check the modes
-[ -d {store} ] && sudo sh -c 'mv {store}/* {WALL_HOME}/secrets/ 2>/dev/null; chown -R {WALL_USER}:{WALL_USER} {WALL_HOME}/secrets; chmod 0600 {WALL_HOME}/secrets/*'
-sudo tee /etc/systemd/system/ws-broker.service >/dev/null <<'EOF'
+sudo install -o root -g root -m 0644 {q(str(registry))} {WALL_HOME}/secrets.toml
+
+sudo tee /etc/systemd/system/ws-broker.service >/dev/null <<'EOF-UNIT'
 {unit}
-EOF
+EOF-UNIT
 sudo systemctl daemon-reload
 sudo systemctl enable --now ws-broker
 
-# point your profile at it (the ws-secret adapter), then log out and in once so the new group applies:
+# Values in the old store ({q(str(old_store))}) were readable by everything that ran as {user}, agents included.
+# They are not moved. Make a new key at each provider, revoke the old one, then paste the new one here:
+{rotate or "# (no names are registered yet)"}
+# and delete the old store:  rm -r {q(str(old_store))}
+
+# Point your profile at the broker, then log out and in once so the new group applies:
 #   [roles.secrets]
 #   adapter = "ws-secret"
 #   store = "{WALL_HOME}/secrets"
 #   socket = "{WALL_SOCKET}"
-# if you change the registry later, run the `install -o root` line again
-# set or replace a value from now on with:  sudo -u {WALL_USER} env WS_HOME={WALL_HOME} {ws_exe} secret set NAME
-# check it:  ws doctor   (WS104 should be ok, not warn)"""
+# Registry changes later: review the file, then run the `install -o root` line above again.
+# Check it: ws doctor  (WS104 should be ok, not warn)"""
 
 
 def cmd_wall(args: argparse.Namespace) -> int:
     osi = osinfo.detect()
     if osi.kind == "linux" and osi.scheduler == "systemd":
-        exe = shutil.which("ws") or f"{sys.executable} -m ws"
-        print(wall_commands(getpass.getuser(), registry_path(), store_dir(), exe))
+        import pwd
+
+        if os.getuid() == 0:
+            print("ws: run this as your normal user, not root: it says which user to put in the group", file=sys.stderr)
+            return 1
+        py, why = trusted_python()
+        if py is None:
+            print(
+                f"ws: the broker must run on a Python that only root can change, and there is none: {why}.\n"
+                "    Install the system python3 (3.11 or newer), e.g. `sudo apt install python3`, then run this again.",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            names = sorted(load_registry(registry_path()))
+        except SecretsError as e:
+            print(f"ws: {e}", file=sys.stderr)
+            return 1
+        user = pwd.getpwuid(os.getuid()).pw_name
+        pkg_dir = Path(__file__).resolve().parent
+        print(wall_commands(user, registry_path(), store_dir(), py, pkg_dir, names))
         return 0
     why = {
         "macos": "macOS needs a _ws-broker user and a launchd job; that is not built yet",

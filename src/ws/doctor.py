@@ -99,6 +99,10 @@ def _secrets(cfg, osi, env, network):
         return WARN, f"same-user boundary: run `ws secret wall` for the one sudo step{tail}"
     if answer is None:
         return FAIL, f"store is walled but the broker is not answering: {down}"
+    cp = answer.get("code_problem")
+    if cp is None or cp:  # a broker that runs code another user can edit hands that user the keys
+        why = cp or "it did not say where it runs from"
+        return WARN, f"store is walled, but the broker's own code is not locked down: {why}"
     return OK, f"ws-secret: store owned by {wsecrets.owner_name(owner)}, broker answering"
 
 

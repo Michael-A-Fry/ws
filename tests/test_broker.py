@@ -103,8 +103,7 @@ class StubHandler(BaseHTTPRequestHandler):
 
 
 @pytest.fixture
-def stub(monkeypatch):
-    monkeypatch.setenv(broker.TEST_HTTP_ENV, "1")
+def stub():
     s = Stub()
     threading.Thread(target=s.serve_forever, args=(0.05,), daemon=True).start()
     yield s
@@ -139,6 +138,7 @@ class Env:
         )
 
     def start(self, **kw) -> broker.Broker:
+        kw.setdefault("allow_plain_http", True)  # the stub speaks plain http; the real thing never does
         self.broker = broker.Broker(
             self.sock, self.registry, self.store, log_path=self.log, clock=lambda: self.now, **kw
         ).start()
@@ -339,8 +339,8 @@ def test_streaming_passes_through_without_buffering(env):
     c.close()
 
 
-def test_plain_http_upstream_is_refused_without_the_test_switch(env, monkeypatch):
-    monkeypatch.delenv(broker.TEST_HTTP_ENV)
+def test_plain_http_upstream_is_refused_unless_the_constructor_allows_it(env):
+    env.broker.allow_plain_http = False
     status, _, data = env.call()
     assert status == 502 and json.loads(data) == {"error": "upstream_unreachable"}
     assert env.stub.seen == []
@@ -607,11 +607,13 @@ def test_a_silent_connection_is_dropped_at_the_deadline(base, stub, monkeypatch)
 
 
 def test_cli_round_trip_through_real_processes(base, stub):
-    """ws secret set -> ws broker serve -> ws broker request -> curl-style call through the proxy."""
+    """ws secret set -> ws broker serve -> ws broker request -> a call through the proxy. The command line cannot be
+    told to use plain http, so the call is refused: the stub must see nothing. (Injection is tested above, in process,
+    and across users in tests/e2e/test_secret_wall.py.)"""
     home = base / "home"
     home.mkdir(mode=0o700)
     (home / "secrets.toml").write_text(f'[anthropic]\nhosts = ["{stub.host}"]\n', encoding="utf-8")
-    envv = {**os.environ, "WS_HOME": str(home), broker.TEST_HTTP_ENV: "1"}
+    envv = {**os.environ, "WS_HOME": str(home)}
     envv.pop("WS_BROKER_SOCKET", None)
     ws = [sys.executable, "-m", "ws"]
     r = subprocess.run(
@@ -642,8 +644,8 @@ def test_cli_round_trip_through_real_processes(base, stub):
         hostport, _, prefix = lease.base_url.removeprefix("http://").partition("/")
         c = http.client.HTTPConnection(hostport, timeout=10)
         c.request("POST", f"/{prefix}/v1/messages", body=b"{}", headers={"x-api-key": "placeholder"})
-        assert c.getresponse().status == 200
-        assert stub.seen[-1]["headers"]["x-api-key"] == VALUE
+        assert c.getresponse().status == 502
+        assert stub.seen == []
         r = subprocess.run(
             [*ws, "broker", "request", "nothere", "--purpose", "run", "--host", stub.host],
             env=envv,
@@ -672,3 +674,108 @@ def test_imports_and_doctor_work_without_posix_modules():
     )
     r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=False)
     assert r.returncode == 0, r.stderr[-300:]
+
+
+# ---- request bodies, connection caps, the socket folder, the code check
+
+
+def raw_proxy(env, payload: bytes, shut_write: bool = True) -> int:
+    """Send raw bytes to the proxy under a fresh lease; the HTTP status of the reply."""
+    lease = env.lease()
+    hostport, _, prefix = lease.base_url.removeprefix("http://").partition("/")
+    host, _, port = hostport.partition(":")
+    c = socket.create_connection((host, int(port)), timeout=10)
+    c.sendall(f"POST /{prefix}/v1/x HTTP/1.1\r\nHost: x\r\n".encode() + payload)
+    if shut_write:
+        c.shutdown(socket.SHUT_WR)
+    line = c.makefile("rb").readline()
+    c.close()
+    return int(line.split()[1])
+
+
+@pytest.mark.parametrize(
+    ("payload", "want"),
+    [
+        (b"Transfer-Encoding: chunked\r\n\r\n-5\r\nabcde\r\n0\r\n\r\n", 400),  # negative size
+        (b"Transfer-Encoding: chunked\r\n\r\nzz\r\nab\r\n0\r\n\r\n", 400),  # not hex
+        (b"Transfer-Encoding: chunked\r\n\r\n" + b"f" * 9 + b"\r\n", 400),  # too many digits
+        (b"Transfer-Encoding: chunked\r\n\r\nffffffff\r\n", 413),  # over the cap, refused before any read
+        (b"Transfer-Encoding: chunked\r\n\r\n5\r\nab", 400),  # short chunk
+        (b"Transfer-Encoding: chunked\r\n\r\n2\r\nabXX0\r\n\r\n", 400),  # no CRLF after the chunk
+        (b"Transfer-Encoding: chunked\r\n\r\n2\r\nab\r\n", 400),  # ends before the last chunk
+        (b"Content-Length: 10\r\n\r\nabc", 400),  # short body
+        (b"Content-Length: -1\r\n\r\n", 400),
+        (b"Content-Length: 99999999999\r\n\r\n", 413),
+    ],
+)
+def test_bad_request_bodies_are_refused_and_never_forwarded(env, payload, want):
+    assert raw_proxy(env, payload) == want
+    assert env.stub.seen == []
+
+
+def test_the_proxy_caps_concurrent_connections(base, stub, monkeypatch):
+    monkeypatch.setattr(broker, "MAX_PROXY_CONNECTIONS", 1)
+    e = Env(base, stub)
+    e.write_registry()
+    e.store.write("anthropic", VALUE)
+    e.start()
+    try:
+        lease = e.lease()
+        hostport, _, prefix = lease.base_url.removeprefix("http://").partition("/")
+        held = http.client.HTTPConnection(hostport, timeout=10)
+        held.request("GET", f"/{prefix}/sse")
+        r = held.getresponse()
+        assert r.read1(100) == b"data: one\n\n"  # the one slot is now busy until the stream ends
+        assert e.call(lease=e.lease())[0] == 503
+        stub.go.set()
+        r.read()
+        held.close()
+        for _ in range(50):  # the slot comes back
+            if e.call(lease=e.lease())[0] == 200:
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail("the proxy never took another connection")
+    finally:
+        stub.go.set()
+        e.broker.stop()
+
+
+def test_socket_folder_must_be_the_brokers_and_closed_to_group_write(base, stub):
+    import grp
+
+    e = Env(base, stub)
+    e.write_registry()
+    mine = grp.getgrgid(os.getgid()).gr_name
+    shared = base / "shared"
+    shared.mkdir()
+    shared.chmod(0o770)
+    with pytest.raises(broker.BrokerError, match="changed or entered"):
+        broker.Broker(shared / "b.sock", e.registry, e.store, group=mine).start()
+    private = base / "private"
+    private.mkdir(mode=0o700)
+    other = broker.Broker(private / "b.sock", e.registry, e.store)
+    other.own_uid = os.geteuid() + 1  # the folder is not this broker's
+    with pytest.raises(broker.BrokerError, match="belong to the broker"):
+        other.start()
+    assert not (private / "b.sock").exists()
+
+
+def test_status_says_where_the_code_runs_from(env):
+    # the tests run from a checkout the user can write, which is exactly what a walled broker must report
+    if os.geteuid() == 0:
+        pytest.skip("running as root")
+    assert broker.status(env.sock)["code_problem"] != ""
+
+
+def test_there_is_no_environment_switch_for_plain_http(base, stub, monkeypatch):
+    monkeypatch.setenv("WS_BROKER_TEST_HTTP_UPSTREAM", "1")
+    e = Env(base, stub)
+    e.write_registry()
+    e.store.write("anthropic", VALUE)
+    e.start(allow_plain_http=False)
+    try:
+        assert e.call()[0] == 502
+        assert stub.seen == []
+    finally:
+        e.broker.stop()

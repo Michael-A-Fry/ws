@@ -11,6 +11,11 @@ files, so it wins.
     OPENCODE_CONFIG_CONTENT="$(cat OUT/opencode.json)"  OPENCODE_CONFIG_DIR=OUT  opencode
 
 OPENCODE_CONFIG_DIR is searched for `plugins/`, which is where the shim sits.
+
+The wall is `ws gate launch --runner opencode -- opencode ...` (ws.sandbox: bubblewrap on Linux, sandbox-exec on macOS),
+because OpenCode has no sandbox of its own. The launch hint says so, and launch puts WS_GATED_SESSION in the
+environment so `ws approve` knows it is being run from a gated session. The whole generated folder is read-only in the
+wall; see IGNORE below for what that needs.
 """
 
 from __future__ import annotations
@@ -29,6 +34,41 @@ NAME = "opencode"
 CONFIG = "opencode.json"
 PLUGIN = "plugins/ws-gate.js"
 _TOOLS = {"web_fetch": "webfetch", "web_search": "websearch"}
+# For ws.sandbox: the env var that names the generated folder. The whole folder is read-only in the wall (OpenCode loads
+# plugin/, tool/, agent/, command/ and opencode.jsonc from it, so a planted file there would outlive the session).
+CONFIG_DIR_ENV = "OPENCODE_CONFIG_DIR"
+
+
+# OpenCode writes this file into its config folder at start and will not run if it cannot (1.19.4). Written here at
+# generate time, with the content OpenCode writes, so the folder can stay read-only; it needs no node_modules.
+def wall_writable(env: dict) -> list[str]:
+    """The folders OpenCode itself writes (its database and logs, key-value state, model and package cache), which the
+    wall leaves writable besides the project: the `opencode` folder under XDG data, state and cache."""
+    home = env.get("HOME") or str(Path.home())
+    return [
+        f"{env.get(var) or f'{home}/{default}'}/opencode"
+        for var, default in (
+            ("XDG_DATA_HOME", ".local/share"),
+            ("XDG_STATE_HOME", ".local/state"),
+            ("XDG_CACHE_HOME", ".cache"),
+        )
+    ]
+
+
+def wall_prepare(env: dict) -> None:
+    """What OpenCode makes at start in its global config folder, and fails (EROFS) if it cannot: the folder and its
+    `.gitignore` (it keeps one in every config folder). Done by the launcher, outside the wall, where the folder is
+    writable; inside it stays read-only, so a session cannot plant a global plugin."""
+    home = env.get("HOME") or str(Path.home())
+    folder = Path(f"{env.get('XDG_CONFIG_HOME') or f'{home}/.config'}/opencode")
+    folder.mkdir(parents=True, exist_ok=True)
+    ignore = folder / IGNORE
+    if not ignore.exists():
+        ignore.write_text(IGNORE_TEXT, encoding="utf-8")
+
+
+IGNORE = ".gitignore"
+IGNORE_TEXT = "node_modules\npackage.json\npackage-lock.json\nbun.lock\n.gitignore"
 _NEUTRAL = {v: k for k, v in _TOOLS.items()}
 
 # Where this runner keeps what ws installs globally, and where a repo may shadow it (read by ws.globals).
@@ -88,7 +128,7 @@ def generate(policy: Policy, ws_cmd: list[str], out: Path, policy_file: Path) ->
     config = {"$schema": "https://opencode.ai/config.json", "permission": permission}
     plugin = SOURCE.replace("/*__CHECK__*/ []", json.dumps(check_argv(ws_cmd, NAME, policy_file, out)))
     plugin = plugin.replace("/*__WS__*/ []", json.dumps(ws_cmd))
-    return {CONFIG: json.dumps(config, indent=2) + "\n", PLUGIN: plugin}
+    return {CONFIG: json.dumps(config, indent=2) + "\n", PLUGIN: plugin, IGNORE: IGNORE_TEXT}
 
 
 def parse(payload: dict) -> Call | None:
@@ -121,7 +161,10 @@ def _text(d: dict, key: str) -> str:
 
 def launch_hint(out: str) -> str:
     q = shlex.quote(out)
-    return f'start OpenCode with: OPENCODE_CONFIG_CONTENT="$(cat {q}/{CONFIG})" OPENCODE_CONFIG_DIR={q} opencode'
+    return (
+        f'start OpenCode with: OPENCODE_CONFIG_CONTENT="$(cat {q}/{CONFIG})" OPENCODE_CONFIG_DIR={q} '
+        "ws gate launch --runner opencode -- opencode"
+    )
 
 
 # --- ws run: the command line, and the event stream read back as a run record --------------------------------------

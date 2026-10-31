@@ -22,6 +22,7 @@ from ws import (
     notesdetect,
     osinfo,
     rating,
+    roles,
     run,
     secrets,
     session,
@@ -164,6 +165,7 @@ def build_parser() -> argparse.ArgumentParser:
     skills.register(sub)
     canary.register(sub)
     rating.register(sub)
+    roles.register(sub)
     return p
 
 

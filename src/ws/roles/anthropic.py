@@ -1,0 +1,46 @@
+"""Model role, `anthropic`: Claude models over Anthropic's API.
+
+    [roles.model]
+    adapter = "anthropic"            optional: this is the default
+    default = "<model id>"
+    key = "anthropic"                optional: the secret's name in secrets.toml, for API-key runs
+
+The key is only ever named. A run leases it from the broker (job `[[secrets]]`, host api.anthropic.com), so this check
+looks at the registry, never at the store, and makes no network call. It looks at the registry only when `key` is
+set: a subscription login has no key, so a profile with just `default` checks the model name and nothing else.
+`ws models probe` is phase 5.
+"""
+
+from __future__ import annotations
+
+from ws import secrets as wsecrets
+from ws.roles import FAIL, OK, WARN
+
+ROLE, NAME = "model", "anthropic"
+HOST = "api.anthropic.com"
+
+
+def check(cfg, osi, env, network):
+    m = cfg.get("default")
+    if not isinstance(m, str) or not m:
+        return FAIL, "no default model named"
+    detail = f"default model {m} (named; not probed yet)"
+    if "key" not in cfg:
+        return OK, detail
+    name = cfg["key"]
+    if not isinstance(name, str) or not wsecrets.NAME_RE.match(name):
+        return FAIL, "key must be the name of a secret (letters, digits, - and _)"
+    try:
+        entry = wsecrets.load_registry(wsecrets.registry_path(env)).get(name)
+    except wsecrets.SecretsError as e:
+        return WARN, f"{detail}; the secrets registry does not read: {e}"
+    if entry is None:
+        return WARN, f"{detail}; no [{name}] in the secrets registry, so a run cannot lease a key yet"
+    if HOST not in entry.hosts:
+        return WARN, f"{detail}; [{name}] is not allowed at {HOST}"
+    return OK, f"{detail}; key {name} leased through the broker"
+
+
+def steps(cfg, answers, env):
+    """None: install already records the model in the profile, and the key is the person's to add."""
+    return []

@@ -7,7 +7,7 @@ import json
 import sys
 from pathlib import Path
 
-from ws import __version__, doctor, osinfo
+from ws import __version__, doctor, mcp_server, memory, notes, osinfo
 from ws.profile import ProfileError, load, profile_path, write_if_changed
 
 YES = {"y", "yes", "true", "1", "on"}
@@ -128,6 +128,10 @@ def build_parser() -> argparse.ArgumentParser:
     i.add_argument("--create-notes", action="store_true", help="create the notes folder if it is missing")
     i.add_argument("-y", "--yes", action="store_true", help="take the defaults for anything not given; no prompts")
     i.set_defaults(func=cmd_init)
+
+    notes.register(sub)
+    memory.register(sub)
+    mcp_server.register(sub)
     return p
 
 

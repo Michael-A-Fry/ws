@@ -12,9 +12,8 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from ws import __version__, broker, canary, usage
+from ws import __version__, canary, roles, usage
 from ws import globals as ws_globals
-from ws import secrets as wsecrets
 from ws.osinfo import OSInfo
 from ws.profile import ProfileError, load, profile_path
 
@@ -97,10 +96,12 @@ def _version_change(adapter: str, version: str, detail: str, env, network: bool)
 
 
 def _model(cfg, osi, env, network):
-    m = cfg.get("default")
-    if not isinstance(m, str) or not m:
-        return FAIL, "no default model named"
-    return OK, f"default model {m} (named; not probed yet)"
+    a = cfg.get("adapter")
+    if isinstance(a, str) and a and a not in roles.adapters("model"):
+        # a profile from before the model adapters: only the name was ever checked, and it still is
+        status, detail = roles.get("model", "anthropic").check({"default": cfg.get("default")}, osi, env, network)
+        return status, f"{detail}; adapter {a!r} has no check of its own"
+    return roles.check("model", cfg, osi, env, network, default="anthropic")
 
 
 def _budget(cfg, osi, env, network):
@@ -111,57 +112,14 @@ def _budget(cfg, osi, env, network):
 
 
 def _secrets(cfg, osi, env, network):
-    a, bad = _adapter(cfg, {"ws-secret": "", "sops-age": "", "env": ""})
-    if bad or a != "ws-secret":
-        return bad or (OK, f"{a}")
-    store, sock = wsecrets.Store(wsecrets.store_dir(env, cfg)), wsecrets.socket_path(env, cfg)
-    try:
-        problems, owner = wsecrets.health(wsecrets.registry_path(env), store)
-    except PermissionError:  # the store belongs to another user: only the broker can vouch for it
-        problems, owner = None, None
-    try:
-        answer, down = broker.status(sock), ""
-    except broker.BrokerError as e:
-        answer, down = None, str(e)
-    if problems is None:
-        if answer is None:
-            return FAIL, f"the store belongs to another user and the broker is not answering: {down}"
-        problems = answer.get("problems", ["the broker did not report on its store"])
-        owner = answer.get("store_owner_uid")
-    if problems:
-        return FAIL, "; ".join(problems)
-    if owner == os.geteuid():
-        tail = "" if answer else f"; broker not answering ({down})"
-        return WARN, f"same-user boundary: run `ws secret wall` for the one sudo step{tail}"
-    if answer is None:
-        return FAIL, f"store is walled but the broker is not answering: {down}"
-    cp = answer.get("code_problem")
-    if cp is None or cp:  # a broker that runs code another user can edit hands that user the keys
-        why = cp or "it did not say where it runs from"
-        return WARN, f"store is walled, but the broker's own code is not locked down: {why}"
-    return OK, f"ws-secret: store owned by {wsecrets.owner_name(owner)}, broker answering"
+    return roles.check("secrets", cfg, osi, env, network)
 
 
-def _folder(cfg: dict) -> tuple[Path | None, tuple[str, str] | None]:
-    p = cfg.get("path")
-    if not isinstance(p, str) or not p:
-        return None, (FAIL, "no path set")
-    d = Path(p).expanduser()
-    return (d, None) if d.is_dir() else (None, (FAIL, f"{d} is not a folder"))
+_folder = roles.folder
 
 
 def _memory(cfg, osi, env, network):
-    from ws import memory
-
-    d, bad = _folder(cfg)
-    if bad:
-        p = cfg.get("path")
-        missing = isinstance(p, str) and p and not Path(p).expanduser().exists()
-        return (bad[0], f"{bad[1]}: `ws memory init` makes it") if missing else bad
-    if not memory.is_repo(d):
-        return WARN, f"{d} is not in git: run `ws memory init`"
-    built, detail = memory.check_index(d)
-    return (OK, f"{d}: git repo; {detail}") if built else (FAIL, f"{d}: {detail}")
+    return roles.check("memory", cfg, osi, env, network, default="markdown-git")
 
 
 def _notes(cfg, osi, env, network):
@@ -180,22 +138,15 @@ def _notes(cfg, osi, env, network):
 
 
 def _scheduler(cfg, osi, env, network):
-    a, bad = _adapter(cfg, {"systemd": "", "launchd": ""})
-    if bad:
-        return bad
-    if a != osi.scheduler:
-        return FAIL, f"{a} selected but this machine runs {osi.scheduler}"
-    return OK, a
+    return roles.check("scheduler", cfg, osi, env, network)
 
 
 def _notify(cfg, osi, env, network):
-    a, bad = _adapter(cfg, {"ntfy": "", "none": ""})
-    return bad or (OK, "off (no pushes)" if a == "none" else a)
+    return roles.check("notify", cfg, osi, env, network)
 
 
 def _backup(cfg, osi, env, network):
-    a, bad = _adapter(cfg, {"restic": ""})
-    return bad or (OK, a)
+    return roles.check("backup", cfg, osi, env, network)
 
 
 def _usage(cfg, osi, env, network):
@@ -222,7 +173,7 @@ ROLES = (
     Role("WS106", "notes", "your notes folder (any app)", 'path = "~/Notes"', _notes),
     Role("WS107", "scheduler", "runs jobs on a timer", 'adapter = "systemd"', _scheduler),
     Role("WS108", "notify", "how ws reaches you", 'adapter = "none"', _notify),
-    Role("WS109", "backup", "proves your files can come back", 'adapter = "restic"', _backup),
+    Role("WS109", "backup", "proves your files can come back", 'adapter = "restic", repo = "<folder>"', _backup),
     Role("WS110", "usage", "the provider's own usage report", 'adapter = "anthropic"', _usage),
 )
 

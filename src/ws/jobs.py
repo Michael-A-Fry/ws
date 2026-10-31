@@ -9,6 +9,10 @@
     bare = true                         headless default: no hooks, plugins or auto-discovered context
     allow_unpriced = false              run even if the runner cannot price the model (counted at your fallback)
     sources = ["notes"]                 policy sources the job reads (the Rule of Two looks at these)
+    schedule = "daily 03:30"            optional: hourly | daily HH:MM | weekly DAY HH:MM (local time). `ws schedule
+                                        apply` turns it into a systemd timer or a launchd agent.
+    command = "backup"                  instead of runner, model and prompt: a ws command the schedule runs
+                                        (`ws backup run`). Only `ws schedule` runs these; `ws run` refuses them.
 
     [[secrets]]                         the provider credential, leased through the broker
     name = "anthropic"
@@ -50,11 +54,33 @@ KEYS = {
     "sources",
     "secrets",
     "runner_options",
+    "schedule",
+    "command",
 }
+COMMANDS = {"backup": ("backup", "run")}  # the ws commands a job file may schedule in place of a runner
+DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+_DAY_NAMES = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+_CLOCK = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 
 
 class JobError(Exception):
     pass
+
+
+@dataclass(frozen=True)
+class When:
+    """A repeat time in local time. weekday is 0 for Monday to 6 for Sunday; only `weekly` uses it."""
+
+    kind: str  # hourly | daily | weekly
+    hour: int = 0
+    minute: int = 0
+    weekday: int = 0
+
+    def __str__(self) -> str:
+        if self.kind == "hourly":
+            return "hourly"
+        at = f"{self.hour:02d}:{self.minute:02d}"
+        return f"daily {at}" if self.kind == "daily" else f"weekly {DAYS[self.weekday]} {at}"
 
 
 @dataclass(frozen=True)
@@ -78,6 +104,16 @@ class Job:
     sources: tuple[str, ...] = ()
     secrets: tuple[SecretUse, ...] = ()
     runner_options: dict = field(default_factory=dict)
+    schedule: When | None = None
+
+
+@dataclass(frozen=True)
+class Scheduled:
+    """A job file with a schedule: `argv` is what follows `ws` on the command line."""
+
+    name: str
+    when: When
+    argv: tuple[str, ...]
 
 
 def jobs_dir(env: dict | None = None) -> Path:
@@ -105,6 +141,28 @@ def _number(d: dict, key: str, where: str, default, integer: bool = False):
     return v
 
 
+def parse_schedule(text: str, where: str) -> When:
+    """`hourly`, `daily HH:MM` or `weekly DAY HH:MM`. Raises JobError naming the key."""
+    words = text.lower().split()
+    if words == ["hourly"]:
+        return When("hourly")
+    clock = _CLOCK.match(words[-1]) if words else None
+    if clock and len(words) == 2 and words[0] == "daily":
+        return When("daily", int(clock[1]), int(clock[2]))
+    if clock and len(words) == 3 and words[0] == "weekly" and words[1] in (*DAYS, *_DAY_NAMES):
+        return When("weekly", int(clock[1]), int(clock[2]), DAYS.index(words[1][:3]))
+    raise JobError(f"{where}: schedule must be hourly, daily HH:MM or weekly DAY HH:MM (for example weekly mon 09:00)")
+
+
+def _command(d: dict, where: str) -> tuple[str, ...] | None:
+    c = _string(d, "command", where)
+    if c is None:
+        return None
+    if c not in COMMANDS:
+        raise JobError(f"{where}: command {c!r} is not known (known: {', '.join(COMMANDS)})")
+    return COMMANDS[c]
+
+
 def loads(name: str, text: str, base: Path, where: str | None = None) -> Job:
     """Parse and check a job file's text. `base` is the folder `prompt_file` is relative to."""
     where = where or f"job {name}"
@@ -117,6 +175,9 @@ def loads(name: str, text: str, base: Path, where: str | None = None) -> Job:
     unknown = sorted(set(d) - KEYS)
     if unknown:
         raise JobError(f"{where}: unknown key {unknown[0]!r} (known: {', '.join(sorted(KEYS))})")
+    if _command(d, where):
+        raise JobError(f"{where}: this job runs a ws command on a schedule; `ws run` is for jobs with a runner")
+    schedule = _string(d, "schedule", where)
     runner = _string(d, "runner", where, required=True)
     known = adapters.all_adapters()
     if runner not in known:
@@ -178,6 +239,7 @@ def loads(name: str, text: str, base: Path, where: str | None = None) -> Job:
         sources=tuple(sources),
         secrets=tuple(secrets),
         runner_options=options,
+        schedule=parse_schedule(schedule, f"{where}: schedule") if schedule else None,
     )
 
 
@@ -208,6 +270,34 @@ def load(name: str, env: dict | None = None) -> Job:
     except (OSError, UnicodeDecodeError) as e:
         raise JobError(f"{path}: {e}") from e
     return loads(name, text, folder, where=str(path))
+
+
+def scheduled(env: dict | None = None) -> list[Scheduled]:
+    """Every job file with a `schedule`, checked the way `ws run` checks it. A missing jobs folder is no jobs; a bad
+    file raises JobError (a timer must never run what `ws run` would refuse)."""
+    folder = jobs_dir(env)
+    if not folder.is_dir():
+        return []
+    check_private(folder)
+    out = []
+    for path in sorted(folder.glob("*.toml")):
+        if not NAME.match(path.stem):
+            continue
+        check_private(path)
+        try:
+            text = path.read_text(encoding="utf-8")
+            d = tomllib.loads(text)
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
+            raise JobError(f"{path}: {e}") from e
+        if "schedule" not in d:
+            continue
+        where = str(path)
+        command = _command(d, where)
+        if command is None:
+            loads(path.stem, text, folder, where)  # a runner job must be valid before it gets a timer
+        when = parse_schedule(_string(d, "schedule", where) or "", f"{where}: schedule")
+        out.append(Scheduled(path.stem, when, command or ("run", path.stem)))
+    return out
 
 
 def check_options(job: Job, allowed: set[str]) -> None:

@@ -67,15 +67,10 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from secrets import token_hex
 
-from ws import evalstats, jobs, output, policy, rating, run, runrecord, sandbox
+from ws import evalstats, jobs, jsonl, output, policy, rating, run, runrecord, sandbox
 from ws import secrets as wsecrets
 from ws.output import WsError
 from ws.profile import ProfileError, load, profile_path, ws_home
-
-try:  # not on native Windows; ws runs there only through WSL2, but the module must still import
-    import fcntl
-except ImportError:  # pragma: no cover
-    fcntl = None  # type: ignore[assignment]
 
 SCHEMA_VERSION = 1
 NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
@@ -884,29 +879,13 @@ def write_files(folder: Path, files: dict) -> None:
 
 
 def append_jsonl(path: Path, rec: dict) -> None:
-    """One write() on an O_APPEND fd under an flock, 0600: the way runs.jsonl and ratings.jsonl are written."""
-    line = (json.dumps(rec, ensure_ascii=True, separators=(",", ":")) + "\n").encode()
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-    try:
-        if fcntl is not None:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-        os.write(fd, line)
-    finally:
-        os.close(fd)
+    """One bounded line (ws.jsonl: locked, rotated at a size, one string field capped), the way runs.jsonl is written."""
+    jsonl.append(path, rec)
 
 
 def read_jsonl(path: Path) -> list[dict]:
-    if not path.exists():
-        return []
-    out = []
-    with path.open(encoding="utf-8", errors="replace") as fh:
-        for line in fh:
-            with contextlib.suppress(ValueError):
-                rec = json.loads(line)
-                if isinstance(rec, dict):
-                    out.append(rec)
-    return out
+    """Every record, oldest first, across rotated files. A missing file is none."""
+    return jsonl.read(path)
 
 
 def write_private(path: Path, text: str, exclusive: bool = False) -> None:
@@ -977,14 +956,19 @@ def make_plan(
     return runs, skipped
 
 
-def _find_record(log: Path, before: int, task: str, trial: int, arm: str) -> dict | None:
+def _find_record(log: Path, seen: set, task: str, trial: int, arm: str) -> dict | None:
+    """The record this trial made: the newest one with its eval marker whose run id was not in the log before."""
     try:
-        recs = runrecord.read(log)[before:]
+        recs = runrecord.read(log)
     except OSError:
         return None
     for rec in reversed(recs):
         ev = rec.get("eval")
-        if isinstance(ev, dict) and (ev.get("task"), ev.get("trial"), ev.get("arm")) == (task, trial, arm):
+        if (
+            isinstance(ev, dict)
+            and rec.get("run_id") not in seen
+            and (ev.get("task"), ev.get("trial"), ev.get("arm")) == (task, trial, arm)
+        ):
             return rec
     return None
 
@@ -1024,13 +1008,13 @@ def run_trial(task: Task, trial: int, arm: str, job: jobs.Job, batch: str, keep:
         job, prompt=task.prompt, cwd=str(folder), timeout_s=task.timeout_s,
         max_turns=task.max_turns or job.max_turns, schedule=None,
     )  # fmt: skip
-    before = len(runrecord.read(log)) if log.exists() else 0
+    seen = {r.get("run_id") for r in runrecord.read(log)}
     marker = {"eval": {"task": task.id, "trial": trial, "arm": arm, "pass": None}}
     code = None
     try:
         code = run.run_job(argparse.Namespace(job=job.name, dry_run=False), trial_job, marker, hook)
     finally:  # also on SIGTERM: whatever got as far as a record gets a result line
-        rec = state["rec"] or _find_record(log, before, task.id, trial, arm)
+        rec = state["rec"] or _find_record(log, seen, task.id, trial, arm)
         result = {
             "schema": SCHEMA_VERSION, "ts": runrecord.iso(datetime.now(UTC)), "batch": batch, "task": task.id,
             "task_hash": task_hash(task), "family": task.family, "kind": task.kind, "trial": trial, "arm": arm,

@@ -439,6 +439,9 @@ def current_roots(env) -> list[Path]:
         p = cfg.get("path") if isinstance(cfg, dict) else None
         if isinstance(p, str) and p:
             roots.append(expand(p, env))
+    from ws import skills  # the folders of the skills ws ships, in each runner's skills folder
+
+    roots += skills.roots(env)
     return [r for r in dict.fromkeys(roots) if not _root_problem(r, env)]
 
 
@@ -564,7 +567,8 @@ def _rows(steps: list[Step], result: Result) -> list[dict]:
 
 def cmd_install(args: argparse.Namespace) -> int:
     try:
-        steps = plan(answers_from_args(args, os.environ))
+        answers = answers_from_args(args, os.environ)
+        steps = plan(answers)
         result = apply(steps, dry_run=True)
         if not args.dry_run:
             if result.changes and not args.yes and not args.json and sys.stdin.isatty():
@@ -573,6 +577,10 @@ def cmd_install(args: argparse.Namespace) -> int:
                     print("ws: nothing changed")
                     return 1
             result = apply(steps)
+        if "skills" in answers.modules:  # skills you removed stay removed; say so
+            from ws import skills
+
+            result.notes += skills.notices(answers.runner, os.environ)
     except (InstallError, OSError) as e:
         print(f"ws: {e}", file=sys.stderr)
         return 1

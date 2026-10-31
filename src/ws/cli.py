@@ -10,6 +10,7 @@ from pathlib import Path
 from ws import (
     __version__,
     broker,
+    canary,
     devices,
     doctor,
     gate,
@@ -20,9 +21,11 @@ from ws import (
     notes,
     notesdetect,
     osinfo,
+    rating,
     run,
     secrets,
     session,
+    skills,
 )
 from ws import globals as ws_globals
 from ws.profile import ProfileError, load, profile_path, write_if_changed
@@ -158,6 +161,9 @@ def build_parser() -> argparse.ArgumentParser:
     install.register(sub)
     modules.register(sub)
     devices.register(sub)
+    skills.register(sub)
+    canary.register(sub)
+    rating.register(sub)
     return p
 
 

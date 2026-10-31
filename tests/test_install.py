@@ -303,6 +303,7 @@ def test_profile_gets_the_answers_and_keeps_what_was_there(box, capsys):
     assert prof["modules"] == {
         "memory": True,
         "notes": True,
+        "skills": True,
         "mail-drafts": False,
         "calendar": False,
         "finance": False,

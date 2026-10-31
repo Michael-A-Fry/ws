@@ -33,7 +33,7 @@ def role_path(role: str, env: dict | None = None) -> Path:
     p = cfg.get("path") if isinstance(cfg, dict) else None
     if not isinstance(p, str) or not p:
         raise WsError(f"no [roles.{role}] path in {pf} (run `ws doctor`)")
-    return Path(p).expanduser()
+    return Path(p).expanduser().resolve()  # absolute, so index keys do not depend on the current directory
 
 
 def slugify(text: str, limit: int = 48) -> str:

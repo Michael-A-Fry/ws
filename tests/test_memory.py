@@ -6,6 +6,7 @@ import json
 import os
 import sqlite3
 import subprocess
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -273,3 +274,82 @@ def test_doctor_notes_ok_and_fail(home):
             assert check("notes", {"path": str(home / "vault")})[0] == "fail"
         finally:
             (home / "vault").chmod(0o700)
+
+
+def set_roles(**paths):
+    profile_path().write_text(dumps({"roles": {name: {"path": str(p)} for name, p in paths.items()}}))
+
+
+def test_paths_are_absolute_so_the_current_directory_does_not_matter(home, mem, monkeypatch):
+    memory.add("tomato soup recipe", "Soup")
+    (home / "sub").mkdir()
+    monkeypatch.chdir(home)
+    set_roles(memory="./mem", notes="vault")
+    first = memory.search("soup")
+    assert [h.path for h in first] == [str(home / "mem" / "facts" / "soup.md")]
+    monkeypatch.chdir(home / "sub")
+    set_roles(memory="../mem", notes="../vault")  # the same folders, spelled from somewhere else
+    assert memory.search("soup") == first
+    stats, _ = memory.reindex()
+    assert (stats.indexed, stats.removed) == (0, 0)  # the rows stayed
+    conn = sqlite3.connect(memory.index_path())
+    assert [r[0] for r in conn.execute("SELECT path FROM files")] == [str(home / "mem" / "facts" / "soup.md")]
+    conn.close()
+
+
+def test_a_file_that_moves_between_roots_is_relabelled(home, mem):
+    shared = home / "shared"
+    shared.mkdir()
+    (shared / "a.md").write_text("zucchini bake", encoding="utf-8")
+    set_roles(notes=shared, memory=mem)
+    assert [(h.source, Path(h.path).name) for h in memory.search("zucchini")] == [("notes", "a.md")]
+    set_roles(memory=shared, notes=home / "vault")  # same file, same bytes, now memory
+    assert [(h.source, Path(h.path).name) for h in memory.search("zucchini")] == [("memory", "a.md")]
+    conn = sqlite3.connect(memory.index_path())
+    assert conn.execute("SELECT count(*) FROM files").fetchone()[0] == 1
+    assert conn.execute("SELECT source FROM docs").fetchall() == [("memory",)]
+    conn.close()
+
+
+def test_only_a_damaged_index_is_deleted(home, mem, monkeypatch):
+    memory.add("keep calm", "Calm")
+    memory.reindex()
+    db = memory.index_path()
+    real_open = memory._open
+
+    def not_corrupt(path):
+        raise sqlite3.OperationalError("attempt to write a readonly database")
+
+    monkeypatch.setattr(memory, "_open", not_corrupt)
+    with pytest.raises(notes.WsError, match="index failed"):
+        memory.search("calm")
+    assert db.is_file() and db.stat().st_size > 0  # left alone
+    monkeypatch.setattr(memory, "_open", real_open)
+    assert [h.title for h in memory.search("calm")] == ["Calm"]
+    assert memory._corrupt(sqlite3.DatabaseError("database disk image is malformed"))
+    assert memory._corrupt(sqlite3.DatabaseError("file is not a database"))
+    assert not memory._corrupt(sqlite3.OperationalError("disk I/O error"))
+    assert not memory._corrupt(sqlite3.OperationalError("no such table: docs"))
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="no named pipes on this platform")
+def test_a_named_pipe_called_x_md_does_not_hang_the_index(home, mem):
+    memory.add("real file about quinces", "Quinces")
+    os.mkfifo(home / "vault" / "x.md")
+    result = []
+    t = threading.Thread(target=lambda: result.append(memory.search("quinces")), daemon=True)
+    t.start()
+    t.join(15)
+    assert not t.is_alive(), "reading the FIFO blocked the index"
+    assert [h.title for h in result[0]] == ["Quinces"]
+    assert list(memory.walk(home / "vault")) == []
+
+
+def test_user_version_is_set_once(home, mem):
+    memory.add("x", "One")
+    memory.reindex()
+    conn = sqlite3.connect(memory.index_path())
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == memory.SCHEMA
+    conn.close()
+    stats, _ = memory.reindex()
+    assert stats.unchanged == 1

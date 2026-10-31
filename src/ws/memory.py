@@ -129,8 +129,9 @@ def walk(root: Path):
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
         for name in sorted(filenames):
-            if name.endswith(".md") and not name.startswith("."):
-                yield Path(dirpath) / name
+            p = Path(dirpath) / name
+            if name.endswith(".md") and not name.startswith(".") and p.is_file():  # not a FIFO, socket or device
+                yield p
 
 
 def parse_file(path: Path, data: bytes) -> tuple[str, str, str]:
@@ -192,24 +193,27 @@ def _warn_no_fts5() -> None:
 
 def _open(db: Path | str) -> sqlite3.Connection:
     conn = sqlite3.connect(db, timeout=10)
-    if conn.execute("PRAGMA user_version").fetchone()[0] != SCHEMA:
+    stale = conn.execute("PRAGMA user_version").fetchone()[0] != SCHEMA
+    if stale:
         conn.executescript("DROP TABLE IF EXISTS docs; DROP TABLE IF EXISTS files;")
     conn.executescript(
         "CREATE TABLE IF NOT EXISTS files (id INTEGER PRIMARY KEY, path TEXT UNIQUE NOT NULL, source TEXT NOT NULL,"
         " mtime_ns INTEGER NOT NULL, size INTEGER NOT NULL, sha256 TEXT NOT NULL);"
         "CREATE VIRTUAL TABLE IF NOT EXISTS docs USING fts5(title, body, tags, path, source UNINDEXED,"
         " tokenize = 'porter unicode61 remove_diacritics 2');"
-        f"PRAGMA user_version = {SCHEMA};"
     )
+    if stale:
+        conn.execute(f"PRAGMA user_version = {SCHEMA}")
     return conn
 
 
 def refresh(conn: sqlite3.Connection, roots: list[tuple[str, Path]]) -> Stats:
     """Bring the index in line with the files: new or changed ones in (mtime+size, then sha256), gone ones out."""
     stats = Stats()
-    rows = {r[1]: r for r in conn.execute("SELECT id, path, mtime_ns, size, sha256 FROM files")}
+    rows = {r[1]: r for r in conn.execute("SELECT id, path, mtime_ns, size, sha256, source FROM files")}
     seen: set[str] = set()
-    for source, root in roots:
+    for source, given in roots:
+        root = given.resolve()  # the keys are absolute whatever the caller passed
         for p in walk(root):
             key = str(p)
             if key in seen:  # a notes folder inside the memory folder is indexed once
@@ -221,7 +225,7 @@ def refresh(conn: sqlite3.Connection, roots: list[tuple[str, Path]]) -> Stats:
                 continue
             seen.add(key)
             row = rows.get(key)
-            if row and row[2] == st.st_mtime_ns and row[3] == st.st_size:
+            if row and row[2] == st.st_mtime_ns and row[3] == st.st_size and row[5] == source:
                 stats.unchanged += 1
                 continue
             if st.st_size > MAX_BYTES:
@@ -235,7 +239,7 @@ def refresh(conn: sqlite3.Connection, roots: list[tuple[str, Path]]) -> Stats:
                 seen.discard(key)
                 continue
             sha = hashlib.sha256(data).hexdigest()
-            if row and row[4] == sha:
+            if row and row[4] == sha and row[5] == source:
                 conn.execute(
                     "UPDATE files SET mtime_ns = ?, size = ? WHERE id = ?", (st.st_mtime_ns, st.st_size, row[0])
                 )
@@ -281,6 +285,14 @@ def reindex(env: dict | None = None, full: bool = False) -> tuple[Stats, Path]:
     return _with_index(db, lambda conn: refresh(conn, roots)), db
 
 
+def _corrupt(e: sqlite3.DatabaseError) -> bool:
+    """True when SQLite says the file itself is damaged (SQLITE_CORRUPT 11, SQLITE_NOTADB 26)."""
+    if getattr(e, "sqlite_errorcode", 0) & 0xFF in (11, 26):
+        return True
+    text = str(e).lower()
+    return any(s in text for s in ("malformed", "not a database", "disk image"))
+
+
 def _with_index(db: Path, fn):
     """Run fn(conn) on the index. A broken index file is deleted and rebuilt once: it is only a cache."""
     db.parent.mkdir(parents=True, exist_ok=True)
@@ -292,7 +304,7 @@ def _with_index(db: Path, fn):
         except sqlite3.DatabaseError as e:
             if isinstance(e, sqlite3.OperationalError) and "locked" in str(e):
                 raise WsError("the search index is busy: try again in a moment") from e
-            if attempt == 2:
+            if attempt == 2 or not _corrupt(e):  # only a damaged file is deleted; anything else is left alone
                 raise WsError(
                     f"the search index failed ({type(e).__name__}); `ws memory reindex --full` rebuilds it"
                 ) from e

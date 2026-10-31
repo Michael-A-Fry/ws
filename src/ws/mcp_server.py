@@ -18,7 +18,7 @@ from ws.notes import WsError
 from ws.profile import ProfileError
 
 LATEST = "2026-07-28"
-SUPPORTED = (LATEST, "2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
+SUPPORTED = (LATEST, "2025-11-25", "2025-06-18")  # no batching, so nothing older
 VERSION_KEY = "io.modelcontextprotocol/protocolVersion"
 SERVER_INFO = {"name": "ws", "version": __version__}
 INSTRUCTIONS = (

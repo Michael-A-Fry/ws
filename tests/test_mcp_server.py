@@ -78,7 +78,8 @@ def test_initialize_negotiates_the_version_and_lists_tools(client):
     r = client.call("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t"}})
     assert r["result"]["protocolVersion"] == "2025-06-18"  # the client's, because ws supports it
     assert "tools" in r["result"]["capabilities"] and r["result"]["serverInfo"]["name"] == "ws"
-    assert client.call("initialize", {"protocolVersion": "1999-01-01"})["result"]["protocolVersion"] == "2026-07-28"
+    for old in ("1999-01-01", "2025-03-26", "2024-11-05"):  # unknown, or from before we dropped batching
+        assert client.call("initialize", {"protocolVersion": old})["result"]["protocolVersion"] == "2026-07-28"
     # a notification gets no reply: the next answer is for the next request
     client.proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
     tools = client.call("tools/list")["result"]["tools"]

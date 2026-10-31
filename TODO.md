@@ -47,3 +47,17 @@
 - [ ] Sandbox as the real wall behind the command matcher (phase 4); bound single-use approvals (phase 4)
 - [x] WS110 usage: off (Michael: "leave it off"); `adapter = "none"`, spend comes from `runs.jsonl`
 - [x] CLA signed by Michael (`license/cla` passes on PR #6)
+
+## Phase 4 (setup, adapters, public skills, the wall)
+
+- [x] Installer engine: `ws install` / `ws uninstall` with a manifest; a second install reports 0 changes, uninstall
+  returns HOME to its pre-install state (tests/test_install.py, 3-OS matrix; PR #12)
+- [x] Plugins by checkbox (#163, #164, #180): `ws plugin list|add|remove`; Finance is NZ-only; Obsidian/Logseq folder
+  detection; `ws device add` (PR #12, #14)
+- [x] Public skills align, checkpoint, taste-gate, dataviz, scrubbed (#165); `doctor` records runner versions and runs
+  `ws canary` on a change; `ws rate <run> up|down` beside runs.jsonl (#162) (PR #14)
+- [x] Role adapters anthropic, opencode, markdown-git, systemd, launchd, ntfy, restic, sops-age (PR #15)
+- [ ] The wall (PR #13): bound single-use approvals, sandbox behind the matcher, OpenCode nudge e2e; in fix round 2
+  then all steps wired to `ws install`
+- [ ] Known limit: the notify cap counts ws's own sends only; count notify leases in the broker
+- [ ] Known limit: sops-age is named but not read by the broker yet

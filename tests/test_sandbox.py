@@ -316,6 +316,9 @@ def env(tmp_path, monkeypatch, wshome):
     monkeypatch.setenv("WS_HOME", str(wshome))
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.delenv("OPENCODE_CONFIG_DIR", raising=False)
+    nowhere = tmp_path / "empty-path"
+    nowhere.mkdir()
+    monkeypatch.setenv("PATH", str(nowhere))  # no bwrap, whatever the machine has: these tests must not need it
     started = []
     monkeypatch.setattr(sandbox.os, "execvpe", lambda exe, argv, e: started.append((argv, e)))
     monkeypatch.setattr(sandbox, "run_with_broker", lambda cmd, e, fds, root: started.append((cmd, e, root)) or 0)
@@ -341,7 +344,12 @@ def test_launch_fails_closed_when_the_wall_cannot_be_built(env, monkeypatch, cap
     assert env == []  # the runner never started
 
 
-def test_no_sandbox_starts_bare_and_says_what_it_gives_up(env, capsys):
+def test_no_sandbox_starts_bare_and_says_what_it_gives_up(env, capsys, monkeypatch):
+    def never(*a, **k):
+        raise AssertionError("--no-sandbox must not build a wall")
+
+    monkeypatch.setattr(sandbox, "wrap", never)
+    monkeypatch.setattr(sandbox, "run_with_broker", never)
     assert cli.main(["gate", "launch", "--runner", "opencode", "--no-sandbox", "--", "opencode"]) == 0
     err = capsys.readouterr().err
     assert "NO wall" in err and "python3 -c" in err and "policy" in err and "tmux" in err

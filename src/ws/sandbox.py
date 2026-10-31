@@ -479,6 +479,7 @@ def cmd_launch(args: argparse.Namespace) -> int:
         except OSError as e:
             print(f"ws: could not start {shlex.join(argv[:1])}: {e}", file=sys.stderr)
             return 127
+        return 0  # exec does not return; this is for a test that replaces it. --no-sandbox never reaches the wall code
     tmp = tempfile.mkdtemp(prefix="ws-wall-")  # the wall's /tmp: the rest of the disk is read-only
     try:
         project = project_folder(os.getcwd(), env)

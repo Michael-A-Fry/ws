@@ -9,16 +9,17 @@ kit in `ws.setup_ui`; every file written goes through `ws.setup_ui.flow` and so 
 
 from __future__ import annotations
 
-import contextlib
 import os
 import re
 import select
 import shutil
+import signal
 import sys
+import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from dataclasses import replace
-from typing import IO
+from typing import IO, Self
 
 from ws import __version__, install
 from ws.install import InstallError
@@ -155,6 +156,7 @@ def choices_rows(facts: flow.Facts, c: flow.Choices) -> list[tuple[str, str]]:
         ("Core", " · ".join(name for _, name, _ in flow.CORE)),
         ("Plugins", " · ".join(names) if names else "none yet (ws plugin add later)"),
         ("Notes", flow.tilde(install.expand(c.notes, facts.env), facts.env)),
+        *([("Cap", f"US${c.cap:g} a month")] if c.cap else []),
     ]
 
 
@@ -222,17 +224,25 @@ class Wizard:
         key: Callable[[], str],
         *,
         sleep: Callable[[float], None] = time.sleep,
-        cols: int = 100,
+        cols: int | Callable[[], int] = 100,
         color: bool = True,
         live: bool = True,
         interactive: bool = True,
     ) -> None:
         self.facts, self.c, self.out, self.key, self.sleep = facts, choices, out, key, sleep
-        self.cols, self.live, self.interactive = cols, live, interactive
-        self.width = max(56, min(cols - 4, 100))
+        self._cols, self.live, self.interactive = cols, live, interactive
         self.a = Ansi(color)
         self.shown = 0  # lines of the live block currently on screen
         self.out_lines = 0  # lines printed so far that stay on the screen
+
+    @property
+    def cols(self) -> int:
+        """The terminal's width now: read again each time, so a resize is picked up by the next thing drawn."""
+        return self._cols() if callable(self._cols) else self._cols
+
+    @property
+    def width(self) -> int:
+        return max(56, min(self.cols - 4, 100))
 
     # -- output
     def w(self, text: str = "") -> None:
@@ -280,7 +290,7 @@ class Wizard:
         except Cancelled:
             self.w("\n" + a.dim("  Cancelled. Nothing was written.") + "\n")
             return 1
-        except InstallError as e:
+        except flow.ENGINE_ERRORS as e:
             self.fail(str(e), "Nothing was written.")
             return 1
         finally:
@@ -296,10 +306,11 @@ class Wizard:
         while True:
             self.pick_plugins()
             self.ask_notes()
+            self.ask_cap()
             used = self.out_lines - first
             try:
                 pv = flow.preview(facts, self.c)
-            except InstallError as e:
+            except flow.ENGINE_ERRORS as e:
                 self.fail(str(e), "Pick the notes folder again.")
                 if not self.interactive:
                     return 1
@@ -447,6 +458,37 @@ class Wizard:
         self.draw([notes_line(a, facts, text, False)], final=True)
         self.print([""])
 
+    def ask_cap(self) -> None:
+        """An optional monthly cap, asked only when the profile has none and none was given. Enter skips it."""
+        a = self.a
+        if not self.interactive or self.facts.cap is not None or self.c.cap is not None:
+            return
+        text, err, value = "", "", None
+        label = a.violet("Monthly cap (US$)", bold=True)
+        while True:
+            line = f"  {label}  {a.bold(text)}{a.violet('▏')}   {a.dim('optional: the most ws may spend in a month')}"
+            rows = [line, hints(a, ("type", "a number"), ("↵", "set" if text else "skip"))]
+            self.draw(rows + ([f"  {a.fg(AMBER, err)}"] if err else []))
+            k = self.key()
+            if k == "enter":
+                try:
+                    value = flow.parse_cap(text)
+                except InstallError as e:
+                    err = str(e)
+                    continue
+                break
+            if k == "esc":
+                raise Cancelled
+            err = ""
+            if k == "backspace":
+                text = text[:-1]
+            elif len(k) == 1 and (k.isdigit() or k in ".$"):
+                text += k
+        self.c = replace(self.c, cap=value)
+        done = f"US${value:g} a month" if value else "skipped"
+        self.draw([f"  {label}  {a.bold(done)}"], final=True)
+        self.print([""])
+
     def confirm(self, question: str) -> bool:
         a = self.a
         self.draw([f"  {a.bold(question)} {a.dim('[Y/n]')}"])
@@ -530,7 +572,7 @@ class Wizard:
         self.draw(block())
         try:
             outcome = flow.run_install(facts, self.c, pv.steps, on_step)
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, Cancelled):
             self.draw(block(), final=True)
             self.print(
                 [
@@ -541,7 +583,7 @@ class Wizard:
                 ]
             )
             return 130
-        except (InstallError, OSError) as e:
+        except flow.ENGINE_ERRORS as e:
             self.draw(block(), final=True)
             self.fail(str(e), "What was written is recorded; `ws uninstall` removes it.")
             return 1
@@ -551,14 +593,14 @@ class Wizard:
         headline = pv.headline() if res.changes else "0 changes"
         lines = ["", done_line(a, headline)]
         lines += [a.dim(f"  Saved in {flow.saved_in(facts.env)}. Run ws setup again any time to change it.")]
-        lines += [a.dim(f"  you changed it, so ws left it: {p}") for p in res.edited]
+        lines += [a.dim(f"  you changed it, so ws left it: {flow.tilde(p, facts.env)}") for p in res.edited]
         lines += [a.dim(f"  {n}") for n in outcome.notes]
         lines += ["", command_line(a, "Next", flow.next_commands(facts, self.c)), ""]
         self.print(lines)
         return 0
 
     def fail(self, message: str, hint: str) -> None:
-        a = self.a
+        a, message = self.a, flow.clean(message)
         self.print(["", f"  {a.fg(AMBER, '✗', bold=True)} {a.bold(message)}", a.dim(f"  {hint}"), ""])
         if not self.interactive:  # a script reads stderr
             print(f"ws: {message}", file=sys.stderr)
@@ -567,17 +609,63 @@ class Wizard:
 # ---- the terminal -------------------------------------------------------------------------------------------------
 
 
-@contextlib.contextmanager
-def raw_keys(fd: int) -> Iterator[None]:
-    import termios  # only here: native Windows has no termios, and `ws --help` must still load there
-    import tty
+class Terminal:
+    """Single-key input and a hidden cursor while ws asks things, put back on every way out: a normal finish, Ctrl-C,
+    SIGTERM and SIGHUP (both raise Cancelled, which writes nothing before Install), and Ctrl-Z (the screen is restored and
+    the shell gets control; when ws is continued it takes the terminal again). termios is imported only here, so native
+    Windows, which has none, still loads `ws --help`."""
 
-    old = termios.tcgetattr(fd)
-    try:
-        tty.setcbreak(fd)
-        yield
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    def __init__(self, fd: int, out: IO[str]) -> None:
+        import termios
+
+        self.fd, self.out = fd, out
+        self.old = termios.tcgetattr(fd)
+        self._saved: dict[int, object] = {}
+
+    def enter(self) -> None:
+        import tty
+
+        tty.setcbreak(self.fd)
+        self.out.write(HIDE)
+        self.out.flush()
+
+    def leave(self) -> None:
+        import termios
+
+        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old)
+        self.out.write(SHOW)
+        self.out.flush()
+
+    def _on_stop(self, signum, frame) -> None:  # Ctrl-Z
+        self.leave()
+        signal.signal(signal.SIGTSTP, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGTSTP)
+
+    def _on_cont(self, signum, frame) -> None:  # fg: take the terminal again
+        signal.signal(signal.SIGTSTP, self._on_stop)
+        self.enter()
+
+    def _on_end(self, signum, frame) -> None:  # SIGTERM, SIGHUP
+        raise Cancelled
+
+    def __enter__(self) -> Self:
+        self.enter()
+        if threading.current_thread() is threading.main_thread():
+            for name, handler in (
+                ("SIGTERM", self._on_end),
+                ("SIGHUP", self._on_end),
+                ("SIGTSTP", self._on_stop),
+                ("SIGCONT", self._on_cont),
+            ):
+                sig = getattr(signal, name, None)
+                if sig is not None:
+                    self._saved[sig] = signal.signal(sig, handler)
+        return self
+
+    def __exit__(self, *exc) -> None:
+        for sig, old in self._saved.items():
+            signal.signal(sig, old)
+        self.leave()
 
 
 class Keys:
@@ -643,7 +731,6 @@ def run(facts: flow.Facts, choices: flow.Choices, *, yes: bool = False, out: IO[
     """Walk the steps. Without a terminal (or with --yes) the defaults and the flags are taken and nothing is asked."""
     out = out or sys.stdout
     color = wants_color(out, facts.env)
-    cols = shutil.get_terminal_size().columns
     if not facts.osi.supported:
         print("ws: native Windows is not supported; install WSL2 and run ws inside it", file=sys.stderr)
         return 1
@@ -652,13 +739,13 @@ def run(facts: flow.Facts, choices: flow.Choices, *, yes: bool = False, out: IO[
             print("ws: setup needs a terminal; pass --yes to take the defaults, or use --web", file=sys.stderr)
             return 1
         wiz = Wizard(
-            facts, choices, out, lambda: "enter", sleep=lambda _: None, cols=cols, color=color, live=False,
-            interactive=False,
+            facts, choices, out, lambda: "enter", sleep=lambda _: None, cols=shutil.get_terminal_size().columns,
+            color=color, live=False, interactive=False,
         )  # fmt: skip
         return wiz.run()
     fd = sys.stdin.fileno()
-    with raw_keys(fd):
-        wiz = Wizard(facts, choices, out, Keys(fd).read, cols=cols, color=color)
+    with Terminal(fd, out):
+        wiz = Wizard(facts, choices, out, Keys(fd).read, cols=lambda: shutil.get_terminal_size().columns, color=color)
         try:
             return wiz.run()
         except KeyboardInterrupt:

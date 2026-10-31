@@ -8,17 +8,21 @@ request also needs the right Host, and a POST needs a matching Origin. Nothing i
 
 from __future__ import annotations
 
+import html
 import json
+import os
 import secrets
+import shutil
+import tempfile
 import threading
 import time
 import webbrowser
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from ws import __version__, install
-from ws.install import InstallError
 from ws.setup_ui import flow
 from ws.setup_ui.brand import GRADIENT, LOGO, TAGLINE, xterm_hex
 
@@ -191,7 +195,7 @@ const main = document.getElementById('main'), rail = document.getElementById('ra
 const back = document.getElementById('back'), next = document.getElementById('next'), count = document.getElementById('count');
 let step = 0, plan = null, busy = false, done = false;
 const picked = new Set(B.plugins.filter(p => p.on).map(p => p.name));
-let notes = B.notes.value;
+let notes = B.notes.value, capText = '';
 
 async function api(path, body) {
   const r = await fetch(path, {method: 'POST', headers: {'Content-Type': 'application/json', 'X-Ws-Token': T},
@@ -199,7 +203,7 @@ async function api(path, body) {
   let j = {}; try { j = await r.json(); } catch (e) { j = {error: 'The server did not answer.'}; }
   return {ok: r.ok, j};
 }
-const choice = () => ({plugins: [...picked], notes});
+const choice = () => ({plugins: [...picked], notes, cap: capText});
 
 function steps() {
   document.getElementById('steps').replaceChildren(...STEPS.map((n, i) => h('li',
@@ -264,6 +268,13 @@ function plugins() {
         h('span', {class: 'chk'}, svg('m5 12.5 4.5 4.5L19 7.5', 12)));
     }))];
 }
+function capField() {  // optional, and only when the profile has no cap yet
+  const cap = h('input', {type: 'text', id: 'cap', inputmode: 'decimal', placeholder: 'skip', spellcheck: 'false', 'aria-label': 'Monthly cap (US$)'});
+  cap.value = capText;
+  let t = null;
+  cap.addEventListener('input', () => { capText = cap.value; clearTimeout(t); t = setTimeout(loadPlan, 300); });
+  return h('div', {style: 'margin-top:22px'}, h('div', {class: 'label'}, h('b', {text: 'Monthly cap (US$)'}), h('span', {text: 'Optional: the most ws may spend in a month'})), cap);
+}
 function notesStep() {
   const input = h('input', {type: 'text', id: 'notes', spellcheck: 'false', 'aria-label': 'Notes folder'});
   input.value = notes;
@@ -277,6 +288,7 @@ function notesStep() {
   return [h('h1', {text: 'Notes folder'}),
     h('p', {class: 'sub', text: 'ws files new notes in an _inbox there. It never edits your notes.'}),
     h('div', {class: 'label'}, h('b', {text: 'Notes folder'}), hint), input,
+    B.cap ? null : capField(),
     B.notes.options.length ? h('div', {class: 'chips'}, B.notes.options.map(o => h('button', {type: 'button', class: 'chip',
       text: o.path, onclick: () => { input.value = o.path; input.dispatchEvent(new Event('input')); }}))) : null];
 }
@@ -286,7 +298,7 @@ function review(err) {
   if (!p) return [h('h1', {text: 'Review'}), h('p', {class: 'sub', text: 'Working out what would change…'})];
   const names = B.plugins.filter(x => picked.has(x.name)).map(x => x.label);
   const rows = [['Core', B.core.map(c => c.name).join(' · ')], ['Plugins', names.join(' · ') || 'none yet (ws plugin add later)'],
-    ['Notes', p.notes], ['Runner', B.runner || 'none yet (the gate files wait for one)'], ['Writes', p.headline]];
+    ['Notes', p.notes], ...(p.cap ? [['Cap', 'US$' + p.cap + ' a month']] : []), ['Runner', B.runner || 'none yet (the gate files wait for one)'], ['Writes', p.headline]];
   const list = p.rows.filter(r => r.action !== 'keep' && r.kind === 'file');
   return [h('h1', {text: p.changes ? 'Ready to install' : 'Nothing to change'}),
     h('p', {class: 'sub', text: p.changes ? 'Check it, then press Install.' : 'Everything already matches.'}),
@@ -484,21 +496,53 @@ class SetupServer:
             def _json(self, code: int, doc: dict) -> None:
                 self._send(code, json.dumps(doc).encode(), "application/json")
 
+            def _same(self, a: str, b: str) -> bool:
+                """Constant-time compare on bytes: a header with a non-ASCII character is a no, never a traceback."""
+                try:
+                    return secrets.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
+                except (UnicodeError, TypeError):
+                    return False
+
+            def _fail_500(self) -> None:
+                try:
+                    self._json(
+                        500,
+                        {"error": "Something went wrong inside ws setup. Run `ws doctor` to see where things stand."},
+                    )
+                except OSError:  # the connection is already gone: nothing more to do, and no traceback on the terminal
+                    return
+
             # -- routes
             def do_GET(self):
-                owner._last = time.monotonic()
-                q = parse_qs(urlsplit(self.path).query)
-                if not self._host_ok() or not secrets.compare_digest((q.get("t") or [""])[0], owner.token):
-                    return self._send(403, b"forbidden", "text/plain")
-                if urlsplit(self.path).path != "/":
-                    return self._send(404, b"not found", "text/plain")
-                self._send(200, render_page(owner.facts, owner.choices).encode(), "text/html")
+                try:
+                    self._get()
+                except Exception:  # noqa: BLE001 - a handler never raises: the person gets a plain 500, not a traceback
+                    self._fail_500()
 
             def do_POST(self):
-                owner._last = time.monotonic()
+                try:
+                    self._post()
+                except Exception:  # noqa: BLE001 - a handler never raises: the person gets a plain 500, not a traceback
+                    self._fail_500()
+
+            def _get(self):
+                q = parse_qs(urlsplit(self.path).query)
+                if not self._host_ok() or not self._same((q.get("t") or [""])[0], owner.token):
+                    return self._send(
+                        403, b"This page needs the link that ws setup printed. Open that link again.", "text/plain"
+                    )
+                owner._last = time.monotonic()  # only a request that proves it has the token keeps the page alive
+                if urlsplit(self.path).path != "/":
+                    return self._send(404, b"not found", "text/plain")
+                page = render_page(owner.facts, owner.choices).encode()
+                owner.forget_launcher()  # the token has been used once: the file that carried it goes
+                self._send(200, page, "text/html")
+
+            def _post(self):
                 header = self.headers.get("X-Ws-Token") or ""
-                if not (self._host_ok() and self._origin_ok() and secrets.compare_digest(header, owner.token)):
+                if not (self._host_ok() and self._origin_ok() and self._same(header, owner.token)):
                     return self._send(403, b"forbidden", "text/plain")
+                owner._last = time.monotonic()
                 if not (self.headers.get("Content-Type") or "").startswith("application/json"):
                     return self._send(415, b"send JSON", "text/plain")
                 path = urlsplit(self.path).path
@@ -511,10 +555,12 @@ class SetupServer:
                     data = json.loads(self.rfile.read(n) or b"{}")
                     if not isinstance(data, dict):
                         raise TypeError
-                    picks, notes = data.get("plugins", []), data.get("notes")
-                    if not isinstance(picks, list) or not all(isinstance(m, str) for m in picks):
+                    picks, notes, cap = data.get("plugins", []), data.get("notes"), data.get("cap")
+                    if not isinstance(picks, list) or not all(isinstance(m, str) for m in picks) or len(picks) > 50:
                         raise ValueError
                     if notes is not None and not isinstance(notes, str):
+                        raise ValueError
+                    if cap is not None and (isinstance(cap, bool) or not isinstance(cap, (str, int, float))):
                         raise ValueError
                 except (ValueError, TypeError):
                     return self._send(400, b"bad request", "text/plain")
@@ -523,7 +569,7 @@ class SetupServer:
                     self._json(200, {"ok": True})
                     owner._done.set()
                     return
-                self._json(*owner.handle(path, picks, notes))
+                self._json(*owner.handle(path, picks, notes, cap))
 
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.httpd.daemon_threads = True
@@ -533,36 +579,63 @@ class SetupServer:
     def url(self) -> str:
         return f"http://127.0.0.1:{self.port}/?t={self.token}"
 
-    def _choices(self, picks: list[str], notes: str | None) -> flow.Choices:
-        c = replace(self.choices, plugins=frozenset(picks))
-        return replace(c, notes=notes.strip()) if notes and notes.strip() else c
+    launcher: Path | None = None  # the local file that redirects the browser here; gone after the first load
 
-    def handle(self, path: str, picks: list[str], notes: str | None) -> tuple[int, dict]:
-        """Run a preview or the install for what the page sent. Errors the person can fix come back as 400 + a message."""
-        facts, c = self.facts, self._choices(picks, notes)
+    def forget_launcher(self) -> None:
+        if self.launcher is not None:
+            shutil.rmtree(self.launcher.parent, ignore_errors=True)
+            self.launcher = None
+
+    def _choices(self, picks: list[str], notes: str | None, cap) -> flow.Choices:
+        """What the page sent, on top of the starting choices. Nothing is trimmed but spaces; a control character or a
+        cap that is not a number is refused by `flow.check_choices` / `flow.parse_cap` with a plain message."""
+        c = replace(self.choices, plugins=frozenset(picks))
+        if notes is not None and notes.strip(" "):
+            c = replace(c, notes=notes.strip(" "))
+        if isinstance(cap, str):
+            c = replace(c, cap=flow.parse_cap(cap) if cap.strip() else self.choices.cap)
+        elif cap is not None:
+            c = replace(c, cap=float(cap))
+        return c
+
+    def handle(self, path: str, picks: list[str], notes: str | None, cap=None) -> tuple[int, dict]:
+        """Run a preview or the install for what the page sent. Input ws cannot use comes back as a 400 with a plain
+        message, before anything is written; anything unexpected is a 500 that says so. It never raises."""
+        facts = self.facts
+        started = False
         with self._lock:
             if self._done.is_set():
                 return 409, {"error": "Setup has already finished."}
             try:
-                pv = flow.preview(facts, c)
+                c = self._choices(picks, notes, cap)
+                pv = flow.preview(facts, c)  # checks everything, and does a dry run, before the first write
                 headline = pv.headline()
                 if path == "/api/preview":
                     return 200, {
                         "headline": headline,
                         "changes": pv.changes,
                         "notes": flow.tilde(install.expand(c.notes, facts.env), facts.env),
+                        "cap": c.cap,
                         "rows": pv.rows[:MAX_ROWS],
                         "groups": [{"name": n, "detail": ""} for n, _ in flow.groups(pv.steps)],
                     }
                 prog = flow.Progress(pv.steps)
+                started = True
                 outcome = flow.run_install(facts, c, pv.steps, prog.step)
-            except (InstallError, OSError) as e:
-                return 400, {"error": str(e)}
+            except flow.ENGINE_ERRORS as e:
+                tail = " What was written is recorded; `ws uninstall` removes it." if started else ""
+                return 400, {"error": flow.clean(str(e)) + tail}
+            except Exception:  # noqa: BLE001 - whatever it was, answer with JSON and say what state things are in
+                tail = (
+                    " What was written is recorded; `ws uninstall` removes it." if started else " Nothing was written."
+                )
+                return 500, {"error": "Something went wrong inside ws setup." + tail}
             res = outcome.result
             doc = {
                 "headline": pv.headline() if res.changes else "0 changes",
                 "groups": [{"name": n, "detail": prog.detail(n)} for n in prog.names],
-                "notes": outcome.notes + [f"you changed it, so ws left it: {p}" for p in res.edited],
+                "notes": outcome.notes
+                + [f"you changed it, so ws left it: {flow.tilde(p, facts.env)}" for p in res.edited],
                 "next": flow.next_commands(facts, c),
                 "saved": flow.saved_in(facts.env),
             }
@@ -587,17 +660,36 @@ class SetupServer:
         self._done.set()
 
 
+def _launcher(url: str) -> Path:
+    """A local page that sends the browser to `url`. The browser is started on this file, so the one-time token is
+    never on a command line (where `ps` would show it); the file is private to you and goes after the first load."""
+    folder = Path(tempfile.mkdtemp(prefix="ws-setup-"))  # created 0700
+    path = folder / "open.html"
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    safe = html.escape(url, quote=True)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(
+            f'<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="0;url={safe}">'
+            f'<title>ws setup</title><p>Opening ws setup. If nothing happens, <a href="{safe}">open it</a>.</p>'
+        )
+    return path
+
+
 def run(facts: flow.Facts, choices: flow.Choices, open_browser: bool = True) -> int:
     server = SetupServer(facts, choices)
     print(f"ws setup: {server.url}")
     print("Open it in a browser on this machine. It closes when you finish, or after 10 idle minutes.")
-    if open_browser:
-        webbrowser.open(server.url)
+    print("If you reload the page, open this link again: the address is good for this run only.")
     try:
+        if open_browser:
+            server.launcher = _launcher(server.url)
+            webbrowser.open(server.launcher.as_uri())
         result = server.serve()
     except KeyboardInterrupt:
         print("ws setup: cancelled; nothing was written")
         return 130
+    finally:
+        server.forget_launcher()
     if result is None:
         print("ws setup: closed without installing; nothing was written")
         return 1

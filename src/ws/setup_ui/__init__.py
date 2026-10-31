@@ -51,7 +51,6 @@ import re
 import sys
 
 from ws import doctor
-from ws.install import InstallError
 
 
 def _fail(message: str, hint: str = "") -> int:
@@ -67,6 +66,8 @@ HINTS = (  # (a word in the message, what to try)
     ("NZ only", "if that is wrong: ws setup --region NZ"),
     ("above 0", "for example: ws setup --cap 20"),
     ("too broad", "pick a folder of its own, for example: ws setup --notes ~/Notes"),
+    ("must start with", "write it as ~/Notes or a full path, for example: ws setup --notes ~/Notes"),
+    ("control character", "type a plain path"),
     ("unknown runner", "known runners: " + ", ".join(doctor.RUNNERS)),
 )
 
@@ -91,7 +92,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
             region=args.region,
         )
         flow.check_choices(facts, choices)
-    except (InstallError, OSError) as e:
+    except flow.ENGINE_ERRORS as e:
         return _fail(str(e), next((hint for word, hint in HINTS if word in str(e)), ""))
     if args.web:
         from ws.setup_ui import web

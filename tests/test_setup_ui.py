@@ -12,6 +12,7 @@ import re
 import stat
 import sys
 import threading
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -51,9 +52,10 @@ def plain(text: str) -> str:
     return ANSI_RE.sub("", text)
 
 
-def walk(keys, *, live=False, interactive=True, region="NZ", cols=100, **flags):
+def walk(keys, *, live=False, interactive=True, region="NZ", cols=100, cap=20, **flags):
+    """Walk the steps with these keys. A cap is given by default, so the optional cap step is not asked."""
     facts = flow.gather(os.environ, region=region)
-    choices = flow.choices_from(facts, region=region, **flags)
+    choices = flow.choices_from(facts, region=region, cap=cap, **flags)
     out = io.StringIO()
     it = iter(keys)
 
@@ -557,3 +559,312 @@ def test_a_plugin_already_on_is_marked_on_now(box, capsys):
     walk(["enter", "space", "enter", "enter", "enter"])
     _, text, _ = walk(["c", "enter", "enter", "enter"])
     assert "on now" in text
+
+
+# ---- review round 1: input that is not plain, signals, the token, the cap ------------------------------------------------
+
+ESC = "\x1b"
+OSC = f"{ESC}]0;pwned\x07"
+
+
+def test_clean_removes_every_control_character():
+    assert flow.clean(f"a{OSC}b\x85c\x7fd\ne\tf\x00g") == "a]0;pwnedbcdefg"
+    assert flow.has_control("x\x9b") and not flow.has_control("naïve ✓ ~/Notes")
+
+
+def test_nothing_from_outside_reaches_the_terminal_raw(box):
+    fake_runner(box, f"9.9.9{OSC}")  # what the runner prints for --version
+    (box / ".ws").mkdir()
+    toml = (
+        '[roles.model]\ndefault = "m\\u001b]0;pwned\\u0007x"\n'  # TOML escapes: the file holds the text, not a raw ESC
+    )
+    (box / ".ws" / "profile.toml").write_text(toml)
+    (box / "Obsidian" / f"V{ESC}[31m" / ".obsidian").mkdir(parents=True)  # a vault whose folder name has an ESC in it
+    facts = flow.gather(os.environ, region="NZ")
+    rows = {r.label: r.value for r in flow.status_rows(facts)}
+    assert not any(flow.has_control(v) for v in rows.values())
+    assert facts.vaults == []  # not offered: a name with a control character cannot be chosen by typing it
+    _, text, _ = walk(ALL_ENTER, live=True)
+    assert f"{ESC}]" not in text and "\x07" not in text  # no OSC: no window title, no bell
+    assert all(not flow.has_control(c) or c in "\n\r" for c in set(ANSI_RE.sub("", text)))  # only ws's own escapes
+
+
+def test_a_notes_folder_must_be_plain_and_a_full_path(box, capsys):
+    (box / "elsewhere").mkdir()
+    (box / "linkhome").symlink_to(box, target_is_directory=True)
+    pre = snapshot(box)
+    for notes, message in (
+        ("Notes", "must start with"),  # relative
+        ("~root/x", "must start with"),  # another user's home
+        ("~", "must start with"),
+        (f"~/a{ESC}b", "control character"),
+        ("~/a\x00b", "control character"),
+        ("~/a\x85b", "control character"),
+        (str(box / "linkhome"), "too broad"),  # a link to your home does not get past the check
+        ("/", "too broad"),
+        ("", "empty"),
+        ("~/" + "x" * 5000, "too long"),
+    ):
+        facts = flow.gather(os.environ, region="NZ")
+        c = replace(flow.choices_from(facts, region="NZ"), notes=notes)
+        with pytest.raises(InstallError, match=message):
+            flow.check_choices(facts, c)
+    assert snapshot(box) == pre
+
+
+def test_the_cli_refuses_a_bad_notes_folder_with_a_hint(box, capsys):
+    pre = snapshot(box)
+    for notes, hint in (("Notes", "~/Notes"), ("~root/x", "~/Notes"), (f"~/a{ESC}b", "plain path")):
+        assert cli.main(["setup", "--yes", "--notes", notes]) == 1
+        err = capsys.readouterr().err.splitlines()
+        assert err[0].startswith("ws: ") and hint in err[1]
+        assert ESC not in "".join(err)
+    assert snapshot(box) == pre
+
+
+def test_a_step_that_could_fail_half_way_is_refused_before_the_first_write(box):
+    with pytest.raises(InstallError, match="control character"):
+        flow.check_steps([install.Step(box / "a\x00b", "file", "x")])
+    with pytest.raises(InstallError, match="cannot be written"):
+        flow.check_steps([install.Step(box / "ok", "file", "bad \ud800 text")])
+
+
+@posix_only
+def test_the_web_refuses_a_nul_in_the_notes_folder_without_writing_and_stays_up(box):
+    srv, t, _ = _start()
+    pre = snapshot(box)
+    try:
+        for notes in ("\u0000x", "~/a\u0000b", f"~/a{ESC}b", "relative"):
+            for path in ("/api/preview", "/api/install"):
+                status, data = _api(srv, path, {"plugins": [], "notes": notes})
+                assert status == 400 and json.loads(data)["error"]
+        assert snapshot(box) == pre  # not even the policy or the profile
+        assert _api(srv, "/api/preview", {"plugins": [], "notes": "~/Notes"})[0] == 200  # still answering
+    finally:
+        srv.close()
+        t.join(5)
+
+
+def test_the_web_handler_never_raises_whatever_goes_wrong(box, monkeypatch):
+    srv, t, _ = _start()
+    body = {"plugins": [], "notes": "~/Notes"}
+    try:
+        monkeypatch.setattr(flow, "preview", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+        status, data = _api(srv, "/api/preview", body)
+        doc = json.loads(data)
+        assert status == 500 and "went wrong" in doc["error"] and "boom" not in doc["error"]
+        monkeypatch.undo()
+        real = flow.run_install
+
+        def broken(*a, **k):
+            real(*a, **k)
+            raise ValueError("late")
+
+        monkeypatch.setattr(flow, "run_install", broken)
+        status, data = _api(srv, "/api/install", body)
+        assert status == 400 and "ws uninstall" in json.loads(data)["error"]  # it says what state things are in
+        monkeypatch.setattr(flow, "run_install", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x")))
+        status, data = _api(srv, "/api/install", body)
+        assert status == 500 and "recorded" in json.loads(data)["error"]
+    finally:
+        monkeypatch.undo()
+        srv.close()
+        t.join(5)
+
+
+def test_a_non_ascii_token_is_a_403_not_a_traceback(box, capsys):
+    srv, t, _ = _start()
+    try:
+        assert _call(srv, "GET", "/?t=%C3%A9")[0] == 403
+        status, _ = _call(srv, "POST", "/api/preview", "{}", {"X-Ws-Token": "t\xe9k\xe9n"})
+        assert status == 403
+        assert _call(srv, "GET", f"/?t={srv.token}")[0] == 200  # still up
+    finally:
+        srv.close()
+        t.join(5)
+    assert "Traceback" not in capsys.readouterr().err
+
+
+def test_only_a_request_with_the_token_keeps_the_page_alive(box):
+    import time
+
+    facts = flow.gather(os.environ, region="NZ")
+    srv = SetupServer(facts, flow.choices_from(facts), idle_seconds=0.6)
+    done = threading.Event()
+    threading.Thread(target=lambda: (srv.serve(), done.set()), daemon=True).start()
+    end = time.monotonic() + 3
+    while not done.is_set() and time.monotonic() < end:
+        try:
+            _call(srv, "GET", "/?t=wrong")  # a stranger knocking does not reset the idle clock
+        except OSError:
+            break
+        time.sleep(0.1)
+    assert done.wait(3)
+
+
+def test_the_browser_is_started_on_a_private_file_not_on_the_token(box, monkeypatch, capsys):
+    from ws.setup_ui import web
+
+    seen: dict = {}
+    made: list = []
+
+    class Spy(SetupServer):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            made.append(self)
+
+    monkeypatch.setattr(web, "SetupServer", Spy)
+    monkeypatch.setattr(web.webbrowser, "open", lambda arg: seen.setdefault("arg", arg))
+    facts = flow.gather(os.environ, region="NZ")
+    t = threading.Thread(target=lambda: seen.setdefault("code", web.run(facts, flow.choices_from(facts))), daemon=True)
+    t.start()
+    import time
+
+    for _ in range(100):
+        if "arg" in seen:
+            break
+        time.sleep(0.05)
+    srv = made[0]
+    arg = seen["arg"]
+    assert arg.startswith("file://") and srv.token not in arg
+    launcher = Path(arg.removeprefix("file://"))
+    assert srv.token in launcher.read_text()  # the token is in the private file, which only you can read
+    if sys.platform != "win32":
+        assert stat.S_IMODE(launcher.stat().st_mode) == 0o600 and stat.S_IMODE(launcher.parent.stat().st_mode) == 0o700
+    assert _call(srv, "GET", f"/?t={srv.token}")[0] == 200
+    assert not launcher.exists()  # gone after the first load
+    assert _api(srv, "/api/finish", {})[0] == 200
+    t.join(5)
+    out = capsys.readouterr().out
+    assert "open this link again" in out and seen["code"] == 0
+
+
+def test_the_403_page_says_what_to_do(box):
+    srv, t, _ = _start()
+    try:
+        status, body = _call(srv, "GET", "/")
+        assert status == 403 and b"link that ws setup printed" in body
+    finally:
+        srv.close()
+        t.join(5)
+
+
+@posix_only
+def test_sigterm_in_raw_mode_restores_the_terminal_and_cancels(box):
+    import pty
+    import signal
+    import termios
+    import time
+
+    master, slave = pty.openpty()
+    out = io.StringIO()
+    before = termios.tcgetattr(slave)[3]
+    try:
+        with pytest.raises(inline.Cancelled), inline.Terminal(slave, out):
+            assert not termios.tcgetattr(slave)[3] & termios.ICANON  # single-key mode while it runs
+            os.kill(os.getpid(), signal.SIGTERM)
+            time.sleep(0.2)
+        assert termios.tcgetattr(slave)[3] == before  # put back
+        assert out.getvalue().startswith(inline.HIDE) and out.getvalue().endswith(inline.SHOW)
+        assert signal.getsignal(signal.SIGTERM) in (signal.SIG_DFL, signal.default_int_handler) or callable(
+            signal.getsignal(signal.SIGTERM)
+        )
+    finally:
+        os.close(master)
+        os.close(slave)
+
+
+@posix_only
+def test_ctrl_z_gives_the_screen_back_and_fg_takes_it_again(box):
+    import pty
+    import termios
+
+    master, slave = pty.openpty()
+    out = io.StringIO()
+    try:
+        term = inline.Terminal(slave, out)
+        term.enter()
+        assert not termios.tcgetattr(slave)[3] & termios.ICANON and out.getvalue().endswith(inline.HIDE)
+        term.leave()  # what the Ctrl-Z handler does before it stops the process
+        assert termios.tcgetattr(slave)[3] & termios.ICANON and out.getvalue().endswith(inline.SHOW)
+        term.enter()  # and what SIGCONT does
+        assert not termios.tcgetattr(slave)[3] & termios.ICANON and out.getvalue().endswith(inline.HIDE)
+        term.leave()
+    finally:
+        os.close(master)
+        os.close(slave)
+
+
+def test_the_width_is_read_again_so_a_resize_is_picked_up(box):
+    size = [120]
+    facts = flow.gather(os.environ, region="NZ")
+    wiz = inline.Wizard(facts, flow.choices_from(facts), io.StringIO(), lambda: "enter", cols=lambda: size[0])
+    assert (wiz.cols, wiz.width) == (120, 100)
+    size[0] = 70  # the window was resized
+    assert (wiz.cols, wiz.width) == (70, 66)
+
+
+def test_the_cap_step_is_asked_only_when_there_is_no_cap_and_skips_by_default(box):
+    keys = ["enter", "enter", "enter", "enter", "enter"]  # begin, plugins, notes, cap (skip), install
+    code, text, _ = walk(keys, cap=None, live=True)
+    assert (
+        code == 0
+        and "Monthly cap" in plain(text)
+        and "monthly_cap_usd" not in (box / ".ws" / "profile.toml").read_text()
+    )
+
+
+def test_a_cap_typed_in_the_walk_goes_into_the_profile(box):
+    keys = ["enter", "enter", "enter", "2", "0", "enter", "enter"]
+    code, text, _ = walk(keys, cap=None, live=True)
+    assert code == 0 and "monthly_cap_usd = 20" in (box / ".ws" / "profile.toml").read_text()
+    assert "US$20 a month" in plain(text)
+
+
+def test_a_bad_cap_is_said_plainly_and_asked_again(box):
+    keys = ["enter", "enter", "enter", "0", "enter", "backspace", "5", "enter", "enter"]
+    code, text, _ = walk(keys, cap=None, live=True)
+    assert (
+        code == 0
+        and "number above 0" in plain(text)
+        and "monthly_cap_usd = 5" in (box / ".ws" / "profile.toml").read_text()
+    )
+
+
+def test_the_cap_step_is_not_asked_when_the_profile_or_a_flag_has_one(box):
+    code, text, _ = walk(ALL_ENTER, cap=30)
+    assert code == 0 and "Monthly cap" not in text
+    code, text, _ = walk(ALL_ENTER)  # the profile now has 30
+    assert "Monthly cap" not in text
+
+
+def test_the_web_takes_an_optional_cap_and_refuses_one_that_is_not_a_number(box):
+    facts = flow.gather(os.environ, region="NZ")
+    srv = SetupServer(facts, flow.choices_from(facts))
+    threading.Thread(target=srv.serve, daemon=True).start()
+    try:
+        assert flow.parse_cap("") is None and flow.parse_cap("US$ 12.5") == 12.5
+        for bad in ("abc", "0", "-3", "nan", "inf", "1e400"):
+            status, _ = _api(srv, "/api/preview", {"plugins": [], "notes": "~/Notes", "cap": bad})
+            assert status == 400, bad
+        assert _api(srv, "/api/preview", {"plugins": [], "notes": "~/Notes", "cap": True})[0] == 400
+        status, _ = _api(srv, "/api/install", {"plugins": [], "notes": "~/Notes", "cap": "20"})
+        assert status == 200
+        assert "monthly_cap_usd = 20" in (box / ".ws" / "profile.toml").read_text()
+    finally:
+        srv.close()
+    page = render_page(facts, flow.choices_from(facts))
+    assert "Monthly cap (US$)" in page
+
+
+def test_setup_never_writes_dial_act(box, capsys):
+    from ws import policy
+
+    cli.main(["setup", "--yes", "--region", "NZ", "--plugin", "calendar", "--cap", "20"])
+    for name in ("policy.toml", "profile.toml"):
+        text = (box / ".ws" / name).read_text()
+        assert 'dial = "act"' not in text
+    assert policy.loads((box / ".ws" / "policy.toml").read_text()).dial == "prepare"
+    # and no code path in setup sets a dial at all
+    src = "".join(p.read_text() for p in Path(inline.__file__).parent.glob("*.py"))
+    assert not re.search(r"\bdial\b", src)

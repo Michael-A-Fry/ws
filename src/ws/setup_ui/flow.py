@@ -5,7 +5,9 @@ changes the machine goes through `ws.install.plan` and `apply`, so setup, `ws in
 
 from __future__ import annotations
 
+import math
 import os
+import re
 import shutil
 import tomllib
 from collections.abc import Callable, Mapping
@@ -16,6 +18,24 @@ from ws import doctor, install, modules, notesdetect, osinfo, runrecord, skills
 from ws import run as ws_run
 from ws.install import Answers, InstallError, Step
 from ws.profile import dumps, profile_path
+
+# Anything that comes from outside ws (a vault's folder name, what `claude --version` prints, a profile value, a path a
+# person typed) is cleaned before it reaches a terminal or a width calculation: a stray ESC could set the window title or
+# move the cursor. `ENGINE_ERRORS` is what the engine can raise for input it cannot use.
+CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+ENGINE_ERRORS = (InstallError, OSError, ValueError, UnicodeError)
+MAX_PATH = 4096
+MAX_CAP = 1_000_000.0
+
+
+def clean(text) -> str:
+    """The text with every C0 and C1 control character (ESC, BEL, newline, DEL, ...) removed."""
+    return CONTROL.sub("", str(text))
+
+
+def has_control(text: str) -> bool:
+    return bool(CONTROL.search(text))
+
 
 RUNNER_LABELS = {"claude-code": "Claude Code", "opencode": "OpenCode"}
 OS_LABELS = {"macos": "macOS", "linux": "Linux", "wsl": "WSL2"}
@@ -132,7 +152,7 @@ def saved_in(env) -> str:
 
 def tilde(path: str | Path, env) -> str:
     """A path as the person would write it: under their home it starts with ~."""
-    p, home = str(path), env.get("HOME") or str(Path.home())
+    p, home = clean(path), env.get("HOME") or str(Path.home())
     return "~" + p[len(home) :] if p == home or p.startswith(home.rstrip("/") + "/") else p
 
 
@@ -145,7 +165,7 @@ def _runners(env, probe: bool) -> list[Runner]:
         path = shutil.which(exe, path=env.get("PATH"))
         if path:
             version = ws_run.exe_version(path, dict(env), timeout=3.0) if probe else None
-            found.append(Runner(name, RUNNER_LABELS.get(name, name), path, version or None))
+            found.append(Runner(name, RUNNER_LABELS.get(name, name), path, clean(version)[:40] or None))
     return found
 
 
@@ -153,7 +173,7 @@ def _plugin_state(m: modules.Module, here: str | None, source: str | None) -> tu
     """(available, why). A region from the profile, `--region` or the time zone refuses; a locale only warns."""
     if not m.region or here is None or here in m.region:
         return True, ""
-    want = "/".join(m.region)
+    here, want = clean(here), "/".join(m.region)
     if source == "locale":
         return True, f"your locale says {here}, which is only a guess"
     return False, f"for {want} only; this machine is in {here}"
@@ -183,6 +203,8 @@ def gather(env=None, region: str | None = None, osi: osinfo.OSInfo | None = None
     env = os.environ if env is None else env
     osi = osi or osinfo.detect()
     base = install.answers_from_profile(env)
+    if has_control(base.notes):  # a folder name with a control character is never offered as the default
+        base = replace(base, notes=notesdetect.PLAIN)
     if region:
         here, source = region.upper(), "flag"
     else:
@@ -197,7 +219,7 @@ def gather(env=None, region: str | None = None, osi: osinfo.OSInfo | None = None
         has_profile=profile_path(env).is_file(),
         set_up=False,
         spent=_spent(env),
-        vaults=notesdetect.find(Path(env.get("HOME") or Path.home())),
+        vaults=[v for v in notesdetect.find(Path(env.get("HOME") or Path.home())) if not has_control(str(v.path))],
         plugins=_plugins(here, source),
     )
     facts.set_up = _is_set_up(facts)
@@ -245,8 +267,9 @@ def status_rows(facts: Facts) -> list[Row]:
         found = Row("Notes", f"{app} vault found at {tilde(install.expand(notes, facts.env), facts.env)}", "ok")
     else:
         found = Row("Notes", f"{tilde(install.expand(notes, facts.env), facts.env)} ({app})")
-    model = facts.base.model or "the runner's default"
-    return [Row("Machine", machine), runner, Row("Model", model), budget, found]
+    model = clean(facts.base.model) or "the runner's default"
+    rows = [Row("Machine", machine), runner, Row("Model", model), budget, found]
+    return [replace(r, value=clean(r.value)) for r in rows]
 
 
 def _pick_runner(facts: Facts, name: str = "") -> Runner | None:
@@ -286,17 +309,52 @@ def choices_from(
 
 
 def check_choices(facts: Facts, c: Choices) -> None:
-    """Refuse what ws would refuse: an unknown plugin, a plugin made for another region, a runner it does not know."""
+    """Refuse what ws would refuse, before anything is planned or written: an unknown plugin, a plugin made for another
+    region, a runner it does not know, a notes folder that is not a plain `~/...` or full path, a cap that is not a number."""
     known = {p.name: p for p in facts.plugins}
     for name in sorted(c.plugins):
         if name not in known:
-            raise InstallError(f"unknown plugin {name!r}; known: {', '.join(known)}")
+            raise InstallError(f"unknown plugin {clean(repr(name))}; known: {', '.join(known)}")
         if not known[name].available:
             raise InstallError(f"{name} is {known[name].why}; if that is wrong, run setup with --region {_cc(name)}")
     if c.runner and c.runner not in doctor.RUNNERS:
         raise InstallError(f"unknown runner {c.runner!r}; known: {', '.join(doctor.RUNNERS)}")
-    if c.cap is not None and not (c.cap > 0 and c.cap != float("inf")):
+    if c.cap is not None and not (isinstance(c.cap, (int, float)) and 0 < c.cap <= MAX_CAP and math.isfinite(c.cap)):
         raise InstallError("the monthly cap must be a number above 0")
+    validate_notes(c.notes, facts.env)
+    if c.region is not None and not re.fullmatch(r"[A-Z]{2}", c.region):
+        raise InstallError("the region must be two letters such as NZ")
+
+
+def validate_notes(path: str, env) -> None:
+    """A notes folder is `~/...` or a full path with nothing odd in it, and not so broad that it covers your home (the
+    check follows symlinks, so a link to your home does not get past it)."""
+    if not isinstance(path, str) or not path.strip():
+        raise InstallError("the notes folder cannot be empty")
+    if has_control(path):
+        raise InstallError("the notes folder has a control character in it; type a plain path")
+    if len(path) > MAX_PATH:
+        raise InstallError("the notes folder path is too long")
+    if not (path.startswith("~/") or os.path.isabs(path)):
+        raise InstallError(f"the notes folder must start with ~/ or be a full path, not {path!r}")
+    resolved = Path(os.path.realpath(install.expand(path, env)))
+    home = Path(os.path.realpath(env.get("HOME") or Path.home()))
+    if resolved == Path(resolved.anchor) or resolved == home or resolved in home.parents:
+        raise InstallError(f"{path} is too broad for ws to manage; pick a folder of its own")
+
+
+def parse_cap(text: str) -> float | None:
+    """What a person typed for the monthly cap: empty means skip; otherwise a number above 0 (a leading US$ or $ is fine)."""
+    t = text.strip().removeprefix("US$").removeprefix("$").strip()
+    if not t:
+        return None
+    try:
+        value = float(t)
+    except ValueError as e:
+        raise InstallError("type a number above 0 for the cap, or leave it empty to skip") from e
+    if not (0 < value <= MAX_CAP and math.isfinite(value)):
+        raise InstallError("type a number above 0 for the cap, or leave it empty to skip")
+    return value
 
 
 def _cc(plugin: str) -> str:
@@ -334,6 +392,7 @@ def preview(facts: Facts, c: Choices) -> Preview:
     """What the install would do, from the real plan and a dry run. Writes nothing."""
     check_choices(facts, c)
     steps = _with_region(install.plan(answers_for(facts, c), facts.env, facts.osi), c.region, facts.env)
+    check_steps(steps)
     result = install.apply(steps, facts.env, dry_run=True)
     action = {}
     for name, paths in (
@@ -344,10 +403,23 @@ def preview(facts: Facts, c: Choices) -> Preview:
     ):
         action.update(dict.fromkeys(paths, name))
     rows = [
-        {"path": tilde(s.path, facts.env), "kind": s.kind, "what": s.what, "action": action.get(s.path, "keep")}
+        {"path": tilde(s.path, facts.env), "kind": s.kind, "what": clean(s.what), "action": action.get(s.path, "keep")}
         for s in steps
     ]
     return Preview(steps, result, rows)
+
+
+def check_steps(steps: list[Step]) -> None:
+    """Everything the install will write, checked before the first write: no path with a control character in it and no
+    file content that cannot be written as UTF-8. A step that would fail half way is refused here instead."""
+    for s in steps:
+        if has_control(str(s.path)):
+            raise InstallError(f"a path with a control character in it: {clean(repr(str(s.path)))}")
+        if s.content is not None:
+            try:
+                s.content.encode("utf-8")
+            except UnicodeError as e:
+                raise InstallError(f"{clean(str(s.path))}: its content cannot be written as text") from e
 
 
 def group_of(step: Step) -> str:
@@ -410,11 +482,14 @@ class Outcome:
 def run_install(
     facts: Facts, c: Choices, steps: list[Step], on_step: Callable[[Step, str], None] | None = None
 ) -> Outcome:
-    """Apply the plan with `install.apply`. `on_step(step, action)` is called as each step finishes."""
+    """Apply the plan with `install.apply`. `on_step(step, action)` is called as each step finishes. The choices and the
+    steps are checked again first, so bad input stops here and not part way through the writes."""
+    check_choices(facts, c)
+    check_steps(steps)
     result = install.apply(steps, facts.env, progress=on_step)
-    notes = list(result.notes)
+    notes = [clean(n) for n in result.notes]
     if "skills" in answers_for(facts, c).modules:
-        notes += skills.notices(c.runner, facts.env)
+        notes += [clean(n) for n in skills.notices(c.runner, facts.env)]
     return Outcome(result, notes)
 
 

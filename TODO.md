@@ -14,3 +14,8 @@
 - [x] prek + gitleaks + PII regex + private denylist secret; `ci.yml` as the required check (planted key, IP and name each
   failed CI: PRs #2-#4, closed)
 - [ ] ShellCheck and taplo hooks when the first shell or TOML file lands; licence check with the first dependency
+
+## Phase 2 (CLI skeleton, doctor)
+
+- [ ] CLI skeleton, `ws doctor` (check IDs, `--json`), OS detection, the 3 questions, Console usage API check
+- [ ] `doctor` exits non-zero listing every role unconfigured on ubuntu-24.04, windows-2025 (WSL) and macos-26

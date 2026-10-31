@@ -7,7 +7,8 @@ import json
 import sys
 from pathlib import Path
 
-from ws import __version__, broker, doctor, gate, mcp_server, memory, notes, osinfo, run, secrets
+from ws import __version__, broker, doctor, gate, mcp_server, memory, notes, osinfo, run, secrets, session
+from ws import globals as ws_globals
 from ws.profile import ProfileError, load, profile_path, write_if_changed
 
 YES = {"y", "yes", "true", "1", "on"}
@@ -136,6 +137,8 @@ def build_parser() -> argparse.ArgumentParser:
     memory.register(sub)
     mcp_server.register(sub)
     run.register(sub)
+    ws_globals.register(sub)
+    session.register(sub)
     return p
 
 

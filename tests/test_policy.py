@@ -757,7 +757,7 @@ def test_reading_or_copying_from_ws_own_files_is_fine(cmd):
 def test_control_paths_are_ws_homes_files_and_folders(tmp_path):
     paths = policy.control_paths(tmp_path)
     assert [p.removeprefix(str(tmp_path) + "/") for p in paths] == list(policy.CONTROL_NAMES)
-    assert {"profile.toml", "policy.toml", "secrets.toml", "jobs", "release", "runs", "logs"} == set(
+    assert {"profile.toml", "policy.toml", "secrets.toml", "jobs", "release", "runs", "logs", "sessions"} == set(
         policy.CONTROL_NAMES
     )
     p = policy.loads("")

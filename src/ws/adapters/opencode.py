@@ -31,6 +31,24 @@ PLUGIN = "plugins/ws-gate.js"
 _TOOLS = {"web_fetch": "webfetch", "web_search": "websearch"}
 _NEUTRAL = {v: k for k, v in _TOOLS.items()}
 
+# Where this runner keeps what ws installs globally, and where a repo may shadow it (read by ws.globals).
+# Both the older singular and the newer plural folder names are listed. kinds: see adapters/claude_code.py.
+GLOBALS = {
+    "user_dir": "~/.config/opencode",
+    "xdg": "opencode",
+    "project_dir": ".opencode",
+    "kinds": {
+        "skills": "dir",
+        "skill": "dir",
+        "agents": "name",
+        "agent": "name",
+        "commands": "name",
+        "command": "name",
+        "plugins": "stem",
+        "plugin": "stem",
+    },
+}
+
 
 def _read_forms(rule: str) -> list[str]:
     """OpenCode matches read and edit rules against the path as it sees it (relative to the project, so a file in
@@ -69,6 +87,7 @@ def generate(policy: Policy, ws_cmd: list[str], out: Path, policy_file: Path) ->
         permission[_TOOLS[t]] = "deny"
     config = {"$schema": "https://opencode.ai/config.json", "permission": permission}
     plugin = SOURCE.replace("/*__CHECK__*/ []", json.dumps(check_argv(ws_cmd, NAME, policy_file, out)))
+    plugin = plugin.replace("/*__WS__*/ []", json.dumps(ws_cmd))
     return {CONFIG: json.dumps(config, indent=2) + "\n", PLUGIN: plugin}
 
 

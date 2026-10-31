@@ -250,6 +250,7 @@ jobs:
           set +e; uv run --locked ws doctor --json > /tmp/doctor.json; code=$?; set -e
           uv run --locked python scripts/check_fresh_doctor.py /tmp/doctor.json "$code"
       - name: credential-free smoke inside WSL2
+        if: ${{ !cancelled() }} # independent of the test step above
         shell: wsl-bash {0}
         run: |
           set -euo pipefail
@@ -258,6 +259,7 @@ jobs:
           WS_SMOKE_CMD="uv run --locked ws" WS_E2E_CELL=wsl2-ubuntu-24.04 /bin/bash scripts/e2e_first_task.sh --smoke
       # The timing file goes back to the Windows workspace (WSLENV translates the two paths) so it can be uploaded.
       - name: first task, timed, inside WSL2
+        if: ${{ !cancelled() }} # independent of the test step above
         shell: wsl-bash {0}
         env:
           WSLENV: GITHUB_WORKSPACE/p:GITHUB_STEP_SUMMARY/p

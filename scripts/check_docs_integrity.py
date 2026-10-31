@@ -36,7 +36,7 @@ SKIP_PARTS = {".git", ".venv", "node_modules", ".claude", ".claude-state", ".pyt
 
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 HEADING = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.*?)(?:[ \t]+#+)?[ \t]*$")
-CODE_SPAN = re.compile(r"(`+)(.+?)\1", re.DOTALL)
+CODE_SPAN = re.compile(r"(`+)(.+?)\1")  # one line only: a stray backtick must not hide links far below it
 INLINE_LINK = re.compile(r"!?\[(?:[^\]\\]|\\.)*\]\(\s*(<[^>]*>|[^)\s]*)(?:\s+(?:\"[^\"]*\"|'[^']*'))?\s*\)")
 REF_DEF = re.compile(r"^ {0,3}\[[^\]]+\]:[ \t]*(<[^>]*>|\S+)", re.MULTILINE)
 HTML_REF = re.compile(r"<(?:a\s[^>]*?href|img\s[^>]*?src)\s*=\s*(?:\"([^\"]*)\"|'([^']*)')", re.IGNORECASE)
@@ -72,8 +72,8 @@ def strip_code(text: str) -> str:
         if fence:
             marker = fence.group(1)
             continue
-        kept.append(line)
-    return CODE_SPAN.sub("", "\n".join(kept))
+        kept.append(CODE_SPAN.sub("", line))
+    return "\n".join(kept)
 
 
 def link_targets(text: str) -> list[str]:

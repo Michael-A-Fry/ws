@@ -557,6 +557,7 @@ main() {
                 ;;
             --from)
                 [ $# -ge 2 ] || usage_error "--from needs the folder of a checkout"
+                [ -n "${2//[[:space:]]/}" ] || usage_error "--from needs the folder of a checkout"
                 from_path="$2"
                 shift 2
                 ;;

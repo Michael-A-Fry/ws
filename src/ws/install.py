@@ -706,7 +706,7 @@ def _answers_from_args(args: argparse.Namespace, env: Mapping[str, str]) -> Answ
         a = replace(a, stays_on=_yes_no(args.stays_on))
     if args.server is not None:
         a = replace(a, server="" if args.server.strip().lower() == "none" else args.server.strip())
-    if args.notes is not None:
+    if args.notes is not None and args.notes.strip():
         a = replace(a, notes=args.notes)
     if args.module:
         a = replace(a, modules=a.modules | frozenset(args.module))

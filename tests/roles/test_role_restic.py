@@ -7,12 +7,13 @@ import json
 import os
 import random
 import shutil
+import socket
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
-from ws import cli, install, jobs
+from ws import cli, install, jobs, osinfo
 from ws.roles import restic
 
 PASSWORD = "pw-" + "x7q2" * 4  # built here so no fixed secret sits in the repo
@@ -114,12 +115,18 @@ def test_password_from_a_private_file(box, env):
     f.write_text(PASSWORD + "\n")
     f.chmod(0o600)
     assert restic.password({"password_file": str(f)}, env) == PASSWORD
-    f.chmod(0o666)
-    with pytest.raises(restic.BackupError, match="can be written by others"):
-        restic.password({"password_file": str(f)}, env)
+    for mode in (0o666, 0o640, 0o604, 0o644):  # readable by others is as bad as writable
+        f.chmod(mode)
+        with pytest.raises(restic.BackupError, match=r"open to other users \(mode") as e:
+            restic.password({"password_file": str(f)}, env)
+        assert PASSWORD not in str(e.value)
+    f.chmod(0o400)
+    assert restic.password({"password_file": str(f)}, env) == PASSWORD
+    f.chmod(0o600)
+    with pytest.raises(restic.BackupError, match="not a file"):
+        restic.password({"password_file": str(box)}, env)
     with pytest.raises(restic.BackupError, match="No such file"):
         restic.password({"password_file": str(box / "nope")}, env)
-    f.chmod(0o600)
     f.write_text("a\x01b")
     with pytest.raises(restic.BackupError, match="cannot be used"):
         restic.password({"password_file": str(f)}, env)
@@ -134,6 +141,18 @@ def test_password_secret_problems_are_plain(box, env, setup):
     (box / ".ws" / "secrets").chmod(0o755)
     with pytest.raises(restic.BackupError, match="open to other users") as e:
         restic.password(cfg, env)
+    assert PASSWORD not in str(e.value)
+
+
+def test_a_walled_store_says_to_use_password_file(box, env, setup):
+    """Store.read reports a closed store as SecretsError, so the message has to come from here."""
+    cfg, *_ = setup
+    (box / ".ws" / "secrets").chmod(0o755)
+    real = os.geteuid()
+    with pytest.MonkeyPatch.context() as m:
+        m.setattr(restic.os, "geteuid", lambda: real + 1)  # the store is now another user's
+        with pytest.raises(restic.BackupError, match="belongs to another user.*password_file") as e:
+            restic.password(cfg, env)
     assert PASSWORD not in str(e.value)
 
 
@@ -159,9 +178,31 @@ def test_verify_restores_one_file_and_compares_hashes(box, env, setup):
     result = restic.verify(cfg, env, fake, rng=random.Random(1), now=datetime(2026, 3, 5, tzinfo=UTC))
     assert result.ok and "SHA-256 matches" in result.detail
     restores = [c for c, _ in fake.calls if c[0] == "restore"]
-    assert len(restores) == 1 and restores[0][:3] == ["restore", "latest", "--target"]
-    assert not Path(restores[0][3]).exists()  # the temporary folder is gone
+    assert len(restores) == 1 and restores[0][:6] == [
+        "restore",
+        "latest",
+        "--tag",
+        "ws",
+        "--host",
+        socket.gethostname(),
+    ]
+    assert not Path(restores[0][restores[0].index("--target") + 1]).exists()  # the temporary folder is gone
     assert json.loads(restic.verify_path(env).read_text())["last_ok_at"].startswith("2026-03-05")
+
+
+def test_ls_and_restore_only_look_at_this_machines_ws_snapshots(box, env, setup):
+    cfg, mem, _ = setup
+    old(mem / "a.md")
+    fake = FakeRestic(snapshot_of(mem / "a.md"))
+    restic.verify(cfg, env, fake, rng=random.Random(0))
+    want = ["latest", "--tag", "ws", "--host", socket.gethostname()]
+    ls = next(c for c, _ in fake.calls if c[0] == "ls")
+    assert ls[1:6] == want and ls[-1] == "--json"
+    restore = next(c for c, _ in fake.calls if c[0] == "restore")
+    assert restore[1:6] == want
+    fake = FakeRestic()
+    restic.backup(cfg, env, fake)
+    assert fake.calls[0][0][:3] == ["backup", "--tag", "ws"]
 
 
 def test_verify_picks_a_random_file(box, env, setup):
@@ -262,11 +303,27 @@ def test_doctor_warns_until_a_verify_has_passed_in_30_days(box, with_restic, lin
     assert status == "ok" and "verified 2 days ago" in detail
 
 
+def test_doctor_fails_when_the_nightly_job_could_not_read_the_password(box, env, with_restic, linux, setup):
+    cfg, *_ = setup
+    assert restic.check(cfg, linux, with_restic, False)[0] == "warn"  # readable: only the missing verify
+    (box / ".ws" / "secrets" / "restic-password").unlink()
+    status, detail = restic.check(cfg, linux, with_restic, False)
+    assert status == "fail" and "nightly backup would fail" in detail and "ws secret set restic-password" in detail
+    f = box / "pw"
+    f.write_text(PASSWORD)
+    f.chmod(0o644)
+    status, detail = restic.check({**cfg, "password_file": str(f)}, linux, with_restic, False)
+    assert status == "fail" and "open to other users" in detail and PASSWORD not in detail
+    f.chmod(0o600)
+    assert restic.check({**cfg, "password_file": str(f)}, linux, with_restic, False)[0] == "warn"
+
+
 def test_doctor_fails_without_a_repo_restic_or_anything_to_back_up(box, env, with_restic, linux, setup):
     cfg, *_ = setup
     assert restic.check({"adapter": "restic"}, linux, with_restic, False)[0] == "fail"
     assert restic.check(cfg, linux, {**env, "PATH": str(box)}, False) == ("fail", "restic is not on PATH")
-    assert restic.check({**cfg, "password_secret": "../x"}, linux, with_restic, False)[0] == "fail"
+    status, detail = restic.check({**cfg, "password_secret": "../x"}, linux, with_restic, False)
+    assert status == "fail" and "name of a secret" in detail
     shutil.rmtree(box / "mem")
     shutil.rmtree(box / "Notes")
     (box / ".ws" / "profile.toml").unlink()
@@ -284,6 +341,38 @@ def test_steps_make_a_backup_job_the_scheduler_picks_up(box, env, setup):
     install.apply([step], env)
     [s] = jobs.scheduled(env)
     assert s.name == "backup" and s.argv == ("backup", "run") and str(s.when) == "daily 03:00"
+
+
+def test_install_plan_writes_the_backup_job_and_the_memory_folder(box, env, setup):
+    """restic's and markdown-git's steps() are part of `ws install`, so backup.toml is written without a second command."""
+    _cfg, mem, _ = setup
+    steps = install.plan(install.Answers(memory=str(mem)), env, osinfo.OSInfo("linux", "x", "x86_64", "systemd", True))
+    job = [s for s in steps if s.path == box / ".ws" / "jobs" / "backup.toml"]
+    assert len(job) == 1 and job[0].content == 'command = "backup"\nschedule = "daily 03:00"\n'
+    assert len([s for s in steps if s.path == mem]) == 1  # the memory folder is not asked for twice
+    result = install.apply(steps, env)
+    assert (box / ".ws" / "jobs" / "backup.toml").is_file()
+    assert (
+        install.apply(
+            install.plan(install.Answers(memory=str(mem)), env, osinfo.OSInfo("linux", "x", "x86_64", "systemd", True)),
+            env,
+        ).changes
+        == 0
+    )
+    assert result.changes >= 1
+
+
+def test_install_plan_without_a_backup_role_adds_no_job(box, env, write_profile):
+    write_profile({"roles": {"memory": {"path": str(box / "m")}}})
+    steps = install.plan(install.Answers(), env, osinfo.OSInfo("linux", "x", "x86_64", "systemd", True))
+    assert not any(s.path.name == "backup.toml" for s in steps)
+
+
+def test_install_plan_refuses_a_bad_backup_schedule_by_name(box, env, setup, write_profile):
+    cfg, mem, _ = setup
+    write_profile({"roles": {"memory": {"path": str(mem)}, "backup": {**cfg, "schedule": "sometime"}}})
+    with pytest.raises(install.InstallError, match=r"\[roles.backup\].*schedule must be"):
+        install.plan(install.Answers(), env, osinfo.OSInfo("linux", "x", "x86_64", "systemd", True))
 
 
 def test_steps_keep_a_job_file_you_changed_and_refuse_a_bad_schedule(box, env, setup):

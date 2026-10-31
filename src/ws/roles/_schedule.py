@@ -2,8 +2,10 @@
 
 Unit files are written to `$WS_HOME/jobs/units/`, inside ws's own folders, so `install.apply` records them and
 `ws uninstall` removes them. The folder is under `jobs`, which a session may not write to: a timer runs code, so the
-agent must not be able to edit what it runs. systemd links them into place (`systemctl --user link`); launchd is
-pointed at them (`launchctl bootstrap`). Neither needs a file outside `$WS_HOME`.
+agent must not be able to edit what it runs. systemd links them into place (`systemctl --user link`, which leaves a
+symlink per file in `~/.config/systemd/user`); launchd is pointed at them (`launchctl bootstrap`, which keeps its own
+record). Both records are outside `$WS_HOME`, so removing a job's timer, and `ws uninstall`, switch them off through the
+adapter's `deactivate` before the files go.
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from ws import jobs
-from ws.profile import ProfileError, load, profile_path, ws_home
+from ws.profile import ws_home
 
 Runner = Callable[[list[str]], tuple[int, str]]
 CONTROL = re.compile(r"[\x00-\x1f\x7f]")
@@ -35,15 +37,6 @@ def ws_command(env) -> list[str]:
     """How a timer starts ws: the `ws` on PATH, else this Python with -m ws. Absolute either way."""
     exe = shutil.which("ws", path=env.get("PATH"))
     return [os.path.abspath(exe)] if exe else [sys.executable, "-m", "ws"]
-
-
-def stays_on(env) -> bool:
-    """The install answer 'does this machine stay on?': when it does not, a timer must catch up what it missed."""
-    try:
-        machine = (load(profile_path(env)) or {}).get("machine")
-    except ProfileError:
-        return False
-    return isinstance(machine, dict) and machine.get("stays_on") is True
 
 
 def run_cmd(argv: list[str]) -> tuple[int, str]:

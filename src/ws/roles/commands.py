@@ -1,6 +1,6 @@
 """The commands the role adapters bring: `ws notify`, `ws backup` and `ws schedule`.
 
-    ws notify test|send|status      a test push, a counted push or digest, today's count against the cap
+    ws notify test|send|status      a test push, a push or digest, today's count against the policy's cap
     ws backup init|run|verify       make the restic repository, back up, prove a file restores
     ws schedule list|apply|remove   timers for the job files that have a `schedule`
 
@@ -53,10 +53,14 @@ def cmd_notify_send(args: argparse.Namespace) -> int:
 
 
 def cmd_notify_status(args: argparse.Namespace) -> int:
-    counts = ntfy.read_counts(os.environ, ntfy.today())
-    print(
-        f"ws: today {counts['push']} of {ntfy.CAPS['push']} pushes, {counts['digest']} of {ntfy.CAPS['digest']} digest"
-    )
+    try:
+        cfg, env = _role("notify", "ntfy"), os.environ
+        cap = ntfy.caps(env)
+        counts = ntfy.read_counts(env, ntfy.today(ntfy.zone(cfg, env)))
+    except (ValueError, ntfy.NotifyError) as e:
+        print(f"ws: {e}", file=sys.stderr)
+        return 1
+    print(f"ws: today {counts['push']} of {cap['push']} pushes, {counts['digest']} of {cap['digest']} digest")
     return 0
 
 
@@ -134,20 +138,38 @@ def cmd_schedule_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def _drop(sched, env, names: list[str]) -> tuple[int, list[str]]:
+    """Switch these jobs' timers off, delete the unit files ws wrote for them and take them out of the manifest, so
+    uninstall does not look for them. Returns (files deleted, problems)."""
+    problems = sched.deactivate(names, env)
+    gone = []
+    for name in names:
+        for path in sched.files_for(env, name):
+            if path.is_file() and not path.is_symlink():
+                path.unlink()
+                gone.append(path)
+    install.forget(gone, env)
+    return len(gone), problems
+
+
 def cmd_schedule_apply(args: argparse.Namespace) -> int:
     env = os.environ
     try:
         sched = _scheduler(osinfo.detect())
-        answers = install.answers_from_profile(env)
-        steps = sched.steps({}, answers, env)
+        steps = sched.steps({}, install.answers_from_profile(env), env)
         result = install.apply(steps, env, dry_run=args.dry_run)
-        problems = [] if args.dry_run or not steps else sched.activate(env)
+        stale = sched.orphans(env)  # a job whose schedule was removed: its timer must not stay on
+        problems: list[str] = []
+        if not args.dry_run:
+            problems += _drop(sched, env, stale)[1]
+            problems += sched.activate(env)
     except (ValueError, install.InstallError, OSError) as e:
         print(f"ws: {e}", file=sys.stderr)
         return 1
     for p in problems:
         print(f"ws: {p}", file=sys.stderr)
-    print(f"ws: {'dry run: ' if args.dry_run else ''}{len(steps)} unit file(s), {result.summary()}")
+    tail = f"; {'would stop' if args.dry_run else 'stopped'} {', '.join(stale)} (no schedule now)" if stale else ""
+    print(f"ws: {'dry run: ' if args.dry_run else ''}{len(steps)} unit file(s), {result.summary()}{tail}")
     return 1 if problems else 0
 
 
@@ -157,14 +179,8 @@ def cmd_schedule_remove(args: argparse.Namespace) -> int:
     try:
         if not jobs.NAME.match(args.job):
             raise ValueError("a job name is letters, digits, - and _")
-        sched = _scheduler(osinfo.detect())
-        problems = sched.deactivate([args.job], env)
-        gone = 0
-        for path in sched.files_for(env, args.job):
-            if path.is_file() and not path.is_symlink():
-                path.unlink()
-                gone += 1
-    except (ValueError, OSError) as e:
+        gone, problems = _drop(_scheduler(osinfo.detect()), env, [args.job])
+    except (ValueError, install.InstallError, OSError) as e:
         print(f"ws: {e}", file=sys.stderr)
         return 1
     for p in problems:
@@ -176,7 +192,7 @@ def cmd_schedule_remove(args: argparse.Namespace) -> int:
 def register(sub) -> None:
     n = sub.add_parser("notify", help="push to your phone through ntfy: at most 1 digest and 3 pushes a day")
     ns = n.add_subparsers(dest="notify_command", required=True)
-    p = ns.add_parser("test", help="send a test message (does not count against the daily cap)")
+    p = ns.add_parser("test", help="send a test push (it counts against the daily cap)")
     p.set_defaults(func=cmd_notify_test)
     p = ns.add_parser("send", help="send a push, or a digest with --digest, if today's cap allows")
     p.add_argument("message")

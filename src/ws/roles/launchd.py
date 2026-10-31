@@ -3,7 +3,7 @@
     jobs/<name>.toml  with  schedule = "daily 03:30"   ->   ws.job.<name>.plist
 
 The plist uses StartCalendarInterval, which launchd runs late if the Mac was asleep at the time (several missed
-firings become one). That is the catch-up a laptop needs, so `stays on?` changes nothing here. A Mac that was powered
+firings become one). That is the catch-up a laptop needs, so the "stays on?" answer changes nothing here. A Mac that was powered
 off at the time does not catch up: launchd has no setting for it, and RunAtLoad would run the job at every login.
 `activate` bootstraps the agents into the user's GUI domain through an injectable runner; tests check the argv.
 """
@@ -61,13 +61,22 @@ def _want(env) -> dict[Path, str]:
     return {_schedule.units_dir(env) / f"{label(j.name)}.plist": render(j, env, cmd) for j in _schedule.scheduled(env)}
 
 
+def orphans(env) -> list[str]:
+    """Jobs that have a plist here but no longer have a schedule."""
+    keep = {p.name for p in _want(env)}
+    files = _schedule.orphans(env, PREFIX, (".plist",), keep)
+    return sorted(p.stem.removeprefix(PREFIX) for p in files)
+
+
 def check(cfg, osi, env, network):
     if osi.scheduler != NAME:
         return FAIL, f"{NAME} selected but this machine runs {osi.scheduler}"
     try:
-        want = _want(env)
+        want, gone = _want(env), orphans(env)
     except ValueError as e:
         return FAIL, str(e)
+    if gone:
+        return WARN, f"{NAME}: agents for {', '.join(gone)}, which no longer have a schedule: run `ws schedule apply`"
     if not want:
         return OK, NAME
     jobs_ = f"{len(want)} scheduled job{'' if len(want) == 1 else 's'}"
@@ -94,7 +103,7 @@ def activate(env, runner=None, uid: int | None = None) -> list[str]:
     runner = runner or _schedule.run_cmd
     domain = f"gui/{os.getuid() if uid is None else uid}"
     problems = []
-    for plist in sorted(_schedule.units_dir(env).glob(f"{PREFIX}*.plist")):
+    for plist in sorted(_want(env)):
         runner(["launchctl", "bootout", f"{domain}/{plist.stem}"])  # not loaded yet is not a problem
         code, out = runner(["launchctl", "bootstrap", domain, str(plist)])
         if code:

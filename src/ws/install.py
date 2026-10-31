@@ -93,6 +93,7 @@ class Removal:
     not_ours: list[Path] = field(default_factory=list)  # in the manifest but ws did not create it
     missing: list[Path] = field(default_factory=list)  # already gone
     refused: list[Path] = field(default_factory=list)  # outside the folders ws manages, or behind a symlink
+    problems: list[str] = field(default_factory=list)  # timers that could not be switched off first
 
 
 # ---- paths -------------------------------------------------------------------------------------------------------
@@ -240,11 +241,12 @@ def plan(answers: Answers, env=None, osi: osinfo.OSInfo | None = None) -> list[S
         raise InstallError(f"{policy_file}: {e}") from e
     steps.append(Step(policy_file, "file", text, "your policy (kept as it is if you already have one)", toml=True))
 
-    profile_text = dumps(compose_profile(prof, answers, env, osi))
-    steps.append(Step(profile_path(env).absolute(), "file", profile_text, "your profile", toml=True))
+    composed = compose_profile(prof, answers, env, osi)
+    steps.append(Step(profile_path(env).absolute(), "file", dumps(composed), "your profile", toml=True))
     for m in modules.REGISTRY.values():
         if m.name in answers.modules:
             steps.extend(m.steps(answers, env))
+    steps.extend(_role_steps(composed, answers, env, {(s.path, s.kind) for s in steps}))
     if answers.runner:
         try:
             adapter = adapters.get(answers.runner)
@@ -254,6 +256,28 @@ def plan(answers: Answers, env=None, osi: osinfo.OSInfo | None = None) -> list[S
         files = adapter.generate(pol, ["ws"], out, policy_file.resolve())
         steps.extend(Step(out / name, "file", body, f"{answers.runner} deny rules") for name, body in files.items())
     return steps
+
+
+ROLE_STEPS = ("memory", "backup")  # the roles whose adapter brings files of its own (the backup job file)
+
+
+def _role_steps(composed: dict, answers: Answers, env, have: set[tuple[Path, str]]) -> list[Step]:
+    """The steps of the adapters the profile names for ROLE_STEPS, minus any a module already gave."""
+    from ws import jobs, roles
+
+    roles_cfg = composed.get("roles") if isinstance(composed.get("roles"), dict) else {}
+    out: list[Step] = []
+    for role in ROLE_STEPS:
+        cfg = roles_cfg.get(role)
+        name = cfg.get("adapter", "markdown-git" if role == "memory" else None) if isinstance(cfg, dict) else None
+        if not isinstance(name, str) or name not in roles.adapters(role):
+            continue
+        try:
+            found = roles.get(role, name).steps(cfg, answers, env)
+        except (jobs.JobError, ValueError, OSError) as e:
+            raise InstallError(f"[roles.{role}]: {e}") from e
+        out += [s for s in found if (s.path, s.kind) not in have]
+    return out
 
 
 # ---- apply ---------------------------------------------------------------------------------------------------------
@@ -423,6 +447,17 @@ def apply(steps: list[Step], env=None, dry_run: bool = False) -> Result:
     return result
 
 
+def forget(paths, env=None) -> None:
+    """Drop these paths from the manifest (ws removed them itself), so uninstall does not look for them."""
+    env = os.environ if env is None else env
+    entries, roots = _read_manifest(env)
+    gone = {str(p) for p in paths} & entries.keys()
+    if gone:
+        for k in gone:
+            del entries[k]
+        _save_manifest(env, entries, roots)
+
+
 # ---- uninstall -------------------------------------------------------------------------------------------------------
 
 
@@ -467,9 +502,10 @@ def _may_touch(e: dict, roots: list[Path]) -> bool:
     return _inside(p, roots)
 
 
-def uninstall(env=None, keep_data: bool = True, dry_run: bool = False) -> Removal:
+def uninstall(env=None, keep_data: bool = True, dry_run: bool = False, deactivate=None) -> Removal:
     """Remove what the manifest says ws created, inside the folders it manages. Files first, then folders deepest
-    first, and only empty ones."""
+    first, and only empty ones. Timer and agent files are switched off in systemd or launchd first (`deactivate(paths,
+    env)` returns what went wrong; the default runs the real thing), since those links live outside $WS_HOME."""
     if not keep_data:
         raise InstallError("deleting your notes and memory is not built: ws only removes what it made")
     env = os.environ if env is None else env
@@ -482,6 +518,13 @@ def uninstall(env=None, keep_data: bool = True, dry_run: bool = False) -> Remova
             mine.append(e)
         else:
             out.refused.append(Path(e["path"]))
+    units = [
+        Path(os.path.normpath(e["path"])) for e in mine if e.get("kind") == "file" and e.get("created_by_ws") is True
+    ]
+    if units and not dry_run:
+        from ws import roles
+
+        out.problems += (deactivate or roles.deactivate_units)(units, env)
     for e in sorted((e for e in mine if e.get("kind") == "file"), key=lambda e: e["path"]):
         p = Path(os.path.normpath(e["path"]))
         if e.get("created_by_ws") is not True:
@@ -622,6 +665,8 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
         print(f"ws did not create it, so ws left it: {p}")
     for p in r.refused:
         print(f"outside the folders ws manages, so ws left it: {p}")
+    for problem in r.problems:
+        print(f"ws: {problem}", file=sys.stderr)
     left = len(r.edited) + len(r.not_empty) + len(r.not_ours) + len(r.refused)
     print(f"ws: {'would remove' if args.dry_run else 'removed'} {len(r.removed)}; left {left}")
     return 0

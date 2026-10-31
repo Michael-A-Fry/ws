@@ -16,8 +16,14 @@ def test_anthropic_needs_a_model(linux, env):
     assert anthropic.check({"default": ""}, linux, env, False)[0] == "fail"
 
 
-def test_anthropic_names_the_model_and_does_not_probe(linux, env):
-    status, detail = anthropic.check({"default": "m-1"}, linux, env, True)
+def test_a_subscription_profile_stays_ok_with_no_registry(linux, env):
+    """Profiles from before the adapters have only `default`: they were ok and still are."""
+    assert anthropic.check({"default": "m-1"}, linux, env, True) == ("ok", "default model m-1 (named; not probed yet)")
+    assert anthropic.check({"default": "m-1", "adapter": "anthropic"}, linux, env, True)[0] == "ok"
+
+
+def test_anthropic_with_a_key_warns_until_the_registry_can_lease_it(linux, env):
+    status, detail = anthropic.check({"default": "m-1", "key": "anthropic"}, linux, env, True)
     assert status == "warn" and "m-1" in detail and "not probed" in detail  # no registry yet
 
 
@@ -28,7 +34,7 @@ def test_anthropic_looks_at_the_registry_never_the_store(box, linux, env, monkey
         raise AssertionError("the store was read")
 
     monkeypatch.setattr("ws.secrets.Store.read", boom)
-    status, detail = anthropic.check({"default": "m-1"}, linux, env, True)
+    status, detail = anthropic.check({"default": "m-1", "key": "anthropic"}, linux, env, True)
     assert status == "ok" and "leased through the broker" in detail
 
 

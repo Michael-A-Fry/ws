@@ -36,9 +36,9 @@ def cfg_for(files):
     return {"adapter": "sops-age", "file": str(files[0]), "key_file": str(files[1])}
 
 
-def test_named_only_stays_ok_and_says_what_a_full_check_needs(linux):
+def test_named_only_warns_that_the_broker_does_not_use_it_yet(linux):
     status, detail = sops_age.check({"adapter": "sops-age"}, linux, {}, False)
-    assert status == "ok" and "file and key_file" in detail
+    assert status == "warn" and "not used by the broker yet" in detail and "file and key_file" in detail
 
 
 def test_one_of_the_two_paths_is_a_failure(linux, files):
@@ -71,7 +71,7 @@ def test_a_missing_key_or_file_fails(linux, files, tools, tmp_path):
     assert "sops file" in sops_age.check(cfg_for(files), linux, tools, False)[1]
 
 
-def test_a_key_owned_by_someone_else_and_closed_is_ok(linux, files, tools, monkeypatch):
+def test_a_good_setup_is_still_a_warning_while_the_broker_ignores_it(linux, files, tools, monkeypatch):
     real = Path.stat
 
     def stat(self, **kw):
@@ -82,10 +82,10 @@ def test_a_key_owned_by_someone_else_and_closed_is_ok(linux, files, tools, monke
 
     monkeypatch.setattr(Path, "stat", stat)
     status, detail = sops_age.check(cfg_for(files), linux, tools, False)
-    assert status == "ok" and "cannot read" in detail
+    assert status == "warn" and "not used by the broker yet" in detail
 
 
-def test_a_key_in_a_folder_we_cannot_enter_is_the_point(linux, files, tools, monkeypatch):
+def test_a_key_in_a_folder_we_cannot_enter_passes_the_key_check(linux, files, tools, monkeypatch):
     real = Path.stat
 
     def stat(self, **kw):
@@ -94,7 +94,7 @@ def test_a_key_in_a_folder_we_cannot_enter_is_the_point(linux, files, tools, mon
         return real(self, **kw)
 
     monkeypatch.setattr(Path, "stat", stat)
-    assert sops_age.check(cfg_for(files), linux, tools, False)[0] == "ok"
+    assert "not used by the broker yet" in sops_age.check(cfg_for(files), linux, tools, False)[1]
 
 
 def test_the_check_never_opens_the_key(linux, files, tools, monkeypatch):

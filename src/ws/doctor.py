@@ -96,6 +96,11 @@ def _version_change(adapter: str, version: str, detail: str, env, network: bool)
 
 
 def _model(cfg, osi, env, network):
+    a = cfg.get("adapter")
+    if isinstance(a, str) and a and a not in roles.adapters("model"):
+        # a profile from before the model adapters: only the name was ever checked, and it still is
+        status, detail = roles.get("model", "anthropic").check({"default": cfg.get("default")}, osi, env, network)
+        return status, f"{detail}; adapter {a!r} has no check of its own"
     return roles.check("model", cfg, osi, env, network, default="anthropic")
 
 
@@ -168,7 +173,7 @@ ROLES = (
     Role("WS106", "notes", "your notes folder (any app)", 'path = "~/Notes"', _notes),
     Role("WS107", "scheduler", "runs jobs on a timer", 'adapter = "systemd"', _scheduler),
     Role("WS108", "notify", "how ws reaches you", 'adapter = "none"', _notify),
-    Role("WS109", "backup", "proves your files can come back", 'adapter = "restic"', _backup),
+    Role("WS109", "backup", "proves your files can come back", 'adapter = "restic", repo = "<folder>"', _backup),
     Role("WS110", "usage", "the provider's own usage report", 'adapter = "anthropic"', _usage),
 )
 

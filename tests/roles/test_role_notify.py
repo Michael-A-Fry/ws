@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pytest
 
@@ -13,6 +14,12 @@ from ws.roles import ntfy
 
 URL = "https://ntfy.example.org/my-topic"
 CFG = {"adapter": "ntfy", "url": URL}
+try:
+    ZoneInfo("Pacific/Auckland")
+    HAS_TZDATA = True
+except ZoneInfoNotFoundError:
+    HAS_TZDATA = False
+needs_tzdata = pytest.mark.skipif(not HAS_TZDATA, reason="no time zone database on this machine")
 NOON = datetime(2026, 3, 4, 12, 0, tzinfo=UTC)
 
 
@@ -123,10 +130,97 @@ def test_a_failed_send_does_not_use_up_the_allowance(env):
     assert ntfy.read_counts(env, "2026-03-04")["push"] == 0
 
 
-def test_a_test_message_does_not_count(env):
+def test_a_test_message_counts_as_a_push_and_is_capped(env):
     s = Sender()
-    assert "does not count" in ntfy.send_test(CFG, env, s)
-    assert s.calls[0][2]["Title"] == "ws test" and not ntfy.counter_path(env).exists()
+    for n in (1, 2, 3):
+        assert ntfy.send_test(CFG, env, NOON, s) == f"sent: {n} of 3 pushes today"
+    assert s.calls[0][2]["Title"] == "ws test"
+    with pytest.raises(ntfy.CapReached):
+        ntfy.send_test(CFG, env, NOON, s)
+    assert len(s.calls) == 3
+
+
+def test_the_counter_is_under_logs_a_control_path(box, env):
+    from ws import policy
+
+    ntfy.send(CFG, env, "m", now=NOON, sender=Sender())
+    path = ntfy.counter_path(env)
+    assert path == box / ".ws" / "logs" / "notify-count.json" and path.is_file()
+    assert str(path).startswith(tuple(policy.control_paths(box / ".ws")))
+
+
+def write_counter(env, day, push=0, digest=0):
+    ntfy.counter_path(env).parent.mkdir(parents=True, exist_ok=True)
+    ntfy.counter_path(env).write_text(json.dumps({"date": day, "push": push, "digest": digest}))
+
+
+def test_the_count_never_goes_back_when_the_date_does(env):
+    """Alternating the zone between +14 and -12 moved the date back and forth and wiped the count each time."""
+    s = Sender()
+    write_counter(env, "2026-03-05", push=3)  # a zone ahead of UTC already saw the 5th
+    with pytest.raises(ntfy.CapReached):
+        ntfy.send(CFG, env, "m", now=NOON, sender=s)  # it is the 4th here
+    assert s.calls == []
+    assert json.loads(ntfy.counter_path(env).read_text())["date"] == "2026-03-05"
+
+
+@needs_tzdata
+def test_flipping_zones_cannot_get_more_than_the_cap(env):
+    s, sent = Sender(), 0
+    for i in range(10):
+        zone = "Pacific/Kiritimati" if i % 2 == 0 else "Etc/GMT+12"  # +14 and -12
+        try:
+            ntfy.send({**CFG, "timezone": zone}, env, "m", now=NOON, sender=s)
+            sent += 1
+        except ntfy.CapReached:
+            pass
+    assert sent == 3 and len(s.calls) == 3
+
+
+def test_a_later_date_moves_on_and_an_earlier_one_is_fresh(env):
+    write_counter(env, "2026-03-03", push=3, digest=1)
+    assert ntfy.send(CFG, env, "m", now=NOON, sender=Sender()) == "sent: 1 of 3 pushes today"
+    assert ntfy.read_counts(env, "2026-03-04") == {"date": "2026-03-04", "push": 1, "digest": 0}
+
+
+@needs_tzdata
+def test_the_day_is_the_date_in_the_profile_zone(env, write_profile):
+    late = datetime(2026, 3, 4, 23, 30, tzinfo=UTC)  # already the 5th in Auckland
+    assert ntfy.today(ntfy.zone(CFG, env), late) == "2026-03-04"  # no zone set: UTC
+    write_profile({"machine": {"timezone": "Pacific/Auckland"}})
+    assert ntfy.today(ntfy.zone(CFG, env), late) == "2026-03-05"
+    assert ntfy.today(ntfy.zone({**CFG, "timezone": "UTC"}, env), late) == "2026-03-04"  # the role's own wins
+    ntfy.send(CFG, env, "m", now=late, sender=Sender())
+    assert json.loads(ntfy.counter_path(env).read_text())["date"] == "2026-03-05"
+
+
+def test_a_bad_timezone_is_a_plain_error(env, linux):
+    with pytest.raises(ntfy.NotifyError, match="not a time zone name"):
+        ntfy.zone({"timezone": "Mars/Olympus"}, env)
+    with pytest.raises(ntfy.NotifyError):
+        ntfy.zone({"timezone": 5}, env)
+    assert ntfy.check({**CFG, "timezone": "Mars/Olympus"}, linux, env, False)[0] == "fail"
+
+
+def test_the_caps_come_from_the_policy(box, env):
+    (box / ".ws" / "policy.toml").write_text("[interrupts]\ndigest_per_day = 0\npushes_per_day = 1\n")
+    assert ntfy.caps(env) == {"push": 1, "digest": 0}
+    s = Sender()
+    ntfy.send(CFG, env, "m", now=NOON, sender=s)
+    with pytest.raises(ntfy.CapReached, match="1 of 1 pushes"):
+        ntfy.send(CFG, env, "m", now=NOON, sender=s)
+    with pytest.raises(ntfy.CapReached, match="0 of 0 digest"):
+        ntfy.send(CFG, env, "d", kind="digest", now=NOON, sender=s)
+
+
+def test_the_defaults_are_one_digest_and_three_pushes(env):
+    assert ntfy.caps(env) == {"push": 3, "digest": 1}
+
+
+def test_a_policy_that_does_not_read_stops_a_send(box, env):
+    (box / ".ws" / "policy.toml").write_text("[interrupts]\npushes_per_day = -2\n")
+    with pytest.raises(ntfy.NotifyError, match="policy"):
+        ntfy.send(CFG, env, "m", now=NOON, sender=Sender())
 
 
 def test_bad_messages_and_kinds(env):
@@ -144,6 +238,7 @@ def test_a_header_cannot_carry_a_line_break(env):
 
 
 def test_a_damaged_counter_file_is_a_fresh_day(env):
+    ntfy.counter_path(env).parent.mkdir(parents=True)
     ntfy.counter_path(env).write_text("{not json")
     assert ntfy.read_counts(env, "2026-03-04") == {"date": "2026-03-04", "push": 0, "digest": 0}
     ntfy.counter_path(env).write_text('{"date": "2026-03-04", "push": -1, "digest": 0}')
@@ -191,7 +286,9 @@ def test_cli_send_status_and_test(box, write_profile, capsys, monkeypatch):
     assert cli.main(["notify", "status"]) == 0
     assert "0 of 3 pushes" in capsys.readouterr().out
     assert cli.main(["notify", "test"]) == 0
-    assert "does not count" in capsys.readouterr().out
+    assert "sent: 1 of 3 pushes today" in capsys.readouterr().out
+    assert cli.main(["notify", "status"]) == 0
+    assert "1 of 3 pushes" in capsys.readouterr().out
 
 
 def test_cli_refuses_when_notify_is_not_ntfy(box, write_profile, capsys):

@@ -24,6 +24,8 @@ import os
 import random
 import re
 import shutil
+import socket
+import stat
 import subprocess
 import tempfile
 from collections.abc import Callable
@@ -41,6 +43,7 @@ VERIFY_FILE = "backup-verify.json"
 VERIFY_MAX_AGE = timedelta(days=30)
 DEFAULT_SECRET = "restic-password"
 DEFAULT_SCHEDULE = "daily 03:00"
+TAG = "ws"  # on every snapshot ws makes
 LOOK_AT = 50  # files looked at for one that has not changed since the snapshot
 MAX_VERIFY_BYTES = 50 * 1024 * 1024
 BACKUP_TIMEOUT_S = 6 * 3600
@@ -119,6 +122,22 @@ def sources(env) -> list[Path]:
     return [p for p in dict.fromkeys(out) if p.exists()]
 
 
+def _private_file(path: Path) -> None:
+    """Raises BackupError unless `path` is a file of yours that nobody else can read or write."""
+    try:
+        st = path.stat()
+    except OSError as e:
+        raise BackupError(f"password_file {path}: {e.strerror or type(e).__name__}") from e
+    if not stat.S_ISREG(st.st_mode):
+        raise BackupError(f"password_file {path} is not a file")
+    if st.st_uid != os.geteuid():
+        raise BackupError(f"password_file {path} belongs to another user")
+    if st.st_mode & 0o077:
+        raise BackupError(
+            f"password_file {path} is open to other users (mode {st.st_mode & 0o777:04o}); run `chmod 600 {path}`"
+        )
+
+
 def password(cfg: dict, env) -> str:
     """The repository password, from a file only you can read or from ws's store. Raises BackupError (no value in it)."""
     f = cfg.get("password_file")
@@ -126,22 +145,33 @@ def password(cfg: dict, env) -> str:
         if not isinstance(f, str) or not f:
             raise BackupError("password_file must be a path")
         path = Path(f).expanduser()
+        _private_file(path)
         try:
-            jobs.check_private(path)
             return wsecrets.check_value(path.read_text(encoding="utf-8").rstrip("\r\n"))
-        except (jobs.JobError, wsecrets.SecretsError, OSError, UnicodeDecodeError) as e:
-            raise BackupError(str(e) if isinstance(e, jobs.JobError) else f"password_file {path} cannot be used") from e
+        except (wsecrets.SecretsError, OSError, UnicodeDecodeError) as e:
+            raise BackupError(f"password_file {path} cannot be used") from e
     name = cfg.get("password_secret", DEFAULT_SECRET)
     if not isinstance(name, str) or not wsecrets.NAME_RE.match(name):
         raise BackupError("password_secret must be the name of a secret (letters, digits, - and _)")
+    store = wsecrets.Store(wsecrets.store_dir(env))
     try:
-        return wsecrets.Store(wsecrets.store_dir(env)).read(name)
+        return store.read(name)
     except FileNotFoundError as e:
         raise BackupError(f"{name} has no value; run `ws secret set {name}` (and add [{name}] to secrets.toml)") from e
-    except PermissionError as e:
-        raise BackupError(f"the store belongs to another user, so restic cannot get {name}: use password_file") from e
     except wsecrets.SecretsError as e:
+        if _walled(store.path):  # Store.read reports a closed store as SecretsError, never PermissionError
+            raise BackupError(
+                f"the store belongs to another user (or is closed to you), so restic cannot get {name}: "
+                "set password_file to a file only you can read"
+            ) from e
         raise BackupError(f"{name}: {e}") from e
+
+
+def _walled(folder: Path) -> bool:
+    try:
+        return folder.stat().st_uid != os.geteuid() or not os.access(folder, os.R_OK | os.X_OK)
+    except OSError:
+        return True
 
 
 def restic_env(cfg: dict, env) -> dict[str, str]:
@@ -150,6 +180,11 @@ def restic_env(cfg: dict, env) -> dict[str, str]:
     out["RESTIC_REPOSITORY"] = repo_of(cfg)
     out["RESTIC_PASSWORD"] = password(cfg, env)
     return out
+
+
+def _latest() -> list[str]:
+    """The snapshot to look at: the newest one ws made on this machine, not whatever else shares the repository."""
+    return ["latest", "--tag", TAG, "--host", socket.gethostname()]
 
 
 def _call(run: Run, argv: list[str], renv: dict[str, str], timeout: float) -> tuple[str, str]:
@@ -172,7 +207,7 @@ def backup(cfg: dict, env, run: Run | None = None) -> str:
     paths = sources(env)
     if not paths:
         raise BackupError("nothing to back up: no memory folder, notes folder or profile exists")
-    _call(run or run_restic, ["backup", "--tag", "ws", *map(str, paths)], restic_env(cfg, env), BACKUP_TIMEOUT_S)
+    _call(run or run_restic, ["backup", "--tag", TAG, *map(str, paths)], restic_env(cfg, env), BACKUP_TIMEOUT_S)
     return f"backed up {len(paths)} item{'' if len(paths) == 1 else 's'} to {shown(repo_of(cfg))}"
 
 
@@ -216,7 +251,7 @@ def verify(
     """Restore random files from the latest snapshot until one can be compared with its live copy. Records the result."""
     rng, run = rng or random.SystemRandom(), run or run_restic
     renv = restic_env(cfg, env)
-    out, _ = _call(run, ["ls", "latest", "--json"], renv, 600)
+    out, _ = _call(run, ["ls", *_latest(), "--json"], renv, 600)
     taken, files = _listing(out)
     pool = [(p, n) for p, n in files if 0 < n <= MAX_VERIFY_BYTES and not _GLOB.search(p) and os.path.isabs(p)]
     rng.shuffle(pool)
@@ -234,7 +269,7 @@ def verify(
             continue
         tmp = tempfile.mkdtemp(prefix="ws-verify-")
         try:
-            _call(run, ["restore", "latest", "--target", tmp, "--include", path], renv, 1800)
+            _call(run, ["restore", *_latest(), "--target", tmp, "--include", path], renv, 1800)
             restored = Path(tmp) / path.lstrip("/")
             if not restored.is_file():
                 result = Verified(False, "restic restored nothing for the file it listed")
@@ -290,10 +325,10 @@ def check(cfg, osi, env, network):
         return FAIL, str(e)
     if not shutil.which("restic", path=env.get("PATH")):
         return FAIL, "restic is not on PATH"
-    if cfg.get("password_file") is None:
-        name = cfg.get("password_secret", DEFAULT_SECRET)
-        if not isinstance(name, str) or not wsecrets.NAME_RE.match(name):
-            return FAIL, "password_secret must be the name of a secret (letters, digits, - and _)"
+    try:
+        password(cfg, env)  # readable by the account the nightly job runs as; the value is dropped, never shown
+    except BackupError as e:
+        return FAIL, f"the nightly backup would fail: {e}"
     detail = f"restic repository {shown(repo)}"
     try:
         n = len(sources(env))

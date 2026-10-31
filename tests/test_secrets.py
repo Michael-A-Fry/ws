@@ -400,7 +400,7 @@ def no_broker(monkeypatch):
 
 def test_ws104_other_adapters_keep_their_behaviour(home):
     assert ws104(home, adapter="env")[0] == "ok"
-    assert ws104(home, adapter="sops-age")[0] == "ok"
+    assert ws104(home, adapter="sops-age")[0] == "warn"
     assert ws104(home, adapter="nope")[0] == "fail"
     assert doctor._secrets({}, None, {}, False)[0] == "fail"
 

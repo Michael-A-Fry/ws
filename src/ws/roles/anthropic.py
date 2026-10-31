@@ -3,10 +3,12 @@
     [roles.model]
     adapter = "anthropic"            optional: this is the default
     default = "<model id>"
-    key = "anthropic"                the secret's name in secrets.toml (default "anthropic")
+    key = "anthropic"                optional: the secret's name in secrets.toml, for API-key runs
 
 The key is only ever named. A run leases it from the broker (job `[[secrets]]`, host api.anthropic.com), so this check
-looks at the registry, never at the store, and makes no network call. `ws models probe` is phase 5.
+looks at the registry, never at the store, and makes no network call. It looks at the registry only when `key` is
+set: a subscription login has no key, so a profile with just `default` checks the model name and nothing else.
+`ws models probe` is phase 5.
 """
 
 from __future__ import annotations
@@ -16,17 +18,18 @@ from ws.roles import FAIL, OK, WARN
 
 ROLE, NAME = "model", "anthropic"
 HOST = "api.anthropic.com"
-DEFAULT_KEY = "anthropic"
 
 
 def check(cfg, osi, env, network):
     m = cfg.get("default")
     if not isinstance(m, str) or not m:
         return FAIL, "no default model named"
-    name = cfg.get("key", DEFAULT_KEY)
+    detail = f"default model {m} (named; not probed yet)"
+    if "key" not in cfg:
+        return OK, detail
+    name = cfg["key"]
     if not isinstance(name, str) or not wsecrets.NAME_RE.match(name):
         return FAIL, "key must be the name of a secret (letters, digits, - and _)"
-    detail = f"default model {m} (named; not probed yet)"
     try:
         entry = wsecrets.load_registry(wsecrets.registry_path(env)).get(name)
     except wsecrets.SecretsError as e:

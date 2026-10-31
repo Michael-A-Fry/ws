@@ -4,6 +4,7 @@ of its own."""
 from __future__ import annotations
 
 import inspect
+import tomllib
 
 import pytest
 
@@ -49,10 +50,17 @@ def test_doctor_asks_the_registry_not_a_list(linux, monkeypatch):
     seen = set()
     monkeypatch.setattr(roles, "adapters", lambda role: seen.add(role) or {})
     for r in doctor.ROLES:
-        if r.name in ("model", "secrets", "memory", "scheduler", "notify", "backup"):
+        if r.name in ("secrets", "memory", "scheduler", "notify", "backup"):
             status, detail = r.check({"adapter": "x"}, linux, {}, False)
             assert status == "fail" and "unknown adapter 'x'" in detail
-    assert seen == {"model", "secrets", "memory", "scheduler", "notify", "backup"}
+    assert seen == {"secrets", "memory", "scheduler", "notify", "backup"}
+
+
+def test_a_model_table_from_before_the_adapters_still_passes(linux, env):
+    model = next(r for r in doctor.ROLES if r.name == "model")
+    status, detail = model.check({"adapter": "subscription", "default": "m-1"}, linux, env, False)
+    assert status == "ok" and "m-1" in detail and "no check of its own" in detail
+    assert model.check({"adapter": "subscription"}, linux, env, False)[0] == "fail"  # still needs a model
 
 
 def test_role_ids_do_not_change():
@@ -84,6 +92,25 @@ def test_doctor_end_to_end_uses_the_adapters(box, linux, write_profile):
     assert checks["WS102"].status == "ok" and "local/qwen" in checks["WS102"].detail
     assert checks["WS108"].status == "fail" and "https" in checks["WS108"].detail
     assert checks["WS109"].status == "fail" and "repo" in checks["WS109"].detail
+
+
+def test_doctor_fix_examples_for_adapter_roles_pass_their_own_check(box, linux, write_profile, tmp_path):
+    """The table doctor tells you to add must not itself fail."""
+    exe = tmp_path / "bin" / "restic"
+    exe.parent.mkdir()
+    exe.write_text("#!/bin/sh\n")
+    exe.chmod(0o755)
+    store = box / ".ws" / "secrets"
+    store.mkdir(mode=0o700)
+    (store / "restic-password").write_text("pw")
+    (store / "restic-password").chmod(0o600)
+    write_profile({"roles": {"memory": {"path": str(box)}}})
+    env = {"HOME": str(box), "WS_HOME": str(box / ".ws"), "PATH": str(exe.parent)}
+    for r in doctor.ROLES:
+        if r.name in ("model", "scheduler", "notify", "backup"):
+            cfg = tomllib.loads(r.example.replace(" and ", "\n").replace(", ", "\n"))
+            status, detail = r.check(cfg, linux, env, False)
+            assert status in ("ok", "warn"), (r.name, status, detail)
 
 
 def test_adapter_steps_are_install_steps(box, env):

@@ -8,7 +8,7 @@ import plistlib
 
 import pytest
 
-from ws import cli, install, jobs, osinfo
+from ws import cli, install, jobs, osinfo, roles
 from ws.roles import _schedule, launchd, systemd
 
 WS = ["/opt/ws/bin/ws"]
@@ -97,7 +97,7 @@ def job(name="daily", when="daily 03:30", argv=None):
 
 
 def test_systemd_service_and_timer(env):
-    files = systemd.render(job(), env, True, WS)
+    files = systemd.render(job(), env, WS)
     assert set(files) == {"ws-daily.service", "ws-daily.timer"}
     svc, timer = files["ws-daily.service"], files["ws-daily.timer"]
     assert 'ExecStart="/opt/ws/bin/ws" "run" "daily"' in svc and "Type=oneshot" in svc
@@ -106,10 +106,11 @@ def test_systemd_service_and_timer(env):
     assert "WantedBy=timers.target" in timer
 
 
-def test_the_stays_on_answer_sets_catch_up(env):
-    on = systemd.render(job(), env, True, WS)["ws-daily.timer"]
-    off = systemd.render(job(), env, False, WS)["ws-daily.timer"]
-    assert "Persistent" not in on and "Persistent=true" in off
+def test_every_timer_catches_up_whatever_the_stays_on_answer(env):
+    for stays_on in (True, False):
+        files = systemd.steps({}, install.Answers(stays_on=stays_on), env)
+        assert all("Persistent=true" in st.content for st in files if st.path.suffix == ".timer")
+    assert "Persistent=true" in systemd.render(job(), env, WS)["ws-daily.timer"]
 
 
 @pytest.mark.parametrize(
@@ -127,12 +128,14 @@ def test_on_calendar(when, want):
 
 def test_systemd_quotes_what_systemd_would_expand(env):
     odd = {**env, "WS_HOME": '/tmp/we ird/50%/$x"y', "PATH": "/a%b:/c"}
-    svc = systemd.render(job(), odd, True, ["/p ath/ws"])["ws-daily.service"]
+    svc = systemd.render(job(), odd, ["/p ath/ws"])["ws-daily.service"]
     assert 'ExecStart="/p ath/ws" "run" "daily"' in svc
-    assert 'Environment="WS_HOME=/tmp/we ird/50%%/$$x\\"y"' in svc
+    assert 'Environment="WS_HOME=/tmp/we ird/50%%/$x\\"y"' in svc  # Environment= takes $ literally; only % is special
+    exec_odd = systemd.render(jobs.Scheduled("d", job().when, ("run", "a$b%c")), env, WS)["ws-d.service"]
+    assert 'ExecStart="/opt/ws/bin/ws" "run" "a$$b%%c"' in exec_odd  # ExecStart= expands $ and %
     assert "PATH=" not in svc  # a PATH with % is left out, not mangled
     with pytest.raises(ValueError, match="control character"):
-        systemd.render(job(), {**env, "WS_HOME": "/tmp/a\nb"}, True, WS)
+        systemd.render(job(), {**env, "WS_HOME": "/tmp/a\nb"}, WS)
 
 
 def test_systemd_steps_install_and_uninstall(box, write_job, env, linux):
@@ -149,10 +152,38 @@ def test_systemd_steps_install_and_uninstall(box, write_job, env, linux):
     r = install.apply(steps, env)
     assert len(r.created) >= 4
     assert install.apply(steps, env).changes == 0  # a second run reports 0 changes
-    assert "Persistent=true" in (box / ".ws/jobs/units/ws-daily.timer").read_text()
-    removed = install.uninstall(env)
+    fake = Fake()
+    removed = install.uninstall(env, deactivate=lambda paths, e: roles.deactivate_units(paths, e, fake))
     assert not list((box / ".ws" / "jobs" / "units").glob("ws-*"))
     assert len([p for p in removed.removed if p.name.startswith("ws-")]) == 4
+    # the links systemctl made outside $WS_HOME are undone before the files go
+    assert fake.calls[0] == ["systemctl", "--user", "disable", "--now", "ws-backup.timer", "ws-daily.timer"]
+    assert removed.problems == []
+
+
+def test_uninstall_reports_a_timer_it_could_not_switch_off(box, write_job, env):
+    write_job("daily", AI_JOB)
+    install.apply(systemd.steps({}, install.Answers(), env), env)
+    r = install.uninstall(env, deactivate=lambda paths, e: roles.deactivate_units(paths, e, Fake(1, "no bus")))
+    assert r.problems and "no bus" in r.problems[0]
+    assert not list((box / ".ws" / "jobs" / "units").glob("ws-*"))  # the files still go
+
+
+def test_uninstall_leaves_launchd_and_systemd_alone_when_there_are_no_units(box, env):
+    install.apply([install.Step(box / ".ws" / "x.txt", "file", "x", "x")], env)
+    fake = Fake()
+    install.uninstall(env, deactivate=lambda paths, e: roles.deactivate_units(paths, e, fake))
+    assert fake.calls == []
+
+
+def test_deactivate_units_picks_the_adapter_by_file(box, env):
+    units = box / ".ws" / "jobs" / "units"
+    fake = Fake()
+    paths = [units / "ws-a.service", units / "ws-a.timer", units / "ws.job.b.plist", box / "elsewhere" / "ws-c.timer"]
+    roles.deactivate_units(paths, env, fake)
+    assert ["systemctl", "--user", "disable", "--now", "ws-a.timer"] in fake.calls
+    assert any(c[:2] == ["launchctl", "bootout"] and c[2].endswith("/ws.job.b") for c in fake.calls)
+    assert not any("ws-c.timer" in c for c in fake.calls)
 
 
 def test_systemd_activate_argv(box, write_job, env):
@@ -252,6 +283,15 @@ def test_launchd_steps_install_and_activate(box, write_job, env):
     ]
 
 
+def test_launchd_warns_about_an_agent_with_no_schedule(box, write_job, env, mac):
+    write_job("daily", AI_JOB)
+    install.apply(launchd.steps({}, install.Answers(), env), env)
+    write_job("daily", AI_JOB.replace('schedule = "daily 03:30"\n', ""))
+    status, detail = launchd.check({}, mac, env, False)
+    assert status == "warn" and "daily" in detail
+    assert launchd.orphans(env) == ["daily"]
+
+
 def test_launchd_with_no_jobs_writes_nothing(box, env):
     assert launchd.steps({}, install.Answers(), env) == []
 
@@ -308,6 +348,35 @@ def test_cli_list_dry_run_apply_remove(box, write_job, env, linux, capsys, monke
     assert code == 0 and "removed 2 unit file(s)" in out
     assert fake.calls[0] == ["systemctl", "--user", "disable", "--now", "ws-daily.timer"]
     assert not list((box / ".ws" / "jobs" / "units").glob("ws-*"))
+    manifest = (box / ".ws" / "install-manifest.json").read_text()
+    assert "ws-daily" not in manifest  # ws removed them itself, so uninstall need not look for them
+
+
+def test_a_job_whose_schedule_is_gone_loses_its_timer(box, write_job, env, linux, capsys, monkeypatch):
+    monkeypatch.setenv("PATH", env["PATH"])  # the CLI reads os.environ; the checks here read env
+    monkeypatch.setattr(osinfo, "detect", lambda *a, **k: linux)
+    fake = Fake()
+    monkeypatch.setattr(_schedule, "run_cmd", fake)
+    write_job("daily", AI_JOB)
+    write_job("other", AI_JOB)
+    assert run(capsys, "schedule", "apply")[0] == 0
+    assert systemd.check({}, linux, env, False)[0] == "ok"
+    write_job("daily", AI_JOB.replace('schedule = "daily 03:30"\n', ""))  # the schedule is taken out
+    status, detail = systemd.check({}, linux, env, False)
+    assert status == "warn" and "daily" in detail and "no longer have a schedule" in detail
+    fake.calls.clear()
+    code, out, _ = run(capsys, "schedule", "apply", "--dry-run")
+    assert code == 0 and "would stop daily" in out and fake.calls == []
+    assert (box / ".ws" / "jobs" / "units" / "ws-daily.timer").exists()
+    code, out, _ = run(capsys, "schedule", "apply")
+    assert code == 0 and "stopped daily" in out
+    assert fake.calls[0] == ["systemctl", "--user", "disable", "--now", "ws-daily.timer"]
+    enable = next(c for c in fake.calls if "enable" in c)
+    assert enable[-1:] == ["ws-other.timer"]  # only the job that still has a schedule is switched on
+    link = next(c for c in fake.calls if "link" in c)
+    assert not any("ws-daily" in a for a in link)
+    assert not list((box / ".ws" / "jobs" / "units").glob("ws-daily*"))
+    assert systemd.check({}, linux, env, False)[0] == "ok"
 
 
 def test_cli_apply_failure_exits_1_and_remove_checks_the_name(box, write_job, linux, capsys, monkeypatch):

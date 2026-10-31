@@ -67,6 +67,22 @@ def folder(cfg: dict) -> tuple[Path | None, tuple[str, str] | None]:
     return (d, None) if d.is_dir() else (None, (FAIL, f"{d} is not a folder"))
 
 
+def deactivate_units(paths, env, runner=None) -> list[str]:
+    """Switch off the timers and agents whose unit files these are (the others are ignored). Returns what went wrong.
+    `ws uninstall` calls this before it deletes the files, because the links live outside $WS_HOME."""
+    from ws.roles import _schedule, launchd, systemd
+
+    folder = _schedule.units_dir(env)
+    own = [p for p in paths if p.parent == folder]
+    timers = [
+        p.stem.removeprefix(systemd.PREFIX) for p in own if p.suffix == ".timer" and p.name.startswith(systemd.PREFIX)
+    ]
+    agents = [
+        p.stem.removeprefix(launchd.PREFIX) for p in own if p.suffix == ".plist" and p.name.startswith(launchd.PREFIX)
+    ]
+    return systemd.deactivate(sorted(timers), env, runner) + launchd.deactivate(sorted(agents), env, runner)
+
+
 def register(sub) -> None:
     """`ws notify`, `ws backup` and `ws schedule`."""
     from ws.roles import commands

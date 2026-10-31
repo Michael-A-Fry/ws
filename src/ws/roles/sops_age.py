@@ -5,9 +5,11 @@
     file = "/var/lib/ws-broker/secrets.sops.yaml"     a sops file: {name: value, ...}
     key_file = "/var/lib/ws-broker/age-key.txt"       the age key; owned by another user, mode 0600 or 0400
 
-It stands in for ws's own store (ws.secrets.Store): the registry still says which names go to which hosts, and agents
-still reach a value only through the broker. `SopsStore.read` has the same shape as `Store.read`, so the broker can
-use it in place of the store. The check looks at the key file's owner and mode and never at its content.
+It is meant to stand in for ws's own store (ws.secrets.Store): the registry would still say which names go to which
+hosts, and agents would still reach a value only through the broker. `SopsStore.read` has the same shape as
+`Store.read` so the broker can take it, but THE BROKER DOES NOT USE IT YET: wiring it in is security-critical and gets
+its own review. Until then this adapter only names the choice, and the check says so with a warning whatever else is
+right. The check looks at the key file's owner and mode and never at its content.
 """
 
 from __future__ import annotations
@@ -19,7 +21,7 @@ import subprocess
 from pathlib import Path
 
 from ws import secrets as wsecrets
-from ws.roles import FAIL, OK, WARN
+from ws.roles import FAIL, WARN
 
 ROLE, NAME = "secrets", "sops-age"
 TIMEOUT_S = 20.0
@@ -76,10 +78,8 @@ def key_problem(key_file: Path) -> tuple[str, str] | None:
 
 def check(cfg, osi, env, network):
     file, key_file = _path(cfg, "file"), _path(cfg, "key_file")
-    if (
-        file is None and key_file is None
-    ):  # nothing named yet: say what a full check needs, do not fail an unset-up role
-        return OK, "sops-age (named; add file and key_file to have them checked)"
+    if file is None and key_file is None:  # nothing named yet: say what a full check needs
+        return WARN, f"{NAME}: named; not used by the broker yet (add file and key_file to have them checked)"
     if file is None or key_file is None:
         return FAIL, f"set both file and key_file ({'file' if file is None else 'key_file'} is missing)"
     missing = [t for t in ("sops", "age") if not shutil.which(t, path=env.get("PATH"))]
@@ -93,7 +93,10 @@ def check(cfg, osi, env, network):
     problem = key_problem(key_file)
     if problem:
         return problem
-    return OK, f"sops-age: {file.name} opened with a key the agent user cannot read"
+    return (
+        WARN,
+        f"{NAME}: named; not used by the broker yet ({file.name} and its key look right, but nothing reads them)",
+    )
 
 
 def steps(cfg, answers, env):

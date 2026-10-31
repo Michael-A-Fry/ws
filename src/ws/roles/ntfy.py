@@ -5,10 +5,14 @@
     url = "https://ntfy.example.org/my-topic"     the topic URL (https only); its host is the one the broker allows
     token = "ntfy"                                optional: the secret's name in secrets.toml (host = the URL's host)
 
-The interruption cap is part of the design: at most 1 digest and 3 pushes a day, counted in `$WS_HOME/notify-count.json`
-by local date. A fourth push is refused, not queued, and says so. With a token, the send goes through a broker lease
-(the broker adds the Authorization header; ws never reads the token); without one it is a plain request to the topic.
-`ws notify test` sends a message that does not count against the cap.
+The interruption cap is part of the design. The numbers come from `[interrupts]` in policy.toml (1 digest and 3 pushes
+a day unless you changed them) and are counted in `$WS_HOME/logs/notify-count.json`: `logs` is a control path, so a
+session cannot write the counter. The day is the date in the profile's time zone (`[machine] timezone`, or `timezone`
+in `[roles.notify]`; UTC if neither is set). A day is never counted down: if the stored date is later than today's
+(the clock or the zone moved back), the stored day keeps counting, so changing zone does not reset the count. A push
+over the cap is refused, not queued, and says so. `ws notify test` sends a push and counts as one.
+With a token, the send goes through a broker lease (the broker adds the Authorization header; ws never reads the
+token); without one it is a plain request to the topic.
 """
 
 from __future__ import annotations
@@ -21,18 +25,19 @@ import re
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime
+from datetime import UTC, date, datetime, tzinfo
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
-from ws import broker
+from ws import broker, policy
 from ws import secrets as wsecrets
-from ws.profile import ws_home
+from ws.profile import ProfileError, load, profile_path, ws_home
 from ws.roles import FAIL, OK, WARN
 
 ROLE, NAME = "notify", "ntfy"
-CAPS = {"push": 3, "digest": 1}  # per local day
+KINDS = ("push", "digest")
 NOUN = {"push": "pushes", "digest": "digest"}
-COUNT_FILE = "notify-count.json"
+COUNT_FILE = "logs/notify-count.json"
 MAX_MESSAGE = 4000
 TIMEOUT_S = 10.0
 _TOPIC = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -80,23 +85,53 @@ def counter_path(env) -> Path:
     return ws_home(env) / COUNT_FILE
 
 
-def today(now: datetime | None = None) -> str:
-    return (now or datetime.now().astimezone()).date().isoformat()
+def caps(env) -> dict[str, int]:
+    """Today's allowance per kind, from the policy's [interrupts]. Raises NotifyError if the policy does not read."""
+    try:
+        it = policy.load(policy.policy_path(env)).interrupts
+    except policy.PolicyError as e:
+        raise NotifyError(f"policy: {e}") from e
+    return {"push": it.pushes_per_day, "digest": it.digest_per_day}
 
 
-def _empty(day: str) -> dict:
+def zone(cfg: dict, env) -> tzinfo:
+    """The time zone whose date counts as 'today': [roles.notify] timezone, else [machine] timezone, else UTC."""
+    name = cfg.get("timezone")
+    if name is None:
+        try:
+            machine = (load(profile_path(env)) or {}).get("machine")
+        except ProfileError:
+            machine = None
+        name = machine.get("timezone") if isinstance(machine, dict) else None
+    if name is None or name == "UTC":
+        return UTC
+    try:
+        if not isinstance(name, str):
+            raise TypeError(name)
+        return ZoneInfo(name)
+    except (TypeError, ValueError, OSError, KeyError) as e:  # ZoneInfoNotFoundError is a KeyError
+        raise NotifyError(f"timezone {name!r} is not a time zone name (for example Pacific/Auckland)") from e
+
+
+def today(tz: tzinfo = UTC, now: datetime | None = None) -> str:
+    return (now or datetime.now(UTC)).astimezone(tz).date().isoformat()
+
+
+def _fresh(day: str) -> dict:
     return {"date": day, "push": 0, "digest": 0}
 
 
 def read_counts(env, day: str) -> dict:
-    """Today's counts. A missing, unreadable or old file is a fresh day."""
+    """The counts to use for `day`. A missing or damaged file is a fresh day. A stored date after `day` wins: the count
+    never goes back to zero because the date moved back."""
     try:
         d = json.loads(counter_path(env).read_text(encoding="utf-8"))
-        if d.get("date") == day and all(isinstance(d.get(k), int) and d[k] >= 0 for k in CAPS):
-            return {"date": day, "push": d["push"], "digest": d["digest"]}
-    except (OSError, ValueError, AttributeError):
+        stored = date.fromisoformat(d["date"]).isoformat()
+        if all(isinstance(d.get(k), int) and not isinstance(d[k], bool) and d[k] >= 0 for k in KINDS) and stored >= day:
+            return {"date": stored, "push": d["push"], "digest": d["digest"]}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
         pass
-    return _empty(day)
+    return _fresh(day)
 
 
 @contextlib.contextmanager
@@ -178,27 +213,27 @@ def send(
 ) -> str:
     """Send a push or a digest if today's cap allows; count it once it has gone. Returns a line for the person.
     Raises CapReached (nothing sent) or NotifyError."""
-    if kind not in CAPS:
+    if kind not in KINDS:
         raise NotifyError(f"kind must be push or digest, not {kind!r}")
     if not message.strip():
         raise NotifyError("nothing to send: the message is empty")
-    day = today(now)
+    cap = caps(env)
+    day = today(zone(cfg, env), now)
     with _locked(env, day) as (counts, save):
-        if counts[kind] >= CAPS[kind]:
+        if counts[kind] >= cap[kind]:
             raise CapReached(
-                f"not sent: {counts[kind]} of {CAPS[kind]} {NOUN[kind]} already went today"
-                " (ws holds the line at 1 digest and 3 pushes a day)"
+                f"not sent: {counts[kind]} of {cap[kind]} {NOUN[kind]} already went today"
+                " (the limit is [interrupts] in your policy)"
             )
         deliver(cfg, env, title, message[:MAX_MESSAGE], sender)
         counts[kind] += 1
         save()
-    return f"sent: {counts[kind]} of {CAPS[kind]} {NOUN[kind]} today"
+    return f"sent: {counts[kind]} of {cap[kind]} {NOUN[kind]} today"
 
 
-def send_test(cfg: dict, env, sender=None) -> str:
-    """A message that does not use up the day's allowance."""
-    deliver(cfg, env, "ws test", "ws notify test: if you can read this, pushes work.", sender)
-    return "sent a test message (it does not count against the daily cap)"
+def send_test(cfg: dict, env, now: datetime | None = None, sender=None) -> str:
+    """A test push. It counts as a push, so a loop of tests cannot get past the cap."""
+    return send(cfg, env, "ws notify test: if you can read this, pushes work.", "ws test", "push", now, sender)
 
 
 def check(cfg, osi, env, network):
@@ -207,8 +242,12 @@ def check(cfg, osi, env, network):
         name = token_name(cfg)
     except NotifyError as e:
         return FAIL, str(e)
-    counts = read_counts(env, today())
-    used = f"{counts['push']}/{CAPS['push']} pushes, {counts['digest']}/{CAPS['digest']} digest today"
+    try:
+        cap, tz = caps(env), zone(cfg, env)
+    except NotifyError as e:
+        return FAIL, str(e)
+    counts = read_counts(env, today(tz))
+    used = f"{counts['push']}/{cap['push']} pushes, {counts['digest']}/{cap['digest']} digest today"
     if name is None:
         return OK, f"ntfy topic {topic} at {host} (no token: anyone who knows the topic can read it); {used}"
     try:

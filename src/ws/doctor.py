@@ -12,7 +12,8 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from ws import __version__, usage
+from ws import __version__, broker, usage
+from ws import secrets as wsecrets
 from ws.osinfo import OSInfo
 from ws.profile import ProfileError, load
 
@@ -75,7 +76,34 @@ def _budget(cfg, osi, env, network):
 
 def _secrets(cfg, osi, env, network):
     a, bad = _adapter(cfg, {"ws-secret": "", "sops-age": "", "env": ""})
-    return bad or (OK, f"{a}")
+    if bad or a != "ws-secret":
+        return bad or (OK, f"{a}")
+    store, sock = wsecrets.Store(wsecrets.store_dir(env, cfg)), wsecrets.socket_path(env, cfg)
+    try:
+        problems, owner = wsecrets.health(wsecrets.registry_path(env), store)
+    except PermissionError:  # the store belongs to another user: only the broker can vouch for it
+        problems, owner = None, None
+    try:
+        answer, down = broker.status(sock), ""
+    except broker.BrokerError as e:
+        answer, down = None, str(e)
+    if problems is None:
+        if answer is None:
+            return FAIL, f"the store belongs to another user and the broker is not answering: {down}"
+        problems = answer.get("problems", ["the broker did not report on its store"])
+        owner = answer.get("store_owner_uid")
+    if problems:
+        return FAIL, "; ".join(problems)
+    if owner == os.geteuid():
+        tail = "" if answer else f"; broker not answering ({down})"
+        return WARN, f"same-user boundary: run `ws secret wall` for the one sudo step{tail}"
+    if answer is None:
+        return FAIL, f"store is walled but the broker is not answering: {down}"
+    cp = answer.get("code_problem")
+    if cp is None or cp:  # a broker that runs code another user can edit hands that user the keys
+        why = cp or "it did not say where it runs from"
+        return WARN, f"store is walled, but the broker's own code is not locked down: {why}"
+    return OK, f"ws-secret: store owned by {wsecrets.owner_name(owner)}, broker answering"
 
 
 def _folder(cfg: dict) -> tuple[Path | None, tuple[str, str] | None]:

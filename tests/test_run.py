@@ -208,7 +208,9 @@ def test_the_runner_sees_a_scrubbed_environment(ws, monkeypatch):
     assert not any(value in v for v in env.values())
     assert env["ANTHROPIC_API_KEY"] == claude_code.PLACEHOLDER_KEY  # the parent's key did not leak through
     allowed = set(run.PASS_ENV) | {"WS_HOME", "DISABLE_AUTOUPDATER", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"}
-    assert set(env) <= allowed | {"ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "PWD", "SHLVL", "_", "LC_CTYPE"}
+    added_by_the_os = {k for k in env if k.startswith("__CF")}  # macOS adds its own
+    ok_extra = {"ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "PWD", "SHLVL", "_", "LC_CTYPE"}
+    assert set(env) - added_by_the_os <= allowed | ok_extra
 
 
 def test_job_env_is_the_only_way_to_add_variables(ws):

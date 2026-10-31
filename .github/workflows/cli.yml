@@ -1,4 +1,5 @@
 # Phase 2 pass test on three OSs: on a fresh machine `ws doctor` exits non-zero listing every role unconfigured.
+# Phase 3 pass test (gate-e2e): a denied command is blocked on both runners, against a stub model, no paid provider.
 # Nightly, and on pull requests that touch the CLI. Not a required check: a slow or flaky runner never blocks a PR.
 name: cli
 on:
@@ -41,6 +42,28 @@ jobs:
           export WS_HOME="$RUNNER_TEMP/wshome"
           set +e; uv run --locked ws doctor --json > "$RUNNER_TEMP/doctor.json"; code=$?; set -e
           uv run --locked python scripts/check_fresh_doctor.py "$RUNNER_TEMP/doctor.json" "$code"
+
+  gate-e2e:
+    name: gate e2e (ubuntu-24.04, stub model)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: "0.13.1"
+          enable-cache: true
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+      - name: install the runners (versions released at least 7 days before pinning, 31 Oct 2026)
+        run: npm install --global @anthropic-ai/claude-code@2.1.308 opencode-ai@1.19.4
+      - name: a denied command is blocked on Claude Code (deny list, hook) and OpenCode (deny list, shim)
+        env:
+          WS_E2E_REQUIRE: "1" # a missing runner fails the job instead of skipping
+        run: uv run --locked pytest -q tests/e2e/test_gate_runners.py
 
   wsl:
     name: doctor (windows-2025, WSL2 Ubuntu-24.04)

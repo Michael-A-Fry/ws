@@ -115,4 +115,4 @@
 - [ ] PyPI trusted publisher for `ws-aitoolkit` (Michael's login); until then the GitHub release is the install route
 - [x] Triage labels (needs-repro, duplicate, out-of-scope, accepted) as GitHub labels
 - [ ] Pass test: fresh install from the tag on CI (3 OS) and lab, twice, each followed by `scripts/e2e_first_task.sh`
-- [ ] Tag `v0.1.0` after Michael's go on the release notes (CHANGELOG date set first: the workflow refuses "unreleased")
+- [ ] Tag `v0.1.1` (0.1.0 was published, then withdrawn and deleted on GitHub and PyPI: DECISIONS 190)

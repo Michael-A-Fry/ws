@@ -31,7 +31,6 @@ import hashlib
 import http.client
 import json
 import os
-import pwd
 import re
 import socket
 import socketserver
@@ -49,11 +48,6 @@ from pathlib import Path
 from ws import __version__
 from ws import secrets as wsecrets
 from ws.profile import ws_home
-
-try:  # not on Windows; ws runs there only through WSL2
-    import grp
-except ImportError:  # pragma: no cover
-    grp = None  # type: ignore[assignment]
 
 CODES = (
     "unknown_name",
@@ -194,8 +188,11 @@ def peer_cred(conn: socket.socket) -> tuple[int, int]:
 
 
 def in_group(uid: int, group: str | None) -> bool:
-    if not group or grp is None:
+    if not group:
         return False
+    import grp  # POSIX only: imported here so `ws doctor` still runs on native Windows (and says to use WSL2)
+    import pwd
+
     try:
         g = grp.getgrnam(group)
         pw = pwd.getpwuid(uid)
@@ -294,7 +291,7 @@ class Broker:
         self._grants: dict[str, _Grant] = {}  # sha256(token) -> grant
         self._lock = threading.Lock()
         self._slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
-        self._unix: _UnixServer | None = None
+        self._unix: socketserver.BaseServer | None = None
         self._http: ThreadingHTTPServer | None = None
         self._stopped = threading.Event()
 
@@ -320,9 +317,16 @@ class Broker:
         return self._http.server_address[1]
 
     def start(self) -> Broker:
-        self._bind_unix()
+        # the loopback port first: the socket file appearing is the signal that the broker is ready to answer
         self._http = _ProxyServer(("127.0.0.1", self._port), _ProxyHandler, self)
         threading.Thread(target=self._http.serve_forever, args=(0.05,), daemon=True, name="ws-broker-proxy").start()
+        try:
+            self._bind_unix()
+        except BaseException:
+            self._http.shutdown()
+            self._http.server_close()
+            self._http = None
+            raise
         assert self._unix is not None
         threading.Thread(target=self._unix.serve_forever, args=(0.05,), daemon=True, name="ws-broker-socket").start()
         return self
@@ -348,9 +352,11 @@ class Broker:
         d = self.socket_path.parent
         gid = None
         if self.group:
+            import grp
+
             try:
-                gid = grp.getgrnam(self.group).gr_gid  # type: ignore[union-attr]
-            except (KeyError, AttributeError) as e:
+                gid = grp.getgrnam(self.group).gr_gid
+            except KeyError as e:
                 raise BrokerError(f"no such group: {self.group}") from e
         want = 0o750 if self.group else 0o700
         if not d.exists():
@@ -367,7 +373,7 @@ class Broker:
         self._clear_stale_socket()
         old = os.umask(0o117 if self.group else 0o177)
         try:
-            self._unix = _UnixServer(self)
+            self._unix = _unix_server(self)
         finally:
             os.umask(old)
         self.socket_path.chmod(0o660 if self.group else 0o600)
@@ -597,31 +603,36 @@ def _read_line(conn: socket.socket, buf: bytes, deadline: float) -> tuple[bytes 
     return line, rest
 
 
-class _UnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
-    daemon_threads = True
-    request_queue_size = MAX_CONNECTIONS
+def _unix_server(broker: Broker) -> socketserver.BaseServer:
+    """Built on demand: socketserver has no Unix server on native Windows, and the module must still import there."""
 
-    def __init__(self, broker: Broker):
-        self.broker = broker
-        super().__init__(str(broker.socket_path), _ConnHandler)
+    class _UnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+        daemon_threads = True
+        request_queue_size = MAX_CONNECTIONS
 
-    def process_request(self, request, client_address):
-        if not self.broker._slots.acquire(blocking=False):
-            with contextlib.suppress(OSError):
-                request.settimeout(1)
-                request.sendall(json.dumps(_refuse("busy", "too many connections")).encode() + b"\n")
-            self.shutdown_request(request)
-            return
-        super().process_request(request, client_address)
+        def __init__(self, broker: Broker):
+            self.broker = broker
+            super().__init__(str(broker.socket_path), _ConnHandler)
 
-    def process_request_thread(self, request, client_address):
-        try:
-            super().process_request_thread(request, client_address)
-        finally:
-            self.broker._slots.release()
+        def process_request(self, request, client_address):
+            if not self.broker._slots.acquire(blocking=False):
+                with contextlib.suppress(OSError):
+                    request.settimeout(1)
+                    request.sendall(json.dumps(_refuse("busy", "too many connections")).encode() + b"\n")
+                self.shutdown_request(request)
+                return
+            super().process_request(request, client_address)
 
-    def handle_error(self, request, client_address):
-        print("ws broker: a connection failed", file=sys.stderr)  # not the traceback: it could quote a value
+        def process_request_thread(self, request, client_address):
+            try:
+                super().process_request_thread(request, client_address)
+            finally:
+                self.broker._slots.release()
+
+        def handle_error(self, request, client_address):
+            print("ws broker: a connection failed", file=sys.stderr)  # not the traceback: it could quote a value
+
+    return _UnixServer(broker)
 
 
 class _ConnHandler(socketserver.BaseRequestHandler):
@@ -635,6 +646,11 @@ class _ProxyServer(ThreadingHTTPServer):
     def __init__(self, addr, handler, broker: Broker):
         self.broker = broker
         super().__init__(addr, handler)
+
+    def server_bind(self):
+        # HTTPServer.server_bind asks DNS for the host's full name, which can stall for many seconds (seen on macOS)
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = "127.0.0.1", self.server_address[1]
 
     def handle_error(self, request, client_address):
         print("ws broker: a proxy connection failed", file=sys.stderr)

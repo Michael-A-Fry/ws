@@ -623,11 +623,13 @@ def test_cli_round_trip_through_real_processes(base, stub):
     )
     try:
         sock = home / "run" / "broker.sock"
-        for _ in range(100):
-            if sock.exists():
+        for _ in range(300):  # a slow runner can take seconds to start
+            try:
+                broker.status(sock, timeout=1.0)
                 break
-            time.sleep(0.1)
-        assert sock.exists()
+            except broker.BrokerError:
+                time.sleep(0.1)
+        assert broker.status(sock)["problems"] == []
         r = subprocess.run(
             [*ws, "broker", "request", "anthropic", "--purpose", "run", "--host", stub.host],
             env=envv,
@@ -656,3 +658,17 @@ def test_cli_round_trip_through_real_processes(base, stub):
         srv.terminate()
         out, err = srv.communicate(timeout=10)
     assert VALUE not in out + err and not sock.exists()
+
+
+def test_imports_and_doctor_work_without_posix_modules():
+    """Native Windows has no pwd, grp or Unix servers: `ws doctor` must still run there and fail WS001 cleanly."""
+    code = (
+        "import socketserver, sys\n"
+        "for m in ('pwd', 'grp', 'fcntl'):\n"
+        "    sys.modules[m] = None\n"
+        "del socketserver.UnixStreamServer, socketserver.ThreadingUnixStreamServer\n"
+        "from ws import broker, cli, doctor, secrets\n"
+        "print(secrets.owner_name.__name__)\n"
+    )
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=False)
+    assert r.returncode == 0, r.stderr[-300:]

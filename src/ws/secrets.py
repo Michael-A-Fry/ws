@@ -18,7 +18,6 @@ import contextlib
 import getpass
 import json
 import os
-import pwd
 import re
 import shutil
 import stat
@@ -249,6 +248,8 @@ def health(reg_path: Path, store: Store) -> tuple[list[str], int | None]:
 
 
 def owner_name(uid: int) -> str:
+    import pwd  # POSIX only: not at the top so `ws doctor` still runs on native Windows
+
     try:
         return pwd.getpwuid(uid).pw_name
     except KeyError:

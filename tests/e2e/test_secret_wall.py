@@ -120,12 +120,17 @@ def wall():
          f"{broker.TEST_HTTP_ENV}=1", PY, "-m", "ws", "broker", "serve", "--socket", str(sock), "--group", GROUP],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd="/",
     )  # fmt: skip
+    # the runner user is outside the group, so it cannot even stat the socket: ask as the broker user
     for _ in range(100):
-        if sock.exists() or srv.poll() is not None:
+        if sudo("test", "-S", str(sock), user=BROKER_USER).returncode == 0 or srv.poll() is not None:
             break
         time.sleep(0.1)
-    if not sock.exists():
-        err = srv.communicate(timeout=10)[1] if srv.poll() is not None else "no socket after 10 s"
+    if sudo("test", "-S", str(sock), user=BROKER_USER).returncode != 0:
+        err = "no socket after 10 s"
+        if srv.poll() is not None:
+            err = srv.communicate(timeout=10)[1]
+        else:
+            sudo("pkill", "-TERM", "-u", BROKER_USER, "-f", "broker serve")
         sudo("rm", "-rf", str(base))
         pytest.fail(f"the broker did not start as {BROKER_USER}: {err.strip()[-300:]}")
     yield {"base": base, "wb": wb, "dev": dev, "sock": sock, "stub": stub, "host": host, "srv": srv}

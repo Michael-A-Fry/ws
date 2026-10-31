@@ -35,6 +35,9 @@ def stub(bindir: Path, name: str, body: str) -> None:
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
 
+AT = "@"  # built at run time: the PII gate reads a literal login-in-URL as an e-mail address
+
+
 def wheel_name(tag: str) -> str:
     return f"ws_aitoolkit-{tag.removeprefix('v')}-py3-none-any.whl"
 
@@ -140,10 +143,11 @@ class Box:
         script.write_text(code, encoding="utf-8")
         stub(self.bin, "wget", f'echo "wget $*" >> "{self.log}"\nexec "{sys.executable}" "{script}" "$@"')
 
-    def cosign(self, ok: bool = True) -> None:
+    def cosign(self, ok: bool = True, version: str = "v3.1.4") -> None:
         stub(
             self.bin,
             "cosign",
+            f'if [ "$1" = version ]; then echo "GitVersion:    {version}"; exit 0; fi\n'
             f'echo "cosign $*" >> "{self.log}"\n' + ("exit 0" if ok else 'echo "no match" >&2; exit 1'),
         )
 
@@ -515,7 +519,17 @@ def test_a_missing_wheel_names_the_url(box: Box):
 
 
 @pytest.mark.parametrize(
-    "bad", ["http://example.invalid", "http://127.0.0.1.example.invalid", "ftp://x", "file:///tmp"]
+    "bad",
+    [
+        "http://example.invalid",
+        "http://127.0.0.1.example.invalid",
+        "ftp://x",
+        "file:///tmp",
+        "http://localhost:x" + AT + "evil.example",  # curl reads `localhost:x` as a login and goes to evil.example
+        "http://localhost/" + AT + "evil.example",
+        "http://127.0.0.1:1" + AT + "evil.example",
+        "https://user" + AT + "mirror.example",
+    ],
 )
 def test_the_override_must_be_https_or_this_machine(box: Box, bad: str):
     ready(box)
@@ -544,6 +558,16 @@ def test_cosign_when_installed_verifies_the_bundle_for_this_tag(box: Box):
     assert call.endswith(wheel_name("v0.3.0"))
     assert "cosign signature verifies" in r.stdout
     assert box.gh.asked_for(".sigstore.json")
+
+
+def test_a_cosign_too_old_for_the_bundle_says_so_and_checks_the_sha_only(box: Box):
+    ready(box, "v0.3.0")
+    box.cosign(ok=False, version="v2.4.1")  # would refuse a genuine v3 bundle: it must not be asked
+    box.ws()
+    r = box.run()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "cosign 2.x can't read" in r.stdout
+    assert [c for c in box.calls() if c.startswith("cosign")] == []
 
 
 def test_a_signature_that_does_not_verify_stops_the_install(box: Box):

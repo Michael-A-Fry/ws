@@ -52,11 +52,21 @@ jobs:
           if [ "$TAG" != "v$version" ]; then
             echo "::error::tag $TAG does not match pyproject.toml version $version; bump the version and tag again"; exit 1
           fi
+          if [ "$GITHUB_EVENT_NAME" = "push" ] && [ "$(git rev-parse HEAD)" != "$GITHUB_SHA" ]; then
+            echo "::error::refs/tags/$TAG is not the commit this run started from ($GITHUB_SHA); the tag moved"; exit 1
+          fi
           if ! git merge-base --is-ancestor HEAD origin/main; then
             echo "::error::$TAG is not on main; releases are cut from main"; exit 1
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: stamp the build (src/ws/_build.py, git-ignored; `ws version` reads it)
+        run: |
+          sha="$(git rev-parse HEAD)"
+          if [ -n "$(git status --porcelain)" ]; then dirty=True; else dirty=False; fi
+          printf '"""Written by the release workflow before `uv build`; absent in a checkout."""\n\ngit_sha = "%s"\ndirty = %s\nbuild_date = "%s"\nsource = "release"\n' \
+            "$sha" "$dirty" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > src/ws/_build.py
+          cat src/ws/_build.py
       - name: release notes from the CHANGELOG section for this version
         env:
           VERSION: ${{ steps.meta.outputs.version }}
@@ -67,16 +77,12 @@ jobs:
             echo "::error::CHANGELOG.md has no '## [$VERSION]' section with text in it"; exit 1
           fi
           if grep -q "^## \[$VERSION\].*unreleased" CHANGELOG.md; then
+            if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+              echo "::error::CHANGELOG.md still says '## [$VERSION] - unreleased'; put the date in before tagging"; exit 1
+            fi
             echo "::warning::CHANGELOG.md still says '## [$VERSION] - unreleased'; put the date in"
           fi
           cat release-notes.md
-      - name: stamp the build (src/ws/_build.py, git-ignored; `ws version` reads it)
-        run: |
-          sha="$(git rev-parse HEAD)"
-          if [ -n "$(git status --porcelain)" ]; then dirty=True; else dirty=False; fi
-          printf '"""Written by the release workflow before `uv build`; absent in a checkout."""\n\ngit_sha = "%s"\ndirty = %s\nbuild_date = "%s"\nsource = "release"\n' \
-            "$sha" "$dirty" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > src/ws/_build.py
-          cat src/ws/_build.py
       - name: uv build (sdist and wheel)
         run: uv build
       - name: install the wheel in a clean environment; it reports this commit, and the SBOM is read from that environment
@@ -92,6 +98,7 @@ jobs:
           assert data["git_sha"] == sys.argv[2], data
           assert data["version"] == sys.argv[3], data
           assert data["install_source"] == "release", data
+          assert data["dirty"] is False, data
           PY
           # cyclonedx-bom is pinned; --exclude-newer holds its own dependencies to versions at least 7 days old
           uvx --exclude-newer "7 days" --from cyclonedx-bom==7.5.0 cyclonedx-py environment \

@@ -103,7 +103,8 @@ Options:
 Environment overrides:
   WS_SKIP_VERIFY       set to 1 to skip the smoke test, as --skip-smoke-test does
   WS_RELEASE_BASE_URL  fetch releases from here instead of GitHub; https, or http on 127.0.0.1 or localhost only (the
-                       tests use it). Every check still runs: it can move the download, not skip a check.
+                       tests use it). Every check still runs, but the wheel and its .sha256 then come from that
+                       host, so only the cosign check proves they are the release: install cosign if you use it.
 EOF
 }
 
@@ -367,7 +368,28 @@ fetch_release() {
     fi
     ok "sha256 matches: ${out}"
 
+    local cosign_major=""
     if require_cmd cosign; then
+        # pure bash: `cosign version` prints "GitVersion:    v3.1.4" among other lines
+        local line
+        while IFS= read -r line; do
+            case "${line}" in
+                GitVersion:*)
+                    line="${line#GitVersion:}"
+                    line="${line#"${line%%[![:space:]]*}"}"
+                    line="${line#v}"
+                    line="${line%%.*}"
+                    case "${line}" in ''|*[!0-9]*) ;; *) cosign_major="${line}" ;; esac
+                    break
+                    ;;
+            esac
+        done <<EOF_COSIGN
+$(cosign version 2>/dev/null </dev/null || true)
+EOF_COSIGN
+    fi
+    if [ -n "${cosign_major}" ] && [ "${cosign_major}" -lt 3 ]; then
+        warn "cosign ${cosign_major}.x can't read the release's signature bundle (cosign 3 or newer can), so only the SHA-256 was checked; upgrade cosign to check the signature too"
+    elif require_cmd cosign; then
         download_asset "${url}.sigstore.json" "${WORKDIR}/${wheel}.sigstore.json"
         if ! out="$(cosign verify-blob --bundle "${WORKDIR}/${wheel}.sigstore.json" \
             --certificate-identity "${identity}" --certificate-oidc-issuer "${issuer}" \
@@ -487,13 +509,11 @@ main() {
     local download_base="${REPO_URL}/releases/download"
     if [ -n "${WS_RELEASE_BASE_URL:-}" ]; then
         local base="${WS_RELEASE_BASE_URL%/}"
-        case "${base}" in
-            https://*|http://127.0.0.1:*|http://127.0.0.1/*|http://localhost:*|http://localhost/*) ;;
-            *)
-                error "WS_RELEASE_BASE_URL must be https, or http on 127.0.0.1 or localhost: '${base}'"
-                exit 2
-                ;;
-        esac
+        # The host is matched whole: no login part (`user@host`), and a local http host ends at a port or a slash.
+        if ! printf '%s' "${base}" | grep -Eq '^(https://[A-Za-z0-9.-]+(:[0-9]+)?|http://(127\.0\.0\.1|localhost)(:[0-9]+)?)(/[^@]*)?$'; then
+            error "WS_RELEASE_BASE_URL must be https, or http on 127.0.0.1 or localhost, with no login part: '${base}'"
+            exit 2
+        fi
         api_url="${base}/repos/${REPO_SLUG}/releases/latest"
         download_base="${base}/${REPO_SLUG}/releases/download"
     fi

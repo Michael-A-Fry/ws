@@ -159,7 +159,8 @@ def test_the_real_checkout_reports_its_own_head(capsys):
         (None, False, "/home/u/.local/pipx/venvs/ws-aitoolkit", "pipx"),
         (None, False, "C:\\Users\\u\\pipx\\venvs\\ws-aitoolkit", "pipx"),
         (None, False, "/somewhere/else", "unknown"),
-        ({"url": "file:///t/ws.whl", "archive_info": {}}, False, "/home/u/.local/pipx/venvs/ws", "release"),
+        ({"url": "file:///t/ws.whl", "archive_info": {}}, False, "/home/u/.local/pipx/venvs/ws", "pipx"),  # unstamped
+        ({"url": "file:///t/ws.whl", "archive_info": {}}, False, "/somewhere/else", "unknown"),
         ({"url": "https://example.invalid/x"}, False, "/home/u/.local/pipx/venvs/ws", "pipx"),
     ],
 )

@@ -14,7 +14,8 @@ OPENCODE_CONFIG_DIR is searched for `plugins/`, which is where the shim sits.
 
 The wall is `ws gate launch --runner opencode -- opencode ...` (ws.sandbox: bubblewrap on Linux, sandbox-exec on macOS),
 because OpenCode has no sandbox of its own. The launch hint says so, and launch puts WS_GATED_SESSION in the
-environment so `ws approve` knows it is being run from a gated session.
+environment so `ws approve` knows it is being run from a gated session. The whole generated folder is read-only in the
+wall; see IGNORE below for what that needs.
 """
 
 from __future__ import annotations
@@ -33,10 +34,13 @@ NAME = "opencode"
 CONFIG = "opencode.json"
 PLUGIN = "plugins/ws-gate.js"
 _TOOLS = {"web_fetch": "webfetch", "web_search": "websearch"}
-# For ws.sandbox: the env var that names the generated folder, and the files in it the wall locks read-only (the
-# runner writes its own package files there, so the rest of the folder stays writable).
+# For ws.sandbox: the env var that names the generated folder. The whole folder is read-only in the wall (OpenCode loads
+# plugin/, tool/, agent/, command/ and opencode.jsonc from it, so a planted file there would outlive the session).
 CONFIG_DIR_ENV = "OPENCODE_CONFIG_DIR"
-WALL_PROTECT = (CONFIG, "plugins")
+# OpenCode writes this file into its config folder at start and will not run if it cannot (1.19.4). Written here at
+# generate time, with the content OpenCode writes, so the folder can stay read-only; it needs no node_modules.
+IGNORE = ".gitignore"
+IGNORE_TEXT = "node_modules\npackage.json\npackage-lock.json\nbun.lock\n.gitignore"
 _NEUTRAL = {v: k for k, v in _TOOLS.items()}
 
 # Where this runner keeps what ws installs globally, and where a repo may shadow it (read by ws.globals).
@@ -96,7 +100,7 @@ def generate(policy: Policy, ws_cmd: list[str], out: Path, policy_file: Path) ->
     config = {"$schema": "https://opencode.ai/config.json", "permission": permission}
     plugin = SOURCE.replace("/*__CHECK__*/ []", json.dumps(check_argv(ws_cmd, NAME, policy_file, out)))
     plugin = plugin.replace("/*__WS__*/ []", json.dumps(ws_cmd))
-    return {CONFIG: json.dumps(config, indent=2) + "\n", PLUGIN: plugin}
+    return {CONFIG: json.dumps(config, indent=2) + "\n", PLUGIN: plugin, IGNORE: IGNORE_TEXT}
 
 
 def parse(payload: dict) -> Call | None:

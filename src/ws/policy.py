@@ -20,12 +20,21 @@ claude-code adapter writes), which acts on what a process does, not on what its 
   * closed, for a shell command, the first four lines above: a write to ws's own files (`$WS_HOME`, the policy, the
     generated folder) fails read-only whatever program makes it, and a read under a deny_read rule finds an empty folder
     or file. The tested cases are in tests/e2e/test_sandbox.py, on both runners, Linux only (bubblewrap). macOS gets a
-    generated sandbox-exec profile, which CI does not run.
+    generated sandbox-exec profile, which CI does not run. Also closed and tested (tests/e2e/test_wall_escapes.py): a
+    daemon on a host Unix socket (tmux, screen, systemd-run --user, docker), the host's process list, typing into the
+    person's terminal (TIOCSTI), renaming a folder above a protected one, a plugin or agent planted in the OpenCode
+    config folder, and a repo's `.claude/settings.json` that opens Claude Code's sandbox.
   * still open: a `deny_commands` rule is not enforced inside an interpreter (`python3 -c 'os.system("git push -f")'`
     pushes; only the sandbox's file rules apply to it). Reading is denied only for deny_read paths that exist when the
     runner starts and have no wildcard below their first folder. OpenCode's `patch` tool is not a shell command, so it
     is not sandboxed: its native `edit` rules are all that stop it. A runner started without the wrapper
     (`ws gate launch --no-sandbox`) has no wall at all, and the command says so.
+  * not closed: a protected path outside $WS_HOME that does not exist when the runner starts (a --policy file
+    that was never written) can be created there; a `deny_read` rule with a wildcard in the middle is matcher-only; Claude
+    Code's own sandbox covers its Bash tool, not its Read/Edit tools (permission rules and the hook cover those); an
+    interactive Claude session can still be started in a folder whose project settings open the sandbox, and the hook
+    then denies every call there rather than reconfiguring it; Anthropic's sandbox-runtime was evaluated and not
+    adopted (see ws.sandbox).
   * `allow_hosts` limits the network on Claude Code only (its sandbox proxy filters by host). The OpenCode wall does not
     filter the network: bubblewrap can only cut it off whole, which would cut off the model too.
 A call the policy lets through only with a human's say-so is `ask_commands`: see ws.approvals.

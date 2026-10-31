@@ -18,6 +18,17 @@ nothing: `ws approve` re-derives the id from the record's own fields before it g
 text, so a forged pending record can only put a call in front of the person that they can refuse. Files are 0600 in
 0700 folders, so under the secret wall (ws-secrets) the agent's user cannot write them at all.
 
+Inside the OpenCode wall the hook cannot consume a grant: `granted/` is read-only there (making it writable would let a
+session replay or pre-plant grants). So `ws gate launch` keeps a socketpair, outside the wall, and hands the runner the
+other end as an inherited descriptor (WS_APPROVAL_FD). The hook only *peeks* at the record and exits 4 with the id; the
+shim sends `claim <id>` down the descriptor; the launcher, outside the wall, consumes the record (the same atomic rename
+as above) and answers `ok` or `no <why>`. An inherited descriptor survives the wall's block on creating new Unix
+sockets. A forged claim from inside can only burn an approval, never create one: the shim decides what runs.
+
+What the person grants is exactly what was shown: `ws approve` resolves the typed prefix once, to one record, shows
+that record, and writes the grant from the same parsed fields, never re-reading the folder (which the wall leaves
+writable at `pending/`). A planted record with the same prefix makes the prefix ambiguous; it does not swap the call.
+
 Who may approve: `ws approve` refuses when stdin is not a terminal, and when the session's env marker is set
 (WS_GATED_SESSION, put there by the generated Claude Code settings and by `ws gate launch`). The matcher also denies
 `ws approve` as a shell command. A session that allocates its own pty and unsets the marker defeats the first two; the
@@ -46,6 +57,8 @@ import json
 import os
 import re
 import secrets
+import socket
+import stat
 import sys
 import time
 from dataclasses import dataclass
@@ -57,6 +70,8 @@ TTL = 600  # seconds a pending or a granted approval lives
 ENV_MARKER = "WS_GATED_SESSION"  # set in a gated session's env; `ws approve` refuses when it is there
 _SHORT = 12  # hex digits of the id shown to a person
 _ID = re.compile(r"^[0-9a-f]{8,64}$")
+_FULL = re.compile(r"^[0-9a-f]{64}$")
+FD_ENV = "WS_APPROVAL_FD"  # the inherited claim socket, set by `ws gate launch` inside the OpenCode wall
 _SKEW = 60  # seconds a record's clock may run ahead before it counts as tampered
 
 
@@ -137,11 +152,26 @@ def _parse(text: str, ident: str, now: float) -> tuple[Bound, dict]:
     return bound, rec
 
 
-def _load(path: Path, now: float) -> tuple[Bound, dict]:
+def _read_regular(path: Path) -> str:
+    """A record's text. Opened without following a link and without blocking, and refused unless it is a regular
+    file: `pending/` is writable from the wall, and a FIFO there would hang the reader."""
     try:
-        return _parse(path.read_text(encoding="utf-8"), path.stem, now)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError as e:
         raise ApprovalError(f"unreadable ({type(e).__name__})") from e
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ApprovalError("not a regular file")
+        with os.fdopen(fd, "r", encoding="utf-8", closefd=False) as f:
+            return f.read(65536)
+    except (OSError, UnicodeDecodeError) as e:
+        raise ApprovalError(f"unreadable ({type(e).__name__})") from e
+    finally:
+        os.close(fd)
+
+
+def _load(path: Path, now: float) -> tuple[Bound, dict]:
+    return _parse(_read_regular(path), path.stem, now)
 
 
 def _expired(rec: dict, now: float) -> bool:
@@ -167,9 +197,15 @@ def _prune(root: Path, now: float) -> None:
 _NONE = "no approval"
 
 
-def _consume(root: Path, bound: Bound, now: float) -> str | None:
-    """Use up a granted approval for exactly this call. None = used; else why not (_NONE: there was none)."""
-    ident = bound.digest()
+@dataclass(frozen=True)
+class Claim:
+    """A granted approval exists for this call but could not be consumed here: the caller must `claim` it."""
+
+    ident: str
+
+
+def consume_id(root: Path, ident: str, now: float) -> str | None:
+    """Use up the granted approval with this id. None = used; else why not (_NONE: there was none)."""
     path = _granted(root) / f"{ident}.json"
     claimed = path.with_name(f".{ident}.{os.getpid()}.{secrets.token_hex(4)}.used")
     try:
@@ -179,11 +215,15 @@ def _consume(root: Path, bound: Bound, now: float) -> str | None:
     except OSError as e:
         return f"approval could not be claimed: {type(e).__name__}"
     try:
-        text = claimed.read_text(encoding="utf-8")
-    except OSError:
-        text = ""
+        text = _read_regular(claimed)
+    except ApprovalError as e:
+        text = f"{e}"
     finally:
         claimed.unlink(missing_ok=True)
+    return _verdict(text, ident, now)
+
+
+def _verdict(text: str, ident: str, now: float) -> str | None:
     try:
         _, rec = _parse(text, ident, now)
     except ApprovalError as e:
@@ -195,15 +235,25 @@ def _consume(root: Path, bound: Bound, now: float) -> str | None:
     return None
 
 
-def require(root: Path, bound: Bound, now: float | None = None) -> str | None:
+def peek(root: Path, ident: str, now: float) -> str | None:
+    """Like consume_id, but leaves the record: None = a valid granted approval is there."""
+    try:
+        text = _read_regular(_granted(root) / f"{ident}.json")
+    except ApprovalError:
+        return _NONE if not (_granted(root) / f"{ident}.json").exists() else "the approval is unreadable"
+    return _verdict(text, ident, now)
+
+
+def require(root: Path, bound: Bound, now: float | None = None, consume: bool = True) -> str | Claim | None:
     """None if this exact call holds a granted approval (which is used up). Else the reason it is refused, with the
-    id to approve: a pending record is written (or kept, if one is still fresh)."""
+    id to approve: a pending record is written (or kept, if one is still fresh). With consume=False (inside the
+    wall, where the grant cannot be consumed) a valid grant gives a Claim for the caller to send to the launcher."""
     now = time.time() if now is None else now
     root = Path(root)
-    why = _consume(root, bound, now)
-    if why is None:
-        return None
     ident = bound.digest()
+    why = consume_id(root, ident, now) if consume else peek(root, ident, now)
+    if why is None:
+        return None if consume else Claim(ident)
     path = _pending(root) / f"{ident}.json"
     fresh = False
     with contextlib.suppress(ApprovalError, OSError):
@@ -219,10 +269,41 @@ def require(root: Path, bound: Bound, now: float | None = None) -> str | None:
     )
 
 
+def serve_claims(sock: socket.socket, root: Path) -> None:
+    """The launcher's side of the claim socket, outside the wall: `claim <64 hex>` -> `ok` or `no <why>`. Runs until the
+    runner closes its end."""
+    with sock, sock.makefile("rw", encoding="utf-8", newline="\n") as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) == 2 and parts[0] == "claim" and _FULL.match(parts[1]):
+                why = consume_id(Path(root), parts[1], time.time())
+                f.write("ok\n" if why is None else f"no {why}\n")
+            else:
+                f.write("no bad request\n")
+            f.flush()
+
+
+def claim(sock: socket.socket, ident: str) -> str | None:
+    """The runner's side (used by tests; the OpenCode shim does the same in JavaScript). None = granted and used."""
+    f = sock.makefile("rw", encoding="utf-8", newline="\n")
+    f.write(f"claim {ident}\n")
+    f.flush()
+    answer = f.readline().strip()
+    return None if answer == "ok" else answer.removeprefix("no ") or "no answer"
+
+
 # --- the person's side ---------------------------------------------------------------------------------------------
 
 
-def _find(root: Path, prefix: str, now: float) -> tuple[Path, Bound, dict]:
+@dataclass(frozen=True)
+class Found:
+    path: Path
+    bound: Bound
+    rec: dict
+
+
+def _find(root: Path, prefix: str, now: float) -> Found:
+    """The one pending record whose id starts with `prefix`. Resolved once: everything after uses this result."""
     prefix = prefix.lower()
     if not _ID.match(prefix):
         raise ApprovalError("an id is 8 to 64 hex digits, as `ws approve --list` shows")
@@ -234,7 +315,7 @@ def _find(root: Path, prefix: str, now: float) -> tuple[Path, Bound, dict]:
     bound, rec = _load(hits[0], now)
     if _expired(rec, now):
         raise ApprovalError(f"{prefix} expired: retry the call to get a new id")
-    return hits[0], bound, rec
+    return Found(hits[0], bound, rec)
 
 
 def pending(root: Path, now: float | None = None) -> list[tuple[str, Bound, float]]:
@@ -249,22 +330,29 @@ def pending(root: Path, now: float | None = None) -> list[tuple[str, Bound, floa
     return sorted(out, key=lambda t: t[2])
 
 
-def grant(root: Path, prefix: str, now: float | None = None) -> tuple[str, Bound]:
-    """Turn a pending approval into a granted one. Raises ApprovalError. The caller shows the person `bound` first."""
+def grant_found(root: Path, found: Found, now: float | None = None) -> str:
+    """Grant exactly the call in `found` (what the person was shown), whatever the folder holds now."""
     now = time.time() if now is None else now
-    root = Path(root)
-    path, bound, rec = _find(root, prefix, now)
-    _write(_granted(root) / f"{rec['id']}.json", _record(bound, rec["created"], now))
-    path.unlink(missing_ok=True)
-    return rec["id"], bound
+    ident = found.bound.digest()
+    _write(_granted(root) / f"{ident}.json", _record(found.bound, found.rec["created"], now))
+    found.path.unlink(missing_ok=True)
+    return ident
+
+
+def grant(root: Path, prefix: str, now: float | None = None) -> tuple[str, Bound]:
+    """Find, then grant. Raises ApprovalError. A person's terminal shows `bound` between the two (see cmd_approve)."""
+    now = time.time() if now is None else now
+    found = _find(Path(root), prefix, now)
+    return grant_found(Path(root), found, now), found.bound
 
 
 def describe(bound: Bound) -> str:
     """The call as a person should see it. JSON-escaped: the text came from a model, and a raw control or escape
     sequence could repaint the terminal to show something else."""
+    j = json.dumps
     return (
-        f"  runner  {bound.runner}\n  {bound.kind:<7} {json.dumps(bound.value)}\n"
-        f"  cwd     {json.dumps(bound.cwd)}\n  session {json.dumps(bound.session)}"
+        f"  id      {bound.digest()}\n  runner  {j(bound.runner)}\n  kind    {j(bound.kind)}\n"
+        f"  call    {j(bound.value)}\n  cwd     {j(bound.cwd)}\n  session {j(bound.session)}"
     )
 
 
@@ -287,7 +375,9 @@ def cmd_approve(args: argparse.Namespace) -> int:
             return 1
         rows = pending(root)
         for ident, bound, left in rows:
-            print(f"{ident[:_SHORT]}  {int(left // 60)}m left  {bound.runner}  {json.dumps(bound.value)[:100]}")
+            print(
+                f"{ident[:_SHORT]}  {int(left // 60)}m left  {json.dumps(bound.runner)}  {json.dumps(bound.value)[:100]}"
+            )
         if not rows:
             print("ws: nothing is waiting for approval")
         return 0
@@ -299,12 +389,12 @@ def cmd_approve(args: argparse.Namespace) -> int:
         print("ws: give the id the gate printed, or --list", file=sys.stderr)
         return 1
     try:
-        _, bound, _ = _find(root, args.id, time.time())
-        print("Approve this call, once?\n" + describe(bound))
+        found = _find(root, args.id, time.time())
+        print("Approve this call, once?\n" + describe(found.bound))
         if not args.yes and input("approve? [y/N] ").strip().lower() not in ("y", "yes"):
             print("ws: not approved")
             return 1
-        ident, _ = grant(root, args.id)
+        ident = grant_found(root, found)
     except (ApprovalError, EOFError, OSError) as e:
         print(f"ws: {e}", file=sys.stderr)
         return 1

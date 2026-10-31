@@ -69,23 +69,25 @@ jobs:
           node node_modules/@anthropic-ai/claude-code/install.cjs
           echo "$PWD/node_modules/.bin" >> "$GITHUB_PATH"
       # The sandbox wall: Claude Code's native sandbox needs bubblewrap and socat; `ws gate launch` needs bubblewrap.
-      # Versions are the ubuntu-24.04 image's own (bubblewrap 0.9, socat 1.8 at the time of writing). That image
+      # tmux and screen are the host daemons the wall tests try to reach (systemd-run --user needs a user manager, which
+      # a CI runner does not have, so that one test skips). Versions are the ubuntu-24.04 image's own (bubblewrap 0.9,
+      # socat 1.8 at the time of writing). That image
       # switches off unprivileged user namespaces for unconfined programs with AppArmor, which bubblewrap needs, so the
       # restriction is lifted for this throwaway runner only.
       - name: install the sandbox tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends bubblewrap socat
+          sudo apt-get install -y --no-install-recommends bubblewrap socat tmux screen
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           bwrap --version
       - name: a denied command is blocked on Claude Code (deny list, hook) and OpenCode (deny list, shim)
         env:
           WS_E2E_REQUIRE: "1" # a missing runner fails the job instead of skipping
         run: uv run --locked pytest -q tests/e2e/test_gate_runners.py
-      - name: the sandbox stops what the matcher cannot see, on both runners; the OpenCode nudge fires on a real run
+      - name: the sandbox stops what the matcher cannot see, and the host-socket escapes; the OpenCode nudge and approvals work
         env:
           WS_E2E_REQUIRE: "1" # missing bubblewrap or a runner fails the job instead of skipping
-        run: uv run --locked pytest -q tests/e2e/test_sandbox.py tests/e2e/test_opencode_nudge.py
+        run: uv run --locked pytest -q tests/e2e/test_sandbox.py tests/e2e/test_wall_escapes.py tests/e2e/test_opencode_nudge.py
 
   # Phase 3 pass test (row 3): a job's run record is complete against its schema on both runners. Same stub model, plus
   # a real broker lease to a stub upstream; no paid provider.

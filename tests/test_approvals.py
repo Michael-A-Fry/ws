@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import stat
@@ -318,3 +319,88 @@ def test_ask_commands_and_allow_hosts_load_and_validate():
         with pytest.raises(policy.PolicyError, match="allow_hosts"):
             policy.loads(f"[gate]\nallow_hosts = {bad}\n")
     assert policy.loads(policy.default_toml()).gate.ask_commands == ()
+
+
+# --- fix round: exact grant, FIFOs, claims ---------------------------------------------------------------------
+
+
+def test_the_person_grants_exactly_what_was_shown_even_if_the_folder_changes_after(root):
+    ask(root)
+    found = approvals._find(root, ident()[:12], NOW + 1)
+    pend = root / "pending"
+    # an inotify-quick swap: another record with the same prefix appears, and the shown one is rewritten
+    evil = Bound("claude-code", "command", "rm -rf ~", "/work", "sess-1")
+    (pend / f"{ident()[:12]}{'f' * 52}.json").write_text(json.dumps({"id": "x"}))
+    edit(pend / f"{ident()}.json", lambda r: r["bound"].update(value=evil.value))
+    assert approvals.grant_found(root, found, NOW + 2) == ident()
+    assert ask(root, CALL, NOW + 3) is None  # the call that was shown runs
+    assert ask(root, evil, NOW + 3)  # and the one swapped in does not
+
+
+def test_a_colliding_prefix_is_ambiguous_not_a_swap(root):
+    ask(root)
+    (root / "pending" / f"{ident()[:12]}{'e' * 52}.json").write_text("{}")
+    with pytest.raises(ApprovalError, match="more digits"):
+        approvals._find(root, ident()[:12], NOW + 1)
+    assert approvals._find(root, ident(), NOW + 1).bound == CALL  # the full id still works
+
+
+def test_a_fifo_or_a_link_in_place_of_a_record_is_refused_without_hanging(root):
+    ask(root)
+    pend = root / "pending"
+    os.mkfifo(pend / f"{'a' * 64}.json")
+    os.symlink("/etc/hostname", pend / f"{'b' * 64}.json")
+    assert [i for i, *_ in approvals.pending(root, NOW + 1)] == [ident()]
+    ask(root, CALL, NOW + 2)  # the sweep reads every file in the folder: it must not block on the FIFO
+    for name in ("a", "b"):
+        with pytest.raises(ApprovalError):
+            approvals._load(pend / f"{name * 64}.json", NOW)
+
+
+def test_what_the_person_is_shown_has_every_field_escaped():
+    bound = Bound("open\x1b[2Jcode", "com\nmand", "echo\x07 hi", "/w\r", "s\x00")
+    text = approvals.describe(bound)
+    assert not any(c in text for c in "\x1b\x07\r\x00") and text.count("\n") == 5
+    assert "\\u001b" in text and "\\u0007" in text
+
+
+def test_the_list_escapes_what_the_session_wrote(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("WS_HOME", str(tmp_path))
+    monkeypatch.delenv(approvals.ENV_MARKER, raising=False)
+    approvals.require(tmp_path / "approvals", Bound("op\x1bencode", "command", "x\ry", "/w", "s"))
+    assert cli.main(["approve", "--list"]) == 0
+    out = capsys.readouterr().out
+    assert "\x1b" not in out and "\r" not in out
+
+
+def test_inside_the_wall_a_grant_is_peeked_not_used_and_comes_back_as_a_claim(root):
+    approve(root)
+    got = approvals.require(root, CALL, NOW + 10, consume=False)
+    assert got == approvals.Claim(ident())
+    assert granted(root).exists()  # still there: only the launcher uses it up
+    assert approvals.consume_id(root, ident(), NOW + 11) is None
+    assert approvals.require(root, CALL, NOW + 12, consume=False) != approvals.Claim(ident())
+
+
+def test_peeking_asks_when_there_is_no_valid_grant(root):
+    why = approvals.require(root, CALL, NOW, consume=False)
+    assert isinstance(why, str) and "ws approve" in why
+    approve(root, now=NOW + 1)
+    edit(granted(root), lambda r: r["bound"].update(value="other"))
+    assert isinstance(approvals.require(root, CALL, NOW + 20, consume=False), str)
+
+
+def test_the_gate_check_exits_4_with_the_claim_inside_the_wall(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("WS_HOME", str(tmp_path))
+    monkeypatch.setenv(approvals.FD_ENV, "5")
+    (tmp_path / "policy.toml").write_text('[gate]\nask_commands = ["terraform apply*"]\n')
+    raw = payload("terraform apply")
+    monkeypatch.setattr("sys.stdin", io.StringIO(raw))
+    assert cli.main(["gate", "check", "--runner", "claude-code"]) == gate.DENY  # first try: asks
+    bound = Bound("claude-code", "command", "terraform apply", "/work", "sess-1")
+    approvals.grant(tmp_path / "approvals", bound.digest()[:12])
+    capsys.readouterr()
+    monkeypatch.setattr("sys.stdin", io.StringIO(raw))
+    assert cli.main(["gate", "check", "--runner", "claude-code"]) == gate.CLAIM
+    assert json.loads(capsys.readouterr().out) == {"claim": bound.digest()}
+    assert (tmp_path / "approvals" / "granted" / f"{bound.digest()}.json").exists()

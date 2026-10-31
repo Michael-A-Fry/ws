@@ -130,7 +130,7 @@ def claude_settings(tmp_path, layer: str) -> Path:
     return settings
 
 
-def claude_run(tmp_path, stub, settings, bare: bool, work) -> subprocess.CompletedProcess:
+def claude_run(tmp_path, stub, settings, bare: bool, work, sources: str | None = "user") -> subprocess.CompletedProcess:
     env = base_env(tmp_path)
     env.update(
         ANTHROPIC_BASE_URL=stub.url,
@@ -147,6 +147,8 @@ def claude_run(tmp_path, stub, settings, bare: bool, work) -> subprocess.Complet
         "claude-sonnet-4-5",
         "--no-session-persistence",
     ]
+    if sources:  # as `ws run` does: a repo's own .claude/settings*.json must not widen the generated sandbox
+        cmd += ["--setting-sources", sources]
     if bare:
         cmd.append("--bare")
     return run(cmd, env, work)

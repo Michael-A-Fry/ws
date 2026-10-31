@@ -16,6 +16,13 @@ confines every shell command Claude runs, whatever program it starts:
   * `filesystem.denyRead`: the deny_read rules that name a folder or file (ws.policy.sandbox_read_paths).
   * `network.allowedDomains`: the policy's allow_hosts, only when the policy names some. Without them the sandbox
     asks (interactive) or refuses (`-p`) for a host it has not been told about.
+  * `autoAllowBashIfSandboxed: false`, set on purpose: with it on, Claude Code runs sandboxed shell commands without
+    asking. ws leaves that choice to the person's own permission mode, so a sandboxed command still prompts as before.
+Project settings can widen all of this: in 2.1.308 `sandbox.excludedCommands` merges across settings sources and
+`filesystem.allowRead` beats `denyRead`, and `claude -p` shows no trust dialog. Two guards, both tested: gated headless
+runs pass `--setting-sources user` (ws run and the e2e), so a repo's `.claude/settings*.json` is never loaded; and the
+hook (`preflight`) denies, with a plain message, every call made from a folder whose project or local settings turn the
+sandbox off or open it up, because an interactive session cannot be started with that flag by ws.
 The sandbox covers shell commands; Claude's own Read, Edit and Write tools are covered by the permission rules above and
 the hook, not by it. `env` carries WS_GATED_SESSION so `ws approve` knows it is being run from a gated session.
 
@@ -26,6 +33,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import shlex
 from pathlib import Path
@@ -76,6 +84,7 @@ def sandbox_block(policy: Policy, out: Path, policy_file: Path) -> dict:
         fs["denyRead"] = sandbox_read_paths(policy)
     block: dict = {
         "enabled": True,
+        "autoAllowBashIfSandboxed": False,
         "failIfUnavailable": True,
         "allowUnsandboxedCommands": False,
         "filesystem": fs,
@@ -83,6 +92,56 @@ def sandbox_block(policy: Policy, out: Path, policy_file: Path) -> dict:
     if policy.gate.allow_hosts:
         block["network"] = {"allowedDomains": list(policy.gate.allow_hosts)}
     return block
+
+
+def preflight(payload: dict) -> str | None:
+    """A reason to deny every call from this folder: a project or local `.claude/settings*.json`, in the session folder or
+    any folder above it, that turns the sandbox off or opens it up (see the module docstring). A file that does not
+    parse is ignored, as Claude Code ignores it; one that cannot be read is a deny."""
+    cwd = payload.get("cwd")
+    if not isinstance(cwd, str) or not cwd.startswith("/"):
+        return None
+    home = Path(os.environ.get("HOME") or Path.home())
+    for d in [Path(cwd), *Path(cwd).parents]:
+        if d == home:  # ~/.claude/settings.json is the person's own (user scope), not a project's
+            continue
+        for name in ("settings.json", "settings.local.json"):
+            f = d / ".claude" / name
+            try:
+                conf = json.loads(f.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                continue
+            except ValueError:
+                continue
+            except OSError as e:
+                return f"{f} could not be read ({type(e).__name__}); blocked to be safe"
+            key = _widens_sandbox(conf)
+            if key:
+                return (
+                    f"{f} sets sandbox.{key}, which would open the sandbox ws generated: take it out of the project "
+                    "settings (ws gated runs start with --setting-sources user and never load it)"
+                )
+    return None
+
+
+def _widens_sandbox(conf) -> str | None:
+    sb = conf.get("sandbox") if isinstance(conf, dict) else None
+    if not isinstance(sb, dict):
+        return None
+    if sb.get("enabled") is False:
+        return "enabled = false"
+    if sb.get("allowUnsandboxedCommands") is True:
+        return "allowUnsandboxedCommands = true"
+    if sb.get("excludedCommands"):
+        return "excludedCommands"
+    fs = sb.get("filesystem")
+    if isinstance(fs, dict):
+        if fs.get("disabled") is True:
+            return "filesystem.disabled = true"
+        for k in ("allowRead", "allowWrite"):
+            if fs.get(k):
+                return f"filesystem.{k}"
+    return None
 
 
 def generate(policy: Policy, ws_cmd: list[str], out: Path, policy_file: Path) -> dict[str, str]:
@@ -166,6 +225,7 @@ def build_command(job, run_dir: Path, lease) -> tuple[list[str], dict[str, str]]
     exe = jobs.option(job, "exe", str, EXE)
     tools = jobs.string_list(job, "allowed_tools")
     argv = [exe, "-p", "--output-format", "json", "--model", job.model, "--settings", str(run_dir / "gate" / FILE)]
+    argv += ["--setting-sources", "user"]  # a repo's own .claude/settings*.json must not widen the sandbox
     if job.bare:
         argv.append("--bare")
     if job.max_turns is not None:

@@ -1,0 +1,92 @@
+# Phase 2 pass test on three OSs: on a fresh machine `ws doctor` exits non-zero listing every role unconfigured.
+# Nightly, and on pull requests that touch the CLI. Not a required check: a slow or flaky runner never blocks a PR.
+name: cli
+on:
+  pull_request:
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "scripts/check_fresh_doctor.py"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/cli.yml"
+  schedule:
+    - cron: "17 14 * * *" # 02:17 or 03:17 in Auckland
+  workflow_dispatch:
+permissions: read-all
+concurrency:
+  group: cli-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  doctor:
+    name: doctor (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-26]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: "0.13.1"
+          enable-cache: true
+      - name: tests
+        run: uv run --locked pytest -q
+      - name: fresh doctor exits non-zero, every role unconfigured
+        run: |
+          export WS_HOME="$RUNNER_TEMP/wshome"
+          set +e; uv run --locked ws doctor --json > "$RUNNER_TEMP/doctor.json"; code=$?; set -e
+          uv run --locked python scripts/check_fresh_doctor.py "$RUNNER_TEMP/doctor.json" "$code"
+
+  wsl:
+    name: doctor (windows-2025, WSL2 Ubuntu-24.04)
+    runs-on: windows-2025
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Vampire/setup-wsl@4c48163d9f981914dd8caa0fc335fe19cca5bff4 # v7.2.0
+        with:
+          distribution: Ubuntu-24.04
+          additional-packages: curl ca-certificates
+      - name: tests and fresh doctor inside WSL2
+        shell: wsl-bash {0}
+        run: |
+          set -euo pipefail
+          v=0.13.1; sum=eadd9d27c134ab5ac1ffd4473b97a741407f3ea238288f03121fc4deddf90220
+          curl -sSfL -o /tmp/uv.tgz "https://github.com/astral-sh/uv/releases/download/$v/uv-x86_64-unknown-linux-gnu.tar.gz"
+          echo "$sum  /tmp/uv.tgz" | sha256sum -c -
+          mkdir -p "$HOME/.local/bin" && tar -xzf /tmp/uv.tgz -C "$HOME/.local/bin" --strip-components=1
+          export PATH="$HOME/.local/bin:$PATH"
+          # copy off the Windows drive: a venv on /mnt is slow and loses Unix permissions
+          rm -rf "$HOME/ws" && cp -r . "$HOME/ws" && cd "$HOME/ws"
+          uv run --locked pytest -q
+          export WS_HOME="$HOME/wshome"
+          set +e; uv run --locked ws doctor --json > /tmp/doctor.json; code=$?; set -e
+          uv run --locked python scripts/check_fresh_doctor.py /tmp/doctor.json "$code"
+
+  windows-native:
+    name: doctor (windows-2025, native: points at WSL2)
+    runs-on: windows-2025
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: "0.13.1"
+          enable-cache: true
+      - name: native doctor fails WS001 with the WSL2 fix, every role unconfigured
+        run: |
+          export WS_HOME="$RUNNER_TEMP/wshome"
+          set +e; uv run --locked ws doctor --json > "$RUNNER_TEMP/doctor.json"; code=$?; set -e
+          uv run --locked python scripts/check_fresh_doctor.py "$RUNNER_TEMP/doctor.json" "$code" --native-windows

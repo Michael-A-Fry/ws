@@ -4,10 +4,10 @@
 
 - [x] Public repo, Apache-2.0 + NOTICE, squash-only, auto-delete head branches
 - [x] Secret scanning + push protection, Dependabot alerts and security updates, immutable releases
-- [ ] SSH signing key on GitHub; first commit Verified
+- [x] SSH signing key on GitHub; local commits Verified (checked on 8a0064b), squash merges signed by GitHub
 - [x] Rulesets: `main` (no force push, no delete, linear, signed) and `v*` tags (no update/delete); no bypass; `ci` required
-- [ ] CLA bot (CLA Assistant, hosted) linked to CLA.md
-- [ ] `ws-toolkit` reserved on PyPI and npm
+- [x] CLA bot (CLA Assistant, hosted) linked to CLA.md: the `license/cla` check appeared on PR #5 (not a required check)
+- [x] `ws-aitoolkit` 0.0.0 on PyPI and npm (#175); `ws-toolkit` held on PyPI, never released
 
 ## Phase 1 (hygiene gate)
 
@@ -17,5 +17,6 @@
 
 ## Phase 2 (CLI skeleton, doctor)
 
-- [ ] CLI skeleton, `ws doctor` (check IDs, `--json`), OS detection, the 3 questions, Console usage API check
+- [x] CLI skeleton, `ws doctor` (check IDs, `--json`), OS detection, the 3 questions (`ws init`), Console usage API check
+  (WS110; needs an Admin API key, which Anthropic gives organisations only)
 - [ ] `doctor` exits non-zero listing every role unconfigured on ubuntu-24.04, windows-2025 (WSL) and macos-26

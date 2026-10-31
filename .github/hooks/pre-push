@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Runs the checks CI runs, on your machine, before a push leaves it.
+# Turn it on once per clone:  git config core.hooksPath .github/hooks
+# Skip it for one push:       WS_SKIP_PREPUSH=1 git push
+# A skip is never silent: it adds a line to .git/ws-prepush-skips.log (the log of the worktree's git dir).
+set -euo pipefail
+
+top="$(git rev-parse --show-toplevel)"
+cd "$top"
+
+if [[ "${WS_SKIP_PREPUSH:-}" == "1" ]]; then
+  log="$(git rev-parse --git-path ws-prepush-skips.log)"
+  printf '%s skipped pre-push on %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(git rev-parse --abbrev-ref HEAD)" >>"$log"
+  echo "pre-push: skipped because WS_SKIP_PREPUSH=1 (logged in $log)" >&2
+  exit 0
+fi
+
+echo "pre-push: uvx prek run --all-files" >&2
+uvx prek run --all-files >&2
+
+echo "pre-push: uv run --locked pytest -q" >&2
+uv run --locked pytest -q >&2

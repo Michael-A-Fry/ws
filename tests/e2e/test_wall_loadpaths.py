@@ -30,6 +30,9 @@ Linux only (bubblewrap). A missing tool skips, unless WS_E2E_REQUIRE=1 (CI), whe
 
 from __future__ import annotations
 
+import ast
+import json
+import signal
 import stat
 import subprocess
 from collections.abc import Callable
@@ -41,6 +44,7 @@ import pytest
 from e2e import test_gate_runners as gr
 from e2e import test_sandbox as sb
 from e2e import test_wall_escapes as we
+from e2e.stubs import AnthropicStub, Call, OpenAIStub
 from ws import policy, sandbox
 
 need_wall = sb.need_wall
@@ -284,6 +288,80 @@ ROWS.append(
     )
 )
 
+# --- git: which folder git reads its hooks and config from (the pointers), and folders other than `.git` ----------------
+IDENT = f"-c user.name=t -c user.email=t{chr(64)}t.invalid"  # built here: the PII gate is for real addresses
+COMMIT = f"git {IDENT} commit -q --allow-empty -m first"
+SEPARATE = "git init -q --separate-git-dir=realgit ."  # the git folder is in the project, `.git` is a pointer file
+WORKTREE = f"{GIT}; {COMMIT}; git worktree add -q wt"
+REDIRECT = "git init -q --bare fake && printf '[alias]\\n\\tzz = !touch alias-ran\\n' >> fake/config && echo ../fake > .git/commondir"
+
+
+def text_is(rel: str, value: str) -> Callable[[Path, Path], bool]:
+    return lambda work, home: (work / rel).is_file() and (work / rel).read_text().strip() == value
+
+
+ROWS += variants(
+    "git-commondir",
+    "every git command (commondir names the folder git reads its hooks and config from)",
+    write(".git/commondir"),
+    has(".git/commondir"),
+    "echo . > .git/commondir",
+    GIT,
+)
+ROWS += [
+    Row(
+        "git-commondir-redirect",
+        "every git command: a git folder made in the project, named by commondir, supplies the config",
+        REDIRECT,
+        text_is(".git/commondir", "../fake"),
+        GIT,
+    ),
+    Row("git-separate-dir-hook", "git commit", write("realgit/hooks/pre-commit"), has("realgit/hooks"), SEPARATE),
+    Row(
+        "git-separate-dir-config",
+        "every git command",
+        "printf '[alias]\\n\\tst = ws-plant\\n' >> realgit/config",
+        has("realgit/config"),
+        SEPARATE,
+    ),
+    Row(
+        "git-separate-dir-commondir",
+        "every git command",
+        write("realgit/commondir"),
+        has("realgit/commondir"),
+        SEPARATE,
+    ),
+    Row("git-separate-dir-rename", "every git command", "mv realgit moved", moved("moved"), SEPARATE),
+    Row(
+        "git-worktree-commondir",
+        "git in a linked worktree",
+        write(".git/worktrees/wt/commondir"),
+        has(".git/worktrees/wt/commondir"),
+        WORKTREE,
+    ),
+    Row(
+        "git-worktree-gitdir",
+        "git in a linked worktree",
+        write(".git/worktrees/wt/gitdir"),
+        has(".git/worktrees/wt/gitdir"),
+        WORKTREE,
+    ),
+    Row(
+        "git-worktree-config",
+        "git in a linked worktree, with extensions.worktreeConfig",
+        write(".git/worktrees/wt/config.worktree"),
+        has(".git/worktrees/wt/config.worktree"),
+        WORKTREE,
+    ),
+    Row(
+        "git-include-missing-parent",
+        "every git command, with an [include] of a file in a folder that is not there",
+        "mkdir -p cfg && printf '[alias]\\n\\tst = ws-plant\\n' > cfg/local.gitconfig",
+        has("cfg/local.gitconfig"),
+        f"{GIT}; git config include.path ../cfg/local.gitconfig",
+    ),
+]
+
 # --- written on purpose, or a known limit: the plant lands inside the wall --------------------------------------------
 ROWS += [
     Row("content-claude-md", "Claude Code: instructions, not code", write("CLAUDE.md"), has("CLAUDE.md"), open=True),
@@ -352,6 +430,10 @@ def test_a_load_path_cannot_be_planted_inside_the_wall(tmp_path, row):
 # --- the runner's own folders are private in the wall -----------------------------------------------------------
 
 
+def key(root: Path) -> str:
+    return sandbox.project_key(str((root / "work").resolve()))
+
+
 def test_a_walled_run_gets_its_own_xdg_folders_that_persist_and_the_real_ones_stay_clean(tmp_path):
     root = world(tmp_path, "w", "")
     home = root / "home"
@@ -359,8 +441,13 @@ def test_a_walled_run_gets_its_own_xdg_folders_that_persist_and_the_real_ones_st
     proc = run(root, probe)
     data, state, cache = (root / "work" / "vars.txt").read_text().split()
     wall = (root / "wshome" / "wall" / "opencode").resolve()
-    assert (data, state, cache) == tuple(str(wall / k) for k in ("data", "state", "cache")), proc.stderr
-    assert (wall / "cache" / "seen").read_text() == "one\n"
+    # data and cache are kept per project, state is shared: see sandbox.private_homes
+    assert (data, state, cache) == (
+        str(wall / "data" / key(root)),
+        str(wall / "state"),
+        str(wall / "cache" / key(root)),
+    ), proc.stderr
+    assert (wall / "cache" / key(root) / "seen").read_text() == "one\n"
     assert not (home / ".cache" / "opencode").exists() and not (home / ".local" / "share" / "opencode").exists()
     assert (root / "wshome" / "wall" / ".gitignore").read_text() == "*\n"
     assert stat.S_IMODE(wall.parent.stat().st_mode) == 0o700
@@ -381,7 +468,7 @@ def test_the_sign_in_is_copied_in_and_the_real_one_cannot_be_written(tmp_path):
     )
     assert (root / "work" / "copy.json").read_text() == '{"k": 1}', proc.stderr
     assert (real / "auth.json").read_text() == '{"k": 1}'
-    seeded = root / "wshome" / "wall" / "opencode" / "data" / "opencode" / "auth.json"
+    seeded = root / "wshome" / "wall" / "opencode" / "data" / key(root) / "opencode" / "auth.json"
     assert stat.S_IMODE(seeded.stat().st_mode) == 0o600
     (real / "auth.json").unlink()  # logged out: the copy goes too
     run(root, "true")
@@ -397,7 +484,7 @@ def test_a_sign_in_the_policy_hides_is_not_copied(tmp_path):
     real.mkdir(parents=True)
     (real / "auth.json").write_text("secret")
     run(root, "true")
-    assert not (root / "wshome" / "wall" / "opencode" / "data" / "opencode" / "auth.json").exists()
+    assert not (root / "wshome" / "wall" / "opencode" / "data" / key(root) / "opencode" / "auth.json").exists()
 
 
 # --- nothing is left in the person's project --------------------------------------------------------------------
@@ -425,7 +512,385 @@ def test_a_project_config_that_is_a_symbolic_link_is_refused(tmp_path):
     assert (root / "work" / ".claude").is_symlink()  # and nothing was changed
 
 
-def test_a_repository_the_session_creates_is_flagged_when_it_ends(tmp_path):
+def test_a_repository_the_session_creates_is_reported_when_it_ends(tmp_path):
     root = world(tmp_path, "w", "")
-    assert sandbox.NEW_REPO_NOTE in run(root, GIT).stderr
-    assert sandbox.NEW_REPO_NOTE not in run(root, "true").stderr
+    assert "new a git folder: .git" in run(root, GIT).stderr
+    assert "wall report" not in run(root, "true").stderr
+
+
+def test_another_project_gets_its_own_data_and_cache_but_shares_state(tmp_path):
+    one, two = world(tmp_path, "one", ""), world(tmp_path, "two", "")
+    seen = {}
+    for name, root in (("one", one), ("two", two)):
+        run(root, 'printf "%s\\n" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$XDG_CACHE_HOME" > vars.txt')
+        seen[name] = (root / "work" / "vars.txt").read_text().split()
+    assert seen["one"][0] != seen["two"][0] and seen["one"][2] != seen["two"][2]
+    assert Path(seen["one"][0]).name == key(one) and Path(seen["two"][2]).name == key(two)
+
+
+def test_a_link_planted_in_the_private_folders_is_not_followed_when_the_sign_in_is_copied(tmp_path):
+    root = world(tmp_path, "w", "")
+    real = root / "home" / ".local" / "share" / "opencode"
+    real.mkdir(parents=True)
+    (real / "auth.json").write_text("sign-in")
+    run(root, "true")  # makes the private folders
+    app = root / "wshome" / "wall" / "opencode" / "data" / key(root) / "opencode"
+    victim = root / "home" / "victim"
+    victim.write_text("keep")
+    # what a walled session could do: leave links where the launcher will write next time
+    run(root, f'ln -s {victim} "$XDG_DATA_HOME/opencode/auth.json.new"')
+    assert (app / "auth.json.new").is_symlink()
+    run(root, "true")
+    assert victim.read_text() == "keep" and (app / "auth.json").read_text() == "sign-in"
+    assert not (app / "auth.json.new").exists() and not (app / "auth.json").is_symlink()
+    other = root / "home" / "elsewhere"
+    other.mkdir()
+    run(root, f'rm -rf "$XDG_DATA_HOME/opencode"; ln -s {other} "$XDG_DATA_HOME/opencode"')
+    run(root, "touch ran")  # the link is removed (not followed) and the folder made again
+    assert not any(other.iterdir()) and (root / "work" / "ran").exists()
+    assert not app.is_symlink() and (app / "auth.json").read_text() == "sign-in"
+
+
+# --- Claude Code: no launcher, so its own sandbox and Edit rules carry the same project lock ----------------------------
+
+
+def py_write(path: str) -> str:
+    """A write the text rules cannot read: only the kernel layer of Claude Code's sandbox can stop it."""
+    return (
+        f"python3 -c \"import os; os.makedirs(os.path.dirname('{path}') or '.', exist_ok=True); "
+        f"open('{path}', 'w').write('ws-plant')\""
+    )
+
+
+# Not here: `.claude` itself. Claude Code asks before it writes there whatever the settings say, so `claude -p` cannot even
+# attempt it (the control would fail); the rule for it is in the settings and tested as text in tests/test_sandbox.py.
+CLAUDE_BASH = {  # id: (setup, what the Bash tool runs, where it must not land)
+    "opencode-plugin": ("", py_write(".opencode/plugins/x.js"), ".opencode"),
+    "opencode-json": ("", py_write("opencode.json"), "opencode.json"),
+    "mcp-json": ("", py_write(".mcp.json"), ".mcp.json"),
+    "git-hook": (GIT, py_write(".git/hooks/pre-commit"), ".git/hooks"),
+    "git-config": (GIT, py_write(".git/config"), ".git/config"),
+    "git-commondir": (GIT, py_write(".git/commondir"), ".git/commondir"),
+    "separate-git-dir-hook": (SEPARATE, py_write("realgit/hooks/pre-commit"), "realgit/hooks"),
+    "separate-git-dir-commondir": (SEPARATE, py_write("realgit/commondir"), "realgit/commondir"),
+}
+CLAUDE_WRITE = {  # id: (setup, the file the Write tool is asked to create, relative to the project)
+    "opencode-plugin": ("", ".opencode/plugins/x.js"),
+    "opencode-json": ("", "opencode.json"),
+    "nested-opencode-plugin": ("", "sub/.opencode/plugins/x.js"),  # the Edit rules say **/, so a sub-folder is held too
+    "nested-opencode-json": ("", "sub/opencode.json"),
+}
+
+
+def claude_world(tmp_path, monkeypatch, name: str, setup: str) -> Path:
+    root = world(tmp_path, name, setup)
+    monkeypatch.setenv("WS_HOME", str(root / "wshome"))
+    monkeypatch.setenv("HOME", str(root / "home"))
+    monkeypatch.chdir(root / "work")  # the settings name the project they are made in (see claude_code.sandbox_block)
+    return root
+
+
+def claude_try(root: Path, call, layers: tuple[str, ...]) -> Path:
+    """Claude Code (the real runner, a stub model) with only the named layers of the generated settings: `sandbox`
+    (shell commands) and `permissions` (the Edit rules, which cover Write). The hooks are always taken out, so only the
+    layer under test can stop the call."""
+    settings = gr.generate(root, "claude-code") / "settings.json"
+    conf = json.loads(settings.read_text())
+    del conf["hooks"]
+    for layer in ("sandbox", "permissions"):
+        if layer not in layers:
+            del conf[layer]
+    settings.write_text(json.dumps(conf))
+    with AnthropicStub([call]) as stub:
+        proc = gr.claude_run(root, stub, settings, False, root / "work")
+    assert stub.tool_results(), f"the runner never reported the call back\n{gr.where(proc)}"
+    return root / "work"
+
+
+@pytest.mark.parametrize("name", CLAUDE_BASH)
+def test_claude_codes_sandbox_holds_the_project_config_too(tmp_path, monkeypatch, name):
+    setup, command, where = CLAUDE_BASH[name]
+    call = Call("Bash", {"command": f"{command}; touch {RAN}"})
+    walled = claude_try(claude_world(tmp_path, monkeypatch, "walled", setup), call, ("sandbox",))
+    assert (walled / RAN).exists(), "the control write in the same command did not run"
+    assert not has(where)(walled, walled), f"the plant landed past Claude Code's sandbox: {where}"
+    bare = claude_try(claude_world(tmp_path, monkeypatch, "bare", setup), call, ())
+    assert has(where)(bare, bare), "control: with no sandbox the same plant must land"
+
+
+@pytest.mark.parametrize("name", CLAUDE_WRITE)
+def test_claude_codes_edit_rules_hold_the_project_config_for_the_write_tool(tmp_path, monkeypatch, name):
+    setup, rel = CLAUDE_WRITE[name]
+    root = claude_world(tmp_path, monkeypatch, "walled", setup)
+    call = Call("Write", {"file_path": str(root / "work" / rel), "content": PLANT})
+    claude_try(root, call, ("permissions",))
+    assert not has(rel)(root / "work", root), "the Write tool planted past the Edit deny rules"
+    other = claude_world(tmp_path, monkeypatch, "bare", setup)
+    claude_try(other, Call("Write", {"file_path": str(other / "work" / rel), "content": PLANT}), ())
+    assert has(rel)(other / "work", other), "control: with no rules the Write tool must create it"
+
+
+# --- the loader actually runs it: a control per class, with real repos and real runners --------------------------------
+
+FIRE = {
+    "GIT_AUTHOR_NAME": "t",
+    "GIT_COMMITTER_NAME": "t",
+    "GIT_AUTHOR_EMAIL": f"t{chr(64)}t.invalid",
+    "GIT_COMMITTER_EMAIL": f"t{chr(64)}t.invalid",
+}
+
+
+def fire(root: Path, command: str) -> None:
+    """Run `command` in the project the way the person would next: bare, outside the wall, in their HOME."""
+    env = {**gr.base_env(root), **FIRE}
+    subprocess.run(
+        ["bash", "-c", command], cwd=root / "work", env=env, capture_output=True, text=True, timeout=60, check=False
+    )
+
+
+def test_a_planted_git_hook_fires_on_the_next_commit_outside_the_wall_only(tmp_path):
+    plant = "printf '#!/bin/sh\\ntouch hook-ran\\n' > .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit"
+    walled, bare = world(tmp_path, "walled", GIT), world(tmp_path, "bare", GIT)
+    run(walled, plant)
+    run(bare, plant, "--no-sandbox")
+    for root in (walled, bare):
+        fire(root, "git commit -q --allow-empty -m x")
+    assert (bare / "work" / "hook-ran").exists(), "control: the planted hook must fire on a real commit"
+    assert not (walled / "work" / "hook-ran").exists()
+
+
+@pytest.mark.parametrize(
+    "plant, setup",
+    [
+        ("printf '[alias]\\n\\tzz = !touch alias-ran\\n' >> .git/config", GIT),
+        (REDIRECT, GIT),
+        (
+            "git init -q --bare fake; printf '[alias]\\n\\tzz = !touch alias-ran\\n' >> fake/config; echo ../fake > realgit/commondir",
+            SEPARATE,
+        ),
+        ("printf '[alias]\\n\\tzz = !touch alias-ran\\n' >> realgit/config", SEPARATE),
+    ],
+    ids=["config", "commondir-redirect", "separate-dir-commondir", "separate-dir-config"],
+)
+def test_a_planted_git_alias_runs_on_the_next_git_command_outside_the_wall_only(tmp_path, plant, setup):
+    walled, bare = world(tmp_path, "walled", setup), world(tmp_path, "bare", setup)
+    run(walled, plant)
+    run(bare, plant, "--no-sandbox")
+    for root in (walled, bare):
+        fire(root, "git zz")
+    assert (bare / "work" / "alias-ran").exists(), "control: the planted alias must run on a real git command"
+    assert not (walled / "work" / "alias-ran").exists()
+
+
+def test_git_still_commits_inside_the_wall_with_the_placeholders_in_place(tmp_path):
+    """The commondir placeholder ('.') and the empty config.worktree must not break git itself."""
+    root = world(tmp_path, "w", GIT)
+    proc = run(
+        root, f"echo a > a && git add a && git {IDENT} commit -q -m one && git log --oneline | wc -l > n", env=FIRE
+    )
+    assert (root / "work" / "n").read_text().strip() == "1", proc.stderr
+
+
+def test_a_planted_opencode_plugin_loads_on_the_next_unwalled_start_only(tmp_path):
+    plugin = (
+        'import {writeFileSync} from "fs"; export const P = async () => { writeFileSync("plugin-ran", "1"); return {} }'
+    )
+    plant = f"mkdir -p .opencode/plugins && cat > .opencode/plugins/x.js <<'EOF'\n{plugin}\nEOF"
+    outcomes = {}
+    for name, flags in (("walled", ()), ("bare", ("--no-sandbox",))):
+        root = world(tmp_path, name, "")
+        run(root, plant, *flags)
+        out = gr.generate(root, "opencode")
+        (out / "plugins" / "ws-gate.js").unlink()
+        conf = json.loads((out / "opencode.json").read_text())
+        del conf["permission"]
+        (out / "opencode.json").write_text(json.dumps(conf))
+        with OpenAIStub([]) as stub:
+            gr.opencode_run(root, stub, out, root / "work")  # unwalled: the next start, as the person would
+        outcomes[name] = (root / "work" / "plugin-ran").exists()
+    assert outcomes == {"walled": False, "bare": True}, outcomes
+
+
+def test_a_planted_claude_hook_runs_on_the_next_unwalled_start_only(tmp_path, monkeypatch):
+    settings = '{"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "touch hook-ran"}]}]}}'
+    plant = f"mkdir -p .claude && echo '{settings}' > .claude/settings.json"
+    outcomes = {}
+    for name, flags in (("walled", ()), ("bare", ("--no-sandbox",))):
+        root = claude_world(tmp_path, monkeypatch, name, "")
+        run(root, plant, *flags)
+        plain = root / "plain.json"
+        plain.write_text("{}")
+        with AnthropicStub([Call("Bash", {"command": "true"})]) as stub:
+            gr.claude_run(root, stub, plain, False, root / "work", sources="user,project")
+        outcomes[name] = (root / "work" / "hook-ran").exists()
+    assert outcomes == {"walled": False, "bare": True}, outcomes
+
+
+# --- several sessions, a launcher that dies, the signals ----------------------------------------------------------------
+
+
+def start(root: Path, script: str, *flags: str) -> subprocess.Popen:
+    env = gr.base_env(root)
+    return subprocess.Popen(
+        [*sb.WALL, *flags, "--", "bash", "-c", script], cwd=root / "work", env=env, stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )  # fmt: skip
+
+
+def wait_for(path: Path, seconds: float = 15.0) -> bool:
+    return we.wait_for(path, seconds)
+
+
+def test_two_sessions_in_one_project_the_first_out_leaves_the_placeholders_for_the_second(tmp_path):
+    root = world(tmp_path, "w", "")
+    work = root / "work"
+    first = start(root, "touch first-in; sleep 4")
+    assert wait_for(work / "first-in")
+    second = start(root, "touch second-in; sleep 9; mkdir .claude/x 2> mkdir-err; touch second-out")
+    assert wait_for(work / "second-in")
+    first.communicate(timeout=30)  # the first leaves while the second is inside
+    assert (work / ".claude").is_dir(), "the first launcher took the placeholders down under the second session"
+    second.communicate(timeout=60)
+    assert (work / "second-out").exists() and "ead-only" in (work / "mkdir-err").read_text()
+    assert not (work / ".claude").exists() and not (work / ".opencode").exists()  # the last one out tidied up
+
+
+def test_a_hangup_still_tidies_up_and_a_killed_launcher_is_cleaned_by_the_next_one(tmp_path):
+    root = world(tmp_path, "w", "")
+    work = root / "work"
+    hung = start(root, "touch in; sleep 60")
+    assert wait_for(work / "in") and (work / ".claude").is_dir()
+    hung.send_signal(signal.SIGHUP)
+    hung.communicate(timeout=30)
+    assert not (work / ".claude").exists(), "SIGHUP left the placeholders behind"
+    killed = start(root, "touch in2; sleep 60")
+    assert wait_for(work / "in2")
+    killed.kill()
+    killed.communicate(timeout=30)
+    assert (work / ".claude").is_dir()  # nothing could tidy up after a SIGKILL...
+    run(root, "true")
+    assert not (work / ".claude").exists(), "...but the next launch must clean up what the dead one left"
+
+
+# --- the end-of-run report ----------------------------------------------------------------------------------------------
+
+LEFT = (
+    "mkdir -p sub/.claude sub/.opencode/plugins nested && echo ws-plant > sub/.claude/settings.json "
+    "&& echo ws-plant > sub/.opencode/plugins/x.js && echo ws-plant > sub/opencode.json "
+    "&& git init -q nested && echo '#!/bin/sh' > nested/.git/hooks/pre-commit "
+    "&& git -C nested config alias.zz '!true' && mkdir -p .vscode .venv/bin node_modules/.bin "
+    "&& echo ws-plant > .vscode/tasks.json && echo ws-plant > .venv/bin/evil && echo ws-plant > node_modules/.bin/evil "
+    "&& echo ws-plant > mise.toml && echo ws-plant > .pre-commit-config.yaml"
+)
+
+
+def test_the_launcher_reports_what_the_session_left_that_the_next_command_would_run(tmp_path):
+    root = world(tmp_path, "w", "")
+    proc = run(root, LEFT)
+    said = proc.stderr
+    for path in (
+        "sub/.claude",
+        "sub/.opencode",
+        "sub/opencode.json",
+        "nested/.git",
+        ".vscode/tasks.json",
+        ".venv/bin/evil",
+        "node_modules/.bin/evil",
+        "mise.toml",
+        ".pre-commit-config.yaml",
+    ):
+        assert path in said, f"{path} is not in the report:\n{said}"
+    assert "hooks: pre-commit" in said and "alias.zz" in said and "removed nothing" in said
+    assert (root / "work" / "sub" / ".claude" / "settings.json").exists()  # report only, nothing deleted
+    log = [json.loads(line) for line in (root / "wshome" / "logs" / "wall-report.jsonl").read_text().splitlines()]
+    assert len(log) == 1 and {f["path"] for f in log[0]["findings"]} >= {"sub/.claude", "nested/.git", "mise.toml"}
+
+
+def test_a_clean_session_reports_nothing_and_the_second_run_does_not_repeat_the_first(tmp_path):
+    root = world(tmp_path, "w", "")
+    assert "wall report" not in run(root, "echo a > a.txt").stderr
+    assert not (root / "wshome" / "logs" / "wall-report.jsonl").exists()
+    run(root, LEFT)
+    again = run(root, "echo b > b.txt")  # what is there already is not new
+    assert "wall report" not in again.stderr, again.stderr
+
+
+def test_a_changed_hook_in_an_existing_nested_repo_is_reported(tmp_path):
+    root = world(tmp_path, "w", "git init -q nested")
+    proc = run(root, "echo '#!/bin/sh' > nested/.git/hooks/post-commit")
+    assert "changed a git folder: nested/.git" in proc.stderr and "post-commit" in proc.stderr
+
+
+# --- reaching into another process: ptrace and process_vm_* are refused by the seccomp filter ---------------------------
+
+PROBE = r"""
+import ctypes
+import os
+import sys
+
+ppid = os.getppid()
+libc = ctypes.CDLL(None, use_errno=True)
+out = {}
+
+# 1. /proc/PPID/mem
+try:
+    start = next(line.split("-")[0] for line in open(f"/proc/{ppid}/maps") if "r-" in line.split()[1])
+    fd = os.open(f"/proc/{ppid}/mem", os.O_RDONLY)
+    os.pread(fd, 8, int(start, 16))
+    out["procmem"] = "read"
+except OSError as e:
+    out["procmem"] = f"errno {e.errno}"
+
+# 2. PTRACE_ATTACH
+libc.ptrace.restype = ctypes.c_long
+r = libc.ptrace(0x4206, ppid, 0, 0)  # PTRACE_SEIZE: the ATTACH permission check, without stopping the target
+out["ptrace"] = "attached" if r == 0 else f"errno {ctypes.get_errno()}"
+if r == 0:
+    libc.ptrace(17, ppid, 0, 0)  # detach
+
+# 3. process_vm_readv
+
+
+class Iov(ctypes.Structure):
+    _fields_ = [("base", ctypes.c_void_p), ("len", ctypes.c_size_t)]
+
+
+buf = ctypes.create_string_buffer(8)
+local, remote = Iov(ctypes.cast(buf, ctypes.c_void_p).value, 8), Iov(int(start, 16), 8)
+n = libc.process_vm_readv(ppid, ctypes.byref(local), 1, ctypes.byref(remote), 1, 0)
+out["process_vm_readv"] = "read" if n == 8 else f"errno {ctypes.get_errno()}"
+print(out)
+"""
+
+
+def yama_allows() -> bool:
+    try:
+        return Path("/proc/sys/kernel/yama/ptrace_scope").read_text().strip() == "0"
+    except OSError:
+        return True  # no Yama: same-user attach is allowed
+
+
+def probe(tmp_path: Path, name: str, *flags: str) -> dict:
+    root = world(tmp_path, name, "")
+    (root / "work" / "probe.py").write_text(PROBE)
+    proc = run(root, "python3 probe.py > out.txt; true", *flags)
+    return ast.literal_eval((root / "work" / "out.txt").read_text()), proc
+
+
+def test_a_walled_child_cannot_ptrace_or_process_vm_read_the_process_that_started_it(tmp_path):
+    seen, proc = probe(tmp_path, "walled")
+    assert seen["ptrace"] == "errno 1" and seen["process_vm_readv"] == "errno 1", (seen, proc.stderr)
+    if not yama_allows():
+        pytest.skip("ptrace_scope is above 0 on this host: the bare control cannot attach either")
+    bare, _ = probe(tmp_path, "bare", "--no-sandbox")
+    assert bare["ptrace"] == "attached" and bare["process_vm_readv"] == "read", f"control: {bare}"
+    assert bare["procmem"] == "read"
+
+
+def test_proc_pid_mem_of_the_parent_is_still_reachable_a_known_limit(tmp_path):
+    """Reading (and writing) /proc/PID/mem of a process of the same user is the same reach as ptrace, by file: it is
+    governed by Yama and the dumpable flag, not by a system call, so the seccomp filter cannot refuse it, and bubblewrap
+    drops the capability that would let a non-dumpable target be read, but the runner is dumpable. Pinned here so that a
+    change which closes it (a runner started non-dumpable, say) is noticed and ws.policy's limits are updated."""
+    seen, _ = probe(tmp_path, "walled")
+    assert seen["procmem"] == "read"

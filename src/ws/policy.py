@@ -29,12 +29,20 @@ claude-code adapter writes), which acts on what a process does, not on what its 
     loads at start): the config, hook and plugin paths a runner or git reads, and the folders a runner keeps programs
     in, are not writable by a walled run in the places an unwalled one reads them (the project's own source, a
     Makefile or a package script are the person's to review: the project folder is writable on purpose). OpenCode's XDG
-    data, state and cache folders are private to the wall (`$WS_HOME/wall/opencode/`), so a program planted in `~/.cache/opencode` or a
-    plugin's `node_modules/.bin` cannot run outside it. The project's `.git/hooks`, `.git/config`, `.claude`,
-    `.opencode`, `.mcp.json`, `opencode.json(c)` and `tui.json(c)` are read-only whether or not they exist yet (a
-    missing one is made empty for the run and removed after), so are the `core.hooksPath` folder when it is in the
-    project, config files `[include]`d from it and the submodule repositories' hooks and config, and `mv .git .git2`
-    or `mv .claude x` is refused.
+    data and cache folders are private to the wall and to the project (`$WS_HOME/wall/opencode/{data,cache}/NAME-HASH`;
+    state is shared, being preferences and prompt history), so a program planted in `~/.cache/opencode` or a plugin's
+    `node_modules/.bin` cannot run outside the wall, or in another project's walled session. In the project, `.claude`,
+    `.opencode`, `.mcp.json`, `opencode.json(c)`, `tui.json(c)`, and in every git folder the project holds (found with
+    `git rev-parse`, so a `--separate-git-dir` or a worktree is included) the hooks, config, `config.worktree`,
+    `commondir` and the worktree pointer files, the submodule repositories, the `core.hooksPath` folder when it is in the
+    project and `[include]`d config files are read-only whether or not they exist yet (a missing one is made for the run
+    and removed after, by the last session out of the project). `mv .git .git2` and `mv .claude x` are refused. Claude
+    Code has the same list in its own sandbox `denyWrite` (absolute paths of the project the settings are made in, which
+    stops an interpreter) and in its Edit deny rules (`**/NAME`, any project and any depth, which stop the Edit and Write
+    tools and a shell redirect it can read). The seccomp filter refuses ptrace, process_vm_readv and process_vm_writev.
+    After every walled run the launcher compares the project with how it was and reports, never deleting, a new or
+    changed git folder, runner or tool config, or auto-loaded program at any depth (stderr, and
+    `$WS_HOME/logs/wall-report.jsonl`): that covers what the lists cannot name.
   * still open: a `deny_commands` rule is not enforced inside an interpreter (`python3 -c 'os.system("git push -f")'`
     pushes; only the sandbox's file rules apply to it). Reading is denied only for deny_read paths that exist when the
     runner starts and have no wildcard below their first folder. OpenCode's `patch` tool is not a shell command, so it
@@ -47,12 +55,17 @@ claude-code adapter writes), which acts on what a process does, not on what its 
     `ws gate launch` refuses a protected path, or a project config path (`.claude`, `.opencode`, `opencode.json`, ...),
     behind a symbolic link the session could replace, and a start from the home folder or above; the macOS
     sandbox-exec profile (including its Unix-socket rule and the `literal` rules that stop a rename of `.git`) is not
-    run in CI and is unit-tested as text only. Three gaps in the project lock, left on purpose or not yet closed: a
-    repository the session creates itself (`git init` must keep working inside the wall, so its hooks and config are
-    writable; the launcher prints a note when one appeared), a submodule added during the session, and config in a
-    sub-folder of the project (`sub/.claude/settings.json` is read only when a runner is started in `sub`); only the
-    project folder's own config is locked. CLAUDE.md, AGENTS.md and `.gitmodules` are content and stay writable. A
-    sign-in the walled OpenCode refreshes is not carried back to the real data folder (it is copied in at each start).
+    run in CI and is unit-tested as text only: the macOS wall is UNTESTED on a real Mac, treat it as unproven. Gaps in
+    the project lock, left on purpose or not closable by a path: a repository the session creates itself (`git init`
+    must keep working inside the wall, so its hooks and config are writable), a submodule added during the session, and
+    config in a sub-folder of the project (`sub/.claude/settings.json` is read only when a runner is started in `sub`;
+    the Claude Code Edit rules reach it, the OpenCode wall does not): the end-of-run report names all three, but only
+    after the fact. /proc/PID/mem of the runner is readable from a walled child of the same user (no system call to
+    filter; pinned by a test), so a session can still read or patch the memory of the runner that started it. The Claude
+    Code kernel layer needs the settings made from the project folder; elsewhere only its Edit rules hold. CLAUDE.md,
+    AGENTS.md and `.gitmodules` are content and stay writable. A sign-in the walled OpenCode refreshes is not carried back
+    to the real data folder (it is copied in at each start). A killed launcher leaves empty placeholders until the next
+    launch in that project.
     A `deny_read` rule with a wildcard in the middle is matcher-only; Claude
     Code's own sandbox covers its Bash tool, not its Read/Edit tools (permission rules and the hook cover those); an
     interactive Claude session can still be started in a folder whose project settings open the sandbox, and the hook

@@ -93,11 +93,11 @@ def run_bpf(program: bytes, arch: int, nr: int, args: tuple = (0, 0, 0, 0, 0, 0)
 
 
 @pytest.mark.parametrize(
-    "machine, arch, nr_socket, nr_socketpair, nr_ioctl",
-    [("x86_64", X86, 41, 53, 16), ("aarch64", ARM, 198, 199, 29)],
+    "machine, arch, nr_socket, nr_socketpair, nr_ioctl, peeks",
+    [("x86_64", X86, 41, 53, 16, (101, 310, 311)), ("aarch64", ARM, 198, 199, 29, (117, 270, 271))],
 )
-def test_the_filter_refuses_unix_sockets_io_uring_and_terminal_injection(
-    machine, arch, nr_socket, nr_socketpair, nr_ioctl
+def test_the_filter_refuses_unix_sockets_io_uring_terminal_injection_and_reaching_into_processes(
+    machine, arch, nr_socket, nr_socketpair, nr_ioctl, peeks
 ):
     prog = sandbox.seccomp_program(machine)
     assert len(prog) % 8 == 0
@@ -111,7 +111,10 @@ def test_the_filter_refuses_unix_sockets_io_uring_and_terminal_injection(
     assert f(nr_ioctl, 0, 0x5412) == EPERM  # TIOCSTI
     assert f(nr_ioctl, 0, 0x541C) == EPERM  # TIOCLINUX
     assert f(nr_ioctl, 0, 0x5401) == ALLOW  # TCGETS
+    for nr in peeks:  # ptrace, process_vm_readv, process_vm_writev
+        assert f(nr) == EPERM
     assert f(0) == ALLOW  # an ordinary call
+    assert f(max(peeks) + 1) == ALLOW and f(min(peeks) - 1) == ALLOW  # the neighbours are not caught
     assert run_bpf(prog, arch ^ 1, nr_socket, (2,) * 6) == EPERM  # another architecture
     assert f(0x40000000 | nr_socket, 2) == EPERM  # x32 numbers
 
@@ -229,16 +232,20 @@ def test_the_allow_list_is_project_tmp_and_the_policy_extras_not_the_runners_rea
 
 def test_a_runner_with_state_gets_private_xdg_folders_under_ws_home(tmp_path, home, wshome):
     env = {"HOME": str(home), "XDG_DATA_HOME": str(tmp_path / "data")}
-    got = sandbox.private_homes(wshome, "opencode", POLICY, env)
+    got = sandbox.private_homes(wshome, "opencode", POLICY, env, str(tmp_path / "proj"))
     base = wshome.resolve() / "wall" / "opencode"
+    key = sandbox.project_key(str(tmp_path / "proj"))
+    assert key.startswith("proj-") and sandbox.project_key(str(tmp_path / "other")) != key
     assert got == {
-        "XDG_DATA_HOME": f"{base}/data",
-        "XDG_STATE_HOME": f"{base}/state",
-        "XDG_CACHE_HOME": f"{base}/cache",
+        "XDG_DATA_HOME": f"{base}/data/{key}",  # per project: programs live here
+        "XDG_STATE_HOME": f"{base}/state",  # shared: preferences and prompt history, nothing a runner executes
+        "XDG_CACHE_HOME": f"{base}/cache/{key}",  # per project
     }
     assert all(os.path.isdir(p) for p in got.values()) and (wshome / "wall" / ".gitignore").read_text() == "*\n"
     assert (wshome / "wall").stat().st_mode & 0o077 == 0
-    assert sandbox.private_homes(wshome, "claude-code", POLICY, env) == {}  # no wall_writable: nothing of its own
+    assert (
+        sandbox.private_homes(wshome, "claude-code", POLICY, env, str(tmp_path / "proj")) == {}
+    )  # no wall_writable: nothing of its own
 
 
 def test_the_sign_in_is_copied_in_each_start_removed_when_gone_and_not_when_hidden(tmp_path, home, wshome):
@@ -246,18 +253,22 @@ def test_the_sign_in_is_copied_in_each_start_removed_when_gone_and_not_when_hidd
     real.mkdir(parents=True)
     (real / "auth.json").write_text("one")
     env = {"HOME": str(home)}
-    seeded = Path(sandbox.private_homes(wshome, "opencode", POLICY, env)["XDG_DATA_HOME"]) / "opencode" / "auth.json"
+    seeded = (
+        Path(sandbox.private_homes(wshome, "opencode", POLICY, env, str(tmp_path / "proj"))["XDG_DATA_HOME"])
+        / "opencode"
+        / "auth.json"
+    )
     assert seeded.read_text() == "one" and seeded.stat().st_mode & 0o777 == 0o600
     (real / "auth.json").write_text("two")
-    sandbox.private_homes(wshome, "opencode", POLICY, env)
+    sandbox.private_homes(wshome, "opencode", POLICY, env, str(tmp_path / "proj"))
     assert seeded.read_text() == "two"
     hide = policy.loads('[gate]\ndeny_read = ["~/.local/share/opencode/**"]\n')
-    sandbox.private_homes(wshome, "opencode", hide, env)
+    sandbox.private_homes(wshome, "opencode", hide, env, str(tmp_path / "proj"))
     assert not seeded.exists()  # deny_read wins over the convenience
-    sandbox.private_homes(wshome, "opencode", POLICY, env)
+    sandbox.private_homes(wshome, "opencode", POLICY, env, str(tmp_path / "proj"))
     assert seeded.exists()
     (real / "auth.json").unlink()
-    sandbox.private_homes(wshome, "opencode", POLICY, env)
+    sandbox.private_homes(wshome, "opencode", POLICY, env, str(tmp_path / "proj"))
     assert not seeded.exists()
 
 
@@ -265,7 +276,7 @@ def test_the_private_folders_are_bound_after_ws_home_and_allowed_on_macos(tmp_pa
     (wshome / "policy.toml").write_text("")
     proj = tmp_path / "proj"
     proj.mkdir()
-    priv = sandbox.private_homes(wshome, "opencode", POLICY, {"HOME": str(home)})
+    priv = sandbox.private_homes(wshome, "opencode", POLICY, {"HOME": str(home)}, str(tmp_path / "proj"))
     text = " ".join(wrapped(home, wshome, writable=[str(proj)], homes=list(priv.values())).argv)
     ro, cache = f"--ro-bind {wshome.resolve()} {wshome.resolve()}", priv["XDG_CACHE_HOME"]
     assert text.index(ro) < text.index(f"--bind {cache} {cache}")
@@ -359,14 +370,16 @@ def test_git_facts_finds_the_hooks_folder_and_the_config_files_inside_the_projec
     set_config(proj, "core.hooksPath", ".githooks")
     set_config(proj, "include.path", "../local.gitconfig")
     set_config(proj, "includeIf.gitdir:/x/.path", "../later.cfg")
-    hooks, files = sandbox.git_facts(str(proj))
+    facts = sandbox.git_facts(str(proj))
+    hooks, files = facts.hooks, facts.files
+    assert facts.dirs == [f"{proj.resolve()}/.git"]
     real = proj.resolve()
     assert hooks == f"{real}/.githooks"
     assert f"{real}/local.gitconfig" in files and f"{real}/.git/config" in files
     assert f"{real}/later.cfg" in files  # named though it is not there and its condition is false
     set_config(proj, "core.hooksPath", str(tmp_path / "outside"))
-    assert sandbox.git_facts(str(proj))[0] is None  # a hooks folder outside the project is read-only already
-    assert sandbox.git_facts(str(tmp_path)) == (None, [])  # not a repository
+    assert sandbox.git_facts(str(proj)).hooks is None  # a hooks folder outside the project is read-only already
+    assert sandbox.git_facts(str(tmp_path)) == sandbox.GitFacts(None, [], [])  # not a repository
 
 
 def test_the_hooks_folder_and_includes_are_made_if_missing_and_removed_after(tmp_path):
@@ -509,9 +522,10 @@ def test_launch_gives_the_runner_private_xdg_folders_and_locks_the_project(env, 
     assert cli.main(["gate", "launch", "--runner", "opencode", "--", "opencode"]) == 0
     _, e, _ = env[0]
     base = wshome.resolve() / "wall" / "opencode"
-    assert e["XDG_DATA_HOME"] == f"{base}/data" and e["XDG_STATE_HOME"] == f"{base}/state"
-    assert e["XDG_CACHE_HOME"] == f"{base}/cache"
-    assert set(seen["homes"]) == {f"{base}/data", f"{base}/state", f"{base}/cache"}
+    key = sandbox.project_key(str(proj.resolve()))
+    assert e["XDG_DATA_HOME"] == f"{base}/data/{key}" and e["XDG_STATE_HOME"] == f"{base}/state"
+    assert e["XDG_CACHE_HOME"] == f"{base}/cache/{key}"
+    assert set(seen["homes"]) == {f"{base}/data/{key}", f"{base}/state", f"{base}/cache/{key}"}
     assert str(proj.resolve() / ".claude") in seen["locked"]  # the placeholder was there for the wall to hold
     assert not (proj / ".claude").exists()  # and is gone once the run has ended
 
@@ -796,3 +810,139 @@ def test_allow_write_may_not_be_the_home_folder_or_above_whatever_it_is_spelled_
         sandbox.writable_folders(
             policy.loads(f'[gate]\nallow_write = ["{tmp_path}"]\n'), "opencode", str(proj), str(tmp), [], env
         )
+
+
+# --- the git folders, several sessions, the end-of-run report, the Claude Code lock ---------------------------------------
+
+
+def run_git(root: Path, *args: str) -> None:
+    subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True)
+
+
+def test_every_git_folder_in_the_project_is_locked_with_its_pointers(tmp_path):
+    ident = ["-c", "user.name=t", "-c", f"user.email=t{chr(64)}t.invalid"]
+    proj = tmp_path / "p"
+    subprocess.run(
+        ["git", "init", "-q", "--separate-git-dir", str(proj / "realgit"), str(proj)], check=True, capture_output=True
+    )
+    run_git(proj, *ident, "commit", "-q", "--allow-empty", "-m", "i")
+    run_git(proj, "worktree", "add", "-q", "wt")
+    real = proj.resolve()
+    assert sandbox.git_facts(str(proj)).dirs == [f"{real}/realgit"]
+    wanted = dict(sandbox.lock_wanted(str(proj)))
+    assert wanted[f"{real}/.git"] is None  # the pointer file itself
+    for name in ("hooks", "config", "config.worktree", "commondir"):
+        assert f"{real}/realgit/{name}" in wanted
+    assert wanted[f"{real}/realgit/commondir"] == ".\n"  # an empty file would make git die
+    for name in ("commondir", "gitdir", "config.worktree"):
+        assert f"{real}/realgit/worktrees/wt/{name}" in wanted
+
+
+def test_the_claude_code_settings_carry_the_same_project_lock(tmp_path, monkeypatch):
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    monkeypatch.chdir(proj)
+    out = tmp_path / "gate"
+    files = claude_code.generate(policy.loads(""), ["ws"], out, tmp_path / "policy.toml")
+    conf = json.loads(files[claude_code.FILE])
+    deny, edit = conf["sandbox"]["filesystem"]["denyWrite"], conf["permissions"]["deny"]
+    for rel in sandbox.claude_denied():  # the Edit rules are project-independent and reach sub-folders
+        assert f"Edit(**/{rel})" in edit and f"Edit(**/{rel}/**)" in edit
+        assert f"{proj.resolve()}/{rel}" in deny  # the kernel layer names the project the settings are made in
+    wanted = {".claude", ".opencode", ".mcp.json", "opencode.json", ".git/hooks", ".git/config", ".git/commondir"}
+    assert wanted <= set(sandbox.claude_denied())
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir()
+    monkeypatch.chdir(tmp_path / "home")  # the home folder is never a project: no project paths, the Edit rules hold
+    bare = json.loads(claude_code.generate(policy.loads(""), ["ws"], out, tmp_path / "policy.toml")[claude_code.FILE])
+    assert not any(p.endswith("/.claude") for p in bare["sandbox"]["filesystem"]["denyWrite"])
+    assert "Edit(**/.claude/**)" in bare["permissions"]["deny"]
+
+
+def test_only_the_last_launcher_out_takes_the_placeholders_down_and_a_dead_one_is_cleaned_after(tmp_path, wshome):
+    proj = tmp_path / "p"
+    proj.mkdir()
+    mine = os.getpid()
+    sandbox.enter_project(wshome, str(proj))
+    assert (proj / ".claude").is_dir()
+    other = subprocess.Popen(["sleep", "30"])
+    record = next((wshome / "wall" / "projects").glob("*.json"))
+    try:
+        state = json.loads(record.read_text())
+        state["pids"].append(other.pid)  # a second launcher, alive
+        record.write_text(json.dumps(state))
+        sandbox.leave_project(wshome, str(proj))
+        assert (proj / ".claude").is_dir(), "the placeholders must stay for the launcher still inside"
+        assert json.loads(record.read_text())["pids"] == [other.pid]
+    finally:
+        other.kill()
+        other.wait()
+    # the second died without leaving: the next launch cleans up before it makes its own
+    sandbox.enter_project(wshome, str(proj))
+    assert json.loads(record.read_text())["pids"] == [mine]
+    sandbox.leave_project(wshome, str(proj))
+    assert not (proj / ".claude").exists() and not record.exists()
+
+
+def test_scan_and_compare_find_new_and_changed_things_and_skip_the_placeholders(tmp_path):
+    proj = tmp_path / "p"
+    (proj / "nested" / ".git" / "hooks").mkdir(parents=True)
+    (proj / "nested" / ".git" / "config").write_text("[core]\n\tbare = false\n")
+    (proj / "mise.toml").write_text("a")
+    before, note = sandbox.scan_project(str(proj))
+    assert note is None
+    (proj / "nested" / ".git" / "hooks" / "pre-commit").write_text("#!/bin/sh\n")
+    (proj / "nested" / ".git" / "hooks" / "pre-commit.sample").write_text("x")  # a sample is not a hook
+    (proj / "nested" / ".git" / "config").write_text("[core]\n\tbare = false\n\tfsmonitor = x\n[Alias]\n\tzz = y\n")
+    (proj / "mise.toml").write_text("b")
+    (proj / "sub" / ".claude").mkdir(parents=True)
+    (proj / "sub" / ".claude" / "settings.json").write_text("{}")
+    (proj / ".vscode").mkdir()
+    (proj / ".vscode" / "tasks.json").write_text("{}")
+    (proj / ".vscode" / "launch.json").write_text("{}")  # not one of the two files
+    (proj / ".venv" / "lib" / "python3.12" / "site-packages").mkdir(parents=True)
+    (proj / ".venv" / "lib" / "python3.12" / "site-packages" / "x.pth").write_text("import os")
+    (proj / "node_modules" / ".bin").mkdir(parents=True)
+    (proj / "node_modules" / ".bin" / "tool").write_text("x")
+    (proj / "node_modules" / "pkg" / "node_modules" / ".bin").mkdir(parents=True)  # deeper ones: not walked into
+    (proj / ".opencode").mkdir()  # a placeholder of another session
+    after, _ = sandbox.scan_project(str(proj), (str(proj / ".opencode"),))
+    found = {(f["path"], f["change"]): f for f in sandbox.compare_scans(before, after)}
+    assert set(found) == {
+        ("nested/.git", "changed"),
+        ("mise.toml", "changed"),
+        ("sub/.claude", "new"),
+        (".vscode/tasks.json", "new"),
+        (".venv/lib/python3.12/site-packages/x.pth", "new"),
+        ("node_modules/.bin/tool", "new"),
+    }
+    git = found[("nested/.git", "changed")]["detail"]
+    assert list(git["hooks"]) == ["pre-commit"] and git["extra_config"] == ["alias.zz", "core.fsmonitor"]
+    assert "hooks: pre-commit" in sandbox.describe(found[("nested/.git", "changed")])
+    assert sandbox.compare_scans(after, after) == []
+
+
+def test_the_scan_is_bounded_and_says_where_it_stopped(tmp_path, monkeypatch):
+    proj = tmp_path / "p"
+    for i in range(30):
+        (proj / f"d{i}").mkdir(parents=True)
+    monkeypatch.setattr(sandbox, "SCAN_ENTRIES", 10)
+    _, note = sandbox.scan_project(str(proj))
+    assert note and "stopped" in note
+    monkeypatch.setattr(sandbox, "SCAN_ENTRIES", 10**6)
+    ticks = iter(range(0, 1000, 5))
+    _, note = sandbox.scan_project(str(proj), clock=lambda: next(ticks))
+    assert note and "stopped" in note
+    # a first scan that stopped cannot call anything new: only changes are reported
+    assert sandbox.compare_scans({}, {"config:x": "1"}, complete=False) == []
+    assert sandbox.compare_scans({"config:x": "0"}, {"config:x": "1"}, complete=False)[0]["change"] == "changed"
+
+
+def test_a_launcher_with_nothing_to_say_prints_and_writes_nothing(tmp_path, wshome, capsys):
+    assert sandbox.report_run(wshome, "/p", "opencode", {"a:x": "1"}, {"a:x": "1"}, []) == []
+    assert capsys.readouterr().err == "" and not (wshome / "logs").exists()
+    got = sandbox.report_run(wshome, "/p", "opencode", {}, {"config:.claude": "h"}, ["a note"])
+    err = capsys.readouterr().err
+    assert got and ".claude" in err and "note: a note" in err and "removed nothing" in err
+    line = json.loads((wshome / "logs" / "wall-report.jsonl").read_text())
+    assert line["project"] == "/p" and line["findings"][0]["path"] == ".claude" and line["notes"] == ["a note"]

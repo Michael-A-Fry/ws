@@ -34,18 +34,32 @@ Decisions, and why:
     real folders stay visible and read-only. The runner's sign-in files are copied across at each start, unless a
     deny_read rule hides them. `ws uninstall` takes the folder with `$WS_HOME`.
   * The project's own config is the second half of that class: the folders and files a runner or git LOADS at start
-    (`PROJECT_LOCKED`, `git_facts`, `submodule_repos`; the table of what and why is tests/e2e/test_wall_loadpaths.py).
-    They are read-only whether or not they exist. A path that exists is bound read-only onto itself; one that does not
-    is made by the launcher first (an empty folder, or an empty valid config file) and removed after the run, because
-    bubblewrap can only bind what is there; a launcher that is killed leaves them behind, empty. Every folder between
-    the project and a locked path is bound onto itself too (`Plan.ancestors`): a locked path is a mount point, but
-    `mv .git .git2` moves the folder above it, and rename(2) refuses a mount point. Git's own routes are read from
-    `git config --list --show-origin`: the `core.hooksPath` folder when it is in the project (a husky or `.githooks`
-    folder), config files pulled in with `[include]`, and the submodule repositories' hooks and config. A locked path
-    that is a symbolic link is refused, since a link in a writable folder can be deleted and replaced. Not closed: a
-    repository the session itself creates (`git init` has to keep working; the launcher says so when it ends), a
-    submodule added during the session, and config in a sub-folder of the project (read only when the runner is started
-    there).
+    (`PROJECT_LOCKED`, `GIT_LOCKED`, `git_facts`, `submodule_repos`; the table of what and why is
+    tests/e2e/test_wall_loadpaths.py). They are read-only whether or not they exist. A path that exists is bound
+    read-only onto itself; one that does not is made by the launcher first (an empty folder, or an empty valid config
+    file) and removed after the run, because bubblewrap can only bind what is there. Every folder between the project and
+    a locked path is bound onto itself too (`Plan.ancestors`): a locked path is a mount point, but `mv .git .git2` moves
+    the folder above it, and rename(2) refuses a mount point. What git reads is asked of git: `rev-parse
+    --absolute-git-dir --git-common-dir` names the git folders in the project (a `--separate-git-dir` or a worktree can
+    put them anywhere in it), and in each the hooks, config, `config.worktree`, `commondir` (it decides which folder git
+    reads the others from; its placeholder is "." because an empty file makes git die), the pointer files of every
+    `worktrees/NAME`, and the submodule repositories are locked; `git config --list --show-origin` gives the
+    `core.hooksPath` folder and the `[include]`d files. A locked path that is a symbolic link is refused, since a link in
+    a writable folder can be deleted and replaced.
+  * Several sessions in one project share the placeholders. A record under `$WS_HOME/wall/projects/` (a file lock, the
+    pids inside, the placeholders made) lets only the last launcher out take them down: the first one removing a
+    folder that the second's wall has bound would detach the bind in the second's mount namespace. A launcher that is
+    killed leaves its record; the next launch for that project finds every pid dead and cleans up first. SIGHUP and
+    SIGTERM (and SIGINT when there is no terminal) stop the runner and leave through the same path.
+  * The end-of-run report, because a list of paths is always one path short. After the runner exits, outside the wall,
+    the launcher compares a bounded scan of the project taken before it started with one taken after (8 seconds and
+    300000 entries, then it says where it stopped): a new or changed `.git` at any depth (non-sample hooks, config keys
+    beyond a stock `git init`, submodules), any runner or tool config at any depth (`.claude`, `.opencode`, `.mcp.json`,
+    `opencode.json(c)`, `tui.json(c)`, `.vscode/settings.json|tasks.json`, `mise.toml`, `.pre-commit-config.yaml`,
+    `.envrc`), and the auto-loaded files of `.venv` and `node_modules/.bin`. It prints to stderr and appends a line to
+    `$WS_HOME/logs/wall-report.jsonl`, and removes nothing. This is what covers a runner started later in a sub-folder
+    (`sub/.claude`), a repository the session creates with `git init` (which has to keep working), and a submodule added
+    during the session.
   * A protected path reached through a symbolic link the session could replace is refused, with the real path in the
     message. A read-only bind holds the real path; delete a link in a writable folder and plant a folder under its name,
     and the hook's fixed --policy path reads the plant. (Links in folders the user cannot write are fine.)
@@ -73,6 +87,10 @@ Decisions, and why:
   * `--unshare-pid --unshare-ipc --proc /proc`, `--die-with-parent`. Without its own pid namespace the runner sees the
     person's processes, and `/proc/PID/root/...` of one is a path to every file as that process sees it, around every
     bind here. A process left behind dies with the launcher.
+  * Other processes' memory. The filter also refuses ptrace, process_vm_readv and process_vm_writev: with Yama's
+    ptrace_scope at 0 a shell child of the runner could attach to it and patch the in-process gate plugin. Not closed:
+    /proc/PID/mem of the runner (same user, dumpable), which a system-call filter cannot see. The macOS profile has no
+    rule for this: the Seatbelt syntax could not be checked on a Mac, and a wrong rule would stop the profile loading.
   * The terminal. The filter refuses the TIOCSTI and TIOCLINUX ioctls (typing into the person's shell; kernel 6.1 has no
     sysctl for it). `--new-session` (no controlling terminal) as well when stdin is not a terminal; an interactive runner
     keeps its terminal for Ctrl-C and window size.
@@ -93,26 +111,35 @@ Decisions, and why:
     `(deny network-outbound (remote unix-socket))`. Seatbelt matches paths, not mount points, so a renamed ancestor of a
     protected path does not help an attacker there; a renamed ancestor of a locked project path does (`mv .git .git2`,
     plant in `.git2/hooks`, `mv .git2 .git`), so those folders get a `literal` deny of their own. sandbox-exec is deprecated by Apple but still ships and is what Claude Code and Codex
-    use. The profile text is unit tested; no CI job runs it, so the unix-socket rule in particular is unverified.
+    use. The profile text is unit tested; no CI job runs it and it has not been run on a Mac: the macOS wall is UNTESTED,
+    the unix-socket and `literal` rules in particular.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
+import glob
+import hashlib
+import json
 import os
 import platform
 import posixpath
+import re
 import shlex
 import shutil
 import signal
 import socket
+import stat
 import struct
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 from ws import adapters, approvals, policy
 from ws.approvals import ENV_MARKER, FD_ENV, approvals_dir
@@ -167,6 +194,8 @@ def socket_dirs(env: dict | None = None) -> list[str]:
 _AUDIT_ARCH = {"x86_64": 0xC000003E, "aarch64": 0xC00000B7}
 # (socket, ioctl, io_uring_setup) system call numbers
 _NR = {"x86_64": (41, 16, 425), "aarch64": (198, 29, 425)}
+# (ptrace, process_vm_readv, process_vm_writev): reading or patching another process's memory
+_PEEK = {"x86_64": (101, 310, 311), "aarch64": (117, 270, 271)}
 _AF_UNIX = 1
 _TIOCSTI, _TIOCLINUX = 0x5412, 0x541C
 _LD, _JEQ, _JGE, _RET = 0x20, 0x15, 0x35, 0x06  # BPF_LD|W|ABS, BPF_JMP|JEQ|K, BPF_JMP|JGE|K, BPF_RET|K
@@ -177,12 +206,18 @@ def seccomp_program(machine: str | None = None) -> bytes:
     """A classic-BPF seccomp program (`struct sock_filter[]`, what `bwrap --seccomp FD` reads) that fails with EPERM:
       * any call from another architecture, and x32 calls (number >= 0x40000000): their numbers are not the ones below;
       * socket(AF_UNIX, ...), and io_uring_setup (io_uring can open a socket without the call);
+      * ptrace, process_vm_readv and process_vm_writev: with Yama's ptrace_scope at 0 a shell child could attach to the
+        runner that started it and patch the in-process gate plugin, or read a sibling's secrets and nonces. NOT closed:
+        opening `/proc/PID/mem` of such a process is the same reach by file, which no system-call filter can refuse (the
+        path is not visible to it); the runner is dumpable and the wall's user namespace has no capability to change
+        that. tests/e2e/test_wall_loadpaths.py pins it as a known limit.
       * ioctl TIOCSTI and TIOCLINUX (typing into, or reading, the person's terminal).
     Everything else is allowed. Raises SandboxError on a CPU it has no numbers for."""
     machine = machine or platform.machine()
     if machine not in _AUDIT_ARCH:
         raise SandboxError(f"no seccomp filter for {machine or 'this CPU'}; ws builds one for x86_64 and aarch64")
     nr_socket, nr_ioctl, nr_uring = _NR[machine]
+    peeks = _PEEK[machine]
     # (label, code, jump if true, jump if false, k); a jump is a label or 0 (fall through)
     prog = [
         (None, _LD, 0, 0, 4),  # seccomp_data.arch
@@ -191,6 +226,7 @@ def seccomp_program(machine: str | None = None) -> bytes:
         (None, _JGE, "deny", 0, 0x40000000),
         (None, _JEQ, "sock", 0, nr_socket),
         (None, _JEQ, "deny", 0, nr_uring),
+        *((None, _JEQ, "deny", 0, nr) for nr in peeks),
         (None, _JEQ, "ioc", "allow", nr_ioctl),
         ("sock", _LD, 0, 0, 16),  # args[0], the low word: the domain
         (None, _JEQ, "deny", "allow", _AF_UNIX),
@@ -421,9 +457,6 @@ def _bwrap_starts() -> bool:
 # stay writable.
 DIR = "dir"
 PROJECT_LOCKED = (
-    (".git/hooks", DIR),
-    (".git/config", None),
-    (".git/config.worktree", ""),
     (".claude", DIR),
     (".opencode", DIR),
     (".mcp.json", '{"mcpServers": {}}\n'),
@@ -432,10 +465,35 @@ PROJECT_LOCKED = (
     ("tui.json", "{}\n"),
     ("tui.jsonc", "{}\n"),
 )
-NEW_REPO_NOTE = (
-    "ws: this session created a git repository here. Its hooks and config were writable inside the wall: read "
-    ".git/hooks and .git/config before you run git in this folder outside it."
-)
+# In every git folder the project holds (`.git`, and a separate or common one inside the project). Hooks and config are
+# code to git; `commondir` and the pointer files in `worktrees/NAME` decide WHICH folder git reads them from, so a
+# planted `commondir` that names a git folder made in the project is as good as writing the hooks themselves. The
+# placeholder for `commondir` is "." ("this folder"): an empty file makes git die.
+GIT_LOCKED = (("hooks", DIR), ("config", None), ("config.worktree", ""), ("commondir", ".\n"))
+GIT_WORKTREE_FILES = (("commondir", None), ("gitdir", None), ("config.worktree", ""))  # in worktrees/NAME
+GIT_OTHER_DIRS = ("worktrees", "modules")  # held whole by the Claude Code settings, which cannot name a glob
+
+
+def claude_denied_paths(cwd: str) -> list[str]:
+    """Absolute paths for the claude-code adapter's `denyWrite`, for the project at `cwd`: the names above, and what the
+    OpenCode wall resolves (`lock_wanted`: a separate git folder, worktree pointers, submodules, an included config). []
+    where `cwd` is the home folder or above it, or git is slow: Claude Code's settings then carry the Edit rules only."""
+    project = os.path.realpath(cwd)
+    if _home_or_above(project, os.environ):
+        return []
+    named = [os.path.join(project, rel) for rel in claude_denied()]
+    return list(dict.fromkeys([*named, *(path for path, _ in lock_wanted(project))]))
+
+
+def claude_denied() -> list[str]:
+    """The project paths, relative to the project root, that the claude-code adapter puts in its sandbox denyWrite and
+    its Edit deny rules: the same set as above, with what a name cannot say (a separate git folder, the files under
+    `worktrees/*`) held by the folder."""
+    return [
+        *(rel for rel, _ in PROJECT_LOCKED),
+        *(f".git/{n}" for n, _ in GIT_LOCKED),
+        *(f".git/{n}" for n in GIT_OTHER_DIRS),
+    ]
 
 
 def launch_env(env: dict, tmp: str | None = None, homes: dict | None = None) -> dict:
@@ -495,15 +553,68 @@ def writable_folders(pol: policy.Policy, runner: str, project: str, tmp: str, ex
 
 # --- the runner's own state --------------------------------------------------------------------------------------
 
-# XDG variable -> the folder under `$WS_HOME/wall/<runner>/` that stands in for it.
-XDG_HOMES = (("XDG_DATA_HOME", "data"), ("XDG_STATE_HOME", "state"), ("XDG_CACHE_HOME", "cache"))
+# XDG variable -> (folder under `$WS_HOME/wall/<runner>/`, whether it is kept per project).
+XDG_HOMES = (("XDG_DATA_HOME", "data", True), ("XDG_STATE_HOME", "state", False), ("XDG_CACHE_HOME", "cache", True))
 # The files in the runner's real data folder that a walled run needs to be signed in, copied in at each start.
 SEED = {"opencode": ("auth.json", "mcp-auth.json")}
+_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 
 
-def private_homes(home: Path, runner: str, pol: policy.Policy, env: dict) -> dict[str, str]:
-    """XDG data, state and cache folders for a walled run of `runner`, as {variable: folder}; {} for a runner that keeps
-    no state of its own (one without `wall_writable` in its adapter, which is the marker).
+def project_key(project: str) -> str:
+    """A folder name for a project: its name, made safe, and a hash of its real path."""
+    name = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(project))[:40] or "project"
+    return f"{name}-{hashlib.sha256(project.encode()).hexdigest()[:10]}"
+
+
+def _subdir(parent_fd: int, name: str) -> int:
+    """A descriptor for `name` below `parent_fd`, made (0700) if missing, never through a symbolic link: the walled
+    session can write inside the private folders, so a link it plants must not be followed by the launcher (it is
+    removed and the folder made again)."""
+    try:
+        return os.open(name, _DIR_FLAGS, dir_fd=parent_fd)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        if not stat.S_ISLNK(os.lstat(name, dir_fd=parent_fd).st_mode):
+            raise
+        os.unlink(name, dir_fd=parent_fd)  # a planted link is removed itself, not followed
+    os.mkdir(name, 0o700, dir_fd=parent_fd)
+    return os.open(name, _DIR_FLAGS, dir_fd=parent_fd)
+
+
+def _unlink(dir_fd: int, name: str) -> None:
+    try:
+        os.unlink(name, dir_fd=dir_fd)  # a link is removed itself, not followed
+    except FileNotFoundError:
+        pass
+
+
+def _seed(data_fd: int, runner: str, real_data: Path, hidden: list[str]) -> None:
+    """Copy the runner's sign-in files from the real data folder into the private one, or remove the copy when the real
+    file is gone or hidden by deny_read. Every step is relative to a descriptor, opened without following links, and the
+    file is made with O_EXCL | O_NOFOLLOW: a planted `auth.json.new` link, or a link where `opencode/` should be, cannot
+    make the launcher (which runs outside the wall) overwrite or delete anything else."""
+    app_fd = _subdir(data_fd, runner)
+    try:
+        for name in SEED.get(runner, ()):
+            src = real_data / name
+            real = os.path.realpath(src)
+            tmp = name + ".new"
+            _unlink(app_fd, tmp)
+            if not src.is_file() or any(real == h or _inside(real, h) for h in hidden):
+                _unlink(app_fd, name)
+                continue
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=app_fd)
+            with os.fdopen(fd, "wb") as f:
+                f.write(src.read_bytes())
+            os.rename(tmp, name, src_dir_fd=app_fd, dst_dir_fd=app_fd)
+    finally:
+        os.close(app_fd)
+
+
+def private_homes(home: Path, runner: str, pol: policy.Policy, env: dict, project: str) -> dict[str, str]:
+    """XDG data, state and cache folders for a walled run of `runner` in `project`, as {variable: folder}; {} for a
+    runner that keeps no state of its own (one without `wall_writable` in its adapter, which is the marker).
 
     Why private. OpenCode keeps programs in the XDG cache and data folders (`bin/rg`, `node_modules/.bin` plugins,
     language servers) and runs them later, and the walled run has to write there. If it wrote the person's real
@@ -511,8 +622,15 @@ def private_homes(home: Path, runner: str, pol: policy.Policy, env: dict) -> dic
     its own, under `$WS_HOME/wall/<runner>/`, which no unwalled run is pointed at; the real ones stay visible and
     read-only. Why under `$WS_HOME` and not the private tmp: the session history and the model cache are worth keeping
     between runs, and `ws uninstall` removes `$WS_HOME`. They are made 0700, and a `.gitignore` of `*` keeps them out of
-    a synced `$WS_HOME`. What is lost: a sign-in is copied from the real data folder at each start (a token the run
-    refreshes is not carried back), and one the policy hides with deny_read is not copied."""
+    a synced `$WS_HOME`.
+
+    Which are per project. Data and cache are (`<kind>/<name>-<hash of the real path>`): the programs live there, and
+    a program planted by a session in one project must not run in a walled session of another. State stays shared: it
+    holds small preference and prompt-history files, nothing a runner executes (if that is wrong it is data, not code,
+    that crosses). OpenCode keys its sessions by project, so per-project data loses no history, except when a project
+    moves. What is lost: a sign-in is copied from the real data folder at each start (a token the run refreshes is not
+    carried back), and one the policy hides with deny_read is not copied. A session that holds its project's folder can
+    swap it for a link between the check and the bind; that needs a second walled session in the same project."""
     if not hasattr(adapters.get(runner), "wall_writable"):
         return {}
     base = home / "wall"
@@ -520,24 +638,29 @@ def private_homes(home: Path, runner: str, pol: policy.Policy, env: dict) -> dic
     base.chmod(0o700)
     if not (base / ".gitignore").exists():
         (base / ".gitignore").write_text("*\n", encoding="utf-8")
-    out: dict[str, str] = {}
-    for var, kind in XDG_HOMES:
-        folder = base / runner / kind
-        folder.mkdir(mode=0o700, parents=True, exist_ok=True)
-        out[var] = os.path.realpath(folder)
+    root = Path(os.path.realpath(base / runner))
+    key, out = project_key(project), {}
     real_data = Path(env.get("XDG_DATA_HOME") or f"{env.get('HOME') or Path.home()}/.local/share") / runner
     hidden = hidden_paths(pol, env)
-    for name in SEED.get(runner, ()):
-        src, dest = real_data / name, Path(out["XDG_DATA_HOME"]) / runner / name
-        real = os.path.realpath(src)
-        if src.is_file() and not any(real == h or _inside(real, h) for h in hidden):
-            dest.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            new = dest.with_name(dest.name + ".new")
-            new.write_bytes(src.read_bytes())
-            new.chmod(0o600)
-            new.replace(dest)
-        else:
-            dest.unlink(missing_ok=True)
+    for var, kind, per_project in XDG_HOMES:
+        folder = root / kind
+        folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if not per_project:
+            out[var] = str(folder)
+            continue
+        top = os.open(folder, _DIR_FLAGS)
+        try:
+            fd = _subdir(top, key)
+            try:
+                if var == "XDG_DATA_HOME":
+                    _seed(fd, runner, real_data, hidden)
+            finally:
+                os.close(fd)
+        except OSError as e:
+            raise SandboxError(f"{folder / key}: {e.strerror}; remove it, it may be a link planted in a session") from e
+        finally:
+            os.close(top)
+        out[var] = str(folder / key)
     return out
 
 
@@ -548,10 +671,18 @@ def _inside(path: str, folder: str) -> bool:
     return path.startswith(folder.rstrip("/") + "/")
 
 
-def git_facts(project: str) -> tuple[str | None, list[str]]:
-    """What git, started in `project`, would load that is not under `.git`: the folder named by core.hooksPath and the
-    config files (an `[include]` of a file in the project). Both are code to git: a hook runs at the next commit, and
-    a config sets `core.fsmonitor`, an alias or a credential helper. Read with `git config`, which runs nothing. Empty
+class GitFacts(NamedTuple):
+    hooks: str | None  # the core.hooksPath folder, when it is inside the project
+    files: list[str]  # config files in the project that git reads (an `[include]` of one)
+    dirs: list[str]  # git folders inside the project: the one git finds from here, and its common folder
+
+
+def git_facts(project: str) -> GitFacts:
+    """What git, started in `project`, would load that is not a plain file under `.git`: the git folders it resolves
+    (`rev-parse --absolute-git-dir --git-common-dir`; a `--separate-git-dir` or a worktree can put them anywhere in the
+    project), the folder named by core.hooksPath, and the config files pulled in by `[include]`. All of it is code to
+    git: a hook runs at the next commit, and a config sets `core.fsmonitor`, an alias or a credential helper. Read with
+    `git rev-parse` and `git config`, which run nothing. `.git` itself is always counted when it is a folder. Empty
     where git is missing, this is not a repository, or git takes longer than 10 seconds."""
 
     def git(*args: str) -> str | None:
@@ -568,12 +699,16 @@ def git_facts(project: str) -> tuple[str | None, list[str]]:
             return None
         return r.stdout if r.returncode == 0 else None
 
-    top, listing = git("rev-parse", "--show-toplevel"), git("config", "--list", "--show-origin", "-z")
-    if not top or listing is None:
-        return None, []
-    top, parts = top.strip(), listing.split("\0")
+    real = os.path.realpath(project)
+    dirs = [os.path.join(real, ".git")] if os.path.isdir(os.path.join(real, ".git")) else []
+    where = git("rev-parse", "--show-toplevel", "--absolute-git-dir", "--git-common-dir")
+    listing = git("config", "--list", "--show-origin", "-z")
+    if where is None or listing is None or len(where.splitlines()) != 3:
+        return GitFacts(None, [], [d for d in dirs if os.path.isdir(d)])
+    top, *folders = where.splitlines()
+    dirs += [os.path.realpath(os.path.join(real, f)) for f in folders]
     files, hooks = [], None
-    for origin, entry in zip(parts[0::2], parts[1::2], strict=False):  # origin NUL "key" NL "value" NUL
+    for origin, entry in zip(*(iter(listing.split("\0")),) * 2, strict=False):  # origin NUL "key" NL "value" NUL
         key, _, value = entry.partition("\n")
         here = os.path.realpath(os.path.join(top, origin[5:])) if origin.startswith("file:") else None
         if here:
@@ -583,14 +718,17 @@ def git_facts(project: str) -> tuple[str | None, list[str]]:
             files.append(os.path.realpath(os.path.join(os.path.dirname(here or top), expand(value, os.environ))))
         if key == "core.hookspath":
             hooks = os.path.realpath(os.path.join(top, expand(value, os.environ)))
-    real = os.path.realpath(project)
     mine = [f for f in dict.fromkeys(files) if _inside(f, real) and not os.path.isdir(f)]
-    return (hooks if hooks and _inside(hooks, real) else None), mine
+    return GitFacts(
+        hooks if hooks and _inside(hooks, real) else None,
+        mine,
+        [d for d in dict.fromkeys(dirs) if _inside(d, real) and os.path.isdir(d)],
+    )
 
 
 def submodule_repos(git_dir: Path) -> list[str]:
     """The hooks folders and config files of the submodule repositories under `.git/modules`, which git runs and reads
-    like the project's own. Ones the session adds later are not seen (a known limit)."""
+    like the project's own. Ones the session adds later are not seen (the end-of-run report names them)."""
     out: list[str] = []
     for here, dirs, files in os.walk(git_dir / "modules"):
         if "HEAD" in files:  # a repository: its hooks and config, then only its own `modules` below
@@ -601,24 +739,24 @@ def submodule_repos(git_dir: Path) -> list[str]:
 
 
 def lock_wanted(project: str) -> list[tuple[str, str | None]]:
-    """(path, placeholder) for everything in the project the wall locks: `PROJECT_LOCKED`, what git is set up to load
-    (`git_facts`) and the submodule repositories. The placeholder is what a missing path is made into (`DIR`, the text
-    of a file, or None to leave it missing)."""
+    """(path, placeholder) for everything in the project the wall locks: `PROJECT_LOCKED`; in each git folder
+    `GIT_LOCKED`, the pointer files of its worktrees and its submodule repositories; the `.git` pointer when it is a
+    file (or a link, which is then refused); and what git is set up to load (`git_facts`). The placeholder is what a
+    missing path is made into (`DIR`, the text of a file, or None to leave it missing)."""
     root = Path(project)
-    git_dir = root / ".git"
-    out: list[tuple[str, str | None]] = []
-    for rel, fill in PROJECT_LOCKED:
-        if rel.startswith(".git/") and not git_dir.is_dir():
-            continue  # a worktree's `.git` is a file (locked below); with no repository there is nothing to hold
-        out.append((str(root / rel), fill))
-    if git_dir.is_file():  # a linked worktree or submodule: the pointer to its real git folder must not be swapped
-        out.append((str(git_dir), None))
-    hooks, config = git_facts(project)
-    out += [(f, "") for f in config]  # a config file that is missing is made empty
-    if hooks and hooks != os.path.realpath(project):
-        out.append((hooks, DIR))
-    if git_dir.is_dir():
-        out += [(p, None) for p in submodule_repos(git_dir)]
+    out: list[tuple[str, str | None]] = [(str(root / rel), fill) for rel, fill in PROJECT_LOCKED]
+    pointer = root / ".git"
+    if os.path.lexists(pointer) and (pointer.is_symlink() or pointer.is_file()):
+        out.append((str(pointer), None))  # a pointer file must not be swapped; a link is refused later
+    facts = git_facts(project)
+    for g in facts.dirs:
+        out += [(f"{g}/{name}", fill) for name, fill in GIT_LOCKED]
+        out += [(p, None) for p in submodule_repos(Path(g))]
+        for w in sorted(Path(g, "worktrees").glob("*")):
+            out += [(str(w / name), fill) for name, fill in GIT_WORKTREE_FILES if w.is_dir()]
+    out += [(f, "") for f in facts.files]  # a config file that is missing is made empty
+    if facts.hooks and facts.hooks != os.path.realpath(project):
+        out.append((facts.hooks, DIR))
     first: dict[str, str | None] = {}
     for path, fill in out:
         first.setdefault(path, fill)
@@ -629,9 +767,9 @@ def lock_project(project: str) -> tuple[list[str], list[tuple[str, str]]]:
     """(locked, created): the paths for the wall to hold read-only, and the placeholders made so a missing one cannot be
     created inside the wall. bubblewrap can only bind what is there, and a read-only bind of a folder or file that is
     in the way is what stops `mkdir .claude` and `echo '{...}' > .mcp.json`. They are made here, by the launcher, before
-    the wall, and removed by `unlock_project` after it (only if still what was made); a launcher that is killed leaves
-    them behind, empty. Raises SandboxError for a locked path that is a symbolic link: it could be deleted and replaced
-    by a real folder, which no bind prevents."""
+    the wall, and removed by `unlock_project` after it (only if still what was made; see `enter_project` for who
+    removes them when several sessions share the project). Raises SandboxError for a locked path that is a symbolic
+    link: it could be deleted and replaced by a real folder, which no bind prevents."""
     locked: list[str] = []
     created: list[tuple[str, str]] = []
     wanted = lock_wanted(project)
@@ -644,12 +782,12 @@ def lock_project(project: str) -> tuple[list[str], list[tuple[str, str]]]:
     for path, fill in wanted:
         if fill is not None and not os.path.lexists(path):
             try:
-                if fill == DIR:
-                    for q in reversed([path, *(str(a) for a in Path(path).parents if _inside(str(a), project))]):
-                        if not os.path.lexists(q):
-                            os.mkdir(q)
-                            created.append((q, DIR))
-                else:
+                parents = [str(a) for a in Path(path).parents if _inside(str(a), project)]
+                for q in reversed([*([path] if fill == DIR else []), *parents]):  # a missing parent is made too
+                    if not os.path.lexists(q):
+                        os.mkdir(q)
+                        created.append((q, DIR))
+                if fill != DIR:
                     Path(path).write_text(fill, encoding="utf-8")
                     created.append((path, fill))
             except OSError:
@@ -690,6 +828,293 @@ def unlock_project(created: list[tuple[str, str]]) -> None:
             pass
 
 
+# --- several sessions in one project, and a launcher that dies ------------------------------------------------------
+
+
+@contextlib.contextmanager
+def _project_state(home: Path, project: str):
+    """The record of which launchers are inside `project` and which placeholders they made, as a dict, under a lock
+    (`$WS_HOME/wall/projects/<key>.json`, outside the wall's reach: `$WS_HOME` is read-only in it)."""
+    import fcntl  # POSIX only; the wall is Linux and macOS
+
+    folder = home / "wall" / "projects"
+    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+    key = hashlib.sha256(project.encode()).hexdigest()[:16]
+    with open(folder / f"{key}.lock", "a", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        record = folder / f"{key}.json"
+        try:
+            state = json.loads(record.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            state = {}
+        state["project"] = project
+        state["pids"] = [p for p in state.get("pids", []) if _alive(p)]
+        state.setdefault("created", [])
+        yield state
+        if state["pids"] or state["created"]:
+            record.write_text(json.dumps(state), encoding="utf-8")
+        else:
+            record.unlink(missing_ok=True)
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        pass  # exists, owned by someone else
+    return True
+
+
+def enter_project(home: Path, project: str) -> list[str]:
+    """Lock the project for this launcher and record it. Placeholders are shared: a second walled session in the same
+    project finds them and adds its pid, and only the last one out removes them (`leave_project`); the first launcher
+    taking them down under a second one would detach the read-only bind in the second's mount namespace. If every
+    launcher the record names is dead (killed), the placeholders it left are taken down first. Returns the locked paths."""
+    with _project_state(home, project) as state:
+        if not state["pids"] and state["created"]:
+            unlock_project([tuple(c) for c in state["created"]])
+            state["created"] = []
+        locked, created = lock_project(project)
+        state["created"] += created
+        state["pids"].append(os.getpid())
+    return locked
+
+
+def leave_project(home: Path, project: str) -> list[str]:
+    """Take this launcher out of the record; the last one out removes the placeholders. Returns the paths of the
+    placeholders that exist for the project (the end-of-run report leaves them out)."""
+    with _project_state(home, project) as state:
+        state["pids"] = [p for p in state["pids"] if p != os.getpid()]
+        made = [c[0] for c in state["created"]]
+        if not state["pids"]:
+            unlock_project([tuple(c) for c in state["created"]])
+            state["created"] = []
+    return made
+
+
+# --- the end-of-run report --------------------------------------------------------------------------------------------
+
+# The wall is a list of paths, and a list is always one path short. So the launcher also looks, outside the wall, after
+# the runner exits, at what the session left that the person would run next: a git folder it made, a config or plugin
+# file anywhere in the project (a runner started in a sub-folder reads that folder's own `.claude`, `opencode.json`...),
+# and the auto-loaded files of a virtual environment or `node_modules`. It reports and never deletes: it cannot tell a
+# planted hook from one the person asked for.
+REPORT_NAMES = (
+    ".claude",
+    ".opencode",
+    ".mcp.json",
+    "opencode.json",
+    "opencode.jsonc",
+    "tui.json",
+    "tui.jsonc",
+    "mise.toml",
+    ".mise.toml",
+    ".pre-commit-config.yaml",
+    ".envrc",
+)
+REPORT_VSCODE = ("settings.json", "tasks.json")  # in a `.vscode` folder
+STOCK_CONFIG = {
+    "core.repositoryformatversion",
+    "core.filemode",
+    "core.bare",
+    "core.logallrefupdates",
+    "core.ignorecase",
+    "core.precomposeunicode",
+    "core.symlinks",
+}
+VENV_AUTO = ("bin/*", "Scripts/*", "lib*/python*/site-packages/*.pth", "Lib/site-packages/*.pth")  # in a `.venv`
+SCAN_ENTRIES, SCAN_SECONDS = 300_000, 8.0  # the scan stops at either, and says so
+
+
+def _digest(path: str) -> str:
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+    except OSError:
+        return "unreadable"
+    return h.hexdigest()[:16]
+
+
+def _stat_print(path: str) -> str:
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return "gone"
+    return f"{st.st_size}:{st.st_mtime_ns}"
+
+
+def _tree_print(folder: str) -> str:
+    """One print for a folder and everything under it: names, sizes and times (not contents), links not followed."""
+    h = hashlib.sha256()
+    for here, dirs, files in os.walk(folder):
+        dirs.sort()
+        for name in sorted(files):
+            h.update(
+                f"{os.path.relpath(os.path.join(here, name), folder)}:{_stat_print(os.path.join(here, name))}\n".encode()
+            )
+    return h.hexdigest()[:16]
+
+
+def _config_keys(text: str) -> list[str]:
+    """`section.key` (or `section.sub.key`) for every setting in a git config file, lower-cased where git does."""
+    out, section = [], ""
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("[") and "]" in line:
+            head = line[1 : line.index("]")].strip()
+            name, _, sub = head.partition(" ")
+            section = name.lower() + (("." + sub.strip().strip('"')) if sub else "")
+        elif line and not line.startswith(("#", ";")) and section:
+            out.append(f"{section}.{line.split('=')[0].strip().lower()}")
+    return sorted(set(out))
+
+
+def _git_print(git_dir: str, skip_set: set[str]) -> dict:
+    """What matters about a git folder: hooks that are not samples, config keys beyond a stock `git init`, the config's
+    digest, and the submodule repositories."""
+    hooks = {}
+    try:
+        for name in sorted(os.listdir(os.path.join(git_dir, "hooks"))):
+            if not name.endswith(".sample"):
+                hooks[name] = _digest(os.path.join(git_dir, "hooks", name))
+    except OSError:
+        pass
+    try:
+        text = Path(git_dir, "config").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        text = ""
+    modules = (
+        sorted(os.listdir(os.path.join(git_dir, "modules"))) if os.path.isdir(os.path.join(git_dir, "modules")) else []
+    )
+    pointer = os.path.join(git_dir, "commondir")
+    return {
+        "hooks": hooks,
+        "extra_config": [k for k in _config_keys(text) if k not in STOCK_CONFIG],
+        "config": _digest(os.path.join(git_dir, "config")),
+        "modules": modules,
+        "pointers": _digest(pointer) if os.path.exists(pointer) and os.path.realpath(pointer) not in skip_set else "",
+    }
+
+
+def scan_project(
+    project: str, skip: tuple[str, ...] = (), clock=time.monotonic
+) -> tuple[dict[str, object], str | None]:
+    """({key: print}, note): what is in the project that a person's next command could run. Keys are `git:REL` (a git
+    folder or `.git` file, at any depth), `config:REL` (a `REPORT_NAMES` entry or a `.vscode` settings or tasks file) and
+    `auto:REL` (`.venv/bin/*`, `.venv/**/*.pth`, `node_modules/.bin/*`). `skip` is paths not to look at (the placeholders
+    of another session). Bounded: `SCAN_ENTRIES` entries or `SCAN_SECONDS` seconds, then it stops and the note says where."""
+    found: dict[str, object] = {}
+    seen, start, note = 0, clock(), None
+    skip_set = {os.path.realpath(p) for p in skip}
+
+    def add(prefix: str, path: str, value) -> None:
+        if os.path.realpath(path) not in skip_set:
+            found[f"{prefix}:{os.path.relpath(path, project)}"] = value
+
+    for here, dirs, files in os.walk(project):
+        seen += len(dirs) + len(files)
+        if seen > SCAN_ENTRIES or clock() - start > SCAN_SECONDS:
+            note = (
+                f"the scan stopped after {seen} entries in {clock() - start:.1f}s, at {os.path.relpath(here, project)}"
+            )
+            break
+        keep = []
+        for d in dirs:
+            p = os.path.join(here, d)
+            if d == ".git":
+                add("git", p, _git_print(p, skip_set))
+            elif d in REPORT_NAMES:
+                add("config", p, _tree_print(p))
+            elif d == ".vscode":
+                for name in REPORT_VSCODE:
+                    if os.path.isfile(os.path.join(p, name)):
+                        add("config", os.path.join(p, name), _digest(os.path.join(p, name)))
+            elif d == "node_modules":
+                for f in sorted(glob.glob(os.path.join(p, ".bin", "*"))):
+                    add("auto", f, _stat_print(f))
+            elif d == ".venv":
+                autos = [f for pat in VENV_AUTO for f in glob.glob(os.path.join(p, pat))]
+                for f in sorted(autos):
+                    add("auto", f, _stat_print(f))
+            else:
+                keep.append(d)
+        dirs[:] = keep
+        for f in files:
+            p = os.path.join(here, f)
+            if f == ".git":
+                add("git", p, {"pointer": Path(p).read_text(encoding="utf-8", errors="replace")[:200]})
+            elif f in REPORT_NAMES:
+                add("config", p, _digest(p))
+    return found, note
+
+
+def compare_scans(before: dict, after: dict, complete: bool = True) -> list[dict]:
+    """The findings: every key in `after` that is new or has a different print. Removed ones are not findings. If the
+    first scan was cut short, a key it did not reach cannot be called new: only changes are reported then."""
+    out = []
+    for key in sorted(after):
+        change = (
+            "new"
+            if key not in before and complete
+            else "changed"
+            if key in before and before[key] != after[key]
+            else None
+        )
+        if change:
+            kind, _, rel = key.partition(":")
+            detail = after[key] if kind == "git" else ""
+            out.append({"kind": kind, "path": rel, "change": change, "detail": detail})
+    return out
+
+
+def describe(finding: dict) -> str:
+    what = {"git": "a git folder", "config": "a runner or tool config", "auto": "an auto-loaded program"}[
+        finding["kind"]
+    ]
+    line = f"{finding['change']} {what}: {finding['path']}"
+    d = finding["detail"]
+    if isinstance(d, dict) and d.get("pointer") is None:
+        extra = [f"hooks: {', '.join(d['hooks'])}"] if d["hooks"] else []
+        extra += [f"config keys beyond a stock init: {', '.join(d['extra_config'])}"] if d["extra_config"] else []
+        extra += [f"submodules: {', '.join(d['modules'])}"] if d["modules"] else []
+        line += f" ({'; '.join(extra)})" if extra else ""
+    return line
+
+
+def report_run(
+    home: Path, project: str, runner: str, before: dict, after: dict, notes: list[str], complete: bool = True
+) -> list[dict]:
+    """Print what the session left (stderr), and append one JSON line to `$WS_HOME/logs/wall-report.jsonl`. Nothing is
+    printed or written when there is nothing to say. Never removes anything."""
+    findings = compare_scans(before, after, complete)
+    if not findings and not notes:
+        return []
+    lines = [f"ws: wall report for {project}: the session left what you may run next, outside the wall:"]
+    lines += [f"  {describe(f)}" for f in findings]
+    lines += [f"  note: {n}" for n in notes]
+    lines.append("  Read these before you run git, a runner or a build here. ws removed nothing.")
+    print("\n".join(lines), file=sys.stderr)
+    try:
+        log = home / "logs" / "wall-report.jsonl"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "project": project,
+            "runner": runner,
+            "findings": findings,
+            "notes": notes,
+        }
+        with open(log, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+    except OSError:
+        pass  # the stderr lines are the report; a log that cannot be written is not worth failing the run for
+    return findings
+
+
 def run_with_broker(cmd: list[str], env: dict, pass_fds: tuple[int, ...], root: Path) -> int:
     """Start the wrapped runner and stay beside it, outside the wall, to use up approvals it claims (WS_APPROVAL_FD)."""
     mine, theirs = socket.socketpair()
@@ -700,7 +1125,11 @@ def run_with_broker(cmd: list[str], env: dict, pass_fds: tuple[int, ...], root: 
     for fd in pass_fds:
         os.close(fd)
     threading.Thread(target=approvals.serve_claims, args=(mine, root), daemon=True).start()
-    signal.signal(signal.SIGTERM, lambda *_: proc.terminate())
+    stop = [signal.SIGTERM, signal.SIGHUP]
+    if not sys.stdin.isatty():  # at a terminal Ctrl-C reaches the runner itself, and the runner decides
+        stop.append(signal.SIGINT)
+    for sig in stop:
+        signal.signal(sig, lambda *_: proc.terminate())  # the launcher stays up to tidy after the runner has gone
     while True:
         try:
             return proc.wait()
@@ -738,14 +1167,15 @@ def cmd_launch(args: argparse.Namespace) -> int:
             return 127
         return 0  # exec does not return; this is for a test that replaces it. --no-sandbox never reaches the wall code
     tmp = tempfile.mkdtemp(prefix="ws-wall-")  # the wall's /tmp: the rest of the disk is read-only
-    created: list[tuple[str, str]] = []
-    project = ""
-    had_git = True
+    project, entered, before, notes = "", False, {}, []
+    old = _exit_on_hangup()
     try:
         project = project_folder(os.getcwd(), env)
-        had_git = os.path.lexists(Path(project) / ".git")
-        homes = private_homes(home, args.runner, pol, env)
-        locked, created = lock_project(project)
+        homes = private_homes(home, args.runner, pol, env, project)
+        before, note = scan_project(project)
+        notes += [note] if note else []
+        locked = enter_project(home, project)
+        entered = True
         wrapped = wrap(
             argv,
             pol,
@@ -767,10 +1197,33 @@ def cmd_launch(args: argparse.Namespace) -> int:
         print(f"ws: could not start {shlex.join(argv[:1])}: {e}", file=sys.stderr)
         return 127
     finally:
-        unlock_project(created)
-        if project and not had_git and os.path.lexists(Path(project) / ".git"):
-            print(NEW_REPO_NOTE, file=sys.stderr)
+        made = leave_project(home, project) if entered else []
+        if entered:
+            try:
+                after, note = scan_project(project, tuple(made))
+                complete = not any("scan stopped" in n for n in notes)
+                report_run(home, project, args.runner, before, after, [*notes, *([note] if note else [])], complete)
+            except OSError as e:
+                print(f"ws: could not write the wall report: {e}", file=sys.stderr)
         shutil.rmtree(tmp, ignore_errors=True)
+        for sig, handler in old.items():
+            signal.signal(sig, handler)
+
+
+def _exit_on_hangup() -> dict:
+    """Make a hang-up or a terminate before the runner starts leave through `finally` (placeholders taken down, the
+    report written), like the handlers `run_with_broker` installs afterwards. Returns the old handlers, to restore."""
+    old: dict = {}
+
+    def leave(signum, _frame):
+        raise SystemExit(128 + signum)
+
+    try:
+        for sig in (signal.SIGHUP, signal.SIGTERM):
+            old[sig] = signal.signal(sig, leave)
+    except ValueError:  # not the main thread
+        pass
+    return old
 
 
 def add_launch(gs, names: list[str]) -> None:

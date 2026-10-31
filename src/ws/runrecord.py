@@ -15,7 +15,7 @@ import copy
 import json
 import math
 import os
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from ws import jsonl
@@ -107,8 +107,11 @@ def new(**fields) -> dict:
 
 
 def _this_month(rec: dict) -> bool:
-    """A record that counts against this month's cap: rotation keeps any file that holds one."""
-    return str(rec.get("started_at", "")).startswith(f"{datetime.now(UTC):%Y-%m}")
+    """A record from this UTC month or the last: rotation keeps any file that holds one. (Only this month counts against
+    the cap; last month's are kept a little longer so a month boundary, or a clock a day out, never loses the spend.)"""
+    now = datetime.now(UTC)
+    last = (now.replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
+    return str(rec.get("started_at", ""))[:7] in (f"{now:%Y-%m}", last)
 
 
 def append(path: Path, rec: dict, **limits) -> None:

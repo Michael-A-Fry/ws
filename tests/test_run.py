@@ -86,12 +86,13 @@ class Leases:
         self.released: list[str] = []
         self.refuse: broker.BrokerError | None = None
         self.unavailable_times = 0  # the next N requests find no broker
+        self.not_running = True  # ... and it is really not running (not a timeout, a permission error or a bad reply)
 
     def request(self, name, purpose, host, socket=None, ttl_s=None):
         self.requested.append((name, purpose, host))
         if self.unavailable_times > 0:
             self.unavailable_times -= 1
-            raise broker.BrokerUnavailable("no broker answering")
+            raise broker.BrokerUnavailable("no broker answering", not_running=self.not_running)
         if self.refuse:
             raise self.refuse
         return broker.Lease(
@@ -402,6 +403,82 @@ def test_a_broker_ws_does_not_own_is_waited_for_not_started(ws, monkeypatch, tmp
     (rec,) = ws.records()
     assert rec["recovered"] == [{"kind": "broker_unavailable", "action": "waited and asked again", "ok": True}]
     assert ws.started == []
+
+
+def test_a_broker_that_is_there_but_not_answering_properly_is_never_started_over(ws, monkeypatch):
+    """A timeout, a permission error or a bad reply is not "not running": starting a second broker would not help."""
+    ws.leases.unavailable_times = 1
+    ws.leases.not_running = False
+    monkeypatch.setattr(broker, "status", lambda socket=None, timeout=3.0: {"leases": 0})
+    ws.job()
+    assert cli.main(["run", "daily"]) == 0
+    (rec,) = ws.records()
+    assert rec["recovered"] == [{"kind": "broker_unavailable", "action": "waited and asked again", "ok": True}]
+    assert ws.started == []
+
+
+def test_a_subclass_of_a_known_failure_is_mended_too(ws, monkeypatch):
+    class Slow(broker.BrokerUnavailable):
+        pass
+
+    real = ws.leases.request
+
+    def request(*a, **kw):
+        if not ws.leases.requested:
+            ws.leases.requested.append(("anthropic", "run", "api.anthropic.com"))
+            raise Slow("slow", not_running=True)
+        return real(*a, **kw)
+
+    monkeypatch.setattr(broker, "request", request)
+    monkeypatch.setattr(run, "_start_broker", lambda sock: ws.started.append(sock) or True)
+    ws.job()
+    assert cli.main(["run", "daily"]) == 0
+    assert ws.records()[0]["recovered"][0]["kind"] == "broker_unavailable" and len(ws.started) == 1
+
+
+def test_the_broker_client_says_when_nothing_is_running_and_when_it_is_something_else(tmp_path):
+    import socket as pysocket
+    import threading
+
+    missing = tmp_path / "none.sock"
+    with pytest.raises(broker.BrokerUnavailable) as e:
+        broker.status(missing)
+    assert e.value.not_running is True  # no socket file
+
+    stale = tmp_path / "stale.sock"
+    s = pysocket.socket(pysocket.AF_UNIX)
+    s.bind(str(stale))
+    s.close()  # the file is left behind with nothing listening
+    with pytest.raises(broker.BrokerUnavailable) as e:
+        broker.status(stale)
+    assert e.value.not_running is True
+
+    live = tmp_path / "live.sock"
+    srv = pysocket.socket(pysocket.AF_UNIX)
+    srv.bind(str(live))
+    srv.listen(4)
+    replies = [b"not json\n", None]  # a bad reply, then silence
+
+    def serve():
+        for reply in replies:
+            conn, _ = srv.accept()
+            conn.recv(4096)
+            if reply:
+                conn.sendall(reply)
+            else:
+                threading.Event().wait(1.0)
+            conn.close()
+
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    with pytest.raises(broker.BrokerUnavailable) as e:
+        broker.status(live, timeout=2.0)
+    assert e.value.not_running is False  # it answered, badly
+    with pytest.raises(broker.BrokerUnavailable) as e:
+        broker.status(live, timeout=0.2)
+    assert e.value.not_running is False  # a timeout
+    t.join(timeout=5)
+    srv.close()
 
 
 def test_a_refusal_is_not_a_known_failure(ws):

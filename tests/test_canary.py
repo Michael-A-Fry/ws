@@ -55,7 +55,7 @@ def run(capsys, *argv):
 
 
 def lines(box, name="canary.jsonl") -> list[dict]:
-    p = box / ".ws" / name
+    p = box / ".ws" / "logs" / name
     return [json.loads(x) for x in p.read_text().splitlines()] if p.is_file() else []
 
 
@@ -324,10 +324,11 @@ def test_ws_canary_passing_is_what_remembers_the_new_version(box, capsys, monkey
 def test_canary_jsonl_is_private_and_versions_json_leaves_no_temp_file(box, capsys, monkeypatch):
     fake(box, "claude", "1.0.0")
     assert run(capsys, "canary", "--runner", "claude-code")[0] == 0
-    assert oct((box / ".ws" / "canary.jsonl").stat().st_mode & 0o777) == "0o600"
+    assert oct((box / ".ws" / "logs" / "canary.jsonl").stat().st_mode & 0o777) == "0o600"
     canary.observe(dict(os.environ), "claude-code", "3.0.0", "m")
-    # the lock file is the one extra file ws.jsonl keeps beside the log; no temp file is left behind
-    assert sorted(p.name for p in (box / ".ws").iterdir()) == ["canary.jsonl", "canary.jsonl.lock", "versions.json"]
+    # the log and its lock sit under logs/ (a folder the gate denies a session); no temp file is left behind
+    assert sorted(p.name for p in (box / ".ws" / "logs").iterdir()) == ["canary.jsonl", "canary.jsonl.lock"]
+    assert sorted(p.name for p in (box / ".ws").iterdir()) == ["logs", "versions.json"]
     names = []
     real = os.replace
     monkeypatch.setattr(os, "replace", lambda a, b: (names.append(os.path.basename(a)), real(a, b))[1])
@@ -372,3 +373,25 @@ def test_doctor_does_not_write_without_a_ws_home(tmp_path, monkeypatch):
     env = {"PATH": str(bin_dir), "HOME": str(home)}
     assert doctor._runner({"adapter": "claude-code"}, osinfo.detect(), env, True)[0] == "ok"
     assert not home.exists()
+
+
+def test_an_old_canary_log_in_ws_home_is_moved_under_logs_once(box, capsys):
+    fake(box, "claude", "1.0.0")
+    old = box / ".ws" / "canary.jsonl"
+    old.write_text('{"schema": 1, "ok": true, "old": true}\n')
+    assert run(capsys, "canary", "--runner", "claude-code")[0] == 0
+    assert not old.exists()
+    got = lines(box)
+    assert len(got) == 2 and got[0]["old"] is True and got[1]["ok"] is True
+    assert run(capsys, "canary", "--runner", "claude-code")[0] == 0
+    assert len(lines(box)) == 3 and not old.exists()
+
+
+def test_a_canary_log_that_is_a_symlink_is_not_followed(box, capsys, tmp_path):
+    fake(box, "claude", "1.0.0")
+    target = tmp_path / "elsewhere.jsonl"
+    target.write_text("")
+    (box / ".ws" / "logs").mkdir()
+    (box / ".ws" / "logs" / "canary.jsonl").symlink_to(target)
+    run(capsys, "canary", "--runner", "claude-code")  # the append is refused quietly: a canary never fails on its log
+    assert target.read_text() == ""

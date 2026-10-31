@@ -68,6 +68,7 @@ LICENSES/         third-party licence texts (see NOTICE)
 | `runschema.py` | The JSON Schema (draft 2020-12) of a run record, as a Python dict: `ws secret wall` copies only... |
 | `sandbox.py` | The sandbox as the real wall: `ws gate launch --runner R -- argv` starts a runner inside an... |
 | `secrets.py` | The secrets registry and store, and `ws secret` |
+| `selfcmd.py` | How ws starts itself with this Python: `python -I -m ws`, so a folder named `ws/` in the working... |
 | `session.py` | `ws session`: tell a long-running session once when ws has been updated under it |
 | `setup_ui/` | `ws setup`: the first-run and re-run setup, inline in your terminal (default) or in a page in... |
 | `skills/` | The skills ws ships (`align`, `checkpoint`, `taste-gate`, `dataviz`) and how they get onto a machine |

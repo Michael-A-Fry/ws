@@ -10,6 +10,8 @@ import subprocess
 import sys
 import threading
 
+import pytest
+
 from ws import jsonl, rating, runrecord
 
 SMALL = {"max_bytes": 200, "keep": 3}
@@ -197,3 +199,54 @@ def test_two_processes_appending_through_rotation_lose_nothing(tmp_path):
     for pr in procs:
         assert pr.wait(timeout=120) == 0
     assert sorted(ids(p)) == sorted(b + i for b in (0, 1000, 2000) for i in range(40))
+
+
+def test_a_lock_held_too_long_is_a_typed_timeout_error(tmp_path):
+    import fcntl
+
+    p = tmp_path / "a.jsonl"
+    jsonl.append(p, rec(1))
+    fd = os.open(tmp_path / "a.jsonl.lock", os.O_RDWR)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        with pytest.raises(jsonl.LockTimeout) as e:
+            jsonl.append(p, rec(2), lock_timeout_s=0.1)
+        assert isinstance(e.value, OSError) and "locked" in str(e.value)
+        with pytest.raises(jsonl.LockTimeout):
+            jsonl.read(p, lock_timeout_s=0.1)
+    finally:
+        os.close(fd)
+    jsonl.append(p, rec(2), lock_timeout_s=0.1)  # free again
+    assert ids(p) == [1, 2]
+
+
+def test_a_log_or_lock_that_is_a_symlink_is_refused_and_never_written_through(tmp_path):
+    target = tmp_path / "target.txt"
+    target.write_text("keep")
+    p = tmp_path / "a.jsonl"
+    p.symlink_to(target)
+    with pytest.raises(OSError):
+        jsonl.append(p, rec(1))
+    with pytest.raises(OSError):
+        jsonl.read(p)
+    assert target.read_text() == "keep"
+    p.unlink()
+    (tmp_path / "a.jsonl.lock").unlink(missing_ok=True)
+    (tmp_path / "a.jsonl.lock").symlink_to(target)
+    with pytest.raises(OSError):
+        jsonl.append(p, rec(1))
+    assert target.read_text() == "keep"
+
+
+def test_rotation_keeps_a_file_with_a_record_from_last_month_too(tmp_path):
+    from datetime import UTC, datetime, timedelta
+
+    last = runrecord.iso(datetime.now(UTC).replace(day=1) - timedelta(days=1))
+    p = tmp_path / "runs.jsonl"
+    old = runrecord.new(run_id="20260101T000000Z-aaaaaa", job="j", started_at=last, status="ok")
+    runrecord.append(p, old, max_bytes=800, keep=1)
+    for i in range(4):
+        now = datetime.now(UTC)
+        r = runrecord.new(run_id=f"{now:%Y%m%dT%H%M%SZ}-{i:06x}", job="j", started_at=runrecord.iso(now), status="ok")
+        runrecord.append(p, r, max_bytes=800, keep=1)
+    assert "20260101T000000Z-aaaaaa" in {r["run_id"] for r in runrecord.read(p)}

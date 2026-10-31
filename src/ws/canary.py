@@ -1,7 +1,7 @@
 """`ws canary`: a few small checks that a runner's update did not break what ws relies on. No model is called, so it
 costs nothing.
 
-    ws canary [--runner R] [--json]     run the checks; one line goes to `$WS_HOME/canary.jsonl`; exit 1 if any fail
+    ws canary [--runner R] [--json]     run the checks; one line goes to `$WS_HOME/logs/canary.jsonl`; exit 1 if any fail
 
 Per runner:
   version      `<runner> --version` runs
@@ -24,12 +24,11 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
-from ws import __version__, adapters, gate, jsonl, output, policy, runrecord
+from ws import __version__, adapters, gate, jsonl, output, policy, runrecord, selfcmd
 from ws.output import WsError
 from ws.profile import ProfileError, load, profile_path
 
@@ -113,6 +112,17 @@ def _replace(path: Path, text: str) -> None:
         raise
 
 
+def log_path(home: Path) -> Path:
+    """The canary log. It sits under `logs/`, which the gate denies a session: a canary line a session could write
+    would let it fake a passing canary. The log used to be `$WS_HOME/canary.jsonl`; that file is moved here once."""
+    new = home / "logs" / "canary.jsonl"
+    old = home / "canary.jsonl"
+    if old.is_file() and not old.is_symlink() and not new.exists():
+        new.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.replace(old, new)
+    return new
+
+
 def _append_line(path: Path, line: dict) -> None:
     """One line through `ws.jsonl`: locked, 0600, rotated at 5 MB."""
     jsonl.append(path, line)
@@ -189,9 +199,8 @@ def _hook(runner: str, payload: dict, policy_file: Path, home: Path, env) -> int
     """The exit code of the real hook entry for one payload."""
     child = {k: env[k] for k in ("PATH", "HOME", "LANG") if k in env}
     child["WS_HOME"] = str(home)
-    child["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])  # `-m ws` finds this ws even if it is not installed
-    p = subprocess.run(
-        [sys.executable, "-m", "ws", "gate", "check", "--runner", runner, "--policy", str(policy_file)],
+    p = subprocess.run(  # the same isolated command the generated hook uses, from a folder that has no ws/ of its own
+        [*selfcmd.argv(), "gate", "check", "--runner", runner, "--policy", str(policy_file)],
         input=json.dumps(payload), env=child, capture_output=True, text=True, timeout=30, check=False,
     )  # fmt: skip
     return p.returncode
@@ -281,7 +290,7 @@ def canary_runner(runner: str, env, work: Path) -> dict:
 
 
 def run_canary(runners: list[str], env=None, model: str | None = None) -> dict:
-    """Run the checks for each runner and append one line to canary.jsonl (when ws's home exists). A runner that passes
+    """Run the checks for each runner and append one line to logs/canary.jsonl (when ws's home exists). A runner that passes
     has its version (and the default model) remembered in versions.json, so a change is reported until a canary passes.
     Returns the line."""
     env = os.environ if env is None else env
@@ -305,7 +314,7 @@ def run_canary(runners: list[str], env=None, model: str | None = None) -> dict:
     home = _home(env)
     if home and home.is_dir():
         try:
-            _append_line(home / "canary.jsonl", line)
+            _append_line(log_path(home), line)
         except OSError:
             pass
     return {**line, "details": {r: res["details"] for r, res in results.items()}}
@@ -367,7 +376,7 @@ def register(sub) -> None:
     c = sub.add_parser(
         "canary",
         help="check a runner still works with ws after an update (no model is called)",
-        description="Small checks, no paid model. Each run adds one line to $WS_HOME/canary.jsonl. Exit 1 on a failure.",
+        description="Small checks, no paid model. Each run adds one line to $WS_HOME/logs/canary.jsonl. Exit 1 on a failure.",
     )
     c.add_argument("--runner", choices=list(adapters.all_adapters()), help="default: the profile's runner")
     c.set_defaults(func=cmd_canary)

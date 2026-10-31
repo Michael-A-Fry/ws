@@ -43,7 +43,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-from ws import __version__, adapters, broker, gate, jobs, output, policy, runrecord
+from ws import __version__, adapters, broker, gate, jobs, output, policy, runrecord, selfcmd
 from ws import secrets as wsecrets
 from ws.output import WsError
 from ws.profile import ProfileError, load, profile_path, ws_home
@@ -91,12 +91,25 @@ def _budget(prof: dict) -> tuple[float | None, float | None, float | None]:
 
 
 def _start_broker(sock: Path) -> bool:
-    """Start a per-user broker on `sock` (it clears a stale socket file itself) and wait for it to answer."""
+    """Start a per-user broker on `sock` (it clears a stale socket file itself) and wait for it to answer.
+
+    It runs isolated (`selfcmd.argv`), in ws's home and with the runner's scrubbed environment plus WS_HOME, never the
+    project folder's `ws/`. It is left running on purpose, so the next run finds it, in its own session; its stderr goes
+    to `logs/broker-start.log`. Started from a systemd oneshot unit (a timer's job), the unit's kill mode ends it with
+    the unit; that is fine, the next run starts it again."""
+    home = ws_home().absolute()
     try:
-        subprocess.Popen(  # left running on purpose: the next run finds it
-            [sys.executable, "-m", "ws", "broker", "serve", "--socket", str(sock)],
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
-        )  # fmt: skip
+        logs = home / "logs"
+        logs.mkdir(mode=0o700, parents=True, exist_ok=True)
+        err_fd = os.open(logs / "broker-start.log", os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            subprocess.Popen(
+                [*selfcmd.argv(), "broker", "serve", "--socket", str(sock)],
+                env=_child_env(home, {}), cwd=home,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=err_fd, start_new_session=True,
+            )  # fmt: skip
+        finally:
+            os.close(err_fd)
     except OSError:
         return False
     deadline = time.monotonic() + BROKER_START_S
@@ -109,10 +122,12 @@ def _start_broker(sock: Path) -> bool:
     return False
 
 
-def _mend_broker(sock: Path) -> tuple[str, bool]:
-    """(what ws did, whether the broker answers now). A socket in this user's own run folder is a broker ws may start;
-    any other (the walled service, a socket the profile names) is not ws's to start, so it waits and looks again."""
-    if sock == ws_home().absolute() / "run" / "broker.sock":
+def _mend_broker(sock: Path, err: broker.BrokerUnavailable) -> tuple[str, bool]:
+    """(what ws did, whether the broker answers now). Only a broker that is not running (no socket file, or nothing
+    listening on it), on a socket in this user's own run folder, is one ws may start. Any other trouble (a timeout, no
+    permission, a bad reply) or any other socket (the walled service, one the profile names) is not ws's to start, so it
+    waits and looks again."""
+    if err.not_running and sock == ws_home().absolute() / "run" / "broker.sock":
         return "started the broker", _start_broker(sock)
     time.sleep(RECOVERY_WAIT_S)
     try:
@@ -122,7 +137,8 @@ def _mend_broker(sock: Path) -> tuple[str, bool]:
     return "waited and asked again", True
 
 
-# The known failures ws mends once, keyed by the exception class that reports each: (kind, what to do about it). A new
+# The known failures ws mends once, keyed by the exception class that reports each (a subclass counts): (kind, what to do
+# about it, given the socket and the exception). A new
 # row is a typed error that something in ws already raises, and a fix that is safe to try without asking.
 RECOVERIES = {broker.BrokerUnavailable: ("broker_unavailable", _mend_broker)}
 
@@ -133,10 +149,10 @@ def _lease(s: jobs.SecretUse, sock: Path, rec: dict) -> broker.Lease:
     try:
         return broker.request(s.name, s.purpose, s.host, socket=sock)
     except tuple(RECOVERIES) as e:
-        kind, mend = RECOVERIES[type(e)]
+        kind, mend = next(v for k, v in RECOVERIES.items() if isinstance(e, k))
         if any(r["kind"] == kind for r in rec["recovered"]):
             raise
-        action, ok = mend(sock)
+        action, ok = mend(sock, e)
         rec["recovered"].append({"kind": kind, "action": action, "ok": ok})
         if not ok:
             raise
@@ -441,7 +457,7 @@ def _execute(job, adapter, pol, rec: dict, run_dir: Path, cwd: Path, log: Path, 
         cwd.mkdir(parents=True, exist_ok=True)
         rec["cwd"] = str(cwd)
         policy_file = policy.policy_path().absolute()
-        files = adapter.generate(pol, [sys.executable, "-m", "ws"], run_dir / "gate", policy_file)
+        files = adapter.generate(pol, selfcmd.argv(), run_dir / "gate", policy_file)
         gate.write_files(run_dir / "gate", files)
         for s in job.secrets:
             leases.append(_lease(s, sock, rec))

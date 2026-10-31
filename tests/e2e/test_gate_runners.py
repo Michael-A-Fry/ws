@@ -22,13 +22,12 @@ import os
 import shlex
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
 
 from e2e.stubs import AnthropicStub, Call, OpenAIStub
-from ws import cli
+from ws import cli, selfcmd
 from ws.testing import scenarios
 
 REQUIRE = os.environ.get("WS_E2E_REQUIRE") == "1"
@@ -83,7 +82,7 @@ def secrets(tmp_path):
 
 def generate(tmp_path, runner: str) -> Path:
     out = tmp_path / "wshome" / "gate" / runner  # where ws puts it: $WS_HOME/gate/<runner>
-    ws_cmd = shlex.join([sys.executable, "-m", "ws"])
+    ws_cmd = shlex.join(selfcmd.argv())  # the isolated command, as the real hook uses
     assert cli.main(["gate", "generate", "--runner", runner, "--out", str(out), "--ws-cmd", ws_cmd]) == 0
     return out
 

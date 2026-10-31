@@ -103,7 +103,13 @@ class BrokerError(Exception):
 
 
 class BrokerUnavailable(BrokerError):
-    """The broker is not running, or this user cannot reach its socket."""
+    """The broker is not running, or this user cannot reach its socket. `not_running` is True only when the socket file
+    is missing or nothing is listening on it (a stale file): the one case where starting a broker can help. A timeout, a
+    permission error or a bad reply leaves it False."""
+
+    def __init__(self, message: str, not_running: bool = False):
+        super().__init__(message)
+        self.not_running = not_running
 
 
 class BrokerRefused(BrokerError):
@@ -141,7 +147,8 @@ def _client_call(msg: dict, socket_file: str | Path | None, timeout: float = 10.
                 raise BrokerUnavailable("the broker's reply was too long")
         reply = json.loads(buf.split(b"\n", 1)[0])
     except (OSError, ValueError) as e:
-        raise BrokerUnavailable(f"no broker answering at {path} ({type(e).__name__})") from e
+        down = isinstance(e, (FileNotFoundError, ConnectionRefusedError))
+        raise BrokerUnavailable(f"no broker answering at {path} ({type(e).__name__})", not_running=down) from e
     finally:
         s.close()
     if not isinstance(reply, dict):

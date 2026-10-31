@@ -241,6 +241,11 @@ allow_write = []
 # --- load and validate -------------------------------------------------------------------------------------------
 
 
+# A key that was renamed: old dotted key -> its replacement (`ws config` warns). Policy fails closed, so `loads` must keep
+# accepting the old spelling, with the same meaning, for the release that deprecates it. Empty now.
+DEPRECATED: dict[str, str] = {}
+
+
 def policy_path(env: dict | None = None) -> Path:
     return ws_home(env) / "policy.toml"
 

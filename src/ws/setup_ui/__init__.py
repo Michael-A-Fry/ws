@@ -51,14 +51,12 @@ import re
 import sys
 
 from ws import doctor
+from ws.output import WsError
 
 
-def _fail(message: str, hint: str = "") -> int:
-    """An error line, then one line that says what to try (the way claw-code ends its errors with a Usage line)."""
-    print(f"ws: {message}", file=sys.stderr)
-    if hint:
-        print(f"    {hint}", file=sys.stderr)
-    return 1
+def _fail(message: str, hint: str = ""):
+    """An error, then what to try (the way claw-code ends its errors with a Usage line)."""
+    raise WsError("bad_input", message, hint)
 
 
 HINTS = (  # (a word in the message, what to try)
@@ -70,6 +68,11 @@ HINTS = (  # (a word in the message, what to try)
     ("control character", "type a plain path"),
     ("unknown runner", "known runners: " + ", ".join(doctor.RUNNERS)),
 )
+
+
+def _at_terminal(args: argparse.Namespace) -> bool:
+    """A person walking the steps (or the page): the command keeps the terminal, so --json has nothing to wrap."""
+    return bool(args.web or (not args.yes and sys.stdin.isatty()))
 
 
 def cmd_setup(args: argparse.Namespace) -> int:
@@ -143,4 +146,4 @@ def register(sub) -> None:
     g.add_argument("--runner", choices=list(doctor.RUNNERS), help="the AI tool ws runs jobs with")
     g.add_argument("--cap", type=float, metavar="USD", help="your own monthly spend cap")
     g.add_argument("--region", metavar="CC", help="your country (two letters); kept in [machine] region")
-    s.set_defaults(func=cmd_setup)
+    s.set_defaults(func=cmd_setup, raw=_at_terminal)

@@ -64,6 +64,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from ws.output import WsError
 from ws.profile import ws_home
 
 TTL = 600  # seconds a pending or a granted approval lives
@@ -379,8 +380,7 @@ def cmd_approve(args: argparse.Namespace) -> int:
     root = approvals_dir()
     if args.list:
         if os.environ.get(ENV_MARKER):
-            print(f"ws: {refuse_reason(os.environ, True)}", file=sys.stderr)
-            return 1
+            raise WsError("refused", refuse_reason(os.environ, True), "run `ws approve` yourself, in a terminal")
         rows = pending(root)
         for ident, bound, left in rows:
             print(
@@ -391,11 +391,9 @@ def cmd_approve(args: argparse.Namespace) -> int:
         return 0
     why = refuse_reason(os.environ, sys.stdin.isatty())
     if why:
-        print(f"ws: {why}", file=sys.stderr)
-        return 1
+        raise WsError("refused", why, "run `ws approve` yourself, in a terminal")
     if not args.id:
-        print("ws: give the id the gate printed, or --list", file=sys.stderr)
-        return 1
+        raise WsError("usage", "give the id the gate printed", "or `ws approve --list` to see what is waiting", 2)
     try:
         found = _find(root, args.id, time.time())
         print("Approve this call, once?\n" + describe(found.bound))
@@ -404,8 +402,7 @@ def cmd_approve(args: argparse.Namespace) -> int:
             return 1
         ident = grant_found(root, found)
     except (ApprovalError, EOFError, OSError) as e:
-        print(f"ws: {e}", file=sys.stderr)
-        return 1
+        raise WsError("failed", str(e) or "no answer", "`ws approve --list` shows what is waiting") from e
     print(f"ws: approved {ident[:_SHORT]} for one use, within {TTL // 60} minutes; the session may retry the call")
     return 0
 

@@ -164,7 +164,7 @@ def test_set_list_rm_round_trip_never_shows_the_value(home, capsys, monkeypatch)
     line = next(ln for ln in out.splitlines() if ln.startswith("anthropic"))
     assert " set " in line and "api.anthropic.com" in line
     code, out, _ = run(capsys, "secret", "list", "--json")
-    rows = {r["name"]: r for r in json.loads(out)["secrets"]}
+    rows = {r["name"]: r for r in json.loads(out)["data"]["secrets"]}
     assert rows["anthropic"]["state"] == "set" and rows["github"]["state"] == "unset"
     assert VALUE not in out
     code, out, _ = run(capsys, "secret", "rm", "anthropic")

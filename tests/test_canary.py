@@ -124,7 +124,7 @@ def test_a_canary_run_passes_and_leaves_one_line(box, capsys):
     assert res["version"] == "2.5.1" and res["ok"] is True
     assert res["checks"] == {"version": "pass", "gate": "pass", "hook_config": "pass", "run_record": "pass"}
     code, out, _ = run(capsys, "canary", "--json")
-    assert code == 0 and json.loads(out)["details"]["claude-code"]["gate"].startswith("blocks")
+    assert code == 0 and json.loads(out)["data"]["details"]["claude-code"]["gate"].startswith("blocks")
     assert len(lines(box)) == 2
 
 

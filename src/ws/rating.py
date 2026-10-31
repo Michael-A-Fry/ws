@@ -15,11 +15,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
-from ws import runrecord
+from ws import output, runrecord
+from ws.output import WsError
 from ws.profile import ws_home
 
 try:  # not on native Windows; ws runs there only through WSL2, but the module must still import
@@ -106,11 +106,12 @@ def cmd_rate(args: argparse.Namespace) -> int:
         earlier = latest(read(path)).get(run_id)
         append(path, new(run_id, args.rating, args.note))
     except ValueError as e:
-        print(f"ws: {e}", file=sys.stderr)
-        return 1
+        raise WsError("not_found", str(e), "`ws runs` lists the runs") from e
     except OSError as e:
-        print(f"ws: could not read or write the ratings: {e.strerror or type(e).__name__}", file=sys.stderr)
-        return 1
+        raise WsError("io", f"could not read or write the ratings: {e.strerror or type(e).__name__}") from e
+    if args.json:
+        output.result({"run_id": run_id, "rating": args.rating, "was": earlier})
+        return 0
     tail = f" (was {earlier})" if earlier and earlier != args.rating else ""
     print(f"ws: rated {run_id} {args.rating}{tail}")
     return 0

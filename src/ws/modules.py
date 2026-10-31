@@ -12,15 +12,15 @@ carries on. If neither says, nothing is refused.
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import re
 import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from ws import install
+from ws import install, output
 from ws.install import Answers, InstallError, Step
+from ws.output import WsError
 from ws.profile import ProfileError, load, profile_path, write_if_changed
 
 NOT_BUILT = "not built yet"
@@ -223,8 +223,7 @@ def cmd_list(args: argparse.Namespace) -> int:
     try:
         on = install.answers_from_profile(os.environ).modules
     except InstallError as e:
-        print(f"ws: {e}", file=sys.stderr)
-        return 1
+        raise WsError("bad_config", str(e), "run `ws doctor`") from e
     rows = [
         {
             "name": m.name,
@@ -238,7 +237,7 @@ def cmd_list(args: argparse.Namespace) -> int:
         for m in REGISTRY.values()
     ]
     if args.json:
-        print(json.dumps(rows, indent=2))
+        output.result(rows)
         return 0
     for r in rows:
         note = "" if r["status"] == "built" else f" ({r['status']})"
@@ -247,13 +246,15 @@ def cmd_list(args: argparse.Namespace) -> int:
     return 0
 
 
-def _change(name: str, turn_on: bool, region: str | None = None) -> int:
+def _change(name: str, turn_on: bool, region: str | None = None, output_json: bool = False) -> int:
     if name not in REGISTRY:
-        print(f"ws: unknown plugin {name!r}; known: {', '.join(REGISTRY)}", file=sys.stderr)
-        return 1
+        raise WsError(
+            "not_found",
+            f"unknown plugin {name!r}",
+            output.did_you_mean(name, REGISTRY) or f"known: {', '.join(REGISTRY)}",
+        )
     if region is not None and not re.fullmatch(r"[A-Za-z]{2}", region):
-        print(f"ws: --region takes a two-letter country code such as NZ, not {region!r}", file=sys.stderr)
-        return 1
+        raise WsError("bad_input", f"--region takes a two-letter country code such as NZ, not {region!r}")
     region = region.upper() if region else None
     try:
         if not install.profile_path().is_file():
@@ -269,8 +270,10 @@ def _change(name: str, turn_on: bool, region: str | None = None) -> int:
         modules = answers.modules | {name} if turn_on else answers.modules - {name}
         result = install.apply(install.plan(replace(answers, modules=modules)))
     except (InstallError, OSError) as e:
-        print(f"ws: {e}", file=sys.stderr)
-        return 1
+        raise WsError("failed", str(e)) from e
+    if output_json:
+        output.result({"name": name, "on": turn_on, "summary": result.summary()})
+        return 0
     print(f"ws: {name} is {'on' if turn_on else 'off'}: {result.summary()}")
     if turn_on and not REGISTRY[name].built:
         print(f"ws: {name} is {NOT_BUILT}: this records your choice and changes nothing else")
@@ -278,11 +281,11 @@ def _change(name: str, turn_on: bool, region: str | None = None) -> int:
 
 
 def cmd_add(args: argparse.Namespace) -> int:
-    return _change(args.name, True, args.region)
+    return _change(args.name, True, args.region, args.json)
 
 
 def cmd_remove(args: argparse.Namespace) -> int:
-    return _change(args.name, False)
+    return _change(args.name, False, output_json=args.json)
 
 
 def register(sub) -> None:
@@ -291,7 +294,6 @@ def register(sub) -> None:
         m = sub.add_parser(command, help="switch parts of ws on or off" if shown else argparse.SUPPRESS)
         ms = m.add_subparsers(dest="module_command", required=True)
         ls = ms.add_parser("list", help="every plugin, and whether it is on")
-        ls.add_argument("--json", action="store_true")
         ls.set_defaults(func=cmd_list)
         for name, fn, text in (("add", cmd_add, "switch a plugin on"), ("remove", cmd_remove, "switch a plugin off")):
             p = ms.add_parser(name, help=text)

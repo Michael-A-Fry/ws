@@ -43,6 +43,7 @@ LICENSES/         third-party licence texts (see NOTICE)
 | `broker.py` | The secrets broker: a small process that is not an LLM and holds the store, so agents never see... |
 | `canary.py` | `ws canary`: a few small checks that a runner's update did not break what ws relies on |
 | `cli.py` | The `ws` command |
+| `config_cmd.py` | `ws config`: every file ws reads, where its path came from, and the keys it sets |
 | `devices.py` | `ws device add`: the one line that links a second machine to this one |
 | `doctor.py` | `ws doctor`: one line per check, each with a stable ID |
 | `frontmatter.py` | YAML front matter, the safe subset: stdlib only |
@@ -56,6 +57,7 @@ LICENSES/         third-party licence texts (see NOTICE)
 | `notes.py` | Notes module: `ws note` drops a Markdown file into the `_inbox` of your own notes folder (any... |
 | `notesdetect.py` | Find notes you already keep: an Obsidian vault (a folder holding `.obsidian/`) or a Logseq graph... |
 | `osinfo.py` | Which machine are we on: macOS, Linux, Windows via WSL2, or native Windows (not supported; use WSL2) |
+| `output.py` | One output contract for every `ws` command: a typed error, one JSON envelope, and the global... |
 | `policy.py` | The policy: one vendor-neutral `policy.toml` that says what a session may do |
 | `profile.py` | The profile: one TOML file per person (machine answers, roles, caps) |
 | `rating.py` | `ws rate`: a thumbs up or down on a run, in one command |
@@ -68,6 +70,7 @@ LICENSES/         third-party licence texts (see NOTICE)
 | `session.py` | `ws session`: tell a long-running session once when ws has been updated under it |
 | `setup_ui/` | `ws setup`: the first-run and re-run setup, inline in your terminal (default) or in a page in... |
 | `skills/` | The skills ws ships (`align`, `checkpoint`, `taste-gate`, `dataviz`) and how they get onto a machine |
+| `status.py` | `ws status`: for each runner, every rules, skill, hook and MCP file it will load here, with... |
 | `usage.py` | The Console usage check: can ws read the provider's own usage report, the billing truth... |
 
 <!-- code-map:end -->

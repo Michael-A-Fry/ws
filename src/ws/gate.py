@@ -19,8 +19,9 @@ import shlex
 import sys
 from pathlib import Path
 
-from ws import adapters, approvals, policy, sandbox
+from ws import adapters, approvals, output, policy, sandbox
 from ws.adapters import Call
+from ws.output import WsError
 from ws.profile import ws_home
 
 DENY = 2
@@ -140,17 +141,18 @@ def cmd_generate(args: argparse.Namespace) -> int:
     out = Path(args.out).expanduser().resolve()
     for h in _runner_homes():
         if out == h.resolve() or h.resolve() in out.parents:
-            print(f"ws: {out} is a runner's own config folder; generate into a separate folder", file=sys.stderr)
-            return 1
+            raise WsError("refused", f"{out} is a runner's own config folder", "generate into a separate folder")
     policy_file = _policy_arg(args) or policy.policy_path()
     try:
         pol = policy.load(policy_file)
         adapter = adapters.get(args.runner)
         files = adapter.generate(pol, shlex.split(args.ws_cmd), out, policy_file.resolve())
     except (policy.PolicyError, KeyError, ValueError) as e:
-        print(f"ws: {e}", file=sys.stderr)
-        return 1
+        raise WsError("bad_config", str(e), f"fix {policy_file}, or `ws gate init`") from e
     changed = write_files(out, files)
+    if args.json:
+        output.result({"out": str(out), "changed": changed, "launch": adapter.launch_hint(str(out))})
+        return 0
     print(f"ws: {len(changed)} changes to {out} ({', '.join(changed)})" if changed else f"ws: 0 changes to {out}")
     print(adapter.launch_hint(str(out)))
     return 0
@@ -162,12 +164,17 @@ def cmd_init(args: argparse.Namespace) -> int:
         try:
             policy.load(path)
         except policy.PolicyError as e:
-            print(f"ws: {e}", file=sys.stderr)
-            return 1
+            raise WsError("bad_config", str(e), f"fix {path}") from e
+        if args.json:
+            output.result({"path": str(path), "changed": False})
+            return 0
         print(f"ws: 0 changes to {path}")
         return 0
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(policy.default_toml(), encoding="utf-8")
+    if args.json:
+        output.result({"path": str(path), "changed": True})
+        return 0
     print(f"ws: wrote {path}")
     print("next: `ws gate generate --runner claude-code|opencode --out DIR`")
     return 0
@@ -198,6 +205,6 @@ def register(sub) -> None:
     c.add_argument(
         "--protect", action="append", metavar="PATH", help="a file or folder of ws's own that a session may not write"
     )
-    c.set_defaults(func=cmd_check)
+    c.set_defaults(func=cmd_check, raw=True)  # a hook: the runner reads this command's own stdout, stderr and exit code
 
     sandbox.add_launch(gs, names)

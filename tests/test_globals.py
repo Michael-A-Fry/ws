@@ -155,8 +155,9 @@ def test_json_report(world, capsys):
     _, repo = world
     put(repo, ".claude/skills/align/SKILL.md", "mine\n")
     code, out = run(capsys, repo, "--json")
-    rep = json.loads(out)
-    assert code == 1
+    env = json.loads(out)
+    rep = env["data"]
+    assert code == 1 and env["status"] == "attention"
     assert rep["status"] == "fail"
     assert rep["shadows"][0]["path"] == ".claude/skills/align"
 

@@ -81,10 +81,8 @@ def test_an_unknown_run_or_an_empty_log_is_refused_and_writes_nothing(box, capsy
 
 def test_only_up_or_down_and_a_long_note_is_cut(box, capsys):
     rid = add_run(box, "20260101T000000Z-aaaaaa")
-    with pytest.raises(SystemExit) as e:
-        cli.main(["rate", rid, "meh"])
-    assert e.value.code == 2
-    capsys.readouterr()
+    assert cli.main(["rate", rid, "meh"]) == 2
+    assert "invalid choice" in capsys.readouterr().err
     assert run(capsys, "rate", rid, "up", "--note", "x" * 2000)[0] == 0
     assert len(ratings(box)[0]["note"]) == rating.NOTE_MAX
 

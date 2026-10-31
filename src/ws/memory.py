@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import json
 import os
 import re
 import sqlite3
@@ -19,7 +18,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 
-from ws import frontmatter
+from ws import frontmatter, output
 from ws.notes import WsError, clean_tags, read_text, role_path, title_slug, write_new
 from ws.profile import ProfileError, ws_home
 
@@ -55,12 +54,12 @@ def _git(root: Path, *args: str) -> subprocess.CompletedProcess:
     try:
         return subprocess.run(["git", *args], cwd=root, env=env, capture_output=True, text=True, check=False)
     except FileNotFoundError as e:
-        raise WsError("git is not installed or not on PATH") from e
+        raise WsError("unavailable", "git is not installed or not on PATH", "install git") from e
 
 
 def _git_fail(what: str, p: subprocess.CompletedProcess) -> WsError:
     lines = (p.stderr or p.stdout or "").strip().splitlines()
-    return WsError(f"git {what} failed: {lines[0] if lines else 'no output'}")
+    return WsError("failed", f"git {what} failed: {lines[0] if lines else 'no output'}")
 
 
 def is_repo(root: Path) -> bool:
@@ -96,13 +95,13 @@ def add(
 ) -> Path:
     """Write one memory file and commit it. Returns the path."""
     if kind not in KINDS:
-        raise WsError(f"kind must be one of {', '.join(KINDS)}, not {kind!r}")
+        raise WsError("bad_input", f"kind must be one of {', '.join(KINDS)}, not {kind!r}")
     text = text.strip()
     if not text:
-        raise WsError("nothing to remember: the text is empty")
+        raise WsError("bad_input", "nothing to remember: the text is empty")
     root = role_path("memory", env)
     if not is_repo(root):
-        raise WsError(f"{root} is not a git repo (run `ws memory init`)")
+        raise WsError("not_found", f"{root} is not a git repo", "run `ws memory init`")
     now = now if now is not None and now.tzinfo is not None else (now or datetime.now()).astimezone()
     meta: dict = {"id": str(uuid.uuid4()), "created": now.replace(microsecond=0), "kind": kind}
     if title and title.strip():
@@ -111,13 +110,13 @@ def add(
     try:
         path = write_new(root / f"{kind}s", title_slug(title, text), frontmatter.dumps(meta, text))
     except OSError as e:
-        raise WsError(f"could not write to {root}: {e.strerror or type(e).__name__}") from e
+        raise WsError("io", f"could not write to {root}: {e.strerror or type(e).__name__}") from e
     rel = path.relative_to(root).as_posix()
     p = _git(root, "add", "--", rel)
     if p.returncode == 0:
         p = _git(root, "commit", "-q", "-m", f"memory: add {path.stem}", "--", rel)
     if p.returncode != 0:
-        raise WsError(f"{path} was written but not committed: {_git_fail('commit', p)}")
+        raise WsError("failed", f"{path} was written but not committed: {_git_fail('commit', p).message}")
     return path
 
 
@@ -156,12 +155,12 @@ def configured_roots(env: dict | None = None) -> list[tuple[str, Path]]:
         try:
             p = role_path(role, env)
         except WsError as e:
-            problem = problem or str(e)
+            problem = problem or e.message
             continue
         if p.is_dir():
             roots.append((source, p))
     if not roots:
-        raise WsError(problem or "neither a memory nor a notes folder exists (run `ws doctor`)")
+        raise WsError("not_found", problem or "neither a memory nor a notes folder exists", "run `ws doctor`")
     return roots
 
 
@@ -303,10 +302,10 @@ def _with_index(db: Path, fn):
             return fn(conn)
         except sqlite3.DatabaseError as e:
             if isinstance(e, sqlite3.OperationalError) and "locked" in str(e):
-                raise WsError("the search index is busy: try again in a moment") from e
+                raise WsError("unavailable", "the search index is busy", "try again in a moment") from e
             if attempt == 2 or not _corrupt(e):  # only a damaged file is deleted; anything else is left alone
                 raise WsError(
-                    f"the search index failed ({type(e).__name__}); `ws memory reindex --full` rebuilds it"
+                    "failed", f"the search index failed ({type(e).__name__})", "`ws memory reindex --full` rebuilds it"
                 ) from e
             if conn:
                 conn.close()
@@ -339,7 +338,7 @@ def check_index(root: Path) -> tuple[bool, str]:
 def _terms(query: str) -> list[str]:
     terms = _TERM.findall(query.lower())
     if not terms:
-        raise WsError("nothing to search for: the query has no words")
+        raise WsError("bad_input", "nothing to search for: the query has no words")
     return terms
 
 
@@ -428,9 +427,8 @@ def _guard(fn):
     def run(args: argparse.Namespace) -> int:
         try:
             return fn(args)
-        except (WsError, ProfileError) as e:
-            print(f"ws: {e}", file=sys.stderr)
-            return 1
+        except ProfileError as e:
+            raise WsError("bad_config", str(e), "fix or remove the profile") from e
 
     return run
 
@@ -439,6 +437,9 @@ def _guard(fn):
 def cmd_init(args: argparse.Namespace) -> int:
     root = role_path("memory")
     changed = init(root)
+    if args.json:
+        output.result({"path": str(root), "changed": changed})
+        return 0
     print(f"ws: {'made ' + str(root) + ' a git repo' if changed else '0 changes to ' + str(root)}")
     return 0
 
@@ -446,6 +447,9 @@ def cmd_init(args: argparse.Namespace) -> int:
 @_guard
 def cmd_add(args: argparse.Namespace) -> int:
     path = add(read_text(args.text), args.title, args.kind, args.tag)
+    if args.json:
+        output.result({"path": str(path)})
+        return 0
     print(path)
     return 0
 
@@ -454,7 +458,7 @@ def cmd_add(args: argparse.Namespace) -> int:
 def cmd_search(args: argparse.Namespace) -> int:
     hits = search(" ".join(args.query), args.limit)
     if args.json:
-        print(json.dumps([asdict(h) for h in hits], indent=2))
+        output.result([asdict(h) for h in hits])
     elif hits:
         print(render_hits(hits))
     else:
@@ -466,7 +470,13 @@ def cmd_search(args: argparse.Namespace) -> int:
 def cmd_reindex(args: argparse.Namespace) -> int:
     stats, db = reindex(full=args.full)
     if not has_fts5():
+        if args.json:
+            output.result({"indexed": 0, "fts5": False})
+            return 0
         print("ws: nothing to index without FTS5; search scans the files")
+        return 0
+    if args.json:
+        output.result({"indexed": stats.indexed, "unchanged": stats.unchanged, "removed": stats.removed, "db": str(db)})
         return 0
     print(f"ws: indexed {stats.indexed}, unchanged {stats.unchanged}, removed {stats.removed} ({db})")
     return 0
@@ -489,7 +499,6 @@ def register(sub) -> None:
     s = ms.add_parser("search", help="search memory and notes")
     s.add_argument("query", nargs="+")
     s.add_argument("--limit", type=int, default=10, metavar="N", help="most results (default 10)")
-    s.add_argument("--json", action="store_true", help="machine-readable results")
     s.set_defaults(func=cmd_search)
 
     r = ms.add_parser("reindex", help="update the search index (it is only a cache)")

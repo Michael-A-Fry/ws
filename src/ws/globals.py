@@ -16,12 +16,12 @@ import argparse
 import hashlib
 import json
 import os
-import sys
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ws import adapters
+from ws import adapters, output
+from ws.output import WsError
 
 OVERRIDES = Path(".ws") / "overrides.toml"
 MANIFEST_ENV = "WS_GLOBALS_MANIFEST"
@@ -412,16 +412,24 @@ def cmd_check(args: argparse.Namespace) -> int:
     start = Path(args.repo) if args.repo else Path.cwd()
     repo = find_repo(start) or start
     rep = check(repo, dict(os.environ), Path(args.manifest).expanduser() if args.manifest else None)
-    print(json.dumps(rep.as_dict(), indent=2) if args.json else render(rep))
-    return 1 if rep.status == "fail" or (args.strict and rep.status == "warn") else 0
+    bad = rep.status == "fail" or (args.strict and rep.status == "warn")
+    if args.json:
+        output.result(rep.as_dict(), status=output.ATTENTION if bad else output.OK)
+    else:
+        print(render(rep))
+    return 1 if bad else 0
 
 
 def cmd_manifest(args: argparse.Namespace) -> int:
     data = manifest(dict(os.environ), args.runner)
     if not data["runners"]:
-        print("ws: no globals found in any runner's user config", file=sys.stderr)
-        return 1
-    print(json.dumps(data, indent=2, sort_keys=True))
+        raise WsError(
+            "not_found", "no globals found in any runner's user config", "install a runner (`ws doctor` lists them)"
+        )
+    if args.json:
+        output.result(data)
+    else:
+        print(json.dumps(data, indent=2, sort_keys=True))
     return 0
 
 
@@ -432,7 +440,6 @@ def register(sub) -> None:
     c = gs.add_parser("check", help="fail on a repo copy of a global skill, agent, workflow or hook")
     c.add_argument("--repo", metavar="DIR", help="the repo to check (default: the current directory)")
     c.add_argument("--manifest", metavar="FILE", help="globals manifest, used when there is no user config")
-    c.add_argument("--json", action="store_true", help="machine-readable report")
     c.add_argument("--strict", action="store_true", help="also exit 1 when there was nothing to compare")
     c.set_defaults(func=cmd_check)
 

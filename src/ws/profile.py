@@ -8,7 +8,10 @@ import re
 import tomllib
 from pathlib import Path
 
-HEADER = "# ws profile. `ws init` writes [machine]; `ws doctor` checks every [roles.*] table.\n"
+HEADER = (
+    "# ws profile. `ws init` writes [machine]; `ws doctor` checks every [roles.*] table.\n"
+    "# ws rewrites this file when it changes it: comments are not kept.\n"
+)
 _BARE_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
@@ -30,7 +33,7 @@ def load(path: Path) -> dict | None:
     if not path.is_file():
         return None
     try:
-        return tomllib.loads(path.read_text())
+        return tomllib.loads(path.read_text(encoding="utf-8"))
     except (tomllib.TOMLDecodeError, UnicodeDecodeError) as e:
         raise ProfileError(f"{path}: {e}") from e
 
@@ -41,7 +44,7 @@ def _key(k: str) -> str:
 
 def _string(s: str) -> str:
     out = s.replace("\\", "\\\\").replace('"', '\\"')
-    out = "".join(c if c >= " " or c == "\t" else f"\\u{ord(c):04x}" for c in out)
+    out = "".join(c if (c >= " " and c != "\x7f") or c == "\t" else f"\\u{ord(c):04x}" for c in out)
     return f'"{out}"'
 
 
@@ -59,7 +62,7 @@ def _value(v) -> str:
 
 def dumps(data: dict) -> str:
     """Write a profile: top-level scalars first, then each table, nested tables as dotted headers."""
-    lines = [HEADER.rstrip("\n")]
+    lines = HEADER.rstrip("\n").split("\n")
 
     def table(prefix: list[str], d: dict) -> None:
         scalars = {k: v for k, v in d.items() if not isinstance(v, dict)}
@@ -79,10 +82,10 @@ def dumps(data: dict) -> str:
 def write_if_changed(path: Path, data: dict) -> bool:
     """Write the profile only if its content would change. True if the file was written."""
     text = dumps(data)
-    if path.is_file() and path.read_text() == text:
+    if path.is_file() and path.read_text(encoding="utf-8") == text:
         return False
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".toml.tmp")
-    tmp.write_text(text)
+    tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, path)
     return True

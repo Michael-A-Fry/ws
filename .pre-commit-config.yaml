@@ -18,6 +18,10 @@ repos:
     rev: v0.3.0
     hooks:
       - id: rumdl-check
+  - repo: https://github.com/Mateusz-Grzelinski/actionlint-py
+    rev: v1.7.12.24
+    hooks:
+      - id: actionlint
   - repo: local
     hooks:
       - id: pii-gate

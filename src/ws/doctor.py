@@ -175,7 +175,7 @@ def run_checks(osi: OSInfo, profile_file: Path, env: dict | None = None, network
         try:
             status, detail = r.check(cfg, osi, env, network)
         except Exception as e:  # noqa: BLE001 (a broken check must report, not crash the whole doctor)
-            status, detail = FAIL, f"check crashed: {type(e).__name__}: {e}"
+            status, detail = FAIL, f"check crashed ({type(e).__name__}); details withheld in case they hold a secret"
         checks.append(Check(r.id, r.name, status, detail, fix if status in BAD else ""))
     return checks
 

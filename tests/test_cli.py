@@ -140,7 +140,7 @@ def test_native_windows_fails_ws001_with_the_wsl_fix(tmp_path):
 def test_profile_writer_round_trips_awkward_strings():
     data = {
         "top": 1,
-        "machine": {"notes": 'C:\\Users\\a "b"\n\tc ✓', "stays_on": True, "cap": 2.5},
+        "machine": {"notes": 'C:\\Users\\a "b"\n\tc ✓\x7f', "stays_on": True, "cap": 2.5},
         "roles": {"notes": {"path": "~/N"}, "odd key": {"list": ["a", "b"]}},
     }
     assert tomllib.loads(dumps(data)) == data
@@ -171,6 +171,17 @@ class _Stub(BaseHTTPRequestHandler):
     seen: ClassVar[list] = []
 
     def do_GET(self):
+        if self.path.startswith("/elsewhere"):
+            _Stub.seen.append(("elsewhere", self.headers.get("x-api-key"), None))
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"data": []}')
+            return
+        if self.status in (301, 302, 307, 308):
+            self.send_response(self.status)
+            self.send_header("location", "/elsewhere")
+            self.end_headers()
+            return
         _Stub.seen.append((self.path, self.headers.get("x-api-key"), self.headers.get("anthropic-version")))
         self.send_response(self.status)
         self.send_header("content-type", "application/json")
@@ -240,3 +251,52 @@ def test_package_has_no_runtime_dependencies():
 def test_usage_never_sends_the_key_over_plain_http_off_localhost():
     status, detail = usage.check_anthropic(KEY, "http://usage.example.com")
     assert status == "fail" and "https" in detail
+
+
+def test_usage_key_with_a_newline_never_reaches_the_output(stub):
+    _, base = stub
+    _Stub.status, _Stub.body = 200, b'{"data": []}'
+    assert usage.check_anthropic(KEY + "\n", base)[0] == "ok"
+    status, detail = usage.check_anthropic(KEY[:20] + "\r\n" + KEY[20:], base)
+    assert status == "fail" and KEY[20:] not in detail
+
+
+def test_usage_does_not_follow_a_redirect_with_the_key(stub):
+    _, base = stub
+    _Stub.status = 307
+    status, detail = usage.check_anthropic(KEY, base)
+    assert status == "fail" and "redirect" in detail
+    assert all(where != "elsewhere" for where, *_ in _Stub.seen)
+
+
+def test_crashing_check_withholds_the_message(home, monkeypatch):
+    def boom(*a):
+        raise ValueError("secret-" + "value")
+
+    role = doctor.ROLES[0]
+    monkeypatch.setattr(doctor, "ROLES", (doctor.Role(role.id, role.name, role.what, role.example, boom),))
+    p = profile_path()
+    p.parent.mkdir(parents=True)
+    p.write_text('[roles.runner]\nadapter = "opencode"\n')
+    c = doctor.run_checks(linux(), p, env={})[-1]
+    assert c.status == "fail" and "secret-value" not in c.detail
+
+
+def test_init_keeps_extra_machine_keys_and_stores_an_absolute_notes_path(home, monkeypatch, capsys):
+    p = profile_path()
+    p.parent.mkdir(parents=True)
+    p.write_text('[machine]\nnickname = "desk"\n')
+    (home / "n").mkdir()
+    monkeypatch.chdir(home)
+    assert cli.main(["init", "--yes", "--notes", "n"]) == 0
+    prof = tomllib.loads(p.read_text())
+    assert prof["machine"]["nickname"] == "desk"
+    assert prof["machine"]["notes"] == str((home / "n").resolve())
+
+
+def test_init_reports_a_roles_notes_that_is_not_a_table(home, capsys):
+    p = profile_path()
+    p.parent.mkdir(parents=True)
+    p.write_text('[roles]\nnotes = "oops"\n')
+    assert cli.main(["init", "--yes", "--notes", str(home)]) == 1
+    assert "must be tables" in capsys.readouterr().err

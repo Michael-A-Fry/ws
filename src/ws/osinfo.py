@@ -24,7 +24,7 @@ class OSInfo:
 
 def _read(path: Path) -> str:
     try:
-        return path.read_text(errors="replace")
+        return path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return ""
 

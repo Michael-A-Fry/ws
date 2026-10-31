@@ -53,7 +53,11 @@ def cmd_init(args: argparse.Namespace) -> int:
     except ProfileError as e:
         print(f"ws: {e}", file=sys.stderr)
         return 1
-    machine = dict(prof.get("machine") or {})
+    machine = prof.get("machine") or {}
+    if not isinstance(machine, dict):
+        print(f"ws: {path}: [machine] must be a table", file=sys.stderr)
+        return 1
+    machine = dict(machine)
     interactive = not args.yes and sys.stdin.isatty()
     try:
         if args.stays_on is not None:
@@ -88,10 +92,20 @@ def cmd_init(args: argparse.Namespace) -> int:
             print(f"ws: {notes_dir} is not a folder (pass --create-notes to make it)", file=sys.stderr)
             return 1
         notes_dir.mkdir(parents=True, exist_ok=True)
-    prof["machine"] = {"os": osi.kind, "stays_on": stays_on, "server": server, "notes": notes}
+    if not notes.startswith("~"):
+        notes = str(notes_dir.resolve())  # the same folder whichever directory doctor runs from
+    machine.update({"os": osi.kind, "stays_on": stays_on, "server": server, "notes": notes})
+    prof["machine"] = machine
     roles = prof.setdefault("roles", {})
-    roles.setdefault("notes", {})["path"] = notes
-    changed = write_if_changed(path, prof)
+    if not isinstance(roles, dict) or not isinstance(roles.setdefault("notes", {}), dict):
+        print(f"ws: {path}: [roles] and [roles.notes] must be tables", file=sys.stderr)
+        return 1
+    roles["notes"]["path"] = notes
+    try:
+        changed = write_if_changed(path, prof)
+    except ProfileError as e:
+        print(f"ws: {e}", file=sys.stderr)
+        return 1
     print(f"ws: {'wrote' if changed else '0 changes to'} {path}")
     print("next: `ws doctor` lists what is still to set up")
     return 0

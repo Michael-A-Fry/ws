@@ -73,7 +73,7 @@ LICENSES/         third-party licence texts (see NOTICE)
 | `secrets.py` | The secrets registry and store, and `ws secret` |
 | `selfcmd.py` | How ws starts itself with this Python: `python -I -m ws`, so a folder named `ws/` in the working... |
 | `session.py` | `ws session`: tell a long-running session once when ws has been updated under it |
-| `setup_ui/` | `ws setup`: the first-run and re-run setup, inline in your terminal (default) or in a page in... |
+| `setup_ui/` | `ws setup`: the first-run and re-run setup, walked in your terminal (the default) or in a local... |
 | `skills/` | The skills ws ships (`align`, `checkpoint`, `taste-gate`, `dataviz`) and how they get onto a machine |
 | `status.py` | `ws status`: for each runner, every rules, skill, hook and MCP file it will load here, with... |
 | `testing/` | Test support that ships with ws: the mock model provider and its scenarios |

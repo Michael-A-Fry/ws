@@ -5,3 +5,5 @@ __pycache__/
 .rumdl_cache/
 *.egg-info/
 dist/
+# the Vale style package that `vale sync` downloads (.vale.ini)
+.github/vale/Microsoft/

@@ -40,5 +40,15 @@ jobs:
           SKIP: gitleaks # the step above scans the whole history, not just the tree
         with:
           prek-version: 0.5.7
+      - name: docs integrity (policy files, links, anchors, banned strings)
+        run: python3 scripts/check_docs_integrity.py --allow-missing scripts/docs_pending.txt
+      - name: Vale (Microsoft style, errors only) over the README, docs and policy files
+        run: |
+          v=3.25.1; sum=4bf5c5176b682b1da0830f471584d3494f1c2e27ee3029e1ad6f6661d4962182
+          curl -sSfL -o /tmp/vale.tgz "https://github.com/vale-cli/vale/releases/download/v$v/vale_${v}_Linux_64-bit.tar.gz"
+          echo "$sum  /tmp/vale.tgz" | sha256sum -c -
+          tar -xzf /tmp/vale.tgz -C /tmp vale
+          /tmp/vale sync
+          /tmp/vale README.md docs/ SECURITY.md SUPPORT.md CONTRIBUTING.md
       - name: tests
         run: uv run --locked pytest -q

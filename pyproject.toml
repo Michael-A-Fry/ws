@@ -1,0 +1,41 @@
+[project]
+name = "ws-aitoolkit"
+version = "0.0.1"
+description = "Your memory, skills and rules, in any AI."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+requires-python = ">=3.11"
+authors = [{ name = "Michael Fry" }]
+# The core has no runtime dependencies: stdlib only, so the install works the same on every OS.
+dependencies = []
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Environment :: Console",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+]
+
+[project.urls]
+Source = "https://github.com/Michael-A-Fry/ws"
+
+[project.scripts]
+ws = "ws.cli:main"
+
+[dependency-groups]
+dev = ["pytest==8.4.2"]
+
+[build-system]
+requires = ["uv_build>=0.13,<0.14"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "ws"
+
+[tool.uv]
+# Hold new upstream releases for a week before they can enter the lock.
+exclude-newer = "7 days"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

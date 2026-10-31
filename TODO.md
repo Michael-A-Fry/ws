@@ -43,7 +43,7 @@
 - [x] Pass tests in CI (`cli.yml`): `gate e2e` (denied command blocked on Claude Code and OpenCode, stub model),
   `run record e2e` (record complete against the schema, both runners), `secret wall` (no secret readable by `ws-dev`)
 - [ ] Secrets wall on Michael's machine: at the phase 6 cut-over (`ws secret wall`, one sudo script, re-paste keys)
-- [ ] Trust on first use of the root-owned /opt/ws copy: closes at phase T (install from the signed tag)
+- [x] Trust on first use of the root-owned /opt/ws copy: closed at phase T (installs come from the signed tag)
 - [ ] Sandbox as the real wall behind the command matcher (phase 4); bound single-use approvals (phase 4)
 - [x] WS110 usage: off (Michael: "leave it off"); `adapter = "none"`, spend comes from `runs.jsonl`
 - [x] CLA signed by Michael (`license/cla` passes on PR #6)
@@ -82,8 +82,8 @@
 - [x] Eval engine: task format, graders in the wall with a nonce, 10 metrics, McNemar per task, harvest (PR #22)
 - [x] Matrix: timed install -> first task -> return on ubuntu, macOS and WSL2; credential-free smoke on 4 cells;
   `lab.yml` with a JIT-registered ephemeral runner (PR #24); fork-PR runs need approval for all outside contributors
-- [ ] **Lab cell (pass test):** needs the lab VM (Michael's call: Proxmox access or a new VM), then one green
-  `lab.yml` run from a dispatch; `scripts/lab-host-cycle.sh` has not run on a real host
+- [x] **Lab cell (pass test):** VM 470 ws-lab (firewalled, snapshot reset, JIT runner): lab.yml run 41235914165 green
+  (57 s); the host cycle ran by hand from the ws VM, a timer is phase 6
 - [ ] Known limit: a repo the session makes with `git init`, submodules added mid-session and `sub/.claude` config
   are reported after the run (logs/wall-report.jsonl), not blocked
 - [ ] Known limit: `/proc/PID/mem` of the runner is readable inside the wall at ptrace_scope 0 for a runner without
@@ -111,8 +111,8 @@
   pre-push hook, issue forms; private vulnerability reporting on
 - [x] Write-up 1 (`docs/explanation/write-up-1.md`)
 - [x] Restore drill 2 against the restic adapter: pass (AI_Workspace docs/plan/restore-drill-2026-11-01-restic.md)
-- [ ] Exit-arm run: OpenCode + a non-Claude model on `ws eval run --set starter` (waits on the key paste)
-- [ ] PyPI trusted publisher for `ws-aitoolkit` (Michael's login); until then the GitHub release is the install route
+- [x] Exit-arm run: qwen3-coder through OpenCode, 5 of 8 on the starter set, about US$0.04
+- [x] PyPI trusted publisher for `ws-aitoolkit`: release 0.1.1 published through it
 - [x] Triage labels (needs-repro, duplicate, out-of-scope, accepted) as GitHub labels
-- [ ] Pass test: fresh install from the tag on CI (3 OS) and lab, twice, each followed by `scripts/e2e_first_task.sh`
-- [ ] Tag `v0.1.1` (0.1.0 was published, then withdrawn and deleted on GitHub and PyPI: DECISIONS 190)
+- [x] Pass test: v0.1.1 installed twice per cell, each with e2e: CI runs 41245122690 (6/6), lab 41245897083
+- [x] Tag `v0.1.1` (0.1.0 was published, then withdrawn and deleted on GitHub and PyPI: DECISIONS 190)

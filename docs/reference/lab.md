@@ -3,18 +3,18 @@
 The lab cell is one more place the same timed run happens: install ws, set it up, run a first task against the mock
 model, rate it, uninstall, check nothing is left behind (`scripts/e2e_first_task.sh`). The other cells (Linux, macOS,
 Windows via WSL2) run on GitHub's hosted runners in `.github/workflows/cli.yml`. The lab cell runs on a virtual machine
-in the lab (Proxmox), through `.github/workflows/lab.yml`, so a release is also timed on a machine that is not a
-disposable cloud image. It is Tier 1 of the test plan (ADR 0011).
+in the lab (Proxmox), through `.github/workflows/lab.yml`, so a release is also timed on a machine that's not a
+disposable cloud image. It's Tier 1 of the test plan (ADR 0011).
 
 ## What protects the runner
 
 Leaving `pull_request` out of `lab.yml` protects nothing by itself. On a public repository a fork's pull request can add
 its own workflow file with `runs-on: [self-hosted, ws-lab]`, and that file is the one that runs. A self-hosted runner
-runs whatever job it is handed, so the protection is a stack, and each layer is there because the one above can fail:
+runs whatever job it's handed, so the protection is a stack, and each layer is there because the one above can fail:
 
 1. **Outside contributors' workflow runs need approval.** The repository requires a maintainer's approval before any
    workflow runs for a pull request from an outside collaborator, first-timer or not. This is a repository setting and
-   it is not in git; the repository owner sets it once (`gh` needs an admin token):
+   it's not in git; the repository owner sets it once (`gh` needs an admin token):
 
    ```sh
    gh api -X PUT repos/Michael-A-Fry/ws/actions/permissions/fork-pr-contributor-approval \
@@ -28,15 +28,15 @@ runs whatever job it is handed, so the protection is a stack, and each layer is 
    `Michael-A-Fry/ws`, the actor is the repository owner, and the event is a release tag or a dispatch. That step is a
    last check in the job, not a wall: a fork's own workflow would simply not contain it.
 3. **The runner holds one job and the VM is thrown away after it.** The runner is a single-use (just-in-time)
-   registration, and the host resets the VM from a clean snapshot after every job. A job that is somehow run on it
+   registration, and the host resets the VM from a clean snapshot after every job. A job that's somehow run on it
    (an approved fork run, say) finds a machine with no secrets, no token, no ws and no history, and leaves nothing
    behind for the next job.
 4. **The VM holds no repository credential.** Only the one-time runner configuration (below) goes in. There is no
    admin token, no deploy key and no provider key on it, and the job's token is read-only (`contents: read`).
 
-The risk that is left: a maintainer approves a fork's workflow run (layer 1) without reading the workflow file. That
+The risk that's left: a maintainer approves a fork's workflow run (layer 1) without reading the workflow file. That
 run gets one job on a disposable VM on the lab network, with outbound network access. So: read the workflow file of any
-fork pull request before approving it, and keep the VM on a network segment that cannot reach anything else in the
+fork pull request before approving it, and keep the VM on a network segment that can't reach anything else in the
 lab. Layer 1 is the one setting that has to be on; check it before relying on the lab cell.
 
 ## How the VM is reset and registered
@@ -56,14 +56,14 @@ Each job starts from a clean machine, and the host, not the workflow and not the
 The token that step 3 needs is a fine-grained personal access token for this one repository, with the Administration
 permission set to write and nothing else. It lives on the host only, in a file (mode 0600) whose path is given as
 `--token-file`. The VM never sees it, and the configuration goes in on the standard input of `qm guest exec --pass-stdin`
-(Proxmox VE 8 or newer), so it is not on the host's command line either. Run a cycle when a `lab` run is queued,
+(Proxmox VE 8 or newer), so it's not on the host's command line either. Run a cycle when a `lab` run is queued,
 from a timer on the host or by hand:
 
 ```sh
 scripts/lab-host-cycle.sh --token-file /path/to/token --vm-id VMID --node NODE --snapshot SNAPSHOT
 ```
 
-The script has not been run against a real host yet (CI cannot reach one); try it once by hand and read its output
+The script hasn't been run against a real host yet (CI can't reach one); try it once by hand and read its output
 before putting it on a timer.
 
 What the VM image needs, all in the snapshot taken before any registration:
@@ -73,7 +73,7 @@ What the VM image needs, all in the snapshot taken before any registration:
   outbound HTTPS to GitHub, PyPI and npm. The runner user has no sudo. No provider key is on the machine: the run uses
   the mock provider.
 - The QEMU guest agent, and the GitHub Actions runner package unpacked in the runner user's folder (get it from the
-  repository's Settings, Actions, Runners, "New self-hosted runner" page). It is not registered: no `config.sh`.
+  repository's Settings, Actions, Runners, "New self-hosted runner" page). It's not registered: no `config.sh`.
 - A folder `/etc/ws-lab` owned by the runner user (mode 0700), and a service that starts the runner when the
   configuration arrives, for example `ws-lab-runner.path` watching `/etc/ws-lab/jitconfig` and
   `ws-lab-runner.service`:
@@ -88,9 +88,9 @@ What the VM image needs, all in the snapshot taken before any registration:
 
 ## Until a runner exists
 
-Until a cycle has registered a runner with the label `ws-lab`, a `lab` run does not fail: the job waits in the queue
-("Waiting for a runner") and GitHub cancels it after 24 hours. A release tag therefore does not turn red for want of a
-lab. Cancel a queued run by hand if you do not want it hanging around.
+Until a cycle has registered a runner with the label `ws-lab`, a `lab` run doesn't fail: the job waits in the queue
+("Waiting for a runner") and GitHub cancels it after 24 hours. A release tag therefore doesn't turn red for want of a
+lab. Cancel a queued run by hand if you don't want it hanging around.
 
 ## Running it by hand
 
@@ -101,10 +101,10 @@ gh workflow run lab.yml --ref main
 Then start a cycle on the host. The result is a job summary line and an `e2e-timing-lab` artifact holding
 `e2e-timing.json`: every step's seconds and exit code, the total, the run id and the run's own duration.
 
-## What the run proves and does not prove
+## What the run proves and doesn't prove
 
 It runs the real `ws broker serve`, started the way a person's service would be, on the default socket, and the real
 `ws run`, `ws setup`, `ws rate` and `ws uninstall`, against a mock provider that serves https on 127.0.0.1 with a
 throw-away certificate. The broker is told to trust that certificate with `SSL_CERT_FILE`, so the broker's TLS
-relay is exercised. It does not prove the real provider's certificate chain or hostnames, the secret wall (a separate
+relay is exercised. It doesn't prove the real provider's certificate chain or hostnames, the secret wall (a separate
 system user holding the store; the broker here runs as the person), or anything about a real model's answers.

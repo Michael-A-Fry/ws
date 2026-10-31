@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # One lab cycle, run on the Proxmox HOST (never inside the VM): reset the VM from its clean snapshot, start it, give the
-# runner in it a single-use registration, wait for its one job to finish, stop the VM. See docs/lab.md.
+# runner in it a single-use registration, wait for its one job to finish, stop the VM. See docs/reference/lab.md.
 #
 #   lab-host-cycle.sh --token-file FILE --vm-id ID --node NODE --snapshot NAME [--repo OWNER/REPO] [--timeout SECONDS]
 #
@@ -13,7 +13,7 @@
 # The configuration reaches the VM on the standard input of `qm guest exec --pass-stdin` (Proxmox VE 8 or newer), so it
 # is never on the host's command line where `ps` could show it.
 #
-# Needs on the host: qm, curl, python3. In the VM: the guest agent, and the runner service of docs/lab.md, which
+# Needs on the host: qm, curl, python3. In the VM: the guest agent, and the runner service of docs/reference/lab.md, which
 # starts `./run.sh --jitconfig` when /etc/ws-lab/jitconfig appears. Not run by CI; run it from a systemd timer or by hand.
 # ID and NODE are Proxmox's own VM id and node name; nothing here is a hostname or an address.
 #

@@ -1,4 +1,4 @@
-# ws eval: your own eval
+# ws eval: Your own eval
 
 `ws eval` tells you whether a change to your setup (a model, a skill, a rule, a job) helps on tasks that look like your
 own work. It ships the engine, the file format, ten metrics and eight synthetic starter tasks. Your own tasks come from
@@ -49,22 +49,22 @@ Graders (all must pass; up to five per task):
 | `regex` | `path`, `pattern` (up to 500 characters), `ignore_case`, `negate` | the pattern matches in the file (multi-line) |
 | `rubric` | `rubric` | never yet: a model-judged grader is accepted in the file but refused at run time |
 
-Files are read only if they are regular files (no pipe, device or socket), and at most 1 MiB of each is read.
+Files are read only if they're regular files (no pipe, device or socket), and at most 1 MiB of each is read.
 
-A rubric task runs only if the profile names a judge model (`[eval] judge_model`), and the judge call is not built yet,
+A rubric task runs only if the profile names a judge model (`[eval] judge_model`), and the judge call isn't built yet,
 so for now a task with a rubric grader is skipped. Use a deterministic grader. A trial passes only if the run finished
 `ok` and every grader passed.
 
 ### Command graders run the agent's code, so they run in the wall
 
 A `command` grader usually imports or runs what the agent wrote. It runs inside ws's own sandbox (`ws.sandbox`): the
-whole disk read-only, the trial folder included, Unix sockets shut. The wall does not close the network. With no sandbox
+whole disk read-only, the trial folder included, Unix sockets shut. The wall doesn't close the network. With no sandbox
 on the machine (no bubblewrap on Linux) `ws eval run` refuses a set that has a command grader, with the install hint;
-there is no unsandboxed fallback, and `--dry-run` shows "would be refused". Tasks with only file graders need no sandbox.
+there is no unsandboxed fallback, and `--dry-run` shows "would be refused." Tasks with only file graders need no sandbox.
 
 An exit code alone proves nothing, because agent code can end the checker early (`os._exit(0)`). So ws sends each
 trial a random nonce on the command's stdin, and the grade needs the command to exit 0 AND print that nonce as a line.
-Write the checker like this, as a hidden file, and run it with `python -I` so the agent cannot shadow the modules it
+Write the checker like this, as a hidden file, and run it with `python -I` so the agent can't shadow the modules it
 imports:
 
 ```toml
@@ -95,23 +95,23 @@ command = "{python} -I check.py"
 
 The child has no stdin and no environment variable with the nonce, so it never sees it. The nonce does sit in the
 checker's memory, and inside the wall a child could read `/proc/<parent>/mem` (the wall's seccomp filter allows `ptrace`
-and `process_vm_readv`, and `ptrace_scope` is often 0). That is why the checker first makes itself non-dumpable
-(`PR_SET_DUMPABLE`, or `PT_DENY_ATTACH` on macOS) and exits 97 if it cannot, which ws reports as "could not make its
-memory unreadable" and fails the grade (a platform with neither call fails closed). A test checks that a child cannot
+and `process_vm_readv`, and `ptrace_scope` is often 0). That's why the checker first makes itself non-dumpable
+(`PR_SET_DUMPABLE`, or `PT_DENY_ATTACH` on macOS) and exits 97 if it can't, which ws reports as "couldn't make its
+memory unreadable" and fails the grade (a platform with neither call fails closed). A test checks that a child can't
 read the nonce on Linux. A checker that prints the nonce before it has checked anything defeats the scheme. The starter
 tasks that use a command grader follow this pattern (see `CHECK_PRELUDE` in `src/ws/eval.py`).
 
-Regex graders run the match in a child Python with a 5 s limit and kill it on overrun (a thread cannot be stopped and `re`
-cannot be interrupted, so a pattern like `(a+)+$` would otherwise hang ws).
+Regex graders run the match in a child Python with a 5 s limit and kill it on overrun (a thread can't be stopped and `re`
+can't be interrupted, so a pattern like `(a+)+$` would otherwise hang ws).
 
 Known limits of the grader's wall:
 
-- It has the same network and read access as the runner's wall (it is the same `ws.sandbox` wall), so it gives the agent's
-  code nothing it did not already have in the trial; it does not close the network.
-- `$WS_HOME/approvals/pending` and `$WS_HOME/sessions` stay writable inside it. That is by design and harmless: a forged
+- It has the same network and read access as the runner's wall (it's the same `ws.sandbox` wall), so it gives the agent's
+  code nothing it didn't already have in the trial; it doesn't close the network.
+- `$WS_HOME/approvals/pending` and `$WS_HOME/sessions` stay writable inside it. That's by design and harmless: a forged
   pending record grants nothing (see `ws.approvals`).
-- A grader run as root gets no nonce protection (root has CAP_SYS_PTRACE, which `PR_SET_DUMPABLE` does not stop), so
-  do not run evals as root.
+- A grader run as root gets no nonce protection (root has CAP_SYS_PTRACE, which `PR_SET_DUMPABLE` doesn't stop), so
+  don't run evals as root.
 
 ## Run
 
@@ -142,11 +142,11 @@ Ten metrics. One with no data says `not measured` and why; nothing is filled in.
 2. pass^k: the chance that k trials of a task all pass (k defaults to the fewest trials any task has, at most 5).
 3. Harm per 100 runs: refused runs and Rule of Two refusals. Reported alone, never averaged into another score.
 4. Rework within 14 days: for tasks that name a `repo` (and optionally `files`), the share of solved trials followed by
-   a `fix`, `fixup!` or `Revert` commit on those files within 14 days. Trials under 14 days old are not judged yet.
+   a `fix`, `fixup!` or `Revert` commit on those files within 14 days. Trials under 14 days old aren't judged yet.
 5. Tokens per solved task: all tokens of all trials with counts, over the trials solved (failures cost too), by type.
 6. Cost per solved task: `runrecord.record_cost`. ws has no price table; a trial with no reported cost counts at your
    `[roles.budget]` fallback and the report says how many did.
-7. Time per solved task, p50 and p90. Time to first output is not in the run record, so it reads `not measured`.
+7. Time per solved task, p50 and p90. Time to first output isn't in the run record, so it reads `not measured`.
 8. Attention minutes and interventions: ws records neither for headless runs, so `not measured`.
 9. Quality flag: thumbs-down share of the trials you rated with `ws rate`.
 10. Maintenance minutes: commits with a `maintenance` subject in the repos your tasks name; minutes are counted only
@@ -159,17 +159,17 @@ ws eval compare base tighter [--look 1|2]
 ```
 
 Pairs at task level and runs an exact two-sided McNemar test on the tasks where the arms differ. Trials of one task
-share a prompt and a grader, so they are not independent draws; counting them as pairs would overstate the evidence. For
+share a prompt and a grader, so they're not independent draws; counting them as pairs would overstate the evidence. For
 each arm and task, a task passes when more than half of its trials do (a tie, like 1 of 2, fails). Only results from the
 job each arm ran last (its name and the hash of its file and prompt), and from the version of the task (its hash) it
 ran last, are used, and a task whose text differs
-between the two arms is not paired; the output says how many results were left out. It prints the tasks and the trials
+between the two arms isn't paired; the output says how many results were left out. It prints the tasks and the trials
 behind them side by side. If the two arms ran different numbers of trials of a task, the comparison is refused (and uses
 no look): run both arms with the same `--trials`.
 
 A win needs 6 of 6, 8 of 9, 9 of 10 or 10 of 12 discordant tasks. A gap under 3 points is noise. The rule is success
-first, then a quality veto (the arm with the worse thumbs-down rate by 3 points or more cannot win, but only once each
-arm has at least 5 ratings; otherwise it says "too few ratings" and does not veto), then tokens per solved task among
+first, then a quality veto (the arm with the worse thumbs-down rate by 3 points or more can't win, but only once each
+arm has at least 5 ratings; otherwise it says "too few ratings" and doesn't veto), then tokens per solved task among
 equals. If the baseline already passes more than 85%, fix the task set first.
 
 Each pair of arms gets two looks (kept in `looks.jsonl` under the two names as a JSON array). The first two `compare`
@@ -187,10 +187,10 @@ ws eval reject ID       # sets it aside; harvest will not offer it again
 
 Harvest looks at your runs in the window and proposes one task per job from its most recent run that failed, timed out,
 was rated down, or was an `ok` run that followed a failure of the same job within a day (a retry). Refused runs and eval
-trials are not used. Each proposal is written to `$WS_HOME/eval/proposed/<id>.toml` with `approved = false`,
-`review_required = true`, `source_run`, `source_job`, a placeholder rubric grader (so it cannot run until you give it a
-real grader), and the job's prompt. A run record does not keep its prompt, so the prompt comes from the job file as it is
-now, which may differ from what the run used; `prompt_source` says so. A malformed run id or a proposal that is not a
+trials aren't used. Each proposal is written to `$WS_HOME/eval/proposed/<id>.toml` with `approved = false`,
+`review_required = true`, `source_run`, `source_job`, a placeholder rubric grader (so it can't run until you give it a
+real grader), and the job's prompt. A run record doesn't keep its prompt, so the prompt comes from the job file as it's
+now, which may differ from what the run used; `prompt_source` says so. A malformed run id or a proposal that's not a
 valid task stops the harvest with an error, and the proposals are written all or none.
 
 `ws eval approve ID` shows the prompt and asks you in the terminal; `--yes` skips the question for scripts (with `--json`

@@ -881,7 +881,7 @@ def grade_in_wall(folder, task) -> bool:
 @pytest.mark.skipif(not Path("/proc/self/mem").exists(), reason="needs /proc")
 @pytest.mark.skipif(
     os.geteuid() == 0,
-    reason="root has CAP_SYS_PTRACE, so PR_SET_DUMPABLE does not stop it reading the checker (docs/eval.md known limits)",
+    reason="root has CAP_SYS_PTRACE, so PR_SET_DUMPABLE does not stop it reading the checker (docs/reference/eval.md known limits)",
 )
 def test_a_child_of_the_checker_cannot_read_the_nonce_from_its_memory(real_wall, tmp_path):
     unprotected = ws_eval.CHECK_PRELUDE.replace("\nprotect()\n", "\n")

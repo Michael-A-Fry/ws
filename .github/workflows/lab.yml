@@ -15,6 +15,11 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Also install this release twice from GitHub (vX.Y.Z); empty = the checkout run only"
+        required: false
+        type: string
 permissions:
   contents: read
 concurrency:
@@ -70,9 +75,23 @@ jobs:
           WS_E2E_CELL: lab
           WS_E2E_OUT: ${{ github.workspace }}/e2e-timing.json
         run: bash scripts/e2e_first_task.sh
+      # The pass test of a release: install.sh with no --from, twice, each followed by the first task. On a tag push it
+      # installs that tag; by hand, the tag given.
+      - name: install the release twice, each followed by the first task
+        if: github.event_name == 'push' || inputs.tag != ''
+        env:
+          WS_E2E_INSTALL: release
+          WS_E2E_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+          WS_E2E_EXPECT: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+        run: |
+          for r in 1 2; do
+            WS_E2E_CELL="lab-release-$r" WS_E2E_OUT="$GITHUB_WORKSPACE/e2e-timing-release-$r.json" bash scripts/e2e_first_task.sh
+          done
       - if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-timing-lab
-          path: e2e-timing.json
+          path: |
+            e2e-timing.json
+            e2e-timing-release-*.json
           if-no-files-found: warn

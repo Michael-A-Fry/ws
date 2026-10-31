@@ -98,3 +98,21 @@
 - [ ] P3: `PYTHONPYCACHEPREFIX` is set in the OpenCode wall only, so `.pyc` files crowd the Claude Code report
 - [ ] P3: a `.git/hooks` folder with many files is not counted against the report's scan budget
 - [ ] Not built: the rubric (model-judged) grader; time to first output and attention minutes need run-record fields
+
+## Phase T (v0.1 thin tag)
+
+- [x] Release workflow on `v*` tags: sdist + wheel, `.sha256` per asset, CycloneDX SBOM, build provenance, cosign
+  keyless bundles, one immutable release, PyPI by trusted publishing; tag must equal the pyproject version and the
+  run's commit; Opus cold review, 8 findings fixed
+- [x] `ws version [--json]` (commit, dirty, build date, install source) with a CI check against the checkout's HEAD
+- [x] `install.sh` installs the latest release's wheel after its SHA-256 (and cosign 3+ when installed) verifies
+- [x] Docs to #158: README in claw's order, Diátaxis tree (30 pages), a page and a how-to per safety rule, known limits,
+  SECURITY/SUPPORT/CONTRIBUTING/CHANGELOG, Vale (Microsoft) and the docs-integrity check in `ci`, PR template,
+  pre-push hook, issue forms; private vulnerability reporting on
+- [x] Write-up 1 (`docs/explanation/write-up-1.md`)
+- [x] Restore drill 2 against the restic adapter: pass (AI_Workspace docs/plan/restore-drill-2026-11-01-restic.md)
+- [ ] Exit-arm run: OpenCode + a non-Claude model on `ws eval run --set starter` (waits on the key paste)
+- [ ] PyPI trusted publisher for `ws-aitoolkit` (Michael's login); until then the GitHub release is the install route
+- [ ] Triage labels (needs-repro, duplicate, out-of-scope, accepted) as GitHub labels
+- [ ] Pass test: fresh install from the tag on CI (3 OS) and lab, twice, each followed by `scripts/e2e_first_task.sh`
+- [ ] Tag `v0.1.0` after Michael's go on the release notes (CHANGELOG date set first: the workflow refuses "unreleased")

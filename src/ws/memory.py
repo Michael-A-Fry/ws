@@ -103,7 +103,7 @@ def add(
     root = role_path("memory", env)
     if not is_repo(root):
         raise WsError(f"{root} is not a git repo (run `ws memory init`)")
-    now = (now or datetime.now()).astimezone()
+    now = now if now is not None and now.tzinfo is not None else (now or datetime.now()).astimezone()
     meta: dict = {"id": str(uuid.uuid4()), "created": now.replace(microsecond=0), "kind": kind}
     if title and title.strip():
         meta["title"] = title.strip()

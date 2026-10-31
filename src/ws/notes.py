@@ -85,7 +85,7 @@ def capture(
         raise WsError("nothing to note: the text is empty")
     if not root.is_dir():
         raise WsError(f"{root} is not a folder (run `ws init --create-notes`)")
-    now = (now or datetime.now()).astimezone()
+    now = now if now is not None and now.tzinfo is not None else (now or datetime.now()).astimezone()
     meta: dict = {"id": str(uuid.uuid4()), "created": now.replace(microsecond=0), "type": "note"}
     if title and title.strip():
         meta["title"] = title.strip()

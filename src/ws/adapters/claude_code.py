@@ -5,6 +5,20 @@ other hook failure is non-blocking in Claude Code).
 
 Also denied: Edit/Write of the policy file and of the generated folder, so a session cannot loosen its own gate.
 
+The third layer is Claude Code's own `sandbox` block (the wall; documented keys only, checked on 2.1.308), which
+confines every shell command Claude runs, whatever program it starts:
+  * `enabled` with `failIfUnavailable`: if the sandbox cannot start (no bubblewrap or socat), Claude Code refuses to
+    start, instead of running commands unsandboxed. Fail closed, as the hook is.
+  * `allowUnsandboxedCommands: false`: the model's `dangerouslyDisableSandbox` retry is ignored, so a command the
+    sandbox stops cannot be re-run outside it. Nothing is "approved" past the wall: what must leave it, a person runs.
+  * `filesystem.denyWrite`: `$WS_HOME` (the folder the policy sits in) and every protected path. It beats any allowWrite
+    a project adds, so a project's own settings cannot reopen it.
+  * `filesystem.denyRead`: the deny_read rules that name a folder or file (ws.policy.sandbox_read_paths).
+  * `network.allowedDomains`: the policy's allow_hosts, only when the policy names some. Without them the sandbox
+    asks (interactive) or refuses (`-p`) for a host it has not been told about.
+The sandbox covers shell commands; Claude's own Read, Edit and Write tools are covered by the permission rules above and
+the hook, not by it. `env` carries WS_GATED_SESSION so `ws approve` knows it is being run from a gated session.
+
 Pass the file with `claude --settings OUT/settings.json`. Nothing here touches ~/.claude.
 """
 
@@ -18,7 +32,8 @@ from pathlib import Path
 
 from ws import jobs
 from ws.adapters import Call, check_argv, protected_paths
-from ws.policy import Policy, native_patterns
+from ws.approvals import ENV_MARKER
+from ws.policy import Policy, native_patterns, sandbox_read_paths
 
 NAME = "claude-code"
 FILE = "settings.json"
@@ -53,6 +68,23 @@ def _path(path: str) -> str:
     return f"/{path}" if path.startswith("/") else path
 
 
+def sandbox_block(policy: Policy, out: Path, policy_file: Path) -> dict:
+    """The `sandbox` settings: see the module docstring for what each key is for."""
+    home = str(Path(policy_file).parent)
+    fs: dict = {"denyWrite": list(dict.fromkeys([home, *protected_paths(out, policy_file)]))}
+    if policy.gate.deny_read:
+        fs["denyRead"] = sandbox_read_paths(policy)
+    block: dict = {
+        "enabled": True,
+        "failIfUnavailable": True,
+        "allowUnsandboxedCommands": False,
+        "filesystem": fs,
+    }
+    if policy.gate.allow_hosts:
+        block["network"] = {"allowedDomains": list(policy.gate.allow_hosts)}
+    return block
+
+
 def generate(policy: Policy, ws_cmd: list[str], out: Path, policy_file: Path) -> dict[str, str]:
     deny = [f"Bash({p})" for p in native_patterns(policy)]
     deny += [f"Read({_path(p)})" for p in policy.gate.deny_read]
@@ -62,6 +94,8 @@ def generate(policy: Policy, ws_cmd: list[str], out: Path, policy_file: Path) ->
     hook = shlex.join(check_argv(ws_cmd, NAME, policy_file, out)) + " || exit 2"
     settings = {
         "permissions": {"deny": list(dict.fromkeys(deny))},
+        "sandbox": sandbox_block(policy, out, policy_file),
+        "env": {ENV_MARKER: "1"},
         "hooks": {"PreToolUse": [{"matcher": MATCHER, "hooks": [{"type": "command", "command": hook}]}]},
     }
     settings["hooks"].update(session_hooks(ws_cmd))

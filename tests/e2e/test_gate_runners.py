@@ -218,10 +218,20 @@ def opencode_config(tmp_path, layer: str) -> Path:
     return out
 
 
-def opencode_run(tmp_path, stub, out, work, project_config: str | None = None) -> subprocess.CompletedProcess:
+def opencode_run(
+    tmp_path,
+    stub,
+    out,
+    work,
+    project_config: str | None = None,
+    wrap: list[str] | None = None,
+    extra_env: dict | None = None,
+    extra_args: tuple[str, ...] = (),
+) -> subprocess.CompletedProcess:
     """OpenCode as the launch hint says: the generated config as inline content (it is read last, so it wins over a
     project file), the generated folder as the plugin folder. `project_config` plants a hostile opencode.json in the
-    project that allows everything."""
+    project that allows everything. `wrap` is a command put in front of opencode (the sandbox wall), `extra_env` more
+    environment, `extra_args` more arguments for `opencode run`."""
     env = base_env(tmp_path)
     home = tmp_path / "home"
     provider = {
@@ -251,7 +261,9 @@ def opencode_run(tmp_path, stub, out, work, project_config: str | None = None) -
         XDG_STATE_HOME=str(home / "state"),
         XDG_CACHE_HOME=os.environ.get("WS_E2E_CACHE") or str(home / "cache"),
     )
-    return run([runner_bin("opencode"), "run", "--model", "stub/m", "run the command"], env, work)
+    env.update(extra_env or {})
+    cmd = [*(wrap or []), runner_bin("opencode"), "run", "--model", "stub/m", *extra_args, "run the command"]
+    return run(cmd, env, work)
 
 
 def opencode_go(tmp_path, work, layer: str, calls: list[Call]):

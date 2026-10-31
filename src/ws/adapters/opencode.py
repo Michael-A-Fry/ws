@@ -11,6 +11,10 @@ files, so it wins.
     OPENCODE_CONFIG_CONTENT="$(cat OUT/opencode.json)"  OPENCODE_CONFIG_DIR=OUT  opencode
 
 OPENCODE_CONFIG_DIR is searched for `plugins/`, which is where the shim sits.
+
+The wall is `ws gate launch --runner opencode -- opencode ...` (ws.sandbox: bubblewrap on Linux, sandbox-exec on macOS),
+because OpenCode has no sandbox of its own. The launch hint says so, and launch puts WS_GATED_SESSION in the
+environment so `ws approve` knows it is being run from a gated session.
 """
 
 from __future__ import annotations
@@ -29,6 +33,10 @@ NAME = "opencode"
 CONFIG = "opencode.json"
 PLUGIN = "plugins/ws-gate.js"
 _TOOLS = {"web_fetch": "webfetch", "web_search": "websearch"}
+# For ws.sandbox: the env var that names the generated folder, and the files in it the wall locks read-only (the
+# runner writes its own package files there, so the rest of the folder stays writable).
+CONFIG_DIR_ENV = "OPENCODE_CONFIG_DIR"
+WALL_PROTECT = (CONFIG, "plugins")
 _NEUTRAL = {v: k for k, v in _TOOLS.items()}
 
 # Where this runner keeps what ws installs globally, and where a repo may shadow it (read by ws.globals).
@@ -121,7 +129,10 @@ def _text(d: dict, key: str) -> str:
 
 def launch_hint(out: str) -> str:
     q = shlex.quote(out)
-    return f'start OpenCode with: OPENCODE_CONFIG_CONTENT="$(cat {q}/{CONFIG})" OPENCODE_CONFIG_DIR={q} opencode'
+    return (
+        f'start OpenCode with: OPENCODE_CONFIG_CONTENT="$(cat {q}/{CONFIG})" OPENCODE_CONFIG_DIR={q} '
+        "ws gate launch --runner opencode -- opencode"
+    )
 
 
 # --- ws run: the command line, and the event stream read back as a run record --------------------------------------

@@ -9,6 +9,7 @@ from pathlib import Path
 
 from ws import (
     __version__,
+    approvals,
     broker,
     canary,
     devices,
@@ -166,6 +167,7 @@ def build_parser() -> argparse.ArgumentParser:
     canary.register(sub)
     rating.register(sub)
     roles.register(sub)
+    approvals.register(sub)
     return p
 
 

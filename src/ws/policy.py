@@ -9,14 +9,26 @@ Stdlib only. Three jobs:
     retries, not every spelling a shell allows;
   * `rule_of_two`: refuse a session that holds untrusted input, private data and a way out at the same time.
 
-Known limits. The matcher reads command text, so it cannot see:
+Known limits of the matcher. It reads command text, so it cannot see:
   * what an interpreter does inside its own program (`python3 -c`, `perl -e`, `node -e`, a script it runs);
   * a script that is downloaded and run in two steps (`curl -o a.sh ... && bash a.sh`);
   * a path built by a command (`cat "$(echo ~)/.ssh/id_rsa"`), or by a variable set outside the command line;
   * the version-control tool restoring a protected tracked file (`git -C ~/.ws checkout policy.toml`);
   * OpenCode's `patch` tool, which carries no single file path (its native `edit` rules still apply).
-These stay allowed here. The runner's own deny rules are the first layer; a sandbox (the planned wall) is what
-closes the rest.
+These stay allowed by the matcher. What closes them is the sandbox (ws.sandbox, and the `sandbox` block the
+claude-code adapter writes), which acts on what a process does, not on what its command line says:
+  * closed, for a shell command, the first four lines above: a write to ws's own files (`$WS_HOME`, the policy, the
+    generated folder) fails read-only whatever program makes it, and a read under a deny_read rule finds an empty folder
+    or file. The tested cases are in tests/e2e/test_sandbox.py, on both runners, Linux only (bubblewrap). macOS gets a
+    generated sandbox-exec profile, which CI does not run.
+  * still open: a `deny_commands` rule is not enforced inside an interpreter (`python3 -c 'os.system("git push -f")'`
+    pushes; only the sandbox's file rules apply to it). Reading is denied only for deny_read paths that exist when the
+    runner starts and have no wildcard below their first folder. OpenCode's `patch` tool is not a shell command, so it
+    is not sandboxed: its native `edit` rules are all that stop it. A runner started without the wrapper
+    (`ws gate launch --no-sandbox`) has no wall at all, and the command says so.
+  * `allow_hosts` limits the network on Claude Code only (its sandbox proxy filters by host). The OpenCode wall does not
+    filter the network: bubblewrap can only cut it off whole, which would cut off the model too.
+A call the policy lets through only with a human's say-so is `ask_commands`: see ws.approvals.
 """
 
 from __future__ import annotations
@@ -39,6 +51,7 @@ KNOWN_TOOLS = ("web_fetch", "web_search")
 # Tools that can carry data out of the session (Rule of Two, leg C).
 EGRESS_TOOLS = ("web_fetch", "web_search")
 _NAME = re.compile(r"^[A-Za-z0-9_-]+$")
+_HOST = re.compile(r"^(\*\.)?[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?$")
 _MAX_DEPTH = 4
 
 
@@ -67,6 +80,8 @@ class Gate:
     deny_commands: tuple[str, ...] = ()
     deny_read: tuple[str, ...] = ()
     deny_tools: tuple[str, ...] = ()
+    ask_commands: tuple[str, ...] = ()  # run only with a single-use approval from a human (ws.approvals)
+    allow_hosts: tuple[str, ...] = ()  # empty = the policy says nothing about the network
 
 
 @dataclass(frozen=True)
@@ -173,6 +188,13 @@ deny_commands = {arr(default_deny_commands())}
 deny_read = ["~/.ssh/**", "~/.gnupg/**", "~/.aws/credentials"]
 # Neutral tool names to switch off: {", ".join(KNOWN_TOOLS)}. An allowed web tool counts as a way out (leg C).
 deny_tools = []
+# Commands that run only after you approve that exact call, once: the gate refuses the first try and prints an id; in a
+# terminal of your own (not the session's) run `ws approve ID`, then the session retries the identical call. Same globs
+# as deny_commands; a command that also matches deny_commands stays denied. Example: ["git push*", "terraform apply*"].
+ask_commands = []
+# Hosts a session's shell may reach, for runners whose sandbox filters the network (Claude Code). Empty = no limit
+# from the policy. Example: ["api.anthropic.com", "github.com", "*.npmjs.org"].
+allow_hosts = []
 
 # Rule of Two, leg C (a way out): besides a source's outward acts and the web tools above, the SHELL counts as a way
 # out while any of curl, wget, nc, ssh, scp, python -c ... is not in deny_commands. To close it, deny the lot
@@ -195,10 +217,22 @@ def policy_path(env: dict | None = None) -> Path:
     return ws_home(env) / "policy.toml"
 
 
-# What an agent must never rewrite under $WS_HOME: its own policy, profile, secrets, jobs, release, and the run
-# records. (Reading logs/runs.jsonl stays allowed; only writes are denied.) Generated gate folders are added by the
-# caller, since they can sit anywhere.
-CONTROL_NAMES = ("profile.toml", "policy.toml", "secrets.toml", "jobs", "release", "runs", "logs", "sessions")
+# What an agent must never rewrite under $WS_HOME: its own policy, profile, secrets, jobs, release, approvals, install
+# manifest, ratings and the run records. (Reading logs/runs.jsonl stays allowed; only writes are denied.) Generated
+# gate folders are added by the caller, since they can sit anywhere.
+CONTROL_NAMES = (
+    "profile.toml",
+    "policy.toml",
+    "secrets.toml",
+    "jobs",
+    "release",
+    "runs",
+    "logs",
+    "sessions",
+    "approvals",
+    "install-manifest.json",
+    "ratings.jsonl",
+)
 
 
 def control_paths(home: Path) -> list[str]:
@@ -273,12 +307,19 @@ def loads(text: str) -> Policy:
             _strings(body, "outward", where),
         )
 
-    g = _table(raw.get("gate", {}), "[gate]", {"deny_commands", "deny_read", "deny_tools"})
+    g = _table(
+        raw.get("gate", {}), "[gate]", {"deny_commands", "deny_read", "deny_tools", "ask_commands", "allow_hosts"}
+    )
     gate = Gate(
         _strings(g, "deny_commands", "[gate] "),
         _strings(g, "deny_read", "[gate] "),
         _strings(g, "deny_tools", "[gate] "),
+        _strings(g, "ask_commands", "[gate] "),
+        _strings(g, "allow_hosts", "[gate] "),
     )
+    for h in gate.allow_hosts:
+        if not _HOST.match(h):
+            raise PolicyError(f"[gate] allow_hosts: {h!r} is not a host (a name, `*.name` or an IP, optional :port)")
     for t in gate.deny_tools:
         if t not in KNOWN_TOOLS:
             raise PolicyError(f"[gate] deny_tools: unknown tool {t!r} (known: {', '.join(KNOWN_TOOLS)})")
@@ -943,12 +984,12 @@ def _opt_values(toks: list[str], letters: str = "", longs: tuple[str, ...] = ())
     return out
 
 
-_ADMIN = {"secret", "broker"}
+_ADMIN = {"secret", "broker", "approve"}
 
 
 def _ws_admin(canon: list[str]) -> str | None:
-    """`ws gate generate|init`, `ws secret ...`, `ws broker ...` (also `uv run ws ...`, `python -m ws ...`): a gated
-    session must not regenerate its own gate or touch secrets."""
+    """`ws gate generate|init`, `ws secret ...`, `ws broker ...`, `ws approve ...` (also `uv run ws ...`, `python -m ws ...`): a gated
+    session must not regenerate its own gate, touch secrets or approve its own call."""
     for i, t in enumerate(canon):
         if posixpath.basename(t) != "ws" or not (
             i == 0 or canon[i - 1] in ("run", "-m", "--", "exec", "tool") or canon[i - 1].startswith("-")
@@ -1207,6 +1248,37 @@ def is_denied_command(
         if any(rx.match(c) for c in cands):
             return f"command matches deny_commands rule {pat!r}"
     return None
+
+
+def needs_approval(policy: Policy, command: str, *, cwd: str | None = None) -> bool:
+    """True if some shell segment of the command matches an `ask_commands` rule. It reads the line as
+    is_denied_command does (so `bash -c "git push"` asks as `git push` does). Call it after is_denied_command: a
+    command that is denied outright never gets as far as asking."""
+    if not isinstance(command, str):
+        raise TypeError("command must be text")
+    if not policy.gate.ask_commands:
+        return False
+    cands: list[str] = []
+    _walk(policy, command, _Ctx(cwd or _cwd()), 0, cands)
+    return any(_glob_regex(_canon_pattern(pat)).match(c) for pat in policy.gate.ask_commands for c in cands)
+
+
+def sandbox_read_paths(policy: Policy) -> list[str]:
+    """The deny_read rules a sandbox can enforce by hiding the path: a folder or file, written `~/x` or `/x`, with at
+    most a trailing `**` (`~/.ssh/**` -> `~/.ssh`). A rule with any other wildcard is left to the matcher; so is one
+    that would hide the whole home or the root, which would end the session rather than guard it."""
+    out = []
+    for rule in policy.gate.deny_read:
+        r = rule
+        for pre in ("${HOME}", "$HOME"):
+            if r == pre or r.startswith(pre + "/"):
+                r = "~" + r[len(pre) :]
+        while r.endswith("/**"):
+            r = r[:-3]
+        if r in ("", "~", "/") or re.search(r"[*?\[]", r) or not r.startswith(("~/", "/")):
+            continue
+        out.append(posixpath.normpath(r))
+    return list(dict.fromkeys(out))
 
 
 def is_denied_read(policy: Policy, path: str, *, cwd: str | None = None) -> str | None:

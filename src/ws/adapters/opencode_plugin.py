@@ -48,6 +48,22 @@ const cloexec = async () => {
     }
   } catch {}
 }
+// Not readable or patchable by a process of the same user: /proc/PID/mem and ptrace of a dumpable process are allowed to
+// any process of the same user when Yama's ptrace_scope is 0, which includes a shell command the model runs. prctl(
+// PR_SET_DUMPABLE, 0) makes this process refuse both unless the caller has CAP_SYS_PTRACE, which the wall drops. It is not
+// inherited by children (exec sets it again), so they stay ordinary processes. Where bun:ffi is not there nothing is set.
+const undumpable = async () => {
+  try {
+    const { dlopen, FFIType } = await import("bun:ffi")
+    const t = FFIType
+    for (const lib of ["libc.so.6", "libc.dylib", "libSystem.B.dylib"]) {
+      try {
+        const { symbols } = dlopen(lib, { prctl: { args: [t.i32, t.u64, t.u64, t.u64, t.u64], returns: t.i32 } })
+        if (symbols.prctl(4, 0, 0, 0, 0) === 0) return // PR_SET_DUMPABLE
+      } catch {}
+    }
+  } catch {}
+}
 const claim = (id) => {
   const fd = approvalFd
   if (!Number.isInteger(fd) || fd < 3) return "no approval channel: start OpenCode with `ws gate launch`"
@@ -67,6 +83,7 @@ const claim = (id) => {
 
 export const WsGate = async ({ client, directory } = {}) => {
   await cloexec()
+  await undumpable()
   return {
     event: async ({ event }) => {
       try {

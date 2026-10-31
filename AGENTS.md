@@ -102,8 +102,11 @@ LICENSES/         third-party licence texts (see NOTICE)
 - Never classify an error by matching its message. Raise a typed error with a kind and a hint, and branch on that.
 - Never partial-load the policy or the secrets registry. Either the whole file validates or the command refuses.
 - Never scaffold the `act` dial. Anything that writes a policy or profile for a person writes `prepare`; pin it with a test.
-- No top-level import of a POSIX-only module (`fcntl`, `termios`, `pwd`, `grp`). Import inside the function or in a
-  `try/except ImportError`, so the native Windows doctor can still run and point at WSL2.
+- No top-level import of a POSIX-only module (`fcntl`, `termios`, `pwd`, `grp`, `pty`, `resource`), and no POSIX-only
+  `os` name at import time (`os.O_DIRECTORY`, `os.O_NOFOLLOW`, `os.getuid()` in a constant). Import or use it inside
+  the function, in a `try/except ImportError`, or as `getattr(os, "O_NOFOLLOW", 0)`, so the native Windows doctor can
+  still run and point at WSL2. `tests/test_windows_import.py` imports every module with those names taken away and
+  fails on the first one that dies.
 - No test that reads the real HOME, the real `WS_HOME`, the clock's timezone or the network.
 - No repo copy of a global skill, agent, workflow or hook (`ws globals check` fails it; list a deliberate one in
   `.ws/overrides.toml` with the reason).

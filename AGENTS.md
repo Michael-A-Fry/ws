@@ -52,7 +52,7 @@ LICENSES/         third-party licence texts (see NOTICE)
 | `frontmatter.py` | YAML front matter, the safe subset: stdlib only |
 | `gate.py` | `ws gate`: turn the policy into each runner's own config, and answer the hooks |
 | `globals.py` | `ws globals`: what ws installs globally stays global |
-| `install.py` | `ws install` and `ws uninstall`: one setup engine that the terminal command and the setup... |
+| `install.py` | `ws install` and `ws uninstall`: the engine that plans, writes and undoes what ws puts on a machine |
 | `jobs.py` | Job files: `$WS_HOME/jobs/<name>.toml`, one headless job each, run with `ws run <name>` |
 | `jsonl.py` | Bounded, locked JSON-lines logs: one object per line, a size limit with rotation, and no lost lines |
 | `mcp_server.py` | `ws mcp serve`: a small MCP server over stdio, so any runner can search and add to memory and... |

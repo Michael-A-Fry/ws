@@ -51,7 +51,7 @@ def test_lab_workflow_asks_for_the_lab_runner_and_reads_only():
     assert runs_on and set(runs_on) == {"[self-hosted, ws-lab]"}, runs_on
     assert [line.strip() for line in top_level(text, "permissions")] == ["contents: read"]
     assert "persist-credentials: false" in text
-    doc = (ROOT / "docs" / "lab.md").read_text(encoding="utf-8")
+    doc = (ROOT / "docs" / "reference" / "lab.md").read_text(encoding="utf-8")
     for needed in ("generate-jitconfig", "fork-pr-contributor-approval", "all_external_contributors", "--token-file"):
         assert needed in doc, needed
 

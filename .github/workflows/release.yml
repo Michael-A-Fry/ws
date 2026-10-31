@@ -70,7 +70,7 @@ jobs:
         run: |
           sha="$(git rev-parse HEAD)"
           if [ -n "$(git status --porcelain)" ]; then dirty=True; else dirty=False; fi
-          printf '"""Written by the release workflow before `uv build`; absent in a checkout."""\n\ngit_sha = "%s"\ndirty = %s\nbuild_date = "%s"\nsource = "release"\n' \
+          printf '"""Written by the release workflow before uv build; absent in a checkout."""\n\ngit_sha = "%s"\ndirty = %s\nbuild_date = "%s"\nsource = "release"\n' \
             "$sha" "$dirty" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > src/ws/_build.py
           cat src/ws/_build.py
       - name: release notes from the CHANGELOG section for this version

@@ -17,10 +17,10 @@ from __future__ import annotations
 
 import json
 import shlex
-from importlib import resources
 from pathlib import Path
 
 from ws.adapters import Call, check_argv, protected_paths
+from ws.adapters.opencode_plugin import SOURCE
 from ws.policy import Policy, native_patterns
 
 NAME = "opencode"
@@ -66,8 +66,7 @@ def generate(policy: Policy, ws_cmd: list[str], out: Path, policy_file: Path) ->
     for t in policy.gate.deny_tools:
         permission[_TOOLS[t]] = "deny"
     config = {"$schema": "https://opencode.ai/config.json", "permission": permission}
-    plugin = resources.files("ws.adapters").joinpath("opencode_plugin.js").read_text(encoding="utf-8")
-    plugin = plugin.replace("/*__CHECK__*/ []", json.dumps(check_argv(ws_cmd, NAME, policy_file, out)))
+    plugin = SOURCE.replace("/*__CHECK__*/ []", json.dumps(check_argv(ws_cmd, NAME, policy_file, out)))
     return {CONFIG: json.dumps(config, indent=2) + "\n", PLUGIN: plugin}
 
 

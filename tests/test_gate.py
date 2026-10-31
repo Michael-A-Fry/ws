@@ -8,10 +8,11 @@ import json
 import shlex
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
-from ws import adapters, cli, policy
+from ws import adapters, cli, gate, policy
 
 PUSH = "git push --force origin main"
 
@@ -391,3 +392,10 @@ def test_opencode_edit_patterns_never_drop_the_parent_folder(home, tmp_path):
     assert "**/wshome/gate/opencode/**" in edit and "**/wshome/logs/**" in edit and "**/wshome/policy.toml" in edit
     bare = [k for k in edit if k.startswith("**/") and "/" not in k[3:].rstrip("/*")]
     assert not bare, bare  # nothing like **/logs/** or **/opencode/**, which would hit any project's own folder
+
+
+def test_the_ws_package_ships_python_files_only():
+    """The secret wall copies ws as a plain snapshot of .py files and refuses anything else (the shim is a string)."""
+    pkg = Path(gate.__file__).parent
+    others = [p for p in pkg.rglob("*") if p.is_file() and p.suffix != ".py" and "__pycache__" not in p.parts]
+    assert others == []

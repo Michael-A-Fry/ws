@@ -198,7 +198,7 @@ def policy_path(env: dict | None = None) -> Path:
 # What an agent must never rewrite under $WS_HOME: its own policy, profile, secrets, jobs, release, and the run
 # records. (Reading logs/runs.jsonl stays allowed; only writes are denied.) Generated gate folders are added by the
 # caller, since they can sit anywhere.
-CONTROL_NAMES = ("profile.toml", "policy.toml", "secrets.toml", "jobs", "release", "runs", "logs")
+CONTROL_NAMES = ("profile.toml", "policy.toml", "secrets.toml", "jobs", "release", "runs", "logs", "sessions")
 
 
 def control_paths(home: Path) -> list[str]:

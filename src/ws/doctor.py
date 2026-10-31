@@ -13,6 +13,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from ws import __version__, broker, usage
+from ws import globals as ws_globals
 from ws import secrets as wsecrets
 from ws.osinfo import OSInfo
 from ws.profile import ProfileError, load
@@ -222,6 +223,11 @@ def run_checks(osi: OSInfo, profile_file: Path, env: dict | None = None, network
     else:
         on = "stays on" if machine["stays_on"] else "not always on"
         checks.append(Check("WS004", "machine", OK, f"{on}; server: {machine['server'] or 'none'}"))
+    try:
+        status, detail, fix = ws_globals.doctor_check(env)
+    except Exception as e:  # noqa: BLE001 (a broken check must report, not crash the whole doctor)
+        status, detail, fix = FAIL, f"check crashed ({type(e).__name__})", ""
+    checks.append(Check("WS005", "globals", status, detail, fix))
     roles = prof.get("roles") if isinstance(prof.get("roles"), dict) else {}
     for r in ROLES:
         cfg = roles.get(r.name)

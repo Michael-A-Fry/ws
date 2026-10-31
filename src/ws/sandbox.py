@@ -81,6 +81,7 @@ from __future__ import annotations
 import argparse
 import os
 import platform
+import posixpath
 import shlex
 import shutil
 import signal
@@ -383,12 +384,16 @@ def expand(path: str, env: dict) -> str:
     return home + path[1:] if path == "~" or path.startswith("~/") else path
 
 
+def _home_or_above(real: str, env: dict) -> bool:
+    home = os.path.realpath(env.get("HOME") or str(Path.home()))
+    return real == "/" or real == home or home.startswith(real + "/")
+
+
 def project_folder(cwd: str, env: dict) -> str:
     """The folder the wall leaves writable: where the runner is started. Not the home folder or anything above it: that
     would put `~/.bashrc`, `~/.local/bin` and the ws install itself in reach, which is what the allow-list is for."""
     real = os.path.realpath(cwd)
-    home = os.path.realpath(env.get("HOME") or str(Path.home()))
-    if real == "/" or real == home or home.startswith(real + "/"):
+    if _home_or_above(real, env):
         raise SandboxError(
             f"{cwd} is your home folder or above it: start the runner from a project folder, so the wall can leave only "
             "that writable (everything in the home folder, shell start-up files included, would be writable otherwise)"
@@ -421,7 +426,13 @@ def writable_folders(pol: policy.Policy, runner: str, project: str, tmp: str, ex
         Path(p).mkdir(parents=True, exist_ok=True)
         out.append(p)
     for p in [*policy.sandbox_write_paths(pol), *extra]:
-        out.append(expand(p, env))
+        real = os.path.realpath(expand(posixpath.normpath(p), env))
+        if _home_or_above(real, env):
+            raise SandboxError(
+                f"{p} is the home folder or above it (or /): it cannot be made writable, because that would put shell "
+                "start-up files, ~/.local/bin and the ws install in reach. Name a folder inside it"
+            )
+        out.append(real)
     return [p for p in dict.fromkeys(out) if os.path.isdir(p)]
 
 

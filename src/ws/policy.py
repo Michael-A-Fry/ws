@@ -36,7 +36,13 @@ claude-code adapter writes), which acts on what a process does, not on what its 
     through), and so does `git config` or a git hook in the project (`.git/hooks` and `.git/config` are read-only);
     `ws gate launch` refuses a protected path behind a symbolic link the session could replace, and a start from the
     home folder or above; the macOS sandbox-exec profile (including its Unix-socket rule) is not run in CI and is
-    unit-tested as text only; a `deny_read` rule with a wildcard in the middle is matcher-only; Claude
+    unit-tested as text only; two gaps the last check found, not yet fixed: (1) `~/.cache/opencode` is writable inside
+    the wall and holds programs OpenCode later runs outside it (bin/rg, node_modules/.bin plugins, language servers);
+    planned fix: a walled run gets its own XDG data, state and cache folders. (2) the project lock covers only paths
+    that exist at launch and does not bind their parents, so a `.claude/settings.json` hook, an `.opencode/` plugin or a
+    `.git/hooks` script can be created, and `mv .git .git2` unlocks the hooks and config; planned fix: bind the locked
+    paths' in-project parents onto themselves and add read-only placeholders for a missing `.claude`, `.opencode` and
+    `.git/hooks`; a `deny_read` rule with a wildcard in the middle is matcher-only; Claude
     Code's own sandbox covers its Bash tool, not its Read/Edit tools (permission rules and the hook cover those); an
     interactive Claude session can still be started in a folder whose project settings open the sandbox, and the hook
     then denies every call there rather than reconfiguring it; the approval socket's close-on-exec mark needs Bun's
@@ -342,14 +348,16 @@ def loads(text: str) -> Policy:
         _strings(g, "allow_hosts", "[gate] "),
         _strings(g, "allow_write", "[gate] "),
     )
-    for w in gate.allow_write:
-        if not w.startswith(("~/", "$HOME/", "${HOME}/", "/")) or w in ("/", "~/") or re.search(r"[*?\[]", w):
-            raise PolicyError(
-                f"[gate] allow_write: {w!r} must be a folder, absolute or under ~/, with no wildcard, not /"
-            )
     for h in gate.allow_hosts:
         if not _HOST.match(h):
             raise PolicyError(f"[gate] allow_hosts: {h!r} is not a host (a name, `*.name` or an IP, optional :port)")
+    for w in gate.allow_write:
+        n = posixpath.normpath(re.sub(r"^(\$HOME|\$\{HOME\})(?=/|$)", "~", w)) if w else ""
+        if n in ("", ".", "/", "~") or not n.startswith(("~/", "/")) or re.search(r"[*?\[]", w):
+            raise PolicyError(
+                f"[gate] allow_write: {w!r} must be a folder, absolute or under ~/, with no wildcard, and not / or "
+                "the home folder (after `.` and `..` are resolved)"
+            )
     for t in gate.deny_tools:
         if t not in KNOWN_TOOLS:
             raise PolicyError(f"[gate] deny_tools: unknown tool {t!r} (known: {', '.join(KNOWN_TOOLS)})")

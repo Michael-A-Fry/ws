@@ -219,10 +219,10 @@ def test_the_allow_list_is_project_tmp_the_runners_folders_and_the_policy_extras
         d.mkdir(parents=True)
     pol = policy.loads(f'[gate]\nallow_write = ["~/extra", "~/missing", "{tmp_path}/nope"]\n')
     env = {"HOME": str(home), "XDG_CACHE_HOME": str(tmp_path / "cache")}
-    got = sandbox.writable_folders(pol, "opencode", str(proj), str(tmp), [str(tmp_path)], env)
+    got = sandbox.writable_folders(pol, "opencode", str(proj), str(tmp), [str(tmp)], env)
     assert got[:2] == [str(proj), str(tmp)]
     assert str(home / ".local" / "share" / "opencode") in got and str(tmp_path / "cache" / "opencode") in got
-    assert str(extra) in got and str(tmp_path) in got  # --allow-write
+    assert str(extra) in got and str(tmp) in got  # --allow-write
     assert not any(p.endswith(("missing", "nope")) for p in got)  # a folder that is not there is skipped
     assert (home / ".config" / "opencode" / ".gitignore").is_file()  # what OpenCode would have made at start
 
@@ -240,7 +240,7 @@ def test_the_projects_own_config_is_locked_when_it_exists(tmp_path):
 
 
 def test_allow_write_in_the_policy_is_checked_and_reaches_the_claude_settings(tmp_path):
-    for bad in ('"relative"', '"/"', '"~/"', '"~/x*"', '"/a/b?"'):
+    for bad in ('"relative"', '"/"', '"~/"', '"~/."', '"/."', '"~/x/.."', '"/a/.."', '"$HOME"', '"~/x*"', '"/a/b?"'):
         with pytest.raises(policy.PolicyError, match="allow_write"):
             policy.loads(f"[gate]\nallow_write = [{bad}]\n")
     s = claude_settings(tmp_path, '[gate]\nallow_write = ["~/.npm", "$HOME/.cache/uv"]\n')
@@ -592,3 +592,24 @@ def test_the_generated_opencode_folder_needs_nothing_written_at_start(tmp_path):
     files = opencode.generate(policy.loads(""), ["ws"], tmp_path / "out", tmp_path / "policy.toml")
     assert set(files) == {opencode.CONFIG, opencode.PLUGIN, opencode.IGNORE}
     assert files[opencode.IGNORE].splitlines()[-1] == opencode.IGNORE  # what OpenCode itself writes
+
+
+def test_allow_write_may_not_be_the_home_folder_or_above_whatever_it_is_spelled_as(tmp_path, home):
+    env = {"HOME": str(home)}
+    pol = policy.loads("")
+    proj, tmp = tmp_path / "proj", tmp_path / "tmp"
+    proj.mkdir()
+    tmp.mkdir()
+    link = tmp_path / "home-link"
+    link.symlink_to(home)
+    for bad in (str(home), str(home) + "/.", str(tmp_path), "/", str(home / "sub" / ".."), str(link), "~", "~/."):
+        with pytest.raises(sandbox.SandboxError, match="home folder or above"):
+            sandbox.writable_folders(pol, "opencode", str(proj), str(tmp), [bad], env)
+    ok = home / "extra"
+    ok.mkdir()
+    assert str(ok) in sandbox.writable_folders(pol, "opencode", str(proj), str(tmp), [str(ok)], env)
+    # the same check applies to the policy's own allow_write
+    with pytest.raises(sandbox.SandboxError):
+        sandbox.writable_folders(
+            policy.loads(f'[gate]\nallow_write = ["{tmp_path}"]\n'), "opencode", str(proj), str(tmp), [], env
+        )

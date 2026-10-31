@@ -145,7 +145,7 @@ def test_from_installs_a_checkout_without_asking_git(box: Box, tmp_path: Path):
     box.ws()  # no git stub at all: a checkout needs neither git nor a tag lookup
     r = box.run("--from", str(checkout))
     assert r.returncode == 0, r.stdout + r.stderr
-    assert f"uv tool install --force {checkout.resolve()}" in box.calls()
+    assert f"uv tool install --force --reinstall {checkout.resolve()}" in box.calls()  # not from the wheel cache
     assert not any(c.startswith("git") for c in box.calls())
 
 

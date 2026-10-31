@@ -178,6 +178,29 @@ ROLES = (
 )
 
 
+def _ptrace_check(osi) -> Check:
+    """WS007: can a process in the wall read the memory of the runner that started it? With Yama's ptrace_scope at 0 (or
+    no Yama) any process of the same user can, through `/proc/PID/mem` or ptrace, and a system-call filter cannot refuse
+    the first. ptrace_scope 1 limits it to descendants of the target, so a child cannot reach its parent."""
+    if osi.kind not in ("linux", "wsl"):
+        return Check("WS007", "ptrace", OK, "not applicable on this system")
+    from ws import sandbox
+
+    scope = sandbox.ptrace_scope()
+    if scope is not None and scope >= 1:
+        return Check("WS007", "ptrace", OK, f"ptrace_scope is {scope}: a walled child cannot read its parent's memory")
+    now = "absent (no Yama)" if scope is None else "0"
+    fix = "echo 'kernel.yama.ptrace_scope = 1' | sudo tee /etc/sysctl.d/10-ptrace.conf && sudo sysctl --system"
+    return Check(
+        "WS007",
+        "ptrace",
+        WARN,
+        f"ptrace_scope is {now}: a process in the wall can read the runner's memory through /proc/PID/mem (the OpenCode "
+        "shim makes OpenCode undumpable, which covers it; other runners are not covered)",
+        fix,
+    )
+
+
 def run_checks(osi: OSInfo, profile_file: Path, env: dict | None = None, network: bool = True) -> list[Check]:
     env = os.environ if env is None else env
     checks: list[Check] = []
@@ -226,6 +249,7 @@ def run_checks(osi: OSInfo, profile_file: Path, env: dict | None = None, network
             checks.append(Check("WS006", "jobs", FAIL, detail, fix))
         else:
             checks.append(Check("WS006", "jobs", OK, "every job file loads"))
+    checks.append(_ptrace_check(osi))
     roles = prof.get("roles") if isinstance(prof.get("roles"), dict) else {}
     for r in ROLES:
         cfg = roles.get(r.name)

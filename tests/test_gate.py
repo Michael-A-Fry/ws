@@ -119,7 +119,10 @@ def test_claude_code_rule_syntax_for_paths_and_tools(home, tmp_path):
     deny = json.loads((out / "settings.json").read_text())["permissions"]["deny"]
     assert deny[:3] == ["Read(//etc/shadow)", "Read(~/x/**)", "Read(.env)"]
     assert deny[-2:] == ["WebFetch", "WebSearch"]
-    assert all(d.startswith("Edit(//") for d in deny[3:-2]) and len(deny[3:-2]) == 2 * (len(policy.CONTROL_NAMES) + 1)
+    middle = [
+        d for d in deny[3:-2] if not d.startswith("Edit(**/")
+    ]  # the project's own config: ws.sandbox PROJECT_LOCKED
+    assert all(d.startswith("Edit(//") for d in middle) and len(middle) == 2 * (len(policy.CONTROL_NAMES) + 1)
 
 
 def test_opencode_config_and_shim(home, tmp_path):

@@ -93,7 +93,7 @@ jobs:
       - name: the sandbox stops what the matcher cannot see, and the host-socket escapes; the OpenCode nudge and approvals work
         env:
           WS_E2E_REQUIRE: "1" # missing bubblewrap or a runner fails the job instead of skipping
-        run: uv run --locked pytest -q tests/e2e/test_sandbox.py tests/e2e/test_wall_escapes.py tests/e2e/test_opencode_nudge.py
+        run: uv run --locked pytest -q tests/e2e/test_sandbox.py tests/e2e/test_wall_escapes.py tests/e2e/test_wall_loadpaths.py tests/e2e/test_opencode_nudge.py
 
   # Phase 3 pass test (row 3): a job's run record is complete against its schema on both runners. Same stub model, plus
   # a real broker lease to a stub upstream; no paid provider.

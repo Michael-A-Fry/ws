@@ -14,6 +14,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from datetime import UTC, datetime, timedelta
@@ -139,6 +140,7 @@ def ws(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "userhome"))
     monkeypatch.setenv("PATH", f"{w.bin}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.delenv("WS_BROKER_SOCKET", raising=False)
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
     monkeypatch.setattr(broker, "request", w.leases.request)
     monkeypatch.setattr(broker, "release", w.leases.release)
     w.started = []  # sockets ws was asked to start a broker on
@@ -157,7 +159,7 @@ def valid(rec: dict) -> dict:
 # --- a normal run ------------------------------------------------------------------------------------------------
 
 
-def test_a_run_leaves_one_complete_record(ws, capsys):
+def test_a_run_leaves_one_complete_record(ws, capsys, tmp_path):
     ws.job()
     assert cli.main(["run", "daily"]) == 0
     (rec,) = ws.records()
@@ -171,7 +173,7 @@ def test_a_run_leaves_one_complete_record(ws, capsys):
     assert rec["session_id"] and rec["duration_api_ms"] == 82 and rec["duration_ms"] >= 0
     assert rec["secrets_used"] == [{"name": "anthropic", "host": "api.anthropic.com"}]
     assert rec["policy"] == {"dial": "prepare", "rule_of_two": "ok"}
-    assert rec["cwd"] == str(ws.home / "work" / rec["run_id"])  # not under runs/: the agent may not write there
+    assert rec["cwd"] == str(tmp_path / "userhome" / ".local" / "state" / "ws" / "work" / rec["run_id"])
     assert stat.S_IMODE(ws.log.stat().st_mode) == 0o600
     assert ws.leases.requested == [("anthropic", "run", "api.anthropic.com")]
     assert ws.leases.released == ["lease1"]
@@ -650,6 +652,32 @@ def test_an_unknown_runner_option_exits_2(ws, capsys):
     assert cli.main(["run", "daily"]) == 2
     assert "runner_options.turbo" in capsys.readouterr().err
     assert "runner_options.turbo" in valid(ws.records()[0])["error"]
+
+
+def test_the_default_cwd_is_outside_ws_home_so_the_wall_leaves_it_writable(ws, tmp_path, monkeypatch):
+    """The wall makes WS_HOME read-only; a job with no cwd must still get a folder it can write in."""
+    ws.job()
+    assert cli.main(["run", "daily"]) == 0
+    cwd = Path(ws.records()[0]["cwd"])
+    assert cwd.is_dir() and stat.S_IMODE(cwd.stat().st_mode) == 0o700
+    assert not cwd.is_relative_to(ws.home)
+    assert Path(ws.saw()["cwd"]).resolve() == cwd.resolve()
+    # the gate's protected folders are still where they were: the run folder and the log stay under WS_HOME
+    assert (ws.home / "runs").is_dir() and ws.log.is_file()
+    # XDG_STATE_HOME moves it
+    state = tmp_path / "state with space"
+    monkeypatch.setenv("XDG_STATE_HOME", str(state))
+    assert cli.main(["run", "daily"]) == 0
+    assert Path(ws.records()[1]["cwd"]) == state / "ws" / "work" / ws.records()[1]["run_id"]
+
+
+def test_a_ws_home_that_holds_the_state_folder_falls_back_to_the_temp_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "h"))
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path / "tmp"))
+    home = tmp_path / "h" / ".local" / "state" / "ws"
+    got = run.default_cwd(home, "r1")
+    assert not got.is_relative_to(home) and got.name == "r1" and got.is_relative_to(tmp_path / "tmp")
 
 
 def test_a_job_with_its_own_cwd_runs_there(ws, tmp_path):

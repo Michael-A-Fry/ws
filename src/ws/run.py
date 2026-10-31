@@ -23,6 +23,9 @@ ws starts a per-user broker once (or, for a broker it does not own, waits and as
 the record's `recovered` list as {kind, action, ok}; if the failure comes back, the run ends as an error and says so.
 The job may also declare `green`, what its verification covers; the record carries it.
 
+A job with no `cwd` runs in a fresh empty folder, `$XDG_STATE_HOME/ws/work/<run_id>` (default `~/.local/state/...`).
+It is outside `$WS_HOME` on purpose: the wall makes `$WS_HOME` read-only, so a folder there could not be written to.
+
 Exit: 0 ok, 1 the runner failed or timed out, 2 the job could not be read (a record is written when the job name is
 safe), 3 refused.
 """
@@ -38,6 +41,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from datetime import UTC, datetime
@@ -181,6 +185,18 @@ def _child_env(home: Path, extra: dict[str, str]) -> dict[str, str]:
     env.update(extra)
     env["WS_HOME"] = str(home)  # last: where the gate hook finds the policy
     return env
+
+
+def default_cwd(home: Path, run_id: str, env: dict[str, str] | None = None) -> Path:
+    """The folder a job with no `cwd` runs in: `<state dir>/ws/work/<run_id>`, never inside `home` (`$WS_HOME`), which
+    the wall makes read-only for the runner. A `$WS_HOME` that holds the state dir too falls back to the temp dir."""
+    env = os.environ if env is None else env
+    state = env.get("XDG_STATE_HOME")
+    base = Path(state) if state and os.path.isabs(state) else Path.home() / ".local" / "state"
+    folder = base / "ws" / "work" / run_id
+    if folder.is_relative_to(home):
+        folder = Path(tempfile.gettempdir()) / f"ws-work-{os.getuid()}" / run_id
+    return folder
 
 
 def _find_exe(name: str, env: dict[str, str]) -> str | None:
@@ -434,8 +450,8 @@ def _run(args: argparse.Namespace, job: jobs.Job | None = None, fields: dict | N
     started = datetime.now(UTC)
     run_id = runrecord.new_run_id(started)
     run_dir = home / "runs" / run_id
-    # no cwd in the job: a fresh empty folder. Not under runs/, which the agent may not write to.
-    cwd = Path(job.cwd).expanduser() if job.cwd else home / "work" / run_id
+    # no cwd in the job: a fresh empty folder, outside WS_HOME (the wall makes that read-only)
+    cwd = Path(job.cwd).expanduser() if job.cwd else default_cwd(home, run_id)
     try:
         argv, extra = adapter.build_command(job, run_dir, _PLAN_LEASE if job.secrets else None)
     except ValueError as e:
@@ -492,7 +508,7 @@ def _execute(
     try:
         run_dir.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         run_dir.mkdir(mode=0o700)
-        cwd.mkdir(parents=True, exist_ok=True)
+        cwd.mkdir(mode=0o700, parents=True, exist_ok=True)  # a job's own cwd exists already
         rec["cwd"] = str(cwd)
         policy_file = policy.policy_path().absolute()
         files = adapter.generate(pol, selfcmd.argv(), run_dir / "gate", policy_file)

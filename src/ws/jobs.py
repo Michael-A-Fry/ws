@@ -8,6 +8,8 @@
     max_turns = 12                      optional
     bare = true                         headless default: no hooks, plugins or auto-discovered context
     allow_unpriced = false              run even if the runner cannot price the model (counted at your fallback)
+    green = "targeted"                  optional: what the job's verification covers (targeted | package | full |
+                                        merge_ready); written to the run record as `green`
     sources = ["notes"]                 policy sources the job reads (the Rule of Two looks at these)
     schedule = "daily 03:30"            optional: hourly | daily HH:MM | weekly DAY HH:MM (local time). `ws schedule
                                         apply` turns it into a systemd timer or a launchd agent.
@@ -51,12 +53,14 @@ KEYS = {
     "max_turns",
     "bare",
     "allow_unpriced",
+    "green",
     "sources",
     "secrets",
     "runner_options",
     "schedule",
     "command",
 }
+GREEN_LEVELS = ("targeted", "package", "full", "merge_ready")  # as runrecord.GREEN_LEVELS
 COMMANDS = {"backup": ("backup", "run")}  # the ws commands a job file may schedule in place of a runner
 DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 _DAY_NAMES = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
@@ -101,6 +105,7 @@ class Job:
     max_turns: int | None = None
     bare: bool = True
     allow_unpriced: bool = False
+    green: str | None = None
     sources: tuple[str, ...] = ()
     secrets: tuple[SecretUse, ...] = ()
     runner_options: dict = field(default_factory=dict)
@@ -205,6 +210,9 @@ def loads(name: str, text: str, base: Path, where: str | None = None) -> Job:
     allow_unpriced = d.get("allow_unpriced", False)
     if not isinstance(allow_unpriced, bool):
         raise JobError(f"{where}: allow_unpriced must be true or false")
+    green = _string(d, "green", where)
+    if green is not None and green not in GREEN_LEVELS:
+        raise JobError(f"{where}: green must be one of {', '.join(GREEN_LEVELS)}")
     sources = d.get("sources", [])
     if not isinstance(sources, list) or not all(isinstance(s, str) and s for s in sources):
         raise JobError(f"{where}: sources must be a list of source names")
@@ -236,6 +244,7 @@ def loads(name: str, text: str, base: Path, where: str | None = None) -> Job:
         max_turns=_number(d, "max_turns", where, None, integer=True),
         bare=bare,
         allow_unpriced=allow_unpriced,
+        green=green,
         sources=tuple(sources),
         secrets=tuple(secrets),
         runner_options=options,

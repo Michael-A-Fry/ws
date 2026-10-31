@@ -14,11 +14,10 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 from collections.abc import Callable
 from pathlib import Path
 
-from ws import jobs
+from ws import jobs, selfcmd
 from ws.profile import ws_home
 
 Runner = Callable[[list[str]], tuple[int, str]]
@@ -34,9 +33,10 @@ def logs_dir(env) -> Path:
 
 
 def ws_command(env) -> list[str]:
-    """How a timer starts ws: the `ws` on PATH, else this Python with -m ws. Absolute either way."""
+    """How a timer starts ws: the `ws` on PATH, else this Python isolated with -m ws (`selfcmd.argv`). Absolute either
+    way."""
     exe = shutil.which("ws", path=env.get("PATH"))
-    return [os.path.abspath(exe)] if exe else [sys.executable, "-m", "ws"]
+    return [os.path.abspath(exe)] if exe else selfcmd.argv()
 
 
 def run_cmd(argv: list[str]) -> tuple[int, str]:

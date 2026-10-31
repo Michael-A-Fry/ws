@@ -50,6 +50,12 @@ allowed_tools = ["Read"]
     assert j.runner_options == {"allowed_tools": ["Read"]}
 
 
+def test_green_is_optional_and_one_of_the_four_levels():
+    assert load(GOOD).green is None
+    for level in ("targeted", "package", "full", "merge_ready"):
+        assert load(GOOD + f'green = "{level}"\n').green == level
+
+
 def test_the_purpose_of_a_secret_defaults_to_run():
     j = load(GOOD + '[[secrets]]\nname = "anthropic"\nhost = "api.anthropic.com"\n')
     assert j.secrets[0].purpose == "run"
@@ -75,6 +81,8 @@ def test_prompt_file_is_read_relative_to_the_jobs_folder(tmp_path):
         (GOOD + 'bare = "yes"\n', "bare must be true or false"),
         (GOOD + "sources = [1]\n", "sources must be a list of source names"),
         (GOOD + "colour = 1\n", "unknown key 'colour'"),
+        (GOOD + 'green = "great"\n', "green must be one of targeted, package, full, merge_ready"),
+        (GOOD + "green = 3\n", "green must be a non-empty string"),
         (GOOD + "runner_options = 3\n", "runner_options must be a table"),
         (GOOD + '[[secrets]]\nhost = "h.example"\n', "secrets #1: name is required"),
         (GOOD + '[[secrets]]\nname = "k"\n', "secrets #1: host is required"),

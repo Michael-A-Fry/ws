@@ -2,9 +2,9 @@
 
     ws rate <run-id|last> up|down [--note TEXT]
 
-Each rating is one line appended to `$WS_HOME/ratings.jsonl`: run id, UTC time, `up` or `down`, an optional note and
-`who` ("person"). Rating the same run again adds a line; the latest one for a run is the one that counts. `ws run`
-prints the matching `ws: rate:` line after its hand-back.
+Each rating is one line appended to `$WS_HOME/ratings.jsonl` (rotated at 5 MB into `logs/`): run id, UTC time, `up`
+or `down`, an optional note and `who` ("person"). Rating the same run again adds a line; the latest one for a run is
+the one that counts. `ws run` prints the matching `ws: rate:` line after its hand-back.
 
 Only the person rates. The file sits in ws's home with the other control files, which a session may not write, so an
 agent cannot mark its own work. The id must be one `ws run` recorded in `runs.jsonl`.
@@ -13,19 +13,13 @@ agent cannot mark its own work. The id must be one `ws run` recorded in `runs.js
 from __future__ import annotations
 
 import argparse
-import json
 import os
 from datetime import UTC, datetime
 from pathlib import Path
 
-from ws import output, runrecord
+from ws import jsonl, output, runrecord
 from ws.output import WsError
 from ws.profile import ws_home
-
-try:  # not on native Windows; ws runs there only through WSL2, but the module must still import
-    import fcntl
-except ImportError:  # pragma: no cover
-    fcntl = None  # type: ignore[assignment]
 
 SCHEMA_VERSION = 1
 RATINGS = ("up", "down")
@@ -51,32 +45,15 @@ def new(run_id: str, rating: str, note: str | None = None, now: datetime | None 
 
 
 def append(path: Path, rec: dict) -> None:
-    """One write() on an O_APPEND fd under an flock, 0600: the same way runs.jsonl is written."""
-    line = (json.dumps(rec, ensure_ascii=True, separators=(",", ":")) + "\n").encode()
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-    try:
-        if fcntl is not None:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-        os.write(fd, line)
-    finally:
-        os.close(fd)
+    """Add a rating through `ws.jsonl` (locked, rotated at 5 MB). The old files and the lock sit under `logs/`, which a
+    session may not write: a planted `ratings.jsonl.1` could otherwise rate an agent's own work."""
+    jsonl.append(path, rec, side_dir=path.parent / "logs")
 
 
 def read(path: Path) -> list[dict]:
-    """Every rating, oldest first; a line that is not a JSON object is skipped. A missing file is no ratings."""
-    if not path.exists():
-        return []
-    out = []
-    with path.open(encoding="utf-8", errors="replace") as fh:
-        for line in fh:
-            try:
-                rec = json.loads(line)
-            except ValueError:
-                continue
-            if isinstance(rec, dict):
-                out.append(rec)
-    return out
+    """Every rating, oldest first, across the rotated files; a line that is not a JSON object is skipped. No file is
+    no ratings."""
+    return jsonl.read(path, side_dir=path.parent / "logs")
 
 
 def latest(ratings: list[dict]) -> dict[str, str]:

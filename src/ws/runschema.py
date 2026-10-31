@@ -39,9 +39,14 @@ SCHEMA: dict = {
         "ws_version",
         "output_truncated",
         "allow_unpriced",
+        "green",
+        "recovered",
     ],
     "properties": {
-        "schema": {"const": 1},
+        "schema": {
+            "description": "2 added green and recovered. Lines written under 1 stay in the log without them.",
+            "const": 2,
+        },
         "run_id": {
             "description": "Sortable: UTC start time, then six random hex digits.",
             "type": "string",
@@ -140,6 +145,24 @@ SCHEMA: dict = {
         "allow_unpriced": {
             "description": "The job set allow_unpriced: it ran although its cost could not be known in advance.",
             "type": "boolean",
+        },
+        "green": {
+            "description": "What the job's verification covers, as the job file declares it (claw-code's green levels): 'targeted' (the tests for what changed), 'package' (the whole module or package), 'full' (the whole suite), 'merge_ready' (full, plus the review and lint gates). Null when the job says nothing.",
+            "enum": ["targeted", "package", "full", "merge_ready", None],
+        },
+        "recovered": {
+            "description": "The automatic recoveries ws tried before or during the run, each once: what failed (kind), what ws did (action), and whether it worked (ok). A run that still failed after one carries the typed error as its error.",
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["kind", "action", "ok"],
+                "properties": {
+                    "kind": {"type": "string", "minLength": 1},
+                    "action": {"type": "string", "minLength": 1},
+                    "ok": {"type": "boolean"},
+                },
+            },
         },
     },
 }

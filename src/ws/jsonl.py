@@ -1,44 +1,29 @@
-"""Bounded JSONL logs: one line per record, rotated at a size, with any one string field capped.
+"""Bounded, locked JSON-lines logs: one object per line, a size limit with rotation, and no lost lines.
 
-`runs.jsonl`, `ratings.jsonl` and `canary.jsonl` all go through here, so a runaway job cannot grow them without limit
-(claw-code's session log does the same: three old files, a 16 KiB field cap).
+Every ws log that grows over time (runs, ratings, canary, eval results, the sandbox wall report) is written through
+here. A long string field is cut and marked, a full file rotates into `name.N` (newest is `.1`), a reader spans the live
+file and every old one, and writers take an advisory lock so two of them never interleave or lose a line. Nothing is
+written through a symlink, and every file is private to its owner (0600 in a 0700 folder).
 
-  * Cap: a string longer than `field_cap` characters (default 16 KiB) is cut there and ends with
-    `[truncated: N chars]`, N being the original length. It applies to every string value at any depth, not to keys.
-  * Rotation: before a write that would take the live file past `max_bytes` (default 5 MB), the live file becomes
-    `name.jsonl.1`, the old `.1` becomes `.2`, and so on. Up to `keep` (default 3) old files are kept. The `name.jsonl.N`
-    form is logrotate's, and it keeps `*.jsonl` meaning "the live logs". A file past `keep` is dropped, unless
-    `keep_if(record)` is true for any record in it (a run record from this month): spend is never undercounted.
-  * Old files and the lock file can sit in `side_dir` instead of beside the log, for a log whose own folder an agent may
-    write to (`ratings.jsonl` keeps them under `logs/`, which the gate denies a session).
-  * Safe with two writers: every append, and the rotation it may cause, holds an exclusive flock on `name.jsonl.lock`,
-    a file that is never renamed (an flock on the log itself would follow the inode through a rotation). A reader takes
-    the shared lock, so it never reads while the files are being renamed. A lock held for `LOCK_TIMEOUT_S` (10 s)
-    raises `LockTimeout`. Files and folders are 0600 and 0700, and a log or lock that is a symlink is refused
-    (`O_NOFOLLOW`), so a planted link cannot point a write elsewhere.
-
-`read` gives every record oldest first across the old files, skipping any line that is not a JSON object.
-
-A session can read `logs/` (it may read its own run record; the gate denies it writes only) and any process it starts
-can take a lock on a file it can open. The gate cannot hide the lock file: `deny_read` is a list of globs the person
-sets, the matcher only sees commands, and the sandbox hides only paths that exist when it starts, so none of them stops
-a program the session starts from opening a file. So a lock held to stall the log is assumed, and made harmless:
-`probe` (the check before a run) takes the exclusive lock, so a held lock refuses the run rather than letting it go
-unrecorded; and `append_plain` writes a record that could not take the lock to a sibling file that is never locked
-(`runrecord` uses it for `runs.fallback.jsonl`), in one O_APPEND write, so nothing a session holds can keep a record out.
+The lock lives in its own file (`name.lock`, never rotated) because locking the log itself would follow the inode
+through a rename. A session under policy may be able to open that file, so a lock held for the whole wait is treated as
+hostile: `probe` lets a caller refuse work up front, and `append_plain` / `read_plain` give a lock-free fallback file so
+a stalled lock cannot hide a record. Where `fcntl` does not exist (native Windows) locking is skipped and the rest works.
 """
 
 from __future__ import annotations
 
-import contextlib
 import json
 import os
 import re
+import stat
 import time
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 
-try:  # not on native Windows; ws runs there only through WSL2, but the module must still import
+try:  # POSIX only; absent on native Windows, where locking is simply skipped
     import fcntl
 except ImportError:  # pragma: no cover
     fcntl = None  # type: ignore[assignment]
@@ -46,129 +31,229 @@ except ImportError:  # pragma: no cover
 DEFAULT_MAX_BYTES = 5 * 1024 * 1024
 DEFAULT_KEEP = 3
 DEFAULT_FIELD_CAP = 16 * 1024
-LOCK_TIMEOUT_S = 10.0  # how long a write or read waits for the lock before it gives up
-NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)  # a log that is a symlink is never followed (not on native Windows)
+LOCK_TIMEOUT_S = 10.0
+NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
+_POLL_S = 0.01
+_NUMBER = re.compile(r"[0-9]+")
 
 
 class LockTimeout(TimeoutError):
-    """The log's lock was held for the whole wait: another process is stuck holding it. An OSError (TimeoutError is
-    one), so a caller that already handles an unwritable log handles this too."""
+    """The lock stayed held by another process for the whole wait. An `OSError`, so "log not writable" handlers catch it."""
 
 
-def cap_fields(value, cap: int | None = None):
-    """`value` with every string longer than `cap` cut and marked; dicts and lists are copied, not changed."""
-    cap = DEFAULT_FIELD_CAP if cap is None else cap
+# ---------------------------------------------------------------------------------------------------------------------
+# Field cap and file naming
+
+
+def cap_fields(value: Any, cap: int | None = None) -> Any:
+    """A copy of `value` with every string longer than `cap` characters cut and marked with its original length."""
+    limit = DEFAULT_FIELD_CAP if cap is None else cap
     if isinstance(value, str):
-        return value if len(value) <= cap else f"{value[:cap]}[truncated: {len(value)} chars]"
+        return value if len(value) <= limit else f"{value[:limit]}[truncated: {len(value)} chars]"
     if isinstance(value, dict):
-        return {k: cap_fields(v, cap) for k, v in value.items()}
-    if isinstance(value, list):
-        return [cap_fields(v, cap) for v in value]
+        return {k: cap_fields(v, limit) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [cap_fields(v, limit) for v in value]
     return value
 
 
-def _side(path: Path, side_dir: Path | None) -> Path:
-    return side_dir if side_dir is not None else path.parent
+def _folder(path: Path, side_dir: Path | None) -> Path:
+    return Path(side_dir) if side_dir is not None else path.parent
 
 
 def archive_path(path: Path, n: int, side_dir: Path | None = None) -> Path:
-    return _side(path, side_dir) / f"{path.name}.{n}"
+    """Where old file number `n` of this log lives."""
+    return _folder(path, side_dir) / f"{path.name}.{n}"
 
 
 def archives(path: Path, side_dir: Path | None = None) -> list[tuple[int, Path]]:
-    """The old files as (number, path), newest (lowest number) first."""
-    side = _side(path, side_dir)
-    pat = re.compile(re.escape(path.name) + r"\.(\d+)$")
+    """The old files that exist as `(number, path)`, newest first (`.1` is the most recent)."""
+    folder = _folder(path, side_dir)
+    prefix = path.name + "."
+    found: list[tuple[int, Path]] = []
     try:
-        names = os.listdir(side)
+        names = os.listdir(folder)
     except OSError:
         return []
-    found = [(int(m[1]), side / n) for n in names if (m := pat.match(n))]
+    for name in names:
+        if name.startswith(prefix) and _NUMBER.fullmatch(name[len(prefix) :]):
+            found.append((int(name[len(prefix) :]), folder / name))
     return sorted(found)
 
 
 def files(path: Path, side_dir: Path | None = None) -> list[Path]:
-    """Every file of the log that exists, oldest first, the live file last."""
-    old = [p for _, p in reversed(archives(path, side_dir))]
-    return [*old, path] if os.path.lexists(path) else old
+    """Every file of the log that exists, oldest first, with the live file last."""
+    out = [p for _, p in reversed(archives(path, side_dir))]
+    if os.path.lexists(path):
+        out.append(path)
+    return out
 
 
-def _flock(fd: int, shared: bool, timeout_s: float, lock: Path) -> None:
-    """Take the lock, trying without blocking until `timeout_s` has gone."""
-    mode = (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB
-    deadline = time.monotonic() + timeout_s
-    while True:
-        try:
-            fcntl.flock(fd, mode)
-            return
-        except BlockingIOError:
-            if time.monotonic() >= deadline:
-                raise LockTimeout(f"{lock.name} has been locked for {timeout_s:g} s by another process") from None
-            time.sleep(0.01)
+# ---------------------------------------------------------------------------------------------------------------------
+# Lock
 
 
-@contextlib.contextmanager
-def _locked(
-    path: Path, side_dir: Path | None, shared: bool = False, create: bool = True, timeout_s: float | None = None
-) -> Iterator[None]:
-    """Hold the log's lock. A reader that cannot open the lock file (a read-only folder) goes without it."""
-    lock = _side(path, side_dir) / f"{path.name}.lock"
-    fd = None
+def _lock_path(path: Path, side_dir: Path | None) -> Path:
+    return _folder(path, side_dir) / f"{path.name}.lock"
+
+
+@contextmanager
+def _locked(lock_file: Path, *, exclusive: bool, create: bool, timeout: float) -> Iterator[None]:
+    """Hold the advisory lock on `lock_file` for the block.
+
+    Writers pass `create=True` and a missing lock file is made (a symlink there is an error). Readers and `probe` pass
+    `create=False`: if the file cannot be opened they carry on unlocked, because no file means no writer has run."""
+    if fcntl is None:
+        yield
+        return
+    flags = os.O_RDWR | NOFOLLOW | (os.O_CREAT if create else 0)
     try:
-        fd = os.open(lock, os.O_RDWR | NOFOLLOW | (os.O_CREAT if create else 0), 0o600)
+        fd = os.open(lock_file, flags, 0o600)
     except OSError:
         if create:
             raise
+        yield
+        return
     try:
-        if fd is not None and fcntl is not None:
-            _flock(fd, shared, LOCK_TIMEOUT_S if timeout_s is None else timeout_s, lock)
+        deadline = time.monotonic() + timeout
+        mode = (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB
+        while True:
+            try:
+                fcntl.flock(fd, mode)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise LockTimeout(f"{lock_file.name} stayed locked for {timeout:g}s") from None
+                time.sleep(_POLL_S)
         yield
     finally:
-        if fd is not None:
-            os.close(fd)  # closing also drops the lock
+        os.close(fd)  # closing the descriptor drops the lock
 
 
-def _open_text(path: Path):
-    """The file for reading, refusing a symlink."""
-    return os.fdopen(os.open(path, os.O_RDONLY | NOFOLLOW), encoding="utf-8", errors="replace")
+def _timeout(value: float | None) -> float:
+    return LOCK_TIMEOUT_S if value is None else value
 
 
-def _parse(fh) -> Iterator[dict]:
-    for line in fh:
-        with contextlib.suppress(ValueError):
-            rec = json.loads(line)
-            if isinstance(rec, dict):
-                yield rec
+# ---------------------------------------------------------------------------------------------------------------------
+# Reading
 
 
-def _has(path: Path, keep_if: Callable[[dict], bool]) -> bool:
+def _parse(data: bytes) -> list[dict]:
+    out: list[dict] = []
+    for line in data.decode("utf-8", errors="replace").split("\n"):
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(obj, dict):
+            out.append(obj)
+    return out
+
+
+def _read_file(path: Path) -> list[dict]:
+    """The records of one file. A symlink (or anything else that cannot be opened) raises `OSError`."""
+    fd = os.open(path, os.O_RDONLY | NOFOLLOW)
+    with os.fdopen(fd, "rb") as f:
+        return _parse(f.read())
+
+
+def read(path: Path, side_dir: Path | None = None, lock_timeout_s: float | None = None) -> list[dict]:
+    """Every record, oldest first: old files from the highest number down, then the live file. Bad lines are skipped."""
+    path = Path(path)
+    out: list[dict] = []
+    with _locked(_lock_path(path, side_dir), exclusive=False, create=False, timeout=_timeout(lock_timeout_s)):
+        for f in files(path, side_dir):
+            try:
+                out.extend(_read_file(f))
+            except FileNotFoundError:
+                continue
+    return out
+
+
+def read_plain(path: Path) -> list[dict]:
+    """The records of one file, with no lock and no old files. Missing gives `[]`; a symlink raises `OSError`."""
     try:
-        with _open_text(path) as fh:
-            return any(keep_if(r) for r in _parse(fh))
+        return _read_file(Path(path))
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+
+
+def probe(path: Path, side_dir: Path | None = None, lock_timeout_s: float | None = None) -> None:
+    """Take the exclusive lock and let go at once, writing nothing. `LockTimeout` if someone else holds it."""
+    with _locked(_lock_path(Path(path), side_dir), exclusive=True, create=False, timeout=_timeout(lock_timeout_s)):
+        pass
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Writing
+
+
+def _make_dir(folder: Path) -> None:
+    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+
+def _encode(rec: Any, field_cap: int | None) -> bytes:
+    text = json.dumps(cap_fields(rec, field_cap), separators=(",", ":"), ensure_ascii=True)
+    return (text + "\n").encode("ascii")
+
+
+def _write_line(path: Path, line: bytes) -> None:
+    """Append one line in a single write; never through a symlink; narrow a wider file that we own."""
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | NOFOLLOW, 0o600)
+    try:
+        st = os.fstat(fd)
+        geteuid = getattr(os, "geteuid", None)
+        if st.st_mode & 0o077 and geteuid is not None and st.st_uid == geteuid():
+            os.fchmod(fd, 0o600)
+        os.write(fd, line)
+    finally:
+        os.close(fd)
+
+
+def _protected(path: Path, keep_if: Callable[[dict], bool]) -> bool:
+    try:
+        return any(keep_if(r) for r in _read_file(path))
     except OSError:
-        return True  # cannot tell, so do not delete it
+        return True  # unsure: do not delete
+
+
+def _forget(path: Path) -> None:
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
 
 
 def rotate(path: Path, keep: int, side_dir: Path | None = None, keep_if: Callable[[dict], bool] | None = None) -> None:
-    """Make the live file `.1` and shift the old ones up. The caller holds the lock."""
-    old = [p for _, p in archives(path, side_dir)]
-    kept = old[: max(keep - 1, 0)]
-    for p in old[len(kept) :]:
-        if keep_if is not None and _has(p, keep_if):
-            kept.append(p)
+    """Make the live file `.1` and shift the old ones up. The caller holds the exclusive lock.
+
+    The newest `keep - 1` old files stay. Older ones go, unless `keep_if` is true for a record in them (or they cannot
+    be read), so a log can hold more than `keep` old files. Gaps in the numbers close. Nothing is ever overwritten."""
+    old = archives(path, side_dir)
+    room = max(keep - 1, 0)
+    kept = list(old[:room])
+    for n, f in old[room:]:
+        if keep_if is not None and _protected(f, keep_if):
+            kept.append((n, f))
         else:
-            p.unlink(missing_ok=True)
-    for i, p in enumerate(kept, 1):  # close any gap first (ascending: each target is free)
-        if p != archive_path(path, i, side_dir):
-            os.replace(p, archive_path(path, i, side_dir))
-    for i in range(len(kept), 0, -1):  # then shift up from the top, so nothing is overwritten
-        os.replace(archive_path(path, i, side_dir), archive_path(path, i + 1, side_dir))
-    os.replace(path, archive_path(path, 1, side_dir))
+            _forget(f)
+    for new_n, (n, f) in enumerate(kept, start=1):  # ascending, so a target number is always free
+        if n != new_n:
+            os.replace(f, archive_path(path, new_n, side_dir))
+    for new_n in range(len(kept), 0, -1):  # descending, so a target number is always free
+        os.replace(archive_path(path, new_n, side_dir), archive_path(path, new_n + 1, side_dir))
+    try:
+        os.replace(path, archive_path(path, 1, side_dir))
+    except FileNotFoundError:
+        pass
 
 
 def append(
     path: Path,
-    rec: dict,
+    rec: Any,
     *,
     max_bytes: int | None = None,
     keep: int | None = None,
@@ -177,76 +262,29 @@ def append(
     keep_if: Callable[[dict], bool] | None = None,
     lock_timeout_s: float | None = None,
 ) -> None:
-    """Add one record: fields capped, the file rotated first if the line would take it past `max_bytes`, then one
-    write() on an O_APPEND fd. A line bigger than `max_bytes` still goes in, alone in a fresh file."""
-    max_bytes = DEFAULT_MAX_BYTES if max_bytes is None else max_bytes
-    keep = DEFAULT_KEEP if keep is None else keep
-    field_cap = DEFAULT_FIELD_CAP if field_cap is None else field_cap
-    line = (json.dumps(cap_fields(rec, field_cap), ensure_ascii=True, separators=(",", ":")) + "\n").encode()
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    """Add one record: cap its fields, take the exclusive lock, rotate if it would overflow, write the line.
+
+    A line bigger than `max_bytes` still goes in, alone. Raises `LockTimeout` if the lock stays held, and `OSError`
+    if the log or the lock file is a symlink or cannot be written."""
+    path = Path(path)
+    limit = DEFAULT_MAX_BYTES if max_bytes is None else max_bytes
+    line = _encode(rec, field_cap)
+    _make_dir(path.parent)
     if side_dir is not None:
-        side_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with _locked(path, side_dir, timeout_s=lock_timeout_s):
-        if 0 < _size(path) and _size(path) + len(line) > max_bytes:
-            rotate(path, keep, side_dir, keep_if)
-        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | NOFOLLOW, 0o600)
+        _make_dir(Path(side_dir))
+    with _locked(_lock_path(path, side_dir), exclusive=True, create=True, timeout=_timeout(lock_timeout_s)):
         try:
-            st = os.fstat(fd)
-            if st.st_mode & 0o077 and st.st_uid == os.geteuid():  # made earlier with a wider mode
-                os.fchmod(fd, 0o600)
-            os.write(fd, line)
-        finally:
-            os.close(fd)
+            st = os.lstat(path)
+        except FileNotFoundError:
+            st = None
+        if st is not None and stat.S_ISREG(st.st_mode) and st.st_size > 0 and st.st_size + len(line) > limit:
+            rotate(path, DEFAULT_KEEP if keep is None else keep, side_dir, keep_if)
+        _write_line(path, line)
 
 
-def _size(path: Path) -> int:
-    try:
-        return path.lstat().st_size
-    except FileNotFoundError:
-        return 0
-
-
-def read(path: Path, side_dir: Path | None = None, lock_timeout_s: float | None = None) -> list[dict]:
-    """Every record, oldest first, across the old files. A line that is not a JSON object is skipped, so one bad write
-    never hides the rest. No files is no records; one that exists but cannot be read raises OSError."""
-    out: list[dict] = []
-    with _locked(path, side_dir, shared=True, create=False, timeout_s=lock_timeout_s):
-        for p in files(path, side_dir):
-            try:
-                with _open_text(p) as fh:
-                    out.extend(_parse(fh))
-            except FileNotFoundError:
-                continue
-    return out
-
-
-def probe(path: Path, side_dir: Path | None = None, lock_timeout_s: float | None = None) -> None:
-    """Take the exclusive lock and let it go, to learn that a write would not wait. Raises LockTimeout if another
-    process holds the lock (shared or exclusive) for the whole wait. Writes nothing: no lock file yet is no holder."""
-    with _locked(path, side_dir, create=False, timeout_s=lock_timeout_s):
-        pass
-
-
-def append_plain(path: Path, rec: dict, field_cap: int | None = None) -> None:
-    """One record, no lock and no rotation: field cap, then a single write() on an O_APPEND fd (0600, no symlink). For
-    the fallback a record goes to when the locked log cannot be written; nothing can hold a lock on it."""
-    cap = DEFAULT_FIELD_CAP if field_cap is None else field_cap
-    line = (json.dumps(cap_fields(rec, cap), ensure_ascii=True, separators=(",", ":")) + "\n").encode()
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | NOFOLLOW, 0o600)
-    try:
-        st = os.fstat(fd)
-        if st.st_mode & 0o077 and st.st_uid == os.geteuid():
-            os.fchmod(fd, 0o600)
-        os.write(fd, line)
-    finally:
-        os.close(fd)
-
-
-def read_plain(path: Path) -> list[dict]:
-    """Every record of one file, with no lock (the file `append_plain` writes). A missing file is no records."""
-    try:
-        with _open_text(path) as fh:
-            return list(_parse(fh))
-    except (FileNotFoundError, NotADirectoryError):
-        return []
+def append_plain(path: Path, rec: Any, field_cap: int | None = None) -> None:
+    """Add one record to a single file with no lock and no rotation: the fallback when the locked log is unusable."""
+    path = Path(path)
+    line = _encode(rec, field_cap)
+    _make_dir(path.parent)
+    _write_line(path, line)

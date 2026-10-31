@@ -1,7 +1,7 @@
 """The CLI contract: every command takes --json and answers with one envelope; errors are typed, with a hint.
 
-claw-code pins the same thing in tests/output_format_contract.rs. The walker below finds every leaf command from the
-real parser, so a new command fails here until it is given a case (or is listed as raw, with a reason).
+The walker below finds every leaf command from the real
+parser, so a new command fails here until it is given a case (or is listed as raw, with a reason).
 """
 
 from __future__ import annotations
@@ -87,7 +87,7 @@ CASES: dict[str, list[str]] = {
 
 @pytest.fixture
 def box(tmp_path, monkeypatch):
-    home = tmp_path / "home dir"  # a space in the path, as claw-code's Windows smoke has
+    home = tmp_path / "home dir"  # a space in the path, as a Windows home folder often has
     home.mkdir()
     bare = tmp_path / "bin"
     bare.mkdir()

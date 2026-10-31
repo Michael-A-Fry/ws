@@ -1,14 +1,53 @@
-"""The JSON Schema (draft 2020-12) of a run record, as a Python dict: `ws secret wall` copies only .py files, so the
-schema lives here rather than in a .json file. `runrecord.schema_json()` gives the JSON text; the tests validate
-records against it with `jsonschema`."""
+"""The JSON Schema (draft 2020-12) of one run record, as a Python dict: the shape of a line in `runs.jsonl`.
+
+It is a dict and not a `.json` file because `ws secret wall` copies only `.py` files. `runrecord.schema()` hands out a
+copy, and `ws canary` checks a sample record against it with a small checker that understands only these keywords:
+`type`, `const`, `enum`, `pattern`, `minimum`, `minLength`, `maxLength`, `required`, `properties`,
+`additionalProperties: false` and `items`. Keep to them. Every key is always present in a record; an unknown value is
+`null`, never a missing key. Nothing here holds a secret, and the `error` field is short by rule.
+"""
 
 from __future__ import annotations
+
+_STAMP = r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T.*Z$"
+
+_COUNT = {"type": ["integer", "null"], "minimum": 0}
+_TEXT_OR_NULL = {"type": ["string", "null"]}
+
+_MODEL_ITEM = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["model", "input", "output", "cache_creation", "cache_read", "cost_usd"],
+    "properties": {
+        "model": {"type": "string", "minLength": 1},
+        "input": dict(_COUNT),
+        "output": dict(_COUNT),
+        "cache_creation": dict(_COUNT),
+        "cache_read": dict(_COUNT),
+        "cost_usd": {"type": ["number", "null"], "minimum": 0},
+    },
+}
+
+_TOKENS = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["input", "output", "cache_creation", "cache_read"],
+    "properties": {
+        "input": dict(_COUNT),
+        "output": dict(_COUNT),
+        "cache_creation": dict(_COUNT),
+        "cache_read": dict(_COUNT),
+    },
+}
 
 SCHEMA: dict = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "$id": "https://github.com/Michael-A-Fry/ws/schemas/run-record.schema.json",
     "title": "ws run record",
-    "description": "One line of runs.jsonl: what one headless job did, whichever runner ran it. Unknown values are null, never missing.",
+    "description": (
+        "One line of runs.jsonl: what one headless job did, whichever runner ran it. "
+        "Unknown values are null, never missing."
+    ),
     "type": "object",
     "additionalProperties": False,
     "required": [
@@ -45,91 +84,80 @@ SCHEMA: dict = {
     ],
     "properties": {
         "schema": {
-            "description": "2 added green and recovered. Lines written under 1 stay in the log without them.",
             "const": 2,
+            "description": (
+                "Record version. Version 2 added green and recovered; older lines in a log are not rewritten, so a "
+                "reader must cope without them. This schema describes version 2 only."
+            ),
         },
         "run_id": {
-            "description": "Sortable: UTC start time, then six random hex digits.",
             "type": "string",
-            "pattern": "^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}$",
+            "pattern": r"^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}$",
+            "description": "Sorts by time: the UTC start, then six random hex digits.",
         },
-        "job": {"type": "string", "pattern": "^[A-Za-z0-9_-]+$"},
+        "job": {"type": "string", "pattern": r"^[A-Za-z0-9_-]+$", "description": "The job file's name."},
         "runner": {
-            "description": "Null only for a job file that could not be read.",
             "type": ["string", "null"],
             "minLength": 1,
+            "description": "Which AI runner ran the job. Null only when the job file could not be read.",
         },
-        "runner_version": {"type": ["string", "null"]},
-        "exe_path": {
-            "description": "The runner executable ws started, as resolved on PATH.",
-            "type": ["string", "null"],
-        },
-        "model_requested": {"type": ["string", "null"]},
+        "runner_version": {"type": ["string", "null"], "description": "The runner's own version string."},
+        "exe_path": {"type": ["string", "null"], "description": "The runner executable, as found on PATH."},
+        "model_requested": {"type": ["string", "null"], "description": "The model the job asked for."},
         "models_used": {
-            "description": "Per model the runner reported (or the requested model when the runner does not name one).",
             "type": "array",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "required": ["model", "input", "output", "cache_creation", "cache_read", "cost_usd"],
-                "properties": {
-                    "model": {"type": "string", "minLength": 1},
-                    "input": {"type": ["integer", "null"], "minimum": 0},
-                    "output": {"type": ["integer", "null"], "minimum": 0},
-                    "cache_creation": {"type": ["integer", "null"], "minimum": 0},
-                    "cache_read": {"type": ["integer", "null"], "minimum": 0},
-                    "cost_usd": {"type": ["number", "null"], "minimum": 0},
-                },
-            },
+            "items": _MODEL_ITEM,
+            "description": "One item per model the runner reported, or the requested model if it names none.",
         },
-        "started_at": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T.*Z$"},
-        "ended_at": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T.*Z$"},
-        "duration_ms": {"type": ["integer", "null"], "minimum": 0},
-        "duration_api_ms": {"type": ["integer", "null"], "minimum": 0},
-        "exit_code": {
-            "description": "The runner's exit code; null when it never ran or was killed.",
+        "started_at": {"type": "string", "pattern": _STAMP, "description": "When the job started (UTC)."},
+        "ended_at": {"type": "string", "pattern": _STAMP, "description": "When the job ended (UTC)."},
+        "duration_ms": {"type": ["integer", "null"], "minimum": 0, "description": "Wall-clock time of the run."},
+        "duration_api_ms": {
             "type": ["integer", "null"],
+            "minimum": 0,
+            "description": "Time the runner says it spent waiting on the model API.",
         },
-        "status": {"enum": ["ok", "error", "timeout", "refused"]},
+        "exit_code": {
+            "type": ["integer", "null"],
+            "description": "The runner's exit code. Null if it never ran or was killed.",
+        },
+        "status": {"enum": ["ok", "error", "timeout", "refused"], "description": "How the run ended."},
         "error": {
-            "description": "Short, and never a secret or a lease URL.",
             "type": ["string", "null"],
             "maxLength": 300,
+            "description": "A short reason when the run did not go well. Never a secret or a lease URL.",
         },
-        "session_id": {"type": ["string", "null"]},
+        "session_id": {"type": ["string", "null"], "description": "The runner's session id, if it gave one."},
         "transcript_path": {
-            "description": "Where the runner keeps the full transcript: a file for Claude Code, the session database for OpenCode.",
             "type": ["string", "null"],
+            "description": "Where the runner kept the transcript: a file for one runner, a session database for another.",
         },
-        "tokens": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["input", "output", "cache_creation", "cache_read"],
-            "properties": {
-                "input": {"type": ["integer", "null"], "minimum": 0},
-                "output": {"type": ["integer", "null"], "minimum": 0},
-                "cache_creation": {"type": ["integer", "null"], "minimum": 0},
-                "cache_read": {"type": ["integer", "null"], "minimum": 0},
-            },
-        },
-        "cost_usd": {"type": ["number", "null"], "minimum": 0},
+        "tokens": {**_TOKENS, "description": "Token counts for the whole run."},
+        "cost_usd": {"type": ["number", "null"], "minimum": 0, "description": "What the run cost, in US dollars."},
         "cost_basis": {
-            "description": "How cost_usd was worked out: 'list' (the runner's list-price estimate), 'runner' (the runner's own figure), 'mixed', or 'unpriced' (tokens but no price, so cost is null).",
             "type": ["string", "null"],
+            "description": (
+                "Where cost_usd came from: list (an estimate at list price), runner (the runner's own figure), "
+                "mixed, or unpriced (tokens were counted but no price was known, so cost is null)."
+            ),
         },
-        "num_turns": {"type": ["integer", "null"], "minimum": 0},
-        "cwd": {"type": ["string", "null"]},
+        "num_turns": {"type": ["integer", "null"], "minimum": 0, "description": "Model turns in the run."},
+        "cwd": {"type": ["string", "null"], "description": "The folder the job ran in."},
         "policy": {
             "type": "object",
             "additionalProperties": False,
             "required": ["dial", "rule_of_two"],
             "properties": {
-                "dial": {"type": ["string", "null"]},
-                "rule_of_two": {"type": ["string", "null"], "pattern": "^(ok|refused|exception:[A-Za-z0-9_-]+)$"},
+                "dial": {"type": ["string", "null"], "description": "The autonomy dial the job ran under."},
+                "rule_of_two": {
+                    "type": ["string", "null"],
+                    "pattern": r"^(ok|refused|exception:[A-Za-z0-9_-]+)$",
+                    "description": "The rule-of-two outcome: ok, refused, or exception:<name>.",
+                },
             },
+            "description": "The policy the run was held to.",
         },
         "secrets_used": {
-            "description": "Names and hosts only.",
             "type": "array",
             "items": {
                 "type": "object",
@@ -137,22 +165,26 @@ SCHEMA: dict = {
                 "required": ["name", "host"],
                 "properties": {"name": {"type": "string"}, "host": {"type": "string"}},
             },
+            "description": "Secrets the run was allowed to use: names and hosts only, never values.",
         },
-        "ws_version": {"type": "string"},
+        "ws_version": {"type": "string", "description": "The ws build that wrote the record."},
         "output_truncated": {
-            "description": "True when the runner printed more than the output cap and the saved stdout.txt or stderr.txt stops short.",
             "type": "boolean",
+            "description": "True when the runner printed more than the output cap and the rest was dropped.",
         },
         "allow_unpriced": {
-            "description": "The job set allow_unpriced: it ran although its cost could not be known in advance.",
             "type": "boolean",
+            "description": "True when the job allowed a run whose cost could not be known in advance.",
         },
         "green": {
-            "description": "What the job's verification covers, as the job file declares it (claw-code's green levels): 'targeted' (the tests for what changed), 'package' (the whole module or package), 'full' (the whole suite), 'merge_ready' (full, plus the review and lint gates). Null when the job says nothing.",
             "enum": ["targeted", "package", "full", "merge_ready", None],
+            "description": (
+                "What the job's verification covers, as its job file declares: targeted (tests for what changed), "
+                "package (the whole package), full (the whole suite), merge_ready (the whole suite plus review and "
+                "lint gates). Null when the job says nothing."
+            ),
         },
         "recovered": {
-            "description": "The automatic recoveries ws tried before or during the run, each once: what failed (kind), what ws did (action), and whether it worked (ok). A run that still failed after one carries the typed error as its error.",
             "type": "array",
             "items": {
                 "type": "object",
@@ -164,9 +196,9 @@ SCHEMA: dict = {
                     "ok": {"type": "boolean"},
                 },
             },
+            "description": "Automatic recoveries tried before or during the run, and whether each worked.",
         },
         "eval": {
-            "description": "Set only on a trial of `ws eval run`: the task, the trial number and the arm. `pass` is null here: the record is written before grading, and the graded outcome is in eval/results.jsonl.",
             "type": ["object", "null"],
             "additionalProperties": False,
             "required": ["task", "trial", "arm", "pass"],
@@ -176,6 +208,7 @@ SCHEMA: dict = {
                 "arm": {"type": "string"},
                 "pass": {"type": ["boolean", "null"]},
             },
+            "description": "Set only on a trial of the eval command. pass is null when written: grading comes later.",
         },
     },
 }

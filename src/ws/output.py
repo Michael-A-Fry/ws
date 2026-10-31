@@ -1,20 +1,10 @@
-"""One output contract for every `ws` command: a typed error, one JSON envelope, and the global `--json` / `-C`.
+"""The output contract for every `ws` command: one typed error, one JSON envelope, and two global flags.
 
-Shapes (schema `ws.cli/1`, the same for every command; a change to either bumps the number):
-
-    result  {"schema", "kind", "status", "data"}
-    error   {"schema", "kind", "status": "error", "error_kind", "message", "hint", "exit_code"}
-
-`kind` is the command (`doctor`, `gate.generate`); `status` is `ok`, `attention` (a valid result, exit code 1: doctor
-found something to do) or `error`. `error_kind` is raised at the source as a `WsError` kind and never worked out from
-the message text. Kinds in use: usage, invalid_cwd, no_profile, bad_config, bad_input, not_found, refused, denied,
-unavailable, io, unsupported, failed.
-
-`--json` (or `WS_OUTPUT=json`) is global: it works before or after the command, on every command. A command with
-structured data calls `result(data)`; one that only prints prose gets its text wrapped as `{"output": ...}`; one that
-speaks a protocol on stdout (the MCP server, the gate hook) or asks a person a question (`ws approve`) sets `raw`: it
-keeps its own stdout and stdin, and its errors are text on stderr, since the runner or the person reads those. Text mode prints `ws: <message>` then `hint: <hint>` to stderr. The shape follows claw-code's error
-envelope (MIT; https://github.com/ultraworkers/claw-code, rusty-claude-cli main.rs), except that the kind is typed.
+A command signals failure by raising `WsError(kind, message, hint, exit_code)`; the kind is chosen where it is raised
+and is never worked out from message text. With `--json` (or `WS_OUTPUT=json`) stdout carries exactly one JSON document
+in the envelope shape `ws.cli/1`, whatever the command prints along the way. `-C PATH` / `--cwd PATH` run any command
+from another folder. Commands that speak a protocol, are a hook or ask a person a question are "raw": they keep the
+terminal and report errors as text on stderr. Changing either envelope shape means bumping `SCHEMA`.
 """
 
 from __future__ import annotations
@@ -25,27 +15,40 @@ import io
 import json
 import os
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass
-from pathlib import Path
+from typing import Any
 
 SCHEMA = "ws.cli/1"
-OK, ATTENTION, ERROR = "ok", "attention", "error"
+OK = "ok"
+ATTENTION = "attention"  # a valid result, but with exit code 1: something is left to do
+ERROR = "error"
+
+_CWD_HINT = "give a folder that exists, e.g. `ws -C ~/code doctor`"
+
+# Per-dispatch state, reset around every JSON-mode call: the command being run, whether it has printed its envelope,
+# and the stream the envelope goes to (the real stdout, while the command's own prints are being captured).
+_kind = "ws"
+_emitted = False
+_sink: Any = None
 
 
 class WsError(Exception):
-    """A failure the person can act on. `str(e)` is the message; `hint` says what to try next."""
+    """A failure the person can act on. `kind` says what sort; `hint` says what to try; `exit_code` is the exit status."""
 
-    def __init__(self, kind: str, message: str, hint: str = "", exit_code: int = 1, details: dict | None = None):
+    def __init__(
+        self, kind: str, message: str, hint: str = "", exit_code: int = 1, details: dict | None = None
+    ) -> None:
         super().__init__(message)
         self.kind = kind
         self.message = message
         self.hint = hint
         self.exit_code = exit_code
-        self.details = details or {}
+        self.details = dict(details) if details else {}
 
 
-def did_you_mean(word: str, choices) -> str:
-    """A "did you mean" hint for the closest of `choices`, or an empty string."""
+def did_you_mean(word: str, choices: Sequence[Any]) -> str:
+    """A "did you mean `x`?" sentence for the closest choice, or an empty string when nothing is close."""
     close = difflib.get_close_matches(word, [str(c) for c in choices], n=1, cutoff=0.6)
     return f"did you mean `{close[0]}`?" if close else ""
 
@@ -66,13 +69,7 @@ def error_envelope(e: WsError, kind: str = "ws") -> dict:
 
 
 def error_text(e: WsError) -> str:
-    text = f"ws: {e.message}"
-    if e.hint:
-        text += f"\nhint: {e.hint}"
-    return text
-
-
-# ---- the global flags ---------------------------------------------------------------------------------------------------
+    return f"ws: {e.message}" + (f"\nhint: {e.hint}" if e.hint else "")
 
 
 @dataclass
@@ -81,114 +78,114 @@ class Globals:
     cwd: str | None = None
 
 
-def wants_json(argv: list[str], env: dict | None = None) -> bool:
+def wants_json(argv: Sequence[str], env: Any = None) -> bool:
+    """True if `WS_OUTPUT=json` or `--json` comes before the first bare `--` (after it, tokens are the command's own)."""
     env = os.environ if env is None else env
-    before_dashes = argv[: argv.index("--")] if "--" in argv else argv
-    return env.get("WS_OUTPUT", "").strip().lower() == "json" or "--json" in before_dashes
+    if str(env.get("WS_OUTPUT", "")).strip().lower() == "json":
+        return True
+    for tok in argv:
+        if tok == "--":
+            return False
+        if tok == "--json":
+            return True
+    return False
 
 
-def split_global(argv: list[str], env: dict | None = None) -> tuple[Globals, list[str]]:
-    """Take `--json` and `-C PATH` out of argv wherever they are (not after a bare `--`), so they work on any command."""
-    env = os.environ if env is None else env
+def split_global(argv: Sequence[str], env: Any = None) -> tuple[Globals, list[str]]:
+    """Take `--json` and `-C PATH` out of `argv` wherever they sit, up to the first bare `--`. Returns them and the rest."""
     g = Globals(json=wants_json([], env))
     rest: list[str] = []
     i = 0
     while i < len(argv):
-        a = argv[i]
-        if a == "--":
+        tok = argv[i]
+        if tok == "--":
             rest.extend(argv[i:])
             break
-        if a == "--json":
+        if tok == "--json":
             g.json = True
-        elif a in ("-C", "--cwd"):
+        elif tok in ("-C", "--cwd"):
             if i + 1 >= len(argv):
-                raise WsError("usage", f"{a} needs a folder", "e.g. `ws -C ~/code/app doctor`", 2)
+                raise WsError("usage", f"{tok} needs a folder", "e.g. `ws -C ~/code/app doctor`", 2)
             g.cwd = argv[i + 1]
             i += 1
-        elif a.startswith("--cwd="):
-            g.cwd = a[len("--cwd=") :]
-        elif a.startswith("-C") and len(a) > 2:
-            g.cwd = a[2:]
+        elif tok.startswith("--cwd="):
+            g.cwd = tok[len("--cwd=") :]
+        elif tok.startswith("-C") and len(tok) > 2:
+            g.cwd = tok[2:]
         else:
-            rest.append(a)
+            rest.append(tok)
         i += 1
     return g, rest
 
 
 def enter_cwd(path: str) -> None:
-    """Change into `path` before anything runs; a bad one is `invalid_cwd`, with the reason."""
-    p = Path(path).expanduser()
-    if not p.exists():
+    """Change into `path` (`~` expanded), or raise an `invalid_cwd` error saying why not."""
+    target = os.path.expanduser(path)
+    if not os.path.exists(target):
         reason = "does not exist"
-    elif not p.is_dir():
+    elif not os.path.isdir(target):
         reason = "is not a folder"
-    elif not os.access(p, os.X_OK):
+    elif not os.access(target, os.X_OK):
         reason = "is not readable"
     else:
-        os.chdir(p)
-        return
-    raise WsError(
-        "invalid_cwd",
-        f"-C {path}: {reason}",
-        "give a folder that exists, e.g. `ws -C ~/code doctor`",
-        2,
-        {"path": str(path), "reason": reason},
-    )
+        try:
+            os.chdir(target)
+        except OSError:
+            reason = "is not readable"
+        else:
+            return
+    raise WsError("invalid_cwd", f"-C {path}: {reason}", _CWD_HINT, 2, {"path": str(path), "reason": reason})
 
 
-# ---- results ------------------------------------------------------------------------------------------------------------
-
-_sink: io.TextIOBase | None = None  # the real stdout while dispatch has captured the command's own prints
-_kind = "ws"
-_emitted = False
-
-
-def result(data, *, status: str = OK, kind: str | None = None) -> None:
-    """Print the result envelope. A command with `--json` calls this instead of printing its own JSON."""
+def result(data: Any, *, status: str = OK, kind: str | None = None) -> None:
+    """Print the result envelope to the real stdout and note that one has been sent."""
     global _emitted
-    _emitted = True
     env = {"schema": SCHEMA, "kind": kind or _kind, "status": status, "data": data}
-    print(json.dumps(env, indent=2, default=str), file=_sink or sys.stdout)
+    out = _sink if _sink is not None else sys.stdout
+    print(json.dumps(env, indent=2, default=str), file=out)
+    out.flush()
+    _emitted = True
 
 
-def _raw(args) -> bool:
-    raw = getattr(args, "raw", False)
-    return bool(raw(args)) if callable(raw) else bool(raw)
+def _raw(args: Any) -> bool:
+    """Does this command keep the real terminal under `--json`? Its `raw` is a flag, or a function of the arguments."""
+    flag = getattr(args, "raw", False)
+    return bool(flag(args)) if callable(flag) else bool(flag)
 
 
-def dispatch(args, kind: str, want_json: bool) -> int:
-    """Run `args.func(args)`. In JSON mode the command's prints are captured so that stdout is exactly one envelope."""
-    global _sink, _kind, _emitted
+def dispatch(args: Any, kind: str, want_json: bool) -> int:
+    """Run `args.func(args)` and return its exit code, making stdout one envelope when JSON is wanted."""
+    global _kind, _emitted, _sink
     args.json = want_json or bool(getattr(args, "json", False))
     if not args.json:
         return args.func(args)
     if _raw(args):
         try:
             return args.func(args)
-        except WsError as e:  # a hook or a prompt: the person or the runner reads stderr, never an envelope
+        except WsError as e:
             print(error_text(e), file=sys.stderr)
             return e.exit_code
-    _kind, _emitted = kind, False
-    real = sys.stdout
+
+    real_out, real_err = sys.stdout, sys.stderr
     out, err = io.StringIO(), io.StringIO()
-    _sink = real
+    _kind, _emitted, _sink = kind, False, real_out
     try:
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            rc = args.func(args)
-    except WsError:
-        sys.stderr.write(err.getvalue())  # warnings the command printed before it failed
-        raise
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = args.func(args) or 0
+        except WsError:
+            if err.getvalue():
+                real_err.write(err.getvalue())
+            raise
+        if err.getvalue():
+            if code and not _emitted:
+                first, _, rest = err.getvalue().strip().partition("\n")
+                failure = WsError("failed", first.removeprefix("ws: "), rest.strip(), code)
+                print(json.dumps(error_envelope(failure, kind), indent=2), file=real_out)
+                return code
+            real_err.write(err.getvalue())
+        if not _emitted:
+            result({"output": out.getvalue().rstrip("\n")}, status=OK if not code else ATTENTION, kind=kind)
+        return code
     finally:
-        _sink = None
-    if err.getvalue():
-        if rc and not _emitted:
-            msg = err.getvalue().strip()
-            first, _, rest = msg.partition("\n")
-            first = first.removeprefix("ws: ")
-            env = error_envelope(WsError("failed", first, rest.strip(), rc), kind)
-            print(json.dumps(env, indent=2), file=real)
-            return rc
-        sys.stderr.write(err.getvalue())
-    if not _emitted:
-        result({"output": out.getvalue().rstrip("\n")}, status=OK if not rc else ATTENTION, kind=kind)
-    return rc
+        _kind, _emitted, _sink = "ws", False, None

@@ -1,41 +1,15 @@
-"""The mock model provider: stub servers for the Tier 0 tests and the eval, with no network, paid provider or real key.
+"""Stub model servers that script a runner's tool calls, so tests and evals need no network, paid provider or real key.
 
-It is a package module (it was `tests/e2e/stubs.py`, which now re-exports it) so the end-to-end tests and the eval share
-one fake provider. Run it alone to serve a named scenario from `ws.testing.scenarios` until it is killed:
-
-    python -m ws.testing.mockprovider --scenario first_task [--provider anthropic|openai] [--work DIR]
-                                      [--tls-cert FILE --tls-key FILE]
-
-With a certificate and key it serves https (the lab and CI runs use that, so the broker's real TLS path to the
-upstream is exercised). Its first stdout line, flushed, is `MOCK_ANTHROPIC_BASE_URL=http://127.0.0.1:PORT` (or `MOCK_OPENAI_BASE_URL=...`), the
-way claw-code's mock service announces itself; point the runner's base URL there.
-
-Two servers on 127.0.0.1 (random port), stdlib only:
-
-    AnthropicStub(calls)   the Anthropic Messages API, SSE streaming (Claude Code)
-    OpenAIStub(calls)      OpenAI-compatible /v1/chat/completions, SSE streaming (OpenCode, any compatible runner)
-
-`calls` is the script: a list of Call(tool, args). The stub answers each request like this:
-
-  * the request offers the first scripted tool (matched case-insensitively) and has seen N tool results
-    -> if N < len(calls): reply with a tool_use for calls[N]; otherwise reply with plain text (`final_text`);
-  * any other request (titles, quota probes, side calls) -> plain text.
-
-So a script of one call runs that call once, then lets the runner finish. An empty script never calls a tool.
-
-Every request is recorded: `stub.requests` (parsed JSON bodies, in order), `stub.tool_results()` (the text of each tool
-result the runner sent back, in order: what the model "saw" after the tool ran or was blocked).
-
-    with AnthropicStub([Call("Bash", {"command": "touch ALLOWED"})]) as stub:
-        run_runner(base_url=stub.url)
-        assert stub.tool_results() == [...]
-
-Use as a context manager (or call start()/stop()). `url` is the base URL: http://127.0.0.1:PORT.
+Two stubs imitate the wire formats a runner speaks (a Messages-style API and a chat-completions-style API). Each walks
+the runner through a scripted list of tool calls, one per round trip, then answers in plain text. They bind to loopback
+only, ask for no credentials and never echo any. `python -m ws.testing.mockprovider --scenario NAME` serves one named
+scenario and prints `<VAR>=<url>` as its only stdout line, so a caller can learn the port.
 """
 
 from __future__ import annotations
 
 import argparse
+import http.server
 import json
 import os
 import signal
@@ -43,303 +17,299 @@ import ssl
 import sys
 import threading
 from dataclasses import dataclass, field
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Self
+from typing import Any, Self
+
+PROVIDER_VARS = {"anthropic": "MOCK_ANTHROPIC_BASE_URL", "openai": "MOCK_OPENAI_BASE_URL"}
+
+_USAGE = {"input_tokens": 10, "output_tokens": 5}
+_EMPTY_LIST = {"data": [], "object": "list"}
 
 
 @dataclass(frozen=True)
 class Call:
-    """One scripted tool call: the tool's name as the runner offers it ("Bash" for Claude Code, "bash" for
-    OpenCode) and its input."""
+    """One scripted tool call. `tool` is the name as the runner offers it (`Bash`, `bash`); matching ignores case."""
 
     tool: str
     args: dict = field(default_factory=dict)
 
 
+def _compact(obj: Any) -> str:
+    return json.dumps(obj, separators=(",", ":"))
+
+
+def _joined_text(content: Any) -> str:
+    """The text of a tool result: the `text` of each dict item joined by spaces, or `str()` for anything else."""
+    if isinstance(content, list):
+        return " ".join(str(item.get("text", "")) for item in content if isinstance(item, dict))
+    return str(content)
+
+
+class _Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    stub: _Stub  # set on the subclass made for each server
+
+    def log_message(self, format: str, *args: Any) -> None:
+        pass
+
+    def _send(self, content_type: str, body: bytes, extra: dict[str, str] | None = None) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        for name, value in (extra or {}).items():
+            self.send_header(name, value)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def json_reply(self, obj: Any) -> None:
+        self._send("application/json", _compact(obj).encode())
+
+    def sse(self, events: list[str]) -> None:
+        self._send("text/event-stream", "".join(events).encode(), {"Cache-Control": "no-cache"})
+
+    def do_GET(self) -> None:
+        self.json_reply(_EMPTY_LIST)
+
+    def do_HEAD(self) -> None:
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_POST(self) -> None:
+        size = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(size) if size else b""
+        body = json.loads(raw) if raw.strip() else {}
+        if not self.path.split("?", 1)[0].endswith(self.stub.route):
+            self.json_reply({"input_tokens": 1})  # a token-count or other side call: not a model request
+            return
+        with self.stub._lock:
+            self.stub.requests.append(body)
+        self.stub.respond(self, body)
+
+
 class _Stub:
-    """Shared server plumbing. A subclass sets `path_suffix` and implements respond() and tool_results()."""
+    """Base of both stubs: the server, the script and the record of requests. Subclasses fill in the wire format."""
 
-    path_suffix = ""
+    route = ""
 
-    def __init__(self, calls: list[Call] | None = None, final_text: str = "ok, done"):
+    def __init__(self, calls: list[Call] | None = None, final_text: str = "ok, done") -> None:
         self.calls = list(calls or [])
         self.final_text = final_text
         self.requests: list[dict] = []
         self._lock = threading.Lock()
-        self._server: ThreadingHTTPServer | None = None
+        self._server: http.server.ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._scheme = "http"
 
-    # -- life cycle
-    def start(self, tls: tuple[str, str] | None = None) -> Self:
-        """Start serving on 127.0.0.1; `tls` is (certificate file, key file) to serve https instead of http."""
-        stub = self
-
-        class Handler(BaseHTTPRequestHandler):
-            protocol_version = "HTTP/1.1"
-
-            def log_message(self, *args):  # silence
-                pass
-
-            def do_GET(self):  # model lists, health probes
-                self.json_reply({"data": [], "object": "list"})
-
-            def do_HEAD(self):
-                self.send_response(200)
-                self.send_header("Content-Length", "0")
-                self.end_headers()
-
-            def do_POST(self):
-                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
-                if not self.path.split("?")[0].endswith(stub.path_suffix):
-                    return self.json_reply({"input_tokens": 1})  # e.g. count_tokens
-                with stub._lock:
-                    stub.requests.append(body)
-                stub.respond(self, body)
-
-            def json_reply(self, obj):
-                data = json.dumps(obj).encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
-
-            def sse(self, events: list[str]):
-                data = "".join(events).encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream")
-                self.send_header("Cache-Control", "no-cache")
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
-
-        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        if tls:
-            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-            ctx.load_cert_chain(*tls)
-            self._server.socket = ctx.wrap_socket(self._server.socket, server_side=True)
+    def start(self, tls: tuple[str, str] | None = None) -> _Stub:
+        handler = type("Handler", (_Handler,), {"stub": self})
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        server.daemon_threads = True
+        if tls is not None:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(certfile=tls[0], keyfile=tls[1])
+            server.socket = context.wrap_socket(server.socket, server_side=True)
             self._scheme = "https"
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._server = server
+        self._thread = threading.Thread(target=server.serve_forever, daemon=True)
         self._thread.start()
         return self
 
     def stop(self) -> None:
-        if self._server:
-            self._server.shutdown()
-            self._server.server_close()
-            self._thread.join(timeout=5)
-            self._server = None
+        server, thread = self._server, self._thread
+        self._server = self._thread = None
+        if server is not None:
+            server.shutdown()
+            server.server_close()
+        if thread is not None:
+            thread.join(timeout=5)
 
     def __enter__(self) -> Self:
         return self.start()
 
-    def __exit__(self, *exc) -> None:
+    def __exit__(self, *exc: object) -> None:
         self.stop()
 
     @property
     def url(self) -> str:
+        assert self._server is not None, "start the stub first"
         return f"{self._scheme}://127.0.0.1:{self._server.server_address[1]}"
 
-    # -- what the script does
     def next_call(self, offered: list[str], results_seen: int) -> Call | None:
-        """The scripted call to make now, or None for plain text."""
-        if not self.calls or results_seen >= len(self.calls):
+        """The call to make now: the one after the results already in the conversation, if the runner offers its tool."""
+        if results_seen >= len(self.calls):
             return None
-        want = self.calls[results_seen].tool.lower()
-        return self.calls[results_seen] if want in (o.lower() for o in offered) else None
+        call = self.calls[results_seen]
+        return call if call.tool.lower() in {name.lower() for name in offered} else None
 
-    def respond(self, handler, body: dict) -> None:
+    def _offered_as(self, offered: list[str], call: Call) -> str:
+        return next(name for name in offered if name.lower() == call.tool.lower())
+
+    def respond(self, handler: _Handler, body: dict) -> None:
         raise NotImplementedError
 
     def tool_results(self) -> list[str]:
         raise NotImplementedError
 
-
-def _sse(event: str, data: dict) -> str:
-    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+    def _longest(self, per_request: list[list[str]]) -> list[str]:
+        return max(per_request, key=len, default=[])  # each request repeats the earlier results
 
 
 class AnthropicStub(_Stub):
-    """POST /v1/messages. Streams message_start ... message_stop; answers a non-stream request with one JSON message."""
+    route = "/v1/messages"
 
-    path_suffix = "/v1/messages"
-
-    def respond(self, handler, body: dict) -> None:
+    def respond(self, handler: _Handler, body: dict) -> None:
         offered = [t.get("name", "") for t in body.get("tools") or []]
-        call = self.next_call(offered, len(self._results(body)))
+        seen = sum(
+            1
+            for m in body.get("messages") or []
+            if m.get("role") == "user" and isinstance(m.get("content"), list)
+            for block in m["content"]
+            if isinstance(block, dict) and block.get("type") == "tool_result"
+        )
+        call = self.next_call(offered, seen)
         n = len(self.requests)
         if call:
-            blocks = [
-                {
-                    "type": "tool_use",
-                    "id": f"toolu_stub{n:04d}",
-                    "name": _real_name(offered, call.tool),
-                    "input": call.args,
-                }
-            ]
+            block = {"type": "tool_use", "id": f"toolu_stub{n:04d}", "name": self._offered_as(offered, call),
+                     "input": call.args}  # fmt: skip
             stop = "tool_use"
         else:
-            blocks = [{"type": "text", "text": self.final_text}]
+            block = {"type": "text", "text": self.final_text}
             stop = "end_turn"
-        usage = {"input_tokens": 10, "output_tokens": 5}
-        message = {
-            "id": f"msg_stub{n:04d}",
-            "type": "message",
-            "role": "assistant",
-            "model": body.get("model", "stub"),
-            "stop_reason": None,
-            "stop_sequence": None,
-            "usage": usage,
-        }
+        shell = {
+            "id": f"msg_stub{n:04d}", "type": "message", "role": "assistant", "model": body.get("model") or "stub",
+            "stop_reason": None, "stop_sequence": None, "usage": dict(_USAGE),
+        }  # fmt: skip
         if not body.get("stream"):
-            return handler.json_reply({**message, "content": blocks, "stop_reason": stop})
-        events = [_sse("message_start", {"type": "message_start", "message": {**message, "content": []}})]
-        for i, b in enumerate(blocks):
-            if b["type"] == "tool_use":
-                start = {**b, "input": {}}
-                delta = {"type": "input_json_delta", "partial_json": json.dumps(b["input"])}
-            else:
-                start = {"type": "text", "text": ""}
-                delta = {"type": "text_delta", "text": b["text"]}
-            events += [
-                _sse("content_block_start", {"type": "content_block_start", "index": i, "content_block": start}),
-                _sse("content_block_delta", {"type": "content_block_delta", "index": i, "delta": delta}),
-                _sse("content_block_stop", {"type": "content_block_stop", "index": i}),
-            ]
-        events += [
-            _sse(
-                "message_delta",
-                {"type": "message_delta", "delta": {"stop_reason": stop, "stop_sequence": None}, "usage": usage},
-            ),
-            _sse("message_stop", {"type": "message_stop"}),
-        ]
-        handler.sse(events)
-
-    @staticmethod
-    def _results(body: dict) -> list[str]:
-        out = []
-        for m in body.get("messages") or []:
-            content = m.get("content")
-            if m.get("role") != "user" or not isinstance(content, list):
-                continue
-            for b in content:
-                if b.get("type") == "tool_result":
-                    c = b.get("content")
-                    if isinstance(c, list):
-                        c = " ".join(x.get("text", "") for x in c if isinstance(x, dict))
-                    out.append(str(c))
-        return out
+            handler.json_reply({**shell, "content": [block], "stop_reason": stop})
+            return
+        if block["type"] == "tool_use":
+            start = {**block, "input": {}}
+            delta = {"type": "input_json_delta", "partial_json": _compact(call.args)}
+        else:
+            start = {**block, "text": ""}
+            delta = {"type": "text_delta", "text": block["text"]}
+        events = [
+            ("message_start", {"type": "message_start", "message": {**shell, "content": []}}),
+            ("content_block_start", {"type": "content_block_start", "index": 0, "content_block": start}),
+            ("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": delta}),
+            ("content_block_stop", {"type": "content_block_stop", "index": 0}),
+            ("message_delta", {"type": "message_delta", "delta": {"stop_reason": stop, "stop_sequence": None},
+                               "usage": dict(_USAGE)}),
+            ("message_stop", {"type": "message_stop"}),
+        ]  # fmt: skip
+        handler.sse([f"event: {name}\ndata: {_compact(data)}\n\n" for name, data in events])
 
     def tool_results(self) -> list[str]:
-        """Tool results in the longest conversation the stub saw (each request repeats the earlier ones)."""
-        return max((self._results(r) for r in self.requests), key=len, default=[])
+        with self._lock:
+            bodies = list(self.requests)
+        return self._longest(
+            [
+                [
+                    _joined_text(block.get("content"))
+                    for m in body.get("messages") or []
+                    if m.get("role") == "user" and isinstance(m.get("content"), list)
+                    for block in m["content"]
+                    if isinstance(block, dict) and block.get("type") == "tool_result"
+                ]
+                for body in bodies
+            ]
+        )
 
 
 class OpenAIStub(_Stub):
-    """POST /v1/chat/completions. Streams chat.completion.chunk events then [DONE]; non-stream gets one JSON."""
+    route = "/chat/completions"
 
-    path_suffix = "/chat/completions"
-
-    def respond(self, handler, body: dict) -> None:
+    def respond(self, handler: _Handler, body: dict) -> None:
         offered = [(t.get("function") or {}).get("name", "") for t in body.get("tools") or []]
-        call = self.next_call(offered, len(self._results(body)))
+        seen = sum(1 for m in body.get("messages") or [] if m.get("role") == "tool")
+        call = self.next_call(offered, seen)
         n = len(self.requests)
-        base = {
-            "id": f"chatcmpl-stub{n:04d}",
-            "object": "chat.completion.chunk",
-            "created": 0,
-            "model": body.get("model", "stub"),
-        }
         if call:
-            name = _real_name(offered, call.tool)
-            tc = {
-                "index": 0,
-                "id": f"call_stub{n:04d}",
-                "type": "function",
-                "function": {"name": name, "arguments": json.dumps(call.args)},
-            }
-            delta, finish = {"role": "assistant", "content": None, "tool_calls": [tc]}, "tool_calls"
+            entry = {
+                "index": 0, "id": f"call_stub{n:04d}", "type": "function",
+                "function": {"name": self._offered_as(offered, call), "arguments": _compact(call.args)},
+            }  # fmt: skip
+            delta: dict = {"role": "assistant", "content": None, "tool_calls": [entry]}
+            finish = "tool_calls"
         else:
-            delta, finish = {"role": "assistant", "content": self.final_text}, "stop"
-        if not body.get("stream"):
-            msg = {k: v for k, v in delta.items()}
-            if call:
-                msg["tool_calls"] = [{k: v for k, v in tc.items() if k != "index"}]
-            return handler.json_reply(
-                {
-                    **base,
-                    "object": "chat.completion",
-                    "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
-                    "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
-                }
-            )
+            delta = {"role": "assistant", "content": self.final_text}
+            finish = "stop"
+        base = {"id": f"chatcmpl-stub{n:04d}", "object": "chat.completion.chunk", "created": 0,
+                "model": body.get("model") or "stub"}  # fmt: skip
         usage = {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        if not body.get("stream"):
+            message = dict(delta)
+            if call:
+                message["tool_calls"] = [{k: v for k, v in e.items() if k != "index"} for e in delta["tool_calls"]]
+            handler.json_reply(
+                {**base, "object": "chat.completion",
+                 "choices": [{"index": 0, "message": message, "finish_reason": finish}], "usage": usage}
+            )  # fmt: skip
+            return
         chunks = [
             {**base, "choices": [{"index": 0, "delta": delta, "finish_reason": None}]},
             {**base, "choices": [{"index": 0, "delta": {}, "finish_reason": finish}]},
             {**base, "choices": [], "usage": usage},
         ]
-        handler.sse([f"data: {json.dumps(c)}\n\n" for c in chunks] + ["data: [DONE]\n\n"])
-
-    @staticmethod
-    def _results(body: dict) -> list[str]:
-        out = []
-        for m in body.get("messages") or []:
-            if m.get("role") == "tool":
-                c = m.get("content")
-                if isinstance(c, list):
-                    c = " ".join(x.get("text", "") for x in c if isinstance(x, dict))
-                out.append(str(c))
-        return out
+        handler.sse([f"data: {_compact(c)}\n\n" for c in chunks] + ["data: [DONE]\n\n"])
 
     def tool_results(self) -> list[str]:
-        return max((self._results(r) for r in self.requests), key=len, default=[])
+        with self._lock:
+            bodies = list(self.requests)
+        return self._longest(
+            [[_joined_text(m.get("content")) for m in body.get("messages") or [] if m.get("role") == "tool"]
+             for body in bodies]
+        )  # fmt: skip
 
 
-def _real_name(offered: list[str], wanted: str) -> str:
-    """The tool's name exactly as the runner offered it."""
-    return next(o for o in offered if o.lower() == wanted.lower())
+_STUBS = {"anthropic": AnthropicStub, "openai": OpenAIStub}
 
 
-PROVIDER_VARS = {"anthropic": "MOCK_ANTHROPIC_BASE_URL", "openai": "MOCK_OPENAI_BASE_URL"}
-
-
-def for_scenario(name: str, provider: str = "anthropic", scenarios_file: str | None = None, **variables: str) -> _Stub:
-    """A stub (not started) scripted from the scenario `name`; `variables` fill `${...}` in its arguments (`work`)."""
-    from ws.testing import scenarios
+def for_scenario(name: str, provider: str = "anthropic", scenarios_file: str | None = None, **variables: Any) -> _Stub:
+    """An unstarted stub scripted from the named scenario. An unknown provider is a `KeyError`."""
+    from ws.testing import scenarios  # lazy: scenarios imports `Call` from here
 
     scenario = scenarios.get(name, scenarios_file)
     runner = scenarios.PROVIDERS[provider]
-    cls = AnthropicStub if provider == "anthropic" else OpenAIStub
-    return cls(scenario.calls_for(runner, **variables), final_text=scenario.final_text)
+    return _STUBS[provider](scenario.calls_for(runner, **variables), final_text=scenario.final_text)
 
 
 def main(argv: list[str] | None = None) -> int:
-    from ws.testing import scenarios
+    from ws.testing import scenarios  # lazy, as above
 
-    p = argparse.ArgumentParser(prog="python -m ws.testing.mockprovider", description="Serve a scenario until killed.")
-    p.add_argument("--scenario", required=True, metavar="NAME", help="one of: " + ", ".join(scenarios.load()))
-    p.add_argument("--provider", choices=sorted(PROVIDER_VARS), default="anthropic")
-    p.add_argument("--work", metavar="DIR", default=os.getcwd(), help="what ${work} means in the scenario's paths")
-    p.add_argument("--scenarios", metavar="FILE", help="a scenarios file (default: $WS_MOCK_SCENARIOS, else built in)")
-    p.add_argument("--tls-cert", metavar="FILE", help="serve https with this certificate (needs --tls-key)")
-    p.add_argument("--tls-key", metavar="FILE", help="the certificate's private key")
-    args = p.parse_args(argv)
+    parser = argparse.ArgumentParser(
+        prog="python -m ws.testing.mockprovider",
+        description="Serve a scripted stand-in for a model API on loopback and print its base URL.",
+    )
+    parser.add_argument(
+        "--scenario", required=True, help=f"scenario to serve; built in: {', '.join(scenarios.DEFAULT['scenarios'])}"
+    )
+    parser.add_argument("--provider", choices=sorted(PROVIDER_VARS), default="anthropic")
+    parser.add_argument("--work", default=None, help="what ${work} means in the scenario's paths (default: here)")
+    parser.add_argument(
+        "--scenarios", default=None, help="a scenarios file (default: $WS_MOCK_SCENARIOS, else built in)"
+    )
+    parser.add_argument("--tls-cert", default=None, help="serve https with this certificate (needs --tls-key)")
+    parser.add_argument("--tls-key", default=None, help="the certificate's private key (needs --tls-cert)")
+    args = parser.parse_args(argv)
     if bool(args.tls_cert) != bool(args.tls_key):
-        p.error("--tls-cert and --tls-key go together")
+        parser.error("--tls-cert and --tls-key go together")
+
     try:
-        stub = for_scenario(args.scenario, args.provider, args.scenarios, work=args.work)
+        stub = for_scenario(
+            args.scenario, args.provider, args.scenarios, work=args.work if args.work is not None else os.getcwd()
+        )
     except scenarios.ScenarioError as e:
         print(f"mockprovider: {e}", file=sys.stderr)
         return 2
-    stopping = threading.Event()
+
+    stop = threading.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
-        signal.signal(sig, lambda *_: stopping.set())
+        signal.signal(sig, lambda *_: stop.set())
     stub.start((args.tls_cert, args.tls_key) if args.tls_cert else None)
     try:
         print(f"{PROVIDER_VARS[args.provider]}={stub.url}", flush=True)
-        stopping.wait()
+        stop.wait()
     finally:
         stub.stop()
     return 0

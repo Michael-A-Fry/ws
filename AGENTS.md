@@ -54,21 +54,21 @@ LICENSES/         third-party licence texts (see NOTICE)
 | `globals.py` | `ws globals`: what ws installs globally stays global |
 | `install.py` | `ws install` and `ws uninstall`: one setup engine that the terminal command and the setup... |
 | `jobs.py` | Job files: `$WS_HOME/jobs/<name>.toml`, one headless job each, run with `ws run <name>` |
-| `jsonl.py` | Bounded JSONL logs: one line per record, rotated at a size, with any one string field capped |
+| `jsonl.py` | Bounded, locked JSON-lines logs: one object per line, a size limit with rotation, and no lost lines |
 | `mcp_server.py` | `ws mcp serve`: a small MCP server over stdio, so any runner can search and add to memory and... |
 | `memory.py` | Memory module: Markdown files with front matter in a git repo, plus a rebuildable SQLite FTS5 index |
 | `modules.py` | Plugins (the modules in the code): the parts of ws you can switch on or off |
 | `notes.py` | Notes module: `ws note` drops a Markdown file into the `_inbox` of your own notes folder (any... |
 | `notesdetect.py` | Find notes you already keep: an Obsidian vault (a folder holding `.obsidian/`) or a Logseq graph... |
 | `osinfo.py` | Which machine are we on: macOS, Linux, Windows via WSL2, or native Windows (not supported; use WSL2) |
-| `output.py` | One output contract for every `ws` command: a typed error, one JSON envelope, and the global... |
+| `output.py` | The output contract for every `ws` command: one typed error, one JSON envelope, and two global flags |
 | `policy.py` | The policy: one vendor-neutral `policy.toml` that says what a session may do |
 | `profile.py` | The profile: one TOML file per person (machine answers, roles, caps) |
 | `rating.py` | `ws rate`: a thumbs up or down on a run, in one command |
 | `roles/` | Role adapters: one module per (role, adapter) pair |
 | `run.py` | `ws run JOB`: every headless job goes through here and leaves one complete record in `runs.jsonl` |
 | `runrecord.py` | The run record: one JSON line per headless job in `$WS_HOME/logs/runs.jsonl`, the same shape for... |
-| `runschema.py` | The JSON Schema (draft 2020-12) of a run record, as a Python dict: `ws secret wall` copies only... |
+| `runschema.py` | The JSON Schema (draft 2020-12) of one run record, as a Python dict: the shape of a line in... |
 | `sandbox.py` | The sandbox as the real wall: `ws gate launch --runner R -- argv` starts a runner inside an... |
 | `secrets.py` | The secrets registry and store, and `ws secret` |
 | `selfcmd.py` | How ws starts itself with this Python: `python -I -m ws`, so a folder named `ws/` in the working... |

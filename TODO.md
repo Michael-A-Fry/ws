@@ -57,7 +57,15 @@
 - [x] Public skills align, checkpoint, taste-gate, dataviz, scrubbed (#165); `doctor` records runner versions and runs
   `ws canary` on a change; `ws rate <run> up|down` beside runs.jsonl (#162) (PR #14)
 - [x] Role adapters anthropic, opencode, markdown-git, systemd, launchd, ntfy, restic, sops-age (PR #15)
-- [ ] The wall (PR #13): bound single-use approvals, sandbox behind the matcher, OpenCode nudge e2e; in fix round 2
-  then all steps wired to `ws install`
+- [x] The wall (PR #13): bound single-use approvals, a write-allowlist sandbox behind the matcher (bwrap + seccomp on
+  Linux, sandbox-exec on macOS, Claude Code's native sandbox), OpenCode nudge e2e; three Opus cold-review rounds
+- [x] Setup (PR #17): inline terminal setup and a localhost web page in the approved look (#182), wired to `ws install`
+  (PR #18); one CLI contract with typed errors, hints, `ws config`, `ws status` (PR #19)
+- [x] Pass test on main: `ws setup --yes` twice reports 0 changes; `ws uninstall --yes` leaves 0 paths behind
+- [ ] **Before the tag:** the wall's open class (known limits in policy.py): OpenCode cache binaries writable inside
+  the wall; the project lock misses not-yet-existing or renamed `.git/hooks`, `.claude`, `.opencode`
+- [ ] P3: under `WS_OUTPUT=json`, an argparse or `-C` error before dispatch on `gate check` prints the envelope to
+  stdout and nothing to stderr (still exit 2, still denies; the runner shows no reason)
+- [ ] P3: tests leak `WS_OUTPUT` and `WS_GATED_SESSION` from the environment; clear them in conftest
 - [ ] Known limit: the notify cap counts ws's own sends only; count notify leases in the broker
 - [ ] Known limit: sops-age is named but not read by the broker yet

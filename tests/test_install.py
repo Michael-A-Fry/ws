@@ -558,3 +558,13 @@ def test_uninstall_leaves_a_linked_work_root_alone(box, capsys, monkeypatch):
     (box / ".local" / "state" / "ws").symlink_to(elsewhere)
     assert run(capsys, "uninstall", "--yes")[0] == 0
     assert (elsewhere / "keep.txt").is_file()
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_a_blank_notes_value_counts_as_not_given_so_the_profile_folder_stays(box, capsys, blank):
+    notes = box / "Notes"
+    assert run(capsys, "install", *FULL, "--notes", str(notes))[0] == 0
+    after_first = snapshot(box)
+    code, out, _ = run(capsys, "install", *FULL, "--notes", blank)
+    assert code == 0 and "0 changes" in out
+    assert snapshot(box) == after_first

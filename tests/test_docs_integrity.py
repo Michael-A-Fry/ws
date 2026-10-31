@@ -125,3 +125,16 @@ def test_command_line_exit_codes(tmp_path):
     (root / "docs").mkdir()
     (root / "docs" / "new.md").write_text("# New\n", encoding="utf-8")
     assert "now exists" in cli("--allow-missing", str(pending)).stdout
+
+
+def test_two_stray_backticks_far_apart_do_not_hide_the_links_between_them(tmp_path):
+    text = "# A\n\nA stray ` here.\n\nSee [gone](missing.md) and [bad](#nope).\n\nAnother stray ` there.\n"
+    root = make_repo(tmp_path, {"docs/a.md": text})
+    found = " ".join(problems(root))
+    assert "missing.md" in found and "nope" in found
+
+
+def test_code_spans_on_one_line_still_hide_their_links_including_multi_backtick_ones(tmp_path):
+    text = "# A\n\nUse `[x](missing.md)` and ``[y](`gone.md`)`` in text.\n"
+    root = make_repo(tmp_path, {"docs/a.md": text})
+    assert problems(root) == []

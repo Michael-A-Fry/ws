@@ -539,6 +539,7 @@ def test_errors_end_with_a_line_that_says_what_to_try(box, capsys):
         assert err[0].startswith("ws: ") and hint in err[1]
 
 
+def test_help_reads_as_usage_flags_examples(capsys):
     with pytest.raises(SystemExit):
         cli.main(["setup", "--help"])
     out = capsys.readouterr().out

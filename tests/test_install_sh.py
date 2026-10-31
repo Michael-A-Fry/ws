@@ -735,9 +735,18 @@ def test_a_truncated_download_runs_nothing(box: Box):
         assert box.gh.hits == []
 
 
-def test_script_is_executable_and_carries_the_full_mit_text():
+def test_script_is_executable_and_is_apache_2_0_with_no_mit_text():
     assert os.access(INSTALL_SH, os.X_OK)
     text = INSTALL_SH.read_text(encoding="utf-8")
-    commented = [line[1:].lstrip(" ") for line in text.splitlines()[:40] if line.startswith("#")]
-    for line in licence:
-        assert not line or line in commented, line
+    assert "# SPDX-License-Identifier: Apache-2.0" in text.splitlines()[:5]
+    assert "MIT License" not in text and "Permission is hereby granted" not in text
+
+
+@pytest.mark.parametrize("blank", ["", "  "])
+def test_from_with_a_blank_folder_exits_2_and_does_not_fall_through_to_the_release(box: Box, blank: str):
+    ready(box)
+    r = box.run("--from", blank)
+    assert r.returncode == 2
+    assert "--from needs the folder of a checkout" in r.stdout + r.stderr
+    assert box.gh.hits == []
+    assert not any(c.startswith("uv tool") for c in box.calls())

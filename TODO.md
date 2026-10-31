@@ -60,6 +60,7 @@
 - [x] The wall (PR #13): bound single-use approvals, a write-allowlist sandbox behind the matcher (bwrap + seccomp on
   Linux, sandbox-exec on macOS, Claude Code's native sandbox), OpenCode nudge e2e; three Opus cold-review rounds
 - [x] Setup (PR #17): inline terminal setup and a localhost web page in the approved look (#182), wired to `ws install`
+- [x] From the outside-project assessment (#183, #184): repo AGENTS.md with a generated code map, install.sh, notice file
   (PR #18); one CLI contract with typed errors, hints, `ws config`, `ws status` (PR #19)
 - [x] Pass test on main: `ws setup --yes` twice reports 0 changes; `ws uninstall --yes` leaves 0 paths behind
 - [x] **Before the tag:** the wall's open class (known limits in policy.py): OpenCode cache binaries writable inside
@@ -105,6 +106,7 @@
   run's commit; Opus cold review, 8 findings fixed
 - [x] `ws version [--json]` (commit, dirty, build date, install source) with a CI check against the checkout's HEAD
 - [x] `install.sh` installs the latest release's wheel after its SHA-256 (and cosign 3+ when installed) verifies
+- [x] Docs to #158: README reordered, Diátaxis tree (30 pages), a page and a how-to per safety rule, known limits,
   SECURITY/SUPPORT/CONTRIBUTING/CHANGELOG, Vale (Microsoft) and the docs-integrity check in `ci`, PR template,
   pre-push hook, issue forms; private vulnerability reporting on
 - [x] Write-up 1 (`docs/explanation/write-up-1.md`)

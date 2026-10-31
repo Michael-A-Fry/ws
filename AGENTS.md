@@ -1,6 +1,6 @@
 # AGENTS.md: ws
 
-AGENTS.md (MIT; see NOTICE). Humans: start with README.md.
+Read by any coding agent (Claude Code, OpenCode, Codex and others) working in this repo. Humans: start with README.md.
 
 ## Overview
 
@@ -17,7 +17,6 @@ tests/            pytest; tests/e2e/ needs real runners and skips without them
 scripts/          repo checks run by prek and CI (PII gate, fresh-doctor check, docs integrity, this code map)
 .github/          CI workflows, issue forms, the PR template, the opt-in pre-push hook; .vale.ini sets the prose lint
 install.sh        the installer people run first (pipx or uv)
-LICENSES/         third-party licence texts (see NOTICE)
 ```
 
 ## Where to look
@@ -51,28 +50,28 @@ LICENSES/         third-party licence texts (see NOTICE)
 | `frontmatter.py` | YAML front matter, the safe subset: stdlib only |
 | `gate.py` | `ws gate`: turn the policy into each runner's own config, and answer the hooks |
 | `globals.py` | `ws globals`: what ws installs globally stays global |
-| `install.py` | `ws install` and `ws uninstall`: one setup engine that the terminal command and the setup... |
+| `install.py` | `ws install` and `ws uninstall`: the engine that plans, writes and undoes what ws puts on a machine |
 | `jobs.py` | Job files: `$WS_HOME/jobs/<name>.toml`, one headless job each, run with `ws run <name>` |
-| `jsonl.py` | Bounded JSONL logs: one line per record, rotated at a size, with any one string field capped |
+| `jsonl.py` | Bounded, locked JSON-lines logs: one object per line, a size limit with rotation, and no lost lines |
 | `mcp_server.py` | `ws mcp serve`: a small MCP server over stdio, so any runner can search and add to memory and... |
 | `memory.py` | Memory module: Markdown files with front matter in a git repo, plus a rebuildable SQLite FTS5 index |
 | `modules.py` | Plugins (the modules in the code): the parts of ws you can switch on or off |
 | `notes.py` | Notes module: `ws note` drops a Markdown file into the `_inbox` of your own notes folder (any... |
 | `notesdetect.py` | Find notes you already keep: an Obsidian vault (a folder holding `.obsidian/`) or a Logseq graph... |
 | `osinfo.py` | Which machine are we on: macOS, Linux, Windows via WSL2, or native Windows (not supported; use WSL2) |
-| `output.py` | One output contract for every `ws` command: a typed error, one JSON envelope, and the global... |
+| `output.py` | The output contract for every `ws` command: one typed error, one JSON envelope, and two global flags |
 | `policy.py` | The policy: one vendor-neutral `policy.toml` that says what a session may do |
 | `profile.py` | The profile: one TOML file per person (machine answers, roles, caps) |
 | `rating.py` | `ws rate`: a thumbs up or down on a run, in one command |
 | `roles/` | Role adapters: one module per (role, adapter) pair |
 | `run.py` | `ws run JOB`: every headless job goes through here and leaves one complete record in `runs.jsonl` |
 | `runrecord.py` | The run record: one JSON line per headless job in `$WS_HOME/logs/runs.jsonl`, the same shape for... |
-| `runschema.py` | The JSON Schema (draft 2020-12) of a run record, as a Python dict: `ws secret wall` copies only... |
+| `runschema.py` | The JSON Schema (draft 2020-12) of one run record, as a Python dict: the shape of a line in... |
 | `sandbox.py` | The sandbox as the real wall: `ws gate launch --runner R -- argv` starts a runner inside an... |
 | `secrets.py` | The secrets registry and store, and `ws secret` |
 | `selfcmd.py` | How ws starts itself with this Python: `python -I -m ws`, so a folder named `ws/` in the working... |
 | `session.py` | `ws session`: tell a long-running session once when ws has been updated under it |
-| `setup_ui/` | `ws setup`: the first-run and re-run setup, inline in your terminal (default) or in a page in... |
+| `setup_ui/` | `ws setup`: the first-run and re-run setup, walked in your terminal (the default) or in a local... |
 | `skills/` | The skills ws ships (`align`, `checkpoint`, `taste-gate`, `dataviz`) and how they get onto a machine |
 | `status.py` | `ws status`: for each runner, every rules, skill, hook and MCP file it will load here, with... |
 | `testing/` | Test support that ships with ws: the mock model provider and its scenarios |

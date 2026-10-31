@@ -4,9 +4,17 @@
 # macOS, Linux, WSL2 and the lab VM (.github/workflows/cli.yml, lab.yml).
 #
 # The model is the mock provider (`python -m ws.testing.mockprovider`, scenario first_task): no network, no paid
-# provider, no real key. The key in the store is a placeholder; the broker (the one `ws run` leases from) is started in
-# plain-http mode, as the end-to-end tests do, because the real `ws broker serve` has no switch for http. The runner is
-# Claude Code when it is installed, else OpenCode (WS_E2E_RUNNER=claude-code|opencode picks one).
+# provider, no real key. It serves https on 127.0.0.1 with a throw-away certificate (made with openssl, 127.0.0.1 as its
+# subject alternative name), and the key in the store is a placeholder. The broker is the real one, `ws broker serve` on
+# the default socket in WS_HOME, started the way a person's service would be, with SSL_CERT_FILE naming that
+# certificate so it trusts the mock; `ws run` leases from it, and the broker relays over real TLS. The job has no `cwd`,
+# so the run's default working folder is what gets tested: the mock writes a relative file, and the script reads the
+# folder back from the run record. The runner is Claude Code when it is installed, else OpenCode
+# (WS_E2E_RUNNER=claude-code|opencode picks one).
+#
+# What that does not prove: the real provider's certificate chain and hostnames (the mock's certificate is trusted by
+# file), and anything about a real model. Where the secret wall is in use (a separate system user holds the store) the
+# broker runs as that user; here it runs as the person.
 #
 # Writes e2e-timing.json (WS_E2E_OUT to move it):
 #   {cell, os, steps: [{name, seconds, exit, ok}], total_seconds, run_id, run_duration_ms, ws_version, runner}
@@ -95,17 +103,15 @@ if command -v uv >/dev/null 2>&1; then
     export UV_CACHE_DIR UV_PYTHON_INSTALL_DIR
 fi
 
-BASE="$(mktemp -d "${TMPDIR:-/tmp}/ws-e2e.XXXXXX")" || exit 1
-BASE="$(cd "$BASE" && pwd)"
-SOCK_DIR="$(mktemp -d /tmp/wsb.XXXXXX)" || exit 1 # a Unix socket path tops out near 100 characters
-unset XDG_BIN_HOME XDG_DATA_HOME XDG_CONFIG_HOME XDG_STATE_HOME XDG_CACHE_HOME
+# Under /tmp, not TMPDIR: the broker socket is $WS_HOME/run/broker.sock, and a Unix socket path tops out near 100
+# characters (macOS's TMPDIR alone is 50).
+BASE="$(mktemp -d /tmp/ws-e2e.XXXXXX)" || exit 1
+unset XDG_BIN_HOME XDG_DATA_HOME XDG_CONFIG_HOME XDG_STATE_HOME XDG_CACHE_HOME WS_BROKER_SOCKET
 unset_provider_vars
 export HOME="$BASE/home"
 export WS_HOME="$BASE/ws home" # a space in the path, on purpose
-export WS_BROKER_SOCKET="$SOCK_DIR/b.sock"
-PROJECT="$BASE/project"
 LOGS="$BASE/logs"
-mkdir -p "$HOME" "$WS_HOME" "$PROJECT" "$LOGS"
+mkdir -p "$HOME" "$WS_HOME" "$LOGS"
 export PATH="$HOME/.local/bin:$PATH"
 
 STEPS="$BASE/steps.tsv"
@@ -150,7 +156,6 @@ cleanup() {
     [ -n "$BROKER_PID" ] && kill "$BROKER_PID" 2> /dev/null
     [ -n "$MOCK_PID" ] && kill "$MOCK_PID" 2> /dev/null
     wait 2> /dev/null
-    rm -rf "$SOCK_DIR"
     write_json
     if [ "${WS_E2E_KEEP:-0}" = "1" ]; then
         echo "e2e: scratch folder kept at $BASE"
@@ -223,11 +228,32 @@ pick_runner() {
 
 do_setup() { ws setup --yes --runner "$RUNNER" --cap 20; }
 
+# A self-signed certificate for 127.0.0.1 that is also its own authority: Python 3.13+ checks strictly, so it says so.
+# A config file, not -addext, because macOS's openssl is LibreSSL.
+make_cert() {
+    cat > "$BASE/cert.cnf" << 'CNF'
+[req]
+distinguished_name = dn
+x509_extensions = v3
+prompt = no
+[dn]
+CN = 127.0.0.1
+[v3]
+basicConstraints = critical,CA:TRUE
+keyUsage = critical,keyCertSign,digitalSignature,keyEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = IP:127.0.0.1
+CNF
+    openssl req -x509 -newkey rsa:2048 -nodes -keyout "$BASE/mock-key.pem" -out "$BASE/mock-cert.pem" -days 2 \
+        -config "$BASE/cert.cnf"
+}
+
+# The mock writes ./hello.txt: relative to the runner's working folder, which `ws run` chooses.
 start_mock() {
-    local provider=anthropic i url
+    local provider=anthropic i url=""
     [ "$RUNNER" = "opencode" ] && provider=openai
-    "$WSPY" -I -m ws.testing.mockprovider --scenario first_task --provider "$provider" --work "$PROJECT" \
-        > "$BASE/mock.out" 2> "$BASE/mock.err" &
+    "$WSPY" -I -m ws.testing.mockprovider --scenario first_task --provider "$provider" --work . \
+        --tls-cert "$BASE/mock-cert.pem" --tls-key "$BASE/mock-key.pem" > "$BASE/mock.out" 2> "$BASE/mock.err" &
     MOCK_PID=$!
     i=0
     while [ "$i" -lt 100 ]; do
@@ -242,33 +268,21 @@ start_mock() {
         cat "$BASE/mock.err"
         return 1
     fi
-    MOCK_HOST="${url#http://}"
-    echo "mock provider ($provider) at $url, writing to $PROJECT"
+    MOCK_HOST="${url#https://}"
+    echo "mock provider ($provider) at $url"
 }
 
-# The registry and a placeholder value for the mock's host, then a broker that may speak plain http to it.
+# The registry and a placeholder value for the mock's host, then the real broker, on the default socket.
 start_broker() {
     local header=x-api-key i
     [ "$RUNNER" = "opencode" ] && header=authorization
     printf '[mockkey]\nhosts = ["%s"]\npurposes = ["run"]\nheader = "%s"\n' "$MOCK_HOST" "$header" > "$WS_HOME/secrets.toml"
     printf '%s' "$PLACEHOLDER_KEY" | ws secret set mockkey || return 1
-    cat > "$BASE/broker.py" << 'PY'
-import signal
-import sys
-
-from ws import broker
-
-b = broker.Broker.from_env(sys.argv[1], None, 0, 3600, allow_plain_http=True)
-signal.signal(signal.SIGTERM, lambda *_: b.request_stop())
-b.start()
-print("ready", flush=True)
-b._stopped.wait()
-PY
-    "$WSPY" -I "$BASE/broker.py" "$WS_BROKER_SOCKET" > "$BASE/broker.out" 2> "$BASE/broker.err" &
+    SSL_CERT_FILE="$BASE/mock-cert.pem" ws broker serve > "$BASE/broker.out" 2> "$BASE/broker.err" &
     BROKER_PID=$!
     i=0
     while [ "$i" -lt 100 ]; do
-        grep -q '^ready' "$BASE/broker.out" 2> /dev/null && return 0
+        ws broker status > /dev/null 2>&1 && return 0
         kill -0 "$BROKER_PID" 2> /dev/null || break
         sleep 0.2
         i=$((i + 1))
@@ -288,7 +302,6 @@ write_job() {
             printf 'model = "stub/m"\nallow_unpriced = true\n' # a stub model has no price
         fi
         printf 'prompt = "Write hello.txt in this folder."\ntimeout_s = 240\n'
-        printf 'cwd = "%s"\n' "$PROJECT"
         printf '\n[runner_options]\n'
         if [ "$RUNNER" = "claude-code" ]; then
             printf 'allowed_tools = ["Edit"]\n'
@@ -305,14 +318,6 @@ do_run() { ws run first-task; }
 
 # The job's file landed, and the run record says ok with a duration.
 check_run() {
-    [ -f "$PROJECT/hello.txt" ] || {
-        echo "the job's file did not land: $PROJECT/hello.txt"
-        return 1
-    }
-    grep -q hello "$PROJECT/hello.txt" || {
-        echo "hello.txt does not say hello"
-        return 1
-    }
     ws runs --last 1 --json > "$BASE/runs.json" || return 1
     "$WSPY" -I - "$BASE/runs.json" "$BASE/record.tsv" << 'PY'
 import json
@@ -329,13 +334,30 @@ if not isinstance(rec.get("duration_ms"), int) or rec["duration_ms"] <= 0:
 if problems:
     sys.exit("run record: " + "; ".join(problems))
 with open(sys.argv[2], "w", encoding="utf-8") as fh:
-    fh.write(f"{rec['run_id']}\t{rec['duration_ms']}\n")
+    fh.write(f"{rec['run_id']}\t{rec['duration_ms']}\t{rec.get('cwd') or ''}\n")
 PY
     local rc=$?
     [ "$rc" = "0" ] || return "$rc"
     RUN_ID="$(cut -f1 "$BASE/record.tsv")"
     RUN_MS="$(cut -f2 "$BASE/record.tsv")"
-    echo "run $RUN_ID ok in $RUN_MS ms"
+    WORK="$(cut -f3 "$BASE/record.tsv")"
+    echo "run $RUN_ID ok in $RUN_MS ms, working folder $WORK"
+    # the default working folder: under the state dir, never inside WS_HOME (the wall makes that read-only)
+    case "$WORK" in
+        "$HOME/.local/state/ws/work/"*) ;;
+        *)
+            echo "the working folder is not under $HOME/.local/state/ws/work/: $WORK"
+            return 1
+            ;;
+    esac
+    [ -f "$WORK/hello.txt" ] || {
+        echo "the job's file did not land: $WORK/hello.txt"
+        return 1
+    }
+    grep -q hello "$WORK/hello.txt" || {
+        echo "hello.txt does not say hello"
+        return 1
+    }
 }
 
 do_rate() { ws rate last up; }
@@ -349,12 +371,16 @@ do_tool_uninstall() {
     fi
 }
 
-# What is in HOME now must be what was there before the install. Three things are not ws's and are left out of the
-# comparison: the runner's own state (Claude Code's sessions and settings, OpenCode's data, the npm log Claude Code
-# writes), uv's empty tool folders after `uv tool uninstall`, and macOS's ~/Library. ws's own files (skills under
-# ~/.claude/skills, the notes and memory folders, the `ws` command) are compared.
-RUNNER_STATE='^~/\.claude\.json|^~/\.claude/([^s]|s[^k])|^~/\.claude$|^~/\.config/anthropic|^~/\.npm|/opencode(/|$)'
-RUNNER_STATE="$RUNNER_STATE|^~/\.(local|config|cache)$|^~/\.local/(share|state)$|^~/\.local/bin$|^~/\.local/share/uv|^~/Library"
+# What is in HOME now must be what was there before the install, apart from state that is not ws's: the runners' own
+# (Claude Code's sessions, backups and settings; OpenCode's data, state and cache; the npm log and the folder Claude Code
+# writes), uv's empty tool folders after `uv tool uninstall`, and macOS's caches. Those are named one by one, so what ws
+# put under the same folders (skills in ~/.claude/skills, the work folder in ~/.local/state/ws) counts as residue.
+CLAUDE_STATE='^~/\.claude\.json|^~/\.claude/(projects|backups|dev-mods|seed-admin|sessions|ssh|shell-snapshots|todos'
+CLAUDE_STATE="$CLAUDE_STATE|statsig|telemetry|cache|plugins|history\.jsonl|ide|logs)(/|\$)|^~/\.config/anthropic|^~/\.npm(/|\$)"
+OPENCODE_STATE='^~/\.(local/share|local/state|cache|config)/opencode(/|$)'
+OTHER_STATE='^~/\.claude$|^~/\.(local|config|cache)$|^~/\.local/(share|state)$|^~/\.local/bin$|^~/\.local/share/uv'
+OTHER_STATE="$OTHER_STATE|^~/Library$|^~/Library/(Caches|Application Support|Logs)(/|\$)"
+RUNNER_STATE="$CLAUDE_STATE|$OPENCODE_STATE|$OTHER_STATE"
 check_residue() {
     list_home > "$BASE/after.txt"
     local left
@@ -376,6 +402,7 @@ main() {
     run_step doctor "0 1" ws doctor --offline || return 1 # 1 is the normal answer: roles are still to set up
     run_step pick_runner "0" pick_runner || return 1
     run_step setup "0" do_setup || return 1
+    run_step mock_cert "0" make_cert || return 1
     run_step mock_start "0" start_mock || return 1
     run_step broker_start "0" start_broker || return 1
     run_step write_job "0" write_job || return 1

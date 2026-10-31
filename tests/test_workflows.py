@@ -51,7 +51,18 @@ def test_lab_workflow_asks_for_the_lab_runner_and_reads_only():
     assert runs_on and set(runs_on) == {"[self-hosted, ws-lab]"}, runs_on
     assert [line.strip() for line in top_level(text, "permissions")] == ["contents: read"]
     assert "persist-credentials: false" in text
-    assert "--ephemeral" in (ROOT / "docs" / "lab.md").read_text(encoding="utf-8")
+    doc = (ROOT / "docs" / "lab.md").read_text(encoding="utf-8")
+    for needed in ("generate-jitconfig", "fork-pr-contributor-approval", "all_external_contributors", "--token-file"):
+        assert needed in doc, needed
+
+
+def test_lab_workflow_refuses_in_its_first_step_unless_it_is_the_owners_tag_or_dispatch():
+    text = (WORKFLOWS / "lab.yml").read_text(encoding="utf-8")
+    first = text.split("    steps:\n", 1)[1].split("      - uses:", 1)[0]
+    assert "github.repository_owner" in first and "github.actor" in first and "github.repository }}" in first
+    assert 'REPO" != "Michael-A-Fry/ws"' in first and 'ACTOR" != "$OWNER"' in first
+    assert "push:refs/tags/v*" in first and "workflow_dispatch:*" in first
+    assert first.count("exit 1") == 3  # a wrong repository, a wrong actor, a wrong event
 
 
 def test_no_other_workflow_uses_the_lab_runner():
@@ -131,3 +142,29 @@ def test_the_script_is_valid_bash_and_has_no_bash_4_only_features():
     for bash4 in ("declare -A", "mapfile", "readarray", "${EPOCHREALTIME", "&>>", "|&", ";&", "${@^^}", ",,}"):
         assert bash4 not in text, bash4
     assert text.startswith("#!/usr/bin/env bash") and "set -u" in text
+
+
+@posix_only
+def test_the_host_cycle_script_is_valid_bash_and_keeps_the_token_off_the_command_line():
+    script = ROOT / "scripts" / "lab-host-cycle.sh"
+    assert subprocess.run([BASH, "-n", str(script)], check=False).returncode == 0
+    text = script.read_text(encoding="utf-8")
+    assert "generate-jitconfig" in text and "--config -" in text and "--token-file" in text
+    assert not re.search(r"curl[^\n]*(Bearer \$TOKEN|-H \"Authorization)", text.replace("printf", ""))
+
+
+@posix_only
+def test_the_host_cycle_script_refuses_a_token_file_open_to_others(tmp_path: Path):
+    token = tmp_path / "token"
+    token.write_text("x", encoding="utf-8")
+    token.chmod(0o644)
+    r = subprocess.run(
+        [BASH, str(ROOT / "scripts" / "lab-host-cycle.sh"), "--token-file", str(token), "--vm-id", "1",
+         "--node", "n", "--snapshot", "s"],
+        capture_output=True, text=True, timeout=30, check=False,
+    )  # fmt: skip
+    assert r.returncode == 1 and "must be 0600" in r.stderr
+    assert (
+        subprocess.run([BASH, str(ROOT / "scripts" / "lab-host-cycle.sh")], capture_output=True, check=False).returncode
+        == 2
+    )

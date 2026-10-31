@@ -1,11 +1,15 @@
 # The lab VM cell (ADR 0011, Tier 1): the same timed first-task run as the other cells, on a self-hosted runner in the
-# lab. It runs on a release tag or by hand, and NEVER on a pull request: a fork's pull request must not be able to
-# reach a machine on the lab network. Do not add pull_request or pull_request_target here; tests/test_workflows.py
-# fails the build if someone does.
+# lab. It runs on a release tag or by hand, and never on a pull request: do not add pull_request or
+# pull_request_target here; tests/test_workflows.py fails the build if someone does.
 #
-# This workflow resets nothing itself. The lab VM is reset from its clean snapshot by the host before each job (the
-# runner is registered --ephemeral, so it takes one job and goes), which is what makes "a fresh machine" true. docs/lab.md
-# has the reset and the runner registration. Until a runner with the label `ws-lab` exists, the job just queues.
+# Leaving the trigger out is NOT what protects the runner: a fork's pull request can bring its own workflow file with
+# `runs-on: [self-hosted, ws-lab]`. What protects it is in docs/lab.md: a single-use runner on a VM that is reset after
+# every job, the repository's approval rule for outside contributors' workflow runs, and the tag ruleset. The first
+# step below is a last check inside the job, not the defence.
+#
+# This workflow resets nothing itself. The lab VM is reset from its clean snapshot by the host before each job
+# (scripts/lab-host-cycle.sh), which is what makes "a fresh machine" true. Until a runner with the label `ws-lab`
+# exists, the job just queues.
 name: lab
 on:
   push:
@@ -22,6 +26,22 @@ jobs:
     runs-on: [self-hosted, ws-lab]
     timeout-minutes: 30
     steps:
+      # Refuse unless this is the owner's repository, started by the owner, from a release tag or by hand.
+      - name: refuse anything but the owner's release tag or dispatch
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          ACTOR: ${{ github.actor }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [ "$REPO" != "Michael-A-Fry/ws" ]; then echo "not the owner's repository: $REPO" >&2; exit 1; fi
+          if [ "$ACTOR" != "$OWNER" ]; then echo "started by $ACTOR, not by the repository owner" >&2; exit 1; fi
+          case "$EVENT:$REF" in
+            push:refs/tags/v*) ;;
+            workflow_dispatch:*) ;;
+            *) echo "event $EVENT on $REF is not a release tag or a manual dispatch" >&2; exit 1 ;;
+          esac
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false

@@ -49,11 +49,15 @@ Each job starts from a clean machine, and the host, not the workflow and not the
 3. Ask GitHub for a just-in-time runner configuration (`POST /repos/{owner}/{repo}/actions/runners/generate-jitconfig`,
    label `ws-lab`). A JIT runner is always single-use: it takes one job, then GitHub removes it.
 4. Write that configuration into the VM through the guest agent, as `/etc/ws-lab/jitconfig`.
-5. Wait until GitHub forgets the runner, which is when its one job has finished (or a timeout, when the runner is
-   removed through the API), then stop the VM.
+5. Wait until GitHub answers 404 for the runner, which is when its one job has finished, then stop the VM. Any other
+   answer (a 5xx, a rate limit, no network) is retried with a longer wait and never ends the cycle early; on the timeout
+   the runner is removed through the API and the VM is stopped.
 
-The repository-admin token that step 3 needs lives on the host only, in a file (mode 0600) whose path is given as
-`--token-file`. The VM never sees it. Run a cycle when a `lab` run is queued, from a timer on the host or by hand:
+The token that step 3 needs is a fine-grained personal access token for this one repository, with the Administration
+permission set to write and nothing else. It lives on the host only, in a file (mode 0600) whose path is given as
+`--token-file`. The VM never sees it, and the configuration goes in on the standard input of `qm guest exec --pass-stdin`
+(Proxmox VE 8 or newer), so it is not on the host's command line either. Run a cycle when a `lab` run is queued,
+from a timer on the host or by hand:
 
 ```sh
 scripts/lab-host-cycle.sh --token-file /path/to/token --vm-id VMID --node NODE --snapshot SNAPSHOT

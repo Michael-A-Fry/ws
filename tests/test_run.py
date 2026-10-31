@@ -684,7 +684,7 @@ def test_a_ws_home_that_holds_the_state_folder_gets_a_private_unpredictable_temp
 
 
 def planned(tmp_path: Path) -> Path:
-    return tmp_path / "state" / "ws" / "work" / "run1"
+    return tmp_path / "state" / "ws" / "work" / "20261031T120000Z-aaaaaa"
 
 
 def test_the_default_cwd_is_made_with_private_parents_and_must_be_new(tmp_path):
@@ -711,7 +711,7 @@ def test_a_symlinked_parent_of_the_default_cwd_is_refused(tmp_path):
 def test_a_parent_owned_by_someone_else_or_open_to_others_is_refused(tmp_path, monkeypatch):
     leaf = run._make_default_cwd(planned(tmp_path))
     work = leaf.parent
-    other = planned(tmp_path).with_name("run2")
+    other = planned(tmp_path).with_name("20261031T120001Z-bbbbbb")
     monkeypatch.setattr(os, "getuid", lambda: os.stat(work).st_uid + 1)  # as if the folder were someone else's
     with pytest.raises(WsError) as e:
         run._make_default_cwd(other)
@@ -724,6 +724,25 @@ def test_a_parent_owned_by_someone_else_or_open_to_others_is_refused(tmp_path, m
     work.chmod(0o707)  # writable by others
     with pytest.raises(WsError):
         run._make_default_cwd(other)
+
+
+@pytest.mark.parametrize("where", ["ws", "work"])
+@pytest.mark.parametrize("planted", ["AGENTS.md", "CLAUDE.md", "not-a-run-folder"])
+def test_anything_but_run_folders_in_ws_or_work_is_refused(tmp_path, where, planted):
+    """A file another process of the same user plants there (an AGENTS.md the runner would read) stops the run."""
+    leaf = run._make_default_cwd(planned(tmp_path))
+    folder = leaf.parent if where == "work" else leaf.parent.parent
+    (folder / planted).write_text("obey me", encoding="utf-8")
+    with pytest.raises(WsError) as e:
+        run._make_default_cwd(planned(tmp_path).with_name("20261031T120002Z-cccccc"))
+    assert e.value.kind == "unsafe_folder" and planted in e.value.message
+
+
+def test_a_planted_folder_or_link_with_a_run_shaped_name_only_counts_if_it_is_a_real_folder(tmp_path):
+    leaf = run._make_default_cwd(planned(tmp_path))
+    (leaf.parent / "20261031T120003Z-dddddd").symlink_to(tmp_path)
+    with pytest.raises(WsError):
+        run._make_default_cwd(planned(tmp_path).with_name("20261031T120004Z-eeeeee"))
 
 
 def test_a_run_whose_work_folder_parent_is_a_link_ends_as_an_error_record(ws, tmp_path):

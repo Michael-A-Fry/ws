@@ -168,3 +168,47 @@ def test_the_host_cycle_script_refuses_a_token_file_open_to_others(tmp_path: Pat
         subprocess.run([BASH, str(ROOT / "scripts" / "lab-host-cycle.sh")], capture_output=True, check=False).returncode
         == 2
     )
+
+
+@posix_only
+def test_the_host_cycle_waits_for_a_real_404_and_keeps_the_jit_config_off_the_command_line(tmp_path: Path):
+    """With stub qm, curl and sleep: GitHub blips (502, no answer) do not end the cycle; 404 does; the VM is stopped last."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    jit = "jit-" + os.urandom(8).hex()
+    (bin_dir / "sleep").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    (bin_dir / "qm").write_text(
+        f'#!/bin/sh\necho "qm $*" >> "{tmp_path}/qm.log"\ncase "$1 $2" in "guest exec") cat > "{tmp_path}/jit.in";; esac\n',
+        encoding="utf-8",
+    )
+    (bin_dir / "curl").write_text(
+        f"""#!/bin/sh
+cat > /dev/null
+case "$*" in
+  *http_code*)
+    n=$(cat "{tmp_path}/count" 2>/dev/null || echo 0); n=$((n + 1)); echo $n > "{tmp_path}/count"
+    case $n in 1) printf 502;; 2) printf 000;; 3) printf 200;; *) printf 404;; esac ;;
+  *generate-jitconfig*) echo '{{"runner": {{"id": 42}}, "encoded_jit_config": "{jit}"}}' ;;
+  *) echo '{{}}' ;;
+esac
+""",
+        encoding="utf-8",
+    )
+    for f in bin_dir.iterdir():
+        f.chmod(f.stat().st_mode | stat.S_IXUSR)
+    token = tmp_path / "token"
+    token.write_text("t", encoding="utf-8")
+    token.chmod(0o600)
+    env = {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "HOME": str(tmp_path)}
+    r = subprocess.run(
+        [BASH, str(ROOT / "scripts" / "lab-host-cycle.sh"), "--token-file", str(token), "--vm-id", "7", "--node", "n",
+         "--snapshot", "clean"],
+        env=env, capture_output=True, text=True, timeout=60, check=False,
+    )  # fmt: skip
+    assert r.returncode == 0, r.stdout + r.stderr
+    calls = (tmp_path / "qm.log").read_text(encoding="utf-8").splitlines()
+    assert calls[:3] == ["qm stop 7", "qm rollback 7 clean", "qm start 7"]
+    assert calls[-1] == "qm stop 7" and calls.count("qm stop 7") == 2  # at the start, and once the job was done
+    assert (tmp_path / "jit.in").read_text(encoding="utf-8") == jit  # on stdin
+    assert jit not in "\n".join(calls) and jit not in r.stdout + r.stderr  # never on a command line
+    assert (tmp_path / "count").read_text(encoding="utf-8").strip() == "4"  # 502, no answer, 200, then 404

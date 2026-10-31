@@ -12,8 +12,8 @@
 # folder back from the run record. The runner is Claude Code when it is installed, else OpenCode
 # (WS_E2E_RUNNER=claude-code|opencode picks one).
 #
-# What that does not prove: the real provider's certificate chain and hostnames (the mock's certificate is trusted by
-# file), and anything about a real model. Where the secret wall is in use (a separate system user holds the store) the
+# What that does not prove: `ws run`'s own broker auto-start (the broker is started here, as a service would), the real
+# provider's certificate chain and hostnames (the mock's certificate is trusted by file), and anything about a real model. Where the secret wall is in use (a separate system user holds the store) the
 # broker runs as that user; here it runs as the person.
 #
 # Writes e2e-timing.json (WS_E2E_OUT to move it):

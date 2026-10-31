@@ -210,8 +210,13 @@ def default_cwd(home: Path, run_id: str, env: dict[str, str] | None = None) -> P
     return None if folder.is_relative_to(home) else folder
 
 
-def _check_private(folder: Path) -> None:
-    """Refuse a folder that is a link, is not ours, or that group or others can write to (lstat: a link is not followed)."""
+_RUN_FOLDER = re.compile(r"^\d{8}T\d{6}Z-[0-9a-f]{6}$")  # runrecord.new_run_id
+
+
+def _check_private(folder: Path, allowed: re.Pattern) -> None:
+    """Refuse a folder that is a link, is not ours, that group or others can write to (lstat: a link is not followed), or
+    that holds anything but folders whose names match `allowed`. The last one blocks a file planted by another process of
+    the same user (an AGENTS.md or CLAUDE.md the runner would read from a parent of its working folder)."""
     st = os.lstat(folder)
     if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o022:
         raise WsError(
@@ -219,6 +224,13 @@ def _check_private(folder: Path) -> None:
             f"{folder} is not a private folder of yours (a link, someone else's, or writable by others)",
             f"look at it, and remove or fix it, or set XDG_STATE_HOME to a folder of your own: `ls -ld {folder}`",
         )
+    for child in folder.iterdir():
+        if not allowed.match(child.name) or child.is_symlink() or not child.is_dir():
+            raise WsError(
+                "unsafe_folder",
+                f"{child} should not be in {folder}: only ws's own folders belong there",
+                f"look at it, and move it away if it is yours, or set XDG_STATE_HOME to a folder of your own: `ls -la {folder}`",
+            )
 
 
 def _make_default_cwd(planned: Path | None) -> Path:
@@ -228,10 +240,10 @@ def _make_default_cwd(planned: Path | None) -> Path:
     if planned is None:
         return Path(tempfile.mkdtemp(prefix="ws-work-"))  # private (0700) and unpredictable
     planned.parent.parent.parent.mkdir(parents=True, exist_ok=True)
-    for folder in (planned.parent.parent, planned.parent):
+    for folder, allowed in ((planned.parent.parent, re.compile(r"^work$")), (planned.parent, _RUN_FOLDER)):
         with contextlib.suppress(FileExistsError):
             os.mkdir(folder, 0o700)
-        _check_private(folder)
+        _check_private(folder, allowed)
     try:
         os.mkdir(planned, 0o700)
     except FileExistsError as e:

@@ -28,7 +28,7 @@ jobs:
           curl -sSfL -o /tmp/gl.tgz "https://github.com/gitleaks/gitleaks/releases/download/v$v/gitleaks_${v}_linux_x64.tar.gz"
           echo "$sum  /tmp/gl.tgz" | sha256sum -c -
           tar -xzf /tmp/gl.tgz -C /tmp gitleaks
-          /tmp/gitleaks git --redact --exit-code 1 --no-banner .
+          /tmp/gitleaks git --redact --exit-code 1 --no-banner --log-opts="HEAD" .  # HEAD only: other branches are theirs
       - name: PII gate over the full history
         run: python3 scripts/pii_gate.py --history
       - name: hooks (ruff, typos, rumdl, PII gate on every tracked file)

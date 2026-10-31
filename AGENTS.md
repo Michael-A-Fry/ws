@@ -15,7 +15,8 @@ model) are filled by adapters found by scanning a folder. Apache-2.0, signed com
 ```text
 src/ws/           the package: one module per concern; adapters/ (runners), roles/ (role adapters), skills/ (text)
 tests/            pytest; tests/e2e/ needs real runners and skips without them
-scripts/          repo checks run by prek and CI (PII gate, fresh-doctor check, this code map)
+scripts/          repo checks run by prek and CI (PII gate, fresh-doctor check, docs integrity, this code map)
+.github/          CI workflows, issue forms, the PR template, the opt-in pre-push hook; .vale.ini sets the prose lint
 install.sh        the installer people run first (pipx or uv)
 LICENSES/         third-party licence texts (see NOTICE)
 ```
@@ -77,6 +78,7 @@ LICENSES/         third-party licence texts (see NOTICE)
 | `status.py` | `ws status`: for each runner, every rules, skill, hook and MCP file it will load here, with... |
 | `testing/` | Test support that ships with ws: the mock model provider and its scenarios |
 | `usage.py` | The Console usage check: can ws read the provider's own usage report, the billing truth... |
+| `version.py` | `ws version`: which build is this, where did it come from, and where is it installed |
 
 <!-- code-map:end -->
 
@@ -121,5 +123,7 @@ uv run --locked pytest -q            # the whole suite (tests/e2e skips without 
 uvx prek run --all-files             # gitleaks, ruff, typos, rumdl, actionlint, shellcheck, PII gate, globals, code map
 uv run --locked ws doctor --offline  # the installed tool checking itself; exit 1 for unconfigured roles is expected
 python3 scripts/gen_code_map.py      # regenerate the code map above after changing a module docstring
+python3 scripts/check_docs_integrity.py  # links, anchors, policy files
+git config core.hooksPath .github/hooks  # once: prek and the suite before each push (WS_SKIP_PREPUSH=1 skips, logged)
 bash install.sh --dry-run            # what the installer would do, without installing
 ```

@@ -35,7 +35,8 @@
 
 set -euo pipefail
 
-REPO_URL="https://github.com/Michael-A-Fry/ws"
+REPO_SLUG="Michael-A-Fry/ws"
+REPO_URL="https://github.com/${REPO_SLUG}"
 RAW_URL="https://raw.githubusercontent.com/Michael-A-Fry/ws/main/install.sh"
 PACKAGE="ws-aitoolkit"
 
@@ -83,20 +84,27 @@ print_usage() {
 Usage: bash install.sh [options]
    or: curl -fsSL ${RAW_URL} | bash -s -- [options]
 
-Installs the ws command with uv or pipx, then checks it runs. By default it installs the latest release tag from
-GitHub. While no release tag exists yet it installs the main branch and says so.
+Installs the ws command with uv or pipx, then checks it runs. By default it installs the wheel of the latest GitHub
+release: it downloads the wheel and its .sha256 into a temporary folder, checks the SHA-256 and, when cosign is on
+your PATH, also checks the wheel's signature bundle against this repo's release workflow. A check that fails stops
+the install. Until a release exists, use --from with a checkout.
 
 Options:
-  --version TAG   Install that release tag (for example --version vX.Y.Z) instead of the latest.
-  --pypi          Install ${PACKAGE} from PyPI instead of GitHub.
+  --version TAG   Install that release (for example --version vX.Y.Z) instead of the latest. Checked the same way.
+  --pypi          Install ${PACKAGE} from PyPI instead of GitHub. No checksum or signature check is made here.
   --from PATH     Install from a checkout of ws on this machine (a folder with pyproject.toml), not GitHub. For the
-                  end-to-end timing script and for trying a change; no tag lookup, no git needed.
-  --no-verify     Skip the smoke test (ws --version, ws doctor --offline).
-  --dry-run       Run the preflight and print what would be installed; change nothing.
+                  end-to-end timing script and for trying a change; no download, no checks.
+  --no-verify     Skip the SHA-256 and cosign checks of a release download. Loud warning; the smoke test still runs.
+  --skip-smoke-test
+                  Skip the smoke test (ws --version, ws doctor --offline).
+  --dry-run       Run the preflight, look up the release and print what would be installed; change nothing.
   -h, --help      Show this help text and exit.
 
 Environment overrides:
-  WS_SKIP_VERIFY  set to 1 to skip the smoke test
+  WS_SKIP_VERIFY       set to 1 to skip the smoke test, as --skip-smoke-test does
+  WS_RELEASE_BASE_URL  fetch releases from here instead of GitHub; https, or http on 127.0.0.1 or localhost only (the
+                       tests use it). Every check still runs, but the wheel and its .sha256 then come from that
+                       host, so only the cosign check proves they are the release: install cosign if you use it.
 EOF
 }
 
@@ -133,9 +141,11 @@ ${COLOR_DIM}---------------${COLOR_RESET}
        pipx ensurepath
      then open a new terminal.
 
-  ${COLOR_BOLD}5. The GitHub route fails${COLOR_RESET}
-     It needs git on your PATH and a network that can reach ${REPO_URL}.
-     --version TAG must be a tag that exists: ${REPO_URL}/tags
+  ${COLOR_BOLD}5. The release route fails${COLOR_RESET}
+     It needs curl or wget, sha256sum or shasum, and a network that reaches github.com. Releases: ${REPO_URL}/releases
+     "No release yet" or a rate-limit answer from GitHub: name one with --version vX.Y.Z, or install a checkout:
+       git clone ${REPO_URL}.git ws && bash ws/install.sh --from ws
+     A checksum or signature failure means the download is not the release: do not use it. Try again, then open an issue.
 
   ${COLOR_BOLD}6. Still stuck${COLOR_RESET}
      Run it again with --dry-run to see the plan, then open an issue with the output:
@@ -212,11 +222,186 @@ python_hint() {
     esac
 }
 
-# Prints the newest plain release tag (vX.Y.Z) of the repo, nothing when there is none. Returns 1 when git cannot ask.
-latest_tag() {
-    local refs
-    refs="$(GIT_TERMINAL_PROMPT=0 git ls-remote --tags --refs "${REPO_URL}" 'v*' </dev/null)" || return 1
-    printf '%s\n' "${refs}" | sed 's|.*refs/tags/||' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true
+# ---------------------------------------------------------------------------
+# The release route: look up, download, check
+# ---------------------------------------------------------------------------
+
+WORKDIR=""
+
+cleanup() {
+    if [ -n "${WORKDIR}" ] && [ -d "${WORKDIR}" ]; then
+        rm -rf -- "${WORKDIR}"
+    fi
+    WORKDIR=""
+}
+
+# GETs a URL into a file and prints the HTTP status. Returns non-zero when no answer came at all (network, TLS, DNS).
+# curl if there is one, else wget; the redirect to GitHub's asset host has to stay on https.
+http_get() {
+    local url="$1" dest="$2" hdrs rc=0
+    if require_cmd curl; then
+        curl -sSL --connect-timeout 20 --max-time 300 --proto-redir '=https' -o "${dest}" -w '%{http_code}' "${url}" </dev/null
+        return $?
+    fi
+    hdrs="${dest}.headers"
+    wget -q -S --timeout=30 --tries=2 -O "${dest}" "${url}" 2>"${hdrs}" </dev/null || rc=$?
+    if [ "${rc}" = "0" ]; then
+        printf '200'
+    elif [ "${rc}" = "8" ]; then # the server answered with an error status; the last HTTP line is the final answer
+        sed -n 's|^ *HTTP/[0-9.]* \([0-9][0-9]*\).*|\1|p' "${hdrs}" | tail -n 1
+        rc=0
+    fi
+    rm -f -- "${hdrs}"
+    return "${rc}"
+}
+
+# Checks FILE against its sha256sum-format line in SUMFILE, both inside DIR. Linux has sha256sum, macOS has shasum.
+check_sha256() {
+    local dir="$1" sumfile="$2"
+    if require_cmd sha256sum; then
+        (cd "${dir}" && sha256sum -c "${sumfile}" </dev/null)
+    else
+        (cd "${dir}" && shasum -a 256 -c "${sumfile}" </dev/null)
+    fi
+}
+
+# Reads the tag name out of the GitHub "latest release" JSON on stdin (no jq needed: the key is on a line of its own).
+tag_from_json() {
+    sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | sed 1q
+}
+
+# A plain release tag, vX.Y.Z: the release workflow only builds those, and the wheel's file name comes from it.
+is_release_tag() {
+    printf '%s\n' "$1" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'
+}
+
+make_workdir() {
+    if [ -z "${WORKDIR}" ]; then
+        WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/ws-install.XXXXXX")"
+    fi
+}
+
+# Sets RELEASE_TAG to the latest release's tag. Exits 1 when it cannot, except in a dry run, which warns and leaves
+# the tag empty so the rest of the preflight still prints.
+RELEASE_TAG=""
+find_latest_release() {
+    local url="$1" dry="$2" status="" why=""
+    RELEASE_TAG=""
+    make_workdir
+    if status="$(http_get "${url}" "${WORKDIR}/latest.json")"; then
+        case "${status}" in
+            200)
+                RELEASE_TAG="$(tag_from_json <"${WORKDIR}/latest.json")"
+                if is_release_tag "${RELEASE_TAG}"; then
+                    return 0
+                fi
+                why="GitHub's answer did not hold a release tag like vX.Y.Z"
+                RELEASE_TAG=""
+                ;;
+            404)
+                if [ "${dry}" = "1" ]; then
+                    warn "no release has been published yet; a real run needs --from with a checkout (or --version once one exists)"
+                    return 0
+                fi
+                error "no release has been published yet at ${REPO_URL}/releases"
+                error "Install a checkout instead: git clone ${REPO_URL}.git ws && bash ws/install.sh --from ws"
+                exit 1
+                ;;
+            *) why="GitHub answered HTTP ${status} (a rate limit looks like this)" ;;
+        esac
+    else
+        why="could not reach ${url}"
+    fi
+    if [ "${dry}" = "1" ]; then
+        warn "${why}; a real run would stop here"
+        return 0
+    fi
+    error "could not find the latest release: ${why}"
+    error "Check the network, or name a release with --version vX.Y.Z (${REPO_URL}/releases)"
+    exit 1
+}
+
+# Downloads URL to DEST, or exits 1 saying what came back.
+download_asset() {
+    local url="$1" dest="$2" status=""
+    if ! status="$(http_get "${url}" "${dest}")"; then
+        error "download failed (no answer): ${url}"
+        exit 1
+    fi
+    if [ "${status}" != "200" ]; then
+        error "download failed (HTTP ${status}): ${url}"
+        exit 1
+    fi
+}
+
+# Sets INSTALL_SRC to the wheel of release TAG, downloaded into WORKDIR and checked. A dry run only says what it would do.
+INSTALL_SRC=""
+fetch_release() {
+    local base="$1" tag="$2" skip_checks="$3" dry="$4"
+    local wheel="ws_aitoolkit-${tag#v}-py3-none-any.whl" out
+    local url="${base}/${tag}/${wheel}"
+    local identity="https://github.com/${REPO_SLUG}/.github/workflows/release.yml@refs/tags/${tag}"
+    local issuer="https://token.actions.githubusercontent.com"
+
+    if [ "${dry}" = "1" ]; then
+        info "would download: ${url}"
+        if [ "${skip_checks}" = "0" ]; then
+            info "would check:    ${wheel}.sha256, and the signature bundle when cosign is installed"
+        fi
+        INSTALL_SRC="${wheel}"
+        return 0
+    fi
+
+    make_workdir
+    info "downloading ${wheel}"
+    download_asset "${url}" "${WORKDIR}/${wheel}"
+    INSTALL_SRC="${WORKDIR}/${wheel}"
+    if [ "${skip_checks}" = "1" ]; then
+        return 0
+    fi
+
+    download_asset "${url}.sha256" "${WORKDIR}/${wheel}.sha256"
+    if ! grep -Fq -- "  ${wheel}" "${WORKDIR}/${wheel}.sha256" || ! out="$(check_sha256 "${WORKDIR}" "${wheel}.sha256" 2>&1)"; then
+        error "the SHA-256 of ${wheel} does not match the release's .sha256 file. Nothing was installed."
+        error "The download is damaged or is not the release. Do not use it."
+        exit 1
+    fi
+    ok "sha256 matches: ${out}"
+
+    local cosign_major=""
+    if require_cmd cosign; then
+        # pure bash: `cosign version` prints "GitVersion:    v3.1.4" among other lines
+        local line
+        while IFS= read -r line; do
+            case "${line}" in
+                GitVersion:*)
+                    line="${line#GitVersion:}"
+                    line="${line#"${line%%[![:space:]]*}"}"
+                    line="${line#v}"
+                    line="${line%%.*}"
+                    case "${line}" in ''|*[!0-9]*) ;; *) cosign_major="${line}" ;; esac
+                    break
+                    ;;
+            esac
+        done <<EOF_COSIGN
+$(cosign version 2>/dev/null </dev/null || true)
+EOF_COSIGN
+    fi
+    if [ -n "${cosign_major}" ] && [ "${cosign_major}" -lt 3 ]; then
+        warn "cosign ${cosign_major}.x can't read the release's signature bundle (cosign 3 or newer can), so only the SHA-256 was checked; upgrade cosign to check the signature too"
+    elif require_cmd cosign; then
+        download_asset "${url}.sigstore.json" "${WORKDIR}/${wheel}.sigstore.json"
+        if ! out="$(cosign verify-blob --bundle "${WORKDIR}/${wheel}.sigstore.json" \
+            --certificate-identity "${identity}" --certificate-oidc-issuer "${issuer}" \
+            "${WORKDIR}/${wheel}" 2>&1 </dev/null)"; then
+            printf '%s\n' "${out}" 1>&2
+            error "the signature of ${wheel} did not verify as made by this repo's release workflow for ${tag}. Nothing was installed."
+            exit 1
+        fi
+        ok "cosign signature verifies (made by the release workflow for ${tag})"
+    else
+        info "cosign is not installed, so only the SHA-256 was checked; install cosign to check the signature too"
+    fi
 }
 
 # Where the installed `ws` is: on PATH, else where uv or pipx put commands.
@@ -246,7 +431,7 @@ find_ws() {
 # ---------------------------------------------------------------------------
 
 main() {
-    local tag="" tag_given="0" from_pypi="0" from_path="" dry_run="0" skip_verify="${WS_SKIP_VERIFY:-0}"
+    local tag="" tag_given="0" from_pypi="0" from_path="" dry_run="0" no_verify="0" skip_smoke="${WS_SKIP_VERIFY:-0}"
 
     while [ "$#" -gt 0 ]; do
         case "$1" in
@@ -273,7 +458,10 @@ main() {
                 fi
                 ;;
             --no-verify)
-                skip_verify="1"
+                no_verify="1"
+                ;;
+            --skip-smoke-test)
+                skip_smoke="1"
                 ;;
             --dry-run)
                 dry_run="1"
@@ -291,14 +479,12 @@ main() {
         shift
     done
 
-    # The tag ends up in a pip requirement, so keep it to what a git tag normally holds.
+    # The tag ends up in a URL and a file name, so it has to be exactly what the release workflow builds: vX.Y.Z.
     if [ "${tag_given}" = "1" ]; then
-        case "${tag}" in
-            ""|*..*|*[!A-Za-z0-9._/-]*)
-                error "invalid release tag: '${tag}' (letters, digits and . _ / - only, no '..', not empty)"
-                exit 2
-                ;;
-        esac
+        if ! is_release_tag "${tag}"; then
+            error "invalid release tag: '${tag}' (a release is named vX.Y.Z, for example v0.1.0)"
+            exit 2
+        fi
         if [ "${from_pypi}" = "1" ]; then
             error "--version and --pypi do not go together: a tag is a GitHub thing"
             exit 2
@@ -317,8 +503,23 @@ main() {
         from_path="$(cd "${from_path}" && pwd)"
     fi
 
+    # Where releases come from. The override moves the download (the tests point it at a local server); it has no
+    # say in whether the checks run. Anything but https, or http to this machine, is refused.
+    local api_url="https://api.github.com/repos/${REPO_SLUG}/releases/latest"
+    local download_base="${REPO_URL}/releases/download"
+    if [ -n "${WS_RELEASE_BASE_URL:-}" ]; then
+        local base="${WS_RELEASE_BASE_URL%/}"
+        # The host is matched whole: no login part (`user@host`), and a local http host ends at a port or a slash.
+        if ! printf '%s' "${base}" | grep -Eq '^(https://[A-Za-z0-9.-]+(:[0-9]+)?|http://(127\.0\.0\.1|localhost)(:[0-9]+)?)(/[^@]*)?$'; then
+            error "WS_RELEASE_BASE_URL must be https, or http on 127.0.0.1 or localhost, with no login part: '${base}'"
+            exit 2
+        fi
+        api_url="${base}/repos/${REPO_SLUG}/releases/latest"
+        download_base="${base}/${REPO_SLUG}/releases/download"
+    fi
+
     # shellcheck disable=SC2154  # rc is set inside the trap string, when it fires
-    trap 'rc=$?; if [ "$rc" -ne 0 ]; then error "installation failed (exit ${rc})"; print_troubleshooting; fi' EXIT
+    trap 'rc=$?; cleanup; if [ "$rc" -ne 0 ]; then error "installation failed (exit ${rc})"; print_troubleshooting; fi' EXIT
 
     printf '%sws installer%s\n' "${COLOR_BOLD}" "${COLOR_RESET}"
     if [ "${dry_run}" = "1" ]; then
@@ -407,9 +608,15 @@ main() {
         fi
     fi
 
-    if [ "${from_pypi}" = "0" ] && [ -z "${from_path}" ] && ! require_cmd git; then
-        error "installing from GitHub needs git, which is not on PATH (or use --pypi)"
-        missing="1"
+    if [ "${from_pypi}" = "0" ] && [ -z "${from_path}" ]; then
+        if ! require_cmd curl && ! require_cmd wget; then
+            error "installing a release needs curl or wget, and neither is on PATH (or use --pypi, or --from with a checkout)"
+            missing="1"
+        fi
+        if [ "${no_verify}" = "0" ] && ! require_cmd sha256sum && ! require_cmd shasum; then
+            error "checking a release needs sha256sum or shasum, and neither is on PATH (Linux: coreutils; macOS has shasum)"
+            missing="1"
+        fi
     fi
 
     if [ "${missing}" != "0" ]; then
@@ -424,25 +631,30 @@ main() {
     local install_src
     if [ "${from_pypi}" = "1" ]; then
         install_src="${PACKAGE}"
-        info "source: PyPI (${PACKAGE})"
+        info "source: PyPI (${PACKAGE}); no checksum or signature is checked on this route"
     elif [ -n "${from_path}" ]; then
         install_src="${from_path}"
         info "source: checkout at ${install_src}"
     else
-        if [ "${tag_given}" = "0" ]; then
-            if ! tag="$(latest_tag)"; then
-                error "could not list the release tags at ${REPO_URL}; check the network, or name one with --version"
-                exit 1
-            fi
-            if [ -z "${tag}" ]; then
-                tag="main"
-                warn "pre-release: no release tag exists yet, so this installs the main branch"
-            else
-                info "latest release tag: ${tag}"
-            fi
+        if [ -n "${WS_RELEASE_BASE_URL:-}" ]; then
+            warn "WS_RELEASE_BASE_URL is set: releases come from ${WS_RELEASE_BASE_URL%/}, not from GitHub"
         fi
-        install_src="git+${REPO_URL}@${tag}"
-        info "source: ${install_src}"
+        if [ "${no_verify}" = "1" ]; then
+            warn "--no-verify: the SHA-256 and the signature of the download will NOT be checked."
+            warn "Anyone who can alter the download can alter what runs on this machine. Continue only if you accept that."
+        fi
+        # These two set globals and exit on failure themselves: a command substitution would lose WORKDIR.
+        if [ "${tag_given}" = "0" ]; then
+            find_latest_release "${api_url}" "${dry_run}"
+            tag="${RELEASE_TAG}"
+        fi
+        if [ -n "${tag}" ]; then
+            info "release: ${tag}"
+            fetch_release "${download_base}" "${tag}" "${no_verify}" "${dry_run}"
+            install_src="${INSTALL_SRC}"
+        else
+            install_src="<wheel of the latest release>"
+        fi
     fi
 
     # A checkout changes under the same version number, so uv must not serve it from its cache of built wheels.
@@ -480,7 +692,7 @@ main() {
             version_out="$("${ws_bin}" --version 2>&1 </dev/null || true)"
             case "${version_out}" in
                 *" 0.0.0")
-                    error "installed ${version_out}, which is the PyPI placeholder and not ws. Install from GitHub (the default)."
+                    error "installed ${version_out}, which is the PyPI placeholder and not ws. Install a release from GitHub (the default)."
                     exit 1
                     ;;
             esac
@@ -493,8 +705,8 @@ main() {
 
     if [ "${dry_run}" = "1" ]; then
         info "dry run: would run: ws --version, then ws doctor --offline"
-    elif [ "${skip_verify}" = "1" ]; then
-        warn "verification skipped (--no-verify or WS_SKIP_VERIFY=1)"
+    elif [ "${skip_smoke}" = "1" ]; then
+        warn "smoke test skipped (--skip-smoke-test or WS_SKIP_VERIFY=1)"
     else
         local ws_bin version_out doctor_out doctor_rc=0
         if ! ws_bin="$(find_ws)"; then
@@ -551,6 +763,7 @@ EOF
     fi
 
     # clear the failure trap on a clean exit
+    cleanup
     trap - EXIT
 }
 

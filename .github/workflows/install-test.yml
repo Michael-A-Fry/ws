@@ -1,0 +1,122 @@
+# Phase T pass test: a fresh install from the published release, twice, on every CI cell, each followed by the first-task
+# e2e against what was installed (scripts/e2e_first_task.sh with WS_E2E_INSTALL=release). "Twice" is two separate jobs
+# per cell (a fresh runner each time), so the second proves the first was not luck or a warm cache. install.sh runs with
+# no --from: on a release event with no --version either (the latest release, which is the one just published), and
+# with --version for a manual dispatch. A release made by release.yml's own token fires no `release` event, so
+# release.yml dispatches this with latest=true. The lab cell does the same in lab.yml. Nothing here holds a secret or writes anything.
+name: install-test
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to install (vX.Y.Z)"
+        required: true
+        type: string
+      latest:
+        description: "Install the latest release (install.sh with no flags), then check it is this tag"
+        required: false
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: install-test-${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+env:
+  TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
+  # `latest` (what release.yml sends) and a release event install with no flags, exactly as a person would, and then
+  # check the version is this tag; otherwise install.sh --version TAG
+  WS_E2E_TAG: ${{ (github.event_name == 'release' || inputs.latest) && '' || inputs.tag }}
+  WS_E2E_EXPECT: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
+jobs:
+  unix:
+    name: install from ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }} (${{ matrix.os }}, round ${{ matrix.round }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-26]
+        round: [1, 2]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ env.TAG }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: "0.13.1"
+          enable-cache: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+      - name: install the runners
+        working-directory: tests/e2e/runners
+        run: |
+          npm ci --ignore-scripts
+          node node_modules/opencode-ai/postinstall.mjs
+          node node_modules/@anthropic-ai/claude-code/install.cjs
+          echo "$PWD/node_modules/.bin" >> "$GITHUB_PATH"
+      - name: install the sandbox tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bubblewrap socat
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: install from the release, then the first task, timed
+        env:
+          WS_E2E_INSTALL: release
+          WS_E2E_CELL: ${{ matrix.os }}-release-${{ matrix.round }}
+          WS_E2E_OUT: ${{ github.workspace }}/e2e-timing.json
+        run: /bin/bash scripts/e2e_first_task.sh
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: install-test-${{ matrix.os }}-${{ matrix.round }}
+          path: e2e-timing.json
+          if-no-files-found: warn
+
+  wsl:
+    name: install from ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }} (WSL2, round ${{ matrix.round }})
+    strategy:
+      fail-fast: false
+      matrix:
+        round: [1, 2]
+    runs-on: windows-2025
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ env.TAG }}
+          persist-credentials: false
+      - uses: Vampire/setup-wsl@4c48163d9f981914dd8caa0fc335fe19cca5bff4 # v7.2.0
+        with:
+          distribution: Ubuntu-24.04
+          additional-packages: curl ca-certificates nodejs npm bubblewrap socat
+      - name: install from the release, then the first task, timed, inside WSL2
+        shell: wsl-bash {0}
+        env:
+          WSLENV: GITHUB_WORKSPACE/p:WS_E2E_TAG:WS_E2E_EXPECT
+        run: |
+          set -euo pipefail
+          v=0.13.1; sum=eadd9d27c134ab5ac1ffd4473b97a741407f3ea238288f03121fc4deddf90220
+          curl -sSfL -o /tmp/uv.tgz "https://github.com/astral-sh/uv/releases/download/$v/uv-x86_64-unknown-linux-gnu.tar.gz"
+          echo "$sum  /tmp/uv.tgz" | sha256sum -c -
+          mkdir -p "$HOME/.local/bin" && tar -xzf /tmp/uv.tgz -C "$HOME/.local/bin" --strip-components=1
+          export PATH="$HOME/.local/bin:$PATH"
+          rm -rf "$HOME/ws" && cp -r . "$HOME/ws" && cd "$HOME/ws/tests/e2e/runners"
+          npm ci --ignore-scripts
+          node node_modules/opencode-ai/postinstall.mjs
+          node node_modules/@anthropic-ai/claude-code/install.cjs
+          export PATH="$PWD/node_modules/.bin:$PATH"
+          cd "$HOME/ws"
+          WS_E2E_INSTALL=release WS_E2E_CELL="wsl2-release-${{ matrix.round }}" \
+            WS_E2E_OUT="$GITHUB_WORKSPACE/e2e-timing.json" /bin/bash scripts/e2e_first_task.sh
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: install-test-wsl2-${{ matrix.round }}
+          path: e2e-timing.json
+          if-no-files-found: warn

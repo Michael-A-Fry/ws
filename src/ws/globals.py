@@ -27,8 +27,12 @@ OVERRIDES = Path(".ws") / "overrides.toml"
 MANIFEST_ENV = "WS_GLOBALS_MANIFEST"
 SCHEMA = 1
 _SKIP_DIRS = {"__pycache__", "node_modules"}
+_WALK_SKIP = {".git", "node_modules", ".venv", "__pycache__"}  # never searched for nested config folders
+_MIN_BYTES = 64  # a smaller file ("pyyaml", "exit 0") is too common to call a copy
 _MAX_BYTES = 5_000_000
 _MAX_DEPTH = 8
+_WALK_DEPTH = 6
+MANIFEST_FILE = Path(".ws") / "globals.json"  # a manifest committed in the repo is used when none is given
 
 
 @dataclass(frozen=True)
@@ -48,7 +52,7 @@ class Shadow:
 @dataclass
 class Report:
     status: str = "ok"  # ok | warn | fail
-    compared: int = 0  # global files compared against
+    compared: int = 0  # global items compared against
     source: str = ""
     shadows: list[Shadow] = field(default_factory=list)  # unlisted: these fail
     overridden: list[tuple[Shadow, str]] = field(default_factory=list)  # listed, with the reason
@@ -91,9 +95,9 @@ def user_dir(layout: dict, env: dict) -> Path:
 
 
 def _sha(path: Path) -> str | None:
-    """sha256 of a file's bytes; None for an empty, huge or unreadable file (empty files all hash alike)."""
+    """sha256 of a file's bytes; None for a huge or unreadable file."""
     try:
-        if path.stat().st_size in range(1, _MAX_BYTES):
+        if path.stat().st_size < _MAX_BYTES:
             return hashlib.sha256(path.read_bytes()).hexdigest()
     except OSError:
         pass
@@ -118,9 +122,20 @@ def _key(top: Path, how: str) -> str:
     return top.name if (how in ("dir", "name") or top.is_dir()) else top.stem
 
 
-def scan(root: Path, kinds: dict[str, str], skip_inside: Path | None = None) -> list[Entry]:
-    """Every file under root/<kind>/ as an Entry. A top-level entry that resolves inside `skip_inside` (a repo link
-    to the global itself) is left out: that is using the global, not shadowing it."""
+def _main_file(top: Path, files: list[Path], how: str) -> Path | None:
+    """The file that stands for an item: the file itself, or SKILL.md of a skill folder."""
+    if top.is_file():
+        return top
+    if how == "dir":
+        return next((f for f in files if f.parent == top and f.name.lower() == "skill.md"), None)
+    return None
+
+
+def scan(root: Path, kinds: dict[str, str], skip_inside: list[Path] | None = None) -> list[Entry]:
+    """What lives under root/<kind>/, as Entries. Each item (a skill folder, an agent file ...) gets one entry for its
+    name, carrying the hash of its main file; a folder with several files gets a second, carrying a digest of the
+    whole folder. Files that are too small to mean anything are matched on name only. A top-level item that resolves
+    inside one of `skip_inside` (a repo link to the global itself) is left out: that is using the global."""
     out: list[Entry] = []
     for kind, how in kinds.items():
         base = root / kind
@@ -131,13 +146,21 @@ def scan(root: Path, kinds: dict[str, str], skip_inside: Path | None = None) -> 
         for top in tops:
             if top.name.startswith(".") or top.name in _SKIP_DIRS:
                 continue
-            if skip_inside is not None and top.resolve().is_relative_to(skip_inside):
-                continue
-            name = _key(top, how)
-            for f in _files(top):
-                digest = _sha(f)
-                if digest:
-                    out.append(Entry(kind, name, f.relative_to(root).as_posix(), digest))
+            if skip_inside:
+                real = _resolved(top)
+                if any(real.is_relative_to(s) for s in skip_inside):
+                    continue
+            name, folder = _key(top, how), f"{kind}/{top.name}"
+            files = list(_files(top))
+            main = _main_file(top, files, how)
+            digest = _sha(main) if main else None
+            big = digest and main.stat().st_size >= _MIN_BYTES
+            out.append(Entry(kind, name, main.relative_to(root).as_posix() if main else folder, digest if big else ""))
+            if top.is_dir() and len(files) > 1:
+                parts = [(f.relative_to(top).as_posix(), _sha(f)) for f in files]
+                if all(h for _, h in parts) and sum(f.stat().st_size for f in files) >= _MIN_BYTES:
+                    whole = hashlib.sha256("\n".join(f"{n}:{h}" for n, h in parts).encode()).hexdigest()
+                    out.append(Entry(kind, name, folder, whole))
     return out
 
 
@@ -185,8 +208,20 @@ def read_manifest(path: Path) -> dict[str, list[Entry]]:
 # --- overrides -----------------------------------------------------------------------------------------------------
 
 
-def load_overrides(repo: Path) -> tuple[dict[str, str], list[str]]:
-    """path -> reason, plus errors. An override with no reason is an error and is not applied."""
+def _too_broad(path: str, layouts: list[dict]) -> bool:
+    """An override must name an item (<project_dir>/<kind>/<name>) or something inside one, not a whole folder."""
+    parts = path.split("/")
+    if ".." in parts:
+        return True
+    for lay in layouts:
+        for i, p in enumerate(parts):
+            if p == lay["project_dir"] and i + 2 < len(parts) and parts[i + 1] in lay["kinds"]:
+                return False
+    return True
+
+
+def load_overrides(repo: Path, layouts: list[dict] | None = None) -> tuple[dict[str, str], list[str]]:
+    """path -> reason, plus errors. A bad override (no reason, too broad, listed twice) is an error and is not applied."""
     f = repo / OVERRIDES
     if not f.is_file():
         return {}, []
@@ -197,6 +232,11 @@ def load_overrides(repo: Path) -> tuple[dict[str, str], list[str]]:
     rows = data.get("override", [])
     if not isinstance(rows, list):
         return {}, [f"{OVERRIDES.as_posix()}: use [[override]] tables"]
+    layouts = (
+        layouts
+        if layouts is not None
+        else [m.GLOBALS for m in adapters.all_adapters().values() if hasattr(m, "GLOBALS")]
+    )
     out: dict[str, str] = {}
     errors = []
     for i, row in enumerate(rows, 1):
@@ -204,10 +244,16 @@ def load_overrides(repo: Path) -> tuple[dict[str, str], list[str]]:
         reason = row.get("reason") if isinstance(row, dict) else None
         if not isinstance(path, str) or not path.strip():
             errors.append(f"override {i} has no path")
-        elif not isinstance(reason, str) or not reason.strip():
+            continue
+        path = path.strip().removeprefix("./").rstrip("/")
+        if not isinstance(reason, str) or not reason.strip():
             errors.append(f"override {path}: a reason is required (why is this repo's copy better than the global?)")
+        elif _too_broad(path, layouts):
+            errors.append(f"override {path}: too broad; name an item, like .claude/skills/<name>, or a file inside one")
+        elif path in out:
+            errors.append(f"override {path}: listed twice")
         else:
-            out[path.strip().removeprefix("./").rstrip("/")] = reason.strip()
+            out[path] = reason.strip()
     return out, errors
 
 
@@ -226,40 +272,60 @@ def find_repo(start: Path) -> Path | None:
     return None
 
 
-def shadows_in(repo: Path, layout: dict, globals_: list[Entry], user: Path) -> list[Shadow]:
-    proj = repo / layout["project_dir"]
+def project_dirs(repo: Path, name: str) -> list[Path]:
+    """Every `name` folder in the repo, nested ones included (a monorepo has several). Not searched: .git, node_modules,
+    .venv, a folder with a .git of its own (another repo), or anything inside a config folder (worktrees live there)."""
+    found: list[Path] = []
+    for dirpath, dirs, _ in os.walk(repo):
+        here = Path(dirpath)
+        depth = len(here.relative_to(repo).parts)
+        keep = []
+        for d in sorted(dirs):
+            if d == name:
+                found.append(here / d)
+            elif d not in _WALK_SKIP and depth < _WALK_DEPTH and not (here / d / ".git").exists():
+                keep.append(d)
+        dirs[:] = keep
+    return found
+
+
+def shadows_in(repo: Path, proj: Path, layout: dict, globals_: list[Entry], user: Path) -> list[Shadow]:
     if _resolved(proj) == _resolved(user):
         return []  # the repo is the config folder itself (a run from ~): nothing to shadow
-    names = {(g.kind, g.name): g for g in globals_}
-    hashes = {g.sha256: g for g in globals_}
+    prefix = proj.relative_to(repo).as_posix()
+    names = {(g.kind, g.name.lower()): g for g in globals_}
+    hashes = {g.sha256: g for g in globals_ if g.sha256}
+    # a repo link into the global tree, however the global itself is linked, is using it
+    real_roots = [_resolved(user), *(_resolved(user / k) for k in layout["kinds"])]
     out: list[Shadow] = []
-    seen: set[str] = set()
-    by_top: dict[tuple[str, str], list[Entry]] = {}
-    for e in scan(proj, layout["kinds"], skip_inside=_resolved(user)):
-        by_top.setdefault((e.kind, e.path.split("/")[1]), []).append(e)
-    for (kind, top), files in sorted(by_top.items()):
-        name = files[0].name
-        base = f"{layout['project_dir']}/{kind}/{top}"
+    by_item: dict[tuple[str, str], list[Entry]] = {}
+    for e in scan(proj, layout["kinds"], skip_inside=real_roots):
+        by_item.setdefault((e.kind, e.path.split("/")[1]), []).append(e)
+    for (kind, top), items in sorted(by_item.items()):
+        name = items[0].name.lower()
         if (kind, name) in names:
-            out.append(Shadow(base, f"same name as global {kind}/{names[kind, name].path.split('/')[1]}"))
+            out.append(
+                Shadow(f"{prefix}/{kind}/{top}", f"same name as global {kind}/{names[kind, name].path.split('/')[1]}")
+            )
             continue
-        for f in files:
-            g = hashes.get(f.sha256)
-            path = f"{layout['project_dir']}/{f.path}"
-            if g and path not in seen:
-                seen.add(path)
-                out.append(Shadow(path, f"same content as global {g.path}"))
+        for e in items:
+            g = hashes.get(e.sha256)
+            if g:
+                out.append(Shadow(f"{prefix}/{e.path}", f"same content as global {g.path}"))
+                break
     return out
 
 
 def check(repo: Path, env: dict, manifest_path: Path | None = None) -> Report:
     rep = Report()
-    overrides, rep.errors = load_overrides(repo)
     mod_layouts = {n: m.GLOBALS for n, m in adapters.all_adapters().items() if hasattr(m, "GLOBALS")}
+    overrides, rep.errors = load_overrides(repo, list(mod_layouts.values()))
     from_user = user_entries(env)
     from_manifest: dict[str, list[Entry]] = {}
     if manifest_path is None and env.get(MANIFEST_ENV):
         manifest_path = Path(env[MANIFEST_ENV]).expanduser()
+    if manifest_path is None and (repo / MANIFEST_FILE).is_file():
+        manifest_path = repo / MANIFEST_FILE
     if manifest_path is not None:
         try:
             from_manifest = read_manifest(manifest_path)
@@ -275,8 +341,9 @@ def check(repo: Path, env: dict, manifest_path: Path | None = None) -> Report:
         else:
             continue
         sources.add(src)
-        rep.compared += len(entries)
-        found += shadows_in(repo, layout, entries, user_dir(layout, env))
+        rep.compared += len({(e.kind, e.name) for e in entries})
+        for proj in project_dirs(repo, layout["project_dir"]):
+            found += shadows_in(repo, proj, layout, entries, user_dir(layout, env))
     rep.source = " and ".join(sorted(sources))
     used: set[str] = set()
     for s in found:
@@ -289,7 +356,10 @@ def check(repo: Path, env: dict, manifest_path: Path | None = None) -> Report:
     if sources:  # with nothing to compare against, no override can be called stale
         rep.stale = sorted(set(overrides) - used)
     if not sources and not rep.errors:
-        rep.warnings.append("nothing to compare: no user config and no manifest (--manifest or $WS_GLOBALS_MANIFEST)")
+        rep.warnings.append(
+            "nothing to compare: no user config and no manifest (--manifest, $WS_GLOBALS_MANIFEST or "
+            f"{MANIFEST_FILE.as_posix()}), so this run checked nothing; --strict makes that a failure"
+        )
     rep.status = "fail" if rep.shadows or rep.errors else "warn" if rep.warnings else "ok"
     return rep
 
@@ -304,14 +374,14 @@ def render(rep: Report) -> str:
     out += [f"warn: {w}" for w in rep.warnings]
     out.append(
         f"ws globals: {len(rep.shadows)} shadows, {len(rep.overridden)} overrides, {len(rep.stale)} stale"
-        f" ({rep.compared} global files from {rep.source or 'nowhere'})"
+        f" ({rep.compared} global items from {rep.source or 'nowhere'})"
     )
     return "\n".join(out)
 
 
 def summary(rep: Report) -> tuple[str, str, str]:
     """(status, detail, fix) for `ws doctor`."""
-    n = f"{rep.compared} global files from {rep.source or 'nowhere'}"
+    n = f"{rep.compared} global items from {rep.source or 'nowhere'}"
     if rep.errors:
         return "fail", "; ".join(rep.errors), "fix .ws/overrides.toml or the manifest"
     if rep.shadows:

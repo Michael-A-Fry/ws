@@ -35,3 +35,4 @@ repos:
         language: system
         pass_filenames: false
         always_run: true
+        verbose: true # prints "nothing to compare" in CI, where there is no user config

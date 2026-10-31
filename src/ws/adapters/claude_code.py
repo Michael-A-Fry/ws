@@ -29,7 +29,7 @@ GLOBALS = {
     "user_dir": "~/.claude",
     "user_dir_env": "CLAUDE_CONFIG_DIR",
     "project_dir": ".claude",
-    "kinds": {"skills": "dir", "agents": "name", "workflows": "stem", "hooks": "name"},
+    "kinds": {"skills": "dir", "agents": "name", "commands": "name", "workflows": "stem", "hooks": "name"},
 }
 
 
@@ -40,7 +40,7 @@ def session_hooks(ws_cmd: list[str]) -> dict:
 
     def hook(sub: str) -> list[dict]:
         cmd = f"{base} session {sub} --runner {NAME} || true"
-        return [{"hooks": [{"type": "command", "command": cmd}]}]
+        return [{"hooks": [{"type": "command", "command": cmd, "timeout": 5}]}]
 
     return {"SessionStart": hook("start"), "UserPromptSubmit": hook("nudge")}
 

@@ -36,6 +36,8 @@ GLOBALS = {
     "xdg": "opencode",
     "project_dir": ".opencode",
     "kinds": {
+        "skills": "dir",
+        "skill": "dir",
         "agents": "name",
         "agent": "name",
         "commands": "name",

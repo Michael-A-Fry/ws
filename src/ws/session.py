@@ -16,7 +16,9 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -24,6 +26,8 @@ from ws import __version__
 from ws.profile import ws_home
 
 _SAFE_ID = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+_RELEASE = re.compile(r"^[A-Za-z0-9._+-]{1,64}$")  # a release string is printed into the model's context: keep it plain
+_KEEP_DAYS = 30
 
 
 # --- the release ---------------------------------------------------------------------------------------------------
@@ -34,23 +38,29 @@ def _marker(env: dict) -> str:
     $WS_HOME/release. A path may be a file holding the id, or a folder (or link to one) named by the id, which is how
     older ws lays out ~/.ws-release/<id>."""
     if env.get("WS_RELEASE", "").strip():
-        return env["WS_RELEASE"].strip()
+        return _plain(env["WS_RELEASE"].strip())
     path = Path(env["WS_RELEASE_FILE"]).expanduser() if env.get("WS_RELEASE_FILE") else ws_home(env) / "release"
     try:
         if path.is_dir():
-            return path.resolve().name
+            return _plain(path.resolve().name)
         if path.is_file():
             lines = path.read_text(encoding="utf-8").strip().splitlines()
-            return lines[0].strip() if lines else ""
+            return _plain(lines[0].strip()) if lines else ""
     except (OSError, UnicodeDecodeError):
         pass
     return ""
 
 
+def _plain(marker: str) -> str:
+    """The marker if it is a plain release string, else nothing (it is dropped, not repaired)."""
+    return marker if _RELEASE.match(marker) else ""
+
+
 def current_release(env: dict | None = None) -> str:
     env = os.environ if env is None else env
     marker = _marker(env)
-    return f"{__version__}+{marker}" if marker else __version__
+    release = f"{__version__}+{marker}" if marker else __version__
+    return release if _RELEASE.match(release) else (__version__ if _RELEASE.match(__version__) else "unknown")
 
 
 def _natural(text: str) -> list[tuple[int, int | str]]:
@@ -77,11 +87,28 @@ def _record_path(env: dict, session_id: str) -> Path:
 
 def _write(path: Path, record: dict) -> None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(json.dumps(record, indent=2) + "\n")
-    os.replace(tmp, path)
+    path.parent.chmod(0o700)
+    # a new, uniquely named file that refuses to follow a planted link, then an atomic rename over the record
+    tmp = path.parent / f".{path.stem}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(record, indent=2) + "\n")
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _prune(folder: Path) -> None:
+    """Drop records not touched for 30 days (a session that old is long gone)."""
+    cutoff = time.time() - _KEEP_DAYS * 86400
+    for f in folder.glob("*.json"):
+        try:
+            if f.stat().st_mtime < cutoff:
+                f.unlink()
+        except OSError:
+            continue
 
 
 def _read(path: Path) -> dict | None:
@@ -89,7 +116,8 @@ def _read(path: Path) -> dict | None:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    return data if isinstance(data, dict) and isinstance(data.get("release"), str) else None
+    ok = isinstance(data, dict) and isinstance(data.get("release"), str) and _RELEASE.match(data["release"])
+    return data if ok else None
 
 
 def _new_record(session_id: str, release: str, runner: str, cwd: str) -> dict:
@@ -123,7 +151,9 @@ def cmd_start(args: argparse.Namespace) -> int:
         if got:
             env = dict(os.environ)
             # always overwrite: a resumed, cleared or compacted session reloads its rules, so it starts again here
-            _write(_record_path(env, got[0]), _new_record(got[0], current_release(env), args.runner, got[1]))
+            path = _record_path(env, got[0])
+            _write(path, _new_record(got[0], current_release(env), args.runner, got[1]))
+            _prune(path.parent)
     return 0
 
 

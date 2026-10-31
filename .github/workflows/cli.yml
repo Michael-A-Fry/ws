@@ -42,6 +42,37 @@ jobs:
           set +e; uv run --locked ws doctor --json > "$RUNNER_TEMP/doctor.json"; code=$?; set -e
           uv run --locked python scripts/check_fresh_doctor.py "$RUNNER_TEMP/doctor.json" "$code"
 
+  # Phase 3 pass test: no secret is readable by the agent user (ws-dev), yet its lease request gets a proxied call
+  # whose upstream sees the injected header. Needs real users, so it runs on a runner with passwordless sudo.
+  secret-wall:
+    name: secret wall (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      # the system Python, so the venv's interpreter is reachable by the other two users
+      UV_PYTHON: /usr/bin/python3
+      UV_PYTHON_DOWNLOADS: never
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: "0.13.1"
+          enable-cache: true
+      - name: create the broker user, the agent user and their shared group
+        run: |
+          sudo groupadd ws-clients
+          sudo useradd --system --create-home --shell /usr/sbin/nologin --groups ws-clients ws-broker
+          sudo useradd --create-home --shell /bin/bash --groups ws-clients ws-dev
+          chmod o+x "$HOME"   # both users run the checkout's venv
+      - name: install
+        run: uv sync --locked
+      - name: the pass test
+        env:
+          WS_E2E_REQUIRE: "1"
+        run: uv run --locked pytest -q -rs tests/e2e/test_secret_wall.py
+
   wsl:
     name: doctor (windows-2025, WSL2 Ubuntu-24.04)
     runs-on: windows-2025

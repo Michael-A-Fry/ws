@@ -1,0 +1,9 @@
+{
+  "name": "ws-e2e-runners",
+  "private": true,
+  "description": "The two runners the gate e2e drives, pinned. Install with: npm ci --ignore-scripts",
+  "dependencies": {
+    "@anthropic-ai/claude-code": "2.1.308",
+    "opencode-ai": "1.19.4"
+  }
+}

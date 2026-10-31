@@ -9,6 +9,7 @@ on:
       - "src/**"
       - "tests/**"
       - "scripts/check_fresh_doctor.py"
+      - "install.sh"
       - "pyproject.toml"
       - "uv.lock"
       - ".github/workflows/cli.yml"
@@ -38,6 +39,11 @@ jobs:
           enable-cache: true
       - name: tests
         run: uv run --locked pytest -q
+      # bash 3.2 on macOS and bash 5 on Linux both have to read it; --dry-run changes nothing on the runner
+      - name: install.sh --help and --dry-run
+        run: |
+          bash install.sh --help
+          bash install.sh --dry-run
       - name: fresh doctor exits non-zero, every role unconfigured
         run: |
           export WS_HOME="$RUNNER_TEMP/wshome"

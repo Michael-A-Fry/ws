@@ -27,6 +27,7 @@ from ws import (
     run,
     secrets,
     session,
+    setup_ui,
     skills,
 )
 from ws import globals as ws_globals
@@ -168,6 +169,7 @@ def build_parser() -> argparse.ArgumentParser:
     rating.register(sub)
     roles.register(sub)
     approvals.register(sub)
+    setup_ui.register(sub)
     return p
 
 

@@ -22,8 +22,18 @@ repos:
     rev: v1.7.12.24
     hooks:
       - id: actionlint
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.11.0.1
+    hooks:
+      - id: shellcheck
   - repo: local
     hooks:
+      - id: code-map
+        name: AGENTS.md code map is current (python3 scripts/gen_code_map.py rewrites it)
+        entry: python3 scripts/gen_code_map.py --check
+        language: system
+        files: ^(src/ws/.*\.py|AGENTS\.md|scripts/gen_code_map\.py)$
+        pass_filenames: false
       - id: pii-gate
         name: PII gate (private IPs, tailnet hosts, e-mails, private denylist)
         entry: python3 scripts/pii_gate.py

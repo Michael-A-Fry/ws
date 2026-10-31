@@ -110,6 +110,8 @@ Known limits of the grader's wall:
   code nothing it did not already have in the trial; it does not close the network.
 - `$WS_HOME/approvals/pending` and `$WS_HOME/sessions` stay writable inside it. That is by design and harmless: a forged
   pending record grants nothing (see `ws.approvals`).
+- A grader run as root gets no nonce protection (root has CAP_SYS_PTRACE, which `PR_SET_DUMPABLE` does not stop), so
+  do not run evals as root.
 
 ## Run
 

@@ -514,3 +514,47 @@ def test_a_profile_whose_notes_folder_is_your_home_is_one_clear_error(box, capsy
     code, _, err = run(capsys, "uninstall", "--yes")
     assert code == 0 and "Traceback" not in err
     assert run(capsys, "module", "list")[0] == 0
+
+
+def test_uninstall_removes_only_empty_run_folders_and_keeps_what_a_job_wrote(box, capsys, monkeypatch):
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    assert run(capsys, "install", *FULL, "--notes", str(box / "Notes"))[0] == 0
+    root = box / ".local" / "state" / "ws"
+    full, empty = root / "work" / "20261031T120000Z-aaaaaa", root / "work" / "20261031T120001Z-bbbbbb"
+    full.mkdir(parents=True)
+    empty.mkdir()
+    (full / "hello.txt").write_text("hello", encoding="utf-8")
+    code, out, _ = run(capsys, "uninstall", "--dry-run")
+    assert code == 0 and empty.is_dir() and "would remove" in out  # a dry run removes nothing
+    code, out, _ = run(capsys, "uninstall", "--yes")
+    assert code == 0
+    assert (full / "hello.txt").read_text(encoding="utf-8") == "hello"  # the job's output is the person's
+    assert not empty.exists()
+    assert f"has your files in it, so ws left it: {full}" in out
+    (full / "hello.txt").unlink()
+    full.rmdir()
+    assert run(capsys, "uninstall", "--yes")[0] == 0  # nothing left in them: work/ and ws/ go too
+    assert not root.exists() and (box / ".local" / "state").is_dir()
+
+
+def test_uninstall_leaves_something_else_of_yours_in_the_work_root(box, capsys, monkeypatch):
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    assert run(capsys, "install", *FULL, "--notes", str(box / "Notes"))[0] == 0
+    root = box / ".local" / "state" / "ws"
+    (root / "work").mkdir(parents=True)
+    (root / "mine.txt").write_text("mine", encoding="utf-8")
+    code, out, _ = run(capsys, "uninstall", "--yes")
+    assert code == 0 and (root / "mine.txt").is_file() and not (root / "work").exists()
+    assert f"has your files in it, so ws left it: {root}" in out
+
+
+def test_uninstall_leaves_a_linked_work_root_alone(box, capsys, monkeypatch):
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    assert run(capsys, "install", *FULL, "--notes", str(box / "Notes"))[0] == 0
+    elsewhere = box / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "keep.txt").write_text("keep", encoding="utf-8")
+    (box / ".local" / "state").mkdir(parents=True)
+    (box / ".local" / "state" / "ws").symlink_to(elsewhere)
+    assert run(capsys, "uninstall", "--yes")[0] == 0
+    assert (elsewhere / "keep.txt").is_file()

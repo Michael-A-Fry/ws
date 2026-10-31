@@ -46,7 +46,7 @@ class Memory(Module):
         return {"memory": {"path": install.store_path(answers.memory, env)}}
 
     def steps(self, answers, env):
-        return [Step(install.expand(answers.memory, env), "dir", None, "your memory folder")]
+        return [Step(install.expand(answers.memory, env), "dir", None, "your memory folder", root=True)]
 
 
 class Notes(Module):
@@ -55,7 +55,10 @@ class Notes(Module):
 
     def steps(self, answers, env):
         notes = install.expand(answers.notes, env)
-        return [Step(notes, "dir", None, "your notes folder"), Step(notes / "_inbox", "dir", None, "the notes _inbox")]
+        return [
+            Step(notes, "dir", None, "your notes folder", root=True),
+            Step(notes / "_inbox", "dir", None, "the notes _inbox"),
+        ]
 
 
 REGISTRY: dict[str, Module] = {

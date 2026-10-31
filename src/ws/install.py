@@ -7,7 +7,9 @@
     uninstall(env)        removes what the manifest says ws created and nothing else. A file you changed since is
                           left and listed; folders are removed only when empty, so notes and memory you wrote stay.
 
-The manifest is the whole contract: ws never deletes a path it did not create.
+The manifest is the whole contract: ws never deletes a path it did not create. It also records the folders ws manages
+(`roots`: $WS_HOME, your notes and memory folders); uninstall refuses any entry outside them, so an edited manifest
+cannot point it at your other files.
 """
 
 from __future__ import annotations
@@ -15,8 +17,12 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
+import stat
 import sys
+import tempfile
+import tomllib
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -56,6 +62,8 @@ class Step:
     kind: str  # "file" | "dir"
     content: str | None = None  # the file's final text; None for a dir
     what: str = ""  # a few words for the person: "your profile"
+    root: bool = False  # a folder ws manages (your notes, your memory): uninstall may act inside it
+    toml: bool = False  # compared as TOML, so a re-formatted or commented file with the same data is unchanged
 
 
 @dataclass
@@ -63,15 +71,18 @@ class Result:
     created: list[Path] = field(default_factory=list)
     changed: list[Path] = field(default_factory=list)
     unchanged: list[Path] = field(default_factory=list)
+    edited: list[Path] = field(default_factory=list)  # a file ws made that you edited: left as it is
+    notes: list[str] = field(default_factory=list)
 
     @property
     def changes(self) -> int:
         return len(self.created) + len(self.changed)
 
     def summary(self) -> str:
+        tail = f", {len(self.edited)} left because you edited them" if self.edited else ""
         if not self.changes:
-            return f"0 changes ({len(self.unchanged)} unchanged)"
-        return f"{len(self.created)} created, {len(self.changed)} changed, {len(self.unchanged)} unchanged"
+            return f"0 changes ({len(self.unchanged)} unchanged{tail})"
+        return f"{len(self.created)} created, {len(self.changed)} changed, {len(self.unchanged)} unchanged{tail}"
 
 
 @dataclass
@@ -81,6 +92,7 @@ class Removal:
     not_empty: list[Path] = field(default_factory=list)  # a folder with something of yours in it
     not_ours: list[Path] = field(default_factory=list)  # in the manifest but ws did not create it
     missing: list[Path] = field(default_factory=list)  # already gone
+    refused: list[Path] = field(default_factory=list)  # outside the folders ws manages, or behind a symlink
 
 
 # ---- paths -------------------------------------------------------------------------------------------------------
@@ -155,7 +167,7 @@ def answers_from_profile(env=None, home: Path | None = None) -> Answers:
         modules=enabled,
         runner=runner if isinstance(runner, str) and runner in adapters.all_adapters() else "",
         model=model if isinstance(model, str) else "",
-        cap=float(cap) if isinstance(cap, (int, float)) and not isinstance(cap, bool) else None,
+        cap=float(cap) if isinstance(cap, (int, float)) and not isinstance(cap, bool) and math.isfinite(cap) else None,
         memory=role("memory", "path") if isinstance(role("memory", "path"), str) else "",
     )
 
@@ -183,8 +195,8 @@ def compose_profile(prof: dict, answers: Answers, env, osi: osinfo.OSInfo) -> di
     if answers.model:
         set_role("model", default=answers.model)
     if answers.cap is not None:
-        if answers.cap <= 0:
-            raise InstallError("the monthly cap must be above 0")
+        if not math.isfinite(answers.cap) or answers.cap <= 0:
+            raise InstallError("the monthly cap must be a number above 0")
         set_role("budget", monthly_cap_usd=answers.cap if answers.cap != int(answers.cap) else int(answers.cap))
     unknown = sorted(answers.modules - set(modules.REGISTRY))
     if unknown:
@@ -226,11 +238,10 @@ def plan(answers: Answers, env=None, osi: osinfo.OSInfo | None = None) -> list[S
         pol = policy.loads(text)
     except (policy.PolicyError, OSError, UnicodeDecodeError) as e:
         raise InstallError(f"{policy_file}: {e}") from e
-    steps.append(Step(policy_file, "file", text, "your policy (kept as it is if you already have one)"))
+    steps.append(Step(policy_file, "file", text, "your policy (kept as it is if you already have one)", toml=True))
 
-    steps.append(
-        Step(profile_path(env).absolute(), "file", dumps(compose_profile(prof, answers, env, osi)), "your profile")
-    )
+    profile_text = dumps(compose_profile(prof, answers, env, osi))
+    steps.append(Step(profile_path(env).absolute(), "file", profile_text, "your profile", toml=True))
     for m in modules.REGISTRY.values():
         if m.name in answers.modules:
             steps.extend(m.steps(answers, env))
@@ -248,47 +259,81 @@ def plan(answers: Answers, env=None, osi: osinfo.OSInfo | None = None) -> list[S
 # ---- apply ---------------------------------------------------------------------------------------------------------
 
 
-def _read_manifest(env) -> dict[str, dict]:
+def _read_manifest(env) -> tuple[dict[str, dict], set[str]]:
+    """(entries by path, roots). A manifest that does not read stops everything: ws touches nothing."""
     path = manifest_path(env)
     if not path.is_file():
-        return {}
+        return {}, set()
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        entries = data["entries"]
-        return {e["path"]: e for e in entries if isinstance(e, dict) and isinstance(e.get("path"), str)}
-    except (OSError, ValueError, KeyError, TypeError) as e:
+        entries = {e["path"]: e for e in data["entries"] if isinstance(e, dict) and isinstance(e.get("path"), str)}
+        roots = {r for r in data.get("roots", []) if isinstance(r, str)}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
         raise InstallError(f"{path} does not read as a ws manifest ({type(e).__name__}); not touching anything") from e
+    return entries, roots
 
 
-def _manifest_text(entries: dict[str, dict]) -> str:
-    doc = {"schema": SCHEMA, "ws_version": __version__, "entries": [entries[k] for k in sorted(entries)]}
+def _manifest_text(entries: dict[str, dict], roots: set[str]) -> str:
+    doc = {
+        "schema": SCHEMA,
+        "ws_version": __version__,
+        "roots": sorted(roots),
+        "entries": [entries[k] for k in sorted(entries)],
+    }
     return json.dumps(doc, indent=2) + "\n"
 
 
 def _write_atomic(path: Path, data: bytes) -> None:
-    tmp = path.with_name(path.name + ".ws-tmp")
+    """Write beside the target under a unique name, flush to disk, keep the target's mode, then replace it."""
     try:
-        tmp.write_bytes(data)
+        mode = stat.S_IMODE(path.stat().st_mode)
+    except OSError:
+        umask = os.umask(0)
+        os.umask(umask)
+        mode = 0o666 & ~umask
+    fd, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".ws-tmp")
+    tmp = Path(name)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
         os.replace(tmp, path)
     except OSError:
         tmp.unlink(missing_ok=True)
         raise
 
 
-def _missing_ancestors(path: Path) -> list[Path]:
-    """Folders above path that do not exist yet, outermost first."""
+def _missing_ancestors(path: Path, virtual: set[Path]) -> list[Path]:
+    """Folders above path that do not exist yet (or will not until an earlier step makes them), outermost first."""
     out: list[Path] = []
     for parent in path.parents:
-        if parent.exists():
+        if parent.exists() or parent in virtual:
             break
         out.append(parent)
     return out[::-1]
 
 
-def classify(step: Step) -> str:
+def _same_toml(a: bytes, b: bytes) -> bool:
+    try:
+        return tomllib.loads(a.decode("utf-8")) == tomllib.loads(b.decode("utf-8"))
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError):
+        return False
+
+
+def _edited_by_person(entry: dict | None, on_disk: bytes) -> bool:
+    """A file ws made, whose content is no longer what ws wrote."""
+    return bool(entry) and entry.get("created_by_ws") is True and entry.get("sha256") != sha256(on_disk)
+
+
+def classify(step: Step, entries: dict[str, dict] | None = None, virtual: set[Path] | None = None) -> str:
+    """created | changed | unchanged | edited. `virtual` holds folders an earlier step will make, so a dry run and a
+    real run agree."""
+    entries, virtual = entries or {}, virtual or set()
     p = step.path
     if step.kind == "dir":
-        if p.is_dir():
+        if p.is_dir() or p in virtual:
             return "unchanged"
         if p.exists() or p.is_symlink():
             raise InstallError(f"{p} is in the way: ws needs a folder there")
@@ -297,52 +342,121 @@ def classify(step: Step) -> str:
         raise InstallError(f"{p} is a folder: ws needs a file there")
     if not p.exists():
         return "created"
-    return "unchanged" if p.read_bytes() == (step.content or "").encode("utf-8") else "changed"
+    disk, want = p.read_bytes(), (step.content or "").encode("utf-8")
+    if disk == want or (step.toml and _same_toml(disk, want)):
+        return "unchanged"
+    if not step.toml and _edited_by_person(entries.get(str(p)), disk):
+        return "edited"  # a generated file you changed: left alone
+    return "changed"
+
+
+def _root_problem(root: Path, env) -> str | None:
+    """Why a folder cannot be a root: one that covers your whole home (or the disk) is not 'ws's folder'."""
+    home = Path(os.path.abspath(env.get("HOME") or Path.home()))
+    if root == Path(root.anchor) or root == home or root in home.parents:
+        return f"{root} is too broad for ws to manage; pick a folder of its own"
+    return None
 
 
 def apply(steps: list[Step], env=None, dry_run: bool = False) -> Result:
-    """Write what differs. Records every path ws creates in the manifest; a file ws changes but did not create is
-    recorded with created_by_ws false so uninstall knows to leave it."""
+    """Write what differs. Records every path ws creates in the manifest, even when a later step fails. A file ws
+    changes but did not create is recorded with created_by_ws false so uninstall knows to leave it; a generated file
+    you edited is left and reported."""
     env = os.environ if env is None else env
     result = Result()
-    entries = _read_manifest(env)
-    for step in steps:
-        action = classify(step)
-        getattr(result, action).append(step.path)
-        if dry_run or action == "unchanged":
-            continue
-        for parent in _missing_ancestors(step.path):
-            parent.mkdir()
-            entries[str(parent)] = {"path": str(parent), "kind": "dir", "sha256": None, "created_by_ws": True}
-        key = str(step.path)
-        if step.kind == "dir":
-            step.path.mkdir()
-            entries[key] = {"path": key, "kind": "dir", "sha256": None, "created_by_ws": True}
-            continue
-        data = (step.content or "").encode("utf-8")
-        _write_atomic(step.path, data)
-        ours = action == "created" or entries.get(key, {}).get("created_by_ws") is True
-        entries[key] = {"path": key, "kind": "file", "sha256": sha256(data), "created_by_ws": ours}
-    if not dry_run and entries:
-        path, text = manifest_path(env), _manifest_text(entries)
-        if not path.is_file() or path.read_text(encoding="utf-8") != text:
-            _write_atomic(path, text.encode("utf-8"))
+    entries, roots = _read_manifest(env)
+    new_roots = {Path(os.path.abspath(ws_home(env)))} | {s.path for s in steps if s.root}
+    for r in sorted(new_roots):
+        if problem := _root_problem(r, env):
+            raise InstallError(problem)
+    roots |= {str(r) for r in new_roots}
+    virtual: set[Path] = set()
+    try:
+        for step in steps:
+            action = classify(step, entries, virtual)
+            getattr(result, action).append(step.path)
+            if action in ("unchanged", "edited"):
+                continue
+            missing = _missing_ancestors(step.path, virtual)
+            virtual.update(missing)
+            if step.kind == "dir":
+                virtual.add(step.path)
+            if dry_run:
+                continue
+            for parent in missing:
+                parent.mkdir()
+                entries[str(parent)] = {"path": str(parent), "kind": "dir", "sha256": None, "created_by_ws": True}
+            key = str(step.path)
+            if step.kind == "dir":
+                step.path.mkdir()
+                entries[key] = {"path": key, "kind": "dir", "sha256": None, "created_by_ws": True}
+                continue
+            data = (step.content or "").encode("utf-8")
+            entry = entries.get(key)
+            ours = action == "created" or bool(entry and entry.get("created_by_ws") is True)
+            if action == "changed" and ours and _edited_by_person(entry, step.path.read_bytes()):
+                ours = (
+                    False  # a TOML file you edited, rewritten to carry a new answer: yours now, so uninstall leaves it
+                )
+                result.notes.append(f"{step.path} had your edits: ws kept your values and rewrote it")
+            _write_atomic(step.path, data)
+            entries[key] = {"path": key, "kind": "file", "sha256": sha256(data), "created_by_ws": ours}
+    finally:
+        if not dry_run and entries:
+            path, text = manifest_path(env), _manifest_text(entries, roots)
+            for parent in _missing_ancestors(path, set()):  # steps outside ws's home: its home may not exist yet
+                parent.mkdir()
+                entries[str(parent)] = {"path": str(parent), "kind": "dir", "sha256": None, "created_by_ws": True}
+                text = _manifest_text(entries, roots)
+            if not path.is_file() or path.read_text(encoding="utf-8") != text:
+                _write_atomic(path, text.encode("utf-8"))
     return result
 
 
 # ---- uninstall -------------------------------------------------------------------------------------------------------
 
 
+def _inside(path: Path, roots: list[Path]) -> bool:
+    """Under a root with no symlink on the way down (the root itself may be a link to where you keep it)."""
+    for root in roots:
+        if root in path.parents:
+            between = [p for p in path.parents if root in p.parents]
+            return not any(p.is_symlink() for p in between)
+    return False
+
+
+def _may_touch(e: dict, roots: list[Path]) -> bool:
+    """An entry is acted on only if its normalised path is a root, inside one, or (a folder) above one."""
+    p = Path(os.path.normpath(e["path"]))
+    if not p.is_absolute():
+        return False
+    if e.get("kind") == "dir":
+        if p.is_symlink():
+            return False
+        if p in roots or any(p in r.parents for r in roots):
+            return True
+    return _inside(p, roots)
+
+
 def uninstall(env=None, keep_data: bool = True, dry_run: bool = False) -> Removal:
-    """Remove what the manifest says ws created. Files first, then folders deepest first, and only empty ones."""
+    """Remove what the manifest says ws created, inside the folders it manages. Files first, then folders deepest
+    first, and only empty ones."""
     if not keep_data:
         raise InstallError("deleting your notes and memory is not built: ws only removes what it made")
     env = os.environ if env is None else env
-    entries = _read_manifest(env)
+    entries, recorded = _read_manifest(env)
     out = Removal()
-    mine = [e for e in entries.values() if Path(e["path"]).is_absolute()]
+    roots = [Path(os.path.normpath(r)) for r in recorded if Path(r).is_absolute()]
+    roots = [r for r in roots if not _root_problem(r, env)]
+    roots.append(Path(os.path.abspath(ws_home(env))))  # the one root that does not come from the manifest
+    mine = []
+    for e in entries.values():
+        if _may_touch(e, roots):
+            mine.append(e)
+        else:
+            out.refused.append(Path(e["path"]))
     for e in sorted((e for e in mine if e.get("kind") == "file"), key=lambda e: e["path"]):
-        p = Path(e["path"])
+        p = Path(os.path.normpath(e["path"]))
         if e.get("created_by_ws") is not True:
             out.not_ours.append(p)
         elif p.is_symlink() or not p.is_file():
@@ -357,16 +471,16 @@ def uninstall(env=None, keep_data: bool = True, dry_run: bool = False) -> Remova
     gone = {*out.removed, mpath}
     if not dry_run and mpath.is_file():
         mpath.unlink()
-    ours = {Path(e["path"]) for e in mine if e.get("kind") == "dir" and e.get("created_by_ws") is True}
-    home = Path(os.path.abspath(ws_home(env)))
-    for d in sorted({*ours, home} if entries else set(), key=lambda p: (-len(p.parts), str(p))):
+    ours = {
+        Path(os.path.normpath(e["path"])) for e in mine if e.get("kind") == "dir" and e.get("created_by_ws") is True
+    }
+    for d in sorted(ours, key=lambda p: (-len(p.parts), str(p))):
         if d.is_symlink() or not d.is_dir():
-            if d in ours:
-                out.missing.append(d)
+            out.missing.append(d)
         elif _removable(d, gone, dry_run):
             out.removed.append(d)
             gone.add(d)
-        elif d in ours:
+        else:
             out.not_empty.append(d)
     return out
 
@@ -414,7 +528,12 @@ def answers_from_args(args: argparse.Namespace, env) -> Answers:
 
 def _rows(steps: list[Step], result: Result) -> list[dict]:
     action = {}
-    for name, paths in (("create", result.created), ("change", result.changed), ("keep", result.unchanged)):
+    for name, paths in (
+        ("create", result.created),
+        ("change", result.changed),
+        ("keep", result.unchanged),
+        ("left", result.edited),
+    ):
         action.update(dict.fromkeys(paths, name))
     return [{"path": str(s.path), "kind": s.kind, "what": s.what, "action": action[s.path]} for s in steps]
 
@@ -434,13 +553,17 @@ def cmd_install(args: argparse.Namespace) -> int:
         print(f"ws: {e}", file=sys.stderr)
         return 1
     if args.json:
-        counts = {k: len(getattr(result, k)) for k in ("created", "changed", "unchanged")}
+        counts = {k: len(getattr(result, k)) for k in ("created", "changed", "unchanged", "edited")}
         print(json.dumps({**counts, "dry_run": args.dry_run, "steps": _rows(steps, result)}, indent=2))
         return 0
     if args.dry_run:
         for row in _rows(steps, result):
             if row["action"] != "keep":
                 print(f"would {row['action']} {row['path']} ({row['what'] or row['kind']})")
+    for path in result.edited:
+        print(f"you changed it, so ws left it: {path}")
+    for note in result.notes:
+        print(f"ws: {note}")
     print(f"ws: {'dry run: ' if args.dry_run else ''}{result.summary()}")
     if result.changes and not args.dry_run:
         print("next: `ws doctor` lists what is still to set up")
@@ -465,7 +588,9 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
         print(f"has your files in it, so ws left it: {p}")
     for p in r.not_ours:
         print(f"ws did not create it, so ws left it: {p}")
-    left = len(r.edited) + len(r.not_empty) + len(r.not_ours)
+    for p in r.refused:
+        print(f"outside the folders ws manages, so ws left it: {p}")
+    left = len(r.edited) + len(r.not_empty) + len(r.not_ours) + len(r.refused)
     print(f"ws: {'would remove' if args.dry_run else 'removed'} {len(r.removed)}; left {left}")
     return 0
 

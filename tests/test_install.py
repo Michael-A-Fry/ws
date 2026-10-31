@@ -95,15 +95,166 @@ def test_uninstall_never_touches_a_path_not_in_the_manifest(box, capsys):
     assert stray.read_text() == "x" and other.read_text() == "y"
 
 
-def test_uninstall_ignores_a_manifest_entry_whose_hash_does_not_match(box, capsys):
-    victim = box / "precious.txt"
-    victim.write_text("keep me")
+def test_uninstall_leaves_an_entry_in_ws_home_whose_hash_does_not_match(box, capsys):
+    assert run(capsys, "install", "--yes", "--notes", str(box / "Notes"))[0] == 0
     mp = install.manifest_path()
-    mp.parent.mkdir(parents=True)
-    entry = {"path": str(victim), "kind": "file", "sha256": "0" * 64, "created_by_ws": True}
-    mp.write_text(json.dumps({"schema": 1, "ws_version": "x", "entries": [entry]}))
+    doc = json.loads(mp.read_text())
+    victim = box / ".ws" / "precious.txt"
+    victim.write_text("keep me")
+    doc["entries"].append({"path": str(victim), "kind": "file", "sha256": "0" * 64, "created_by_ws": True})
+    mp.write_text(json.dumps(doc))
     code, out, _ = run(capsys, "uninstall", "--yes")
-    assert code == 0 and "you changed it" in out and victim.read_text() == "keep me"
+    assert code == 0 and f"you changed it, so ws left it: {victim}" in out and victim.read_text() == "keep me"
+
+
+def tamper(*entries, roots=None):
+    """Add (path, kind) entries to the manifest, each with a hash that matches the file as it is now."""
+    mp = install.manifest_path()
+    doc = json.loads(mp.read_text())
+    for path, kind in entries:
+        digest = hashlib.sha256(path.read_bytes()).hexdigest() if kind == "file" else None
+        doc["entries"].append({"path": str(path), "kind": kind, "sha256": digest, "created_by_ws": True})
+    if roots is not None:
+        doc["roots"] = roots
+    mp.write_text(json.dumps(doc))
+
+
+def test_an_edited_manifest_cannot_point_uninstall_at_your_other_files(box, capsys):
+    assert run(capsys, "install", "--yes", "--notes", str(box / "Notes"))[0] == 0
+    key = box / ".ssh" / "id_rsa"
+    key.parent.mkdir()
+    key.write_text("private")
+    empty = box / "somewhere-else"
+    empty.mkdir()
+    sneaky = box / ".ws" / ".." / ".ssh" / "id_rsa"  # looks like it is under ws's home until the .. is resolved
+    tamper((key, "file"), (sneaky, "file"), (empty, "dir"))
+    code, out, _ = run(capsys, "uninstall", "--yes")
+    assert code == 0
+    assert key.read_text() == "private" and empty.is_dir()
+    assert "outside the folders ws manages" in out and str(key) in out
+    assert not (box / ".ws").exists()  # what ws really made still went
+
+
+def test_widening_the_recorded_roots_does_not_help(box, capsys):
+    assert run(capsys, "install", "--yes", "--notes", str(box / "Notes"))[0] == 0
+    key = box / ".ssh" / "id_rsa"
+    key.parent.mkdir()
+    key.write_text("private")
+    tamper((key, "file"), roots=[str(box), "/"])
+    assert run(capsys, "uninstall", "--yes")[0] == 0
+    assert key.read_text() == "private"
+
+
+def test_an_entry_behind_a_symlinked_folder_is_refused(box, capsys):
+    assert run(capsys, "install", "--yes", "--notes", str(box / "Notes"))[0] == 0
+    outside = box / "outside"
+    outside.mkdir()
+    target = outside / "x.txt"
+    target.write_text("not ws's")
+    (box / ".ws" / "link").symlink_to(outside, target_is_directory=True)
+    tamper((box / ".ws" / "link" / "x.txt", "file"))
+    assert run(capsys, "uninstall", "--yes")[0] == 0
+    assert target.read_text() == "not ws's"
+
+
+def test_the_manifest_records_the_folders_ws_manages(box, capsys):
+    assert run(capsys, "install", "--yes", "--notes", str(box / "Notes"))[0] == 0
+    roots = json.loads(install.manifest_path().read_text())["roots"]
+    assert roots == sorted([str(box / ".ws"), str(box / "Notes"), str(box / "ws-memory")])
+
+
+def test_a_notes_folder_that_is_your_whole_home_is_refused(box, capsys):
+    pre = snapshot(box)
+    code, _, err = run(capsys, "install", "--yes", "--notes", str(box))
+    assert code == 1 and "too broad" in err and snapshot(box) == pre
+
+
+def test_a_failure_part_way_still_records_what_was_created(box, capsys, monkeypatch):
+    real = install._write_atomic
+
+    def flaky(path, data):
+        if path.name == "profile.toml":
+            raise OSError("disk full")
+        real(path, data)
+
+    monkeypatch.setattr(install, "_write_atomic", flaky)
+    code, _, err = run(capsys, "install", "--yes", "--notes", str(box / "Notes"))
+    assert code == 1 and "disk full" in err
+    assert (box / ".ws" / "policy.toml").is_file()
+    recorded = {e["path"] for e in json.loads(install.manifest_path().read_text())["entries"]}
+    assert str(box / ".ws" / "policy.toml") in recorded and str(box / ".ws") in recorded
+    monkeypatch.setattr(install, "_write_atomic", real)
+    assert run(capsys, "uninstall", "--yes")[0] == 0
+    assert not (box / ".ws").exists()
+
+
+def test_a_generated_file_you_edited_is_left_and_reported_not_overwritten(box, capsys):
+    args = ["install", "--yes", "--runner", "claude-code", "--notes", str(box / "Notes")]
+    assert run(capsys, *args)[0] == 0
+    gate = next(p for p in (box / ".ws" / "gate").rglob("*") if p.is_file())
+    gate.write_text(gate.read_text() + "\n")
+    mine = gate.read_text()
+    code, out, _ = run(capsys, *args)
+    assert code == 0 and gate.read_text() == mine
+    assert f"you changed it, so ws left it: {gate}" in out and "0 changes" in out and "1 left" in out
+    assert run(capsys, "uninstall", "--yes")[0] == 0
+    assert gate.read_text() == mine
+
+
+def test_profile_comments_survive_a_rerun_that_changes_nothing(box, capsys):
+    args = ["install", "--yes", "--notes", str(box / "Notes")]
+    assert run(capsys, *args)[0] == 0
+    prof = box / ".ws" / "profile.toml"
+    prof.write_text(prof.read_text() + "\n# my own comment\n")
+    code, out, _ = run(capsys, *args)
+    assert code == 0 and "0 changes" in out and "my own comment" in prof.read_text()
+
+
+def test_a_profile_you_edited_is_kept_not_deleted_when_ws_changes_it_or_uninstalls(box, capsys):
+    args = ["install", "--yes", "--notes", str(box / "Notes")]
+    assert run(capsys, *args)[0] == 0
+    prof = box / ".ws" / "profile.toml"
+    prof.write_text(prof.read_text() + '\n[machine.extra]\nmine = "yes"\n')
+    code, out, _ = run(capsys, *args, "--cap", "7")
+    assert code == 0 and "1 changed" in out and "had your edits" in out
+    kept = tomllib.loads(prof.read_text())
+    assert kept["machine"]["extra"] == {"mine": "yes"} and kept["roles"]["budget"]["monthly_cap_usd"] == 7
+    assert run(capsys, "uninstall", "--yes")[0] == 0
+    assert prof.is_file()
+
+
+def test_uninstall_leaves_a_ws_home_that_was_there_before(box, capsys):
+    (box / ".ws").mkdir()
+    assert run(capsys, "install", "--yes", "--notes", str(box / "Notes"))[0] == 0
+    assert run(capsys, "uninstall", "--yes")[0] == 0
+    assert (box / ".ws").is_dir() and list((box / ".ws").iterdir()) == []
+
+
+@pytest.mark.parametrize("cap", ["nan", "inf", "-inf", "0"])
+def test_a_cap_that_is_not_a_positive_number_is_refused(box, capsys, cap):
+    pre = snapshot(box)
+    code, _, err = run(capsys, "install", "--yes", "--notes", str(box / "Notes"), f"--cap={cap}")
+    assert code == 1 and "above 0" in err and "Traceback" not in err and snapshot(box) == pre
+
+
+def test_a_rewrite_keeps_the_files_mode_and_leaves_no_temp_files(box, capsys):
+    args = ["install", "--yes", "--notes", str(box / "Notes")]
+    assert run(capsys, *args)[0] == 0
+    prof = box / ".ws" / "profile.toml"
+    prof.chmod(0o600)
+    assert run(capsys, *args, "--cap", "3")[0] == 0
+    assert prof.stat().st_mode & 0o777 == 0o600
+    assert not [p for p in (box / ".ws").iterdir() if p.name.endswith(".ws-tmp")]
+
+
+def test_a_dry_run_counts_the_same_as_the_real_run_when_a_folder_follows_its_contents(box):
+    top = box / "made" / "inner"
+    steps = [install.Step(top / "a.txt", "file", "x"), install.Step(top, "dir")]
+    dry = install.apply(steps, dry_run=True)
+    assert not (box / "made").exists()
+    real = install.apply(steps)
+    assert (dry.created, dry.changed, dry.unchanged) == (real.created, real.changed, real.unchanged)
+    assert real.created == [top / "a.txt"] and real.unchanged == [top]
 
 
 def test_a_file_ws_changed_but_did_not_create_is_left_on_uninstall(box, capsys):

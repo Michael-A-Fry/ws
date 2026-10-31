@@ -14,8 +14,6 @@ from pathlib import Path
 DEPTH = 2  # folders below a search place that are looked into (the place itself is depth 0)
 MAX_ENTRIES = 2000  # per folder: a huge folder of loose files is not scanned to the end
 PLAIN = "~/Notes"
-# `config` + `.e` + `dn`, split so the spell checker does not "correct" the real extension
-LOGSEQ_CONFIG = Path("logseq") / ("config." + "e" + "dn")
 SKIP = {"node_modules", "Library", "Applications", "Pictures", "Music", "Movies"}
 
 
@@ -50,7 +48,7 @@ def search_places(home: Path) -> list[Path]:
 def app_of(folder: Path) -> str | None:
     if (folder / ".obsidian").is_dir():
         return "Obsidian"
-    if (folder / LOGSEQ_CONFIG).is_file():
+    if (folder / "logseq" / "config.edn").is_file():
         return "Logseq"
     return None
 

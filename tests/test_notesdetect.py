@@ -12,7 +12,7 @@ def vault(path):
 
 def graph(path):
     (path / "logseq").mkdir(parents=True)
-    (path / notesdetect.LOGSEQ_CONFIG).write_text("{}")
+    (path / "logseq" / "config.edn").write_text("{}")
     return path
 
 

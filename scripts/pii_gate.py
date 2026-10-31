@@ -95,7 +95,13 @@ def file_lines(path: Path):
 def history_chunks():
     """Yield (commit, [(n, line)]) for every message and added line reachable from HEAD (other branches are theirs)."""
     out = subprocess.run(
-        ["git", "log", "-p", "--no-color", "--format=@@COMMIT %H%n%B@@ENDMSG"],
+        [
+            "git",
+            "log",
+            "-p",
+            "--no-color",
+            "--format=@@COMMIT %H%n%B%n@@ENDMSG",
+        ],  # %n: a squash-merge message has no final newline
         capture_output=True,
         text=True,
         errors="replace",

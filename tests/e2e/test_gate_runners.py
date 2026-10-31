@@ -81,7 +81,7 @@ def secrets(tmp_path):
 
 
 def generate(tmp_path, runner: str) -> Path:
-    out = tmp_path / f"gate-{runner}"
+    out = tmp_path / "wshome" / "gate" / runner  # where ws puts it: $WS_HOME/gate/<runner>
     ws_cmd = shlex.join([sys.executable, "-m", "ws"])
     assert cli.main(["gate", "generate", "--runner", runner, "--out", str(out), "--ws-cmd", ws_cmd]) == 0
     return out
@@ -189,7 +189,7 @@ def test_claude_code_still_reads_an_allowed_file(tmp_path, work, secrets, layer)
 
 @pytest.mark.parametrize("layer", ["native", "hook"])
 def test_claude_code_cannot_write_its_own_gate(tmp_path, work, layer):
-    gate_file = tmp_path / "gate-claude-code" / "plugins" / "evil.js"
+    gate_file = tmp_path / "wshome" / "gate" / "claude-code" / "plugins" / "evil.js"
     protected = [gate_file, tmp_path / "wshome" / "policy.toml", tmp_path / "wshome" / "jobs" / "x.toml"]
     calls = [Call("Edit", EDIT_NEW | {"file_path": str(p)}) for p in protected]
     stub, proc, _ = claude_go(tmp_path, work, layer, calls)
@@ -292,7 +292,7 @@ def test_opencode_still_reads_an_allowed_file(tmp_path, work, secrets, layer):
 
 @pytest.mark.parametrize("layer", ["native", "shim"])
 def test_opencode_cannot_write_its_own_gate(tmp_path, work, layer):
-    gate_file = tmp_path / "gate-opencode" / "plugins" / "evil.js"
+    gate_file = tmp_path / "wshome" / "gate" / "opencode" / "plugins" / "evil.js"
     protected = [gate_file, tmp_path / "wshome" / "policy.toml", tmp_path / "wshome" / "jobs" / "x.toml"]
     calls = [Call("write", {"filePath": str(p), "content": "x"}) for p in protected]
     stub, proc = opencode_go(tmp_path, work, layer, calls)

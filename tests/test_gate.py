@@ -382,3 +382,12 @@ def test_the_generated_hook_command_allows_denies_and_fails_closed(home, tmp_pat
     assert run_hook(broken, bash("ls"), env).returncode == 2
     crashing = f"{shlex.quote(sys.executable)} -c 'import sys; sys.exit(1)' gate check || exit 2"
     assert run_hook(crashing, bash("ls"), env).returncode == 2
+
+
+def test_opencode_edit_patterns_never_drop_the_parent_folder(home, tmp_path):
+    out = home / "wshome" / "gate" / "opencode"
+    assert generate("opencode", out) == 0
+    edit = json.loads((out / "opencode.json").read_text())["permission"]["edit"]
+    assert "**/wshome/gate/opencode/**" in edit and "**/wshome/logs/**" in edit and "**/wshome/policy.toml" in edit
+    bare = [k for k in edit if k.startswith("**/") and "/" not in k[3:].rstrip("/*")]
+    assert not bare, bare  # nothing like **/logs/** or **/opencode/**, which would hit any project's own folder

@@ -8,6 +8,15 @@ Stdlib only. Three jobs:
     second layer (the runner's own deny rules are the first, a sandbox the real wall): it catches the plausible
     retries, not every spelling a shell allows;
   * `rule_of_two`: refuse a session that holds untrusted input, private data and a way out at the same time.
+
+Known limits. The matcher reads command text, so it cannot see:
+  * what an interpreter does inside its own program (`python3 -c`, `perl -e`, `node -e`, a script it runs);
+  * a script that is downloaded and run in two steps (`curl -o a.sh ... && bash a.sh`);
+  * a path built by a command (`cat "$(echo ~)/.ssh/id_rsa"`), or by a variable set outside the command line;
+  * the version-control tool restoring a protected tracked file (`git -C ~/.ws checkout policy.toml`);
+  * OpenCode's `patch` tool, which carries no single file path (its native `edit` rules still apply).
+These stay allowed here. The runner's own deny rules are the first layer; a sandbox (the planned wall) is what
+closes the rest.
 """
 
 from __future__ import annotations
@@ -461,6 +470,14 @@ def _canon_path(tok: str) -> str:
     """One spelling for the same place: ~, $HOME, ${HOME} and the real home dir all become ~; // and /./ and
     trailing slashes go. Only for tokens that look like a path."""
     home = _home().rstrip("/")
+    if not re.search(r"[*?\[]", tok):
+        full = _expand(tok)
+        if not full.startswith("/"):
+            return tok
+        full = _abs(full, "/")  # resolve .. and // first: ~/../x is not under ~
+        if home and (full == home or full.startswith(home + "/")):
+            return "~" + full[len(home) :]
+        return full
     for pre in ("${HOME}", "$HOME"):
         if tok == pre or tok.startswith(pre + "/"):
             tok = "~" + tok[len(pre) :]
@@ -521,7 +538,7 @@ def _git_normal(toks: list[str]) -> list[str]:
         re.fullmatch(r"-[A-Za-z]*f[A-Za-z]*", t)
         or t.startswith(("+", ":"))
         or ":+" in t
-        or t in ("--mirror", "--delete")
+        or t in ("--mirror", "--delete", "-d")
         for t in toks[2:]
     ):
         toks.append("--force")
@@ -863,13 +880,17 @@ def _read_hit(policy: Policy, path: str, cwd: str, recursive: bool = False, fold
     return None
 
 
-def _under(paths: tuple[str, ...], path: str, cwd: str) -> str | None:
+def _under(paths: tuple[str, ...], path: str, cwd: str, ancestors: bool = False) -> str | None:
+    """The protected path that `path` is, or is inside. With `ancestors`, also one that is inside `path`: removing,
+    moving or unpacking over a folder takes everything under it too."""
     p = _abs(path, cwd)
     forms = {p, os.path.realpath(p)}
     for q in paths:
         qa = _abs(q, cwd)
         for target in {qa, os.path.realpath(qa)}:
-            if any(f == target or f.startswith(target + "/") for f in forms):
+            if any(
+                f == target or f.startswith(target + "/") or (ancestors and target.startswith(f + "/")) for f in forms
+            ):
                 return q
     return None
 
@@ -880,6 +901,65 @@ def _under(paths: tuple[str, ...], path: str, cwd: str) -> str | None:
 def _expand_vars(seg: str, ctx: _Ctx) -> str:
     known = ctx.vars or {}
     return _VAR.sub(lambda m: known.get(m.group(1) or m.group(2), m.group(0)), seg) if known else seg
+
+
+_BRACE = re.compile(r"\{([^{}]*,[^{}]*)\}")
+_FETCHERS = {"curl", "wget", "nc", "ncat", "ssh", "scp", "ftp", "fetch"}
+
+
+def _braces(word: str, limit: int = 32) -> list[str]:
+    """`x{1,2}y` -> x1y, x2y (one shell word becomes several)."""
+    m = _BRACE.search(word)
+    if not m:
+        return [word]
+    out: list[str] = []
+    for alt in m.group(1).split(","):
+        out += _braces(word[: m.start()] + alt + word[m.end() :], limit)
+        if len(out) >= limit:
+            break
+    return out[:limit]
+
+
+def _dotted(op: str, cwd: str) -> str:
+    """`.`, `..`, `*` and `../..` name a place that depends on where the command runs: spell it out."""
+    if op and not op.startswith(("/", "~", "$", "-")) and re.fullmatch(r"[./*]+", op):
+        return _canon_path(_abs(op, cwd))
+    return op
+
+
+def _opt_values(toks: list[str], letters: str = "", longs: tuple[str, ...] = ()) -> list[str]:
+    """The values given to an option: `-o X`, `-sSLo X` (the option last in a group), `--output X`, `--output=X`."""
+    out = []
+    for i, t in enumerate(toks[1:], 1):
+        nxt = toks[i + 1] if i + 1 < len(toks) else None
+        if t.startswith("--"):
+            for lg in longs:
+                if t == lg and nxt is not None:
+                    out.append(nxt)
+                elif t.startswith(lg + "="):
+                    out.append(t.split("=", 1)[1])
+        elif re.fullmatch(r"-[A-Za-z]+", t) and t[-1] in letters and nxt is not None:
+            out.append(nxt)
+    return out
+
+
+_ADMIN = {"secret", "broker"}
+
+
+def _ws_admin(canon: list[str]) -> str | None:
+    """`ws gate generate|init`, `ws secret ...`, `ws broker ...` (also `uv run ws ...`, `python -m ws ...`): a gated
+    session must not regenerate its own gate or touch secrets."""
+    for i, t in enumerate(canon):
+        if posixpath.basename(t) != "ws" or not (
+            i == 0 or canon[i - 1] in ("run", "-m", "--", "exec", "tool") or canon[i - 1].startswith("-")
+        ):
+            continue
+        sub = [x for x in canon[i + 1 :] if not x.startswith("-")][:2]
+        if sub[:1] == ["gate"] and ("generate" in canon[i + 2 :] or "init" in canon[i + 2 :]):
+            return "ws gate generate/init is not for a gated session: it would rewrite its own gate"
+        if sub[:1] and sub[0] in _ADMIN:
+            return f"ws {sub[0]} is not for a gated session"
+    return None
 
 
 def _walk(policy: Policy, cmd: str, ctx: _Ctx, depth: int, cands: list[str]) -> str | None:
@@ -909,6 +989,7 @@ def _walk(policy: Policy, cmd: str, ctx: _Ctx, depth: int, cands: list[str]) -> 
 def _segment(policy: Policy, seg: str, ctx: _Ctx, in_pipe: bool, cands: list[str]) -> tuple[str | None, str, list[str]]:
     cands.append(" ".join(seg.split()))
     words, redirs = _lex(_expand_vars(seg, ctx))
+    words = [b for w in words for b in _braces(w)]
     if not words and not redirs:
         return None, "", []
     if words and all(_ASSIGN.match(w) for w in words):  # X=/ ; later $X
@@ -926,8 +1007,15 @@ def _segment(policy: Policy, seg: str, ctx: _Ctx, in_pipe: bool, cands: list[str
 
     if cmd in ("cd", "pushd"):
         ctx.cwd = _abs(operands[0] if operands else "~", ctx.cwd)
+    admin = _ws_admin(canon)
+    if admin:
+        return admin, line, []
     if cmd == "eval":
-        nested.append(" ".join(toks[1:]))
+        text = " ".join(toks[1:])
+        fetched = re.match(r"\s*(?:\$\(|`)\s*(\S+)", text)
+        if fetched and posixpath.basename(fetched.group(1)) in _FETCHERS:
+            return "eval of text a network command fetches", line, []
+        nested.append(text)
     if cmd in _SHELL_NAMES:
         reason, nested = _shell(toks, canon, flags, operands, redirs, in_pipe)
         if reason:
@@ -937,9 +1025,9 @@ def _segment(policy: Policy, seg: str, ctx: _Ctx, in_pipe: bool, cands: list[str
     if cmd in ("source", ".") and _PROCSUB in operands:
         return "a script is being sourced from a process substitution", line, []
     if cmd in _OPERAND_CMDS:
-        cands += [" ".join([cmd, *flags, op]) for op in operands[:64]]
+        cands += [" ".join([cmd, *flags, _dotted(op, ctx.cwd)]) for op in operands[:64]]
     if cmd == "find":
-        cands += _find_deletes(canon)
+        cands += _find_deletes(canon, ctx.cwd)
     if (
         "xargs" in wrappers
         and cmd == "rm"
@@ -959,13 +1047,15 @@ def _segment(policy: Policy, seg: str, ctx: _Ctx, in_pipe: bool, cands: list[str
         or "--archive" in flags
         or (cmd in ("cp", "rsync") and _cluster(flags, "a"))
     )
+    if recursive and _searches_cwd(cmd, canon, operands):
+        named.append(".")  # `cd ~ && grep -r x`: no path given means here
     for p in named:
         rule = _read_hit(policy, p, ctx.cwd, recursive=recursive)
         if rule:
             return f"command names a path denied by deny_read rule {rule!r}", line, nested
     if ctx.protect:
-        for p in _written(cmd, flags, operands, redirs, canon):
-            hit = _under(ctx.protect, p, ctx.cwd)
+        for p, ancestors in _written(cmd, flags, operands, redirs, canon, toks):
+            hit = _under(ctx.protect, p, ctx.cwd, ancestors)
             if hit:
                 return f"command writes to {hit}, which ws protects (policy and generated gate)", line, nested
     return None, line, nested
@@ -977,6 +1067,10 @@ def _shell(toks, canon, flags, operands, redirs, in_pipe):
     checked on its own)."""
     here = any(op in ("<<<", "<<", "<<-") for op, _ in redirs)
     nested = [t for op, t in redirs if op == "<<<"]
+    operands = list(operands)
+    for f in flags:  # `-o pipefail` and `-O extglob` take a word that is not the script
+        if f[1:2] != "-" and ("o" in f[1:] or "O" in f[1:]) and operands:
+            operands.pop(0)
     if _PROCSUB in operands:
         return "a shell is reading its script from a process substitution", nested
     if _cluster(flags, "c"):
@@ -998,7 +1092,18 @@ def _shell(toks, canon, flags, operands, redirs, in_pipe):
     return None, nested
 
 
-def _find_deletes(canon: list[str]) -> list[str]:
+def _searches_cwd(cmd: str, canon: list[str], operands: list[str]) -> bool:
+    """A recursive search that names no folder searches the one it runs in."""
+    if cmd in ("grep", "egrep", "fgrep", "rg", "ag"):
+        return len(operands) <= 1
+    if cmd in ("ls", "du", "tree"):
+        return not operands
+    if cmd == "find":
+        return not canon[1:2] or canon[1].startswith(("-", "(", "!"))
+    return False
+
+
+def _find_deletes(canon: list[str], cwd: str) -> list[str]:
     """`find P -delete` and `find P -exec rm ...` as the `rm -rf P` they amount to."""
     rest = canon[1:]
     deleting = "-delete" in rest or any(
@@ -1011,23 +1116,51 @@ def _find_deletes(canon: list[str]) -> list[str]:
         if t.startswith(("-", "(", "!", ",")):
             break
         starts.append(t)
-    return [f"rm -fr {p}" for p in (starts or ["."])]
+    return [f"rm -fr {_dotted(p, cwd)}" for p in (starts or ["."])]
 
 
-def _written(cmd, flags, operands, redirs, canon) -> list[str]:
-    """Paths this command writes (or removes): redirect targets, and operands of the commands that write."""
-    out = [t for op, t in redirs if op.startswith(">") or op == "<>"]
+def _written(cmd, flags, operands, redirs, canon, toks) -> list[tuple[str, bool]]:
+    """Paths this command writes or removes, as (path, ancestors): redirect targets, operands of the commands that
+    write, and where curl, wget, tar, unzip and zip put files. `ancestors` is true where a folder above a protected
+    path is just as bad (rm, mv, and unpacking or copying a tree over it)."""
+    out: list[tuple[str, bool]] = [(t, False) for op, t in redirs if op.startswith(">") or op == "<>"]
+    recursive = any(_cluster(flags, c) for c in "rRa")
     if cmd in _WRITE_ALL:
-        out += operands
+        out += [(o, cmd in ("rm", "rmdir", "mv", "shred", "unlink")) for o in operands]
     elif cmd in _WRITE_LAST:
-        out += operands[-1:] + [f.split("=", 1)[1] for f in flags if f.startswith("--target-directory=")]
-        out += [canon[i + 1] for i, t in enumerate(canon[:-1]) if t == "-t"]
+        deep = recursive or cmd == "rsync"
+        out += [(o, deep) for o in operands[-1:]]
+        out += [(v, deep) for v in _opt_values(toks, "t", ("--target-directory",))]
     elif cmd in ("sed", "perl", "ruby") and any(
         f.startswith("--in-place") or re.match(r"^-[A-Za-z]*i", f) for f in flags
     ):
-        out += operands
+        out += [(o, False) for o in operands]
     elif cmd == "dd":
-        out += [o[3:] for o in operands if o.startswith("of=")]
+        out += [(o[3:], False) for o in operands if o.startswith("of=")]
+    elif cmd == "curl":
+        out += [(v, False) for v in _opt_values(toks, "o", ("--output",))]
+        if any(t == "--remote-name" or re.fullmatch(r"-[A-Za-z]*O[A-Za-z]*", t) for t in toks[1:]):
+            out.append((".", True))
+    elif cmd == "wget":
+        files = _opt_values(toks, "O", ("--output-document",))
+        dirs = _opt_values(toks, "P", ("--directory-prefix",))
+        out += [(v, False) for v in files] + [(v, True) for v in dirs]
+        if not files and not dirs:
+            out.append((".", True))
+    elif cmd in ("tar", "bsdtar"):
+        if len(toks) > 1 and re.fullmatch(r"[A-Za-z]+", toks[1]):  # old style: tar czf x.tgz
+            toks = [toks[0], "-" + toks[1], *toks[2:]]
+        modes = "".join(t[1:] for t in toks[1:] if re.fullmatch(r"-[A-Za-z]+", t))
+        archives = _opt_values(toks, "f", ("--file",))
+        if "x" in modes:
+            dirs = _opt_values(toks, "C", ("--directory",))
+            out += [(d, True) for d in dirs or ["."]]
+        elif any(m in modes for m in "cru"):
+            out += [(a, False) for a in archives]
+    elif cmd == "unzip":
+        out += [(d, True) for d in _opt_values(toks, "d") or ["."]]
+    elif cmd == "zip":
+        out += [(o, False) for o in operands[:1]]
     return out
 
 

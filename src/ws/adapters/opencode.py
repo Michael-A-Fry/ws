@@ -44,10 +44,10 @@ def _read_forms(rule: str) -> list[str]:
 
 def _protect_forms(path: str, is_out: bool) -> list[str]:
     """Edit rules for a protected file or folder, in the same two spellings (see _read_forms). A folder name like
-    `jobs` or `logs` is common, so a ws control path keeps its parent (`.ws/logs/**`); the generated folder, which
-    can sit anywhere, keeps its own name."""
-    p = Path(path)
-    tail = p.name if is_out else f"{p.parent.name}/{p.name}"
+    `jobs` or `logs` is common, so a pattern never drops the parent folder: a ws control path keeps one
+    (`.ws/logs/**`), the generated folder two (`.ws/gate/opencode/**`), whatever else is above it."""
+    parts = Path(path).parts
+    tail = "/".join(parts[-3:] if is_out else parts[-2:])
     return [path, f"{path}/**", f"**/{tail}", f"**/{tail}/**"]
 
 

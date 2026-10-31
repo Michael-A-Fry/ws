@@ -45,6 +45,8 @@ LICENSES/         third-party licence texts (see NOTICE)
 | `config_cmd.py` | `ws config`: every file ws reads, where its path came from, and the keys it sets |
 | `devices.py` | `ws device add`: the one line that links a second machine to this one |
 | `doctor.py` | `ws doctor`: one line per check, each with a stable ID |
+| `eval.py` | `ws eval`: your own eval, with TOML tasks, deterministic graders, ten metrics and an exact A/B... |
+| `evalstats.py` | The numbers behind `ws eval`: exact McNemar, pass^k, percentiles and the ten report metrics |
 | `frontmatter.py` | YAML front matter, the safe subset: stdlib only |
 | `gate.py` | `ws gate`: turn the policy into each runner's own config, and answer the hooks |
 | `globals.py` | `ws globals`: what ws installs globally stays global |

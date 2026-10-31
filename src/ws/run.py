@@ -408,15 +408,23 @@ def cmd_run(args: argparse.Namespace) -> int:
         return _run(args)
 
 
-def _run(args: argparse.Namespace) -> int:
+def run_job(args: argparse.Namespace, job: jobs.Job, fields: dict | None = None, hook=None) -> int:
+    """`ws run` for a job that is already loaded (`ws eval` changes its prompt, folder and limits). `fields` is merged
+    into the record when it is made; `hook(rec)` is called with the finished record just after it is written."""
+    with _term_becomes_exit():
+        return _run(args, job, fields, hook)
+
+
+def _run(args: argparse.Namespace, job: jobs.Job | None = None, fields: dict | None = None, hook=None) -> int:
     env = os.environ
     home = ws_home(env).absolute()
     log = runrecord.runs_path(env)
     record = not args.dry_run
-    try:
-        job = jobs.load(args.job, env)
-    except jobs.JobError as e:
-        return _bad_job(args.job, str(e), log, record=record)
+    if job is None:
+        try:
+            job = jobs.load(args.job, env)
+        except jobs.JobError as e:
+            return _bad_job(args.job, str(e), log, record=record)
     try:
         adapter = adapters.get(job.runner)
         prof = load(profile_path(env)) or {}
@@ -451,6 +459,7 @@ def _run(args: argparse.Namespace) -> int:
     verdict = policy.rule_of_two(pol, list(job.sources), job.name, shell=getattr(adapter, "HAS_SHELL", True))
     reason = lock_reason or _refusal(prof, verdict, spend, job, adapter)
     rec = _base_record(job, run_id, started, pol, verdict)
+    rec.update(fields or {})
     child_env = _child_env(home, extra)
     if args.dry_run:
         plan = {
@@ -471,10 +480,12 @@ def _run(args: argparse.Namespace) -> int:
         print(f"ws: {rec['error']}", file=sys.stderr)
         return EXIT_FAILED
     rec["exe_path"] = exe
-    return _execute(job, adapter, pol, rec, run_dir, cwd, log, exe, stdin)
+    return _execute(job, adapter, pol, rec, run_dir, cwd, log, exe, stdin, hook)
 
 
-def _execute(job, adapter, pol, rec: dict, run_dir: Path, cwd: Path, log: Path, exe: str, stdin: bool) -> int:
+def _execute(
+    job, adapter, pol, rec: dict, run_dir: Path, cwd: Path, log: Path, exe: str, stdin: bool, hook=None
+) -> int:
     t0 = time.monotonic()
     leases: list[broker.Lease] = []
     sock = wsecrets.socket_path(os.environ)
@@ -533,6 +544,9 @@ def _execute(job, adapter, pol, rec: dict, run_dir: Path, cwd: Path, log: Path, 
             rec.update(status="error", error="interrupted before the runner finished")
             print(f"ws: interrupted; recorded as {rec['run_id']}", file=sys.stderr)
         written = _append(log, rec)
+        if hook is not None:  # after the write: a signal or a crash in the hook cannot lose the record
+            with contextlib.suppress(Exception):
+                hook(rec)
     _report(rec, log)
     code = {"ok": 0, "refused": EXIT_REFUSED}.get(rec["status"], EXIT_FAILED)
     return code or (0 if written else EXIT_FAILED)

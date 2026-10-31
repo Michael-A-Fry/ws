@@ -114,18 +114,54 @@ def _this_month(rec: dict) -> bool:
     return str(rec.get("started_at", ""))[:7] in (f"{now:%Y-%m}", last)
 
 
-def append(path: Path, rec: dict, **limits) -> None:
-    """Add a record (see `ws.jsonl.append` for the lock, rotation and field cap; `limits` overrides its sizes)."""
+def fallback_path(path: Path) -> Path:
+    """Where a record goes when the log cannot be written: `runs.fallback.jsonl`, beside it, never locked."""
+    return path.with_name(f"{path.stem}.fallback{path.suffix}")
+
+
+def append(path: Path, rec: dict, **limits) -> Path:
+    """Add a record (see `ws.jsonl.append` for the lock, rotation and field cap; `limits` overrides its sizes). If the
+    log cannot be written (its lock is held for too long, the disk is full) the record goes to `fallback_path` instead,
+    so the spend still counts; `read` includes that file. Returns the file the record went to. Raises OSError only when
+    both fail."""
     missing = [k for k in KEYS if k not in rec]
     if missing:
         raise ValueError(f"run record is missing {', '.join(missing)}")
-    jsonl.append(path, rec, keep_if=_this_month, **limits)
+    try:
+        jsonl.append(path, rec, keep_if=_this_month, **limits)
+    except OSError as e:
+        fallback = fallback_path(path)
+        try:
+            jsonl.append_plain(fallback, rec, limits.get("field_cap"))
+        except OSError:
+            raise e from None
+        return fallback
+    return path
+
+
+def probe(path: Path) -> None:
+    """Raises jsonl.LockTimeout when another process holds the log's lock: a run now could not be recorded in it."""
+    jsonl.probe(path)
+
+
+def fallback_count(path: Path) -> int:
+    """How many records are waiting in the fallback file (0 if there is none or it cannot be read)."""
+    try:
+        return len(jsonl.read_plain(fallback_path(path)))
+    except OSError:
+        return 0
 
 
 def read(path: Path) -> list[dict]:
-    """Every record, oldest first, across the rotated files. A line that is not a JSON object is skipped, so one bad
-    write never hides the rest. No log is no records; one that exists but cannot be read raises OSError."""
-    return jsonl.read(path)
+    """Every record, oldest first, across the rotated files and then the fallback file. A line that is not a JSON object
+    is skipped, so one bad write never hides the rest. No log is no records; one that exists but cannot be read raises
+    OSError. Fallback records are merged in by end time, since they were written later than the log's lines around
+    them."""
+    recs = jsonl.read(path)
+    extra = jsonl.read_plain(fallback_path(path))
+    if not extra:
+        return recs
+    return sorted([*recs, *extra], key=lambda r: str(r.get("ended_at") or r.get("started_at") or ""))
 
 
 # What a run counts against the cap when the runner did not say what it cost. ws ships no prices (they go stale), so

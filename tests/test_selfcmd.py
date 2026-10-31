@@ -3,10 +3,15 @@ working in) never runs in place of the gate hook, the broker or a timer's job.""
 
 from __future__ import annotations
 
+import ast
+import itertools
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -85,16 +90,55 @@ def test_a_timer_without_ws_on_the_path_starts_the_isolated_command(monkeypatch)
     assert _schedule.ws_command({"PATH": "/nonexistent"}) == selfcmd.argv()
 
 
+DASH_M_WS = re.compile(r"""(^|\s)-m\s+ws(\s|$)""")
+
+
+def spawns_plain_dash_m_ws(source: str) -> bool:
+    """True if the code builds a `-m ws` command: a list with "-m" then "ws" next to each other, or a string (not a
+    docstring) with `-m ws` in it, whether or not it is an f-string."""
+    tree = ast.parse(source)
+    docstrings = {
+        id(n.body[0].value)
+        for n in ast.walk(tree)
+        if isinstance(n, (ast.Module, ast.FunctionDef, ast.ClassDef))
+        and n.body
+        and isinstance(n.body[0], ast.Expr)
+        and isinstance(n.body[0].value, ast.Constant)
+    }
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.List, ast.Tuple)):
+            vals = [e.value if isinstance(e, ast.Constant) else None for e in n.elts]
+            if any(a == "-m" and b == "ws" for a, b in itertools.pairwise(vals)):
+                return True
+        is_text = isinstance(n, ast.Constant) and isinstance(n.value, str) and id(n) not in docstrings
+        if is_text and DASH_M_WS.search(n.value):
+            return True
+    return False
+
+
+def test_the_scan_catches_every_spelling_it_is_meant_to():
+    for src in (
+        'x = [sys.executable, "-m", "ws", "gate"]',
+        'x = (sys.executable, "-m", "ws")',
+        'x = "python3 -m ws gate check"',
+        'x = f"{py} -m ws serve"',
+        "x = ['-m', 'ws']",
+        'x = "exec python -m ws"',
+    ):
+        assert spawns_plain_dash_m_ws(src), src
+    for src in ('"""docs say python -m ws."""', 'x = "-m"', 'x = ["-m", "wsx"]', 'x = "-m wsx"', "x = 1"):
+        assert not spawns_plain_dash_m_ws(src), src
+
+
 def test_no_module_spawns_plain_dash_m_ws():
-    """Guard against a new self-spawn that forgets the isolation. (secrets.py's wall launcher is its own, with -P -s.)"""
-    root = os.path.dirname(run.__file__)
-    bad = []
-    for d, _, names in os.walk(root):
-        for n in names:
-            if n.endswith(".py") and n not in ("selfcmd.py", "secrets.py"):
-                text = (Path(d) / n).read_text(encoding="utf-8")
-                if '"-m", "ws"' in text:
-                    bad.append(n)
+    """Guard against a new self-spawn that forgets the isolation. (secrets.py's wall launcher is its own, with -P -s;
+    selfcmd.py is where the isolated list is built.)"""
+    root = Path(run.__file__).parent
+    bad = [
+        str(p.relative_to(root))
+        for p in root.rglob("*.py")
+        if p.name not in ("selfcmd.py", "secrets.py") and spawns_plain_dash_m_ws(p.read_text(encoding="utf-8"))
+    ]
     assert bad == []
 
 
@@ -136,7 +180,8 @@ def test_a_real_broker_started_from_a_folder_with_a_planted_package_does_not_run
         return procs[-1]
 
     monkeypatch.setattr(run.subprocess, "Popen", spy)
-    sock = tmp_path / "b.sock"  # short path: a Unix socket path tops out near 100 characters
+    short = Path(tempfile.mkdtemp(prefix="wsb", dir="/tmp"))  # a Unix socket path tops out near 100 characters
+    sock = short / "b.sock"
     monkeypatch.setattr(run, "BROKER_START_S", 20.0)
     try:
         started = run._start_broker(sock)
@@ -146,3 +191,4 @@ def test_a_real_broker_started_from_a_folder_with_a_planted_package_does_not_run
         for pr in procs:
             pr.terminate()
             pr.wait(timeout=30)
+        shutil.rmtree(short, ignore_errors=True)

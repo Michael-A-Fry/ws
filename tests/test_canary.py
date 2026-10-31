@@ -375,16 +375,17 @@ def test_doctor_does_not_write_without_a_ws_home(tmp_path, monkeypatch):
     assert not home.exists()
 
 
-def test_an_old_canary_log_in_ws_home_is_moved_under_logs_once(box, capsys):
+def test_an_old_canary_log_in_ws_home_is_set_aside_not_trusted(box, capsys):
+    """A session could write `$WS_HOME/canary.jsonl`, so its lines must never become part of the new log."""
     fake(box, "claude", "1.0.0")
     old = box / ".ws" / "canary.jsonl"
     old.write_text('{"schema": 1, "ok": true, "old": true}\n')
     assert run(capsys, "canary", "--runner", "claude-code")[0] == 0
-    assert not old.exists()
-    got = lines(box)
-    assert len(got) == 2 and got[0]["old"] is True and got[1]["ok"] is True
+    assert not old.exists() and (box / ".ws" / "canary.jsonl.old").read_text().startswith('{"schema": 1')
+    (line,) = lines(box)
+    assert "old" not in line and line["ok"] is True
     assert run(capsys, "canary", "--runner", "claude-code")[0] == 0
-    assert len(lines(box)) == 3 and not old.exists()
+    assert len(lines(box)) == 2 and not old.exists()
 
 
 def test_a_canary_log_that_is_a_symlink_is_not_followed(box, capsys, tmp_path):

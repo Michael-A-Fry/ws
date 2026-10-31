@@ -43,7 +43,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-from ws import __version__, adapters, broker, gate, jobs, output, policy, runrecord, selfcmd
+from ws import __version__, adapters, broker, gate, jobs, jsonl, output, policy, runrecord, selfcmd
 from ws import secrets as wsecrets
 from ws.output import WsError
 from ws.profile import ProfileError, load, profile_path, ws_home
@@ -149,6 +149,8 @@ def _lease(s: jobs.SecretUse, sock: Path, rec: dict) -> broker.Lease:
     try:
         return broker.request(s.name, s.purpose, s.host, socket=sock)
     except tuple(RECOVERIES) as e:
+        if isinstance(e, broker.SocketPathTooLong):
+            raise  # nothing to mend: starting or waiting for a broker does not shorten the path
         kind, mend = next(v for k, v in RECOVERIES.items() if isinstance(e, k))
         if any(r["kind"] == kind for r in rec["recovered"]):
             raise
@@ -311,13 +313,33 @@ def _refusal(prof: dict, verdict: policy.Verdict, spend: float, job: jobs.Job, a
 
 
 def _append(log: Path, rec: dict) -> bool:
-    """Write the record. False (after saying why) when the log cannot be written."""
+    """Write the record. A log that cannot be written (its lock held, the disk full) gets the record in the fallback
+    file instead, with a warning, and that counts as written: the spend is in `runs.fallback.jsonl`, which `read` and
+    the cap check include. False (after saying why) only when the fallback fails too."""
     try:
-        runrecord.append(log, rec)
+        where = runrecord.append(log, rec)
     except OSError as e:
         print(f"ws: could not write the record to {log}: {e.strerror or type(e).__name__}", file=sys.stderr)
         return False
+    if where != log:
+        print(f"ws: {log.name} could not be written; the record is in {where} (`ws runs` lists it)", file=sys.stderr)
     return True
+
+
+def _lock_reason(log: Path) -> str | None:
+    """Why a run must be refused because the log's lock is held, else None. A session can leave a process holding the
+    lock it can read; a run that went ahead would then be recorded only in the fallback, so it is refused instead."""
+    try:
+        runrecord.probe(log)
+    except jsonl.LockTimeout:
+        lock = log.with_name(log.name + ".lock")
+        return (
+            f"another process is holding the lock on the run log ({lock}), so this run could not be recorded; "
+            f"`fuser {lock}` or `lsof {lock}` shows which, stop it and run again"
+        )
+    except OSError:
+        return None  # a log that cannot be opened at all is reported by the read below
+    return None
 
 
 def _refuse(rec: dict, reason: str, path: Path) -> int:
@@ -416,13 +438,18 @@ def _run(args: argparse.Namespace) -> int:
     if not stdin:
         argv = [*argv, "--", job.prompt]
     _, unknown_run_usd, fallback_usd_per_mtok = _budget(prof)
+    lock_reason = _lock_reason(log)  # first: a lock held by another process would stall the read below as well
     try:
-        spend = runrecord.month_spend(runrecord.read(log), started, unknown_run_usd, fallback_usd_per_mtok)
+        spend = (
+            0.0
+            if lock_reason
+            else runrecord.month_spend(runrecord.read(log), started, unknown_run_usd, fallback_usd_per_mtok)
+        )
     except OSError as e:
         print(f"ws: cannot read {log}: {e.strerror or type(e).__name__}", file=sys.stderr)
         return EXIT_FAILED
     verdict = policy.rule_of_two(pol, list(job.sources), job.name, shell=getattr(adapter, "HAS_SHELL", True))
-    reason = _refusal(prof, verdict, spend, job, adapter)
+    reason = lock_reason or _refusal(prof, verdict, spend, job, adapter)
     rec = _base_record(job, run_id, started, pol, verdict)
     child_env = _child_env(home, extra)
     if args.dry_run:
@@ -492,7 +519,7 @@ def _execute(job, adapter, pol, rec: dict, run_dir: Path, cwd: Path, log: Path, 
         rec.update(status="refused", error=_short(f"broker refused the secret: {e}", leases))
     except broker.BrokerUnavailable as e:
         tried = f" (ws already {rec['recovered'][-1]['action']}, once)" if rec["recovered"] else ""
-        rec.update(status="error", error=_short(f"{e}{tried}; is the broker running? `ws doctor` checks", leases, 300))
+        rec.update(status="error", error=_short(f"{e}{tried}; {broker._hint(e)}", leases, 300))
 
     except Exception as e:  # noqa: BLE001 (whatever went wrong, the run still gets its record)
         rec.update(status="error", error=_short(f"{type(e).__name__}: {e}", leases))
@@ -531,6 +558,13 @@ def cmd_runs(args: argparse.Namespace) -> int:
         recs = runrecord.read(log)[-args.last :]
     except OSError as e:
         raise WsError("io", f"cannot read {log}: {e.strerror or type(e).__name__}", exit_code=EXIT_FAILED) from e
+    pending = runrecord.fallback_count(log)
+    if pending:
+        print(
+            f"ws: {pending} record(s) are in {runrecord.fallback_path(log)}: the run log could not be written when they "
+            "finished (another process held its lock). They count towards the cap; look into what held the lock.",
+            file=sys.stderr,
+        )
     if args.json:
         output.result(recs)
         return 0

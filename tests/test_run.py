@@ -9,6 +9,7 @@ from __future__ import annotations
 import _thread
 import json
 import os
+import shutil
 import signal
 import stat
 import subprocess
@@ -436,10 +437,14 @@ def test_a_subclass_of_a_known_failure_is_mended_too(ws, monkeypatch):
     assert ws.records()[0]["recovered"][0]["kind"] == "broker_unavailable" and len(ws.started) == 1
 
 
-def test_the_broker_client_says_when_nothing_is_running_and_when_it_is_something_else(tmp_path):
+def test_the_broker_client_says_when_nothing_is_running_and_when_it_is_something_else(request):
     import socket as pysocket
+    import tempfile
     import threading
 
+    short = Path(tempfile.mkdtemp(prefix="wsb", dir="/tmp"))  # a Unix socket path tops out near 100 characters
+    request.addfinalizer(lambda: shutil.rmtree(short, ignore_errors=True))
+    tmp_path = short
     missing = tmp_path / "none.sock"
     with pytest.raises(broker.BrokerUnavailable) as e:
         broker.status(missing)
@@ -1221,3 +1226,142 @@ def test_the_schema_as_json_is_a_valid_schema_and_matches():
     text = runrecord.schema_json()
     jsonschema.Draft202012Validator.check_schema(json.loads(text))
     assert json.loads(text) == runrecord.schema()
+
+
+# --- a lock held to stall the log must not hide spend ------------------------------------------------------------
+
+HOLD = (
+    "import fcntl, os, sys\n"
+    "os.makedirs(os.path.dirname(sys.argv[1]), exist_ok=True)\n"
+    "fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)\n"
+    "fcntl.flock(fd, fcntl.LOCK_SH if sys.argv[2] == 'shared' else fcntl.LOCK_EX)\n"
+    "print('held', flush=True)\n"
+    "sys.stdin.read()\n"
+)
+
+
+@pytest.fixture
+def lock_held(ws, monkeypatch):
+    """Another process (as a session's background process could) holds the run log's lock until the test ends."""
+    from ws import jsonl
+
+    monkeypatch.setattr(jsonl, "LOCK_TIMEOUT_S", 0.3)
+    procs = []
+
+    def hold(mode: str) -> None:
+        lock = str(ws.log.parent / "runs.jsonl.lock")
+        p = subprocess.Popen(
+            [sys.executable, "-I", "-c", HOLD, lock, mode],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+        )  # fmt: skip
+        procs.append(p)
+        assert p.stdout.readline().strip() == "held"
+
+    yield hold
+    for p in procs:
+        p.stdin.close()
+        p.wait(timeout=30)
+        p.stdout.close()
+
+
+@pytest.mark.parametrize("mode", ["shared", "exclusive"])
+def test_a_lock_held_by_another_process_refuses_the_run_and_the_refusal_is_still_recorded(ws, lock_held, capsys, mode):
+    ws.job()
+    lock_held(mode)
+    assert cli.main(["run", "daily"]) == 3
+    err = capsys.readouterr().err
+    lock = str(ws.log.parent / "runs.jsonl.lock")
+    assert "holding the lock" in err and lock in err and "fuser" in err and "lsof" in err
+    assert not (ws.home / "fake-saw.json").exists(), "the runner started although the run could not be recorded"
+    assert not ws.log.exists() or ws.log.read_text() == ""  # nothing could go into the locked log
+    fb = runrecord.fallback_path(ws.log)
+    (rec,) = [json.loads(line) for line in fb.read_text().splitlines()]
+    assert valid(rec)["status"] == "refused" and "lock" in rec["error"]
+    if mode == "shared":  # an exclusive holder would stall this read too, which is why the run was refused
+        assert [r["run_id"] for r in ws.records()] == [rec["run_id"]]  # read() includes the fallback
+
+
+def test_a_dry_run_with_the_lock_held_says_it_would_refuse_and_writes_nothing(ws, lock_held, capsys):
+    ws.job()
+    lock_held("shared")
+    assert cli.main(["run", "daily", "--dry-run"]) == 3
+    assert "holding the lock" in json.loads(capsys.readouterr().out)["would_refuse"]
+    assert not runrecord.fallback_path(ws.log).exists()
+
+
+def test_a_probe_with_no_lock_file_yet_writes_nothing(ws, capsys):
+    ws.job()
+    assert cli.main(["run", "daily", "--dry-run"]) == 0
+    assert not (ws.home / "logs").exists()
+
+
+def test_a_record_that_cannot_be_written_goes_to_the_fallback_and_still_counts_towards_the_cap(ws, monkeypatch, capsys):
+    from ws import jsonl
+
+    real = jsonl.append
+
+    def broken(*a, **kw):
+        raise jsonl.LockTimeout("runs.jsonl.lock has been locked for 10 s by another process")
+
+    ws.job()
+    monkeypatch.setattr(jsonl, "append", broken)
+    assert cli.main(["run", "daily"]) == 0  # the run itself was fine, and its record is safe
+    err = capsys.readouterr().err
+    assert "runs.fallback.jsonl" in err
+    (rec,) = [json.loads(line) for line in runrecord.fallback_path(ws.log).read_text().splitlines()]
+    assert valid(rec)["status"] == "ok" and rec["cost_usd"] == 0.00021
+    monkeypatch.setattr(jsonl, "append", real)
+    assert not ws.log.exists()
+    spend = runrecord.month_spend(ws.records(), datetime.now(UTC))
+    assert spend == pytest.approx(0.00021)
+    ws.cap(0.0001)  # below what that one run cost: the next run must be refused on the strength of the fallback alone
+    assert cli.main(["run", "daily"]) == 3
+    assert "monthly cap" in capsys.readouterr().err
+
+
+def test_ws_runs_says_when_records_are_waiting_in_the_fallback(ws, monkeypatch, capsys):
+    from ws import jsonl
+
+    ws.job()
+    monkeypatch.setattr(jsonl, "append", lambda *a, **kw: (_ for _ in ()).throw(OSError("full")))
+    assert cli.main(["run", "daily"]) == 0
+    capsys.readouterr()
+    assert cli.main(["runs"]) == 0
+    out = capsys.readouterr()
+    assert "1 record(s) are in" in out.err and "runs.fallback.jsonl" in out.err
+    assert "daily" in out.out
+
+
+def test_both_the_log_and_the_fallback_failing_is_a_failed_run_with_a_message(ws, monkeypatch, capsys):
+    from ws import jsonl
+
+    def boom(*a, **kw):
+        raise OSError("disk full")
+
+    ws.job()
+    monkeypatch.setattr(jsonl, "append", boom)
+    monkeypatch.setattr(jsonl, "append_plain", boom)
+    assert cli.main(["run", "daily"]) == 1
+    assert "could not write the record" in capsys.readouterr().err
+
+
+def test_a_socket_path_that_is_too_long_is_its_own_typed_case_with_a_hint(tmp_path, capsys):
+    long = tmp_path / ("d" * 120) / "broker.sock"
+    with pytest.raises(broker.SocketPathTooLong) as e:
+        broker.status(long)
+    assert isinstance(e.value, broker.BrokerUnavailable) and e.value.not_running is False
+    assert str(broker.UNIX_PATH_MAX - 1) in str(e.value) and "WS_BROKER_SOCKET" in e.value.hint
+    with pytest.raises(broker.SocketPathTooLong):
+        broker.Broker(long, tmp_path / "secrets.toml", None)._bind_unix()
+    assert cli.main(["broker", "status", "--socket", str(long)]) == 1
+    err = capsys.readouterr().err
+    assert "limit is" in err and "shorter WS_HOME" in err
+
+
+def test_a_run_whose_socket_path_is_too_long_ends_with_the_hint_and_tries_no_recovery(ws, monkeypatch, tmp_path):
+    monkeypatch.setenv("WS_BROKER_SOCKET", str(tmp_path / ("d" * 120) / "b.sock"))
+    monkeypatch.setattr(broker, "request", lambda *a, **kw: broker.check_socket_path(os.environ["WS_BROKER_SOCKET"]))
+    ws.job()
+    assert cli.main(["run", "daily"]) == 1
+    (rec,) = ws.records()
+    assert rec["recovered"] == [] and "shorter WS_HOME" in rec["error"] and ws.started == []

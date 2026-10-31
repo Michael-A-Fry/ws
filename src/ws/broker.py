@@ -119,6 +119,34 @@ class BrokerRefused(BrokerError):
         self.reason = reason
 
 
+# The longest Unix socket path the system takes, in bytes: sun_path is 104 bytes on macOS and the BSDs, 108 on Linux,
+# and one is the NUL. Past it connect() and bind() fail with a plain OSError, which says nothing typed about why.
+UNIX_PATH_MAX = 104 if sys.platform != "linux" else 108
+
+
+class SocketPathTooLong(BrokerUnavailable):
+    """The broker socket's path is longer than this system's Unix sockets allow. Raised before connect or bind, so it
+    is its own case rather than a guess from an OSError's text. Starting a broker would not help (`not_running` is
+    False)."""
+
+    def __init__(self, path: str | Path):
+        n = len(os.fsencode(str(path)))
+        super().__init__(
+            f"the broker socket path is {n} bytes; this system's limit is {UNIX_PATH_MAX - 1}",
+            not_running=False,
+        )
+        self.hint = (
+            "use a shorter WS_HOME, or set WS_BROKER_SOCKET (or [roles.secrets] socket) to a short path "
+            "such as /tmp/ws-broker.sock"
+        )
+
+
+def check_socket_path(path: str | Path) -> None:
+    """Raises SocketPathTooLong if a Unix socket cannot have this path."""
+    if len(os.fsencode(str(path))) >= UNIX_PATH_MAX:
+        raise SocketPathTooLong(path)
+
+
 @dataclass(frozen=True)
 class Lease:
     lease: str  # an id for release and the audit log; not a credential
@@ -132,6 +160,7 @@ class Lease:
 
 def _client_call(msg: dict, socket_file: str | Path | None, timeout: float = 10.0) -> dict:
     path = str(socket_file) if socket_file else str(wsecrets.socket_path())
+    check_socket_path(path)
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(timeout)
     try:
@@ -371,6 +400,7 @@ class Broker:
         threading.Thread(target=self.stop, daemon=True).start()
 
     def _bind_unix(self) -> None:
+        check_socket_path(self.socket_path)
         d = self.socket_path.parent
         gid = None
         if self.group:
@@ -899,6 +929,10 @@ class _ProxyHandler(BaseHTTPRequestHandler):
 # ---------------------------------------------------------------- the command
 
 
+def _hint(e: Exception) -> str:
+    return e.hint if isinstance(e, SocketPathTooLong) else "is the broker running? `ws doctor` checks"
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     import signal
 
@@ -908,7 +942,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         signal.signal(signal.SIGINT, lambda *_: broker.request_stop())
         broker.start()
     except (BrokerError, wsecrets.SecretsError, OSError) as e:
-        raise WsError("unavailable", str(e)) from e
+        raise WsError("unavailable", str(e), e.hint if isinstance(e, SocketPathTooLong) else "") from e
     print(f"ws broker: socket {broker.socket_path}, leases on 127.0.0.1:{broker.port}", file=sys.stderr, flush=True)
     broker._stopped.wait()
     return 0
@@ -920,7 +954,7 @@ def cmd_request(args: argparse.Namespace) -> int:
     except BrokerRefused as e:
         raise WsError("refused", str(e)) from e
     except BrokerUnavailable as e:
-        raise WsError("unavailable", str(e), "is the broker running? `ws doctor` checks") from e
+        raise WsError("unavailable", str(e), _hint(e)) from e
     if args.json:
         output.result(lease.__dict__)
     else:
@@ -932,7 +966,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     try:
         info = status(args.socket)
     except BrokerError as e:
-        raise WsError("unavailable", str(e), "is the broker running? `ws doctor` checks") from e
+        raise WsError("unavailable", str(e), _hint(e)) from e
     if args.json:
         output.result(info)
     else:

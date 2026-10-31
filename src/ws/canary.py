@@ -114,13 +114,12 @@ def _replace(path: Path, text: str) -> None:
 
 def log_path(home: Path) -> Path:
     """The canary log. It sits under `logs/`, which the gate denies a session: a canary line a session could write
-    would let it fake a passing canary. The log used to be `$WS_HOME/canary.jsonl`; that file is moved here once."""
-    new = home / "logs" / "canary.jsonl"
+    would let it fake a passing canary. The log used to be `$WS_HOME/canary.jsonl`, a place a session can write, so
+    nothing in it is trusted: it is renamed to `canary.jsonl.old` (kept for a look) and the new log starts empty."""
     old = home / "canary.jsonl"
-    if old.is_file() and not old.is_symlink() and not new.exists():
-        new.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.replace(old, new)
-    return new
+    if os.path.lexists(old):
+        os.replace(old, home / "canary.jsonl.old")
+    return home / "logs" / "canary.jsonl"
 
 
 def _append_line(path: Path, line: dict) -> None:

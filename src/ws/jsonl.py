@@ -18,6 +18,14 @@
     (`O_NOFOLLOW`), so a planted link cannot point a write elsewhere.
 
 `read` gives every record oldest first across the old files, skipping any line that is not a JSON object.
+
+A session can read `logs/` (it may read its own run record; the gate denies it writes only) and any process it starts
+can take a lock on a file it can open. The gate cannot hide the lock file: `deny_read` is a list of globs the person
+sets, the matcher only sees commands, and the sandbox hides only paths that exist when it starts, so none of them stops
+a program the session starts from opening a file. So a lock held to stall the log is assumed, and made harmless:
+`probe` (the check before a run) takes the exclusive lock, so a held lock refuses the run rather than letting it go
+unrecorded; and `append_plain` writes a record that could not take the lock to a sibling file that is never locked
+(`runrecord` uses it for `runs.fallback.jsonl`), in one O_APPEND write, so nothing a session holds can keep a record out.
 """
 
 from __future__ import annotations
@@ -210,3 +218,35 @@ def read(path: Path, side_dir: Path | None = None, lock_timeout_s: float | None 
             except FileNotFoundError:
                 continue
     return out
+
+
+def probe(path: Path, side_dir: Path | None = None, lock_timeout_s: float | None = None) -> None:
+    """Take the exclusive lock and let it go, to learn that a write would not wait. Raises LockTimeout if another
+    process holds the lock (shared or exclusive) for the whole wait. Writes nothing: no lock file yet is no holder."""
+    with _locked(path, side_dir, create=False, timeout_s=lock_timeout_s):
+        pass
+
+
+def append_plain(path: Path, rec: dict, field_cap: int | None = None) -> None:
+    """One record, no lock and no rotation: field cap, then a single write() on an O_APPEND fd (0600, no symlink). For
+    the fallback a record goes to when the locked log cannot be written; nothing can hold a lock on it."""
+    cap = DEFAULT_FIELD_CAP if field_cap is None else field_cap
+    line = (json.dumps(cap_fields(rec, cap), ensure_ascii=True, separators=(",", ":")) + "\n").encode()
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | NOFOLLOW, 0o600)
+    try:
+        st = os.fstat(fd)
+        if st.st_mode & 0o077 and st.st_uid == os.geteuid():
+            os.fchmod(fd, 0o600)
+        os.write(fd, line)
+    finally:
+        os.close(fd)
+
+
+def read_plain(path: Path) -> list[dict]:
+    """Every record of one file, with no lock (the file `append_plain` writes). A missing file is no records."""
+    try:
+        with _open_text(path) as fh:
+            return list(_parse(fh))
+    except (FileNotFoundError, NotADirectoryError):
+        return []

@@ -29,3 +29,10 @@ repos:
         entry: python3 scripts/pii_gate.py
         language: system
         types: [text]
+      - id: ws-globals
+        name: ws globals (no repo copy of a global skill, agent, workflow or hook)
+        entry: uv run --locked ws globals check
+        language: system
+        pass_filenames: false
+        always_run: true
+        verbose: true # prints "nothing to compare" in CI, where there is no user config

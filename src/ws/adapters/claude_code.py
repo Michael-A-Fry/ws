@@ -5,6 +5,29 @@ other hook failure is non-blocking in Claude Code).
 
 Also denied: Edit/Write of the policy file and of the generated folder, so a session cannot loosen its own gate.
 
+The third layer is Claude Code's own `sandbox` block (the wall; documented keys only, checked on 2.1.308), which
+confines every shell command Claude runs, whatever program it starts:
+  * `enabled` with `failIfUnavailable`: if the sandbox cannot start (no bubblewrap or socat), Claude Code refuses to
+    start, instead of running commands unsandboxed. Fail closed, as the hook is.
+  * `allowUnsandboxedCommands: false`: the model's `dangerouslyDisableSandbox` retry is ignored, so a command the
+    sandbox stops cannot be re-run outside it. Nothing is "approved" past the wall: what must leave it, a person runs.
+  * `filesystem.denyWrite`: `$WS_HOME` (the folder the policy sits in) and every protected path. It beats any allowWrite
+    a project adds, so a project's own settings cannot reopen it.
+  * `filesystem.allowWrite`: the policy's allow_write, if it names any. Claude Code's own default (the project folder
+    and its tmp; nothing else) is already an allow-list.
+  * `filesystem.denyRead`: the deny_read rules that name a folder or file (ws.policy.sandbox_read_paths).
+  * `network.allowedDomains`: the policy's allow_hosts, only when the policy names some. Without them the sandbox
+    asks (interactive) or refuses (`-p`) for a host it has not been told about.
+  * `autoAllowBashIfSandboxed: false`, set on purpose: with it on, Claude Code runs sandboxed shell commands without
+    asking. ws leaves that choice to the person's own permission mode, so a sandboxed command still prompts as before.
+Project settings can widen all of this: in 2.1.308 `sandbox.excludedCommands` merges across settings sources and
+`filesystem.allowRead` beats `denyRead`, and `claude -p` shows no trust dialog. Two guards, both tested: gated headless
+runs pass `--setting-sources user` (ws run and the e2e), so a repo's `.claude/settings*.json` is never loaded; and the
+hook (`preflight`) denies, with a plain message, every call made from a folder whose project or local settings turn the
+sandbox off or open it up, because an interactive session cannot be started with that flag by ws.
+The sandbox covers shell commands; Claude's own Read, Edit and Write tools are covered by the permission rules above and
+the hook, not by it. `env` carries WS_GATED_SESSION so `ws approve` knows it is being run from a gated session.
+
 Pass the file with `claude --settings OUT/settings.json`. Nothing here touches ~/.claude.
 """
 
@@ -12,13 +35,16 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import shlex
 from pathlib import Path
 
 from ws import jobs
 from ws.adapters import Call, check_argv, protected_paths
-from ws.policy import Policy, native_patterns
+from ws.approvals import ENV_MARKER, ApprovalError
+from ws.approvals import _read_regular as read_regular
+from ws.policy import Policy, native_patterns, sandbox_read_paths, sandbox_write_paths
 
 NAME = "claude-code"
 FILE = "settings.json"
@@ -53,6 +79,79 @@ def _path(path: str) -> str:
     return f"/{path}" if path.startswith("/") else path
 
 
+def sandbox_block(policy: Policy, out: Path, policy_file: Path) -> dict:
+    """The `sandbox` settings: see the module docstring for what each key is for."""
+    home = str(Path(policy_file).parent)
+    fs: dict = {"denyWrite": list(dict.fromkeys([home, *protected_paths(out, policy_file)]))}
+    if policy.gate.deny_read:
+        fs["denyRead"] = sandbox_read_paths(policy)
+    if policy.gate.allow_write:  # Claude Code already allows its project folder and tmp; these are the person's extras
+        fs["allowWrite"] = sandbox_write_paths(policy)
+    block: dict = {
+        "enabled": True,
+        "autoAllowBashIfSandboxed": False,
+        "failIfUnavailable": True,
+        "allowUnsandboxedCommands": False,
+        "filesystem": fs,
+    }
+    if policy.gate.allow_hosts:
+        block["network"] = {"allowedDomains": list(policy.gate.allow_hosts)}
+    return block
+
+
+def preflight(payload: dict) -> str | None:
+    """A reason to deny every call from this project: a `.claude/settings.json` or `settings.local.json`, in the project
+    folder or any folder above it, that turns the sandbox off or opens it up (see the module docstring). The project
+    folder is CLAUDE_PROJECT_DIR (set for hooks; Claude reads project settings from there, wherever the session has since
+    changed to), else the payload's cwd. A file that does not parse is ignored, as Claude Code ignores it. A settings
+    file that is not a plain file (a link, a FIFO), is too big or cannot be read is a deny: it is read without following a
+    link and without blocking, because a hook that hangs fails open (only exit 2 blocks)."""
+    project = os.environ.get("CLAUDE_PROJECT_DIR") or payload.get("cwd")
+    if not isinstance(project, str) or not project.startswith("/"):
+        return None
+    home = Path(os.environ.get("HOME") or Path.home())
+    for d in [Path(project), *Path(project).parents]:
+        if d == home:  # ~/.claude/settings.json is the person's own (user scope), not a project's
+            continue
+        for name in ("settings.json", "settings.local.json"):
+            f = d / ".claude" / name
+            if not os.path.lexists(f):
+                continue
+            try:
+                conf = json.loads(read_regular(f, 1 << 20))
+            except ApprovalError as e:
+                return f"{f} is not a plain readable settings file ({e}); blocked to be safe"
+            except ValueError:
+                continue
+            key = _widens_sandbox(conf)
+            if key:
+                return (
+                    f"{f} sets sandbox.{key}, which would open the sandbox ws generated: take it out of the project "
+                    "settings (ws gated runs start with --setting-sources user and never load it)"
+                )
+    return None
+
+
+def _widens_sandbox(conf) -> str | None:
+    sb = conf.get("sandbox") if isinstance(conf, dict) else None
+    if not isinstance(sb, dict):
+        return None
+    if sb.get("enabled") is False:
+        return "enabled = false"
+    if sb.get("allowUnsandboxedCommands") is True:
+        return "allowUnsandboxedCommands = true"
+    if sb.get("excludedCommands"):
+        return "excludedCommands"
+    fs = sb.get("filesystem")
+    if isinstance(fs, dict):
+        if fs.get("disabled") is True:
+            return "filesystem.disabled = true"
+        for k in ("allowRead", "allowWrite"):
+            if fs.get(k):
+                return f"filesystem.{k}"
+    return None
+
+
 def generate(policy: Policy, ws_cmd: list[str], out: Path, policy_file: Path) -> dict[str, str]:
     deny = [f"Bash({p})" for p in native_patterns(policy)]
     deny += [f"Read({_path(p)})" for p in policy.gate.deny_read]
@@ -62,6 +161,8 @@ def generate(policy: Policy, ws_cmd: list[str], out: Path, policy_file: Path) ->
     hook = shlex.join(check_argv(ws_cmd, NAME, policy_file, out)) + " || exit 2"
     settings = {
         "permissions": {"deny": list(dict.fromkeys(deny))},
+        "sandbox": sandbox_block(policy, out, policy_file),
+        "env": {ENV_MARKER: "1"},
         "hooks": {"PreToolUse": [{"matcher": MATCHER, "hooks": [{"type": "command", "command": hook}]}]},
     }
     settings["hooks"].update(session_hooks(ws_cmd))
@@ -132,6 +233,7 @@ def build_command(job, run_dir: Path, lease) -> tuple[list[str], dict[str, str]]
     exe = jobs.option(job, "exe", str, EXE)
     tools = jobs.string_list(job, "allowed_tools")
     argv = [exe, "-p", "--output-format", "json", "--model", job.model, "--settings", str(run_dir / "gate" / FILE)]
+    argv += ["--setting-sources", "user"]  # a repo's own .claude/settings*.json must not widen the sandbox
     if job.bare:
         argv.append("--bare")
     if job.max_turns is not None:

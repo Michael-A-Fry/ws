@@ -3,22 +3,28 @@
     ws gate init                                   write the commented default policy if there is none
     ws gate generate --runner R --out DIR          write R's native config into DIR (0 changes when it is current)
     ws gate check --runner R                       hook payload on stdin; exit 0 = allow, 2 = deny (reason on stderr)
+    ws gate launch --runner R -- ARGV              start a runner inside the sandbox wall (ws.sandbox)
 
-`check` fails closed: a payload it cannot read, a policy that does not load, or any crash is a deny.
+`check` fails closed: a payload it cannot read, a policy that does not load, or any crash is a deny. Exit 4 is not a
+deny: inside the OpenCode wall a granted approval cannot be consumed by the hook, so it prints {"claim": ID} and the shim
+claims it from the launcher over an inherited socket (see ws.approvals).
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import shlex
 import sys
 from pathlib import Path
 
-from ws import adapters, policy
+from ws import adapters, approvals, policy, sandbox
 from ws.adapters import Call
+from ws.profile import ws_home
 
 DENY = 2
+CLAIM = 4
 
 
 def evaluate(pol: policy.Policy, call: Call, protect: tuple[str, ...] = ()) -> str | None:
@@ -36,17 +42,45 @@ def evaluate(pol: policy.Policy, call: Call, protect: tuple[str, ...] = ()) -> s
     raise ValueError(f"unknown call kind {call.kind!r}")
 
 
-def check(runner: str, raw: str, pol: policy.Policy, protect: tuple[str, ...] = ()) -> str | None:
-    """None to allow, else the reason. Raises on anything it cannot judge; cmd_check turns that into a deny."""
+def check(
+    runner: str,
+    raw: str,
+    pol: policy.Policy,
+    protect: tuple[str, ...] = (),
+    approval_root: Path | None = None,
+    consume: bool = True,
+) -> str | approvals.Claim | None:
+    """None to allow, else the reason. Raises on anything it cannot judge; cmd_check turns that into a deny.
+    A shell command that matches `ask_commands` (and nothing denies) runs only on a granted approval bound to this
+    runner, command, folder and session; `approval_root` is where those live (None: it cannot ask, so it denies).
+    With consume=False (inside the wall) a valid grant comes back as a Claim to be claimed from the launcher."""
     payload = json.loads(raw)
     if not isinstance(payload, dict):
         raise TypeError("payload is not a JSON object")
-    calls = adapters.get(runner).parse(payload)
-    for call in [] if calls is None else [calls] if isinstance(calls, Call) else calls:
+    adapter = adapters.get(runner)
+    preflight = getattr(adapter, "preflight", None)
+    if preflight and (why := preflight(payload)):
+        return why
+    calls = adapter.parse(payload)
+    calls = [] if calls is None else [calls] if isinstance(calls, Call) else calls
+    for call in calls:
         reason = evaluate(pol, call, protect)
         if reason:
             return reason
+    for call in calls:
+        if call.kind == "command" and policy.needs_approval(pol, call.value):
+            if approval_root is None:
+                return "this command needs a person's approval, and there is no approvals folder to ask through"
+            session, cwd = _text(payload, "session_id"), _text(payload, "cwd")
+            bound = approvals.Bound(runner, call.kind, call.value, cwd, session)
+            return approvals.require(approval_root, bound, consume=consume)
     return None
+
+
+def _text(payload: dict, key: str) -> str:
+    """A string the runner sends beside the call (session id, folder), or "" when it sends none."""
+    v = payload.get(key)
+    return v if isinstance(v, str) else ""
 
 
 def _policy_arg(args: argparse.Namespace) -> Path | None:
@@ -60,13 +94,24 @@ def cmd_check(args: argparse.Namespace) -> int:
         protect = (
             str(policy_file),
             *policy.control_paths(policy_file.parent),
+            *policy.control_paths(ws_home()),
             *(str(Path(p).expanduser().absolute()) for p in args.protect or []),
         )
-        reason = check(args.runner, sys.stdin.read(), policy.load(policy_file), protect)
+        reason = check(
+            args.runner,
+            sys.stdin.read(),
+            policy.load(policy_file),
+            protect,
+            approvals.approvals_dir(),  # $WS_HOME, whatever --policy says: ws approve and ws gate launch use it too
+            consume=approvals.FD_ENV not in os.environ,
+        )
     except BaseException as e:  # noqa: BLE001 - fail closed on anything, including a broken policy file
         reason = f"could not check this call ({type(e).__name__}: {e}); blocked to be safe"
     if reason is None:
         return 0
+    if isinstance(reason, approvals.Claim):
+        print(json.dumps({"claim": reason.ident}))
+        return CLAIM
     print(f"ws gate: blocked: {reason}", file=sys.stderr)
     return DENY
 
@@ -154,3 +199,5 @@ def register(sub) -> None:
         "--protect", action="append", metavar="PATH", help="a file or folder of ws's own that a session may not write"
     )
     c.set_defaults(func=cmd_check)
+
+    sandbox.add_launch(gs, names)

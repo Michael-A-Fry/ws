@@ -366,8 +366,8 @@ def compute(
 
 def is_setup_error(result: dict, runs: dict[str, dict]) -> bool:
     """True for a trial that failed before the runner was launched: status "error" and either no run record at all
-    (the job could not load or build) or a record with no exit code (the runner was not on PATH, or ws failed while
-    preparing the run). Those say something about the machine, not about the arm, so they are counted apart. A run that
+    (the job could not load or build) or a record with no exit code and no runner path (the runner was not on PATH, or
+    ws failed while preparing the run). A run stopped part-way (a signal) has a runner path, so it stays a failure. Those say something about the machine, not about the arm, so they are counted apart. A run that
     started and then failed or timed out has an exit code and stays an ordinary failure; so does a refused one. A
     result whose record is no longer in the log (rotated away) cannot be told, and stays counted."""
     if result.get("status") != "error":
@@ -376,7 +376,7 @@ def is_setup_error(result: dict, runs: dict[str, dict]) -> bool:
     if not run_id:
         return True
     rec = runs.get(str(run_id))
-    return rec is not None and rec.get("exit_code") is None
+    return rec is not None and rec.get("exit_code") is None and not rec.get("exe_path")
 
 
 def split_setup_errors(results: list[dict], runs: dict[str, dict]) -> tuple[list[dict], list[dict]]:

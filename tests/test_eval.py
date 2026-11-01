@@ -947,6 +947,7 @@ def test_only_an_error_that_never_launched_the_runner_is_a_setup_error():
         rid(2): never_launched(rid(2)),  # the runner was not on PATH
         rid(3): run_rec(rid(3), status="timeout"),
         rid(4): run_rec(rid(4)),
+        rid(5): {**never_launched(rid(5)), "exe_path": "/usr/bin/claude"},  # started, then stopped by a signal
     }
     is_setup = evalstats.is_setup_error
     assert is_setup(result(None, "t", 1, "A", False, status="error"), runs)  # no run record at all
@@ -956,6 +957,7 @@ def test_only_an_error_that_never_launched_the_runner_is_a_setup_error():
     assert not is_setup(result(rid(4), "t", 1, "A", True), runs)
     assert not is_setup(result(None, "t", 1, "A", False, status="refused"), runs)
     assert not is_setup(result(rid(9), "t", 1, "A", False, status="error"), runs)  # record gone: cannot tell
+    assert not is_setup(result(rid(5), "t", 1, "A", False, status="error"), runs)
 
 
 def plant_with_setup_errors() -> None:

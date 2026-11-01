@@ -1,5 +1,6 @@
-"""record-calls: append each tool call a session makes to `$WS_HOME/logs/gate-calls.jsonl` as `{at, runner, payload}`,
-so `ws gate replay` can run the same calls against a changed policy. It only records: a log it can't write is a
+"""record-calls: append each tool call a session makes to `$WS_HOME/logs/gate-calls.jsonl` as `{schema, ts, at, runner,
+payload}` (`at` is the legacy spelling of `ts`, kept beside it), so `ws gate replay` can run the same calls against a
+changed policy. It only records: a log it can't write is a
 warning. The log has the bounds every ws log has (ws.jsonl: long fields cut, the file rotates, writers take a lock).
 
 What a line holds: the hook payload as the runner sent it (tool name, folder, session id and the tool's input: a
@@ -29,6 +30,7 @@ EVENTS = ("pre",)
 KINDS = ("command", "read", "search", "write", "tool", "agent", "skill", "message")
 
 LOG = "gate-calls.jsonl"
+SCHEMA_VERSION = 1
 _WRITE_TOOLS = {"write", "edit", "multiedit", "notebookedit", "patch", "apply_patch"}  # lower case, both runners'
 _PATCH_TOOLS = {"patch", "apply_patch"}  # OpenCode: one call writes every file named in its `patchText`
 _TEXT_KEYS = {"content", "old_string", "new_string", "new_source", "oldString", "newString", "newSource", "patchText"}
@@ -94,7 +96,8 @@ def judge(call, cfg, ctx) -> Finding | None:
     ctx.memo[NAME] = True
     stamp = datetime.fromtimestamp(ctx.now(), UTC).isoformat(timespec="seconds")
     try:
-        jsonl.append(log_path(ctx.home), {"at": stamp, "runner": ctx.runner, "payload": redact(ctx.payload)})
+        rec = {"at": stamp, "runner": ctx.runner, "payload": redact(ctx.payload)}  # `at` is legacy; `ts` is the key
+        jsonl.append(log_path(ctx.home), jsonl.stamped(rec, SCHEMA_VERSION, ctx.now()))
     except OSError as e:  # recording is a convenience: a log that cannot be written never stops the call
         return Finding("warn", f"record-calls could not write {LOG} ({type(e).__name__})")
     return None

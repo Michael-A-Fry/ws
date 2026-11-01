@@ -1,7 +1,7 @@
 """Bounded, locked JSON-lines logs: one object per line, a size limit with rotation, and no lost lines.
 
 Every ws log that grows over time (runs, ratings, canary, eval results, the sandbox wall report) is written through
-here. A long string field is cut and marked, a full file rotates into `name.N` (newest is `.1`), a reader spans the live
+here, and `stamped` gives each line its `schema` and `ts`; docs/reference/stores.md lists the logs. A long string field is cut and marked, a full file rotates into `name.N` (newest is `.1`), a reader spans the live
 file and every old one, and writers take an advisory lock so two of them never interleave or lose a line. Nothing is
 written through a symlink, and every file is private to its owner (0600 in a 0700 folder).
 
@@ -20,6 +20,7 @@ import stat
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +41,31 @@ _NUMBER = re.compile(r"[0-9]+")
 
 class LockTimeout(TimeoutError):
     """The lock stayed held by another process for the whole wait. An `OSError`, so "log not writable" handlers catch it."""
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# The stamp every line carries
+
+
+def iso_utc(epoch: float) -> str:
+    """RFC 3339 in UTC with a `Z`, to the millisecond: `2026-11-02T01:02:03.456Z`."""
+    return datetime.fromtimestamp(epoch, UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def stamped(rec: dict, schema: int, epoch: float | None = None) -> dict:
+    """`rec` behind the two keys every log line carries: `schema` (a whole number, one per log) and `ts` (when the line
+    was written, `iso_utc`). A log that used `at` keeps writing it in `rec` beside these (see docs/reference/stores.md)."""
+    return {"schema": schema, "ts": iso_utc(time.time() if epoch is None else epoch), **rec}
+
+
+def when(rec: dict) -> str | None:
+    """When a line was written: its `ts`, else the legacy `at` of a line written before `ts` existed. None if neither is
+    text. A line with no `schema` is schema 1."""
+    for key in ("ts", "at"):
+        value = rec.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
 
 
 # ---------------------------------------------------------------------------------------------------------------------

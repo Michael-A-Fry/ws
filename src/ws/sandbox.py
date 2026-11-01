@@ -587,6 +587,8 @@ def writable_folders(pol: policy.Policy, runner: str, project: str, tmp: str, ex
     return [p for p in dict.fromkeys(out) if os.path.isdir(p)]
 
 
+WALL_REPORT_SCHEMA = 1  # the `schema` of a line in logs/wall-report.jsonl
+
 # --- the runner's own state --------------------------------------------------------------------------------------
 
 # XDG variable -> (folder under `$WS_HOME/wall/<runner>/`, whether it is kept per project).
@@ -1296,8 +1298,9 @@ def report_run(
     home: Path, project: str, runner: str, before: dict, after: dict, notes: list[str], complete: bool = True
 ) -> list[dict]:
     """Print what the session left (stderr), and append one JSON line to `$WS_HOME/logs/wall-report.jsonl` (ws.jsonl:
-    bounded, rotated, link-safe). Nothing is printed or written when there is nothing to say. A scan that stopped says
-    INCOMPLETE on the first line: what is listed is then a lower bound. Never removes anything."""
+    bounded, rotated, link-safe; the line carries `schema` and `ts`, and `at`, the legacy spelling of `ts`). Nothing is
+    printed or written when there is nothing to say. A scan that stopped says INCOMPLETE on the first line: what is
+    listed is then a lower bound. Never removes anything."""
     findings = compare_scans(before, after, complete)
     if not findings and not notes:
         return []
@@ -1317,7 +1320,7 @@ def report_run(
             "findings": findings,
             "notes": notes,
         }
-        jsonl.append(home / "logs" / "wall-report.jsonl", record)
+        jsonl.append(home / "logs" / "wall-report.jsonl", jsonl.stamped(record, WALL_REPORT_SCHEMA))
     except OSError:
         pass  # the stderr lines are the report; a log that cannot be written is not worth failing the run for
     return findings

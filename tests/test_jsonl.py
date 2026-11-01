@@ -250,3 +250,17 @@ def test_rotation_keeps_a_file_with_a_record_from_last_month_too(tmp_path):
         r = runrecord.new(run_id=f"{now:%Y%m%dT%H%M%SZ}-{i:06x}", job="j", started_at=runrecord.iso(now), status="ok")
         runrecord.append(p, r, max_bytes=800, keep=1)
     assert "20260101T000000Z-aaaaaa" in {r["run_id"] for r in runrecord.read(p)}
+
+
+def test_stamped_puts_schema_and_ts_first_and_keeps_every_field():
+    out = jsonl.stamped({"at": "legacy", "x": 1}, 3, 86400.5)
+    assert out == {"schema": 3, "ts": "1970-01-02T00:00:00.500Z", "at": "legacy", "x": 1}
+    assert list(out)[:2] == ["schema", "ts"]
+    assert jsonl.stamped({}, 1)["ts"].endswith("Z")
+
+
+def test_when_takes_ts_then_the_legacy_at_and_nothing_else():
+    assert jsonl.when({"ts": "a", "at": "b"}) == "a"
+    assert jsonl.when({"at": "b"}) == "b"
+    assert jsonl.when({"ts": 5, "at": ""}) is None
+    assert jsonl.when({"t": "c"}) is None

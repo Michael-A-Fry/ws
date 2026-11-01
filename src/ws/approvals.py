@@ -35,6 +35,9 @@ Who may approve: `ws approve` refuses when stdin is not a terminal, and when the
 third and the sandbox are what stand then, and this is not a defence against a determined session that can run
 arbitrary programs outside the wall. It stops the model approving itself by accident or by a plain instruction.
 
+Each record is one JSON file named by its id, with `schema`, `ts` (when it was made; `v` is the older spelling of
+`schema`) and `created` and `granted` as Unix seconds; docs/reference/stores.md lists it.
+
 Tamper: a granted record whose fields no longer hash to its id, whose timestamps are out of order or in the future, or
 that is unreadable, is refused and removed; the call goes back to asking. That catches a damaged or edited file. It does
 not stop a writer who can compute the hash, which is why the folder is a control path.
@@ -64,9 +67,11 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from ws import jsonl
 from ws.output import WsError
 from ws.profile import ws_home
 
+SCHEMA_VERSION = 1  # the `schema` of a record in approvals/pending and approvals/granted
 TTL = 600  # seconds a pending or a granted approval lives
 ENV_MARKER = "WS_GATED_SESSION"  # set in a gated session's env; `ws approve` refuses when it is there
 SANDBOX_MARKER = "WS_SANDBOXED"  # set in the env of a session that has ws's sandbox block (the hook checks for it)
@@ -128,7 +133,18 @@ def _write(path: Path, record: dict) -> None:
 
 
 def _record(bound: Bound, created: float, granted: float | None = None) -> dict:
-    rec = {"v": 1, "id": bound.digest(), "bound": bound.__dict__.copy(), "created": created}
+    try:
+        ts = jsonl.iso_utc(created)
+    except (OverflowError, OSError, ValueError):  # a `created` out of range in an edited record: the grant still writes
+        ts = None
+    rec = {
+        "v": 1,  # legacy spelling of `schema`, kept for one release
+        "schema": SCHEMA_VERSION,
+        "ts": ts,
+        "id": bound.digest(),
+        "bound": bound.__dict__.copy(),
+        "created": created,
+    }
     if granted is not None:
         rec["granted"] = granted
     return rec

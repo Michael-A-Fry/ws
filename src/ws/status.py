@@ -158,7 +158,8 @@ def cmd_status(args: argparse.Namespace) -> int:
     if args.json:
         output.result(data)
     else:
-        print(render(data, Style.detect(sys.stdout, no_color=getattr(args, "no_color", False))))
+        st = Style.detect(sys.stdout, no_color=getattr(args, "no_color", False))
+        st.write(render(data, st))
     return 0
 
 

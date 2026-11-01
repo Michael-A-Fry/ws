@@ -8,10 +8,12 @@ import pytest
 
 from ws import brand, output
 from ws.output import WsError
-from ws.style import GLYPHS, KINDS, Style, pad, plural
+from ws.style import ASCII_GLYPHS, GLYPHS, KINDS, Style, can_encode, pad, plural
 
 
 class Stream(io.StringIO):
+    encoding = "utf-8"
+
     def __init__(self, tty: bool) -> None:
         super().__init__()
         self._tty = tty
@@ -143,3 +145,46 @@ def test_an_error_reads_the_same_with_and_without_colour():
     assert plain == "ws: no such thing\nhint: try `ws help`"
     coloured = output.error_text(e, Style(brand.FULL))
     assert coloured != plain and strip(coloured) == plain
+
+
+class Encoded(io.TextIOWrapper):
+    """A stream that writes bytes in a given encoding and says so, as a Windows console does."""
+
+    def __init__(self, encoding: str) -> None:
+        self.raw = io.BytesIO()
+        super().__init__(self.raw, encoding=encoding, errors="strict")
+
+
+@pytest.mark.parametrize(("encoding", "ascii_glyphs"), [("utf-8", False), ("cp1252", True), ("ascii", True)])
+def test_a_stream_that_cannot_hold_the_glyphs_gets_ascii_ones_with_the_same_words(encoding, ascii_glyphs):
+    stream = Encoded(encoding)
+    style = Style.detect(stream, {})
+    table = ASCII_GLYPHS if ascii_glyphs else GLYPHS
+    for kind in KINDS:
+        assert style.status(kind) == f"{table[kind]} {kind}"
+    style.write(style.status("fail", "unconfigured") + " ✗ – done", stream)  # never raises
+    stream.flush()
+    assert stream.raw.getvalue().decode(encoding).startswith(f"{table['fail']} unconfigured")
+    assert can_encode(stream, "".join(GLYPHS.values())) is not ascii_glyphs
+
+
+def test_a_stream_with_no_encoding_is_taken_as_ascii():
+    class Bare:
+        pass
+
+    assert not can_encode(Bare(), "✓") and can_encode(Bare(), "ok")
+    assert Style.detect(Bare(), {}).status("ok") == "+ ok"
+
+
+def test_doctor_and_status_text_survive_a_cp1252_console(tmp_path, monkeypatch):
+    from ws import doctor, osinfo
+    from ws.doctor import Check
+
+    osi = osinfo.OSInfo(kind="windows", release="11", arch="x86_64", scheduler="none", supported=False)
+    checks = [Check("WS001", "platform", doctor.FAIL, "native Windows is not supported · use WSL2", "install WSL2")]
+    stream = Encoded("cp1252")
+    style = Style.detect(stream, {})
+    style.write(doctor.render(checks, osi, style), stream)
+    stream.flush()
+    out = stream.raw.getvalue().decode("cp1252")
+    assert "x fail" in out and "WS001" in out and "✗" not in out

@@ -69,7 +69,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     if args.json:
         output.result(doctor.report(checks, osi, path), status=output.ATTENTION if bad else output.OK)
     else:
-        print(doctor.render(checks, osi, Style.detect(sys.stdout, no_color=getattr(args, "no_color", False))))
+        st = Style.detect(sys.stdout, no_color=getattr(args, "no_color", False))
+        st.write(doctor.render(checks, osi, st))
     return 1 if bad else 0
 
 
@@ -311,5 +312,6 @@ def main(argv: list[str] | None = None) -> int:
         if want_json:
             print(json.dumps(output.error_envelope(e, kind), indent=2))
         else:
-            print(output.error_text(e, Style.detect(sys.stderr, no_color=no_color)), file=sys.stderr)
+            st = Style.detect(sys.stderr, no_color=no_color)
+            st.write(output.error_text(e, st), sys.stderr)
         return e.exit_code

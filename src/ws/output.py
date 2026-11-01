@@ -176,7 +176,8 @@ def dispatch(args: Any, kind: str, want_json: bool) -> int:
         try:
             return args.func(args)
         except WsError as e:
-            print(error_text(e, Style.detect(sys.stderr, no_color=_no_color(args))), file=sys.stderr)
+            st = Style.detect(sys.stderr, no_color=_no_color(args))
+            st.write(error_text(e, st), sys.stderr)
             return e.exit_code
 
     real_out, real_err = sys.stdout, sys.stderr

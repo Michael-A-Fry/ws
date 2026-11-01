@@ -98,6 +98,12 @@ known clears it, and every doubt hides it. A record is **opaque** when any of th
   an approval, or a live session's folder). A folder named in the asks or events file doesn't count, nor does an empty,
   relative or unreadable path, nor a session id ws doesn't know.
 
+An ask that names a tmux target and no session id is placed by the one live Claude Code session in that pane or window
+(`ws:@1.%1` is a pane, `ws:@1` a window id, and a window number such as `ws:2` is looked up with `tmux list-windows`).
+That session's folder decides: open, and the ask is shown; under `opaque_paths`, and it's opaque. When the ask and the
+session both carry a name, the names must agree, because a window number can move after the ask is written. No match,
+or more than one session in the window, leaves the ask opaque.
+
 Folders are compared as written: runs of spaces in a name aren't collapsed, and a path is cut off, never tidied, at 4096
 characters (a longer one counts as opaque). A name is compared the way the file system compares names, and on a
 case-insensitive file system a folder that's the same one on disk under another spelling (`~/Code/fiu` for

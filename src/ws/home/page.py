@@ -54,6 +54,10 @@ text-decoration:none;white-space:nowrap;background:none}
 .act:hover{border-color:var(--accent);background:var(--raise)}
 .act:disabled{opacity:.6;cursor:default}
 .act.off{color:var(--muted)}
+.act.sm{padding:1px 8px;font-size:12px;color:var(--muted)}
+.o-desk,.o-phone{display:inline-flex;flex-wrap:wrap;gap:8px;align-items:center}
+.o-phone{display:none}
+.why{color:var(--muted);font-size:12px}
 code.cmd{font-size:12.5px;background:var(--raise);color:var(--text);padding:3px 8px;border-radius:5px;
 overflow-wrap:anywhere}
 .meta{display:flex;flex-wrap:wrap;gap:6px}
@@ -96,6 +100,8 @@ font-size:14px;list-style:none}
 .panel>details>summary::-webkit-details-marker{display:none}
 .panel>details>summary span{color:var(--muted);font-weight:400;font-size:13px}
 @media (max-width:700px){
+.o-desk{display:none}
+.o-phone{display:inline-flex}
 .wrap{padding-left:16px;padding-right:16px}
 h1{font-size:24px}
 .list>li,.list>li.ask{grid-template-columns:minmax(0,1fr);padding:12px 14px}
@@ -119,6 +125,18 @@ tb.addEventListener('click', () => {
   try { localStorage.setItem('ws-theme', root.dataset.theme); } catch (_) {}
 });
 label();
+async function copyText(t) {
+  try { await navigator.clipboard.writeText(t); return; } catch (_) {}
+  const a = document.createElement('textarea'); a.value = t; document.body.appendChild(a); a.select();
+  try { document.execCommand('copy'); } catch (_) {}
+  a.remove();
+}
+document.addEventListener('click', async (e) => {
+  const b = e.target.closest('button[data-copy]');
+  if (!b) return;
+  const was = b.textContent; await copyText(b.dataset.copy); b.textContent = 'Copied';
+  setTimeout(() => { b.textContent = was; }, 1500);
+});
 """
 
 # What a page served on loopback adds: the open buttons post to the server with the token the address carries, and the

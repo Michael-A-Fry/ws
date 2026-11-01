@@ -20,6 +20,7 @@ __all__ = [
     "STATES",
     "action",
     "chip",
+    "copy_button",
     "empty",
     "link",
     "mark",
@@ -146,10 +147,21 @@ def link(label: str, href: str) -> str:
     return f'<a class="act" href="{_e(href)}" target="_blank" rel="noopener noreferrer">{_e(label)}</a>'
 
 
-def action(label: str, **data: str) -> str:
-    """A button the page's script turns into a POST. `data` becomes `data-*` attributes (`_` in a name is `-`)."""
+def action(label: str, *, disabled: bool = False, title: str = "", **data: str) -> str:
+    """A button the page's script turns into a POST. `data` becomes `data-*` attributes (`_` in a name is `-`).
+    `disabled` draws it greyed out; `title` is the hover text (say why when it is disabled)."""
     attrs = "".join(f' data-{_e(k.replace("_", "-"))}="{_e(v)}"' for k, v in data.items())
+    attrs += f' title="{_e(title)}"' if title else ""
+    attrs += " disabled" if disabled else ""
     return f'<button type="button" class="act"{attrs}>{_e(label)}</button>'
+
+
+def copy_button(text: str, label: str, *, small: bool = False, title: str = "") -> str:
+    """A button the page's script turns into "copy `text`". `label` is what shows; `text` only rides in `data-copy`,
+    so a command can sit behind a button and never be its label."""
+    cls = "act sm" if small else "act"
+    hover = f' title="{_e(title)}"' if title else ""
+    return f'<button type="button" class="{cls}" data-copy="{_e(text)}"{hover}>{_e(label)}</button>'
 
 
 def page(title: str, body: str, nonce: str, extra_css: str = "", *, script: str = "") -> str:

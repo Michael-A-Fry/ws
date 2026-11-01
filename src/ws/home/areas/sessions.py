@@ -46,7 +46,7 @@ def row(view: View, s) -> str:
         f'<span class="where">{_fmt.esc(" · ".join(where))}</span>{note}</div>'
         f'<div class="c-num"><span>{_fmt.esc(_fmt.tokens(s))}</span><span>{_fmt.esc(_fmt.cost(s))}</span>'
         f'<span class="seen">{_fmt.esc(seen)}</span></div>'
-        f'<div class="c-open">{_fmt.opens(view, s, "session")}</div></li>'
+        f'<div class="c-open">{_fmt.open_cell(view, s, "session")}</div></li>'
     )
 
 

@@ -57,7 +57,7 @@ def item(view: View, ask) -> str:
         f'<div class="c-st">{components.status("waiting", kind)}</div>'
         f'<div class="c-who"><b class="nm">{_fmt.esc(title)}</b><span class="meta">{chips}</span>'
         f"{'' if ask.opaque else _options(ask)}</div>"
-        f'<div class="c-open">{_fmt.opens(view, ask, "ask")}</div></li>'
+        f'<div class="c-open">{_fmt.open_cell(view, ask, "ask")}</div></li>'
     )
 
 

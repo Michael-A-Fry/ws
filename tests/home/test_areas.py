@@ -292,3 +292,59 @@ def test_ages_counts_and_money_read_plainly():
     assert [_fmt.count(n) for n in (950, 12_300, 4_100_000, 2_500_000_000)] == ["950", "12.3k", "4.1M", "2.5G"]
     assert _fmt.usd(None) == "not measured" and _fmt.usd(0.0052) == "US$0.0052" and _fmt.usd(12) == "US$12.00"
     assert _fmt.percent(1.0) == "100%" and _fmt.percent(0.9795) == "98%" and _fmt.percent(0.935) == "93.5%"
+
+
+# --- the Open button ---------------------------------------------------------------------------------------------------
+
+TERM_POST = {"opener": "terminal", "label": "Switch to it", "post": True, "text": "tmux switch-client -t ws:1"}
+TERM_TEXT = {"opener": "terminal", "label": "Attach", "text": "tmux attach -t ws:1"}
+CMD_POST = {"opener": "command", "label": "Open with ws-term", "post": True, "text": "ws-term ws:1"}
+APP = {"opener": "claude_app", "label": "Open in Claude", "href": "https://claude.ai/code/x"}
+
+
+def _cell(opens, live=True, rec=None):
+    return _fmt.open_cell(view(live=live), rec or session(opens=tuple(opens)), "session")
+
+
+def _visible(html_text: str) -> str:
+    """The text a person reads: tags and attribute values removed."""
+    return re.sub(r"<[^>]*>", "", html_text)
+
+
+def test_the_open_button_is_labelled_and_the_command_sits_behind_a_copy_control():
+    out = _cell([TERM_POST])
+    assert 'data-opener="terminal"' in out and "Open →" in _visible(out)
+    assert 'data-copy="tmux switch-client -t ws:1"' in out and ">Copy<" in out
+    assert "tmux" not in _visible(out)  # the raw command is never a visible label
+
+
+def test_without_a_server_the_open_button_copies_the_command():
+    for o in (TERM_TEXT, TERM_POST):
+        out = _cell([o], live=False)
+        assert "data-opener" not in out and "data-copy=" in out and "Open →" in _visible(out)
+        assert "tmux" not in _visible(out)
+
+
+def test_a_record_with_a_claude_app_link_gets_a_second_link():
+    out = _cell([TERM_POST, APP])
+    assert '<a class="act" href="https://claude.ai/code/x"' in out and ">Claude app</a>" in out
+    assert "Open in Claude" not in out
+
+
+def test_the_phone_opener_is_the_command_opener_when_one_is_set():
+    out = _cell([TERM_POST, CMD_POST])
+    desk, phone = out.split('<span class="o-phone">')
+    assert 'data-opener="terminal"' in desk and 'data-opener="command"' in phone
+    assert 'data-opener="terminal"' not in phone and "terminal only" not in out
+
+
+def test_without_a_command_opener_the_phone_gets_a_disabled_button_that_says_why():
+    out = _cell([TERM_POST])
+    phone = out.split('<span class="o-phone">')[1]
+    assert "<button" in phone and " disabled" in phone and 'title="terminal only"' in phone
+    assert "terminal only</span>" in phone and "data-opener" not in phone
+
+
+def test_a_record_with_nothing_to_open_it_with_draws_no_button():
+    assert _cell([]) == ""
+    assert "Open →" not in areas.MODULES["sessions"].render(view(sessions=(session(),)))

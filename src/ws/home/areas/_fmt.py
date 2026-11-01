@@ -92,15 +92,50 @@ def percent(rate: float | None) -> str:
     return f"{pct:.0f}%" if abs(pct - round(pct)) < 0.05 else f"{pct:.1f}%"
 
 
-def opens(view: View, rec, kind: str) -> str:
-    """The ways to open one session or ask, as links and buttons (or lines to paste when no server stands behind the
-    page). Nothing is drawn for a record with none."""
-    parts: list[str] = []
-    for o in rec.opens:
-        if o.get("href"):
-            parts.append(components.link(o["label"], o["href"]))
-        elif o.get("post") and view.live:
-            parts.append(components.action(o["label"], opener=o["opener"], kind=kind, id=rec.id))
-        elif o.get("text"):
-            parts.append(f'<code class="cmd" title="{esc(o["label"])}">{esc(o["text"])}</code>')
-    return f'<span class="acts">{"".join(parts)}</span>' if parts else ""
+LINK_LABELS = {"claude_app": "Claude app", "browser": "Browser"}
+OPEN_LABEL = "Open →"
+PHONE_WHY = "terminal only"
+
+
+def _button(view: View, o: dict, kind: str, rec, *, copy_too: bool) -> str:
+    """The Open button for one call: it runs the call when a server stands behind the page, else it copies the line.
+    The line itself is the button's hover text, never its label; `copy_too` adds a small copy control beside a button
+    that runs."""
+    text = o.get("text", "")
+    if o.get("post") and view.live:
+        run = components.action(OPEN_LABEL, opener=o["opener"], kind=kind, id=rec.id)
+        more = components.copy_button(text, "Copy", small=True, title="Copy the command") if copy_too and text else ""
+        return run + more
+    if text:
+        return components.copy_button(text, OPEN_LABEL, title=f"Copies: {text}")
+    return ""
+
+
+def open_cell(view: View, rec, kind: str) -> str:
+    """How to open one session or ask: a labelled `Open →` button, and a `Claude app` link when the record carries one.
+
+    At desktop width the button is the terminal call (or your own `command` when there is no terminal one). At phone
+    width it is your `command` opener when you set one, else a greyed-out button that says `terminal only`. A record
+    with nothing to open it with draws nothing."""
+    by_name = {o["opener"]: o for o in rec.opens if not o.get("href")}
+    links = "".join(
+        components.link(LINK_LABELS.get(o["opener"], o["label"]), o["href"]) for o in rec.opens if o.get("href")
+    )
+    desk_call = by_name.get("terminal") or by_name.get("command")
+    phone_call = by_name.get("command")
+    if desk_call is None and not links:
+        return ""
+    desk = _button(view, desk_call, kind, rec, copy_too=True) if desk_call else ""
+    if phone_call is not None:
+        phone = _button(view, phone_call, kind, rec, copy_too=False)
+    elif desk_call is not None:
+        phone = components.action(OPEN_LABEL, disabled=True, title=PHONE_WHY) + f'<span class="why">{PHONE_WHY}</span>'
+    else:
+        phone = ""
+    return (
+        '<span class="acts">'
+        + (f'<span class="o-desk">{desk}</span>' if desk else "")
+        + (f'<span class="o-phone">{phone}</span>' if phone else "")
+        + links
+        + "</span>"
+    )

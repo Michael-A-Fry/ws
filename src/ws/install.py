@@ -12,6 +12,9 @@ The promises, each pinned by a test:
 - A file ws made that the person has since edited is left in place and listed, never overwritten or deleted.
 - Every write is atomic and keeps the file's permission bits. A run that fails part way still records what it made.
 - Removal uses `unlink` and `rmdir` only; nothing is ever deleted recursively.
+- A runner's own config file (Claude Code's `settings.json`) is changed only by adding ws's items beside yours, and only
+  after a byte-exact backup. Undo gives your bytes back, or takes out just ws's recorded items if you changed the file
+  since (see `ws.userconfig`).
 
 Python 3.11+, standard library only.
 """
@@ -32,7 +35,7 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from ws import __version__, adapters, notesdetect, osinfo, output, policy, profile, roles
+from ws import __version__, adapters, notesdetect, osinfo, output, policy, profile, roles, userconfig
 from ws.jobs import JobError
 from ws.output import WsError
 
@@ -45,6 +48,11 @@ _TMP_SUFFIX = ".ws-tmp"
 
 class InstallError(Exception):
     """A problem the person can fix. The message is safe to print as it is."""
+
+
+class MergeRefused(WsError, InstallError):
+    """A runner's config file ws won't merge into. It keeps its kind and hint for the command line, and the setup screens
+    and role commands, which catch `InstallError`, show its message."""
 
 
 def _default_modules() -> frozenset[str]:
@@ -65,6 +73,7 @@ class Answers:
     model: str = ""
     cap: float | None = None  # monthly spend cap in US$
     memory: str = ""  # empty = keep the profile's memory folder, else DEFAULT_MEMORY
+    gate: str = ""  # "every-session" | "launch"; empty = keep the profile's, else every-session for a new runner
 
 
 @dataclass(frozen=True)
@@ -72,11 +81,12 @@ class Step:
     """One file or folder ws wants to exist."""
 
     path: Path
-    kind: str  # "file" | "dir"
+    kind: str  # "file" | "dir" | "merge"
     content: str | None = None  # the whole text of a file; None for a dir
     what: str = ""
     root: bool = False  # a folder ws manages (notes, memory): uninstall may act inside it
     toml: bool = False  # compare as TOML data, so a re-formatted file with the same data counts as unchanged
+    merge: userconfig.Merge | None = None  # kind "merge": ws's items added to (or taken out of) a runner's user config
 
 
 @dataclass
@@ -107,6 +117,8 @@ class Removal:
     missing: list[Path] = field(default_factory=list)  # already gone
     refused: list[Path] = field(default_factory=list)  # outside the managed folders, or behind a symlink
     problems: list[str] = field(default_factory=list)
+    restored: list[Path] = field(default_factory=list)  # a runner's user config put back exactly as it was
+    kept_edits: list[Path] = field(default_factory=list)  # a user config you changed: only ws's items came out
 
 
 # ---- paths -----------------------------------------------------------------------------------------------------------
@@ -188,6 +200,9 @@ def answers_from_profile(env: Mapping[str, str] | None = None, home: Path | None
         on = modules.default_on()
 
     runner = _text(_sub(rls, "runner").get("adapter"))
+    gate = _sub(rls, "runner").get("gate")
+    if gate is not None and gate not in userconfig.GATES:
+        raise InstallError(f"profile: [roles.runner] gate must be one of {', '.join(userconfig.GATES)}")
     cap = _sub(rls, "budget").get("monthly_cap_usd")
     good_cap = isinstance(cap, (int, float)) and not isinstance(cap, bool) and math.isfinite(cap)
     return Answers(
@@ -199,7 +214,19 @@ def answers_from_profile(env: Mapping[str, str] | None = None, home: Path | None
         model=_text(_sub(rls, "model").get("default")),
         cap=cap if good_cap else None,
         memory=_text(_sub(rls, "memory").get("path")),
+        gate=gate or "",
     )
+
+
+def resolve_gate(prof: dict, answers: Answers) -> str:
+    """The gate setting these answers end up with: the one asked for, else the profile's, else every-session for a runner
+    being set up now and `launch` for a profile that already had a runner before the setting existed."""
+    if answers.gate:
+        return answers.gate
+    tbl = _sub(_sub(prof, "roles"), "runner")
+    if tbl.get("gate") in userconfig.GATES:
+        return tbl["gate"]
+    return "launch" if tbl.get("adapter") else "every-session"
 
 
 def _table_of(doc: dict, key: str, label: str) -> dict:
@@ -239,6 +266,9 @@ def compose_profile(prof: dict, answers: Answers, env: Mapping[str, str], osi) -
 
     if answers.runner:
         role("runner")["adapter"] = answers.runner
+        gate = resolve_gate(prof, answers)
+        if answers.gate or "gate" in role("runner") or gate == "every-session":
+            role("runner")["gate"] = gate
     if answers.model:
         role("model")["default"] = answers.model
     if answers.cap is not None:
@@ -316,15 +346,42 @@ def plan(answers: Answers, env: Mapping[str, str] | None = None, osi=None) -> li
     taken = {(s.path, s.kind) for s in steps}
     steps += _role_steps(composed, answers, env, taken)
 
+    entries, _ = _read_manifest(env)
+    wide = answers.runner and userconfig.supports(answers.runner) and resolve_gate(prof, answers) == "every-session"
     if answers.runner:
         try:
             adapter = adapters.get(answers.runner)
         except KeyError as e:
             raise InstallError(str(e.args[0])) from e
         out = _ws_home(env) / "gate" / answers.runner
-        files = adapter.generate(parsed, ["ws"], out, policy_step.path.resolve())
+        if wide:
+            made = userconfig.plan(
+                answers.runner, parsed, policy_step.path.resolve(), env, _merge_entry(entries, answers.runner, env)
+            )
+            files = made.files
+        else:
+            files = adapter.generate(parsed, ["ws"], out, policy_step.path.resolve())
         steps += [Step(out / name, "file", text, f"{answers.runner} deny rules") for name, text in files.items()]
+        if wide:
+            steps += [
+                Step(path, "file", text, "OpenCode plugin: the gate in every session")
+                for path, text in made.copies.items()
+            ]
+            what = f"{answers.runner} user config: ws's deny rules and hooks, beside yours"
+            steps.append(Step(made.merge.path, "merge", None, what, merge=made.merge))
+    for runner in userconfig.RUNNERS:  # a runner that is no longer gated in every session: take ws's items out again
+        old = _merge_entry(entries, runner, env)
+        if old is not None and not (wide and runner == answers.runner):
+            what = f"{runner} user config: take ws's entries out"
+            steps.append(
+                Step(userconfig.target(runner, env), "merge", None, what, merge=userconfig.withdrawal(runner, env))
+            )
     return steps
+
+
+def _merge_entry(entries: Mapping[str, dict], runner: str, env: Mapping[str, str]) -> dict | None:
+    e = entries.get(str(userconfig.target(runner, env)))
+    return e if e is not None and e.get("kind") == userconfig.KIND else None
 
 
 # ---- the manifest ----------------------------------------------------------------------------------------------------
@@ -425,6 +482,11 @@ def _same_toml(a: bytes, b: bytes) -> bool:
 def classify(step: Step, entries: Mapping[str, dict] | None = None, virtual: set[Path] | None = None) -> str:
     """What applying this step would do: created, changed, unchanged, or edited (a generated file the person changed)."""
     path = step.path
+    if step.kind == "merge":
+        try:
+            return userconfig.classify(step.merge, (entries or {}).get(str(path)))
+        except WsError as e:
+            raise MergeRefused(e.kind, e.message, e.hint) from e
     if step.kind == "dir":
         if path.is_dir() or (virtual is not None and path in virtual):
             return "unchanged"
@@ -475,6 +537,12 @@ def apply(
                 if not dry_run and progress:
                     progress(step, action)
                 continue
+            if step.kind == "merge":
+                if not dry_run:
+                    _record_merge(step, entries, result, env)
+                    if progress:
+                        progress(step, action)
+                continue
             parents = _missing_parents(step.path, virtual)
             virtual.update(parents)
             if step.kind == "dir":
@@ -500,6 +568,20 @@ def apply(
                 if not failed:
                     raise
     return result
+
+
+def _record_merge(step: Step, entries: dict[str, dict], result: Result, env: Mapping[str, str]) -> None:
+    key = str(step.path)
+    try:
+        kept, outcome = userconfig.apply(step.merge, entries.get(key), env)
+    except WsError as e:
+        raise MergeRefused(e.kind, e.message, e.hint) from e
+    if kept is None:
+        entries.pop(key, None)
+    else:
+        entries[key] = kept
+    if outcome.note:
+        result.notes.append(outcome.note)
 
 
 def _record_file(step: Step, action: str, entries: dict[str, dict], result: Result) -> None:
@@ -532,6 +614,7 @@ def current_roots(env: Mapping[str, str] | None = None) -> list[Path]:
         if isinstance(p, str) and p:
             found.append(expand(p, env))
     found += [Path(os.path.abspath(r)) for r in skills.roots(env)]
+    found += userconfig.file_roots(env)
     out: list[Path] = []
     for r in found:
         if r not in out and not _too_broad(r, env):
@@ -619,8 +702,11 @@ def uninstall(
     removal = Removal()
 
     mine: list[tuple[Path, dict]] = []
+    merges = [e for e in entries.values() if e.get("kind") == userconfig.KIND]
     for key, entry in entries.items():
         path = Path(os.path.normpath(key))
+        if entry.get("kind") == userconfig.KIND:
+            continue
         if entry.get("kind") in ("file", "dir") and _may_touch(path, entry["kind"], roots):
             mine.append((path, entry))
         else:
@@ -635,6 +721,22 @@ def uninstall(
         removal.problems += deactivate(ours, env)
 
     gone: set[Path] = set()
+    pending: dict[str, dict] = {}
+    for entry in merges:
+        out = userconfig.withdraw(entry, env, dry_run)
+        path = Path(str(entry.get("path")))
+        if out.action in ("restored", "removed"):
+            removal.restored.append(path)
+            removal.removed += out.removed
+            gone.update(out.removed)
+            gone.add(path)
+        elif out.action == "trimmed":
+            removal.kept_edits.append(path)
+        elif out.action == "refused":
+            removal.refused.append(path)
+        elif out.action == "pending":
+            pending[str(entry["path"])] = entry
+            removal.problems.append(out.note)
     for path, entry in files:
         if entry.get("created_by_ws") is not True:
             removal.not_ours.append(path)
@@ -655,7 +757,13 @@ def uninstall(
     _tidy_work_root(_work_root(env), removal, gone, dry_run)
 
     manifest = manifest_path(env)
-    if manifest.is_file():
+    if manifest.is_file() and pending:
+        if not dry_run:  # a user config that can't be read now keeps its record, so a later uninstall can finish
+            try:
+                _save_manifest(env, pending, [])
+            except OSError as e:
+                removal.problems.append(f"could not update {manifest}: {e.strerror}")
+    elif manifest.is_file():
         if not dry_run:
             try:
                 manifest.unlink()
@@ -716,6 +824,10 @@ def _answers_from_args(args: argparse.Namespace, env: Mapping[str, str]) -> Answ
         a = replace(a, model=args.model)
     if args.cap is not None:
         a = replace(a, cap=args.cap)
+    if args.gate:
+        if not a.runner:
+            raise InstallError("--gate needs a runner: pass --runner (claude-code or opencode)")
+        a = replace(a, gate=args.gate)
     return a
 
 
@@ -741,6 +853,8 @@ def cmd_install(args: argparse.Namespace) -> int:
                 from ws import skills
 
                 result.notes += skills.notices(answers.runner, env)
+    except WsError:
+        raise
     except (InstallError, OSError) as e:
         raise WsError("failed", str(e)) from e
 
@@ -817,6 +931,8 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
             {
                 "dry_run": args.dry_run,
                 "removed": [str(p) for p in r.removed],
+                "restored": [str(p) for p in r.restored],
+                "kept_edits": [str(p) for p in r.kept_edits],
                 "left": [str(p) for p in left],
                 "problems": r.problems,
             }
@@ -830,6 +946,10 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
     ):
         for p in paths:
             print(f"{label}: {p}")
+    for p in r.restored:
+        print(f"{'would restore' if args.dry_run else 'restored'} {p} (your settings, exactly as they were)")
+    for p in r.kept_edits:
+        print(f"you changed it since, so ws kept your edits and took out only its own entries: {p}")
     for problem in r.problems:
         print(f"ws: {problem}", file=sys.stderr)
     print(f"ws: {'would remove' if args.dry_run else 'removed'} {len(r.removed)}; left {len(left)}")
@@ -844,6 +964,12 @@ def register(sub) -> None:
     i.add_argument("--module", action="append", metavar="NAME", help="switch a module on; repeat for more")
     i.add_argument("--runner", choices=sorted(adapters.all_adapters()), help="the runner to write deny rules for")
     i.add_argument("--model", metavar="ID", help="the default model")
+    i.add_argument(
+        "--gate",
+        choices=userconfig.GATES,
+        help="every-session: the runner's own user config carries ws's deny rules and hooks, so every session is "
+        "gated; launch: only a session started with `ws gate launch` is",
+    )
     i.add_argument("--cap", type=float, metavar="USD", help="a monthly spend cap in US$")
     i.add_argument("-y", "--yes", action="store_true", help="do not ask before writing")
     i.add_argument("--dry-run", action="store_true", help="show what would change and write nothing")

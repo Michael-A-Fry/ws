@@ -1,6 +1,6 @@
 """`ws doctor`: one line per check, each with a stable ID. Exit 0 only when nothing is failing or unconfigured.
 
-IDs never change meaning once released: WS0xx are the machine, profile and jobs, WS1xx are the roles (one per role).
+IDs never change meaning once released: WS0xx are the machine, profile, jobs and gate, WS1xx are the roles (one per role).
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from ws import __version__, canary, jobs, roles, usage
+from ws import __version__, canary, jobs, roles, usage, userconfig
 from ws import globals as ws_globals
 from ws.osinfo import OSInfo
 from ws.profile import ProfileError, load, profile_path
@@ -250,6 +250,11 @@ def run_checks(osi: OSInfo, profile_file: Path, env: dict | None = None, network
         else:
             checks.append(Check("WS006", "jobs", OK, "every job file loads"))
     checks.append(_ptrace_check(osi))
+    try:
+        status, detail, fix = userconfig.check(env)
+    except Exception as e:  # noqa: BLE001 (a broken check must report, not crash the whole doctor)
+        status, detail, fix = FAIL, f"check crashed ({type(e).__name__})", ""
+    checks.append(Check("WS008", "gate", status, detail, fix))
     roles = prof.get("roles") if isinstance(prof.get("roles"), dict) else {}
     for r in ROLES:
         cfg = roles.get(r.name)

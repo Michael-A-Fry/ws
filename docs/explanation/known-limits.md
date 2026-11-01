@@ -129,6 +129,31 @@ standard output and nothing to standard error. It still exits 2 and still denies
 
 - **Workaround.** Don't set `WS_OUTPUT=json` in the environment of a hook.
 
+### The gate in every session
+
+With `gate = "every-session"` (the default for a new profile), `ws install` adds ws's deny rules, hooks and env keys to
+your runner's own config file, beside yours. It records exactly what it added and saves your file's bytes first. See
+[Upgrade and uninstall](../how-to/upgrade-and-uninstall.md) for the undo. What stays outside the gate:
+
+- **No wall in the shared file.** The file carries no `sandbox` block. A global `failIfUnavailable` sandbox would stop
+  Claude Code on a machine without bubblewrap, and it would override your own sandbox choices. The wall still comes from
+  `ws gate launch`. Where the launch settings and your config file hold the same hook, Claude Code runs it once. OpenCode
+  loads the global plugin and the launch plugin, so a launched OpenCode session asks the gate twice.
+- **Your file's edits go through your terminal.** Gated sessions can't edit the config file ws merged into, or any
+  `.claude` or `opencode.json` file in a project. Change them in a terminal of your own. A later undo keeps whatever you
+  added to the file.
+- **Some files are refused.** A config file that's a link, isn't plain JSON (comments, a trailing comma), or is
+  `opencode.jsonc`, is left alone. So is one where you've set an `env` key, or an OpenCode rule, to a value that
+  contradicts ws's. `ws install` names the key and changes nothing. Use `ws gate launch` for those machines.
+- **Layout.** ws keeps your indentation and key order. A rewrite lays the JSON out in one style, so hand-aligned inline
+  arrays come back expanded. The saved copy in `$WS_HOME/backups/` is exact, and it can hold env values you put in the
+  file, so it's mode 0600.
+- **OpenCode runs none of the guards yet.** `ws doctor` (WS008) lists each guard that's on in your policy and the runner
+  doesn't run.
+- **A broken ws blocks calls, not skips them.** The hook fails closed. When ws can't start, each governed call is
+  blocked and the message names the command that takes ws out of the file. See
+  [When the gate can't start](../how-to/upgrade-and-uninstall.md#when-the-gate-cant-start).
+
 ## Secrets
 
 ### The `sops-age` role isn't read by the broker

@@ -272,7 +272,7 @@ def test_plan_is_pure_and_dry_run_writes_nothing(box, capsys):
     pre = snapshot(box)
     steps = install.plan(install.Answers(notes=str(box / "Notes"), runner="opencode"))
     assert snapshot(box) == pre
-    assert {s.kind for s in steps} == {"file", "dir"}
+    assert {s.kind for s in steps} == {"file", "dir", "merge"}
     code, out, _ = run(capsys, "install", "--dry-run", "--runner", "opencode", "--notes", str(box / "Notes"))
     assert code == 0 and "would create" in out and "dry run: " in out
     assert snapshot(box) == pre

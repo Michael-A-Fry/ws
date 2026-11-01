@@ -550,6 +550,7 @@ ws plugin add [-h] [--region CC] NAME
 |---|---|
 | `NAME` | The plugin (see `ws plugin list`). |
 | `--region CC` | Your country (two letters); kept in `[machine] region`. |
+| `--no-color` | Print with no colour, the same as a non-empty `NO_COLOR`. |
 
 ### `ws plugin remove`
 
@@ -806,7 +807,7 @@ Set up ws, step by step; run it again and it reports 0 changes (--web for a page
 
 ```text
 ws setup [-h] [--web] [--no-open] [-y] [--plugin NAME] [--notes PATH]
-    [--runner {claude-code,opencode}] [--cap USD] [--region CC]
+    [--runner {claude-code,opencode}] [--cap USD] [--region CC] [--no-color]
 ```
 
 | Argument | Meaning |

@@ -8,11 +8,46 @@ body of the GitHub release.
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-11-02
+
+One token source for the brand, rules enforced by tests, and a stricter gate.
+
+### Added
+
+- `docs/reference/principles.md`: the rules for each layer (brand, terminal colour, UI, writing, front end, CLI, data,
+  governance), each naming the test that checks it; `tests/test_principles.py` keeps the page honest.
+- `src/ws/brand.py`: one role-named token source (dark, light, 256-colour and basic ANSI) that the setup page and the
+  terminal both read, with WCAG contrast tests for every pair.
+- `src/ws/style.py`: one shared terminal style for doctor, status and error text; a global `--no-color`.
+- `docs/reference/stores.md`: every log ws writes, with its fields, schema and rotation. Log lines carry `ts` and
+  `schema`; `at` is kept beside `ts` for one release.
+- spawn-cap has a default limit when `max_agents` isn't set, from the machine's CPUs and memory (cgroup-aware).
+- syntax-check checks `.js`, `.mjs` and `.cjs` files with `node --check` when node is installed.
+
+### Changed
+
+- PyPI lists Documentation, Changelog, Issues and Security links beside Source, and the README carries version,
+  Python, licence and CI badges.
+- Colour: a non-empty `NO_COLOR` turns it off; `FORCE_COLOR` and `--no-color` work on every command; `TERM=dumb`
+  prints each step once. A light terminal (from `COLORFGBG`) gets darker brand colours and its own status colours.
+- Light-mode colours on the setup page meet contrast as text: mint, amber, accent text, borders and the mark.
+- The setup page uses a per-response nonce in its Content-Security-Policy.
+- `ws doctor` ends with a line pointing at `ws setup` when roles are unconfigured.
+- Symbols fall back to ASCII where the terminal's encoding can't print them.
+- `ws status` lists each path once and marks folders.
+- A plain `ws install` keeps the every-session gate merged; only `--gate launch` or `ws uninstall` removes it.
+
 ### Fixed
 
+- An install keeps manifest records it didn't write, under a lock of its own, so a later install can't drop the
+  gate's merge record. A file that matches what ws would write is taken back as ws's own.
+- The gate denies reads of ws's secrets folder, including through `$WS_HOME`, a linked home and wildcards.
+- The gate reads a quoted here-doc's body as file content only for plain `cat` and `tee` steps; every other body is
+  read as commands. A command whose here-doc body holds an apostrophe no longer hides the lines after it.
+- The gate denies a command too long to check in time, and says to write it to a file and run that.
 - The README on PyPI links to the docs, changelog and licence on GitHub at the release's tag; relative links there
   went to a 404. The release fails if a built file's description still holds a relative link or image.
-- PyPI lists Documentation, Changelog, Issues and Security links beside Source.
+- systemd: ws recognises its own units after the ws home moves, and leaves units it didn't write alone.
 
 ## [0.1.4] - 2026-11-02
 

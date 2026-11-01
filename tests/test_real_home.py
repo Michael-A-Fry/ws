@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import importlib.util
 import os
 from pathlib import Path
 
-import conftest
+# by path: `import conftest` can pick up tests/roles/conftest.py instead
+_spec = importlib.util.spec_from_file_location("ws_tests_conftest", Path(__file__).with_name("conftest.py"))
+assert _spec and _spec.loader
+conftest = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(conftest)
 
 
 def test_home_is_a_scratch_folder_even_after_undo(monkeypatch, tmp_path):

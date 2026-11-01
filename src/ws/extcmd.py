@@ -5,9 +5,12 @@ profile's `[cli] fallback`; the usual usage error with "did you mean". An extern
 `WS_OUTPUT=json` when `--json` was given, and `-C PATH` as its working folder (the way git runs `git-<word>`). The
 fallback gets the whole original argument list, leading flags and the empty list (a bare `ws`) included, and runs with
 `WS_FALLBACK=1`; a run that already has it set is not handed on again. The fallback is an absolute path (or `~/...`) to a
-file that is yours, executable and closed to other writers, the same test a job file passes. PATH entries that are not
-absolute are skipped, so a program in the current folder is never picked up by name. `ws config fallback` reads, sets
-and clears it.
+file that is yours, executable and closed to other writers, the same test a job file passes, in a folder that other
+users cannot write to. A `ws-<word>` runs when it belongs to you or root, only you (or root) can write to it, and its
+folder is closed to other writers (or sticky, like /tmp); a program that fails this is skipped, with one line on stderr
+saying why. ws searches the absolute PATH entries only, so it runs programs from fixed folders. A profile it cannot
+read does not turn a mistyped word into a config error: the usual usage error comes with a one-line note naming the
+profile problem. `ws config fallback` reads, sets and clears it.
 """
 
 from __future__ import annotations
@@ -15,6 +18,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import stat
 import subprocess
 import sys
 from collections.abc import Collection, Mapping
@@ -41,8 +45,44 @@ class Launch:
     keep_cwd: bool = True  # an external runs in the `-C` folder; the fallback is told `-C` itself
 
 
+_noted: set[str] = set()
+
+
 def _is_exec(path: Path) -> bool:
     return path.is_file() and os.access(path, os.X_OK)
+
+
+def folder_open_to_others(folder: Path) -> bool:
+    """True when anyone can write in `folder` and it has no sticky bit, so anyone could swap a file in it."""
+    try:
+        mode = folder.stat().st_mode
+    except OSError:
+        return False
+    return bool(mode & stat.S_IWOTH) and not mode & stat.S_ISVTX
+
+
+def unsafe_reason(path: Path) -> str | None:
+    """Why ws will not run `path` as `ws <word>`, or None. Checks the file and the folders it is reached through."""
+    if os.name != "posix":
+        return None
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    if st.st_uid not in (os.geteuid(), 0):
+        return "it belongs to another user"
+    if st.st_mode & 0o022:
+        return f"it can be written by others (mode {st.st_mode & 0o777:04o})"
+    for folder in dict.fromkeys([path.parent, path.resolve().parent]):
+        if folder_open_to_others(folder):
+            return f"its folder {folder} can be written by anyone"
+    return None
+
+
+def _note_once(path: Path, why: str) -> None:
+    if str(path) not in _noted:
+        _noted.add(str(path))
+        print(f"ws: skipping {path}: {why}", file=sys.stderr)
 
 
 def _path_dirs(env: Mapping[str, str]) -> list[Path]:
@@ -50,14 +90,18 @@ def _path_dirs(env: Mapping[str, str]) -> list[Path]:
 
 
 def find_external(word: str, env: Mapping[str, str] | None = None) -> str | None:
-    """The path of `ws-<word>` in the first absolute PATH entry that holds an executable of that name."""
+    """The path of `ws-<word>` in the first absolute PATH entry that holds a safe executable of that name."""
     env = os.environ if env is None else env
     if not WORD.match(word):
         return None
     for d in _path_dirs(env):
         candidate = d / f"{PREFIX}{word}"
-        if _is_exec(candidate):
+        if not _is_exec(candidate):
+            continue
+        why = unsafe_reason(candidate)
+        if why is None:
             return str(candidate)
+        _note_once(candidate, why)
     return None
 
 
@@ -72,7 +116,7 @@ def list_externals(builtins: Collection[str], env: Mapping[str, str] | None = No
             continue
         for name in names:
             word = name[len(PREFIX) :]
-            if word not in builtins and WORD.match(word) and _is_exec(d / name):
+            if word not in builtins and WORD.match(word) and _is_exec(d / name) and unsafe_reason(d / name) is None:
                 found.add(name)
     return sorted(found)
 
@@ -110,6 +154,9 @@ def resolve_fallback(value: str) -> Path:
         jobs.check_private(p)
     except jobs.JobError as e:
         raise WsError("refused", str(e), _FALLBACK_HINT) from e
+    for folder in dict.fromkeys([p.parent, p.resolve().parent]):
+        if folder_open_to_others(folder):
+            raise WsError("refused", f"the fallback program's folder {folder} can be written by anyone", _FALLBACK_HINT)
     return p
 
 
@@ -135,7 +182,12 @@ def plan(
             return Launch(found, rest[1:], child)
     elif first is not None and first.split("=")[0] in flags:
         return None
-    value = configured_fallback()
+    try:
+        value = configured_fallback()
+    except WsError as e:
+        # The profile only holds the fallback, so a broken one leaves the person the usual usage error and the reason.
+        print(f"ws: note: [cli] fallback was not looked up: {' '.join(e.message.split())}", file=sys.stderr)
+        return None
     if value is None:
         return None
     what = f"`{first}`" if first is not None else "ws with no command"

@@ -76,9 +76,9 @@ Options:
   --no-verify         do not check the release's SHA-256 or signature (not recommended)
   --skip-smoke-test   do not run 'ws --version' and 'ws doctor --offline' afterwards
   --move-existing-ws-to PATH
-                      if another program named 'ws' is in the install folder, rename it to PATH (a rename,
-                      never a delete) and, after the install, set it as the program that gets words ws lacks
-                      ('ws config fallback PATH')
+                      if another program named 'ws' is in the install folder, rename it to PATH just before
+                      the install and, once ws is installed, set it as the program that gets the words ws
+                      lacks ('ws config fallback PATH'); a failed install puts it back
   --dry-run           run the checks and say what would happen; install nothing
   --help              show this text
 
@@ -203,6 +203,9 @@ cleanup() {
 on_exit() {
     local status=$?
     cleanup
+    if [ "${status}" -ne 0 ]; then
+        restore_moved_ws
+    fi
     if [ "${status}" -ne 0 ]; then
         error "installation failed (exit ${status})"
         print_troubleshooting
@@ -454,34 +457,55 @@ resolve_link() {
     printf '%s' "${p}"
 }
 
-# True when the file at PATH_ARG is this toolkit: it lives in the ws-aitoolkit tool environment, or its
-# `version --json` answers in the ws.cli/1 shape with an install_source field.
+# True when the file at $1 is this toolkit: it lives in the ws-aitoolkit tool environment (uv's tools folder or
+# pipx's venvs folder), or it is a script whose first line points at that environment's Python. The program is
+# only read: its path and first line are looked at, and an unknown program is left unstarted.
 is_this_toolkit() {
-    local file="$1" real answer
+    local file="$1" real first=""
     real="$(resolve_link "${file}")"
     case "${real}" in */ws-aitoolkit/*) return 0 ;; esac
-    [ -f "${real}" ] && [ -x "${real}" ] || return 1
-    answer="$("${real}" version --json 2>/dev/null </dev/null || true)"
-    case "${answer}" in
-        *'"ws.cli/1"'*'"install_source"'*) return 0 ;;
-    esac
+    [ -f "${real}" ] && [ -r "${real}" ] || return 1
+    { IFS= read -r first || true; } <"${real}" 2>/dev/null
+    case "${first}" in '#!'*/ws-aitoolkit/*) return 0 ;; esac
     return 1
 }
 
-# If the install folder already holds a different `ws`, stops with no changes and prints the two commands that
-# keep it working as the fallback; with a move target it does the rename instead. A dry run only says what it would do.
-# Sets MOVED_WS to the new place of a program it moved.
+# A path as a shell would need it typed, so a printed command works for a folder with a space in its name.
+quoted() {
+    printf '%q' "$1"
+}
+
+# Puts the program at $1 in a new place $2 (which is free). A symlink is recreated with its resolved absolute
+# target, since a relative target would point nowhere from another folder; then the old link is removed.
+move_aside() {
+    local src="$1" dst="$2" target dir
+    if [ -L "${src}" ]; then
+        target="$(resolve_link "${src}")"
+        case "${target}" in /*) ;; *) target="$(pwd -P)/${target}" ;; esac
+        dir="$(cd "${target%/*}" 2>/dev/null && pwd -P)" && target="${dir}/${target##*/}"
+        ln -s -- "${target}" "${dst}" && rm -f -- "${src}"
+    else
+        mv -- "${src}" "${dst}"
+    fi
+}
+
+# If the install folder already holds a different `ws`, stops before anything is downloaded and prints the two
+# commands that keep it working as the fallback. With a move target it records the move (MOVE_SRC, MOVE_DST) for
+# move_existing_aside, which does it just before the install command. A dry run only says what it would do.
+MOVE_SRC=""
+MOVE_DST=""
 MOVED_WS=""
+MOVE_PENDING=0
 check_existing_ws() {
-    local dry="$1" move_to="$2" bin_dir existing
+    local dry="$1" move_to="$2" bin_dir existing legacy
     bin_dir="$(install_bin_dir)"
     existing="${bin_dir}/ws"
     if [ ! -e "${existing}" ] && [ ! -L "${existing}" ]; then
-        [ -z "${move_to}" ] || info "no other 'ws' in ${bin_dir}, so there is nothing to move"
+        [ -z "${move_to}" ] || info "no other 'ws' in ${bin_dir}, so the install goes ahead as usual"
         return 0
     fi
     if is_this_toolkit "${existing}"; then
-        [ -z "${move_to}" ] || info "the 'ws' in ${bin_dir} is this toolkit, so there is nothing to move"
+        [ -z "${move_to}" ] || info "the 'ws' in ${bin_dir} is this toolkit, so the install replaces it in place"
         return 0
     fi
     if [ -n "${move_to}" ]; then
@@ -490,38 +514,64 @@ check_existing_ws() {
             exit 1
         fi
         if [ "${dry}" = "1" ]; then
-            info "would rename ${existing} to ${move_to}, then run: ws config fallback ${move_to}"
+            info "would rename ${existing} to ${move_to} just before the install, then run: ws config fallback $(quoted "${move_to}")"
             return 0
         fi
-        mv -- "${existing}" "${move_to}" ||
-            {
-                error "could not rename ${existing} to ${move_to}"
-                exit 1
-            }
-        ok "renamed ${existing} to ${move_to}"
-        MOVED_WS="${move_to}"
+        MOVE_SRC="${existing}"
+        MOVE_DST="${move_to}"
         return 0
     fi
+    legacy="${existing}-legacy"
     if [ "${dry}" = "1" ]; then
         warn "another program named 'ws' is at ${existing}; a real run would stop here"
     else
-        error "another program named 'ws' is at ${existing}. Nothing was changed."
+        error "another program named 'ws' is at ${existing}. The install stops here and leaves it where it is."
     fi
-    printf '       1. move it aside:        mv %s %s-legacy\n' "${existing}" "${existing}" >&2
-    printf '       2. after the install:    ws config fallback %s-legacy\n' "${existing}" >&2
+    printf '       1. move it aside:        mv %s %s\n' "$(quoted "${existing}")" "$(quoted "${legacy}")" >&2
+    printf '       2. after the install:    ws config fallback %s\n' "$(quoted "${legacy}")" >&2
     printf '          (ws then hands it every word ws has no command for)\n' >&2
-    printf '       or let the installer do both: bash install.sh --move-existing-ws-to %s-legacy\n' "${existing}" >&2
+    printf '       or let the installer do both: bash install.sh --move-existing-ws-to %s\n' "$(quoted "${legacy}")" >&2
     if [ "${dry}" = "1" ]; then
         return 0
     fi
     exit 1
 }
 
+# Renames the other `ws` out of the way, right before the install command. From here until the install is
+# confirmed, MOVE_PENDING makes the exit trap put it back.
+move_existing_aside() {
+    [ -n "${MOVE_SRC}" ] || return 0
+    if [ -e "${MOVE_DST}" ] || [ -L "${MOVE_DST}" ]; then
+        error "${MOVE_DST} already exists; choose a name that is free for --move-existing-ws-to"
+        exit 1
+    fi
+    if ! move_aside "${MOVE_SRC}" "${MOVE_DST}"; then
+        error "could not rename ${MOVE_SRC} to ${MOVE_DST}"
+        exit 1
+    fi
+    ok "renamed ${MOVE_SRC} to ${MOVE_DST}"
+    MOVED_WS="${MOVE_DST}"
+    MOVE_PENDING=1
+}
+
+# The exit trap's part: a failure before the install is confirmed puts the program back where it was.
+restore_moved_ws() {
+    [ "${MOVE_PENDING}" = "1" ] || return 0
+    MOVE_PENDING=0
+    if [ -e "${MOVE_SRC}" ] || [ -L "${MOVE_SRC}" ]; then
+        warn "your original 'ws' is at ${MOVED_WS}; ${MOVE_SRC} holds the half-finished install"
+    elif mv -- "${MOVED_WS}" "${MOVE_SRC}"; then
+        ok "put your original 'ws' back at ${MOVE_SRC}"
+    else
+        error "your original 'ws' is at ${MOVED_WS}; move it back to ${MOVE_SRC} yourself"
+    fi
+}
+
 # After the install: make the moved program the fallback, using the ws that was just installed.
 set_moved_fallback() {
     local ws_bin="$1" target="$2"
     if ! "${ws_bin}" config fallback "${target}" </dev/null; then
-        error "ws is installed, but setting the fallback failed. Run: ws config fallback ${target}"
+        error "ws is installed, but setting the fallback failed. Run: ws config fallback $(quoted "${target}")"
         exit 1
     fi
     ok "words ws lacks now go to ${target}"
@@ -776,6 +826,7 @@ main() {
             info "would run: ${run_cmd}"
         fi
     else
+        move_existing_aside
         info "running: ${run_cmd}"
         if [ "${INSTALLER}" = "uv" ]; then
             if [ -n "${from_path}" ]; then
@@ -796,10 +847,11 @@ main() {
                     ;;
             esac
         fi
+        MOVE_PENDING=0
         if [ -n "${MOVED_WS}" ]; then
             ws_bin="$(install_bin_dir)/ws"
             [ -x "${ws_bin}" ] || ws_bin="$(find_ws)" || {
-                error "ws was installed but is not on PATH, so the fallback is not set. After fixing PATH run: ws config fallback ${MOVED_WS}"
+                error "ws was installed but is not on PATH, so the fallback is not set. After fixing PATH run: ws config fallback $(quoted "${MOVED_WS}")"
                 exit 1
             }
             set_moved_fallback "${ws_bin}" "${MOVED_WS}"

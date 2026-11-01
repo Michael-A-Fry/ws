@@ -38,6 +38,7 @@ def box(tmp_path, monkeypatch):
     monkeypatch.setenv("PATH", str(tmp_path / "bin"))
     monkeypatch.delenv("WS_OUTPUT", raising=False)
     monkeypatch.delenv(extcmd.FALLBACK_ENV, raising=False)
+    monkeypatch.setattr(extcmd, "_noted", set())
     monkeypatch.chdir(home)
     return tmp_path
 
@@ -212,14 +213,85 @@ def test_a_fallback_path_must_be_absolute(box, started, capsys):
     assert env["error_kind"] == "bad_config" and "absolute" in env["message"] and "ws config fallback" in env["hint"]
 
 
-def test_a_broken_profile_is_a_typed_error_only_when_the_fallback_is_needed(box, started, capsys):
+@pytest.mark.parametrize("argv", [["doctr"], ["--bogus"], []])
+def test_a_broken_profile_leaves_the_usual_usage_error_and_names_the_problem(box, started, capsys, argv):
     p = profile_path()
     p.parent.mkdir(parents=True)
     p.write_text("[cli\n", encoding="utf-8")
     script(box / "bin" / "ws-hello")
     assert cli.main(["hello"]) == 0  # an external does not read the profile
+    started.clear()
+    capsys.readouterr()
+    assert cli.main(argv) == 2  # the usage error, not bad_config
+    err = capsys.readouterr().err
+    assert err.count("[cli] fallback was not looked up") == 1 and str(p) in err
+    assert started == []
+    if argv == ["doctr"]:
+        assert "did you mean `doctor`?" in err
+
+
+def test_a_fallback_that_is_not_a_path_is_noted_the_same_way(box, started, capsys):
+    p = profile_path()
+    p.parent.mkdir(parents=True)
+    p.write_text("[cli]\nfallback = 3\n", encoding="utf-8")
+    assert cli.main(["x"]) == 2
+    assert "[cli] fallback was not looked up" in capsys.readouterr().err and started == []
+
+
+@posix_only
+def test_a_ws_program_that_others_could_have_written_is_skipped_with_one_note(box, started, capsys):
+    prog = script(box / "bin" / "ws-hello", mode=0o775)  # group-writable
+    assert extcmd.find_external("hello") is None
+    assert extcmd.find_external("hello") is None
+    err = capsys.readouterr().err
+    assert err.count(f"skipping {prog}") == 1 and "written by others" in err
+    assert extcmd.list_externals([]) == []  # help does not list what ws would not run
+    assert cli.main(["hello"]) == 2 and started == []
+    prog.chmod(0o755)
+    assert extcmd.find_external("hello") == str(prog)
+
+
+@posix_only
+def test_a_ws_program_owned_by_someone_else_is_skipped(box, monkeypatch, capsys):
+    prog = script(box / "bin" / "ws-hello")
+    monkeypatch.setattr(os, "geteuid", lambda: os.stat(prog).st_uid + 1)
+    assert extcmd.find_external("hello") is None
+    assert "belongs to another user" in capsys.readouterr().err
+
+
+@posix_only
+def test_a_ws_program_in_a_world_writable_folder_is_skipped_unless_the_folder_is_sticky(box, monkeypatch, capsys):
+    folder = box / "open"
+    prog = script(folder / "ws-hello")
+    monkeypatch.setenv("PATH", str(folder))
+    folder.chmod(0o777)
+    assert extcmd.find_external("hello") is None
+    assert "its folder" in capsys.readouterr().err
+    folder.chmod(0o1777)  # sticky, like /tmp
+    assert extcmd.find_external("hello") == str(prog)
+
+
+@posix_only
+def test_a_symlinked_ws_program_is_judged_by_the_file_it_points_at_and_its_folder(box, capsys):
+    real = script(box / "tools" / "ws-hello")
+    (box / "bin" / "ws-hello").symlink_to(real)
+    assert extcmd.find_external("hello") == str(box / "bin" / "ws-hello")
+    (box / "tools").chmod(0o777)
+    assert extcmd.find_external("hello") is None
+    assert "its folder" in capsys.readouterr().err
+
+
+@posix_only
+def test_the_fallback_folder_must_be_closed_to_others_too(box, started, capsys):
+    prog = fallback_to(box, name="sub/old-ws")
+    started.clear()
+    capsys.readouterr()
+    prog.parent.chmod(0o777)
     assert cli.main(["x", "--json"]) == 1
-    assert json.loads(capsys.readouterr().out)["error_kind"] == "bad_config"
+    env = json.loads(capsys.readouterr().out)
+    assert env["error_kind"] == "refused" and "can be written by anyone" in env["message"]
+    prog.parent.chmod(0o1777)
+    assert cli.main(["x"]) == 0 and len(started) == 1
 
 
 def test_a_tilde_path_is_stored_as_typed_and_found_under_home(box, started):

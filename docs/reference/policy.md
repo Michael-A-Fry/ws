@@ -44,7 +44,7 @@ the built-in default, which has the list below.
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `deny_commands` | list of text | `[]` in a file | Shell command patterns no session may run. `ws gate init` writes the [built-in list](#built-in-deny_commands). |
-| `deny_read` | list of text | `[]` in a file | Paths no session may read. `~/` is your home. `**` crosses folders. `ws gate init` writes `~/.ssh/**`, `~/.gnupg/**` and `~/.aws/credentials`. |
+| `deny_read` | list of text | `[]` in a file | Paths no session may read. `~/` is your home. `**` crosses folders. `ws gate init` writes `~/.ssh/**`, `~/.gnupg/**` and `~/.aws/credentials`. Whatever the file says, ws also denies reads of its own secrets folder (`$WS_HOME/secrets`, and the `[roles.secrets] store` folder when the profile names one), for every runner. |
 | `deny_tools` | list of text | `[]` | Neutral tool names to switch off. Known: `web_fetch`, `web_search`. An allowed web tool counts as a way out. |
 | `ask_commands` | list of text | `[]` | Command patterns that run only after you approve that exact call. Same globs as `deny_commands`. A command that also matches `deny_commands` stays denied. |
 | `allow_hosts` | list of text | `[]` | Hosts a session's shell may reach, for runners whose sandbox filters the network (Claude Code). Empty means the policy says nothing about the network. |
@@ -55,6 +55,13 @@ Rules:
 - A pattern is a glob. `*` matches anything and `\*` is a literal star. Each command is checked per shell segment (`a
   && b`,
   pipes, `$(...)`, `bash -c "..."`). Flags are normalised first.
+- The body of a here-document is text in one plain shape only: lines of `cat` or `tee` steps, joined by a new line,
+  `;` or `&&`, where each step is plain words, at most one `>` or `>>` to a plain path and one quoted opener
+  (`<<'EOF'`, `<<"EOF"`, `<<-'EOF'`; the name is letters, digits and `_`, and can't start with a digit), and each body
+  ends on its exact closing line. A plain word has letters, digits and `_ . / , : @ % + -` only. Anything else in the
+  command (a pipe, a group, a function, a variable, a substitution, a comment, a quote, an unquoted or here-string
+  opener, a file descriptor, another program, a backslash-newline) and every body is read as commands. The file a
+  `tee` or `>` names goes through the same path checks as any other write.
 - Every item must be non-empty text.
 - `allow_hosts` items are a name, `*.name` or an IP, with an optional `:port`.
 - `allow_write` items must be a folder, absolute or under `~/` (`$HOME` is accepted), with no wildcard, not `/` and

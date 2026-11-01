@@ -17,9 +17,12 @@ import pytest
 from ws import approvals, cli, jobs, jsonl, policy, sandbox
 from ws.adapters import claude_code, opencode
 
-POLICY = policy.loads(
-    '[gate]\ndeny_read = ["~/.ssh/**", "~/.aws/credentials", "$HOME/.gnupg/**", "~/.s*/id_rsa", "/"]\n'
-)
+
+def sandbox_policy():
+    """Built when a test asks (loading a policy reads WS_HOME and the profile, which a test sets)."""
+    return policy.loads(
+        '[gate]\ndeny_read = ["~/.ssh/**", "~/.aws/credentials", "$HOME/.gnupg/**", "~/.s*/id_rsa", "/"]\n'
+    )
 
 
 @pytest.fixture
@@ -47,14 +50,14 @@ def which(*present):
 
 def test_read_rules_become_paths_a_sandbox_can_hide():
     # a trailing ** goes; a wildcard in the middle, the root and a bare ~ are left to the matcher
-    assert policy.sandbox_read_paths(POLICY) == ["~/.ssh", "~/.aws/credentials", "~/.gnupg"]
-    assert (
-        policy.sandbox_read_paths(policy.loads('[gate]\ndeny_read = ["~", "~/**", "**/.ssh/**", "relative"]\n')) == []
-    )
+    toolkit = [r.removesuffix("/**") for r in policy.secret_read_rules()]  # added to every policy that is read
+    assert policy.sandbox_read_paths(sandbox_policy()) == ["~/.ssh", "~/.aws/credentials", "~/.gnupg", *toolkit]
+    left = policy.loads('[gate]\ndeny_read = ["~", "~/**", "**/.ssh/**", "relative"]\n')
+    assert policy.sandbox_read_paths(left) == toolkit
 
 
 def test_only_paths_that_exist_are_hidden_and_home_is_the_runners(home):
-    got = sandbox.hidden_paths(POLICY, {"HOME": str(home)})
+    got = sandbox.hidden_paths(sandbox_policy(), {"HOME": str(home)})
     assert got == [str(home.resolve() / ".ssh"), str(home.resolve() / ".aws" / "credentials")]  # no .gnupg here
 
 
@@ -134,7 +137,7 @@ def wrapped(home, wshome, **kw) -> sandbox.Wrapped:
     kw.setdefault("system", "linux")
     kw.setdefault("machine", "x86_64")
     return sandbox.wrap(
-        ["opencode", "run"], POLICY, wshome, [str(wshome / "policy.toml")], env={"HOME": str(home)}, **kw
+        ["opencode", "run"], sandbox_policy(), wshome, [str(wshome / "policy.toml")], env={"HOME": str(home)}, **kw
     )
 
 
@@ -191,7 +194,14 @@ def test_a_protected_path_behind_a_replaceable_symlink_is_refused(tmp_path, home
     assert sandbox.Plan(real).symlinked() is None
     with pytest.raises(sandbox.SandboxError, match="symbolic link") as e:
         sandbox.wrap(
-            ["x"], POLICY, link, [], system="linux", which=which("bwrap"), probe=lambda: True, machine="x86_64"
+            ["x"],
+            sandbox_policy(),
+            link,
+            [],
+            system="linux",
+            which=which("bwrap"),
+            probe=lambda: True,
+            machine="x86_64",
         )
     assert str(real) in str(e.value)
     # a link whose own folder the user cannot write cannot be replaced: left alone
@@ -233,7 +243,7 @@ def test_the_allow_list_is_project_tmp_and_the_policy_extras_not_the_runners_rea
 
 def test_a_runner_with_state_gets_private_xdg_folders_under_ws_home(tmp_path, home, wshome):
     env = {"HOME": str(home), "XDG_DATA_HOME": str(tmp_path / "data")}
-    got = sandbox.private_homes(wshome, "opencode", POLICY, env, str(tmp_path / "proj"))
+    got = sandbox.private_homes(wshome, "opencode", sandbox_policy(), env, str(tmp_path / "proj"))
     base = wshome.resolve() / "wall" / "opencode"
     key = sandbox.project_key(str(tmp_path / "proj"))
     assert key.startswith("proj-") and sandbox.project_key(str(tmp_path / "other")) != key
@@ -245,7 +255,7 @@ def test_a_runner_with_state_gets_private_xdg_folders_under_ws_home(tmp_path, ho
     assert all(os.path.isdir(p) for p in got.values()) and (wshome / "wall" / ".gitignore").read_text() == "*\n"
     assert (wshome / "wall").stat().st_mode & 0o077 == 0
     assert (
-        sandbox.private_homes(wshome, "claude-code", POLICY, env, str(tmp_path / "proj")) == {}
+        sandbox.private_homes(wshome, "claude-code", sandbox_policy(), env, str(tmp_path / "proj")) == {}
     )  # no wall_writable: nothing of its own
 
 
@@ -255,21 +265,21 @@ def test_the_sign_in_is_copied_in_each_start_removed_when_gone_and_not_when_hidd
     (real / "auth.json").write_text("one")
     env = {"HOME": str(home)}
     seeded = (
-        Path(sandbox.private_homes(wshome, "opencode", POLICY, env, str(tmp_path / "proj"))["XDG_DATA_HOME"])
+        Path(sandbox.private_homes(wshome, "opencode", sandbox_policy(), env, str(tmp_path / "proj"))["XDG_DATA_HOME"])
         / "opencode"
         / "auth.json"
     )
     assert seeded.read_text() == "one" and seeded.stat().st_mode & 0o777 == 0o600
     (real / "auth.json").write_text("two")
-    sandbox.private_homes(wshome, "opencode", POLICY, env, str(tmp_path / "proj"))
+    sandbox.private_homes(wshome, "opencode", sandbox_policy(), env, str(tmp_path / "proj"))
     assert seeded.read_text() == "two"
     hide = policy.loads('[gate]\ndeny_read = ["~/.local/share/opencode/**"]\n')
     sandbox.private_homes(wshome, "opencode", hide, env, str(tmp_path / "proj"))
     assert not seeded.exists()  # deny_read wins over the convenience
-    sandbox.private_homes(wshome, "opencode", POLICY, env, str(tmp_path / "proj"))
+    sandbox.private_homes(wshome, "opencode", sandbox_policy(), env, str(tmp_path / "proj"))
     assert seeded.exists()
     (real / "auth.json").unlink()
-    sandbox.private_homes(wshome, "opencode", POLICY, env, str(tmp_path / "proj"))
+    sandbox.private_homes(wshome, "opencode", sandbox_policy(), env, str(tmp_path / "proj"))
     assert not seeded.exists()
 
 
@@ -277,7 +287,7 @@ def test_the_private_folders_are_bound_after_ws_home_and_allowed_on_macos(tmp_pa
     (wshome / "policy.toml").write_text("")
     proj = tmp_path / "proj"
     proj.mkdir()
-    priv = sandbox.private_homes(wshome, "opencode", POLICY, {"HOME": str(home)}, str(tmp_path / "proj"))
+    priv = sandbox.private_homes(wshome, "opencode", sandbox_policy(), {"HOME": str(home)}, str(tmp_path / "proj"))
     text = " ".join(wrapped(home, wshome, writable=[str(proj)], homes=list(priv.values())).argv)
     ro, cache = f"--ro-bind {wshome.resolve()} {wshome.resolve()}", priv["XDG_CACHE_HOME"]
     assert text.index(ro) < text.index(f"--bind {cache} {cache}")
@@ -696,7 +706,8 @@ def claude_settings(tmp_path, toml: str = "") -> dict:
     return json.loads(files["settings.json"])
 
 
-def test_claude_code_settings_turn_the_sandbox_on_and_fail_closed(tmp_path):
+def test_claude_code_settings_turn_the_sandbox_on_and_fail_closed(tmp_path, monkeypatch):
+    monkeypatch.setenv("WS_HOME", str(tmp_path / "wshome"))
     s = claude_settings(tmp_path, '[gate]\ndeny_read = ["~/.ssh/**", "~/.aws/credentials", "~/x*/y"]\n')
     sb = s["sandbox"]
     assert sb["enabled"] is True and sb["failIfUnavailable"] is True and sb["allowUnsandboxedCommands"] is False
@@ -706,7 +717,7 @@ def test_claude_code_settings_turn_the_sandbox_on_and_fail_closed(tmp_path):
     assert deny[0] == wshome and str(tmp_path / "wshome" / "policy.toml") in deny
     assert str(tmp_path / "wshome" / "gate" / "claude-code") in deny
     assert all(str(tmp_path / "wshome" / n) in deny for n in policy.CONTROL_NAMES)
-    assert sb["filesystem"]["denyRead"] == ["~/.ssh", "~/.aws/credentials"]
+    assert sb["filesystem"]["denyRead"] == ["~/.ssh", "~/.aws/credentials", str(tmp_path / "wshome" / "secrets")]
     assert "network" not in sb  # the policy names no hosts: it says nothing about the network
     assert s["env"] == {"WS_GATED_SESSION": "1", "WS_SANDBOXED": "1"}
 

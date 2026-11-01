@@ -1,6 +1,7 @@
 """syntax-check: after a session writes a file, check that it parses and tell the model the line that does not. Python
 (`compile`), JSON and TOML are read in process; `.sh` and `.bash` go through `sh -n` or `bash -n` (a note when the
-machine has no such shell). `extra` maps any other extension to a checker, with the file path added as its last
+machine has no such shell); `.js`, `.mjs` and `.cjs` go through `node --check` (a note when node isn't installed).
+`extra` maps any other extension to a checker, with the file path added as its last
 argument and 10 seconds to answer: `extra = { yaml = ["yamllint", "-d", "relaxed"] }`.
 
 It runs after the write, so a finding is a message to the model: the runner shows it the text.
@@ -24,6 +25,7 @@ EVENTS = ("post",)
 KINDS = ("write",)
 
 TIMEOUT_S = 10
+JS_CHECKER = ("node", "--check")  # for .js, .mjs and .cjs; the file path is added last
 _EXT = re.compile(r"^[a-z0-9]+$")
 _MAX_FILE = 4 * 1024 * 1024
 _MAX_REPORT = 600
@@ -138,6 +140,8 @@ def judge(call, cfg: Config, ctx) -> Finding | None:
         if shutil.which(shell) is None and shutil.which("bash") is not None:
             shell = "bash"
         problem, note = _run([shell, "-n"], path)
+    elif ext in ("js", "mjs", "cjs"):
+        problem, note = _run(list(JS_CHECKER), path)
     else:
         return None
     if problem:

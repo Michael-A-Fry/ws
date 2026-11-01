@@ -108,6 +108,7 @@ display:grid;place-content:center;color:transparent}
 .plug:has(input:checked) .ico{background:var(--accent);color:var(--on-accent)}
 .plug:has(input:checked) .chk{background:var(--accent);border-color:var(--accent);color:var(--on-accent)}
 .plug:has(input:focus-visible){outline:2px solid var(--accent);outline-offset:2px}
+/* .plug.na is a disabled option, so WCAG exempts its reduced contrast */
 .plug.na{opacity:.55;cursor:not-allowed}.plug.na:hover{background:var(--panel);border-color:var(--line)}
 .rail{display:flex;flex-direction:column;gap:10px;position:sticky;top:20px}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:12px}

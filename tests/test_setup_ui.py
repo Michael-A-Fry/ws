@@ -388,6 +388,7 @@ def test_a_terminal_that_can_redraw_does(box, monkeypatch):
     ("env", "flag", "colour"),
     [
         ({}, False, True),
+        ({"COLORFGBG": "0;15"}, False, True),
         ({"NO_COLOR": "1"}, False, False),
         ({"NO_COLOR": ""}, False, True),  # an empty NO_COLOR is not a request
         ({}, True, False),  # --no-color

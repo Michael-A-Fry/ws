@@ -13,7 +13,7 @@ from ws.brand import BASIC, FULL, OFF, PAIRS, TOKENS, Ansi, color_mode, contrast
 
 SRC = Path(brand.__file__).parent
 SURFACES = {"bg", "panel", "raise", "line"}  # backgrounds and a hairline: never a foreground that carries meaning
-HEX = re.compile(r"#[0-9a-fA-F]{6}(?:[0-9a-fA-F]{2})?\b")
+COLOUR_LITERAL = re.compile(r"#[0-9a-fA-F]{3,8}\b|\b(?:rgb|hsl)a?\(")
 
 
 # ---- contrast -------------------------------------------------------------------------------------------------------
@@ -29,8 +29,7 @@ def test_contrast_matches_the_wcag_definition():
 @pytest.mark.parametrize("theme", ["dark", "light"])
 @pytest.mark.parametrize(("fg", "bg", "kind"), PAIRS, ids=[f"{f}-on-{b}-{k}" for f, b, k in PAIRS])
 def test_every_declared_pair_reaches_its_ratio(theme, fg, bg, kind):
-    pick = (lambda t: t.dark) if theme == "dark" else (lambda t: t.light)
-    ratio = contrast(pick(token(fg)), pick(token(bg)))
+    ratio = contrast(brand.colour(fg, theme), brand.colour(bg, theme))
     assert ratio >= brand.KIND_MIN[kind], f"{theme}: {fg} on {bg} is {ratio:.2f}, a {kind} needs {brand.KIND_MIN[kind]}"
 
 
@@ -53,6 +52,20 @@ def test_the_basic_terminal_grey_holds_4_5_on_black_and_white():
     assert contrast(grey, "#000000") >= 4.5 and contrast(grey, "#ffffff") >= 4.5
 
 
+def test_on_a_light_terminal_the_mark_and_rule_hold_3_to_1_and_violet_text_4_5_on_white():
+    light = Ansi(BASIC)
+    for role in {*brand.GRADIENT_ROLES, *brand.RAMP_ROLES, *brand.SMALL_ROLES}:
+        assert contrast(xterm_hex(light.number(role)), "#ffffff") >= 3, role
+    assert contrast(xterm_hex(light.number("accent")), "#ffffff") >= 4.5  # the keys in a hint line
+    used = {
+        int(n) for n in re.findall(r"38;5;(\d+)", "".join([*light.logo(), *light.logo(small=True), light.rule(40)]))
+    }
+    assert used == {light.number(r) for r in (*brand.GRADIENT_ROLES, *brand.RAMP_ROLES, *brand.SMALL_ROLES)}
+    assert "38;5;99" not in light.violet("k", bold=True) and "38;5;57" in light.violet("k", bold=True)
+    dark = Ansi(FULL)  # the dark terminal keeps the brand numbers
+    assert [dark.number(r) for r in brand.GRADIENT_ROLES] == list(brand.GRADIENT)
+
+
 # ---- one source ----------------------------------------------------------------------------------------------------
 
 
@@ -68,6 +81,7 @@ def test_tokens_are_well_formed_and_named_once():
     for t in TOKENS:
         assert re.fullmatch(r"#[0-9a-f]{6}", t.dark) and re.fullmatch(r"#[0-9a-f]{6}", t.light), t.name
         assert t.xterm is None or 0 <= t.xterm <= 255
+        assert t.xterm_light is None or t.xterm is not None
     for role in (*brand.GRADIENT_ROLES, *brand.RAMP_ROLES, *brand.SMALL_ROLES):
         assert token(role).xterm is not None
 
@@ -97,20 +111,28 @@ def test_tokens_json_is_dtcg_shaped_and_round_trips():
 
 # ---- no colour literal outside brand.py -----------------------------------------------------------------------------
 
-# A file that may hold a #rrggbb, and why. Empty on purpose: every colour belongs in brand.py.
-HEX_ALLOWED: dict[str, str] = {}
+# A file that may hold a colour literal, and why. Empty on purpose: every colour belongs in brand.py.
+LITERAL_ALLOWED: dict[str, str] = {}
 
 
-def test_no_hex_colour_in_src_outside_brand_py():
+def test_no_colour_literal_in_src_outside_brand_py():
+    """No #rgb to #rrggbbaa, rgb()/rgba()/hsl()/hsla() in a .py (and any .css, .js or .html) under src/ws."""
     found = []
-    for path in sorted(SRC.rglob("*.py")):
+    for path in sorted(p for p in SRC.rglob("*") if p.suffix in (".py", ".css", ".js", ".html")):
         rel = path.relative_to(SRC).as_posix()
-        if rel == "brand.py" or rel in HEX_ALLOWED:
+        if rel == "brand.py" or rel in LITERAL_ALLOWED:
             continue
         for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-            if HEX.search(line):
+            if COLOUR_LITERAL.search(line):
                 found.append(f"{rel}:{n}: {line.strip()[:70]}")
     assert not found, "a colour literal belongs in ws/brand.py:\n" + "\n".join(found)
+
+
+def test_the_scan_sees_the_literals_it_is_looking_for():
+    for text in ("#fff", "#FFFF", "#00ffaf", "#00ffaf80", "rgba(1,2,3,.5)", "hsl(1 2% 3%)", "color: hsla(0,0%,0%,1)"):
+        assert COLOUR_LITERAL.search(text), text
+    for text in ("issue #1", "#boot", "rgb_value", "issue #12"):
+        assert not COLOUR_LITERAL.search(text), text
 
 
 # ---- when colour is on ----------------------------------------------------------------------------------------------
@@ -122,26 +144,32 @@ LIGHT = {"COLORFGBG": "0;15"}
 @pytest.mark.parametrize(
     ("env", "tty", "flag", "want"),
     [
-        ({}, True, False, BASIC),  # a terminal that doesn't say it is dark: the terminal's own colours
+        ({}, True, False, FULL),  # a terminal that doesn't say: the brand palette (most are dark)
         (DARK, True, False, FULL),
         ({"COLORFGBG": "15;default;0"}, True, False, FULL),
-        (LIGHT, True, False, BASIC),
-        ({"COLORFGBG": "junk"}, True, False, BASIC),
+        (LIGHT, True, False, BASIC),  # only a light background says basic
+        ({"COLORFGBG": "0;7"}, True, False, BASIC),
+        ({"COLORFGBG": "junk"}, True, False, FULL),
         ({}, False, False, OFF),  # a pipe
         ({"TERM": "dumb"}, True, False, OFF),
-        ({"TERM": "xterm-256color"}, True, False, BASIC),
+        ({"TERM": "xterm-256color"}, True, False, FULL),
         # NO_COLOR: only a non-empty value turns colour off
         ({"NO_COLOR": "1"}, True, False, OFF),
         ({"NO_COLOR": "0"}, True, False, OFF),
-        ({"NO_COLOR": ""}, True, False, BASIC),
-        ({"NO_COLOR": "", **DARK}, True, False, FULL),
+        ({"NO_COLOR": ""}, True, False, FULL),
+        ({"NO_COLOR": "", **LIGHT}, True, False, BASIC),
         # --no-color beats everything
         ({}, True, True, OFF),
         ({"FORCE_COLOR": "1"}, True, True, OFF),
         # FORCE_COLOR: colour for a pipe or a dumb terminal; "0" and empty are no request; NO_COLOR wins
-        ({"FORCE_COLOR": "1"}, False, False, BASIC),
+        ({"FORCE_COLOR": "1"}, False, False, FULL),
+        ({"FORCE_COLOR": "1", **LIGHT}, False, False, BASIC),
+        ({"FORCE_COLOR": "true"}, False, False, FULL),
         ({"FORCE_COLOR": "1", **DARK}, False, False, FULL),
-        ({"FORCE_COLOR": "1", "TERM": "dumb"}, True, False, BASIC),
+        ({"FORCE_COLOR": "1", "TERM": "dumb"}, True, False, FULL),
+        ({"FORCE_COLOR": "false"}, False, False, OFF),
+        ({"FORCE_COLOR": "False"}, False, False, OFF),
+        ({"FORCE_COLOR": "FALSE", "TERM": "dumb"}, True, False, OFF),
         ({"FORCE_COLOR": "0"}, False, False, OFF),
         ({"FORCE_COLOR": ""}, False, False, OFF),
         ({"FORCE_COLOR": "1", "NO_COLOR": "1"}, True, False, OFF),
@@ -172,8 +200,8 @@ def test_status_roles_follow_the_mode_and_the_mark_never_does():
     assert full.mint("x") == "\x1b[38;5;49mx\x1b[0m" and basic.mint("x") == "\x1b[32mx\x1b[0m"
     assert full.amber("x") == "\x1b[38;5;214mx\x1b[0m" and basic.amber("x", bold=True) == "\x1b[1;33mx\x1b[0m"
     assert full.error("x") == "\x1b[38;5;203mx\x1b[0m" and basic.error("x") == "\x1b[31mx\x1b[0m"
-    assert basic.violet("x") == full.violet("x") == "\x1b[38;5;99mx\x1b[0m"
-    assert basic.logo() == full.logo() and basic.rule(20) == full.rule(20)
+    assert full.violet("x") == "\x1b[38;5;99mx\x1b[0m" and basic.violet("x") == "\x1b[38;5;57mx\x1b[0m"
+    assert basic.logo() != full.logo() and basic.rule(20) != full.rule(20)  # darker numbers on a light background
     assert off.mint("x") == off.violet("x") == off.dim("x") == "x" and off.rule(3) == "━━━"
     assert Ansi(True).mode == FULL and Ansi(False).mode == OFF
 

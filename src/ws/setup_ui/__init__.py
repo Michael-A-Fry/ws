@@ -22,9 +22,10 @@ Visual kit (the rules the terminal walk and the page both follow; the colours ar
   Plugins are chosen, Review says what will be written, Install ticks the work off group by group.
 - Hint line: the last line of anything that waits for a key, `key text` pairs in a row, the key in violet.
 - Colour: off with a non-empty `NO_COLOR`, with `--no-color`, for output that isn't a terminal and for `TERM=dumb`
-  (a non-empty `FORCE_COLOR` other than `0` turns it back on; `NO_COLOR` wins). Where the terminal's background isn't
-  known to be dark (`COLORFGBG`), mint, amber, red and grey use the terminal's own basic colours so its theme can
-  re-colour them; violet and the mark stay 256-colour.
+  (a `FORCE_COLOR` that isn't empty, `0` or `false` turns it back on; `NO_COLOR` wins). The brand palette in 256
+  colours is the default, for the mark, the rule and the status roles. Only when `COLORFGBG` says the background is
+  light does it change: the mark, the rule and the violet use darker numbers that hold their contrast on white, and
+  mint, amber, red and grey use the terminal's own basic colours so its theme can re-colour them.
 - Fallbacks: with colour off the same words print with no colour code; a `TERM` of `dumb` prints each step once, with
   no cursor-move or erase code; with `--yes` nothing is asked and nothing redraws; under 80 columns the mark folds; a
   resize is picked up on the next draw.

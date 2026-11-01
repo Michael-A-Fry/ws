@@ -9,10 +9,12 @@ it has to reach (text 4.5, shapes and borders 3, by `contrast`); a test checks e
 caught where it is set.
 
 The terminal rule is `color_mode(env, isatty, no_color=...)`: off for a non-empty `NO_COLOR` or `--no-color`, off for a
-pipe or `TERM=dumb`, forced on by a non-empty `FORCE_COLOR` other than `0` (`NO_COLOR` wins), and otherwise "full"
-(256-colour status roles) only when `COLORFGBG` says the background is dark. When it can't tell, the status roles use
-the terminal's own green, yellow and red, which its theme re-colours; the mark and the violet stay 256-colour in every
-mode. `can_redraw` says whether cursor-move and erase codes are safe (a terminal that is not `TERM=dumb`).
+pipe or `TERM=dumb`, forced on by a `FORCE_COLOR` that is not empty, `0` or `false` (`NO_COLOR` wins), and otherwise
+the full brand palette in 256 colours (mark, rule and status roles). Only when `COLORFGBG` says the background is
+light does it drop to "basic": the mark and rule take darker 256-colour numbers that hold 3:1 on white, violet text
+holds 4.5:1, and mint, amber, red and grey use the terminal's own colours so its theme can re-colour them. A
+terminal that doesn't say (most dark ones over ssh) gets the full palette. `can_redraw` says whether cursor-move and
+erase codes are safe (a terminal that is not `TERM=dumb`).
 """
 
 from __future__ import annotations
@@ -43,6 +45,7 @@ __all__ = [
     "Token",
     "can_redraw",
     "color_mode",
+    "colour",
     "contrast",
     "css",
     "dark_background",
@@ -58,8 +61,9 @@ __all__ = [
 
 @dataclass(frozen=True)
 class Token:
-    """One colour role. `xterm` is the 256-colour number a terminal uses (None where only the page uses it); `basic` is
-    the SGR foreground parameter used when the background is not known to be dark (None keeps the 256-colour number)."""
+    """One colour role. `xterm` is the 256-colour number a terminal uses (None where only the page uses it). On a
+    background known to be light: `basic` is the SGR foreground parameter for a status role, `xterm_light` a darker
+    256-colour number for the mark and for violet text; with neither, the role keeps `xterm`."""
 
     name: str
     dark: str
@@ -67,6 +71,7 @@ class Token:
     xterm: int | None
     basic: str | None
     use: str
+    xterm_light: int | None = None
 
 
 TOKENS: tuple[Token, ...] = (
@@ -77,12 +82,12 @@ TOKENS: tuple[Token, ...] = (
     Token("line2", "#6b7180", "#85857f", 245, None, "a control border, a card border, an empty meter cell"),
     Token("text", "#e8e9ec", "#1b1c1f", None, None, "body text"),
     Token("muted", "#92959d", "#62656c", 245, "38;5;243", "quiet text"),
-    Token("accent", "#875fff", "#6a3fe0", 99, None, "violet: chosen, current, a filled control"),
+    Token("accent", "#875fff", "#6a3fe0", 99, None, "violet: chosen, current, a filled control", 57),
     Token("accent-text", "#a284ff", "#6a3fe0", 99, None, "violet used as text on a panel"),
     Token("on-accent", "#121316", "#ffffff", None, None, "text or an icon on an accent fill"),
-    Token("indigo", "#5f5fff", "#4a4fc8", 63, None, "the mark and the rule, between violet and teal"),
-    Token("teal", "#00d7af", "#0b7f86", 43, None, "the mark and the rule, between indigo and mint"),
-    Token("ok", "#00ffaf", "#087a60", 49, "32", "mint: done, added, found"),
+    Token("indigo", "#5f5fff", "#4a4fc8", 63, None, "the mark and the rule, between violet and teal", 62),
+    Token("teal", "#00d7af", "#0b7f86", 43, None, "the mark and the rule, between indigo and mint", 30),
+    Token("ok", "#00ffaf", "#087a60", 49, "32", "mint: done, added, found", 29),
     Token("warn", "#ffaf00", "#8f5800", 214, "33", "amber: needs a look, a file that changed"),
     Token("error", "#ff5f5f", "#b42318", 203, "31", "red: a refusal"),
 )
@@ -127,6 +132,9 @@ PAIRS: tuple[tuple[str, str, str], ...] = (
     *(("accent", bg, "shape") for bg in ("bg", "panel", "raise")),
     *((fg, "bg", "shape") for fg in ("indigo", "teal", "ok")),
     ("error", "panel", "border"),
+    # the tint of a chosen card (the accent at low alpha over a panel)
+    *((fg, "tint", "text") for fg in ("text", "muted", "ok", "warn")),
+    ("line2", "tint", "border"),
 )
 
 
@@ -152,6 +160,17 @@ def contrast(fg: str, bg: str) -> float:
     """The WCAG contrast ratio of two `#rrggbb` colours, 1 to 21."""
     hi, lo = sorted((luminance(fg), luminance(bg)), reverse=True)
     return (hi + 0.05) / (lo + 0.05)
+
+
+def colour(name: str, theme: str) -> str:
+    """The `#rrggbb` of a role in a theme. `tint` is the accent at its alpha laid over `panel`, as the page draws it."""
+    dark = theme == "dark"
+    if name == "tint":
+        alpha = next(a_dark if dark else a_light for n, a_dark, a_light in DERIVED if n == name)
+        top, under = _channels(colour("accent", theme)), _channels(colour("panel", theme))
+        return "#" + "".join(f"{round(t * alpha + u * (1 - alpha)):02x}" for t, u in zip(top, under, strict=True))
+    t = _BY_NAME[name]
+    return t.dark if dark else t.light
 
 
 # ---- the page: CSS and a data form --------------------------------------------------------------------------------
@@ -209,17 +228,17 @@ def dark_background(env: Mapping[str, str]) -> bool | None:
 
 
 def color_mode(env: Mapping[str, str], isatty: bool, *, no_color: bool = False) -> str:
-    """`OFF`, `BASIC` (status roles in the terminal's own colours) or `FULL` (256-colour status roles).
+    """`OFF`, `FULL` (the brand palette in 256 colours) or `BASIC` (only when `COLORFGBG` says the background is light).
 
-    `--no-color` and a non-empty `NO_COLOR` win; then a non-empty `FORCE_COLOR` other than `0` turns colour on even for
-    a pipe or `TERM=dumb`; otherwise colour needs a terminal that isn't `TERM=dumb`.
+    `--no-color` and a non-empty `NO_COLOR` win; then a `FORCE_COLOR` that isn't empty, `0` or `false` (any case) turns
+    colour on even for a pipe or `TERM=dumb`; otherwise colour needs a terminal that isn't `TERM=dumb`.
     """
     if no_color or env.get("NO_COLOR"):
         return OFF
-    force = env.get("FORCE_COLOR", "")
-    if not (force and force != "0") and (not isatty or env.get("TERM") == "dumb"):
+    force = env.get("FORCE_COLOR", "").lower() not in ("", "0", "false")
+    if not force and (not isatty or env.get("TERM") == "dumb"):
         return OFF
-    return FULL if dark_background(env) else BASIC
+    return BASIC if dark_background(env) is False else FULL
 
 
 def can_redraw(env: Mapping[str, str], isatty: bool) -> bool:
@@ -260,8 +279,8 @@ LOGO_SMALL_WIDTH = max(len(row) for row in LOGO_SMALL)
 class Ansi:
     """Colour helpers that turn into plain text when colour is off (`OFF`, or `False`).
 
-    `Ansi(True)` is `FULL`. The status roles (`mint`, `amber`, `error`, `dim`) follow the mode; the violet, the rule and
-    the mark are 256-colour in every mode that has colour.
+    `Ansi(True)` is `FULL`. In `BASIC` (a light background) the status roles use the terminal's own colours, and the
+    violet, the rule and the mark use darker 256-colour numbers; in `FULL` all of them are the brand numbers.
     """
 
     def __init__(self, color: bool | str = True) -> None:
@@ -274,9 +293,16 @@ class Ansi:
     def fg(self, n: int, text: str, bold: bool = False) -> str:
         return self.sgr(f"{'1;' if bold else ''}38;5;{n}", text)
 
+    def number(self, name: str) -> int:
+        """The 256-colour number of a role in this mode (the mark and the rule use this)."""
+        t = _BY_NAME[name]
+        n = t.xterm_light if self.mode == BASIC and t.xterm_light is not None else t.xterm
+        assert n is not None
+        return n
+
     def role(self, name: str, text: str, bold: bool = False) -> str:
         t = _BY_NAME[name]
-        code = t.basic if self.mode == BASIC and t.basic else f"38;5;{t.xterm}"
+        code = t.basic if self.mode == BASIC and t.basic else f"38;5;{self.number(name)}"
         return self.sgr(f"{'1;' if bold else ''}{code}", text)
 
     def bold(self, text: str) -> str:
@@ -302,7 +328,7 @@ class Ansi:
 
     def rule(self, width: int) -> str:
         """A thin line that runs violet to mint across `width` columns."""
-        return "".join(self.fg(RAMP[i * len(RAMP) // width], "━") for i in range(width))
+        return "".join(self.fg(self.number(RAMP_ROLES[i * len(RAMP_ROLES) // width]), "━") for i in range(width))
 
     def track(self, done: int, total: int, width: int = 24) -> str:
         """A continuous progress track: violet where done, a dark line for the rest."""
@@ -311,10 +337,12 @@ class Ansi:
 
     def logo(self, cols: int | None = None, small: bool = False) -> list[str]:
         """The mark, one colour per row. `cols` shows only the left part (for the sweep-in)."""
-        rows, width, colours = (LOGO_SMALL, LOGO_SMALL_WIDTH, SMALL_COLOURS) if small else (LOGO, LOGO_WIDTH, GRADIENT)
+        rows, width, roles = (
+            (LOGO_SMALL, LOGO_SMALL_WIDTH, SMALL_ROLES) if small else (LOGO, LOGO_WIDTH, GRADIENT_ROLES)
+        )
         out = []
         for i, row in enumerate(rows):
             row = row.ljust(width)
             row = row if cols is None else row[:cols].ljust(width)
-            out.append(self.fg(colours[i], row, bold=True))
+            out.append(self.fg(self.number(roles[i]), row, bold=True))
         return out

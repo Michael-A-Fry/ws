@@ -81,13 +81,13 @@ on standard error and exit code 0. The deny path is `ws gate check`, which fails
 
 ## What `ws gate generate` writes for Claude Code
 
-The settings carry a hook for an event only when a guard that is on runs there:
+The settings carry a hook for an event only when a guard that's on runs there:
 
 | Hook | Added when |
 |---|---|
-| `PreToolUse` matcher gains `Agent\|Task`, `Skill` and `SendMessage` | A guard that is on reads agent, skill or message calls before a call. The matcher always has the shell, file, search and web tools. |
-| `PostToolUse` running `ws gate event` | A guard that is on runs after a call. The matcher lists the tools for the kinds those guards read. |
-| `SessionStart`, `UserPromptSubmit`, `Stop`, `SubagentStop` running `ws gate event` | A guard that is on runs at that event. |
+| `PreToolUse` matcher gains `Agent\|Task`, `Skill` and `SendMessage` | A guard that's on reads agent, skill or message calls before a call. The matcher always has the shell, file, search and web tools. |
+| `PostToolUse` running `ws gate event` | A guard that's on runs after a call. The matcher lists the tools for the kinds those guards read. |
+| `SessionStart`, `UserPromptSubmit`, `Stop`, `SubagentStop` running `ws gate event` | A guard that's on runs at that event. |
 
 The `PreToolUse` hook ends `|| exit 2`, so a missing or crashing ws blocks the call. The `PostToolUse` hook has no
 `|| exit`: `ws gate event` exits 2 on purpose after a tool call, and Claude Code shows that message to the model. Every
@@ -99,7 +99,7 @@ The settings `env` carries `WS_GATED_SESSION=1` and `WS_SANDBOXED=1`. The hook c
 `WS_SANDBOXED=0`, the marker of settings written without ws's `sandbox` block. Settings generated before the marker
 existed have the block and no marker, so the check runs for them.
 
-OpenCode's adapter lists the guard names it doesn't run yet in `UNSUPPORTED_GUARDS`; that is every guard for now.
+OpenCode's adapter lists the guard names it doesn't run yet in `UNSUPPORTED_GUARDS`; that's every guard for now.
 
 ## Replay
 

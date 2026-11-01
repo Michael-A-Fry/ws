@@ -2,7 +2,7 @@
 
 Precedence, first match wins: a built-in command; `ws-<word>` on PATH (a word is `[a-z][a-z0-9-]{0,40}`); the
 profile's `[cli] fallback`; the usual usage error with "did you mean". An external gets the arguments after its word,
-`WS_OUTPUT=json` when `--json` was given, and `-C PATH` as its working folder (the way git runs `git-<word>`). The
+`--json` (before any `--`) and `WS_OUTPUT=json` when `--json` was given, and `-C PATH` as its working folder (the way git runs `git-<word>`). The
 fallback gets the whole original argument list, leading flags and the empty list (a bare `ws`) included, and runs with
 `WS_FALLBACK=1`; a run that already has it set is not handed on again. The fallback is an absolute path (or `~/...`) to a
 file that is yours, executable and closed to other writers, the same test a job file passes, in a folder that other
@@ -177,9 +177,12 @@ def plan(
         found = find_external(first, env)
         if found:
             child = dict(env)
+            args = rest[1:]
             if g.json:
                 child["WS_OUTPUT"] = "json"
-            return Launch(found, rest[1:], child)
+                cut = args.index("--") if "--" in args else len(args)
+                args = [*args[:cut], "--json", *args[cut:]]  # passed on as well: most programs read the flag
+            return Launch(found, args, child)
     elif first is not None and first.split("=")[0] in flags:
         return None
     try:

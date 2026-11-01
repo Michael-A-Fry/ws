@@ -81,13 +81,20 @@ def test_an_external_gets_the_arguments_after_its_word(box, started):
     assert spec.env.get("WS_OUTPUT") is None and extcmd.FALLBACK_ENV not in spec.env
 
 
+def test_json_goes_before_a_bare_double_dash(box, started):
+    script(box / "bin" / "ws-hello")
+    assert cli.main(["hello", "--json", "a", "--", "b"]) == 0
+    ((spec, _cwd),) = started
+    assert spec.argv == ["a", "--json", "--", "b"]
+
+
 def test_json_becomes_an_environment_variable_and_c_becomes_the_folder(box, started):
     script(box / "bin" / "ws-hello")
     work = box / "work"
     work.mkdir()
     assert cli.main(["--json", "hello", "-C", str(work), "x"]) == 0
     ((spec, cwd),) = started
-    assert spec.argv == ["x"] and spec.env["WS_OUTPUT"] == "json"
+    assert spec.argv == ["x", "--json"] and spec.env["WS_OUTPUT"] == "json"
     assert Path(cwd) == work.resolve()
 
 
@@ -436,7 +443,9 @@ def test_an_external_runs_with_its_exit_code_json_variable_and_folder(box):
     work.mkdir()
     r = ws(box, "--json", "-C", str(work), "where", "a", "b")
     out = r.stdout.splitlines()
-    assert r.returncode == 7 and out[0] == "out=json" and Path(out[1]).resolve() == work.resolve() and out[2] == "n=2"
+    assert (
+        r.returncode == 7 and out[0] == "out=json" and Path(out[1]).resolve() == work.resolve() and out[2] == "n=3"
+    )  # a, b and the passed-on --json
 
 
 @posix_only

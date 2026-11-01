@@ -607,6 +607,22 @@ def test_a_silent_connection_is_dropped_at_the_deadline(base, stub, monkeypatch)
         e.broker.stop()
 
 
+def test_serve_socket_comes_from_the_flag_then_env_then_profile_then_home(base):
+    home = base / "home"
+    home.mkdir()
+    (home / "secrets.toml").write_text("", encoding="utf-8")
+    envv = {"WS_HOME": str(home)}
+
+    def where(flag=None, **extra):
+        return broker.Broker.from_env(flag, None, 0, 60.0, env={**envv, **extra}).socket_path
+
+    assert where() == home / "run" / "broker.sock"
+    (home / "profile.toml").write_text(f'[roles.secrets]\nsocket = "{base / "p.sock"}"\n', encoding="utf-8")
+    assert where() == base / "p.sock"
+    assert where(WS_BROKER_SOCKET=str(base / "e.sock")) == base / "e.sock"
+    assert where(str(base / "f.sock"), WS_BROKER_SOCKET=str(base / "e.sock")) == base / "f.sock"
+
+
 def test_cli_round_trip_through_real_processes(base, stub):
     """ws secret set -> ws broker serve -> ws broker request -> a call through the proxy. The command line cannot be
     told to use plain http, so the call is refused: the stub must see nothing. (Injection is tested above, in process,

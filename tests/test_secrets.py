@@ -204,6 +204,103 @@ def test_store_path_comes_from_the_profile(home, tmp_path, capsys, monkeypatch):
     assert code == 0 and (elsewhere / "anthropic").is_file()
 
 
+def envfile(tmp_path: Path, text: str) -> Path:
+    f = tmp_path / "carry.env"
+    f.write_text(text, encoding="utf-8")
+    return f
+
+
+def test_import_stores_the_raw_value_from_an_env_file(home, tmp_path, capsys):
+    registry(home, GOOD)
+    src = envfile(tmp_path, f"# from ws-secret\nANTHROPIC_API_KEY={VALUE}\n")
+    code, out, err = run(capsys, "secret", "import", "anthropic", "--from-env", str(src))
+    assert code == 0 and VALUE not in out + err and src.exists()
+    store = wsecrets.Store(home / "secrets")
+    assert store.read("anthropic") == VALUE
+    assert stat.S_IMODE((home / "secrets" / "anthropic").stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize("quote", ['"', "'"])
+def test_import_strips_one_pair_of_surrounding_quotes(home, tmp_path, capsys, quote):
+    registry(home, GOOD)
+    src = envfile(tmp_path, f"export KEY = {quote}{VALUE}{quote}\r\n")
+    code, out, err = run(capsys, "secret", "import", "anthropic", "--from-env", str(src), "--json")
+    assert code == 0 and VALUE not in out + err
+    assert wsecrets.Store(home / "secrets").read("anthropic") == VALUE
+
+
+@pytest.mark.parametrize("line", ["KEY={v} # pasted on Monday", 'KEY="{v}"  # quoted', "KEY={v}\t#tab"])
+def test_import_drops_a_trailing_comment(home, tmp_path, capsys, line):
+    registry(home, GOOD)
+    src = envfile(tmp_path, line.format(v=VALUE) + "\n")
+    code, out, err = run(capsys, "secret", "import", "anthropic", "--from-env", str(src))
+    assert code == 0 and VALUE not in out + err
+    assert wsecrets.Store(home / "secrets").read("anthropic") == VALUE
+
+
+def test_import_refuses_text_after_a_closing_quote(home, tmp_path, capsys):
+    registry(home, GOOD)
+    src = envfile(tmp_path, f'KEY="{VALUE}"extra\n')
+    code, out, err = run(capsys, "secret", "import", "anthropic", "--from-env", str(src))
+    assert code != 0 and VALUE not in out + err and "line 1" in out + err
+
+
+def test_import_with_several_lines_needs_var(home, tmp_path, capsys):
+    registry(home, GOOD)
+    other = "other-" + os.urandom(8).hex()
+    src = envfile(tmp_path, f"A={other}\nB={VALUE}\n")
+    code, out, err = run(capsys, "secret", "import", "anthropic", "--from-env", str(src))
+    assert code == 1 and "--var" in err and VALUE not in out + err and other not in out + err
+    assert wsecrets.Store(home / "secrets").names() == []
+    code, out, err = run(capsys, "secret", "import", "anthropic", "--from-env", str(src), "--var", "B")
+    assert code == 0 and VALUE not in out + err and other not in out + err
+    assert wsecrets.Store(home / "secrets").read("anthropic") == VALUE
+    code, out, err = run(capsys, "secret", "import", "github", "--from-env", str(src), "--var", "C")
+    assert code == 1 and "no C line" in err and VALUE not in out + err
+
+
+def test_import_refuses_an_unregistered_name_and_keeps_the_file(home, tmp_path, capsys):
+    registry(home, GOOD)
+    src = envfile(tmp_path, f"K={VALUE}\n")
+    code, out, err = run(capsys, "secret", "import", "nothere", "--from-env", str(src), "--delete-source")
+    assert code == 2 and "not in" in err and VALUE not in out + err
+    assert src.exists()
+
+
+def test_import_errors_name_the_file_and_line_never_the_value(home, tmp_path, capsys):
+    registry(home, GOOD)
+    bad = envfile(tmp_path, f"K={VALUE}\nthis is {VALUE} not an assignment\n")
+    code, out, err = run(capsys, "secret", "import", "anthropic", "--from-env", str(bad))
+    assert code == 1 and "carry.env" in err and "line 2" in err and VALUE not in out + err
+    ctl = envfile(tmp_path, f"K={VALUE}\x07\n")  # a control character the store refuses
+    code, out, err = run(capsys, "secret", "import", "anthropic", "--from-env", str(ctl))
+    assert code == 1 and "control character" in err and VALUE not in out + err
+    empty = envfile(tmp_path, "\n# nothing\nK=\n")
+    code, out, err = run(capsys, "secret", "import", "anthropic", "--from-env", str(empty))
+    assert code == 1 and "empty" in err
+    code, out, err = run(capsys, "secret", "import", "anthropic", "--from-env", str(tmp_path / "gone.env"))
+    assert code == 1 and "gone.env" in err
+    assert wsecrets.Store(home / "secrets").names() == []
+
+
+def test_import_delete_source_removes_the_file_only_after_a_good_write(home, tmp_path, capsys, monkeypatch):
+    registry(home, GOOD)
+    src = envfile(tmp_path, f"K={VALUE}\n")
+
+    def deny(self, name, value):
+        raise PermissionError
+
+    monkeypatch.setattr(wsecrets.Store, "write", deny)
+    code, out, err = run(capsys, "secret", "import", "anthropic", "--from-env", str(src), "--delete-source")
+    assert code == 1 and "another user" in err and VALUE not in out + err
+    assert src.exists()
+    monkeypatch.undo()
+    monkeypatch.setenv("WS_HOME", str(home))
+    code, out, err = run(capsys, "secret", "import", "anthropic", "--from-env", str(src), "--delete-source")
+    assert code == 0 and VALUE not in out + err
+    assert not src.exists() and wsecrets.Store(home / "secrets").read("anthropic") == VALUE
+
+
 def test_list_says_when_the_store_belongs_to_someone_else(home, capsys, monkeypatch):
     registry(home, GOOD)
 

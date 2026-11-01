@@ -38,6 +38,7 @@ CASES: dict[str, list[str]] = {
     "secret.set": ["secret", "set", "nope"],
     "secret.list": ["secret", "list"],
     "secret.rm": ["secret", "rm", "nope"],
+    "secret.import": ["secret", "import", "nope", "--from-env", "missing.env"],
     "secret.wall": ["secret", "wall"],
     "broker.request": ["broker", "request", "x", "--purpose", "p", "--host", "h", "--socket", "{home}/none.sock"],
     "broker.status": ["broker", "status", "--socket", "{home}/none.sock"],

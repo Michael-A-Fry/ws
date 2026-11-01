@@ -96,7 +96,8 @@ def check(
     if not isinstance(payload, dict):
         raise TypeError("payload is not a JSON object")
     adapter = adapters.get(runner)
-    # A runner that has the sandbox block (WS_SANDBOXED) is checked for a project that widens it; see the adapter.
+    # A session with the sandbox block is checked for a project that widens it (WS_SANDBOXED=0 marks settings
+    # written without it); see the adapter.
     preflight = getattr(adapter, "preflight", None)
     if preflight and (why := preflight(payload)):
         return why
@@ -114,7 +115,7 @@ def check(
         elif not found.approvable:
             return reason
         elif approval_root is None:
-            return Ask(f"{reason}; a person can approve it, and there is no approvals folder to ask through")
+            return Ask(f"{reason}; a person approves it from a gated session, where the approvals folder is reachable")
         else:
             bound = approvals.Bound(runner, f"guard:{name}", call.value if call else "", cwd, session)
             asked = approvals.require(approval_root, bound, consume=consume, why_asked=reason)
@@ -123,7 +124,7 @@ def check(
     for call in calls:
         if call.kind == "command" and policy.needs_approval(pol, call.value):
             if approval_root is None:
-                return Ask("this command needs a person's approval, and there is no approvals folder to ask through")
+                return Ask("this command needs a person's approval, given from a gated session (`ws approve`)")
             bound = approvals.Bound(runner, call.kind, call.value, cwd, session)
             return approvals.require(approval_root, bound, consume=consume)
     return None
@@ -139,7 +140,11 @@ def event(runner: str, raw: str, pol: policy.Policy, *, clock=None, home: Path |
     name = payload.get("hook_event_name")
     ev = getattr(adapter, "EVENT_NAMES", {}).get(name) if isinstance(name, str) else None
     if ev is None or ev == "pre":
-        return 0, "", f"ws gate event: nothing to do for {str(name)[:40]!r}\n"
+        return (
+            0,
+            "",
+            f"ws gate event: {str(name)[:40]!r} is answered by `ws gate check` or is not a hook event ws reads\n",
+        )
     calls = _calls(adapter, payload) if ev == "post" else []
     found = guards.run(pol, ev, calls, _context(runner, ev, payload, clock, home))
     lines = [f"ws gate: {n}: {f.reason}" for n, _, f in found]

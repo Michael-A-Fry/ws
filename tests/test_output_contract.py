@@ -20,6 +20,7 @@ from ws import cli, output
 # Commands that keep their own stdout (a protocol, a hook, the terminal) and so are not wrapped; their errors still are.
 RAW = {
     "gate.check": "a hook: the runner reads its stdout, stderr and exit code",
+    "gate.event": "a hook: the runner reads its stdout, stderr and exit code (2 after a tool call carries a finding)",
     "gate.launch": "hands the terminal to the runner",
     "mcp.serve": "stdout is the MCP protocol",
     "broker.serve": "stays up until stopped",
@@ -35,6 +36,7 @@ CASES: dict[str, list[str]] = {
     "init": ["init", "--yes", "--create-notes", "--notes", "{home}/Notes"],
     "gate.init": ["gate", "init"],
     "gate.generate": ["gate", "generate", "--runner", "claude-code", "--out", "{home}/gate"],
+    "gate.replay": ["gate", "replay", "{home}/none.jsonl", "--runner", "claude-code"],
     "secret.set": ["secret", "set", "nope"],
     "secret.list": ["secret", "list"],
     "secret.rm": ["secret", "rm", "nope"],

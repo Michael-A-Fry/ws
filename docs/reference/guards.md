@@ -27,10 +27,10 @@ name, and a key in a guard's table that guard doesn't read.
 
 | Guard | Runs | Reads | What it does |
 |---|---|---|---|
-| `bulk-staging` | before a call | shell commands | Stops `git add -A`, `--all`, `.`, `./` and `:/`, and `git commit -a`, `-am` and `--all`, with or without git's global options. `git add file` and `git add -- file` go through. Text in quotes and here-document bodies is data, so `git commit -m "git add -A"` goes through. The runner's own deny rules carry the plain spellings too. |
+| `bulk-staging` | before a call | shell commands | Stops `git add -A`, `--all` (and a prefix such as `--al`), `.`, `./`, `*`, `:/` and `:(top)`, the same with `git stage`, and `git commit -a`, `-am` and `--all`, with or without git's global options. Stops `git -c alias.NAME=...`, which can define a command that stages everything. `git add file` and `git add -- file` go through. Text in quotes, comments and here-document bodies is data, so `git commit -m "git add -A"` goes through; the text after `eval` and in `bash -c` is a command and is read. The runner's own deny rules carry the plain spellings too. |
 | `syntax-check` | after a call | file writes | Checks the file the session wrote and tells the model the line that doesn't parse. Python, JSON and TOML are read in process. `.sh` and `.bash` go through `sh -n` or `bash -n`, with a note when the machine has no shell. |
 | `session-context` | at session start | none | Lists, one line each, which of `files` exist in the project: the git top level above the session's folder, and the main worktree when the session runs in a linked one. |
-| `record-calls` | before a call | every kind | Appends `{at, runner, payload}` to `$WS_HOME/logs/gate-calls.jsonl`, one line for each hook run. `ws gate replay` reads that file. |
+| `record-calls` | before a call | every kind | Appends `{at, runner, payload}` to `$WS_HOME/logs/gate-calls.jsonl`, one line for each hook run. A file write keeps its path and records the text as `{"bytes", "sha256"}`. `ws gate replay` reads that file. |
 
 `bulk-staging` and `record-calls` take no table.
 
@@ -42,8 +42,11 @@ extension.
 `session-context` takes `files`, a list of paths relative to the project (default `[".claude-state/STATE.md"]`). A path
 must stay inside the project: no leading `/` or `~`, no `..`.
 
-`record-calls` is off unless you name it. A payload holds the command text as the session typed it, so a value typed into
-a command is in the log. The log has the bounds of every ws log: a long field is cut and marked, the file rotates, and
+`record-calls` is off unless you name it. A line holds the hook payload as the runner sent it, with one change: the text
+a write tool carries (Write `content`, Edit `old_string` and `new_string`, each MultiEdit edit's two strings, NotebookEdit
+`new_source`) becomes its size in bytes and a SHA-256, and the path stays. Replay judges a call by its tool, path and
+command, so it runs a line as it is. A command is kept as the session typed it, so a value typed into a command is in
+the log. The log has the bounds of every ws log: a long field is cut and marked, the file rotates, and
 writers take a lock. The `logs` folder is one a session can't write.
 
 ## Findings
@@ -66,7 +69,7 @@ The first `deny` in the order of `on` wins. A reason is shown as `guard-name: re
 
 | Event | Claude Code hook | `ws gate event` answers with |
 |---|---|---|
-| `pre` | `PreToolUse` | Not this command: `ws gate check` answers it. |
+| `pre` | `PreToolUse` | `ws gate check` answers this event. |
 | `post` | `PostToolUse` | A `deny` or `warn` as standard error with exit code 2. A `note` as standard error with exit code 0. |
 | `start` | `SessionStart` | Findings as text on standard output, which Claude Code adds to the session's context. Exit code 0. |
 | `prompt` | `UserPromptSubmit` | Findings as text on standard output. Exit code 0. |
@@ -85,14 +88,16 @@ The settings carry a hook for an event only when a guard that is on runs there:
 | `PreToolUse` matcher gains `Agent\|Task`, `Skill` and `SendMessage` | A guard that is on reads agent, skill or message calls before a call. The matcher always has the shell, file, search and web tools. |
 | `PostToolUse` running `ws gate event` | A guard that is on runs after a call. The matcher lists the tools for the kinds those guards read. |
 | `SessionStart`, `UserPromptSubmit`, `Stop`, `SubagentStop` running `ws gate event` | A guard that is on runs at that event. |
-| `Notification` and `Stop` running `ws notify alert --runner claude-code \|\| true` | Always. |
 
-The `PreToolUse` hook ends `|| exit 2`. The other hooks carry no `|| exit`: `ws gate event` exits 2 on purpose after a
-tool call, and Claude Code treats any other hook failure as non-blocking.
+The `PreToolUse` hook ends `|| exit 2`, so a missing or crashing ws blocks the call. The `PostToolUse` hook has no
+`|| exit`: `ws gate event` exits 2 on purpose after a tool call, and Claude Code shows that message to the model. Every
+other hook command (`SessionStart`, `UserPromptSubmit`, `Stop`, `SubagentStop`) ends `|| true`, so the session carries
+on whatever it returns.
 
 The settings `env` carries `WS_GATED_SESSION=1` and `WS_SANDBOXED=1`. The hook checks a project's own
-`.claude/settings*.json` for keys that open the sandbox only when `WS_SANDBOXED` is `1`, because that is the session
-that has ws's `sandbox` block.
+`.claude/settings*.json` for keys that open the sandbox in every session except one whose settings set
+`WS_SANDBOXED=0`, the marker of settings written without ws's `sandbox` block. Settings generated before the marker
+existed have the block and no marker, so the check runs for them.
 
 OpenCode's adapter lists the guard names it doesn't run yet in `UNSUPPORTED_GUARDS`; that is every guard for now.
 

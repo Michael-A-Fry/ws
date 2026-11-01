@@ -1437,6 +1437,45 @@ def test_simple_commands_gives_each_command_with_quotes_and_heredocs_resolved(cm
     assert policy.simple_commands(cmd) == expected
 
 
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        'echo "<<X"\ngit add -A',  # in double quotes
+        "echo '<<X'\ngit add -A",  # in single quotes
+        "echo hi # <<X\ngit add -A",  # in a comment
+        "# <<X\ngit add -A",
+        "echo $((1<<X))\ngit add -A",  # a shift in arithmetic
+        "echo $((1 << X))\ngit add -A",
+        "((x = 1<<X))\ngit add -A",
+        'echo "$((1<<X))"\ngit add -A',
+        "cat <<< X\ngit add -A",  # a here-string
+        "echo a\\<<X\ngit add -A",  # an escaped character in front
+    ],
+)
+def test_simple_commands_sees_the_line_after_a_double_angle_that_is_not_a_heredoc(cmd):
+    assert ["git", "add", "-A"] in policy.simple_commands(cmd)
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "cat <<X\ngit add -A\nX\nls",
+        'cat <<"X"\ngit add -A\nX\nls',
+        "cat <<-X\n\tgit add -A\n\tX\nls",
+        "cat <<A <<B\ngit add -A\nA\ngit add .\nB\nls",  # two on one line
+        "echo $((1<<2)); cat <<X\ngit add -A\nX\nls",  # a shift, then a real one
+        "echo '<<Y' \"<<Z\" && cat <<X\ngit add -A\nX\nls",  # quoted ones, then a real one
+    ],
+)
+def test_simple_commands_leaves_out_a_real_heredoc_body(cmd):
+    found = policy.simple_commands(cmd)
+    assert ["git", "add", "-A"] not in found and ["git", "add", "."] not in found and ["ls"] in found
+
+
+def test_simple_commands_leaves_a_comment_out():
+    assert policy.simple_commands("ls # git add -A") == [["ls"]]
+
+
 def test_simple_commands_refuses_what_it_cannot_judge():
     with pytest.raises(TypeError):
         policy.simple_commands(5)  # type: ignore[arg-type]

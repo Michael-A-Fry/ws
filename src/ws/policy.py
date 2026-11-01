@@ -675,13 +675,19 @@ def _merge_flags(tokens: list[str]) -> list[str]:
     return [cmd, "-" + "".join(sorted(letters)), *tokens[rest_at:]]
 
 
-def _git_normal(toks: list[str]) -> list[str]:
-    """Drop git's global options (`-C dir`, `-c k=v`, `--git-dir=...`) so the subcommand is where a rule expects it;
-    spell any forcing or destroying push (`-f`, `-uf`, `+refspec`, `:ref`, `--mirror`, `--delete`) as `--force`."""
+def git_split(toks: list[str]) -> tuple[list[str], list[str]]:
+    """(the global options with their values, the command without them) for the words of a `git` command:
+    `git -C d -c k=v add x` gives (["-C", "d", "-c", "k=v"], ["git", "add", "x"])."""
     i = 1
     while i < len(toks) and toks[i].startswith("-"):
         i += 2 if toks[i] in _GIT_ARG_OPTS else 1
-    toks = ["git", *toks[i:]]
+    return toks[1:i], ["git", *toks[i:]]
+
+
+def _git_normal(toks: list[str]) -> list[str]:
+    """Drop git's global options (`-C dir`, `-c k=v`, `--git-dir=...`) so the subcommand is where a rule expects it;
+    spell any forcing or destroying push (`-f`, `-uf`, `+refspec`, `:ref`, `--mirror`, `--delete`) as `--force`."""
+    toks = git_split(toks)[1]
     forcing = len(toks) > 1 and toks[1] == "push" and "--force" not in toks
     if forcing and any(
         re.fullmatch(r"-[A-Za-z]*f[A-Za-z]*", t)
@@ -807,14 +813,28 @@ def _prep(cmd: str) -> str:
     return re.sub(r"\$\{IFS\}|\$IFS\b", " ", cmd)
 
 
-def _scan(cmd: str) -> tuple[list[list[str]], list[str]]:
+_HEREDOC_WORD = re.compile(r"<<(-?)[ \t]*(?:'([^']*)'|\"([^\"]*)\"|\\?([A-Za-z_][A-Za-z0-9_]*))")
+
+
+def _arithmetic(body: str) -> bool:
+    """Is the text between `$(` and its closing `)` really `((...))`, shell arithmetic?"""
+    return body.startswith("(") and body.endswith(")")
+
+
+def _scan(cmd: str, heredocs: bool = False) -> tuple[list[list[str]], list[str]]:
     """Split a shell command line. Returns (pipelines, inner): each pipeline is a list of segments (split on |, |&),
-    pipelines are split on ; && || & newline ( ); inner holds the text of $(...), backticks and <(...), which run too."""
+    pipelines are split on ; && || & newline ( ); inner holds the text of $(...), backticks and <(...), which run too.
+    With `heredocs`, the body and closing line of each here-document are left out (that text is data for a program,
+    not commands): a `<<WORD` starts one only outside quotes and comments, and not as `<<<` or a shift in `((...))`."""
     pipelines: list[list[str]] = []
     inner: list[str] = []
     segs: list[str] = []
     buf: list[str] = []
+    waiting: list[tuple[str, bool]] = []  # (closing word, may be indented) of the here-documents the line opened
     n, i, quote = len(cmd), 0, ""
+
+    def sub(body: str) -> str:  # the text of a $(...) that is really `$((a<<b))` arithmetic: its `<<` is a shift
+        return body.replace("<<", "< <") if heredocs and _arithmetic(body) else body
 
     def end_seg() -> None:
         s = "".join(buf).strip()
@@ -844,10 +864,44 @@ def _scan(cmd: str) -> tuple[list[list[str]], list[str]]:
                     inner.append(cmd[i + 1 : j])
             elif quote == '"' and cmd.startswith("$(", i):
                 j = _close_paren(cmd, i + 2)
-                inner.append(cmd[i + 2 : j])
+                inner.append(sub(cmd[i + 2 : j]))
             buf.append(c)
             i += 1
             continue
+        if heredocs and c == "#" and (not buf or buf[-1] in " \t"):  # a comment: not commands, and no here-document
+            eol = cmd.find("\n", i)
+            i = n if eol < 0 else eol
+            continue
+        if heredocs and c == "<" and cmd.startswith("<<<", i):  # a here-string: its word is data, not a delimiter
+            buf.append("<<<")
+            i += 3
+            continue
+        if heredocs and c == "<" and cmd.startswith("<<", i):
+            m = _HEREDOC_WORD.match(cmd, i)
+            if m:
+                waiting.append((m.group(2) or m.group(3) or m.group(4) or "", m.group(1) == "-"))
+                buf.append(m.group(0))
+                i = m.end()
+                continue
+        if heredocs and c == "\n" and waiting:
+            end_pipeline()
+            i += 1
+            for word, indented in waiting:  # skip each body, up to and including its closing line
+                while i < n:
+                    eol = cmd.find("\n", i)
+                    eol = n if eol < 0 else eol
+                    line = cmd[i:eol]
+                    i = eol + 1
+                    if (line.strip(" \t") if indented else line) == word:
+                        break
+            waiting.clear()
+            continue
+        if heredocs and c == "(" and cmd.startswith("((", i) and not buf:  # an arithmetic command: `((x<<2))`
+            j = _close_paren(cmd, i + 1)
+            if _arithmetic(cmd[i + 1 : j]):
+                inner.append(sub(cmd[i + 1 : j])[1:-1])
+                i = j + 1
+                continue
         if c in "'\"":
             quote = c
             buf.append(c)
@@ -860,7 +914,7 @@ def _scan(cmd: str) -> tuple[list[list[str]], list[str]]:
             continue
         elif cmd.startswith("$(", i):
             j = _close_paren(cmd, i + 2)
-            inner.append(cmd[i + 2 : j])
+            inner.append(sub(cmd[i + 2 : j]))
             buf.append(cmd[i : j + 1])
             i = j + 1
             continue
@@ -1336,52 +1390,35 @@ def _canon_pattern(pattern: str) -> str:
     return " ".join(toks)
 
 
-_HEREDOC = re.compile(r"(?<!<)<<(-?)\s*(?:'([^']*)'|\"([^\"]*)\"|\\?([A-Za-z_][A-Za-z0-9_]*))")
-
-
-def _strip_heredocs(cmd: str) -> str:
-    """The command with the body and closing line of every here-document taken out: that text is data for a program,
-    not commands. The line that opens it stays."""
-    out: list[str] = []
-    waiting: list[tuple[str, bool]] = []  # (closing word, may be indented) of the here-documents still open
-    for line in cmd.split("\n"):
-        if waiting:
-            word, indented = waiting[0]
-            if (line.strip(" \t") if indented else line) == word:
-                waiting.pop(0)
-            continue
-        out.append(line)
-        for m in _HEREDOC.finditer(line):
-            waiting.append((m.group(2) or m.group(3) or m.group(4) or "", m.group(1) == "-"))
-    return "\n".join(out)
-
-
-def simple_commands(command: str, _depth: int = 0) -> list[list[str]]:
+def simple_commands(command: str, _depth: int = 0, *, git_options: bool = False) -> list[list[str]]:
     """Every simple command in a command line, as its words: quotes resolved, `sudo`/`env`/`timeout` wrappers and git's
-    global options (`-C dir`, `-c k=v`) dropped. It reads the line as the matcher does (segments split on `;`, `&&`,
-    pipes and newlines, and the text of `$(...)`, backticks and `bash -c` read too), and leaves out what is not a
-    command: quoted text and here-document bodies. For a check that wants one command's words, such as a guard."""
+    global options (`-C dir`, `-c k=v`) dropped (kept with `git_options`, for a check of the options themselves; see
+    git_split). It reads the line as the matcher does (segments split on `;`, `&&`, pipes and newlines, and the text of
+    `$(...)`, backticks, `bash -c` and `eval` read too), and leaves out what is not a command: quoted text, comments
+    and here-document bodies. For a check that wants one command's words, such as a guard."""
     if not isinstance(command, str):
         raise TypeError("command must be text")
     if _depth > _MAX_DEPTH:
         raise ValueError("command nests too deeply to check")
-    pipelines, inner = _scan(_prep(_strip_heredocs(command)))
+    pipelines, inner = _scan(_prep(command), heredocs=True)
     found: list[list[str]] = []
     nested = list(inner)
     for segs in pipelines:
         for seg in segs:
             toks, _ = _strip_wrappers(_lex(seg)[0])
-            if toks and toks[0] == "git":
+            if toks and toks[0] == "git" and not git_options:
                 toks = _git_normal(toks)
             if not toks:
                 continue
             found.append(toks)
+            if toks[0] == "eval" and len(toks) > 1:  # eval joins its words and runs the text as a command line
+                nested.append(" ".join(toks[1:]))
             if toks[0] in _SHELL_NAMES:
                 flags, operands = _args(toks)
                 if _cluster(flags, "c") and operands:
                     nested.append(operands[0])
     for text in nested:
-        found += simple_commands(text, _depth + 1)
+        found += simple_commands(text, _depth + 1, git_options=git_options)
     return found
 
 

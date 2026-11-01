@@ -43,13 +43,17 @@ the hook, not by it. `env` carries WS_GATED_SESSION so `ws approve` knows it is 
 
 Guards (ws.guards) add hooks, only for the events and tools the guards that are on need: PreToolUse matches more tools
 (Agent, Task, Skill, SendMessage) when a guard reads them; PostToolUse, SubagentStop and the prompt event run
-`ws gate event`; SessionStart and Stop run it beside what they already run. Notification and Stop also run
-`ws notify alert`. These are advice, not a gate: only the PreToolUse hook (`ws gate check`) blocks a call, and it ends
-`|| exit 2`; the others carry no `|| exit`, because `ws gate event` exits 2 on purpose after a tool call (Claude Code
-shows that stderr to the model) and any other failure of a hook is non-blocking.
+`ws gate event`; SessionStart and Stop run it beside what they already run.
 
-`env` also carries WS_SANDBOXED, which tells the hook this session has the sandbox block above; `preflight` applies only
-when it is set, because without that block there is nothing for a project's settings to widen.
+Which hooks can block: PreToolUse (`ws gate check`) denies a call, and its command ends `|| exit 2` so a missing or
+crashing ws blocks too. PostToolUse (`ws gate event`) exits 2 on purpose when a check finds a problem, and Claude Code
+shows that stderr to the model; it carries no `|| exit`. Every other generated hook command (SessionStart,
+UserPromptSubmit, Stop, SubagentStop) ends `|| true`, because an exit 2 there would block the person's prompt or keep the
+session going: those hooks add context and findings, and the session carries on whatever they return.
+
+`env` also carries WS_SANDBOXED=1, which tells the hook this session has the sandbox block above. `preflight` runs for
+every session except one whose settings set WS_SANDBOXED=0, the marker of a settings file written without the sandbox
+block; settings written before the marker existed carry the block and no marker, so `preflight` runs for them.
 
 Pass the file with `claude --settings OUT/settings.json`. Nothing here touches ~/.claude.
 """
@@ -127,20 +131,25 @@ def _matcher(kinds: set[str], base: tuple[str, ...] = ()) -> str:
     return "|".join(tools)
 
 
+def _event_hook(ws_cmd: list[str], policy_file: Path, *, may_block: bool = False) -> dict:
+    """A `ws gate event` hook. It ends `|| true` unless it may block (PostToolUse, whose exit 2 reaches the model)."""
+    cmd = shlex.join(event_argv(ws_cmd, NAME, policy_file)) + ("" if may_block else " || true")
+    return {"type": "command", "command": cmd, "timeout": HOOK_TIMEOUT}
+
+
 def guard_hooks(policy: Policy, ws_cmd: list[str], policy_file: Path) -> dict:
-    """The hooks beyond the PreToolUse check: Notification and Stop always run `ws notify alert` (`|| true`: it is
-    advice, and an exit 2 from Stop would keep the session going); `ws gate event` is added for each event a guard
-    that is on runs at. Returns {event name: [matcher groups]} to merge with the session hooks."""
+    """The hooks beyond the PreToolUse check and the session hooks: `ws gate event` for each event a guard that is on
+    runs at (PostToolUse, Stop, SubagentStop). Returns {event name: [matcher groups]} to merge with the session hooks."""
     on = policy.guards.on
-    event = {"type": "command", "command": shlex.join(event_argv(ws_cmd, NAME, policy_file)), "timeout": HOOK_TIMEOUT}
-    alert = {"type": "command", "command": f"{shlex.join(ws_cmd)} notify alert --runner {NAME} || true", "timeout": 5}
-    hooks: dict[str, list[dict]] = {"Notification": [{"hooks": [alert]}], "Stop": [{"hooks": [alert]}]}
+    hooks: dict[str, list[dict]] = {}
     post = guards.kinds_for(on, "post")
     if post:
-        hooks["PostToolUse"] = [{"matcher": _matcher(post), "hooks": [event]}]
+        hooks["PostToolUse"] = [
+            {"matcher": _matcher(post), "hooks": [_event_hook(ws_cmd, policy_file, may_block=True)]}
+        ]
     for name, ev in (("Stop", "stop"), ("SubagentStop", "subagent-stop")):
         if guards.wanted(on, ev):
-            hooks.setdefault(name, [{"hooks": []}])[0]["hooks"].append(event)
+            hooks[name] = [{"hooks": [_event_hook(ws_cmd, policy_file)]}]
     return hooks
 
 
@@ -175,9 +184,10 @@ def preflight(payload: dict) -> str | None:
     folder is CLAUDE_PROJECT_DIR (set for hooks; Claude reads project settings from there, wherever the session has since
     changed to), else the payload's cwd. A file that does not parse is ignored, as Claude Code ignores it. A settings
     file that is not a plain file (a link, a FIFO), is too big or cannot be read is a deny: it is read without following a
-    link and without blocking, because a hook that hangs fails open (only exit 2 blocks). It applies only to a session
-    that has ws's sandbox block (WS_SANDBOXED=1 in the settings `env`): without it there is nothing to widen."""
-    if os.environ.get(SANDBOX_MARKER) != "1":
+    link and without blocking, because a hook that hangs fails open (only exit 2 blocks). It is skipped only when the
+    settings `env` says WS_SANDBOXED=0 (the marker of settings written without the sandbox block); settings written
+    before the marker existed have the block and no marker, so it runs for them."""
+    if os.environ.get(SANDBOX_MARKER) == "0":
         return None
     project = os.environ.get("CLAUDE_PROJECT_DIR") or payload.get("cwd")
     if not isinstance(project, str) or not project.startswith("/"):
@@ -261,10 +271,9 @@ def generate(
         "hooks": {"PreToolUse": [{"matcher": matcher, "hooks": [{"type": "command", "command": hook}]}]},
     }
     settings["hooks"].update(session_hooks(ws_cmd))
-    event = {"type": "command", "command": shlex.join(event_argv(ws_cmd, NAME, policy_file)), "timeout": HOOK_TIMEOUT}
     for name, ev in (("SessionStart", "start"), ("UserPromptSubmit", "prompt")):
         if guards.wanted(policy.guards.on, ev):
-            settings["hooks"][name][0]["hooks"].append(event)
+            settings["hooks"][name][0]["hooks"].append(_event_hook(ws_cmd, policy_file))
     for name, groups in guard_hooks(policy, ws_cmd, policy_file).items():
         settings["hooks"][name] = groups
     return {FILE: json.dumps(settings, indent=2) + "\n"}
@@ -314,8 +323,13 @@ def _write_data(tool: str, inp: dict) -> dict:
     edits = inp.get("edits")
     if tool == "MultiEdit" and isinstance(edits, list):
         found["edits"] = tuple(
-            {"old": e.get("old_string"), "new": e.get("new_string")} for e in edits if isinstance(e, dict)
-        )
+            {
+                k: e[key] if isinstance(e.get(key), str) else None
+                for k, key in (("old", "old_string"), ("new", "new_string"))
+            }
+            for e in edits
+            if isinstance(e, dict)
+        )  # a recorded call (record-calls) holds a size and fingerprint where the text was: None here
     return found
 
 

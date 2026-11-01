@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import shlex
@@ -152,6 +153,30 @@ def test_the_policy_judges_only_the_kinds_it_has_rules_for():
         "echo $(git add -A)",
         "git add -- .",
         "git add a.py .",
+        "git stage -A",
+        "git stage .",
+        "git stage --all",
+        "git -C x stage :/",
+        "git add --a",
+        "git add --al",
+        "git stage --al",
+        "git commit --al -m m",
+        "git add :(top)",
+        "git add ':(top)'",
+        "git add ':(top).'",
+        "git add ':(top,glob)*'",
+        "git add :/.",
+        "git add '*'",
+        "git -c alias.go='add -A' go",
+        "git -calias.go='add -A' go",
+        "git -C x -c alias.go=status go",
+        "git --config-env=alias.go=GOV go",
+        "git --config-env alias.go=GOV go",
+        'eval "git add -A"',
+        "eval git add .",
+        "FOO=1 eval 'ls; git commit -am m'",
+        "bash -lc 'git stage .'",
+        'echo "<<X"\ngit add -A',
     ],
 )
 def test_bulk_staging_stops_whole_tree_staging(cmd):
@@ -174,7 +199,15 @@ def test_bulk_staging_stops_whole_tree_staging(cmd):
         "git commit --amend --no-edit",
         "git commit -ma",
         "git status",
+        "git stage a.py",
+        "git add ':(top)src/a.py'",
+        "git add :/src/a.py",
+        "git add ':(glob)*.py'",
+        "git commit --amend",
+        "git -c user.name=x -c core.editor=true commit -m m",
         "echo git add -A",
+        "eval 'echo git add -A'",
+        "ls # git add -A",
         "git log --all",
         "git commit -m \"$(cat <<'EOF'\ngit add -A\nand git commit -a\nEOF\n)\"",
         "cat <<EOF > notes.txt\ngit add .\nEOF",
@@ -199,6 +232,7 @@ def test_bulk_staging_adds_native_deny_patterns_only_while_on():
     assert "git add -A*" not in policy.native_patterns(pol())
     on = policy.native_patterns(pol("bulk-staging"))
     assert {"git add -A*", "git add .", "git commit -a*", "git -* add -A*"} <= set(on)
+    assert {"git stage -A*", "git stage .", "git add --a*", "git -c alias.*", "git * -c alias.*"} <= set(on)
     deny = json.loads(claude_code.generate(pol("bulk-staging"), ["ws"], _P("o"), _P("p.toml"))["settings.json"])
     assert "Bash(git add -A*)" in deny["permissions"]["deny"]
 
@@ -349,6 +383,79 @@ def test_record_calls_appends_one_line_per_hook_run_and_never_denies(home):
     lines = jsonl.read(home / "wshome" / "logs" / "gate-calls.jsonl")
     assert len(lines) == 1
     assert lines[0] == {"at": "1970-01-01T00:00:00+00:00", "runner": "claude-code", "payload": glob}
+
+
+SECRET_TEXT = "planted-" + "7" * 12  # built at run time
+
+
+def _fingerprint(text: str) -> dict:
+    return {"bytes": len(text.encode()), "sha256": hashlib.sha256(text.encode()).hexdigest()}
+
+
+@pytest.mark.parametrize(
+    "tool, inp, redacted",
+    [
+        ("Write", {"file_path": "/p/a.txt", "content": SECRET_TEXT}, {"content": SECRET_TEXT}),
+        (
+            "Edit",
+            {"file_path": "/p/a.txt", "old_string": "before " + SECRET_TEXT, "new_string": "after " + SECRET_TEXT},
+            {"old_string": "before " + SECRET_TEXT, "new_string": "after " + SECRET_TEXT},
+        ),
+        (
+            "MultiEdit",
+            {"file_path": "/p/a.txt", "edits": [{"old_string": "a" + SECRET_TEXT, "new_string": "b" + SECRET_TEXT}]},
+            {},
+        ),
+        (
+            "NotebookEdit",
+            {"notebook_path": "/p/n.ipynb", "new_source": SECRET_TEXT, "cell_id": "c1"},
+            {"new_source": SECRET_TEXT},
+        ),
+    ],
+)
+def test_record_calls_keeps_the_path_and_a_fingerprint_not_the_text_of_a_write(home, tool, inp, redacted):
+    payload = {"tool_name": tool, "tool_input": inp, "session_id": "s"}
+    assert gate.check("claude-code", json.dumps(payload), pol("record-calls")) is None
+    raw = (home / "wshome" / "logs" / "gate-calls.jsonl").read_text()
+    assert SECRET_TEXT not in raw
+    (line,) = jsonl.read(home / "wshome" / "logs" / "gate-calls.jsonl")
+    got = line["payload"]["tool_input"]
+    assert got.get("file_path", got.get("notebook_path")) == inp.get("file_path", inp.get("notebook_path"))
+    for key, text in redacted.items():
+        assert got[key] == _fingerprint(text)
+    if tool == "MultiEdit":
+        assert got["edits"] == [
+            {"old_string": _fingerprint("a" + SECRET_TEXT), "new_string": _fingerprint("b" + SECRET_TEXT)}
+        ]
+    assert got.get("cell_id", "c1") == "c1"
+    assert line["payload"]["session_id"] == "s"
+
+
+def test_record_calls_redacts_open_code_writes_and_leaves_commands_and_reads_alone(home):
+    write = {"tool": "write", "args": {"filePath": "/p/a", "content": SECRET_TEXT}}
+    edit = {"tool": "multiedit", "args": {"filePath": "/p/a", "edits": [{"oldString": "x", "newString": SECRET_TEXT}]}}
+    for payload in (write, edit):
+        gate.check("opencode", json.dumps(payload), pol("record-calls"))
+    gate.check("claude-code", json.dumps(bash("echo " + "hi")), pol("record-calls"))
+    read = {"tool_name": "Read", "tool_input": {"file_path": "/p/a"}}
+    gate.check("claude-code", json.dumps(read), pol("record-calls"))
+    lines = jsonl.read(home / "wshome" / "logs" / "gate-calls.jsonl")
+    assert SECRET_TEXT not in json.dumps(lines)
+    assert lines[0]["payload"]["args"]["content"] == _fingerprint(SECRET_TEXT)
+    assert lines[1]["payload"]["args"]["edits"][0]["newString"] == _fingerprint(SECRET_TEXT)
+    assert lines[2]["payload"]["tool_input"]["command"] == "echo hi" and lines[3]["payload"] == read
+
+
+def test_a_recorded_write_still_replays_by_its_path(home, capsys):
+    p = write_policy(home, '[guards]\non = ["record-calls"]\n')
+    for tool, inp in (
+        ("Write", {"file_path": "/p/a", "content": SECRET_TEXT}),
+        ("MultiEdit", {"file_path": "/p/a", "edits": [{"old_string": "x", "new_string": SECRET_TEXT}]}),
+    ):
+        gate.check("claude-code", json.dumps({"tool_name": tool, "tool_input": inp}), policy.load(p))
+    log = home / "wshome" / "logs" / "gate-calls.jsonl"
+    assert cli.main(["gate", "replay", str(log), "--runner", "claude-code", "--policy", str(p)]) == 0
+    assert "2 allow" in capsys.readouterr().out
 
 
 def test_record_calls_bounds_what_it_writes(home):
@@ -615,13 +722,13 @@ def test_event_for_a_name_ws_does_not_answer_is_a_quiet_exit_0(home, monkeypatch
     p = write_policy(home, '[guards]\non = ["syntax-check"]\n')
     for name in ("PreToolUse", "Notification", "Nonsense", None):
         code, out, err = run_gate(monkeypatch, capsys, "event", {"hook_event_name": name}, "--policy", str(p))
-        assert code == 0 and out == "" and "nothing to do" in err
+        assert code == 0 and out == "" and "is answered by `ws gate check` or is not a hook event" in err
 
 
 def test_a_runner_with_no_event_names_exits_0(home, monkeypatch, capsys):
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"hook_event_name": "Stop"})))
     assert cli.main(["gate", "event", "--runner", "opencode"]) == 0
-    assert "nothing to do" in capsys.readouterr().err
+    assert "is not a hook event ws reads" in capsys.readouterr().err
 
 
 # --- ws gate replay ----------------------------------------------------------------------------------------------
@@ -693,14 +800,11 @@ def commands(group: list[dict]) -> list[str]:
     return [h["command"] for g in group for h in g["hooks"]]
 
 
-def test_with_no_guards_the_hooks_are_the_old_ones_plus_notification_and_stop():
+def test_with_no_guards_the_hooks_are_the_old_ones():
     hooks = generate(pol())["hooks"]
-    assert set(hooks) == {"PreToolUse", "SessionStart", "UserPromptSubmit", "Notification", "Stop"}
+    assert set(hooks) == {"PreToolUse", "SessionStart", "UserPromptSubmit"}
     assert hooks["PreToolUse"][0]["matcher"] == claude_code.MATCHER
     assert commands(hooks["SessionStart"]) == ["ws session start --runner claude-code || true"]
-    assert (
-        commands(hooks["Notification"]) == commands(hooks["Stop"]) == ["ws notify alert --runner claude-code || true"]
-    )
     assert generate(pol())["env"] == {"WS_GATED_SESSION": "1", "WS_SANDBOXED": "1"}
 
 
@@ -709,9 +813,9 @@ def test_the_default_policy_adds_post_tool_use_and_session_start_events():
     assert hooks["PostToolUse"][0]["matcher"] == "Edit|Write|MultiEdit|NotebookEdit"
     event = "ws gate event --runner claude-code --policy /x/wshome/policy.toml"
     assert commands(hooks["PostToolUse"]) == [event]  # no `|| exit`: exit 2 here is a message to the model
-    assert commands(hooks["SessionStart"]) == ["ws session start --runner claude-code || true", event]
+    assert commands(hooks["SessionStart"]) == ["ws session start --runner claude-code || true", event + " || true"]
     assert hooks["PostToolUse"][0]["hooks"][0]["timeout"] > 10  # the checkers get 10 seconds
-    assert "SubagentStop" not in hooks and commands(hooks["Stop"]) == ["ws notify alert --runner claude-code || true"]
+    assert "SubagentStop" not in hooks and "Stop" not in hooks and "Notification" not in hooks
 
 
 def test_each_event_gets_a_hook_only_when_a_guard_runs_there(monkeypatch):
@@ -722,7 +826,7 @@ def test_each_event_gets_a_hook_only_when_a_guard_runs_there(monkeypatch):
     assert hooks["PostToolUse"][0]["matcher"] == "Bash|Agent|Task|Skill"
     assert hooks["PreToolUse"][0]["matcher"] == claude_code.MATCHER + "|Skill|SendMessage"
     assert "gate event" in commands(hooks["SubagentStop"])[0]
-    assert [("gate event" in c) for c in commands(hooks["Stop"])] == [False, True]
+    assert [("gate event" in c) for c in commands(hooks["Stop"])] == [True]
     assert [("gate event" in c) for c in commands(hooks["UserPromptSubmit"])] == [False, True]
 
 
@@ -755,7 +859,7 @@ def test_the_commented_default_policy_generates_and_a_settings_file_round_trips(
     out = tmp_path / "out"
     assert cli.main(["gate", "generate", "--runner", "claude-code", "--out", str(out)]) == 0
     hooks = json.loads((out / "settings.json").read_text())["hooks"]
-    assert {"PostToolUse", "Stop", "Notification"} <= set(hooks)
+    assert {"PostToolUse", "SessionStart", "UserPromptSubmit"} <= set(hooks)
     assert cli.main(["gate", "generate", "--runner", "claude-code", "--out", str(out)]) == 0
     assert "0 changes" in capsys.readouterr().out
 
@@ -784,22 +888,37 @@ def test_the_generated_post_tool_use_hook_reports_a_syntax_error_to_the_model(ho
 # --- preflight only for a session with the sandbox block ----------------------------------------------------------
 
 
-def test_preflight_applies_only_when_the_session_has_the_sandbox_block(tmp_path, monkeypatch):
+def test_preflight_is_skipped_only_for_settings_marked_as_having_no_sandbox_block(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     d = tmp_path / "proj"
     (d / ".claude").mkdir(parents=True)
     (d / ".claude" / "settings.json").write_text(json.dumps({"sandbox": {"enabled": False}}))
     payload = {"cwd": str(d)}
-    monkeypatch.delenv("WS_SANDBOXED", raising=False)
-    assert claude_code.preflight(payload) is None
-    monkeypatch.setenv("WS_SANDBOXED", "0")
-    assert claude_code.preflight(payload) is None
+    monkeypatch.delenv("WS_SANDBOXED", raising=False)  # settings written before the marker: the block, no marker
+    assert "enabled = false" in claude_code.preflight(payload)
     monkeypatch.setenv("WS_SANDBOXED", "1")
     assert "enabled = false" in claude_code.preflight(payload)
     raw = json.dumps({"tool_name": "Read", "tool_input": {"file_path": "/tmp/x"}, "cwd": str(d)})
     assert "enabled = false" in gate.check("claude-code", raw, pol())
-    monkeypatch.delenv("WS_SANDBOXED")
+    monkeypatch.setenv("WS_SANDBOXED", "0")
+    assert claude_code.preflight(payload) is None
     assert gate.check("claude-code", raw, pol()) is None
+    monkeypatch.delenv("WS_SANDBOXED")
+    assert "enabled = false" in gate.check("claude-code", raw, pol())
+
+
+def test_every_generated_hook_but_pre_and_post_tool_use_ends_in_true(monkeypatch):
+    fake_guard(monkeypatch, "e-all", events=("start", "prompt", "stop", "subagent-stop", "post"), kinds=("command",))
+    hooks = generate(pol("e-all"))["hooks"]
+    assert set(hooks) == {"PreToolUse", "PostToolUse", "SessionStart", "UserPromptSubmit", "Stop", "SubagentStop"}
+    for name, groups in hooks.items():
+        for cmd in commands(groups):
+            if name == "PreToolUse":
+                assert cmd.endswith("|| exit 2")
+            elif name == "PostToolUse":
+                assert cmd.endswith("--policy /x/wshome/policy.toml")  # exit 2 is the message to the model
+            else:
+                assert cmd.endswith("|| true"), (name, cmd)
 
 
 def test_the_sandbox_marker_is_in_the_generated_env_beside_the_gated_marker():

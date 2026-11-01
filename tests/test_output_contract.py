@@ -327,6 +327,23 @@ def test_no_color_after_dashes_is_the_commands_own(box, capsys):
     assert code == 1 and "no [roles.notes]" in err and out == ""
 
 
+def test_no_color_reaches_an_external_program_as_a_flag_and_as_the_environment(box, capsys, monkeypatch):
+    from ws import extcmd
+
+    prog = box.parent / "bin" / "ws-hello"
+    prog.write_text("#!/bin/sh\nexit 0\n")
+    prog.chmod(0o755)
+    seen = []
+    monkeypatch.setattr(extcmd, "launch", lambda spec: seen.append(spec) or 0)
+    assert cli.main(["hello", "--no-color", "a", "--", "--no-color"]) == 0
+    assert cli.main(["--no-color", "hello", "a"]) == 0
+    assert cli.main(["hello", "a"]) == 0
+    first, second, plain = seen
+    assert first.argv == ["a", "--no-color", "--", "--no-color"] and first.env["NO_COLOR"] == "1"
+    assert second.argv == ["a", "--no-color"] and second.env["NO_COLOR"] == "1"
+    assert plain.argv == ["a"] and "NO_COLOR" not in plain.env
+
+
 def test_no_color_is_a_global_option_in_help(box, capsys):
     _, out, _ = run(capsys, "help", "--json")
     assert "--no-color" in envelope(out)["data"]["global_options"]

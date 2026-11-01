@@ -300,11 +300,10 @@ def main(argv: list[str] | None = None) -> int:
         if g.cwd is not None and (spec is None or spec.keep_cwd):
             output.enter_cwd(g.cwd)
         if spec is not None:
-            if g.no_color:
-                spec.env["NO_COLOR"] = "1"
             return extcmd.launch(spec)
         args = parser.parse_args(rest)
-        # the global flag was taken out into `g`; `ws setup` also declares its own, which the parser read
+        # `or g.no_color` keeps `ws setup --no-color` working: the global flag is taken out of argv before the parser
+        # sees it, so setup's own flag would otherwise never be set
         args.no_color = bool(getattr(args, "no_color", False)) or g.no_color
         kind = args.ws_command
         return output.dispatch(args, kind, g.json)

@@ -34,13 +34,13 @@ One source of truth for every colour, size and font, so a restyle is a change of
 
 | ID | Rule | Rung | Check | Status |
 |---|---|---|---|---|
-| B1 | Type each colour, size and font value once, in `src/ws/brand.py` (being added); the terminal, the pages and the docs read it. | T0 | `tests/test_brand.py` | planned |
-| B2 | Use two tiers: a palette, then role names (accent, done, warn, text, muted, background, panel, line). | T0 | `tests/test_brand.py` | planned |
-| B3 | Keep dark and light on the same role keys, so a mode changes values only. | T0 | `tests/test_brand.py` | planned |
-| B4 | Meet WCAG 2.2 contrast for every text and background pair in every mode: 4.5:1 for text, 3:1 for large text and controls. | T0 | `tests/test_brand.py` | planned |
-| B5 | Keep raw colour literals (`#rrggbb`, `rgb(`, `38;5;`) inside `src/ws/brand.py` (being added) and what it generates. | T0 | `tests/test_brand.py` | planned |
+| B1 | Type each colour value once, in `src/ws/brand.py`; the terminal and the pages read it. | T0 | `tests/test_brand.py::test_the_page_and_the_terminal_agree_on_the_brand_colours` | enforced |
+| B2 | Name every colour by its role (accent, ok, warn, error, text, muted, background, panel, line), once. | T0 | `tests/test_brand.py::test_tokens_are_well_formed_and_named_once` | enforced |
+| B3 | Give every role a dark and a light value, so a mode changes values only. | T0 | `tests/test_brand.py::test_tokens_are_well_formed_and_named_once` | enforced |
+| B4 | Meet WCAG 2.2 contrast for every text and background pair in every mode: 4.5:1 for text, 3:1 for large text and controls. | T0 | `tests/test_brand.py::test_every_declared_pair_reaches_its_ratio` | enforced |
+| B5 | Keep raw colour literals (`#rgb` to `#rrggbbaa`, `rgb(`, `hsl(`) inside `src/ws/brand.py`. | T0 | `tests/test_brand.py::test_no_colour_literal_in_src_outside_brand_py` | enforced |
 | B6 | Show status as a glyph plus a word; colour only reinforces it. | T0 | `tests/test_brand.py` | planned |
-| B7 | Treat motion as a token that drops to zero under `prefers-reduced-motion`, and end every animation. | T0 | `tests/test_brand.py` | planned |
+| B7 | Stop motion under `prefers-reduced-motion`. | T0 | `tests/test_setup_ui.py::test_the_spinner_stops_for_people_who_ask_for_reduced_motion` | enforced |
 
 ## Terminal colour
 
@@ -48,10 +48,10 @@ Colour is a capability the terminal grants, not something ws assumes.
 
 | ID | Rule | Rung | Check | Status |
 |---|---|---|---|---|
-| TC1 | Print colour only on a terminal, and turn it off for `NO_COLOR`, `TERM=dumb` and a pipe. | T0 | `tests/test_setup_ui.py::test_colour_is_off_for_no_color_pipes_and_dumb_terminals` | enforced |
+| TC1 | Print colour only on a terminal; turn it off for a non-empty `NO_COLOR`, `--no-color`, `TERM=dumb` and a pipe. | T0 | `tests/test_brand.py::test_color_mode_table` | enforced |
 | TC2 | Accept `--no-color` on every command. | T0 | `tests/test_output_contract.py` | planned |
 | TC3 | Pick the richest colour depth the terminal reports (truecolour, 256, 16, none) from the same tokens. | T0 | `tests/test_brand.py` | planned |
-| TC4 | Carry status in the basic 16 colours, which people re-theme; use 256-colour and truecolour for the mark and accents. | T0 | `tests/test_brand.py` | planned |
+| TC4 | Use the brand 256 colours by default; on a light terminal, carry status in the basic 16 colours and darken the mark. | T0 | `tests/test_brand.py::test_status_roles_follow_the_mode_and_the_mark_never_does` | enforced |
 
 ## UI
 

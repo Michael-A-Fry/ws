@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PAGE = ROOT / "docs" / "reference" / "principles.md"
 
 # The most planned rows the page may hold. A row that gets its check moves this number down in the same change.
-PLANNED_BASELINE = 26
+PLANNED_BASELINE = 19
 
 # Every ID the page has published: prefix -> how many. Raise a count when a rule is added; never lower it.
 PUBLISHED = {"B": 7, "TC": 4, "U": 5, "W": 10, "F": 6, "C": 12, "D": 9, "G": 12}

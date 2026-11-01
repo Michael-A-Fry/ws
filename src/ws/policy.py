@@ -179,15 +179,41 @@ class Verdict:
 # --- the default policy ------------------------------------------------------------------------------------------
 
 # System directories a recursive delete must never target (Linux and macOS).
-_SYSTEM_DIRS = ("bin", "boot", "dev", "etc", "lib", "lib64", "proc", "root", "sbin", "sys", "usr", "System", "Library")
+_SYSTEM_DIRS = (
+    *("bin", "boot", "dev", "etc", "lib", "lib64", "proc", "root", "sbin", "sys", "usr", "var", "opt", "srv", "mnt"),
+    *("media", "run", "snap", "System", "Library", "Volumes", "Applications", "private"),
+)
+# Where people's own folders live: the folder and `/dir/*` are named here, and one level down (a whole home folder) is
+# judged in code (see _home_folder), because a glob's `*` would also take every path below it.
+_HOME_PARENTS = ("home", "Users")
 _SHELLS = ("sh", "bash", "zsh", "dash")
+# Paths no session may read by default: the keys, tokens and credential files of the common tools, and ws's own secrets.
+DEFAULT_DENY_READ = (
+    "~/.ssh/**",
+    "~/.gnupg/**",
+    "~/.aws/**",
+    "~/.config/gcloud/**",
+    "~/.config/gh/hosts.yml",
+    "~/.config/ws/secrets/**",
+    "~/.docker/config.json",
+    "~/.kube/config",
+    "~/.claude/.credentials.json",
+    "~/.netrc",
+    "~/.npmrc",
+    "~/.pypirc",
+    "**/.env*",
+)
 
 
 def default_deny_commands() -> list[str]:
     """The built-in deny list. `*` matches anything; `\\*` is a literal star. Flags are normalised before matching
-    (see _canon_tokens), so `rm -rf` here also covers `rm -fr`, `rm -r -f` and `rm -Rf`."""
-    out = ["rm -* /", "rm -* /\\*", "rm -* ~", "rm -* ~/\\*", "rm -* /home", "rm -* /Users"]
-    out += [f"rm -* /{d}*" for d in _SYSTEM_DIRS]
+    (see _canon_tokens), so `rm -rf` here also covers `rm -fr`, `rm -r -f` and `rm -Rf`. A system folder is named whole
+    and as `/dir/*`, so `/var` and `/var/log` are covered and `/variant` is not."""
+    out = ["rm -* /", "rm -* /\\*", "rm -* ~", "rm -* ~/\\*"]
+    for d in _HOME_PARENTS:
+        out += [f"rm -* /{d}", f"rm -* /{d}/\\*"]
+    for d in _SYSTEM_DIRS:
+        out += [f"rm -* /{d}", f"rm -* /{d}/*"]
     # A forcing push in any spelling (-f, -uf, +refspec, --force-with-lease), with or without git's global options.
     out += ["git push*--force*", "git push* -f*", "git -* push*--force*", "git -* push* -f*"]
     out += ["mkfs*", "dd*of=/dev/*"]
@@ -247,7 +273,7 @@ outward = []
 [gate]
 deny_commands = {arr(default_deny_commands())}
 # Paths no session may read. `~/` is your home; `**` crosses folders.
-deny_read = ["~/.ssh/**", "~/.gnupg/**", "~/.aws/credentials"]
+deny_read = {arr(list(DEFAULT_DENY_READ))}
 # Neutral tool names to switch off: {", ".join(KNOWN_TOOLS)}. An allowed web tool counts as a way out (leg C).
 deny_tools = []
 # Commands that run only after you approve that exact call, once: the gate refuses the first try and prints an id; in a
@@ -406,7 +432,7 @@ def loads(text: str) -> Policy:
     if not isinstance(srcs, dict):
         raise PolicyError("[sources] must be a table of tables")
     for name, body in srcs.items():
-        if not _NAME.match(name):
+        if not _NAME.fullmatch(name):
             raise PolicyError(f"[sources]: {name!r} is not a plain name (letters, digits, _ and -)")
         where = f"[sources.{name}] "
         body = _table(body, where.strip(), {"mode", "untrusted", "sensitive", "acts", "outward"})
@@ -437,7 +463,7 @@ def loads(text: str) -> Policy:
         _strings(g, "allow_write", "[gate] "),
     )
     for h in gate.allow_hosts:
-        if not _HOST.match(h):
+        if not _HOST.fullmatch(h):
             raise PolicyError(f"[gate] allow_hosts: {h!r} is not a host (a name, `*.name` or an IP, optional :port)")
     for w in gate.allow_write:
         n = posixpath.normpath(re.sub(r"^(\$HOME|\$\{HOME\})(?=/|$)", "~", w)) if w else ""
@@ -705,7 +731,7 @@ def _merge_flags(tokens: list[str]) -> list[str]:
     rm = cmd == "rm"
     while i < len(tokens):
         t = tokens[i]
-        if _FLAGS.match(t):
+        if _FLAGS.fullmatch(t):
             letters |= set(t[1:])
         elif rm and t in ("--recursive", "--force"):
             letters.add("r" if t == "--recursive" else "f")
@@ -1442,6 +1468,84 @@ def _dotted(op: str, cwd: str) -> str:
     return op
 
 
+_VALUE_BREAKS = re.compile(r"[=@<>:,]")
+
+
+def _word_paths(word: str) -> list[str]:
+    """The places a word may name besides itself: the text after `=`, `@`, `<`, `>`, `:` or `,` (`if=P`, `f=@P`,
+    `-d@P`, `host:P`, `file://P`), each piece between them, and the value glued to a short option (`-oP`). A word that
+    looks like a path is also judged whole, which covers the argument of an option the matcher does not know."""
+    flag = word.startswith("-") and len(word) > 1
+    found: list[str] = []
+    if not flag and ("/" in word or _is_pathlike(word)):
+        found.append(word)
+    if flag and word[1] != "-" and len(word) > 2:
+        found.append(word[2:])
+    pieces = _VALUE_BREAKS.split(word)
+    found += [p for p in (pieces[1:] if flag else pieces) if p]
+    found += [word[m.end() :] for m in _VALUE_BREAKS.finditer(word) if word[m.end() :]]
+    out = []
+    for p in found:
+        out.append(p)
+        if p.startswith("//") and p.lstrip("/")[:1] in ("~", "$"):
+            out.append(p.lstrip("/"))
+    return list(dict.fromkeys(out))
+
+
+def _home_folder(op: str, cwd: str) -> bool:
+    """Is this operand one person's whole home folder (`/home/NAME`, `/Users/NAME`)? The folders above it are rules in
+    the deny list; a path further down is ordinary work."""
+    return re.fullmatch(f"/(?:{'|'.join(_HOME_PARENTS)})/[^/]+", _abs(op, cwd)) is not None
+
+
+# Settings that make git run a command, or change what a later git command means (an alias can spell a forcing push).
+_GIT_RUNS = (
+    "core.hookspath", "core.sshcommand", "core.fsmonitor", "core.pager", "core.editor", "core.askpass",
+    "core.gitproxy", "core.alternaterefscommand", "credential.helper", "diff.external", "gpg.program",
+    "sequence.editor", "include.path",
+)  # fmt: skip
+_GIT_READS = {"--get", "--get-all", "--get-regexp", "--get-urlmatch", "--list", "-l", "--show-origin", "--show-scope"}
+_GIT_WRITES = {"--add", "--replace-all", "--unset", "--unset-all", "--edit", "-e"}
+_GIT_CONFIG_ENV = re.compile(r"(?:GIT_CONFIG_KEY_\d+|GIT_CONFIG_PARAMETERS)=(.*)", re.DOTALL)
+
+
+def _git_key_runs(key: str) -> bool:
+    key = key.lower()
+    return key.startswith("alias.") or key in _GIT_RUNS
+
+
+def _git_config_hazard(words: list[str], toks: list[str]) -> str | None:
+    """A reason when this command gives git an alias or a command to run: `git config KEY VALUE` for such a key,
+    `git -c KEY=VALUE` or `--config-env` with such a key, and GIT_CONFIG_KEY_n or
+    GIT_CONFIG_PARAMETERS in the environment. Reading a key stays allowed."""
+    for w in words:
+        m = _GIT_CONFIG_ENV.fullmatch(w)
+        if m and ("alias." in m.group(1).lower() or any(k in m.group(1).lower() for k in _GIT_RUNS)):
+            return "an environment setting gives git an alias or a command to run"
+    if not toks or toks[0] != "git":
+        return None
+    opts, rest = git_split(toks)
+    for i, o in enumerate(opts):
+        if o in ("-c", "--config-env") and i + 1 < len(opts):
+            value = opts[i + 1]
+        elif o.startswith("--config-env="):
+            value = o.split("=", 1)[1]
+        else:
+            continue
+        key = value.split("=", 1)[0].lower()
+        if _git_key_runs(key):
+            return f"git option {key} gives git an alias or a command to run"
+    if rest[1:2] == ["config"]:
+        flags, operands = _args(rest[1:])
+        if (
+            not any(f in _GIT_READS for f in flags)
+            and any(_git_key_runs(o) for o in operands)
+            and (len(operands) > 1 or any(f in _GIT_WRITES for f in flags))
+        ):
+            return "git config would set an alias or a command for git to run"
+    return None
+
+
 def _opt_values(toks: list[str], letters: str = "", longs: tuple[str, ...] = ()) -> list[str]:
     """The values given to an option: `-o X`, `-sSLo X` (the option last in a group), `--output X`, `--output=X`."""
     out = []
@@ -1586,6 +1690,21 @@ def _segment(policy: Policy, seg: str, ctx: _Ctx, in_pipe: bool, cands: list[str
         rule = _read_hit(policy, p, ctx.cwd, recursive=recursive)
         if rule:
             return f"command names a path denied by deny_read rule {rule!r}", line, nested
+    # Every word as typed, wrappers and their options included: a path sits in an option's value (`if=P`, `f=@P`,
+    # `-a P`) as often as it is an operand, whichever option the matcher knows. A folder above a protected one is
+    # judged only for the operands above, so a bare `/` inside a value is not a recursive read of everything.
+    for word in words:
+        for p in _word_paths(word):
+            rule = _read_hit(policy, p, ctx.cwd, recursive=recursive and p != "/")
+            if rule:
+                return f"command names a path denied by deny_read rule {rule!r}", line, nested
+    if cmd == "rm" and (_cluster(flags, "r") or "--recursive" in flags):
+        for op in operands:
+            if _home_folder(op, ctx.cwd):
+                return "rm of a whole home folder", line, nested
+    config = _git_config_hazard(words, toks)
+    if config:
+        return config, line, nested
     if ctx.protect:
         for p, ancestors in _written(cmd, flags, operands, redirs, canon, toks):
             hit = _under(ctx.protect, p, ctx.cwd, ancestors)
@@ -1813,13 +1932,14 @@ def is_denied_command(
         return f"the command ends inside an unclosed {quote} quote, so what runs cannot be read; close the quote"
     cands: list[str] = []
     reason = _walk_command(policy, command, cwd or _cwd(), tuple(protect), cands)
-    if reason:
-        return reason
+    # A deny_commands rule that matched is named first, whether or not a path check also stopped the walk (the parts it
+    # had read by then are in `cands`), so the reason says the rule that applies to the command.
     for pat in policy.gate.deny_commands:
         rx = _glob_regex(_canon_pattern(pat))
         if any(rx.match(c) for c in cands):
-            return f"command matches deny_commands rule {pat!r}"
-    return None
+            rule = f"command matches deny_commands rule {pat!r}"
+            return f"{rule}; also {reason}" if reason else rule
+    return reason
 
 
 def needs_approval(policy: Policy, command: str, *, cwd: str | None = None) -> bool:
@@ -1911,7 +2031,7 @@ def variants(pattern: str, limit: int = 24) -> list[str]:
     """Spellings of a deny pattern for runners that match the raw command text with no normalising: the flag cluster
     in every order and split (`-rf` -> `-rf`, `-fr`, `-r -f`, `-f -r`). The pattern itself comes first."""
     toks = pattern.split()
-    if len(toks) < 2 or not _FLAGS.match(toks[1]) or len(toks[1]) > 4:
+    if len(toks) < 2 or not _FLAGS.fullmatch(toks[1]) or len(toks[1]) > 4:
         return [pattern]
     from itertools import permutations
 

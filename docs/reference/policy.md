@@ -44,7 +44,7 @@ the built-in default, which has the list below.
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `deny_commands` | list of text | `[]` in a file | Shell command patterns no session may run. `ws gate init` writes the [built-in list](#built-in-deny_commands). |
-| `deny_read` | list of text | `[]` in a file | Paths no session may read. `~/` is your home. `**` crosses folders. `ws gate init` writes `~/.ssh/**`, `~/.gnupg/**` and `~/.aws/credentials`. Whatever the file says, ws also denies reads of its own secrets folder (`$WS_HOME/secrets`, and the `[roles.secrets] store` folder when the profile names one), for every runner. |
+| `deny_read` | list of text | `[]` in a file | Paths no session may read. `~/` is your home. `**` crosses folders. `ws gate init` writes the [built-in list](#built-in-deny_read). Whatever the file says, ws also denies reads of its own secrets folder (`$WS_HOME/secrets`, and the `[roles.secrets] store` folder when the profile names one), for every runner. |
 | `deny_tools` | list of text | `[]` | Neutral tool names to switch off. Known: `web_fetch`, `web_search`. An allowed web tool counts as a way out. |
 | `ask_commands` | list of text | `[]` | Command patterns that run only after you approve that exact call. Same globs as `deny_commands`. A command that also matches `deny_commands` stays denied. |
 | `allow_hosts` | list of text | `[]` | Hosts a session's shell may reach, for runners whose sandbox filters the network (Claude Code). Empty means the policy says nothing about the network. |
@@ -69,14 +69,32 @@ Rules:
   home folder after `.` and `..` are resolved.
 - `deny_tools` items must be a known tool name.
 
+### Built-in `deny_read`
+
+The default list, which `ws gate init` writes: `~/.ssh/**`, `~/.gnupg/**`, `~/.aws/**`, `~/.config/gcloud/**`,
+`~/.config/gh/hosts.yml`, `~/.config/ws/secrets/**`, `~/.docker/config.json`, `~/.kube/config`,
+`~/.claude/.credentials.json`, `~/.netrc`, `~/.npmrc`, `~/.pypirc` and `**/.env*`.
+
+The matcher checks a path wherever a word holds one: as an operand, after `=` (`if=PATH`), after a leading `@` or `<`
+(`-F f=@PATH`, `-d @PATH`), glued to a short option (`-d@PATH`), in a `host:PATH` or `file://PATH` form, and in the
+option of a wrapper such as `xargs -a PATH`.
+
 ### Built-in `deny_commands`
 
 The default list, which `ws gate init` writes:
 
-- Recursive deletes of `/`, `/*`, `~`, `~/*`, `/home`, `/Users`, and of the system folders `/bin`, `/boot`, `/dev`, `/etc`,
-  `/lib`, `/lib64`, `/proc`, `/root`, `/sbin`, `/sys`, `/usr`, `/System` and `/Library`. Written as `rm -* PATH`.
+- Recursive deletes of `/`, `/*`, `~`, `~/*`, and of each of these folders and `/FOLDER/*`: `/home`, `/Users`, `/bin`,
+  `/boot`, `/dev`, `/etc`, `/lib`, `/lib64`, `/proc`, `/root`, `/sbin`, `/sys`, `/usr`, `/var`, `/opt`, `/srv`, `/mnt`,
+  `/media`, `/run`, `/snap`, `/System`, `/Library`, `/Volumes`, `/Applications` and `/private`. Written as
+  `rm -* PATH`. A longer name such as `/variant` isn't covered. A recursive delete of one person's whole home folder
+  (`/home/NAME`, `/Users/NAME`) is also denied, and a folder further down is ordinary work.
 - A forcing push in any spelling: `git push*--force*`, `git push* -f*`, and both with git's global options.
 - `mkfs*` and `dd*of=/dev/*`.
+- Git settings that define an alias or name a command for git to run, however they're given: `git config KEY VALUE`,
+  `git -c KEY=VALUE`, `--config-env` and `GIT_CONFIG_KEY_N`. The keys are `alias.*`, `core.hooksPath`,
+  `core.sshCommand`, `core.fsmonitor`, `core.pager`, `core.editor`, `core.askPass`, `core.gitProxy`,
+  `core.alternateRefsCommand`, `credential.helper`, `diff.external`, `gpg.program`, `sequence.editor` and
+  `include.path`. Reading a key stays allowed.
 - A shell that reads its script from standard input: `sh`, `sh -s*` and `sh -`, and the same three for `bash`, `zsh` and
   `dash`.
 
@@ -135,7 +153,7 @@ sensitive = true
 acts = ["write"]
 
 [gate]
-deny_read = ["~/.ssh/**", "~/.gnupg/**", "~/.aws/credentials"]
+deny_read = ["~/.ssh/**", "~/.gnupg/**", "~/.aws/**"]
 deny_tools = ["web_fetch", "web_search"]
 ask_commands = ["git push*"]
 allow_hosts = ["api.anthropic.com", "github.com"]

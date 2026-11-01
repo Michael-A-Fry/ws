@@ -115,6 +115,14 @@ command builds, or the version-control tool restoring a protected tracked file.
 
 - **Workaround.** Rely on the wall for these, and keep `ask_commands` for the actions that matter.
 
+### The default lists name common places only
+
+The matcher reads a path in an option's value, but only against your `deny_read` list. A credential file the list
+doesn't name is readable. `**/.env*` also covers `.env.example`. A git alias set before the session starts runs as
+written.
+
+- **Workaround.** Add your own paths to `deny_read`, and rely on the wall.
+
 ### Approvals aren't a defence against a determined session
 
 A session that allocates its own terminal and clears the session marker can defeat the first two `ws approve` checks.

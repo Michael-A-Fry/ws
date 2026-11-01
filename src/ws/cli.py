@@ -39,6 +39,7 @@ from ws import eval as ws_eval
 from ws import globals as ws_globals
 from ws.output import WsError
 from ws.profile import ProfileError, load, profile_path, write_if_changed
+from ws.style import Style
 
 YES = {"y", "yes", "true", "1", "on"}
 NO = {"n", "no", "false", "0", "off"}
@@ -68,7 +69,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     if args.json:
         output.result(doctor.report(checks, osi, path), status=output.ATTENTION if bad else output.OK)
     else:
-        print(doctor.render(checks, osi))
+        print(doctor.render(checks, osi, Style.detect(sys.stdout, no_color=getattr(args, "no_color", False))))
     return 1 if bad else 0
 
 
@@ -207,7 +208,7 @@ def _help_json(parser: argparse.ArgumentParser) -> dict:
         "commands": kids,
         "options": options,
         "positionals": positionals,
-        "global_options": ["--json", "-C PATH"],
+        "global_options": ["--json", "-C PATH", "--no-color"],
     }
 
 
@@ -239,6 +240,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--version", action="version", version=f"ws {__version__}")
     p.add_argument("--json", action="store_true", help="every command: one JSON envelope on stdout (or WS_OUTPUT=json)")
     p.add_argument("-C", "--cwd", metavar="PATH", help="every command: run as if started in PATH")
+    p.add_argument(
+        "--no-color", action="store_true", help="every command: print no colour (a non-empty NO_COLOR does the same)"
+    )
     p.set_defaults(ws_command="ws", ws_parser=p, ws_root=p)
     sub = p.add_subparsers(dest="command", required=True)
 
@@ -286,23 +290,27 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
-    kind, want_json = "ws", output.wants_json(raw)
+    kind, want_json, no_color = "ws", output.wants_json(raw), False
     try:
         g, rest = output.split_global(raw)
-        want_json = g.json
+        want_json, no_color = g.json, g.no_color
         parser = build_parser()
         flags = [o for a in parser._actions for o in a.option_strings]
         spec = extcmd.plan(raw, g, rest, _subcommands(parser), flags)
         if g.cwd is not None and (spec is None or spec.keep_cwd):
             output.enter_cwd(g.cwd)
         if spec is not None:
+            if g.no_color:
+                spec.env["NO_COLOR"] = "1"
             return extcmd.launch(spec)
         args = parser.parse_args(rest)
+        # the global flag was taken out into `g`; `ws setup` also declares its own, which the parser read
+        args.no_color = bool(getattr(args, "no_color", False)) or g.no_color
         kind = args.ws_command
         return output.dispatch(args, kind, g.json)
     except WsError as e:
         if want_json:
             print(json.dumps(output.error_envelope(e, kind), indent=2))
         else:
-            print(output.error_text(e), file=sys.stderr)
+            print(output.error_text(e, Style.detect(sys.stderr, no_color=no_color)), file=sys.stderr)
         return e.exit_code

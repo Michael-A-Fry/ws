@@ -5,6 +5,9 @@ It answers "why did the agent do that". Origin is `global` (the runner's user co
 scan as `ws globals check` (src/ws/globals.py); the rules, settings and MCP files are the fixed names in FILES below. A
 file that is not there is not listed. Only names and sizes are read, plus the key names of a JSON settings file (which
 hooks and MCP servers it sets); no file content is shown.
+
+A path is listed once per runner, and a skill folder with no main file is shown as a folder (a trailing `/`). The text
+output goes through `style.py`; `--json` is the same data with a `folder` flag on each row.
 """
 
 from __future__ import annotations
@@ -12,10 +15,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
 
 from ws import adapters, output
 from ws import globals as ws_globals
+from ws.style import Style, pad, plural
 
 # runner -> (kind, name below the user config folder, name below the repo). Kinds: rules, settings, mcp.
 FILES: dict[str, list[tuple[str, str | None, str | None]]] = {
@@ -74,6 +79,7 @@ def _row(runner: str, kind: str, path: Path, origin: str, name: str = "", reason
         "kind": kind,
         "name": name or path.name,
         "path": str(path),
+        "folder": path.is_dir(),
         "origin": origin,
         "bytes": _size(path),
     }
@@ -81,6 +87,18 @@ def _row(runner: str, kind: str, path: Path, origin: str, name: str = "", reason
         row["reason"] = reason
     row.update(_sets(path))
     return row
+
+
+def _once(rows: list[dict]) -> list[dict]:
+    """The rows with a repeated path dropped (the first stays): a folder that holds several files is scanned as a whole
+    and as its parts, and a link can reach the same file twice."""
+    seen: set[str] = set()
+    out = []
+    for r in rows:
+        if r["path"] not in seen:
+            seen.add(r["path"])
+            out.append(r)
+    return out
 
 
 def collect(start: Path, env: dict | None = None) -> dict:
@@ -106,7 +124,7 @@ def collect(start: Path, env: dict | None = None) -> dict:
                 rel = (proj / e.path).relative_to(repo).as_posix()
                 why = next((r for o, r in overrides.items() if ws_globals._covers(o, rel)), "")
                 rows.append(_row(runner, e.kind, proj / e.path, "override" if why else "repo", e.name, why))
-        runners[runner] = rows
+        runners[runner] = _once(rows)
     return {
         "cwd": str(start),
         "repo": str(repo),
@@ -116,18 +134,22 @@ def collect(start: Path, env: dict | None = None) -> dict:
     }
 
 
-def render(data: dict) -> str:
-    out = [f"repo: {data['repo']}"]
+def render(data: dict, st: Style | None = None) -> str:
+    st = st or Style()
+    out = [f"{st.muted('repo:')} {data['repo']}"]
     for runner, rows in data["runners"].items():
-        out.append(f"{runner}: {len(rows)} file(s), {sum(r['bytes'] for r in rows):,} bytes")
+        total = plural(sum(r["bytes"] for r in rows), "byte")
+        out.append(st.heading(f"{runner}:") + f" {plural(len(rows), 'item')}, {total}")
         for r in rows:
             extra = ""
             if r.get("hooks"):
                 extra += f"  hooks: {', '.join(r['hooks'])}"
             if r.get("mcp_servers"):
                 extra += f"  mcp: {', '.join(r['mcp_servers'])}"
-            out.append(f"  {r['origin']:<8} {r['kind']:<9} {r['bytes']:>8,}  {r['path']}{extra}")
-    out += [f"error: {e}" for e in data["errors"]]
+            origin = pad(st.warn(r["origin"]) if r["origin"] == "override" else st.muted(r["origin"]), 8)
+            path = r["path"] + ("/" if r.get("folder") else "")
+            out.append(f"  {origin} {r['kind']:<9} {r['bytes']:>8,}  {path}{extra}")
+    out += [f"{st.status('fail', 'error')}: {e}" for e in data["errors"]]
     return "\n".join(out)
 
 
@@ -136,7 +158,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     if args.json:
         output.result(data)
     else:
-        print(render(data))
+        print(render(data, Style.detect(sys.stdout, no_color=getattr(args, "no_color", False))))
     return 0
 
 

@@ -4,7 +4,7 @@ Every `ws` command and flag. This page is generated from the command parsers, so
 command is for, see [Usage](../usage.md).
 
 ```text
-ws [--json] [-C PATH] [--version] COMMAND ...
+ws [--json] [--no-color] [-C PATH] [--version] COMMAND ...
 ```
 
 ## Global options
@@ -15,6 +15,7 @@ These work on every command, before or after the command name.
 |---|---|
 | `--json` | Print one JSON envelope on standard output. `WS_OUTPUT=json` does the same. |
 | `-C PATH`, `--cwd PATH` | Run as if started in `PATH`. |
+| `--no-color` | Print no colour. A non-empty `NO_COLOR` does the same. |
 | `--version` | Print `ws X.Y.Z` and exit. |
 | `-h`, `--help` | Print help for the command and exit. `ws help COMMAND` does the same. |
 

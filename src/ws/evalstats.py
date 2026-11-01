@@ -361,6 +361,43 @@ def compute(
     }
 
 
+# ---- trials that never started -------------------------------------------------------------------------------------
+
+
+def is_setup_error(result: dict, runs: dict[str, dict]) -> bool:
+    """True for a trial that failed before the runner was launched: status "error" and either no run record at all
+    (the job could not load or build) or a record with no exit code and no runner path (the runner was not on PATH, or
+    ws failed while preparing the run). A run stopped part-way (a signal) has a runner path, so it stays a failure. Those say something about the machine, not about the arm, so they are counted apart. A run that
+    started and then failed or timed out has an exit code and stays an ordinary failure; so does a refused one. A
+    result whose record is no longer in the log (rotated away) cannot be told, and stays counted."""
+    if result.get("status") != "error":
+        return False
+    run_id = result.get("run_id")
+    if not run_id:
+        return True
+    rec = runs.get(str(run_id))
+    return rec is not None and rec.get("exit_code") is None and not rec.get("exe_path")
+
+
+def split_setup_errors(results: list[dict], runs: dict[str, dict]) -> tuple[list[dict], list[dict]]:
+    """(the trials that count, the setup errors), in their original order."""
+    counted: list[dict] = []
+    setup: list[dict] = []
+    for r in results:
+        (setup if is_setup_error(r, runs) else counted).append(r)
+    return counted, setup
+
+
+def setup_error_report(setup: list[dict]) -> dict:
+    """The setup errors as a report block: the total, and per arm how many and which task and trial."""
+    by_arm: dict[str, dict] = {}
+    for r in setup:
+        entry = by_arm.setdefault(str(r.get("arm")), {"count": 0, "trials": []})
+        entry["count"] += 1
+        entry["trials"].append({"task": r.get("task"), "trial": r.get("trial"), "run_id": r.get("run_id")})
+    return {"count": len(setup), "by_arm": dict(sorted(by_arm.items()))}
+
+
 # ---- comparing two arms -------------------------------------------------------------------------------------------
 
 

@@ -1060,12 +1060,30 @@ def test_a_child_that_ignores_sigterm_does_not_survive_the_timeout(ws, monkeypat
 
 
 ORPHAN = f"""#!{sys.executable}
-import subprocess, sys, time
+import os, subprocess, sys, time
 sys.stdin.read()
-child = "import os, time\\nopen(os.environ['WS_HOME'] + '/orphan.pid', 'w').write(str(os.getpid()))\\ntime.sleep(60)"
+pidfile = os.path.join(os.environ["WS_HOME"], "orphan.pid")
+child = (
+    "import os, time\\n"
+    "pidfile = os.environ['WS_HOME'] + '/orphan.pid'\\n"
+    "open(pidfile + '.tmp', 'w').write(str(os.getpid()))\\n"
+    "os.replace(pidfile + '.tmp', pidfile)\\n"  # atomic: the pid file is whole or absent, and only once this runs
+    "time.sleep(60)"
+)
 subprocess.Popen([sys.executable, "-c", child])
-time.sleep(0.5)
+deadline = time.monotonic() + 20
+while not os.path.exists(pidfile) and time.monotonic() < deadline:  # leave only once the grandchild is running
+    time.sleep(0.01)
 """
+
+
+def wait_gone(pid: int, seconds: float = 10.0) -> bool:
+    end = time.monotonic() + seconds
+    while alive(pid):
+        if time.monotonic() >= end:
+            return False
+        time.sleep(0.02)
+    return True
 
 
 def test_a_grandchild_left_behind_by_a_runner_that_exits_is_killed_too(ws, tmp_path):
@@ -1074,9 +1092,11 @@ def test_a_grandchild_left_behind_by_a_runner_that_exits_is_killed_too(ws, tmp_p
     out.mkdir()
     env = {**os.environ, "WS_HOME": str(ws.home)}
     t0 = time.monotonic()
-    code, timed_out, _ = run._spawn([str(ws.bin / "claude")], env, tmp_path, 20, None, out)
-    assert code == 0 and not timed_out and time.monotonic() - t0 < 10  # not held up by the orphan holding the pipes
-    assert not alive(int((ws.home / "orphan.pid").read_text()))
+    code, timed_out, _ = run._spawn([str(ws.bin / "claude")], env, tmp_path, 30, None, out)
+    assert code == 0 and not timed_out and time.monotonic() - t0 < 25  # not held up by the orphan holding the pipes
+    pidfile = ws.home / "orphan.pid"
+    assert pidfile.exists(), "the runner left before its grandchild was running"
+    assert wait_gone(int(pidfile.read_text())), "the grandchild survived the runner"
 
 
 def test_ctrl_c_kills_the_runner_writes_the_record_and_releases_the_lease(ws, capsys):

@@ -12,9 +12,48 @@ import os
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 
+from ws.output import WsError
+
 DEFAULT_BASE = "https://api.anthropic.com"
+BASE_ENV = "WS_ANTHROPIC_API_BASE"
+TEST_LOOPBACK_ENV = "WS_TEST_ALLOW_LOOPBACK_BASE"  # tests only: lets BASE_ENV name a local stub server
+LOOPBACK = ("127.0.0.1", "localhost", "::1")
+
+
+class BaseRefused(WsError):
+    """The base URL from the environment is not the provider's own host."""
+
+    def __init__(self, why: str):
+        super().__init__("refused", f"${BASE_ENV} {why}", f"unset ${BASE_ENV}, or set it to {DEFAULT_BASE}")
+
+
+def env_base(environ: Mapping[str, str] | None = None) -> str:
+    """The base URL the usage report is read from. `$WS_ANTHROPIC_API_BASE` is honoured only when it names the
+    provider's own host (https, no user, port or query), because the Admin key is sent to it. Anything else raises
+    BaseRefused. A loopback address is honoured only when the test flag is set."""
+    environ = os.environ if environ is None else environ
+    value = environ.get(BASE_ENV)
+    if not value:
+        return DEFAULT_BASE
+    if any(c.isspace() or ord(c) < 32 or c == "\\" for c in value):
+        raise BaseRefused("has spaces, control characters or a backslash in it")
+    try:
+        parts = urllib.parse.urlsplit(value)
+        host, port = (parts.hostname or "").lower(), parts.port
+    except ValueError:
+        raise BaseRefused("isn't a URL ws can read") from None
+    if parts.username is not None or parts.password is not None or "@" in parts.netloc:
+        raise BaseRefused("names a user")
+    if parts.query or parts.fragment or parts.path.strip("/"):
+        raise BaseRefused("must be a host alone, with no path or query")
+    own = parts.scheme == "https" and host == urllib.parse.urlsplit(DEFAULT_BASE).hostname and port in (None, 443)
+    local = host in LOOPBACK and environ.get(TEST_LOOPBACK_ENV) == "1"
+    if not (own or local):
+        raise BaseRefused(f"must be {DEFAULT_BASE} (the provider's own host)")
+    return value.rstrip("/")
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -36,7 +75,10 @@ def check_anthropic(key: str, base: str | None = None, now: datetime | None = No
         return "fail", "the key contains spaces or control characters; paste it again"
     if not key.startswith("sk-ant-admin"):
         return "fail", "the key is not an Admin API key (sk-ant-admin...); a normal API key cannot read usage"
-    base = (base or os.environ.get("WS_ANTHROPIC_API_BASE") or DEFAULT_BASE).rstrip("/")
+    try:
+        base = (base or env_base()).rstrip("/")
+    except BaseRefused as e:
+        return "fail", f"{e}; the Admin key is sent only to the provider's own host"
     parts = urllib.parse.urlsplit(base)
     if parts.scheme != "https" and parts.hostname not in ("127.0.0.1", "localhost"):
         return "fail", "the usage report base URL must be https (plain http only to localhost, for tests)"

@@ -16,6 +16,7 @@ import pytest
 
 from ws import approvals, cli, jobs, jsonl, policy, sandbox
 from ws.adapters import claude_code, opencode
+from ws.output import WsError
 
 
 def sandbox_policy():
@@ -1147,3 +1148,111 @@ def test_doctor_warns_when_ptrace_scope_is_zero_or_absent_and_gives_the_fix(tmp_
 def test_the_opencode_shim_marks_the_runner_undumpable():
     shim = opencode.generate(policy.loads(""), ["ws"], Path("/x/out"), Path("/x/policy.toml"))[opencode.PLUGIN]
     assert "prctl" in shim and "symbols.prctl(4, 0, 0, 0, 0)" in shim and "await undumpable()" in shim
+
+
+# --- the runner's environment -------------------------------------------------------------------------------------
+
+CREDENTIAL_NAMES = (
+    "ANTHROPIC_API_KEY", "ANTHROPIC_ADMIN_KEY", "OPENAI_API_KEY", "GITHUB_TOKEN", "GH_TOKEN", "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "SSH_AUTH_SOCK", "HTTPS_PROXY", "NPM_TOKEN", "WS_ANTHROPIC_API_BASE",
+)  # fmt: skip
+
+
+def planted(monkeypatch) -> dict[str, str]:
+    """A made-up value in each credential name, built here so no real one is ever in the file."""
+    values = {name: "planted-" + "x" * 6 + f"-{i}" for i, name in enumerate(CREDENTIAL_NAMES)}
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+    return values
+
+
+def all_values(e: dict) -> str:
+    return "\n".join(f"{k}={v}" for k, v in e.items())
+
+
+def test_launch_env_hands_over_only_the_listed_names():
+    plain = {"PATH": "/bin", "HOME": "/h", "LC_ALL": "C", "XDG_DATA_HOME": "/d", "TERM": "x"}
+    got = sandbox.launch_env({n: "v" for n in CREDENTIAL_NAMES} | plain)
+    assert not set(CREDENTIAL_NAMES) & set(got)
+    assert set(got) == {*plain, "WS_GATED_SESSION"} and got["WS_GATED_SESSION"] == "1"
+
+
+def test_launch_env_keeps_the_runners_own_variables():
+    parent = {"CLAUDE_CONFIG_DIR": "/c", "OPENCODE_CONFIG_DIR": "/o", "OPENCODE_CONFIG": "/oc", "OTHER": "x"}
+    assert "CLAUDE_CONFIG_DIR" in sandbox.launch_env(parent, runner="claude-code")
+    got = sandbox.launch_env(parent, runner="opencode")
+    assert "CLAUDE_CONFIG_DIR" not in got and "OTHER" not in got
+    assert got["OPENCODE_CONFIG_DIR"] == "/o" and got["OPENCODE_CONFIG"] == "/oc"
+
+
+def test_pass_env_adds_exactly_the_names_given_and_cannot_unmark_the_session():
+    parent = {"ANTHROPIC_API_KEY": "k", "GITHUB_TOKEN": "t", "WS_GATED_SESSION": "0"}
+    got = sandbox.launch_env(parent, pass_env=["ANTHROPIC_API_KEY", "WS_GATED_SESSION", "NOT_SET"])
+    assert got == {"ANTHROPIC_API_KEY": "k", "WS_GATED_SESSION": "1"}
+
+
+@pytest.mark.parametrize("name", ["", "A=b", "*", "1X", "A B", "A-B", "A\n", "$(id)", "A,B"])
+def test_pass_env_takes_a_plain_variable_name_only(name):
+    with pytest.raises(WsError) as e:
+        sandbox.check_pass_env([name])
+    assert e.value.kind == "usage" and e.value.hint
+
+
+def test_launch_leaves_the_shells_credentials_behind(env, monkeypatch, tmp_path):
+    values = planted(monkeypatch)
+    monkeypatch.setattr(sandbox, "wrap", lambda argv, *a, **k: sandbox.Wrapped(["wall", *argv]))
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    monkeypatch.chdir(proj)
+    assert cli.main(["gate", "launch", "--runner", "opencode", "--", "opencode"]) == 0
+    _, e, _ = env[0]
+    assert not set(CREDENTIAL_NAMES) & set(e)
+    assert not any(v in all_values(e) for v in values.values())
+    assert e["PATH"] and e["HOME"] and e["WS_GATED_SESSION"] == "1"
+
+
+def test_launch_without_a_wall_also_leaves_them_behind(env, monkeypatch, capsys):
+    values = planted(monkeypatch)
+    assert cli.main(["gate", "launch", "--runner", "opencode", "--no-sandbox", "--", "opencode"]) == 0
+    assert not any(v in all_values(env[0][1]) for v in values.values())
+    capsys.readouterr()
+
+
+def test_claude_code_launch_leaves_them_behind_too(env, monkeypatch, tmp_path, wshome):
+    values = planted(monkeypatch)
+    claude_launch_setup(env, monkeypatch, tmp_path, wshome, "one")
+    assert cli.main(["gate", "launch", "--runner", "claude-code", "--", "claude"]) == 0
+    assert not any(v in all_values(env[0][1]) for v in values.values())
+
+
+def test_pass_env_hands_over_the_named_variable_and_says_so(env, monkeypatch, tmp_path, capsys):
+    values = planted(monkeypatch)
+    monkeypatch.setattr(sandbox, "wrap", lambda argv, *a, **k: sandbox.Wrapped(["wall", *argv]))
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    monkeypatch.chdir(proj)
+    argv = [
+        "gate",
+        "launch",
+        "--runner",
+        "opencode",
+        "--pass-env",
+        "GH_TOKEN",
+        "--pass-env",
+        "NPM_TOKEN",
+        "--",
+        "opencode",
+    ]
+    assert cli.main(argv) == 0
+    _, e, _ = env[0]
+    assert e["GH_TOKEN"] == values["GH_TOKEN"] and e["NPM_TOKEN"] == values["NPM_TOKEN"]
+    assert "ANTHROPIC_API_KEY" not in e and "GITHUB_TOKEN" not in e
+    err = capsys.readouterr().err
+    assert "passing GH_TOKEN, NPM_TOKEN" in err and not any(v in err for v in values.values())
+
+
+def test_a_bad_pass_env_name_stops_the_launch(env, capsys):
+    assert cli.main(["gate", "launch", "--runner", "opencode", "--pass-env", "A=b", "--", "opencode"]) == 1
+    err = capsys.readouterr().err
+    assert "variable name" in err and "hint:" in err
+    assert env == []

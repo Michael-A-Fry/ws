@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import ClassVar
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -235,6 +236,7 @@ def test_usage_rejects_a_normal_api_key_before_any_call(stub):
 def test_usage_role_wiring(stub, monkeypatch):
     _, base = stub
     monkeypatch.setenv("WS_ANTHROPIC_API_BASE", base)
+    monkeypatch.setenv("WS_TEST_ALLOW_LOOPBACK_BASE", "1")  # a local stub is honoured only with the test flag
     _Stub.status, _Stub.body = 200, b'{"data": []}'
     cfg = {"adapter": "anthropic", "key_env": "WS_TEST_ADMIN"}
     assert doctor._usage(cfg, linux(), {}, True)[0] == "fail"
@@ -300,3 +302,51 @@ def test_init_reports_a_roles_notes_that_is_not_a_table(home, capsys):
     p.write_text('[roles]\nnotes = "oops"\n')
     assert cli.main(["init", "--yes", "--notes", str(home)]) == 1
     assert "must be tables" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "https://usage.example.com",
+        "https://api.anthropic.com.usage.example.com",
+        "https://api.anthropic.com" + "@" + "usage.example.com",
+        "https://user:pw" + "@" + "api.anthropic.com",
+        "http://api.anthropic.com",
+        "https://api.anthropic.com:8443",
+        "https://api.anthropic.com/x",
+        "https://api.anthropic.com?x=1",
+        "https://api.anthropic.com\nx",
+        "https://api.anthropic.com\\@usage.example.com",
+        "http://127.0.0.1:9",
+        "https://localhost",
+    ],
+)
+def test_the_usage_base_url_from_the_environment_must_be_the_providers_own_host(value):
+    with pytest.raises(usage.BaseRefused) as e:
+        usage.env_base({"WS_ANTHROPIC_API_BASE": value})
+    assert e.value.kind == "refused" and "WS_ANTHROPIC_API_BASE" in str(e.value) and e.value.hint
+
+
+@pytest.mark.parametrize(
+    "value", ["", "https://api.anthropic.com", "https://API.anthropic.com/", "https://api.anthropic.com:443"]
+)
+def test_the_usage_base_url_accepts_the_providers_own_host(value):
+    assert urlsplit(usage.env_base({"WS_ANTHROPIC_API_BASE": value})).hostname == "api.anthropic.com"
+
+
+def test_a_loopback_usage_base_needs_the_test_flag():
+    env = {"WS_ANTHROPIC_API_BASE": "http://127.0.0.1:8123"}
+    with pytest.raises(usage.BaseRefused):
+        usage.env_base(env)
+    assert usage.env_base({**env, "WS_TEST_ALLOW_LOOPBACK_BASE": "1"}) == "http://127.0.0.1:8123"
+
+
+def test_a_refused_usage_base_sends_nothing_and_never_shows_the_key(monkeypatch):
+    def never(*a, **k):
+        raise AssertionError("the key must not be sent")
+
+    monkeypatch.setattr(usage._OPENER, "open", never)
+    monkeypatch.delenv("WS_TEST_ALLOW_LOOPBACK_BASE", raising=False)
+    monkeypatch.setenv("WS_ANTHROPIC_API_BASE", "https://usage.example.com")
+    status, detail = usage.check_anthropic(KEY)
+    assert status == "fail" and "WS_ANTHROPIC_API_BASE" in detail and KEY not in detail

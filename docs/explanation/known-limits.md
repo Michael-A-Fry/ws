@@ -106,6 +106,17 @@ The grader's wall in `ws eval` has the same network as the runner's wall.
 
 - **Workaround.** Use Claude Code if you need host filtering, or filter at your firewall.
 
+### The runner gets a short list of environment variables
+
+`ws gate launch` hands the runner `PATH`, `HOME`, the locale and terminal names, `XDG_*`, `WS_HOME`, the broker socket
+and the runner's own configuration variables. The rest of the launching shell's environment stays behind.
+
+- **What it means.** A key you export in that shell isn't in the session unless you name it with `--pass-env NAME`.
+  A name you pass is readable by the session and by every program it starts. A runner behind a proxy needs the proxy
+  variable passed too.
+- **Workaround.** Pass only what the runner needs, or use a lease from the [broker](broker.md) so the session never
+  holds the value.
+
 ## The gate and approvals
 
 ### The matcher reads text

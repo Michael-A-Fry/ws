@@ -47,7 +47,8 @@ WSL2 it's not built yet, and `ws doctor` (WS104) stays at warn.
 
 - **A same-user store.** Until you run the secret wall, a program running as you can read the store files. WS104 warns.
 - **A secret the agent already has.** The broker can't take back a key that's in the environment, a file the agent can
-  read or its prompt.
+  read or its prompt. `ws gate launch` starts the runner with a short list of environment variables, not the whole
+  shell's; a variable you name with `--pass-env` is the agent's.
 - **A value used for its own host.** A lease lets a session make requests to the allowed host, so it can use the key
   there. Scope the registry to the narrowest host and purpose.
 - **Secrets the broker doesn't read yet.** The `sops-age` role is named in the profile and checked by `ws doctor`, but

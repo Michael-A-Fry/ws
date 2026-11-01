@@ -265,19 +265,28 @@ allow_write = []
 # Guards: small named checks that run beside the rules above. `ws gate generate` writes the runner hooks they need.
 #   syntax-check     after an edit, checks the file by its extension (.py, .json, .toml, .sh, .js) and tells the model the
 #                    line that does not parse
-#   session-context  at session start, lists which of the files below exist in the project
+#   session-context  at session start, lists which of the files below exist in the project, warns when an API key (not
+#                    the subscription) bills the session, and says once for each ws version what changed
 #   bulk-staging     stops `git add -A`, `git add .` and `git commit -a`, so a commit holds only named files
 #   record-calls     appends each tool call to $WS_HOME/logs/gate-calls.jsonl, for `ws gate replay`
 #   test-weakening   before a test file is written, denies a skip marker added to an existing test
-#   claims           checks a commit named beside merged, pushed or on main against a ref
+#   claims           checks a commit named beside merged, pushed or on main against a ref; with release_dir, a release
+#                    called live must be the one its `current` link points at
 #   spawn-cap        denies a subagent start at max_agents running (default from the machine's CPUs and memory)
-#   skill-gate       a write to chosen paths waits for a skill ([[guards.skill-gate]] skill, paths)
+#   skill-gate       a write to chosen paths waits for a skill ([[guards.skill-gate]] skill, paths); a skill's own
+#                    SKILL.md front matter can list `gates` (path globs) too, from skill_dirs
 [guards]
 on = ["syntax-check", "session-context"]
 # [guards.syntax-check]
 # extra = {{ yaml = ["yamllint", "-d", "relaxed"] }}   # an extension and the checker that gets the file path appended
 # [guards.session-context]
 # files = [".claude-state/STATE.md"]
+# warn_api_key = true   # on by default: a line when ANTHROPIC_API_KEY, not the subscription, bills a session
+# [guards.claims]
+# release_dir = "~/releases"   # a folder whose `current` link names the promoted release; left out, claims are off
+# release_tags = ["v[0-9]+[.][0-9]+([.][0-9]+)*"]   # regexes for a release's name; the default reads v1.2 and v1.2.3
+# [guards.skill-gate]
+# skill_dirs = ["~/.claude/skills"]   # where skills keep their own `gates`; add rules as [[guards.skill-gate.rules]]
 # [guards.spawn-cap]
 # max_agents = 4   # optional: left out, half the CPUs or half the GiB of memory, whichever is less (2 to 8)
 

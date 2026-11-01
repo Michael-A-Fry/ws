@@ -83,6 +83,26 @@ def pass_hat_k(per_task: list[tuple[int, int]], k: int) -> float | None:
     return sum(shares) / len(shares) if shares else None
 
 
+def trend(results: list[dict]) -> list[dict]:
+    """The pass rate per batch, oldest batch first: [{batch, ts, n, pass_rate}]. `ts` is the first trial of the batch,
+    `n` its trials. A result with no batch name is left out; no results give an empty list."""
+    batches: dict[str, list[dict]] = {}
+    for r in results:
+        if isinstance(r.get("batch"), str) and r["batch"]:
+            batches.setdefault(r["batch"], []).append(r)
+    rows = []
+    for batch, trials in batches.items():
+        stamped = sorted(
+            (str(t["ts"]) for t in trials if t.get("ts")),
+            key=lambda s: (parse_ts(s) or datetime.max.replace(tzinfo=UTC), s),
+        )
+        passed = sum(1 for t in trials if t.get("pass") is True)
+        rows.append(
+            {"batch": batch, "ts": stamped[0] if stamped else None, "n": len(trials), "pass_rate": passed / len(trials)}
+        )
+    return sorted(rows, key=lambda row: (parse_ts(row["ts"]) or datetime.max.replace(tzinfo=UTC), row["batch"]))
+
+
 # ---- small helpers ------------------------------------------------------------------------------------------------
 
 

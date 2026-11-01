@@ -1,10 +1,11 @@
-"""The output contract for every `ws` command: one typed error, one JSON envelope, and two global flags.
+"""The output contract for every `ws` command: one typed error, one JSON envelope, and the global flags.
 
 A command signals failure by raising `WsError(kind, message, hint, exit_code)`; the kind is chosen where it is raised
-and is never worked out from message text. With `--json` (or `WS_OUTPUT=json`) stdout carries exactly one JSON document
-in the envelope shape `ws.cli/1`, whatever the command prints along the way. `-C PATH` / `--cwd PATH` run any command
-from another folder. Commands that speak a protocol, are a hook or ask a person a question are "raw": they keep the
-terminal and report errors as text on stderr. Changing either envelope shape means bumping `SCHEMA`.
+and is never worked out from message text. With `--json` (or `WS_OUTPUT=json`) stdout carries exactly one JSON
+document in the envelope shape `ws.cli/1`, whatever the command prints along the way. `-C PATH` / `--cwd PATH` run any
+command from another folder. `--no-color` turns colour off for any command (a non-empty `NO_COLOR` does the same, see
+`style.py`). Commands that speak a protocol, are a hook or ask a person a question are "raw": they keep the terminal
+and report errors as text on stderr. Changing either envelope shape means bumping `SCHEMA`.
 """
 
 from __future__ import annotations
@@ -18,6 +19,8 @@ import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
+
+from ws.style import Style
 
 SCHEMA = "ws.cli/1"
 OK = "ok"
@@ -68,14 +71,17 @@ def error_envelope(e: WsError, kind: str = "ws") -> dict:
     return env
 
 
-def error_text(e: WsError) -> str:
-    return f"ws: {e.message}" + (f"\nhint: {e.hint}" if e.hint else "")
+def error_text(e: WsError, style: Style | None = None) -> str:
+    """The error as the person reads it: `ws: message`, then `hint: ...`. Colour only reinforces (red, then quiet)."""
+    st = style or Style()
+    return f"ws: {st.error(e.message)}" + (f"\nhint: {st.muted(e.hint)}" if e.hint else "")
 
 
 @dataclass
 class Globals:
     json: bool = False
     cwd: str | None = None
+    no_color: bool = False
 
 
 def wants_json(argv: Sequence[str], env: Any = None) -> bool:
@@ -92,7 +98,8 @@ def wants_json(argv: Sequence[str], env: Any = None) -> bool:
 
 
 def split_global(argv: Sequence[str], env: Any = None) -> tuple[Globals, list[str]]:
-    """Take `--json` and `-C PATH` out of `argv` wherever they sit, up to the first bare `--`. Returns them and the rest."""
+    """Take `--json`, `--no-color` and `-C PATH` out of `argv` wherever they sit, up to the first bare `--`. Returns them
+    and the rest."""
     g = Globals(json=wants_json([], env))
     rest: list[str] = []
     i = 0
@@ -103,6 +110,8 @@ def split_global(argv: Sequence[str], env: Any = None) -> tuple[Globals, list[st
             break
         if tok == "--json":
             g.json = True
+        elif tok == "--no-color":
+            g.no_color = True
         elif tok in ("-C", "--cwd"):
             if i + 1 >= len(argv):
                 raise WsError("usage", f"{tok} needs a folder", "e.g. `ws -C ~/code/app doctor`", 2)
@@ -153,6 +162,10 @@ def _raw(args: Any) -> bool:
     return bool(flag(args)) if callable(flag) else bool(flag)
 
 
+def _no_color(args: Any) -> bool:
+    return bool(getattr(args, "no_color", False))
+
+
 def dispatch(args: Any, kind: str, want_json: bool) -> int:
     """Run `args.func(args)` and return its exit code, making stdout one envelope when JSON is wanted."""
     global _kind, _emitted, _sink
@@ -163,7 +176,8 @@ def dispatch(args: Any, kind: str, want_json: bool) -> int:
         try:
             return args.func(args)
         except WsError as e:
-            print(error_text(e), file=sys.stderr)
+            st = Style.detect(sys.stderr, no_color=_no_color(args))
+            st.write(error_text(e, st), sys.stderr)
             return e.exit_code
 
     real_out, real_err = sys.stdout, sys.stderr

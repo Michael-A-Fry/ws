@@ -2,7 +2,7 @@
 
 Precedence, first match wins: a built-in command; `ws-<word>` on PATH (a word is `[a-z][a-z0-9-]{0,40}`); the
 profile's `[cli] fallback`; the usual usage error with "did you mean". An external gets the arguments after its word,
-`--json` (before any `--`) and `WS_OUTPUT=json` when `--json` was given, and `-C PATH` as its working folder (the way git runs `git-<word>`). The
+`--json` (before any `--`) and `WS_OUTPUT=json` when `--json` was given, `--no-color` and `NO_COLOR=1` likewise, and `-C PATH` as its working folder (the way git runs `git-<word>`). The
 fallback gets the whole original argument list, leading flags and the empty list (a bare `ws`) included, and runs with
 `WS_FALLBACK=1`; a run that already has it set is not handed on again. The fallback is an absolute path (or `~/...`) to a
 file that is yours, executable and closed to other writers, the same test a job file passes, in a folder that other
@@ -182,6 +182,10 @@ def plan(
                 child["WS_OUTPUT"] = "json"
                 cut = args.index("--") if "--" in args else len(args)
                 args = [*args[:cut], "--json", *args[cut:]]  # passed on as well: most programs read the flag
+            if g.no_color:
+                child["NO_COLOR"] = "1"
+                cut = args.index("--") if "--" in args else len(args)
+                args = [*args[:cut], "--no-color", *args[cut:]]  # passed on as well, like --json
             return Launch(found, args, child)
     elif first is not None and first.split("=")[0] in flags:
         return None
@@ -203,7 +207,9 @@ def plan(
             2,
         )
     path = resolve_fallback(value)
-    return Launch(str(path), list(raw), {**env, FALLBACK_ENV: "1"}, keep_cwd=False)
+    return Launch(
+        str(path), list(raw), {**env, FALLBACK_ENV: "1", **({"NO_COLOR": "1"} if g.no_color else {})}, keep_cwd=False
+    )
 
 
 def launch(spec: Launch) -> int:

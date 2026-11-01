@@ -39,7 +39,7 @@ One source of truth for every colour, size and font, so a restyle is a change of
 | B3 | Give every role a dark and a light value, so a mode changes values only. | T0 | `tests/test_brand.py::test_tokens_are_well_formed_and_named_once` | enforced |
 | B4 | Meet WCAG 2.2 contrast for every text and background pair in every mode: 4.5:1 for text, 3:1 for large text and controls. | T0 | `tests/test_brand.py::test_every_declared_pair_reaches_its_ratio` | enforced |
 | B5 | Keep raw colour literals (`#rgb` to `#rrggbbaa`, `rgb(`, `hsl(`) inside `src/ws/brand.py`. | T0 | `tests/test_brand.py::test_no_colour_literal_in_src_outside_brand_py` | enforced |
-| B6 | Show status as a glyph plus a word; colour only reinforces it. | T0 | `tests/test_brand.py` | planned |
+| B6 | Show status as a glyph plus a word; colour only reinforces it. | T0 | `tests/test_style.py::test_status_is_a_glyph_plus_a_word_in_every_mode`, `tests/test_doctor_render.py::test_every_check_shows_a_glyph_and_its_status_word` | enforced |
 | B7 | Stop motion under `prefers-reduced-motion`. | T0 | `tests/test_setup_ui.py::test_the_spinner_stops_for_people_who_ask_for_reduced_motion` | enforced |
 
 ## Terminal colour
@@ -49,7 +49,7 @@ Colour is a capability the terminal grants, not something ws assumes.
 | ID | Rule | Rung | Check | Status |
 |---|---|---|---|---|
 | TC1 | Print colour only on a terminal; turn it off for a non-empty `NO_COLOR`, `--no-color`, `TERM=dumb` and a pipe. | T0 | `tests/test_brand.py::test_color_mode_table` | enforced |
-| TC2 | Accept `--no-color` on every command. | T0 | `tests/test_output_contract.py` | planned |
+| TC2 | Accept `--no-color` on every command. | T0 | `tests/test_output_contract.py::test_no_color_is_accepted_on_every_command` | enforced |
 | TC3 | Pick the richest colour depth the terminal reports (truecolour, 256, 16, none) from the same tokens. | T0 | `tests/test_brand.py` | planned |
 | TC4 | Use the brand 256 colours by default; on a light terminal, carry status in the basic 16 colours and darken the mark. | T0 | `tests/test_brand.py::test_status_roles_follow_the_mode_and_the_mark_never_does` | enforced |
 

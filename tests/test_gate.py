@@ -475,3 +475,24 @@ def test_the_generated_files_for_both_runners_name_the_secrets_folder(home, tmp_
     conf = json.loads((opencode / "opencode.json").read_text())
     for tool in ("read", "grep", "glob", "list"):
         assert conf["permission"][tool][f"{secrets}/**"] == "deny"
+
+
+# --- a quoted here-document written to a file is data, through the whole hook ----------------------------------------
+
+
+def test_the_hook_lets_a_script_be_written_with_a_quoted_heredoc_and_still_denies_a_shell_fed_one(
+    home, monkeypatch, capsys
+):
+    body = 'CMD=x\nbash -c "$(fetch)"\necho a | bash'
+    write = f"cat > f.sh <<'EOF'\n{body}\nEOF\nchmod +x f.sh"
+    assert check(monkeypatch, capsys, "claude-code", bash(write)) == (0, "")
+    assert check(monkeypatch, capsys, "opencode", {"tool": "bash", "args": {"command": write}}) == (0, "")
+    danger = "rm -rf " + "/"
+    fed = [
+        f"bash <<'EOF'\n{danger}\nEOF",
+        f"cat <<EOF\n$({danger})\nEOF",
+        f"cat <<'EOF'\nnote\nEOF\n{danger}",
+    ]
+    for cmd in fed:
+        assert check(monkeypatch, capsys, "claude-code", bash(cmd))[0] == 2, cmd
+        assert check(monkeypatch, capsys, "opencode", {"tool": "bash", "args": {"command": cmd}})[0] == 2, cmd

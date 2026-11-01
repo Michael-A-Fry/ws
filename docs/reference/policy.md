@@ -55,6 +55,12 @@ Rules:
 - A pattern is a glob. `*` matches anything and `\*` is a literal star. Each command is checked per shell segment (`a
   && b`,
   pipes, `$(...)`, `bash -c "..."`). Flags are normalised first.
+- The body of a here-document is text when its command only reads input as data (`cat`, `tee`, `grep`, `wc`, `head`,
+  `tail` and a few like them): a quoted body (`<<'EOF'`) isn't read at all, and an unquoted one is read only for its
+  `$(...)` and backticks, because those run. A here-document given to a shell, an interpreter, `ssh` or any other
+  program is read as commands, as is a body whose text goes on to a pipe or a process substitution, one inside
+  `$(...)`, `eval` or `bash -c`, and any line the gate can't plainly read (a word that isn't a plain name, a `#`
+  earlier on the line, a body that never closes, a function or alias in the command, a backslash-newline).
 - Every item must be non-empty text.
 - `allow_hosts` items are a name, `*.name` or an IP, with an optional `:port`.
 - `allow_write` items must be a folder, absolute or under `~/` (`$HOME` is accepted), with no wildcard, not `/` and

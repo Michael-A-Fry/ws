@@ -116,3 +116,53 @@
 - [x] Triage labels (needs-repro, duplicate, out-of-scope, accepted) as GitHub labels
 - [x] Pass test: v0.1.1 installed twice per cell, each with e2e: CI runs 41245122690 (6/6), lab 41245897083
 - [x] Tag `v0.1.1` (0.1.0 was published, then withdrawn and deleted on GitHub and PyPI: DECISIONS 190)
+
+## Phase 6 (harvest, then cut-over on the maintainer's machine)
+
+Decisions (align, 1 Nov; DECISIONS 192, 193): every cut-over step gets a watchdog with automatic rollback (guards,
+phone alerts, app sessions and scheduled jobs must not stop for a day). Mail switches on in drafts mode, a setting.
+Descriptions, docs and messages say what a thing does.
+
+Carried from phase T:
+
+- [ ] `ws broker serve` resolves its socket like the clients do (#35)
+- [ ] `ws secret import NAME --from-env PATH`: one store format, the value never shown (#35)
+- [ ] `ws eval report` lists trials that errored before a run apart from the metrics (#36)
+- [ ] The orphan-kill test in `test_run.py` waits on a signal, not the clock (#36)
+- [ ] Lab: the runner restarts after the jitconfig write; the host cycle on a timer
+- [ ] Exit arm weekly on the scheduler (the first job on the new schedule grammar)
+
+Step 1, gate and skills (harvest gaps):
+
+- [ ] Hook kinds: claim check on messages and at Stop, test-file protection, skill-gated files with an override,
+  a cap on concurrent subagents, a staging rule (`git add -A`, `git add .`, `git commit -a`), a syntax check after
+  each write, the saved-state note at session start, Notification and Stop alerts through the notify role
+- [ ] A replay tool: recorded tool-call payloads through the gate hook
+- [ ] Skills `resume` and `ship`
+- [ ] Apply the gate to every Claude Code session (merge into the user settings, manifest, residue-free undo), next to
+  the person's own hooks
+- [ ] External subcommands (`ws <x>` runs `ws-<x>` on PATH) and an optional fallback for unknown words
+
+Step 2, timers:
+
+- [ ] Schedule grammar: daily at a time, monthly on a day, nth weekday of the month, every N minutes, once at a date
+- [ ] Jobs that run a script (argv); unit names that can't clash with units the person already has
+- [ ] `ws models probe`: a daily diff of the provider's model list
+- [ ] Watchdog job: checks each switched piece, runs its recorded rollback once, records it in the run log, alerts,
+  then escalates (one automatic recovery per known failure)
+
+Step 3, mail:
+
+- [ ] `mail-drafts` role: triage new mail and save reply drafts, every 10 minutes; OAuth tokens held by the broker
+
+Cut-over (each step only when `ws doctor` is green for it):
+
+- [ ] Secrets wall on the maintainer's machine (one sudo script, then the keys re-pasted)
+- [ ] Gate and skills switched; old hooks disabled, kept 30 days; rollback re-enable tested once
+- [ ] Timers switched; old units disabled, kept 30 days; rollback re-enable tested once
+- [ ] Mail switched on
+- [ ] Pass test: old units disabled 30 days with nothing broken; a rollback re-enable tested
+
+Adopted ideas (neutral wording): one automatic recovery per known failure, recorded, then escalate; green levels
+(targeted, package, full, merge-ready) on hand-backs and run records with a known-flakes list; the pinpoint format
+(fix, verification, review correction) for bug rows here.

@@ -254,6 +254,8 @@ def test_a_ws_program_that_others_could_have_written_is_skipped_with_one_note(bo
 @posix_only
 def test_a_ws_program_owned_by_someone_else_is_skipped(box, monkeypatch, capsys):
     prog = script(box / "bin" / "ws-hello")
+    if os.stat(prog).st_uid == 0:
+        pytest.skip("running as root: a root-owned program is trusted by design")
     monkeypatch.setattr(os, "geteuid", lambda: os.stat(prog).st_uid + 1)
     assert extcmd.find_external("hello") is None
     assert "belongs to another user" in capsys.readouterr().err

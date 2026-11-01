@@ -69,6 +69,7 @@ from ws.profile import ws_home
 
 TTL = 600  # seconds a pending or a granted approval lives
 ENV_MARKER = "WS_GATED_SESSION"  # set in a gated session's env; `ws approve` refuses when it is there
+SANDBOX_MARKER = "WS_SANDBOXED"  # set in the env of a session that has ws's sandbox block (the hook checks for it)
 _SHORT = 12  # hex digits of the id shown to a person
 _ID = re.compile(r"^[0-9a-f]{8,64}$")
 _FULL = re.compile(r"^[0-9a-f]{64}$")
@@ -249,10 +250,13 @@ def peek(root: Path, ident: str, now: float) -> str | None:
     return _verdict(text, ident, now)
 
 
-def require(root: Path, bound: Bound, now: float | None = None, consume: bool = True) -> str | Claim | None:
+def require(
+    root: Path, bound: Bound, now: float | None = None, consume: bool = True, why_asked: str = ""
+) -> str | Claim | None:
     """None if this exact call holds a granted approval (which is used up). Else the reason it is refused, with the
     id to approve: a pending record is written (or kept, if one is still fresh). With consume=False (inside the
-    wall, where the grant cannot be consumed) a valid grant gives a Claim for the caller to send to the launcher."""
+    wall, where the grant cannot be consumed) a valid grant gives a Claim for the caller to send to the launcher.
+    `why_asked` goes in front of the reason: what stopped the call (a guard's finding)."""
     now = time.time() if now is None else now
     root = Path(root)
     ident = bound.digest()
@@ -269,6 +273,7 @@ def require(root: Path, bound: Bound, now: float | None = None, consume: bool = 
         _prune(root, now)
     note = "" if why == _NONE else f" ({why})"
     return (
+        f"{why_asked + ': ' if why_asked else ''}"
         f"needs a person's approval{note}: in a terminal of your own run `ws approve {ident[:_SHORT]}`, "
         f"then retry the identical call (good for one use, within {TTL // 60} minutes)"
     )

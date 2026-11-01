@@ -247,7 +247,8 @@ def test_input_it_cannot_judge_raises_so_callers_deny(pol):
 
 def test_text_inside_quotes_is_not_run_so_not_denied(pol):
     assert policy.is_denied_command(pol, "echo 'a; " + rm("-rf", ROOT) + "'") is None
-    assert policy.is_denied_command(pol, 'echo "x; ' + rm("-rf", ROOT)) is None  # unterminated: the shell rejects it
+    # unterminated: the shell rejects it, and the gate does not guess what it would have run
+    assert "unclosed" in policy.is_denied_command(pol, 'echo "x; ' + rm("-rf", ROOT))
 
 
 # --- the cold review's probe cases -------------------------------------------------------------------------------
@@ -1411,3 +1412,144 @@ def test_eval_of_fetched_text_and_shell_options_with_arguments():
     for opt in ("-o pipefail", "-O extglob", "-eo pipefail", "-o errexit -x"):
         assert policy.is_denied_command(p, f"echo x | bash {opt}"), opt
     assert policy.is_denied_command(p, "echo x | bash -o pipefail script.sh") is None
+
+
+# --- guards, and the command lexer a guard reuses -------------------------------------------------------------------
+
+
+def test_the_default_policy_turns_two_guards_on_and_a_policy_with_no_table_turns_none_on():
+    assert policy.default_policy().guards.on == ("syntax-check", "session-context")
+    assert policy.loads("schema = 1\n").guards == policy.Guards()
+
+
+@pytest.mark.parametrize(
+    "cmd, expected",
+    [
+        ("git -C x add -A", [["git", "add", "-A"]]),
+        ("sudo env A=1 git commit -m 'a b'", [["git", "commit", "-m", "a b"]]),
+        ("ls | grep x && echo $(git status)", [["ls"], ["grep", "x"], ["echo", "$(git status)"], ["git", "status"]]),
+        ("bash -c 'git add .'", [["bash", "-c", "git add ."], ["git", "add", "."]]),
+        ("cat <<EOF\ngit add -A\nEOF\nls", [["cat"], ["ls"]]),
+        ("cat <<-'EOF'\n\tx\n\tEOF", [["cat"]]),
+        ("echo a <<< b", [["echo", "a"]]),
+    ],
+)
+def test_simple_commands_gives_each_command_with_quotes_and_heredocs_resolved(cmd, expected):
+    assert policy.simple_commands(cmd) == expected
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        'echo "<<X"\ngit add -A',  # in double quotes
+        "echo '<<X'\ngit add -A",  # in single quotes
+        "echo hi # <<X\ngit add -A",  # in a comment
+        "# <<X\ngit add -A",
+        "echo $((1<<X))\ngit add -A",  # a shift in arithmetic
+        "echo $((1 << X))\ngit add -A",
+        "((x = 1<<X))\ngit add -A",
+        'echo "$((1<<X))"\ngit add -A',
+        "cat <<< X\ngit add -A",  # a here-string
+        "echo a\\<<X\ngit add -A",  # an escaped character in front
+    ],
+)
+def test_simple_commands_sees_the_line_after_a_double_angle_that_is_not_a_heredoc(cmd):
+    assert ["git", "add", "-A"] in policy.simple_commands(cmd)
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "cat <<X\ngit add -A\nX\nls",
+        'cat <<"X"\ngit add -A\nX\nls',
+        "cat <<-X\n\tgit add -A\n\tX\nls",
+        "cat <<A <<B\ngit add -A\nA\ngit add .\nB\nls",  # two on one line
+        "echo $((1<<2)); cat <<X\ngit add -A\nX\nls",  # a shift, then a real one
+        "echo '<<Y' \"<<Z\" && cat <<X\ngit add -A\nX\nls",  # quoted ones, then a real one
+    ],
+)
+def test_simple_commands_leaves_out_a_real_heredoc_body(cmd):
+    found = policy.simple_commands(cmd)
+    assert ["git", "add", "-A"] not in found and ["git", "add", "."] not in found and ["ls"] in found
+
+
+def test_simple_commands_leaves_a_comment_out():
+    assert policy.simple_commands("ls # git add -A") == [["ls"]]
+
+
+def test_simple_commands_refuses_what_it_cannot_judge():
+    with pytest.raises(TypeError):
+        policy.simple_commands(5)  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        policy.simple_commands("echo $(" * 8 + "ls" + ")" * 8)
+
+
+# --- quoting the scan used to misread ------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "echo $'it\\'s'NLGP FF",  # ANSI-C quoting: the backslash escapes the quote inside it
+        "echo $'a\\'b\\'c'NLGP FF",
+        "echo $'\\''; GP FF",
+        "echo hi $'x\\'y' PIPE cat NL GP FF",
+        "ls #BSNLGP FF",  # a comment ends at its newline, trailing backslash or not
+        "ls # a comment \\\\BSNLGP FF",
+        "echo ok # one \\BSNLls # two \\BSNLGP FF",
+        "$'XX' -rf /",  # the word is what bash decodes it to
+        "$'r\\x6d' -rf /",
+        "$'\\162m' -rf /",
+        '$"XX" -rf /',
+        "echo $(echo $'it\\'s')NLGP FF",
+    ],
+)
+def test_ansi_c_quotes_and_comment_backslashes_do_not_hide_a_command(pol, home, case):
+    assert policy.is_denied_command(pol, build(case)), case
+
+
+def test_a_comment_still_ends_at_its_newline_and_a_real_continuation_still_joins(pol, home):
+    assert (
+        policy.is_denied_command(pol, build("ls # note\\\\\\nls")) is None
+    )  # not a continuation: two lines, both fine
+    assert policy.is_denied_command(pol, "echo $'it\\'s'\nls") is None
+    assert policy.is_denied_command(pol, "echo a#b\\\nc") is None
+    assert policy.simple_commands("echo ab\\\ncd") == [["echo", "abcd"]]
+    assert policy.simple_commands("echo $'a\\tb\\x41'") == [["echo", "a\tbA"]]
+
+
+@pytest.mark.parametrize(
+    "cmd", ["echo ${x#<<X}", "echo ${x/<<X/}", "echo ${x:-<<X}", "echo $[x<<X]", "echo ${x:-${y#<<X}}"]
+)
+def test_a_double_angle_inside_a_parameter_expansion_is_not_a_heredoc(cmd):
+    assert ["ls"] in policy.simple_commands(cmd + "\nls"), cmd
+
+
+@pytest.mark.parametrize(
+    "cmd", ["cat <<X\nls\nX\nls", "echo ${x}; cat <<X\nls\nX\nls", "echo ${x:-a} $[1+2] <<X\nls\nX\nls"]
+)
+def test_a_heredoc_after_a_closed_expansion_is_still_one(cmd):
+    assert policy.simple_commands(cmd).count(["ls"]) == 1
+
+
+@pytest.mark.parametrize(
+    "cmd", ["echo 'a", 'echo "a', "echo $'a", "echo hi; echo 'aNLGP FF", "echo $'it\\'s", "echo it's"]
+)
+def test_a_quote_left_open_at_the_end_is_a_deny_with_a_reason(pol, home, cmd):
+    reason = policy.is_denied_command(pol, build(cmd))
+    assert reason and "unclosed" in reason, cmd
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "echo it\\'s",
+        "echo 'it'\"'\"'s'",
+        "ls # it's a comment",
+        "cat <<EOF\nit's here\nEOF",
+        "echo \"$(cat <<'EOF'\nit's\nEOF\n)\"",
+        "echo $'it\\'s'",
+    ],
+)
+def test_a_quote_that_closes_or_sits_in_a_comment_or_heredoc_is_fine(pol, home, cmd):
+    assert policy.is_denied_command(pol, cmd) is None, cmd

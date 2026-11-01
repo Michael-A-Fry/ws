@@ -87,7 +87,7 @@ import posixpath
 import re
 import tomllib
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from ws.profile import ws_home
@@ -135,6 +135,15 @@ class Gate:
 
 
 @dataclass(frozen=True)
+class Guards:
+    """The guards that run (ws.guards): `on` is their names in order; `config` maps each to what its `config()` made of
+    its `[guards.NAME]` table. A policy with no `[guards]` has none on."""
+
+    on: tuple[str, ...] = ()
+    config: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class RuleException:
     name: str
     job: str
@@ -150,6 +159,7 @@ class Policy:
     sources: dict[str, Source]
     gate: Gate
     exceptions: tuple[RuleException, ...]
+    guards: Guards = Guards()
 
 
 @dataclass(frozen=True)
@@ -250,6 +260,19 @@ allow_hosts = []
 # ["~/.npm", "~/.cache/uv"].
 allow_write = []
 
+# Guards: small named checks that run beside the rules above. `ws gate generate` writes the runner hooks they need.
+#   syntax-check     after an edit, checks the file by its extension (.py, .json, .toml, .sh) and tells the model the
+#                    line that does not parse
+#   session-context  at session start, lists which of the files below exist in the project
+#   bulk-staging     stops `git add -A`, `git add .` and `git commit -a`, so a commit holds only named files
+#   record-calls     appends each tool call to $WS_HOME/logs/gate-calls.jsonl, for `ws gate replay`
+[guards]
+on = ["syntax-check", "session-context"]
+# [guards.syntax-check]
+# extra = {{ yaml = ["yamllint", "-d", "relaxed"] }}   # an extension and the checker that gets the file path appended
+# [guards.session-context]
+# files = [".claude-state/STATE.md"]
+
 # Rule of Two, leg C (a way out): besides a source's outward acts and the web tools above, the SHELL counts as a way
 # out while any of curl, wget, nc, ssh, scp, python -c ... is not in deny_commands. To close it, deny the lot
 # (for example "curl*", "wget*", "nc *", "ssh *", "scp *", "python* -c*"); there is no half measure.
@@ -330,7 +353,7 @@ def loads(text: str) -> Policy:
         raw = tomllib.loads(text)
     except tomllib.TOMLDecodeError as e:
         raise PolicyError(f"not valid TOML: {e}") from e
-    raw = _table(raw, "policy", {"schema", "dial", "interrupts", "sources", "gate", "exceptions"})
+    raw = _table(raw, "policy", {"schema", "dial", "interrupts", "sources", "gate", "exceptions", "guards"})
     schema = raw.get("schema", SCHEMA)
     if schema != SCHEMA or isinstance(schema, bool):
         raise PolicyError(f"schema must be {SCHEMA}, not {schema!r}")
@@ -414,7 +437,23 @@ def loads(text: str) -> Policy:
         if any(x.name == e["name"] for x in exceptions):
             raise PolicyError(f"{where}name {e['name']!r} is used twice")
         exceptions.append(RuleException(e["name"], e["job"], covered, e["reason"]))
-    return Policy(schema, dial, interrupts, sources, gate, tuple(exceptions))
+    return Policy(schema, dial, interrupts, sources, gate, tuple(exceptions), _guards(raw.get("guards", {})))
+
+
+def _guards(raw) -> Guards:
+    """`[guards]`: `on` names the guards that run; `[guards.NAME]` is that guard's own table, checked by the guard."""
+    from ws import guards  # here, not at the top: the guards import this module
+
+    known = guards.names()
+    t = _table(raw, "[guards]", {"on", *known})
+    on = _strings(t, "on", "[guards] ")
+    for name in on:
+        if name not in known:
+            raise PolicyError(f"[guards] on: unknown guard {name!r} (known: {', '.join(known)})")
+    if len(set(on)) != len(on):
+        raise PolicyError("[guards] on: a guard is named twice")
+    config = {name: guards.get(name).config(t.get(name, {}), f"[guards.{name}]") for name in known}
+    return Guards(on, {name: config[name] for name in on})
 
 
 def default_policy() -> Policy:
@@ -636,13 +675,19 @@ def _merge_flags(tokens: list[str]) -> list[str]:
     return [cmd, "-" + "".join(sorted(letters)), *tokens[rest_at:]]
 
 
-def _git_normal(toks: list[str]) -> list[str]:
-    """Drop git's global options (`-C dir`, `-c k=v`, `--git-dir=...`) so the subcommand is where a rule expects it;
-    spell any forcing or destroying push (`-f`, `-uf`, `+refspec`, `:ref`, `--mirror`, `--delete`) as `--force`."""
+def git_split(toks: list[str]) -> tuple[list[str], list[str]]:
+    """(the global options with their values, the command without them) for the words of a `git` command:
+    `git -C d -c k=v add x` gives (["-C", "d", "-c", "k=v"], ["git", "add", "x"])."""
     i = 1
     while i < len(toks) and toks[i].startswith("-"):
         i += 2 if toks[i] in _GIT_ARG_OPTS else 1
-    toks = ["git", *toks[i:]]
+    return toks[1:i], ["git", *toks[i:]]
+
+
+def _git_normal(toks: list[str]) -> list[str]:
+    """Drop git's global options (`-C dir`, `-c k=v`, `--git-dir=...`) so the subcommand is where a rule expects it;
+    spell any forcing or destroying push (`-f`, `-uf`, `+refspec`, `:ref`, `--mirror`, `--delete`) as `--force`."""
+    toks = git_split(toks)[1]
     forcing = len(toks) > 1 and toks[1] == "push" and "--force" not in toks
     if forcing and any(
         re.fullmatch(r"-[A-Za-z]*f[A-Za-z]*", t)
@@ -653,6 +698,52 @@ def _git_normal(toks: list[str]) -> list[str]:
     ):
         toks.append("--force")
     return toks
+
+
+_ANSI_ESCAPES = {"a": "\a", "b": "\b", "e": "\x1b", "E": "\x1b", "f": "\f", "n": "\n", "r": "\r", "t": "\t", "v": "\v"}
+_ANSI_NUMBER = {
+    "x": re.compile(r"[0-9A-Fa-f]{1,2}"),
+    "u": re.compile(r"[0-9A-Fa-f]{1,4}"),
+    "U": re.compile(r"[0-9A-Fa-f]{1,8}"),
+}
+_ANSI_OCTAL = re.compile(r"[0-7]{1,3}")
+
+
+def _ansi_c(seg: str, i: int) -> tuple[str, int]:
+    """The text of a `$'...'` word whose body starts at i, and the index after its closing quote: backslash escapes
+    are decoded as bash does (newline, hex, octal and unicode escapes, `\\'`), so `$'r\\x6d'` is the word `rm`. An
+    escape it does not know stays as written."""
+    out: list[str] = []
+    n = len(seg)
+    while i < n:
+        c = seg[i]
+        if c == "'":
+            return "".join(out), i + 1
+        if c != "\\" or i + 1 >= n:
+            out.append(c)
+            i += 1
+            continue
+        d = seg[i + 1]
+        if d in _ANSI_ESCAPES:
+            out.append(_ANSI_ESCAPES[d])
+            i += 2
+        elif d in "\\'\"?":
+            out.append(d)
+            i += 2
+        elif d in _ANSI_NUMBER and (m := _ANSI_NUMBER[d].match(seg, i + 2)):
+            out.append(chr(min(int(m.group(), 16), 0x10FFFF)))
+            i = m.end()
+        elif d in "01234567":
+            m = _ANSI_OCTAL.match(seg, i + 1)
+            out.append(chr(int(m.group(), 8) & 0xFF))
+            i = m.end()
+        elif d == "c" and i + 2 < n:
+            out.append(chr(ord(seg[i + 2]) & 0x1F))
+            i += 3
+        else:
+            out.append("\\" + d)
+            i += 2
+    return "".join(out), n
 
 
 def _lex(seg: str) -> tuple[list[str], list[tuple[str, str]]]:
@@ -676,6 +767,11 @@ def _lex(seg: str) -> tuple[list[str], list[tuple[str, str]]]:
                 j = n if j < 0 else j
                 buf.append(seg[i + 1 : j])
                 i = j + 1
+            elif seg.startswith("$'", i):
+                text, i = _ansi_c(seg, i + 2)
+                buf.append(text)
+            elif seg.startswith('$"', i):  # locale quoting reads as double quotes
+                i += 1
             elif c == '"':
                 i += 1
                 while i < n and seg[i] != '"':
@@ -717,13 +813,16 @@ def _lex(seg: str) -> tuple[list[str], list[tuple[str, str]]]:
     return words, redirs
 
 
-def _strip_wrappers(words: list[str]) -> tuple[list[str], set[str]]:
+def _strip_wrappers(words: list[str], env: list[str] | None = None) -> tuple[list[str], set[str]]:
     """Drop leading keywords, VAR=value and exec wrappers (sudo, env, timeout, nice, xargs, busybox ...): what is left
-    is the command that really runs. Also returns the wrappers it removed."""
+    is the command that really runs. Also returns the wrappers it removed. If `env` is given, the VAR=value words it
+    drops (a prefix, or the ones `env` sets) are added to it."""
     toks, seen = list(words), set()
     while toks:
         w = toks[0]
         if w in _KEYWORDS or _ASSIGN.match(w):
+            if env is not None and _ASSIGN.match(w):
+                env.append(w)
             toks = toks[1:]
             continue
         if w.startswith("/") and "/" in w[1:]:
@@ -746,6 +845,8 @@ def _strip_wrappers(words: list[str]) -> tuple[list[str], set[str]]:
             elif t.startswith("-") and len(t) > 1:
                 i += 2 if "-" + t[-1] in arg_opts else 1  # `-u root`, and the `u` of `-iu root`
             elif w == "env" and _ASSIGN.match(t):
+                if env is not None:
+                    env.append(t)
                 i += 1
             else:
                 break
@@ -764,18 +865,84 @@ def _canon_tokens(tokens: list[str]) -> list[str]:
 
 def _prep(cmd: str) -> str:
     """Line continuations joined, full-width characters folded, ${IFS} read as the space it is."""
-    cmd = unicodedata.normalize("NFKC", cmd).replace("\\\n", "")
+    cmd = _join_lines(unicodedata.normalize("NFKC", cmd))
     return re.sub(r"\$\{IFS\}|\$IFS\b", " ", cmd)
 
 
-def _scan(cmd: str) -> tuple[list[list[str]], list[str]]:
+def _join_lines(cmd: str) -> str:
+    """Backslash-newline pairs removed, as the shell does, except in a comment: a comment ends at its newline whatever
+    precedes it, so a comment's trailing backslash must not swallow the line below. Quotes, `$'...'`, `$(...)` and
+    backticks are tracked so that a `#` inside them is not taken for a comment; an escaped character is a pair."""
+    out: list[str] = []
+    n, i, quote = len(cmd), 0, ""
+    while i < n:
+        c = cmd[i]
+        if quote == "'":  # no escapes inside; a backslash-newline is joined here as it always was
+            if cmd.startswith("\\\n", i):
+                i += 2
+                continue
+            quote = "" if c == "'" else quote
+        elif c == "\\" and i + 1 < n:
+            if cmd[i + 1] != "\n":
+                out.append(cmd[i : i + 2])
+            i += 2
+            continue
+        elif quote == "$'":
+            quote = "" if c == "'" else quote
+        elif cmd.startswith("$(", i) or (c == "`" and cmd.find("`", i + 1) > 0):
+            if c == "`":
+                j, head, tail = cmd.find("`", i + 1), "`", "`"
+            else:
+                j, head, tail = _close_paren(cmd, i + 2), "$(", ")"
+            out += [head, _join_lines(cmd[i + len(head) : j])]
+            if j < n:
+                out.append(tail)
+            i = j + 1
+            continue
+        elif quote == '"':
+            quote = "" if c == '"' else quote
+        elif c == "$" and cmd.startswith("$'", i):
+            quote = "$'"
+            out.append("$")
+            i += 1
+            c = "'"
+        elif c in "'\"":
+            quote = c
+        elif c == "#" and (not out or out[-1][-1:] in (" ", "\t", "\n", ";", "&", "|", "(", ")")):
+            eol = cmd.find("\n", i)
+            eol = n if eol < 0 else eol
+            out.append(cmd[i:eol].rstrip("\\"))  # a trailing backslash would escape the newline in a later scan
+            i = eol
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+_HEREDOC_WORD = re.compile(r"<<(-?)[ \t]*(?:'([^']*)'|\"([^\"]*)\"|\\?([A-Za-z_][A-Za-z0-9_]*))")
+
+
+def _arithmetic(body: str) -> bool:
+    """Is the text between `$(` and its closing `)` really `((...))`, shell arithmetic?"""
+    return body.startswith("(") and body.endswith(")")
+
+
+def _scan(cmd: str, heredocs: bool = False, end: dict | None = None) -> tuple[list[list[str]], list[str]]:
     """Split a shell command line. Returns (pipelines, inner): each pipeline is a list of segments (split on |, |&),
-    pipelines are split on ; && || & newline ( ); inner holds the text of $(...), backticks and <(...), which run too."""
+    pipelines are split on ; && || & newline ( ); inner holds the text of $(...), backticks and <(...), which run too.
+    With `heredocs`, the body and closing line of each here-document are left out (that text is data for a program,
+    not commands): a `<<WORD` starts one only outside quotes and comments, and not as `<<<` or a shift in `((...))` or inside `${...}` and `$[...]`, which are one word. If `end` is given,
+    end["quote"] is the quote still open at the end of the text (empty if none)."""
     pipelines: list[list[str]] = []
     inner: list[str] = []
     segs: list[str] = []
     buf: list[str] = []
+    waiting: list[tuple[str, bool]] = []  # (closing word, may be indented) of the here-documents the line opened
+    nest: list[str] = []  # the closers still owed by the ${...} and $[...] we are inside
     n, i, quote = len(cmd), 0, ""
+
+    def sub(body: str) -> str:  # the text of a $(...) that is really `$((a<<b))` arithmetic: its `<<` is a shift
+        return body.replace("<<", "< <") if heredocs and _arithmetic(body) else body
 
     def end_seg() -> None:
         s = "".join(buf).strip()
@@ -797,7 +964,7 @@ def _scan(cmd: str) -> tuple[list[list[str]], list[str]]:
             i += 2
             continue
         if quote:
-            if c == quote:
+            if c == quote[-1]:
                 quote = ""
             elif quote == '"' and c == "`":
                 j = cmd.find("`", i + 1)
@@ -805,9 +972,60 @@ def _scan(cmd: str) -> tuple[list[list[str]], list[str]]:
                     inner.append(cmd[i + 1 : j])
             elif quote == '"' and cmd.startswith("$(", i):
                 j = _close_paren(cmd, i + 2)
-                inner.append(cmd[i + 2 : j])
+                inner.append(sub(cmd[i + 2 : j]))
             buf.append(c)
             i += 1
+            continue
+        if c == "$" and cmd[i + 1 : i + 2] in ("{", "["):  # a parameter expansion or $[...] arithmetic: one word
+            nest.append("}" if cmd[i + 1] == "{" else "]")
+            buf.append(cmd[i : i + 2])
+            i += 2
+            continue
+        if nest and c == "[" and nest[-1] == "]":
+            nest.append("]")
+        elif nest and c == nest[-1]:
+            nest.pop()
+        heredocs_here = (
+            heredocs and not nest
+        )  # in ${...} and $[...], `#` and `<<` are operators, not comment or here-doc
+        if heredocs_here and c == "#" and (not buf or buf[-1] in " \t"):  # a comment: not commands, no here-document
+            eol = cmd.find("\n", i)
+            i = n if eol < 0 else eol
+            continue
+        if heredocs_here and c == "<" and cmd.startswith("<<<", i):  # a here-string: its word is data, not a delimiter
+            buf.append("<<<")
+            i += 3
+            continue
+        if heredocs_here and c == "<" and cmd.startswith("<<", i):
+            m = _HEREDOC_WORD.match(cmd, i)
+            if m:
+                waiting.append((m.group(2) or m.group(3) or m.group(4) or "", m.group(1) == "-"))
+                buf.append(m.group(0))
+                i = m.end()
+                continue
+        if heredocs and c == "\n" and waiting:
+            end_pipeline()
+            i += 1
+            for word, indented in waiting:  # skip each body, up to and including its closing line
+                while i < n:
+                    eol = cmd.find("\n", i)
+                    eol = n if eol < 0 else eol
+                    line = cmd[i:eol]
+                    i = eol + 1
+                    if (line.strip(" \t") if indented else line) == word:
+                        break
+            waiting.clear()
+            continue
+        if heredocs_here and c == "(" and cmd.startswith("((", i) and not buf:  # an arithmetic command: `((x<<2))`
+            j = _close_paren(cmd, i + 1)
+            if _arithmetic(cmd[i + 1 : j]):
+                inner.append(sub(cmd[i + 1 : j])[1:-1])
+                i = j + 1
+                continue
+        if c == "$" and cmd.startswith("$'", i):  # ANSI-C quoting: backslash escapes work inside, `\'` included
+            quote = "$'"
+            buf.append("$'")
+            i += 2
             continue
         if c in "'\"":
             quote = c
@@ -821,7 +1039,7 @@ def _scan(cmd: str) -> tuple[list[list[str]], list[str]]:
             continue
         elif cmd.startswith("$(", i):
             j = _close_paren(cmd, i + 2)
-            inner.append(cmd[i + 2 : j])
+            inner.append(sub(cmd[i + 2 : j]))
             buf.append(cmd[i : j + 1])
             i = j + 1
             continue
@@ -854,6 +1072,8 @@ def _scan(cmd: str) -> tuple[list[list[str]], list[str]]:
             buf.append(c)
         i += 1
     end_pipeline()
+    if end is not None:
+        end["quote"] = quote
     return pipelines, inner
 
 
@@ -862,11 +1082,14 @@ def _close_paren(cmd: str, i: int) -> int:
     depth, quote = 1, ""
     while i < len(cmd):
         c = cmd[i]
-        if c == "\\":
+        if c == "\\" and quote != "'":
             i += 2
             continue
         if quote:
-            quote = "" if c == quote else quote
+            quote = "" if c == quote[-1] else quote
+        elif c == "$" and cmd.startswith("$'", i):  # ANSI-C quoting: a backslash escapes inside it
+            quote = "$'"
+            i += 1
         elif c in "'\"":
             quote = c
         elif c == "(":
@@ -1297,6 +1520,62 @@ def _canon_pattern(pattern: str) -> str:
     return " ".join(toks)
 
 
+def simple_commands(command: str, _depth: int = 0, *, git_options: bool = False) -> list[list[str]]:
+    """Every simple command in a command line, as its words: quotes resolved, `sudo`/`env`/`timeout` wrappers and git's
+    global options (`-C dir`, `-c k=v`) dropped (kept with `git_options`, for a check of the options themselves; see
+    git_split). It reads the line as the matcher does (segments split on `;`, `&&`, pipes and newlines, and the text of
+    `$(...)`, backticks, `bash -c` and `eval` read too), and leaves out what is not a command: quoted text, comments
+    and here-document bodies. For a check that wants one command's words, such as a guard."""
+    return [words for words, _ in simple_commands_env(command, _depth, git_options=git_options) if words]
+
+
+def simple_commands_env(
+    command: str, _depth: int = 0, *, git_options: bool = False
+) -> list[tuple[list[str], list[str]]]:
+    """simple_commands with the `VAR=value` words each command was given before it (a prefix, or after `env`), as
+    (words, assignments). A line that only sets variables comes back with no words, so a check sees `X=1; cmd`."""
+    if not isinstance(command, str):
+        raise TypeError("command must be text")
+    if _depth > _MAX_DEPTH:
+        raise ValueError("command nests too deeply to check")
+    pipelines, inner = _scan(_prep(command), heredocs=True)
+    found: list[tuple[list[str], list[str]]] = []
+    nested = list(inner)
+    for segs in pipelines:
+        for seg in segs:
+            env: list[str] = []
+            toks, _ = _strip_wrappers(_lex(seg)[0], env)
+            if toks and toks[0] == "git" and not git_options:
+                toks = _git_normal(toks)
+            if not toks and not env:
+                continue
+            found.append((toks, env))
+            if toks and toks[0] == "eval" and len(toks) > 1:  # eval joins its words and runs the text as a command line
+                nested.append(" ".join(toks[1:]))
+            if toks and toks[0] in _SHELL_NAMES:
+                flags, operands = _args(toks)
+                if _cluster(flags, "c") and operands:
+                    nested.append(operands[0])
+    for text in nested:
+        found += simple_commands_env(text, _depth + 1, git_options=git_options)
+    return found
+
+
+def _readings(command: str) -> list[str]:
+    """The texts to judge for one command: itself and, when it holds a backslash-newline, that pair removed wherever it
+    is (the way older ws read it, which also joins a comment's trailing backslash to the next line). The shell reads
+    one of them; a rule that denies either reading denies the command."""
+    return [command, command.replace("\\\n", "")] if "\\\n" in command else [command]
+
+
+def _open_quote(command: str) -> str:
+    """The quote still open at the end of the command text (`'`, `"` or `$'`), or "" if every quote is closed. Comments
+    and here-document bodies are not read: an apostrophe in prose there is not a quote."""
+    end: dict = {}
+    _scan(_prep(command), heredocs=True, end=end)
+    return end.get("quote", "")
+
+
 def is_denied_command(
     policy: Policy, command: str, *, protect: tuple[str, ...] = (), cwd: str | None = None
 ) -> str | None:
@@ -1308,10 +1587,14 @@ def is_denied_command(
     it cannot judge: callers treat that as a deny. This is the second layer; see the note above."""
     if not isinstance(command, str):
         raise TypeError("command must be text")
+    quote = _open_quote(command)
+    if quote:
+        return f"the command ends inside an unclosed {quote} quote, so what runs cannot be read; close the quote"
     cands: list[str] = []
-    reason = _walk(policy, command, _Ctx(cwd or _cwd(), tuple(protect)), 0, cands)
-    if reason:
-        return reason
+    for text in _readings(command):
+        reason = _walk(policy, text, _Ctx(cwd or _cwd(), tuple(protect)), 0, cands)
+        if reason:
+            return reason
     for pat in policy.gate.deny_commands:
         rx = _glob_regex(_canon_pattern(pat))
         if any(rx.match(c) for c in cands):
@@ -1328,7 +1611,8 @@ def needs_approval(policy: Policy, command: str, *, cwd: str | None = None) -> b
     if not policy.gate.ask_commands:
         return False
     cands: list[str] = []
-    _walk(policy, command, _Ctx(cwd or _cwd()), 0, cands)
+    for text in _readings(command):
+        _walk(policy, text, _Ctx(cwd or _cwd()), 0, cands)
     return any(_glob_regex(_canon_pattern(pat)).match(c) for pat in policy.gate.ask_commands for c in cands)
 
 
@@ -1392,12 +1676,15 @@ _HOOK_ONLY = ("|", ";", "&", "\n", "`", "$(", "\\*")
 
 
 def native_patterns(policy: Policy) -> list[str]:
-    """The deny_commands a runner can enforce from its own rule list, each in every flag spelling (see variants).
-    The rest are enforced by the hook alone."""
+    """The deny_commands a runner can enforce from its own rule list, each in every flag spelling (see variants), and
+    the patterns the guards that are on contribute. The rest are enforced by the hook alone."""
+    from ws import guards
+
     out: list[str] = []
     for pat in policy.gate.deny_commands:
         if not any(c in pat for c in _HOOK_ONLY):
             out += variants(pat)
+    out += guards.native_deny(policy.guards.on)
     return list(dict.fromkeys(out))
 
 

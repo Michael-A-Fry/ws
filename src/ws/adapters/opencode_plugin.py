@@ -15,7 +15,9 @@ import { resolve } from "node:path"
 
 const CHECK = /*__CHECK__*/ []
 const WS = /*__WS__*/ []
-const GOVERNED = new Set(["bash", "read", "grep", "glob", "list", "edit", "write", "multiedit", "webfetch", "websearch"])
+const GOVERNED = new Set([
+  "bash", "read", "grep", "glob", "list", "edit", "write", "multiedit", "patch", "apply_patch", "webfetch", "websearch",
+])
 
 // Session notes (advice, never a gate): record the release on session.created; on session.idle ask `ws session nudge`
 // and show its one line as a toast (OpenCode has no way for a plugin to add text to the model's context). Any error is

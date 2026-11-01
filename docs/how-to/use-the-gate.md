@@ -71,6 +71,32 @@ Step 4 prints `ws gate: blocked: command matches deny_commands rule 'curl*'` and
 Edit `policy.toml`, then run `ws gate generate` again for each runner. A policy with an unknown key or a bad value is
 refused whole and the message names the key. The runner keeps the rules it loaded at start, so start a new session.
 
+## Turn on a guard
+
+Guards are small named checks. `ws gate init` turns on `syntax-check` and `session-context`. To add one, name it in the
+`[guards]` table of `policy.toml`, regenerate and start a new session.
+
+```toml
+[guards]
+on = ["syntax-check", "session-context", "bulk-staging"]
+```
+
+With `bulk-staging` on, `git add -A` and `git commit -am` are stopped and `git add file.py` goes through. With
+`syntax-check` on, a Python file written with a syntax error comes back to the model with the line number. The
+[guards reference](../reference/guards.md) lists every guard and its keys.
+
+## Replay recorded calls
+
+Name `record-calls` in `on` and each tool call a session makes is appended to `$WS_HOME/logs/gate-calls.jsonl`. After you
+change a rule, run the recorded calls against it.
+
+```sh
+ws gate replay ~/.ws/logs/gate-calls.jsonl --runner claude-code
+```
+
+Each line prints `allow`, `deny` or `ask`. To pin an answer, make a file of `{"payload": {...}, "expect": "deny"}` lines.
+The command exits 1 when a result differs from its `expect`.
+
 ## Other keys
 
 | To do this | Set |

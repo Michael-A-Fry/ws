@@ -22,10 +22,11 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import shlex
 from pathlib import Path
 
-from ws import jobs
+from ws import guards, jobs
 from ws.adapters import Call, check_argv, protected_paths
 from ws.adapters.opencode_plugin import SOURCE
 from ws.policy import Policy, native_patterns
@@ -37,6 +38,8 @@ _TOOLS = {"web_fetch": "webfetch", "web_search": "websearch"}
 # For ws.sandbox: the env var that names the generated folder. The whole folder is read-only in the wall (OpenCode loads
 # plugin/, tool/, agent/, command/ and opencode.jsonc from it, so a planted file there would outlive the session).
 CONFIG_DIR_ENV = "OPENCODE_CONFIG_DIR"
+# The guards (ws.guards) the generated shim does not run yet: all of them. `ws doctor` names them when a policy has one on.
+UNSUPPORTED_GUARDS = guards.names()
 
 
 # OpenCode writes this file into its config folder at start and will not run if it cannot (1.19.4). Written here at
@@ -111,7 +114,10 @@ def _protect_forms(path: str, is_out: bool) -> list[str]:
     return [path, f"{path}/**", f"**/{tail}", f"**/{tail}/**"]
 
 
-def generate(policy: Policy, ws_cmd: list[str], out: Path, policy_file: Path) -> dict[str, str]:
+def generate(
+    policy: Policy, ws_cmd: list[str], out: Path, policy_file: Path, *, protect: tuple[str, ...] = ()
+) -> dict[str, str]:
+    protect = tuple(protect)
     # Last matching rule wins, so the catch-all comes first.
     bash: dict[str, str] = {"*": "allow"}
     bash.update(dict.fromkeys(native_patterns(policy), "deny"))
@@ -120,19 +126,32 @@ def generate(policy: Policy, ws_cmd: list[str], out: Path, policy_file: Path) ->
         rules = {"*": "allow", **dict.fromkeys((f for r in policy.gate.deny_read for f in _read_forms(r)), "deny")}
         permission.update(read=rules, grep=dict(rules), glob=dict(rules), list=dict(rules))
     edit = {"*": "allow"}  # covers write and patch too; a path may be a file or a folder: cover both
-    for p in protected_paths(out, policy_file):
+    for p in protected_paths(out, policy_file, protect):
         edit.update(dict.fromkeys(_protect_forms(p, p == str(out)), "deny"))
     permission["edit"] = edit
     for t in policy.gate.deny_tools:
         permission[_TOOLS[t]] = "deny"
     config = {"$schema": "https://opencode.ai/config.json", "permission": permission}
-    plugin = SOURCE.replace("/*__CHECK__*/ []", json.dumps(check_argv(ws_cmd, NAME, policy_file, out)))
+    plugin = SOURCE.replace("/*__CHECK__*/ []", json.dumps(check_argv(ws_cmd, NAME, policy_file, out, protect)))
     plugin = plugin.replace("/*__WS__*/ []", json.dumps(ws_cmd))
     return {CONFIG: json.dumps(config, indent=2) + "\n", PLUGIN: plugin, IGNORE: IGNORE_TEXT}
 
 
-def parse(payload: dict) -> Call | None:
-    """What the shim sends: {"tool": "bash", "args": {"command": ...}}."""
+_PATCH_PATH = re.compile(r"^\*\*\* (?:Add File|Update File|Delete File|Move to):[ \t]*(\S.*?)[ \t\r]*$", re.MULTILINE)
+
+
+def patch_paths(patch: str) -> list[str]:
+    """The files a patch (OpenCode's `*** Begin Patch` text) adds, updates, deletes or moves to, in order. A patch
+    that names none cannot be judged, so it raises: the call is denied."""
+    paths = list(dict.fromkeys(_PATCH_PATH.findall(patch)))
+    if not paths:
+        raise TypeError("args.patchText names no file (expected `*** Update File: path` lines)")
+    return paths
+
+
+def parse(payload: dict) -> Call | list[Call] | None:
+    """What the shim sends: {"tool": "bash", "args": {"command": ...}}. A patch tool is a write of each file in the
+    patch."""
     tool, args = payload.get("tool"), payload.get("args")
     if not isinstance(tool, str) or not isinstance(args, dict):
         raise TypeError("payload has no tool and args")
@@ -142,6 +161,15 @@ def parse(payload: dict) -> Call | None:
         return Call("read", _text(args, "filePath"))
     if tool in ("edit", "write", "multiedit"):
         return Call("write", _text(args, "filePath"))
+    if tool in ("patch", "apply_patch"):
+        kept = payload.get(
+            "paths"
+        )  # only a line record-calls kept has these (the shim sends none): text -> fingerprint
+        if isinstance(args.get("patchText"), dict) and isinstance(kept, list) and kept:
+            if not all(isinstance(p, str) and p for p in kept):
+                raise TypeError("paths must be non-empty text")
+            return [Call.of("write", p, tool=tool) for p in kept]
+        return [Call.of("write", p, tool=tool) for p in patch_paths(_text(args, "patchText"))]
     if tool in ("grep", "glob", "list"):
         path = args.get("path")
         if path is not None and not isinstance(path, str):

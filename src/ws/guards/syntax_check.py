@@ -104,6 +104,22 @@ def _run(argv: list[str], path: str) -> tuple[str | None, str | None]:
     return f"{path}: {argv[0]} found a problem:\n{_brief(done.stdout + done.stderr)}", None
 
 
+def _bash_shebang(path: str) -> bool:
+    """Does the script ask for bash on its first line (`#!/bin/bash`, `#!/usr/bin/env bash`)? Then `sh -n` would
+    report bash syntax such as `>(...)` as an error."""
+    try:
+        with open(path, "rb") as f:
+            first = f.readline(256)
+    except OSError:
+        return False
+    if not first.startswith(b"#!"):
+        return False
+    words = first[2:].split()
+    if words and words[0].endswith(b"/env"):
+        words = [w for w in words[1:] if not w.startswith(b"-")]
+    return bool(words) and words[0].rsplit(b"/", 1)[-1] == b"bash"
+
+
 def judge(call, cfg: Config, ctx) -> Finding | None:
     path = os.path.abspath(os.path.join(ctx.cwd or "", call.value))
     ext = path.rsplit(".", 1)[-1].lower() if "." in os.path.basename(path) else ""
@@ -118,7 +134,7 @@ def judge(call, cfg: Config, ctx) -> Finding | None:
             data = f.read()
         problem, note = {"py": _python, "json": _json, "toml": _toml}[ext](path, data), None
     elif ext in ("sh", "bash"):
-        shell = "bash" if ext == "bash" else "sh"
+        shell = "bash" if ext == "bash" or _bash_shebang(path) else "sh"
         if shutil.which(shell) is None and shutil.which("bash") is not None:
             shell = "bash"
         problem, note = _run([shell, "-n"], path)

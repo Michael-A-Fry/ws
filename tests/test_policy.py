@@ -165,6 +165,9 @@ def test_default_policy_denies(pol, home, cmd):
 
 
 ALLOWED = [
+    # a test inside bash -c whose path has a dash is not a bracket class running backwards (s-c)
+    "timeout 3 bash -c 'until [ -f ~/.config/ws-cutover/switch-exit ]; do sleep 3; done'",
+    "ls ~/a/[ab]*.log /tmp/a-b/c-*.log",
     "ls -la",
     "echo hi",
     "rm -rf ./build",
@@ -606,6 +609,8 @@ READS = [
     "cat>/tmp/o<~/.ssh/id_rsa",
     "cat ~/.s*/id_rsa",
     "cat ~/.ss?/id_rsa",
+    "cat ~/.[r-t]sh/id_rsa",
+    "cat ~/.[!a]sh/id_rsa",
     "cat ~/.aws/cred*",
     "cat ~/*/id_rsa",
     "cd ~ && cat .ssh/id_rsa",

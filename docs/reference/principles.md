@@ -130,6 +130,8 @@ Plain files that open without ws, with a version on every record.
 | D8 | Record who ran what in each run: run id, job, runner, ws version and times. | T0 | `tests/test_run.py::test_a_run_leaves_one_complete_record` | enforced |
 | D9 | Keep secrets and personal data out of prompts, fixtures, commits and comments. | T0 | `.pre-commit-config.yaml` | enforced |
 | D10 | List every log ws writes in `docs/reference/stores.md`, and give each line a `schema` number and a `ts` in RFC 3339 UTC. | T0 | `tests/test_stores.py::test_every_module_that_writes_a_jsonl_file_is_listed_in_stores_md`, `tests/test_jsonl.py::test_a_line_without_a_schema_or_a_ts_is_refused_before_anything_is_written`, `tests/test_stores.py::test_the_page_gives_each_log_the_schema_its_writer_declares` | enforced |
+| D11 | Draw each home area from the records `ws.home.api` gives it, and from nothing else: no file, program or source. | T0 | `tests/home/test_areas.py::test_every_area_reads_only_through_the_api` | enforced |
+| D12 | Offer an opaque home item only an opener that says it's safe for one, whatever the profile picks. | T0 | `tests/home/test_open.py::test_opaque_items_offer_only_opaque_ok_openers` | enforced |
 
 ## Engineering governance
 

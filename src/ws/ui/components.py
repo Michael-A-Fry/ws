@@ -15,7 +15,24 @@ from collections.abc import Iterable
 from ws import brand
 from ws.ui import css
 
-__all__ = ["STATES", "mark", "page", "panel", "row", "sparkline", "status"]
+__all__ = [
+    "SAFE_SCHEMES",
+    "STATES",
+    "action",
+    "chip",
+    "empty",
+    "link",
+    "mark",
+    "page",
+    "panel",
+    "row",
+    "sparkline",
+    "stat",
+    "status",
+]
+
+# A link is drawn only for these schemes; anything else (javascript:, data:, a path) is shown as plain text.
+SAFE_SCHEMES = ("http://", "https://", "claude://")
 
 # state -> (css class, glyph, default word). A glyph differs per state so the shape tells it apart without colour.
 STATES: dict[str, tuple[str, str, str]] = {
@@ -62,9 +79,19 @@ def _num(v: float) -> str:
     return f"{v:.2f}".rstrip("0").rstrip(".")
 
 
-def sparkline(values: Iterable[float], *, width: int = 96, height: int = 24, label: str = "trend") -> str:
+def sparkline(
+    values: Iterable[float],
+    *,
+    width: int = 96,
+    height: int = 24,
+    label: str = "trend",
+    lo: float | None = None,
+    hi: float | None = None,
+) -> str:
     """A small line over `values`, oldest first, as inline SVG. Nothing finite gives a dashed baseline; one point gives
-    a dot; a flat run gives a level line. NaN, infinity and non-numbers are dropped, never drawn."""
+    a dot; a flat run gives a level line. NaN, infinity and non-numbers are dropped, never drawn. `lo` and `hi` fix the
+    scale (a rate from 0 to 1, say) so a small wobble isn't drawn as a cliff; without them the line fills the box."""
+    width, height = int(width), int(height)
     pts = [float(v) for v in values if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)]
     pad = 3
     inner_w, inner_h = width - 2 * pad, height - 2 * pad
@@ -74,7 +101,8 @@ def sparkline(values: Iterable[float], *, width: int = 96, height: int = 24, lab
         shapes = f'<line class="base" x1="{pad}" y1="{mid}" x2="{width - pad}" y2="{mid}"/>'
         text = f"{label}: no data"
     else:
-        lo, hi = min(pts), max(pts)
+        lo = min(pts) if lo is None else min(lo, *pts)
+        hi = max(pts) if hi is None else max(hi, *pts)
         span = hi - lo
 
         def y(v: float) -> float:
@@ -92,6 +120,36 @@ def sparkline(values: Iterable[float], *, width: int = 96, height: int = 24, lab
         f'<svg class="spark" viewBox="0 0 {width} {height}" width="{width}" height="{height}" role="img" '
         f'aria-label="{_e(text)}">{shapes}</svg>'
     )
+
+
+def empty(text: str) -> str:
+    """The quiet line a panel shows when it has nothing to show. `text` says why, and what to do."""
+    return f'<p class="empty">{_e(text)}</p>'
+
+
+def chip(text: str) -> str:
+    """A small outlined label, for a kind or a source. Text only."""
+    return f'<span class="chip">{_e(text)}</span>'
+
+
+def stat(label: str, value: object, note: str = "") -> str:
+    """One figure with its label and, under it, a quiet note (why it has no value, or what it is measured over)."""
+    tail = f'<span class="n">{_e(note)}</span>' if note else ""
+    return f'<div class="stat"><span class="k">{_e(label)}</span><span class="v">{_e(value)}</span>{tail}</div>'
+
+
+def link(label: str, href: str) -> str:
+    """A plain `<a href>` that opens in a new tab (it works on a phone). A `href` that isn't http, https or claude is
+    drawn as text, never as a link."""
+    if not href.lower().startswith(SAFE_SCHEMES):
+        return f'<span class="act off">{_e(label)}</span>'
+    return f'<a class="act" href="{_e(href)}" target="_blank" rel="noopener noreferrer">{_e(label)}</a>'
+
+
+def action(label: str, **data: str) -> str:
+    """A button the page's script turns into a POST. `data` becomes `data-*` attributes (`_` in a name is `-`)."""
+    attrs = "".join(f' data-{_e(k.replace("_", "-"))}="{_e(v)}"' for k, v in data.items())
+    return f'<button type="button" class="act"{attrs}>{_e(label)}</button>'
 
 
 def page(title: str, body: str, nonce: str, extra_css: str = "", *, script: str = "") -> str:

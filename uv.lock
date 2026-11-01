@@ -263,7 +263,7 @@ wheels = [
 
 [[package]]
 name = "ws-aitoolkit"
-version = "0.1.3"
+version = "0.1.4"
 source = { editable = "." }
 
 [package.dev-dependencies]

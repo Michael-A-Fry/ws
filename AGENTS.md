@@ -53,6 +53,7 @@ install.sh        the installer people run first (pipx or uv)
 | `gate.py` | `ws gate`: turn the policy into each runner's own config, and answer the hooks |
 | `globals.py` | `ws globals`: what ws installs globally stays global |
 | `guards/` | Guards: small, named checks the policy switches on, run by `ws gate` at the points a session can... |
+| `home/` | ws home: one read-only data API (`ws.home.api`) that every home area, app and script reads through |
 | `install.py` | `ws install` and `ws uninstall`: the engine that plans, writes and undoes what ws puts on a machine |
 | `jobs.py` | Job files: `$WS_HOME/jobs/<name>.toml`, one headless job each, run with `ws run <name>` |
 | `jsonl.py` | Bounded, locked JSON-lines logs: one object per line, a size limit with rotation, and no lost lines |

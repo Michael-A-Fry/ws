@@ -88,6 +88,7 @@ CASES: dict[str, list[str]] = {
     "eval.harvest": ["eval", "harvest"],
     "eval.approve": ["eval", "approve", "nothing"],
     "eval.reject": ["eval", "reject", "nothing"],
+    "home.data": ["home", "data"],
 }
 
 

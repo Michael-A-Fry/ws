@@ -37,6 +37,7 @@ from ws import (
 )
 from ws import eval as ws_eval
 from ws import globals as ws_globals
+from ws.home import cli as home_cli
 from ws.output import WsError
 from ws.profile import ProfileError, load, profile_path, write_if_changed
 from ws.style import Style
@@ -285,6 +286,7 @@ def build_parser() -> argparse.ArgumentParser:
     extcmd.register(sub)
     status.register(sub)
     ws_eval.register(sub)
+    home_cli.register(sub)
     version.register(sub)
     return p
 

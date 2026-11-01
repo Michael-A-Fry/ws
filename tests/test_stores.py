@@ -133,8 +133,12 @@ def modules_that_write() -> dict[str, set[str]]:
 
 
 # Modules that spell out a .jsonl name without writing it: the policy lists ws's logs among the paths a session may
-# not write, and the Claude Code adapter reads the runner's own transcript.
-NAMES_ONLY = {"src/ws/policy.py", "src/ws/adapters/claude_code.py"}
+# not write, the Claude Code adapter reads the runner's own transcript, and the home API names the default path of
+# the asks file it reads (it writes nothing).
+NAMES_ONLY = {"src/ws/policy.py", "src/ws/adapters/claude_code.py", "src/ws/home/api.py"}
+# Files another tool writes and ws only reads (the home API's default sources). Not ws stores, so stores.md doesn't
+# list them; only a NAMES_ONLY module may name one.
+FOREIGN = {"asks.jsonl"}
 
 
 def test_every_module_that_writes_a_jsonl_file_is_listed_in_stores_md():
@@ -145,6 +149,8 @@ def test_every_module_that_writes_a_jsonl_file_is_listed_in_stores_md():
     assert not unlisted, f"these write a .jsonl file but are not a Writer in docs/reference/stores.md: {unlisted}"
     for module, names in found.items():
         for name in sorted(names):
+            if module in NAMES_ONLY and name in FOREIGN:
+                continue
             assert name in rows or name.endswith(".old"), f"{module} names {name}, which stores.md doesn't list"
 
 

@@ -372,6 +372,16 @@ def test_syntax_check_runs_sh_n_on_shell_scripts(tmp_path):
     assert judge_file(f) is None
 
 
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+@pytest.mark.parametrize("shebang", ["#!/usr/bin/env bash", "#!/bin/bash", "#!/usr/bin/env -S bash -e"])
+def test_syntax_check_runs_bash_n_on_a_sh_file_that_asks_for_bash(tmp_path, shebang):
+    f = tmp_path / "a.sh"
+    f.write_text(f"{shebang}\nexec > >(tee -a log) 2>&1\n")
+    assert judge_file(f) is None
+    f.write_text(f"{shebang}\nif true; then\n")
+    assert "bash found a problem" in judge_file(f).reason
+
+
 def test_syntax_check_says_so_when_there_is_no_shell(tmp_path, monkeypatch):
     f = tmp_path / "a.sh"
     f.write_text("echo hi\n")

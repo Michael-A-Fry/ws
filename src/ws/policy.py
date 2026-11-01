@@ -1131,6 +1131,28 @@ def _cluster(flags: list[str], letter: str) -> bool:
 # --- paths: deny_read, protected files ----------------------------------------------------------------------------
 
 
+def _glob_class(pattern: str, i: int) -> tuple[str, int] | None:
+    """The bracket class opening at `pattern[i]` as a regex class and the index of its `]`, or None when it is not
+    one (no `]` before a `/`, or a range like `s-c` that runs backwards), so the `[` is matched as itself."""
+    j = pattern.find("]", i + 2)
+    if j < 0 or "/" in pattern[i + 1 : j]:
+        return None
+    body = pattern[i + 1 : j]
+    neg = body[0] in "!^"
+    body = body[1:] if neg else body
+    parts, k = [], 0
+    while k < len(body):
+        if k + 2 < len(body) and body[k + 1] == "-":
+            if body[k] > body[k + 2]:
+                return None
+            parts.append(re.escape(body[k]) + "-" + re.escape(body[k + 2]))
+            k += 3
+        else:
+            parts.append(re.escape(body[k]))
+            k += 1
+    return "[" + ("^" if neg else "") + "".join(parts) + "]", j
+
+
 def _glob_regex_path(pattern: str) -> re.Pattern:
     out, i = [], 0
     while i < len(pattern):
@@ -1147,10 +1169,9 @@ def _glob_regex_path(pattern: str) -> re.Pattern:
             out.append("[^/]*")
         elif c == "?":
             out.append("[^/]")
-        elif c == "[" and (j := pattern.find("]", i + 2)) > 0:
-            body = pattern[i + 1 : j]
-            out.append("[" + ("^" + body[1:] if body[0] == "!" else body) + "]")
-            i = j
+        elif c == "[" and (cls := _glob_class(pattern, i)) is not None:
+            out.append(cls[0])
+            i = cls[1]
         else:
             out.append(re.escape(c))
         i += 1

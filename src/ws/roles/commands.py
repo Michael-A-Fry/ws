@@ -11,6 +11,7 @@ Each reads its adapter's settings from `[roles.<role>]` of the profile. Messages
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import sys
@@ -83,8 +84,9 @@ MAX_PAYLOAD = 1_000_000
 
 
 def cmd_notify_alert(args: argparse.Namespace) -> int:
-    """Hook entry. Pushes the alert the runner's hook JSON on stdin asks for. Advice, not a gate: always exits 0, and
-    says on stderr why nothing went when something is wrong."""
+    """Hook entry. Pushes the alert the runner's hook JSON on stdin asks for. Advice, not a gate: always exits 0 and
+    says on stderr why nothing went when something is wrong. Any failure counts, including a payload nested deep enough
+    to hit the recursion limit, a missing stdin and a broker that is down."""
     try:
         roles = (load(profile_path()) or {}).get("roles")
         cfg = roles.get("notify") if isinstance(roles, dict) else None
@@ -95,8 +97,16 @@ def cmd_notify_alert(args: argparse.Namespace) -> int:
         if line:
             print(f"ws: {line}", file=sys.stderr)
     except (ProfileError, ntfy.NotifyError, ValueError, OSError) as e:  # ValueError covers a payload that isn't JSON
-        print(f"ws: alert not sent: {e}", file=sys.stderr)
+        _warn(f"ws: alert not sent: {e}")
+    except Exception as e:  # noqa: BLE001  a hook must never fail its session; the type is enough to go on
+        _warn(f"ws: alert not sent ({type(e).__name__})")
     return 0
+
+
+def _warn(text: str) -> None:
+    """A line on stderr; a closed stderr is not worth failing a hook for."""
+    with contextlib.suppress(Exception):
+        print(text, file=sys.stderr)
 
 
 # ---- ws backup -------------------------------------------------------------------------------------------------------
@@ -234,7 +244,7 @@ def register(sub) -> None:
     p = ns.add_parser("status", help="today's count against the caps")
     p.set_defaults(func=cmd_notify_status)
     p = ns.add_parser("alert", help='hook entry: push "<folder> needs you" or "<folder> finished" (hook JSON on stdin)')
-    p.add_argument("--runner", required=True, help="the runner whose hook is calling, for example claude-code")
+    p.add_argument("--runner", default="unknown", help="the runner whose hook is calling, for example claude-code")
     p.set_defaults(func=cmd_notify_alert)
 
     b = sub.add_parser("backup", help="back up memory, notes and profile with restic, and prove a file restores")

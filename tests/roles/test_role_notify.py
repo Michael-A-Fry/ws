@@ -5,6 +5,11 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import threading
+import time
+import urllib.error
+import urllib.request
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -361,7 +366,15 @@ def test_full_text_adds_the_runners_message(env):
     assert b"permission" not in s2.calls[0][1]
 
 
-def test_alert_text_must_be_title_or_full(env):
+def test_plain_text_sends_no_folder_name_or_runner_message(env):
+    s = Sender()
+    ntfy.alert({**CFG, "alert_text": "plain"}, env, NOTIFICATION, "claude-code", now=NOON, sender=s)
+    ntfy.alert({**CFG, "alert_text": "plain"}, env, STOP, "claude-code", now=NOON + timedelta(minutes=1), sender=s)
+    assert [c[1] for c in s.calls] == [b"a session needs you", b"a session finished"]
+    assert "payroll" not in json.dumps([[c[1].decode(), c[2]] for c in s.calls])
+
+
+def test_alert_text_must_be_title_full_or_plain(env):
     with pytest.raises(ntfy.NotifyError, match="alert_text"):
         ntfy.alert({**CFG, "alert_text": "loud"}, env, STOP, "claude-code", now=NOON, sender=Sender())
 
@@ -416,6 +429,8 @@ def test_no_alert_for_other_events_or_junk(env, payload):
     [
         (STOP, {"WS_RUN_ID": "r1"}),
         (STOP, {"CLAUDE_CODE_ENTRYPOINT": "sdk-cli"}),
+        (STOP, {"CLAUDE_CODE_ENTRYPOINT": "sdk-py"}),
+        (STOP, {"CLAUDE_CODE_ENTRYPOINT": "sdk-ts"}),
         ({**STOP, "headless": True}, {}),
     ],
 )
@@ -460,7 +475,7 @@ def test_notify_last_is_written_on_failure(env):
     with pytest.raises(ntfy.NotifyError, match="500"):
         ntfy.alert(CFG, env, STOP, "claude-code", now=NOON, sender=Sender(500))
     last = read_last(env)
-    assert last["kind"] == "alert" and last["ok"] is False and "500" in last["error"]
+    assert last["kind"] == "alert" and last["ok"] is False and last["error"] == "http_500"
     assert ntfy.read_counts(env, "2026-03-04")["alert"] == 0  # a failed send isn't counted
     assert "payroll" not in json.dumps(last)
 
@@ -536,3 +551,207 @@ def test_cli_alert_skips_a_ws_run_session(box, write_profile, capsys, monkeypatc
     monkeypatch.setenv("WS_RUN_ID", "r1")
     code, err = run_alert(monkeypatch, capsys, STOP)
     assert (code, err, s.calls) == (0, "", [])
+
+
+# ---- an alert must not hold a session up ---------------------------------------------------------------------------------
+
+
+def test_an_alert_that_hangs_gives_up_with_a_timeout_code(env, monkeypatch):
+    monkeypatch.setattr(ntfy, "ALERT_TIMEOUT_S", 0.2)
+    gate = threading.Event()
+
+    def stuck(url, body, headers):
+        gate.wait(10)
+        return 200
+
+    started = time.monotonic()
+    try:
+        with pytest.raises(ntfy.NotifyError, match="more than"):
+            ntfy.alert(CFG, env, STOP, "claude-code", now=NOON, sender=stuck)
+        assert time.monotonic() - started < 2
+    finally:
+        gate.set()
+    assert read_last(env)["error"] == "timeout"
+    assert ntfy.read_counts(env, "2026-03-04")["alert"] == 0
+
+
+def test_the_default_alert_sender_waits_three_seconds_and_a_push_ten(env, monkeypatch):
+    seen = []
+
+    class Opener:
+        def open(self, req, timeout=None):
+            seen.append(timeout)
+            raise urllib.error.HTTPError(req.full_url, 204, "", {}, None)
+
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *a: Opener())
+    ntfy.alert(CFG, env, STOP, "claude-code", now=NOON)
+    ntfy.send(CFG, env, "hi", now=NOON)
+    assert seen == [3.0, 10.0]
+
+
+def test_the_lease_is_inside_the_alert_time_limit(env, monkeypatch):
+    monkeypatch.setattr(ntfy, "ALERT_TIMEOUT_S", 0.2)
+    gate = threading.Event()
+
+    def slow_lease(name, purpose, host, socket=None, ttl_s=None):
+        gate.wait(10)
+        raise broker.BrokerError("late")
+
+    monkeypatch.setattr(broker, "request", slow_lease)
+    try:
+        with pytest.raises(ntfy.NotifyError, match="more than"):
+            ntfy.alert({**CFG, "token": "ntfy"}, env, STOP, "claude-code", now=NOON, sender=Sender())
+    finally:
+        gate.set()
+    assert read_last(env)["error"] == "timeout"
+
+
+def test_a_pushes_wait_is_not_cut_short(env, monkeypatch):
+    monkeypatch.setattr(ntfy, "ALERT_TIMEOUT_S", 0.01)
+
+    def slowish(url, body, headers):
+        time.sleep(0.1)
+        return 200
+
+    assert ntfy.send(CFG, env, "hi", now=NOON, sender=slowish).startswith("sent")
+
+
+def test_an_alert_skips_when_another_send_holds_the_counter(env):
+    fcntl = pytest.importorskip("fcntl")
+    ntfy.counter_path(env).parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(ntfy.counter_path(env), os.O_RDWR | os.O_CREAT, 0o600)
+    s = Sender()
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        started = time.monotonic()
+        with pytest.raises(ntfy.NotifyError, match="holds the counter"):
+            ntfy.alert(CFG, env, STOP, "claude-code", now=NOON, sender=s)
+        assert time.monotonic() - started < 1
+    finally:
+        os.close(fd)
+    assert s.calls == []
+    last = read_last(env)
+    assert (last["ok"], last["error"]) == (False, "busy")
+    ntfy.alert(CFG, env, STOP, "claude-code", now=NOON, sender=s)  # busy is not a failure: no backoff
+    assert len(s.calls) == 1
+
+
+def test_a_failed_alert_backs_off_alerts_for_five_minutes(env):
+    with pytest.raises(ntfy.NotifyError, match="500"):
+        ntfy.alert(CFG, env, STOP, "claude-code", now=NOON, sender=Sender(500))
+    s = Sender()
+    with pytest.raises(ntfy.NotifyError, match="paused"):
+        ntfy.alert(CFG, env, STOP, "claude-code", now=NOON + timedelta(minutes=4, seconds=59), sender=s)
+    assert s.calls == []
+    assert read_last(env)["error"] == "http_500"  # the pause does not extend itself
+    assert ntfy.send(CFG, env, "hi", now=NOON + timedelta(minutes=1), sender=s).startswith("sent")  # pushes go on
+    assert len(s.calls) == 1
+    # the push went fine, so the failure is no longer the last word and alerts resume
+    ntfy.alert(CFG, env, STOP, "claude-code", now=NOON + timedelta(minutes=2), sender=s)
+    assert len(s.calls) == 2
+
+
+def test_alerts_resume_after_the_backoff(env):
+    with pytest.raises(ntfy.NotifyError):
+        ntfy.alert(CFG, env, STOP, "claude-code", now=NOON, sender=Sender(503))
+    s = Sender()
+    ntfy.alert(CFG, env, STOP, "claude-code", now=NOON + timedelta(minutes=5), sender=s)
+    assert len(s.calls) == 1 and read_last(env)["ok"] is True
+
+
+def test_a_backoff_refusal_carries_its_code(env):
+    with pytest.raises(ntfy.NotifyError) as e:
+        ntfy.alert(CFG, env, STOP, "claude-code", now=NOON, sender=Sender(500))
+    assert e.value.code == "http_500"
+    with pytest.raises(ntfy.NotifyError) as e:
+        ntfy.alert(CFG, env, STOP, "claude-code", now=NOON, sender=Sender())
+    assert e.value.code == "backoff"
+
+
+def test_notify_last_is_private_and_holds_only_a_fixed_code(env):
+    def odd(url, body, headers):
+        raise ntfy.NotifyError("token SECRET-123 at https://host/lease", "not-a-code")
+
+    with pytest.raises(ntfy.NotifyError):
+        ntfy.send(CFG, env, "hi", now=NOON, sender=odd)
+    path = ntfy.ws_home(env) / "logs" / "notify-last.json"
+    assert read_last(env)["error"] == "error" and "SECRET" not in path.read_text()
+    assert path.stat().st_mode & 0o777 == 0o600
+    path.chmod(0o644)
+    ntfy.send(CFG, env, "hi", now=NOON, sender=Sender())
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert not path.with_name(path.name + ".tmp").exists()
+
+
+@pytest.mark.parametrize(
+    ("exc", "code"),
+    [
+        (urllib.error.URLError(TimeoutError("slow")), "timeout"),
+        (TimeoutError("slow"), "timeout"),
+        (urllib.error.URLError(ConnectionRefusedError()), "refused"),
+        (ConnectionRefusedError(), "refused"),
+        (urllib.error.URLError("dns"), "error"),
+        (ValueError("x"), "error"),
+    ],
+)
+def test_the_post_helper_codes_network_failures_by_type(monkeypatch, exc, code):
+    class Opener:
+        def open(self, req, timeout=None):
+            raise exc
+
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *a: Opener())
+    with pytest.raises(ntfy.NotifyError) as e:
+        ntfy.post(URL, b"x", {})
+    assert e.value.code == code
+
+
+def test_a_broker_that_will_not_lease_is_coded_refused(env, monkeypatch):
+    def refuse(*a, **k):
+        raise broker.BrokerError("no")
+
+    monkeypatch.setattr(broker, "request", refuse)
+    with pytest.raises(ntfy.NotifyError):
+        ntfy.alert({**CFG, "token": "ntfy"}, env, STOP, "claude-code", now=NOON, sender=Sender())
+    assert read_last(env)["error"] == "refused"
+
+
+def run_alert_args(monkeypatch, capsys, payload, argv):
+    monkeypatch.setattr("sys.stdin", io.StringIO(payload if isinstance(payload, str) else json.dumps(payload)))
+    code = cli.main(argv)
+    return code, capsys.readouterr().err
+
+
+def test_cli_alert_runs_without_a_runner(box, write_profile, capsys, monkeypatch):
+    write_profile({"roles": {"notify": CFG}})
+    s = Sender()
+    monkeypatch.setattr(ntfy, "post", s)
+    code, err = run_alert_args(monkeypatch, capsys, STOP, ["notify", "alert"])
+    assert code == 0 and "1 of 50 alerts" in err
+    assert s.calls[0][2]["Title"] == "ws unknown"
+
+
+def test_cli_alert_exits_0_with_no_stdin(box, write_profile, capsys, monkeypatch):
+    write_profile({"roles": {"notify": CFG}})
+    monkeypatch.setattr(ntfy, "post", Sender())
+    monkeypatch.setattr("sys.stdin", None)
+    assert cli.main(["notify", "alert", "--runner", "claude-code"]) == 0
+    assert "alert not sent" in capsys.readouterr().err
+
+
+def test_cli_alert_exits_0_on_a_payload_nested_past_the_recursion_limit(box, write_profile, capsys, monkeypatch):
+    write_profile({"roles": {"notify": CFG}})
+    s = Sender()
+    monkeypatch.setattr(ntfy, "post", s)
+    code, err = run_alert_args(monkeypatch, capsys, "[" * 200_000 + "]" * 200_000, ["notify", "alert"])
+    assert code == 0 and "alert not sent" in err and s.calls == []
+
+
+def test_cli_alert_exits_0_when_the_broker_breaks(box, write_profile, capsys, monkeypatch):
+    write_profile({"roles": {"notify": {**CFG, "token": "ntfy"}}})
+
+    def boom(*a, **k):
+        raise RuntimeError("broker exploded with TOKEN-XYZ")
+
+    monkeypatch.setattr(broker, "request", boom)
+    code, err = run_alert_args(monkeypatch, capsys, STOP, ["notify", "alert", "--runner", "claude-code"])
+    assert code == 0 and "RuntimeError" in err and "TOKEN-XYZ" not in err

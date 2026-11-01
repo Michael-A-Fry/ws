@@ -3,21 +3,23 @@ install manifest without ever overwriting a skill the person already has."""
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
+import os
 import re
 
 import pytest
 
 from ws import cli, frontmatter, skills
 
-NAMES = ["align", "checkpoint", "taste-gate", "dataviz"]
+NAMES = ["align", "checkpoint", "taste-gate", "dataviz", "resume", "ship"]
 
 # Nothing in a shipped skill may name a person, a machine, a private path or a private tool.
 SCRUB = {
     "a personal name": r"Michael|Fry\b",
     "an e-mail address": r"[\w.+-]+@[\w-]+\.[\w.-]+",
-    "the private workspace": r"AI_Workspace|\.ws-live|ws dispatch|\.claude-state|ws-checkpoint|ws-test",
+    "the private workspace": r"AI_Workspace|\.ws-live|ws dispatch|ws-checkpoint|ws-test",
     "a lesson id": r"\bL-0\d\d\b",
     "a private agent": r"ui-density-critic",
     "a runner-only tool name": r"AskUserQuestion|TodoWrite|\bTask tool\b|ToolSearch",
@@ -58,7 +60,7 @@ def install(capsys, box, *extra):
 # ---- the text ------------------------------------------------------------------------------------------------------
 
 
-def test_the_four_skills_are_shipped():
+def test_the_six_skills_are_shipped():
     assert sorted(skills.SKILLS) == sorted(NAMES)
 
 
@@ -104,6 +106,20 @@ def test_dataviz_is_ours_and_short():
 def test_the_other_skills_stay_short():
     for name in ("align", "checkpoint", "taste-gate"):
         assert len(skills.SKILLS[name].splitlines()) <= 110
+
+
+def test_resume_and_ship_are_short_and_say_what_they_do():
+    for name, needed in (
+        ("resume", ("STATE.md", "TODO.md", "git log", "two lines", "carry on")),
+        ("ship", ("gh pr create", "exit code", "register", "commit", "branch")),
+    ):
+        text = skills.SKILLS[name]
+        assert len(text.splitlines()) <= 120
+        for word in needed:
+            assert word.lower() in text.lower(), (name, word)
+        assert not re.search(r"\b(never|do not|don't|does not|doesn't)\b", text, re.IGNORECASE), (
+            name
+        )  # what it does, only
 
 
 # ---- installing -------------------------------------------------------------------------------------------------------
@@ -307,3 +323,170 @@ def test_skills_add_installs_one_that_was_never_installed(box, capsys):
     remove_skill(box, "align")  # ws made it, so it is "removed" even with the plugin off
     assert run(capsys, "skills", "add", "align")[0] == 0
     assert (box / ".claude" / "skills" / "align" / "SKILL.md").is_file()
+
+
+# ---- adopting a skill of yours that has a shipped name ----------------------------------------------------------------------
+
+
+def claude_skills(box):
+    return box / ".claude" / "skills"
+
+
+def backups(box):
+    return box / ".ws" / "backups" / "skills"
+
+
+def make_mine(box, name="align", text="my own align\n"):
+    mine = claude_skills(box) / name
+    mine.mkdir(parents=True)
+    (mine / "SKILL.md").write_text(text)
+    (mine / "notes.txt").write_text("extra file\n")
+    return mine
+
+
+def test_adopt_moves_yours_aside_installs_ws_s_and_restore_puts_it_back(box, capsys):
+    mine = make_mine(box)
+    inode = mine.stat().st_ino
+    assert install(capsys, box, "--runner", "claude-code")[0] == 0
+    assert (mine / "SKILL.md").read_text() == "my own align\n"  # yours is kept at install
+
+    code, out, _ = run(capsys, "skills", "adopt", "align", "--runner", "claude-code")
+    assert code == 0 and "yours is kept at" in out
+    (kept,) = (backups(box) / "claude-code").iterdir()
+    assert re.fullmatch(r"align-\d{8}T\d{6}Z", kept.name)
+    assert (kept / "SKILL.md").read_text() == "my own align\n" and kept.stat().st_ino == inode
+    assert (mine / "SKILL.md").read_text() == skills.SKILLS["align"]
+    record = json.loads((backups(box) / "adopted.json").read_text())["adopted"]
+    assert record["claude-code/align"]["backup"] == str(kept)
+
+    code, out, _ = run(capsys, "skills", "list")
+    assert code == 0 and f"adopted (yours kept at {kept})" in out
+    rows = {(r["name"], r["runner"]): r for r in json.loads(run(capsys, "skills", "list", "--json")[1])["data"]}
+    assert rows[("align", "claude-code")]["backup"] == str(kept)
+
+    code, out, _ = install(capsys, box, "--runner", "claude-code")
+    assert code == 0 and "0 changes" in out  # a second install changes nothing after the swap
+
+    code, out, _ = run(capsys, "skills", "restore", "align", "--runner", "claude-code")
+    assert code == 0 and "yours is back" in out
+    assert mine.stat().st_ino == inode
+    assert snapshot(mine) == {
+        "SKILL.md": hashlib.sha256(b"my own align\n").hexdigest(),
+        "notes.txt": hashlib.sha256(b"extra file\n").hexdigest(),
+    }
+    assert not kept.exists()
+    assert json.loads((backups(box) / "adopted.json").read_text())["adopted"] == {}
+    assert "yours, kept" in run(capsys, "skills", "list")[1]
+
+
+def test_adopt_then_restore_leaves_the_skills_folder_as_it_was(box, capsys):
+    make_mine(box)
+    before = snapshot(claude_skills(box))
+    assert run(capsys, "skills", "adopt", "align", "--runner", "claude-code")[0] == 0
+    assert snapshot(claude_skills(box)) != before
+    assert run(capsys, "skills", "restore", "align", "--runner", "claude-code")[0] == 0
+    assert snapshot(claude_skills(box)) == before
+
+
+def test_adopt_from_a_link_renames_the_link_and_restore_returns_it(box, capsys):
+    real = box / "elsewhere" / "dataviz"
+    real.mkdir(parents=True)
+    (real / "SKILL.md").write_text("linked dataviz\n")
+    claude_skills(box).mkdir(parents=True)
+    link = claude_skills(box) / "dataviz"
+    link.symlink_to(real)
+    assert run(capsys, "skills", "adopt", "dataviz", "--runner", "claude-code")[0] == 0
+    (kept,) = (backups(box) / "claude-code").iterdir()
+    assert kept.is_symlink() and kept.resolve() == real.resolve()
+    assert (real / "SKILL.md").read_text() == "linked dataviz\n"  # the target is untouched
+    assert not link.is_symlink() and (link / "SKILL.md").read_text() == skills.SKILLS["dataviz"]
+    assert run(capsys, "skills", "restore", "dataviz", "--runner", "claude-code")[0] == 0
+    assert link.is_symlink() and link.resolve() == real.resolve()
+    assert (real / "SKILL.md").read_text() == "linked dataviz\n"
+
+
+def test_adopt_across_filesystems_is_a_typed_error_and_changes_nothing(box, capsys, monkeypatch):
+    make_mine(box)
+    before = snapshot(box)
+
+    def refuse(src, dst):
+        raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+    with monkeypatch.context() as m:
+        m.setattr(os, "rename", refuse)
+        code, _, err = run(capsys, "skills", "adopt", "align", "--runner", "claude-code")
+    assert code == 1 and "different filesystems" in err
+    assert snapshot(box) == before and not backups(box).exists()
+
+
+def test_adopt_has_nothing_to_do_without_a_skill_of_yours(box, capsys):
+    (box / ".claude").mkdir()
+    code, _, err = run(capsys, "skills", "adopt", "align", "--runner", "claude-code")
+    assert code == 1 and "you have no align" in err
+    assert install(capsys, box, "--runner", "claude-code")[0] == 0
+    code, _, err = run(capsys, "skills", "adopt", "align", "--runner", "claude-code")
+    assert code == 1 and "already ws's own" in err
+    code, _, err = run(capsys, "skills", "restore", "align", "--runner", "claude-code")
+    assert code == 1 and "no adopted align" in err
+
+
+def test_adopt_for_opencode_points_at_the_folder_it_reads(box, capsys):
+    make_mine(box, "dataviz", "my dataviz\n")
+    code, _, err = run(capsys, "skills", "adopt", "dataviz", "--runner", "opencode")
+    assert code == 1 and "reads your dataviz from another folder" in err and "--runner" in err
+    assert (claude_skills(box) / "dataviz" / "SKILL.md").read_text() == "my dataviz\n"
+
+
+def test_a_skills_folder_that_is_a_link_is_listed_and_left_alone(box, capsys):
+    elsewhere = box / "shared-skills"
+    elsewhere.mkdir()
+    (box / ".claude").mkdir()
+    (box / ".claude" / "skills").symlink_to(elsewhere)
+    assert install(capsys, box, "--runner", "claude-code")[0] == 0
+    assert list(elsewhere.iterdir()) == []  # ws wrote nothing through the link
+    code, out, _ = run(capsys, "skills", "list")
+    assert code == 0 and out.count("ws installs nothing there") == len(NAMES)
+    assert f"your skills folder is a link to {elsewhere.resolve()}: ws installs nothing there" in out
+    rows = json.loads(run(capsys, "skills", "list", "--json")[1])["data"]
+    assert {r["action"] for r in rows} == {"linked"}
+    code, out, _ = run(capsys, "skills", "add", "align")
+    assert code == 0 and "ws installs nothing there" in out
+    code, _, err = run(capsys, "skills", "adopt", "align", "--runner", "claude-code")
+    assert code == 1 and "ws installs nothing there" in err and list(elsewhere.iterdir()) == []
+
+
+def test_restore_refuses_when_ws_s_copy_has_your_edits(box, capsys):
+    make_mine(box)
+    assert run(capsys, "skills", "adopt", "align", "--runner", "claude-code")[0] == 0
+    ours = claude_skills(box) / "align" / "SKILL.md"
+    ours.write_text(ours.read_text() + "my line\n")
+    code, _, err = run(capsys, "skills", "restore", "align", "--runner", "claude-code")
+    assert code == 1 and "not ws's untouched copy" in err and "my line" in ours.read_text()
+    assert len(list((backups(box) / "claude-code").iterdir())) == 1
+
+
+def test_uninstall_after_adopt_leaves_your_copy_and_list_says_where(box, capsys):
+    make_mine(box)
+    assert run(capsys, "skills", "adopt", "align", "--runner", "claude-code")[0] == 0
+    (kept,) = (backups(box) / "claude-code").iterdir()
+    code, out, _ = run(capsys, "uninstall", "--yes")
+    assert code == 0
+    assert (kept / "SKILL.md").read_text() == "my own align\n"  # the backup stays
+    assert not (claude_skills(box) / "align").exists()
+    code, out, _ = run(capsys, "skills", "list")
+    assert code == 0 and f"yours is kept at {kept}" in out
+    assert run(capsys, "skills", "restore", "align", "--runner", "claude-code")[0] == 0
+    assert (claude_skills(box) / "align" / "SKILL.md").read_text() == "my own align\n"
+
+
+def test_adopt_and_restore_take_only_a_shipped_name_and_a_known_runner():
+    assert cli.main(["skills", "adopt", "nope"]) == 2
+    assert cli.main(["skills", "restore", "align", "--runner", "nope"]) == 2
+
+
+def test_an_adoption_record_that_does_not_read_stops_the_command(box, capsys):
+    backups(box).mkdir(parents=True)
+    (backups(box) / "adopted.json").write_text("{not json")
+    (box / ".claude").mkdir()
+    code, _, err = run(capsys, "skills", "list")
+    assert code == 1 and "does not read as the adoption record" in err

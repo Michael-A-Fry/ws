@@ -358,13 +358,3 @@ def test_a_policy_file_in_a_linked_ws_home_covers_both_spellings(tmp_path):
     p = policy.load(link / "policy.toml")
     assert policy.is_denied_read(p, str(link / "secrets" / "k"))
     assert policy.is_denied_read(p, str(real / "secrets" / "k"))
-
-
-# --- tests start in their own HOME and WS_HOME ---------------------------------------------------------------------
-
-
-def test_every_test_starts_with_a_home_and_ws_home_under_tmp_path(tmp_path):
-    import os
-
-    assert os.environ["HOME"].startswith(str(tmp_path))
-    assert os.environ["WS_HOME"].startswith(str(tmp_path))

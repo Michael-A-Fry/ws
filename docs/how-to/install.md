@@ -53,7 +53,7 @@ Save the script first if you want to read it before you run it: `curl -fsSLO <th
 ## If you already have a program called `ws`
 
 The installer looks in its install folder (`uv tool dir --bin`, or `~/.local/bin` for pipx) before it changes anything.
-If a different `ws` is there, it stops before the download, leaves it where it is, and prints two commands:
+If a different `ws` is there, it stops before the download, keeps it in place, and prints two commands:
 
 ```sh
 mv ~/.local/bin/ws ~/.local/bin/ws-legacy      # step 1: move it aside, then run the installer again

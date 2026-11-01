@@ -9,7 +9,7 @@ The install goes through the same `install.plan/apply` steps as everything else,
 That includes one a runner reads from another runner's folder (OpenCode reads `~/.claude/skills` and `~/.agents/skills`).
 
     ws skills [list] [--json]      each shipped skill, per runner: installed by ws, adopted, yours (kept), removed by you,
-                                   in a linked folder, or not installed
+                                   a link of yours, or not installed
     ws skills add NAME             put a skill back that you removed (or add one that is not installed yet)
     ws skills adopt NAME [--runner R]
                                    swap your own skill of that name for ws's: yours moves to
@@ -19,8 +19,10 @@ That includes one a runner reads from another runner's folder (OpenCode reads `~
 
 A skill ws installed and you then deleted stays deleted: ws takes that as your choice, says so on `ws install`, and
 only `ws skills add NAME` brings it back. Each adoption is recorded in `$WS_HOME/backups/skills/adopted.json`, which
-`list` reads to say where your copy is kept. A runner skills folder that is itself a link to somewhere else is read and
-listed; ws writes nothing through the link.
+`list` reads to say where your copy is kept; a second adopt of a name is refused while that copy is still unrestored.
+A runner skills folder that is itself a link is a folder like any other, and ws writes its own skills through it; a
+skill entry that is itself a link is yours, and ws leaves it alone. A record that does not read stops `ws skills`, but
+`ws install` only warns about it.
 """
 
 from __future__ import annotations
@@ -53,7 +55,7 @@ class Item:
     runner: str
     path: Path  # where ws would put it: <skills folder>/<name>
     # "install" (new or ws's own) | "yours" (kept) | "shared" (read elsewhere) | "removed" (by the person) |
-    # "linked" (the runner's skills folder is a link to somewhere else: ws installs nothing there)
+    # "linked" (the skill entry is itself a link: it is the person's, and ws installs nothing over it)
     action: str
     note: str = ""
     backup: str = ""  # where the person's own copy is kept, when ws adopted the name
@@ -124,23 +126,28 @@ def _write_adopted(env, adopted: dict[str, dict]) -> None:
     install._write_atomic(path, (json.dumps({"adopted": adopted}, indent=2, sort_keys=True) + "\n").encode("utf-8"))
 
 
-def items(runners: list[str], env, entries: dict[str, dict] | None = None) -> list[Item]:
-    """What to do with each shipped skill for each runner. `entries` is the install manifest's entries by path."""
+def items(runners: list[str], env, entries: dict[str, dict] | None = None, strict: bool = False) -> list[Item]:
+    """What to do with each shipped skill for each runner. `entries` is the install manifest's entries by path. An
+    adoption record that does not read stops the caller when `strict`; otherwise it counts as empty."""
     entries = install._read_manifest(env)[0] if entries is None else entries
-    adopted = _read_adopted(env)
+    try:
+        adopted = _read_adopted(env)
+    except WsError:
+        if strict:
+            raise
+        adopted = {}
     out = []
     for runner in runners:
         own = skills_dir(runner, env)
         elsewhere = _also_reads(runner, env)
-        if own.is_symlink():
-            note = f"your skills folder is a link to {os.path.realpath(own)}: ws installs nothing there"
-            out += [Item(name, runner, own / name, "linked", note) for name in SKILLS]
-            continue
         for name in SKILLS:
             target = own / name
             kept = adopted.get(f"{runner}/{name}", {}).get("backup", "")
             kept = kept if kept and os.path.lexists(kept) else ""
-            if _ours(target, entries) and (target / FILE).is_file():
+            if target.is_symlink():  # a link in the skills folder is the person's, whoever made it
+                note = f"{target} is a link to {os.path.realpath(target)}: ws left it"
+                out.append(Item(name, runner, target, "linked", note, kept))
+            elif _ours(target, entries) and (target / FILE).is_file():
                 note = f"adopted (yours kept at {kept})" if kept else "installed by ws"
                 out.append(Item(name, runner, target, "install", note, kept))
             elif _ours(target, entries):  # ws made it, and it has gone since: that was the person's doing
@@ -175,10 +182,16 @@ def runners_for(runner: str, env) -> list[str]:
 
 
 def notices(runner: str, env) -> list[str]:
-    """One line per skill the person removed, for `ws install` to print (ws leaves it out each time)."""
-    return [
+    """One line per skill the person removed, for `ws install` to print (ws leaves it out each time), and a warning
+    when the adoption record does not read (install carries on; `ws skills` stops until it is fixed)."""
+    out = [
         f"{it.name} ({it.runner}): {it.note}" for it in items(runners_for(runner, env), env) if it.action == "removed"
     ]
+    try:
+        _read_adopted(env)
+    except WsError as e:
+        out.append(f"warning: {e.message}: {e.hint}")
+    return out
 
 
 # ---- the command -----------------------------------------------------------------------------------------------------
@@ -188,7 +201,7 @@ def cmd_list(args: argparse.Namespace) -> int:
     env = os.environ
     try:
         runner = install.answers_from_profile(env).runner
-        rows = items(runners_for(runner, env), env)
+        rows = items(runners_for(runner, env), env, strict=True)
     except install.InstallError as e:
         raise WsError("bad_config", str(e), "run `ws doctor`") from e
     if args.json:
@@ -203,7 +216,7 @@ def cmd_list(args: argparse.Namespace) -> int:
             "yours": "yours, kept",
             "shared": "yours, read from elsewhere",
             "removed": "removed by you",
-            "linked": "skills folder is a link",
+            "linked": "a link of yours, kept",
         }[r.action]
         print(f"{r.name:<12} {r.runner:<12} {state}")
         if r.action != "install":
@@ -223,7 +236,7 @@ def cmd_add(args: argparse.Namespace) -> int:
                 "set one with `ws install --runner claude-code|opencode`",
             )
         for r in runners:
-            (it,) = (i for i in items([r], env) if i.name == args.name)
+            (it,) = (i for i in items([r], env, strict=True) if i.name == args.name)
             if it.action in ("yours", "shared", "linked"):
                 print(f"ws: {it.note}")
                 continue
@@ -238,7 +251,7 @@ def cmd_add(args: argparse.Namespace) -> int:
 
 
 def _item(runner: str, name: str, env) -> Item:
-    (it,) = (i for i in items([runner], env) if i.name == name)
+    (it,) = (i for i in items([runner], env, strict=True) if i.name == name)
     return it
 
 
@@ -273,11 +286,30 @@ def _move(src: Path, dst: Path) -> None:
         raise WsError("failed", f"could not move {src} to {dst}: {e.strerror}") from e
 
 
+def _put_back(backup: Path, path: Path, env, cause: Exception) -> None:
+    """Undo a half-done adopt: take out whatever ws wrote at `path`, then move `backup` back. If that cannot be done,
+    a typed error names where the person's copy is."""
+    try:
+        if os.path.lexists(path):
+            skill = path / FILE
+            if path.is_symlink() or not path.is_dir():
+                raise OSError(errno.EEXIST, "something other than ws's folder is in the way", str(path))
+            with contextlib.suppress(FileNotFoundError):
+                skill.unlink()
+            path.rmdir()
+            install.forget([skill, path], env)
+        os.rename(backup, path)
+    except (OSError, install.InstallError) as e:
+        raise WsError(
+            "failed",
+            f"adopting failed ({cause}) and ws could not put your skill back at {path}; it is kept at {backup}",
+            f"move {backup} back to {path} yourself",
+        ) from e
+
+
 def adopt(runner: str, name: str, env) -> Path:
     """Swap the person's own `name` skill in this runner's folder for ws's. Returns where theirs is kept."""
     it = _item(runner, name, env)
-    if it.action == "linked":
-        raise WsError("refused", it.note, "move your skills out of the linked folder, or install the skill by hand")
     if it.action == "shared":
         raise WsError(
             "not_found",
@@ -290,6 +322,14 @@ def adopt(runner: str, name: str, env) -> Path:
         if os.path.lexists(it.path):
             raise WsError("not_found", f"{name} for {runner} is already ws's own: {it.note}")
         raise WsError("not_found", f"you have no {name} in {it.path.parent}", f"`ws skills add {name}` installs ws's")
+    held = _read_adopted(env).get(f"{runner}/{name}", {}).get("backup", "")
+    if held and os.path.lexists(held):
+        raise WsError(
+            "refused",
+            f"an earlier {name} of yours for {runner} is still kept at {held}, and a second adopt would lose track of it",
+            f"run `ws skills restore {name} --runner {runner}`, or move {held} somewhere of your own and remove its "
+            f"entry from {backups_dir(env) / ADOPTED}",
+        )
     backup = _backup_path(runner, name, env)
     _move(it.path, backup)
     try:
@@ -302,8 +342,7 @@ def adopt(runner: str, name: str, env) -> Path:
             },
         )
     except (install.InstallError, OSError, WsError) as e:
-        with contextlib.suppress(OSError):
-            os.rename(backup, it.path)  # put yours back exactly as it was
+        _put_back(backup, it.path, env, e)  # yours back exactly as it was
         if isinstance(e, WsError):
             raise
         raise WsError("failed", str(e)) from e
@@ -324,12 +363,16 @@ def restore(runner: str, name: str, env) -> Path:
     backup, target = Path(rec["backup"]), skills_dir(runner, env) / name
     if not os.path.lexists(backup):
         raise WsError("not_found", f"your {name} is no longer at {backup}", "nothing was changed")
-    if skills_dir(runner, env).is_symlink():
-        raise WsError("refused", _item(runner, name, env).note, "nothing was changed")
     if os.path.lexists(target):
         entries = install._read_manifest(env)[0]
         skill = target / FILE
         mine = entries.get(str(skill))
+        if mine is None:
+            raise WsError(
+                "refused",
+                f"the install record has no entry for {skill}, so ws cannot tell its copy from yours and left it",
+                f"move {target} aside yourself, then run `ws skills restore {name}` again",
+            )
         clean = (
             _ours(target, entries)
             and not target.is_symlink()

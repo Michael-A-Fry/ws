@@ -13,13 +13,14 @@ import pytest
 
 from ws import cli, frontmatter, skills
 
+ADOPTED = skills.ADOPTED
 NAMES = ["align", "checkpoint", "taste-gate", "dataviz", "resume", "ship"]
 
 # Nothing in a shipped skill may name a person, a machine, a private path or a private tool.
 SCRUB = {
     "a personal name": r"Michael|Fry\b",
     "an e-mail address": r"[\w.+-]+@[\w-]+\.[\w.-]+",
-    "the private workspace": r"AI_Workspace|\.ws-live|ws dispatch|ws-checkpoint|ws-test",
+    "the private workspace": r"AI_Workspace|\.ws-live|ws dispatch|\.claude-state|ws-checkpoint|ws-test",
     "a lesson id": r"\bL-0\d\d\b",
     "a private agent": r"ui-density-critic",
     "a runner-only tool name": r"AskUserQuestion|TodoWrite|\bTask tool\b|ToolSearch",
@@ -437,22 +438,111 @@ def test_adopt_for_opencode_points_at_the_folder_it_reads(box, capsys):
     assert (claude_skills(box) / "dataviz" / "SKILL.md").read_text() == "my dataviz\n"
 
 
-def test_a_skills_folder_that_is_a_link_is_listed_and_left_alone(box, capsys):
+def test_a_skills_folder_that_is_a_link_still_gets_ws_s_skills(box, capsys):
     elsewhere = box / "shared-skills"
     elsewhere.mkdir()
     (box / ".claude").mkdir()
     (box / ".claude" / "skills").symlink_to(elsewhere)
     assert install(capsys, box, "--runner", "claude-code")[0] == 0
-    assert list(elsewhere.iterdir()) == []  # ws wrote nothing through the link
-    code, out, _ = run(capsys, "skills", "list")
-    assert code == 0 and out.count("ws installs nothing there") == len(NAMES)
-    assert f"your skills folder is a link to {elsewhere.resolve()}: ws installs nothing there" in out
+    assert sorted(p.name for p in elsewhere.iterdir()) == sorted(NAMES)  # written through the link
     rows = json.loads(run(capsys, "skills", "list", "--json")[1])["data"]
-    assert {r["action"] for r in rows} == {"linked"}
+    assert {r["action"] for r in rows} == {"install"}
+    assert run(capsys, "uninstall", "--yes")[0] == 0
+    assert list(elsewhere.iterdir()) == [] and (box / ".claude" / "skills").is_symlink()
+
+
+def test_a_skill_entry_that_is_a_link_is_listed_and_left_alone(box, capsys):
+    real = box / "elsewhere" / "align"
+    real.mkdir(parents=True)
+    (real / "SKILL.md").write_text("linked align\n")
+    claude_skills(box).mkdir(parents=True)
+    (claude_skills(box) / "align").symlink_to(real)
+    assert install(capsys, box, "--runner", "claude-code")[0] == 0
+    assert (real / "SKILL.md").read_text() == "linked align\n" and (claude_skills(box) / "align").is_symlink()
+    rows = {r["name"]: r["action"] for r in json.loads(run(capsys, "skills", "list", "--json")[1])["data"]}
+    assert rows["align"] == "linked" and {v for k, v in rows.items() if k != "align"} == {"install"}
     code, out, _ = run(capsys, "skills", "add", "align")
-    assert code == 0 and "ws installs nothing there" in out
+    assert code == 0 and "ws left it" in out and (real / "SKILL.md").read_text() == "linked align\n"
+
+
+def test_a_failed_adopt_puts_yours_back_even_after_ws_wrote_part_of_its_own(box, capsys, monkeypatch):
+    mine = make_mine(box)
+    before = snapshot(box)
+    real_apply = skills.install.apply
+
+    def half_then_fail(steps, *a, **kw):
+        real_apply(list(steps)[:1], *a, **kw)  # the folder is made, then the file step "fails"
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(skills.install, "apply", half_then_fail)
     code, _, err = run(capsys, "skills", "adopt", "align", "--runner", "claude-code")
-    assert code == 1 and "ws installs nothing there" in err and list(elsewhere.iterdir()) == []
+    assert code == 1 and "No space left" in err
+    assert (mine / "SKILL.md").read_text() == "my own align\n" and (mine / "notes.txt").is_file()
+    assert snapshot(box / ".claude") == {k[len(".claude/") :]: v for k, v in before.items() if k.startswith(".claude/")}
+    assert not (backups(box) / ADOPTED).exists()
+    assert json.loads(skills.install.manifest_path().read_text())["entries"] == []  # ws's half-copy is not recorded
+
+
+def test_a_failed_adopt_that_cannot_put_yours_back_names_where_it_is_kept(box, capsys, monkeypatch):
+    make_mine(box)
+    real_apply, real_rename = skills.install.apply, os.rename
+
+    def fail(steps, *a, **kw):
+        real_apply(list(steps), *a, **kw)
+        raise OSError(errno.EIO, "disk error")
+
+    def no_rename_back(src, dst):
+        if "backups" in str(src):
+            raise OSError(errno.EIO, "disk error")
+        real_rename(src, dst)
+
+    monkeypatch.setattr(skills.install, "apply", fail)
+    monkeypatch.setattr(os, "rename", no_rename_back)
+    code, _, err = run(capsys, "skills", "adopt", "align", "--runner", "claude-code")
+    (kept,) = (backups(box) / "claude-code").iterdir()
+    assert code == 1 and str(kept) in err and "could not put your skill back" in err
+    assert (kept / "SKILL.md").read_text() == "my own align\n"
+
+
+def test_restore_refuses_when_the_install_record_has_no_entry_for_ws_s_copy(box, capsys):
+    make_mine(box)
+    assert run(capsys, "skills", "adopt", "align", "--runner", "claude-code")[0] == 0
+    manifest = skills.install.manifest_path()
+    doc = json.loads(manifest.read_text())
+    doc["entries"] = [e for e in doc["entries"] if not e["path"].endswith("align/SKILL.md")]
+    manifest.write_text(json.dumps(doc))
+    code, _, err = run(capsys, "skills", "restore", "align", "--runner", "claude-code")
+    assert code == 1 and "no entry for" in err and "AttributeError" not in err
+    assert (claude_skills(box) / "align" / "SKILL.md").read_text() == skills.SKILLS["align"]
+    assert (backups(box) / "claude-code").is_dir()
+
+
+def test_a_second_adopt_is_refused_while_the_first_copy_is_unrestored(box, capsys):
+    make_mine(box)
+    assert run(capsys, "skills", "adopt", "align", "--runner", "claude-code")[0] == 0
+    (first,) = (backups(box) / "claude-code").iterdir()
+    ws_copy = claude_skills(box) / "align"
+    (ws_copy / "SKILL.md").unlink()
+    ws_copy.rmdir()
+    skills.install.forget([ws_copy / "SKILL.md", ws_copy], os.environ)
+    make_mine(box, text="my newer align\n")
+    code, _, err = run(capsys, "skills", "adopt", "align", "--runner", "claude-code")
+    assert code == 1 and str(first) in err and "restore align" in err
+    assert (claude_skills(box) / "align" / "SKILL.md").read_text() == "my newer align\n"
+    assert [p.name for p in (backups(box) / "claude-code").iterdir()] == [first.name]
+    assert (first / "SKILL.md").read_text() == "my own align\n"
+
+
+def test_a_corrupt_adoption_record_stops_ws_skills_but_not_ws_install(box, capsys):
+    (box / ".claude").mkdir()
+    backups(box).mkdir(parents=True)
+    (backups(box) / ADOPTED).write_text("{not json")
+    code, out, err = install(capsys, box, "--runner", "claude-code")
+    assert code == 0 and "warning" in (out + err) and "adopted.json" in (out + err)
+    assert sorted(p.name for p in claude_skills(box).iterdir()) == sorted(NAMES)
+    for argv in (("list",), ("adopt", "align"), ("restore", "align")):
+        code, _, err = run(capsys, "skills", *argv)
+        assert code == 1 and "adoption record" in err, argv
 
 
 def test_restore_refuses_when_ws_s_copy_has_your_edits(box, capsys):

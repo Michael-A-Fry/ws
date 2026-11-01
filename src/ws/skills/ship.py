@@ -34,7 +34,8 @@ and run the affected checks again.
 ## 4. Update the record
 
 - Tick the finished rows in the register (`TODO.md` or the repo's equivalent) and add rows for work you found.
-- Rewrite the state file (`.claude-state/STATE.md` if the repo uses one): goal, done, in flight, next.
+- Rewrite the state file (`STATE.md` in the folder the repo ignores for it, if the repo uses one): goal, done, in
+  flight, next.
 - Add a changelog line when the repo keeps a changelog.
 
 ## 5. Commit in the repo's style

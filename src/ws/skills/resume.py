@@ -14,7 +14,8 @@ Goal: get back to work in a few minutes, from what the repo itself recorded, wit
 
 Stop at the first source that answers "what was in flight, and what is next":
 
-1. The state file: `.claude-state/STATE.md` at the repo root (or the state file the repo's own instructions name).
+1. The state file: `STATE.md` in the folder the repo ignores for it, at the main worktree root (or the state file the
+   repo's own instructions name).
 2. The repo's register: `TODO.md`, or the nearest equivalent (a backlog, a roadmap, an issues list the repo points to).
 3. The git record: `git status`, `git branch --show-current`, `git worktree list`, and `git log --oneline -15`. Read the
    messages that start with `wip:`, since they mark work saved mid-way.

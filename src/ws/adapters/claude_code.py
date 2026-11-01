@@ -41,6 +41,16 @@ sandbox off or open it up, because an interactive session cannot be started with
 The sandbox covers shell commands; Claude's own Read, Edit and Write tools are covered by the permission rules above and
 the hook, not by it. `env` carries WS_GATED_SESSION so `ws approve` knows it is being run from a gated session.
 
+Guards (ws.guards) add hooks, only for the events and tools the guards that are on need: PreToolUse matches more tools
+(Agent, Task, Skill, SendMessage) when a guard reads them; PostToolUse, SubagentStop and the prompt event run
+`ws gate event`; SessionStart and Stop run it beside what they already run. Notification and Stop also run
+`ws notify alert`. These are advice, not a gate: only the PreToolUse hook (`ws gate check`) blocks a call, and it ends
+`|| exit 2`; the others carry no `|| exit`, because `ws gate event` exits 2 on purpose after a tool call (Claude Code
+shows that stderr to the model) and any other failure of a hook is non-blocking.
+
+`env` also carries WS_SANDBOXED, which tells the hook this session has the sandbox block above; `preflight` applies only
+when it is set, because without that block there is nothing for a project's settings to widen.
+
 Pass the file with `claude --settings OUT/settings.json`. Nothing here touches ~/.claude.
 """
 
@@ -53,9 +63,9 @@ import re
 import shlex
 from pathlib import Path
 
-from ws import jobs
-from ws.adapters import Call, check_argv, protected_paths
-from ws.approvals import ENV_MARKER, ApprovalError
+from ws import guards, jobs
+from ws.adapters import Call, check_argv, event_argv, protected_paths
+from ws.approvals import ENV_MARKER, SANDBOX_MARKER, ApprovalError
 from ws.approvals import _read_regular as read_regular
 from ws.policy import Policy, native_patterns, sandbox_read_paths, sandbox_write_paths
 
@@ -64,6 +74,28 @@ FILE = "settings.json"
 MATCHER = "Bash|Read|Grep|Glob|WebFetch|WebSearch|Edit|Write|MultiEdit|NotebookEdit"
 _TOOLS = {"web_fetch": "WebFetch", "web_search": "WebSearch"}
 _NEUTRAL = {v: k for k, v in _TOOLS.items()}
+# Claude Code's hook event names, as ws.guards names them.
+EVENT_NAMES = {
+    "PreToolUse": "pre",
+    "PostToolUse": "post",
+    "SessionStart": "start",
+    "UserPromptSubmit": "prompt",
+    "Stop": "stop",
+    "SubagentStop": "subagent-stop",
+}
+# The tools a Call kind comes from, in the order a matcher lists them.
+_KIND_TOOLS = {
+    "command": ("Bash",),
+    "read": ("Read",),
+    "search": ("Grep", "Glob"),
+    "tool": ("WebFetch", "WebSearch"),
+    "write": ("Edit", "Write", "MultiEdit", "NotebookEdit"),
+    "agent": ("Agent", "Task"),
+    "skill": ("Skill",),
+    "message": ("SendMessage",),
+}
+_EXTRA_PRE_KINDS = ("agent", "skill", "message")  # the PreToolUse matcher covers the other kinds already
+HOOK_TIMEOUT = 20  # seconds: the syntax checkers get 10
 
 # Where this runner keeps what ws installs globally, and where a repo may shadow it (read by ws.globals).
 # kinds: sub-folder -> how a name is taken: "dir" the folder name, "name" the file name, "stem" the name without extension.
@@ -87,15 +119,40 @@ def session_hooks(ws_cmd: list[str]) -> dict:
     return {"SessionStart": hook("start"), "UserPromptSubmit": hook("nudge")}
 
 
+def _matcher(kinds: set[str], base: tuple[str, ...] = ()) -> str:
+    tools = [*base]
+    for kind, names in _KIND_TOOLS.items():
+        if kind in kinds:
+            tools += [t for t in names if t not in tools]
+    return "|".join(tools)
+
+
+def guard_hooks(policy: Policy, ws_cmd: list[str], policy_file: Path) -> dict:
+    """The hooks beyond the PreToolUse check: Notification and Stop always run `ws notify alert` (`|| true`: it is
+    advice, and an exit 2 from Stop would keep the session going); `ws gate event` is added for each event a guard
+    that is on runs at. Returns {event name: [matcher groups]} to merge with the session hooks."""
+    on = policy.guards.on
+    event = {"type": "command", "command": shlex.join(event_argv(ws_cmd, NAME, policy_file)), "timeout": HOOK_TIMEOUT}
+    alert = {"type": "command", "command": f"{shlex.join(ws_cmd)} notify alert --runner {NAME} || true", "timeout": 5}
+    hooks: dict[str, list[dict]] = {"Notification": [{"hooks": [alert]}], "Stop": [{"hooks": [alert]}]}
+    post = guards.kinds_for(on, "post")
+    if post:
+        hooks["PostToolUse"] = [{"matcher": _matcher(post), "hooks": [event]}]
+    for name, ev in (("Stop", "stop"), ("SubagentStop", "subagent-stop")):
+        if guards.wanted(on, ev):
+            hooks.setdefault(name, [{"hooks": []}])[0]["hooks"].append(event)
+    return hooks
+
+
 def _path(path: str) -> str:
     """Claude's path syntax: `~/x` is home, `//x` is an absolute path, anything else is cwd-relative gitignore."""
     return f"/{path}" if path.startswith("/") else path
 
 
-def sandbox_block(policy: Policy, out: Path, policy_file: Path) -> dict:
+def sandbox_block(policy: Policy, out: Path, policy_file: Path, protect: tuple[str, ...] = ()) -> dict:
     """The `sandbox` settings: see the module docstring for what each key is for."""
     home = str(Path(policy_file).parent)
-    fs: dict = {"denyWrite": list(dict.fromkeys([home, *protected_paths(out, policy_file)]))}
+    fs: dict = {"denyWrite": list(dict.fromkeys([home, *protected_paths(out, policy_file, protect)]))}
     if policy.gate.deny_read:
         fs["denyRead"] = sandbox_read_paths(policy)
     if policy.gate.allow_write:  # Claude Code already allows its project folder and tmp; these are the person's extras
@@ -118,7 +175,10 @@ def preflight(payload: dict) -> str | None:
     folder is CLAUDE_PROJECT_DIR (set for hooks; Claude reads project settings from there, wherever the session has since
     changed to), else the payload's cwd. A file that does not parse is ignored, as Claude Code ignores it. A settings
     file that is not a plain file (a link, a FIFO), is too big or cannot be read is a deny: it is read without following a
-    link and without blocking, because a hook that hangs fails open (only exit 2 blocks)."""
+    link and without blocking, because a hook that hangs fails open (only exit 2 blocks). It applies only to a session
+    that has ws's sandbox block (WS_SANDBOXED=1 in the settings `env`): without it there is nothing to widen."""
+    if os.environ.get(SANDBOX_MARKER) != "1":
+        return None
     project = os.environ.get("CLAUDE_PROJECT_DIR") or payload.get("cwd")
     if not isinstance(project, str) or not project.startswith("/"):
         return None
@@ -176,10 +236,13 @@ def for_project(settings: str, project: str) -> str:
     return json.dumps(conf, indent=2) + "\n"
 
 
-def generate(policy: Policy, ws_cmd: list[str], out: Path, policy_file: Path) -> dict[str, str]:
+def generate(
+    policy: Policy, ws_cmd: list[str], out: Path, policy_file: Path, *, protect: tuple[str, ...] = ()
+) -> dict[str, str]:
+    protect = tuple(protect)
     deny = [f"Bash({p})" for p in native_patterns(policy)]
     deny += [f"Read({_path(p)})" for p in policy.gate.deny_read]
-    for p in protected_paths(out, policy_file):  # a file or a folder: cover both; Edit rules cover Write too
+    for p in protected_paths(out, policy_file, protect):  # a file or a folder: cover both; Edit rules cover Write too
         deny += [f"Edit({_path(p)})", f"Edit({_path(p)}/**)"]
     from ws import sandbox
 
@@ -189,14 +252,21 @@ def generate(policy: Policy, ws_cmd: list[str], out: Path, policy_file: Path) ->
             f"Edit(**/{rel}/**)",
         ]  # at any depth: a runner started in a sub-folder reads that one
     deny += [_TOOLS[t] for t in policy.gate.deny_tools]
-    hook = shlex.join(check_argv(ws_cmd, NAME, policy_file, out)) + " || exit 2"
+    hook = shlex.join(check_argv(ws_cmd, NAME, policy_file, out, protect)) + " || exit 2"
+    matcher = _matcher(guards.kinds_for(policy.guards.on, "pre") & set(_EXTRA_PRE_KINDS), tuple(MATCHER.split("|")))
     settings = {
         "permissions": {"deny": list(dict.fromkeys(deny))},
-        "sandbox": sandbox_block(policy, out, policy_file),
-        "env": {ENV_MARKER: "1"},
-        "hooks": {"PreToolUse": [{"matcher": MATCHER, "hooks": [{"type": "command", "command": hook}]}]},
+        "sandbox": sandbox_block(policy, out, policy_file, protect),
+        "env": {ENV_MARKER: "1", SANDBOX_MARKER: "1"},
+        "hooks": {"PreToolUse": [{"matcher": matcher, "hooks": [{"type": "command", "command": hook}]}]},
     }
     settings["hooks"].update(session_hooks(ws_cmd))
+    event = {"type": "command", "command": shlex.join(event_argv(ws_cmd, NAME, policy_file)), "timeout": HOOK_TIMEOUT}
+    for name, ev in (("SessionStart", "start"), ("UserPromptSubmit", "prompt")):
+        if guards.wanted(policy.guards.on, ev):
+            settings["hooks"][name][0]["hooks"].append(event)
+    for name, groups in guard_hooks(policy, ws_cmd, policy_file).items():
+        settings["hooks"][name] = groups
     return {FILE: json.dumps(settings, indent=2) + "\n"}
 
 
@@ -211,9 +281,18 @@ def parse(payload: dict) -> Call | list[Call] | None:
     if name == "Read":
         return Call("read", _text(inp, "file_path"))
     if name in ("Edit", "Write", "MultiEdit"):
-        return Call("write", _text(inp, "file_path"))
+        return Call.of("write", _text(inp, "file_path"), tool=name, **_write_data(name, inp))
     if name == "NotebookEdit":
-        return Call("write", _text(inp, "notebook_path"))
+        return Call.of("write", _text(inp, "notebook_path"), tool=name, **_write_data(name, inp))
+    if name in ("Agent", "Task"):
+        found = {k: inp[k] for k in ("prompt", "description", "subagent_type") if isinstance(inp.get(k), str)}
+        return Call.of("agent", found.get("subagent_type", ""), tool=name, **found)
+    if name == "Skill":
+        skill = inp.get("skill") if isinstance(inp.get("skill"), str) else _optional(inp, "name") or ""
+        return Call.of("skill", skill, tool=name, name=skill, args=_optional(inp, "args") or "")
+    if name == "SendMessage":
+        text = next((inp[k] for k in ("message", "text", "content") if isinstance(inp.get(k), str)), "")
+        return Call.of("message", _optional(inp, "to") or "", tool=name, text=text)
     if name in ("Grep", "Glob"):
         calls = [Call("search", _optional(inp, "path") or ".")]
         pattern = inp.get("pattern")
@@ -223,6 +302,21 @@ def parse(payload: dict) -> Call | list[Call] | None:
     if name in _NEUTRAL:
         return Call("tool", _NEUTRAL[name])
     return None
+
+
+def _write_data(tool: str, inp: dict) -> dict:
+    """What a write tool gives besides the path: `old` and `new` (Edit), `content` (Write), `edits` (MultiEdit, as a
+    tuple of {old, new}), `new` (NotebookEdit). Only text the tool really sent."""
+    found: dict = {}
+    for key, name in (("old_string", "old"), ("new_string", "new"), ("content", "content"), ("new_source", "new")):
+        if isinstance(inp.get(key), str):
+            found[name] = inp[key]
+    edits = inp.get("edits")
+    if tool == "MultiEdit" and isinstance(edits, list):
+        found["edits"] = tuple(
+            {"old": e.get("old_string"), "new": e.get("new_string")} for e in edits if isinstance(e, dict)
+        )
+    return found
 
 
 def _text(d: dict, key: str) -> str:

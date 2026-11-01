@@ -87,7 +87,7 @@ import posixpath
 import re
 import tomllib
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from ws.profile import ws_home
@@ -135,6 +135,15 @@ class Gate:
 
 
 @dataclass(frozen=True)
+class Guards:
+    """The guards that run (ws.guards): `on` is their names in order; `config` maps each to what its `config()` made of
+    its `[guards.NAME]` table. A policy with no `[guards]` has none on."""
+
+    on: tuple[str, ...] = ()
+    config: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class RuleException:
     name: str
     job: str
@@ -150,6 +159,7 @@ class Policy:
     sources: dict[str, Source]
     gate: Gate
     exceptions: tuple[RuleException, ...]
+    guards: Guards = Guards()
 
 
 @dataclass(frozen=True)
@@ -250,6 +260,19 @@ allow_hosts = []
 # ["~/.npm", "~/.cache/uv"].
 allow_write = []
 
+# Guards: small named checks that run beside the rules above. `ws gate generate` writes the runner hooks they need.
+#   syntax-check     after an edit, checks the file by its extension (.py, .json, .toml, .sh) and tells the model the
+#                    line that does not parse
+#   session-context  at session start, lists which of the files below exist in the project
+#   bulk-staging     stops `git add -A`, `git add .` and `git commit -a`, so a commit holds only named files
+#   record-calls     appends each tool call to $WS_HOME/logs/gate-calls.jsonl, for `ws gate replay`
+[guards]
+on = ["syntax-check", "session-context"]
+# [guards.syntax-check]
+# extra = {{ yaml = ["yamllint", "-d", "relaxed"] }}   # an extension and the checker that gets the file path appended
+# [guards.session-context]
+# files = [".claude-state/STATE.md"]
+
 # Rule of Two, leg C (a way out): besides a source's outward acts and the web tools above, the SHELL counts as a way
 # out while any of curl, wget, nc, ssh, scp, python -c ... is not in deny_commands. To close it, deny the lot
 # (for example "curl*", "wget*", "nc *", "ssh *", "scp *", "python* -c*"); there is no half measure.
@@ -330,7 +353,7 @@ def loads(text: str) -> Policy:
         raw = tomllib.loads(text)
     except tomllib.TOMLDecodeError as e:
         raise PolicyError(f"not valid TOML: {e}") from e
-    raw = _table(raw, "policy", {"schema", "dial", "interrupts", "sources", "gate", "exceptions"})
+    raw = _table(raw, "policy", {"schema", "dial", "interrupts", "sources", "gate", "exceptions", "guards"})
     schema = raw.get("schema", SCHEMA)
     if schema != SCHEMA or isinstance(schema, bool):
         raise PolicyError(f"schema must be {SCHEMA}, not {schema!r}")
@@ -414,7 +437,23 @@ def loads(text: str) -> Policy:
         if any(x.name == e["name"] for x in exceptions):
             raise PolicyError(f"{where}name {e['name']!r} is used twice")
         exceptions.append(RuleException(e["name"], e["job"], covered, e["reason"]))
-    return Policy(schema, dial, interrupts, sources, gate, tuple(exceptions))
+    return Policy(schema, dial, interrupts, sources, gate, tuple(exceptions), _guards(raw.get("guards", {})))
+
+
+def _guards(raw) -> Guards:
+    """`[guards]`: `on` names the guards that run; `[guards.NAME]` is that guard's own table, checked by the guard."""
+    from ws import guards  # here, not at the top: the guards import this module
+
+    known = guards.names()
+    t = _table(raw, "[guards]", {"on", *known})
+    on = _strings(t, "on", "[guards] ")
+    for name in on:
+        if name not in known:
+            raise PolicyError(f"[guards] on: unknown guard {name!r} (known: {', '.join(known)})")
+    if len(set(on)) != len(on):
+        raise PolicyError("[guards] on: a guard is named twice")
+    config = {name: guards.get(name).config(t.get(name, {}), f"[guards.{name}]") for name in known}
+    return Guards(on, {name: config[name] for name in on})
 
 
 def default_policy() -> Policy:
@@ -1297,6 +1336,55 @@ def _canon_pattern(pattern: str) -> str:
     return " ".join(toks)
 
 
+_HEREDOC = re.compile(r"(?<!<)<<(-?)\s*(?:'([^']*)'|\"([^\"]*)\"|\\?([A-Za-z_][A-Za-z0-9_]*))")
+
+
+def _strip_heredocs(cmd: str) -> str:
+    """The command with the body and closing line of every here-document taken out: that text is data for a program,
+    not commands. The line that opens it stays."""
+    out: list[str] = []
+    waiting: list[tuple[str, bool]] = []  # (closing word, may be indented) of the here-documents still open
+    for line in cmd.split("\n"):
+        if waiting:
+            word, indented = waiting[0]
+            if (line.strip(" \t") if indented else line) == word:
+                waiting.pop(0)
+            continue
+        out.append(line)
+        for m in _HEREDOC.finditer(line):
+            waiting.append((m.group(2) or m.group(3) or m.group(4) or "", m.group(1) == "-"))
+    return "\n".join(out)
+
+
+def simple_commands(command: str, _depth: int = 0) -> list[list[str]]:
+    """Every simple command in a command line, as its words: quotes resolved, `sudo`/`env`/`timeout` wrappers and git's
+    global options (`-C dir`, `-c k=v`) dropped. It reads the line as the matcher does (segments split on `;`, `&&`,
+    pipes and newlines, and the text of `$(...)`, backticks and `bash -c` read too), and leaves out what is not a
+    command: quoted text and here-document bodies. For a check that wants one command's words, such as a guard."""
+    if not isinstance(command, str):
+        raise TypeError("command must be text")
+    if _depth > _MAX_DEPTH:
+        raise ValueError("command nests too deeply to check")
+    pipelines, inner = _scan(_prep(_strip_heredocs(command)))
+    found: list[list[str]] = []
+    nested = list(inner)
+    for segs in pipelines:
+        for seg in segs:
+            toks, _ = _strip_wrappers(_lex(seg)[0])
+            if toks and toks[0] == "git":
+                toks = _git_normal(toks)
+            if not toks:
+                continue
+            found.append(toks)
+            if toks[0] in _SHELL_NAMES:
+                flags, operands = _args(toks)
+                if _cluster(flags, "c") and operands:
+                    nested.append(operands[0])
+    for text in nested:
+        found += simple_commands(text, _depth + 1)
+    return found
+
+
 def is_denied_command(
     policy: Policy, command: str, *, protect: tuple[str, ...] = (), cwd: str | None = None
 ) -> str | None:
@@ -1392,12 +1480,15 @@ _HOOK_ONLY = ("|", ";", "&", "\n", "`", "$(", "\\*")
 
 
 def native_patterns(policy: Policy) -> list[str]:
-    """The deny_commands a runner can enforce from its own rule list, each in every flag spelling (see variants).
-    The rest are enforced by the hook alone."""
+    """The deny_commands a runner can enforce from its own rule list, each in every flag spelling (see variants), and
+    the patterns the guards that are on contribute. The rest are enforced by the hook alone."""
+    from ws import guards
+
     out: list[str] = []
     for pat in policy.gate.deny_commands:
         if not any(c in pat for c in _HOOK_ONLY):
             out += variants(pat)
+    out += guards.native_deny(policy.guards.on)
     return list(dict.fromkeys(out))
 
 

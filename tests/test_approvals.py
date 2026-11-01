@@ -404,3 +404,16 @@ def test_the_gate_check_exits_4_with_the_claim_inside_the_wall(tmp_path, monkeyp
     assert cli.main(["gate", "check", "--runner", "claude-code"]) == gate.CLAIM
     assert json.loads(capsys.readouterr().out) == {"claim": bound.digest()}
     assert (tmp_path / "approvals" / "granted" / f"{bound.digest()}.json").exists()
+
+
+def test_a_refusal_can_say_what_stopped_the_call(root):
+    text = approvals.require(root, CALL, NOW, why_asked="bulk-staging: too wide")
+    assert text.startswith("bulk-staging: too wide: needs a person's approval: in a terminal")
+    assert ask(root).startswith("needs a person's approval")  # without it, the old text
+
+
+def test_a_command_that_needs_approval_with_no_folder_to_ask_through_is_an_ask():
+    p = policy.loads('[gate]\nask_commands = ["terraform apply*"]\n')
+    raw = json.dumps({"tool_name": "Bash", "tool_input": {"command": "terraform apply"}})
+    reason = gate.check("claude-code", raw, p)
+    assert isinstance(reason, gate.Ask) and "needs a person's approval" in reason

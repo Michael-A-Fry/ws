@@ -73,6 +73,18 @@ The default list, which `ws gate init` writes:
 - A shell that reads its script from standard input: `sh`, `sh -s*` and `sh -`, and the same three for `bash`, `zsh` and
   `dash`.
 
+## `[guards]`
+
+Named checks that run beside the `[gate]` rules. The [guards reference](guards.md) describes each one.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `on` | list of text | `[]` | The guards that run, in order. A name ws doesn't know stops the load. `ws gate init` writes `["syntax-check", "session-context"]`. |
+| `[guards.syntax-check]` `extra` | table of extension to command | `{}` | A checker for an extension, such as `{ yaml = ["yamllint", "-d", "relaxed"] }`. The file path is added as the last argument. |
+| `[guards.session-context]` `files` | list of text | `[".claude-state/STATE.md"]` | Project-relative files to list at session start. |
+
+A file with no `[guards]` table has no guards on. `bulk-staging` and `record-calls` take no table.
+
 ## `[[exceptions]]`
 
 A named Rule of Two exception. Each entry needs all four keys.
@@ -121,6 +133,12 @@ deny_tools = ["web_fetch", "web_search"]
 ask_commands = ["git push*"]
 allow_hosts = ["api.anthropic.com", "github.com"]
 allow_write = ["~/.cache/uv"]
+
+[guards]
+on = ["syntax-check", "session-context", "bulk-staging"]
+
+[guards.syntax-check]
+extra = { yaml = ["yamllint", "-d", "relaxed"] }
 
 [[exceptions]]
 name = "morning-digest"

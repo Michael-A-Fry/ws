@@ -35,6 +35,20 @@ all a deny. A policy file is used whole or refused: an unknown key stops the loa
 The gate also protects ws's own files. A session can't write the policy, the profile, the secrets registry, the job
 files, the logs, the approvals folder or the folder `ws gate generate` wrote, so it can't loosen its own rules.
 
+## Guards
+
+A guard is a small named check that the policy switches on (`[guards] on = [...]`). The layers above answer "may this
+call run?" from the policy's lists. A guard looks at one thing in more detail: it can read what a file write contains,
+what a `git` command stages or which state files a project holds. Guards run at the points where a runner calls ws:
+before a tool call (through `ws gate check`, so a guard's deny stops the call), after a tool call, when a session
+starts, when a prompt is sent and when a session or subagent stops (through `ws gate event`).
+
+A guard's deny before a call is as firm as a `deny_commands` match, and it can be marked approvable: you override it once
+with `ws approve`, as for `ask_commands`. After a call the guard can only tell the model what it found, because the tool
+has already run. `ws gate generate` writes the runner hooks for the events and tools the guards that are on need, and no
+others. `ws gate replay` runs recorded calls against the current policy, so a change to a rule or a guard is tried
+before it's relied on. See the [guards reference](../reference/guards.md).
+
 What the policy holds:
 
 - `deny_commands`: shell command patterns. `*` matches anything. The default list covers recursive deletes of system

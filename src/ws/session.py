@@ -79,10 +79,13 @@ def is_newer(current: str, recorded: str) -> bool:
 # --- records -------------------------------------------------------------------------------------------------------
 
 
+def safe_id(session_id: str) -> str:
+    """A session id as a file name: anything odd is hashed rather than trusted."""
+    return session_id if _SAFE_ID.match(session_id) else hashlib.sha256(session_id.encode()).hexdigest()[:32]
+
+
 def _record_path(env: dict, session_id: str) -> Path:
-    # a session id becomes a file name: anything odd is hashed rather than trusted
-    sid = session_id if _SAFE_ID.match(session_id) else hashlib.sha256(session_id.encode()).hexdigest()[:32]
-    return ws_home(env) / "sessions" / f"{sid}.json"
+    return ws_home(env) / "sessions" / f"{safe_id(session_id)}.json"
 
 
 def _write(path: Path, record: dict) -> None:
@@ -101,7 +104,8 @@ def _write(path: Path, record: dict) -> None:
 
 
 def _prune(folder: Path) -> None:
-    """Drop records not touched for 30 days (a session that old is long gone)."""
+    """Drop records not touched for 30 days (a session that old is long gone). A guard's own record for a session
+    (`<id>.<name>.json`, see ws.guards) goes with it."""
     cutoff = time.time() - _KEEP_DAYS * 86400
     for f in folder.glob("*.json"):
         try:

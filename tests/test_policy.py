@@ -1411,3 +1411,34 @@ def test_eval_of_fetched_text_and_shell_options_with_arguments():
     for opt in ("-o pipefail", "-O extglob", "-eo pipefail", "-o errexit -x"):
         assert policy.is_denied_command(p, f"echo x | bash {opt}"), opt
     assert policy.is_denied_command(p, "echo x | bash -o pipefail script.sh") is None
+
+
+# --- guards, and the command lexer a guard reuses -------------------------------------------------------------------
+
+
+def test_the_default_policy_turns_two_guards_on_and_a_policy_with_no_table_turns_none_on():
+    assert policy.default_policy().guards.on == ("syntax-check", "session-context")
+    assert policy.loads("schema = 1\n").guards == policy.Guards()
+
+
+@pytest.mark.parametrize(
+    "cmd, expected",
+    [
+        ("git -C x add -A", [["git", "add", "-A"]]),
+        ("sudo env A=1 git commit -m 'a b'", [["git", "commit", "-m", "a b"]]),
+        ("ls | grep x && echo $(git status)", [["ls"], ["grep", "x"], ["echo", "$(git status)"], ["git", "status"]]),
+        ("bash -c 'git add .'", [["bash", "-c", "git add ."], ["git", "add", "."]]),
+        ("cat <<EOF\ngit add -A\nEOF\nls", [["cat"], ["ls"]]),
+        ("cat <<-'EOF'\n\tx\n\tEOF", [["cat"]]),
+        ("echo a <<< b", [["echo", "a"]]),
+    ],
+)
+def test_simple_commands_gives_each_command_with_quotes_and_heredocs_resolved(cmd, expected):
+    assert policy.simple_commands(cmd) == expected
+
+
+def test_simple_commands_refuses_what_it_cannot_judge():
+    with pytest.raises(TypeError):
+        policy.simple_commands(5)  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        policy.simple_commands("echo $(" * 8 + "ls" + ")" * 8)

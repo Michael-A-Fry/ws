@@ -25,7 +25,7 @@ import math
 import shlex
 from pathlib import Path
 
-from ws import jobs
+from ws import guards, jobs
 from ws.adapters import Call, check_argv, protected_paths
 from ws.adapters.opencode_plugin import SOURCE
 from ws.policy import Policy, native_patterns
@@ -37,6 +37,8 @@ _TOOLS = {"web_fetch": "webfetch", "web_search": "websearch"}
 # For ws.sandbox: the env var that names the generated folder. The whole folder is read-only in the wall (OpenCode loads
 # plugin/, tool/, agent/, command/ and opencode.jsonc from it, so a planted file there would outlive the session).
 CONFIG_DIR_ENV = "OPENCODE_CONFIG_DIR"
+# The guards (ws.guards) the generated shim does not run yet: all of them. `ws doctor` names them when a policy has one on.
+UNSUPPORTED_GUARDS = guards.names()
 
 
 # OpenCode writes this file into its config folder at start and will not run if it cannot (1.19.4). Written here at
@@ -111,7 +113,10 @@ def _protect_forms(path: str, is_out: bool) -> list[str]:
     return [path, f"{path}/**", f"**/{tail}", f"**/{tail}/**"]
 
 
-def generate(policy: Policy, ws_cmd: list[str], out: Path, policy_file: Path) -> dict[str, str]:
+def generate(
+    policy: Policy, ws_cmd: list[str], out: Path, policy_file: Path, *, protect: tuple[str, ...] = ()
+) -> dict[str, str]:
+    protect = tuple(protect)
     # Last matching rule wins, so the catch-all comes first.
     bash: dict[str, str] = {"*": "allow"}
     bash.update(dict.fromkeys(native_patterns(policy), "deny"))
@@ -120,13 +125,13 @@ def generate(policy: Policy, ws_cmd: list[str], out: Path, policy_file: Path) ->
         rules = {"*": "allow", **dict.fromkeys((f for r in policy.gate.deny_read for f in _read_forms(r)), "deny")}
         permission.update(read=rules, grep=dict(rules), glob=dict(rules), list=dict(rules))
     edit = {"*": "allow"}  # covers write and patch too; a path may be a file or a folder: cover both
-    for p in protected_paths(out, policy_file):
+    for p in protected_paths(out, policy_file, protect):
         edit.update(dict.fromkeys(_protect_forms(p, p == str(out)), "deny"))
     permission["edit"] = edit
     for t in policy.gate.deny_tools:
         permission[_TOOLS[t]] = "deny"
     config = {"$schema": "https://opencode.ai/config.json", "permission": permission}
-    plugin = SOURCE.replace("/*__CHECK__*/ []", json.dumps(check_argv(ws_cmd, NAME, policy_file, out)))
+    plugin = SOURCE.replace("/*__CHECK__*/ []", json.dumps(check_argv(ws_cmd, NAME, policy_file, out, protect)))
     plugin = plugin.replace("/*__WS__*/ []", json.dumps(ws_cmd))
     return {CONFIG: json.dumps(config, indent=2) + "\n", PLUGIN: plugin, IGNORE: IGNORE_TEXT}
 

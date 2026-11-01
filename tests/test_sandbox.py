@@ -708,7 +708,7 @@ def test_claude_code_settings_turn_the_sandbox_on_and_fail_closed(tmp_path):
     assert all(str(tmp_path / "wshome" / n) in deny for n in policy.CONTROL_NAMES)
     assert sb["filesystem"]["denyRead"] == ["~/.ssh", "~/.aws/credentials"]
     assert "network" not in sb  # the policy names no hosts: it says nothing about the network
-    assert s["env"] == {"WS_GATED_SESSION": "1"}
+    assert s["env"] == {"WS_GATED_SESSION": "1", "WS_SANDBOXED": "1"}
 
 
 def test_claude_code_network_follows_allow_hosts(tmp_path):
@@ -754,6 +754,7 @@ def project(tmp_path, name: str, conf) -> Path:
 @pytest.mark.parametrize("name", ["settings.json", "settings.local.json"])
 def test_the_hook_denies_a_folder_whose_project_settings_open_the_sandbox(tmp_path, monkeypatch, conf, name):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("WS_SANDBOXED", "1")  # the hook checks projects only for a session with the sandbox block
     d = project(tmp_path, name, conf)
     (d / "sub").mkdir()
     for cwd in (d, d / "sub"):  # from a folder below the project too
@@ -763,6 +764,7 @@ def test_the_hook_denies_a_folder_whose_project_settings_open_the_sandbox(tmp_pa
 
 def test_harmless_project_settings_and_the_users_own_settings_are_fine(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("WS_SANDBOXED", "1")  # the hook checks projects only for a session with the sandbox block
     d = project(tmp_path, "settings.json", {"sandbox": {"network": {"allowedDomains": ["a.b"]}}, "model": "x"})
     assert claude_code.preflight({"cwd": str(d)}) is None
     assert claude_code.preflight({"cwd": str(tmp_path / "nowhere")}) is None
@@ -777,6 +779,7 @@ def test_harmless_project_settings_and_the_users_own_settings_are_fine(tmp_path,
 
 def test_a_settings_file_that_is_a_fifo_or_a_link_is_a_deny_and_does_not_hang(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("WS_SANDBOXED", "1")  # the hook checks projects only for a session with the sandbox block
     d = tmp_path / "proj"
     (d / ".claude").mkdir(parents=True)
     os.mkfifo(d / ".claude" / "settings.json")
@@ -794,6 +797,7 @@ def test_a_settings_file_that_is_a_fifo_or_a_link_is_a_deny_and_does_not_hang(tm
 
 def test_the_project_dir_the_hook_is_given_wins_over_the_cwd(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("WS_SANDBOXED", "1")  # the hook checks projects only for a session with the sandbox block
     bad = project(tmp_path, "settings.json", {"sandbox": {"excludedCommands": ["x"]}})
     other = tmp_path / "other"
     other.mkdir()
@@ -807,6 +811,7 @@ def test_the_gate_check_applies_the_preflight(tmp_path, monkeypatch):
     from ws import gate
 
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("WS_SANDBOXED", "1")  # the hook checks projects only for a session with the sandbox block
     d = project(tmp_path, "settings.json", {"sandbox": {"excludedCommands": ["x"]}})
     raw = json.dumps({"tool_name": "Read", "tool_input": {"file_path": "/etc/hostname"}, "cwd": str(d)})
     assert "excludedCommands" in gate.check("claude-code", raw, policy.loads(""))

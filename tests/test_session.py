@@ -266,3 +266,10 @@ def test_start_prunes_records_older_than_30_days(home, monkeypatch, capsys):
     call(monkeypatch, capsys, "start")
     assert not old.exists()
     assert fresh.exists()
+
+
+def test_safe_id_keeps_a_plain_id_and_hashes_anything_else():
+    assert session.safe_id("abc-1.2_x") == "abc-1.2_x"
+    hashed = session.safe_id("../evil")
+    assert hashed != "../evil" and len(hashed) == 32 and "/" not in hashed
+    assert session.safe_id("../evil") == hashed

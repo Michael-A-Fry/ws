@@ -33,6 +33,10 @@ before this setting existed stays on `launch`, so an upgrade doesn't touch that 
 `ws install --gate every-session`. [Known limits](../explanation/known-limits.md#the-gate-in-every-session) says what goes into the
 file and what stays outside the gate.
 
+Once ws's entries are in your runner's config, a later `ws install` or setup run keeps them there and says so, even when
+that run doesn't name a runner. The install manifest keeps every record, and every key from a newer ws, that a run
+didn't write itself. Only the `launch` gate setting or an uninstall takes the entries out.
+
 A session that was already running keeps the rules it loaded at start. When a newer release is installed, the session
 gets one line about it, once. Start a new session to use the new release.
 

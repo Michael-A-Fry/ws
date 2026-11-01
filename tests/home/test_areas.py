@@ -21,7 +21,9 @@ BAD = "<script>alert(1)</script>"
 TS = "2026-11-02T12:00:00.000Z"
 
 # What an area or the page may import: the records, the shared UI, the areas themselves and plain text helpers.
-ALLOWED = ("__future__", "html", "dataclasses", "types", "datetime", "ws.home.records", "ws.ui", "ws.home.areas")
+ALLOWED = (
+    "__future__", "html", "dataclasses", "types", "datetime", "ws.home.records", "ws.ui", "ws.home.areas", "ws.brand",
+)  # fmt: skip
 FORBIDDEN_NAMES = {"open", "os", "pathlib", "subprocess", "sources", "eval", "runrecord", "api", "openers", "server"}
 
 
@@ -58,7 +60,7 @@ def view(**kw) -> areas.View:
 
 def test_every_slot_has_a_module_and_a_contract():
     ids = [s.id for s in areas.SLOTS]
-    assert ids == ["lead", "needs_you", "sessions", "evals", "plugins", "terminal"]
+    assert ids == ["composer", "lead", "needs_you", "sessions", "evals", "plugins", "terminal", "quiet"]
     assert [s.order for s in areas.SLOTS] == sorted(s.order for s in areas.SLOTS)
     on_disk = {p.stem for p in (SRC / "areas").glob("*.py") if not p.stem.startswith("_") and p.stem != "__init__"}
     assert on_disk == set(ids)  # a module with no slot, or a slot with no module, is a mistake
@@ -76,10 +78,10 @@ def test_plugins_and_terminal_are_slots_that_are_not_built_and_draw_nothing():
     v = view(plugins=(Plugin("memory", on=True, built=True),), sessions=(session(),))
     for sid in unbuilt:
         assert areas.MODULES[sid].render(v) == ""
-    assert [s.id for s in areas.built()] == ["lead", "needs_you", "sessions", "evals"]
+    assert [s.id for s in areas.built()] == ["composer", "lead", "needs_you", "sessions", "evals", "quiet"]
 
 
-def test_the_page_draws_lead_then_needs_you_then_sessions_then_evaluation():
+def test_the_page_draws_the_box_then_pinned_then_needs_you_then_sessions_and_evals_on_their_own_page():
     s = snap(
         lead=session(lead=True, name="Boss"),
         asks=(Ask(id="a1", source="asks_jsonl", kind="question", title="Which one?"),),
@@ -87,10 +89,11 @@ def test_the_page_draws_lead_then_needs_you_then_sessions_then_evaluation():
         evals=(arm(),),
     )
     out = page.render(s)
-    marks = [out.index(m) for m in ("Boss", "Needs you", "second", "Evaluation")]
+    steps = ('id="composer"', 'data-grp="pin"', "Boss", 'data-grp="need"', "Which one?", 'data-grp="work"', "second")
+    marks = [out.index(m) for m in steps]
     assert marks == sorted(marks)
-    assert out.count("Boss") >= 1 and 'class="sep"' in out
-    assert out.index('class="sep"') < out.index("Needs you")
+    assert out.index('id="v-home"') < out.index('id="v-evals"') and "Evaluation" in out.split('id="v-evals"')[1]
+    assert out.index("Evaluation") > out.index("second")  # the arms are on the Evals page, below the list
 
 
 # --- reading only through the API --------------------------------------------------------------------------------------
@@ -150,59 +153,85 @@ def test_each_area_has_its_empty_state():
 
 def test_a_status_is_a_glyph_and_a_word_never_colour_alone():
     out = areas.MODULES["sessions"].render(
-        view(
-            sessions=tuple(
-                session(id=f"s{i}", state=st) for i, st in enumerate(("working", "waiting", "idle", "unknown"))
-            )
-        )
+        view(sessions=tuple(session(id=f"s{i}", state=st) for i, st in enumerate(("working", "idle", "unknown"))))
     )
-    for glyph, word in (("●", "working"), ("◆", "waiting"), ("○", "idle"), ("?", "unknown")):
+    for glyph, word in (("●", "working"), ("○", "idle")):
         assert re.search(
             rf'<span class="g" aria-hidden="true">{re.escape(glyph)}</span><span class="w">{word}</span>', out
         )
     ask = areas.MODULES["needs_you"].render(view(asks=(Ask(id="a", source="s", kind="permission", title="Run it?"),)))
-    assert '<span class="g" aria-hidden="true">◆</span><span class="w">Permission</span>' in ask
+    assert '<span class="g" aria-hidden="true">◆</span><span class="w">needs you</span>' in ask
+    done = areas.MODULES["sessions"].render(view(sessions=(session(id="d", state="ended"),)))
+    assert '<span class="g" aria-hidden="true">✓</span><span class="w">done</span>' in done
 
 
 def test_a_cost_or_token_count_that_is_not_known_says_so():
     out = areas.MODULES["sessions"].render(view(sessions=(session(tokens=None, cost_usd=None),)))
-    assert out.count("not measured") == 2
+    assert out.count("not measured") == 2  # in the row's body, which opens in place
     known = areas.MODULES["sessions"].render(
         view(sessions=(session(tokens={"input": 1000, "output": 2000}, cost_usd=12.5, cost_basis="otel"),))
     )
     assert "3k tokens" in known and "US$12.50" in known and "not measured" not in known
 
 
-def test_the_ended_sessions_fold_into_a_count_and_the_lead_is_not_listed_twice():
-    ended = tuple(session(id=f"e{i}", name=f"old{i}", state="ended") for i in range(20))
+def test_idle_is_folded_done_today_is_capped_and_the_lead_is_not_listed_twice():
+    done = tuple(session(id=f"e{i}", name=f"old{i}", state="ended", tmux="") for i in range(20))
+    stale = session(id="old", name="ancient", state="ended", last_seen="2026-10-01T00:00:00.000Z")
     lead = session(id="L", name="Boss", lead=True)
-    out = areas.MODULES["sessions"].render(view(lead=lead, sessions=(lead, session(id="live"), *ended)))
-    assert "20 ended" in out and "and 12 more" in out and "Boss" not in out and "1 live" in out
-    assert out.count('class="sess') == 1 + _fmt_shown()
+    idle = session(id="i", name="napper", state="idle")
+    out = areas.MODULES["sessions"].render(view(lead=lead, sessions=(lead, session(id="live"), idle, stale, *done)))
+    assert 'class="grp" data-grp="idle"' in out and out.count('<details class="grp"') == 1  # one fold: Idle
+    assert 'data-grp="done"' in out and '<em class="num">20</em>' in out and "and 12 more" in out
+    assert "Boss" not in out and "ancient" not in out
+    assert out.count('class="r done"') == _fmt_shown()
 
 
 def _fmt_shown() -> int:
-    return areas.sessions.ENDED_SHOWN
+    return areas.sessions.DONE_SHOWN
 
 
-def test_needs_you_names_the_source_and_session_and_puts_the_recommended_option_first():
+def test_needs_you_shows_the_recommended_option_first_and_says_where_it_is_answered():
     ask = Ask(
-        id="a1", source="asks_jsonl", kind="question", session_name="builder", title="Pick one",
+        id="a1", source="asks_jsonl", kind="question", session_name="builder", title="Pick one", decision="the plan",
         options=({"label": "Tidy", "description": "small"}, {"label": "Rewrite", "description": ""}),
         created="2026-11-02T10:00:00.000Z", answer_in="app",
     )  # fmt: skip
     out = areas.MODULES["needs_you"].render(view(asks=(ask,)))
-    assert "asks_jsonl" in out and "builder" in out and "2 h ago" in out and "Answer in the app" in out
-    assert out.index("Tidy") < out.index("Rewrite") and out.count("recommended") == 1
+    assert "asks_jsonl" in out and "builder" in out and ">2h<" in out and "Answer in the app" in out
+    assert out.index("Tidy") < out.index("Rewrite") and out.count("recommended") == 1 and "Decides: the plan" in out
+    assert "data-choice" not in out  # no server behind this one: it can't be answered here
+
+
+def test_a_question_the_page_can_answer_has_the_form_and_the_first_option_is_the_only_filled_one():
+    ask = Ask(id="a1", source="asks_jsonl", kind="question", title="Pick one", options=(
+        {"label": "Tidy", "description": "small"}, {"label": "Rewrite", "description": ""}, {"label": "Stop"}))  # fmt: skip
+    hub = areas.Hub(answerable=frozenset({"a1"}), answer_set=True)
+    out = areas.MODULES["needs_you"].render(areas.View(snap(asks=(ask,)), True, hub))
+    assert out.count('class="opt rec"') == 1 and out.index('class="opt rec"') < out.index('data-choice="Rewrite"')
+    assert (
+        "Something else…" in out
+        and 'data-act="not-now"' in out
+        and 'data-act="undo"' in out
+        and '<details class="r need"' in out
+    )
+    assert " open>" in out  # the first answerable ask opens
+
+
+def test_an_ask_the_page_is_not_set_up_to_answer_says_what_to_set():
+    ask = Ask(id="a1", source="asks_jsonl", kind="question", title="Pick one", options=({"label": "Tidy"},))
+    out = areas.MODULES["needs_you"].render(areas.View(snap(asks=(ask,)), True, areas.Hub()))
+    assert "Set [home.answer] command to answer here" in out and "data-choice" not in out
 
 
 def test_an_opaque_ask_and_session_say_to_open_the_session_and_show_nothing_hidden():
     ask = Ask(id="a1", source="asks_jsonl", kind="question", repo="vault", tmux="ws:2", opaque=True)
     sess = session(opaque=True, name="", cwd="", repo="vault", tokens=None, cost_usd=None, cost_basis="hidden")
-    out = page.render(snap(asks=(ask,), sessions=(sess,)))
-    assert out.count("Open the session to see this") == 2
-    assert "Hidden session" in out and "hidden" in out and "not measured" not in out.split("Evaluation")[0]
-    assert "/work/app" not in out and "builder" not in out
+    hub = areas.Hub(answerable=frozenset({"a1"}), answer_set=True)  # even if a page said so, an opaque ask has no form
+    out = page.render(snap(asks=(ask,), sessions=(sess,)), live=True, hub=hub)
+    assert out.count("Open the session to see this") >= 3  # the row's line and its body, for each
+    assert "Hidden session" in out and "terminal only" in out and "not measured" not in out.split("Evals")[0]
+    body = out.split("<script")[0]  # the page's own script mentions data-choice
+    assert "/work/app" not in body and "builder" not in body and "data-choice" not in body
 
 
 def test_an_arm_shows_each_figure_and_a_trend_and_the_noise_band():
@@ -348,3 +377,68 @@ def test_without_a_command_opener_the_phone_gets_a_disabled_button_that_says_why
 def test_a_record_with_nothing_to_open_it_with_draws_no_button():
     assert _cell([]) == ""
     assert "Open →" not in areas.MODULES["sessions"].render(view(sessions=(session(),)))
+
+
+# --- the shell: places, the box, the menus ------------------------------------------------------------------------------
+
+
+def test_every_place_in_the_sidebar_leads_somewhere_and_the_unbuilt_ones_say_what_is_coming():
+    out = page.render(snap(sessions=(session(),), evals=(arm(),)))
+    links = set(re.findall(r'href="#(v-[a-z]+)"', out))
+    ids = set(re.findall(r'<section class="pg" id="(v-[a-z]+)"', out))
+    assert links and links <= ids  # no link to a page that isn't there
+    for place in ("search", "scheduled", "history", "skills", "plugins", "connections"):
+        page_html = out.split(f'id="v-{place}"')[1].split("</section>")[0]
+        assert "Coming next" in page_html and 'href="#v-home"' in page_html
+    for label in ("New session", "Search", "Home", "Scheduled", "History", "Skills", "Plugins", "Connections", "Evals"):
+        assert f">{label}" in out or f"</svg>{label}" in out, label
+
+
+def test_the_view_menu_and_settings_hold_what_the_plan_names():
+    out = page.render(snap())
+    for text in ("Need", "Workspace", "Model", "Machine", "Comfortable", "Compact", "Pinned", "Done today",
+                 "Save as view", "System", "Light", "Dark", "Sans", "Mono", "Indigo", "Teal", "Violet"):  # fmt: skip
+        assert text in out, text
+    assert 'data-store="view" data-k="group"' in out and 'data-store="look" data-k="theme"' in out
+
+
+def test_the_list_carries_what_the_script_needs_to_regroup_it():
+    s = session(id="s1", repo="app", host="other", runner="claude-code")
+    out = areas.MODULES["sessions"].render(view(sessions=(s,)))
+    assert 'data-ws="app"' in out and 'data-machine="other"' in out and 'data-model="claude-code"' in out
+    assert 'data-need="work"' in out
+
+
+def test_a_row_says_what_it_is_doing_where_it_runs_and_how_old_it_is():
+    out = areas.MODULES["sessions"].render(view(sessions=(session(last_seen="2026-11-02T11:48:00.000Z"),)))
+    assert (
+        ">12m<" in out and "Working" in out and "this machine" in out and "ws:@1.%1" in out and "claude-code" not in out
+    )
+    other = areas.MODULES["sessions"].render(view(sessions=(session(host="laptop", runner="opencode"),)))
+    assert ">laptop<" in other and ">opencode<" in other
+
+
+def test_a_session_with_an_ask_shows_as_the_ask_and_waiting_with_no_ask_is_still_needs_you():
+    s = session(id="s1", state="waiting", waiting_for="a reply")
+    waiting = session(id="s2", state="waiting", tmux="", waiting_for="a reply", name="lonely")
+    ask = Ask(id="a1", source="asks_jsonl", kind="question", session_id="s1", title="Which?")
+    v = view(sessions=(s, waiting), asks=(ask,))
+    assert 'class="r work"' not in areas.MODULES["sessions"].render(v)
+    out = areas.MODULES["needs_you"].render(v)
+    assert out.count('class="r need"') == 2 and "Waiting for: a reply" in out and "lonely" in out
+
+
+def test_the_quiet_line_says_the_last_eval_verdict_in_words():
+    tie = view(evals=(arm(), arm(arm="sonnet", pass_rate=0.92)))
+    assert "sonnet and haiku are within noise" in areas.MODULES["quiet"].render(tie)
+    clear = view(evals=(arm(), arm(arm="sonnet", pass_rate=0.5, solved=5)))
+    assert "haiku leads sonnet by 40 points" in areas.MODULES["quiet"].render(clear)
+    assert "no eval trials yet" in areas.MODULES["quiet"].render(view())
+    ended = view(sessions=(session(id="e1", state="ended"), session(id="e2", state="ended", tmux="")))
+    assert "1 ended session window" in areas.MODULES["quiet"].render(ended)
+
+
+def test_the_machine_filter_is_there_only_when_more_than_one_machine_is_seen():
+    one = page.render(snap(sessions=(session(),)), hub=areas.Hub(machines=("testhost",)))
+    two = page.render(snap(sessions=(session(),)), hub=areas.Hub(machines=("testhost", "laptop")))
+    assert 'id="machine"' not in one and 'id="machine"' in two and ">laptop<" in two

@@ -401,3 +401,13 @@ def test_the_sparkline_takes_a_fixed_scale_and_whole_pixel_sizes():
     ys = [float(p.split(",")[1]) for p in re.search(r'points="([^"]+)"', flat_top).group(1).split()]
     assert max(ys) - min(ys) < 2
     assert 'width="160" height="32"' in components.sparkline([1, 2], width=160.0, height=32.0)  # type: ignore[arg-type]
+
+
+def test_an_icon_points_into_the_sprite_and_an_unknown_name_draws_nothing():
+    sprite = components.sprite()
+    assert sprite.startswith("<svg") and sprite.count("<symbol ") == len(components.ICONS)
+    for name in components.ICONS:
+        assert f'id="i-{name}"' in sprite and f'href="#i-{name}"' in components.icon(name)
+    assert components.icon("nope") == "" and components.icon('x"><script>') == ""
+    assert 'class="i chev"' in components.icon("chev", "chev") and ESCAPED in components.icon("chev", BAD)
+    assert "<script>" not in components.icon("chev", BAD)

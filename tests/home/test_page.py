@@ -66,7 +66,7 @@ def test_render_shows_the_records_the_api_found(box, capsys, tmp_path):
     target = tmp_path / "home.html"
     run(capsys, "home", "--render", str(target))
     text = target.read_text(encoding="utf-8")
-    assert "app" in text and "Lead" in text and "No lead session" not in text
+    assert "app" in text and "Pinned" in text and "No lead session" not in text
     assert "collie" in text  # the sources list says what was and wasn't read
 
 
@@ -111,9 +111,12 @@ def test_a_bad_profile_stops_the_server_before_it_binds(box):
         server.run(open_browser=False)
 
 
-def test_the_page_script_holds_the_theme_toggle_and_only_a_live_page_posts():
-    assert "ws-theme" in page.SCRIPT and "fetch(" not in page.SCRIPT
-    assert "/api/open" in page.SCRIPT_LIVE and "X-Ws-Token" in page.SCRIPT_LIVE and page.SCRIPT in page.SCRIPT_LIVE
+def test_the_shared_script_holds_the_look_and_the_view_and_only_a_live_page_posts():
+    assert "ws-home-look" in page.SCRIPT and "ws-home-view" in page.SCRIPT and "fetch(" not in page.SCRIPT
+    for path in ("/api/open", "/api/answer", "/api/start"):
+        assert path in page.SCRIPT_LIVE and path not in page.SCRIPT
+    assert "X-Ws-Token" in page.SCRIPT_LIVE and page.SCRIPT in page.SCRIPT_LIVE
+    assert "UNDO_MS = 6000" in page.SCRIPT_LIVE  # an answer is sent after a 6 second undo window
 
 
 def test_the_page_works_at_phone_width():

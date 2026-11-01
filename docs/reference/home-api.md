@@ -51,6 +51,15 @@ and the repo label only.
 
 `opens` is empty here. The openers in the home page fill it in.
 
+## Answering
+
+`api.answer(ask_id, choice, text, env)` answers one ask, with one of its options (`choice`) or in your own words
+(`text`). The source that gave the ask does it, by running `[home.answer] command`; ws never writes the source's file.
+Only a question that isn't opaque, from a source that can take an answer (`asks_jsonl`), is answerable
+(`api.answerable`). A permission, an approval, a waiting session and every opaque ask are answered where they live, and
+asking the API to answer one raises `WsError` with kind `refused`. The other kinds are `not_found`, `not_set` (no
+`[home.answer] command`) and `failed` (the program didn't run or stopped).
+
 ## Sources
 
 Sources are modules in `src/ws/home/sources/`, found by scanning the folder like the role adapters. To add one, add a
@@ -148,7 +157,27 @@ claude_dir = "~/.claude"        # $CLAUDE_CONFIG_DIR when set
 session = "terminal"
 ask = "browser"
 opaque = "terminal"
+
+[home.start]                    # the program the home page's box runs to start a session; no shell
+command = ["ws", "dispatch", "{workspace}", "{request}"]
+
+[home.answer]                   # the program that answers a question from its row; no shell
+command = ["ws-ask", "answer", "{id}", "{choice}"]
+
+[home.workspaces]               # workspace folder name -> its data class, shown beside it in the box and sidebar
+investments = "financial"
+
+[home.models]                   # runner -> the models the box offers for it (none: the runner's own default)
+claude-code = ["opus", "sonnet"]
+
+[home.deny]                     # a runner, or runner/model -> the data classes it can't take
+opencode = ["financial"]
 ```
+
+`[home.start] command` and `[home.answer] command` are lists of words, the first the program. `{name}` in a later word is
+replaced by a value, as one argument: `[home.start]` has `{what}` (`session`, `chat` or `job`), `{workspace}`, `{where}`,
+`{runner}`, `{model}` and `{request}` (and needs `{request}`); `[home.answer]` has `{id}`, `{choice}` and `{text}` (and
+needs `{id}`). A value that would start a word with a dash is refused.
 
 `lead = "cwd:PATH"` matches a session whose folder is exactly `PATH`. `lead = "name:GLOB"` matches by name. If several
 match, the most recently seen one that hasn't ended is the lead.

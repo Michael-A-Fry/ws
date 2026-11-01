@@ -1,9 +1,11 @@
-"""The home data API: `snapshot` and the reads behind it (`lead`, `asks`, `sessions`, `plugins`, `evals`, `events`).
+"""The home data API: `snapshot` and the reads behind it (`lead`, `asks`, `sessions`, `plugins`, `evals`, `events`) and the one write, `answer`.
 
 Every area, app and script reads home data through here and nowhere else. It reads the sources (ws.home.sources) in
 order, drops any source that can't be read whole into one `sources[]` row with a typed reason, merges sessions by
 (runner, session id), and applies the opaque rule last: an opaque record leaves with only what ws.home.records.KEEP
-lists. It is read-only. The profile's `[home]` table is read and checked here; an unknown key is an error naming it.
+lists. Reading changes nothing. `answer` hands one answer to the source that gave the ask, which runs the profile's
+`[home.answer]` command; ws never writes a source's file itself, and an opaque ask, an approval or a permission can't
+be answered this way. The profile's `[home]` table is read and checked here; an unknown key is an error naming it.
 """
 
 from __future__ import annotations
@@ -19,15 +21,18 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from ws import jsonl
-from ws.home import records
+from ws.home import records, template
 from ws.home.records import Ask, Event, Plugin, Session, Snapshot, SourceRow
 from ws.home.sources import FAILED, TIMEOUT, UNAVAILABLE, SourceError, _files, discover
 from ws.output import WsError
 from ws.profile import ProfileError, load, profile_path, ws_home
 
-HOME_KEYS = ("lead", "opaque_paths", "sources", "open")
+HOME_KEYS = ("lead", "opaque_paths", "sources", "open", "start", "answer", "workspaces", "models", "deny")
 SOURCE_KEYS = ("asks_jsonl", "events_dir", "otel_dir", "claude_dir")
 OPEN_KEYS = ("session", "ask", "opaque")
+START_NAMES = ("what", "workspace", "where", "runner", "model", "request")  # what `[home.start] command` may use
+ANSWER_NAMES = ("id", "choice", "text")  # what `[home.answer] command` may use
+ANSWER_TEXT_MAX = 2000
 _LEAD = re.compile(r"^(cwd|name):\S.*$")
 EVENT_WINDOW_S = 24 * 3600  # how far back a snapshot's events reach
 RUN_TIMEOUT_S = 10.0
@@ -45,6 +50,11 @@ class HomeConfig:
     roots: tuple[str, ...] = ()  # opaque_paths as absolute paths, links followed (records.roots_of)
     sources: Mapping[str, str] = field(default_factory=dict)
     open: Mapping[str, str] = field(default_factory=dict)
+    start: tuple[str, ...] = ()  # `[home.start] command`: the argument template that starts a session
+    answer: tuple[str, ...] = ()  # `[home.answer] command`: the argument template that answers an ask
+    workspaces: Mapping[str, str] = field(default_factory=dict)  # workspace name -> its data class
+    models: Mapping[str, tuple[str, ...]] = field(default_factory=dict)  # runner -> the models it offers
+    deny: Mapping[str, tuple[str, ...]] = field(default_factory=dict)  # runner or runner/model -> classes it can't take
 
 
 def _bad(path: Path, message: str, hint: str) -> WsError:
@@ -67,6 +77,45 @@ def _strings(table: object, allowed: tuple[str, ...], where: str, path: Path) ->
         if not isinstance(value, str) or not value.strip():
             raise _bad(path, f"{where}.{key} must be a non-empty string", f"set {where}.{key} to text")
     return {k: v.strip() for k, v in table.items()}
+
+
+def _command(table: object, where: str, path: Path, allowed: tuple[str, ...], required: str) -> tuple[str, ...]:
+    """`[home.start]` or `[home.answer]`: one key, `command`, a list of words checked as a template."""
+    if table is None:
+        return ()
+    if not isinstance(table, dict):
+        raise _bad(path, f"{where} must be a table", f"write {where} as a table with a command list")
+    for key in table:
+        if key != "command":
+            raise _bad(path, f"unknown key {key!r} in {where}", "the key is: command")
+    words = table.get("command")
+    if words is None:
+        return ()
+    if not isinstance(words, list) or not all(isinstance(w, str) and w for w in words):
+        raise _bad(path, f"{where}.command must be a list of words", f'e.g. command = ["prog", "{{{required}}}"]')
+    why = template.check(words, allowed, required)
+    if why:
+        raise _bad(path, f"{where}.command {why}", f"the names you can use are: {', '.join(allowed)}")
+    return tuple(words)
+
+
+def _free(table: object, where: str, path: Path, lists: bool) -> dict:
+    """A table whose keys the person picks: each value a text (a class) or, when `lists`, a list of texts."""
+    if table is None:
+        return {}
+    if not isinstance(table, dict):
+        raise _bad(path, f"{where} must be a table", f"write {where} as a table")
+    out: dict = {}
+    for key, value in table.items():
+        if lists:
+            if not (isinstance(value, list) and all(isinstance(v, str) and v.strip() for v in value)):
+                raise _bad(path, f"{where}.{key} must be a list of text", f'e.g. {key} = ["name"]')
+            out[key] = tuple(v.strip() for v in value)
+        else:
+            if not isinstance(value, str) or not value.strip():
+                raise _bad(path, f"{where}.{key} must be text", f'e.g. {key} = "financial"')
+            out[key] = value.strip()
+    return out
 
 
 def load_config(environ: Mapping[str, str], home: Path) -> HomeConfig:
@@ -106,6 +155,11 @@ def load_config(environ: Mapping[str, str], home: Path) -> HomeConfig:
         roots=records.roots_of(expanded),
         sources={k: _expand(v, home) for k, v in sources.items()},
         open=opens,
+        start=_command(table.get("start"), "[home.start]", path, START_NAMES, "request"),
+        answer=_command(table.get("answer"), "[home.answer]", path, ANSWER_NAMES, "id"),
+        workspaces=_free(table.get("workspaces"), "[home.workspaces]", path, lists=False),
+        models=_free(table.get("models"), "[home.models]", path, lists=True),
+        deny=_free(table.get("deny"), "[home.deny]", path, lists=True),
     )
 
 
@@ -459,3 +513,40 @@ def events(since: float | None = None, env: Env | None = None) -> list[Event]:
     loaded = _load(env, {"events", "sessions"})
     _, verdict = _finish_sessions(env, loaded)
     return _finish_events(env, loaded, verdict)
+
+
+# --- the one write -------------------------------------------------------------------------------------------------
+
+
+def answerable(ask: Ask) -> bool:
+    """True when an ask is one a person may answer through the API: a question that isn't opaque, from a source that can
+    take an answer. A permission, an approval, a waiting session and every opaque ask are answered where they live."""
+    if ask.opaque or ask.kind != "question":
+        return False
+    return any(m.NAME == ask.source and callable(getattr(m, "answer", None)) for m in discover()[0])
+
+
+def answer(ask_id: str, choice: str = "", text: str = "", env: Env | None = None) -> None:
+    """Answer one ask with one of its options (`choice`, the option's label) or in your own words (`text`), never both.
+    The source that gave the ask does it. Raises WsError: `not_found` (no such ask now), `refused` (it can't be answered
+    here, or the answer isn't one of its options), `not_set` (`[home.answer] command` isn't in the profile) or `failed`
+    (the program didn't run or stopped)."""
+    env = env or Env.make()
+    ask = next((a for a in asks(env) if a.id == ask_id), None)
+    if ask is None:
+        raise WsError("not_found", "that ask is gone", "reload the page to see what is waiting")
+    if not answerable(ask):
+        raise WsError("refused", "that ask is answered where it lives", "use Open to go to its session")
+    if bool(choice) == bool(text):
+        raise WsError("refused", "give one option or your own words, not both or neither", "pick an option or type")
+    if choice and choice not in {o.get("label") for o in ask.options}:
+        raise WsError("refused", "that isn't one of the ask's options", "reload the page and pick again")
+    if len(text) > ANSWER_TEXT_MAX:
+        raise WsError("refused", f"an answer is at most {ANSWER_TEXT_MAX} characters", "shorten it")
+    if not env.cfg.answer:
+        raise WsError("not_set", "no answer command is set", "set [home.answer] command in the profile")
+    mod = next(m for m in discover()[0] if m.NAME == ask.source)
+    try:
+        mod.answer(ask, choice, text, env)
+    except SourceError as e:
+        raise WsError("failed", e.why, "check the program in [home.answer] command") from e

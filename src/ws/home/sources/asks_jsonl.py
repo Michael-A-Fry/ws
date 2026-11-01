@@ -5,19 +5,23 @@ Each line has `event` (`added`, `answered`, `withdrawn` or `done`), `id` and `ts
 `source` (`permission` for a permission, else a question), `rc_url` and `redacted`. The file's own word never places an
 ask: one is open only on a session in the snapshot that is open. A later `answered`, `withdrawn` or
 `done` line closes the ask. The path is `[home.sources] asks_jsonl`.
+
+`answer(ask, choice, text, env)` is how the home page answers one: it runs the profile's `[home.answer] command` with
+no shell, filling `{id}`, `{choice}` and `{text}`. It never writes the file; the program that runs closes the ask.
 """
 
 from __future__ import annotations
 
-from ws.home import records
+from ws.home import records, template
 from ws.home.records import Ask
-from ws.home.sources import _files
+from ws.home.sources import FAILED, TIMEOUT, SourceError, _files
 
 NAME = "asks_jsonl"
 PROVIDES = ("asks",)
 ORDER = 50
 CLOSING = ("answered", "withdrawn", "done")
 MAX_OPTIONS = 8
+ANSWER_TIMEOUT_S = 15.0
 
 
 def available(env):
@@ -69,3 +73,19 @@ def read(kind, env):
                 rc_url=link,
             )
     return list(open_asks.values())
+
+
+def answer(ask, choice, text, env) -> None:
+    """Run `[home.answer] command` for `ask`. Raises SourceError when it can't be filled, run or stops with an error."""
+    try:
+        argv = template.fill(env.cfg.answer, {"id": ask.id, "choice": choice, "text": text})
+    except ValueError as e:
+        raise SourceError(FAILED, str(e)) from e
+    try:
+        code, _ = env.run(argv, ANSWER_TIMEOUT_S)
+    except TimeoutError as e:
+        raise SourceError(TIMEOUT, f"{argv[0]} took too long") from e
+    except OSError as e:
+        raise SourceError(FAILED, f"{argv[0]} didn't run") from e
+    if code != 0:
+        raise SourceError(FAILED, f"{argv[0]} stopped with code {code}")

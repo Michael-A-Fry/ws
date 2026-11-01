@@ -44,6 +44,24 @@ def age(ts: str | None, now: str | None) -> str:
     return ""
 
 
+def age_short(ts: str | None, now: str | None) -> str:
+    """The age in a few characters for the right of a row: `now`, `12m`, `3h`, `2d`; empty when there is no time."""
+    then, here = _when(ts), _when(now)
+    if then is None or here is None:
+        return ""
+    secs = int((here - then).total_seconds())
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if secs >= size:
+            return f"{secs // size}{unit}"
+    return "now"
+
+
+def within(ts: str | None, now: str | None, seconds: int) -> bool:
+    """True when `ts` is no more than `seconds` before `now` (a time in the future counts)."""
+    then, here = _when(ts), _when(now)
+    return then is not None and here is not None and (here - then).total_seconds() <= seconds
+
+
 def count(n: float) -> str:
     """A count as a short figure: 950, 12.3k, 4.1M, 2.5G."""
     for size, suffix in ((1e9, "G"), (1e6, "M"), (1e3, "k")):

@@ -104,6 +104,28 @@ def _gap(arms: list) -> str:
     return f'<p class="gap">{_fmt.esc(hi.arm)} and {_fmt.esc(lo.arm)} are {gap:.1f} points apart: {verdict}.</p>'
 
 
+def verdict(arms, now: str | None = None) -> str:
+    """The latest eval result in a few words, for the quiet line on Home: which arm leads and whether the gap is more than
+    noise, or why there is nothing to say yet."""
+    if not arms:
+        return "no eval trials yet"
+    rated = sorted((a for a in arms if a.pass_rate is not None), key=lambda a: -a.pass_rate)
+    if not rated:
+        return f"{len(arms)} arm{'s' if len(arms) != 1 else ''}, no pass rate yet"
+    stamps = [p["ts"] for a in arms for p in a.trend if p.get("ts")]
+    when = _fmt.age(max(stamps), now) if stamps else ""
+    tail = f", {when}" if when else ""
+    if len(rated) == 1:
+        a = rated[0]
+        return f"{a.arm} solved {a.solved} of {a.trials}{tail}"
+    best, next_ = rated[0], rated[1]
+    gap = (best.pass_rate - next_.pass_rate) * 100
+    points = (best.noise or {}).get("points")
+    if points is not None and gap < points:
+        return f"{best.arm} and {next_.arm} are within noise{tail}"
+    return f"{best.arm} leads {next_.arm} by {gap:.0f} points{tail}"
+
+
 def render(view: View) -> str:
     arms = list(view.snap.evals)
     if not arms:

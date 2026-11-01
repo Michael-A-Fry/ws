@@ -22,12 +22,14 @@ __all__ = [
     "chip",
     "copy_button",
     "empty",
+    "icon",
     "link",
     "mark",
     "page",
     "panel",
     "row",
     "sparkline",
+    "sprite",
     "stat",
     "status",
 ]
@@ -48,8 +50,55 @@ STATES: dict[str, tuple[str, str, str]] = {
 }
 
 
+# Line icons on a 24 by 24 grid, stroked in the text colour: name -> the shapes inside its <symbol>.
+ICONS: dict[str, str] = {
+    "plus": '<path d="M12 5v14M5 12h14"/>',
+    "new": '<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/>',
+    "search": '<circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/>',
+    "home": '<path d="M3 10.5 12 3l9 7.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/>',
+    "clock": '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+    "hist": '<path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/><path d="M12 8v4l3 2"/>',
+    "book": '<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20V3H6.5A2.5 2.5 0 0 0 4 5.5z"/>'
+    '<path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H20v-5"/>',
+    "blocks": '<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/>'
+    '<rect x="3" y="14" width="7" height="7" rx="1.5"/><path d="M14 17.5h7M17.5 14v7"/>',
+    "plug": '<path d="M9 2v5M15 2v5M6 7h12v4a6 6 0 0 1-12 0zM12 17v5"/>',
+    "gauge": '<path d="M4 18a9 9 0 1 1 16 0"/><path d="M12 14l4-5"/>',
+    "lock": '<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>',
+    "chev": '<path d="M6 9l6 6 6-6"/>',
+    "up": '<path d="M12 19V5M5 12l7-7 7 7"/>',
+    "menu": '<path d="M4 7h16M4 12h16M4 17h10"/>',
+    "mon": '<rect x="3" y="4" width="18" height="12" rx="1.5"/><path d="M8 20h8M12 16v4"/>',
+    "term": '<path d="M4 17l6-5-6-5M12 19h8"/>',
+    "check": '<path d="M5 12l5 5 9-10"/>',
+    "layers": '<path d="M12 3 2 8l10 5 10-5z"/><path d="M2 16l10 5 10-5"/>',
+    "chip": '<rect x="6" y="6" width="12" height="12" rx="2"/>'
+    '<path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/>',
+    "folder": '<path d="M3 6a1 1 0 0 1 1-1h5l2 2h9a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1z"/>',
+    "sliders": '<path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1"/><circle cx="15" cy="6" r="2"/>'
+    '<circle cx="9" cy="12" r="2"/><circle cx="17" cy="18" r="2"/>',
+    "gear": '<circle cx="12" cy="12" r="3"/>'
+    '<path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9 7 7M17 17l2.1 2.1M4.9 19.1 7 17M17 7l2.1-2.1"/>',
+}
+
+
 def _e(text: object) -> str:
     return html.escape(str(text), quote=True)
+
+
+def sprite() -> str:
+    """The icon shapes as one hidden SVG of `<symbol>`s, written once per page; `icon` points into it."""
+    body = "".join(f'<symbol id="i-{n}" viewBox="0 0 24 24">{shapes}</symbol>' for n, shapes in ICONS.items())
+    return f'<svg width="0" height="0" class="sprite" aria-hidden="true" focusable="false">{body}</svg>'
+
+
+def icon(name: str, extra: str = "") -> str:
+    """A line icon from the sprite, 16 px unless the page's rules say otherwise. `extra` adds a class (a plain word). A
+    name not in `ICONS` draws nothing."""
+    if name not in ICONS:
+        return ""
+    more = f" {_e(extra)}" if extra else ""
+    return f'<svg class="i{more}" aria-hidden="true" focusable="false"><use href="#i-{name}"/></svg>'
 
 
 def panel(title: str, body: str, *, aside: str = "") -> str:

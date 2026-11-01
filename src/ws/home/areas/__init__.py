@@ -8,12 +8,12 @@ source: what it shows is what the API gave it.
 
 from __future__ import annotations
 
-from ws.home.areas import evals, lead, needs_you, plugins, sessions, terminal
-from ws.home.areas._base import Slot, View
+from ws.home.areas import composer, evals, lead, needs_you, plugins, quiet, sessions, terminal
+from ws.home.areas._base import Hub, Slot, View
 
-__all__ = ["MODULES", "SLOTS", "Slot", "View", "built"]
+__all__ = ["MODULES", "SLOTS", "Hub", "Slot", "View", "built"]
 
-MODULES = {m.ID: m for m in (lead, needs_you, sessions, evals, plugins, terminal)}
+MODULES = {m.ID: m for m in (composer, lead, needs_you, sessions, evals, quiet, plugins, terminal)}
 SLOTS: tuple[Slot, ...] = tuple(sorted((Slot.of(m) for m in MODULES.values()), key=lambda s: s.order))
 
 

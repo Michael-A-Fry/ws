@@ -8,8 +8,7 @@ import sys
 from pathlib import Path
 
 from ws import output
-from ws.home import api, page, server
-from ws.home import open as opener
+from ws.home import api, server
 from ws.home.records import Snapshot
 from ws.style import Style, plural
 
@@ -54,7 +53,7 @@ def cmd_home(args: argparse.Namespace) -> int:
     if not args.render:
         return server.run(open_browser=not args.no_browser)
     env = api.Env.make()
-    text = page.render(opener.attach(api.snapshot(env), env), live=False)
+    text = server.page_for(env, live=False)
     out = Path(args.render).expanduser()
     out.write_text(text, encoding="utf-8")
     out.chmod(0o600)  # the page holds the person's own session names and folders

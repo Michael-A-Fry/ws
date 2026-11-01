@@ -2,8 +2,10 @@
 
 It binds 127.0.0.1 on a random port and prints an address that carries the token (`ws.ui.server`). `GET /` builds a
 fresh snapshot, fills each record's `opens` and returns the page; `POST /api/open` runs one opener's call for one
-record, after the token, Host and Origin checks, and only a call the page itself offers for that record. Reading the
-page changes nothing.
+record, after the token, Host and Origin checks, and only a call the page itself offers for that record. Two more
+calls run a program the profile names, behind the same checks: `POST /api/answer` answers an ask that `ws.home.api`
+says can be answered (`[home.answer] command`), and `POST /api/start` starts a session from the box (`[home.start]
+command`). Reading the page changes nothing.
 """
 
 from __future__ import annotations
@@ -15,9 +17,10 @@ import tempfile
 import webbrowser
 from pathlib import Path
 
-from ws.home import api, page
+from ws.home import api, hub, page
 from ws.home import open as opener
 from ws.home.records import Snapshot
+from ws.output import WsError
 from ws.ui.server import BadRequest, LoopbackServer
 
 __all__ = ["HomeServer", "build", "run"]
@@ -25,10 +28,19 @@ __all__ = ["HomeServer", "build", "run"]
 IDLE_SECONDS = 3600  # the page reloads itself while it is in view, so an hour of silence means nobody is looking
 
 
+ANSWER_STATUS = {"not_found": 404, "refused": 409, "not_set": 409, "failed": 502}
+
+
 def build(env: api.Env | None = None) -> tuple[Snapshot, api.Env]:
     """A fresh snapshot with its openers filled in, and the environment it was read in."""
     env = env or api.Env.make()
     return opener.attach(api.snapshot(env), env), env
+
+
+def page_for(env: api.Env | None = None, nonce: str = "", *, live: bool = True) -> str:
+    """The whole page from a fresh snapshot: what `GET /` serves and `ws home --render` writes."""
+    snap, env = build(env)
+    return page.render(snap, nonce, live=live, hub=hub.build(snap, env))
 
 
 class HomeServer(LoopbackServer):
@@ -38,7 +50,7 @@ class HomeServer(LoopbackServer):
         self._env = env_factory
         super().__init__(
             {"/": self._page, "/api/home": self._data},
-            {"/api/open": self._open},
+            {"/api/open": self._open, "/api/answer": self._answer, "/api/start": self._start},
             token=token,
             idle_seconds=idle_seconds,
             server_version="ws-home",
@@ -47,8 +59,7 @@ class HomeServer(LoopbackServer):
         )
 
     def _page(self, nonce: str) -> str:
-        snap, _ = build(self._env())
-        return page.render(snap, nonce, live=True)
+        return page_for(self._env(), nonce)
 
     def _data(self, nonce: str) -> dict:
         snap, _ = build(self._env())
@@ -59,6 +70,23 @@ class HomeServer(LoopbackServer):
         if not all(isinstance(v, str) and 0 < len(v) <= 256 for v in want):
             raise BadRequest("opener, kind and id are text")
         return opener.perform(self._env(), *want)
+
+    def _answer(self, data: dict) -> tuple[int, dict]:
+        ident, choice, text = (data.get(k, "") for k in ("id", "choice", "text"))
+        if not all(isinstance(v, str) for v in (ident, choice, text)) or not 0 < len(ident) <= 256:
+            raise BadRequest("id, choice and text are text")
+        if len(choice) > 256 or len(text) > api.ANSWER_TEXT_MAX:
+            raise BadRequest("choice or text is too long")
+        try:
+            api.answer(ident, choice, text, self._env())
+        except WsError as e:
+            return ANSWER_STATUS.get(e.kind, 502), {"error": e.message, "hint": e.hint}
+        return 200, {"ok": True}
+
+    def _start(self, data: dict) -> tuple[int, dict]:
+        if not all(isinstance(data.get(k, ""), str) and len(data.get(k, "")) <= hub.REQUEST_MAX for k in data):
+            raise BadRequest("every field is text")
+        return hub.start(self._env(), data)
 
 
 def _launcher(url: str) -> Path:

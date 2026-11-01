@@ -545,7 +545,14 @@ def test_record_calls_appends_one_line_per_hook_run_and_never_denies(home):
     assert gate.check("claude-code", json.dumps(glob), p, clock=lambda: 0) is None
     lines = jsonl.read(home / "wshome" / "logs" / "gate-calls.jsonl")
     assert len(lines) == 1
-    assert lines[0] == {"at": "1970-01-01T00:00:00+00:00", "runner": "claude-code", "payload": glob}
+    assert lines[0] == {
+        "schema": 1,
+        "ts": "1970-01-01T00:00:00.000Z",
+        "at": "1970-01-01T00:00:00+00:00",  # legacy spelling of ts, kept beside it
+        "runner": "claude-code",
+        "payload": glob,
+    }
+    assert jsonl.when(lines[0]) == "1970-01-01T00:00:00.000Z"
 
 
 SECRET_TEXT = "planted-" + "7" * 12  # built at run time

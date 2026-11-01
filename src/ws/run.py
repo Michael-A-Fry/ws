@@ -26,7 +26,9 @@ The job may also declare `green`, what its verification covers; the record carri
 A job with no `cwd` runs in a fresh empty folder, `$XDG_STATE_HOME/ws/work/<run_id>` (default `~/.local/state/...`).
 It is outside `$WS_HOME` on purpose: the wall makes `$WS_HOME` read-only, so a folder there could not be written to.
 Each folder on the way is made private (0700) and checked before use: not a link, ours, and not writable by anyone
-else, so another user cannot plant one to steer the run. `ws uninstall` removes `$XDG_STATE_HOME/ws`.
+else, so another user cannot plant one to steer the run. `ws uninstall` removes the empty run folders there and then
+the empty `work/` and `ws/` folders; a run folder that holds anything stays, and so does everything above it, because
+what a job wrote is the person's.
 
 Exit: 0 ok, 1 the runner failed or timed out, 2 the job could not be read (a record is written when the job name is
 safe), 3 refused.
@@ -192,7 +194,7 @@ def _child_env(home: Path, extra: dict[str, str]) -> dict[str, str]:
 
 def work_root(env: dict[str, str] | None = None) -> Path:
     """`$XDG_STATE_HOME/ws` (default `~/.local/state/ws`): the only thing ws keeps there, the work folders of jobs with no
-    `cwd`. `ws uninstall` removes it."""
+    `cwd`. `ws uninstall` removes the empty run folders in it, and the folder itself once it is empty."""
     env = os.environ if env is None else env
     state = env.get("XDG_STATE_HOME")
     if state and os.path.isabs(state):

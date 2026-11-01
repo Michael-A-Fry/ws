@@ -34,7 +34,7 @@ name, and a key in a guard's table that guard doesn't read.
 | `claims` | before a message, and when the session stops | messages to other agents | Checks each commit-like token that sits in the same sentence as a claim word (`on main`, `merged into main`, `merged to main`, `pushed to main`) against a ref, and denies the message when the commit isn't on it. On stop, logs the claims in the runner's last message. |
 | `spawn-cap` | before a call, and when a subagent stops | subagent starts | Denies a subagent start when `max_agents` (default from the machine) are already running in the session. Counts agents started in the background. |
 | `skill-gate` | before a call, and when a prompt is sent | file writes and skill calls | Denies a write to a guarded path until the named skill has run in the session. The person can approve the write once. Judges Edit, Write and MultiEdit calls only. |
-| `record-calls` | before a call | every kind | Appends `{at, runner, payload}` to `$WS_HOME/logs/gate-calls.jsonl`, one line for each hook run. A file write keeps its path and records the text as `{"bytes", "sha256"}`. `ws gate replay` reads that file. |
+| `record-calls` | before a call | every kind | Appends `{schema, ts, at, runner, payload}` (`ts` is the time; `at` is its legacy spelling, kept beside it) to `$WS_HOME/logs/gate-calls.jsonl`, one line for each hook run. A file write keeps its path and records the text as `{"bytes", "sha256"}`. `ws gate replay` reads that file. |
 
 `bulk-staging` and `record-calls` take no table. The four guards below take one.
 
@@ -105,7 +105,8 @@ message each let the message through with a note. Git runs with `GIT_NO_LAZY_FET
 network.
 
 When the session stops, the claims in the runner's last message (the stop payload's `last_assistant_message`, when the
-runner sends one) are appended to `$WS_HOME/logs/claims.jsonl` with whether each commit was on `ref`.
+runner sends one) are appended to `$WS_HOME/logs/claims.jsonl` with whether each commit was on `ref`. Each line has
+`schema`, `ts` and `at`, like the other logs listed in [Stores](stores.md).
 
 ### spawn-cap
 

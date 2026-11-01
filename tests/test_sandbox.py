@@ -1006,6 +1006,7 @@ def test_a_launcher_with_nothing_to_say_prints_and_writes_nothing(tmp_path, wsho
     assert got and ".claude" in err and "note: a note" in err and "removed nothing" in err
     line = json.loads((wshome / "logs" / "wall-report.jsonl").read_text())
     assert line["project"] == "/p" and line["findings"][0]["path"] == ".claude" and line["notes"] == ["a note"]
+    assert line["schema"] == 1 and line["ts"].endswith("Z") and line["at"].endswith("Z")  # `at` is the legacy key
 
 
 # --- the report does not trust the tree it reads ----------------------------------------------------------------------------

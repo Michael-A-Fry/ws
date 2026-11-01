@@ -2,7 +2,8 @@
 
 A session loads its rules and skills when it starts. If ws is released while it runs, it keeps working from the old
 ones. `ws session start` records the release a session began on; `ws session nudge` prints one line, once, when the
-installed release is newer than that.
+installed release is newer than that. The record is one JSON file per session, with `schema` and `ts` (when it was
+written) beside `started_at`; docs/reference/stores.md lists it.
 
 This is advice, not a gate. The gate (`ws gate check`) fails closed; this does the opposite: any error exits 0 and
 says nothing, so a broken nudge can never block or slow the host tool.
@@ -22,12 +23,13 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-from ws import __version__
+from ws import __version__, jsonl
 from ws.profile import ws_home
 
 _SAFE_ID = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 _RELEASE = re.compile(r"^[A-Za-z0-9._+-]{1,64}$")  # a release string is printed into the model's context: keep it plain
 _KEEP_DAYS = 30
+SCHEMA_VERSION = 1  # the `schema` of a session record in sessions/<id>.json
 
 
 # --- the release ---------------------------------------------------------------------------------------------------
@@ -125,10 +127,13 @@ def _read(path: Path) -> dict | None:
 
 
 def _new_record(session_id: str, release: str, runner: str, cwd: str) -> dict:
+    now = datetime.now(UTC)
     return {
+        "schema": SCHEMA_VERSION,
+        "ts": jsonl.iso_utc(now.timestamp()),
         "session_id": session_id,
         "release": release,
-        "started_at": datetime.now(UTC).isoformat(timespec="seconds"),
+        "started_at": now.isoformat(timespec="seconds"),
         "runner": runner,
         "cwd": cwd,
     }

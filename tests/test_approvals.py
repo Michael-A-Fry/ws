@@ -10,7 +10,7 @@ import stat
 
 import pytest
 
-from ws import approvals, cli, gate, policy
+from ws import approvals, cli, gate, jsonl, policy
 from ws.approvals import ApprovalError, Bound
 
 NOW = 1_000_000.0
@@ -43,6 +43,14 @@ def test_the_first_try_is_refused_with_an_id_and_a_pending_record(root):
     assert why and f"ws approve {ident()[:12]}" in why and "10 minutes" in why
     rec = json.loads((root / "pending" / f"{ident()}.json").read_text())
     assert rec["bound"] == CALL.__dict__ and rec["id"] == ident()
+    assert (rec["schema"], rec["v"]) == (1, 1)  # `v` is the older spelling of `schema`
+    assert rec["ts"] == jsonl.iso_utc(NOW) and rec["created"] == NOW
+
+
+def test_a_granted_record_is_stamped_with_the_time_of_the_grant():
+    rec = approvals._record(CALL, NOW, NOW + 30)
+    assert rec["ts"] == jsonl.iso_utc(NOW + 30) and rec["created"] == NOW and rec["granted"] == NOW + 30
+    assert approvals._record(CALL, NOW)["ts"] == jsonl.iso_utc(NOW)
 
 
 def test_a_refused_call_stays_refused_until_a_person_grants_it(root):

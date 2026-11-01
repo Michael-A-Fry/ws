@@ -98,8 +98,9 @@ state as WS008.
 ## What's kept
 
 - Your notes folder and your memory folder, and anything you wrote in them.
-- A work folder that holds your files, under `$XDG_STATE_HOME/ws` (default `~/.local/state/ws`). ws removes only empty
-  run folders there.
+- The work folders of jobs with no `cwd`, under `$XDG_STATE_HOME/ws` (default `~/.local/state/ws`). ws removes the
+  empty run folders there, then `work/` and `ws/` once they're empty. A run folder that holds a file stays, with the
+  folders above it, because what a job wrote is yours.
 - The backup in `$WS_HOME/backups/`, when you'd edited your config file after ws wrote to it. After an exact restore the
   backup is the same as the file, so ws removes it.
 - The secret store, if you moved it to its own user with `ws secret wall`. Remove that system user and its folder by hand.

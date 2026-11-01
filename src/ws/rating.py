@@ -2,8 +2,9 @@
 
     ws rate <run-id|last> up|down [--note TEXT]
 
-Each rating is one line appended to `$WS_HOME/ratings.jsonl` (rotated at 5 MB into `logs/`): run id, UTC time, `up`
-or `down`, an optional note and `who` ("person"). Rating the same run again adds a line; the latest one for a run is
+Each rating is one line appended to `$WS_HOME/ratings.jsonl` (rotated at 5 MB into `logs/`): `schema`, run id, `ts`
+(UTC), `up` or `down`, an optional note and `who` ("person"). It is the one log at the top of `$WS_HOME` and not in
+`logs/`: the top holds the control files a session may not write, and the person's verdicts sit with them. Rating the same run again adds a line; the latest one for a run is
 the one that counts. `ws run` prints the matching `ws: rate:` line after its hand-back.
 
 Only the person rates. The file sits in ws's home with the other control files, which a session may not write, so an

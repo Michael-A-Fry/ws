@@ -5,6 +5,11 @@ copy, and `ws canary` checks a sample record against it with a small checker tha
 `type`, `const`, `enum`, `pattern`, `minimum`, `minLength`, `maxLength`, `required`, `properties`,
 `additionalProperties: false` and `items`. Keep to them. Every key is always present in a record; an unknown value is
 `null`, never a missing key. Nothing here holds a secret, and the `error` field is short by rule.
+
+The `$id` is a URN, because the schema ships inside ws as this dict and no web address serves it. This schema
+describes version 2 only: a version 1 line has no `green` or `recovered`, and a reader treats a line with no `schema`
+as version 1. Run records carry `started_at` and `ended_at` and no `ts` (the schema forbids extra keys); every other
+ws log carries `schema` and `ts`. docs/reference/stores.md lists them all.
 """
 
 from __future__ import annotations
@@ -42,7 +47,7 @@ _TOKENS = {
 
 SCHEMA: dict = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "$id": "https://github.com/Michael-A-Fry/ws/schemas/run-record.schema.json",
+    "$id": "urn:ws:schema:run-record:2",
     "title": "ws run record",
     "description": (
         "One line of runs.jsonl: what one headless job did, whichever runner ran it. "

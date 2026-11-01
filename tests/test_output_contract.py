@@ -25,6 +25,7 @@ RAW = {
     "broker.serve": "stays up until stopped",
     "session.start": "a hook entry",
     "session.nudge": "a hook entry",
+    "notify.alert": "a hook entry",
     "setup": "a person at a terminal, or the page (setup --yes is covered below)",
 }
 

@@ -7,7 +7,7 @@
 #
 # The repo-admin token lives in FILE on the host (mode 0600 or tighter, refused otherwise) and is only ever sent to the
 # GitHub API from here. The VM never holds it: after the reset the host asks GitHub for a just-in-time runner
-# configuration (POST /repos/{repo}/actions/runners/generate-jitconfig, labels ws-lab; a JIT runner is always
+# configuration (POST /repos/{repo}/actions/runners/generate-jitconfig, labels self-hosted and ws-lab; a JIT runner is always
 # ephemeral: it takes one job, then GitHub forgets it) and writes only that configuration into the VM through the
 # QEMU guest agent. A leaked configuration is good for one runner, once; it cannot register anything else.
 #
@@ -205,7 +205,7 @@ done
 
 echo "lab-host-cycle: asking GitHub for a single-use runner configuration"
 reply="$(api POST "/repos/$REPO/actions/runners/generate-jitconfig" \
-    "{\"name\":\"ws-lab-$(date +%s)\",\"runner_group_id\":1,\"labels\":[\"ws-lab\"],\"work_folder\":\"_work\"}")"
+    "{\"name\":\"ws-lab-$(date +%s)\",\"runner_group_id\":1,\"labels\":[\"self-hosted\",\"ws-lab\"],\"work_folder\":\"_work\"}")"
 RUNNER_ID="$(printf '%s' "$reply" | python3 -c 'import json,sys; print(json.load(sys.stdin)["runner"]["id"])')"
 JIT="$(printf '%s' "$reply" | python3 -c 'import json,sys; print(json.load(sys.stdin)["encoded_jit_config"])')"
 [ -n "$RUNNER_ID" ] && [ -n "$JIT" ] || die "GitHub gave no runner configuration"

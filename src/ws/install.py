@@ -11,6 +11,9 @@ The promises, each pinned by a test:
   out from the live profile each time; the manifest is untrusted input and cannot widen them.
 - A file ws made that the person has since edited is left in place and listed, never overwritten or deleted.
 - Every write is atomic and keeps the file's permission bits. A run that fails part way still records what it made.
+- A run keeps every manifest entry and key it didn't write, including ones a newer ws added: the manifest is read again
+  and merged at save, so only an explicit removal (an uninstall, `forget`, `--gate launch`) drops a record. When the
+  run changed a runner's user config, the save happens while the lock beside that config is still held.
 - Removal uses `unlink` and `rmdir` only; nothing is ever deleted recursively.
 - A runner's own config file (Claude Code's `settings.json`) is changed only by adding ws's items beside yours, and only
   after a byte-exact backup. Undo gives your bytes back, or takes out just ws's recorded items if you changed the file
@@ -23,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import copy
 import hashlib
 import json
 import math
@@ -87,6 +91,7 @@ class Step:
     root: bool = False  # a folder ws manages (notes, memory): uninstall may act inside it
     toml: bool = False  # compare as TOML data, so a re-formatted file with the same data counts as unchanged
     merge: userconfig.Merge | None = None  # kind "merge": ws's items added to (or taken out of) a runner's user config
+    carried: bool = False  # kind "merge": an earlier install merged the gate and this plan keeps it
 
 
 @dataclass
@@ -218,15 +223,17 @@ def answers_from_profile(env: Mapping[str, str] | None = None, home: Path | None
     )
 
 
-def resolve_gate(prof: dict, answers: Answers) -> str:
+def resolve_gate(prof: dict, answers: Answers, merged: bool = False) -> str:
     """The gate setting these answers end up with: the one asked for, else the profile's, else every-session for a runner
-    being set up now and `launch` for a profile that already had a runner before the setting existed."""
+    being set up now and `launch` for a profile that already had a runner before the setting existed. `merged`: ws
+    already merged its items into this runner's user config, so a profile with no setting stays every-session; only
+    `--gate launch` takes them out."""
     if answers.gate:
         return answers.gate
     tbl = _sub(_sub(prof, "roles"), "runner")
     if tbl.get("gate") in userconfig.GATES:
         return tbl["gate"]
-    return "launch" if tbl.get("adapter") else "every-session"
+    return "launch" if tbl.get("adapter") and not merged else "every-session"
 
 
 def _table_of(doc: dict, key: str, label: str) -> dict:
@@ -236,8 +243,9 @@ def _table_of(doc: dict, key: str, label: str) -> dict:
     return dict(v)
 
 
-def compose_profile(prof: dict, answers: Answers, env: Mapping[str, str], osi) -> dict:
-    """The profile after these answers: everything present is kept and only the answered keys change."""
+def compose_profile(prof: dict, answers: Answers, env: Mapping[str, str], osi, merged: bool = False) -> dict:
+    """The profile after these answers: everything present is kept and only the answered keys change. `merged`: the
+    runner's user config already carries ws's items (see `resolve_gate`)."""
     from ws import modules
 
     unknown = sorted(answers.modules - set(modules.REGISTRY))
@@ -266,7 +274,7 @@ def compose_profile(prof: dict, answers: Answers, env: Mapping[str, str], osi) -
 
     if answers.runner:
         role("runner")["adapter"] = answers.runner
-        gate = resolve_gate(prof, answers)
+        gate = resolve_gate(prof, answers, merged)
         if answers.gate or "gate" in role("runner") or gate == "every-session":
             role("runner")["gate"] = gate
     if answers.model:
@@ -337,7 +345,9 @@ def plan(answers: Answers, env: Mapping[str, str] | None = None, osi=None) -> li
         answers = replace(answers, memory=saved or DEFAULT_MEMORY)
 
     policy_step, parsed = _policy_step(env)
-    composed = compose_profile(prof, answers, env, osi)
+    entries, _ = _read_manifest(env)
+    merged = bool(answers.runner) and _merge_entry(entries, answers.runner, env) is not None
+    composed = compose_profile(prof, answers, env, osi, merged)
     steps = [policy_step, Step(profile_path(env), "file", profile.dumps(composed), "your profile", toml=True)]
     for name, mod in modules.REGISTRY.items():
         if name in answers.modules:
@@ -346,36 +356,65 @@ def plan(answers: Answers, env: Mapping[str, str] | None = None, osi=None) -> li
     taken = {(s.path, s.kind) for s in steps}
     steps += _role_steps(composed, answers, env, taken)
 
-    entries, _ = _read_manifest(env)
-    wide = answers.runner and userconfig.supports(answers.runner) and resolve_gate(prof, answers) == "every-session"
-    if answers.runner:
+    return steps + _gate_steps(answers, prof, parsed, policy_step.path.resolve(), entries, env)
+
+
+def _gate_steps(
+    answers: Answers, prof: dict, parsed: policy.Policy, policy_file: Path, entries: Mapping[str, dict], env
+) -> list[Step]:
+    """The runner's gate files, and its user config merged (every-session) or taken out (anything else). A user config
+    that holds ws's items from an earlier install stays merged unless the answers or the profile say `launch`: a plan
+    that names no runner (a setup screen on a machine with none found) leaves it alone and refreshes it."""
+    steps: list[Step] = []
+    tbl = _sub(_sub(prof, "roles"), "runner")
+    keep: set[str] = set()  # runners whose user config this plan leaves merged
+    runner = answers.runner
+    if runner:
         try:
-            adapter = adapters.get(answers.runner)
+            adapter = adapters.get(runner)
         except KeyError as e:
             raise InstallError(str(e.args[0])) from e
-        out = _ws_home(env) / "gate" / answers.runner
+        old = _merge_entry(entries, runner, env)
+        wide = userconfig.supports(runner) and resolve_gate(prof, answers, old is not None) == "every-session"
+        out = _ws_home(env) / "gate" / runner
         if wide:
-            made = userconfig.plan(
-                answers.runner, parsed, policy_step.path.resolve(), env, _merge_entry(entries, answers.runner, env)
-            )
+            made = userconfig.plan(runner, parsed, policy_file, env, old)
             files = made.files
         else:
-            files = adapter.generate(parsed, ["ws"], out, policy_step.path.resolve())
-        steps += [Step(out / name, "file", text, f"{answers.runner} deny rules") for name, text in files.items()]
+            files = adapter.generate(parsed, ["ws"], out, policy_file)
+        steps += [Step(out / name, "file", text, f"{runner} deny rules") for name, text in files.items()]
         if wide:
-            steps += [
-                Step(path, "file", text, "OpenCode plugin: the gate in every session")
-                for path, text in made.copies.items()
-            ]
-            what = f"{answers.runner} user config: ws's deny rules and hooks, beside yours"
-            steps.append(Step(made.merge.path, "merge", None, what, merge=made.merge))
-    for runner in userconfig.RUNNERS:  # a runner that is no longer gated in every session: take ws's items out again
-        old = _merge_entry(entries, runner, env)
-        if old is not None and not (wide and runner == answers.runner):
-            what = f"{runner} user config: take ws's entries out"
+            steps += _merge_steps(runner, made, old is not None)
+            keep.add(runner)
+    elif answers.gate != "launch" and tbl.get("gate") != "launch":
+        for other in userconfig.RUNNERS:
+            if _merge_entry(entries, other, env) is None or tbl.get("adapter") not in (None, "", other):
+                continue
+            keep.add(other)
+            try:
+                made = userconfig.plan(other, parsed, policy_file, env, _merge_entry(entries, other, env))
+            except (
+                WsError
+            ):  # can't build a fresh merge now: the record stays as it is, and doctor says if it went stale
+                continue
+            out = _ws_home(env) / "gate" / other
+            steps += [Step(out / name, "file", text, f"{other} deny rules") for name, text in made.files.items()]
+            steps += _merge_steps(other, made, True)
+    for other in userconfig.RUNNERS:  # a runner that is no longer gated in every session: take ws's items out again
+        if _merge_entry(entries, other, env) is not None and other not in keep:
+            what = f"{other} user config: take ws's entries out"
             steps.append(
-                Step(userconfig.target(runner, env), "merge", None, what, merge=userconfig.withdrawal(runner, env))
+                Step(userconfig.target(other, env), "merge", None, what, merge=userconfig.withdrawal(other, env))
             )
+    return steps
+
+
+def _merge_steps(runner: str, made: userconfig.GatePlan, carried: bool) -> list[Step]:
+    steps = [
+        Step(path, "file", text, "OpenCode plugin: the gate in every session") for path, text in made.copies.items()
+    ]
+    what = f"{runner} user config: ws's deny rules and hooks, beside yours"
+    steps.append(Step(made.merge.path, "merge", None, what, merge=made.merge, carried=carried))
     return steps
 
 
@@ -387,11 +426,29 @@ def _merge_entry(entries: Mapping[str, dict], runner: str, env: Mapping[str, str
 # ---- the manifest ----------------------------------------------------------------------------------------------------
 
 
-def _read_manifest(env: Mapping[str, str] | None = None) -> tuple[dict[str, dict], list[str]]:
-    """(entries by path, recorded roots). A missing manifest is empty; one that does not read stops everything."""
+@dataclass
+class _Doc:
+    """The manifest as it is on disk: what this ws uses, and what it only carries so a newer ws's data survives a save."""
+
+    entries: dict[str, dict] = field(default_factory=dict)
+    roots: list[str] = field(default_factory=list)
+    extra: dict = field(default_factory=dict)  # top-level keys this ws doesn't know
+    opaque: list = field(default_factory=list)  # entries this ws can't use (no path, or not an object)
+    schema: int = SCHEMA
+
+
+_KNOWN_KEYS = ("schema", "ws_version", "roots", "entries")
+
+
+def _usable(e) -> bool:
+    return isinstance(e, dict) and isinstance(e.get("path"), str)
+
+
+def _read_doc(env: Mapping[str, str] | None = None) -> _Doc:
+    """The whole manifest. A missing one is empty; one that does not read stops everything."""
     path = manifest_path(env)
     if not path.is_file():
-        return {}, []
+        return _Doc()
     try:
         doc = json.loads(path.read_text(encoding="utf-8"))
         raw = doc["entries"]
@@ -401,8 +458,21 @@ def _read_manifest(env: Mapping[str, str] | None = None) -> tuple[dict[str, dict
         roots = [r for r in listed if isinstance(r, str)] if isinstance(listed, list) else []
     except (OSError, ValueError, KeyError, TypeError) as e:
         raise InstallError(f"{path} does not read as a ws manifest ({type(e).__name__}); not touching anything") from e
-    entries = {e["path"]: dict(e) for e in raw if isinstance(e, dict) and isinstance(e.get("path"), str)}
-    return entries, roots
+    schema = doc.get("schema")
+    newer = isinstance(schema, int) and not isinstance(schema, bool) and schema > SCHEMA
+    return _Doc(
+        entries={e["path"]: dict(e) for e in raw if _usable(e)},
+        roots=roots,
+        extra={k: v for k, v in doc.items() if k not in _KNOWN_KEYS},
+        opaque=[e for e in raw if not _usable(e)],
+        schema=schema if newer else SCHEMA,
+    )
+
+
+def _read_manifest(env: Mapping[str, str] | None = None) -> tuple[dict[str, dict], list[str]]:
+    """(entries by path, recorded roots)."""
+    doc = _read_doc(env)
+    return doc.entries, doc.roots
 
 
 def _missing_parents(path: Path, virtual: set[Path]) -> list[Path]:
@@ -419,16 +489,21 @@ def _dir_entry(path: Path) -> dict:
     return {"path": str(path), "kind": "dir", "sha256": None, "created_by_ws": True}
 
 
-def _save_manifest(env: Mapping[str, str], entries: dict[str, dict], roots: Iterable[str]) -> None:
+def _save_manifest(
+    env: Mapping[str, str], entries: dict[str, dict], roots: Iterable[str], keep: _Doc | None = None
+) -> None:
+    """Write the manifest as `entries` and `roots` say, plus what `keep` carries (keys and entries this ws doesn't use)."""
     path = manifest_path(env)
     for d in _missing_parents(path, set()):  # ws's own home may not exist yet
         d.mkdir()
         entries[str(d)] = _dir_entry(d)
+    keep = keep or _Doc()
     doc = {
-        "schema": SCHEMA,
+        "schema": keep.schema,
         "ws_version": __version__,
         "roots": sorted(set(roots)),
-        "entries": sorted(entries.values(), key=lambda e: e["path"]),
+        "entries": [*sorted(entries.values(), key=lambda e: e["path"]), *keep.opaque],
+        **{k: v for k, v in keep.extra.items() if k not in _KNOWN_KEYS},
     }
     data = (json.dumps(doc, indent=2) + "\n").encode("utf-8")
     with contextlib.suppress(OSError):
@@ -437,13 +512,29 @@ def _save_manifest(env: Mapping[str, str], entries: dict[str, dict], roots: Iter
     _write_atomic(path, data)
 
 
+def _commit(env: Mapping[str, str], base: Mapping[str, dict], entries: dict[str, dict], roots: Iterable[str]) -> None:
+    """Read the manifest again and save it with only this run's changes in it: an entry `entries` has that differs from
+    `base` (what the run started from) is written, one it dropped is removed, and everything else stays as the file
+    has it now. A record this run didn't write is never lost, nor one a concurrent run added meanwhile."""
+    fresh = _read_doc(env)
+    merged = dict(fresh.entries)
+    for key in base.keys() | entries.keys():
+        if entries.get(key) != base.get(key):
+            if key in entries:
+                merged[key] = entries[key]
+            else:
+                merged.pop(key, None)
+    _save_manifest(env, merged, [*fresh.roots, *roots], fresh)
+
+
 def forget(paths: Iterable[Path], env: Mapping[str, str] | None = None) -> None:
     """Drop these paths from the manifest because ws removed them itself."""
     env = os.environ if env is None else env
     entries, roots = _read_manifest(env)
+    base = copy.deepcopy(entries)
     gone = [entries.pop(str(p)) for p in paths if str(p) in entries]
     if gone:
-        _save_manifest(env, entries, roots)
+        _commit(env, base, entries, roots)
 
 
 # ---- writing ---------------------------------------------------------------------------------------------------------
@@ -515,10 +606,13 @@ def apply(
     progress: Callable[[Step, str], None] | None = None,
 ) -> Result:
     """Write what differs and record what ws created. `progress(step, action)` hears each finished step (never on a
-    dry run). If a step fails, what was made so far is still recorded and the first error is the one reported."""
+    dry run). If a step fails, what was made so far is still recorded and the first error is the one reported. The
+    manifest is saved by merging this run's changes into the file as it is then, and while the lock beside a runner's
+    user config is still held when the run changed that config."""
     env = os.environ if env is None else env
     steps = list(steps)
     entries, roots = _read_manifest(env)
+    base = copy.deepcopy(entries)
     managed = {str(r) for r in roots}
     for r in [_ws_home(env), *(s.path for s in steps if s.root)]:
         r = Path(os.path.abspath(r))
@@ -529,57 +623,108 @@ def apply(
     result = Result()
     virtual: set[Path] = set()
     failed = True
+    tidy: list[tuple[Path, dict]] = []  # user configs taken out: tidy their folders once the lock is let go
     try:
-        for step in steps:
-            action = classify(step, entries, virtual)
-            getattr(result, action).append(step.path)
-            if action in ("unchanged", "edited"):
-                if not dry_run and progress:
-                    progress(step, action)
-                continue
-            if step.kind == "merge":
-                if not dry_run:
-                    _record_merge(step, entries, result, env)
+        with contextlib.ExitStack() as locks:
+            held: set[Path] = set()
+            try:
+                for step in steps:
+                    action = classify(step, entries, virtual)
+                    getattr(result, action).append(step.path)
+                    if step.carried:
+                        result.notes.append(
+                            f"the gate stays merged into {step.path} (an earlier install put it there); "
+                            "`ws install --gate launch` is what takes it out"
+                        )
+                    if action in ("unchanged", "edited"):
+                        if not dry_run:
+                            if action == "unchanged":
+                                _refresh_sha(step, entries)
+                            if progress:
+                                progress(step, action)
+                        continue
+                    if step.kind == "merge":
+                        if not dry_run:
+                            _record_merge(step, entries, base, result, env, locks, held, tidy)
+                            if progress:
+                                progress(step, action)
+                        continue
+                    parents = _missing_parents(step.path, virtual)
+                    virtual.update(parents)
+                    if step.kind == "dir":
+                        virtual.add(step.path)
+                    if dry_run:
+                        continue
+                    for d in parents:
+                        d.mkdir()
+                        entries[str(d)] = _dir_entry(d)
+                    if step.kind == "dir":
+                        step.path.mkdir()
+                        entries[str(step.path)] = _dir_entry(step.path)
+                    else:
+                        _record_file(step, action, entries, result)
                     if progress:
                         progress(step, action)
-                continue
-            parents = _missing_parents(step.path, virtual)
-            virtual.update(parents)
-            if step.kind == "dir":
-                virtual.add(step.path)
-            if dry_run:
-                continue
-            for d in parents:
-                d.mkdir()
-                entries[str(d)] = _dir_entry(d)
-            if step.kind == "dir":
-                step.path.mkdir()
-                entries[str(step.path)] = _dir_entry(step.path)
-            else:
-                _record_file(step, action, entries, result)
-            if progress:
-                progress(step, action)
-        failed = False
+                failed = False
+            finally:
+                if not dry_run and (entries or base):
+                    try:
+                        _commit(env, base, entries, managed)
+                    except (OSError, InstallError):
+                        if not failed:
+                            raise
     finally:
-        if not dry_run and entries:
-            try:
-                _save_manifest(env, entries, managed)
-            except OSError:
-                if not failed:
-                    raise
+        for path, entry in tidy:
+            with contextlib.suppress(OSError):
+                userconfig.tidy(path, entry, env)
     return result
 
 
-def _record_merge(step: Step, entries: dict[str, dict], result: Result, env: Mapping[str, str]) -> None:
+def _refresh_sha(step: Step, entries: dict[str, dict]) -> None:
+    """A file whose bytes are exactly what this install would write is ws's own, whatever hash the manifest holds (a
+    copy from another branch, say): record its real hash, so it isn't later taken for an edit."""
+    prior = entries.get(str(step.path))
+    if step.kind != "file" or not prior or prior.get("kind") != "file":
+        return
+    try:
+        disk = step.path.read_bytes()
+    except OSError:
+        return
+    if disk == (step.content or "").encode("utf-8") and prior.get("sha256") != sha256(disk):
+        entries[str(step.path)] = {**prior, "sha256": sha256(disk)}
+
+
+def _record_merge(
+    step: Step,
+    entries: dict[str, dict],
+    base: dict[str, dict],
+    result: Result,
+    env: Mapping[str, str],
+    locks: contextlib.ExitStack,
+    held: set[Path],
+    tidy: list[tuple[Path, dict]],
+) -> None:
     key = str(step.path)
     try:
-        kept, outcome = userconfig.apply(step.merge, entries.get(key), env)
+        if step.path not in held:  # the lock stays until the manifest is saved; the record is read again under it
+            locks.enter_context(userconfig.locked(step.path))
+            held.add(step.path)
+            disk = _read_doc(env).entries.get(key)
+            for table in (entries, base):
+                if disk is None:
+                    table.pop(key, None)
+                else:
+                    table[key] = copy.deepcopy(disk)
+        old = entries.get(key)
+        kept, outcome = userconfig.apply(step.merge, old, env, held=True)
     except WsError as e:
         raise MergeRefused(e.kind, e.message, e.hint) from e
     if kept is None:
         entries.pop(key, None)
+        if old and outcome.action in ("restored", "removed"):
+            tidy.append((step.path, old))
     else:
-        entries[key] = kept
+        entries[key] = {**(old if old and old.get("kind") == userconfig.KIND else {}), **kept}
     if outcome.note:
         result.notes.append(outcome.note)
 
@@ -593,7 +738,8 @@ def _record_file(step: Step, action: str, entries: dict[str, dict], result: Resu
         result.notes.append(f"{step.path} had your edits: ws kept your values and rewrote it")
     data = (step.content or "").encode("utf-8")
     _write_atomic(step.path, data)
-    entries[key] = {"path": key, "kind": "file", "sha256": sha256(data), "created_by_ws": ours}
+    earlier = prior if prior and prior.get("kind") == "file" else {}  # fields a newer ws added stay
+    entries[key] = {**earlier, "path": key, "kind": "file", "sha256": sha256(data), "created_by_ws": ours}
 
 
 # ---- uninstall -------------------------------------------------------------------------------------------------------
@@ -760,7 +906,7 @@ def uninstall(
     if manifest.is_file() and pending:
         if not dry_run:  # a user config that can't be read now keeps its record, so a later uninstall can finish
             try:
-                _save_manifest(env, pending, [])
+                _save_manifest(env, pending, [], _read_doc(env))
             except OSError as e:
                 removal.problems.append(f"could not update {manifest}: {e.strerror}")
     elif manifest.is_file():

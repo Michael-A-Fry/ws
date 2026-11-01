@@ -120,8 +120,9 @@ def test_claude_code_rule_syntax_for_paths_and_tools(home, tmp_path):
     assert deny[:3] == ["Read(//etc/shadow)", "Read(~/x/**)", "Read(.env)"]
     assert deny[-2:] == ["WebFetch", "WebSearch"]
     assert f"Read(/{(home / 'wshome' / 'secrets').resolve()}/**)" in deny  # the toolkit's own secrets folder
+    secret_reads = {f"Read(/{rule})" for rule in policy.secret_read_rules()}  # only the ones this policy adds
     middle = [
-        d for d in deny[3:-2] if not d.startswith(("Edit(**/", "Read("))
+        d for d in deny[3:-2] if not d.startswith("Edit(**/") and d not in secret_reads
     ]  # the project's own config: ws.sandbox PROJECT_LOCKED
     assert all(d.startswith("Edit(//") for d in middle) and len(middle) == 2 * (len(policy.CONTROL_NAMES) + 1)
 

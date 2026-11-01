@@ -5,6 +5,7 @@ Dangerous strings are built at run time from parts (nothing here is ever execute
 from __future__ import annotations
 
 import shlex
+import time
 
 import pytest
 
@@ -1628,6 +1629,72 @@ def test_a_policy_file_in_another_ws_home_denies_that_homes_secrets_folder_too(w
     p = policy.load(other / "policy.toml")
     assert policy.is_denied_read(p, str(other / "secrets" / "key"))
     assert policy.is_denied_read(p, str(wshome / "secrets" / "key"))
+
+
+# --- a glob in a command path: judged segment by segment over the deny_read folder ---------------------------------
+
+
+@pytest.fixture
+def dotws(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    (home / ".ws").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("WS_HOME", str(home / ".ws"))
+    return home
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "cat ~/.ws/secret?/ANTHROPIC_API_KEY",
+        "cat $WS_HOME/se*/GITHUB_TOKEN",
+        "cat ${WS_HOME}/s[a-z]cret[s]/GITHUB_TOKEN",
+        "cat ~/.ss?/config",
+        "cat ~/.s*/id_*",
+        "cat ~/.ws/sec*",
+        "cat ~/.ws/*/key",
+        "cat ~/**/secrets/key",
+        "cat ~/.ws/**/key",
+        "cat /**/home/.ws/secrets/key",
+        "cat ~/.ssh/[a-z]*",
+        "cat ~/.ws/secrets/[unclosed*",
+    ],
+)
+def test_a_glob_that_can_match_a_denied_folder_is_denied(dotws, cmd):
+    assert "deny_read" in (policy.is_denied_command(policy.default_policy(), cmd) or ""), cmd
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "cat ~/.wsx/notes.txt",
+        "cat ~/docs/*.md",
+        "cat ~/.ws/policy.t*",
+        "cat ~/.ws/secretsx/*",
+        "cat ~/.sshx/*",
+        "cat ~/.[x-z]*/config",
+        "cat ~/*.txt",
+    ],
+)
+def test_a_glob_that_cannot_reach_a_denied_folder_is_allowed(dotws, cmd):
+    assert policy.is_denied_command(policy.default_policy(), cmd) is None, cmd
+
+
+# --- a command too long to check ----------------------------------------------------------------------------------
+
+
+def test_a_command_over_the_size_limit_is_denied_quickly_with_a_way_out(pol):
+    big = "echo " + "word " * (1024 * 1024 // 5)  # about 1 MB
+    start = time.monotonic()
+    reason = policy.is_denied_command(pol, big)
+    assert time.monotonic() - start < 1
+    assert reason and "too long to check" in reason and "Write tool" in reason
+
+
+def test_a_command_at_the_size_limit_is_still_judged(pol):
+    ok = "echo " + "x" * (policy.MAX_COMMAND_CHARS - 5)
+    assert len(ok) == policy.MAX_COMMAND_CHARS and policy.is_denied_command(pol, ok) is None
+    assert "too long" in policy.is_denied_command(pol, ok + "x")
 
 
 # --- here-documents: a quoted body written out by `cat` or `tee` is data -------------------------------------------

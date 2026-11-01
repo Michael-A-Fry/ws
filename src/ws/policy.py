@@ -103,6 +103,7 @@ EGRESS_TOOLS = ("web_fetch", "web_search")
 _NAME = re.compile(r"^[A-Za-z0-9_-]+$")
 _HOST = re.compile(r"^(\*\.)?[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?$")
 _MAX_DEPTH = 4
+MAX_COMMAND_CHARS = 64 * 1024  # a longer command takes longer to judge than a runner's hook may run
 
 
 class PolicyError(Exception):
@@ -1316,16 +1317,44 @@ def _rule_root(rule: str) -> str | None:
     return posixpath.normpath("/".join(parts) or "/")
 
 
+def _glob_segment(seg: str) -> re.Pattern | None:
+    """One path segment as a pattern (`*`, `?`, bracket classes), or None when it cannot be read."""
+    try:
+        return _glob_regex_path(seg)
+    except re.error:
+        return None
+
+
+def _segments_reach(glob: list[str], root: list[str]) -> bool:
+    """Can the glob's segments, taken one for one over the root's segments, all match? `**` takes any number of
+    segments (none too). What the glob has after the root does not matter: it is already inside it. A glob that ends
+    above the root names a folder above it, not the root. A segment it cannot read counts as a match (fails closed)."""
+    seen: set[tuple[int, int]] = set()
+
+    def walk(gi: int, ri: int) -> bool:
+        if ri == len(root):
+            return True
+        if gi == len(glob) or (gi, ri) in seen:
+            return False
+        seen.add((gi, ri))
+        g = glob[gi]
+        if g == "**":
+            return walk(gi, ri + 1) or walk(gi + 1, ri) or walk(gi + 1, ri + 1)
+        rx = _glob_segment(g)
+        return (rx is None or rx.match(root[ri]) is not None) and walk(gi + 1, ri + 1)
+
+    return walk(0, 0)
+
+
 def _glob_reaches(policy: Policy, token_abs: str) -> str | None:
-    """Could this glob (`~/.s*/id_rsa`) name something a deny_read rule covers? Tried against the rule's folder and a
-    few names a secrets folder holds."""
-    rx = _glob_regex_path(token_abs)
+    """Could this glob (`~/.s*/id_rsa`, `~/.ws/secret?/KEY`) name something a deny_read rule covers? It does when,
+    segment by segment over the rule's folder, each of the glob's segments can match the rule's."""
+    glob = [g for g in token_abs.split("/") if g]
     for rule in policy.gate.deny_read:
         root = _rule_root(rule)
         if root is None:
             continue
-        samples = [root] + [f"{root}/{x}" for x in ("id_rsa", "id_ed25519", "credentials", "key", "x")]
-        if any(rx.match(s) for s in samples):
+        if _segments_reach(glob, [r for r in root.split("/") if r]):
             return rule
     return None
 
@@ -1765,6 +1794,11 @@ def is_denied_command(
     it cannot judge: callers treat that as a deny. This is the second layer; see the note above."""
     if not isinstance(command, str):
         raise TypeError("command must be text")
+    if len(command) > MAX_COMMAND_CHARS:
+        return (
+            f"the command is {len(command):,} characters, too long to check in time (the limit is "
+            f"{MAX_COMMAND_CHARS:,}); write it to a file with the Write tool and run that file"
+        )
     quote = _open_quote(command)
     if quote:
         return f"the command ends inside an unclosed {quote} quote, so what runs cannot be read; close the quote"

@@ -431,6 +431,71 @@ def test_syntax_check_rejects_a_bad_table(extra, message):
         pol("syntax-check", f"[guards.syntax-check]\n{extra}\n")
 
 
+FAKE_NODE = [sys.executable, "-c", "import sys; sys.exit(1 if 'bad' in open(sys.argv[-1]).read() else 0)"]
+
+
+@pytest.mark.parametrize("ext", ["js", "mjs", "cjs"])
+def test_syntax_check_runs_node_check_on_javascript(tmp_path, monkeypatch, ext):
+    calls = []
+
+    def fake(argv, path):  # the runner: what would be run, and what it says
+        calls.append((argv, path))
+        return ("a problem", None) if "bad" in open(path).read() else (None, None)
+
+    monkeypatch.setattr(syntax_check, "_run", fake)
+    f = tmp_path / f"a.{ext}"
+    f.write_text("const x = bad(;\n")
+    found = judge_file(f)
+    assert found.action == "deny" and found.reason == "a problem"
+    assert calls == [(["node", "--check"], str(f))]
+    f.write_text("const x = 1;\n")
+    assert judge_file(f) is None
+
+
+@pytest.mark.parametrize("ext", ["js", "mjs", "cjs"])
+def test_syntax_check_reports_what_the_javascript_checker_prints(tmp_path, monkeypatch, ext):
+    monkeypatch.setattr(syntax_check, "JS_CHECKER", tuple(FAKE_NODE))
+    f = tmp_path / f"a.{ext}"
+    f.write_text("bad\n")
+    found = judge_file(f)
+    assert found.action == "deny" and "found a problem" in found.reason and str(f) in found.reason
+    f.write_text("fine\n")
+    assert judge_file(f) is None
+
+
+def test_syntax_check_notes_when_node_is_not_installed_and_stays_advice_only(tmp_path, monkeypatch):
+    monkeypatch.setattr(syntax_check.shutil, "which", lambda name: None)
+    f = tmp_path / "a.js"
+    f.write_text("const x = bad(;\n")
+    found = judge_file(f)
+    assert found.action == "note" and "skipped" in found.reason and "node is not installed" in found.reason
+
+
+def test_syntax_check_notes_a_javascript_checker_that_is_slow_or_cannot_run(tmp_path, monkeypatch):
+    f = tmp_path / "a.mjs"
+    f.write_text("x\n")
+    monkeypatch.setattr(syntax_check, "TIMEOUT_S", 0.2)
+    monkeypatch.setattr(syntax_check, "JS_CHECKER", (sys.executable, "-c", "import time; time.sleep(5)"))
+    assert "took more than" in judge_file(f).reason
+    monkeypatch.setattr(syntax_check, "JS_CHECKER", (str(tmp_path / "gone"),))
+    assert judge_file(f).action == "note"
+
+
+def test_syntax_check_leaves_other_javascript_flavours_alone_and_extra_wins(tmp_path, monkeypatch):
+    monkeypatch.setattr(syntax_check, "JS_CHECKER", tuple(FAKE_NODE))
+    (tmp_path / "a.ts").write_text("bad\n")
+    (tmp_path / "a.jsx").write_text("bad\n")
+    assert judge_file(tmp_path / "a.ts") is None and judge_file(tmp_path / "a.jsx") is None
+    f = tmp_path / "a.js"
+    f.write_text("bad\n")
+    assert judge_file(f, extra={"js": [sys.executable, "-c", "pass"]}) is None  # the policy's own checker replaces it
+    assert judge_file(f).action == "deny"
+
+
+def test_syntax_check_does_not_check_a_javascript_file_that_is_missing(tmp_path):
+    assert judge_file(tmp_path / "nope.js") is None
+
+
 # --- session-context ---------------------------------------------------------------------------------------------
 
 

@@ -261,7 +261,7 @@ allow_hosts = []
 allow_write = []
 
 # Guards: small named checks that run beside the rules above. `ws gate generate` writes the runner hooks they need.
-#   syntax-check     after an edit, checks the file by its extension (.py, .json, .toml, .sh) and tells the model the
+#   syntax-check     after an edit, checks the file by its extension (.py, .json, .toml, .sh, .js) and tells the model the
 #                    line that does not parse
 #   session-context  at session start, lists which of the files below exist in the project
 #   bulk-staging     stops `git add -A`, `git add .` and `git commit -a`, so a commit holds only named files

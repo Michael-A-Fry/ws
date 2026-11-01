@@ -229,6 +229,22 @@ def test_import_strips_one_pair_of_surrounding_quotes(home, tmp_path, capsys, qu
     assert wsecrets.Store(home / "secrets").read("anthropic") == VALUE
 
 
+@pytest.mark.parametrize("line", ["KEY={v} # pasted on Monday", 'KEY="{v}"  # quoted', "KEY={v}\t#tab"])
+def test_import_drops_a_trailing_comment(home, tmp_path, capsys, line):
+    registry(home, GOOD)
+    src = envfile(tmp_path, line.format(v=VALUE) + "\n")
+    code, out, err = run(capsys, "secret", "import", "anthropic", "--from-env", str(src))
+    assert code == 0 and VALUE not in out + err
+    assert wsecrets.Store(home / "secrets").read("anthropic") == VALUE
+
+
+def test_import_refuses_text_after_a_closing_quote(home, tmp_path, capsys):
+    registry(home, GOOD)
+    src = envfile(tmp_path, f'KEY="{VALUE}"extra\n')
+    code, out, err = run(capsys, "secret", "import", "anthropic", "--from-env", str(src))
+    assert code != 0 and VALUE not in out + err and "line 1" in out + err
+
+
 def test_import_with_several_lines_needs_var(home, tmp_path, capsys):
     registry(home, GOOD)
     other = "other-" + os.urandom(8).hex()

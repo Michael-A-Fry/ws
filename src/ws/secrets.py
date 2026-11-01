@@ -354,8 +354,14 @@ def _env_value(path: Path, var: str | None) -> str:
         if not m:
             raise SecretsError(f"{path}: line {n} is not VAR=value")
         v = m.group(2).strip()
-        if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
-            v = v[1:-1]
+        if len(v) >= 2 and v[0] in "\"'" and v[0] in v[1:]:
+            q = v.index(v[0], 1)
+            rest = v[q + 1 :].strip()
+            if rest and not rest.startswith("#"):
+                raise SecretsError(f"{path}: line {n} has text after the closing quote")
+            v = v[1:q]
+        elif " #" in v or "\t#" in v:
+            v = re.split(r"\s#", v, maxsplit=1)[0].rstrip()
         found.append((n, m.group(1), v))
     if not found:
         raise SecretsError(f"{path} has no VAR=value line")
@@ -395,6 +401,12 @@ def cmd_import(args: argparse.Namespace) -> int:
             "refused",
             f"the store {store_dir()} belongs to another user",
             f"set it as that user: `{wall_hint('set', args.name)}`",
+        ) from e
+    except OSError as e:
+        raise WsError(
+            "failed",
+            f"{args.name} could not be written to {store_dir()}: {e.strerror or type(e).__name__}",
+            "check the store folder exists and is yours, then run this again",
         ) from e
     removed = False
     if args.delete_source:

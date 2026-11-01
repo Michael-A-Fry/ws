@@ -4,7 +4,7 @@ Every `ws` command and flag. This page is generated from the command parsers, so
 command is for, see [Usage](../usage.md).
 
 ```text
-ws [--json] [-C PATH] [--version] COMMAND ...
+ws [--json] [--no-color] [-C PATH] [--version] COMMAND ...
 ```
 
 ## Global options
@@ -15,6 +15,7 @@ These work on every command, before or after the command name.
 |---|---|
 | `--json` | Print one JSON envelope on standard output. `WS_OUTPUT=json` does the same. |
 | `-C PATH`, `--cwd PATH` | Run as if started in `PATH`. |
+| `--no-color` | Print no colour. A non-empty `NO_COLOR` does the same. |
 | `--version` | Print `ws X.Y.Z` and exit. |
 | `-h`, `--help` | Print help for the command and exit. `ws help COMMAND` does the same. |
 
@@ -71,10 +72,10 @@ A command that speaks a protocol on standard output (`ws mcp serve`, `ws gate ch
 | `WS_OUTPUT` | Set to `json` for `--json` on every command. |
 | `WS_BROKER_SOCKET` | The broker socket a client uses. |
 | `WS_GATED_SESSION` | Set inside a gated session. `ws approve` refuses when it's present. |
-| `NO_COLOR` | Any non-empty value turns colour off in `ws setup`. An empty value is ignored. `ws setup --no-color` does the same. |
+| `NO_COLOR` | Any non-empty value turns colour off in every command. An empty value is ignored. `--no-color` does the same. |
 | `FORCE_COLOR` | Any value except empty, `0` or `false` (any case) keeps colour on when output goes to a pipe or `TERM=dumb`. `NO_COLOR` and `--no-color` win. |
-| `TERM` | `dumb` turns colour off and makes `ws setup` print each step once, with no cursor-move or erase codes. |
-| `COLORFGBG` | Read by `ws setup`. The default is the full brand palette in 256 colours; a light background (`0;15`) switches to darker violet and mark colours and your terminal's own green, yellow and red. |
+| `TERM` | `dumb` turns colour off in every command, and makes `ws setup` print each step once, with no cursor-move or erase codes. |
+| `COLORFGBG` | Read by every command that prints colour. The default is the full brand palette in 256 colours; a light background (`0;15`) switches to darker violet and mark colours and your terminal's own green, yellow and red. |
 | `XDG_STATE_HOME` | Where run folders for jobs with no `cwd` go, under `ws/work`. Default `~/.local/state`. |
 
 ## Commands
@@ -843,6 +844,9 @@ Per runner, every rules, skill, hook and MCP file it will load here, and its ori
 ```text
 ws status [-h]
 ```
+
+A path is listed once per runner. With `--json`, each row has a `folder` key: `true` when the row is a folder (a
+skill folder with no main file), `false` for a file. The text output shows a folder with a trailing `/`.
 
 ## `ws eval`
 

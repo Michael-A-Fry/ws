@@ -313,6 +313,56 @@ def test_help_is_json_per_topic(box, capsys):
     assert code == 0 and out.startswith("usage: ws gate")
 
 
+@pytest.mark.parametrize("kind", sorted(CASES))
+def test_no_color_is_accepted_on_every_command(box, capsys, kind):
+    argv = [a.format(home=box) for a in CASES[kind]]
+    _, out, _ = run(capsys, *argv, "--json", "--no-color")
+    assert envelope(out)["kind"] == kind  # after the command
+    _, out, _ = run(capsys, "--no-color", *argv, "--json")
+    assert envelope(out)["kind"] == kind  # before it
+
+
+def test_no_color_after_dashes_is_the_commands_own(box, capsys):
+    code, out, err = run(capsys, "note", "--", "--no-color")  # a note whose text is "--no-color"
+    assert code == 1 and "no [roles.notes]" in err and out == ""
+
+
+def test_no_color_reaches_an_external_program_as_a_flag_and_as_the_environment(box, capsys, monkeypatch):
+    from ws import extcmd
+
+    prog = box.parent / "bin" / "ws-hello"
+    prog.write_text("#!/bin/sh\nexit 0\n")
+    prog.chmod(0o755)
+    seen = []
+    monkeypatch.setattr(extcmd, "launch", lambda spec: seen.append(spec) or 0)
+    assert cli.main(["hello", "--no-color", "a", "--", "--no-color"]) == 0
+    assert cli.main(["--no-color", "hello", "a"]) == 0
+    assert cli.main(["hello", "a"]) == 0
+    first, second, plain = seen
+    assert first.argv == ["a", "--no-color", "--", "--no-color"] and first.env["NO_COLOR"] == "1"
+    assert second.argv == ["a", "--no-color"] and second.env["NO_COLOR"] == "1"
+    assert plain.argv == ["a"] and "NO_COLOR" not in plain.env
+
+
+def test_no_color_is_a_global_option_in_help(box, capsys):
+    _, out, _ = run(capsys, "help", "--json")
+    assert "--no-color" in envelope(out)["data"]["global_options"]
+    _, out, _ = run(capsys, "help")
+    assert "--no-color" in out
+
+
+def test_no_color_beats_force_color_in_output_and_errors(box, capsys, monkeypatch):
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    _, out, _ = run(capsys, "doctor", "--offline")
+    assert "\x1b[" in out
+    _, out, _ = run(capsys, "doctor", "--offline", "--no-color")
+    assert "\x1b[" not in out
+    _, _, err = run(capsys, "note")
+    assert "\x1b[" in err and err.startswith("ws: ")
+    _, _, err = run(capsys, "--no-color", "note")
+    assert err.splitlines() == ["ws: nothing to note: give some text", "hint: or `-` to read it from stdin"]
+
+
 def test_stdout_is_only_the_envelope_even_if_the_command_prints(box, capsys):
     _, out, _ = run(capsys, "globals", "manifest", "--json")  # prints prose or JSON of its own when not --json
     assert envelope(out)["kind"] == "globals.manifest"

@@ -936,7 +936,13 @@ def commands(group: list[dict]) -> list[str]:
 
 def test_with_no_guards_the_hooks_are_the_old_ones():
     hooks = generate(pol())["hooks"]
-    assert set(hooks) == {"PreToolUse", "SessionStart", "UserPromptSubmit"}
+    assert set(hooks) == {
+        "PreToolUse",
+        "SessionStart",
+        "UserPromptSubmit",
+        "Notification",
+        "Stop",
+    }  # the last two: phone alerts
     assert hooks["PreToolUse"][0]["matcher"] == claude_code.MATCHER
     assert commands(hooks["SessionStart"]) == ["ws session start --runner claude-code || true"]
     assert generate(pol())["env"] == {"WS_GATED_SESSION": "1", "WS_SANDBOXED": "1"}
@@ -949,7 +955,9 @@ def test_the_default_policy_adds_post_tool_use_and_session_start_events():
     assert commands(hooks["PostToolUse"]) == [event]  # no `|| exit`: exit 2 here is a message to the model
     assert commands(hooks["SessionStart"]) == ["ws session start --runner claude-code || true", event + " || true"]
     assert hooks["PostToolUse"][0]["hooks"][0]["timeout"] > 10  # the checkers get 10 seconds
-    assert "SubagentStop" not in hooks and "Stop" not in hooks and "Notification" not in hooks
+    assert "SubagentStop" not in hooks
+    alert = "ws notify alert --runner claude-code || true"
+    assert commands(hooks["Stop"]) == [alert] and commands(hooks["Notification"]) == [alert]
 
 
 def test_each_event_gets_a_hook_only_when_a_guard_runs_there(monkeypatch):
@@ -960,7 +968,7 @@ def test_each_event_gets_a_hook_only_when_a_guard_runs_there(monkeypatch):
     assert hooks["PostToolUse"][0]["matcher"] == "Bash|Agent|Task|Skill"
     assert hooks["PreToolUse"][0]["matcher"] == claude_code.MATCHER + "|Skill|SendMessage"
     assert "gate event" in commands(hooks["SubagentStop"])[0]
-    assert [("gate event" in c) for c in commands(hooks["Stop"])] == [True]
+    assert [("gate event" in c) for c in commands(hooks["Stop"])] == [True, False]  # then the phone alert
     assert [("gate event" in c) for c in commands(hooks["UserPromptSubmit"])] == [False, True]
 
 
@@ -1044,7 +1052,15 @@ def test_preflight_is_skipped_only_for_settings_marked_as_having_no_sandbox_bloc
 def test_every_generated_hook_but_pre_and_post_tool_use_ends_in_true(monkeypatch):
     fake_guard(monkeypatch, "e-all", events=("start", "prompt", "stop", "subagent-stop", "post"), kinds=("command",))
     hooks = generate(pol("e-all"))["hooks"]
-    assert set(hooks) == {"PreToolUse", "PostToolUse", "SessionStart", "UserPromptSubmit", "Stop", "SubagentStop"}
+    assert set(hooks) == {
+        "PreToolUse",
+        "PostToolUse",
+        "SessionStart",
+        "UserPromptSubmit",
+        "Stop",
+        "SubagentStop",
+        "Notification",
+    }
     for name, groups in hooks.items():
         for cmd in commands(groups):
             if name == "PreToolUse":

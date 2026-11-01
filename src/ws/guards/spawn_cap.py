@@ -14,8 +14,12 @@ the session's own, at `$WS_HOME/sessions/ID.spawn-cap.json`, and is advice: the 
 `max_agents` is optional. When the policy gives none, the limit comes from the machine: the smaller of half the CPUs
 and half the memory in GiB, raised to at least 2 and held to at most 8. The CPUs and memory are those the container or
 service is allowed when the cgroup v2 files say so (`cpu.max` quota over period; `memory.max`), else `os.cpu_count()`
-and no memory limit. A file that is missing, says `max` or can't be read counts as no limit. An explicit `max_agents`
-always wins.
+and no memory limit. The files read are those of the session's own cgroup and the ones above it, the tightest limit
+winning: `/proc/self/cgroup` names the cgroup, and `/sys/fs/cgroup` is read under it. Inside a cgroup namespace (a
+container, or a service that has one) that file names the namespace's root, so `/sys/fs/cgroup` itself is the cgroup
+and the limit is the container's or service's; on a host without one, the path in it finds the service's folder. A file
+that is missing, says `max`, holds a number too big to use or can't be read counts as no limit. An explicit
+`max_agents` always wins.
 """
 
 from __future__ import annotations
@@ -34,6 +38,7 @@ KINDS = ("agent",)
 DEFAULT_STALE_S = 1800
 STATE = "spawn-cap"
 CGROUP_DIR = Path("/sys/fs/cgroup")  # cgroup v2 root; tests plant their own
+PROC_CGROUP = Path("/proc/self/cgroup")  # names this process's cgroup under that root
 FLOOR, CEILING = 2, 8
 
 
@@ -64,19 +69,58 @@ def _cgroup_value(cgroup_dir: Path, name: str) -> list[str]:
         return []
 
 
-def default_max_agents(cgroup_dir: Path | None = None, cpu_count: int | None = None) -> int:
+def _whole_number(text: str) -> int | None:
+    """The number in a cgroup file's word, or None when it isn't one this code can use (`max`, junk, a huge value)."""
+    try:
+        return int(text) if text.isdecimal() else None
+    except ValueError:  # more digits than int() will read
+        return None
+
+
+def _hierarchy(root: Path, proc_cgroup: Path) -> list[Path]:
+    """The cgroup folders that bound this process, its own first and `root` last. The cgroup v2 line of
+    `proc_cgroup` (`0::/path`) gives the path under `root`; without one, or when that folder isn't there, only `root`."""
+    try:
+        lines = proc_cgroup.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return [root]
+    rel = next((x[3:] for x in lines if x.startswith("0::")), "").removesuffix(" (deleted)")
+    parts = [x for x in rel.split("/") if x and x != "."]
+    if ".." in parts or not (root.joinpath(*parts)).is_dir():
+        return [root]
+    return [root.joinpath(*parts[:n]) for n in range(len(parts), -1, -1)]
+
+
+def default_max_agents(
+    cgroup_dir: Path | None = None, cpu_count: int | None = None, proc_cgroup: Path | None = None
+) -> int:
     """The limit when the policy gives none: min(CPUs // 2, GiB of memory // 2), at least 2 and at most 8. CPUs are
     the cgroup v2 `cpu.max` quota over its period when one is set, else the machine's; memory is `memory.max` when
-    set, else not a limit."""
+    set, else not a limit. With no `cgroup_dir` the process's own cgroup (and those above it) is found from
+    `proc_cgroup` under /sys/fs/cgroup; a `cgroup_dir` given alone is read as it is."""
     root = CGROUP_DIR if cgroup_dir is None else cgroup_dir
-    cpus = (os.cpu_count() or 1) if cpu_count is None else cpu_count
-    quota = _cgroup_value(root, "cpu.max")
-    if len(quota) == 2 and quota[0].isdecimal() and quota[1].isdecimal() and int(quota[1]) > 0:
-        cpus = min(cpus, int(quota[0]) / int(quota[1]))
+    folders = (
+        _hierarchy(root, PROC_CGROUP if proc_cgroup is None else proc_cgroup)
+        if (cgroup_dir is None or proc_cgroup is not None)
+        else [root]
+    )
+    cpus: float = (os.cpu_count() or 1) if cpu_count is None else cpu_count
+    memory_limit: int | None = None
+    for folder in folders:
+        quota = _cgroup_value(folder, "cpu.max")
+        if len(quota) == 2:
+            top, period = _whole_number(quota[0]), _whole_number(quota[1])
+            if top is not None and period:
+                try:
+                    cpus = min(cpus, top / period)
+                except OverflowError:  # a quota too big to divide is no limit
+                    pass
+        memory = _cgroup_value(folder, "memory.max")
+        if len(memory) == 1 and (m := _whole_number(memory[0])) is not None:
+            memory_limit = m if memory_limit is None else min(memory_limit, m)
     limit = cpus // 2
-    memory = _cgroup_value(root, "memory.max")
-    if len(memory) == 1 and memory[0].isdecimal():
-        limit = min(limit, int(memory[0]) // (2 * 1024**3))
+    if memory_limit is not None:
+        limit = min(limit, memory_limit // (2 * 1024**3))
     return int(max(FLOOR, min(CEILING, limit)))
 
 

@@ -269,7 +269,10 @@ def test_approvals_are_a_control_path(tmp_path):
 
 # --- in the gate -----------------------------------------------------------------------------------------------
 
-ASK = policy.loads('[gate]\nask_commands = ["terraform apply*"]\ndeny_commands = ["rm -* /", "make deploy*"]\n')
+
+def ask_policy():
+    """Built when a test asks (loading a policy reads WS_HOME and the profile, which a test sets)."""
+    return policy.loads('[gate]\nask_commands = ["terraform apply*"]\ndeny_commands = ["rm -* /", "make deploy*"]\n')
 
 
 def payload(command, session="sess-1", cwd="/work"):
@@ -277,40 +280,40 @@ def payload(command, session="sess-1", cwd="/work"):
 
 
 def test_the_gate_asks_then_runs_the_same_call_once(root):
-    first = gate.check("claude-code", payload("terraform apply -auto-approve"), ASK, approval_root=root)
+    first = gate.check("claude-code", payload("terraform apply -auto-approve"), ask_policy(), approval_root=root)
     assert first and "ws approve" in first
     bound = Bound("claude-code", "command", "terraform apply -auto-approve", "/work", "sess-1")
     approvals.grant(root, bound.digest()[:12])
-    assert gate.check("claude-code", payload("terraform apply -auto-approve"), ASK, approval_root=root) is None
-    assert gate.check("claude-code", payload("terraform apply -auto-approve"), ASK, approval_root=root)
+    assert gate.check("claude-code", payload("terraform apply -auto-approve"), ask_policy(), approval_root=root) is None
+    assert gate.check("claude-code", payload("terraform apply -auto-approve"), ask_policy(), approval_root=root)
 
 
 def test_the_gate_binds_the_session_and_folder(root):
-    gate.check("claude-code", payload("terraform apply"), ASK, approval_root=root)
+    gate.check("claude-code", payload("terraform apply"), ask_policy(), approval_root=root)
     approvals.grant(root, Bound("claude-code", "command", "terraform apply", "/work", "sess-1").digest()[:12])
-    assert gate.check("claude-code", payload("terraform apply", session="other"), ASK, approval_root=root)
-    assert gate.check("claude-code", payload("terraform apply", cwd="/elsewhere"), ASK, approval_root=root)
-    assert gate.check("claude-code", payload("terraform apply"), ASK, approval_root=root) is None
+    assert gate.check("claude-code", payload("terraform apply", session="other"), ask_policy(), approval_root=root)
+    assert gate.check("claude-code", payload("terraform apply", cwd="/elsewhere"), ask_policy(), approval_root=root)
+    assert gate.check("claude-code", payload("terraform apply"), ask_policy(), approval_root=root) is None
 
 
 def test_a_hidden_ask_inside_a_compound_command_still_asks(root):
-    assert gate.check("claude-code", payload("echo hi && bash -c 'terraform apply'"), ASK, approval_root=root)
+    assert gate.check("claude-code", payload("echo hi && bash -c 'terraform apply'"), ask_policy(), approval_root=root)
 
 
 def test_a_command_that_is_not_asked_about_runs_and_leaves_no_record(root):
-    assert gate.check("claude-code", payload("terraform plan"), ASK, approval_root=root) is None
+    assert gate.check("claude-code", payload("terraform plan"), ask_policy(), approval_root=root) is None
     assert not root.exists()
 
 
 def test_a_denied_command_is_never_offered_for_approval(root):
-    why = gate.check("claude-code", payload("make deploy"), ASK, approval_root=root)
+    why = gate.check("claude-code", payload("make deploy"), ask_policy(), approval_root=root)
     assert why and "deny_commands" in why and not root.exists()
     # a rule on the toolkit's secrets folder comes first for this one (a delete from / reaches it): still a deny
-    assert gate.check("claude-code", payload("rm -rf /"), ASK, approval_root=root) and not root.exists()
+    assert gate.check("claude-code", payload("rm -rf /"), ask_policy(), approval_root=root) and not root.exists()
 
 
 def test_without_an_approvals_folder_an_ask_is_a_deny():
-    assert "approval" in gate.check("claude-code", payload("terraform apply"), ASK)
+    assert "approval" in gate.check("claude-code", payload("terraform apply"), ask_policy())
 
 
 def test_ask_commands_and_allow_hosts_load_and_validate():

@@ -894,12 +894,14 @@ def test_wrappers_are_stripped_in_any_order(pol):
         assert policy.is_denied_command(pol, cmd), cmd
 
 
-def test_the_account_home_by_name_and_by_path_is_home(pol):
-    """`~name` and the real home path are the same place as `~` (uses this account, not the fixture's HOME)."""
+def test_the_account_home_by_name_and_by_path_is_home(pol, monkeypatch):
+    """`~name` and the real home path are the same place as `~` (the account's own home, which HOME names here)."""
     import getpass
-    from pathlib import Path
+    import pwd
 
-    me, where = getpass.getuser(), str(Path.home())
+    me = getpass.getuser()
+    where = pwd.getpwnam(me).pw_dir
+    monkeypatch.setenv("HOME", where)
     assert policy.is_denied_command(pol, f"cat ~{me}/.ssh/id_rsa")
     assert policy.is_denied_command(pol, rm("-rf", where))
 

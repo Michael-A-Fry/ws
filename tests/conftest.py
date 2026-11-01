@@ -36,6 +36,17 @@ def _no_real_config():
 
 
 @pytest.fixture(autouse=True)
+def _own_home(tmp_path):
+    """HOME and WS_HOME start under the test's `tmp_path`, so code that reads either (a policy reads the profile for
+    the secrets folder) never sees the machine's own. A test that needs another sets it; its own monkeypatch wins."""
+    mp = pytest.MonkeyPatch()
+    mp.setenv("HOME", str(tmp_path / "autohome"))
+    mp.setenv("WS_HOME", str(tmp_path / "autohome" / ".ws"))
+    yield
+    mp.undo()
+
+
+@pytest.fixture(autouse=True)
 def _interpreter_is_stable():
     mp = pytest.MonkeyPatch()
     mp.setattr(userconfig, "require_stable_interpreter", lambda cmd: None)

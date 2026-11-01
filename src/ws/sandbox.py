@@ -1312,15 +1312,16 @@ def report_run(
     lines.append("  Read these before you run git, a runner or a build here. ws removed nothing.")
     print("\n".join(lines), file=sys.stderr)
     try:
+        now = time.time()  # one clock read feeds both `ts` and the legacy `at`
         record = {
-            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
             "project": project,
             "runner": runner,
             "incomplete": stopped,
             "findings": findings,
             "notes": notes,
         }
-        jsonl.append(home / "logs" / "wall-report.jsonl", jsonl.stamped(record, WALL_REPORT_SCHEMA))
+        jsonl.append(home / "logs" / "wall-report.jsonl", jsonl.stamped(record, WALL_REPORT_SCHEMA, now))
     except OSError:
         pass  # the stderr lines are the report; a log that cannot be written is not worth failing the run for
     return findings

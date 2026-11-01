@@ -37,13 +37,19 @@ def user_unit_dir(env) -> Path:
 
 def is_foreign(env, name: str, marker: str) -> bool:
     """True when the user manager's folder already holds a unit called `name` that ws did not write: a regular file whose
-    first line isn't `marker`, or a link that doesn't lead into ws's own `jobs/units/` folder. A name nothing holds is
-    not foreign; nor is a link ws made (dangling or not)."""
+    first line isn't `marker`, or a link that leads anywhere but a unit of ws's own. A link is ws's when its target, with
+    every link resolved, sits in this `$WS_HOME`'s `jobs/units/` (so a moved or linked home still matches), or is a
+    `ws-*` unit in some `jobs/units/` folder (a link made from a home that has since moved). A name nothing holds is not
+    foreign; nor is a link ws made, dangling or not."""
     path = user_unit_dir(env) / name
     try:
         if path.is_symlink():
-            target = Path(os.path.abspath(path.parent / os.readlink(path)))
-            return not target.is_relative_to(units_dir(env))
+            target = Path(os.path.realpath(path))
+            if target.is_relative_to(os.path.realpath(units_dir(env))):
+                return False
+            return not (
+                target.name.startswith("ws-") and target.parent.name == "units" and target.parent.parent.name == "jobs"
+            )
         if not path.exists():
             return False
         with path.open(encoding="utf-8", errors="replace") as f:

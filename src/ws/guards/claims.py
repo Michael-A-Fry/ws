@@ -215,7 +215,8 @@ def _log(cfg: Config, ctx) -> Finding | None:
     if not claims:
         return None
     budget = Budget()
-    stamp = datetime.fromtimestamp(ctx.now(), UTC).isoformat(timespec="seconds")
+    now = ctx.now()  # one clock read feeds both `ts` and the legacy `at`
+    stamp = datetime.fromtimestamp(now, UTC).isoformat(timespec="seconds")
     rec = {
         "at": stamp,
         "runner": ctx.runner,
@@ -226,7 +227,7 @@ def _log(cfg: Config, ctx) -> Finding | None:
     try:
         jsonl.append(
             (ctx.home if ctx.home is not None else ws_home()) / "logs" / LOG,
-            jsonl.stamped(rec, SCHEMA_VERSION, ctx.now()),
+            jsonl.stamped(rec, SCHEMA_VERSION, now),
         )
     except OSError as e:
         return Finding("warn", f"claims could not write {LOG} ({type(e).__name__})")

@@ -9,8 +9,11 @@ list.
 - Every line of a JSON-lines log carries `schema`, a whole number that's one per log, and `ts`, the time the line was
   written: RFC 3339, UTC, with a `Z` (`2026-11-02T01:02:03.456Z`). A line with no `schema` is schema 1.
 - `at` is the older spelling of `ts`. The logs that used it (`gate-calls`, `claims`, `wall-report`) write both for one
-  release, with the same moment in each. Read a line with `ws.jsonl.when(rec)`: it takes `ts`, then `at`.
+  release. One clock read feeds both, so they're the same moment: `at` to the second, `ts` to the millisecond.
+  Read a line with `ws.jsonl.when(rec)`: it takes `ts`, then `at`.
 - Within one schema number a log only gains fields. A change that removes or reshapes a field takes a new number.
+- `ws.jsonl` refuses a line that has no whole-number `schema` or no `ts` (the run record's own time key is
+  `started_at`), so a writer that forgets the stamp fails its tests.
 - Every log is written through `ws.jsonl`: one `write()` under a lock (`name.lock` beside the log), a text field cut
   at 16 KiB and marked, files private to the owner (0600 in a 0700 folder), no write through a symlink.
 - A log rotates when the next line would take it past 5 MiB: the live file becomes `name.jsonl.1`, the older ones shift
@@ -52,7 +55,7 @@ One JSON file per record, written to a temporary name and renamed into place (06
 | Record | Path under `$WS_HOME` | Writer | Fields | Schema | Time key | Kept |
 |---|---|---|---|---|---|---|
 | Session | `sessions/<id>.json` | `src/ws/session.py` | `schema`, `ts`, `session_id`, `release`, `started_at`, `runner`, `cwd` | 1 | `ts` | Removed 30 days after its last change |
-| Approval, pending and granted | `approvals/pending/<id>.json`, `approvals/granted/<id>.json` | `src/ws/approvals.py` | `schema`, `v`, `ts`, `id`, `bound`, `created`, `granted` | 1 | `ts` | Expires 10 minutes after it's made; a granted one is deleted when it's used |
+| Approval, pending and granted | `approvals/pending/<id>.json`, `approvals/granted/<id>.json` | `src/ws/approvals.py` | `schema`, `v`, `ts`, `id`, `bound`, `created`, `granted` | 1 | `ts` (when the file was written) | Expires 10 minutes after it's made; a granted one is deleted when it's used |
 | Seen versions | `versions.json` | `src/ws/canary.py` | `schema`, `runners`, `default_model` | 1 | none | Rewritten when a passing canary sees a change |
 
 `v` in an approval is the older spelling of `schema`, kept for one release. `created` and `granted` are Unix seconds.

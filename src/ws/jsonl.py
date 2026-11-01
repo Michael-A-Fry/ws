@@ -58,6 +58,20 @@ def stamped(rec: dict, schema: int, epoch: float | None = None) -> dict:
     return {"schema": schema, "ts": iso_utc(time.time() if epoch is None else epoch), **rec}
 
 
+def check_stamp(rec: Any, time_keys: tuple[str, ...] = ("ts",)) -> None:
+    """Raise ValueError unless `rec` is an object with a whole-number `schema` and a text value under one of `time_keys`
+    (`ts`; a log whose schema fixes its own time keys, like the run record, names them). Every line a ws log takes
+    passes this first, so a writer that forgets the stamp fails its own tests."""
+    ok = (
+        isinstance(rec, dict)
+        and isinstance(rec.get("schema"), int)
+        and not isinstance(rec.get("schema"), bool)
+        and any(isinstance(rec.get(k), str) and rec[k] for k in time_keys)
+    )
+    if not ok:
+        raise ValueError(f"a log line needs an integer schema and a {' or '.join(time_keys)} (see jsonl.stamped)")
+
+
 def when(rec: dict) -> str | None:
     """When a line was written: its `ts`, else the legacy `at` of a line written before `ts` existed. None if neither is
     text. A line with no `schema` is schema 1."""
@@ -287,11 +301,15 @@ def append(
     side_dir: Path | None = None,
     keep_if: Callable[[dict], bool] | None = None,
     lock_timeout_s: float | None = None,
+    time_keys: tuple[str, ...] = ("ts",),
 ) -> None:
-    """Add one record: cap its fields, take the exclusive lock, rotate if it would overflow, write the line.
+    """Add one record: check its stamp, cap its fields, take the exclusive lock, rotate if it would overflow, write the
+    line.
 
-    A line bigger than `max_bytes` still goes in, alone. Raises `LockTimeout` if the lock stays held, and `OSError`
-    if the log or the lock file is a symlink or cannot be written."""
+    The record needs an integer `schema` and a `ts` (or one of `time_keys`): `check_stamp`. A line bigger than
+    `max_bytes` still goes in, alone. Raises `LockTimeout` if the lock stays held, and `OSError` if the log or the lock
+    file is a symlink or cannot be written."""
+    check_stamp(rec, time_keys)
     path = Path(path)
     limit = DEFAULT_MAX_BYTES if max_bytes is None else max_bytes
     line = _encode(rec, field_cap)
@@ -308,8 +326,10 @@ def append(
         _write_line(path, line)
 
 
-def append_plain(path: Path, rec: Any, field_cap: int | None = None) -> None:
-    """Add one record to a single file with no lock and no rotation: the fallback when the locked log is unusable."""
+def append_plain(path: Path, rec: Any, field_cap: int | None = None, time_keys: tuple[str, ...] = ("ts",)) -> None:
+    """Add one record to a single file with no lock and no rotation: the fallback when the locked log is unusable. The
+    same stamp check as `append`."""
+    check_stamp(rec, time_keys)
     path = Path(path)
     line = _encode(rec, field_cap)
     _make_dir(path.parent)

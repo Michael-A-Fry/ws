@@ -94,10 +94,11 @@ def judge(call, cfg, ctx) -> Finding | None:
     if ctx.memo.get(NAME):
         return None  # one line per hook run, however many calls the payload held: replay reads the payload back whole
     ctx.memo[NAME] = True
-    stamp = datetime.fromtimestamp(ctx.now(), UTC).isoformat(timespec="seconds")
+    now = ctx.now()  # one clock read feeds both `ts` and the legacy `at`
+    stamp = datetime.fromtimestamp(now, UTC).isoformat(timespec="seconds")
     try:
         rec = {"at": stamp, "runner": ctx.runner, "payload": redact(ctx.payload)}  # `at` is legacy; `ts` is the key
-        jsonl.append(log_path(ctx.home), jsonl.stamped(rec, SCHEMA_VERSION, ctx.now()))
+        jsonl.append(log_path(ctx.home), jsonl.stamped(rec, SCHEMA_VERSION, now))
     except OSError as e:  # recording is a convenience: a log that cannot be written never stops the call
         return Finding("warn", f"record-calls could not write {LOG} ({type(e).__name__})")
     return None

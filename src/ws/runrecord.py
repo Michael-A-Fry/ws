@@ -23,6 +23,7 @@ from ws.profile import ws_home
 from ws.runschema import SCHEMA
 
 SCHEMA_VERSION = 2
+RUN_TIME_KEYS = ("started_at",)  # the run-record schema allows no `ts`; the start time is its stamp
 KEYS = (
     "schema",
     "run_id",
@@ -129,11 +130,11 @@ def append(path: Path, rec: dict, **limits) -> Path:
     if missing:
         raise ValueError(f"run record is missing {', '.join(missing)}")
     try:
-        jsonl.append(path, rec, keep_if=_this_month, **limits)
+        jsonl.append(path, rec, keep_if=_this_month, time_keys=RUN_TIME_KEYS, **limits)
     except OSError as e:
         fallback = fallback_path(path)
         try:
-            jsonl.append_plain(fallback, rec, limits.get("field_cap"))
+            jsonl.append_plain(fallback, rec, limits.get("field_cap"), RUN_TIME_KEYS)
         except OSError:
             raise e from None
         return fallback

@@ -47,9 +47,10 @@ def test_the_first_try_is_refused_with_an_id_and_a_pending_record(root):
     assert rec["ts"] == jsonl.iso_utc(NOW) and rec["created"] == NOW
 
 
-def test_a_record_with_an_out_of_range_time_still_gets_written():
-    rec = approvals._record(CALL, 1e30)
-    assert rec["ts"] is None and rec["created"] == 1e30
+def test_a_granted_record_is_stamped_with_the_time_of_the_grant():
+    rec = approvals._record(CALL, NOW, NOW + 30)
+    assert rec["ts"] == jsonl.iso_utc(NOW + 30) and rec["created"] == NOW and rec["granted"] == NOW + 30
+    assert approvals._record(CALL, NOW)["ts"] == jsonl.iso_utc(NOW)
 
 
 def test_a_refused_call_stays_refused_until_a_person_grants_it(root):

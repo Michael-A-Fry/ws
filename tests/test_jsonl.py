@@ -18,7 +18,7 @@ SMALL = {"max_bytes": 200, "keep": 3}
 
 
 def rec(i: int, pad: int = 0) -> dict:
-    return {"i": i, "pad": "x" * pad}
+    return {"schema": 1, "ts": "t", "i": i, "pad": "x" * pad}
 
 
 def ids(path, **kw) -> list[int]:
@@ -27,7 +27,7 @@ def ids(path, **kw) -> list[int]:
 
 def test_a_long_string_is_cut_with_a_marker_and_its_original_length(tmp_path):
     p = tmp_path / "a.jsonl"
-    jsonl.append(p, {"i": 1, "text": "y" * 100, "nested": {"list": ["z" * 100, 5, None]}}, field_cap=10)
+    jsonl.append(p, rec(1) | {"text": "y" * 100, "nested": {"list": ["z" * 100, 5, None]}}, field_cap=10)
     (r,) = jsonl.read(p)
     assert r["text"] == "y" * 10 + "[truncated: 100 chars]"
     assert r["nested"]["list"] == ["z" * 10 + "[truncated: 100 chars]", 5, None]
@@ -41,7 +41,7 @@ def test_a_string_at_the_cap_and_the_keys_are_left_alone(tmp_path):
 
 def test_the_default_cap_is_16_kib(tmp_path):
     p = tmp_path / "a.jsonl"
-    jsonl.append(p, {"text": "q" * 20000})
+    jsonl.append(p, rec(1) | {"text": "q" * 20000})
     (r,) = jsonl.read(p)
     assert r["text"].startswith("q" * 16384) and r["text"].endswith("[truncated: 20000 chars]")
 
@@ -70,7 +70,7 @@ def test_only_keep_old_files_are_kept_and_the_oldest_records_go(tmp_path):
 def test_a_file_with_a_protected_record_is_kept_past_the_limit(tmp_path):
     p = tmp_path / "a.jsonl"
     keep_if = lambda r: r.get("keep") is True
-    jsonl.append(p, {"i": 0, "keep": True, "pad": "x" * 40}, keep_if=keep_if, **SMALL)
+    jsonl.append(p, rec(0, 40) | {"keep": True}, keep_if=keep_if, **SMALL)
     for i in range(1, 40):
         jsonl.append(p, rec(i, 40), keep_if=keep_if, **SMALL)
     assert 0 in ids(p), "the protected record was dropped"
@@ -192,7 +192,7 @@ def test_two_processes_appending_through_rotation_lose_nothing(tmp_path):
         "import sys\nfrom pathlib import Path\nfrom ws import jsonl\n"
         "base = int(sys.argv[2])\n"
         "for i in range(40):\n"
-        "    jsonl.append(Path(sys.argv[1]), {'i': base + i, 'pad': 'x' * 30}, max_bytes=400, keep=1000)\n"
+        "    jsonl.append(Path(sys.argv[1]), {'schema': 1, 'ts': 't', 'i': base + i, 'pad': 'x' * 30}, max_bytes=400, keep=1000)\n"
     )
     env = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)}
     procs = [subprocess.Popen([sys.executable, "-c", code, str(p), str(b)], env=env) for b in (0, 1000, 2000)]
@@ -264,3 +264,24 @@ def test_when_takes_ts_then_the_legacy_at_and_nothing_else():
     assert jsonl.when({"at": "b"}) == "b"
     assert jsonl.when({"ts": 5, "at": ""}) is None
     assert jsonl.when({"t": "c"}) is None
+
+
+def test_a_line_without_a_schema_or_a_ts_is_refused_before_anything_is_written(tmp_path):
+    p = tmp_path / "x.jsonl"
+    for bad in (
+        {"i": 1},
+        {"schema": 1},
+        {"ts": "t"},
+        {"schema": "1", "ts": "t"},
+        {"schema": True, "ts": "t"},
+        {"schema": 1, "ts": ""},
+        [1],
+    ):
+        with pytest.raises(ValueError, match="schema"):
+            jsonl.append(p, bad)
+        with pytest.raises(ValueError, match="schema"):
+            jsonl.append_plain(p, bad)
+    assert not p.exists()
+    jsonl.append(p, {"schema": 1, "started_at": "t"}, time_keys=("started_at",))  # a log with its own time key
+    with pytest.raises(ValueError):
+        jsonl.append(p, {"schema": 1, "ts": "t"}, time_keys=("started_at",))

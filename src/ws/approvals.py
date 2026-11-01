@@ -133,14 +133,10 @@ def _write(path: Path, record: dict) -> None:
 
 
 def _record(bound: Bound, created: float, granted: float | None = None) -> dict:
-    try:
-        ts = jsonl.iso_utc(created)
-    except (OverflowError, OSError, ValueError):  # a `created` out of range in an edited record: the grant still writes
-        ts = None
     rec = {
         "v": 1,  # legacy spelling of `schema`, kept for one release
         "schema": SCHEMA_VERSION,
-        "ts": ts,
+        "ts": jsonl.iso_utc(created if granted is None else granted),  # when this file was written
         "id": bound.digest(),
         "bound": bound.__dict__.copy(),
         "created": created,

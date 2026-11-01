@@ -148,6 +148,45 @@ def test_every_module_that_writes_a_jsonl_file_is_listed_in_stores_md():
             assert name in rows or name.endswith(".old"), f"{module} names {name}, which stores.md doesn't list"
 
 
+# The modules known to write a log through ws.jsonl. If the scan stops finding one, it has gone blind.
+KNOWN_WRITERS = {
+    "src/ws/rating.py",
+    "src/ws/runrecord.py",
+    "src/ws/sandbox.py",
+    "src/ws/guards/claims.py",
+    "src/ws/eval.py",
+    "src/ws/canary.py",
+    "src/ws/guards/record_calls.py",
+}
+
+
+def test_the_scan_finds_every_known_writer():
+    missing = KNOWN_WRITERS - set(modules_that_write())
+    assert not missing, f"the scan no longer sees {sorted(missing)}"
+
+
+def test_ws_jsonl_is_imported_only_as_plain_jsonl_so_the_scan_can_see_the_calls():
+    """`from ws import jsonl` is the one spelling the scan reads. `from ws.jsonl import append`, `import ws.jsonl`, a
+    relative import or any `as` alias would let a writer slip past it."""
+    bad = []
+    for path in sorted(SRC.rglob("*.py")):
+        if path.name == "jsonl.py" and path.parent == SRC:
+            continue
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            where = f"{path.relative_to(ROOT).as_posix()}:{node.lineno}" if hasattr(node, "lineno") else ""
+            if isinstance(node, ast.ImportFrom):
+                mod = node.module or ""
+                if mod.split(".")[-1] == "jsonl" or (
+                    mod in {"ws", ""} and any(a.name == "jsonl" and a.asname for a in node.names)
+                ):
+                    bad.append(where)
+                elif node.level and any(a.name == "jsonl" for a in node.names):
+                    bad.append(where)  # `from . import jsonl`
+            elif isinstance(node, ast.Import) and any(a.name.split(".")[-1] == "jsonl" for a in node.names):
+                bad.append(where)
+    assert not bad, f"import ws.jsonl as `from ws import jsonl`, with no alias: {bad}"
+
+
 def test_each_listed_writer_module_exists_and_each_log_is_named_in_its_writer():
     for name, row in listed().items():
         mods = writer_modules(row)

@@ -8,6 +8,14 @@ body of the GitHub release.
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-11-02
+
+### Fixed
+
+- The gate no longer blocks a `[ -f path ]` test inside `bash -c` when a dash later in the path reads as a backwards
+  glob range; a `[` that does not open a valid class is matched as itself.
+- syntax-check checks a `.sh` file with bash when its first line asks for bash.
+
 ## [0.1.3] - 2026-11-01
 
 ### Fixed

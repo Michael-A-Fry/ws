@@ -53,7 +53,9 @@ _PLUGIN_NAME = "plugins/ws-gate.js"
 _HOOK_SUFFIX = " || exit 2"
 _MISSING = object()
 _LOCK_WAIT = 10.0  # seconds to wait for another ws that holds the lock beside the config
-_WS_HOOK = re.compile(r"\b(gate (check|event)|session (start|nudge))\b.*--runner\b")  # every hook command ws writes
+_WS_HOOK = re.compile(
+    r"\b(gate (check|event)|session (start|nudge)|notify alert)\b.*--runner\b"
+)  # every hook command ws writes
 
 
 @dataclass(frozen=True)
@@ -569,7 +571,7 @@ def _is_ws_group(group) -> bool:
 
 def earlier_items(doc: dict, m: Merge) -> list:
     """The items an earlier ws left in the file when its record is lost, as ops. A hook is ws's when its command runs
-    `gate check`, `gate event` or `session start|nudge` with `--runner`: that holds for a command from an older ws or
+    `gate check`, `gate event`, `session start|nudge` or `notify alert` with `--runner`: that holds for a command from an older ws or
     another Python too, so it is swapped in place. With such a hook in the file (or OpenCode's plugin beside it), the
     deny rules and env keys that equal what ws wants now are ws's too. None found means ws was never here."""
     found: list = []

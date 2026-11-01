@@ -125,23 +125,30 @@ Descriptions, docs and messages say what a thing does.
 
 Carried from phase T:
 
-- [ ] `ws broker serve` resolves its socket like the clients do (#35)
-- [ ] `ws secret import NAME --from-env PATH`: one store format, the value never shown (#35)
-- [ ] `ws eval report` lists trials that errored before a run apart from the metrics (#36)
-- [ ] The orphan-kill test in `test_run.py` waits on a signal, not the clock (#36)
-- [ ] Lab: the runner restarts after the jitconfig write; the host cycle on a timer
-- [ ] Exit arm weekly on the scheduler (the first job on the new schedule grammar)
+- [x] `ws broker serve` resolves its socket like the clients do (#35)
+- [x] `ws secret import NAME --from-env PATH`: one store format for both tools (#35)
+- [x] `ws eval report` lists trials that errored before a run apart from the metrics (#36)
+- [x] The orphan-kill test in `test_run.py` waits on a signal, not the clock (#36)
+- [x] Lab: the runner restarts after the jitconfig write (#38); the host cycle runs every 15 minutes when a lab run
+  is queued
+- [ ] Exit arm weekly on the scheduler: phase 7, with the schedule grammar
 
 Step 1, gate and skills (harvest gaps):
 
 - [ ] Hook kinds: claim check on messages and at Stop, test-file protection, skill-gated files with an override,
   a cap on concurrent subagents, a staging rule (`git add -A`, `git add .`, `git commit -a`), a syntax check after
   each write, the saved-state note at session start, Notification and Stop alerts through the notify role
-- [ ] A replay tool: recorded tool-call payloads through the gate hook
-- [ ] Skills `resume` and `ship`
+- [x] Guard framework, PostToolUse/Stop/Notification events, `ws gate event`, call recording (paths and hashes for
+  writes), bulk-staging, syntax-check and session-context guards (#41)
+- [x] A replay tool: recorded tool-call payloads through the gate hook (`ws gate replay`, #41)
+- [x] Skills `resume` and `ship`; `ws skills adopt|restore` swaps a person's same-named skill (#39)
 - [ ] Apply the gate to every Claude Code session (merge into the user settings, manifest, residue-free undo), next to
   the person's own hooks
-- [ ] External subcommands (`ws <x>` runs `ws-<x>` on PATH) and an optional fallback for unknown words
+- [x] External subcommands (`ws <x>` runs `ws-<x>` on PATH) and an optional fallback for unknown words;
+  install.sh moves a different `ws` aside (#40)
+- [x] `ws notify alert`: session alerts to the phone on their own daily cap (#42)
+
+Moved to phase 7 (DECISIONS 195: phase 6 builds and cuts over gate and skills only; the old timers stay on):
 
 Step 2, timers:
 
@@ -162,6 +169,13 @@ Cut-over (each step only when `ws doctor` is green for it):
 - [ ] Timers switched; old units disabled, kept 30 days; rollback re-enable tested once
 - [ ] Mail switched on
 - [ ] Pass test: old units disabled 30 days with nothing broken; a rollback re-enable tested
+
+Known gate limits (found in review of #41; the sandbox is the wall behind the matcher):
+
+- [ ] `xargs git add`, `git config alias.x '!git add -A'`, and `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` files that
+  define an alias pass the bulk-staging guard
+- [ ] False deny: an apostrophe in nested double quotes inside `$(...)` inside double quotes reads as an unclosed quote
+- [ ] OpenCode copies of the new guards: phase 7
 
 Adopted ideas (neutral wording): one automatic recovery per known failure, recorded, then escalate; green levels
 (targeted, package, full, merge-ready) on hand-backs and run records with a known-flakes list; the pinpoint format

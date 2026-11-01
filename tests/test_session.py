@@ -44,6 +44,7 @@ def test_start_records_the_session_privately(home, monkeypatch, capsys):
     assert rec["release"].endswith("+r1")
     assert (rec["runner"], rec["cwd"]) == ("claude-code", "/work/here")
     assert rec["started_at"]
+    assert rec["schema"] == 1 and rec["ts"].endswith("Z")
     path = home / "wshome" / "sessions" / "abc-123.json"
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
 

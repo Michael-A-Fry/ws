@@ -354,6 +354,7 @@ def test_stop_logs_the_claims_in_the_last_message_and_stops_nothing(repo, home):
     lines = (home / "wshome" / "logs" / "claims.jsonl").read_text().splitlines()
     rec = json.loads(lines[-1])
     assert rec["session"] == "s1" and rec["ref"] == "origin/main" and rec["at"].startswith("1970-01-01")
+    assert (rec["schema"], rec["ts"]) == (1, "1970-01-01T00:00:00.000Z")
     assert [(c["word"], c["commit"], c["on_ref"]) for c in rec["claims"]] == [
         ("merged into main", on, True),
         ("pushed to main", off, False),

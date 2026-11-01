@@ -24,6 +24,7 @@ from ws.roles import FAIL, OK, WARN, _schedule
 
 ROLE, NAME = "scheduler", "systemd"
 PREFIX = "ws-"
+MARKER = "# Written by ws"  # first line of every unit ws writes: the proof a unit in the user folder is its own
 
 
 def _quote(word: str, expand: bool = False) -> str:
@@ -53,12 +54,12 @@ def render(job: Scheduled, env, ws_cmd: list[str]) -> dict[str, str]:
         lines.append(f"Environment={_quote('PATH=' + path)}")
     exec_start = " ".join(_quote(w, expand=True) for w in [*ws_cmd, *job.argv])
     service = (
-        "# Written by ws from the job file's schedule; `ws schedule apply` rewrites it.\n"
+        f"{MARKER} from the job file's schedule; `ws schedule apply` rewrites it.\n"
         f"[Unit]\nDescription=ws job {job.name}\n\n"
         f"[Service]\nType=oneshot\n{chr(10).join(lines)}\nExecStart={exec_start}\n"
     )
     timer = (
-        "# Written by ws from the job file's schedule; `ws schedule apply` rewrites it.\n"
+        f"{MARKER} from the job file's schedule; `ws schedule apply` rewrites it.\n"
         f"[Unit]\nDescription=ws job {job.name} ({job.when})\n\n"
         f"[Timer]\nOnCalendar={on_calendar(job.when)}\nPersistent=true\n"
         f"Unit={unit}.service\n\n[Install]\nWantedBy=timers.target\n"
@@ -123,16 +124,31 @@ def steps(cfg, answers, env):
     return out
 
 
+def _skip_foreign(env, files: list[Path]) -> tuple[set[str], list[str]]:
+    """(the file names to leave out, what to say) for any job whose unit name the user folder already holds for a unit
+    ws didn't write. Both files of such a job are left out."""
+    clash = sorted({p.stem for p in files if _schedule.is_foreign(env, p.name, MARKER)})
+    left_out = {p.name for p in files if p.stem in clash}
+    said = [
+        f"{stem}.service or {stem}.timer already exists in {_schedule.user_unit_dir(env)} and isn't ws's, "
+        f"so ws skipped job {stem.removeprefix(PREFIX)}: rename that unit or the job"
+        for stem in clash
+    ]
+    return left_out, said
+
+
 def activate(env, runner=None) -> list[str]:
     """Link the unit files of the jobs that still have a schedule into the user manager, reload it and enable the
-    timers. Returns what went wrong."""
+    timers. A name the user folder already holds for a unit ws didn't write is left alone, its job is skipped and the
+    answer says so. Returns what went wrong."""
     runner = runner or _schedule.run_cmd
     keep = _want(env)
     files = sorted(keep)
+    left_out, problems = _skip_foreign(env, files)
+    files = [p for p in files if p.name not in left_out]
     timers = [p for p in files if p.suffix == ".timer"]
     if not files:
-        return []
-    problems = []
+        return problems
     for argv in (
         ["systemctl", "--user", "link", *map(str, files)],
         ["systemctl", "--user", "daemon-reload"],
@@ -146,19 +162,19 @@ def activate(env, runner=None) -> list[str]:
 
 
 def deactivate(names: list[str], env, runner=None) -> list[str]:
-    """Stop and unlink the timers of these jobs, then reload. Returns what went wrong."""
+    """Stop and unlink the timers of these jobs, then reload. A unit of that name that ws didn't write is left alone and
+    named in the answer. Returns what went wrong."""
     if not names:
         return []
     runner = runner or _schedule.run_cmd
-    problems = []
+    units = [f"{PREFIX}{n}{ext}" for n in names for ext in (".timer", ".service")]
+    foreign = [u for u in units if _schedule.is_foreign(env, u, MARKER)]
+    problems = [f"{u} in {_schedule.user_unit_dir(env)} isn't ws's, so ws left it alone" for u in foreign]
+    units = [u for u in units if u not in foreign]
+    if not units:
+        return problems
     for argv in (
-        [
-            "systemctl",
-            "--user",
-            "disable",
-            "--now",
-            *(f"{PREFIX}{n}{ext}" for n in names for ext in (".timer", ".service")),
-        ],
+        ["systemctl", "--user", "disable", "--now", *units],
         ["systemctl", "--user", "daemon-reload"],
     ):
         code, out = runner(argv)

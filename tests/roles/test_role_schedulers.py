@@ -220,6 +220,96 @@ def test_systemd_activate_with_no_units_runs_nothing(box, env):
     assert systemd.activate(env, fake) == [] and fake.calls == []
 
 
+def _user_dir(box):
+    d = box / ".config" / "systemd" / "user"
+    d.mkdir(parents=True)
+    return d
+
+
+def test_systemd_activate_links_nothing_over_a_unit_it_did_not_write(box, write_job, env):
+    write_job("daily", AI_JOB)
+    write_job("weekly", BACKUP_JOB)
+    install.apply(systemd.steps({}, install.Answers(), env), env)
+    user = _user_dir(box)
+    (user / "ws-daily.timer").write_text("[Timer]\nOnCalendar=hourly\n", encoding="utf-8")  # someone else's, no marker
+    fake, units = Fake(), box / ".ws" / "jobs" / "units"
+    problems = systemd.activate(env, fake)
+    assert len(problems) == 1 and "ws-daily" in problems[0] and "isn't ws's" in problems[0]
+    assert fake.calls[0] == [
+        "systemctl",
+        "--user",
+        "link",
+        str(units / "ws-weekly.service"),
+        str(units / "ws-weekly.timer"),
+    ]
+    assert fake.calls[2][-1] == "ws-weekly.timer"
+    assert (user / "ws-daily.timer").read_text(encoding="utf-8") == "[Timer]\nOnCalendar=hourly\n"
+
+
+def test_systemd_activate_runs_nothing_when_every_job_clashes(box, write_job, env):
+    write_job("daily", AI_JOB)
+    install.apply(systemd.steps({}, install.Answers(), env), env)
+    (_user_dir(box) / "ws-daily.service").symlink_to(box / "elsewhere.service")  # a link into some other place
+    fake = Fake()
+    assert len(systemd.activate(env, fake)) == 1 and fake.calls == []
+
+
+def test_systemd_activate_accepts_its_own_link_and_a_file_with_its_marker(box, write_job, env):
+    write_job("daily", AI_JOB)
+    install.apply(systemd.steps({}, install.Answers(), env), env)
+    units, user = box / ".ws" / "jobs" / "units", _user_dir(box)
+    (user / "ws-daily.service").symlink_to(units / "ws-daily.service")
+    (user / "ws-daily.timer").write_text(f"{systemd.MARKER} from before\n[Timer]\n", encoding="utf-8")
+    fake = Fake()
+    assert systemd.activate(env, fake) == [] and len(fake.calls) == 3
+
+
+def test_a_link_through_a_symlinked_ws_home_is_still_ws_s_own(box, write_job, env):
+    write_job("daily", AI_JOB)
+    install.apply(systemd.steps({}, install.Answers(), env), env)
+    via_link = box / "ws-link"
+    via_link.symlink_to(box / ".ws")
+    user = _user_dir(box)
+    # the user manager holds the link by one spelling of the folder; ws now reaches it by the other
+    (user / "ws-daily.service").symlink_to(via_link / "jobs" / "units" / "ws-daily.service")
+    (user / "ws-daily.timer").symlink_to(box / ".ws" / "jobs" / "units" / "ws-daily.timer")
+    for e in (env, {**env, "WS_HOME": str(via_link)}):
+        assert not _schedule.is_foreign(e, "ws-daily.service", systemd.MARKER)
+        assert not _schedule.is_foreign(e, "ws-daily.timer", systemd.MARKER)
+
+
+def test_a_link_into_a_ws_units_folder_of_a_home_that_moved_is_still_ws_s_own(box, env):
+    user = _user_dir(box)
+    old = box / "old-home" / "jobs" / "units"  # the home the link was made from; nothing is there now
+    (user / "ws-daily.timer").symlink_to(old / "ws-daily.timer")
+    assert not _schedule.is_foreign(env, "ws-daily.timer", systemd.MARKER)
+    (user / "ws-weekly.timer").symlink_to(old / "evil.timer")  # not a ws-* unit
+    (user / "ws-monthly.timer").symlink_to(box / "elsewhere" / "units" / "ws-monthly.timer")  # not under jobs/
+    (user / "ws-hourly.timer").symlink_to(box / "ws-hourly.timer")
+    for name in ("ws-weekly.timer", "ws-monthly.timer", "ws-hourly.timer"):
+        assert _schedule.is_foreign(env, name, systemd.MARKER)
+
+
+def test_systemd_deactivate_leaves_a_unit_it_did_not_write_alone(box, env):
+    user = _user_dir(box)
+    (user / "ws-a.service").write_text("[Service]\n", encoding="utf-8")
+    fake = Fake()
+    problems = systemd.deactivate(["a", "b"], env, fake)
+    assert len(problems) == 1 and "ws-a.service" in problems[0]
+    assert fake.calls[0] == ["systemctl", "--user", "disable", "--now", "ws-a.timer", "ws-b.timer", "ws-b.service"]
+    fake = Fake()
+    assert len(systemd.deactivate(["a"], env, fake)) == 1 and fake.calls[0][3:] == ["--now", "ws-a.timer"]
+
+
+def test_the_user_unit_folder_follows_an_absolute_xdg_config_home(box):
+    default = box / ".config" / "systemd" / "user"
+    assert _schedule.user_unit_dir({"HOME": str(box)}) == default
+    assert (
+        _schedule.user_unit_dir({"HOME": str(box), "XDG_CONFIG_HOME": str(box / "c")}) == box / "c" / "systemd" / "user"
+    )
+    assert _schedule.user_unit_dir({"HOME": str(box), "XDG_CONFIG_HOME": "rel"}) == default
+
+
 def test_systemd_deactivate_argv(env):
     fake = Fake()
     assert systemd.deactivate(["a", "b"], env, fake) == []

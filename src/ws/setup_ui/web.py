@@ -4,7 +4,9 @@ Bound to 127.0.0.1 on a random port, no CDN, no external fonts. The address carr
 memory and sends back in an `X-Ws-Token` header on every call, so a page from another site cannot drive it; every
 request also needs the right Host, and a POST needs a matching Origin. Nothing is written until Install, which calls
 `ws.install.apply` here on the server. The server closes after Install, after "Close", or after ten idle minutes.
-The colours come from `ws.brand`, and the page's one script and one stylesheet carry a nonce made for each response.
+The server, the stylesheet's base and the mark are the shared `ws.ui` package; this module holds the setup page's own
+rules, its script and the steps behind its three calls. The colours come from `ws.brand`, and the page's one script and
+one stylesheet carry a nonce made for each response.
 """
 
 from __future__ import annotations
@@ -12,35 +14,24 @@ from __future__ import annotations
 import html
 import json
 import os
-import secrets
 import shutil
 import tempfile
 import threading
-import time
 import webbrowser
 from dataclasses import replace
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from functools import partial
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
 
 from ws import __version__, brand, install
 from ws.setup_ui import flow
+from ws.ui import components, css
+from ws.ui.server import IDLE_SECONDS, BadRequest, LoopbackServer, csp  # noqa: F401 - csp stays importable from here
 
-IDLE_SECONDS = 600
-MAX_BODY = 64 * 1024
 MAX_ROWS = 400  # rows of the file list sent to the page
 
-# The colours come from `ws.brand`; the rules below name them as `var(--role)` and hold no colour of their own.
-STYLE = """
-*{box-sizing:border-box}
-body{margin:0;background:radial-gradient(900px 280px at 6% -60px,var(--glow),transparent 70%) no-repeat,
-var(--bg);color:var(--text);font:15px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
-min-height:100vh}
-code,.mono,input[type=text]{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
-button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
-svg{display:block;flex:none}
-:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-.wrap{max-width:1200px;margin:0 auto;padding:0 28px}
+# The colours come from `ws.brand`; the rules below name them as `var(--role)` and hold no colour of their own. The
+# base rules and the panel are the shared ones in `ws.ui.css`; they sit here in the order they have always had.
+_STYLE_A = """
 .top{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;padding-top:18px;padding-bottom:14px}
 .logo{margin:0;font:700 9px/9px ui-monospace,SFMono-Regular,Menlo,Consolas,"DejaVu Sans Mono",monospace;
 white-space:pre;letter-spacing:0}
@@ -67,12 +58,8 @@ margin:0 0 10px;font-size:13px;color:var(--muted);font-weight:500}
 .hero{display:flex;flex-direction:column;gap:6px;margin:10px 0 26px}
 .hero .logo{font-size:15px;line-height:15px}
 .hero b{font-size:18px;font-weight:650;margin-top:14px}.hero small{color:var(--muted);font-size:14px}
-.panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;margin:0 0 24px;overflow:hidden}
-.panel h2{display:flex;justify-content:space-between;align-items:center;margin:0;padding:12px 18px;font-size:14px;
-font-weight:600;border-bottom:1px solid var(--line)}
-.panel h2 span{color:var(--muted);font-weight:400;font-size:13px}
-.panel h2 span.mint{color:var(--ok);font-size:15px;font-weight:650}
-.panel ul{list-style:none;margin:0;padding:4px 0 6px}
+"""
+_STYLE_B = """
 .core li{display:grid;grid-template-columns:20px 150px 1fr;align-items:center;gap:0 12px;padding:6px 18px 6px 20px}
 .core li svg{color:var(--ok)}.core li b{font-weight:550}.core li span{color:var(--muted);font-size:14px}
 .rowsr{display:grid;grid-template-columns:90px 1fr;gap:6px 14px;padding:14px 18px;margin:0}
@@ -161,14 +148,9 @@ animation:turn .7s linear infinite}
 .bar .wrap{padding-top:10px;padding-bottom:10px}.logo{font-size:6px;line-height:6px}.hero .logo{font-size:9px;line-height:9px}
 .prog li{grid-template-columns:22px 1fr}.prog li span{grid-column:2}}
 """
+STYLE = _STYLE_A.strip("\n") + "\n" + css.PANEL + _STYLE_B.strip("\n") + "\n"
 
-
-def _mark_css() -> str:
-    """One class per row of the mark, each naming the role it takes its colour from (a darker ramp in light mode)."""
-    return "\n".join(f".logo .r{i}{{color:var(--{role})}}" for i, role in enumerate(brand.GRADIENT_ROLES))
-
-
-CSS = brand.css() + "\n" + STYLE.strip("\n") + "\n" + _mark_css()
+CSS = css.stylesheet(STYLE)
 
 JS = """
 const B = JSON.parse(document.getElementById('boot').textContent);
@@ -382,12 +364,6 @@ label(); draw();
 """
 
 
-def _mark() -> str:
-    """The pixel mark as text: one class per row, coloured by the stylesheet."""
-    rows = "\n".join(f'<i class="r{i}">{row}</i>' for i, row in enumerate(brand.LOGO))
-    return f'<pre class="logo" role="img" aria-label="ws">{rows}</pre>'
-
-
 def _boot(facts: flow.Facts, c: flow.Choices) -> str:
     """Everything the page needs, from the real machine, as JSON (escaped so it cannot close the script tag)."""
     env = facts.env
@@ -431,17 +407,6 @@ def _boot(facts: flow.Facts, c: flow.Choices) -> str:
     return json.dumps(data).replace("<", "\\u003c")
 
 
-def csp(nonce: str | None = None) -> str:
-    """The Content-Security-Policy for a response. The page gets a per-response nonce for its one script and one
-    stylesheet (no `unsafe-inline`); everything else (JSON, text) is allowed nothing."""
-    if nonce is None:
-        return "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
-    return (
-        f"default-src 'none'; style-src 'nonce-{nonce}'; script-src 'nonce-{nonce}'; connect-src 'self'; "
-        "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
-    )
-
-
 def render_page(facts: flow.Facts, c: flow.Choices, nonce: str = "") -> str:
     """The whole page as one string. The page builds its steps from the JSON with `textContent`, never with markup.
     `nonce` goes on the script and the stylesheet; it must be the one in this response's `csp`."""
@@ -451,147 +416,40 @@ def render_page(facts: flow.Facts, c: flow.Choices, nonce: str = "") -> str:
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="referrer" content="no-referrer"><title>ws setup</title><style{attr}>{CSS}</style></head>
 <body>
-<header class="wrap top">{_mark()}
+<header class="wrap top">{components.mark()}
 <ol class="steps" id="steps" aria-label="Setup steps"></ol>
 <button type="button" class="ghost" id="theme">Light</button></header>
 <div class="wrap layout"><main id="main" tabindex="-1"></main><aside class="rail" id="rail" aria-label="Status"></aside></div>
 <div class="bar"><div class="wrap"><span id="count"></span>
 <span class="acts"><button type="button" class="ghost" id="back" hidden>Back</button>
 <button type="button" class="go" id="next">Begin</button></span></div></div>
-<template id="mark">{_mark()}</template>
+<template id="mark">{components.mark()}</template>
 <script type="application/json" id="boot">{_boot(facts, c)}</script>
 <script{attr}>{JS}</script>
 </body></html>"""
 
 
-class SetupServer:
+class SetupServer(LoopbackServer):
     """A one-shot local server. `serve()` returns the install result, or None if it closed idle or on Close."""
 
     def __init__(
         self, facts: flow.Facts, choices: flow.Choices, *, token: str | None = None, idle_seconds: float = IDLE_SECONDS
     ):
         self.facts, self.choices = facts, choices
-        self.token = token or secrets.token_urlsafe(16)
-        self.idle_seconds = idle_seconds
-        self.result: dict | None = None
-        self._last = time.monotonic()
-        self._done = threading.Event()
         self._lock = threading.Lock()
-        owner = self
-
-        class Handler(BaseHTTPRequestHandler):
-            server_version = "ws-setup"
-
-            def log_message(self, *args):  # quiet: the terminal belongs to the person
-                pass
-
-            # -- checks
-            def _host_ok(self) -> bool:
-                host = (self.headers.get("Host") or "").lower()
-                return host in (f"127.0.0.1:{owner.port}", f"localhost:{owner.port}")
-
-            def _origin_ok(self) -> bool:
-                origin = (self.headers.get("Origin") or "").lower()
-                return origin in (f"http://127.0.0.1:{owner.port}", f"http://localhost:{owner.port}")
-
-            def _send(self, code: int, body: bytes, kind: str, nonce: str | None = None) -> None:
-                self.send_response(code)
-                self.send_header("Content-Type", f"{kind}; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.send_header("Cache-Control", "no-store")
-                self.send_header("Referrer-Policy", "no-referrer")
-                self.send_header("X-Content-Type-Options", "nosniff")
-                self.send_header("X-Frame-Options", "DENY")
-                self.send_header("Content-Security-Policy", csp(nonce))
-                self.end_headers()
-                self.wfile.write(body)
-
-            def _json(self, code: int, doc: dict) -> None:
-                self._send(code, json.dumps(doc).encode(), "application/json")
-
-            def _same(self, a: str, b: str) -> bool:
-                """Constant-time compare on bytes: a header with a non-ASCII character is a no, never a traceback."""
-                try:
-                    return secrets.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
-                except (UnicodeError, TypeError):
-                    return False
-
-            def _fail_500(self) -> None:
-                try:
-                    self._json(
-                        500,
-                        {"error": "Something went wrong inside ws setup. Run `ws doctor` to see where things stand."},
-                    )
-                except OSError:  # the connection is already gone: nothing more to do, and no traceback on the terminal
-                    return
-
-            # -- routes
-            def do_GET(self):
-                try:
-                    self._get()
-                except Exception:  # noqa: BLE001 - a handler never raises: the person gets a plain 500, not a traceback
-                    self._fail_500()
-
-            def do_POST(self):
-                try:
-                    self._post()
-                except Exception:  # noqa: BLE001 - a handler never raises: the person gets a plain 500, not a traceback
-                    self._fail_500()
-
-            def _get(self):
-                q = parse_qs(urlsplit(self.path).query)
-                if not self._host_ok() or not self._same((q.get("t") or [""])[0], owner.token):
-                    return self._send(
-                        403, b"This page needs the link that ws setup printed. Open that link again.", "text/plain"
-                    )
-                owner._last = time.monotonic()  # only a request that proves it has the token keeps the page alive
-                if urlsplit(self.path).path != "/":
-                    return self._send(404, b"not found", "text/plain")
-                nonce = secrets.token_urlsafe(16)  # new for every response
-                page = render_page(owner.facts, owner.choices, nonce).encode()
-                owner.forget_launcher()  # the token has been used once: the file that carried it goes
-                self._send(200, page, "text/html", nonce)
-
-            def _post(self):
-                header = self.headers.get("X-Ws-Token") or ""
-                if not (self._host_ok() and self._origin_ok() and self._same(header, owner.token)):
-                    return self._send(403, b"forbidden", "text/plain")
-                owner._last = time.monotonic()
-                if not (self.headers.get("Content-Type") or "").startswith("application/json"):
-                    return self._send(415, b"send JSON", "text/plain")
-                path = urlsplit(self.path).path
-                if path not in ("/api/preview", "/api/install", "/api/finish"):
-                    return self._send(404, b"not found", "text/plain")
-                try:
-                    n = int(self.headers.get("Content-Length") or 0)
-                    if not 0 <= n <= MAX_BODY:
-                        raise ValueError
-                    data = json.loads(self.rfile.read(n) or b"{}")
-                    if not isinstance(data, dict):
-                        raise TypeError
-                    picks, notes, cap = data.get("plugins", []), data.get("notes"), data.get("cap")
-                    if not isinstance(picks, list) or not all(isinstance(m, str) for m in picks) or len(picks) > 50:
-                        raise ValueError
-                    if notes is not None and not isinstance(notes, str):
-                        raise ValueError
-                    if cap is not None and (isinstance(cap, bool) or not isinstance(cap, (str, int, float))):
-                        raise ValueError
-                except (ValueError, TypeError):
-                    return self._send(400, b"bad request", "text/plain")
-                if path == "/api/finish":
-                    owner.result = {"headline": "0 changes", "groups": [], "notes": [], "next": []}
-                    self._json(200, {"ok": True})
-                    owner._done.set()
-                    return
-                self._json(*owner.handle(path, picks, notes, cap))
-
-        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.httpd.daemon_threads = True
-        self.port = self.httpd.server_address[1]
-
-    @property
-    def url(self) -> str:
-        return f"http://127.0.0.1:{self.port}/?t={self.token}"
+        super().__init__(
+            {"/": self._page},
+            {
+                "/api/preview": partial(self._call, "/api/preview"),
+                "/api/install": partial(self._call, "/api/install"),
+                "/api/finish": self._finish,
+            },
+            token=token,
+            idle_seconds=idle_seconds,
+            server_version="ws-setup",
+            denied="This page needs the link that ws setup printed. Open that link again.",
+            failed="Something went wrong inside ws setup. Run `ws doctor` to see where things stand.",
+        )
 
     launcher: Path | None = None  # the local file that redirects the browser here; gone after the first load
 
@@ -599,6 +457,32 @@ class SetupServer:
         if self.launcher is not None:
             shutil.rmtree(self.launcher.parent, ignore_errors=True)
             self.launcher = None
+
+    def _page(self, nonce: str) -> str:
+        page = render_page(self.facts, self.choices, nonce)
+        self.forget_launcher()  # the token has been used once: the file that carried it goes
+        return page
+
+    @staticmethod
+    def _fields(data: dict) -> tuple[list[str], str | None, object]:
+        """What the page sent, checked for shape. Anything else is a 400 `bad request`."""
+        picks, notes, cap = data.get("plugins", []), data.get("notes"), data.get("cap")
+        if not isinstance(picks, list) or not all(isinstance(m, str) for m in picks) or len(picks) > 50:
+            raise BadRequest
+        if notes is not None and not isinstance(notes, str):
+            raise BadRequest
+        if cap is not None and (isinstance(cap, bool) or not isinstance(cap, (str, int, float))):
+            raise BadRequest
+        return picks, notes, cap
+
+    def _call(self, path: str, data: dict) -> tuple[int, dict]:
+        picks, notes, cap = self._fields(data)
+        return self.handle(path, picks, notes, cap)
+
+    def _finish(self, data: dict) -> tuple[int, dict, bool]:
+        self._fields(data)
+        self.result = {"headline": "0 changes", "groups": [], "notes": [], "next": []}
+        return 200, {"ok": True}, True
 
     def _choices(self, picks: list[str], notes: str | None, cap) -> flow.Choices:
         """What the page sent, on top of the starting choices. Nothing is trimmed but spaces; a control character or a
@@ -656,22 +540,6 @@ class SetupServer:
             self.result = doc
             self._done.set()
             return 200, doc
-
-    def serve(self) -> dict | None:
-        self.httpd.timeout = 0.2
-        try:
-            while not self._done.is_set():
-                self.httpd.handle_request()
-                if time.monotonic() - self._last > self.idle_seconds:
-                    break
-            if self._done.is_set():
-                time.sleep(0.4)  # let the reply reach the page before the socket goes
-        finally:
-            self.httpd.server_close()
-        return self.result
-
-    def close(self) -> None:
-        self._done.set()
 
 
 def _launcher(url: str) -> Path:

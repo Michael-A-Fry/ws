@@ -268,7 +268,7 @@ allow_write = []
 #   record-calls     appends each tool call to $WS_HOME/logs/gate-calls.jsonl, for `ws gate replay`
 #   test-weakening   before a test file is written, denies a skip marker added to an existing test
 #   claims           checks a commit named beside merged, pushed or on main against a ref
-#   spawn-cap        denies a subagent start at max_agents running (set [guards.spawn-cap] max_agents)
+#   spawn-cap        denies a subagent start at max_agents running (default from the machine's CPUs and memory)
 #   skill-gate       a write to chosen paths waits for a skill ([[guards.skill-gate]] skill, paths)
 [guards]
 on = ["syntax-check", "session-context"]
@@ -277,7 +277,7 @@ on = ["syntax-check", "session-context"]
 # [guards.session-context]
 # files = [".claude-state/STATE.md"]
 # [guards.spawn-cap]
-# max_agents = 4
+# max_agents = 4   # optional: left out, half the CPUs or half the GiB of memory, whichever is less (2 to 8)
 
 # Rule of Two, leg C (a way out): besides a source's outward acts and the web tools above, the SHELL counts as a way
 # out while any of curl, wget, nc, ssh, scp, python -c ... is not in deny_commands. To close it, deny the lot

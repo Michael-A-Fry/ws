@@ -321,11 +321,75 @@ def _known(verdict: dict[str, bool], session_id: str) -> bool | None:
     return verdict.get(session_id) if session_id else None
 
 
-def _finish_asks(env: Env, loaded: Loaded, verdict: dict[str, bool]) -> list[Ask]:
+TMUX_TARGET = re.compile(r"^([^:.\s]+):([^.\s]+)(?:\.(\S+))?$")  # session:window[.pane]
+TMUX_TIMEOUT_S = 5.0
+
+
+def _tmux_target(text: str) -> tuple[str, str, str] | None:
+    """(session, window, pane) of a tmux target like `ws:2`, `ws:@45` or `ws:@1.%1`; None for anything else."""
+    m = TMUX_TARGET.match(text.strip())
+    return (m.group(1), m.group(2), m.group(3) or "") if m else None
+
+
+def _window_ids(env: Env) -> dict[tuple[str, str], str]:
+    """{(tmux session, window index): window id} from `tmux list-windows`, read once. A window index changes when
+    windows are moved, so it is only used to find the one window that has it now; no tmux, or any failure, is {}."""
+    if "tmux_windows" not in env.cache:
+        found: dict[tuple[str, str], str] = {}
+        try:
+            code, out = env.run(
+                ["tmux", "list-windows", "-a", "-F", "#{session_name}:#{window_index} #{window_id}"], TMUX_TIMEOUT_S
+            )
+        except (OSError, TimeoutError):
+            code, out = 1, ""
+        for line in out.splitlines() if code == 0 else ():
+            where, _, wid = line.strip().partition(" ")
+            t = _tmux_target(where)
+            if t and wid:
+                found[(t[0], t[1])] = wid
+        env.cache["tmux_windows"] = found
+    return env.cache["tmux_windows"]
+
+
+def _place(env: Env, ask: Ask, sessions: list[Session]) -> bool | None:
+    """The opaque verdict on an ask that names no session id, from the one live Claude Code session in its tmux pane or
+    window: that session's own verdict (claude_code saw its folder, so it may vouch). None when the ask names no
+    target, nothing matches, or more than one session does (it stays opaque by the usual rules). When the ask and the
+    session both carry a name they must agree: a window number can have moved since the ask was written."""
+    want = _tmux_target(ask.tmux)
+    if want is None:
+        return None
+    sess, win, pane = want
+    if not pane and win.isdigit():
+        wid = _window_ids(env).get((sess, win))
+        win = wid or win
+    hits = []
+    for s in sessions:
+        if s.state == "ended" or "claude_code" not in s.source.split("+"):
+            continue
+        have = _tmux_target(s.tmux)
+        if have is None or have[0] != sess:
+            continue
+        if (pane and have[2] == pane) or (not pane and have[1] == win):
+            hits.append(s)
+    if len(hits) != 1:
+        return None
+    hit = hits[0]
+    if not hit.opaque and ask.session_name and hit.name and ask.session_name != hit.name:
+        return None
+    return hit.opaque
+
+
+def _finish_asks(env: Env, loaded: Loaded, verdict: dict[str, bool], sessions: list[Session]) -> list[Ask]:
     seen: dict[tuple[str, str], Ask] = {}
     for a in loaded.by_kind.get("asks", []):
         seen.setdefault((a.source, a.id), a)
-    out = [records.seal(a, records.is_opaque(a, env.cfg.roots, _known(verdict, a.session_id))) for a in seen.values()]
+    out = []
+    for a in seen.values():
+        known = _known(verdict, a.session_id)
+        if known is None:
+            known = _place(env, a, sessions)
+        out.append(records.seal(a, records.is_opaque(a, env.cfg.roots, known)))
     return sorted(out, key=lambda a: (a.created is None, a.created or ""))
 
 
@@ -350,7 +414,7 @@ def snapshot(env: Env | None = None) -> Snapshot:
         ts=jsonl.iso_utc(env.now),
         host=env.host,
         lead=next((s for s in sessions if s.lead), None),
-        asks=tuple(_finish_asks(env, loaded, verdict)),
+        asks=tuple(_finish_asks(env, loaded, verdict, sessions)),
         sessions=tuple(sessions),
         plugins=tuple(loaded.by_kind["plugins"]),
         evals=tuple(loaded.by_kind["evals"]),
@@ -374,8 +438,8 @@ def asks(env: Env | None = None) -> list[Ask]:
     """What is waiting for the person, oldest first."""
     env = env or Env.make()
     loaded = _load(env, {"asks", "sessions"})
-    _, verdict = _finish_sessions(env, loaded)
-    return _finish_asks(env, loaded, verdict)
+    sessions, verdict = _finish_sessions(env, loaded)
+    return _finish_asks(env, loaded, verdict, sessions)
 
 
 def plugins(env: Env | None = None) -> list[Plugin]:

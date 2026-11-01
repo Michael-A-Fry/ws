@@ -63,6 +63,8 @@ class Box:
         if run is None:
 
             def run(argv, timeout_s):
+                if argv[0] == "tmux":  # an ask's window number is looked up through tmux; no tmux server here
+                    return 1, ""
                 assert argv[:3] == ["claude", "agents", "--json"] and timeout_s > 0
                 return 0, json.dumps(agents if agents is not None else [])
 

@@ -1,12 +1,12 @@
 # Stores
 
-Every log and record file ws writes: where it is, which module writes it, what a line holds, its `schema` and how long
+Every log and record file ws writes: where it's kept, which module writes it, what a line holds, its `schema` and how long
 it lives. `tests/test_stores.py` fails when a module under `src/ws` writes a JSON-lines file that this page doesn't
 list.
 
 ## One convention
 
-- Every line of a JSON-lines log carries `schema`, a whole number that is one per log, and `ts`, the time the line was
+- Every line of a JSON-lines log carries `schema`, a whole number that's one per log, and `ts`, the time the line was
   written: RFC 3339, UTC, with a `Z` (`2026-11-02T01:02:03.456Z`). A line with no `schema` is schema 1.
 - `at` is the older spelling of `ts`. The logs that used it (`gate-calls`, `claims`, `wall-report`) write both for one
   release, with the same moment in each. Read a line with `ws.jsonl.when(rec)`: it takes `ts`, then `at`.
@@ -15,7 +15,7 @@ list.
   at 16 KiB and marked, files private to the owner (0600 in a 0700 folder), no write through a symlink.
 - A log rotates when the next line would take it past 5 MiB: the live file becomes `name.jsonl.1`, the older ones shift
   up, and the newest two old files stay. A reader spans the live file and every old one.
-- A day's file is not a thing in ws: each log is one live file. Where a reader needs a day, it cuts on the UTC date of
+- A log has no day files: each is one live file. Where a reader needs a day, it cuts on the UTC date of
   `ts`.
 
 ## JSON-lines logs
@@ -37,7 +37,7 @@ Notes:
 
 - Run records keep `started_at` and `ended_at`. The run-record schema lists its keys and allows no others, so a `ts`
   there is the next schema number.
-- The broker audit log predates the convention. It is the one log that doesn't go through `ws.jsonl`, and it has no
+- The broker audit log predates the convention. It's the one log that doesn't go through `ws.jsonl`, and it has no
   `schema`. Its time key is `t`. A change to it takes a schema number of its own.
 - Ratings sit at the top of `$WS_HOME` and not in `logs/`. The top holds the control files a session may not write,
   and the person's verdicts sit with them, so an agent can't mark its own work. `logs/` is where a session may be able
@@ -52,8 +52,8 @@ One JSON file per record, written to a temporary name and renamed into place (06
 | Record | Path under `$WS_HOME` | Writer | Fields | Schema | Time key | Kept |
 |---|---|---|---|---|---|---|
 | Session | `sessions/<id>.json` | `src/ws/session.py` | `schema`, `ts`, `session_id`, `release`, `started_at`, `runner`, `cwd` | 1 | `ts` | Removed 30 days after its last change |
-| Approval, pending and granted | `approvals/pending/<id>.json`, `approvals/granted/<id>.json` | `src/ws/approvals.py` | `schema`, `v`, `ts`, `id`, `bound`, `created`, `granted` | 1 | `ts` | Expires 10 minutes after it is made; a granted one is deleted when it is used |
-| Seen versions | `logs/versions.json` | `src/ws/canary.py` | `schema`, `runners`, `default_model` | 1 | none | Rewritten when a passing canary sees a change |
+| Approval, pending and granted | `approvals/pending/<id>.json`, `approvals/granted/<id>.json` | `src/ws/approvals.py` | `schema`, `v`, `ts`, `id`, `bound`, `created`, `granted` | 1 | `ts` | Expires 10 minutes after it's made; a granted one is deleted when it's used |
+| Seen versions | `versions.json` | `src/ws/canary.py` | `schema`, `runners`, `default_model` | 1 | none | Rewritten when a passing canary sees a change |
 
 `v` in an approval is the older spelling of `schema`, kept for one release. `created` and `granted` are Unix seconds.
 

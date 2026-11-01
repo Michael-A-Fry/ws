@@ -7,6 +7,8 @@ model without starting again.
 ws is a small command-line toolkit. The core is Python 3.11 or newer and the standard library only. It runs on macOS and
 Linux. On Windows it runs inside WSL2.
 
+![ws setup in a terminal: the ws mark, what it found on the machine, then a card per step, ending in what it installed](docs/assets/ws-setup.gif)
+
 ## Install
 
 Run the installer. It checks the machine, installs the `ws` command with uv or pipx, and runs a smoke test.
@@ -39,6 +41,8 @@ the roles you set up (runner, model, budget, secrets, memory, notes, scheduler, 
 | `unconfigured` | You haven't set this up yet. This is normal on a new install. |
 | `fail` | Something is wrong. Read the `fix:` line. |
 
+![ws doctor after setup: one line per check with its ID, status and a fix line for each one not yet set up](docs/assets/ws-doctor.png)
+
 Doctor exits with 1 while anything needs doing, so a new install exits with 1. Run `ws init` to answer the three setup
 questions, or `ws setup` to go step by step. `ws doctor --json` gives the same report for scripts.
 
@@ -52,6 +56,20 @@ and `ship`. `ws skills` lists them per runner. A skill you already have under on
 To use ws's version of a name you already have, run `ws skills adopt NAME`. Yours moves to
 `$WS_HOME/backups/skills/<runner>/` and ws installs its own. `ws skills restore NAME` takes ws's copy out and moves yours
 back.
+
+## The gate
+
+The gate turns `policy.toml` into each runner's deny rules and answers its hooks. `ws gate replay` runs recorded calls
+against the policy, so you can see what a session would be refused before it tries. A refused call exits with 2, which
+the runner reads as a block. See [Use the gate](docs/how-to/use-the-gate.md).
+
+![ws gate replay: six calls, three refused (a read of ~/.ssh, a script piped into a shell, a command that names ~/.ssh), then one refusal with exit 2](docs/assets/ws-gate.png)
+
+Setup shows what it will write before it writes anything:
+
+![The Review card of ws setup: core parts, the chosen plugin, notes folder, cap and runner, and the count of files it will write](docs/assets/ws-setup-review.png)
+
+These screens are recorded from tapes in [docs/tapes](docs/tapes/README.md), on a made-up demo machine.
 
 ## Verify
 

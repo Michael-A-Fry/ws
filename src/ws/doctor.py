@@ -16,6 +16,7 @@ from ws import __version__, canary, jobs, roles, usage, userconfig
 from ws import globals as ws_globals
 from ws.osinfo import OSInfo
 from ws.profile import ProfileError, load, profile_path
+from ws.style import Style, plural
 
 OK, WARN, FAIL, UNCONFIGURED = "ok", "warn", "fail", "unconfigured"
 BAD = (FAIL, UNCONFIGURED)
@@ -244,7 +245,7 @@ def run_checks(osi: OSInfo, profile_file: Path, env: dict | None = None, network
     else:
         if bad_jobs:
             first = next(iter(bad_jobs.values()))
-            detail = f"{len(bad_jobs)} job file(s) ws would refuse ({', '.join(bad_jobs)}): {first}"
+            detail = f"{plural(len(bad_jobs), 'job file')} ws would refuse ({', '.join(bad_jobs)}): {first}"
             fix = "fix or remove that job file; the other jobs still run"
             checks.append(Check("WS006", "jobs", FAIL, detail, fix))
         else:
@@ -287,13 +288,23 @@ def report(checks: list[Check], osi: OSInfo, profile_file: Path) -> dict:
     }
 
 
-def render(checks: list[Check], osi: OSInfo) -> str:
-    out = [f"ws doctor {__version__} on {osi.kind} ({osi.release}, {osi.arch})", ""]
+# The glyph a status wears. Unconfigured is an amber `!` like a warning, but it still counts as needing doing.
+KIND = {OK: "ok", WARN: "warn", FAIL: "fail", UNCONFIGURED: "warn"}
+_STATUS_WIDTH = 2 + max(len(s) for s in KIND)  # the glyph, a space, then the longest word
+
+
+def render(checks: list[Check], osi: OSInfo, st: Style | None = None) -> str:
+    st = st or Style()
+    out = [st.heading(f"ws doctor {__version__} on {osi.kind} ({osi.release}, {osi.arch})"), ""]
     w = max(len(c.role) for c in checks)
     for c in checks:
-        out.append(f"{c.id}  {c.status:<12}  {c.role:<{w}}  {c.detail}")
+        detail = st.muted(c.detail) if c.status == OK else c.detail  # steady states stay quiet
+        out.append(f"{c.id}  {st.status(KIND[c.status], c.status, _STATUS_WIDTH)}  {c.role:<{w}}  {detail}")
         if c.fix:
-            out.append(f"{'':5}  {'':12}  {'':<{w}}  fix: {c.fix}")
+            out.append(f"{'':5}  {'':{_STATUS_WIDTH}}  {'':<{w}}  {st.muted('fix:')} {c.fix}")
     counts = {s: sum(c.status == s for c in checks) for s in (OK, WARN, FAIL, UNCONFIGURED)}
-    out += ["", f"{len(checks)} checks: " + ", ".join(f"{n} {s}" for s, n in counts.items())]
+    out += ["", f"{plural(len(checks), 'check')}: " + ", ".join(f"{n} {s}" for s, n in counts.items())]
+    if counts[UNCONFIGURED]:
+        n = counts[UNCONFIGURED]
+        out.append(st.warn(f"{n} unconfigured: run `ws setup` to set {'it' if n == 1 else 'them'} up."))
     return "\n".join(out)

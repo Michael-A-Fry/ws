@@ -297,7 +297,12 @@ def test_a_bad_body_a_bad_request_and_a_route_that_raises(served, capsys):
     srv, _, _ = served
     assert _req(srv, "POST", "/echo", "not json", {**_post_headers(srv)})[0] == 400
     assert _req(srv, "POST", "/echo", "[1]", {**_post_headers(srv)})[0] == 400  # JSON, but not an object
-    assert _req(srv, "POST", "/echo", "{}" + " " * 70_000, {**_post_headers(srv)})[0] == 400  # over the size limit
+    # over the size limit: refused. The server answers 400 without reading the body, so a client still sending can
+    # see the connection reset instead (macOS does); either way the request is refused.
+    try:
+        assert _req(srv, "POST", "/echo", "{}" + " " * 70_000, {**_post_headers(srv)})[0] == 400
+    except (ConnectionResetError, BrokenPipeError):
+        pass
     assert _post(srv, {"bad": True})[0] == 400
     status, body, _ = _post(srv, {"boom": True})
     assert status == 500 and b"secret detail" not in body and json.loads(body)["error"]

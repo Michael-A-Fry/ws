@@ -47,10 +47,10 @@ def which(*present):
 
 def test_read_rules_become_paths_a_sandbox_can_hide():
     # a trailing ** goes; a wildcard in the middle, the root and a bare ~ are left to the matcher
-    assert policy.sandbox_read_paths(POLICY) == ["~/.ssh", "~/.aws/credentials", "~/.gnupg"]
-    assert (
-        policy.sandbox_read_paths(policy.loads('[gate]\ndeny_read = ["~", "~/**", "**/.ssh/**", "relative"]\n')) == []
-    )
+    toolkit = [r.removesuffix("/**") for r in policy.secret_read_rules()]  # added to every policy that is read
+    assert policy.sandbox_read_paths(POLICY) == ["~/.ssh", "~/.aws/credentials", "~/.gnupg", *toolkit]
+    left = policy.loads('[gate]\ndeny_read = ["~", "~/**", "**/.ssh/**", "relative"]\n')
+    assert policy.sandbox_read_paths(left) == toolkit
 
 
 def test_only_paths_that_exist_are_hidden_and_home_is_the_runners(home):
@@ -696,7 +696,8 @@ def claude_settings(tmp_path, toml: str = "") -> dict:
     return json.loads(files["settings.json"])
 
 
-def test_claude_code_settings_turn_the_sandbox_on_and_fail_closed(tmp_path):
+def test_claude_code_settings_turn_the_sandbox_on_and_fail_closed(tmp_path, monkeypatch):
+    monkeypatch.setenv("WS_HOME", str(tmp_path / "wshome"))
     s = claude_settings(tmp_path, '[gate]\ndeny_read = ["~/.ssh/**", "~/.aws/credentials", "~/x*/y"]\n')
     sb = s["sandbox"]
     assert sb["enabled"] is True and sb["failIfUnavailable"] is True and sb["allowUnsandboxedCommands"] is False
@@ -706,7 +707,7 @@ def test_claude_code_settings_turn_the_sandbox_on_and_fail_closed(tmp_path):
     assert deny[0] == wshome and str(tmp_path / "wshome" / "policy.toml") in deny
     assert str(tmp_path / "wshome" / "gate" / "claude-code") in deny
     assert all(str(tmp_path / "wshome" / n) in deny for n in policy.CONTROL_NAMES)
-    assert sb["filesystem"]["denyRead"] == ["~/.ssh", "~/.aws/credentials"]
+    assert sb["filesystem"]["denyRead"] == ["~/.ssh", "~/.aws/credentials", str(tmp_path / "wshome" / "secrets")]
     assert "network" not in sb  # the policy names no hosts: it says nothing about the network
     assert s["env"] == {"WS_GATED_SESSION": "1", "WS_SANDBOXED": "1"}
 

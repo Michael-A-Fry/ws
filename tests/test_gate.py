@@ -119,8 +119,9 @@ def test_claude_code_rule_syntax_for_paths_and_tools(home, tmp_path):
     deny = json.loads((out / "settings.json").read_text())["permissions"]["deny"]
     assert deny[:3] == ["Read(//etc/shadow)", "Read(~/x/**)", "Read(.env)"]
     assert deny[-2:] == ["WebFetch", "WebSearch"]
+    assert f"Read(/{(home / 'wshome' / 'secrets').resolve()}/**)" in deny  # the toolkit's own secrets folder
     middle = [
-        d for d in deny[3:-2] if not d.startswith("Edit(**/")
+        d for d in deny[3:-2] if not d.startswith(("Edit(**/", "Read("))
     ]  # the project's own config: ws.sandbox PROJECT_LOCKED
     assert all(d.startswith("Edit(//") for d in middle) and len(middle) == 2 * (len(policy.CONTROL_NAMES) + 1)
 
@@ -137,6 +138,8 @@ def test_opencode_config_and_shim(home, tmp_path):
     assert next(iter(perm["bash"])) == "*" and perm["bash"]["*"] == "allow"  # last match wins: the catch-all is first
     assert perm["bash"]["make deploy"] == "deny" and perm["bash"]["rm -fr /x"] == "deny"
     rules = {"*": "allow", "~/.ssh/**": "deny", "**/.ssh/**": "deny"}  # the second is how OpenCode sees a path
+    secrets = str(tmp_path / "wshome" / "secrets")  # the toolkit's own secrets folder is added to every policy
+    rules |= {f"{secrets}/**": "deny", "**/wshome/secrets/**": "deny"}
     assert perm["read"] == perm["grep"] == perm["glob"] == perm["list"] == rules
     wshome = (home / "wshome").resolve()
     assert perm["edit"]["*"] == "allow" and next(iter(perm["edit"])) == "*"
@@ -429,3 +432,46 @@ def test_the_opencode_shim_governs_the_patch_tools(home, tmp_path):
     assert generate("opencode", tmp_path / "out") == 0
     shim = (tmp_path / "out" / "plugins" / "ws-gate.js").read_text()
     assert '"patch"' in shim and '"apply_patch"' in shim
+
+
+# --- the toolkit's own secrets folder is denied to reads, for both runners ----------------------------------------
+
+
+@pytest.mark.parametrize("policy_text", ["", "[gate]\ndeny_read = []\n"])
+def test_a_session_cannot_read_the_secrets_folder_with_a_tool_or_a_shell(home, monkeypatch, capsys, policy_text):
+    write_policy(home, policy_text)
+    secret = home / "wshome" / "secrets" / "anthropic"
+    claude = [
+        {"tool_name": "Read", "tool_input": {"file_path": str(secret)}},
+        {"tool_name": "Grep", "tool_input": {"path": str(secret.parent), "pattern": "x"}},
+        bash(f"cat {secret}"),
+        bash(f"cat < {secret}"),
+    ]
+    for payload in claude:
+        code, err = check(monkeypatch, capsys, "claude-code", payload)
+        assert code == 2 and "deny_read" in err, payload
+    opencode = [
+        {"tool": "read", "args": {"filePath": str(secret)}},
+        {"tool": "grep", "args": {"path": str(secret.parent), "pattern": "x"}},
+        {"tool": "bash", "args": {"command": f"cat {secret}"}},
+    ]
+    for payload in opencode:
+        code, err = check(monkeypatch, capsys, "opencode", payload)
+        assert code == 2 and "deny_read" in err, payload
+    ok = home / "wshome" / "policy.toml"
+    assert (
+        check(monkeypatch, capsys, "claude-code", {"tool_name": "Read", "tool_input": {"file_path": str(ok)}})[0] == 0
+    )
+    assert check(monkeypatch, capsys, "claude-code", bash(f"cat {ok}"))[0] == 0
+
+
+def test_the_generated_files_for_both_runners_name_the_secrets_folder(home, tmp_path):
+    secrets = (home / "wshome" / "secrets").resolve()
+    claude, opencode = tmp_path / "c", tmp_path / "o"
+    assert generate("claude-code", claude) == 0 and generate("opencode", opencode) == 0
+    settings = json.loads((claude / "settings.json").read_text())
+    assert f"Read(/{secrets}/**)" in settings["permissions"]["deny"]
+    assert str(secrets) in settings["sandbox"]["filesystem"]["denyRead"]
+    conf = json.loads((opencode / "opencode.json").read_text())
+    for tool in ("read", "grep", "glob", "list"):
+        assert conf["permission"][tool][f"{secrets}/**"] == "deny"

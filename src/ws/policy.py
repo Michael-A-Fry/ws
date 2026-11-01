@@ -87,7 +87,7 @@ import posixpath
 import re
 import tomllib
 import unicodedata
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from ws.profile import ws_home
@@ -323,6 +323,21 @@ CONTROL_NAMES = (
 )
 
 
+def secret_read_rules(home: Path | None = None) -> tuple[str, ...]:
+    """deny_read rules for where the secrets store keeps its values: `$WS_HOME/secrets` and, when the profile names
+    another folder (`[roles.secrets] store`), that one too. They are added to every policy that is read, so a session
+    can't read them whatever its policy file says; the runners' own rules, the sandbox and the hook all see them."""
+    from ws import secrets  # here, not at the top: it is a command module that imports more than the policy needs
+
+    base = ws_home() if home is None else Path(home).expanduser().absolute()
+    folders = [base / "secrets"]
+    try:
+        folders.append(secrets.store_dir({"WS_HOME": str(base)}).expanduser().absolute())
+    except Exception:  # noqa: BLE001 - a profile that does not read leaves the default folder, which is always covered
+        return (f"{folders[0]}/**",)
+    return tuple(dict.fromkeys(f"{f}/**" for f in folders))
+
+
 def control_paths(home: Path) -> list[str]:
     """ws's own control files under a ws home, as absolute paths (files and folders alike; a path covers what is
     under it)."""
@@ -400,9 +415,10 @@ def loads(text: str) -> Policy:
         "[gate]",
         {"deny_commands", "deny_read", "deny_tools", "ask_commands", "allow_hosts", "allow_write"},
     )
+    deny_read = _strings(g, "deny_read", "[gate] ")
     gate = Gate(
         _strings(g, "deny_commands", "[gate] "),
-        _strings(g, "deny_read", "[gate] "),
+        (*deny_read, *(r for r in secret_read_rules() if r not in deny_read)),
         _strings(g, "deny_tools", "[gate] "),
         _strings(g, "ask_commands", "[gate] "),
         _strings(g, "allow_hosts", "[gate] "),
@@ -476,9 +492,16 @@ def load(path: Path | None = None) -> Policy:
     except (OSError, UnicodeDecodeError) as e:
         raise PolicyError(f"{path}: {e}") from e
     try:
-        return loads(text)
+        return _with_secret_reads(loads(text), path.parent)
     except PolicyError as e:
         raise PolicyError(f"{path}: {e}") from e
+
+
+def _with_secret_reads(pol: Policy, home: Path) -> Policy:
+    """The policy with the secrets folder of the ws home the file sits in denied too (`loads` covers the one `$WS_HOME`
+    names; a policy kept in another ws home, such as the one a generated hook is told to read, covers its own)."""
+    extra = tuple(r for r in secret_read_rules(home) if r not in pol.gate.deny_read)
+    return replace(pol, gate=replace(pol.gate, deny_read=(*pol.gate.deny_read, *extra))) if extra else pol
 
 
 # --- Rule of Two -------------------------------------------------------------------------------------------------

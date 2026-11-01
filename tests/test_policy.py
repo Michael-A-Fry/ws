@@ -1558,3 +1558,68 @@ def test_a_quote_left_open_at_the_end_is_a_deny_with_a_reason(pol, home, cmd):
 )
 def test_a_quote_that_closes_or_sits_in_a_comment_or_heredoc_is_fine(pol, home, cmd):
     assert policy.is_denied_command(pol, cmd) is None, cmd
+
+
+# --- the toolkit's own secrets folder: denied to reads whatever the policy file says ----------------------------
+
+
+@pytest.fixture
+def wshome(tmp_path, monkeypatch):
+    h = tmp_path / "wshome"
+    monkeypatch.setenv("WS_HOME", str(h))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    return h
+
+
+def test_every_policy_denies_reads_of_the_secrets_folder_even_one_that_names_no_deny_read(wshome):
+    for text in ("", "[gate]\ndeny_read = []\n", policy.default_toml()):
+        p = policy.loads(text)
+        assert f"{wshome}/secrets/**" in p.gate.deny_read
+        assert policy.is_denied_read(p, str(wshome / "secrets" / "anthropic"))
+        assert policy.is_denied_read(p, str(wshome / "secrets" / "deep" / "er" / "key"))
+        assert policy.is_denied_read(p, str(wshome / "secrets2" / "x")) is None
+        assert policy.is_denied_read(p, str(wshome / "policy.toml")) is None  # the rest of ws home stays readable
+
+
+def test_a_command_that_reads_the_secrets_folder_is_denied(wshome):
+    p = policy.loads("")
+    secret = wshome / "secrets" / "anthropic"
+    for cmd in (
+        f"cat {secret}",
+        f"head -c 20 {secret}",
+        f"cat < {secret}",
+        f"grep -r x {wshome / 'secrets'}",
+        f"ls {wshome / 'secrets'}",
+    ):
+        assert "deny_read" in (policy.is_denied_command(p, cmd) or ""), cmd
+    assert policy.is_denied_command(p, f"cat {wshome / 'policy.toml'}") is None
+
+
+def test_the_secrets_folder_the_profile_names_is_denied_too(wshome, tmp_path):
+    wshome.mkdir()
+    store = tmp_path / "elsewhere" / "vault"
+    (wshome / "profile.toml").write_text(f'[roles.secrets]\nstore = "{store}"\n')
+    p = policy.loads("")
+    assert policy.is_denied_read(p, str(store / "key"))
+    assert policy.is_denied_read(p, str(wshome / "secrets" / "key"))
+    assert policy.secret_read_rules() == (f"{wshome}/secrets/**", f"{store}/**")
+
+
+def test_a_profile_that_does_not_read_leaves_the_default_secrets_folder_denied(wshome):
+    wshome.mkdir()
+    (wshome / "profile.toml").write_text("this is [not toml")
+    assert policy.secret_read_rules() == (f"{wshome}/secrets/**",)
+
+
+def test_a_rule_the_policy_already_has_is_not_added_twice(wshome):
+    p = policy.loads(f'[gate]\ndeny_read = ["{wshome}/secrets/**"]\n')
+    assert p.gate.deny_read.count(f"{wshome}/secrets/**") == 1
+
+
+def test_a_policy_file_in_another_ws_home_denies_that_homes_secrets_folder_too(wshome, tmp_path):
+    other = tmp_path / "other-ws"
+    other.mkdir()
+    (other / "policy.toml").write_text("[gate]\ndeny_read = []\n")
+    p = policy.load(other / "policy.toml")
+    assert policy.is_denied_read(p, str(other / "secrets" / "key"))
+    assert policy.is_denied_read(p, str(wshome / "secrets" / "key"))

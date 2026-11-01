@@ -476,7 +476,7 @@ def test_session_context_default_files_and_bad_paths():
 
 def test_record_calls_appends_one_line_per_hook_run_and_never_denies(home):
     p = pol("record-calls")
-    glob = {"tool_name": "Glob", "tool_input": {"pattern": "/etc/*", "path": "/tmp"}, "session_id": "s"}  # two calls
+    glob = {"tool_name": "Glob", "tool_input": {"pattern": "/etc/*", "path": "/usr"}, "session_id": "s"}  # two calls
     assert gate.check("claude-code", json.dumps(glob), p, clock=lambda: 0) is None
     lines = jsonl.read(home / "wshome" / "logs" / "gate-calls.jsonl")
     assert len(lines) == 1

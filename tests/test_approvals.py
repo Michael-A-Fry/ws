@@ -269,7 +269,7 @@ def test_approvals_are_a_control_path(tmp_path):
 
 # --- in the gate -----------------------------------------------------------------------------------------------
 
-ASK = policy.loads('[gate]\nask_commands = ["terraform apply*"]\ndeny_commands = ["rm -* /"]\n')
+ASK = policy.loads('[gate]\nask_commands = ["terraform apply*"]\ndeny_commands = ["rm -* /", "make deploy*"]\n')
 
 
 def payload(command, session="sess-1", cwd="/work"):
@@ -303,8 +303,10 @@ def test_a_command_that_is_not_asked_about_runs_and_leaves_no_record(root):
 
 
 def test_a_denied_command_is_never_offered_for_approval(root):
-    why = gate.check("claude-code", payload("rm -rf /"), ASK, approval_root=root)
+    why = gate.check("claude-code", payload("make deploy"), ASK, approval_root=root)
     assert why and "deny_commands" in why and not root.exists()
+    # a rule on the toolkit's secrets folder comes first for this one (a delete from / reaches it): still a deny
+    assert gate.check("claude-code", payload("rm -rf /"), ASK, approval_root=root) and not root.exists()
 
 
 def test_without_an_approvals_folder_an_ask_is_a_deny():

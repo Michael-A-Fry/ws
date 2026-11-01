@@ -29,14 +29,14 @@ name, and a key in a guard's table that guard doesn't read.
 |---|---|---|---|
 | `bulk-staging` | before a call | shell commands | Stops `git add -A`, `--all` (and a prefix such as `--al`), `.`, `./`, `*`, `:/` and `:(top)`, the same with `git stage`, and `git commit -a`, `-am` and `--all`, with or without git's global options. Stops `git -c alias.NAME=...`, which can define a command that stages everything. `git add file` and `git add -- file` go through. Text in quotes, comments and here-document bodies is data, so `git commit -m "git add -A"` goes through; the text after `eval` and in `bash -c` is a command and is read. The runner's own deny rules carry the plain spellings too. |
 | `syntax-check` | after a call | file writes | Checks the file the session wrote and tells the model the line that doesn't parse. Python, JSON and TOML are read in process. `.sh` and `.bash` go through `sh -n` or `bash -n`, with a note when the machine has no shell. `.js`, `.mjs` and `.cjs` go through `node --check`, with a note when node isn't installed. |
-| `session-context` | at session start | none | Lists, one line each, which of `files` exist in the project: the git top level above the session's folder, and the main worktree when the session runs in a linked one. |
+| `session-context` | at session start | none | Lists, one line each, which of `files` exist in the project: the git top level above the session's folder, and the main worktree when the session runs in a linked one. Adds a line when an API key bills an interactive session, and once for each ws version in each project, the version and what changed. |
 | `test-weakening` | before a call | file writes | Applies the edit to the test file on disk and compares before and after. Denies a skip or expected-failure marker added to a test that already exists; the person can approve it once. Warns about a test removed, fewer assertion lines, or an always-true assertion added. Judges Edit, Write and MultiEdit calls only. |
-| `claims` | before a message, and when the session stops | messages to other agents | Checks each commit-like token that sits in the same sentence as a claim word (`on main`, `merged into main`, `merged to main`, `pushed to main`) against a ref, and denies the message when the commit isn't on it. On stop, logs the claims in the runner's last message. |
+| `claims` | before a message, and when the session stops | messages to other agents | Checks each commit-like token that sits in the same sentence as a claim word (`on main`, `merged into main`, `merged to main`, `pushed to main`) against a ref, and denies the message when the commit isn't on it. With `release_dir` set, also denies a message that calls a release other than the promoted one live. On stop, logs the claims in the runner's last message. |
 | `spawn-cap` | before a call, and when a subagent stops | subagent starts | Denies a subagent start when `max_agents` (default from the machine) are already running in the session. Counts agents started in the background. |
-| `skill-gate` | before a call, and when a prompt is sent | file writes and skill calls | Denies a write to a guarded path until the named skill has run in the session. The person can approve the write once. Judges Edit, Write and MultiEdit calls only. |
+| `skill-gate` | before a call, and when a prompt is sent | file writes and skill calls | Denies a write to a guarded path until the named skill has run in the session. The paths come from the policy's rules and from each skill's own `gates` front matter. The person can approve the write once. Judges Edit, Write and MultiEdit calls only. |
 | `record-calls` | before a call | every kind | Appends `{schema, ts, at, runner, payload}` (`ts` is the time; `at` is its legacy spelling, kept beside it) to `$WS_HOME/logs/gate-calls.jsonl`, one line for each hook run. A file write keeps its path and records the text as `{"bytes", "sha256"}`. `ws gate replay` reads that file. |
 
-`bulk-staging` and `record-calls` take no table. The four guards below take one.
+`bulk-staging` and `record-calls` take no table. The other guards take one.
 
 `test-weakening` and `skill-gate` judge Edit, Write and MultiEdit calls. A change made through the shell, such as
 `sed -i` or a redirect, or through a notebook edit, isn't seen by them. The sandbox is what stops a write; these guards
@@ -52,7 +52,8 @@ A checker that isn't installed, or runs out of time, is a note. An entry in `ext
 extension.
 
 `session-context` takes `files`, a list of paths relative to the project (default `[".claude-state/STATE.md"]`). A path
-must stay inside the project: no leading `/` or `~`, no `..`.
+must stay inside the project: no leading `/` or `~`, no `..`. It also takes `warn_api_key`; see
+[session-context](#session-context).
 
 `record-calls` is off unless you name it. A line holds the hook payload as the runner sent it, with one change: the text
 a write tool carries (Write `content`, Edit `old_string` and `new_string`, each MultiEdit edit's two strings, NotebookEdit
@@ -90,6 +91,8 @@ fingerprint of that text instead, so write the payload by hand to replay this gu
 [guards.claims]
 words = ["on main", "merged into main", "merged to main", "pushed to main"]   # optional
 ref = "origin/main"                        # optional
+release_dir = "~/releases"                 # optional: release claims are off without it
+release_tags = ["v[0-9]+[.][0-9]+([.][0-9]+)*"]   # optional: the shapes of a release name
 ```
 
 A claim is a phrase from `words` (whole words, any case) in the same sentence as a commit-like token: 7 to 40
@@ -104,9 +107,46 @@ repository, a machine with no git, a `ref` that doesn't exist there and git taki
 message each let the message through with a note. Git runs with `GIT_NO_LAZY_FETCH=1`, so a check never goes to the
 network.
 
+With `release_dir` set, the guard also checks release claims. `release_dir` is a folder whose `current` link points at
+the promoted release tree; the path is absolute or starts with `~/`. A clause says a release is live when it reads
+`v0.2 is live`, `v0.2 is now live`, `promoted v0.2 to live`, `live now: v0.2`, `live: v0.2` or `the live release is
+v0.2`. A clause ends at a full stop, a new line, `;` or `but`, `while`, `whereas` and `although`, and at a comma that
+starts a new clause such as `v0.3 is staged, v0.2 is live`. A release is a name that matches one of `release_tags`
+(regular expressions; the default reads `v0.2` and `v0.2.1`). A pattern must be simple: the policy refuses one that can
+match nothing (`v?`, `\b`), is over 200 characters, or repeats a group that only holds repeats, such as `(\d+)+` (that
+shape can take minutes on a long message). A fixed part inside the group, as in `([.][0-9]+)*`, is fine. The clause may
+name only the release that `current` points at: its target folder's name, with or without a leading `v`. A clause that
+names another release is denied, and the reason names `current`'s target. A live claim is also denied when `current` is
+missing, is a folder or file rather than a link, points at nothing or can't be read. A clause with no release name
+isn't checked. Quotes and backticks, negation (`v0.3 isn't live`) and the future (`goes live after the next promote`,
+`will be live`, `once v0.3 is live`) make a clause not a claim, as they do for commits. The guard reads the link and
+nothing else: it doesn't fetch, use the network or write a file. Commit claims and release claims in one message are
+judged together and the reason names both.
+
 When the session stops, the claims in the runner's last message (the stop payload's `last_assistant_message`, when the
 runner sends one) are appended to `$WS_HOME/logs/claims.jsonl` with whether each commit was on `ref`. Each line has
 `schema`, `ts` and `at`, like the other logs listed in [Stores](stores.md).
+
+### session-context
+
+```toml
+[guards.session-context]
+files = [".claude-state/STATE.md"]   # optional
+warn_api_key = true                  # optional, true unless you set it
+```
+
+Two lines come after the file lines.
+
+- **The API key.** When `ANTHROPIC_API_KEY` is set in an interactive session, one line says the session bills that key,
+  not your Claude subscription. The line never holds the key or any part of it. A headless session gets none: Claude Code
+  sets `CLAUDE_CODE_ENTRYPOINT` to a value starting `sdk` for `claude -p` and the SDKs, and a `ws run` job holds ws's
+  lease placeholder in place of a key. Set `warn_api_key = false` to turn the line off.
+- **What changed in ws.** The first time a project's session starts on a ws version, one line gives the version (and the
+  version that project last saw), then up to four lines from that version's section of `CHANGELOG.md` when ws ships one
+  beside its code. Without one, the version line is all there is. The next start in that project on the same version says
+  nothing. The record is `$WS_HOME/sessions/project-HASH.session-context.json`, where HASH comes from the project's
+  folder (a linked worktree shares its main worktree's record). A start with no session id records nothing. If the record
+  can't be written, the line is left out and the rest of the start text goes ahead.
 
 ### spawn-cap
 
@@ -139,10 +179,39 @@ skill = "taste-gate"
 paths = ["**/*.css", "**/templates/**"]
 ```
 
+To name `skill_dirs` as well, put the rules under one table:
+
+```toml
+[guards.skill-gate]
+skill_dirs = ["~/.claude/skills"]     # optional: this is the default for Claude Code
+
+[[guards.skill-gate.rules]]
+skill = "taste-gate"
+paths = ["**/*.css", "**/templates/**"]
+```
+
 One table for each skill. A Skill tool call for the skill, or a prompt that starts with `/taste-gate` (or
 `/plugin:taste-gate`), records it for the session. A write to a path in `paths`, before the skill is recorded, is a
 deny you can override once with `ws approve ID`. After the skill is recorded the paths are open for the rest of the
 session. The record is `$WS_HOME/sessions/<session id>.skill-gate.json`.
+
+A skill can carry its own rule. A `gates` list in the front matter of its `SKILL.md` names the globs it guards:
+
+```markdown
+---
+name: taste-gate
+gates: ["**/*.css", "**/templates/**"]
+---
+```
+
+The guard reads `SKILL.md` in each folder under `skill_dirs` (Claude Code's default is `~/.claude/skills`; another
+runner reads none until you name a folder). The skill's name is `name` from the front matter, else the folder's name. A
+policy rule for the same skill replaces that skill's front matter rule, so the policy has the last word. A skill folder
+or `SKILL.md` that's a link is read through the link, but a link that leads outside your home folder isn't followed,
+and a `skill_dirs` entry outside your home folder is a policy error. Only the first 16384 bytes of a `SKILL.md` are
+read, so the front matter must close inside them; one that doesn't gives the stderr line.
+A `SKILL.md` that can't be read, or whose `gates` isn't a list of globs, adds no rule and gives one line on standard
+error, once for each session. It never stops a write. The front matter is read as ws's safe subset of YAML.
 
 ## Findings
 

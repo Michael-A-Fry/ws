@@ -366,3 +366,201 @@ def test_stop_with_no_claim_or_no_message_writes_nothing(home):
         ctx = Context("claude-code", "stop", "s1", str(home), payload)
         assert cl.judge(None, cl.config({}, "w"), ctx) is None
     assert not (home / "wshome" / "logs" / "claims.jsonl").exists()
+
+
+# --- release claims ----------------------------------------------------------------------------------------------
+
+
+def releases(home, current="v0.2", link=True):
+    """A release folder holding v0.2 and v0.3, with `current` pointing at `current` (or not a link)."""
+    root = home / "rel"
+    for name in ("v0.2", "v0.2.1", "v0.3", "r2026-11-02.1"):
+        (root / name).mkdir(parents=True, exist_ok=True)
+    if current and link:
+        (root / "current").symlink_to(root / current)
+    elif current:
+        (root / "current").mkdir()
+    return root
+
+
+def release_cfg(root, **extra):
+    return cl.config({"release_dir": str(root), **extra}, "[guards.claims]")
+
+
+def test_release_claims_are_off_until_a_release_dir_is_set(home):
+    assert cl.config({}, "w").release_dir == "" and cl.config({}, "w").release_tags == cl.DEFAULT_TAGS
+    assert judge("v9.9 is live", home) is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["v0.2 is live", "We promoted v0.2 to live.", "live now: v0.2", "v0.2 is now live", "V0.2 went live", "live: v0.2"],
+)
+def test_the_promoted_release_may_be_called_live(home, text):
+    assert judge(text, home, release_cfg(releases(home))) is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "v0.3 is live",
+        "promoted v0.3 to live",
+        "live now: v0.3",
+        "v0.2 is live, v0.3 is live too",
+        "v0.2 and v0.3 are live",
+        "v0.2 is live; v0.3 is live",
+        "v0.2 is live but v0.3 is live as well",
+        "The live release is v0.3.",
+        "v0.2.1 is live",
+    ],
+)
+def test_another_release_called_live_is_denied(home, text):
+    found = judge(text, home, release_cfg(releases(home)))
+    assert found.action == "deny" and "current points at v0.2" in found.reason
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "v0.3 goes live after the next promote",
+        "v0.3 will be live tomorrow",
+        "once v0.3 is live we stop",
+        "when v0.3 is live, tell me",
+        "v0.3 isn't live",
+        "v0.3 is not live yet",
+        "never promoted v0.3 to live",
+        "the words `v0.3 is live` are a quote",
+        'say "v0.3 is live" when it is',
+        "v0.3 is staged, v0.2 is live",
+        "v0.3 is in the folder. Nothing is live.",
+        "it is live",
+        "v0.3 is ready",
+    ],
+)
+def test_negation_the_future_quotes_and_unnamed_releases_are_not_claims(home, text):
+    assert judge(text, home, release_cfg(releases(home))) is None
+
+
+def test_the_claim_is_denied_when_current_is_missing_not_a_link_or_dangling(home):
+    root = releases(home, current=None)
+    cfg = release_cfg(root)
+    assert "is missing" in judge("v0.2 is live", home, cfg).reason
+    (root / "current").mkdir()
+    assert judge("v0.2 is live", home, cfg).action == "deny"  # a folder is not a link
+    (root / "current").rmdir()
+    (root / "current").symlink_to(root / "v0.9")
+    assert judge("v0.2 is live", home, cfg).action == "deny"  # points at nothing
+    (root / "current").unlink()
+    (root / "current").write_text("v0.2")
+    assert judge("v0.2 is live", home, cfg).action == "deny"  # a file is not a link
+
+
+def test_a_release_folder_that_does_not_exist_denies_a_live_claim_and_nothing_else(home):
+    cfg = release_cfg(home / "nowhere")
+    assert judge("v0.2 is live", home, cfg).action == "deny"
+    assert judge("nothing to say", home, cfg) is None
+
+
+def test_the_target_may_be_a_relative_link_and_may_leave_off_the_v(home):
+    root = releases(home, current=None)
+    (root / "0.3").mkdir()
+    (root / "current").symlink_to("0.3/")
+    assert judge("v0.3 is live", home, release_cfg(root)) is None
+    assert judge("v0.2 is live", home, release_cfg(root)).action == "deny"
+
+
+def test_release_tags_are_the_shapes_the_policy_names(home):
+    root = releases(home, current="r2026-11-02.1")
+    cfg = release_cfg(root, release_tags=[r"r\d{4}-\d\d-\d\d\.\d+"])
+    assert judge("r2026-11-02.1 is live", home, cfg) is None
+    assert judge("r2026-11-03.1 is live", home, cfg).action == "deny"
+    assert judge("v0.3 is live", home, cfg) is None  # not a tag shape this policy names
+
+
+def test_a_tilde_in_release_dir_is_this_homes(home):
+    releases(home / "home")
+    cfg = cl.config({"release_dir": "~/rel"}, "w")
+    assert judge("v0.2 is live", home, cfg) is None
+    assert judge("v0.3 is live", home, cfg).action == "deny"
+
+
+@needs_git
+def test_release_and_commit_claims_are_judged_together(repo, home):
+    d, on, off = repo
+    cfg = release_cfg(releases(home))
+    found = judge(f"{off} is on main and v0.3 is live", d, cfg)
+    assert found.action == "deny" and off in found.reason and "v0.3" in found.reason
+    assert judge(f"{on} is on main and v0.2 is live", d, cfg) is None
+
+
+def test_the_release_check_reads_a_link_and_writes_nothing(home):
+    root = releases(home)
+    before = sorted(str(p) for p in home.rglob("*"))
+    judge("v0.3 is live", home, release_cfg(root))
+    assert sorted(str(p) for p in home.rglob("*")) == before
+
+
+@pytest.mark.parametrize(
+    "table, key",
+    [
+        ({"release_dir": 5}, "release_dir"),
+        ({"release_dir": "relative/dir"}, "release_dir"),
+        ({"release_tags": []}, "release_tags"),
+        ({"release_tags": "v1"}, "release_tags"),
+        ({"release_tags": ["("]}, "release_tags"),
+        ({"release_tags": ["v?"]}, "release_tags"),  # can match nothing
+        ({"release_tags": [r"\b"]}, "release_tags"),  # a zero-width hit
+        ({"release_tags": ["(?=v)"]}, "release_tags"),
+        ({"release_tags": [r"(?:v\d+)?"]}, "release_tags"),
+        ({"release_tags": [r"v\d+", ""]}, "release_tags"),
+        ({"release_tags": [r"(\d+)+"]}, "release_tags"),  # a group that repeats, repeated
+        ({"release_tags": [r"v(?:\d+)*x"]}, "release_tags"),
+        ({"release_tags": [r"v([0-9]+\.?)+"]}, "release_tags"),
+        ({"release_tags": ["(?i)v1"]}, "release_tags"),  # an inline flag only works at the start of a pattern
+        ({"release_tags": ["v" + "1" * 300]}, "release_tags"),
+    ],
+)
+def test_a_bad_release_key_names_it(table, key):
+    with pytest.raises(policy.PolicyError, match=key):
+        cl.config(table, "[guards.claims]")
+
+
+def test_the_gate_denies_a_wrong_live_claim_from_a_policy(home):
+    root = releases(home)
+    pol = policy.loads(f'[guards]\non = ["claims"]\n[guards.claims]\nrelease_dir = "{root}"\n')
+    assert pol.guards.config["claims"].release_dir == str(root)
+    raw = json.dumps(
+        {
+            "tool_name": "SendMessage",
+            "tool_input": {"to": "lead", "message": "v0.3 is live"},
+            "session_id": "s1",
+            "cwd": str(home),
+        }
+    )
+    reason = gate.check("claude-code", raw, pol, home=home / "wshome")
+    assert reason and "v0.3" in reason and "v0.2" in reason
+
+
+def test_release_tags_with_a_fixed_part_in_a_repeated_group_are_fine():
+    for tag in (*cl.DEFAULT_TAGS, "v[0-9]+[.][0-9]+([.][0-9]+)*", r"r\d{4}-\d\d-\d\d\.\d+", r"v(\d+)"):
+        assert cl.config({"release_tags": [tag]}, "w").release_tags == (tag,)
+
+
+def test_a_long_run_of_spaces_is_read_in_linear_time():
+    import time
+
+    for text in ("v0.2" + " " * 19990 + "x", "v0.2 is live" + " " * 19990 + "x", "v0.2 is live;" + " " * 19990 + "x"):
+        t = time.perf_counter()
+        cl.release_claims(text, cl.DEFAULT_TAGS)
+        assert time.perf_counter() - t < 0.5
+
+
+def test_one_stray_quote_does_not_hide_a_later_claim():
+    assert cl.release_claims('He typed "v0.3 then: v0.4 is live', cl.DEFAULT_TAGS) == ["v0.3", "v0.4"]
+    assert cl.release_claims("It's `v0.4 is live", cl.DEFAULT_TAGS) == ["v0.4"]
+    assert cl.release_claims("He said \u201cv0.4 is live", cl.DEFAULT_TAGS) == ["v0.4"]
+
+
+def test_a_claim_between_a_matched_pair_of_quotes_is_still_quoted():
+    for text in ('She wrote "v0.4 is live" there', "see `v0.4 is live`", "\u201cv0.4 is live\u201d, she said"):
+        assert cl.release_claims(text, cl.DEFAULT_TAGS) == []

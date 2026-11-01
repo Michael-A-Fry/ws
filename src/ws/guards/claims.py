@@ -11,6 +11,14 @@ Not a claim: a claim word in quotes or backticks, one with a negation or a futur
 the machine, a REF that doesn't exist here, or git taking more than 8 seconds in total for one message lets the message
 through with a note. Git runs without lazy fetching (`GIT_NO_LAZY_FETCH=1`), so a check never goes to the network.
 
+Release claims are off until `release_dir` is set: a folder whose `current` link points at the promoted release. A clause
+(a sentence cut at `;`, `but`, `while`, `whereas`) that says a release is live or promoted (`v0.2 is live`, `promoted
+v0.2 to live`, `live now: v0.2`) must name only the release `current` points at. A release is a tag whose shape is one of
+`release_tags` (regexes, default `v1.2` and `v1.2.3`) and it matches the link's target folder name, with or without a
+leading `v`. A clause that names another release is denied, and so is a live claim when `current` is missing, isn't a
+link or can't be read. The same quote, negation and future rules apply (`goes live`, `will be live`, `once promoted`
+aren't claims). It reads the link and nothing else: no fetch, no network, nothing written.
+
 When the session stops, the claims in the runner's last message (if the stop payload carries it) are appended to
 `$WS_HOME/logs/claims.jsonl` with whether each commit was on REF. That is a log only; nothing is stopped. Each line
 carries `schema` and `ts`, and `at` (the legacy spelling of `ts`) beside them.
@@ -37,6 +45,8 @@ KINDS = ("message",)
 
 DEFAULT_WORDS = ("on main", "merged into main", "merged to main", "pushed to main")
 DEFAULT_REF = "origin/main"
+DEFAULT_TAGS = (r"v\d+\.\d+(?:\.\d+)*",)
+MAX_TAG_PATTERN = 200
 LOG = "claims.jsonl"
 SCHEMA_VERSION = 1
 GIT_BUDGET_S = 8.0  # all the git time one hook may use
@@ -59,17 +69,125 @@ _TO_BRANCH = re.compile(
 class Config:
     words: tuple[str, ...] = DEFAULT_WORDS
     ref: str = DEFAULT_REF
+    release_dir: str = ""  # "" = release claims are off
+    release_tags: tuple[str, ...] = DEFAULT_TAGS
 
 
 def config(table: dict, where: str) -> Config:
-    known_keys(table, where, ("words", "ref"))
+    known_keys(table, where, ("words", "ref", "release_dir", "release_tags"))
     words = text_list(table, "words", where, DEFAULT_WORDS)
     if not words:
         raise PolicyError(f"{where}: words must name at least one claim word")
     ref = table.get("ref", DEFAULT_REF)
     if not isinstance(ref, str) or not re.fullmatch(r"[A-Za-z0-9_./@{}^~-]+", ref) or ref.startswith("-"):
         raise PolicyError(f"{where}: ref must be a branch, tag or remote branch name such as origin/main")
-    return Config(words, ref)
+    return Config(words, ref, _release_dir(table, where), _release_tags(table, where))
+
+
+def _release_dir(table: dict, where: str) -> str:
+    folder = table.get("release_dir", "")
+    if not isinstance(folder, str):
+        raise PolicyError(f"{where}: release_dir must be a folder path such as ~/.ws-release")
+    if folder and (not (folder.startswith(("/", "~/")) or folder == "~") or "\n" in folder or "\0" in folder):
+        raise PolicyError(f"{where}: release_dir must be an absolute path or start with ~/")
+    return folder
+
+
+def _release_tags(table: dict, where: str) -> tuple[str, ...]:
+    tags = text_list(table, "release_tags", where, DEFAULT_TAGS)
+    if not tags:
+        raise PolicyError(f"{where}: release_tags must name at least one pattern")
+    for t in tags:
+        try:
+            compiled = re.compile(t)
+        except re.error as e:
+            raise PolicyError(f"{where}: release_tags: {t!r} is not a regular expression ({e})") from None
+        if len(t) > MAX_TAG_PATTERN or compiled.fullmatch("") or _zero_width(compiled):
+            raise PolicyError(
+                f"{where}: release_tags: {t!r} must be at most {MAX_TAG_PATTERN} characters and can't match nothing"
+            )
+        if _nested_quantifier(t):
+            raise PolicyError(
+                f"{where}: release_tags: {t!r} repeats a group that repeats (such as (\\d+)+), which can take "
+                "minutes on a long message; write a simple shape such as v[0-9]+[.][0-9]+"
+            )
+    try:
+        _tag_pattern(tags)  # the patterns are joined and wrapped: one that only works alone (an inline flag) is out
+    except re.error as e:
+        raise PolicyError(f"{where}: release_tags: the patterns don't work together ({e})") from None
+    return tags
+
+
+_PROBES = ("", "v1.2", "release v1.2.3 is live, v0.2")
+
+
+def _zero_width(compiled: re.Pattern) -> bool:
+    """True when the pattern matches nothing (an empty hit) anywhere in a few sample messages."""
+    return any(m.start() == m.end() for probe in _PROBES for m in compiled.finditer(probe))
+
+
+def _quantifier(pattern: str, i: int) -> tuple[str | None, int]:
+    """(kind, next index) for the repeat at `i`: "many" for `*`, `+`, `{n,}`; "some" for `?` and `{n,m}`; else None.
+    A lazy or possessive mark after it is read too."""
+    m = re.match(r"[*+]|\?|\{\d+(,\d*)?\}", pattern[i:])
+    if not m:
+        return None, i
+    text = m.group(0)
+    many = text in ("*", "+") or (text.startswith("{") and text.endswith(",}"))
+    j = i + len(text)
+    if pattern[j : j + 1] in ("?", "+"):
+        j += 1
+    return ("many" if many else "some"), j
+
+
+def _nested_quantifier(pattern: str) -> bool:
+    """True when a group that is only repeats inside (`(\\d+)`, `(a*)`) is itself repeated without a bound: the
+    shapes `(\\d+)+` and `(a*)*` that can take minutes on a long message. A group with a fixed part, such as the dot
+    in `(\\.\\d+)*`, is fine. A structural check over escapes, classes and groups, not a proof."""
+    stack: list[tuple[bool, bool]] = []  # the enclosing groups' (holds an unbounded repeat, has a fixed part)
+    rep = fixed = False
+    i, n = 0, len(pattern)
+    while i < n:
+        c = pattern[i]
+        if c == "(":
+            stack.append((rep, fixed))
+            rep = fixed = False
+            i += 1
+            if pattern[i : i + 1] == "?":  # (?:  (?=  (?!  (?<=  (?P<name>
+                while i < n and pattern[i] not in ":=!>":
+                    i += 1
+                i += 1
+            continue
+        if c == "|":
+            i += 1
+            continue
+        if c == ")":
+            inner_rep, inner_fixed = rep, fixed
+            rep, fixed = stack.pop() if stack else (False, False)
+            i += 1
+        else:
+            inner_rep, inner_fixed = False, True
+            if c == "\\":
+                i += 2
+            elif c == "[":  # a class runs to its closing bracket; a bracket first in it is a member
+                i += 2 if pattern[i + 1 : i + 2] == "^" else 1
+                i += 1
+                while i < n and pattern[i] != "]":
+                    i += 2 if pattern[i] == "\\" else 1
+                i += 1
+            else:
+                i += 1
+        kind, i = _quantifier(pattern, i)
+        if kind == "many":
+            if inner_rep and not inner_fixed:
+                return True
+            rep = True
+        elif kind == "some":
+            rep = rep or inner_rep
+        else:
+            rep = rep or inner_rep
+            fixed = fixed or inner_fixed
+    return False
 
 
 # --- reading the claims --------------------------------------------------------------------------------------------
@@ -178,6 +296,108 @@ def on_ref(cwd: str, sha: str, ref: str, budget: Budget | None = None) -> bool |
     return found == 0
 
 
+# --- release claims ------------------------------------------------------------------------------------------------
+
+# `(?<!\s)` lets a run of spaces start a match only at its first space, so a long run is read once, not once for each space
+_CLAUSE = re.compile(r"(?<=[.!?])\s+|\n+|(?<!\s)(?:\s*;\s*|\s+(?:but|while|whereas|although)\s+)", re.IGNORECASE)
+_LIVE = re.compile(
+    r"\b(?:is|are|was|were|went|gone|got|been|now|stays|remains)\s+(?:now\s+)?live\b"
+    r"|\blive\s+now\b|\bnow\s+live\b|\blive\s*:"
+    r"|\blive\s+(?:release|version|tag)\s+(?:is|=)"
+    r"|\bpromoted\b[^;\n]{0,80}?\b(?:to|into)\s+(?:live|prod|production)\b",
+    re.IGNORECASE,
+)
+
+
+def _tag_pattern(tags: tuple[str, ...]) -> re.Pattern:
+    body = "|".join(f"(?:{t})" for t in tags)
+    return re.compile(rf"(?<![\w./-])(?:{body})(?![\w-])(?!\.\w)")
+
+
+def _quoted_spans(text: str) -> list[tuple[int, int]]:
+    """The (open, close) positions of each matched pair of backticks, double quotes or curly double quotes, paired left
+    to right. A quote with no partner in the clause (`He typed "v0.3 ...`) makes no span, so it hides nothing."""
+    spans: list[tuple[int, int]] = []
+    for q in ("`", '"'):
+        marks = [i for i, c in enumerate(text) if c == q]
+        spans += list(zip(marks[0::2], marks[1::2]))
+    i = text.find("“")
+    while i != -1:
+        j = text.find("”", i + 1)
+        if j == -1:
+            break
+        spans.append((i, j))
+        i = text.find("“", j + 1)
+    return spans
+
+
+def _live_claim(clause: str) -> bool:
+    """True when the clause says a release is live or promoted, now: not quoted, not negated, not in the future."""
+    spans = _quoted_spans(clause)
+    for m in _LIVE.finditer(clause):
+        if any(a < m.start() < b for a, b in spans):
+            continue
+        previous = _FOUR.findall(clause[: m.start()].lower())[-4:]
+        if any(w in _NEGATION | _FUTURE or w.endswith(("n't", "'ll")) for w in previous):
+            continue
+        after = _FOUR.findall(clause[m.end() :].lower())[:2]
+        if any(w in _FUTURE for w in after):
+            continue  # "live after the next promote"
+        return True
+    return False
+
+
+def release_claims(text: str, tags: tuple[str, ...]) -> list[str]:
+    """The release tags named in each clause that says a release is live, in order, without repeats."""
+    pattern = _tag_pattern(tags)
+    # a comma also ends a clause when a new one starts: "v0.3 is staged, v0.2 is live"
+    new_clause = re.compile(rf",\s+(?=(?:and\s+|then\s+)?{pattern.pattern}\s+(?:is|are|was|went|now)\b)", re.IGNORECASE)
+    found: list[str] = []
+    for clause in (c for part in _CLAUSE.split(text[:MAX_TEXT]) if part for c in new_clause.split(part)):
+        if not clause or not _live_claim(clause):
+            continue
+        found += [t for t in dict.fromkeys(m.group(0) for m in pattern.finditer(clause)) if t not in found]
+    return found
+
+
+def promoted_release(release_dir: str) -> str | None:
+    """The name of the folder `release_dir/current` points at, or None when `current` is missing, isn't a link, points
+    at nothing or can't be read. Reads the link and nothing else."""
+    link = Path(os.path.expanduser(release_dir)) / "current"
+    try:
+        if not link.is_symlink() or not link.exists():
+            return None
+        target = os.readlink(link)
+    except OSError:
+        return None
+    return Path(target.rstrip("/")).name or None
+
+
+def _same_release(tag: str, promoted: str) -> bool:
+    return tag.lower().removeprefix("v") == promoted.lower().removeprefix("v")
+
+
+def check_releases(text: str, cfg: Config) -> str | None:
+    """The deny reason when the message says a release is live and it isn't the one promoted, else None."""
+    named = release_claims(text, cfg.release_tags) if cfg.release_dir else []
+    if not named:
+        return None
+    promoted = promoted_release(cfg.release_dir)
+    if promoted is None:
+        return (
+            f"the message says {', '.join(named)} is live but {cfg.release_dir}/current is missing, isn't a link, "
+            "points at nothing or can't be read here. Name the commit on the ref, or the promoted release, and send "
+            "it again."
+        )
+    wrong = [t for t in named if not _same_release(t, promoted)]
+    if not wrong:
+        return None
+    return (
+        f"the message says {', '.join(wrong)} is live but {cfg.release_dir}/current points at {promoted}. "
+        "Name the commit on the ref, or the promoted release, and send it again with what is true."
+    )
+
+
 # --- the guard -----------------------------------------------------------------------------------------------------
 
 
@@ -187,6 +407,7 @@ def judge(call, cfg: Config, ctx) -> Finding | None:
     text = call.data.get("text", "")
     claims = find_claims(text, cfg.words, cfg.ref) if isinstance(text, str) else []
     wrong, notes = [], []
+    release = check_releases(text, cfg) if isinstance(text, str) else None
     budget = Budget()
     for word, sha in claims:
         result = on_ref(ctx.cwd, sha, cfg.ref, budget)
@@ -197,12 +418,14 @@ def judge(call, cfg: Config, ctx) -> Finding | None:
         elif result not in notes:
             notes.append(result)
     if wrong:
-        return Finding(
-            "deny",
+        reason = (
             f"the message says {', '.join(wrong)} but that commit isn't on {cfg.ref} here. "
             f"If {cfg.ref} may be out of date, run `git fetch` first. Check with `git branch -r --contains SHA`, then "
-            "send it again with what is true.",
+            "send it again with what is true."
         )
+        return Finding("deny", f"{reason} Also: {release}" if release else reason)
+    if release:
+        return Finding("deny", release)
     if notes:
         return Finding("note", f"claims not checked: {notes[0]}")
     return None

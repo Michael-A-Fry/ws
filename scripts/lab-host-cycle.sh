@@ -3,6 +3,7 @@
 # runner in it a single-use registration, wait for its one job to finish, stop the VM. See docs/reference/lab.md.
 #
 #   lab-host-cycle.sh --token-file FILE --vm-id ID --node NODE --snapshot NAME [--repo OWNER/REPO] [--timeout SECONDS]
+#                     [--pve-env FILE]
 #
 # The repo-admin token lives in FILE on the host (mode 0600 or tighter, refused otherwise) and is only ever sent to the
 # GitHub API from here. The VM never holds it: after the reset the host asks GitHub for a just-in-time runner
@@ -13,7 +14,15 @@
 # The configuration reaches the VM on the standard input of `qm guest exec --pass-stdin` (Proxmox VE 8 or newer), so it
 # is never on the host's command line where `ps` could show it.
 #
-# Needs on the host: qm, curl, python3. In the VM: the guest agent, and the runner service of docs/reference/lab.md, which
+# By default the VM is driven with `qm`, on the Proxmox host. With --pve-env FILE it is driven through the Proxmox API
+# instead, so the cycle can run from any machine that can reach the API (FILE is a shell env file, mode 0600 or tighter,
+# with PVE_HOST, PVE_TOKEN_ID and PVE_TOKEN_SECRET, and optionally PVE_CA, a CA certificate file). The API token needs
+# only VM.PowerMgmt, VM.Snapshot.Rollback and VM.Monitor on that one VM.
+#
+# The configuration is written atomically (a temporary file, then a rename) and the runner service is restarted after
+# the write, so a service that starts on the file appearing can never read it half-written or empty.
+#
+# Needs on the host: qm (or, with --pve-env, nothing of Proxmox), curl, python3. In the VM: the guest agent, and the runner service of docs/reference/lab.md, which
 # starts `./run.sh --jitconfig` when /etc/ws-lab/jitconfig appears. Not run by CI; run it from a systemd timer or by hand.
 # ID and NODE are Proxmox's own VM id and node name; nothing here is a hostname or an address.
 #
@@ -26,7 +35,7 @@ set -euo pipefail
 
 REPO="Michael-A-Fry/ws"
 TIMEOUT=2400
-TOKEN_FILE="" VM_ID="" NODE="" SNAPSHOT=""
+TOKEN_FILE="" PVE_ENV="" VM_ID="" NODE="" SNAPSHOT=""
 RUNNER_ID=""
 TOKEN=""
 
@@ -46,6 +55,7 @@ while [ "$#" -gt 0 ]; do
         --vm-id) VM_ID="${2:-}"; shift 2 ;;
         --node) NODE="${2:-}"; shift 2 ;;
         --snapshot) SNAPSHOT="${2:-}"; shift 2 ;;
+        --pve-env) PVE_ENV="${2:-}"; shift 2 ;;
         --repo) REPO="${2:-}"; shift 2 ;;
         --timeout) TIMEOUT="${2:-}"; shift 2 ;;
         -h | --help) usage ;;
@@ -65,6 +75,86 @@ case "$mode" in
 esac
 TOKEN="$(cat "$TOKEN_FILE")"
 
+if [ -n "$PVE_ENV" ]; then
+    [ -f "$PVE_ENV" ] || die "$PVE_ENV is not a file"
+    case "$(stat -c %a "$PVE_ENV" 2> /dev/null || stat -f %Lp "$PVE_ENV")" in
+        400 | 600) ;;
+        *) die "$PVE_ENV must be mode 0600 or 0400 (it holds a Proxmox API token)" ;;
+    esac
+    PVE_HOST="" PVE_TOKEN_ID="" PVE_TOKEN_SECRET="" PVE_CA=""
+    # shellcheck disable=SC1090
+    . "$PVE_ENV"
+    [ -n "$PVE_HOST" ] && [ -n "$PVE_TOKEN_ID" ] && [ -n "$PVE_TOKEN_SECRET" ] || die "$PVE_ENV needs PVE_HOST, PVE_TOKEN_ID and PVE_TOKEN_SECRET"
+fi
+
+# pve_raw METHOD URLPATH [curl --config lines on stdin]: one call to the Proxmox API; prints the "data" member
+pve_raw() {
+    local method="$1" path="$2" extra="" ca=()
+    [ -t 0 ] || extra="$(cat)"
+    [ -z "$PVE_CA" ] || ca=(--cacert "$PVE_CA")
+    { printf 'header = "Authorization: PVEAPIToken=%s=%s"\n' "$PVE_TOKEN_ID" "$PVE_TOKEN_SECRET"; printf '%s\n' "$extra"; } |
+        curl -fsS --max-time 60 "${ca[@]}" --config - -X "$method" "https://$PVE_HOST:8006/api2/json$path" |
+        python3 -c 'import json,sys; d=json.load(sys.stdin).get("data"); print("" if d is None else d if isinstance(d,str) else json.dumps(d))'
+}
+pve() { pve_raw "$1" "/nodes/$NODE/qemu/$VM_ID$2"; }
+
+# pve_task METHOD PATH: a call that returns a task id; wait for the task and fail unless it ended OK
+pve_task() {
+    local upid n=0 st
+    upid="$(pve "$1" "$2" < /dev/null)"
+    while :; do
+        st="$(pve_raw GET "/nodes/$NODE/tasks/$(python3 -c 'import sys,urllib.parse as u; print(u.quote(sys.argv[1],safe=""))' "$upid")/status" < /dev/null |
+            python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["status"], d.get("exitstatus",""))')"
+        case "$st" in
+            "stopped OK") return 0 ;;
+            stopped*) die "Proxmox task failed: $st ($1 $2)" ;;
+        esac
+        n=$((n + 1))
+        [ "$n" -le 150 ] || die "Proxmox task did not finish in 5 minutes ($1 $2)"
+        sleep 2
+    done
+}
+
+# vm_run SCRIPT < input: run SCRIPT with /bin/sh in the VM as root through the guest agent, input on its stdin; fails
+# unless it exits 0. The input never goes on a command line (qm: --pass-stdin; API: the request body, read from stdin).
+vm_run() {
+    if [ -z "$PVE_ENV" ]; then
+        qm guest exec "$VM_ID" --pass-stdin 1 --synchronous 1 -- /bin/sh -c "$1" > /dev/null
+        return
+    fi
+    local input pid out
+    input="$(cat)"
+    pid="$(printf 'data-urlencode = "command=/bin/sh"\ndata-urlencode = "command=-c"\ndata-urlencode = "command=%s"\ndata-urlencode = "input-data=%s"\n' \
+        "$1" "$input" | pve POST /agent/exec | python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["pid"])')"
+    input=""
+    for _ in $(seq 1 60); do
+        out="$(pve GET "/agent/exec-status?pid=$pid" < /dev/null)"
+        if [ "$(printf '%s' "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("exited",0))')" = 1 ]; then
+            [ "$(printf '%s' "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("exitcode",1))')" = 0 ] || die "the command in the VM failed"
+            return 0
+        fi
+        sleep 1
+    done
+    die "the command in the VM did not finish in 1 minute"
+}
+
+vm_stop() {
+    if [ -z "$PVE_ENV" ]; then
+        qm stop "$VM_ID" > /dev/null 2>&1 || true
+    else
+        (pve_task POST /status/stop) > /dev/null 2>&1 || true # a subshell: die must not end the cleanup
+    fi
+}
+vm_rollback() {
+    if [ -z "$PVE_ENV" ]; then qm rollback "$VM_ID" "$SNAPSHOT"; else pve_task POST "/snapshot/$SNAPSHOT/rollback"; fi
+}
+vm_start() {
+    if [ -z "$PVE_ENV" ]; then qm start "$VM_ID"; else pve_task POST /status/start; fi
+}
+vm_ping() {
+    if [ -z "$PVE_ENV" ]; then qm agent "$VM_ID" ping > /dev/null 2>&1; else pve POST /agent/ping < /dev/null > /dev/null 2>&1; fi
+}
+
 api() { # api METHOD PATH [JSON BODY]: the token goes in a header read from stdin, not onto the command line
     local method="$1" path="$2" body="${3:-}"
     if [ -n "$body" ]; then
@@ -79,7 +169,7 @@ api() { # api METHOD PATH [JSON BODY]: the token goes in a header read from stdi
 }
 
 stop_vm() {
-    qm stop "$VM_ID" > /dev/null 2>&1 || true
+    vm_stop
 }
 
 # runner_code: the HTTP status of the runner's own page (000 when GitHub could not be reached at all).
@@ -102,12 +192,12 @@ trap cleanup EXIT
 
 echo "lab-host-cycle: reset VM $VM_ID to snapshot $SNAPSHOT"
 stop_vm
-qm rollback "$VM_ID" "$SNAPSHOT"
-qm start "$VM_ID"
+vm_rollback
+vm_start
 
 echo "lab-host-cycle: waiting for the guest agent"
 i=0
-until qm agent "$VM_ID" ping > /dev/null 2>&1; do
+until vm_ping; do
     i=$((i + 1))
     [ "$i" -le 90 ] || die "the guest agent did not answer in 3 minutes"
     sleep 2
@@ -121,8 +211,9 @@ JIT="$(printf '%s' "$reply" | python3 -c 'import json,sys; print(json.load(sys.s
 [ -n "$RUNNER_ID" ] && [ -n "$JIT" ] || die "GitHub gave no runner configuration"
 
 echo "lab-host-cycle: handing the configuration to the VM (runner $RUNNER_ID)"
-printf '%s' "$JIT" | qm guest exec "$VM_ID" --pass-stdin 1 --synchronous 1 -- \
-    /bin/sh -c 'umask 077 && cat > /etc/ws-lab/jitconfig' > /dev/null
+# A temporary file in the same folder, then a rename: the service that watches the file never sees it empty or partial.
+# The restart afterwards is for the case where it started anyway, on an earlier change, before the content was whole.
+printf '%s' "$JIT" | vm_run 'umask 077 && cat > /etc/ws-lab/jitconfig.new && [ -s /etc/ws-lab/jitconfig.new ] && mv /etc/ws-lab/jitconfig.new /etc/ws-lab/jitconfig && systemctl restart ws-lab-runner.service'
 JIT=""
 
 echo "lab-host-cycle: waiting for the job (up to $TIMEOUT s)"

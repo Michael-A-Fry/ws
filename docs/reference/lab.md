@@ -48,7 +48,10 @@ Each job starts from a clean machine, and the host, not the workflow and not the
 2. Wait for the QEMU guest agent to answer.
 3. Ask GitHub for a just-in-time runner configuration (`POST /repos/{owner}/{repo}/actions/runners/generate-jitconfig`,
    label `ws-lab`). A JIT runner is always single-use: it takes one job, then GitHub removes it.
-4. Write that configuration into the VM through the guest agent, as `/etc/ws-lab/jitconfig`.
+4. Write that configuration into the VM through the guest agent, as `/etc/ws-lab/jitconfig`. It's written to
+   `jitconfig.new` and renamed, so a service watching the file never sees it empty or half-written (a path unit fires on
+   the first change, and a runner started on an empty configuration sits there until someone restarts it). Then the
+   host restarts `ws-lab-runner.service`, which covers a start that happened anyway.
 5. Wait until GitHub answers 404 for the runner, which is when its one job has finished, then stop the VM. Any other
    answer (a 5xx, a rate limit, no network) is retried with a longer wait and never ends the cycle early; on the timeout
    the runner is removed through the API and the VM is stopped.
@@ -63,8 +66,15 @@ from a timer on the host or by hand:
 scripts/lab-host-cycle.sh --token-file /path/to/token --vm-id VMID --node NODE --snapshot SNAPSHOT
 ```
 
-The script hasn't been run against a real host yet (CI can't reach one); try it once by hand and read its output
-before putting it on a timer.
+By default the script drives the VM with `qm` and runs on the Proxmox host. With `--pve-env FILE` it uses the Proxmox
+API instead, so it can run from any machine that reaches the API. `FILE` is a shell env file (mode 0600 or 0400) with
+`PVE_HOST`, `PVE_TOKEN_ID`, `PVE_TOKEN_SECRET` and optionally `PVE_CA` (a CA certificate file). The API token needs
+only these privileges on `/vms/VMID`: `VM.PowerMgmt`, `VM.Snapshot.Rollback` (plus `VM.Snapshot`) and `VM.Monitor` (the
+guest agent; Proxmox VE 8). It needs no `VM.Allocate`.
+
+The script hasn't been run by CI (CI can't reach a host); the API mode has been run by hand against the lab VM. Put it
+on a timer only after a hand run. A timer should skip the cycle while a `lab.yml` run is queued or in progress, and
+cancel queued runs older than an hour first (`gh run list --workflow lab.yml --status queued`).
 
 What the VM image needs, all in the snapshot taken before any registration:
 
@@ -79,6 +89,9 @@ What the VM image needs, all in the snapshot taken before any registration:
   `ws-lab-runner.service`:
 
   ```ini
+  [Unit]
+  ConditionFileNotEmpty=/etc/ws-lab/jitconfig
+
   [Service]
   User=runner
   WorkingDirectory=/home/runner/actions-runner

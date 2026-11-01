@@ -62,7 +62,7 @@ install.sh        the installer people run first (pipx or uv)
 | `notes.py` | Notes module: `ws note` drops a Markdown file into the `_inbox` of your own notes folder (any... |
 | `notesdetect.py` | Find notes you already keep: an Obsidian vault (a folder holding `.obsidian/`) or a Logseq graph... |
 | `osinfo.py` | Which machine are we on: macOS, Linux, Windows via WSL2, or native Windows (not supported; use WSL2) |
-| `output.py` | The output contract for every `ws` command: one typed error, one JSON envelope, and two global flags |
+| `output.py` | The output contract for every `ws` command: one typed error, one JSON envelope, and the global flags |
 | `policy.py` | The policy: one vendor-neutral `policy.toml` that says what a session may do |
 | `profile.py` | The profile: one TOML file per person (machine answers, roles, caps) |
 | `rating.py` | `ws rate`: a thumbs up or down on a run, in one command |
@@ -77,6 +77,7 @@ install.sh        the installer people run first (pipx or uv)
 | `setup_ui/` | `ws setup`: the first-run and re-run setup, walked in your terminal (the default) or in a local... |
 | `skills/` | The skills ws ships (`align`, `checkpoint`, `taste-gate`, `dataviz`, `resume`, `ship`) and how... |
 | `status.py` | `ws status`: for each runner, every rules, skill, hook and MCP file it will load here, with... |
+| `style.py` | The terminal style every `ws` command prints with: a status glyph and word, headings, key/value... |
 | `testing/` | Test support that ships with ws: the mock model provider and its scenarios |
 | `usage.py` | The Console usage check: can ws read the provider's own usage report, the billing truth... |
 | `userconfig.py` | The gate in the runner's own user config: ws's deny rules and hooks added beside yours... |

@@ -614,10 +614,10 @@ class _Ctx:
     cwd: str
     protect: tuple[str, ...] = ()
     vars: dict[str, str] | None = None
-    data_bodies: bool = False  # may the body of a here-document to a data-only program be left unread (_scan)?
+    heredocs: bool = False  # read the command line with here-document bodies left out (a second reading, never alone)
 
     def fork(self) -> _Ctx:
-        return _Ctx(self.cwd, self.protect, dict(self.vars or {}), self.data_bodies)
+        return _Ctx(self.cwd, self.protect, dict(self.vars or {}))
 
 
 def _home() -> str:
@@ -956,39 +956,7 @@ def _join_lines(cmd: str) -> str:
 
 _HEREDOC_WORD = re.compile(r"<<(-?)[ \t]*(?:'([^']*)'|\"([^\"]*)\"|\\?([A-Za-z_][A-Za-z0-9_]*))")
 
-# Programs that only read their standard input as data (print, count, cut, check or write it out). The body of a
-# here-document given to one of these is text, so the gate doesn't read it as commands, when its output goes to a file
-# or the screen (not on to a pipe or a process substitution) and the command is not inside another one's text. A
-# shell, an interpreter, ssh, a database client or anything else not named here may run its input, so a body given to
-# it is read as commands.
-_DATA_SINK_NAMES = (
-    "cat tee tr wc uniq head tail cut fold nl tac rev base64 grep egrep fgrep diff cmp md5sum sha1sum sha256sum "
-    "sha512sum cksum true :"
-)
-_DATA_SINKS = frozenset(_DATA_SINK_NAMES.split())
-_DELIMITER = re.compile(r"[A-Za-z0-9_.-]+\Z")
-# Things that could make `cat` (or a pipe after the here-document) run something other than the program it names: a
-# function, alias or hash entry for it, a changed PATH, an `eval`/`source`/`.` that defines one, a fifo, coprocess,
-# process substitution or `exec` redirect that takes the text to another program, or a compound command piped on. With
-# any of them anywhere in the command, no body is left unread.
-_REDEFINES = re.compile(
-    r"\(\s*\)"
-    r"|(?<![\w./-])(?:alias|unalias|function|hash|enable|builtin|eval|source|coproc|exec|mkfifo|mknod)(?![\w-])"
-    r"|(?<!\w)PATH(?!\w)"
-    r"|(?<![\w-])command\s+-\w*p"
-    r"|(?:^|[;&|(\n{])\s*\.\s"
-    r"|[<>]\("
-    r"|(?:[})]|\bdone|\bfi|\besac)\s*\|",
-)
 _IFS = re.compile(r"\$\{IFS\}|\$IFS\b")
-# What the shell runs in the body of an unquoted here-document: `$(...)`, a backtick and `${ cmd; }`.
-_RUNS = re.compile(r"\$\(|`|\$\{[\s|]")
-
-
-def _runs(body: str) -> bool:
-    """Does the body of an unquoted here-document hold something the shell would run? A backslash keeps the next
-    character from starting one; any other `$(`, backtick or `${ ` counts, wherever it sits."""
-    return _RUNS.search(re.sub(r"\\.", "", body, flags=re.DOTALL)) is not None
 
 
 def _folds(command: str) -> bool:
@@ -997,8 +965,42 @@ def _folds(command: str) -> bool:
     return unicodedata.normalize("NFKC", command) != command or _IFS.search(command) is not None
 
 
-def _skippable_bodies(command: str) -> bool:
-    return _prep(command) == command and "\\\n" not in command and not _REDEFINES.search(command)
+# The one shape of command whose here-document bodies are left unread, because the shell can only treat them as text:
+# steps of `cat` or `tee`, each with plain-word arguments, at most one `>` or `>>` to a plain-word path and one
+# here-document opener with a quoted name, joined by `;`, `&&` or a new line. Anything else anywhere in the command
+# (a pipe, a group, a function, a variable, a substitution, a comment, an unquoted opener, a here-string, another
+# program) and every body is read as commands.
+_PLAIN = r"[A-Za-z0-9_./,:@%+-]+"
+_OPENER = r"<<-?(?:'[A-Za-z_][A-Za-z0-9_]*'|\"[A-Za-z_][A-Za-z0-9_]*\")"
+_REDIRECT = rf"[ \t]+>>?[ \t]*{_PLAIN}"
+_STEP = re.compile(rf"(?:cat|tee)(?:[ \t]+{_PLAIN})*(?P<r1>{_REDIRECT})?[ \t]+(?P<open>{_OPENER})(?P<r2>{_REDIRECT})?")
+_STEPS = re.compile(r";|&&")
+
+
+def _without_bodies(command: str) -> str | None:
+    """The command with the body and closing line of each here-document taken out, when every line of it is the
+    shape above and every body closes on its exact closing line; None otherwise (read the whole text as commands)."""
+    if _prep(command) != command or "\\\n" in command:
+        return None
+    out: list[str] = []
+    i, n = 0, len(command)
+    while i < n:
+        eol = command.find("\n", i)
+        eol = n if eol < 0 else eol
+        line, i = command[i:eol], eol + 1
+        out.append(line)
+        if not line:
+            continue
+        opened: list[tuple[str, bool]] = []
+        for step in _STEPS.split(line):
+            m = _STEP.fullmatch(step.strip(" \t"))
+            if not m or (m["r1"] and m["r2"]):
+                return None
+            opened.append((m["open"].lstrip("<-")[1:-1], m["open"].startswith("<<-")))
+        i = _after_bodies(command, i, opened)
+        if i is None:
+            return None
+    return "\n".join(out) + "\n" if any(out) else None
 
 
 def _closes(line: str, word: str, indented: bool) -> bool:
@@ -1012,83 +1014,36 @@ def _arithmetic(body: str) -> bool:
     return body.startswith("(") and body.endswith(")")
 
 
-def _body_spans(cmd: str, i: int, opened: list[tuple[str, bool, str]]) -> list[tuple[int, int, str, int]] | None:
-    """Where the bodies of the here-documents a line opened sit, from `i`, the start of the next line: for each, (start,
-    end of its text, kind, index after its closing line). None when one never closes (the shell would take the rest of
-    the text as its body; here that is read as commands, so a typo can't hide a command)."""
-    spans, n = [], len(cmd)
-    for word, indented, kind in opened:
-        start = i
+def _after_bodies(cmd: str, i: int, opened: list[tuple[str, bool]]) -> int | None:
+    """The index after the closing lines of the here-documents a line opened (closing word, may be indented), whose
+    bodies start at `i`, the start of the next line. None when one never closes (the shell would take the rest of the
+    text as its body; here that is read as commands, so a typo can't hide a command)."""
+    n = len(cmd)
+    for word, indented in opened:
         while True:
             if i >= n:
                 return None
             eol = cmd.find("\n", i)
             eol = n if eol < 0 else eol
-            line, here = cmd[i:eol], i
-            i = eol + 1
+            line, i = cmd[i:eol], eol + 1
             if _closes(line, word, indented):
-                spans.append((start, here, kind, i))
                 break
-    return spans
+    return i
 
 
-def _opened(cmd: str, m: re.Match, before: str) -> tuple[str, bool, str]:
-    """(closing word, may be indented, kind) of the here-document `m` opens, for _scan's data_bodies. The kind is
-    `data` (quoted, so no expansion), `expands` (unquoted) or `scan` (read its body as commands): `scan` unless the
-    command is a plain data-only program whose output stays on the line (no pipe, process substitution, file
-    descriptor or quote that runs on to the next line), the word is a plain name that ends there, and no `#` earlier
-    on the line could make the whole line a comment."""
-    word = m.group(2) if m.group(2) is not None else m.group(3) if m.group(3) is not None else m.group(4) or ""
-    indented = m.group(1) == "-"
-    quoted = m.group(2) is not None or m.group(3) is not None
-    after = m.end()
-    boundary = after >= len(cmd) or cmd[after] in " \t\n;&|<>()"
-    line = cmd.rfind("\n", 0, m.start()) + 1
-    if not (boundary and _DELIMITER.match(word) and "\\" not in m.group(0) and "#" not in cmd[line : m.start()]):
-        return word, indented, "scan"
-    eol = cmd.find("\n", after)
-    rest = cmd[after : len(cmd) if eol < 0 else eol]
-    text = before + m.group(0) + rest
-    plain = text.replace("2>&1", "").replace("1>&2", "").replace(">&2", "").replace("&&", "")
-    if (
-        "\n" in before
-        or any(x in text for x in ("|", "`", "$(", "<(", ">(", "\\"))  # the text goes on, or the line goes on
-        or "&" in plain  # a file descriptor, or the background: not the screen or a file
-        or text.count("'") % 2
-        or text.count('"') % 2  # a quote left open: its text runs on to the next line
-    ):
-        return word, indented, "scan"
-    try:
-        words = _lex(text)[0]
-    except Exception:  # noqa: BLE001 - a line that does not lex is read as commands
-        return word, indented, "scan"
-    if not words or words[0] not in _DATA_SINKS:
-        return word, indented, "scan"
-    return word, indented, "data" if quoted else "expands"
-
-
-def _scan(
-    cmd: str, heredocs: bool = False, end: dict | None = None, data_bodies: bool = False
-) -> tuple[list[list[str]], list[str]]:
+def _scan(cmd: str, heredocs: bool = False, end: dict | None = None) -> tuple[list[list[str]], list[str]]:
     """Split a shell command line. Returns (pipelines, inner): each pipeline is a list of segments (split on |, |&),
     pipelines are split on ; && || & newline ( ); inner holds the text of $(...), backticks and <(...), which run too.
     With `heredocs`, the body and closing line of each here-document are left out (that text is data for a program,
     not commands): a `<<WORD` starts one only outside quotes and comments, and not as `<<<` or a shift in `((...))` or inside `${...}` and `$[...]`, which are one word. If `end` is given,
-    end["quote"] is the quote still open at the end of the text (empty if none). With `data_bodies` (and not
-    `heredocs`), the body of a here-document is left out only when its command is in _DATA_SINKS and its word is a
-    plain name: a quoted body is data, and so is an unquoted one that holds no `$(`, backtick or `${ ` (the only things
-    the shell runs in it). Every other here-document, and any line where one is unclear, is read as it always was,
-    and once one is read that way no later body is left out: the shell's idea of where a body ends can then differ from
-    ours."""
+    end["quote"] is the quote still open at the end of the text (empty if none)."""
     pipelines: list[list[str]] = []
     inner: list[str] = []
     segs: list[str] = []
     buf: list[str] = []
     waiting: list[tuple[str, bool]] = []  # (closing word, may be indented) of the here-documents the line opened
-    opened: list[tuple[str, bool, str]] = []  # the same with data_bodies, and what the body is: data, expands or scan
     nest: list[str] = []  # the closers still owed by the ${...} and $[...] we are inside
     n, i, quote = len(cmd), 0, ""
-    skipping = data_bodies and not heredocs  # false once a body had to be read as commands
 
     def sub(body: str) -> str:  # the text of a $(...) that is really `$((a<<b))` arithmetic: its `<<` is a shift
         return body.replace("<<", "< <") if heredocs and _arithmetic(body) else body
@@ -1152,23 +1107,6 @@ def _scan(
                 buf.append(m.group(0))
                 i = m.end()
                 continue
-        if skipping and not nest and c == "<" and cmd.startswith("<<", i):
-            m = None if cmd.startswith("<<<", i) else _HEREDOC_WORD.match(cmd, i)
-            if m:
-                opened.append(_opened(cmd, m, "".join(buf)))
-                buf.append(m.group(0))
-                i = m.end()
-                continue
-        if skipping and c == "\n" and opened:
-            todo, opened = opened, []
-            spans = _body_spans(cmd, i + 1, todo) if all(kind != "scan" for _, _, kind in todo) else None
-            if spans and any(kind == "expands" and _runs(cmd[start:stop]) for start, stop, kind, _ in spans):
-                spans = None  # an unquoted body that expands something: all of it is read as commands
-            if spans:  # every body is data and closes; any other line is read as commands, as it always was
-                end_pipeline()
-                i = spans[-1][3]
-                continue
-            skipping = False
         if heredocs and c == "\n" and waiting:
             end_pipeline()
             i += 1
@@ -1524,9 +1462,7 @@ def _walk(policy: Policy, cmd: str, ctx: _Ctx, depth: int, cands: list[str]) -> 
     the reason at once for the checks that are not globs (pipe into a shell, denied paths, protected files)."""
     if depth > _MAX_DEPTH:
         raise ValueError("command nests too deeply to check")
-    # Only the command line itself: the text of a `$(...)`, `eval` or `bash -c` is run for what it prints or does, so
-    # a body in it may be commands.
-    pipelines, inner = _scan(_prep(cmd), data_bodies=ctx.data_bodies and depth == 0)
+    pipelines, inner = _scan(_prep(cmd), heredocs=ctx.heredocs and depth == 0)
     nested: list[str] = list(inner)
     for segs in pipelines:
         canon_segs = []
@@ -1794,6 +1730,22 @@ def _readings(command: str) -> list[str]:
     return [command, command.replace("\\\n", "")] if "\\\n" in command else [command]
 
 
+def _walk_command(policy: Policy, command: str, cwd: str, protect: tuple[str, ...], cands: list[str]) -> str | None:
+    """_walk for a whole command. In the one plain shape _without_bodies accepts, the bodies are text and the lines
+    around them are judged. Any other command is judged with every body read as commands (so a body can't hide
+    anything) and then once more with the bodies left out, so a stray quote in a body can't hide the lines after it."""
+    data = _without_bodies(command)
+    if data is not None:
+        return _walk(policy, data, _Ctx(cwd, protect), 0, cands)
+    for text in _readings(command):
+        reason = _walk(policy, text, _Ctx(cwd, protect), 0, cands)
+        if reason:
+            return reason
+    if "<<" in command and not _folds(command):
+        return _walk(policy, command, _Ctx(cwd, protect, None, True), 0, cands)
+    return None
+
+
 def _open_quote(command: str) -> str:
     """The quote still open at the end of the command text (`'`, `"` or `$'`), or "" if every quote is closed. Comments
     and here-document bodies are not read: an apostrophe in prose there is not a quote."""
@@ -1817,10 +1769,9 @@ def is_denied_command(
     if quote:
         return f"the command ends inside an unclosed {quote} quote, so what runs cannot be read; close the quote"
     cands: list[str] = []
-    for text in _readings(command):
-        reason = _walk(policy, text, _Ctx(cwd or _cwd(), tuple(protect), None, _skippable_bodies(command)), 0, cands)
-        if reason:
-            return reason
+    reason = _walk_command(policy, command, cwd or _cwd(), tuple(protect), cands)
+    if reason:
+        return reason
     for pat in policy.gate.deny_commands:
         rx = _glob_regex(_canon_pattern(pat))
         if any(rx.match(c) for c in cands):
@@ -1837,8 +1788,7 @@ def needs_approval(policy: Policy, command: str, *, cwd: str | None = None) -> b
     if not policy.gate.ask_commands:
         return False
     cands: list[str] = []
-    for text in _readings(command):
-        _walk(policy, text, _Ctx(cwd or _cwd(), (), None, _skippable_bodies(command)), 0, cands)
+    _walk_command(policy, command, cwd or _cwd(), (), cands)
     return any(_glob_regex(_canon_pattern(pat)).match(c) for pat in policy.gate.ask_commands for c in cands)
 
 

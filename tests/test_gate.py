@@ -484,7 +484,7 @@ def test_the_hook_lets_a_script_be_written_with_a_quoted_heredoc_and_still_denie
     home, monkeypatch, capsys
 ):
     body = 'CMD=x\nbash -c "$(fetch)"\necho a | bash'
-    write = f"cat > f.sh <<'EOF'\n{body}\nEOF\nchmod +x f.sh"
+    write = f"cat > f.sh <<'EOF'\n{body}\nEOF\n"
     assert check(monkeypatch, capsys, "claude-code", bash(write)) == (0, "")
     assert check(monkeypatch, capsys, "opencode", {"tool": "bash", "args": {"command": write}}) == (0, "")
     danger = "rm -rf " + "/"
@@ -492,6 +492,7 @@ def test_the_hook_lets_a_script_be_written_with_a_quoted_heredoc_and_still_denie
         f"bash <<'EOF'\n{danger}\nEOF",
         f"cat <<EOF\n$({danger})\nEOF",
         f"cat <<'EOF'\nnote\nEOF\n{danger}",
+        write + "chmod +x f.sh",  # a command after the body: the whole line is read as commands, body included
     ]
     for cmd in fed:
         assert check(monkeypatch, capsys, "claude-code", bash(cmd))[0] == 2, cmd

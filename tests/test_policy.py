@@ -1630,7 +1630,9 @@ def test_a_policy_file_in_another_ws_home_denies_that_homes_secrets_folder_too(w
     assert policy.is_denied_read(p, str(wshome / "secrets" / "key"))
 
 
-# --- here-documents: a quoted body given to a data-only program is data --------------------------------------------
+# --- here-documents: a quoted body written out by `cat` or `tee` is data -------------------------------------------
+#
+# The allowlist itself (and every shape outside it) is tested in test_policy_heredoc_bypass.py.
 
 DANGER = rm("-rf", ROOT)
 
@@ -1653,20 +1655,25 @@ def test_the_body_of_a_quoted_heredoc_written_to_a_file_is_data(pol, home, quote
         "cat <<'EOF'",
         "cat <<-'EOF'",
         "tee out.txt <<'EOF'",
+        "tee -a out.txt <<'EOF'",
         "cat >> notes.md <<'EOF'",
-        "grep -c x <<'EOF'",
-        "wc -l <<'EOF'",
-        'cat > f.sh <<"EOF" && chmod +x f.sh',
-        "2>&1 cat <<'EOF'",
+        "cat <<'EOF' > notes.md",
+        'cat > f.sh <<"EOF"',
+        "cat -n <<'EOF'",
     ],
 )
-def test_a_quoted_heredoc_to_a_data_program_is_not_read_as_commands(pol, home, opener):
+def test_a_quoted_heredoc_to_cat_or_tee_is_not_read_as_commands(pol, home, opener):
     assert policy.is_denied_command(pol, doc(opener, DANGER, 'bash -c "$(x)"')) is None
 
 
 @pytest.mark.parametrize(
     "opener",
     [
+        "grep -c x <<'EOF'",
+        "wc -l <<'EOF'",
+        ": <<'EOF'",
+        'cat > f.sh <<"EOF" && chmod +x f.sh',
+        "2>&1 cat <<'EOF'",
         "bash <<'EOF'",
         "sh <<'EOF'",
         'zsh <<"EOF"',
@@ -1684,7 +1691,7 @@ def test_a_quoted_heredoc_to_a_data_program_is_not_read_as_commands(pol, home, o
         "xargs sh <<'EOF'",
     ],
 )
-def test_a_heredoc_given_to_a_shell_or_any_other_program_is_still_read_as_commands(pol, home, opener):
+def test_a_heredoc_given_to_any_other_command_is_read_as_commands(pol, home, opener):
     assert policy.is_denied_command(pol, doc(opener, DANGER)), opener
 
 
@@ -1694,21 +1701,21 @@ def test_a_heredoc_fed_to_a_shell_stays_denied_by_the_shell_rule(pol, home):
 
 
 @pytest.mark.parametrize("sub", ["$(" + DANGER + ")", "`" + DANGER + "`", "x $(echo `" + DANGER + "`) y"])
-def test_an_unquoted_heredoc_body_still_has_its_substitutions_checked(pol, home, sub):
+def test_an_unquoted_heredoc_body_is_read_as_commands(pol, home, sub):
     assert policy.is_denied_command(pol, doc("cat <<EOF", "hello", sub, "bye"))
     assert policy.is_denied_command(pol, doc("cat > f <<-EOF", sub))
 
 
-def test_an_unquoted_heredoc_body_is_otherwise_text(pol, home):
+def test_an_unquoted_heredoc_is_never_left_unread(pol, home):
     text = doc("cat > f.sh <<EOF", "CMD=x", 'bash -c "$CMD"', "echo a | bash", "it's fine", "price is \\$(not run)")
-    assert policy.is_denied_command(pol, text) is None
-    assert policy.is_denied_command(pol, doc("cat <<EOF", "\\`" + DANGER + "\\`")) is None  # escaped: not run
+    assert policy.is_denied_command(pol, text)
 
 
 def test_the_command_after_a_heredoc_is_still_read(pol, home):
     assert policy.is_denied_command(pol, doc("cat <<'EOF'", "text", tail=DANGER))
     assert policy.is_denied_command(pol, doc("cat <<'EOF'", "it's here", tail=DANGER))  # an apostrophe in the body
     assert policy.is_denied_command(pol, doc("cat <<EOF", "it's here", tail=DANGER))
+    assert policy.is_denied_command(pol, doc("bash <<'EOF'", "it's here", tail=DANGER))
     assert policy.is_denied_command(pol, doc("cat <<'EOF' > f && " + DANGER, "text"))
     assert policy.is_denied_command(pol, "cat <<'A'; cat <<'B'\none\nA\ntwo\nB\n" + DANGER)
 

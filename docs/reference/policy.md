@@ -55,12 +55,13 @@ Rules:
 - A pattern is a glob. `*` matches anything and `\*` is a literal star. Each command is checked per shell segment (`a
   && b`,
   pipes, `$(...)`, `bash -c "..."`). Flags are normalised first.
-- The body of a here-document is text when its command only reads input as data (`cat`, `tee`, `grep`, `wc`, `head`,
-  `tail` and a few like them): a quoted body (`<<'EOF'`) isn't read at all, and an unquoted one is read only for its
-  `$(...)` and backticks, because those run. A here-document given to a shell, an interpreter, `ssh` or any other
-  program is read as commands, as is a body whose text goes on to a pipe or a process substitution, one inside
-  `$(...)`, `eval` or `bash -c`, and any line the gate can't plainly read (a word that isn't a plain name, a `#`
-  earlier on the line, a body that never closes, a function or alias in the command, a backslash-newline).
+- The body of a here-document is text in one plain shape only: lines of `cat` or `tee` steps, joined by a new line,
+  `;` or `&&`, where each step is plain words, at most one `>` or `>>` to a plain path and one quoted opener
+  (`<<'EOF'`, `<<"EOF"`, `<<-'EOF'`; the name is letters, digits and `_`, and can't start with a digit), and each body
+  ends on its exact closing line. A plain word has letters, digits and `_ . / , : @ % + -` only. Anything else in the
+  command (a pipe, a group, a function, a variable, a substitution, a comment, a quote, an unquoted or here-string
+  opener, a file descriptor, another program, a backslash-newline) and every body is read as commands. The file a
+  `tee` or `>` names goes through the same path checks as any other write.
 - Every item must be non-empty text.
 - `allow_hosts` items are a name, `*.name` or an IP, with an optional `:port`.
 - `allow_write` items must be a folder, absolute or under `~/` (`$HOME` is accepted), with no wildcard, not `/` and

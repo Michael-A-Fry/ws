@@ -31,7 +31,7 @@ KINDS = ()
 
 DEFAULT_FILES = (".claude-state/STATE.md",)
 STATE = "session-context"
-LEASE_PLACEHOLDER = "ws-lease-placeholder"  # the key a `ws run` job holds: the broker swaps in the real one
+LEASE_PLACEHOLDER = "ws-lease-placeholder"  # the key a `ws run` job holds (a test pins it equal to the adapter's PLACEHOLDER_KEY, which this can't import)
 HEADLESS_ENTRYPOINT = "sdk"  # CLAUDE_CODE_ENTRYPOINT starts with this for `claude -p` and the SDKs
 CHANGE_LINES = 4  # lines of changelog after the version line: 5 in all
 CHANGE_WIDTH = 160

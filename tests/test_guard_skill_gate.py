@@ -344,10 +344,33 @@ def test_a_skills_folder_that_is_a_link_outside_home_is_never_read(home):
     assert judge_write(home, "a.css", NONE) is None
 
 
-def test_a_skill_dirs_entry_outside_home_is_ignored(home):
+def test_a_skill_dirs_entry_outside_home_is_refused_when_the_policy_loads(home):
     skill(home, "taste-gate", "---\ngates: ['**/*.css']\n---\n", where="../outside")
-    cfg = cfg_of(f'[guards.skill-gate]\nskill_dirs = ["{home / "outside"}"]\n')
-    assert judge_write(home, "a.css", cfg) is None
+    for outside in (str(home / "outside"), "/opt/skills", "~/../elsewhere"):
+        with pytest.raises(policy.PolicyError, match=r"skill_dirs.*inside your home folder"):
+            cfg_of(f'[guards.skill-gate]\nskill_dirs = ["{outside}"]\n')
+    with pytest.raises(policy.PolicyError, match=r"skill_dirs"):
+        cfg_of(
+            '[guards.skill-gate]\nskill_dirs = ["/opt/skills"]\n[[guards.skill-gate.rules]]\nskill = "x"\npaths = ["*.css"]'
+        )
+
+
+def test_a_skill_dirs_entry_inside_home_still_loads(home):
+    cfg = cfg_of('[guards.skill-gate]\nskill_dirs = ["~", "~/a/b", "' + str(home / "home" / "c") + '"]\n')
+    assert len(cfg.skill_dirs) == 3
+
+
+def test_a_multi_byte_character_across_the_read_limit_does_not_skip_the_gates(home):
+    head = "---\ngates: ['**/*.css']\n---\n"
+    room = sg.MAX_SKILL_FILE - len(head.encode()) - 1
+    skill(home, "wide", head + "x" * room + "é" * 10)  # the first é starts at the last byte that is read
+    assert judge_write(home, "a.css", NONE).action == "deny"
+
+
+def test_front_matter_that_is_not_closed_within_the_read_limit_says_so(home):
+    skill(home, "long", "---\nname: long\n" + "# a line of text\n" * 2000)
+    found = judge_write(home, "src/app.py", NONE)
+    assert found.action == "note" and "long/SKILL.md" in found.reason and "isn't closed" in found.reason
 
 
 def test_a_slash_prompt_unlocks_a_front_matter_gate(home):

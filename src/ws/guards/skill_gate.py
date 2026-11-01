@@ -88,6 +88,16 @@ def _dirs(value, where: str) -> tuple[str, ...]:
     for d in value:
         if not (d.startswith(("/", "~/")) or d == "~") or "\n" in d or "\0" in d:
             raise PolicyError(f"{where}: skill_dirs: {d!r} must be an absolute path or start with ~/")
+    home = _home()
+    for d in value:
+        try:
+            outside = home is not None and not Path(d).expanduser().resolve().is_relative_to(home)
+        except (OSError, RuntimeError, ValueError):
+            outside = True
+        if outside:  # a folder outside HOME is never read, so a rule from it would gate nothing, and say nothing
+            raise PolicyError(
+                f"{where}: skill_dirs: {d!r} must be inside your home folder (skills outside it aren't read)"
+            )
     return tuple(value)
 
 
@@ -158,11 +168,21 @@ def _front_rules(cfg: Rules, ctx, skipped: list[str]) -> list[Rule]:
 def _read_gates(file: Path, folder: str, skipped: list[str]) -> Rule | None:
     try:
         with file.open("rb") as f:
-            text = f.read(MAX_SKILL_FILE).decode("utf-8")
-    except (OSError, UnicodeDecodeError):
+            data = f.read(MAX_SKILL_FILE)
+    except OSError:
         skipped.append(f"{folder}/SKILL.md can't be read")
         return None
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        if len(data) < MAX_SKILL_FILE:  # a whole file that isn't text
+            skipped.append(f"{folder}/SKILL.md can't be read")
+            return None
+        text = data.decode("utf-8", "replace")  # the cut may fall inside a character; the front matter is above it
     doc = frontmatter.parse(text)
+    if doc.raw is None and len(data) >= MAX_SKILL_FILE and text.lstrip("\ufeff").startswith("---"):
+        skipped.append(f"{folder}/SKILL.md: the front matter isn't closed in the first {MAX_SKILL_FILE} bytes")
+        return None
     if doc.raw is None or ("gates" not in doc.meta and not any(u.lstrip().startswith("gates") for u in doc.unparsed)):
         return None  # no front matter, or it names no gates
     gates = doc.meta.get("gates")

@@ -112,13 +112,16 @@ the promoted release tree; the path is absolute or starts with `~/`. A clause sa
 `v0.2 is live`, `v0.2 is now live`, `promoted v0.2 to live`, `live now: v0.2`, `live: v0.2` or `the live release is
 v0.2`. A clause ends at a full stop, a new line, `;` or `but`, `while`, `whereas` and `although`, and at a comma that
 starts a new clause such as `v0.3 is staged, v0.2 is live`. A release is a name that matches one of `release_tags`
-(regular expressions; the default reads `v0.2` and `v0.2.1`). The clause may name only the release that `current`
-points at: its target folder's name, with or without a leading `v`. A clause that names another release is denied, and
-the reason names `current`'s target. A live claim is also denied when `current` is missing, is a folder or file rather
-than a link, points at nothing or can't be read. A clause with no release name isn't checked. Quotes and backticks,
-negation (`v0.3 isn't live`) and the future (`goes live after the next promote`, `will be live`, `once v0.3 is live`)
-make a clause not a claim, as they do for commits. The guard reads the link and nothing else: it doesn't fetch, use the
-network or write a file. Commit claims and release claims in one message are judged together and the reason names both.
+(regular expressions; the default reads `v0.2` and `v0.2.1`). A pattern must be simple: the policy refuses one that can
+match nothing (`v?`, `\b`), is over 200 characters, or repeats a group that only holds repeats, such as `(\d+)+` (that
+shape can take minutes on a long message). A fixed part inside the group, as in `([.][0-9]+)*`, is fine. The clause may
+name only the release that `current` points at: its target folder's name, with or without a leading `v`. A clause that
+names another release is denied, and the reason names `current`'s target. A live claim is also denied when `current` is
+missing, is a folder or file rather than a link, points at nothing or can't be read. A clause with no release name
+isn't checked. Quotes and backticks, negation (`v0.3 isn't live`) and the future (`goes live after the next promote`,
+`will be live`, `once v0.3 is live`) make a clause not a claim, as they do for commits. The guard reads the link and
+nothing else: it doesn't fetch, use the network or write a file. Commit claims and release claims in one message are
+judged together and the reason names both.
 
 When the session stops, the claims in the runner's last message (the stop payload's `last_assistant_message`, when the
 runner sends one) are appended to `$WS_HOME/logs/claims.jsonl` with whether each commit was on `ref`. Each line has
@@ -204,7 +207,9 @@ gates: ["**/*.css", "**/templates/**"]
 The guard reads `SKILL.md` in each folder under `skill_dirs` (Claude Code's default is `~/.claude/skills`; another
 runner reads none until you name a folder). The skill's name is `name` from the front matter, else the folder's name. A
 policy rule for the same skill replaces that skill's front matter rule, so the policy has the last word. A skill folder
-or `SKILL.md` that's a link is read through the link, but a link that leads outside your home folder isn't followed.
+or `SKILL.md` that's a link is read through the link, but a link that leads outside your home folder isn't followed,
+and a `skill_dirs` entry outside your home folder is a policy error. Only the first 16384 bytes of a `SKILL.md` are
+read, so the front matter must close inside them; one that doesn't gives the stderr line.
 A `SKILL.md` that can't be read, or whose `gates` isn't a list of globs, adds no rule and gives one line on standard
 error, once for each session. It never stops a write. The front matter is read as ws's safe subset of YAML.
 

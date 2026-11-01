@@ -99,18 +99,95 @@ def _release_tags(table: dict, where: str) -> tuple[str, ...]:
         raise PolicyError(f"{where}: release_tags must name at least one pattern")
     for t in tags:
         try:
-            ok = len(t) <= MAX_TAG_PATTERN and re.compile(t).search("") is None
+            compiled = re.compile(t)
         except re.error as e:
             raise PolicyError(f"{where}: release_tags: {t!r} is not a regular expression ({e})") from None
-        if not ok:
+        if len(t) > MAX_TAG_PATTERN or compiled.fullmatch("") or _zero_width(compiled):
             raise PolicyError(
                 f"{where}: release_tags: {t!r} must be at most {MAX_TAG_PATTERN} characters and can't match nothing"
+            )
+        if _nested_quantifier(t):
+            raise PolicyError(
+                f"{where}: release_tags: {t!r} repeats a group that repeats (such as (\\d+)+), which can take "
+                "minutes on a long message; write a simple shape such as v[0-9]+[.][0-9]+"
             )
     try:
         _tag_pattern(tags)  # the patterns are joined and wrapped: one that only works alone (an inline flag) is out
     except re.error as e:
         raise PolicyError(f"{where}: release_tags: the patterns don't work together ({e})") from None
     return tags
+
+
+_PROBES = ("", "v1.2", "release v1.2.3 is live, v0.2")
+
+
+def _zero_width(compiled: re.Pattern) -> bool:
+    """True when the pattern matches nothing (an empty hit) anywhere in a few sample messages."""
+    return any(m.start() == m.end() for probe in _PROBES for m in compiled.finditer(probe))
+
+
+def _quantifier(pattern: str, i: int) -> tuple[str | None, int]:
+    """(kind, next index) for the repeat at `i`: "many" for `*`, `+`, `{n,}`; "some" for `?` and `{n,m}`; else None.
+    A lazy or possessive mark after it is read too."""
+    m = re.match(r"[*+]|\?|\{\d+(,\d*)?\}", pattern[i:])
+    if not m:
+        return None, i
+    text = m.group(0)
+    many = text in ("*", "+") or (text.startswith("{") and text.endswith(",}"))
+    j = i + len(text)
+    if pattern[j : j + 1] in ("?", "+"):
+        j += 1
+    return ("many" if many else "some"), j
+
+
+def _nested_quantifier(pattern: str) -> bool:
+    """True when a group that is only repeats inside (`(\\d+)`, `(a*)`) is itself repeated without a bound: the
+    shapes `(\\d+)+` and `(a*)*` that can take minutes on a long message. A group with a fixed part, such as the dot
+    in `(\\.\\d+)*`, is fine. A structural check over escapes, classes and groups, not a proof."""
+    stack: list[tuple[bool, bool]] = []  # the enclosing groups' (holds an unbounded repeat, has a fixed part)
+    rep = fixed = False
+    i, n = 0, len(pattern)
+    while i < n:
+        c = pattern[i]
+        if c == "(":
+            stack.append((rep, fixed))
+            rep = fixed = False
+            i += 1
+            if pattern[i : i + 1] == "?":  # (?:  (?=  (?!  (?<=  (?P<name>
+                while i < n and pattern[i] not in ":=!>":
+                    i += 1
+                i += 1
+            continue
+        if c == "|":
+            i += 1
+            continue
+        if c == ")":
+            inner_rep, inner_fixed = rep, fixed
+            rep, fixed = stack.pop() if stack else (False, False)
+            i += 1
+        else:
+            inner_rep, inner_fixed = False, True
+            if c == "\\":
+                i += 2
+            elif c == "[":  # a class runs to its closing bracket; a bracket first in it is a member
+                i += 2 if pattern[i + 1 : i + 2] == "^" else 1
+                i += 1
+                while i < n and pattern[i] != "]":
+                    i += 2 if pattern[i] == "\\" else 1
+                i += 1
+            else:
+                i += 1
+        kind, i = _quantifier(pattern, i)
+        if kind == "many":
+            if inner_rep and not inner_fixed:
+                return True
+            rep = True
+        elif kind == "some":
+            rep = rep or inner_rep
+        else:
+            rep = rep or inner_rep
+            fixed = fixed or inner_fixed
+    return False
 
 
 # --- reading the claims --------------------------------------------------------------------------------------------
@@ -221,7 +298,8 @@ def on_ref(cwd: str, sha: str, ref: str, budget: Budget | None = None) -> bool |
 
 # --- release claims ------------------------------------------------------------------------------------------------
 
-_CLAUSE = re.compile(r"(?<=[.!?])\s+|\n+|\s*;\s*|\s+(?:but|while|whereas|although)\s+", re.IGNORECASE)
+# `(?<!\s)` lets a run of spaces start a match only at its first space, so a long run is read once, not once for each space
+_CLAUSE = re.compile(r"(?<=[.!?])\s+|\n+|(?<!\s)(?:\s*;\s*|\s+(?:but|while|whereas|although)\s+)", re.IGNORECASE)
 _LIVE = re.compile(
     r"\b(?:is|are|was|were|went|gone|got|been|now|stays|remains)\s+(?:now\s+)?live\b"
     r"|\blive\s+now\b|\bnow\s+live\b|\blive\s*:"
@@ -236,16 +314,28 @@ def _tag_pattern(tags: tuple[str, ...]) -> re.Pattern:
     return re.compile(rf"(?<![\w./-])(?:{body})(?![\w-])(?!\.\w)")
 
 
-def _in_quotes(text: str, pos: int) -> bool:
-    """True when `pos` sits inside a pair of backticks, double quotes or curly double quotes."""
-    before = text[:pos]
-    return before.count("`") % 2 == 1 or before.count('"') % 2 == 1 or before.count("“") > before.count("”")
+def _quoted_spans(text: str) -> list[tuple[int, int]]:
+    """The (open, close) positions of each matched pair of backticks, double quotes or curly double quotes, paired left
+    to right. A quote with no partner in the clause (`He typed "v0.3 ...`) makes no span, so it hides nothing."""
+    spans: list[tuple[int, int]] = []
+    for q in ("`", '"'):
+        marks = [i for i, c in enumerate(text) if c == q]
+        spans += list(zip(marks[0::2], marks[1::2]))
+    i = text.find("“")
+    while i != -1:
+        j = text.find("”", i + 1)
+        if j == -1:
+            break
+        spans.append((i, j))
+        i = text.find("“", j + 1)
+    return spans
 
 
 def _live_claim(clause: str) -> bool:
     """True when the clause says a release is live or promoted, now: not quoted, not negated, not in the future."""
+    spans = _quoted_spans(clause)
     for m in _LIVE.finditer(clause):
-        if _in_quotes(clause, m.start()):
+        if any(a < m.start() < b for a, b in spans):
             continue
         previous = _FOUR.findall(clause[: m.start()].lower())[-4:]
         if any(w in _NEGATION | _FUTURE or w.endswith(("n't", "'ll")) for w in previous):

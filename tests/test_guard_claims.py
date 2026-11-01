@@ -509,6 +509,13 @@ def test_the_release_check_reads_a_link_and_writes_nothing(home):
         ({"release_tags": "v1"}, "release_tags"),
         ({"release_tags": ["("]}, "release_tags"),
         ({"release_tags": ["v?"]}, "release_tags"),  # can match nothing
+        ({"release_tags": [r"\b"]}, "release_tags"),  # a zero-width hit
+        ({"release_tags": ["(?=v)"]}, "release_tags"),
+        ({"release_tags": [r"(?:v\d+)?"]}, "release_tags"),
+        ({"release_tags": [r"v\d+", ""]}, "release_tags"),
+        ({"release_tags": [r"(\d+)+"]}, "release_tags"),  # a group that repeats, repeated
+        ({"release_tags": [r"v(?:\d+)*x"]}, "release_tags"),
+        ({"release_tags": [r"v([0-9]+\.?)+"]}, "release_tags"),
         ({"release_tags": ["(?i)v1"]}, "release_tags"),  # an inline flag only works at the start of a pattern
         ({"release_tags": ["v" + "1" * 300]}, "release_tags"),
     ],
@@ -532,3 +539,28 @@ def test_the_gate_denies_a_wrong_live_claim_from_a_policy(home):
     )
     reason = gate.check("claude-code", raw, pol, home=home / "wshome")
     assert reason and "v0.3" in reason and "v0.2" in reason
+
+
+def test_release_tags_with_a_fixed_part_in_a_repeated_group_are_fine():
+    for tag in (*cl.DEFAULT_TAGS, "v[0-9]+[.][0-9]+([.][0-9]+)*", r"r\d{4}-\d\d-\d\d\.\d+", r"v(\d+)"):
+        assert cl.config({"release_tags": [tag]}, "w").release_tags == (tag,)
+
+
+def test_a_long_run_of_spaces_is_read_in_linear_time():
+    import time
+
+    for text in ("v0.2" + " " * 19990 + "x", "v0.2 is live" + " " * 19990 + "x", "v0.2 is live;" + " " * 19990 + "x"):
+        t = time.perf_counter()
+        cl.release_claims(text, cl.DEFAULT_TAGS)
+        assert time.perf_counter() - t < 0.5
+
+
+def test_one_stray_quote_does_not_hide_a_later_claim():
+    assert cl.release_claims('He typed "v0.3 then: v0.4 is live', cl.DEFAULT_TAGS) == ["v0.3", "v0.4"]
+    assert cl.release_claims("It's `v0.4 is live", cl.DEFAULT_TAGS) == ["v0.4"]
+    assert cl.release_claims("He said \u201cv0.4 is live", cl.DEFAULT_TAGS) == ["v0.4"]
+
+
+def test_a_claim_between_a_matched_pair_of_quotes_is_still_quoted():
+    for text in ('She wrote "v0.4 is live" there', "see `v0.4 is live`", "\u201cv0.4 is live\u201d, she said"):
+        assert cl.release_claims(text, cl.DEFAULT_TAGS) == []

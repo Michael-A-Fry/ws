@@ -89,6 +89,9 @@ install.sh        the installer people run first (pipx or uv)
 
 ## Conventions
 
+- Register: GitHub Issues (github.com/Michael-A-Fry/ws), board 'ws roadmap'; TODO.md is the Now list. File a new bug,
+  gap or idea as an issue with `kind:`, `area:`, `P0`-`P3` and `size:` labels (or `triage:needed`). A vulnerability goes
+  to a private advisory, never an issue.
 - Stdlib only in `src/ws`. A new dependency needs a reason written in the PR and a pin in `uv.lock`.
 - One module per concern, and its docstring is its contract: what it does, why, and what it promises. The code map above
   is built from those docstrings, so write the first sentence for a reader skimming the table.

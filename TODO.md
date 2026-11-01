@@ -1,6 +1,20 @@
 # TODO
 
-## Phase 0 (repo setup)
+The backlog lives in [GitHub Issues](https://github.com/Michael-A-Fry/ws/issues), ranked on the
+[ws roadmap](https://github.com/users/Michael-A-Fry/projects/1) board (Inbox, Now, Next, Later, Won't do, Done). This
+file holds only what's being worked on now. Report a vulnerability privately, as [SECURITY.md](SECURITY.md) says.
+
+## Now
+
+- [ ] Release 0.1.6 with the gate and environment hardening now in review
+- [ ] ws home: the hub page (#72)
+- [ ] Triage the audit issues (#73 to #105) and choose Next
+
+## Earlier phases (record)
+
+The rows below are the plan as it stood before the move to issues. Open rows move to issues at triage.
+
+### Phase 0 (repo setup)
 
 - [x] Public repo, Apache-2.0 + NOTICE, squash-only, auto-delete head branches
 - [x] Secret scanning + push protection, Dependabot alerts and security updates, immutable releases
@@ -9,7 +23,7 @@
 - [x] CLA bot (CLA Assistant, hosted) linked to CLA.md: the `license/cla` check appeared on PR #5 (not a required check)
 - [x] `ws-aitoolkit` 0.0.0 on PyPI and npm (#175); `ws-toolkit` held on PyPI, never released
 
-## Phase 1 (hygiene gate)
+### Phase 1 (hygiene gate)
 
 - [x] prek + gitleaks + PII regex + private denylist secret; `ci.yml` as the required check (planted key, IP and name each
   failed CI: PRs #2-#4, closed)
@@ -17,14 +31,14 @@
 - [ ] ShellCheck and taplo hooks when the first shell file or a hand-edited TOML lands; licence check with the first
   runtime dependency (the core has none)
 
-## Phase 2 (CLI skeleton, doctor)
+### Phase 2 (CLI skeleton, doctor)
 
 - [x] CLI skeleton, `ws doctor` (check IDs, `--json`), OS detection, the 3 questions (`ws init`), Console usage API check
   (WS110; needs an Admin API key, which Anthropic gives organisations only)
 - [x] `doctor` exits non-zero listing every role unconfigured on ubuntu-24.04, windows-2025 (WSL) and macos-26
   (`cli.yml` on 778cfdf; native Windows fails WS001 and points at WSL2)
 
-## Phase 2b (globals stay global, #178)
+### Phase 2b (globals stay global, #178)
 
 - [x] Shadowed-globals check: `ws doctor` WS005 + a prek hook in `ci`; a repo copy of a global skill, agent, workflow
   or hook fails unless listed in `.ws/overrides.toml` with a reason; listed overrides are reported
@@ -32,7 +46,7 @@
 - [x] Pass test: a planted shadow fails; a listed override passes and is reported; an old-release session is nudged once
   (tests/test_globals.py, tests/test_session.py; PR #10)
 
-## Phase 3 (core)
+### Phase 3 (core)
 
 - [x] Policy schema + generated gate for Claude Code and OpenCode (PR #9): native deny lists, a fail-closed hook and an
   OpenCode shim; self-protection of `$WS_HOME`; Rule of Two with named exceptions; known matcher limits in policy.py
@@ -48,7 +62,7 @@
 - [x] WS110 usage: off (Michael: "leave it off"); `adapter = "none"`, spend comes from `runs.jsonl`
 - [x] CLA signed by Michael (`license/cla` passes on PR #6)
 
-## Phase 4 (setup, adapters, public skills, the wall)
+### Phase 4 (setup, adapters, public skills, the wall)
 
 - [x] Installer engine: `ws install` / `ws uninstall` with a manifest; a second install reports 0 changes, uninstall
   returns HOME to its pre-install state (tests/test_install.py, 3-OS matrix; PR #12)
@@ -71,7 +85,7 @@
 - [ ] Known limit: the notify cap counts ws's own sends only; count notify leases in the broker
 - [ ] Known limit: sops-age is named but not read by the broker yet
 
-## Phase 5 (lab + evals)
+### Phase 5 (lab + evals)
 
 - [x] The wall's open class (PR #23): a load-path table e2e (Claude Code, OpenCode, git) with real-loader controls;
   private per-project XDG data/cache; git-aware project lock with parent binds and placeholders; per-project Claude Code
@@ -99,7 +113,7 @@
 - [ ] P3: a `.git/hooks` folder with many files is not counted against the report's scan budget
 - [ ] Not built: the rubric (model-judged) grader; time to first output and attention minutes need run-record fields
 
-## Phase T (v0.1 thin tag)
+### Phase T (v0.1 thin tag)
 
 - [x] Release workflow on `v*` tags: sdist + wheel, `.sha256` per asset, CycloneDX SBOM, build provenance, cosign
   keyless bundles, one immutable release, PyPI by trusted publishing; tag must equal the pyproject version and the
@@ -117,7 +131,7 @@
 - [x] Pass test: v0.1.1 installed twice per cell, each with e2e: CI runs 41245122690 (6/6), lab 41245897083
 - [x] Tag `v0.1.1` (0.1.0 was published, then withdrawn and deleted on GitHub and PyPI: DECISIONS 190)
 
-## Phase 6 (harvest, then cut-over on the maintainer's machine)
+### Phase 6 (harvest, then cut-over on the maintainer's machine)
 
 Decisions (align, 1 Nov; DECISIONS 192, 193): every cut-over step gets a watchdog with automatic rollback (guards,
 phone alerts, app sessions and scheduled jobs must not stop for a day). Mail switches on in drafts mode, a setting.

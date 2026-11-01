@@ -139,9 +139,18 @@ your runner's own config file, beside yours. It records exactly what it added an
   Claude Code on a machine without bubblewrap, and it would override your own sandbox choices. The wall still comes from
   `ws gate launch`. Where the launch settings and your config file hold the same hook, Claude Code runs it once. OpenCode
   loads the global plugin and the launch plugin, so a launched OpenCode session asks the gate twice.
-- **Your file's edits go through your terminal.** Gated sessions can't edit the config file ws merged into, or any
-  `.claude` or `opencode.json` file in a project. Change them in a terminal of your own. A later undo keeps whatever you
-  added to the file.
+- **What a session can't edit.** In every session: the config file ws merged into, a project's
+  `.claude/settings.json`, `.claude/settings.local.json` and `.mcp.json`, the hooks and config of any repo's git folder,
+  ws's own control files and the folder of the Python that runs the hook. Change those in a terminal of your own.
+  Everything else under a project's `.claude` folder, including a `.claude/worktrees/` checkout, stays editable. The
+  wider project locks (the whole `.claude` folder, `opencode.json` and the rest of the git folder) apply only to a
+  session started with `ws gate launch`, inside the wall. A later undo keeps whatever you added to the config file.
+- **A project can turn the hooks off.** A project's `disableAllHooks` setting turns off every hook for sessions in that
+  project, including ws's gate check. ws's deny rules stay, but they're only part of the gate. Headless jobs from
+  `ws run` load only your user settings, so a project's setting doesn't reach them.
+- **A running session keeps the hooks it started with.** Claude Code reads its hooks at start. After `ws install`
+  changes the file, start a new session to get the change. A session that began before the gate went in stays ungated
+  until you restart it, and one that began before an undo keeps calling the hook until you restart it.
 - **Some files are refused.** A config file that's a link, isn't plain JSON (comments, a trailing comma), or is
   `opencode.jsonc`, is left alone. So is one where you've set an `env` key, or an OpenCode rule, to a value that
   contradicts ws's. `ws install` names the key and changes nothing. Use `ws gate launch` for those machines.
@@ -151,8 +160,14 @@ your runner's own config file, beside yours. It records exactly what it added an
 - **OpenCode runs none of the guards yet.** `ws doctor` (WS008) lists each guard that's on in your policy and the runner
   doesn't run.
 - **A broken ws blocks calls, not skips them.** The hook fails closed. When ws can't start, each governed call is
-  blocked and the message names the command that takes ws out of the file. See
+  blocked and the message names the two ways out: `ws install --gate launch`, or deleting the PreToolUse group whose
+  command contains `gate check` from the file. See
   [When the gate can't start](../how-to/upgrade-and-uninstall.md#when-the-gate-cant-start).
+- **ws must be installed to stay.** `ws install` won't put the hook in your config if the Python that runs the hook
+  sits in a project's `.venv`, under `.claude/worktrees/` or in a temp folder, because that folder goes away and the
+  hook then blocks every call. Install ws with `install.sh`, pipx or `uv tool install` first.
+- **Your allow rules lose to ws's deny rules.** Claude Code lets a deny rule win. `ws doctor` (WS008) lists each of your
+  `permissions.allow` rules that a ws deny rule overrides, one line each.
 
 ## Secrets
 

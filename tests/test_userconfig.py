@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import stat
 import subprocess
@@ -106,7 +107,7 @@ def test_ws_items_go_in_beside_yours_and_nothing_of_yours_moves(box, capsys):
     assert len(got["permissions"]["deny"]) > 2
     assert got["permissions"]["allow"] == ["Bash(ls:*)"]
     assert got["env"]["FOO"] == "1" and got["env"]["CAFÉ"] == "☕"
-    assert got["env"]["WS_GATED_SESSION"] == "1"
+    assert "WS_GATED_SESSION" not in got["env"]  # it would block `ws approve` in your own Claude shell
     assert got["env"]["WS_SANDBOXED"] == "0"  # no sandbox block here, so the hook skips the project-settings preflight
     assert "sandbox" not in got
     text = f.read_text(encoding="utf-8")
@@ -261,11 +262,11 @@ def test_an_item_you_already_had_is_not_ws_s_to_remove(box, capsys):
 
 
 def test_an_env_key_you_set_to_another_value_is_a_conflict_and_nothing_changes(box, capsys):
-    mine = {**MINE, "env": {"WS_GATED_SESSION": "0"}}
+    mine = {**MINE, "env": {"WS_SANDBOXED": "1"}}
     f = plant(box, mine)
     original = f.read_bytes()
     e = refused(capsys, box, runner="claude-code")
-    assert e["error_kind"] == "conflict" and "env.WS_GATED_SESSION" in e["message"]
+    assert e["error_kind"] == "conflict" and "env.WS_SANDBOXED" in e["message"]
     assert "ws gate launch" in e["hint"]
     assert f.read_bytes() == original
     assert not (box / ".ws").exists() and not (box / "Notes").exists()  # nothing at all was written
@@ -669,3 +670,379 @@ def test_install_module_still_lists_a_merge_as_a_step_kind(box):
     steps = install.plan(install.Answers(notes=str(box / "Notes"), runner="claude-code"))
     merges = [s for s in steps if s.kind == "merge"]
     assert len(merges) == 1 and merges[0].path == box / ".claude" / "settings.json"
+
+
+# ---- a re-merge after the file changed -------------------------------------------------------------------------------
+
+
+def edit(box, **keys):
+    doc = settings(box)
+    doc.update(keys)
+    (box / ".claude" / "settings.json").write_text(json.dumps(doc, indent=4) + "\n", encoding="utf-8")
+
+
+def tighten_policy(box):
+    pol = box / ".ws" / "policy.toml"
+    pol.write_text(pol.read_text(encoding="utf-8").replace("deny_tools = []", 'deny_tools = ["web_fetch"]'))
+
+
+def test_a_re_merge_after_you_edited_the_file_drops_the_exact_restore(box, capsys):
+    plant(box)
+    do_install(capsys, box)
+    edit(box, model="sonnet", brandNew=True)  # between two installs
+    tighten_policy(box)
+    do_install(capsys, box)
+    assert merge_entry(box)["exact"] is False
+    assert len(list((box / ".ws" / "backups").iterdir())) == 1  # still the one saved copy
+    code, out, _ = run(capsys, "uninstall", "--yes")
+    assert code == 0 and "kept your edits" in out
+    got = settings(box)
+    assert got["model"] == "sonnet" and got["brandNew"] is True  # the edits made in between stay
+    assert got["permissions"]["deny"] == MINE["permissions"]["deny"]
+    assert got["hooks"] == MINE["hooks"] and got["env"] == MINE["env"]
+
+
+def test_a_file_ws_made_that_gained_content_is_not_deleted_by_a_later_undo(box, capsys):
+    do_install(capsys, box)
+    assert merge_entry(box)["created_by_ws"] is True
+    edit(box, model="sonnet")
+    tighten_policy(box)
+    do_install(capsys, box)
+    code, out, _ = run(capsys, "uninstall", "--yes")
+    assert code == 0 and "kept your edits" in out
+    assert settings(box) == {"model": "sonnet"}
+
+
+def test_a_re_merge_of_an_unchanged_file_keeps_the_exact_restore(box, capsys):
+    f = plant(box)
+    original = f.read_bytes()
+    do_install(capsys, box)
+    tighten_policy(box)
+    do_install(capsys, box)
+    assert merge_entry(box)["exact"] is True
+    run(capsys, "uninstall", "--yes")
+    assert f.read_bytes() == original
+
+
+# ---- no test writes into a real config ------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "OPENCODE_CONFIG"],
+)
+def test_the_suite_starts_every_test_without_a_runner_config_variable(name):
+    assert name not in os.environ  # tests/conftest.py takes them out, whatever the shell running pytest had
+
+
+# ---- what every session locks ---------------------------------------------------------------------------------------------
+
+
+def edit_rule_matches(rule: str, path: str) -> bool:
+    """Claude Code's gitignore-style `Edit(...)` rule against an absolute path (`//x` is the absolute path /x)."""
+    spec = rule[len("Edit(") : -1]
+    if spec.startswith("//"):
+        return re.fullmatch(re.escape(spec[1:]) + r"(/.*)?", path) is not None
+    out, i = "", 0
+    while i < len(spec):
+        if spec.startswith("**/", i):
+            out += "(.*/)?"
+            i += 3
+        elif spec.startswith("**", i):
+            out += ".*"
+            i += 2
+        elif spec[i] == "*":
+            out += "[^/]*"
+            i += 1
+        else:
+            out += re.escape(spec[i])
+            i += 1
+    return re.fullmatch(".*/" + out, path) is not None
+
+
+def edit_rules(doc):
+    return [r for r in doc["permissions"]["deny"] if r.startswith("Edit(")]
+
+
+def test_every_session_locks_only_the_files_that_run_as_code(box, capsys):
+    do_install(capsys, box)
+    rules = edit_rules(settings(box))
+    for want in (
+        "Edit(**/.claude/settings.json)",
+        "Edit(**/.claude/settings.local.json)",
+        "Edit(**/.mcp.json)",
+        "Edit(**/.git/hooks/**)",
+        "Edit(**/.git/config)",
+    ):
+        assert want in rules
+    for wide in ("Edit(**/.claude/**)", "Edit(**/.claude)", "Edit(**/.git/**)", "Edit(**/opencode.json)"):
+        assert wide not in rules
+
+
+def test_an_edit_in_a_claude_worktree_is_matched_by_no_every_session_deny_rule(box, capsys):
+    do_install(capsys, box)
+    rules = edit_rules(settings(box))
+    repo = "/work/repo"
+    for ok in (
+        f"{repo}/.claude/worktrees/x/src/a.py",
+        f"{repo}/.claude/worktrees/x/README.md",
+        f"{repo}/src/a.py",
+        f"{repo}/.claude/skills/mine/SKILL.md",
+        f"{repo}/.claude/worktrees/x/.claude/commands/c.md",
+    ):
+        assert not [r for r in rules if edit_rule_matches(r, ok)], ok
+    for locked in (
+        f"{repo}/.claude/settings.json",
+        f"{repo}/.claude/worktrees/x/.claude/settings.local.json",
+        f"{repo}/.mcp.json",
+        f"{repo}/.git/hooks/pre-commit",
+        f"{repo}/.git/config",
+        str(box / ".ws" / "policy.toml"),
+        str(box / ".claude" / "settings.json"),
+    ):
+        assert [r for r in rules if edit_rule_matches(r, locked)], locked
+
+
+def test_the_interpreter_tree_the_hook_runs_from_is_locked(box, capsys, monkeypatch):
+    tree = box / "tools" / "ws-env"
+    monkeypatch.setattr(selfcmd, "tree", lambda: tree)
+    do_install(capsys, box)
+    rules = edit_rules(settings(box))
+    assert [r for r in rules if edit_rule_matches(r, str(tree / "lib" / "ws" / "gate.py"))]
+
+
+def test_the_launch_file_keeps_the_wide_project_locks(box, capsys):
+    do_install(capsys, box)
+    wide = json.loads((box / ".ws" / "gate" / "claude-code" / "settings.json").read_text())
+    rules = edit_rules(wide)
+    assert "Edit(**/.claude/**)" in rules and "Edit(**/.git/hooks/**)" in rules
+    assert [r for r in rules if edit_rule_matches(r, "/work/repo/.claude/worktrees/x/src/a.py")]
+
+
+# ---- a hook interpreter that comes and goes ------------------------------------------------------------------------------
+
+REAL_STABLE_CHECK = userconfig.require_stable_interpreter  # tests/conftest.py swaps it out while a test runs
+
+
+@pytest.mark.parametrize(
+    ("exe", "word"),
+    [
+        ("/home/me/code/proj/.venv/bin/python", ".venv"),
+        ("/home/me/code/proj/.claude/worktrees/agent-1/.venv/bin/python", ".venv"),
+        ("/home/me/code/proj/.claude/worktrees/agent-1/env/bin/python", "worktree"),
+        ("/tmp/xyz/env/bin/python", "temp"),
+        ("/var/tmp/env/bin/python", "temp"),
+    ],
+)
+def test_an_interpreter_that_comes_and_goes_is_named(exe, word):
+    assert word in (selfcmd.unstable([exe, "-I", "-m", "ws"]) or "")
+
+
+@pytest.mark.parametrize(
+    "exe",
+    [
+        "/home/me/.local/share/pipx/venvs/ws/bin/python",
+        "/home/me/.local/share/uv/tools/ws/bin/python",
+        "/usr/bin/python3",
+        "/opt/ws/bin/python",
+    ],
+)
+def test_an_installed_interpreter_is_fine(exe):
+    assert selfcmd.unstable([exe, "-I", "-m", "ws"]) is None
+
+
+def test_every_session_refuses_a_project_venv_interpreter_and_writes_nothing(box, capsys, monkeypatch):
+    monkeypatch.setattr(userconfig, "require_stable_interpreter", REAL_STABLE_CHECK)
+    monkeypatch.setattr(selfcmd, "argv", lambda: [str(box / "proj" / ".venv" / "bin" / "python"), "-I", "-m", "ws"])
+    e = refused(capsys, box)
+    assert e["error_kind"] == "refused" and ".venv" in e["message"]
+    assert "install.sh" in e["hint"] and "pipx" in e["hint"] and "uv tool" in e["hint"]
+    assert not (box / ".claude").exists() and not (box / ".ws").exists()
+    code, _, _ = do_install(capsys, box, "--gate", "launch")  # the wall alone needs no hook in your config
+    assert code == 0 and not (box / ".claude" / "settings.json").exists()
+
+
+def test_when_the_gate_cannot_run_the_message_says_how_to_get_unstuck(box, capsys):
+    plant(box)
+    do_install(capsys, box)
+    cmd = hook_command(box).replace(selfcmd.argv()[0], "/nonexistent/python", 1)
+    res = run_hook(box, cmd, "ls")
+    assert res.returncode == 2
+    assert "run `ws install --gate launch`" in res.stderr
+    assert "delete the PreToolUse group whose command contains `gate check`" in res.stderr
+    assert str(box / ".claude" / "settings.json") in res.stderr
+
+
+# ---- one writer at a time, and a checked write ---------------------------------------------------------------------------
+
+
+def test_the_lock_file_is_gone_after_an_install_and_an_uninstall(box, capsys):
+    plant(box)
+    do_install(capsys, box)
+    assert not [p for p in (box / ".claude").iterdir() if "lock" in p.name]
+    run(capsys, "uninstall", "--yes")
+    assert not [p for p in (box / ".claude").iterdir() if "lock" in p.name]
+
+
+def test_an_install_waits_for_the_lock_then_refuses_and_changes_nothing(box, capsys, monkeypatch):
+    fcntl = pytest.importorskip("fcntl")
+    f = plant(box)
+    original = f.read_bytes()
+    monkeypatch.setattr(userconfig, "_LOCK_WAIT", 0.2)
+    fd = os.open(f.parent / ".settings.json.ws-lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        e = refused(capsys, box)
+    finally:
+        os.close(fd)
+    assert e["error_kind"] == "conflict" and "another ws holds the lock" in e["message"]
+    assert f.read_bytes() == original and not (box / ".ws" / "backups").exists()
+
+
+def concurrent_writer(box, monkeypatch, times):
+    """After ws has read the file and built its merge, someone else writes to it: `times` times."""
+    real = userconfig.dump
+    state = {"n": 0}
+
+    def dump(doc, raw):
+        out = real(doc, raw)
+        if state["n"] < times:
+            state["n"] += 1
+            other = settings(box) if raw is not None else {}
+            other[f"other{state['n']}"] = True
+            (box / ".claude" / "settings.json").write_text(json.dumps(other, indent=4) + "\n", encoding="utf-8")
+        return out
+
+    monkeypatch.setattr(userconfig, "dump", dump)
+
+
+def test_a_file_that_changes_under_ws_is_merged_again_once(box, capsys, monkeypatch):
+    plant(box)
+    concurrent_writer(box, monkeypatch, 1)
+    code, _, _ = do_install(capsys, box)
+    assert code == 0
+    got = settings(box)
+    assert got["other1"] is True and got["model"] == "opus"  # the other writer's key is in the file ws wrote
+    assert len(got["hooks"]["PreToolUse"]) == 2
+    backups = list((box / ".ws" / "backups").iterdir())
+    assert len(backups) == 1  # the first attempt's saved copy was taken away again
+    assert "other1" in backups[0].read_text()  # the one left holds the bytes ws merged into
+
+
+def test_a_file_that_keeps_changing_is_refused_and_left_as_the_other_writer_left_it(box, capsys, monkeypatch):
+    plant(box)
+    concurrent_writer(box, monkeypatch, 5)
+    e = refused(capsys, box)
+    assert e["error_kind"] == "conflict" and "changed while ws was writing" in e["message"]
+    got = settings(box)
+    assert got["other2"] is True and len(got["hooks"]["PreToolUse"]) == 1  # no ws item went in
+    assert not (box / ".ws" / "backups").exists()
+    assert not [e for e in manifest(box)["entries"] if e.get("kind") == "merge"]  # nothing recorded for the file
+
+
+# ---- a lost record ---------------------------------------------------------------------------------------------------------
+
+
+def lose_the_record(box):
+    (box / ".ws" / "install-manifest.json").unlink()
+
+
+def test_ws_items_with_no_record_are_adopted_so_an_undo_takes_them_out(box, capsys):
+    plant(box)
+    do_install(capsys, box)
+    lose_the_record(box)
+    assert ws008(box).status == "fail"
+    code, out, _ = do_install(capsys, box)
+    assert code == 0 and "0 changes" not in out
+    e = merge_entry(box)
+    assert e["added"] and e["exact"] is False and e["created_by_ws"] is False
+    assert ws008(box).status == "ok"
+    assert len(settings(box)["hooks"]["PreToolUse"]) == 2  # no second copy of ws's hook
+    assert "0 changes" in do_install(capsys, box)[1]
+    run(capsys, "uninstall", "--yes")
+    assert settings(box) == MINE
+
+
+def test_a_stale_ws_hook_with_no_record_is_updated_in_place(box, capsys):
+    plant(box)
+    do_install(capsys, box)
+    lose_the_record(box)
+    doc = settings(box)
+    hook = doc["hooks"]["PreToolUse"][-1]["hooks"][0]
+    hook["command"] = hook["command"].replace(selfcmd.argv()[0], "/old/ws/bin/python", 1)
+    (box / ".claude" / "settings.json").write_text(json.dumps(doc, indent=4) + "\n", encoding="utf-8")
+    assert "/old/ws/bin/python" in hook_command(box)
+    do_install(capsys, box)
+    assert "/old/ws/bin/python" not in hook_command(box)
+    assert len(settings(box)["hooks"]["PreToolUse"]) == 2
+    run(capsys, "uninstall", "--yes")
+    assert settings(box) == MINE
+
+
+def test_a_file_with_no_ws_items_and_no_record_is_a_normal_first_install(box, capsys):
+    plant(box)
+    do_install(capsys, box)
+    e = merge_entry(box)
+    assert e["exact"] is True and e["backup"]
+
+
+# ---- WS008 lists allow rules that ws's deny rules override ------------------------------------------------------------
+
+
+def ws008_rows(box):
+    checks = doctor.run_checks(osinfo.detect(), box / ".ws" / "profile.toml", env=dict(os.environ), network=False)
+    return [c for c in checks if c.id == "WS008"]
+
+
+def test_ws008_lists_each_allow_rule_that_a_ws_deny_rule_overrides(box, capsys):
+    do_install(capsys, box)
+    doc = settings(box)
+    doc["permissions"]["allow"] = ["Bash(rm -rf /etc/hosts)", "Bash(ls:*)", "Bash(npm test:*)"]
+    (box / ".claude" / "settings.json").write_text(json.dumps(doc, indent=4) + "\n", encoding="utf-8")
+    rows = ws008_rows(box)
+    over = [c for c in rows if "overridden" in c.detail]
+    assert len(over) == 1 and over[0].status == "warn"
+    assert "`Bash(rm -rf /etc/hosts)`" in over[0].detail and "deny rule `Bash(rm -* /etc*)`" in over[0].detail
+    assert "allow rule" in over[0].fix
+    assert rows[0].status == "ok"  # the gate itself is in place
+
+
+def test_ws008_has_no_override_lines_when_nothing_overlaps(box, capsys):
+    plant(box)
+    do_install(capsys, box)
+    assert len(ws008_rows(box)) == 1
+
+
+@pytest.mark.parametrize(
+    ("allow", "deny", "hit"),
+    [
+        ("WebFetch", "WebFetch", True),
+        ("WebFetch(domain:example.com)", "WebFetch", True),
+        ("Bash(git push:*)", "Bash(git push*)", True),
+        ("Bash(git push origin main)", "Bash(git push:*)", True),
+        ("Bash(git:*)", "Bash(git push:*)", True),
+        ("Bash(ls:*)", "Bash(rm -* /)", False),
+        ("Read(~/notes/**)", "Bash(rm -* /)", False),
+        ("Bash", "Bash(rm -* /)", False),
+    ],
+)
+def test_which_allow_rules_a_deny_rule_overrides(allow, deny, hit):
+    assert userconfig._overrides(allow, deny) is hit
+
+
+# ---- ws approve from your own Claude shell ----------------------------------------------------------------------------------
+
+
+def test_the_merged_env_does_not_stop_ws_approve_in_your_own_claude_shell(box, capsys):
+    from ws import approvals
+
+    do_install(capsys, box)
+    env = settings(box)["env"]  # what Claude Code puts into the shell a person's `!` command runs in
+    assert approvals.refuse_reason(dict(env), True) is None
+    assert "not for a gated session" in policy.is_denied_command(policy.loads(""), "ws approve abc")  # the model's call
+
+
+def test_a_test_that_undoes_its_monkeypatch_still_has_no_runner_config_variable(monkeypatch):
+    monkeypatch.undo()  # test_modules does this; it must not bring the shell's variables back
+    for name in ("CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME", "OPENCODE_CONFIG"):
+        assert name not in os.environ

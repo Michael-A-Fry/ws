@@ -255,6 +255,12 @@ def run_checks(osi: OSInfo, profile_file: Path, env: dict | None = None, network
     except Exception as e:  # noqa: BLE001 (a broken check must report, not crash the whole doctor)
         status, detail, fix = FAIL, f"check crashed ({type(e).__name__})", ""
     checks.append(Check("WS008", "gate", status, detail, fix))
+    try:
+        over = userconfig.overridden(env)
+    except Exception:  # noqa: BLE001 (the main WS008 line already says whether the gate is in place)
+        over = []
+    fix = "remove that allow rule, or take the deny rule out of the policy and run `ws install`"
+    checks += [Check("WS008", "gate", WARN, line, fix) for line in over]
     roles = prof.get("roles") if isinstance(prof.get("roles"), dict) else {}
     for r in ROLES:
         cfg = roles.get(r.name)

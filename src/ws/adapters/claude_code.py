@@ -55,7 +55,13 @@ session going: those hooks add context and findings, and the session carries on 
 every session except one whose settings set WS_SANDBOXED=0, the marker of a settings file written without the sandbox
 block; settings written before the marker existed carry the block and no marker, so `preflight` runs for them.
 
-Pass the file with `claude --settings OUT/settings.json`. Nothing here touches ~/.claude.
+Pass the file with `claude --settings OUT/settings.json`. Nothing in this module writes ~/.claude: `ws install` merges
+the hooks, deny rules and env of this file into the user's own `settings.json` when the profile says
+`gate = "every-session"` (ws.userconfig). That copy is built with `user_scope=True`, which swaps the project-lock Edit
+rules above for `USER_LOCKS`. In every session, not only inside the wall, a rule such as `Edit(**/.claude/**)` would
+also block a session working in a `.claude/worktrees/` checkout, so the shared file locks only the files Claude Code
+or the version-control tool runs as code. It also leaves out WS_GATED_SESSION, so `ws approve` still works from the
+person's own Claude shell (the hook denies it to the model whatever the env says).
 """
 
 from __future__ import annotations
@@ -78,6 +84,15 @@ FILE = "settings.json"
 MATCHER = "Bash|Read|Grep|Glob|WebFetch|WebSearch|Edit|Write|MultiEdit|NotebookEdit"
 _TOOLS = {"web_fetch": "WebFetch", "web_search": "WebSearch"}
 _NEUTRAL = {v: k for k, v in _TOOLS.items()}
+# The project files that run as code, at any depth. These are the Edit locks in the user's own settings.json (every
+# session); the wide set from ws.sandbox.claude_denied() stays in the file `ws gate launch` uses, inside the wall.
+USER_LOCKS = (
+    "Edit(**/.claude/settings.json)",
+    "Edit(**/.claude/settings.local.json)",
+    "Edit(**/.mcp.json)",
+    "Edit(**/.git/hooks/**)",
+    "Edit(**/.git/config)",
+)
 # Claude Code's hook event names, as ws.guards names them.
 EVENT_NAMES = {
     "PreToolUse": "pre",
@@ -247,20 +262,29 @@ def for_project(settings: str, project: str) -> str:
 
 
 def generate(
-    policy: Policy, ws_cmd: list[str], out: Path, policy_file: Path, *, protect: tuple[str, ...] = ()
+    policy: Policy,
+    ws_cmd: list[str],
+    out: Path,
+    policy_file: Path,
+    *,
+    protect: tuple[str, ...] = (),
+    user_scope: bool = False,
 ) -> dict[str, str]:
     protect = tuple(protect)
     deny = [f"Bash({p})" for p in native_patterns(policy)]
     deny += [f"Read({_path(p)})" for p in policy.gate.deny_read]
     for p in protected_paths(out, policy_file, protect):  # a file or a folder: cover both; Edit rules cover Write too
         deny += [f"Edit({_path(p)})", f"Edit({_path(p)}/**)"]
-    from ws import sandbox
+    if user_scope:
+        deny += USER_LOCKS
+    else:
+        from ws import sandbox
 
-    for rel in sandbox.claude_denied():  # the project's own config and git hooks: see ws.sandbox PROJECT_LOCKED
-        deny += [
-            f"Edit(**/{rel})",
-            f"Edit(**/{rel}/**)",
-        ]  # at any depth: a runner started in a sub-folder reads that one
+        for rel in sandbox.claude_denied():  # the project's own config and git hooks: see ws.sandbox PROJECT_LOCKED
+            deny += [
+                f"Edit(**/{rel})",
+                f"Edit(**/{rel}/**)",
+            ]  # at any depth: a runner started in a sub-folder reads that one
     deny += [_TOOLS[t] for t in policy.gate.deny_tools]
     hook = shlex.join(check_argv(ws_cmd, NAME, policy_file, out, protect)) + " || exit 2"
     matcher = _matcher(guards.kinds_for(policy.guards.on, "pre") & set(_EXTRA_PRE_KINDS), tuple(MATCHER.split("|")))

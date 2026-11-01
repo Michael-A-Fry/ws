@@ -9,8 +9,13 @@ The promises, each pinned by a test:
   to another value).
 - Before the first write the file's own bytes go to `$WS_HOME/backups/` (mode 0600).
 - The manifest records the items ws added, as exact JSON, and the hash of ws's last write.
-- Undo is exact. If the file is still what ws last wrote, your original bytes come back (or the file goes, when ws made
-  it). If you changed it since, only the recorded items come out and your edits stay.
+- Undo is exact only when it can be. If the file is still what ws last wrote, and it was not changed between two
+  `ws install` runs, your original bytes come back (or the file goes, when ws made it). If it was changed at any point
+  after the first write, only the recorded items come out and your edits stay.
+- Writes are checked. ws holds a lock file beside the config while it merges, and reads the file again just before it
+  replaces it; a file that changed under it is merged again once, then refused.
+- A config that already holds ws's hooks but has no record (the manifest was lost) is adopted: the entries are recorded
+  so an undo takes them out, and a hook command from an older ws is replaced in place.
 - A file ws cannot merge safely (a link, not plain JSON, JSONC with comments) is refused with the reason and the way to
   gate a session without it: `ws gate launch`.
 
@@ -19,18 +24,23 @@ Python 3.11+, standard library only.
 
 from __future__ import annotations
 
+import contextlib
 import copy
+import fnmatch
 import hashlib
 import json
 import os
+import re
 import shlex
 import subprocess
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
 from ws import adapters, policy, profile, selfcmd
+from ws.approvals import ENV_MARKER
 from ws.output import WsError
 
 GATES = ("every-session", "launch")
@@ -42,6 +52,8 @@ _MAX_BYTES = 4 << 20
 _PLUGIN_NAME = "plugins/ws-gate.js"
 _HOOK_SUFFIX = " || exit 2"
 _MISSING = object()
+_LOCK_WAIT = 10.0  # seconds to wait for another ws that holds the lock beside the config
+_WS_HOOK = re.compile(r"\b(gate (check|event)|session (start|nudge))\b.*--runner\b")  # every hook command ws writes
 
 
 @dataclass(frozen=True)
@@ -323,7 +335,8 @@ def _claude_ops(files: Mapping[str, str]) -> list[dict]:
         ops += [{"op": "append", "path": ["hooks", event], "value": g} for g in groups]
     deny = conf.get("permissions", {}).get("deny", [])
     ops += [{"op": "append", "path": ["permissions", "deny"], "value": rule} for rule in deny]
-    env = dict(conf.get("env", {}))
+    # WS_GATED_SESSION is left out: here it would also be set in the person's own Claude shell and block `ws approve`
+    env = {k: v for k, v in conf.get("env", {}).items() if k != ENV_MARKER}
     env["WS_SANDBOXED"] = "0"  # this file carries no sandbox block; the hook then skips the project-settings preflight
     ops += [{"op": "set", "path": ["env", k], "value": v} for k, v in env.items()]
     return ops
@@ -344,10 +357,13 @@ def _opencode_ops(files: Mapping[str, str]) -> list[dict]:
     return ops
 
 
-def _notice(runner: str, where: Path, backup: Path | None, cmd: list[str]) -> str:
-    out = f"ws: the gate did not run, so this call is blocked. To take ws out of {where}: {shlex.join(cmd)} install --gate launch"
+def _notice(where: Path, backup: Path | None) -> str:
+    out = (
+        "ws: the gate did not run, so this call is blocked. To get unstuck, run `ws install --gate launch`, or delete "
+        f"the PreToolUse group whose command contains `gate check` from {where}"
+    )
     if backup:
-        out += f" (your file from before ws is saved at {backup})"
+        out += f" (a saved copy of your file is at {backup})"
     return out
 
 
@@ -376,10 +392,24 @@ def _new_backup(runner: str, env: Mapping[str, str]) -> Path:
     return path
 
 
+def require_stable_interpreter(cmd) -> None:
+    """Refuse a hook interpreter that comes and goes (a project `.venv`, a worktree, a temp folder). The hook would stay
+    in the person's config long after that folder is gone, and every governed call would then be blocked."""
+    why = selfcmd.unstable(list(cmd))
+    if why:
+        raise WsError(
+            "refused",
+            f"{why}; hooks that run it would go into every session and break when it goes. ws changed nothing",
+            "install ws with install.sh, pipx or `uv tool install` first, then run `ws install` from that copy; or use "
+            "`ws install --gate launch`",
+        )
+
+
 def plan(runner: str, pol: policy.Policy, policy_file: Path, env: Mapping[str, str], entry: Mapping | None) -> GatePlan:
     """The generated files and the merge for this runner. Pure but for reading the target (to name the backup)."""
     adapter = adapters.get(runner)
     cmd = selfcmd.argv()
+    require_stable_interpreter(cmd)
     where = target(runner, env)
     out = _ws_home(env) / "gate" / runner
     if entry is not None:
@@ -388,9 +418,13 @@ def plan(runner: str, pol: policy.Policy, policy_file: Path, env: Mapping[str, s
         backup = _new_backup(runner, env) if os.path.lexists(where) else None
     copies: dict = {}
     if runner == "claude-code":
-        files = adapter.generate(pol, cmd, out, policy_file, protect=(str(where),))
-        files = _tune(files, _notice(runner, where, backup, cmd))
-        ops = _claude_ops(files)
+        tree = selfcmd.tree()
+        protect = (str(where), *([str(tree)] if tree else []))
+        notice = _notice(where, backup)
+        # `ws gate launch` runs inside the wall, so its file keeps the wide project locks; the user's own config is read
+        # by every session, so it gets the narrow set (see USER_LOCKS)
+        files = _tune(adapter.generate(pol, cmd, out, policy_file, protect=protect), notice)
+        ops = _claude_ops(_tune(adapter.generate(pol, cmd, out, policy_file, protect=protect, user_scope=True), notice))
     else:
         plug = plugin_path(env)
         files = adapter.generate(pol, cmd, out, policy_file, protect=(str(where), str(plug)))
@@ -419,9 +453,12 @@ def classify(m: Merge, entry: Mapping | None) -> str:
     _check_jsonc_sibling(m)
     doc, raw = load(m.path)
     if entry is None:
-        _, added, made = update(doc, [], [], m.ops, m.path)
+        earlier = earlier_items(doc, m)  # ws's items with no record: applying records them
+        _, added, made = update(doc, earlier, [], m.ops, m.path)
         if not added and not made:
             return "unchanged"
+        if earlier:
+            return "changed"
         return "created" if raw is None else "changed"
     update(
         doc, entry.get("added", []), entry.get("made", []), m.ops, m.path
@@ -441,23 +478,145 @@ def _write_backup(m: Merge, raw: bytes) -> None:
         os.fsync(f.fileno())
 
 
-def apply(m: Merge, entry: Mapping | None, env: Mapping[str, str]) -> tuple[dict | None, Outcome]:
-    """Merge into the file. Returns (the manifest entry to keep, or None when there is nothing to record, the outcome)."""
-    if not m.ops:
-        out = withdraw(entry, env) if entry else Outcome("gone")
-        return (dict(entry) if out.action == "pending" else None), out
-    _check_jsonc_sibling(m)
+# ---- one writer at a time, and a write that checks what it replaces ---------------------------------------------------------
+
+
+class _Changed(Exception):
+    """The file was changed by someone else between ws reading it and replacing it."""
+
+
+def _take_lock(fcntl, lock: Path, path: Path) -> int | None:
+    """An open, exclusively locked descriptor on `lock`, or None where a lock can't be made (a read-only folder, a file
+    system without locks): the checked write below still protects the file. Waits up to `_LOCK_WAIT` seconds."""
+    deadline = time.monotonic() + _LOCK_WAIT
+    while True:
+        try:
+            fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+        except OSError:
+            return None
+        try:
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except (BlockingIOError, PermissionError):
+                    if time.monotonic() >= deadline:
+                        raise WsError(
+                            "conflict",
+                            f"another ws holds the lock on {path} ({lock}); ws changed nothing",
+                            "wait for it to finish and run the command again",
+                        ) from None
+                    time.sleep(0.05)
+            try:
+                if os.fstat(fd).st_ino == os.stat(lock).st_ino:
+                    return fd
+            except FileNotFoundError:
+                pass  # the holder before us removed the lock file: take the new one
+        except OSError:
+            os.close(fd)
+            return None
+        except BaseException:
+            os.close(fd)
+            raise
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def _locked(path: Path):
+    """Hold an exclusive lock on a file beside `path` while ws reads it, merges and replaces it, so two ws runs (an
+    install and a setup screen) take turns. The runner doesn't take the lock, so `_replace` checks the file as well."""
+    try:
+        import fcntl
+    except ImportError:  # native Windows: the doctor runs there, installs don't
+        yield
+        return
+    lock = path.parent / f".{path.name}.ws-lock"
+    fd = _take_lock(fcntl, lock, path) if path.parent.is_dir() else None
+    try:
+        yield
+    finally:
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(lock)  # still holding the lock, so nobody else has it
+            os.close(fd)
+
+
+def _disk_sha(path: Path) -> str | None:
+    try:
+        return _sha(path.read_bytes())
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return "unreadable"
+
+
+def _replace(path: Path, data: bytes, based_on: bytes | None) -> None:
+    """Replace the file with `data`, if it is still the bytes `based_on` that ws merged into; else raise `_Changed`."""
+    if _disk_sha(path) != (None if based_on is None else _sha(based_on)):
+        raise _Changed
+    _write(path, data)
+
+
+# ---- adopting what an earlier ws left --------------------------------------------------------------------------------------
+
+
+def _is_ws_group(group) -> bool:
+    hooks = group.get("hooks") if isinstance(group, dict) else None
+    return isinstance(hooks, list) and any(
+        isinstance(h, dict) and isinstance(h.get("command"), str) and _WS_HOOK.search(h["command"]) for h in hooks
+    )
+
+
+def earlier_items(doc: dict, m: Merge) -> list:
+    """The items an earlier ws left in the file when its record is lost, as ops. A hook is ws's when its command runs
+    `gate check`, `gate event` or `session start|nudge` with `--runner`: that holds for a command from an older ws or
+    another Python too, so it is swapped in place. With such a hook in the file (or OpenCode's plugin beside it), the
+    deny rules and env keys that equal what ws wants now are ws's too. None found means ws was never here."""
+    found: list = []
+    hooks = doc.get("hooks")
+    if isinstance(hooks, dict):
+        for event, groups in hooks.items():
+            if isinstance(groups, list):
+                found += [{"op": "append", "path": ["hooks", event], "value": g} for g in groups if _is_ws_group(g)]
+    if not found and not (m.runner == "opencode" and (m.path.parent / _PLUGIN_NAME).is_file()):
+        return []
+    for op in m.ops:
+        if op["path"][0] != "hooks" and present(doc, [op]):
+            found.append(op)
+    return found
+
+
+# ---- applying ------------------------------------------------------------------------------------------------------------------
+
+
+def _emptied_by(doc: dict, items: list, where: Path) -> list:
+    """The containers (lists and objects, with the ones above them) that hold nothing once `items` are out of the doc:
+    ws made them. Recorded for an adopted file, so an undo tidies them away as it does after a normal install."""
+    paths: list = []
+    for op in items:
+        path = op["path"] if op["op"] == "append" else op["path"][:-1]
+        paths += [path[:i] for i in range(1, len(path) + 1) if path[:i] not in paths]
+    bare, _, _ = update(doc, items, paths, [], where)
+    return [p for p in paths if _lookup(doc, p) is not _MISSING and _lookup(bare, p) is _MISSING]
+
+
+def _merge_once(m: Merge, entry: Mapping | None, made_dirs: list, new_dirs: list) -> tuple[dict | None, Outcome]:
     doc, raw = load(m.path)
     old_added = list(entry.get("added", [])) if entry else []
     old_made = list(entry.get("made", [])) if entry else []
+    adopted = False
+    if entry is None:
+        old_added = earlier_items(doc, m)
+        adopted = bool(old_added)
+        old_made = _emptied_by(doc, old_added, m.path)
     new, added, made = update(doc, old_added, old_made, m.ops, m.path)
     if entry is None and not added and not made:
         return None, Outcome("applied")
+    first = entry is None and raw is not None and m.backup is not None
     backup = entry.get("backup") if entry else (str(m.backup) if m.backup and raw is not None else None)
     backup_sha = entry.get("backup_sha256") if entry else (_sha(raw) if raw is not None else None)
-    if entry is None and raw is not None and m.backup:
+    if first:
         _write_backup(m, raw)
-    made_dirs = list(entry.get("made_dirs", [])) if entry else []
     if raw is None:
         missing = []
         p = m.path.parent
@@ -467,9 +626,21 @@ def apply(m: Merge, entry: Mapping | None, env: Mapping[str, str]) -> tuple[dict
         for d in reversed(missing):
             d.mkdir()
             made_dirs.append(str(d))
+            new_dirs.append(d)
     data = dump(new, raw)
     if data != raw:
-        _write(m.path, data)
+        try:
+            _replace(m.path, data, raw)
+        except _Changed:
+            if first:
+                m.backup.unlink(missing_ok=True)
+                with contextlib.suppress(OSError):
+                    m.backup.parent.rmdir()  # only if it is empty now
+            raise
+    if entry is None:
+        exact = not adopted  # an adopted file already held ws's items: its bytes now are not ones to give back
+    else:  # exact only if the file is what ws last wrote, and it was not changed between two installs before
+        exact = entry.get("exact") is not False and (raw is None or _sha(raw) == entry.get("sha256"))
     kept = {
         "path": str(m.path),
         "kind": KIND,
@@ -477,14 +648,44 @@ def apply(m: Merge, entry: Mapping | None, env: Mapping[str, str]) -> tuple[dict
         "runner": m.runner,
         "added": added,
         "made": made,
-        "made_dirs": made_dirs,
+        "made_dirs": list(made_dirs),
         "wanted": wanted(m.ops),
         "cmd": list(m.cmd),
         "sha256": _sha(data),
+        "exact": exact,
         "backup": backup,
         "backup_sha256": backup_sha,
     }
     return kept, Outcome("applied")
+
+
+def apply(m: Merge, entry: Mapping | None, env: Mapping[str, str]) -> tuple[dict | None, Outcome]:
+    """Merge into the file. Returns (the manifest entry to keep, or None when there is nothing to record, the outcome).
+    Under a lock, and with the file read again just before it is replaced: if it changed meanwhile, ws merges into the
+    new bytes once more, then refuses and leaves the file as the other writer left it."""
+    if not m.ops:
+        out = withdraw(entry, env) if entry else Outcome("gone")
+        return (dict(entry) if out.action == "pending" else None), out
+    _check_jsonc_sibling(m)
+    made_dirs = list(entry.get("made_dirs", [])) if entry else []
+    new_dirs: list = []
+    try:
+        for _ in range(2):
+            with _locked(m.path):
+                try:
+                    return _merge_once(m, entry, made_dirs, new_dirs)
+                except _Changed:
+                    continue
+        raise WsError(
+            "conflict",
+            f"{m.path} changed while ws was writing to it, twice; ws changed nothing",
+            "close whatever else writes to it (a running session's settings screen?), then run `ws install` again",
+        )
+    except BaseException:
+        for d in reversed(new_dirs):
+            with contextlib.suppress(OSError):
+                d.rmdir()
+        raise
 
 
 def _backup_ok(entry: Mapping, env: Mapping[str, str]) -> Path | None:
@@ -498,15 +699,7 @@ def _backup_ok(entry: Mapping, env: Mapping[str, str]) -> Path | None:
     return p if _sha(p.read_bytes()) == entry.get("backup_sha256") else None
 
 
-def withdraw(entry: Mapping, env: Mapping[str, str], dry_run: bool = False) -> Outcome:
-    """Take ws's entries out of the file the manifest names. Exact when the file is as ws last wrote it, surgical when
-    you have edited it since. The path must be the target for the runner now: the manifest can't point this elsewhere."""
-    runner = entry.get("runner")
-    if runner not in RUNNERS or Path(os.path.normpath(str(entry.get("path")))) != target(runner, env):
-        return Outcome("refused", note=f"{entry.get('path')}: not a user config file ws manages")
-    path = target(runner, env)
-    if not os.path.lexists(path):
-        return Outcome("gone", note=f"{path} is already gone")
+def _withdraw_once(entry: Mapping, env: Mapping[str, str], path: Path, dry_run: bool) -> Outcome:
     try:
         doc, raw = load(path)
     except WsError as e:
@@ -516,22 +709,52 @@ def withdraw(entry: Mapping, env: Mapping[str, str], dry_run: bool = False) -> O
     removed: list = []
     backup = _backup_ok(entry, env)
     as_written = _sha(raw) == entry.get("sha256")
-    if as_written and (backup is not None or not entry.get("backup")):
+    exact = as_written and entry.get("exact") is not False
+    made_it = not entry.get("backup") and entry.get("created_by_ws", True) is not False
+    if exact and (backup is not None or made_it):
         if not dry_run:
             if backup is None:
+                if _disk_sha(path) != _sha(raw):
+                    raise _Changed
                 path.unlink()  # ws made the file
             else:
-                _write(path, backup.read_bytes())
+                _replace(path, backup.read_bytes(), raw)
                 backup.unlink()
                 removed.append(backup)
-            removed += _tidy(path, entry, backups_dir(env))
         word = "removed (ws made it)" if backup is None else "restored exactly"
         return Outcome("removed" if backup is None else "restored", removed, f"{path}: {word}")
     new, _, _ = update(doc, entry.get("added", []), entry.get("made", []), [], path)
     if not dry_run:
-        _write(path, dump(new, raw))
-    why = "you changed it since" if as_written is False else "the saved copy is gone"
+        _replace(path, dump(new, raw), raw)
+    if not as_written:
+        why = "you changed it since"
+    elif entry.get("exact") is False:
+        why = "it was changed between two installs, so the saved copy is out of date"
+    else:
+        why = "the saved copy is gone"
     return Outcome("trimmed", removed, f"{path}: {why}, so ws took out only its own entries and kept your edits")
+
+
+def withdraw(entry: Mapping, env: Mapping[str, str], dry_run: bool = False) -> Outcome:
+    """Take ws's entries out of the file the manifest names. Exact when the file is as ws last wrote it and was never
+    changed between two installs; surgical otherwise. The path must be the target for the runner now: the manifest can't
+    point this elsewhere."""
+    runner = entry.get("runner")
+    if runner not in RUNNERS or Path(os.path.normpath(str(entry.get("path")))) != target(runner, env):
+        return Outcome("refused", note=f"{entry.get('path')}: not a user config file ws manages")
+    path = target(runner, env)
+    if not os.path.lexists(path):
+        return Outcome("gone", note=f"{path} is already gone")
+    for _ in range(2):
+        with contextlib.nullcontext() if dry_run else _locked(path):
+            try:
+                out = _withdraw_once(entry, env, path, dry_run)
+            except _Changed:
+                continue
+        if out.action in ("restored", "removed") and not dry_run:
+            out.removed += _tidy(path, entry, backups_dir(env))  # after the lock file is gone, so the folder is empty
+        return out
+    return Outcome("pending", note=f"{path} changed while ws was writing to it; ws's entries are still in it")
 
 
 def _tidy(path: Path, entry: Mapping, backup_dir: Path) -> list:
@@ -627,3 +850,46 @@ def check(env: Mapping[str, str] | None = None) -> tuple[str, str, str]:
         return WARN, "; ".join([f"ws's entries in {where} are from an earlier policy", *notes]), "run `ws install`"
     detail = f"every session is gated: ws's entries are in {where}"
     return (WARN, "; ".join([detail, *notes]), "") if notes else (OK, detail, "")
+
+
+def _rule(text: str) -> tuple[str, str | None]:
+    """`Bash(git push:*)` -> ("Bash", "git push*"); `WebFetch` -> ("WebFetch", None). `:*` is Claude Code's prefix form."""
+    m = re.fullmatch(r"([A-Za-z_]+)\((.*)\)", text, re.DOTALL)
+    if not m:
+        return text, None
+    spec = m.group(2)
+    return m.group(1), spec[:-2] + "*" if spec.endswith(":*") else spec
+
+
+def _overrides(allow: str, deny: str) -> bool:
+    """Does the deny rule take away some or all of what the allow rule grants? A deny wins over an allow in Claude Code.
+    Same tool, and either rule's pattern matches the other's text (one is a case of the other), or the deny names the
+    whole tool."""
+    (a_tool, a_spec), (d_tool, d_spec) = _rule(allow), _rule(deny)
+    if a_tool != d_tool:
+        return False
+    if d_spec is None or a_spec is None:
+        return d_spec is None
+    return fnmatch.fnmatchcase(a_spec, d_spec) or fnmatch.fnmatchcase(d_spec, a_spec)
+
+
+def overridden(env: Mapping[str, str] | None = None) -> list[str]:
+    """One line for each of your `permissions.allow` rules that a deny rule ws added now overrides (Claude Code lets a
+    deny win), for doctor's WS008. [] when ws has added nothing to the file or the file doesn't read."""
+    env = os.environ if env is None else env
+    entry = _manifest_entry("claude-code", env)
+    if entry is None:
+        return []
+    try:
+        doc, _ = load(target("claude-code", env))
+    except WsError:
+        return []
+    perms = doc.get("permissions")
+    allow = perms.get("allow") if isinstance(perms, dict) else None
+    ours = [op["value"] for op in entry.get("added", []) if op["path"] == ["permissions", "deny"]]
+    lines = []
+    for rule in allow if isinstance(allow, list) else []:
+        hit = next((d for d in ours if isinstance(rule, str) and isinstance(d, str) and _overrides(rule, d)), None)
+        if hit:
+            lines.append(f"your allow rule `{rule}` is overridden by ws's deny rule `{hit}`")
+    return lines

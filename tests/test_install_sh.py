@@ -9,6 +9,7 @@ but cannot switch a check off (several tests below prove that with a damaged or 
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -22,7 +23,7 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 INSTALL_SH = ROOT / "install.sh"
 BASH = shutil.which("bash")
-SYSTEM_TOOLS = ("uname", "grep", "cat", "sed", "sort", "tail", "mktemp", "rm")
+SYSTEM_TOOLS = ("uname", "grep", "cat", "sed", "sort", "tail", "mktemp", "rm", "mv", "ln", "readlink")
 SLUG = "Michael-A-Fry/ws"
 ISSUER = "https://token.actions.githubusercontent.com"
 
@@ -675,7 +676,11 @@ def test_installed_placeholder_version_fails_even_with_the_checks_off(box: Box):
 def test_ws_found_in_the_uv_bin_folder_when_not_on_path(box: Box, tmp_path: Path):
     uv_bin = tmp_path / "uvbin"
     uv_bin.mkdir()
-    stub(uv_bin, "ws", 'case "$1" in --version) echo "ws 9.9.9";; doctor) exit 1;; esac')
+    # an earlier install of this toolkit, which the new one replaces
+    env_bin = tmp_path / "tools" / "ws-aitoolkit" / "bin"
+    env_bin.mkdir(parents=True)
+    stub(env_bin, "ws", 'case "$1" in --version) echo "ws 9.9.9";; doctor) exit 1;; esac')
+    (uv_bin / "ws").symlink_to(env_bin / "ws")
     box.python()
     box.curl()
     box.sha()
@@ -750,3 +755,192 @@ def test_from_with_a_blank_folder_exits_2_and_does_not_fall_through_to_the_relea
     assert "--from needs the folder of a checkout" in r.stdout + r.stderr
     assert box.gh.hits == []
     assert not any(c.startswith("uv tool") for c in box.calls())
+
+
+# ---- a different `ws` already in the install folder ---------------------------------------------------------------
+
+
+def foreign_ws(box: Box, body: str = 'echo "the old ws"') -> Path:
+    """A program named ws in the folder the installer writes to (uv's stub prints no folder, so ~/.local/bin)."""
+    folder = box.home / ".local" / "bin"
+    folder.mkdir(parents=True, exist_ok=True)
+    stub(folder, "ws", body)
+    return folder / "ws"
+
+
+def test_a_different_ws_in_the_install_folder_stops_the_run_with_no_changes_and_the_two_commands(box: Box):
+    ready(box)
+    old = foreign_ws(box)
+    before = old.read_bytes()
+    r = box.run()
+    assert r.returncode == 1
+    assert f"mv {old} {old}-legacy" in r.stderr
+    assert f"ws config fallback {old}-legacy" in r.stderr
+    assert f"--move-existing-ws-to {old}-legacy" in r.stderr
+    assert "leaves it where it is" in r.stderr and "Nothing was changed" not in r.stderr
+    assert box.installs() == [] and box.gh.hits == []  # the stop comes before any download or install
+    assert old.read_bytes() == before and not Path(f"{old}-legacy").exists()
+
+
+def test_the_printed_commands_quote_a_path_with_spaces(box: Box):
+    ready(box)
+    home = box.tmp / "my home"
+    folder = home / ".local" / "bin"
+    folder.mkdir(parents=True)
+    stub(folder, "ws", "echo old")
+    old = folder / "ws"
+    r = box.run(env={"HOME": str(home)})
+    assert r.returncode == 1
+    lines = {ln.split(":", 1)[0].strip()[:2]: ln.split(":", 1)[1] for ln in r.stderr.splitlines() if ":    " in ln}
+    assert shlex.split(lines["1."]) == ["mv", str(old), f"{old}-legacy"]
+    assert shlex.split(lines["2."]) == ["ws", "config", "fallback", f"{old}-legacy"]
+    both = next(ln for ln in r.stderr.splitlines() if "let the installer do both" in ln)
+    assert shlex.split(both.split(": ", 1)[1])[-1] == f"{old}-legacy"
+
+
+def test_the_dry_run_names_a_different_ws_and_still_exits_0(box: Box):
+    ready(box)
+    old = foreign_ws(box)
+    r = box.run("--dry-run")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert f"another program named 'ws' is at {old}" in r.stdout and "a real run would stop here" in r.stdout
+    assert box.installs() == [] and old.exists()
+
+
+def test_this_toolkit_in_the_install_folder_is_replaced_as_before(box: Box):
+    ready(box)
+    box.ws()
+    real = box.tmp / "uv" / "tools" / "ws-aitoolkit" / "bin"
+    real.mkdir(parents=True)
+    stub(real, "ws", "echo whatever")
+    folder = box.home / ".local" / "bin"
+    folder.mkdir(parents=True)
+    (folder / "ws").symlink_to(real / "ws")
+    assert box.run().returncode == 0
+    assert len(box.installs()) == 1
+
+
+def test_a_script_started_by_the_tool_environments_python_is_replaced_as_before(box: Box):
+    ready(box)
+    box.ws()
+    foreign_ws(box, "echo whatever")
+    folder = box.home / ".local" / "bin"
+    (folder / "ws").write_text("#!/opt/uv/tools/ws-aitoolkit/bin/python\nprint(1)\n", encoding="utf-8")
+    assert box.run().returncode == 0
+    assert len(box.installs()) == 1
+
+
+@pytest.mark.parametrize("args", [(), ("--dry-run",), ("--move-existing-ws-to", "MOVED")])
+def test_the_other_ws_is_read_and_never_started(box: Box, args: tuple[str, ...]):
+    ready(box)
+    box.ws()
+    marker = box.tmp / "started"
+    foreign_ws(
+        box, f'echo started > "{marker}"\necho \'{{"schema": "ws.cli/1", "data": {{"install_source": "release"}}}}\''
+    )
+    args = tuple(str(box.tmp / "ws-legacy") if a == "MOVED" else a for a in args)
+    box.run(*args)
+    assert not marker.exists()
+
+
+def test_move_existing_renames_it_installs_and_sets_it_as_the_fallback(box: Box):
+    ready(box)
+    box.ws()
+    old = foreign_ws(box)
+    dest = box.tmp / "ws-legacy"
+    r = box.run("--move-existing-ws-to", str(dest))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert dest.read_text(encoding="utf-8").endswith('echo "the old ws"\n') and not old.exists()
+    assert len(box.installs()) == 1
+    calls = box.calls()
+    assert f"ws config fallback {dest}" in calls
+    assert calls.index(f"ws config fallback {dest}") < calls.index("ws doctor --offline")  # right after the install
+    assert f"words ws lacks now go to {dest}" in r.stdout
+
+
+def test_move_existing_never_overwrites_a_file_that_is_already_there(box: Box):
+    ready(box)
+    old = foreign_ws(box)
+    dest = box.tmp / "taken"
+    dest.write_text("mine", encoding="utf-8")
+    r = box.run("--move-existing-ws-to", str(dest))
+    assert r.returncode == 1 and "already exists" in r.stderr
+    assert dest.read_text(encoding="utf-8") == "mine" and old.exists() and box.installs() == []
+
+
+def test_move_existing_in_a_dry_run_moves_nothing(box: Box):
+    ready(box)
+    old = foreign_ws(box)
+    dest = box.tmp / "ws-legacy"
+    r = box.run("--dry-run", "--move-existing-ws-to", str(dest))
+    assert r.returncode == 0 and f"would rename {old} to {dest}" in r.stdout
+    assert old.exists() and not dest.exists()
+
+
+def test_move_existing_with_no_other_ws_does_nothing(box: Box):
+    ready(box)
+    box.ws()
+    dest = box.tmp / "ws-legacy"
+    r = box.run("--move-existing-ws-to", str(dest))
+    assert r.returncode == 0 and "install goes ahead as usual" in r.stdout
+    assert not dest.exists() and not any(c.startswith("ws config fallback") for c in box.calls())
+
+
+@pytest.mark.parametrize("args", [("--move-existing-ws-to",), ("--move-existing-ws-to", "relative/ws-old")])
+def test_move_existing_needs_an_absolute_path(box: Box, args: tuple[str, ...]):
+    ready(box)
+    r = box.run(*args)
+    assert r.returncode == 2 and "--move-existing-ws-to" in r.stderr
+
+
+def test_move_existing_waits_until_the_download_has_passed_its_checks(box: Box):
+    ready(box, "v0.3.0")
+    box.gh.routes[f"/{SLUG}/releases/download/v0.3.0/{wheel_name('v0.3.0')}"] = b"tampered"
+    old = foreign_ws(box)
+    dest = box.tmp / "ws-legacy"
+    r = box.run("--move-existing-ws-to", str(dest))
+    assert r.returncode == 1 and "does not match" in r.stderr
+    assert old.exists() and not dest.exists() and "renamed" not in r.stdout
+
+
+def test_a_failed_install_puts_the_moved_ws_back(box: Box):
+    ready(box)
+    box.uv(extra='case "$1" in tool) exit 7;; esac')
+    old = foreign_ws(box)
+    before = old.read_bytes()
+    dest = box.tmp / "ws-legacy"
+    r = box.run("--move-existing-ws-to", str(dest))
+    assert r.returncode == 7
+    assert f"renamed {old} to {dest}" in r.stdout and f"put your original 'ws' back at {old}" in r.stdout
+    assert old.read_bytes() == before and not dest.exists()
+    assert not any(c.startswith("ws config fallback") for c in box.calls())
+
+
+def test_a_failed_install_that_left_a_new_file_keeps_it_and_says_where_the_original_is(box: Box):
+    ready(box)
+    folder = box.home / ".local" / "bin"
+    box.uv(extra=f'case "$1" in tool) echo partial > "{folder}/ws"; exit 7;; esac')
+    foreign_ws(box)
+    dest = box.tmp / "ws-legacy"
+    r = box.run("--move-existing-ws-to", str(dest))
+    assert r.returncode == 7 and dest.exists()
+    assert f"your original 'ws' is at {dest}" in r.stdout + r.stderr
+
+
+def test_a_moved_symlink_is_recreated_with_its_absolute_target(box: Box):
+    ready(box)
+    box.ws()
+    folder = box.home / ".local" / "bin"
+    folder.mkdir(parents=True)
+    real = box.home / "apps" / "old-ws-1.2" / "run"
+    real.parent.mkdir(parents=True)
+    stub(real.parent, "run", 'echo "the old ws"')
+    (folder / "ws").symlink_to(os.path.relpath(real, folder))  # a relative target
+    assert not os.readlink(folder / "ws").startswith("/")
+    dest = box.tmp / "elsewhere" / "ws-legacy"
+    dest.parent.mkdir()
+    r = box.run("--move-existing-ws-to", str(dest))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert dest.is_symlink() and os.readlink(dest) == str(real)
+    assert dest.resolve() == real.resolve() and not (folder / "ws").is_symlink()
+    assert f"ws config fallback {dest}" in box.calls()

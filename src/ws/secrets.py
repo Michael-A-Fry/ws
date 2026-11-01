@@ -327,6 +327,103 @@ def cmd_set(args: argparse.Namespace) -> int:
     return 0
 
 
+_ENV_LINE = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$")
+
+
+def _env_value(path: Path, var: str | None) -> str:
+    """The raw value from an env file of `VAR=value` lines (blank lines and # comments skipped, one pair of
+    surrounding quotes stripped). With several lines, `var` says which. Every error names the file and a line number,
+    never a line's text."""
+    try:
+        with path.open("rb") as fh:
+            data = fh.read(MAX_VALUE * 64 + 1)
+    except OSError as e:
+        raise SecretsError(f"{path} cannot be read") from e
+    if len(data) > MAX_VALUE * 64:
+        raise SecretsError(f"{path} is too big for an env file")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise SecretsError(f"{path} is not UTF-8 text") from e
+    found: list[tuple[int, str, str]] = []
+    for n, line in enumerate(text.splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = _ENV_LINE.match(line)
+        if not m:
+            raise SecretsError(f"{path}: line {n} is not VAR=value")
+        v = m.group(2).strip()
+        if len(v) >= 2 and v[0] in "\"'" and v[0] in v[1:]:
+            q = v.index(v[0], 1)
+            rest = v[q + 1 :].strip()
+            if rest and not rest.startswith("#"):
+                raise SecretsError(f"{path}: line {n} has text after the closing quote")
+            v = v[1:q]
+        elif " #" in v or "\t#" in v:
+            v = re.split(r"\s#", v, maxsplit=1)[0].rstrip()
+        found.append((n, m.group(1), v))
+    if not found:
+        raise SecretsError(f"{path} has no VAR=value line")
+    if var is None:
+        if len(found) > 1:
+            raise SecretsError(
+                f"{path} has {len(found)} VAR=value lines (lines {found[0][0]} to {found[-1][0]}); use --var"
+            )
+        return found[0][2]
+    hits = [f for f in found if f[1] == var]
+    if not hits:
+        raise SecretsError(f"{path} has no {var} line")
+    return hits[-1][2]
+
+
+def cmd_import(args: argparse.Namespace) -> int:
+    src = Path(args.from_env).expanduser()
+    try:
+        reg = load_registry(registry_path())
+        if args.name not in reg:
+            raise WsError(
+                "not_found",
+                f"{args.name!r} is not in {registry_path()}",
+                f'add it with its hosts first, e.g.\n    [{args.name}]\n    hosts = ["api.example.com"]\n    header = "x-api-key"',
+                2,
+            )
+        value = check_value(_env_value(src, args.var))
+        Store(store_dir()).write(args.name, value)
+    except SecretsError as e:
+        raise WsError(
+            "failed",
+            str(e),
+            "the env file needs one VAR=value line, or several with --var VAR; the value is never shown",
+        ) from e
+    except PermissionError as e:
+        raise WsError(
+            "refused",
+            f"the store {store_dir()} belongs to another user",
+            f"set it as that user: `{wall_hint('set', args.name)}`",
+        ) from e
+    except OSError as e:
+        raise WsError(
+            "failed",
+            f"{args.name} could not be written to {store_dir()}: {e.strerror or type(e).__name__}",
+            "check the store folder exists and is yours, then run this again",
+        ) from e
+    removed = False
+    if args.delete_source:
+        try:
+            src.unlink()
+            removed = True
+        except OSError as e:
+            raise WsError(
+                "failed", f"{args.name} was stored, but {src} could not be removed", "remove it yourself"
+            ) from e
+    if args.json:
+        output.result({"name": args.name, "set": True, "source_removed": removed})
+        return 0
+    print(f"ws: set {args.name}" + (f" (removed {src})" if removed else ""))
+    return 0
+
+
 def cmd_list(args: argparse.Namespace) -> int:
     try:
         rows, note = _rows(None)
@@ -622,6 +719,12 @@ def register(sub) -> None:
     p = ssub.add_parser("set", help="store a value for a registered name (prompted, or from stdin)")
     p.add_argument("name")
     p.set_defaults(func=cmd_set)
+    p = ssub.add_parser("import", help="store a value for a registered name from an env file (VAR=value)")
+    p.add_argument("name")
+    p.add_argument("--from-env", required=True, metavar="PATH", help="the env file to read")
+    p.add_argument("--var", metavar="VAR", help="which variable, when the file has several lines")
+    p.add_argument("--delete-source", action="store_true", help="remove the env file after the value is stored")
+    p.set_defaults(func=cmd_import)
     p = ssub.add_parser("list", help="names, hosts, set/unset and owner; never values")
     p.set_defaults(func=cmd_list)
     p = ssub.add_parser("rm", help="remove a stored value")

@@ -26,6 +26,7 @@ RAW = {
     "broker.serve": "stays up until stopped",
     "session.start": "a hook entry",
     "session.nudge": "a hook entry",
+    "notify.alert": "a hook entry",
     "setup": "a person at a terminal, or the page (setup --yes is covered below)",
 }
 
@@ -40,6 +41,7 @@ CASES: dict[str, list[str]] = {
     "secret.set": ["secret", "set", "nope"],
     "secret.list": ["secret", "list"],
     "secret.rm": ["secret", "rm", "nope"],
+    "secret.import": ["secret", "import", "nope", "--from-env", "missing.env"],
     "secret.wall": ["secret", "wall"],
     "broker.request": ["broker", "request", "x", "--purpose", "p", "--host", "h", "--socket", "{home}/none.sock"],
     "broker.status": ["broker", "status", "--socket", "{home}/none.sock"],
@@ -63,6 +65,8 @@ CASES: dict[str, list[str]] = {
     "device.add": ["device", "add"],
     "skills.list": ["skills", "list"],
     "skills.add": ["skills", "add", "align"],
+    "skills.adopt": ["skills", "adopt", "align"],
+    "skills.restore": ["skills", "restore", "align"],
     "canary": ["canary"],
     "rate": ["rate", "last", "up"],
     "notify.test": ["notify", "test"],

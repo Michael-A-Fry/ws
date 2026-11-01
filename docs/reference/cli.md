@@ -20,6 +20,26 @@ These work on every command, before or after the command name.
 
 A mistyped command or flag gets a "did you mean" hint.
 
+## Your own commands
+
+`ws <word>` looks for a command in this order, and the first match runs.
+
+1. A ws command (`ws doctor`).
+2. A program named `ws-<word>` in a folder on `PATH` (`ws hello` runs `ws-hello`). The word is lower case letters,
+   digits and `-`, starting with a letter, up to 41 characters. It gets the arguments after the word. `--json` becomes
+   `WS_OUTPUT=json` in its environment, and `-C PATH` is its working folder. Absolute `PATH` entries are searched. The
+   program has to belong to you or root, be writable by only that owner, and sit in a folder only its owner can write
+   to (or one with the sticky bit, like `/tmp`); otherwise ws skips it and says why on stderr.
+3. The program in the profile's `[cli] fallback`. It gets the whole original argument list, including flags ws has no
+   use for (`ws -n repo tag`) and an empty list (a bare `ws`), and runs with `WS_FALLBACK=1`. A run that already has
+   `WS_FALLBACK` set goes no further than that program.
+4. The usage error, with a "did you mean" hint. An unreadable profile gets a one-line note beside it.
+
+The fallback is an absolute path (or one that starts with `~/`) to an executable file you own that nobody else can
+write to, in a folder only its owner can write to; the file passes the same test as a job file. Set it with
+`ws config fallback PATH`, clear it with `ws config fallback --clear`. `ws help` lists the `ws-<word>` programs on
+`PATH` and names the fallback.
+
 ## Exit codes
 
 | Code | Meaning |
@@ -176,6 +196,21 @@ ws secret set [-h] name
 |---|---|
 | `name` | A name registered in `secrets.toml`. |
 
+### `ws secret import`
+
+Store a value for a registered name from an env file (VAR=value).
+
+```text
+ws secret import [-h] --from-env PATH [--var VAR] [--delete-source] name
+```
+
+| Argument | Meaning |
+|---|---|
+| `name` | A name registered in `secrets.toml`. |
+| `--from-env PATH` | The env file to read; required. |
+| `--var VAR` | Which variable, when the file has several lines. |
+| `--delete-source` | Remove the env file after the value is stored. |
+
 ### `ws secret list`
 
 Names, hosts, set/unset and owner; never values.
@@ -218,7 +253,7 @@ ws broker serve [-h] [--socket PATH] [--group GROUP] [--port PORT] [--lease-ttl 
 
 | Argument | Meaning |
 |---|---|
-| `--socket PATH` | Default $WS_HOME/run/broker.sock. |
+| `--socket PATH` | Default $WS_BROKER_SOCKET, else [roles.secrets] socket in the profile, else $WS_HOME/run/broker.sock. |
 | `--group GROUP` | Also serve members of this group (socket folder becomes 0750). |
 | `--port PORT` | Lease proxy port on 127.0.0.1 (default: any free one). |
 | `--lease-ttl SECONDS` | Longest lease (default 3600). |
@@ -690,11 +725,18 @@ ws setup [-h] [--web] [--no-open] [-y] [--plugin NAME] [--notes PATH]
 
 ## `ws config`
 
-Every file ws reads: where it's, where its path came from, the keys it sets.
+Every file ws reads: where it's, where its path came from, the keys it sets. `ws config fallback` shows, sets and
+clears the program that gets words ws has no command for (see [Your own commands](#your-own-commands)).
 
 ```text
-ws config [-h]
+ws config [-h] [--clear] [{fallback}] [PATH]
 ```
+
+| Argument | Meaning |
+|---|---|
+| `fallback` | Show the fallback program. With `PATH`, set it; with `--clear`, remove it. |
+| `PATH` | With `fallback`: the program (absolute, or `~/...`). It has to be an executable file you own that nobody else can write to. |
+| `--clear` | With `fallback`: remove it. |
 
 ## `ws status`
 

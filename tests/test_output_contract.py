@@ -62,6 +62,8 @@ CASES: dict[str, list[str]] = {
     "device.add": ["device", "add"],
     "skills.list": ["skills", "list"],
     "skills.add": ["skills", "add", "align"],
+    "skills.adopt": ["skills", "adopt", "align"],
+    "skills.restore": ["skills", "restore", "align"],
     "canary": ["canary"],
     "rate": ["rate", "last", "up"],
     "notify.test": ["notify", "test"],

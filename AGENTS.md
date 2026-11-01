@@ -72,7 +72,7 @@ install.sh        the installer people run first (pipx or uv)
 | `selfcmd.py` | How ws starts itself with this Python: `python -I -m ws`, so a folder named `ws/` in the working... |
 | `session.py` | `ws session`: tell a long-running session once when ws has been updated under it |
 | `setup_ui/` | `ws setup`: the first-run and re-run setup, walked in your terminal (the default) or in a local... |
-| `skills/` | The skills ws ships (`align`, `checkpoint`, `taste-gate`, `dataviz`) and how they get onto a machine |
+| `skills/` | The skills ws ships (`align`, `checkpoint`, `taste-gate`, `dataviz`, `resume`, `ship`) and how... |
 | `status.py` | `ws status`: for each runner, every rules, skill, hook and MCP file it will load here, with... |
 | `testing/` | Test support that ships with ws: the mock model provider and its scenarios |
 | `usage.py` | The Console usage check: can ws read the provider's own usage report, the billing truth... |

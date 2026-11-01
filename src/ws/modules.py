@@ -90,7 +90,7 @@ REGISTRY: dict[str, Module] = {
         ),
         Skills(
             "skills",
-            "the skills ws ships (align, checkpoint, taste-gate, dataviz), added to your runner",
+            "the skills ws ships (align, checkpoint, taste-gate, dataviz, resume, ship), added to your runner",
             True,
             "modules.skills",
             True,

@@ -1,6 +1,7 @@
 """The commands the role adapters bring: `ws notify`, `ws backup` and `ws schedule`.
 
-    ws notify test|send|status      a test push, a push or digest, today's count against the policy's cap
+    ws notify test|send|status      a test push, a push or digest, today's count against the caps
+    ws notify alert                 hook entry: "<folder> needs you" or "<folder> finished" to your phone
     ws backup init|run|verify       make the restic repository, back up, prove a file restores
     ws schedule list|apply|remove   timers for the job files that have a `schedule`
 
@@ -10,6 +11,7 @@ Each reads its adapter's settings from `[roles.<role>]` of the profile. Messages
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 
@@ -60,10 +62,40 @@ def cmd_notify_status(args: argparse.Namespace) -> int:
         raise WsError("failed", str(e)) from e
     if args.json:
         output.result(
-            {"push": counts["push"], "push_cap": cap["push"], "digest": counts["digest"], "digest_cap": cap["digest"]}
+            {
+                "push": counts["push"],
+                "push_cap": cap["push"],
+                "digest": counts["digest"],
+                "digest_cap": cap["digest"],
+                "alert": counts["alert"],
+                "alert_cap": cap["alert"],
+            }
         )
         return 0
-    print(f"ws: today {counts['push']} of {cap['push']} pushes, {counts['digest']} of {cap['digest']} digest")
+    print(
+        f"ws: today {counts['push']} of {cap['push']} pushes, {counts['digest']} of {cap['digest']} digest,"
+        f" {counts['alert']} of {cap['alert']} alerts"
+    )
+    return 0
+
+
+MAX_PAYLOAD = 1_000_000
+
+
+def cmd_notify_alert(args: argparse.Namespace) -> int:
+    """Hook entry. Pushes the alert the runner's hook JSON on stdin asks for. Advice, not a gate: always exits 0, and
+    says on stderr why nothing went when something is wrong."""
+    try:
+        roles = (load(profile_path()) or {}).get("roles")
+        cfg = roles.get("notify") if isinstance(roles, dict) else None
+        if not isinstance(cfg, dict) or cfg.get("adapter") != ntfy.NAME:
+            return 0  # no phone alerts set up: nothing to do
+        payload = None if sys.stdin.isatty() else json.loads(sys.stdin.read(MAX_PAYLOAD) or "null")
+        line = ntfy.alert(cfg, os.environ, payload, args.runner)
+        if line:
+            print(f"ws: {line}", file=sys.stderr)
+    except (ProfileError, ntfy.NotifyError, ValueError, OSError) as e:  # ValueError covers a payload that isn't JSON
+        print(f"ws: alert not sent: {e}", file=sys.stderr)
     return 0
 
 
@@ -188,7 +220,9 @@ def cmd_schedule_remove(args: argparse.Namespace) -> int:
 
 
 def register(sub) -> None:
-    n = sub.add_parser("notify", help="push to your phone through ntfy: at most 1 digest and 3 pushes a day")
+    n = sub.add_parser(
+        "notify", help="push to your phone through ntfy: 1 digest and 3 pushes a day, plus session alerts"
+    )
     ns = n.add_subparsers(dest="notify_command", required=True)
     p = ns.add_parser("test", help="send a test push (it counts against the daily cap)")
     p.set_defaults(func=cmd_notify_test)
@@ -197,8 +231,11 @@ def register(sub) -> None:
     p.add_argument("--title", default="ws")
     p.add_argument("--digest", action="store_true", help="the one daily digest, not a push")
     p.set_defaults(func=cmd_notify_send)
-    p = ns.add_parser("status", help="today's count against the cap")
+    p = ns.add_parser("status", help="today's count against the caps")
     p.set_defaults(func=cmd_notify_status)
+    p = ns.add_parser("alert", help='hook entry: push "<folder> needs you" or "<folder> finished" (hook JSON on stdin)')
+    p.add_argument("--runner", required=True, help="the runner whose hook is calling, for example claude-code")
+    p.set_defaults(func=cmd_notify_alert)
 
     b = sub.add_parser("backup", help="back up memory, notes and profile with restic, and prove a file restores")
     bs = b.add_subparsers(dest="backup_command", required=True)

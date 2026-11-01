@@ -3,6 +3,7 @@ and the broker are fakes; nothing leaves the machine."""
 
 from __future__ import annotations
 
+import io
 import json
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -114,7 +115,7 @@ def test_the_cap_is_three_pushes_and_one_digest_a_day(env):
     assert ntfy.send(CFG, env, "digest", kind="digest", now=NOON, sender=s) == "sent: 1 of 1 digest today"
     with pytest.raises(ntfy.CapReached, match="1 of 1 digest already"):
         ntfy.send(CFG, env, "digest 2", kind="digest", now=NOON, sender=s)
-    assert json.loads(ntfy.counter_path(env).read_text()) == {"date": "2026-03-04", "push": 3, "digest": 1}
+    assert json.loads(ntfy.counter_path(env).read_text()) == {"date": "2026-03-04", "push": 3, "digest": 1, "alert": 0}
 
 
 def test_the_count_starts_again_the_next_day(env):
@@ -180,7 +181,7 @@ def test_flipping_zones_cannot_get_more_than_the_cap(env):
 def test_a_later_date_moves_on_and_an_earlier_one_is_fresh(env):
     write_counter(env, "2026-03-03", push=3, digest=1)
     assert ntfy.send(CFG, env, "m", now=NOON, sender=Sender()) == "sent: 1 of 3 pushes today"
-    assert ntfy.read_counts(env, "2026-03-04") == {"date": "2026-03-04", "push": 1, "digest": 0}
+    assert ntfy.read_counts(env, "2026-03-04") == {"date": "2026-03-04", "push": 1, "digest": 0, "alert": 0}
 
 
 @needs_tzdata
@@ -204,7 +205,7 @@ def test_a_bad_timezone_is_a_plain_error(env, linux):
 
 def test_the_caps_come_from_the_policy(box, env):
     (box / ".ws" / "policy.toml").write_text("[interrupts]\ndigest_per_day = 0\npushes_per_day = 1\n")
-    assert ntfy.caps(env) == {"push": 1, "digest": 0}
+    assert ntfy.caps(env) == {"push": 1, "digest": 0, "alert": 50}
     s = Sender()
     ntfy.send(CFG, env, "m", now=NOON, sender=s)
     with pytest.raises(ntfy.CapReached, match="1 of 1 pushes"):
@@ -214,7 +215,7 @@ def test_the_caps_come_from_the_policy(box, env):
 
 
 def test_the_defaults_are_one_digest_and_three_pushes(env):
-    assert ntfy.caps(env) == {"push": 3, "digest": 1}
+    assert ntfy.caps(env) == {"push": 3, "digest": 1, "alert": 50}
 
 
 def test_a_policy_that_does_not_read_stops_a_send(box, env):
@@ -226,7 +227,7 @@ def test_a_policy_that_does_not_read_stops_a_send(box, env):
 def test_bad_messages_and_kinds(env):
     with pytest.raises(ntfy.NotifyError, match="empty"):
         ntfy.send(CFG, env, "  ", now=NOON, sender=Sender())
-    with pytest.raises(ntfy.NotifyError, match="push or digest"):
+    with pytest.raises(ntfy.NotifyError, match="push, digest or alert"):
         ntfy.send(CFG, env, "m", kind="alarm", now=NOON, sender=Sender())
 
 
@@ -240,7 +241,7 @@ def test_a_header_cannot_carry_a_line_break(env):
 def test_a_damaged_counter_file_is_a_fresh_day(env):
     ntfy.counter_path(env).parent.mkdir(parents=True)
     ntfy.counter_path(env).write_text("{not json")
-    assert ntfy.read_counts(env, "2026-03-04") == {"date": "2026-03-04", "push": 0, "digest": 0}
+    assert ntfy.read_counts(env, "2026-03-04") == {"date": "2026-03-04", "push": 0, "digest": 0, "alert": 0}
     ntfy.counter_path(env).write_text('{"date": "2026-03-04", "push": -1, "digest": 0}')
     assert ntfy.read_counts(env, "2026-03-04")["push"] == 0
 
@@ -322,3 +323,216 @@ def test_a_profile_zone_beats_the_detected_one(env, write_profile):
     late = datetime(2026, 3, 4, 23, 30, tzinfo=UTC)
     write_profile({"machine": {"timezone": "UTC"}})
     assert ntfy.today(ntfy.zone(CFG, {**env, "TZ": "Pacific/Auckland"}), late) == "2026-03-04"
+
+
+# ---- session alerts and notify-last ------------------------------------------------------------------------------------
+
+NOTIFICATION = {"hook_event_name": "Notification", "cwd": "/work/payroll-app", "message": "Claude needs permission"}
+STOP = {"hook_event_name": "Stop", "cwd": "/work/payroll-app"}
+
+
+def counts_of(env):
+    return json.loads(ntfy.counter_path(env).read_text())
+
+
+def test_a_notification_is_one_high_priority_alert_and_no_push(env):
+    s = Sender()
+    line = ntfy.alert(CFG, env, NOTIFICATION, "claude-code", now=NOON, sender=s)
+    [(url, body, headers)] = s.calls
+    assert url == URL and body == b"payroll-app needs you"  # title mode: the folder only
+    assert headers["Priority"] == "high" and headers["Title"] == "ws claude-code"
+    assert line == "sent: 1 of 50 alerts today"
+    assert (counts_of(env)["alert"], counts_of(env)["push"]) == (1, 0)
+
+
+def test_a_stop_is_a_default_priority_alert(env):
+    s = Sender()
+    ntfy.alert(CFG, env, STOP, "claude-code", now=NOON, sender=s)
+    [(_, body, headers)] = s.calls
+    assert body == b"payroll-app finished" and "Priority" not in headers
+
+
+def test_full_text_adds_the_runners_message(env):
+    s = Sender()
+    ntfy.alert({**CFG, "alert_text": "full"}, env, NOTIFICATION, "claude-code", now=NOON, sender=s)
+    assert s.calls[0][1] == b"payroll-app needs you: Claude needs permission"
+    s2 = Sender()
+    ntfy.alert(CFG, env, NOTIFICATION, "claude-code", now=NOON, sender=s2)
+    assert b"permission" not in s2.calls[0][1]
+
+
+def test_alert_text_must_be_title_or_full(env):
+    with pytest.raises(ntfy.NotifyError, match="alert_text"):
+        ntfy.alert({**CFG, "alert_text": "loud"}, env, STOP, "claude-code", now=NOON, sender=Sender())
+
+
+def test_the_alert_cap_is_apart_from_the_push_cap(env):
+    s = Sender()
+    for _ in range(3):
+        ntfy.send(CFG, env, "p", now=NOON, sender=s)
+    with pytest.raises(ntfy.CapReached):
+        ntfy.send(CFG, env, "p", now=NOON, sender=s)
+    cfg = {**CFG, "alerts_per_day": 2}
+    ntfy.alert(cfg, env, STOP, "claude-code", now=NOON, sender=s)
+    ntfy.alert(cfg, env, STOP, "claude-code", now=NOON, sender=s)
+    with pytest.raises(ntfy.CapReached, match="2 of 2 alerts"):
+        ntfy.alert(cfg, env, STOP, "claude-code", now=NOON, sender=s)
+    assert len(s.calls) == 5
+    assert counts_of(env)["push"] == 3  # alerts didn't use up pushes
+
+
+def test_alerts_per_day_defaults_to_50_and_is_checked():
+    assert ntfy.alert_cap({}) == 50
+    for bad in (-1, "5", True, 1.5):
+        with pytest.raises(ntfy.NotifyError, match="alerts_per_day"):
+            ntfy.alert_cap({"alerts_per_day": bad})
+
+
+def test_a_counter_file_from_before_alerts_still_reads(env):
+    ntfy.counter_path(env).parent.mkdir(parents=True, exist_ok=True)
+    ntfy.counter_path(env).write_text(json.dumps({"date": "2026-03-04", "push": 2, "digest": 1}))
+    assert ntfy.read_counts(env, "2026-03-04") == {"date": "2026-03-04", "push": 2, "digest": 1, "alert": 0}
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"hook_event_name": "PreToolUse", "cwd": "/w"},
+        {"cwd": "/w"},
+        {"hook_event_name": ["Stop"]},
+        [],
+        "Stop",
+        None,
+    ],
+)
+def test_no_alert_for_other_events_or_junk(env, payload):
+    s = Sender()
+    assert ntfy.alert(CFG, env, payload, "claude-code", now=NOON, sender=s) is None
+    assert s.calls == []
+
+
+@pytest.mark.parametrize(
+    ("payload", "extra_env"),
+    [
+        (STOP, {"WS_RUN_ID": "r1"}),
+        (STOP, {"CLAUDE_CODE_ENTRYPOINT": "sdk-cli"}),
+        ({**STOP, "headless": True}, {}),
+    ],
+)
+def test_no_alert_for_a_headless_session(env, payload, extra_env):
+    s = Sender()
+    assert ntfy.alert(CFG, {**env, **extra_env}, payload, "claude-code", now=NOON, sender=s) is None
+    assert s.calls == []
+
+
+def test_an_app_session_gets_its_alert(env):
+    s = Sender()
+    ntfy.alert(CFG, {**env, "CLAUDE_CODE_ENTRYPOINT": "claude-desktop"}, STOP, "claude-code", now=NOON, sender=s)
+    assert len(s.calls) == 1
+
+
+def test_session_alerts_false_sends_nothing(env):
+    s = Sender()
+    assert ntfy.alert({**CFG, "session_alerts": False}, env, STOP, "claude-code", now=NOON, sender=s) is None
+    with pytest.raises(ntfy.NotifyError, match="session_alerts"):
+        ntfy.alert({**CFG, "session_alerts": "no"}, env, STOP, "claude-code", now=NOON, sender=s)
+    assert s.calls == []
+
+
+def test_the_folder_name_is_one_clean_line(env):
+    s = Sender()
+    ntfy.alert(CFG, env, {**STOP, "cwd": "/w/bad\nname\x07/"}, "claude-code", now=NOON, sender=s)
+    assert s.calls[0][1] == b"bad name finished"
+    ntfy.alert(CFG, env, {"hook_event_name": "Stop"}, "claude-code", now=NOON, sender=s)
+    assert s.calls[1][1] == b"session finished"
+
+
+def read_last(env):
+    return json.loads((ntfy.ws_home(env) / "logs" / "notify-last.json").read_text())
+
+
+def test_notify_last_is_written_on_ok_without_the_text(env):
+    ntfy.send(CFG, env, "private body", "T", kind="digest", now=NOON, sender=Sender())
+    assert read_last(env) == {"at": "2026-03-04T12:00:00+00:00", "kind": "digest", "ok": True, "error": None}
+
+
+def test_notify_last_is_written_on_failure(env):
+    with pytest.raises(ntfy.NotifyError, match="500"):
+        ntfy.alert(CFG, env, STOP, "claude-code", now=NOON, sender=Sender(500))
+    last = read_last(env)
+    assert last["kind"] == "alert" and last["ok"] is False and "500" in last["error"]
+    assert ntfy.read_counts(env, "2026-03-04")["alert"] == 0  # a failed send isn't counted
+    assert "payroll" not in json.dumps(last)
+
+
+def test_a_refused_cap_leaves_notify_last_alone(env):
+    with pytest.raises(ntfy.CapReached):
+        ntfy.alert({**CFG, "alerts_per_day": 0}, env, STOP, "claude-code", now=NOON, sender=Sender())
+    assert not (ntfy.ws_home(env) / "logs" / "notify-last.json").exists()
+
+
+def test_the_test_push_writes_notify_last(env):
+    ntfy.send_test(CFG, env, now=NOON, sender=Sender())
+    assert read_last(env)["kind"] == "push"
+
+
+def run_alert(monkeypatch, capsys, payload):
+    monkeypatch.setattr("sys.stdin", io.StringIO(payload if isinstance(payload, str) else json.dumps(payload)))
+    code = cli.main(["notify", "alert", "--runner", "claude-code"])
+    return code, capsys.readouterr().err
+
+
+def test_cli_alert_sends_one_high_priority_alert_and_no_push(box, write_profile, capsys, monkeypatch):
+    write_profile({"roles": {"notify": CFG}})
+    s = Sender()
+    monkeypatch.setattr(ntfy, "post", s)
+    code, err = run_alert(monkeypatch, capsys, NOTIFICATION)
+    assert code == 0 and "1 of 50 alerts" in err
+    assert len(s.calls) == 1 and s.calls[0][2]["Priority"] == "high"
+    assert cli.main(["notify", "status"]) == 0
+    out = capsys.readouterr().out
+    assert "0 of 3 pushes" in out and "1 of 50 alerts" in out
+
+
+def test_cli_status_json_has_the_alert_count(box, write_profile, capsys, monkeypatch):
+    write_profile({"roles": {"notify": CFG}})
+    monkeypatch.setattr(ntfy, "post", Sender())
+    run_alert(monkeypatch, capsys, STOP)
+    assert cli.main(["notify", "status", "--json"]) == 0
+    data = json.loads(capsys.readouterr().out)["data"]
+    assert (data["push"], data["alert"], data["alert_cap"]) == (0, 1, 50)
+
+
+@pytest.mark.parametrize("profile", [None, {"roles": {"notify": {"adapter": "none"}}}, {"roles": {}}])
+def test_cli_alert_is_silent_without_a_notify_setup(box, write_profile, capsys, monkeypatch, profile):
+    if profile is not None:
+        write_profile(profile)
+    s = Sender()
+    monkeypatch.setattr(ntfy, "post", s)
+    code, err = run_alert(monkeypatch, capsys, STOP)
+    assert (code, err, s.calls) == (0, "", [])
+
+
+@pytest.mark.parametrize("junk", ["", "not json", "[1, 2]", "42", "null", '{"hook_event_name": 5}'])
+def test_cli_alert_exits_0_on_a_junk_payload(box, write_profile, capsys, monkeypatch, junk):
+    write_profile({"roles": {"notify": CFG}})
+    s = Sender()
+    monkeypatch.setattr(ntfy, "post", s)
+    code, _ = run_alert(monkeypatch, capsys, junk)
+    assert code == 0 and s.calls == []
+
+
+def test_cli_alert_exits_0_and_says_why_when_the_send_fails(box, write_profile, capsys, monkeypatch):
+    write_profile({"roles": {"notify": CFG}})
+    monkeypatch.setattr(ntfy, "post", Sender(503))
+    code, err = run_alert(monkeypatch, capsys, STOP)
+    assert code == 0 and "alert not sent" in err and "503" in err
+
+
+def test_cli_alert_skips_a_ws_run_session(box, write_profile, capsys, monkeypatch):
+    write_profile({"roles": {"notify": CFG}})
+    s = Sender()
+    monkeypatch.setattr(ntfy, "post", s)
+    monkeypatch.setenv("WS_RUN_ID", "r1")
+    code, err = run_alert(monkeypatch, capsys, STOP)
+    assert (code, err, s.calls) == (0, "", [])

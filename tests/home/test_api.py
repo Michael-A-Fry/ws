@@ -695,7 +695,8 @@ def test_a_home_relative_opaque_path_is_accepted(box):
 def test_a_case_insensitive_file_system_matches_by_normcase(tmp_path, monkeypatch):
     roots = records.roots_of([str(tmp_path / "code" / "fiu")])
     other = str(tmp_path / "Code" / "FIU" / "case.csv")
-    assert not records.under(other, roots)  # a case-sensitive system keeps the two apart
+    if os.path.normcase("A") == "A":
+        assert not records.under(other, roots)  # a case-sensitive system keeps the two apart
     monkeypatch.setattr(os.path, "normcase", str.lower)
     assert records.under(other, roots) and not records.open_path(other, roots)
     assert not records.under(str(tmp_path / "Code" / "FIU-too"), roots)
@@ -707,7 +708,8 @@ def test_a_folder_that_is_the_same_on_disk_under_another_spelling_is_under(tmp_p
     roots = records.roots_of([str(real)])
     spelled = tmp_path / "CODE" / "FIU"  # exists only as far as the file system folds case
     deep = str(spelled / "a" / "b.csv")
-    assert not records.under(deep, roots)
+    # on a case-insensitive disk (macOS) the other spelling already exists, so it is under; elsewhere it isn't yet
+    assert records.under(deep, roots) == os.path.lexists(spelled)
     # a case-insensitive file system answers for the folder above the file, so the check walks up to it
     monkeypatch.setattr(os.path, "lexists", lambda p: str(p).lower() in (str(spelled).lower(), str(real).lower()))
     monkeypatch.setattr(os.path, "samefile", lambda a, b: str(a).lower() == str(b).lower())

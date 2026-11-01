@@ -15,6 +15,7 @@ from ws import (
     config_cmd,
     devices,
     doctor,
+    extcmd,
     gate,
     install,
     mcp_server,
@@ -217,10 +218,19 @@ def cmd_help(args: argparse.Namespace) -> int:
         if word not in kids:
             raise WsError("usage", f"no help topic {word!r}", output.did_you_mean(word, kids) or "run `ws help`", 2)
         parser = kids[word]
+    root = parser is args.ws_root
+    extra = extcmd.help_lines(_subcommands(parser)) if root else []
     if args.json:
-        output.result(_help_json(parser))
+        data = _help_json(parser)
+        if root:
+            builtins = _subcommands(parser)
+            data["external"] = extcmd.list_externals(builtins)
+            data["fallback"] = extcmd._fallback_for_help()
+        output.result(data)
     else:
         print(parser.format_help(), end="")
+        if extra:
+            print("\n" + "\n".join(extra))
     return 0
 
 
@@ -267,6 +277,7 @@ def build_parser() -> argparse.ArgumentParser:
     approvals.register(sub)
     setup_ui.register(sub)
     config_cmd.register(sub)
+    extcmd.register(sub)
     status.register(sub)
     ws_eval.register(sub)
     version.register(sub)
@@ -279,9 +290,14 @@ def main(argv: list[str] | None = None) -> int:
     try:
         g, rest = output.split_global(raw)
         want_json = g.json
-        if g.cwd is not None:
+        parser = build_parser()
+        flags = [o for a in parser._actions for o in a.option_strings]
+        spec = extcmd.plan(raw, g, rest, _subcommands(parser), flags)
+        if g.cwd is not None and (spec is None or spec.keep_cwd):
             output.enter_cwd(g.cwd)
-        args = build_parser().parse_args(rest)
+        if spec is not None:
+            return extcmd.launch(spec)
+        args = parser.parse_args(rest)
         kind = args.ws_command
         return output.dispatch(args, kind, g.json)
     except WsError as e:

@@ -47,6 +47,7 @@ install.sh        the installer people run first (pipx or uv)
 | `doctor.py` | `ws doctor`: one line per check, each with a stable ID |
 | `eval.py` | `ws eval`: your own eval, with TOML tasks, deterministic graders, ten metrics and an exact A/B... |
 | `evalstats.py` | The numbers behind `ws eval`: exact McNemar, pass^k, percentiles and the ten report metrics |
+| `extcmd.py` | The `ws` name: your own `ws-<word>` programs, and one fallback program for every other word |
 | `frontmatter.py` | YAML front matter, the safe subset: stdlib only |
 | `gate.py` | `ws gate`: turn the policy into each runner's own config, and answer the hooks |
 | `globals.py` | `ws globals`: what ws installs globally stays global |

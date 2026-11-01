@@ -75,6 +75,10 @@ Options:
   --from PATH         install a checkout of the repo that is on this machine
   --no-verify         do not check the release's SHA-256 or signature (not recommended)
   --skip-smoke-test   do not run 'ws --version' and 'ws doctor --offline' afterwards
+  --move-existing-ws-to PATH
+                      if another program named 'ws' is in the install folder, rename it to PATH (a rename,
+                      never a delete) and, after the install, set it as the program that gets words ws lacks
+                      ('ws config fallback PATH')
   --dry-run           run the checks and say what would happen; install nothing
   --help              show this text
 
@@ -426,6 +430,103 @@ find_ws() {
     return 1
 }
 
+# The folder the installer puts the ws command in: uv's tool bin folder, else pipx's.
+install_bin_dir() {
+    local dir=""
+    if [ "${INSTALLER}" = "uv" ]; then
+        dir="$(uv tool dir --bin 2>/dev/null </dev/null || true)"
+    fi
+    printf '%s' "${dir:-${PIPX_BIN_DIR:-${HOME}/.local/bin}}"
+}
+
+# Follows a chain of symlinks to the file at the end (at most 20 steps), without needing readlink -f.
+resolve_link() {
+    local p="$1" target n=0
+    while [ -L "${p}" ] && [ "${n}" -lt 20 ] && require_cmd readlink; do
+        target="$(readlink "${p}" 2>/dev/null </dev/null || true)"
+        [ -n "${target}" ] || break
+        case "${target}" in
+            /*) p="${target}" ;;
+            *) p="${p%/*}/${target}" ;;
+        esac
+        n=$((n + 1))
+    done
+    printf '%s' "${p}"
+}
+
+# True when the file at PATH_ARG is this toolkit: it lives in the ws-aitoolkit tool environment, or its
+# `version --json` answers in the ws.cli/1 shape with an install_source field.
+is_this_toolkit() {
+    local file="$1" real answer
+    real="$(resolve_link "${file}")"
+    case "${real}" in */ws-aitoolkit/*) return 0 ;; esac
+    [ -f "${real}" ] && [ -x "${real}" ] || return 1
+    answer="$("${real}" version --json 2>/dev/null </dev/null || true)"
+    case "${answer}" in
+        *'"ws.cli/1"'*'"install_source"'*) return 0 ;;
+    esac
+    return 1
+}
+
+# If the install folder already holds a different `ws`, stops with no changes and prints the two commands that
+# keep it working as the fallback; with a move target it does the rename instead. A dry run only says what it would do.
+# Sets MOVED_WS to the new place of a program it moved.
+MOVED_WS=""
+check_existing_ws() {
+    local dry="$1" move_to="$2" bin_dir existing
+    bin_dir="$(install_bin_dir)"
+    existing="${bin_dir}/ws"
+    if [ ! -e "${existing}" ] && [ ! -L "${existing}" ]; then
+        [ -z "${move_to}" ] || info "no other 'ws' in ${bin_dir}, so there is nothing to move"
+        return 0
+    fi
+    if is_this_toolkit "${existing}"; then
+        [ -z "${move_to}" ] || info "the 'ws' in ${bin_dir} is this toolkit, so there is nothing to move"
+        return 0
+    fi
+    if [ -n "${move_to}" ]; then
+        if [ -e "${move_to}" ] || [ -L "${move_to}" ]; then
+            error "${move_to} already exists; choose a name that is free for --move-existing-ws-to"
+            exit 1
+        fi
+        if [ "${dry}" = "1" ]; then
+            info "would rename ${existing} to ${move_to}, then run: ws config fallback ${move_to}"
+            return 0
+        fi
+        mv -- "${existing}" "${move_to}" ||
+            {
+                error "could not rename ${existing} to ${move_to}"
+                exit 1
+            }
+        ok "renamed ${existing} to ${move_to}"
+        MOVED_WS="${move_to}"
+        return 0
+    fi
+    if [ "${dry}" = "1" ]; then
+        warn "another program named 'ws' is at ${existing}; a real run would stop here"
+    else
+        error "another program named 'ws' is at ${existing}. Nothing was changed."
+    fi
+    printf '       1. move it aside:        mv %s %s-legacy\n' "${existing}" "${existing}" >&2
+    printf '       2. after the install:    ws config fallback %s-legacy\n' "${existing}" >&2
+    printf '          (ws then hands it every word ws has no command for)\n' >&2
+    printf '       or let the installer do both: bash install.sh --move-existing-ws-to %s-legacy\n' "${existing}" >&2
+    if [ "${dry}" = "1" ]; then
+        return 0
+    fi
+    exit 1
+}
+
+# After the install: make the moved program the fallback, using the ws that was just installed.
+set_moved_fallback() {
+    local ws_bin="$1" target="$2"
+    if ! "${ws_bin}" config fallback "${target}" </dev/null; then
+        error "ws is installed, but setting the fallback failed. Run: ws config fallback ${target}"
+        exit 1
+    fi
+    ok "words ws lacks now go to ${target}"
+}
+
 # ---------------------------------------------------------------------------
 # main: the whole run, so a partial download runs nothing
 # ---------------------------------------------------------------------------
@@ -532,7 +633,7 @@ preflight() {
 main() {
     local dry_run=0 from_pypi=0 from_path="" have_version=0 version_tag="" no_verify=0 skip_smoke=0
     local override="${WS_RELEASE_BASE_URL:-}" api_base="https://api.github.com" download_base="https://github.com"
-    local path_fix="" uninstall_cmd="" run_cmd="" ws_bin="" out="" code=0
+    local path_fix="" uninstall_cmd="" run_cmd="" ws_bin="" out="" code=0 move_existing=""
 
     if [ "${WS_SKIP_VERIFY:-0}" = "1" ]; then
         skip_smoke=1
@@ -573,6 +674,11 @@ main() {
                 dry_run=1
                 shift
                 ;;
+            --move-existing-ws-to)
+                [ $# -ge 2 ] || usage_error "--move-existing-ws-to needs a new path for the existing ws"
+                move_existing="$2"
+                shift 2
+                ;;
             *) usage_error "unknown argument: $1" ;;
         esac
     done
@@ -587,6 +693,13 @@ main() {
         [ "${from_pypi}" = "0" ] || usage_error "--from and --pypi cannot be used together"
         [ -f "${from_path}/pyproject.toml" ] || usage_error "--from needs the folder of a ws checkout (no pyproject.toml in '${from_path}')"
         from_path="$(cd "${from_path}" && pwd -P)"
+    fi
+    if [ -n "${move_existing}" ]; then
+        case "${move_existing}" in
+            /*) ;;
+            *) usage_error "--move-existing-ws-to needs an absolute path, not '${move_existing}'" ;;
+        esac
+        case "${move_existing}" in */) usage_error "--move-existing-ws-to needs a file path, not a folder" ;; esac
     fi
     if [ -n "${override}" ]; then
         valid_base_url "${override}" ||
@@ -620,6 +733,7 @@ main() {
         path_fix="pipx ensurepath"
         uninstall_cmd="pipx uninstall ${PACKAGE}"
     fi
+    check_existing_ws "${dry_run}" "${move_existing}"
     INSTALL_SRC=""
     if [ -n "${from_path}" ]; then
         INSTALL_SRC="${from_path}"
@@ -681,6 +795,14 @@ main() {
                     exit 1
                     ;;
             esac
+        fi
+        if [ -n "${MOVED_WS}" ]; then
+            ws_bin="$(install_bin_dir)/ws"
+            [ -x "${ws_bin}" ] || ws_bin="$(find_ws)" || {
+                error "ws was installed but is not on PATH, so the fallback is not set. After fixing PATH run: ws config fallback ${MOVED_WS}"
+                exit 1
+            }
+            set_moved_fallback "${ws_bin}" "${MOVED_WS}"
         fi
     fi
 

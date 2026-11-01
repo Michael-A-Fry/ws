@@ -46,8 +46,24 @@ Install the `ws` command on macOS, Linux or Windows (through WSL2), and check th
 | The package from PyPI | `bash install.sh --pypi` |
 | A checkout on this machine | `bash install.sh --from PATH` |
 | To see what would happen | `bash install.sh --dry-run` |
+| To rename a `ws` you already have | `bash install.sh --move-existing-ws-to PATH` |
 
 Save the script first if you want to read it before you run it: `curl -fsSLO <the URL above>`, then `bash install.sh`.
+
+## If you already have a program called `ws`
+
+The installer looks in its install folder (`uv tool dir --bin`, or `~/.local/bin` for pipx) before it changes anything.
+If a different `ws` is there, it stops and prints two commands:
+
+```sh
+mv ~/.local/bin/ws ~/.local/bin/ws-legacy      # step 1: move it aside, then run the installer again
+ws config fallback ~/.local/bin/ws-legacy      # step 2: after the install, hand it the words ws has no command for
+```
+
+`bash install.sh --move-existing-ws-to PATH` does both: it renames the old program (a rename, never a delete) and sets
+it as the fallback once ws is installed. After that `ws doctor` runs ws's own command, and `ws dispatch x` or a bare
+`ws` reach the old program with the same arguments. A program named `ws-<word>` on your `PATH` also runs as
+`ws <word>`; see [Your own commands](../reference/cli.md#your-own-commands).
 
 To install by hand, use `uv tool install ws-aitoolkit` or `pipx install ws-aitoolkit`.
 

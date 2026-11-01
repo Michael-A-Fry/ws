@@ -20,6 +20,23 @@ These work on every command, before or after the command name.
 
 A mistyped command or flag gets a "did you mean" hint.
 
+## Your own commands
+
+`ws <word>` looks for a command in this order, and the first match runs.
+
+1. A ws command (`ws doctor`).
+2. A program named `ws-<word>` in a folder on `PATH` (`ws hello` runs `ws-hello`). The word is lower case letters,
+   digits and `-`, starting with a letter, up to 41 characters. It gets the arguments after the word. `--json` becomes
+   `WS_OUTPUT=json` in its environment, and `-C PATH` is its working folder. Only absolute `PATH` entries count.
+3. The program in the profile's `[cli] fallback`. It gets the whole original argument list, including flags ws has no
+   use for (`ws -n repo tag`) and an empty list (a bare `ws`), and runs with `WS_FALLBACK=1`. A run that already has
+   `WS_FALLBACK` set goes no further than that program.
+4. The usage error, with a "did you mean" hint.
+
+The fallback is an absolute path (or one that starts with `~/`) to an executable file you own that nobody else can
+write to, the same test a job file passes. Set it with `ws config fallback PATH`, clear it with
+`ws config fallback --clear`. `ws help` lists the `ws-<word>` programs on `PATH` and names the fallback.
+
 ## Exit codes
 
 | Code | Meaning |
@@ -690,11 +707,18 @@ ws setup [-h] [--web] [--no-open] [-y] [--plugin NAME] [--notes PATH]
 
 ## `ws config`
 
-Every file ws reads: where it's, where its path came from, the keys it sets.
+Every file ws reads: where it's, where its path came from, the keys it sets. `ws config fallback` shows, sets and
+clears the program that gets words ws has no command for (see [Your own commands](#your-own-commands)).
 
 ```text
-ws config [-h]
+ws config [-h] [--clear] [{fallback}] [PATH]
 ```
+
+| Argument | Meaning |
+|---|---|
+| `fallback` | Show the fallback program. With `PATH`, set it; with `--clear`, remove it. |
+| `PATH` | With `fallback`: the program (absolute, or `~/...`). It has to be an executable file you own that nobody else can write to. |
+| `--clear` | With `fallback`: remove it. |
 
 ## `ws status`
 

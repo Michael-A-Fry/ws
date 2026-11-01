@@ -776,11 +776,11 @@ def test_the_web_handler_never_raises_whatever_goes_wrong(box, monkeypatch):
     srv, t, _ = _start()
     body = {"plugins": [], "notes": "~/Notes"}
     try:
-        monkeypatch.setattr(flow, "preview", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
-        status, data = _api(srv, "/api/preview", body)
+        with monkeypatch.context() as m:  # a context, not monkeypatch.undo(): that would drop box's HOME too
+            m.setattr(flow, "preview", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+            status, data = _api(srv, "/api/preview", body)
         doc = json.loads(data)
         assert status == 500 and "went wrong" in doc["error"] and "boom" not in doc["error"]
-        monkeypatch.undo()
         real = flow.run_install
 
         def broken(*a, **k):

@@ -71,6 +71,10 @@ A command that speaks a protocol on standard output (`ws mcp serve`, `ws gate ch
 | `WS_OUTPUT` | Set to `json` for `--json` on every command. |
 | `WS_BROKER_SOCKET` | The broker socket a client uses. |
 | `WS_GATED_SESSION` | Set inside a gated session. `ws approve` refuses when it's present. |
+| `NO_COLOR` | Any non-empty value turns colour off in `ws setup`. An empty value is ignored. `ws setup --no-color` does the same. |
+| `FORCE_COLOR` | Any value except empty, `0` or `false` (any case) keeps colour on when output goes to a pipe or `TERM=dumb`. `NO_COLOR` and `--no-color` win. |
+| `TERM` | `dumb` turns colour off and makes `ws setup` print each step once, with no cursor-move or erase codes. |
+| `COLORFGBG` | Read by `ws setup`. The default is the full brand palette in 256 colours; a light background (`0;15`) switches to darker violet and mark colours and your terminal's own green, yellow and red. |
 | `XDG_STATE_HOME` | Where run folders for jobs with no `cwd` go, under `ws/work`. Default `~/.local/state`. |
 
 ## Commands
@@ -546,6 +550,7 @@ ws plugin add [-h] [--region CC] NAME
 |---|---|
 | `NAME` | The plugin (see `ws plugin list`). |
 | `--region CC` | Your country (two letters); kept in `[machine] region`. |
+| `--no-color` | Print with no colour, the same as a non-empty `NO_COLOR`. |
 
 ### `ws plugin remove`
 
@@ -802,7 +807,7 @@ Set up ws, step by step; run it again and it reports 0 changes (--web for a page
 
 ```text
 ws setup [-h] [--web] [--no-open] [-y] [--plugin NAME] [--notes PATH]
-    [--runner {claude-code,opencode}] [--cap USD] [--region CC]
+    [--runner {claude-code,opencode}] [--cap USD] [--region CC] [--no-color]
 ```
 
 | Argument | Meaning |

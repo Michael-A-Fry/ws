@@ -39,6 +39,7 @@ install.sh        the installer people run first (pipx or uv)
 |---|---|
 | `adapters/` | Runner adapters: one module per runner |
 | `approvals.py` | Bound, single-use approvals: how a call the policy marks `ask_commands` gets a human's yes, once |
+| `brand.py` | The ws look in one place: colour tokens by role, the mark, and the rule for when colour is on |
 | `broker.py` | The secrets broker: a small process that is not an LLM and holds the store, so agents never see... |
 | `canary.py` | `ws canary`: a few small checks that a runner's update did not break what ws relies on |
 | `cli.py` | The `ws` command |

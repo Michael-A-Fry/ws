@@ -14,14 +14,15 @@ import sys
 import threading
 from dataclasses import replace
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 from test_install import snapshot
 
-from ws import cli, install
+from ws import brand, cli, install
+from ws.brand import ANSI_RE, BASIC, FULL, LOGO, LOGO_SMALL, LOGO_WIDTH, Ansi, visible_len, xterm_hex
 from ws.install import InstallError
 from ws.setup_ui import flow, inline
-from ws.setup_ui.brand import ANSI_RE, LOGO, LOGO_SMALL, LOGO_WIDTH, Ansi, visible_len, xterm_hex
 from ws.setup_ui.web import SetupServer, render_page
 
 posix_only = pytest.mark.skipif(sys.platform == "win32", reason="the fake runner is a shell script")
@@ -52,7 +53,7 @@ def plain(text: str) -> str:
     return ANSI_RE.sub("", text)
 
 
-def walk(keys, *, live=False, interactive=True, region="NZ", cols=100, cap=20, **flags):
+def walk(keys, *, live=False, interactive=True, region="NZ", cols=100, cap=20, color=False, **flags):
     """Walk the steps with these keys. A cap is given by default, so the optional cap step is not asked."""
     facts = flow.gather(os.environ, region=region)
     choices = flow.choices_from(facts, region=region, cap=cap, **flags)
@@ -67,7 +68,7 @@ def walk(keys, *, live=False, interactive=True, region="NZ", cols=100, cap=20, *
         return k
 
     wiz = inline.Wizard(
-        facts, choices, out, key, sleep=lambda _: None, cols=cols, color=False, live=live, interactive=interactive
+        facts, choices, out, key, sleep=lambda _: None, cols=cols, color=color, live=live, interactive=interactive
     )
     return wiz.run(), out.getvalue(), facts
 
@@ -321,17 +322,98 @@ def test_the_mark_folds_under_80_columns(box):
     assert LOGO[0].strip() not in small and LOGO_SMALL[0].strip() in small and "Your memory" not in small
 
 
-def test_colour_is_off_for_no_color_pipes_and_dumb_terminals(monkeypatch):
-    class Tty(io.StringIO):
-        def isatty(self):
-            return True
+class Tty(io.StringIO):
+    def isatty(self):
+        return True
 
-    assert inline.wants_color(Tty(), {}) is True
-    assert inline.wants_color(Tty(), {"NO_COLOR": "1"}) is False
-    assert inline.wants_color(Tty(), {"TERM": "dumb"}) is False
-    assert inline.wants_color(io.StringIO(), {}) is False
-    a = Ansi(False)
-    assert a.violet("x") == "x" and a.rule(5) == "━" * 5 and plain(Ansi(True).mint("ok")) == "ok"
+
+class FakeStdin:
+    def isatty(self):
+        return True
+
+    def fileno(self):
+        return 0
+
+
+class FakeTerminal:
+    """Stands in for the real terminal: records whether the cursor codes were asked for."""
+
+    made: ClassVar[list] = []
+
+    def __init__(self, fd, out, *, cursor=True):
+        self.cursor, self.pending = cursor, False
+        FakeTerminal.made.append(self)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def attended_run(monkeypatch, env, *, no_color=False):
+    """`inline.run` on a pretend terminal with these environment variables; returns (code, output, terminal)."""
+    FakeTerminal.made = []
+    monkeypatch.setattr(sys, "stdin", FakeStdin())
+    monkeypatch.setattr(inline, "Terminal", FakeTerminal)
+    keys = iter(ALL_ENTER)
+    monkeypatch.setattr(inline, "Keys", lambda fd: type("K", (), {"read": staticmethod(lambda: next(keys))})())
+    facts = flow.gather(os.environ, region="NZ")
+    out = Tty()
+    code = inline.run(facts, flow.choices_from(facts, region="NZ", cap=20), out=out, no_color=no_color, env=env)
+    return code, out.getvalue(), FakeTerminal.made[0]
+
+
+def test_a_dumb_terminal_is_asked_the_same_questions_but_nothing_is_redrawn(box, monkeypatch):
+    code, text, term = attended_run(monkeypatch, {"TERM": "dumb"})
+    assert code == 0 and term.cursor is False
+    assert "\x1b" not in text  # no colour, no cursor-move, no erase, no hide or show
+    assert "Review" in text and "Done" in text
+
+
+def test_forced_colour_on_a_dumb_terminal_is_colour_only(box, monkeypatch):
+    code, text, term = attended_run(monkeypatch, {"TERM": "dumb", "FORCE_COLOR": "1"})
+    codes = ANSI_RE.findall(text)
+    assert code == 0 and term.cursor is False and codes
+    assert all(c.endswith("m") for c in codes), "only colour codes: nothing that moves the cursor or erases"
+
+
+def test_a_terminal_that_can_redraw_does(box, monkeypatch):
+    code, text, term = attended_run(monkeypatch, {"TERM": "xterm-256color"})
+    assert code == 0 and term.cursor is True
+    assert "\x1b[?25l" in text and "\x1b[2K" in text
+
+
+@pytest.mark.parametrize(
+    ("env", "flag", "colour"),
+    [
+        ({}, False, True),
+        ({"COLORFGBG": "0;15"}, False, True),
+        ({"NO_COLOR": "1"}, False, False),
+        ({"NO_COLOR": ""}, False, True),  # an empty NO_COLOR is not a request
+        ({}, True, False),  # --no-color
+        ({"NO_COLOR": "1", "FORCE_COLOR": "1"}, False, False),
+    ],
+)
+def test_colour_follows_no_color_the_flag_and_force_color(box, monkeypatch, env, flag, colour):
+    _, text, _ = attended_run(monkeypatch, {"TERM": "xterm", **env}, no_color=flag)
+    assert bool(re.search(r"\x1b\[[0-9;]*m", text)) is colour
+
+
+def test_the_no_color_flag_is_accepted_by_ws_setup(box, capsys):
+    assert cli.main(["setup", "--yes", "--no-color", "--region", "NZ"]) == 0
+    assert "\x1b" not in capsys.readouterr().out
+
+
+def test_with_colour_stripped_the_output_is_the_no_color_output(box):
+    """The same walk three ways: stripping the codes from either coloured run gives the NO_COLOR text."""
+    texts = {}
+    for name, color in (("full", FULL), ("basic", BASIC), ("off", False)):
+        code, texts[name], _ = walk(ALL_ENTER, color=color)
+        assert code == 0
+        assert cli.main(["uninstall", "--yes"]) == 0
+    assert "\x1b[" in texts["full"] and "\x1b[" in texts["basic"] and "\x1b" not in texts["off"]
+    assert plain(texts["full"]) == texts["off"] == plain(texts["basic"])
 
 
 def test_setup_needs_a_terminal_without_yes(box, capsys):
@@ -375,11 +457,52 @@ def test_brand_colours_mark_and_helpers():
     assert [plain(r) for r in Ansi(True).logo()] == [r.ljust(LOGO_WIDTH) for r in LOGO]
 
 
-def test_the_visual_kit_is_written_down():
-    import ws.setup_ui as ui
+@posix_only
+def test_the_visual_kit_describes_what_the_code_draws(box):
+    """The kit in `ws.setup_ui`'s docstring, checked against the output rather than against its own words."""
+    fake_runner(box)
+    full = Ansi(FULL)
+    facts = flow.gather(os.environ, region="NZ")
+    banner = "\n".join(inline.banner(full, 100, 120))
+    assert "\x1b[1mws-aitoolkit" in banner  # the name is bold, with no colour of its own
+    assert "\x1b[1;38;5;49msetup" in banner  # the word "setup" is mint
+    assert banner.count("38;5;99m") >= 4 and "38;5;63m" in banner and "38;5;43m" in banner  # the mark and the rule
+    assert "38;5;99" in inline.hints(full, ("↵", "begin"))  # the key in a hint is violet
+    assert "\x1b[1;38;5;214m~" in "\n".join(  # a changed file is amber, an added one mint
+        inline.review_rows(
+            full,
+            facts,
+            flow.choices_from(facts),
+            type(
+                "P",
+                (),
+                {"headline": lambda s: "+1", "rows": [{"kind": "file", "action": "change", "path": "p", "what": "w"}]},
+            )(),
+            details=True,
+            room=5,
+            collapsed=True,
+        )
+    )
+    ok = [r for r in flow.status_rows(facts) if r.tone == "ok"]
+    assert ok and "\x1b[38;5;49m✓" in "\n".join(inline.status(full, facts))  # a found fact gets a mint tick
 
-    for word in ("Visual kit", "Violet", "Mint", "gradient rule", "Status block", "Hint line", "Cards", "Fallbacks"):
-        assert word in ui.__doc__
+
+def test_the_terminal_uses_only_the_colours_the_kit_names(box):
+    """Two accents and a few greys: every 256-colour number in a coloured walk is a token's number."""
+    _, text, _ = walk(ALL_ENTER, color=FULL)
+    used = {int(n) for n in re.findall(r"38;5;(\d+)", text)}
+    assert used and used <= {t.xterm for t in brand.TOKENS if t.xterm is not None}
+    assert {99, 49, 245} <= used  # violet, mint and the quiet grey are all there
+
+
+def test_a_refusal_is_red_and_a_warning_amber(box):
+    for color, red, amber in ((FULL, "38;5;203", "38;5;214"), (BASIC, "31", "33")):
+        facts = flow.gather(os.environ, region="NZ")
+        out = io.StringIO()
+        wiz = inline.Wizard(facts, flow.choices_from(facts), out, lambda: "q", color=color, live=False)
+        wiz.fail("no", "hint")
+        assert f"\x1b[1;{red}m✗" in out.getvalue()
+        assert f"\x1b[{amber}m" in Ansi(color).amber("x")
 
 
 # ---- the web page ------------------------------------------------------------------------------------------------------
@@ -485,7 +608,11 @@ def test_install_calls_the_engine_then_the_server_closes(box):
     srv, t, out = _start()
     status, data = _api(srv, "/api/install", {"plugins": ["calendar"], "notes": "~/Notes"})
     doc = json.loads(data)
-    assert status == 200 and doc["headline"].startswith("+") and doc["next"][0] == "ws doctor"
+    assert (
+        status == 200
+        and doc["headline"].startswith("+")
+        and doc["next"][0] == ["ws doctor", "check that everything works"]
+    )
     assert doc["groups"][0]["name"] == "Profile and policy"
     t.join(5)
     assert not t.is_alive() and out["result"]["headline"] == doc["headline"]
@@ -706,7 +833,7 @@ def test_the_browser_is_started_on_a_private_file_not_on_the_token(box, monkeypa
     from ws.setup_ui import web
 
     seen: dict = {}
-    made: list = []
+    made: ClassVar[list] = []
 
     class Spy(SetupServer):
         def __init__(self, *a, **k):
@@ -907,3 +1034,70 @@ def test_a_sigterm_while_installing_is_noted_and_the_summary_says_what_was_writt
     finally:
         os.close(master)
         os.close(slave)
+
+
+# ---- the page's look: tokens, motion, policy -----------------------------------------------------------------------
+
+
+def test_the_page_colours_come_from_the_tokens(box):
+    from ws.setup_ui import web
+
+    facts = flow.gather(os.environ, region="NZ")
+    page = render_page(facts, flow.choices_from(facts))
+    assert brand.css() in page
+    assert not re.search(r"#[0-9a-fA-F]{3,8}\b|rgba?\(", web.STYLE), "the rules name roles; the tokens hold the colours"
+    assert not re.search(r"#[0-9a-fA-F]{6}\b", web.JS)
+    assert "--add" not in page and "--faint" not in page  # the old hand-typed names are gone
+    for i, role in enumerate(brand.GRADIENT_ROLES):  # the mark: a class per row, no inline colour
+        assert f'<i class="r{i}">' in page and f".logo .r{i}{{color:var(--{role})}}" in page
+    assert "<i style" not in page and 'style="' not in page
+
+
+def test_the_spinner_stops_for_people_who_ask_for_reduced_motion(box):
+    from ws.setup_ui import web
+
+    block = re.search(r"@media\(prefers-reduced-motion:reduce\)\{(.*?)\}\}?\n", web.CSS, re.DOTALL)
+    assert block and "animation:none" in block.group(1) and "transition:none" in block.group(1)
+    assert "animation:turn" in web.CSS  # the spinner it switches off
+
+
+def _get_page(srv):
+    conn = http.client.HTTPConnection("127.0.0.1", srv.port, timeout=5)
+    conn.request("GET", f"/?t={srv.token}")
+    r = conn.getresponse()
+    body = r.read().decode()
+    csp = r.getheader("Content-Security-Policy")
+    conn.close()
+    return csp, body
+
+
+def test_each_response_gets_its_own_nonce_and_the_policy_has_no_unsafe_inline(box):
+    srv, t, _ = _start()
+    try:
+        csp1, page1 = _get_page(srv)
+        csp2, page2 = _get_page(srv)
+        for csp, page in ((csp1, page1), (csp2, page2)):
+            nonce = re.search(r"script-src 'nonce-([\w-]+)'", csp).group(1)
+            assert f"style-src 'nonce-{nonce}'" in csp and "unsafe-inline" not in csp
+            assert f'<style nonce="{nonce}">' in page and f'<script nonce="{nonce}">' in page
+        assert csp1 != csp2
+        status, _ = _call(srv, "GET", "/nothing?t=" + srv.token)
+        assert status == 404
+    finally:
+        srv.close()
+        t.join(5)
+
+
+def test_a_json_reply_is_allowed_nothing(box):
+    from ws.setup_ui import web
+
+    assert web.csp() == "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+
+
+def test_the_finished_screen_has_a_description_for_every_command(box):
+    facts = flow.gather(os.environ, region="NZ")
+    steps = flow.next_steps(facts, flow.choices_from(facts))
+    assert [c for c, _ in steps] == flow.next_commands(facts, flow.choices_from(facts))
+    assert all(cmd.startswith("ws ") and desc for cmd, desc in steps)
+    page = render_page(facts, flow.choices_from(facts))
+    assert "text: 'ws-aitoolkit'" not in page and "h('b', {text: 'ws'})" in page

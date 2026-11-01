@@ -21,17 +21,18 @@ from dataclasses import replace
 from typing import Self
 
 from ws import __version__
-from ws.install import InstallError
-from ws.output import WsError
-from ws.setup_ui import flow
-from ws.setup_ui.brand import (
-    AMBER,
+from ws.brand import (
     LOGO_WIDTH,
     SPINNER,
     TAGLINE,
     Ansi,
+    can_redraw,
+    color_mode,
     visible_len,
 )
+from ws.install import InstallError
+from ws.output import WsError
+from ws.setup_ui import flow
 
 HIDE = "\x1b[?25l"
 SHOW = "\x1b[?25h"
@@ -136,11 +137,12 @@ class Terminal:
     While `hold` is set (the install is writing) SIGTERM and SIGHUP only set `pending`, so a write is never cut in half.
     """
 
-    def __init__(self, fd: int, out) -> None:
+    def __init__(self, fd: int, out, *, cursor: bool = True) -> None:
         import termios
 
         self.fd = fd
         self.out = out
+        self.cursor = cursor  # False for TERM=dumb: no hide or show code at all
         self.saved = termios.tcgetattr(fd)
         self.hold = False
         self.pending = False
@@ -150,15 +152,17 @@ class Terminal:
         import tty
 
         tty.setcbreak(self.fd)
-        self.out.write(HIDE)
-        self.out.flush()
+        if self.cursor:
+            self.out.write(HIDE)
+            self.out.flush()
 
     def leave(self) -> None:
         import termios
 
         termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
-        self.out.write(SHOW)
-        self.out.flush()
+        if self.cursor:
+            self.out.write(SHOW)
+            self.out.flush()
 
     def _on_end(self, signum, frame) -> None:
         if self.hold:
@@ -197,14 +201,11 @@ class Terminal:
         return False
 
 
-def wants_color(out, env=None) -> bool:
-    """Colour only on a terminal, and not when NO_COLOR is set (to anything) or TERM is dumb."""
-    env = os.environ if env is None else env
+def is_tty(out) -> bool:
     try:
-        tty = bool(out.isatty())
+        return bool(out.isatty())
     except (AttributeError, ValueError, OSError):
-        tty = False
-    return tty and "NO_COLOR" not in env and env.get("TERM") != "dumb"
+        return False
 
 
 # ---- looks: pure functions of text ----------------------------------------------------------------------------------------
@@ -254,7 +255,7 @@ def status(a: Ansi, facts: flow.Facts, width: int = 100) -> list[str]:
         if row.tone == "ok":
             value = a.mint("✓") + " " + value
         elif row.tone == "warn":
-            value = a.fg(AMBER, value)
+            value = a.amber(value)
         if row.label == "Budget" and facts.cap and facts.spent > 0:
             value += "  " + a.track(min(facts.spent, facts.cap), facts.cap, 20)
         lines.append(fit("  " + a.dim(row.label.ljust(9)) + value, width))
@@ -342,7 +343,7 @@ def review_rows(
         listed = [r for r in pv.rows if r["kind"] == "file" and r["action"] in ("create", "change")]
         rows.append("")
         for r in listed[:room]:
-            sign = a.mint("+", bold=True) if r["action"] == "create" else a.fg(AMBER, "~", bold=True)
+            sign = a.mint("+", bold=True) if r["action"] == "create" else a.amber("~", bold=True)
             what = re.sub(r"\s*\([^()]*\)\s*$", "", r["what"])
             rows.append(f"{sign} {r['path']}  {a.dim(what)}")
         if len(listed) > room:
@@ -379,7 +380,7 @@ class Wizard:
         *,
         sleep=time.sleep,
         cols=100,
-        color: bool = True,
+        color: bool | str = True,
         live: bool = True,
         interactive: bool = True,
         terminal: Terminal | None = None,
@@ -465,7 +466,7 @@ class Wizard:
 
     def fail(self, message: str, hint: str) -> None:
         a, text = self.a, flow.clean(message)
-        self.print(["", "  " + a.fg(AMBER, "✗", bold=True) + " " + a.bold(text), "  " + a.dim(hint), ""])
+        self.print(["", "  " + a.error("✗", bold=True) + " " + a.bold(text), "  " + a.dim(hint), ""])
         if not self.interactive:
             print(f"ws: {text}", file=sys.stderr)
 
@@ -703,7 +704,7 @@ class Wizard:
                 + a.dim("optional: the most ws may spend in a month")
             ]
             if error:
-                rows.append("  " + a.fg(AMBER, error))
+                rows.append("  " + a.error(error))
             rows += ["", hints(a, ("type a number", ""), ("↵", "set" if text else "skip")).rstrip()]
             self.draw(rows)
             k = self.key()
@@ -822,7 +823,7 @@ class Wizard:
             self.print(
                 [
                     "",
-                    "  " + a.fg(AMBER, "Stopped."),
+                    "  " + a.amber("Stopped."),
                     a.dim("  What was written is recorded; run ws setup again to finish, or ws uninstall."),
                     "",
                 ]
@@ -849,12 +850,20 @@ class Wizard:
 # ---- the entry point -----------------------------------------------------------------------------------------------------
 
 
-def run(facts: flow.Facts, choices: flow.Choices, *, yes: bool = False, out=None) -> int:
-    """Walk setup. With `yes`, take the defaults without asking; otherwise it needs a terminal to ask on."""
+def run(
+    facts: flow.Facts, choices: flow.Choices, *, yes: bool = False, out=None, no_color: bool = False, env=None
+) -> int:
+    """Walk setup. With `yes`, take the defaults without asking; otherwise it needs a terminal to ask on.
+
+    Colour follows `brand.color_mode`; a `TERM=dumb` terminal is asked the same questions but nothing is redrawn.
+    """
     out = sys.stdout if out is None else out
+    env = os.environ if env is None else env
     if not facts.osi.supported:
         raise WsError("unsupported", "native Windows is not supported", "install WSL2 and run ws inside it")
-    attended = sys.stdin is not None and sys.stdin.isatty() and out.isatty()
+    tty = is_tty(out)
+    mode = color_mode(env, tty, no_color=no_color)
+    attended = sys.stdin is not None and sys.stdin.isatty() and tty
     if yes or not attended:
         if not yes:
             raise WsError("usage", "setup needs a terminal", "pass --yes to take the defaults, or use --web")
@@ -865,28 +874,28 @@ def run(facts: flow.Facts, choices: flow.Choices, *, yes: bool = False, out=None
             lambda: "enter",
             sleep=lambda _: None,
             cols=lambda: shutil.get_terminal_size().columns,
-            color=wants_color(out),
+            color=mode,
             live=False,
             interactive=False,
         )
         return wiz.run()
     fd = sys.stdin.fileno()
-    color = wants_color(out)
+    live = can_redraw(env, tty)
     try:
-        with Terminal(fd, out) as terminal:
+        with Terminal(fd, out, cursor=live) as terminal:
             wiz = Wizard(
                 facts,
                 choices,
                 out,
                 Keys(fd).read,
                 cols=lambda: shutil.get_terminal_size().columns,
-                color=color,
-                live=True,
+                color=mode,
+                live=live,
                 interactive=True,
                 terminal=terminal,
             )
             return wiz.run()
     except KeyboardInterrupt:
-        out.write(SHOW + "\n" + Ansi(color).dim(CANCELLED) + "\n")
+        out.write(("\n" if not live else SHOW + "\n") + Ansi(mode).dim(CANCELLED) + "\n")
         out.flush()
         return 130

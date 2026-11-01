@@ -4,6 +4,7 @@ Bound to 127.0.0.1 on a random port, no CDN, no external fonts. The address carr
 memory and sends back in an `X-Ws-Token` header on every call, so a page from another site cannot drive it; every
 request also needs the right Host, and a POST needs a matching Origin. Nothing is written until Install, which calls
 `ws.install.apply` here on the server. The server closes after Install, after "Close", or after ten idle minutes.
+The colours come from `ws.brand`, and the page's one script and one stylesheet carry a nonce made for each response.
 """
 
 from __future__ import annotations
@@ -22,26 +23,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from ws import __version__, install
+from ws import __version__, brand, install
 from ws.setup_ui import flow
-from ws.setup_ui.brand import GRADIENT, LOGO, TAGLINE, xterm_hex
 
 IDLE_SECONDS = 600
 MAX_BODY = 64 * 1024
 MAX_ROWS = 400  # rows of the file list sent to the page
 
-CSS = """
-:root{--bg:#121316;--panel:#181a1e;--raise:#1f2126;--line:#272a30;--line2:#383c45;--text:#e8e9ec;--muted:#92959d;
---faint:#353840;--accent:#875fff;--tint:rgba(135,95,255,.13);--add:#00ffaf;--warn:#ffaf00;--on-accent:#fff;
-color-scheme:dark}
-:root[data-theme=light]{--bg:#f5f5f2;--panel:#fff;--raise:#f0f0ec;--line:#e2e2dc;--line2:#c9c9c2;--text:#1b1c1f;
---muted:#62656c;--faint:#d9d9d3;--accent:#6a3fe0;--tint:rgba(106,63,224,.08);--add:#0c9a7a;--warn:#b26b00;
---on-accent:#fff;color-scheme:light}
-@media(prefers-color-scheme:light){:root:not([data-theme=dark]){--bg:#f5f5f2;--panel:#fff;--raise:#f0f0ec;
---line:#e2e2dc;--line2:#c9c9c2;--text:#1b1c1f;--muted:#62656c;--faint:#d9d9d3;--accent:#6a3fe0;
---tint:rgba(106,63,224,.08);--add:#0c9a7a;--warn:#b26b00;--on-accent:#fff;color-scheme:light}}
+# The colours come from `ws.brand`; the rules below name them as `var(--role)` and hold no colour of their own.
+STYLE = """
 *{box-sizing:border-box}
-body{margin:0;background:radial-gradient(900px 280px at 6% -60px,rgba(135,95,255,.17),transparent 70%) no-repeat,
+body{margin:0;background:radial-gradient(900px 280px at 6% -60px,var(--glow),transparent 70%) no-repeat,
 var(--bg);color:var(--text);font:15px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
 min-height:100vh}
 code,.mono,input[type=text]{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
@@ -79,22 +71,22 @@ margin:0 0 10px;font-size:13px;color:var(--muted);font-weight:500}
 .panel h2{display:flex;justify-content:space-between;align-items:center;margin:0;padding:12px 18px;font-size:14px;
 font-weight:600;border-bottom:1px solid var(--line)}
 .panel h2 span{color:var(--muted);font-weight:400;font-size:13px}
-.panel h2 span.mint{color:var(--add);font-size:15px;font-weight:650}
+.panel h2 span.mint{color:var(--ok);font-size:15px;font-weight:650}
 .panel ul{list-style:none;margin:0;padding:4px 0 6px}
 .core li{display:grid;grid-template-columns:20px 150px 1fr;align-items:center;gap:0 12px;padding:6px 18px 6px 20px}
-.core li svg{color:var(--add)}.core li b{font-weight:550}.core li span{color:var(--muted);font-size:14px}
+.core li svg{color:var(--ok)}.core li b{font-weight:550}.core li span{color:var(--muted);font-size:14px}
 .rowsr{display:grid;grid-template-columns:90px 1fr;gap:6px 14px;padding:14px 18px;margin:0}
 .rowsr dt{color:var(--muted)}.rowsr dd{margin:0;word-break:break-word}
-.tick{color:var(--add)}.amber{color:var(--warn)}.mint{color:var(--add);font-weight:550}
+.tick{color:var(--ok)}.amber{color:var(--warn)}.mint{color:var(--ok);font-weight:550}
 .cmds{display:grid;grid-template-columns:auto 1fr;gap:6px 18px;padding:14px 18px;margin:0}
-.cmds dt{color:var(--accent);font-weight:550;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+.cmds dt{color:var(--accent-text);font-weight:550;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
 font-size:13px}.cmds dd{margin:0;color:var(--muted)}
 input[type=text]{width:100%;background:var(--bg);color:var(--text);border:1px solid var(--line2);border-radius:8px;
 padding:11px 14px;font-size:14px}
 input[type=text]:hover{border-color:var(--muted)}
 input[type=text]:focus-visible{outline-offset:0;border-color:var(--accent)}
 .hint{display:inline-flex;align-items:center;gap:8px;font-weight:400;font-size:13px;color:var(--muted)}
-.dot{width:7px;height:7px;border-radius:50%;background:var(--add);flex:none}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--ok);flex:none}
 .chips{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0 0}
 .chip{border:1px solid var(--line2);border-radius:999px;padding:3px 12px;font-size:13px;color:var(--muted)}
 .chip:hover{border-color:var(--accent);color:var(--text)}
@@ -116,6 +108,7 @@ display:grid;place-content:center;color:transparent}
 .plug:has(input:checked) .ico{background:var(--accent);color:var(--on-accent)}
 .plug:has(input:checked) .chk{background:var(--accent);border-color:var(--accent);color:var(--on-accent)}
 .plug:has(input:focus-visible){outline:2px solid var(--accent);outline-offset:2px}
+/* .plug.na is a disabled option, so WCAG exempts its reduced contrast */
 .plug.na{opacity:.55;cursor:not-allowed}.plug.na:hover{background:var(--panel);border-color:var(--line)}
 .rail{display:flex;flex-direction:column;gap:10px;position:sticky;top:20px}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:12px}
@@ -127,19 +120,19 @@ border-radius:12px}
 transform:rotate(-45deg);transition:transform .12s;margin-right:2px}
 .card[open] summary::before{transform:rotate(45deg) translate(-1px,-1px)}
 .card summary span{margin-left:auto;color:var(--muted);font-weight:400;font-variant-numeric:tabular-nums}
-.card summary span.add{color:var(--add)}
+.card summary span.add{color:var(--ok)}
 .body{padding:0 14px 13px 28px}
 .rows{margin:0;padding:0;list-style:none;color:var(--muted)}
 .rows li{display:grid;grid-template-columns:62px 1fr;gap:10px;padding:2px 0}
 .rows li b{font-weight:400;color:var(--text)}.rows li b.amber{color:var(--warn)}
 .files{max-height:15em;overflow:auto;font-size:12.5px;margin:0;padding:0;list-style:none}
 .files li{display:flex;gap:8px;padding:1px 0;color:var(--muted)}
-.files li::before{content:"+";color:var(--add)}.files li.chg::before{content:"~";color:var(--warn)}
+.files li::before{content:"+";color:var(--ok)}.files li.chg::before{content:"~";color:var(--warn)}
 .meter{display:grid;grid-template-columns:repeat(20,1fr);gap:2px;margin:6px 0 4px}
-.meter i{height:5px;border-radius:2px;background:var(--faint)}.meter i.on{background:var(--accent)}
+.meter i{height:5px;border-radius:2px;background:var(--line2)}.meter i.on{background:var(--accent)}
 .bar{position:fixed;left:0;right:0;bottom:0;background:var(--bg);border-top:1px solid var(--line)}
 .bar .wrap{display:flex;align-items:center;justify-content:space-between;padding-top:14px;padding-bottom:14px}
-.bar #count{color:var(--add);font-variant-numeric:tabular-nums;font-weight:500;min-width:0;overflow:hidden;
+.bar #count{color:var(--ok);font-variant-numeric:tabular-nums;font-weight:500;min-width:0;overflow:hidden;
 text-overflow:ellipsis;white-space:nowrap;margin-right:12px}
 .acts{display:flex;gap:10px;align-items:center;flex:none}
 .welcome .top .logo{visibility:hidden}
@@ -148,12 +141,15 @@ transition:filter .12s}
 .go:hover{filter:brightness(1.1)}.go:active{filter:brightness(.95)}.go:disabled{opacity:.4;cursor:default}
 .prog{list-style:none;margin:0;padding:6px 0}
 .prog li{display:grid;grid-template-columns:22px 190px 1fr;align-items:center;padding:6px 18px;gap:0 8px}
-.prog .st{color:var(--muted)}.prog li.ok .st{color:var(--add)}.prog li.ok span{color:var(--add)}
+.prog .st{color:var(--muted)}.prog li.ok .st{color:var(--ok)}.prog li.ok span{color:var(--ok)}
 .prog li.wait{color:var(--muted)}.prog li span{color:var(--muted)}
 .spin{width:14px;height:14px;border:2px solid var(--line2);border-top-color:var(--accent);border-radius:50%;
 animation:turn .7s linear infinite}
 @keyframes turn{to{transform:rotate(360deg)}}
-.err{border-color:var(--warn)}.err h2{color:var(--warn)}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
+.err{border-color:var(--error)}.err h2{color:var(--error)}
+.err p{padding:14px 18px;margin:0}
+.gap{margin-top:22px}
 [hidden]{display:none!important}
 @media(max-width:860px){
 .wrap{padding:0 16px}.top{grid-template-columns:auto 1fr auto;gap:12px;padding-top:14px;padding-bottom:12px}
@@ -165,6 +161,14 @@ animation:turn .7s linear infinite}
 .bar .wrap{padding-top:10px;padding-bottom:10px}.logo{font-size:6px;line-height:6px}.hero .logo{font-size:9px;line-height:9px}
 .prog li{grid-template-columns:22px 1fr}.prog li span{grid-column:2}}
 """
+
+
+def _mark_css() -> str:
+    """One class per row of the mark, each naming the role it takes its colour from (a darker ramp in light mode)."""
+    return "\n".join(f".logo .r{i}{{color:var(--{role})}}" for i, role in enumerate(brand.GRADIENT_ROLES))
+
+
+CSS = brand.css() + "\n" + STYLE.strip("\n") + "\n" + _mark_css()
 
 JS = """
 const B = JSON.parse(document.getElementById('boot').textContent);
@@ -233,7 +237,7 @@ function railCards() {
 
 function welcome() {
   const mark = document.getElementById('mark').content.firstElementChild.cloneNode(true);
-  const hero = h('div', {class: 'hero'}, mark, h('b', {text: 'ws-aitoolkit'}), h('small', {text: B.tagline}));
+  const hero = h('div', {class: 'hero'}, mark, h('b', {text: 'ws'}), h('small', {text: B.tagline}));
   const out = [hero];
   if (B.setUp) {
     out.push(h('section', {class: 'panel'}, h('h2', {}, 'Everything is set up', h('span', {text: '0 changes'})),
@@ -273,7 +277,7 @@ function capField() {  // optional, and only when the profile has no cap yet
   cap.value = capText;
   let t = null;
   cap.addEventListener('input', () => { capText = cap.value; clearTimeout(t); t = setTimeout(loadPlan, 300); });
-  return h('div', {style: 'margin-top:22px'}, h('div', {class: 'label'}, h('b', {text: 'Monthly cap (US$)'}), h('span', {text: 'Optional: the most ws may spend in a month'})), cap);
+  return h('div', {class: 'gap'}, h('div', {class: 'label'}, h('b', {text: 'Monthly cap (US$)'}), h('span', {text: 'Optional: the most ws may spend in a month'})), cap);
 }
 function notesStep() {
   const input = h('input', {type: 'text', id: 'notes', spellcheck: 'false', 'aria-label': 'Notes folder'});
@@ -294,7 +298,7 @@ function notesStep() {
 }
 function review(err) {
   const p = plan;
-  if (err) return [h('h1', {text: 'Review'}), h('section', {class: 'panel err'}, h('h2', {}, 'This cannot go ahead'), h('p', {class: 'sub', style: 'padding:14px 18px;margin:0', text: err}))];
+  if (err) return [h('h1', {text: 'Review'}), h('section', {class: 'panel err'}, h('h2', {}, 'This cannot go ahead'), h('p', {class: 'sub', text: err}))];
   if (!p) return [h('h1', {text: 'Review'}), h('p', {class: 'sub', text: 'Working out what would change…'})];
   const names = B.plugins.filter(x => picked.has(x.name)).map(x => x.label);
   const rows = [['Core', B.core.map(c => c.name).join(' · ')], ['Plugins', names.join(' · ') || 'none yet (ws plugin add later)'],
@@ -317,7 +321,7 @@ function installing(groups, upto) {
 function finished(res) {
   done = true; steps();
   const out = [h('section', {class: 'panel'}, h('h2', {}, h('span', {class: 'mint', text: '✓ Done'}), h('span', {text: res.headline})),
-    h('dl', {class: 'cmds'}, res.next.flatMap(c => [h('dt', {text: c}), h('dd', {text: ''})])))];
+    h('dl', {class: 'cmds'}, res.next.flatMap(([c, w]) => [h('dt', {text: c}), h('dd', {text: w})])))];
   if (res.notes.length) out.push(h('p', {class: 'sub', text: res.notes.join(' ')}));
   out.push(h('p', {class: 'sub', text: 'Saved in ' + res.saved + '. Run ws setup again any time to change it.'}));
   out.push(h('p', {class: 'sub', text: 'You can close this tab.'}));
@@ -379,8 +383,8 @@ label(); draw();
 
 
 def _mark() -> str:
-    """The pixel mark as coloured text: one colour per row."""
-    rows = "\n".join(f'<i style="color:{xterm_hex(GRADIENT[i])}">{row}</i>' for i, row in enumerate(LOGO))
+    """The pixel mark as text: one class per row, coloured by the stylesheet."""
+    rows = "\n".join(f'<i class="r{i}">{row}</i>' for i, row in enumerate(brand.LOGO))
     return f'<pre class="logo" role="img" aria-label="ws">{rows}</pre>'
 
 
@@ -399,7 +403,7 @@ def _boot(facts: flow.Facts, c: flow.Choices) -> str:
         options.insert(0, {"path": flow.tilde(c.notes, env), "app": flow.notes_app(facts, c.notes)})
     data = {
         "version": __version__,
-        "tagline": TAGLINE,
+        "tagline": brand.TAGLINE,
         "status": [{"label": r.label, "value": r.value, "tone": r.tone} for r in flow.status_rows(facts)],
         "spent": facts.spent,
         "cap": facts.cap,
@@ -427,12 +431,25 @@ def _boot(facts: flow.Facts, c: flow.Choices) -> str:
     return json.dumps(data).replace("<", "\\u003c")
 
 
-def render_page(facts: flow.Facts, c: flow.Choices) -> str:
-    """The whole page as one string. The page builds its steps from the JSON with `textContent`, never with markup."""
+def csp(nonce: str | None = None) -> str:
+    """The Content-Security-Policy for a response. The page gets a per-response nonce for its one script and one
+    stylesheet (no `unsafe-inline`); everything else (JSON, text) is allowed nothing."""
+    if nonce is None:
+        return "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+    return (
+        f"default-src 'none'; style-src 'nonce-{nonce}'; script-src 'nonce-{nonce}'; connect-src 'self'; "
+        "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+    )
+
+
+def render_page(facts: flow.Facts, c: flow.Choices, nonce: str = "") -> str:
+    """The whole page as one string. The page builds its steps from the JSON with `textContent`, never with markup.
+    `nonce` goes on the script and the stylesheet; it must be the one in this response's `csp`."""
+    attr = f' nonce="{nonce}"' if nonce else ""
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="referrer" content="no-referrer"><title>ws setup</title><style>{CSS}</style></head>
+<meta name="referrer" content="no-referrer"><title>ws setup</title><style{attr}>{CSS}</style></head>
 <body>
 <header class="wrap top">{_mark()}
 <ol class="steps" id="steps" aria-label="Setup steps"></ol>
@@ -443,7 +460,7 @@ def render_page(facts: flow.Facts, c: flow.Choices) -> str:
 <button type="button" class="go" id="next">Begin</button></span></div></div>
 <template id="mark">{_mark()}</template>
 <script type="application/json" id="boot">{_boot(facts, c)}</script>
-<script>{JS}</script>
+<script{attr}>{JS}</script>
 </body></html>"""
 
 
@@ -477,7 +494,7 @@ class SetupServer:
                 origin = (self.headers.get("Origin") or "").lower()
                 return origin in (f"http://127.0.0.1:{owner.port}", f"http://localhost:{owner.port}")
 
-            def _send(self, code: int, body: bytes, kind: str) -> None:
+            def _send(self, code: int, body: bytes, kind: str, nonce: str | None = None) -> None:
                 self.send_response(code)
                 self.send_header("Content-Type", f"{kind}; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
@@ -485,11 +502,7 @@ class SetupServer:
                 self.send_header("Referrer-Policy", "no-referrer")
                 self.send_header("X-Content-Type-Options", "nosniff")
                 self.send_header("X-Frame-Options", "DENY")
-                self.send_header(
-                    "Content-Security-Policy",
-                    "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; "
-                    "frame-ancestors 'none'",
-                )
+                self.send_header("Content-Security-Policy", csp(nonce))
                 self.end_headers()
                 self.wfile.write(body)
 
@@ -534,9 +547,10 @@ class SetupServer:
                 owner._last = time.monotonic()  # only a request that proves it has the token keeps the page alive
                 if urlsplit(self.path).path != "/":
                     return self._send(404, b"not found", "text/plain")
-                page = render_page(owner.facts, owner.choices).encode()
+                nonce = secrets.token_urlsafe(16)  # new for every response
+                page = render_page(owner.facts, owner.choices, nonce).encode()
                 owner.forget_launcher()  # the token has been used once: the file that carried it goes
-                self._send(200, page, "text/html")
+                self._send(200, page, "text/html", nonce)
 
             def _post(self):
                 header = self.headers.get("X-Ws-Token") or ""
@@ -636,7 +650,7 @@ class SetupServer:
                 "groups": [{"name": n, "detail": prog.detail(n)} for n in prog.names],
                 "notes": outcome.notes
                 + [f"you changed it, so ws left it: {flow.tilde(p, facts.env)}" for p in res.edited],
-                "next": flow.next_commands(facts, c),
+                "next": [list(x) for x in flow.next_steps(facts, c)],
                 "saved": flow.saved_in(facts.env),
             }
             self.result = doc

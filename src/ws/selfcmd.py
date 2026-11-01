@@ -11,9 +11,41 @@ already an absolute path to the `ws` script (the installer's way) needs none of 
 
 from __future__ import annotations
 
+import itertools
+import os
 import sys
+import tempfile
+from pathlib import Path
 
 
 def argv() -> list[str]:
     """The argv prefix that runs ws: this Python, isolated, `-m ws`. Add the subcommand after it."""
     return [sys.executable, "-I", "-m", "ws"]
+
+
+_TEMP_ROOTS = ("/tmp", "/var/tmp", "/private/tmp", "/private/var/folders", "/dev/shm")
+
+
+def tree() -> Path | None:
+    """The environment folder this Python lives in (a pipx, uv tool or venv folder), or None for a system Python. The
+    gate hook runs code from here, so a gated session must not edit it."""
+    if sys.prefix == sys.base_prefix:
+        return None
+    return Path(os.path.abspath(sys.prefix))
+
+
+def unstable(cmd: list[str] | None = None) -> str | None:
+    """Why this interpreter is a poor home for a hook that stays in a config file for months, or None when it is fine:
+    a project's `.venv`, a Claude Code worktree, or a temp folder all come and go. The path is read as written, not
+    resolved: a venv's `python` is a link to the system one, and its own folder is what matters."""
+    exe = (cmd or argv())[0]
+    path = os.path.abspath(exe)
+    parts = Path(path).parts
+    if ".venv" in parts:
+        return f"{path} is inside a project's .venv folder"
+    if any(a == ".claude" and b == "worktrees" for a, b in itertools.pairwise(parts)):
+        return f"{path} is inside a Claude Code worktree"
+    temp = {os.path.abspath(t) for t in (*_TEMP_ROOTS, tempfile.gettempdir())}
+    if any(path == t or path.startswith(t + os.sep) for t in temp):
+        return f"{path} is in a temp folder"
+    return None

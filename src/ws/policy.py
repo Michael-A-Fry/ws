@@ -1282,12 +1282,26 @@ def _opt_values(toks: list[str], letters: str = "", longs: tuple[str, ...] = ())
     return out
 
 
-_ADMIN = {"secret", "broker", "approve"}
+_ADMIN = {"secret", "broker", "approve", "uninstall"}
+_ADMIN_SUB = {("skills", "adopt"), ("skills", "restore"), ("config", "fallback")}
+
+
+def _gate_flag(rest: list[str]) -> bool:
+    """`--gate launch` / `--gate=launch` (argparse takes any prefix of the flag, from `--g`) on a `ws install` line."""
+    for i, t in enumerate(rest):
+        name, eq, value = t.partition("=")
+        if len(name) >= 3 and "--gate".startswith(name) and name.startswith("--g"):
+            nxt = value if eq else (rest[i + 1] if i + 1 < len(rest) else "")
+            if nxt != "every-session":
+                return True
+    return False
 
 
 def _ws_admin(canon: list[str]) -> str | None:
-    """`ws gate generate|init`, `ws secret ...`, `ws broker ...`, `ws approve ...` (also `uv run ws ...`, `python -m ws ...`): a gated
-    session must not regenerate its own gate, touch secrets or approve its own call."""
+    """`ws gate generate|init`, `ws secret ...`, `ws broker ...`, `ws approve ...`, `ws uninstall`, `ws install --gate
+    launch`, `ws skills adopt|restore`, `ws config fallback` (also `uv run ws ...`, `python -m ws ...`): a gated session
+    must not regenerate or take off its own gate, touch secrets, approve its own call or swap what the person installed.
+    A plain `ws install` only refreshes, so it stays allowed."""
     for i, t in enumerate(canon):
         if posixpath.basename(t) != "ws" or not (
             i == 0 or canon[i - 1] in ("run", "-m", "--", "exec", "tool") or canon[i - 1].startswith("-")
@@ -1298,6 +1312,10 @@ def _ws_admin(canon: list[str]) -> str | None:
             return "ws gate generate/init is not for a gated session: it would rewrite its own gate"
         if sub[:1] and sub[0] in _ADMIN:
             return f"ws {sub[0]} is not for a gated session"
+        if tuple(sub[:2]) in _ADMIN_SUB:
+            return f"ws {sub[0]} {sub[1]} is not for a gated session"
+        if sub[:1] == ["install"] and _gate_flag(canon[i + 1 :]):
+            return "ws install --gate launch is not for a gated session: it would take off its own gate"
     return None
 
 

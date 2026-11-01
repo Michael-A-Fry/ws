@@ -21,8 +21,8 @@ ws doctor --json       # the same report for scripts
 `ws doctor` exits 0 only when no check is `fail` or `unconfigured`. Otherwise it exits 1. A new machine exits 1 until you
 set up each role.
 
-The IDs are in two ranges. `WS0xx` checks the machine, the profile and the jobs. `WS1xx` checks the roles, one per role.
-You configure a role as a `[roles.NAME]` table in `profile.toml`.
+The IDs are in two ranges. `WS0xx` checks the machine, the profile, the jobs and the gate. `WS1xx` checks the roles,
+one per role. You configure a role as a `[roles.NAME]` table in `profile.toml`.
 
 ## Machine checks (WS0xx)
 
@@ -35,6 +35,7 @@ You configure a role as a `[roles.NAME]` table in `profile.toml`.
 | WS005 | globals | No repo copy shadows a global skill, agent, workflow or hook (`.ws/overrides.toml` lists deliberate ones). `ok` when you aren't in a repo. `fail` on a shadow. | Run `ws globals check`. Remove the copy, or list it in `.ws/overrides.toml` with a reason. |
 | WS006 | jobs | Every file in `$WS_HOME/jobs/` loads. `fail` names the files ws would refuse and the first error. | Fix or remove that job file. The other jobs still run. |
 | WS007 | ptrace | On Linux and WSL2, `kernel.yama.ptrace_scope` is 1 or more, so a walled child can't read its parent's memory. `warn` at 0 or when Yama is absent. `ok` elsewhere. | `echo 'kernel.yama.ptrace_scope = 1' \| sudo tee /etc/sysctl.d/10-ptrace.conf && sudo sysctl --system` |
+| WS008 | gate | Where the gate lives. With `gate = "every-session"` in `[roles.runner]`, ws's entries are in the runner's config file (`~/.claude/settings.json`, or `opencode.json` plus the plugin) and match the current policy, and the hook command still starts. `warn` when the policy changed since the last `ws install`, when the profile says `launch` but ws's entries are still in the file, and once for each guard that's on in the policy and the runner doesn't run, and once more (same ID, one line each) for each of your `permissions.allow` rules that a ws deny rule overrides. `fail` when ws's entries are gone, the file is gone or won't read, or the hook command no longer starts. With `gate = "launch"` it's `ok`: a session is gated when started with `ws gate launch`. | Run `ws install` to put the entries back or refresh them. `ws install --gate launch` takes ws out of the file. |
 
 ## Role checks (WS1xx)
 

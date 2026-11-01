@@ -142,13 +142,19 @@ Step 1, gate and skills (harvest gaps):
   writes), bulk-staging, syntax-check and session-context guards (#41)
 - [x] A replay tool: recorded tool-call payloads through the gate hook (`ws gate replay`, #41)
 - [x] Skills `resume` and `ship`; `ws skills adopt|restore` swaps a person's same-named skill (#39)
-- [ ] Apply the gate to every Claude Code session (merge into the user settings, manifest, residue-free undo), next to
-  the person's own hooks
+- [x] Apply the gate to every Claude Code session (merge into the user settings, manifest, residue-free undo), next to
+  the person's own hooks (#46, #47)
 - [x] External subcommands (`ws <x>` runs `ws-<x>` on PATH) and an optional fallback for unknown words;
   install.sh moves a different `ws` aside (#40)
 - [x] `ws notify alert`: session alerts to the phone on their own daily cap (#42)
 
 Moved to phase 7 (DECISIONS 195: phase 6 builds and cuts over gate and skills only; the old timers stay on):
+
+Step 1, platform (DECISIONS 200, 212):
+
+- [ ] Evaluation view, part of the one ws surface: per arm or setup, quality (pass rate, pass^k), time per solved task,
+  tokens and cost per solved task, the trend over runs and the noise floor; through taste-gate in the ws look, no
+  separate page before then
 
 Step 2, timers:
 

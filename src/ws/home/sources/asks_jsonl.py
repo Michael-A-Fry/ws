@@ -2,7 +2,8 @@
 
 Each line has `event` (`added`, `answered`, `withdrawn` or `done`), `id` and `ts`. An `added` line carries `repo`,
 `session` ({name, tmux}), `question`, `options` ([{label, description}], the first the recommended one), `decision`,
-`source` (`permission` for a permission, else a question), `rc_url` and `redacted`. A later `answered`, `withdrawn` or
+`source` (`permission` for a permission, else a question), `rc_url` and `redacted`. The file's own word never places an
+ask: one is open only on a session in the snapshot that is open. A later `answered`, `withdrawn` or
 `done` line closes the ask. The path is `[home.sources] asks_jsonl`.
 """
 
@@ -64,7 +65,6 @@ def read(kind, env):
                 created=_files.iso(line.get("ts")),
                 # only an explicit `redacted: false` is visible: a line that doesn't say is treated as redacted
                 opaque=line.get("redacted") is not False or (is_path and records.under(repo_raw, env.cfg.roots)),
-                placed=is_path and records.open_path(repo_raw, env.cfg.roots),
                 answer_in="app" if link else "terminal",
                 rc_url=link,
             )

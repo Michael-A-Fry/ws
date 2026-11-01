@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import unicodedata
 from dataclasses import fields
 
 import pytest
@@ -182,11 +183,18 @@ def test_asks_come_oldest_first(box):
     box.lines(
         box.usage / "asks" / "asks.jsonl",
         [
-            {"event": "added", "id": "b", "ts": iso(-10), "repo": "app", "question": "later", "redacted": False},
-            {"event": "added", "id": "a", "ts": iso(-500), "repo": "app", "question": "earlier", "redacted": False},
+            {"event": "added", "id": "bbbbbbb2", "ts": iso(-10), "repo": "app", "question": "later", "redacted": False},
+            {
+                "event": "added",
+                "id": "aaaaaaa1",
+                "ts": iso(-500),
+                "repo": "app",
+                "question": "earlier",
+                "redacted": False,
+            },
         ],
     )
-    assert [a.id for a in api.asks(box.env([]))] == ["a", "b"]
+    assert [a.id for a in api.asks(box.env([]))] == ["aaaaaaa1", "bbbbbbb2"]
 
 
 # --- the lead --------------------------------------------------------------------------------------------------------
@@ -297,14 +305,14 @@ def test_the_opaque_rule_is_applied_last_so_a_merge_cannot_unhide(box):
 
 
 def test_seal_keeps_only_the_listed_fields_and_nothing_else():
-    s = Session(id="i", source="s", runner="r", name="n", cwd="/c", repo="rp", tmux="t", state="idle", started_at="x",
+    s = Session(id="abcdef01", source="s", runner="r", name="n", cwd="/c", repo="rp", tmux="t", state="idle", started_at="x",
                 tokens={"input": 1}, cost_usd=1.0, cost_basis="otel", waiting_for="w", host="h", rc_url="u")  # fmt: skip
     sealed = records.seal(s, True)
-    assert sealed == Session(id="i", source="s", repo="rp", tmux="t", state="idle", started_at="x", opaque=True,
+    assert sealed == Session(id="abcdef01", source="s", repo="rp", tmux="t", state="idle", started_at="x", opaque=True,
                              cost_basis="hidden")  # fmt: skip
     assert records.seal(s, False) is s
-    e = Event(id="e", ts="t", source="s", type="ty", session_id="sid", summary="sum")
-    assert records.seal(e, True) == Event(id="e", ts="t", source="s", type="ty", opaque=True)
+    e = Event(id="e0000001", ts="t", source="s", type="ty", session_id="sid", summary="sum")
+    assert records.seal(e, True) == Event(id="e0000001", ts="t", source="s", type="ty", opaque=True)
 
 
 def test_under_follows_folders_not_prefixes(tmp_path):
@@ -457,9 +465,9 @@ def test_events_are_newest_first_and_cut_at_since(box):
                 }
             ],
         )
-    got = api.events(env=box.env([]))
+    got = api.events(env=box.env([agent(SID, "/w/app")]))  # the session is open, so the events are
     assert [e.id for e in got] == ["e-2026-11-02"]  # the default window is the last 24 hours
-    longer = api.events(NOW - 86400 * 2, env=box.env([]))
+    longer = api.events(NOW - 86400 * 2, env=box.env([agent(SID, "/w/app")]))
     assert [e.id for e in longer] == ["e-2026-11-02", "e-2026-11-01"]
     assert longer[0].summary == "t.x in app"
 
@@ -470,15 +478,15 @@ def test_an_event_with_no_session_or_under_an_opaque_path_is_opaque(box):
         box.usage / "events" / "2026-11-02.jsonl",
         [
             {
-                "id": "a",
+                "id": "aaaaaaa1",
                 "time": iso(-5),
                 "source": "s",
                 "type": "ty",
                 "data": {"session_id": SID, "repo": "r", "cwd": "/work/private/x"},
             },
-            {"id": "b", "time": iso(-6), "source": "s", "type": "ty", "data": {"repo": "r"}},
+            {"id": "bbbbbbb2", "time": iso(-6), "source": "s", "type": "ty", "data": {"repo": "r"}},
             {
-                "id": "c",
+                "id": "ccccccc3",
                 "time": iso(-7),
                 "source": "s",
                 "type": "ty",
@@ -486,9 +494,9 @@ def test_an_event_with_no_session_or_under_an_opaque_path_is_opaque(box):
             },
         ],
     )
-    got = {e.id: e for e in api.events(env=box.env([]))}
-    assert got["a"].opaque and got["b"].opaque and not got["c"].opaque
-    assert got["a"].summary == "" and got["a"].session_id == "" and got["c"].summary == "ty in r"
+    got = {e.id: e for e in api.events(env=box.env([agent(SID2, "/work/public")]))}
+    assert got["aaaaaaa1"].opaque and got["bbbbbbb2"].opaque and not got["ccccccc3"].opaque
+    assert got["aaaaaaa1"].summary == "" and got["aaaaaaa1"].session_id == "" and got["ccccccc3"].summary == "ty in r"
 
 
 # --- the opaque rule, fail closed (fix round 1) ----------------------------------------------------------------------
@@ -525,19 +533,42 @@ def test_an_ask_with_a_repo_name_but_no_session_or_folder_is_opaque(box):
     assert a.opaque and a.title == ""
 
 
-def test_an_ask_on_a_known_open_folder_or_open_session_is_shown(box):
+def test_an_ask_on_an_open_session_is_shown_and_a_folder_in_the_file_is_not_enough(box):
     fiu_profile(box)
     box.lines(
         box.usage / "asks" / "asks.jsonl",
         [
-            {"event": "added", "id": "a", "ts": iso(), "redacted": False, "repo": "/work/app", "question": "own folder"},
-            {"event": "added", "id": "b", "ts": iso(), "redacted": False, "session": {"session_id": SID},
+            {"event": "added", "id": "aaaaaaa1", "ts": iso(), "redacted": False, "repo": "/work/app", "question": "own folder"},
+            {"event": "added", "id": "bbbbbbb2", "ts": iso(), "redacted": False, "session": {"session_id": SID},
              "question": "own session"},
         ],
     )  # fmt: skip
     got = {a.id: a for a in api.asks(box.env([agent(SID, "/work/app")]))}
-    assert not got["a"].opaque and got["a"].title == "own folder"
-    assert not got["b"].opaque and got["b"].title == "own session"
+    assert got["aaaaaaa1"].opaque and got["aaaaaaa1"].title == ""  # the file's own word about a folder places nothing
+    assert not got["bbbbbbb2"].opaque and got["bbbbbbb2"].title == "own session"
+
+
+def test_an_ask_naming_an_unknown_session_is_opaque_whatever_folder_it_claims(box):
+    fiu_profile(box)
+    box.lines(
+        box.usage / "asks" / "asks.jsonl",
+        [{"event": "added", "id": "q", "ts": iso(), "redacted": False, "repo": "/work/app",
+          "session": {"session_id": SID}, "question": "SECRET Q"}],
+    )  # fmt: skip
+    (a,) = api.asks(box.env([]))  # S is not in the snapshot
+    assert a.opaque and a.title == "" and "SECRET" not in json.dumps(a.to_dict())
+
+
+def test_an_ask_whose_folder_drifted_from_its_session_is_opaque(box):
+    fiu_profile(box)
+    box.ws_session(SID, cwd=str(box.home / "code" / "fiu"))  # ws recorded S under the opaque folder
+    box.lines(
+        box.usage / "asks" / "asks.jsonl",
+        [{"event": "added", "id": "q", "ts": iso(), "redacted": False, "repo": "/work/app",
+          "session": {"session_id": SID}, "question": "SECRET Q"}],
+    )  # fmt: skip
+    (a,) = api.asks(box.env([]))
+    assert a.opaque and a.title == "" and "SECRET" not in json.dumps(a.to_dict())
 
 
 def test_a_pending_approval_with_no_folder_and_an_unknown_session_is_opaque(box):
@@ -557,12 +588,27 @@ def test_an_event_with_an_unknown_session_and_no_folder_is_opaque(box):
     box.lines(
         box.usage / "events" / "2026-11-02.jsonl",
         [
-            {"id": "e1", "time": iso(-5), "source": "s", "type": "ty", "data": {"session_id": SID, "repo": "case-1"}},
-            {"id": "e2", "time": iso(-6), "source": "s", "type": "ty", "data": {"session_id": SID, "cwd": "/work/app"}},
+            {
+                "id": "e0000001",
+                "time": iso(-5),
+                "source": "s",
+                "type": "ty",
+                "data": {"session_id": SID, "repo": "case-1"},
+            },
+            {
+                "id": "e0000002",
+                "time": iso(-6),
+                "source": "s",
+                "type": "ty",
+                "data": {"session_id": SID, "cwd": "/work/app"},
+            },
         ],
     )
     got = {e.id: e for e in api.events(env=box.env([]))}
-    assert got["e1"].opaque and got["e1"].summary == "" and not got["e2"].opaque
+    assert got["e0000001"].opaque and got["e0000001"].summary == ""
+    assert got["e0000002"].opaque  # the file's own cwd places nothing; the session isn't in the snapshot
+    (shown,) = [e for e in api.events(env=box.env([agent(SID, "/work/app")])) if e.id == "e0000002"]
+    assert not shown.opaque  # the same event on a session that is open
 
 
 def test_a_session_with_no_folder_is_opaque_even_with_a_repo_name(box):
@@ -682,25 +728,57 @@ def test_a_folder_ws_cant_look_at_counts_as_under(tmp_path, monkeypatch):
     assert records.under("/bad\0path", roots) is True
 
 
-def test_an_opaque_record_leaves_with_a_safe_short_id(box):
+def test_an_opaque_record_leaves_with_a_machine_id_or_a_hash(box):
     fiu_profile(box)
     odd = "SECRET case: name/with spaces " + "x" * 200
+    ask_id = "a20261102T120000-k3x9"
     box.lines(
         box.usage / "asks" / "asks.jsonl",
         [
             {"event": "added", "id": odd, "ts": iso(), "redacted": True, "question": "SECRET Q"},
-            {"event": "added", "id": "plain-id_1:2.3", "ts": iso(), "redacted": True, "question": "SECRET Q"},
+            {"event": "added", "id": ask_id, "ts": iso(), "redacted": True, "question": "SECRET Q"},
+            {"event": "added", "id": "FIU-CASE-1234", "ts": iso(), "redacted": True, "question": "SECRET Q"},
         ],
     )
     got = {a.id for a in api.asks(box.env([]))}
-    assert "plain-id_1:2.3" in got and odd not in got
-    (hashed,) = got - {"plain-id_1:2.3"}
-    assert records.SAFE_ID.fullmatch(hashed) and hashed == records.safe_id(odd) and len(hashed) <= 16
-    assert records.safe_id("x" * 81) != "x" * 81 and records.safe_id("x" * 80) == "x" * 80
-    assert records.SAFE_ID.fullmatch(records.safe_id(""))
-    assert records.seal(Event(id=odd, ts="t", source="s", type="ty"), True).id == hashed
-    assert records.seal(Session(id=odd, source="s"), True).id == hashed
-    assert records.seal(Session(id=odd, source="s"), False).id == odd  # an open record keeps its id
+    assert ask_id in got and odd not in got and "FIU-CASE-1234" not in got
+    assert got - {ask_id} == {records.safe_id(odd), records.safe_id("FIU-CASE-1234")}
+    assert all(len(h) == 16 for h in got - {ask_id})
+    assert "FIU" not in json.dumps(sorted(got))
+
+
+@pytest.mark.parametrize(
+    "ident",
+    [SID, f"waiting:{SID}", "a20261102T120000-k3x9", "deadbeef", "0123456789abcdef" * 4],
+)
+def test_a_machine_shaped_id_is_kept_on_an_opaque_record(ident):
+    assert records.safe_id(ident) == ident
+    assert records.seal(Session(id=ident, source="s"), True).id == ident
+
+
+@pytest.mark.parametrize("ident", ["FIU-CASE-1234", "plain-id_1:2.3", "abc", "", "g" * 12, "0123456789abcdef" * 5])
+def test_any_other_id_is_hashed_to_sixteen_characters(ident):
+    hashed = records.safe_id(ident)
+    assert hashed != ident and len(hashed) == 16 and records.MACHINE_ID.fullmatch(hashed)
+    assert records.safe_id(hashed) == hashed  # hashing twice changes nothing
+    assert records.seal(Event(id=ident, ts="t", source="s", type="ty"), True).id == hashed
+    assert records.seal(Session(id=ident, source="s"), True).id == hashed
+    assert records.seal(Session(id=ident, source="s"), False).id == ident  # an open record keeps its id
+
+
+@pytest.mark.parametrize("form", ["NFC", "NFD"])
+def test_a_label_and_a_path_match_whichever_unicode_form_they_are_written_in(form):
+    def fm(text):
+        return unicodedata.normalize(form, text)
+
+    cafe = unicodedata.normalize("NFC", "café")
+    roots = records.roots_of(["/work/" + cafe])
+    assert records.label_matches(fm("café"), roots)
+    assert records.under("/work/" + fm("café") + "/case", roots)
+    other = records.roots_of(["/work/" + fm("café")])
+    assert records.label_matches(cafe, other)
+    assert records.under("/work/" + cafe + "/case", other)
+    assert not records.under("/work/cafe/case", roots)
 
 
 def test_the_internal_placed_flag_is_not_in_the_output():

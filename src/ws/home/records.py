@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import unicodedata
 from dataclasses import dataclass, field, fields
 from typing import Any
 
@@ -90,7 +91,9 @@ class Ask(_Record):
     answer_in: str = "terminal"  # one of ANSWER_IN
     opens: tuple = ()
     rc_url: str = ""
-    placed: bool = _internal()  # the source saw a folder for this ask and it isn't under an opaque path (not output)
+    placed: bool = (
+        _internal()
+    )  # the source itself saw an open folder for this ask (not output); a file's word isn't that
 
 
 @dataclass(frozen=True)
@@ -171,7 +174,15 @@ KEEP: dict[type, tuple[str, ...]] = {
 }
 
 
-SAFE_ID = re.compile(r"[A-Za-z0-9._:-]{1,80}")
+_HEX = r"[0-9A-Fa-f]"
+_UUID = rf"{_HEX}{{8}}-{_HEX}{{4}}-{_HEX}{{4}}-{_HEX}{{4}}-{_HEX}{{12}}"
+# the id shapes ws's own sources make: a UUID, `waiting:<UUID>`, an ask id (`a20261102T120000-k3x9`), a hex string
+MACHINE_ID = re.compile(rf"{_UUID}|waiting:{_UUID}|a\d{{8}}T\d{{6}}-[a-z0-9]{{4}}|{_HEX}{{8,64}}")
+
+
+def _nfc(text: str) -> str:
+    """Text in one Unicode form, so `café` typed two ways is one name."""
+    return unicodedata.normalize("NFC", text)
 
 
 def _norm(path: str) -> str:
@@ -190,7 +201,7 @@ def roots_of(paths: list[str] | tuple[str, ...]) -> tuple[str, ...]:
 
 def _inside(form: str, root: str) -> bool:
     """`form` is `root` or in it, compared the way this file system compares names (os.path.normcase)."""
-    f, r = os.path.normcase(form), os.path.normcase(root)
+    f, r = _nfc(os.path.normcase(form)), _nfc(os.path.normcase(root))
     return f == r or f.startswith(r.rstrip(os.sep) + os.sep)
 
 
@@ -247,7 +258,7 @@ def label_matches(label: str, roots: tuple[str, ...]) -> bool:
         return False
 
     def plain(name: str) -> str:
-        return " ".join(name.split()).casefold()
+        return _nfc(" ".join(_nfc(name).split())).casefold()
 
     want = plain(label)
     return any(plain(os.path.basename(r.rstrip(os.sep))) == want for r in roots)
@@ -273,8 +284,9 @@ def is_opaque(rec: Session | Ask | Event, roots: tuple[str, ...], session: bool 
 
 
 def safe_id(ident: str) -> str:
-    """An id as it may leave on an opaque record: itself when it's short and plain, else a short sha256 prefix."""
-    if SAFE_ID.fullmatch(ident):
+    """An id as it may leave on an opaque record: itself when it has a machine shape (MACHINE_ID), else a 16-character
+    sha256 prefix. A free-text id (a case number, a title) never leaves as written."""
+    if MACHINE_ID.fullmatch(ident):
         return ident
     return hashlib.sha256(ident.encode("utf-8", "surrogatepass")).hexdigest()[:16]
 

@@ -94,13 +94,15 @@ known clears it, and every doubt hides it. A record is **opaque** when any of th
 - the session it belongs to is opaque, or isn't in the snapshot (a session is opaque if any source that knows it says
   so, judged piece by piece before the merge, so one source's opaque folder can't be lost behind another's open one);
 - ws can't tell where it belongs. Only a known place that isn't opaque clears a record: a session needs a folder, and an
-  ask or event needs a folder of its own or a session in the snapshot that's open. An empty, relative or unreadable
-  path, or a bare session id for a session ws doesn't know, isn't a place.
+  ask or event needs a session in the snapshot that's open, or a folder that the source saw itself (the gate's record of
+  an approval, or a live session's folder). A folder named in the asks or events file doesn't count, nor does an empty,
+  relative or unreadable path, nor a session id ws doesn't know.
 
 Folders are compared as written: runs of spaces in a name aren't collapsed, and a path is cut off, never tidied, at 4096
 characters (a longer one counts as opaque). A name is compared the way the file system compares names, and on a
 case-insensitive file system a folder that's the same one on disk under another spelling (`~/Code/fiu` for
-`~/code/fiu`) is covered too.
+`~/code/fiu`) is covered too. Names are compared in one Unicode form, so `café` typed two ways is one name. The check
+walks up each path and looks at every folder on the way, so a stale network mount can make it wait.
 
 The rule runs last, after merging, and an opaque record keeps only these fields:
 
@@ -111,7 +113,8 @@ The rule runs last, after merging, and an opaque record keeps only these fields:
 | Event | `id`, `source`, `type`, `ts`, and `opaque` set |
 
 Every other field is back at its empty default: no name, folder, title, tokens or cost. An opaque record's `id` is kept
-only when it's up to 80 characters of letters, digits and `. _ : -`; any other id is replaced by a short sha256 prefix.
+only when it has a machine shape (a UUID, `waiting:` and a UUID, an ask id like `a20261102T120000-k3x9`, or 8 to 64 hex
+digits); any other id, such as a case number, is replaced by a 16-character sha256 prefix.
 An opaque session is never the lead.
 
 ## Sessions from several sources

@@ -851,6 +851,13 @@ def test_an_installed_interpreter_is_fine(exe):
     assert selfcmd.unstable([exe, "-I", "-m", "ws"]) is None
 
 
+def test_a_tool_install_under_a_home_that_sits_in_a_temp_folder_is_fine(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    exe = str(tmp_path / ".local" / "share" / "uv" / "tools" / "ws-aitoolkit" / "bin" / "python")
+    assert selfcmd.unstable([exe, "-I", "-m", "ws"]) is None
+    assert ".venv" in (selfcmd.unstable([str(tmp_path / "code" / "p" / ".venv" / "bin" / "python")]) or "")
+
+
 def test_every_session_refuses_a_project_venv_interpreter_and_writes_nothing(box, capsys, monkeypatch):
     monkeypatch.setattr(userconfig, "require_stable_interpreter", REAL_STABLE_CHECK)
     monkeypatch.setattr(selfcmd, "argv", lambda: [str(box / "proj" / ".venv" / "bin" / "python"), "-I", "-m", "ws"])

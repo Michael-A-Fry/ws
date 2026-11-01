@@ -36,7 +36,7 @@ def tree() -> Path | None:
 
 def unstable(cmd: list[str] | None = None) -> str | None:
     """Why this interpreter is a poor home for a hook that stays in a config file for months, or None when it is fine:
-    a project's `.venv`, a Claude Code worktree, or a temp folder all come and go. The path is read as written, not
+    a project's `.venv`, a Claude Code worktree, or a temp folder outside HOME all come and go. The path is read as written, not
     resolved: a venv's `python` is a link to the system one, and its own folder is what matters."""
     exe = (cmd or argv())[0]
     path = os.path.abspath(exe)
@@ -45,6 +45,9 @@ def unstable(cmd: list[str] | None = None) -> str | None:
         return f"{path} is inside a project's .venv folder"
     if any(a == ".claude" and b == "worktrees" for a, b in itertools.pairwise(parts)):
         return f"{path} is inside a Claude Code worktree"
+    home = os.path.abspath(os.path.expanduser("~"))
+    if path.startswith(home + os.sep):
+        return None  # under the person's own HOME (a uv or pipx tool install), wherever that HOME lives
     temp = {os.path.abspath(t) for t in (*_TEMP_ROOTS, tempfile.gettempdir())}
     if any(path == t or path.startswith(t + os.sep) for t in temp):
         return f"{path} is in a temp folder"

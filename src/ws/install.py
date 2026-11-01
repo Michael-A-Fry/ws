@@ -101,6 +101,9 @@ class Result:
     unchanged: list[Path] = field(default_factory=list)
     edited: list[Path] = field(default_factory=list)  # generated files the person changed: left alone
     notes: list[str] = field(default_factory=list)
+    tidied: list[Path] = field(
+        default_factory=list
+    )  # empty folders ws removed after taking its items out of a user config
 
     @property
     def changes(self) -> int:
@@ -515,16 +518,24 @@ def _save_manifest(
 def _commit(env: Mapping[str, str], base: Mapping[str, dict], entries: dict[str, dict], roots: Iterable[str]) -> None:
     """Read the manifest again and save it with only this run's changes in it: an entry `entries` has that differs from
     `base` (what the run started from) is written, one it dropped is removed, and everything else stays as the file
-    has it now. A record this run didn't write is never lost, nor one a concurrent run added meanwhile."""
-    fresh = _read_doc(env)
-    merged = dict(fresh.entries)
-    for key in base.keys() | entries.keys():
-        if entries.get(key) != base.get(key):
-            if key in entries:
-                merged[key] = entries[key]
-            else:
-                merged.pop(key, None)
-    _save_manifest(env, merged, [*fresh.roots, *roots], fresh)
+    has it now. A record this run didn't write is never lost, nor one a concurrent run added meanwhile. The read and the
+    write happen under a lock of their own beside the manifest (taken after any user-config lock, never before)."""
+    with _manifest_lock(env):
+        fresh = _read_doc(env)
+        merged = dict(fresh.entries)
+        for key in base.keys() | entries.keys():
+            if entries.get(key) != base.get(key):
+                if key in entries:
+                    merged[key] = entries[key]
+                else:
+                    merged.pop(key, None)
+        _save_manifest(env, merged, [*fresh.roots, *roots], fresh)
+
+
+def _manifest_lock(env: Mapping[str, str]):
+    """The lock beside the manifest: the same kind as the one beside a user config, so two runs that never touch a user
+    config still take turns."""
+    return userconfig.locked(manifest_path(env))
 
 
 def forget(paths: Iterable[Path], env: Mapping[str, str] | None = None) -> None:
@@ -628,6 +639,11 @@ def apply(
         with contextlib.ExitStack() as locks:
             held: set[Path] = set()
             try:
+                if (
+                    not dry_run
+                ):  # every user-config lock this run needs, in path order, so two runs can't wait on each other
+                    for path in _paths_to_lock(steps, entries, virtual):
+                        _hold(path, locks, held, entries, base, env)
                 for step in steps:
                     action = classify(step, entries, virtual)
                     getattr(result, action).append(step.path)
@@ -676,8 +692,49 @@ def apply(
     finally:
         for path, entry in tidy:
             with contextlib.suppress(OSError):
-                userconfig.tidy(path, entry, env)
+                result.tidied += userconfig.tidy(path, entry, env)
+        result.notes += [f"removed the empty folder {p}" for p in result.tidied]
     return result
+
+
+def _paths_to_lock(steps: list[Step], entries: Mapping[str, dict], virtual: set[Path]) -> list[Path]:
+    """The user configs these steps would change, sorted. A step that can't be classified is left for the main loop, which
+    raises its refusal where it always did."""
+    out: set[Path] = set()
+    for step in steps:
+        if step.kind != "merge":
+            continue
+        try:
+            if classify(step, entries, virtual) not in ("unchanged", "edited"):
+                out.add(step.path)
+        except (WsError, InstallError):
+            continue
+    return sorted(out)
+
+
+def _hold(
+    path: Path,
+    locks: contextlib.ExitStack,
+    held: set[Path],
+    entries: dict[str, dict],
+    base: dict[str, dict],
+    env: Mapping[str, str],
+) -> None:
+    """Take the lock beside this user config, which stays until the manifest is saved, and read its record again under it."""
+    if path in held or not path.parent.is_dir():  # no folder yet: the merge step takes the lock once it exists
+        return
+    try:
+        locks.enter_context(userconfig.locked(path))
+    except WsError as e:
+        raise MergeRefused(e.kind, e.message, e.hint) from e
+    held.add(path)
+    key = str(path)
+    disk = _read_doc(env).entries.get(key)
+    for table in (entries, base):
+        if disk is None:
+            table.pop(key, None)
+        else:
+            table[key] = copy.deepcopy(disk)
 
 
 def _refresh_sha(step: Step, entries: dict[str, dict]) -> None:
@@ -706,15 +763,7 @@ def _record_merge(
 ) -> None:
     key = str(step.path)
     try:
-        if step.path not in held:  # the lock stays until the manifest is saved; the record is read again under it
-            locks.enter_context(userconfig.locked(step.path))
-            held.add(step.path)
-            disk = _read_doc(env).entries.get(key)
-            for table in (entries, base):
-                if disk is None:
-                    table.pop(key, None)
-                else:
-                    table[key] = copy.deepcopy(disk)
+        _hold(step.path, locks, held, entries, base, env)
         old = entries.get(key)
         kept, outcome = userconfig.apply(step.merge, old, env, held=True)
     except WsError as e:
@@ -906,13 +955,15 @@ def uninstall(
     if manifest.is_file() and pending:
         if not dry_run:  # a user config that can't be read now keeps its record, so a later uninstall can finish
             try:
-                _save_manifest(env, pending, [], _read_doc(env))
+                with _manifest_lock(env):
+                    _save_manifest(env, pending, [], _read_doc(env))
             except OSError as e:
                 removal.problems.append(f"could not update {manifest}: {e.strerror}")
     elif manifest.is_file():
         if not dry_run:
             try:
-                manifest.unlink()
+                with _manifest_lock(env):
+                    manifest.unlink()
             except OSError as e:
                 removal.problems.append(f"could not remove {manifest}: {e.strerror}")
         gone.add(manifest)

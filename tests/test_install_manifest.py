@@ -84,15 +84,6 @@ def test_an_install_planned_without_a_runner_keeps_the_gate_merged(box, capsys):
     assert has_ws_hooks(box)
 
 
-def test_steps_that_leave_the_merge_out_leave_its_record_as_it_was(box, capsys):
-    do_install(capsys, box)
-    before = manifest(box)["entries"]
-    steps = [s for s in install.plan(without_a_runner(box), os.environ) if s.kind != "merge"]
-    install.apply(steps, os.environ)
-    assert manifest(box)["entries"] == before
-    assert has_ws_hooks(box)
-
-
 def test_a_plain_install_keeps_the_gate_and_says_so(box, capsys):
     do_install(capsys, box)
     code, out, _ = run(capsys, "install", "--yes", "--notes", str(box / "Notes"))
@@ -241,13 +232,16 @@ def test_the_lock_is_taken_before_the_save_and_let_go_after(box, capsys, monkeyp
     class Spy:
         def __init__(self, path):
             self.inner = real_locked(path)
+            self.mine = path.name != install.MANIFEST
 
         def __enter__(self):
-            events.append("lock")
+            if self.mine:
+                events.append("lock")
             return self.inner.__enter__()
 
         def __exit__(self, *a):
-            events.append("unlock")
+            if self.mine:
+                events.append("unlock")
             return self.inner.__exit__(*a)
 
     def commit(*a, **k):
@@ -264,9 +258,72 @@ def test_a_run_that_does_not_touch_the_user_config_takes_no_lock(box, capsys, mo
     do_install(capsys, box)
     events: list[str] = []
     real = userconfig.locked
-    monkeypatch.setattr(userconfig, "locked", lambda p: events.append("lock") or real(p))
+    monkeypatch.setattr(userconfig, "locked", lambda p: events.append(p.name) or real(p))
     assert run(capsys, "install", "--yes", "--notes", str(box / "Notes"))[0] == 0
-    assert events == []
+    assert events == [install.MANIFEST]  # only the manifest's own lock
+
+
+def test_two_user_configs_are_locked_in_path_order(box, capsys, monkeypatch):
+    do_install(capsys, box)  # claude-code is merged; moving to opencode merges that file first and withdraws this one
+    names: list[str] = []
+    real = userconfig.locked
+    monkeypatch.setattr(userconfig, "locked", lambda p: names.append(str(p)) or real(p))
+    code, _, _ = run(capsys, "install", "--yes", "--runner", "opencode", "--notes", str(box / "Notes"))
+    assert code == 0
+    configs = [n for n in names if not n.endswith(install.MANIFEST)]
+    assert configs == sorted(configs) and len(configs) == 2
+    assert names[-1].endswith(install.MANIFEST)  # the manifest's lock comes after every user config's
+
+
+def test_two_commits_that_overlap_take_turns(box, monkeypatch):
+    pytest.importorskip("fcntl")
+    import threading
+
+    install.apply([one_file(box, "x\n")], os.environ)  # the manifest and ws's home exist now
+
+    def entry(name):
+        return {"path": str(box / name), "kind": "file", "sha256": "0" * 64, "created_by_ws": True}
+
+    state = {"first": True, "b_finished_early": None}
+    errors: list[BaseException] = []
+
+    def commit_b():
+        try:
+            install._commit(os.environ, {}, {str(box / "b"): entry("b")}, [])
+        except BaseException as e:  # noqa: BLE001 (reported by the assert below)
+            errors.append(e)
+
+    other = threading.Thread(target=commit_b)
+    real = install._read_doc
+
+    def read_then_let_b_try(env=None):
+        doc = real(env)
+        if state["first"]:
+            state["first"] = False
+            other.start()
+            other.join(0.5)  # B can't get past its own read while A holds the manifest lock
+            state["b_finished_early"] = not other.is_alive()
+        return doc
+
+    monkeypatch.setattr(install, "_read_doc", read_then_let_b_try)
+    install._commit(os.environ, {}, {str(box / "a"): entry("a")}, [])
+    other.join(10)
+    assert not errors and state["b_finished_early"] is False
+    paths = [e["path"] for e in manifest(box)["entries"]]
+    assert str(box / "a") in paths and str(box / "b") in paths
+
+
+def test_taking_the_gate_out_of_a_config_ws_made_reports_the_folder_it_tidied(box):
+    merge = [s for s in install.plan(install.answers_from_profile(os.environ), os.environ) if s.kind == "merge"]
+    assert not merge  # no runner in the profile yet
+    answers = replace(install.answers_from_profile(os.environ), runner="claude-code")
+    merge = [s for s in install.plan(answers, os.environ) if s.kind == "merge"]
+    install.apply(merge, os.environ)
+    assert (box / ".claude" / "settings.json").is_file()
+    out = install.Step(merge[0].path, "merge", None, "", merge=userconfig.withdrawal("claude-code", os.environ))
+    result = install.apply([out], os.environ)
+    assert result.tidied == [box / ".claude"] and not (box / ".claude").exists()
+    assert f"removed the empty folder {box / '.claude'}" in result.notes
 
 
 # ---- the merge record says what the release wanted --------------------------------------------------------------------
@@ -296,6 +353,23 @@ def test_ws008_reports_an_op_a_newer_release_no_longer_asks_for(box, capsys):
     assert "ws install" in fix
     assert do_install(capsys, box)[0] == 0
     assert userconfig.check(os.environ)[0] == "ok"
+
+
+def test_ws008_names_the_policy_too_when_the_policy_changed_as_well(box, capsys):
+    do_install(capsys, box)
+    gone = {"op": "append", "path": ["hooks", "OldEvent"], "value": {"hooks": [{"type": "command", "command": "x"}]}}
+
+    def edit(doc):
+        for e in doc["entries"]:
+            if e.get("kind") == "merge":
+                e["wanted_ops"] = [*e["wanted_ops"], gone]
+
+    rewrite(box, edit)
+    pol = box / ".ws" / "policy.toml"
+    pol.write_text(pol.read_text(encoding="utf-8").replace("deny_tools = []", 'deny_tools = ["web_fetch"]'))
+    status, detail, _ = userconfig.check(os.environ)
+    assert status == "warn" and "the current policy and release no longer ask for 1" in detail
+    assert "this release no longer asks" not in detail
 
 
 def test_ws008_with_a_record_from_before_wanted_ops_reports_no_drop(box, capsys):

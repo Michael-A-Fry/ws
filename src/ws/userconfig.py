@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import dataclasses
 import fnmatch
 import hashlib
 import json
@@ -68,6 +69,7 @@ class Merge:
     ops: tuple = ()
     backup: Path | None = None  # where the file's own bytes go on the first write; None when there is no file yet
     cmd: tuple = ()  # the argv that runs ws in the hooks (recorded, so doctor can see it still starts)
+    inputs: str = ""  # a hash of the policy these ops were built from (see `policy_digest`)
 
 
 @dataclass(frozen=True)
@@ -328,6 +330,11 @@ def wanted(ops) -> str:
     return _sha(json.dumps(list(ops), sort_keys=True).encode("utf-8"))
 
 
+def policy_digest(pol: policy.Policy) -> str:
+    """A hash of everything in the policy, so doctor can tell a change of policy from a change of release."""
+    return _sha(json.dumps(dataclasses.asdict(pol), sort_keys=True, default=str).encode("utf-8"))
+
+
 def dropped_ops(entry: Mapping, ops) -> list:
     """The ops the record says the release asked for (`wanted_ops`) that `ops`, what it asks for now, no longer holds. A
     record from before `wanted_ops` existed has none to compare, so nothing is reported dropped."""
@@ -453,7 +460,7 @@ def plan(runner: str, pol: policy.Policy, policy_file: Path, env: Mapping[str, s
         files = adapter.generate(pol, cmd, out, policy_file, protect=(str(where), str(plug)))
         ops = _opencode_ops(files)
         copies[plug] = files[adapter.PLUGIN]
-    return GatePlan(files, Merge(runner, where, tuple(ops), backup, tuple(cmd)), copies)
+    return GatePlan(files, Merge(runner, where, tuple(ops), backup, tuple(cmd), policy_digest(pol)), copies)
 
 
 def withdrawal(runner: str, env: Mapping[str, str]) -> Merge:
@@ -680,6 +687,7 @@ def _merge_once(m: Merge, entry: Mapping | None, made_dirs: list, new_dirs: list
         "made_dirs": list(made_dirs),
         "wanted": wanted(m.ops),
         "wanted_ops": list(m.ops),
+        "inputs": m.inputs,
         "cmd": list(m.cmd),
         "sha256": _sha(data),
         "exact": exact,
@@ -878,18 +886,22 @@ def check(env: Mapping[str, str] | None = None) -> tuple[str, str, str]:
     except (policy.PolicyError, OSError) as e:
         return FAIL, f"the policy doesn't load ({e}), so the gate blocks every call", f"fix {policy_file}"
     dropped: list = []
+    same_policy = False
     try:
         want = plan(runner, pol, policy_file.resolve(), env, entry)
         stale = wanted(want.merge.ops) != entry.get("wanted")
         dropped = dropped_ops(entry, want.merge.ops)
+        same_policy = entry.get("inputs") == want.merge.inputs
     except (WsError, KeyError, ValueError, OSError):
         stale = True
     unsupported = [g for g in getattr(adapters.get(runner), "UNSUPPORTED_GUARDS", ()) if g in pol.guards.on]
     notes = [f"the guard `{g}` isn't run by {runner}" for g in unsupported]
     if stale:
         first = f"ws's entries in {where} are from an earlier policy"
-        if dropped:
+        if dropped and same_policy:
             first += f"; this release no longer asks for {len(dropped)} of them ({_names(dropped)})"
+        elif dropped:
+            first += f"; the current policy and release no longer ask for {len(dropped)} of them ({_names(dropped)})"
         return WARN, "; ".join([first, *notes]), "run `ws install`"
     detail = f"every session is gated: ws's entries are in {where}"
     return (WARN, "; ".join([detail, *notes]), "") if notes else (OK, detail, "")

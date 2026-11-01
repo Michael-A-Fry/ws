@@ -8,6 +8,30 @@ body of the GitHub release.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-11-01
+
+The gate and skills ready to run in every session on a person's machine, alongside their own hooks.
+
+### Added
+
+- Guards: named checks beside the policy rules, found by scanning `ws/guards/`. Shipped: `syntax-check`,
+  `session-context`, `bulk-staging`, `record-calls`, `test-weakening`, `claims`, `spawn-cap` and `skill-gate`. The
+  generated Claude Code config gains PostToolUse, Stop and Notification hooks; `ws gate event` answers them.
+- `ws gate replay FILE`: re-runs recorded tool calls through the gate (writes are recorded as path, size and hash).
+- `ws install --gate every-session`: adds the gate's hooks, deny rules and env to the user settings of Claude Code and
+  OpenCode, keeps the person's own entries, records what it added and undoes exactly that; doctor check WS008.
+- `ws <word>` runs `ws-<word>` from PATH when ws has no such command, and `ws config fallback PATH` hands any other
+  word to a program of the person's; `install.sh --move-existing-ws-to PATH` moves a different `ws` aside.
+- Skills `resume` and `ship`; `ws skills adopt|restore` swaps a person's same-named skill for ws's copy and back.
+- `ws notify alert`: a phone alert when a session needs the person or finishes, on its own daily cap.
+- `ws secret import NAME --from-env PATH`: stores a value from a `VAR=value` file.
+
+### Fixed
+
+- `ws broker serve` uses `WS_BROKER_SOCKET` and `[roles.secrets] socket`, as the clients do.
+- `ws eval report` and `compare` list trials that errored before a run started apart from the metrics.
+- The command matcher reads ANSI-C quoting (`$'...'`), here-documents, `${...}` and comments the way bash does.
+
 ## [0.1.1] - 2026-11-01
 
 The first thin tag: phases 0 to 5 of the plan, installed from the signed release. It replaces 0.1.0, which was

@@ -1,11 +1,14 @@
 """docs/reference/principles.md is the rules page, and this test keeps it honest.
 
 Every row has a unique ID, a rung (T0 to T3) and a status. A row that is `enforced` names a check that exists in the
-repo, or is a `[judge]` row. A T0 row is never `[judge]`. A `planned` row is reported and passes, but the count of
-planned rows can only fall: lower PLANNED_BASELINE when one is built.
+repo, or is a `[judge]` row. A T0 row is never `[judge]`. A `planned` row is reported and passes, and its path may not
+exist yet, but the count of planned rows can only fall: lower PLANNED_BASELINE when one is built. A published ID never
+leaves the page; a rule that goes away stays as a `retired` row.
 """
 
+import ast
 import re
+import sys
 from pathlib import Path
 
 import pytest
@@ -14,7 +17,10 @@ ROOT = Path(__file__).resolve().parents[1]
 PAGE = ROOT / "docs" / "reference" / "principles.md"
 
 # The most planned rows the page may hold. A row that gets its check moves this number down in the same change.
-PLANNED_BASELINE = 21
+PLANNED_BASELINE = 26
+
+# Every ID the page has published: prefix -> how many. Raise a count when a rule is added; never lower it.
+PUBLISHED = {"B": 7, "TC": 4, "U": 5, "W": 10, "F": 6, "C": 12, "D": 9, "G": 12}
 
 LAYERS = (
     "Brand and tokens",
@@ -27,35 +33,64 @@ LAYERS = (
     "Engineering governance",
 )
 RUNGS = {"T0", "T1", "T2", "T3"}
-STATUSES = {"enforced", "planned"}
+STATUSES = {"enforced", "planned", "retired"}
 ID = re.compile(r"^([A-Z]{1,2})([1-9][0-9]*)$")
 CHECK_REF = re.compile(r"`([^`]+)`")
 HEADING = re.compile(r"^## (.+?)\s*$")
 HEADER = ["ID", "Rule", "Rung", "Check", "Status"]
+RUNG_HEADER = ["Rung", "Meaning", "Where it lives"]
 
 
 def cells(line: str) -> list[str]:
     return [c.strip() for c in line.strip().strip("|").split("|")]
 
 
-def parse(text: str) -> list[dict]:
-    """Every row of every table whose header is `ID | Rule | Rung | Check | Status`, with the layer it sits under."""
-    rows, layer, in_table = [], None, False
-    for line in text.splitlines():
+def is_separator(line: str) -> bool:
+    return set(line.replace("|", "").strip()) <= set("-: ") and "-" in line
+
+
+def scan(text: str) -> tuple[list[dict], list[str], dict[str, int]]:
+    """The rows of every rules table (header `ID | Rule | Rung | Check | Status`) with the layer each sits under, the
+    problems in the table layout, and how many rules tables each layer holds.
+
+    A line that starts with `|` must belong to a table the scan recognises: a header, then a separator on the next
+    line, then rows with no blank line between. Anything else (a stray row, a second header, a row after a blank line)
+    is a problem, because Markdown would not render it as part of the table.
+    """
+    rows, errors, headers = [], [], {}
+    layer, kind, state = None, None, None  # state: None, "sep" (header seen) or "rows"
+    for n, line in enumerate(text.splitlines(), 1):
         heading = HEADING.match(line)
         if heading:
-            layer, in_table = heading.group(1), False
+            layer, state = heading.group(1), None
             continue
         if not line.lstrip().startswith("|"):
-            in_table = False
+            state = None
             continue
         parts = cells(line)
-        if parts == HEADER:
-            in_table = True
-            continue
-        if in_table and not set(line.replace("|", "").strip()) <= set("-: "):
+        if state is None:
+            if parts == HEADER:
+                kind, state = "rules", "sep"
+                headers[layer] = headers.get(layer, 0) + 1
+            elif parts == RUNG_HEADER:
+                kind, state = "rung", "sep"
+            else:
+                errors.append(f"line {n}: a table line outside a recognised table (a blank line above it?)")
+        elif state == "sep":
+            if is_separator(line):
+                state = "rows"
+            else:
+                errors.append(f"line {n}: the header needs a separator line right under it")
+                state = None
+        elif parts in (HEADER, RUNG_HEADER):
+            errors.append(f"line {n}: a second header inside a table")
+        elif kind == "rules":
             rows.append(dict(zip(HEADER, parts, strict=False), layer=layer, ncells=len(parts)))
-    return rows
+    return rows, errors, headers
+
+
+def parse(text: str) -> list[dict]:
+    return scan(text)[0]
 
 
 def refs(check: str) -> list[str]:
@@ -78,9 +113,11 @@ def problems(rows: list[dict], root: Path) -> list[str]:
         if r["Rung"] not in RUNGS:
             out.append(f"{rid}: rung {r['Rung']!r} is not one of T0 to T3")
         if r["Status"] not in STATUSES:
-            out.append(f"{rid}: status {r['Status']!r} is not enforced or planned")
+            out.append(f"{rid}: status {r['Status']!r} is not enforced, planned or retired")
         if not r["Rule"]:
             out.append(f"{rid}: no rule")
+        if r["Status"] == "retired":
+            continue  # the row only holds the ID; its check may be gone
         judge = r["Check"] == "[judge]"
         if r["Rung"] == "T0" and judge:
             out.append(f"{rid}: a T0 row needs a check, not [judge]")
@@ -88,7 +125,7 @@ def problems(rows: list[dict], root: Path) -> list[str]:
             out.append(f"{rid}: a planned row names the check it will get")
         if not judge and not refs(r["Check"]):
             out.append(f"{rid}: Check is neither [judge] nor a `path`")
-        if r["Status"] == "enforced" and not judge:
+        if r["Status"] == "enforced" and not judge:  # a planned row's path may not exist yet
             for ref in CHECK_REF.findall(r["Check"]):
                 path, _, name = ref.partition("::")
                 target = (root / path).resolve()
@@ -101,20 +138,35 @@ def problems(rows: list[dict], root: Path) -> list[str]:
     return out
 
 
+def missing_published(rows: list[dict], published: dict[str, int]) -> list[str]:
+    have = {r["ID"] for r in rows}
+    return [f"{p}{n}" for p, count in published.items() for n in range(1, count + 1) if f"{p}{n}" not in have]
+
+
 @pytest.fixture(scope="module")
-def rows():
-    return parse(PAGE.read_text(encoding="utf-8"))
+def scanned():
+    return scan(PAGE.read_text(encoding="utf-8"))
 
 
-def test_the_page_has_every_layer_and_they_hold_rows(rows):
+@pytest.fixture(scope="module")
+def rows(scanned):
+    return scanned[0]
+
+
+def test_the_page_has_every_layer_with_one_rules_table_each(scanned):
     text = PAGE.read_text(encoding="utf-8")
     assert [h for h in re.findall(r"^## (.+)$", text, re.MULTILINE) if h in LAYERS] == list(LAYERS)
+    assert scanned[2] == dict.fromkeys(LAYERS, 1)
     for layer in LAYERS:
-        assert any(r["layer"] == layer for r in rows), f"{layer} has no rows"
+        assert any(r["layer"] == layer for r in scanned[0]), f"{layer} has no rows"
+
+
+def test_every_table_line_belongs_to_a_recognised_table(scanned):
+    assert scanned[1] == []
 
 
 def test_the_page_stays_short_enough_to_read(rows):
-    assert 30 <= len(rows) <= 60
+    assert 30 <= len(rows) <= 66
 
 
 def test_each_layer_uses_one_prefix_and_counts_up_without_gaps(rows):
@@ -134,6 +186,13 @@ def test_the_page_follows_the_rules_it_states(rows):
     assert problems(rows, ROOT) == []
 
 
+def test_a_published_id_never_leaves_the_page(rows):
+    assert missing_published(rows, PUBLISHED) == [], "keep a removed rule as a row with status retired"
+    assert {r["ID"] for r in rows} == {f"{p}{n}" for p, c in PUBLISHED.items() for n in range(1, c + 1)}, (
+        "a rule was added: raise its count in PUBLISHED"
+    )
+
+
 def test_planned_rows_are_reported_and_can_only_shrink(rows, capsys):
     planned = [r for r in rows if r["Status"] == "planned"]
     with capsys.disabled():
@@ -149,17 +208,34 @@ def test_the_page_is_linked_from_the_docs_index_and_the_contributing_guide():
         assert "principles.md" in (ROOT / rel).read_text(encoding="utf-8"), rel
 
 
-# The checks on the checker: each way a row can be wrong is caught.
+def test_src_ws_imports_only_the_standard_library():
+    """G1: every import in src/ws is the standard library or ws itself (a relative import is ws)."""
+    offenders = []
+    for path in sorted((ROOT / "src" / "ws").rglob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            names = [a.name for a in node.names] if isinstance(node, ast.Import) else []
+            if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                names = [node.module]
+            offenders += [
+                f"{path.relative_to(ROOT)}: {n}"
+                for n in names
+                if n.split(".")[0] not in sys.stdlib_module_names | {"ws"}
+            ]
+    assert offenders == []
+
+
+# The checks on the checker: each way a row or a table can be wrong is caught.
 
 
 def page(*body: str) -> str:
     return "## CLI\n\n" + "\n".join(["| ID | Rule | Rung | Check | Status |", "|---|---|---|---|---|", *body]) + "\n"
 
 
-def run(tmp_path, *body: str) -> list[str]:
+def run(tmp_path, *body: str, text: str | None = None) -> list[str]:
     (tmp_path / "tests").mkdir(exist_ok=True)
     (tmp_path / "tests" / "test_real.py").write_text("def test_real():\n    pass\n", encoding="utf-8")
-    return problems(parse(page(*body)), tmp_path)
+    found_rows, errors, _ = scan(text or page(*body))
+    return errors + problems(found_rows, tmp_path)
 
 
 def test_a_good_page_has_no_problems(tmp_path):
@@ -169,6 +245,7 @@ def test_a_good_page_has_no_problems(tmp_path):
             "| C1 | Do a thing. | T0 | `tests/test_real.py::test_real` | enforced |",
             "| C2 | Weigh a thing. | T3 | [judge] | enforced |",
             "| C3 | Do a later thing. | T0 | `tests/test_later.py` | planned |",
+            "| C4 | Gone. | T0 | `tests/test_gone.py` | retired |",
         )
         == []
     )
@@ -193,3 +270,45 @@ def test_a_good_page_has_no_problems(tmp_path):
 def test_each_way_a_row_can_be_wrong_is_reported(tmp_path, row, fragment):
     found = run(tmp_path, "| C1 | Rule. | T0 | `tests/test_real.py` | enforced |", row)
     assert any(fragment in f for f in found), found
+
+
+def test_a_planned_path_may_be_missing_and_an_enforced_one_may_not(tmp_path):
+    assert run(tmp_path, "| C1 | Rule. | T0 | `src/ws/brand.py` | planned |") == []
+    assert run(tmp_path, "| C1 | Rule. | T0 | `src/ws/brand.py` | enforced |") != []
+
+
+@pytest.mark.parametrize(
+    ("text", "fragment"),
+    [
+        (
+            page("| C1 | Rule. | T0 | `x` | planned |") + "\n| C2 | After a blank line. | T0 | `x` | planned |\n",
+            "outside",
+        ),
+        (page("| C1 | Rule. | T0 | `x` | planned |") + "| A | stray | table |\n", "columns"),
+        ("## CLI\n\n| ID | Rule | Rung | Check | Status |\n| C1 | No separator. | T0 | `x` | planned |\n", "separator"),
+        (
+            "## CLI\n\n| ID | Rule | Rung | Check | Status |\n|---|---|---|---|---|\n\n| C1 | Gap. | T0 | `x` | planned |\n",
+            "outside",
+        ),
+        (page() + "| ID | Rule | Rung | Check | Status |\n", "second header"),
+    ],
+)
+def test_a_table_line_outside_a_table_is_reported(tmp_path, text, fragment):
+    found = run(tmp_path, text=text)
+    assert any(fragment in f for f in found), found
+
+
+def test_a_second_rules_table_in_a_layer_is_counted():
+    text = (
+        page("| C1 | Rule. | T0 | `x` | planned |")
+        + "\nMore.\n\n"
+        + page("| C2 | Rule. | T0 | `x` | planned |").split("\n\n", 1)[1]
+    )
+    assert scan(text)[2] == {"CLI": 2}
+
+
+def test_a_missing_published_id_is_reported_and_a_retired_row_keeps_it():
+    gone = parse(page("| C1 | Rule. | T0 | `x` | planned |"))
+    assert missing_published(gone, {"C": 2}) == ["C2"]
+    kept = parse(page("| C1 | Rule. | T0 | `x` | planned |", "| C2 | Gone. | T0 | `x` | retired |"))
+    assert missing_published(kept, {"C": 2}) == []

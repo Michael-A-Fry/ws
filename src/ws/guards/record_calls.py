@@ -6,7 +6,9 @@ What a line holds: the hook payload as the runner sent it (tool name, folder, se
 command, a path, a search pattern, an agent prompt, a message) with one change. The text a write tool carries is
 replaced by its size and fingerprint, `{"bytes": N, "sha256": "..."}`: Write `content`, Edit `old_string` and
 `new_string`, each MultiEdit edit's two strings, NotebookEdit `new_source` (OpenCode's `content`, `oldString`,
-`newString` and `edits` likewise). The path stays, so the file a call wrote is on record and the file's text is not.
+`newString`, `edits` and a patch tool's `patchText` likewise); whatever sits under one of those keys is fingerprinted,
+a value that is not text too (as its JSON). The path stays, so the file a call wrote is on record and the file's text is
+not; for an OpenCode patch the files it names are kept as `paths` beside the payload's `args`.
 Replay judges a call by its tool, path and command, so it runs a line as it is. A command is kept as the session typed
 it, so a value typed into a command is in the log. Off unless the policy names it in `[guards] on`.
 """
@@ -14,6 +16,7 @@ it, so a value typed into a command is in the log. Off unless the policy names i
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -26,8 +29,9 @@ EVENTS = ("pre",)
 KINDS = ("command", "read", "search", "write", "tool", "agent", "skill", "message")
 
 LOG = "gate-calls.jsonl"
-_WRITE_TOOLS = {"write", "edit", "multiedit", "notebookedit"}  # lower case: Claude Code's names and OpenCode's
-_TEXT_KEYS = {"content", "old_string", "new_string", "new_source", "oldString", "newString", "newSource"}
+_WRITE_TOOLS = {"write", "edit", "multiedit", "notebookedit", "patch", "apply_patch"}  # lower case, both runners'
+_PATCH_TOOLS = {"patch", "apply_patch"}  # OpenCode: one call writes every file named in its `patchText`
+_TEXT_KEYS = {"content", "old_string", "new_string", "new_source", "oldString", "newString", "newSource", "patchText"}
 
 
 def config(table: dict, where: str) -> None:
@@ -38,15 +42,29 @@ def log_path(home: Path | None = None) -> Path:
     return (home if home is not None else ws_home()) / "logs" / LOG
 
 
-def _fingerprint(text: str) -> dict:
+def _fingerprint(value) -> dict:
+    """Size and sha256 of the text, or of the JSON of a value that is not text."""
+    text = value if isinstance(value, str) else json.dumps(value, sort_keys=True, default=str, ensure_ascii=False)
     data = text.encode("utf-8", "replace")
     return {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
 
 
-def _redact_text(fields: dict) -> dict:
-    out = {k: _fingerprint(v) if k in _TEXT_KEYS and isinstance(v, str) else v for k, v in fields.items()}
-    if isinstance(out.get("edits"), list):  # MultiEdit: a list of {old_string, new_string}
-        out["edits"] = [_redact_text(e) if isinstance(e, dict) else e for e in out["edits"]]
+def _redact_text(fields):
+    """Every value under a text key fingerprinted, whatever its type, and the dicts and lists inside the fields read
+    the same way (MultiEdit's `edits`). An `edits` that is not a list is fingerprinted whole, and so is an item of it
+    that is not a dict."""
+    if isinstance(fields, list):
+        return [_redact_text(f) for f in fields]
+    if not isinstance(fields, dict):
+        return fields
+    out = {}
+    for key, value in fields.items():
+        if key in _TEXT_KEYS or (key == "edits" and not isinstance(value, list)):
+            out[key] = _fingerprint(value)
+        elif key == "edits":
+            out[key] = [_redact_text(e) if isinstance(e, dict) else _fingerprint(e) for e in value]
+        else:
+            out[key] = _redact_text(value)
     return out
 
 
@@ -56,6 +74,14 @@ def redact(payload: dict) -> dict:
     if not isinstance(tool, str) or tool.lower() not in _WRITE_TOOLS:
         return payload
     out = dict(payload)
+    args = out.get("args")
+    if tool.lower() in _PATCH_TOOLS and isinstance(args, dict) and isinstance(args.get("patchText"), str):
+        from ws.adapters import opencode
+
+        try:  # the files stay on record beside the fingerprint, and the line still replays (the adapter reads them)
+            out["paths"] = opencode.patch_paths(args["patchText"])
+        except TypeError:
+            pass
     for key in ("tool_input", "args"):
         if isinstance(out.get(key), dict):
             out[key] = _redact_text(out[key])

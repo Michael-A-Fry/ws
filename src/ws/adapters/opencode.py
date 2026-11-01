@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import shlex
 from pathlib import Path
 
@@ -136,8 +137,21 @@ def generate(
     return {CONFIG: json.dumps(config, indent=2) + "\n", PLUGIN: plugin, IGNORE: IGNORE_TEXT}
 
 
-def parse(payload: dict) -> Call | None:
-    """What the shim sends: {"tool": "bash", "args": {"command": ...}}."""
+_PATCH_PATH = re.compile(r"^\*\*\* (?:Add File|Update File|Delete File|Move to):[ \t]*(\S.*?)[ \t\r]*$", re.MULTILINE)
+
+
+def patch_paths(patch: str) -> list[str]:
+    """The files a patch (OpenCode's `*** Begin Patch` text) adds, updates, deletes or moves to, in order. A patch
+    that names none cannot be judged, so it raises: the call is denied."""
+    paths = list(dict.fromkeys(_PATCH_PATH.findall(patch)))
+    if not paths:
+        raise TypeError("args.patchText names no file (expected `*** Update File: path` lines)")
+    return paths
+
+
+def parse(payload: dict) -> Call | list[Call] | None:
+    """What the shim sends: {"tool": "bash", "args": {"command": ...}}. A patch tool is a write of each file in the
+    patch."""
     tool, args = payload.get("tool"), payload.get("args")
     if not isinstance(tool, str) or not isinstance(args, dict):
         raise TypeError("payload has no tool and args")
@@ -147,6 +161,15 @@ def parse(payload: dict) -> Call | None:
         return Call("read", _text(args, "filePath"))
     if tool in ("edit", "write", "multiedit"):
         return Call("write", _text(args, "filePath"))
+    if tool in ("patch", "apply_patch"):
+        kept = payload.get(
+            "paths"
+        )  # only a line record-calls kept has these (the shim sends none): text -> fingerprint
+        if isinstance(args.get("patchText"), dict) and isinstance(kept, list) and kept:
+            if not all(isinstance(p, str) and p for p in kept):
+                raise TypeError("paths must be non-empty text")
+            return [Call.of("write", p, tool=tool) for p in kept]
+        return [Call.of("write", p, tool=tool) for p in patch_paths(_text(args, "patchText"))]
     if tool in ("grep", "glob", "list"):
         path = args.get("path")
         if path is not None and not isinstance(path, str):

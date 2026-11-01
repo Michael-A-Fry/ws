@@ -190,8 +190,21 @@ def test_bulk_staging_stops_whole_tree_staging(cmd):
         "git add a.py b.py",
         "git add -- a.py",
         "git add src/",
-        "git add -u",
+        "git add -u src/",  # -u with a pathspec of its own stays; with none it is the whole tree (below)
+        "git add -u -- a.py",
         "git -C x add file.txt",
+        'git add "$f" other.py',
+        "git add $PWD/a.py",
+        "git commit -m . a.py",
+        "git commit -m m -- a.py",
+        "git commit -i a.py -m m",
+        "git commit -m m -o src/",
+        "echo $'it\\'s'\ngit status",
+        "ls #\\\ngit status",
+        "echo ${x#<<X}\ngit status",
+        "git -c user.name=x -c Core.editor=true commit -m m",
+        "GIT_AUTHOR_NAME=x git commit -m m",
+        "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.editor GIT_CONFIG_VALUE_0=true git status",
         "git commit -m 'fix it'",
         'git commit -m "git add -A"',
         'git commit -m "use -a here"',
@@ -216,6 +229,81 @@ def test_bulk_staging_stops_whole_tree_staging(cmd):
 )
 def test_bulk_staging_lets_named_paths_and_quoted_text_through(cmd):
     assert bulk_staging.judge(Call("command", cmd), None, None) is None, cmd
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        # quoting the scan once misread, each hiding the line below
+        "echo $'it\\'s'\ngit add -A",
+        "echo $'a\\'b'; git add -A",
+        "echo $(echo $'it\\'s')\ngit add -A",
+        "ls #\\\ngit add -A",
+        "ls # note \\\\\ngit add -A",
+        "echo ${x#<<X}\ngit add -A",
+        "echo ${x/<<X/}\ngit add -A",
+        "echo ${x:-<<X}\ngit add -A",
+        "echo $[x<<X]\ngit add -A",
+        "echo ${x:-${y#<<X}}\ngit add -A",
+        "$'g\\x69t' add -A",
+        "git add $'-\\x41'",
+        # git config keys are not case-sensitive
+        "git -c Alias.go='add -A' go",
+        "git -c ALIAS.go='add -A' go",
+        "git -cAlias.go='add -A' go",
+        "git --config-env=ALIAS.go=GOV go",
+        "git --config-env Alias.go=GOV go",
+        # the same through the environment
+        "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.go GIT_CONFIG_VALUE_0='add -A' git go",
+        "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=Alias.go GIT_CONFIG_VALUE_0='add -A' git go",
+        "env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=ALIAS.go GIT_CONFIG_VALUE_0='add -A' git go",
+        "GIT_CONFIG_PARAMETERS=\"'alias.go=add -A'\" git go",
+        "GIT_CONFIG_PARAMETERS= git status",
+        "export GIT_CONFIG_PARAMETERS=\"'alias.go=add -A'\"; git go",
+        "export GIT_CONFIG_KEY_0=alias.go; git go",
+        "GIT_CONFIG_KEY_0=$K git go",
+        # more ways to name the whole tree
+        "git add ./.",
+        "git add .//",
+        "git add ./",
+        "git add ..",
+        "git add '**'",
+        'git add "$PWD"',
+        "git add $PWD",
+        "git add ${PWD}",
+        "git add $(pwd)",
+        'git add "$(pwd)"',
+        "git add `pwd`",
+        "git stage $(pwd)",
+        "git add -u",
+        "git add --update",
+        "git add --upd",
+        "git add -uv",
+        "git add -u -v",
+        "git stage -u",
+        "git commit .",
+        "git commit -- .",
+        "git commit -i .",
+        "git commit --include .",
+        "git commit -o .",
+        "git commit --only .",
+        "git commit -m m .",
+        "git commit -m m -- .",
+        "git commit -m m -i ./.",
+        "git commit -m m :/",
+        "git commit -m m $PWD",
+        "git -C x commit -m m .",
+    ],
+)
+def test_bulk_staging_stops_each_bypass_the_reviewer_found(cmd):
+    found = bulk_staging.judge(Call("command", cmd), None, None)
+    assert found is not None and found.action == "deny" and not found.approvable, cmd
+
+
+def test_the_gate_denies_a_quote_left_open_with_a_clear_reason(home):
+    reason = gate.check("claude-code", json.dumps(bash("echo 'it\ngit status")), pol("bulk-staging"))
+    assert reason and "unclosed" in reason
+    assert gate.check("claude-code", json.dumps(bash("echo it\\'s")), pol("bulk-staging")) is None
 
 
 def test_bulk_staging_reads_a_command_after_a_heredoc_ends():
@@ -444,6 +532,52 @@ def test_record_calls_redacts_open_code_writes_and_leaves_commands_and_reads_alo
     assert lines[0]["payload"]["args"]["content"] == _fingerprint(SECRET_TEXT)
     assert lines[1]["payload"]["args"]["edits"][0]["newString"] == _fingerprint(SECRET_TEXT)
     assert lines[2]["payload"]["tool_input"]["command"] == "echo hi" and lines[3]["payload"] == read
+
+
+@pytest.mark.parametrize(
+    "tool, inp, where",
+    [
+        ("Write", {"file_path": "/p/a", "content": [SECRET_TEXT]}, ("content",)),  # not text: a list
+        ("Write", {"file_path": "/p/a", "content": {"x": SECRET_TEXT}}, ("content",)),
+        ("Edit", {"file_path": "/p/a", "old_string": "x", "new_string": [SECRET_TEXT]}, ("new_string",)),
+        ("MultiEdit", {"file_path": "/p/a", "edits": [{"old_string": 1, "new_string": [SECRET_TEXT]}]}, ()),
+        ("MultiEdit", {"file_path": "/p/a", "edits": [SECRET_TEXT]}, ()),  # an edit that is not a dict
+        ("MultiEdit", {"file_path": "/p/a", "edits": SECRET_TEXT}, ("edits",)),  # edits that is not a list
+        ("Write", {"file_path": "/p/a", "content": 12345}, ("content",)),
+    ],
+)
+def test_record_calls_fingerprints_a_value_under_a_text_key_whatever_its_type(home, tool, inp, where):
+    payload = {"tool_name": tool, "tool_input": inp}
+    assert gate.check("claude-code", json.dumps(payload), pol("record-calls")) is None
+    raw = (home / "wshome" / "logs" / "gate-calls.jsonl").read_text()
+    assert SECRET_TEXT not in raw
+    (line,) = jsonl.read(home / "wshome" / "logs" / "gate-calls.jsonl")
+    got = line["payload"]["tool_input"]
+    for key in where:
+        assert set(got[key]) == {"bytes", "sha256"}
+    if where == ("content",) and inp["content"] == 12345:
+        assert got["content"] == _fingerprint("12345")
+
+
+@pytest.mark.parametrize("tool", ["patch", "apply_patch"])
+def test_record_calls_keeps_the_paths_and_a_fingerprint_of_an_open_code_patch(home, tool):
+    text = f"*** Begin Patch\n*** Update File: /p/a.py\n@@\n-x\n+{SECRET_TEXT}\n*** End Patch"
+    payload = {"tool": tool, "args": {"patchText": text}, "session_id": "s"}
+    assert gate.check("opencode", json.dumps(payload), pol("record-calls")) is None
+    raw = (home / "wshome" / "logs" / "gate-calls.jsonl").read_text()
+    assert SECRET_TEXT not in raw
+    (line,) = jsonl.read(home / "wshome" / "logs" / "gate-calls.jsonl")
+    assert line["payload"]["args"]["patchText"] == _fingerprint(text)
+    assert line["payload"]["paths"] == ["/p/a.py"]
+    # the kept line replays by its paths: a protected file in it is still a deny, a plain one still an allow
+    p = pol("record-calls")
+    assert gate.check("opencode", json.dumps(line["payload"]), p) is None
+    protected = str(home / "wshome" / "policy.toml")
+    kept = {**line["payload"], "paths": [protected]}
+    assert "protected" in gate.check("opencode", json.dumps(kept), p, (protected,))
+    forged = {"tool": tool, "args": {"patchText": {"bytes": 1}}}  # a fingerprint with no paths beside it: not judged
+    with pytest.raises(TypeError):
+        gate.check("opencode", json.dumps(forged), p)
 
 
 def test_a_recorded_write_still_replays_by_its_path(home, capsys):

@@ -401,3 +401,31 @@ def test_the_ws_package_ships_python_files_only():
     pkg = Path(gate.__file__).parent
     others = [p for p in pkg.rglob("*") if p.is_file() and p.suffix != ".py" and "__pycache__" not in p.parts]
     assert others == []
+
+
+def _patch(*lines: str) -> str:
+    return "\n".join(["*** Begin Patch", *lines, "*** End Patch"])
+
+
+@pytest.mark.parametrize("tool", ["patch", "apply_patch"])
+def test_check_opencode_patch_tools_are_writes_of_each_file_in_the_patch(home, monkeypatch, capsys, tool):
+    policy_file = home / "wshome" / "policy.toml"
+    extra = ("--protect", str(home / "gate-out"))
+    ok = home / "project" / "a.py"
+    fine = _patch(f"*** Update File: {ok}", "@@", "-a", "+b", "*** Add File: new.txt", "+x")
+    assert check(monkeypatch, capsys, "opencode", {"tool": tool, "args": {"patchText": fine}}, *extra)[0] == 0
+    for header in ("Update File", "Add File", "Delete File", "Move to"):
+        text = _patch(f"*** Update File: {ok}", "@@", "-a", "+b", f"*** {header}: {policy_file}")
+        code, err = check(monkeypatch, capsys, "opencode", {"tool": tool, "args": {"patchText": text}}, *extra)
+        assert code == 2 and "protected" in err, (tool, header)
+
+
+@pytest.mark.parametrize("args", [{"patchText": _patch("*** Update File:   ")}, {"patchText": "no files"}, {}])
+def test_check_opencode_patch_that_names_no_file_cannot_be_judged_so_is_denied(home, monkeypatch, capsys, args):
+    assert check(monkeypatch, capsys, "opencode", {"tool": "patch", "args": args})[0] == 2
+
+
+def test_the_opencode_shim_governs_the_patch_tools(home, tmp_path):
+    assert generate("opencode", tmp_path / "out") == 0
+    shim = (tmp_path / "out" / "plugins" / "ws-gate.js").read_text()
+    assert '"patch"' in shim and '"apply_patch"' in shim

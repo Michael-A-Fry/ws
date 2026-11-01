@@ -12,7 +12,8 @@ the machine, a REF that doesn't exist here, or git taking more than 8 seconds in
 through with a note. Git runs without lazy fetching (`GIT_NO_LAZY_FETCH=1`), so a check never goes to the network.
 
 When the session stops, the claims in the runner's last message (if the stop payload carries it) are appended to
-`$WS_HOME/logs/claims.jsonl` with whether each commit was on REF. That is a log only; nothing is stopped.
+`$WS_HOME/logs/claims.jsonl` with whether each commit was on REF. That is a log only; nothing is stopped. Each line
+carries `schema` and `ts`, and `at` (the legacy spelling of `ts`) beside them.
 """
 
 from __future__ import annotations
@@ -37,6 +38,7 @@ KINDS = ("message",)
 DEFAULT_WORDS = ("on main", "merged into main", "merged to main", "pushed to main")
 DEFAULT_REF = "origin/main"
 LOG = "claims.jsonl"
+SCHEMA_VERSION = 1
 GIT_BUDGET_S = 8.0  # all the git time one hook may use
 MAX_TEXT = 20000  # a message is read to this length
 
@@ -213,7 +215,8 @@ def _log(cfg: Config, ctx) -> Finding | None:
     if not claims:
         return None
     budget = Budget()
-    stamp = datetime.fromtimestamp(ctx.now(), UTC).isoformat(timespec="seconds")
+    now = ctx.now()  # one clock read feeds both `ts` and the legacy `at`
+    stamp = datetime.fromtimestamp(now, UTC).isoformat(timespec="seconds")
     rec = {
         "at": stamp,
         "runner": ctx.runner,
@@ -222,7 +225,10 @@ def _log(cfg: Config, ctx) -> Finding | None:
         "claims": [{"word": w, "commit": s, "on_ref": on_ref(ctx.cwd, s, cfg.ref, budget)} for w, s in claims],
     }
     try:
-        jsonl.append((ctx.home if ctx.home is not None else ws_home()) / "logs" / LOG, rec)
+        jsonl.append(
+            (ctx.home if ctx.home is not None else ws_home()) / "logs" / LOG,
+            jsonl.stamped(rec, SCHEMA_VERSION, now),
+        )
     except OSError as e:
         return Finding("warn", f"claims could not write {LOG} ({type(e).__name__})")
     return None

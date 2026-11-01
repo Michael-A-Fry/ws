@@ -25,7 +25,14 @@ def box(tmp_path, monkeypatch):
 
 
 def add_run(box, run_id: str) -> str:
-    rec = runrecord.new(run_id=run_id, job="daily", runner="claude-code", status="ok", ws_version="0")
+    rec = runrecord.new(
+        run_id=run_id,
+        job="daily",
+        runner="claude-code",
+        status="ok",
+        ws_version="0",
+        started_at="2026-01-01T00:00:00.000Z",
+    )
     runrecord.append(runrecord.runs_path(os.environ), rec)
     return run_id
 

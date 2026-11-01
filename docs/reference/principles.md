@@ -123,12 +123,13 @@ Plain files that open without ws, with a version on every record.
 | D1 | Store data in open formats: Markdown, TOML, JSON lines, CSV or SQLite. | T1 | [judge] | enforced |
 | D2 | Describe a run record with one JSON Schema (2020-12), and carry its version in every line. | T0 | `tests/test_run.py::test_the_schema_rejects_a_missing_key_an_extra_key_and_a_bad_status` | enforced |
 | D3 | Append to logs under a lock, cap their size, and rotate them, so no line is lost or cut in half. | T0 | `tests/test_jsonl.py` | enforced |
-| D4 | Within one schema version, only add fields; a breaking change takes a new version name. | T0 | `tests/test_run.py` | planned |
+| D4 | Within one schema version, only add fields; a breaking change takes a new version name. | T0 | `tests/test_stores.py::test_run_record_schema_2_only_gains_keys` | enforced |
 | D5 | Load the policy and the secrets registry whole or refuse; an unknown key is an error that names it. | T0 | `tests/test_policy.py::test_bad_policy_raises_with_a_plain_message_naming_the_key` | enforced |
 | D6 | Show a secret's name and never its value. | T0 | `tests/test_secrets.py::test_set_list_rm_round_trip_never_shows_the_value`, `tests/test_secrets.py::test_store_writes_0600_in_0700_and_leaves_no_temp_files` | enforced |
 | D7 | Keep memory as Markdown in a git repository, with a search index that can be rebuilt from the files. | T0 | `tests/test_memory.py::test_a_rebuild_from_scratch_gives_the_same_results` | enforced |
 | D8 | Record who ran what in each run: run id, job, runner, ws version and times. | T0 | `tests/test_run.py::test_a_run_leaves_one_complete_record` | enforced |
 | D9 | Keep secrets and personal data out of prompts, fixtures, commits and comments. | T0 | `.pre-commit-config.yaml` | enforced |
+| D10 | List every log ws writes in `docs/reference/stores.md`, and give each line a `schema` number and a `ts` in RFC 3339 UTC. | T0 | `tests/test_stores.py::test_every_module_that_writes_a_jsonl_file_is_listed_in_stores_md`, `tests/test_jsonl.py::test_a_line_without_a_schema_or_a_ts_is_refused_before_anything_is_written`, `tests/test_stores.py::test_the_page_gives_each_log_the_schema_its_writer_declares` | enforced |
 
 ## Engineering governance
 

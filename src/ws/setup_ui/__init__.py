@@ -2,23 +2,32 @@
 
 Both screens ask the same questions through `flow`, and everything they change goes through `ws.install` (a plan, then
 an apply), so what setup writes is what `ws install` would write, and a second run reports 0 changes. This file is the
-command; `flow` holds the facts, the choices and their checks; `inline` is the terminal walk; `web` is the page; `brand`
-is the look they share.
+command; `flow` holds the facts, the choices and their checks; `inline` is the terminal walk; `web` is the page;
+`ws.brand` is the look they share.
 
-Visual kit (the rules the terminal walk and the page both follow):
+Visual kit (the rules the terminal walk and the page both follow; the colours are the tokens in `ws.brand`):
 
-- Violet is the colour of what you are on or have chosen, and of the name. Mint is what is done, added or found. Amber
-  is a warning or a refusal. Everything quiet is one grey. Two accent colours, no more.
-- The mark is `ws` on a pixel grid, six rows tall, in a gradient from violet to mint. Under 80 columns it folds to a
-  three-row mark. The gradient rule under the banner runs the same way.
+- Violet (`accent`) is what you are on or have chosen: the cursor, a ticked plugin, the keys in a hint line, the filled
+  part of a track. Mint (`ok`) is what is done, added or found, and the word "setup" in the banner. Amber (`warn`) is a
+  warning, a file ws changed (`~`) or a fact it found nothing for. Red (`error`) is a refusal (`✗`). The name
+  `ws-aitoolkit` is bold with no colour.
+- Quiet text is one grey (`muted`); card borders are a second (`line2`); the empty part of a track is a third (`line`).
+  Nothing else is grey.
+- The mark is `ws` on a pixel grid, six rows tall, in a gradient from violet through indigo and teal to mint (the two
+  between-hues appear only in the mark and the rule). Under 80 columns it folds to a three-row mark. The gradient rule
+  under the banner runs the same way. On the page the rows are classes, with a darker ramp in light mode.
 - Status block: one line per fact about this machine (machine, runner, model, budget, notes), label in grey, value
   after it, a mint tick where ws found something it can use and amber where it found nothing.
 - Cards: each step is a rounded frame with a title on its left and a short caption on its right. Core is always on,
   Plugins are chosen, Review says what will be written, Install ticks the work off group by group.
 - Hint line: the last line of anything that waits for a key, `key text` pairs in a row, the key in violet.
-- Fallbacks: with `NO_COLOR`, a `TERM` of `dumb` or output that is not a terminal, the same words print with no escape
-  code at all; with `--yes` nothing is asked and nothing redraws; under 80 columns the mark folds; a resize is picked
-  up on the next draw.
+- Colour: off with a non-empty `NO_COLOR`, with `--no-color`, for output that isn't a terminal and for `TERM=dumb`
+  (a non-empty `FORCE_COLOR` other than `0` turns it back on; `NO_COLOR` wins). Where the terminal's background isn't
+  known to be dark (`COLORFGBG`), mint, amber, red and grey use the terminal's own basic colours so its theme can
+  re-colour them; violet and the mark stay 256-colour.
+- Fallbacks: with colour off the same words print with no colour code; a `TERM` of `dumb` prints each step once, with
+  no cursor-move or erase code; with `--yes` nothing is asked and nothing redraws; under 80 columns the mark folds; a
+  resize is picked up on the next draw.
 
 Setup never writes a policy setting of its own: it writes only what the install plan gives it.
 """
@@ -49,6 +58,7 @@ Flags:
   --runner NAME      the AI tool to set up rules for: {runners}
   --cap USD          the most ws may spend in a month, e.g. 20
   --region CC        your country (two letters, e.g. NZ); kept in the profile
+  --no-color         print no colour (a non-empty NO_COLOR does the same)
   -h, --help         show this help
 
 Examples:
@@ -95,6 +105,7 @@ def register(sub) -> None:
     p.add_argument("--runner", choices=runners, help="the AI tool to set up rules for")
     p.add_argument("--cap", type=float, metavar="USD", help="the most ws may spend in a month")
     p.add_argument("--region", metavar="CC", help="your country (two letters); kept in [machine] region")
+    p.add_argument("--no-color", action="store_true", help="print no colour (a non-empty NO_COLOR does the same)")
     p.set_defaults(func=cmd_setup, raw=_at_terminal)
 
 
@@ -132,4 +143,4 @@ def cmd_setup(args: argparse.Namespace) -> int:
         return web.run(facts, choices, open_browser=not args.no_open)
     from ws.setup_ui import inline
 
-    return inline.run(facts, choices, yes=args.yes)
+    return inline.run(facts, choices, yes=args.yes, no_color=args.no_color)

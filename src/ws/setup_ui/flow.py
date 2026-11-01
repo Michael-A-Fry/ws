@@ -535,9 +535,18 @@ def _first_unchosen(facts: Facts, c: Choices) -> str | None:
     return next((p.name for p in facts.plugins if p.available and p.name not in c.plugins), None)
 
 
-def next_commands(facts: Facts, c: Choices) -> list[str]:
+def next_steps(facts: Facts, c: Choices) -> list[tuple[str, str]]:
+    """What to run next, as (command, what it does) pairs."""
     left = _first_unchosen(facts, c)
-    return ["ws doctor", f"ws plugin add {left}" if left else "ws plugin list", 'ws note "first note"']
+    return [
+        ("ws doctor", "check that everything works"),
+        (f"ws plugin add {left}", "switch a plugin on") if left else ("ws plugin list", "see the plugins"),
+        ('ws note "first note"', "file your first note"),
+    ]
+
+
+def next_commands(facts: Facts, c: Choices) -> list[str]:
+    return [cmd for cmd, _ in next_steps(facts, c)]
 
 
 def change_commands(facts: Facts, c: Choices) -> list[tuple[str, str]]:

@@ -71,6 +71,10 @@ A command that speaks a protocol on standard output (`ws mcp serve`, `ws gate ch
 | `WS_OUTPUT` | Set to `json` for `--json` on every command. |
 | `WS_BROKER_SOCKET` | The broker socket a client uses. |
 | `WS_GATED_SESSION` | Set inside a gated session. `ws approve` refuses when it's present. |
+| `NO_COLOR` | Any non-empty value turns colour off in `ws setup`. An empty value is ignored. `ws setup --no-color` does the same. |
+| `FORCE_COLOR` | Any non-empty value except `0` keeps colour on when output goes to a pipe or `TERM=dumb`. `NO_COLOR` and `--no-color` win. |
+| `TERM` | `dumb` turns colour off and makes `ws setup` print each step once, with no cursor-move or erase codes. |
+| `COLORFGBG` | Read by `ws setup` to learn whether the terminal background is dark (`15;0`). When it can't tell, the status colours are your terminal's own green, yellow and red. |
 | `XDG_STATE_HOME` | Where run folders for jobs with no `cwd` go, under `ws/work`. Default `~/.local/state`. |
 
 ## Commands

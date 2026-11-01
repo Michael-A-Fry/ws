@@ -82,6 +82,7 @@ Every command accepts `--json` (one JSON envelope on standard output) and `-C PA
 | Add or search memory | `ws memory add`, `search`, `reindex` | [CLI reference](reference/cli.md) |
 | Let a runner search memory and add notes | `ws mcp serve` | [CLI reference](reference/cli.md) |
 | List or install the skills ws ships | `ws skills list`, `add` | [CLI reference](reference/cli.md) |
+| Use ws's version of a skill you already have | `ws skills adopt`, `restore` | [CLI reference](reference/cli.md) |
 
 ## Machine-read commands
 

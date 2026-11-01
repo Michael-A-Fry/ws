@@ -46,7 +46,7 @@ write to, in a folder only its owner can write to; the file passes the same test
 |---|---|
 | 0 | Fine. |
 | 1 | Needs doing: a check found something to fix, or a run failed or timed out. |
-| 2 | Usage error. `ws run` also uses 2 when the job file can't be read. For `ws gate check`, 2 is a deny. |
+| 2 | Usage error. `ws run` also uses 2 when the job file can't be read. For `ws gate check`, 2 is a deny. For `ws gate event`, 2 comes after a PostToolUse event, with the finding on standard error. |
 | 3 | Refused: `ws run` refused to start a job. |
 | 4 | `ws gate check` only: a granted approval is waiting to be claimed (OpenCode wall). |
 
@@ -161,6 +161,42 @@ ws gate check [-h] [--policy FILE] --runner {claude-code,opencode} [--protect PA
 | `--policy FILE` | Policy file (default $WS_HOME/policy.toml). |
 | `--runner RUNNER` | The runner whose hook payload is on standard input. One of `claude-code`, `opencode`; required. |
 | `--protect PATH` | A file or folder of ws's own that a session may not write. |
+
+### `ws gate event`
+
+Hook entry for the guards' other events (after a call, start, stop): payload on stdin. Exit 0, or 2 after a tool call
+with a finding on standard error.
+
+```text
+ws gate event [-h] [--policy FILE] --runner {claude-code,opencode}
+```
+
+| Argument | Meaning |
+|---|---|
+| `--policy FILE` | Policy file (default $WS_HOME/policy.toml). |
+| `--runner RUNNER` | The runner whose hook payload is on standard input. One of `claude-code`, `opencode`; required. |
+
+An event that `ws gate check` answers, or one ws doesn't read, exits 0 with a line on standard error. A payload it can't
+read exits 0 with a line saying it was skipped: this command gives advice and never blocks a session by crashing.
+See [Guards](guards.md).
+
+### `ws gate replay`
+
+Run recorded hook payloads against the policy and print allow, deny or ask for each. No approval is used up and no guard
+state is kept.
+
+```text
+ws gate replay [-h] [--policy FILE] --runner {claude-code,opencode} FILE
+```
+
+| Argument | Meaning |
+|---|---|
+| `FILE` | One JSON object per line: a payload, or `{payload, expect}` where `expect` is `allow`, `deny` or `ask`. |
+| `--policy FILE` | Policy file (default $WS_HOME/policy.toml). |
+| `--runner RUNNER` | The runner the payloads came from. One of `claude-code`, `opencode`; required. |
+
+Exit 0 when every line with an `expect` matches (or none has one), and 1 when an `expect` differs. With `--json` the
+result is `{results, differ}`, one entry per line. See [Guards](guards.md).
 
 ### `ws gate launch`
 
@@ -556,12 +592,39 @@ ws skills list [-h]
 Put a skill back (one you removed), or add one that's not installed yet.
 
 ```text
-ws skills add [-h] {align,checkpoint,taste-gate,dataviz}
+ws skills add [-h] {align,checkpoint,taste-gate,dataviz,resume,ship}
 ```
 
 | Argument | Meaning |
 |---|---|
-| `name` | The skill to install. One of `align`, `checkpoint`, `taste-gate`, `dataviz`. |
+| `name` | The skill to install. One of `align`, `checkpoint`, `taste-gate`, `dataviz`, `resume`, `ship`. |
+
+### `ws skills adopt`
+
+Use ws's version of a skill you already have: it replaces your skill of the same name with ws's, keeping yours so
+`ws skills restore` can put it back.
+
+```text
+ws skills adopt [-h] [--runner {claude-code,opencode}] {align,checkpoint,taste-gate,dataviz,resume,ship}
+```
+
+| Argument | Meaning |
+|---|---|
+| `name` | The skill to adopt. One of `align`, `checkpoint`, `taste-gate`, `dataviz`, `resume`, `ship`. |
+| `--runner RUNNER` | The runner (default: every runner found). One of `claude-code`, `opencode`. |
+
+### `ws skills restore`
+
+Put back the skill of yours that `ws skills adopt` replaced.
+
+```text
+ws skills restore [-h] [--runner {claude-code,opencode}] {align,checkpoint,taste-gate,dataviz,resume,ship}
+```
+
+| Argument | Meaning |
+|---|---|
+| `name` | The skill to restore. One of `align`, `checkpoint`, `taste-gate`, `dataviz`, `resume`, `ship`. |
+| `--runner RUNNER` | The runner (default: every runner found). One of `claude-code`, `opencode`. |
 
 ## `ws canary`
 
@@ -593,7 +656,7 @@ ws rate [-h] [--note TEXT] RUN_ID|last {up,down}
 
 ## `ws notify`
 
-Push to your phone through ntfy: at most 1 digest and 3 pushes a day.
+Push to your phone through ntfy: at most 1 digest and 3 pushes a day, and session alerts on their own daily allowance.
 
 ### `ws notify test`
 
@@ -619,11 +682,41 @@ ws notify send [-h] [--title TITLE] [--digest] message
 
 ### `ws notify status`
 
-Today's count against the cap.
+Today's count against the caps.
 
 ```text
 ws notify status [-h]
 ```
+
+### `ws notify alert`
+
+Hook entry: push `FOLDER needs you` (a Notification event, high priority) or `FOLDER finished` (a Stop event). The hook
+JSON is on stdin. Exits 0, including when it sends nothing.
+
+```text
+ws notify alert [-h] [--runner RUNNER]
+```
+
+| Argument | Meaning |
+|---|---|
+| `--runner RUNNER` | The runner whose hook is calling, for example `claude-code`. |
+
+It sends nothing for any other event, for a headless session (`claude -p`, or `WS_RUN_ID` set), or when `session_alerts`
+is `false`. The send gets 3 seconds. If another send holds the counter it skips that alert, and after a failed send
+alerts pause for 5 minutes.
+
+#### Profile keys
+
+Set these in the `[roles.notify]` table of `profile.toml`, beside `adapter = "ntfy"`, `url` and `token`.
+
+| Key | Meaning |
+|---|---|
+| `session_alerts` | `true` (default) or `false`. When `false`, `ws notify alert` sends nothing. |
+| `alert_text` | What an alert says. `"title"` (default) sends the folder name with the event, such as `FOLDER needs you`. `"full"` adds the runner's own message after it. `"plain"` sends `a session needs you` with no folder name, for private folder names. |
+| `alerts_per_day` | The daily allowance for session alerts, a whole number, 0 or more (default 50). Counted apart from pushes and the digest. |
+
+The folder name goes to the notify server (ntfy.sh or your own) with the push. Each send writes
+`$WS_HOME/logs/notify-last.json`.
 
 ## `ws backup`
 

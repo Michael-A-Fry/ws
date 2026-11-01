@@ -8,6 +8,13 @@ body of the GitHub release.
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-11-01
+
+### Fixed
+
+- `ws <word>` passes `--json` on to a `ws-<word>` program as well as setting `WS_OUTPUT=json`.
+- Every-session install accepts an interpreter under HOME wherever HOME lives, including through a link.
+
 ## [0.1.2] - 2026-11-01
 
 The gate and skills ready to run in every session on a person's machine, alongside their own hooks.

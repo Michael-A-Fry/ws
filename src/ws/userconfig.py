@@ -8,7 +8,8 @@ The promises, each pinned by a test:
   appends its items; it refuses, and changes nothing, when one of your values would be overridden (an `env` key you set
   to another value).
 - Before the first write the file's own bytes go to `$WS_HOME/backups/` (mode 0600).
-- The manifest records the items ws added, as exact JSON, and the hash of ws's last write.
+- The manifest records the items ws added, as exact JSON, the items the release asked for (`wanted_ops`, so doctor can
+  see a later release stop asking for one), and the hash of ws's last write.
 - Undo is exact only when it can be. If the file is still what ws last wrote, and it was not changed between two
   `ws install` runs, your original bytes come back (or the file goes, when ws made it). If it was changed at any point
   after the first write, only the recorded items come out and your edits stay.
@@ -26,6 +27,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import dataclasses
 import fnmatch
 import hashlib
 import json
@@ -67,6 +69,7 @@ class Merge:
     ops: tuple = ()
     backup: Path | None = None  # where the file's own bytes go on the first write; None when there is no file yet
     cmd: tuple = ()  # the argv that runs ws in the hooks (recorded, so doctor can see it still starts)
+    inputs: str = ""  # a hash of the policy these ops were built from (see `policy_digest`)
 
 
 @dataclass(frozen=True)
@@ -327,6 +330,31 @@ def wanted(ops) -> str:
     return _sha(json.dumps(list(ops), sort_keys=True).encode("utf-8"))
 
 
+def policy_digest(pol: policy.Policy) -> str:
+    """A hash of everything in the policy, so doctor can tell a change of policy from a change of release."""
+    return _sha(json.dumps(dataclasses.asdict(pol), sort_keys=True, default=str).encode("utf-8"))
+
+
+def dropped_ops(entry: Mapping, ops) -> list:
+    """The ops the record says the release asked for (`wanted_ops`) that `ops`, what it asks for now, no longer holds. A
+    record from before `wanted_ops` existed has none to compare, so nothing is reported dropped."""
+    before = entry.get("wanted_ops")
+    if not isinstance(before, list):
+        return []
+    now = list(ops)
+    return [op for op in before if isinstance(op, dict) and op not in now]
+
+
+def _names(ops) -> str:
+    """The places in the file these ops touch, each once, a few at most."""
+    seen: list = []
+    for op in ops:
+        where = ".".join(str(x) for x in op["path"]) if isinstance(op.get("path"), list) else "?"
+        if where not in seen:
+            seen.append(where)
+    return ", ".join(seen[:4]) + (", ..." if len(seen) > 4 else "")
+
+
 # ---- what ws wants in each runner's file ------------------------------------------------------------------------------------
 
 
@@ -432,7 +460,7 @@ def plan(runner: str, pol: policy.Policy, policy_file: Path, env: Mapping[str, s
         files = adapter.generate(pol, cmd, out, policy_file, protect=(str(where), str(plug)))
         ops = _opencode_ops(files)
         copies[plug] = files[adapter.PLUGIN]
-    return GatePlan(files, Merge(runner, where, tuple(ops), backup, tuple(cmd)), copies)
+    return GatePlan(files, Merge(runner, where, tuple(ops), backup, tuple(cmd), policy_digest(pol)), copies)
 
 
 def withdrawal(runner: str, env: Mapping[str, str]) -> Merge:
@@ -541,6 +569,12 @@ def _locked(path: Path):
             with contextlib.suppress(OSError):
                 os.unlink(lock)  # still holding the lock, so nobody else has it
             os.close(fd)
+
+
+def locked(path: Path):
+    """The lock beside `path`, for a caller (the install engine) that must keep it until it has saved its manifest. Pass
+    `held=True` to `apply` and `withdraw` while holding it: the lock is not re-entrant."""
+    return _locked(path)
 
 
 def _disk_sha(path: Path) -> str | None:
@@ -652,6 +686,8 @@ def _merge_once(m: Merge, entry: Mapping | None, made_dirs: list, new_dirs: list
         "made": made,
         "made_dirs": list(made_dirs),
         "wanted": wanted(m.ops),
+        "wanted_ops": list(m.ops),
+        "inputs": m.inputs,
         "cmd": list(m.cmd),
         "sha256": _sha(data),
         "exact": exact,
@@ -661,19 +697,20 @@ def _merge_once(m: Merge, entry: Mapping | None, made_dirs: list, new_dirs: list
     return kept, Outcome("applied")
 
 
-def apply(m: Merge, entry: Mapping | None, env: Mapping[str, str]) -> tuple[dict | None, Outcome]:
+def apply(m: Merge, entry: Mapping | None, env: Mapping[str, str], held: bool = False) -> tuple[dict | None, Outcome]:
     """Merge into the file. Returns (the manifest entry to keep, or None when there is nothing to record, the outcome).
     Under a lock, and with the file read again just before it is replaced: if it changed meanwhile, ws merges into the
-    new bytes once more, then refuses and leaves the file as the other writer left it."""
+    new bytes once more, then refuses and leaves the file as the other writer left it. `held`: the caller already holds
+    `locked(m.path)` (and keeps it until its manifest is saved)."""
     if not m.ops:
-        out = withdraw(entry, env) if entry else Outcome("gone")
+        out = withdraw(entry, env, held=held) if entry else Outcome("gone")
         return (dict(entry) if out.action == "pending" else None), out
     _check_jsonc_sibling(m)
     made_dirs = list(entry.get("made_dirs", [])) if entry else []
     new_dirs: list = []
     try:
         for _ in range(2):
-            with _locked(m.path):
+            with contextlib.nullcontext() if held else _locked(m.path):
                 try:
                     return _merge_once(m, entry, made_dirs, new_dirs)
                 except _Changed:
@@ -737,10 +774,11 @@ def _withdraw_once(entry: Mapping, env: Mapping[str, str], path: Path, dry_run: 
     return Outcome("trimmed", removed, f"{path}: {why}, so ws took out only its own entries and kept your edits")
 
 
-def withdraw(entry: Mapping, env: Mapping[str, str], dry_run: bool = False) -> Outcome:
+def withdraw(entry: Mapping, env: Mapping[str, str], dry_run: bool = False, held: bool = False) -> Outcome:
     """Take ws's entries out of the file the manifest names. Exact when the file is as ws last wrote it and was never
     changed between two installs; surgical otherwise. The path must be the target for the runner now: the manifest can't
-    point this elsewhere."""
+    point this elsewhere. `held`: the caller holds the lock and calls `tidy` itself once it lets go (the lock file sits
+    in the folder `tidy` empties)."""
     runner = entry.get("runner")
     if runner not in RUNNERS or Path(os.path.normpath(str(entry.get("path")))) != target(runner, env):
         return Outcome("refused", note=f"{entry.get('path')}: not a user config file ws manages")
@@ -748,15 +786,21 @@ def withdraw(entry: Mapping, env: Mapping[str, str], dry_run: bool = False) -> O
     if not os.path.lexists(path):
         return Outcome("gone", note=f"{path} is already gone")
     for _ in range(2):
-        with contextlib.nullcontext() if dry_run else _locked(path):
+        with contextlib.nullcontext() if dry_run or held else _locked(path):
             try:
                 out = _withdraw_once(entry, env, path, dry_run)
             except _Changed:
                 continue
-        if out.action in ("restored", "removed") and not dry_run:
+        if out.action in ("restored", "removed") and not dry_run and not held:
             out.removed += _tidy(path, entry, backups_dir(env))  # after the lock file is gone, so the folder is empty
         return out
     return Outcome("pending", note=f"{path} changed while ws was writing to it; ws's entries are still in it")
+
+
+def tidy(path: Path, entry: Mapping, env: Mapping[str, str]) -> list:
+    """What `withdraw` tidies up after itself, for a caller that held the lock: the backups folder and the folders ws
+    made above the file, each only when empty."""
+    return _tidy(path, entry, backups_dir(env))
 
 
 def _tidy(path: Path, entry: Mapping, backup_dir: Path) -> list:
@@ -841,15 +885,24 @@ def check(env: Mapping[str, str] | None = None) -> tuple[str, str, str]:
         pol = policy.load(policy_file)
     except (policy.PolicyError, OSError) as e:
         return FAIL, f"the policy doesn't load ({e}), so the gate blocks every call", f"fix {policy_file}"
+    dropped: list = []
+    same_policy = False
     try:
         want = plan(runner, pol, policy_file.resolve(), env, entry)
         stale = wanted(want.merge.ops) != entry.get("wanted")
+        dropped = dropped_ops(entry, want.merge.ops)
+        same_policy = entry.get("inputs") == want.merge.inputs
     except (WsError, KeyError, ValueError, OSError):
         stale = True
     unsupported = [g for g in getattr(adapters.get(runner), "UNSUPPORTED_GUARDS", ()) if g in pol.guards.on]
     notes = [f"the guard `{g}` isn't run by {runner}" for g in unsupported]
     if stale:
-        return WARN, "; ".join([f"ws's entries in {where} are from an earlier policy", *notes]), "run `ws install`"
+        first = f"ws's entries in {where} are from an earlier policy"
+        if dropped and same_policy:
+            first += f"; this release no longer asks for {len(dropped)} of them ({_names(dropped)})"
+        elif dropped:
+            first += f"; the current policy and release no longer ask for {len(dropped)} of them ({_names(dropped)})"
+        return WARN, "; ".join([first, *notes]), "run `ws install`"
     detail = f"every session is gated: ws's entries are in {where}"
     return (WARN, "; ".join([detail, *notes]), "") if notes else (OK, detail, "")
 

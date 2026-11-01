@@ -46,7 +46,8 @@ def unstable(cmd: list[str] | None = None) -> str | None:
     if any(a == ".claude" and b == "worktrees" for a, b in itertools.pairwise(parts)):
         return f"{path} is inside a Claude Code worktree"
     home = os.path.abspath(os.path.expanduser("~"))
-    if path.startswith(home + os.sep):
+    real_home, real_dir = os.path.realpath(home), os.path.realpath(os.path.dirname(path))
+    if path.startswith(home + os.sep) or real_dir == real_home or real_dir.startswith(real_home + os.sep):
         return None  # under the person's own HOME (a uv or pipx tool install), wherever that HOME lives
     temp = {os.path.abspath(t) for t in (*_TEMP_ROOTS, tempfile.gettempdir())}
     if any(path == t or path.startswith(t + os.sep) for t in temp):

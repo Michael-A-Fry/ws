@@ -858,6 +858,15 @@ def test_a_tool_install_under_a_home_that_sits_in_a_temp_folder_is_fine(tmp_path
     assert ".venv" in (selfcmd.unstable([str(tmp_path / "code" / "p" / ".venv" / "bin" / "python")]) or "")
 
 
+@pytest.mark.skipif(os.name == "nt", reason="symlinks need rights on Windows")
+def test_a_home_reached_through_a_link_still_counts_as_home(tmp_path, monkeypatch):
+    real = tmp_path / "real"
+    (real / "tools" / "bin").mkdir(parents=True)
+    (tmp_path / "link").symlink_to(real)
+    monkeypatch.setenv("HOME", str(tmp_path / "link"))
+    assert selfcmd.unstable([str(real / "tools" / "bin" / "python"), "-I", "-m", "ws"]) is None
+
+
 def test_every_session_refuses_a_project_venv_interpreter_and_writes_nothing(box, capsys, monkeypatch):
     monkeypatch.setattr(userconfig, "require_stable_interpreter", REAL_STABLE_CHECK)
     monkeypatch.setattr(selfcmd, "argv", lambda: [str(box / "proj" / ".venv" / "bin" / "python"), "-I", "-m", "ws"])

@@ -56,6 +56,7 @@ agents. In short:
   timezone or the network.
 - No private data. The PII gate enforces it.
 - Pin everything: Actions by commit SHA, tools at least 7 days old.
+- A new rule goes on [principles.md](docs/reference/principles.md) with its check.
 
 ## Commits and pull requests
 

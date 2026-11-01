@@ -60,6 +60,7 @@ Measure:
 - [Eval](reference/eval.md): task files, graders and the ten metrics.
 - [Lab](reference/lab.md): the lab virtual machine cell and how it's protected.
 - [`ws version --json`](reference/version-json.md): the build and install fields.
+- [Principles](reference/principles.md): the rules ws follows, each with the check that enforces it.
 
 ## Project files
 

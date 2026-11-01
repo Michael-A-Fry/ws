@@ -112,6 +112,7 @@ reference (the [Diátaxis](https://diataxis.fr/) split).
 | [Eval reference](docs/reference/eval.md) | Task format, graders, metrics |
 | [Lab reference](docs/reference/lab.md) | The lab machine and the launch matrix |
 | [`ws version --json`](docs/reference/version-json.md) | The fields of the version report |
+| [Principles](docs/reference/principles.md) | The rules ws follows and the check for each |
 
 For contributors: [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), [SUPPORT.md](SUPPORT.md),
 [CHANGELOG.md](CHANGELOG.md) and [AGENTS.md](AGENTS.md).

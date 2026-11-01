@@ -1101,3 +1101,15 @@ def test_the_finished_screen_has_a_description_for_every_command(box):
     assert all(cmd.startswith("ws ") and desc for cmd, desc in steps)
     page = render_page(facts, flow.choices_from(facts))
     assert "text: 'ws-aitoolkit'" not in page and "h('b', {text: 'ws'})" in page
+
+
+def test_the_setup_server_is_the_shared_loopback_server_with_setups_three_calls(box):
+    from ws.ui.server import LoopbackServer
+
+    facts = flow.gather(os.environ, region="NZ")
+    srv = SetupServer(facts, flow.choices_from(facts))
+    try:
+        assert isinstance(srv, LoopbackServer)
+        assert set(srv.get_routes) == {"/"} and set(srv.post_routes) == {"/api/preview", "/api/install", "/api/finish"}
+    finally:
+        srv.httpd.server_close()

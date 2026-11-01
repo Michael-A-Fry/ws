@@ -51,6 +51,8 @@ shows that stderr to the model; it carries no `|| exit`. Every other generated h
 UserPromptSubmit, Stop, SubagentStop) ends `|| true`, because an exit 2 there would block the person's prompt or keep the
 session going: those hooks add context and findings, and the session carries on whatever they return.
 
+Notification and Stop also run `ws notify alert --runner claude-code || true`, the phone alert.
+
 `env` also carries WS_SANDBOXED=1, which tells the hook this session has the sandbox block above. `preflight` runs for
 every session except one whose settings set WS_SANDBOXED=0, the marker of a settings file written without the sandbox
 block; settings written before the marker existed carry the block and no marker, so `preflight` runs for them.
@@ -121,6 +123,12 @@ def session_hooks(ws_cmd: list[str]) -> dict:
         return [{"hooks": [{"type": "command", "command": cmd, "timeout": 5}]}]
 
     return {"SessionStart": hook("start"), "UserPromptSubmit": hook("nudge")}
+
+
+def alert_hook(ws_cmd: list[str]) -> dict:
+    """The phone alert: `ws notify alert` reads the hook payload and always exits 0; `|| true` keeps it advice."""
+    cmd = f"{shlex.join(ws_cmd)} notify alert --runner {NAME} || true"
+    return {"type": "command", "command": cmd, "timeout": 5}
 
 
 def _matcher(kinds: set[str], base: tuple[str, ...] = ()) -> str:
@@ -276,6 +284,8 @@ def generate(
             settings["hooks"][name][0]["hooks"].append(_event_hook(ws_cmd, policy_file))
     for name, groups in guard_hooks(policy, ws_cmd, policy_file).items():
         settings["hooks"][name] = groups
+    settings["hooks"]["Notification"] = [{"hooks": [alert_hook(ws_cmd)]}]
+    settings["hooks"].setdefault("Stop", [{"hooks": []}])[0]["hooks"].append(alert_hook(ws_cmd))
     return {FILE: json.dumps(settings, indent=2) + "\n"}
 
 

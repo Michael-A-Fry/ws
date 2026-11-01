@@ -27,17 +27,19 @@ def read(kind, env):
         raise SourceError(UNREADABLE, f"can't read pending approvals: {e.strerror or type(e).__name__}") from e
     out = []
     for ident, bound, left in rows:
+        cwd = _files.path(bound.cwd)
         out.append(
             Ask(
                 id=ident,
                 source=NAME,
                 kind="approval",
                 session_id=bound.session,
-                repo=_files.repo_label(bound.cwd),
+                repo=_files.repo_label(cwd),
                 title=_files.text(f"{bound.kind}: {bound.value}", 200),
                 decision=f"ws approve {ident[:12]}",
                 created=_files.iso(env.now + left - approvals.TTL),
-                opaque=records.under(bound.cwd, env.cfg.roots),
+                opaque=records.under(cwd, env.cfg.roots),
+                placed=records.open_path(cwd, env.cfg.roots),
                 answer_in="terminal",
             )
         )

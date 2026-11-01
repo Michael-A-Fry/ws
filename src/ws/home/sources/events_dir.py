@@ -31,7 +31,7 @@ def read(kind, env):
                 continue
             data = line.get("data") if isinstance(line.get("data"), dict) else {}
             repo = _files.text(data.get("repo"), 120)
-            cwd = _files.text(data.get("cwd"), 500)
+            cwd = _files.path(data.get("cwd"))
             out.append(
                 Event(
                     id=ident,
@@ -41,6 +41,7 @@ def read(kind, env):
                     session_id=_files.text(data.get("session_id"), 128),
                     summary=f"{_files.text(etype, 80)} in {repo}" if repo else _files.text(etype, 80),
                     opaque=records.under(cwd, env.cfg.roots) or records.label_matches(repo, env.cfg.roots),
+                    placed=records.open_path(cwd, env.cfg.roots),
                 )
             )
     return sorted(out, key=lambda e: e.ts)[-KEEP:]

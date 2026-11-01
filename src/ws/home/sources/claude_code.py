@@ -99,7 +99,7 @@ def read(kind, env):
         if not isinstance(sid, str) or not sid:
             continue
         extra = files.get(sid, {})
-        cwd = _files.text(agent.get("cwd") or extra.get("cwd"), 500)
+        cwd = _files.path(agent.get("cwd") or extra.get("cwd"))
         waiting = _waiting_text(agent.get("waitingFor"))
         state = "waiting" if waiting else _STATE.get(str(agent.get("status") or extra.get("status")).lower(), "unknown")
         name = _files.text(agent.get("name") or extra.get("name"), 80)
@@ -133,6 +133,7 @@ def read(kind, env):
                     title=waiting,
                     created=_files.iso(extra.get("statusUpdatedAt") or extra.get("updatedAt")),
                     opaque=records.under(cwd, env.cfg.roots),
+                    placed=records.open_path(cwd, env.cfg.roots),
                 )
             )
     return sessions if kind == "sessions" else asks

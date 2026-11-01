@@ -6,7 +6,9 @@ function of a record and the folders the person marked opaque. The envelope is `
 
 from __future__ import annotations
 
+import hashlib
 import os
+import re
 from dataclasses import dataclass, field, fields
 from typing import Any
 
@@ -30,9 +32,18 @@ def _plain(value: Any) -> Any:
     return value
 
 
+def _internal() -> Any:
+    """A field that stays inside ws: the API reads it, `to_dict` leaves it out."""
+    return field(default=False, metadata={"internal": True})
+
+
 class _Record:
     def to_dict(self) -> dict:
-        return {f.name: _plain(getattr(self, f.name)) for f in fields(self)}  # type: ignore[arg-type]
+        return {
+            f.name: _plain(getattr(self, f.name))
+            for f in fields(self)  # type: ignore[arg-type]
+            if not f.metadata.get("internal")
+        }
 
 
 @dataclass(frozen=True)
@@ -79,6 +90,7 @@ class Ask(_Record):
     answer_in: str = "terminal"  # one of ANSWER_IN
     opens: tuple = ()
     rc_url: str = ""
+    placed: bool = _internal()  # the source saw a folder for this ask and it isn't under an opaque path (not output)
 
 
 @dataclass(frozen=True)
@@ -119,6 +131,7 @@ class Event(_Record):
     session_id: str = ""
     summary: str = ""
     opaque: bool = False
+    placed: bool = _internal()  # as Ask.placed
 
 
 @dataclass(frozen=True)
@@ -158,6 +171,9 @@ KEEP: dict[type, tuple[str, ...]] = {
 }
 
 
+SAFE_ID = re.compile(r"[A-Za-z0-9._:-]{1,80}")
+
+
 def _norm(path: str) -> str:
     return os.path.normpath(os.path.abspath(os.path.expanduser(path)))
 
@@ -172,41 +188,104 @@ def roots_of(paths: list[str] | tuple[str, ...]) -> tuple[str, ...]:
     return tuple(out)
 
 
+def _inside(form: str, root: str) -> bool:
+    """`form` is `root` or in it, compared the way this file system compares names (os.path.normcase)."""
+    f, r = os.path.normcase(form), os.path.normcase(root)
+    return f == r or f.startswith(r.rstrip(os.sep) + os.sep)
+
+
+def _same(a: str, b: str) -> bool:
+    """True when `a` and `b` are the same folder on disk (a different spelling on a case-insensitive file system).
+    A name that isn't there is not the same; any other failure to look counts as the same (fail closed)."""
+    try:
+        return os.path.samefile(a, b)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except (OSError, ValueError):
+        return True
+
+
+def _beside_root(form: str, roots: tuple[str, ...]) -> bool:
+    """True when `form` or a folder above it is, on disk, one of the roots: ~/Code/fiu covers ~/code/fiu on macOS."""
+    cur = form
+    while True:
+        if os.path.lexists(cur) and any(_same(cur, r) for r in roots):
+            return True
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return False
+        cur = parent
+
+
 def under(path: str, roots: tuple[str, ...]) -> bool:
-    """True when `path` is one of `roots` or inside one. A path ws can't turn into an absolute one counts as under."""
+    """True when `path` is one of `roots` or inside one, by name or on disk. A path ws can't turn into an absolute one
+    (relative, or one the system refuses) counts as under. The empty path is not under anything: whether it is
+    *placed* is `open_path`'s question."""
     if not path:
         return False
     try:
-        forms = (_norm(path), os.path.realpath(os.path.expanduser(path)))
+        expanded = os.path.expanduser(path)
+        if not os.path.isabs(expanded):
+            return True
+        forms = (_norm(path), os.path.realpath(expanded))
+        if any(_inside(f, r) for f in forms for r in roots):
+            return True
+        return any(_beside_root(f, roots) for f in dict.fromkeys(forms))
     except (OSError, ValueError):
         return True
-    return any(f == r or f.startswith(r.rstrip(os.sep) + os.sep) for f in forms for r in roots)
+
+
+def open_path(path: str, roots: tuple[str, ...]) -> bool:
+    """True only when ws knows where something is and that place isn't opaque: a non-empty absolute path that isn't
+    under a root. Empty, relative, unreadable or under a root is False: only a known open place clears a record."""
+    return bool(path) and os.path.isabs(os.path.expanduser(path)) and not under(path, roots)
 
 
 def label_matches(label: str, roots: tuple[str, ...]) -> bool:
     """True when a repo label is the last folder name of an opaque root (a label has no folder to test)."""
-    return bool(label) and any(os.path.basename(r.rstrip(os.sep)) == label for r in roots)
+    if not label:
+        return False
+
+    def plain(name: str) -> str:
+        return " ".join(name.split()).casefold()
+
+    want = plain(label)
+    return any(plain(os.path.basename(r.rstrip(os.sep))) == want for r in roots)
 
 
-def is_opaque(rec: Session | Ask | Event, roots: tuple[str, ...], session_opaque: bool = False) -> bool:
-    """Fail closed: opaque when the source said so, the folder or repo is under an opaque root, the session it belongs
-    to is opaque, or ws can't tell where it belongs. `session_opaque` is the verdict on the record's session."""
-    if rec.opaque or session_opaque:
+def part_denied(rec: Session, roots: tuple[str, ...]) -> bool:
+    """One source's piece of a session says it is opaque: marked so, a folder that isn't open, or an opaque repo label.
+    A piece with no folder (tokens, cost) says nothing; the merged session still needs a known open folder."""
+    return rec.opaque or label_matches(rec.repo, roots) or (bool(rec.cwd) and not open_path(rec.cwd, roots))
+
+
+def is_opaque(rec: Session | Ask | Event, roots: tuple[str, ...], session: bool | None = None) -> bool:
+    """Fail closed: a record is open only when something known clears it. `session` is the verdict on the session the
+    record belongs to: True opaque, False a session in the snapshot that is open, None not in the snapshot (or none).
+    A session is open on a known open folder; an ask or event on an open session or a folder of its own."""
+    if rec.opaque or session:
         return True
     if isinstance(rec, Session):
-        return under(rec.cwd, roots) or label_matches(rec.repo, roots) or not (rec.cwd or rec.repo)
-    if isinstance(rec, Ask):
-        placed = rec.repo or rec.session_id
-        return under(rec.repo, roots) or label_matches(rec.repo, roots) or not placed
-    return not rec.session_id  # an event: it belongs to a session or it can't be placed
+        return part_denied(rec, roots) or not open_path(rec.cwd, roots)
+    if label_matches(getattr(rec, "repo", ""), roots):
+        return True
+    return not (session is False or rec.placed)
+
+
+def safe_id(ident: str) -> str:
+    """An id as it may leave on an opaque record: itself when it's short and plain, else a short sha256 prefix."""
+    if SAFE_ID.fullmatch(ident):
+        return ident
+    return hashlib.sha256(ident.encode("utf-8", "surrogatepass")).hexdigest()[:16]
 
 
 def seal(rec: Session | Ask | Event, opaque: bool) -> Session | Ask | Event:
-    """The record as it leaves the API: whole, or reduced to KEEP with `opaque` set."""
+    """The record as it leaves the API: whole, or reduced to KEEP with `opaque` set (and its id made safe)."""
     if not opaque:
         return rec
     keep = KEEP[type(rec)]
     shown = {name: getattr(rec, name) for name in keep}
+    shown["id"] = safe_id(shown["id"])
     if isinstance(rec, Session):
         shown["cost_basis"] = HIDDEN
     return type(rec)(**shown, opaque=True)  # type: ignore[arg-type]

@@ -12,7 +12,8 @@ A module must define:
 
 Modules are found by scanning this package, like ws.roles, so the registry is the directory. A module whose name starts
 with an underscore is a helper. The API calls `available` once, then `read` for each kind in PROVIDES; if anything
-raises, none of that source's records are used and it becomes one `sources[]` row with a typed reason. A source never
+raises, none of that source's records are used and it becomes one `sources[]` row with a typed reason; so does a
+module that won't import. A source never
 opens a file ending in `.key` and never reads a transcript beyond its `usage` fields; the helpers in `_files.py` are the
 only way the sources open a file.
 """
@@ -38,13 +39,24 @@ class SourceError(Exception):
         self.why = why
 
 
-def all_sources() -> list[ModuleType]:
-    """Every source module, in the order they read."""
-    found = []
+def discover() -> tuple[list[ModuleType], list[tuple[str, str]]]:
+    """Every source module, in the order they read, and the (name, why) of each one that wouldn't import. A module that
+    fails to import is one row for the snapshot (the why names only the error's type); it never stops the others."""
+    found: list[ModuleType] = []
+    broken: list[tuple[str, str]] = []
     for info in pkgutil.iter_modules(__path__):
         if info.name.startswith("_"):
             continue
-        mod = importlib.import_module(f"{__name__}.{info.name}")
+        try:
+            mod = importlib.import_module(f"{__name__}.{info.name}")
+        except Exception as e:  # noqa: BLE001 - a source that won't import is a row, not a crash
+            broken.append((info.name, f"{type(e).__name__} while loading"))
+            continue
         if all(hasattr(mod, a) for a in ("NAME", "PROVIDES", "ORDER", "available", "read")):
             found.append(mod)
-    return sorted(found, key=lambda m: (m.ORDER, m.NAME))
+    return sorted(found, key=lambda m: (m.ORDER, m.NAME)), broken
+
+
+def all_sources() -> list[ModuleType]:
+    """Every source module that imports, in the order they read."""
+    return discover()[0]

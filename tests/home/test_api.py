@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 from dataclasses import fields
@@ -9,10 +10,11 @@ from dataclasses import fields
 import pytest
 
 from home import NOW, SID, SID2, Box, agent, iso
-from ws import cli, output
+from ws import approvals, cli, output
+from ws.approvals import Bound
 from ws.home import api, records
 from ws.home.records import Ask, Event, Session
-from ws.home.sources import claude_code
+from ws.home.sources import _files, claude_code
 from ws.output import WsError
 
 
@@ -487,3 +489,237 @@ def test_an_event_with_no_session_or_under_an_opaque_path_is_opaque(box):
     got = {e.id: e for e in api.events(env=box.env([]))}
     assert got["a"].opaque and got["b"].opaque and not got["c"].opaque
     assert got["a"].summary == "" and got["a"].session_id == "" and got["c"].summary == "ty in r"
+
+
+# --- the opaque rule, fail closed (fix round 1) ----------------------------------------------------------------------
+
+FIU = "~/code/fiu"
+
+
+def fiu_profile(box, root: str = FIU) -> None:
+    box.profile(f'[home]\nopaque_paths = ["{root}"]\n')
+
+
+def timed_out(argv, timeout_s):
+    raise TimeoutError("claude agents timed out")
+
+
+def test_an_ask_whose_session_is_not_in_the_snapshot_is_opaque(box):
+    fiu_profile(box)  # claude agents timed out, so session S isn't known
+    box.lines(
+        box.usage / "asks" / "asks.jsonl",
+        [{"event": "added", "id": "q", "ts": iso(), "redacted": False, "session": {"session_id": SID},
+          "question": "SECRET Q"}],
+    )  # fmt: skip
+    (a,) = api.asks(box.env(run=timed_out))
+    assert a.opaque and a.title == "" and "SECRET" not in json.dumps(a.to_dict())
+
+
+def test_an_ask_with_a_repo_name_but_no_session_or_folder_is_opaque(box):
+    fiu_profile(box)
+    box.lines(
+        box.usage / "asks" / "asks.jsonl",
+        [{"event": "added", "id": "q", "ts": iso(), "redacted": False, "repo": "case-1", "question": "SECRET Q"}],
+    )
+    (a,) = api.asks(box.env([]))
+    assert a.opaque and a.title == ""
+
+
+def test_an_ask_on_a_known_open_folder_or_open_session_is_shown(box):
+    fiu_profile(box)
+    box.lines(
+        box.usage / "asks" / "asks.jsonl",
+        [
+            {"event": "added", "id": "a", "ts": iso(), "redacted": False, "repo": "/work/app", "question": "own folder"},
+            {"event": "added", "id": "b", "ts": iso(), "redacted": False, "session": {"session_id": SID},
+             "question": "own session"},
+        ],
+    )  # fmt: skip
+    got = {a.id: a for a in api.asks(box.env([agent(SID, "/work/app")]))}
+    assert not got["a"].opaque and got["a"].title == "own folder"
+    assert not got["b"].opaque and got["b"].title == "own session"
+
+
+def test_a_pending_approval_with_no_folder_and_an_unknown_session_is_opaque(box):
+    fiu_profile(box)
+    root = box.ws / "approvals"
+    approvals.require(root, Bound("claude-code", "command", "cat ~/code/fiu/case.csv", "", SID), NOW - 60)
+    approvals.require(root, Bound("claude-code", "command", "ls", "/work/app", SID2), NOW - 60)
+    asks = api.asks(box.env([]))
+    assert [a.opaque for a in asks].count(True) == 1
+    assert "fiu" not in json.dumps([a.to_dict() for a in asks if a.opaque])
+    (shown,) = [a for a in asks if not a.opaque]
+    assert shown.title == "command: ls"  # a folder ws knows, and that isn't opaque, clears an approval
+
+
+def test_an_event_with_an_unknown_session_and_no_folder_is_opaque(box):
+    fiu_profile(box)
+    box.lines(
+        box.usage / "events" / "2026-11-02.jsonl",
+        [
+            {"id": "e1", "time": iso(-5), "source": "s", "type": "ty", "data": {"session_id": SID, "repo": "case-1"}},
+            {"id": "e2", "time": iso(-6), "source": "s", "type": "ty", "data": {"session_id": SID, "cwd": "/work/app"}},
+        ],
+    )
+    got = {e.id: e for e in api.events(env=box.env([]))}
+    assert got["e1"].opaque and got["e1"].summary == "" and not got["e2"].opaque
+
+
+def test_a_session_with_no_folder_is_opaque_even_with_a_repo_name(box):
+    fiu_profile(box)
+    box.ws_session(SID, cwd="")
+    (s,) = api.sessions(box.env([]))
+    assert s.opaque and s.cwd == "" and s.cost_basis == "hidden"
+
+
+def test_a_relative_folder_cant_be_placed_and_is_opaque(box):
+    fiu_profile(box)
+    (s,) = api.sessions(box.env([agent(SID, "code/app")]))
+    assert s.opaque
+
+
+def test_one_sources_opaque_folder_survives_the_merge_in_either_order(box):
+    fiu_profile(box)
+    here = str(box.home / "code" / "fiu")
+    box.ws_session(SID, cwd=here)  # ws_sessions says S is in the opaque folder
+    (s,) = api.sessions(box.env([agent(SID, "/work/app")]))  # claude agents says it is at /work/app
+    assert s.opaque and s.cwd == "" and s.name == ""
+    open_first = Session(id=SID, source="a", runner="r", cwd="/work/app", name="n")
+    shut_second = Session(id=SID, source="b", runner="r", cwd=here)
+    for parts in ([open_first, shut_second], [shut_second, open_first]):
+        (m,) = api.merge_sessions(parts, records.roots_of([here]))
+        assert m.opaque
+
+
+def test_a_part_with_no_folder_does_not_hide_a_session_another_part_places(box):
+    fiu_profile(box)
+    box.transcript(SID, [{"message": {"id": "m", "usage": {"input_tokens": 5}}}])
+    (s,) = api.sessions(box.env([agent(SID, "/work/app")]))
+    assert not s.opaque and s.tokens["input"] == 5  # type: ignore[index]
+
+
+@pytest.mark.parametrize("gap", ["  ", "\t", "  "])
+def test_a_folder_with_runs_of_spaces_in_its_name_is_still_opaque(box, gap):
+    name = f"My{gap}Drive"
+    fiu_profile(box, f"~/{name}/fiu")
+    folder = str(box.home / name / "fiu" / "case-1")
+    box.ws_session(SID, cwd=folder)
+    box.lines(
+        box.ws / "logs" / "runs.jsonl",
+        [{"run_id": "r1", "job": "J", "runner": "claude-code", "cwd": folder, "started_at": iso(-600),
+          "ended_at": iso(-540), "status": "ok", "cost_usd": 1.0}],
+    )  # fmt: skip
+    box.lines(
+        box.usage / "asks" / "asks.jsonl",
+        [{"event": "added", "id": "q", "ts": iso(), "redacted": False, "repo": folder, "question": "SECRET Q"}],
+    )
+    box.lines(
+        box.usage / "events" / "2026-11-02.jsonl",
+        [{"id": "e", "time": iso(-5), "source": "s", "type": "ty", "data": {"session_id": SID2, "cwd": folder}}],
+    )
+    approvals.require(box.ws / "approvals", Bound("claude-code", "command", "SECRET C", folder, SID2), NOW - 60)
+    snap = api.snapshot(box.env([agent(SID2, folder, waitingFor="SECRET W")]))
+    assert snap.sessions and all(s.opaque for s in snap.sessions)
+    assert len(snap.asks) == 3 and all(a.opaque for a in snap.asks)  # the file, the approval, the waiting session
+    assert len(snap.events) == 1 and snap.events[0].opaque
+    assert "SECRET" not in json.dumps(snap.to_dict())
+
+
+def test_a_path_is_capped_but_never_normalised():
+    assert _files.path("/a  b\t/c ") == "/a  b\t/c "
+    assert _files.path(5) == "" and _files.path(None) == ""
+    got = _files.path("/" + "x" * 5000)
+    assert records.under(got, records.roots_of(["/work"])) and not records.open_path(got, ())
+
+
+@pytest.mark.parametrize("entry", ["code/private", "private", "./x", "  relative/dir  "])
+def test_a_relative_opaque_path_is_a_profile_error_naming_the_key(box, entry):
+    box.profile(f'[home]\nopaque_paths = ["/ok", "{entry}"]\n')
+    with pytest.raises(WsError) as e:
+        api.Env.make(box.environ, now=NOW)
+    assert e.value.kind == "bad_config" and "home.opaque_paths" in e.value.message and entry.strip() in e.value.message
+    assert e.value.hint
+
+
+def test_a_home_relative_opaque_path_is_accepted(box):
+    box.profile('[home]\nopaque_paths = ["~/code/fiu", "~"]\n')
+    assert api.Env.make(box.environ, now=NOW).cfg.opaque_paths == ("~/code/fiu", "~")
+
+
+def test_a_case_insensitive_file_system_matches_by_normcase(tmp_path, monkeypatch):
+    roots = records.roots_of([str(tmp_path / "code" / "fiu")])
+    other = str(tmp_path / "Code" / "FIU" / "case.csv")
+    assert not records.under(other, roots)  # a case-sensitive system keeps the two apart
+    monkeypatch.setattr(os.path, "normcase", str.lower)
+    assert records.under(other, roots) and not records.open_path(other, roots)
+    assert not records.under(str(tmp_path / "Code" / "FIU-too"), roots)
+
+
+def test_a_folder_that_is_the_same_on_disk_under_another_spelling_is_under(tmp_path, monkeypatch):
+    real = tmp_path / "code" / "fiu"
+    real.mkdir(parents=True)
+    roots = records.roots_of([str(real)])
+    spelled = tmp_path / "CODE" / "FIU"  # exists only as far as the file system folds case
+    deep = str(spelled / "a" / "b.csv")
+    assert not records.under(deep, roots)
+    # a case-insensitive file system answers for the folder above the file, so the check walks up to it
+    monkeypatch.setattr(os.path, "lexists", lambda p: str(p).lower() in (str(spelled).lower(), str(real).lower()))
+    monkeypatch.setattr(os.path, "samefile", lambda a, b: str(a).lower() == str(b).lower())
+    assert records.under(deep, roots)
+    assert not records.under(str(tmp_path / "CODE" / "other" / "x"), roots)
+
+
+def test_a_folder_ws_cant_look_at_counts_as_under(tmp_path, monkeypatch):
+    real = tmp_path / "fiu"
+    real.mkdir()
+    roots = records.roots_of([str(real)])
+
+    def refuse(a, b):
+        raise PermissionError("no")
+
+    monkeypatch.setattr(os.path, "samefile", refuse)
+    assert records.under(str(tmp_path / "elsewhere" / "x"), roots) is True  # can't compare: closed
+    assert records.under("/bad\0path", roots) is True
+
+
+def test_an_opaque_record_leaves_with_a_safe_short_id(box):
+    fiu_profile(box)
+    odd = "SECRET case: name/with spaces " + "x" * 200
+    box.lines(
+        box.usage / "asks" / "asks.jsonl",
+        [
+            {"event": "added", "id": odd, "ts": iso(), "redacted": True, "question": "SECRET Q"},
+            {"event": "added", "id": "plain-id_1:2.3", "ts": iso(), "redacted": True, "question": "SECRET Q"},
+        ],
+    )
+    got = {a.id for a in api.asks(box.env([]))}
+    assert "plain-id_1:2.3" in got and odd not in got
+    (hashed,) = got - {"plain-id_1:2.3"}
+    assert records.SAFE_ID.fullmatch(hashed) and hashed == records.safe_id(odd) and len(hashed) <= 16
+    assert records.safe_id("x" * 81) != "x" * 81 and records.safe_id("x" * 80) == "x" * 80
+    assert records.SAFE_ID.fullmatch(records.safe_id(""))
+    assert records.seal(Event(id=odd, ts="t", source="s", type="ty"), True).id == hashed
+    assert records.seal(Session(id=odd, source="s"), True).id == hashed
+    assert records.seal(Session(id=odd, source="s"), False).id == odd  # an open record keeps its id
+
+
+def test_the_internal_placed_flag_is_not_in_the_output():
+    assert "placed" not in Ask(id="a", source="s", kind="question", placed=True).to_dict()
+    assert "placed" not in Event(id="e", ts="t", source="s", type="ty", placed=True).to_dict()
+
+
+def test_a_source_that_wont_import_is_one_row_and_the_rest_still_read(box, monkeypatch):
+    real = importlib.import_module
+
+    def broken(name, *a, **k):
+        if name.endswith(".ws_runs"):
+            raise ImportError("a dependency that isn't here: /secret/path")
+        return real(name, *a, **k)
+
+    monkeypatch.setattr("ws.home.sources.importlib.import_module", broken)
+    snap = api.snapshot(box.env([agent()]))
+    row = by_name(snap)["ws_runs"]
+    assert (row.ok, row.kind, row.why) == (False, "failed", "ImportError while loading")
+    assert "secret" not in json.dumps(snap.to_dict()["sources"])
+    assert by_name(snap)["claude_code"].ok and len(snap.sessions) == 1
+    assert api.sessions(box.env([agent()]))  # the single reads survive it too

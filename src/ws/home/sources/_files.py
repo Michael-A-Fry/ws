@@ -18,6 +18,8 @@ from ws.home.sources import UNREADABLE, SourceError
 
 LINE_CAP = 1024 * 1024  # bytes of one JSON line that are looked at; a longer line is skipped
 FILE_CAP = 64 * 1024 * 1024  # bytes of one file that are read
+LABEL_CAP = 120  # characters of a repo label
+PATH_CAP = 4096  # characters of a folder path that are looked at; a longer one is hidden
 SMALL_CAP = 256 * 1024  # bytes of a one-record JSON file
 _DAY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -125,8 +127,17 @@ def epoch(text: str | None) -> float:
 
 
 def repo_label(cwd: str) -> str:
-    """The last folder of a path: the label shown for a repo."""
-    return os.path.basename(cwd.rstrip("/\\")) if cwd else ""
+    """The last folder of a path: the label shown for a repo. Cut at LABEL_CAP characters, not otherwise changed."""
+    return os.path.basename(cwd.rstrip("/\\"))[:LABEL_CAP] if cwd else ""
+
+
+def path(value) -> str:
+    """A folder path as the source gave it, byte for byte: whitespace is not collapsed and nothing is trimmed, so the
+    opaque rule tests the real name. A value that isn't text is empty. One longer than PATH_CAP is replaced by a name
+    no system accepts (it has a NUL), which the opaque rule can't place and so hides."""
+    if not isinstance(value, str):
+        return ""
+    return value if len(value) <= PATH_CAP else "\0path too long"
 
 
 def text(value, limit: int = 200) -> str:

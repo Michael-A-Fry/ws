@@ -21,7 +21,7 @@ from pathlib import Path
 from ws import jsonl
 from ws.home import records
 from ws.home.records import Ask, Event, Plugin, Session, Snapshot, SourceRow
-from ws.home.sources import FAILED, TIMEOUT, UNAVAILABLE, SourceError, _files, all_sources
+from ws.home.sources import FAILED, TIMEOUT, UNAVAILABLE, SourceError, _files, discover
 from ws.output import WsError
 from ws.profile import ProfileError, load, profile_path, ws_home
 
@@ -92,7 +92,14 @@ def load_config(environ: Mapping[str, str], home: Path) -> HomeConfig:
         raise _bad(path, "home.opaque_paths must be a list of folders", 'e.g. opaque_paths = ["~/code/private"]')
     sources = _strings(table.get("sources", {}), SOURCE_KEYS, "[home.sources]", path)
     opens = _strings(table.get("open", {}), OPEN_KEYS, "[home.open]", path)
-    expanded = tuple(_expand(p.strip(), home) for p in paths)
+    for p in paths:
+        if not os.path.isabs(_expand(p.strip(), home)):
+            raise _bad(
+                path,
+                f"home.opaque_paths entry {p!r} isn't an absolute folder",
+                'start it with / or ~/, e.g. opaque_paths = ["~/code/private"]',
+            )
+    expanded = tuple(dict.fromkeys(f for p in paths for f in (_expand(p.strip(), home), _expand(p, home))))
     return HomeConfig(
         lead=lead,
         opaque_paths=tuple(paths),
@@ -171,7 +178,9 @@ class Env:
     def sessions_so_far(self) -> list[Session]:
         """The sessions earlier sources gave, merged, each with its opaque verdict set. A source that must not open an
         opaque session's file asks here."""
-        return [replace(s, opaque=records.is_opaque(s, self.cfg.roots)) for s in merge_sessions(self.seen)]
+        return [
+            replace(s, opaque=records.is_opaque(s, self.cfg.roots)) for s in merge_sessions(self.seen, self.cfg.roots)
+        ]
 
 
 # --- merging --------------------------------------------------------------------------------------------------------
@@ -213,10 +222,13 @@ def _join(a: Session, b: Session) -> Session:
     )
 
 
-def merge_sessions(parts: list[Session]) -> list[Session]:
-    """One session per (runner, id): the parts from different sources joined. Order of first appearance."""
+def merge_sessions(parts: list[Session], roots: tuple[str, ...] = ()) -> list[Session]:
+    """One session per (runner, id): the parts from different sources joined. Order of first appearance. Each part is
+    judged on its own folder before the join, and `opaque` is carried by the join, so one source's opaque folder
+    can't be lost behind another source's open one."""
     merged: dict[tuple[str, str], Session] = {}
     for part in parts:
+        part = replace(part, opaque=records.part_denied(part, roots))
         key = (part.runner, part.id)
         merged[key] = _join(merged[key], part) if key in merged else part
     return list(merged.values())
@@ -252,7 +264,9 @@ class Loaded:
 def _load(env: Env, kinds: set[str]) -> Loaded:
     """Read every source that provides one of `kinds`. A source is used whole or not at all; a failure is a row."""
     out = Loaded({k: [] for k in kinds}, [], set(), set())
-    for mod in all_sources():
+    mods, broken = discover()
+    out.rows.extend(SourceRow(name, False, FAILED, why) for name, why in broken)
+    for mod in mods:
         wanted = [k for k in mod.PROVIDES if k in kinds]
         if not wanted:
             continue
@@ -283,8 +297,9 @@ def _load(env: Env, kinds: set[str]) -> Loaded:
 
 
 def _finish_sessions(env: Env, loaded: Loaded) -> tuple[list[Session], dict[str, bool]]:
-    """The merged sessions, sealed. Also the opaque verdict by session id, which asks and events use."""
-    merged = merge_sessions(loaded.by_kind.get("sessions", []))
+    """The merged sessions, sealed. Also the opaque verdict by session id (True opaque, False open); a session id not
+    here is unknown, and asks and events that name one are opaque."""
+    merged = merge_sessions(loaded.by_kind.get("sessions", []), env.cfg.roots)
     lead = _lead_key(merged, env.cfg.lead, env.home)
     out: list[Session] = []
     verdict: dict[str, bool] = {}
@@ -301,19 +316,22 @@ def _finish_sessions(env: Env, loaded: Loaded) -> tuple[list[Session], dict[str,
     return out, verdict
 
 
+def _known(verdict: dict[str, bool], session_id: str) -> bool | None:
+    """The verdict on a session id; None when the id is empty or no session in the snapshot has it."""
+    return verdict.get(session_id) if session_id else None
+
+
 def _finish_asks(env: Env, loaded: Loaded, verdict: dict[str, bool]) -> list[Ask]:
     seen: dict[tuple[str, str], Ask] = {}
     for a in loaded.by_kind.get("asks", []):
         seen.setdefault((a.source, a.id), a)
-    out = [
-        records.seal(a, records.is_opaque(a, env.cfg.roots, verdict.get(a.session_id, False))) for a in seen.values()
-    ]
+    out = [records.seal(a, records.is_opaque(a, env.cfg.roots, _known(verdict, a.session_id))) for a in seen.values()]
     return sorted(out, key=lambda a: (a.created is None, a.created or ""))
 
 
 def _finish_events(env: Env, loaded: Loaded, verdict: dict[str, bool]) -> list[Event]:
     out = [
-        records.seal(e, records.is_opaque(e, env.cfg.roots, verdict.get(e.session_id, False)))
+        records.seal(e, records.is_opaque(e, env.cfg.roots, _known(verdict, e.session_id)))
         for e in loaded.by_kind.get("events", [])
         if (_files.epoch(e.ts) >= env.event_since)
     ]

@@ -22,7 +22,7 @@ def read(kind, env):
         # a guard's own record for a session has no `release`; only the session record does
         if not rec or not isinstance(rec.get("session_id"), str) or not isinstance(rec.get("release"), str):
             continue
-        cwd = _files.text(rec.get("cwd"), 500)
+        cwd = _files.path(rec.get("cwd"))
         out.append(
             Session(
                 id=rec["session_id"],

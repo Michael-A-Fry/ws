@@ -45,7 +45,7 @@ def read(kind, env):
             continue
         cost = rec.get("cost_usd")
         has_cost = isinstance(cost, (int, float)) and not isinstance(cost, bool) and math.isfinite(cost) and cost >= 0
-        cwd = _files.text(rec.get("cwd"), 500)
+        cwd = _files.path(rec.get("cwd"))
         basis = rec.get("cost_basis") if isinstance(rec.get("cost_basis"), str) and rec["cost_basis"] else "reported"
         out.append(
             Session(

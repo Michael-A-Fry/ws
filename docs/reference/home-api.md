@@ -74,8 +74,8 @@ folder's `__init__.py`.
 A source is used whole or not at all. If it can't be read (a missing program, a timeout, text that isn't JSON, a file
 that won't open, a bug), none of its records are used and it becomes one row in `sources[]`. `kind` says why:
 `unavailable` (there's nothing to read here), `unreadable`, `bad_format`, `timeout` or `failed`; `why` is one plain
-sentence with no file contents. `ok` rows have `kind` `ok` and `n`, the number of records. A line or file that isn't a
-JSON object isn't a record and is skipped.
+sentence with no file contents. A source module that won't import is a `failed` row too. `ok` rows have `kind` `ok` and
+`n`, the number of records. A line or file that isn't a JSON object isn't a record and is skipped.
 
 Three rules hold for every source:
 
@@ -86,14 +86,21 @@ Three rules hold for every source:
 
 ## The opaque rule
 
-Some records must be opened in their own app to be seen. A record is **opaque** when any of these holds:
+Some records must be opened in their own app to be seen. The rule fails closed: a record is shown only when something
+known clears it, and every doubt hides it. A record is **opaque** when any of these holds:
 
 - its source says it's redacted (an ask line that doesn't say `redacted: false` counts as redacted);
 - its folder, or its repo, is under one of `[home] opaque_paths`, or its repo label is the last folder name of one;
-- the session it belongs to is opaque (a session is opaque if any source that knows it says so, so a merge can't show
-  what one source hides);
-- ws can't tell where it belongs: no folder and no repo for a session, no repo and no session for an ask, no session
-  for an event.
+- the session it belongs to is opaque, or isn't in the snapshot (a session is opaque if any source that knows it says
+  so, judged piece by piece before the merge, so one source's opaque folder can't be lost behind another's open one);
+- ws can't tell where it belongs. Only a known place that isn't opaque clears a record: a session needs a folder, and an
+  ask or event needs a folder of its own or a session in the snapshot that's open. An empty, relative or unreadable
+  path, or a bare session id for a session ws doesn't know, isn't a place.
+
+Folders are compared as written: runs of spaces in a name aren't collapsed, and a path is cut off, never tidied, at 4096
+characters (a longer one counts as opaque). A name is compared the way the file system compares names, and on a
+case-insensitive file system a folder that's the same one on disk under another spelling (`~/Code/fiu` for
+`~/code/fiu`) is covered too.
 
 The rule runs last, after merging, and an opaque record keeps only these fields:
 
@@ -103,8 +110,9 @@ The rule runs last, after merging, and an opaque record keeps only these fields:
 | Ask | `id`, `source`, `kind`, `repo`, `tmux`, `created`, and `opaque` set |
 | Event | `id`, `source`, `type`, `ts`, and `opaque` set |
 
-Every other field is back at its empty default: no name, folder, title, tokens or cost. An opaque session is never
-the lead.
+Every other field is back at its empty default: no name, folder, title, tokens or cost. An opaque record's `id` is kept
+only when it's up to 80 characters of letters, digits and `. _ : -`; any other id is replaced by a short sha256 prefix.
+An opaque session is never the lead.
 
 ## Sessions from several sources
 
@@ -119,7 +127,7 @@ ws reads and checks these keys. An unknown key is an error that names it, and ws
 ```toml
 [home]
 lead = "cwd:~/code"             # or "name:Home*": the session the home pins at the top
-opaque_paths = ["~/code/private"]
+opaque_paths = ["~/code/private"]  # absolute folders (or ~/...); a relative one is an error
 
 [home.sources]                  # where a source reads; the defaults are under your home folder
 asks_jsonl = "~/.claude-usage/asks/asks.jsonl"

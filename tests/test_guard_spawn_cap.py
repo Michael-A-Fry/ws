@@ -27,10 +27,34 @@ class Clock:
         return self.t
 
 
+def _ctx(event, home, clock, session, payload):
+    return Context("claude-code", event, session, str(home), payload, clock, home / "wshome")
+
+
+def pre(cfg, home, clock, session="s1", background=True):
+    """The check before an Agent call; it only reads the count."""
+    payload = {
+        "tool_name": "Agent",
+        "tool_input": {"subagent_type": "worker", "prompt": "go", "run_in_background": background},
+    }
+    return sc.judge(claude_code.parse(payload), cfg, _ctx("pre", home, clock, session, payload))
+
+
+def post(cfg, home, clock, session="s1", background=True):
+    """The hook after an Agent call that went through."""
+    payload = {
+        "tool_name": "Agent",
+        "tool_input": {"subagent_type": "worker", "prompt": "go", "run_in_background": background},
+    }
+    return sc.judge(claude_code.parse(payload), cfg, _ctx("post", home, clock, session, payload))
+
+
 def start(cfg, home, clock, session="s1"):
-    payload = {"tool_name": "Agent", "tool_input": {"subagent_type": "worker", "prompt": "go"}}
-    ctx = Context("claude-code", "pre", session, str(home), payload, clock, home / "wshome")
-    return sc.judge(claude_code.parse(payload), cfg, ctx)
+    """An Agent call as the runner makes it: the check, and when that lets it through, the hook after it."""
+    found = pre(cfg, home, clock, session)
+    if found is None:
+        post(cfg, home, clock, session)
+    return found
 
 
 def stop(cfg, home, clock, session="s1"):
@@ -42,9 +66,47 @@ def cfg_of(**table):
     return sc.config(table, "[guards.spawn-cap]")
 
 
-def test_it_runs_before_an_agent_starts_and_when_one_stops():
+def test_it_runs_before_and_after_an_agent_starts_and_when_one_stops():
     mod = guards.get("spawn-cap")
-    assert (mod.EVENTS, mod.KINDS) == (("pre", "subagent-stop"), ("agent",))
+    assert (mod.EVENTS, mod.KINDS) == (("pre", "post", "subagent-stop"), ("agent",))
+
+
+def test_the_check_before_a_call_uses_no_slot(home):
+    cfg, clock = cfg_of(max_agents=1), Clock()
+    for _ in range(5):  # calls that were declined, or denied by another guard, never reach the hook after them
+        assert pre(cfg, home, clock) is None
+    assert start(cfg, home, clock) is None
+    assert pre(cfg, home, clock).action == "deny"
+
+
+def test_a_denied_or_declined_agent_call_leaves_no_slot_used(home):
+    cfg, clock = cfg_of(max_agents=1), Clock()
+    assert start(cfg, home, clock) is None
+    assert pre(cfg, home, clock).action == "deny"  # denied: no hook after it
+    assert stop(cfg, home, clock) is None
+    assert pre(cfg, home, clock) is None  # a person declines this one: no hook after it
+    assert pre(cfg, home, clock) is None  # so the slot is still free
+    assert start(cfg, home, clock) is None
+
+
+def test_the_hook_after_a_call_records_the_start(home):
+    cfg, clock = cfg_of(max_agents=2), Clock()
+    post(cfg, home, clock)
+    post(cfg, home, clock)
+    assert pre(cfg, home, clock).action == "deny"
+    record = json.loads((home / "wshome" / "sessions" / "s1.spawn-cap.json").read_text())
+    assert record["running"] == [1000.0, 1000.0]
+
+
+def test_a_foreground_agent_has_stopped_before_its_call_returns_so_it_is_not_counted(home):
+    cfg, clock = cfg_of(max_agents=1), Clock()
+    post(cfg, home, clock, background=False)
+    assert pre(cfg, home, clock) is None
+
+
+def test_the_hook_after_a_call_with_no_limit_set_records_nothing(home):
+    post(cfg_of(), home, Clock())
+    assert not (home / "wshome" / "sessions" / "s1.spawn-cap.json").exists()
 
 
 def test_it_denies_at_the_limit_and_says_how_to_see_what_is_running(home):
@@ -144,11 +206,13 @@ def test_the_policy_loads_the_table_and_the_gate_denies_the_fifth_agent(home):
             "tool_name": "Agent",
             "session_id": "s9",
             "cwd": str(home),
-            "tool_input": {"subagent_type": "w", "prompt": "p"},
+            "tool_input": {"subagent_type": "w", "prompt": "p", "run_in_background": True},
         }
     )
+    post_raw = json.dumps({**json.loads(raw), "hook_event_name": "PostToolUse"})
     for _ in range(4):
         assert gate.check("claude-code", raw, pol, home=home / "wshome") is None
+        gate.event("claude-code", post_raw, pol, home=home / "wshome")
     assert gate.check("claude-code", raw, pol, home=home / "wshome").startswith(
         "spawn-cap: 4 agents are already running"
     )
@@ -159,8 +223,18 @@ def test_a_subagent_stop_hook_runs_for_the_guard(home):
     files = claude_code.generate(pol, ["ws"], home / "out", home / "p.toml")
     hooks = json.loads(files["settings.json"])["hooks"]
     assert "SubagentStop" in hooks and "Agent|Task" in hooks["PreToolUse"][0]["matcher"]
-    start_raw = json.dumps({"tool_name": "Agent", "session_id": "s", "cwd": str(home), "tool_input": {"prompt": "p"}})
+    assert "Agent|Task" in hooks["PostToolUse"][0]["matcher"]
+    start_raw = json.dumps(
+        {
+            "tool_name": "Agent",
+            "session_id": "s",
+            "cwd": str(home),
+            "tool_input": {"prompt": "p", "run_in_background": True},
+        }
+    )
+    post_raw = json.dumps({**json.loads(start_raw), "hook_event_name": "PostToolUse"})
     assert gate.check("claude-code", start_raw, pol, home=home / "wshome") is None
+    gate.event("claude-code", post_raw, pol, home=home / "wshome")
     assert gate.check("claude-code", start_raw, pol, home=home / "wshome")
     code, _, _ = gate.event(
         "claude-code",

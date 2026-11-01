@@ -30,13 +30,21 @@ name, and a key in a guard's table that guard doesn't read.
 | `bulk-staging` | before a call | shell commands | Stops `git add -A`, `--all` (and a prefix such as `--al`), `.`, `./`, `*`, `:/` and `:(top)`, the same with `git stage`, and `git commit -a`, `-am` and `--all`, with or without git's global options. Stops `git -c alias.NAME=...`, which can define a command that stages everything. `git add file` and `git add -- file` go through. Text in quotes, comments and here-document bodies is data, so `git commit -m "git add -A"` goes through; the text after `eval` and in `bash -c` is a command and is read. The runner's own deny rules carry the plain spellings too. |
 | `syntax-check` | after a call | file writes | Checks the file the session wrote and tells the model the line that doesn't parse. Python, JSON and TOML are read in process. `.sh` and `.bash` go through `sh -n` or `bash -n`, with a note when the machine has no shell. |
 | `session-context` | at session start | none | Lists, one line each, which of `files` exist in the project: the git top level above the session's folder, and the main worktree when the session runs in a linked one. |
-| `test-weakening` | before a call | file writes | Applies the edit to the test file on disk and compares before and after. Denies a skip or expected-failure marker added to a test that already exists. Warns about a test removed, fewer assertion lines, or an always-true assertion added. |
-| `claims` | before a message, and when the session stops | messages to other agents | Checks each commit-like token that sits in the same sentence as a claim word (`merged`, `pushed`, `on main`) against a ref, and denies the message when the commit isn't on it. On stop, logs the claims in the runner's last message. |
-| `spawn-cap` | before a call, and when a subagent stops | subagent starts | Denies a subagent start when `max_agents` are already running in the session. |
-| `skill-gate` | before a call, and when a prompt is sent | file writes and skill calls | Denies a write to a guarded path until the named skill has run in the session. The person can approve the write once. |
+| `test-weakening` | before a call | file writes | Applies the edit to the test file on disk and compares before and after. Denies a skip or expected-failure marker added to a test that already exists; the person can approve it once. Warns about a test removed, fewer assertion lines, or an always-true assertion added. Judges Edit, Write and MultiEdit calls only. |
+| `claims` | before a message, and when the session stops | messages to other agents | Checks each commit-like token that sits in the same sentence as a claim word (`on main`, `merged into main`, `merged to main`, `pushed to main`) against a ref, and denies the message when the commit isn't on it. On stop, logs the claims in the runner's last message. |
+| `spawn-cap` | before a call, and when a subagent stops | subagent starts | Denies a subagent start when `max_agents` are already running in the session. Counts agents started in the background. |
+| `skill-gate` | before a call, and when a prompt is sent | file writes and skill calls | Denies a write to a guarded path until the named skill has run in the session. The person can approve the write once. Judges Edit, Write and MultiEdit calls only. |
 | `record-calls` | before a call | every kind | Appends `{at, runner, payload}` to `$WS_HOME/logs/gate-calls.jsonl`, one line for each hook run. A file write keeps its path and records the text as `{"bytes", "sha256"}`. `ws gate replay` reads that file. |
 
 `bulk-staging` and `record-calls` take no table. The four guards below take one.
+
+`test-weakening` and `skill-gate` judge Edit, Write and MultiEdit calls. A change made through the shell, such as
+`sed -i` or a redirect, or through a notebook edit, isn't seen by them. The sandbox is what stops a write; these guards
+tell the model what it's about to break.
+
+The per-session records under `$WS_HOME/sessions` (`skill-gate`'s record of skills run, `spawn-cap`'s count) are
+advice-level. A session that can write that folder can change them, so they keep an honest session honest and don't stop
+a hostile one. The sandbox is the wall.
 
 `syntax-check` takes `extra`, a table of lower-case extension to checker command. ws adds the file path as the last
 argument and gives the checker 10 seconds. An exit code other than 0 is a finding that quotes the checker's first lines.
@@ -69,8 +77,9 @@ The guard builds the file's text after the write (Edit, Write and MultiEdit; not
 line. A test is a `def test...` with its decorators, an `it(` or `test(` with a title, `test_that("...")`, a Go
 `func TestX(`, a Rust `fn test_x(` or a Java method after `@Test`. Skip markers are counted for each test, so a new test
 or a new file can carry one. A marker added to a class, or to the file as a whole, in a file that already had tests is
-also a deny. A write it can't apply, such as a file that doesn't exist yet or an edit whose old text isn't in the file,
-isn't judged.
+also a deny. A plain `describe(` block isn't a marker; `xdescribe(` and `describe.skip` are. The deny is approvable: the
+reason names `ws approve`, and the person can allow the edit once. A write it can't apply, such as a file that
+doesn't exist yet or an edit whose old text isn't in the file, isn't judged.
 
 `ws gate replay` judges a line only when the line holds the text of the edit. A line from `record-calls` keeps a
 fingerprint of that text instead, so write the payload by hand to replay this guard.
@@ -79,16 +88,21 @@ fingerprint of that text instead, so write the payload by hand to replay this gu
 
 ```toml
 [guards.claims]
-words = ["merged", "pushed", "on main"]   # optional
+words = ["on main", "merged into main", "merged to main", "pushed to main"]   # optional
 ref = "origin/main"                        # optional
 ```
 
-A claim is a word from `words` (whole words, any case) in the same sentence as a commit-like token: 7 to 40 lower-case
-hex characters with at least one digit and one of `a` to `f`. The guard runs `git merge-base --is-ancestor TOKEN REF` in
-the session's folder. A commit that isn't an ancestor of `ref`, or isn't in the repository, denies the message and the
-reason names it. A claim word in quotes or backticks isn't a claim, and neither is one with a negation or a future form
-in the four words before it (`not merged`, `will be pushed`, `once it's merged`). A folder that isn't a repository, a
-machine with no git and a `ref` that doesn't exist there each let the message through with a note.
+A claim is a phrase from `words` (whole words, any case) in the same sentence as a commit-like token: 7 to 40
+lower-case hex characters with at least one digit and one of `a` to `f`. A commit may sit inside the phrase, as in
+`merged abc1234 into main`. The default phrases are about `main` only, because the check is against one ref. The guard
+runs `git merge-base --is-ancestor TOKEN REF` in the session's folder. A commit that isn't an ancestor of `ref`, or
+isn't in the repository, denies the message and the reason names it. If `ref` may be out of date, the reason says to run
+`git fetch` first; the guard never fetches. A claim word in quotes or backticks isn't a claim, and neither is one with a
+negation or a future form in the four words before it (`not merged`, `will be pushed`, `once it's merged`). A sentence
+that names another branch, such as `origin/work` or `pushed to work`, isn't checked either. A folder that isn't a
+repository, a machine with no git, a `ref` that doesn't exist there and git taking more than 8 seconds in total for one
+message each let the message through with a note. Git runs with `GIT_NO_LAZY_FETCH=1`, so a check never goes to the
+network.
 
 When the session stops, the claims in the runner's last message (the stop payload's `last_assistant_message`, when the
 runner sends one) are appended to `$WS_HOME/logs/claims.jsonl` with whether each commit was on `ref`.
@@ -101,9 +115,12 @@ max_agents = 4      # required, 1 or more
 stale_s = 1800      # optional: seconds before an unfinished start stops counting
 ```
 
-The guard counts the subagents this session has started and not seen stop. At `max_agents` it denies the start and the
-reason says how many are running. The count is an estimate: a stop clears the oldest start, because the stop payload
-doesn't say which agent it was, and a start older than `stale_s` drops out. The record is
+The guard counts the subagents this session has started and not seen stop. Before the call it only reads the count;
+at `max_agents` it denies the start and the reason says how many are running. The start is recorded after the call, in
+the `PostToolUse` hook, so a call that was denied or that you declined uses no slot. Only an agent started with
+`run_in_background` is recorded: a foreground agent has already stopped when its call returns. The count is an
+estimate: agents started together in one message are all checked before any is recorded, a stop clears the oldest start
+because the stop payload doesn't say which agent it was, and a start older than `stale_s` drops out. The record is
 `$WS_HOME/sessions/<session id>.spawn-cap.json`. With the guard on and no `max_agents`, every start is denied and the
 reason says the key is missing.
 
@@ -132,7 +149,7 @@ A guard returns nothing, or a finding with an action:
 
 A `deny` marked approvable can be overridden once by you with `ws approve ID` in a terminal of your own, the same way
 `ask_commands` works: the approval is bound to the runner, the call, the folder and the session. See
-[Approve a command](../how-to/approve-a-command.md). `skill-gate` is the guard that ships with an approvable deny; the others stop the call outright.
+[Approve a command](../how-to/approve-a-command.md). `skill-gate` and `test-weakening` ship with an approvable deny; the others stop the call outright.
 
 The first `deny` in the order of `on` wins. A reason is shown as `guard-name: reason`.
 

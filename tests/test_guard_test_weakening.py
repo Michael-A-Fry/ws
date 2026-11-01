@@ -50,7 +50,8 @@ def test_it_is_a_guard_for_writes_before_a_call():
 
 def test_a_skip_marker_added_to_an_existing_test_is_denied(repo):
     f = edit(repo, "def test_a():", "@pytest.mark.skip\ndef test_a():")
-    assert f.action == "deny" and not f.approvable and "test_a" in f.reason
+    assert f.action == "deny" and f.approvable and "test_a" in f.reason
+    assert "`ws approve`" in f.reason
 
 
 @pytest.mark.parametrize(
@@ -253,6 +254,14 @@ def test_javascript_tests_are_read_by_title(tmp_path):
     assert tw.compare(before, before + "expect(true).toBe(true)\n", False)[1]
 
 
+def test_a_plain_describe_block_is_allowed_and_xdescribe_is_not(tmp_path):
+    before = "it('adds', () => {\n  expect(1+1).toBe(2)\n})\n"
+    plain = before + "\ndescribe('maths', () => {\n  it('subtracts', () => {\n    expect(2-1).toBe(1)\n  })\n})\n"
+    assert tw.compare(before, plain, False) == ([], [])
+    assert tw.compare(before, plain.replace("describe(", "xdescribe("), False)[0]
+    assert tw.compare(before, plain.replace("describe(", "describe.skip("), False)[0]
+
+
 def test_r_go_and_rust_tests(tmp_path):
     r = 'test_that("adds", {\n  expect_equal(1 + 1, 2)\n})\n'
     assert tw.compare(r, r.replace("{\n", "{\n  skip_on_cran()\n", 1), False)[0]
@@ -292,7 +301,7 @@ def test_the_gate_denies_the_edit_and_names_the_guard(repo):
     assert gate.check("claude-code", json.dumps(payload), _policy()) is None
 
 
-def test_replay_of_an_edit_that_adds_a_skip_marker_is_a_deny(repo, tmp_path, monkeypatch, capsys):
+def test_replay_of_an_edit_that_adds_a_skip_marker_is_an_ask(repo, tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("WS_HOME", str(tmp_path / "wshome"))
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     pol_file = tmp_path / "policy.toml"
@@ -308,9 +317,9 @@ def test_replay_of_an_edit_that_adds_a_skip_marker_is_a_deny(repo, tmp_path, mon
                 "new_string": "@pytest.mark.skip\ndef test_a():",
             },
         },
-        "expect": "deny",
+        "expect": "ask",
     }
     log = tmp_path / "calls.jsonl"
     log.write_text(json.dumps(line) + "\n")
     assert cli.main(["gate", "replay", str(log), "--runner", "claude-code", "--policy", str(pol_file)]) == 0
-    assert "deny" in capsys.readouterr().out
+    assert "ask" in capsys.readouterr().out

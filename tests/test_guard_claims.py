@@ -74,19 +74,29 @@ def judge(text, cwd, cfg=None):
 @pytest.mark.parametrize(
     "text, expect",
     [
-        ("merged abc1234", [("merged", "abc1234")]),
-        ("Merged abc1234.", [("Merged", "abc1234")]),
+        ("merged into main abc1234", [("merged into main", "abc1234")]),
+        ("Merged abc1234 into main.", [("Merged into main", "abc1234")]),  # a commit may sit inside the phrase
         ("abc1234 is on main", [("on main", "abc1234")]),
-        ("pushed 0123abcdef0123abcdef0123abcdef0123abcdef", [("pushed", "0123abcdef0123abcdef0123abcdef0123abcdef")]),
-        ("they merged abc1234 and def5678", [("merged", "abc1234"), ("merged", "def5678")]),
-        ("merged abc1234 and again abc1234", [("merged", "abc1234")]),
-        ("It was pushed. See abc1234 for the diff.", []),  # two sentences
-        ("merged abc123", []),  # six characters
-        ("merged 1234567 rows", []),  # no hex letter
-        ("merged deadbeef", []),  # no digit
-        ("merged ABC1234", []),  # git prints lower case
-        ("the pushed-branch abc1234", []),  # not the word
-        ("unmerged abc1234", []),
+        ("abc1234 on main", [("on main", "abc1234")]),  # the claim ends the sentence: not "quoted" by nothing
+        ("merged to main: abc1234", [("merged to main", "abc1234")]),
+        (
+            "pushed to main 0123abcdef0123abcdef0123abcdef0123abcdef",
+            [("pushed to main", "0123abcdef0123abcdef0123abcdef0123abcdef")],
+        ),
+        (
+            "they merged into main abc1234 and def5678",
+            [("merged into main", "abc1234"), ("merged into main", "def5678")],
+        ),
+        ("merged into main abc1234 and again abc1234", [("merged into main", "abc1234")]),
+        ("It was pushed to main. See abc1234 for the diff.", []),  # two sentences
+        ("merged into main abc123", []),  # six characters
+        ("merged into main 1234567 rows", []),  # no hex letter
+        ("merged into main deadbeef", []),  # no digit
+        ("merged into main ABC1234", []),  # git prints lower case
+        ("the pushed-branch abc1234 on main-street", []),  # not the words
+        ("unmerged into main abc1234", []),
+        ("merged abc1234", []),  # merged where? only main is checked
+        ("pushed abc1234", []),
     ],
 )
 def test_what_counts_as_a_claim(text, expect):
@@ -96,31 +106,52 @@ def test_what_counts_as_a_claim(text, expect):
 @pytest.mark.parametrize(
     "text",
     [
-        "the word `merged` abc1234",
-        'the word "merged" abc1234',
-        "the word 'merged' abc1234",
-        "I have not merged abc1234",
+        "the words `merged into main` abc1234",
+        'the words "merged into main" abc1234',
+        "the words 'pushed to main' abc1234",
+        "I have not merged into main abc1234",
         "abc1234 is not on main",
-        "it isn't pushed abc1234",
-        "never merged abc1234",
-        "it will be merged: abc1234",
+        "it isn't pushed to main abc1234",
+        "never merged into main abc1234",
+        "it will be merged into main: abc1234",
         "it'll be on main abc1234",
-        "once it's merged abc1234",
-        "to be pushed abc1234",
-        "not yet really merged abc1234",
+        "once it's merged into main abc1234",
+        "to be pushed to main abc1234",
+        "not yet really merged into main abc1234",
     ],
 )
 def test_quotes_negation_and_the_future_are_not_claims(text):
     assert cl.find_claims(text, W) == []
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "abc1234 is on main and pushed to origin/work",
+        "merged abc1234 into main, then pushed to origin/feature-x",
+        "abc1234 is on origin/work and on main",
+        "pushed abc1234 to work, so it is on main soon",
+        "merged abc1234 into release/1.2 and then on main",
+    ],
+)
+def test_a_sentence_that_names_another_branch_is_not_a_claim(text):
+    assert cl.find_claims(text, W) == []
+
+
+def test_naming_main_or_the_ref_itself_is_still_a_claim():
+    assert cl.find_claims("merged abc1234 into main from origin/main", W)
+    assert cl.find_claims("abc1234 is on main", W, "origin/work")
+    assert cl.find_claims("landed abc1234 on origin/work", ("landed",), "origin/work")
+    assert cl.find_claims("merged abc1234 into main", W, "origin/work")
+
+
 def test_a_negation_more_than_four_words_back_does_not_cancel_the_claim():
-    assert cl.find_claims("no problem at all, and then one two three four merged abc1234", W)
+    assert cl.find_claims("no problem at all, and then one two three four merged into main abc1234", W)
 
 
 def test_custom_words_replace_the_defaults():
     assert cl.find_claims("landed abc1234", ("landed",)) == [("landed", "abc1234")]
-    assert cl.find_claims("merged abc1234", ("landed",)) == []
+    assert cl.find_claims("merged into main abc1234", ("landed",)) == []
 
 
 @pytest.mark.parametrize(
@@ -146,22 +177,22 @@ def test_a_bad_table_names_the_key(table, key):
 @needs_git
 def test_a_commit_not_on_the_ref_is_denied_and_one_on_it_is_allowed(repo):
     d, on, off = repo
-    denied = judge(f"merged {off}", d)
+    denied = judge(f"merged {off} into main", d)
     assert denied.action == "deny" and off in denied.reason and "origin/main" in denied.reason and not denied.approvable
-    assert judge(f"merged {on}", d) is None
-    assert judge(f"all done. I merged {on}, then pushed {on}.", d) is None
+    assert judge(f"merged {on} into main", d) is None
+    assert judge(f"all done. I merged {on} into main, then pushed {on} to main.", d) is None
 
 
 @needs_git
 def test_one_wrong_commit_among_right_ones_is_denied(repo):
     d, on, off = repo
-    assert judge(f"merged {on} and {off}", d).action == "deny"
+    assert judge(f"merged into main: {on} and {off}", d).action == "deny"
 
 
 @needs_git
 def test_a_commit_this_repository_doesnt_have_is_denied(repo):
     d, _, _ = repo
-    assert judge("merged abc1234", d).action == "deny"
+    assert judge("merged abc1234 into main", d).action == "deny"
 
 
 @needs_git
@@ -176,24 +207,82 @@ def test_a_message_with_no_claim_is_allowed_without_asking_git(repo, monkeypatch
 def test_the_ref_is_the_one_the_policy_names(repo):
     d, on, off = repo
     git(d, "update-ref", "refs/remotes/origin/work", "HEAD")
-    assert judge(f"merged {off}", d, cl.config({"ref": "origin/work"}, "w")) is None
-    assert judge(f"merged {on}", d, cl.config({"ref": "origin/nope"}, "w")).action == "note"
+    assert judge(f"merged {off} into main", d, cl.config({"ref": "origin/work"}, "w")) is None
+    assert judge(f"merged {on} into main", d, cl.config({"ref": "origin/nope"}, "w")).action == "note"
 
 
 @needs_git
 def test_a_folder_that_is_not_a_repository_is_a_note(home):
     d = home / "plain"
     d.mkdir()
-    f = judge("merged abc1234", d)
+    f = judge("merged abc1234 into main", d)
     assert f.action == "note" and "isn't a git repository" in f.reason
 
 
+@needs_git
+def test_the_deny_reason_says_to_fetch_when_the_ref_may_be_stale(repo):
+    d, _, off = repo
+    reason = judge(f"merged {off} into main", d).reason
+    assert "origin/main may be out of date" in reason and "`git fetch`" in reason
+
+
+@needs_git
+def test_a_claim_about_another_branch_is_allowed_without_asking_git(repo, monkeypatch):
+    d, _, off = repo
+    monkeypatch.setattr(cl, "on_ref", lambda *a: pytest.fail("git was asked"))
+    assert judge(f"pushed {off} to origin/work, so it is on main", d) is None
+
+
+@needs_git
+def test_git_runs_with_lazy_fetch_off_and_a_bare_environment(repo, monkeypatch):
+    d, on, _ = repo
+    seen = []
+    real = subprocess.run
+
+    def spy(*a, **k):
+        seen.append(k["env"])
+        return real(*a, **k)
+
+    monkeypatch.setattr(cl.subprocess, "run", spy)
+    monkeypatch.setenv("GIT_DIR", "/nowhere")
+    assert cl.on_ref(str(d), on, "origin/main") is True
+    assert seen and all(e["GIT_NO_LAZY_FETCH"] == "1" and "GIT_DIR" not in e for e in seen)
+
+
+def test_git_time_is_one_budget_for_the_whole_hook(tmp_path, monkeypatch):
+    now = [0.0]
+    budget = cl.Budget(8.0, clock=lambda: now[0])
+    calls = []
+
+    def fake_run(argv, **k):
+        calls.append(k["timeout"])
+        now[0] += 5.0  # each git call takes five seconds
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(cl.subprocess, "run", fake_run)
+    note = cl.on_ref(str(tmp_path), "abc1234", "origin/main", budget)
+    assert calls == [8.0, 3.0]  # the second call gets only what is left
+    assert isinstance(note, str) and "took more than 8 seconds" in note  # and the third never starts
+
+
+def test_a_timeout_in_git_lets_the_message_through_with_a_note(home, monkeypatch):
+    d = home / "d"
+    d.mkdir()
+
+    def slow(argv, **k):
+        raise subprocess.TimeoutExpired(argv, k["timeout"])
+
+    monkeypatch.setattr(cl.subprocess, "run", slow)
+    f = judge("merged abc1234 into main", d)
+    assert f.action == "note" and "claims not checked" in f.reason
+
+
 def test_a_missing_folder_or_no_git_is_a_note(home, monkeypatch):
-    assert judge("merged abc1234", home / "nowhere").action == "note"
+    assert judge("merged abc1234 into main", home / "nowhere").action == "note"
     d = home / "d"
     d.mkdir()
     monkeypatch.setenv("PATH", str(home / "empty"))
-    f = judge("merged abc1234", d)
+    f = judge("merged abc1234 into main", d)
     assert f.action == "note" and "git can't run" in f.reason
 
 
@@ -213,9 +302,9 @@ def _payload(text, cwd):
 def test_the_gate_denies_a_false_claim_and_lets_a_true_one_through(repo):
     d, on, off = repo
     pol = policy.loads('[guards]\non = ["claims"]\n')
-    reason = gate.check("claude-code", json.dumps(_payload(f"merged {off}", d)), pol)
+    reason = gate.check("claude-code", json.dumps(_payload(f"merged {off} into main", d)), pol)
     assert reason.startswith("claims: ") and off in reason
-    assert gate.check("claude-code", json.dumps(_payload(f"merged {on}", d)), pol) is None
+    assert gate.check("claude-code", json.dumps(_payload(f"merged {on} into main", d)), pol) is None
 
 
 @needs_git
@@ -225,9 +314,9 @@ def test_replay_of_a_send_message_matches_the_ref(repo, home, capsys):
     pol.write_text('[guards]\non = ["claims"]\n')
     log = home / "calls.jsonl"
     log.write_text(
-        json.dumps({"payload": _payload(f"merged {off}", d), "expect": "deny"})
+        json.dumps({"payload": _payload(f"merged {off} into main", d), "expect": "deny"})
         + "\n"
-        + json.dumps({"payload": _payload(f"merged {on}", d), "expect": "allow"})
+        + json.dumps({"payload": _payload(f"merged {on} into main", d), "expect": "allow"})
         + "\n"
     )
     assert cli.main(["gate", "replay", str(log), "--runner", "claude-code", "--policy", str(pol)]) == 0
@@ -252,7 +341,7 @@ def test_stop_logs_the_claims_in_the_last_message_and_stops_nothing(repo, home):
         "stop",
         "s1",
         str(d),
-        {"last_assistant_message": f"merged {on}. Also pushed {off}."},
+        {"last_assistant_message": f"merged {on} into main. Also pushed {off} to main."},
         clock=lambda: 0.0,
     )
     assert cl.judge(None, cl.config({}, "w"), ctx) is None
@@ -260,8 +349,8 @@ def test_stop_logs_the_claims_in_the_last_message_and_stops_nothing(repo, home):
     rec = json.loads(lines[-1])
     assert rec["session"] == "s1" and rec["ref"] == "origin/main" and rec["at"].startswith("1970-01-01")
     assert [(c["word"], c["commit"], c["on_ref"]) for c in rec["claims"]] == [
-        ("merged", on, True),
-        ("pushed", off, False),
+        ("merged into main", on, True),
+        ("pushed to main", off, False),
     ]
 
 

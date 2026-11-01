@@ -7,8 +7,10 @@ table's `paths` replaces the first list and `except` the second (globs: `**` cro
 matches at any depth).
 
 Deny: a skip or expected-failure marker added to a test that already existed (a decorator, a skip call, `it.skip`,
-`xit`, `t.Skip`, `skip_if(...)`, `#[ignore]`, `@Disabled`), counted for each test, so a new test or a new file may carry
-one; or a marker added outside any test (a class decorator, `pytestmark`, `describe.skip`) in a file that had tests.
+`xit`, `xdescribe`, `t.Skip`, `skip_if(...)`, `#[ignore]`, `@Disabled`), counted for each test, so a new test or a new
+file may carry one; or a marker added outside any test (a class decorator, `pytestmark`, `describe.skip`) in a file that
+had tests. A plain `describe(` block is not a marker. The deny is approvable: the person can allow it once with
+`ws approve`.
 Warn: a test removed, fewer assertion lines in the file, or an always-true assertion added (`assert True`,
 `assert x == x`, `expect(true).toBe(true)`, `expect_true(TRUE)`).
 
@@ -66,7 +68,7 @@ def config(table: dict, where: str) -> Config:
 _SKIP = re.compile(
     r"""@?\bpytest\.mark\.(?:skip|skipif|xfail)\b | \bpytest\.(?:skip|xfail)\s*\( | @unittest\.(?:skip\w*|expectedFailure)\b
     | \.skipTest\s*\( | @(?:skip|skipif|xfail|expectedFailure)\b
-    | \b(?:it|test|describe)\.(?:skip|fixme)\b | \b(?:xit|xtest|describe)\s*\(
+    | \b(?:it|test|describe)\.(?:skip|fixme)\b | \b(?:xit|xtest|xdescribe)\s*\(
     | (?<![\w.])skip(?:_if|_if_not|_on_cran|_on_os|_on_ci|_on_bioc)?\s*\(
     | \bt\.Skip(?:f|Now)?\s*\( | \#\[ignore | @Ignore\b | @Disabled\b""",
     re.VERBOSE,
@@ -225,7 +227,12 @@ def judge(call, cfg: Config, ctx) -> Finding | None:
         return None
     deny, warn = compare(before, after, path.suffix == ".py")
     if deny:
-        return Finding("deny", f"{rel}: " + "; ".join(deny) + ". Make the test pass, or ask the person to change it.")
+        why = f"{rel}: " + "; ".join(deny)
+        return Finding(
+            "deny",
+            f"{why}. Make the test pass. If the person agrees to the change, they can allow it once with `ws approve`",
+            approvable=True,
+        )
     if warn:
         return Finding("warn", f"{rel}: " + "; ".join(warn))
     return None

@@ -1,2 +1,3 @@
 [default.extend-words]
 edn = "edn"  # the Logseq config file extension
+xdescribe = "xdescribe"  # the Jasmine and Jest skipped-suite function

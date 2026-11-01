@@ -104,9 +104,12 @@ def test_a_foreground_agent_has_stopped_before_its_call_returns_so_it_is_not_cou
     assert pre(cfg, home, clock) is None
 
 
-def test_the_hook_after_a_call_with_no_limit_set_records_nothing(home):
-    post(cfg_of(), home, Clock())
-    assert not (home / "wshome" / "sessions" / "s1.spawn-cap.json").exists()
+def test_the_hook_after_a_call_with_no_limit_set_records_the_start(home, cgroup):
+    cgroup(cpu="800000 100000")  # 8 CPUs: the machine's default is 4
+    cfg, clock = cfg_of(), Clock()
+    for _ in range(4):
+        post(cfg, home, clock)
+    assert pre(cfg, home, clock).action == "deny"
 
 
 def test_it_denies_at_the_limit_and_says_how_to_see_what_is_running(home):
@@ -177,9 +180,132 @@ def test_a_stop_clears_the_oldest_start(home):
     assert start(cfg, home, clock).action == "deny"
 
 
-def test_with_no_limit_set_every_start_is_denied_and_says_why(home):
-    f = start(cfg_of(), home, Clock())
-    assert f.action == "deny" and "max_agents" in f.reason
+@pytest.fixture
+def cgroup(tmp_path, monkeypatch):
+    """Plant a cgroup v2 folder and point the guard at it; the real /sys is never read."""
+    root = tmp_path / "cgroup"
+    root.mkdir()
+    monkeypatch.setattr(sc, "CGROUP_DIR", root)
+    monkeypatch.setattr(sc, "PROC_CGROUP", tmp_path / "no-proc-cgroup")  # the real /proc is never read either
+    monkeypatch.setattr(sc.os, "cpu_count", lambda: 16)
+
+    def plant(cpu=None, memory=None):
+        for name, text in (("cpu.max", cpu), ("memory.max", memory)):
+            if text is not None:
+                (root / name).write_text(text + "\n")
+        return root
+
+    return plant
+
+
+GIB = 1024**3
+
+
+@pytest.mark.parametrize(
+    "cpu, memory, expected",
+    [
+        (None, None, 8),  # no cgroup files: 16 CPUs // 2 = 8, no memory limit
+        ("max 100000", "max", 8),  # files that say "no limit"
+        ("400000 100000", None, 2),  # 4 CPUs of quota // 2
+        ("1000000 100000", None, 5),  # 10 CPUs of quota // 2
+        ("50000 100000", None, 2),  # half a CPU: raised to the floor
+        ("max 100000", str(8 * GIB), 4),  # 8 GiB // 2 beats 16 CPUs // 2
+        ("1600000 100000", str(64 * GIB), 8),  # held to the ceiling
+        ("200000 100000", str(2 * GIB), 2),  # both low: the floor
+        ("junk", "junk", 8),  # unreadable values count as no limit
+        ("100 0", None, 8),  # a zero period is no quota
+        ("1000 -5", "-1", 8),
+    ],
+)
+def test_the_default_limit_comes_from_the_cgroup_quota_and_memory(cgroup, cpu, memory, expected):
+    cgroup(cpu, memory)
+    assert sc.default_max_agents() == expected
+
+
+def test_the_default_limit_reads_the_folder_it_is_given_and_the_cpu_count_it_is_told(tmp_path):
+    (tmp_path / "memory.max").write_text(str(12 * GIB))
+    assert sc.default_max_agents(tmp_path, cpu_count=32) == 6
+    assert sc.default_max_agents(tmp_path / "missing", cpu_count=6) == 3
+
+
+def test_a_number_too_big_to_read_is_no_limit(cgroup):
+    huge = "9" * 5000
+    cgroup(f"{huge} 100000", huge)
+    assert sc.default_max_agents() == 8
+    cgroup(f"100000 {huge}", huge)
+    assert sc.default_max_agents() == 8
+
+
+def _service_tree(tmp_path, own_cpu=None, own_memory=None, parent_cpu=None, proc="0::/system.slice/ws.service\n"):
+    """A host's cgroup tree with the session in system.slice/ws.service, and the /proc/self/cgroup file for it."""
+    root = tmp_path / "host-cgroup"
+    own = root / "system.slice" / "ws.service"
+    own.mkdir(parents=True)
+    for folder, name, text in (
+        (own, "cpu.max", own_cpu),
+        (own, "memory.max", own_memory),
+        (root / "system.slice", "cpu.max", parent_cpu),
+    ):
+        if text is not None:
+            (folder / name).write_text(text + "\n")
+    (tmp_path / "proc-cgroup").write_text(proc)
+    return root, tmp_path / "proc-cgroup"
+
+
+def test_on_a_host_the_limit_is_read_from_the_cgroup_the_session_is_in(tmp_path):
+    root, proc = _service_tree(tmp_path, own_cpu="400000 100000", own_memory=str(64 * GIB))
+    (root / "cpu.max").write_text("max 100000\n")
+    assert sc.default_max_agents(root, cpu_count=32, proc_cgroup=proc) == 2  # the service's 4 CPUs, not the host's 32
+    assert sc.default_max_agents(root, cpu_count=32) == 8  # the root alone is read when no /proc file is named
+
+
+def test_a_limit_on_a_folder_above_the_service_counts_and_the_tightest_wins(tmp_path):
+    root, proc = _service_tree(tmp_path, own_cpu="max 100000", parent_cpu="1200000 100000")
+    assert sc.default_max_agents(root, cpu_count=32, proc_cgroup=proc) == 6
+    root, proc = _service_tree(tmp_path / "b", own_cpu="400000 100000", parent_cpu="1200000 100000")
+    assert sc.default_max_agents(root, cpu_count=32, proc_cgroup=proc) == 2
+
+
+@pytest.mark.parametrize(
+    "proc",
+    [
+        "0::/\n",
+        "",
+        "1:cpu:/system.slice\n",
+        "0::/missing/dir\n",
+        "0::/../../etc\n",
+        "0::/system.slice/ws.service (deleted)\n",
+    ],
+)
+def test_a_cgroup_namespace_root_or_an_unusable_proc_file_reads_the_root(tmp_path, proc):
+    root, path = _service_tree(tmp_path, own_cpu="200000 100000", proc=proc)
+    (root / "cpu.max").write_text("800000 100000\n")
+    # "(deleted)" is still the service's folder; every other line here leaves the root's 8 CPUs, 4 agents
+    assert sc.default_max_agents(root, cpu_count=32, proc_cgroup=path) == (2 if "(deleted)" in proc else 4)
+    assert sc.default_max_agents(root, cpu_count=32, proc_cgroup=tmp_path / "gone") == 4
+
+
+def test_a_cpu_quota_above_the_machine_s_cpus_does_not_raise_the_limit(cgroup):
+    cgroup("6400000 100000")  # a quota of 64 CPUs on a 16 CPU machine
+    assert sc.default_max_agents() == 8
+    assert sc.default_max_agents(cpu_count=6, cgroup_dir=sc.CGROUP_DIR) == 3
+
+
+def test_with_no_limit_set_the_machine_s_default_applies_and_the_reason_names_it(home, cgroup):
+    cgroup(cpu="200000 100000")  # 2 CPUs: the floor of 2
+    cfg, clock = cfg_of(), Clock()
+    assert start(cfg, home, clock) is None and start(cfg, home, clock) is None
+    f = start(cfg, home, clock)
+    assert f.action == "deny" and "limit 2" in f.reason
+
+
+def test_an_explicit_max_agents_wins_over_the_machine_default(home, cgroup):
+    cgroup(cpu="200000 100000", memory=str(GIB))  # the default would be 2
+    cfg, clock = cfg_of(max_agents=5), Clock()
+    for _ in range(5):
+        assert start(cfg, home, clock) is None
+    assert start(cfg, home, clock).action == "deny"
+    assert sc.config({"max_agents": 1}, "x").max_agents == 1 and sc.config({}, "x").max_agents is None
 
 
 @pytest.mark.parametrize(

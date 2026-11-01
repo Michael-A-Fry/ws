@@ -82,12 +82,13 @@ A call the policy lets through only with a human's say-so is `ask_commands`: see
 
 from __future__ import annotations
 
+import contextlib
 import os
 import posixpath
 import re
 import tomllib
 import unicodedata
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from ws.profile import ws_home
@@ -102,6 +103,7 @@ EGRESS_TOOLS = ("web_fetch", "web_search")
 _NAME = re.compile(r"^[A-Za-z0-9_-]+$")
 _HOST = re.compile(r"^(\*\.)?[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?$")
 _MAX_DEPTH = 4
+MAX_COMMAND_CHARS = 64 * 1024  # a longer command takes longer to judge than a runner's hook may run
 
 
 class PolicyError(Exception):
@@ -261,14 +263,14 @@ allow_hosts = []
 allow_write = []
 
 # Guards: small named checks that run beside the rules above. `ws gate generate` writes the runner hooks they need.
-#   syntax-check     after an edit, checks the file by its extension (.py, .json, .toml, .sh) and tells the model the
+#   syntax-check     after an edit, checks the file by its extension (.py, .json, .toml, .sh, .js) and tells the model the
 #                    line that does not parse
 #   session-context  at session start, lists which of the files below exist in the project
 #   bulk-staging     stops `git add -A`, `git add .` and `git commit -a`, so a commit holds only named files
 #   record-calls     appends each tool call to $WS_HOME/logs/gate-calls.jsonl, for `ws gate replay`
 #   test-weakening   before a test file is written, denies a skip marker added to an existing test
 #   claims           checks a commit named beside merged, pushed or on main against a ref
-#   spawn-cap        denies a subagent start at max_agents running (set [guards.spawn-cap] max_agents)
+#   spawn-cap        denies a subagent start at max_agents running (default from the machine's CPUs and memory)
 #   skill-gate       a write to chosen paths waits for a skill ([[guards.skill-gate]] skill, paths)
 [guards]
 on = ["syntax-check", "session-context"]
@@ -277,7 +279,7 @@ on = ["syntax-check", "session-context"]
 # [guards.session-context]
 # files = [".claude-state/STATE.md"]
 # [guards.spawn-cap]
-# max_agents = 4
+# max_agents = 4   # optional: left out, half the CPUs or half the GiB of memory, whichever is less (2 to 8)
 
 # Rule of Two, leg C (a way out): besides a source's outward acts and the web tools above, the SHELL counts as a way
 # out while any of curl, wget, nc, ssh, scp, python -c ... is not in deny_commands. To close it, deny the lot
@@ -321,6 +323,22 @@ CONTROL_NAMES = (
     "install-manifest.json",
     "ratings.jsonl",
 )
+
+
+def secret_read_rules(home: Path | None = None) -> tuple[str, ...]:
+    """deny_read rules for where the secrets store keeps its values: `$WS_HOME/secrets` and, when the profile names
+    another folder (`[roles.secrets] store`), that one too. Each folder is named as written (made absolute) and as the
+    real path it resolves to, so a ws home that is a symlink is covered whichever way a command spells it. They are
+    added to every policy that is read, so a session can't read them whatever its policy file says; the runners' own
+    rules, the sandbox and the hook all see them."""
+    from ws import secrets  # here, not at the top: it is a command module that imports more than the policy needs
+
+    base = ws_home() if home is None else Path(home).expanduser().absolute()
+    folders = [base / "secrets"]
+    with contextlib.suppress(Exception):  # a profile that does not read leaves the default folder, always covered
+        folders.append(secrets.store_dir({"WS_HOME": str(base)}).expanduser().absolute())
+    spellings = [f for folder in folders for f in (folder, Path(os.path.realpath(folder)))]
+    return tuple(dict.fromkeys(f"{f}/**" for f in spellings))
 
 
 def control_paths(home: Path) -> list[str]:
@@ -400,9 +418,10 @@ def loads(text: str) -> Policy:
         "[gate]",
         {"deny_commands", "deny_read", "deny_tools", "ask_commands", "allow_hosts", "allow_write"},
     )
+    deny_read = _strings(g, "deny_read", "[gate] ")
     gate = Gate(
         _strings(g, "deny_commands", "[gate] "),
-        _strings(g, "deny_read", "[gate] "),
+        (*deny_read, *(r for r in secret_read_rules() if r not in deny_read)),
         _strings(g, "deny_tools", "[gate] "),
         _strings(g, "ask_commands", "[gate] "),
         _strings(g, "allow_hosts", "[gate] "),
@@ -476,9 +495,16 @@ def load(path: Path | None = None) -> Policy:
     except (OSError, UnicodeDecodeError) as e:
         raise PolicyError(f"{path}: {e}") from e
     try:
-        return loads(text)
+        return _with_secret_reads(loads(text), path.parent)
     except PolicyError as e:
         raise PolicyError(f"{path}: {e}") from e
+
+
+def _with_secret_reads(pol: Policy, home: Path) -> Policy:
+    """The policy with the secrets folder of the ws home the file sits in denied too (`loads` covers the one `$WS_HOME`
+    names; a policy kept in another ws home, such as the one a generated hook is told to read, covers its own)."""
+    extra = tuple(r for r in secret_read_rules(home) if r not in pol.gate.deny_read)
+    return replace(pol, gate=replace(pol.gate, deny_read=(*pol.gate.deny_read, *extra))) if extra else pol
 
 
 # --- Rule of Two -------------------------------------------------------------------------------------------------
@@ -589,6 +615,7 @@ class _Ctx:
     cwd: str
     protect: tuple[str, ...] = ()
     vars: dict[str, str] | None = None
+    heredocs: bool = False  # read the command line with here-document bodies left out (a second reading, never alone)
 
     def fork(self) -> _Ctx:
         return _Ctx(self.cwd, self.protect, dict(self.vars or {}))
@@ -606,11 +633,14 @@ def _cwd() -> str:
 
 
 def _expand(path: str) -> str:
-    """~, ~user, $HOME and ${HOME} to a real prefix."""
+    """~, ~user, $HOME, ${HOME}, $WS_HOME and ${WS_HOME} to a real prefix."""
     home = _home().rstrip("/")
     for pre in ("${HOME}", "$HOME", "~"):
         if path == pre or path.startswith(pre + "/"):
             return home + path[len(pre) :]
+    for pre in ("${WS_HOME}", "$WS_HOME"):
+        if path == pre or path.startswith(pre + "/"):
+            return str(ws_home()).rstrip("/") + path[len(pre) :]
     return os.path.expanduser(path) if path.startswith("~") else path
 
 
@@ -654,7 +684,7 @@ def _canon_path(tok: str) -> str:
 
 
 def _is_pathlike(tok: str) -> bool:
-    return tok.startswith(("/", "~", "$HOME", "${HOME}"))
+    return tok.startswith(("/", "~", "$HOME", "${HOME}", "$WS_HOME", "${WS_HOME}"))
 
 
 def _merge_flags(tokens: list[str]) -> list[str]:
@@ -895,9 +925,9 @@ def _join_lines(cmd: str) -> str:
             continue
         elif quote == "$'":
             quote = "" if c == "'" else quote
-        elif cmd.startswith("$(", i) or (c == "`" and cmd.find("`", i + 1) > 0):
+        elif cmd.startswith("$(", i) or (c == "`" and _backtick_end(cmd, i) > 0):
             if c == "`":
-                j, head, tail = cmd.find("`", i + 1), "`", "`"
+                j, head, tail = _backtick_end(cmd, i), "`", "`"
             else:
                 j, head, tail = _close_paren(cmd, i + 2), "$(", ")"
             out += [head, _join_lines(cmd[i + len(head) : j])]
@@ -927,10 +957,79 @@ def _join_lines(cmd: str) -> str:
 
 _HEREDOC_WORD = re.compile(r"<<(-?)[ \t]*(?:'([^']*)'|\"([^\"]*)\"|\\?([A-Za-z_][A-Za-z0-9_]*))")
 
+_IFS = re.compile(r"\$\{IFS\}|\$IFS\b")
+
+
+def _folds(command: str) -> bool:
+    """Would _prep change the characters the shell sees (full-width letters read as plain ones, `$IFS` as a space)?
+    Closing words are matched on the text the shell reads, so such a line can't be trusted to close a body."""
+    return unicodedata.normalize("NFKC", command) != command or _IFS.search(command) is not None
+
+
+# The one shape of command whose here-document bodies are left unread, because the shell can only treat them as text:
+# steps of `cat` or `tee`, each with plain-word arguments, at most one `>` or `>>` to a plain-word path and one
+# here-document opener with a quoted name, joined by `;`, `&&` or a new line. Anything else anywhere in the command
+# (a pipe, a group, a function, a variable, a substitution, a comment, an unquoted opener, a here-string, another
+# program) and every body is read as commands.
+_PLAIN = r"[A-Za-z0-9_./,:@%+-]+"
+_OPENER = r"<<-?(?:'[A-Za-z_][A-Za-z0-9_]*'|\"[A-Za-z_][A-Za-z0-9_]*\")"
+_REDIRECT = rf"[ \t]+>>?[ \t]*{_PLAIN}"
+_STEP = re.compile(rf"(?:cat|tee)(?:[ \t]+{_PLAIN})*(?P<r1>{_REDIRECT})?[ \t]+(?P<open>{_OPENER})(?P<r2>{_REDIRECT})?")
+_STEPS = re.compile(r";|&&")
+
+
+def _without_bodies(command: str) -> str | None:
+    """The command with the body and closing line of each here-document taken out, when every line of it is the
+    shape above and every body closes on its exact closing line; None otherwise (read the whole text as commands)."""
+    if _prep(command) != command or "\\\n" in command:
+        return None
+    out: list[str] = []
+    i, n = 0, len(command)
+    while i < n:
+        eol = command.find("\n", i)
+        eol = n if eol < 0 else eol
+        line, i = command[i:eol], eol + 1
+        out.append(line)
+        if not line:
+            continue
+        opened: list[tuple[str, bool]] = []
+        for step in _STEPS.split(line):
+            m = _STEP.fullmatch(step.strip(" \t"))
+            if not m or (m["r1"] and m["r2"]):
+                return None
+            opened.append((m["open"].lstrip("<-")[1:-1], m["open"].startswith("<<-")))
+        i = _after_bodies(command, i, opened)
+        if i is None:
+            return None
+    return "\n".join(out) + "\n" if any(out) else None
+
+
+def _closes(line: str, word: str, indented: bool) -> bool:
+    """Does this line end a here-document? The shell takes the line as it is, word and nothing else; `<<-` also lets
+    leading tabs (only tabs) go."""
+    return (line.lstrip("\t") if indented else line) == word
+
 
 def _arithmetic(body: str) -> bool:
     """Is the text between `$(` and its closing `)` really `((...))`, shell arithmetic?"""
     return body.startswith("(") and body.endswith(")")
+
+
+def _after_bodies(cmd: str, i: int, opened: list[tuple[str, bool]]) -> int | None:
+    """The index after the closing lines of the here-documents a line opened (closing word, may be indented), whose
+    bodies start at `i`, the start of the next line. None when one never closes (the shell would take the rest of the
+    text as its body; here that is read as commands, so a typo can't hide a command)."""
+    n = len(cmd)
+    for word, indented in opened:
+        while True:
+            if i >= n:
+                return None
+            eol = cmd.find("\n", i)
+            eol = n if eol < 0 else eol
+            line, i = cmd[i:eol], eol + 1
+            if _closes(line, word, indented):
+                break
+    return i
 
 
 def _scan(cmd: str, heredocs: bool = False, end: dict | None = None) -> tuple[list[list[str]], list[str]]:
@@ -973,9 +1072,9 @@ def _scan(cmd: str, heredocs: bool = False, end: dict | None = None) -> tuple[li
             if c == quote[-1]:
                 quote = ""
             elif quote == '"' and c == "`":
-                j = cmd.find("`", i + 1)
+                j = _backtick_end(cmd, i)
                 if j > 0:
-                    inner.append(cmd[i + 1 : j])
+                    inner.append(_unbacktick(cmd[i + 1 : j]))
             elif quote == '"' and cmd.startswith("$(", i):
                 j = _close_paren(cmd, i + 2)
                 inner.append(sub(cmd[i + 2 : j]))
@@ -1018,7 +1117,7 @@ def _scan(cmd: str, heredocs: bool = False, end: dict | None = None) -> tuple[li
                     eol = n if eol < 0 else eol
                     line = cmd[i:eol]
                     i = eol + 1
-                    if (line.strip(" \t") if indented else line) == word:
+                    if _closes(line, word, indented):
                         break
             waiting.clear()
             continue
@@ -1037,9 +1136,9 @@ def _scan(cmd: str, heredocs: bool = False, end: dict | None = None) -> tuple[li
             quote = c
             buf.append(c)
         elif c == "`":
-            j = cmd.find("`", i + 1)
+            j = _backtick_end(cmd, i)
             j = n if j < 0 else j
-            inner.append(cmd[i + 1 : j])
+            inner.append(_unbacktick(cmd[i + 1 : j]))
             buf.append(cmd[i : j + 1])
             i = j + 1
             continue
@@ -1081,6 +1180,25 @@ def _scan(cmd: str, heredocs: bool = False, end: dict | None = None) -> tuple[li
     if end is not None:
         end["quote"] = quote
     return pipelines, inner
+
+
+def _backtick_end(cmd: str, i: int) -> int:
+    """Index of the backtick that closes the one at `i`, or -1. A backslash escapes the next character, so an escaped
+    backtick belongs to a command nested inside."""
+    i += 1
+    while i < len(cmd):
+        if cmd[i] == "\\":
+            i += 2
+        elif cmd[i] == "`":
+            return i
+        else:
+            i += 1
+    return -1
+
+
+def _unbacktick(text: str) -> str:
+    """The command inside a backtick pair, as the shell reads it: `\\``, `\\$` and `\\\\` lose their backslash."""
+    return re.sub(r"\\([`$\\])", r"\1", text)
 
 
 def _close_paren(cmd: str, i: int) -> int:
@@ -1199,16 +1317,44 @@ def _rule_root(rule: str) -> str | None:
     return posixpath.normpath("/".join(parts) or "/")
 
 
+def _glob_segment(seg: str) -> re.Pattern | None:
+    """One path segment as a pattern (`*`, `?`, bracket classes), or None when it cannot be read."""
+    try:
+        return _glob_regex_path(seg)
+    except re.error:
+        return None
+
+
+def _segments_reach(glob: list[str], root: list[str]) -> bool:
+    """Can the glob's segments, taken one for one over the root's segments, all match? `**` takes any number of
+    segments (none too). What the glob has after the root does not matter: it is already inside it. A glob that ends
+    above the root names a folder above it, not the root. A segment it cannot read counts as a match (fails closed)."""
+    seen: set[tuple[int, int]] = set()
+
+    def walk(gi: int, ri: int) -> bool:
+        if ri == len(root):
+            return True
+        if gi == len(glob) or (gi, ri) in seen:
+            return False
+        seen.add((gi, ri))
+        g = glob[gi]
+        if g == "**":
+            return walk(gi, ri + 1) or walk(gi + 1, ri) or walk(gi + 1, ri + 1)
+        rx = _glob_segment(g)
+        return (rx is None or rx.match(root[ri]) is not None) and walk(gi + 1, ri + 1)
+
+    return walk(0, 0)
+
+
 def _glob_reaches(policy: Policy, token_abs: str) -> str | None:
-    """Could this glob (`~/.s*/id_rsa`) name something a deny_read rule covers? Tried against the rule's folder and a
-    few names a secrets folder holds."""
-    rx = _glob_regex_path(token_abs)
+    """Could this glob (`~/.s*/id_rsa`, `~/.ws/secret?/KEY`) name something a deny_read rule covers? It does when,
+    segment by segment over the rule's folder, each of the glob's segments can match the rule's."""
+    glob = [g for g in token_abs.split("/") if g]
     for rule in policy.gate.deny_read:
         root = _rule_root(rule)
         if root is None:
             continue
-        samples = [root] + [f"{root}/{x}" for x in ("id_rsa", "id_ed25519", "credentials", "key", "x")]
-        if any(rx.match(s) for s in samples):
+        if _segments_reach(glob, [r for r in root.split("/") if r]):
             return rule
     return None
 
@@ -1345,7 +1491,7 @@ def _walk(policy: Policy, cmd: str, ctx: _Ctx, depth: int, cands: list[str]) -> 
     the reason at once for the checks that are not globs (pipe into a shell, denied paths, protected files)."""
     if depth > _MAX_DEPTH:
         raise ValueError("command nests too deeply to check")
-    pipelines, inner = _scan(_prep(cmd))
+    pipelines, inner = _scan(_prep(cmd), heredocs=ctx.heredocs and depth == 0)
     nested: list[str] = list(inner)
     for segs in pipelines:
         canon_segs = []
@@ -1583,7 +1729,7 @@ def simple_commands_env(
         raise TypeError("command must be text")
     if _depth > _MAX_DEPTH:
         raise ValueError("command nests too deeply to check")
-    pipelines, inner = _scan(_prep(command), heredocs=True)
+    pipelines, inner = _scan(_prep(command), heredocs=not _folds(command))
     found: list[tuple[list[str], list[str]]] = []
     nested = list(inner)
     for segs in pipelines:
@@ -1613,6 +1759,22 @@ def _readings(command: str) -> list[str]:
     return [command, command.replace("\\\n", "")] if "\\\n" in command else [command]
 
 
+def _walk_command(policy: Policy, command: str, cwd: str, protect: tuple[str, ...], cands: list[str]) -> str | None:
+    """_walk for a whole command. In the one plain shape _without_bodies accepts, the bodies are text and the lines
+    around them are judged. Any other command is judged with every body read as commands (so a body can't hide
+    anything) and then once more with the bodies left out, so a stray quote in a body can't hide the lines after it."""
+    data = _without_bodies(command)
+    if data is not None:
+        return _walk(policy, data, _Ctx(cwd, protect), 0, cands)
+    for text in _readings(command):
+        reason = _walk(policy, text, _Ctx(cwd, protect), 0, cands)
+        if reason:
+            return reason
+    if "<<" in command and not _folds(command):
+        return _walk(policy, command, _Ctx(cwd, protect, None, True), 0, cands)
+    return None
+
+
 def _open_quote(command: str) -> str:
     """The quote still open at the end of the command text (`'`, `"` or `$'`), or "" if every quote is closed. Comments
     and here-document bodies are not read: an apostrophe in prose there is not a quote."""
@@ -1632,14 +1794,18 @@ def is_denied_command(
     it cannot judge: callers treat that as a deny. This is the second layer; see the note above."""
     if not isinstance(command, str):
         raise TypeError("command must be text")
+    if len(command) > MAX_COMMAND_CHARS:
+        return (
+            f"the command is {len(command):,} characters, too long to check in time (the limit is "
+            f"{MAX_COMMAND_CHARS:,}); write it to a file with the Write tool and run that file"
+        )
     quote = _open_quote(command)
     if quote:
         return f"the command ends inside an unclosed {quote} quote, so what runs cannot be read; close the quote"
     cands: list[str] = []
-    for text in _readings(command):
-        reason = _walk(policy, text, _Ctx(cwd or _cwd(), tuple(protect)), 0, cands)
-        if reason:
-            return reason
+    reason = _walk_command(policy, command, cwd or _cwd(), tuple(protect), cands)
+    if reason:
+        return reason
     for pat in policy.gate.deny_commands:
         rx = _glob_regex(_canon_pattern(pat))
         if any(rx.match(c) for c in cands):
@@ -1656,8 +1822,7 @@ def needs_approval(policy: Policy, command: str, *, cwd: str | None = None) -> b
     if not policy.gate.ask_commands:
         return False
     cands: list[str] = []
-    for text in _readings(command):
-        _walk(policy, text, _Ctx(cwd or _cwd()), 0, cands)
+    _walk_command(policy, command, cwd or _cwd(), (), cands)
     return any(_glob_regex(_canon_pattern(pat)).match(c) for pat in policy.gate.ask_commands for c in cands)
 
 

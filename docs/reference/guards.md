@@ -28,11 +28,11 @@ name, and a key in a guard's table that guard doesn't read.
 | Guard | Runs | Reads | What it does |
 |---|---|---|---|
 | `bulk-staging` | before a call | shell commands | Stops `git add -A`, `--all` (and a prefix such as `--al`), `.`, `./`, `*`, `:/` and `:(top)`, the same with `git stage`, and `git commit -a`, `-am` and `--all`, with or without git's global options. Stops `git -c alias.NAME=...`, which can define a command that stages everything. `git add file` and `git add -- file` go through. Text in quotes, comments and here-document bodies is data, so `git commit -m "git add -A"` goes through; the text after `eval` and in `bash -c` is a command and is read. The runner's own deny rules carry the plain spellings too. |
-| `syntax-check` | after a call | file writes | Checks the file the session wrote and tells the model the line that doesn't parse. Python, JSON and TOML are read in process. `.sh` and `.bash` go through `sh -n` or `bash -n`, with a note when the machine has no shell. |
+| `syntax-check` | after a call | file writes | Checks the file the session wrote and tells the model the line that doesn't parse. Python, JSON and TOML are read in process. `.sh` and `.bash` go through `sh -n` or `bash -n`, with a note when the machine has no shell. `.js`, `.mjs` and `.cjs` go through `node --check`, with a note when node isn't installed. |
 | `session-context` | at session start | none | Lists, one line each, which of `files` exist in the project: the git top level above the session's folder, and the main worktree when the session runs in a linked one. |
 | `test-weakening` | before a call | file writes | Applies the edit to the test file on disk and compares before and after. Denies a skip or expected-failure marker added to a test that already exists; the person can approve it once. Warns about a test removed, fewer assertion lines, or an always-true assertion added. Judges Edit, Write and MultiEdit calls only. |
 | `claims` | before a message, and when the session stops | messages to other agents | Checks each commit-like token that sits in the same sentence as a claim word (`on main`, `merged into main`, `merged to main`, `pushed to main`) against a ref, and denies the message when the commit isn't on it. On stop, logs the claims in the runner's last message. |
-| `spawn-cap` | before a call, and when a subagent stops | subagent starts | Denies a subagent start when `max_agents` are already running in the session. Counts agents started in the background. |
+| `spawn-cap` | before a call, and when a subagent stops | subagent starts | Denies a subagent start when `max_agents` (default from the machine) are already running in the session. Counts agents started in the background. |
 | `skill-gate` | before a call, and when a prompt is sent | file writes and skill calls | Denies a write to a guarded path until the named skill has run in the session. The person can approve the write once. Judges Edit, Write and MultiEdit calls only. |
 | `record-calls` | before a call | every kind | Appends `{schema, ts, at, runner, payload}` (`ts` is the time; `at` is its legacy spelling, kept beside it) to `$WS_HOME/logs/gate-calls.jsonl`, one line for each hook run. A file write keeps its path and records the text as `{"bytes", "sha256"}`. `ws gate replay` reads that file. |
 
@@ -112,7 +112,7 @@ runner sends one) are appended to `$WS_HOME/logs/claims.jsonl` with whether each
 
 ```toml
 [guards.spawn-cap]
-max_agents = 4      # required, 1 or more
+max_agents = 4      # optional, 1 or more; left out, it comes from the machine (see below)
 stale_s = 1800      # optional: seconds before an unfinished start stops counting
 ```
 
@@ -122,8 +122,14 @@ the `PostToolUse` hook, so a call that was denied or that you declined uses no s
 `run_in_background` is recorded: a foreground agent has already stopped when its call returns. The count is an
 estimate: agents started together in one message are all checked before any is recorded, a stop clears the oldest start
 because the stop payload doesn't say which agent it was, and a start older than `stale_s` drops out. The record is
-`$WS_HOME/sessions/<session id>.spawn-cap.json`. With the guard on and no `max_agents`, every start is denied and the
-reason says the key is missing.
+`$WS_HOME/sessions/<session id>.spawn-cap.json`.
+
+With no `max_agents`, the limit is worked out from the machine each time: the smaller of half the CPUs and half the
+memory in GiB, at least 2 and at most 8. The CPUs are the cgroup v2 `cpu.max` quota divided by its period when one is
+set (a container or service limit), never more than the machine has, else `os.cpu_count()`. The memory is
+`memory.max` when it's set, else it isn't a limit. A file that's missing, says `max` or can't be read counts as no limit.
+A 4 CPU, 16 GiB container gets 2; an 8 CPU, 8 GiB machine gets 4; a 32 CPU host with no limit gets 8. The reason a
+start is denied names the limit in force.
 
 ### skill-gate
 

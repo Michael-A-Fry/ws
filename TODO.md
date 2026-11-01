@@ -171,7 +171,9 @@ Step 3, mail:
 Cut-over (each step only when `ws doctor` is green for it):
 
 - [ ] Secrets wall on the maintainer's machine (one sudo script, then the keys re-pasted)
-- [ ] Gate and skills switched; old hooks disabled, kept 30 days; rollback re-enable tested once
+- [x] Gate and skills switched (2026-11-02); old hooks git-staging-guard.sh and syntax-check.sh disabled, kept 30
+  days; rollback re-enable tested once (2026-11-02)
+- [ ] notify.sh off once the notify role sends plain alert text
 - [ ] Timers switched; old units disabled, kept 30 days; rollback re-enable tested once
 - [ ] Mail switched on
 - [ ] Pass test: old units disabled 30 days with nothing broken; a rollback re-enable tested
@@ -182,6 +184,7 @@ Known gate limits (found in review of #41; the sandbox is the wall behind the ma
   define an alias pass the bulk-staging guard
 - [ ] False deny: an apostrophe in nested double quotes inside `$(...)` inside double quotes reads as an unclosed quote
 - [ ] OpenCode copies of the new guards: phase 7
+- [ ] False deny: the body of a quoted here-doc written to a file is checked as if it were run
 
 Adopted ideas (neutral wording): one automatic recovery per known failure, recorded, then escalate; green levels
 (targeted, package, full, merge-ready) on hand-backs and run records with a known-flakes list; the pinpoint format

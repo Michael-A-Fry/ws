@@ -1,5 +1,10 @@
 # ws: Your memory, skills and rules, in any AI
 
+[![PyPI version](https://img.shields.io/pypi/v/ws-aitoolkit)](https://pypi.org/project/ws-aitoolkit/)
+[![Python versions](https://img.shields.io/pypi/pyversions/ws-aitoolkit)](https://pypi.org/project/ws-aitoolkit/)
+[![Licence: Apache-2.0](https://img.shields.io/pypi/l/ws-aitoolkit)](LICENSE)
+[![CI](https://github.com/Michael-A-Fry/ws/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Michael-A-Fry/ws/actions/workflows/ci.yml)
+
 ws turns one `policy.toml` into each AI tool's own config, answers the tools' hooks, and runs headless jobs that leave
 one complete record each. Your memory, skills and rules live in plain files that you own, so you can change tool or
 model without starting again.

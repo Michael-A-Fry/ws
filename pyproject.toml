@@ -19,6 +19,10 @@ classifiers = [
 
 [project.urls]
 Source = "https://github.com/Michael-A-Fry/ws"
+Documentation = "https://github.com/Michael-A-Fry/ws/blob/main/docs/README.md"
+Changelog = "https://github.com/Michael-A-Fry/ws/blob/main/CHANGELOG.md"
+Issues = "https://github.com/Michael-A-Fry/ws/issues"
+Security = "https://github.com/Michael-A-Fry/ws/blob/main/SECURITY.md"
 
 [project.scripts]
 ws = "ws.cli:main"

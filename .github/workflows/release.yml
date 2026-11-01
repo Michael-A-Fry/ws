@@ -89,8 +89,16 @@ jobs:
             echo "::warning::CHANGELOG.md still says '## [$VERSION] - unreleased'; put the date in"
           fi
           cat release-notes.md
+      # After the stamp, so `dirty` describes the tree at the tag. PyPI resolves a relative README link against
+      # pypi.org (a 404), so the README in the built files links to GitHub at this tag instead.
+      - name: pin the README's links and images to the tag, for PyPI
+        env:
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+        run: python3 scripts/pypi_readme.py rewrite --tag "$RELEASE_TAG" README.md
       - name: uv build (sdist and wheel)
         run: uv build
+      - name: the description in the built sdist and wheel has no relative link or image
+        run: python3 scripts/pypi_readme.py check dist/*.whl dist/*.tar.gz
       - name: install the wheel in a clean environment; it reports this commit, and the SBOM is read from that environment
         env:
           VERSION: ${{ steps.meta.outputs.version }}

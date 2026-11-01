@@ -24,7 +24,7 @@ then spread it.
    misaligned or noisy, and fix what you agree with. If your runner has a design or density critic subagent, run it;
    otherwise check any charts against the `dataviz` skill's checklist.
 5. **Show the person** the screenshots and 3-5 lines on the choices made. **Stop and wait for approval.**
-6. **On approval,** write the approved rules as a short "visual kit" section in the repo's design doc or instructions
-   file (colours, type scale, spacing, density, chart rules) so anyone applying them to the remaining pages can do it
-   mechanically. Then do the other pages.
+6. **On approval,** update the repo's one rules page and its tokens file with what was approved (colours, type scale,
+   spacing, density, chart rules), changing values where a rule already exists. Don't start a second kit beside them.
+   Anyone applying the rules to the remaining pages can then do it mechanically. Then do the other pages.
 """

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 import shutil
 import subprocess
 
@@ -29,6 +31,7 @@ def git(cwd, *args) -> str:
     done = subprocess.run(
         ["git", "-c", "user.name=T", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false", *args],
         cwd=cwd,
+        env={**os.environ, "GIT_AUTHOR_DATE": "2026-01-01T00:00:00Z", "GIT_COMMITTER_DATE": "2026-01-01T00:00:00Z"},
         capture_output=True,
         text=True,
         check=True,
@@ -50,7 +53,10 @@ def repo(home):
     git(d, "checkout", "-q", "-b", "work")
     (d / "a").write_text("2")
     git(d, "commit", "-q", "-am", "second")
-    return d, on[:10], git(d, "rev-parse", "HEAD")[:10]
+    off = git(d, "rev-parse", "HEAD")
+    for sha in (on[:10], off[:10]):  # fixed dates give fixed ids; each must look like a commit id to the guard
+        assert re.search(r"\d", sha) and re.search(r"[a-f]", sha), sha
+    return d, on[:10], off[:10]
 
 
 def message(text: str, cwd, event="pre", **extra):

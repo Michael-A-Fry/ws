@@ -56,6 +56,7 @@ Measure:
 - [CLI](reference/cli.md): every command and flag, the exit codes and the JSON envelope.
 - [Doctor checks](reference/doctor-checks.md): every `WS` ID with its meaning and fix.
 - [Policy](reference/policy.md): every `policy.toml` key.
+- [Guards](reference/guards.md): the named checks, their events and findings, replay.
 - [Eval](reference/eval.md): task files, graders and the ten metrics.
 - [Lab](reference/lab.md): the lab virtual machine cell and how it's protected.
 - [`ws version --json`](reference/version-json.md): the build and install fields.

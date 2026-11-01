@@ -1,0 +1,24 @@
+{
+  "name": "ws-aitoolkit",
+  "version": "0.0.1",
+  "description": "ws: your memory, skills and rules, in any AI. A small CLI that turns one policy.toml into each AI coding tool's config (Claude Code, OpenCode, Codex), answers their hooks, and runs headless jobs. The tool itself is on PyPI: uv tool install ws-aitoolkit.",
+  "keywords": [
+    "claude-code",
+    "ai-agents",
+    "guardrails",
+    "cli"
+  ],
+  "homepage": "https://github.com/Michael-A-Fry/ws#readme",
+  "bugs": {
+    "url": "https://github.com/Michael-A-Fry/ws/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Michael-A-Fry/ws.git"
+  },
+  "license": "Apache-2.0",
+  "author": "Michael Fry",
+  "files": [
+    "README.md"
+  ]
+}

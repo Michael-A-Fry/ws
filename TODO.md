@@ -155,6 +155,15 @@ Step 1, platform (DECISIONS 200, 212):
 - [ ] Evaluation view, part of the one ws surface: per arm or setup, quality (pass rate, pass^k), time per solved task,
   tokens and cost per solved task, the trend over runs and the noise floor; through taste-gate in the ws look, no
   separate page before then
+- [ ] Uninstall saves the manifest without merging records an install saved after uninstall read it (install.py,
+  uninstall's save); save through `_commit` like install does (#65 review, medium)
+- [ ] A config folder that doesn't exist yet is locked late, out of sorted order, and `held=True` reaches
+  `userconfig.apply` without its lock (set `XDG_CONFIG_HOME` or `CLAUDE_CONFIG_DIR`); a manifest lock timeout raises
+  `WsError` past apply's `finally` and replaces the first error (#65 review, low)
+- [ ] PyPI images (DECISIONS 217): the setup welcome screen with the mark near the top of the README, optionally the
+  gate refusing a command; re-recorded in the brand look from the tapes in #51; PNG or short GIF, 1 MB or less, alt
+  text, nothing only the image says; raw URLs pinned to the tag (the README check already covers images)
+- [ ] npm: `packaging/npm` is the 0.0.1 pointer package (README points to PyPI); the `npx` installer shim is 7c
 
 Step 2, timers:
 
@@ -184,7 +193,9 @@ Known gate limits (found in review of #41; the sandbox is the wall behind the ma
   define an alias pass the bulk-staging guard
 - [ ] False deny: an apostrophe in nested double quotes inside `$(...)` inside double quotes reads as an unclosed quote
 - [ ] OpenCode copies of the new guards: phase 7
-- [ ] False deny: the body of a quoted here-doc written to a file is checked as if it were run
+- [x] False deny: the body of a quoted here-doc written to a file is checked as if it were run (#59: plain `cat`/`tee`
+  steps only)
+- [ ] `cat >> ~/.bashrc` is allowed: no rc-file protect by default (the sandbox is the wall); found in #59 review
 
 Adopted ideas (neutral wording): one automatic recovery per known failure, recorded, then escalate; green levels
 (targeted, package, full, merge-ready) on hand-backs and run records with a known-flakes list; the pinpoint format

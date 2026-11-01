@@ -8,6 +8,12 @@ body of the GitHub release.
 
 ## [Unreleased]
 
+### Fixed
+
+- The README on PyPI links to the docs, changelog and licence on GitHub at the release's tag; relative links there
+  went to a 404. The release fails if a built file's description still holds a relative link or image.
+- PyPI lists Documentation, Changelog, Issues and Security links beside Source.
+
 ## [0.1.4] - 2026-11-02
 
 ### Fixed

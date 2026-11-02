@@ -89,6 +89,10 @@ install.sh        the installer people run first (pipx or uv)
 
 ## Conventions
 
+- **Golden rule: ws is for everyone.** Every feature, guard, test, default and doc must be generic, useful and
+  accessible to anyone working with AI tools, on any runner, provider or OS. Never build for one person's setup, habits
+  or scenarios. Something only one user needs belongs in that user's own private config, outside this repo. Reviews
+  check this first: "would a stranger who just installed ws want this, and does it work for them?"
 - Register: GitHub Issues (github.com/Michael-A-Fry/ws), board 'ws roadmap'; TODO.md is the Now list. File a new bug,
   gap or idea as an issue with `kind:`, `area:`, `P0`-`P3` and `size:` labels (or `triage:needed`). A vulnerability goes
   to a private advisory, never an issue.

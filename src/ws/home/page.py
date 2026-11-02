@@ -86,7 +86,7 @@ def render(snap: Snapshot, nonce: str = "", *, live: bool = False, hub: areas.Hu
         components.sprite()
         + '<div class="app">'
         + _chrome.sidebar(view)
-        + '<div class="scrim" data-act="drawer"></div>'
+        + '<div class="scrim" data-act="drawer" data-action="drawer.close" data-expect="close-drawer"></div>'
         + f'<div class="main">{_chrome.topbar(view)}'
         + f'<main class="col" id="main">{_home(view)}{_evals(view)}'
         + f'<section class="pg" id="v-sources"><h2 class="vh2">Sources</h2>{_sources(snap)}</section>'

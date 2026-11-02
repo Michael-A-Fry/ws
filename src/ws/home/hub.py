@@ -43,8 +43,9 @@ def _runners(cfg: api.HomeConfig) -> tuple:
 
 def _workspaces(snap: Snapshot, cfg: api.HomeConfig) -> tuple:
     """Each place work can start: `key` (what the box sends back), `label` (the folder's name), `name` (what the box
-    shows: the label, with the parent folder when two share it) and `cls`. An open folder is keyed by its full path; an
-    opaque session's path isn't known, so its key is its label under `opaque:`. A folder an opaque rule covers, by its
+    shows: the label, with the parent folder when two share it), `folder` (its full path; empty when none is known) and
+    `cls`. An open folder is keyed by its full path; an opaque session's path isn't known, so its key is its label
+    under `opaque:`. A folder an opaque rule covers, by its
     path, is `terminal only`. A name the profile lists that a session also shows is that session's folder."""
     found: dict[str, dict] = {}
     for s in snap.sessions:
@@ -68,7 +69,8 @@ def _workspaces(snap: Snapshot, cfg: api.HomeConfig) -> tuple:
     out = []
     for e in entries:
         name = f"{e['parent']}/{e['label']}" if count[e["label"]] > 1 and e["parent"] else e["label"]
-        out.append({"key": e["key"], "label": e["label"], "name": name, "cls": e["cls"]})
+        folder = e["key"] if os.path.isabs(e["key"]) else ""  # an opaque or profile-only workspace has no known path
+        out.append({"key": e["key"], "label": e["label"], "name": name, "cls": e["cls"], "folder": folder})
     return tuple(out)
 
 
@@ -123,6 +125,13 @@ def start(env: api.Env, data: dict) -> tuple[int, dict]:
         return 409, {"error": "that workspace isn't one ws knows"}
     if chosen_ws["cls"] == OPAQUE_CLASS:
         return 409, {"error": "that folder is terminal only: start it from a terminal", "kind": "refused"}
+    if "folder" not in template.names(cfg.start) and any(
+        w["label"] == chosen_ws["label"] and w["cls"] == OPAQUE_CLASS for w in hub.workspaces
+    ):  # {workspace} is a short name, and a terminal-only folder has the same one: the program could pick either
+        return 409, {
+            "error": f"{chosen_ws['label']} is also the name of a terminal-only folder: use {{folder}} in [home.start] command",
+            "kind": "ambiguous",
+        }
     if where not in hub.machines:
         return 409, {"error": "that machine isn't one ws has seen"}
     pick = next((r for r in hub.runners if r["name"] == runner), None)
@@ -135,6 +144,7 @@ def start(env: api.Env, data: dict) -> tuple[int, dict]:
     values = {
         "what": what,
         "workspace": chosen_ws["label"],
+        "folder": chosen_ws["folder"],
         "where": where,
         "runner": runner,
         "model": model,

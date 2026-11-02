@@ -156,7 +156,7 @@ document.addEventListener('click', (e) => {
     view = Object.assign({}, DEFAULT_VIEW, found || {}); view.show = Object.assign({}, DEFAULT_VIEW.show, view.show || {});
     active = found ? found.name : ''; saveView(); applyView(); document.body.classList.remove('drawer'); location.hash = '#v-home'; return;
   }
-  const nav = t.closest('.side a.nav'); if (nav) document.body.classList.remove('drawer');
+  const nav = t.closest('.side a[href^="#"]'); if (nav) document.body.classList.remove('drawer');
   const cp = t.closest('button[data-copy]');
   if (cp) {
     const was = cp.textContent, text = cp.dataset.copy;

@@ -30,7 +30,15 @@ from ws.profile import ProfileError, load, profile_path, ws_home
 HOME_KEYS = ("lead", "opaque_paths", "sources", "open", "start", "answer", "workspaces", "models", "deny")
 SOURCE_KEYS = ("asks_jsonl", "events_dir", "otel_dir", "claude_dir")
 OPEN_KEYS = ("session", "ask", "opaque")
-START_NAMES = ("what", "workspace", "where", "runner", "model", "request")  # what `[home.start] command` may use
+START_NAMES = (
+    "what",
+    "workspace",
+    "folder",
+    "where",
+    "runner",
+    "model",
+    "request",
+)  # what `[home.start] command` may use
 ANSWER_NAMES = ("id", "choice", "text")  # what `[home.answer] command` may use
 ANSWER_TEXT_MAX = 2000
 _LEAD = re.compile(r"^(cwd|name):\S.*$")

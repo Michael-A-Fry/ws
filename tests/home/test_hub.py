@@ -183,3 +183,32 @@ def test_the_start_call_needs_the_token_origin_and_host(box):
     finally:
         srv.close()
         t.join(5)
+
+
+def _shared_name_box(tmp_path, start):
+    b = Box(tmp_path)
+    private = b.home / "code" / "private"
+    b.profile(f'[home]\nopaque_paths = ["{private}"]\n' + start)
+    b.ws_session(SID, cwd=str(private / "app"))
+    b.ws_session(SID2, cwd=str(b.home / "code" / "app"))
+    return b
+
+
+def test_a_short_name_shared_with_a_terminal_only_folder_needs_the_folder_in_the_template(tmp_path):
+    b = _shared_name_box(tmp_path, '[home.start]\ncommand = ["starter", "{workspace}", "{request}"]\n')
+    calls: list = []
+    env = env_of(b, calls)
+    open_one = next(w for w in hub.build(api.snapshot(env), env).workspaces if w["cls"] == "")
+    code, body = hub.start(env, {**GOOD, "workspace": open_one["key"], "runner": "claude-code", "model": ""})
+    assert code == 409 and body["kind"] == "ambiguous" and "{folder}" in body["error"] and calls == []
+
+
+def test_the_folder_name_holds_the_full_path_of_the_folder_started_in(tmp_path):
+    b = _shared_name_box(tmp_path, '[home.start]\ncommand = ["starter", "{workspace}", "{folder}", "{request}"]\n')
+    calls: list = []
+    env = env_of(b, calls)
+    h = hub.build(api.snapshot(env), env)
+    assert {w["folder"] for w in h.workspaces if w["cls"] == ""} == {str(b.home / "code" / "app")}
+    open_one = next(w for w in h.workspaces if w["cls"] == "")
+    code, _ = hub.start(env, {**GOOD, "workspace": open_one["key"], "model": ""})
+    assert code == 200 and calls == [["starter", "app", str(b.home / "code" / "app"), GOOD["request"]]]

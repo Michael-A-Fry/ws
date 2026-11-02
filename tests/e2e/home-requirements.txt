@@ -1,0 +1,12 @@
+# What the home click-walk (test_home_clicks.py) needs beyond ws, installed in a venv of its own by the home-e2e job in
+# .github/workflows/cli.yml. Not a ws dependency: ws's own code stays standard library only. Every pin was released at
+# least 7 days before it was pinned (2 Nov 2026), and the job installs with --no-deps so nothing else comes in.
+playwright==1.64.1
+greenlet==3.5.6
+pyee==14.0.0
+typing_extensions==4.16.0
+pytest==9.0.3
+iniconfig==2.3.1
+packaging==26.3
+pluggy==1.7.0
+pygments==2.21.0

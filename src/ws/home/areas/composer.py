@@ -26,6 +26,7 @@ ACTIONS = "Start a session, a chat or a job from the box; the profile's [home.st
 BUILT = True
 
 SET_START = "Set [home.start] command to start sessions from here"
+NOT_LIVE = "This copy of the page is read-only: run ws home to start sessions"
 WHAT = (("session", "Session", "term"), ("chat", "Chat", "new"), ("job", "Job", "clock"))
 PLACEHOLDER = "Describe a task, ask a question, or paste a link…"
 REASON = "not for {cls} data (your policy)"
@@ -88,12 +89,13 @@ def _models(hub: Hub) -> str:
 
 
 def _note(view: View) -> tuple[str, bool]:
-    """The line under the box when sending is off, and whether sending is on. With `[home.start]` set the line is empty."""
+    """The line under the box when sending is off, and whether sending is on. With a server behind the page and
+    `[home.start]` set the line is empty."""
     if not view.hub.start:
         return SET_START, False
     if not view.hub.workspaces:
         return EMPTY, False
-    return "", view.live
+    return ("", True) if view.live else (NOT_LIVE, False)
 
 
 def render(view: View) -> str:

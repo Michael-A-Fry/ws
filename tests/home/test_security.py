@@ -79,7 +79,8 @@ def test_the_box_greys_every_runner_out_for_a_terminal_only_folder_and_says_why(
 def test_an_opaque_folder_and_an_open_one_with_the_same_name_stay_two_workspaces(tmp_path):
     b = Box(tmp_path)
     private = b.home / "code" / "private"
-    b.profile(f'[home]\nopaque_paths = ["{private}"]\n' + START)
+    start = '[home.start]\ncommand = ["starter", "{workspace}", "{folder}", "{runner}", "{model}", "{request}"]\n'
+    b.profile(f'[home]\nopaque_paths = ["{private}"]\n' + start)  # {folder}: a short name alone could mean either
     b.ws_session(SID, cwd=str(private / "app"))
     b.ws_session(SID2, cwd=str(b.home / "code" / "app"))
     calls: list = []
@@ -94,7 +95,7 @@ def test_an_opaque_folder_and_an_open_one_with_the_same_name_stay_two_workspaces
     shut = next(w for w in h.workspaces if w["cls"])
     assert hub.start(env, {**good, "workspace": shut["key"]})[0] == 409
     assert hub.start(env, {**good, "workspace": "app"})[0] == 409  # a bare name that two folders share isn't a choice
-    assert calls == [["starter", "app", "claude-code", "", "go"]]
+    assert calls == [["starter", "app", str(b.home / "code" / "app"), "claude-code", "", "go"]]
 
 
 # --- 2: a typed answer needs {text} ------------------------------------------------------------------------------------

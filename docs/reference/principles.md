@@ -59,7 +59,7 @@ Rules for any page ws serves, not a look. The look comes from a reference set th
 
 | ID | Rule | Rung | Check | Status |
 |---|---|---|---|---|
-| U1 | Build one representative page, get it approved, then restyle the rest (the `taste-gate` skill). | T2 | [judge] | enforced |
+| U1 | Build one representative page, get it approved, then restyle the rest (the `taste-gate` skill). Every control on a ws page has a `data-action` and a `data-expect`, and the click-walk test exercises each one. | T2 | [judge] for the first part; `tests/e2e/test_home_clicks.py::test_every_control_does_what_it_says` for the controls | enforced |
 | U2 | Keep steady states quiet and spend emphasis on exceptions. | T3 | [judge] | enforced |
 | U3 | Draw type, spacing and radius from one small fixed scale shared by every stylesheet. | T0 | `tests/test_brand.py` | planned |
 | U4 | Give every pointer target at least 24 by 24 CSS pixels, set with `min-height`. | T0 | `tests/test_setup_ui.py` | planned |

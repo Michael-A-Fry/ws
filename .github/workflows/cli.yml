@@ -70,6 +70,32 @@ jobs:
           assert data["install_source"] == "checkout", data["install_source"]
           PY
 
+  # The home page's click-walk: every control with a data-action is clicked in a real Chromium, at a desktop and a phone
+  # size, in light and dark. Playwright lives in a venv of its own (tests/e2e/home-requirements.txt), so ws's package
+  # dependencies stay as they are. Not a required check.
+  home-e2e:
+    name: home click-walk (ubuntu-24.04, chromium)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: "0.13.1"
+          enable-cache: true
+      - name: install Playwright and Chromium in their own venv
+        run: |
+          uv venv "$RUNNER_TEMP/pw"
+          uv pip install --python "$RUNNER_TEMP/pw/bin/python" --no-deps -r tests/e2e/home-requirements.txt
+          "$RUNNER_TEMP/pw/bin/python" -m playwright install --with-deps chromium
+      - name: every control on the home page does what it says
+        env:
+          WS_E2E_REQUIRE: "1" # a missing Playwright or Chromium fails the job instead of skipping
+          PYTHONPATH: src
+        run: '"$RUNNER_TEMP/pw/bin/python" -m pytest -q -s -p no:cacheprovider tests/e2e/test_home_clicks.py'
+
   gate-e2e:
     name: gate e2e (ubuntu-24.04, stub model)
     runs-on: ubuntu-24.04

@@ -179,9 +179,11 @@ opencode = ["financial"]
 ```
 
 `[home.start] command` and `[home.answer] command` are lists of words, the first the program. `{name}` in a later word is
-replaced by a value, as one argument: `[home.start]` has `{what}` (`session`, `chat` or `job`), `{workspace}`, `{where}`,
-`{runner}`, `{model}` and `{request}` (and needs `{request}`); `[home.answer]` has `{id}`, `{choice}` and `{text}` (and
-needs `{id}`). A value that would start a word with a dash is refused.
+replaced by a value, as one argument: `[home.start]` has `{what}` (`session`, `chat` or `job`), `{workspace}` (the
+folder's short name), `{folder}` (its full path), `{where}`, `{runner}`, `{model}` and `{request}` (and needs `{request}`);
+`[home.answer]` has `{id}`, `{choice}` and `{text}` (and needs `{id}`). A value that would start a word with a dash is
+refused. When a terminal-only folder shares the short name of the folder you start in, a template without `{folder}` is
+refused, because the program could pick either folder.
 
 `lead = "cwd:PATH"` matches a session whose folder is exactly `PATH`. `lead = "name:GLOB"` matches by name. If several
 match, the most recently seen one that hasn't ended is the lead.

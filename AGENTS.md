@@ -124,6 +124,9 @@ install.sh        the installer people run first (pipx or uv)
   `.ws/overrides.toml` with the reason).
 - Never put a secret, a person's data or a private host in a prompt, fixture, commit or comment.
 - Never merge, close or push to `main` from automation. Work on a branch and open a PR.
+- Never develop a security fix on a public branch or in a public PR. Build it in the security advisory's temporary
+  private fork and merge it with the release that publishes the advisory. A public PR carries no test, fixture or
+  wording that shows a case the released version gets wrong.
 
 ## Commands
 

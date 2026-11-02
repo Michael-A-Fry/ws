@@ -8,7 +8,10 @@ one list of every folder. The pending-permission list is held in the running ser
 the store has no row for one, and a tool call waiting for a yes looks the same on disk as one still running. So this
 source gives sessions and no asks, and states nothing it can't see.
 
-The store is opened read-only (`mode=ro`, `query_only`), so ws can't write to it. A session's tokens and cost come from
+The store is opened read-only (`query_only`), so ws can't write to it, and reading it leaves no file behind: a
+WAL-mode store with no `-wal` file beside it (no writer is live) is opened `immutable=1`, which makes no side files; one
+with a `-wal` file (OpenCode is running) is opened `mode=ro`, so the writer's latest rows are seen. If that folder can't
+be written to and holds no `-shm`, SQLite may be unable to open the store, and that is one unreadable row. A session's tokens and cost come from
 the `session` row's own totals, and its state from two fields of its latest `message` row (its role and when it
 completed). The `part` table, where the text of a conversation is kept, is never queried, and neither is any other
 field of a message. A session in an opaque folder (or one with no folder ws can place) is listed by id, folder and
@@ -43,7 +46,7 @@ BUSY_MS = 2000  # how long a read waits on a locked store
 # the columns this source reads; a store without one is a layout ws doesn't know
 _SESSION = ("id", "directory", "title", "parent_id", "time_created", "time_updated", "time_archived", "cost",
             "tokens_input", "tokens_output", "tokens_cache_read", "tokens_cache_write")  # fmt: skip
-_MESSAGE = ("session_id", "data", "time_created")
+_MESSAGE = ("id", "session_id", "data", "time_created")
 
 # SQLite's primary result codes (the low byte of `sqlite_errorcode`)
 _ERROR, _PERM, _BUSY, _LOCKED, _CORRUPT, _CANTOPEN, _NOTADB = 1, 3, 5, 6, 11, 14, 26
@@ -89,6 +92,16 @@ def _typed(e: sqlite3.Error) -> SourceError:
     return SourceError(FAILED, f"{type(e).__name__} while reading the OpenCode store")
 
 
+def _wal_mode(path: Path) -> bool:
+    """True when the file's header says WAL mode (bytes 18 and 19, the write and read versions, are both 2)."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(20)
+    except OSError:
+        return False
+    return len(head) == 20 and head[:16] == b"SQLite format 3\x00" and head[18] == head[19] == 2
+
+
 def _connect(path: Path) -> sqlite3.Connection:
     """The store, read-only. A path that isn't a regular file (a pipe planted under the name) is not opened."""
     try:
@@ -96,7 +109,12 @@ def _connect(path: Path) -> sqlite3.Connection:
             raise SourceError(UNAVAILABLE, f"{path.name} isn't a regular file")
     except OSError as e:
         raise SourceError(UNREADABLE, f"can't read {path.name}: {e.strerror or type(e).__name__}") from e
-    uri = Path(os.path.abspath(path)).as_uri() + "?mode=ro"
+    base = Path(os.path.abspath(path))
+    # `mode=ro` on a WAL-mode store with no writer would create `-wal` and `-shm` and leave them behind, so that case is
+    # opened `immutable=1`, which makes nothing. A `-wal` file means a writer is live: read through it (`mode=ro`).
+    # A store that isn't in WAL mode makes no side file, and `immutable` would ignore a writer's lock.
+    wal_mode = _wal_mode(base) and not base.with_name(base.name + "-wal").exists()
+    uri = base.as_uri() + ("?immutable=1" if wal_mode else "?mode=ro")
     try:
         conn = sqlite3.connect(uri, uri=True, timeout=BUSY_MS / 1000)
         conn.execute("PRAGMA query_only = ON")

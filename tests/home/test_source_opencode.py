@@ -195,7 +195,46 @@ def test_a_message_that_is_not_json_leaves_that_state_unknown_and_the_source_ok(
 def test_a_store_in_wal_mode_is_read_without_its_side_files(box):
     make(box, wal=True)
     assert [f.name for f in make_files(box)] == ["opencode.db"]
-    assert len(mine(api.snapshot(box.env(agents=[])))) == 2
+    snap = api.snapshot(box.env(agents=[]))
+    assert len(mine(snap)) == 2
+    assert [f.name for f in make_files(box)] == ["opencode.db"]  # the read left no -wal or -shm behind
+
+
+def test_a_live_writer_is_read_through_its_wal_and_no_new_file_appears(box):
+    st = Store(box, wal=True)
+    st.session(OC1, "/work/app", updated=-20)
+    st.message(OC1, "user", at=-25)
+    st.db.commit()  # the rows sit in the writer's -wal; the writer stays open
+    before = make_files(box)
+    assert {f.name for f in before} == {"opencode.db", "opencode.db-wal", "opencode.db-shm"}
+    snap = api.snapshot(box.env(agents=[]))
+    assert [(s.id, s.state) for s in mine(snap)] == [(OC1, "working")]  # the latest rows, not the last checkpoint
+    assert make_files(box) == before
+    st.db.close()
+
+
+def test_a_wal_with_no_shm_in_a_folder_that_cannot_be_written_to_is_one_unreadable_row(box, monkeypatch):
+    """Some SQLite builds can't open a store that has a `-wal` but no `-shm` when they can't make the `-shm`; the code
+    for that failure is `SQLITE_CANTOPEN`, and the row is typed from the code."""
+    st = Store(box, wal=True)
+    st.session(OC1, "/work/app", updated=-20)
+    st.db.commit()
+    seen: list[str] = []
+
+    def cant_open(target, *a, **k):
+        seen.append(target)
+        err = sqlite3.OperationalError("unable to open database file")
+        err.sqlite_errorcode = 14
+        raise err
+
+    monkeypatch.setattr(opencode.sqlite3, "connect", cant_open)
+    try:
+        snap = api.snapshot(box.env(agents=[]))
+    finally:
+        st.db.close()
+    row = rows(snap)["opencode"]
+    assert seen and seen[0].endswith("?mode=ro")  # a live writer's -wal is read through, not as immutable
+    assert (row.ok, row.kind) == (False, "unreadable") and mine(snap) == []
 
 
 def make_files(box):
@@ -331,6 +370,17 @@ def test_a_store_missing_a_column_this_source_reads_is_a_bad_format_row_with_no_
     snap = api.snapshot(box.env(agents=[]))
     row = rows(snap)["opencode"]
     assert (row.ok, row.kind) == (False, "bad_format") and "session" in row.why and mine(snap) == []
+
+
+def test_a_message_table_without_an_id_is_a_bad_format_row_not_an_unknown_state(box):
+    st = Store(box)
+    st.session(OC1, "/work/app")
+    st.db.execute("DROP TABLE message")
+    st.db.execute(MESSAGE_DDL.replace("id text PRIMARY KEY, ", "", 1))
+    st.done()
+    snap = api.snapshot(box.env(agents=[]))
+    row = rows(snap)["opencode"]
+    assert (row.ok, row.kind) == (False, "bad_format") and "message" in row.why and mine(snap) == []
 
 
 def test_a_store_with_no_message_table_is_a_bad_format_row(box):
@@ -470,7 +520,7 @@ def test_no_key_file_is_opened_and_the_store_is_opened_read_only(box, monkeypatc
     snap = api.snapshot(box.env(agents=[]))
     assert len(mine(snap)) == 2
     uris = [t for t in touched if "opencode.db" in t]
-    assert uris and all(t.endswith("?mode=ro") for t in uris if t.startswith("file:"))
+    assert uris and all(t.endswith(("?mode=ro", "?immutable=1")) for t in uris if t.startswith("file:"))
     assert [t for t in touched if ".key" in t] == []
     assert "not-a-real-secret" not in json.dumps(snap.to_dict())
 

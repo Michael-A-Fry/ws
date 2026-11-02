@@ -60,7 +60,7 @@ folder's `__init__.py`.
 | Source | Kind | Reads |
 |---|---|---|
 | `claude_code` | sessions, asks | `claude agents --json` and the per-process files in `<claude dir>/sessions/*.json`. A session with `waitingFor` is also an ask of kind `waiting` |
-| `opencode` | sessions | OpenCode's own store (`opencode.db` in `$XDG_DATA_HOME/opencode`, checked against 1.19.4), opened read-only: id, title, folder, times, tokens and cost from the session row, and working or idle from the latest message's role and completion time. A session with no parent, updated in the last day. OpenCode holds a pending permission request in the running server's memory, so it isn't in the store and this source gives no asks |
+| `opencode` | sessions | OpenCode's own store (`opencode.db` in `$XDG_DATA_HOME/opencode`, checked against 1.19.4), opened read-only, leaving no file behind: id, title, folder, times, tokens and cost from the session row, and working or idle from the latest message's role and completion time. "Working" is a heuristic: the latest message is a prompt, or a reply with no completed time, and the session changed in the last 10 minutes. A reply that was aborted reads as working for up to 10 minutes. Only sessions with no parent that aren't archived and were updated in the last day are listed, newest first, at most 200. OpenCode holds a pending permission request in the running server's memory, so it isn't in the store and this source gives no asks |
 | `ws_plugins` | plugins | The plugin registry and the profile's `[modules]` |
 | `ws_runs` | sessions | Finished headless jobs in `logs/runs.jsonl`, with their cost. Eval trials show under `evals` |
 | `ws_sessions` | sessions | The records `ws session start` writes |

@@ -667,6 +667,44 @@ def test_braces_in_quotes_stay_one_word_and_bare_ones_still_expand(pol, home):
     assert policy.is_denied_command(pol, "echo '{~/.ssh/id_rsa,x}'") is None
 
 
+@pytest.mark.parametrize(
+    "word",
+    [
+        '{~/.ssh/id_rsa,"}"}',
+        "{~/.ssh/id_rsa,\\}}",
+        "{~/.ssh/id_rsa,'}'}",
+        '{~/.ssh/id_rsa,"{"}',
+        "{~/.ssh/id_rsa,\\{}",
+        "{~/.ssh/id_rsa,$'\\x7b'}",
+        "~/.s{s..s}h/id_rsa",
+        "{x,{~/.ssh/id_rsa,y}}",
+    ],
+)
+def test_a_brace_group_is_paired_the_way_the_shell_pairs_it(pol, home, word):
+    assert policy.is_denied_command(pol, f"cat {word}")
+
+
+def test_quoted_braces_are_not_expanded_and_a_sequence_is(pol, home):
+    assert policy.is_denied_command(pol, 'cat "{~/.ssh/id_rsa,x}"') is None
+    assert policy.is_denied_command(pol, "echo '{a,b}'") is None
+    assert policy._braces("{1..3}") == ["1", "2", "3"]
+    assert policy._braces("{01..03}") == ["01", "02", "03"]
+    assert policy._braces("{a..e..2}") == ["a", "c", "e"]
+    assert policy._braces("{a,b{c,d}}") == ["a", "bc", "bd"]
+    assert policy._braces("{a}") == ["{a}"] and policy._braces("${x,y}") == ["${x,y}"]
+    with pytest.raises(policy.TooManyPieces):
+        policy._braces("{1..999}")
+    with pytest.raises(policy.TooManyPieces):
+        policy._braces("{a,b}" * 6)
+
+
+def test_a_piece_after_an_unquoted_brace_or_comma_is_tested_whether_or_not_it_expands():
+    assert policy._brace_pieces("{~/.ssh/id_rsa,x}", "1" * 17) == ["~/.ssh/id_rsa"]
+    assert policy._brace_pieces("{x,/etc/y}", "1" * 10) == ["/etc/y"]
+    assert policy._brace_pieces("{x,/etc/y}", "11" + "0" * 8) == []
+    assert "~/.ssh/id_rsa" in policy._word_paths("{a,~/.ssh/id_rsa}", mask="1" * 17)
+
+
 def test_an_unquoted_brace_bomb_is_bounded(pol, home):
     reason = _decided_fast(pol, "echo " + "{a,b}" * 300)
     assert reason is None or "too many to check" in reason

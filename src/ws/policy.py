@@ -199,6 +199,12 @@ _TEMP_BELOW = {
 # Where people's own folders live: the folder and `/dir/*` are named here, and one level down (a whole home folder) is
 # judged in code (see _home_folder), because a glob's `*` would also take every path below it.
 _HOME_PARENTS = ("home", "Users")
+# System state below `/var` and `/private`, named as plain globs (no literal star), so a runner that skips hooks still
+# has them in its own deny rules: the folder and everything under it.
+_STATE_BELOW = (
+    *(f"/var/{d}" for d in ("lib", "log", "db", "cache", "spool", "mail", "backups", "opt", "local", "root", "run")),
+    *("/var/vm", "/var/www", "/private/etc", "/private/var/db", "/private/var/root", "/private/var/log"),
+)
 _SHELLS = ("sh", "bash", "zsh", "dash")
 # Paths no session may read by default: the keys, tokens and credential files of the common tools, and ws's own secrets.
 DEFAULT_DENY_READ = (
@@ -237,6 +243,8 @@ def default_deny_commands() -> list[str]:
         out += [f"rm -* /{d}", f"rm -* /{d}/*"]
     for d in (*_MOUNT_DIRS, *_TEMP_BELOW):
         out += [f"rm -* /{d}", f"rm -* /{d}/\\*"]
+    for d in _STATE_BELOW:
+        out += [f"rm -* {d}", f"rm -* {d}/*"]
     # A forcing push in any spelling (-f, -uf, +refspec, --force-with-lease), with or without git's global options.
     out += ["git push*--force*", "git push* -f*", "git -* push*--force*", "git -* push* -f*"]
     out += ["mkfs*", "dd*of=/dev/*"]
@@ -1509,34 +1517,136 @@ def _expand_vars(seg: str, ctx: _Ctx) -> str:
     return _VAR.sub(lambda m: known.get(m.group(1) or m.group(2), m.group(0)), seg) if known else seg
 
 
-_BRACE = re.compile(r"\{([^{}]*,[^{}]*)\}")
 _FETCHERS = {"curl", "wget", "nc", "ncat", "ssh", "scp", "ftp", "fetch"}
+_BRACE_DEPTH = 64  # nested open braces a word may hold before the matcher refuses it
+_SEQ_INT = re.compile(r"(-?\d{1,18})\.\.(-?\d{1,18})(?:\.\.(-?\d{1,18}))?")
+_SEQ_CHAR = re.compile(r"([A-Za-z])\.\.([A-Za-z])(?:\.\.(-?\d{1,18}))?")
+
+
+def _brace_sequence(body: str, limit: int) -> list[str] | None:
+    """`1..3`, `01..10..3`, `a..e`: the words a brace sequence makes, or None when the text is not a sequence. A
+    sequence longer than `limit` raises TooManyPieces."""
+    m = _SEQ_INT.fullmatch(body)
+    chars = False
+    if m:
+        lo, hi = int(m.group(1)), int(m.group(2))
+        width = max(len(m.group(1)), len(m.group(2))) if any(re.match(r"-?0\d", g) for g in m.groups()[:2]) else 0
+    else:
+        m = _SEQ_CHAR.fullmatch(body)
+        if not m:
+            return None
+        lo, hi, chars, width = ord(m.group(1)), ord(m.group(2)), True, 0
+    step = abs(int(m.group(3) or 1)) or 1
+    if abs(hi - lo) // step + 1 > limit:
+        raise TooManyPieces
+    values = range(lo, hi + 1, step) if lo <= hi else range(lo, hi - 1, -step)
+    if chars:
+        return [chr(v) for v in values]
+    return [(("-" + str(-v).zfill(width - 1)) if v < 0 else str(v).zfill(width)) for v in values]
+
+
+def _brace_pairs(word: str, mask: str) -> dict[int, tuple[int, list[int]]]:
+    """Every unquoted `{` that an unquoted `}` closes, with the unquoted commas directly inside it, in one pass. A `{`
+    straight after an unquoted `$` is a parameter expansion, not a brace group."""
+    pairs: dict[int, tuple[int, list[int]]] = {}
+    stack: list[tuple[int, list[int], bool]] = []
+    for i, c in enumerate(word):
+        if mask[i] != "1":
+            continue
+        if c == "{":
+            if len(stack) >= _BRACE_DEPTH:
+                raise TooManyPieces
+            stack.append((i, [], i > 0 and word[i - 1] == "$" and mask[i - 1] == "1"))
+        elif c == "," and stack:
+            stack[-1][1].append(i)
+        elif c == "}" and stack:
+            a, commas, param = stack.pop()
+            if not param:
+                pairs[a] = (i, commas)
+    return pairs
 
 
 def _braces(word: str, mask: str | None = None, limit: int = 32) -> list[str]:
-    """`x{1,2}y` -> x1y, x2y (one shell word becomes several). Braces and commas the shell reads as text (`mask` is
-    "0" there: in quotes, behind a backslash) are left alone, so a quoted `{"a": 1, "b": 2}` stays one word."""
+    """`x{1,2}y` -> x1y, x2y and `x{1..3}` -> x1, x2, x3 (one shell word becomes several), as the shell does it: an
+    unquoted `{` is closed by the unquoted `}` that matches it, and only unquoted commas split. `mask` is "1" for a
+    character read as syntax and "0" where it sat in quotes, behind a backslash or in `$'...'`, so a quoted
+    `{"a": 1, "b": 2}` stays one word. More than `limit` words raises TooManyPieces."""
+    if "{" not in word:
+        return [word]
     if mask is None:
         mask = "1" * len(word)
-    for m in _BRACE.finditer(word):
-        a, b = m.start(), m.end() - 1
-        if mask[a] != "1" or mask[b] != "1":
+    pairs = _brace_pairs(word, mask)
+    if not pairs:
+        return [word]
+
+    def parse(lo: int, hi: int) -> tuple[list, int]:
+        nodes: list = []
+        total, text, i = 1, [], lo
+        while i < hi:
+            hit = pairs.get(i)
+            if hit and hit[0] < hi:
+                end, commas = hit
+                alts: list | None = None
+                count = 0
+                if commas:
+                    alts, count = [], 0
+                    for left, right in itertools.pairwise([i, *commas, end]):
+                        sub, n = parse(left + 1, right)
+                        alts.append(sub)
+                        count += n
+                elif "0" not in mask[i + 1 : end]:
+                    seq = _brace_sequence(word[i + 1 : end], limit)
+                    if seq is not None:
+                        alts, count = [[s] for s in seq], len(seq)
+                if alts is not None:
+                    if text:
+                        nodes.append("".join(text))
+                        text = []
+                    nodes.append(alts)
+                    total *= count
+                    if total > limit:
+                        raise TooManyPieces
+                    i = end + 1
+                    continue
+            text.append(word[i])
+            i += 1
+        if text:
+            nodes.append("".join(text))
+        return nodes, total
+
+    def render(nodes: list) -> list[str]:
+        outs = [""]
+        for node in nodes:
+            if isinstance(node, str):
+                outs = [o + node for o in outs]
+            else:
+                outs = [o + w for o in outs for alt in node for w in render(alt)]
+        return outs
+
+    return render(parse(0, len(word))[0])
+
+
+def _brace_pieces(word: str, mask: str) -> list[str]:
+    """The pieces of a brace group that start like a path: right after an unquoted `{` or an unquoted `,` inside one
+    (`{~/.ssh/id_rsa,x}`), up to the next unquoted `,` or `}`. Tested whether or not the group expands."""
+    out: list[str] = []
+    depth = 0
+    for i, c in enumerate(word):
+        if mask[i] != "1":
             continue
-        cuts = [k for k in range(a + 1, b) if word[k] == "," and mask[k] == "1"]
-        if not cuts:
+        if c == "{" and not (i > 0 and word[i - 1] == "$" and mask[i - 1] == "1"):
+            depth += 1
+        elif c == "}":
+            depth = max(depth - 1, 0)
+        elif c != "," or not depth:
             continue
-        edges = [a, *cuts, b]
-        out: list[str] = []
-        for lo, hi in itertools.pairwise(edges):
-            out += _braces(
-                word[:a] + word[lo + 1 : hi] + word[b + 1 :],
-                mask[:a] + mask[lo + 1 : hi] + mask[b + 1 :],
-                limit,
-            )
-            if len(out) >= limit:
-                break
-        return out[:limit]
-    return [word]
+        j = i + 1
+        if depth and j < len(word) and word[j] in _PATH_START:
+            k = j
+            while k < len(word) and k - j < _PATH_MAX and not (word[k] in ",}" and mask[k] == "1"):
+                k += 1
+            out.append(word[j:k])
+    return out
 
 
 def _dotted(op: str, cwd: str) -> str:
@@ -1563,12 +1673,14 @@ class TooManyPieces(Exception):
     all takes longer than a runner's hook may run."""
 
 
-def _word_paths(word: str, spent: list[int] | None = None) -> list[str]:
+def _word_paths(word: str, spent: list[int] | None = None, mask: str | None = None) -> list[str]:
     """The places a word may name besides itself: the text after `=`, `@`, `<`, `>`, `:` or `,` (`if=P`, `f=@P`,
     `-d@P`, `host:P`, `file://P`), each piece between them, and the value glued to a short option (`-oP`, `-sSLoP`). A
     word that looks like a path is also judged whole, which covers the argument of an option the matcher does not
     know. Only a piece that starts like a path (`~`, `/`, `$`, `.`) or follows `=`, `@` or `<` is tested. `spent[0]`
-    counts the pieces tested over a command line; the line past COMMAND_PIECE_CAP raises TooManyPieces."""
+    counts the pieces tested over a command line; the line past COMMAND_PIECE_CAP raises TooManyPieces. With `mask`
+    (see `_lex_masked`), a piece that starts like a path right after an unquoted `{` or `,` of a brace group is tested
+    too, so a group the matcher did not expand still has its parts judged."""
     flag = word.startswith("-") and len(word) > 1
     breaks = [m.start() for m in _VALUE_BREAKS.finditer(word)]
     starts: list[int] = [] if flag else [0]
@@ -1597,6 +1709,13 @@ def _word_paths(word: str, spent: list[int] | None = None) -> list[str]:
             found.append(word[st : st + _PATH_MAX])
     for m in itertools.islice(_FILE_URL.finditer(word), _SUFFIX_TESTS):
         found.append(word[m.end() : m.end() + _PATH_MAX])
+    if mask is not None and "{" in word:
+        pieces = _brace_pieces(word, mask)
+        if (spent[0] if spent is not None else 0) + len(pieces) > COMMAND_PIECE_CAP:
+            raise TooManyPieces
+        if spent is not None:
+            spent[0] += len(pieces)
+        found += pieces
     out = []
     for p in found:
         if not p:
@@ -1817,7 +1936,11 @@ def _walk(policy: Policy, cmd: str, ctx: _Ctx, depth: int, cands: list[str]) -> 
 def _segment(policy: Policy, seg: str, ctx: _Ctx, in_pipe: bool, cands: list[str]) -> tuple[str | None, str, list[str]]:
     cands.append(" ".join(seg.split()))
     words, masks, redirs = _lex_masked(_expand_vars(seg, ctx))
-    words = [b for w, k in zip(words, masks) for b in _braces(w, k)]
+    raw = [(w, k) for w, k in zip(words, masks) if "{" in w]
+    try:
+        words = [b for w, k in zip(words, masks) for b in _braces(w, k)]
+    except TooManyPieces:
+        return "a brace list in the command holds too many words, too many to check in time", seg[:200], []
     if not words and not redirs:
         return None, "", []
     ctx.spent[1] += len(words)
@@ -1898,8 +2021,8 @@ def _segment(policy: Policy, seg: str, ctx: _Ctx, in_pipe: bool, cands: list[str
     # `-a P`) as often as it is an operand, whichever option the matcher knows. A folder above a protected one is
     # judged only for the operands above, so a bare `/` inside a value is not a recursive read of everything.
     try:
-        for word in words:
-            for p in _word_paths(word, ctx.spent):
+        for word, mask in [(w, None) for w in words] + raw:
+            for p in _word_paths(word, ctx.spent, mask):
                 rule = _read_hit(policy, p, ctx.cwd, recursive=recursive and p != "/")
                 if rule and not (p == made and rule in _ENV_RULES):
                     return f"command names a path denied by deny_read rule {rule!r}", line, nested

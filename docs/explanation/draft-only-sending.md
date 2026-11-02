@@ -27,8 +27,8 @@ sending keeps the useful part of an assistant (the first draft) and drops the pa
 
 ## What doesn't exist
 
-- ws ships no mail connector. The `mail-drafts` plugin is in the list (`ws plugin list`) marked "not built yet," with a
-  line in the setup screens: "Drafts replies. Never sends." No code behind the plugin reads or writes mail.
+- ws ships no mail connector. No code in ws reads or writes mail, and no mail plugin is listed in `ws plugin list` or
+  the setup screens.
 - ws doesn't stop a tool you add yourself (an MCP server for your mail, a script) from sending. The dial is a setting
   that ws records and reads in the Rule of Two. It doesn't block a send.
 - There is no `deny_send` setting and no check that a connector has no send scope.

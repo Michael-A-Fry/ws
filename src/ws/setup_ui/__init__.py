@@ -66,7 +66,7 @@ Examples:
   ws setup                            walk through it in this terminal
   ws setup --yes                      take the defaults, ask nothing
   ws setup --web                      use a page in your browser
-  ws setup --yes --region NZ --plugin finance --cap 20
+  ws setup --yes --region NZ --cap 20
   ws setup --notes ~/Obsidian/Vault   use an existing vault
 """
 

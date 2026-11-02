@@ -152,13 +152,24 @@ STYLE = _STYLE_A.strip("\n") + "\n" + css.PANEL + _STYLE_B.strip("\n") + "\n"
 
 CSS = css.stylesheet(STYLE)
 
+# An icon is the path of a 24 by 24 drawing, sent with each plugin the page offers: the page itself names no plugin.
+GRAPH_ICON = (
+    "M4 7a2 2 0 1 0 4 0a2 2 0 1 0-4 0M16 6a2 2 0 1 0 4 0a2 2 0 1 0-4 0M10 18a2 2 0 1 0 4 0a2 2 0 1 0-4 0"
+    "M8 8l8-1.5M7 9l4 7M17 8l-4 8"
+)
+PLUGIN_ICONS = {
+    "mail-drafts": "M3 5h18v14H3zM4 7.5l8 5.5 8-5.5",
+    "calendar": "M3.5 5h17v15h-17zM3.5 10h17M8 3v4M16 3v4",
+    "finance": "M4 19V5M4 19h16M8 15l3.5-4 3 2.5L20 7",
+}
+
 JS = """
 const B = JSON.parse(document.getElementById('boot').textContent);
 const T = new URLSearchParams(location.search).get('t');
 history.replaceState(null, '', location.pathname);  // the token stays in memory, not in the address bar
 const STEPS = ['Welcome', 'Core', 'Plugins', 'Notes', 'Review'];
-const ICON = {mail: 'M3 5h18v14H3zM4 7.5l8 5.5 8-5.5', calendar: 'M3.5 5h17v15h-17zM3.5 10h17M8 3v4M16 3v4',
-  finance: 'M4 19V5M4 19h16M8 15l3.5-4 3 2.5L20 7', graph: 'M4 7a2 2 0 1 0 4 0a2 2 0 1 0-4 0M16 6a2 2 0 1 0 4 0a2 2 0 1 0-4 0M10 18a2 2 0 1 0 4 0a2 2 0 1 0-4 0M8 8l8-1.5M7 9l4 7M17 8l-4 8'};
+const SHOWN = STEPS.map((n, i) => i).filter(i => i !== 2 || B.plugins.length);  // no plugin to choose, no Plugins step
+const after = s => SHOWN.find(i => i > s), before = s => SHOWN.slice().reverse().find(i => i < s);
 const h = (tag, props, ...kids) => {
   const e = document.createElement(tag);
   for (const [k, v] of Object.entries(props || {})) {
@@ -192,11 +203,11 @@ async function api(path, body) {
 const choice = () => ({plugins: [...picked], notes, cap: capText});
 
 function steps() {
-  document.getElementById('steps').replaceChildren(...STEPS.map((n, i) => h('li',
+  document.getElementById('steps').replaceChildren(...SHOWN.map((i, pos) => h('li',
     {class: done || i < step ? 'done' : i === step ? 'now' : '', ...(i === step ? {'aria-current': 'step'} : {})},
-    h('span', {class: 'n', text: done || i < step ? '✓' : String(i + 1)}),
-    i === step ? h('span', {class: 'mob', text: 'Step ' + (i + 1) + ' of ' + STEPS.length + ' ·'}) : null,
-    h('span', {class: 't', text: n}))));
+    h('span', {class: 'n', text: done || i < step ? '✓' : String(pos + 1)}),
+    i === step ? h('span', {class: 'mob', text: 'Step ' + (pos + 1) + ' of ' + SHOWN.length + ' ·'}) : null,
+    h('span', {class: 't', text: STEPS[i]}))));
 }
 
 function railCards() {
@@ -228,8 +239,8 @@ function welcome() {
   } else {
     out.push(h('h1', {text: 'Set up ws'}));
     out.push(h('p', {class: 'sub', text: 'About a minute. Nothing is written until you press Install.'}));
-    out.push(h('section', {class: 'panel'}, h('h2', {}, 'What happens', h('span', {text: '5 steps'})),
-      h('dl', {class: 'cmds'}, [['Core', 'is on already: memory, notes, skills and your rules.'], ['Plugins', 'you choose which to add.'],
+    out.push(h('section', {class: 'panel'}, h('h2', {}, 'What happens', h('span', {text: SHOWN.length + ' steps'})),
+      h('dl', {class: 'cmds'}, [['Core', 'is on already: memory, notes, skills and your rules.'], ...(B.plugins.length ? [['Plugins', 'you choose which to add.']] : []),
         ['Notes', 'you confirm the folder ws files notes in.'], ['Review', 'you see exactly what would change, then install.']].flatMap(([k, v]) => [h('dt', {text: k}), h('dd', {text: v})]))));
   }
   return out;
@@ -242,13 +253,13 @@ function core() {
 function plugins() {
   return [h('h1', {text: 'Choose your plugins'}),
     h('p', {class: 'sub'}, 'Each plugin adds one job. Add them now, or later with ', h('code', {text: 'ws plugin add'}), '.'),
-    h('div', {class: 'label'}, h('b', {text: 'Plugins'}), h('span', {text: 'Planned: a choice is recorded for now'})),
+    h('div', {class: 'label'}, h('b', {text: 'Plugins'}), h('span', {text: B.plugins.some(p => !p.built) ? 'Planned: a choice is recorded for now' : ''})),
     h('div', {class: 'plugs'}, B.plugins.map(p => {
       const input = h('input', {type: 'checkbox', value: p.name, ...(p.available ? {} : {disabled: ''})});
       input.checked = p.available && picked.has(p.name);
       input.addEventListener('change', () => { input.checked ? picked.add(p.name) : picked.delete(p.name); loadPlan(); });
       return h('label', {class: 'plug' + (p.available ? '' : ' na')}, input,
-        h('span', {class: 'ico'}, svg(ICON[p.icon], 22)),
+        h('span', {class: 'ico'}, svg(p.icon, 22)),
         h('b', {}, p.label, p.tag ? h('span', {class: 'tag', text: p.tag}) : null, p.current ? h('span', {class: 'tag', text: 'on now'}) : null),
         h('small', {text: p.available ? p.line : 'Not available in your region' + (p.why ? ' (' + p.why + ')' : '')}),
         h('span', {class: 'chk'}, svg('m5 12.5 4.5 4.5L19 7.5', 12)));
@@ -283,7 +294,7 @@ function review(err) {
   if (err) return [h('h1', {text: 'Review'}), h('section', {class: 'panel err'}, h('h2', {}, 'This cannot go ahead'), h('p', {class: 'sub', text: err}))];
   if (!p) return [h('h1', {text: 'Review'}), h('p', {class: 'sub', text: 'Working out what would change…'})];
   const names = B.plugins.filter(x => picked.has(x.name)).map(x => x.label);
-  const rows = [['Core', B.core.map(c => c.name).join(' · ')], ['Plugins', names.join(' · ') || 'none yet (ws plugin add later)'],
+  const rows = [['Core', B.core.map(c => c.name).join(' · ')], ...(B.plugins.length ? [['Plugins', names.join(' · ') || 'none yet (ws plugin add later)']] : []),
     ['Notes', p.notes], ...(p.cap ? [['Cap', 'US$' + p.cap + ' a month']] : []), ['Runner', B.runner || 'none yet (the gate files wait for one)'], ['Writes', p.headline]];
   const list = p.rows.filter(r => r.action !== 'keep' && r.kind === 'file');
   return [h('h1', {text: p.changes ? 'Ready to install' : 'Nothing to change'}),
@@ -341,11 +352,11 @@ async function go(to) {
     if (r.ok) { plan = r.j; draw(); } else { plan = null; draw(r.j.error || 'Something went wrong.'); }
   }
 }
-back.addEventListener('click', () => go(Math.max(0, step - 1)));
+back.addEventListener('click', () => go(before(step) ?? 0));
 next.addEventListener('click', async () => {
   if (done || busy) return;
-  if (step === 0 && B.setUp) return go(2);
-  if (step < 4) return go(step + 1);
+  if (step === 0 && B.setUp) return go(after(1));
+  if (step < 4) return go(after(step));
   if (plan && !plan.changes) { await api('/api/finish'); done = true; main.replaceChildren(h('h1', {text: 'Everything is set up'}), h('p', {class: 'sub', text: 'You can close this tab.'})); refreshBar(); steps(); return; }
   if (!plan) return;
   busy = true; refreshBar();
@@ -368,7 +379,6 @@ def _boot(facts: flow.Facts, c: flow.Choices) -> str:
     """Everything the page needs, from the real machine, as JSON (escaped so it cannot close the script tag)."""
     env = facts.env
     on = set(c.plugins)
-    icons = {"mail-drafts": "mail", "calendar": "calendar", "finance": "finance", "knowledge-graph": "graph"}
     runner = next((r for r in facts.runners if r.name == c.runner), None)
     options = [
         {"path": flow.tilde(v.path, env), "app": v.app}
@@ -395,7 +405,7 @@ def _boot(facts: flow.Facts, c: flow.Choices) -> str:
                 "why": p.why,
                 "on": p.name in on,
                 "current": p.name in facts.base.modules,
-                "icon": icons.get(p.name, "graph"),
+                "icon": PLUGIN_ICONS.get(p.name, GRAPH_ICON),
             }
             for p in facts.plugins
         ],

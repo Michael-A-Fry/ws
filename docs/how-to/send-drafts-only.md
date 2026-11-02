@@ -79,6 +79,6 @@ It prints `ws gate: blocked: command matches deny_commands rule 'sendmail*'` and
 - It doesn't stop a connector that has a send scope. ws can't see inside it.
 - It doesn't stop an interpreter running a script that sends. The wall limits what the script can write, not what it can
   send over the network.
-- It doesn't make drafts. No ws plugin drafts mail yet (`mail-drafts` is listed as "not built yet").
+- It doesn't make drafts. No ws plugin drafts mail yet.
 
 This gap is in [Known limits](../explanation/known-limits.md).

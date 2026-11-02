@@ -21,7 +21,7 @@ RUNNERS = ("claude-code", "opencode")
 # the number here goes down with it; a new known row has to raise it on purpose.
 STAGE_ALL = "git add " + "-A"  # what the bulk-staging guard stops
 STAGE_SOME = "git commit " + "-a -m x"
-KNOWN_BASELINE = {"oracle": 0, "parity": 4, "regression": 0, "control": 0}
+KNOWN_BASELINE = {"oracle": 0, "parity": 0, "regression": 0, "control": 0}
 
 
 @pytest.fixture

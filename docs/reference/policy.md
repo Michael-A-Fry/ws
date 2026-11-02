@@ -45,6 +45,7 @@ the built-in default, which has the list below.
 |---|---|---|---|
 | `deny_commands` | list of text | `[]` in a file | Shell command patterns no session may run. `ws gate init` writes the [built-in list](#built-in-deny_commands). |
 | `deny_read` | list of text | `[]` in a file | Paths no session may read. `~/` is your home. `**` crosses folders. `ws gate init` writes `~/.ssh/**`, `~/.gnupg/**`, `~/.aws/credentials` and `~/.config/ws/secrets/**`. Whatever the file says, ws also denies reads of its own secrets folder (`$WS_HOME/secrets`, and the `[roles.secrets] store` folder when the profile names one), for every runner. |
+| `allow_read` | list of text | `[]` in a file | Files inside a `deny_read` rule that hold no secret and may be read, never written: absolute or under `~/`, `*` stays in one folder, no `**`. `ws gate init` writes `~/.ssh/*.pub`, `~/.ssh/config` and `~/.ssh/known_hosts`. A path counts only when it and the file a link leads to are both listed; naming the folder, or a glob that could reach a private key, is still refused. A runner's own file rules and the wall do not read this key. |
 | `deny_tools` | list of text | `[]` | Neutral tool names to switch off. Known: `web_fetch`, `web_search`. An allowed web tool counts as a way out. |
 | `ask_commands` | list of text | `[]` | Command patterns that run only after you approve that exact call. Same globs as `deny_commands`. A command that also matches `deny_commands` stays denied. |
 | `allow_hosts` | list of text | `[]` | Hosts a session's shell may reach, for runners whose sandbox filters the network (Claude Code). Empty means the policy says nothing about the network. |
@@ -92,21 +93,30 @@ recognised however it's spelled. It reads:
 - Words: quotes and escapes are removed, and a brace group is expanded before anything else, as the shell does. Comma
   lists nest and chain, and `{1..40}` and `{a..e}` sequences (with a step, and zero padding such as `{01..10}`) are
   expanded in full. A quoted `{`, `,` or `}` isn't part of a group, so `'{a,b}'` is one word.
-- `~`, `$HOME` and `${HOME}`, `$WS_HOME` and the variables set earlier on the same line, including the `${NAME:-x}`,
-  `${NAME%/*}`, `${NAME/a/b}` and `${NAME:1:3}` forms. A quoted `~` is the folder called `~`, and a single-quoted
-  `$HOME` is text. A variable the line doesn't set is left as written.
+- `~`, `$HOME` and `${HOME}`, `$WS_HOME` and the variables set earlier on the same line (by `NAME=value`, `export`,
+  `declare`, `typeset`, `local`, `readonly`, `read NAME <<< word` and a `for` loop, which is read once for each word of
+  its list), including the `${NAME:-x}`, `${NAME:+x}`, `${NAME%/*}`, `${NAME##*/}`, `${NAME/a/b}`, `${NAME:1:3}` and
+  `${!NAME}` forms. The word of a default or alternative is expanded like any word. `~+`, `~-`, `$PWD` and `$OLDPWD`
+  follow `cd` on the same line. The case-change (`${NAME,,}`) and `@` (`${NAME@Q}`) operators and `${NAME[0]}` read as
+  the value, so a path is matched whatever its case. A quoted `~` is the folder called `~`, and a single-quoted `$HOME`
+  is text. A variable the line doesn't set is left as written.
 - Redirections: `<`, `>`, `>>`, `>|`, `<>`, `&>`, `&>>`, `>&`, here-strings, and file-descriptor forms such as `3<` and
   `2>`. Each target is expanded like any word, so a brace group in a target names every file it expands to.
 - Paths inside a word: the value of an option (`dd if=P`, `--opt=P`, `-oP`, `-sSLo P`), a file argument (`-F f=@P`,
   `-d @P`, `-F 'f=<P'`), a `file://` address, a path followed by a separator (a mount such as `-v P:/in/container`),
   and the files a wrapper takes (`xargs -a P`, `--arg-file=P`). Here `~` and `$HOME` count even inside quotes, because
   the program reads the text itself. A `host:path` remote isn't a local path.
-- Wrappers: `sudo`, `doas`, `env`, `xargs`, `timeout`, `nice`, `nohup`, `time` and the like are taken off the front.
+- Wrappers: `sudo`, `doas`, `env`, `xargs`, `timeout`, `nice`, `nohup`, `time` and the like are taken off the front. The
+  text that `env -S`, `su -c`, `runuser -c`, `flock -c`, `script -c` and `watch` give to a shell is read as a command
+  line of its own.
 
 The reader is bounded. A command may expand to at most 4,096 words in all, including the commands inside it, and
-braces may nest 64 deep. A command over a limit, and one that ends inside a quote, is refused with a reason that says
-so; it's never let through unread. `tests/test_shellwords_oracle.py` compares the reader with bash on a fixed set of
-spellings.
+braces may nest 64 deep. A variable that `%`, `#`, `/` or `:` works on may hold at most 4,096 characters, a `for` list
+at most 64 different words (a run of numbers counts as three), and reading one command line may take two seconds.
+Shells, substitutions and `eval` may nest four deep. A command over a limit, one that uses an expansion the reader
+doesn't follow (`${NAME:$n}`, `${!NAME}` for a name the line doesn't set), and one that ends inside a quote, is refused
+with a reason that says so; it's never let through unread. `tests/test_shellwords_oracle.py` compares the reader with
+bash on a fixed set of spellings.
 
 ## `[guards]`
 
@@ -166,6 +176,7 @@ acts = ["write"]
 
 [gate]
 deny_read = ["~/.ssh/**", "~/.gnupg/**", "~/.aws/credentials", "~/.config/ws/secrets/**"]
+allow_read = ["~/.ssh/*.pub", "~/.ssh/config", "~/.ssh/known_hosts"]
 deny_tools = ["web_fetch", "web_search"]
 ask_commands = ["git push*"]
 allow_hosts = ["api.anthropic.com", "github.com"]

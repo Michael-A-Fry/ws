@@ -145,7 +145,8 @@ def test_tilde_follows_an_equals_sign_in_a_word_that_looks_like_an_assignment():
 
 
 def test_a_variable_the_line_does_not_know_is_left_as_written():
-    assert words("$FOO ${BAR:-x} $1 $$ $") == ["$FOO", "${BAR:-x}", "$1", "$$", "$"]
+    assert words("$FOO ${BAR} ${BAR%x} $1 $$ $") == ["$FOO", "${BAR}", "${BAR%x}", "$1", "$$", "$"]
+    assert words("${BAR:-x}") == ["x"]  # the word of a default is what the shell makes of a variable it has not got
     assert sw.lex("cat ~/x $HOME").words == ["cat", "~/x", "$HOME"]  # no variables given: nothing is expanded
 
 

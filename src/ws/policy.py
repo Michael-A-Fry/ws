@@ -85,6 +85,7 @@ A call the policy lets through only with a human's say-so is `ask_commands`: see
 from __future__ import annotations
 
 import contextlib
+import itertools
 import os
 import posixpath
 import re
@@ -106,6 +107,7 @@ EGRESS_TOOLS = ("web_fetch", "web_search")
 _NAME = re.compile(r"^[A-Za-z0-9_-]+$")
 _HOST = re.compile(r"^(\*\.)?[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?$")
 _MAX_DEPTH = 4
+_TOO_DEEP = "the command nests shells, substitutions or eval too deeply to check; write the inner command out plainly"
 MAX_COMMAND_CHARS = 64 * 1024  # a longer command takes longer to judge than a runner's hook may run
 
 
@@ -133,6 +135,7 @@ class Source:
 class Gate:
     deny_commands: tuple[str, ...] = ()
     deny_read: tuple[str, ...] = ()
+    allow_read: tuple[str, ...] = ()  # paths inside a deny_read rule that hold no secret and may be read, never written
     deny_tools: tuple[str, ...] = ()
     ask_commands: tuple[str, ...] = ()  # run only with a single-use approval from a human (ws.approvals)
     allow_hosts: tuple[str, ...] = ()  # empty = the policy says nothing about the network
@@ -251,6 +254,9 @@ outward = []
 deny_commands = {arr(default_deny_commands())}
 # Paths no session may read. `~/` is your home; `**` crosses folders.
 deny_read = ["~/.ssh/**", "~/.gnupg/**", "~/.aws/credentials", "~/.config/ws/secrets/**"]
+# Files inside those that hold no secret and may be read (never written): public keys, the ssh config and known hosts.
+# `*` stays in one folder; a folder or a glob that could reach a private key is still refused.
+allow_read = ["~/.ssh/*.pub", "~/.ssh/config", "~/.ssh/known_hosts"]
 # Neutral tool names to switch off: {", ".join(KNOWN_TOOLS)}. An allowed web tool counts as a way out (leg C).
 deny_tools = []
 # Commands that run only after you approve that exact call, once: the gate refuses the first try and prints an id; in a
@@ -437,12 +443,13 @@ def loads(text: str) -> Policy:
     g = _table(
         raw.get("gate", {}),
         "[gate]",
-        {"deny_commands", "deny_read", "deny_tools", "ask_commands", "allow_hosts", "allow_write"},
+        {"deny_commands", "deny_read", "allow_read", "deny_tools", "ask_commands", "allow_hosts", "allow_write"},
     )
     deny_read = _strings(g, "deny_read", "[gate] ")
     gate = Gate(
         _strings(g, "deny_commands", "[gate] "),
         (*deny_read, *(r for r in secret_read_rules() if r not in deny_read)),
+        _strings(g, "allow_read", "[gate] "),
         _strings(g, "deny_tools", "[gate] "),
         _strings(g, "ask_commands", "[gate] "),
         _strings(g, "allow_hosts", "[gate] "),
@@ -457,6 +464,11 @@ def loads(text: str) -> Policy:
             raise PolicyError(
                 f"[gate] allow_write: {w!r} must be a folder, absolute or under ~/, with no wildcard, and not / or "
                 "the home folder (after `.` and `..` are resolved)"
+            )
+    for a in gate.allow_read:
+        if not a.startswith(("~/", "/", "$HOME/", "${HOME}/")) or "**" in a:
+            raise PolicyError(
+                f"[gate] allow_read: {a!r} must be a file path, absolute or under ~/, with no `**` (a `*` stays in one folder)"
             )
     for t in gate.deny_tools:
         if t not in KNOWN_TOOLS:
@@ -614,9 +626,13 @@ class _Ctx:
     vars: dict[str, str] | None = None
     heredocs: bool = False  # read the command line with here-document bodies left out (a second reading, never alone)
     budget: shellwords.Budget = field(default_factory=shellwords.Budget)  # shared by every part of one command line
+    oldpwd: str = ""  # the folder before the last `cd` (`cd -`, `~-`, `$OLDPWD`)
+    loops: dict[str, list[str]] | None = None  # a `for` variable and the words it takes in turn
 
     def fork(self) -> _Ctx:
-        return _Ctx(self.cwd, self.protect, dict(self.vars or {}), budget=self.budget)
+        return _Ctx(
+            self.cwd, self.protect, dict(self.vars or {}), budget=self.budget, oldpwd=self.oldpwd, loops=self.loops
+        )
 
 
 def _home() -> str:
@@ -630,9 +646,13 @@ def _cwd() -> str:
         return "/"
 
 
-def _env(known: dict[str, str] | None = None) -> dict[str, str]:
-    """The variables a command word may use: `HOME` and `WS_HOME`, then what earlier parts of the line set."""
-    return {"HOME": _home().rstrip("/") or "/", "WS_HOME": str(ws_home()), **(known or {})}
+def _env(known: dict[str, str] | None = None, cwd: str = "", oldpwd: str = "") -> dict[str, str]:
+    """The variables a command word may use: `HOME` and `WS_HOME`, the folder the command runs in as `PWD` (and the one
+    before the last `cd` as `OLDPWD`) when it is given, then what earlier parts of the line set."""
+    where = {"PWD": cwd} if cwd else {}
+    if oldpwd:
+        where["OLDPWD"] = oldpwd
+    return {"HOME": _home().rstrip("/") or "/", "WS_HOME": str(ws_home()), **where, **(known or {})}
 
 
 def _expand(path: str) -> str:
@@ -861,6 +881,12 @@ def _rules(deny_read: tuple[str, ...], home: str, ws: str) -> tuple[tuple[str, r
     return tuple((rule, _path_regex(rule), _rule_root(rule)) for rule in deny_read)
 
 
+@lru_cache(maxsize=16)
+def _allowed(allow_read: tuple[str, ...], home: str, ws: str) -> tuple[re.Pattern, ...]:
+    """The allow_read paths as patterns, made once (`home` and `ws` are only the cache key, as for _rules)."""
+    return tuple(_path_regex(a) for a in allow_read)
+
+
 def _read_hit(
     policy: Policy, path: str, cwd: str, recursive: bool = False, folder: bool = True, expand: bool = True
 ) -> str | None:
@@ -877,9 +903,12 @@ def _read_hit(
         forms.add(os.path.realpath(p))  # a symlink into a denied folder is still that folder
     except OSError:
         pass
+    allowed = _allowed(policy.gate.allow_read, _home(), os.environ.get("WS_HOME", ""))
     for rule, rx, root in _rules(policy.gate.deny_read, _home(), os.environ.get("WS_HOME", "")):
         for f in forms:
             if rx.match(f):
+                if any(a.match(f) for a in allowed):  # every form must be allowed: a link to a private key is not
+                    continue
                 return rule
             if root is None:
                 continue
@@ -959,7 +988,7 @@ def _walk(policy: Policy, cmd: str, ctx: _Ctx, depth: int, cands: list[str]) -> 
     """Look at every part of a command line. Fills `cands` with the strings the deny globs are tried on and returns
     the reason at once for the checks that are not globs (pipe into a shell, denied paths, protected files)."""
     if depth > _MAX_DEPTH:
-        raise ValueError("command nests too deeply to check")
+        raise shellwords.ShellError("too_deep", _TOO_DEEP)
     pipelines, inner = shellwords.scan(shellwords.prep(cmd), heredocs=ctx.heredocs and depth == 0)
     nested: list[str] = list(inner)
     for segs in pipelines:
@@ -979,20 +1008,100 @@ def _walk(policy: Policy, cmd: str, ctx: _Ctx, depth: int, cands: list[str]) -> 
     return None
 
 
+_DECLARERS = ("export", "declare", "typeset", "local", "readonly")
+_READ_TAKES = frozenset(["a", "d", "i", "n", "N", "p", "t", "u"])  # the options of `read` that take a value
+_MAX_LOOP_WORDS = 64  # different words a `for` list may hold before a command that uses its variable is refused
+_MAX_LOOP_RUNS = 256  # readings of one command for the words of the `for` loops around it
+
+
+def _read_values(toks: list[str], redirs: list[shellwords.Redirect]) -> dict[str, str]:
+    """The variables `read -r NAME... <<< word` sets: the word split on blanks, the last name taking the rest."""
+    here = [t for op, t in redirs if op == "<<<"]
+    if not here:
+        return {}
+    names: list[str] = []
+    i = 1
+    while i < len(toks):
+        t = toks[i]
+        if t == "--":
+            names += toks[i + 1 :]
+            break
+        if t.startswith("-") and len(t) > 1:
+            i += 2 if t[-1] in _READ_TAKES else 1
+        else:
+            names.append(t)
+            i += 1
+    if not names:
+        return {"REPLY": here[-1]}
+    parts = here[-1].split(None, len(names) - 1)
+    return {n: (parts[k] if k < len(parts) else "") for k, n in enumerate(names) if shellwords.ASSIGN.match(n + "=")}
+
+
+def _loop_words(words: list[str]) -> list[str]:
+    """The words of a `for` list, one reading each: a run of numbers counts as three (it is the same command with
+    other numbers in it), and a list longer than _MAX_LOOP_WORDS is refused."""
+    out: list[str] = []
+    numbers = 0
+    for w in words:
+        if w.isdigit():
+            numbers += 1
+            if numbers > 3:
+                continue
+        if w not in out:
+            out.append(w)
+    if len(out) > _MAX_LOOP_WORDS:
+        raise shellwords.ShellError(
+            "too_many_words",
+            f"a for loop takes more than {_MAX_LOOP_WORDS} different words; use a file and a read loop",
+        )
+    return out
+
+
 def _segment(policy: Policy, seg: str, ctx: _Ctx, in_pipe: bool, cands: list[str]) -> tuple[str | None, str, list[str]]:
+    """One pipeline segment, judged once for each word its `for` variables take (a loop's body runs for every word of
+    its list), and the first refusal returned."""
+    used = [n for n in ctx.loops or {} if re.search(r"\$\{?" + re.escape(n) + r"(?![A-Za-z0-9_])", seg)]
+    if not used:
+        return _segment_once(policy, seg, ctx, in_pipe, cands, {})
+    assert ctx.loops is not None
+    runs = list(itertools.product(*(ctx.loops[n] for n in used)))
+    if len(runs) > _MAX_LOOP_RUNS:
+        raise shellwords.ShellError(
+            "too_many_words", "the for loops around this command take too many word combinations"
+        )
+    nested: list[str] = []
+    last: tuple[str, list[str]] = ("", [])
+    for run in runs:
+        reason, canon, more = _segment_once(policy, seg, ctx, in_pipe, cands, dict(zip(used, run, strict=True)))
+        if reason:
+            return reason, canon, more
+        last = (canon, more)
+        nested += more
+    return None, last[0], nested
+
+
+def _segment_once(
+    policy: Policy, seg: str, ctx: _Ctx, in_pipe: bool, cands: list[str], loop_vars: dict[str, str]
+) -> tuple[str | None, str, list[str]]:
     cands.append(" ".join(seg.split()))
-    env = _env(ctx.vars)
+    env = _env({**(ctx.vars or {}), **loop_vars}, ctx.cwd, ctx.oldpwd)
     lexed = shellwords.lex(seg, env, ctx.budget)
     words, redirs = lexed.words, lexed.redirs
     if not words and not redirs:
         return None, "", []
     if words and all(shellwords.ASSIGN.match(w) for w in words):  # X=/ ; later $X
         ctx.vars = {**(ctx.vars or {}), **dict(w.split("=", 1) for w in words)}
-    elif len(words) > 3 and words[0] == "for" and words[2] == "in":  # for i in /; do ... $i
-        ctx.vars = {**(ctx.vars or {}), words[1]: words[3]}
+    elif len(words) > 3 and words[0] == "for" and words[2] == "in":  # for i in a b; do ... $i
+        listed = _loop_words(words[3:])
+        ctx.loops = {**(ctx.loops or {}), words[1]: listed}
+        ctx.vars = {**(ctx.vars or {}), words[1]: words[-1]}  # what the variable holds once the loop is done
     nested: list[str] = []
     dropped: list[str] = []
     toks, wrappers = shellwords.strip_wrappers(words, lexenv=env, budget=ctx.budget, dropped=dropped, scripts=nested)
+    if toks and toks[0] in _DECLARERS:  # export X=/ ; declare -x X=/ ; local X=/
+        ctx.vars = {**(ctx.vars or {}), **dict(w.split("=", 1) for w in toks[1:] if shellwords.ASSIGN.match(w))}
+    elif toks and toks[0] == "read":  # read -r X <<< /
+        ctx.vars = {**(ctx.vars or {}), **_read_values(toks, redirs)}
     canon = _canon_tokens(toks)
     line = " ".join(canon)
     if line:
@@ -1001,7 +1110,9 @@ def _segment(policy: Policy, seg: str, ctx: _Ctx, in_pipe: bool, cands: list[str
     flags, operands = shellwords.split_args(canon)
 
     if cmd in ("cd", "pushd"):
-        ctx.cwd = _abs(operands[0] if operands else "~", ctx.cwd)
+        target = operands[0] if operands else "~"
+        if target != "-" or ctx.oldpwd:
+            ctx.oldpwd, ctx.cwd = ctx.cwd, _abs(ctx.oldpwd if target == "-" else target, ctx.cwd)
     admin = _ws_admin(canon)
     if admin:
         return admin, line, []
@@ -1198,11 +1309,14 @@ def simple_commands(command: str, _depth: int = 0, *, git_options: bool = False)
     return [words for words, _ in simple_commands_env(command, _depth, git_options=git_options) if words]
 
 
-def _seg_words(seg: str, git_options: bool, budget: shellwords.Budget) -> tuple[list[str], list[str], list[str]]:
-    """(words, assignments, nested command texts) of one pipeline segment: what simple_commands_env reads from it."""
+def _seg_words(
+    seg: str, git_options: bool, budget: shellwords.Budget, known: dict[str, str]
+) -> tuple[list[str], list[str], list[str]]:
+    """(words, assignments, nested command texts) of one pipeline segment: what simple_commands_env reads from it.
+    `known` holds the variables earlier segments of the same line set; a segment of only assignments adds to it."""
     env: list[str] = []
     nested: list[str] = []
-    lexenv = _env()
+    lexenv = _env(known)
     toks, _ = shellwords.strip_wrappers(
         shellwords.words_of(seg, lexenv, budget), env, lexenv=lexenv, budget=budget, scripts=nested
     )
@@ -1214,6 +1328,8 @@ def _seg_words(seg: str, git_options: bool, budget: shellwords.Budget) -> tuple[
         flags, operands = shellwords.split_args(toks)
         if shellwords.has_flag(flags, "c") and operands:
             nested.append(operands[0])
+    if not toks:  # `X=/` on its own: later words may use it
+        known.update(w.split("=", 1) for w in env)
     return toks, env, nested
 
 
@@ -1222,24 +1338,33 @@ def simple_commands_env(
 ) -> list[tuple[list[str], list[str]]]:
     """simple_commands with the `VAR=value` words each command was given before it (a prefix, or after `env`), as
     (words, assignments). A line that only sets variables comes back with no words, so a check sees `X=1; cmd`.
-    Raises ShellError for a command that expands to more words than the reader allows."""
+    Raises ShellError for a command that expands to more words than the reader allows, nests too deeply or takes
+    too long to read."""
+    with shellwords.time_limit():
+        return _commands_env(command, _depth, git_options, _budget)
+
+
+def _commands_env(
+    command: str, _depth: int, git_options: bool, _budget: shellwords.Budget | None
+) -> list[tuple[list[str], list[str]]]:
     if not isinstance(command, str):
         raise TypeError("command must be text")
     if _depth > _MAX_DEPTH:
-        raise ValueError("command nests too deeply to check")
+        raise shellwords.ShellError("too_deep", _TOO_DEEP)
     budget = _budget or shellwords.Budget()
     pipelines, inner = shellwords.scan(shellwords.prep(command), heredocs=not shellwords.folds(command))
     found: list[tuple[list[str], list[str]]] = []
     nested = list(inner)
+    known: dict[str, str] = {}
     for segs in pipelines:
         for seg in segs:
-            toks, env, more = _seg_words(seg, git_options, budget)
+            toks, env, more = _seg_words(seg, git_options, budget, known)
             if not toks and not env:
                 continue
             found.append((toks, env))
             nested += more
     for text in nested:
-        found += simple_commands_env(text, _depth + 1, git_options=git_options, _budget=budget)
+        found += _commands_env(text, _depth + 1, git_options, budget)
     return found
 
 
@@ -1252,26 +1377,34 @@ def simple_commands_flow(
     structure: `(` opens and `)` closes a subshell (also what a nested `bash -c`, `eval` or `$(...)` runs in; the
     text of a `$(...)` has no known place, so its mark is `(?`), and `&` says the command before it ran in the
     background."""
+    with shellwords.time_limit():
+        return _commands_flow(command, _depth, git_options, _budget)
+
+
+def _commands_flow(
+    command: str, _depth: int, git_options: bool, _budget: shellwords.Budget | None
+) -> list[tuple[list[str], list[str], str, bool]]:
     if not isinstance(command, str):
         raise TypeError("command must be text")
     if _depth > _MAX_DEPTH:
-        raise ValueError("command nests too deeply to check")
+        raise shellwords.ShellError("too_deep", _TOO_DEEP)
     budget = _budget or shellwords.Budget()
     flow: list = []
     pipelines, inner = shellwords.scan(shellwords.prep(command), heredocs=not shellwords.folds(command), flow=flow)
     steps: list[tuple[list[str], list[str], str, bool]] = []
     link = ";"
+    known: dict[str, str] = {}
 
     def nest(text: str, mark: str) -> None:
         steps.append(([], [], mark, False))
-        steps.extend(simple_commands_flow(text, _depth + 1, git_options=git_options, _budget=budget))
+        steps.extend(_commands_flow(text, _depth + 1, git_options, budget))
         steps.append(([], [], ")", False))
 
     for item in flow:
         if isinstance(item, int):
             segs = pipelines[item]
             for seg in segs:
-                toks, env, more = _seg_words(seg, git_options, budget)
+                toks, env, more = _seg_words(seg, git_options, budget, known)
                 if toks or env:
                     steps.append((toks, env, link, len(segs) > 1))
                 for text in more:
@@ -1327,8 +1460,9 @@ def is_denied_command(
         )
     cands: list[str] = []
     try:
-        shellwords.require_closed(command)
-        reason = _walk_command(policy, command, cwd or _cwd(), tuple(protect), cands)
+        with shellwords.time_limit():
+            shellwords.require_closed(command)
+            reason = _walk_command(policy, command, cwd or _cwd(), tuple(protect), cands)
     except shellwords.ShellError as e:  # text the reader will not expand: a refusal, with the kind kept in the error
         return e.message
     if reason:
@@ -1349,7 +1483,8 @@ def needs_approval(policy: Policy, command: str, *, cwd: str | None = None) -> b
     if not policy.gate.ask_commands:
         return False
     cands: list[str] = []
-    _walk_command(policy, command, cwd or _cwd(), (), cands)
+    with shellwords.time_limit():
+        _walk_command(policy, command, cwd or _cwd(), (), cands)
     return any(_glob_regex(_canon_pattern(pat)).match(c) for pat in policy.gate.ask_commands for c in cands)
 
 

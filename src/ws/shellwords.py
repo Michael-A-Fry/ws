@@ -13,39 +13,73 @@ A command line is read the way a shell reads it, so a path is recognised however
     `option_values` sort what is left into flags, operands and the values options take.
 
 What it promises. A shell word that is quoted is the text between the quotes: `'{a,b}'` is one word and `'~/x'` names a
-folder called `~`. Expansion is bounded: a `Budget` caps the words that brace expansion may make for one command, and
-a command that goes over, or text it cannot read, raises `ShellError` with a `kind`; callers treat that as a refusal
-and never as an allow. It reads text only: what a command substitution prints, or a variable the line does not set,
-is not known and is left as written.
+folder called `~`. Expansion is bounded: a `Budget` caps the words that brace expansion may make for one command, a
+value that an operator works on may not be longer than `MAX_VALUE`, and `time_limit` puts a deadline on the whole read.
+A command that goes over, or text it cannot read or an expansion it does not know, raises `ShellError` with a `kind`;
+callers treat that as a refusal and never as an allow. It reads text only: what a command substitution prints, or a
+variable the line does not set, is not known and is left as written.
 
 Stdlib only. Nothing here knows about a policy; ws.policy decides what a word means.
 """
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
+import fnmatch
+import functools
 import itertools
 import os
 import posixpath
 import re
+import time
 import unicodedata
-from collections.abc import Mapping
-from fnmatch import fnmatchcase
+from collections.abc import Iterator, Mapping
 from typing import NamedTuple
 
 MAX_WORDS = 4096  # words that brace expansion may add for one command; more is refused, not slowed down
 MAX_BRACE_DEPTH = 64  # nested brace groups in one word
+# Characters in a variable that `%`, `#`, `/` and `:` work on; a longer one is refused, not slowed down.
+MAX_VALUE = 4096
+TIME_LIMIT = 2.0  # seconds the reader may take over one command line, well inside a runner's hook time-out
 PROCSUB = "/dev/fd/63"  # what `<(...)` becomes
 WRITE_OPS = (">", ">>", ">|", ">&", "&>", "&>>", "<>")  # redirections that write to their target
 
 
 class ShellError(ValueError):
-    """Text the reader cannot read or will not expand. `kind` is one of unclosed_quote, too_many_words,
-    too_deep; callers branch on it, never on the message."""
+    """Text the reader cannot read or will not expand. `kind` is one of unclosed_quote, too_many_words, too_deep,
+    too_long (a value past MAX_VALUE), too_slow (past the time limit) and unsupported (an expansion it does not know);
+    callers branch on it, never on the message."""
 
     def __init__(self, kind: str, message: str):
         super().__init__(message)
         self.kind = kind
         self.message = message
+
+
+_deadline: contextvars.ContextVar[float | None] = contextvars.ContextVar("ws_shell_deadline", default=None)
+
+
+@contextlib.contextmanager
+def time_limit(seconds: float | None = None) -> Iterator[None]:
+    """Everything the reader does inside this block must finish within `seconds` (TIME_LIMIT when not given), or it
+    raises ShellError (kind `too_slow`). A block inside another keeps the outer clock; with none, the reader is not
+    timed. A check calls this once around a whole command line."""
+    if _deadline.get() is not None:
+        yield
+        return
+    token = _deadline.set(time.monotonic() + (TIME_LIMIT if seconds is None else seconds))
+    try:
+        yield
+    finally:
+        _deadline.reset(token)
+
+
+def tick() -> None:
+    """Called from the loops that can run long: raises ShellError (kind `too_slow`) once the deadline has passed."""
+    limit = _deadline.get()
+    if limit is not None and time.monotonic() > limit:
+        raise ShellError("too_slow", "the command takes too long to read; split it into smaller commands")
 
 
 class Budget:
@@ -153,6 +187,8 @@ def join_lines(cmd: str) -> str:
     out: list[str] = []
     n, i, quote = len(cmd), 0, ""
     while i < n:
+        if i & 63 == 0:
+            tick()
         c = cmd[i]
         if quote == "'":  # no escapes inside; a backslash-newline is joined here as it always was
             if cmd.startswith("\\\n", i):
@@ -317,6 +353,8 @@ def scan(
             flow.append(op)
 
     while i < n:
+        if i & 63 == 0:
+            tick()
         c = cmd[i]
         if c == "\\" and quote != "'" and i + 1 < n:
             buf.append(cmd[i : i + 2])
@@ -469,6 +507,8 @@ def close_paren(cmd: str, i: int) -> int:
     """Index of the ')' that closes a '$(' whose body starts at i (the end of the text if it never closes)."""
     depth, quote = 1, ""
     while i < len(cmd):
+        if i & 63 == 0:
+            tick()
         c = cmd[i]
         if c == "\\" and quote != "'":
             i += 2
@@ -511,8 +551,70 @@ _WRAPPERS = {
     "watch": {"-n"},
     "xargs": {"-I", "-n", "-P", "-d", "-E", "-s", "-L", "-a", "-J"},
     "busybox": set(),
+    "chroot": set(),
+    "flock": {"-w", "-E"},
+    "su": {"-g", "-G", "-s", "-w"},
+    "runuser": {"-u", "-g", "-G", "-s", "-w"},
+    "script": {"-T", "-I", "-O", "-B", "-E", "-m", "-o"},
 }
-_LONG_ARG = {"timeout": {"--signal", "--kill-after"}, "sudo": {"--user", "--group", "--host", "--prompt"}}
+_LONG_ARG = {
+    "timeout": {"--signal", "--kill-after"},
+    "sudo": {"--user", "--group", "--host", "--prompt"},
+    "watch": {"--interval"},
+    "flock": {"--timeout", "--conflict-exit-code"},
+    "chroot": {"--userspec", "--groups"},
+}
+# Words a wrapper takes before the command: the duration, the new root, the lock.
+_POSITIONAL = {"timeout": 1, "chroot": 1, "flock": 1}
+# Wrappers that run a `-c` text through a shell. A text is looked for among the options and at most one name (a user, a lock
+# file, a typescript file); `script` and `su` run nothing else, and `su` or `script` with no `-c` run nothing a check can read.
+_SHELL_TEXT = {"su", "runuser", "flock", "script"}
+
+
+def _shell_text(w: str, toks: list[str]) -> str | None:
+    """The `-c TEXT` (`-cTEXT`, `-lc TEXT`, `--command=TEXT`) of `su`, `runuser`, `flock` or `script`: the text a shell
+    runs. Only the options, and at most one name before or among them, are read, so the `-c` of the program they
+    start is not taken for theirs."""
+    arg_opts, names, i = _WRAPPERS[w], 0, 1
+    while i < len(toks):
+        t = toks[i]
+        if t == "--":
+            return None
+        if t == "--command":
+            return toks[i + 1] if i + 1 < len(toks) else ""
+        if t.startswith("--command="):
+            return t.split("=", 1)[1]
+        if t.startswith("--"):
+            i += 2 if t in _LONG_ARG.get(w, ()) else 1
+        elif t.startswith("-") and len(t) > 1:
+            for k, ch in enumerate(t[1:], 1):
+                if ch == "c":
+                    return t[k + 1 :] or (toks[i + 1] if i + 1 < len(toks) else "")
+                if "-" + ch in arg_opts:
+                    i += 0 if k + 1 < len(t) else 1
+                    break
+            i += 1
+        else:
+            names += 1
+            if names > 1:
+                return None
+            i += 1
+    return None
+
+
+def _env_split(t: str, nxt: str | None) -> tuple[str, int] | None:
+    """(text, words used) when the `env` option `t` is a split string: `-S`, `-Stext`, `-iS`, `--split-string=text`. The
+    text is the glued part or the next word. None for any other option; `-u` and `-C` take a name, which may hold an S."""
+    if t.startswith("--split-string="):
+        return t.split("=", 1)[1], 1
+    if t.startswith("--") or not t.startswith("-"):
+        return None
+    for k, ch in enumerate(t[1:], 1):
+        if ch in "uC":
+            return None
+        if ch == "S":
+            return (t[k + 1 :], 1) if k + 1 < len(t) else (nxt or "", 2)
+    return None
 
 
 def strip_wrappers(
@@ -527,10 +629,12 @@ def strip_wrappers(
     """Drop leading keywords, VAR=value and exec wrappers (sudo, env, timeout, nice, xargs, busybox ...): what is left
     is the command that really runs. Also returns the wrappers it removed. If `env` is given, the VAR=value words it
     drops (a prefix, or the ones `env` sets) are added to it. `dropped` gets the words a wrapper took as its own
-    (`-a FILE` of xargs, the user of `sudo -u`), and `scripts` the text of an `env -S` string, which runs as a command
-    line of its own; `lexenv` and `budget` are for reading that string (see `lex`)."""
+    (`-a FILE` of xargs, the user of `sudo -u`), and `scripts` the text a shell runs for the wrapper: an `env -S`
+    string, the `-c` text of `su`, `flock` and `script`, and what `watch` is given to run; each is a command line of its
+    own. `lexenv` and `budget` are for reading an `env -S` string (see `lex`)."""
     toks, seen = list(words), set()
     while toks:
+        tick()
         w = toks[0]
         if w in KEYWORDS or ASSIGN.match(w):
             if env is not None and ASSIGN.match(w):
@@ -542,7 +646,14 @@ def strip_wrappers(
         if w not in _WRAPPERS:
             break
         seen.add(w)
-        arg_opts, i, resplit = _WRAPPERS[w], 1, None
+        if w in _SHELL_TEXT:
+            text = _shell_text(w, toks)
+            if text is not None or w in ("su", "script"):
+                if text and scripts is not None:
+                    scripts.append(text)
+                toks = []
+                break
+        arg_opts, i, resplit, exec_form = _WRAPPERS[w], 1, None, False
         while i < len(toks):
             t = toks[i]
             if t == "--":
@@ -552,9 +663,15 @@ def strip_wrappers(
                 resplit = toks[i + 1] if i + 1 < len(toks) else ""
                 i += 2
                 break
+            if w == "env" and (got := _env_split(t, toks[i + 1] if i + 1 < len(toks) else None)):
+                resplit = got[0]
+                i += got[1]
+                break
             if t.startswith("--"):
+                exec_form = exec_form or (w == "watch" and t == "--exec")
                 i += 2 if t in _LONG_ARG.get(w, ()) else 1
             elif t.startswith("-") and len(t) > 1:
+                exec_form = exec_form or (w == "watch" and "x" in t[1:])
                 i += 2 if "-" + t[-1] in arg_opts else 1  # `-u root`, and the `u` of `-iu root`
             elif w == "env" and ASSIGN.match(t):
                 if env is not None:
@@ -562,12 +679,17 @@ def strip_wrappers(
                 i += 1
             else:
                 break
-        if w == "timeout" and i < len(toks):
-            i += 1  # the duration
+        if i < len(toks):
+            i += _POSITIONAL.get(w, 0)
         if dropped is not None:
             dropped += [t for t in toks[1:i] if not t.startswith("-") and not ASSIGN.match(t)]
         if resplit and scripts is not None:
             scripts.append(resplit)
+        if w == "watch" and not exec_form and i < len(toks):  # watch gives its words to `sh -c` joined
+            if scripts is not None:
+                scripts.append(" ".join(toks[i:]))
+            toks = []
+            break
         toks = (words_of(resplit, lexenv, budget) if resplit else []) + toks[i:]
     return toks, seen
 
@@ -633,6 +755,8 @@ def _read_raw(seg: str, i: int) -> int:
     and backticks are read whole, so the blanks and `>` inside them do not end the word."""
     n = len(seg)
     while i < n:
+        if i & 63 == 0:
+            tick()
         c = seg[i]
         if c in " \t\r\n<>":
             break
@@ -742,6 +866,8 @@ def _expand_units(units: list[str], budget: Budget, depth: int) -> list[str]:
     lit: list[str] = []
     i, n = 0, len(units)
     while i < n:
+        if i & 63 == 0:
+            tick()
         if units[i] == "{" and i in close:
             end, commas = close[i]
             alts: list[str] | None
@@ -789,40 +915,153 @@ _SPLIT = re.compile(r"([ \t\r\n]+)")
 
 
 def _tilde(name: str, env: Mapping[str, str]) -> str | None:
-    """What `~name` stands for: the home folder for a bare `~`, the named user's, or None when it is not known."""
+    """What `~name` stands for: the home folder for a bare `~`, the working folder for `~+` and the last one for `~-`
+    (when `env` knows them), the named user's, or None when it is not known."""
     if not name:
         return env.get("HOME")
+    if name in ("+", "-"):
+        return env.get("PWD" if name == "+" else "OLDPWD")
     path = os.path.expanduser("~" + name)
     return None if path.startswith("~") else path
 
 
-def _param(body: str, env: Mapping[str, str]) -> str | None:
-    """The value of `${body}` for a variable `env` knows (with `:-`, `:=`, `:+`, `%`, `#`, `/` and `:offset:length`
-    operators), or None when the variable or the operator is not known: the text is then left as written."""
-    m = _NAME.match(body)
-    if not m or m.group() not in env:
-        return None
-    val, rest = env[m.group()], body[m.end() :]
-    if not rest:
+_GLOB_CHARS = re.compile(r"[*?\[\\'\"]")
+
+
+class _Glob:
+    """A shell pattern (`*`, `?`, `[...]`, a backslash or quotes for a plain character) as steps for a matcher that
+    walks the text once. `mask(ch)` is the set of steps that accept `ch`, as bits; `star` the steps that are a `*`."""
+
+    def __init__(self, pat: str, reverse: bool):
+        steps: list[tuple[str, object]] = []  # ("*", None), ("?", None), ("c", char) or ("[", compiled class)
+        i, n = 0, len(pat)
+        while i < n:
+            c = pat[i]
+            if c == "\\" and i + 1 < n:
+                steps.append(("c", pat[i + 1]))
+                i += 2
+            elif c in "'\"" and (j := pat.find(c, i + 1)) > 0:
+                steps += [("c", ch) for ch in pat[i + 1 : j]]
+                i = j + 1
+            elif c == "[" and (j := self._class_end(pat, i)) > 0:
+                steps.append(("[", re.compile(fnmatch.translate(pat[i : j + 1]))))
+                i = j + 1
+            else:
+                if c == "*" and steps and steps[-1][0] == "*":
+                    i += 1
+                    continue
+                steps.append((c, None) if c in "*?" else ("c", c))
+                i += 1
+        if reverse:
+            steps.reverse()
+        self.steps = steps
+        self.star = sum(1 << k for k, (kind, _) in enumerate(steps) if kind == "*")
+        self.accept = 1 << len(steps)
+        self._masks: dict[str, int] = {}
+
+    @staticmethod
+    def _class_end(pat: str, i: int) -> int:
+        j = i + 1
+        if pat[j : j + 1] in ("!", "^"):
+            j += 1
+        if pat[j : j + 1] == "]":
+            j += 1
+        j = pat.find("]", j)
+        return j
+
+    def mask(self, ch: str) -> int:
+        got = self._masks.get(ch)
+        if got is None:
+            got = 0
+            for k, (kind, data) in enumerate(self.steps):
+                if kind == "?" or (kind == "c" and data == ch) or (kind == "[" and data.match(ch)):  # type: ignore[union-attr]
+                    got |= 1 << k
+            self._masks[ch] = got
+        return got
+
+    def reach(self, text: str) -> list[int]:
+        """The lengths of the prefixes of `text` that the whole pattern matches, shortest first. One pass over the text:
+        the set of steps still alive is carried along as bits, so the time is the text times the pattern and no
+        backtracking is done, however many stars there are."""
+        alive = 1
+        alive |= (alive & self.star) << 1
+        found = [0] if alive & self.accept else []
+        for k, ch in enumerate(text, 1):
+            if k % 256 == 0:
+                tick()
+            alive = ((alive & self.mask(ch)) << 1) | (alive & self.star)
+            alive |= (alive & self.star) << 1
+            if not alive:
+                break
+            if alive & self.accept:
+                found.append(k)
+        return found
+
+
+@functools.lru_cache(maxsize=256)
+def _strip(val: str, pat: str, prefix: bool, longest: bool) -> str:
+    """`val` with its shortest or longest prefix (`#`, `##`) or suffix (`%`, `%%`) that matches `pat` taken off: the
+    value of `${X#pat}` and the like. Nothing is taken off when none matches."""
+    if not _GLOB_CHARS.search(pat):
+        if prefix:
+            return val.removeprefix(pat)
+        return val[: len(val) - len(pat)] if pat and val.endswith(pat) else val
+    glob = _Glob(pat, reverse=not prefix)
+    hits = glob.reach(val if prefix else val[::-1])
+    if not hits:
         return val
-    colon = rest[0] == ":"
+    k = hits[-1] if longest else hits[0]
+    return val[k:] if prefix else val[: len(val) - k]
+
+
+_SUBSCRIPT = re.compile(r"\[([^\]]*)\]")
+
+
+def _param(body: str, env: Mapping[str, str], strict: bool = True) -> str | None:
+    """The value of `${body}` for a variable `env` knows (with `:-`, `:=`, `:+`, `%`, `#`, `/` and `:offset:length`
+    operators, `[0]`, `${!NAME}`, and the case-change and `@` operators, which read as the value itself: a path is
+    matched whatever its case), or None when the variable is not known: the text is then left as written. An
+    operator it does not know raises ShellError (kind `unsupported`). Where a default or alternative is used, its
+    word is expanded as the shell does. A variable the line does not set takes the default of `${NAME:-word}`, and
+    reads as set for `${NAME:+word}`, which is the reading that names a path."""
+    if body.startswith("!"):
+        target = env.get(body[1:]) if _NAME.fullmatch(body[1:]) else None
+        if target is not None and _NAME.fullmatch(target) and target in env:
+            return env[target]
+        raise ShellError("unsupported", f"${{{body}}} names a variable the command does not set, so it cannot be read")
+    m = _NAME.match(body)
+    if not m:
+        return None
+    name, rest = m.group(), body[m.end() :]
+    known = name in env
+    sub = _SUBSCRIPT.match(rest)
+    if sub:
+        if known and sub.group(1) not in ("0", "@", "*"):
+            raise ShellError("unsupported", f"${{{body}}} indexes a variable that holds one value")
+        rest = rest[sub.end() :]
+    colon = rest[:1] == ":"
     op = rest[1:2] if colon else rest[:1]
     arg = rest[2:] if colon else rest[1:]
-    if op in ("-", "="):
-        return val if val or not colon else arg
-    if op == "+":
-        return arg if val or not colon else ""
-    if op == "?":
+    if not known:
+        if op in ("-", "=") and (colon or rest[:1] in ("-", "=")):
+            return _word(arg, env)
+        if op == "+" and (colon or rest[:1] == "+"):
+            return _word(arg, env)
+        return None
+    val = env[name]
+    if not rest:
+        return val
+    if len(val) > MAX_VALUE:
+        raise ShellError("too_long", f"a variable the command works on is longer than {MAX_VALUE:,} characters")
+    if op in ("-", "=") and (colon or rest[0] in "-="):
+        return val if val or not colon else _word(arg, env)
+    if op == "+" and (colon or rest[0] == "+"):
+        return _word(arg, env) if val or not colon else ""
+    if op == "?" and (colon or rest[0] == "?"):
         return val if val or not colon else None
     if rest[0] in "%#":
         long = rest[1:2] == rest[0]
-        pat = rest[2:] if long else rest[1:]
-        cuts = range(len(val) + 1)
-        if rest[0] == "%":  # strip a suffix: the shortest match has the largest start
-            hits = [k for k in reversed(cuts) if fnmatchcase(val[k:], pat)]
-            return val[: (hits[-1] if long else hits[0])] if hits else val
-        hits = [k for k in cuts if fnmatchcase(val[:k], pat)]
-        return val[(hits[-1] if long else hits[0]) :] if hits else val
+        return _strip(val, rest[2:] if long else rest[1:], rest[0] == "#", long)
     if rest[0] == "/":
         every = rest[1:2] == "/"
         pat, _, rep = (rest[2:] if every else rest[1:]).partition("/")
@@ -834,14 +1073,27 @@ def _param(body: str, env: Mapping[str, str]) -> str | None:
         start = int(off)
         start = max(len(val) + start, 0) if start < 0 else start
         return val[start : start + int(size)] if size else val[start:]
-    return None
+    if rest[0] in ",^~@":
+        return val
+    raise ShellError("unsupported", f"${{{body}}} uses an expansion the reader does not follow")
 
 
-def _dollar(s: str, k: int, env: Mapping[str, str]) -> tuple[str | None, int]:
+def _word(raw: str, env: Mapping[str, str]) -> str:
+    """The text of the word in a default or an alternative (`${X:-word}`): `~`, variables and quotes read as usual."""
+    return " ".join(_expand_raw(raw, env, False))
+
+
+def _dollar(s: str, k: int, env: Mapping[str, str], strict: bool = True) -> tuple[str | None, int]:
     """(value, end) for the `$NAME` or `${...}` at `s[k]`; the value is None when it is not known, and `end` is where
-    the text of that expansion ends either way."""
+    the text of that expansion ends either way. With `strict` off (text inside single quotes, which a shell does not
+    expand) an expansion the reader does not know is None, not a refusal."""
     if (e := _param_end(s, k)) is not None:
-        return _param(s[k + 2 : e], env), e + 1
+        try:
+            return _param(s[k + 2 : e], env), e + 1
+        except ShellError as err:
+            if strict or err.kind != "unsupported":
+                raise
+            return None, e + 1
     m = _NAME.match(s, k + 1)
     if m:
         return env.get(m.group()), m.end()
@@ -857,7 +1109,7 @@ def _vars(text: str, env: Mapping[str, str]) -> str:
     k, n = 0, len(text)
     while k < n:
         if text[k] == "$":
-            val, e = _dollar(text, k, env)
+            val, e = _dollar(text, k, env, strict=False)
             out.append(text[k:e] if val is None else val)
             k = e
         else:
@@ -919,6 +1171,8 @@ def _expand_raw(raw: str, env: Mapping[str, str], loose: bool) -> list[str]:
         state["started"] = True
 
     while i < n:
+        if i & 63 == 0:
+            tick()
         c = raw[i]
         if c == "~" and i in tilde_at and env:
             m = _TILDE.match(raw, i)
@@ -1044,9 +1298,18 @@ _FD = re.compile(r"(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})\Z")
 
 def lex(seg: str, env: Mapping[str, str] | None = None, budget: Budget | None = None) -> Lexed:
     """Read one shell segment into words, redirections and pieces (see the module docstring). `env` holds the variables
-    that are known (`HOME`, `WS_HOME` and what earlier parts of the line set); with none, `~` and `$NAME` stay as
-    written. A redirection glued to a word (`/>/dev/null`, `<~/f`, `2>&1`) is split off it. Brace expansion makes
-    several words (or several redirections) of one; `budget` caps how many (ShellError)."""
+    that are known (`HOME`, `WS_HOME`, `PWD` and what earlier parts of the line set); with none, `~` and `$NAME` stay
+    as written. A redirection glued to a word (`/>/dev/null`, `<~/f`, `2>&1`) is split off it. Brace expansion makes
+    several words (or several redirections) of one; `budget` caps how many (ShellError). Defaults and alternatives
+    that nest past what the interpreter follows are a ShellError (kind `too_deep`)."""
+    try:
+        return _lex(seg, env, budget)
+    except RecursionError:
+        raise ShellError("too_deep", "the command nests expansions too deeply to check") from None
+
+
+def _lex(seg: str, env: Mapping[str, str] | None = None, budget: Budget | None = None) -> Lexed:
+    """`lex` without the guard on how deep expansions nest."""
     env = env if env is not None else {}
     budget = budget if budget is not None else Budget()
     words: list[str] = []
@@ -1067,6 +1330,7 @@ def lex(seg: str, env: Mapping[str, str] | None = None, budget: Budget | None = 
         return out
 
     while i < n:
+        tick()
         c = seg[i]
         if c in " \t\r\n":
             i += 1

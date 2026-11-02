@@ -245,8 +245,10 @@ def test_input_it_cannot_judge_raises_so_callers_deny(pol):
     deep = "echo"
     for _ in range(8):
         deep = "bash -c " + shlex.quote(deep)
-    with pytest.raises(ValueError, match="nests too deeply"):
-        policy.is_denied_command(pol, deep)
+    assert "nests" in policy.is_denied_command(pol, deep)  # a typed refusal (ShellError, kind too_deep), not a crash
+    with pytest.raises(policy.shellwords.ShellError) as err:
+        policy.simple_commands(deep)
+    assert err.value.kind == "too_deep"
 
 
 def test_text_inside_quotes_is_not_run_so_not_denied(pol):
@@ -990,7 +992,7 @@ PROBE_DENIED = [
     "cd ~/proj && cd .. && cat .ssh/id_rsa",
     "cat --  ~/.ssh/id_rsa",
     "head -c 100 ~/.ssh/id_rsa",
-    "cat ~/.ssh/config",
+    "cat ~/.ssh/authorized_keys",
     "ls -R ~",
     "cd ~ && grep -r foo .",
     "cd ~ && ls -R",

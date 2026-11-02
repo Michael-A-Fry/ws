@@ -73,8 +73,18 @@ Rules:
 
 The default list, which `ws gate init` writes: `~/.ssh/**`, `~/.gnupg/**`, `~/.aws/**`, `~/.config/gcloud/**`,
 `~/.config/gh/hosts.yml`, `~/.config/ws/secrets/**`, `~/.docker/config.json`, `~/.kube/config`,
-`~/.claude/.credentials.json`, `~/.netrc`, `~/.npmrc`, `~/.pypirc`, `**/.env*` and `/proc/*/environ` (the process
+`~/.claude/.credentials.json`, `~/.netrc`, `~/.npmrc`, `~/.pypirc`, `~/.git-credentials`,
+`~/.config/git/credentials`, `**/.env`, `**/.env.*`, `/proc/*/environ` and `/proc/*/task/*/environ` (the process
 environment).
+
+The env-file rules cover `.env` and `.env.NAME`, such as `.env.local` and `.env.test`. The template files `.env.example`,
+`.env.sample` and `.env.template` stay readable, and so does `cp .env.example .env`, which creates the env file without
+reading it. `.envrc` and `.env_notes.md` aren't env files and stay readable. `uv run --env-file .env.test pytest` stays
+denied, because `.env.test` is a real env file. The runner's own deny rules can't make the template exception, so they
+cover the templates too.
+
+A recursive read of `/proc/PID`, `/proc/self` or one of their `task` folders (`grep -r . /proc/self`) is denied, because
+it reaches the `environ` files.
 
 The matcher checks a path wherever a word holds one: as an operand, after `=` (`if=PATH`), after a leading `@` or `<`
 (`-F f=@PATH`, `-d @PATH`), glued to a short option (`-d@PATH`), in a `host:PATH` or `file://PATH` form, and in the
@@ -87,17 +97,28 @@ The default list, which `ws gate init` writes:
 - Recursive deletes of `/`, `/*`, `~`, `~/*`, and of each of these folders and `/FOLDER/*`: `/home`, `/Users`, `/bin`,
   `/boot`, `/dev`, `/etc`, `/lib`, `/lib64`, `/proc`, `/root`, `/sbin`, `/sys`, `/usr`, `/var`, `/opt`, `/srv`, `/mnt`,
   `/media`, `/run`, `/snap`, `/System`, `/Library`, `/Volumes`, `/Applications` and `/private`. Written as
-  `rm -* PATH`. A longer name such as `/variant` isn't covered. A recursive delete of one person's whole home folder
-  (`/home/NAME`, `/Users/NAME`) is also denied, and a folder further down is ordinary work.
+  `rm -* PATH`. A longer name such as `/variant` isn't covered. `/mnt`, `/media`, `/Volumes` and `/run` are denied at one
+  level only: `rm -rf /mnt/data` is denied and `rm -rf /mnt/data/scratch/build` is ordinary work. The macOS temp
+  folders `/private/var/folders` and `/private/tmp` are ordinary work too. A recursive delete of one person's whole home
+  folder (`/home/NAME`, `/Users/NAME`) is also denied, and a folder further down is ordinary work. `find` with `-delete`
+  or `-exec rm` is judged by the folder it starts from, by the same rules.
 - A forcing push in any spelling: `git push*--force*`, `git push* -f*`, and both with git's global options.
 - `mkfs*` and `dd*of=/dev/*`.
 - Printing the process environment: `env` with no command after it (`env -i`, `env A=b`) and `printenv*`. `env A=b cmd`,
   which runs a command with a variable set, is allowed.
-- Git settings that define an alias or name a command for git to run, however they're given: `git config KEY VALUE`,
-  `git -c KEY=VALUE`, `--config-env` and `GIT_CONFIG_KEY_N`. The keys are `alias.*`, `core.hooksPath`,
-  `core.sshCommand`, `core.fsmonitor`, `core.pager`, `core.editor`, `core.askPass`, `core.gitProxy`,
-  `core.alternateRefsCommand`, `credential.helper`, `diff.external`, `gpg.program`, `sequence.editor` and
-  `include.path`. Reading a key stays allowed.
+- Git settings that define an alias, name a command for git to run, or turn on a mirror or forcing push, when they're
+  given by `git config KEY VALUE`, `git -c KEY=VALUE`, `--config-env`, `GIT_CONFIG_KEY_N` or `GIT_CONFIG_PARAMETERS`.
+  The keys are `alias.*`, `pager.*`, `core.hooksPath`, `core.sshCommand`, `core.fsmonitor`, `core.pager`,
+  `core.editor`, `core.askPass`, `core.gitProxy`, `core.alternateRefsCommand`, `credential.helper`,
+  `credential.URL.helper`, `diff.external`, `diff.NAME.textconv`, `diff.NAME.command`, `filter.NAME.clean`,
+  `filter.NAME.smudge`, `filter.NAME.process`, `merge.NAME.driver`, `gpg.program`, `gpg.NAME.program`,
+  `remote.NAME.uploadpack`, `remote.NAME.receivepack`, `sequence.editor` and `include.path`, plus `remote.NAME.mirror`
+  when it's on and `remote.NAME.push` when its refspec starts with `+` or `:`. Reading a key stays allowed.
+- `git config --edit` and `git remote add --mirror`.
+- The environment names `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, `GIT_CONFIG_COUNT`, `GIT_SSH_COMMAND`, `GIT_SSH`,
+  `GIT_EXTERNAL_DIFF`, `GIT_PAGER`, `GIT_ASKPASS` and `GIT_PROXY_COMMAND`, set on any command line.
+- A shell write to a git config file (`>> .git/config`, `tee -a ~/.gitconfig`, `sed -i` on one), because it can add an
+  `[alias]` section. Use `git config` for a setting that names no program.
 - A shell that reads its script from standard input: `sh`, `sh -s*` and `sh -`, and the same three for `bash`, `zsh` and
   `dash`.
 

@@ -118,10 +118,20 @@ command builds, or the version-control tool restoring a protected tracked file.
 ### The default lists name common places only
 
 The matcher reads a path in an option's value, but only against your `deny_read` list. A credential file the list
-doesn't name is readable. `**/.env*` also covers `.env.example`. A git alias set before the session starts runs as
-written.
+doesn't name is readable. The env-file rules cover `.env` and `.env.NAME`, and the runner's own deny rules also cover
+`.env.example`. A git alias set before the session starts runs as written. The git rules name the settings and
+environment names that run a program or force a push; a key or name they don't list, or a setting in a config file the
+session didn't write, isn't checked.
 
 - **Workaround.** Add your own paths to `deny_read`, and rely on the wall.
+
+### The environment deny is a speed bump
+
+The default policy denies `env`, `printenv` and a read of `/proc/PID/environ`. The shell builtins `set`, `export -p`,
+`declare -x` and `compgen -v` can still print environment values. The deny list is a speed bump, not a wall. The launch
+environment allow-list, which passes only the variables a runner needs, is the wall.
+
+- **Workaround.** Launch through `ws gate launch`, and keep secrets out of the environment.
 
 ### Approvals aren't a defence against a determined session
 

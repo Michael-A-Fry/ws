@@ -82,7 +82,10 @@ A call the policy lets through only with a human's say-so is `ask_commands`: see
 
 from __future__ import annotations
 
+import bisect
 import contextlib
+import functools
+import itertools
 import os
 import posixpath
 import re
@@ -178,11 +181,16 @@ class Verdict:
 
 # --- the default policy ------------------------------------------------------------------------------------------
 
-# System directories a recursive delete must never target (Linux and macOS).
+# System directories a recursive delete must never target (Linux and macOS), at any depth below them.
 _SYSTEM_DIRS = (
-    *("bin", "boot", "dev", "etc", "lib", "lib64", "proc", "root", "sbin", "sys", "usr", "var", "opt", "srv", "mnt"),
-    *("media", "run", "snap", "System", "Library", "Volumes", "Applications", "private"),
+    *("bin", "boot", "dev", "etc", "lib", "lib64", "proc", "root", "sbin", "sys", "usr", "var", "opt", "srv"),
+    *("snap", "System", "Library", "Applications"),
 )
+# Folders where mounts, volumes and run state sit: the folder and what is directly in it (`/mnt/data`) are denied; a
+# path further down (`/mnt/data/scratch/build`) is ordinary work. `/private` is macOS system folders and its temp
+# folders. Judged in code (_system_folder), because a glob's `*` would also take every path below.
+_MOUNT_DIRS = ("mnt", "media", "Volumes", "run")
+_PRIVATE_TEMP = ("/private/var/folders/", "/private/tmp/")
 # Where people's own folders live: the folder and `/dir/*` are named here, and one level down (a whole home folder) is
 # judged in code (see _home_folder), because a glob's `*` would also take every path below it.
 _HOME_PARENTS = ("home", "Users")
@@ -201,9 +209,16 @@ DEFAULT_DENY_READ = (
     "~/.netrc",
     "~/.npmrc",
     "~/.pypirc",
-    "**/.env*",
+    "~/.git-credentials",
+    "~/.config/git/credentials",
+    "**/.env",
+    "**/.env.*",
     "/proc/*/environ",
+    "/proc/*/task/*/environ",
 )
+# `**/.env.*` leaves the committed template files readable: they hold names, not values (see _read_hit).
+_ENV_TEMPLATES = frozenset({".env.example", ".env.sample", ".env.template"})
+_ENV_RULES = frozenset({"**/.env", "**/.env.*"})
 
 
 def default_deny_commands() -> list[str]:
@@ -215,6 +230,8 @@ def default_deny_commands() -> list[str]:
         out += [f"rm -* /{d}", f"rm -* /{d}/\\*"]
     for d in _SYSTEM_DIRS:
         out += [f"rm -* /{d}", f"rm -* /{d}/*"]
+    for d in (*_MOUNT_DIRS, "private"):
+        out += [f"rm -* /{d}", f"rm -* /{d}/\\*"]
     # A forcing push in any spelling (-f, -uf, +refspec, --force-with-lease), with or without git's global options.
     out += ["git push*--force*", "git push* -f*", "git -* push*--force*", "git -* push* -f*"]
     out += ["mkfs*", "dd*of=/dev/*"]
@@ -654,9 +671,11 @@ class _Ctx:
     protect: tuple[str, ...] = ()
     vars: dict[str, str] | None = None
     heredocs: bool = False  # read the command line with here-document bodies left out (a second reading, never alone)
+    # What the line has cost to judge so far, shared by every part of it: [path-like pieces tested, words read].
+    spent: list[int] = field(default_factory=lambda: [0, 0])
 
     def fork(self) -> _Ctx:
-        return _Ctx(self.cwd, self.protect, dict(self.vars or {}))
+        return _Ctx(self.cwd, self.protect, dict(self.vars or {}), spent=self.spent)
 
 
 def _home() -> str:
@@ -1337,7 +1356,7 @@ def _glob_regex_path(pattern: str) -> re.Pattern:
 def _path_regex(pattern: str) -> re.Pattern:
     """gitignore-style path glob: `**` crosses folders, `*` stays in one, a bare name matches at any depth."""
     pattern = _expand(pattern)
-    if not pattern.startswith("/"):
+    if not pattern.startswith(("/", "**/")):
         pattern = "**/" + pattern.removeprefix("./")
     return _glob_regex_path(pattern)
 
@@ -1384,17 +1403,33 @@ def _segments_reach(glob: list[str], root: list[str]) -> bool:
     return walk(0, 0)
 
 
+@functools.lru_cache(maxsize=512)
+def _rule_forms(rule: str, home: str, wshome: str) -> tuple[re.Pattern, str | None, bool]:
+    """A deny_read rule as (its regex, its root, whether the root is the whole folder). Built once per rule and
+    environment: `home` and `wshome` are only the cache key, since `~` and `$WS_HOME` read them."""
+    root = _rule_root(rule)
+    # A folder is the thing denied when the rule's first wildcard is its last segment (`~/.ssh/**`); a rule with names
+    # after the wildcard (`/proc/*/environ`) denies those files, not the folder above them.
+    whole = root is not None and "/" not in _expand(rule)[len(root) :].lstrip("/")
+    return _path_regex(rule), root, whole
+
+
 def _glob_reaches(policy: Policy, token_abs: str) -> str | None:
     """Could this glob (`~/.s*/id_rsa`, `~/.ws/secret?/KEY`) name something a deny_read rule covers? It does when,
     segment by segment over the rule's folder, each of the glob's segments can match the rule's."""
     glob = [g for g in token_abs.split("/") if g]
+    key = (_home(), str(ws_home()))
     for rule in policy.gate.deny_read:
-        root = _rule_root(rule)
+        root = _rule_forms(rule, *key)[1]
         if root is None:
             continue
         if _segments_reach(glob, [r for r in root.split("/") if r]):
             return rule
     return None
+
+
+# A process's own folder (and its threads'): a recursive read there reaches its `environ` files.
+_PROC_TREE = re.compile(r"/proc/(?:\d+|self|thread-self)(?:/task(?:/\d+)?)?")
 
 
 def _read_hit(policy: Policy, path: str, cwd: str, recursive: bool = False, folder: bool = True) -> str | None:
@@ -1410,16 +1445,20 @@ def _read_hit(policy: Policy, path: str, cwd: str, recursive: bool = False, fold
         forms.add(os.path.realpath(p))  # a symlink into a denied folder is still that folder
     except OSError:
         pass
+    if recursive and any(_PROC_TREE.fullmatch(f) for f in forms):
+        proc_rule = next((r for r in policy.gate.deny_read if r.startswith("/proc/")), None)
+        if proc_rule:
+            return proc_rule
+    key = (_home(), str(ws_home()))
     for rule in policy.gate.deny_read:
-        rx, root = _path_regex(rule), _rule_root(rule)
+        rx, root, whole = _rule_forms(rule, *key)
         for f in forms:
             if rx.match(f):
+                if rule in _ENV_RULES and posixpath.basename(f) in _ENV_TEMPLATES:
+                    continue
                 return rule
             if root is None:
                 continue
-            # A folder is the thing denied when the rule's first wildcard is its last segment (`~/.ssh/**`); a rule
-            # with names after the wildcard (`/proc/*/environ`) denies those files, not the folder above them.
-            whole = "/" not in _expand(rule)[len(root) :].lstrip("/")
             if folder and whole and f == root:
                 return rule
             if recursive and (f == "/" or root.startswith(f + "/") or f == root):
@@ -1475,23 +1514,60 @@ def _dotted(op: str, cwd: str) -> str:
 
 
 _VALUE_BREAKS = re.compile(r"[=@<>:,]")
+_PATH_START = "~/$."  # a piece that starts like a path is tested wherever it sits in the word
+_VALUE_LEAD = "=@<"  # a piece straight after one of these is a value, so it is tested whatever it starts with
+_FILE_URL = re.compile(r"file://(?:localhost|127\.0\.0\.1|\[::1\])?(?=/)", re.IGNORECASE)
+_PATH_MAX = 4096  # the longest path the system takes; a piece is judged by its first PATH_MAX characters
+WORD_PIECE_CAP = 256  # path-like pieces one word may hold before the matcher refuses it rather than test them all
+COMMAND_PIECE_CAP = 1024  # the same for a whole command line
+COMMAND_WORD_CAP = 4096  # words a command line may hold before the matcher refuses it
+_SUFFIX_TESTS = 8  # pieces per word that are also judged together with the rest of the word
 
 
-def _word_paths(word: str) -> list[str]:
+class TooManyPieces(Exception):
+    """A word or command holds more path-like pieces than the matcher will test. The matcher denies it, because
+    testing them all takes longer than a runner's hook may run."""
+
+
+def _word_paths(word: str, spent: list[int] | None = None) -> list[str]:
     """The places a word may name besides itself: the text after `=`, `@`, `<`, `>`, `:` or `,` (`if=P`, `f=@P`,
-    `-d@P`, `host:P`, `file://P`), each piece between them, and the value glued to a short option (`-oP`). A word that
-    looks like a path is also judged whole, which covers the argument of an option the matcher does not know."""
+    `-d@P`, `host:P`, `file://P`), each piece between them, and the value glued to a short option (`-oP`, `-sSLoP`). A
+    word that looks like a path is also judged whole, which covers the argument of an option the matcher does not
+    know. Only a piece that starts like a path (`~`, `/`, `$`, `.`) or follows `=`, `@` or `<` is tested. `spent[0]`
+    counts the pieces tested over a command line; one word past WORD_PIECE_CAP, or the line past COMMAND_PIECE_CAP,
+    raises TooManyPieces."""
     flag = word.startswith("-") and len(word) > 1
+    breaks = [m.start() for m in _VALUE_BREAKS.finditer(word)]
+    starts: list[int] = [] if flag else [0]
+    free = len(starts)
+    if flag and word[1] != "-" and len(word) > 2:
+        # A value glued to a cluster of short options: `-sT~/x`, `-sSLT$HOME/x`, `-0a~/x`.
+        starts.append(2)
+        starts += [k for k in range(3, min(len(word), 66)) if word[k] in _PATH_START]
+        free = 1
+    starts += [
+        e for e in (b + 1 for b in breaks) if e < len(word) and (word[e] in _PATH_START or word[e - 1] in _VALUE_LEAD)
+    ]
+    extra = len(starts) - free
+    if extra > WORD_PIECE_CAP or (spent is not None and spent[0] + extra > COMMAND_PIECE_CAP):
+        raise TooManyPieces
+    if spent is not None:
+        spent[0] += extra
     found: list[str] = []
     if not flag and ("/" in word or _is_pathlike(word)):
-        found.append(word)
-    if flag and word[1] != "-" and len(word) > 2:
-        found.append(word[2:])
-    pieces = _VALUE_BREAKS.split(word)
-    found += [p for p in (pieces[1:] if flag else pieces) if p]
-    found += [word[m.end() :] for m in _VALUE_BREAKS.finditer(word) if word[m.end() :]]
+        found.append(word[:_PATH_MAX])
+    for n, st in enumerate(starts):
+        i = bisect.bisect_left(breaks, st)
+        end = breaks[i] if i < len(breaks) else len(word)
+        found.append(word[st : min(end, st + _PATH_MAX)])
+        if end < len(word) and (n < free or n - free < _SUFFIX_TESTS):
+            found.append(word[st : st + _PATH_MAX])
+    for m in itertools.islice(_FILE_URL.finditer(word), _SUFFIX_TESTS):
+        found.append(word[m.end() : m.end() + _PATH_MAX])
     out = []
     for p in found:
+        if not p:
+            continue
         out.append(p)
         if p.startswith("//") and p.lstrip("/")[:1] in ("~", "$"):
             out.append(p.lstrip("/"))
@@ -1504,51 +1580,114 @@ def _home_folder(op: str, cwd: str) -> bool:
     return re.fullmatch(f"/(?:{'|'.join(_HOME_PARENTS)})/[^/]+", _abs(op, cwd)) is not None
 
 
+def _system_folder(policy: Policy, op: str, cwd: str) -> str | None:
+    """The folder a recursive delete of this operand would take, when the deny_commands list names the root it sits in:
+    what is directly in `/mnt`, `/media`, `/Volumes` or `/run` (`/mnt/data`), and anything under `/private` except its
+    temp folders. A path further down in the mount folders is ordinary work."""
+    p = _abs(op, cwd)
+    for d in _MOUNT_DIRS:
+        shape = f"/{d}/[^/]+" + (
+            "|/run/user/[^/]+" if d == "run" else ""
+        )  # a person's runtime folder is `/run/user/UID`
+        if f"rm -* /{d}" in policy.gate.deny_commands and re.fullmatch(shape, p):
+            return p
+    if "rm -* /private" in policy.gate.deny_commands and p.startswith("/private/") and not p.startswith(_PRIVATE_TEMP):
+        return p
+    return None
+
+
 # Settings that make git run a command, or change what a later git command means (an alias can spell a forcing push).
 _GIT_RUNS = (
     "core.hookspath", "core.sshcommand", "core.fsmonitor", "core.pager", "core.editor", "core.askpass",
     "core.gitproxy", "core.alternaterefscommand", "credential.helper", "diff.external", "gpg.program",
     "sequence.editor", "include.path",
 )  # fmt: skip
+# The same, for keys with a name in the middle (`filter.NAME.clean`, `credential.URL.helper`, `pager.COMMAND`).
+_GIT_RUNS_NAMED = re.compile(
+    r"alias\..+|pager\..+|filter\..+\.(?:clean|smudge|process)|diff\..+\.(?:textconv|command)|merge\..+\.driver"
+    r"|(?:diff|merge)tool\..+\.(?:cmd|path)|gpg\..+\.program|credential\.(?:.+\.)?helper"
+    r"|remote\..+\.(?:uploadpack|receivepack|vcs)"
+)
+_GIT_MIRROR = re.compile(r"remote\..+\.mirror")
+_GIT_PUSH_KEY = re.compile(r"remote\..+\.push")
+_GIT_OFF = {"false", "no", "off", "0", ""}
+# Environment names that give git a program to run or a config file of the caller's choosing.
+_GIT_ENV_RUNS = frozenset({
+    "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_COUNT", "GIT_SSH_COMMAND", "GIT_SSH", "GIT_EXTERNAL_DIFF",
+    "GIT_PAGER", "GIT_ASKPASS", "GIT_PROXY_COMMAND",
+})  # fmt: skip
 _GIT_READS = {"--get", "--get-all", "--get-regexp", "--get-urlmatch", "--list", "-l", "--show-origin", "--show-scope"}
 _GIT_WRITES = {"--add", "--replace-all", "--unset", "--unset-all", "--edit", "-e"}
-_GIT_CONFIG_ENV = re.compile(r"(?:GIT_CONFIG_KEY_\d+|GIT_CONFIG_PARAMETERS)=(.*)", re.DOTALL)
+_GIT_ENV_WORD = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)", re.DOTALL)
+_GIT_PARAM = re.compile(r"'([^']*)'(?:='([^']*)')?")
+# Files git reads its settings from: a repository's, the person's, the system's.
+_GIT_CONFIG_FILE = re.compile(
+    r"(?:/[^/]*\.git|/\.git/(?:modules|worktrees)/.+)/config(?:\.worktree)?\Z|/\.gitconfig\Z"
+    r"|/\.config/git/config\Z|\A/etc/gitconfig\Z"
+)
 
 
-def _git_key_runs(key: str) -> bool:
-    key = key.lower()
-    return key.startswith("alias.") or key in _GIT_RUNS
+def _git_setting_runs(key: str, value: str | None) -> bool:
+    """Does this setting give git an alias or a command to run, or turn on a mirror or forcing push? `value` is None
+    when none was given (a bare `-c KEY`, which reads as true) and "?" when it can't be seen (`--config-env`)."""
+    k = key.lower()
+    if k in _GIT_RUNS or _GIT_RUNS_NAMED.fullmatch(k):
+        return True
+    if _GIT_MIRROR.fullmatch(k):
+        return value is None or value.strip().lower() not in _GIT_OFF
+    if _GIT_PUSH_KEY.fullmatch(k):
+        return value == "?" or (value is not None and (value.startswith(("+", ":")) or ":+" in value))
+    return False
+
+
+def _git_env_hazard(words: list[str]) -> str | None:
+    """The environment a command line sets for git (`NAME=value` words, also after `env` and `export`)."""
+    assigned = {m.group(1): m.group(2) for w in words if (m := _GIT_ENV_WORD.fullmatch(w))}
+    for name, value in assigned.items():
+        if name in _GIT_ENV_RUNS:
+            return f"{name} in the environment gives git a program to run or a config file"
+        m = re.fullmatch(r"GIT_CONFIG_KEY_(\d+)", name)
+        if m and _git_setting_runs(value, assigned.get(f"GIT_CONFIG_VALUE_{m.group(1)}", "?")):
+            return "an environment setting gives git an alias or a command to run"
+        if name == "GIT_CONFIG_PARAMETERS":
+            pairs = [(k, v or None) for k, v in _GIT_PARAM.findall(value)]
+            if any(_git_setting_runs(k, v) for k, v in pairs or [(t, "?") for t in re.findall(r"[\w.*-]+", value)]):
+                return "an environment setting gives git an alias or a command to run"
+    return None
 
 
 def _git_config_hazard(words: list[str], toks: list[str]) -> str | None:
-    """A reason when this command gives git an alias or a command to run: `git config KEY VALUE` for such a key,
-    `git -c KEY=VALUE` or `--config-env` with such a key, and GIT_CONFIG_KEY_n or
-    GIT_CONFIG_PARAMETERS in the environment. Reading a key stays allowed."""
-    for w in words:
-        m = _GIT_CONFIG_ENV.fullmatch(w)
-        if m and ("alias." in m.group(1).lower() or any(k in m.group(1).lower() for k in _GIT_RUNS)):
-            return "an environment setting gives git an alias or a command to run"
+    """A reason when this command gives git an alias or a command to run, or a mirror or forcing push: `git config
+    KEY VALUE` (and `git config --edit`, which opens an editor), `git -c KEY=VALUE` and `--config-env` for such a
+    key, and the environment names git reads (GIT_CONFIG_KEY_n, GIT_CONFIG_PARAMETERS, GIT_SSH_COMMAND ...). Reading
+    a key stays allowed."""
+    env = _git_env_hazard(words)
+    if env:
+        return env
     if not toks or toks[0] != "git":
         return None
     opts, rest = git_split(toks)
     for i, o in enumerate(opts):
-        if o in ("-c", "--config-env") and i + 1 < len(opts):
-            value = opts[i + 1]
-        elif o.startswith("--config-env="):
-            value = o.split("=", 1)[1]
+        if o == "-c" and i + 1 < len(opts):
+            key, eq, value = opts[i + 1].partition("=")
+            runs = _git_setting_runs(key, value if eq else None)
+        elif o == "--config-env" and i + 1 < len(opts) or o.startswith("--config-env="):
+            key = (opts[i + 1] if o == "--config-env" else o.split("=", 1)[1]).split("=", 1)[0]
+            runs = _git_setting_runs(key, "?")
         else:
             continue
-        key = value.split("=", 1)[0].lower()
-        if _git_key_runs(key):
-            return f"git option {key} gives git an alias or a command to run"
+        if runs:
+            return f"git option {key.lower()} gives git an alias or a command to run"
+    if rest[1:2] == ["remote"] and any(f.startswith("--mirror") for f in _args(rest[1:])[0]):
+        return "git remote would set up a mirror, which pushes every ref"
     if rest[1:2] == ["config"]:
         flags, operands = _args(rest[1:])
-        if (
-            not any(f in _GIT_READS for f in flags)
-            and any(_git_key_runs(o) for o in operands)
-            and (len(operands) > 1 or any(f in _GIT_WRITES for f in flags))
-        ):
-            return "git config would set an alias or a command for git to run"
+        if "--edit" in flags or _cluster(flags, "e"):
+            return "git config --edit opens an editor, which is a command for git to run"
+        if not any(f in _GIT_READS for f in flags) and (len(operands) > 1 or any(f in _GIT_WRITES for f in flags)):
+            for n, key in enumerate(operands):
+                if _git_setting_runs(key, operands[n + 1] if n + 1 < len(operands) else None):
+                    return "git config would set an alias or a command for git to run"
     return None
 
 
@@ -1635,6 +1774,13 @@ def _segment(policy: Policy, seg: str, ctx: _Ctx, in_pipe: bool, cands: list[str
     words = [b for w in words for b in _braces(w)]
     if not words and not redirs:
         return None, "", []
+    ctx.spent[1] += len(words)
+    if ctx.spent[1] > COMMAND_WORD_CAP:
+        return (
+            f"the command holds more than {COMMAND_WORD_CAP:,} words, too many to check in time",
+            " ".join(words[:8]),
+            [],
+        )
     if words and all(_ASSIGN.match(w) for w in words):  # X=/ ; later $X
         ctx.vars = {**(ctx.vars or {}), **dict(w.split("=", 1) for w in words)}
     elif len(words) > 3 and words[0] == "for" and words[2] == "in":  # for i in /; do ... $i
@@ -1694,27 +1840,51 @@ def _segment(policy: Policy, seg: str, ctx: _Ctx, in_pipe: bool, cands: list[str
     )
     if recursive and _searches_cwd(cmd, canon, operands):
         named.append(".")  # `cd ~ && grep -r x`: no path given means here
+    # What a copy writes is made, not read: `cp .env.example .env` creates the env file, so it is the one place an
+    # env-file rule does not stop the last operand. A source, or any other rule, still does.
+    into_dir = _cluster(flags, "t") or any(f.startswith("--target-directory") for f in flags)
+    made = operands[-1] if cmd in _WRITE_LAST and len(operands) > 1 and not into_dir else None
     for p in named:
         rule = _read_hit(policy, p, ctx.cwd, recursive=recursive)
-        if rule:
+        if rule and not (p == made and rule in _ENV_RULES):
             return f"command names a path denied by deny_read rule {rule!r}", line, nested
     # Every word as typed, wrappers and their options included: a path sits in an option's value (`if=P`, `f=@P`,
     # `-a P`) as often as it is an operand, whichever option the matcher knows. A folder above a protected one is
     # judged only for the operands above, so a bare `/` inside a value is not a recursive read of everything.
-    for word in words:
-        for p in _word_paths(word):
-            rule = _read_hit(policy, p, ctx.cwd, recursive=recursive and p != "/")
-            if rule:
-                return f"command names a path denied by deny_read rule {rule!r}", line, nested
+    try:
+        for word in words:
+            for p in _word_paths(word, ctx.spent):
+                rule = _read_hit(policy, p, ctx.cwd, recursive=recursive and p != "/")
+                if rule and not (p == made and rule in _ENV_RULES):
+                    return f"command names a path denied by deny_read rule {rule!r}", line, nested
+    except TooManyPieces:
+        reason = (
+            f"a word or the command holds more than {WORD_PIECE_CAP} (or {COMMAND_PIECE_CAP} in all) path-like pieces, "
+            "too many to check in time; shorten it or move the text to a file"
+        )
+        return reason, line, nested
+    doomed = _find_starts(canon) if cmd == "find" else None
     if cmd == "rm" and (_cluster(flags, "r") or "--recursive" in flags):
-        for op in operands:
-            if _home_folder(op, ctx.cwd):
-                return "rm of a whole home folder", line, nested
+        doomed = operands
+    for op in doomed or ():
+        if _home_folder(op, ctx.cwd):
+            return "a recursive delete of a whole home folder", line, nested
+        folder = _system_folder(policy, op, ctx.cwd)
+        if folder:
+            return f"a recursive delete of {folder}, which the policy keeps", line, nested
     config = _git_config_hazard(words, toks)
     if config:
         return config, line, nested
+    written = _written(cmd, flags, operands, redirs, canon, toks)
+    for p, _ in written:
+        if _GIT_CONFIG_FILE.search(_abs(p, ctx.cwd)):
+            return (
+                "a write to a git config file can give git an alias or a command to run; use git config",
+                line,
+                nested,
+            )
     if ctx.protect:
-        for p, ancestors in _written(cmd, flags, operands, redirs, canon, toks):
+        for p, ancestors in written:
             hit = _under(ctx.protect, p, ctx.cwd, ancestors)
             if hit:
                 return f"command writes to {hit}, which ws protects (policy and generated gate)", line, nested
@@ -1763,20 +1933,33 @@ def _searches_cwd(cmd: str, canon: list[str], operands: list[str]) -> bool:
     return False
 
 
-def _find_deletes(canon: list[str], cwd: str) -> list[str]:
-    """`find P -delete` and `find P -exec rm ...` as the `rm -rf P` they amount to."""
+def _find_starts(canon: list[str]) -> list[str] | None:
+    """The folders a `find` deletes from (`find P -delete`, `find P -exec rm ...`), or None when it deletes nothing. Its
+    leading `-H`, `-L`, `-P`, `-Olevel` and `-D opts` are not folders."""
     rest = canon[1:]
     deleting = "-delete" in rest or any(
         rest[i] in ("-exec", "-execdir") and rest[i + 1 : i + 2] == ["rm"] for i in range(len(rest))
     )
     if not deleting:
-        return []
-    starts = []
-    for t in rest:
-        if t.startswith(("-", "(", "!", ",")):
+        return None
+    starts, i = [], 0
+    while i < len(rest):
+        t = rest[i]
+        if t == "-D":
+            i += 2
+        elif t in ("-H", "-L", "-P") or re.fullmatch(r"-O\d*", t):
+            i += 1
+        elif t.startswith(("-", "(", "!", ",")):
             break
-        starts.append(t)
-    return [f"rm -fr {_dotted(p, cwd)}" for p in (starts or ["."])]
+        else:
+            starts.append(t)
+            i += 1
+    return starts or ["."]
+
+
+def _find_deletes(canon: list[str], cwd: str) -> list[str]:
+    """`find P -delete` and `find P -exec rm ...` as the `rm -rf P` they amount to."""
+    return [f"rm -fr {_dotted(p, cwd)}" for p in _find_starts(canon) or []]
 
 
 def _written(cmd, flags, operands, redirs, canon, toks) -> list[tuple[str, bool]]:

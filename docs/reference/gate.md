@@ -41,7 +41,7 @@ A corpus file is JSON lines, schema `ws.gate-corpus/1`: one row to a line. This 
 | `why` | One line on why the label is right. |
 | `known` | Optional. `true` marks a row the gate gets wrong today. See [The ratchet](#the-ratchet). |
 | `runner` | Optional. With it, `payload` is that runner's own hook payload, and only that runner judges the row. |
-| `guards` | Optional. Names of guards to switch on for this row alone. |
+| `guards` | Optional. Names of guards to switch on for this row alone. The row gets a state folder of its own, so its answer doesn't depend on the rows before it. |
 
 Paths use `~`, `$HOME`, `{HOME}` and `{CWD}`. Replay makes two scratch folders, fills `{HOME}` and `{CWD}` with them,
 points `HOME` and `WS_HOME` at the first while it runs, and removes both after. `${HOME}` is the shell's own and is left
@@ -97,7 +97,7 @@ are:
 
 | File | Source | What it holds |
 |---|---|---|
-| `oracle.jsonl`, `oracle-generated.jsonl` | `oracle` | Spellings of a protected path, and the harmless words the shell reads differently. A shell worked out each label. |
+| `oracle.jsonl`, `oracle-generated.jsonl` | `oracle` | Spellings of a protected path, and the harmless words the shell reads differently. A shell worked out each label. `tests/test_shellwords_oracle.py` checks the same spellings against bash. |
 | `parity.jsonl` | `parity` | Rules shared with other gate implementations: protected paths next to ordinary files, public keys and the ssh config, and calls that need a person's yes. |
 | `regression.jsonl` | `regression` | Spellings the matcher once missed or once refused wrongly, tool calls for reads, searches and writes, and the ordinary calls it still refuses (marked `known`). |
 | `control.jsonl` | `control` | Ordinary commands, reads, searches and writes. They exist to make false blocks measurable. |

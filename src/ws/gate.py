@@ -318,7 +318,9 @@ def _scratch_home(home: Path):
 def replay_corpus(runner: str, rows: list[gatecorpus.Row], policy_file: Path | None = None) -> list[dict]:
     """Each corpus row judged as the live hook would, in scratch `HOME` and `CWD` folders (made here, removed after,
     and the only place a `{HOME}` or `{CWD}` is filled with). The policy is `policy_file`, else the built-in one. A row
-    for another runner is left out. Each result is {id, source, expect, known, result, reason, kind, ms, differs}."""
+    that switches on guards gets a folder of its own for the state they keep, so a decision does not depend on which
+    rows came before it. A row for another runner is left out. Each result is {id, source, expect, known, result,
+    reason, kind, ms, differs}."""
     from ws import gatecorpus  # here, not at the top: the live hook doesn't pay for the corpus code
 
     results = []
@@ -332,12 +334,16 @@ def replay_corpus(runner: str, rows: list[gatecorpus.Row], policy_file: Path | N
             except policy.PolicyError as e:
                 raise WsError("bad_config", str(e), f"fix {policy_file}, or write the default policy") from e
             protect = _protect(policy_file or home / ".ws" / "policy.toml")
-            for row in rows:
+            for n, row in enumerate(rows):
                 payload = gatecorpus.render(row, runner, str(home), str(cwd))
                 if payload is None:
                     continue
                 on = tuple(dict.fromkeys((*pol.guards.on, *row.guards)))
-                judged = _judge(runner, payload, replace(pol, guards=replace(pol.guards, on=on)), protect, home)
+                state = home
+                if row.guards:  # a guard that keeps state starts every row it is switched on for from nothing
+                    state = Path(scratch) / f"guard-state-{n}"
+                    state.mkdir()
+                judged = _judge(runner, payload, replace(pol, guards=replace(pol.guards, on=on)), protect, state)
                 results.append(
                     {
                         "id": row.id,

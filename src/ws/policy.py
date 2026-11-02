@@ -6,7 +6,9 @@ Stdlib only. Three jobs:
   * load and validate the file (PolicyError names the bad key);
   * `is_denied_command` / `is_denied_read` / `is_denied_search`: the one matcher every hook and shim calls. It is the
     second layer (the runner's own deny rules are the first, a sandbox the real wall): it catches the plausible
-    retries, not every spelling a shell allows;
+    retries, not every spelling a shell allows. It reads a command through ws.shellwords, the one reader every check
+    and guard shares, so a path is recognised however the shell is asked to spell it (quotes, brace groups, `~` and
+    `$HOME`, redirections, the value of an option);
   * `rule_of_two`: refuse a session that holds untrusted input, private data and a way out at the same time.
 
 Known limits of the matcher. It reads command text, so it cannot see:

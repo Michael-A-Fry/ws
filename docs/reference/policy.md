@@ -80,6 +80,32 @@ The default list, which `ws gate init` writes:
 - A shell that reads its script from standard input: `sh`, `sh -s*` and `sh -`, and the same three for `bash`, `zsh` and
   `dash`.
 
+### How a command is read
+
+One reader, `src/ws/shellwords.py`, turns a command line into the words a shell would run. Every check on a command
+(`deny_read`, `deny_commands`, `ask_commands`, the protected files and the guards) works from its output, so a path is
+recognised however it's spelled. It reads:
+
+- Segments: `;`, `&&`, `||`, `|`, `&`, new lines and parentheses, `$(...)`, backticks, `<(...)`, `bash -c '...'`, `eval`
+  and `env -S`. A comment is left out.
+- Words: quotes and escapes are removed, and a brace group is expanded before anything else, as the shell does. Comma
+  lists nest and chain, and `{1..40}` and `{a..e}` sequences (with a step, and zero padding such as `{01..10}`) are
+  expanded in full. A quoted `{`, `,` or `}` isn't part of a group, so `'{a,b}'` is one word.
+- `~`, `$HOME` and `${HOME}`, `$WS_HOME` and the variables set earlier on the same line, including the `${NAME:-x}`,
+  `${NAME%/*}`, `${NAME/a/b}` and `${NAME:1:3}` forms. A quoted `~` is the folder called `~`, and a single-quoted
+  `$HOME` is text. A variable the line doesn't set is left as written.
+- Redirections: `<`, `>`, `>>`, `>|`, `<>`, `&>`, `&>>`, `>&`, here-strings, and file-descriptor forms such as `3<` and
+  `2>`. Each target is expanded like any word, so a brace group in a target names every file it expands to.
+- Paths inside a word: the value of an option (`dd if=P`, `--opt=P`, `-oP`, `-sSLo P`), a file argument (`-F f=@P`,
+  `-d @P`, `-F 'f=<P'`), a `file://` address, and the files a wrapper takes (`xargs -a P`, `--arg-file=P`). Here `~` and
+  `$HOME` count even inside quotes, because the program reads the text itself. A `host:path` remote isn't a local path.
+- Wrappers: `sudo`, `doas`, `env`, `xargs`, `timeout`, `nice`, `nohup`, `time` and the like are taken off the front.
+
+The reader is bounded. A command may expand to at most 4,096 words in all, including the commands inside it, and
+braces may nest 64 deep. A command over a limit, and one that ends inside a quote, is refused with a reason that says
+so; it's never let through unread. `tests/test_shellwords_oracle.py` compares the reader with bash on a fixed set of
+spellings.
+
 ## `[guards]`
 
 Named checks that run beside the `[gate]` rules. The [guards reference](guards.md) describes each one.

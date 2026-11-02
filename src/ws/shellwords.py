@@ -56,13 +56,17 @@ class Budget:
         self.limit = words
         self.left = words
 
-    def spend(self, n: int) -> None:
-        self.left -= n
-        if self.left < 0:
+    def check(self, n: int) -> None:
+        """Refuse now if `n` more words would go over, before any of them is made."""
+        if n > self.left:
             raise ShellError(
                 "too_many_words",
                 f"the command expands to more than {self.limit:,} words; write the names to a file or use a loop",
             )
+
+    def spend(self, n: int) -> None:
+        self.check(n)
+        self.left -= n
 
 
 class Redirect(NamedTuple):
@@ -270,8 +274,9 @@ def scan(
 ) -> tuple[list[list[str]], list[str]]:
     """Split a shell command line. Returns (pipelines, inner): each pipeline is a list of segments (split on |, |&),
     pipelines are split on ; && || & newline ( ); inner holds the text of $(...), backticks and <(...), which run too.
-    A comment (a `#` that starts a word, outside quotes and `${...}`) is left out. With `heredocs`, the body and closing
-    line of each here-document are left out too (that text is data for a program, not commands): a `<<WORD` starts one
+    A comment (a `#` that starts a word, outside quotes and `${...}`) is left out, unless the line holds a `<<` and
+    `heredocs` is off: a body is then read as commands, and a `#` line in it is not a comment. With `heredocs`, the body
+    and closing line of each here-document are left out too (that text is data for a program, not commands): a `<<WORD` starts one
     only outside quotes and comments, and not as `<<<` or a shift in `((...))` or inside `${...}` and `$[...]`, which are
     one word. If `end` is given, end["quote"] is the quote still open at the end of the text (empty if none). If `flow`
     is given, it gets the order the line runs in: the index of each pipeline as it ends, and between them the operator that came next (`;`, `&&`, `||`,
@@ -283,6 +288,9 @@ def scan(
     waiting: list[tuple[str, bool]] = []  # (closing word, may be indented) of the here-documents the line opened
     nest: list[str] = []  # the closers still owed by the ${...} and $[...] we are inside
     n, i, quote = len(cmd), 0, ""
+    # Where a here-document may be, a `#` line could be a body line, and the body of an unquoted one is expanded; a line
+    # that is read with its bodies as commands keeps its comments too, so that nothing in a body is passed over.
+    comments = heredocs or "<<" not in cmd
 
     def sub(body: str) -> str:  # the text of a $(...) that is really `$((a<<b))` arithmetic: its `<<` is a shift
         return body.replace("<<", "< <") if heredocs and _arithmetic(body) else body
@@ -344,7 +352,7 @@ def scan(
         heredocs_here = (
             heredocs and not nest
         )  # in ${...} and $[...], `#` and `<<` are operators, not comment or here-doc
-        if not nest and c == "#" and (not buf or buf[-1] in " \t"):  # a comment: not commands, no here-document
+        if comments and not nest and c == "#" and (not buf or buf[-1] in " \t"):  # a comment: not commands
             eol = cmd.find("\n", i)
             i = n if eol < 0 else eol
             continue
@@ -694,14 +702,14 @@ def _sequence(body: list[str], budget: Budget) -> list[str] | None:
         step = abs(int(parts[2])) or 1
     if _INT.match(lo) and _INT.match(hi):
         a, b = int(lo), int(hi)
-        budget.spend(abs(b - a) // step + 1)
+        budget.check(abs(b - a) // step + 1)
         nums = range(a, b + 1, step) if a <= b else range(a, b - 1, -step)
         digits = max(len(lo.lstrip("+-")), len(hi.lstrip("+-")))
         pad = digits if any(len(x.lstrip("+-")) > 1 and x.lstrip("+-").startswith("0") for x in (lo, hi)) else 0
         return [("-" if v < 0 else "") + str(abs(v)).zfill(pad) for v in nums]
     if len(lo) == 1 and len(hi) == 1 and not lo.isdigit() and not hi.isdigit():
         a, b = ord(lo), ord(hi)
-        budget.spend(abs(b - a) // step + 1)
+        budget.check(abs(b - a) // step + 1)
         chars = range(a, b + 1, step) if a <= b else range(a, b - 1, -step)
         return [chr(v) for v in chars]
     return None
@@ -738,6 +746,7 @@ def _expand_units(units: list[str], budget: Budget, depth: int) -> list[str]:
                 edges = [i, *commas, end]
                 for a, b in itertools.pairwise(edges):
                     alts += _expand_units(units[a + 1 : b], budget, depth + 1)
+                    budget.check(len(alts))
             else:
                 alts = _sequence(units[i + 1 : end], budget)
             if alts is not None:
@@ -756,8 +765,7 @@ def _expand_units(units: list[str], budget: Budget, depth: int) -> list[str]:
     total = 1
     for s in slots:
         total *= len(s)
-        if total > budget.left:
-            budget.spend(total)  # raises
+        budget.check(total)
     budget.spend(total)
     return ["".join(c) for c in itertools.product(*slots)]
 

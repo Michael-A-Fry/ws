@@ -34,8 +34,8 @@ or a guard name, and a key in a guard's table that guard doesn't read.
 | `claims` | before a message, and when the session stops | messages to other agents | Checks each commit-like token that sits in the same sentence as a claim word (`on main`, `merged into main`, `merged to main`, `pushed to main`) against a ref, and denies the message when the commit isn't on it. With `release_dir` set, also denies a message that calls a release other than the promoted one live. On stop, logs the claims in the runner's last message. |
 | `spawn-cap` | before a call, and when a subagent stops | subagent starts | Denies a subagent start when `max_agents` (default from the machine) are already running in the session. Counts agents started in the background. |
 | `skill-gate` | before a call, and when a prompt is sent | file writes and skill calls | Denies a write to a guarded path until the named skill has run in the session. The paths come from the policy's rules and from each skill's own `gates` front matter. The person can approve the write once. Judges Edit, Write and MultiEdit calls only. |
-| `dev-server` | before a call | shell commands | Denies a development server that listens on every interface or on an address other than loopback: `python -m http.server` with no `--bind`, `php -S 0.0.0.0:PORT`, `serve` with no `-l`, `vite --host`, `flask run --host 0.0.0.0`, `jupyter lab --ip 0.0.0.0`, `rails s -b 0.0.0.0`, `uvicorn --host 0.0.0.0` and `hugo server --bind 0.0.0.0`. The reason names the flag to add. The person can approve the command once. On by default in the policy `ws gate init` writes. |
-| `checkout-pin` | before a call | shell commands | Denies `git checkout` or `switch` to another branch or commit, `reset --hard`, `--merge` and `--keep`, `rebase`, `merge`, `pull`, `cherry-pick`, `revert` and `worktree move` into a checkout that has linked worktrees, or that `paths` names. `git checkout -- FILE`, `restore`, `commit`, `fetch`, `status`, `log` and a branch switch inside a linked worktree go through. The person can approve the command once. Off until you name it. |
+| `dev-server` | before a call | shell commands | Denies a development server that listens on every interface or on an address other than loopback: `python -m http.server` with no `--bind`, `php -S 0.0.0.0:PORT`, `serve` with no `-l`, `vite --host`, `flask run --host 0.0.0.0`, `jupyter lab --ip 0.0.0.0`, `rails s -b 0.0.0.0`, `uvicorn --host 0.0.0.0`, `hugo server --bind 0.0.0.0`, `http-server` with no `-a`, `manage.py runserver 0.0.0.0:PORT`, `next dev -H 0.0.0.0`, `streamlit run`, `gunicorn -b 0.0.0.0`, `webpack serve --host 0.0.0.0` and `astro dev --host`. The reason names the flag to add. The person can approve the command once. On by default in the policy `ws gate init` writes. |
+| `checkout-pin` | before a call | shell commands | Denies `git checkout` or `switch` to another branch or commit, `reset --hard`, `--merge` and `--keep`, `rebase`, `merge`, `pull`, `cherry-pick`, `revert`, `am`, `bisect`, `stash pop` and `apply`, a whole-tree restore from another ref and `worktree move` into a checkout that has linked worktrees, or that `paths` names, whichever way the checkout is reached (a folder, `-C`, `--git-dir`, `GIT_DIR`, a `cd`). `git checkout -- FILE`, a restore of files, `commit`, `fetch`, `status`, `log` and a branch switch inside a linked worktree go through. The person can approve the command once. Off until you name it. |
 | `record-calls` | before a call | every kind | Appends `{schema, ts, at, runner, payload}` (`ts` is the time; `at` is its legacy spelling, kept beside it) to `$WS_HOME/logs/gate-calls.jsonl`, one line for each hook run. A file write keeps its path and records the text as `{"bytes", "sha256"}`. `ws gate replay` reads that file. |
 
 `bulk-staging` and `record-calls` take no table. The other guards take one.
@@ -239,13 +239,22 @@ flag that keeps the server on this machine.
 | `rails server`, `rails s` | `-b`/`--binding` isn't loopback | `-b 127.0.0.1` |
 | `uvicorn` | `--host` isn't loopback | `--host 127.0.0.1` |
 | `hugo server` | `--bind` isn't loopback | `--bind 127.0.0.1` |
+| `http-server`, `npx http-server` | there is no `-a`/`--address` (it listens on every interface by default), or the value isn't loopback | `-a 127.0.0.1` |
+| `python manage.py runserver`, `django-admin runserver` | the address in `ADDR:PORT` isn't loopback (`0.0.0.0:8000`, `0:8000`, `[::]:8000`); a bare port is fine | `runserver 127.0.0.1:8000` |
+| `next dev`, `next start` | there is no `-H`/`--hostname` (it listens on every interface by default), or the value isn't loopback | `-H 127.0.0.1` |
+| `streamlit run` | there is no `--server.address` with a loopback value | `--server.address 127.0.0.1` |
+| `gunicorn` | a `-b`/`--bind` isn't loopback (`unix:` sockets are fine) | `-b 127.0.0.1:8000` |
+| `webpack serve`, `webpack-dev-server` | `--host` isn't loopback | `--host 127.0.0.1` |
+| `astro dev`, `astro preview` | `--host` has no value, or a value that isn't loopback | `--host 127.0.0.1`, or no `--host` |
 
-Loopback is `localhost`, any `127.x.x.x` address and `::1`. A server that listens on loopback unless told otherwise
-(everything above except `http.server`, `php -S` and `serve`) is checked only when a flag says otherwise. `allow_hosts`
+Loopback is `localhost`, any `127.x.x.x` address, `::1` and `[::1]`. A server that listens on loopback unless told
+otherwise (everything above except `http.server`, `php -S`, `serve`, `http-server`, `next`, and `streamlit`) is checked
+only when a flag says otherwise. `allow_hosts`
 lists hosts and addresses that are fine to bind, such as a VPN or tailnet address; a port after the host is ignored,
 and a name that means every interface (`0.0.0.0`, `::`, `*`) is a policy error. The deny is approvable, so a person can
-allow one command once with `ws approve`. A script that holds the flags (`npm run dev`) isn't read; the sandbox is what
-limits the network.
+allow one command once with `ws approve`. A script that holds the flags (`npm run dev`) isn't read, nor is a host set
+by a variable (`env HOST=0.0.0.0 npm run dev`), nor a listener that isn't a development server (`socat`, `nc`); the
+sandbox is what limits the network.
 
 ### checkout-pin
 
@@ -259,16 +268,27 @@ rebases there pulls the floor from under the others. The guard pins a checkout t
 checkout named in `paths` (absolute or `~/`, matched by the top of the checkout with links followed). Inside a pinned
 checkout it denies `git checkout` and `git switch` to another branch or commit (and `-b`, `-B`, `-c`, `-C`, `--detach`,
 `--orphan`, `-f`), `git checkout NAME` with no `--`, `reset --hard`, `--merge` and `--keep`, `rebase`, `merge`, `pull`,
-`cherry-pick` and `revert`. `--abort` and `--quit` of the last four go through so a half-done one can be undone. `git
-worktree move` to a destination inside the checkout is denied as well. The reason names the checkout and says to
-use a worktree: `git worktree add ../NAME -b BRANCH`.
+`cherry-pick`, `revert` and `am`. `--abort` and `--quit` of those (and `--show-current-patch` of `am`) go through so a
+half-done one can be undone. `git bisect` is denied except `log`, `view`, `visualize`, `help` and `terms`. A whole-tree
+restore from another ref is denied: `git checkout REF -- .` (or `:/`), `git restore --source=REF .` (also with
+`--worktree --staged`), and `git stash pop`, `apply` and `branch`. `git worktree move` to a destination inside the
+checkout is denied as well. The reason names the checkout and says to use a worktree: `git worktree add ../NAME -b
+BRANCH`.
 
-These go through: `git checkout -- FILE` and `git checkout TREE -- FILE`, `restore`, `add`, `commit`, `fetch`, `status`,
-`log`, `diff`, `stash`, a soft or mixed `reset`, and any command in a linked worktree (whose `.git` is a file) that
-`paths` doesn't name. A command is judged by the folder it runs in: the session's folder, `git -C DIR`, `--work-tree
-DIR`, `GIT_WORK_TREE=DIR`, or the folder of a literal `cd` earlier in the same command line. A folder that comes from a
-variable or substitution can't be read, so a command that would move HEAD from there is denied and the reason asks for a
-path. The deny is approvable. The check follows the command line, not a script it runs.
+These go through: `git checkout -- FILE` and `git checkout TREE -- FILE`, `restore` of files, `add`, `commit`, `fetch`,
+`status`, `log`, `diff`, the rest of `stash`, a soft or mixed `reset`, and any command in a linked worktree (whose `.git`
+is a file) that `paths` doesn't name. A command is judged by the checkout it acts on: the one the session's folder is
+in, `git -C DIR`, `--work-tree DIR`, `GIT_WORK_TREE=DIR`, or the folder of a literal `cd` earlier in the same command
+line. `--git-dir DIR` and `GIT_DIR=DIR` count too, since HEAD lives in the git dir: `MAIN/.git` belongs to `MAIN`, and a
+linked worktree's git dir (found through its `gitdir` file) to that worktree. A `GIT_DIR` or `GIT_WORK_TREE` set earlier
+by `export` or `declare` can't be read, so a command that would move HEAD after one is denied.
+
+The guard keeps the set of folders the shell could be in after a `cd`: a subshell `(cd x)`, a pipe, `&&`, `||`, a
+background `&` and a `cd` to a folder that doesn't exist can each leave the shell where it was, and the command is
+denied when any folder in that set is pinned. A plain `cd WORKTREE && git checkout x` goes through. A folder that
+comes from a variable or substitution can't be read, so a command that would move HEAD from there is denied and the
+reason asks for a path. `git -c alias.NAME=COMMAND NAME` is read as `COMMAND`. An alias from a config file or the
+environment isn't read, nor is a script the command line runs. The deny is approvable.
 
 ## Findings
 

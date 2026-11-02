@@ -715,10 +715,10 @@ Under `alert_on = "needs-you"` a Stop alerts, as `FOLDER needs you`, when the se
 something. It does when the message ends with `?` (spaces, quotes, brackets and markdown marks at the end set aside),
 or when its last paragraph names a choice: `which one`, `your call`, `up to you`, `choose`, `pick one`, `reply with`,
 `let me know which`, `whether`, `what` or `how`, or `need your decision`, `answer`, `input`, `approval` or
-`confirmation`. The message is read from the hook payload (`last_assistant_message`, else the last assistant text in
-the file `transcript_path` names). It's only read: the alert says what `alert_text` allows, and never holds any of the
-message. A payload with no last message never asks, and neither does a message that ends in a code block. A
-Notification of the type `auth_success` needs nothing and sends nothing under `"needs-you"`.
+`confirmation`. The message is read from the hook payload (`last_assistant_message`, else the last assistant entry in
+the file `transcript_path` names; a tool-call entry has no text and never asks). It's only read: the alert says what
+`alert_text` allows, and never holds any of the message. A payload with no last message never asks, and neither does a
+message that ends in a code block. A Notification of the type `auth_success` needs nothing and sends nothing under `"needs-you"`.
 
 #### Profile keys
 

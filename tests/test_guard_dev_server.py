@@ -92,6 +92,40 @@ DENIED = [
     ("cd site && python3 -m http.server", "--bind 127.0.0.1"),
     ("bash -c 'python -m http.server 8000'", "--bind 127.0.0.1"),
     ("timeout 60 npx serve", "-l localhost:3000"),
+    ("npx http-server", "-a 127.0.0.1"),
+    ("http-server", "-a 127.0.0.1"),
+    ("npx http-server -p 8080 .", "-a 127.0.0.1"),
+    ("http-server -a 0.0.0.0", "-a 127.0.0.1"),
+    ("http-server --address=0.0.0.0", "-a 127.0.0.1"),
+    ("python manage.py runserver 0.0.0.0:8000", "runserver 127.0.0.1:8000"),
+    ("python3 manage.py runserver 0:8000", "runserver 127.0.0.1:8000"),
+    ("python manage.py runserver [::]:8000", "runserver 127.0.0.1:8000"),
+    ("python manage.py runserver 198.51.100.7:8000 --noreload", "runserver 127.0.0.1:8000"),
+    ("./manage.py runserver 0.0.0.0:8000", "runserver 127.0.0.1:8000"),
+    ("uv run python manage.py runserver 0.0.0.0:80", "runserver 127.0.0.1:8000"),
+    ("django-admin runserver 0.0.0.0:8000", "runserver 127.0.0.1:8000"),
+    ("next dev -H 0.0.0.0", "-H 127.0.0.1"),
+    ("next dev --hostname 0.0.0.0 -p 3001", "-H 127.0.0.1"),
+    ("next dev --hostname=0.0.0.0", "-H 127.0.0.1"),
+    ("npx next dev", "-H 127.0.0.1"),
+    ("next start", "-H 127.0.0.1"),
+    ("streamlit run app.py", "--server.address 127.0.0.1"),
+    ("streamlit run app.py --server.address 0.0.0.0", "--server.address 127.0.0.1"),
+    ("streamlit run app.py --server.address=0.0.0.0", "--server.address 127.0.0.1"),
+    ("python -m streamlit run app.py", "--server.address 127.0.0.1"),
+    ("uv run streamlit run app.py", "--server.address 127.0.0.1"),
+    ("gunicorn -b 0.0.0.0:8000 app:app", "-b 127.0.0.1:8000"),
+    ("gunicorn --bind=0.0.0.0:8000 app:app", "-b 127.0.0.1:8000"),
+    ("gunicorn -b 127.0.0.1:8000 -b 0.0.0.0:9000 app:app", "-b 127.0.0.1:8000"),
+    ("gunicorn -b :8000 app:app", "-b 127.0.0.1:8000"),
+    ("python -m gunicorn -b 0.0.0.0 app:app", "-b 127.0.0.1:8000"),
+    ("webpack serve --host 0.0.0.0", "--host 127.0.0.1"),
+    ("npx webpack serve --host=0.0.0.0 --port 9000", "--host 127.0.0.1"),
+    ("webpack-dev-server --host 0.0.0.0", "--host 127.0.0.1"),
+    ("astro dev --host", "--host 127.0.0.1"),
+    ("astro dev --host 0.0.0.0", "--host 127.0.0.1"),
+    ("npx astro preview --host=0.0.0.0", "--host 127.0.0.1"),
+    ("python -m http.server --bind ::", "--bind 127.0.0.1"),
 ]
 
 ALLOWED = [
@@ -154,7 +188,80 @@ ALLOWED = [
     "npm run dev",
     "npm install serve",
     "ls",
+    "npx http-server -a 127.0.0.1",
+    "http-server -a localhost -p 8080",
+    "http-server --address=::1",
+    "http-server -a [::1]",
+    "http-server --help",
+    "http-server -h",
+    "python manage.py runserver",
+    "python manage.py runserver 8000",
+    "python manage.py runserver 127.0.0.1:8000",
+    "python manage.py runserver localhost:8000",
+    "python manage.py runserver [::1]:8000",
+    "python manage.py migrate",
+    "python manage.py shell -c 'print(1)'",
+    "django-admin startproject site",
+    "next dev -H 127.0.0.1",
+    "next dev --hostname localhost",
+    "next dev -H=127.0.0.2",
+    "next build",
+    "next lint",
+    "streamlit run app.py --server.address 127.0.0.1",
+    "streamlit run app.py --server.address=localhost",
+    "streamlit run app.py --server.address ::1",
+    "streamlit --version",
+    "streamlit hello --server.address=127.0.0.1",
+    "gunicorn app:app",
+    "gunicorn -b 127.0.0.1:8000 app:app",
+    "gunicorn --bind [::1]:8000 app:app",
+    "gunicorn -b localhost:8000 app:app",
+    "gunicorn -b unix:/tmp/app.sock app:app",
+    "webpack",
+    "webpack build",
+    "webpack serve",
+    "webpack serve --host 127.0.0.1",
+    "webpack serve --host=localhost --port 9000",
+    "astro dev",
+    "astro dev --host localhost",
+    "astro dev --host 127.0.0.1",
+    "astro build --host",
+    "astro preview",
+    "env HOST=0.0.0.0 npm run dev",
+    "socat TCP-LISTEN:8000,fork -",
+    "nc -l 8000",
 ]
+
+
+@pytest.mark.parametrize(
+    "addr",
+    [
+        "127.0.0.1",
+        "127.1.2.3",
+        "127.255.255.254",
+        "::1",
+        "[::1]",
+        "[::1]:8000",
+        "localhost",
+        "LOCALHOST:3000",
+        "app.localhost",
+    ],
+)
+def test_every_loopback_spelling_is_accepted(addr):
+    for command in (
+        f"python -m http.server --bind {addr}",
+        f"http-server -a {addr}",
+        f"vite --host {addr}",
+        f"next dev -H {addr}",
+        f"gunicorn -b {addr} app:app",
+    ):
+        assert judge(command) is None, command
+
+
+@pytest.mark.parametrize("addr", ["0.0.0.0", "::", "[::]", "0", "128.0.0.1", "203.0.113.9", "*"])
+def test_an_address_that_reaches_beyond_this_machine_is_denied(addr):
+    for command in (f"python -m http.server --bind '{addr}'", f"http-server -a '{addr}'", f"next dev -H '{addr}'"):
+        assert judge(command), command
 
 
 @pytest.mark.parametrize(("command", "flag"), DENIED)

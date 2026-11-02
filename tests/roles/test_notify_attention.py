@@ -201,10 +201,27 @@ def test_a_transcript_gives_the_last_assistant_text_when_the_payload_has_none(en
         user("go"),
         assistant({"type": "text", "text": "Which table first?"}),
         user("the orders table"),
-        assistant({"type": "text", "text": "Which index do you want?"}, {"type": "tool_use", "name": "Bash"}),
         assistant({"type": "tool_use", "name": "Read", "input": {}}),
+        assistant({"type": "text", "text": "Which index do you want?"}, {"type": "tool_use", "name": "Bash"}),
     )
     assert len(sent(NEEDS, env, stop(None, transcript_path=path))) == 1
+
+
+def test_a_transcript_that_ends_on_a_tool_call_after_an_old_question_sends_nothing(env, tmp_path):
+    path = transcript(
+        tmp_path,
+        assistant({"type": "text", "text": "Which table first?"}),
+        user("orders"),
+        assistant({"type": "tool_use", "name": "Read", "input": {}}),
+    )
+    assert ntfy._transcript_text(path) == ""
+    assert sent(NEEDS, env, stop(None, transcript_path=path)) == []
+    same_turn = transcript(
+        tmp_path,
+        assistant({"type": "text", "text": "Which index do you want?"}),
+        assistant({"type": "tool_use", "name": "Read", "input": {}}),
+    )
+    assert sent(NEEDS, env, stop(None, transcript_path=same_turn)) == []
 
 
 def test_a_transcript_that_ends_with_a_plain_finish_sends_nothing(env, tmp_path):

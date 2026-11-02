@@ -13,12 +13,20 @@ The servers read, and what puts each on every interface:
     rails server            `-b`/`--binding` that isn't loopback
     uvicorn                 `--host` that isn't loopback
     hugo server             `--bind` that isn't loopback
+    http-server             no `-a`/`--address`, or one that isn't loopback (the default is every interface)
+    manage.py runserver     an `ADDR:PORT` whose address isn't loopback (`0.0.0.0:8000`, `0:8000`); a bare port is fine
+    next dev|start          no `-H`/`--hostname` (the default is every interface), or one that isn't loopback
+    streamlit run           no `--server.address`, or one that isn't loopback
+    gunicorn                a `-b`/`--bind` that isn't loopback
+    webpack serve           `--host` that isn't loopback (also `webpack-dev-server`)
+    astro dev|preview       `--host` with no value, or a value that isn't loopback
 
-Loopback is `localhost`, `127.0.0.0/8` and `::1`. A server that listens on loopback unless told otherwise (vite, flask,
-jupyter, rails, uvicorn, hugo) is checked only when it is told otherwise. The server is found through `python -m`, a
-path (`./node_modules/.bin/vite`), and the launchers `npx`, `bunx`, `pnpx`, `uvx`, `npm exec`, `pnpm exec|dlx`,
+Loopback is `localhost`, `127.0.0.0/8`, `::1` and `[::1]`. A server that listens on loopback unless told otherwise (vite,
+flask, jupyter, rails, uvicorn, hugo, runserver, gunicorn, webpack, astro) is checked only when it is told otherwise. The server is found through `python -m`, a
+path (`./node_modules/.bin/vite`), `python manage.py` and `django-admin`, and the launchers `npx`, `bunx`, `pnpx`, `uvx`, `npm exec`, `pnpm exec|dlx`,
 `yarn exec|dlx`, `bun x`, `uv run`, `poetry run`, `pipenv run`, `pdm run`, `rye run`, `hatch run`, `conda run`, `pipx
-run` and `bundle exec`. A script that holds the flags (`npm run dev`) isn't read.
+run` and `bundle exec`. A script that holds the flags (`npm run dev`) isn't read, nor is a host set by a variable
+(`env HOST=0.0.0.0 npm run dev`), nor a listener that isn't a development server (`socat`, `nc`).
 """
 
 from __future__ import annotations
@@ -80,6 +88,7 @@ _JUPYTER_SUBS = {"lab", "notebook", "server", "nbclassic", "labhub"}
 _JUPYTER_PROGRAMS = {"jupyter-lab", "jupyter-notebook", "jupyter-server", "jupyter-nbclassic", "jupyter-labhub"}
 _JUPYTER_MODULES = {"notebook", "jupyterlab", "jupyter_server"}
 _VITE_SUBS = {"dev", "build", "preview", "serve", "optimize"}
+_ASTRO_SUBS = {"dev", "build", "preview", "check", "sync"}
 
 
 @dataclass(frozen=True)
@@ -211,10 +220,9 @@ def _serve(args, env, cfg):
     return None
 
 
-def _vite(args, env, cfg):
-    positional = [a for a in args if not a.startswith("-")]
-    if positional and positional[0] == "build":
-        return None
+def _host_flag(server, args, cfg, subs):
+    """A `--host` that takes a value or none: no value is every interface. `subs` are the words that follow it as a
+    sub-command, so they aren't taken for its value."""
     fix = "--host 127.0.0.1 (or leave --host out)"
     i = 0
     while i < len(args):
@@ -223,16 +231,30 @@ def _vite(args, env, cfg):
             break
         if w == "--host":
             nxt = args[i + 1] if i + 1 < len(args) else ""
-            value = nxt if _HOST.fullmatch(nxt) and not nxt.startswith("-") and nxt not in _VITE_SUBS else None
+            value = nxt if _HOST.fullmatch(nxt) and not nxt.startswith("-") and nxt not in subs else None
             if value is None:
-                return Problem("vite", "every interface (--host with no value)", fix)
+                return Problem(server, "every interface (--host with no value)", fix)
             if _exposed(value, cfg):
-                return Problem("vite", value, fix)
+                return Problem(server, value, fix)
             i += 1
         elif w.startswith("--host=") and _exposed(w.partition("=")[2], cfg):
-            return Problem("vite", w.partition("=")[2] or "every interface", fix)
+            return Problem(server, w.partition("=")[2] or "every interface", fix)
         i += 1
     return None
+
+
+def _vite(args, env, cfg):
+    positional = [a for a in args if not a.startswith("-")]
+    if positional and positional[0] == "build":
+        return None
+    return _host_flag("vite", args, cfg, _VITE_SUBS)
+
+
+def _astro(args, env, cfg):
+    positional = [a for a in args if not a.startswith("-")]
+    if not positional or positional[0] not in ("dev", "preview"):
+        return None
+    return _host_flag("astro", args, cfg, _ASTRO_SUBS)
 
 
 def _flask(args, env, cfg):
@@ -266,6 +288,50 @@ def _hugo(args, env, cfg):
     return _bound("hugo server", args[1:], ("--bind",), (), cfg, "--bind 127.0.0.1", default_open=False)
 
 
+def _http_server_js(args, env, cfg):
+    if "-h" in args:
+        return None
+    return _bound("http-server", args, ("--address",), ("-a",), cfg, "-a 127.0.0.1", default_open=True)
+
+
+def _django(args, env, cfg):
+    if "runserver" not in args:
+        return None
+    operands = [a for a in args[args.index("runserver") + 1 :] if not a.startswith("-")]
+    if not operands or operands[0].isdecimal():  # no address, or a port alone: loopback
+        return None
+    if _exposed(operands[0], cfg):
+        return Problem("runserver", operands[0], "runserver 127.0.0.1:8000")
+    return None
+
+
+def _next(args, env, cfg):
+    if not args or args[0] not in ("dev", "start"):
+        return None
+    return _bound("next", args[1:], ("--hostname",), ("-H",), cfg, "-H 127.0.0.1", default_open=True)
+
+
+def _streamlit(args, env, cfg):
+    if "run" not in args:
+        return None
+    return _bound(
+        "streamlit run", args, ("--server.address",), (), cfg, "--server.address 127.0.0.1", default_open=True
+    )
+
+
+def _gunicorn(args, env, cfg):
+    for value in _values(args, ("--bind",), ("-b",)):
+        if value is not None and not value.startswith(("unix:", "fd://")) and _exposed(value, cfg):
+            return Problem("gunicorn", value or "every interface", "-b 127.0.0.1:8000")
+    return None
+
+
+def _webpack(args, env, cfg):
+    if "serve" not in args and "s" not in args and "server" not in args:
+        return None
+    return _bound("webpack serve", args, ("--host",), (), cfg, "--host 127.0.0.1", default_open=False)
+
+
 _PROGRAMS = {
     "php": _php,
     "serve": _serve,
@@ -274,6 +340,17 @@ _PROGRAMS = {
     "rails": _rails,
     "uvicorn": _uvicorn,
     "hugo": _hugo,
+    "http-server": _http_server_js,
+    "manage.py": _django,
+    "django-admin": _django,
+    "next": _next,
+    "streamlit": _streamlit,
+    "gunicorn": _gunicorn,
+    "webpack": _webpack,
+    "webpack-dev-server": lambda args, env, cfg: _bound(
+        "webpack-dev-server", args, ("--host",), (), cfg, "--host 127.0.0.1", default_open=False
+    ),
+    "astro": _astro,
     **{name: _jupyter for name in _JUPYTER_PROGRAMS},
 }
 _MODULES = {
@@ -281,6 +358,8 @@ _MODULES = {
     "SimpleHTTPServer": _legacy_http_server,
     "flask": _flask,
     "uvicorn": _uvicorn,
+    "gunicorn": _gunicorn,
+    "streamlit": _streamlit,
     **{name: _jupyter for name in _JUPYTER_MODULES},
 }
 
@@ -317,7 +396,8 @@ def _program(words: list[str], depth: int = 0) -> tuple[str, list[str], bool] | 
 
 
 def _python(words: list[str]) -> tuple[str, list[str], bool] | None:
-    """The module `python [options] -m MODULE ...` runs and its arguments; None for a script or `-c`."""
+    """The module `python [options] -m MODULE ...` runs and its arguments, or the script `python [options] FILE ...`
+    (by its file name); None for `-c`."""
     i = 1
     while i < len(words) and words[i].startswith("-") and words[i] != "--":
         w = words[i]
@@ -325,7 +405,13 @@ def _python(words: list[str]) -> tuple[str, list[str], bool] | None:
             return words[i + 1], words[i + 2 :], True
         if w.startswith("-m") and len(w) > 2:
             return w[2:], words[i + 1 :], True
+        if w.startswith("-c"):
+            return None
         i += 2 if w in _PY_VALUE else 1
+    if i < len(words) and words[i] == "--":
+        i += 1
+    if i < len(words):
+        return os.path.basename(words[i]), words[i + 1 :], False
     return None
 
 

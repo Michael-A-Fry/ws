@@ -39,10 +39,10 @@ something; a plain finished turn sends nothing. A last message asks something wh
 brackets and markdown marks set aside, it ends with "?", or when its last paragraph names a choice: "which one",
 "your call", "up to you", "choose", "pick one", "reply with", "let me know which|whether|what|how", "need your
 decision|answer|input|approval|confirmation". The message comes from the hook payload (`last_assistant_message`, or the
-last assistant text in the `transcript_path` file). It is read here and goes nowhere: the alert says what `alert_text`
-says, and a Stop that asks reads "<folder> needs you". A payload with no last message never asks, and neither does a
-message that ends in a code block, so under "needs-you" a runner that sends no last message alerts on its Notification
-events only. A key that is absent means "every-stop", so a config written before the key keeps its behaviour; set
+last assistant entry of the `transcript_path` file, which never asks when it holds no text). It is read here and goes
+nowhere: the alert says what `alert_text` says, and a Stop that asks reads "<folder> needs you". A payload with no last
+message never asks, and neither does a message that ends in a code block, so under "needs-you" a runner that sends no
+last message alerts on its Notification events only. A key that is absent means "every-stop", so a config written before the key keeps its behaviour; set
 "needs-you" in a new one.
 
 An alert must not hold a session up. The whole send (broker lease included) gets 3 seconds, and runs in a daemon thread
@@ -477,8 +477,9 @@ def asks(text: object) -> bool:
 
 
 def _transcript_text(path: object) -> str:
-    """The text of the last assistant message in a JSON-lines transcript file, read from its end; '' when there is none
-    or the file can't be read."""
+    """The text of the last assistant entry in a JSON-lines transcript file, read from its end; '' when there is none,
+    when that entry has no text (it ends on a tool call, so an earlier question isn't the last word), or when the file
+    can't be read."""
     if not isinstance(path, str) or not path:
         return ""
     try:
@@ -501,8 +502,8 @@ def _transcript_text(path: object) -> str:
             return content
         if isinstance(content, list):
             parts = [b.get("text") for b in content if isinstance(b, dict) and b.get("type") == "text"]
-            if text := "\n".join(p for p in parts if isinstance(p, str)):
-                return text
+            return "\n".join(p for p in parts if isinstance(p, str))
+        return ""
     return ""
 
 

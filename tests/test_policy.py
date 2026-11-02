@@ -1836,3 +1836,37 @@ def test_a_heredoc_body_that_is_data_is_not_asked_about(home):
     p = policy.loads('[gate]\nask_commands = ["terraform apply*"]\n')
     assert not policy.needs_approval(p, "cat > run.sh <<'EOF'\nterraform apply\nEOF\n")
     assert policy.needs_approval(p, "cat > run.sh <<'EOF'\nx\nEOF\nterraform apply\n")
+
+
+def test_simple_commands_flow_keeps_the_order_the_links_and_the_subshells():
+    def shape(cmd):
+        return [(" ".join(w), link, piped) for w, _, link, piped in policy.simple_commands_flow(cmd)]
+
+    assert shape("a && b || c; d\ne") == [
+        ("a", ";", False),
+        ("b", "&&", False),
+        ("c", "||", False),
+        ("d", ";", False),
+        ("e", ";", False),
+    ]
+    assert shape("(a; b) | c & d") == [
+        ("", "(", False),
+        ("a", ";", False),
+        ("b", ";", False),
+        ("", ")", False),
+        ("c", ";", False),
+        ("", "&", False),
+        ("d", ";", False),
+    ]
+    assert shape("a | b | c") == [("a", ";", True), ("b", ";", True), ("c", ";", True)]
+    assert shape("bash -c 'x; y'; z") == [
+        ("bash -c x; y", ";", False),
+        ("", "(", False),
+        ("x", ";", False),
+        ("y", ";", False),
+        ("", ")", False),
+        ("z", ";", False),
+    ]
+    assert shape("echo $(x)") == [("echo $(x)", ";", False), ("", "(?", False), ("x", ";", False), ("", ")", False)]
+    flat = [(w, e) for w, e, _, _ in policy.simple_commands_flow("A=1 a && b") if w or e]
+    assert flat == policy.simple_commands_env("A=1 a && b")

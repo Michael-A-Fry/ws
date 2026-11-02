@@ -245,6 +245,224 @@ def test_a_session_folder_is_not_needed_to_judge_an_absolute_path(box, monkeypat
     assert checkout_pin.judge(Call("command", "git pull"), cfg_of(), ctx) is None
 
 
+# --- the git dir, where the shell is, aliases and whole-tree restores ------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git --git-dir={main}/.git checkout feature",
+        "git --git-dir {main}/.git switch feature",
+        "git --git-dir={main}/.git --work-tree={plain} checkout feature",
+        "GIT_DIR={main}/.git git checkout feature",
+        "GIT_DIR={main}/.git git reset --hard",
+        "export GIT_DIR={main}/.git; git checkout feature",
+        "declare -x GIT_DIR={main}/.git && git checkout feature",
+        "GIT_DIR={main}/.git; export GIT_DIR; git reset --hard",
+        "export GIT_WORK_TREE={main}; git pull",
+    ],
+)
+def test_a_git_dir_of_the_pinned_checkout_is_judged_whatever_the_folder(box, command):
+    found = judge(command.format(main=box["main"], plain=box["plain"]), box["plain"])
+    assert found and found.approvable, command
+
+
+def test_a_git_dir_is_read_for_the_checkout_it_belongs_to(box):
+    main_git = box["main"] / ".git"
+    wt_git = main_git / "worktrees" / "wt"  # a linked worktree's git dir names its worktree
+    (wt_git / "commondir").write_text("../..\n")
+    (wt_git / "gitdir").write_text(f"{box['wt']}/.git\n")
+    assert judge(f"git --git-dir={wt_git} checkout feature", box["plain"]) is None
+    assert judge(f"GIT_DIR={wt_git} git reset --hard", box["plain"]) is None
+    assert judge(f"git --git-dir={box['wt']}/.git checkout feature", box["plain"]) is None  # a `.git` file
+    assert judge(f"git --git-dir={box['solo']}/.git checkout feature", box["plain"]) is None
+    assert judge("git --git-dir=.git checkout feature", box["main"])  # relative to the folder it runs in
+    assert judge(f"git --git-dir={main_git} status", box["plain"]) is None  # nothing moves
+    cfg = cfg_of(paths=[str(box["solo"])])
+    assert judge(f"git --git-dir={box['solo']}/.git switch topic", box["plain"], cfg)
+
+
+def test_a_git_dir_that_cannot_be_read_is_a_deny_when_head_would_move(box):
+    for command in (
+        'git --git-dir="$G" checkout x',
+        'GIT_DIR="$(pwd)/.git" git pull',
+        "export GIT_DIR=$G; git switch x",
+    ):
+        found = judge(command, box["wt"])
+        assert found and "variable or substitution" in found.reason, command
+    assert judge('git --git-dir="$G" status', box["wt"]) is None
+    assert judge("export GIT_DIR=/x; git status", box["wt"]) is None
+    assert judge("(export GIT_DIR=/x); git checkout x", box["wt"]) is None  # a subshell's export ends with it
+    assert judge("export PATH=/x; git checkout x", box["wt"]) is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "bisect start",
+        "bisect good",
+        "bisect bad HEAD~3",
+        "bisect new",
+        "bisect skip",
+        "bisect reset",
+        "bisect run make",
+        "am fix.patch",
+        "am --continue",
+        "am --skip",
+    ],
+)
+def test_bisect_and_am_move_head(box, command):
+    assert judge(f"git {command}", box["main"]), command
+    assert judge(f"git {command}", box["wt"]) is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "bisect log",
+        "bisect view",
+        "bisect visualize",
+        "bisect help",
+        "bisect",
+        "am --abort",
+        "am --quit",
+        "am --show-current-patch",
+        "am --show-current-patch=diff",
+        "bisect --help",
+    ],
+)
+def test_the_reads_and_the_undo_of_bisect_and_am_go_through(box, command):
+    assert judge(f"git {command}", box["main"]) is None, command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "(cd {tmp}); git checkout x",
+        "cd {tmp} | cat; git checkout x",
+        "false && cd {tmp}; git checkout x",
+        "true || cd {tmp}; git checkout x",
+        "cd /does/not/exist; git checkout x",
+        "cd /does/not/exist 2>/dev/null; git checkout x",
+        "cd {tmp} & git checkout x",
+        "(cd {tmp} && true); git checkout x",
+        "cd /does/not/exist && cd {tmp}; git checkout x",
+        "bash -c 'cd {tmp}'; git checkout x",
+        "echo $(cd {tmp}); git checkout x",
+    ],
+)
+def test_a_cd_that_may_not_have_moved_the_shell_leaves_the_pinned_folder_judged(box, command):
+    found = judge(command.format(tmp=box["tmp"], wt=box["wt"]), box["main"])
+    assert found and os.path.realpath(box["main"]) in found.reason, command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cd {wt} && git checkout x",
+        "cd {wt}; git checkout x",
+        "cd {wt} && git status && git checkout x",
+        "git status && cd {wt} && git checkout x",
+        "(cd {wt} && git checkout x)",
+        "cd {wt} || git checkout x",
+        "cd {plain} && cd {wt} && git switch x",
+        "cd {wt}\ngit checkout x",
+        "bash -c 'cd {wt} && git checkout x'",
+        "{{ cd {wt}; git checkout x; }}",
+    ],
+)
+def test_a_cd_that_does_move_the_shell_to_a_worktree_goes_through(box, command):
+    assert judge(command.format(wt=box["wt"], plain=box["plain"]), box["main"]) is None, command
+
+
+def test_a_cd_into_the_pinned_checkout_is_judged_the_same_way_from_outside(box):
+    assert judge(f"(cd {box['main']}); git checkout x", box["plain"]) is None
+    assert judge(f"(cd {box['main']} && git checkout x)", box["plain"])
+    assert judge(f"cd {box['main']} | cat; git checkout x", box["plain"]) is None
+    assert judge(f"cd {box['main']} && git checkout x", box["plain"])
+    assert judge(f"true && cd {box['main']} && git checkout x", box["plain"])
+    assert judge(f"cd {box['main']}; cd {box['wt']}; git checkout x", box["plain"]) is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git -c alias.go=checkout go feature",
+        "git -c alias.go='checkout -b' go topic",
+        "git -c alias.GO=switch go feature",
+        "git -c alias.sync=pull sync",
+        "git -c alias.a=reset a --hard",
+        "git -c alias.go='!git checkout' go feature",
+        "git -c alias.go='!f() { git switch \"$@\"; }; f' go feature",
+        "git -c alias.x=go -c alias.go=checkout x feature",
+        "git -c alias.go='-c core.editor=true checkout' go feature",
+    ],
+)
+def test_an_alias_given_with_c_is_read_as_the_command_it_names(box, command):
+    assert judge(command, box["main"]), command
+    assert judge(command, box["wt"]) is None, command
+
+
+def test_an_alias_for_a_command_that_does_not_move_head_goes_through(box):
+    assert judge("git -c alias.st=status st", box["main"]) is None
+    assert judge("git -c alias.go=checkout go -- a.py", box["main"]) is None
+    assert judge("git -c alias.go=checkout status", box["main"]) is None
+    assert judge("git -c alias.checkout=status checkout feature", box["main"])  # git ignores an alias for a command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git checkout HEAD~3 -- .",
+        "git checkout main -- .",
+        "git checkout origin/main -- :/",
+        "git checkout -f main -- ./",
+        "git checkout main -- ':(top)'",
+        "git checkout main -- ':/*'",
+        "git restore --source=HEAD~3 .",
+        "git restore --source HEAD~3 .",
+        "git restore -s main .",
+        "git restore -smain .",
+        "git restore --source=main --worktree --staged .",
+        "git restore --source=main --staged --worktree :/",
+        "git restore --source HEAD~5 -W -S .",
+        "git restore -Ws main .",
+        "git restore --source=main -- .",
+        "git stash pop",
+        "git stash apply",
+        "git stash pop --index",
+        "git stash branch topic",
+    ],
+)
+def test_a_whole_tree_restore_from_another_ref_is_denied(box, command):
+    found = judge(command, box["main"])
+    assert found and found.approvable, command
+    assert judge(command, box["wt"]) is None, command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git checkout main -- a.py",
+        "git checkout main -- src/",
+        "git checkout main -- ./a.py",
+        "git checkout -- .",
+        "git restore .",
+        "git restore --staged .",
+        "git restore --source=main a.py",
+        "git restore --source=main src/",
+        "git restore -s main a.py b.py",
+        "git stash",
+        "git stash push -m pop",
+        "git stash list",
+        "git stash show",
+        "git stash drop",
+    ],
+)
+def test_a_single_file_restore_and_the_rest_of_stash_stay_allowed(box, command):
+    assert judge(command, box["main"]) is None, command
+
+
 # --- the policy and the gate -------------------------------------------------------------------------------------
 
 

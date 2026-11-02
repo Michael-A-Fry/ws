@@ -103,8 +103,8 @@ known clears it, and every doubt hides it. A record is **opaque** when any of th
 
 Folders are compared as written: runs of spaces in a name aren't collapsed, and a path is cut off, never tidied, at 4096
 characters (a longer one counts as opaque). A name is compared the way the file system compares names, and on a
-case-insensitive file system a folder that's the same one on disk under another spelling (`~/Code/fiu` for
-`~/code/fiu`) is covered too. Names are compared in one Unicode form, so `café` typed two ways is one name. The check
+case-insensitive file system a folder that's the same one on disk under another spelling (`~/Code/client` for
+`~/code/client`) is covered too. Names are compared in one Unicode form, so `café` typed two ways is one name. The check
 walks up each path and looks at every folder on the way, so a stale network mount can make it wait.
 
 The rule runs last, after merging, and an opaque record keeps only these fields:

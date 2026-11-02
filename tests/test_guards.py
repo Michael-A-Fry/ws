@@ -516,8 +516,8 @@ def test_session_context_lists_the_state_files_that_exist(tmp_path):
 
 def test_session_context_looks_in_the_main_worktree_too(tmp_path):
     main, linked = tmp_path / "main", tmp_path / "linked"
-    (main / ".claude-state").mkdir(parents=True)
-    (main / ".claude-state" / "STATE.md").write_text("state")
+    main.mkdir()
+    (main / "HANDOFF.md").write_text("state")
     gitdir = main / ".git" / "worktrees" / "w"
     gitdir.mkdir(parents=True)
     (gitdir / "commondir").write_text("../..\n")
@@ -529,8 +529,36 @@ def test_session_context_looks_in_the_main_worktree_too(tmp_path):
     assert found.reason.endswith("(main worktree)") and str(main) in found.reason
 
 
+@pytest.mark.parametrize("name", ["STATE.md", ".state/STATE.md", "HANDOFF.md", "TODO.md"])
+def test_session_context_default_finds_each_common_state_file_for_any_runner(tmp_path, name):
+    (tmp_path / ".git").mkdir()
+    (tmp_path / name).parent.mkdir(exist_ok=True)
+    (tmp_path / name).write_text("state")
+    found = session_context.judge(
+        None, session_context.config({}, "[w]"), guards.Context("opencode", "start", cwd=str(tmp_path))
+    )
+    assert found.reason == f"ws: {name} exists at {tmp_path / name}"
+
+
+def test_session_context_default_says_nothing_where_there_is_no_state_file_and_ignores_the_rules_file(tmp_path):
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "AGENTS.md").write_text("rules, not state")
+    ctx = guards.Context("claude-code", "start", cwd=str(tmp_path))
+    assert session_context.judge(None, session_context.config({}, "[w]"), ctx) is None
+
+
+def test_session_context_files_that_are_set_replace_the_default(tmp_path):
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "STATE.md").write_text("state")
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "LOG.md").write_text("log")
+    cfg = session_context.config({"files": ["docs/LOG.md"]}, "[w]")
+    found = session_context.judge(None, cfg, guards.Context("claude-code", "start", cwd=str(tmp_path)))
+    assert found.reason == f"ws: docs/LOG.md exists at {tmp_path / 'docs' / 'LOG.md'}"
+
+
 def test_session_context_default_files_and_bad_paths():
-    assert session_context.config({}, "[w]").files == (".claude-state/STATE.md",)
+    assert session_context.config({}, "[w]").files == ("STATE.md", ".state/STATE.md", "HANDOFF.md", "TODO.md")
     for bad in ("/etc/passwd", "../x", "~/x", "."):
         with pytest.raises(policy.PolicyError, match="inside the project"):
             session_context.config({"files": [bad]}, "[w]")
@@ -902,11 +930,10 @@ def test_event_at_session_start_puts_the_notes_on_stdout(home, monkeypatch, caps
     p = write_policy(home, '[guards]\non = ["session-context"]\n')
     project = home / "proj"
     (project / ".git").mkdir(parents=True)
-    (project / ".claude-state").mkdir()
-    (project / ".claude-state" / "STATE.md").write_text("s")
+    (project / "STATE.md").write_text("s")
     payload = {"hook_event_name": "SessionStart", "session_id": "s", "cwd": str(project)}
     code, out, err = run_gate(monkeypatch, capsys, "event", payload, "--policy", str(p))
-    assert code == 0 and err == "" and ".claude-state/STATE.md exists at" in out and "session-context" in out
+    assert code == 0 and err == "" and "STATE.md exists at" in out and "session-context" in out
 
 
 @pytest.mark.parametrize(

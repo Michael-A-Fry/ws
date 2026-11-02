@@ -280,7 +280,7 @@ on = ["syntax-check", "session-context"]
 # [guards.syntax-check]
 # extra = {{ yaml = ["yamllint", "-d", "relaxed"] }}   # an extension and the checker that gets the file path appended
 # [guards.session-context]
-# files = [".claude-state/STATE.md"]
+# files = ["STATE.md", ".state/STATE.md", "HANDOFF.md", "TODO.md"]   # the default; list the state files your projects keep
 # warn_api_key = true   # on by default: a line when ANTHROPIC_API_KEY, not the subscription, bills a session
 # [guards.claims]
 # release_dir = "~/releases"   # a folder whose `current` link names the promoted release; left out, claims are off

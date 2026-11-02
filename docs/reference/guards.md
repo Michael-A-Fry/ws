@@ -15,7 +15,7 @@ on = ["syntax-check", "session-context"]     # the guards that run, in this orde
 extra = { yaml = ["yamllint", "-d", "relaxed"] }
 
 [guards.session-context]
-files = [".claude-state/STATE.md"]
+files = ["STATE.md", ".state/STATE.md", "HANDOFF.md", "TODO.md"]   # the default
 ```
 
 A policy file with no `[guards]` table has no guards on, so an upgrade changes nothing until you add the table.
@@ -51,9 +51,9 @@ argument and gives the checker 10 seconds. An exit code other than 0 is a findin
 A checker that isn't installed, or runs out of time, is a note. An entry in `extra` replaces the built-in check for that
 extension.
 
-`session-context` takes `files`, a list of paths relative to the project (default `[".claude-state/STATE.md"]`). A path
-must stay inside the project: no leading `/` or `~`, no `..`. It also takes `warn_api_key`; see
-[session-context](#session-context).
+`session-context` takes `files`, a list of paths relative to the project. The default is the state, handoff and to-do
+files most projects and runners use: `STATE.md`, `.state/STATE.md`, `HANDOFF.md` and `TODO.md`. A path must stay inside
+the project: no leading `/` or `~`, no `..`. It also takes `warn_api_key`; see [session-context](#session-context).
 
 `record-calls` is off unless you name it. A line holds the hook payload as the runner sent it, with one change: the text
 a write tool carries (Write `content`, Edit `old_string` and `new_string`, each MultiEdit edit's two strings, NotebookEdit
@@ -131,7 +131,7 @@ runner sends one) are appended to `$WS_HOME/logs/claims.jsonl` with whether each
 
 ```toml
 [guards.session-context]
-files = [".claude-state/STATE.md"]   # optional
+files = ["STATE.md", ".state/STATE.md", "HANDOFF.md", "TODO.md"]   # optional: this is the default
 warn_api_key = true                  # optional, true unless you set it
 ```
 

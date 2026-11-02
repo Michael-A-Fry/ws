@@ -86,9 +86,11 @@ Named checks that run beside the `[gate]` rules. The [guards reference](guards.m
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `on` | list of text | `[]` | The guards that run, in order. A name ws doesn't know stops the load. `ws gate init` writes `["syntax-check", "session-context"]`. |
+| `on` | list of text | `[]` | The guards that run, in order. A name ws doesn't know stops the load. `ws gate init` writes `["syntax-check", "session-context", "dev-server"]`. |
 | `[guards.syntax-check]` `extra` | table of extension to command | `{}` | A checker for an extension, such as `{ yaml = ["yamllint", "-d", "relaxed"] }`. The file path is added as the last argument. |
 | `[guards.session-context]` `files` | list of text | `["STATE.md", ".state/STATE.md", "HANDOFF.md", "TODO.md"]` | Project-relative files to list at session start, when they exist. |
+| `[guards.dev-server]` `allow_hosts` | list of text | `[]` | Hosts and addresses a dev server may bind besides loopback. |
+| `[guards.checkout-pin]` `paths` | list of text | `[]` | Checkouts to pin besides those with linked worktrees. Absolute or `~/`. |
 
 A file with no `[guards]` table has no guards on. `bulk-staging` and `record-calls` take no table.
 

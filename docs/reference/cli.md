@@ -711,6 +711,15 @@ It sends nothing for any other event, for a headless session (`claude -p`, or `W
 is `false`. The send gets 3 seconds. If another send holds the counter it skips that alert, and after a failed send
 alerts pause for 5 minutes.
 
+Under `alert_on = "needs-you"` a Stop alerts, as `FOLDER needs you`, when the session's last message asks you
+something. It does when the message ends with `?` (spaces, quotes, brackets and markdown marks at the end set aside),
+or when its last paragraph names a choice: `which one`, `your call`, `up to you`, `choose`, `pick one`, `reply with`,
+`let me know which`, `whether`, `what` or `how`, or `need your decision`, `answer`, `input`, `approval` or
+`confirmation`. The message is read from the hook payload (`last_assistant_message`, else the last assistant entry in
+the file `transcript_path` names; a tool-call entry has no text and never asks). It's only read: the alert says what
+`alert_text` allows, and never holds any of the message. A payload with no last message never asks, and neither does a
+message that ends in a code block. A Notification of the type `auth_success` needs nothing and sends nothing under `"needs-you"`.
+
 #### Profile keys
 
 Set these in the `[roles.notify]` table of `profile.toml`, beside `adapter = "ntfy"`, `url` and `token`.
@@ -720,6 +729,7 @@ Set these in the `[roles.notify]` table of `profile.toml`, beside `adapter = "nt
 | `session_alerts` | `true` (default) or `false`. When `false`, `ws notify alert` sends nothing. |
 | `alert_text` | What an alert says. `"title"` (default) sends the folder name with the event, such as `FOLDER needs you`. `"full"` adds the runner's own message after it. `"plain"` sends `a session needs you` with no folder name, for private folder names. |
 | `alerts_per_day` | The daily allowance for session alerts, a whole number, 0 or more (default 50). Counted apart from pushes and the digest. |
+| `alert_on` | Which events alert. `"needs-you"` sends for each Notification (a permission or an answer is wanted) and for a Stop whose last message asks something; a plain finished turn sends nothing. `"every-stop"` sends for every Notification and every Stop. A key that isn't there means `"every-stop"`, so a config from before the key behaves as it did; set `"needs-you"` in a new one. |
 
 The folder name goes to the notify server (ntfy.sh or your own) with the push. Each send writes
 `$WS_HOME/logs/notify-last.json`.

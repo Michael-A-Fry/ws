@@ -14,6 +14,7 @@ from __future__ import annotations
 import html
 import json
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -192,7 +193,7 @@ const main = document.getElementById('main'), rail = document.getElementById('ra
 const back = document.getElementById('back'), next = document.getElementById('next'), count = document.getElementById('count');
 let step = 0, plan = null, busy = false, done = false;
 const picked = new Set(B.plugins.filter(p => p.on).map(p => p.name));
-let notes = B.notes.value, capText = '';
+let notes = B.notes.value, capText = '', region = B.region.value;
 
 async function api(path, body) {
   const r = await fetch(path, {method: 'POST', headers: {'Content-Type': 'application/json', 'X-Ws-Token': T},
@@ -200,7 +201,7 @@ async function api(path, body) {
   let j = {}; try { j = await r.json(); } catch (e) { j = {error: 'The server did not answer.'}; }
   return {ok: r.ok, j};
 }
-const choice = () => ({plugins: [...picked], notes, cap: capText});
+const choice = () => ({plugins: [...picked], notes, cap: capText, region});
 
 function steps() {
   document.getElementById('steps').replaceChildren(...SHOWN.map((i, pos) => h('li',
@@ -250,9 +251,16 @@ function core() {
     h('section', {class: 'panel core'}, h('h2', {}, 'Core', h('span', {text: 'Always on'})),
       h('ul', {}, B.core.map(c => h('li', {}, tickIcon(), h('b', {text: c.name}), h('span', {text: c.line})))))];
 }
+function regionField() {  // only when an offered plugin suits some countries and nothing firm says where this is
+  const input = h('input', {type: 'text', id: 'region', maxlength: '2', placeholder: 'skip', spellcheck: 'false', 'aria-label': 'Your country'});
+  input.value = region;
+  input.addEventListener('input', () => { region = input.value.trim().toUpperCase(); input.value = region; loadPlan(); });
+  return h('div', {class: 'gap'}, h('div', {class: 'label'}, h('b', {text: 'Your country'}), h('span', {text: 'Two letters, such as CA. Some plugins suit only some countries.'})), input);
+}
 function plugins() {
   return [h('h1', {text: 'Choose your plugins'}),
     h('p', {class: 'sub'}, 'Each plugin adds one job. Add them now, or later with ', h('code', {text: 'ws plugin add'}), '.'),
+    ...(B.region.ask ? [regionField()] : []),
     h('div', {class: 'label'}, h('b', {text: 'Plugins'}), h('span', {text: B.plugins.some(p => !p.built) ? 'Planned: a choice is recorded for now' : ''})),
     h('div', {class: 'plugs'}, B.plugins.map(p => {
       const input = h('input', {type: 'checkbox', value: p.name, ...(p.available ? {} : {disabled: ''})});
@@ -411,6 +419,7 @@ def _boot(facts: flow.Facts, c: flow.Choices) -> str:
         ],
         "notes": {"value": flow.tilde(c.notes, env), "options": options},
         "runner": runner.label if runner else "",
+        "region": {"ask": facts.asks_region, "value": c.region or ""},
         "setUp": facts.set_up,
         "change": [list(x) for x in flow.change_commands(facts, c)],
     }
@@ -474,27 +483,30 @@ class SetupServer(LoopbackServer):
         return page
 
     @staticmethod
-    def _fields(data: dict) -> tuple[list[str], str | None, object]:
+    def _fields(data: dict) -> tuple[list[str], str | None, object, str | None]:
         """What the page sent, checked for shape. Anything else is a 400 `bad request`."""
         picks, notes, cap = data.get("plugins", []), data.get("notes"), data.get("cap")
+        region = data.get("region")
+        if region is not None and not isinstance(region, str):
+            raise BadRequest
         if not isinstance(picks, list) or not all(isinstance(m, str) for m in picks) or len(picks) > 50:
             raise BadRequest
         if notes is not None and not isinstance(notes, str):
             raise BadRequest
         if cap is not None and (isinstance(cap, bool) or not isinstance(cap, (str, int, float))):
             raise BadRequest
-        return picks, notes, cap
+        return picks, notes, cap, region
 
     def _call(self, path: str, data: dict) -> tuple[int, dict]:
-        picks, notes, cap = self._fields(data)
-        return self.handle(path, picks, notes, cap)
+        picks, notes, cap, region = self._fields(data)
+        return self.handle(path, picks, notes, cap, region)
 
     def _finish(self, data: dict) -> tuple[int, dict, bool]:
         self._fields(data)
         self.result = {"headline": "0 changes", "groups": [], "notes": [], "next": []}
         return 200, {"ok": True}, True
 
-    def _choices(self, picks: list[str], notes: str | None, cap) -> flow.Choices:
+    def _choices(self, picks: list[str], notes: str | None, cap, region: str | None = None) -> flow.Choices:
         """What the page sent, on top of the starting choices. Nothing is trimmed but spaces; a control character or a
         cap that is not a number is refused by `flow.check_choices` / `flow.parse_cap` with a plain message."""
         c = replace(self.choices, plugins=frozenset(picks))
@@ -504,9 +516,13 @@ class SetupServer(LoopbackServer):
             c = replace(c, cap=flow.parse_cap(cap) if cap.strip() else self.choices.cap)
         elif cap is not None:
             c = replace(c, cap=float(cap))
+        if region is not None and region.strip():
+            c = replace(c, region=region.strip().upper())  # `flow.check_choices` refuses what is not two letters
         return c
 
-    def handle(self, path: str, picks: list[str], notes: str | None, cap=None) -> tuple[int, dict]:
+    def handle(
+        self, path: str, picks: list[str], notes: str | None, cap=None, region: str | None = None
+    ) -> tuple[int, dict]:
         """Run a preview or the install for what the page sent. Input ws cannot use comes back as a 400 with a plain
         message, before anything is written; anything unexpected is a 500 that says so. It never raises."""
         facts = self.facts
@@ -515,7 +531,9 @@ class SetupServer(LoopbackServer):
             if self._done.is_set():
                 return 409, {"error": "Setup has already finished."}
             try:
-                c = self._choices(picks, notes, cap)
+                c = self._choices(picks, notes, cap, region)
+                if c.region and re.fullmatch(r"[A-Z]{2}", c.region):  # the plugins' region rules apply to what was said
+                    facts = flow.with_region(self.facts, c.region)
                 pv = flow.preview(facts, c)  # checks everything, and does a dry run, before the first write
                 headline = pv.headline()
                 if path == "/api/preview":

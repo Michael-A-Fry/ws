@@ -1,7 +1,8 @@
 """session-context: when a session starts, tell it which of the project's state files exist, one line each, so it reads
 them before it asks. The project is the git top level above the session's folder, and the main worktree too when the
-session runs in a linked one. `files` lists the paths to look for, relative to either (default
-`.claude-state/STATE.md`).
+session runs in a linked one. `files` lists the paths to look for, relative to either. The default is the common
+state, handoff and to-do files any runner or project might keep: `STATE.md`, `.state/STATE.md`, `HANDOFF.md` and
+`TODO.md`. Only those that exist are listed.
 
 Two more lines, each short and plain. With `warn_api_key` (default true), an interactive session that has
 `ANTHROPIC_API_KEY` set is told it bills that key, not the subscription; the value is never printed. A headless
@@ -29,7 +30,7 @@ NAME = "session-context"
 EVENTS = ("start",)
 KINDS = ()
 
-DEFAULT_FILES = (".claude-state/STATE.md",)
+DEFAULT_FILES = ("STATE.md", ".state/STATE.md", "HANDOFF.md", "TODO.md")
 STATE = "session-context"
 LEASE_PLACEHOLDER = "ws-lease-placeholder"  # the key a `ws run` job holds (a test pins it equal to the adapter's PLACEHOLDER_KEY, which this can't import)
 HEADLESS_ENTRYPOINT = "sdk"  # CLAUDE_CODE_ENTRYPOINT starts with this for `claude -p` and the SDKs

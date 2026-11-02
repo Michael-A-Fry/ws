@@ -47,8 +47,8 @@ Harvest never approves anything. It writes each proposal to `$WS_HOME/eval/propo
 until you give it a real one), all or none. `approve` shows the prompt and asks you (`--yes` for scripts). Prompts that
 look like they hold a secret are not proposed: ws has no prompt scrubber, so it refuses a prompt that names a registered
 secret, or looks like a key, token, password or URL with a password. It checks names and shapes, not secret values (ws
-cannot read the store safely). Read each proposal before you approve it; FIU or client data in a prompt is for you to
-catch.
+cannot read the store safely). Read each proposal before you approve it; confidential or client data in a prompt is for
+you to catch.
 """
 
 from __future__ import annotations
@@ -558,7 +558,7 @@ pattern = '^\\s*14:00\\s*-\\s*15:00\\s*$'
 id = "starter-plain-english"
 family = "work-style"
 kind = "capability"
-prompt = "Rewrite draft.md in plain NZ English, in 30 words or fewer, and save it as plain.md. Do not use the words leverage, synergies or operationalise."
+prompt = "Rewrite draft.md in plain English, in 30 words or fewer, and save it as plain.md. Do not use the words leverage, synergies or operationalise."
 trials = 3
 timeout_s = 300
 

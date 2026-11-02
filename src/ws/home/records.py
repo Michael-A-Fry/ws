@@ -220,7 +220,7 @@ def _same(a: str, b: str) -> bool:
 
 
 def _beside_root(form: str, roots: tuple[str, ...]) -> bool:
-    """True when `form` or a folder above it is, on disk, one of the roots: ~/Code/fiu covers ~/code/fiu on macOS."""
+    """True when `form` or a folder above it is, on disk, one of the roots: ~/Code/client covers ~/code/client on macOS."""
     cur = form
     while True:
         if os.path.lexists(cur) and any(_same(cur, r) for r in roots):

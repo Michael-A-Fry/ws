@@ -1,9 +1,12 @@
-"""claims: a message that says a commit is merged, pushed or on main names a commit that is. Before a message goes to
-another agent, each claim word (default `on main`, `merged into main`, `merged to main`, `pushed to main`) that sits in
-the same sentence as a commit-like token (7 to 40 lower-case hex characters, with at least one digit and one of a to f)
-is checked with `git merge-base --is-ancestor TOKEN REF` in the session's folder (default REF `origin/main`). A commit
-that isn't an ancestor of REF, or isn't a commit in this repository, denies the message and the reason names it; the
-reason says to `git fetch` first when REF may be out of date.
+"""claims: a message that says a commit is merged, pushed or on the default branch names a commit that is. Before a
+message goes to another agent, each claim word (default `on B`, `merged into B`, `merged to B` and `pushed to B`, where B
+is the repository's default branch) that sits in the same sentence as a commit-like token (7 to 40 lower-case hex
+characters, with at least one digit and one of a to f) is checked with `git merge-base --is-ancestor TOKEN REF` in the
+session's folder. REF is the policy's `ref`, else the default branch on `origin`. B and that REF come from
+`git symbolic-ref refs/remotes/origin/HEAD`; with no `origin/HEAD` they come from the local default branch
+(`init.defaultBranch`, else `main`), taking `origin/B` when that exists and B itself when it doesn't. A commit that isn't
+an ancestor of REF, or isn't a commit in this repository, denies the message and the reason names it; the reason says to
+`git fetch` first when REF may be out of date.
 
 Not a claim: a claim word in quotes or backticks, one with a negation or a future form in the four words before it
 (`not merged`, `will be pushed`, `once it's merged`), and any sentence that names another branch (`origin/work`, or
@@ -43,14 +46,24 @@ NAME = "claims"
 EVENTS = ("pre", "stop")
 KINDS = ("message",)
 
-DEFAULT_WORDS = ("on main", "merged into main", "merged to main", "pushed to main")
-DEFAULT_REF = "origin/main"
+FALLBACK_BRANCH = "main"  # the default branch of a repository that doesn't say (no origin/HEAD, no init.defaultBranch)
+REMOTE = "origin"
+DEFAULT_REF = f"{REMOTE}/{FALLBACK_BRANCH}"
 DEFAULT_TAGS = (r"v\d+\.\d+(?:\.\d+)*",)
 MAX_TAG_PATTERN = 200
 LOG = "claims.jsonl"
 SCHEMA_VERSION = 1
 GIT_BUDGET_S = 8.0  # all the git time one hook may use
 MAX_TEXT = 20000  # a message is read to this length
+
+
+def claim_words(branch: str) -> tuple[str, ...]:
+    """The claim phrases for a default branch."""
+    return (f"on {branch}", f"merged into {branch}", f"merged to {branch}", f"pushed to {branch}")
+
+
+DEFAULT_WORDS = claim_words(FALLBACK_BRANCH)
+_REF_SHAPE = re.compile(r"[A-Za-z0-9_./@{}^~-]+")
 
 _HEX = re.compile(r"(?<![\w-])[0-9a-f]{7,40}(?![\w-])")
 _SENTENCE = re.compile(r"(?<=[.!?])\s+|\n+")
@@ -67,21 +80,25 @@ _TO_BRANCH = re.compile(
 
 @dataclass(frozen=True)
 class Config:
-    words: tuple[str, ...] = DEFAULT_WORDS
-    ref: str = DEFAULT_REF
+    words: tuple[str, ...] = ()  # () = the phrases for the default branch
+    ref: str = ""  # "" = the default branch on origin
     release_dir: str = ""  # "" = release claims are off
     release_tags: tuple[str, ...] = DEFAULT_TAGS
 
 
 def config(table: dict, where: str) -> Config:
     known_keys(table, where, ("words", "ref", "release_dir", "release_tags"))
-    words = text_list(table, "words", where, DEFAULT_WORDS)
-    if not words:
+    words = text_list(table, "words", where)
+    if "words" in table and not words:
         raise PolicyError(f"{where}: words must name at least one claim word")
-    ref = table.get("ref", DEFAULT_REF)
-    if not isinstance(ref, str) or not re.fullmatch(r"[A-Za-z0-9_./@{}^~-]+", ref) or ref.startswith("-"):
+    ref = table.get("ref", "")
+    if "ref" in table and not _ref_ok(ref):
         raise PolicyError(f"{where}: ref must be a branch, tag or remote branch name such as origin/main")
     return Config(words, ref, _release_dir(table, where), _release_tags(table, where))
+
+
+def _ref_ok(ref: object) -> bool:
+    return isinstance(ref, str) and _REF_SHAPE.fullmatch(ref) is not None and not ref.startswith("-")
 
 
 def _release_dir(table: dict, where: str) -> str:
@@ -197,9 +214,10 @@ def _commit_like(token: str) -> bool:
     return any(c.isdigit() for c in token) and any(c in "abcdef" for c in token)
 
 
-def _names_other_branch(sentence: str, ref: str) -> bool:
-    """True when the sentence names a branch other than main and the ref's own (`origin/work`, `pushed to work`)."""
-    own = {"main", ref.lower(), ref.lower().split("/", 1)[-1]}
+def _names_other_branch(sentence: str, ref: str, branch: str = FALLBACK_BRANCH) -> bool:
+    """True when the sentence names a branch other than the default and the ref's own (`origin/work`, `pushed to
+    work`)."""
+    own = {branch.lower(), ref.lower(), ref.lower().split("/", 1)[-1]}
     named = [m.group(1) for m in _REMOTE_BRANCH.finditer(sentence)]
     named += [m.group(1) for m in _TO_BRANCH.finditer(sentence)]
     return any(n.rstrip(".").lower() not in own for n in named)
@@ -221,13 +239,19 @@ def _claim_word(sentence: str, words: tuple[str, ...]) -> str | None:
     return None
 
 
-def find_claims(text: str, words: tuple[str, ...], ref: str = DEFAULT_REF) -> list[tuple[str, str]]:
+def _has_commit(text: str) -> bool:
+    return any(_commit_like(t) for t in _HEX.findall(text[:MAX_TEXT]))
+
+
+def find_claims(
+    text: str, words: tuple[str, ...], ref: str = DEFAULT_REF, branch: str = FALLBACK_BRANCH
+) -> list[tuple[str, str]]:
     """[(claim word as written, commit-like token)] for each sentence that has both, in order, without repeats. A
-    sentence that names a branch other than main and `ref` is skipped."""
+    sentence that names a branch other than the default `branch` and `ref` is skipped."""
     found: list[tuple[str, str]] = []
     for sentence in _SENTENCE.split(text[:MAX_TEXT]):
         tokens = [t for t in _HEX.findall(sentence) if _commit_like(t)]
-        if not tokens or _names_other_branch(sentence, ref):
+        if not tokens or _names_other_branch(sentence, ref, branch):
             continue
         word = _claim_word(sentence, words)
         if word is None:
@@ -249,21 +273,66 @@ class Budget:
         return self.total - (self.clock() - self.start)
 
 
-def _git(cwd: str, *args: str, budget: Budget | None = None) -> int | None:
-    """The exit code of `git -C cwd args`, or None when git can't run (not installed, or out of time). It gets a bare
-    environment: the runner's GIT_DIR and the like must not point it somewhere else, and `GIT_NO_LAZY_FETCH=1` keeps a
-    partial clone from going to the network."""
+def _git_run(cwd: str, *args: str, budget: Budget | None = None) -> subprocess.CompletedProcess | None:
+    """`git -C cwd args`, or None when git can't run (not installed, or out of time). It gets a bare environment: the
+    runner's GIT_DIR and the like must not point it somewhere else, and `GIT_NO_LAZY_FETCH=1` keeps a partial clone from
+    going to the network."""
     env = {k: os.environ[k] for k in ("PATH", "HOME") if k in os.environ}
     env["GIT_OPTIONAL_LOCKS"] = "0"
     env["GIT_NO_LAZY_FETCH"] = "1"
     budget = budget or Budget()
     try:
-        done = subprocess.run(
+        return subprocess.run(
             ["git", "-C", cwd, *args], capture_output=True, timeout=max(budget.left(), 0.01), env=env, check=False
         )
     except (OSError, subprocess.SubprocessError):
         return None
-    return done.returncode
+
+
+def _git(cwd: str, *args: str, budget: Budget | None = None) -> int | None:
+    """The exit code of `git -C cwd args`, or None when git can't run."""
+    done = _git_run(cwd, *args, budget=budget)
+    return None if done is None else done.returncode
+
+
+def _git_text(cwd: str, *args: str, budget: Budget) -> str | None:
+    """The one line `git -C cwd args` prints when it succeeds, else None."""
+    if budget.left() <= 0:
+        return None
+    done = _git_run(cwd, *args, budget=budget)
+    if done is None or done.returncode != 0 or not isinstance(done.stdout, bytes):
+        return None
+    return done.stdout.decode("utf-8", "replace").strip() or None
+
+
+@dataclass(frozen=True)
+class Target:
+    ref: str  # what a commit must be an ancestor of
+    branch: str  # the repository's default branch: the one the claim words are about
+
+
+def default_target(cwd: str, budget: Budget) -> Target:
+    """The default branch and the ref to check against, for the repository at `cwd`.
+
+    From `origin/HEAD` when the repository has one (`git symbolic-ref refs/remotes/origin/HEAD`). Otherwise the local
+    default branch: `init.defaultBranch`, else `main`; its remote-tracking `origin/B` is the ref when that exists, and B
+    itself when it doesn't. A folder that isn't a repository, no git or no time left gives `main` and `origin/main`, and
+    the check that follows says why it can't go on."""
+    fallback = Target(DEFAULT_REF, FALLBACK_BRANCH)
+    if not cwd or not Path(cwd).is_dir():
+        return fallback
+    head = _git_text(cwd, "symbolic-ref", "--short", f"refs/remotes/{REMOTE}/HEAD", budget=budget)
+    prefix = f"{REMOTE}/"
+    if head and head.startswith(prefix) and _ref_ok(head) and len(head) > len(prefix):
+        return Target(head, head.removeprefix(prefix))
+    named = _git_text(cwd, "config", "--get", "init.defaultBranch", budget=budget)
+    branch = named if named and _ref_ok(named) else FALLBACK_BRANCH
+    if budget.left() <= 0:
+        return fallback
+    remote = f"{prefix}{branch}"
+    if _git(cwd, "rev-parse", "--verify", "--quiet", f"{remote}^{{commit}}", budget=budget) == 0:
+        return Target(remote, branch)
+    return Target(branch, branch)
 
 
 def _out_of_time(budget: Budget) -> str:
@@ -405,12 +474,14 @@ def judge(call, cfg: Config, ctx) -> Finding | None:
     if ctx.event == "stop":
         return _log(cfg, ctx)
     text = call.data.get("text", "")
-    claims = find_claims(text, cfg.words, cfg.ref) if isinstance(text, str) else []
+    budget = Budget()
+    ref, claims = "", []
+    if isinstance(text, str) and _has_commit(text):  # a message with no commit-like token never asks git
+        ref, claims = _claims_in(text, cfg, ctx.cwd, budget)
     wrong, notes = [], []
     release = check_releases(text, cfg) if isinstance(text, str) else None
-    budget = Budget()
     for word, sha in claims:
-        result = on_ref(ctx.cwd, sha, cfg.ref, budget)
+        result = on_ref(ctx.cwd, sha, ref, budget)
         if result is True:
             continue
         if result is False:
@@ -419,8 +490,8 @@ def judge(call, cfg: Config, ctx) -> Finding | None:
             notes.append(result)
     if wrong:
         reason = (
-            f"the message says {', '.join(wrong)} but that commit isn't on {cfg.ref} here. "
-            f"If {cfg.ref} may be out of date, run `git fetch` first. Check with `git branch -r --contains SHA`, then "
+            f"the message says {', '.join(wrong)} but that commit isn't on {ref} here. "
+            f"If {ref} may be out of date, run `git fetch` first. Check with `git branch -r --contains SHA`, then "
             "send it again with what is true."
         )
         return Finding("deny", f"{reason} Also: {release}" if release else reason)
@@ -431,21 +502,30 @@ def judge(call, cfg: Config, ctx) -> Finding | None:
     return None
 
 
+def _claims_in(text: str, cfg: Config, cwd: str, budget: Budget) -> tuple[str, list[tuple[str, str]]]:
+    """(the ref to check against, the claims in `text`). The policy's `words` and `ref` win; what they leave out comes
+    from the repository's default branch."""
+    target = default_target(cwd, budget)
+    ref = cfg.ref or target.ref
+    words = cfg.words or claim_words(target.branch)
+    return ref, find_claims(text, words, ref, target.branch)
+
+
 def _log(cfg: Config, ctx) -> Finding | None:
     """On stop: append the claims in the runner's last message to the claims log."""
     text = ctx.payload.get("last_assistant_message")
-    claims = find_claims(text, cfg.words, cfg.ref) if isinstance(text, str) else []
+    budget = Budget()
+    ref, claims = _claims_in(text, cfg, ctx.cwd, budget) if isinstance(text, str) and _has_commit(text) else ("", [])
     if not claims:
         return None
-    budget = Budget()
     now = ctx.now()  # one clock read feeds both `ts` and the legacy `at`
     stamp = datetime.fromtimestamp(now, UTC).isoformat(timespec="seconds")
     rec = {
         "at": stamp,
         "runner": ctx.runner,
         "session": ctx.session_id,
-        "ref": cfg.ref,
-        "claims": [{"word": w, "commit": s, "on_ref": on_ref(ctx.cwd, s, cfg.ref, budget)} for w, s in claims],
+        "ref": ref,
+        "claims": [{"word": w, "commit": s, "on_ref": on_ref(ctx.cwd, s, ref, budget)} for w, s in claims],
     }
     try:
         jsonl.append(

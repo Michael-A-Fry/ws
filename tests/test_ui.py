@@ -23,23 +23,24 @@ ESCAPED = "&lt;script&gt;alert(1)&lt;/script&gt;"
 
 # sha256 of `render_page` for the Facts, Choices and nonce below. It was taken from the code as it stood before ws.ui
 # existed and is re-taken when the page changes on purpose (last: the Plugins step is left out when no plugin is built,
-# and a plugin's icon travels with it instead of a table in the script).
-GOLDEN_SHA256 = "3aa43bbccce9f9496490340fe898e732254c3305c00b54e6688cf4194cc38e28"
-GOLDEN_LEN = 27419
+# and a plugin's icon travels with it instead of a table in the script; then: the country field, shown only when an
+# offered plugin has a region rule).
+GOLDEN_SHA256 = "fa4e562a482f9c617f35564d09d292cd2ff5b2377f6c7e318d8e0992dd242788"
+GOLDEN_LEN = 28126
 
 
 def _fixed():
     facts = flow.Facts(
         env={"HOME": "/nonexistent-home"},
         osi=osinfo.OSInfo("linux", "ubuntu 24.04", "x86_64", "systemd", True),
-        region="NZ",
+        region="CA",
         region_source="flag",
         runners=[flow.Runner("claude", "Claude Code", "/bin/claude", "2.0.0")],
         spent=1.5,
         plugins=[flow.Plugin("finance", "Finance", "Track spending.", True, "built", True)],
     )
     choices = flow.Choices(
-        plugins=frozenset({"finance"}), notes="/nonexistent-home/Notes", runner="claude", cap=20.0, region="NZ"
+        plugins=frozenset({"finance"}), notes="/nonexistent-home/Notes", runner="claude", cap=20.0, region="CA"
     )
     return facts, choices
 

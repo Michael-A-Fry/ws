@@ -227,6 +227,7 @@ def test_the_walk_picks_a_plugin_with_the_keyboard(box):
     assert "mail-drafts = true" in (box / ".ws" / "profile.toml").read_text()
 
 
+@pytest.mark.usefixtures("unbuilt")
 def test_the_walk_will_not_choose_finance_outside_nz(box):
     keys = ["enter", "down", "down", "space", "enter", "enter", "enter"]
     walk(keys, region="US")

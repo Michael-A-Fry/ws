@@ -30,4 +30,5 @@ def read(kind, env):
             region_ok=not m.region or here is None or here in m.region,
         )
         for m in modules.REGISTRY.values()
+        if m.name in modules.offered(environ) or m.name in on  # hidden unless built, or the profile has it on
     ]

@@ -275,8 +275,13 @@ allow_write = []
 #   spawn-cap        denies a subagent start at max_agents running (default from the machine's CPUs and memory)
 #   skill-gate       a write to chosen paths waits for a skill ([[guards.skill-gate]] skill, paths); a skill's own
 #                    SKILL.md front matter can list `gates` (path globs) too, from skill_dirs
+#   dev-server       denies a dev server that listens on every interface (python -m http.server, php -S, serve, vite
+#                    --host, flask run --host, jupyter --ip, rails s -b, uvicorn --host, hugo server --bind); the reason
+#                    names the flag that keeps it on this machine
+#   checkout-pin     denies git checkout, switch, reset --hard, rebase, merge, pull, cherry-pick and revert in a checkout
+#                    that has linked worktrees (and in any folder named in paths), so work happens in a worktree
 [guards]
-on = ["syntax-check", "session-context"]
+on = ["syntax-check", "session-context", "dev-server"]
 # [guards.syntax-check]
 # extra = {{ yaml = ["yamllint", "-d", "relaxed"] }}   # an extension and the checker that gets the file path appended
 # [guards.session-context]
@@ -289,6 +294,10 @@ on = ["syntax-check", "session-context"]
 # skill_dirs = ["~/.claude/skills"]   # where skills keep their own `gates`; add rules as [[guards.skill-gate.rules]]
 # [guards.spawn-cap]
 # max_agents = 4   # optional: left out, half the CPUs or half the GiB of memory, whichever is less (2 to 8)
+# [guards.dev-server]
+# allow_hosts = ["203.0.113.5"]   # optional: addresses a dev server may bind besides loopback (a VPN or tailnet address)
+# [guards.checkout-pin]
+# paths = ["~/code/app"]   # optional: checkouts to pin even with no linked worktree (absolute or ~/)
 
 # Rule of Two, leg C (a way out): besides a source's outward acts and the web tools above, the SHELL counts as a way
 # out while any of curl, wget, nc, ssh, scp, python -c ... is not in deny_commands. To close it, deny the lot
@@ -1041,12 +1050,16 @@ def _after_bodies(cmd: str, i: int, opened: list[tuple[str, bool]]) -> int | Non
     return i
 
 
-def _scan(cmd: str, heredocs: bool = False, end: dict | None = None) -> tuple[list[list[str]], list[str]]:
+def _scan(
+    cmd: str, heredocs: bool = False, end: dict | None = None, flow: list | None = None
+) -> tuple[list[list[str]], list[str]]:
     """Split a shell command line. Returns (pipelines, inner): each pipeline is a list of segments (split on |, |&),
     pipelines are split on ; && || & newline ( ); inner holds the text of $(...), backticks and <(...), which run too.
     With `heredocs`, the body and closing line of each here-document are left out (that text is data for a program,
     not commands): a `<<WORD` starts one only outside quotes and comments, and not as `<<<` or a shift in `((...))` or inside `${...}` and `$[...]`, which are one word. If `end` is given,
-    end["quote"] is the quote still open at the end of the text (empty if none)."""
+    end["quote"] is the quote still open at the end of the text (empty if none). If `flow` is given, it gets the order the
+    line runs in: the index of each pipeline as it ends, and between them the operator that came next (`;`, `&&`, `||`,
+    `&`, `(` or `)`; a newline is `;`)."""
     pipelines: list[list[str]] = []
     inner: list[str] = []
     segs: list[str] = []
@@ -1064,12 +1077,16 @@ def _scan(cmd: str, heredocs: bool = False, end: dict | None = None) -> tuple[li
         if s:
             segs.append(s)
 
-    def end_pipeline() -> None:
+    def end_pipeline(op: str = "") -> None:
         nonlocal segs
         end_seg()
         if segs:
             pipelines.append(segs)
+            if flow is not None:
+                flow.append(len(pipelines) - 1)
         segs = []
+        if op and flow is not None:
+            flow.append(op)
 
     while i < n:
         c = cmd[i]
@@ -1118,7 +1135,7 @@ def _scan(cmd: str, heredocs: bool = False, end: dict | None = None) -> tuple[li
                 i = m.end()
                 continue
         if heredocs and c == "\n" and waiting:
-            end_pipeline()
+            end_pipeline(";")
             i += 1
             for word, indented in waiting:  # skip each body, up to and including its closing line
                 while i < n:
@@ -1164,19 +1181,20 @@ def _scan(cmd: str, heredocs: bool = False, end: dict | None = None) -> tuple[li
             i = j + 1
             continue
         elif c in ";\n()":
-            end_pipeline()
+            end_pipeline(";" if c == "\n" else c)
         elif c == "&":
             if i > 0 and cmd[i - 1] in "<>" or cmd[i + 1 : i + 2] == ">":  # 2>&1, &>file
                 buf.append(c)
+            elif cmd[i + 1 : i + 2] == "&":
+                end_pipeline("&&")
+                i += 1
             else:
-                end_pipeline()
-                if cmd[i + 1 : i + 2] == "&":
-                    i += 1
+                end_pipeline("&")
         elif c == "|" and i > 0 and cmd[i - 1] == ">":  # >| (clobber redirect)
             buf.append(c)
         elif c == "|":
             if cmd[i + 1 : i + 2] == "|":
-                end_pipeline()
+                end_pipeline("||")
                 i += 1
             else:
                 end_seg()
@@ -1729,6 +1747,22 @@ def simple_commands(command: str, _depth: int = 0, *, git_options: bool = False)
     return [words for words, _ in simple_commands_env(command, _depth, git_options=git_options) if words]
 
 
+def _seg_words(seg: str, git_options: bool) -> tuple[list[str], list[str], list[str]]:
+    """(words, assignments, nested command texts) of one pipeline segment: what simple_commands_env reads from it."""
+    env: list[str] = []
+    toks, _ = _strip_wrappers(_lex(seg)[0], env)
+    if toks and toks[0] == "git" and not git_options:
+        toks = _git_normal(toks)
+    nested: list[str] = []
+    if toks and toks[0] == "eval" and len(toks) > 1:  # eval joins its words and runs the text as a command line
+        nested.append(" ".join(toks[1:]))
+    if toks and toks[0] in _SHELL_NAMES:
+        flags, operands = _args(toks)
+        if _cluster(flags, "c") and operands:
+            nested.append(operands[0])
+    return toks, env, nested
+
+
 def simple_commands_env(
     command: str, _depth: int = 0, *, git_options: bool = False
 ) -> list[tuple[list[str], list[str]]]:
@@ -1743,22 +1777,56 @@ def simple_commands_env(
     nested = list(inner)
     for segs in pipelines:
         for seg in segs:
-            env: list[str] = []
-            toks, _ = _strip_wrappers(_lex(seg)[0], env)
-            if toks and toks[0] == "git" and not git_options:
-                toks = _git_normal(toks)
+            toks, env, more = _seg_words(seg, git_options)
             if not toks and not env:
                 continue
             found.append((toks, env))
-            if toks and toks[0] == "eval" and len(toks) > 1:  # eval joins its words and runs the text as a command line
-                nested.append(" ".join(toks[1:]))
-            if toks and toks[0] in _SHELL_NAMES:
-                flags, operands = _args(toks)
-                if _cluster(flags, "c") and operands:
-                    nested.append(operands[0])
+            nested += more
     for text in nested:
         found += simple_commands_env(text, _depth + 1, git_options=git_options)
     return found
+
+
+def simple_commands_flow(
+    command: str, _depth: int = 0, *, git_options: bool = False
+) -> list[tuple[list[str], list[str], str, bool]]:
+    """simple_commands_env in the order the line runs, for a check that follows where the shell is (a `cd`). Each item
+    is (words, assignments, link, piped). A command has the `link` that joins it to the one before (`;`, `&&` or `||`)
+    and `piped` when it is one of several joined by `|`, so each runs in a subshell. Items with no words mark the
+    structure: `(` opens and `)` closes a subshell (also what a nested `bash -c`, `eval` or `$(...)` runs in; the
+    text of a `$(...)` has no known place, so its mark is `(?`), and `&` says the command before it ran in the
+    background."""
+    if not isinstance(command, str):
+        raise TypeError("command must be text")
+    if _depth > _MAX_DEPTH:
+        raise ValueError("command nests too deeply to check")
+    flow: list = []
+    pipelines, inner = _scan(_prep(command), heredocs=not _folds(command), flow=flow)
+    steps: list[tuple[list[str], list[str], str, bool]] = []
+    link = ";"
+
+    def nest(text: str, mark: str) -> None:
+        steps.append(([], [], mark, False))
+        steps.extend(simple_commands_flow(text, _depth + 1, git_options=git_options))
+        steps.append(([], [], ")", False))
+
+    for item in flow:
+        if isinstance(item, int):
+            segs = pipelines[item]
+            for seg in segs:
+                toks, env, more = _seg_words(seg, git_options)
+                if toks or env:
+                    steps.append((toks, env, link, len(segs) > 1))
+                for text in more:
+                    nest(text, "(")
+        elif item in ("(", ")", "&"):
+            steps.append(([], [], item, False))
+            link = ";"
+        else:
+            link = item
+    for text in inner:
+        nest(text, "(?")
+    return steps
 
 
 def _readings(command: str) -> list[str]:

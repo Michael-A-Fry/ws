@@ -26,7 +26,7 @@ from ws.output import WsError
 from ws.profile import ProfileError, load, profile_path, ws_home
 
 HOME_KEYS = ("lead", "opaque_paths", "show_repos", "sources", "open")
-SOURCE_KEYS = ("asks_jsonl", "events_dir", "otel_dir", "claude_dir")
+SOURCE_KEYS = ("asks_jsonl", "events_dir", "otel_dir", "claude_dir", "opencode_dir")
 OPEN_KEYS = ("session", "ask", "opaque")
 _LEAD = re.compile(r"^(cwd|name):\S.*$")
 EVENT_WINDOW_S = 24 * 3600  # how far back a snapshot's events reach
@@ -181,6 +181,10 @@ class Env:
         if key == "claude_dir":
             given = self.environ.get("CLAUDE_CONFIG_DIR")
             return Path(given) if given else self.home / ".claude"
+        if key == "opencode_dir":
+            from ws.home.sources import opencode  # the XDG rule lives with the source that reads the folder
+
+            return opencode.data_dir(self.environ, self.home)
         usage = self.home / ".claude-usage"
         return {
             "asks_jsonl": usage / "asks" / "asks.jsonl",

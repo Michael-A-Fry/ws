@@ -60,6 +60,7 @@ folder's `__init__.py`.
 | Source | Kind | Reads |
 |---|---|---|
 | `claude_code` | sessions, asks | `claude agents --json` and the per-process files in `<claude dir>/sessions/*.json`. A session with `waitingFor` is also an ask of kind `waiting` |
+| `opencode` | sessions | OpenCode's own store (`opencode.db` in `$XDG_DATA_HOME/opencode`, checked against 1.19.4), opened read-only: id, title, folder, times, tokens and cost from the session row, and working or idle from the latest message's role and completion time. A session with no parent, updated in the last day. OpenCode holds a pending permission request in the running server's memory, so it isn't in the store and this source gives no asks |
 | `ws_plugins` | plugins | The plugin registry and the profile's `[modules]` |
 | `ws_runs` | sessions | Finished headless jobs in `logs/runs.jsonl`, with their cost. Eval trials show under `evals` |
 | `ws_sessions` | sessions | The records `ws session start` writes |
@@ -82,6 +83,8 @@ Three rules hold for every source:
 - A file ending in `.key` is never opened. The sources open files through one helper that refuses it, and list folders
   with `*.json` or `*.jsonl` patterns only.
 - A transcript is read for its `usage` fields and nothing else, and the transcript of an opaque session isn't opened.
+  OpenCode's store is opened read-only and only its session rows and each message's role and completion time are read;
+  the text of a conversation stays where it is.
 - `claude` runs through a timeout, with no shell, through `env.run`. Tests give `Env` a fake.
 
 ## The opaque rule
@@ -137,6 +140,7 @@ asks_jsonl = "~/.claude-usage/asks/asks.jsonl"
 events_dir = "~/.claude-usage/events"
 otel_dir = "~/.claude-usage/otel"
 claude_dir = "~/.claude"        # $CLAUDE_CONFIG_DIR when set
+opencode_dir = "~/.local/share/opencode"  # $XDG_DATA_HOME/opencode when set; holds opencode.db
 
 [home.open]                     # the opener for each kind of record (used by the home page)
 session = "terminal"

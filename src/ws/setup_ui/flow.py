@@ -220,9 +220,9 @@ def _spent(env) -> float:
         return 0.0
 
 
-def _plugin_list(region: str | None, source: str | None) -> list[Plugin]:
+def _plugin_list(region: str | None, source: str | None, env=None) -> list[Plugin]:
     out = []
-    for m in modules.REGISTRY.values():
+    for m in modules.offered(env).values():
         if m.default_on:
             continue
         label, line = PLUGIN_TEXT.get(m.name, (m.name, m.what))
@@ -272,7 +272,7 @@ def gather(env=None, region: str | None = None, osi=None, probe: bool = True) ->
         set_up=_is_set_up(base, env, osi),
         spent=_spent(env),
         vaults=vaults,
-        plugins=_plugin_list(where, source),
+        plugins=_plugin_list(where, source, env),
     )
 
 
@@ -411,8 +411,9 @@ def check_choices(facts: Facts, c: Choices) -> None:
 
 
 def answers_for(facts: Facts, c: Choices) -> Answers:
+    kept = frozenset(modules.unbuilt_on(facts.base.modules, facts.env))  # a hidden plugin the profile has on stays on
     return replace(
-        facts.base, modules=modules.default_on() | c.plugins, notes=c.notes, runner=c.runner, cap=c.cap
+        facts.base, modules=modules.default_on() | c.plugins | kept, notes=c.notes, runner=c.runner, cap=c.cap
     )  # fmt: skip
 
 

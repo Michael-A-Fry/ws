@@ -1,6 +1,7 @@
 """`ws doctor`: one line per check, each with a stable ID. Exit 0 only when nothing is failing or unconfigured.
 
-IDs never change meaning once released: WS0xx are the machine, profile, jobs and gate, WS1xx are the roles (one per role).
+IDs never change meaning once released: WS0xx are the machine, profile, jobs, gate and
+plugins, WS1xx are the roles (one per role).
 """
 
 from __future__ import annotations
@@ -202,6 +203,21 @@ def _ptrace_check(osi) -> Check:
     )
 
 
+def _plugins_check(prof: dict, env) -> list[Check]:
+    """WS009: a plugin the profile switches on that ws does not offer yet. One note, nothing else changes; no line when
+    there is none."""
+    from ws import modules  # late: modules pulls in the install engine
+
+    table = prof.get("modules")
+    on = {n for n, v in table.items() if v is True} if isinstance(table, dict) else set()
+    names = modules.unbuilt_on(on, env)
+    if not names:
+        return []
+    verb = "is" if len(names) == 1 else "are"
+    detail = f"{', '.join(names)} {verb} on in your profile and still being built; no effect yet"
+    return [Check("WS009", "plugins", WARN, detail, f"to hide it, run `ws plugin remove {names[0]}`")]
+
+
 def run_checks(osi: OSInfo, profile_file: Path, env: dict | None = None, network: bool = True) -> list[Check]:
     env = os.environ if env is None else env
     checks: list[Check] = []
@@ -262,6 +278,7 @@ def run_checks(osi: OSInfo, profile_file: Path, env: dict | None = None, network
         over = []
     fix = "remove that allow rule, or take the deny rule out of the policy and run `ws install`"
     checks += [Check("WS008", "gate", WARN, line, fix) for line in over]
+    checks += _plugins_check(prof, env)
     roles = prof.get("roles") if isinstance(prof.get("roles"), dict) else {}
     for r in ROLES:
         cfg = roles.get(r.name)

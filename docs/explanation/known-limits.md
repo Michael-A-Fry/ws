@@ -231,7 +231,8 @@ first output and attention minutes, because the run record has no fields for the
 
 - **Draft-only sending isn't enforced.** ws ships no mail connector and doesn't block a send. See
   [Draft-only sending](draft-only-sending.md).
-- **The plugins `mail-drafts`, `calendar`, `finance` and `knowledge-graph`** are listed and marked "not built yet."
+- **Only the plugins that are built are listed.** `ws plugin list` and the setup screens show `memory`, `notes` and
+  `skills`. A plugin still in development stays out of both until it's built.
 - **The secrets wall on your machine** is a step you take (`ws secret wall`). Until you do, WS104 warns.
 - **Trust on first use of the root-owned `/opt/ws` copy** closes when you install from a signed release tag. See
   [Verify a release](../how-to/verify-a-release.md).

@@ -253,7 +253,7 @@ def compose_profile(prof: dict, answers: Answers, env: Mapping[str, str], osi, m
 
     unknown = sorted(answers.modules - set(modules.REGISTRY))
     if unknown:
-        raise InstallError(f"unknown module '{unknown[0]}'; known: {', '.join(modules.REGISTRY)}")
+        raise InstallError(f"unknown module '{unknown[0]}'; known: {', '.join(modules.offered(env))}")
     if answers.cap is not None and not (math.isfinite(answers.cap) and answers.cap > 0):
         raise InstallError("the monthly cap must be a number above 0")
 
@@ -1014,6 +1014,12 @@ def _answers_from_args(args: argparse.Namespace, env: Mapping[str, str]) -> Answ
     if args.notes is not None and args.notes.strip():
         a = replace(a, notes=args.notes)
     if args.module:
+        from ws import modules
+
+        shown = modules.offered(env)
+        unknown = [n for n in args.module if n not in shown]
+        if unknown:
+            raise InstallError(f"unknown module '{unknown[0]}'; known: {', '.join(shown)}")
         a = replace(a, modules=a.modules | frozenset(args.module))
     if args.runner:
         a = replace(a, runner=args.runner)

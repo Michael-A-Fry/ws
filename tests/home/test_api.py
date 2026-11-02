@@ -12,7 +12,7 @@ from dataclasses import fields
 import pytest
 
 from home import NOW, SID, SID2, Box, agent, iso
-from ws import approvals, cli, output
+from ws import approvals, cli, modules, output
 from ws.approvals import Bound
 from ws.home import api, records
 from ws.home.records import Ask, Event, Session
@@ -430,7 +430,8 @@ def test_ws_home_data_json_has_the_snapshot_shape(box, monkeypatch, capsys):
     rows = {r["name"]: r for r in data["sources"]}
     assert rows["claude_code"]["ok"] is False and rows["claude_code"]["kind"] == "unavailable"  # no claude on PATH
     assert rows["collie"]["why"].startswith("not built") and rows["ws_sessions"]["ok"] is True
-    assert [s["id"] for s in data["sessions"]] == [SID] and len(data["plugins"]) >= 7
+    assert [s["id"] for s in data["sessions"]] == [SID]
+    assert {p["name"] for p in data["plugins"]} == set(modules.offered({}))  # only built plugins show
 
 
 def test_ws_home_data_prints_text_without_json(box, monkeypatch, capsys):

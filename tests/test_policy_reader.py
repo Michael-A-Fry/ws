@@ -220,8 +220,11 @@ def test_the_refusal_for_a_huge_expansion_reaches_the_hook_as_exit_two(home, mon
 
 
 def test_substitutions_nested_too_deeply_are_refused_with_a_reason(pol):
-    reason = policy.is_denied_command(pol, "echo " + "$(" * 3000 + "x" + ")" * 3000)
+    reason = policy.is_denied_command(pol, "echo " + "$(" * 1000 + "x" + ")" * 1000)
     assert reason and "too deeply" in reason
+    # far deeper takes longer to read than the clock allows: refused for that, the other typed reason
+    reason = policy.is_denied_command(pol, "echo " + "$(" * 20000 + "x" + ")" * 20000)
+    assert reason and ("too deeply" in reason or "takes too long" in reason)
 
 
 def test_a_deeply_nested_group_is_refused_not_a_crash(pol):

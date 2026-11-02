@@ -34,7 +34,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from ws import adapters, approvals, guards, output, policy, sandbox
+from ws import adapters, approvals, guards, output, policy, sandbox, shellwords
 
 if TYPE_CHECKING:
     from ws import gatecorpus
@@ -105,7 +105,24 @@ def check(
     from the launcher. The guards that are on judge the call after the rules: the first deny wins, an approvable one
     asks for approval the same way, and warnings and notes are added to `notes`. `layer`, when given, gets the kind of
     the layer that made a refusal (preflight, rule:KIND, guard:NAME, ask_commands). `home` and `clock` are for the
-    guards (the ws home their state lives in, and the time)."""
+    guards (the ws home their state lives in, and the time). The rules, the guards and the approval check read the
+    command under one clock (see shellwords.time_limit), so a command cannot take them one after another."""
+    with shellwords.time_limit():
+        return _check(runner, raw, pol, protect, approval_root, consume, notes, layer, clock, home)
+
+
+def _check(
+    runner: str,
+    raw: str,
+    pol: policy.Policy,
+    protect: tuple[str, ...],
+    approval_root: Path | None,
+    consume: bool,
+    notes: list[str] | None,
+    layer: list[str] | None,
+    clock,
+    home: Path | None,
+) -> str | approvals.Claim | None:
     payload = json.loads(raw)
     if not isinstance(payload, dict):
         raise TypeError("payload is not a JSON object")
@@ -156,6 +173,11 @@ def check(
 def event(runner: str, raw: str, pol: policy.Policy, *, clock=None, home: Path | None = None) -> tuple[int, str, str]:
     """(exit code, stdout, stderr) for a hook payload of an event that is not a call's check. Raises on a payload it
     cannot read; cmd_event turns that into exit 0 and one line."""
+    with shellwords.time_limit():
+        return _event(runner, raw, pol, clock, home)
+
+
+def _event(runner: str, raw: str, pol: policy.Policy, clock, home: Path | None) -> tuple[int, str, str]:
     payload = json.loads(raw)
     if not isinstance(payload, dict):
         raise TypeError("payload is not a JSON object")

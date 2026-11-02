@@ -415,17 +415,17 @@ REVIEWER_DENIED = [
     "XX -rf $HOME/",
     'XX -rf "$HOME"',
     "XX -rf ~ ; echo done",
+    'cat "$(echo ~)/.ssh/id_rsa"',  # the part after the unknown $(...) is a protected path under a home folder
 ]
 REVIEWER_GAPS = [
     "python3 -c 'import shutil;shutil.rmtree(\"/\")'",
     "CU x > a; sh a",
     "CU -o a x && bash a",
-    'cat "$(echo ~)/.ssh/id_rsa"',
     "perl -e 'system(\"XX -rf /\")'",
 ]
 
 
-# Known gaps, kept visible: a text matcher cannot see inside an interpreter, a downloaded file or a $(...) path.
+# Known gaps, kept visible: a text matcher cannot see inside an interpreter, or a downloaded file.
 # These stay allowed by the matcher and are left to the runner's own rules and, later, a sandbox.
 
 
@@ -992,7 +992,7 @@ PROBE_DENIED = [
     "cd ~/proj && cd .. && cat .ssh/id_rsa",
     "cat --  ~/.ssh/id_rsa",
     "head -c 100 ~/.ssh/id_rsa",
-    "cat ~/.ssh/authorized_keys",
+    "cat ~/.ssh/config",
     "ls -R ~",
     "cd ~ && grep -r foo .",
     "cd ~ && ls -R",

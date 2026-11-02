@@ -41,14 +41,21 @@ MAX_WORDS = 4096  # words that brace expansion may add for one command; more is 
 MAX_BRACE_DEPTH = 64  # nested brace groups in one word
 # Characters in a variable that `%`, `#`, `/` and `:` work on; a longer one is refused, not slowed down.
 MAX_VALUE = 4096
-TIME_LIMIT = 2.0  # seconds the reader may take over one command line, well inside a runner's hook time-out
+TIME_LIMIT = 1.0  # seconds the reader may take over one command line, well inside a runner's hook time-out
+# A path the checks resolve (to follow links) may have this many parts, and one command line this many paths: past that
+# the line is refused. Resolving a path costs more than its length (a part at a time), so the work is bounded here and
+# not by the clock alone. The kernel opens nothing longer than MAX_PATH_CHARS, so a longer word is not resolved.
+MAX_PATH_CHARS = 4096
+MAX_PATH_PARTS = 256
+MAX_PATHS = 8192
+MAX_EXPANDED = 1 << 20  # characters that variables may add to the words of one command line
 PROCSUB = "/dev/fd/63"  # what `<(...)` becomes
 WRITE_OPS = (">", ">>", ">|", ">&", "&>", "&>>", "<>")  # redirections that write to their target
 
 
 class ShellError(ValueError):
     """Text the reader cannot read or will not expand. `kind` is one of unclosed_quote, too_many_words, too_deep,
-    too_long (a value past MAX_VALUE), too_slow (past the time limit) and unsupported (an expansion it does not know);
+    too_long (a value past MAX_VALUE, a path of too many parts, or too much text from variables), too_slow (past the time limit) and unsupported (an expansion it does not know);
     callers branch on it, never on the message."""
 
     def __init__(self, kind: str, message: str):
@@ -58,6 +65,8 @@ class ShellError(ValueError):
 
 
 _deadline: contextvars.ContextVar[float | None] = contextvars.ContextVar("ws_shell_deadline", default=None)
+_paths: contextvars.ContextVar[list[int] | None] = contextvars.ContextVar("ws_shell_paths", default=None)
+_text: contextvars.ContextVar[list[int] | None] = contextvars.ContextVar("ws_shell_text", default=None)
 
 
 @contextlib.contextmanager
@@ -69,9 +78,12 @@ def time_limit(seconds: float | None = None) -> Iterator[None]:
         yield
         return
     token = _deadline.set(time.monotonic() + (TIME_LIMIT if seconds is None else seconds))
+    counted, grown = _paths.set([0]), _text.set([0])
     try:
         yield
     finally:
+        _text.reset(grown)
+        _paths.reset(counted)
         _deadline.reset(token)
 
 
@@ -80,6 +92,33 @@ def tick() -> None:
     limit = _deadline.get()
     if limit is not None and time.monotonic() > limit:
         raise ShellError("too_slow", "the command takes too long to read; split it into smaller commands")
+
+
+def check_path(path: str) -> bool:
+    """Called before a path is resolved against the file system: refuses (ShellError, kind `too_long`) a path of more
+    than MAX_PATH_PARTS parts, and a command line that makes the checks resolve more than MAX_PATHS paths; also keeps
+    the deadline. Returns whether the file system may be asked about the path at all: the kernel opens nothing longer
+    than MAX_PATH_CHARS, so a longer word (a script or a message handed to a program) is matched as text and not
+    resolved, which is also what keeps resolving a long path from costing more than its length."""
+    tick()
+    if path.count("/") > MAX_PATH_PARTS:
+        raise ShellError("too_long", f"a path in the command has more than {MAX_PATH_PARTS} parts; use a shorter one")
+    seen = _paths.get()
+    if seen is not None:
+        seen[0] += 1
+        if seen[0] > MAX_PATHS:
+            raise ShellError("too_many_words", f"the command names more than {MAX_PATHS:,} paths; use a loop or a file")
+    return len(path) <= MAX_PATH_CHARS
+
+
+def charge(chars: int) -> None:
+    """Called where a variable's value is put into a word: refuses (ShellError, kind `too_long`) a command line whose
+    variables add more than MAX_EXPANDED characters in all, so a value used thousands of times is not built."""
+    grown = _text.get()
+    if grown is not None:
+        grown[0] += chars
+        if grown[0] > MAX_EXPANDED:
+            raise ShellError("too_long", f"the command's variables expand to more than {MAX_EXPANDED:,} characters")
 
 
 class Budget:
@@ -455,6 +494,8 @@ def scan(
             buf.append(" " + PROCSUB + " " if c == "<" else " /dev/null ")
             i = j + 1
             continue
+        elif nest:  # inside ${...} and $[...] a `;`, `(`, `&` or `|` is a character of the pattern, not an operator
+            buf.append(c)
         elif c in ";\n()":
             end_pipeline(";" if c == "\n" else c)
         elif c == "&":
@@ -574,11 +615,15 @@ _SHELL_TEXT = {"su", "runuser", "flock", "script"}
 def _shell_text(w: str, toks: list[str]) -> str | None:
     """The `-c TEXT` (`-cTEXT`, `-lc TEXT`, `--command=TEXT`) of `su`, `runuser`, `flock` or `script`: the text a shell
     runs. Only the options, and at most one name before or among them, are read, so the `-c` of the program they
-    start is not taken for theirs."""
-    arg_opts, names, i = _WRAPPERS[w], 0, 1
+    start is not taken for theirs. A bare `-` (`su - root`) is an option; after `--`, `su` and `runuser` (without `-u`)
+    pass the rest to their shell, so `su -- root -c TEXT` is read, and for `flock` the rest is the program."""
+    arg_opts, names, i, user = _WRAPPERS[w], 0, 1, False
     while i < len(toks):
         t = toks[i]
         if t == "--":
+            if w == "su" or (w == "runuser" and not user):
+                i += 1
+                continue
             return None
         if t == "--command":
             return toks[i + 1] if i + 1 < len(toks) else ""
@@ -586,11 +631,12 @@ def _shell_text(w: str, toks: list[str]) -> str | None:
             return t.split("=", 1)[1]
         if t.startswith("--"):
             i += 2 if t in _LONG_ARG.get(w, ()) else 1
-        elif t.startswith("-") and len(t) > 1:
+        elif t.startswith("-"):  # also a bare `-`
             for k, ch in enumerate(t[1:], 1):
                 if ch == "c":
                     return t[k + 1 :] or (toks[i + 1] if i + 1 < len(toks) else "")
                 if "-" + ch in arg_opts:
+                    user = user or ch == "u"
                     i += 0 if k + 1 < len(t) else 1
                     break
             i += 1
@@ -648,7 +694,11 @@ def strip_wrappers(
         seen.add(w)
         if w in _SHELL_TEXT:
             text = _shell_text(w, toks)
-            if text is not None or w in ("su", "script"):
+            if text is None and w in ("su", "script"):  # it runs a shell the check cannot read: not dropped, refused
+                raise ShellError(
+                    "unsupported", f"`{w}` here runs a shell whose commands cannot be read; use `{w} -c TEXT`"
+                )
+            if text is not None:
                 if text and scripts is not None:
                     scripts.append(text)
                 toks = []
@@ -1014,6 +1064,69 @@ def _strip(val: str, pat: str, prefix: bool, longest: bool) -> str:
     return val[k:] if prefix else val[: len(val) - k]
 
 
+# What a pattern or replacement in `${X%pat}`, `${X/pat/rep}` may not hold, because the reader would leave it as
+# written where a shell reads it: a variable or command to expand, a negated or named bracket class, an extglob group.
+_UNREAD = re.compile(r"[$`]|\[[!^]|\[\[[:.=]|[@!+*?]\(")
+_CASE = {",": str.lower, "^": str.upper}
+
+
+def _unread(body: str, text: str) -> None:
+    """Refuse (ShellError, kind `unsupported`) a pattern the reader does not follow: leaving it as written would let a
+    path through that the shell builds."""
+    if _UNREAD.search(text):
+        raise ShellError("unsupported", f"${{{body}}} has a pattern the reader does not follow; write the path out")
+
+
+def _split_slash(text: str) -> tuple[str, str]:
+    """(the text up to the first `/` that is not quoted or escaped, unquoted; the rest, unquoted)."""
+    out: list[list[str]] = [[], []]
+    side, i, n = 0, 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == "\\" and i + 1 < n:
+            out[side].append(text[i + 1])
+            i += 2
+        elif c in "'\"" and (j := text.find(c, i + 1)) > 0:
+            body = text[i + 1 : j]
+            out[side].append(re.sub(r"\\([\"\\])", r"\1", body) if c == '"' else body)
+            i = j + 1
+        elif c == "/" and side == 0:
+            side = 1
+            i += 1
+        else:
+            out[side].append(c)
+            i += 1
+    return "".join(out[0]), "".join(out[1])
+
+
+def _case_change(val: str, op: str, every: bool) -> str:
+    """`${X,}`, `${X,,}`, `${X^}`, `${X^^}`, `${X~}` and `${X~~}` as bash does: one character at a time, the first or
+    all, and a character whose other case is not one character stays as it is."""
+
+    def one(ch: str) -> str:
+        got = ch.swapcase() if op == "~" else _CASE[op](ch)
+        return got if len(got) == 1 else ch
+
+    return "".join(map(one, val)) if every else (one(val[0]) + val[1:] if val else val)
+
+
+def _offset(val: str, rest: str) -> str:
+    """`${X:off}` and `${X:off:len}` with whole numbers, as bash does: a negative offset counts from the end, a negative
+    length stops that far from the end. A length that stops before the offset is an error in bash, so a refusal here."""
+    off, _, size = rest[1:].partition(":")
+    n = len(val)
+    start = int(off)
+    start = n + start if start < 0 else start
+    if start < 0 or start >= n:
+        return ""
+    if not size:
+        return val[start:]
+    end = start + int(size) if int(size) >= 0 else n + int(size)
+    if end < start:
+        raise ShellError("unsupported", "a substring length that ends before its start cannot be read")
+    return val[start:end]
+
+
 _SUBSCRIPT = re.compile(r"\[([^\]]*)\]")
 
 
@@ -1061,20 +1174,34 @@ def _param(body: str, env: Mapping[str, str], strict: bool = True) -> str | None
         return val if val or not colon else None
     if rest[0] in "%#":
         long = rest[1:2] == rest[0]
-        return _strip(val, rest[2:] if long else rest[1:], rest[0] == "#", long)
+        pat = rest[2:] if long else rest[1:]
+        _unread(body, pat)
+        return _strip(val, pat, rest[0] == "#", long)
     if rest[0] == "/":
         every = rest[1:2] == "/"
-        pat, _, rep = (rest[2:] if every else rest[1:]).partition("/")
-        if not pat or re.search(r"[*?\[]", pat):
-            return None
+        raw = rest[2:] if every else rest[1:]
+        if raw[:1] in ("%", "#") or "&" in raw.partition("/")[2]:
+            raise ShellError(
+                "unsupported", f"${{{body}}} anchors or reuses the match, which the reader does not follow"
+            )
+        if re.search(r"[*?\[]", raw):
+            raise ShellError("unsupported", f"${{{body}}} replaces by a pattern, which the reader does not follow")
+        _unread(body, raw)
+        pat, rep = _split_slash(raw)
+        if not pat:
+            return val
         return val.replace(pat, rep) if every else val.replace(pat, rep, 1)
     if colon and re.fullmatch(r":\s*-?[0-9]+(:\s*-?[0-9]+)?", rest):
-        off, _, size = rest[1:].partition(":")
-        start = int(off)
-        start = max(len(val) + start, 0) if start < 0 else start
-        return val[start : start + int(size)] if size else val[start:]
-    if rest[0] in ",^~@":
-        return val
+        return _offset(val, rest)
+    if rest[0] in ",^~":
+        if len(rest) > 1 + (rest[1:2] == rest[0]):
+            raise ShellError("unsupported", f"${{{body}}} changes case by a pattern, which the reader does not follow")
+        return _case_change(val, rest[0], rest[1:2] == rest[0])
+    if rest[0] == "@" and rest[1:] in ("Q", "U", "L", "u", "l"):
+        return val  # quoted or case-changed: read as the value, so a path matches whatever its case
+    if rest == "@E":
+        escaped = re.sub(r"\\.|'", lambda m: "\\'" if m.group() == "'" else m.group(), val, flags=re.DOTALL)
+        return ansi_c(escaped + "'", 0)[0]
     raise ShellError("unsupported", f"${{{body}}} uses an expansion the reader does not follow")
 
 
@@ -1089,14 +1216,18 @@ def _dollar(s: str, k: int, env: Mapping[str, str], strict: bool = True) -> tupl
     expand) an expansion the reader does not know is None, not a refusal."""
     if (e := _param_end(s, k)) is not None:
         try:
-            return _param(s[k + 2 : e], env), e + 1
+            val = _param(s[k + 2 : e], env)
         except ShellError as err:
             if strict or err.kind != "unsupported":
                 raise
             return None, e + 1
+        charge(len(val or ""))
+        return val, e + 1
     m = _NAME.match(s, k + 1)
     if m:
-        return env.get(m.group()), m.end()
+        val = env.get(m.group())
+        charge(len(val or ""))
+        return val, m.end()
     return None, k + 1
 
 

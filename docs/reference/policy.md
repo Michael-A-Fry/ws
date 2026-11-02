@@ -45,7 +45,6 @@ the built-in default, which has the list below.
 |---|---|---|---|
 | `deny_commands` | list of text | `[]` in a file | Shell command patterns no session may run. `ws gate init` writes the [built-in list](#built-in-deny_commands). |
 | `deny_read` | list of text | `[]` in a file | Paths no session may read. `~/` is your home. `**` crosses folders. `ws gate init` writes `~/.ssh/**`, `~/.gnupg/**`, `~/.aws/credentials` and `~/.config/ws/secrets/**`. Whatever the file says, ws also denies reads of its own secrets folder (`$WS_HOME/secrets`, and the `[roles.secrets] store` folder when the profile names one), for every runner. |
-| `allow_read` | list of text | `[]` in a file | Files inside a `deny_read` rule that hold no secret and may be read, never written: absolute or under `~/`, `*` stays in one folder, no `**`. `ws gate init` writes `~/.ssh/*.pub`, `~/.ssh/config` and `~/.ssh/known_hosts`. A path counts only when it and the file a link leads to are both listed; naming the folder, or a glob that could reach a private key, is still refused. A runner's own file rules and the wall do not read this key. |
 | `deny_tools` | list of text | `[]` | Neutral tool names to switch off. Known: `web_fetch`, `web_search`. An allowed web tool counts as a way out. |
 | `ask_commands` | list of text | `[]` | Command patterns that run only after you approve that exact call. Same globs as `deny_commands`. A command that also matches `deny_commands` stays denied. |
 | `allow_hosts` | list of text | `[]` | Hosts a session's shell may reach, for runners whose sandbox filters the network (Claude Code). Empty means the policy says nothing about the network. |
@@ -97,9 +96,11 @@ recognised however it's spelled. It reads:
   `declare`, `typeset`, `local`, `readonly`, `read NAME <<< word` and a `for` loop, which is read once for each word of
   its list), including the `${NAME:-x}`, `${NAME:+x}`, `${NAME%/*}`, `${NAME##*/}`, `${NAME/a/b}`, `${NAME:1:3}` and
   `${!NAME}` forms. The word of a default or alternative is expanded like any word. `~+`, `~-`, `$PWD` and `$OLDPWD`
-  follow `cd` on the same line. The case-change (`${NAME,,}`) and `@` (`${NAME@Q}`) operators and `${NAME[0]}` read as
-  the value, so a path is matched whatever its case. A quoted `~` is the folder called `~`, and a single-quoted `$HOME`
-  is text. A variable the line doesn't set is left as written.
+  follow `cd` on the same line. The case-change operators (`${NAME,}`, `,,`, `^`, `^^`, `~` and `~~`) change case as
+  bash does, `${NAME@E}` decodes escapes, `${NAME@Q}`, `@U`, `@L`, `@u` and `@l` read as the value, and `${NAME[0]}` is
+  the value. A quoted `~` is the folder called `~`, and a single-quoted `$HOME` is text. A variable the line doesn't set
+  is left as written; a path word that still holds one after that (`/home/$USER/` and then a protected folder) is
+  refused when what follows the unknown part names a protected path under the home folder.
 - Redirections: `<`, `>`, `>>`, `>|`, `<>`, `&>`, `&>>`, `>&`, here-strings, and file-descriptor forms such as `3<` and
   `2>`. Each target is expanded like any word, so a brace group in a target names every file it expands to.
 - Paths inside a word: the value of an option (`dd if=P`, `--opt=P`, `-oP`, `-sSLo P`), a file argument (`-F f=@P`,
@@ -111,12 +112,17 @@ recognised however it's spelled. It reads:
   line of its own.
 
 The reader is bounded. A command may expand to at most 4,096 words in all, including the commands inside it, and
-braces may nest 64 deep. A variable that `%`, `#`, `/` or `:` works on may hold at most 4,096 characters, a `for` list
-at most 64 different words (a run of numbers counts as three), and reading one command line may take two seconds.
+braces may nest 64 deep. A variable that `%`, `#`, `/` or `:` works on may hold at most 4,096 characters, the variables
+in one command line may add at most a million characters, a `for` list at most 64 different words (a run of numbers
+counts as three), and reading one command line may take one second. A path may have at most 256 parts, and one command
+line may name at most 8,192 paths; a word longer than 4,096 characters is matched as text and isn't looked up on disk.
 Shells, substitutions and `eval` may nest four deep. A command over a limit, one that uses an expansion the reader
-doesn't follow (`${NAME:$n}`, `${!NAME}` for a name the line doesn't set), and one that ends inside a quote, is refused
-with a reason that says so; it's never let through unread. `tests/test_shellwords_oracle.py` compares the reader with
-bash on a fixed set of spellings.
+doesn't follow, and one that ends inside a quote, is refused with a reason that says so; it's never let through unread.
+The expansions it doesn't follow are a pattern with a variable, a command, a negated or named bracket class
+(`[!x]`, `[^x]`, `[[:alpha:]]`) or an extglob group (`@(x)`, `!(x)`), an anchored (`${NAME/%x}`) or globbed replacement,
+a replacement that reuses the match (`&`), a case change with a pattern, an arithmetic offset such as `${NAME:0:(-4)}`,
+`${NAME@P}`, `${!NAME}` for a name the line doesn't set, and a `su` or `script` with no `-c` text to read.
+`tests/test_shellwords_oracle.py` compares the reader with bash on a fixed set of spellings.
 
 ## `[guards]`
 
@@ -176,7 +182,6 @@ acts = ["write"]
 
 [gate]
 deny_read = ["~/.ssh/**", "~/.gnupg/**", "~/.aws/credentials", "~/.config/ws/secrets/**"]
-allow_read = ["~/.ssh/*.pub", "~/.ssh/config", "~/.ssh/known_hosts"]
 deny_tools = ["web_fetch", "web_search"]
 ask_commands = ["git push*"]
 allow_hosts = ["api.anthropic.com", "github.com"]

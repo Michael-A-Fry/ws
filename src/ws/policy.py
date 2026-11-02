@@ -135,7 +135,6 @@ class Source:
 class Gate:
     deny_commands: tuple[str, ...] = ()
     deny_read: tuple[str, ...] = ()
-    allow_read: tuple[str, ...] = ()  # paths inside a deny_read rule that hold no secret and may be read, never written
     deny_tools: tuple[str, ...] = ()
     ask_commands: tuple[str, ...] = ()  # run only with a single-use approval from a human (ws.approvals)
     allow_hosts: tuple[str, ...] = ()  # empty = the policy says nothing about the network
@@ -254,9 +253,6 @@ outward = []
 deny_commands = {arr(default_deny_commands())}
 # Paths no session may read. `~/` is your home; `**` crosses folders.
 deny_read = ["~/.ssh/**", "~/.gnupg/**", "~/.aws/credentials", "~/.config/ws/secrets/**"]
-# Files inside those that hold no secret and may be read (never written): public keys, the ssh config and known hosts.
-# `*` stays in one folder; a folder or a glob that could reach a private key is still refused.
-allow_read = ["~/.ssh/*.pub", "~/.ssh/config", "~/.ssh/known_hosts"]
 # Neutral tool names to switch off: {", ".join(KNOWN_TOOLS)}. An allowed web tool counts as a way out (leg C).
 deny_tools = []
 # Commands that run only after you approve that exact call, once: the gate refuses the first try and prints an id; in a
@@ -443,13 +439,12 @@ def loads(text: str) -> Policy:
     g = _table(
         raw.get("gate", {}),
         "[gate]",
-        {"deny_commands", "deny_read", "allow_read", "deny_tools", "ask_commands", "allow_hosts", "allow_write"},
+        {"deny_commands", "deny_read", "deny_tools", "ask_commands", "allow_hosts", "allow_write"},
     )
     deny_read = _strings(g, "deny_read", "[gate] ")
     gate = Gate(
         _strings(g, "deny_commands", "[gate] "),
         (*deny_read, *(r for r in secret_read_rules() if r not in deny_read)),
-        _strings(g, "allow_read", "[gate] "),
         _strings(g, "deny_tools", "[gate] "),
         _strings(g, "ask_commands", "[gate] "),
         _strings(g, "allow_hosts", "[gate] "),
@@ -464,11 +459,6 @@ def loads(text: str) -> Policy:
             raise PolicyError(
                 f"[gate] allow_write: {w!r} must be a folder, absolute or under ~/, with no wildcard, and not / or "
                 "the home folder (after `.` and `..` are resolved)"
-            )
-    for a in gate.allow_read:
-        if not a.startswith(("~/", "/", "$HOME/", "${HOME}/")) or "**" in a:
-            raise PolicyError(
-                f"[gate] allow_read: {a!r} must be a file path, absolute or under ~/, with no `**` (a `*` stays in one folder)"
             )
     for t in gate.deny_tools:
         if t not in KNOWN_TOOLS:
@@ -646,13 +636,19 @@ def _cwd() -> str:
         return "/"
 
 
+@lru_cache(maxsize=8)
+def _base_env(home: str | None, ws: str | None) -> tuple[tuple[str, str], ...]:
+    """`HOME` and `WS_HOME` as a command word sees them, made once for the environment they come from."""
+    return (("HOME", _home().rstrip("/") or "/"), ("WS_HOME", str(ws_home())))
+
+
 def _env(known: dict[str, str] | None = None, cwd: str = "", oldpwd: str = "") -> dict[str, str]:
     """The variables a command word may use: `HOME` and `WS_HOME`, the folder the command runs in as `PWD` (and the one
     before the last `cd` as `OLDPWD`) when it is given, then what earlier parts of the line set."""
     where = {"PWD": cwd} if cwd else {}
     if oldpwd:
         where["OLDPWD"] = oldpwd
-    return {"HOME": _home().rstrip("/") or "/", "WS_HOME": str(ws_home()), **where, **(known or {})}
+    return {**dict(_base_env(os.environ.get("HOME"), os.environ.get("WS_HOME"))), **where, **(known or {})}
 
 
 def _expand(path: str) -> str:
@@ -881,10 +877,25 @@ def _rules(deny_read: tuple[str, ...], home: str, ws: str) -> tuple[tuple[str, r
     return tuple((rule, _path_regex(rule), _rule_root(rule)) for rule in deny_read)
 
 
-@lru_cache(maxsize=16)
-def _allowed(allow_read: tuple[str, ...], home: str, ws: str) -> tuple[re.Pattern, ...]:
-    """The allow_read paths as patterns, made once (`home` and `ws` are only the cache key, as for _rules)."""
-    return tuple(_path_regex(a) for a in allow_read)
+_KNOWN_NAMES = ("HOME", "WS_HOME", "PWD", "OLDPWD")
+_UNSET = re.compile(r"\$(?:\{[^}]*\}|\([^)]*\)|[A-Za-z_][A-Za-z0-9_]*)|`[^`]*`")
+
+
+def _unset_hit(policy: Policy, path: str, cwd: str) -> str | None:
+    """A word of a command that still holds a variable or command the reader could not know (`/home/$USER/x`,
+    `$(pwd)/x`) could name a protected path for some value of it. It is refused when what follows the last such part
+    is a protected path under the home folder (`/home/$USER/` then a denied folder), or on its own; a word that is only
+    the variable (`$FILE`) or ends in it says nothing about where it points, and is left alone."""
+    found = [
+        m for m in _UNSET.finditer(path) if m.group().strip("${}") not in _KNOWN_NAMES
+    ]  # (a known name is quoted text)
+    rest = path[found[-1].end() :] if found else ""
+    if not rest.startswith("/"):
+        return None
+    for form in (_home().rstrip("/") + rest, rest):
+        if hit := _read_hit(policy, form, cwd, expand=False):
+            return hit
+    return None
 
 
 def _read_hit(
@@ -896,19 +907,20 @@ def _read_hit(
     if not policy.gate.deny_read or not path:
         return None
     p = _abs(path, cwd, expand)
+    resolvable = shellwords.check_path(p)
+    if not expand and ("$" in path or "`" in path) and (hit := _unset_hit(policy, path, cwd)):
+        return hit
     if re.search(r"[*?\[]", p):
         return _glob_reaches(policy, p)
     forms = {p}
-    try:
-        forms.add(os.path.realpath(p))  # a symlink into a denied folder is still that folder
-    except OSError:
-        pass
-    allowed = _allowed(policy.gate.allow_read, _home(), os.environ.get("WS_HOME", ""))
+    if resolvable:
+        try:
+            forms.add(os.path.realpath(p))  # a symlink into a denied folder is still that folder
+        except OSError:
+            pass
     for rule, rx, root in _rules(policy.gate.deny_read, _home(), os.environ.get("WS_HOME", "")):
         for f in forms:
             if rx.match(f):
-                if any(a.match(f) for a in allowed):  # every form must be allowed: a link to a private key is not
-                    continue
                 return rule
             if root is None:
                 continue
@@ -923,7 +935,7 @@ def _under(paths: tuple[str, ...], path: str, cwd: str, ancestors: bool = False)
     """The protected path that `path` is, or is inside. With `ancestors`, also one that is inside `path`: removing,
     moving or unpacking over a folder takes everything under it too."""
     p = _abs(path, cwd)
-    forms = {p, os.path.realpath(p)}
+    forms = {p, os.path.realpath(p)} if shellwords.check_path(p) else {p}
     for q in paths:
         qa = _abs(q, cwd)
         for target in {qa, os.path.realpath(qa)}:
@@ -1359,10 +1371,9 @@ def _commands_env(
     for segs in pipelines:
         for seg in segs:
             toks, env, more = _seg_words(seg, git_options, budget, known)
-            if not toks and not env:
-                continue
-            found.append((toks, env))
-            nested += more
+            nested += more  # also where the wrapper took the whole command (`su -c TEXT`): the text runs
+            if toks or env:
+                found.append((toks, env))
     for text in nested:
         found += _commands_env(text, _depth + 1, git_options, budget)
     return found

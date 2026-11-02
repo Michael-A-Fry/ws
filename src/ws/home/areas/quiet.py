@@ -20,7 +20,10 @@ BUILT = True
 
 
 def _link(page: str, label: str, text: str) -> str:
-    return f'<a href="#v-{page}"><b>{label}</b> {_fmt.esc(text)} ›</a>'
+    return (
+        f'<a href="#v-{page}" data-action="quiet.{page}" data-expect="navigate:#v-{page}">'
+        f"<b>{label}</b> {_fmt.esc(text)} ›</a>"
+    )
 
 
 def render(view: View) -> str:

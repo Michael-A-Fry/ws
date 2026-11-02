@@ -38,11 +38,17 @@ class Buckets:
     work: list = field(default_factory=list)
     idle: list = field(default_factory=list)
     done: list = field(default_factory=list)
+    jobs: list = field(default_factory=list)  # (job, [runs, newest first]) for each headless job that ran today
     ended: int = 0  # every ended session with a window, done today or not
 
     @property
     def need(self) -> int:
         return len(self.need_asks) + len(self.need_sessions)
+
+    @property
+    def done_today(self) -> int:
+        """The count line's "done today": sessions, and each job as one."""
+        return len(self.done) + len(self.jobs)
 
 
 def _asked(snap: Snapshot):
@@ -51,11 +57,24 @@ def _asked(snap: Snapshot):
     return lambda s: s.id in ids or bool(s.tmux and s.tmux in panes)
 
 
+def is_run(s) -> bool:
+    """A headless run: a session that ended and never had a terminal pane. Runs are folded by job, not listed one by one.
+    An opaque session is never folded, because the name that would group it is one it hides."""
+    return s.state == "ended" and not s.tmux and not s.opaque and not s.lead
+
+
+def job_of(s) -> str:
+    """The job a run belongs to: its name when the record has one, else the folder it ran in."""
+    return s.name or s.repo or "unnamed job"
+
+
 def buckets(snap: Snapshot) -> Buckets:
     """Sort a snapshot. The lead is pinned. A session that has an ask shows as the ask. Waiting with no ask is still
-    Needs you. Ended sessions are Done today when they ended in the last 24 hours."""
+    Needs you. Ended sessions are Done today when they ended in the last 24 hours; the headless runs among them are
+    gathered into one entry per job."""
     asked = _asked(snap)
     pin, need, work, idle, done, ended = [], [], [], [], [], 0
+    runs: dict[str, list] = {}
     for s in snap.sessions:
         if s.state == "ended" and s.tmux:
             ended += 1
@@ -69,10 +88,22 @@ def buckets(snap: Snapshot) -> Buckets:
             work.append(s)
         elif s.state == "ended":
             if _fmt.within(s.last_seen, snap.ts, DONE_WINDOW_S):
-                done.append(s)
+                (runs.setdefault(job_of(s), []) if is_run(s) else done).append(s)
         else:
             idle.append(s)
-    return Buckets(pin, list(snap.asks), need, work, idle, done, ended)
+    jobs = [(j, sorted(r, key=lambda x: x.last_seen or "", reverse=True)) for j, r in runs.items()]
+    jobs.sort(key=lambda j: j[1][0].last_seen or "", reverse=True)
+    return Buckets(pin, list(snap.asks), need, work, idle, done, jobs, ended)
+
+
+def row_key(key: str) -> str:
+    """A record id as an element id: anything that isn't a letter, digit, dash or underscore becomes a dash."""
+    return "".join(c if c.isascii() and (c.isalnum() or c in "-_") else "-" for c in key)
+
+
+def row_id(key: str) -> str:
+    """The ` id="r-..."` attribute of a row, or nothing without a key."""
+    return f' id="r-{row_key(key)}"' if key else ""
 
 
 def where_of(view: View, host: str) -> str:
@@ -96,9 +127,11 @@ def row(
     pin: bool = False,
     open_: bool = False,
     tag: str = "",
+    key: str = "",
 ) -> str:
     """One row. `meta` is the muted line as HTML (escape each piece: `_fmt.esc`, or `runner_chip`); `body` is the HTML
-    that opens in place. `name`, `what`, `ws`, `host`, `runner`, `cls` and `age` are text and are escaped here."""
+    that opens in place. `name`, `what`, `ws`, `host`, `runner`, `cls` and `age` are text and are escaped here. `key`
+    (a session or ask id) makes the row addressable as `#r-<key>`, which the phone drawer's session lines link to."""
     state, word = BUCKETS[bucket]
     attrs = (
         f' data-need="{bucket}" data-ws="{_fmt.esc(ws)}" data-machine="{_fmt.esc(where_of(view, host))}"'
@@ -106,9 +139,15 @@ def row(
     )
     sep = '<span class="sep">·</span>'
     state_word = f'<span class="sw">{_fmt.esc(word)}{sep}</span>'  # shown only when the list isn't grouped by need
-    line = state_word + sep.join([m for m in meta if m] + ([tag] if tag else []))
+    pieces = [m for m in meta if m]  # a phone keeps the first two (workspace, machine) and drops the rest
+    line = state_word + "".join(
+        f'<span class="mp{" x" if i >= 2 else ""}">{sep if i else ""}{m}</span>' for i, m in enumerate(pieces)
+    )
+    if tag:
+        line += f'<span class="mp">{sep if pieces else ""}{tag}</span>'
     return (
-        f'<details class="r {bucket}"{attrs}{" open" if open_ else ""}><summary>'
+        f'<details class="r {bucket}"{row_id(key)}{attrs}{" open" if open_ else ""}>'
+        '<summary data-action="row.toggle" data-expect="toggle:row">'
         f'<span class="rg">{components.status(state, word)}</span>'
         f'<span class="rt"><span class="l1"><b class="nm">{_fmt.esc(name)}</b><span class="wh">{_fmt.esc(what)}</span></span>'
         f'<span class="l2">{line}</span></span><span class="age num">{_fmt.esc(age)}</span></summary>'
@@ -120,13 +159,21 @@ def group(
     key: str, rows: list[str], *, fold: bool = False, empty: str = "", count: int | None = None, more: str = ""
 ) -> str:
     """A titled group of rows. `fold` makes it a closed `<details>`; `empty` is what shows when there are no rows;
-    `count` is the group's size when `rows` holds only the first few, and `more` the line that says so."""
+    `count` is the group's size when `rows` holds only the first few, and `more` the line that says so, a link to
+    History."""
     title = TITLES[key]
     size = f'<em class="num">{len(rows) if count is None else count}</em>'
     body = "".join(rows) or (f'<p class="more">{_fmt.esc(empty)}</p>' if empty else "")
-    body += f'<p class="more">{_fmt.esc(more)}</p>' if more else ""
+    if more:
+        body += (
+            '<p class="more"><a href="#v-history" data-action="nav.history" data-expect="navigate:#v-history">'
+            f"{_fmt.esc(more)} ›</a></p>"
+        )
     if fold:
-        return f'<details class="grp" data-grp="{key}"><summary>{title} {size}</summary>{body}</details>'
+        return (
+            f'<details class="grp" data-grp="{key}" id="g-{key}">'
+            f'<summary data-action="group.toggle" data-expect="toggle:#g-{key}">{title} {size}</summary>{body}</details>'
+        )
     return f'<section class="grp" data-grp="{key}"><h5>{title} {size}</h5>{body}</section>'
 
 

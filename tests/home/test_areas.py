@@ -89,6 +89,7 @@ def test_the_page_draws_the_box_then_pinned_then_needs_you_then_sessions_and_eva
         evals=(arm(),),
     )
     out = page.render(s)
+    out = out[out.index('<main class="col"') :]  # the sidebar names sessions too
     steps = ('id="composer"', 'data-grp="pin"', "Boss", 'data-grp="need"', "Which one?", 'data-grp="work"', "second")
     marks = [out.index(m) for m in steps]
     assert marks == sorted(marks)
@@ -145,7 +146,7 @@ def test_a_page_renders_from_a_fake_snapshot_with_every_source_and_the_file_syst
 
 def test_each_area_has_its_empty_state():
     v = view()
-    assert "No lead session: set [home] lead" in areas.MODULES["lead"].render(v)
+    assert "Pin a lead: set [home] lead in your profile" in areas.MODULES["lead"].render(v)
     assert areas.MODULES["needs_you"].EMPTY in areas.MODULES["needs_you"].render(v)
     assert "No sessions found" in areas.MODULES["sessions"].render(v)
     assert "ws eval run" in areas.MODULES["evals"].render(v)
@@ -174,16 +175,53 @@ def test_a_cost_or_token_count_that_is_not_known_says_so():
     assert "3k tokens" in known and "US$12.50" in known and "not measured" not in known
 
 
-def test_idle_is_folded_done_today_is_capped_and_the_lead_is_not_listed_twice():
-    done = tuple(session(id=f"e{i}", name=f"old{i}", state="ended", tmux="") for i in range(20))
+def test_idle_and_done_today_are_folded_done_is_capped_and_the_lead_is_not_listed_twice():
+    done = tuple(session(id=f"e{i}", name=f"old{i}", state="ended", tmux="w:@1") for i in range(20))
     stale = session(id="old", name="ancient", state="ended", last_seen="2026-10-01T00:00:00.000Z")
     lead = session(id="L", name="Boss", lead=True)
     idle = session(id="i", name="napper", state="idle")
     out = areas.MODULES["sessions"].render(view(lead=lead, sessions=(lead, session(id="live"), idle, stale, *done)))
-    assert 'class="grp" data-grp="idle"' in out and out.count('<details class="grp"') == 1  # one fold: Idle
-    assert 'data-grp="done"' in out and '<em class="num">20</em>' in out and "and 12 more" in out
+    assert 'data-grp="idle"' in out and 'data-grp="done"' in out and out.count('<details class="grp"') == 2
+    assert '<em class="num">20</em>' in out and "and 15 more" in out
+    assert 'href="#v-history"' in out  # "and N more" goes to History
     assert "Boss" not in out and "ancient" not in out
     assert out.count('class="r done"') == _fmt_shown()
+
+
+def runs(job: str, n: int, **kw) -> tuple:
+    return tuple(
+        session(id=f"{job}-{i}", name=job, state="ended", tmux="", repo=job, last_seen=f"2026-11-02T11:{59 - i:02d}:00.000Z", **kw)
+        for i in range(n)
+    )  # fmt: skip
+
+
+def test_headless_runs_fold_into_one_row_per_job_and_count_as_one_each():
+    sessions = (*runs("triage-replay", 30), *runs("nightly", 2), session(id="live", state="working"))
+    v = view(sessions=sessions)
+    out = areas.MODULES["sessions"].render(v)
+    assert out.count('class="r done"') == 2  # a row per job, never one per run
+    assert "triage-replay" in out and "30 runs today" in out and "2 runs today" in out
+    assert out.count("run-") == 0 and "triage-replay-7" not in out
+    assert '<em class="num">2</em>' in out
+    assert "1 working · 0 idle · 2 done today" in page._summary(v.snap)  # sessions, and each job as one
+
+
+def test_an_ended_session_that_had_a_pane_is_a_done_row_not_a_job(box=None):
+    sessions = (*runs("triage-replay", 5), session(id="mine", name="builder", state="ended", tmux="w:@2"))
+    out = areas.MODULES["sessions"].render(view(sessions=sessions))
+    assert out.count('class="r done"') == 2 and "builder" in out and "5 runs today" in out
+
+
+def test_a_job_row_with_one_run_says_run_and_the_age_is_the_newest(box=None):
+    out = areas.MODULES["sessions"].render(view(sessions=runs("solo", 1)))
+    assert "1 run today" in out and "1 runs" not in out and ">1m<" in out
+
+
+def test_done_today_shows_five_rows_when_opened_then_a_link_to_history():
+    sessions = tuple(session(id=f"d{i}", name=f"w{i}", state="ended", tmux="w:@1") for i in range(9))
+    out = areas.MODULES["sessions"].render(view(sessions=sessions))
+    assert out.count('class="r done"') == 5 and "and 4 more ›" in out
+    assert '<details class="grp" data-grp="done"' in out
 
 
 def _fmt_shown() -> int:

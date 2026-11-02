@@ -68,6 +68,7 @@ ICONS: dict[str, str] = {
     "chev": '<path d="M6 9l6 6 6-6"/>',
     "up": '<path d="M12 19V5M5 12l7-7 7 7"/>',
     "menu": '<path d="M4 7h16M4 12h16M4 17h10"/>',
+    "x": '<path d="M6 6l12 12M18 6 6 18"/>',
     "mon": '<rect x="3" y="4" width="18" height="12" rx="1.5"/><path d="M8 20h8M12 16v4"/>',
     "term": '<path d="M4 17l6-5-6-5M12 19h8"/>',
     "check": '<path d="M5 12l5 5 9-10"/>',
@@ -188,29 +189,33 @@ def stat(label: str, value: object, note: str = "") -> str:
     return f'<div class="stat"><span class="k">{_e(label)}</span><span class="v">{_e(value)}</span>{tail}</div>'
 
 
-def link(label: str, href: str) -> str:
+def _data(data: dict) -> str:
+    return "".join(f' data-{_e(k.replace("_", "-"))}="{_e(v)}"' for k, v in data.items())
+
+
+def link(label: str, href: str, **data: str) -> str:
     """A plain `<a href>` that opens in a new tab (it works on a phone). A `href` that isn't http, https or claude is
-    drawn as text, never as a link."""
+    drawn as text, never as a link. `data` becomes `data-*` attributes, as in `action`."""
     if not href.lower().startswith(SAFE_SCHEMES):
         return f'<span class="act off">{_e(label)}</span>'
-    return f'<a class="act" href="{_e(href)}" target="_blank" rel="noopener noreferrer">{_e(label)}</a>'
+    return f'<a class="act" href="{_e(href)}" target="_blank" rel="noopener noreferrer"{_data(data)}>{_e(label)}</a>'
 
 
 def action(label: str, *, disabled: bool = False, title: str = "", **data: str) -> str:
     """A button the page's script turns into a POST. `data` becomes `data-*` attributes (`_` in a name is `-`).
     `disabled` draws it greyed out; `title` is the hover text (say why when it is disabled)."""
-    attrs = "".join(f' data-{_e(k.replace("_", "-"))}="{_e(v)}"' for k, v in data.items())
+    attrs = _data(data)
     attrs += f' title="{_e(title)}"' if title else ""
     attrs += " disabled" if disabled else ""
     return f'<button type="button" class="act"{attrs}>{_e(label)}</button>'
 
 
-def copy_button(text: str, label: str, *, small: bool = False, title: str = "") -> str:
+def copy_button(text: str, label: str, *, small: bool = False, title: str = "", **data: str) -> str:
     """A button the page's script turns into "copy `text`". `label` is what shows; `text` only rides in `data-copy`,
     so a command can sit behind a button and never be its label."""
     cls = "act sm" if small else "act"
     hover = f' title="{_e(title)}"' if title else ""
-    return f'<button type="button" class="{cls}" data-copy="{_e(text)}"{hover}>{_e(label)}</button>'
+    return f'<button type="button" class="{cls}" data-copy="{_e(text)}"{hover}{_data(data)}>{_e(label)}</button>'
 
 
 def page(title: str, body: str, nonce: str, extra_css: str = "", *, script: str = "") -> str:
@@ -222,7 +227,7 @@ def page(title: str, body: str, nonce: str, extra_css: str = "", *, script: str 
     tail = f"\n<script{attr}>{script}</script>" if script else ""
     return (
         '<!doctype html>\n<html lang="en"><head><meta charset="utf-8">\n'
-        '<meta name="viewport" content="width=device-width,initial-scale=1">\n'
+        '<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">\n'
         f'<meta name="referrer" content="no-referrer"><title>{_e(title)}</title><style{attr}>{sheet}</style></head>\n'
         f"<body>\n{body}{tail}\n</body></html>"
     )

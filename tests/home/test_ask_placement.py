@@ -62,9 +62,11 @@ def test_an_ask_in_the_pane_of_an_open_live_session_is_shown(box):
 
 def test_a_window_number_is_found_through_tmux(box):
     a = live(box, SID, "ws:@1.%1")
-    put_ask(box, tmux="ws:2")
+    put_ask(box, tmux="ws:2", name="builder")  # a number moves, so both sides must name the session
     (ask,) = asks_of(box, [a], windows="ws:1 @0\nws:2 @1\n")
     assert not ask.opaque
+    put_ask(box, ident="a20261102T120000-aaa2", tmux="ws:2")  # no name on the ask: the number alone isn't enough
+    assert sorted(x.opaque for x in asks_of(box, [a], windows="ws:1 @0\nws:2 @1\n")) == [False, True]
 
 
 def test_a_window_number_with_no_tmux_to_ask_stays_opaque(box):

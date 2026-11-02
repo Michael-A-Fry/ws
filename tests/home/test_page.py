@@ -120,5 +120,5 @@ def test_the_shared_script_holds_the_look_and_the_view_and_only_a_live_page_post
 
 
 def test_the_page_works_at_phone_width():
-    assert "@media (max-width:700px)" in page.CSS and "overflow-wrap" in page.CSS
+    assert "@media (max-width:600px)" in page.CSS and "overflow-wrap" in page.CSS
     assert "minmax(min(300px,100%),1fr)" in page.CSS  # an eval card never forces a sideways scroll

@@ -100,8 +100,15 @@ function drawViews() {
   $$('[data-view]:not([data-view=""])', box).forEach((b) => b.remove());
   views.forEach((v) => {
     const b = document.createElement('button'); b.type = 'button'; b.className = 'nav'; b.dataset.view = v.name;
+    b.dataset.action = 'view.apply'; b.dataset.expect = 'set:view=' + v.name;
     b.textContent = v.name; box.appendChild(b);
   });
+}
+
+/* the phone's sheet of pickers, opened by the + in the box */
+function setSheet(on) {
+  document.body.classList.toggle('sheet', on);
+  const p = $('.plus'); if (p) p.setAttribute('aria-expanded', String(on));
 }
 
 /* menus: one open at a time, closed by Escape or a click away */
@@ -109,7 +116,7 @@ function closePops(except) {
   $$('.pop').forEach((p) => { if (p !== except) p.hidden = true; });
   $$('[data-pop]').forEach((b) => b.setAttribute('aria-expanded', String(!!except && b.dataset.pop === except.id && !except.hidden)));
 }
-document.addEventListener('keydown', (e) => { if (e.key === 'Escape') { closePops(null); document.body.classList.remove('drawer'); } });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') { closePops(null); document.body.classList.remove('drawer'); setSheet(false); } });
 
 document.addEventListener('click', (e) => {
   const t = e.target;
@@ -131,6 +138,7 @@ document.addEventListener('click', (e) => {
   if (act) {
     const a = act.dataset.act;
     if (a === 'drawer') document.body.classList.toggle('drawer');
+    else if (a === 'sheet') setSheet(!document.body.classList.contains('sheet'));
     else if (a === 'new') { document.body.classList.remove('drawer'); const ta = $('#c-text'); if (ta) setTimeout(() => ta.focus(), 0); }
     else if (a === 'save-view') {
       const n = ($('#viewname').value || '').trim(); if (!n) return;
@@ -162,9 +170,17 @@ const mach = $('#machine'); if (mach) mach.addEventListener('change', () => { vi
 /* the place you are in: the nav link that matches the address */
 function here() {
   const h = location.hash || '#v-home';
-  $$('.side a.nav[href^="#v-"]').forEach((a) => { if (a.dataset.act !== 'new') { if (a.getAttribute('href') === h) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current'); } });
+  $$('.side a.nav[href^="#"]').forEach((a) => { if (a.dataset.act !== 'new') { if (a.getAttribute('href') === h) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current'); } });
 }
-window.addEventListener('hashchange', here);
+/* a session line in the drawer points at its row: open the row (and the fold it sits in) and close the drawer */
+function showRow() {
+  const el = location.hash.startsWith('#r-') ? document.getElementById(location.hash.slice(1)) : null;
+  if (!el || !el.classList.contains('r')) return;
+  for (let n = el; n && n !== document.body; n = n.parentElement) if (n.tagName === 'DETAILS') n.open = true;
+  document.body.classList.remove('drawer');
+  el.scrollIntoView({ block: 'center' });
+}
+window.addEventListener('hashchange', () => { here(); showRow(); });
 
 /* the box: a workspace's class decides which models stay greyed out; the last choice is kept per workspace */
 const cws = $('#c-ws'), crun = $('#c-runner'), cwhat = $('#c-what'), cwhere = $('#c-where');
@@ -173,8 +189,8 @@ function modelRules() {
   if (!cws || !crun) return;
   const opt = cws.selectedOptions[0], cls = opt ? (opt.dataset.cls || '') : '';
   $$('option[data-deny]', crun).forEach((o) => {
-    const bad = !!cls && (o.dataset.deny || '').split(',').includes(cls);
-    o.disabled = bad; o.textContent = o.dataset.label + (bad ? ' · not for ' + cls + ' data (your policy)' : '');
+    const bad = cls === 'terminal only' || (!!cls && (o.dataset.deny || '').split(',').includes(cls));
+    o.disabled = bad; o.textContent = o.dataset.label + (bad ? (cls === 'terminal only' ? ' · terminal only: start it from a terminal' : ' · not for ' + cls + ' data (your policy)') : '');
   });
   if (crun.selectedOptions[0] && crun.selectedOptions[0].disabled) {
     const ok = $$('option:not([disabled])', crun)[0]; if (ok) crun.value = ok.value;
@@ -196,10 +212,11 @@ if (cws) {
 /* the greeting follows this computer's clock */
 const hello = $('#hello');
 const ta0 = $('#c-text');
-if (ta0 && matchMedia('(max-width:700px)').matches) ta0.placeholder = 'Describe a task\u2026';
+if (ta0 && matchMedia('(max-width:600px)').matches) ta0.placeholder = 'Describe a task\u2026';
 if (hello) { const h = new Date().getHours(); hello.textContent = (h < 12 ? 'Morning' : h < 18 ? 'Afternoon' : 'Evening') + '. What’s next?'; }
 
-applyLook(); drawViews(); applyView(); here();
+const wsd = $('.wsd'); if (wsd && matchMedia('(max-width:600px)').matches) wsd.open = false;
+applyLook(); drawViews(); applyView(); here(); showRow();
 """
 
 LIVE = r"""
@@ -208,7 +225,7 @@ async function post(path, body) {
   try {
     const r = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Ws-Token': token }, body: JSON.stringify(body) });
     let j = {}; try { j = await r.json(); } catch (_) {}
-    return { ok: r.ok, error: j.error || '' };
+    return { ok: r.ok, error: j.error || '', maySend: !!j.may_have_sent };
   } catch (_) { return { ok: false, error: 'ws home did not answer' }; }
 }
 let busy = false, lastTouch = 0;
@@ -238,6 +255,7 @@ function stage(row, label, payload) {
     const r = await post('/api/answer', Object.assign({ id: ask.dataset.ask }, payload));
     busy = false;
     if (r.ok) { msg.textContent = 'Sent · ' + label + ' · ' + clock(); setTimeout(() => location.reload(), 1500); }
+    else if (r.maySend) { msg.textContent = 'It may have been sent. Check the session before answering again.'; }
     else { msg.textContent = r.error || 'It did not work'; stamp.hidden = false; choices.forEach((c) => { c.hidden = false; }); }
   }, UNDO_MS);
   pending.set(row, { timer, choices, stamp });
@@ -262,6 +280,7 @@ document.addEventListener('keydown', (e) => {
 /* start a session from the box */
 const send = $('#c-send'), text = $('#c-text'), note = $('#c-note');
 async function start() {
+  if (send && !send.disabled && $('#c-runner').selectedOptions[0] && $('#c-runner').selectedOptions[0].disabled) { note.className = 'cnote bad'; note.textContent = 'This folder is terminal only, or its data class rules this model out. Pick another, or start it from a terminal.'; return; }
   if (!send || send.disabled || !text.value.trim()) { if (note && text && !text.value.trim()) { note.textContent = 'Write what you want done first.'; note.className = 'cnote bad'; } return; }
   const [runner, model] = $('#c-runner').value.split('|');
   send.disabled = true; busy = true; note.className = 'cnote'; note.textContent = 'Starting…';

@@ -121,11 +121,19 @@ def _button(view: View, o: dict, kind: str, rec, *, copy_too: bool) -> str:
     that runs."""
     text = o.get("text", "")
     if o.get("post") and view.live:
-        run = components.action(OPEN_LABEL, opener=o["opener"], kind=kind, id=rec.id)
-        more = components.copy_button(text, "Copy", small=True, title="Copy the command") if copy_too and text else ""
+        run = components.action(
+            OPEN_LABEL, opener=o["opener"], kind=kind, id=rec.id, action="open.run", expect="post:/api/open"
+        )
+        more = (
+            components.copy_button(
+                text, "Copy", small=True, title="Copy the command", action="open.copy", expect="copy"
+            )
+            if copy_too and text
+            else ""
+        )
         return run + more
     if text:
-        return components.copy_button(text, OPEN_LABEL, title=f"Copies: {text}")
+        return components.copy_button(text, OPEN_LABEL, title=f"Copies: {text}", action="open.copy", expect="copy")
     return ""
 
 
@@ -137,7 +145,11 @@ def open_cell(view: View, rec, kind: str) -> str:
     with nothing to open it with draws nothing."""
     by_name = {o["opener"]: o for o in rec.opens if not o.get("href")}
     links = "".join(
-        components.link(LINK_LABELS.get(o["opener"], o["label"]), o["href"]) for o in rec.opens if o.get("href")
+        components.link(
+            LINK_LABELS.get(o["opener"], o["label"]), o["href"], action="open.link", expect="navigate:external"
+        )
+        for o in rec.opens
+        if o.get("href")
     )
     desk_call = by_name.get("terminal") or by_name.get("command")
     phone_call = by_name.get("command")
@@ -147,7 +159,12 @@ def open_cell(view: View, rec, kind: str) -> str:
     if phone_call is not None:
         phone = _button(view, phone_call, kind, rec, copy_too=False)
     elif desk_call is not None:
-        phone = components.action(OPEN_LABEL, disabled=True, title=PHONE_WHY) + f'<span class="why">{PHONE_WHY}</span>'
+        phone = (
+            components.action(
+                OPEN_LABEL, disabled=True, title=PHONE_WHY, action="open.run", expect="none:terminal only"
+            )
+            + f'<span class="why">{PHONE_WHY}</span>'
+        )
     else:
         phone = ""
     return (

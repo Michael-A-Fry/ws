@@ -2,7 +2,8 @@
 
 A template is a list of words, the first the program: `["ws", "dispatch", "{workspace}", "{request}"]`. Each `{name}` in
 a word is replaced by a value; nothing goes through a shell, so a value is one argument and can't add another. A value
-that would start a word with a dash is refused (the program would read it as a flag), and so is one with a NUL.
+that would make a word start with a dash is refused (the program would read it as a flag), and so is one with a NUL.
+A value is put in once, in a single pass, so a value that holds `{another}` is not filled in again.
 `check` runs when the profile is read (every name must be one the table allows); `fill` runs when a call is made.
 """
 
@@ -41,15 +42,23 @@ def fill(words: Sequence[str], values: Mapping[str, str]) -> list[str]:
     missing, holds a NUL, or would start a word with a dash."""
     out: list[str] = []
     for word in words:
-        built = word
-        for name in _NAME.findall(word):
-            if name not in values:
-                raise ValueError(f"no value for {name}")
-            value = values[name]
-            if "\0" in value:
-                raise ValueError(f"{name} can't hold a NUL character")
-            if value.startswith("-") and word.startswith("{" + name + "}"):
-                raise ValueError(f"{name} can't start with a dash")
-            built = built.replace("{" + name + "}", value)
-        out.append(built)
+        out.append(_fill_word(word, values))
     return out
+
+
+def _fill_word(word: str, values: Mapping[str, str]) -> str:
+    used: list[str] = []
+
+    def put(m: re.Match[str]) -> str:
+        name = m.group(1)
+        if name not in values:
+            raise ValueError(f"no value for {name}")
+        if "\0" in values[name]:
+            raise ValueError(f"{name} can't hold a NUL character")
+        used.append(name)
+        return values[name]
+
+    built = _NAME.sub(put, word)  # one pass, so a value that holds {another} isn't filled in again
+    if used and built.startswith("-") and not word.startswith("-"):
+        raise ValueError(f"{used[0]} can't start with a dash")
+    return built

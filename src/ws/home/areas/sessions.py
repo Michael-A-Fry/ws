@@ -1,8 +1,9 @@
 """Sessions: what is working, what is idle, and what finished today, as rows that open in place.
 
 Each row says what the session is doing, where it runs (workspace, machine, tmux pane, runner) and how old that is.
-Opening a row shows its folder, runner, tokens and cost (`not measured` until it is) and the ways to open it. Idle
-sessions are folded into one line. An opaque session shows its folder label and tmux target, says to open the session to
+Opening a row shows its folder, pane, runner, tokens and cost (`not measured` until it is) and the ways to open it.
+Idle sessions and Done today are folded. Headless runs are one row per job (`triage-replay · 158 runs today`), so one
+busy job can't bury the rest; the API gives no pass or fail for a run, so the row counts runs and no more. An opaque session shows its folder label and tmux target, says to open the session to
 see more, and its tokens and cost read `hidden`. A session that has an ask is drawn as the ask, under Needs you.
 """
 
@@ -21,7 +22,7 @@ OPAQUE = "Name, folder, tokens and cost are hidden; the line says to open the se
 ACTIONS = "Open the session where it lives (the opener the profile picks)."
 BUILT = True
 
-DONE_SHOWN = 8  # a day of finished jobs can run to hundreds; the rest is a count
+DONE_SHOWN = 5  # a day of finished work can run long; the rest is a link to History
 
 WORDS = {
     "working": "Working",
@@ -57,6 +58,8 @@ def _body(view: View, s) -> str:
     started = _fmt.age(s.started_at, view.snap.ts)
     rows = [
         _kv("Folder", s.cwd) if s.cwd else "",
+        _kv("Machine", _rows.where_of(view, s.host)),
+        _kv("Pane", s.tmux) if s.tmux else "",
         _kv("Runner", s.runner) if s.runner else "",
         _kv("Started", started) if started else "",
         _kv("Tokens", _fmt.tokens(s)),
@@ -92,6 +95,41 @@ def session_row(view: View, s, bucket: str, *, pin: bool = False) -> str:
         cls=view.hub.classes.get(s.repo, ""),
         pin=pin,
         tag=tag,
+        key=s.id,
+    )
+
+
+def _plural(n: int, word: str) -> str:
+    return f"{n} {word}{'' if n == 1 else 's'}"
+
+
+def job_row(view: View, job: str, runs: list) -> str:
+    """One headless job as a row: how many runs today and when the newest finished."""
+    newest = runs[0]
+    cost = sum(r.cost_usd for r in runs if r.cost_usd is not None)
+    known = sum(1 for r in runs if r.cost_usd is not None)
+    rows = [
+        _kv("Runs today", str(len(runs))),
+        _kv("Newest", _fmt.age(newest.last_seen, view.snap.ts)),
+        _kv("Folder", newest.cwd) if newest.cwd else "",
+        _kv("Cost", f"US${cost:.2f} ({known} of {len(runs)} measured)" if known else "not measured"),
+    ]
+    body = (
+        f'<dl class="kv">{"".join(rows)}</dl>'
+        '<a class="act" href="#v-history" data-action="nav.history" data-expect="navigate:#v-history">See in History</a>'
+    )
+    return _rows.row(
+        view,
+        bucket="done",
+        name=job,
+        what=_plural(len(runs), "run") + " today",
+        meta=[_fmt.esc(newest.repo), _fmt.esc(_rows.where_of(view, newest.host)), _rows.runner_chip(newest.runner)],
+        age=_fmt.age_short(newest.last_seen, view.snap.ts),
+        body=body,
+        ws=newest.repo,
+        host=newest.host,
+        runner=newest.runner,
+        cls=view.hub.classes.get(newest.repo, ""),
     )
 
 
@@ -105,8 +143,13 @@ def render(view: View) -> str:
     ]
     if b.idle:
         out.append(_rows.group("idle", [session_row(view, s, "idle") for s in b.idle], fold=True))
-    if b.done:
-        shown = [session_row(view, s, "done") for s in b.done[:DONE_SHOWN]]
-        more = len(b.done) - len(shown)
-        out.append(_rows.group("done", shown, count=len(b.done), more=f"and {more} more" if more > 0 else ""))
+    if b.done_today:
+        entries = [(s.last_seen or "", session_row(view, s, "done")) for s in b.done]
+        entries += [(runs[0].last_seen or "", job_row(view, job, runs)) for job, runs in b.jobs]
+        entries.sort(key=lambda e: e[0], reverse=True)
+        shown = [html for _, html in entries[:DONE_SHOWN]]
+        more = len(entries) - len(shown)
+        out.append(
+            _rows.group("done", shown, fold=True, count=len(entries), more=f"and {more} more" if more > 0 else "")
+        )
     return "".join(out)

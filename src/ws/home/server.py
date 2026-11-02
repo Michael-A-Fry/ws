@@ -14,6 +14,7 @@ import html
 import os
 import shutil
 import tempfile
+import threading
 import webbrowser
 from pathlib import Path
 
@@ -28,7 +29,7 @@ __all__ = ["HomeServer", "build", "run"]
 IDLE_SECONDS = 3600  # the page reloads itself while it is in view, so an hour of silence means nobody is looking
 
 
-ANSWER_STATUS = {"not_found": 404, "refused": 409, "not_set": 409, "failed": 502}
+ANSWER_STATUS = {"not_found": 404, "refused": 409, "not_set": 409, "failed": 502, "timeout": 504}
 
 
 def build(env: api.Env | None = None) -> tuple[Snapshot, api.Env]:
@@ -48,6 +49,8 @@ class HomeServer(LoopbackServer):
 
     def __init__(self, env_factory=api.Env.make, *, token: str | None = None, idle_seconds: float = IDLE_SECONDS):
         self._env = env_factory
+        self._sent: set[str] = set()  # asks answered or being answered: an ask is answered once
+        self._sent_lock = threading.Lock()
         super().__init__(
             {"/": self._page, "/api/home": self._data},
             {"/api/open": self._open, "/api/answer": self._answer, "/api/start": self._start},
@@ -77,10 +80,20 @@ class HomeServer(LoopbackServer):
             raise BadRequest("id, choice and text are text")
         if len(choice) > 256 or len(text) > api.ANSWER_TEXT_MAX:
             raise BadRequest("choice or text is too long")
+        with self._sent_lock:
+            if ident in self._sent:
+                return 409, {"error": "that ask has already been answered", "hint": "check the session"}
+            self._sent.add(ident)
         try:
             api.answer(ident, choice, text, self._env())
         except WsError as e:
-            return ANSWER_STATUS.get(e.kind, 502), {"error": e.message, "hint": e.hint}
+            if e.kind not in ("failed", "timeout"):  # nothing ran, so the same ask can be tried again
+                with self._sent_lock:
+                    self._sent.discard(ident)
+            body = {"error": e.message, "hint": e.hint}
+            if e.kind in ("failed", "timeout"):
+                body["may_have_sent"] = True  # the program ran, so it may have acted before it stopped
+            return ANSWER_STATUS.get(e.kind, 502), body
         return 200, {"ok": True}
 
     def _start(self, data: dict) -> tuple[int, dict]:

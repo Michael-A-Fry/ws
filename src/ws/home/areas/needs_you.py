@@ -44,22 +44,27 @@ def _options_list(ask) -> str:
     return f'<ul class="opts">{"".join(items)}</ul>' if items else ""
 
 
-def _form(ask) -> str:
-    """The answer, drawn: option buttons (the first filled and tagged), a box for anything else, Not now."""
+def _form(ask, choice: bool = True, text: bool = True) -> str:
+    """The answer, drawn: option buttons (the first filled and tagged), a box for anything else, Not now. Each part is
+    drawn only when the profile's answer command can take it (`{choice}`, `{text}`)."""
     buttons = []
-    for i, o in enumerate(ask.options[:OPTIONS_SHOWN]):
+    for i, o in enumerate(ask.options[:OPTIONS_SHOWN] if choice else ()):
         rec = i == 0 and len(ask.options) > 1
         tag = "<small>Recommended</small>" if rec else ""
         desc = f"<span>{_fmt.esc(o.get('description', ''))}</span>" if o.get("description") else ""
         buttons.append(
-            f'<button type="button" class="opt{" rec" if rec else ""}" data-choice="{_fmt.esc(o.get("label", ""))}">'
+            f'<button type="button" class="opt{" rec" if rec else ""}" data-choice="{_fmt.esc(o.get("label", ""))}" '
+            'data-action="ask.choose" data-expect="post:/api/answer">'
             f"<b>{_fmt.esc(o.get('label', ''))}{tag}</b>{desc}</button>"
         )
-    return (
-        f'<div class="opts2">{"".join(buttons)}</div>'
+    free = (
         '<div class="else"><input type="text" maxlength="2000" placeholder="Something else…" '
-        'aria-label="Something else"><button type="button" data-act="send-text">Send</button></div>'
+        'aria-label="Something else" data-action="ask.text" data-expect="type:text">'
+        '<button type="button" data-act="send-text" data-action="ask.send" data-expect="post:/api/answer">Send</button></div>'
+        if text
+        else ""
     )
+    return f'<div class="opts2">{"".join(buttons)}</div>{free}'
 
 
 def _body(view: View, ask, can_answer: bool) -> str:
@@ -70,10 +75,10 @@ def _body(view: View, ask, can_answer: bool) -> str:
     title = f'<p class="q">{_fmt.esc(ask.title or "No title given")}</p>'
     if can_answer:
         return (
-            f'<div class="ask" data-ask="{_fmt.esc(ask.id)}">{title}{decides}{_form(ask)}'
+            f'<div class="ask" data-ask="{_fmt.esc(ask.id)}">{title}{decides}{_form(ask, view.hub.answer_choice, view.hub.answer_text)}'
             '<div class="stamp" hidden><span class="ok" aria-hidden="true">✓</span><span class="msg"></span>'
-            '<button type="button" data-act="undo">Undo</button></div>'
-            f'<div class="links"><button type="button" data-act="not-now">Not now</button>{opens}</div></div>'
+            '<button type="button" data-act="undo" data-action="ask.undo" data-expect="cancel:post">Undo</button></div>'
+            f'<div class="links"><button type="button" data-act="not-now" data-action="ask.dismiss" data-expect="toggle:row">Not now</button>{opens}</div></div>'
         )
     where_in = "Answer in the app" if ask.answer_in == "app" else "Answer in a terminal"
     hint = ""
@@ -115,6 +120,7 @@ def _ask_row(view: View, ask, sessions, *, open_: bool) -> str:
         cls=view.hub.classes.get(ws, ""),
         open_=open_,
         tag=tag,
+        key=ask.id,
     )
 
 

@@ -47,6 +47,7 @@ stroke-linejoin:round}
 
 /* the shell: a sidebar of places, one quiet column */
 .app{display:grid;grid-template-columns:268px minmax(0,1fr);min-height:100vh}
+@media (min-width:601px){.app{background:linear-gradient(90deg,var(--panel) 267px,var(--line) 267px 268px,transparent 268px)}}
 .side{position:sticky;top:0;height:100vh;overflow-y:auto;border-right:1px solid var(--line);background:var(--panel);
 display:flex;flex-direction:column;padding:14px 12px;gap:2px}
 .sbrand{display:flex;align-items:center;gap:10px;padding:4px 8px 12px}
@@ -67,7 +68,13 @@ width:100%;text-align:left;text-decoration:none;border:0;background:none;cursor:
 font:600 11px var(--sans);border:1px solid var(--line2);flex:none}
 .who{font-size:13px;line-height:1.25;min-width:0;overflow-wrap:anywhere}.who span{display:block;color:var(--faint);font-size:12px}
 .foot .nav{width:auto;margin-left:auto;padding:6px}
+.side summary.h6{font:500 12px/1 var(--sans);color:var(--faint);margin:16px 8px 6px;cursor:pointer;list-style:none}
+.side summary.h6::-webkit-details-marker{display:none}
+button.avatar{cursor:pointer;color:var(--text)}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .scrim{display:none}
+.sscrim,.plus,.shead,.pick .pl,.topbar .ttl,.ph{display:none}
+.picks{display:contents}
 .main{min-width:0;display:flex;flex-direction:column}
 .topbar{position:relative;display:flex;align-items:center;justify-content:flex-end;gap:8px;padding:12px 20px;min-height:52px}
 .topbar .menu{display:none;margin-right:auto}
@@ -133,6 +140,8 @@ list-style:none;cursor:pointer}
 .r.need .wh{color:var(--text)}
 .l2{font-size:12.5px;color:var(--faint);display:flex;gap:6px;flex-wrap:wrap;align-items:center}
 .l2 .sep{opacity:.6}
+.l2 .mp{display:inline-flex;gap:6px;align-items:center}
+.vshort{display:none}
 .l2 .sw{display:none}
 #list:not([data-group=need]) .l2 .sw{display:inline-flex;gap:6px}
 .age{font-size:12.5px;color:var(--faint);line-height:21px;white-space:nowrap}
@@ -252,35 +261,133 @@ font-size:14px;list-style:none}
 .panel>details>summary::-webkit-details-marker{display:none}
 .panel>details>summary span{color:var(--muted);font-weight:400;font-size:13px}
 
-/* a phone: the sidebar is a drawer, the box sits at the bottom where a thumb is */
-@media (max-width:700px){
+/* a phone: a top bar with the menu, two-line rows, one pill fixed at the bottom and a sheet for the pickers */
+@media (max-width:600px){
+:root{--size:16px}
 .app{grid-template-columns:minmax(0,1fr)}
-.side{position:fixed;z-index:40;inset:0 auto 0 0;width:min(316px,86vw);transform:translateX(-102%);height:100dvh}
+.side{position:fixed;z-index:40;inset:0 auto 0 0;width:min(340px,88vw);transform:translateX(-102%);height:100dvh;
+padding:max(8px,env(safe-area-inset-top)) 12px 0;gap:0}
 body.drawer .side{transform:none;box-shadow:0 0 40px rgba(0,0,0,.4)}
 body.drawer .scrim{display:block;position:fixed;inset:0;z-index:30;background:rgba(0,0,0,.4)}
-.topbar{padding:8px 14px}.topbar .menu{display:inline-flex}
-.col{padding:0 14px 0}
-.hello{display:none}
-.composer{order:90;position:sticky;bottom:10px;z-index:10;margin-bottom:12px;border-radius:20px;
-box-shadow:0 6px 24px rgba(0,0,0,.25)}
-.composer textarea{min-height:36px}
-.pick select{max-width:11ch}
-.pick:last-of-type select{max-width:15ch}
-.pick.solo{display:none}
-.quiet{order:80}
-.r>summary{grid-template-columns:16px minmax(0,1fr) auto}
-.l1{flex-direction:column;gap:1px}
-.wh{white-space:normal;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
-.nm{font-size:15px}
-.rb{padding-left:26px}
+.side .dk{display:none}
+.side h6.ph{display:block;font-size:15px;margin:20px 12px 6px;color:var(--muted)}
+.sbrand{padding:6px 4px 14px;gap:12px}
+.sbrand .logo{font-size:5px}
+.sbrand b{font:400 30px/1 var(--serif);letter-spacing:-.01em;flex:1}
+.rbtn.ph{display:grid;place-content:center;width:48px;height:48px;border-radius:50%;background:var(--raise);
+border:1px solid var(--line2);color:var(--text)}
+.rbtn svg.i{width:22px;height:22px}
+.nav{font-size:17px;gap:14px;padding:0 12px;min-height:52px;border-radius:14px}
+.nav svg.i{width:22px;height:22px}
+.nav .n,.nav .sub{font-size:15px}
+.sessions.ph{display:grid}
+.sess{min-height:48px;font-size:16px;gap:12px}
+.sess .rg{width:22px;line-height:1}.sess .rg .g{font-size:16px}
+.sess .sn{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.nav.more{min-height:44px;color:var(--muted);font-size:16px}
+.wsd>summary.h6{display:flex;align-items:center;gap:8px;min-height:44px;margin:20px 12px 4px;font-size:15px;
+color:var(--muted);cursor:pointer;list-style:none}
+.wsd>summary.h6::-webkit-details-marker{display:none}
+.wsd>summary.h6::after{content:"›"}.wsd[open]>summary.h6::after{content:"⌄"}
+.foot{position:sticky;bottom:0;margin-top:auto;background:var(--panel);border-top:0;gap:12px;
+padding:12px 4px calc(12px + env(safe-area-inset-bottom))}
+.foot .who,.foot .gear{display:none}
+.avatar{width:48px;height:48px;font-size:15px;color:var(--text)}
+.nav.new.ph{display:flex;flex:1;margin-left:auto;max-width:240px;justify-content:center;border-radius:999px;border:0;
+background:var(--text);color:var(--bg);font-weight:550;min-height:52px;width:auto;padding:0 22px}
+.nav.new.ph:hover{background:var(--text)}
+.topbar{position:sticky;top:0;z-index:15;background:var(--bg);padding:8px 12px;gap:8px;min-height:56px}
+.topbar{justify-content:space-between}
+.topbar .menu{display:inline-flex;margin-right:0;border-radius:50%;width:44px;padding:0}
+.topbar .ttl{display:block;position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);font-size:18px;
+font-weight:650;letter-spacing:-.01em;pointer-events:none}
+.topbar .pill{min-height:44px;min-width:44px;justify-content:center;font-size:15px;padding:6px 12px}
+.col{padding:0 0 calc(160px + env(safe-area-inset-bottom));gap:0}
+#v-home,.pg:not(#v-home):target{gap:0}
+.pg:not(#v-home):target{padding:0 16px}
+.hello,.listhead{display:none}
+.grp>h5,.grp>summary{margin:18px 16px 4px;font:600 15px/1.2 var(--sans);min-height:28px;align-items:center}
+.grp>summary{min-height:44px;margin-top:6px}
+.grp>.more{margin:6px 16px;font-size:15px}
+.r{margin:0;border-radius:0}
+.r>summary{position:relative;grid-template-columns:16px minmax(0,1fr) auto;gap:1px 10px;padding:9px 16px;align-items:baseline}
+.r>summary::after{content:"";position:absolute;left:42px;right:0;bottom:0;border-bottom:1px solid var(--line)}
+.rt,.l1{display:contents}
+.rg{grid-area:1/1;line-height:22px}
+.nm{grid-area:1/2;font-size:16px;line-height:22px;overflow:hidden;text-overflow:ellipsis}
+.age{grid-area:1/3;font-size:15px;line-height:22px}
+.wh,.l2{grid-column:2/4;grid-row:2}
+.l2{display:block;font-size:15px;line-height:1.35;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.l2 .mp{display:inline}.l2 .mp.x{display:none}
+.l2 .sep{margin:0 6px}
+#list:not([data-group=need]) .l2 .sw{display:inline}
+.wh{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;white-space:normal;overflow:hidden;
+font-size:15px;line-height:1.35;color:var(--muted)}
+.r.need .wh{color:var(--muted)}
+.r.need .l2{display:none}
+.r:not(.need) .wh{display:none}
+.rb{padding:6px 16px 16px}
+.kv{font-size:15px}
 .o-desk{display:none}
 .o-phone{display:inline-flex}
 .opts2{grid-template-columns:1fr}
-.opt{min-height:52px;padding:12px 14px}
+.opt{min-height:52px;padding:12px 14px;font-size:16px}
+.opt span,.dec{font-size:15px}
+.tagc{font-size:14px}.why,.rec-tag,.opt small{font-size:14px}
+.else{min-height:48px}.else input{font-size:16px;min-height:40px}
+.else button,.links button,.act{min-height:44px;font-size:15px;display:inline-flex;align-items:center}
+.ask .q{font-size:16px}
+.stamp{font-size:15px;min-height:44px}
+.quiet{margin:20px 16px 0;font-size:15px}
+.quiet a{min-height:44px;display:inline-flex;align-items:center;gap:6px}
+.topbar #viewlbl{display:none}.topbar .vshort{display:inline}
 .list>li,.srcs>li{grid-template-columns:minmax(0,1fr)}
 .arms{padding:14px}
 .panel h2,.panel>details>summary,.empty,.fold>summary,.gap{padding-left:14px;padding-right:14px}
-.pop{right:12px}
+.vh2{margin:14px 0 0}
+/* the box: the request, then a + for the sheet, the model and send, pinned to the bottom of the screen */
+.composer{position:fixed;left:10px;right:10px;bottom:calc(8px + env(safe-area-inset-bottom));z-index:12;
+grid-template-columns:44px minmax(0,1fr) 44px;grid-template-rows:auto 44px auto;align-items:center;gap:4px 8px;
+padding:10px 10px 8px 12px;border-radius:24px;box-shadow:0 6px 24px rgba(0,0,0,.28)}
+.composer textarea{grid-area:1/1/2/4;min-height:44px;max-height:140px;field-sizing:content;resize:none;
+font-size:16px;line-height:24px;padding:10px 2px 8px;box-sizing:border-box}
+.plus{grid-area:2/1;display:grid;place-content:center;width:44px;height:44px;border-radius:50%;
+background:var(--raise);color:var(--text)}
+.plus svg{width:22px;height:22px}
+.crow{display:contents}
+.crow>.pick{grid-area:2/2;justify-self:end;width:auto;max-width:100%;min-height:44px;padding:0 14px 0 12px;
+border-radius:999px;background:var(--raise);color:var(--text);font-size:15px;gap:8px}
+.crow>.pick select{max-width:none;height:44px;font-size:15px;padding-right:18px;min-width:0}
+.crow>.pick:last-of-type select{max-width:none}
+.crow>.pick .chev{right:10px}
+.send{grid-area:2/3;margin:0;width:44px;height:44px;border-radius:50%}
+.cnote{grid-area:3/1/4/4;margin:0;padding:2px 6px 0;font-size:15px}
+.cnote:empty{display:none}
+.picks{display:none;position:fixed;left:0;right:0;bottom:0;z-index:50;flex-direction:column;gap:8px;
+background:var(--panel);border-radius:20px 20px 0 0;padding:14px 16px calc(16px + env(safe-area-inset-bottom));
+box-shadow:0 -8px 32px rgba(0,0,0,.35)}
+body.sheet .composer{z-index:60}
+body.sheet .picks{display:flex}
+body.sheet .sscrim{display:block;position:fixed;inset:0;z-index:45;background:rgba(0,0,0,.4)}
+.shead{position:relative;display:flex;align-items:center;justify-content:center;font-size:17px;min-height:48px;
+padding-top:10px}
+.shead::before{content:"";position:absolute;top:0;left:50%;width:44px;height:5px;margin-left:-22px;border-radius:3px;
+background:var(--line2)}
+.shead .xbtn{position:absolute;left:0;bottom:2px;width:44px;height:44px;border-radius:50%;display:grid;
+place-content:center;border:1px solid var(--line2);background:var(--panel);color:var(--text)}
+.shead .xbtn svg{width:20px;height:20px}
+.pick{display:flex;width:100%;min-height:52px;padding:4px 12px;border:1px solid var(--line);border-radius:12px;
+font-size:16px;color:var(--text);gap:10px;align-items:center}
+.picks .pick .pl{display:inline;color:var(--muted);width:7.6em;flex:none}
+.picks .pick select{flex:1;min-width:0;max-width:none;height:46px;font-size:16px;padding-right:22px}
+.picks .pick .chev{right:12px}
+/* menus sit above the drawer and clear of the pill */
+.pop{right:12px;font-size:15px}
+.pop.set{z-index:60;left:12px;bottom:72px;width:min(320px,calc(100vw - 24px))}
+.seg button{min-height:44px;font-size:15px}
+.chk{min-height:44px}
+.popfoot input{font-size:16px;min-height:44px}
+.btn{min-height:44px}
 }
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 """

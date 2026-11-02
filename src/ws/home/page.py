@@ -40,7 +40,7 @@ def _sources(snap: Snapshot) -> str:
     aside = f"{len(rows)} read" if not bad else f"{bad} need a look"
     body = f'<ul class="list srcs">{"".join(_source(r) for r in rows)}</ul>'
     return (
-        '<section class="panel"><details><summary>Sources'
+        '<section class="panel"><details><summary data-action="sources.toggle" data-expect="toggle:details">Sources'
         f"<span>{_fmt.esc(aside)}</span></summary>{body}</details></section>"
     )
 
@@ -52,7 +52,7 @@ def _summary(snap: Snapshot) -> str:
         f"{b.need} need you" if b.need else "nothing needs you",
         f"{len(b.work)} working",
         f"{len(b.idle)} idle",
-        f"{len(b.done)} done today",
+        f"{b.done_today} done today",
     ]
     return " · ".join(parts)
 

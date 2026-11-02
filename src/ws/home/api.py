@@ -149,6 +149,13 @@ def load_config(environ: Mapping[str, str], home: Path) -> HomeConfig:
                 'start it with / or ~/, e.g. opaque_paths = ["~/code/private"]',
             )
     expanded = tuple(dict.fromkeys(f for p in paths for f in (_expand(p.strip(), home), _expand(p, home))))
+    answer = _command(table.get("answer"), "[home.answer]", path, ANSWER_NAMES, "id")
+    if answer and not {"choice", "text"} & template.names(answer):
+        raise _bad(
+            path,
+            "[home.answer].command must use {choice} or {text}, or an answer would be sent with nothing in it",
+            'e.g. command = ["ws-ask", "answer", "{id}", "{choice}"]',
+        )
     return HomeConfig(
         lead=lead,
         opaque_paths=tuple(paths),
@@ -156,7 +163,7 @@ def load_config(environ: Mapping[str, str], home: Path) -> HomeConfig:
         sources={k: _expand(v, home) for k, v in sources.items()},
         open=opens,
         start=_command(table.get("start"), "[home.start]", path, START_NAMES, "request"),
-        answer=_command(table.get("answer"), "[home.answer]", path, ANSWER_NAMES, "id"),
+        answer=answer,
         workspaces=_free(table.get("workspaces"), "[home.workspaces]", path, lists=False),
         models=_free(table.get("models"), "[home.models]", path, lists=True),
         deny=_free(table.get("deny"), "[home.deny]", path, lists=True),
@@ -288,10 +295,25 @@ def merge_sessions(parts: list[Session], roots: tuple[str, ...] = ()) -> list[Se
     return list(merged.values())
 
 
+FRONT_DESK_NAMES = ("Home", "WS Lead")  # a session in ~/code whose name starts so is the front desk
+
+
+def _front_desk(sessions: list[Session], home: Path) -> tuple[str, str] | None:
+    """With no `[home] lead`: the one live session in the person's `~/code` folder named like a front desk, else None."""
+    code = os.path.normpath(str(home / "code"))
+    hits = [
+        s
+        for s in sessions
+        if s.state != "ended" and s.cwd and os.path.normpath(s.cwd) == code and s.name.startswith(FRONT_DESK_NAMES)
+    ]
+    return (hits[0].runner, hits[0].id) if len(hits) == 1 else None
+
+
 def _lead_key(sessions: list[Session], lead: str, home: Path) -> tuple[str, str] | None:
-    """The (runner, id) of the session the `[home] lead` setting names; the most recently seen live one if several."""
+    """The (runner, id) of the session the `[home] lead` setting names; the most recently seen live one if several.
+    With the setting empty, the front desk if exactly one session is."""
     if not lead:
-        return None
+        return _front_desk(sessions, home)
     how, _, want = lead.partition(":")
     if how == "cwd":
         target = os.path.normpath(_expand(want.strip(), home))
@@ -353,15 +375,16 @@ def _load(env: Env, kinds: set[str]) -> Loaded:
 def _finish_sessions(env: Env, loaded: Loaded) -> tuple[list[Session], dict[str, bool]]:
     """The merged sessions, sealed. Also the opaque verdict by session id (True opaque, False open); a session id not
     here is unknown, and asks and events that name one are opaque."""
-    merged = merge_sessions(loaded.by_kind.get("sessions", []), env.cfg.roots)
+    merged = []
+    for s in merge_sessions(loaded.by_kind.get("sessions", []), env.cfg.roots):
+        if s.state == "unknown" and s.runner in loaded.live_runners and (s.runner, s.id) not in loaded.live:
+            s = replace(s, state="ended")  # the live list was read and this session isn't in it
+        merged.append(s)
     lead = _lead_key(merged, env.cfg.lead, env.home)
     out: list[Session] = []
     verdict: dict[str, bool] = {}
     for s in merged:
-        state = s.state
-        if state == "unknown" and s.runner in loaded.live_runners and (s.runner, s.id) not in loaded.live:
-            state = "ended"  # the live list was read and this session isn't in it
-        s = replace(s, state=state, host=s.host or env.host, lead=(s.runner, s.id) == lead)
+        s = replace(s, host=s.host or env.host, lead=(s.runner, s.id) == lead)
         opaque = records.is_opaque(s, env.cfg.roots)
         verdict[s.id] = verdict.get(s.id, False) or opaque
         out.append(records.seal(s, opaque))
@@ -414,9 +437,11 @@ def _place(env: Env, ask: Ask, sessions: list[Session]) -> bool | None:
     if want is None:
         return None
     sess, win, pane = want
-    if not pane and win.isdigit():
+    by_number = not pane and win.isdigit()  # a window number moves; a window id or a pane doesn't
+    if by_number:
         wid = _window_ids(env).get((sess, win))
         win = wid or win
+    made = _files.epoch(ask.created) if ask.created else None
     hits = []
     for s in sessions:
         if s.state == "ended" or "claude_code" not in s.source.split("+"):
@@ -425,10 +450,14 @@ def _place(env: Env, ask: Ask, sessions: list[Session]) -> bool | None:
         if have is None or have[0] != sess:
             continue
         if (pane and have[2] == pane) or (not pane and have[1] == win):
-            hits.append(s)
+            began = _files.epoch(s.started_at) if s.started_at else None
+            if began is not None and made is not None and began <= made:  # a newer session holds the pane now
+                hits.append(s)
     if len(hits) != 1:
         return None
     hit = hits[0]
+    if by_number and not (ask.session_name and hit.name):
+        return None  # a bare number with no name on both sides could be any session that holds it now
     if not hit.opaque and ask.session_name and hit.name and ask.session_name != hit.name:
         return None
     return hit.opaque
@@ -545,8 +574,14 @@ def answer(ask_id: str, choice: str = "", text: str = "", env: Env | None = None
         raise WsError("refused", f"an answer is at most {ANSWER_TEXT_MAX} characters", "shorten it")
     if not env.cfg.answer:
         raise WsError("not_set", "no answer command is set", "set [home.answer] command in the profile")
+    used = template.names(env.cfg.answer)
+    if choice and "choice" not in used:
+        raise WsError("refused", "the answer command takes typed answers only", "add {choice} to [home.answer] command")
+    if text and "text" not in used:
+        raise WsError("refused", "the answer command doesn't take typed text", "add {text} to [home.answer] command")
     mod = next(m for m in discover()[0] if m.NAME == ask.source)
     try:
         mod.answer(ask, choice, text, env)
     except SourceError as e:
-        raise WsError("failed", e.why, "check the program in [home.answer] command") from e
+        kind = "timeout" if e.kind == TIMEOUT else "failed"
+        raise WsError(kind, e.why, "check the program in [home.answer] command") from e

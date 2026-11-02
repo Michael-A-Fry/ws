@@ -13,6 +13,9 @@ from ws.home.areas import _fmt
 from ws.home.areas._base import Hub, View
 from ws.ui import components
 
+OPAQUE_CLASS = (
+    "terminal only"  # as `ws.home.hub.OPAQUE_CLASS`; areas read nothing but records and the hub they're given
+)
 ID = "composer"
 ORDER = 0
 TITLE = "Start"
@@ -22,18 +25,21 @@ OPAQUE = "A workspace that only opaque sessions were seen in is listed by its fo
 ACTIONS = "Start a session, a chat or a job from the box; the profile's [home.start] command does the starting."
 BUILT = True
 
-SET_START = "Set [home.start] command to start sessions here"
-NEEDS_SERVER = "Sessions start from the page that ws home serves"
+SET_START = "Set [home.start] command to start sessions from here"
 WHAT = (("session", "Session", "term"), ("chat", "Chat", "new"), ("job", "Job", "clock"))
 PLACEHOLDER = "Describe a task, ask a question, or paste a link…"
 REASON = "not for {cls} data (your policy)"
+REASON_OPAQUE = "terminal only: start it from a terminal"
 
 
 def _pick(icon: str, select_id: str, label: str, options: str, solo: bool = False) -> str:
-    """One picker: an icon and a native `<select>`. `solo` marks one with a single choice, which a phone leaves out."""
+    """One picker: an icon and a native `<select>`. `solo` marks one with a single choice. A phone shows each picker as
+    a labelled line in the sheet the `+` opens."""
     return (
         f'<label class="pick{" solo" if solo else ""}" title="{_fmt.esc(label)}">{components.icon(icon)}'
-        f'<select id="{select_id}" aria-label="{_fmt.esc(label)}">{options}</select>{components.icon("chev", "chev")}</label>'
+        f'<span class="pl">{_fmt.esc(label)}</span>'
+        f'<select id="{select_id}" aria-label="{_fmt.esc(label)}" data-action="composer.pick-{select_id[2:]}" '
+        f'data-expect="select:#{select_id}">{options}</select>{components.icon("chev", "chev")}</label>'
     )
 
 
@@ -47,7 +53,7 @@ def _workspaces(hub: Hub) -> str:
     out = []
     for w in hub.workspaces:
         label = f"{w['name']} · {w['cls']}" if w["cls"] else w["name"]
-        out.append(f'<option value="{_fmt.esc(w["name"])}" data-cls="{_fmt.esc(w["cls"])}">{_fmt.esc(label)}</option>')
+        out.append(f'<option value="{_fmt.esc(w["key"])}" data-cls="{_fmt.esc(w["cls"])}">{_fmt.esc(label)}</option>')
     return "".join(out)
 
 
@@ -70,8 +76,9 @@ def _models(hub: Hub) -> str:
         for m in r["models"]:
             label = m["name"] or "default model"
             full = f"{r['name']} · {label}"
-            denied = bool(cls) and cls in m["deny"]
-            shown = f"{full} · {REASON.format(cls=cls)}" if denied else full
+            closed = cls == OPAQUE_CLASS  # a terminal-only folder takes no runner from here
+            denied = closed or (bool(cls) and cls in m["deny"])
+            shown = f"{full} · {REASON_OPAQUE if closed else REASON.format(cls=cls)}" if denied else full
             opts.append(
                 f'<option value="{_fmt.esc(r["name"])}|{_fmt.esc(m["name"])}" data-label="{_fmt.esc(full)}" '
                 f'data-deny="{_fmt.esc(",".join(m["deny"]))}"{" disabled" if denied else ""}>{_fmt.esc(shown)}</option>'
@@ -81,14 +88,12 @@ def _models(hub: Hub) -> str:
 
 
 def _note(view: View) -> tuple[str, bool]:
-    """The line under the box when sending is off, and whether sending is on."""
-    if not view.live:
-        return NEEDS_SERVER, False
+    """The line under the box when sending is off, and whether sending is on. With `[home.start]` set the line is empty."""
     if not view.hub.start:
         return SET_START, False
     if not view.hub.workspaces:
         return EMPTY, False
-    return "", True
+    return "", view.live
 
 
 def render(view: View) -> str:
@@ -96,13 +101,22 @@ def render(view: View) -> str:
     return (
         '<p class="hello" id="hello">What\'s next?</p>'
         '<div class="composer" id="composer">'
-        f'<textarea id="c-text" rows="2" maxlength="4000" placeholder="{PLACEHOLDER}" aria-label="Your request"></textarea>'
+        '<button type="button" class="plus" aria-label="Choose what, where and with which model" aria-expanded="false" '
+        f'data-act="sheet" data-action="composer.sheet" data-expect="toggle:#sheet">{components.icon("plus")}</button>'
+        f'<textarea id="c-text" rows="2" maxlength="4000" placeholder="{PLACEHOLDER}" aria-label="Your request" '
+        'data-action="composer.text" data-expect="type:#c-text"></textarea>'
         '<div class="crow">'
+        '<div class="picks" id="sheet" role="dialog" aria-label="Start with"><div class="shead">'
+        '<button type="button" class="xbtn" aria-label="Close" data-act="sheet" data-action="composer.close" '
+        f'data-expect="toggle:#sheet">{components.icon("x")}</button><b>Start with</b></div>'
         + _pick("term", "c-what", "What", _what())
         + _pick("folder", "c-ws", "Workspace", _workspaces(view.hub))
         + _pick("mon", "c-where", "Where", _where(view), solo=len(view.hub.machines) < 2)
+        + "</div>"
         + _pick("chip", "c-runner", "Runner and model", _models(view.hub))
-        + f'<button type="button" class="send" id="c-send" aria-label="Start"{"" if on else " disabled"}>{components.icon("up")}</button>'
+        + f'<button type="button" class="send" id="c-send" aria-label="Start"{"" if on else " disabled"} '
+        f'data-action="composer.send" data-expect="post:/api/start">{components.icon("up")}</button>'
         "</div>"
-        f'<p class="cnote" id="c-note" role="status">{_fmt.esc(note)}</p></div>'
+        f'<p class="cnote" id="c-note" role="status">{_fmt.esc(note)}</p>'
+        '<div class="scrim sscrim" data-act="sheet" data-action="composer.close" data-expect="toggle:#sheet"></div></div>'
     )

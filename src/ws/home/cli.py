@@ -4,6 +4,7 @@ snapshot (`ws.home/1`) as text or as the JSON a script, an app or a page reads."
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -55,8 +56,12 @@ def cmd_home(args: argparse.Namespace) -> int:
     env = api.Env.make()
     text = server.page_for(env, live=False)
     out = Path(args.render).expanduser()
-    out.write_text(text, encoding="utf-8")
-    out.chmod(0o600)  # the page holds the person's own session names and folders
+    # the page holds the person's own session names and folders: made private from the first byte, and never through a link
+    fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    if hasattr(os, "fchmod"):
+        os.fchmod(fd, 0o600)  # a file that was already there keeps its own mode otherwise
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
     if args.json:
         output.result({"path": str(out), "bytes": len(text.encode("utf-8"))})
     else:

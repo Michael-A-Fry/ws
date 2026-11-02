@@ -78,7 +78,7 @@ def test_a_workspace_only_opaque_sessions_were_seen_in_is_terminal_only(box):
     box.profile(START + '[home]\nopaque_paths = ["' + str(box.home / "code" / "app") + '"]\n')
     env = env_of(box, [])
     h = hub.build(api.snapshot(env), env)
-    assert h.workspaces == ({"name": "app", "cls": hub.OPAQUE_CLASS},)
+    assert [(w["name"], w["cls"]) for w in h.workspaces] == [("app", hub.OPAQUE_CLASS)]
 
 
 def test_start_runs_the_template_with_no_shell(box):
@@ -123,7 +123,7 @@ def test_the_box_greys_out_a_model_the_workspace_class_rules_out_and_says_why(bo
     env = env_of(box, [])
     snap = api.snapshot(env)
     out = page.render(snap, live=True, hub=hub.build(snap, env))
-    assert 'id="c-send" aria-label="Start">' in out and "disabled>" not in out.split('id="c-send"')[1].split(">")[0]
+    assert "disabled" not in out.split('id="c-send"')[1].split(">")[0]
     qwen = out.split('value="opencode|qwen"')[1].split("</option>")[0]
     assert " disabled" in qwen and "not for financial data (your policy)" in qwen
 
@@ -137,9 +137,18 @@ def test_the_send_button_is_off_and_says_why_without_a_template_or_a_server(box)
     env = env_of(box, [])
     snap = api.snapshot(env)
     no_template = page.render(snap, live=True, hub=hub.build(snap, env))
-    assert "Set [home.start] command to start sessions here" in no_template and "disabled" in no_template
+    assert "Set [home.start] command to start sessions from here" in no_template and "disabled" in no_template
     static = page.render(snap, live=False, hub=hub.build(snap, env))
-    assert "Sessions start from the page that ws home serves" in static
+    assert "Sessions start from the page that ws home serves" not in static
+
+
+def test_the_note_under_the_box_is_empty_when_a_start_command_is_set(box):
+    box.profile(RULES + '[home.start]\ncommand = ["ws", "dispatch", "{workspace}", "{request}"]\n')
+    env = env_of(box, [])
+    snap = api.snapshot(env)
+    out = page.render(snap, live=True, hub=hub.build(snap, env))
+    assert '<p class="cnote" id="c-note" role="status"></p>' in out
+    assert "start sessions from here" not in out
 
 
 # --- the server ------------------------------------------------------------------------------------------------------

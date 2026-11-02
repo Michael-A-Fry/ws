@@ -58,7 +58,10 @@ and the repo label only.
 Only a question that isn't opaque, from a source that can take an answer (`asks_jsonl`), is answerable
 (`api.answerable`). A permission, an approval, a waiting session and every opaque ask are answered where they live, and
 asking the API to answer one raises `WsError` with kind `refused`. The other kinds are `not_found`, `not_set` (no
-`[home.answer] command`) and `failed` (the program didn't run or stopped).
+`[home.answer] command`), `failed` (the program didn't run or stopped) and `timeout` (it took too long, so the answer may
+have gone). The command must use `{choice}` or `{text}`, or the profile is refused. A typed answer needs `{text}` and an
+option needs `{choice}`; the page only offers what the command can take. The home server answers an ask once: a repeat
+gets a 409.
 
 ## Sources
 
@@ -130,7 +133,8 @@ The rule runs last, after merging, and an opaque record keeps only these fields:
 Every other field is back at its empty default: no name, folder, title, tokens or cost. An opaque record's `id` is kept
 only when it has a machine shape (a UUID, `waiting:` and a UUID, an ask id like `a20261102T120000-k3x9`, or 8 to 64 hex
 digits); any other id, such as a case number, is replaced by a 16-character sha256 prefix.
-An opaque session is never the lead.
+An opaque session is never the lead. With `[home] lead` empty, the lead is the one live session whose folder is
+`~/code` and whose name starts with `Home` or `WS Lead`, if exactly one matches; otherwise there's no lead.
 
 ## Sessions from several sources
 
@@ -164,7 +168,7 @@ command = ["ws", "dispatch", "{workspace}", "{request}"]
 [home.answer]                   # the program that answers a question from its row; no shell
 command = ["ws-ask", "answer", "{id}", "{choice}"]
 
-[home.workspaces]               # workspace folder name -> its data class, shown beside it in the box and sidebar
+[home.workspaces]               # folder name -> data class, shown beside it; an `opaque_paths` folder is "terminal only"
 investments = "financial"
 
 [home.models]                   # runner -> the models the box offers for it (none: the runner's own default)

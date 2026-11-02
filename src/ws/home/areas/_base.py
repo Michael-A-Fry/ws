@@ -13,7 +13,7 @@ class Hub:
     """What the page needs besides records, already worked out by `ws.home.hub` from the profile: whether a session can
     be started here, which asks can be answered here, and the choices behind the box's four pickers.
 
-    `workspaces` holds `{name, cls}`; `machines` host names (this one first); `runners` holds `{name, models}` where each
+    `workspaces` holds `{key, label, name, cls}` (`key` is what the box sends back; `keys` maps it to that entry); `machines` host names (this one first); `runners` holds `{name, models}` where each
     model is `{name, deny}` and `deny` the data classes it can't take. `classes` is workspace -> class.
     """
 
@@ -24,6 +24,9 @@ class Hub:
     machines: tuple = ()
     runners: tuple = ()
     classes: dict = field(default_factory=dict)
+    keys: dict = field(default_factory=dict)
+    answer_choice: bool = True  # the answer command takes {choice}: options can be offered
+    answer_text: bool = True  # it takes {text}: "Something else…" can be offered
 
 
 @dataclass(frozen=True)

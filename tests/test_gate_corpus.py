@@ -472,10 +472,9 @@ def test_the_shipped_corpus_ratchet_pins_every_known_row():
 
 
 def test_a_shipped_known_row_is_only_ever_a_call_that_should_be_let_through():
-    # A shipped corpus is public. A known row that should be stopped would publish a call the released gate lets
-    # through, so those rows live in a private corpus until the fix ships.
+    # A shipped known row is a false block: an ordinary call the gate should let through and doesn't yet.
     held = [r.id for r in shipped_rows() if r.known and r.expect != "allow"]
-    assert held == [], f"known rows that expect deny or ask belong in a private corpus: {held}"
+    assert held == [], f"a shipped known row must expect allow: {held}"
 
 
 @pytest.mark.parametrize("runner", RUNNERS)
@@ -490,3 +489,12 @@ def test_both_runners_agree_on_every_shipped_row():
     claude = {r["id"]: r["result"] for r in gate.replay_corpus("claude-code", rows)}
     opencode = {r["id"]: r["result"] for r in gate.replay_corpus("opencode", rows)}
     assert claude == opencode
+
+
+def test_the_live_hook_does_not_load_the_corpus_code():
+    import subprocess
+    import sys
+
+    code = "import sys, ws.gate; print('ws.gatecorpus' in sys.modules)"
+    out = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, check=True).stdout
+    assert out.strip() == "False"

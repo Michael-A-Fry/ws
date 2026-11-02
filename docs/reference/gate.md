@@ -73,9 +73,7 @@ now gets the decision you wanted: the output says `FIXED` and names it. Remove t
 fix then shows up as an improvement, and the list of known gaps only ever shrinks. Adding a `known` row needs a `why`
 that says what the gate gets wrong today.
 
-The corpus in the repo is public, so its `known` rows are only calls the gate should let through and doesn't yet.
-Keep a call the gate should stop but doesn't in your own corpus outside the repo (replay takes any number of files),
-and move it in once the fix has shipped.
+A `known` row in the shipped corpus is always a call the gate should let through and doesn't yet (a false block).
 
 ### Compare decisions
 

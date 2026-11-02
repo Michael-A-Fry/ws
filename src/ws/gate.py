@@ -32,8 +32,12 @@ import tempfile
 import time
 from dataclasses import replace
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from ws import adapters, approvals, gatecorpus, guards, output, policy, sandbox
+from ws import adapters, approvals, guards, output, policy, sandbox
+
+if TYPE_CHECKING:
+    from ws import gatecorpus
 from ws.adapters import Call
 from ws.output import WsError
 from ws.profile import ws_home
@@ -315,6 +319,8 @@ def replay_corpus(runner: str, rows: list[gatecorpus.Row], policy_file: Path | N
     """Each corpus row judged as the live hook would, in scratch `HOME` and `CWD` folders (made here, removed after,
     and the only place a `{HOME}` or `{CWD}` is filled with). The policy is `policy_file`, else the built-in one. A row
     for another runner is left out. Each result is {id, source, expect, known, result, reason, kind, ms, differs}."""
+    from ws import gatecorpus  # here, not at the top: the live hook doesn't pay for the corpus code
+
     results = []
     with tempfile.TemporaryDirectory(prefix="ws-corpus-") as scratch:
         home, cwd = Path(scratch) / "home", Path(scratch) / "cwd"
@@ -353,6 +359,8 @@ def _read_lines(path: Path) -> list[str]:
 
 
 def cmd_replay(args: argparse.Namespace) -> int:
+    from ws import gatecorpus
+
     files = [Path(f).expanduser() for f in args.file]
     if args.expect_changes and not args.diff:
         raise WsError("bad_input", "--expect-changes needs --diff", "give the saved decisions to compare with", 2)
@@ -385,6 +393,8 @@ def cmd_replay(args: argparse.Namespace) -> int:
 
 
 def _replay_corpus_cmd(args: argparse.Namespace, files: list[Path]) -> int:
+    from ws import gatecorpus
+
     results = replay_corpus(args.runner, gatecorpus.load(files), _policy_arg(args))
     bad, ratchet = gatecorpus.failures(results)
     data: dict = {

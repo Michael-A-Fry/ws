@@ -19,7 +19,7 @@ RUNNERS = ("claude-code", "opencode")
 
 # The ordinary calls the gate still refuses, by source. A fix shows up as a FIXED line until the row is unmarked, and
 # the number here goes down with it; a new known row has to raise it on purpose.
-KNOWN_BASELINE = {"oracle": 2, "parity": 3, "regression": 4, "control": 0}
+KNOWN_BASELINE = {"oracle": 0, "parity": 4, "regression": 0, "control": 0}
 
 
 @pytest.fixture

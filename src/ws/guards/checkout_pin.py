@@ -32,10 +32,9 @@ from __future__ import annotations
 
 import os
 import posixpath
-import shlex
 from dataclasses import dataclass
 
-from ws import policy
+from ws import policy, shellwords
 from ws.guards import Finding, known_keys, text_list
 from ws.policy import PolicyError
 
@@ -197,8 +196,9 @@ def _alias_moves(sub: str, args: list[str], aliases: dict[str, str], depth: int 
                     return what
         return None
     try:
-        parts = shlex.split(value)
-    except ValueError:
+        shellwords.require_closed(value)
+        parts = shellwords.words_of(value)
+    except ValueError:  # shellwords.ShellError is one
         return f"git {sub} (an alias that can't be read)"
     if not parts:
         return None

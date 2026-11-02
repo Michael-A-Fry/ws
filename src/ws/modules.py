@@ -1,5 +1,9 @@
 """Plugins (the modules in the code): the parts of ws you can switch on or off. `memory`, `notes` and `skills` are on by
-default; the rest are opt-in and not built yet, so switching one on only records the choice in `[modules]` of the profile.
+default and are the plugins that are built; `ws plugin list`, setup and `ws plugin add` offer only built plugins.
+
+The registry also holds plugins still being developed (`built=False`). They are hidden from every list and choice. A
+profile that already switches one on keeps loading; `ws doctor` (WS009) says it does nothing yet. Developers can show
+them by setting `WS_SHOW_UNBUILT=1`.
 
 Each is a small adapter: what it is, whether it is on by default, the profile tables it owns, the folders it needs and
 the regions it is for. `ws plugin list|add|remove` goes through the same install.plan/apply as `ws install`, so it is
@@ -24,6 +28,7 @@ from ws.output import WsError
 from ws.profile import ProfileError, load, profile_path, write_if_changed
 
 NOT_BUILT = "not built yet"
+SHOW_UNBUILT = "WS_SHOW_UNBUILT"  # developers only: set to 1 to list and offer plugins that are still being built
 
 
 @dataclass(frozen=True)
@@ -112,6 +117,23 @@ REGISTRY: dict[str, Module] = {
 
 def default_on() -> frozenset[str]:
     return frozenset(n for n, m in REGISTRY.items() if m.default_on)
+
+
+def show_unbuilt(env=None) -> bool:
+    env = os.environ if env is None else env
+    return env.get(SHOW_UNBUILT) == "1"
+
+
+def offered(env=None) -> dict[str, Module]:
+    """The plugins a person is shown and may switch on: the built ones (all of them when a developer asks)."""
+    show = show_unbuilt(env)
+    return {n: m for n, m in REGISTRY.items() if m.built or show}
+
+
+def unbuilt_on(on, env=None) -> list[str]:
+    """Names in `on` that the registry holds but does not offer, in registry order."""
+    shown = offered(env)
+    return [n for n in REGISTRY if n in on and n not in shown]
 
 
 # ---- region ----------------------------------------------------------------------------------------------------------
@@ -234,7 +256,7 @@ def cmd_list(args: argparse.Namespace) -> int:
             "table": m.table,
             "region": list(m.region) or "any",
         }
-        for m in REGISTRY.values()
+        for m in offered().values()
     ]
     if args.json:
         output.result(rows)
@@ -247,11 +269,12 @@ def cmd_list(args: argparse.Namespace) -> int:
 
 
 def _change(name: str, turn_on: bool, region: str | None = None, output_json: bool = False) -> int:
-    if name not in REGISTRY:
+    shown = offered()
+    if name not in (shown if turn_on else REGISTRY):  # a plugin that is on but not offered can still be switched off
         raise WsError(
             "not_found",
             f"unknown plugin {name!r}",
-            output.did_you_mean(name, REGISTRY) or f"known: {', '.join(REGISTRY)}",
+            output.did_you_mean(name, shown) or f"known: {', '.join(shown)}",
         )
     if region is not None and not re.fullmatch(r"[A-Za-z]{2}", region):
         raise WsError("bad_input", f"--region takes a two-letter country code such as NZ, not {region!r}")

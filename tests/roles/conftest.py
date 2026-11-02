@@ -27,7 +27,7 @@ def env(box):
         "WS_HOME": str(box / ".ws"),
         "PATH": "/usr/bin:/bin",
         "TZ": "UTC",
-    }  # the zone is pinned: CI is UTC, a laptop is not
+    }  # the environment handed to the adapter under test (an input, like HOME); the test process's own zone is untouched
 
 
 @pytest.fixture

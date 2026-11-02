@@ -315,11 +315,10 @@ def notes_line(a: Ansi, text: str, editing: bool, state: str) -> str:
 def choices_rows(a: Ansi, facts: flow.Facts, c: flow.Choices) -> list[tuple[str, str]]:
     """The answers so far, as (label, text) pairs; the cap only when there is one."""
     names = [p.label for p in facts.plugins if p.name in c.plugins]
-    rows = [
-        ("Core", " · ".join(label for _, label, _ in flow.CORE)),
-        ("Plugins", " · ".join(names) if names else "none yet (ws plugin add later)"),
-        ("Notes", flow.tilde(c.notes, facts.env)),
-    ]
+    rows = [("Core", " · ".join(label for _, label, _ in flow.CORE))]
+    if facts.plugins:  # nothing built to choose, nothing to say
+        rows.append(("Plugins", " · ".join(names) if names else "none yet (ws plugin add later)"))
+    rows.append(("Notes", flow.tilde(c.notes, facts.env)))
     if c.cap:
         rows.append(("Cap", f"US${c.cap:g} a month"))
     return rows
@@ -592,6 +591,8 @@ class Wizard:
     def pick_plugins(self) -> None:
         a, facts = self.a, self.facts
         plugins = facts.plugins
+        if not plugins:  # nothing built to choose: no card
+            return
         picked = set(self.choices.plugins)
         cursor = next((i for i, p in enumerate(plugins) if p.available), 0)
 

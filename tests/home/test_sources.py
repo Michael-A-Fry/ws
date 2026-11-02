@@ -421,7 +421,14 @@ def test_ws_eval_leaves_out_results_older_than_the_window(box):
 # --- ws_plugins ------------------------------------------------------------------------------------------------------
 
 
+def test_ws_plugins_lists_built_modules_and_hides_unbuilt_ones_that_are_off(box):
+    plugins = {p.name: p for p in read("ws_plugins", "plugins", box.env())}
+    assert plugins["memory"].on and plugins["memory"].built
+    assert "finance" not in plugins  # not built and not on: never shown
+
+
 def test_ws_plugins_lists_the_modules_with_on_built_and_region(box):
+    box.environ["WS_SHOW_UNBUILT"] = "1"  # a developer view: the unbuilt ones show, marked not built
     plugins = {p.name: p for p in read("ws_plugins", "plugins", box.env())}
     assert plugins["memory"].on and plugins["memory"].built
     assert not plugins["finance"].on and not plugins["finance"].built

@@ -21,8 +21,8 @@ ws doctor --json       # the same report for scripts
 `ws doctor` exits 0 only when no check is `fail` or `unconfigured`. Otherwise it exits 1. A new machine exits 1 until you
 set up each role.
 
-The IDs are in two ranges. `WS0xx` checks the machine, the profile, the jobs and the gate. `WS1xx` checks the roles,
-one per role. You configure a role as a `[roles.NAME]` table in `profile.toml`.
+The IDs are in two ranges. `WS0xx` checks the machine, the profile, the jobs, the gate and the plugins. `WS1xx`
+checks the roles, one per role. You configure a role as a `[roles.NAME]` table in `profile.toml`.
 
 ## Machine checks (WS0xx)
 
@@ -36,6 +36,7 @@ one per role. You configure a role as a `[roles.NAME]` table in `profile.toml`.
 | WS006 | jobs | Every file in `$WS_HOME/jobs/` loads. `fail` names the files ws would refuse and the first error. | Fix or remove that job file. The other jobs still run. |
 | WS007 | ptrace | On Linux and WSL2, `kernel.yama.ptrace_scope` is 1 or more, so a walled child can't read its parent's memory. `warn` at 0 or when Yama is absent. `ok` elsewhere. | `echo 'kernel.yama.ptrace_scope = 1' \| sudo tee /etc/sysctl.d/10-ptrace.conf && sudo sysctl --system` |
 | WS008 | gate | Where the gate lives. With `gate = "every-session"` in `[roles.runner]`, ws's entries are in the runner's config file (`~/.claude/settings.json`, or `opencode.json` plus the plugin) and match the current policy, and the hook command still starts. `warn` when the policy changed since the last `ws install` (the line also counts the entries the current release no longer asks for, and names their places in the file), when the profile says `launch` but ws's entries are still in the file, and once for each guard that's on in the policy and the runner doesn't run, and once more (same ID, one line each) for each of your `permissions.allow` rules that a ws deny rule overrides. `fail` when ws's entries are gone, the file is gone or won't read, or the hook command no longer starts. With `gate = "launch"` it's `ok`: a session is gated when started with `ws gate launch`. | Run `ws install` to put the entries back or refresh them. `ws install --gate launch` takes ws out of the file. |
+| WS009 | plugins | The profile switches on a plugin that's still being built. `warn` names it and says it has no effect yet. There's no line when none is on. A profile like that still loads and nothing is lost. | Run `ws plugin remove NAME` to switch it off. |
 
 ## Role checks (WS1xx)
 

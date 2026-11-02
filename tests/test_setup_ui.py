@@ -19,7 +19,7 @@ from typing import ClassVar
 import pytest
 from test_install import snapshot
 
-from ws import brand, cli, install
+from ws import brand, cli, install, modules
 from ws.brand import ANSI_RE, BASIC, FULL, LOGO, LOGO_SMALL, LOGO_WIDTH, Ansi, visible_len, xterm_hex
 from ws.install import InstallError
 from ws.setup_ui import flow, inline
@@ -37,10 +37,17 @@ def box(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("WS_HOME", str(home / ".ws"))
     monkeypatch.setenv("PATH", str(bin_dir))
-    monkeypatch.setenv("TZ", "UTC")
+    monkeypatch.delenv(modules.SHOW_UNBUILT, raising=False)  # the default view: built plugins only
     monkeypatch.delenv("NO_COLOR", raising=False)
     monkeypatch.chdir(home)
     return home
+
+
+@pytest.fixture
+def unbuilt(box, monkeypatch):
+    """The developer view: plugins still being built are offered, so the choosing, region and merge rules can be walked."""
+    monkeypatch.setenv(modules.SHOW_UNBUILT, "1")
+    return box
 
 
 def fake_runner(box: Path, version: str = "2.0.0") -> None:
@@ -81,6 +88,7 @@ ALL_ENTER = ["enter"] * 4  # begin, plugins, notes, install
 
 
 @posix_only
+@pytest.mark.usefixtures("unbuilt")
 def test_a_second_setup_reports_0_changes_and_uninstall_leaves_no_residue(box, capsys):
     fake_runner(box)
     pre = snapshot(box)
@@ -132,6 +140,7 @@ def test_no_runner_found_is_said_plainly_and_nothing_breaks(box, capsys):
     assert "Runner   none yet" in plain(capsys.readouterr().out)
 
 
+@pytest.mark.usefixtures("unbuilt")
 def test_the_region_rule_is_the_real_one(box, capsys):
     nz, us = flow.gather(os.environ, region="NZ"), flow.gather(os.environ, region="US")
     assert {p.name: p.available for p in nz.plugins}["finance"] is True
@@ -149,6 +158,7 @@ def test_a_region_given_goes_into_the_profile_and_the_diff(box, capsys):
     assert 'region = "NZ"' in (box / ".ws" / "profile.toml").read_text()
 
 
+@pytest.mark.usefixtures("unbuilt")
 def test_the_preview_writes_nothing_and_counts_like_the_install(box):
     facts = flow.gather(os.environ, region="NZ")
     pre = snapshot(box)
@@ -204,24 +214,27 @@ def test_the_walk_takes_the_defaults_and_installs(box):
     code, text, _ = walk(ALL_ENTER)
     t = text
     assert code == 0
-    for word in ("ws-aitoolkit", "Machine", "Core", "Plugins", "Notes folder", "Review", "Install", "Done", "Next"):
+    for word in ("ws-aitoolkit", "Machine", "Core", "Notes folder", "Review", "Install", "Done", "Next"):
         assert word in t
     assert "\x1b[" not in t  # no colour and no cursor codes when not live
     assert (box / ".ws" / "profile.toml").is_file() and (box / "Notes" / "_inbox").is_dir()
 
 
+@pytest.mark.usefixtures("unbuilt")
 def test_the_walk_picks_a_plugin_with_the_keyboard(box):
     code, text, _ = walk(["enter", "space", "enter", "enter", "enter"])
     assert code == 0 and "Mail drafts" in text
     assert "mail-drafts = true" in (box / ".ws" / "profile.toml").read_text()
 
 
+@pytest.mark.usefixtures("unbuilt")
 def test_the_walk_will_not_choose_finance_outside_nz(box):
     keys = ["enter", "down", "down", "space", "enter", "enter", "enter"]
     walk(keys, region="US")
     assert "finance = false" in (box / ".ws" / "profile.toml").read_text()
 
 
+@pytest.mark.usefixtures("unbuilt")
 def test_the_walk_lets_the_notes_folder_be_typed_and_asks_before_making_it(box):
     keys = ["enter", "enter", "2", "enter", "y", "enter"]  # begin, plugins, "~/Notes2", confirm the new folder, install
     code, text, _ = walk(keys, live=True)
@@ -229,6 +242,7 @@ def test_the_walk_lets_the_notes_folder_be_typed_and_asks_before_making_it(box):
     assert "~/Notes2" in (box / ".ws" / "profile.toml").read_text()
 
 
+@pytest.mark.usefixtures("unbuilt")
 def test_declining_to_make_the_folder_goes_back_to_editing(box):
     pre = snapshot(box)
     code, text, _ = walk(["enter", "enter", "2", "enter", "n", "esc"], live=True)
@@ -240,11 +254,13 @@ def test_the_walk_can_go_back_from_the_review(box):
     assert code == 0 and text.count("Review") >= 1 and "Done" in text
 
 
+@pytest.mark.usefixtures("unbuilt")
 def test_the_review_lists_the_files_on_demand(box):
     code, text, _ = walk(["enter", "enter", "enter", "d", "enter"], live=True)
     assert code == 0 and "policy.toml" in text and "your policy" in text
 
 
+@pytest.mark.usefixtures("unbuilt")
 @pytest.mark.parametrize(
     "keys",
     [
@@ -296,6 +312,7 @@ def test_a_set_up_machine_opens_on_everything_is_set_up(box):
     assert facts.set_up is True
 
 
+@pytest.mark.usefixtures("unbuilt")
 def test_changing_something_on_a_set_up_machine_walks_the_steps_again(box):
     walk(ALL_ENTER)
     code, text, _ = walk(["c", "space", "enter", "enter", "enter"])  # c, plugins: pick one, notes, install
@@ -536,6 +553,7 @@ def _api(srv, path, body, **kw):
     return _call(srv, "POST", path, json.dumps(body), headers, **kw)
 
 
+@pytest.mark.usefixtures("unbuilt")
 def test_the_page_is_local_escaped_and_has_no_external_urls(box):
     facts = flow.gather(os.environ, region="NZ")
     page = render_page(facts, flow.choices_from(facts))
@@ -545,6 +563,69 @@ def test_the_page_is_local_escaped_and_has_no_external_urls(box):
     assert "<" not in boot and json.loads(boot)["plugins"][0]["name"] == "mail-drafts"
 
 
+def _unbuilt_words() -> set[str]:
+    """Every way a plugin that is not built could be named on screen: its name and its setup label, in lower case."""
+    out = set()
+    for name, m in modules.REGISTRY.items():
+        if not m.built:
+            out |= {name, flow.PLUGIN_TEXT.get(name, (name, ""))[0].lower()}
+    return out
+
+
+def test_setup_offers_only_plugins_that_are_built(box):
+    assert _unbuilt_words()
+    facts = flow.gather(os.environ, region="NZ")
+    assert facts.plugins == []
+    page = render_page(facts, flow.choices_from(facts)).lower()
+    boot = json.loads(re.search(r'id="boot">(.*?)</script>', page, re.DOTALL).group(1))
+    assert boot["plugins"] == []
+    for word in _unbuilt_words():
+        assert word not in page
+
+
+@pytest.mark.parametrize("live", [False, True])
+def test_the_walk_shows_no_plugin_that_is_not_built(box, live):
+    code, text, facts = walk(["enter", "enter", "enter"], live=live)  # begin, notes, install
+    assert code == 0 and facts.plugins == []
+    low = plain(text).lower()
+    assert "plugins" not in low.replace("none yet (ws plugin add later)", "")
+    for word in _unbuilt_words():
+        assert word not in low
+
+
+def test_an_unbuilt_plugin_is_not_a_choice_by_name(box, capsys):
+    facts = flow.gather(os.environ, region="NZ")
+    with pytest.raises(flow.ChoiceError, match="unknown plugin"):
+        flow.check_choices(facts, flow.choices_from(facts, plugins=["finance"]))
+    assert cli.main(["setup", "--yes", "--region", "NZ", "--plugin", "calendar"]) == 1
+    assert "unknown plugin" in capsys.readouterr().err
+    assert not (box / ".ws" / "profile.toml").exists()
+
+
+def test_a_profile_with_an_unbuilt_plugin_on_loads_keeps_it_and_doctor_notes_it(box, capsys, monkeypatch):
+    monkeypatch.setenv(modules.SHOW_UNBUILT, "1")
+    assert cli.main(["setup", "--yes", "--region", "NZ", "--plugin", "calendar", "--cap", "20"]) == 0
+    monkeypatch.delenv(modules.SHOW_UNBUILT)
+    capsys.readouterr()
+    facts = flow.gather(os.environ, region="NZ")
+    assert facts.plugins == [] and "calendar" in facts.base.modules
+    assert cli.main(["setup", "--yes", "--region", "NZ", "--cap", "20"]) == 0  # run again: the choice is not dropped
+    assert "calendar = true" in (box / ".ws" / "profile.toml").read_text()
+    capsys.readouterr()
+    code = cli.main(["doctor", "--offline", "--json"])
+    checks = [c for c in json.loads(capsys.readouterr().out)["data"]["checks"] if c["id"] == "WS009"]
+    assert code in (0, 1) and len(checks) == 1 and checks[0]["status"] == "warn"
+    assert "calendar" in checks[0]["detail"] and "plugin remove calendar" in checks[0]["fix"]
+
+
+def test_doctor_has_no_plugin_line_when_none_is_unbuilt_and_on(box, capsys):
+    assert cli.main(["setup", "--yes", "--region", "NZ", "--cap", "20"]) == 0
+    capsys.readouterr()
+    cli.main(["doctor", "--offline", "--json"])
+    assert not [c for c in json.loads(capsys.readouterr().out)["data"]["checks"] if c["id"] == "WS009"]
+
+
+@pytest.mark.usefixtures("unbuilt")
 def test_the_page_shows_the_real_region_rule(box):
     facts = flow.gather(os.environ, region="US")
     boot = re.search(r'id="boot">(.*?)</script>', render_page(facts, flow.choices_from(facts)), re.DOTALL).group(1)
@@ -590,6 +671,7 @@ def test_the_api_rejects_a_bad_body_and_a_refused_choice_without_writing(box):
     assert snapshot(box) == pre
 
 
+@pytest.mark.usefixtures("unbuilt")
 def test_the_preview_counts_and_writes_nothing(box):
     srv, t, _ = _start()
     pre = snapshot(box)
@@ -604,6 +686,7 @@ def test_the_preview_counts_and_writes_nothing(box):
     assert snapshot(box) == pre
 
 
+@pytest.mark.usefixtures("unbuilt")
 def test_install_calls_the_engine_then_the_server_closes(box):
     srv, t, out = _start()
     status, data = _api(srv, "/api/install", {"plugins": ["calendar"], "notes": "~/Notes"})
@@ -625,6 +708,7 @@ def test_install_calls_the_engine_then_the_server_closes(box):
     assert flow.preview(facts, flow.choices_from(facts)).headline() == "0 changes"
 
 
+@pytest.mark.usefixtures("unbuilt")
 def test_a_refused_region_is_a_400_with_the_reason(box):
     facts = flow.gather(os.environ, region="US")
     srv = SetupServer(facts, flow.choices_from(facts))
@@ -654,6 +738,7 @@ def test_setup_help_lists_every_flag(capsys):
         assert flag in out
 
 
+@pytest.mark.usefixtures("unbuilt")
 def test_errors_end_with_a_line_that_says_what_to_try(box, capsys):
     for argv, hint in (
         (["--plugin", "nope"], "ws plugin list"),
@@ -682,6 +767,7 @@ def test_the_close_says_where_the_answers_are_saved(box, capsys):
     assert "Saved in ~/.ws/profile.toml" in out and "Next" in out
 
 
+@pytest.mark.usefixtures("unbuilt")
 def test_a_plugin_already_on_is_marked_on_now(box, capsys):
     walk(["enter", "space", "enter", "enter", "enter"])
     _, text, _ = walk(["c", "enter", "enter", "enter"])
@@ -942,6 +1028,7 @@ def test_the_cap_step_is_asked_only_when_there_is_no_cap_and_skips_by_default(bo
     )
 
 
+@pytest.mark.usefixtures("unbuilt")
 def test_a_cap_typed_in_the_walk_goes_into_the_profile(box):
     keys = ["enter", "enter", "enter", "2", "0", "enter", "enter"]
     code, text, _ = walk(keys, cap=None, live=True)
@@ -949,6 +1036,7 @@ def test_a_cap_typed_in_the_walk_goes_into_the_profile(box):
     assert "US$20 a month" in plain(text)
 
 
+@pytest.mark.usefixtures("unbuilt")
 def test_a_bad_cap_is_said_plainly_and_asked_again(box):
     keys = ["enter", "enter", "enter", "0", "enter", "backspace", "5", "enter", "enter"]
     code, text, _ = walk(keys, cap=None, live=True)
@@ -985,6 +1073,7 @@ def test_the_web_takes_an_optional_cap_and_refuses_one_that_is_not_a_number(box)
     assert "Monthly cap (US$)" in page
 
 
+@pytest.mark.usefixtures("unbuilt")
 def test_setup_never_writes_dial_act(box, capsys):
     from ws import policy
 

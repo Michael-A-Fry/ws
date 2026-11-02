@@ -21,9 +21,11 @@ ESCAPED = "&lt;script&gt;alert(1)&lt;/script&gt;"
 
 # ---- the setup page is unchanged by the move ------------------------------------------------------------------------
 
-# sha256 of `render_page` for the Facts, Choices and nonce below, taken from the code as it stood before ws.ui existed.
-GOLDEN_SHA256 = "d5cdf6f87890432a4d1c5d54e354eeac184b15b376dac8ba760a4e10b6aaedd6"
-GOLDEN_LEN = 27344
+# sha256 of `render_page` for the Facts, Choices and nonce below. It was taken from the code as it stood before ws.ui
+# existed and is re-taken when the page changes on purpose (last: the Plugins step is left out when no plugin is built,
+# and a plugin's icon travels with it instead of a table in the script).
+GOLDEN_SHA256 = "3aa43bbccce9f9496490340fe898e732254c3305c00b54e6688cf4194cc38e28"
+GOLDEN_LEN = 27419
 
 
 def _fixed():

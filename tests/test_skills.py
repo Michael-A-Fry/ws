@@ -289,7 +289,8 @@ def test_deleting_only_the_skill_file_counts_as_removing_it(box, capsys):
 def test_a_plugin_command_does_not_bring_a_removed_skill_back_either(box, capsys):
     assert install(capsys, box, "--runner", "claude-code")[0] == 0
     remove_skill(box, "checkpoint")
-    assert run(capsys, "plugin", "add", "calendar")[0] == 0
+    assert run(capsys, "plugin", "remove", "notes")[0] == 0
+    assert run(capsys, "plugin", "add", "notes")[0] == 0
     assert not (box / ".claude" / "skills" / "checkpoint").exists()
 
 
@@ -319,7 +320,7 @@ def test_skills_add_never_overwrites_one_you_have_and_needs_a_runner(box, capsys
 
 
 def test_skills_add_installs_one_that_was_never_installed(box, capsys):
-    assert install(capsys, box, "--runner", "claude-code", "--module", "calendar")[0] == 0
+    assert install(capsys, box, "--runner", "claude-code")[0] == 0
     assert run(capsys, "plugin", "remove", "skills")[0] == 0
     remove_skill(box, "align")  # ws made it, so it is "removed" even with the plugin off
     assert run(capsys, "skills", "add", "align")[0] == 0

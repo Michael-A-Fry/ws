@@ -9,8 +9,9 @@ goes). The refusal has its own tests, which put the real check back.
 
 Every test also starts with `HOME` and `WS_HOME` in a folder of its own, set by a MonkeyPatch the test can't undo, so
 a test whose own `monkeypatch.undo()` drops its fixture's HOME still lands in a scratch home, not the person's. A
-tripwire then fails any test after which ws's own files in the real home changed (install manifest, profile, policy,
-Claude Code's settings.json, the skills folder).
+tripwire then fails any test after which files in the real home changed: ws's own (install manifest, profile, policy),
+the runners' config (Claude Code's settings.json and skills, OpenCode's config), git and shell startup files, and the
+entries of ~/.ssh (names, sizes and change times only; their contents are never read).
 """
 
 from __future__ import annotations
@@ -41,7 +42,17 @@ _WATCHED = (
     _REAL_HOME / ".claude" / "settings.json",
     _REAL_HOME / ".claude" / "skills",
     _REAL_HOME / ".config" / "opencode" / "opencode.json",
+    _REAL_HOME / ".gitconfig",
+    _REAL_HOME / ".config" / "git" / "config",
+    _REAL_HOME / ".bashrc",
+    _REAL_HOME / ".bash_profile",
+    _REAL_HOME / ".profile",
+    _REAL_HOME / ".zshrc",
 )
+# Folders whose entries are watched one level deep: each entry's name, size and change time, never its contents.
+_WATCHED_DIRS = (_REAL_HOME / ".ssh",)
+# Entries other programs on the machine change while tests run (ssh adds hosts, agents make sockets).
+_DIR_SKIP = ("known_hosts", "agent", "control", "cm-", "S.")
 
 
 def _real_home_stamp() -> dict[str, tuple[int, int] | None]:
@@ -53,6 +64,20 @@ def _real_home_stamp() -> dict[str, tuple[int, int] | None]:
             out[str(p)] = None
         else:
             out[str(p)] = (st.st_mtime_ns, st.st_size)
+    for d in _WATCHED_DIRS:
+        try:
+            entries = [e for e in os.scandir(d) if not e.name.startswith(_DIR_SKIP)]
+        except OSError:
+            out[str(d)] = None
+            continue
+        out[str(d)] = (len(entries), 0)
+        for e in entries:
+            try:
+                st = e.stat(follow_symlinks=False)
+            except OSError:
+                out[e.path] = None
+            else:
+                out[e.path] = (st.st_mtime_ns, st.st_size)
     return out
 
 
@@ -66,8 +91,9 @@ def _scratch_home(tmp_path_factory):
     mp.setenv("WS_HOME", str(home / ".ws"))
     yield
     mp.undo()
-    changed = [k for k, v in _real_home_stamp().items() if v != before[k]]
-    assert not changed, f"this test changed the real home's ws files: {changed}"
+    after = _real_home_stamp()
+    changed = sorted(k for k in before.keys() | after.keys() if before.get(k) != after.get(k))
+    assert not changed, f"this test changed files in the real home: {changed}"
 
 
 @pytest.fixture(autouse=True)

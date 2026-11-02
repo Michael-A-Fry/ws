@@ -622,7 +622,9 @@ def claude_via_launcher(root: Path, stub) -> subprocess.CompletedProcess:
         CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1",
         DISABLE_AUTOUPDATER="1",
     )
-    cmd = [sys.executable, "-m", "ws", "gate", "launch", "--runner", "claude-code", "--", gr.runner_bin("claude")]
+    # the launcher passes an allow-listed environment; the stub's address and fake key are named, as a person would
+    cmd = [sys.executable, "-m", "ws", "gate", "launch", "--runner", "claude-code"]
+    cmd += ["--pass-env", "ANTHROPIC_BASE_URL", "--pass-env", "ANTHROPIC_API_KEY", "--", gr.runner_bin("claude")]
     cmd += ["-p", "run the command", "--allowedTools", "Bash,Read,Write,Edit,Grep,Glob"]
     cmd += ["--model", "claude-sonnet-4-5", "--no-session-persistence", "--setting-sources", "user"]
     return gr.run(cmd, env, root / "work")

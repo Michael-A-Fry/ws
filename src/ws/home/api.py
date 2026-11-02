@@ -25,7 +25,7 @@ from ws.home.sources import FAILED, TIMEOUT, UNAVAILABLE, SourceError, _files, d
 from ws.output import WsError
 from ws.profile import ProfileError, load, profile_path, ws_home
 
-HOME_KEYS = ("lead", "opaque_paths", "sources", "open")
+HOME_KEYS = ("lead", "opaque_paths", "show_repos", "sources", "open")
 SOURCE_KEYS = ("asks_jsonl", "events_dir", "otel_dir", "claude_dir")
 OPEN_KEYS = ("session", "ask", "opaque")
 _LEAD = re.compile(r"^(cwd|name):\S.*$")
@@ -43,6 +43,7 @@ class HomeConfig:
     lead: str = ""
     opaque_paths: tuple[str, ...] = ()
     roots: tuple[str, ...] = ()  # opaque_paths as absolute paths, links followed (records.roots_of)
+    show_repos: tuple[str, ...] = ()  # repo labels an opaque record may show
     sources: Mapping[str, str] = field(default_factory=dict)
     open: Mapping[str, str] = field(default_factory=dict)
 
@@ -90,6 +91,9 @@ def load_config(environ: Mapping[str, str], home: Path) -> HomeConfig:
     paths = table.get("opaque_paths", [])
     if not isinstance(paths, list) or not all(isinstance(p, str) and p.strip() for p in paths):
         raise _bad(path, "home.opaque_paths must be a list of folders", 'e.g. opaque_paths = ["~/code/private"]')
+    shown = table.get("show_repos", [])
+    if not isinstance(shown, list) or not all(isinstance(r, str) and r.strip() for r in shown):
+        raise _bad(path, "home.show_repos must be a list of repo names", 'e.g. show_repos = ["ws"]')
     sources = _strings(table.get("sources", {}), SOURCE_KEYS, "[home.sources]", path)
     opens = _strings(table.get("open", {}), OPEN_KEYS, "[home.open]", path)
     for p in paths:
@@ -99,11 +103,20 @@ def load_config(environ: Mapping[str, str], home: Path) -> HomeConfig:
                 f"home.opaque_paths entry {p!r} isn't an absolute folder",
                 'start it with / or ~/, e.g. opaque_paths = ["~/code/private"]',
             )
+    roots_for_labels = records.roots_of([_expand(p.strip(), home) for p in paths])
+    for r in shown:
+        if "/" in r or "\\" in r or records.label_matches(r, roots_for_labels):
+            raise _bad(
+                path,
+                f"home.show_repos entry {r!r} is a path, or the name of an opaque folder",
+                "list a plain repo name that isn't under opaque_paths",
+            )
     expanded = tuple(dict.fromkeys(f for p in paths for f in (_expand(p.strip(), home), _expand(p, home))))
     return HomeConfig(
         lead=lead,
         opaque_paths=tuple(paths),
         roots=records.roots_of(expanded),
+        show_repos=tuple(r.strip() for r in shown),
         sources={k: _expand(v, home) for k, v in sources.items()},
         open=opens,
     )
@@ -296,6 +309,38 @@ def _load(env: Env, kinds: set[str]) -> Loaded:
     return out
 
 
+KEY_FILE = "home/seal-key"
+
+
+def seal_key(env: Env) -> bytes:
+    """The per-install key behind the hashes on an opaque record: 32 random bytes in `$WS_HOME/home/seal-key` (0600),
+    made on first use. Where it can't be made or read, a key for this process alone is used: the hashes then change
+    from one run to the next, which is safe and only less steady."""
+    if "seal_key" in env.cache:
+        return env.cache["seal_key"]
+    path = env.ws_home / KEY_FILE
+    key = b""
+    try:
+        key = path.read_bytes() if path.is_file() else b""
+        if len(key) != 32:
+            key = os.urandom(32)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(f"{path.name}.{os.getpid()}.new")
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(key)
+            os.replace(tmp, path)
+    except OSError:
+        key = os.urandom(32)
+    env.cache["seal_key"] = key
+    return key
+
+
+def _seal(env: Env, rec, opaque: bool):
+    """`records.seal`, with the install key fetched only when a record is opaque (an open record needs no hash)."""
+    return records.seal(rec, opaque, env.cfg.show_repos, seal_key(env) if opaque else None)
+
+
 def _finish_sessions(env: Env, loaded: Loaded) -> tuple[list[Session], dict[str, bool]]:
     """The merged sessions, sealed. Also the opaque verdict by session id (True opaque, False open); a session id not
     here is unknown, and asks and events that name one are opaque."""
@@ -310,7 +355,7 @@ def _finish_sessions(env: Env, loaded: Loaded) -> tuple[list[Session], dict[str,
         s = replace(s, state=state, host=s.host or env.host, lead=(s.runner, s.id) == lead)
         opaque = records.is_opaque(s, env.cfg.roots)
         verdict[s.id] = verdict.get(s.id, False) or opaque
-        out.append(records.seal(s, opaque))
+        out.append(_seal(env, s, opaque))
     out.sort(key=lambda s: s.last_seen or "", reverse=True)
     out.sort(key=lambda s: (s.host, _RANK.get(s.state, 3)))
     return out, verdict
@@ -325,13 +370,13 @@ def _finish_asks(env: Env, loaded: Loaded, verdict: dict[str, bool]) -> list[Ask
     seen: dict[tuple[str, str], Ask] = {}
     for a in loaded.by_kind.get("asks", []):
         seen.setdefault((a.source, a.id), a)
-    out = [records.seal(a, records.is_opaque(a, env.cfg.roots, _known(verdict, a.session_id))) for a in seen.values()]
+    out = [_seal(env, a, records.is_opaque(a, env.cfg.roots, _known(verdict, a.session_id))) for a in seen.values()]
     return sorted(out, key=lambda a: (a.created is None, a.created or ""))
 
 
 def _finish_events(env: Env, loaded: Loaded, verdict: dict[str, bool]) -> list[Event]:
     out = [
-        records.seal(e, records.is_opaque(e, env.cfg.roots, _known(verdict, e.session_id)))
+        _seal(env, e, records.is_opaque(e, env.cfg.roots, _known(verdict, e.session_id)))
         for e in loaded.by_kind.get("events", [])
         if (_files.epoch(e.ts) >= env.event_since)
     ]

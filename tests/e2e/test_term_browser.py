@@ -26,10 +26,7 @@ from ws.term.testing import FakeChild
 REQUIRE = os.environ.get("WS_E2E_REQUIRE") == "1"
 sync_api = pytest.importorskip("playwright.sync_api") if not REQUIRE else __import__("playwright.sync_api").sync_api
 
-# Browsers are found from the real home; a test's HOME is a scratch folder, so the path is fixed at import time.
-for _candidate in (Path.home() / ".cache" / "ms-playwright", Path.home() / "Library" / "Caches" / "ms-playwright"):
-    if _candidate.is_dir():
-        os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(_candidate))
+# Browsers: PLAYWRIGHT_BROWSERS_PATH if set, else Playwright's own default folder. Nothing here looks in a home folder.
 
 ESC = "\x1b"
 PROFILES = {
@@ -52,7 +49,7 @@ TESTED_ACTIONS = set(BYTE_ACTIONS) | set(OTHER_ACTIONS)
 INIT = r"""
 (() => {
   window.__sent = []; window.__csp = []; window.__clip = []; window.__notes = [];
-  window.__cliptext = ''; window.__clipdeny = false;
+  window.__cliptext = ''; window.__clipdeny = false; window.__clipreads = 0;
   const Real = window.WebSocket;
   window.WebSocket = new Proxy(Real, { construct(target, args) {
     const ws = new target(...args);
@@ -67,7 +64,7 @@ INIT = r"""
   document.addEventListener('securitypolicyviolation', (e) => window.__csp.push(e.violatedDirective + ' ' + e.blockedURI));
   Object.defineProperty(navigator, 'clipboard', { configurable: true, value: {
     writeText: async (t) => { window.__clip.push(t); },
-    readText: async () => { if (window.__clipdeny) throw new Error('denied'); return window.__cliptext; },
+    readText: async () => { window.__clipreads += 1; if (window.__clipdeny) throw new Error('denied'); return window.__cliptext; },
   } });
   window.Notification = class { static permission = 'granted'; constructor(t, o) { window.__notes.push([t, o ? o.body : null]); } };
 })();
@@ -217,6 +214,20 @@ def test_the_page_loads_connects_and_is_laid_out_for_the_screen(web, term, profi
     cols, rows = web.grid()
     assert term.child and term.session.size == (cols, rows), "the program started at the page's own size"
     assert web.page.get_attribute('meta[name="viewport"]', "content").endswith("interactive-widget=resizes-visual")
+
+
+def test_the_link_token_is_taken_out_of_the_address_bar_and_a_reconnect_still_works(web, term, ctx):
+    assert web.page.evaluate("location.search") == "" and "t=" not in web.page.evaluate("location.href")
+    other = Open(term, ctx, web.profile)
+    wait_for(lambda: web.state() == "replaced", what="the first window to be told")
+    web.press("reconnect")
+    web.page.bring_to_front()
+    wait_for(lambda: web.state() == "open", what="the reconnect with the remembered token")
+    assert web.page.evaluate("location.search") == ""
+    wait_for(lambda: other.state() == "replaced", what="the second window to be told")
+    web.page.keyboard.type("q")
+    assert web.wait_typed(b"q")
+    other.page.close()
 
 
 def test_the_page_scrolls_and_zooms_nothing(web):
@@ -573,6 +584,18 @@ def test_a_clipboard_escape_sets_the_browsers_clipboard(web, term):
     payload = base64.b64encode(b"copied by the program").decode()
     term.child.emit(f"{ESC}]52;c;{payload}\x07".encode())
     wait_for(lambda: web.page.evaluate("window.__clip") == ["copied by the program"], what="the clipboard write")
+
+
+def test_a_clipboard_read_escape_never_reaches_the_clipboard_or_the_program(web, term):
+    planted = "planted-" + base64.b32encode(os.urandom(9)).decode().lower()
+    web.page.evaluate("(v) => { window.__cliptext = v; }", planted)
+    term.child.emit(f"{ESC}]52;c;?\x07{ESC}]52;p;?\x07{ESC}]52;;?\x07".encode())
+    settle()
+    assert web.page.evaluate("window.__clipreads") == 0, "the page never read the clipboard for the program"
+    typed = term.child.typed
+    assert planted.encode() not in typed and base64.b64encode(planted.encode()) not in typed
+    web.page.keyboard.type("ok")  # the page still works, and what it sends is what the person typed
+    assert web.wait_typed(typed + b"ok")
 
 
 def test_the_bundled_terminal_honours_synchronized_output(web, term):

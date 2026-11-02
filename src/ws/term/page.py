@@ -13,6 +13,8 @@ changes. What it keeps still, and how:
 - Input is bytes. Typing, the key bar and paste go out as binary frames; Shift+Enter and Ctrl+Enter send `ESC CR`;
   the Paste button reads the clipboard (or opens a box when the browser won't) and pastes through the terminal, so
   bracketed paste markers are added when the program asked for them.
+- The link's token is read once and removed from the address bar (`history.replaceState`), so it isn't left in the
+  address bar or the history; reconnecting reuses it. A program's clipboard escape can set the clipboard but not read it.
 - A vertical touch drag becomes SGR wheel events when the program has mouse mode on (otherwise the terminal's own
   scrollback scrolls), and the wheel does the same through the terminal itself.
 
@@ -133,11 +135,18 @@ const term = new Terminal({
 });
 const fit = new FitAddon.FitAddon();
 term.loadAddon(fit);
-term.loadAddon(new ClipboardAddon.ClipboardAddon());
+// A program may set the clipboard (OSC 52 write) but never read it: a read answers with nothing.
+term.loadAddon(new ClipboardAddon.ClipboardAddon(undefined, {
+  readText: () => '',
+  writeText: (selection, text) => (selection === 'c' ? navigator.clipboard.writeText(text) : Promise.resolve()),
+}));
 term.loadAddon(new WebLinksAddon.WebLinksAddon((_e, uri) => window.open(uri, '_blank', 'noopener')));
 term.open(termEl);
 
 // ---- the socket
+// The link's token goes into a variable once and out of the address bar and history; a reconnect reuses it.
+const token = new URLSearchParams(location.search).get('t') || '';
+if (location.search) history.replaceState(null, '', location.pathname);
 let sock = null;
 let sent = { cols: 0, rows: 0 };
 let state = 'connecting';
@@ -163,7 +172,6 @@ function connect() {
   clearTimeout(retry);
   if (sock && sock.readyState < 2) return;
   const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const token = new URLSearchParams(location.search).get('t') || '';
   const s = new WebSocket(`${scheme}//${location.host}${cfg.socket}?t=${encodeURIComponent(token)}`);
   s.binaryType = 'arraybuffer';
   sock = s;

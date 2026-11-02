@@ -533,3 +533,67 @@ def test_a_dropped_ui_server_default_is_unchanged_for_the_other_pages():
         assert server.httpd.socket.getsockname()[0] == "127.0.0.1" and server.upgrade_routes == {}
     finally:
         server.httpd.server_close()
+
+
+# -- a window that vanishes without closing
+
+
+def fill_the_pipe(r: Running, conn: Conn) -> None:
+    """Print more than the connection can hold to a client that reads nothing, so the output thread is stuck writing."""
+    until(lambda: r.children)
+    chunk = b"x" * 65536
+    for _ in range(400):  # about 26 MB
+        r.children[0].emit(chunk)
+    time.sleep(0.6)
+
+
+def test_a_takeover_completes_while_the_old_window_is_not_reading(run):
+    r = run()
+    dead = r.connect()  # never reads: its end of the connection fills up
+    fill_the_pipe(r, dead)
+    started = time.monotonic()
+    new = r.connect()
+    until(lambda: r.session.client is not None and r.session.client.ws is not None and not r.session.client.ws.closed)
+    assert time.monotonic() - started < 2
+    new.send(w.BINARY, b"k")
+    until(lambda: r.children[0].typed == b"k")
+    dead.close()
+    new.close()
+
+
+def test_closing_the_session_returns_while_the_window_is_not_reading(run):
+    r = run()
+    dead = r.connect()
+    fill_the_pipe(r, dead)
+    started = time.monotonic()
+    r.session.close()
+    assert time.monotonic() - started < 2
+    dead.close()
+
+
+def test_a_window_that_answers_no_ping_is_dropped_and_the_session_is_free(run):
+    r = run(ping_seconds=0.1, pong_seconds=0.2)
+    silent = r.connect()
+    until(lambda: r.session.client is not None)
+    until(lambda: r.session.client is None, seconds=3)
+    assert r.server.hold() is False, "a dead window doesn't hold the idle stop open"
+    silent.close()
+
+
+def test_a_window_that_answers_pings_stays_attached(run):
+    r = run(ping_seconds=0.1, pong_seconds=0.2)
+    c = r.connect()
+    c.sock.settimeout(0.3)
+    pings = 0
+    end = time.monotonic() + 1.2  # four times the longest silence a window may have
+    while time.monotonic() < end:
+        try:
+            frame = c.frame()
+        except TimeoutError:
+            continue
+        if frame is not None and frame[0] == w.PING:
+            pings += 1
+            c.send(w.PONG, frame[1])
+    assert pings >= 3
+    assert r.session.client is not None and not r.session.client.ws.closed
+    c.close()

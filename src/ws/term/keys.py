@@ -1,11 +1,11 @@
 """The keys a phone has no key for: the bytes each key-bar control sends, and the browser-side key rules.
 
 `KEYBAR` is the one table. Each row is a control the page draws, its `data-action`, its label and the bytes it sends,
-as the text the browser puts on the wire. A row with `bytes: None` isn't a byte sender: `ctrl` is the sticky modifier
-(the next letter becomes `letter & 0x1f`) and `paste` reads the clipboard. The page takes the table as JSON, so the
-buttons, the tests and the bytes can't drift apart. `SHIFT_ENTER` is what Shift+Enter and Ctrl+Enter send from a
-keyboard too: browsers send a plain carriage return for both, which submits, so a newline in a prompt needs `ESC CR`
-(it works without any extended-keys support and through tmux).
+as the text the browser puts on the wire; the arrows run left, right, up, down. A row with `bytes: None` isn't a byte
+sender: `ctrl` is the sticky modifier (the next letter becomes `letter & 0x1f`) and `paste` reads the clipboard. The
+page takes the table as JSON, so the buttons, the tests and the bytes can't drift apart. `SHIFT_ENTER` is what
+Shift+Enter and Ctrl+Enter send from a keyboard too: browsers send a plain carriage return for both, which submits, so
+a newline in a prompt needs `ESC CR` (it works without any extended-keys support and through tmux).
 """
 
 from __future__ import annotations
@@ -21,10 +21,10 @@ KEYBAR: tuple[dict[str, str | None], ...] = (
     {"action": "tab", "label": "Tab", "title": "Tab", "bytes": "\t"},
     {"action": "shift-tab", "label": "⇤", "title": "Shift+Tab", "bytes": f"{ESC}[Z"},
     {"action": "ctrl", "label": "Ctrl", "title": "Control, applies to the next key", "bytes": None},
+    {"action": "left", "label": "←", "title": "Arrow left", "bytes": f"{ESC}[D"},
+    {"action": "right", "label": "→", "title": "Arrow right", "bytes": f"{ESC}[C"},
     {"action": "up", "label": "↑", "title": "Arrow up", "bytes": f"{ESC}[A"},
     {"action": "down", "label": "↓", "title": "Arrow down", "bytes": f"{ESC}[B"},
-    {"action": "right", "label": "→", "title": "Arrow right", "bytes": f"{ESC}[C"},
-    {"action": "left", "label": "←", "title": "Arrow left", "bytes": f"{ESC}[D"},
     {"action": "slash", "label": "/", "title": "Slash", "bytes": "/"},
     {"action": "shift-enter", "label": "↵", "title": "New line (Shift+Enter)", "bytes": SHIFT_ENTER},
     {"action": "ctrl-c", "label": "^C", "title": "Interrupt (Ctrl+C)", "bytes": "\x03"},

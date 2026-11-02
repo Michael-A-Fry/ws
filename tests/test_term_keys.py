@@ -76,3 +76,9 @@ def test_the_page_gets_the_ctrl_punctuation_from_the_same_table():
     cfg = json.loads(re.search(r'id="cfg">(.*?)</script>', html, re.DOTALL).group(1))
     assert cfg["ctrl_punct"] == keys.CTRL_PUNCT and cfg["shift_enter"] == keys.SHIFT_ENTER
     assert cfg["keybar"] == keys.keybar_json()
+
+
+def test_the_arrows_run_left_right_up_down():
+    arrows = [r["label"] for r in keys.KEYBAR if r["action"] in ("left", "right", "up", "down")]
+    assert arrows == ["←", "→", "↑", "↓"]
+    assert [r["action"] for r in keys.KEYBAR if r["label"] in arrows] == ["left", "right", "up", "down"]

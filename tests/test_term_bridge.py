@@ -428,3 +428,149 @@ def test_the_first_window_gets_no_replay():
     a = Browser()
     session.attach(a, 80, 24)
     assert a.received == b""
+
+
+# -- a window that has gone without closing
+
+
+def stuck_client():
+    """A real `WebClient` whose connection is dead: the first write waits until the connection is cut."""
+    import io
+
+    from ws.term import app
+    from ws.term import websocket as w
+
+    entered, cut = threading.Event(), threading.Event()
+
+    class Wire:
+        def write(self, data):
+            entered.set()
+            cut.wait(10)
+            raise BrokenPipeError("cut")
+
+        def flush(self):
+            pass
+
+    return app.WebClient(w.WebSocket(io.BytesIO(), Wire(), abort=cut.set)), entered
+
+
+def test_a_takeover_completes_while_the_old_window_is_stuck_on_a_dead_connection():
+    session, children, _ = make()
+    old, entered = stuck_client()
+    session.attach(old, 80, 24)
+    children[0].emit(b"output the dead window will never take")
+    assert entered.wait(3), "the output thread is stuck writing to the old window"
+    new = Browser()
+    started = time.monotonic()
+    assert session.attach(new, 100, 30)
+    assert time.monotonic() - started < 2
+    assert session.client is new and old.ws.closed
+    children[0].emit(b"after")
+    until(lambda: b"after" in new.received)
+    assert session.write(new, b"k") and children[0].typed == b"k"
+    session.close()
+
+
+def test_closing_the_session_returns_while_the_window_is_stuck_on_a_dead_connection():
+    session, children, _ = make()
+    old, entered = stuck_client()
+    session.attach(old, 80, 24)
+    children[0].emit(b"output")
+    assert entered.wait(3)
+    started = time.monotonic()
+    session.close()
+    assert time.monotonic() - started < 2
+    assert children[0].closed
+
+
+def test_the_old_window_is_closed_outside_the_session_lock():
+    session, _, _ = make()
+    seen = []
+
+    class Old(Browser):
+        def close(self, code, reason):
+            # another thread can take the session lock while this close runs
+            t = threading.Thread(target=lambda: (session.detach(self), seen.append("free")), daemon=True)
+            t.start()
+            t.join(1)
+            super().close(code, reason)
+
+    old = Old()
+    session.attach(old, 80, 24)
+    session.attach(Browser(), 80, 24)
+    assert seen == ["free"] and old.closed == (bridge.CLOSE_REPLACED, "another window took this session over")
+
+
+# -- closing a real pty: stop the program, stop the reader, then close the descriptor
+
+
+class FakeProc:
+    pid = 4242
+
+    def __init__(self, events):
+        self.events = events
+
+    def wait(self, timeout=None):
+        self.events.append("wait")
+        return 0
+
+    def poll(self):
+        return 0
+
+
+def test_the_pty_is_closed_after_the_program_is_signalled_and_the_reader_has_left(monkeypatch):
+    import select
+
+    events: list[str] = []
+    r, w = os.pipe()  # stands in for the pty: nothing is ever written, so a read waits
+    real_close, real_select = os.close, select.select
+
+    def killpg(pgid, sig):
+        events.append("signal")
+
+    def close(fd):
+        if fd == r:
+            events.append("close")
+        real_close(fd)
+
+    def select_(rl, wl, xl, *a):
+        out = real_select(rl, wl, xl, *a)
+        events.append("reader-woken")
+        return out
+
+    monkeypatch.setattr(os, "killpg", killpg)
+    monkeypatch.setattr(os, "close", close)
+    monkeypatch.setattr(select, "select", select_)
+    child = bridge.PtyChild(FakeProc(events), r)
+    got = []
+    reader = threading.Thread(target=lambda: got.append(child.read()), daemon=True)
+    reader.start()
+    time.sleep(0.2)  # the reader is waiting in select
+    child.close()
+    reader.join(3)
+    assert not reader.is_alive() and got == [b""]
+    assert events == ["signal", "wait", "reader-woken", "close"]
+    real_close(w)
+
+
+def test_a_read_after_close_returns_nothing_without_touching_the_descriptor(monkeypatch):
+    r, w = os.pipe()
+    monkeypatch.setattr(os, "killpg", lambda *a: None)
+    child = bridge.PtyChild(FakeProc([]), r)
+    child.close()
+    child.close()  # twice is fine
+    assert child.read() == b""
+    os.close(w)
+
+
+@posix
+def test_a_session_on_a_real_pty_closes_while_the_output_thread_is_reading(sane_env):
+    session = bridge.Session(lambda cols, rows: bridge.open_pty(["/bin/sh", "-c", "sleep 30"], sane_env, cols, rows))
+    session.attach(Browser(), 80, 24)
+    child = session._child
+    time.sleep(0.2)
+    started = time.monotonic()
+    session.close()
+    assert time.monotonic() - started < 5
+    until(lambda: not session._pump.is_alive())
+    assert child.proc.poll() is not None

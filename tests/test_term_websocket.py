@@ -5,6 +5,8 @@ from __future__ import annotations
 import base64
 import io
 import struct
+import threading
+import time
 
 import pytest
 
@@ -236,3 +238,103 @@ def test_close_on_a_dead_connection_doesnt_raise():
     ws = w.WebSocket(io.BytesIO(), Dead())
     ws.close()
     assert ws.closed
+
+
+# -- a peer that has gone without closing
+
+
+class StuckWire:
+    """A write side whose write waits, as a socket does when the peer has gone and its buffers are full, until the
+    connection is cut (`cut`), when the write fails."""
+
+    def __init__(self):
+        self.entered, self.cut = threading.Event(), threading.Event()
+
+    def write(self, data: bytes) -> int:
+        self.entered.set()
+        self.cut.wait(10)
+        raise BrokenPipeError("cut")
+
+    def flush(self) -> None:
+        pass
+
+
+def stuck_socket() -> tuple[w.WebSocket, StuckWire, threading.Thread, list[BaseException]]:
+    wire = StuckWire()
+    ws = w.WebSocket(io.BytesIO(), wire, abort=wire.cut.set)
+    errors: list[BaseException] = []
+
+    def writer():
+        try:
+            ws.send_binary(b"output")
+        except OSError as e:
+            errors.append(e)
+
+    t = threading.Thread(target=writer, daemon=True)
+    t.start()
+    assert wire.entered.wait(2), "the write never started"
+    return ws, wire, t, errors
+
+
+def test_close_does_not_wait_for_a_write_that_is_stuck_on_a_peer_that_has_gone():
+    ws, wire, t, errors = stuck_socket()
+    started = time.monotonic()
+    ws.close(w.CLOSE_GOING_AWAY, "bye")
+    assert time.monotonic() - started < 1.5
+    assert ws.closed and wire.cut.is_set(), "the connection was cut"
+    t.join(2)
+    assert not t.is_alive() and len(errors) == 1, "the stuck write failed instead of hanging"
+
+
+def test_a_write_that_fails_cuts_the_connection_and_closes_the_socket():
+    class Broken:
+        def write(self, data):
+            raise ConnectionResetError("gone")
+
+    cut = []
+    ws = w.WebSocket(io.BytesIO(), Broken(), abort=lambda: cut.append(1))
+    with pytest.raises(OSError):
+        ws.send_text("x")
+    assert ws.closed and cut == [1]
+    with pytest.raises(OSError):
+        ws.send_text("again")
+
+
+def test_close_on_a_connection_that_is_already_cut_returns_at_once():
+    ws, _wire, t, _ = stuck_socket()
+    ws.abort()
+    started = time.monotonic()
+    ws.close()
+    assert time.monotonic() - started < 0.2
+    t.join(2)
+
+
+def test_a_ping_is_skipped_while_a_write_is_in_progress_and_sent_otherwise():
+    ws, _wire, t, _ = stuck_socket()
+    started = time.monotonic()
+    assert ws.ping() is False
+    assert time.monotonic() - started < 0.2, "a ping never waits behind a stuck write"
+    ws.abort()
+    t.join(2)
+    quiet, out = socket_for()
+    assert quiet.ping(b"hi") is True
+    assert written_frames(out.getvalue()) == [(w.PING, b"hi")]
+
+
+def test_last_heard_moves_forward_with_every_frame_the_peer_sends():
+    ws, _ = socket_for(client(w.PONG, b""), client(w.TEXT, b"x"))
+    first = ws.last_heard
+    time.sleep(0.02)
+    assert ws.recv() == (w.TEXT, b"x")
+    assert ws.last_heard > first
+
+
+def test_a_write_to_a_connection_whose_file_has_closed_is_a_broken_pipe_and_cuts_the_connection():
+    wire = io.BytesIO()
+    cut = []
+    ws = w.WebSocket(io.BytesIO(), wire, abort=lambda: cut.append(1))
+    wire.close()
+    with pytest.raises(BrokenPipeError):
+        ws.send_binary(b"late output")
+    assert ws.closed and cut == [1]
+    ws.close()  # and closing it afterwards is quiet

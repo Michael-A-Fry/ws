@@ -4,7 +4,10 @@ The server end only. `check_handshake` validates a client's upgrade request and 
 reads and writes frames over a pair of file objects. A client frame must be masked, a reserved bit, an unknown opcode, a
 fragmented control frame, a bad close code or text that isn't UTF-8 is a protocol error, and a message over
 `max_message` bytes is refused before it is read, so one client can't make the server buffer without limit. Writes are
-locked, so the output thread and the reader can both send.
+locked, so the output thread and the reader can both send. A client that has gone without closing can leave a write
+waiting for ever, so a caller that can drop the connection passes `abort`: `close` calls it, rather than wait for the
+write lock, when the lock isn't free within `CLOSE_WAIT`, and so does a write that fails. `last_heard` is when the peer
+last sent a frame, for a caller that pings and drops a peer that stays silent.
 """
 
 from __future__ import annotations
@@ -15,7 +18,8 @@ import hashlib
 import os
 import struct
 import threading
-from collections.abc import Mapping
+import time
+from collections.abc import Callable, Mapping
 from typing import BinaryIO
 
 __all__ = [
@@ -37,6 +41,7 @@ GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 CONT, TEXT, BINARY, CLOSE, PING, PONG = 0x0, 0x1, 0x2, 0x8, 0x9, 0xA
 CLOSE_NORMAL, CLOSE_GOING_AWAY, CLOSE_PROTOCOL, CLOSE_BAD_DATA, CLOSE_TOO_BIG = 1000, 1001, 1002, 1007, 1009
 MAX_MESSAGE = 4 * 1024 * 1024
+CLOSE_WAIT = 0.25  # seconds `close` waits for a write in progress before it drops the connection instead
 # Close codes a peer may send: the registered ones except the three that mean "no status was sent", plus 3000-4999.
 _BAD_CODES = {1004, 1005, 1006, 1015}
 
@@ -106,21 +111,52 @@ class WebSocket:
     """Frames over `rfile` and `wfile`. `recv()` returns `(opcode, payload)` for a text or binary message, or None once
     the connection is closed (the peer's close frame is answered)."""
 
-    def __init__(self, rfile: BinaryIO, wfile: BinaryIO, *, max_message: int = MAX_MESSAGE):
+    def __init__(
+        self,
+        rfile: BinaryIO,
+        wfile: BinaryIO,
+        *,
+        max_message: int = MAX_MESSAGE,
+        abort: Callable[[], None] | None = None,
+    ):
         self.rfile, self.wfile, self.max_message = rfile, wfile, max_message
+        self._abort = abort
         self._lock = threading.Lock()
         self.closed = False
         self.close_code: int | None = None
+        self.last_heard = time.monotonic()
+
+    def abort(self) -> None:
+        """Drop the connection now, without a close frame: whatever is blocked on it fails."""
+        self.closed = True
+        if self._abort:
+            try:
+                self._abort()
+            except OSError:
+                pass
 
     # -- writing
-    def _write(self, data: bytes) -> None:
-        with self._lock:
+    def _write(self, data: bytes, *, wait: bool = True) -> bool:
+        """Write one frame. With `wait=False`, give up (False) if another write is in progress."""
+        if not self._lock.acquire(blocking=wait):
+            return False
+        try:
             if self.closed:
                 raise BrokenPipeError("the WebSocket is closed")
-            self.wfile.write(data)
-            flush = getattr(self.wfile, "flush", None)
-            if flush:
-                flush()
+            try:
+                self.wfile.write(data)
+                flush = getattr(self.wfile, "flush", None)
+                if flush:
+                    flush()
+            except OSError:
+                self.abort()  # a write that fails part-way leaves the stream unusable
+                raise
+            except ValueError as e:  # the connection's file has been closed under us
+                self.abort()
+                raise BrokenPipeError("the connection has closed") from e
+        finally:
+            self._lock.release()
+        return True
 
     def send_text(self, text: str) -> None:
         self._write(encode_frame(TEXT, text.encode("utf-8")))
@@ -128,12 +164,16 @@ class WebSocket:
     def send_binary(self, data: bytes) -> None:
         self._write(encode_frame(BINARY, data))
 
-    def ping(self, data: bytes = b"") -> None:
-        self._write(encode_frame(PING, data[:125]))
+    def ping(self, data: bytes = b"") -> bool:
+        """Send a ping, unless a write is already in progress (False): a peer that isn't reading is found by silence."""
+        return self._write(encode_frame(PING, data[:125]), wait=False)
 
     def close(self, code: int = CLOSE_NORMAL, reason: str = "") -> None:
         """Send a close frame once, then refuse further writes. Safe to call twice and after the peer has gone."""
-        with self._lock:
+        if not self._lock.acquire(timeout=CLOSE_WAIT):
+            self.abort()  # a write is stuck on a peer that has gone: cut the connection so it fails
+            return
+        try:
             if self.closed:
                 return
             self.closed = True
@@ -142,8 +182,10 @@ class WebSocket:
                 flush = getattr(self.wfile, "flush", None)
                 if flush:
                     flush()
-            except OSError:
-                pass
+            except (OSError, ValueError):
+                self.abort()
+        finally:
+            self._lock.release()
 
     # -- reading
     def _read(self, n: int) -> bytes:
@@ -171,7 +213,9 @@ class WebSocket:
         if n > self.max_message:
             raise ProtocolError(CLOSE_TOO_BIG, "frame too big")
         key = self._read(4)
-        return fin, opcode, _unmask(self._read(n), key)
+        payload = _unmask(self._read(n), key)
+        self.last_heard = time.monotonic()
+        return fin, opcode, payload
 
     def recv(self) -> tuple[int, bytes] | None:
         kind: int | None = None

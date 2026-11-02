@@ -19,34 +19,38 @@ from ws.term import tmux as tmux_mod
 from ws.term.app import build_server
 from ws.term.bridge import Session, child_env, open_pty
 
-__all__ = ["SYNC_ENV", "bind_address", "register"]
+__all__ = ["SYNC_ENV", "bind_address", "bind_warning", "register"]
 
 LOOPBACK = "127.0.0.1"
 # The environment a full-screen program reads to turn on synchronized output (DECSET 2026), which the page's terminal
-# honours. Left unset inside tmux, where programs never use it anyway.
+# honours. Left unset inside tmux, where programs never use it anyway. Other programs ignore it; `--no-sync-output`
+# leaves it out.
 SYNC_ENV = {"CLAUDE_CODE_FORCE_SYNC_OUTPUT": "1"}
 
 
 def bind_address(text: str | None) -> str:
-    """The address to listen on: loopback unless a specific IPv4 address is named. A wildcard is refused."""
+    """The address to listen on: loopback unless a specific IPv4 address is named. A wildcard is refused (exit 2)."""
     if text is None:
         return LOOPBACK
+    hint = "name the address of one network interface, or leave --bind out to listen on loopback only"
     try:
         addr = ipaddress.ip_address(text.strip())
     except ValueError:
-        raise WsError(
-            "bad_bind", f"--bind {text!r} isn't an IPv4 address", "name the address of one network interface"
-        ) from None
+        raise WsError("usage", f"--bind {text!r} isn't an IPv4 address", hint, 2) from None
     if addr.version != 4:
-        raise WsError("bad_bind", "--bind takes an IPv4 address", "name the address of one network interface")
+        raise WsError("usage", "--bind takes an IPv4 address", hint, 2)
     if addr.is_unspecified:
-        raise WsError(
-            "bad_bind",
-            "--bind won't listen on every interface",
-            "name the address of the one interface to use, or leave --bind out to listen on loopback only",
-            2,
-        )
+        raise WsError("usage", "--bind won't listen on every interface", hint, 2)
     return str(addr)
+
+
+def bind_warning(bind: str) -> str | None:
+    """The line printed when the server listens beyond this machine; None on loopback."""
+    if bind == LOOPBACK:
+        return None
+    return (
+        f"listening on {bind}, not just this machine: anyone who can reach it and has the link can run commands as you"
+    )
 
 
 def _program(args: argparse.Namespace) -> list[str]:
@@ -76,12 +80,7 @@ def cmd_term(args: argparse.Namespace) -> int:
     if sys.platform == "win32":
         raise WsError("unsupported", "ws term needs a POSIX system", "run it inside WSL2", 1)
     bind = bind_address(args.bind)
-    warnings = []
-    if bind != LOOPBACK:
-        warnings.append(
-            f"listening on {bind}, not just this machine: anyone who can reach it and has the link can run commands "
-            "as you"
-        )
+    warnings = [w for w in (bind_warning(bind),) if w]
     if args.tmux and args.command:
         raise WsError("usage", "--tmux and a command after -- can't be combined", "pick one", 2)
     tm = None
@@ -164,7 +163,10 @@ def register(sub) -> None:
     p.add_argument(
         "--tmux-server-options",
         action="store_true",
-        help="with --tmux: also set escape-time and extended-keys (they belong to the whole tmux server)",
+        help=(
+            "with --tmux: also set escape-time and extended-keys; these change the tmux server for every session "
+            "on it, not just this one (off by default)"
+        ),
     )
     p.add_argument(
         "--env", action="append", default=[], metavar="NAME=VALUE", help="add a variable to the session's environment"
@@ -172,7 +174,7 @@ def register(sub) -> None:
     p.add_argument(
         "--no-sync-output",
         action="store_true",
-        help="don't set the variable that asks programs for synchronized output",
+        help="don't set the variable that asks programs for synchronized output (other programs ignore it)",
     )
     p.add_argument(
         "--idle-minutes",

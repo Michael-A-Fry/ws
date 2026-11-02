@@ -45,18 +45,27 @@ launched `ws term` is removed, because the session isn't inside that tmux.
 - **Scrolling.** A mouse wheel, and a vertical touch drag, become wheel events for the program when it has mouse mode
   on. Without mouse mode the terminal's own scrollback applies.
 - **Notifications and the clipboard.** A program's notification escapes (OSC 9 and OSC 777) become browser
-  notifications once the browser allows them, and its clipboard escape (OSC 52) sets your clipboard.
-- **When the connection drops** the page reconnects by itself, and the program redraws. When the program exits, the
+  notifications once the browser allows them, and its clipboard escape (OSC 52) sets your clipboard. Clipboard reads
+  are off: a program that asks for your clipboard gets an empty answer.
+- **When the connection drops** the page reconnects by itself, and the program redraws. The page also takes the link's
+  token out of the address bar once it loads, so it isn't left in the address bar or the history; to open the page
+  again use the link `ws term` printed. When the program exits, the
   page says so and puts the terminal back to its normal screen.
 - **Synchronized output.** The bundled terminal supports it (DECSET 2026), and ws sets the environment variable a
   program reads to turn it on (`CLAUDE_CODE_FORCE_SYNC_OUTPUT=1`) unless the session is in tmux, where programs don't
-  use it. Turn it off with `--no-sync-output`. Nothing depends on it.
+  use it. Outside tmux, `ws term` sets that variable in the session's environment; other programs ignore it. Turn it
+  off with `--no-sync-output`. Nothing depends on it.
 
 ## One window at a time
 
 The session has one owner, so two windows never fight over the size. A second window that connects takes the session
 over: the first shows "Another window took this session over" and a Reconnect button, which takes it back. The program
 keeps running between windows, and the new window triggers a redraw.
+
+ws term pings the open window every 20 seconds and drops it once it has been silent for more than 40 (checked at
+each ping). A window that has vanished
+(a closed laptop, a lost network) therefore doesn't block a new window from taking over, doesn't make Ctrl-C wait, and
+doesn't keep the idle stop from running.
 
 ## tmux
 
@@ -74,7 +83,8 @@ If the session already exists, ws attaches to it without changing any of its opt
 size policy then applies: by default tmux follows the client that typed last.
 
 `escape-time 10` (so Esc arrives at once) and `extended-keys on` belong to the whole tmux server, so ws sets them only
-when you add `--tmux-server-options`.
+when you add `--tmux-server-options`. That changes the tmux server for every session on it, not just this one, and
+stays changed after `ws term` exits. Leave it out if you share the server with other work.
 
 ## Reach it from another device
 

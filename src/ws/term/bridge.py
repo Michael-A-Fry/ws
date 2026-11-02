@@ -124,12 +124,25 @@ class PtyChild:
     def __init__(self, proc: subprocess.Popen, fd: int):
         self.proc, self.fd = proc, fd
         self._closed = False
+        self._wake_r, self._wake_w = os.pipe()  # close() writes here to take the reader out of its wait
+        self._reading = threading.Lock()  # held by `read` while it is using `fd`
 
     def read(self) -> bytes:
-        try:
-            return os.read(self.fd, 65536)
-        except OSError:  # EIO on Linux: the other end of the pty has closed
-            return b""
+        import select
+
+        with self._reading:
+            if self._closed:
+                return b""
+            try:
+                try:
+                    ready = select.select([self.fd, self._wake_r], [], [])[0]
+                except ValueError:  # a descriptor too large for select: read without the wake-up
+                    ready = [self.fd]
+                if self._wake_r in ready:
+                    return b""
+                return os.read(self.fd, 65536)
+            except OSError:  # EIO on Linux: the other end of the pty has closed
+                return b""
 
     def write(self, data: bytes) -> None:
         view = memoryview(data)
@@ -151,11 +164,11 @@ class PtyChild:
         return self.proc.wait()
 
     def close(self) -> None:
+        """Stop the program, then the reader, and only then close the pty: the descriptor is never closed under a
+        thread that is reading it (it could be reused by then)."""
         if self._closed:
             return
         self._closed = True
-        with contextlib.suppress(OSError):
-            os.close(self.fd)
         with contextlib.suppress(OSError):
             os.killpg(self.proc.pid, signal.SIGHUP)
         try:
@@ -164,6 +177,17 @@ class PtyChild:
             with contextlib.suppress(OSError):
                 os.killpg(self.proc.pid, signal.SIGKILL)
             self.proc.wait()
+        with contextlib.suppress(OSError):
+            os.write(self._wake_w, b"x")
+        if self._reading.acquire(timeout=2):  # the reader has left; if it hasn't, leak the descriptor, don't race it
+            try:
+                with contextlib.suppress(OSError):
+                    os.close(self.fd)
+                for end in (self._wake_r, self._wake_w):
+                    with contextlib.suppress(OSError):
+                        os.close(end)
+            finally:
+                self._reading.release()
 
 
 def open_pty(argv: Sequence[str], env: Mapping[str, str], cols: int, rows: int, cwd: str | None = None) -> PtyChild:
@@ -226,9 +250,6 @@ class Session:
             return False
         with self._lock:
             old, self._client = self._client, client
-            if old is not None and old is not client:
-                with contextlib.suppress(OSError):
-                    old.close(CLOSE_REPLACED, "another window took this session over")
             if self._child is None and self.exit_code is None:
                 self._child = self._spawn(cols, rows)
                 self._size = (cols, rows)
@@ -240,6 +261,9 @@ class Session:
                     self._child.winch()  # same size: a signal is the only way to get the program to redraw
             else:
                 self._tell(client, {"type": "exit", "code": self.exit_code})
+        if old is not None and old is not client:  # outside the lock: closing a client that has gone can take a moment
+            with contextlib.suppress(OSError):
+                old.close(CLOSE_REPLACED, "another window took this session over")
         return True
 
     def _restore_modes(self, client: Client) -> None:

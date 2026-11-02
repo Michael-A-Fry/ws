@@ -98,10 +98,11 @@ The default list, which `ws gate init` writes:
   `/boot`, `/dev`, `/etc`, `/lib`, `/lib64`, `/proc`, `/root`, `/sbin`, `/sys`, `/usr`, `/var`, `/opt`, `/srv`, `/mnt`,
   `/media`, `/run`, `/snap`, `/System`, `/Library`, `/Volumes`, `/Applications` and `/private`. Written as
   `rm -* PATH`. A longer name such as `/variant` isn't covered. `/mnt`, `/media`, `/Volumes` and `/run` are denied at one
-  level only: `rm -rf /mnt/data` is denied and `rm -rf /mnt/data/scratch/build` is ordinary work. The macOS temp
-  folders `/private/var/folders` and `/private/tmp` are ordinary work too. A recursive delete of one person's whole home
-  folder (`/home/NAME`, `/Users/NAME`) is also denied, and a folder further down is ordinary work. `find` with `-delete`
-  or `-exec rm` is judged by the folder it starts from, by the same rules.
+  level only: `rm -rf /mnt/data` is denied and `rm -rf /mnt/data/scratch/build` is ordinary work. The temp
+  folders `/private/var/folders`, `/private/tmp`, `/var/folders` and `/var/tmp` are ordinary work below the folder,
+  and the folder itself is kept. A recursive delete of one person's whole home folder (`/home/NAME`, `/Users/NAME`) is
+  also denied, and a folder further down is ordinary work. `find` with `-delete` or `-exec rm` is judged by the folder
+  it starts from, by the same rules.
 - A forcing push in any spelling: `git push*--force*`, `git push* -f*`, and both with git's global options.
 - `mkfs*` and `dd*of=/dev/*`.
 - Printing the process environment: `env` with no command after it (`env -i`, `env A=b`) and `printenv*`. `env A=b cmd`,
@@ -116,7 +117,9 @@ The default list, which `ws gate init` writes:
   when it's on and `remote.NAME.push` when its refspec starts with `+` or `:`. Reading a key stays allowed.
 - `git config --edit` and `git remote add --mirror`.
 - The environment names `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, `GIT_CONFIG_COUNT`, `GIT_SSH_COMMAND`, `GIT_SSH`,
-  `GIT_EXTERNAL_DIFF`, `GIT_PAGER`, `GIT_ASKPASS` and `GIT_PROXY_COMMAND`, set on any command line.
+  `GIT_EXTERNAL_DIFF`, `GIT_PAGER`, `GIT_EDITOR`, `GIT_SEQUENCE_EDITOR`, `GIT_ASKPASS` and `GIT_PROXY_COMMAND`, set on
+  any command line. A pager (`GIT_PAGER`, `core.pager`, `pager.*`) may be empty, `cat`, `less` or `more`, and an editor
+  (`GIT_EDITOR`, `GIT_SEQUENCE_EDITOR`, `core.editor`, `sequence.editor`) may be `true` or `:`.
 - A shell write to a git config file (`>> .git/config`, `tee -a ~/.gitconfig`, `sed -i` on one), because it can add an
   `[alias]` section. Use `git config` for a setting that names no program.
 - A shell that reads its script from standard input: `sh`, `sh -s*` and `sh -`, and the same three for `bash`, `zsh` and

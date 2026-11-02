@@ -1128,7 +1128,7 @@ PROBE_DENIED = [
     "command RM -rf /",
     "builtin RM -rf /",
     "exec RM -rf /",
-    "RM -rf /var/tmp/x",
+    "RM -rf /var/lib/x",
     "RM -rf /opt/x",
 ]
 PROBE_ALLOWED = [

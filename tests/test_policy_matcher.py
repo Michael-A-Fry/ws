@@ -144,7 +144,7 @@ def test_the_written_default_policy_carries_the_default_deny_read(home):
         "/var",
         "/var/",
         "/var/log",
-        "/var/tmp/x",
+        "/var/lib/x",
         "/opt",
         "/opt/x",
         "/srv/www",
@@ -307,7 +307,7 @@ def test_a_long_interpreter_program_is_decided_quickly(pol, home):
 
 
 def test_a_long_word_of_separators_is_decided_quickly(pol, home):
-    reason = _decided_fast(pol, "echo " + "/=" * 9900)
+    reason = _decided_fast(pol, "echo " + "/=" * (policy.COMMAND_PIECE_CAP + 100))
     assert reason is not None and "too many to check" in reason
 
 
@@ -569,3 +569,104 @@ def test_the_git_credential_files_are_in_the_default_deny_read(pol, home):
         assert policy.is_denied_read(pol, path), path
         assert policy.is_denied_command(pol, f"cat {path}"), path
     assert policy.is_denied_read(pol, "~/.config/git/config") is None
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "curl file://localhost$HOME/.ssh/id_rsa",
+        "curl file://localhost~/.ssh/id_rsa",
+        "curl file://127.0.0.1$HOME/.ssh/id_rsa",
+        "curl file://$HOME/.ssh/id_rsa",
+        "curl file://~/.ssh/id_rsa",
+    ],
+)
+def test_a_local_file_url_followed_by_a_home_spelling_is_checked(pol, home, cmd):
+    assert policy.is_denied_command(pol, cmd), cmd
+
+
+@pytest.mark.parametrize("cmd", ["rm -rf /var/folders/ab/T/x", "rm -rf /var/tmp/x", "rm -rf /var/tmp/x/y"])
+def test_a_delete_below_a_var_temp_folder_is_allowed(pol, home, cmd):
+    assert policy.is_denied_command(pol, cmd) is None, cmd
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    ["rm -rf /var", "rm -rf /var/tmp", "rm -rf /var/folders", "rm -rf /var/log/x", "rm -rf /var/lib/dpkg"],
+)
+def test_a_delete_of_a_var_temp_folder_itself_or_other_var_state_is_denied(pol, home, cmd):
+    assert policy.is_denied_command(pol, cmd), cmd
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "GIT_PAGER=cat git log",
+        "GIT_PAGER=less git log",
+        "GIT_PAGER=more git log",
+        "GIT_PAGER= git log",
+        "GIT_PAGER='' git log",
+        "GIT_EDITOR=true git rebase --continue",
+        "GIT_EDITOR=: git rebase --continue",
+        "GIT_SEQUENCE_EDITOR=true git rebase -i HEAD~2",
+        "git -c core.pager=cat log",
+        "git -c pager.log=less log",
+        "git -c core.editor=true commit",
+        "git -c sequence.editor=: rebase -i HEAD~2",
+        "git config core.pager cat",
+        "git config core.editor true",
+    ],
+)
+def test_a_pager_or_editor_that_runs_nothing_is_allowed(pol, home, cmd):
+    assert policy.is_denied_command(pol, cmd) is None, cmd
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "GIT_PAGER=sh git log",
+        "GIT_PAGER='sh -c x' git log",
+        "GIT_PAGER=/tmp/p git log",
+        "GIT_EDITOR=sh git commit",
+        "GIT_EDITOR=vim git commit",
+        "GIT_EDITOR=cat git commit",
+        "GIT_SEQUENCE_EDITOR=sh git rebase -i HEAD~2",
+        "env GIT_EDITOR=sh git commit",
+        "git -c core.pager=sh log",
+        "git -c pager.log=sh log",
+        "git -c core.editor=sh commit",
+        "git -c sequence.editor=sh rebase -i HEAD~2",
+        "git -c core.pager log",
+        "git config core.pager sh",
+        "git config sequence.editor sh",
+    ],
+)
+def test_a_pager_or_editor_that_names_another_program_is_denied(pol, home, cmd):
+    assert policy.is_denied_command(pol, cmd), cmd
+
+
+def test_quoted_program_text_with_many_equals_signs_and_dicts_is_decided_quickly(pol, home):
+    prog = "d = {'a': 1, 'b': [2, 3]}; x = {'k': (1, 2)}; z = 0\n" * 70 + "y = 1\n" * 100
+    assert len(prog) > 2800 and prog.count("=") >= 300
+    assert _decided_fast(pol, f'python3 -c "{prog}"') is None
+    assert _decided_fast(pol, "python3 -c '" + prog.replace("'", "") + "'") is None
+
+
+def test_a_twenty_kilobyte_commit_message_of_key_value_lines_is_decided_quickly(pol, home):
+    msg = "\n".join(f"key{n}=value{n}, path=a/b:{n}" for n in range(700))
+    assert len(msg) > 18000
+    assert _decided_fast(pol, f"git commit -m '{msg}'") is None
+
+
+def test_braces_in_quotes_stay_one_word_and_bare_ones_still_expand(pol, home):
+    assert policy._braces("{a,b}c") == ["ac", "bc"]
+    assert policy._braces("{a,b}", "11011") == ["{a,b}"]  # the comma was quoted
+    assert policy._braces("{a,b}", "01110") == ["{a,b}"]  # the braces were quoted
+    assert policy._braces("{a,b,c}", "1110001") == ["a", "b,c"]
+    assert policy.is_denied_command(pol, "cat {~/.ssh/id_rsa,x}")
+    assert policy.is_denied_command(pol, "echo '{~/.ssh/id_rsa,x}'") is None
+
+
+def test_an_unquoted_brace_bomb_is_bounded(pol, home):
+    reason = _decided_fast(pol, "echo " + "{a,b}" * 300)
+    assert reason is None or "too many to check" in reason

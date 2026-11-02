@@ -50,5 +50,9 @@ jobs:
           tar -xzf /tmp/vale.tgz -C /tmp vale
           /tmp/vale sync
           /tmp/vale README.md docs/ SECURITY.md SUPPORT.md CONTRIBUTING.md CHANGELOG.md
+      - name: gate replay corpus (decisions and metrics on both runners; latency is printed, not gated)
+        run: |
+          uv run --locked ws gate replay tests/gate_corpus/*.jsonl --runner claude-code --metrics
+          uv run --locked ws gate replay tests/gate_corpus/*.jsonl --runner opencode --metrics
       - name: tests
         run: uv run --locked pytest -q

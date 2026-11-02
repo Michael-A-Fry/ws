@@ -51,6 +51,7 @@ install.sh        the installer people run first (pipx or uv)
 | `extcmd.py` | The `ws` name: your own `ws-<word>` programs, and one fallback program for every other word |
 | `frontmatter.py` | YAML front matter, the safe subset: stdlib only |
 | `gate.py` | `ws gate`: turn the policy into each runner's own config, and answer the hooks |
+| `gatecorpus.py` | The gate's replay corpus: labelled calls, and the numbers that say how well the gate sorts them |
 | `globals.py` | `ws globals`: what ws installs globally stays global |
 | `guards/` | Guards: small, named checks the policy switches on, run by `ws gate` at the points a session can... |
 | `home/` | ws home: one read-only data API (`ws.home.api`) that every home area, app and script reads through |

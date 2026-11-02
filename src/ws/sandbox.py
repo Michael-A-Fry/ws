@@ -514,12 +514,60 @@ def claude_denied() -> list[str]:
     ]
 
 
-def launch_env(env: dict, tmp: str | None = None, homes: dict | None = None) -> dict:
-    """The runner's environment. In the wall, TMPDIR is the private tmp and so is Python's bytecode cache
-    (PYTHONPYCACHEPREFIX): a `.pyc` written into the project by a walled `python` would be loaded by the next unwalled
-    one, and the report would have to look for them."""
+# What `ws gate launch` hands the runner from the launching shell. Everything else is left behind, so a key or token
+# exported in that shell reaches the session only when the person names it with `--pass-env`. These names say where
+# things are or how to draw the terminal; none is a credential.
+LAUNCH_ENV = (
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "PWD", "LANG", "LANGUAGE", "TZ", "TERM", "COLORTERM", "NO_COLOR",
+    "COLUMNS", "LINES", "TERM_PROGRAM", "TERM_PROGRAM_VERSION", "TMUX", "TMUX_PANE", "TMPDIR", "EDITOR", "VISUAL",
+    "PAGER", "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS", "WS_HOME", "WS_OUTPUT", "WS_BROKER_SOCKET",
+    "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "LC_COLLATE", "LC_NUMERIC", "LC_TIME", "LC_MONETARY",
+    "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME",
+)  # fmt: skip
+# The runner's own variables, besides the folder its adapter names in CONFIG_DIR_ENV. An adapter may list more in a
+# `LAUNCH_ENV` tuple of its own.
+RUNNER_ENV = {
+    "claude-code": (
+        "CLAUDE_CONFIG_DIR", "ANTHROPIC_MODEL", "DISABLE_AUTOUPDATER", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+    ),
+    "opencode": (
+        "OPENCODE_CONFIG", "OPENCODE_CONFIG_CONTENT", "OPENCODE_DISABLE_AUTOUPDATE", "OPENCODE_DISABLE_MODELS_FETCH",
+        "OPENCODE_DISABLE_LSP_DOWNLOAD",
+    ),
+}  # fmt: skip
+ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def check_pass_env(names: list[str] | None) -> list[str]:
+    """The `--pass-env` names, each a plain variable name (letters, digits, `_`), without repeats. Anything else is a
+    usage error: a name is never taken from a `NAME=value` or a pattern."""
+    out: list[str] = []
+    for name in names or []:
+        if not ENV_NAME.fullmatch(name):
+            raise WsError(
+                "usage", f"--pass-env takes a variable name, not {name!r}", "e.g. `--pass-env ANTHROPIC_API_KEY`"
+            )
+        if name not in out:
+            out.append(name)
+    return out
+
+
+def passed_env(env: dict, runner: str = "", pass_env: list[str] | None = None) -> dict:
+    """The part of `env` the runner may have: LAUNCH_ENV, the runner's own variables and the names the person passed. A name that isn't set is simply absent."""
+    mod = adapters.get(runner) if runner else None
+    own = (*RUNNER_ENV.get(runner, ()), *getattr(mod, "LAUNCH_ENV", ()), getattr(mod, "CONFIG_DIR_ENV", ""))
+    names = {*LAUNCH_ENV, *own, *check_pass_env(pass_env)}
+    return {k: v for k, v in env.items() if k in names}
+
+
+def launch_env(
+    env: dict, tmp: str | None = None, homes: dict | None = None, runner: str = "", pass_env: list[str] | None = None
+) -> dict:
+    """The runner's environment: the allow-listed part of `env` (`passed_env`). In the wall, TMPDIR is the private tmp
+    and so is Python's bytecode cache (PYTHONPYCACHEPREFIX): a `.pyc` written into the project by a walled `python`
+    would be loaded by the next unwalled one, and the report would have to look for them."""
     walled = {"TMPDIR": tmp, "PYTHONPYCACHEPREFIX": f"{tmp}/pycache"} if tmp else {}
-    return {**env, ENV_MARKER: "1", **walled, **(homes or {})}
+    return {**passed_env(env, runner, pass_env), ENV_MARKER: "1", **walled, **(homes or {})}
 
 
 def ptrace_scope(path: str = "/proc/sys/kernel/yama/ptrace_scope") -> int | None:
@@ -1424,7 +1472,10 @@ def cmd_launch(args: argparse.Namespace) -> int:
     except policy.PolicyError as e:
         raise WsError("bad_config", str(e), f"fix {policy_file}") from e
     home = ws_home().absolute()  # whatever --policy says, the gate keeps its approvals and sessions here
-    env = launch_env(dict(os.environ))
+    pass_env = check_pass_env(args.pass_env)
+    if pass_env:
+        print(f"ws: note: passing {', '.join(pass_env)} from this shell to {args.runner}", file=sys.stderr)
+    env = launch_env(dict(os.environ), runner=args.runner, pass_env=pass_env)
     if args.runner == "claude-code" and not args.no_sandbox:
         return launch_claude(args, argv, home, env)
     if args.no_sandbox:
@@ -1458,7 +1509,7 @@ def cmd_launch(args: argparse.Namespace) -> int:
             tty=sys.stdin.isatty(),
         )
         return run_with_broker(
-            wrapped.argv, launch_env(dict(os.environ), tmp, homes), wrapped.pass_fds, approvals_dir(home)
+            wrapped.argv, launch_env(env, tmp, homes, args.runner, pass_env), wrapped.pass_fds, approvals_dir(home)
         )
     except SandboxError as e:
         raise WsError(
@@ -1510,6 +1561,12 @@ def add_launch(gs, names: list[str]) -> None:
         action="append",
         metavar="DIR",
         help="another folder the session may write (besides the project)",
+    )
+    p.add_argument(
+        "--pass-env",
+        action="append",
+        metavar="NAME",
+        help="an environment variable to hand the runner (repeat for more); the rest of this shell's is left behind",
     )
     p.add_argument("--no-sandbox", action="store_true", help="start the runner with no wall (says what that gives up)")
     p.add_argument("argv", nargs=argparse.REMAINDER, help="-- then the runner's command line")

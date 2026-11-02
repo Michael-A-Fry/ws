@@ -7,6 +7,7 @@ function of a record and the folders the person marked opaque. The envelope is `
 from __future__ import annotations
 
 import hashlib
+import hmac
 import os
 import re
 import unicodedata
@@ -166,7 +167,9 @@ class Snapshot(_Record):
 
 # --- the opaque rule ----------------------------------------------------------------------------------------------
 
-# What an opaque record keeps. Everything else goes back to its default: no name, folder, title, tokens or cost.
+# What an opaque record keeps. Everything else goes back to its default: no name, folder, title, tokens or cost. `repo`
+# and `tmux` are in the list but pass through a check in `seal`: the repo label only when the person listed it as
+# showable, the tmux target only as a bare id (else a hash).
 KEEP: dict[type, tuple[str, ...]] = {
     Session: ("id", "source", "repo", "tmux", "state", "started_at"),
     Ask: ("id", "source", "kind", "repo", "tmux", "created"),
@@ -283,21 +286,88 @@ def is_opaque(rec: Session | Ask | Event, roots: tuple[str, ...], session: bool 
     return not (session is False or rec.placed)
 
 
-def safe_id(ident: str) -> str:
+# Hashes on an opaque record are keyed (HMAC-SHA256), so a person who guesses a case number can't test it against the
+# output. The API passes the per-install key (`api.seal_key`); without one, a key made fresh for this process is used,
+# so a hash never depends on text alone.
+_PROCESS_KEY = os.urandom(32)
+
+
+def _digest(text: str, key: bytes | None = None) -> str:
+    mac = hmac.new(key or _PROCESS_KEY, text.encode("utf-8", "surrogatepass"), hashlib.sha256)
+    return mac.hexdigest()[:16]
+
+
+def safe_id(ident: str, key: bytes | None = None) -> str:
     """An id as it may leave on an opaque record: itself when it has a machine shape (MACHINE_ID), else a 16-character
-    sha256 prefix. A free-text id (a case number, a title) never leaves as written."""
-    if MACHINE_ID.fullmatch(ident):
-        return ident
-    return hashlib.sha256(ident.encode("utf-8", "surrogatepass")).hexdigest()[:16]
+    keyed hash. A free-text id (a case number, a title) never leaves as written."""
+    return ident if MACHINE_ID.fullmatch(ident) else _digest(ident, key)
 
 
-def seal(rec: Session | Ask | Event, opaque: bool) -> Session | Ask | Event:
-    """The record as it leaves the API: whole, or reduced to KEEP with `opaque` set (and its id made safe)."""
+# a tmux target that is only ids: `@9`, `%3`, `@9.%3`, `$1:@9.%3`. A session or window name is text, so it isn't one.
+TMUX_ID = re.compile(r"(?:\$\d+:)?@\d+(?:\.%\d+)?|%\d+|\$\d+")
+# the event types an opaque event may show as written: the kinds a ws record already names.
+EVENT_TYPES = (*ASK_KINDS, *STATES)
+
+
+def source_names() -> frozenset[str]:
+    """The names of the source modules in `ws.home.sources`, read from the folder without importing any."""
+    import pkgutil
+
+    from ws.home import sources
+
+    return frozenset(i.name for i in pkgutil.iter_modules(sources.__path__) if not i.name.startswith("_"))
+
+
+def safe_tmux(target: str, key: bytes | None = None) -> str:
+    """A tmux target as it may leave on an opaque record: empty stays empty, a bare id stays, anything else (a window
+    named for its work, a session name) becomes a 16-character keyed hash."""
+    if not target or TMUX_ID.fullmatch(target):
+        return target
+    return _digest(target, key)
+
+
+def safe_source(text: str, key: bytes | None = None) -> str:
+    """A source as it may leave on an opaque record: the name of a source module (or several joined by `+`), else a
+    16-character keyed hash. A source name read from a file is text, however short."""
+    known = source_names()
+    return text if text and all(part in known for part in text.split("+")) else _digest(text, key)
+
+
+def safe_type(text: str, key: bytes | None = None) -> str:
+    """An event type as it may leave on an opaque record: one of EVENT_TYPES, else a 16-character keyed hash."""
+    return text if text in EVENT_TYPES else _digest(text, key)
+
+
+def showable(label: str, show_repos: tuple[str, ...]) -> bool:
+    """True when a repo label is one the person listed as showable (`[home] show_repos`): the whole label, compared
+    without regard to case or Unicode form."""
+    want = _nfc(" ".join(label.split())).casefold()
+    return bool(want) and any(_nfc(" ".join(r.split())).casefold() == want for r in show_repos)
+
+
+def seal(
+    rec: Session | Ask | Event, opaque: bool, show_repos: tuple[str, ...] = (), key: bytes | None = None
+) -> Session | Ask | Event:
+    """The record as it leaves the API: whole, or reduced to KEEP with `opaque` set. The id is made safe; the tmux
+    target is kept as a bare id or a keyed hash; the repo label is kept only when `show_repos` lists it; a state or ask
+    kind outside its list, a source that isn't a source module and a type outside EVENT_TYPES don't survive as written."""
     if not opaque:
         return rec
     keep = KEEP[type(rec)]
     shown = {name: getattr(rec, name) for name in keep}
-    shown["id"] = safe_id(shown["id"])
+    shown["id"] = safe_id(shown["id"], key)
+    shown["source"] = safe_source(shown["source"], key)
+    if "repo" in shown and not showable(shown["repo"], show_repos):
+        shown["repo"] = ""
+    if "tmux" in shown:
+        shown["tmux"] = safe_tmux(shown["tmux"], key)
     if isinstance(rec, Session):
         shown["cost_basis"] = HIDDEN
+        if shown["state"] not in STATES:
+            shown["state"] = "unknown"
+    elif isinstance(rec, Ask):
+        if shown["kind"] not in ASK_KINDS:
+            shown["kind"] = "question"
+    else:
+        shown["type"] = safe_type(shown["type"], key)
     return type(rec)(**shown, opaque=True)  # type: ignore[arg-type]

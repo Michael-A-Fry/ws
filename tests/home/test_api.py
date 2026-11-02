@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import json
 import os
@@ -237,7 +238,9 @@ def test_a_redacted_ask_is_opaque_and_keeps_only_the_listed_fields(box):
     for f in fields(Ask):
         keep = f.name in ("id", "source", "kind", "repo", "tmux", "created", "opaque")
         assert keep or getattr(a, f.name) == getattr(blank, f.name), f.name
-    assert (a.repo, a.tmux, a.created, a.kind) == ("app", "ws:@1.%2", iso(-9), "question")
+    key = api.seal_key(api.Env.make(box.environ, now=NOW))  # the install key the hashes are made with
+    assert (a.repo, a.tmux, a.created, a.kind) == ("", records.safe_tmux("ws:@1.%2", key), iso(-9), "question")
+    assert a.tmux != "ws:@1.%2" and len(a.tmux) == 16  # the target held a session name: it leaves as a hash
     assert "SECRET" not in json.dumps(a.to_dict()) and a.answer_in == "terminal"
 
 
@@ -264,7 +267,7 @@ def test_a_session_under_an_opaque_path_keeps_only_the_listed_fields(box):
     for f in fields(Session):
         keep = f.name in ("id", "source", "repo", "tmux", "state", "started_at", "opaque", "cost_basis")
         assert keep or getattr(s, f.name) == getattr(blank, f.name), f.name
-    assert (s.repo, s.state, s.cost_basis) == ("case-1", "waiting", "hidden")
+    assert (s.repo, s.state, s.cost_basis) == ("", "waiting", "hidden")  # the repo label is not listed as showable
     assert s.name == "" and s.cwd == "" and s.waiting_for == "" and s.tokens is None and s.cost_usd is None
     assert sessions["33333333-aaaa-bbbb-cccc-000000000003"].name == "public"
 
@@ -273,7 +276,7 @@ def test_a_ask_whose_session_is_opaque_is_opaque(box):
     box.profile('[home]\nopaque_paths = ["/work/private"]\n')
     snap = api.snapshot(box.env([agent(SID, "/work/private/x", waitingFor="TEXT")]))
     (a,) = snap.asks
-    assert a.opaque and a.title == "" and a.session_id == "" and a.repo == "x"
+    assert a.opaque and a.title == "" and a.session_id == "" and a.repo == ""
 
 
 def test_an_ask_whose_repo_path_is_under_an_opaque_path_is_opaque(box):
@@ -305,14 +308,16 @@ def test_the_opaque_rule_is_applied_last_so_a_merge_cannot_unhide(box):
 
 
 def test_seal_keeps_only_the_listed_fields_and_nothing_else():
-    s = Session(id="abcdef01", source="s", runner="r", name="n", cwd="/c", repo="rp", tmux="t", state="idle", started_at="x",
-                tokens={"input": 1}, cost_usd=1.0, cost_basis="otel", waiting_for="w", host="h", rc_url="u")  # fmt: skip
+    s = Session(id="abcdef01", source="ws_runs", runner="r", name="n", cwd="/c", repo="rp", tmux="t", state="idle",
+                started_at="x", tokens={"input": 1}, cost_usd=1.0, cost_basis="otel", waiting_for="w", host="h",
+                rc_url="u")  # fmt: skip
     sealed = records.seal(s, True)
-    assert sealed == Session(id="abcdef01", source="s", repo="rp", tmux="t", state="idle", started_at="x", opaque=True,
-                             cost_basis="hidden")  # fmt: skip
+    assert sealed == Session(id="abcdef01", source="ws_runs", tmux=records.safe_tmux("t"), state="idle", started_at="x",
+                             opaque=True, cost_basis="hidden")  # fmt: skip
+    assert records.seal(s, True, ("rp",)).repo == "rp"  # kept when the profile lists it as showable
     assert records.seal(s, False) is s
-    e = Event(id="e0000001", ts="t", source="s", type="ty", session_id="sid", summary="sum")
-    assert records.seal(e, True) == Event(id="e0000001", ts="t", source="s", type="ty", opaque=True)
+    e = Event(id="e0000001", ts="t", source="events_dir", type="question", session_id="sid", summary="sum")
+    assert records.seal(e, True) == Event(id="e0000001", ts="t", source="events_dir", type="question", opaque=True)
 
 
 def test_under_follows_folders_not_prefixes(tmp_path):
@@ -744,7 +749,8 @@ def test_an_opaque_record_leaves_with_a_machine_id_or_a_hash(box):
     )
     got = {a.id for a in api.asks(box.env([]))}
     assert ask_id in got and odd not in got and "FIU-CASE-1234" not in got
-    assert got - {ask_id} == {records.safe_id(odd), records.safe_id("FIU-CASE-1234")}
+    key = api.seal_key(api.Env.make(box.environ, now=NOW))
+    assert got - {ask_id} == {records.safe_id(odd, key), records.safe_id("FIU-CASE-1234", key)}
     assert all(len(h) == 16 for h in got - {ask_id})
     assert "FIU" not in json.dumps(sorted(got))
 
@@ -803,3 +809,126 @@ def test_a_source_that_wont_import_is_one_row_and_the_rest_still_read(box, monke
     assert "secret" not in json.dumps(snap.to_dict()["sources"])
     assert by_name(snap)["claude_code"].ok and len(snap.sessions) == 1
     assert api.sessions(box.env([agent()]))  # the single reads survive it too
+
+
+# --- what an opaque record keeps of free text ------------------------------------------------------------------------
+
+FREE = "SECRET case words"
+
+
+def test_no_free_text_from_the_source_survives_seal():
+    s = Session(id=FREE, source=FREE, runner=FREE, name=FREE, host=FREE, tmux=f"{FREE}:@1.%2", cwd=f"/{FREE}", repo=FREE,
+                state=FREE, waiting_for=FREE, started_at="2026-11-02T00:00:00Z", last_seen=FREE, tokens={"input": 1},
+                cost_usd=1.0, cost_basis=FREE, rc_url=FREE, opens=(FREE,))  # fmt: skip
+    a = Ask(id=FREE, source=FREE, kind=FREE, session_id=FREE, session_name=FREE, tmux=FREE, repo=FREE, title=FREE,
+            options=({"label": FREE, "description": FREE},), decision=FREE, created="2026-11-02T00:00:00Z",
+            answer_in=FREE, opens=(FREE,), rc_url=FREE)  # fmt: skip
+    e = Event(id=FREE, ts="2026-11-02T00:00:00Z", source=FREE, type=FREE, session_id=FREE, summary=FREE)
+    for rec in (s, a, e):
+        sealed = records.seal(rec, True)
+        assert sealed.opaque is True
+        assert "SECRET" not in json.dumps(sealed.to_dict()), type(rec).__name__
+        assert "case" not in json.dumps(sealed.to_dict()), type(rec).__name__
+
+
+def test_an_opaque_record_keeps_a_tmux_target_only_as_a_bare_id_or_a_hash():
+    for bare in ("@9", "%3", "@9.%3", "$1:@9.%3", "$2", ""):
+        assert records.safe_tmux(bare) == bare
+    for named in ("ws:@9.%9", "Home·case words:@1.%2", "@9 ", "@9\n", "case", "$1:", "."):
+        out = records.safe_tmux(named)
+        assert out != named and len(out) == 16 and set(out) <= set("0123456789abcdef")
+    assert records.safe_tmux("ws:@9.%9") == records.safe_tmux("ws:@9.%9")  # the same target, the same hash
+
+
+def test_an_opaque_record_shows_its_repo_label_only_when_the_profile_lists_it(box):
+    box.profile('[home]\nopaque_paths = ["/work/private"]\nshow_repos = ["Café"]\n')
+    s = Session(id="abcdef01", source="s", repo=unicodedata.normalize("NFD", "café"))
+    assert records.seal(s, True, ("CAFÉ",)).repo == s.repo  # case and Unicode form don't matter
+    assert records.seal(s, True, ()).repo == "" and records.seal(s, True, ("cafe",)).repo == ""
+    assert api.load_config(box.environ, box.home).show_repos == ("Café",)
+    snap = api.snapshot(box.env([agent(SID, "/work/private/x")]))
+    assert snap.sessions[0].opaque and snap.sessions[0].repo == ""  # "x" isn't listed
+
+
+def test_a_listed_repo_is_shown_on_an_opaque_session(box):
+    box.profile('[home]\nopaque_paths = ["/work/private"]\nshow_repos = ["x"]\n')
+    snap = api.snapshot(box.env([agent(SID, "/work/private/x")]))
+    assert snap.sessions[0].opaque and snap.sessions[0].repo == "x" and snap.sessions[0].cwd == ""
+
+
+@pytest.mark.parametrize(
+    "body",
+    ['show_repos = "x"', "show_repos = [1]", 'show_repos = [""]', 'show_repos = ["a/b"]', 'show_repos = ["private"]'],
+)
+def test_show_repos_that_cant_be_read_or_that_names_an_opaque_folder_is_refused(box, body):
+    box.profile(f'[home]\nopaque_paths = ["/work/private"]\n{body}\n')
+    with pytest.raises(WsError) as e:
+        api.load_config(box.environ, box.home)
+    assert e.value.kind == "bad_config" and "show_repos" in str(e.value)
+
+
+@pytest.mark.parametrize("word", ["case:ACME+bank", "JohnSmith", "freeze-acct-acme-ltd", "ACME", "zq", "a+b"])
+def test_one_word_free_text_in_a_source_or_type_is_hashed(word):
+    for rec in (
+        Session(id="abcdef01", source=word),
+        Ask(id="abcdef01", source=word, kind="question"),
+        Event(id="abcdef01", ts="t", source=word, type=word),
+    ):
+        sealed = records.seal(rec, True)
+        assert sealed.source != word and len(sealed.source) == 16, type(rec).__name__
+        assert word not in json.dumps(sealed.to_dict()), type(rec).__name__
+    assert records.seal(Event(id="abcdef01", ts="t", source="events_dir", type=word), True).type != word
+
+
+def test_a_source_module_name_and_a_known_type_are_kept_on_an_opaque_record():
+    names = records.source_names()
+    assert {"claude_code", "ws_runs", "events_dir", "asks_jsonl"} <= names and not any(n.startswith("_") for n in names)
+    assert (
+        records.seal(Session(id="abcdef01", source="claude_code+ws_sessions"), True).source == "claude_code+ws_sessions"
+    )
+    assert records.seal(Session(id="abcdef01", source="claude_code+JohnSmith"), True).source != "claude_code+JohnSmith"
+    for kind in records.EVENT_TYPES:
+        assert records.seal(Event(id="abcdef01", ts="t", source="events_dir", type=kind), True).type == kind
+    assert records.seal(Ask(id="abcdef01", source="asks_jsonl", kind="permission"), True).kind == "permission"
+    assert records.seal(Ask(id="abcdef01", source="asks_jsonl", kind="JohnSmith"), True).kind == "question"
+
+
+def test_the_hashes_are_keyed_so_the_key_decides_them():
+    one, two = b"1" * 32, b"2" * 32
+    for text in ("FIU-CASE-1234", "case:ACME+bank"):
+        assert records.safe_id(text, one) == records.safe_id(text, one)
+        assert records.safe_id(text, one) != records.safe_id(text, two)
+        assert records.safe_id(text, one) != hashlib.sha256(text.encode()).hexdigest()[:16]  # not a plain digest
+    assert records.safe_tmux("ws:@1.%2", one) != records.safe_tmux("ws:@1.%2", two)
+    assert records.safe_tmux("ws:@1.%2", one) != hashlib.sha256(b"ws:@1.%2").hexdigest()[:16]
+    ev = Event(id="FIU-CASE-1234", ts="t", source="events_dir", type="question")
+    assert records.seal(ev, True, key=one).id != records.seal(ev, True, key=two).id
+
+
+def test_the_install_key_is_made_once_under_ws_home_and_is_private(box):
+    env = api.Env.make(box.environ, now=NOW)
+    path = box.ws / "home" / "seal-key"
+    assert not path.exists()
+    key = api.seal_key(env)
+    assert len(key) == 32 and path.read_bytes() == key and path.stat().st_mode & 0o777 == 0o600
+    assert api.seal_key(api.Env.make(box.environ, now=NOW)) == key  # a later run reads the same key
+
+
+def test_an_open_snapshot_makes_no_key_and_an_opaque_one_hashes_with_it(box):
+    box.profile('[home]\nopaque_paths = ["/work/private"]\n')
+    api.snapshot(box.env([agent(SID, "/work/public/x")]))
+    assert not (box.ws / "home" / "seal-key").exists()
+    snap = api.snapshot(box.env([agent(SID, "/work/private/x", name="FIU-CASE-1234")]))
+    key = (box.ws / "home" / "seal-key").read_bytes()
+    assert snap.sessions and all(s.opaque for s in snap.sessions)
+    assert records.seal(Session(id="FIU-CASE-1234", source="ws_runs"), True, key=key).id == records.safe_id(
+        "FIU-CASE-1234", key
+    )
+
+
+def test_a_key_that_cannot_be_written_falls_back_to_a_key_for_this_process(box, monkeypatch):
+    box.ws.mkdir(parents=True)
+    (box.ws / "home").write_text("a file where the folder should be")
+    env = api.Env.make(box.environ, now=NOW)
+    key = api.seal_key(env)
+    assert len(key) == 32 and api.seal_key(env) == key

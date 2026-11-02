@@ -275,8 +275,13 @@ allow_write = []
 #   spawn-cap        denies a subagent start at max_agents running (default from the machine's CPUs and memory)
 #   skill-gate       a write to chosen paths waits for a skill ([[guards.skill-gate]] skill, paths); a skill's own
 #                    SKILL.md front matter can list `gates` (path globs) too, from skill_dirs
+#   dev-server       denies a dev server that listens on every interface (python -m http.server, php -S, serve, vite
+#                    --host, flask run --host, jupyter --ip, rails s -b, uvicorn --host, hugo server --bind); the reason
+#                    names the flag that keeps it on this machine
+#   checkout-pin     denies git checkout, switch, reset --hard, rebase, merge, pull, cherry-pick and revert in a checkout
+#                    that has linked worktrees (and in any folder named in paths), so work happens in a worktree
 [guards]
-on = ["syntax-check", "session-context"]
+on = ["syntax-check", "session-context", "dev-server"]
 # [guards.syntax-check]
 # extra = {{ yaml = ["yamllint", "-d", "relaxed"] }}   # an extension and the checker that gets the file path appended
 # [guards.session-context]
@@ -289,6 +294,10 @@ on = ["syntax-check", "session-context"]
 # skill_dirs = ["~/.claude/skills"]   # where skills keep their own `gates`; add rules as [[guards.skill-gate.rules]]
 # [guards.spawn-cap]
 # max_agents = 4   # optional: left out, half the CPUs or half the GiB of memory, whichever is less (2 to 8)
+# [guards.dev-server]
+# allow_hosts = ["203.0.113.5"]   # optional: addresses a dev server may bind besides loopback (a VPN or tailnet address)
+# [guards.checkout-pin]
+# paths = ["~/code/app"]   # optional: checkouts to pin even with no linked worktree (absolute or ~/)
 
 # Rule of Two, leg C (a way out): besides a source's outward acts and the web tools above, the SHELL counts as a way
 # out while any of curl, wget, nc, ssh, scp, python -c ... is not in deny_commands. To close it, deny the lot

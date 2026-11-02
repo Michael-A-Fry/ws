@@ -1429,7 +1429,7 @@ def test_eval_of_fetched_text_and_shell_options_with_arguments():
 
 
 def test_the_default_policy_turns_two_guards_on_and_a_policy_with_no_table_turns_none_on():
-    assert policy.default_policy().guards.on == ("syntax-check", "session-context")
+    assert policy.default_policy().guards.on == ("syntax-check", "session-context", "dev-server")
     assert policy.loads("schema = 1\n").guards == policy.Guards()
 
 

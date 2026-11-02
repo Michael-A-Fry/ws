@@ -8,6 +8,8 @@
     alert_text = "title"                          optional: "title" sends the folder name, "full" adds the runner's message,
                                                   "plain" sends "a session needs you" with no folder name
     alerts_per_day = 50                           optional: the daily allowance for session alerts
+    alert_on = "needs-you"                        optional: "needs-you" alerts when a session needs you, "every-stop"
+                                                  alerts on every finished turn (what the key's absence means)
 
 The interruption cap governs ws's own sends, and only those. The numbers come from `[interrupts]` in policy.toml (1
 digest and 3 pushes a day unless you changed them) and are counted in `$WS_HOME/logs/notify-count.json`: `logs` is a
@@ -30,6 +32,18 @@ last part of the session's working directory. With `alert_text = "title"` that i
 notify server (ntfy.sh or your own) with the push, so a person whose folder names are private sets `alert_text =
 "plain"`, which sends "a session needs you" or "a session finished" and no folder name. "full" adds the runner's own
 message to the folder. The hook wiring that calls `ws notify alert` is added by the runner adapter, not here.
+
+`alert_on` says which events alert. "every-stop" pushes for each Notification and each Stop. "needs-you" pushes for each
+Notification (a permission or an answer is wanted) and for a Stop only when the session's last message asks you
+something; a plain finished turn sends nothing. A last message asks something when, with trailing spaces, quotes,
+brackets and markdown marks set aside, it ends with "?", or when its last paragraph names a choice: "which one",
+"your call", "up to you", "choose", "pick one", "reply with", "let me know which|whether|what|how", "need your
+decision|answer|input|approval|confirmation". The message comes from the hook payload (`last_assistant_message`, or the
+last assistant text in the `transcript_path` file). It is read here and goes nowhere: the alert says what `alert_text`
+says, and a Stop that asks reads "<folder> needs you". A payload with no last message never asks, and neither does a
+message that ends in a code block, so under "needs-you" a runner that sends no last message alerts on its Notification
+events only. A key that is absent means "every-stop", so a config written before the key keeps its behaviour; set
+"needs-you" in a new one.
 
 An alert must not hold a session up. The whole send (broker lease included) gets 3 seconds, and runs in a daemon thread
 so a stuck connection is left behind when the time is up. The alert takes the counter lock without waiting: if another
@@ -81,6 +95,17 @@ ALERT_EVENTS = {  # hook event name -> (what the alert says, priority)
 }
 HEADLESS_ENTRYPOINT_PREFIX = "sdk"  # claude -p, the Agent SDK and the like
 ALERT_MODES = ("title", "full", "plain")
+ALERT_ON = ("needs-you", "every-stop")
+DEFAULT_ALERT_ON = "every-stop"  # a key that is absent: a config from before the key keeps alerting on every stop
+QUIET_NOTIFICATIONS = ("auth_success",)  # Notification types that need nothing from the person
+TAIL_BYTES = 262_144  # the end of a transcript file read to find the last assistant message
+MAX_QUESTION_TEXT = 4000
+_CLOSERS = " \t\r\n\"'`)]}>*_~"
+_CHOICE = re.compile(
+    r"\b(?:which (?:one|option|approach|way|of)|your call|up to you|choose|pick (?:one|a|an|the)|reply (?:with|yes|no)|"
+    r"let me know (?:which|whether|what|how)|need(?:s)? your (?:decision|answer|input|approval|confirmation))\b",
+    re.IGNORECASE,
+)
 MAX_FOLDER = 64
 MAX_RUNNER_MESSAGE = 300
 MAX_MESSAGE = 4000
@@ -429,6 +454,67 @@ def alerts_on(cfg: dict) -> bool:
     return v
 
 
+def alert_on(cfg: dict) -> str:
+    """`alert_on` of [roles.notify]: "needs-you" or "every-stop"; "every-stop" when the key is absent."""
+    v = cfg.get("alert_on", DEFAULT_ALERT_ON)
+    if v not in ALERT_ON:
+        raise NotifyError('alert_on must be "needs-you" or "every-stop"')
+    return v
+
+
+def asks(text: object) -> bool:
+    """Does this last message ask the person something: it ends with "?" (trailing space, quotes, brackets and markdown
+    marks set aside), or its last paragraph names a choice (_CHOICE)? A message that ends in a code block doesn't."""
+    if not isinstance(text, str):
+        return False
+    text = text[-MAX_QUESTION_TEXT:]
+    if text.rstrip().endswith("```"):  # a message that ends in a code block ends in code, not in a question
+        return False
+    text = text.rstrip(_CLOSERS + "\u201d\u2019")
+    if text.endswith(("?", "\uff1f")):
+        return True
+    return bool(_CHOICE.search(re.split(r"\n\s*\n", text)[-1]))
+
+
+def _transcript_text(path: object) -> str:
+    """The text of the last assistant message in a JSON-lines transcript file, read from its end; '' when there is none
+    or the file can't be read."""
+    if not isinstance(path, str) or not path:
+        return ""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - TAIL_BYTES))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return ""
+    for line in reversed(lines):
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        message = entry.get("message") if isinstance(entry, dict) else None
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = [b.get("text") for b in content if isinstance(b, dict) and b.get("type") == "text"]
+            if text := "\n".join(p for p in parts if isinstance(p, str)):
+                return text
+    return ""
+
+
+def needs_you(name: str, payload: dict) -> bool:
+    """Under alert_on = "needs-you": does this event need the person? A Notification does (unless its type needs
+    nothing); a Stop does when the session's last message asks something."""
+    if name == "Notification":
+        return payload.get("notification_type") not in QUIET_NOTIFICATIONS
+    last = payload.get("last_assistant_message")
+    return asks(last if isinstance(last, str) else _transcript_text(payload.get("transcript_path")))
+
+
 def is_headless(payload: dict, env) -> bool:
     """A `ws run` job, a `claude -p` session or a payload marked headless: nobody is at that session to be called."""
     return (
@@ -444,7 +530,8 @@ def _line(text: object, limit: int) -> str:
 
 def alert(cfg: dict, env, payload: object, runner: str, now: datetime | None = None, sender=None) -> str | None:
     """Push the alert a hook payload asks for. Returns the line from `send`, or None when there is nothing to send: a
-    payload that isn't a Notification or Stop event, a headless session, or session_alerts set to false. Raises
+    payload that isn't a Notification or Stop event, a headless session, session_alerts set to false, or (with alert_on =
+    "needs-you") an event that needs nothing from the person. Raises
     CapReached or NotifyError."""
     if not isinstance(payload, dict) or not alerts_on(cfg):
         return None
@@ -453,6 +540,10 @@ def alert(cfg: dict, env, payload: object, runner: str, now: datetime | None = N
     if event is None or is_headless(payload, env):
         return None
     said, priority = event
+    if alert_on(cfg) == "needs-you":
+        if not needs_you(name, payload):
+            return None
+        said, priority = ALERT_EVENTS["Notification"]  # a Stop that asks is a call to the person, as a Notification is
     mode = cfg.get("alert_text", "title")
     if mode not in ALERT_MODES:
         raise NotifyError('alert_text must be "title", "full" or "plain"')

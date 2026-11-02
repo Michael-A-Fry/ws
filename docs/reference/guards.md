@@ -9,7 +9,7 @@ session or a subagent stops. For the idea, read [The gate](../explanation/gate.m
 
 ```toml
 [guards]
-on = ["syntax-check", "session-context"]     # the guards that run, in this order
+on = ["syntax-check", "session-context", "dev-server"]     # the guards that run, in this order
 
 [guards.syntax-check]
 extra = { yaml = ["yamllint", "-d", "relaxed"] }
@@ -19,9 +19,9 @@ files = [".claude-state/STATE.md"]
 ```
 
 A policy file with no `[guards]` table has no guards on, so an upgrade changes nothing until you add the table.
-`ws gate init` writes `on = ["syntax-check", "session-context"]` and lists the other guards as comments. A name in `on`
-that ws doesn't know stops the load and the message names it. So does a key in `[guards]` that isn't `on` or a guard
-name, and a key in a guard's table that guard doesn't read.
+`ws gate init` writes `on = ["syntax-check", "session-context", "dev-server"]` and lists the other guards as comments. A
+name in `on` that ws doesn't know stops the load and the message names it. So does a key in `[guards]` that isn't `on`
+or a guard name, and a key in a guard's table that guard doesn't read.
 
 ## The guards
 
@@ -34,6 +34,8 @@ name, and a key in a guard's table that guard doesn't read.
 | `claims` | before a message, and when the session stops | messages to other agents | Checks each commit-like token that sits in the same sentence as a claim word (`on main`, `merged into main`, `merged to main`, `pushed to main`) against a ref, and denies the message when the commit isn't on it. With `release_dir` set, also denies a message that calls a release other than the promoted one live. On stop, logs the claims in the runner's last message. |
 | `spawn-cap` | before a call, and when a subagent stops | subagent starts | Denies a subagent start when `max_agents` (default from the machine) are already running in the session. Counts agents started in the background. |
 | `skill-gate` | before a call, and when a prompt is sent | file writes and skill calls | Denies a write to a guarded path until the named skill has run in the session. The paths come from the policy's rules and from each skill's own `gates` front matter. The person can approve the write once. Judges Edit, Write and MultiEdit calls only. |
+| `dev-server` | before a call | shell commands | Denies a development server that listens on every interface or on an address other than loopback: `python -m http.server` with no `--bind`, `php -S 0.0.0.0:PORT`, `serve` with no `-l`, `vite --host`, `flask run --host 0.0.0.0`, `jupyter lab --ip 0.0.0.0`, `rails s -b 0.0.0.0`, `uvicorn --host 0.0.0.0` and `hugo server --bind 0.0.0.0`. The reason names the flag to add. The person can approve the command once. On by default in the policy `ws gate init` writes. |
+| `checkout-pin` | before a call | shell commands | Denies `git checkout` or `switch` to another branch or commit, `reset --hard`, `--merge` and `--keep`, `rebase`, `merge`, `pull`, `cherry-pick`, `revert` and `worktree move` into a checkout that has linked worktrees, or that `paths` names. `git checkout -- FILE`, `restore`, `commit`, `fetch`, `status`, `log` and a branch switch inside a linked worktree go through. The person can approve the command once. Off until you name it. |
 | `record-calls` | before a call | every kind | Appends `{schema, ts, at, runner, payload}` (`ts` is the time; `at` is its legacy spelling, kept beside it) to `$WS_HOME/logs/gate-calls.jsonl`, one line for each hook run. A file write keeps its path and records the text as `{"bytes", "sha256"}`. `ws gate replay` reads that file. |
 
 `bulk-staging` and `record-calls` take no table. The other guards take one.
@@ -212,6 +214,61 @@ and a `skill_dirs` entry outside your home folder is a policy error. Only the fi
 read, so the front matter must close inside them; one that doesn't gives the stderr line.
 A `SKILL.md` that can't be read, or whose `gates` isn't a list of globs, adds no rule and gives one line on standard
 error, once for each session. It never stops a write. The front matter is read as ws's safe subset of YAML.
+
+### dev-server
+
+```toml
+[guards.dev-server]
+allow_hosts = ["203.0.113.5"]    # optional: addresses a dev server may bind besides loopback
+```
+
+A development server that listens on every interface can be reached by anyone on the same network. The guard reads each
+shell command, through `sudo`, `env`, `bash -c`, `python -m`, a path to the program, and the launchers `npx`, `bunx`,
+`pnpx`, `uvx`, `npm exec`, `pnpm exec` and `dlx`, `yarn exec` and `dlx`, `bun x`, `uv run`, `poetry run`, `pipenv run`,
+`pdm run`, `rye run`, `hatch run`, `conda run`, `pipx run` and `bundle exec`. It denies these, and the reason names the
+flag that keeps the server on this machine.
+
+| Command | Denied when | Flag to add |
+|---|---|---|
+| `python -m http.server` | there is no `--bind`/`-b` (it listens on every interface by default), or the value isn't loopback | `--bind 127.0.0.1` |
+| `php -S` | the host isn't loopback (`0.0.0.0:8000`, `[::]:8000`, `:8000`) | `-S localhost:PORT` |
+| `serve`, `npx serve` | there is no `-l`/`--listen` with a loopback host (`-l 3000` is every interface) | `-l localhost:3000` |
+| `vite` | `--host` has no value, or a value that isn't loopback | `--host 127.0.0.1`, or no `--host` |
+| `flask run` | `--host`/`-h` or `FLASK_RUN_HOST` isn't loopback | `--host 127.0.0.1` |
+| `jupyter lab`, `notebook`, `server` | `--ip` (or `--ServerApp.ip`, `--NotebookApp.ip`) isn't loopback; `*` and an empty value are every interface | `--ip 127.0.0.1` |
+| `rails server`, `rails s` | `-b`/`--binding` isn't loopback | `-b 127.0.0.1` |
+| `uvicorn` | `--host` isn't loopback | `--host 127.0.0.1` |
+| `hugo server` | `--bind` isn't loopback | `--bind 127.0.0.1` |
+
+Loopback is `localhost`, any `127.x.x.x` address and `::1`. A server that listens on loopback unless told otherwise
+(everything above except `http.server`, `php -S` and `serve`) is checked only when a flag says otherwise. `allow_hosts`
+lists hosts and addresses that are fine to bind, such as a VPN or tailnet address; a port after the host is ignored,
+and a name that means every interface (`0.0.0.0`, `::`, `*`) is a policy error. The deny is approvable, so a person can
+allow one command once with `ws approve`. A script that holds the flags (`npm run dev`) isn't read; the sandbox is what
+limits the network.
+
+### checkout-pin
+
+```toml
+[guards.checkout-pin]
+paths = ["~/code/app"]    # optional: checkouts to pin even when they have no linked worktree
+```
+
+When a repository has linked worktrees, its main checkout is the shared one: a session that switches branch, resets or
+rebases there pulls the floor from under the others. The guard pins a checkout that has linked worktrees, and any
+checkout named in `paths` (absolute or `~/`, matched by the top of the checkout with links followed). Inside a pinned
+checkout it denies `git checkout` and `git switch` to another branch or commit (and `-b`, `-B`, `-c`, `-C`, `--detach`,
+`--orphan`, `-f`), `git checkout NAME` with no `--`, `reset --hard`, `--merge` and `--keep`, `rebase`, `merge`, `pull`,
+`cherry-pick` and `revert`. `--abort` and `--quit` of the last four go through so a half-done one can be undone. `git
+worktree move` to a destination inside the checkout is denied as well. The reason names the checkout and says to
+use a worktree: `git worktree add ../NAME -b BRANCH`.
+
+These go through: `git checkout -- FILE` and `git checkout TREE -- FILE`, `restore`, `add`, `commit`, `fetch`, `status`,
+`log`, `diff`, `stash`, a soft or mixed `reset`, and any command in a linked worktree (whose `.git` is a file) that
+`paths` doesn't name. A command is judged by the folder it runs in: the session's folder, `git -C DIR`, `--work-tree
+DIR`, `GIT_WORK_TREE=DIR`, or the folder of a literal `cd` earlier in the same command line. A folder that comes from a
+variable or substitution can't be read, so a command that would move HEAD from there is denied and the reason asks for a
+path. The deny is approvable. The check follows the command line, not a script it runs.
 
 ## Findings
 

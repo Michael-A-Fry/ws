@@ -129,6 +129,7 @@ class Facts:
     osi: osinfo.OSInfo
     region: str | None = None
     region_source: str | None = None  # flag | profile | zone | locale
+    needs_region: bool = False  # an offered plugin has a region rule, so a region is worth knowing (and asking for)
     runners: list[Runner] = field(default_factory=list)
     base: Answers = field(default_factory=Answers)
     has_profile: bool = False
@@ -140,6 +141,12 @@ class Facts:
     @property
     def cap(self) -> float | None:
         return self.base.cap
+
+    @property
+    def asks_region(self) -> bool:
+        """Should setup ask for a country? Only when a plugin on offer needs one and nothing firm has said (a locale
+        alone is a guess)."""
+        return self.needs_region and self.region_source in (None, "locale")
 
     @property
     def home(self) -> str:
@@ -248,6 +255,12 @@ def _is_set_up(base: Answers, env, osi) -> bool:
         return False
 
 
+def with_region(facts: Facts, region: str) -> Facts:
+    """The same facts once the person has said which country they are in (two letters)."""
+    where = region.upper()
+    return replace(facts, region=where, region_source="flag", plugins=_plugin_list(where, "flag", facts.env))
+
+
 def gather(env=None, region: str | None = None, osi=None, probe: bool = True) -> Facts:
     """Read the machine; write nothing."""
     env = os.environ if env is None else env
@@ -255,10 +268,13 @@ def gather(env=None, region: str | None = None, osi=None, probe: bool = True) ->
     base = install.answers_from_profile(env)
     if has_control(base.notes):
         base = replace(base, notes=notesdetect.PLAIN)
+    needs = modules.needs_region(env)
     if region:
         where, source = region.upper(), "flag"
-    else:
+    elif needs:
         where, source = modules.region_of(env)
+    else:  # no plugin on offer cares which country this is
+        where, source = None, None
     home = Path(env.get("HOME") or Path.home())
     vaults = [v for v in notesdetect.find(home) if not has_control(v.path)]
     return Facts(
@@ -266,6 +282,7 @@ def gather(env=None, region: str | None = None, osi=None, probe: bool = True) ->
         osi=osi,
         region=where,
         region_source=source,
+        needs_region=needs,
         runners=_find_runners(env, probe),
         base=base,
         has_profile=profile.profile_path(env).is_file(),
@@ -298,8 +315,8 @@ def picked_runner(facts: Facts, requested: str = "") -> Runner | None:
 
 def status_rows(facts: Facts) -> list[Row]:
     osi = facts.osi
-    where = clean(facts.region) if facts.region else "region unknown"
-    rows = [Row("Machine", f"{clean(OS_LABELS.get(osi.kind, osi.kind))} {clean(osi.release)} · {where}".strip())]
+    where = f" · {clean(facts.region)}" if facts.needs_region and facts.region else ""
+    rows = [Row("Machine", f"{clean(OS_LABELS.get(osi.kind, osi.kind))} {clean(osi.release)}{where}".strip())]
     runner = picked_runner(facts)
     if runner:
         rows.append(Row("Runner", f"{runner.label} {clean(runner.version or '')}".strip(), "ok"))
@@ -395,7 +412,7 @@ def check_choices(facts: Facts, c: Choices) -> None:
                 f"unknown plugin {clean(repr(name))}; known: {', '.join(known)}", "list them with: ws plugin list"
             )
         if not plugin.available:
-            cc = modules.REGISTRY[name].region[0] if modules.REGISTRY[name].region else "NZ"
+            cc = modules.REGISTRY[name].region[0]  # an unavailable plugin has a region rule
             raise ChoiceError(
                 f"{name} is {plugin.why}; if that is wrong, run setup with --region {cc}",
                 f"for example: ws setup --region {cc}",
@@ -407,7 +424,7 @@ def check_choices(facts: Facts, c: Choices) -> None:
         raise ChoiceError("the monthly cap must be a number above 0", "for example: ws setup --cap 20")
     validate_notes(c.notes, facts.env)
     if c.region is not None and not re.fullmatch(r"[A-Z]{2}", c.region):
-        raise ChoiceError("the region must be two letters such as NZ", "for example: ws setup --region NZ")
+        raise ChoiceError("the region must be two letters such as CA", "for example: ws setup --region CA")
 
 
 def answers_for(facts: Facts, c: Choices) -> Answers:

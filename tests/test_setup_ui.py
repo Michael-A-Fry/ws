@@ -50,6 +50,17 @@ def unbuilt(box, monkeypatch):
     return box
 
 
+@pytest.fixture
+def regional(box, monkeypatch):
+    """Built plugins with a region rule of their own, and a machine that says nothing about where it is."""
+    for name, regions in (("ledger", ("AU", "GB")), ("tax-pack", ("CA",))):
+        plugin = modules.Module(name, f"{name} for some countries", False, f"roles.{name}", True, region=regions)
+        monkeypatch.setitem(modules.REGISTRY, name, plugin)
+    monkeypatch.setattr(modules, "zone_region", lambda env: None)
+    monkeypatch.setattr(modules, "locale_region", lambda env: None)
+    return box
+
+
 def fake_runner(box: Path, version: str = "2.0.0") -> None:
     exe = box.parent / "bin" / "claude"
     exe.write_text(f"#!/bin/sh\necho {version}\n")
@@ -60,7 +71,7 @@ def plain(text: str) -> str:
     return ANSI_RE.sub("", text)
 
 
-def walk(keys, *, live=False, interactive=True, region="NZ", cols=100, cap=20, color=False, **flags):
+def walk(keys, *, live=False, interactive=True, region="CA", cols=100, cap=20, color=False, **flags):
     """Walk the steps with these keys. A cap is given by default, so the optional cap step is not asked."""
     facts = flow.gather(os.environ, region=region)
     choices = flow.choices_from(facts, region=region, cap=cap, **flags)
@@ -92,13 +103,13 @@ ALL_ENTER = ["enter"] * 4  # begin, plugins, notes, install
 def test_a_second_setup_reports_0_changes_and_uninstall_leaves_no_residue(box, capsys):
     fake_runner(box)
     pre = snapshot(box)
-    assert cli.main(["setup", "--yes", "--region", "NZ", "--plugin", "calendar"]) == 0
+    assert cli.main(["setup", "--yes", "--region", "CA", "--plugin", "calendar"]) == 0
     first = plain(capsys.readouterr().out)
     assert "Done" in first and "+" in first and "Everything is set up" not in first
     after = snapshot(box)
     assert after != pre
 
-    assert cli.main(["setup", "--yes", "--region", "NZ", "--plugin", "calendar"]) == 0
+    assert cli.main(["setup", "--yes", "--region", "CA", "--plugin", "calendar"]) == 0
     second = plain(capsys.readouterr().out)
     assert "Everything is set up" in second and "0 changes" in second
     assert snapshot(box) == after
@@ -111,7 +122,7 @@ def test_a_second_setup_reports_0_changes_and_uninstall_leaves_no_residue(box, c
 @posix_only
 def test_setup_goes_through_install_apply_so_the_manifest_has_it(box, capsys):
     fake_runner(box)
-    cli.main(["setup", "--yes", "--region", "NZ"])
+    cli.main(["setup", "--yes", "--region", "CA"])
     entries = json.loads(install.manifest_path(os.environ).read_text())["entries"]
     paths = {Path(e["path"]) for e in entries}
     assert box / ".ws" / "profile.toml" in paths and box / ".ws" / "policy.toml" in paths
@@ -123,44 +134,115 @@ def test_the_status_block_is_the_real_machine(box):
     (box / "Obsidian" / "V" / ".obsidian").mkdir(parents=True)
     (box / ".ws").mkdir()
     (box / ".ws" / "profile.toml").write_text('[roles.budget]\nmonthly_cap_usd = 25\n[roles.model]\ndefault = "m-1"\n')
-    facts = flow.gather(os.environ, region="NZ")
+    facts = flow.gather(os.environ, region="CA")
     rows = {r.label: r for r in flow.status_rows(facts)}
     assert rows["Runner"].value == "Claude Code 9.8.7" and rows["Runner"].tone == "ok"
     assert rows["Budget"].value == "US$0.00 of US$25 this month"
     assert rows["Model"].value == "m-1"
     assert "Obsidian vault found" in rows["Notes"].value and rows["Notes"].tone == "ok"
-    assert rows["Machine"].value.endswith("· NZ")
+    assert "·" not in rows["Machine"].value  # no plugin on offer cares which country this is
 
 
 def test_no_runner_found_is_said_plainly_and_nothing_breaks(box, capsys):
-    facts = flow.gather(os.environ, region="NZ")
+    facts = flow.gather(os.environ, region="CA")
     rows = {r.label: r for r in flow.status_rows(facts)}
     assert rows["Runner"].tone == "warn" and "none found" in rows["Runner"].value
-    assert cli.main(["setup", "--yes", "--region", "NZ"]) == 0
+    assert cli.main(["setup", "--yes", "--region", "CA"]) == 0
     assert "Runner   none yet" in plain(capsys.readouterr().out)
 
 
-@pytest.mark.usefixtures("unbuilt")
-def test_the_region_rule_is_the_real_one(box, capsys):
-    nz, us = flow.gather(os.environ, region="NZ"), flow.gather(os.environ, region="US")
-    assert {p.name: p.available for p in nz.plugins}["finance"] is True
-    assert {p.name: p.available for p in us.plugins}["finance"] is False
-    with pytest.raises(InstallError, match="NZ only"):
-        flow.check_choices(us, flow.choices_from(us, plugins=["finance"]))
+@pytest.mark.usefixtures("regional")
+@pytest.mark.parametrize(
+    ("where", "ledger", "tax_pack"),
+    [("AU", True, False), ("GB", True, False), ("CA", False, True), ("US", False, False), ("NZ", False, False)],
+)
+def test_the_region_rule_comes_from_each_plugin_s_metadata(where, ledger, tax_pack):
+    facts = flow.gather(os.environ, region=where)
+    assert {p.name: p.available for p in facts.plugins} == {"ledger": ledger, "tax-pack": tax_pack}
+    for name, ok in (("ledger", ledger), ("tax-pack", tax_pack)):
+        if not ok:
+            with pytest.raises(InstallError, match=f"{name} is for .* only"):
+                flow.check_choices(facts, flow.choices_from(facts, plugins=[name]))
+
+
+@pytest.mark.usefixtures("regional")
+def test_a_refused_region_writes_nothing_and_a_fitting_one_installs(box, capsys):
     pre = snapshot(box)
-    assert cli.main(["setup", "--yes", "--region", "US", "--plugin", "finance"]) == 1
-    assert "NZ only" in capsys.readouterr().err and snapshot(box) == pre
-    assert cli.main(["setup", "--yes", "--region", "NZ", "--plugin", "finance"]) == 0
+    assert cli.main(["setup", "--yes", "--region", "US", "--plugin", "ledger"]) == 1
+    assert "ledger is for AU/GB only" in capsys.readouterr().err and snapshot(box) == pre
+    assert cli.main(["setup", "--yes", "--region", "GB", "--plugin", "ledger"]) == 0
+    assert 'region = "GB"' in (box / ".ws" / "profile.toml").read_text()
+
+
+def test_no_region_is_detected_shown_or_asked_when_no_plugin_needs_one(box, monkeypatch):
+    def boom(env):
+        raise AssertionError("the region was looked up although no plugin on offer needs one")
+
+    monkeypatch.setattr(modules, "region_of", boom)
+    facts = flow.gather(os.environ)
+    rows = {r.label: r for r in flow.status_rows(facts)}
+    assert facts.needs_region is False and facts.asks_region is False and facts.region is None
+    assert "·" not in rows["Machine"].value and "unknown" not in rows["Machine"].value
+    assert "Your country" not in walk(ALL_ENTER, region=None)[1]
+    assert "region" not in (box / ".ws" / "profile.toml").read_text()
+
+
+@pytest.mark.usefixtures("regional")
+def test_the_walk_asks_for_a_country_when_a_plugin_needs_one_and_uses_the_answer(box):
+    # begin, "au" + enter, choose the first plugin, notes, install
+    code, text, _ = walk(["enter", "a", "u", "enter", "space", "enter", "enter", "enter"], region=None)
+    assert code == 0 and "Your country" in text
+    written = (box / ".ws" / "profile.toml").read_text()
+    assert 'region = "AU"' in written and "ledger = true" in written
+
+
+@pytest.mark.usefixtures("regional")
+def test_a_country_can_be_skipped_and_nothing_is_recorded(box):
+    code, text, _ = walk(["enter", "enter", "enter", "enter", "enter"], region=None)
+    assert code == 0 and "skipped" in text
+    assert "region" not in (box / ".ws" / "profile.toml").read_text()
+
+
+@pytest.mark.usefixtures("regional")
+def test_a_one_letter_country_is_refused_where_it_is_typed(box):
+    code, text, _ = walk(["enter", "a", "enter", "u", "enter", "enter", "enter", "enter"], region=None, live=True)
+    assert code == 0 and "a country is two letters" in plain(text)
+    assert 'region = "AU"' in (box / ".ws" / "profile.toml").read_text()
+
+
+@pytest.mark.usefixtures("regional")
+@pytest.mark.parametrize("source", ["zone", "profile"])
+def test_the_walk_does_not_ask_when_the_machine_or_profile_says(box, monkeypatch, source):
+    if source == "zone":
+        monkeypatch.setattr(modules, "zone_region", lambda env: "GB")
+    else:
+        (box / ".ws").mkdir()
+        (box / ".ws" / "profile.toml").write_text('[machine]\nregion = "AU"\n')
+    code, text, facts = walk(["enter", "enter", "enter", "enter"], region=None)
+    assert code == 0 and "Your country" not in text and facts.asks_region is False
+
+
+@pytest.mark.usefixtures("regional")
+def test_a_locale_alone_is_a_guess_so_it_is_still_asked(box, monkeypatch):
+    monkeypatch.setattr(modules, "locale_region", lambda env: "US")
+    facts = flow.gather(os.environ)
+    assert facts.region == "US" and facts.region_source == "locale" and facts.asks_region is True
+
+
+@pytest.mark.usefixtures("regional")
+def test_the_status_row_names_the_country_only_when_it_matters(box):
+    facts = flow.gather(os.environ, region="AU")
+    assert {r.label: r for r in flow.status_rows(facts)}["Machine"].value.endswith("· AU")
 
 
 def test_a_region_given_goes_into_the_profile_and_the_diff(box, capsys):
-    assert cli.main(["setup", "--yes", "--region", "nz"]) == 0
-    assert 'region = "NZ"' in (box / ".ws" / "profile.toml").read_text()
+    assert cli.main(["setup", "--yes", "--region", "ca"]) == 0
+    assert 'region = "CA"' in (box / ".ws" / "profile.toml").read_text()
 
 
 @pytest.mark.usefixtures("unbuilt")
 def test_the_preview_writes_nothing_and_counts_like_the_install(box):
-    facts = flow.gather(os.environ, region="NZ")
+    facts = flow.gather(os.environ, region="CA")
     pre = snapshot(box)
     pv = flow.preview(facts, flow.choices_from(facts, plugins=["calendar"]))
     assert snapshot(box) == pre
@@ -184,7 +266,7 @@ def test_bad_answers_are_refused_before_anything_is_written(box, capsys):
 
 
 def test_apply_calls_progress_after_each_step_and_not_on_a_dry_run(box):
-    facts = flow.gather(os.environ, region="NZ")
+    facts = flow.gather(os.environ, region="CA")
     steps = install.plan(flow.answers_for(facts, flow.choices_from(facts)), os.environ, facts.osi)
     seen = []
     install.apply(steps, os.environ, dry_run=True, progress=lambda s, a: seen.append(a))
@@ -198,7 +280,7 @@ def test_apply_calls_progress_after_each_step_and_not_on_a_dry_run(box):
 
 
 def test_progress_groups_the_steps_and_reports_each_group_once(box):
-    facts = flow.gather(os.environ, region="NZ")
+    facts = flow.gather(os.environ, region="CA")
     steps = install.plan(flow.answers_for(facts, flow.choices_from(facts)), os.environ, facts.osi)
     prog = flow.Progress(steps)
     finished = []
@@ -227,11 +309,10 @@ def test_the_walk_picks_a_plugin_with_the_keyboard(box):
     assert "mail-drafts = true" in (box / ".ws" / "profile.toml").read_text()
 
 
-@pytest.mark.usefixtures("unbuilt")
-def test_the_walk_will_not_choose_finance_outside_nz(box):
-    keys = ["enter", "down", "down", "space", "enter", "enter", "enter"]
-    walk(keys, region="US")
-    assert "finance = false" in (box / ".ws" / "profile.toml").read_text()
+@pytest.mark.usefixtures("regional")
+def test_the_walk_will_not_choose_a_plugin_outside_its_regions(box):
+    walk(["enter", "space", "enter", "enter", "enter"], region="US")
+    assert "ledger = false" in (box / ".ws" / "profile.toml").read_text()
 
 
 @pytest.mark.usefixtures("unbuilt")
@@ -375,9 +456,9 @@ def attended_run(monkeypatch, env, *, no_color=False):
     monkeypatch.setattr(inline, "Terminal", FakeTerminal)
     keys = iter(ALL_ENTER)
     monkeypatch.setattr(inline, "Keys", lambda fd: type("K", (), {"read": staticmethod(lambda: next(keys))})())
-    facts = flow.gather(os.environ, region="NZ")
+    facts = flow.gather(os.environ, region="CA")
     out = Tty()
-    code = inline.run(facts, flow.choices_from(facts, region="NZ", cap=20), out=out, no_color=no_color, env=env)
+    code = inline.run(facts, flow.choices_from(facts, region="CA", cap=20), out=out, no_color=no_color, env=env)
     return code, out.getvalue(), FakeTerminal.made[0]
 
 
@@ -418,7 +499,7 @@ def test_colour_follows_no_color_the_flag_and_force_color(box, monkeypatch, env,
 
 
 def test_the_no_color_flag_is_accepted_by_ws_setup(box, capsys):
-    assert cli.main(["setup", "--yes", "--no-color", "--region", "NZ"]) == 0
+    assert cli.main(["setup", "--yes", "--no-color", "--region", "CA"]) == 0
     assert "\x1b" not in capsys.readouterr().out
 
 
@@ -434,7 +515,7 @@ def test_with_colour_stripped_the_output_is_the_no_color_output(box):
 
 
 def test_setup_needs_a_terminal_without_yes(box, capsys):
-    assert cli.main(["setup", "--region", "NZ"]) == 1
+    assert cli.main(["setup", "--region", "CA"]) == 1
     assert "needs a terminal" in capsys.readouterr().err
 
 
@@ -479,7 +560,7 @@ def test_the_visual_kit_describes_what_the_code_draws(box):
     """The kit in `ws.setup_ui`'s docstring, checked against the output rather than against its own words."""
     fake_runner(box)
     full = Ansi(FULL)
-    facts = flow.gather(os.environ, region="NZ")
+    facts = flow.gather(os.environ, region="CA")
     banner = "\n".join(inline.banner(full, 100, 120))
     assert "\x1b[1mws-aitoolkit" in banner  # the name is bold, with no colour of its own
     assert "\x1b[1;38;5;49msetup" in banner  # the word "setup" is mint
@@ -514,7 +595,7 @@ def test_the_terminal_uses_only_the_colours_the_kit_names(box):
 
 def test_a_refusal_is_red_and_a_warning_amber(box):
     for color, red, amber in ((FULL, "38;5;203", "38;5;214"), (BASIC, "31", "33")):
-        facts = flow.gather(os.environ, region="NZ")
+        facts = flow.gather(os.environ, region="CA")
         out = io.StringIO()
         wiz = inline.Wizard(facts, flow.choices_from(facts), out, lambda: "q", color=color, live=False)
         wiz.fail("no", "hint")
@@ -526,8 +607,8 @@ def test_a_refusal_is_red_and_a_warning_amber(box):
 
 
 def _start(**kw):
-    facts = flow.gather(os.environ, region="NZ")
-    srv = SetupServer(facts, flow.choices_from(facts, region="NZ"), **kw)
+    facts = flow.gather(os.environ, region="CA")
+    srv = SetupServer(facts, flow.choices_from(facts, region="CA"), **kw)
     out: dict = {}
     t = threading.Thread(target=lambda: out.update(result=srv.serve()), daemon=True)
     t.start()
@@ -555,7 +636,7 @@ def _api(srv, path, body, **kw):
 
 @pytest.mark.usefixtures("unbuilt")
 def test_the_page_is_local_escaped_and_has_no_external_urls(box):
-    facts = flow.gather(os.environ, region="NZ")
+    facts = flow.gather(os.environ, region="CA")
     page = render_page(facts, flow.choices_from(facts))
     assert "http://" not in page.replace("http://www.w3.org/2000/svg", "") and "https://" not in page
     assert "opt-in" not in page and "Choose your plugins" in page and 'id="boot"' in page
@@ -574,7 +655,7 @@ def _unbuilt_words() -> set[str]:
 
 def test_setup_offers_only_plugins_that_are_built(box):
     assert _unbuilt_words()
-    facts = flow.gather(os.environ, region="NZ")
+    facts = flow.gather(os.environ, region="CA")
     assert facts.plugins == []
     page = render_page(facts, flow.choices_from(facts)).lower()
     boot = json.loads(re.search(r'id="boot">(.*?)</script>', page, re.DOTALL).group(1))
@@ -594,22 +675,22 @@ def test_the_walk_shows_no_plugin_that_is_not_built(box, live):
 
 
 def test_an_unbuilt_plugin_is_not_a_choice_by_name(box, capsys):
-    facts = flow.gather(os.environ, region="NZ")
+    facts = flow.gather(os.environ, region="CA")
     with pytest.raises(flow.ChoiceError, match="unknown plugin"):
         flow.check_choices(facts, flow.choices_from(facts, plugins=["finance"]))
-    assert cli.main(["setup", "--yes", "--region", "NZ", "--plugin", "calendar"]) == 1
+    assert cli.main(["setup", "--yes", "--region", "CA", "--plugin", "calendar"]) == 1
     assert "unknown plugin" in capsys.readouterr().err
     assert not (box / ".ws" / "profile.toml").exists()
 
 
 def test_a_profile_with_an_unbuilt_plugin_on_loads_keeps_it_and_doctor_notes_it(box, capsys, monkeypatch):
     monkeypatch.setenv(modules.SHOW_UNBUILT, "1")
-    assert cli.main(["setup", "--yes", "--region", "NZ", "--plugin", "calendar", "--cap", "20"]) == 0
+    assert cli.main(["setup", "--yes", "--region", "CA", "--plugin", "calendar", "--cap", "20"]) == 0
     monkeypatch.delenv(modules.SHOW_UNBUILT)
     capsys.readouterr()
-    facts = flow.gather(os.environ, region="NZ")
+    facts = flow.gather(os.environ, region="CA")
     assert facts.plugins == [] and "calendar" in facts.base.modules
-    assert cli.main(["setup", "--yes", "--region", "NZ", "--cap", "20"]) == 0  # run again: the choice is not dropped
+    assert cli.main(["setup", "--yes", "--region", "CA", "--cap", "20"]) == 0  # run again: the choice is not dropped
     assert "calendar = true" in (box / ".ws" / "profile.toml").read_text()
     capsys.readouterr()
     code = cli.main(["doctor", "--offline", "--json"])
@@ -619,18 +700,50 @@ def test_a_profile_with_an_unbuilt_plugin_on_loads_keeps_it_and_doctor_notes_it(
 
 
 def test_doctor_has_no_plugin_line_when_none_is_unbuilt_and_on(box, capsys):
-    assert cli.main(["setup", "--yes", "--region", "NZ", "--cap", "20"]) == 0
+    assert cli.main(["setup", "--yes", "--region", "CA", "--cap", "20"]) == 0
     capsys.readouterr()
     cli.main(["doctor", "--offline", "--json"])
     assert not [c for c in json.loads(capsys.readouterr().out)["data"]["checks"] if c["id"] == "WS009"]
 
 
-@pytest.mark.usefixtures("unbuilt")
+def _boot_of(facts):
+    page = render_page(facts, flow.choices_from(facts))
+    return json.loads(re.search(r'id="boot">(.*?)</script>', page, re.DOTALL).group(1))
+
+
+@pytest.mark.usefixtures("regional")
 def test_the_page_shows_the_real_region_rule(box):
-    facts = flow.gather(os.environ, region="US")
-    boot = re.search(r'id="boot">(.*?)</script>', render_page(facts, flow.choices_from(facts)), re.DOTALL).group(1)
-    finance = next(p for p in json.loads(boot)["plugins"] if p["name"] == "finance")
-    assert finance["available"] is False and "NZ" in finance["why"]
+    boot = _boot_of(flow.gather(os.environ, region="US"))
+    ledger = next(p for p in boot["plugins"] if p["name"] == "ledger")
+    assert ledger["available"] is False and "AU/GB" in ledger["why"] and boot["region"]["ask"] is False
+
+
+@pytest.mark.usefixtures("regional")
+def test_the_page_asks_for_a_country_only_when_a_plugin_needs_one(box):
+    assert _boot_of(flow.gather(os.environ))["region"] == {"ask": True, "value": ""}
+
+
+def test_the_page_does_not_ask_for_a_country_when_nothing_needs_one(box):
+    assert _boot_of(flow.gather(os.environ))["region"] == {"ask": False, "value": ""}
+
+
+@pytest.mark.usefixtures("regional")
+def test_a_country_typed_on_the_page_decides_the_plugin_rules(box):
+    facts = flow.gather(os.environ)
+    srv = SetupServer(facts, flow.choices_from(facts))
+    threading.Thread(target=srv.serve, daemon=True).start()
+    try:
+        body = {"plugins": ["ledger"], "notes": "~/Notes", "region": "us"}
+        status, data = _api(srv, "/api/preview", body)
+        assert status == 400 and "ledger is for AU/GB only" in json.loads(data)["error"]
+        assert _api(srv, "/api/preview", {**body, "region": "x1"})[0] == 400
+        assert _api(srv, "/api/preview", {**body, "region": 5})[0] == 400
+        status, data = _api(srv, "/api/install", {**body, "region": "au"})
+        assert status == 200
+    finally:
+        srv.close()
+    written = (box / ".ws" / "profile.toml").read_text()
+    assert 'region = "AU"' in written and "ledger = true" in written
 
 
 def test_the_server_is_loopback_only_and_checks_token_host_and_origin(box):
@@ -704,18 +817,18 @@ def test_install_calls_the_engine_then_the_server_closes(box):
     with pytest.raises(OSError):
         _call(srv, "GET", f"/?t={srv.token}")
     # what it wrote is what `ws install` would have: a second install changes nothing
-    facts = flow.gather(os.environ, region="NZ")
+    facts = flow.gather(os.environ, region="CA")
     assert flow.preview(facts, flow.choices_from(facts)).headline() == "0 changes"
 
 
-@pytest.mark.usefixtures("unbuilt")
+@pytest.mark.usefixtures("regional")
 def test_a_refused_region_is_a_400_with_the_reason(box):
     facts = flow.gather(os.environ, region="US")
     srv = SetupServer(facts, flow.choices_from(facts))
     threading.Thread(target=srv.serve, daemon=True).start()
     try:
-        status, data = _api(srv, "/api/install", {"plugins": ["finance"], "notes": "~/Notes"})
-        assert status == 400 and "NZ only" in json.loads(data)["error"]
+        status, data = _api(srv, "/api/install", {"plugins": ["ledger"], "notes": "~/Notes"})
+        assert status == 400 and "AU/GB only" in json.loads(data)["error"]
     finally:
         srv.close()
 
@@ -725,7 +838,7 @@ def test_finish_closes_a_set_up_page_and_idle_closes_the_rest(box):
     assert _api(srv, "/api/finish", {})[0] == 200
     t.join(5)
     assert out["result"]["headline"] == "0 changes"
-    facts = flow.gather(os.environ, region="NZ")
+    facts = flow.gather(os.environ, region="CA")
     assert SetupServer(facts, flow.choices_from(facts), idle_seconds=0.3).serve() is None
 
 
@@ -738,13 +851,13 @@ def test_setup_help_lists_every_flag(capsys):
         assert flag in out
 
 
-@pytest.mark.usefixtures("unbuilt")
+@pytest.mark.usefixtures("regional")
 def test_errors_end_with_a_line_that_says_what_to_try(box, capsys):
     for argv, hint in (
         (["--plugin", "nope"], "ws plugin list"),
         (["--cap", "0"], "--cap 20"),
-        (["--region", "N"], "--region NZ"),
-        (["--region", "US", "--plugin", "finance"], "--region NZ"),
+        (["--region", "N"], "--region CA"),
+        (["--region", "US", "--plugin", "ledger"], "--region AU"),
     ):
         assert cli.main(["setup", "--yes", *argv]) == 1
         err = capsys.readouterr().err.splitlines()
@@ -762,7 +875,7 @@ def test_help_reads_as_usage_flags_examples(capsys):
 @posix_only
 def test_the_close_says_where_the_answers_are_saved(box, capsys):
     fake_runner(box)
-    assert cli.main(["setup", "--yes", "--region", "NZ"]) == 0
+    assert cli.main(["setup", "--yes", "--region", "CA"]) == 0
     out = capsys.readouterr().out
     assert "Saved in ~/.ws/profile.toml" in out and "Next" in out
 
@@ -793,7 +906,7 @@ def test_nothing_from_outside_reaches_the_terminal_raw(box):
     )
     (box / ".ws" / "profile.toml").write_text(toml)
     (box / "Obsidian" / f"V{ESC}[31m" / ".obsidian").mkdir(parents=True)  # a vault whose folder name has an ESC in it
-    facts = flow.gather(os.environ, region="NZ")
+    facts = flow.gather(os.environ, region="CA")
     rows = {r.label: r.value for r in flow.status_rows(facts)}
     assert not any(flow.has_control(v) for v in rows.values())
     assert facts.vaults == []  # not offered: a name with a control character cannot be chosen by typing it
@@ -818,8 +931,8 @@ def test_a_notes_folder_must_be_plain_and_a_full_path(box, capsys):
         ("", "empty"),
         ("~/" + "x" * 5000, "too long"),
     ):
-        facts = flow.gather(os.environ, region="NZ")
-        c = replace(flow.choices_from(facts, region="NZ"), notes=notes)
+        facts = flow.gather(os.environ, region="CA")
+        c = replace(flow.choices_from(facts, region="CA"), notes=notes)
         with pytest.raises(InstallError, match=message):
             flow.check_choices(facts, c)
     assert snapshot(box) == pre
@@ -901,7 +1014,7 @@ def test_a_non_ascii_token_is_a_403_not_a_traceback(box, capsys):
 def test_only_a_request_with_the_token_keeps_the_page_alive(box):
     import time
 
-    facts = flow.gather(os.environ, region="NZ")
+    facts = flow.gather(os.environ, region="CA")
     srv = SetupServer(facts, flow.choices_from(facts), idle_seconds=0.6)
     done = threading.Event()
     threading.Thread(target=lambda: (srv.serve(), done.set()), daemon=True).start()
@@ -928,7 +1041,7 @@ def test_the_browser_is_started_on_a_private_file_not_on_the_token(box, monkeypa
 
     monkeypatch.setattr(web, "SetupServer", Spy)
     monkeypatch.setattr(web.webbrowser, "open", lambda arg: seen.setdefault("arg", arg))
-    facts = flow.gather(os.environ, region="NZ")
+    facts = flow.gather(os.environ, region="CA")
     t = threading.Thread(target=lambda: seen.setdefault("code", web.run(facts, flow.choices_from(facts))), daemon=True)
     t.start()
     import time
@@ -1011,7 +1124,7 @@ def test_ctrl_z_gives_the_screen_back_and_fg_takes_it_again(box):
 
 def test_the_width_is_read_again_so_a_resize_is_picked_up(box):
     size = [120]
-    facts = flow.gather(os.environ, region="NZ")
+    facts = flow.gather(os.environ, region="CA")
     wiz = inline.Wizard(facts, flow.choices_from(facts), io.StringIO(), lambda: "enter", cols=lambda: size[0])
     assert (wiz.cols, wiz.width) == (120, 100)
     size[0] = 70  # the window was resized
@@ -1055,7 +1168,7 @@ def test_the_cap_step_is_not_asked_when_the_profile_or_a_flag_has_one(box):
 
 
 def test_the_web_takes_an_optional_cap_and_refuses_one_that_is_not_a_number(box):
-    facts = flow.gather(os.environ, region="NZ")
+    facts = flow.gather(os.environ, region="CA")
     srv = SetupServer(facts, flow.choices_from(facts))
     threading.Thread(target=srv.serve, daemon=True).start()
     try:
@@ -1077,7 +1190,7 @@ def test_the_web_takes_an_optional_cap_and_refuses_one_that_is_not_a_number(box)
 def test_setup_never_writes_dial_act(box, capsys):
     from ws import policy
 
-    cli.main(["setup", "--yes", "--region", "NZ", "--plugin", "calendar", "--cap", "20"])
+    cli.main(["setup", "--yes", "--region", "CA", "--plugin", "calendar", "--cap", "20"])
     for name in ("policy.toml", "profile.toml"):
         text = (box / ".ws" / name).read_text()
         assert 'dial = "act"' not in text
@@ -1101,7 +1214,7 @@ def test_a_sigterm_while_installing_is_noted_and_the_summary_says_what_was_writt
 
     monkeypatch.setattr(flow, "run_install", term_then_install)
     try:
-        facts = flow.gather(os.environ, region="NZ")
+        facts = flow.gather(os.environ, region="CA")
         out = io.StringIO()
         keys = iter(ALL_ENTER)
         with inline.Terminal(slave, out) as term:
@@ -1131,7 +1244,7 @@ def test_a_sigterm_while_installing_is_noted_and_the_summary_says_what_was_writt
 def test_the_page_colours_come_from_the_tokens(box):
     from ws.setup_ui import web
 
-    facts = flow.gather(os.environ, region="NZ")
+    facts = flow.gather(os.environ, region="CA")
     page = render_page(facts, flow.choices_from(facts))
     assert brand.css() in page
     assert not re.search(r"#[0-9a-fA-F]{3,8}\b|rgba?\(", web.STYLE), "the rules name roles; the tokens hold the colours"
@@ -1184,7 +1297,7 @@ def test_a_json_reply_is_allowed_nothing(box):
 
 
 def test_the_finished_screen_has_a_description_for_every_command(box):
-    facts = flow.gather(os.environ, region="NZ")
+    facts = flow.gather(os.environ, region="CA")
     steps = flow.next_steps(facts, flow.choices_from(facts))
     assert [c for c, _ in steps] == flow.next_commands(facts, flow.choices_from(facts))
     assert all(cmd.startswith("ws ") and desc for cmd, desc in steps)
@@ -1195,7 +1308,7 @@ def test_the_finished_screen_has_a_description_for_every_command(box):
 def test_the_setup_server_is_the_shared_loopback_server_with_setups_three_calls(box):
     from ws.ui.server import LoopbackServer
 
-    facts = flow.gather(os.environ, region="NZ")
+    facts = flow.gather(os.environ, region="CA")
     srv = SetupServer(facts, flow.choices_from(facts))
     try:
         assert isinstance(srv, LoopbackServer)

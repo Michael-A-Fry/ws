@@ -7,10 +7,12 @@ them by setting `WS_SHOW_UNBUILT=1`.
 
 Each is a small adapter: what it is, whether it is on by default, the profile tables it owns, the folders it needs and
 the regions it is for. `ws plugin list|add|remove` goes through the same install.plan/apply as `ws install`, so it is
-idempotent too. (`ws module` still works as a hidden alias.) A plugin made for one region, such as `finance` for NZ,
-will not switch on in another. The region is `[machine] region` in the profile (`ws plugin add NAME --region CC` sets
-it), else the country of the time zone. A locale alone is only a hint (a UTC server often has a US one): it warns and
-carries on. If neither says, nothing is refused.
+idempotent too. (`ws module` still works as a hidden alias.) A plugin names its own regions (ISO country codes) in its
+metadata, and one made for some regions will not switch on in another. There is no default country: a plugin with no
+regions is for everyone, and setup asks for a region only when an offered plugin has a region rule. The region is
+`[machine] region` in the profile (`ws plugin add NAME --region CC` sets it), else the country of the time zone, read
+from the system's `zone.tab` or, when that is missing, from the REGIONS table below. A locale alone is only a hint (a
+UTC server often has a US one): it warns and carries on. If nothing says, nothing is refused.
 """
 
 from __future__ import annotations
@@ -39,7 +41,7 @@ class Module:
     table: str  # the profile table it adds, written the way the profile shows it
     built: bool = False
     role_names: tuple[str, ...] = ()  # the [roles.*] tables it owns: dropped when it is switched off
-    region: tuple[str, ...] = ()  # ISO country codes it is made for; empty = any
+    region: tuple[str, ...] = ()  # ISO country codes it is made for (its own rule); empty = any
 
     @property
     def status(self) -> str:
@@ -102,14 +104,7 @@ REGISTRY: dict[str, Module] = {
         ),
         Module("mail-drafts", "draft replies to your mail for you to send", False, "roles.mail-drafts", False),
         Module("calendar", "read your calendar to plan around", False, "roles.calendar", False),
-        Module(
-            "finance",
-            "your investments and spending, kept on your machine",
-            False,
-            "roles.finance",
-            False,
-            region=("NZ",),
-        ),
+        Module("finance", "your investments and spending, kept on your machine", False, "roles.finance", False),
         Module("knowledge-graph", "links between your notes and memory", False, "roles.knowledge-graph", False),
     )
 }
@@ -138,8 +133,90 @@ def unbuilt_on(on, env=None) -> list[str]:
 
 # ---- region ----------------------------------------------------------------------------------------------------------
 
-_NZ_ZONES = {"Pacific/Auckland", "Pacific/Chatham", "NZ", "NZ-CHAT", "Antarctica/McMurdo", "Antarctica/South_Pole"}
 ZONE_TAB = Path("/usr/share/zoneinfo/zone.tab")
+
+
+@dataclass(frozen=True)
+class Region:
+    """One row of the region table: how a time zone points at a country when the system's `zone.tab` can't be read."""
+
+    code: str  # ISO 3166 alpha-2
+    zones: tuple[str, ...]  # IANA zone names, with the legacy aliases people still have in $TZ
+    abbreviations: tuple[str, ...] = ()  # POSIX names such as NZST; only ones no other country uses
+
+
+def _regions(*rows: Region) -> dict[str, Region]:
+    return {r.code: r for r in rows}
+
+
+# A starting set, not a list of supported countries: `zone.tab` covers every country, and a profile or `--region`
+# names any two-letter code. Adding a row needs no other change.
+REGIONS: dict[str, Region] = _regions(
+    Region(
+        "AU",
+        (
+            "Australia/Sydney",
+            "Australia/Melbourne",
+            "Australia/Brisbane",
+            "Australia/Adelaide",
+            "Australia/Perth",
+            "Australia/Darwin",
+            "Australia/Hobart",
+            "Australia/Canberra",
+        ),
+        ("AEST", "AEDT", "ACST", "ACDT", "AWST"),
+    ),
+    Region(
+        "CA",
+        (
+            "America/Toronto",
+            "America/Vancouver",
+            "America/Edmonton",
+            "America/Winnipeg",
+            "America/Halifax",
+            "America/St_Johns",
+            "Canada/Eastern",
+            "Canada/Pacific",
+        ),
+    ),
+    Region("DE", ("Europe/Berlin",)),
+    Region("FR", ("Europe/Paris",)),
+    Region("GB", ("Europe/London", "Europe/Belfast", "GB")),
+    Region("IE", ("Europe/Dublin", "Eire")),
+    Region("IN", ("Asia/Kolkata", "Asia/Calcutta")),
+    Region("JP", ("Asia/Tokyo", "Japan"), ("JST",)),
+    Region(
+        "NZ",
+        ("Pacific/Auckland", "Pacific/Chatham", "NZ", "NZ-CHAT", "Antarctica/McMurdo", "Antarctica/South_Pole"),
+        ("NZST", "NZDT"),
+    ),
+    Region("SG", ("Asia/Singapore", "Singapore")),
+    Region(
+        "US",
+        (
+            "America/New_York",
+            "America/Chicago",
+            "America/Denver",
+            "America/Los_Angeles",
+            "America/Phoenix",
+            "America/Anchorage",
+            "Pacific/Honolulu",
+            "US/Eastern",
+            "US/Central",
+            "US/Mountain",
+            "US/Pacific",
+        ),
+    ),
+    Region("ZA", ("Africa/Johannesburg",), ("SAST",)),
+)
+_BY_ZONE = {z: r.code for r in REGIONS.values() for z in r.zones}
+_BY_ABBREVIATION = {a: r.code for r in REGIONS.values() for a in r.abbreviations}
+_POSIX_TZ = re.compile(r"^([A-Za-z]{3,6})[-+]?\d")  # a POSIX $TZ such as NZST-12NZDT,M9.5.0,M4.1.0/3
+
+
+def needs_region(env=None) -> bool:
+    """Does any plugin on offer carry a region rule? Setup asks for a region only when one does."""
+    return any(m.region for m in offered(env).values())
 
 
 def _zone_name(env) -> str | None:
@@ -159,12 +236,7 @@ def _zone_name(env) -> str | None:
         return None
 
 
-_POSIX_NZ = re.compile(r"^NZ[SD]T[-+]?\d")  # a POSIX $TZ such as NZST-12NZDT,M9.5.0,M4.1.0/3
-
-
 def _zone_country(zone: str) -> str | None:
-    if zone in _NZ_ZONES or _POSIX_NZ.match(zone):
-        return "NZ"
     try:
         for line in ZONE_TAB.read_text(encoding="utf-8").splitlines():
             cols = line.split("\t")
@@ -172,11 +244,14 @@ def _zone_country(zone: str) -> str | None:
                 return cols[0]
     except OSError:
         pass
-    return None
+    if hit := _BY_ZONE.get(zone):
+        return hit
+    posix = _POSIX_TZ.match(zone)
+    return _BY_ABBREVIATION.get(posix.group(1).upper()) if posix else None
 
 
 def zone_region(env) -> str | None:
-    """The country of this machine's time zone (Pacific/Auckland, or a POSIX NZST-12NZDT, -> NZ); None for UTC and any
+    """The country of this machine's time zone (Europe/Dublin -> IE; a POSIX NZST-12NZDT -> NZ); None for UTC and any
     zone that belongs to no country."""
     zone = _zone_name(env)
     return _zone_country(zone) if zone else None
@@ -277,7 +352,7 @@ def _change(name: str, turn_on: bool, region: str | None = None, output_json: bo
             output.did_you_mean(name, shown) or f"known: {', '.join(shown)}",
         )
     if region is not None and not re.fullmatch(r"[A-Za-z]{2}", region):
-        raise WsError("bad_input", f"--region takes a two-letter country code such as NZ, not {region!r}")
+        raise WsError("bad_input", f"--region takes a two-letter country code such as CA, not {region!r}")
     region = region.upper() if region else None
     try:
         if not install.profile_path().is_file():

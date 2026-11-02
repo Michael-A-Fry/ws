@@ -8,6 +8,14 @@ body of the GitHub release.
 
 ## [Unreleased]
 
+### Changed
+
+- The session-context guard's default state files are `STATE.md`, `.state/STATE.md`, `HANDOFF.md` and `TODO.md`. A
+  project that keeps its state elsewhere sets `files` under `[guards.session-context]`.
+- Plugins carry their own region rule; there's no default country, and setup asks for one only when an offered plugin
+  needs it.
+- The claims guard reads the default branch from `origin/HEAD`, then `init.defaultBranch`, then `main`.
+
 ## [0.1.6] - 2026-11-02
 
 A safer launch environment, setup that offers only what's built, and the first part of the ws home data API.

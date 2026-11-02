@@ -11,7 +11,7 @@ import os
 import pytest
 
 from home import NOW, SID, SID2, Box, agent, iso
-from ws import approvals, evalstats
+from ws import approvals, evalstats, modules
 from ws.approvals import Bound
 from ws.home import api
 from ws.home.sources import SourceError, _files, all_sources, claude_code, collie, otel_jsonl, transcripts
@@ -427,16 +427,21 @@ def test_ws_plugins_lists_built_modules_and_hides_unbuilt_ones_that_are_off(box)
     assert "finance" not in plugins  # not built and not on: never shown
 
 
-def test_ws_plugins_lists_the_modules_with_on_built_and_region(box):
+def test_ws_plugins_lists_the_modules_with_on_built_and_region(box, monkeypatch):
     box.environ["WS_SHOW_UNBUILT"] = "1"  # a developer view: the unbuilt ones show, marked not built
+    plugin = modules.Module("ledger", "a ledger", False, "roles.ledger", False, region=("AU", "GB"))
+    monkeypatch.setitem(modules.REGISTRY, "ledger", plugin)  # a plugin's region rule is its own metadata
+    monkeypatch.setattr(modules, "zone_region", lambda env: None)  # whatever zone and locale the host has
+    monkeypatch.setattr(modules, "locale_region", lambda env: None)
     plugins = {p.name: p for p in read("ws_plugins", "plugins", box.env())}
     assert plugins["memory"].on and plugins["memory"].built
     assert not plugins["finance"].on and not plugins["finance"].built
-    assert plugins["finance"].region_ok is True  # no region known on this box: ws doesn't refuse on a guess
-    box.profile('[machine]\nregion = "AU"\n')
-    assert {p.name: p for p in read("ws_plugins", "plugins", box.env())}["finance"].region_ok is False
-    box.profile('[machine]\nregion = "NZ"\n')
-    assert {p.name: p for p in read("ws_plugins", "plugins", box.env())}["finance"].region_ok is True
+    assert plugins["finance"].region_ok is True  # no region rule at all
+    assert plugins["ledger"].region_ok is True  # no region known on this box: ws doesn't refuse on a guess
+    for region, ok in (("NZ", False), ("AU", True), ("GB", True), ("US", False)):
+        box.profile(f'[machine]\nregion = "{region}"\n')
+        listed = {p.name: p for p in read("ws_plugins", "plugins", box.env())}
+        assert listed["ledger"].region_ok is ok and listed["finance"].region_ok is True
 
 
 # --- evalstats.trend -------------------------------------------------------------------------------------------------

@@ -199,8 +199,8 @@ or no terminal, `--yes` is required). Harvest never approves anything.
 ws has no prompt scrubber, so harvest refuses to copy a prompt that names a secret in your registry or looks like a key,
 token, password, URL with a password, private key or long base64 string, and says which job it skipped. It checks names
 and shapes, not secret values: the store belongs to the broker and the registry offers no check that avoids reading
-them. That check catches shapes, not meaning: read each proposal before you approve it. Client or FIU data in a prompt
-is for you to catch.
+them. That check catches shapes, not meaning: read each proposal before you approve it. Confidential or client data in
+a prompt is for you to catch.
 
 Files: tasks in `$WS_HOME/eval/tasks/`, proposals in `proposed/`, set-aside ones in `rejected/`, trial results in
 `results.jsonl`, stored looks in `looks.jsonl`.

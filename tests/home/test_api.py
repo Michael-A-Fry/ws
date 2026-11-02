@@ -507,10 +507,10 @@ def test_an_event_with_no_session_or_under_an_opaque_path_is_opaque(box):
 
 # --- the opaque rule, fail closed (fix round 1) ----------------------------------------------------------------------
 
-FIU = "~/code/fiu"
+CLIENT = "~/code/client"
 
 
-def fiu_profile(box, root: str = FIU) -> None:
+def client_profile(box, root: str = CLIENT) -> None:
     box.profile(f'[home]\nopaque_paths = ["{root}"]\n')
 
 
@@ -519,7 +519,7 @@ def timed_out(argv, timeout_s):
 
 
 def test_an_ask_whose_session_is_not_in_the_snapshot_is_opaque(box):
-    fiu_profile(box)  # claude agents timed out, so session S isn't known
+    client_profile(box)  # claude agents timed out, so session S isn't known
     box.lines(
         box.usage / "asks" / "asks.jsonl",
         [{"event": "added", "id": "q", "ts": iso(), "redacted": False, "session": {"session_id": SID},
@@ -530,7 +530,7 @@ def test_an_ask_whose_session_is_not_in_the_snapshot_is_opaque(box):
 
 
 def test_an_ask_with_a_repo_name_but_no_session_or_folder_is_opaque(box):
-    fiu_profile(box)
+    client_profile(box)
     box.lines(
         box.usage / "asks" / "asks.jsonl",
         [{"event": "added", "id": "q", "ts": iso(), "redacted": False, "repo": "case-1", "question": "SECRET Q"}],
@@ -540,7 +540,7 @@ def test_an_ask_with_a_repo_name_but_no_session_or_folder_is_opaque(box):
 
 
 def test_an_ask_on_an_open_session_is_shown_and_a_folder_in_the_file_is_not_enough(box):
-    fiu_profile(box)
+    client_profile(box)
     box.lines(
         box.usage / "asks" / "asks.jsonl",
         [
@@ -555,7 +555,7 @@ def test_an_ask_on_an_open_session_is_shown_and_a_folder_in_the_file_is_not_enou
 
 
 def test_an_ask_naming_an_unknown_session_is_opaque_whatever_folder_it_claims(box):
-    fiu_profile(box)
+    client_profile(box)
     box.lines(
         box.usage / "asks" / "asks.jsonl",
         [{"event": "added", "id": "q", "ts": iso(), "redacted": False, "repo": "/work/app",
@@ -566,8 +566,8 @@ def test_an_ask_naming_an_unknown_session_is_opaque_whatever_folder_it_claims(bo
 
 
 def test_an_ask_whose_folder_drifted_from_its_session_is_opaque(box):
-    fiu_profile(box)
-    box.ws_session(SID, cwd=str(box.home / "code" / "fiu"))  # ws recorded S under the opaque folder
+    client_profile(box)
+    box.ws_session(SID, cwd=str(box.home / "code" / "client"))  # ws recorded S under the opaque folder
     box.lines(
         box.usage / "asks" / "asks.jsonl",
         [{"event": "added", "id": "q", "ts": iso(), "redacted": False, "repo": "/work/app",
@@ -578,19 +578,19 @@ def test_an_ask_whose_folder_drifted_from_its_session_is_opaque(box):
 
 
 def test_a_pending_approval_with_no_folder_and_an_unknown_session_is_opaque(box):
-    fiu_profile(box)
+    client_profile(box)
     root = box.ws / "approvals"
-    approvals.require(root, Bound("claude-code", "command", "cat ~/code/fiu/case.csv", "", SID), NOW - 60)
+    approvals.require(root, Bound("claude-code", "command", "cat ~/code/client/case.csv", "", SID), NOW - 60)
     approvals.require(root, Bound("claude-code", "command", "ls", "/work/app", SID2), NOW - 60)
     asks = api.asks(box.env([]))
     assert [a.opaque for a in asks].count(True) == 1
-    assert "fiu" not in json.dumps([a.to_dict() for a in asks if a.opaque])
+    assert "client" not in json.dumps([a.to_dict() for a in asks if a.opaque])
     (shown,) = [a for a in asks if not a.opaque]
     assert shown.title == "command: ls"  # a folder ws knows, and that isn't opaque, clears an approval
 
 
 def test_an_event_with_an_unknown_session_and_no_folder_is_opaque(box):
-    fiu_profile(box)
+    client_profile(box)
     box.lines(
         box.usage / "events" / "2026-11-02.jsonl",
         [
@@ -618,21 +618,21 @@ def test_an_event_with_an_unknown_session_and_no_folder_is_opaque(box):
 
 
 def test_a_session_with_no_folder_is_opaque_even_with_a_repo_name(box):
-    fiu_profile(box)
+    client_profile(box)
     box.ws_session(SID, cwd="")
     (s,) = api.sessions(box.env([]))
     assert s.opaque and s.cwd == "" and s.cost_basis == "hidden"
 
 
 def test_a_relative_folder_cant_be_placed_and_is_opaque(box):
-    fiu_profile(box)
+    client_profile(box)
     (s,) = api.sessions(box.env([agent(SID, "code/app")]))
     assert s.opaque
 
 
 def test_one_sources_opaque_folder_survives_the_merge_in_either_order(box):
-    fiu_profile(box)
-    here = str(box.home / "code" / "fiu")
+    client_profile(box)
+    here = str(box.home / "code" / "client")
     box.ws_session(SID, cwd=here)  # ws_sessions says S is in the opaque folder
     (s,) = api.sessions(box.env([agent(SID, "/work/app")]))  # claude agents says it is at /work/app
     assert s.opaque and s.cwd == "" and s.name == ""
@@ -644,7 +644,7 @@ def test_one_sources_opaque_folder_survives_the_merge_in_either_order(box):
 
 
 def test_a_part_with_no_folder_does_not_hide_a_session_another_part_places(box):
-    fiu_profile(box)
+    client_profile(box)
     box.transcript(SID, [{"message": {"id": "m", "usage": {"input_tokens": 5}}}])
     (s,) = api.sessions(box.env([agent(SID, "/work/app")]))
     assert not s.opaque and s.tokens["input"] == 5  # type: ignore[index]
@@ -653,8 +653,8 @@ def test_a_part_with_no_folder_does_not_hide_a_session_another_part_places(box):
 @pytest.mark.parametrize("gap", ["  ", "\t", "  "])
 def test_a_folder_with_runs_of_spaces_in_its_name_is_still_opaque(box, gap):
     name = f"My{gap}Drive"
-    fiu_profile(box, f"~/{name}/fiu")
-    folder = str(box.home / name / "fiu" / "case-1")
+    client_profile(box, f"~/{name}/client")
+    folder = str(box.home / name / "client" / "case-1")
     box.ws_session(SID, cwd=folder)
     box.lines(
         box.ws / "logs" / "runs.jsonl",
@@ -694,25 +694,25 @@ def test_a_relative_opaque_path_is_a_profile_error_naming_the_key(box, entry):
 
 
 def test_a_home_relative_opaque_path_is_accepted(box):
-    box.profile('[home]\nopaque_paths = ["~/code/fiu", "~"]\n')
-    assert api.Env.make(box.environ, now=NOW).cfg.opaque_paths == ("~/code/fiu", "~")
+    box.profile('[home]\nopaque_paths = ["~/code/client", "~"]\n')
+    assert api.Env.make(box.environ, now=NOW).cfg.opaque_paths == ("~/code/client", "~")
 
 
 def test_a_case_insensitive_file_system_matches_by_normcase(tmp_path, monkeypatch):
-    roots = records.roots_of([str(tmp_path / "code" / "fiu")])
-    other = str(tmp_path / "Code" / "FIU" / "case.csv")
+    roots = records.roots_of([str(tmp_path / "code" / "client")])
+    other = str(tmp_path / "Code" / "CLIENT" / "case.csv")
     if os.path.normcase("A") == "A":
         assert not records.under(other, roots)  # a case-sensitive system keeps the two apart
     monkeypatch.setattr(os.path, "normcase", str.lower)
     assert records.under(other, roots) and not records.open_path(other, roots)
-    assert not records.under(str(tmp_path / "Code" / "FIU-too"), roots)
+    assert not records.under(str(tmp_path / "Code" / "CLIENT-too"), roots)
 
 
 def test_a_folder_that_is_the_same_on_disk_under_another_spelling_is_under(tmp_path, monkeypatch):
-    real = tmp_path / "code" / "fiu"
+    real = tmp_path / "code" / "client"
     real.mkdir(parents=True)
     roots = records.roots_of([str(real)])
-    spelled = tmp_path / "CODE" / "FIU"  # exists only as far as the file system folds case
+    spelled = tmp_path / "CODE" / "CLIENT"  # exists only as far as the file system folds case
     deep = str(spelled / "a" / "b.csv")
     # on a case-insensitive disk (macOS) the other spelling already exists, so it is under; elsewhere it isn't yet
     assert records.under(deep, roots) == os.path.lexists(spelled)
@@ -724,7 +724,7 @@ def test_a_folder_that_is_the_same_on_disk_under_another_spelling_is_under(tmp_p
 
 
 def test_a_folder_ws_cant_look_at_counts_as_under(tmp_path, monkeypatch):
-    real = tmp_path / "fiu"
+    real = tmp_path / "client"
     real.mkdir()
     roots = records.roots_of([str(real)])
 
@@ -737,7 +737,7 @@ def test_a_folder_ws_cant_look_at_counts_as_under(tmp_path, monkeypatch):
 
 
 def test_an_opaque_record_leaves_with_a_machine_id_or_a_hash(box):
-    fiu_profile(box)
+    client_profile(box)
     odd = "SECRET case: name/with spaces " + "x" * 200
     ask_id = "a20261102T120000-k3x9"
     box.lines(
@@ -745,15 +745,15 @@ def test_an_opaque_record_leaves_with_a_machine_id_or_a_hash(box):
         [
             {"event": "added", "id": odd, "ts": iso(), "redacted": True, "question": "SECRET Q"},
             {"event": "added", "id": ask_id, "ts": iso(), "redacted": True, "question": "SECRET Q"},
-            {"event": "added", "id": "FIU-CASE-1234", "ts": iso(), "redacted": True, "question": "SECRET Q"},
+            {"event": "added", "id": "CLIENT-CASE-1234", "ts": iso(), "redacted": True, "question": "SECRET Q"},
         ],
     )
     got = {a.id for a in api.asks(box.env([]))}
-    assert ask_id in got and odd not in got and "FIU-CASE-1234" not in got
+    assert ask_id in got and odd not in got and "CLIENT-CASE-1234" not in got
     key = api.seal_key(api.Env.make(box.environ, now=NOW))
-    assert got - {ask_id} == {records.safe_id(odd, key), records.safe_id("FIU-CASE-1234", key)}
+    assert got - {ask_id} == {records.safe_id(odd, key), records.safe_id("CLIENT-CASE-1234", key)}
     assert all(len(h) == 16 for h in got - {ask_id})
-    assert "FIU" not in json.dumps(sorted(got))
+    assert "CLIENT" not in json.dumps(sorted(got))
 
 
 @pytest.mark.parametrize(
@@ -765,7 +765,7 @@ def test_a_machine_shaped_id_is_kept_on_an_opaque_record(ident):
     assert records.seal(Session(id=ident, source="s"), True).id == ident
 
 
-@pytest.mark.parametrize("ident", ["FIU-CASE-1234", "plain-id_1:2.3", "abc", "", "g" * 12, "0123456789abcdef" * 5])
+@pytest.mark.parametrize("ident", ["CLIENT-CASE-1234", "plain-id_1:2.3", "abc", "", "g" * 12, "0123456789abcdef" * 5])
 def test_any_other_id_is_hashed_to_sixteen_characters(ident):
     hashed = records.safe_id(ident)
     assert hashed != ident and len(hashed) == 16 and records.MACHINE_ID.fullmatch(hashed)
@@ -896,13 +896,13 @@ def test_a_source_module_name_and_a_known_type_are_kept_on_an_opaque_record():
 
 def test_the_hashes_are_keyed_so_the_key_decides_them():
     one, two = b"1" * 32, b"2" * 32
-    for text in ("FIU-CASE-1234", "case:ACME+bank"):
+    for text in ("CLIENT-CASE-1234", "case:ACME+bank"):
         assert records.safe_id(text, one) == records.safe_id(text, one)
         assert records.safe_id(text, one) != records.safe_id(text, two)
         assert records.safe_id(text, one) != hashlib.sha256(text.encode()).hexdigest()[:16]  # not a plain digest
     assert records.safe_tmux("ws:@1.%2", one) != records.safe_tmux("ws:@1.%2", two)
     assert records.safe_tmux("ws:@1.%2", one) != hashlib.sha256(b"ws:@1.%2").hexdigest()[:16]
-    ev = Event(id="FIU-CASE-1234", ts="t", source="events_dir", type="question")
+    ev = Event(id="CLIENT-CASE-1234", ts="t", source="events_dir", type="question")
     assert records.seal(ev, True, key=one).id != records.seal(ev, True, key=two).id
 
 
@@ -919,11 +919,11 @@ def test_an_open_snapshot_makes_no_key_and_an_opaque_one_hashes_with_it(box):
     box.profile('[home]\nopaque_paths = ["/work/private"]\n')
     api.snapshot(box.env([agent(SID, "/work/public/x")]))
     assert not (box.ws / "home" / "seal-key").exists()
-    snap = api.snapshot(box.env([agent(SID, "/work/private/x", name="FIU-CASE-1234")]))
+    snap = api.snapshot(box.env([agent(SID, "/work/private/x", name="CLIENT-CASE-1234")]))
     key = (box.ws / "home" / "seal-key").read_bytes()
     assert snap.sessions and all(s.opaque for s in snap.sessions)
-    assert records.seal(Session(id="FIU-CASE-1234", source="ws_runs"), True, key=key).id == records.safe_id(
-        "FIU-CASE-1234", key
+    assert records.seal(Session(id="CLIENT-CASE-1234", source="ws_runs"), True, key=key).id == records.safe_id(
+        "CLIENT-CASE-1234", key
     )
 
 

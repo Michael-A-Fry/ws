@@ -564,3 +564,163 @@ def test_one_stray_quote_does_not_hide_a_later_claim():
 def test_a_claim_between_a_matched_pair_of_quotes_is_still_quoted():
     for text in ('She wrote "v0.4 is live" there', "see `v0.4 is live`", "\u201cv0.4 is live\u201d, she said"):
         assert cl.release_claims(text, cl.DEFAULT_TAGS) == []
+
+
+# --- the default branch comes from the repository ----------------------------------------------------------------
+
+
+def default_repo(home, name, branch, *, remote_tracking=None, origin_head=False, configured=None):
+    """A repo whose default branch is `branch`: commit `on` is on it, and `off` is on a side branch only.
+    `remote_tracking` makes `origin/<it>` point at `on`; `origin_head` points origin/HEAD at that; `configured` sets
+    init.defaultBranch in the repository's own config."""
+    d = home / name
+    d.mkdir()
+    git(d, "init", "-q", "-b", branch)
+    if configured:
+        git(d, "config", "init.defaultBranch", configured)
+    (d / "a").write_text("1")
+    git(d, "add", "a")
+    git(d, "commit", "-q", "-m", "first")
+    on = git(d, "rev-parse", "HEAD")
+    if remote_tracking:
+        git(d, "update-ref", f"refs/remotes/origin/{remote_tracking}", on)
+        if origin_head:
+            git(d, "symbolic-ref", "refs/remotes/origin/HEAD", f"refs/remotes/origin/{remote_tracking}")
+    git(d, "checkout", "-q", "-b", "side")
+    (d / "a").write_text("2")
+    git(d, "commit", "-q", "-am", "second")
+    off = git(d, "rev-parse", "HEAD")
+    for sha in (on[:10], off[:10]):
+        assert re.search(r"\d", sha) and re.search(r"[a-f]", sha), sha
+    return d, on[:10], off[:10]
+
+
+@needs_git
+def test_the_default_branch_comes_from_origin_head(home):
+    d, on, off = default_repo(home, "t", "trunk", remote_tracking="trunk", origin_head=True)
+    assert cl.default_target(str(d), cl.Budget()) == cl.Target("origin/trunk", "trunk")
+    assert judge(f"merged {on} into trunk", d) is None
+    denied = judge(f"merged {off} into trunk", d)
+    assert denied.action == "deny" and "origin/trunk" in denied.reason and off in denied.reason
+    assert judge(f"{on} is on trunk and {off} is on trunk", d).action == "deny"
+
+
+@needs_git
+def test_a_repo_whose_default_is_trunk_does_not_claim_about_main(home):
+    d, _, off = default_repo(home, "t", "trunk", remote_tracking="trunk", origin_head=True)
+    assert judge(f"merged {off} into main", d) is None  # main is another branch here: not this guard's claim
+
+
+@needs_git
+def test_with_no_origin_head_the_local_default_branch_is_used(home):
+    d, on, off = default_repo(home, "t", "trunk", configured="trunk")
+    assert cl.default_target(str(d), cl.Budget()) == cl.Target("trunk", "trunk")
+    assert judge(f"pushed {on} to trunk", d) is None
+    denied = judge(f"pushed {off} to trunk", d)
+    assert denied.action == "deny" and "isn't on trunk here" in denied.reason
+
+
+@needs_git
+def test_with_no_origin_head_the_remote_tracking_branch_is_used_when_it_exists(home):
+    d, on, off = default_repo(home, "t", "trunk", remote_tracking="trunk", configured="trunk")
+    assert cl.default_target(str(d), cl.Budget()) == cl.Target("origin/trunk", "trunk")
+    assert judge(f"merged {on} into trunk", d) is None
+    assert "origin/trunk" in judge(f"merged {off} into trunk", d).reason
+
+
+@needs_git
+def test_with_nothing_to_go_on_the_default_branch_is_main(home):
+    d, on, off = default_repo(home, "m", "main")
+    assert cl.default_target(str(d), cl.Budget()) == cl.Target("main", "main")
+    assert judge(f"merged {on} into main", d) is None
+    assert judge(f"merged {off} into main", d).action == "deny"
+
+
+@needs_git
+def test_a_default_branch_with_a_slash_in_it_works(home):
+    d, on, off = default_repo(home, "r", "release/1", remote_tracking="release/1", origin_head=True)
+    assert cl.default_target(str(d), cl.Budget()) == cl.Target("origin/release/1", "release/1")
+    assert judge(f"merged {on} into release/1", d) is None
+    assert judge(f"merged {off} into release/1", d).action == "deny"
+
+
+@needs_git
+def test_the_policy_ref_and_words_still_win(home):
+    d, on, off = default_repo(home, "t", "trunk", remote_tracking="trunk", origin_head=True)
+    git(d, "update-ref", "refs/remotes/origin/side", "side")
+    side = cl.config({"ref": "origin/side"}, "w")
+    assert judge(f"merged {off} into trunk", d, side) is None  # the ref the policy names, not origin/HEAD
+    landed = cl.config({"words": ["landed"]}, "w")
+    assert judge(f"landed {on}", d, landed) is None
+    assert judge(f"landed {off}", d, landed).action == "deny"
+    assert judge(f"merged {off} into trunk", d, landed) is None  # not one of the words
+
+
+@needs_git
+def test_a_config_that_names_main_and_origin_main_keeps_working(repo):
+    d, on, off = repo
+    cfg = cl.config({"words": ["merged into main"], "ref": "origin/main"}, "w")
+    assert judge(f"merged {on} into main", d, cfg) is None
+    assert judge(f"merged {off} into main", d, cfg).action == "deny"
+
+
+@needs_git
+def test_a_message_with_no_commit_never_asks_git_for_the_default_branch(home, monkeypatch):
+    d, _, _ = default_repo(home, "t", "trunk", remote_tracking="trunk", origin_head=True)
+    monkeypatch.setattr(cl, "_git_run", lambda *a, **k: pytest.fail("git was asked"))
+    assert judge("merged, thanks. It is on trunk now", d) is None
+
+
+@needs_git
+def test_the_stop_log_names_the_ref_it_checked(home):
+    d, on, off = default_repo(home, "t", "trunk", remote_tracking="trunk", origin_head=True)
+    ctx = Context(
+        "claude-code", "stop", "s1", str(d), {"last_assistant_message": f"merged {on} into trunk. {off} is on trunk."}
+    )
+    assert cl.judge(None, cl.config({}, "w"), ctx) is None
+    rec = json.loads((home / "wshome" / "logs" / "claims.jsonl").read_text().splitlines()[-1])
+    assert rec["ref"] == "origin/trunk"
+    assert [(c["commit"], c["on_ref"]) for c in rec["claims"]] == [(on, True), (off, False)]
+
+
+def test_a_folder_that_is_not_a_repository_falls_back_to_main(home):
+    d = home / "plain"
+    d.mkdir()
+    assert cl.default_target(str(d), cl.Budget()) == cl.Target("main", "main")
+    assert cl.default_target("", cl.Budget()) == cl.Target("origin/main", "main")
+    assert cl.default_target(str(home / "nowhere"), cl.Budget()) == cl.Target("origin/main", "main")
+
+
+def test_a_default_branch_that_git_prints_oddly_is_not_trusted(home, monkeypatch):
+    d = home / "d"
+    d.mkdir()
+
+    def run(argv, **k):
+        out = {"symbolic-ref": b"origin/--upload-pack=x\n", "config": b"-bad\n"}.get(argv[3], b"")
+        return subprocess.CompletedProcess(argv, 0 if out else 1, out, b"")
+
+    monkeypatch.setattr(cl.subprocess, "run", run)
+    assert cl.default_target(str(d), cl.Budget()) == cl.Target("main", "main")
+
+
+def test_git_time_spent_finding_the_default_branch_comes_out_of_the_same_budget(home, monkeypatch):
+    d = home / "d"
+    d.mkdir()
+    now = [0.0]
+    budget = cl.Budget(8.0, clock=lambda: now[0])
+
+    def slow(argv, **k):
+        now[0] += 9.0
+        return subprocess.CompletedProcess(argv, 1, b"", b"")
+
+    monkeypatch.setattr(cl.subprocess, "run", slow)
+    assert cl.default_target(str(d), budget) == cl.Target("origin/main", "main")
+    assert budget.left() < 0
+
+
+def test_the_ref_in_a_policy_is_checked_only_when_it_is_given():
+    assert cl.config({}, "w").ref == "" and cl.config({}, "w").words == ()
+    assert cl.config({"ref": "origin/trunk"}, "w").ref == "origin/trunk"
+    for table in ({"ref": ""}, {"ref": "-x"}, {"words": []}):
+        with pytest.raises(policy.PolicyError):
+            cl.config(table, "w")

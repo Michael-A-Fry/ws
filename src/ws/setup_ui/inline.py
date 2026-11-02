@@ -400,6 +400,7 @@ class Wizard:
         self._perm = 0  # lines printed for good so far
         self._core_mark = 0  # `_perm` when the Core card began: what the review may fold
         self._fold = 0  # lines the review's fold took (0 = nothing folded)
+        self._region_asked = False
 
     # sizes ----------------------------------------------------------------------------------------------------
 
@@ -494,6 +495,7 @@ class Wizard:
             return done
         self._core()
         while True:
+            self.ask_region()
             self.pick_plugins()
             self.ask_notes()
             self.ask_cap()
@@ -585,6 +587,49 @@ class Wizard:
                 self.draw(self._core_card(reached))
                 self.pause(0.14)
         self.draw([*self._core_card(count), ""], final=True)
+
+    # region ---------------------------------------------------------------------------------------------------------
+
+    def ask_region(self) -> None:
+        """Ask for a country, once, and only when a plugin on offer has a region rule and nothing firm says where this
+        is. The answer decides which of those plugins can be chosen next."""
+        a = self.a
+        if self._region_asked or not (self.interactive and self.facts.asks_region and self.choices.region is None):
+            return
+        self._region_asked = True
+        label = a.bold("Your country")
+        text, error = "", ""
+        while True:
+            rows = [
+                "  "
+                + label
+                + "  "
+                + text
+                + a.violet(CURSOR)
+                + "  "
+                + a.dim("two letters, such as CA; some plugins suit only some countries")
+            ]
+            if error:
+                rows.append("  " + a.error(error))
+            rows += ["", hints(a, ("type two letters", ""), ("↵", "set" if text else "skip")).rstrip()]
+            self.draw(rows)
+            k = self.key()
+            if k == "esc":
+                raise Cancelled
+            if k == "enter":
+                if text and not re.fullmatch(r"[A-Za-z]{2}", text):
+                    error = "a country is two letters, such as CA"
+                    continue
+                break
+            error = ""
+            if k == "backspace":
+                text = text[:-1]
+            elif len(text) < 2 and len(k) == 1 and k.isascii() and k.isalpha():
+                text += k.upper()
+        if text:
+            self.facts = flow.with_region(self.facts, text)
+            self.choices = replace(self.choices, region=text)
+        self.draw(["  " + label + "  " + (text or "skipped"), ""], final=True)
 
     # plugins ------------------------------------------------------------------------------------------------------
 

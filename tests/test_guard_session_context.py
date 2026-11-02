@@ -231,11 +231,10 @@ def test_the_shipped_changelog_is_read_only_beside_a_source_tree_or_the_package(
 
 
 def test_an_unwritable_record_loses_the_news_line_but_not_the_rest(env, monkeypatch):
-    (env / ".claude-state").mkdir()
-    (env / ".claude-state" / "STATE.md").write_text("s")
+    (env / "STATE.md").write_text("s")
     (env.parent / "wshome").write_text("a file where the folder should be")
     found = start(env)
-    assert lines(found) == [f"ws: .claude-state/STATE.md exists at {env / '.claude-state' / 'STATE.md'}"]
+    assert lines(found) == [f"ws: STATE.md exists at {env / 'STATE.md'}"]
 
 
 def test_a_record_that_is_not_json_starts_again(env):
@@ -248,8 +247,7 @@ def test_a_record_that_is_not_json_starts_again(env):
 
 
 def test_the_lines_come_in_order_files_key_news(env, monkeypatch):
-    (env / ".claude-state").mkdir()
-    (env / ".claude-state" / "STATE.md").write_text("s")
+    (env / "STATE.md").write_text("s")
     monkeypatch.setenv("ANTHROPIC_API_KEY", KEY)
     got = lines(start(env))
     assert "STATE.md exists" in got[0] and "ANTHROPIC_API_KEY" in got[1] and got[2] == "ws: version 1.2.3"

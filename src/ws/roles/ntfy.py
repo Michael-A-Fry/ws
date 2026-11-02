@@ -212,7 +212,7 @@ def zone(cfg: dict, env) -> tzinfo:
             raise TypeError(name)
         return ZoneInfo(name)
     except (TypeError, ValueError, OSError, KeyError) as e:  # ZoneInfoNotFoundError is a KeyError
-        raise NotifyError(f"timezone {name!r} is not a time zone name (for example Pacific/Auckland)") from e
+        raise NotifyError(f"timezone {name!r} is not a time zone name (an IANA name such as Region/City)") from e
 
 
 def today(tz: tzinfo = UTC, now: datetime | None = None) -> str:

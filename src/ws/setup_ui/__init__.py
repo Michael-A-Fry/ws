@@ -58,7 +58,7 @@ Flags:
   --notes PATH       your notes folder: ~/something or a full path
   --runner NAME      the AI tool to set up rules for: {runners}
   --cap USD          the most ws may spend in a month, e.g. 20
-  --region CC        your country (two letters, e.g. NZ); kept in the profile
+  --region CC        your country (two letters, e.g. CA); kept in the profile
   --no-color         print no colour (a non-empty NO_COLOR does the same)
   -h, --help         show this help
 
@@ -66,7 +66,7 @@ Examples:
   ws setup                            walk through it in this terminal
   ws setup --yes                      take the defaults, ask nothing
   ws setup --web                      use a page in your browser
-  ws setup --yes --region NZ --cap 20
+  ws setup --yes --region CA --cap 20
   ws setup --notes ~/Obsidian/Vault   use an existing vault
 """
 
@@ -122,8 +122,8 @@ def cmd_setup(args: argparse.Namespace) -> int:
     if region is not None and not re.fullmatch(r"[A-Za-z]{2}", region):
         raise WsError(
             "bad_input",
-            f"--region takes a two-letter country code such as NZ, not {region!r}",
-            "for example: ws setup --region NZ",
+            f"--region takes a two-letter country code such as CA, not {region!r}",
+            "for example: ws setup --region CA",
         )
     try:
         facts = flow.gather(os.environ, region=region)

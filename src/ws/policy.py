@@ -270,8 +270,8 @@ allow_write = []
 #   bulk-staging     stops `git add -A`, `git add .` and `git commit -a`, so a commit holds only named files
 #   record-calls     appends each tool call to $WS_HOME/logs/gate-calls.jsonl, for `ws gate replay`
 #   test-weakening   before a test file is written, denies a skip marker added to an existing test
-#   claims           checks a commit named beside merged, pushed or on main against a ref; with release_dir, a release
-#                    called live must be the one its `current` link points at
+#   claims           checks a commit named beside merged, pushed or on the default branch against a ref; with
+#                    release_dir, a release called live must be the one its `current` link points at
 #   spawn-cap        denies a subagent start at max_agents running (default from the machine's CPUs and memory)
 #   skill-gate       a write to chosen paths waits for a skill ([[guards.skill-gate]] skill, paths); a skill's own
 #                    SKILL.md front matter can list `gates` (path globs) too, from skill_dirs
@@ -285,7 +285,7 @@ on = ["syntax-check", "session-context", "dev-server"]
 # [guards.syntax-check]
 # extra = {{ yaml = ["yamllint", "-d", "relaxed"] }}   # an extension and the checker that gets the file path appended
 # [guards.session-context]
-# files = [".claude-state/STATE.md"]
+# files = ["STATE.md", ".state/STATE.md", "HANDOFF.md", "TODO.md"]   # the default; list the state files your projects keep
 # warn_api_key = true   # on by default: a line when ANTHROPIC_API_KEY, not the subscription, bills a session
 # [guards.claims]
 # release_dir = "~/releases"   # a folder whose `current` link names the promoted release; left out, claims are off

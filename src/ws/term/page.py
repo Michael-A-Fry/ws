@@ -91,7 +91,7 @@ button{{font:600 14px {FONT_SANS};color:var(--text);cursor:pointer;touch-action:
 border-radius:8px;background:var(--raise)}}
 #keybar button[aria-pressed=true]{{background:var(--accent);border-color:var(--accent);color:var(--on-accent)}}
 #banner,#sheet{{position:absolute;z-index:5;left:8px;right:8px;display:flex;gap:8px;align-items:center;padding:10px 12px;
-background:var(--panel);border:1px solid var(--line2);border-radius:10px;box-shadow:0 4px 18px rgb(0 0 0/.35)}}
+background:var(--panel);border:1px solid var(--line2);border-radius:10px}}
 #banner{{top:8px;justify-content:space-between}}
 #sheet{{bottom:8px;flex-wrap:wrap}}
 #sheet textarea{{flex:1 1 100%;min-height:96px;background:var(--bg);color:var(--text);border:1px solid var(--line2);

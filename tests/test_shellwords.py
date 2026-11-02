@@ -283,6 +283,12 @@ def test_a_word_with_no_path_in_it_gives_no_pieces_for_the_home_folder(seg):
     assert not [p for p in sw.lex(seg, ENV).pieces if p.startswith(HOME)]
 
 
+def test_a_path_followed_by_a_separator_is_given_as_the_path_alone():
+    assert f"{HOME}/.ssh" in sw.lex("docker run -v ~/.ssh:/root/.ssh img", ENV).pieces
+    assert f"{HOME}/.ssh" in sw.lex("tool --paths=$HOME/.ssh,/tmp/x", ENV).pieces
+    assert not [p for p in sw.lex("echo '~/.ssh:x'", ENV).pieces if p.startswith(HOME)]
+
+
 def test_a_path_cut_at_the_first_separator_is_also_given():
     assert f"{HOME}/x" in sw.lex("curl 'f=@$HOME/x;type=text/plain' u", ENV).pieces
 
@@ -401,6 +407,12 @@ def test_a_quote_left_open_is_a_typed_refusal():
         sw.require_closed("echo 'a")
     assert err.value.kind == "unclosed_quote" and "unclosed '" in err.value.message
     sw.require_closed("echo 'a' \"b\"")
+
+
+def test_substitutions_nested_beyond_what_the_reader_follows_are_a_typed_refusal():
+    with pytest.raises(sw.ShellError) as err:
+        sw.prep("echo " + "$(" * 3000 + "x" + ")" * 3000)
+    assert err.value.kind == "too_deep"
 
 
 def test_here_document_bodies_are_left_out_only_when_asked():

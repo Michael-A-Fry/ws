@@ -87,7 +87,8 @@ One reader, `src/ws/shellwords.py`, turns a command line into the words a shell 
 recognised however it's spelled. It reads:
 
 - Segments: `;`, `&&`, `||`, `|`, `&`, new lines and parentheses, `$(...)`, backticks, `<(...)`, `bash -c '...'`, `eval`
-  and `env -S`. A comment is left out.
+  and `env -S`. A comment is left out, except on a line that holds a here-document, where a `#` line may be part of the
+  text a shell expands.
 - Words: quotes and escapes are removed, and a brace group is expanded before anything else, as the shell does. Comma
   lists nest and chain, and `{1..40}` and `{a..e}` sequences (with a step, and zero padding such as `{01..10}`) are
   expanded in full. A quoted `{`, `,` or `}` isn't part of a group, so `'{a,b}'` is one word.
@@ -97,8 +98,9 @@ recognised however it's spelled. It reads:
 - Redirections: `<`, `>`, `>>`, `>|`, `<>`, `&>`, `&>>`, `>&`, here-strings, and file-descriptor forms such as `3<` and
   `2>`. Each target is expanded like any word, so a brace group in a target names every file it expands to.
 - Paths inside a word: the value of an option (`dd if=P`, `--opt=P`, `-oP`, `-sSLo P`), a file argument (`-F f=@P`,
-  `-d @P`, `-F 'f=<P'`), a `file://` address, and the files a wrapper takes (`xargs -a P`, `--arg-file=P`). Here `~` and
-  `$HOME` count even inside quotes, because the program reads the text itself. A `host:path` remote isn't a local path.
+  `-d @P`, `-F 'f=<P'`), a `file://` address, a path followed by a separator (a mount such as `-v P:/in/container`),
+  and the files a wrapper takes (`xargs -a P`, `--arg-file=P`). Here `~` and `$HOME` count even inside quotes, because
+  the program reads the text itself. A `host:path` remote isn't a local path.
 - Wrappers: `sudo`, `doas`, `env`, `xargs`, `timeout`, `nice`, `nohup`, `time` and the like are taken off the front.
 
 The reader is bounded. A command may expand to at most 4,096 words in all, including the commands inside it, and

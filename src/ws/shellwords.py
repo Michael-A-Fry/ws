@@ -137,8 +137,12 @@ def ansi_c(seg: str, i: int) -> tuple[str, int]:
 
 
 def prep(cmd: str) -> str:
-    """Line continuations joined, full-width characters folded, ${IFS} read as the space it is."""
-    cmd = join_lines(unicodedata.normalize("NFKC", cmd))
+    """Line continuations joined, full-width characters folded, ${IFS} read as the space it is. Raises ShellError (kind
+    `too_deep`) for substitutions nested past what the reader follows."""
+    try:
+        cmd = join_lines(unicodedata.normalize("NFKC", cmd))
+    except RecursionError:
+        raise ShellError("too_deep", "the command nests substitutions too deeply to check") from None
     return re.sub(r"\$\{IFS\}|\$IFS\b", " ", cmd)
 
 
@@ -985,10 +989,11 @@ _CUT = re.compile(r"[;,:]")
 _HINT = re.compile(r"[=@<>:,;]|\A-[^-]|\Afile:")
 
 
-def _pieces(word: str, env: Mapping[str, str]) -> list[str]:
+def _pieces(word: str, env: Mapping[str, str], head: bool = False) -> list[str]:
     """Where inside one word a program may read a path from: after `=`, `@`, `<`, `>`, `:`, `,` or `;`, after the
     letters of a short option (`-sT/x`, `-0a~/x`), and after `file://`; each is given whole and cut at its first `;`, `,`
-    or `:`. A leading `~` is expanded. A word with a blank in it is prose or a program, and has none."""
+    or `:`. A leading `~` is expanded. With `head`, a word that is a path followed by a separator (`P:/in/container`,
+    a mount) also gives that path. A word with a blank in it is prose or a program, and has none."""
     if not _HINT.search(word) or len(word) > 2048 or _SPLIT.search(word):
         return []
     starts: set[int] = set()
@@ -1005,6 +1010,8 @@ def _pieces(word: str, env: Mapping[str, str]) -> list[str]:
     if m:
         starts.add(m.end())
     out = []
+    if head and word.startswith("/") and (first := _CUT.split(word, 1)[0]) not in ("", word):
+        out.append(first)
     remote = _REMOTE.match(word)  # `host:~/x` names a file on another machine
     if remote:
         starts.discard(remote.end())
@@ -1052,8 +1059,11 @@ def lex(seg: str, env: Mapping[str, str] | None = None, budget: Budget | None = 
         for alt in expand_braces(raw, budget):
             got = _expand_raw(alt, env, False)
             out += got
-            for w in got if ("'" not in alt and "$" not in alt) else _expand_raw(alt, env, True):
-                pieces.extend(_pieces(w, env))
+            for w in got:
+                pieces.extend(_pieces(w, env, head=True))
+            if "'" in alt or "$" in alt:  # what a program reads when it expands for itself
+                for w in _expand_raw(alt, env, True):
+                    pieces.extend(_pieces(w, env))
         return out
 
     while i < n:

@@ -1019,3 +1019,10 @@ def test_compare_leaves_a_trial_that_never_started_out_of_both_arms(box, capsys)
     assert c["setup_errors"]["count"] == 1 and c["setup_errors"]["by_arm"]["A"]["trials"][0]["trial"] == 3
     _, text, _ = ws(capsys, "eval", "compare", "A", "B", "--look", "1")
     assert "setup errors" in text and "A: 1 (t#3)" in text
+
+
+def test_the_harvest_warning_names_the_data_in_plain_terms_not_one_sector():
+    """The reminder to read each proposal says "confidential or client data", in the module's contract and the docs."""
+    docs = Path(__file__).resolve().parent.parent / "docs" / "reference" / "eval.md"
+    for text in (" ".join(ws_eval.__doc__.split()), " ".join(docs.read_text(encoding="utf-8").split())):
+        assert "onfidential or client data in a prompt is for you to catch" in text

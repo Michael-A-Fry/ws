@@ -79,6 +79,7 @@ install.sh        the installer people run first (pipx or uv)
 | `skills/` | The skills ws ships (`align`, `checkpoint`, `taste-gate`, `dataviz`, `resume`, `ship`) and how... |
 | `status.py` | `ws status`: for each runner, every rules, skill, hook and MCP file it will load here, with... |
 | `style.py` | The terminal style every `ws` command prints with: a status glyph and word, headings, key/value... |
+| `term/` | `ws term`: a browser terminal that behaves like a native one, for reaching a ws machine from a... |
 | `testing/` | Test support that ships with ws: the mock model provider and its scenarios |
 | `ui/` | The shared page toolkit: the ws look as CSS, small HTML components, and the loopback server that... |
 | `usage.py` | The Console usage check: can ws read the provider's own usage report, the billing truth... |

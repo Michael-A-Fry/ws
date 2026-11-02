@@ -1,0 +1,7 @@
+{
+  "about": "A full-screen program clears and repaints on every size change. Each distinct size from the owner reaches it once; a repeat of the current size does not reach it.",
+  "start": [100, 30],
+  "sizes": [[60, 20], [60, 20], [140, 40], [100, 30], [100, 30]],
+  "expect_delivered": [[60, 20], [140, 40], [100, 30]],
+  "repaint_prefix": "\u001b[2J"
+}

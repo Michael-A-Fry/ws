@@ -89,6 +89,7 @@ CASES: dict[str, list[str]] = {
     "eval.approve": ["eval", "approve", "nothing"],
     "eval.reject": ["eval", "reject", "nothing"],
     "home.data": ["home", "data"],
+    "term": ["term", "--bind", "0.0.0.0"],  # a typed refusal: the real command stays up until stopped
 }
 
 

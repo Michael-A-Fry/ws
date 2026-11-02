@@ -40,6 +40,7 @@ def test_every_source_keeps_the_contract():
             "ws_runs",
             "ws_approvals",
             "claude_code",
+            "opencode",
             "transcripts",
             "asks_jsonl",
             "events_dir",

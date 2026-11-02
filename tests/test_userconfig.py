@@ -1018,7 +1018,7 @@ def test_ws008_lists_each_allow_rule_that_a_ws_deny_rule_overrides(box, capsys):
     rows = ws008_rows(box)
     over = [c for c in rows if "overridden" in c.detail]
     assert len(over) == 1 and over[0].status == "warn"
-    assert "`Bash(rm -rf /etc/hosts)`" in over[0].detail and "deny rule `Bash(rm -* /etc*)`" in over[0].detail
+    assert "`Bash(rm -rf /etc/hosts)`" in over[0].detail and "deny rule `Bash(rm -* /etc/*)`" in over[0].detail
     assert "allow rule" in over[0].fix
     assert rows[0].status == "ok"  # the gate itself is in place
 

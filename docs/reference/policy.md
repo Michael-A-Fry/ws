@@ -73,7 +73,8 @@ Rules:
 
 The default list, which `ws gate init` writes: `~/.ssh/**`, `~/.gnupg/**`, `~/.aws/**`, `~/.config/gcloud/**`,
 `~/.config/gh/hosts.yml`, `~/.config/ws/secrets/**`, `~/.docker/config.json`, `~/.kube/config`,
-`~/.claude/.credentials.json`, `~/.netrc`, `~/.npmrc`, `~/.pypirc` and `**/.env*`.
+`~/.claude/.credentials.json`, `~/.netrc`, `~/.npmrc`, `~/.pypirc`, `**/.env*` and `/proc/*/environ` (the process
+environment).
 
 The matcher checks a path wherever a word holds one: as an operand, after `=` (`if=PATH`), after a leading `@` or `<`
 (`-F f=@PATH`, `-d @PATH`), glued to a short option (`-d@PATH`), in a `host:PATH` or `file://PATH` form, and in the
@@ -90,6 +91,8 @@ The default list, which `ws gate init` writes:
   (`/home/NAME`, `/Users/NAME`) is also denied, and a folder further down is ordinary work.
 - A forcing push in any spelling: `git push*--force*`, `git push* -f*`, and both with git's global options.
 - `mkfs*` and `dd*of=/dev/*`.
+- Printing the process environment: `env` with no command after it (`env -i`, `env A=b`) and `printenv*`. `env A=b cmd`,
+  which runs a command with a variable set, is allowed.
 - Git settings that define an alias or name a command for git to run, however they're given: `git config KEY VALUE`,
   `git -c KEY=VALUE`, `--config-env` and `GIT_CONFIG_KEY_N`. The keys are `alias.*`, `core.hooksPath`,
   `core.sshCommand`, `core.fsmonitor`, `core.pager`, `core.editor`, `core.askPass`, `core.gitProxy`,

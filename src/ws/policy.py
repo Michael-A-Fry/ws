@@ -202,6 +202,7 @@ DEFAULT_DENY_READ = (
     "~/.npmrc",
     "~/.pypirc",
     "**/.env*",
+    "/proc/*/environ",
 )
 
 
@@ -217,6 +218,8 @@ def default_deny_commands() -> list[str]:
     # A forcing push in any spelling (-f, -uf, +refspec, --force-with-lease), with or without git's global options.
     out += ["git push*--force*", "git push* -f*", "git -* push*--force*", "git -* push* -f*"]
     out += ["mkfs*", "dd*of=/dev/*"]
+    # Reading the process environment: `env` with no command to run (see _segment) and `printenv`.
+    out += ["env", "printenv *"]
     # A shell reading its script from stdin is the end of `curl ... | sh` (and of `echo ... | sh`). Written as a
     # plain command so the runner's own deny list, which splits pipes, catches it too.
     for s in _SHELLS:
@@ -1414,9 +1417,12 @@ def _read_hit(policy: Policy, path: str, cwd: str, recursive: bool = False, fold
                 return rule
             if root is None:
                 continue
-            if folder and f == root:
+            # A folder is the thing denied when the rule's first wildcard is its last segment (`~/.ssh/**`); a rule
+            # with names after the wildcard (`/proc/*/environ`) denies those files, not the folder above them.
+            whole = "/" not in _expand(rule)[len(root) :].lstrip("/")
+            if folder and whole and f == root:
                 return rule
-            if recursive and (f == "/" or root.startswith(f + "/")):
+            if recursive and (f == "/" or root.startswith(f + "/") or f == root):
                 return rule
     return None
 
@@ -1638,6 +1644,8 @@ def _segment(policy: Policy, seg: str, ctx: _Ctx, in_pipe: bool, cands: list[str
     line = " ".join(canon)
     if line:
         cands.append(line)
+    elif "env" in wrappers:
+        cands.append("env")  # `env`, `env -i`, `env A=b`: nothing after it to run, so it prints the environment
     cmd = canon[0] if canon else ""
     flags, operands = _args(canon)
     nested: list[str] = []

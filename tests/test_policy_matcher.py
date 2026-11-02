@@ -237,3 +237,45 @@ def test_other_git_settings_and_reads_are_allowed(pol, home, cmd):
 def test_a_name_or_host_with_a_trailing_newline_is_refused(toml):
     with pytest.raises(policy.PolicyError):
         policy.loads(toml)
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "env",
+        "env -i",
+        "env -0",
+        "env A=b",
+        "/usr/bin/env",
+        "sudo env",
+        "env | sort",
+        "printenv",
+        "printenv HOME",
+        "cat /proc/self/environ",
+        "cat /proc/1/environ",
+        "dd if=/proc/12/environ",
+        "grep -a x /proc/self/environ",
+        "tr '\\0' '\\n' < /proc/self/environ",
+        "xargs -a /proc/self/environ echo",
+    ],
+)
+def test_reading_the_process_environment_is_denied(pol, home, cmd):
+    assert policy.is_denied_command(pol, cmd), cmd
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "env A=b true",
+        "env -u X ls",
+        "env -i PATH=/usr/bin make test",
+        "/usr/bin/env python3 script.py",
+        "FOO=1 make",
+        "echo env",
+        "ls /proc",
+        "cat /proc/1/status",
+        "cat /proc/cpuinfo",
+    ],
+)
+def test_running_a_command_with_a_variable_set_stays_allowed(pol, home, cmd):
+    assert policy.is_denied_command(pol, cmd) is None, cmd

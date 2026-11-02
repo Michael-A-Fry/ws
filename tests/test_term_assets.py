@@ -71,7 +71,13 @@ def test_the_integrity_value_is_the_base64_of_the_bundles_sha256():
 def test_the_policy_runs_only_the_pinned_script_and_the_pages_own_nonce():
     policy = page.policy("NONCE", "sha256-HASH")
     assert "script-src 'sha256-HASH' 'nonce-NONCE'" in policy and "style-src 'nonce-NONCE'" in policy
-    assert "unsafe-inline" not in policy and "unsafe-eval" not in policy and "*" not in policy
+    assert "unsafe-eval" not in policy and "*" not in policy
+    assert policy.count("unsafe-inline") == 1 and "style-src-attr 'unsafe-inline'" in policy, (
+        "only for style attributes"
+    )
+    assert (
+        "unsafe-inline" not in policy.split("style-src-attr")[0] and "script-src 'sha256-HASH' 'nonce-NONCE'" in policy
+    )
     assert policy.startswith("default-src 'none'") and "frame-ancestors 'none'" in policy
     assert "https:" not in policy and "http:" not in policy, "nothing loads from outside"
 

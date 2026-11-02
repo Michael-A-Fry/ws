@@ -365,3 +365,66 @@ def test_open_pty_failure_is_an_error_and_leaks_nothing(monkeypatch, sane_env):
         bridge.open_pty(["/bin/true"], sane_env, 80, 24)
     if before is not None:
         assert len(os.listdir("/dev/fd")) <= before
+
+
+# -- the modes a program has set, replayed to a window that arrives later
+
+
+def test_the_mode_tracker_follows_set_and_reset_and_replays_in_a_fixed_order():
+    t = bridge.ModeTracker()
+    t.feed(b"\x1b[?1000h\x1b[?1006h\x1b[?1049h\x1b[?25l\x1b[?2004h")
+    t.feed(b"text \x1b[?1000l more")
+    assert t.restore() == b"\x1b[?1049h\x1b[?25l\x1b[?2004h\x1b[?1000l\x1b[?1006h"
+
+
+def test_the_mode_tracker_reads_a_sequence_split_across_chunks_at_every_byte():
+    seq = b"\x1b[?1049h\x1b[?1000h"
+    for cut in range(1, len(seq)):
+        t = bridge.ModeTracker()
+        t.feed(b"abc" + seq[:cut])
+        t.feed(seq[cut:] + b"xyz")
+        assert t.restore() == b"\x1b[?1049h\x1b[?1000h", cut
+
+
+def test_the_mode_tracker_reads_several_modes_in_one_sequence_and_ignores_the_rest():
+    t = bridge.ModeTracker()
+    t.feed(b"\x1b[?1000;1006h\x1b[?9999h\x1b[1h\x1b[?x\x1b]0;title\x07\x1b[2J")
+    assert t.restore() == b"\x1b[?1000h\x1b[?1006h"
+
+
+def test_a_stray_escape_doesnt_hold_back_later_sequences():
+    t = bridge.ModeTracker()
+    t.feed(b"\x1b")
+    t.feed(b"\x1b[?25l")
+    t.feed(b"\x1b[31mred\x1b[?1")
+    t.feed(b"049h")
+    assert t.restore() == b"\x1b[?1049h\x1b[?25l"
+
+
+def test_a_program_that_set_no_modes_replays_nothing():
+    t = bridge.ModeTracker()
+    t.feed(b"plain output\r\n")
+    assert t.restore() == b""
+
+
+def test_a_window_that_arrives_later_gets_the_modes_before_the_redraw():
+    session, children, _ = make()
+    a = Browser()
+    session.attach(a, 80, 24)
+    children[0].emit(b"\x1b[?1049h\x1b[2J\x1b[?1000h\x1b[?1006h\x1b[?25l> ready")
+    until(lambda: b"> ready" in a.received)
+    session.detach(a)
+    b = Browser()
+    session.attach(b, 80, 24)
+    assert b.received == b"\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h"
+    assert children[0].winches == 1, "the redraw signal follows the modes"
+    c = Browser()
+    session.attach(c, 100, 30)
+    assert c.received.startswith(b"\x1b[?1049h") and children[0].sizes == [(100, 30)]
+
+
+def test_the_first_window_gets_no_replay():
+    session, _, _ = make()
+    a = Browser()
+    session.attach(a, 80, 24)
+    assert a.received == b""

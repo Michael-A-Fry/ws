@@ -1,7 +1,32 @@
 {
-  "about": "A synthetic start-up of a full-screen program: input modes, the title, the alternate screen, mouse reporting, the cursor hidden. The bridge must pass every byte through, whatever the chunking.",
+  "about": "A synthetic start-up of a full-screen program: input modes, the title, the alternate screen, mouse reporting, the cursor hidden. The bridge must pass every byte through, whatever the chunking. A window that connects later is put in the modes the program tracks (the screen, the cursor, paste, focus and mouse); the title and key-protocol sets aren't replayed.",
   "stream": "\u001b[?2004h\u001b[?2031h\u001b[?1004h\u001b[>5u\u001b[>4;2m\u001b]0;Agent\u0007\u001b[?1049h\u001b[2J\u001b[H\u001b[?1000h\u001b[?1002h\u001b[?1003h\u001b[?1006h\u001b[?25l> ready",
-  "chunk_sizes": [1, 3, 7, 64],
-  "modes_on": ["1000", "1002", "1003", "1004", "1006", "1049", "2004", "2031"],
-  "modes_off": ["25"]
+  "chunk_sizes": [
+    1,
+    3,
+    7,
+    64
+  ],
+  "modes_on": [
+    "1000",
+    "1002",
+    "1003",
+    "1004",
+    "1006",
+    "1049",
+    "2004",
+    "2031"
+  ],
+  "modes_off": [
+    "25"
+  ],
+  "modes_on_replayed": [
+    "1000",
+    "1002",
+    "1003",
+    "1004",
+    "1006",
+    "1049",
+    "2004"
+  ]
 }

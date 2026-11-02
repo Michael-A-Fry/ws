@@ -220,3 +220,16 @@ def test_synchronized_output_is_asked_for_by_the_environment_only_outside_tmux(c
     assert ("CLAUDE_CODE_FORCE_SYNC_OUTPUT" in env) is case["expect_set"]
     assert "TMUX" not in env, "the session isn't inside the tmux that launched ws term"
     assert env["TERM"] == "xterm-256color"
+
+
+def test_the_startup_modes_are_replayed_to_a_window_that_connects_after_them():
+    child = FakeChild()
+    session, first = session_with(child)
+    raw = STARTUP["stream"].encode("utf-8")
+    child.emit(raw)
+    until(lambda: first.received == raw)
+    session.detach(first)
+    late = Browser()
+    session.attach(late, 100, 30)
+    on, off = modes(late.received.decode())
+    assert sorted(on) == STARTUP["modes_on_replayed"] and sorted(off) == STARTUP["modes_off"]

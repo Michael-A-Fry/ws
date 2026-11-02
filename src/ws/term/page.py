@@ -17,7 +17,10 @@ changes. What it keeps still, and how:
   scrollback scrolls), and the wheel does the same through the terminal itself.
 
 The policy is exact: the vendored terminal script runs by its sha256 (the tag carries the same hash as `integrity`),
-the page's own script and stylesheet by a per-response nonce, and nothing else loads. The page holds no environment
+the page's own script and stylesheet by a per-response nonce, and nothing else loads. The one loosening is
+`style-src-attr 'unsafe-inline'`: the terminal colours a cell with a `style` attribute (a true-colour cell can't be a
+class), and without it a coloured screen draws plain. It can't run script or load anything, since the rest of the policy
+allows neither. The page holds no environment
 values: its only data is the key table, the colours and fixed settings.
 """
 
@@ -51,7 +54,7 @@ def script_integrity(script: bytes) -> str:
 def policy(nonce: str, script_hash: str) -> str:
     return (
         f"default-src 'none'; script-src '{script_hash}' 'nonce-{nonce}'; style-src 'nonce-{nonce}'; "
-        "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+        "style-src-attr 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
     )
 
 
@@ -77,12 +80,12 @@ font:14px/1.4 {FONT_SANS};-webkit-text-size-adjust:100%}}
 #term{{position:absolute;left:0;right:0;bottom:0;height:100%;padding:0 4px;box-sizing:border-box}}
 #term[data-mouse=on]{{touch-action:none}}
 .xterm{{font-family:{FONT_MONO}}}
-#keybar{{display:flex;gap:6px;padding:6px calc(6px + env(safe-area-inset-right)) calc(6px + env(safe-area-inset-bottom))
-calc(6px + env(safe-area-inset-left));background:var(--panel);border-top:1px solid var(--line);overflow-x:auto;
-flex:none}}
+#keybar{{display:grid;grid-template-columns:repeat(auto-fit,minmax(56px,1fr));gap:6px;
+padding:6px calc(6px + env(safe-area-inset-right)) calc(6px + env(safe-area-inset-bottom))
+calc(6px + env(safe-area-inset-left));background:var(--panel);border-top:1px solid var(--line);flex:none}}
 button{{font:600 14px {FONT_SANS};color:var(--text);cursor:pointer;touch-action:manipulation;user-select:none;
 -webkit-user-select:none}}
-#keybar button{{flex:1 0 auto;min-width:44px;min-height:44px;padding:0 10px;border:1px solid var(--line2);
+#keybar button{{min-width:0;min-height:44px;padding:0 6px;border:1px solid var(--line2);
 border-radius:8px;background:var(--raise)}}
 #keybar button[aria-pressed=true]{{background:var(--accent);border-color:var(--accent);color:var(--on-accent)}}
 #banner,#sheet{{position:absolute;z-index:5;left:8px;right:8px;display:flex;gap:8px;align-items:center;padding:10px 12px;
@@ -276,7 +279,10 @@ function act(action) {
   if (action === 'paste-cancel') { $('[data-field=paste-text]').value = ''; sheet.hidden = true; return; }
   if (action === 'reconnect') { tries = 0; setState('connecting', ''); connect(); return; }
   const row = rows[action];
-  if (row && row.bytes !== null) sendInput(row.bytes);
+  if (row && row.bytes !== null) {
+    sendInput(row.bytes);
+    if (ctrl) setCtrl(false); // a key from the bar uses up Ctrl, whatever its length
+  }
 }
 document.addEventListener('mousedown', (e) => { if (e.target.closest('#keybar,#banner')) e.preventDefault(); });
 document.addEventListener('click', (e) => {
@@ -330,7 +336,7 @@ addEventListener('pointerdown', () => {
 addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible' && state === 'closed') { tries = 0; connect(); }
 });
-window.wsTerm = { term };
+window.wsTerm = { term, fit };
 
 (document.fonts ? document.fonts.ready : Promise.resolve()).then(() => requestAnimationFrame(() => {
   doFit();

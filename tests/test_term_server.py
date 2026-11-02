@@ -165,7 +165,8 @@ def test_the_page_policy_allows_the_vendored_script_by_hash_and_nothing_loose(ru
     csp = resp.getheader("Content-Security-Policy")
     integrity = page.script_integrity(assets.bundle())
     nonce = re.search(r"nonce-([\w-]+)", csp).group(1)
-    assert f"script-src '{integrity}' 'nonce-{nonce}'" in csp and "unsafe" not in csp
+    assert f"script-src '{integrity}' 'nonce-{nonce}'" in csp and "unsafe-eval" not in csp
+    assert csp.count("unsafe-inline") == 1 and "style-src-attr 'unsafe-inline'" in csp
     html = body.decode()
     assert f'integrity="{integrity}"' in html and html.count(f'nonce="{nonce}"') == 2, "one style, one script"
     assert re.search(r"<script(?![^>]*(?:nonce|src|type=\"application/json\"))", html) is None, "no unmarked script"

@@ -5,8 +5,9 @@ client. A client that attaches while another is attached takes over: the old one
 new one can type or set the size, so two screens never fight over the grid. The size is the owner's alone: a resize from
 anyone else is ignored, a repeat of the current size is ignored (the child isn't signalled for nothing), and a size out
 of range is refused. The child starts on the first attach, at that client's size, so a full-screen app draws once at the
-right size instead of redrawing after a resize. When a client detaches the child keeps running; the next client gets a
-redraw signal. When the child exits, the client is told with its exit code, and `on_exit` runs.
+right size instead of redrawing after a resize. When a client detaches the child keeps running; the next client gets
+the modes the program has set (screen, mouse, paste), so its new terminal matches, and then a redraw signal. When the
+child exits, the client is told with its exit code, and `on_exit` runs.
 
 Stdlib only; `fcntl` and `termios` are imported inside the functions that need them (not at import), so the module
 loads on a machine without them.
@@ -16,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -28,6 +30,7 @@ __all__ = [
     "MAX_DIM",
     "Child",
     "Client",
+    "ModeTracker",
     "PtyChild",
     "Session",
     "child_env",
@@ -39,6 +42,35 @@ CLOSE_REPLACED = 4000  # the WebSocket close code a client gets when another cli
 MAX_DIM = 1000
 # Run in the child before the program: make the pty its controlling terminal, then become the program.
 _SHIM = "import fcntl,os,sys,termios\nfcntl.ioctl(0,termios.TIOCSCTTY,0)\nos.execvp(sys.argv[1],sys.argv[1:])"
+
+
+# The private modes whose state a fresh terminal needs to draw a running program: the screen it is on, the cursor,
+# what the mouse and focus report, bracketed paste and synchronized output. In the order they are replayed.
+TRACKED_MODES = (1049, 1047, 47, 25, 1, 2004, 1004, 1000, 1002, 1003, 1005, 1006, 1015, 2026)
+_MODE_SEQ = re.compile(rb"\x1b\[\?([0-9;]+)([hl])")
+_PARTIAL = re.compile(rb"\x1b(?:\[(?:\?[0-9;]*)?)?")
+
+
+class ModeTracker:
+    """Follows the private modes a program sets (`ESC [ ? N h` and `l`) across the output chunks it prints, so a
+    window that connects later, whose terminal is new, can be put in the same modes before the program redraws."""
+
+    def __init__(self) -> None:
+        self.state: dict[int, bool] = {}
+        self._tail = b""
+
+    def feed(self, data: bytes) -> None:
+        buf = self._tail + data
+        for m in _MODE_SEQ.finditer(buf):
+            for part in m.group(1).split(b";"):
+                if part.isdigit() and int(part) in TRACKED_MODES:
+                    self.state[int(part)] = m.group(2) == b"h"
+        i = buf.rfind(b"\x1b", max(0, len(buf) - 40))
+        self._tail = buf[i:] if i >= 0 and _PARTIAL.fullmatch(buf[i:]) else b""
+
+    def restore(self) -> bytes:
+        """The sequences that put a fresh terminal in the modes seen so far (empty if the program set none)."""
+        return b"".join(b"\x1b[?%d%s" % (n, b"h" if self.state[n] else b"l") for n in TRACKED_MODES if n in self.state)
 
 
 def valid_size(cols: object, rows: object) -> bool:
@@ -177,6 +209,7 @@ class Session:
         self._client: Client | None = None
         self._size: tuple[int, int] | None = None
         self.exit_code: int | None = None
+        self.modes = ModeTracker()
         self._pump: threading.Thread | None = None
 
     @property
@@ -202,11 +235,19 @@ class Session:
                 self._pump = threading.Thread(target=self._run, args=(self._child,), daemon=True)
                 self._pump.start()
             elif self.exit_code is None:
+                self._restore_modes(client)
                 if not self._apply(cols, rows):
                     self._child.winch()  # same size: a signal is the only way to get the program to redraw
             else:
                 self._tell(client, {"type": "exit", "code": self.exit_code})
         return True
+
+    def _restore_modes(self, client: Client) -> None:
+        """A window that arrives while the program runs has a new terminal: set it in the program's modes first."""
+        seq = self.modes.restore()
+        if seq:
+            with contextlib.suppress(OSError):
+                client.send_output(seq)
 
     def detach(self, client: Client) -> None:
         with self._lock:
@@ -264,7 +305,9 @@ class Session:
             data = child.read()
             if not data:
                 break
-            client = self._client
+            with self._lock:  # a window that attaches now gets the modes up to here, then the output after
+                self.modes.feed(data)
+                client = self._client
             if client is not None:
                 try:
                     client.send_output(data)

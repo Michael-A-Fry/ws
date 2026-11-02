@@ -31,7 +31,7 @@ name, and a key in a guard's table that guard doesn't read.
 | `syntax-check` | after a call | file writes | Checks the file the session wrote and tells the model the line that doesn't parse. Python, JSON and TOML are read in process. `.sh` and `.bash` go through `sh -n` or `bash -n`, with a note when the machine has no shell. `.js`, `.mjs` and `.cjs` go through `node --check`, with a note when node isn't installed. |
 | `session-context` | at session start | none | Lists, one line each, which of `files` exist in the project: the git top level above the session's folder, and the main worktree when the session runs in a linked one. Adds a line when an API key bills an interactive session, and once for each ws version in each project, the version and what changed. |
 | `test-weakening` | before a call | file writes | Applies the edit to the test file on disk and compares before and after. Denies a skip or expected-failure marker added to a test that already exists; the person can approve it once. Warns about a test removed, fewer assertion lines, or an always-true assertion added. Judges Edit, Write and MultiEdit calls only. |
-| `claims` | before a message, and when the session stops | messages to other agents | Checks each commit-like token that sits in the same sentence as a claim word (`on main`, `merged into main`, `merged to main`, `pushed to main`) against a ref, and denies the message when the commit isn't on it. With `release_dir` set, also denies a message that calls a release other than the promoted one live. On stop, logs the claims in the runner's last message. |
+| `claims` | before a message, and when the session stops | messages to other agents | Checks each commit-like token that sits in the same sentence as a claim word (`on B`, `merged into B`, `merged to B`, `pushed to B`, where B is the repository's default branch) against a ref, and denies the message when the commit isn't on it. With `release_dir` set, also denies a message that calls a release other than the promoted one live. On stop, logs the claims in the runner's last message. |
 | `spawn-cap` | before a call, and when a subagent stops | subagent starts | Denies a subagent start when `max_agents` (default from the machine) are already running in the session. Counts agents started in the background. |
 | `skill-gate` | before a call, and when a prompt is sent | file writes and skill calls | Denies a write to a guarded path until the named skill has run in the session. The paths come from the policy's rules and from each skill's own `gates` front matter. The person can approve the write once. Judges Edit, Write and MultiEdit calls only. |
 | `record-calls` | before a call | every kind | Appends `{schema, ts, at, runner, payload}` (`ts` is the time; `at` is its legacy spelling, kept beside it) to `$WS_HOME/logs/gate-calls.jsonl`, one line for each hook run. A file write keeps its path and records the text as `{"bytes", "sha256"}`. `ws gate replay` reads that file. |
@@ -89,16 +89,19 @@ fingerprint of that text instead, so write the payload by hand to replay this gu
 
 ```toml
 [guards.claims]
-words = ["on main", "merged into main", "merged to main", "pushed to main"]   # optional
-ref = "origin/main"                        # optional
+words = ["on trunk", "merged into trunk", "merged to trunk", "pushed to trunk"]   # optional
+ref = "origin/trunk"                       # optional
 release_dir = "~/releases"                 # optional: release claims are off without it
 release_tags = ["v[0-9]+[.][0-9]+([.][0-9]+)*"]   # optional: the shapes of a release name
 ```
 
 A claim is a phrase from `words` (whole words, any case) in the same sentence as a commit-like token: 7 to 40
 lower-case hex characters with at least one digit and one of `a` to `f`. A commit may sit inside the phrase, as in
-`merged abc1234 into main`. The default phrases are about `main` only, because the check is against one ref. The guard
-runs `git merge-base --is-ancestor TOKEN REF` in the session's folder. A commit that isn't an ancestor of `ref`, or
+`merged abc1234 into main`. The default phrases are about the repository's default branch only, because the check is
+against one ref. ws reads that branch from `git symbolic-ref refs/remotes/origin/HEAD`. A repository with no
+`origin/HEAD` uses its local default branch: `init.defaultBranch`, else `main`. That branch's `origin/` copy is the ref
+when it exists, and the branch itself when it doesn't. Setting `words` or `ref` replaces that part of the default. The
+guard runs `git merge-base --is-ancestor TOKEN REF` in the session's folder. A commit that isn't an ancestor of `ref`, or
 isn't in the repository, denies the message and the reason names it. If `ref` may be out of date, the reason says to run
 `git fetch` first; the guard never fetches. A claim word in quotes or backticks isn't a claim, and neither is one with a
 negation or a future form in the four words before it (`not merged`, `will be pushed`, `once it's merged`). A sentence

@@ -558,7 +558,7 @@ pattern = '^\\s*14:00\\s*-\\s*15:00\\s*$'
 id = "starter-plain-english"
 family = "work-style"
 kind = "capability"
-prompt = "Rewrite draft.md in plain NZ English, in 30 words or fewer, and save it as plain.md. Do not use the words leverage, synergies or operationalise."
+prompt = "Rewrite draft.md in plain English, in 30 words or fewer, and save it as plain.md. Do not use the words leverage, synergies or operationalise."
 trials = 3
 timeout_s = 300
 

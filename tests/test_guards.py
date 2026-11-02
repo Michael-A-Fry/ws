@@ -501,14 +501,14 @@ def test_syntax_check_does_not_check_a_javascript_file_that_is_missing(tmp_path)
 
 def test_session_context_lists_the_state_files_that_exist(tmp_path):
     (tmp_path / ".git").mkdir()
-    (tmp_path / ".claude-state").mkdir()
-    (tmp_path / ".claude-state" / "STATE.md").write_text("state")
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "LOG.md").write_text("state")
     (tmp_path / "sub").mkdir()
-    cfg = session_context.config({"files": [".claude-state/STATE.md", "NOPE.md"]}, "[guards.session-context]")
+    cfg = session_context.config({"files": ["docs/LOG.md", "NOPE.md"]}, "[guards.session-context]")
     ctx = guards.Context("claude-code", "start", cwd=str(tmp_path / "sub"))  # from below the git top level
     found = session_context.judge(None, cfg, ctx)
     assert found.action == "note"
-    assert found.reason == f"ws: .claude-state/STATE.md exists at {tmp_path / '.claude-state' / 'STATE.md'}"
+    assert found.reason == f"ws: docs/LOG.md exists at {tmp_path / 'docs' / 'LOG.md'}"
     assert session_context.judge(None, cfg, guards.Context("claude-code", "start")) is None
     empty = guards.Context("claude-code", "start", cwd=str(tmp_path / "sub"))
     assert session_context.judge(None, session_context.Config(("NOPE.md",)), empty) is None

@@ -4,7 +4,8 @@
     ws gate generate --runner R --out DIR          write R's native config into DIR (0 changes when it is current)
     ws gate check --runner R                       hook payload on stdin; exit 0 = allow, 2 = deny (reason on stderr)
     ws gate event --runner R                       hook payload on stdin for the events that are not a call's check
-    ws gate replay FILE --runner R                 run recorded payloads against the policy; print allow, deny or ask
+    ws gate replay FILE... --runner R              run recorded payloads against the policy; print allow, deny or ask
+    ws gate replay CORPUS... --runner R --metrics  a labelled corpus: confusion matrix, error rates, latency, a decision diff
     ws gate launch --runner R -- ARGV              start a runner inside the sandbox wall (ws.sandbox)
 
 `check` fails closed: a payload it cannot read, a policy that does not load, or any crash is a deny. Exit 4 is not a
@@ -22,15 +23,17 @@ exit 0.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import shlex
 import sys
 import tempfile
 import time
+from dataclasses import replace
 from pathlib import Path
 
-from ws import adapters, approvals, guards, output, policy, sandbox
+from ws import adapters, approvals, gatecorpus, guards, output, policy, sandbox
 from ws.adapters import Call
 from ws.output import WsError
 from ws.profile import ws_home
@@ -73,6 +76,11 @@ def _context(runner: str, event: str, payload: dict, clock=None, home: Path | No
     )
 
 
+def _mark(layer: list[str] | None, kind: str) -> None:
+    if layer is not None:
+        layer.append(kind)
+
+
 def check(
     runner: str,
     raw: str,
@@ -82,6 +90,7 @@ def check(
     consume: bool = True,
     *,
     notes: list[str] | None = None,
+    layer: list[str] | None = None,
     clock=None,
     home: Path | None = None,
 ) -> str | approvals.Claim | None:
@@ -90,8 +99,9 @@ def check(
     runner, command, folder and session; `approval_root` is where those live (None: it cannot ask, so it denies, and
     the reason is an `Ask`). With consume=False (inside the wall) a valid grant comes back as a Claim to be claimed
     from the launcher. The guards that are on judge the call after the rules: the first deny wins, an approvable one
-    asks for approval the same way, and warnings and notes are added to `notes`. `home` and `clock` are for the guards
-    (the ws home their state lives in, and the time)."""
+    asks for approval the same way, and warnings and notes are added to `notes`. `layer`, when given, gets the kind of
+    the layer that made a refusal (preflight, rule:KIND, guard:NAME, ask_commands). `home` and `clock` are for the
+    guards (the ws home their state lives in, and the time)."""
     payload = json.loads(raw)
     if not isinstance(payload, dict):
         raise TypeError("payload is not a JSON object")
@@ -100,11 +110,13 @@ def check(
     # written without it); see the adapter.
     preflight = getattr(adapter, "preflight", None)
     if preflight and (why := preflight(payload)):
+        _mark(layer, "preflight")
         return why
     calls = _calls(adapter, payload)
     for call in calls:
         reason = evaluate(pol, call, protect)
         if reason:
+            _mark(layer, f"rule:{call.kind}")
             return reason
     session, cwd = _text(payload, "session_id"), _text(payload, "cwd")
     for name, call, found in guards.run(pol, "pre", calls, _context(runner, "pre", payload, clock, home)):
@@ -113,20 +125,27 @@ def check(
             if notes is not None:
                 notes.append(reason)
         elif not found.approvable:
+            _mark(layer, f"guard:{name}")
             return reason
         elif approval_root is None:
+            _mark(layer, f"guard:{name}")
             return Ask(f"{reason}; a person approves it from a gated session, where the approvals folder is reachable")
         else:
             bound = approvals.Bound(runner, f"guard:{name}", call.value if call else "", cwd, session)
             asked = approvals.require(approval_root, bound, consume=consume, why_asked=reason)
             if asked is not None:
+                _mark(layer, f"guard:{name}")
                 return asked
     for call in calls:
         if call.kind == "command" and policy.needs_approval(pol, call.value):
             if approval_root is None:
+                _mark(layer, "ask_commands")
                 return Ask("this command needs a person's approval, given from a gated session (`ws approve`)")
             bound = approvals.Bound(runner, call.kind, call.value, cwd, session)
-            return approvals.require(approval_root, bound, consume=consume)
+            asked = approvals.require(approval_root, bound, consume=consume)
+            if asked is not None:
+                _mark(layer, "ask_commands")
+            return asked
     return None
 
 
@@ -233,6 +252,26 @@ def _replay_line(n: int, line: str) -> tuple[dict, str | None]:
     return payload, expect
 
 
+def _judge(runner: str, payload: dict, pol: policy.Policy, protect: tuple[str, ...], scratch: Path) -> dict:
+    """One call judged as the live hook would, with no approval used up and no guard state kept: {result (allow, deny
+    or ask), reason, kind (the layer that refused it, None for an allow), ms (the time check() took)}."""
+    layer: list[str] = []
+    began = time.perf_counter()
+    try:
+        reason = check(runner, json.dumps(payload), pol, protect, None, home=scratch, layer=layer)
+    except Exception as e:  # noqa: BLE001 - what the live hook would do: a call it cannot judge is a deny
+        reason = f"could not check this call ({type(e).__name__}: {e})"
+        layer = ["error"]
+    ms = (time.perf_counter() - began) * 1000
+    result = "allow" if reason is None else "ask" if isinstance(reason, Ask) else "deny"
+    return {
+        "result": result,
+        "reason": reason if isinstance(reason, str) else None,
+        "kind": (layer[0] if layer else "unknown") if reason is not None else None,
+        "ms": ms,
+    }
+
+
 def replay(runner: str, lines: list[str], pol: policy.Policy, protect: tuple[str, ...] = ()) -> list[dict]:
     """Each non-blank line judged as the live hook would, with no approval used up and no guard state kept: a list of
     {line, result (allow, deny or ask), reason, expect, differs}."""
@@ -242,35 +281,94 @@ def replay(runner: str, lines: list[str], pol: policy.Policy, protect: tuple[str
             if not text.strip():
                 continue
             payload, expect = _replay_line(n, text)
-            try:
-                reason = check(runner, json.dumps(payload), pol, protect, None, home=Path(scratch))
-            except Exception as e:  # noqa: BLE001 - what the live hook would do: a call it cannot judge is a deny
-                reason = f"could not check this call ({type(e).__name__}: {e})"
-            result = "allow" if reason is None else "ask" if isinstance(reason, Ask) else "deny"
+            judged = _judge(runner, payload, pol, protect, Path(scratch))
             results.append(
                 {
                     "line": n,
-                    "result": result,
-                    "reason": reason if isinstance(reason, str) else None,
+                    "result": judged["result"],
+                    "reason": judged["reason"],
                     "expect": expect,
-                    "differs": expect is not None and expect != result,
+                    "differs": expect is not None and expect != judged["result"],
                 }
             )
     return results
 
 
+@contextlib.contextmanager
+def _scratch_home(home: Path):
+    """HOME, USERPROFILE and WS_HOME point into `home` for the block, so `~` and `$HOME` in a corpus name the scratch
+    folder and not the person's own."""
+    keys = ("HOME", "USERPROFILE", "WS_HOME")
+    saved = {k: os.environ.get(k) for k in keys}
+    os.environ.update({"HOME": str(home), "USERPROFILE": str(home), "WS_HOME": str(home / ".ws")})
+    try:
+        yield
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def replay_corpus(runner: str, rows: list[gatecorpus.Row], policy_file: Path | None = None) -> list[dict]:
+    """Each corpus row judged as the live hook would, in scratch `HOME` and `CWD` folders (made here, removed after,
+    and the only place a `{HOME}` or `{CWD}` is filled with). The policy is `policy_file`, else the built-in one. A row
+    for another runner is left out. Each result is {id, source, expect, known, result, reason, kind, ms, differs}."""
+    results = []
+    with tempfile.TemporaryDirectory(prefix="ws-corpus-") as scratch:
+        home, cwd = Path(scratch) / "home", Path(scratch) / "cwd"
+        home.mkdir()
+        cwd.mkdir()
+        with _scratch_home(home):
+            try:
+                pol = policy.load(policy_file) if policy_file else policy.default_policy()
+            except policy.PolicyError as e:
+                raise WsError("bad_config", str(e), f"fix {policy_file}, or write the default policy") from e
+            protect = _protect(policy_file or home / ".ws" / "policy.toml")
+            for row in rows:
+                payload = gatecorpus.render(row, runner, str(home), str(cwd))
+                if payload is None:
+                    continue
+                on = tuple(dict.fromkeys((*pol.guards.on, *row.guards)))
+                judged = _judge(runner, payload, replace(pol, guards=replace(pol.guards, on=on)), protect, home)
+                results.append(
+                    {
+                        "id": row.id,
+                        "source": row.source,
+                        "expect": row.expect,
+                        "known": row.known,
+                        **judged,
+                        "differs": row.expect != judged["result"],
+                    }
+                )
+    return results
+
+
+def _read_lines(path: Path) -> list[str]:
+    try:
+        return path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError) as e:
+        raise WsError("not_found", f"cannot read {path} ({type(e).__name__})", "give a file of payloads") from e
+
+
 def cmd_replay(args: argparse.Namespace) -> int:
+    files = [Path(f).expanduser() for f in args.file]
+    if args.expect_changes and not args.diff:
+        raise WsError("bad_input", "--expect-changes needs --diff", "give the saved decisions to compare with", 2)
+    corpus = (
+        args.metrics or args.save or args.diff or any(gatecorpus.is_corpus("\n".join(_read_lines(f))) for f in files)
+    )
+    if corpus:
+        return _replay_corpus_cmd(args, files)
+    if len(files) != 1:
+        raise WsError("bad_input", "give one file of payloads", "several files are for a corpus (rows with an id)")
     policy_file = _policy_arg(args) or policy.policy_path()
     try:
         pol = policy.load(policy_file)
     except policy.PolicyError as e:
         raise WsError("bad_config", str(e), f"fix {policy_file}, or `ws gate init`") from e
-    source = Path(args.file).expanduser()
-    try:
-        lines = source.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeDecodeError) as e:
-        raise WsError("not_found", f"cannot read {source} ({type(e).__name__})", "give a file of payloads") from e
-    results = replay(args.runner, lines, pol, _protect(policy_file))
+    results = replay(args.runner, _read_lines(files[0]), pol, _protect(policy_file))
     differ = [r for r in results if r["differs"]]
     if args.json:
         output.result(
@@ -284,6 +382,59 @@ def cmd_replay(args: argparse.Namespace) -> int:
     counts = ", ".join(f"{sum(r['result'] == k for r in results)} {k}" for k in RESULTS)
     print(f"ws: {len(results)} calls: {counts}" + (f"; {len(differ)} differ from expect" if differ else ""))
     return 1 if differ else 0
+
+
+def _replay_corpus_cmd(args: argparse.Namespace, files: list[Path]) -> int:
+    results = replay_corpus(args.runner, gatecorpus.load(files), _policy_arg(args))
+    bad, ratchet = gatecorpus.failures(results)
+    data: dict = {
+        "runner": args.runner,
+        "rows": len(results),
+        "differ": [r["id"] for r in bad],
+        "now_pass": [r["id"] for r in ratchet],
+    }
+    if args.metrics:
+        data["metrics"] = gatecorpus.metrics(results)
+    changes, unlisted, stale = None, [], []
+    if args.diff:
+        changes = gatecorpus.diff(gatecorpus.read_snapshot(Path(args.diff).expanduser(), args.runner), results)
+        expected = gatecorpus.read_expected(Path(args.expect_changes).expanduser()) if args.expect_changes else {}
+        unlisted, stale = gatecorpus.unexpected(changes, expected)
+        data["diff"] = {**changes, "unexpected": [c["id"] for c in unlisted], "expected_but_unchanged": stale}
+    if args.save:
+        out = Path(args.save).expanduser()
+        try:
+            out.write_text(json.dumps(gatecorpus.snapshot(args.runner, results), indent=1, sort_keys=True) + "\n")
+        except OSError as e:
+            raise WsError(
+                "io", f"cannot write {out} ({type(e).__name__})", "give a file in a folder that exists"
+            ) from e
+        data["saved"] = str(out)
+    failed = bool(bad or ratchet or unlisted or stale)
+    if args.json:
+        data["results"] = results
+        output.result(data, status=output.ATTENTION if failed else output.OK, kind="gate")
+        return 1 if failed else 0
+    for r in bad:
+        tail = f"  {r['reason']}" if r["reason"] else ""
+        print(f"FAIL  {r['id']}: expected {r['expect']}, got {r['result']} ({r['source']}){tail}")
+    for r in ratchet:
+        print(f'FIXED {r["id"]}: now {r["result"]} as expected; remove its "known" mark')
+    if args.metrics:
+        print("\n".join(gatecorpus.report_lines(data["metrics"])))
+    if changes is not None:
+        print()
+        for c in changes["changed"]:
+            note = "  (not listed in --expect-changes)" if c in unlisted else ""
+            print(f"changed {c['id']}: {gatecorpus.change_text(c)}  [{c['from']['kind']} -> {c['to']['kind']}]{note}")
+        for i in stale:
+            print(f"listed but unchanged: {i}")
+        if changes["added"] or changes["removed"]:
+            print(f"rows added {len(changes['added'])}, removed {len(changes['removed'])} since the saved decisions")
+        print(f"{len(changes['changed'])} changed, {len(unlisted)} not listed")
+    counts = ", ".join(f"{sum(r['result'] == k for r in results)} {k}" for k in RESULTS)
+    print(f"ws: {len(results)} rows: {counts}; {len(bad)} differ, {len(ratchet)} known rows now pass")
+    return 1 if failed else 0
 
 
 def write_files(out: Path, files: dict[str, str]) -> list[str]:
@@ -383,8 +534,23 @@ def register(sub) -> None:
     e.set_defaults(func=cmd_event, raw=True)  # a hook: the runner reads this command's own stdout, stderr and exit code
 
     r = gs.add_parser("replay", help="run recorded hook payloads against the policy and print allow, deny or ask")
-    r.add_argument("file", metavar="FILE", help="one JSON object per line: a payload, or {payload, expect}")
+    r.add_argument(
+        "file",
+        nargs="+",
+        metavar="FILE",
+        help="one JSON object per line: a payload, or {payload, expect}; or labelled corpus files (rows with an id)",
+    )
     common(r)
+    r.add_argument("--metrics", action="store_true", help="a corpus: the confusion matrix, error rates and latency")
+    r.add_argument("--save", metavar="OUT.json", help="a corpus: write each row's decision and layer to OUT.json")
+    r.add_argument(
+        "--diff", metavar="OLD.json", help="a corpus: list each decision that changed since OLD.json was saved"
+    )
+    r.add_argument(
+        "--expect-changes",
+        metavar="FILE",
+        help="with --diff: the ids expected to change, one a line (ID or ID: OLD -> NEW)",
+    )
     r.set_defaults(func=cmd_replay)
 
     sandbox.add_launch(gs, names)

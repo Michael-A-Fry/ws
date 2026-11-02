@@ -521,14 +521,18 @@ LAUNCH_ENV = (
     "PATH", "HOME", "USER", "LOGNAME", "SHELL", "PWD", "LANG", "LANGUAGE", "TZ", "TERM", "COLORTERM", "NO_COLOR",
     "COLUMNS", "LINES", "TERM_PROGRAM", "TERM_PROGRAM_VERSION", "TMUX", "TMUX_PANE", "TMPDIR", "EDITOR", "VISUAL",
     "PAGER", "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS", "WS_HOME", "WS_OUTPUT", "WS_BROKER_SOCKET",
+    "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "LC_COLLATE", "LC_NUMERIC", "LC_TIME", "LC_MONETARY",
+    "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME",
 )  # fmt: skip
-LAUNCH_ENV_PREFIXES = ("LC_", "XDG_")
 # The runner's own variables, besides the folder its adapter names in CONFIG_DIR_ENV. An adapter may list more in a
 # `LAUNCH_ENV` tuple of its own.
 RUNNER_ENV = {
-    "claude-code": ("CLAUDE_CONFIG_DIR", "ANTHROPIC_MODEL"),
+    "claude-code": (
+        "CLAUDE_CONFIG_DIR", "ANTHROPIC_MODEL", "DISABLE_AUTOUPDATER", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+    ),
     "opencode": (
-        "OPENCODE_CONFIG", "OPENCODE_DISABLE_AUTOUPDATE", "OPENCODE_DISABLE_MODELS_FETCH", "OPENCODE_DISABLE_LSP_DOWNLOAD",
+        "OPENCODE_CONFIG", "OPENCODE_CONFIG_CONTENT", "OPENCODE_DISABLE_AUTOUPDATE", "OPENCODE_DISABLE_MODELS_FETCH",
+        "OPENCODE_DISABLE_LSP_DOWNLOAD",
     ),
 }  # fmt: skip
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -549,12 +553,11 @@ def check_pass_env(names: list[str] | None) -> list[str]:
 
 
 def passed_env(env: dict, runner: str = "", pass_env: list[str] | None = None) -> dict:
-    """The part of `env` the runner may have: LAUNCH_ENV, the LC_ and XDG_ families, the runner's own variables and
-    the names the person passed. A name that isn't set is simply absent."""
+    """The part of `env` the runner may have: LAUNCH_ENV, the runner's own variables and the names the person passed. A name that isn't set is simply absent."""
     mod = adapters.get(runner) if runner else None
     own = (*RUNNER_ENV.get(runner, ()), *getattr(mod, "LAUNCH_ENV", ()), getattr(mod, "CONFIG_DIR_ENV", ""))
     names = {*LAUNCH_ENV, *own, *check_pass_env(pass_env)}
-    return {k: v for k, v in env.items() if k in names or k.startswith(LAUNCH_ENV_PREFIXES)}
+    return {k: v for k, v in env.items() if k in names}
 
 
 def launch_env(

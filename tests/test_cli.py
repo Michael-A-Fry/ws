@@ -235,8 +235,7 @@ def test_usage_rejects_a_normal_api_key_before_any_call(stub):
 
 def test_usage_role_wiring(stub, monkeypatch):
     _, base = stub
-    monkeypatch.setenv("WS_ANTHROPIC_API_BASE", base)
-    monkeypatch.setenv("WS_TEST_ALLOW_LOOPBACK_BASE", "1")  # a local stub is honoured only with the test flag
+    monkeypatch.setattr(usage, "TEST_BASE", base)  # the test-only hook; the environment cannot name a local stub
     _Stub.status, _Stub.body = 200, b'{"data": []}'
     cfg = {"adapter": "anthropic", "key_env": "WS_TEST_ADMIN"}
     assert doctor._usage(cfg, linux(), {}, True)[0] == "fail"
@@ -319,6 +318,12 @@ def test_init_reports_a_roles_notes_that_is_not_a_table(home, capsys):
         "https://api.anthropic.com\\@usage.example.com",
         "http://127.0.0.1:9",
         "https://localhost",
+        "http://localhost:8123",
+        "https://127.0.0.1",
+        "http://[::1]:8123",
+        "file://localhost",
+        "file://localhost/etc/hostname",
+        "ftp://api.anthropic.com",
     ],
 )
 def test_the_usage_base_url_from_the_environment_must_be_the_providers_own_host(value):
@@ -334,11 +339,61 @@ def test_the_usage_base_url_accepts_the_providers_own_host(value):
     assert urlsplit(usage.env_base({"WS_ANTHROPIC_API_BASE": value})).hostname == "api.anthropic.com"
 
 
-def test_a_loopback_usage_base_needs_the_test_flag():
-    env = {"WS_ANTHROPIC_API_BASE": "http://127.0.0.1:8123"}
+@pytest.mark.parametrize("flag", ["WS_TEST_ALLOW_LOOPBACK_BASE", "WS_TEST_BASE", "WS_USAGE_TEST_BASE"])
+def test_no_environment_variable_lets_the_usage_base_name_a_local_server(flag):
+    env = {"WS_ANTHROPIC_API_BASE": "http://127.0.0.1:8123", flag: "1"}
     with pytest.raises(usage.BaseRefused):
         usage.env_base(env)
-    assert usage.env_base({**env, "WS_TEST_ALLOW_LOOPBACK_BASE": "1"}) == "http://127.0.0.1:8123"
+
+
+def test_the_usage_check_in_production_reads_only_the_providers_host(monkeypatch):
+    assert usage.TEST_BASE is None
+    seen = []
+
+    class Stop(Exception):
+        pass
+
+    def opener(req, timeout):
+        seen.append(req.full_url)
+        raise Stop
+
+    monkeypatch.setattr(usage._OPENER, "open", opener)
+    monkeypatch.setenv("WS_ANTHROPIC_API_BASE", "http://127.0.0.1:8123")
+    monkeypatch.setenv("WS_TEST_ALLOW_LOOPBACK_BASE", "1")
+    status, _ = usage.check_anthropic(KEY)
+    assert status == "fail" and seen == []  # refused before any request
+    monkeypatch.delenv("WS_ANTHROPIC_API_BASE")
+    with pytest.raises(Stop):
+        usage.check_anthropic(KEY)
+    assert seen[0].startswith("https://api.anthropic.com/v1/organizations/usage_report/messages?")
+
+
+@pytest.mark.parametrize(
+    "value", ["http://127.0.0.1:8123", "https://localhost:9", "http://[::1]:5", "http://localhost"]
+)
+def test_the_test_only_base_accepts_http_or_https_to_loopback(value):
+    assert usage.local_base(value + "/") == value
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "file://localhost",
+        "file://localhost/etc/hostname",
+        "ftp://127.0.0.1",
+        "http://usage.example.com",
+        "https://api.anthropic.com",
+        "http://127.0.0.1.usage.example.com",
+        "http://127.0.0.1:9/x",
+        "http://127.0.0.1:9?x=1",
+        "http://u:p" + "@127.0.0.1:9",
+        "http://127.0.0.1:port",
+    ],
+)
+def test_the_test_only_base_refuses_anything_else(value):
+    with pytest.raises(usage.BaseRefused):
+        usage.local_base(value)
+    assert usage.check_anthropic(KEY, value)[0] == "fail"  # refused before any request
 
 
 def test_a_refused_usage_base_sends_nothing_and_never_shows_the_key(monkeypatch):
@@ -346,7 +401,6 @@ def test_a_refused_usage_base_sends_nothing_and_never_shows_the_key(monkeypatch)
         raise AssertionError("the key must not be sent")
 
     monkeypatch.setattr(usage._OPENER, "open", never)
-    monkeypatch.delenv("WS_TEST_ALLOW_LOOPBACK_BASE", raising=False)
     monkeypatch.setenv("WS_ANTHROPIC_API_BASE", "https://usage.example.com")
     status, detail = usage.check_anthropic(KEY)
     assert status == "fail" and "WS_ANTHROPIC_API_BASE" in detail and KEY not in detail

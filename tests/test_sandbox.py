@@ -6,11 +6,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import struct
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -1183,6 +1185,52 @@ def test_launch_env_keeps_the_runners_own_variables():
     got = sandbox.launch_env(parent, runner="opencode")
     assert "CLAUDE_CONFIG_DIR" not in got and "OTHER" not in got
     assert got["OPENCODE_CONFIG_DIR"] == "/o" and got["OPENCODE_CONFIG"] == "/oc"
+
+
+def test_launch_env_keeps_the_opencode_inline_config_and_folder():
+    parent = {"OPENCODE_CONFIG_CONTENT": '{"permission": {}}', "OPENCODE_CONFIG_DIR": "/o", "OTHER": "x"}
+    got = sandbox.launch_env(parent, runner="opencode")
+    assert got["OPENCODE_CONFIG_CONTENT"] == parent["OPENCODE_CONFIG_CONTENT"] and got["OPENCODE_CONFIG_DIR"] == "/o"
+    assert "OTHER" not in got
+
+
+# Set by `ws run` for a leased key: the base URL and the placeholder key. A launch hands them on only by name.
+LEASE_ENV = {"ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY"}
+
+
+def _own_names(runner: str, tmp_path) -> set[str]:
+    """Every variable the adapter's launch hint and `build_command` name, found from the adapter itself."""
+    mod = {"claude-code": claude_code, "opencode": opencode}[runner]
+    hint = set(re.findall(r"\b([A-Z][A-Z0-9_]+)=", mod.launch_hint(str(tmp_path))))
+    model = "m" if runner == "claude-code" else "p/m"
+    job = jobs.loads("j", f'runner = "{runner}"\nmodel = "{model}"\nprompt = "-hello"\n', Path("."))
+    (tmp_path / "gate").mkdir(exist_ok=True)
+    lease = SimpleNamespace(base_url="http://127.0.0.1:1/l/x")
+    _, env = mod.build_command(job, tmp_path, lease)
+    return hint | set(env)
+
+
+@pytest.mark.parametrize("runner", ["claude-code", "opencode"])
+def test_launch_env_keeps_every_variable_the_adapter_sets_for_its_runner(runner, tmp_path):
+    names = _own_names(runner, tmp_path) - LEASE_ENV
+    assert names  # the adapter names something to keep
+    got = sandbox.launch_env({n: "v" for n in names}, runner=runner)
+    assert names <= set(got), sorted(names - set(got))
+
+
+@pytest.mark.parametrize("runner", ["claude-code", "opencode"])
+def test_launch_env_leaves_the_lease_variables_to_pass_env(runner):
+    parent = {n: "v" for n in LEASE_ENV}
+    assert not set(sandbox.launch_env(parent, runner=runner)) & LEASE_ENV
+    assert set(sandbox.launch_env(parent, runner=runner, pass_env=sorted(LEASE_ENV))) >= LEASE_ENV
+
+
+def test_launch_env_keeps_only_the_named_locale_and_xdg_variables():
+    named = ["LANG", "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "LC_COLLATE", "LC_NUMERIC", "LC_TIME", "LC_MONETARY",
+             "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"]  # fmt: skip
+    other = ["LC_SECRET_NOTE", "XDG_SESSION_TOKEN", "LC_", "XDG_"]
+    got = sandbox.launch_env({n: "v" for n in [*named, *other]})
+    assert set(named) <= set(got) and not set(other) & set(got)
 
 
 def test_pass_env_adds_exactly_the_names_given_and_cannot_unmark_the_session():

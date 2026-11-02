@@ -309,6 +309,38 @@ def _load(env: Env, kinds: set[str]) -> Loaded:
     return out
 
 
+KEY_FILE = "home/seal-key"
+
+
+def seal_key(env: Env) -> bytes:
+    """The per-install key behind the hashes on an opaque record: 32 random bytes in `$WS_HOME/home/seal-key` (0600),
+    made on first use. Where it can't be made or read, a key for this process alone is used: the hashes then change
+    from one run to the next, which is safe and only less steady."""
+    if "seal_key" in env.cache:
+        return env.cache["seal_key"]
+    path = env.ws_home / KEY_FILE
+    key = b""
+    try:
+        key = path.read_bytes() if path.is_file() else b""
+        if len(key) != 32:
+            key = os.urandom(32)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(f"{path.name}.{os.getpid()}.new")
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(key)
+            os.replace(tmp, path)
+    except OSError:
+        key = os.urandom(32)
+    env.cache["seal_key"] = key
+    return key
+
+
+def _seal(env: Env, rec, opaque: bool):
+    """`records.seal`, with the install key fetched only when a record is opaque (an open record needs no hash)."""
+    return records.seal(rec, opaque, env.cfg.show_repos, seal_key(env) if opaque else None)
+
+
 def _finish_sessions(env: Env, loaded: Loaded) -> tuple[list[Session], dict[str, bool]]:
     """The merged sessions, sealed. Also the opaque verdict by session id (True opaque, False open); a session id not
     here is unknown, and asks and events that name one are opaque."""
@@ -323,7 +355,7 @@ def _finish_sessions(env: Env, loaded: Loaded) -> tuple[list[Session], dict[str,
         s = replace(s, state=state, host=s.host or env.host, lead=(s.runner, s.id) == lead)
         opaque = records.is_opaque(s, env.cfg.roots)
         verdict[s.id] = verdict.get(s.id, False) or opaque
-        out.append(records.seal(s, opaque, env.cfg.show_repos))
+        out.append(_seal(env, s, opaque))
     out.sort(key=lambda s: s.last_seen or "", reverse=True)
     out.sort(key=lambda s: (s.host, _RANK.get(s.state, 3)))
     return out, verdict
@@ -338,16 +370,13 @@ def _finish_asks(env: Env, loaded: Loaded, verdict: dict[str, bool]) -> list[Ask
     seen: dict[tuple[str, str], Ask] = {}
     for a in loaded.by_kind.get("asks", []):
         seen.setdefault((a.source, a.id), a)
-    out = [
-        records.seal(a, records.is_opaque(a, env.cfg.roots, _known(verdict, a.session_id)), env.cfg.show_repos)
-        for a in seen.values()
-    ]
+    out = [_seal(env, a, records.is_opaque(a, env.cfg.roots, _known(verdict, a.session_id))) for a in seen.values()]
     return sorted(out, key=lambda a: (a.created is None, a.created or ""))
 
 
 def _finish_events(env: Env, loaded: Loaded, verdict: dict[str, bool]) -> list[Event]:
     out = [
-        records.seal(e, records.is_opaque(e, env.cfg.roots, _known(verdict, e.session_id)), env.cfg.show_repos)
+        _seal(env, e, records.is_opaque(e, env.cfg.roots, _known(verdict, e.session_id)))
         for e in loaded.by_kind.get("events", [])
         if (_files.epoch(e.ts) >= env.event_since)
     ]

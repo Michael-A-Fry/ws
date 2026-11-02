@@ -108,8 +108,9 @@ The grader's wall in `ws eval` has the same network as the runner's wall.
 
 ### The runner gets a short list of environment variables
 
-`ws gate launch` hands the runner `PATH`, `HOME`, the locale and terminal names, `XDG_*`, `WS_HOME`, the broker socket
-and the runner's own configuration variables. The rest of the launching shell's environment stays behind.
+`ws gate launch` hands the runner `PATH`, `HOME`, the locale and terminal names, the named `LC_` and `XDG_` variables,
+`WS_HOME`, the broker socket and the runner's own configuration variables. The rest of the launching shell's
+environment stays behind.
 
 - **What it means.** A key you export in that shell isn't in the session unless you name it with `--pass-env NAME`.
   A name you pass is readable by the session and by every program it starts. A runner behind a proxy needs the proxy

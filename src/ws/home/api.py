@@ -1,9 +1,11 @@
-"""The home data API: `snapshot` and the reads behind it (`lead`, `asks`, `sessions`, `plugins`, `evals`, `events`).
+"""The home data API: `snapshot` and the reads behind it (`lead`, `asks`, `sessions`, `plugins`, `evals`, `events`) and the one write, `answer`.
 
 Every area, app and script reads home data through here and nowhere else. It reads the sources (ws.home.sources) in
 order, drops any source that can't be read whole into one `sources[]` row with a typed reason, merges sessions by
 (runner, session id), and applies the opaque rule last: an opaque record leaves with only what ws.home.records.KEEP
-lists. It is read-only. The profile's `[home]` table is read and checked here; an unknown key is an error naming it.
+lists. Reading changes nothing. `answer` hands one answer to the source that gave the ask, which runs the profile's
+`[home.answer]` command; ws never writes a source's file itself, and an opaque ask, an approval or a permission can't
+be answered this way. The profile's `[home]` table is read and checked here; an unknown key is an error naming it.
 """
 
 from __future__ import annotations
@@ -19,15 +21,18 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from ws import jsonl
-from ws.home import records
+from ws.home import records, template
 from ws.home.records import Ask, Event, Plugin, Session, Snapshot, SourceRow
 from ws.home.sources import FAILED, TIMEOUT, UNAVAILABLE, SourceError, _files, discover
 from ws.output import WsError
 from ws.profile import ProfileError, load, profile_path, ws_home
 
-HOME_KEYS = ("lead", "opaque_paths", "sources", "open")
+HOME_KEYS = ("lead", "opaque_paths", "sources", "open", "start", "answer", "workspaces", "models", "deny")
 SOURCE_KEYS = ("asks_jsonl", "events_dir", "otel_dir", "claude_dir")
 OPEN_KEYS = ("session", "ask", "opaque")
+START_NAMES = ("what", "workspace", "where", "runner", "model", "request")  # what `[home.start] command` may use
+ANSWER_NAMES = ("id", "choice", "text")  # what `[home.answer] command` may use
+ANSWER_TEXT_MAX = 2000
 _LEAD = re.compile(r"^(cwd|name):\S.*$")
 EVENT_WINDOW_S = 24 * 3600  # how far back a snapshot's events reach
 RUN_TIMEOUT_S = 10.0
@@ -45,6 +50,11 @@ class HomeConfig:
     roots: tuple[str, ...] = ()  # opaque_paths as absolute paths, links followed (records.roots_of)
     sources: Mapping[str, str] = field(default_factory=dict)
     open: Mapping[str, str] = field(default_factory=dict)
+    start: tuple[str, ...] = ()  # `[home.start] command`: the argument template that starts a session
+    answer: tuple[str, ...] = ()  # `[home.answer] command`: the argument template that answers an ask
+    workspaces: Mapping[str, str] = field(default_factory=dict)  # workspace name -> its data class
+    models: Mapping[str, tuple[str, ...]] = field(default_factory=dict)  # runner -> the models it offers
+    deny: Mapping[str, tuple[str, ...]] = field(default_factory=dict)  # runner or runner/model -> classes it can't take
 
 
 def _bad(path: Path, message: str, hint: str) -> WsError:
@@ -67,6 +77,45 @@ def _strings(table: object, allowed: tuple[str, ...], where: str, path: Path) ->
         if not isinstance(value, str) or not value.strip():
             raise _bad(path, f"{where}.{key} must be a non-empty string", f"set {where}.{key} to text")
     return {k: v.strip() for k, v in table.items()}
+
+
+def _command(table: object, where: str, path: Path, allowed: tuple[str, ...], required: str) -> tuple[str, ...]:
+    """`[home.start]` or `[home.answer]`: one key, `command`, a list of words checked as a template."""
+    if table is None:
+        return ()
+    if not isinstance(table, dict):
+        raise _bad(path, f"{where} must be a table", f"write {where} as a table with a command list")
+    for key in table:
+        if key != "command":
+            raise _bad(path, f"unknown key {key!r} in {where}", "the key is: command")
+    words = table.get("command")
+    if words is None:
+        return ()
+    if not isinstance(words, list) or not all(isinstance(w, str) and w for w in words):
+        raise _bad(path, f"{where}.command must be a list of words", f'e.g. command = ["prog", "{{{required}}}"]')
+    why = template.check(words, allowed, required)
+    if why:
+        raise _bad(path, f"{where}.command {why}", f"the names you can use are: {', '.join(allowed)}")
+    return tuple(words)
+
+
+def _free(table: object, where: str, path: Path, lists: bool) -> dict:
+    """A table whose keys the person picks: each value a text (a class) or, when `lists`, a list of texts."""
+    if table is None:
+        return {}
+    if not isinstance(table, dict):
+        raise _bad(path, f"{where} must be a table", f"write {where} as a table")
+    out: dict = {}
+    for key, value in table.items():
+        if lists:
+            if not (isinstance(value, list) and all(isinstance(v, str) and v.strip() for v in value)):
+                raise _bad(path, f"{where}.{key} must be a list of text", f'e.g. {key} = ["name"]')
+            out[key] = tuple(v.strip() for v in value)
+        else:
+            if not isinstance(value, str) or not value.strip():
+                raise _bad(path, f"{where}.{key} must be text", f'e.g. {key} = "financial"')
+            out[key] = value.strip()
+    return out
 
 
 def load_config(environ: Mapping[str, str], home: Path) -> HomeConfig:
@@ -100,12 +149,24 @@ def load_config(environ: Mapping[str, str], home: Path) -> HomeConfig:
                 'start it with / or ~/, e.g. opaque_paths = ["~/code/private"]',
             )
     expanded = tuple(dict.fromkeys(f for p in paths for f in (_expand(p.strip(), home), _expand(p, home))))
+    answer = _command(table.get("answer"), "[home.answer]", path, ANSWER_NAMES, "id")
+    if answer and not {"choice", "text"} & template.names(answer):
+        raise _bad(
+            path,
+            "[home.answer].command must use {choice} or {text}, or an answer would be sent with nothing in it",
+            'e.g. command = ["ws-ask", "answer", "{id}", "{choice}"]',
+        )
     return HomeConfig(
         lead=lead,
         opaque_paths=tuple(paths),
         roots=records.roots_of(expanded),
         sources={k: _expand(v, home) for k, v in sources.items()},
         open=opens,
+        start=_command(table.get("start"), "[home.start]", path, START_NAMES, "request"),
+        answer=answer,
+        workspaces=_free(table.get("workspaces"), "[home.workspaces]", path, lists=False),
+        models=_free(table.get("models"), "[home.models]", path, lists=True),
+        deny=_free(table.get("deny"), "[home.deny]", path, lists=True),
     )
 
 
@@ -234,10 +295,25 @@ def merge_sessions(parts: list[Session], roots: tuple[str, ...] = ()) -> list[Se
     return list(merged.values())
 
 
+FRONT_DESK_NAMES = ("Home", "WS Lead")  # a session in ~/code whose name starts so is the front desk
+
+
+def _front_desk(sessions: list[Session], home: Path) -> tuple[str, str] | None:
+    """With no `[home] lead`: the one live session in the person's `~/code` folder named like a front desk, else None."""
+    code = os.path.normpath(str(home / "code"))
+    hits = [
+        s
+        for s in sessions
+        if s.state != "ended" and s.cwd and os.path.normpath(s.cwd) == code and s.name.startswith(FRONT_DESK_NAMES)
+    ]
+    return (hits[0].runner, hits[0].id) if len(hits) == 1 else None
+
+
 def _lead_key(sessions: list[Session], lead: str, home: Path) -> tuple[str, str] | None:
-    """The (runner, id) of the session the `[home] lead` setting names; the most recently seen live one if several."""
+    """The (runner, id) of the session the `[home] lead` setting names; the most recently seen live one if several.
+    With the setting empty, the front desk if exactly one session is."""
     if not lead:
-        return None
+        return _front_desk(sessions, home)
     how, _, want = lead.partition(":")
     if how == "cwd":
         target = os.path.normpath(_expand(want.strip(), home))
@@ -299,15 +375,16 @@ def _load(env: Env, kinds: set[str]) -> Loaded:
 def _finish_sessions(env: Env, loaded: Loaded) -> tuple[list[Session], dict[str, bool]]:
     """The merged sessions, sealed. Also the opaque verdict by session id (True opaque, False open); a session id not
     here is unknown, and asks and events that name one are opaque."""
-    merged = merge_sessions(loaded.by_kind.get("sessions", []), env.cfg.roots)
+    merged = []
+    for s in merge_sessions(loaded.by_kind.get("sessions", []), env.cfg.roots):
+        if s.state == "unknown" and s.runner in loaded.live_runners and (s.runner, s.id) not in loaded.live:
+            s = replace(s, state="ended")  # the live list was read and this session isn't in it
+        merged.append(s)
     lead = _lead_key(merged, env.cfg.lead, env.home)
     out: list[Session] = []
     verdict: dict[str, bool] = {}
     for s in merged:
-        state = s.state
-        if state == "unknown" and s.runner in loaded.live_runners and (s.runner, s.id) not in loaded.live:
-            state = "ended"  # the live list was read and this session isn't in it
-        s = replace(s, state=state, host=s.host or env.host, lead=(s.runner, s.id) == lead)
+        s = replace(s, host=s.host or env.host, lead=(s.runner, s.id) == lead)
         opaque = records.is_opaque(s, env.cfg.roots)
         verdict[s.id] = verdict.get(s.id, False) or opaque
         out.append(records.seal(s, opaque))
@@ -321,11 +398,81 @@ def _known(verdict: dict[str, bool], session_id: str) -> bool | None:
     return verdict.get(session_id) if session_id else None
 
 
-def _finish_asks(env: Env, loaded: Loaded, verdict: dict[str, bool]) -> list[Ask]:
+TMUX_TARGET = re.compile(r"^([^:.\s]+):([^.\s]+)(?:\.(\S+))?$")  # session:window[.pane]
+TMUX_TIMEOUT_S = 5.0
+
+
+def _tmux_target(text: str) -> tuple[str, str, str] | None:
+    """(session, window, pane) of a tmux target like `ws:2`, `ws:@45` or `ws:@1.%1`; None for anything else."""
+    m = TMUX_TARGET.match(text.strip())
+    return (m.group(1), m.group(2), m.group(3) or "") if m else None
+
+
+def _window_ids(env: Env) -> dict[tuple[str, str], str]:
+    """{(tmux session, window index): window id} from `tmux list-windows`, read once. A window index changes when
+    windows are moved, so it is only used to find the one window that has it now; no tmux, or any failure, is {}."""
+    if "tmux_windows" not in env.cache:
+        found: dict[tuple[str, str], str] = {}
+        try:
+            code, out = env.run(
+                ["tmux", "list-windows", "-a", "-F", "#{session_name}:#{window_index} #{window_id}"], TMUX_TIMEOUT_S
+            )
+        except (OSError, TimeoutError):
+            code, out = 1, ""
+        for line in out.splitlines() if code == 0 else ():
+            where, _, wid = line.strip().partition(" ")
+            t = _tmux_target(where)
+            if t and wid:
+                found[(t[0], t[1])] = wid
+        env.cache["tmux_windows"] = found
+    return env.cache["tmux_windows"]
+
+
+def _place(env: Env, ask: Ask, sessions: list[Session]) -> bool | None:
+    """The opaque verdict on an ask that names no session id, from the one live Claude Code session in its tmux pane or
+    window: that session's own verdict (claude_code saw its folder, so it may vouch). None when the ask names no
+    target, nothing matches, or more than one session does (it stays opaque by the usual rules). When the ask and the
+    session both carry a name they must agree: a window number can have moved since the ask was written."""
+    want = _tmux_target(ask.tmux)
+    if want is None:
+        return None
+    sess, win, pane = want
+    by_number = not pane and win.isdigit()  # a window number moves; a window id or a pane doesn't
+    if by_number:
+        wid = _window_ids(env).get((sess, win))
+        win = wid or win
+    made = _files.epoch(ask.created) if ask.created else None
+    hits = []
+    for s in sessions:
+        if s.state == "ended" or "claude_code" not in s.source.split("+"):
+            continue
+        have = _tmux_target(s.tmux)
+        if have is None or have[0] != sess:
+            continue
+        if (pane and have[2] == pane) or (not pane and have[1] == win):
+            began = _files.epoch(s.started_at) if s.started_at else None
+            if began is not None and made is not None and began <= made:  # a newer session holds the pane now
+                hits.append(s)
+    if len(hits) != 1:
+        return None
+    hit = hits[0]
+    if by_number and not (ask.session_name and hit.name):
+        return None  # a bare number with no name on both sides could be any session that holds it now
+    if not hit.opaque and ask.session_name and hit.name and ask.session_name != hit.name:
+        return None
+    return hit.opaque
+
+
+def _finish_asks(env: Env, loaded: Loaded, verdict: dict[str, bool], sessions: list[Session]) -> list[Ask]:
     seen: dict[tuple[str, str], Ask] = {}
     for a in loaded.by_kind.get("asks", []):
         seen.setdefault((a.source, a.id), a)
-    out = [records.seal(a, records.is_opaque(a, env.cfg.roots, _known(verdict, a.session_id))) for a in seen.values()]
+    out = []
+    for a in seen.values():
+        known = _known(verdict, a.session_id)
+        if known is None:
+            known = _place(env, a, sessions)
+        out.append(records.seal(a, records.is_opaque(a, env.cfg.roots, known)))
     return sorted(out, key=lambda a: (a.created is None, a.created or ""))
 
 
@@ -350,7 +497,7 @@ def snapshot(env: Env | None = None) -> Snapshot:
         ts=jsonl.iso_utc(env.now),
         host=env.host,
         lead=next((s for s in sessions if s.lead), None),
-        asks=tuple(_finish_asks(env, loaded, verdict)),
+        asks=tuple(_finish_asks(env, loaded, verdict, sessions)),
         sessions=tuple(sessions),
         plugins=tuple(loaded.by_kind["plugins"]),
         evals=tuple(loaded.by_kind["evals"]),
@@ -374,8 +521,8 @@ def asks(env: Env | None = None) -> list[Ask]:
     """What is waiting for the person, oldest first."""
     env = env or Env.make()
     loaded = _load(env, {"asks", "sessions"})
-    _, verdict = _finish_sessions(env, loaded)
-    return _finish_asks(env, loaded, verdict)
+    sessions, verdict = _finish_sessions(env, loaded)
+    return _finish_asks(env, loaded, verdict, sessions)
 
 
 def plugins(env: Env | None = None) -> list[Plugin]:
@@ -395,3 +542,46 @@ def events(since: float | None = None, env: Env | None = None) -> list[Event]:
     loaded = _load(env, {"events", "sessions"})
     _, verdict = _finish_sessions(env, loaded)
     return _finish_events(env, loaded, verdict)
+
+
+# --- the one write -------------------------------------------------------------------------------------------------
+
+
+def answerable(ask: Ask) -> bool:
+    """True when an ask is one a person may answer through the API: a question that isn't opaque, from a source that can
+    take an answer. A permission, an approval, a waiting session and every opaque ask are answered where they live."""
+    if ask.opaque or ask.kind != "question":
+        return False
+    return any(m.NAME == ask.source and callable(getattr(m, "answer", None)) for m in discover()[0])
+
+
+def answer(ask_id: str, choice: str = "", text: str = "", env: Env | None = None) -> None:
+    """Answer one ask with one of its options (`choice`, the option's label) or in your own words (`text`), never both.
+    The source that gave the ask does it. Raises WsError: `not_found` (no such ask now), `refused` (it can't be answered
+    here, or the answer isn't one of its options), `not_set` (`[home.answer] command` isn't in the profile) or `failed`
+    (the program didn't run or stopped)."""
+    env = env or Env.make()
+    ask = next((a for a in asks(env) if a.id == ask_id), None)
+    if ask is None:
+        raise WsError("not_found", "that ask is gone", "reload the page to see what is waiting")
+    if not answerable(ask):
+        raise WsError("refused", "that ask is answered where it lives", "use Open to go to its session")
+    if bool(choice) == bool(text):
+        raise WsError("refused", "give one option or your own words, not both or neither", "pick an option or type")
+    if choice and choice not in {o.get("label") for o in ask.options}:
+        raise WsError("refused", "that isn't one of the ask's options", "reload the page and pick again")
+    if len(text) > ANSWER_TEXT_MAX:
+        raise WsError("refused", f"an answer is at most {ANSWER_TEXT_MAX} characters", "shorten it")
+    if not env.cfg.answer:
+        raise WsError("not_set", "no answer command is set", "set [home.answer] command in the profile")
+    used = template.names(env.cfg.answer)
+    if choice and "choice" not in used:
+        raise WsError("refused", "the answer command takes typed answers only", "add {choice} to [home.answer] command")
+    if text and "text" not in used:
+        raise WsError("refused", "the answer command doesn't take typed text", "add {text} to [home.answer] command")
+    mod = next(m for m in discover()[0] if m.NAME == ask.source)
+    try:
+        mod.answer(ask, choice, text, env)
+    except SourceError as e:
+        kind = "timeout" if e.kind == TIMEOUT else "failed"
+        raise WsError(kind, e.why, "check the program in [home.answer] command") from e

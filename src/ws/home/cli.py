@@ -1,12 +1,15 @@
-"""`ws home data`: the home snapshot (`ws.home/1`) as text, or as the JSON a script, an app or a page reads."""
+"""`ws home`: the home page on loopback, `ws home --render FILE` to write it as one file, and `ws home data` for the
+snapshot (`ws.home/1`) as text or as the JSON a script, an app or a page reads."""
 
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+from pathlib import Path
 
 from ws import output
-from ws.home import api
+from ws.home import api, server
 from ws.home.records import Snapshot
 from ws.style import Style, plural
 
@@ -46,8 +49,34 @@ def cmd_data(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_home(args: argparse.Namespace) -> int:
+    """Serve the page on loopback, or (`--render FILE`) write it as one file and say where."""
+    if not args.render:
+        return server.run(open_browser=not args.no_browser)
+    env = api.Env.make()
+    text = server.page_for(env, live=False)
+    out = Path(args.render).expanduser()
+    # the page holds the person's own session names and folders: made private from the first byte, and never through a link
+    fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    if hasattr(os, "fchmod"):
+        os.fchmod(fd, 0o600)  # a file that was already there keeps its own mode otherwise
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    if args.json:
+        output.result({"path": str(out), "bytes": len(text.encode("utf-8"))})
+    else:
+        print(f"ws home: wrote {out}")
+    return 0
+
+
 def register(sub) -> None:
-    h = sub.add_parser("home", help="the home view: sessions, asks, evals and plugins from every source")
-    hs = h.add_subparsers(dest="home_command", required=True)
+    h = sub.add_parser(
+        "home",
+        help="the home page: sessions, asks and evals from every source (--render FILE writes it as one file)",
+    )
+    h.add_argument("--render", metavar="FILE", help="write the page to FILE as it is now, and stop")
+    h.add_argument("--no-browser", action="store_true", help="print the address and don't open a browser")
+    h.set_defaults(func=cmd_home, raw=lambda a: not a.render)
+    hs = h.add_subparsers(dest="home_command")
     d = hs.add_parser("data", help="the home snapshot: one read-only view of every source (add --json for machines)")
-    d.set_defaults(func=cmd_data)
+    d.set_defaults(func=cmd_data, raw=False)

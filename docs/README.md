@@ -58,6 +58,7 @@ Measure:
 - [Policy](reference/policy.md): every `policy.toml` key.
 - [Guards](reference/guards.md): the named checks, their events and findings, replay.
 - [Eval](reference/eval.md): task files, graders and the ten metrics.
+- [Home data API](reference/home-api.md): the one read-only view of sessions, asks and evals that the home page reads.
 - [Stores](reference/stores.md): every log and record file ws writes, its fields, schema and retention.
 - [Lab](reference/lab.md): the lab virtual machine cell and how it's protected.
 - [`ws version --json`](reference/version-json.md): the build and install fields.

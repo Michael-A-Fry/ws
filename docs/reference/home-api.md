@@ -51,6 +51,18 @@ and the repo label only.
 
 `opens` is empty here. The openers in the home page fill it in.
 
+## Answering
+
+`api.answer(ask_id, choice, text, env)` answers one ask, with one of its options (`choice`) or in your own words
+(`text`). The source that gave the ask does it, by running `[home.answer] command`; ws never writes the source's file.
+Only a question that isn't opaque, from a source that can take an answer (`asks_jsonl`), is answerable
+(`api.answerable`). A permission, an approval, a waiting session and every opaque ask are answered where they live, and
+asking the API to answer one raises `WsError` with kind `refused`. The other kinds are `not_found`, `not_set` (no
+`[home.answer] command`), `failed` (the program didn't run or stopped) and `timeout` (it took too long, so the answer may
+have gone). The command must use `{choice}` or `{text}`, or the profile is refused. A typed answer needs `{text}` and an
+option needs `{choice}`; the page only offers what the command can take. The home server answers an ask once: a repeat
+gets a 409.
+
 ## Sources
 
 Sources are modules in `src/ws/home/sources/`, found by scanning the folder like the role adapters. To add one, add a
@@ -98,6 +110,12 @@ known clears it, and every doubt hides it. A record is **opaque** when any of th
   an approval, or a live session's folder). A folder named in the asks or events file doesn't count, nor does an empty,
   relative or unreadable path, nor a session id ws doesn't know.
 
+An ask that names a tmux target and no session id is placed by the one live Claude Code session in that pane or window
+(`ws:@1.%1` is a pane, `ws:@1` a window id, and a window number such as `ws:2` is looked up with `tmux list-windows`).
+That session's folder decides: open, and the ask is shown; under `opaque_paths`, and it's opaque. When the ask and the
+session both carry a name, the names must agree, because a window number can move after the ask is written. No match,
+or more than one session in the window, leaves the ask opaque.
+
 Folders are compared as written: runs of spaces in a name aren't collapsed, and a path is cut off, never tidied, at 4096
 characters (a longer one counts as opaque). A name is compared the way the file system compares names, and on a
 case-insensitive file system a folder that's the same one on disk under another spelling (`~/Code/fiu` for
@@ -115,7 +133,8 @@ The rule runs last, after merging, and an opaque record keeps only these fields:
 Every other field is back at its empty default: no name, folder, title, tokens or cost. An opaque record's `id` is kept
 only when it has a machine shape (a UUID, `waiting:` and a UUID, an ask id like `a20261102T120000-k3x9`, or 8 to 64 hex
 digits); any other id, such as a case number, is replaced by a 16-character sha256 prefix.
-An opaque session is never the lead.
+An opaque session is never the lead. With `[home] lead` empty, the lead is the one live session whose folder is
+`~/code` and whose name starts with `Home` or `WS Lead`, if exactly one matches; otherwise there's no lead.
 
 ## Sessions from several sources
 
@@ -142,7 +161,27 @@ claude_dir = "~/.claude"        # $CLAUDE_CONFIG_DIR when set
 session = "terminal"
 ask = "browser"
 opaque = "terminal"
+
+[home.start]                    # the program the home page's box runs to start a session; no shell
+command = ["ws", "dispatch", "{workspace}", "{request}"]
+
+[home.answer]                   # the program that answers a question from its row; no shell
+command = ["ws-ask", "answer", "{id}", "{choice}"]
+
+[home.workspaces]               # folder name -> data class, shown beside it; an `opaque_paths` folder is "terminal only"
+investments = "financial"
+
+[home.models]                   # runner -> the models the box offers for it (none: the runner's own default)
+claude-code = ["opus", "sonnet"]
+
+[home.deny]                     # a runner, or runner/model -> the data classes it can't take
+opencode = ["financial"]
 ```
+
+`[home.start] command` and `[home.answer] command` are lists of words, the first the program. `{name}` in a later word is
+replaced by a value, as one argument: `[home.start]` has `{what}` (`session`, `chat` or `job`), `{workspace}`, `{where}`,
+`{runner}`, `{model}` and `{request}` (and needs `{request}`); `[home.answer]` has `{id}`, `{choice}` and `{text}` (and
+needs `{id}`). A value that would start a word with a dash is refused.
 
 `lead = "cwd:PATH"` matches a session whose folder is exactly `PATH`. `lead = "name:GLOB"` matches by name. If several
 match, the most recently seen one that hasn't ended is the lead.

@@ -361,3 +361,53 @@ def test_the_denied_and_failed_messages_are_the_callers():
     finally:
         srv.close()
         t.join(5)
+
+
+# ---- components the home page added ---------------------------------------------------------------------------------
+
+
+def test_the_home_components_escape_script_and_quotes():
+    frags = [
+        components.empty(BAD),
+        components.chip(BAD),
+        components.stat(BAD, BAD, BAD),
+        components.link(BAD, "https://example.test/?a=1&b=" + BAD),
+        components.action(BAD, opener=BAD, kind=BAD, id='x" onclick="boom'),
+    ]
+    for frag in frags:
+        assert "<script>" not in frag and "alert(1)</script>" not in frag
+    assert 'onclick="boom' not in frags[4] and "data-opener=" in frags[4]
+    assert ESCAPED in frags[0] and ESCAPED in frags[1] and ESCAPED in frags[2]
+
+
+def test_a_link_is_a_plain_anchor_for_a_safe_scheme_and_text_for_any_other():
+    out = components.link("Open", "https://claude.ai/code/x")
+    assert out == '<a class="act" href="https://claude.ai/code/x" target="_blank" rel="noopener noreferrer">Open</a>'
+    for href in ("javascript:alert(1)", "data:text/html,x", "//evil.test/x", "/etc/passwd", "file:///x", ""):
+        assert "<a " not in components.link("Open", href)
+    assert "<a " in components.link("Open", "claude://session/1")
+
+
+def test_an_action_turns_underscores_in_a_name_into_dashes():
+    assert (
+        components.action("Go", session_id="s1") == '<button type="button" class="act" data-session-id="s1">Go</button>'
+    )
+
+
+def test_the_sparkline_takes_a_fixed_scale_and_whole_pixel_sizes():
+    flat_top = components.sparkline([0.96, 1.0], lo=0.0, hi=1.0)
+    auto = components.sparkline([0.96, 1.0])
+    assert flat_top != auto  # a fixed scale doesn't stretch a small wobble across the box
+    ys = [float(p.split(",")[1]) for p in re.search(r'points="([^"]+)"', flat_top).group(1).split()]
+    assert max(ys) - min(ys) < 2
+    assert 'width="160" height="32"' in components.sparkline([1, 2], width=160.0, height=32.0)  # type: ignore[arg-type]
+
+
+def test_an_icon_points_into_the_sprite_and_an_unknown_name_draws_nothing():
+    sprite = components.sprite()
+    assert sprite.startswith("<svg") and sprite.count("<symbol ") == len(components.ICONS)
+    for name in components.ICONS:
+        assert f'id="i-{name}"' in sprite and f'href="#i-{name}"' in components.icon(name)
+    assert components.icon("nope") == "" and components.icon('x"><script>') == ""
+    assert 'class="i chev"' in components.icon("chev", "chev") and ESCAPED in components.icon("chev", BAD)
+    assert "<script>" not in components.icon("chev", BAD)

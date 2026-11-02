@@ -20,7 +20,7 @@ PAGE = ROOT / "docs" / "reference" / "principles.md"
 PLANNED_BASELINE = 16
 
 # Every ID the page has published: prefix -> how many. Raise a count when a rule is added; never lower it.
-PUBLISHED = {"B": 7, "TC": 4, "U": 5, "W": 10, "F": 6, "C": 12, "D": 10, "G": 12}
+PUBLISHED = {"B": 7, "TC": 4, "U": 5, "W": 10, "F": 6, "C": 12, "D": 12, "G": 12}
 
 LAYERS = (
     "Brand and tokens",
@@ -166,7 +166,7 @@ def test_every_table_line_belongs_to_a_recognised_table(scanned):
 
 
 def test_the_page_stays_short_enough_to_read(rows):
-    assert 30 <= len(rows) <= 66
+    assert 30 <= len(rows) <= 68
 
 
 def test_each_layer_uses_one_prefix_and_counts_up_without_gaps(rows):

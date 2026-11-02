@@ -936,6 +936,58 @@ ws eval reject [-h] id
 |---|---|
 | `id` | The proposal's id. |
 
+## `ws home`
+
+The home page: one box to start work, then your sessions grouped by what they need (Pinned, Needs you, Working, Idle,
+Done today), a quiet line for Scheduled, Evals and Tidy, and a sidebar of places. The questions waiting for you open on
+their row, and you can answer one there. It reads through [the home data API](home-api.md).
+
+```text
+ws home [-h] [--render FILE] [--no-browser]
+ws home data [-h]
+```
+
+| Flag | Meaning |
+|---|---|
+| `--render FILE` | Write the page to `FILE` (mode 0600) and stop. Open buttons show the line to paste instead. |
+| `--no-browser` | Print the address and leave the browser alone. |
+
+With no flag, `ws home` serves the page on `127.0.0.1` at a random port and prints an address that carries a token. It
+reloads itself while it's in view (and not while you're typing or have a row open), and closes after an hour with nobody
+looking. The page makes three kinds of call, each after the token, Host and Origin checks: the open button for a
+session or an ask, an answer to a question, and a new session from the box. An answer is sent six seconds after you pick
+it, so Undo can stop it.
+
+The box has four pickers: what (session, chat or job), the workspace, where, and the runner and model. A model that the
+workspace's data class rules out shows greyed with the reason, and the server refuses it too. Sending runs the profile's
+`[home.start] command`; with none set the button is off and says so. Only a question that isn't opaque, from a source
+that takes an answer, can be answered on its row, through `[home.answer] command`. Permissions, approvals and every
+opaque item offer `Open` only.
+
+The sidebar's Evals page shows each arm. Search, Scheduled, History, Skills, Plugins and Connections are places that
+say what's coming. View (group by need, workspace, model or machine, density, what shows), saved views, and Settings
+(theme, accent, list font, text size) are kept in your browser for now.
+
+`ws home data` prints the snapshot (add `--json` for the whole `ws.home/1` view).
+
+The profile's `[home.open]` picks how each kind of item opens, by name:
+
+| Key | Picks the opener for | Default |
+|---|---|---|
+| `session` | A session | Every opener that has something to offer |
+| `ask` | A question waiting for you | Every opener that has something to offer |
+| `opaque` | An item whose folder is marked opaque | `terminal` |
+
+The profile's `[home.start]`, `[home.answer]`, `[home.workspaces]`, `[home.models]` and `[home.deny]` tables are
+described in [the home data API](home-api.md#the-home-profile-table).
+
+The openers are `claude_app` (the Remote Control link the source gave), `browser` (any web link the record carries),
+`terminal` (`tmux switch-client -t T` when the page runs inside tmux, else the `tmux attach -t T` line) and `command`.
+Write `command: ws-term {tmux}` to run your own program: the words are split like a shell would, but the program starts
+with no shell, and `{tmux}`, `{cwd}` and `{session_id}` are replaced by the item's own values. Name more than one
+opener with commas, for example `session = "claude_app, terminal"`. An opaque item is only ever offered `terminal` or
+`command`, because they need nothing it hides.
+
 ## `ws version`
 
 Print which build of ws you run. Available from v0.1. See [`ws version --json`](version-json.md).

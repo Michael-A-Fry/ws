@@ -214,6 +214,26 @@ def test_no_lead_setting_means_no_lead(box):
     assert api.lead(box.env([agent()])) is None
 
 
+def test_with_no_lead_setting_the_one_front_desk_session_in_code_is_the_lead(box):
+    code = str(box.home / "code")
+    snap = api.snapshot(box.env([agent(SID, code, name="WS Lead"), agent(SID2, code + "/app", name="Home app")]))
+    assert snap.lead is not None and snap.lead.id == SID and snap.lead.lead is True
+    only_home = api.lead(box.env([agent(SID, code, name="Home I-need"), agent(SID2, code, name="builder")]))
+    assert only_home is not None and only_home.id == SID
+
+
+def test_the_front_desk_is_left_alone_when_it_is_not_exactly_one_live_session(box):
+    code = str(box.home / "code")
+    two = [agent(SID, code, name="Home"), agent(SID2, code, name="WS Lead")]
+    assert api.lead(box.env(two)) is None  # two match: no guess
+    assert api.lead(box.env([agent(SID, code + "/app", name="Home")])) is None  # not the ~/code folder itself
+    assert api.lead(box.env([agent(SID, code, name="builder")])) is None  # not named like a front desk
+    box.profile('[home]\nlead = "name:nothing*"\n')
+    assert (
+        api.lead(box.env([agent(SID, code, name="Home")])) is None
+    )  # a setting that matches nothing isn't guessed over
+
+
 def test_a_lead_that_is_opaque_is_not_pinned(box):
     box.profile('[home]\nlead = "cwd:/secret/place"\nopaque_paths = ["/secret"]\n')
     assert api.lead(box.env([agent(SID, "/secret/place")])) is None

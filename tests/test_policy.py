@@ -451,7 +451,7 @@ def test_deny_read_matches_home_forms_and_real_paths(pol, home):
     assert policy.is_denied_read(pol, str(home / ".ssh" / "deep" / "er" / "key"))
     assert policy.is_denied_read(pol, str(home / ".aws" / "credentials"))
     assert policy.is_denied_read(pol, "~/.ssh2/x") is None
-    assert policy.is_denied_read(pol, str(home / ".aws" / "config")) is None
+    assert policy.is_denied_read(pol, str(home / ".aws" / "config"))
     assert policy.is_denied_read(pol, "/etc/hostname") is None
 
 
@@ -643,7 +643,6 @@ def test_the_shell_cannot_read_a_denied_folder(pol, home, cmd):
         "cp ~/a ~/b",
         "grep -r x ~/projects",
         "find ~/projects -name x",
-        "cat ~/.aws/config",
     ],
 )
 def test_a_folder_above_a_denied_one_is_only_denied_when_used_recursively(pol, home, cmd):
@@ -1129,6 +1128,8 @@ PROBE_DENIED = [
     "command RM -rf /",
     "builtin RM -rf /",
     "exec RM -rf /",
+    "RM -rf /var/lib/x",
+    "RM -rf /opt/x",
 ]
 PROBE_ALLOWED = [
     "python3 -c \"print(open('/x/.ssh/id_rsa').read())\"",
@@ -1171,8 +1172,6 @@ PROBE_ALLOWED = [
     "RM -rf ~/proj/build",
     "RM -rf ~/.cache/pip",
     "RM -rf ~/code/ws/.venv",
-    "RM -rf /var/tmp/x",
-    "RM -rf /opt/x",
     "make clean && RM -rf dist",
     "cat ~/.ws/logs/runs.jsonl",
     "cat ~/.ws/policy.toml",

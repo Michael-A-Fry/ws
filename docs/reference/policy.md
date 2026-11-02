@@ -44,7 +44,7 @@ the built-in default, which has the list below.
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `deny_commands` | list of text | `[]` in a file | Shell command patterns no session may run. `ws gate init` writes the [built-in list](#built-in-deny_commands). |
-| `deny_read` | list of text | `[]` in a file | Paths no session may read. `~/` is your home. `**` crosses folders. `ws gate init` writes `~/.ssh/**`, `~/.gnupg/**` and `~/.aws/credentials`. Whatever the file says, ws also denies reads of its own secrets folder (`$WS_HOME/secrets`, and the `[roles.secrets] store` folder when the profile names one), for every runner. |
+| `deny_read` | list of text | `[]` in a file | Paths no session may read. `~/` is your home. `**` crosses folders. `ws gate init` writes the [built-in list](#built-in-deny_read). Whatever the file says, ws also denies reads of its own secrets folder (`$WS_HOME/secrets`, and the `[roles.secrets] store` folder when the profile names one), for every runner. |
 | `deny_tools` | list of text | `[]` | Neutral tool names to switch off. Known: `web_fetch`, `web_search`. An allowed web tool counts as a way out. |
 | `ask_commands` | list of text | `[]` | Command patterns that run only after you approve that exact call. Same globs as `deny_commands`. A command that also matches `deny_commands` stays denied. |
 | `allow_hosts` | list of text | `[]` | Hosts a session's shell may reach, for runners whose sandbox filters the network (Claude Code). Empty means the policy says nothing about the network. |
@@ -69,14 +69,59 @@ Rules:
   home folder after `.` and `..` are resolved.
 - `deny_tools` items must be a known tool name.
 
+### Built-in `deny_read`
+
+The default list, which `ws gate init` writes: `~/.ssh/**`, `~/.gnupg/**`, `~/.aws/**`, `~/.config/gcloud/**`,
+`~/.config/gh/hosts.yml`, `~/.config/ws/secrets/**`, `~/.docker/config.json`, `~/.kube/config`,
+`~/.claude/.credentials.json`, `~/.netrc`, `~/.npmrc`, `~/.pypirc`, `~/.git-credentials`,
+`~/.config/git/credentials`, `**/.env`, `**/.env.*`, `/proc/*/environ` and `/proc/*/task/*/environ` (the process
+environment).
+
+The env-file rules cover `.env` and `.env.NAME`, such as `.env.local` and `.env.test`. The template files `.env.example`,
+`.env.sample` and `.env.template` stay readable, and so does `cp .env.example .env`, which creates the env file without
+reading it. `.envrc` and `.env_notes.md` aren't env files and stay readable. `uv run --env-file .env.test pytest` stays
+denied, because `.env.test` is a real env file. The runner's own deny rules can't make the template exception, so they
+cover the templates too.
+
+A recursive read of `/proc/PID`, `/proc/self` or one of their `task` folders (`grep -r . /proc/self`) is denied, because
+it reaches the `environ` files.
+
+The matcher checks a path wherever a word holds one: as an operand, after `=` (`if=PATH`), after a leading `@` or `<`
+(`-F f=@PATH`, `-d @PATH`), glued to a short option (`-d@PATH`), in a `host:PATH` or `file://PATH` form, and in the
+option of a wrapper such as `xargs -a PATH`.
+
 ### Built-in `deny_commands`
 
 The default list, which `ws gate init` writes:
 
-- Recursive deletes of `/`, `/*`, `~`, `~/*`, `/home`, `/Users`, and of the system folders `/bin`, `/boot`, `/dev`, `/etc`,
-  `/lib`, `/lib64`, `/proc`, `/root`, `/sbin`, `/sys`, `/usr`, `/System` and `/Library`. Written as `rm -* PATH`.
+- Recursive deletes of `/`, `/*`, `~`, `~/*`, and of each of these folders and `/FOLDER/*`: `/home`, `/Users`, `/bin`,
+  `/boot`, `/dev`, `/etc`, `/lib`, `/lib64`, `/proc`, `/root`, `/sbin`, `/sys`, `/usr`, `/var`, `/opt`, `/srv`, `/mnt`,
+  `/media`, `/run`, `/snap`, `/System`, `/Library`, `/Volumes`, `/Applications` and `/private`. Written as
+  `rm -* PATH`. A longer name such as `/variant` isn't covered. `/mnt`, `/media`, `/Volumes` and `/run` are denied at one
+  level only: `rm -rf /mnt/data` is denied and `rm -rf /mnt/data/scratch/build` is ordinary work. The temp
+  folders `/private/var/folders`, `/private/tmp`, `/var/folders` and `/var/tmp` are ordinary work below the folder,
+  and the folder itself is kept. A recursive delete of one person's whole home folder (`/home/NAME`, `/Users/NAME`) is
+  also denied, and a folder further down is ordinary work. `find` with `-delete` or `-exec rm` is judged by the folder
+  it starts from, by the same rules.
 - A forcing push in any spelling: `git push*--force*`, `git push* -f*`, and both with git's global options.
 - `mkfs*` and `dd*of=/dev/*`.
+- Printing the process environment: `env` with no command after it (`env -i`, `env A=b`) and `printenv*`. `env A=b cmd`,
+  which runs a command with a variable set, is allowed.
+- Git settings that define an alias, name a command for git to run, or turn on a mirror or forcing push, when they're
+  given by `git config KEY VALUE`, `git -c KEY=VALUE`, `--config-env`, `GIT_CONFIG_KEY_N` or `GIT_CONFIG_PARAMETERS`.
+  The keys are `alias.*`, `pager.*`, `core.hooksPath`, `core.sshCommand`, `core.fsmonitor`, `core.pager`,
+  `core.editor`, `core.askPass`, `core.gitProxy`, `core.alternateRefsCommand`, `credential.helper`,
+  `credential.URL.helper`, `diff.external`, `diff.NAME.textconv`, `diff.NAME.command`, `filter.NAME.clean`,
+  `filter.NAME.smudge`, `filter.NAME.process`, `merge.NAME.driver`, `gpg.program`, `gpg.NAME.program`,
+  `remote.NAME.uploadpack`, `remote.NAME.receivepack`, `sequence.editor` and `include.path`, plus `remote.NAME.mirror`
+  when it's on and `remote.NAME.push` when its refspec starts with `+` or `:`. Reading a key stays allowed.
+- `git config --edit` and `git remote add --mirror`.
+- The environment names `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, `GIT_CONFIG_COUNT`, `GIT_SSH_COMMAND`, `GIT_SSH`,
+  `GIT_EXTERNAL_DIFF`, `GIT_PAGER`, `GIT_EDITOR`, `GIT_SEQUENCE_EDITOR`, `GIT_ASKPASS` and `GIT_PROXY_COMMAND`, set on
+  any command line. A pager (`GIT_PAGER`, `core.pager`, `pager.*`) may be empty, `cat`, `less` or `more`, and an editor
+  (`GIT_EDITOR`, `GIT_SEQUENCE_EDITOR`, `core.editor`, `sequence.editor`) may be `true` or `:`.
+- A shell write to a git config file (`>> .git/config`, `tee -a ~/.gitconfig`, `sed -i` on one), because it can add an
+  `[alias]` section. Use `git config` for a setting that names no program.
 - A shell that reads its script from standard input: `sh`, `sh -s*` and `sh -`, and the same three for `bash`, `zsh` and
   `dash`.
 
@@ -135,7 +180,7 @@ sensitive = true
 acts = ["write"]
 
 [gate]
-deny_read = ["~/.ssh/**", "~/.gnupg/**", "~/.aws/credentials"]
+deny_read = ["~/.ssh/**", "~/.gnupg/**", "~/.aws/**"]
 deny_tools = ["web_fetch", "web_search"]
 ask_commands = ["git push*"]
 allow_hosts = ["api.anthropic.com", "github.com"]

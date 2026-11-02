@@ -78,6 +78,15 @@ def test_the_default_policy_file_is_commented_and_round_trips():
 # --- generate ----------------------------------------------------------------------------------------------------
 
 
+def test_claude_code_settings_carry_the_system_state_delete_rules(home, tmp_path):
+    out = tmp_path / "out"
+    assert generate("claude-code", out, "--ws-cmd", "uv run ws") == 0
+    deny = set(json.loads((out / "settings.json").read_text())["permissions"]["deny"])
+    var = ["lib", "log", "db", "cache", "spool", "mail", "backups", "opt", "local", "root", "run", "vm", "www"]
+    for d in [f"/var/{v}" for v in var] + ["/private/etc", "/private/var/db", "/private/var/root", "/private/var/log"]:
+        assert f"Bash(rm -* {d})" in deny and f"Bash(rm -* {d}/*)" in deny, d
+
+
 def test_claude_code_settings(home, tmp_path, capsys):
     out = tmp_path / "out"
     assert generate("claude-code", out, "--ws-cmd", "uv run ws") == 0

@@ -8,6 +8,20 @@ A good change is small, tested and explained. This page is what to read before y
 - Open an issue first for anything bigger than a fix, so we can agree on it before you spend the time.
 - Report a vulnerability through [SECURITY.md](SECURITY.md), never a public issue.
 
+## What goes into ws
+
+Every idea, including the maintainer's, goes through the same three steps.
+
+1. **For everyone?** ws is generic: it must be useful to anyone working with AI tools, on any runner, provider or OS.
+   Something only one person needs belongs in that person's own private config, not here.
+2. **Core or plugin?** The core holds only what every user needs and what can't be done as a plugin: safety, secrets,
+   memory, sessions and the connections between them. Everything else is a plugin. When in doubt, it's a plugin.
+3. **What comes first?** Rank accepted ideas by reach × impact × confidence ÷ effort. Confidence comes from evidence:
+   a measured `ws eval` result counts for more than an opinion. Effort is the size estimate.
+
+Each piece of work gets a size budget before it starts and stops at it. After it ships, a feature nobody uses is
+removed at its review date.
+
 ## Set up
 
 You need [uv](https://docs.astral.sh/uv/) and Git.

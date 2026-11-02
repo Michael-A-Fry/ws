@@ -8,6 +8,41 @@ body of the GitHub release.
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-11-02
+
+A safer launch environment, setup that offers only what's built, and the first part of the ws home data API.
+
+### Added
+
+- `ws home data [--json]`: one read-only snapshot (schema `ws.home/1`) of your sessions, what's waiting on you,
+  plugins and eval results, read from scanned sources. A source that can't be read is one row saying why. Sessions in
+  folders you list under `[home] opaque_paths` show only kind, place, state and age.
+- `ws.ui`: the shared page styles, components and loopback server that the setup page uses, ready for the home page.
+- Guards: the claims guard checks claims that a release is live against the promoted release (`release_dir`);
+  skill-gate reads a skill's own `gates` front matter; session-context warns when an API key is set in an interactive
+  session and lists what changed in ws since the last session.
+- `ws gate launch --pass-env NAME`: pass a named variable into the session.
+- Doctor check WS009: a profile still switches on a plugin that isn't built yet.
+
+### Changed
+
+- `ws gate launch` passes the session an allow-listed environment (the runner's own variables, locale and paths)
+  instead of everything in your shell. A key you want the session to have now needs `--pass-env NAME`, or the broker.
+- Setup, `ws plugin list` and `ws install --module` offer only plugins that are built. A profile that already has an
+  unbuilt one switched on still loads.
+- The usage check sends the admin key only to the provider's own address.
+- The backlog lives in GitHub Issues; `TODO.md` holds what's being worked on now.
+
+### Fixed
+
+- Tests no longer set one time zone for the whole run, and pass in any zone.
+- A UI test no longer fails on macOS when an oversize request is refused by closing the connection.
+
+### Known limits
+
+- The gate's command matcher is being hardened against more ways of writing a path; that lands in 0.1.7. Until then
+  the sandbox (`ws gate launch`) is the boundary, as [known limits](docs/explanation/known-limits.md) says.
+
 ## [0.1.5] - 2026-11-02
 
 One token source for the brand, rules enforced by tests, and a stricter gate.

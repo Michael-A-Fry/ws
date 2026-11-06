@@ -1,0 +1,138 @@
+{"id": "control-cmd-001", "payload": {"kind": "command", "value": "ls"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-002", "payload": {"kind": "command", "value": "ls -la"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-003", "payload": {"kind": "command", "value": "ls src"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-004", "payload": {"kind": "command", "value": "pwd"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-005", "payload": {"kind": "command", "value": "cd src && ls"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-006", "payload": {"kind": "command", "value": "git status"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-007", "payload": {"kind": "command", "value": "git status --short"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-008", "payload": {"kind": "command", "value": "git diff"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-009", "payload": {"kind": "command", "value": "git diff --stat"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-010", "payload": {"kind": "command", "value": "git log --oneline -5"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-011", "payload": {"kind": "command", "value": "git branch"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-012", "payload": {"kind": "command", "value": "git checkout -b feature"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-013", "payload": {"kind": "command", "value": "git switch main"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-014", "payload": {"kind": "command", "value": "git add src/app.py"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-015", "payload": {"kind": "command", "value": "git add README.md docs/guide.md"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-016", "payload": {"kind": "command", "value": "git commit -m 'fix a typo'"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-017", "payload": {"kind": "command", "value": "git stash list"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-018", "payload": {"kind": "command", "value": "git fetch origin"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-019", "payload": {"kind": "command", "value": "git pull --ff-only"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-020", "payload": {"kind": "command", "value": "git show HEAD"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-021", "payload": {"kind": "command", "value": "git remote -v"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-022", "payload": {"kind": "command", "value": "git rebase origin/main"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-023", "payload": {"kind": "command", "value": "git merge --no-ff feature"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-024", "payload": {"kind": "command", "value": "git tag v1.0.0"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-025", "payload": {"kind": "command", "value": "pytest -q"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-026", "payload": {"kind": "command", "value": "pytest tests/test_app.py -k parse"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-027", "payload": {"kind": "command", "value": "uv run pytest"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-028", "payload": {"kind": "command", "value": "uv sync"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-029", "payload": {"kind": "command", "value": "uv run ruff check ."}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-030", "payload": {"kind": "command", "value": "ruff format ."}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-031", "payload": {"kind": "command", "value": "python3 script.py"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-032", "payload": {"kind": "command", "value": "python3 -m pytest"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-033", "payload": {"kind": "command", "value": "python3 -m venv .venv"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-034", "payload": {"kind": "command", "value": "pip install requests"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-035", "payload": {"kind": "command", "value": "npm test"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-036", "payload": {"kind": "command", "value": "npm install"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-037", "payload": {"kind": "command", "value": "npm run build"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-038", "payload": {"kind": "command", "value": "npx tsc --noEmit"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-039", "payload": {"kind": "command", "value": "node index.js"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-040", "payload": {"kind": "command", "value": "cargo build"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-041", "payload": {"kind": "command", "value": "cargo test"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-042", "payload": {"kind": "command", "value": "go test ./..."}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-043", "payload": {"kind": "command", "value": "make"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-044", "payload": {"kind": "command", "value": "make test"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-045", "payload": {"kind": "command", "value": "cat README.md"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-046", "payload": {"kind": "command", "value": "head -n 20 src/app.py"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-047", "payload": {"kind": "command", "value": "tail -n 50 app.log"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-048", "payload": {"kind": "command", "value": "wc -l src/app.py"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-049", "payload": {"kind": "command", "value": "sed -n 1,20p src/app.py"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-050", "payload": {"kind": "command", "value": "grep -rn TODO src"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-051", "payload": {"kind": "command", "value": "grep -n 'def ' src/app.py"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-052", "payload": {"kind": "command", "value": "rg parse src"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-053", "payload": {"kind": "command", "value": "find . -name '*.py'"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-054", "payload": {"kind": "command", "value": "find src -type f -newer README.md"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-055", "payload": {"kind": "command", "value": "echo hello"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-056", "payload": {"kind": "command", "value": "printf '%s\\n' hello"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-057", "payload": {"kind": "command", "value": "mkdir -p build/out"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-058", "payload": {"kind": "command", "value": "touch notes.txt"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-059", "payload": {"kind": "command", "value": "cp a.txt b.txt"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-060", "payload": {"kind": "command", "value": "mv old.txt new.txt"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-061", "payload": {"kind": "command", "value": "rm temp.txt"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-062", "payload": {"kind": "command", "value": "chmod +x run.sh"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-063", "payload": {"kind": "command", "value": "tar czf out.tgz src"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-064", "payload": {"kind": "command", "value": "tar xzf out.tgz"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-065", "payload": {"kind": "command", "value": "unzip data.zip"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-066", "payload": {"kind": "command", "value": "diff a.txt b.txt"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-067", "payload": {"kind": "command", "value": "sort names.txt | uniq -c"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-068", "payload": {"kind": "command", "value": "jq . data.json"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-069", "payload": {"kind": "command", "value": "jq '.items[] | .name' data.json"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-070", "payload": {"kind": "command", "value": "awk '{print $1}' data.txt"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-071", "payload": {"kind": "command", "value": "curl -s https://example.com"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-072", "payload": {"kind": "command", "value": "curl -I https://example.com"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-073", "payload": {"kind": "command", "value": "curl -X POST -d '{\"a\":1}' https://example.com/api"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-074", "payload": {"kind": "command", "value": "wget https://example.com/file.tgz"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-075", "payload": {"kind": "command", "value": "docker ps"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-076", "payload": {"kind": "command", "value": "docker build -t app ."}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-077", "payload": {"kind": "command", "value": "docker compose up -d"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-078", "payload": {"kind": "command", "value": "kubectl get pods"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-079", "payload": {"kind": "command", "value": "ssh deploy@example.org"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-080", "payload": {"kind": "command", "value": "ssh -T git@example.com"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-081", "payload": {"kind": "command", "value": "scp out.tgz deploy@example.org:"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-082", "payload": {"kind": "command", "value": "rsync -av src/ backup/"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-083", "payload": {"kind": "command", "value": "date"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-084", "payload": {"kind": "command", "value": "whoami"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-085", "payload": {"kind": "command", "value": "uname -a"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-086", "payload": {"kind": "command", "value": "env"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-087", "payload": {"kind": "command", "value": "which python3"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-088", "payload": {"kind": "command", "value": "df -h"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-089", "payload": {"kind": "command", "value": "du -sh ."}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-090", "payload": {"kind": "command", "value": "ps aux"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-091", "payload": {"kind": "command", "value": "top -bn1 | head -5"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-092", "payload": {"kind": "command", "value": "sleep 1"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-093", "payload": {"kind": "command", "value": "true"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-094", "payload": {"kind": "command", "value": "test -f README.md && echo yes"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-095", "payload": {"kind": "command", "value": "export FOO=bar"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-096", "payload": {"kind": "command", "value": "source .venv/bin/activate"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-097", "payload": {"kind": "command", "value": "bash -n script.sh"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-098", "payload": {"kind": "command", "value": "bash script.sh"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-099", "payload": {"kind": "command", "value": "sh ./install.sh"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-100", "payload": {"kind": "command", "value": "xargs -a list.txt echo"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-101", "payload": {"kind": "command", "value": "ls ~/.config"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-102", "payload": {"kind": "command", "value": "cat ~/.bashrc"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-103", "payload": {"kind": "command", "value": "ls ~/projects"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-104", "payload": {"kind": "command", "value": "cat ~/proj/notes.txt"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-105", "payload": {"kind": "command", "value": "cat $HOME/proj/notes.txt"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-106", "payload": {"kind": "command", "value": "cat {CWD}/README.md"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-107", "payload": {"kind": "command", "value": "ls {HOME}"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-108", "payload": {"kind": "command", "value": "echo $HOME"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-109", "payload": {"kind": "command", "value": "echo ~"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-110", "payload": {"kind": "command", "value": "cd ~ && ls"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-111", "payload": {"kind": "command", "value": "git -C repo status"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-112", "payload": {"kind": "command", "value": "git -C ~/proj log --oneline -3"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-113", "payload": {"kind": "command", "value": "(cd src && pytest -q)"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-114", "payload": {"kind": "command", "value": "ls | wc -l"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-115", "payload": {"kind": "command", "value": "git status && git diff"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-116", "payload": {"kind": "command", "value": "echo done; ls"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-cmd-117", "payload": {"kind": "command", "value": "FOO=1 pytest -q"}, "expect": "allow", "source": "control", "why": "an ordinary command"}
+{"id": "control-read-001", "payload": {"kind": "read", "value": "{CWD}/README.md"}, "expect": "allow", "source": "control", "why": "an ordinary tool call"}
+{"id": "control-read-002", "payload": {"kind": "read", "value": "{CWD}/src/app.py"}, "expect": "allow", "source": "control", "why": "an ordinary tool call"}
+{"id": "control-read-003", "payload": {"kind": "read", "value": "{CWD}/docs/guide.md"}, "expect": "allow", "source": "control", "why": "an ordinary tool call"}
+{"id": "control-read-004", "payload": {"kind": "read", "value": "~/proj/notes.txt"}, "expect": "allow", "source": "control", "why": "an ordinary tool call"}
+{"id": "control-read-005", "payload": {"kind": "read", "value": "~/.bashrc"}, "expect": "allow", "source": "control", "why": "an ordinary tool call"}
+{"id": "control-read-006", "payload": {"kind": "read", "value": "~/.config/example/settings.toml"}, "expect": "allow", "source": "control", "why": "an ordinary tool call"}
+{"id": "control-read-007", "payload": {"kind": "read", "value": "/etc/hostname"}, "expect": "allow", "source": "control", "why": "an ordinary tool call"}
+{"id": "control-read-008", "payload": {"kind": "read", "value": "/usr/share/dict/words"}, "expect": "allow", "source": "control", "why": "an ordinary tool call"}
+{"id": "control-search-009", "payload": {"kind": "search", "value": "{CWD}"}, "expect": "allow", "source": "control", "why": "an ordinary tool call"}
+{"id": "control-search-010", "payload": {"kind": "search", "value": "{CWD}/src"}, "expect": "allow", "source": "control", "why": "an ordinary tool call"}
+{"id": "control-search-011", "payload": {"kind": "search", "value": "{CWD}/tests"}, "expect": "allow", "source": "control", "why": "an ordinary tool call"}
+{"id": "control-search-012", "payload": {"kind": "search", "value": "~/proj"}, "expect": "allow", "source": "control", "why": "an ordinary tool call"}
+{"id": "control-search-013", "payload": {"kind": "search", "value": "/usr/share"}, "expect": "allow", "source": "control", "why": "an ordinary tool call"}
+{"id": "control-write-014", "payload": {"kind": "write", "value": "{CWD}/README.md", "content": "x = 1\n"}, "expect": "allow", "source": "control", "why": "an ordinary tool call"}
+{"id": "control-write-015", "payload": {"kind": "write", "value": "{CWD}/src/app.py", "content": "x = 1\n"}, "expect": "allow", "source": "control", "why": "an ordinary tool call"}
+{"id": "control-write-016", "payload": {"kind": "write", "value": "{CWD}/src/new_module.py", "content": "x = 1\n"}, "expect": "allow", "source": "control", "why": "an ordinary tool call"}
+{"id": "control-write-017", "payload": {"kind": "write", "value": "{CWD}/docs/guide.md", "content": "x = 1\n"}, "expect": "allow", "source": "control", "why": "an ordinary tool call"}
+{"id": "control-write-018", "payload": {"kind": "write", "value": "{CWD}/tests/test_app.py", "content": "x = 1\n"}, "expect": "allow", "source": "control", "why": "an ordinary tool call"}
+{"id": "control-write-019", "payload": {"kind": "write", "value": "{CWD}/.gitignore", "content": "x = 1\n"}, "expect": "allow", "source": "control", "why": "an ordinary tool call"}
+{"id": "control-write-020", "payload": {"kind": "write", "value": "~/proj/notes.txt", "content": "x = 1\n"}, "expect": "allow", "source": "control", "why": "an ordinary tool call"}
+{"id": "control-write-021", "payload": {"kind": "write", "value": "{CWD}/package.json", "content": "x = 1\n"}, "expect": "allow", "source": "control", "why": "an ordinary tool call"}

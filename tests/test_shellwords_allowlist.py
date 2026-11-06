@@ -44,8 +44,6 @@ def value(text: str, **env: str) -> list[str]:
 SAMPLES = {
     "-": ('"${X-d}"', {"X": "v"}, "v"),
     ":-": ('"${E:-d}"', {"E": ""}, "d"),
-    "=": ('"${X=d}"', {"X": "v"}, "v"),
-    ":=": ('"${E:=d}"', {"E": ""}, "d"),
     "+": ('"${X+d}"', {"X": "v"}, "d"),
     ":+": ('"${E:+d}"', {"E": ""}, ""),
     "?": ('"${X?m}"', {"X": "v"}, "v"),
@@ -147,6 +145,8 @@ REFUSED = {
     "a length": ["${#X}", "${#X[@]}", "${#1}"],
     "a pattern that is not followed": ["${X%$Y}", "${X#[!a]}", "${X/a*}", "${X/%a/b}", "${X/a/&}", "${X%@(a)}"],
     "an index": ["${X[1]}", "${X[a]}"],
+    "an assignment": ["${X=d}", "${E:=d}", "${U:=d}"],
+    "the last word of the previous command": ["${_}", "${_:-a}"],
     "a case change by a pattern": ["${X,,a}", "${X^^[a-c]}", "${X~a}"],
     "an indirection that is not a plain name": ["${!X[@]}", "${!X*}", "${!Q}"],
 }
@@ -262,3 +262,24 @@ def test_the_worst_case_of_a_large_input_is_under_two_seconds(box, monkeypatch, 
         started = time.monotonic()
         code, _ = hook(monkeypatch, capsys, body[:65536])
         assert code == 2 and time.monotonic() - started < 2, body[:20]
+
+
+@pytest.mark.parametrize("cmd", ["IFS=/; cat x", "IFS+=/ cat x", "export IFS=/"])
+def test_a_line_that_sets_ifs_is_refused(cmd):
+    with pytest.raises(sw.ShellError) as err:
+        sw.prep(cmd)
+    assert err.value.kind == "unsupported", cmd
+    assert "write" in err.value.message, cmd
+
+
+@pytest.mark.parametrize("cmd", ["echo a $_", 'echo "$_"b'])
+def test_reading_the_last_word_of_the_previous_command_is_refused(cmd):
+    with pytest.raises(sw.ShellError) as err:
+        sw.lex(cmd, {"HOME": "/h"})
+    assert err.value.kind == "unsupported", cmd
+    assert "write" in err.value.message, cmd
+
+
+@pytest.mark.parametrize("cmd", ["echo $IFS_DIR", "echo MYIFS=1", "cat a_b", "echo $_x"])
+def test_names_that_only_look_like_ifs_or_the_last_word_are_read_as_usual(cmd):
+    sw.lex(sw.prep(cmd), {"HOME": "/h"})  # no refusal

@@ -217,6 +217,8 @@ def prep(cmd: str) -> str:
         cmd = join_lines(unicodedata.normalize("NFKC", cmd))
     except RecursionError:
         raise ShellError("too_deep", "the command nests substitutions too deeply to check") from None
+    if re.search(r"(?<![A-Za-z0-9_])IFS\+?=", cmd):
+        raise ShellError("unsupported", f"a line that sets IFS is not followed; {_HOW}")
     return re.sub(r"\$\{IFS\}|\$IFS\b", " ", cmd)
 
 
@@ -1145,7 +1147,7 @@ _SUBSCRIPT = re.compile(r"\[([^\]]*)\]")
 _NUMBER = r"-?(?:0|[1-9][0-9]{0,17})"
 _OFFSET = re.compile(rf":[ \t]*{_NUMBER}(?::[ \t]*{_NUMBER})?\Z")
 OPERATORS = (
-    "-", ":-", "=", ":=", "+", ":+", "?", ":?",  # a default, an alternative, an error: the word is read as usual
+    "-", ":-", "+", ":+", "?", ":?",  # a default, an alternative, an error: the word is read as usual
     "#", "##", "%", "%%",  # the shortest or longest prefix or suffix that a pattern matches
     "/", "//",  # replace the first or every match of a pattern
     ":off", ":off:len",  # a substring, from plain decimal numbers
@@ -1202,6 +1204,8 @@ def _param(body: str, env: Mapping[str, str], strict: bool = True) -> str | None
     if not m:
         raise _refuse(body, "is not a name, a positional or a special parameter, which the reader does not follow")
     name, rest = m.group(), body[m.end() :]
+    if name == "_":
+        raise _refuse(body, "is the last word of the previous command, which the reader does not follow")
     named = m.group(1) is not None
     sub = _SUBSCRIPT.match(rest) if named else None
     if sub:
@@ -1211,6 +1215,8 @@ def _param(body: str, env: Mapping[str, str], strict: bool = True) -> str | None
     if name == "#" and rest:
         raise _refuse(body, "takes a length, which the reader does not follow")
     op = _shape(body, rest)
+    if op in ("=", ":="):
+        raise _refuse(body, "assigns the variable, which the reader does not follow")
     colon = rest[:1] == ":"
     arg = rest[len(op) :] if op in ("-", ":-", "=", ":=", "+", ":+", "?", ":?") else ""
     known = named and name in env
@@ -1278,6 +1284,8 @@ def _dollar(s: str, k: int, env: Mapping[str, str], strict: bool = True) -> tupl
         charge(len(val or ""))
         return val, e + 1
     m = _NAME.match(s, k + 1)
+    if m and m.group() == "_":
+        raise _refuse("_", "is the last word of the previous command, which the reader does not follow")
     if m:
         val = env.get(m.group())
         charge(len(val or ""))

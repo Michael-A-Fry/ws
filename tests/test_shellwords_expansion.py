@@ -231,7 +231,7 @@ def test_a_variable_the_line_does_not_set_still_refuses_an_operator_the_reader_d
 @needs_bash
 @pytest.mark.parametrize(
     "word",
-    ["${NOPE:-~}", "${NOPE-~}", "${NOPE:=~}", "${NOPE=~}", "${HOME:+$HOME}", "${HOME:+~}", "${HOME:-x}", "${NOPE:+x}y",
+    ["${NOPE:-~}", "${NOPE-~}", "${HOME:+$HOME}", "${HOME:+~}", "${HOME:-x}", "${NOPE:+x}y",
      '"${NOPE:-a b}"', "${NOPE:-${HOME}/a}", "${NOPE:-$HOME/.ssh}"],
 )  # fmt: skip
 def test_a_default_or_alternative_is_expanded_as_bash_does(box, word):
@@ -245,7 +245,7 @@ def test_a_default_or_alternative_is_expanded_as_bash_does(box, word):
 
 @pytest.mark.parametrize(
     "form",
-    ["${NOPE:-~}", "${NOPE:=~}", "${NOPE-~}", "${HOME:+$HOME}", "${HOME:+~}", "${NOPE:-$HOME}", "${NOPE:-${HOME}}"],
+    ["${NOPE:-~}", "${NOPE-~}", "${HOME:+$HOME}", "${HOME:+~}", "${NOPE:-$HOME}", "${NOPE:-${HOME}}"],
 )
 def test_a_path_in_a_default_or_alternative_is_refused_through_the_hook(box, monkeypatch, capsys, form):
     assert refused(monkeypatch, capsys, f"cat {form}/.ssh/id_rsa"), form

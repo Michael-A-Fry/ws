@@ -618,10 +618,17 @@ class _Ctx:
     budget: shellwords.Budget = field(default_factory=shellwords.Budget)  # shared by every part of one command line
     oldpwd: str = ""  # the folder before the last `cd` (`cd -`, `~-`, `$OLDPWD`)
     loops: dict[str, list[str]] | None = None  # a `for` variable and the words it takes in turn
+    unknown: frozenset[str] = frozenset()  # names set more than once, appended to, or set inside a block
 
     def fork(self) -> _Ctx:
         return _Ctx(
-            self.cwd, self.protect, dict(self.vars or {}), budget=self.budget, oldpwd=self.oldpwd, loops=self.loops
+            self.cwd,
+            self.protect,
+            dict(self.vars or {}),
+            budget=self.budget,
+            oldpwd=self.oldpwd,
+            loops=self.loops,
+            unknown=self.unknown,
         )
 
 
@@ -1092,17 +1099,49 @@ def _segment(policy: Policy, seg: str, ctx: _Ctx, in_pipe: bool, cands: list[str
     return None, last[0], nested
 
 
+_APPEND = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\+=")
+_BLOCK_WORDS = ("do", "then", "else", "elif", "{", "(", "!", "time", "if", "while", "until")
+
+
+def _assign(ctx: _Ctx, values: dict[str, str]) -> None:
+    """Record what a part of the line sets. A name set a second time becomes unknown: the reader doesn't follow which
+    assignment ran (a subshell, a branch that didn't run, a pipe stage), so it never guesses."""
+    known = dict(ctx.vars or {})
+    again = {name for name in values if name in known or name in ctx.unknown}
+    for name in again:
+        known.pop(name, None)
+    known.update({name: value for name, value in values.items() if name not in again})
+    ctx.vars, ctx.unknown = known, ctx.unknown | again
+
+
+def _mark_unknown(ctx: _Ctx, seg: str, words: list[str]) -> None:
+    """Names this part of the line sets in a way the reader doesn't follow become unknown: an append (`X+=`), an
+    assignment inside a block or a loop body, and one written ahead of a command (it lasts for that command only)."""
+    names = {m.group(1) for w in words if (m := _APPEND.match(w))}
+    names |= {m.group(1) for m in re.finditer(r"(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]*)\+=", seg)}
+    rest = list(words)
+    while rest and rest[0] in _BLOCK_WORDS:  # `do X=1`, `then X=1`, `{ X=1`: set inside a block or a loop body
+        rest = rest[1:]
+    lead = list(itertools.takewhile(shellwords.ASSIGN.match, rest))
+    if lead and (len(rest) > len(lead) or len(rest) < len(words)):  # ahead of a command, or inside a block
+        names |= {w.split("=", 1)[0] for w in lead}
+    if names:
+        ctx.vars = {k: v for k, v in (ctx.vars or {}).items() if k not in names}
+        ctx.unknown = ctx.unknown | names
+
+
 def _segment_once(
     policy: Policy, seg: str, ctx: _Ctx, in_pipe: bool, cands: list[str], loop_vars: dict[str, str]
 ) -> tuple[str | None, str, list[str]]:
     cands.append(" ".join(seg.split()))
-    env = _env({**(ctx.vars or {}), **loop_vars}, ctx.cwd, ctx.oldpwd)
+    env = shellwords.Unknown(_env({**(ctx.vars or {}), **loop_vars}, ctx.cwd, ctx.oldpwd), ctx.unknown - set(loop_vars))
     lexed = shellwords.lex(seg, env, ctx.budget)
     words, redirs = lexed.words, lexed.redirs
     if not words and not redirs:
         return None, "", []
+    _mark_unknown(ctx, seg, words)
     if words and all(shellwords.ASSIGN.match(w) for w in words):  # X=/ ; later $X
-        ctx.vars = {**(ctx.vars or {}), **dict(w.split("=", 1) for w in words)}
+        _assign(ctx, dict(w.split("=", 1) for w in words))
     elif len(words) > 3 and words[0] == "for" and words[2] == "in":  # for i in a b; do ... $i
         listed = _loop_words(words[3:])
         ctx.loops = {**(ctx.loops or {}), words[1]: listed}
@@ -1111,9 +1150,9 @@ def _segment_once(
     dropped: list[str] = []
     toks, wrappers = shellwords.strip_wrappers(words, lexenv=env, budget=ctx.budget, dropped=dropped, scripts=nested)
     if toks and toks[0] in _DECLARERS:  # export X=/ ; declare -x X=/ ; local X=/
-        ctx.vars = {**(ctx.vars or {}), **dict(w.split("=", 1) for w in toks[1:] if shellwords.ASSIGN.match(w))}
+        _assign(ctx, dict(w.split("=", 1) for w in toks[1:] if shellwords.ASSIGN.match(w)))
     elif toks and toks[0] == "read":  # read -r X <<< /
-        ctx.vars = {**(ctx.vars or {}), **_read_values(toks, redirs)}
+        _assign(ctx, _read_values(toks, redirs))
     canon = _canon_tokens(toks)
     line = " ".join(canon)
     if line:

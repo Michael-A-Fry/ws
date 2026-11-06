@@ -35,7 +35,7 @@ import posixpath
 import re
 import time
 import unicodedata
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from typing import NamedTuple
 
 MAX_WORDS = 4096  # words that brace expansion may add for one command; more is refused, not slowed down
@@ -1073,6 +1073,31 @@ def _strip(val: str, pat: str, prefix: bool, longest: bool) -> str:
 _UNREAD = re.compile(r"[$`~]|\[[!^]|\[\[[:.=]|[@!+*?]\(")
 _CASE = {",": str.lower, "^": str.upper}
 _HOW = "write the path out in full, or set it in a plain variable first"
+
+
+class Unknown(dict):
+    """The variables a command line may use, where some names hold a value the reader can't know: a name set more than
+    once, appended to, or set inside a block, a loop body or ahead of a command. Reading one raises ShellError (kind
+    `unsupported`), so an unknown value never stands in a path as if it were known."""
+
+    def __init__(self, values: Mapping[str, str], unknown: Iterable[str] = ()):
+        super().__init__(values)
+        self.unknown = frozenset(unknown)
+
+    def __contains__(self, name: object) -> bool:
+        return name in self.unknown or super().__contains__(name)
+
+    def __getitem__(self, name: str) -> str:
+        if name in self.unknown:
+            raise ShellError(
+                "unsupported", f"${name} is set more than once or inside a block, so its value isn't known; {_HOW}"
+            )
+        return super().__getitem__(name)
+
+    def get(self, name: str, default: str | None = None) -> str | None:  # type: ignore[override]
+        if name in self.unknown:
+            return self[name]  # raises: the value isn't known
+        return super().get(name, default)
 
 
 def _refuse(body: str, why: str) -> ShellError:

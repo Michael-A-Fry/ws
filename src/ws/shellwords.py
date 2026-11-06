@@ -217,7 +217,7 @@ def prep(cmd: str) -> str:
         cmd = join_lines(unicodedata.normalize("NFKC", cmd))
     except RecursionError:
         raise ShellError("too_deep", "the command nests substitutions too deeply to check") from None
-    if re.search(r"(?<![A-Za-z0-9_])IFS\+?=", cmd):
+    if re.search(r"(?<![A-Za-z0-9_${])IFS(?![A-Za-z0-9_])(?!})", cmd):  # IFS named as a word: set, read into, declared
         raise ShellError("unsupported", f"a line that sets IFS is not followed; {_HOW}")
     return re.sub(r"\$\{IFS\}|\$IFS\b", " ", cmd)
 
@@ -1080,22 +1080,26 @@ class Unknown(dict):
     once, appended to, or set inside a block, a loop body or ahead of a command. Reading one raises ShellError (kind
     `unsupported`), so an unknown value never stands in a path as if it were known."""
 
-    def __init__(self, values: Mapping[str, str], unknown: Iterable[str] = ()):
+    def __init__(self, values: Mapping[str, str], unknown: Iterable[str] = (), everything: bool = False):
         super().__init__(values)
         self.unknown = frozenset(unknown)
+        self.everything = everything  # after a command that can set any variable, no name has a known value
+
+    def _unknown(self, name: object) -> bool:
+        return self.everything or name in self.unknown
 
     def __contains__(self, name: object) -> bool:
-        return name in self.unknown or super().__contains__(name)
+        return self._unknown(name) or super().__contains__(name)
 
     def __getitem__(self, name: str) -> str:
-        if name in self.unknown:
+        if self._unknown(name):
             raise ShellError(
                 "unsupported", f"${name} is set more than once or inside a block, so its value isn't known; {_HOW}"
             )
         return super().__getitem__(name)
 
     def get(self, name: str, default: str | None = None) -> str | None:  # type: ignore[override]
-        if name in self.unknown:
+        if self._unknown(name):
             return self[name]  # raises: the value isn't known
         return super().get(name, default)
 

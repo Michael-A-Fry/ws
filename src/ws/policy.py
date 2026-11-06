@@ -619,6 +619,7 @@ class _Ctx:
     oldpwd: str = ""  # the folder before the last `cd` (`cd -`, `~-`, `$OLDPWD`)
     loops: dict[str, list[str]] | None = None  # a `for` variable and the words it takes in turn
     unknown: frozenset[str] = frozenset()  # names set more than once, appended to, or set inside a block
+    distrust: bool = False  # a part of the line ran a command that can set any variable: trust no value after it
 
     def fork(self) -> _Ctx:
         return _Ctx(
@@ -629,6 +630,7 @@ class _Ctx:
             oldpwd=self.oldpwd,
             loops=self.loops,
             unknown=self.unknown,
+            distrust=self.distrust,
         )
 
 
@@ -1107,7 +1109,10 @@ def _assign(ctx: _Ctx, values: dict[str, str]) -> None:
     """Record what a part of the line sets. A name set a second time becomes unknown: the reader doesn't follow which
     assignment ran (a subshell, a branch that didn't run, a pipe stage), so it never guesses."""
     known = dict(ctx.vars or {})
-    again = {name for name in values if name in known or name in ctx.unknown}
+    again = {name for name in values if name in known or name in ctx.unknown or ctx.distrust}
+    if ctx.loops:
+        again |= set(values) & set(ctx.loops)
+        ctx.loops = {k: v for k, v in ctx.loops.items() if k not in values}
     for name in again:
         known.pop(name, None)
     known.update({name: value for name, value in values.items() if name not in again})
@@ -1125,16 +1130,50 @@ def _mark_unknown(ctx: _Ctx, seg: str, words: list[str]) -> None:
     lead = list(itertools.takewhile(shellwords.ASSIGN.match, rest))
     if lead and (len(rest) > len(lead) or len(rest) < len(words)):  # ahead of a command, or inside a block
         names |= {w.split("=", 1)[0] for w in lead}
+    if words and words[0] in _ENV_WRAPPERS:  # env X=/ cmd, sudo X=/ cmd: set for the command it runs
+        names |= {w.split("=", 1)[0] for w in words[1:] if shellwords.ASSIGN.match(w)}
     if names:
         ctx.vars = {k: v for k, v in (ctx.vars or {}).items() if k not in names}
         ctx.unknown = ctx.unknown | names
+        if ctx.loops:
+            ctx.loops = {k: v for k, v in ctx.loops.items() if k not in names}
+
+
+_ENV_WRAPPERS = ("env", "sudo", "doas", "run0")
+_SETTERS = frozenset(["eval", "source", ".", "read", "mapfile", "readarray", "getopts", "let", "coproc"])
+
+
+def _sets_anything(toks: list[str], seg: str) -> bool:
+    """Whether this part of the line runs a command that can set variables in a way the reader doesn't follow: eval
+    and source text, read and its kin, printf -v, wait -p, a nameref (declare -n), or arithmetic that assigns."""
+    if not toks:
+        return False
+    head, flags = toks[0], [t for t in toks[1:] if t.startswith("-")]
+    if head in _SETTERS:
+        return True
+    if head == "printf" and any(f.startswith("-") and "v" in f[1:] for f in flags):
+        return True
+    if head == "wait" and any("p" in f[1:] for f in flags):
+        return True
+    if head in _DECLARERS and any(not f.startswith("--") and "n" in f[1:] for f in flags):
+        return True
+    return bool(re.search(r"\(\((?:[^()]|\([^()]*\))*=", seg))
+
+
+def _distrust(ctx: _Ctx) -> None:
+    """After a command that can set any variable, no value the reader holds is known, the home and working folders
+    included."""
+    ctx.unknown = ctx.unknown | set(ctx.vars or {}) | {"HOME", "PWD", "OLDPWD", "WS_HOME"} | set(ctx.loops or {})
+    ctx.vars, ctx.loops, ctx.distrust = {}, {}, True
 
 
 def _segment_once(
     policy: Policy, seg: str, ctx: _Ctx, in_pipe: bool, cands: list[str], loop_vars: dict[str, str]
 ) -> tuple[str | None, str, list[str]]:
     cands.append(" ".join(seg.split()))
-    env = shellwords.Unknown(_env({**(ctx.vars or {}), **loop_vars}, ctx.cwd, ctx.oldpwd), ctx.unknown - set(loop_vars))
+    env = shellwords.Unknown(
+        _env({**(ctx.vars or {}), **loop_vars}, ctx.cwd, ctx.oldpwd), ctx.unknown - set(loop_vars), ctx.distrust
+    )
     lexed = shellwords.lex(seg, env, ctx.budget)
     words, redirs = lexed.words, lexed.redirs
     if not words and not redirs:
@@ -1153,6 +1192,8 @@ def _segment_once(
         _assign(ctx, dict(w.split("=", 1) for w in toks[1:] if shellwords.ASSIGN.match(w)))
     elif toks and toks[0] == "read":  # read -r X <<< /
         _assign(ctx, _read_values(toks, redirs))
+    if _sets_anything(toks, seg):
+        _distrust(ctx)
     canon = _canon_tokens(toks)
     line = " ".join(canon)
     if line:

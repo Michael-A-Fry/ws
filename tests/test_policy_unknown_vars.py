@@ -58,3 +58,41 @@ def test_reading_an_unknown_name_is_a_typed_refusal_with_a_hint():
     with pytest.raises(shellwords.ShellError) as err:
         shellwords.lex("cat $X", env)
     assert err.value.kind == "unsupported" and "write" in err.value.message
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "for X in a; do :; done; X=$HOME/.aws; cat $X/credentials",
+        "for X in a; do X=$HOME/.aws; cat $X/credentials; done",
+        "env X=$HOME/.aws sh -c 'cat $X/credentials'",
+        "sudo X=$HOME/.aws bash -c 'cat $X/credentials'",
+        "eval 'X=$HOME/.aws'; cat $X/credentials",
+        "eval X=$HOME/.aws; cat $X/credentials",
+        "source /dev/stdin <<< 'X=$HOME/.aws'; cat $X/credentials",
+        "X=/tmp; . ./set.sh; cat $X/credentials",
+        'read IFS <<< /; cat "$HOME${IFS}.aws${IFS}credentials"',
+        'printf -v IFS %s /; cat "$HOME${IFS}.aws${IFS}credentials"',
+        "Y=$HOME/.aws; declare -n X=Y; cat $X/credentials",
+        "X=/tmp; printf -v X %s $HOME/.aws; cat $X/credentials",
+        "X=/tmp; ((X=1)); cat $X/credentials",
+        "eval 'HOME=/x'; cat ~/.aws/credentials",
+    ],
+)
+def test_a_command_that_can_set_any_variable_makes_later_values_unknown(pol, cmd):
+    assert policy.is_denied_command(pol, cmd, cwd="/tmp"), cmd
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "source .venv/bin/activate && pytest -q",
+        "source ~/.venv/bin/activate",
+        'eval "$(ssh-agent -s)"',
+        "for f in a b; do echo $f; done; echo ok",
+        "read -r name; echo hi",
+        "echo $IFS",
+    ],
+)
+def test_common_lines_with_those_commands_are_still_allowed(pol, cmd):
+    assert not policy.is_denied_command(pol, cmd, cwd="/tmp"), cmd

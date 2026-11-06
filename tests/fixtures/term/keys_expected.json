@@ -1,0 +1,14 @@
+{
+  "about": "The bytes a program needs for each key a phone has no key for, as hex. Shift+Enter is ESC CR: browsers send a plain CR for it, which submits.",
+  "esc": "1b",
+  "tab": "09",
+  "shift-tab": "1b5b5a",
+  "up": "1b5b41",
+  "down": "1b5b42",
+  "right": "1b5b43",
+  "left": "1b5b44",
+  "slash": "2f",
+  "shift-enter": "1b0d",
+  "ctrl-c": "03",
+  "ctrl_of": {"a": "01", "c": "03", "d": "04", "r": "12", "z": "1a", "[": "1b", "\\": "1c", "]": "1d", "_": "1f", "?": "7f", "1": "31"}
+}

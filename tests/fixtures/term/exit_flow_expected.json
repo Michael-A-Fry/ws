@@ -1,0 +1,6 @@
+{
+  "about": "A program that exits writes its reset set: modes off, main screen, cursor back. The bridge passes it on, then reports the exit code.",
+  "stream": "bye\u001b[?1004l\u001b[>4m\u001b[<u\u001b[?2031l\u001b[?2004l\u001b[?1006l\u001b[?1003l\u001b[?1002l\u001b[?1000l\u001b[?25h\u001b[?1049l\u001b]0;\u0007",
+  "ends_with_modes": ["?25h", "?1049l"],
+  "exit_code": 3
+}

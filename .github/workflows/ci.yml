@@ -1,4 +1,5 @@
 # The required check `ci`: Linux, under 5 minutes. Actions pinned by commit SHA (version in the comment).
+# `term-browser` runs beside it: the web terminal's browser tests, with Chromium installed.
 name: ci
 on:
   push:
@@ -56,3 +57,27 @@ jobs:
           uv run --locked ws gate replay tests/gate_corpus/*.jsonl --runner opencode --metrics
       - name: tests
         run: uv run --locked pytest -q
+
+  # The web terminal's browser tests (every control, desktop and phone). They skip where there is no browser, so this
+  # job installs one and sets WS_E2E_REQUIRE=1: a missing browser fails here instead of skipping.
+  term-browser:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      WS_E2E_REQUIRE: "1"
+      PLAYWRIGHT_VERSION: "1.64.1" # released 2026-10-22, more than 7 days before it was pinned
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: "0.13.1"
+          enable-cache: true
+      - name: Chromium for Playwright
+        run: |
+          echo "PLAYWRIGHT_BROWSERS_PATH=$RUNNER_TEMP/ms-playwright" >> "$GITHUB_ENV"
+          PLAYWRIGHT_BROWSERS_PATH="$RUNNER_TEMP/ms-playwright" \
+            uv run --locked --with "playwright==$PLAYWRIGHT_VERSION" playwright install --with-deps chromium
+      - name: browser tests
+        run: uv run --locked --with "playwright==$PLAYWRIGHT_VERSION" pytest -q tests/e2e/test_term_browser.py

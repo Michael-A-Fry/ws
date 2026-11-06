@@ -1,0 +1,8 @@
+{
+  "about": "Whether ws asks the program for synchronized output through its environment: yes by default, never in a tmux session (programs don't use it there), and not when the person turns it off.",
+  "cases": [
+    {"tmux": false, "no_sync_output": false, "expect_set": true},
+    {"tmux": false, "no_sync_output": true, "expect_set": false},
+    {"tmux": true, "no_sync_output": false, "expect_set": false}
+  ]
+}

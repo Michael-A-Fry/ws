@@ -251,6 +251,8 @@ def test_a_coding_agents_session_variables_are_not_passed_on_and_everything_else
         "OPENCODE": "1",
         "CODEX_SANDBOX": "seatbelt",
         "CLAUDE_CONFIG_DIR": "/c",
+        "CLAUDE_CODE_USE_BEDROCK": "1",
+        "CLAUDE_CODE_OAUTH_TOKEN": "planted-value",
         "KEEP_ME": "1",
         "PATH": "/bin",
         "HOME": "/h",
@@ -262,6 +264,7 @@ def test_a_coding_agents_session_variables_are_not_passed_on_and_everything_else
     env = bridge.child_env(base)
     assert not [k for k in env if bridge.is_runner_session_var(k)], "no runner session variable is left"
     kept = {"KEEP_ME", "PATH", "HOME", "LANG", "LC_ALL", "USER", "SHELL", "CLAUDE_CONFIG_DIR", "TERM", "COLORTERM"}
+    kept |= {"CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_FORCE_SYNC_OUTPUT"}  # the person's own
     assert set(env) == kept
     assert all(k in base for k in RUNNER_VARS), "the input isn't changed"
     named = bridge.child_env(base, {"CLAUDE_CODE_FORCE_SYNC_OUTPUT": "1", "CLAUDE_CODE_ENTRYPOINT": "mine"})
@@ -620,3 +623,21 @@ def test_a_real_child_started_from_inside_a_coding_agent_session_sees_none_of_it
     assert {"KEEP_ME", "PATH", "HOME", "TERM", "CLAUDE_CODE_FORCE_SYNC_OUTPUT"} <= seen
     assert not seen & set(RUNNER_VARS), "the program isn't told it's inside the parent's session"
     assert f"HOME={tmp_path}" in out
+
+
+def test_the_tmux_server_ws_term_starts_gets_the_same_filtered_environment(monkeypatch):
+    from ws.term import tmux as tmux_mod
+
+    seen = {}
+    monkeypatch.setattr(tmux_mod.subprocess, "run", lambda argv, **kw: seen.update(kw) or SimpleRun())
+    env = bridge.child_env({**RUNNER_VARS, "PATH": "/bin", "KEEP_ME": "1"})
+    tmux_mod.runner(env=env)(["new-session", "-d", "-s", "s"])
+    assert seen["env"] == env and not set(RUNNER_VARS) & set(seen["env"])
+    tmux_mod.runner()(["ls"])
+    assert seen["env"] is None, "with no env given, tmux gets the process's own"
+
+
+class SimpleRun:
+    returncode = 0
+    stdout = ""
+    stderr = ""

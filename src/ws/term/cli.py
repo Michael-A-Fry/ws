@@ -83,20 +83,20 @@ def cmd_term(args: argparse.Namespace) -> int:
     warnings = [w for w in (bind_warning(bind),) if w]
     if args.tmux and args.command:
         raise WsError("usage", "--tmux and a command after -- can't be combined", "pick one", 2)
+    extra = {} if (args.tmux or args.no_sync_output) else dict(SYNC_ENV)
+    extra.update(_env_pairs(args.env))
+    env = child_env(os.environ, extra)
     tm = None
     if args.tmux:
         if shutil.which("tmux") is None:
             raise WsError("missing_tool", "tmux isn't installed", "install tmux, or leave --tmux out", 1)
         try:
-            tm = tmux_mod.Tmux(args.tmux, server_options=args.tmux_server_options)
+            tm = tmux_mod.Tmux(args.tmux, server_options=args.tmux_server_options, run=tmux_mod.runner(env=env))
         except ValueError as e:
             raise WsError("bad_name", str(e), "for example --tmux work", 2) from None
         argv = ["tmux"]
     else:
         argv = _program(args)
-    extra = {} if (tm or args.no_sync_output) else dict(SYNC_ENV)
-    extra.update(_env_pairs(args.env))
-    env = child_env(os.environ, extra)
 
     def spawn(cols: int, rows: int):
         if tm is None:

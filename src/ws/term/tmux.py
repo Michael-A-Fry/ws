@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import re
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
 __all__ = [
@@ -68,13 +68,17 @@ def managed_options(version: tuple[int, int], *, server_options: bool) -> list[O
     return [o for o in OPTIONS if version >= o.since and (server_options or o.scope != "server")]
 
 
-def runner(prefix: list[str] | None = None) -> Run:
-    """The real `run`: tmux with `prefix` (for example `-L name -f /dev/null` for a private server) before each command."""
+def runner(prefix: list[str] | None = None, env: Mapping[str, str] | None = None) -> Run:
+    """The real `run`: tmux with `prefix` (for example `-L name -f /dev/null` for a private server) before each command,
+    in `env` when it's given (a tmux server started here keeps that environment for every pane it makes)."""
     pre = list(prefix or [])
+    environ = dict(env) if env is not None else None
 
     def run(argv: list[str]) -> tuple[int, str]:
         try:
-            p = subprocess.run(["tmux", *pre, *argv], capture_output=True, text=True, timeout=10, check=False)
+            p = subprocess.run(
+                ["tmux", *pre, *argv], capture_output=True, text=True, timeout=10, check=False, env=environ
+            )
         except (OSError, subprocess.TimeoutExpired) as e:
             return 127, str(e)
         return p.returncode, (p.stdout if p.returncode == 0 else p.stderr or p.stdout)

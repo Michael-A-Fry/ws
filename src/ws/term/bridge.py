@@ -82,10 +82,20 @@ def valid_size(cols: object, rows: object) -> bool:
 
 
 # Variables a coding agent sets in its own session, to say "this process is inside me". A program started from that
-# session would believe it, so the new session is started without them. `CLAUDE_CODE_*` is a prefix; the rest are names.
-# What `ws term` sets on purpose, and what `--env` names, comes back through `extra`.
-RUNNER_SESSION_NAMES = ("CLAUDECODE", "OPENCODE", "CODEX_SANDBOX", "CODEX_SANDBOX_NETWORK_DISABLED")
-RUNNER_SESSION_PREFIXES = ("CLAUDE_CODE_",)
+# session would believe it, so the new session is started without them. Only these session markers go: a person's own
+# settings for a runner (its sign-in, provider or options) stay. What `ws term` sets on purpose, and what `--env`
+# names, comes back through `extra`.
+RUNNER_SESSION_NAMES = (
+    "CLAUDECODE",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_SSE_PORT",
+    "CLAUDE_CODE_EXECPATH",
+    "CLAUDE_CODE_SESSION_ID",
+    "OPENCODE",
+    "CODEX_SANDBOX",
+    "CODEX_SANDBOX_NETWORK_DISABLED",
+)
+RUNNER_SESSION_PREFIXES: tuple[str, ...] = ()
 
 
 def is_runner_session_var(name: str) -> bool:

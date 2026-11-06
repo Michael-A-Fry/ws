@@ -77,6 +77,11 @@ def test_reading_an_unknown_name_is_a_typed_refusal_with_a_hint():
         "X=/tmp; printf -v X %s $HOME/.aws; cat $X/credentials",
         "X=/tmp; ((X=1)); cat $X/credentials",
         "eval 'HOME=/x'; cat ~/.aws/credentials",
+        "X=$HOME/.aws; read X <<< /tmp; cat $X/credentials",
+        "X=/tmp; let X=1; cat $X/credentials",
+        "X=/tmp; read -r X; cat $X/credentials",
+        "X=/tmp; mapfile X < f; cat $X/credentials",
+        'declare IFS=/; cat "$HOME${IFS}.aws${IFS}credentials"',
     ],
 )
 def test_a_command_that_can_set_any_variable_makes_later_values_unknown(pol, cmd):
@@ -92,6 +97,16 @@ def test_a_command_that_can_set_any_variable_makes_later_values_unknown(pol, cmd
         "for f in a b; do echo $f; done; echo ok",
         "read -r name; echo hi",
         "echo $IFS",
+        'while read -r x; do echo "$x"; done < list.txt',
+        'git ls-files | while read -r f; do wc -l "$f"; done',
+        "read -r x <<< hi; echo $x",
+        "let x=1; echo $x",
+        "source ~/.bashrc; ls $HOME",
+        ". venv/bin/activate; cd $HOME/proj",
+        "source .env && cd ~ && ls",
+        "grep -r IFS src",
+        "git log -S IFS",
+        "unset IFS",
     ],
 )
 def test_common_lines_with_those_commands_are_still_allowed(pol, cmd):

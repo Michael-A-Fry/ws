@@ -1133,14 +1133,19 @@ def _mark_unknown(ctx: _Ctx, seg: str, words: list[str]) -> None:
     if words and words[0] in _ENV_WRAPPERS:  # env X=/ cmd, sudo X=/ cmd: set for the command it runs
         names |= {w.split("=", 1)[0] for w in words[1:] if shellwords.ASSIGN.match(w)}
     if names:
-        ctx.vars = {k: v for k, v in (ctx.vars or {}).items() if k not in names}
-        ctx.unknown = ctx.unknown | names
-        if ctx.loops:
-            ctx.loops = {k: v for k, v in ctx.loops.items() if k not in names}
+        _mark_names(ctx, names)
+
+
+def _mark_names(ctx: _Ctx, names: set[str]) -> None:
+    ctx.vars = {k: v for k, v in (ctx.vars or {}).items() if k not in names}
+    ctx.unknown = ctx.unknown | names
+    if ctx.loops:
+        ctx.loops = {k: v for k, v in ctx.loops.items() if k not in names}
 
 
 _ENV_WRAPPERS = ("env", "sudo", "doas", "run0")
-_SETTERS = frozenset(["eval", "source", ".", "read", "mapfile", "readarray", "getopts", "let", "coproc"])
+_SETTERS = frozenset(["eval", "source", ".", "coproc"])  # run text or a file that can set any variable
+_TARGET_SETTERS = frozenset(["read", "mapfile", "readarray", "getopts", "let"])  # set the names they're given
 
 
 def _sets_anything(toks: list[str], seg: str) -> bool:
@@ -1155,15 +1160,25 @@ def _sets_anything(toks: list[str], seg: str) -> bool:
         return True
     if head == "wait" and any("p" in f[1:] for f in flags):
         return True
-    if head in _DECLARERS and any(not f.startswith("--") and "n" in f[1:] for f in flags):
-        return True
-    return bool(re.search(r"\(\((?:[^()]|\([^()]*\))*=", seg))
+    return head in _DECLARERS and any(not f.startswith("--") and "n" in f[1:] for f in flags)
 
 
-def _distrust(ctx: _Ctx) -> None:
-    """After a command that can set any variable, no value the reader holds is known, the home and working folders
-    included."""
-    ctx.unknown = ctx.unknown | set(ctx.vars or {}) | {"HOME", "PWD", "OLDPWD", "WS_HOME"} | set(ctx.loops or {})
+def _targets(toks: list[str]) -> set[str]:
+    """The names `read`, `mapfile`, `readarray`, `getopts` and `let` set: their values come from input or arithmetic,
+    which the reader doesn't follow, so a name that held a value before becomes unknown."""
+    if not toks or toks[0] not in _TARGET_SETTERS:
+        return set()
+    if toks[0] == "let":
+        return {m.group(1) for t in toks[1:] if (m := re.match(r"([A-Za-z_][A-Za-z0-9_]*)\s*[-+*/%&|^<>]*=", t))}
+    names = [t for t in toks[1:] if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", t)]
+    return set(names[1:2]) if toks[0] == "getopts" else set(names)
+
+
+def _distrust(ctx: _Ctx, folders: bool) -> None:
+    """After a command that can set any variable, no value the reader holds is known; with `folders`, the home and
+    working folders aren't either (eval text can set them; a sourced file is trusted to leave them)."""
+    gone = set(ctx.vars or {}) | set(ctx.loops or {}) | ({"HOME", "PWD", "OLDPWD", "WS_HOME"} if folders else set())
+    ctx.unknown = ctx.unknown | gone
     ctx.vars, ctx.loops, ctx.distrust = {}, {}, True
 
 
@@ -1172,7 +1187,10 @@ def _segment_once(
 ) -> tuple[str | None, str, list[str]]:
     cands.append(" ".join(seg.split()))
     env = shellwords.Unknown(
-        _env({**(ctx.vars or {}), **loop_vars}, ctx.cwd, ctx.oldpwd), ctx.unknown - set(loop_vars), ctx.distrust
+        _env({**(ctx.vars or {}), **loop_vars}, ctx.cwd, ctx.oldpwd),
+        ctx.unknown - set(loop_vars),
+        ctx.distrust,
+        keep={"HOME", "PWD", "OLDPWD", "WS_HOME"} - ctx.unknown,
     )
     lexed = shellwords.lex(seg, env, ctx.budget)
     words, redirs = lexed.words, lexed.redirs
@@ -1188,12 +1206,15 @@ def _segment_once(
     nested: list[str] = []
     dropped: list[str] = []
     toks, wrappers = shellwords.strip_wrappers(words, lexenv=env, budget=ctx.budget, dropped=dropped, scripts=nested)
+    held = _targets(toks) & (set(ctx.vars or {}) | set(ctx.loops or {}) | set(ctx.unknown))
+    if held:  # read X / let X=.. after X held a value: which value it has now isn't followed
+        _mark_names(ctx, held)
     if toks and toks[0] in _DECLARERS:  # export X=/ ; declare -x X=/ ; local X=/
         _assign(ctx, dict(w.split("=", 1) for w in toks[1:] if shellwords.ASSIGN.match(w)))
     elif toks and toks[0] == "read":  # read -r X <<< /
         _assign(ctx, _read_values(toks, redirs))
     if _sets_anything(toks, seg):
-        _distrust(ctx)
+        _distrust(ctx, folders=bool(toks) and toks[0] in ("eval", "coproc"))
     canon = _canon_tokens(toks)
     line = " ".join(canon)
     if line:

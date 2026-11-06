@@ -210,6 +210,13 @@ def ansi_c(seg: str, i: int) -> tuple[str, int]:
     return "".join(out), n
 
 
+_SETS_IFS = re.compile(
+    r"(?<![A-Za-z0-9_${])IFS\+?="
+    r"|\b(?:read|mapfile|readarray|printf|declare|typeset|local|export|readonly|getopts)\b[^;&|\n]*?"
+    r"(?<![A-Za-z0-9_${])IFS(?![A-Za-z0-9_])"
+)
+
+
 def prep(cmd: str) -> str:
     """Line continuations joined, full-width characters folded, ${IFS} read as the space it is. Raises ShellError (kind
     `too_deep`) for substitutions nested past what the reader follows."""
@@ -217,7 +224,7 @@ def prep(cmd: str) -> str:
         cmd = join_lines(unicodedata.normalize("NFKC", cmd))
     except RecursionError:
         raise ShellError("too_deep", "the command nests substitutions too deeply to check") from None
-    if re.search(r"(?<![A-Za-z0-9_${])IFS(?![A-Za-z0-9_])(?!})", cmd):  # IFS named as a word: set, read into, declared
+    if re.search(_SETS_IFS, cmd):  # a line that sets IFS: an assignment, read into, printf -v, declared
         raise ShellError("unsupported", f"a line that sets IFS is not followed; {_HOW}")
     return re.sub(r"\$\{IFS\}|\$IFS\b", " ", cmd)
 
@@ -1080,13 +1087,16 @@ class Unknown(dict):
     once, appended to, or set inside a block, a loop body or ahead of a command. Reading one raises ShellError (kind
     `unsupported`), so an unknown value never stands in a path as if it were known."""
 
-    def __init__(self, values: Mapping[str, str], unknown: Iterable[str] = (), everything: bool = False):
+    def __init__(
+        self, values: Mapping[str, str], unknown: Iterable[str] = (), everything: bool = False, keep: Iterable[str] = ()
+    ):
         super().__init__(values)
         self.unknown = frozenset(unknown)
-        self.everything = everything  # after a command that can set any variable, no name has a known value
+        self.everything = everything  # after a command that can set any variable, no name has a known value...
+        self.keep = frozenset(keep)  # ...except these (the home and working folders, after a sourced file)
 
     def _unknown(self, name: object) -> bool:
-        return self.everything or name in self.unknown
+        return (self.everything and name not in self.keep) or name in self.unknown
 
     def __contains__(self, name: object) -> bool:
         return self._unknown(name) or super().__contains__(name)

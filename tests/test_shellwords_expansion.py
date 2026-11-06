@@ -376,7 +376,7 @@ def test_the_values_a_builtin_sets_are_split_as_the_shell_splits_them():
     assert policy._read_values(["read", "-a", "arr", "A"], [sw.Redirect("<<<", "x")]) == {"A": "x"}
 
 
-@pytest.mark.parametrize("setter", ["export D=work", "declare -x D=work"])
+@pytest.mark.parametrize("setter", ["export D=work", "declare -x D=work", "read -r D <<< work"])
 def test_a_variable_a_builtin_sets_to_a_harmless_name_allows_the_command(box, monkeypatch, capsys, setter):
     assert not refused(monkeypatch, capsys, f"{setter}; cat $D/a.txt"), setter
 

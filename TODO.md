@@ -6,7 +6,7 @@ file holds only what's being worked on now. Report a vulnerability privately, as
 
 ## Now
 
-- [ ] Release 0.1.6 with the gate and environment hardening now in review
+- [x] Release 0.1.6 with the gate and environment hardening
 - [ ] ws home: the hub page (#72)
 - [ ] Triage the audit issues (#73 to #105) and choose Next
 

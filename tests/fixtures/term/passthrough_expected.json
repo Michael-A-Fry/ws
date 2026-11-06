@@ -1,0 +1,9 @@
+{
+  "about": "Escape sequences wrapped for a multiplexer (a notification and a clipboard write) reach the browser unchanged, so the page can act on them.",
+  "streams": [
+    "\u001bPtmux;\u001b\u001b]9;build finished\u0007\u001b\\",
+    "\u001b]9;build finished\u0007",
+    "\u001b]777;notify;Title;Body text\u0007",
+    "\u001b]52;c;aGVsbG8=\u0007"
+  ]
+}

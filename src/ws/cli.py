@@ -41,6 +41,7 @@ from ws.home import cli as home_cli
 from ws.output import WsError
 from ws.profile import ProfileError, load, profile_path, write_if_changed
 from ws.style import Style
+from ws.term import cli as term_cli
 
 YES = {"y", "yes", "true", "1", "on"}
 NO = {"n", "no", "false", "0", "off"}
@@ -287,6 +288,7 @@ def build_parser() -> argparse.ArgumentParser:
     status.register(sub)
     ws_eval.register(sub)
     home_cli.register(sub)
+    term_cli.register(sub)
     version.register(sub)
     return p
 

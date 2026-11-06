@@ -1,0 +1,18 @@
+{
+  "about": "The browser is the one size owner: the tmux window is set to the browser's grid less the status line, and only options this tmux version has are set.",
+  "cases": [
+    {"version": "tmux 3.3a", "status": "on", "cols": 100, "rows": 30, "window": [100, 29]},
+    {"version": "tmux 3.3a", "status": "off", "cols": 100, "rows": 30, "window": [100, 30]},
+    {"version": "tmux 3.4", "status": "2", "cols": 80, "rows": 24, "window": [80, 22]},
+    {"version": "tmux 3.3a", "status": "on", "cols": 20, "rows": 1, "window": [20, 1]}
+  ],
+  "options_by_version": [
+    {"version": "tmux 3.5a", "session": ["window-size"], "window": ["allow-passthrough"], "server": ["escape-time", "extended-keys"]},
+    {"version": "tmux 3.3a", "session": ["window-size"], "window": ["allow-passthrough"], "server": ["escape-time", "extended-keys"]},
+    {"version": "tmux 3.2", "session": ["window-size"], "window": [], "server": ["escape-time", "extended-keys"]},
+    {"version": "tmux 3.1c", "session": ["window-size"], "window": [], "server": ["escape-time"]},
+    {"version": "tmux 2.8", "session": [], "window": [], "server": ["escape-time"]},
+    {"version": "tmux 1.9a", "session": [], "window": [], "server": []},
+    {"version": "tmux next-3.6", "session": ["window-size"], "window": ["allow-passthrough"], "server": ["escape-time", "extended-keys"]}
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "about": "A 10 KB multi-line paste with bracketed-paste markers, written to the program in the 4095-byte reads a pty gives. Newlines inside the paste are carriage returns, as a terminal sends them.",
+  "start_marker": "\u001b[200~",
+  "end_marker": "\u001b[201~",
+  "lines": 400,
+  "line_template": "line {n}: the quick brown fox jumps over the lazy dog",
+  "read_size": 4095
+}

@@ -172,8 +172,8 @@ ENV = {"HOME": HOME}
 
 @pytest.mark.parametrize(
     "raw",
-    ["${HOME,}", "${HOME,,}", "${HOME^}", "${HOME~}", "${HOME@E}", "${HOME@Q}", "${HOME@U}",
-     "${HOME@L}", "${HOME[0]}", "${HOME[@]}", "${HOME[*]}", "${HOME[0]%/*}"],
+    ["${HOME,}", "${HOME,,}", "${HOME^}", "${HOME~}", "${HOME@E}", "${HOME[0]}", "${HOME[@]}", "${HOME[*]}",
+     "${HOME[0]%/*}"],
 )  # fmt: skip
 def test_a_case_change_or_at_operator_or_index_reads_as_the_value(raw):
     got = sw.lex(raw, ENV).words
@@ -209,13 +209,20 @@ def test_text_in_single_quotes_is_not_refused_for_an_expansion_the_reader_does_n
     assert hook(monkeypatch, capsys, "echo '${HOME:$N}' | grep -c x")[0] == 0
 
 
-def test_a_variable_the_line_does_not_set_keeps_whatever_operator_it_has():
-    assert sw.lex("${NOPE,,} ${NOPE[1]} ${NOPE%x} ${NOPE:$N}", ENV).words == [
+def test_a_variable_the_line_does_not_set_keeps_the_operators_the_reader_follows():
+    assert sw.lex("${NOPE,,} ${NOPE[1]} ${NOPE%x} ${NOPE:1:2}", ENV).words == [
         "${NOPE,,}",
         "${NOPE[1]}",
         "${NOPE%x}",
-        "${NOPE:$N}",
+        "${NOPE:1:2}",
     ]
+
+
+@pytest.mark.parametrize("raw", ["${NOPE:$N}", "${NOPE@Q}", "${NOPE@L}", "${NOPE:010}", "${NOPE,,a}", "${NOPE.x}"])
+def test_a_variable_the_line_does_not_set_still_refuses_an_operator_the_reader_does_not_follow(raw):
+    with pytest.raises(sw.ShellError) as err:
+        sw.lex(raw, ENV)
+    assert err.value.kind == "unsupported"
 
 
 # --- defaults and alternatives, indirection -----------------------------------------------------------------------

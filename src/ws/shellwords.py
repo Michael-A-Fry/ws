@@ -16,7 +16,8 @@ What it promises. A shell word that is quoted is the text between the quotes: `'
 folder called `~`. Expansion is bounded: a `Budget` caps the words that brace expansion may make for one command, a
 value that an operator works on may not be longer than `MAX_VALUE`, and `time_limit` puts a deadline on the whole read.
 A command that goes over, or text it cannot read or an expansion it does not know, raises `ShellError` with a `kind`;
-callers treat that as a refusal and never as an allow. It reads text only: what a command substitution prints, or a
+callers treat that as a refusal and never as an allow. `${...}` is an allowlist (`OPERATORS`): a body or operator that is
+not listed is refused with a hint on how to write it plainly, never passed through as written. It reads text only: what a command substitution prints, or a
 variable the line does not set, is not known and is left as written.
 
 Stdlib only. Nothing here knows about a policy; ws.policy decides what a word means.
@@ -1065,16 +1066,23 @@ def _strip(val: str, pat: str, prefix: bool, longest: bool) -> str:
 
 
 # What a pattern or replacement in `${X%pat}`, `${X/pat/rep}` may not hold, because the reader would leave it as
-# written where a shell reads it: a variable or command to expand, a negated or named bracket class, an extglob group.
-_UNREAD = re.compile(r"[$`]|\[[!^]|\[\[[:.=]|[@!+*?]\(")
+# written where a shell reads it: a variable or command to expand, a `~` (which a shell expands to a home folder before
+# it matches), a negated or named bracket class, an extglob group.
+_UNREAD = re.compile(r"[$`~]|\[[!^]|\[\[[:.=]|[@!+*?]\(")
 _CASE = {",": str.lower, "^": str.upper}
+_HOW = "write the path out in full, or set it in a plain variable first"
+
+
+def _refuse(body: str, why: str) -> ShellError:
+    """The refusal (kind `unsupported`) for a `${body}` the reader does not follow, with how to write it plainly."""
+    return ShellError("unsupported", f"${{{body}}} {why}; {_HOW}")
 
 
 def _unread(body: str, text: str) -> None:
     """Refuse (ShellError, kind `unsupported`) a pattern the reader does not follow: leaving it as written would let a
     path through that the shell builds."""
     if _UNREAD.search(text):
-        raise ShellError("unsupported", f"${{{body}}} has a pattern the reader does not follow; write the path out")
+        raise _refuse(body, "has a pattern the reader does not follow")
 
 
 def _split_slash(text: str) -> tuple[str, str]:
@@ -1111,8 +1119,9 @@ def _case_change(val: str, op: str, every: bool) -> str:
 
 
 def _offset(val: str, rest: str) -> str:
-    """`${X:off}` and `${X:off:len}` with whole numbers, as bash does: a negative offset counts from the end, a negative
-    length stops that far from the end. A length that stops before the offset is an error in bash, so a refusal here."""
+    """`${X:off}` and `${X:off:len}` with plain decimal numbers (see `_OFFSET`), as bash does: a negative offset counts
+    from the end, a negative length stops that far from the end. A length that stops before the offset is an error in
+    bash, so a refusal here."""
     off, _, size = rest[1:].partition(":")
     n = len(val)
     start = int(off)
@@ -1123,86 +1132,122 @@ def _offset(val: str, rest: str) -> str:
         return val[start:]
     end = start + int(size) if int(size) >= 0 else n + int(size)
     if end < start:
-        raise ShellError("unsupported", "a substring length that ends before its start cannot be read")
+        raise ShellError("unsupported", f"a substring length that ends before its start cannot be read; {_HOW}")
     return val[start:end]
 
 
+# The allowlist of `${...}`. A body is read only if it is one of these; anything else is a refusal, never text left as
+# written. The head is a name, a positional parameter or a one-character special parameter; what follows it is
+# nothing or one of the operators in OPERATORS (the test that pins this list fails when one is added without a test).
+# A number in an offset is a plain decimal: bash reads a leading 0 as octal, `0x` as hex and `1+1` as arithmetic.
+_HEAD = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)|([0-9]+)|([@*#?$!-])")
 _SUBSCRIPT = re.compile(r"\[([^\]]*)\]")
+_NUMBER = r"-?(?:0|[1-9][0-9]{0,17})"
+_OFFSET = re.compile(rf":[ \t]*{_NUMBER}(?::[ \t]*{_NUMBER})?\Z")
+OPERATORS = (
+    "-", ":-", "=", ":=", "+", ":+", "?", ":?",  # a default, an alternative, an error: the word is read as usual
+    "#", "##", "%", "%%",  # the shortest or longest prefix or suffix that a pattern matches
+    "/", "//",  # replace the first or every match of a pattern
+    ":off", ":off:len",  # a substring, from plain decimal numbers
+    ",", ",,", "^", "^^", "~", "~~",  # the case of the first or every letter, with no pattern
+    "@E",  # backslash escapes expanded
+    "[0]", "[@]", "[*]",  # the one value of a variable that holds one
+    "!NAME",  # the variable whose name NAME holds
+)  # fmt: skip
+
+
+def _shape(body: str, rest: str) -> str:
+    """The operator in `rest` (the part of `${body}` after the head and subscript), as spelt in OPERATORS, or "" for
+    none. Refuses (ShellError, kind `unsupported`) any `rest` that is not one of them."""
+    if not rest:
+        return ""
+    if rest[0] == ":" and rest[1:2] in ("-", "=", "+", "?"):  # `${X:-1}` is a default, `${X: -1}` an offset
+        return rest[:2]
+    if rest[0] == ":" and _OFFSET.fullmatch(rest):
+        return ":off:len" if rest.count(":") == 2 else ":off"
+    if rest[0] in "-=+?":
+        return rest[0]
+    for op in ("##", "%%", "//", "#", "%", "/"):
+        if rest.startswith(op):
+            return op
+    for op in (",,", "^^", "~~", ",", "^", "~"):
+        if rest == op:
+            return op
+    if rest == "@E":
+        return "@E"
+    if rest[0] == "@":
+        raise _refuse(body, "uses a transformation the reader does not follow")
+    if rest[0] == ":":
+        raise _refuse(
+            body, "takes a substring by something other than plain decimal numbers, which the reader does not follow"
+        )
+    if rest[0] in ",^~":
+        raise _refuse(body, "changes case by a pattern, which the reader does not follow")
+    raise _refuse(body, "uses an expansion the reader does not follow")
 
 
 def _param(body: str, env: Mapping[str, str], strict: bool = True) -> str | None:
-    """The value of `${body}` for a variable `env` knows (with `:-`, `:=`, `:+`, `%`, `#`, `/` and `:offset:length`
-    operators, `[0]`, `${!NAME}`, and the case-change and `@` operators, which read as the value itself: a path is
-    matched whatever its case), or None when the variable is not known: the text is then left as written. An
-    operator it does not know raises ShellError (kind `unsupported`). Where a default or alternative is used, its
-    word is expanded as the shell does. A variable the line does not set takes the default of `${NAME:-word}`, and
-    reads as set for `${NAME:+word}`, which is the reading that names a path."""
-    if body.startswith("!"):
+    """The value of `${body}` for a variable `env` knows, with the operators in OPERATORS, or None when the head is a
+    variable `env` does not know, a positional or a special parameter: the text is then left as written. A body that
+    is not on that list raises ShellError (kind `unsupported`) with how to write the command plainly. Where a default
+    or alternative is used, its word is expanded as the shell does. A variable the line does not set takes the default
+    of `${NAME:-word}`, and reads as set for `${NAME:+word}`, which is the reading that names a path. The case-change
+    operators and `@E` are the value changed as bash changes it."""
+    if body.startswith("!") and body != "!":
         target = env.get(body[1:]) if _NAME.fullmatch(body[1:]) else None
         if target is not None and _NAME.fullmatch(target) and target in env:
             return env[target]
-        raise ShellError("unsupported", f"${{{body}}} names a variable the command does not set, so it cannot be read")
-    m = _NAME.match(body)
+        raise _refuse(body, "names a variable the command does not set, so it cannot be read")
+    m = _HEAD.match(body)
     if not m:
-        return None
+        raise _refuse(body, "is not a name, a positional or a special parameter, which the reader does not follow")
     name, rest = m.group(), body[m.end() :]
-    known = name in env
-    sub = _SUBSCRIPT.match(rest)
+    named = m.group(1) is not None
+    sub = _SUBSCRIPT.match(rest) if named else None
     if sub:
-        if known and sub.group(1) not in ("0", "@", "*"):
-            raise ShellError("unsupported", f"${{{body}}} indexes a variable that holds one value")
+        if name in env and sub.group(1) not in ("0", "@", "*"):
+            raise _refuse(body, "indexes a variable that holds one value")
         rest = rest[sub.end() :]
+    if name == "#" and rest:
+        raise _refuse(body, "takes a length, which the reader does not follow")
+    op = _shape(body, rest)
     colon = rest[:1] == ":"
-    op = rest[1:2] if colon else rest[:1]
-    arg = rest[2:] if colon else rest[1:]
+    arg = rest[len(op) :] if op in ("-", ":-", "=", ":=", "+", ":+", "?", ":?") else ""
+    known = named and name in env
     if not known:
-        if op in ("-", "=") and (colon or rest[:1] in ("-", "=")):
-            return _word(arg, env)
-        if op == "+" and (colon or rest[:1] == "+"):
-            return _word(arg, env)
-        return None
+        return _word(arg, env) if named and op in ("-", ":-", "=", ":=", "+", ":+") else None
     val = env[name]
-    if not rest:
+    if not op:
         return val
     if len(val) > MAX_VALUE:
         raise ShellError("too_long", f"a variable the command works on is longer than {MAX_VALUE:,} characters")
-    if op in ("-", "=") and (colon or rest[0] in "-="):
+    if op in ("-", ":-", "=", ":="):
         return val if val or not colon else _word(arg, env)
-    if op == "+" and (colon or rest[0] == "+"):
+    if op in ("+", ":+"):
         return _word(arg, env) if val or not colon else ""
-    if op == "?" and (colon or rest[0] == "?"):
+    if op in ("?", ":?"):
         return val if val or not colon else None
-    if rest[0] in "%#":
-        long = rest[1:2] == rest[0]
-        pat = rest[2:] if long else rest[1:]
+    if op in ("#", "##", "%", "%%"):
+        pat = rest[len(op) :]
         _unread(body, pat)
-        return _strip(val, pat, rest[0] == "#", long)
-    if rest[0] == "/":
-        every = rest[1:2] == "/"
-        raw = rest[2:] if every else rest[1:]
+        return _strip(val, pat, op[0] == "#", len(op) == 2)
+    if op in ("/", "//"):
+        raw = rest[len(op) :]
         if raw[:1] in ("%", "#") or "&" in raw.partition("/")[2]:
-            raise ShellError(
-                "unsupported", f"${{{body}}} anchors or reuses the match, which the reader does not follow"
-            )
+            raise _refuse(body, "anchors or reuses the match, which the reader does not follow")
         if re.search(r"[*?\[]", raw):
-            raise ShellError("unsupported", f"${{{body}}} replaces by a pattern, which the reader does not follow")
+            raise _refuse(body, "replaces by a pattern, which the reader does not follow")
         _unread(body, raw)
         pat, rep = _split_slash(raw)
         if not pat:
             return val
-        return val.replace(pat, rep) if every else val.replace(pat, rep, 1)
-    if colon and re.fullmatch(r":\s*-?[0-9]+(:\s*-?[0-9]+)?", rest):
+        return val.replace(pat, rep) if op == "//" else val.replace(pat, rep, 1)
+    if op in (":off", ":off:len"):
         return _offset(val, rest)
-    if rest[0] in ",^~":
-        if len(rest) > 1 + (rest[1:2] == rest[0]):
-            raise ShellError("unsupported", f"${{{body}}} changes case by a pattern, which the reader does not follow")
-        return _case_change(val, rest[0], rest[1:2] == rest[0])
-    if rest[0] == "@" and rest[1:] in ("Q", "U", "L", "u", "l"):
-        return val  # quoted or case-changed: read as the value, so a path matches whatever its case
-    if rest == "@E":
+    if op == "@E":
         escaped = re.sub(r"\\.|'", lambda m: "\\'" if m.group() == "'" else m.group(), val, flags=re.DOTALL)
         return ansi_c(escaped + "'", 0)[0]
-    raise ShellError("unsupported", f"${{{body}}} uses an expansion the reader does not follow")
+    return _case_change(val, op[0], len(op) == 2)
 
 
 def _word(raw: str, env: Mapping[str, str]) -> str:
@@ -1214,13 +1259,22 @@ def _dollar(s: str, k: int, env: Mapping[str, str], strict: bool = True) -> tupl
     """(value, end) for the `$NAME` or `${...}` at `s[k]`; the value is None when it is not known, and `end` is where
     the text of that expansion ends either way. With `strict` off (text inside single quotes, which a shell does not
     expand) an expansion the reader does not know is None, not a refusal."""
-    if (e := _param_end(s, k)) is not None:
+    if s.startswith("${", k):
+        e = _param_end(s, k)
         try:
+            if (
+                e is None
+            ):  # a command group (`${ cmd; }`, `${| cmd; }`) runs a command; one that never closes is no word
+                raise ShellError(
+                    "unsupported",
+                    "a `${ ... }` or `${| ... }` command group, or a `${` that never closes, is not followed; "
+                    "write the command out plainly, outside the quotes",
+                )
             val = _param(s[k + 2 : e], env)
         except ShellError as err:
             if strict or err.kind != "unsupported":
                 raise
-            return None, e + 1
+            return None, (k + 2 if e is None else e + 1)
         charge(len(val or ""))
         return val, e + 1
     m = _NAME.match(s, k + 1)

@@ -175,8 +175,10 @@ def test_a_parameter_operator_on_a_known_variable_is_applied(raw, expected):
     assert words(raw) == [expected]
 
 
-def test_a_command_group_is_not_a_parameter_expansion():
-    assert words("${ rm -rf /; }") == ["${", "rm", "-rf", "/;", "}"]
+def test_a_command_group_is_not_a_parameter_expansion_and_is_refused():
+    with pytest.raises(sw.ShellError) as err:
+        words("${ rm -rf /; }")
+    assert err.value.kind == "unsupported"
 
 
 def test_a_substitution_is_one_word_and_is_kept_as_written():

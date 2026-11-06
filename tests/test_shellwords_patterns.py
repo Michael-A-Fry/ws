@@ -96,7 +96,7 @@ def test_the_refusal_does_not_depend_on_the_path_being_protected(box, monkeypatc
 
 def test_text_in_single_quotes_and_a_name_the_line_does_not_set_are_not_refused(box, monkeypatch, capsys):
     assert value("'${X%$Y}'", X="a") == ["${X%$Y}"]
-    assert value("${NOPE%$Y} ${NOPE/%a/b} ${NOPE:0:(-4)}") == ["${NOPE%$Y}", "${NOPE/%a/b}", "${NOPE:0:(-4)}"]
+    assert value("${NOPE%$Y} ${NOPE/%a/b} ${NOPE:0:4}") == ["${NOPE%$Y}", "${NOPE/%a/b}", "${NOPE:0:4}"]
     assert hook(monkeypatch, capsys, "echo '${X%$Y}' | wc -c")[0] == 0
 
 
@@ -188,9 +188,7 @@ def test_a_case_change_that_does_not_make_a_protected_path_is_allowed(box, monke
 def test_the_at_operators():
     assert value('"${X@E}"', X="a\\x2fb\\n") == ["a/b\n"]
     assert value('"${X@E}"', X="it's") == ["it's"]
-    for raw in ("${X@Q}", "${X@U}", "${X@L}", "${X@u}", "${X@l}"):
-        assert value(raw, X="a/b") == ["a/b"], raw
-    for raw in ("${X@P}", "${X@A}", "${X@a}", "${X@K}"):
+    for raw in ("${X@Q}", "${X@U}", "${X@L}", "${X@u}", "${X@l}", "${X@P}", "${X@A}", "${X@a}", "${X@K}", "${X@k}"):
         with pytest.raises(sw.ShellError) as err:
             value(raw, X="a")
         assert err.value.kind == "unsupported", raw

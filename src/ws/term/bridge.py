@@ -28,12 +28,15 @@ from typing import Any, Protocol
 __all__ = [
     "CLOSE_REPLACED",
     "MAX_DIM",
+    "RUNNER_SESSION_NAMES",
+    "RUNNER_SESSION_PREFIXES",
     "Child",
     "Client",
     "ModeTracker",
     "PtyChild",
     "Session",
     "child_env",
+    "is_runner_session_var",
     "open_pty",
     "valid_size",
 ]
@@ -78,12 +81,26 @@ def valid_size(cols: object, rows: object) -> bool:
     return all(type(v) is int and 1 <= v <= MAX_DIM for v in (cols, rows))
 
 
+# Variables a coding agent sets in its own session, to say "this process is inside me". A program started from that
+# session would believe it, so the new session is started without them. `CLAUDE_CODE_*` is a prefix; the rest are names.
+# What `ws term` sets on purpose, and what `--env` names, comes back through `extra`.
+RUNNER_SESSION_NAMES = ("CLAUDECODE", "OPENCODE", "CODEX_SANDBOX", "CODEX_SANDBOX_NETWORK_DISABLED")
+RUNNER_SESSION_PREFIXES = ("CLAUDE_CODE_",)
+
+
+def is_runner_session_var(name: str) -> bool:
+    return name in RUNNER_SESSION_NAMES or name.startswith(RUNNER_SESSION_PREFIXES)
+
+
 def child_env(base: Mapping[str, str], extra: Mapping[str, str] | None = None) -> dict[str, str]:
-    """The environment a session's program gets: the person's own, as a terminal that is not inside their tmux.
+    """The environment a session's program gets: the person's own, as a terminal that is not inside their tmux or a
+    coding agent's session.
 
     `TERM` and `COLORTERM` describe the browser terminal. `TMUX` and `TMUX_PANE` go, because the session is not inside
-    the tmux that launched `ws term` (and a program that sees them changes how it draws). `extra` is added last."""
-    env = {k: v for k, v in base.items() if k not in ("TMUX", "TMUX_PANE")}
+    the tmux that launched `ws term` (and a program that sees them changes how it draws). The variables a coding agent
+    sets to mark its own session (`is_runner_session_var`) go too, so `ws term` started from inside one doesn't make the
+    program think it is nested in it. `extra` is added last, so what is named on purpose wins."""
+    env = {k: v for k, v in base.items() if k not in ("TMUX", "TMUX_PANE") and not is_runner_session_var(k)}
     env["TERM"] = "xterm-256color"
     env["COLORTERM"] = "truecolor"
     env.update(extra or {})

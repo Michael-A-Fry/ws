@@ -518,6 +518,96 @@ def test_on_a_phone_turning_it_sideways_sends_one_new_size(web):
     assert (sizes[-1]["cols"], sizes[-1]["rows"]) == web.grid()
 
 
+# -- the grid fills the visible space: no blank band above it, no document scroll
+
+GEOMETRY = """() => {
+  const rows = [...document.querySelectorAll('.xterm-rows > div')];
+  const bar = document.querySelector('#keybar').getBoundingClientRect();
+  const screen = document.querySelector('.xterm-screen').getBoundingClientRect();
+  return { first: rows[0].getBoundingClientRect().top, last: rows[rows.length - 1].getBoundingClientRect().bottom,
+           barTop: bar.top, barBottom: bar.bottom, cell: screen.height / wsTerm.term.rows, rows: wsTerm.term.rows };
+}"""
+
+
+def assert_filled(web, visible: float) -> dict:
+    """The last row ends just above the key bar, the first starts within a cell of the top, the key bar ends at the
+    bottom of what is visible, and the document doesn't scroll."""
+    g = web.page.evaluate(GEOMETRY)
+    assert abs(g["barBottom"] - visible) <= 1, f"the key bar is at the bottom of the visible space: {g}"
+    assert -0.5 <= g["barTop"] - g["last"] < g["cell"], f"the last row sits directly above the key bar: {g}"
+    assert 0 <= g["first"] < g["cell"] + 0.5, f"the first row starts at the top: {g}"
+    assert g["rows"] == int((visible - (g["barBottom"] - g["barTop"])) // g["cell"]), (
+        f"every row that fits is there: {g}"
+    )
+    web.page.evaluate("window.scrollTo(0, 500); document.scrollingElement.scrollTop = 500")
+    assert web.page.evaluate("[scrollY, document.scrollingElement.scrollTop, document.body.scrollTop]") == [0, 0, 0]
+    assert web.page.evaluate("document.scrollingElement.scrollHeight <= innerHeight + 1")
+    return g
+
+
+def test_the_grid_fills_the_space_above_the_key_bar_and_the_page_doesnt_scroll(web):
+    settle()
+    assert_filled(web, PROFILES[web.profile]["viewport"]["height"])
+
+
+IOS_VISIBLE = """
+(() => {
+  window.__vvh = 700; // iOS: the visual viewport is shorter than the layout one (a toolbar takes the difference)
+  Object.defineProperty(window.visualViewport, 'height', { configurable: true, get: () => window.__vvh });
+})();
+"""
+
+
+def test_on_a_phone_whose_visual_viewport_is_shorter_than_the_layout_one_the_grid_fills_what_is_visible(browser, term):
+    c = browser.new_context(**PROFILES["phone"])
+    c.add_init_script(INIT)
+    c.add_init_script(IOS_VISIBLE)
+    try:
+        web = Open(term, c, "phone")
+        settle()
+        assert web.page.evaluate("[innerHeight, visualViewport.height]") == [844, 700]
+        first = assert_filled(web, 700)
+        sent = len(web.resizes())
+        # the toolbar slides away: the visible height grows, so the grid does too
+        web.page.evaluate("window.__vvh = 844; visualViewport.dispatchEvent(new Event('resize'))")
+        settle()
+        grown = assert_filled(web, 844)
+        assert grown["rows"] > first["rows"] and len(web.resizes()) == sent + 1
+        # a keyboard opens and closes: the grid and the size sent stay as they were
+        for h in (420, 844):
+            web.page.evaluate(f"window.__vvh = {h}; visualViewport.dispatchEvent(new Event('resize'))")
+            settle(0.4)
+        assert web.grid()[1] == grown["rows"] and len(web.resizes()) == sent + 1
+        assert abs(web.page.evaluate(GEOMETRY)["barBottom"] - 844) <= 1
+    finally:
+        c.close()
+
+
+def test_a_phone_that_first_laid_out_short_fills_the_screen_when_the_height_grows(browser, term):
+    c = browser.new_context(**{**PROFILES["phone"], "viewport": {"width": 390, "height": 500}})
+    c.add_init_script(INIT)
+    try:
+        web = Open(term, c, "phone")
+        settle()
+        short = assert_filled(web, 500)
+        web.page.set_viewport_size({"width": 390, "height": 844})
+        settle()
+        assert assert_filled(web, 844)["rows"] > short["rows"]
+        assert web.resizes()[-1]["rows"] == web.grid()[1]
+    finally:
+        c.close()
+
+
+def test_a_phone_still_fills_the_screen_after_turning_sideways_and_back(web):
+    if not web.phone:
+        pytest.skip("a phone behaviour")
+    settle()
+    for w, h in ((844, 390), (390, 844)):
+        web.page.set_viewport_size({"width": w, "height": h})
+        settle()
+        assert_filled(web, h)
+
+
 # -- scroll: wheel and touch drag as SGR mouse events
 
 

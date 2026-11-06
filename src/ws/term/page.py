@@ -6,10 +6,14 @@ changes. What it keeps still, and how:
 - One size owner. The grid is fitted once after the fonts load, before the socket opens, so the first size is the
   final one. Later changes are debounced (150 ms) and the final size alone is sent; a repeat of the last size is not
   sent. There is no size label anywhere.
+- The grid fills what is visible. Its rows are the visual viewport's height (`innerHeight` where there is none) less
+  the key bar, over the measured cell height, so there is no blank band above it; the page is that tall, fixed, and
+  never scrolls as a document. The key bar sits under the grid, clear of the home-indicator inset.
 - The on-screen keyboard doesn't resize the grid. The viewport meta says `interactive-widget=resizes-visual`; the page
-  follows `visualViewport` only to keep the key bar above the keyboard, and the grid stays anchored to the bottom so the
-  prompt line stays in view. On a touch device a change of height alone is a keyboard, not a resize; width changes
-  (orientation) and any change on a mouse-and-keyboard device refit.
+  follows `visualViewport` to keep the key bar above the keyboard, and the grid stays anchored to the bottom so the
+  prompt line stays in view. On a touch device the grid is sized to the tallest the visible height has been at this
+  width: it grows when the first layout was short or a browser toolbar slides away, never when a keyboard shrinks the
+  view. A new width (orientation) starts again, and on a mouse-and-keyboard device every change refits.
 - Input is bytes. Typing, the key bar and paste go out as binary frames; Shift+Enter and Ctrl+Enter send `ESC CR`;
   the Paste button reads the clipboard (or opens a box when the browser won't) and pastes through the terminal, so
   bracketed paste markers are added when the program asked for them.
@@ -77,6 +81,7 @@ def _css(xterm_css: str) -> str:
 [hidden]{{display:none!important}}
 html,body{{height:100%;margin:0;overflow:hidden;overscroll-behavior:none;background:var(--bg);color:var(--text);
 font:14px/1.4 {FONT_SANS};-webkit-text-size-adjust:100%}}
+@supports (height:100dvh){{html,body{{height:100dvh}}}}
 #app{{position:fixed;left:0;right:0;top:var(--vv-top,0px);height:var(--vv-h,100%);display:flex;flex-direction:column}}
 #stage{{position:relative;flex:1 1 0;min-height:0;overflow:hidden}}
 #term{{position:absolute;left:0;right:0;bottom:0;height:100%;padding:0 4px;box-sizing:border-box}}
@@ -203,37 +208,51 @@ function connect() {
 }
 
 // ---- size: one owner, one debounced resize, no label
+// The grid is as many rows as fit in what is really visible: the visual viewport's height (the layout one, where the
+// browser has no visual one) less the key bar, over the measured cell height. The page is that tall and never scrolls.
+const vv = window.visualViewport;
+const viewHeight = () => Math.round(vv ? vv.height : innerHeight);
 let fitTimer = null;
 let lastWidth = innerWidth;
+// On a touch device a height that only shrinks is the keyboard, so the grid is sized to the tallest the visible height
+// has been at this width: a first layout that was short, or a toolbar that slides away, grows it; a keyboard doesn't.
+let tallest = 0;
+function followViewport() {
+  root.style.setProperty('--vv-h', `${viewHeight()}px`);
+  root.style.setProperty('--vv-top', `${vv ? vv.offsetTop : 0}px`);
+}
 function doFit() {
   fitTimer = null;
-  termEl.style.height = '100%';
-  fit.fit();
+  followViewport();
+  tallest = coarse ? Math.max(tallest, viewHeight()) : viewHeight();
+  const dims = fit.proposeDimensions();
   const screen = termEl.querySelector('.xterm-screen');
-  if (screen) termEl.style.height = `${screen.offsetHeight}px`;
+  const cell = screen && term.rows ? screen.getBoundingClientRect().height / term.rows : 0;
+  if (!dims || !cell) {
+    fit.fit();
+  } else {
+    const rows = Math.max(1, Math.floor((tallest - keybar.offsetHeight) / cell));
+    if (dims.cols !== term.cols || rows !== term.rows) term.resize(dims.cols, rows);
+  }
+  if (screen) termEl.style.height = `${screen.getBoundingClientRect().height}px`; // bottom-anchored: the prompt stays in view
   sendResize(false);
 }
 function scheduleFit() { clearTimeout(fitTimer); fitTimer = setTimeout(doFit, cfg.debounce_ms); }
-addEventListener('resize', () => {
-  if (coarse && innerWidth === lastWidth) return; // a keyboard changes the height only
-  lastWidth = innerWidth;
-  scheduleFit();
-});
-// The on-screen keyboard shrinks the visual viewport only; the key bar rides above it and the grid stays put.
-function followViewport() {
-  const vv = window.visualViewport;
-  if (!vv) return;
-  if (vv.height < innerHeight - 1) {
-    root.style.setProperty('--vv-h', `${vv.height}px`);
-    root.style.setProperty('--vv-top', `${vv.offsetTop}px`);
-  } else {
-    root.style.removeProperty('--vv-h');
-    root.style.removeProperty('--vv-top');
+function viewportChanged() {
+  followViewport(); // the key bar rides above the on-screen keyboard
+  if (innerWidth !== lastWidth) { // turning the phone: a new width, so the height starts again
+    lastWidth = innerWidth;
+    tallest = 0;
+    scheduleFit();
+  } else if (!coarse || viewHeight() > tallest) {
+    scheduleFit();
   }
 }
-if (window.visualViewport) {
-  visualViewport.addEventListener('resize', followViewport);
-  visualViewport.addEventListener('scroll', followViewport);
+addEventListener('resize', viewportChanged);
+addEventListener('orientationchange', viewportChanged);
+if (vv) {
+  vv.addEventListener('resize', viewportChanged);
+  vv.addEventListener('scroll', followViewport);
 }
 
 // ---- keys
@@ -346,6 +365,7 @@ addEventListener('visibilitychange', () => {
 });
 window.wsTerm = { term, fit };
 
+followViewport();
 (document.fonts ? document.fonts.ready : Promise.resolve()).then(() => requestAnimationFrame(() => {
   doFit();
   connect();

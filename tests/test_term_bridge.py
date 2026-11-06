@@ -241,6 +241,34 @@ def test_the_environment_is_the_persons_own_as_a_terminal_outside_tmux():
     assert base["TMUX"], "the input isn't changed"
 
 
+RUNNER_VARS = {"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "cli", "CLAUDE_CODE_SSE_PORT": "1"}
+
+
+def test_a_coding_agents_session_variables_are_not_passed_on_and_everything_else_is():
+    base = {
+        **RUNNER_VARS,
+        "CLAUDE_CODE_FORCE_SYNC_OUTPUT": "0",
+        "OPENCODE": "1",
+        "CODEX_SANDBOX": "seatbelt",
+        "CLAUDE_CONFIG_DIR": "/c",
+        "KEEP_ME": "1",
+        "PATH": "/bin",
+        "HOME": "/h",
+        "LANG": "en_NZ.UTF-8",
+        "LC_ALL": "en_NZ.UTF-8",
+        "USER": "u",
+        "SHELL": "/bin/zsh",
+    }
+    env = bridge.child_env(base)
+    assert not [k for k in env if bridge.is_runner_session_var(k)], "no runner session variable is left"
+    kept = {"KEEP_ME", "PATH", "HOME", "LANG", "LC_ALL", "USER", "SHELL", "CLAUDE_CONFIG_DIR", "TERM", "COLORTERM"}
+    assert set(env) == kept
+    assert all(k in base for k in RUNNER_VARS), "the input isn't changed"
+    named = bridge.child_env(base, {"CLAUDE_CODE_FORCE_SYNC_OUTPUT": "1", "CLAUDE_CODE_ENTRYPOINT": "mine"})
+    assert named["CLAUDE_CODE_FORCE_SYNC_OUTPUT"] == "1" and named["CLAUDE_CODE_ENTRYPOINT"] == "mine"
+    assert "CLAUDECODE" not in named and "CLAUDE_CODE_SSE_PORT" not in named, "only what is named comes back"
+
+
 # -- a real pty (POSIX)
 
 posix = pytest.mark.skipif(sys.platform == "win32", reason="needs a pty")
@@ -574,3 +602,21 @@ def test_a_session_on_a_real_pty_closes_while_the_output_thread_is_reading(sane_
     assert time.monotonic() - started < 5
     until(lambda: not session._pump.is_alive())
     assert child.proc.poll() is not None
+
+
+@posix
+def test_a_real_child_started_from_inside_a_coding_agent_session_sees_none_of_its_variables(tmp_path, monkeypatch):
+    for name, value in {**RUNNER_VARS, "KEEP_ME": "1"}.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    env = bridge.child_env(os.environ, {"CLAUDE_CODE_FORCE_SYNC_OUTPUT": "1"})
+    child = bridge.open_pty(["/bin/sh", "-c", "/usr/bin/env; echo __END__"], env, 80, 24)
+    try:
+        out = read_until(child, b"__END__").decode()
+        assert child.wait() == 0
+    finally:
+        child.close()
+    seen = {line.split("=", 1)[0] for line in out.replace("\r", "").splitlines() if "=" in line}
+    assert {"KEEP_ME", "PATH", "HOME", "TERM", "CLAUDE_CODE_FORCE_SYNC_OUTPUT"} <= seen
+    assert not seen & set(RUNNER_VARS), "the program isn't told it's inside the parent's session"
+    assert f"HOME={tmp_path}" in out

@@ -7,6 +7,7 @@ resize, bracketed paste, key bytes, the reset on exit); none is a recording. The
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from pathlib import Path
@@ -160,8 +161,8 @@ def test_wrapped_and_plain_escape_strings_reach_the_browser_byte_for_byte(stream
 SYNC = fixture("sync_output_gate.json")
 
 
-@pytest.mark.parametrize("case", SYNC["cases"], ids=lambda c: f"tmux={c['tmux']}-off={c['no_sync_output']}")
-def test_synchronized_output_is_asked_for_by_the_environment_only_outside_tmux(case, monkeypatch, tmp_path):
+def launch_env(monkeypatch, *, tmux=False, no_sync_output=False, env=()):
+    """Run `ws term`'s start-up with a fake server and program; return the environment the program was given."""
     import argparse
 
     seen = {}
@@ -172,10 +173,10 @@ def test_synchronized_output_is_asked_for_by_the_environment_only_outside_tmux(c
         bind=None,
         port=0,
         allow_host=None,
-        tmux="s" if case["tmux"] else None,
+        tmux="s" if tmux else None,
         tmux_server_options=False,
-        env=[],
-        no_sync_output=case["no_sync_output"],
+        env=list(env),
+        no_sync_output=no_sync_output,
         idle_minutes=1.0,
         command=[],
         json=False,
@@ -197,7 +198,7 @@ def test_synchronized_output_is_asked_for_by_the_environment_only_outside_tmux(c
         return Stub()
 
     monkeypatch.setattr(cli, "build_server", fake_build)
-    if case["tmux"]:
+    if tmux:
         monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/bin/" + name)
 
         class T:
@@ -216,10 +217,27 @@ def test_synchronized_output_is_asked_for_by_the_environment_only_outside_tmux(c
 
         monkeypatch.setattr(cli.tmux_mod, "Tmux", T)
     assert cli.cmd_term(args) == 0
-    env = seen["env"]
+    return seen["env"]
+
+
+@pytest.mark.parametrize("case", SYNC["cases"], ids=lambda c: f"tmux={c['tmux']}-off={c['no_sync_output']}")
+def test_synchronized_output_is_asked_for_by_the_environment_only_outside_tmux(case, monkeypatch, tmp_path):
+    env = launch_env(monkeypatch, tmux=case["tmux"], no_sync_output=case["no_sync_output"])
     assert ("CLAUDE_CODE_FORCE_SYNC_OUTPUT" in env) is case["expect_set"]
     assert "TMUX" not in env, "the session isn't inside the tmux that launched ws term"
     assert env["TERM"] == "xterm-256color"
+
+
+def test_ws_term_started_inside_a_coding_agent_session_doesnt_pass_its_variables_on(monkeypatch):
+    planted = {"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "cli", "CLAUDE_CODE_SSE_PORT": "1", "KEEP_ME": "1"}
+    for name, value in planted.items():
+        monkeypatch.setenv(name, value)
+    env = launch_env(monkeypatch)
+    assert not {"CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT"} & set(env)
+    assert env["KEEP_ME"] == "1" and env["PATH"] == os.environ["PATH"] and env["HOME"] == os.environ["HOME"]
+    assert env["CLAUDE_CODE_FORCE_SYNC_OUTPUT"] == "1", "what ws term sets itself is set afresh"
+    mine = launch_env(monkeypatch, env=["CLAUDE_CODE_ENTRYPOINT=mine", "CLAUDECODE=2"])
+    assert mine["CLAUDE_CODE_ENTRYPOINT"] == "mine" and mine["CLAUDECODE"] == "2", "--env sets one on purpose"
 
 
 def test_the_startup_modes_are_replayed_to_a_window_that_connects_after_them():

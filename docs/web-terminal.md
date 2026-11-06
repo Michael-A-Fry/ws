@@ -24,17 +24,23 @@ random token that's new every launch, and it stops working when `ws term` exits 
 | Scripts to read the link | `ws term --json` (one JSON document with `url`, `bind` and `port`, printed at start) |
 
 The session runs as you, with your environment, and `TERM=xterm-256color`. A `TMUX` variable from the terminal that
-launched `ws term` is removed, because the session isn't inside that tmux.
+launched `ws term` is removed, because the session isn't inside that tmux. So are the variables a coding agent sets to
+mark its own session (`CLAUDECODE`, `CLAUDE_CODE_*`, `OPENCODE` and the Codex sandbox flags), so a program started
+from inside an agent doesn't think it's nested in it; `--env NAME=VALUE` still sets one on purpose.
 
 ## What the page does
 
 - **One size owner.** The page fits the grid once the fonts have loaded, then opens the connection, so the first size
   it sends is the final one. A later change waits 150 ms and sends only the last size. Repeating the current size sends
   nothing. A full-screen program clears and redraws on every size change, so fewer changes means less flicker.
+- **It fills the screen.** The grid has as many rows as fit in the visible height, less the key bar, so on a phone
+  the terminal starts at the top of the screen with no blank band, and the page itself never scrolls. The page is
+  fitted on load, when the visible height changes (a browser toolbar sliding away) and when you turn the phone.
 - **The on-screen keyboard.** The page sets `interactive-widget=resizes-visual`, and a keyboard opening or closing
   doesn't change the grid. The key bar rides above the keyboard and the grid stays anchored to the bottom, so the prompt
-  line stays in view. On a touch device a change in height alone is a keyboard. A change in width, such as turning the
-  phone sideways, fits again. On a device with a mouse every change fits again.
+  line stays in view. On a touch device the grid is sized to the tallest the visible height has been, so a shorter view
+  is a keyboard and a taller one refits. A change in width, such as turning the phone sideways, fits again. On a
+  device with a mouse every change fits again.
 - **A key bar** with the keys a phone lacks: Esc, Tab, Shift+Tab, Ctrl (applies to the next key), the arrows, `/`,
   a new line (Shift+Enter), Ctrl+C and Paste. Every control carries a `data-action` and has a test.
 - **Shift+Enter and Ctrl+Enter** send ESC then carriage return. Browsers send a plain carriage return for both, which
@@ -139,7 +145,9 @@ To update, `npm pack` the new versions, replace the blobs and hashes in `assets.
 - A real tmux on a private socket checks that the global options are byte-identical before and after a session runs.
 - Browser tests (`tests/e2e/test_term_browser.py`, Playwright with Chromium) drive a desktop and a phone, press every
   key-bar control, paste 10 KB, open and close the keyboard, resize the window, scroll by wheel and touch, and check
-  that no size label ever shows. They skip when Playwright isn't installed.
+  that no size label ever shows. They also check the grid fills the visible space above the key bar (with the
+  visible height shorter than the layout one, as on iOS) and that the page never scrolls. They skip when Playwright
+  isn't installed.
 
 ## Limits
 

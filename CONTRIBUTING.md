@@ -5,8 +5,22 @@ A good change is small, tested and explained. This page is what to read before y
 ## Before you start
 
 - Sign the [CLA](CLA.md). A bot asks on your first pull request, and the `license/cla` check shows the result.
-- Open an issue first for anything bigger than a fix, so we can agree on it before you spend the time.
+- Open an issue first for anything bigger than a fix, so we can agree on it before you spend the time. GitHub Issues is
+  where ws keeps its backlog.
 - Report a vulnerability through [SECURITY.md](SECURITY.md), never a public issue.
+
+## What goes into ws
+
+Every idea, including the maintainer's, goes through the same three steps.
+
+1. **For everyone?** ws is generic: it must be useful to anyone working with AI tools, on any runner, provider or OS.
+   Something only one person needs belongs in that person's own private config, not here.
+2. **Core or plugin?** The core holds only what every user needs and what can't be done as a plugin: safety, secrets,
+   memory, sessions and the connections between them. Everything else is a plugin. When in doubt, it's a plugin.
+3. **What comes first?** Rank accepted ideas by reach × impact × confidence ÷ effort. Confidence comes from evidence:
+   a measured `ws eval` result counts for more than an opinion. Effort is the size estimate.
+
+Agree a size for each piece of work before it starts. A feature that nobody uses is a candidate for removal.
 
 ## Set up
 
@@ -24,7 +38,7 @@ uv sync
 uv run --locked pytest -q            # the whole suite (tests/e2e skips without runners)
 uvx prek run --all-files             # gitleaks, ruff, typos, rumdl, actionlint, shellcheck, PII gate, globals, code map
 uv run --locked ws doctor --offline  # the installed tool checking itself; exit 1 for unconfigured roles is expected
-python3 scripts/gen_code_map.py      # regenerate the code map in AGENTS.md after a module docstring changes
+python3 scripts/gen_code_map.py      # regenerate docs/reference/code-map.md after a module docstring changes
 python3 scripts/check_docs_integrity.py  # policy files exist, links and anchors resolve, no banned strings
 ```
 
@@ -56,7 +70,8 @@ agents. In short:
   timezone or the network.
 - No private data. The PII gate enforces it.
 - Pin everything: Actions by commit SHA, tools at least 7 days old.
-- A new rule goes on [principles.md](docs/reference/principles.md) with its check.
+- A new rule goes on [principles.md](docs/reference/principles.md) with its check. A new design decision gets a record in
+  [docs/decisions](docs/decisions/README.md).
 
 ## Commits and pull requests
 

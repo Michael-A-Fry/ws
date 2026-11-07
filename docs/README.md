@@ -1,7 +1,7 @@
 # ws documentation
 
-ws is a small command-line toolkit: your memory, skills and rules, in any AI. These pages follow four kinds of need.
-Pick the one that matches yours.
+ws is a small command-line toolkit: your memory, skills and rules, across your AI coding tools. These pages follow four
+kinds of need. Pick the one that matches yours.
 
 | You want to | Go to |
 |---|---|
@@ -49,6 +49,7 @@ Measure:
 - [The budget](explanation/budget.md): no run without a monthly cap.
 - [Draft-only sending](explanation/draft-only-sending.md): what exists, and what doesn't, in v0.1.
 - [Known limits](explanation/known-limits.md): what ws doesn't do, in plain words.
+- [Decision records](decisions/README.md): why each engine choice was made, one record each.
 - [Write-up 1](explanation/write-up-1.md): what phases 0 to 5 taught.
 
 ## Reference
@@ -57,6 +58,7 @@ Measure:
 - [Doctor checks](reference/doctor-checks.md): every `WS` ID with its meaning and fix.
 - [Policy](reference/policy.md): every `policy.toml` key.
 - [Guards](reference/guards.md): the named checks, their events and findings, replay.
+- [Code map](reference/code-map.md): what each module in `src/ws/` is for, built from its docstring.
 - [Eval](reference/eval.md): task files, graders and the ten metrics.
 - [Stores](reference/stores.md): every log and record file ws writes, its fields, schema and retention.
 - [Lab](reference/lab.md): the lab virtual machine cell and how it's protected.

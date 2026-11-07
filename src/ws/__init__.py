@@ -1,4 +1,4 @@
-"""ws: your memory, skills and rules, in any AI."""
+"""ws: your memory, skills and rules, across your AI coding tools."""
 
 # Aliased: a bare `version` here would be the package attribute `ws.version`, which is the `ws version` module.
 from importlib.metadata import PackageNotFoundError

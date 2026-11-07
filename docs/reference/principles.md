@@ -144,7 +144,7 @@ How ws changes without breaking what it promised.
 | G5 | Keep tests from writing into the real runner config on the machine. | T0 | `tests/conftest.py` | enforced |
 | G6 | Pin every GitHub Action by commit SHA. | T0 | `tests/test_workflows.py::test_every_action_is_pinned_by_commit` | enforced |
 | G7 | Keep no repo copy of a global skill, agent, workflow or hook. | T0 | `tests/test_globals.py` | enforced |
-| G8 | Build the code map in `AGENTS.md` from module docstrings, and fail when it's stale. | T0 | `scripts/gen_code_map.py` | enforced |
+| G8 | Build the code map in `docs/reference/code-map.md` from module docstrings, and fail when it's stale. | T0 | `scripts/gen_code_map.py` | enforced |
 | G9 | Make the release tag equal the version in `pyproject.toml`. | T0 | `.github/workflows/release.yml` | enforced |
 | G10 | Name a check for every rule on this page, and let the planned count only fall. | T0 | `tests/test_principles.py` | enforced |
 | G11 | Sign every commit, keep one author per commit, and never push to `main` from automation. | T1 | [judge] | enforced |

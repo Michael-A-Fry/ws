@@ -1,8 +1,8 @@
 # ws-aitoolkit
 
-ws: your memory, skills and rules, in any AI. ws turns one `policy.toml` into each AI coding tool's own config, answers
-the tools' hooks, and runs headless jobs that leave one complete record each. It runs on macOS and Linux, and on Windows
-inside WSL2.
+ws: your memory, skills and rules, across your AI coding tools. ws turns one `policy.toml` into each AI coding tool's
+own config, answers the tools' hooks, and runs headless jobs that leave one complete record each. It runs on macOS and
+Linux, and on Windows inside WSL2.
 
 ws is a Python package. This npm package points to it and holds no code yet.
 

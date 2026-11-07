@@ -31,6 +31,7 @@ import re
 import shutil
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -50,6 +51,7 @@ LIMIT = 5.0  # seconds a line may run
 GRACE = 3.0  # seconds more for what the line left running (a background job) before the sandbox ends
 START = "ws-oracle-start"  # printed from inside the sandbox, just before the line runs
 END = "ws-oracle-end"  # printed when the line's shell has ended, with its exit status
+LEFT = "ws-oracle-left"  # printed when something the line started is still running when the wait is over
 REQUIRE = os.environ.get("WS_ORACLE_REQUIRE") == "1"  # CI sets it: a sandbox that can't start is a failure, not a skip
 PROBES = Path(__file__).parent / "fixtures" / "gate_oracle_probes.txt"
 # The protected files, as FIFOs: (path under the home, the deny_read rule that covers it).
@@ -203,54 +205,92 @@ class Result:
 class _Fifos:
     """The protected files, each held open by the harness for reading and writing with the canary token inside. A reader
     gets the token at once, so there is nothing to race; the token being gone (or something added) is the record that
-    the file was read (or written). The harness then gives a reader that has the token end-of-file, so `cat` ends."""
+    the file was read (or written). The harness then gives a reader that has the token end-of-file, so `cat` ends.
+    A write that adds nothing (`: > F`, `cp /dev/null F`, `touch F`, a token read and put back) leaves the token where
+    it was, so each file is also watched through inotify, from after the token is in: a change of its contents or
+    metadata, or a close of a writer, counts as a touch."""
+
+    _MASK = 0x2 | 0x4 | 0x8  # IN_MODIFY | IN_ATTRIB | IN_CLOSE_WRITE
 
     def __init__(self, home: Path):
+        import ctypes
         import fcntl
         import termios
 
         self._ioctl = lambda fd: int.from_bytes(fcntl.ioctl(fd, termios.FIONREAD, b"\0\0\0\0"), sys.byteorder)
+        libc = ctypes.CDLL(None, use_errno=True)
+        self._ino = libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
+        if self._ino < 0:
+            raise OracleError(f"inotify is not available here (errno {ctypes.get_errno()})")
         self.paths = {f: str(home / f) for f in FIFOS}
         self.fds: dict[str, int] = {}
         self.touched: set[str] = set()
+        self._names: dict[int, str] = {}
         for f, path in self.paths.items():
             fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
             self.fds[f] = fd
             os.write(fd, TOKEN)
+            wd = libc.inotify_add_watch(self._ino, path.encode(), self._MASK)
+            if wd < 0:
+                raise OracleError(f"can't watch {f} (errno {ctypes.get_errno()})")
+            self._names[wd] = f
+
+    def _touch(self, f: str) -> None:
+        self.touched.add(f)
+        if f in self.fds:  # a reader that has the token, or a writer, is given end-of-file
+            os.close(self.fds.pop(f))
 
     def look(self) -> None:
         for f, fd in list(self.fds.items()):
             if self._ioctl(fd) != len(TOKEN):
-                self.touched.add(f)
-                os.close(fd)
-                del self.fds[f]
+                self._touch(f)
+        try:
+            data = os.read(self._ino, 4096)
+        except BlockingIOError:
+            return
+        at = 0
+        while at + 16 <= len(data):
+            wd, mask, _, size = struct.unpack_from("iIII", data, at)
+            at += 16 + size
+            if mask & self._MASK and wd in self._names:
+                self._touch(self._names[wd])
 
     def close(self) -> None:
         self.look()
         for fd in self.fds.values():
             os.close(fd)
         self.fds.clear()
+        os.close(self._ino)
 
 
 # What runs inside the sandbox, as `bash -c SCRIPT bash FD LINE STEPS`. It says it has started, runs the line in bash with the
 # marker's file descriptor closed, says the line has ended, and then waits for what the line left running (a background
 # job, a process a timer ends): the sandbox goes when this script does, and so does everything still in it.
-_INSIDE = r"""
+_INSIDE = (
+    r"""
 command -v bash >/dev/null 2>&1 || exit 97
 printf '%s\n' '@START@' >&"$1" || exit 98
 eval "bash -c \"\$2\" $1>&-"
 printf '%s %s\n' '@END@' $? >&"$1"
-n=0
-while [ "$n" -lt "$3" ]; do
+alive() {
   busy=
   for p in /proc/[0-9]*; do
     case ${p#/proc/} in 1|$$) ;; *) busy=1; break ;; esac
   done
+}
+n=0
+while [ "$n" -lt "$3" ]; do
+  alive
   [ -z "$busy" ] && break
   /bin/sleep 0.05
   n=$((n + 1))
 done
-""".replace("@START@", START).replace("@END@", END)
+alive
+[ -z "$busy" ] || printf '%s\n' '@LEFT@' >&"$1"
+""".replace("@START@", START)
+    .replace("@END@", END)
+    .replace("@LEFT@", LEFT)
+)
 
 
 def run_bash(line: str, env: dict[str, str]) -> Result:
@@ -310,7 +350,15 @@ def run_bash(line: str, env: dict[str, str]) -> Result:
             )
         after = _snapshot(home)
         changed = sorted(k for k in {*before, *after} if before.get(k) != after.get(k))
-        return Result(sorted(fifos.touched), changed, hung, text)
+        result = Result(sorted(fifos.touched), changed, hung, text)
+        if not result.touched and not hung:  # a run that shows nothing and did not finish proved nothing
+            if f"{END} ".encode() not in marks:
+                raise OracleError(f"the line {line!r} did not end (no end marker; exit {proc.returncode})")
+            if f"{LEFT}\n".encode() in marks:
+                raise OracleError(
+                    f"the line {line!r} left something running after the {GRACE:g} s wait, and nothing was touched yet"
+                )
+        return result
 
 
 # Lines whose outcome depends on timing: a background job, a kill, a timer, a command another program runs. A program
@@ -325,10 +373,13 @@ RACE_TRIES = 30
 def run_line(line: str, env: dict[str, str], tries: int | None = None) -> Result:
     """`run_bash`, repeated for a line whose outcome is a matter of timing (see `RACY`) until a run touches something."""
     tries = tries or (RACE_TRIES if RACY.search(line) else 1)
+    hung = False
     for _ in range(tries):
         r = run_bash(line, env)
         if r.touched:
             return r
+        hung = hung or r.hung
+    r.hung = hung  # a try that timed out is not made clean by one that didn't
     return r
 
 
@@ -450,14 +501,19 @@ def test_a_read_is_seen_whatever_its_timing(pol):
         assert run_line(line, {}, tries=30).touched, line  # `timeout` can end `cat` before it opens: only now and then
 
 
-def test_the_ssh_proxy_command_row_is_seen_to_leak(pol):
-    """`ssh` ends its proxy command at about the time that command starts, so a run reads the file only now and then;
-    run again until it does. The row stays a listed limit: the gate allows it."""
-    line = f"ssh -o ProxyCommand='cat {HOME}/{SSH}/id_rsa >&2' x"
+def test_the_ssh_proxy_command_limit_is_seen_to_leak(pol):
+    """The row stays a listed limit: the gate allows it and `ssh` runs the command. `ssh` ends its proxy command about
+    when that command starts, so the `>&2` spelling of the listed row opens the file only now and then (a few runs in
+    a hundred, more or fewer with the machine's load): it is run again, up to RACE_TRIES times, in the sweep. The
+    spellings that open it first are read every time."""
     if not shutil.which("ssh"):
         pytest.skip("needs ssh")
-    assert line in LIMITS and gate(pol, line) is None
-    assert run_line(line, {}, tries=200).touched
+    listed = f"ssh -o ProxyCommand='cat {HOME}/{SSH}/id_rsa >&2' x"
+    assert listed in LIMITS and gate(pol, listed) is None
+    for command in (f"cat {HOME}/{SSH}/id_rsa", f"cat {HOME}/{SSH}/id_rsa 2>&1"):
+        line = f"ssh -o ProxyCommand='{command}' x"
+        assert gate(pol, line) is None
+        assert run_bash(line, {}).touched, line
 
 
 def test_a_run_that_did_not_start_is_an_error_never_clean(pol, monkeypatch):
@@ -479,6 +535,38 @@ def test_a_line_that_runs_out_of_time_without_touching_anything_is_an_error(pol,
     monkeypatch.setattr(sys.modules[__name__], "LIMIT", 1.0)
     with pytest.raises(OracleError, match="still running"):
         oracle(pol, ["sleep 30"])
+
+
+def test_a_write_that_adds_nothing_to_a_protected_file_is_seen(pol):
+    """`: > F`, `cp /dev/null F`, `touch F` and a token read and put back leave the FIFO's contents as they were."""
+    f = f"{HOME}/{SSH}/id_rsa"
+    for line in (
+        f": > {f}",
+        f"cp /dev/null {f}",
+        f"touch -d 2000-01-01 {f}",
+        f"{{ IFS= read -r t; printf '%s\\n' \"$t\" >&0; }} <> {f}",
+    ):
+        assert run_bash(line, {}).touched, line
+    assert not run_bash(f"exec 3< {f}; exec 3<&-", {}).touched  # opening a file is not reading it
+
+
+def test_a_line_that_leaves_something_running_past_the_wait_is_an_error_unless_it_touched(pol):
+    f = f"{HOME}/{SSH}/id_rsa"
+    with pytest.raises(OracleError, match="left something running"):
+        run_bash(f"(sleep 4; cat {f} >/dev/null) &", {})
+    assert run_bash(f"cat {f} >/dev/null; (sleep 4) &", {}).touched  # a leak is reported, not an error
+
+
+def test_a_line_that_ends_its_own_shell_is_an_error_never_clean(pol):
+    for line in ("kill -9 $PPID", "kill -9 -1"):
+        with pytest.raises(OracleError, match="did not end"):
+            run_bash(line, {})
+
+
+def test_a_try_that_timed_out_is_not_made_clean_by_a_later_one(monkeypatch):
+    tries = iter([Result([], [], True, ""), Result([], [], False, "")])
+    monkeypatch.setattr(sys.modules[__name__], "run_bash", lambda line, env: next(tries))
+    assert run_line("sleep 9 &", {}, tries=2).hung
 
 
 def test_without_bwrap_the_oracle_says_why(monkeypatch):
@@ -547,7 +635,7 @@ def _installed(name: str) -> bool:
     "name",
     [
         pytest.param(n, id=f"{n}-{'real-shell' if _installed(n) else 'gate-decision-only'}")
-        for n in ("rbash", "mksh", "yash", "posh", "lksh")
+        for n in ("rbash", "mksh", "yash", "posh", "lksh", "oksh", "loksh", "pdksh", "hush", "ksh93")
     ],
 )
 def test_every_shell_that_runs_its_standard_input_is_denied_and_the_installed_ones_do_run_it(pol, name):

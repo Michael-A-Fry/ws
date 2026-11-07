@@ -597,10 +597,17 @@ _SHELL_NAMES = {
     "posh",
     "lksh",
 }
-# A here-document or here-string given to one of these is read as code: a shell runs it, `source` and `.` run it as a
-# script, `eval` runs it as text, `ssh` hands it to the shell on the other end, and `xargs` builds commands from it.
+# A here-document or here-string given to one of these is read as code: a shell runs it (any command whose name ends in
+# `sh`, and `ksh93`), `source` and `.` run it as a script, `eval` runs it as text, `ssh` hands it to the shell on the
+# other end, and `xargs` builds commands from it. The names are not a closed list, because shells keep being written.
 _UNKNOWN_VALUE = "${_WS_UNKNOWN}"  # what a variable holds when a command substitution set it: a part no one can read
-_STDIN_IS_CODE = frozenset({*_SHELL_NAMES, "source", ".", "eval", "ssh"})
+_STDIN_IS_CODE = frozenset({*_SHELL_NAMES, "source", ".", "eval", "ssh", "ksh93"})
+
+
+def _reads_stdin_as_code(cmd: str) -> bool:
+    return cmd in _STDIN_IS_CODE or cmd.endswith("sh")
+
+
 _GIT_ARG_OPTS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env"}
 # Commands whose operands are each judged on their own: `rm -rf / /tmp` is a delete of `/`.
 _OPERAND_CMDS = {"rm", "rmdir", "shred", "unlink", "chmod", "chown", "chgrp", "mv"}
@@ -1352,7 +1359,7 @@ def _segment_once(
         if reason:
             return reason, line, []
         nested += more
-    if any(op in ("<<", "<<-", "<<<") for op, _ in redirs) and (cmd in _STDIN_IS_CODE or "xargs" in wrappers):
+    if any(op in ("<<", "<<-", "<<<") for op, _ in redirs) and (_reads_stdin_as_code(cmd) or "xargs" in wrappers):
         raise shellwords.ShellError(
             "stdin-is-code",
             f"{'xargs' if 'xargs' in wrappers else cmd} runs the text of the "

@@ -24,6 +24,9 @@ MAX_WORD = (
 )
 _NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _SPECIAL = frozenset("@*#?$!-0123456789")
+_COUNTERS = frozenset(  # parameters whose value is a number: no slash, no dot, so no way up out of a folder
+    ["RANDOM", "SECONDS", "LINENO", "BASHPID", "PPID", "UID", "EUID", "SHLVL", "BASH_SUBSHELL", "EPOCHSECONDS"]
+)
 _Item = str | None  # one character the word spells out, or None for a part whose value is not known
 _Token = tuple[str, str]  # (kind, text): kind is c (a character), ? (one non-/), * (non-/ run), ** (any run) or cls
 
@@ -76,6 +79,8 @@ def split(word: str, known: Collection[str] = (), producer: Callable[[str], str 
             inner = word[i + 2 : end - 1]
             closed = end - 1 > i + 1 and word[end - 1] == ")" and not inner.startswith("(")
             made = producer(inner) if producer and closed else None
+            if inner.startswith("(") and inner.endswith(")") and word[end - 1 : end] == ")":
+                made = "0"  # `$((i+1))`: arithmetic gives a number (what it runs is read apart, see ws.policy)
             if made is None:
                 unknown()
             else:
@@ -92,9 +97,14 @@ def split(word: str, known: Collection[str] = (), producer: Callable[[str], str 
         elif c == "$" and (m := _NAME.match(word, i + 1)):
             if m.group() in known:
                 out += list(word[i : m.end()])
+            elif m.group() in _COUNTERS:
+                out.append("0")
             else:
                 unknown()
             i = m.end()
+        elif c == "$" and nxt and nxt in "$?#!":  # the shell's own numbers: a process id, a status, a count
+            out.append("0")
+            i += 2
         elif c == "$" and nxt in _SPECIAL:
             unknown()
             i += 2

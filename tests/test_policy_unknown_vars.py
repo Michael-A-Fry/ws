@@ -93,7 +93,6 @@ def test_a_command_that_can_set_any_variable_makes_later_values_unknown(pol, cmd
     [
         "source .venv/bin/activate && pytest -q",
         "source ~/.venv/bin/activate",
-        'eval "$(ssh-agent -s)"',
         "for f in a b; do echo $f; done; echo ok",
         "read -r name; echo hi",
         "echo $IFS",

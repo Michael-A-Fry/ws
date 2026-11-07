@@ -37,7 +37,6 @@ UNKNOWN_BEFORE_A_PROTECTED_TAIL = [
     "cat $SOME_DIR/ws/secrets/x",
     "cat ${A}/.ssh/id_rsa",
     'cat "$(cat dir.txt)"/.aws/credentials',
-    "cat $((1+2))/.ssh/id_rsa",
     "cat ${X:-/tmp}/.ssh/id_rsa",
     "cat ${X:-}/.ssh/id_rsa",
     "head -n 5 $D/.ssh/id_rsa",
@@ -156,7 +155,8 @@ def test_a_write_to_a_protected_path_through_an_unknown_part_is_refused(pol):
 def test_a_cd_to_a_place_the_reader_cannot_resolve_makes_later_relative_paths_unknown(pol):
     for cmd in ("cd $D && cat .ssh/id_rsa", "cd $(cat dir.txt) && cat notes.txt", "cd ${PROJECT:-.} && cp a.txt b.txt"):
         assert denied(pol, cmd), cmd
-    assert denied(pol, "cd $(mktemp -d) && cat notes.txt") is None  # a folder under the pinned temp folder is known
+    assert denied(pol, "cd $(mktemp -d) && cat notes.txt")  # the shell's TMPDIR is not known
+    assert denied(pol, "cd $(mktemp -d -p /tmp) && cat notes.txt") is None  # a full path to the folder is
     assert denied(pol, "cd $D && cd /tmp && cat notes.txt") is None  # a full path says where it is
     assert denied(pol, "cd /tmp/proj && cat notes.txt") is None
 
@@ -178,8 +178,8 @@ EVERYDAY = [
     "grep -n $PATTERN src/main.py",
     "head -n $N notes.txt",
     "tail -n +$N notes.txt",
-    "curl $URL",
-    "curl -s -o /tmp/out.json $URL",
+    'git commit -m "fix $THING"',
+    'curl -s -o /tmp/out.json "https://$HOST/x.json"',
     "echo $X/foo",
     "echo ${NOPE:-}",
 ]
@@ -196,7 +196,8 @@ NOW_REFUSED = [
     "ls $DIR",
     "ls $DIR/sub",
     "git checkout $BRANCH",
-    'git commit -m "fix $THING"',
+    "curl $URL",
+    "curl -s -o /tmp/out.json $URL",
     "make -j$JOBS",
     "pytest $TESTS",
     "ruff check $SRC",
@@ -260,7 +261,10 @@ def test_split_reads_every_kind_of_unresolved_part():
     assert words("$X") == [None] and unknownpath.is_bare(words("$X$Y${Z}"))
     assert words("a$(b $(c) d)e") == ["a", None, "e"]
     assert words("a`b`c") == ["a", None, "c"]
-    assert words("$((1+2))") == [None] and words("$1") == [None] and words("$$") == [None]
+    assert words("$1") == [None] and words("$@") == [None]
+    assert (
+        words("$((1+2))") == ["0"] and words("$$") == ["0"] and words("$RANDOM") == ["0"]
+    )  # numbers: no slash, no dot
     assert words("${A:-x/y}/z") == [None, "/", "z"]
     assert words("$HOME/x", known=("HOME",)) == list("$HOME/x")  # a known name that is still there was quoted
     assert words("cost$") == list("cost$")

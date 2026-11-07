@@ -35,7 +35,7 @@ import posixpath
 import re
 import time
 import unicodedata
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from typing import NamedTuple
 
 MAX_WORDS = 4096  # words that brace expansion may add for one command; more is refused, not slowed down
@@ -281,7 +281,48 @@ def join_lines(cmd: str) -> str:
     return "".join(out)
 
 
-_HEREDOC_WORD = re.compile(r"<<(-?)[ \t]*(?:'([^']*)'|\"([^\"]*)\"|\\?([A-Za-z_][A-Za-z0-9_]*))")
+def heredoc_word(cmd: str, i: int) -> tuple[str, bool, int] | None:
+    """The here-document opener at `cmd[i:]` (which starts with `<<`): (the closing word, whether `<<-` lets tabs go, the
+    index after the opener's word). The closing word is the shell word after the operator with its quotes taken out the
+    way bash takes them (`E\\OF`, `"E"OF` and `E''OF` all close on `EOF`); None when no word follows."""
+    n = len(cmd)
+    j = i + 2
+    indented = cmd.startswith("-", j)
+    j += indented
+    while j < n and cmd[j] in " \t":
+        j += 1
+    out: list[str] = []
+    start = j
+    while j < n and cmd[j] not in " \t\n;&|<>()":
+        c = cmd[j]
+        if c == "\\":
+            out.append(cmd[j + 1 : j + 2])
+            j += 2
+        elif c == "'":
+            k = cmd.find("'", j + 1)
+            if k < 0:
+                raise ShellError("unclosed_quote", "a quote in the name of a here-document is never closed")
+            out.append(cmd[j + 1 : k])
+            j = k + 1
+        elif c == '"' or cmd.startswith('$"', j):
+            j += c == "$"
+            j += 1
+            while j < n and cmd[j] != '"':
+                if cmd[j] == "\\" and cmd[j + 1 : j + 2] in ("$", "`", '"', "\\"):
+                    j += 1
+                out.append(cmd[j : j + 1])
+                j += 1
+            if j >= n:
+                raise ShellError("unclosed_quote", "a quote in the name of a here-document is never closed")
+            j += 1
+        elif cmd.startswith("$'", j):
+            text, j = ansi_c(cmd, j + 2)
+            out.append(text)
+        else:
+            out.append(c)
+            j += 1
+    return ("".join(out), indented, min(j, n)) if j > start else None
+
 
 _IFS = re.compile(r"\$\{IFS\}|\$IFS\b")
 
@@ -330,6 +371,16 @@ def without_bodies(command: str) -> str | None:
     return "\n".join(out) + "\n" if any(out) else None
 
 
+_OPENERS = re.compile(r"[ \t]*<<-?(?:'[A-Za-z_][A-Za-z0-9_]*'|\"[A-Za-z_][A-Za-z0-9_]*\")")
+
+
+def _text_of(body: str) -> str:
+    """A `$(...)` that is only `cat`, with quoted here-documents, is the text of their bodies: what is left to judge is
+    the `cat` (and a redirect it has), with the openers and the bodies taken out. Any other text is returned as it is."""
+    plain = without_bodies(body)
+    return _OPENERS.sub("", plain) if plain is not None else body
+
+
 def _closes(line: str, word: str, indented: bool) -> bool:
     """Does this line end a here-document? The shell takes the line as it is, word and nothing else; `<<-` also lets
     leading tabs (only tabs) go."""
@@ -359,12 +410,20 @@ def _after_bodies(cmd: str, i: int, opened: list[tuple[str, bool]]) -> int | Non
 
 
 def scan(
-    cmd: str, heredocs: bool = False, end: dict | None = None, flow: list | None = None
+    cmd: str,
+    heredocs: bool = False,
+    end: dict | None = None,
+    flow: list | None = None,
+    message: Callable[[str, str], bool] | None = None,
 ) -> tuple[list[list[str]], list[str]]:
     """Split a shell command line. Returns (pipelines, inner): each pipeline is a list of segments (split on |, |&),
     pipelines are split on ; && || & newline ( ); inner holds the text of $(...), backticks and <(...), which run too.
     A comment (a `#` that starts a word, outside quotes and `${...}`) is left out, unless the line holds a `<<` and
-    `heredocs` is off: a body is then read as commands, and a `#` line in it is not a comment. With `heredocs`, the body
+    `heredocs` is off: a body is then read as commands, and a `#` line in it is not a comment. With `message`, a
+    function that is given the text of a segment up to a here-document's opener (and `"stdin"`), the body of a quoted one
+    is left out even then when it says the segment reads its message from standard input (`git commit -F -`); given the
+    text up to a `$(` (and `"value"`), a `$(cat <<'EOF' ... EOF)` that is the value of a message option is left as the
+    plain `cat` it amounts to. With `heredocs`, the body
     and closing line of each here-document are left out too (that text is data for a program, not commands): a `<<WORD` starts one
     only outside quotes and comments, and not as `<<<` or a shift in `((...))` or inside `${...}` and `$[...]`, which are
     one word. If `end` is given, end["quote"] is the quote still open at the end of the text (empty if none). If `flow`
@@ -421,7 +480,9 @@ def scan(
                     continue
             elif quote == '"' and cmd.startswith("$(", i):
                 j = close_paren(cmd, i + 2)
-                inner.append(sub(cmd[i + 2 : j]))
+                inner.append(
+                    _text_of(sub(cmd[i + 2 : j])) if message and message("".join(buf), "value") else sub(cmd[i + 2 : j])
+                )
                 if (
                     j < n
                 ):  # closed: its quotes are its own; if not (a here-document inside), read on character by character
@@ -451,24 +512,30 @@ def scan(
             buf.append("<<<")
             i += 3
             continue
-        if heredocs_here and c == "<" and cmd.startswith("<<", i):
-            m = _HEREDOC_WORD.match(cmd, i)
-            if m:
-                waiting.append((m.group(2) or m.group(3) or m.group(4) or "", m.group(1) == "-"))
-                buf.append(m.group(0))
-                i = m.end()
+        if (heredocs_here or (message and not nest)) and c == "<" and cmd.startswith("<<", i):
+            opener = heredoc_word(cmd, i)
+            raw = cmd[i + 2 : opener[2]] if opener else ""
+            quoted = any(ch in raw for ch in "'\"\\")
+            if opener and (heredocs_here or (quoted and message and message("".join(buf), "stdin"))):
+                waiting.append((opener[0], opener[1]))
+                buf.append(cmd[i : opener[2]])
+                i = opener[2]
                 continue
-        if heredocs and c == "\n" and waiting:
+        if c == "\n" and waiting:
             end_pipeline(";")
             i += 1
             for word, indented in waiting:  # skip each body, up to and including its closing line
-                while i < n:
+                closed = False
+                while i < n and not closed:
                     eol = cmd.find("\n", i)
                     eol = n if eol < 0 else eol
                     line = cmd[i:eol]
                     i = eol + 1
-                    if _closes(line, word, indented):
-                        break
+                    closed = _closes(line, word, indented)
+                if not closed:  # the body would run to the end of the text, and whatever follows it would hide in it
+                    raise ShellError(
+                        "unsupported", "a here-document never reaches its closing line; write the closing line out"
+                    )
             waiting.clear()
             continue
         if heredocs_here and c == "(" and cmd.startswith("((", i) and not buf:  # an arithmetic command: `((x<<2))`
@@ -494,7 +561,9 @@ def scan(
             continue
         elif cmd.startswith("$(", i):
             j = close_paren(cmd, i + 2)
-            inner.append(sub(cmd[i + 2 : j]))
+            inner.append(
+                _text_of(sub(cmd[i + 2 : j])) if message and message("".join(buf), "value") else sub(cmd[i + 2 : j])
+            )
             buf.append(cmd[i : j + 1])
             i = j + 1
             continue
@@ -971,6 +1040,7 @@ def expand_braces(raw: str, budget: Budget | None = None) -> list[str]:
 
 _NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _TILDE = re.compile(r"~([A-Za-z0-9_.+-]*)")
+_STACK_ENTRY = re.compile(r"[+-]?[0-9]+")
 _SPLIT = re.compile(r"([ \t\r\n]+)")
 
 
@@ -1419,7 +1489,12 @@ def _expand_raw(raw: str, env: Mapping[str, str], loose: bool) -> list[str]:
         if c == "~" and i in tilde_at and env:
             m = _TILDE.match(raw, i)
             end = m.end()
-            val = _tilde(m.group(1), env) if end >= n or raw[end] == "/" or (assign and raw[end] == ":") else None
+            at_end = end >= n or raw[end] == "/" or (assign and raw[end] == ":")
+            val = _tilde(m.group(1), env) if at_end else None
+            if at_end and _STACK_ENTRY.fullmatch(m.group(1)):  # `~2`, `~+2`, `~-2`: an entry of the directory stack
+                lit("${DIRSTACK[" + m.group(1).lstrip("+") + "]}")  # which the reader does not follow: an unknown part
+                i = end
+                continue
             if val is not None:
                 lit(val)
                 i = end
@@ -1628,6 +1703,13 @@ def has_flag(flags: list[str], letter: str) -> bool:
     return any(f[0] == "-" and f[1:2] != "-" and letter in f[1:] for f in flags)
 
 
+def long_option(name: str, longs: tuple[str, ...]) -> bool:
+    """Is `--name` one of the long options, or an abbreviation of one? GNU tools take any prefix of a long option from
+    `--x` (three characters) up, so `--fil` is `--file`. An abbreviation that two options share counts as both: the
+    reader would rather refuse a spelling than guess which one the tool takes."""
+    return len(name) >= 3 and any(lg.startswith(name) for lg in longs)
+
+
 def option_values(toks: list[str], letters: str = "", longs: tuple[str, ...] = ()) -> list[str]:
     """The values given to an option: `-o X`, `-oX`, `-sSLo X` (the option last in a group), `--output X`,
     `--output=X`. `letters` are the short options that take a value and `longs` the long ones."""
@@ -1635,11 +1717,12 @@ def option_values(toks: list[str], letters: str = "", longs: tuple[str, ...] = (
     for i, t in enumerate(toks[1:], 1):
         nxt = toks[i + 1] if i + 1 < len(toks) else None
         if t.startswith("--"):
-            for lg in longs:
-                if t == lg and nxt is not None:
+            name, eq, value = t.partition("=")
+            if long_option(name, longs):
+                if eq:
+                    out.append(value)
+                elif nxt is not None:
                     out.append(nxt)
-                elif t.startswith(lg + "="):
-                    out.append(t.split("=", 1)[1])
         elif re.fullmatch(r"-[A-Za-z]+", t) and t[-1] in letters and nxt is not None:
             out.append(nxt)
         elif t.startswith("-") and len(t) > 2:

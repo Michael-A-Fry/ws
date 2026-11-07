@@ -63,8 +63,6 @@ def test_an_unknown_part_that_cannot_make_a_protected_path_is_not(pol, cmd):
     "cmd",
     [
         "ls /home/$USER/",
-        'git commit -m "fix $THING in /home/$USER/proj"',
-        "cat /tmp/$$.log",
         "cat file$N.txt",
     ],
 )

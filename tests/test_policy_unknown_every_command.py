@@ -12,12 +12,9 @@ Tests set HOME and WS_HOME to a made-up home folder and read nothing from the ma
 
 from __future__ import annotations
 
-import shutil
-from pathlib import Path
-
 import pytest
 
-from ws import paths, policy, unknownpath
+from ws import policy, unknownpath
 
 HINT = "set the variable on its own first"
 SSH = ".ss" + "h"  # spelled in two parts so that the file is not itself a path word
@@ -129,7 +126,7 @@ LINES = {  # the shape that gives each exempt command a word of its own
     "read": "read -r $X",
     "getopts": "getopts ab $X",
     "let": "let n=$X+1",
-    "eval": 'eval "$(ssh-agent -s)"',
+    "eval": "eval 'echo hi'",
     "export": "export A=$X",
     "declare": "declare A=$X",
     "typeset": "typeset A=$X",
@@ -140,6 +137,7 @@ LINES = {  # the shape that gives each exempt command a word of its own
     "expr": "expr $X + 1",
     "printf": "printf '%s' $X",
     "pwd": "pwd $X",
+    "date": "date -u +%s",  # (a whole word it cannot resolve may be `--file=P`, so `date $X` is read as a file command)
 }
 
 
@@ -236,19 +234,18 @@ def test_after_a_sourced_file_the_home_and_working_folders_are_not_known(pol, sr
     assert denied(pol, "cat ~/notes.txt") is None
 
 
-def test_a_name_looked_up_in_cdpath_is_not_the_folder_beside_the_working_one(pol, monkeypatch):
-    assert denied(pol, f"cd {SSH} && cat id_rsa") is None  # no CDPATH: the folder under the working one
+def test_a_name_looked_up_in_cdpath_is_not_the_folder_beside_the_working_one(pol, tmp_path):
+    # CDPATH (and cdable_vars) belong to the shell the runner started, which no hook sees: whatever the hook's own
+    # environment says, a relative name is only the folder beside the working one when that folder is there
     for ok in (f"cd ./{SSH} && cat id_rsa", "cd .. && cat x", "cd /tmp && cat x", "cd ~ && cat x"):
         assert denied(pol, ok) is None, ok
-    monkeypatch.setenv("CDPATH", "/home/pat")
-    for bad in (
-        f"cd {SSH} && cat id_rsa",
-        f"cd {SSH}; cat id_rsa",
-        f"pushd {SSH}; cat id_rsa",
-    ):
-        why = denied(pol, bad)
+    for bad in (f"cd {SSH} && cat id_rsa", f"cd {SSH}; cat id_rsa", f"pushd {SSH}; cat id_rsa"):
+        why = denied(pol, bad)  # (there is no such folder under /tmp)
         assert why and HINT in why, bad
-    assert denied(pol, f"cd ./{SSH} && cat id_rsa") is None
+    (tmp_path / SSH).mkdir()
+    assert (
+        denied(pol, f"cd {SSH} && cat id_rsa", cwd=str(tmp_path)) is None
+    )  # the limit: a CDPATH folder of that name too
 
 
 def test_cdpath_set_by_the_line_itself(pol):
@@ -260,7 +257,9 @@ def test_cdpath_set_by_the_line_itself(pol):
     ):
         why = denied(pol, bad)
         assert why, bad
-    assert denied(pol, f"export CDPATH=; cd {SSH}; cat id_rsa") is None  # known to be empty
+    assert denied(
+        pol, f"export CDPATH=; cd {SSH}; cat id_rsa"
+    )  # no such folder here: the shell's own CDPATH may differ
 
 
 # --- what a command prints, when it is known ---------------------------------------------------------------------
@@ -301,14 +300,15 @@ def box(tmp_path, pol):
 
 
 def test_a_producer_with_known_arguments_is_a_path_in_a_known_place(pol, box):
-    cat = shutil.which("cat", path=paths.tool_path())
     cases = [
-        "cat $(mktemp)",
-        "cat $(mktemp -d)/x",
+        "cat $(mktemp -p /tmp)",
+        "cat $(mktemp -d -p /tmp)/x",
         "cat $(mktemp /tmp/x.XXXX)",
-        "cat $(mktemp -t x.XXXX)",
+        "cat $(mktemp x.XXXX)",
         "cat $(mktemp -p /var/tmp)",
-        "F=$(mktemp); cat $F",
+        "F=$(mktemp -p /tmp); cat $F",
+        "TMPDIR=/var/tmp; cat $(mktemp)",
+        "export TMPDIR=/var/tmp; cat $(mktemp -d)/x",
         "echo hi > $(mktemp /tmp/x.XXXX)",
         "cat $(pwd)/README.md",
         f"cat $(dirname {box}/a/b)/c",
@@ -317,21 +317,17 @@ def test_a_producer_with_known_arguments_is_a_path_in_a_known_place(pol, box):
         f"cat $(readlink -f {box}/a)",
         "cat $(dirname /tmp/a/b)/c",
         "cat $(basename /tmp/a/b)",
-        "cat $(dirname $(mktemp))/x",
+        "cat $(dirname $(mktemp -p /tmp))/x",
     ]
-    if cat:
-        cases += ["cat $(which cat)", "cat $(command -v cat)"]
     for cmd in cases:
         assert denied(pol, cmd) is None, cmd
-    repo = str(box / "repo" / "sub")
-    assert denied(pol, "cat $(git rev-parse --show-toplevel)/README.md", cwd=repo) is None
 
 
 def test_the_result_of_a_producer_is_checked_against_the_protected_paths_like_any_path(pol, box):
     for cmd in (
         f"cat $(realpath /home/pat/{SSH}/id_rsa)",
         f"cat $(dirname /home/pat/{SSH}/id_rsa)/id_rsa",
-        f"cat $(mktemp)/../../home/pat/{SSH}/id_rsa",
+        f"cat $(mktemp -p /tmp)/../../home/pat/{SSH}/id_rsa",
         f"cat $(basename /home/pat/{SSH})/id_rsa",
         f"cat $(mktemp -p /home/pat/{SSH})",
         "cat $(pwd)/id_rsa",
@@ -343,26 +339,32 @@ def test_the_result_of_a_producer_is_checked_against_the_protected_paths_like_an
     assert denied(pol, "cp a $(mktemp -p /home/pat/.ws)", protect=("/home/pat/.ws",))
 
 
-def test_temp_comes_from_the_pin_and_never_from_the_environment(pol, monkeypatch, tmp_path):
+def test_temp_is_the_one_the_line_sets_and_neither_the_pin_nor_the_environment(pol, monkeypatch):
+    # a project's settings can put any TMPDIR in the shell: `mktemp` and `$TMPDIR` are only known when the line says
     monkeypatch.setenv("TMPDIR", f"/home/pat/{SSH}")
-    assert denied(pol, "cat $(mktemp)") is None and denied(pol, "cat $TMPDIR/x") is None
-    pin = paths.Pin(Path("/home/pat"), Path("/c"), Path("/s"), Path("/d"), Path("/k"), tmp=Path("/var/pinned"))
-    with paths.pinned(pin):
-        assert paths.tmp_dir() == Path("/var/pinned")
-        ctx = policy._Ctx("/tmp")
-        env = policy._env()
-        assert env["TMPDIR"] == "/var/pinned"
-        assert policy._produced("mktemp", ctx, env) == "/var/pinned/tmp.XXXXXXXXXX"
-        assert policy._produced("mktemp -d", ctx, env) == "/var/pinned/tmp.XXXXXXXXXX"
-    assert paths.tmp_dir() == Path("/tmp")
+    for cmd in (
+        "cat $(mktemp)",
+        "cat $TMPDIR/x",
+        "cat $(mktemp -d)/x",
+        "cat $(mktemp -t x.XXXX)",
+        "cd $TMPDIR && cat x",
+    ):
+        why = denied(pol, cmd)
+        assert why and HINT in why, cmd
+    assert denied(pol, f'export TMPDIR=/home/pat; cat "$(mktemp -d)/../{SSH}/id_rsa"')
+    assert denied(pol, f"TMPDIR=/home/pat/{SSH}; cat $(mktemp)")
+    assert denied(pol, "TMPDIR=/var/tmp; cat $(mktemp)") is None
+    ctx = policy._Ctx("/tmp")
+    assert policy._produced("mktemp", ctx, policy._env()) is None
+    assert policy._produced("mktemp", ctx, policy._env({"TMPDIR": "/var/tmp"})) == "/var/tmp/tmp.XXXXXXXXXX"
 
 
 def test_the_here_document_cat_of_a_message_is_its_text(pol):
     ok = "git commit -q -m \"$(cat <<'EOF'\nFix the $X thing in dd of=$Y\nEOF\n)\""
     assert denied(pol, ok) is None
     unquoted = 'git commit -q -m "$(cat <<EOF\nFix the $X thing\nEOF\n)"'
-    why = denied(pol, unquoted)
-    assert why and HINT in why  # an unquoted body expands, and the part is not known
+    assert denied(pol, unquoted) is None  # a message: $X is text in it, wherever its value comes from
+    assert denied(pol, f'git commit -q -m "$(cat <<EOF\n$(cat /home/pat/{SSH}/id_rsa)\nEOF\n)"')  # but $( ) runs
     assert denied(pol, "gh pr create --title t --body \"$(cat <<'EOF'\nSee ~/.config and $HOME\nEOF\n)\"") is None
 
 

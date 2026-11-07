@@ -400,7 +400,7 @@ def test_ws_eval_gives_one_arm_per_arm_with_its_numbers_and_reasons(box):
         a.tokens_per_solved == 200.0
     )  # 8 trials of 150 tokens over 6 solved and a.cost_per_solved_usd == pytest.approx(0.08 / 6)
     assert [(t["batch"], t["n"], t["pass_rate"]) for t in a.trend] == [("b1", 4, 0.5), ("b2", 4, 1.0)]
-    assert a.noise == {"points": evalstats.NOISE_POINTS, "wins_needed": evalstats.wins_needed(2)}
+    assert a.noise == {"points": evalstats.TIE_POINTS, "wins_needed": evalstats.wins_needed(2)}
     assert a.not_measured == {}
     b = arms["beta"]
     assert (b.trials, b.solved, b.pass_rate) == (1, 0, 0.0)

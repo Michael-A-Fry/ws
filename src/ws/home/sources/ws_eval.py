@@ -66,7 +66,7 @@ def read(kind, env):
                 cost_per_solved_usd=_value(metrics, "cost_per_solved"),
                 trend=tuple(evalstats.trend(mine)),
                 noise={
-                    "points": evalstats.NOISE_POINTS,
+                    "points": evalstats.TIE_POINTS,
                     "wins_needed": evalstats.wins_needed(len({str(r.get("task")) for r in mine})),
                 },
                 not_measured={

@@ -191,10 +191,23 @@ def test_a_case_change_that_makes_a_protected_path_is_refused(box, monkeypatch, 
     assert refused(monkeypatch, capsys, "cd ~; X=.AWS/CREDENTIALS; cat ${X~~}")
 
 
-def test_a_case_change_that_does_not_make_a_protected_path_is_allowed(box, monkeypatch, capsys):
-    assert not refused(monkeypatch, capsys, "cd ~; X=.AWS/credentials; cat ${X,}")  # only the first letter changes
-    assert not refused(monkeypatch, capsys, "cd ~; X=.AWS/credentials; cat ${X^^}")  # upper case is another file
-    assert not refused(monkeypatch, capsys, "cd ~; X=.AWS/credentials; cat ${X~~}")  # so is the swapped case
+@pytest.mark.parametrize("caseless", [False, True])
+def test_a_case_change_is_judged_by_whether_the_file_system_tells_case_apart(box, monkeypatch, capsys, caseless):
+    """On a case-sensitive file system (Linux) `.AWS` is another folder, so these are allowed; on a case-insensitive one
+    (macOS by default) it's the same folder as `.aws`, so they're refused."""
+    from ws import policy
+
+    monkeypatch.setattr(policy, "CASELESS_PATHS", caseless)
+    policy._rules.cache_clear()
+    try:
+        for cmd in (
+            "cd ~; X=.AWS/credentials; cat ${X,}",  # only the first letter changes
+            "cd ~; X=.AWS/credentials; cat ${X^^}",  # upper case
+            "cd ~; X=.AWS/credentials; cat ${X~~}",  # swapped case
+        ):
+            assert refused(monkeypatch, capsys, cmd) is caseless, (cmd, caseless)
+    finally:
+        policy._rules.cache_clear()
 
 
 def test_the_at_operators():

@@ -90,6 +90,7 @@ import itertools
 import os
 import posixpath
 import re
+import sys
 import tomllib
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
@@ -792,6 +793,11 @@ def _glob_class(pattern: str, i: int) -> tuple[str, int] | None:
     return "[" + ("^" if neg else "") + "".join(parts) + "]", j
 
 
+# macOS file systems are case-insensitive by default: `~/.SSH/ID_RSA` is the same file as `~/.ssh/id_rsa`, so path rules
+# match without regard to case there. (Linux file systems are case-sensitive.)
+CASELESS_PATHS = sys.platform == "darwin"
+
+
 def _glob_regex_path(pattern: str) -> re.Pattern:
     out, i = [], 0
     while i < len(pattern):
@@ -814,7 +820,7 @@ def _glob_regex_path(pattern: str) -> re.Pattern:
         else:
             out.append(re.escape(c))
         i += 1
-    return re.compile("".join(out) + r"\Z", re.DOTALL)
+    return re.compile("".join(out) + r"\Z", re.DOTALL | (re.IGNORECASE if CASELESS_PATHS else 0))
 
 
 def _path_regex(pattern: str) -> re.Pattern:
@@ -946,9 +952,12 @@ def _under(paths: tuple[str, ...], path: str, cwd: str, ancestors: bool = False)
     moving or unpacking over a folder takes everything under it too."""
     p = _abs(path, cwd)
     forms = {p, os.path.realpath(p)} if shellwords.check_path(p) else {p}
+    if CASELESS_PATHS:
+        forms = {f.casefold() for f in forms}
     for q in paths:
         qa = _abs(q, cwd)
         for target in {qa, os.path.realpath(qa)}:
+            target = target.casefold() if CASELESS_PATHS else target
             if any(
                 f == target or f.startswith(target + "/") or (ancestors and target.startswith(f + "/")) for f in forms
             ):

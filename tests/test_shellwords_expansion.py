@@ -19,8 +19,20 @@ import pytest
 from ws import cli, policy
 from ws import shellwords as sw
 
+
+def _bash_major(path: str | None) -> int:
+    """The major version of the bash at `path` (0 when there's none): the oracle needs bash 4 or newer, which has the
+    case operators, zero-padded sequences and the replacement forms; macOS ships bash 3.2 as /bin/bash."""
+    if not path:
+        return 0
+    import subprocess
+
+    out = subprocess.run([path, "-c", "echo ${BASH_VERSINFO[0]}"], capture_output=True, text=True, check=False).stdout
+    return int(out.strip() or 0) if out.strip().isdigit() else 0
+
+
 BASH = shutil.which("bash")
-needs_bash = pytest.mark.skipif(BASH is None, reason="bash is not on PATH")
+needs_bash = pytest.mark.skipif(_bash_major(BASH) < 4, reason="needs bash 4 or newer on PATH")
 KEY = "~/.ssh/id_rsa"
 
 
@@ -116,7 +128,9 @@ def test_many_different_cuts_of_a_long_value_are_refused_when_they_take_too_long
     cmd = "X=" + "ab" * 2000 + "; echo " + " ".join(f"${{X##*b{k}*}}" for k in range(1500))
     began = time.perf_counter()
     code, err = hook(monkeypatch, capsys, cmd)
-    assert code == 2 and "takes too long" in err
+    assert code == 2 and ("takes too long" in err or "expand to more than" in err), (
+        err
+    )  # a limit, whichever is hit first
     assert time.perf_counter() - began < 5
 
 

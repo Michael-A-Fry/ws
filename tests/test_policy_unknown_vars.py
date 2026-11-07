@@ -111,3 +111,12 @@ def test_a_command_that_can_set_any_variable_makes_later_values_unknown(pol, cmd
 )
 def test_common_lines_with_those_commands_are_still_allowed(pol, cmd):
     assert not policy.is_denied_command(pol, cmd, cwd="/tmp"), cmd
+
+
+def test_on_a_case_insensitive_platform_path_rules_match_without_regard_to_case(pol, monkeypatch):
+    for caseless in (True, False):
+        monkeypatch.setattr(policy, "CASELESS_PATHS", caseless)
+        policy._rules.cache_clear()
+        denied = policy.is_denied_command(policy.default_policy(), "cat ~/.SSH/ID_RSA", cwd="/tmp")
+        assert bool(denied) is caseless, caseless
+    policy._rules.cache_clear()

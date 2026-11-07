@@ -18,7 +18,8 @@ def run(tmp_path, text, denylist=NAME, extra_env=None):
     repo.mkdir(exist_ok=True)
     subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
     (repo / "f.md").write_text(text)
-    env = {**os.environ, "WS_PII_DENYLIST": denylist, **(extra_env or {})}
+    env = {k: v for k, v in os.environ.items() if k not in ("WS_PII_DENYLIST_OPTIONAL", "GITHUB_ACTIONS")}
+    env = {**env, "WS_PII_DENYLIST": denylist, **(extra_env or {})}
     env.pop("WS_PII_DENYLIST_FILE", None)
     if not denylist:
         env.pop("WS_PII_DENYLIST")
@@ -85,3 +86,15 @@ def test_history_reads_a_message_without_a_final_newline(tmp_path):
         [sys.executable, str(GATE), "--history"], check=False, cwd=repo, env=env, capture_output=True, text=True
     )
     assert r.returncode == 0, r.stdout
+
+
+def test_optional_without_denylist_warns_on_github(tmp_path):
+    r = run(tmp_path, "clean\n", denylist="", extra_env={"WS_PII_DENYLIST_OPTIONAL": "1", "GITHUB_ACTIONS": "true"})
+    assert r.returncode == 0, r.stderr
+    assert "::warning title=PII gate::" in r.stdout
+
+
+def test_ambient_optional_does_not_leak_into_the_refusal(tmp_path, monkeypatch):
+    monkeypatch.setenv("WS_PII_DENYLIST_OPTIONAL", "1")
+    r = run(tmp_path, "clean\n", denylist="")
+    assert r.returncode == 2

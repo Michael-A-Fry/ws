@@ -132,6 +132,8 @@ def main(argv: list[str]) -> int:
     if deny is None:
         if os.environ.get("WS_PII_DENYLIST_OPTIONAL") == "1":
             print("pii-gate: no denylist (fork PR?): checking the built-in rules only", file=sys.stderr)
+            if os.environ.get("GITHUB_ACTIONS") == "true":
+                print("::warning title=PII gate::no denylist here, so only the built-in rules ran")
             deny = []
         else:
             print("pii-gate: no denylist (WS_PII_DENYLIST or WS_PII_DENYLIST_FILE): refusing to pass", file=sys.stderr)

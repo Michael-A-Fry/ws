@@ -28,7 +28,7 @@ runner, the call, the folder and the session, exactly as `ask_commands` is.
 
 `Context` carries what a guard may know: the runner, the event, the session id, the folder, the raw payload, `now()`
 (the clock, so a test can set it), `memo` (scratch shared by the guards for one hook run) and `state(name, update)`, a small JSON record of its own for this session, read and
-written under a lock at `$WS_HOME/sessions/<session id>.<name>.json` and removed with the session record.
+written under a lock at `<state>/sessions/<session id>.<name>.json` and removed with the session record.
 
 A new guard is one module here; nothing else changes. The policy turns a guard on, and `ws gate generate` writes the
 runner hooks for the events and tools the guards that are on need.
@@ -68,7 +68,7 @@ class Finding:
 
 @dataclass
 class Context:
-    """What a guard may know about the moment it runs. `home` is the ws home (default $WS_HOME)."""
+    """What a guard may know about the moment it runs. `home` is ws's state folder (default `paths.state_dir()`)."""
 
     runner: str
     event: str
@@ -92,12 +92,12 @@ class Context:
 
 
 def _state_path(home: Path | None, session_id: str, name: str) -> Path:
-    from ws.profile import ws_home
+    from ws import paths
     from ws.session import safe_id
 
     if not name or not name.replace("-", "").replace("_", "").isalnum():
         raise ValueError(f"{name!r} is not a plain state name")
-    return (Path(home) if home is not None else ws_home()) / "sessions" / f"{safe_id(session_id)}.{name}.json"
+    return (Path(home) if home is not None else paths.state_dir()) / "sessions" / f"{safe_id(session_id)}.{name}.json"
 
 
 def _state(home: Path | None, session_id: str, name: str, update: Callable[[dict], dict | None] | None) -> dict:

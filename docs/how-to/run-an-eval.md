@@ -6,7 +6,7 @@ The [eval reference](../reference/eval.md) has the task format, the graders and 
 ## Before you start
 
 - A monthly cap ([Set a budget](set-a-budget.md)). Every trial is a `ws run`, so the cap applies to each one.
-- A job file for the setup you want to test, in `$WS_HOME/jobs/`. Set tight `timeout_s` and `max_turns`.
+- A job file for the setup you want to test, in `~/.config/ws/jobs/`. Set tight `timeout_s` and `max_turns`.
 - For tasks with a `command` grader: bubblewrap on Linux ([Use the wall](use-the-wall.md)). Without a sandbox, `ws eval run`
   refuses those tasks.
 - A normal user. Don't run evals as root.

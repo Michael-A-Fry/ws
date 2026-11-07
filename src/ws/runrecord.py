@@ -1,4 +1,4 @@
-"""The run record: one JSON line per headless job in `$WS_HOME/logs/runs.jsonl`, the same shape for every runner.
+"""The run record: one JSON line per headless job in `<state>/logs/runs.jsonl`, the same shape for every runner.
 
 The shape is `runschema.SCHEMA` (JSON Schema 2020-12, a Python dict so the package stays .py files only). Every key is always
 present; a value ws could not learn is null. Appends go through `ws.jsonl`: one `write()` under a lock, so two jobs
@@ -18,8 +18,7 @@ import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from ws import jsonl
-from ws.profile import ws_home
+from ws import jsonl, paths
 from ws.runschema import SCHEMA
 
 SCHEMA_VERSION = 2
@@ -62,7 +61,7 @@ STATUSES = ("ok", "error", "timeout", "refused")
 
 
 def runs_path(env: dict | None = None) -> Path:
-    return ws_home(env) / "logs" / "runs.jsonl"
+    return paths.state_dir(env) / "logs" / "runs.jsonl"
 
 
 def schema() -> dict:

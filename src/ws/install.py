@@ -39,7 +39,7 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from ws import __version__, adapters, notesdetect, osinfo, output, policy, profile, roles, userconfig
+from ws import __version__, adapters, notesdetect, osinfo, output, paths, policy, profile, roles, userconfig
 from ws.jobs import JobError
 from ws.output import WsError
 
@@ -152,16 +152,21 @@ def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _ws_home(env: Mapping[str, str]) -> Path:
-    return Path(os.path.abspath(profile.ws_home(dict(env))))
+def _dir(kind: str, env: Mapping[str, str]) -> Path:
+    return Path(os.path.abspath(paths.layout(dict(env)).dir(kind)))
+
+
+def _ws_dirs(env: Mapping[str, str]) -> list[Path]:
+    """Every folder of the layout in use: the ones ws manages as its own."""
+    return [Path(os.path.abspath(p)) for p in paths.roots(dict(env))]
 
 
 def manifest_path(env: Mapping[str, str] | None = None) -> Path:
-    return _ws_home(os.environ if env is None else env) / MANIFEST
+    return _dir("state", os.environ if env is None else env) / MANIFEST
 
 
 def profile_path(env: Mapping[str, str] | None = None) -> Path:
-    return _ws_home(os.environ if env is None else env) / "profile.toml"
+    return _dir("config", os.environ if env is None else env) / "profile.toml"
 
 
 def _too_broad(root: Path, env: Mapping[str, str]) -> bool:
@@ -305,7 +310,7 @@ def compose_profile(prof: dict, answers: Answers, env: Mapping[str, str], osi, m
 
 
 def _policy_step(env: Mapping[str, str]) -> tuple[Step, policy.Policy]:
-    path = _ws_home(env) / "policy.toml"
+    path = _dir("config", env) / "policy.toml"
     try:
         text = path.read_text(encoding="utf-8") if path.exists() else policy.default_toml()
         parsed = policy.loads(text)
@@ -379,7 +384,7 @@ def _gate_steps(
             raise InstallError(str(e.args[0])) from e
         old = _merge_entry(entries, runner, env)
         wide = userconfig.supports(runner) and resolve_gate(prof, answers, old is not None) == "every-session"
-        out = _ws_home(env) / "gate" / runner
+        out = _dir("state", env) / "gate" / runner
         if wide:
             made = userconfig.plan(runner, parsed, policy_file, env, old)
             files = made.files
@@ -400,7 +405,7 @@ def _gate_steps(
                 WsError
             ):  # can't build a fresh merge now: the record stays as it is, and doctor says if it went stale
                 continue
-            out = _ws_home(env) / "gate" / other
+            out = _dir("state", env) / "gate" / other
             steps += [Step(out / name, "file", text, f"{other} deny rules") for name, text in made.files.items()]
             steps += _merge_steps(other, made, True)
     for other in userconfig.RUNNERS:  # a runner that is no longer gated in every session: take ws's items out again
@@ -625,7 +630,7 @@ def apply(
     entries, roots = _read_manifest(env)
     base = copy.deepcopy(entries)
     managed = {str(r) for r in roots}
-    for r in [_ws_home(env), *(s.path for s in steps if s.root)]:
+    for r in [*_ws_dirs(env), *(s.path for s in steps if s.root)]:
         r = Path(os.path.abspath(r))
         if _too_broad(r, env):
             raise InstallError(f"{r} is too broad for ws to manage; pick a folder of its own")
@@ -799,7 +804,7 @@ def current_roots(env: Mapping[str, str] | None = None) -> list[Path]:
     from ws import skills
 
     env = os.environ if env is None else env
-    found = [_ws_home(env)]
+    found = _ws_dirs(env)
     try:
         rls = _sub(profile.load(profile_path(env)) or {}, "roles")
     except (profile.ProfileError, OSError):
@@ -837,25 +842,25 @@ def _owned(path: Path) -> bool:
     return getuid is None or os.stat(path).st_uid == getuid()
 
 
-def _tidy_work_root(root: Path, removal: Removal, gone: set[Path], dry_run: bool) -> None:
-    """Tidy the folder headless jobs without a `cwd` get as their working folder. ws makes it without a manifest entry,
-    so only empty run folders go; whatever a job wrote is the person's."""
+def _tidy_work_root(root: Path, removal: Removal, gone: set[Path], dry_run: bool, above: Path | None = None) -> None:
+    """Tidy the folder headless jobs without a `cwd` get as their working folder (`root`, one folder per run). ws makes
+    it without a manifest entry, so only empty run folders go; whatever a job wrote is the person's. `above`: the folder
+    an earlier ws kept it in (`.../ws/work`), taken too once empty."""
     if not (root.exists() or root.is_symlink()):
         return
     try:
         if root.is_symlink() or not root.is_dir() or not _owned(root):
             removal.refused.append(root)
             return
-        work = root / "work"
-        if work.is_dir() and not work.is_symlink():
-            for child in sorted(work.iterdir()):
-                if child.is_symlink() or not child.is_dir() or any(child.iterdir()):
-                    removal.not_empty.append(child)
-                else:
-                    _rmdir(child, removal, gone, dry_run)
-        for folder in (work, root):
-            if folder.is_symlink() or not folder.is_dir():
-                continue
+        for child in sorted(root.iterdir()):
+            if child.is_symlink() or not child.is_dir() or any(child.iterdir()):
+                removal.not_empty.append(child)
+            else:
+                _rmdir(child, removal, gone, dry_run)
+        folders = [root]
+        if above is not None and not above.is_symlink() and above.is_dir():
+            folders.append(above)
+        for folder in folders:
             kids = list(folder.iterdir())
             if all(k in gone for k in kids):
                 _rmdir(folder, removal, gone, dry_run)
@@ -874,12 +879,6 @@ def _rmdir(path: Path, removal: Removal, gone: set[Path], dry_run: bool) -> None
             return
     removal.removed.append(path)
     gone.add(path)
-
-
-def _work_root(env: Mapping[str, str]) -> Path:
-    state = env.get("XDG_STATE_HOME", "")
-    base = Path(state) if os.path.isabs(state) else Path(_home(env)) / ".local" / "state"
-    return Path(os.path.abspath(base)) / "ws"
 
 
 def uninstall(
@@ -949,7 +948,10 @@ def uninstall(
             removal.removed.append(path)
             gone.add(path)
 
-    _tidy_work_root(_work_root(env), removal, gone, dry_run)
+    _tidy_work_root(paths.work_dir(env), removal, gone, dry_run)
+    old = paths.old_work_dir(env)  # where ws kept them before the XDG folders
+    keep = old.parent in _ws_dirs(env)  # in the XDG layout that folder is ws's own state folder
+    _tidy_work_root(old, removal, gone, dry_run, above=None if keep else old.parent)
 
     manifest = manifest_path(env)
     if manifest.is_file() and pending:
@@ -1141,13 +1143,13 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
             }
         )
         return 0
-    for label, paths in (
+    for label, listed in (
         ("you changed it, so ws left it", r.edited),
         ("has your files in it, so ws left it", r.not_empty),
         ("ws did not create it, so ws left it", r.not_ours),
         ("outside the folders ws manages, so ws left it", r.refused),
     ):
-        for p in paths:
+        for p in listed:
             print(f"{label}: {p}")
     for p in r.restored:
         print(f"{'would restore' if args.dry_run else 'restored'} {p} (your settings, exactly as they were)")

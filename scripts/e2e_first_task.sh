@@ -367,11 +367,11 @@ PY
     RUN_MS="$(cut -f2 "$BASE/record.tsv")"
     WORK="$(cut -f3 "$BASE/record.tsv")"
     echo "run $RUN_ID ok in $RUN_MS ms, working folder $WORK"
-    # the default working folder: under the state dir, never inside WS_HOME (the wall makes that read-only)
+    # the default working folder: beside the state dir, never inside ws's folders (the wall makes those read-only)
     case "$WORK" in
-        "$HOME/.local/state/ws/work/"*) ;;
+        "$HOME/.local/state/ws-work/"*) ;;
         *)
-            echo "the working folder is not under $HOME/.local/state/ws/work/: $WORK"
+            echo "the working folder is not under $HOME/.local/state/ws-work/: $WORK"
             return 1
             ;;
     esac
@@ -400,14 +400,14 @@ do_tool_uninstall() {
 # (Claude Code's sessions, backups and settings; OpenCode's data, state and cache; the npm log and the folder Claude Code
 # writes), uv's empty tool folders after `uv tool uninstall`, and macOS's caches. Those are named one by one, so what ws
 # put under the same folders (skills in ~/.claude/skills) counts as residue. The one thing ws leaves on purpose is
-# what the job wrote in its working folder (~/.local/state/ws/work/<run id>/hello.txt): that is the person's, and the
+# what the job wrote in its working folder (~/.local/state/ws-work/<run id>/hello.txt): that is the person's, and the
 # check below asserts it is still there.
 CLAUDE_STATE='^~/\.claude\.json|^~/\.claude/(projects|backups|dev-mods|seed-admin|sessions|ssh|shell-snapshots|todos'
 CLAUDE_STATE="$CLAUDE_STATE|statsig|telemetry|cache|plugins|history\.jsonl|ide|logs)(/|\$)|^~/\.config/anthropic|^~/\.npm(/|\$)"
 OPENCODE_STATE='^~/\.(local/share|local/state|cache|config)/opencode(/|$)'
 OTHER_STATE='^~/\.claude$|^~/\.(local|config|cache)$|^~/\.local/(share|state)$|^~/\.local/bin$|^~/\.local/share/uv'
 OTHER_STATE="$OTHER_STATE|^~/Library$|^~/Library/(Caches|Application Support|Logs)(/|\$)"
-JOB_OUTPUT='^~/\.local/state/ws(/work(/[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}(/hello\.txt)?)?)?$'
+JOB_OUTPUT='^~/\.local/state/ws-work(/[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}(/hello\.txt)?)?$'
 RUNNER_STATE="$CLAUDE_STATE|$OPENCODE_STATE|$OTHER_STATE|$JOB_OUTPUT"
 check_residue() {
     list_home > "$BASE/after.txt"

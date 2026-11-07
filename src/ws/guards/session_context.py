@@ -9,7 +9,7 @@ Two more lines, each short and plain. With `warn_api_key` (default true), an int
 `claude -p` or SDK session, and a `ws run` job (its key is the lease placeholder), get no line. And once for each ws
 version in each project (a start that carries a session id), a session is told which ws version it runs and up to four lines of what that version
 changed, read from a `CHANGELOG.md` shipped with ws when there is one (else the version line alone). That record is
-`$WS_HOME/sessions/project-HASH.session-context.json`.
+`<state>/sessions/project-HASH.session-context.json`.
 
 The runner adds the text to the session's context at start.
 """

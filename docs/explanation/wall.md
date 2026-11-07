@@ -42,7 +42,7 @@ What a walled session can't do:
 
 After every walled run, the launcher compares the project with how it was and reports anything that will run later: a
 new or changed git folder, runner config, program loaded on its own in a virtual environment or `node_modules`. It reports
-and deletes nothing. The report goes to standard error and to `$WS_HOME/logs/wall-report.jsonl`.
+and deletes nothing. The report goes to standard error and to `~/.local/state/ws/logs/wall-report.jsonl`.
 
 The wall fails closed. With no bubblewrap, or with unprivileged user namespaces switched off, `ws gate launch` refuses and
 prints the install line. `--no-sandbox` starts the runner bare and says what that gives up, so skipping the wall is a

@@ -106,6 +106,27 @@ def test_systemd_service_and_timer(env):
     assert "WantedBy=timers.target" in timer
 
 
+def test_a_unit_carries_the_four_folders_in_the_xdg_layout_and_pins_the_old_folder_by_name(tmp_path):
+    home = tmp_path / "xdg-home"
+    home.mkdir()
+    xdg = {"HOME": str(home), "PATH": "/usr/bin:/bin"}
+    svc = systemd.render(job(), xdg, WS)["ws-daily.service"]
+    for var, folder in (
+        ("WS_CONFIG_DIR", home / ".config" / "ws"),
+        ("WS_STATE_DIR", home / ".local" / "state" / "ws"),
+        ("WS_DATA_DIR", home / ".local" / "share" / "ws"),
+        ("WS_CACHE_DIR", home / ".cache" / "ws"),
+    ):
+        assert f'Environment="{var}={folder}"' in svc
+    assert "WS_HOME=" not in svc
+    plist = launchd.render(job(), xdg, WS)
+    assert "WS_STATE_DIR" in plist and "WS_HOME" not in plist
+    (home / ".ws").mkdir()  # an earlier ws's folder: pinned by name; `ws migrate` writes the units again after the move
+    old = systemd.render(job(), xdg, WS)["ws-daily.service"]
+    assert f'Environment="WS_HOME={home / ".ws"}"' in old and "WS_STATE_DIR" not in old
+    assert f"<string>{home / '.ws'}</string>" in launchd.render(job(), xdg, WS)
+
+
 def test_every_timer_catches_up_whatever_the_stays_on_answer(env):
     for stays_on in (True, False):
         files = systemd.steps({}, install.Answers(stays_on=stays_on), env)

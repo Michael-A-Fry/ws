@@ -1,7 +1,7 @@
 """`ws doctor`: one line per check, each with a stable ID. Exit 0 only when nothing is failing or unconfigured.
 
-IDs never change meaning once released: WS0xx are the machine, profile, jobs, gate and
-plugins, WS1xx are the roles (one per role).
+IDs never change meaning once released: WS0xx are the machine, profile, jobs, gate,
+plugins and where ws keeps its files, WS1xx are the roles (one per role).
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from ws import __version__, canary, jobs, roles, usage, userconfig
+from ws import __version__, canary, jobs, paths, roles, usage, userconfig
 from ws import globals as ws_globals
 from ws.osinfo import OSInfo
 from ws.profile import ProfileError, load, profile_path
@@ -218,6 +218,26 @@ def _plugins_check(prof: dict, env) -> list[Check]:
     return [Check("WS009", "plugins", WARN, detail, f"to hide it, run `ws plugin remove {names[0]}`")]
 
 
+def _layout_check(env) -> Check:
+    """WS010: where ws keeps its files. `ok` for the XDG folders or a folder you named; `warn` while they are still in
+    `~/.ws` from an earlier ws (nothing moves by itself: `ws migrate` does it); `fail` when both exist, because ws can't
+    tell which holds the truth."""
+    pr = paths.probe(env)
+    if pr.state == "both":
+        found = ", ".join(str(p) for p in pr.owned[:3]) + (" ..." if len(pr.owned) > 3 else "")
+        detail = f"ws files are in two places: {pr.legacy} and {found}"
+        return Check(
+            "WS010", "layout", FAIL, detail, "run `ws migrate` to finish the move, or move the old folder aside"
+        )
+    if pr.state == "legacy":
+        detail = f"ws files are still in {pr.legacy}, where an earlier ws kept them"
+        return Check("WS010", "layout", WARN, detail, "run `ws migrate --dry-run` to see the move, then `ws migrate`")
+    lay = paths.layout(env)
+    if lay.mode == "single" and len(lay.distinct()) == 1:
+        return Check("WS010", "layout", OK, f"one folder: {lay.config}")
+    return Check("WS010", "layout", OK, f"config {lay.config}; state {lay.state}; data {lay.data}")
+
+
 def run_checks(osi: OSInfo, profile_file: Path, env: dict | None = None, network: bool = True) -> list[Check]:
     env = os.environ if env is None else env
     checks: list[Check] = []
@@ -278,7 +298,14 @@ def run_checks(osi: OSInfo, profile_file: Path, env: dict | None = None, network
         over = []
     fix = "remove that allow rule, or take the deny rule out of the policy and run `ws install`"
     checks += [Check("WS008", "gate", WARN, line, fix) for line in over]
-    checks += _plugins_check(prof, env)
+    try:
+        checks.append(_layout_check(env))
+    except Exception as e:  # noqa: BLE001 (a broken check must report, not crash the whole doctor)
+        checks.append(Check("WS010", "layout", FAIL, f"check crashed ({type(e).__name__})"))
+    try:
+        checks += _plugins_check(prof, env)
+    except Exception as e:  # noqa: BLE001 (a broken check must report, not crash the whole doctor)
+        checks.append(Check("WS009", "plugins", FAIL, f"check crashed ({type(e).__name__})"))
     roles = prof.get("roles") if isinstance(prof.get("roles"), dict) else {}
     for r in ROLES:
         cfg = roles.get(r.name)

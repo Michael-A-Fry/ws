@@ -10,7 +10,7 @@ needs its own approval; one changed byte is a new call. It is single use (the gr
 rename, so two racing calls cannot both use it) and it expires: a pending one 10 minutes after the request, a granted
 one 10 minutes after the grant.
 
-Where it lives: `$WS_HOME/approvals/pending/<id>.json` (written by the gate) and `.../granted/<id>.json` (written only
+Where it lives: `<state>/approvals/pending/<id>.json` (written by the gate) and `.../granted/<id>.json` (written only
 by `ws approve`). `approvals` is a ws control path (ws.policy.CONTROL_NAMES), so a session's own write tools cannot
 touch it and the sandbox keeps `granted/` read-only. `pending/` is the one writable exception in the OpenCode wall
 (ws.sandbox): the gate runs inside that wall and must be able to ask. That is safe because a pending record grants
@@ -67,9 +67,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from ws import jsonl
+from ws import jsonl, paths
 from ws.output import WsError
-from ws.profile import ws_home
 
 SCHEMA_VERSION = 1  # the `schema` of a record in approvals/pending and approvals/granted
 TTL = 600  # seconds a pending or a granted approval lives
@@ -103,7 +102,7 @@ class Bound:
 
 
 def approvals_dir(home: Path | None = None) -> Path:
-    return (home if home is not None else ws_home()) / "approvals"
+    return (home if home is not None else paths.state_dir()) / "approvals"
 
 
 def _pending(root: Path) -> Path:

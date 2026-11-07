@@ -1,6 +1,6 @@
 """Memory module: Markdown files with front matter in a git repo, plus a rebuildable SQLite FTS5 index.
 
-The files are the truth. The index (`$WS_HOME/index/memory.sqlite`) only helps search; delete it and the next search
+The files are the truth. The index (`index/memory.sqlite` in ws's cache folder) only helps search; delete it and the next search
 rebuilds the same one. Search covers memory and your notes folder. ws writes new memory files and never edits one.
 """
 
@@ -18,9 +18,9 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 
-from ws import frontmatter, output
+from ws import frontmatter, output, paths
 from ws.notes import WsError, clean_tags, read_text, role_path, title_slug, write_new
-from ws.profile import ProfileError, ws_home
+from ws.profile import ProfileError
 
 KINDS = ("fact", "decision", "preference", "person", "project")
 MAX_BYTES = 5_000_000  # a Markdown file bigger than this is skipped
@@ -168,7 +168,7 @@ def configured_roots(env: dict | None = None) -> list[tuple[str, Path]]:
 
 
 def index_path(env: dict | None = None) -> Path:
-    return ws_home(env) / "index" / "memory.sqlite"
+    return paths.cache_dir(env) / "index" / "memory.sqlite"
 
 
 def has_fts5() -> bool:

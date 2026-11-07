@@ -57,6 +57,59 @@ def test_a_second_install_reports_0_changes_and_uninstall_leaves_no_residue(box,
     assert snapshot(box) == pre
 
 
+@pytest.fixture
+def xdg_box(tmp_path, monkeypatch):
+    """A HOME with no WS_HOME and no ~/.ws: ws uses the XDG folders."""
+    home = tmp_path / "xdg-home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("WS_HOME", raising=False)
+    monkeypatch.chdir(home)
+    return home
+
+
+def test_in_the_xdg_layout_each_file_lands_in_its_folder_and_uninstall_leaves_no_residue(xdg_box, capsys):
+    box = xdg_box
+    pre = snapshot(box)
+    notes = box / "Notes"
+    code, out, _ = run(capsys, "install", *FULL, "--notes", str(notes))
+    assert code == 0 and "0 changes" not in out
+    cfg, state = box / ".config" / "ws", box / ".local" / "state" / "ws"
+    assert (cfg / "policy.toml").is_file() and (cfg / "profile.toml").is_file()
+    assert (state / "install-manifest.json").is_file() and (state / "gate" / "claude-code" / "settings.json").is_file()
+    assert not (box / ".ws").exists()
+    after_first = snapshot(box)
+
+    code, out, _ = run(capsys, "install", *FULL, "--notes", str(notes))
+    assert code == 0 and "0 changes" in out and snapshot(box) == after_first
+
+    code, out, _ = run(capsys, "uninstall", "--yes")
+    assert code == 0 and "left 0" in out
+    assert snapshot(box) == pre
+
+
+def test_in_the_old_layout_install_keeps_using_the_old_folder(xdg_box, capsys):
+    (xdg_box / ".ws").mkdir()
+    assert run(capsys, "install", *FULL, "--notes", str(xdg_box / "Notes"))[0] == 0
+    assert (xdg_box / ".ws" / "policy.toml").is_file() and not (xdg_box / ".config").exists()
+
+
+def test_uninstall_removes_empty_run_folders_in_the_work_folder_and_keeps_what_a_job_wrote(xdg_box, capsys):
+    assert run(capsys, "install", *FULL, "--notes", str(xdg_box / "Notes"))[0] == 0
+    root = xdg_box / ".local" / "state" / "ws-work"
+    full, empty = root / "20261031T120000Z-aaaaaa", root / "20261031T120001Z-bbbbbb"
+    full.mkdir(parents=True)
+    empty.mkdir()
+    (full / "hello.txt").write_text("hello", encoding="utf-8")
+    code, out, _ = run(capsys, "uninstall", "--yes")
+    assert code == 0 and (full / "hello.txt").read_text(encoding="utf-8") == "hello" and not empty.exists()
+    assert f"has your files in it, so ws left it: {full}" in out
+    (full / "hello.txt").unlink()
+    full.rmdir()
+    assert run(capsys, "uninstall", "--yes")[0] == 0
+    assert not root.exists()  # nothing left in it: the folder goes too
+
+
 def test_uninstall_keeps_a_notes_folder_that_was_there_and_what_is_in_it(box, capsys):
     notes = box / "Notes"
     notes.mkdir()

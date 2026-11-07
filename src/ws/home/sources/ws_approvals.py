@@ -1,4 +1,4 @@
-"""Approvals waiting for a person: the gate's pending records (`$WS_HOME/approvals/pending`), one ask each.
+"""Approvals waiting for a person: the gate's pending records (`approvals/pending` in ws's state folder), one ask each.
 
 Granting needs a real terminal (the approve command), so each ask is answered in a terminal, whatever the app.
 """
@@ -16,13 +16,13 @@ ORDER = 50
 
 
 def available(env):
-    folder = env.ws_home / "approvals" / "pending"
+    folder = env.state / "approvals" / "pending"
     return (True, "") if folder.is_dir() else (False, "no pending approvals folder")
 
 
 def read(kind, env):
     try:
-        rows = approvals.pending(env.ws_home / "approvals", env.now)
+        rows = approvals.pending(env.state / "approvals", env.now)
     except OSError as e:
         raise SourceError(UNREADABLE, f"can't read pending approvals: {e.strerror or type(e).__name__}") from e
     out = []

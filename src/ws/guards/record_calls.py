@@ -1,4 +1,4 @@
-"""record-calls: append each tool call a session makes to `$WS_HOME/logs/gate-calls.jsonl` as `{schema, ts, at, runner,
+"""record-calls: append each tool call a session makes to `<state>/logs/gate-calls.jsonl` as `{schema, ts, at, runner,
 payload}` (`at` is the legacy spelling of `ts`, kept beside it), so `ws gate replay` can run the same calls against a
 changed policy. It only records: a log it can't write is a
 warning. The log has the bounds every ws log has (ws.jsonl: long fields cut, the file rotates, writers take a lock).
@@ -21,9 +21,8 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
-from ws import jsonl
+from ws import jsonl, paths
 from ws.guards import Finding, known_keys
-from ws.profile import ws_home
 
 NAME = "record-calls"
 EVENTS = ("pre",)
@@ -41,7 +40,7 @@ def config(table: dict, where: str) -> None:
 
 
 def log_path(home: Path | None = None) -> Path:
-    return (home if home is not None else ws_home()) / "logs" / LOG
+    return (home if home is not None else paths.state_dir()) / "logs" / LOG
 
 
 def _fingerprint(value) -> dict:

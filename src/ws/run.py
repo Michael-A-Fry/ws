@@ -1,12 +1,12 @@
 """`ws run JOB`: every headless job goes through here and leaves one complete record in `runs.jsonl`.
 
-    ws run JOB [--dry-run]         run `$WS_HOME/jobs/JOB.toml`; --dry-run shows what would start and starts nothing
+    ws run JOB [--dry-run]         run `jobs/JOB.toml` in the config folder; --dry-run shows what would start and starts nothing
     ws runs [--last N] [--json]    the last N records (default 10)
 
 The steps: load the job, profile and policy; refuse (exit 3, and still write a record with status "refused") when there
 is no monthly cap, this month's spend is at the cap, the Rule of Two says no, or the runner cannot price the model and
 the job does not say `allow_unpriced = true`; write the runner's gate config into a per-run folder
-`$WS_HOME/runs/<run_id>/gate` (the gate denies the agent writes to `runs/` and `logs/`, so those hold only
+`runs/<run_id>/gate` in the state folder (the gate denies the agent writes to `runs/` and `logs/`, so those hold only
 what ws wrote); lease each secret from the broker (the runner only ever holds a placeholder key and the
 lease's base URL); start the runner with a scrubbed environment, the prompt on stdin and the job's timeout; keep its
 output in files in the run folder (capped); read that into the record; release the leases whatever happened, including a
@@ -23,12 +23,12 @@ ws starts a per-user broker once (or, for a broker it does not own, waits and as
 the record's `recovered` list as {kind, action, ok}; if the failure comes back, the run ends as an error and says so.
 The job may also declare `green`, what its verification covers; the record carries it.
 
-A job with no `cwd` runs in a fresh empty folder, `$XDG_STATE_HOME/ws/work/<run_id>` (default `~/.local/state/...`).
-It is outside `$WS_HOME` on purpose: the wall makes `$WS_HOME` read-only, so a folder there could not be written to.
-Each folder on the way is made private (0700) and checked before use: not a link, ours, and not writable by anyone
-else, so another user cannot plant one to steer the run. `ws uninstall` removes the empty run folders there and then
-the empty `work/` and `ws/` folders; a run folder that holds anything stays, and so does everything above it, because
-what a job wrote is the person's.
+A job with no `cwd` runs in a fresh empty folder, `$XDG_STATE_HOME/ws-work/<run_id>` (default `~/.local/state/...`).
+It is beside ws's folders and not in one on purpose: the wall makes those read-only, so a folder there could not be
+written to. The `ws-work` folder is made private (0700) and checked before use: not a link, ours, and not writable by
+anyone else, so another user cannot plant one to steer the run. `ws uninstall` removes the empty run folders there and
+then `ws-work` once it is empty; a run folder that holds anything stays, and so does everything above it, because what a
+job wrote is the person's.
 
 Exit: 0 ok, 1 the runner failed or timed out, 2 the job could not be read (a record is written when the job name is
 safe), 3 refused.
@@ -52,10 +52,10 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-from ws import __version__, adapters, broker, gate, jobs, jsonl, output, policy, runrecord, selfcmd
+from ws import __version__, adapters, broker, gate, jobs, jsonl, output, paths, policy, runrecord, selfcmd
 from ws import secrets as wsecrets
 from ws.output import WsError
-from ws.profile import ProfileError, load, profile_path, ws_home
+from ws.profile import ProfileError, load, profile_path
 
 # The only variables the runner inherits from ws. Anything else it needs is set by the adapter or the job file.
 PASS_ENV = ("PATH", "HOME", "LANG", "TZ", "TERM")
@@ -102,11 +102,11 @@ def _budget(prof: dict) -> tuple[float | None, float | None, float | None]:
 def _start_broker(sock: Path) -> bool:
     """Start a per-user broker on `sock` (it clears a stale socket file itself) and wait for it to answer.
 
-    It runs isolated (`selfcmd.argv`), in ws's home and with the runner's scrubbed environment plus WS_HOME, never the
+    It runs isolated (`selfcmd.argv`), in ws's state folder and with the runner's scrubbed environment plus the layout, never the
     project folder's `ws/`. It is left running on purpose, so the next run finds it, in its own session; its stderr goes
     to `logs/broker-start.log`. Started from a systemd oneshot unit (a timer's job), the unit's kill mode ends it with
     the unit; that is fine, the next run starts it again."""
-    home = ws_home().absolute()
+    home = paths.state_dir().absolute()
     try:
         logs = home / "logs"
         logs.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -114,7 +114,7 @@ def _start_broker(sock: Path) -> bool:
         try:
             subprocess.Popen(
                 [*selfcmd.argv(), "broker", "serve", "--socket", str(sock)],
-                env=_child_env(home, {}), cwd=home,
+                env=_child_env({}), cwd=home,
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=err_fd, start_new_session=True,
             )  # fmt: skip
         finally:
@@ -136,7 +136,7 @@ def _mend_broker(sock: Path, err: broker.BrokerUnavailable) -> tuple[str, bool]:
     listening on it), on a socket in this user's own run folder, is one ws may start. Any other trouble (a timeout, no
     permission, a bad reply) or any other socket (the walled service, one the profile names) is not ws's to start, so it
     waits and looks again."""
-    if err.not_running and sock == ws_home().absolute() / "run" / "broker.sock":
+    if err.not_running and sock == paths.state_dir().absolute() / "run" / "broker.sock":
         return "started the broker", _start_broker(sock)
     time.sleep(RECOVERY_WAIT_S)
     try:
@@ -185,31 +185,27 @@ def _short(text: str, leases: list[broker.Lease], n: int = 200) -> str:
     return _redact(" ".join(str(text).split()), leases)[:n]
 
 
-def _child_env(home: Path, extra: dict[str, str]) -> dict[str, str]:
+def _child_env(extra: dict[str, str]) -> dict[str, str]:
     env = {k: os.environ[k] for k in PASS_ENV if k in os.environ}
     env.update(extra)
-    env["WS_HOME"] = str(home)  # last: where the gate hook finds the policy
+    env.update(paths.env_for(os.environ))  # last: where the gate hook finds the policy
     return env
 
 
 def work_root(env: dict[str, str] | None = None) -> Path:
-    """`$XDG_STATE_HOME/ws` (default `~/.local/state/ws`): the only thing ws keeps there, the work folders of jobs with no
-    `cwd`. `ws uninstall` removes the empty run folders in it, and the folder itself once it is empty."""
-    env = os.environ if env is None else env
-    state = env.get("XDG_STATE_HOME")
-    if state and os.path.isabs(state):
-        base = Path(state)
-    else:
-        base = (Path(env["HOME"]) if env.get("HOME") else Path.home()) / ".local" / "state"
-    return base / "ws"
+    """`$XDG_STATE_HOME/ws-work` (default `~/.local/state/ws-work`, `paths.work_dir`): the work folders of jobs with no
+    `cwd`, one per run. `ws uninstall` removes the empty run folders in it, and the folder itself once it is empty."""
+    return paths.work_dir(os.environ if env is None else env)
 
 
 def default_cwd(home: Path, run_id: str, env: dict[str, str] | None = None) -> Path | None:
-    """The folder a job with no `cwd` runs in: `<work root>/work/<run_id>`, never inside `home` (`$WS_HOME`), which the
-    wall makes read-only for the runner. None when the work root would sit inside `home`: `_make_default_cwd` then makes
-    a private folder under the temp dir. Pure: it makes nothing."""
-    folder = work_root(env) / "work" / run_id
-    return None if folder.is_relative_to(home) else folder
+    """The folder a job with no `cwd` runs in: `<work root>/<run_id>`, never inside `home` (ws's state folder) or any
+    other of ws's folders, which the wall makes read-only for the runner. None when the work root would sit inside one
+    (a `XDG_STATE_HOME` set to a ws folder): `_make_default_cwd` then makes a private folder under the temp dir. Pure: it
+    makes nothing."""
+    folder = work_root(env) / run_id
+    held = [home, *paths.roots(os.environ if env is None else env)]
+    return None if any(folder.is_relative_to(r) for r in held) else folder
 
 
 _RUN_FOLDER = re.compile(r"^\d{8}T\d{6}Z-[0-9a-f]{6}$")  # runrecord.new_run_id
@@ -236,16 +232,15 @@ def _check_private(folder: Path, allowed: re.Pattern) -> None:
 
 
 def _make_default_cwd(planned: Path | None) -> Path:
-    """Make the default working folder. Every folder ws owns on the way (`ws`, `ws/work`) is made 0700 if missing and
-    checked either way; the last one must be new (mkdir without exist_ok), so a run never starts in a folder someone
-    else prepared. The state dir above them is the person's own and is only created if missing."""
+    """Make the default working folder. The folder ws owns on the way (`ws-work`) is made 0700 if missing and checked
+    either way; the last one must be new (mkdir without exist_ok), so a run never starts in a folder someone else
+    prepared. The state home above them is the person's own and is only created if missing."""
     if planned is None:
         return Path(tempfile.mkdtemp(prefix="ws-work-"))  # private (0700) and unpredictable
-    planned.parent.parent.parent.mkdir(parents=True, exist_ok=True)
-    for folder, allowed in ((planned.parent.parent, re.compile(r"^work$")), (planned.parent, _RUN_FOLDER)):
-        with contextlib.suppress(FileExistsError):
-            os.mkdir(folder, 0o700)
-        _check_private(folder, allowed)
+    planned.parent.parent.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(FileExistsError):
+        os.mkdir(planned.parent, 0o700)
+    _check_private(planned.parent, _RUN_FOLDER)
     try:
         os.mkdir(planned, 0o700)
     except FileExistsError as e:
@@ -489,7 +484,7 @@ def run_job(args: argparse.Namespace, job: jobs.Job, fields: dict | None = None,
 
 def _run(args: argparse.Namespace, job: jobs.Job | None = None, fields: dict | None = None, hook=None) -> int:
     env = os.environ
-    home = ws_home(env).absolute()
+    home = paths.state_dir(env).absolute()
     log = runrecord.runs_path(env)
     record = not args.dry_run
     if job is None:
@@ -506,7 +501,7 @@ def _run(args: argparse.Namespace, job: jobs.Job | None = None, fields: dict | N
     started = datetime.now(UTC)
     run_id = runrecord.new_run_id(started)
     run_dir = home / "runs" / run_id
-    # no cwd in the job: a fresh empty folder, outside WS_HOME (the wall makes that read-only)
+    # no cwd in the job: a fresh empty folder, outside ws's folders (the wall makes those read-only)
     cwd = Path(job.cwd).expanduser() if job.cwd else default_cwd(home, run_id)
     try:
         argv, extra = adapter.build_command(job, run_dir, _PLAN_LEASE if job.secrets else None)
@@ -532,7 +527,7 @@ def _run(args: argparse.Namespace, job: jobs.Job | None = None, fields: dict | N
     reason = lock_reason or _refusal(prof, verdict, spend, job, adapter)
     rec = _base_record(job, run_id, started, pol, verdict)
     rec.update(fields or {})
-    child_env = _child_env(home, extra)
+    child_env = _child_env(extra)
     if args.dry_run:
         plan = {
             "job": job.name, "runner": job.runner, "argv": argv, "prompt_via": "stdin" if stdin else "argv",
@@ -573,7 +568,7 @@ def _execute(
             leases.append(_lease(s, sock, rec))
             rec["secrets_used"].append({"name": s.name, "host": s.host})
         argv, extra = adapter.build_command(job, run_dir, leases[0] if leases else None)
-        child_env = _child_env(ws_home().absolute(), extra)
+        child_env = _child_env(extra)
         argv[0] = exe
         prompt_file = None
         if stdin:
@@ -677,10 +672,10 @@ def _positive(text: str) -> int:
 def register(sub) -> None:
     r = sub.add_parser(
         "run",
-        help="run a headless job (a file in $WS_HOME/jobs) and record what it did",
+        help="run a headless job (a file in the config folder's jobs/) and record what it did",
         description="Run a headless job. The monthly cap is checked before the run, not enforced during it.",
     )
-    r.add_argument("job", help="the job name: $WS_HOME/jobs/<name>.toml")
+    r.add_argument("job", help="the job name: jobs/<name>.toml in the config folder")
     r.add_argument("--dry-run", action="store_true", help="show what would start, and whether it would be refused")
     r.set_defaults(func=cmd_run)
     s = sub.add_parser("runs", help="show the last records of `ws run`")

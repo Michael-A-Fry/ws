@@ -9,7 +9,7 @@ call returns while the agent still runs; a foreground agent has stopped by the t
 counted. A stop clears the oldest start, because a stop doesn't say which agent it was. A start older than `stale_s`
 seconds (default 1800) is dropped, so an agent whose stop was never seen doesn't hold a slot for ever. Agents started
 together in one message are all checked before any is recorded, so the cap can be passed by that many. The record is
-the session's own, at `$WS_HOME/sessions/ID.spawn-cap.json`, and is advice: the sandbox is the wall.
+the session's own, at `<state>/sessions/ID.spawn-cap.json`, and is advice: the sandbox is the wall.
 
 `max_agents` is optional. When the policy gives none, the limit comes from the machine: the smaller of half the CPUs
 and half the memory in GiB, raised to at least 2 and held to at most 8. The CPUs and memory are those the container or

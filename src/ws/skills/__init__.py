@@ -13,12 +13,12 @@ That includes one a runner reads from another runner's folder (OpenCode reads `~
     ws skills add NAME             put a skill back that you removed (or add one that is not installed yet)
     ws skills adopt NAME [--runner R]
                                    swap your own skill of that name for ws's: yours moves to
-                                   `$WS_HOME/backups/skills/<runner>/<NAME>-<UTC stamp>` and ws installs its own
+                                   `<state>/backups/skills/<runner>/<NAME>-<UTC stamp>` and ws installs its own
     ws skills restore NAME [--runner R]
                                    take ws's copy out and move yours back where it was
 
 A skill ws installed and you then deleted stays deleted: ws takes that as your choice, says so on `ws install`, and
-only `ws skills add NAME` brings it back. Each adoption is recorded in `$WS_HOME/backups/skills/adopted.json`, which
+only `ws skills add NAME` brings it back. Each adoption is recorded in `<state>/backups/skills/adopted.json`, which
 `list` reads to say where your copy is kept; a second adopt of a name is refused while that copy is still unrestored.
 A runner skills folder that is itself a link is a folder like any other, and ws writes its own skills through it; a
 skill entry that is itself a link is yours, and ws leaves it alone. A record that does not read stops `ws skills`, but
@@ -36,7 +36,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from ws import adapters, install, output, profile
+from ws import adapters, install, output, paths
 from ws import globals as ws_globals
 from ws.install import Step
 from ws.output import WsError
@@ -99,7 +99,7 @@ def _ours(path: Path, entries: dict[str, dict]) -> bool:
 
 
 def backups_dir(env) -> Path:
-    return profile.ws_home(dict(env)) / "backups" / "skills"
+    return paths.state_dir(dict(env)) / "backups" / "skills"
 
 
 def _read_adopted(env) -> dict[str, dict]:
@@ -280,7 +280,7 @@ def _move(src: Path, dst: Path) -> None:
             raise WsError(
                 "failed",
                 f"{src} and {dst} are on different filesystems, so ws cannot move it in one step",
-                "put WS_HOME on the same filesystem as the skills folder, or move the folder aside yourself and run "
+                "put ws's state folder (WS_HOME or XDG_STATE_HOME) on the same filesystem as the skills folder, or move the folder aside yourself and run "
                 "`ws install`",
             ) from e
         raise WsError("failed", f"could not move {src} to {dst}: {e.strerror}") from e
@@ -450,7 +450,7 @@ def register(sub) -> None:
     add.add_argument("name", choices=list(SKILLS))
     add.set_defaults(func=cmd_add)
     for verb, func, text in (
-        ("adopt", cmd_adopt, "swap your own skill of this name for ws's; yours is kept in $WS_HOME/backups/skills"),
+        ("adopt", cmd_adopt, "swap your own skill of this name for ws's; yours is kept in <state>/backups/skills"),
         ("restore", cmd_restore, "take ws's copy out and move the skill you adopted from back"),
     ):
         p = ss.add_parser(verb, help=text)

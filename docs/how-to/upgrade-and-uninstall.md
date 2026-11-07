@@ -20,8 +20,8 @@ Move to a newer release, or remove ws and what it installed.
    ws doctor
    ```
 
-3. Bring what ws installed up to date. This rewrites the generated gate files under `$WS_HOME/gate/` from your policy, and
-   reports `0 changes` when nothing differs.
+3. Bring what ws installed up to date. This rewrites the generated gate files under `~/.local/state/ws/gate/` from your
+   policy, and reports `0 changes` when nothing differs.
 
    ```sh
    ws setup --yes
@@ -45,6 +45,44 @@ gets one line about it, once. Start a new session to use the new release.
 ws never updates your AI tool. When `ws doctor` sees that a runner or the default model changed, it runs `ws canary` and
 says so in WS101. A canary makes no paid model call. Run it by hand any time with `ws canary`.
 
+## Move your files to the new folders
+
+Releases before 0.1.8 kept everything in `~/.ws`. Now ws follows the XDG rules: what you write goes in
+`~/.config/ws`, what ws writes as it works in `~/.local/state/ws`, the secrets store and eval tasks in
+`~/.local/share/ws`, and the memory index in `~/.cache/ws`. Nothing moves by itself. While `~/.ws` is there, ws keeps
+using it, and `ws doctor` shows a `WS010` warning.
+
+1. See what would move.
+
+   ```sh
+   ws migrate --dry-run
+   ```
+
+2. Move it.
+
+   ```sh
+   ws migrate
+   ```
+
+   ws copies each file with its mode kept, checks every copy by its hash, writes a list of what moved to
+   `~/.local/state/ws/migrate-manifest.json`, renames `~/.ws` to `~/.ws.migrated-DATE` and refreshes the runner hooks,
+   which name your policy by its path. It deletes nothing: remove `~/.ws.migrated-DATE` yourself when you've looked.
+   If a target already exists and differs from its source, ws stops before changing anything and names it.
+
+3. If you have scheduled jobs, point their timers at the new folders.
+
+   ```sh
+   ws schedule apply
+   ```
+
+4. Check.
+
+   ```sh
+   ws doctor
+   ```
+
+   `WS010` is `ok`. If you set `WS_HOME` yourself, there's nothing to move: ws uses the folder you named.
+
 ## Uninstall
 
 1. See what would be removed. Nothing changes.
@@ -65,7 +103,7 @@ says so in WS101. A canary makes no paid model call. Run it by hand any time wit
    If ws added its entries to your runner's config file, uninstall takes them out again. When nothing else has changed
    that file since ws last wrote it, you get your original bytes back, exactly (or the file goes, if ws made it). When
    you've edited it at any point since the first write, even between two `ws install` runs, only the entries ws
-   recorded come out, your edits stay, and `ws uninstall` says `kept your edits`. If the install record in `$WS_HOME`
+   recorded come out, your edits stay, and `ws uninstall` says `kept your edits`. If the install record in the state folder
    is lost but ws's hooks are still in the file, the next `ws install` records them again, so an undo takes them out and
    keeps the rest of the file.
 
@@ -92,7 +130,7 @@ Every gated call goes through a hook that starts ws. When ws can't start (a move
 blocks the call and says how to get unstuck. In a terminal of your own, either run `ws install --gate launch`, or open
 `~/.claude/settings.json` and delete the PreToolUse group whose command contains `gate check`. The message also names
 where a saved copy of your file is. If ws can't run at all, you can copy that file over your config file instead. It
-sits in `$WS_HOME/backups/` (mode 0600), named `claude-code-user-config-<time>.json`. `ws doctor` reports the same
+sits in `~/.local/state/ws/backups/` (mode 0600), named `claude-code-user-config-<time>.json`. `ws doctor` reports the same
 state as WS008.
 
 `ws install` refuses to put the hook in your config when the Python that runs the hook sits in a project's `.venv`, under
@@ -105,6 +143,6 @@ state as WS008.
 - The work folders of jobs with no `cwd`, under `$XDG_STATE_HOME/ws` (default `~/.local/state/ws`). ws removes the
   empty run folders there, then `work/` and `ws/` once they're empty. A run folder that holds a file stays, with the
   folders above it, because what a job wrote is yours.
-- The backup in `$WS_HOME/backups/`, when you'd edited your config file after ws wrote to it. After an exact restore the
-  backup is the same as the file, so ws removes it.
+- The backup in `~/.local/state/ws/backups/`, when you'd edited your config file after ws wrote to it. After an exact
+  restore the backup is the same as the file, so ws removes it.
 - The secret store, if you moved it to its own user with `ws secret wall`. Remove that system user and its folder by hand.

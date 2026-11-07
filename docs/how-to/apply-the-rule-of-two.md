@@ -7,7 +7,7 @@ nothing can carry the data out. To understand the rule first, read [The Rule of 
 ## Before you start
 
 - A policy: `ws gate init` ([Use the gate](use-the-gate.md)).
-- A job file in `$WS_HOME/jobs/` that lists `sources`.
+- A job file in `~/.config/ws/jobs/` that lists `sources`.
 
 ## Steps
 
@@ -65,7 +65,7 @@ nothing can carry the data out. To understand the rule first, read [The Rule of 
 
    ```sh
    ws run triage --dry-run
-   ws gate generate --runner claude-code --out ~/.ws/gate/claude-code
+   ws gate generate --runner claude-code --out ~/.local/state/ws/gate/claude-code
    ```
 
 ## Success

@@ -52,7 +52,7 @@ You see one line per check, each with an ID. For example:
 ```text
 WS001  ok            platform   linux (debian 12, x86_64)
 WS002  ok            python     Python 3.12.3
-WS003  ok            profile    /home/you/.ws/profile.toml
+WS003  ok            profile    /home/you/.config/ws/profile.toml
 ```
 
 Lines marked `unconfigured` list what's still to set up, with a `fix:` line that shows the exact text to add to your
@@ -101,7 +101,7 @@ You see only `exit code: 0`. Nothing was blocked.
 ## 6. Generate the rules for your AI tool
 
 ```sh
-ws gate generate --runner claude-code --out ~/.ws/gate/claude-code
+ws gate generate --runner claude-code --out ~/.local/state/ws/gate/claude-code
 ```
 
 You see `ws: 1 changes to ...` and a line that tells you how to start Claude Code with the generated settings. For
@@ -112,16 +112,16 @@ OpenCode, use `--runner opencode` and another folder. Run the command again and 
 A job file says what to run. Make one, with permissions that only you can use:
 
 ```sh
-mkdir -p ~/.ws/jobs && chmod 700 ~/.ws/jobs
+mkdir -p ~/.config/ws/jobs && chmod 700 ~/.config/ws/jobs
 printf 'runner = "claude-code"\nmodel = "claude-haiku-4-5"\nprompt = "Say hello."\ntimeout_s = 300\nmax_turns = 4\n' \
-  > ~/.ws/jobs/hello.toml
-chmod 600 ~/.ws/jobs/hello.toml
+  > ~/.config/ws/jobs/hello.toml
+chmod 600 ~/.config/ws/jobs/hello.toml
 ws run hello --dry-run
 ```
 
 You see the command ws would start, the environment it would pass, and two lines that matter here:
 `"monthly_cap_usd"` and `"would_refuse"`. Without a cap, `would_refuse` says `no monthly budget cap (WS103)`. Set a
-cap in `~/.ws/profile.toml` as the [budget how-to](../how-to/set-a-budget.md) shows, and run the dry run again:
+cap in `~/.config/ws/profile.toml` as the [budget how-to](../how-to/set-a-budget.md) shows, and run the dry run again:
 `would_refuse` is `null`. ws starts nothing in a dry run.
 
 ## What you have now

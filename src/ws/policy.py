@@ -16,11 +16,11 @@ Known limits of the matcher. It reads command text, so it cannot see:
   * a script that is downloaded and run in two steps (`curl -o a.sh ... && bash a.sh`);
   * a path built entirely by a command, or by a variable set outside the command line (a built part followed by a
     protected path is refused);
-  * the version-control tool restoring a protected tracked file (`git -C ~/.ws checkout policy.toml`);
+  * the version-control tool restoring a protected tracked file (`git -C ~/.config/ws checkout policy.toml`);
   * OpenCode's `patch` tool, which carries no single file path (its native `edit` rules still apply).
 These stay allowed by the matcher. What closes them is the sandbox (ws.sandbox, and the `sandbox` block the
 claude-code adapter writes), which acts on what a process does, not on what its command line says:
-  * closed, for a shell command, the first four lines above: a write to ws's own files (`$WS_HOME`, the policy, the
+  * closed, for a shell command, the first four lines above: a write to ws's own files (its folders, the policy, the
     generated folder) fails read-only whatever program makes it, and a read under a deny_read rule finds an empty folder
     or file. The tested cases are in tests/e2e/test_sandbox.py, on both runners, Linux only (bubblewrap). macOS gets a
     generated sandbox-exec profile, which CI does not run. Also closed and tested (tests/e2e/test_wall_escapes.py): a
@@ -32,7 +32,7 @@ claude-code adapter writes), which acts on what a process does, not on what its 
     loads at start): the config, hook and plugin paths a runner or git reads, and the folders a runner keeps programs
     in, are not writable by a walled run in the places an unwalled one reads them (the project's own source, a
     Makefile or a package script are the person's to review: the project folder is writable on purpose). OpenCode's XDG
-    data and cache folders are private to the wall and to the project (`$WS_HOME/wall/opencode/{data,cache}/NAME-HASH`;
+    data and cache folders are private to the wall and to the project (`<state>/wall/opencode/{data,cache}/NAME-HASH`;
     state is shared, being preferences and prompt history), so a program planted in `~/.cache/opencode` or a plugin's
     `node_modules/.bin` cannot run outside the wall, or in another project's walled session. In the project, `.claude`,
     `.opencode`, `.mcp.json`, `opencode.json(c)`, `tui.json(c)`, and in every git folder the project holds (found with
@@ -47,7 +47,7 @@ claude-code adapter writes), which acts on what a process does, not on what its 
     runner non-dumpable, which closes /proc/PID/mem for it.
     After every walled run the launcher compares the project with how it was and reports, never deleting, a new or
     changed git folder, runner or tool config, or auto-loaded program at any depth (stderr, and
-    `$WS_HOME/logs/wall-report.jsonl`): that covers what the lists cannot name.
+    `<state>/logs/wall-report.jsonl`): that covers what the lists cannot name.
   * still open: a `deny_commands` rule is not enforced inside an interpreter (`python3 -c 'os.system("git push -f")'`
     pushes; only the sandbox's file rules apply to it). Reading is denied only for deny_read paths that exist when the
     runner starts and have no wildcard below their first folder. OpenCode's `patch` tool is not a shell command, so it
@@ -96,8 +96,7 @@ from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
 
-from ws import shellwords
-from ws.profile import ws_home
+from ws import paths, shellwords
 
 SCHEMA = 1
 DIALS = ("prepare", "allowlist", "act")
@@ -254,7 +253,7 @@ outward = []
 [gate]
 deny_commands = {arr(default_deny_commands())}
 # Paths no session may read. `~/` is your home; `**` crosses folders.
-deny_read = ["~/.ssh/**", "~/.gnupg/**", "~/.aws/credentials", "~/.config/ws/secrets/**"]
+deny_read = ["~/.ssh/**", "~/.gnupg/**", "~/.aws/credentials", "~/.config/ws/secrets/**", "~/.local/share/ws/secrets/**"]
 # Neutral tool names to switch off: {", ".join(KNOWN_TOOLS)}. An allowed web tool counts as a way out (leg C).
 deny_tools = []
 # Commands that run only after you approve that exact call, once: the gate refuses the first try and prints an id; in a
@@ -275,7 +274,7 @@ allow_write = []
 #   session-context  at session start, lists which of the files below exist in the project, warns when an API key (not
 #                    the subscription) bills the session, and says once for each ws version what changed
 #   bulk-staging     stops `git add -A`, `git add .` and `git commit -a`, so a commit holds only named files
-#   record-calls     appends each tool call to $WS_HOME/logs/gate-calls.jsonl, for `ws gate replay`
+#   record-calls     appends each tool call to <state>/logs/gate-calls.jsonl, for `ws gate replay`
 #   test-weakening   before a test file is written, denies a skip marker added to an existing test
 #   claims           checks a commit named beside merged, pushed or on the default branch against a ref; with
 #                    release_dir, a release called live must be the one its `current` link points at
@@ -329,47 +328,45 @@ DEPRECATED: dict[str, str] = {}
 
 
 def policy_path(env: dict | None = None) -> Path:
-    return ws_home(env) / "policy.toml"
+    return paths.config_dir(env) / "policy.toml"
 
 
-# What an agent must never rewrite under $WS_HOME: its own policy, profile, secrets, jobs, release, approvals, install
-# manifest, ratings and the run records. (Reading logs/runs.jsonl stays allowed; only writes are denied.) Generated
-# gate folders are added by the caller, since they can sit anywhere.
-CONTROL_NAMES = (
-    "profile.toml",
-    "policy.toml",
-    "secrets.toml",
-    "jobs",
-    "release",
-    "runs",
-    "logs",
-    "sessions",
-    "approvals",
-    "install-manifest.json",
-    "ratings.jsonl",
-)
+# What an agent must never rewrite in ws's folders: its own policy, profile, secrets, jobs, release, approvals, install
+# manifest, ratings and the run records (`ws.paths.CONTROL_NAMES`, each under the folder that keeps it). (Reading
+# logs/runs.jsonl stays allowed; only writes are denied.) Generated gate folders are added by the caller, since they can
+# sit anywhere.
+CONTROL_NAMES = paths.CONTROL_NAMES
 
 
 def secret_read_rules(home: Path | None = None) -> tuple[str, ...]:
-    """deny_read rules for where the secrets store keeps its values: `$WS_HOME/secrets` and, when the profile names
-    another folder (`[roles.secrets] store`), that one too. Each folder is named as written (made absolute) and as the
-    real path it resolves to, so a ws home that is a symlink is covered whichever way a command spells it. They are
-    added to every policy that is read, so a session can't read them whatever its policy file says; the runners' own
-    rules, the sandbox and the hook all see them."""
+    """deny_read rules for where the secrets store keeps its values: `secrets/` in the data folder of the layout in use
+    (every layout ws could use, when that can't be told) and, when the profile names another folder (`[roles.secrets] store`),
+    that one too. With `home`, a policy kept in a folder of its own: that folder's `secrets`, as a single-folder layout.
+    Each folder is named as written (made absolute) and as the real path it resolves to, so a ws folder that is a
+    symlink is covered whichever way a command spells it. They are added to every policy that is read, so a session
+    can't read them whatever its policy file says; the runners' own rules, the sandbox and the hook all see them.
+    Without `home`, each `~/.ws.migrated-*` folder (what `ws migrate` left of the old one) is covered whole too."""
     from ws import secrets  # here, not at the top: it is a command module that imports more than the policy needs
 
-    base = ws_home() if home is None else Path(home).expanduser().absolute()
-    folders = [base / "secrets"]
-    with contextlib.suppress(Exception):  # a profile that does not read leaves the default folder, always covered
-        folders.append(secrets.store_dir({"WS_HOME": str(base)}).expanduser().absolute())
+    if home is None:
+        folders = [*paths.secret_dirs()]
+        with contextlib.suppress(Exception):  # a profile that does not read leaves the default folders, always covered
+            folders.append(secrets.store_dir().expanduser().absolute())
+        with contextlib.suppress(Exception):
+            folders += paths.migrated_dirs()
+    else:
+        base = Path(home).expanduser().absolute()
+        folders = [base / "secrets"]
+        with contextlib.suppress(Exception):
+            folders.append(secrets.store_dir({"WS_HOME": str(base)}).expanduser().absolute())
     spellings = [f for folder in folders for f in (folder, Path(os.path.realpath(folder)))]
     return tuple(dict.fromkeys(f"{f}/**" for f in spellings))
 
 
 def control_paths(home: Path) -> list[str]:
-    """ws's own control files under a ws home, as absolute paths (files and folders alike; a path covers what is
-    under it)."""
-    return [str(Path(home).expanduser().absolute() / n) for n in CONTROL_NAMES]
+    """ws's own control files under a folder that holds them all (a policy kept in a folder of its own), as absolute
+    paths (files and folders alike; a path covers what is under it). For the folders in use, `ws.paths.control_paths`."""
+    return paths.control_paths_in(home)
 
 
 def _table(d, where: str, allowed: set[str]) -> dict:
@@ -511,7 +508,7 @@ def default_policy() -> Policy:
 
 
 def load(path: Path | None = None) -> Policy:
-    """The policy at `path` (default $WS_HOME/policy.toml). No file = the built-in defaults."""
+    """The policy at `path` (default <config>/policy.toml). No file = the built-in defaults."""
     path = path or policy_path()
     if not path.is_file():
         return default_policy()
@@ -526,8 +523,8 @@ def load(path: Path | None = None) -> Policy:
 
 
 def _with_secret_reads(pol: Policy, home: Path) -> Policy:
-    """The policy with the secrets folder of the ws home the file sits in denied too (`loads` covers the one `$WS_HOME`
-    names; a policy kept in another ws home, such as the one a generated hook is told to read, covers its own)."""
+    """The policy with the secrets folder of the ws home the file sits in denied too (`loads` covers the one ws uses; a
+    policy kept in another folder, such as the one a generated hook is told to read, covers its own)."""
     extra = tuple(r for r in secret_read_rules(home) if r not in pol.gate.deny_read)
     return replace(pol, gate=replace(pol.gate, deny_read=(*pol.gate.deny_read, *extra))) if extra else pol
 
@@ -647,10 +644,33 @@ def _cwd() -> str:
         return "/"
 
 
+_LAYOUT_VARS = (
+    "HOME",
+    "WS_HOME",
+    *paths.ENV_DIRS.values(),
+    "XDG_CONFIG_HOME",
+    "XDG_STATE_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+)
+_WS_NAMES = ("WS_HOME", *paths.ENV_DIRS.values())
+
+
+def _env_key() -> tuple[str | None, ...]:
+    """The variables the folders ws uses come from: the cache key for what is worked out from them."""
+    return tuple(os.environ.get(v) for v in _LAYOUT_VARS)
+
+
 @lru_cache(maxsize=8)
-def _base_env(home: str | None, ws: str | None) -> tuple[tuple[str, str], ...]:
-    """`HOME` and `WS_HOME` as a command word sees them, made once for the environment they come from."""
-    return (("HOME", _home().rstrip("/") or "/"), ("WS_HOME", str(ws_home())))
+def _base_env(key: tuple[str | None, ...]) -> tuple[tuple[str, str], ...]:
+    """`HOME`, `WS_HOME` and the four `WS_*_DIR` names as a command word sees them, made once for the environment they
+    come from (`key`, from `_env_key`). `WS_HOME` is the one folder of a single-folder layout, else the config folder."""
+    lay = paths.layout()
+    return (
+        ("HOME", _home().rstrip("/") or "/"),
+        ("WS_HOME", str(lay.config)),
+        *((var, str(lay.dir(kind))) for kind, var in paths.ENV_DIRS.items()),
+    )
 
 
 def _env(known: dict[str, str] | None = None, cwd: str = "", oldpwd: str = "") -> dict[str, str]:
@@ -659,11 +679,12 @@ def _env(known: dict[str, str] | None = None, cwd: str = "", oldpwd: str = "") -
     where = {"PWD": cwd} if cwd else {}
     if oldpwd:
         where["OLDPWD"] = oldpwd
-    return {**dict(_base_env(os.environ.get("HOME"), os.environ.get("WS_HOME"))), **where, **(known or {})}
+    return {**dict(_base_env(_env_key())), **where, **(known or {})}
 
 
 def _expand(path: str) -> str:
-    """~, ~user, $HOME, ${HOME}, $WS_HOME and ${WS_HOME} to a real prefix: a path as a rule or a tool writes it."""
+    """~, ~user, $HOME, ${HOME}, $WS_HOME, $WS_STATE_DIR (and the other ws names, with or without braces) to a real prefix: a
+    path as a rule or a tool writes it."""
     return shellwords.expand_path(path, _env()) if path[:1] in ("~", "$") else path
 
 
@@ -709,7 +730,7 @@ def _canon_path(tok: str) -> str:
 
 
 def _is_pathlike(tok: str) -> bool:
-    return tok.startswith(("/", "~", "$HOME", "${HOME}", "$WS_HOME", "${WS_HOME}"))
+    return tok.startswith(("/", "~", "$HOME", "${HOME}", *(p for n in _WS_NAMES for p in (f"${n}", f"${{{n}}}"))))
 
 
 def _merge_flags(tokens: list[str]) -> list[str]:
@@ -874,7 +895,7 @@ def _segments_reach(glob: list[str], root: list[str]) -> bool:
 
 
 def _glob_reaches(policy: Policy, token_abs: str) -> str | None:
-    """Could this glob (`~/.s*/id_rsa`, `~/.ws/secret?/KEY`) name something a deny_read rule covers? It does when,
+    """Could this glob (`~/.s*/id_rsa`, `~/.config/ws/secret?/KEY`) name something a deny_read rule covers? It does when,
     segment by segment over the rule's folder, each of the glob's segments can match the rule's."""
     glob = [g for g in token_abs.split("/") if g]
     for rule in policy.gate.deny_read:
@@ -887,13 +908,15 @@ def _glob_reaches(policy: Policy, token_abs: str) -> str | None:
 
 
 @lru_cache(maxsize=16)
-def _rules(deny_read: tuple[str, ...], home: str, ws: str) -> tuple[tuple[str, re.Pattern, str | None], ...]:
-    """Each deny_read rule with its pattern and root, made once for a home and ws home (`home` and `ws` are only the
-    cache key: the expansion reads the same environment)."""
+def _rules(
+    deny_read: tuple[str, ...], home: str, env_key: tuple[str | None, ...]
+) -> tuple[tuple[str, re.Pattern, str | None], ...]:
+    """Each deny_read rule with its pattern and root, made once for a home and the ws folders (`home` and `env_key` are only
+    the cache key: the expansion reads the same environment)."""
     return tuple((rule, _path_regex(rule), _rule_root(rule)) for rule in deny_read)
 
 
-_KNOWN_NAMES = ("HOME", "WS_HOME", "PWD", "OLDPWD")
+_KNOWN_NAMES = ("HOME", *_WS_NAMES, "PWD", "OLDPWD")
 _UNSET = re.compile(r"\$(?:\{[^}]*\}|\([^)]*\)|[A-Za-z_][A-Za-z0-9_]*)|`[^`]*`")
 
 
@@ -934,7 +957,7 @@ def _read_hit(
             forms.add(os.path.realpath(p))  # a symlink into a denied folder is still that folder
         except OSError:
             pass
-    for rule, rx, root in _rules(policy.gate.deny_read, _home(), os.environ.get("WS_HOME", "")):
+    for rule, rx, root in _rules(policy.gate.deny_read, _home(), _env_key()):
         for f in forms:
             if rx.match(f):
                 return rule
@@ -1187,7 +1210,7 @@ def _targets(toks: list[str]) -> set[str]:
 def _distrust(ctx: _Ctx, folders: bool) -> None:
     """After a command that can set any variable, no value the reader holds is known; with `folders`, the home and
     working folders aren't either (eval text can set them; a sourced file is trusted to leave them)."""
-    gone = set(ctx.vars or {}) | set(ctx.loops or {}) | ({"HOME", "PWD", "OLDPWD", "WS_HOME"} if folders else set())
+    gone = set(ctx.vars or {}) | set(ctx.loops or {}) | ({"HOME", "PWD", "OLDPWD", *_WS_NAMES} if folders else set())
     ctx.unknown = ctx.unknown | gone
     ctx.vars, ctx.loops, ctx.distrust = {}, {}, True
 
@@ -1200,7 +1223,7 @@ def _segment_once(
         _env({**(ctx.vars or {}), **loop_vars}, ctx.cwd, ctx.oldpwd),
         ctx.unknown - set(loop_vars),
         ctx.distrust,
-        keep={"HOME", "PWD", "OLDPWD", "WS_HOME"} - ctx.unknown,
+        keep={"HOME", "PWD", "OLDPWD", *_WS_NAMES} - ctx.unknown,
     )
     lexed = shellwords.lex(seg, env, ctx.budget)
     words, redirs = lexed.words, lexed.redirs

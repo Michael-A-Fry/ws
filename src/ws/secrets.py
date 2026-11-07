@@ -1,6 +1,6 @@
 """The secrets registry and store, and `ws secret`.
 
-The registry (`$WS_HOME/secrets.toml`) is not secret. It says which names exist and where each may be used:
+The registry (`secrets.toml` in the config folder) is not secret. It says which names exist and where each may be used:
 
     [anthropic]
     hosts = ["api.anthropic.com"]
@@ -27,9 +27,9 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ws import osinfo, output
+from ws import osinfo, output, paths
 from ws.output import WsError
-from ws.profile import ProfileError, load, profile_path, ws_home
+from ws.profile import ProfileError, load, profile_path
 
 NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
 HOST_RE = re.compile(r"^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?(:[0-9]{1,5})?$")
@@ -58,7 +58,7 @@ class Entry:
 
 
 def registry_path(env: dict | None = None) -> Path:
-    return ws_home(env) / "secrets.toml"
+    return paths.config_dir(env) / "secrets.toml"
 
 
 def _profile_secrets(env: dict | None) -> dict:
@@ -72,22 +72,22 @@ def _profile_secrets(env: dict | None) -> dict:
 
 
 def store_dir(env: dict | None = None, cfg: dict | None = None) -> Path:
-    """`[roles.secrets] store` in the profile (or the `cfg` already read from it), else `$WS_HOME/secrets`."""
+    """`[roles.secrets] store` in the profile (or the `cfg` already read from it), else `secrets/` in the data folder."""
     s = (_profile_secrets(env) if cfg is None else cfg).get("store")
     if isinstance(s, str) and s:
         return Path(s).expanduser()
-    return ws_home(env) / "secrets"
+    return paths.data_dir(env) / "secrets"
 
 
 def socket_path(env: dict | None = None, cfg: dict | None = None) -> Path:
-    """The broker socket a client uses: $WS_BROKER_SOCKET, else `[roles.secrets] socket`, else `$WS_HOME/run/broker.sock`."""
+    """The broker socket a client uses: $WS_BROKER_SOCKET, else `[roles.secrets] socket`, else `run/broker.sock` in the state folder."""
     env = os.environ if env is None else env
     if env.get("WS_BROKER_SOCKET"):
         return Path(env["WS_BROKER_SOCKET"]).expanduser()
     s = (_profile_secrets(env) if cfg is None else cfg).get("socket")
     if isinstance(s, str) and s:
         return Path(s).expanduser()
-    return ws_home(env) / "run" / "broker.sock"
+    return paths.state_dir(env) / "run" / "broker.sock"
 
 
 def load_registry(path: Path) -> dict[str, Entry]:

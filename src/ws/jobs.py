@@ -1,4 +1,4 @@
-"""Job files: `$WS_HOME/jobs/<name>.toml`, one headless job each, run with `ws run <name>`.
+"""Job files: `jobs/<name>.toml` in ws's config folder, one headless job each, run with `ws run <name>`.
 
     runner = "claude-code"              adapter name (see `ws gate generate --help`)
     model = "claude-haiku-4-5"          the smallest model that passes
@@ -37,8 +37,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ws import adapters
-from ws.profile import ws_home
+from ws import adapters, paths
 from ws.secrets import HOST_RE, NAME_RE
 
 NAME = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -122,7 +121,7 @@ class Scheduled:
 
 
 def jobs_dir(env: dict | None = None) -> Path:
-    return ws_home(env) / "jobs"
+    return paths.config_dir(env) / "jobs"
 
 
 def _string(d: dict, key: str, where: str, required: bool = False) -> str | None:

@@ -30,10 +30,11 @@ The code is `src/ws/approvals.py`, with `src/ws/gate.py` calling it.
 - **Tamper checks.** A granted record whose fields no longer hash to its id, whose timestamps are out of order or in the
   future, or that's unreadable, is refused and removed. The call goes back to asking.
 
-Records live in `$WS_HOME/approvals/pending/` (written by the gate) and `$WS_HOME/approvals/granted/` (written only by
-`ws approve`). Both are ws control paths, so a session can't write them with its own tools. Inside the OpenCode wall
-the hook can't consume a grant, because `granted/` is read-only there. The launcher keeps a socket pair outside the
-wall and hands the runner one end. The shim claims the grant through it, and the launcher consumes the record.
+Records live in `~/.local/state/ws/approvals/pending/` (written by the gate) and `~/.local/state/ws/approvals/granted/`
+(written only by `ws approve`). Both are ws control paths, so a session can't write them with its own tools. Inside the
+OpenCode wall the hook can't consume a grant, because `granted/` is read-only there. The launcher keeps a socket pair
+outside the wall and hands the runner one end. The shim claims the grant through it, and the launcher consumes the
+record.
 
 A command that matches both `ask_commands` and `deny_commands` stays denied.
 

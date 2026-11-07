@@ -173,7 +173,7 @@ def test_a_run_leaves_one_complete_record(ws, capsys, tmp_path):
     assert rec["session_id"] and rec["duration_api_ms"] == 82 and rec["duration_ms"] >= 0
     assert rec["secrets_used"] == [{"name": "anthropic", "host": "api.anthropic.com"}]
     assert rec["policy"] == {"dial": "prepare", "rule_of_two": "ok"}
-    assert rec["cwd"] == str(tmp_path / "userhome" / ".local" / "state" / "ws" / "work" / rec["run_id"])
+    assert rec["cwd"] == str(tmp_path / "userhome" / ".local" / "state" / "ws-work" / rec["run_id"])
     assert stat.S_IMODE(ws.log.stat().st_mode) == 0o600
     assert ws.leases.requested == [("anthropic", "run", "api.anthropic.com")]
     assert ws.leases.released == ["lease1"]
@@ -668,14 +668,14 @@ def test_the_default_cwd_is_outside_ws_home_so_the_wall_leaves_it_writable(ws, t
     state = tmp_path / "state with space"
     monkeypatch.setenv("XDG_STATE_HOME", str(state))
     assert cli.main(["run", "daily"]) == 0
-    assert Path(ws.records()[1]["cwd"]) == state / "ws" / "work" / ws.records()[1]["run_id"]
+    assert Path(ws.records()[1]["cwd"]) == state / "ws-work" / ws.records()[1]["run_id"]
 
 
-def test_a_ws_home_that_holds_the_state_folder_gets_a_private_unpredictable_temp_folder(tmp_path, monkeypatch):
+def test_a_ws_home_that_holds_the_work_folder_gets_a_private_unpredictable_temp_folder(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "h"))
     monkeypatch.delenv("XDG_STATE_HOME", raising=False)
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
-    home = tmp_path / "h" / ".local" / "state" / "ws"
+    home = tmp_path / "h" / ".local" / "state"
     assert run.default_cwd(home, "r1") is None  # pure: it plans, it makes nothing
     a, b = run._make_default_cwd(None), run._make_default_cwd(None)
     assert a != b and a.parent == tmp_path and a.name.startswith("ws-work-") and a.name != "ws-work-"
@@ -683,13 +683,13 @@ def test_a_ws_home_that_holds_the_state_folder_gets_a_private_unpredictable_temp
 
 
 def planned(tmp_path: Path) -> Path:
-    return tmp_path / "state" / "ws" / "work" / "20261031T120000Z-aaaaaa"
+    return tmp_path / "state" / "ws-work" / "20261031T120000Z-aaaaaa"
 
 
 def test_the_default_cwd_is_made_with_private_parents_and_must_be_new(tmp_path):
     leaf = run._make_default_cwd(planned(tmp_path))
     assert leaf.is_dir()
-    for folder in (leaf, leaf.parent, leaf.parent.parent):
+    for folder in (leaf, leaf.parent):
         assert stat.S_IMODE(folder.stat().st_mode) == 0o700
     with pytest.raises(WsError) as e:  # a folder someone prepared under that name is never reused
         run._make_default_cwd(leaf)
@@ -700,7 +700,7 @@ def test_a_symlinked_parent_of_the_default_cwd_is_refused(tmp_path):
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
     (tmp_path / "state").mkdir()
-    (tmp_path / "state" / "ws").symlink_to(elsewhere)
+    (tmp_path / "state" / "ws-work").symlink_to(elsewhere)
     with pytest.raises(WsError) as e:
         run._make_default_cwd(planned(tmp_path))
     assert e.value.kind == "unsafe_folder"
@@ -725,13 +725,11 @@ def test_a_parent_owned_by_someone_else_or_open_to_others_is_refused(tmp_path, m
         run._make_default_cwd(other)
 
 
-@pytest.mark.parametrize("where", ["ws", "work"])
 @pytest.mark.parametrize("planted", ["AGENTS.md", "CLAUDE.md", "not-a-run-folder"])
-def test_anything_but_run_folders_in_ws_or_work_is_refused(tmp_path, where, planted):
+def test_anything_but_run_folders_in_the_work_folder_is_refused(tmp_path, planted):
     """A file another process of the same user plants there (an AGENTS.md the runner would read) stops the run."""
     leaf = run._make_default_cwd(planned(tmp_path))
-    folder = leaf.parent if where == "work" else leaf.parent.parent
-    (folder / planted).write_text("obey me", encoding="utf-8")
+    (leaf.parent / planted).write_text("obey me", encoding="utf-8")
     with pytest.raises(WsError) as e:
         run._make_default_cwd(planned(tmp_path).with_name("20261031T120002Z-cccccc"))
     assert e.value.kind == "unsafe_folder" and planted in e.value.message
@@ -747,7 +745,7 @@ def test_a_planted_folder_or_link_with_a_run_shaped_name_only_counts_if_it_is_a_
 def test_a_run_whose_work_folder_parent_is_a_link_ends_as_an_error_record(ws, tmp_path):
     state = tmp_path / "userhome" / ".local" / "state"
     state.mkdir(parents=True)
-    (state / "ws").symlink_to(tmp_path)
+    (state / "ws-work").symlink_to(tmp_path)
     ws.job()
     assert cli.main(["run", "daily"]) == 1
     (rec,) = ws.records()

@@ -1,7 +1,7 @@
 """`ws canary`: a few small checks that a runner's update did not break what ws relies on. No model is called, so it
 costs nothing.
 
-    ws canary [--runner R] [--json]     run the checks; one line goes to `$WS_HOME/logs/canary.jsonl`; exit 1 if any fail
+    ws canary [--runner R] [--json]     run the checks; one line goes to `logs/canary.jsonl` in the state folder; exit 1 if any fail
 
 Per runner:
   version      `<runner> --version` runs
@@ -10,7 +10,7 @@ Per runner:
   hook_config  the config ws generates for the runner parses and still holds the hook
   run_record   a run record still validates against `runschema` (stdlib check, so no extra dependency)
 
-`ws doctor` records the last version it saw of each runner, and the default model id, in `$WS_HOME/versions.json`.
+`ws doctor` records the last version it saw of each runner, and the default model id, in `versions.json` in the state folder.
 When one changes it says so in WS101 and runs this (or, with --offline, points here). A change is remembered only when
 a canary passes, whether doctor or `ws canary` ran it, so the note stays until then. ws never forces an update: people
 update when they update, and this is how ws finds out whether it still works after they did.
@@ -28,7 +28,7 @@ import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
-from ws import __version__, adapters, gate, jsonl, output, policy, runrecord, selfcmd
+from ws import __version__, adapters, gate, jsonl, output, paths, policy, runrecord, selfcmd
 from ws.output import WsError
 from ws.profile import ProfileError, load, profile_path
 
@@ -46,11 +46,11 @@ PAYLOADS = {
 
 
 def _home(env) -> Path | None:
-    """ws's home as `env` says it, or None if env names neither WS_HOME nor HOME (a bare test environment): nothing is
-    written then, so a check run with an empty environment never lands in the real home."""
-    if env.get("WS_HOME"):
-        return Path(env["WS_HOME"]).expanduser()
-    return Path(env["HOME"]) / ".ws" if env.get("HOME") else None
+    """ws's state folder as `env` says it, or None if env names no layout and no HOME (a bare test environment): nothing
+    is written then, so a check run with an empty environment never lands in the real home."""
+    if not (env.get("HOME") or env.get("WS_HOME") or env.get(paths.ENV_DIRS["state"])):
+        return None
+    return paths.state_dir(env)
 
 
 # ---- versions.json -----------------------------------------------------------------------------------------------------
@@ -71,8 +71,8 @@ def _read_versions(path: Path) -> dict:
 
 def observe(env, runner: str, version: str | None, model: str | None, record: bool = True) -> list[str]:
     """What changed since the last sighting, as short phrases ("claude-code 2.1.0, was 2.0.9"), and (unless record is
-    False) remember what is seen now. The first sighting is not a change. Nothing is read or kept unless ws's home
-    already exists: doctor does not make it."""
+    False) remember what is seen now. The first sighting is not a change. Nothing is read or kept unless ws's state
+    folder already exists: doctor does not make it."""
     path = versions_path(env)
     if path is None or not path.parent.is_dir():
         return []
@@ -114,7 +114,7 @@ def _replace(path: Path, text: str) -> None:
 
 def log_path(home: Path) -> Path:
     """The canary log. It sits under `logs/`, which the gate denies a session: a canary line a session could write
-    would let it fake a passing canary. The log used to be `$WS_HOME/canary.jsonl`, a place a session can write, so
+    would let it fake a passing canary. The log used to be `canary.jsonl` at the top of the state folder, a place a session can write, so
     nothing in it is trusted: it is renamed to `canary.jsonl.old` (kept for a look) and the new log starts empty."""
     old = home / "canary.jsonl"
     if os.path.lexists(old):
@@ -289,7 +289,7 @@ def canary_runner(runner: str, env, work: Path) -> dict:
 
 
 def run_canary(runners: list[str], env=None, model: str | None = None) -> dict:
-    """Run the checks for each runner and append one line to logs/canary.jsonl (when ws's home exists). A runner that passes
+    """Run the checks for each runner and append one line to logs/canary.jsonl (when ws's state folder exists). A runner that passes
     has its version (and the default model) remembered in versions.json, so a change is reported until a canary passes.
     Returns the line."""
     env = os.environ if env is None else env
@@ -375,7 +375,7 @@ def register(sub) -> None:
     c = sub.add_parser(
         "canary",
         help="check a runner still works with ws after an update (no model is called)",
-        description="Small checks, no paid model. Each run adds one line to $WS_HOME/logs/canary.jsonl. Exit 1 on a failure.",
+        description="Small checks, no paid model. Each run adds one line to logs/canary.jsonl in the state folder. Exit 1 on a failure.",
     )
     c.add_argument("--runner", choices=list(adapters.all_adapters()), help="default: the profile's runner")
     c.set_defaults(func=cmd_canary)

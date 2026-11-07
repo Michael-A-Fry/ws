@@ -23,8 +23,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-from ws import __version__, jsonl
-from ws.profile import ws_home
+from ws import __version__, jsonl, paths
 
 _SAFE_ID = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 _RELEASE = re.compile(r"^[A-Za-z0-9._+-]{1,64}$")  # a release string is printed into the model's context: keep it plain
@@ -37,11 +36,13 @@ SCHEMA_VERSION = 1  # the `schema` of a session record in sessions/<id>.json
 
 def _marker(env: dict) -> str:
     """A release marker if one is configured: $WS_RELEASE (the id itself), or a path in $WS_RELEASE_FILE, or
-    $WS_HOME/release. A path may be a file holding the id, or a folder (or link to one) named by the id, which is how
+    `release` in ws's config folder. A path may be a file holding the id, or a folder (or link to one) named by the id, which is how
     older ws lays out ~/.ws-release/<id>."""
     if env.get("WS_RELEASE", "").strip():
         return _plain(env["WS_RELEASE"].strip())
-    path = Path(env["WS_RELEASE_FILE"]).expanduser() if env.get("WS_RELEASE_FILE") else ws_home(env) / "release"
+    path = (
+        Path(env["WS_RELEASE_FILE"]).expanduser() if env.get("WS_RELEASE_FILE") else paths.config_dir(env) / "release"
+    )
     try:
         if path.is_dir():
             return _plain(path.resolve().name)
@@ -87,7 +88,7 @@ def safe_id(session_id: str) -> str:
 
 
 def _record_path(env: dict, session_id: str) -> Path:
-    return ws_home(env) / "sessions" / f"{safe_id(session_id)}.json"
+    return paths.state_dir(env) / "sessions" / f"{safe_id(session_id)}.json"
 
 
 def _write(path: Path, record: dict) -> None:

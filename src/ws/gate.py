@@ -34,13 +34,12 @@ from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from ws import adapters, approvals, guards, output, policy, sandbox, shellwords
+from ws import adapters, approvals, guards, output, paths, policy, sandbox, shellwords
 
 if TYPE_CHECKING:
     from ws import gatecorpus
 from ws.adapters import Call
 from ws.output import WsError
-from ws.profile import ws_home
 
 DENY = 2
 CLAIM = 4
@@ -214,11 +213,13 @@ def _policy_arg(args: argparse.Namespace) -> Path | None:
 
 
 def _protect(policy_file: Path, extra: list[str] | None = None) -> tuple[str, ...]:
-    """ws's own files: the policy it reads, the control files beside it, and what generate wrote (--protect)."""
+    """ws's own files: the policy it reads, the control files beside it, every folder ws keeps its files in (in each layout
+    it could use) and what generate wrote (--protect)."""
     return (
         str(policy_file),
-        *policy.control_paths(policy_file.parent),
-        *policy.control_paths(ws_home()),
+        *paths.control_paths_in(policy_file.parent),
+        *paths.control_paths(),
+        *map(str, paths.protected_roots()),
         *(str(Path(p).expanduser().absolute()) for p in extra or []),
     )
 
@@ -232,7 +233,7 @@ def cmd_check(args: argparse.Namespace) -> int:
             sys.stdin.read(),
             policy.load(policy_file),
             _protect(policy_file, args.protect),
-            approvals.approvals_dir(),  # $WS_HOME, whatever --policy says: ws approve and ws gate launch use it too
+            approvals.approvals_dir(),  # ws's state folder, whatever --policy says: ws approve and ws gate launch use it too
             consume=approvals.FD_ENV not in os.environ,
             notes=notes,
         )
@@ -322,11 +323,13 @@ def replay(runner: str, lines: list[str], pol: policy.Policy, protect: tuple[str
 
 @contextlib.contextmanager
 def _scratch_home(home: Path):
-    """HOME, USERPROFILE and WS_HOME point into `home` for the block, so `~` and `$HOME` in a corpus name the scratch
+    """HOME, USERPROFILE and WS_HOME (one folder, `home/.ws`) point into `home` for the block, so `~` and `$HOME` in a corpus name the scratch
     folder and not the person's own."""
     keys = ("HOME", "USERPROFILE", "WS_HOME")
     saved = {k: os.environ.get(k) for k in keys}
-    os.environ.update({"HOME": str(home), "USERPROFILE": str(home), "WS_HOME": str(home / ".ws")})
+    os.environ.update(
+        {"HOME": str(home), "USERPROFILE": str(home), "WS_HOME": str(paths.legacy_dir({"HOME": str(home)}))}
+    )
     try:
         yield
     finally:
@@ -355,7 +358,7 @@ def replay_corpus(runner: str, rows: list[gatecorpus.Row], policy_file: Path | N
                 pol = policy.load(policy_file) if policy_file else policy.default_policy()
             except policy.PolicyError as e:
                 raise WsError("bad_config", str(e), f"fix {policy_file}, or write the default policy") from e
-            protect = _protect(policy_file or home / ".ws" / "policy.toml")
+            protect = _protect(policy_file or paths.config_dir() / "policy.toml")
             for n, row in enumerate(rows):
                 payload = gatecorpus.render(row, runner, str(home), str(cwd))
                 if payload is None:
@@ -544,7 +547,7 @@ def register(sub) -> None:
     names = list(adapters.all_adapters())
 
     def common(p: argparse.ArgumentParser, runner: bool = True) -> None:
-        p.add_argument("--policy", metavar="FILE", help="policy file (default $WS_HOME/policy.toml)")
+        p.add_argument("--policy", metavar="FILE", help="policy file (default: policy.toml in the config folder)")
         if runner:
             p.add_argument("--runner", required=True, choices=names)
 

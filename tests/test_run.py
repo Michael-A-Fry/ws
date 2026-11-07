@@ -6,7 +6,6 @@ The broker is faked at its client functions; tests/e2e/test_run_record.py runs t
 
 from __future__ import annotations
 
-import _thread
 import json
 import os
 import shutil
@@ -1104,7 +1103,10 @@ def test_ctrl_c_kills_the_runner_writes_the_record_and_releases_the_lease(ws, ca
 
     def interrupt():
         wait_for(ws.home / "fake-saw.json")
-        _thread.interrupt_main()
+        # A real SIGINT, as Ctrl-C sends: `_thread.interrupt_main()` only flags the main thread, which can't break a
+        # wait already blocked in the kernel (on newer Pythons `Popen.wait(timeout)` blocks there), so the test lost
+        # the interrupt under load and ran to the 60 s timeout.
+        os.kill(os.getpid(), signal.SIGINT)
 
     threading.Thread(target=interrupt, daemon=True).start()
     with pytest.raises(KeyboardInterrupt):

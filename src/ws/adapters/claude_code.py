@@ -53,9 +53,16 @@ session going: those hooks add context and findings, and the session carries on 
 
 Notification and Stop also run `ws notify alert --runner claude-code || true`, the phone alert.
 
-`env` also carries WS_SANDBOXED=1, which tells the hook this session has the sandbox block above. `preflight` runs for
-every session except one whose settings set WS_SANDBOXED=0, the marker of a settings file written without the sandbox
-block; settings written before the marker existed carry the block and no marker, so `preflight` runs for them. The
+The block is on by default, in the settings `ws gate launch` passes and in the ones `ws install` merges into the user's
+own file (ws.userconfig): the policy's `[gate] sandbox = false` is the one switch that leaves it out. `env` then carries
+WS_SANDBOXED=0 and the hook commands carry no `--wall`; otherwise `env` carries WS_SANDBOXED=1, which tells the hook this
+session has the sandbox block above, and the PreToolUse and SessionStart hook commands carry `--wall`. `--wall` is in the
+command (which the session cannot edit), not in the environment (which a project's settings can set): with it, and only
+then, the hook may turn a refusal for a path it cannot read into a logged allow once ws.wallproof has proved the wall for
+that very call (ws.gate, policy.Soften); SessionStart runs the same proof and says in one line whether it passed.
+`preflight` runs for every session except one whose settings set WS_SANDBOXED=0, the marker of a settings file written
+without the sandbox block; settings written before the marker existed carry the block and no marker, so `preflight` runs
+for them. The
 marker can be trusted where it matters: the file `ws gate launch` passes with `--settings` outranks a project's settings,
 so a project cannot set it back. Every hook command carries `--pin`: the home folder and ws's four folders as `ws install`
 resolved them (see ws.paths). The environment, unlike the command, is the project's to set, so the hook uses the pinned
@@ -159,9 +166,12 @@ def _matcher(kinds: set[str], base: tuple[str, ...] = ()) -> str:
     return "|".join(tools)
 
 
-def _event_hook(ws_cmd: list[str], policy_file: Path, pin: paths.Pin, *, may_block: bool = False) -> dict:
-    """A `ws gate event` hook. It ends `|| true` unless it may block (PostToolUse, whose exit 2 reaches the model)."""
-    cmd = shlex.join(event_argv(ws_cmd, NAME, policy_file, pin)) + ("" if may_block else " || true")
+def _event_hook(
+    ws_cmd: list[str], policy_file: Path, pin: paths.Pin, *, may_block: bool = False, wall: bool = False
+) -> dict:
+    """A `ws gate event` hook. It ends `|| true` unless it may block (PostToolUse, whose exit 2 reaches the model).
+    `wall`: the settings switch the sandbox on, and this hook says at session start whether it is proven."""
+    cmd = shlex.join(event_argv(ws_cmd, NAME, policy_file, pin, wall)) + ("" if may_block else " || true")
     return {"type": "command", "command": cmd, "timeout": HOOK_TIMEOUT}
 
 
@@ -274,7 +284,9 @@ def for_project(settings: str, project: str) -> str:
     from ws import sandbox  # here, not at the top: ws.sandbox imports the adapters
 
     conf = json.loads(settings)
-    fs = conf.setdefault("sandbox", {}).setdefault("filesystem", {})
+    if "sandbox" not in conf:  # the policy switched the sandbox off: there is no block to add the project's paths to
+        return json.dumps(conf, indent=2) + "\n"
+    fs = conf["sandbox"].setdefault("filesystem", {})
     fs["denyWrite"] = list(dict.fromkeys([*fs.get("denyWrite", []), *sandbox.claude_denied_paths(project)]))
     return json.dumps(conf, indent=2) + "\n"
 
@@ -306,18 +318,22 @@ def generate(
             ]  # at any depth: a runner started in a sub-folder reads that one
     deny += [_TOOLS[t] for t in policy.gate.deny_tools]
     pin = pin or paths.pin_of()
-    hook = shlex.join(check_argv(ws_cmd, NAME, policy_file, out, protect, pin)) + " || exit 2"
+    wall = policy.gate.sandbox
+    hook = shlex.join(check_argv(ws_cmd, NAME, policy_file, out, protect, pin, wall)) + " || exit 2"
     matcher = _matcher(guards.kinds_for(policy.guards.on, "pre") & set(_EXTRA_PRE_KINDS), tuple(MATCHER.split("|")))
     settings = {
         "permissions": {"deny": list(dict.fromkeys(deny))},
-        "sandbox": sandbox_block(policy, out, policy_file, protect),
-        "env": {ENV_MARKER: "1", SANDBOX_MARKER: "1"},
+        # `sandbox = false` in the policy: no block, and the marker says so (the hook then skips the preflight)
+        **({"sandbox": sandbox_block(policy, out, policy_file, protect)} if wall else {}),
+        "env": {ENV_MARKER: "1", SANDBOX_MARKER: "1" if wall else "0"},
         "hooks": {"PreToolUse": [{"matcher": matcher, "hooks": [{"type": "command", "command": hook}]}]},
     }
     settings["hooks"].update(session_hooks(ws_cmd, pin))
     for name, ev in (("SessionStart", "start"), ("UserPromptSubmit", "prompt")):
-        if guards.wanted(policy.guards.on, ev):
-            settings["hooks"][name][0]["hooks"].append(_event_hook(ws_cmd, policy_file, pin))
+        if guards.wanted(policy.guards.on, ev) or (wall and ev == "start"):
+            settings["hooks"][name][0]["hooks"].append(
+                _event_hook(ws_cmd, policy_file, pin, wall=wall and ev == "start")
+            )
     for name, groups in guard_hooks(policy, ws_cmd, policy_file, pin).items():
         settings["hooks"][name] = groups
     settings["hooks"]["Notification"] = [{"hooks": [alert_hook(ws_cmd, pin)]}]

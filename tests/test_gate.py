@@ -109,7 +109,7 @@ def test_claude_code_settings(home, tmp_path, capsys):
     policy_file = (home / "wshome" / "policy.toml").resolve()
     # absolute paths: the hook reads this policy wherever the runner starts, and protects this folder
     assert hook["hooks"][0]["command"] == (
-        f"uv run ws gate check --runner claude-code --policy {policy_file} --protect {out.resolve()} {pins(home)} "
+        f"uv run ws gate check --runner claude-code --policy {policy_file} --protect {out.resolve()} --wall {pins(home)} "
         "|| exit 2"
     )
     assert f"Edit(/{policy_file})" in deny and f"Edit(/{out.resolve()}/**)" in deny  # a session cannot edit its gate

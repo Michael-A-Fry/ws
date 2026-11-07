@@ -367,8 +367,26 @@ def _claude_ops(files: Mapping[str, str]) -> list[dict]:
     ops += [{"op": "append", "path": ["permissions", "deny"], "value": rule} for rule in deny]
     # WS_GATED_SESSION is left out: here it would also be set in the person's own Claude shell and block `ws approve`
     env = {k: v for k, v in conf.get("env", {}).items() if k != ENV_MARKER}
-    env["WS_SANDBOXED"] = "0"  # this file carries no sandbox block; the hook then skips the project-settings preflight
-    ops += [{"op": "set", "path": ["env", k], "value": v} for k, v in env.items()]
+    ops += [
+        {"op": "set", "path": ["env", k], "value": v} for k, v in env.items()
+    ]  # WS_SANDBOXED: 1, or 0 with no block
+    block = conf.get("sandbox")  # the runner's own sandbox: the wall; the policy's `sandbox = false` leaves it out
+    if isinstance(block, dict):
+        ops += _sandbox_ops(block, ["sandbox"])
+    return ops
+
+
+def _sandbox_ops(node: dict, path: list[str]) -> list[dict]:
+    """The ops for the `sandbox` block: a setting is set (and ws refuses, saying so, when yours differs), a list gets
+    ws's items appended after yours."""
+    ops: list[dict] = []
+    for key, value in node.items():
+        if isinstance(value, dict):
+            ops += _sandbox_ops(value, [*path, key])
+        elif isinstance(value, list):
+            ops += [{"op": "append", "path": [*path, key], "value": v} for v in value]
+        else:
+            ops.append({"op": "set", "path": [*path, key], "value": value})
     return ops
 
 

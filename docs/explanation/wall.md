@@ -44,6 +44,13 @@ After every walled run, the launcher compares the project with how it was and re
 new or changed git folder, runner config, program loaded on its own in a virtual environment or `node_modules`. It reports
 and deletes nothing. The report goes to standard error and to `~/.local/state/ws/logs/wall-report.jsonl`.
 
+In Claude Code the wall is on by default. `ws install` merges Claude Code's own `sandbox` settings into your
+`settings.json` (the same block `ws gate launch` uses), and the gate checks at session start, and again for any
+command it would otherwise refuse for a path it can't read, that the wall holds: the `deny_read` paths read as empty
+and ws's files refuse a write. Where it does, that command is allowed and logged, because the wall, not the reading of
+text, is what keeps the file safe. [`sandbox = false`](../reference/policy.md#gate) under `[gate]` turns the block
+off, and the session is then unsandboxed, with the strict reading on.
+
 The wall fails closed. With no bubblewrap, or with unprivileged user namespaces switched off, `ws gate launch` refuses and
 prints the install line. `--no-sandbox` starts the runner bare and says what that gives up, so skipping the wall is a
 visible choice.

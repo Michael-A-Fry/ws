@@ -19,7 +19,10 @@ Known limits of the matcher. It reads command text, so it cannot see:
   * the version-control tool restoring a protected tracked file (`git -C ~/.config/ws checkout policy.toml`);
   * OpenCode's `patch` tool, which carries no single file path (its native `edit` rules still apply).
 These stay allowed by the matcher. What closes them is the sandbox (ws.sandbox, and the `sandbox` block the
-claude-code adapter writes), which acts on what a process does, not on what its command line says:
+claude-code adapter writes, on by default: `[gate] sandbox = false` leaves it out), which acts on what a process does, not
+on what its command line says. It is the boundary and this matcher is defence in depth: where ws.wallproof has proved the
+sandbox for a call, a refusal for a path word holding a part the reader cannot resolve becomes a logged allow (`Soften`);
+every other refusal stays:
   * closed, for a shell command, the first four lines above: a write to ws's own files (its folders, the policy, the
     generated folder) fails read-only whatever program makes it, and a read under a deny_read rule finds an empty folder
     or file. The tested cases are in tests/e2e/test_sandbox.py, on both runners, Linux only (bubblewrap). macOS gets a
@@ -141,6 +144,7 @@ class Gate:
     ask_commands: tuple[str, ...] = ()  # run only with a single-use approval from a human (ws.approvals)
     allow_hosts: tuple[str, ...] = ()  # empty = the policy says nothing about the network
     allow_write: tuple[str, ...] = ()  # folders besides the project a sandboxed session may write (`~/x` or `/x`)
+    sandbox: bool = True  # the runner's own sandbox is switched on in what ws writes (Claude Code); false = unsandboxed
 
 
 @dataclass(frozen=True)
@@ -169,6 +173,35 @@ class Policy:
     gate: Gate
     exceptions: tuple[RuleException, ...]
     guards: Guards = Guards()
+
+
+@dataclass
+class Soften:
+    """The allow-with-log switch of one `is_denied_command` call, for a session whose sandbox is proven up.
+
+    The reader refuses a path word it cannot resolve (an unknown variable, a command substitution) when some value of it
+    would be a path ws protects. Inside a proven wall that refusal is not the boundary: a protected path is read-only
+    and a hidden one reads empty, whatever program the line starts. So those refusals, and only those, are noted in
+    `pending` (kind and text) and the walk goes on, so a named protected path, a shell launcher, `stdin-is-code`, a ws
+    command or a `deny_commands` rule later in the line still denies. If nothing else denies and `pending` is not empty,
+    `prove()` is asked, at that moment and never remembered: true allows the call and `logged` has the kinds; false
+    reads the line again strictly, so the answer is the one the same call gets with no wall.
+
+    `covered` is the deny_read rules the wall hides (see `wall_rules`). A refusal for a rule outside it (a wildcard in
+    the middle), and a bare word that could be any file while some rule is outside it, stay refusals."""
+
+    prove: Callable[[], bool]
+    covered: frozenset[str] = frozenset()
+    all_covered: bool = False
+    pending: list[tuple[str, str]] = field(default_factory=list)
+    logged: list[str] = field(default_factory=list)
+
+    def can(self, kind: str, rule: str | None = None) -> bool:
+        if kind == "unknown-deny-read":
+            return rule in self.covered
+        if kind == "unknown-bare":
+            return self.all_covered
+        return kind == "unknown-protected-write"
 
 
 @dataclass(frozen=True)
@@ -268,6 +301,11 @@ allow_hosts = []
 # folders, which ws knows). Everything else is read-only inside the wall. Absolute or `~/`, no wildcards. Example:
 # ["~/.npm", "~/.cache/uv"].
 allow_write = []
+# The sandbox is the wall: on by default, it makes ws's own files read-only and hides the deny_read paths from every
+# program a shell command starts. Where the sandbox is proven up at the moment of a call, a command the reader can't fully
+# read (a path built from an unknown variable) is allowed and logged instead of refused. false = no sandbox block in what
+# ws writes, and the strict reading stays on for every call; `ws doctor` says so.
+sandbox = true
 
 # Guards: small named checks that run beside the rules above. `ws gate generate` writes the runner hooks they need.
 #   syntax-check     after an edit, checks the file by its extension (.py, .json, .toml, .sh, .js) and tells the model the
@@ -439,7 +477,7 @@ def loads(text: str) -> Policy:
     g = _table(
         raw.get("gate", {}),
         "[gate]",
-        {"deny_commands", "deny_read", "deny_tools", "ask_commands", "allow_hosts", "allow_write"},
+        {"deny_commands", "deny_read", "deny_tools", "ask_commands", "allow_hosts", "allow_write", "sandbox"},
     )
     deny_read = _strings(g, "deny_read", "[gate] ")
     gate = Gate(
@@ -449,6 +487,7 @@ def loads(text: str) -> Policy:
         _strings(g, "ask_commands", "[gate] "),
         _strings(g, "allow_hosts", "[gate] "),
         _strings(g, "allow_write", "[gate] "),
+        _get(g, "sandbox", bool, "[gate] ", True),
     )
     for h in gate.allow_hosts:
         if not _HOST.match(h):
@@ -670,6 +709,7 @@ class _Ctx:
         False  # here-document bodies are read as commands here; the other reading judges the rest
     )
     arith: bool = False  # the line holds arithmetic, which runs the command substitutions in the text it is given
+    soften: Soften | None = None  # set in a proven wall: an unresolved-part refusal is noted, not returned
 
     def fork(self) -> _Ctx:
         return _Ctx(
@@ -685,6 +725,7 @@ class _Ctx:
             cwd_unknown=self.cwd_unknown,
             bodies_as_commands=self.bodies_as_commands,
             arith=self.arith,
+            soften=self.soften,
         )
 
 
@@ -1715,6 +1756,15 @@ def _protect_hit(items: list, protect: tuple[str, ...], cwd: str, ancestors: boo
     return None
 
 
+def _unknown_kept(ctx: _Ctx, kind: str, text: str, rule: str | None = None) -> str | None:
+    """`text`, the refusal; or, inside a proven wall (ctx.soften) for a kind the wall covers, None with it noted."""
+    soft = ctx.soften
+    if soft is None or not soft.can(kind, rule):
+        return text
+    soft.pending.append((kind, text))
+    return None
+
+
 def _unknown_refusal(
     policy: Policy, ctx: _Ctx, cmd: str, canon, toks, redirs, pieces, dropped, written, env
 ) -> str | None:
@@ -1756,10 +1806,13 @@ def _unknown_refusal(
         items = unknownpath.split(word, known, prod)
         if unknownpath.is_bare(items):
             takes = {"redirect": "a redirect to", "written": f"{cmd} writing to"}.get(how, f"{cmd} the file")
-            return (
+            text = (
                 f"command gives {takes} {word!r}, which ws cannot read: it could be any file, including one ws "
                 f"protects; {HOW_TO_SPELL}"
             )
+            if kept := _unknown_kept(ctx, "unknown-bare", text):
+                return kept
+            continue
         if how == "operand" and cmd in _ADDRESS_CMDS and "@" not in word and _URL.match(word):
             continue  # a scheme ahead of the unresolved part: an address, and not the file a bare word could be
         pattern = _pattern_of(word, ctx, known, prod)
@@ -1773,16 +1826,20 @@ def _unknown_refusal(
             return f"a path word is too long to check ({len(pattern)} characters); {HOW_TO_SPELL}"
         for p, ancestors in written:
             if p == word and (hit := _protect_hit(pattern, ctx.protect, ctx.cwd, ancestors)):
-                return (
+                text = (
                     f"command writes {word!r}, which holds a part ws cannot read, and some value of it would be {hit}, "
                     f"which ws protects; {HOW_TO_SPELL}"
                 )
+                if kept := _unknown_kept(ctx, "unknown-protected-write", text):
+                    return kept
         for rule, alts in deny:
             if unknownpath.reaches(pattern, alts, CASELESS_PATHS):
-                return (
+                text = (
                     f"command names {word!r}, which holds a part ws cannot read, and some value of it would be a path "
                     f"denied by deny_read rule {rule!r}; {HOW_TO_SPELL}"
                 )
+                if kept := _unknown_kept(ctx, "unknown-deny-read", text, rule):
+                    return kept  # a rule the wall does not hide still refuses, whichever rule matched first
     return None
 
 
@@ -2259,32 +2316,41 @@ def _readings(command: str) -> list[str]:
     return [command, command.replace("\\\n", "")] if "\\\n" in command else [command]
 
 
-def _walk_command(policy: Policy, command: str, cwd: str, protect: tuple[str, ...], cands: list[str]) -> str | None:
+def _walk_command(
+    policy: Policy, command: str, cwd: str, protect: tuple[str, ...], cands: list[str], soften: Soften | None = None
+) -> str | None:
     """_walk for a whole command. In the one plain shape shellwords.without_bodies accepts, the bodies are text and the lines
     around them are judged. Any other command is judged with every body read as commands (so a body can't hide
     anything) and then once more with the bodies left out, so a stray quote in a body can't hide the lines after it."""
     data = shellwords.without_bodies(command)
     if data is not None:
-        return _walk(policy, data, _Ctx(cwd, protect), 0, cands)
+        return _walk(policy, data, _Ctx(cwd, protect, soften=soften), 0, cands)
     second = "<<" in command and not shellwords.folds(command)  # the reading that leaves the bodies out
     for text in _readings(command):
-        reason = _walk(policy, text, _Ctx(cwd, protect, bodies_as_commands=second), 0, cands)
+        reason = _walk(policy, text, _Ctx(cwd, protect, bodies_as_commands=second, soften=soften), 0, cands)
         if reason:
             return reason
     if second:
-        return _walk(policy, command, _Ctx(cwd, protect, None, True), 0, cands)
+        return _walk(policy, command, _Ctx(cwd, protect, None, True, soften=soften), 0, cands)
     return None
 
 
 def is_denied_command(
-    policy: Policy, command: str, *, protect: tuple[str, ...] = (), cwd: str | None = None
+    policy: Policy,
+    command: str,
+    *,
+    protect: tuple[str, ...] = (),
+    cwd: str | None = None,
+    soften: Soften | None = None,
 ) -> str | None:
     """None if the command may run, else the reason. Every shell segment is checked (split on ; && || | & newline,
     $(...), backticks, <(...), `bash -c`), after stripping sudo/env/timeout/xargs wrappers and normalising flags,
     paths, git's global options, `cd` and simple `VAR=value`. Also denied: a shell fed its script by a pipe or
     here-document, a path under deny_read (or the folder itself, or a folder above it used recursively, or a glob
     that reaches it), and a write to a `protect` path (ws's own policy and generated gate files). Raises on input
-    it cannot judge: callers treat that as a deny. This is the second layer; see the note above."""
+    it cannot judge: callers treat that as a deny. This is the second layer; see the note above. With `soften` (a
+    session whose sandbox is proven up at this call: see `Soften`) a refusal for a part ws cannot read is an allow, noted
+    in `soften.logged`; every other refusal is unchanged."""
     if not isinstance(command, str):
         raise TypeError("command must be text")
     if len(command) > MAX_COMMAND_CHARS:
@@ -2293,10 +2359,13 @@ def is_denied_command(
             f"{MAX_COMMAND_CHARS:,}); write it to a file with the Write tool and run that file"
         )
     cands: list[str] = []
+    if soften is not None:
+        soften.pending.clear()
+        soften.logged.clear()
     try:
         with shellwords.time_limit():
             shellwords.require_closed(command)
-            reason = _walk_command(policy, command, cwd or _cwd(), tuple(protect), cands)
+            reason = _walk_command(policy, command, cwd or _cwd(), tuple(protect), cands, soften)
     except shellwords.ShellError as e:  # text the reader will not expand: a refusal, with the kind kept in the error
         return e.message
     if reason:
@@ -2305,6 +2374,11 @@ def is_denied_command(
         rx = _glob_regex(_canon_pattern(pat))
         if any(rx.match(c) for c in cands):
             return f"command matches deny_commands rule {pat!r}"
+    if soften is not None and soften.pending:
+        if soften.prove():  # asked now, for this call, and never remembered
+            soften.logged.extend(k for k, _ in soften.pending)
+            return None
+        return is_denied_command(policy, command, protect=protect, cwd=cwd)  # no proof: the strict reading
     return None
 
 
@@ -2337,18 +2411,25 @@ def sandbox_read_paths(policy: Policy) -> list[str]:
     """The deny_read rules a sandbox can enforce by hiding the path: a folder or file, written `~/x` or `/x`, with at
     most a trailing `**` (`~/.ssh/**` -> `~/.ssh`). A rule with any other wildcard is left to the matcher; so is one
     that would hide the whole home or the root, which would end the session rather than guard it."""
-    out = []
-    for rule in policy.gate.deny_read:
-        r = rule
-        for pre in ("${HOME}", "$HOME"):
-            if r == pre or r.startswith(pre + "/"):
-                r = "~" + r[len(pre) :]
-        while r.endswith("/**"):
-            r = r[:-3]
-        if r in ("", "~", "/") or re.search(r"[*?\[]", r) or not r.startswith(("~/", "/")):
-            continue
-        out.append(posixpath.normpath(r))
-    return list(dict.fromkeys(out))
+    return list(dict.fromkeys(w for rule in policy.gate.deny_read if (w := _wall_path(rule))))
+
+
+def _wall_path(rule: str) -> str | None:
+    """The folder or file a sandbox hides for one deny_read rule, or None when the rule is the matcher's alone."""
+    r = rule
+    for pre in ("${HOME}", "$HOME"):
+        if r == pre or r.startswith(pre + "/"):
+            r = "~" + r[len(pre) :]
+    while r.endswith("/**"):
+        r = r[:-3]
+    if r in ("", "~", "/") or re.search(r"[*?\[]", r) or not r.startswith(("~/", "/")):
+        return None
+    return posixpath.normpath(r)
+
+
+def wall_rules(policy: Policy) -> frozenset[str]:
+    """The deny_read rules the wall hides (the rest are the matcher's alone): what a `Soften` may rely on."""
+    return frozenset(r for r in policy.gate.deny_read if _wall_path(r))
 
 
 def is_denied_read(policy: Policy, path: str, *, cwd: str | None = None) -> str | None:

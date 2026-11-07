@@ -50,6 +50,7 @@ the built-in default, which has the list below.
 | `ask_commands` | list of text | `[]` | Command patterns that run only after you approve that exact call. Same globs as `deny_commands`. A command that also matches `deny_commands` stays denied. |
 | `allow_hosts` | list of text | `[]` | Hosts a session's shell may reach, for runners whose sandbox filters the network (Claude Code). Empty means the policy says nothing about the network. |
 | `allow_write` | list of text | `[]` | Folders besides the project that a walled session may write. |
+| `sandbox` | true or false | `true` | Switch on the runner's own sandbox in what ws writes (Claude Code), both for a session started with `ws gate launch` and for one started the usual way once `ws install` has merged the settings into your file. `false` leaves the block out and marks the session unsandboxed: every command is read strictly, and `ws doctor` (WS012) says so. |
 
 Rules:
 
@@ -129,6 +130,54 @@ a replacement that reuses the match (`&`), a case change with a pattern, an arit
 A here-document or here-string is text for whatever reads it. When that's a shell (`bash`, `sh`, `zsh`, `dash`, `ksh`,
 `fish`), `source`, `.`, `eval`, `ssh` or `xargs`, the text runs as code, so the command is refused with the reason
 `stdin-is-code`. Any other body, a commit message included, is read as commands, whatever its quoting.
+
+### The sandbox is the boundary
+
+The sandbox is the boundary, and the static gate is defence in depth. The gate reads the text of a command and refuses
+what it can show is wrong, with a reason a person can act on. The sandbox acts on what a program does, whatever its
+command line says: ws's own files are read-only and the `deny_read` paths read as empty for every program a shell
+command starts. It's on by default (`sandbox = true`), and it's the layer a bypass of the gate meets.
+
+The gate's limits are the kinds of text it can't see into. The first four are the `LIMITS` rows in
+`tests/test_gate_oracle.py`:
+
+- An interpreter, and the program it runs from `-c`, a file or standard input.
+- An `awk` program.
+- A script the line writes and then runs.
+- An option whose value is a command the tool runs (ssh's `ProxyCommand`).
+- A launcher that starts an interpreter. The gate refuses a launcher that starts a shell, but what an interpreter does
+  inside its own program is the same limit as the first.
+
+Only the sandbox closes those, so they're closed only in a session that has one.
+
+### When the sandbox is proven
+
+Where the sandbox is up, a refusal for a path the reader can't resolve isn't what keeps a file safe, so ws can allow the
+command and log it instead. It does that only for a session whose settings carry the sandbox block, and only after it
+has proved the sandbox for that very call:
+
+1. At session start the hook builds the wall ws's own sandbox builds from the policy on this machine and runs a small
+   probe inside it. Every `deny_read` path that exists must read as empty, every protected path (the policy, ws's
+   folders, anything named with `--protect`) must refuse a write, and the probe must remove what it made. The result is
+   one line in the session: proven, or not proven with the kinds that failed (never a path), and `ws doctor` (WS012)
+   shows the same.
+2. When a command is refused only because a path word holds a part ws can't read (an unset variable, a command
+   substitution), the hook runs the probe again for that call. If it passes, the command is allowed, and one line goes
+   to `logs/gate-allowed.jsonl` with the kind of the refusal (`unknown-bare`, `unknown-deny-read` or
+   `unknown-protected-write`), the runner and the session. The command isn't logged.
+3. The answer is never stored: there's no file, variable or memory of a pass, so a session has nothing to set. A probe
+   that can't run, runs out of time or answers wrongly counts as a fail.
+
+A half-pass keeps the strict reading, as does `sandbox = false`. These stay refused whether or not the sandbox is proven:
+a named protected path or `deny_read` path, a `deny_commands` rule, a shell started by a launcher or fed by a pipe,
+`stdin-is-code`, the `ws` admin commands, a program name or `eval` text that holds an unknown part, and an unknown part
+that could reach a `deny_read` rule the sandbox can't hide (one with a wildcard in the middle).
+
+A session without the sandbox (the policy switch is off, the machine can't run it, or the runner has none) is
+unsandboxed. The strict reading stays on for it, more commands are refused for paths ws can't read in full, and
+`ws doctor` suggests running under `ws gate launch` for fewer refusals. Linux and WSL2 need bubblewrap and socat
+(`sudo apt install bubblewrap socat`, or `sudo dnf install bubblewrap socat`). macOS has its own, and native Windows has
+none.
 
 The static gate reads shell, so it's a check on shell and not a wall against interpreters. A program that `python`,
 `python3`, `perl`, `node`, `ruby`, `php`, `lua` or `Rscript` runs (from `-c`, a file, or standard input), `awk` code,

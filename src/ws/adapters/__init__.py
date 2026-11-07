@@ -101,18 +101,34 @@ def check_argv(
     out: Path,
     protect: tuple[str, ...] = (),
     pin: paths.Pin | None = None,
+    wall: bool = False,
 ) -> list[str]:
     """The command a generated hook or shim runs. The policy and the protected folder are absolute paths, so the hook
     reads the same policy wherever the runner starts and cannot be pointed at another one by the session's cwd. Each
     `protect` path is one more `--protect`. `--pin` carries the layout `ws install` resolved (the home folder and ws's
-    four folders): the hook uses only that, and refuses when the environment it runs in resolves to another.
+    four folders): the hook uses only that, and refuses when the environment it runs in resolves to another. `--wall`
+    says the settings this command sits in switch the runner's sandbox on: it is in the command, which the session
+    cannot edit, and not in the environment, which a project's settings can set.
     """
     argv = [*ws_cmd, "gate", "check", "--runner", runner, "--policy", str(policy_file), "--protect", str(out)]
     for p in protect:
         argv += ["--protect", str(p)]
-    return [*argv, *(pin or paths.pin_of()).args()]
+    return [*argv, *(["--wall"] if wall else []), *(pin or paths.pin_of()).args()]
 
 
-def event_argv(ws_cmd: list[str], runner: str, policy_file: Path, pin: paths.Pin | None = None) -> list[str]:
-    """The command a generated hook runs for the events that are not a tool call's check: `ws gate event`."""
-    return [*ws_cmd, "gate", "event", "--runner", runner, "--policy", str(policy_file), *(pin or paths.pin_of()).args()]
+def event_argv(
+    ws_cmd: list[str], runner: str, policy_file: Path, pin: paths.Pin | None = None, wall: bool = False
+) -> list[str]:
+    """The command a generated hook runs for the events that are not a tool call's check: `ws gate event`. `wall` as in
+    `check_argv`."""
+    return [
+        *ws_cmd,
+        "gate",
+        "event",
+        "--runner",
+        runner,
+        "--policy",
+        str(policy_file),
+        *(["--wall"] if wall else []),
+        *(pin or paths.pin_of()).args(),
+    ]

@@ -771,8 +771,10 @@ def test_a_launcher_that_starts_a_shell_is_denied_and_the_installed_ones_do_read
 @pytest.mark.parametrize(
     "name",
     [
-        pytest.param(n, id=f"{n}-{'real-shell' if _installed(n) else 'gate-decision-only'}")
-        for n in ("sh5", "bash5.2", "bash-static", "zsh5", "mksh-static")
+        pytest.param(
+            n, id=f"{n.replace(' ', '-')}-{'real-shell' if _installed(n.split()[0]) else 'gate-decision-only'}"
+        )
+        for n in ("sh5", "bash5.2", "bash-static", "zsh5", "mksh-static", "busybox sh", "toybox sh")
     ],
 )
 def test_a_shell_with_a_version_or_build_in_its_name_is_denied_whatever_starts_it(pol, name):
@@ -785,7 +787,7 @@ def test_a_shell_with_a_version_or_build_in_its_name_is_denied_whatever_starts_i
         f"fakeroot {name} <<< 'cat {f}'",
     ]
     assert [line for line in lines if gate(pol, line) is None] == []
-    if _installed(name):
+    if _installed(name.split()[0]):  # a multi-call binary is installed when its program is
         assert all(run_bash(line, {}).touched for line in lines[:3])
 
 

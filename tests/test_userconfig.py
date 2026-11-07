@@ -108,8 +108,8 @@ def test_ws_items_go_in_beside_yours_and_nothing_of_yours_moves(box, capsys):
     assert got["permissions"]["allow"] == ["Bash(ls:*)"]
     assert got["env"]["FOO"] == "1" and got["env"]["CAFÉ"] == "☕"
     assert "WS_GATED_SESSION" not in got["env"]  # it would block `ws approve` in your own Claude shell
-    assert got["env"]["WS_SANDBOXED"] == "0"  # no sandbox block here, so the hook skips the project-settings preflight
-    assert "sandbox" not in got
+    assert got["env"]["WS_SANDBOXED"] == "1"  # the sandbox block is here, so the hook checks the project's settings
+    assert got["sandbox"]["enabled"] is True and got["sandbox"]["allowUnsandboxedCommands"] is False
     text = f.read_text(encoding="utf-8")
     assert text.startswith('{\n    "model"') and text.endswith("\n")  # your indentation
     backup = next((box / ".ws" / "backups").iterdir())
@@ -262,7 +262,7 @@ def test_an_item_you_already_had_is_not_ws_s_to_remove(box, capsys):
 
 
 def test_an_env_key_you_set_to_another_value_is_a_conflict_and_nothing_changes(box, capsys):
-    mine = {**MINE, "env": {"WS_SANDBOXED": "1"}}
+    mine = {**MINE, "env": {"WS_SANDBOXED": "0"}}
     f = plant(box, mine)
     original = f.read_bytes()
     e = refused(capsys, box, runner="claude-code")

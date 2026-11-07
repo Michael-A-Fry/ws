@@ -1057,7 +1057,11 @@ def test_with_no_guards_the_hooks_are_the_old_ones():
         "Stop",
     }  # the last two: phone alerts
     assert hooks["PreToolUse"][0]["matcher"] == claude_code.MATCHER
-    assert commands(hooks["SessionStart"]) == [f"ws session start --runner claude-code {pins()} || true"]
+    # the sandbox is on by default, so session start also runs the wall canary (`gate event --wall`)
+    assert commands(hooks["SessionStart"]) == [
+        f"ws session start --runner claude-code {pins()} || true",
+        f"ws gate event --runner claude-code --policy /x/wshome/policy.toml --wall {pins()} || true",
+    ]
     assert generate(pol())["env"] == {"WS_GATED_SESSION": "1", "WS_SANDBOXED": "1"}
 
 
@@ -1068,7 +1072,7 @@ def test_the_default_policy_adds_post_tool_use_and_session_start_events():
     assert commands(hooks["PostToolUse"]) == [event]  # no `|| exit`: exit 2 here is a message to the model
     assert commands(hooks["SessionStart"]) == [
         f"ws session start --runner claude-code {pins()} || true",
-        event + " || true",
+        event.replace("--policy /x/wshome/policy.toml", "--policy /x/wshome/policy.toml --wall") + " || true",
     ]
     assert hooks["PostToolUse"][0]["hooks"][0]["timeout"] > 10  # the checkers get 10 seconds
     assert "SubagentStop" not in hooks

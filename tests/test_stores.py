@@ -9,7 +9,7 @@ import ast
 import re
 from pathlib import Path
 
-from ws import canary, jsonl, rating, runrecord, sandbox
+from ws import canary, gate, jsonl, rating, runrecord, sandbox
 from ws import eval as ws_eval
 from ws.guards import claims, record_calls
 
@@ -31,6 +31,7 @@ SCHEMAS = {
     "gate-calls.jsonl": record_calls.SCHEMA_VERSION,
     "claims.jsonl": claims.SCHEMA_VERSION,
     "wall-report.jsonl": sandbox.WALL_REPORT_SCHEMA,
+    gate.ALLOWED_LOG: gate.ALLOWED_SCHEMA,
 }
 
 # Version 2 of the run record, frozen: a later change may add a key to the schema under a new number, never to this one.

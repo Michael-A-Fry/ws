@@ -8,6 +8,51 @@ body of the GitHub release.
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-11-13
+
+A security release. The runner's sandbox is now on in every install mode and is the boundary; the gate reads more
+command forms that run other text, and is tested against a real shell. ws's files move to the XDG folders.
+
+Run `ws install` once after upgrading, so the hooks and the sandbox settings are rewritten.
+
+### Added
+
+- The sandbox is on by default when ws installs into the runner's own settings (Claude Code), with ws's protected
+  paths hidden from it and ws's own files read-only. `[gate] sandbox = false` turns it off.
+- `ws install` refuses a Claude Code settings file that widens the sandbox (the sandbox switched off, excluded
+  commands, unsandboxed retries allowed, an allowed read or write that covers a protected path), and names each key
+  and why. `--allow-widened-sandbox` keeps your settings and records the choice.
+- Doctor check WS012: the sandbox's settings, read from your settings and the managed settings files ws can read.
+  `warn` when the wall is widened or its hidden-path list is older than the policy ("run `ws install`").
+- `ws migrate [--dry-run]` and doctor check WS010: ws keeps its files in the XDG base folders (`~/.config/ws`,
+  `~/.local/state/ws`, `~/.local/share/ws`, `~/.cache/ws`). An existing `~/.ws` keeps working until you migrate.
+- Release channels: `install.sh --channel stable|rc|edge` (uv first, pipx as the fallback), release candidates on
+  PyPI as pre-releases, and a `channel` field in `ws version`.
+- Evals: every result records a fingerprint (models, runner, ws version, policy, guards, job, limits), and
+  `ws eval compare` refuses mixed arms unless `--allow-mixed`. Compare reports an exact 95% interval and says whether
+  a difference is real or there are too few runs to tell.
+- `scripts/oracle_sweep.py`: every row the real-shell oracle knows, through the gate and run in a sandbox, as one
+  command with an exit code.
+
+### Changed
+
+- The gate refuses a command it has no entry for when that command is given a shell to run, and treats a shell's
+  versioned or static build (`bash5.2`, `bash-static`, `busybox sh`) as that shell.
+- A here-document or here-string given to any shell, `source`, `.`, `eval`, `ssh` or `xargs` is read as code.
+- The gate hooks run on the folders `ws install` pinned and start ws isolated; a missing named policy file is a deny,
+  not the default policy.
+- CI runs the real-shell oracle on every Linux job and fails if it can't start a sandbox.
+- A copy of the repo without the PII denylist can opt in to the built-in rules only, with a visible warning.
+- The local actionlint hook brings its own shellcheck, so it matches CI.
+- Docs: decision records, a shorter AGENTS.md, and the code map in the reference.
+
+### Security
+
+- Fixes advisory [GHSA-q765-g7hh-6gw4](https://github.com/Michael-A-Fry/ws/security/advisories/GHSA-q765-g7hh-6gw4):
+  a session could steer the gate's state folders, fall back to the default policy, or get a protected-path read past
+  the gate through command forms it didn't read. The sandbox is the boundary; the gate is defence in depth, and its
+  known limits are listed in the advisory and in the docs.
+
 ## [0.1.7] - 2026-11-07
 
 A browser terminal that keeps the screen still, a gate that reads commands the way the shell does, and a labelled

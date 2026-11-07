@@ -14,7 +14,7 @@ Linux. On Windows it runs inside WSL2.
 
 ## Install
 
-Run the installer. It checks the machine, installs the `ws` command with uv or pipx, and runs a smoke test.
+Run the installer. It checks the machine, installs the `ws` command with uv (or pipx), and runs a smoke test.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Michael-A-Fry/ws/main/install.sh | bash
@@ -23,10 +23,12 @@ curl -fsSL https://raw.githubusercontent.com/Michael-A-Fry/ws/main/install.sh | 
 Or install the package yourself:
 
 ```sh
-pipx install ws-aitoolkit
+uv tool install ws-aitoolkit
 ```
 
-For other ways to install, including a pinned version, see [Install ws](docs/how-to/install.md).
+There are three release channels: `stable` (the default), `rc` for release candidates and `edge` for the `main` branch.
+`install.sh --channel rc` or `--channel edge` picks one. For those, and for a pinned version, see
+[Install ws](docs/how-to/install.md).
 
 ## First command
 
@@ -66,8 +68,8 @@ Check which build you have:
 ws version --json
 ```
 
-The output has `version`, `git_sha`, `dirty`, `build_date`, `python`, `install_path` and `install_source`. Each release
-carries a checksum, a build provenance attestation, a Sigstore bundle and an SBOM. To check them, see
+The output has `version`, `channel`, `git_sha`, `dirty`, `build_date`, `python`, `install_path` and `install_source`.
+Each release carries a checksum, a build provenance attestation, a Sigstore bundle and an SBOM. To check them, see
 [Verify a release](docs/how-to/verify-a-release.md).
 
 ## Troubleshooting

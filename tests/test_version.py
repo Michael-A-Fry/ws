@@ -14,7 +14,7 @@ import pytest
 from ws import cli, version
 from ws.output import SCHEMA
 
-FIELDS = {"version", "git_sha", "dirty", "build_date", "python", "install_path", "install_source"}
+FIELDS = {"version", "channel", "git_sha", "dirty", "build_date", "python", "install_path", "install_source"}
 GIT = shutil.which("git")
 
 
@@ -196,3 +196,35 @@ def test_direct_url_is_read_from_the_installed_metadata(monkeypatch):
     assert version.direct_url() is None
     monkeypatch.setattr(version.metadata, "distribution", lambda name: Dist("[1]"))
     assert version.direct_url() is None
+
+
+@pytest.mark.parametrize(
+    ("ver", "source", "expected"),
+    [
+        ("0.2.0", "release", "stable"),
+        ("0.2.0", "pypi", "stable"),
+        ("0.2.0", "uv-tool", "stable"),
+        ("0.2.0.post1", "pipx", "stable"),
+        ("0.2.0rc1", "release", "rc"),
+        ("0.2.0rc12", "pypi", "rc"),
+        ("0.2.0b2", "pypi", "rc"),
+        ("0.2.0a1", "pypi", "rc"),
+        ("0.2.0", "checkout", "edge"),  # a checkout or a git install is edge whatever the version says
+        ("0.2.0rc1", "checkout", "edge"),
+        ("0.2.0.dev3", "unknown", "edge"),
+        ("0.2.0rc1.dev3", "pypi", "edge"),
+        ("0.0.0+src", "unknown", "edge"),
+        ("0.2.0+abc123", "release", "edge"),
+    ],
+)
+def test_channel_rules(ver, source, expected):
+    assert version.channel(ver, source) == expected
+
+
+def test_collect_reports_the_channel_of_this_install(monkeypatch):
+    monkeypatch.setattr(version, "__version__", "0.2.0rc1")
+    monkeypatch.setattr(version, "install_source", lambda *a: "release")
+    data = version.collect()
+    assert (data["channel"], data["install_source"]) == ("rc", "release")
+    monkeypatch.setattr(version, "install_source", lambda *a: "checkout")
+    assert version.collect()["channel"] == "edge"

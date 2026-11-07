@@ -16,12 +16,17 @@ Like every ws command, the result is in the `data` field of the standard JSON en
 | Field | Type | Meaning |
 |---|---|---|
 | `version` | text | The ws version, taken from the release tag. A source checkout reports `0.0.0+src`. |
+| `channel` | text | The release channel the install came from: `stable`, `rc` or `edge`. |
 | `git_sha` | text | The full commit that the build came from. |
 | `dirty` | true or false | `true` when the build came from a working tree with uncommitted changes. |
 | `build_date` | text | When the build was made, as a UTC date and time. |
 | `python` | text | The Python version that runs ws, for example `3.12.3`. |
 | `install_path` | text | The folder that holds the installed `ws` package. |
 | `install_source` | text | Where the install came from, for example a release wheel, PyPI or a local checkout. |
+
+`channel` is `edge` for a checkout or a git install and for a version with a dev or local part (`0.2.0.dev3`,
+`0.0.0+src`), `rc` for a pre-release version such as `0.2.0rc1`, and `stable` otherwise. See
+[Release channels](../how-to/install.md#release-channels).
 
 ## Use it
 

@@ -4,13 +4,14 @@ Move to a newer release, or remove ws and what it installed.
 
 ## Upgrade
 
-1. Run the installer again. It takes the latest release.
+1. Run the installer again. It takes the latest stable release.
 
    ```sh
    curl -fsSL https://raw.githubusercontent.com/Michael-A-Fry/ws/main/install.sh | bash
    ```
 
-   To pick a release, add `-s -- --version vX.Y.Z` after `bash`. To check the file first, see
+   To pick a release, add `-s -- --version vX.Y.Z` after `bash`. To follow another channel, add `-s -- --channel rc` or
+   `-s -- --channel edge` (see [Release channels](install.md#release-channels)). To check the file first, see
    [Verify a release](verify-a-release.md).
 
 2. Check the version and the machine.

@@ -5,7 +5,8 @@ Install the `ws` command on macOS, Linux or Windows (through WSL2), and check th
 ## Before you start
 
 - Python 3.11 or newer.
-- [uv](https://docs.astral.sh/uv/) or [pipx](https://pipx.pypa.io/). The installer uses whichever it finds, uv first.
+- [uv](https://docs.astral.sh/uv/) or [pipx](https://pipx.pypa.io/). The installer uses uv, and falls back to pipx when
+  uv isn't there.
 - On Windows, WSL2 with a Linux distribution. Run every command below inside it. Native Windows isn't supported.
 
 ## Steps
@@ -16,9 +17,9 @@ Install the `ws` command on macOS, Linux or Windows (through WSL2), and check th
    curl -fsSL https://raw.githubusercontent.com/Michael-A-Fry/ws/main/install.sh | bash
    ```
 
-   With no options, the installer takes the wheel of the latest GitHub release, checks its `.sha256` file (and its cosign
-   bundle if `cosign` is on your `PATH`), and refuses to install if a check fails. While no release exists, it installs
-   the `main` branch and says so.
+   With no options, the installer takes the wheel of the latest stable GitHub release, checks its `.sha256` file (and its
+   cosign bundle if `cosign` is on your `PATH`), and refuses to install if a check fails. While no release exists, it
+   stops and says how to install the `main` branch instead (`--channel edge`).
 
 2. Check that `ws` runs.
 
@@ -38,12 +39,41 @@ Install the `ws` command on macOS, Linux or Windows (through WSL2), and check th
 
    See the [first-run tutorial](../tutorials/first-run.md).
 
+## Release channels
+
+ws comes in three channels. Pick the one that suits how much risk you want. Run the installer again with a different
+`--channel` to move between them.
+
+| Channel | You get | Run |
+|---|---|---|
+| `stable` (default) | The latest plain release, `vX.Y.Z`. Checked against its checksum and signature. | `bash install.sh` |
+| `rc` | The newest release, release candidates (`vX.Y.ZrcN`) included. Checked like a stable release. | `bash install.sh --channel rc` |
+| `edge` | The `main` branch, built from its repository. The newest work, and it can break. Nothing to check, because it isn't a release. Needs `git`. | `bash install.sh --channel edge` |
+
+`ws version` shows the channel your install came from (`channel` in `ws version --json`).
+
+To install a channel with the tool itself, without the installer:
+
+```sh
+uv tool install ws-aitoolkit                                      # stable
+uv tool install --prerelease allow ws-aitoolkit                   # rc: pip and uv skip pre-releases unless asked
+uv tool install git+https://github.com/Michael-A-Fry/ws@main     # edge
+```
+
+With pip or pipx, the pre-release switch for `rc` is `--pre` (`pipx install --pip-args=--pre ws-aitoolkit`).
+
+### How releases are withdrawn
+
+A bad release is yanked on PyPI and never deleted. A yanked version stays in the index, so an install that pinned it
+still resolves, and a fresh install skips it. A release tag is never moved or deleted: a fix is a new version. The
+GitHub release for a yanked version stays up, and its notes say why it was yanked.
+
 ## Choose a different source
 
 | You want | Run |
 |---|---|
-| A specific release | `bash install.sh --version vX.Y.Z` |
-| The package from PyPI | `bash install.sh --pypi` |
+| A specific release or release candidate | `bash install.sh --version vX.Y.Z` (or `vX.Y.ZrcN`) |
+| The package from PyPI | `bash install.sh --pypi` (add `--channel rc` for pre-releases) |
 | A checkout on this machine | `bash install.sh --from PATH` |
 | To see what would happen | `bash install.sh --dry-run` |
 | To rename a `ws` you already have | `bash install.sh --move-existing-ws-to PATH` |
@@ -66,7 +96,7 @@ installed. If the install fails, the old program goes back to its place. After t
 command, and `ws dispatch x` or a bare `ws` reach the old program with the same arguments. A program named
 `ws-<word>` on your `PATH` also runs as `ws <word>`; see [Your own commands](../reference/cli.md#your-own-commands).
 
-To install by hand, use `uv tool install ws-aitoolkit` or `pipx install ws-aitoolkit`.
+To install by hand, use `uv tool install ws-aitoolkit` (or `pipx install ws-aitoolkit`).
 
 ## Success
 

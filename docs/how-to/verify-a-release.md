@@ -2,9 +2,9 @@
 
 Check that a ws release file is the one the project built, before you install it.
 
-Every release tag (`vX.Y.Z`) builds a source archive and a wheel in GitHub Actions. Each file comes with a checksum, a
-build provenance attestation and a cosign signature. A software bill of materials (SBOM) in CycloneDX form lists what
-went in.
+Every release tag (`vX.Y.Z`, or `vX.Y.ZrcN` for a release candidate) builds a source archive and a wheel in GitHub
+Actions. Each file comes with a checksum, a build provenance attestation and a cosign signature. A software bill of
+materials (SBOM) in CycloneDX form lists what went in.
 
 ## Before you start
 
@@ -59,4 +59,7 @@ install when a check fails. It doesn't run the attestation check, so run step 2 
 
 - The checks prove where a file came from. They don't prove that the code is free of bugs.
 - Releases are immutable. A tag can't be moved or deleted after it's published.
+- A bad release is yanked on PyPI, never deleted. Yanking hides it from a fresh install and leaves it for anyone who
+  pinned it, so a check on an old file still works.
+- `edge` (the `main` branch) isn't a release and has no checksum or signature.
 - The SBOM lists the dependencies. ws's core has none outside the Python standard library.

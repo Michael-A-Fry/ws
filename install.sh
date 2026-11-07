@@ -6,8 +6,10 @@
 #   bash install.sh [options]
 #   curl -fsSL https://raw.githubusercontent.com/Michael-A-Fry/ws/main/install.sh | bash -s -- [options]
 #
-# By default it installs the wheel of the latest GitHub release, after checking the wheel's SHA-256 (and its cosign
-# signature when cosign 3 or newer is installed). Everything runs inside main(), and the last line of this file calls it,
+# It installs with uv (pipx when uv is missing). --channel picks what to install: stable (the default) is the wheel of
+# the latest GitHub release, rc is the newest release including release candidates, and edge is the main branch from
+# its repository. Stable and rc are checked against the wheel's SHA-256 (and its cosign signature when cosign 3 or newer
+# is installed); edge is a source checkout and has no such file to check. Everything runs inside main(), and the last line of this file calls it,
 # so a download that stops part way defines some functions and runs nothing.
 #
 # Exit codes: 0 done (or a dry run that passed), 1 a failure (an installer's own exit code is passed on), 2 bad usage.
@@ -19,6 +21,7 @@ REPO_URL="https://github.com/${REPO_SLUG}"
 RAW_URL="https://raw.githubusercontent.com/${REPO_SLUG}/main/install.sh"
 PACKAGE="ws-aitoolkit"
 TOTAL_STEPS=5
+EDGE_REF="main"
 
 # State shared by the phases below.
 CURRENT_STEP=0
@@ -66,12 +69,17 @@ usage() {
 Usage: bash install.sh [options]
        curl -fsSL ${RAW_URL} | bash -s -- [options]
 
-Installs the ws command with uv or pipx. With no options it installs the latest GitHub
-release, after checking its SHA-256 (and its cosign signature, when cosign 3+ is installed).
+Installs the ws command with uv, or with pipx when uv is not there. With no options it installs
+the latest stable GitHub release, after checking its SHA-256 (and its cosign signature, when
+cosign 3+ is installed).
 
 Options:
-  --version TAG       install this release (a tag like v0.1.0) instead of the latest
-  --pypi              install ${PACKAGE} from PyPI instead of a release
+  --channel NAME      which release channel to follow (default stable):
+                        stable  the latest release, vX.Y.Z
+                        rc      the newest release, release candidates (vX.Y.ZrcN) included
+                        edge    the ${EDGE_REF} branch, installed from its repository (needs git; nothing to check)
+  --version TAG       install this release (a tag like v0.1.0 or v0.2.0rc1) instead of the latest
+  --pypi              install ${PACKAGE} from PyPI instead of a release (with --channel rc, pre-releases too)
   --from PATH         install a checkout of the repo that is on this machine
   --no-verify         do not check the release's SHA-256 or signature (not recommended)
   --skip-smoke-test   do not run 'ws --version' and 'ws doctor --offline' afterwards
@@ -120,7 +128,8 @@ print_troubleshooting() {
     printf '\n%s5. The release download fails%s\n' "${BOLD}" "${RESET}"
     printf '   It needs curl or wget, sha256sum or shasum, and a network that reaches github.com.\n'
     printf '   Releases: %s/releases\n' "${REPO_URL}"
-    printf '   "No release yet" or a rate limit: name a release with --version vX.Y.Z, or install a checkout:\n'
+    printf '   "No release yet" or a rate limit: name a release with --version vX.Y.Z, install the main branch with\n'
+    printf '   --channel edge, or install a checkout:\n'
     printf '     git clone %s.git ws && bash ws/install.sh --from ws\n' "${REPO_URL}"
     printf '   A checksum or signature failure means the download is not the release. Do not use it.\n'
     printf '\n%s6. Still stuck%s\n' "${BOLD}" "${RESET}"
@@ -277,9 +286,15 @@ tag_from_json() {
     sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | sed 1q
 }
 
-# A plain release tag, vX.Y.Z: the release workflow only builds those, and the wheel's file name comes from it.
-is_release_tag() {
+# A stable release tag, vX.Y.Z.
+is_stable_tag() {
     printf '%s\n' "$1" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'
+}
+
+# A release tag, vX.Y.Z or a release candidate vX.Y.ZrcN: the release workflow only builds those, and the wheel's
+# file name comes from it.
+is_release_tag() {
+    printf '%s\n' "$1" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(rc[0-9]+)?$'
 }
 
 make_workdir() {
@@ -288,21 +303,28 @@ make_workdir() {
     fi
 }
 
-# Sets RELEASE_TAG to the latest release's tag. Exits 1 when it cannot, except in a dry run, which warns and leaves
-# the tag empty so the rest of the preflight still prints.
+# Sets RELEASE_TAG to the tag of the release at URL: GitHub's latest release (never a release candidate) for the
+# stable channel, the newest release of any kind for rc. Exits 1 when it cannot, except in a dry run, which warns
+# and leaves the tag empty so the rest of the preflight still prints.
 RELEASE_TAG=""
 find_latest_release() {
-    local url="$1" dry="$2" status="" why=""
+    local url="$1" dry="$2" channel="$3" status="" why="" found=0
     RELEASE_TAG=""
     make_workdir
     if status="$(http_get "${url}" "${WORKDIR}/latest.json")"; then
         case "${status}" in
             200)
                 RELEASE_TAG="$(tag_from_json <"${WORKDIR}/latest.json")"
-                if is_release_tag "${RELEASE_TAG}"; then
+                why="GitHub's answer did not hold a release tag like vX.Y.Z"
+                if [ "${channel}" = "rc" ]; then
+                    why="GitHub's answer did not hold a release tag like vX.Y.Z or vX.Y.ZrcN"
+                    if is_release_tag "${RELEASE_TAG}"; then found=1; fi
+                elif is_stable_tag "${RELEASE_TAG}"; then
+                    found=1
+                fi
+                if [ "${found}" = "1" ]; then
                     return 0
                 fi
-                why="GitHub's answer did not hold a release tag like vX.Y.Z"
                 RELEASE_TAG=""
                 ;;
             404)
@@ -324,7 +346,7 @@ find_latest_release() {
         return 0
     fi
     error "could not find the latest release: ${why}"
-    error "Check the network, or name a release with --version vX.Y.Z (${REPO_URL}/releases)"
+    error "Check the network, name a release with --version vX.Y.Z (${REPO_URL}/releases), or use --channel edge"
     exit 1
 }
 
@@ -626,7 +648,7 @@ detect_os() {
 
 # Looks at everything before stopping, so one run lists every tool that is missing.
 preflight() {
-    local release_route="$1" no_verify="$2" missing=0 version=""
+    local release_route="$1" no_verify="$2" need_git="$3" missing=0 version=""
 
     PYTHON_BIN="$(find_python)" || PYTHON_BIN=""
     if [ -n "${PYTHON_BIN}" ]; then
@@ -670,6 +692,11 @@ preflight() {
         fi
     fi
 
+    if [ "${need_git}" = "1" ] && ! require_cmd git; then
+        error "--channel edge installs from the ${EDGE_REF} branch and needs git, which is not on PATH (or use --channel stable)"
+        missing=1
+    fi
+
     if [ "${missing}" = "1" ]; then
         error "Missing required tools. See troubleshooting below."
         exit 1
@@ -682,6 +709,8 @@ preflight() {
 
 main() {
     local dry_run=0 from_pypi=0 from_path="" have_version=0 version_tag="" no_verify=0 skip_smoke=0
+    local channel="stable" channel_given=0
+    local -a install_cmd=()
     local override="${WS_RELEASE_BASE_URL:-}" api_base="https://api.github.com" download_base="https://github.com"
     local path_fix="" uninstall_cmd="" run_cmd="" ws_bin="" out="" code=0 move_existing=""
 
@@ -700,6 +729,12 @@ main() {
                 [ $# -ge 2 ] || usage_error "--version needs a release tag such as v0.1.0"
                 have_version=1
                 version_tag="$2"
+                shift 2
+                ;;
+            --channel)
+                [ $# -ge 2 ] || usage_error "--channel needs stable, rc or edge"
+                channel="$2"
+                channel_given=1
                 shift 2
                 ;;
             --pypi)
@@ -733,9 +768,21 @@ main() {
         esac
     done
 
+    case "${channel}" in
+        stable | rc | edge) ;;
+        *) usage_error "--channel takes stable, rc or edge, not '${channel}'" ;;
+    esac
+    if [ "${channel_given}" = "1" ]; then
+        [ "${have_version}" = "0" ] || usage_error "--channel and --version cannot be used together (a version names its own release)"
+        [ -z "${from_path}" ] || usage_error "--channel and --from cannot be used together (a checkout is what it is)"
+        if [ "${channel}" = "edge" ] && [ "${from_pypi}" = "1" ]; then
+            usage_error "--channel edge and --pypi cannot be used together (edge is the ${EDGE_REF} branch, not a published package)"
+        fi
+    fi
     if [ "${have_version}" = "1" ]; then
-        case "${version_tag}" in *[!A-Za-z0-9.]*) usage_error "--version takes a release tag like v1.2.3" ;; esac
-        is_release_tag "${version_tag}" || usage_error "--version takes a release tag like v1.2.3, not '${version_tag}'"
+        case "${version_tag}" in *[!A-Za-z0-9.]*) usage_error "--version takes a release tag like v1.2.3 or v1.2.3rc1" ;; esac
+        is_release_tag "${version_tag}" ||
+            usage_error "--version takes a release tag like v1.2.3 or v1.2.3rc1, not '${version_tag}'"
         [ "${from_pypi}" = "0" ] || usage_error "--version and --pypi cannot be used together"
         [ -z "${from_path}" ] || usage_error "--version and --from cannot be used together"
     fi
@@ -768,12 +815,15 @@ main() {
     step "Detecting host environment"
     detect_os
 
-    local release_route=1
-    if [ "${from_pypi}" = "1" ] || [ -n "${from_path}" ]; then
+    local release_route=1 need_git=0
+    if [ "${from_pypi}" = "1" ] || [ -n "${from_path}" ] || [ "${channel}" = "edge" ]; then
         release_route=0
     fi
+    if [ "${channel}" = "edge" ]; then
+        need_git=1
+    fi
     step "Checking prerequisites"
-    preflight "${release_route}" "${no_verify}"
+    preflight "${release_route}" "${no_verify}" "${need_git}"
 
     step "Installing ws"
     if [ "${INSTALLER}" = "uv" ]; then
@@ -790,7 +840,14 @@ main() {
         info "source: the checkout at ${from_path}"
     elif [ "${from_pypi}" = "1" ]; then
         INSTALL_SRC="${PACKAGE}"
-        info "source: ${PACKAGE} on PyPI"
+        info "source: ${PACKAGE} on PyPI (channel ${channel})"
+    elif [ "${channel}" = "edge" ]; then
+        INSTALL_SRC="git+${REPO_URL}@${EDGE_REF}"
+        info "channel: edge, the ${EDGE_REF} branch (the newest work; it can break)"
+        warn "edge is built from git, so there is no checksum or signature to check; use --channel stable for a checked release"
+        if [ -n "${override}" ]; then
+            warn "WS_RELEASE_BASE_URL does not apply to edge: the source is ${INSTALL_SRC}"
+        fi
     else
         if [ -n "${override}" ]; then
             warn "WS_RELEASE_BASE_URL is set: releases come from ${override}. The checks still run."
@@ -801,7 +858,13 @@ main() {
         if [ "${have_version}" = "1" ]; then
             RELEASE_TAG="${version_tag}"
         else
-            find_latest_release "${api_base}/repos/${REPO_SLUG}/releases/latest" "${dry_run}"
+            info "channel: ${channel}"
+            if [ "${channel}" = "rc" ]; then
+                # the newest release of any kind; /releases/latest never returns a release candidate
+                find_latest_release "${api_base}/repos/${REPO_SLUG}/releases?per_page=1" "${dry_run}" "rc"
+            else
+                find_latest_release "${api_base}/repos/${REPO_SLUG}/releases/latest" "${dry_run}" "stable"
+            fi
         fi
         if [ -n "${RELEASE_TAG}" ]; then
             info "release: ${RELEASE_TAG}"
@@ -811,14 +874,22 @@ main() {
 
     if [ -n "${INSTALL_SRC}" ]; then
         if [ "${INSTALLER}" = "uv" ]; then
-            run_cmd="uv tool install --force"
-            if [ -n "${from_path}" ]; then
-                run_cmd="${run_cmd} --reinstall"
+            install_cmd=(uv tool install --force)
+            # a checkout or a branch can change under the same name, so rebuild it rather than reuse uv's cache
+            if [ -n "${from_path}" ] || [ "${channel}" = "edge" ]; then
+                install_cmd+=(--reinstall)
+            fi
+            if [ "${from_pypi}" = "1" ] && [ "${channel}" = "rc" ]; then
+                install_cmd+=(--prerelease allow)
             fi
         else
-            run_cmd="pipx install --python ${PYTHON_BIN} --force"
+            install_cmd=(pipx install --python "${PYTHON_BIN}" --force)
+            if [ "${from_pypi}" = "1" ] && [ "${channel}" = "rc" ]; then
+                install_cmd+=(--pip-args=--pre)
+            fi
         fi
-        run_cmd="${run_cmd} ${INSTALL_SRC}"
+        install_cmd+=("${INSTALL_SRC}")
+        run_cmd="${install_cmd[*]}"
     fi
     if [ "${dry_run}" = "1" ]; then
         info "dry run: not installed"
@@ -828,15 +899,7 @@ main() {
     else
         move_existing_aside
         info "running: ${run_cmd}"
-        if [ "${INSTALLER}" = "uv" ]; then
-            if [ -n "${from_path}" ]; then
-                uv tool install --force --reinstall "${INSTALL_SRC}" </dev/null
-            else
-                uv tool install --force "${INSTALL_SRC}" </dev/null
-            fi
-        else
-            pipx install --python "${PYTHON_BIN}" --force "${INSTALL_SRC}" </dev/null
-        fi
+        "${install_cmd[@]}" </dev/null
         # The PyPI name once held a placeholder at 0.0.0. Whatever the other switches say, that is not ws.
         if ws_bin="$(find_ws)"; then
             out="$("${ws_bin}" --version 2>&1 </dev/null || true)"

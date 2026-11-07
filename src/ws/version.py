@@ -2,8 +2,8 @@
 
     ws version [--json]
 
-Fields (the JSON `data`, schema `ws.cli/1`): `version`, `git_sha`, `dirty`, `build_date`, `python`, `install_path` and
-`install_source`. `ws --version` stays the one line `ws X.Y.Z`.
+Fields (the JSON `data`, schema `ws.cli/1`): `version`, `channel`, `git_sha`, `dirty`, `build_date`, `python`,
+`install_path` and `install_source`. `ws --version` stays the one line `ws X.Y.Z`.
 
 Where the build facts come from. The release workflow writes `ws/_build.py` (a Python string module, git-ignored) just
 before `uv build`, so a release wheel carries the commit it was built from, whether the tree was clean and when it was
@@ -20,6 +20,10 @@ built. A checkout has no such file: there `ws version` asks git, at run time, ab
 3. `pypi`: no `direct_url.json` and a `_build.py`, so an index handed over the release's own wheel.
 4. `uv-tool` or `pipx`: neither of the above, and the interpreter lives in that tool's environment folder.
 5. `unknown`.
+
+`channel` is the release channel the install came from, the first rule that matches: `edge` when the install is a
+checkout or a git install (`install_source` is `checkout`) or the version has a dev or local part (`0.2.0.dev3`,
+`0.0.0+src`); `rc` when the version is a pre-release (`0.2.0rc1`); else `stable`.
 """
 
 from __future__ import annotations
@@ -28,6 +32,7 @@ import argparse
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 from importlib import metadata
@@ -37,6 +42,8 @@ from ws import __version__, output
 
 UNKNOWN = "unknown"
 PACKAGE = "ws-aitoolkit"
+_DEV_OR_LOCAL = re.compile(r"\.dev\d*|\+")
+_PRE_RELEASE = re.compile(r"\d(?:a|b|rc)\d+")
 
 
 def package_dir() -> Path:
@@ -130,6 +137,15 @@ def install_source(pkg: Path, has_build: bool, durl: dict | None, prefix: str) -
     return tool_manager(prefix) or UNKNOWN
 
 
+def channel(version: str, source: str) -> str:
+    """`edge`, `rc` or `stable`: from the install source and the PEP 440 shape of the version."""
+    if source == "checkout" or _DEV_OR_LOCAL.search(version):
+        return "edge"
+    if _PRE_RELEASE.search(version):
+        return "rc"
+    return "stable"
+
+
 def collect() -> dict:
     pkg = package_dir()
     built = build_info()
@@ -140,14 +156,16 @@ def collect() -> dict:
         facts = git_info(root)
     else:
         facts = {"git_sha": UNKNOWN, "dirty": None, "build_date": UNKNOWN}
+    source = install_source(pkg, built is not None, direct_url(), sys.prefix)
     return {
         "version": __version__,
+        "channel": channel(__version__, source),
         "git_sha": facts["git_sha"],
         "dirty": facts["dirty"],
         "build_date": facts["build_date"],
         "python": platform.python_version(),
         "install_path": str(pkg),
-        "install_source": install_source(pkg, built is not None, direct_url(), sys.prefix),
+        "install_source": source,
     }
 
 

@@ -39,29 +39,29 @@ def generated(pol: policy.Policy) -> dict:
     return json.loads(files["settings.json"])
 
 
+def no_wall_flag(conf: dict) -> bool:
+    """No hook command in the settings carries `--wall`: no mode turns a refusal into an allow."""
+    cmds = [h["command"] for groups in conf["hooks"].values() for g in groups for h in g["hooks"]]
+    return bool(cmds) and not any("--wall" in shlex.split(c) for c in cmds)
+
+
 # --- what is generated --------------------------------------------------------------------------------------------------
 
 
-def test_the_generated_settings_carry_the_sandbox_block_and_the_hooks_say_so():
+def test_the_generated_settings_carry_the_sandbox_block_and_no_hook_changes_a_refusal():
     conf = generated(policy.default_policy())
     sb = conf["sandbox"]
     assert sb["enabled"] is True and sb["failIfUnavailable"] is True and sb["allowUnsandboxedCommands"] is False
     assert "~/.ssh" in sb["filesystem"]["denyRead"]
     assert any(p.endswith(("policy.toml", "wshome")) for p in sb["filesystem"]["denyWrite"])
     assert conf["env"]["WS_SANDBOXED"] == "1"
-    check = next(h["command"] for g in conf["hooks"]["PreToolUse"] for h in g["hooks"])
-    assert "--wall" in shlex.split(check)
-    start = [h["command"] for g in conf["hooks"]["SessionStart"] for h in g["hooks"]]
-    assert any("gate event" in c and "--wall" in shlex.split(c) for c in start)
+    assert no_wall_flag(conf)
 
 
 def test_the_policy_switch_leaves_the_block_out_and_says_so_in_the_marker():
     conf = generated(policy.loads("[gate]\nsandbox = false\n"))
     assert "sandbox" not in conf and conf["env"]["WS_SANDBOXED"] == "0"
-    check = next(h["command"] for g in conf["hooks"]["PreToolUse"] for h in g["hooks"])
-    assert "--wall" not in shlex.split(check)
-    start = [h["command"] for g in conf["hooks"]["SessionStart"] for h in g["hooks"]]
-    assert not any("--wall" in shlex.split(c) for c in start)
+    assert no_wall_flag(conf)
 
 
 def test_the_project_copy_of_unsandboxed_settings_is_the_settings_unchanged():
@@ -93,8 +93,7 @@ def test_install_writes_the_block_beside_the_users_own_keys_and_stops_marking_th
     assert sb["filesystem"]["denyRead"][0] == "~/mine" and "~/.ssh" in sb["filesystem"]["denyRead"]  # yours first
     assert any(p.endswith(".ws") for p in sb["filesystem"]["denyWrite"])  # ws's own folder is read-only to a shell
     assert conf["env"]["WS_SANDBOXED"] == "1"
-    check = next(h["command"] for g in conf["hooks"]["PreToolUse"] for h in g["hooks"] if "gate check" in h["command"])
-    assert "--wall" in shlex.split(check)
+    assert no_wall_flag(conf)
 
 
 def test_the_off_switch_takes_the_block_out_and_marks_the_session_unsandboxed(box, capsys):
@@ -104,8 +103,7 @@ def test_the_off_switch_takes_the_block_out_and_marks_the_session_unsandboxed(bo
     assert install(capsys, box) == 0
     conf = settings(box)
     assert "sandbox" not in conf and conf["env"]["WS_SANDBOXED"] == "0"
-    check = next(h["command"] for g in conf["hooks"]["PreToolUse"] for h in g["hooks"] if "gate check" in h["command"])
-    assert "--wall" not in shlex.split(check)
+    assert no_wall_flag(conf)
 
 
 def test_turning_it_back_on_puts_the_block_back_and_a_second_install_changes_nothing(box, capsys):
@@ -119,15 +117,16 @@ def test_turning_it_back_on_puts_the_block_back_and_a_second_install_changes_not
     assert (box / ".claude" / "settings.json").read_bytes() == after
 
 
-def test_a_user_who_has_set_the_sandbox_off_gets_a_clear_conflict_and_nothing_changes(box, capsys):
+def test_a_user_who_has_set_the_sandbox_off_is_refused_naming_the_key_and_the_file_and_nothing_changes(box, capsys):
     f = box / ".claude" / "settings.json"
     f.parent.mkdir()
     f.write_text(json.dumps({"sandbox": {"enabled": False}}))
     before = f.read_bytes()
     code = cli.main(["install", "--yes", "--json", "--runner", "claude-code", "--notes", str(box / "Notes")])
     out = json.loads(capsys.readouterr().out)
-    assert code == 1 and out["error_kind"] == "conflict" and "sandbox.enabled" in out["message"]
-    assert "ws gate launch" in out["hint"] and f.read_bytes() == before
+    assert code == 1 and out["error_kind"] == "refused"
+    assert "sandbox.enabled" in out["message"] and str(f) in out["message"]
+    assert "--allow-widened-sandbox" in out["hint"] and f.read_bytes() == before
 
 
 def test_the_users_denyread_survives_an_uninstall_and_ws_items_come_out(box, capsys):

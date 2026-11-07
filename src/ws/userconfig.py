@@ -17,6 +17,10 @@ The promises, each pinned by a test:
   replaces it; a file that changed under it is merged again once, then refused.
 - A config that already holds ws's hooks but has no record (the manifest was lost) is adopted: the entries are recorded
   so an undo takes them out, and a hook command from an older ws is replaced in place.
+- The wall stays whole. A Claude Code settings file of yours that opens the sandbox (it is off, it excludes commands, it
+  allows unsandboxed ones, or it re-opens a path the wall holds) is refused, naming each setting and its file, unless you
+  keep them on purpose with `--allow-widened-sandbox`; ws then records the choice (`widened_by_user`), and doctor reports
+  the wall as widened.
 - A file ws cannot merge safely (a link, not plain JSON, JSONC with comments) is refused with the reason and the way to
   gate a session without it: `ws gate launch`.
 
@@ -41,7 +45,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
-from ws import adapters, paths, policy, profile, selfcmd
+from ws import adapters, paths, policy, profile, selfcmd, wallsettings
 from ws.approvals import ENV_MARKER
 from ws.output import WsError
 
@@ -70,6 +74,7 @@ class Merge:
     backup: Path | None = None  # where the file's own bytes go on the first write; None when there is no file yet
     cmd: tuple = ()  # the argv that runs ws in the hooks (recorded, so doctor can see it still starts)
     inputs: str = ""  # a hash of the policy these ops were built from (see `policy_digest`)
+    widened: tuple = ()  # the wall-widening settings of yours that you chose to keep (recorded as `widened_by_user`)
 
 
 @dataclass(frozen=True)
@@ -453,8 +458,47 @@ def require_stable_interpreter(cmd) -> None:
         )
 
 
-def plan(runner: str, pol: policy.Policy, policy_file: Path, env: Mapping[str, str], entry: Mapping | None) -> GatePlan:
-    """The generated files and the merge for this runner. Pure but for reading the target (to name the backup)."""
+def _claude_protect(where: Path) -> tuple[str, ...]:
+    tree = selfcmd.tree()
+    return (str(where), *([str(tree)] if tree else []))
+
+
+def expected_sandbox(pol: policy.Policy, policy_file: Path, env: Mapping[str, str]) -> dict:
+    """The `sandbox` block ws merges into Claude Code's user settings for this policy ({} when the policy leaves it out)."""
+    if not pol.gate.sandbox:
+        return {}
+    where = target("claude-code", env)
+    out = _state(env) / "gate" / "claude-code"
+    return adapters.get("claude-code").sandbox_block(pol, out, policy_file, _claude_protect(where))
+
+
+def _kept_widenings(
+    where: Path, block: dict, env: Mapping[str, str], entry: Mapping | None, allow: bool
+) -> list[wallsettings.Widening]:
+    """The settings in your file that widen the wall and that you have agreed to keep: all of them with `allow`, else the
+    ones an earlier install recorded. Any other raises the refusal, so nothing is merged beside a wider wall unasked."""
+    if not block:
+        return []
+    doc, _ = load(where)
+    found = wallsettings.widenings(doc, where, block, wallsettings._home(env))
+    agreed = set(entry.get("widened_by_user", [])) if entry else set()
+    new = [w for w in found if not allow and w.label not in agreed]
+    if new:
+        raise wallsettings.refusal(new, where)
+    return found
+
+
+def plan(
+    runner: str,
+    pol: policy.Policy,
+    policy_file: Path,
+    env: Mapping[str, str],
+    entry: Mapping | None,
+    allow_widened: bool = False,
+) -> GatePlan:
+    """The generated files and the merge for this runner. Pure but for reading the target (to name the backup). Raises
+    the refusal in `wallsettings.refusal` when your Claude Code settings widen the wall and `allow_widened` is false (and
+    an earlier install didn't record them)."""
     adapter = adapters.get(runner)
     cmd = selfcmd.argv()
     require_stable_interpreter(cmd)
@@ -466,9 +510,10 @@ def plan(runner: str, pol: policy.Policy, policy_file: Path, env: Mapping[str, s
     else:
         backup = _new_backup(runner, env) if os.path.lexists(where) else None
     copies: dict = {}
+    widened: list[wallsettings.Widening] = []
     if runner == "claude-code":
-        tree = selfcmd.tree()
-        protect = (str(where), *([str(tree)] if tree else []))
+        protect = _claude_protect(where)
+        widened = _kept_widenings(where, expected_sandbox(pol, policy_file, env), env, entry, allow_widened)
         notice = _notice(where, backup)
         # `ws gate launch` runs inside the wall, so its file keeps the wide project locks; the user's own config is read
         # by every session, so it gets the narrow set (see USER_LOCKS)
@@ -476,12 +521,16 @@ def plan(runner: str, pol: policy.Policy, policy_file: Path, env: Mapping[str, s
         ops = _claude_ops(
             _tune(adapter.generate(pol, cmd, out, policy_file, protect=protect, user_scope=True, pin=pin), notice)
         )
+        # a switch of yours that ws would set back (the sandbox off) is left as you have it, once you've agreed to keep it
+        own = {w.path for w in widened if not w.item}
+        ops = [op for op in ops if tuple(op["path"]) not in own]
     else:
         plug = plugin_path(env)
         files = adapter.generate(pol, cmd, out, policy_file, protect=(str(where), str(plug)), pin=pin)
         ops = _opencode_ops(files)
         copies[plug] = files[adapter.PLUGIN]
-    return GatePlan(files, Merge(runner, where, tuple(ops), backup, tuple(cmd), policy_digest(pol)), copies)
+    kept = tuple(sorted({w.label for w in widened}))
+    return GatePlan(files, Merge(runner, where, tuple(ops), backup, tuple(cmd), policy_digest(pol), kept), copies)
 
 
 def withdrawal(runner: str, env: Mapping[str, str]) -> Merge:
@@ -514,7 +563,13 @@ def classify(m: Merge, entry: Mapping | None) -> str:
     update(
         doc, entry.get("added", []), entry.get("made", []), m.ops, m.path
     )  # a conflict raises here, before any write
-    if raw is not None and entry.get("wanted") == wanted(m.ops) and present(doc, entry.get("added", [])):
+    same_choice = list(entry.get("widened_by_user", [])) == list(m.widened)  # the record of what you chose to keep
+    if (
+        raw is not None
+        and entry.get("wanted") == wanted(m.ops)
+        and present(doc, entry.get("added", []))
+        and same_choice
+    ):
         return "unchanged"
     return "changed"
 
@@ -709,6 +764,7 @@ def _merge_once(m: Merge, entry: Mapping | None, made_dirs: list, new_dirs: list
         "wanted": wanted(m.ops),
         "wanted_ops": list(m.ops),
         "inputs": m.inputs,
+        "widened_by_user": list(m.widened),
         "cmd": list(m.cmd),
         "sha256": _sha(data),
         "exact": exact,
@@ -909,7 +965,7 @@ def check(env: Mapping[str, str] | None = None) -> tuple[str, str, str]:
     dropped: list = []
     same_policy = False
     try:
-        want = plan(runner, pol, policy_file.resolve(), env, entry)
+        want = plan(runner, pol, policy_file.resolve(), env, entry, allow_widened=True)
         stale = wanted(want.merge.ops) != entry.get("wanted")
         dropped = dropped_ops(entry, want.merge.ops)
         same_policy = entry.get("inputs") == want.merge.inputs

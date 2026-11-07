@@ -133,6 +133,19 @@ def _no_real_config():
 
 
 @pytest.fixture(autouse=True)
+def _no_real_managed_settings(tmp_path_factory):
+    """The machine's own managed-settings files are not read: they could widen the wall and turn a test red."""
+    from ws import wallsettings
+
+    empty = tmp_path_factory.mktemp("managed")
+    mp = pytest.MonkeyPatch()
+    mp.setattr(wallsettings, "MANAGED_FILES", (str(empty / "managed-settings.json"),))
+    mp.setattr(wallsettings, "MANAGED_DIRS", (str(empty / "managed-settings.d"),))
+    yield
+    mp.undo()
+
+
+@pytest.fixture(autouse=True)
 def _interpreter_is_stable():
     mp = pytest.MonkeyPatch()
     mp.setattr(userconfig, "require_stable_interpreter", lambda cmd: None)

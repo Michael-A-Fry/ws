@@ -50,7 +50,7 @@ the built-in default, which has the list below.
 | `ask_commands` | list of text | `[]` | Command patterns that run only after you approve that exact call. Same globs as `deny_commands`. A command that also matches `deny_commands` stays denied. |
 | `allow_hosts` | list of text | `[]` | Hosts a session's shell may reach, for runners whose sandbox filters the network (Claude Code). Empty means the policy says nothing about the network. |
 | `allow_write` | list of text | `[]` | Folders besides the project that a walled session may write. |
-| `sandbox` | true or false | `true` | Switch on the runner's own sandbox in what ws writes (Claude Code), both for a session started with `ws gate launch` and for one started the usual way once `ws install` has merged the settings into your file. `false` leaves the block out and marks the session unsandboxed: every command is read strictly, and `ws doctor` (WS012) says so. |
+| `sandbox` | true or false | `true` | Switch on the runner's own sandbox in what ws writes (Claude Code), both for a session started with `ws gate launch` and for one started the usual way once `ws install` has merged the settings into your file. `false` leaves the block out and marks the session unsandboxed, and `ws doctor` (WS012) says so. |
 
 Rules:
 
@@ -150,32 +150,16 @@ The gate's limits are the kinds of text it can't see into. The first four are th
 
 Only the sandbox closes those, so they're closed only in a session that has one.
 
-### When the sandbox is proven
+### When the sandbox isn't up
 
-Where the sandbox is up, a refusal for a path the reader can't resolve isn't what keeps a file safe, so ws can allow the
-command and log it instead. It does that only for a session whose settings carry the sandbox block, and only after it
-has proved the sandbox for that very call:
+The sandbox block is the wall for shell commands. The gate reads the same text with it up or not: allow-with-log, where
+a refusal for a path the reader can't resolve becomes a logged allow inside a wall, isn't in 0.1.8. A command refused
+for a part ws can't read stays refused.
 
-1. At session start the hook builds the wall ws's own sandbox builds from the policy on this machine and runs a small
-   probe inside it. Every `deny_read` path that exists must read as empty, every protected path (the policy, ws's
-   folders, anything named with `--protect`) must refuse a write, and the probe must remove what it made. The result is
-   one line in the session: proven, or not proven with the kinds that failed (never a path), and `ws doctor` (WS012)
-   shows the same.
-2. When a command is refused only because a path word holds a part ws can't read (an unset variable, a command
-   substitution), the hook runs the probe again for that call. If it passes, the command is allowed, and one line goes
-   to `logs/gate-allowed.jsonl` with the kind of the refusal (`unknown-bare`, `unknown-deny-read` or
-   `unknown-protected-write`), the runner and the session. The command isn't logged.
-3. The answer is never stored: there's no file, variable or memory of a pass, so a session has nothing to set. A probe
-   that can't run, runs out of time or answers wrongly counts as a fail.
-
-A half-pass keeps the strict reading, as does `sandbox = false`. These stay refused whether or not the sandbox is proven:
-a named protected path or `deny_read` path, a `deny_commands` rule, a shell started by a launcher or fed by a pipe,
-`stdin-is-code`, the `ws` admin commands, a program name or `eval` text that holds an unknown part, and an unknown part
-that could reach a `deny_read` rule the sandbox can't hide (one with a wildcard in the middle).
-
-A session without the sandbox (the policy switch is off, the machine can't run it, or the runner has none) is
-unsandboxed. The strict reading stays on for it, more commands are refused for paths ws can't read in full, and
-`ws doctor` suggests running under `ws gate launch` for fewer refusals. Linux and WSL2 need bubblewrap and socat
+`ws doctor` (WS012) reads the settings and says which of these holds. `ok` needs the sandbox block in your settings
+file, its `denyRead` list covering every `deny_read` path the wall can hide (a stale list says to run `ws install`), and
+nothing in your settings or a managed-settings file that widens it. Otherwise it says which, and for an unsandboxed
+session it suggests running under `ws gate launch` for fewer refusals. Linux and WSL2 need bubblewrap and socat
 (`sudo apt install bubblewrap socat`, or `sudo dnf install bubblewrap socat`). macOS has its own, and native Windows has
 none.
 

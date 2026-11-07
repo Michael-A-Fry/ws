@@ -147,10 +147,14 @@ With `gate = "every-session"` (the default for a new profile), `ws install` adds
 your runner's own config file, beside yours. It records exactly what it added and saves your file's bytes first. See
 [Upgrade and uninstall](../how-to/upgrade-and-uninstall.md) for the undo. What stays outside the gate:
 
-- **No wall in the shared file.** The file carries no `sandbox` block. A global `failIfUnavailable` sandbox would stop
-  Claude Code on a machine without bubblewrap, and it would override your own sandbox choices. The wall still comes from
-  `ws gate launch`. Where the launch settings and your config file hold the same hook, Claude Code runs it once. OpenCode
-  loads the global plugin and the launch plugin, so a launched OpenCode session asks the gate twice.
+- **The wall in the shared file.** The file carries the `sandbox` block, and that block is the wall for shell commands
+  (`sandbox = false` under `[gate]` leaves it out). Allow-with-log, where a refusal for a part ws can't read becomes a
+  logged allow inside a proven wall, isn't in 0.1.8: the gate refuses the same lines with the block up or not. Run under
+  `ws gate launch` for fewer refusals. Settings you or a team add can widen the block. `ws install` refuses to merge
+  beside them unless you pass `--allow-widened-sandbox`, and `ws doctor` (WS012) then reports the wall as widened by
+  you. A `--settings` flag or a managed policy outside the files doctor reads can widen it without showing there. Where
+  the launch settings and your config file hold the same hook, Claude Code runs it once. OpenCode loads the global plugin
+  and the launch plugin, so a launched OpenCode session asks the gate twice.
 - **What a session can't edit.** In every session: the config file ws merged into, a project's
   `.claude/settings.json`, `.claude/settings.local.json` and `.mcp.json`, the hooks and config of any repo's git folder,
   ws's own control files and the folder of the Python that runs the hook. Change those in a terminal of your own.

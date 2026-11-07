@@ -501,7 +501,7 @@ Set up ws on this machine; run it again and it reports 0 changes.
 
 ```text
 ws install [-h] [--stays-on yes|no] [--server ADDRESS|none] [--notes PATH] [--module NAME] [--runner
-    {claude-code,opencode}] [--model ID] [--cap USD] [-y] [--dry-run]
+    {claude-code,opencode}] [--model ID] [--allow-widened-sandbox] [--cap USD] [-y] [--dry-run]
 ```
 
 | Argument | Meaning |
@@ -512,6 +512,7 @@ ws install [-h] [--stays-on yes|no] [--server ADDRESS|none] [--notes PATH] [--mo
 | `--module NAME` | Also switch on a module; repeat for more. |
 | `--runner RUNNER` | The AI tool ws runs jobs with. One of `claude-code`, `opencode`. |
 | `--model ID` | The default model. |
+| `--allow-widened-sandbox` | Keep settings of yours that open the sandbox (an excluded command, say); ws records the choice. |
 | `--cap USD` | Your own monthly spend cap. |
 | `-y`, `--yes` | No prompts. |
 | `--dry-run` | Show what would change; write nothing. |

@@ -30,12 +30,11 @@ import shlex
 import sys
 import tempfile
 import time
-from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from ws import adapters, approvals, guards, jsonl, output, paths, policy, sandbox, selfcmd, shellwords, wallproof
+from ws import adapters, approvals, guards, output, paths, policy, sandbox, selfcmd, shellwords
 
 if TYPE_CHECKING:
     from ws import gatecorpus
@@ -45,8 +44,6 @@ from ws.output import WsError
 DENY = 2
 CLAIM = 4
 RESULTS = ("allow", "deny", "ask")
-ALLOWED_LOG = "gate-allowed.jsonl"  # under logs/: a call allowed only because the wall was proven (see `soften_for`)
-ALLOWED_SCHEMA = 1
 
 
 class Ask(str):
@@ -54,21 +51,10 @@ class Ask(str):
     the runner); `replay` tells the two apart by the type."""
 
 
-def soften_for(pol: policy.Policy, wall: Callable[[], bool] | None) -> policy.Soften | None:
-    """The allow-with-log switch for a session whose wall `wall()` can prove, or None (strict). `wall` is asked only when
-    a command holds a part ws cannot read and nothing else denies it, and its answer is used for that call alone."""
-    if wall is None or not pol.gate.sandbox:
-        return None
-    covered = policy.wall_rules(pol)
-    return policy.Soften(wall, covered, len(covered) == len(set(pol.gate.deny_read)))
-
-
-def evaluate(
-    pol: policy.Policy, call: Call, protect: tuple[str, ...] = (), soften: policy.Soften | None = None
-) -> str | None:
+def evaluate(pol: policy.Policy, call: Call, protect: tuple[str, ...] = ()) -> str | None:
     """The reason a call is denied, or None. The one place a neutral Call meets the policy."""
     if call.kind == "command":
-        return policy.is_denied_command(pol, call.value, protect=protect, soften=soften)
+        return policy.is_denied_command(pol, call.value, protect=protect)
     if call.kind == "read":
         return policy.is_denied_read(pol, call.value)
     if call.kind == "search":
@@ -110,12 +96,8 @@ def check(
     layer: list[str] | None = None,
     clock=None,
     home: Path | None = None,
-    wall: Callable[[], bool] | None = None,
-    softened: list[str] | None = None,
 ) -> str | approvals.Claim | None:
     """None to allow, else the reason. Raises on anything it cannot judge; cmd_check turns that into a deny.
-    `wall`, when the session has a sandbox block, proves the wall now (see ws.wallproof); a command that is refused only
-    for a part ws cannot read is then allowed, and `softened` gets the kinds of those refusals (see policy.Soften).
     A shell command that matches `ask_commands` (and nothing denies) runs only on a granted approval bound to this
     runner, command, folder and session; `approval_root` is where those live (None: it cannot ask, so it denies, and
     the reason is an `Ask`). With consume=False (inside the wall) a valid grant comes back as a Claim to be claimed
@@ -125,7 +107,7 @@ def check(
     guards (the ws home their state lives in, and the time). The rules, the guards and the approval check read the
     command under one clock (see shellwords.time_limit), so a command cannot take them one after another."""
     with shellwords.time_limit():
-        return _check(runner, raw, pol, protect, approval_root, consume, notes, layer, clock, home, wall, softened)
+        return _check(runner, raw, pol, protect, approval_root, consume, notes, layer, clock, home)
 
 
 def _check(
@@ -139,8 +121,6 @@ def _check(
     layer: list[str] | None,
     clock,
     home: Path | None,
-    wall: Callable[[], bool] | None = None,
-    softened: list[str] | None = None,
 ) -> str | approvals.Claim | None:
     payload = json.loads(raw)
     if not isinstance(payload, dict):
@@ -153,14 +133,11 @@ def _check(
         _mark(layer, "preflight")
         return why
     calls = _calls(adapter, payload)
-    soften = soften_for(pol, wall)
     for call in calls:
-        reason = evaluate(pol, call, protect, soften)
+        reason = evaluate(pol, call, protect)
         if reason:
             _mark(layer, f"rule:{call.kind}")
             return reason
-        if soften is not None and softened is not None:
-            softened.extend(soften.logged)
     session, cwd = _text(payload, "session_id"), _text(payload, "cwd")
     for name, call, found in guards.run(pol, "pre", calls, _context(runner, "pre", payload, clock, home)):
         reason = f"{name}: {found.reason}"
@@ -192,30 +169,14 @@ def _check(
     return None
 
 
-def event(
-    runner: str,
-    raw: str,
-    pol: policy.Policy,
-    *,
-    clock=None,
-    home: Path | None = None,
-    wall: Callable[[], wallproof.Proof] | None = None,
-) -> tuple[int, str, str]:
+def event(runner: str, raw: str, pol: policy.Policy, *, clock=None, home: Path | None = None) -> tuple[int, str, str]:
     """(exit code, stdout, stderr) for a hook payload of an event that is not a call's check. Raises on a payload it
-    cannot read; cmd_event turns that into exit 0 and one line. `wall`, when the session has a sandbox block, is the
-    canary: at session start it runs and one line says whether the wall is proven (kinds only, never a path)."""
+    cannot read; cmd_event turns that into exit 0 and one line."""
     with shellwords.time_limit():
-        return _event(runner, raw, pol, clock, home, wall)
+        return _event(runner, raw, pol, clock, home)
 
 
-def _event(
-    runner: str,
-    raw: str,
-    pol: policy.Policy,
-    clock,
-    home: Path | None,
-    wall: Callable[[], wallproof.Proof] | None = None,
-) -> tuple[int, str, str]:
+def _event(runner: str, raw: str, pol: policy.Policy, clock, home: Path | None) -> tuple[int, str, str]:
     payload = json.loads(raw)
     if not isinstance(payload, dict):
         raise TypeError("payload is not a JSON object")
@@ -231,8 +192,6 @@ def _event(
     calls = _calls(adapter, payload) if ev == "post" else []
     found = guards.run(pol, ev, calls, _context(runner, ev, payload, clock, home))
     lines = [f"ws gate: {n}: {f.reason}" for n, _, f in found]
-    if ev == "start" and wall is not None and pol.gate.sandbox:
-        lines.append(_wall_line(wall()))
     if not lines:
         return 0, "", ""
     text = "\n".join(lines) + "\n"
@@ -241,16 +200,6 @@ def _event(
     if ev == "post" and any(f.action in ("deny", "warn") for _, _, f in found):
         return DENY, "", text
     return 0, "", text
-
-
-def _wall_line(proof: wallproof.Proof) -> str:
-    """The one session line for the wall canary. A pass says so; a half-pass names its kinds and what it costs."""
-    if proof.ok:
-        return f"ws gate: sandbox: {wallproof.describe(proof)}"
-    return (
-        f"ws gate: sandbox: not proven here ({wallproof.describe(proof)}); every command is read strictly, so a path "
-        "ws can't read in full is refused (`ws doctor`, WS012)"
-    )
 
 
 def _text(payload: dict, key: str) -> str:
@@ -304,54 +253,20 @@ def _protect(policy_file: Path, extra: list[str] | None = None) -> tuple[str, ..
     )
 
 
-def _wall_marker_ok() -> bool:
-    """False when the settings say they carry no sandbox block (WS_SANDBOXED=0). Never what makes a wall: the hook's own
-    `--wall` and the proof are."""
-    return os.environ.get(approvals.SANDBOX_MARKER) != "0"
-
-
-def _wall_prover(args: argparse.Namespace, pol: policy.Policy, protect: tuple[str, ...]) -> Callable[[], bool] | None:
-    """The proof the hook asks for, when its command says `--wall`: built here, run only when a call needs it."""
-    if not getattr(args, "wall", False) or not pol.gate.sandbox or not _wall_marker_ok():
-        return None
-    project = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
-    return lambda: wallproof.prove(pol, protect, project=project).ok
-
-
-def _log_allowed(runner: str, raw: str, kinds: list[str]) -> None:
-    """One line in logs/gate-allowed.jsonl for a call allowed because the wall was proven: the kinds of the refusals it
-    stood in for, the runner and the session id. Never the command. A log that can't be written never stops the call."""
-    try:
-        session = json.loads(raw).get("session_id")
-        rec = {"runner": runner, "session": session if isinstance(session, str) else "", "kinds": sorted(set(kinds))}
-        jsonl.append(paths.state_dir() / "logs" / ALLOWED_LOG, jsonl.stamped(rec, ALLOWED_SCHEMA))
-    except (OSError, ValueError, AttributeError, TypeError):
-        pass
-
-
 def cmd_check(args: argparse.Namespace) -> int:
     notes: list[str] = []
-    softened: list[str] = []
-    raw = ""
     try:
-        raw = sys.stdin.read()
         with _pinned(args):
             policy_file, pol = _load_policy(args)
-            protect = _protect(policy_file, args.protect)
             reason = check(
                 args.runner,
-                raw,
+                sys.stdin.read(),
                 pol,
-                protect,
+                _protect(policy_file, args.protect),
                 approvals.approvals_dir(),  # ws's state folder, whatever --policy says: ws approve and ws gate launch use it too
                 consume=approvals.FD_ENV not in os.environ,
                 notes=notes,
-                wall=_wall_prover(args, pol, protect),
-                softened=softened,
             )
-            if reason is None and softened:
-                _log_allowed(args.runner, raw, softened)
-                notes.append(f"allowed in a proven sandbox: {', '.join(sorted(set(softened)))}")
     except BaseException as e:  # noqa: BLE001 - fail closed on anything, including a broken policy file
         reason = _reason_of(e)
     for note in notes:
@@ -368,13 +283,8 @@ def cmd_check(args: argparse.Namespace) -> int:
 def cmd_event(args: argparse.Namespace) -> int:
     try:
         with _pinned(args):
-            policy_file, pol = _load_policy(args)
-            wall = None
-            if getattr(args, "wall", False) and _wall_marker_ok():
-                protect = _protect(policy_file)
-                project = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
-                wall = lambda: wallproof.prove(pol, protect, project=project)  # run only at session start
-            code, out, err = event(args.runner, sys.stdin.read(), pol, wall=wall)
+            _, pol = _load_policy(args)
+            code, out, err = event(args.runner, sys.stdin.read(), pol)
     except WsError as e:  # advice only: ws's folders or its policy are not as installed, so the guards do not run
         code, out, err = 0, "", f"ws gate event: skipped ({_reason_of(e)})\n"
     except Exception as e:  # noqa: BLE001 - advice only: a crash here never blocks the session
@@ -695,9 +605,6 @@ def register(sub) -> None:
     c.add_argument(
         "--protect", action="append", metavar="PATH", help="a file or folder of ws's own that a session may not write"
     )
-    c.add_argument(
-        "--wall", action="store_true", help="the settings this hook is in switch the runner's sandbox on (set by ws)"
-    )
     c.set_defaults(func=cmd_check, raw=True)  # a hook: the runner reads this command's own stdout, stderr and exit code
 
     e = gs.add_parser(
@@ -705,9 +612,6 @@ def register(sub) -> None:
     )
     common(e)
     paths.add_pin_option(e)
-    e.add_argument(
-        "--wall", action="store_true", help="the settings this hook is in switch the runner's sandbox on (set by ws)"
-    )
     e.set_defaults(func=cmd_event, raw=True)  # a hook: the runner reads this command's own stdout, stderr and exit code
 
     r = gs.add_parser("replay", help="run recorded hook payloads against the policy and print allow, deny or ask")

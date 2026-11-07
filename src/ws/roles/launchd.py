@@ -14,9 +14,8 @@ import os
 import plistlib
 from pathlib import Path
 
-from ws import install
+from ws import install, paths
 from ws.jobs import Scheduled, When
-from ws.profile import ws_home
 from ws.roles import FAIL, OK, WARN, _schedule
 
 ROLE, NAME = "scheduler", "launchd"
@@ -36,8 +35,7 @@ def interval(when: When) -> dict[str, int]:
 
 
 def render(job: Scheduled, env, ws_cmd: list[str]) -> str:
-    home = os.path.abspath(ws_home(env))
-    environment = {"WS_HOME": home}
+    environment = paths.env_for(env, persist=True)
     if path := _schedule.path_value(env):
         environment["PATH"] = path
     log = str(_schedule.logs_dir(env) / f"{job.name}.log")

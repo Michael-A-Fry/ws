@@ -11,7 +11,7 @@ confines every shell command Claude runs, whatever program it starts:
     start, instead of running commands unsandboxed. Fail closed, as the hook is.
   * `allowUnsandboxedCommands: false`: the model's `dangerouslyDisableSandbox` retry is ignored, so a command the
     sandbox stops cannot be re-run outside it. Nothing is "approved" past the wall: what must leave it, a person runs.
-  * `filesystem.denyWrite`: `$WS_HOME` (the folder the policy sits in) and every protected path. It beats any allowWrite
+  * `filesystem.denyWrite`: the folder the policy sits in and every protected path (ws's folders included). It beats any allowWrite
     a project adds, so a project's own settings cannot reopen it.
   * the project's own config is held too (ws.sandbox PROJECT_LOCKED and GIT_LOCKED: `.claude`, `.opencode`, `.mcp.json`,
     `opencode.json(c)`, `tui.json(c)`, `.git/hooks`, `.git/config`, `.git/commondir`, `.git/worktrees`, `.git/modules`), so a

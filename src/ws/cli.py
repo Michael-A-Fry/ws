@@ -20,11 +20,13 @@ from ws import (
     install,
     mcp_server,
     memory,
+    migrate,
     modules,
     notes,
     notesdetect,
     osinfo,
     output,
+    paths,
     rating,
     roles,
     run,
@@ -65,7 +67,12 @@ def _ask(prompt: str, default: str, interactive: bool) -> str:
 
 def cmd_doctor(args: argparse.Namespace) -> int:
     osi = osinfo.detect()
-    path = profile_path()
+    try:
+        path = profile_path()
+    except output.WsError as e:
+        if e.kind != "ambiguous_layout":
+            raise
+        path = paths.probe().xdg.config / "profile.toml"  # WS010 says what to do; the rest of the checks still run
     checks = doctor.run_checks(osi, path, network=not args.offline)
     bad = any(c.status in doctor.BAD for c in checks)
     if args.json:
@@ -275,6 +282,7 @@ def build_parser() -> argparse.ArgumentParser:
     ws_globals.register(sub)
     session.register(sub)
     install.register(sub)
+    migrate.register(sub)
     modules.register(sub)
     devices.register(sub)
     skills.register(sub)

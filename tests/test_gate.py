@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from ws import adapters, cli, gate, policy
+from ws import adapters, cli, gate, paths, policy
 
 PUSH = "git push --force origin main"
 
@@ -124,7 +124,9 @@ def test_claude_code_rule_syntax_for_paths_and_tools(home, tmp_path):
     middle = [
         d for d in deny[3:-2] if not d.startswith("Edit(**/") and d not in secret_reads
     ]  # the project's own config: ws.sandbox PROJECT_LOCKED
-    assert all(d.startswith("Edit(//") for d in middle) and len(middle) == 2 * (len(policy.CONTROL_NAMES) + 1)
+    assert all(d.startswith("Edit(//") for d in middle) and len(middle) == 2 * (
+        len(policy.CONTROL_NAMES) + 1 + len(paths.protected_roots())
+    )
 
 
 def test_opencode_config_and_shim(home, tmp_path):

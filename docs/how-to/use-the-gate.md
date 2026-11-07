@@ -16,8 +16,8 @@ first, read [The gate](../explanation/gate.md).
    ws gate init
    ```
 
-   It prints `ws: wrote .../policy.toml`. The file is `$WS_HOME/policy.toml` (`~/.ws/policy.toml` unless you set
-   `WS_HOME`). It's commented. Run the command again and it prints `ws: 0 changes to ...`.
+   It prints `ws: wrote .../policy.toml`. The file is `~/.config/ws/policy.toml` (`policy.toml` in
+   [the config folder](../reference/stores.md#where-ws-keeps-its-files)). It's commented. Run the command again and it prints `ws: 0 changes to ...`.
 
 2. Add a rule. Open `policy.toml` and add a line inside the existing `deny_commands` list. This one blocks `curl`.
 
@@ -35,10 +35,10 @@ first, read [The gate](../explanation/gate.md).
    (`~/.claude` or `~/.config/opencode`): ws refuses.
 
    ```sh
-   ws gate generate --runner claude-code --out ~/.ws/gate/claude-code
+   ws gate generate --runner claude-code --out ~/.local/state/ws/gate/claude-code
    ```
 
-   Use this folder for Claude Code: `ws gate launch` in step 5 reads its settings from `$WS_HOME/gate/claude-code`
+   Use this folder for Claude Code: `ws gate launch` in step 5 reads its settings from `~/.local/state/ws/gate/claude-code`
    (`ws setup` writes the same place). For OpenCode, use `--runner opencode` and another folder. The command prints
    how to start the runner with the output.
    It's idempotent: a second run prints `0 changes`.
@@ -87,11 +87,11 @@ With `bulk-staging` on, `git add -A` and `git commit -am` are stopped and `git a
 
 ## Replay recorded calls
 
-Name `record-calls` in `on` and each tool call a session makes is appended to `$WS_HOME/logs/gate-calls.jsonl`. After you
-change a rule, run the recorded calls against it.
+Name `record-calls` in `on` and each tool call a session makes is appended to `~/.local/state/ws/logs/gate-calls.jsonl`.
+After you change a rule, run the recorded calls against it.
 
 ```sh
-ws gate replay ~/.ws/logs/gate-calls.jsonl --runner claude-code
+ws gate replay ~/.local/state/ws/logs/gate-calls.jsonl --runner claude-code
 ```
 
 Each line prints `allow`, `deny` or `ask`. To pin an answer, make a file of `{"payload": {...}, "expect": "deny"}` lines.

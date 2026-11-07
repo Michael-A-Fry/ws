@@ -6,20 +6,18 @@ The service runs `ws run <name>` (or the job's `command`, for example `ws backup
 `Persistent=true`, so a run missed while the machine was off happens at the next start; on a machine that stays on it
 never fires, so the "stays on?" answer is not needed here.
 
-The files live in `$WS_HOME/jobs/units/`. `activate` runs `systemctl --user link` on them, which puts one symlink per
-file in `~/.config/systemd/user` (outside $WS_HOME), then enables the timers. `deactivate` (`disable --now`, for the
+The files live in `<config>/jobs/units/`. `activate` runs `systemctl --user link` on them, which puts one symlink per
+file in `~/.config/systemd/user` (outside ws's folders), then enables the timers. `deactivate` (`disable --now`, for the
 timers and the services) takes those links away again, so none is left dangling; `ws schedule remove`, `ws schedule apply` for a job whose schedule is gone, and
 `ws uninstall` all call it. Both go through an injectable runner, so tests check the argv and never call systemctl.
 """
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
-from ws import install
+from ws import install, paths
 from ws.jobs import DAYS, Scheduled, When
-from ws.profile import ws_home
 from ws.roles import FAIL, OK, WARN, _schedule
 
 ROLE, NAME = "scheduler", "systemd"
@@ -48,8 +46,7 @@ def on_calendar(when: When) -> str:
 def render(job: Scheduled, env, ws_cmd: list[str]) -> dict[str, str]:
     """{file name: text} for one job."""
     unit = f"{PREFIX}{job.name}"
-    home = os.path.abspath(ws_home(env))
-    lines = [f"Environment={_quote('WS_HOME=' + home)}"]
+    lines = [f"Environment={_quote(f'{k}={v}')}" for k, v in paths.env_for(env, persist=True).items()]
     if path := _schedule.path_value(env):
         lines.append(f"Environment={_quote('PATH=' + path)}")
     exec_start = " ".join(_quote(w, expand=True) for w in [*ws_cmd, *job.argv])

@@ -57,7 +57,7 @@ exist and lower the risk.
 5. Generate the runner files again and start a new session.
 
    ```sh
-   ws gate generate --runner claude-code --out ~/.ws/gate/claude-code
+   ws gate generate --runner claude-code --out ~/.local/state/ws/gate/claude-code
    ```
 
 6. If you connect a mail tool yourself (an MCP server, a script), give it a draft-only scope at the mail provider. Don't

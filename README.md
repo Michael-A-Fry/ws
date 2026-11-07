@@ -54,9 +54,9 @@ To follow a whole first session, see the [first-run tutorial](docs/tutorials/fir
 `ws install` puts six skills in your runner's skills folder: `align`, `checkpoint`, `taste-gate`, `dataviz`, `resume`
 and `ship`. `ws skills` lists them per runner. A skill you already have under one of those names stays as it is.
 
-To use ws's version of a name you already have, run `ws skills adopt NAME`. Yours moves to
-`$WS_HOME/backups/skills/<runner>/` and ws installs its own. `ws skills restore NAME` takes ws's copy out and moves yours
-back.
+To use ws's version of a name you already have, run `ws skills adopt NAME`. Yours moves to `backups/skills/<runner>/` in
+ws's state folder (`~/.local/state/ws`) and ws installs its own. `ws skills restore NAME` takes ws's copy out and moves
+yours back.
 
 ## Verify
 

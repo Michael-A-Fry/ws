@@ -4,6 +4,27 @@ Every log and record file ws writes: where it's kept, which module writes it, wh
 it lives. `tests/test_stores.py` fails when a module under `src/ws` writes a JSON-lines file that this page doesn't
 list.
 
+## Where ws keeps its files
+
+ws keeps its files in four folders that follow the XDG base directory rules. The defaults are the same on macOS and
+Linux, and a relative `XDG_*` value is ignored. Every path on this page is given under one of them.
+
+| Folder | Default | Holds |
+|---|---|---|
+| Config | `$XDG_CONFIG_HOME/ws` (`~/.config/ws`) | What you write: `policy.toml`, `profile.toml`, `secrets.toml` (the registry), `jobs/`, `release`. |
+| State | `$XDG_STATE_HOME/ws` (`~/.local/state/ws`) | What ws writes as it works: `logs/`, `runs/`, `approvals/`, `sessions/`, `gate/`, `wall/`, `backups/`, `run/`, `ratings.jsonl`, `versions.json`, `install-manifest.json`, `migrate-manifest.json`. |
+| Data | `$XDG_DATA_HOME/ws` (`~/.local/share/ws`) | What you'd miss: the secrets store (`secrets/`) and the eval tasks and results (`eval/`). |
+| Cache | `$XDG_CACHE_HOME/ws` (`~/.cache/ws`) | What ws can rebuild: the memory search index (`index/`). |
+
+Set `WS_HOME` and all four live in that one folder, laid out the way ws always did (`policy.toml`, `logs/` and
+`secrets/` side by side). Set `WS_CONFIG_DIR`, `WS_STATE_DIR`, `WS_DATA_DIR` or `WS_CACHE_DIR` to a full path to move one
+folder; the most specific wins. `ws config` shows the folders in use and where each came from.
+
+Files from an earlier ws are in `~/.ws`. Nothing moves by itself: while that folder exists and the new ones hold none
+of ws's files, ws keeps using it and `ws doctor` (WS010) says to run [`ws migrate`](cli.md#ws-migrate). With both, ws
+stops with an error that names the two places, because it can't tell which one holds the truth. The wall makes all four
+folders read-only, and the gate refuses a session's writes to each of them in either layout.
+
 ## One convention
 
 - Every line of a JSON-lines log carries `schema`, a whole number that's one per log, and `ts`, the time the line was
@@ -23,7 +44,7 @@ list.
 
 ## JSON-lines logs
 
-| Log | Path under `$WS_HOME` | Writer | Fields | Schema | Time key | Kept |
+| Log | Path under its folder | Writer | Fields | Schema | Time key | Kept |
 |---|---|---|---|---|---|---|
 | Run records | `logs/runs.jsonl` | `src/ws/runrecord.py` (for `ws run`) | The keys of the run-record schema (`ws.runschema.SCHEMA`): job, runner, models, tokens, cost, status | 2 | `started_at`, `ended_at` | Rotates at 5 MiB; an old file that holds a record from this or last month stays |
 | Run records, fallback | `logs/runs.fallback.jsonl` | `src/ws/runrecord.py` | The same record, when `runs.jsonl` can't be written | 2 | `started_at`, `ended_at` | Never rotated or locked; `read` includes it |
@@ -42,17 +63,17 @@ Notes:
   there is the next schema number.
 - The broker audit log predates the convention. It's the one log that doesn't go through `ws.jsonl`, and it has no
   `schema`. Its time key is `t`. A change to it takes a schema number of its own.
-- Ratings sit at the top of `$WS_HOME` and not in `logs/`. The top holds the control files a session may not write,
+- Ratings sit at the top of the state folder and not in `logs/`. The top holds the control files a session may not write,
   and the person's verdicts sit with them, so an agent can't mark its own work. `logs/` is where a session may be able
   to write.
-- The canary log used to be `canary.jsonl` at the top of `$WS_HOME`. ws renames that file to `canary.jsonl.old` and
+- The canary log used to be `canary.jsonl` at the top of the state folder. ws renames that file to `canary.jsonl.old` and
   starts `logs/canary.jsonl` empty.
 
 ## Record files
 
 One JSON file per record, written to a temporary name and renamed into place (0600 in a 0700 folder).
 
-| Record | Path under `$WS_HOME` | Writer | Fields | Schema | Time key | Kept |
+| Record | Path under its folder | Writer | Fields | Schema | Time key | Kept |
 |---|---|---|---|---|---|---|
 | Session | `sessions/<id>.json` | `src/ws/session.py` | `schema`, `ts`, `session_id`, `release`, `started_at`, `runner`, `cwd` | 1 | `ts` | Removed 30 days after its last change |
 | Approval, pending and granted | `approvals/pending/<id>.json`, `approvals/granted/<id>.json` | `src/ws/approvals.py` | `schema`, `v`, `ts`, `id`, `bound`, `created`, `granted` | 1 | `ts` (when the file was written) | Expires 10 minutes after it's made; a granted one is deleted when it's used |
@@ -62,6 +83,7 @@ One JSON file per record, written to a temporary name and renamed into place (06
 
 ## Where the work folders go
 
-A job with no `cwd` runs in `$XDG_STATE_HOME/ws/work/<run_id>` (default `~/.local/state/ws/work/<run_id>`), outside
-`$WS_HOME` because the wall makes `$WS_HOME` read-only. `ws uninstall` removes the empty run folders there, then
-`work/` and `ws/` once they're empty. A run folder that holds a file stays, with the folders above it.
+A job with no `cwd` runs in `$XDG_STATE_HOME/ws-work/<run_id>` (default `~/.local/state/ws-work/<run_id>`), beside ws's
+folders and not in one, because the wall makes those read-only. `ws uninstall` removes the empty run folders there, then
+`ws-work` once it's empty. A run folder that holds a file stays, with the folder above it. An earlier ws used
+`~/.local/state/ws/work`; `ws uninstall` tidies that too.

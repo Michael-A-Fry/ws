@@ -9,9 +9,9 @@ The monthly cap is checked before each trial, not during it: keep `timeout_s` an
 
 ## Write a task
 
-One TOML file per task in `$WS_HOME/eval/tasks/`, named after its id. The file must belong to you and not be writable by
-others, like a job file. A file is used whole or refused: an unknown key, a bad grader or a path outside the task folder
-rejects it, and one bad file stops the whole set from loading.
+One TOML file per task in `~/.local/share/ws/eval/tasks/`, named after its id. The file must belong to you and not be
+writable by others, like a job file. A file is used whole or refused: an unknown key, a bad grader or a path outside the
+task folder rejects it, and one bad file stops the whole set from loading.
 
 ```toml
 id = "invoice-total"
@@ -108,8 +108,8 @@ Known limits of the grader's wall:
 
 - It has the same network and read access as the runner's wall (it's the same `ws.sandbox` wall), so it gives the agent's
   code nothing it didn't already have in the trial; it doesn't close the network.
-- `$WS_HOME/approvals/pending` and `$WS_HOME/sessions` stay writable inside it. That's by design and harmless: a forged
-  pending record grants nothing (see `ws.approvals`).
+- `~/.local/state/ws/approvals/pending` and `~/.local/state/ws/sessions` stay writable inside it. That's by design and
+  harmless: a forged pending record grants nothing (see `ws.approvals`).
 - A grader run as root gets no nonce protection (root has CAP_SYS_PTRACE, which `PR_SET_DUMPABLE` doesn't stop), so
   don't run evals as root.
 
@@ -123,11 +123,11 @@ ws eval run --task invoice-total --job daily --trials 5
 ```
 
 The job file supplies the runner, model, options and secrets; the task replaces its prompt, folder, timeout and turn
-limit. Folders are made in the system temp folder (not under `$WS_HOME`, where the sandbox denies shell writes); a
+limit. Folders are made in the system temp folder (not in one of ws's folders, where the sandbox denies shell writes); a
 trial that passes is cleaned up, a failed one is kept and its path printed (`--keep` keeps all). Each trial writes a run
-record with `eval: {task, trial, arm, pass}` and a line in `$WS_HOME/eval/results.jsonl`. The record is written first,
-with `pass` null; grading follows, and the result line holds the verdict, the job, and a hash of the task text. A signal
-during grading leaves the record and a result line that says grading was cut short. A refused run (no cap, cap
+record with `eval: {task, trial, arm, pass}` and a line in `~/.local/share/ws/eval/results.jsonl`. The record is written
+first, with `pass` null; grading follows, and the result line holds the verdict, the job, and a hash of the task text. A
+signal during grading leaves the record and a result line that says grading was cut short. A refused run (no cap, cap
 reached) stops the batch.
 
 ## Read the report
@@ -187,7 +187,7 @@ ws eval reject ID       # sets it aside; harvest will not offer it again
 
 Harvest looks at your runs in the window and proposes one task per job from its most recent run that failed, timed out,
 was rated down, or was an `ok` run that followed a failure of the same job within a day (a retry). Refused runs and eval
-trials aren't used. Each proposal is written to `$WS_HOME/eval/proposed/<id>.toml` with `approved = false`,
+trials aren't used. Each proposal is written to `~/.local/share/ws/eval/proposed/<id>.toml` with `approved = false`,
 `review_required = true`, `source_run`, `source_job`, a placeholder rubric grader (so it can't run until you give it a
 real grader), and the job's prompt. A run record doesn't keep its prompt, so the prompt comes from the job file as it's
 now, which may differ from what the run used; `prompt_source` says so. A malformed run id or a proposal that's not a
@@ -202,5 +202,5 @@ and shapes, not secret values: the store belongs to the broker and the registry 
 them. That check catches shapes, not meaning: read each proposal before you approve it. Confidential or client data in
 a prompt is for you to catch.
 
-Files: tasks in `$WS_HOME/eval/tasks/`, proposals in `proposed/`, set-aside ones in `rejected/`, trial results in
-`results.jsonl`, stored looks in `looks.jsonl`.
+Files: tasks in `~/.local/share/ws/eval/tasks/`, proposals in `proposed/`, set-aside ones in `rejected/`, trial results
+in `results.jsonl`, stored looks in `looks.jsonl`.

@@ -23,7 +23,7 @@ link or can't be read. The same quote, negation and future rules apply (`goes li
 aren't claims). It reads the link and nothing else: no fetch, no network, nothing written.
 
 When the session stops, the claims in the runner's last message (if the stop payload carries it) are appended to
-`$WS_HOME/logs/claims.jsonl` with whether each commit was on REF. That is a log only; nothing is stopped. Each line
+`<state>/logs/claims.jsonl` with whether each commit was on REF. That is a log only; nothing is stopped. Each line
 carries `schema` and `ts`, and `at` (the legacy spelling of `ts`) beside them.
 """
 
@@ -37,10 +37,9 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from ws import jsonl
+from ws import jsonl, paths
 from ws.guards import Finding, known_keys, text_list
 from ws.policy import PolicyError
-from ws.profile import ws_home
 
 NAME = "claims"
 EVENTS = ("pre", "stop")
@@ -529,7 +528,7 @@ def _log(cfg: Config, ctx) -> Finding | None:
     }
     try:
         jsonl.append(
-            (ctx.home if ctx.home is not None else ws_home()) / "logs" / LOG,
+            (ctx.home if ctx.home is not None else paths.state_dir()) / "logs" / LOG,
             jsonl.stamped(rec, SCHEMA_VERSION, now),
         )
     except OSError as e:

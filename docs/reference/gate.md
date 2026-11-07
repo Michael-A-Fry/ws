@@ -44,8 +44,8 @@ A corpus file is JSON lines, schema `ws.gate-corpus/1`: one row to a line. This 
 | `guards` | Optional. Names of guards to switch on for this row alone. The row gets a state folder of its own, so its answer doesn't depend on the rows before it. |
 
 Paths use `~`, `$HOME`, `{HOME}` and `{CWD}`. Replay makes two scratch folders, fills `{HOME}` and `{CWD}` with them,
-points `HOME` and `WS_HOME` at the first while it runs, and removes both after. `${HOME}` is the shell's own and is left
-alone. A corpus therefore names no real path.
+points `HOME` and `WS_HOME` (one folder, `.ws` in it) at the first while it runs, and removes both after. `${HOME}` is
+the shell's own and is left alone. A corpus therefore names no real path.
 
 An unknown key, a repeated `id`, a bad `expect` or `source` and a payload that isn't a call are refused with the file
 and line. A row that can't be judged (a payload the runner's adapter can't read) counts as a deny, as it does in the

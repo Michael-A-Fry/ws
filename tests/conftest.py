@@ -35,10 +35,15 @@ _CONFIG_VARS = (
 
 _REAL_HOME = Path(os.path.expanduser("~"))
 _REAL_WS_HOME = Path(os.environ.get("WS_HOME") or _REAL_HOME / ".ws")
+_REAL_XDG_CONFIG = _REAL_HOME / ".config" / "ws"  # where ws keeps its files since the XDG layout
+_REAL_XDG_STATE = _REAL_HOME / ".local" / "state" / "ws"
 _WATCHED = (
     _REAL_WS_HOME / "install-manifest.json",
     _REAL_WS_HOME / "profile.toml",
     _REAL_WS_HOME / "policy.toml",
+    _REAL_XDG_STATE / "install-manifest.json",
+    _REAL_XDG_CONFIG / "profile.toml",
+    _REAL_XDG_CONFIG / "policy.toml",
     _REAL_HOME / ".claude" / "settings.json",
     _REAL_HOME / ".claude" / "skills",
     _REAL_HOME / ".config" / "opencode" / "opencode.json",

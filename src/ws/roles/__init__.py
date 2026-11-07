@@ -69,7 +69,7 @@ def folder(cfg: dict) -> tuple[Path | None, tuple[str, str] | None]:
 
 def deactivate_units(paths, env, runner=None) -> list[str]:
     """Switch off the timers and agents whose unit files these are (the others are ignored). Returns what went wrong.
-    `ws uninstall` calls this before it deletes the files, because the links live outside $WS_HOME."""
+    `ws uninstall` calls this before it deletes the files, because the links live outside ws's folders."""
     from ws.roles import _schedule, launchd, systemd
 
     folder = _schedule.units_dir(env)

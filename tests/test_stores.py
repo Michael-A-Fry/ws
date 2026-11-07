@@ -95,7 +95,7 @@ def listed() -> dict[str, dict[str, str]]:
     """File name -> its row, for the JSON-lines logs the page lists."""
     out = {}
     for row in table("JSON-lines logs"):
-        name = row["Path under `$WS_HOME`"].strip("`").rsplit("/", 1)[-1]
+        name = row["Path under its folder"].strip("`").rsplit("/", 1)[-1]
         out[name] = row
     return out
 
@@ -134,8 +134,8 @@ def modules_that_write() -> dict[str, set[str]]:
 
 # Modules that spell out a .jsonl name without writing it: the policy lists ws's logs among the paths a session may
 # not write, the Claude Code adapter reads the runner's own transcript, and the home API names the default path of
-# the asks file it reads (it writes nothing).
-NAMES_ONLY = {"src/ws/policy.py", "src/ws/adapters/claude_code.py", "src/ws/home/api.py"}
+# the asks file it reads (it writes nothing), and ws.paths names ratings.jsonl in its table of where files live.
+NAMES_ONLY = {"src/ws/policy.py", "src/ws/adapters/claude_code.py", "src/ws/home/api.py", "src/ws/paths.py"}
 # Files another tool writes and ws only reads (the home API's default sources). Not ws stores, so stores.md doesn't
 # list them; only a NAMES_ONLY module may name one.
 FOREIGN = {"asks.jsonl"}

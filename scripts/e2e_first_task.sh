@@ -367,11 +367,11 @@ PY
     RUN_MS="$(cut -f2 "$BASE/record.tsv")"
     WORK="$(cut -f3 "$BASE/record.tsv")"
     echo "run $RUN_ID ok in $RUN_MS ms, working folder $WORK"
-    # the default working folder: under the state dir, never inside WS_HOME (the wall makes that read-only)
+    # the default working folder: beside the state dir, never inside ws's folders (the wall makes those read-only)
     case "$WORK" in
-        "$HOME/.local/state/ws/work/"*) ;;
+        "$HOME/.local/state/ws-work/"*) ;;
         *)
-            echo "the working folder is not under $HOME/.local/state/ws/work/: $WORK"
+            echo "the working folder is not under $HOME/.local/state/ws-work/: $WORK"
             return 1
             ;;
     esac

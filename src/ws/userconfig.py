@@ -7,7 +7,7 @@ The promises, each pinned by a test:
 - Yours stays. Your hooks, permissions, env and keys ws does not use are never touched, and their order is kept. ws
   appends its items; it refuses, and changes nothing, when one of your values would be overridden (an `env` key you set
   to another value).
-- Before the first write the file's own bytes go to `$WS_HOME/backups/` (mode 0600).
+- Before the first write the file's own bytes go to `backups/` in ws's state folder (mode 0600).
 - The manifest records the items ws added, as exact JSON, the items the release asked for (`wanted_ops`, so doctor can
   see a later release stop asking for one), and the hash of ws's last write.
 - Undo is exact only when it can be. If the file is still what ws last wrote, and it was not changed between two
@@ -41,7 +41,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
-from ws import adapters, policy, profile, selfcmd
+from ws import adapters, paths, policy, profile, selfcmd
 from ws.approvals import ENV_MARKER
 from ws.output import WsError
 
@@ -74,7 +74,7 @@ class Merge:
 
 @dataclass(frozen=True)
 class GatePlan:
-    files: dict  # name -> text for $WS_HOME/gate/<runner>/
+    files: dict  # name -> text for gate/<runner>/ in ws's state folder
     merge: Merge
     copies: dict = field(default_factory=dict)  # more plain files: path -> text (OpenCode's plugin)
 
@@ -93,12 +93,12 @@ def _home(env: Mapping[str, str]) -> Path:
     return Path(env.get("HOME") or str(Path.home()))
 
 
-def _ws_home(env: Mapping[str, str]) -> Path:
-    return Path(os.path.abspath(profile.ws_home(dict(env))))
+def _state(env: Mapping[str, str]) -> Path:
+    return Path(os.path.abspath(paths.state_dir(dict(env))))
 
 
 def backups_dir(env: Mapping[str, str]) -> Path:
-    return _ws_home(env) / "backups"
+    return _state(env) / "backups"
 
 
 def target(runner: str, env: Mapping[str, str]) -> Path:
@@ -441,7 +441,7 @@ def plan(runner: str, pol: policy.Policy, policy_file: Path, env: Mapping[str, s
     cmd = selfcmd.argv()
     require_stable_interpreter(cmd)
     where = target(runner, env)
-    out = _ws_home(env) / "gate" / runner
+    out = _state(env) / "gate" / runner
     if entry is not None:
         backup = Path(entry["backup"]) if entry.get("backup") else None
     else:

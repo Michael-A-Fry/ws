@@ -2,12 +2,12 @@
 
     ws rate <run-id|last> up|down [--note TEXT]
 
-Each rating is one line appended to `$WS_HOME/ratings.jsonl` (rotated at 5 MB into `logs/`): `schema`, run id, `ts`
-(UTC), `up` or `down`, an optional note and `who` ("person"). It is the one log at the top of `$WS_HOME` and not in
-`logs/`: the top holds the control files a session may not write, and the person's verdicts sit with them. Rating the same run again adds a line; the latest one for a run is
-the one that counts. `ws run` prints the matching `ws: rate:` line after its hand-back.
+Each rating is one line appended to `<state>/ratings.jsonl` (rotated at 5 MB into `logs/`): `schema`, run id, `ts`
+(UTC), `up` or `down`, an optional note and `who` ("person"). It is the one log at the top of the state folder and not
+in `logs/`: the top holds the control files a session may not write, and the person's verdicts sit with them. Rating the
+same run again adds a line; the latest one for a run is the one that counts. `ws run` prints the matching `ws: rate:` line after its hand-back.
 
-Only the person rates. The file sits in ws's home with the other control files, which a session may not write, so an
+Only the person rates. The file sits in ws's state folder with the other control files, which a session may not write, so an
 agent cannot mark its own work. The id must be one `ws run` recorded in `runs.jsonl`.
 """
 
@@ -18,9 +18,8 @@ import os
 from datetime import UTC, datetime
 from pathlib import Path
 
-from ws import jsonl, output, runrecord
+from ws import jsonl, output, paths, runrecord
 from ws.output import WsError
-from ws.profile import ws_home
 
 SCHEMA_VERSION = 1
 RATINGS = ("up", "down")
@@ -28,7 +27,7 @@ NOTE_MAX = 500
 
 
 def ratings_path(env: dict | None = None) -> Path:
-    return ws_home(env) / "ratings.jsonl"
+    return paths.state_dir(env) / "ratings.jsonl"
 
 
 def new(run_id: str, rating: str, note: str | None = None, now: datetime | None = None) -> dict:

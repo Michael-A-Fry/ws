@@ -12,7 +12,7 @@ You type the value yourself, in your own terminal. Never paste a key into an AI 
 
 ## Steps
 
-1. Register the name. Add a table to `$WS_HOME/secrets.toml` (`~/.ws/secrets.toml` unless you set `WS_HOME`). The registry
+1. Register the name. Add a table to `~/.config/ws/secrets.toml` (`secrets.toml` in [the config folder](../reference/stores.md#where-ws-keeps-its-files)). The registry
    says where a name may be used. It holds no values.
 
    ```toml
@@ -37,7 +37,7 @@ You type the value yourself, in your own terminal. Never paste a key into an AI 
    ws secret list
    ```
 
-4. Name the secret in a job file, so `ws run` leases it from the broker. The file is `$WS_HOME/jobs/NAME.toml`.
+4. Name the secret in a job file, so `ws run` leases it from the broker. The file is `~/.config/ws/jobs/NAME.toml`.
 
    ```toml
    [[secrets]]

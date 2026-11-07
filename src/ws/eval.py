@@ -9,16 +9,16 @@ Trials run through `ws run`, and new tasks are harvested from your own failed or
     ws eval approve ID | ws eval reject ID               only your command moves a proposal
 
 The product ships the engine, the format, the metrics and a synthetic starter set (no real data); your own set lives
-in `$WS_HOME/eval/tasks/<id>.toml`, one task per file, and grows through `ws eval harvest`. A task file is checked
+in `<data>/eval/tasks/<id>.toml`, one task per file, and grows through `ws eval harvest`. A task file is checked
 whole or refused: an unknown key, a bad grader or a path outside the task folder rejects the file. Task files decide
 what runs on your machine (a `command` grader), so they must belong to you and not be writable by others, like job
 files.
 
 Each trial is one `ws run`, by the same code path (`run.run_job`): a fresh temporary folder holds the task's setup
-files (not under `$WS_HOME`, where the sandbox denies the agent's shell writes), the job named by `--job` is the arm
+files (not in one of ws's folders, where the sandbox denies the agent's shell writes), the job named by `--job` is the arm
 under test (its runner, model, options and secrets; the task replaces only its prompt, folder, timeout and turn limit),
 and the run record carries `eval: {task, trial, arm, pass}`. The record is written before grading, with `pass` null; the
-graded outcome is the line in `$WS_HOME/eval/results.jsonl` (with the task's hash and the job), so a signal during
+graded outcome is the line in `<data>/eval/results.jsonl` (with the task's hash and the job), so a signal during
 grading still leaves the record, and a result line saying grading was cut short. A trial passes only if the run finished
 `ok` and every grader passed. The task's hidden files are written after the run and before grading, over whatever is at
 those paths. A failed trial's folder is kept for you to look at.
@@ -42,7 +42,7 @@ record, or a record with no exit code) apart: it is in no metric and no pair, an
 trial. A run that started and then failed or timed out is an ordinary failure. The result line carries no marker for this;
 it is worked out from the result and the run log, so results written before this change are sorted the same way.
 
-Harvest never approves anything. It writes each proposal to `$WS_HOME/eval/proposed/` with `approved = false`,
+Harvest never approves anything. It writes each proposal to `<data>/eval/proposed/` with `approved = false`,
 `review_required = true`, the source run id, where the prompt came from and a placeholder rubric grader (so it cannot run
 until you give it a real one), all or none. `approve` shows the prompt and asks you (`--yes` for scripts). Prompts that
 look like they hold a secret are not proposed: ws has no prompt scrubber, so it refuses a prompt that names a registered
@@ -72,10 +72,10 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from secrets import token_hex
 
-from ws import evalstats, jobs, jsonl, output, policy, rating, run, runrecord, sandbox
+from ws import evalstats, jobs, jsonl, output, paths, policy, rating, run, runrecord, sandbox
 from ws import secrets as wsecrets
 from ws.output import WsError
-from ws.profile import ProfileError, load, profile_path, ws_home
+from ws.profile import ProfileError, load, profile_path
 
 SCHEMA_VERSION = 1
 NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
@@ -113,7 +113,7 @@ class TaskError(Exception):
 
 
 def eval_dir(env: dict | None = None) -> Path:
-    return ws_home(env) / "eval"
+    return paths.data_dir(env) / "eval"
 
 
 def tasks_dir(env: dict | None = None) -> Path:
@@ -765,7 +765,9 @@ def _wall(argv: list[str], folder: Path) -> sandbox.Wrapped:
     fallback."""
     try:
         pol = policy.load()
-        return sandbox.wrap(argv, pol, ws_home().absolute(), [str(policy.policy_path().absolute())])
+        return sandbox.wrap(
+            argv, pol, paths.state_dir().absolute(), [str(policy.policy_path().absolute()), *map(str, paths.roots())]
+        )
     except (sandbox.SandboxError, policy.PolicyError) as e:
         raise WallUnavailable(str(e)) from e
 
@@ -1055,7 +1057,7 @@ def run_trial(task: Task, trial: int, arm: str, job: jobs.Job, batch: str, keep:
     path except a trial that ran and did not pass (or `keep`), whose folder stays for you to look at."""
     env = os.environ
     log = runrecord.runs_path(env)
-    # Not under $WS_HOME: the gate's sandbox denies shell writes there, and a trial has to be able to write its answer.
+    # Not in one of ws's folders: the gate's sandbox denies shell writes there, and a trial has to be able to write its answer.
     folder = Path(tempfile.mkdtemp(prefix=f"ws-eval-{task.id}-{trial}-")).resolve()
     kept = False
     try:
@@ -1144,7 +1146,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         try:
             job = jobs.load(args.job, env)
         except jobs.JobError as e:
-            raise WsError("bad_config", str(e), "`--job` names a file in $WS_HOME/jobs") from e
+            raise WsError("bad_config", str(e), "`--job` names a file in <config>/jobs") from e
     elif not args.dry_run:
         raise WsError(
             "usage",

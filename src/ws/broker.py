@@ -45,10 +45,9 @@ from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from ws import __version__, output
+from ws import __version__, output, paths
 from ws import secrets as wsecrets
 from ws.output import WsError
-from ws.profile import ws_home
 
 CODES = (
     "unknown_name",
@@ -136,7 +135,7 @@ class SocketPathTooLong(BrokerUnavailable):
             not_running=False,
         )
         self.hint = (
-            "use a shorter WS_HOME, or set WS_BROKER_SOCKET (or [roles.secrets] socket) to a short path "
+            "use a shorter WS_HOME (or XDG_STATE_HOME), or set WS_BROKER_SOCKET (or [roles.secrets] socket) to a short path "
             "such as /tmp/ws-broker.sock"
         )
 
@@ -348,14 +347,14 @@ class Broker:
         allow_plain_http: bool = False,
     ):
         env = os.environ if env is None else env
-        # --socket wins; else what clients use: $WS_BROKER_SOCKET, [roles.secrets] socket, $WS_HOME/run/broker.sock
+        # --socket wins; else what clients use: $WS_BROKER_SOCKET, [roles.secrets] socket, <state>/run/broker.sock
         sock = Path(socket_file).expanduser() if socket_file else wsecrets.socket_path(env)
         return cls(
             sock,
             wsecrets.registry_path(env),
             wsecrets.Store(wsecrets.store_dir(env)),
             group=group,
-            log_path=ws_home(env) / "logs" / "broker.jsonl",
+            log_path=paths.state_dir(env) / "logs" / "broker.jsonl",
             max_ttl_s=ttl,
             port=port,
             allow_plain_http=allow_plain_http,
@@ -982,7 +981,7 @@ def register(sub) -> None:
     p.add_argument(
         "--socket",
         metavar="PATH",
-        help="default $WS_BROKER_SOCKET, else [roles.secrets] socket in the profile, else $WS_HOME/run/broker.sock",
+        help="default $WS_BROKER_SOCKET, else [roles.secrets] socket in the profile, else <state>/run/broker.sock",
     )
     p.add_argument("--group", metavar="GROUP", help="also serve members of this group (socket folder becomes 0750)")
     p.add_argument("--port", type=int, default=0, help="lease proxy port on 127.0.0.1 (default: any free one)")

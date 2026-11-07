@@ -1,10 +1,10 @@
 """What the two scheduler adapters share: where the unit files go, the command they run, and the injectable runner.
 
-Unit files are written to `$WS_HOME/jobs/units/`, inside ws's own folders, so `install.apply` records them and
+Unit files are written to `<config>/jobs/units/`, inside ws's own folders, so `install.apply` records them and
 `ws uninstall` removes them. The folder is under `jobs`, which a session may not write to: a timer runs code, so the
 agent must not be able to edit what it runs. systemd links them into place (`systemctl --user link`, which leaves a
 symlink per file in `~/.config/systemd/user`); launchd is pointed at them (`launchctl bootstrap`, which keeps its own
-record). Both records are outside `$WS_HOME`, so removing a job's timer, and `ws uninstall`, switch them off through the
+record). Both records are outside ws's folders, so removing a job's timer, and `ws uninstall`, switch them off through the
 adapter's `deactivate` before the files go.
 """
 
@@ -17,15 +17,14 @@ import subprocess
 from collections.abc import Callable
 from pathlib import Path
 
-from ws import jobs, selfcmd
-from ws.profile import ws_home
+from ws import jobs, paths, selfcmd
 
 Runner = Callable[[list[str]], tuple[int, str]]
 CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 
 
 def units_dir(env) -> Path:
-    return Path(os.path.abspath(ws_home(env))) / "jobs" / "units"
+    return Path(os.path.abspath(paths.config_dir(env))) / "jobs" / "units"
 
 
 def user_unit_dir(env) -> Path:
@@ -38,7 +37,7 @@ def user_unit_dir(env) -> Path:
 def is_foreign(env, name: str, marker: str) -> bool:
     """True when the user manager's folder already holds a unit called `name` that ws did not write: a regular file whose
     first line isn't `marker`, or a link that leads anywhere but a unit of ws's own. A link is ws's when its target, with
-    every link resolved, sits in this `$WS_HOME`'s `jobs/units/` (so a moved or linked home still matches), or is a
+    every link resolved, sits in this config folder's `jobs/units/` (so a moved or linked home still matches), or is a
     `ws-*` unit in some `jobs/units/` folder (a link made from a home that has since moved). A name nothing holds is not
     foreign; nor is a link ws made, dangling or not."""
     path = user_unit_dir(env) / name
@@ -59,7 +58,7 @@ def is_foreign(env, name: str, marker: str) -> bool:
 
 
 def logs_dir(env) -> Path:
-    return Path(os.path.abspath(ws_home(env))) / "logs"
+    return Path(os.path.abspath(paths.state_dir(env))) / "logs"
 
 
 def ws_command(env) -> list[str]:

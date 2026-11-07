@@ -12,7 +12,7 @@
                                                   alerts on every finished turn (what the key's absence means)
 
 The interruption cap governs ws's own sends, and only those. The numbers come from `[interrupts]` in policy.toml (1
-digest and 3 pushes a day unless you changed them) and are counted in `$WS_HOME/logs/notify-count.json`: `logs` is a
+digest and 3 pushes a day unless you changed them) and are counted in `<state>/logs/notify-count.json`: `logs` is a
 control path, so a session cannot write the counter. It is not a wall: a session that runs ws with a `WS_HOME` of its
 own gets a fresh counter, and one that can reach the topic (no token) can post to it directly. Counting notify leases
 in the broker would close that and is a known gap.
@@ -51,7 +51,7 @@ send holds it, this alert is skipped and recorded as `busy`. After a failed send
 notify-last.json), so a dead server costs one 3-second wait, not one per event. Headless sessions (`WS_RUN_ID` set, an
 entrypoint starting with `sdk`, such as `claude -p`, or a payload marked headless) send no alert.
 
-Every send writes `$WS_HOME/logs/notify-last.json` (mode 0600) as `{at, kind, ok, error}` for the watchdog. There is no
+Every send writes `<state>/logs/notify-last.json` (mode 0600) as `{at, kind, ok, error}` for the watchdog. There is no
 message text in it, and `error` is one fixed code: timeout, http_<status>, refused, busy, backoff, cap or error.
 """
 
@@ -76,9 +76,9 @@ from functools import partial
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from ws import broker, modules, policy
+from ws import broker, modules, paths, policy
 from ws import secrets as wsecrets
-from ws.profile import ProfileError, load, profile_path, ws_home
+from ws.profile import ProfileError, load, profile_path
 from ws.roles import FAIL, OK, WARN
 
 ROLE, NAME = "notify", "ntfy"
@@ -162,7 +162,7 @@ def token_name(cfg: dict) -> str | None:
 
 
 def counter_path(env) -> Path:
-    return ws_home(env) / COUNT_FILE
+    return paths.state_dir(env) / COUNT_FILE
 
 
 def alert_cap(cfg: dict) -> int:
@@ -341,10 +341,10 @@ def _safe_code(code: str | None) -> str | None:
 
 
 def record_last(env, kind: str, ok: bool, error: str | None, now: datetime | None = None) -> None:
-    """Write `$WS_HOME/logs/notify-last.json` (0600): when the last send went, of which kind, whether it landed, and a
+    """Write `<state>/logs/notify-last.json` (0600): when the last send went, of which kind, whether it landed, and a
     fixed error code. No message text, so the watchdog can read it freely. Best effort: a full disk doesn't turn a
     sent push into an error."""
-    path = ws_home(env) / LAST_FILE
+    path = paths.state_dir(env) / LAST_FILE
     at = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
     doc = {"at": at, "kind": kind, "ok": ok, "error": _safe_code(error)}
     tmp = path.with_name(path.name + ".tmp")
@@ -361,7 +361,7 @@ def _in_backoff(env, now: datetime | None) -> bool:
     """True when the last recorded send failed less than 5 minutes ago. A refusal for the cap, `busy` or `backoff` is
     not a failed send, and a missing or damaged file is no backoff."""
     try:
-        last = json.loads((ws_home(env) / LAST_FILE).read_text(encoding="utf-8"))
+        last = json.loads((paths.state_dir(env) / LAST_FILE).read_text(encoding="utf-8"))
         failed = last["ok"] is False and (last["error"] in FAIL_CODES or str(last["error"]).startswith("http_"))
         age = (now or datetime.now(UTC)) - datetime.fromisoformat(last["at"])
     except (OSError, ValueError, KeyError, TypeError):

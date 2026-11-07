@@ -4,11 +4,16 @@ bash or a GNU tool does; this file tests the claims, not the reading of them.
 For each probe line the gate is asked first (as the policy tests ask it). A line the gate allows is then run by a real
 `bash -c` inside `bwrap` (no network, a made-up home that holds the protected paths, a time limit of 5 s):
 
-- each protected FILE is a FIFO that the harness watches with a non-blocking `open(O_WRONLY | O_NONBLOCK)` loop. That open
-  only succeeds while something has the FIFO open to read it, so success means the line opened a protected file; the
-  harness then writes a canary token into the FIFO, and the token turns up in the line's output if it was read;
+- each protected FILE is a FIFO that the harness holds open for reading and writing from the start, with a canary token
+  already in it. Whatever reads the FIFO, whenever it does, gets the token at once; the harness then looks at whether
+  the token is still there. A token that is gone or changed means the line read or wrote the protected file, and no
+  timing is involved. A reader that has taken the token is then given end-of-file, so that `cat` ends;
 - each protected FOLDER (and the regular files ws protects) is compared before and after: a new or changed entry means
-  the line wrote there.
+  the line wrote there;
+- the sandbox is kept until every process the line left behind has ended (a grace of a few seconds), so a background job
+  or a job a timer ends early still counts;
+- a run that did not start (no start marker from inside the sandbox, a `bwrap:` message, a time-out) is an error that
+  names the line, never a clean result.
 
 The test FAILS when the gate allows a line that bash used to touch a protected path. The probes are the cold reviews'
 cases (`fixtures/gate_oracle_probes.txt`) and lines made from the policy's own tables: one for each exempt command in the
@@ -16,7 +21,7 @@ forms that make a shell run quoted text, one for each unique prefix of the long 
 "known producer" lines. A line is run under three environments: the unresolved names set to a protected file, to a
 protected folder, and a hostile one (`TMPDIR`, `CDPATH`, `PATH` and the names all pointing at the home folder), because a
 repository's own settings can put any of them in the environment of the shell a session starts.
-Linux only; skipped without `bwrap`."""
+Linux only. Without a usable `bwrap` the tests skip; `WS_ORACLE_REQUIRE=1` (set in CI) makes that a failure."""
 
 from __future__ import annotations
 
@@ -42,6 +47,10 @@ SSH = ".ss" + "h"  # spelled in two parts so that this file is not itself a path
 HOME = "/home/pat"
 TOKEN = b"CANARY-5f1e0c7a\n"
 LIMIT = 5.0  # seconds a line may run
+GRACE = 3.0  # seconds more for what the line left running (a background job) before the sandbox ends
+START = "ws-oracle-start"  # printed from inside the sandbox, just before the line runs
+END = "ws-oracle-end"  # printed when the line's shell has ended, with its exit status
+REQUIRE = os.environ.get("WS_ORACLE_REQUIRE") == "1"  # CI sets it: a sandbox that can't start is a failure, not a skip
 PROBES = Path(__file__).parent / "fixtures" / "gate_oracle_probes.txt"
 # The protected files, as FIFOs: (path under the home, the deny_read rule that covers it).
 FIFOS = (f"{SSH}/id_rsa", ".aws/credentials", ".gnupg/private.key", ".ws/secrets/KEY")
@@ -78,14 +87,21 @@ _PLAIN = frozenset(
 )
 
 
-def _linux_with_bwrap() -> bool:
-    if not sys.platform.startswith("linux") or not shutil.which("bwrap"):
-        return False
+def _sandbox_problem() -> str:
+    """Why the sandbox can't run lines here, or an empty string when it can."""
+    if not sys.platform.startswith("linux"):
+        return "needs Linux"
+    if not shutil.which("bwrap"):
+        return "needs bwrap (bubblewrap) on PATH"
     try:
-        done = subprocess.run([*_bwrap_base(), "/bin/sh", "-c", "exit 0"], capture_output=True, timeout=20, check=False)
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return done.returncode == 0
+        done = subprocess.run(
+            [*_bwrap_base(), "/bin/sh", "-c", "exit 0"], capture_output=True, text=True, timeout=20, check=False
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        return f"bwrap did not run: {e}"
+    if done.returncode != 0:
+        return f"bwrap cannot start a sandbox here (exit {done.returncode}): {done.stderr.strip()[:200]}"
+    return ""
 
 
 def _bwrap_base(home: str | None = None) -> list[str]:
@@ -101,7 +117,23 @@ def _bwrap_base(home: str | None = None) -> list[str]:
     return [*args, "--chdir", "/tmp"]
 
 
-pytestmark = pytest.mark.skipif(not _linux_with_bwrap(), reason="needs Linux with bwrap (bubblewrap)")
+PROBLEM = _sandbox_problem()
+
+
+@pytest.fixture(autouse=True)
+def _sandbox_or_skip(request):
+    """Every test needs the sandbox, except the one that says why it isn't there: with `WS_ORACLE_REQUIRE=1` that one
+    fails, so a CI cell that can't run the oracle is red, not quietly green."""
+    if PROBLEM and request.function.__name__ != "test_the_sandbox_the_oracle_needs_can_start":
+        pytest.skip(PROBLEM)
+
+
+def test_the_sandbox_the_oracle_needs_can_start():
+    if not PROBLEM:
+        return
+    if REQUIRE and sys.platform.startswith("linux"):
+        pytest.fail(f"WS_ORACLE_REQUIRE=1 but the oracle can't run here: {PROBLEM}")
+    pytest.skip(PROBLEM)
 
 
 @pytest.fixture
@@ -118,6 +150,11 @@ def gate(pol, line: str) -> str | None:
 
 
 # --- the harness -------------------------------------------------------------------------------------------------------
+
+
+class OracleError(AssertionError):
+    """A run that did not prove anything: the sandbox did not start the line, or the line did not end in time. Never a
+    clean result."""
 
 
 def _build(home: Path) -> None:
@@ -138,9 +175,14 @@ def _snapshot(home: Path) -> dict[str, tuple]:
             for name in (*dirs, *files):
                 p = Path(here) / name
                 st = p.lstat()
+                key = str(p.relative_to(home))
                 if stat.S_ISFIFO(st.st_mode):
-                    continue  # the harness itself writes to these: a read of one is seen by the watcher
-                seen[str(p.relative_to(home))] = (st.st_mode, st.st_size, st.st_mtime_ns, st.st_ino)
+                    seen[key] = (
+                        st.st_mode,
+                        st.st_ino,
+                    )  # still there, still the same file; its contents are watched apart
+                else:
+                    seen[key] = (st.st_mode, st.st_size, st.st_mtime_ns, st.st_ino)
         st = root.lstat()
         seen[top] = (st.st_mode, st.st_mtime_ns)
     return seen
@@ -158,52 +200,136 @@ class Result:
         return f"opened={self.opened} changed={self.changed} hung={self.hung}"
 
 
+class _Fifos:
+    """The protected files, each held open by the harness for reading and writing with the canary token inside. A reader
+    gets the token at once, so there is nothing to race; the token being gone (or something added) is the record that
+    the file was read (or written). The harness then gives a reader that has the token end-of-file, so `cat` ends."""
+
+    def __init__(self, home: Path):
+        import fcntl
+        import termios
+
+        self._ioctl = lambda fd: int.from_bytes(fcntl.ioctl(fd, termios.FIONREAD, b"\0\0\0\0"), sys.byteorder)
+        self.paths = {f: str(home / f) for f in FIFOS}
+        self.fds: dict[str, int] = {}
+        self.touched: set[str] = set()
+        for f, path in self.paths.items():
+            fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+            self.fds[f] = fd
+            os.write(fd, TOKEN)
+
+    def look(self) -> None:
+        for f, fd in list(self.fds.items()):
+            if self._ioctl(fd) != len(TOKEN):
+                self.touched.add(f)
+                os.close(fd)
+                del self.fds[f]
+
+    def close(self) -> None:
+        self.look()
+        for fd in self.fds.values():
+            os.close(fd)
+        self.fds.clear()
+
+
+# What runs inside the sandbox, as `bash -c SCRIPT bash FD LINE STEPS`. It says it has started, runs the line in bash with the
+# marker's file descriptor closed, says the line has ended, and then waits for what the line left running (a background
+# job, a process a timer ends): the sandbox goes when this script does, and so does everything still in it.
+_INSIDE = r"""
+command -v bash >/dev/null 2>&1 || exit 97
+printf '%s\n' '@START@' >&"$1" || exit 98
+eval "bash -c \"\$2\" $1>&-"
+printf '%s %s\n' '@END@' $? >&"$1"
+n=0
+while [ "$n" -lt "$3" ]; do
+  busy=
+  for p in /proc/[0-9]*; do
+    case ${p#/proc/} in 1|$$) ;; *) busy=1; break ;; esac
+  done
+  [ -z "$busy" ] && break
+  /bin/sleep 0.05
+  n=$((n + 1))
+done
+""".replace("@START@", START).replace("@END@", END)
+
+
 def run_bash(line: str, env: dict[str, str]) -> Result:
-    """`bash -c line` in the sandbox with a made-up home, watched for a read of a protected FIFO and a change inside a
-    protected folder. At most LIMIT seconds."""
+    """`bash -c line` in the sandbox with a made-up home, watched for a read or write of a protected FIFO and a change
+    inside a protected folder. At most LIMIT seconds for the line, and GRACE more for what it left running. Raises
+    `OracleError` when the line was not started: that run proved nothing."""
     with tempfile.TemporaryDirectory(prefix="ws-oracle-") as tmp:
         home = Path(tmp) / "pat"
         home.mkdir()
         _build(home)
         before = _snapshot(home)
-        argv = [*_bwrap_base(str(home)), "--clearenv"]
         base = {"HOME": HOME, "WS_HOME": HOME + "/.ws", "PATH": "/usr/bin:/bin", "LC_ALL": "C", **env}
-        for k, v in base.items():
-            argv += ["--setenv", k, v]
+        marks_r, marks_w = os.pipe()
+        os.set_blocking(marks_r, False)
+        fifos = _Fifos(home)
         out_file = Path(tmp) / "out"
-        with out_file.open("wb") as out:
-            proc = subprocess.Popen(
-                [*argv, "bash", "-c", line],
-                stdin=subprocess.DEVNULL,
-                stdout=out,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
+        marks = b""
+        hung = False
+        try:
+            argv = [*_bwrap_base(str(home)), "--clearenv"]
+            for k, v in base.items():
+                argv += ["--setenv", k, v]
+            argv += ["/bin/bash", "-c", _INSIDE, "bash", str(marks_w), line, str(round(GRACE / 0.05))]
+            with out_file.open("wb") as out:
+                proc = subprocess.Popen(
+                    argv,
+                    stdin=subprocess.DEVNULL,
+                    stdout=out,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                    pass_fds=(marks_w,),
+                )
+                os.close(marks_w)
+                started = time.monotonic()
+                while proc.poll() is None:
+                    with contextlib.suppress(BlockingIOError):
+                        marks += os.read(marks_r, 4096)
+                    fifos.look()
+                    ended = f"{END} ".encode() in marks
+                    if time.monotonic() - started > LIMIT + (GRACE + 2 if ended else 0):
+                        hung = not ended
+                        with contextlib.suppress(OSError):
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        break
+                    time.sleep(0.002)
+                proc.wait()
+            with contextlib.suppress(BlockingIOError):
+                marks += os.read(marks_r, 4096)
+            fifos.look()
+        finally:
+            os.close(marks_r)
+            fifos.close()
+        text = out_file.read_text(errors="replace")
+        if f"{START}\n".encode() not in marks:
+            raise OracleError(
+                f"the sandbox did not start the line {line!r} (exit {proc.returncode}): {text.strip()[:300] or 'no output'}"
             )
-            opened: set[str] = set()
-            deadline = time.monotonic() + LIMIT
-            fifos = [str(home / f) for f in FIFOS]
-            while proc.poll() is None and time.monotonic() < deadline:
-                for f in fifos:
-                    try:
-                        fd = os.open(f, os.O_WRONLY | os.O_NONBLOCK)
-                    except OSError:
-                        continue  # no reader: nothing has the FIFO open
-                    opened.add(os.path.relpath(f, home))
-                    try:
-                        os.write(fd, TOKEN)
-                    except OSError:
-                        pass
-                    finally:
-                        os.close(fd)
-                time.sleep(0.001)
-            hung = proc.poll() is None
-            if hung:
-                with contextlib.suppress(OSError):
-                    os.killpg(proc.pid, signal.SIGKILL)
-            proc.wait()
         after = _snapshot(home)
         changed = sorted(k for k in {*before, *after} if before.get(k) != after.get(k))
-        return Result(sorted(opened), changed, hung, out_file.read_text(errors="replace"))
+        return Result(sorted(fifos.touched), changed, hung, text)
+
+
+# Lines whose outcome depends on timing: a background job, a kill, a timer, a command another program runs. A program
+# that is killed before it opens the file reads nothing in that run, so such a line is run again (up to RACE_TRIES
+# times) until one run touches a protected path. A line that is not like this is run once.
+RACY = re.compile(
+    r"(?<![&>|])&(?![&>])|\bkill\b|\btimeout\b|ProxyCommand|LocalCommand|\bcoproc\b|\bnohup\b|\bsetsid\b|[<>]\("
+)
+RACE_TRIES = 30
+
+
+def run_line(line: str, env: dict[str, str], tries: int | None = None) -> Result:
+    """`run_bash`, repeated for a line whose outcome is a matter of timing (see `RACY`) until a run touches something."""
+    tries = tries or (RACE_TRIES if RACY.search(line) else 1)
+    for _ in range(tries):
+        r = run_bash(line, env)
+        if r.touched:
+            return r
+    return r
 
 
 def names_of(line: str) -> list[str]:
@@ -225,18 +351,40 @@ def environments(line: str) -> Iterator[dict[str, str]]:
     }
 
 
+def _run_all(lines: list[str], workers: int) -> tuple[dict[str, str], list[str]]:
+    """Every line under each of its environments: what it touched, and the runs that proved nothing (a line that did not
+    start, or that was still running at the limit and had touched nothing)."""
+    jobs = [(line, env) for line in lines for env in environments(line)]
+
+    def one(job):
+        try:
+            return run_line(*job)
+        except OracleError as e:
+            return e
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        results = list(ex.map(one, jobs))
+    bad: dict[str, str] = {}
+    errors: list[str] = []
+    for (line, _), r in zip(jobs, results, strict=True):
+        if isinstance(r, OracleError):
+            errors.append(str(r))
+        elif r.touched and line not in bad:
+            bad[line] = repr(r)
+        elif r.hung and not r.touched:
+            errors.append(f"the line {line!r} was still running at the {LIMIT:g} s limit and had touched nothing")
+    return bad, errors
+
+
 def oracle(pol, lines: list[str], workers: int = 8) -> list[str]:
-    """The lines the gate allows and a real bash used to touch a protected path (each with what it touched)."""
+    """The lines the gate allows and a real bash used to touch a protected path (each with what it touched). A run that
+    proved nothing raises `OracleError` naming the line: it is never counted as clean."""
     allowed = [line for line in lines if gate(pol, line) is None]
     if not allowed:
         return []
-    jobs = [(line, env) for line in allowed for env in environments(line)]
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        results = list(ex.map(lambda j: run_bash(*j), jobs))
-    bad: dict[str, str] = {}
-    for (line, _), r in zip(jobs, results, strict=True):
-        if r.touched and line not in bad:
-            bad[line] = repr(r)
+    bad, errors = _run_all(allowed, workers)
+    if errors:
+        raise OracleError(f"{len(errors)} runs proved nothing:\n" + "\n".join(sorted(set(errors))[:20]))
     return [f"{line!r}: {why}" for line, why in bad.items()]
 
 
@@ -285,6 +433,64 @@ def test_the_gate_denies_what_the_harness_sees_touched(pol):
         assert gate(pol, line), line
 
 
+def test_a_read_is_seen_whatever_its_timing(pol):
+    """The protected file holds its token from the start, so a reader that is slow, short-lived or in the background
+    still takes it, and a line that is a race is run again until a run takes it. (`cat F & kill $!` is not here: the
+    kill ends `cat` before it opens anything, in every run.)"""
+    f = f"{HOME}/{SSH}/id_rsa"
+    for line in (
+        f"cat {f} >&2 &",
+        f"(cat {f} > /dev/null &)",
+        f"timeout 0.001 cat {f}",
+        f"(sleep 0.5; cat {f} >/dev/null) &",
+        f"head -c 1 {f}",
+        f"cat {f}; cat {f}",
+        f"echo x > {f}",
+    ):
+        assert run_line(line, {}, tries=30).touched, line  # `timeout` can end `cat` before it opens: only now and then
+
+
+def test_the_ssh_proxy_command_row_is_seen_to_leak(pol):
+    """`ssh` ends its proxy command at about the time that command starts, so a run reads the file only now and then;
+    run again until it does. The row stays a listed limit: the gate allows it."""
+    line = f"ssh -o ProxyCommand='cat {HOME}/{SSH}/id_rsa >&2' x"
+    if not shutil.which("ssh"):
+        pytest.skip("needs ssh")
+    assert line in LIMITS and gate(pol, line) is None
+    assert run_line(line, {}, tries=200).touched
+
+
+def test_a_run_that_did_not_start_is_an_error_never_clean(pol, monkeypatch):
+    with monkeypatch.context() as m:  # bwrap itself refuses: a path that doesn't exist
+        m.setattr(
+            sys.modules[__name__], "_bwrap_base", lambda home=None: ["bwrap", "--ro-bind", "/ws-oracle-none", "/x"]
+        )
+        with pytest.raises(OracleError, match="did not start.*bwrap:"):
+            run_bash("echo hi", {})
+    with monkeypatch.context() as m:  # the sandbox runs, but nothing says the line began
+        m.setattr(sys.modules[__name__], "_INSIDE", "exit 0")
+        with pytest.raises(OracleError, match="did not start"):
+            run_bash("echo hi", {})
+        with pytest.raises(OracleError, match="did not start"):
+            oracle(pol, ["echo hi"])
+
+
+def test_a_line_that_runs_out_of_time_without_touching_anything_is_an_error(pol, monkeypatch):
+    monkeypatch.setattr(sys.modules[__name__], "LIMIT", 1.0)
+    with pytest.raises(OracleError, match="still running"):
+        oracle(pol, ["sleep 30"])
+
+
+def test_without_bwrap_the_oracle_says_why(monkeypatch):
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    assert "bwrap" in _sandbox_problem()
+
+
+def test_the_sandbox_is_kept_for_what_a_line_leaves_running(pol):
+    assert run_bash(f"(sleep 1; cat {HOME}/{SSH}/id_rsa >/dev/null) &", {}).touched
+    assert not run_bash("(sleep 1; echo done >/dev/null) &", {}).touched
+
+
 # --- the cold reviews' probes ----------------------------------------------------------------------------------------------
 
 
@@ -331,6 +537,28 @@ def test_every_consumer_of_standard_input_that_runs_what_it_reads_is_denied(pol)
     rows = sections()["consumers"]
     assert len(rows) > 90
     assert [line for line in rows if gate(pol, line) is None] == []
+
+
+def _installed(name: str) -> bool:
+    return bool(shutil.which(name, path="/usr/bin:/bin"))
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        pytest.param(n, id=f"{n}-{'real-shell' if _installed(n) else 'gate-decision-only'}")
+        for n in ("rbash", "mksh", "yash", "posh", "lksh")
+    ],
+)
+def test_every_shell_that_runs_its_standard_input_is_denied_and_the_installed_ones_do_run_it(pol, name):
+    """The gate denies a here-document or here-string given to each shell it knows. For a shell installed here the real
+    shell is then run on the same text and seen to read the protected file; for one that isn't, only the gate's decision
+    is tested (the test id says which)."""
+    f = f"{HOME}/{SSH}/id_rsa"
+    lines = [f"{name} <<'EOF'\ncat {f}\nEOF", f"{name} <<< 'cat {f}'", f"{name} <<EOF\ncat {f}\nEOF"]
+    assert [line for line in lines if gate(pol, line) is None] == []
+    if _installed(name):
+        assert all(run_bash(line, {}).touched for line in lines)
 
 
 # --- the policy's own tables, as lines -----------------------------------------------------------------------------------
@@ -477,15 +705,21 @@ def _options_of(command: list[str]) -> list[str]:
     return sorted(set(re.findall(r"--[a-z0-9][a-z0-9-]+", out)))
 
 
-@pytest.mark.parametrize("tool, helps", [("curl", ["curl", "--help", "all"]), ("wget", ["wget", "--help"])])
-def test_no_option_of_an_address_program_opens_the_file_it_is_given_through_a_word_the_gate_allows(pol, tool, helps):
-    if not shutil.which(tool):
-        pytest.skip(f"needs {tool}")
+ADDRESS_TOOLS = (("curl", ["curl", "--help", "all"]), ("wget", ["wget", "--help"]))
+
+
+def address_lines(tool: str, helps: list[str]) -> list[str]:
     options = _options_of(helps)
     url = "https://example.invalid/"
     letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
     lines = []
     for option in [*options, *(f"-{c}" for c in letters)]:
         lines += [f"{tool} {option} $FOO {url}", f"{tool} {option}=$FOO {url}", f"{tool} {option}$FOO {url}"]
-    lines += [f"{tool} $FOO", f"{tool} $FOO {url}", f"{tool} {url} $FOO", f"{tool} -s $FOO", f"{tool} -sS $FOO"]
-    assert oracle(pol, lines) == []
+    return lines + [f"{tool} $FOO", f"{tool} $FOO {url}", f"{tool} {url} $FOO", f"{tool} -s $FOO", f"{tool} -sS $FOO"]
+
+
+@pytest.mark.parametrize("tool, helps", ADDRESS_TOOLS)
+def test_no_option_of_an_address_program_opens_the_file_it_is_given_through_a_word_the_gate_allows(pol, tool, helps):
+    if not shutil.which(tool):
+        pytest.skip(f"needs {tool}")
+    assert oracle(pol, address_lines(tool, helps)) == []

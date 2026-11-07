@@ -1209,6 +1209,36 @@ cat ~/SDIR/id_rsa
 EOF
 )")"
 ====
+rbash <<'EOF'
+cat ~/SDIR/id_rsa
+EOF
+====
+rbash <<< 'cat ~/SDIR/id_rsa'
+====
+mksh <<'EOF'
+cat ~/SDIR/id_rsa
+EOF
+====
+mksh <<< 'cat ~/SDIR/id_rsa'
+====
+yash <<'EOF'
+cat ~/SDIR/id_rsa
+EOF
+====
+yash <<< 'cat ~/SDIR/id_rsa'
+====
+posh <<'EOF'
+cat ~/SDIR/id_rsa
+EOF
+====
+posh <<< 'cat ~/SDIR/id_rsa'
+====
+lksh <<'EOF'
+cat ~/SDIR/id_rsa
+EOF
+====
+lksh <<< 'cat ~/SDIR/id_rsa'
+====
 # --- limits: an interpreter reads the text itself, which a static gate can't see; the sandbox is the wall ---
 ====
 python3 <<'EOF'

@@ -581,7 +581,22 @@ def rule_of_two(policy: Policy, sources: list[str], job: str | None = None, shel
 # cannot judge it denies or leaves to the layers either side.
 
 _FLAGS = re.compile(r"^-[A-Za-z]+$")
-_SHELL_NAMES = {"sh", "bash", "zsh", "dash", "ksh", "fish", "ash", "csh", "tcsh"}
+_SHELL_NAMES = {
+    "sh",
+    "bash",
+    "zsh",
+    "dash",
+    "ksh",
+    "fish",
+    "ash",
+    "csh",
+    "tcsh",
+    "rbash",
+    "mksh",
+    "yash",
+    "posh",
+    "lksh",
+}
 # A here-document or here-string given to one of these is read as code: a shell runs it, `source` and `.` run it as a
 # script, `eval` runs it as text, `ssh` hands it to the shell on the other end, and `xargs` builds commands from it.
 _UNKNOWN_VALUE = "${_WS_UNKNOWN}"  # what a variable holds when a command substitution set it: a part no one can read

@@ -56,8 +56,19 @@ jobs:
         run: |
           uv run --locked ws gate replay tests/gate_corpus/*.jsonl --runner claude-code --metrics
           uv run --locked ws gate replay tests/gate_corpus/*.jsonl --runner opencode --metrics
+      # The gate oracle (tests/test_gate_oracle.py) runs a real bash in a bubblewrap sandbox. Ubuntu 24.04 switches off
+      # unprivileged user namespaces for unconfined programs with AppArmor, so the restriction is lifted for this throwaway
+      # runner only; the guard keeps the line harmless on a kernel that has no such setting.
+      - name: bubblewrap for the gate oracle
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          bwrap --version
       - name: tests
-        run: uv run --locked pytest -q
+        env:
+          WS_ORACLE_REQUIRE: "1" # the oracle can't start a sandbox here = a failure, not a skip
+        run: uv run --locked pytest -q -rs
 
   # The web terminal's browser tests (every control, desktop and phone). They skip where there is no browser, so this
   # job installs one and sets WS_E2E_REQUIRE=1: a missing browser fails here instead of skipping.

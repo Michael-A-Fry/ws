@@ -138,8 +138,12 @@ ws eval report [--arm NAME] [--since 90d] [--k N] [--json]
 
 Ten metrics. One with no data says `not measured` and why; nothing is filled in.
 
-1. Success rate: trials passed over trials run.
-2. pass^k: the chance that k trials of a task all pass (k defaults to the fewest trials any task has, at most 5).
+1. Success rate: trials passed over trials run, with a 95% interval. The interval is over tasks, not trials: a task's
+   repeats are one cluster, so running the same task more times makes its own rate surer but never makes the arm look
+   like it was tested on more tasks.
+2. pass^k: the chance that k trials of a task all pass (k defaults to the fewest trials any task has, at most 5). It
+   comes with pass@k beside it: the chance that at least one of k trials passes. pass@k is never lower; the distance
+   between them is how much a task flips between runs.
 3. Harm per 100 runs: refused runs and Rule of Two refusals. Reported alone, never averaged into another score.
 4. Rework within 14 days: for tasks that name a `repo` (and optionally `files`), the share of solved trials followed by
    a `fix`, `fixup!` or `Revert` commit on those files within 14 days. Trials under 14 days old aren't judged yet.
@@ -155,7 +159,7 @@ Ten metrics. One with no data says `not measured` and why; nothing is filled in.
 ## Compare two arms
 
 ```sh
-ws eval compare base tighter [--look 1|2]
+ws eval compare base tighter [--look 1|2] [--allow-mixed]
 ```
 
 Pairs at task level and runs an exact two-sided McNemar test on the tasks where the arms differ. Trials of one task
@@ -167,10 +171,48 @@ between the two arms isn't paired; the output says how many results were left ou
 behind them side by side. If the two arms ran different numbers of trials of a task, the comparison is refused (and uses
 no look): run both arms with the same `--trials`.
 
-A win needs 6 of 6, 8 of 9, 9 of 10 or 10 of 12 discordant tasks. A gap under 3 points is noise. The rule is success
+A win needs 6 of 6, 8 of 9, 9 of 10 or 10 of 12 discordant tasks, whatever the size of the gap. The rule is success
 first, then a quality veto (the arm with the worse thumbs-down rate by 3 points or more can't win, but only once each
 arm has at least 5 ratings; otherwise it says "too few ratings" and doesn't veto), then tokens per solved task among
-equals. If the baseline already passes more than 85%, fix the task set first.
+equals (within 3% is level). If the baseline already passes more than 85%, fix the task set first.
+
+The line that matters says, in plain words, who leads and by how much, the interval, and what it means (it's one line
+on screen; it's wrapped here):
+
+```text
+base leads new by 30.0 points on 20 paired tasks (95% interval +2.4 to +30.0 points): the difference is real at 95%.
+new leads base by 10.0 points on 20 paired tasks (95% interval -12.2 to +19.7 points):
+  too few runs to tell (MDE 30.0 points).
+```
+
+What each number is:
+
+- **Points**: the leader's passed tasks minus the other arm's, over the paired tasks, in percentage points.
+- **95% interval**: where the true gap plausibly lies. It's an exact interval worked from the tasks the arms split on,
+  so it excludes zero exactly when the McNemar p-value is under 0.05: the interval and the verdict can't disagree.
+  With no split at all it shows the most a hidden gap could be.
+- **The difference is real at 95%**: the exact McNemar p-value is under 0.05. This is the only wording for a win.
+- **Too few runs to tell**: it isn't. It doesn't say the arms are equal, only that this many tasks can't separate them.
+- **MDE** (minimum detectable effect): the smallest lead the test could have called real with this many tasks and this
+  many splits. A lead under the MDE is too few runs to tell, by construction. With under 6 tasks no lead can be real,
+  and the line says so. To shrink the MDE, add tasks (repeats of a task don't help).
+- **Each arm's own interval**: the Wilson 95% interval of its share of tasks passed.
+- **pass^k and pass@k**: per arm, when every task has two or more trials.
+
+### How each arm was run (the fingerprint)
+
+Every result line records a fingerprint of the trial: the models the runner actually used (from the run record's
+`models_used`, not the one the job asked for), the runner and its version, the ws version, a hash of the policy in
+force, a hash of the guards set, a hash of the job file and prompt, the job's limits (time and turns) and the job's
+`bare` setting. `compare` pools an arm's results only if they agree: if they differ inside one arm (the model was
+swapped part-way, ws was updated, the policy or guards changed), it refuses with a typed error that names the fields
+and uses no look. Pass `--allow-mixed` to pool them anyway; the output then says so. A field the run didn't record
+(a runner that doesn't report its model, a trial that never started) is never a difference. Results written before
+fingerprints existed carry none; they're compared as before and the output counts them.
+
+A job with `bare = true` (the default) runs the runner in its bare mode, which skips hooks. The output flags an arm
+that ran that way, because the gate's hook didn't run for it. Set `bare = false` in the job when the gate is part of
+what you're testing. `report` shows the same notes.
 
 Each pair of arms gets two looks (kept in `looks.jsonl` under the two names as a JSON array). The first two `compare`
 calls are stored; a third is refused, because peeking inflates the

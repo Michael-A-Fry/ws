@@ -547,11 +547,12 @@ def test_compare_five_to_nothing_is_not_enough(box, capsys):
     assert code == 0 and "no winner" in out and "p=0.062" in out and "too few" in out
 
 
-def test_a_gap_under_three_points_is_noise(box, capsys):
-    plant(box, rows_for(2, 0, both=98))
+def test_a_small_gap_is_judged_by_the_test_not_a_fixed_band(box, capsys):
+    plant(box, rows_for(2, 0, both=98))  # a 2-point gap on 2 split tasks: the test cannot tell
     _, out, _ = ws(capsys, "eval", "compare", "A", "B", "--json")
     data = json.loads(out)["data"]
-    assert data["gap_points"] == 2.0 and data["winner"] is None and "noise" in data["why"]
+    assert data["gap_points"] == 2.0 and data["winner"] is None and data["real"] is False
+    assert "noise" not in data["why"] and "too few runs to tell (MDE 6.0 points)" in data["statement"]
 
 
 def test_quality_vetoes_a_winner_and_tokens_decide_among_equals():

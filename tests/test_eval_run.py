@@ -13,7 +13,7 @@ from pathlib import Path
 import jsonschema
 import pytest
 
-from ws import cli, runrecord, sandbox
+from ws import cli, policy, runrecord, sandbox
 from ws import eval as ws_eval
 from ws.profile import dumps
 
@@ -190,6 +190,32 @@ def test_the_report_reads_what_the_run_left(rig, capsys):
     assert m["tokens_per_solved"]["value"] == 30  # the recorded fixture: 20 in, 10 out
     assert m["cost_per_solved"]["value"] == pytest.approx(0.00021)
     assert m["harm_per_100"]["value"] == 0.0 and m["time"]["measured"] is True
+
+
+def test_each_result_carries_a_fingerprint_of_how_it_ran(rig, capsys):
+    ws(capsys, "eval", "run", "--task", "starter-csv-total", "--job", "daily", "--arm", "base", "--trials", "2")
+    results = rig.results()
+    fp = results[0]["fingerprint"]
+    assert fp["models"] == ["claude-sonnet-4-5"]  # what the runner reported, not the job's claude-haiku-4-5
+    assert fp["runner"] == "claude-code" and fp["runner_version"] == "9.9.9" and fp["ws_version"]
+    assert fp["resources"] == {"timeout_s": 30.0, "max_turns": None} and fp["bare"] is True
+    assert fp["job_hash"] == results[0]["job_hash"] and fp["policy_hash"] and fp["guards_hash"]
+    assert results[0]["fingerprint"] == results[1]["fingerprint"]
+
+
+def test_compare_refuses_an_arm_after_the_policy_changes_under_it(rig, capsys):
+    run = ("eval", "run", "--task", "starter-csv-total", "--job", "daily", "--trials", "1")
+    ws(capsys, *run, "--arm", "base")
+    ws(capsys, *run, "--arm", "other")
+    code, out, _ = ws(capsys, "eval", "compare", "base", "other")
+    assert code == 0 and "bare mode" in out and "base ran in bare mode" in out  # the job's default is bare
+    text = policy.default_toml().replace('on = ["syntax-check", "session-context", "dev-server"]', "on = []")
+    policy.policy_path().write_text(text, encoding="utf-8")
+    ws(capsys, *run, "--arm", "base")  # same job, same task, a different set of guards
+    code, _, err = ws(capsys, "eval", "compare", "base", "other")
+    assert code == 1 and "base: policy, guards differ" in err
+    code, out, _ = ws(capsys, "eval", "compare", "base", "other", "--allow-mixed")
+    assert code == 0 and "pooled on purpose" in out
 
 
 def test_a_job_that_does_not_exist_is_named(rig, capsys):

@@ -1,9 +1,15 @@
-"""The numbers behind `ws eval`: exact McNemar, pass^k, percentiles and the ten report metrics.
+"""The numbers behind `ws eval`: exact McNemar, intervals, pass^k and pass@k, percentiles and the ten report metrics.
 
 Everything here is a pure function over records already on disk (the eval results, the run log, the ratings), except the
 two git questions (rework, maintenance), which call `git log` and nothing else. A metric with no data is
 "not measured", with the reason; it is never filled in with a guess, and a harm count is never averaged into another
 score. Cost is `runrecord.record_cost` as it stands: ws ships no price table (ADR 0008).
+
+The intervals treat a task as the unit, never a trial: the repeats of one task share a prompt, a setup and a grader, so
+they are one cluster. A single arm's pass rate gets a Wilson score interval over its tasks; the gap between two arms on
+the same tasks gets an exact interval that agrees with the exact McNemar test (it excludes zero exactly when p is below
+ALPHA). `mde_points` says how big a gap must be, at this many tasks, before the test could call it real. Fingerprints
+(`fingerprint_spread`) say which fields of how an arm was run differ between its results.
 """
 
 from __future__ import annotations
@@ -18,7 +24,8 @@ from pathlib import Path
 from ws import runrecord
 
 ALPHA = 0.05  # two-sided, exact
-NOISE_POINTS = 3.0  # a gap under this many percentage points is noise
+Z95 = 1.959963984540054  # the standard normal quantile for a two-sided 95% interval
+TIE_POINTS = 3.0  # thumbs-down rates, and tokens per solved task in percent, closer than this are level
 REWORK_DAYS = 14
 GIT_TIMEOUT_S = 20
 FIXUP = re.compile(r"^(fixup!|squash!|revert\b|fix\b)", re.IGNORECASE)
@@ -81,6 +88,158 @@ def pass_hat_k(per_task: list[tuple[int, int]], k: int) -> float | None:
     over the tasks that have at least k trials. None when no task does."""
     shares = [math.comb(c, k) / math.comb(n, k) for n, c in per_task if n >= k]
     return sum(shares) / len(shares) if shares else None
+
+
+def pass_at_k(per_task: list[tuple[int, int]], k: int) -> float | None:
+    """pass@k over tasks given as (trials, passes): the chance that at least one of k trials drawn from a task passes,
+    1 - C(n-c, k) / C(n, k) (the unbiased estimator of Chen et al. 2021, "Evaluating Large Language Models Trained on
+    Code"), averaged over the tasks that have at least k trials. None when no task does. It is at least pass^k."""
+    shares = [1 - math.comb(n - c, k) / math.comb(n, k) for n, c in per_task if n >= k]
+    return sum(shares) / len(shares) if shares else None
+
+
+def wilson(successes: float, n: int, z: float = Z95) -> tuple[float, float] | None:
+    """The Wilson score interval (Wilson 1927) for `successes` out of `n`, as (low, high) shares; `successes` may be
+    fractional (a task that passed 2 of 3 trials counts 2/3). None for n = 0. Unlike the plain normal interval it stays
+    inside 0 to 1 and does not collapse to a point at 0% or 100%."""
+    if n <= 0:
+        return None
+    p = successes / n
+    z2 = z * z
+    centre = (p + z2 / (2 * n)) / (1 + z2 / n)
+    half = z * math.sqrt(p * (1 - p) / n + z2 / (4 * n * n)) / (1 + z2 / n)
+    return max(0.0, centre - half), min(1.0, centre + half)
+
+
+def task_rates(results: list[dict]) -> dict[str, tuple[int, int]]:
+    """Task id to (trials, passes) over these results: the clusters the intervals are drawn over."""
+    out: dict[str, list[int]] = {}
+    for r in results:
+        t = out.setdefault(str(r.get("task")), [0, 0])
+        t[0] += 1
+        t[1] += r.get("pass") is True
+    return {k: (v[0], v[1]) for k, v in out.items()}
+
+
+def cluster_interval(results: list[dict]) -> dict | None:
+    """The pass rate over these results with a 95% interval drawn over tasks, not trials. A task's repeats are one
+    cluster: each task counts once, at its own pass rate (2 of 3 is 0.667), and the Wilson interval is taken over the
+    number of tasks. Extra repeats of a task make that one task's rate surer; they never make the arm look like it was
+    tested on more tasks. Returns {rate, low, high, tasks, trials} (shares), or None for no results."""
+    rates = task_rates(results)
+    if not rates:
+        return None
+    share = sum(c / n for n, c in rates.values()) / len(rates)
+    low, high = wilson(share * len(rates), len(rates))  # type: ignore[misc]
+    return {"rate": share, "low": low, "high": high, "tasks": len(rates), "trials": sum(n for n, _ in rates.values())}
+
+
+def _log_pmf(i: int, n: int, p: float) -> float:
+    if p <= 0.0:
+        return 0.0 if i == 0 else -math.inf
+    if p >= 1.0:
+        return 0.0 if i == n else -math.inf
+    return math.lgamma(n + 1) - math.lgamma(i + 1) - math.lgamma(n - i + 1) + i * math.log(p) + (n - i) * math.log1p(-p)
+
+
+def binom_cdf(k: int, n: int, p: float) -> float:
+    """P(X <= k) for X ~ Binomial(n, p), summed in log space so a large n does not overflow."""
+    if k < 0:
+        return 0.0
+    if k >= n:
+        return 1.0
+    return min(1.0, sum(math.exp(_log_pmf(i, n, p)) for i in range(k + 1)))
+
+
+def _bisect(f: Callable[[float], float], target: float, increasing: bool) -> float:
+    lo, hi = 0.0, 1.0
+    for _ in range(80):
+        mid = (lo + hi) / 2
+        if (f(mid) < target) == increasing:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2
+
+
+def clopper_pearson(x: int, n: int, alpha: float = ALPHA) -> tuple[float, float] | None:
+    """The exact (Clopper-Pearson 1934) two-sided interval for x of n, as (low, high) shares; None for n = 0. It
+    excludes 0.5 exactly when the two-sided exact binomial test of 0.5 gives p below alpha."""
+    if n <= 0:
+        return None
+    half = alpha / 2
+    low = 0.0 if x == 0 else _bisect(lambda p: 1 - binom_cdf(x - 1, n, p), half, increasing=True)
+    high = 1.0 if x == n else _bisect(lambda p: binom_cdf(x, n, p), half, increasing=False)
+    return low, high
+
+
+def paired_difference(a_only: int, b_only: int, tasks: int) -> dict | None:
+    """The gap between two arms that ran the same `tasks`, A minus B in percentage points, with an exact 95% interval.
+
+    Of the tasks the arms split on (n = a_only + b_only), A took a share pi; the exact interval for pi (Clopper-Pearson)
+    becomes a gap of (2 pi - 1) n / tasks. It is exact given how many tasks the arms disagreed on, and it agrees with
+    `mcnemar_p`: it excludes zero exactly when p is below ALPHA, so the interval and the verdict never disagree. When
+    the arms split on nothing, the interval is the most that could be hiding: with no split in `tasks` tasks, a split
+    rate above 1 - 0.025^(1/tasks) is unlikely, and all of it could have gone one way.
+    Returns {diff_points, low_points, high_points, discordant, p, real}, or None for no tasks."""
+    if tasks <= 0:
+        return None
+    n = a_only + b_only
+    diff = (a_only - b_only) / tasks * 100
+    if n == 0:
+        reach = (1 - (ALPHA / 2) ** (1 / tasks)) * 100
+        low, high = -reach, reach
+    else:
+        lo, hi = clopper_pearson(a_only, n)  # type: ignore[misc]
+        low, high = (2 * lo - 1) * n / tasks * 100, (2 * hi - 1) * n / tasks * 100
+    p = mcnemar_p(a_only, b_only)
+    return {
+        "diff_points": diff, "low_points": low, "high_points": high, "discordant": n, "p": p, "real": p < ALPHA,
+    }  # fmt: skip
+
+
+def mde_points(tasks: int, discordant: int | None = None) -> float | None:
+    """The smallest gap, in percentage points, the exact McNemar test could call real with this many paired tasks.
+
+    Given the number of tasks the arms split on, the gap is (2w - n) / tasks for the fewest wins w that give p below
+    ALPHA (`wins_needed`); a lead smaller than that is, by the test's own rule, too few runs to tell. With no split
+    count (or one too small for any win to count) it is the best case over every split that fits: all of the 6 tasks
+    the arms split on going one way, 6 / tasks. None when even that cannot be reached (under 6 tasks)."""
+    if tasks <= 0:
+        return None
+    if discordant is not None and 0 < discordant <= tasks:
+        need = wins_needed(discordant)
+        if need is not None:
+            return (2 * need - discordant) / tasks * 100
+    best = [(2 * w - n) / tasks * 100 for n in range(1, min(tasks, 40) + 1) if (w := wins_needed(n)) is not None]
+    return min(best) if best else None
+
+
+def lead_sentence(arm_a: str, arm_b: str, tasks: int, a_only: int, b_only: int) -> str:
+    """The comparison in plain words: who leads and by how much, the 95% interval, and whether it is real. Each arm is
+    named once, the leader first; the interval is the leader's gap over the other arm, so its sign always reads the same
+    way."""
+    if arm_a == arm_b:
+        raise ValueError("two different arms are needed to compare")
+    d = paired_difference(a_only, b_only, tasks)
+    if d is None:
+        return "no paired tasks, so no comparison"
+    mde = mde_points(tasks, d["discordant"])
+    verdict = (
+        "the difference is real at 95%"
+        if d["real"]
+        else f"too few runs to tell (MDE {mde:.1f} points)"
+        if mde is not None
+        else f"too few runs to tell (MDE: {tasks} tasks cannot show a gap; at least 6 are needed)"
+    )
+    gap, low, high = d["diff_points"], d["low_points"], d["high_points"]
+    if gap == 0:
+        who = f"{arm_a} and {arm_b} are level on {tasks} paired tasks"
+    else:
+        if gap < 0:
+            arm_a, arm_b, gap, low, high = arm_b, arm_a, -gap, -high, -low
+        who = f"{arm_a} leads {arm_b} by {gap:.1f} points on {tasks} paired tasks"
+    return f"{who} (95% interval {low:+.1f} to {high:+.1f} points): {verdict}."
 
 
 def trend(results: list[dict]) -> list[dict]:
@@ -175,7 +334,16 @@ def _success(results: list[dict]) -> dict:
     if not results:
         return not_measured("no eval trials yet")
     passed = sum(1 for r in results if r.get("pass") is True)
-    return ok(passed / len(results), f"{_pct(passed / len(results))} ({passed} of {len(results)} trials)", len(results))
+    ci = cluster_interval(results)
+    return ok(
+        passed / len(results),
+        f"{_pct(passed / len(results))} ({passed} of {len(results)} trials); "
+        f"95% interval {_pct(ci['low'])} to {_pct(ci['high'])} over {ci['tasks']} tasks",
+        len(results),
+        interval=[ci["low"], ci["high"]],
+        interval_tasks=ci["tasks"],
+        task_rate=ci["rate"],
+    )
 
 
 def _pass_k(results: list[dict], k: int | None) -> dict:
@@ -185,10 +353,18 @@ def _pass_k(results: list[dict], k: int | None) -> dict:
     if not by_task:
         return not_measured("no eval trials yet")
     use = k or min(5, min(len(v) for v in by_task.values()))
-    value = pass_hat_k([(len(v), sum(v)) for v in by_task.values()], use)
+    per_task = [(len(v), sum(v)) for v in by_task.values()]
+    value = pass_hat_k(per_task, use)
     if value is None:
         return not_measured(f"no task has {use} trials")
-    return ok(value, f"{_pct(value)} at k={use}", len(by_task), k=use)
+    at_least_one = pass_at_k(per_task, use)
+    return ok(
+        value,
+        f"{_pct(value)} at k={use} (every trial passes); pass@{use} {_pct(at_least_one)} (at least one passes)",
+        len(by_task),
+        k=use,
+        pass_at_k=at_least_one,
+    )
 
 
 def _is_harm(r: dict, rec: dict | None) -> bool:
@@ -381,6 +557,44 @@ def compute(
     }
 
 
+# ---- how an arm was run ------------------------------------------------------------------------------------------
+
+FINGERPRINT_FIELDS = (
+    "models", "runner", "runner_version", "ws_version", "policy_hash", "guards_hash", "job_hash", "resources", "bare",
+)  # fmt: skip
+
+
+def fingerprint_spread(results: list[dict]) -> dict:
+    """What differs, inside one arm, in how its results were made. Each result may carry a `fingerprint` (see
+    `eval.fingerprint`); a field that is null or an empty list in one result means "not recorded" and is never a
+    difference. Returns {with_fingerprint, without, mixed, bare}: `mixed` maps each field with two or more recorded
+    values to those values (in the order first seen), `bare` is True when any fingerprinted result ran with the
+    runner's bare mode on (hooks skipped, so the gate did not run), False when all had it off, None when none says."""
+    seen: dict[str, list] = {}
+    bare: list[bool] = []
+    have = 0
+    for r in results:
+        fp = r.get("fingerprint")
+        if not isinstance(fp, dict):
+            continue
+        have += 1
+        for f in FINGERPRINT_FIELDS:
+            v = fp.get(f)
+            if v is None or v == []:
+                continue
+            bucket = seen.setdefault(f, [])
+            if v not in bucket:
+                bucket.append(v)
+        if isinstance(fp.get("bare"), bool):
+            bare.append(fp["bare"])
+    return {
+        "with_fingerprint": have,
+        "without": len(results) - have,
+        "mixed": {f: vals for f, vals in seen.items() if len(vals) > 1},
+        "bare": (any(bare) if bare else None),
+    }
+
+
 # ---- trials that never started -------------------------------------------------------------------------------------
 
 
@@ -490,12 +704,13 @@ def paired_tasks(a: list[dict], b: list[dict]) -> dict:
 
 
 def decide(stats: dict) -> dict:
-    """The decision rule over a comparison's numbers: success first (exact McNemar, a gap under 3 points is noise), a
+    """The decision rule over a comparison's numbers: success first (exact McNemar at ALPHA, however small the gap), a
     quality veto, then tokens among equals. Returns {"winner": "A"|"B"|None, "why": text}.
 
     `stats` has: pairs (paired tasks), a_only, b_only, gap_points (A minus B), p, down_a, down_b (thumbs-down rates or
     None), rated_a, rated_b (how many ratings behind them), tokens_a, tokens_b (per solved task or None). A quality
-    flag with fewer than MIN_RATED ratings on either arm cannot veto."""
+    flag with fewer than MIN_RATED ratings on either arm cannot veto. Thumbs-down rates under TIE_POINTS apart, and
+    token counts under TIE_POINTS percent apart, are level."""
     if stats["pairs"] == 0:
         return {
             "winner": None,
@@ -503,7 +718,7 @@ def decide(stats: dict) -> dict:
         }
     discordant = stats["a_only"] + stats["b_only"]
     gap = stats["gap_points"]
-    significant = abs(gap) >= NOISE_POINTS and stats["p"] < ALPHA
+    significant = gap != 0 and stats["p"] < ALPHA
     veto = _veto(stats)
     if significant:
         lead = "A" if gap > 0 else "B"
@@ -513,8 +728,8 @@ def decide(stats: dict) -> dict:
                 "why": f"{lead} passes more (p={stats['p']:.3f}) but its quality flag is worse: veto",
             }
         return {"winner": lead, "why": f"{lead} passes more: {abs(gap):.1f} points, exact McNemar p={stats['p']:.3f}"}
-    if abs(gap) < NOISE_POINTS:
-        gap_text = f"a gap of {abs(gap):.1f} points is under {NOISE_POINTS:g}: noise"
+    if discordant == 0:
+        gap_text = "the arms passed and failed the same tasks"
     else:
         need = wins_needed(discordant)
         wins = f"a win needs {need} of them" if need else "too few to separate the arms"
@@ -525,8 +740,8 @@ def decide(stats: dict) -> dict:
     ta, tb = stats["tokens_a"], stats["tokens_b"]
     if ta is None or tb is None:
         return {"winner": None, "why": f"equal on success ({gap_text}); tokens per solved task not measured for both"}
-    if abs(ta - tb) / max(ta, tb) * 100 < NOISE_POINTS:
-        return {"winner": None, "why": f"equal on success ({gap_text}) and tokens differ by under {NOISE_POINTS:g}%"}
+    if abs(ta - tb) / max(ta, tb) * 100 < TIE_POINTS:
+        return {"winner": None, "why": f"equal on success ({gap_text}) and tokens differ by under {TIE_POINTS:g}%"}
     lean = "A" if ta < tb else "B"
     return {"winner": lean, "why": f"equal on success ({gap_text}); {lean} uses fewer tokens per solved task"}
 
@@ -540,8 +755,8 @@ def quality_note(stats: dict) -> str | None:
 
 
 def _veto(stats: dict) -> str | None:
-    """The arm whose thumbs-down rate is worse by NOISE_POINTS or more, once both arms have MIN_RATED ratings."""
+    """The arm whose thumbs-down rate is worse by TIE_POINTS or more, once both arms have MIN_RATED ratings."""
     da, db = stats["down_a"], stats["down_b"]
-    if quality_note(stats) or da is None or db is None or abs(da - db) * 100 < NOISE_POINTS:
+    if quality_note(stats) or da is None or db is None or abs(da - db) * 100 < TIE_POINTS:
         return None
     return "A" if da > db else "B"

@@ -14,7 +14,8 @@ Stdlib only. Three jobs:
 Known limits of the matcher. It reads command text, so it cannot see:
   * what an interpreter does inside its own program (`python3 -c`, `perl -e`, `node -e`, a script it runs);
   * a script that is downloaded and run in two steps (`curl -o a.sh ... && bash a.sh`);
-  * a path built by a command (`cat "$(echo ~)/.ssh/id_rsa"`), or by a variable set outside the command line;
+  * a path built entirely by a command, or by a variable set outside the command line (a built part followed by a
+    protected path is refused);
   * the version-control tool restoring a protected tracked file (`git -C ~/.ws checkout policy.toml`);
   * OpenCode's `patch` tool, which carries no single file path (its native `edit` rules still apply).
 These stay allowed by the matcher. What closes them is the sandbox (ws.sandbox, and the `sandbox` block the

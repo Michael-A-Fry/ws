@@ -41,13 +41,6 @@ corpus that measures the gate on every change.
 - The claims guard reads the default branch from `origin/HEAD`, then `init.defaultBranch`, then `main`.
 - The default `deny_read` covers `~/.config/ws/secrets`.
 
-### Security
-
-- The gate now refuses command forms that read a protected path through an option value, an argument file, a brace
-  group in a redirect target, or a shell expansion the 0.1.6 matcher didn't resolve. See advisory
-  [GHSA-5g97-2qf5-8g2w](https://github.com/Michael-A-Fry/ws/security/advisories/GHSA-5g97-2qf5-8g2w). The sandbox
-  stays the boundary; the gate is the layer that explains a refusal.
-
 ## [0.1.6] - 2026-11-02
 
 A safer launch environment, setup that offers only what's built, and the first part of the ws home data API.

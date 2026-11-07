@@ -22,7 +22,7 @@ Let an agent run a command only after you say yes to that exact call. To underst
 2. Generate the runner files again, for each runner, and start a new session.
 
    ```sh
-   ws gate generate --runner claude-code --out ~/.ws/gate/claude-code
+   ws gate generate --runner claude-code --out ~/.local/state/ws/gate/claude-code
    ```
 
 3. Let the session try the command. The gate refuses it and prints an id.

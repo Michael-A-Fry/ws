@@ -56,21 +56,23 @@ install.sh        the installer people run first (pipx or uv)
 | `guards/` | Guards: small, named checks the policy switches on, run by `ws gate` at the points a session can... |
 | `home/` | ws home: one read-only data API (`ws.home.api`) that every home area, app and script reads through |
 | `install.py` | `ws install` and `ws uninstall`: the engine that plans, writes and undoes what ws puts on a machine |
-| `jobs.py` | Job files: `$WS_HOME/jobs/<name>.toml`, one headless job each, run with `ws run <name>` |
+| `jobs.py` | Job files: `jobs/<name>.toml` in ws's config folder, one headless job each, run with `ws run <name>` |
 | `jsonl.py` | Bounded, locked JSON-lines logs: one object per line, a size limit with rotation, and no lost lines |
 | `mcp_server.py` | `ws mcp serve`: a small MCP server over stdio, so any runner can search and add to memory and... |
 | `memory.py` | Memory module: Markdown files with front matter in a git repo, plus a rebuildable SQLite FTS5 index |
+| `migrate.py` | `ws migrate`: move ws's files from `~/.ws` to the XDG folders (see `ws.paths` for which file... |
 | `modules.py` | Plugins (the modules in the code): the parts of ws you can switch on or off |
 | `notes.py` | Notes module: `ws note` drops a Markdown file into the `_inbox` of your own notes folder (any... |
 | `notesdetect.py` | Find notes you already keep: an Obsidian vault (a folder holding `.obsidian/`) or a Logseq graph... |
 | `osinfo.py` | Which machine are we on: macOS, Linux, Windows via WSL2, or native Windows (not supported; use WSL2) |
 | `output.py` | The output contract for every `ws` command: one typed error, one JSON envelope, and the global flags |
+| `paths.py` | Where ws keeps its files: four folders that follow the XDG base directory rules, or one folder... |
 | `policy.py` | The policy: one vendor-neutral `policy.toml` that says what a session may do |
 | `profile.py` | The profile: one TOML file per person (machine answers, roles, caps) |
 | `rating.py` | `ws rate`: a thumbs up or down on a run, in one command |
 | `roles/` | Role adapters: one module per (role, adapter) pair |
 | `run.py` | `ws run JOB`: every headless job goes through here and leaves one complete record in `runs.jsonl` |
-| `runrecord.py` | The run record: one JSON line per headless job in `$WS_HOME/logs/runs.jsonl`, the same shape for... |
+| `runrecord.py` | The run record: one JSON line per headless job in `<state>/logs/runs.jsonl`, the same shape for... |
 | `runschema.py` | The JSON Schema (draft 2020-12) of one run record, as a Python dict: the shape of a line in... |
 | `sandbox.py` | The sandbox as the real wall: `ws gate launch --runner R -- argv` starts a runner inside an... |
 | `secrets.py` | The secrets registry and store, and `ws secret` |

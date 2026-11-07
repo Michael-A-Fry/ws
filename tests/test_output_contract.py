@@ -55,6 +55,7 @@ CASES: dict[str, list[str]] = {
     "globals.check": ["globals", "check", "--repo", "{home}"],
     "globals.manifest": ["globals", "manifest"],
     "install": ["install", "--dry-run", "--notes", "{home}/Notes"],
+    "migrate": ["migrate", "--dry-run"],
     "uninstall": ["uninstall", "--dry-run"],
     "plugin.list": ["plugin", "list"],
     "plugin.add": ["plugin", "add", "nope"],

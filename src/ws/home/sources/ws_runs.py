@@ -1,4 +1,4 @@
-"""Headless jobs as sessions: the run log (`$WS_HOME/logs/runs.jsonl`), one session per finished job with its cost."""
+"""Headless jobs as sessions: the run log (`logs/runs.jsonl` in ws's state folder), one session per finished job with its cost."""
 
 from __future__ import annotations
 

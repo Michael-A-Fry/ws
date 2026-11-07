@@ -36,7 +36,7 @@ or a guard name, and a key in a guard's table that guard doesn't read.
 | `skill-gate` | before a call, and when a prompt is sent | file writes and skill calls | Denies a write to a guarded path until the named skill has run in the session. The paths come from the policy's rules and from each skill's own `gates` front matter. The person can approve the write once. Judges Edit, Write and MultiEdit calls only. |
 | `dev-server` | before a call | shell commands | Denies a development server that listens on every interface or on an address other than loopback: `python -m http.server` with no `--bind`, `php -S 0.0.0.0:PORT`, `serve` with no `-l`, `vite --host`, `flask run --host 0.0.0.0`, `jupyter lab --ip 0.0.0.0`, `rails s -b 0.0.0.0`, `uvicorn --host 0.0.0.0`, `hugo server --bind 0.0.0.0`, `http-server` with no `-a`, `manage.py runserver 0.0.0.0:PORT`, `next dev -H 0.0.0.0`, `streamlit run`, `gunicorn -b 0.0.0.0`, `webpack serve --host 0.0.0.0` and `astro dev --host`. The reason names the flag to add. The person can approve the command once. On by default in the policy `ws gate init` writes. |
 | `checkout-pin` | before a call | shell commands | Denies `git checkout` or `switch` to another branch or commit, `reset --hard`, `--merge` and `--keep`, `rebase`, `merge`, `pull`, `cherry-pick`, `revert`, `am`, `bisect`, `stash pop` and `apply`, a whole-tree restore from another ref and `worktree move` into a checkout that has linked worktrees, or that `paths` names, whichever way the checkout is reached (a folder, `-C`, `--git-dir`, `GIT_DIR`, a `cd`). `git checkout -- FILE`, a restore of files, `commit`, `fetch`, `status`, `log` and a branch switch inside a linked worktree go through. The person can approve the command once. Off until you name it. |
-| `record-calls` | before a call | every kind | Appends `{schema, ts, at, runner, payload}` (`ts` is the time; `at` is its legacy spelling, kept beside it) to `$WS_HOME/logs/gate-calls.jsonl`, one line for each hook run. A file write keeps its path and records the text as `{"bytes", "sha256"}`. `ws gate replay` reads that file. |
+| `record-calls` | before a call | every kind | Appends `{schema, ts, at, runner, payload}` (`ts` is the time; `at` is its legacy spelling, kept beside it) to `~/.local/state/ws/logs/gate-calls.jsonl`, one line for each hook run. A file write keeps its path and records the text as `{"bytes", "sha256"}`. `ws gate replay` reads that file. |
 
 `bulk-staging` and `record-calls` take no table. The other guards take one.
 
@@ -44,7 +44,7 @@ or a guard name, and a key in a guard's table that guard doesn't read.
 `sed -i` or a redirect, or through a notebook edit, isn't seen by them. The sandbox is what stops a write; these guards
 tell the model what it's about to break.
 
-The per-session records under `$WS_HOME/sessions` (`skill-gate`'s record of skills run, `spawn-cap`'s count) are
+The per-session records under `~/.local/state/ws/sessions` (`skill-gate`'s record of skills run, `spawn-cap`'s count) are
 advice-level. A session that can write that folder can change them, so they keep an honest session honest and don't stop
 a hostile one. The sandbox is the wall.
 
@@ -129,8 +129,8 @@ nothing else: it doesn't fetch, use the network or write a file. Commit claims a
 judged together and the reason names both.
 
 When the session stops, the claims in the runner's last message (the stop payload's `last_assistant_message`, when the
-runner sends one) are appended to `$WS_HOME/logs/claims.jsonl` with whether each commit was on `ref`. Each line has
-`schema`, `ts` and `at`, like the other logs listed in [Stores](stores.md).
+runner sends one) are appended to `~/.local/state/ws/logs/claims.jsonl` with whether each commit was on `ref`. Each line
+has `schema`, `ts` and `at`, like the other logs listed in [Stores](stores.md).
 
 ### session-context
 
@@ -149,7 +149,7 @@ Two lines come after the file lines.
 - **What changed in ws.** The first time a project's session starts on a ws version, one line gives the version (and the
   version that project last saw), then up to four lines from that version's section of `CHANGELOG.md` when ws ships one
   beside its code. Without one, the version line is all there is. The next start in that project on the same version says
-  nothing. The record is `$WS_HOME/sessions/project-HASH.session-context.json`, where HASH comes from the project's
+  nothing. The record is `~/.local/state/ws/sessions/project-HASH.session-context.json`, where HASH comes from the project's
   folder (a linked worktree shares its main worktree's record). A start with no session id records nothing. If the record
   can't be written, the line is left out and the rest of the start text goes ahead.
 
@@ -167,7 +167,7 @@ the `PostToolUse` hook, so a call that was denied or that you declined uses no s
 `run_in_background` is recorded: a foreground agent has already stopped when its call returns. The count is an
 estimate: agents started together in one message are all checked before any is recorded, a stop clears the oldest start
 because the stop payload doesn't say which agent it was, and a start older than `stale_s` drops out. The record is
-`$WS_HOME/sessions/<session id>.spawn-cap.json`.
+`~/.local/state/ws/sessions/<session id>.spawn-cap.json`.
 
 With no `max_agents`, the limit is worked out from the machine each time: the smaller of half the CPUs and half the
 memory in GiB, at least 2 and at most 8. The CPUs are the cgroup v2 `cpu.max` quota divided by its period when one is
@@ -198,7 +198,7 @@ paths = ["**/*.css", "**/templates/**"]
 One table for each skill. A Skill tool call for the skill, or a prompt that starts with `/taste-gate` (or
 `/plugin:taste-gate`), records it for the session. A write to a path in `paths`, before the skill is recorded, is a
 deny you can override once with `ws approve ID`. After the skill is recorded the paths are open for the rest of the
-session. The record is `$WS_HOME/sessions/<session id>.skill-gate.json`.
+session. The record is `~/.local/state/ws/sessions/<session id>.skill-gate.json`.
 
 A skill can carry its own rule. A `gates` list in the front matter of its `SKILL.md` names the globs it guards:
 
@@ -370,4 +370,4 @@ generated hooks follow the events and kinds it declares.
 Each call a guard sees is a neutral `Call` with a `kind`, a `value` and read-only `data`. The kinds are `command`,
 `read`, `search`, `write`, `tool`, `agent`, `skill` and `message`. A write carries `old`, `new`, `content` or `edits`
 when the tool gives them. A guard keeps its own per-session record with `ctx.state(name, update)`, a locked JSON file at
-`$WS_HOME/sessions/<session id>.<name>.json` that goes when the session record is pruned.
+`~/.local/state/ws/sessions/<session id>.<name>.json` that goes when the session record is pruned.

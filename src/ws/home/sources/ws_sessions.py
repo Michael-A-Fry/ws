@@ -1,4 +1,4 @@
-"""Sessions ws recorded itself: `$WS_HOME/sessions/<id>.json`, one file per session, written by `ws session start`."""
+"""Sessions ws recorded itself: `sessions/<id>.json` in ws's state folder, one file per session, written by `ws session start`."""
 
 from __future__ import annotations
 
@@ -11,13 +11,13 @@ ORDER = 40
 
 
 def available(env):
-    folder = env.ws_home / "sessions"
-    return (True, "") if folder.is_dir() else (False, "no sessions folder in the ws home")
+    folder = env.state / "sessions"
+    return (True, "") if folder.is_dir() else (False, "no sessions folder in ws's state folder")
 
 
 def read(kind, env):
     out = []
-    for path in _files.json_files(env.ws_home / "sessions"):
+    for path in _files.json_files(env.state / "sessions"):
         rec = _files.read_object(path)
         # a guard's own record for a session has no `release`; only the session record does
         if not rec or not isinstance(rec.get("session_id"), str) or not isinstance(rec.get("release"), str):

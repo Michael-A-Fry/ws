@@ -21,7 +21,7 @@ Decisions, and why:
     never the home folder or above it), a private tmp the launcher makes and points TMPDIR at, the runner's own private
     state folders (next point), `allow_write` from the policy and `--allow-write`. A deny-list left everything else
     writable: `~/.bashrc`, `~/.local/bin`, `~/.config/systemd/user` and ws's own installed source, each of which runs
-    outside the wall at the next shell or the next hook. ws's own files (`$WS_HOME`, the policy, the generated folder)
+    outside the wall at the next shell or the next hook. ws's own files (its four folders, the policy, the generated folder)
     are read-only by default and stay so even where one sits inside the project. The price: a program that writes a
     hard-coded path outside those (not TMPDIR) fails; the policy's `allow_write` is how a person lets one through. A
     read-only mount is enforced by the kernel for every process in the sandbox, including the runner's own tool and
@@ -30,9 +30,9 @@ Decisions, and why:
     `node_modules/.bin` plugins, language servers) and runs them later; if the wall let it write the person's real
     ones, a session could plant one that runs outside the wall at the next unwalled start (the P1 the third cold review
     found). So a walled run gets XDG_DATA_HOME, XDG_STATE_HOME and XDG_CACHE_HOME of its own under
-    `$WS_HOME/wall/<runner>/` (`private_homes`): kept between walled runs, never read by an unwalled one. The person's
+    `<state>/wall/<runner>/` (`private_homes`): kept between walled runs, never read by an unwalled one. The person's
     real folders stay visible and read-only. The runner's sign-in files are copied across at each start, unless a
-    deny_read rule hides them. `ws uninstall` takes the folder with `$WS_HOME`.
+    deny_read rule hides them. `ws uninstall` takes the folder with the rest of the state folder.
   * The project's own config is the second half of that class: the folders and files a runner or git LOADS at start
     (`PROJECT_LOCKED`, `GIT_LOCKED`, `git_facts`, `submodule_repos`; the table of what and why is
     tests/e2e/test_wall_loadpaths.py). They are read-only whether or not they exist. A path that exists is bound
@@ -46,7 +46,7 @@ Decisions, and why:
     `worktrees/NAME`, and the submodule repositories are locked; `git config --list --show-origin` gives the
     `core.hooksPath` folder and the `[include]`d files. A locked path that is a symbolic link is refused, since a link in
     a writable folder can be deleted and replaced.
-  * Several sessions in one project share the placeholders. A record under `$WS_HOME/wall/projects/` (a file lock, the
+  * Several sessions in one project share the placeholders. A record under `<state>/wall/projects/` (a file lock, the
     pids inside, the placeholders made) lets only the last launcher out take them down: the first one removing a
     folder that the second's wall has bound would detach the bind in the second's mount namespace. A launcher that is
     killed leaves its record; the next launch for that project finds every pid dead and cleans up first. SIGHUP and
@@ -60,7 +60,7 @@ Decisions, and why:
     `.venv`, `venv` or `env` (`bin/*`, `*.pth`, `site-packages/*.py`), `node_modules` (each `.bin` link and the file it
     resolves to inside the project, and the folder time of each package), and new `.pyc` files. Walled Python writes its
     bytecode to the private tmp (PYTHONPYCACHEPREFIX), so a `.pyc` in the project is not the wall's doing. It prints to
-    stderr and appends a line to `$WS_HOME/logs/wall-report.jsonl` (ws.jsonl), and removes nothing. This is what covers
+    stderr and appends a line to `<state>/logs/wall-report.jsonl` (ws.jsonl), and removes nothing. This is what covers
     a runner started later in a sub-folder (`sub/.claude`), a repository the session creates with `git init` (which has
     to keep working), and a submodule added during the session. It runs as the person on a tree the session wrote, so
     it trusts nothing in it: every entry is lstat'd first, a link is reported as a link (its target text) and never read
@@ -69,7 +69,7 @@ Decisions, and why:
     FIFO named `.mcp.json` or a link to /dev/zero cannot hang it), and git is never run on it.
   * Claude Code has no bubblewrap wall, so `ws gate launch --runner claude-code -- claude` makes its own sandbox
     project-specific: it adds the locked set of THIS project (git folders resolved as above) to `denyWrite` in a copy of
-    the generated settings under `$WS_HOME/gate/claude-code/projects/`, starts `claude --settings` with it, and writes the
+    the generated settings under `<state>/gate/claude-code/projects/`, starts `claude --settings` with it, and writes the
     same end-of-run report. The shared settings carry the Edit deny rules (`**/NAME`) only, because a sandbox path has no
     project-relative spelling in a `--settings` file. See ws.adapters.claude_code.
   * A protected path reached through a symbolic link the session could replace is refused, with the real path in the
@@ -79,7 +79,7 @@ Decisions, and why:
     the path it covers, not the folders above it: `mv ~/.config ~/.config2; mkdir -p ~/.config/ws; echo x >
     ~/.config/ws/policy.toml` plants a policy where the hook's fixed path points. rename(2) refuses a mount point
     (EBUSY), so each such ancestor is bound onto itself. Nothing is refused: the binds cost nothing and change no access.
-  * Two holes in that, on purpose: `$WS_HOME/approvals/pending` and `$WS_HOME/sessions` stay writable. The gate hook and
+  * Two holes in that, on purpose: `<state>/approvals/pending` and `<state>/sessions` stay writable. The gate hook and
     the session nudge run inside the wall (the plugin lives in the runner's process) and must be able to record a
     pending approval and a release marker. Neither grants anything: see ws.approvals for why a forged pending record is
     harmless. `approvals/granted`, the policy, the secrets and the jobs stay read-only; a grant is used up by the
@@ -159,10 +159,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
 
-from ws import adapters, approvals, jsonl, policy
+from ws import adapters, approvals, jsonl, paths, policy
 from ws.approvals import ENV_MARKER, FD_ENV, approvals_dir
 from ws.output import WsError
-from ws.profile import ws_home
 
 INSTALL = {
     "linux": "install bubblewrap: `sudo apt install bubblewrap` (Debian, Ubuntu) or `sudo dnf install bubblewrap` (Fedora)",
@@ -185,7 +184,7 @@ def _system() -> str:
 
 
 def writable_holes(home: Path) -> list[Path]:
-    """The folders inside `home` that the wall leaves writable (see the module docstring)."""
+    """The folders inside `home` (ws's state folder) that the wall leaves writable (see the module docstring)."""
     return [approvals_dir(home) / "pending", home / "sessions"]
 
 
@@ -419,7 +418,7 @@ def wrap(
     if link:
         raise SandboxError(
             f"{link}: a protected path is reached through a symbolic link that the session could delete and replace, "
-            "and the wall can only hold the real path. Point WS_HOME (and --policy) at the real folder"
+            "and the wall can only hold the real path. Point WS_HOME (or the XDG_*_HOME variables) and --policy at the real folders"
         )
     if system == "linux":
         if not which("bwrap"):
@@ -561,13 +560,20 @@ def passed_env(env: dict, runner: str = "", pass_env: list[str] | None = None) -
 
 
 def launch_env(
-    env: dict, tmp: str | None = None, homes: dict | None = None, runner: str = "", pass_env: list[str] | None = None
+    env: dict,
+    tmp: str | None = None,
+    homes: dict | None = None,
+    runner: str = "",
+    pass_env: list[str] | None = None,
+    layout_env: dict | None = None,
 ) -> dict:
     """The runner's environment: the allow-listed part of `env` (`passed_env`). In the wall, TMPDIR is the private tmp
     and so is Python's bytecode cache (PYTHONPYCACHEPREFIX): a `.pyc` written into the project by a walled `python`
-    would be loaded by the next unwalled one, and the report would have to look for them."""
+    would be loaded by the next unwalled one, and the report would have to look for them. `layout_env` (from
+    `paths.env_for`) tells the runner's hooks where ws's folders are, because `homes` moves the XDG variables they would
+    otherwise find them by."""
     walled = {"TMPDIR": tmp, "PYTHONPYCACHEPREFIX": f"{tmp}/pycache"} if tmp else {}
-    return {**passed_env(env, runner, pass_env), ENV_MARKER: "1", **walled, **(homes or {})}
+    return {**passed_env(env, runner, pass_env), **(layout_env or {}), ENV_MARKER: "1", **walled, **(homes or {})}
 
 
 def ptrace_scope(path: str = "/proc/sys/kernel/yama/ptrace_scope") -> int | None:
@@ -606,12 +612,28 @@ def project_folder(cwd: str, env: dict) -> str:
     return real
 
 
+def _wall_roots(env: dict) -> list[Path]:
+    """The folders the wall makes read-only: those of the layout in use, and the other layouts' only where they exist
+    (a link above a folder that isn't there is nothing a session could swap in)."""
+    try:
+        live = set(paths.roots(env))
+    except WsError:
+        live = set()  # an unclear layout: every folder that exists
+    return [r for r in paths.protected_roots(env) if r in live or os.path.lexists(r)]
+
+
 def protected(policy_file: Path, runner: str, extra: list[str] | None = None, env: dict | None = None) -> list[str]:
-    """Everything the wall makes read-only besides `$WS_HOME` itself: the policy (wherever --policy put it), the control
-    files of both its folder and `$WS_HOME`, anything named with --protect, and the generated config folder. With the
-    allow-list most of this is read-only already; it matters where one of these sits inside a writable folder."""
+    """Everything the wall makes read-only besides ws's state folder itself: the policy (wherever --policy put it), the
+    control files of both its folder and ws's own, every folder ws keeps its files in (in each layout it could use),
+    anything named with --protect, and the generated config folder. With the allow-list most of this is read-only
+    already; it matters where one of these sits inside a writable folder."""
     env = os.environ if env is None else env
-    out = [str(policy_file), *policy.control_paths(policy_file.parent), *policy.control_paths(ws_home(env))]
+    out = [
+        str(policy_file),
+        *policy.control_paths(policy_file.parent),
+        *paths.control_paths(env),
+        *map(str, _wall_roots(env)),
+    ]
     out += [str(Path(p).expanduser().absolute()) for p in extra or []]
     config_dir = env.get(getattr(adapters.get(runner), "CONFIG_DIR_ENV", ""), "")
     if config_dir:  # the generated folder the runner was told to use
@@ -639,7 +661,7 @@ WALL_REPORT_SCHEMA = 1  # the `schema` of a line in logs/wall-report.jsonl
 
 # --- the runner's own state --------------------------------------------------------------------------------------
 
-# XDG variable -> (folder under `$WS_HOME/wall/<runner>/`, whether it is kept per project).
+# XDG variable -> (folder under `wall/<runner>/` in ws's state folder, whether it is kept per project).
 XDG_HOMES = (("XDG_DATA_HOME", "data", True), ("XDG_STATE_HOME", "state", False), ("XDG_CACHE_HOME", "cache", True))
 # The files in the runner's real data folder that a walled run needs to be signed in, copied in at each start.
 SEED = {"opencode": ("auth.json", "mcp-auth.json")}
@@ -710,10 +732,10 @@ def private_homes(home: Path, runner: str, pol: policy.Policy, env: dict, projec
     Why private. OpenCode keeps programs in the XDG cache and data folders (`bin/rg`, `node_modules/.bin` plugins,
     language servers) and runs them later, and the walled run has to write there. If it wrote the person's real
     folders, whatever a session planted would run outside the wall at the next unwalled start. So the walled run gets
-    its own, under `$WS_HOME/wall/<runner>/`, which no unwalled run is pointed at; the real ones stay visible and
-    read-only. Why under `$WS_HOME` and not the private tmp: the session history and the model cache are worth keeping
-    between runs, and `ws uninstall` removes `$WS_HOME`. They are made 0700, and a `.gitignore` of `*` keeps them out of
-    a synced `$WS_HOME`.
+    its own, under `wall/<runner>/` in ws's state folder, which no unwalled run is pointed at; the real ones stay visible
+    and read-only. Why there and not the private tmp: the session history and the model cache are worth keeping between
+    runs, and `ws uninstall` removes the state folder. They are made 0700, and a `.gitignore` of `*` keeps them out of a
+    synced state folder.
 
     Which are per project. Data and cache are (`<kind>/<name>-<hash of the real path>`): the programs live there, and
     a program planted by a session in one project must not run in a walled session of another. State stays shared: it
@@ -927,7 +949,7 @@ def unlock_project(created: list[tuple[str, str]]) -> None:
 @contextlib.contextmanager
 def _project_state(home: Path, project: str):
     """The record of which launchers are inside `project` and which placeholders they made, as a dict, under a lock
-    (`$WS_HOME/wall/projects/<key>.json`, outside the wall's reach: `$WS_HOME` is read-only in it)."""
+    (`wall/projects/<key>.json` in ws's state folder, outside the wall's reach: it is read-only in the wall)."""
     import fcntl  # POSIX only; the wall is Linux and macOS
 
     folder = home / "wall" / "projects"
@@ -1345,7 +1367,7 @@ def describe(finding: dict) -> str:
 def report_run(
     home: Path, project: str, runner: str, before: dict, after: dict, notes: list[str], complete: bool = True
 ) -> list[dict]:
-    """Print what the session left (stderr), and append one JSON line to `$WS_HOME/logs/wall-report.jsonl` (ws.jsonl:
+    """Print what the session left (stderr), and append one JSON line to `<state>/logs/wall-report.jsonl` (ws.jsonl:
     bounded, rotated, link-safe; the line carries `schema` and `ts`, and `at`, the legacy spelling of `ts`). Nothing is
     printed or written when there is nothing to say. A scan that stopped says INCOMPLETE on the first line: what is
     listed is then a lower bound. Never removes anything."""
@@ -1417,7 +1439,7 @@ def launch_claude(args: argparse.Namespace, argv: list[str], home: Path, env: di
     project at the start of the session. The shared settings (`ws gate generate`, `ws install`) are made once for every
     project, and a sandbox path has no project-relative spelling in a `--settings` file, so they carry the Edit rules but
     no project paths. Here the project is known: the locked set (ws.sandbox PROJECT_LOCKED, GIT_LOCKED, the git folders
-    git resolves) is added to `denyWrite` in a copy under `$WS_HOME/gate/claude-code/projects/`, and `claude --settings`
+    git resolves) is added to `denyWrite` in a copy under `<state>/gate/claude-code/projects/`, and `claude --settings`
     is started with it. No bubblewrap: Claude Code's sandbox is the wall. The end-of-run report is the launcher's, as
     for OpenCode."""
     from ws.adapters import claude_code
@@ -1471,7 +1493,7 @@ def cmd_launch(args: argparse.Namespace) -> int:
         pol = policy.load(policy_file)
     except policy.PolicyError as e:
         raise WsError("bad_config", str(e), f"fix {policy_file}") from e
-    home = ws_home().absolute()  # whatever --policy says, the gate keeps its approvals and sessions here
+    home = paths.state_dir().absolute()  # whatever --policy says, the gate keeps its approvals and sessions here
     pass_env = check_pass_env(args.pass_env)
     if pass_env:
         print(f"ws: note: passing {', '.join(pass_env)} from this shell to {args.runner}", file=sys.stderr)
@@ -1509,7 +1531,10 @@ def cmd_launch(args: argparse.Namespace) -> int:
             tty=sys.stdin.isatty(),
         )
         return run_with_broker(
-            wrapped.argv, launch_env(env, tmp, homes, args.runner, pass_env), wrapped.pass_fds, approvals_dir(home)
+            wrapped.argv,
+            launch_env(env, tmp, homes, args.runner, pass_env, paths.env_for()),
+            wrapped.pass_fds,
+            approvals_dir(home),
         )
     except SandboxError as e:
         raise WsError(
@@ -1554,7 +1579,7 @@ def add_launch(gs, names: list[str]) -> None:
         help="start a runner inside the sandbox wall (bubblewrap on Linux, sandbox-exec on macOS); fails closed",
     )
     p.add_argument("--runner", required=True, choices=names)
-    p.add_argument("--policy", metavar="FILE", help="policy file (default $WS_HOME/policy.toml)")
+    p.add_argument("--policy", metavar="FILE", help="policy file (default: policy.toml in the config folder)")
     p.add_argument("--protect", action="append", metavar="PATH", help="another file or folder to make read-only")
     p.add_argument(
         "--allow-write",

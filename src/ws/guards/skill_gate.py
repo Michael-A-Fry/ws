@@ -8,7 +8,7 @@ matter rules. A skill folder is read through a link but never when the link lead
 can't be read gives one stderr line and no rules.
 
 A Skill tool call for the skill, or a prompt that starts with `/skill` (or `/plugin:skill`), records the skill in the
-session's own record at `$WS_HOME/sessions/ID.skill-gate.json`. A write to a path a rule guards, before that skill is
+session's own record at `<state>/sessions/ID.skill-gate.json`. A write to a path a rule guards, before that skill is
 recorded, is denied with a reason that names the skill; the person can override it once with `ws approve`. Once the
 skill is recorded, writes to those paths go through for the rest of the session. A skill name matches with or without a
 `plugin:` prefix.

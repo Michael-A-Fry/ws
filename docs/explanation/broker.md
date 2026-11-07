@@ -17,7 +17,7 @@ A prompt-injected agent can then copy it out. If the session never has the value
 
 The code is `src/ws/broker.py` (the broker) and `src/ws/secrets.py` (the registry and the store).
 
-1. **The registry.** `$WS_HOME/secrets.toml` names each secret and where it may be used: the hosts, the header the host
+1. **The registry.** `~/.config/ws/secrets.toml` names each secret and where it may be used: the hosts, the header the host
    expects and the purposes. The registry isn't secret.
 2. **The store.** One file per name, mode 0600, in a folder of mode 0700. `ws secret set NAME` reads the value from a
    hidden prompt (or from standard input) and writes it. Nothing prints, logs or puts a value in an error message.

@@ -33,9 +33,9 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from ws import install, jobs
+from ws import install, jobs, paths
 from ws import secrets as wsecrets
-from ws.profile import ProfileError, load, profile_path, ws_home
+from ws.profile import ProfileError, load, profile_path
 from ws.roles import FAIL, OK, WARN
 
 ROLE, NAME = "backup", "restic"
@@ -291,7 +291,7 @@ def verify(
 
 
 def verify_path(env) -> Path:
-    return ws_home(env) / "logs" / VERIFY_FILE
+    return paths.state_dir(env) / "logs" / VERIFY_FILE
 
 
 def record(env, result: Verified, now: datetime | None = None) -> None:

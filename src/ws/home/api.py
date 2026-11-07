@@ -18,12 +18,12 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from ws import jsonl
+from ws import jsonl, paths
 from ws.home import records
 from ws.home.records import Ask, Event, Plugin, Session, Snapshot, SourceRow
 from ws.home.sources import FAILED, TIMEOUT, UNAVAILABLE, SourceError, _files, discover
 from ws.output import WsError
-from ws.profile import ProfileError, load, profile_path, ws_home
+from ws.profile import ProfileError, load, profile_path
 
 HOME_KEYS = ("lead", "opaque_paths", "show_repos", "sources", "open")
 SOURCE_KEYS = ("asks_jsonl", "events_dir", "otel_dir", "claude_dir", "opencode_dir")
@@ -143,7 +143,7 @@ class Env:
     environ: Mapping[str, str]
     cfg: HomeConfig
     home: Path
-    ws_home: Path
+    state: Path  # ws's state folder: approvals, sessions and the install key
     host: str
     now: float
     run: Runner = default_run
@@ -167,7 +167,7 @@ class Env:
             environ=env,
             cfg=load_config(env, home),
             home=home,
-            ws_home=ws_home(env),
+            state=paths.state_dir(env),
             host=host if host is not None else platform.node(),
             now=t,
             run=run or default_run,
@@ -317,12 +317,12 @@ KEY_FILE = "home/seal-key"
 
 
 def seal_key(env: Env) -> bytes:
-    """The per-install key behind the hashes on an opaque record: 32 random bytes in `$WS_HOME/home/seal-key` (0600),
+    """The per-install key behind the hashes on an opaque record: 32 random bytes in `home/seal-key` in ws's state folder (0600),
     made on first use. Where it can't be made or read, a key for this process alone is used: the hashes then change
     from one run to the next, which is safe and only less steady."""
     if "seal_key" in env.cache:
         return env.cache["seal_key"]
-    path = env.ws_home / KEY_FILE
+    path = env.state / KEY_FILE
     key = b""
     try:
         key = path.read_bytes() if path.is_file() else b""

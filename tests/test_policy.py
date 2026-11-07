@@ -1872,3 +1872,66 @@ def test_simple_commands_flow_keeps_the_order_the_links_and_the_subshells():
     assert shape("echo $(x)") == [("echo $(x)", ";", False), ("", "(?", False), ("x", ";", False), ("", ")", False)]
     flat = [(w, e) for w, e, _, _ in policy.simple_commands_flow("A=1 a && b") if w or e]
     assert flat == policy.simple_commands_env("A=1 a && b")
+
+
+# ---- the folders ws names in a command word (`$WS_STATE_DIR` and the others) ---------------------------------------------
+
+
+@pytest.fixture
+def four_folders(tmp_path, monkeypatch):
+    for var in ("WS_HOME",):
+        monkeypatch.delenv(var, raising=False)
+    folders = {}
+    for kind in ("CONFIG", "STATE", "DATA", "CACHE"):
+        folders[kind] = tmp_path / f"{kind.lower()}-folder"
+        monkeypatch.setenv(f"WS_{kind}_DIR", str(folders[kind]))
+    return folders
+
+
+@pytest.mark.parametrize("name", ["WS_CONFIG_DIR", "WS_STATE_DIR", "WS_DATA_DIR", "WS_CACHE_DIR"])
+def test_a_command_that_writes_through_a_ws_folder_variable_is_denied_like_the_plain_path(four_folders, name):
+    from ws import paths
+
+    protect = (*paths.control_paths(), *map(str, paths.protected_roots()))
+    pol = policy.default_policy()
+    for form in (f"${name}", f"${{{name}}}"):
+        cmd = f'echo x > "{form}/anything"'
+        plain = f'echo x > "{four_folders[name.removeprefix("WS_").removesuffix("_DIR")]}/anything"'
+        assert policy.is_denied_command(pol, plain, protect=protect), plain
+        assert policy.is_denied_command(pol, cmd, protect=protect), cmd
+
+
+def test_reading_the_secrets_store_through_the_data_folder_variable_is_denied(four_folders):
+    pol = policy.default_policy()
+    assert policy.is_denied_command(pol, "cat $WS_DATA_DIR/secrets/KEY")
+    assert policy.is_denied_command(pol, f"cat {four_folders['DATA']}/secrets/KEY")
+    assert policy.is_denied_command(pol, "cat ${WS_DATA_DIR}/secrets/KEY")
+
+
+def test_the_variables_follow_the_folders_when_they_change(tmp_path, monkeypatch):
+    from ws import paths
+
+    for var in ("WS_HOME", "WS_CONFIG_DIR", "WS_STATE_DIR", "WS_DATA_DIR", "WS_CACHE_DIR"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("WS_STATE_DIR", str(tmp_path / "first"))
+    pol = policy.default_policy()
+    protect = tuple(paths.control_paths())
+    assert policy.is_denied_command(pol, "rm $WS_STATE_DIR/logs/runs.jsonl", protect=protect)
+    monkeypatch.setenv("WS_STATE_DIR", str(tmp_path / "second"))
+    protect = tuple(paths.control_paths())
+    assert str(tmp_path / "second" / "logs") in protect and str(tmp_path / "first" / "logs") not in protect
+    assert policy.is_denied_command(pol, "rm $WS_STATE_DIR/logs/runs.jsonl", protect=protect)
+
+
+def test_the_secret_read_rules_name_the_data_folder_in_use_and_the_policy_loads_them(tmp_path, monkeypatch):
+    from ws import paths
+
+    for var in ("WS_HOME", "WS_CONFIG_DIR", "WS_STATE_DIR", "WS_DATA_DIR", "WS_CACHE_DIR"):
+        monkeypatch.delenv(var, raising=False)
+    h = tmp_path / "xdg-user"
+    h.mkdir()
+    monkeypatch.setenv("HOME", str(h))
+    store = paths.data_dir() / "secrets"
+    assert f"{store}/**" in policy.secret_read_rules()
+    assert f"{store}/**" in policy.default_policy().gate.deny_read
+    assert store == h / ".local" / "share" / "ws" / "secrets"

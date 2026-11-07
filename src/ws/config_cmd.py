@@ -14,11 +14,11 @@ import os
 import tomllib
 from pathlib import Path
 
-from ws import jobs, output, policy, profile, secrets
+from ws import jobs, output, paths, policy, profile, secrets
 
 
 def _origin(env: dict) -> str:
-    return "$WS_HOME" if env.get("WS_HOME") else "default (~/.ws)"
+    return paths.describe(env)
 
 
 def _file(name: str, path: Path, origin: str, table: dict[str, str], check) -> dict:
@@ -44,7 +44,7 @@ def _file(name: str, path: Path, origin: str, table: dict[str, str], check) -> d
 
 def collect(env: dict | None = None) -> dict:
     env = dict(os.environ) if env is None else env
-    home = profile.ws_home(env)
+    lay = paths.layout(env)
     origin = _origin(env)
     files = [
         _file(
@@ -75,7 +75,8 @@ def collect(env: dict | None = None) -> dict:
     warnings = [
         f"{f['name']}: `{d['key']}` is deprecated; use `{d['replacement']}`" for f in files for d in f["deprecated"]
     ]
-    return {"home": str(home), "origin": origin, "files": files, "warnings": warnings}
+    folders = {k: str(lay.dir(k)) for k in paths.KINDS}
+    return {"folders": folders, "origin": origin, "files": files, "warnings": warnings}
 
 
 def _raise_if(reason: str | None):
@@ -87,7 +88,11 @@ def _raise_if(reason: str | None):
 
 
 def render(data: dict) -> str:
-    out = [f"ws home: {data['home']} ({data['origin']})"]
+    shown = data["folders"]
+    if len(set(shown.values())) == 1:
+        out = [f"ws folder: {shown['config']} ({data['origin']})"]
+    else:
+        out = [f"ws folders ({data['origin']}):"] + [f"  {k:<7} {v}" for k, v in shown.items()]
     for f in data["files"]:
         keys = f["keys"]
         shown = ", ".join(keys[:8]) + (f", +{len(keys) - 8} more" if len(keys) > 8 else "")

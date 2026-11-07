@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from ws import approvals, cli, jobs, jsonl, policy, sandbox
+from ws import approvals, cli, jobs, jsonl, paths, policy, sandbox
 from ws.adapters import claude_code, opencode
 from ws.output import WsError
 
@@ -641,6 +641,50 @@ def test_the_whole_generated_folder_and_both_control_folders_are_protected(env, 
     assert str(other) in prot and str(other.parent / "approvals") in prot  # wherever --policy put it
     assert str(wshome / "approvals") in prot and str(wshome / "policy.toml") in prot  # $WS_HOME, whatever --policy says
     assert seen["home"] == wshome.absolute()
+
+
+@pytest.mark.parametrize("layout", ["xdg", "legacy", "single"])
+def test_the_wall_makes_every_ws_folder_read_only_in_each_layout(layout, tmp_path):
+    h = tmp_path / "wallhome"
+    h.mkdir()
+    env = {"HOME": str(h)}
+    if layout == "legacy":
+        (h / ".ws").mkdir()
+    if layout == "single":
+        env["WS_HOME"] = str(tmp_path / "one")
+    lay = paths.layout(env)
+    prot = sandbox.protected(lay.config / "policy.toml", "claude-code", env=env)
+    for folder in lay.distinct():  # the folders themselves, not just the control files in them
+        assert str(folder) in prot, folder
+    for name in policy.CONTROL_NAMES:
+        assert str(lay.path_of(name)) in prot, name
+    assert str(lay.config / "policy.toml") in prot
+
+
+def test_the_wall_binds_each_of_the_four_folders_read_only_and_leaves_the_state_holes_writable(tmp_path):
+    lay = paths.layout({"HOME": str(tmp_path / "wh")})
+    for d in lay.distinct():
+        d.mkdir(parents=True)
+    plan = sandbox.Plan(lay.state, tuple(str(d) for d in lay.distinct()), writable=(str(tmp_path / "proj"),))
+    (tmp_path / "proj").mkdir()
+    argv = sandbox.bwrap_argv(["x"], plan, False, 3)
+    ro = [argv[i + 1] for i, a in enumerate(argv) if a == "--ro-bind"]
+    for d in lay.distinct():
+        assert os.path.realpath(d) in ro
+    made = sandbox.writable_holes(lay.state)
+    assert made == [lay.state / "approvals" / "pending", lay.state / "sessions"]
+    assert all(lay.state in h.parents for h in made)  # the holes are in the state folder, and nowhere else
+    mac = sandbox.sandbox_exec_profile(plan)
+    for d in lay.distinct():
+        assert f'(deny file-write* (subpath "{os.path.realpath(d)}"))' in mac
+
+
+def test_the_launcher_hands_the_runner_the_layout_because_the_wall_moves_the_xdg_variables():
+    layout = {"WS_CONFIG_DIR": "/a", "WS_STATE_DIR": "/b", "WS_DATA_DIR": "/c", "WS_CACHE_DIR": "/d"}
+    got = sandbox.launch_env({"HOME": "/h"}, "/tmp/w", {"XDG_STATE_HOME": "/walled/state"}, "opencode", None, layout)
+    assert all(got[k] == v for k, v in layout.items())
+    assert got["XDG_STATE_HOME"] == "/walled/state"  # the runner's own state is the wall's, ws's folders are not
+    assert "WS_STATE_DIR" not in sandbox.launch_env({"HOME": "/h"})
 
 
 # --- the broker, for real -----------------------------------------------------------------------------------------

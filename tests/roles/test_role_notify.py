@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pytest
 
-from ws import broker, cli
+from ws import broker, cli, paths
 from ws.roles import ntfy
 
 URL = "https://ntfy.example.org/my-topic"
@@ -463,7 +463,7 @@ def test_the_folder_name_is_one_clean_line(env):
 
 
 def read_last(env):
-    return json.loads((ntfy.ws_home(env) / "logs" / "notify-last.json").read_text())
+    return json.loads((paths.state_dir(env) / "logs" / "notify-last.json").read_text())
 
 
 def test_notify_last_is_written_on_ok_without_the_text(env):
@@ -483,7 +483,7 @@ def test_notify_last_is_written_on_failure(env):
 def test_a_refused_cap_leaves_notify_last_alone(env):
     with pytest.raises(ntfy.CapReached):
         ntfy.alert({**CFG, "alerts_per_day": 0}, env, STOP, "claude-code", now=NOON, sender=Sender())
-    assert not (ntfy.ws_home(env) / "logs" / "notify-last.json").exists()
+    assert not (paths.state_dir(env) / "logs" / "notify-last.json").exists()
 
 
 def test_the_test_push_writes_notify_last(env):
@@ -674,7 +674,7 @@ def test_notify_last_is_private_and_holds_only_a_fixed_code(env):
 
     with pytest.raises(ntfy.NotifyError):
         ntfy.send(CFG, env, "hi", now=NOON, sender=odd)
-    path = ntfy.ws_home(env) / "logs" / "notify-last.json"
+    path = paths.state_dir(env) / "logs" / "notify-last.json"
     assert read_last(env)["error"] == "error" and "SECRET" not in path.read_text()
     assert path.stat().st_mode & 0o777 == 0o600
     path.chmod(0o644)

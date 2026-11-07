@@ -9,7 +9,8 @@ To understand the rule first, read [The wall](../explanation/wall.md).
   `sudo dnf install bubblewrap`). On macOS the wall uses `sandbox-exec`, which is untested in CI; see
   [Known limits](../explanation/known-limits.md).
 - A policy and generated runner files: [Use the gate](use-the-gate.md).
-- For Claude Code, the settings generated into `$WS_HOME/gate/claude-code` (`ws setup` or `ws gate generate` writes them).
+- For Claude Code, the settings generated into `~/.local/state/ws/gate/claude-code` (`ws setup` or `ws gate generate`
+  writes them).
 
 ## Steps
 
@@ -38,15 +39,15 @@ To understand the rule first, read [The wall](../explanation/wall.md).
    your policy.
 
    ```sh
-   ws gate launch --runner opencode -- sh -c 'touch "${WS_HOME:-$HOME/.ws}/policy.toml"'
+   ws gate launch --runner opencode -- sh -c 'touch ~/.config/ws/policy.toml'
    ```
 
 4. When the runner exits, read the end-of-run report. ws prints it to standard error, and appends a line to
-   `$WS_HOME/logs/wall-report.jsonl`, only when the session left something that would run later: a new git hook, runner
-   config, or a program that loads on its own. It deletes nothing. No report means nothing to report.
+   `~/.local/state/ws/logs/wall-report.jsonl`, only when the session left something that would run later: a new git
+   hook, runner config, or a program that loads on its own. It deletes nothing. No report means nothing to report.
 
    ```sh
-   cat "${WS_HOME:-$HOME/.ws}/logs/wall-report.jsonl"
+   cat ~/.local/state/ws/logs/wall-report.jsonl
    ```
 
 ## Success

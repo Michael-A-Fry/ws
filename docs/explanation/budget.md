@@ -25,8 +25,8 @@ The code is `src/ws/run.py` (the check) and `src/ws/runrecord.py` (the sum). `ws
 WS103.
 
 1. **A cap is required.** A profile with no positive `monthly_cap_usd` makes `ws run` refuse. WS103 fails.
-2. **Spend is counted from the run log.** `ws` adds up `cost_usd` in `$WS_HOME/logs/runs.jsonl` for runs that started in
-   the current UTC month. Refused runs cost nothing.
+2. **Spend is counted from the run log.** `ws` adds up `cost_usd` in `~/.local/state/ws/logs/runs.jsonl` for runs that
+   started in the current UTC month. Refused runs cost nothing.
 3. **A run with no reported cost still counts.** If the runner gave token counts, they count at your
    `fallback_usd_per_mtok`. If it gave neither, the run counts at `unknown_run_usd` (1.0 by default). Spend is never
    undercounted.

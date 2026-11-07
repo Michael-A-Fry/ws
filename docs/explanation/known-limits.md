@@ -109,8 +109,8 @@ The grader's wall in `ws eval` has the same network as the runner's wall.
 ### The runner gets a short list of environment variables
 
 `ws gate launch` hands the runner `PATH`, `HOME`, the locale and terminal names, the named `LC_` and `XDG_` variables,
-`WS_HOME`, the broker socket and the runner's own configuration variables. The rest of the launching shell's
-environment stays behind.
+the variables that say where ws's folders are (`WS_HOME`, or the four `WS_*_DIR` ones), the broker socket and the
+runner's own configuration variables. The rest of the launching shell's environment stays behind.
 
 - **What it means.** A key you export in that shell isn't in the session unless you name it with `--pass-env NAME`.
   A name you pass is readable by the session and by every program it starts. A runner behind a proxy needs the proxy
@@ -167,8 +167,8 @@ your runner's own config file, beside yours. It records exactly what it added an
   `opencode.jsonc`, is left alone. So is one where you've set an `env` key, or an OpenCode rule, to a value that
   contradicts ws's. `ws install` names the key and changes nothing. Use `ws gate launch` for those machines.
 - **Layout.** ws keeps your indentation and key order. A rewrite lays the JSON out in one style, so hand-aligned inline
-  arrays come back expanded. The saved copy in `$WS_HOME/backups/` is exact, and it can hold env values you put in the
-  file, so it's mode 0600.
+  arrays come back expanded. The saved copy in `~/.local/state/ws/backups/` is exact, and it can hold env values you put
+  in the file, so it's mode 0600.
 - **OpenCode runs none of the guards yet.** `ws doctor` (WS008) lists each guard that's on in your policy and the runner
   doesn't run.
 - **A broken ws blocks calls, not skips them.** The hook fails closed. When ws can't start, each governed call is
@@ -191,8 +191,8 @@ your runner's own config file, beside yours. It records exactly what it added an
 
 ### The notify cap counts ws's own sends only
 
-The daily limit of 1 digest and 3 pushes counts what ws sends. A session that runs ws with a `WS_HOME` of its own gets a
-fresh counter, and one that can reach a topic with no token can post to it directly.
+The daily limit of 1 digest and 3 pushes counts what ws sends. A session that runs ws with a `WS_HOME` or `WS_STATE_DIR`
+of its own gets a fresh counter, and one that can reach a topic with no token can post to it directly.
 
 - **Workaround.** Give the topic a token (`token` in `[roles.notify]`) so the broker holds it.
 
@@ -240,6 +240,6 @@ first output and attention minutes, because the run record has no fields for the
 ## Small defects (P3)
 
 - Tests leak `WS_OUTPUT` and `WS_GATED_SESSION` from the environment. This affects contributors, not users.
-- A `canary.jsonl.old` folder planted in `$WS_HOME` silently stops canary lines.
+- A `canary.jsonl.old` folder planted in the state folder silently stops canary lines.
 - `PYTHONPYCACHEPREFIX` is set in the OpenCode wall only, so `.pyc` files crowd the Claude Code end-of-run report.
 - A `.git/hooks` folder with many files isn't counted against the report's scan budget.

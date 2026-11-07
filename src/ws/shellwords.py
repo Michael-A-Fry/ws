@@ -1635,8 +1635,8 @@ def option_values(toks: list[str], letters: str = "", longs: tuple[str, ...] = (
 
 
 def expand_path(path: str, env: Mapping[str, str]) -> str:
-    """A path as written in a rule or by a tool, with a leading `~`, `~user`, `$HOME`, `${HOME}`, `$WS_HOME` or
-    `${WS_HOME}` made into the folder it stands for (the names `env` knows). The rest is left alone."""
+    """A path as written in a rule or by a tool, with a leading `~`, `~user`, `$HOME`, `${HOME}`, `$WS_HOME`, `$WS_CONFIG_DIR`, `$WS_STATE_DIR`,
+    `$WS_DATA_DIR`, `$WS_CACHE_DIR` (or the same in braces) made into the folder it stands for (the names `env` knows). The rest is left alone."""
     if path.startswith("~"):
         m = _TILDE.match(path)
         if m and (m.end() == len(path) or path[m.end()] == "/"):
@@ -1644,7 +1644,7 @@ def expand_path(path: str, env: Mapping[str, str]) -> str:
             if val is not None:
                 return val.rstrip("/") + path[m.end() :] if val != "/" else path[m.end() :] or "/"
         return path
-    for name in ("HOME", "WS_HOME"):
+    for name in ("HOME", "WS_HOME", "WS_CONFIG_DIR", "WS_STATE_DIR", "WS_DATA_DIR", "WS_CACHE_DIR"):
         for pre in ("${" + name + "}", "$" + name):
             if (path == pre or path.startswith(pre + "/")) and name in env:
                 return env[name].rstrip("/") + path[len(pre) :]

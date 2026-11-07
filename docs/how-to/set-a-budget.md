@@ -6,11 +6,11 @@ read [The budget](../explanation/budget.md).
 ## Before you start
 
 - ws installed and `ws init` done ([Install ws](install.md)).
-- A job file in `$WS_HOME/jobs/` ([Rule of Two how-to](apply-the-rule-of-two.md) shows one).
+- A job file in `~/.config/ws/jobs/` ([Rule of Two how-to](apply-the-rule-of-two.md) shows one).
 
 ## Steps
 
-1. Set the cap in your profile, `$WS_HOME/profile.toml` (`~/.ws/profile.toml` unless you set `WS_HOME`). The number is US
+1. Set the cap in your profile, `~/.config/ws/profile.toml` (`profile.toml` in [the config folder](../reference/stores.md#where-ws-keeps-its-files)). The number is US
    dollars for a calendar month in UTC.
 
    ```toml

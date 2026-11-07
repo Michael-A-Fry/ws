@@ -74,12 +74,21 @@ def get(name: str) -> ModuleType:
 
 def protected_paths(out: Path, policy_file: Path, extra: tuple[str, ...] = ()) -> list[str]:
     """Everything a session must not write: the generated folder, the policy, ws's other control files next to
-    it (profile, secrets, jobs, release, runs, logs), and any `extra` path the caller names (a user settings file).
-    Each adapter denies edits to all of them natively."""
+    it (profile, secrets, jobs, release, runs, logs), every folder ws keeps its files in (in each layout it could use:
+    `ws.paths.protected_roots`), and any `extra` path the caller names (a user settings file). Each adapter denies edits
+    to all of them natively."""
+    from ws import paths
     from ws.policy import control_paths
 
-    paths = [str(out), str(policy_file), *control_paths(policy_file.parent), *extra]
-    return list(dict.fromkeys(paths))
+    found = [
+        str(out),
+        str(policy_file),
+        *control_paths(policy_file.parent),
+        *paths.control_paths(),
+        *map(str, paths.protected_roots()),
+        *extra,
+    ]
+    return list(dict.fromkeys(found))
 
 
 def check_argv(

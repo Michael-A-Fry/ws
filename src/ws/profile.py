@@ -8,6 +8,8 @@ import re
 import tomllib
 from pathlib import Path
 
+from ws import paths
+
 HEADER = (
     "# ws profile. `ws init` writes [machine]; `ws doctor` checks every [roles.*] table.\n"
     "# ws rewrites this file when it changes it: comments are not kept.\n"
@@ -23,13 +25,8 @@ class ProfileError(Exception):
     pass
 
 
-def ws_home(env: dict | None = None) -> Path:
-    env = os.environ if env is None else env
-    return Path(env["WS_HOME"]).expanduser() if env.get("WS_HOME") else Path.home() / ".ws"
-
-
 def profile_path(env: dict | None = None) -> Path:
-    return ws_home(env) / "profile.toml"
+    return paths.config_dir(env) / "profile.toml"
 
 
 def load(path: Path) -> dict | None:

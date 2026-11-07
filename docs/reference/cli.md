@@ -68,7 +68,9 @@ A command that speaks a protocol on standard output (`ws mcp serve`, `ws gate ch
 
 | Variable | Meaning |
 |---|---|
-| `WS_HOME` | Where ws keeps its files. Default `~/.ws`. |
+| `WS_HOME` | One folder that holds all of ws's files, laid out the way ws always did. Unset by default: ws then uses the XDG folders (see [Stores](stores.md#where-ws-keeps-its-files)). |
+| `WS_CONFIG_DIR`, `WS_STATE_DIR`, `WS_DATA_DIR`, `WS_CACHE_DIR` | A full path that moves one of ws's four folders. Beats `WS_HOME` for that folder. |
+| `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME` | Where the config, data and cache folders go, under `ws/`. Defaults `~/.config`, `~/.local/share`, `~/.cache`. |
 | `WS_OUTPUT` | Set to `json` for `--json` on every command. |
 | `WS_BROKER_SOCKET` | The broker socket a client uses. |
 | `WS_GATED_SESSION` | Set inside a gated session. `ws approve` refuses when it's present. |
@@ -76,7 +78,7 @@ A command that speaks a protocol on standard output (`ws mcp serve`, `ws gate ch
 | `FORCE_COLOR` | Any value except empty, `0` or `false` (any case) keeps colour on when output goes to a pipe or `TERM=dumb`. `NO_COLOR` and `--no-color` win. |
 | `TERM` | `dumb` turns colour off in every command, and makes `ws setup` print each step once, with no cursor-move or erase codes. |
 | `COLORFGBG` | Read by every command that prints colour. The default is the full brand palette in 256 colours; a light background (`0;15`) switches to darker violet and mark colours and your terminal's own green, yellow and red. |
-| `XDG_STATE_HOME` | Where run folders for jobs with no `cwd` go, under `ws/work`. Default `~/.local/state`. |
+| `XDG_STATE_HOME` | Where the state folder goes, under `ws/`, and run folders for jobs with no `cwd`, under `ws-work`. Default `~/.local/state`. |
 
 ## Commands
 
@@ -136,7 +138,7 @@ ws gate init [-h] [--policy FILE]
 
 | Argument | Meaning |
 |---|---|
-| `--policy FILE` | Policy file (default $WS_HOME/policy.toml). |
+| `--policy FILE` | Policy file (default ~/.config/ws/policy.toml). |
 
 ### `ws gate generate`
 
@@ -148,7 +150,7 @@ ws gate generate [-h] [--policy FILE] --runner {claude-code,opencode} --out DIR 
 
 | Argument | Meaning |
 |---|---|
-| `--policy FILE` | Policy file (default $WS_HOME/policy.toml). |
+| `--policy FILE` | Policy file (default ~/.config/ws/policy.toml). |
 | `--runner RUNNER` | The runner to write config for: `claude-code` or `opencode`. One of `claude-code`, `opencode`; required. |
 | `--out DIR` | Folder to write (never a runner's own config). Required. |
 | `--ws-cmd CMD` | How the hook runs ws (default: ws). |
@@ -163,7 +165,7 @@ ws gate check [-h] [--policy FILE] --runner {claude-code,opencode} [--protect PA
 
 | Argument | Meaning |
 |---|---|
-| `--policy FILE` | Policy file (default $WS_HOME/policy.toml). |
+| `--policy FILE` | Policy file (default ~/.config/ws/policy.toml). |
 | `--runner RUNNER` | The runner whose hook payload is on standard input. One of `claude-code`, `opencode`; required. |
 | `--protect PATH` | A file or folder of ws's own that a session may not write. |
 
@@ -178,7 +180,7 @@ ws gate event [-h] [--policy FILE] --runner {claude-code,opencode}
 
 | Argument | Meaning |
 |---|---|
-| `--policy FILE` | Policy file (default $WS_HOME/policy.toml). |
+| `--policy FILE` | Policy file (default ~/.config/ws/policy.toml). |
 | `--runner RUNNER` | The runner whose hook payload is on standard input. One of `claude-code`, `opencode`; required. |
 
 An event that `ws gate check` answers, or one ws doesn't read, exits 0 with a line on standard error. A payload it can't
@@ -197,7 +199,7 @@ ws gate replay [-h] [--policy FILE] --runner {claude-code,opencode} FILE
 | Argument | Meaning |
 |---|---|
 | `FILE` | One JSON object per line: a payload, or `{payload, expect}` where `expect` is `allow`, `deny` or `ask`. |
-| `--policy FILE` | Policy file (default $WS_HOME/policy.toml). |
+| `--policy FILE` | Policy file (default ~/.config/ws/policy.toml). |
 | `--runner RUNNER` | The runner the payloads came from. One of `claude-code`, `opencode`; required. |
 
 Exit 0 when every line with an `expect` matches (or none has one), and 1 when an `expect` differs. With `--json` the
@@ -215,7 +217,7 @@ ws gate launch [-h] --runner {claude-code,opencode} [--policy FILE] [--protect P
 | Argument | Meaning |
 |---|---|
 | `--runner RUNNER` | The runner to start: `claude-code` or `opencode`. One of `claude-code`, `opencode`; required. |
-| `--policy FILE` | Policy file (default $WS_HOME/policy.toml). |
+| `--policy FILE` | Policy file (default ~/.config/ws/policy.toml). |
 | `--protect PATH` | Another file or folder to make read-only. |
 | `--allow-write DIR` | Another folder the session may write (besides the project). |
 | `--no-sandbox` | Start the runner with no wall (says what that gives up). |
@@ -294,7 +296,7 @@ ws broker serve [-h] [--socket PATH] [--group GROUP] [--port PORT] [--lease-ttl 
 
 | Argument | Meaning |
 |---|---|
-| `--socket PATH` | Default $WS_BROKER_SOCKET, else [roles.secrets] socket in the profile, else $WS_HOME/run/broker.sock. |
+| `--socket PATH` | Default $WS_BROKER_SOCKET, else [roles.secrets] socket in the profile, else ~/.local/state/ws/run/broker.sock. |
 | `--group GROUP` | Also serve members of this group (socket folder becomes 0750). |
 | `--port PORT` | Lease proxy port on 127.0.0.1 (default: any free one). |
 | `--lease-ttl SECONDS` | Longest lease (default 3600). |
@@ -313,7 +315,7 @@ ws broker request [-h] --purpose PURPOSE --host HOST [--ttl SECONDS] [--socket P
 | `--purpose PURPOSE` | What the lease is for; it must be in the registry entry's `purposes`. Required. |
 | `--host HOST` | The host the lease may reach. Required. |
 | `--ttl SECONDS` | Ask for a shorter lease. |
-| `--socket PATH` | The broker's socket (default: from the profile, else `$WS_HOME/run/broker.sock`). |
+| `--socket PATH` | The broker's socket (default: from the profile, else `~/.local/state/ws/run/broker.sock`). |
 
 ### `ws broker status`
 
@@ -325,7 +327,7 @@ ws broker status [-h] [--socket PATH]
 
 | Argument | Meaning |
 |---|---|
-| `--socket PATH` | The broker's socket (default: from the profile, else `$WS_HOME/run/broker.sock`). |
+| `--socket PATH` | The broker's socket (default: from the profile, else `~/.local/state/ws/run/broker.sock`). |
 
 ## `ws note`
 
@@ -408,7 +410,7 @@ ws mcp serve [-h]
 
 ## `ws run`
 
-Run a headless job (a file in $WS_HOME/jobs) and record what it did.
+Run a headless job (a file in ~/.config/ws/jobs) and record what it did.
 
 Run a headless job. The monthly cap is checked before the run, not enforced during it.
 
@@ -418,7 +420,7 @@ ws run [-h] [--dry-run] job
 
 | Argument | Meaning |
 |---|---|
-| `job` | The job name: $WS_HOME/jobs/<name>.toml. |
+| `job` | The job name: ~/.config/ws/jobs/<name>.toml. |
 | `--dry-run` | Show what would start, and whether it would be refused. |
 
 ## `ws runs`
@@ -526,6 +528,24 @@ ws uninstall [-h] [--dry-run] [-y]
 |---|---|
 | `--dry-run` | Show what would be removed. |
 | `-y`, `--yes` | No prompt. |
+
+## `ws migrate`
+
+Move ws's files from `~/.ws` to the XDG folders. Nothing is deleted.
+
+```text
+ws migrate [-h] [--dry-run]
+```
+
+| Argument | Meaning |
+|---|---|
+| `--dry-run` | Show the move and change nothing. |
+
+It plans the move file by file, refuses (changing nothing) if a target exists and differs, copies with the modes kept,
+checks every copy by its SHA-256, writes `migrate-manifest.json` in the state folder, renames `~/.ws` to
+`~/.ws.migrated-DATE`, and refreshes the runner hooks and generated files, because they name the policy by its path.
+Run it again and it says it's done. After it, run `ws schedule apply` if you have scheduled jobs. Exit 0 when done or
+when there's nothing to do, 1 when it was refused or the refresh failed.
 
 ## `ws plugin`
 
@@ -636,7 +656,7 @@ ws skills restore [-h] [--runner {claude-code,opencode}] {align,checkpoint,taste
 
 Check a runner still works with ws after an update (no model is called).
 
-Small checks, no paid model. Each run adds one line to `$WS_HOME/logs/canary.jsonl`. Exit 1 on a failure.
+Small checks, no paid model. Each run adds one line to `~/.local/state/ws/logs/canary.jsonl`. Exit 1 on a failure.
 
 ```text
 ws canary [-h] [--runner {claude-code,opencode}]
@@ -732,7 +752,7 @@ Set these in the `[roles.notify]` table of `profile.toml`, beside `adapter = "nt
 | `alert_on` | Which events alert. `"needs-you"` sends for each Notification (a permission or an answer is wanted) and for a Stop whose last message asks something; a plain finished turn sends nothing. `"every-stop"` sends for every Notification and every Stop. A key that isn't there means `"every-stop"`, so a config from before the key behaves as it did; set `"needs-you"` in a new one. |
 
 The folder name goes to the notify server (ntfy.sh or your own) with the push. Each send writes
-`$WS_HOME/logs/notify-last.json`.
+`~/.local/state/ws/logs/notify-last.json`.
 
 ## `ws backup`
 
@@ -834,7 +854,7 @@ ws setup [-h] [--web] [--no-open] [-y] [--plugin NAME] [--notes PATH]
 
 ## `ws config`
 
-Every file ws reads: where it's, where its path came from, the keys it sets. `ws config fallback` shows, sets and
+Every file ws reads: where it's, which folder layout it came from, the keys it sets. `ws config fallback` shows, sets and
 clears the program that gets words ws has no command for (see [Your own commands](#your-own-commands)).
 
 ```text
@@ -957,7 +977,7 @@ ws version [--json]
 
 ## Job file
 
-A job file is `$WS_HOME/jobs/NAME.toml`. `ws run NAME` runs it. The file and its folder must belong to you and not be
+A job file is `~/.config/ws/jobs/NAME.toml`. `ws run NAME` runs it. The file and its folder must belong to you and not be
 writable by others, because a job decides what a runner starts with. Every error names the key.
 
 | Key | Type | Meaning |
@@ -980,9 +1000,9 @@ writable by others, because a job decides what a runner starts with. Every error
 
 ## Run record
 
-Each `ws run` appends one JSON line to `$WS_HOME/logs/runs.jsonl`. Every key is always present, and a value that ws couldn't
-learn is `null`. The keys are: `schema`, `run_id`, `job`, `runner`, `runner_version`, `exe_path`, `model_requested`,
-`models_used`, `started_at`, `ended_at`, `duration_ms`, `duration_api_ms`, `exit_code`, `status`, `error`, `session_id`,
-`transcript_path`, `tokens`, `cost_usd`, `cost_basis`, `num_turns`, `cwd`, `policy`, `secrets_used`, `ws_version`,
-`output_truncated`, `allow_unpriced`, `green`, `recovered` and `eval`. `status` is `ok`, `error`, `timeout` or `refused`.
-The file is mode 0600 and rotates at 5 MB, keeping three old files.
+Each `ws run` appends one JSON line to `~/.local/state/ws/logs/runs.jsonl`. Every key is always present, and a value
+that ws couldn't learn is `null`. The keys are: `schema`, `run_id`, `job`, `runner`, `runner_version`, `exe_path`,
+`model_requested`, `models_used`, `started_at`, `ended_at`, `duration_ms`, `duration_api_ms`, `exit_code`, `status`,
+`error`, `session_id`, `transcript_path`, `tokens`, `cost_usd`, `cost_basis`, `num_turns`, `cwd`, `policy`,
+`secrets_used`, `ws_version`, `output_truncated`, `allow_unpriced`, `green`, `recovered` and `eval`. `status` is `ok`,
+`error`, `timeout` or `refused`. The file is mode 0600 and rotates at 5 MB, keeping three old files.

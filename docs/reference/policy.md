@@ -1,8 +1,9 @@
 # Policy reference
 
-`policy.toml` is the one vendor-neutral file that says what a session may do. It lives at `$WS_HOME/policy.toml` (default
-`~/.ws/policy.toml`). `ws gate init` writes the commented default. With no file, ws uses the built-in default. A
-different file can be named with `--policy FILE` on the `ws gate` commands.
+`policy.toml` is the one vendor-neutral file that says what a session may do. It lives at `~/.config/ws/policy.toml`
+(`policy.toml` in the [config folder](stores.md#where-ws-keeps-its-files)). `ws gate init` writes the commented default.
+With no file, ws uses the built-in default. A different file can be named with `--policy FILE` on the `ws gate`
+commands.
 
 The file is loaded whole or refused. An unknown key, a wrong type or a bad value stops the load, and the message names the
 key. The gate then denies every call (it fails closed). The schema is `1`.
@@ -44,7 +45,7 @@ the built-in default, which has the list below.
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `deny_commands` | list of text | `[]` in a file | Shell command patterns no session may run. `ws gate init` writes the [built-in list](#built-in-deny_commands). |
-| `deny_read` | list of text | `[]` in a file | Paths no session may read. `~/` is your home. `**` crosses folders. `ws gate init` writes `~/.ssh/**`, `~/.gnupg/**`, `~/.aws/credentials` and `~/.config/ws/secrets/**`. Whatever the file says, ws also denies reads of its own secrets folder (`$WS_HOME/secrets`, and the `[roles.secrets] store` folder when the profile names one), for every runner. |
+| `deny_read` | list of text | `[]` in a file | Paths no session may read. `~/` is your home. `**` crosses folders. `ws gate init` writes `~/.ssh/**`, `~/.gnupg/**`, `~/.aws/credentials`, `~/.config/ws/secrets/**` and `~/.local/share/ws/secrets/**`. Whatever the file says, ws also denies reads of its own secrets folder (`secrets/` in the data folder, and the `[roles.secrets] store` folder when the profile names one), for every runner. |
 | `deny_tools` | list of text | `[]` | Neutral tool names to switch off. Known: `web_fetch`, `web_search`. An allowed web tool counts as a way out. |
 | `ask_commands` | list of text | `[]` | Command patterns that run only after you approve that exact call. Same globs as `deny_commands`. A command that also matches `deny_commands` stays denied. |
 | `allow_hosts` | list of text | `[]` | Hosts a session's shell may reach, for runners whose sandbox filters the network (Claude Code). Empty means the policy says nothing about the network. |
@@ -92,15 +93,16 @@ recognised however it's spelled. It reads:
 - Words: quotes and escapes are removed, and a brace group is expanded before anything else, as the shell does. Comma
   lists nest and chain, and `{1..40}` and `{a..e}` sequences (with a step, and zero padding such as `{01..10}`) are
   expanded in full. A quoted `{`, `,` or `}` isn't part of a group, so `'{a,b}'` is one word.
-- `~`, `$HOME` and `${HOME}`, `$WS_HOME` and the variables set earlier on the same line (by `NAME=value`, `export`,
-  `declare`, `typeset`, `local`, `readonly`, `read NAME <<< word` and a `for` loop, which is read once for each word of
-  its list), including the `${NAME:-x}`, `${NAME:+x}`, `${NAME%/*}`, `${NAME##*/}`, `${NAME/a/b}`, `${NAME:1:3}` and
-  `${!NAME}` forms. The word of a default or alternative is expanded like any word. `~+`, `~-`, `$PWD` and `$OLDPWD`
-  follow `cd` on the same line. The case-change operators (`${NAME,}`, `,,`, `^`, `^^`, `~` and `~~`) change case as
-  bash does, `${NAME@E}` decodes escapes, `${NAME@Q}`, `@U`, `@L`, `@u` and `@l` read as the value, and `${NAME[0]}` is
-  the value. A quoted `~` is the folder called `~`, and a single-quoted `$HOME` is text. A variable the line doesn't set
-  is left as written; a path word that still holds one after that (`/home/$USER/` and then a protected folder) is
-  refused when what follows the unknown part names a protected path under the home folder.
+- `~`, `$HOME` and `${HOME}`, `$WS_HOME`, `$WS_CONFIG_DIR`, `$WS_STATE_DIR`, `$WS_DATA_DIR`, `$WS_CACHE_DIR` and the
+  variables set earlier on the same line (by `NAME=value`, `export`, `declare`, `typeset`, `local`, `readonly`, `read
+  NAME <<< word` and a `for` loop, which is read once for each word of its list), including the `${NAME:-x}`,
+  `${NAME:+x}`, `${NAME%/*}`, `${NAME##*/}`, `${NAME/a/b}`, `${NAME:1:3}` and `${!NAME}` forms. The word of a default or
+  alternative is expanded like any word. `~+`, `~-`, `$PWD` and `$OLDPWD` follow `cd` on the same line. The case-change
+  operators (`${NAME,}`, `,,`, `^`, `^^`, `~` and `~~`) change case as bash does, `${NAME@E}` decodes escapes,
+  `${NAME@Q}`, `@U`, `@L`, `@u` and `@l` read as the value, and `${NAME[0]}` is the value. A quoted `~` is the folder
+  called `~`, and a single-quoted `$HOME` is text. A variable the line doesn't set is left as written; a path word that
+  still holds one after that (`/home/$USER/` and then a protected folder) is refused when what follows the unknown part
+  names a protected path under the home folder.
 - Redirections: `<`, `>`, `>>`, `>|`, `<>`, `&>`, `&>>`, `>&`, here-strings, and file-descriptor forms such as `3<` and
   `2>`. Each target is expanded like any word, so a brace group in a target names every file it expands to.
 - Paths inside a word: the value of an option (`dd if=P`, `--opt=P`, `-oP`, `-sSLo P`), a file argument (`-F f=@P`,
@@ -153,11 +155,10 @@ The exception applies only when the job name matches and every source the sessio
 
 ## What a session may never write
 
-Whatever the policy says, the gate denies a session writing these ws control paths under `$WS_HOME`: `profile.toml`,
-`policy.toml`, `secrets.toml`, `jobs`, `release`, `runs`, `logs`, `sessions`, `approvals`, `install-manifest.json` and
-`ratings.jsonl`. It also protects the policy file in use and any path passed with `--protect` (the generated folder,
-for example).
-Reading `logs/runs.jsonl` stays allowed.
+Whatever the policy says, the gate denies a session writing every one of ws's four folders, and these control paths in
+them: `profile.toml`, `policy.toml`, `secrets.toml`, `jobs`, `release`, `runs`, `logs`, `sessions`, `approvals`,
+`install-manifest.json` and `ratings.jsonl`. It also protects the policy file in use and any path passed with
+`--protect` (the generated folder, for example). Reading `logs/runs.jsonl` stays allowed.
 
 ## Example
 
@@ -181,7 +182,7 @@ sensitive = true
 acts = ["write"]
 
 [gate]
-deny_read = ["~/.ssh/**", "~/.gnupg/**", "~/.aws/credentials", "~/.config/ws/secrets/**"]
+deny_read = ["~/.ssh/**", "~/.gnupg/**", "~/.aws/credentials", "~/.config/ws/secrets/**", "~/.local/share/ws/secrets/**"]
 deny_tools = ["web_fetch", "web_search"]
 ask_commands = ["git push*"]
 allow_hosts = ["api.anthropic.com", "github.com"]

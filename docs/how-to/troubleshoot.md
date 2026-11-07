@@ -91,7 +91,7 @@ A refusal is recorded too. `ws run JOB --dry-run` shows `would_refuse` with the 
 
 `ws run` starts a per-user broker once if none is running. If the broker is walled (`ws secret wall`), it's a system
 service: check `systemctl status ws-broker`. `ws broker status` asks the broker directly. A socket path longer than the
-system limit has its own error: set a shorter `WS_HOME`, or set `WS_BROKER_SOCKET`.
+system limit has its own error: use a shorter `WS_HOME` (or `XDG_STATE_HOME`), or set `WS_BROKER_SOCKET`.
 
 ### A job file is refused
 

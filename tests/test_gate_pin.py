@@ -133,7 +133,7 @@ def test_a_pin_that_cannot_be_read_is_refused(box, monkeypatch, capsys, installe
 
 
 def test_a_missing_pin_key_is_refused(box, monkeypatch, capsys, installed):
-    code, err = installed.check(monkeypatch, capsys, "ls", pin=installed.pin[:-2])
+    code, err = installed.check(monkeypatch, capsys, "ls", pin=installed.pin[2:])  # without the home folder
     assert code == 2 and "incomplete" in err
 
 
@@ -196,9 +196,9 @@ def test_every_generated_hook_command_carries_the_pin(box):
             for h in g["hooks"]:
                 if "ws" in shlex.split(h["command"])[:1]:
                     seen += 1
-                    assert sorted(p.split("=")[0] for p in _pins_in(h["command"])) == sorted(paths.PIN_KEYS), h[
-                        "command"
-                    ]
+                    assert sorted(p.split("=")[0] for p in _pins_in(h["command"])) == sorted(
+                        (*paths.PIN_KEYS, paths.TMP_KEY)
+                    ), h["command"]
     assert seen >= 5  # the check, the session pair and the alert pair at least
 
 
@@ -208,7 +208,7 @@ def test_the_opencode_shim_pins_its_check_and_its_session_commands(box):
     assert "__PIN__" not in shim
     check = json.loads(shim.split("const CHECK = ")[1].split("\n")[0])
     pin = json.loads(shim.split("const PIN = ")[1].split("\n")[0])
-    assert check[-10:] == pin and pin == paths.pin_of().args()
+    assert check[-12:] == pin and pin == paths.pin_of().args()
 
 
 def test_the_pin_comes_from_the_environment_install_planned_with_not_the_process(box, tmp_path):

@@ -39,7 +39,7 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from ws import __version__, adapters, notesdetect, osinfo, output, paths, policy, profile, roles, userconfig
+from ws import __version__, adapters, notesdetect, osinfo, output, paths, policy, profile, roles, selfcmd, userconfig
 from ws.jobs import JobError
 from ws.output import WsError
 
@@ -389,7 +389,7 @@ def _gate_steps(
             made = userconfig.plan(runner, parsed, policy_file, env, old)
             files = made.files
         else:
-            files = adapter.generate(parsed, ["ws"], out, policy_file, pin=paths.pin_of(env))
+            files = adapter.generate(parsed, selfcmd.argv(), out, policy_file, pin=paths.pin_of(env))
         steps += [Step(out / name, "file", text, f"{runner} deny rules") for name, text in files.items()]
         if wide:
             steps += _merge_steps(runner, made, old is not None)

@@ -10,7 +10,7 @@ import subprocess
 
 import pytest
 
-from ws import cli, gate, guards, policy
+from ws import cli, gate, guards, paths, policy
 from ws.adapters import claude_code
 from ws.guards import Context
 from ws.guards import claims as cl
@@ -287,7 +287,7 @@ def test_a_missing_folder_or_no_git_is_a_note(home, monkeypatch):
     assert judge("merged abc1234 into main", home / "nowhere").action == "note"
     d = home / "d"
     d.mkdir()
-    monkeypatch.setenv("PATH", str(home / "empty"))
+    monkeypatch.setattr(paths, "TOOL_PATH", (str(home / "empty"),))  # the folders git is looked for in: it is in none
     f = judge("merged abc1234 into main", d)
     assert f.action == "note" and "git can't run" in f.reason
 
@@ -724,3 +724,19 @@ def test_the_ref_in_a_policy_is_checked_only_when_it_is_given():
     for table in ({"ref": ""}, {"ref": "-x"}, {"words": []}):
         with pytest.raises(policy.PolicyError):
             cl.config(table, "w")
+
+
+@needs_git
+def test_git_is_found_on_the_tool_folders_and_not_the_session_path(tmp_path, monkeypatch):
+    planted = tmp_path / "bin"
+    planted.mkdir()
+    fake = planted / "git"
+    fake.write_text("#!/bin/sh\necho planted > " + str(tmp_path / "ran") + "\nexit 0\n")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{planted}:/usr/bin:/bin")
+    seen = []
+    real = subprocess.run
+    monkeypatch.setattr(cl.subprocess, "run", lambda *a, **k: seen.append((a[0][0], k["env"])) or real(*a, **k))
+    cl._git(str(tmp_path), "status")
+    assert seen and all(exe != str(fake) and env["PATH"] == paths.tool_path() for exe, env in seen)
+    assert not (tmp_path / "ran").exists()  # the planted program never ran

@@ -5,8 +5,10 @@ not told about (`$REPORT`, `${A}`), a command substitution (`$(cat dir.txt)`, ba
 have a value only the shell will know, and a session's own settings can put anything in the environment. So a word
 holding one is read as an allow-list reads it: the unresolved part stands for ANY string, slashes and leading folders
 included, and the word is refused when some value of that part would make it a path a rule protects. This module is the
-pure part of that: it splits a word into known characters and unresolved parts (`split`), and decides whether some
-string fits both the word and a path glob (`reaches`). The reader chooses the words and the rules and words the refusal.
+pure part of that: it splits a word into known characters and unresolved parts (`split`), drops what an unresolved part
+could climb out of (`unconfined`: it may hold `..`, so a folder written before it confines nothing), and decides whether
+some string fits both the word and a path glob (`reaches`). The reader chooses the words and the rules and words the
+refusal.
 Python 3.11+, standard library only.
 """
 
@@ -14,7 +16,7 @@ from __future__ import annotations
 
 import posixpath
 import re
-from collections.abc import Collection
+from collections.abc import Callable, Collection
 from functools import lru_cache
 
 MAX_WORD = (
@@ -45,10 +47,12 @@ def _close(word: str, i: int, open_: str, close: str) -> int:
     return n
 
 
-def split(word: str, known: Collection[str] = ()) -> list[_Item]:
+def split(word: str, known: Collection[str] = (), producer: Callable[[str], str | None] | None = None) -> list[_Item]:
     """`word` as one item per character, with None for each part the reader could not resolve: `$NAME`, `${...}`,
     `$(...)`, `$((...))`, backticks and the special parameters (`$1`, `$@`, `$$`). A name in `known` is left as the text it
-    is (the reader substitutes known names, so one still in a word was quoted). Neighbouring unresolved parts are one."""
+    is (the reader substitutes known names, so one still in a word was quoted). Neighbouring unresolved parts are one.
+    `producer` is asked about the command inside a `$(...)` or a pair of backticks and returns the text that command
+    prints when that is known (see `ws.policy._produced`), else None, which leaves the part unresolved."""
     out: list[_Item] = []
     i, n = 0, len(word)
 
@@ -60,11 +64,23 @@ def split(word: str, known: Collection[str] = ()) -> list[_Item]:
         c = word[i]
         nxt = word[i + 1 : i + 2]
         if c == "`":
-            i = _close_tick(word, i)
-            unknown()
+            end = _close_tick(word, i)
+            made = producer(word[i + 1 : end - 1]) if producer and end - 1 > i and word[end - 1] == "`" else None
+            if made is None:
+                unknown()
+            else:
+                out += list(made)
+            i = end
         elif c == "$" and nxt == "(":
-            i = _close(word, i + 1, "(", ")")
-            unknown()
+            end = _close(word, i + 1, "(", ")")
+            inner = word[i + 2 : end - 1]
+            closed = end - 1 > i + 1 and word[end - 1] == ")" and not inner.startswith("(")
+            made = producer(inner) if producer and closed else None
+            if made is None:
+                unknown()
+            else:
+                out += list(made)
+            i = end
         elif c == "$" and nxt == "{":
             end = _close(word, i + 1, "{", "}")
             head = _NAME.match(word[i + 2 : end - 1])
@@ -129,6 +145,39 @@ def anchor(items: list[_Item], cwd: str, cwd_known: bool = True) -> list[_Item]:
             tidy += "/"
         items = [*tidy, *items[k:]]
     return items
+
+
+def unconfined(items: list[_Item]) -> list[_Item]:
+    """The word as a path where the unresolved parts may hold `..`. A part that is not known can climb out of any folder
+    written before it (`/tmp/$X` with X=`../home/pat/.ssh`), so known text confines a path only AFTER the first unresolved
+    part: everything before it is dropped, and so is everything up to the last `..` of each known run after it (`$X/../a`
+    is a path that ends in `/a` and starts anywhere). Runs of `/` and `/./` are tidied. A word with no unresolved part is
+    returned as it is."""
+    if None not in items:
+        return items
+    out: list[_Item] = [None]
+    run: list[str] = []
+
+    def flush() -> None:
+        text = re.sub(r"/{2,}", "/", "".join(run))
+        text = re.sub(r"/(?:\./)+", "/", text)
+        run.clear()
+        cut = text.rfind("..")
+        if cut >= 0:
+            text = text[cut + 2 :]
+            if out[-1] is not None:
+                out.append(None)
+        out.extend(text)
+
+    for it in items[items.index(None) :]:
+        if it is None:
+            flush()
+            if out[-1] is not None:
+                out.append(None)
+        else:
+            run.append(it)
+    flush()
+    return out
 
 
 @lru_cache(maxsize=512)

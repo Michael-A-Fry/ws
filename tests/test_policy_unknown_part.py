@@ -37,7 +37,6 @@ UNKNOWN_BEFORE_A_PROTECTED_TAIL = [
     "cat $SOME_DIR/ws/secrets/x",
     "cat ${A}/.ssh/id_rsa",
     'cat "$(cat dir.txt)"/.aws/credentials',
-    "cat `pwd`/.ssh/id_rsa",
     "cat $((1+2))/.ssh/id_rsa",
     "cat ${X:-/tmp}/.ssh/id_rsa",
     "cat ${X:-}/.ssh/id_rsa",
@@ -155,8 +154,9 @@ def test_a_write_to_a_protected_path_through_an_unknown_part_is_refused(pol):
 
 
 def test_a_cd_to_a_place_the_reader_cannot_resolve_makes_later_relative_paths_unknown(pol):
-    for cmd in ("cd $D && cat .ssh/id_rsa", "cd $(mktemp -d) && cat notes.txt", "cd ${PROJECT:-.} && cp a.txt b.txt"):
+    for cmd in ("cd $D && cat .ssh/id_rsa", "cd $(cat dir.txt) && cat notes.txt", "cd ${PROJECT:-.} && cp a.txt b.txt"):
         assert denied(pol, cmd), cmd
+    assert denied(pol, "cd $(mktemp -d) && cat notes.txt") is None  # a folder under the pinned temp folder is known
     assert denied(pol, "cd $D && cd /tmp && cat notes.txt") is None  # a full path says where it is
     assert denied(pol, "cd /tmp/proj && cat notes.txt") is None
 
@@ -180,10 +180,21 @@ EVERYDAY = [
     "tail -n +$N notes.txt",
     "curl $URL",
     "curl -s -o /tmp/out.json $URL",
-    "ls $DIR",
-    "ls $DIR/sub",
     "echo $X/foo",
     "echo ${NOPE:-}",
+]
+
+
+@pytest.mark.parametrize("cmd", EVERYDAY)
+def test_everyday_lines_stay_allowed(pol, cmd):
+    assert denied(pol, cmd) is None, cmd
+
+
+# Every command opens the words it is given unless it is on the exemption list (see test_policy_unknown_every_command),
+# so a variable the line does not set is refused for these too. The way out is the same one line: name the value first.
+NOW_REFUSED = [
+    "ls $DIR",
+    "ls $DIR/sub",
     "git checkout $BRANCH",
     'git commit -m "fix $THING"',
     "make -j$JOBS",
@@ -194,8 +205,23 @@ EVERYDAY = [
 ]
 
 
-@pytest.mark.parametrize("cmd", EVERYDAY)
-def test_everyday_lines_stay_allowed(pol, cmd):
+@pytest.mark.parametrize("cmd", NOW_REFUSED)
+def test_a_variable_the_line_does_not_set_is_refused_for_any_command_with_the_way_out(pol, cmd):
+    why = denied(pol, cmd)
+    assert why and HINT in why, cmd
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "BRANCH=main; git checkout $BRANCH",
+        "DIR=/tmp/out; ls $DIR",
+        "DIR=/tmp/out; ls $DIR/sub",
+        "TESTS=tests/test_a.py; pytest $TESTS",
+        "git commit -m 'fix the thing'",
+    ],
+)
+def test_naming_the_value_first_makes_the_same_line_checkable(pol, cmd):
     assert denied(pol, cmd) is None, cmd
 
 
@@ -242,5 +268,5 @@ def test_split_reads_every_kind_of_unresolved_part():
 
 
 def test_a_long_word_is_not_modelled_but_refused(pol):
-    why = denied(pol, "cat " + "a" * 3000 + "$X")
+    why = denied(pol, "cat ${X}" + "a" * 3000)  # only what follows an unresolved part is kept, so the tail is long
     assert why and "too long" in why and HINT in why

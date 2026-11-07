@@ -40,7 +40,7 @@ from __future__ import annotations
 import contextlib
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from ws.output import WsError
@@ -146,6 +146,12 @@ def environ() -> Mapping[str, str]:
     return os.environ if _PINNED is None else _PINNED
 
 
+def tmp_dir() -> Path:
+    """The temp folder `mktemp` and `$TMPDIR` mean for a hook: the one `ws install` pinned, else `/tmp`. Never the
+    environment's own, which a project's settings can change."""
+    return Path(_PINNED["TMPDIR"]) if _PINNED and _PINNED.get("TMPDIR") else Path("/tmp")
+
+
 def merged_environ() -> dict[str, str]:
     """The process's environment with the pinned layout laid over it (just the environment, when nothing is pinned): for
     code that reads other variables too (`WS_RELEASE`, `WS_BROKER_SOCKET`) and must still find ws's folders where
@@ -188,7 +194,8 @@ def xdg_layout(env: Mapping[str, str] | None = None) -> Layout:
     out = {}
     for kind, (var, default) in _XDG.items():
         base = e.get(var)
-        out[kind] = (Path(base) if base and os.path.isabs(base) else home / default) / "ws"
+        # a value with `..` or `//` is the folder it spells: it is compared as that, never as written
+        out[kind] = (Path(os.path.normpath(base)) if base and os.path.isabs(base) else home / default) / "ws"
     return Layout("xdg", out["config"], out["state"], out["data"], out["cache"])
 
 
@@ -389,6 +396,15 @@ def describe(env: Mapping[str, str] | None = None) -> str:
 # --- the pinned layout --------------------------------------------------------------------------------------------
 
 PIN_KEYS = ("home", *KINDS)
+TMP_KEY = "tmp"  # also pinned, but not compared: where `mktemp` and `$TMPDIR` mean, as the installing shell had it
+TOOL_PATH = ("/usr/local/bin", "/usr/bin", "/bin", "/opt/homebrew/bin", "/usr/sbin", "/sbin")
+"""The folders a guard looks for the tools it runs in (a syntax checker, the version control tool), whatever PATH the
+session has: a project can set PATH, and a program it puts first would then run in place of the tool."""
+
+
+def tool_path() -> str:
+    """`PATH` for a program a hook starts: the system folders that exist, never the session's own."""
+    return os.pathsep.join(d for d in TOOL_PATH if os.path.isdir(d))
 
 
 @dataclass(frozen=True)
@@ -400,21 +416,34 @@ class Pin:
     state: Path
     data: Path
     cache: Path
+    tmp: Path = field(default=Path("/tmp"), compare=False)  # the temp folder; the environment may differ from it
 
     def args(self) -> list[str]:
         """The `--pin` arguments a generated hook command carries."""
-        return [a for k in PIN_KEYS for a in ("--pin", f"{k}={getattr(self, k)}")]
+        return [a for k in (*PIN_KEYS, TMP_KEY) for a in ("--pin", f"{k}={getattr(self, k)}")]
 
     def environ(self) -> dict[str, str]:
         """The environment that resolves to exactly this layout and nothing else."""
-        return {"HOME": str(self.home), **{ENV_DIRS[k]: str(getattr(self, k)) for k in KINDS}}
+        return {
+            "HOME": str(self.home),
+            **{ENV_DIRS[k]: str(getattr(self, k)) for k in KINDS},
+            "TMPDIR": str(self.tmp),
+        }
 
 
 def pin_of(env: Mapping[str, str] | None = None) -> Pin:
     """The layout this environment resolves to, as a `Pin` (raises like `layout`)."""
     e = _env(env)
     lay = layout(e)
-    return Pin(home_dir(e), lay.config, lay.state, lay.data, lay.cache)
+    tmp = e.get("TMPDIR") or ""
+    return Pin(
+        home_dir(e),
+        lay.config,
+        lay.state,
+        lay.data,
+        lay.cache,
+        Path(os.path.normpath(tmp)) if os.path.isabs(tmp) else Path("/tmp"),
+    )
 
 
 def read_pin(values: list[str] | None) -> Pin | None:
@@ -425,16 +454,16 @@ def read_pin(values: list[str] | None) -> Pin | None:
     found: dict[str, str] = {}
     for v in values:
         key, eq, path = v.partition("=")
-        if not eq or key not in PIN_KEYS or key in found or not os.path.isabs(path):
+        if not eq or key not in (*PIN_KEYS, TMP_KEY) or key in found or not os.path.isabs(path):
             raise WsError(
                 "layout_changed", "this hook's pinned folders cannot be read", "run `ws install` to write them again"
             )
         found[key] = os.path.abspath(path)
-    if set(found) != set(PIN_KEYS):
+    if not set(PIN_KEYS) <= set(found):
         raise WsError(
             "layout_changed", "this hook's pinned folders are incomplete", "run `ws install` to write them again"
         )
-    return Pin(*(Path(found[k]) for k in PIN_KEYS))
+    return Pin(*(Path(found[k]) for k in PIN_KEYS), Path(found.get(TMP_KEY, "/tmp")))
 
 
 def check_pin(pin: Pin | None, env: Mapping[str, str] | None = None) -> None:

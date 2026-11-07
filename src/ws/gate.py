@@ -34,7 +34,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from ws import adapters, approvals, guards, output, paths, policy, sandbox, shellwords
+from ws import adapters, approvals, guards, output, paths, policy, sandbox, selfcmd, shellwords
 
 if TYPE_CHECKING:
     from ws import gatecorpus
@@ -591,7 +591,12 @@ def register(sub) -> None:
     gen = gs.add_parser("generate", help="write a runner's native deny rules and hook into a folder")
     common(gen)
     gen.add_argument("--out", required=True, metavar="DIR", help="folder to write (never a runner's own config)")
-    gen.add_argument("--ws-cmd", default="ws", metavar="CMD", help="how the hook runs ws (default: ws)")
+    gen.add_argument(
+        "--ws-cmd",
+        default=shlex.join(selfcmd.argv()),
+        metavar="CMD",
+        help="how the hook runs ws (default: this Python, isolated, -m ws)",
+    )
     gen.set_defaults(func=cmd_generate)
 
     c = gs.add_parser("check", help="hook entry: payload on stdin; exit 0 allow, 2 deny")

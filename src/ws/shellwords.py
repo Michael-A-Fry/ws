@@ -1523,6 +1523,11 @@ def _pieces(word: str, env: Mapping[str, str], head: bool = False) -> list[str]:
     return out
 
 
+def pieces_of(word: str, env: Mapping[str, str]) -> list[str]:
+    """The places inside one word a program may read a path from (see `_pieces`), as `lex` finds them."""
+    return _pieces(word, env, head=True)
+
+
 def _operator(seg: str, i: int) -> tuple[str, int]:
     """(redirection operator, index after it) at `seg[i]`, which is `<`, `>` or the `&` of `&>`."""
     if seg[i] == "&":

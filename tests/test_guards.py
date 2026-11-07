@@ -385,7 +385,7 @@ def test_syntax_check_runs_bash_n_on_a_sh_file_that_asks_for_bash(tmp_path, sheb
 def test_syntax_check_says_so_when_there_is_no_shell(tmp_path, monkeypatch):
     f = tmp_path / "a.sh"
     f.write_text("echo hi\n")
-    monkeypatch.setattr(shutil, "which", lambda name: None)
+    monkeypatch.setattr(shutil, "which", lambda name, path=None: None)
     found = judge_file(f)
     assert found.action == "note" and "skipped" in found.reason
 
@@ -464,7 +464,7 @@ def test_syntax_check_reports_what_the_javascript_checker_prints(tmp_path, monke
 
 
 def test_syntax_check_notes_when_node_is_not_installed_and_stays_advice_only(tmp_path, monkeypatch):
-    monkeypatch.setattr(syntax_check.shutil, "which", lambda name: None)
+    monkeypatch.setattr(syntax_check.shutil, "which", lambda name, path=None: None)
     f = tmp_path / "a.js"
     f.write_text("const x = bad(;\n")
     found = judge_file(f)
@@ -1192,3 +1192,32 @@ def test_the_sandbox_marker_is_in_the_generated_env_beside_the_gated_marker():
     assert (
         generate(pol())["env"][approvals.SANDBOX_MARKER] == "1" and generate(pol())["env"][approvals.ENV_MARKER] == "1"
     )
+
+
+def test_syntax_check_looks_for_its_checker_on_the_tool_folders_and_not_the_session_path(tmp_path, monkeypatch):
+    planted = tmp_path / "bin"
+    planted.mkdir()
+    fake = planted / "fakechecker"
+    fake.write_text("#!/bin/sh\nexit 1\n")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{planted}:/usr/bin:/bin")  # a project can put its own program first
+    f = tmp_path / "a.yaml"
+    f.write_text("x\n")
+    found = judge_file(f, extra={"yaml": ["fakechecker"]})
+    assert found.action == "note" and "not installed" in found.reason  # not found, so not run
+
+
+def test_syntax_check_runs_its_checker_with_the_tool_folders_as_path(tmp_path, monkeypatch):
+    seen = []
+    real = syntax_check.subprocess.run
+
+    def spy(*a, **k):
+        seen.append(k["env"])
+        return real(*a, **k)
+
+    monkeypatch.setattr(syntax_check.subprocess, "run", spy)
+    monkeypatch.setenv("PATH", "/project/bin")
+    f = tmp_path / "a.yaml"
+    f.write_text("x\n")
+    judge_file(f, extra={"yaml": [sys.executable, "-c", "pass"]})
+    assert seen and all(e["PATH"] == paths.tool_path() for e in seen)

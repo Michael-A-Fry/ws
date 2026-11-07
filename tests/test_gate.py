@@ -50,6 +50,7 @@ def bash(cmd):
 def pins(home) -> str:
     """The `--pin` arguments a hook generated in the `home` fixture carries: its home folder and the one ws folder."""
     where = {"home": home / "home", **dict.fromkeys(("config", "state", "data", "cache"), home / "wshome")}
+    where["tmp"] = paths.pin_of().tmp  # the temp folder is pinned too, as the installing shell had it
     return shlex.join([a for k, v in where.items() for a in ("--pin", f"{k}={v}")])
 
 

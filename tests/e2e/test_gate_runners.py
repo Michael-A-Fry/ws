@@ -27,7 +27,7 @@ from pathlib import Path
 import pytest
 
 from e2e.stubs import AnthropicStub, Call, OpenAIStub
-from ws import cli, selfcmd
+from ws import cli, policy, selfcmd
 from ws.testing import scenarios
 
 REQUIRE = os.environ.get("WS_E2E_REQUIRE") == "1"
@@ -57,8 +57,11 @@ def allowed_command(work) -> str:
 
 @pytest.fixture(autouse=True)
 def ws_home(tmp_path, monkeypatch):
-    """The policy in this test is the built-in default (no file), found at the same WS_HOME the runners get."""
+    """The policy in this test is the built-in default, found at the same WS_HOME the runners get."""
     monkeypatch.setenv("WS_HOME", str(tmp_path / "wshome"))
+    # the generated hook pins the layout it was made in, and the runner gets this HOME: made in another it would refuse
+    (tmp_path / "home").mkdir(exist_ok=True)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
 
 
 @pytest.fixture
@@ -80,10 +83,21 @@ def secrets(tmp_path):
     return {"denied": home / ".ssh" / "id_rsa", "canary": canary, "ok": home / "notes.txt", "plain": plain}
 
 
+def named_policy(tmp_path) -> Path:
+    """The built-in default policy as a file the hooks name. A hook whose named policy file is missing refuses every
+    call, so there is one; it sits outside WS_HOME, where a test can still show the policy there is never created."""
+    path = tmp_path / "policy-src" / "policy.toml"
+    path.parent.mkdir(exist_ok=True)
+    path.write_text(policy.default_toml(), encoding="utf-8")
+    return path
+
+
 def generate(tmp_path, runner: str) -> Path:
     out = tmp_path / "wshome" / "gate" / runner  # where ws puts it: $WS_HOME/gate/<runner>
     ws_cmd = shlex.join(selfcmd.argv())  # the isolated command, as the real hook uses
-    assert cli.main(["gate", "generate", "--runner", runner, "--out", str(out), "--ws-cmd", ws_cmd]) == 0
+    argv = ["gate", "generate", "--runner", runner, "--out", str(out), "--ws-cmd", ws_cmd]
+    made = tmp_path / "wshome" / "policy.toml"  # a test that wrote its own policy there keeps it
+    assert cli.main([*argv, "--policy", str(made if made.is_file() else named_policy(tmp_path))]) == 0
     return out
 
 

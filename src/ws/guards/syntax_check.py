@@ -17,6 +17,7 @@ import subprocess
 import tomllib
 from dataclasses import dataclass, field
 
+from ws import paths
 from ws.guards import Finding, known_keys
 from ws.policy import PolicyError
 
@@ -85,7 +86,8 @@ def _toml(path: str, data: bytes) -> str | None:
 
 def _run(argv: list[str], path: str) -> tuple[str | None, str | None]:
     """(problem, note) from running a checker on the file: a problem when it exits non-zero, a note when it cannot run."""
-    exe = shutil.which(argv[0])
+    tools = paths.tool_path()  # never the session's PATH: a project can put its own program first
+    exe = shutil.which(argv[0], path=tools)
     if exe is None:
         return None, f"syntax-check skipped {path}: {argv[0]} is not installed"
     try:
@@ -96,6 +98,7 @@ def _run(argv: list[str], path: str) -> tuple[str | None, str | None]:
             timeout=TIMEOUT_S,
             check=False,
             stdin=subprocess.DEVNULL,
+            env={"PATH": tools, "HOME": str(paths.home_dir())},
         )
     except subprocess.TimeoutExpired:
         return None, f"syntax-check skipped {path}: {argv[0]} took more than {TIMEOUT_S} seconds"
@@ -137,7 +140,8 @@ def judge(call, cfg: Config, ctx) -> Finding | None:
         problem, note = {"py": _python, "json": _json, "toml": _toml}[ext](path, data), None
     elif ext in ("sh", "bash"):
         shell = "bash" if ext == "bash" or _bash_shebang(path) else "sh"
-        if shutil.which(shell) is None and shutil.which("bash") is not None:
+        tools = paths.tool_path()
+        if shutil.which(shell, path=tools) is None and shutil.which("bash", path=tools) is not None:
             shell = "bash"
         problem, note = _run([shell, "-n"], path)
     elif ext in ("js", "mjs", "cjs"):

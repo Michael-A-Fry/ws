@@ -1490,9 +1490,11 @@ def cmd_launch(args: argparse.Namespace) -> int:
         )
     policy_file = Path(args.policy).expanduser().absolute() if args.policy else policy.policy_path()
     try:
-        pol = policy.load(policy_file)
+        pol = policy.load(
+            policy_file, required=args.policy is not None
+        )  # a named policy that is not there is no default
     except policy.PolicyError as e:
-        raise WsError("bad_config", str(e), f"fix {policy_file}") from e
+        raise WsError("bad_config", str(e), f"fix {policy_file}, or run `ws install`") from e
     home = paths.state_dir().absolute()  # whatever --policy says, the gate keeps its approvals and sessions here
     pass_env = check_pass_env(args.pass_env)
     if pass_env:

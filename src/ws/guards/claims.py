@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass
@@ -276,13 +277,22 @@ def _git_run(cwd: str, *args: str, budget: Budget | None = None) -> subprocess.C
     """`git -C cwd args`, or None when git can't run (not installed, or out of time). It gets a bare environment: the
     runner's GIT_DIR and the like must not point it somewhere else, and `GIT_NO_LAZY_FETCH=1` keeps a partial clone from
     going to the network."""
-    env = {k: os.environ[k] for k in ("PATH", "HOME") if k in os.environ}
+    env = {"PATH": paths.tool_path()}  # never the session's PATH: a project can put its own program first
+    if "HOME" in os.environ:
+        env["HOME"] = os.environ["HOME"]
     env["GIT_OPTIONAL_LOCKS"] = "0"
     env["GIT_NO_LAZY_FETCH"] = "1"
     budget = budget or Budget()
+    exe = shutil.which("git", path=env["PATH"])
+    if exe is None:  # never a bare name: an empty PATH entry is the folder the session works in
+        return None
     try:
         return subprocess.run(
-            ["git", "-C", cwd, *args], capture_output=True, timeout=max(budget.left(), 0.01), env=env, check=False
+            [exe, "-C", cwd, *args],
+            capture_output=True,
+            timeout=max(budget.left(), 0.01),
+            env=env,
+            check=False,
         )
     except (OSError, subprocess.SubprocessError):
         return None

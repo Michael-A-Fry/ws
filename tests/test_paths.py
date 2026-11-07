@@ -388,3 +388,34 @@ def test_doctor_ws010_fails_and_names_both_when_both_exist(home):
         and str(home / ".ws") in c.detail
         and str(home / ".config" / "ws" / "profile.toml") in c.detail
     )
+
+
+# ---- a value with `..` or `//` is compared as the folder it spells; the pinned temp folder ------------------------------
+
+
+def test_an_xdg_value_with_dots_or_double_slashes_is_the_folder_it_spells(home, tmp_path):
+    odd = env_of(home, XDG_CONFIG_HOME=f"{tmp_path}//a/../cfg/", XDG_STATE_HOME=f"{tmp_path}/x/./st")
+    plain = env_of(home, XDG_CONFIG_HOME=str(tmp_path / "cfg"), XDG_STATE_HOME=str(tmp_path / "x" / "st"))
+    assert paths.layout(odd).config == tmp_path / "cfg" / "ws"
+    assert paths.layout(odd).state == tmp_path / "x" / "st" / "ws"
+    assert paths.pin_of(odd) == paths.pin_of(plain)
+    paths.check_pin(paths.pin_of(plain), odd)  # the hook run with the odd spelling sees the layout it was pinned to
+
+
+def test_the_pin_carries_the_temp_folder_but_does_not_compare_it(home):
+    pin = paths.pin_of(env_of(home, TMPDIR="/var/folders/x//t/../t"))
+    assert pin.tmp == Path("/var/folders/x/t")
+    again = paths.read_pin(pin.args()[1::2])
+    assert again == pin and again is not None and again.tmp == pin.tmp
+    assert "tmp=/var/folders/x/t" in pin.args()
+    paths.check_pin(pin, env_of(home, TMPDIR="/somewhere/else"))  # a session's own TMPDIR does not move the layout
+    assert paths.pin_of(env_of(home)).tmp == Path("/tmp")
+    assert paths.pin_of(env_of(home, TMPDIR="relative")).tmp == Path("/tmp")
+    old = [a for a in pin.args()[1::2] if not a.startswith("tmp=")]  # a hook written before the temp folder was pinned
+    assert paths.read_pin(old).tmp == Path("/tmp")
+
+
+def test_a_hook_gets_the_tools_folders_and_never_the_session_s_path(monkeypatch):
+    monkeypatch.setenv("PATH", "/project/bin:/usr/bin")
+    assert "/project/bin" not in paths.tool_path().split(":")
+    assert all(d.startswith("/") for d in paths.tool_path().split(":"))

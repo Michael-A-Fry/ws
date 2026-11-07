@@ -228,7 +228,7 @@ def check_hook_config(adapter, work: Path) -> tuple[str, str]:
     policy_file = work / "policy.toml"
     policy_file.write_text(policy.default_toml(), encoding="utf-8")
     try:
-        files = adapter.generate(policy.loads(policy.default_toml()), ["ws"], work / "gate", policy_file)
+        files = adapter.generate(policy.loads(policy.default_toml()), selfcmd.argv(), work / "gate", policy_file)
         parsed = {name: json.loads(text) for name, text in files.items() if name.endswith(".json")}
     except (policy.PolicyError, ValueError, KeyError, TypeError) as e:
         return FAIL, f"the generated config does not parse ({type(e).__name__})"

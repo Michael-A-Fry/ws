@@ -100,9 +100,6 @@ def test_a_command_that_can_set_any_variable_makes_later_values_unknown(pol, cmd
         'while read -r x; do echo "$x"; done < list.txt',
         "read -r x <<< hi; echo $x",
         "let x=1; echo $x",
-        "source ~/.bashrc; ls $HOME",
-        ". venv/bin/activate; cd $HOME/proj",
-        "source .env && cd ~ && ls",
         "grep -r IFS src",
         "git log -S IFS",
         "unset IFS",
@@ -110,6 +107,30 @@ def test_a_command_that_can_set_any_variable_makes_later_values_unknown(pol, cmd
 )
 def test_common_lines_with_those_commands_are_still_allowed(pol, cmd):
     assert not policy.is_denied_command(pol, cmd, cwd="/tmp"), cmd
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "source ~/.bashrc; ls $HOME",
+        ". venv/bin/activate; cd $HOME/proj",
+        "source .env && cd ~ && ls",
+        "source ./f; cat ~/notes.txt",
+    ],
+)
+def test_after_a_sourced_file_the_home_and_working_folders_are_not_trusted(pol, cmd):
+    # the file can set HOME and PWD as eval text can, and in a project it is whatever the project holds: the recovery is
+    # to write the path out in full (`ls /home/pat`) or to put the lines that use it before the `source`
+    why = policy.is_denied_command(pol, cmd, cwd="/tmp")
+    assert why and "isn't known" in why, cmd
+
+
+def test_a_loop_over_the_paths_a_command_prints_is_refused_with_the_way_out(pol):
+    # data-derived path, refused on purpose: each `$f` comes out of `git ls-files`, which the reader cannot see, so it
+    # could be any file. Recovery: write the path out (`wc -l src/a.py`).
+    why = policy.is_denied_command(pol, 'git ls-files | while read -r f; do wc -l "$f"; done', cwd="/tmp")
+    assert why and "set the variable on its own first" in why
+    assert policy.is_denied_command(pol, "wc -l src/a.py", cwd="/tmp") is None
 
 
 def test_on_a_case_insensitive_platform_path_rules_match_without_regard_to_case(pol, monkeypatch):

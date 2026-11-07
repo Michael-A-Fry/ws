@@ -45,7 +45,8 @@ def generate(tmp_path, ws_cmd: str):
     from ws import cli
 
     out = tmp_path / "wshome" / "gate" / "opencode"
-    assert cli.main(["gate", "generate", "--runner", "opencode", "--out", str(out), "--ws-cmd", ws_cmd]) == 0
+    argv = ["gate", "generate", "--runner", "opencode", "--out", str(out), "--ws-cmd", ws_cmd]
+    assert cli.main([*argv, "--policy", str(gr.named_policy(tmp_path))]) == 0  # the built-in default, as a file
     return out
 
 

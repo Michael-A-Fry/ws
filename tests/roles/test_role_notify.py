@@ -493,7 +493,7 @@ def test_the_test_push_writes_notify_last(env):
 
 def run_alert(monkeypatch, capsys, payload):
     monkeypatch.setattr("sys.stdin", io.StringIO(payload if isinstance(payload, str) else json.dumps(payload)))
-    code = cli.main(["notify", "alert", "--runner", "claude-code"])
+    code = cli.main(["notify", "alert", "--runner", "claude-code", *paths.pin_of().args()])
     return code, capsys.readouterr().err
 
 
@@ -725,7 +725,7 @@ def test_cli_alert_runs_without_a_runner(box, write_profile, capsys, monkeypatch
     write_profile({"roles": {"notify": CFG}})
     s = Sender()
     monkeypatch.setattr(ntfy, "post", s)
-    code, err = run_alert_args(monkeypatch, capsys, STOP, ["notify", "alert"])
+    code, err = run_alert_args(monkeypatch, capsys, STOP, ["notify", "alert", *paths.pin_of().args()])
     assert code == 0 and "1 of 50 alerts" in err
     assert s.calls[0][2]["Title"] == "ws unknown"
 
@@ -734,7 +734,7 @@ def test_cli_alert_exits_0_with_no_stdin(box, write_profile, capsys, monkeypatch
     write_profile({"roles": {"notify": CFG}})
     monkeypatch.setattr(ntfy, "post", Sender())
     monkeypatch.setattr("sys.stdin", None)
-    assert cli.main(["notify", "alert", "--runner", "claude-code"]) == 0
+    assert cli.main(["notify", "alert", "--runner", "claude-code", *paths.pin_of().args()]) == 0
     assert "alert not sent" in capsys.readouterr().err
 
 
@@ -742,7 +742,9 @@ def test_cli_alert_exits_0_on_a_payload_nested_past_the_recursion_limit(box, wri
     write_profile({"roles": {"notify": CFG}})
     s = Sender()
     monkeypatch.setattr(ntfy, "post", s)
-    code, err = run_alert_args(monkeypatch, capsys, "[" * 200_000 + "]" * 200_000, ["notify", "alert"])
+    code, err = run_alert_args(
+        monkeypatch, capsys, "[" * 200_000 + "]" * 200_000, ["notify", "alert", *paths.pin_of().args()]
+    )
     assert code == 0 and "alert not sent" in err and s.calls == []
 
 
@@ -753,5 +755,7 @@ def test_cli_alert_exits_0_when_the_broker_breaks(box, write_profile, capsys, mo
         raise RuntimeError("broker exploded with TOKEN-XYZ")
 
     monkeypatch.setattr(broker, "request", boom)
-    code, err = run_alert_args(monkeypatch, capsys, STOP, ["notify", "alert", "--runner", "claude-code"])
+    code, err = run_alert_args(
+        monkeypatch, capsys, STOP, ["notify", "alert", "--runner", "claude-code", *paths.pin_of().args()]
+    )
     assert code == 0 and "RuntimeError" in err and "TOKEN-XYZ" not in err

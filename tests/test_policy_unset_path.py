@@ -51,13 +51,25 @@ def test_an_unknown_part_that_could_make_a_protected_path_is_refused(pol, cmd):
 @pytest.mark.parametrize(
     "cmd",
     [
-        "ls /home/$USER/",
-        'git commit -m "fix $THING in /home/$USER/proj"',
-        "cat /tmp/$$.log",
-        "cat file$N.txt",
         "echo $FILE",
         "echo /home/$USER/notes.txt",
     ],
 )
 def test_an_unknown_part_that_cannot_make_a_protected_path_is_not(pol, cmd):
     assert policy.is_denied_command(pol, cmd, cwd="/tmp") is None, cmd
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "ls /home/$USER/",
+        'git commit -m "fix $THING in /home/$USER/proj"',
+        "cat /tmp/$$.log",
+        "cat file$N.txt",
+    ],
+)
+def test_an_unknown_part_may_hold_dots_so_a_folder_before_it_confines_nothing(pol, cmd):
+    # these were allowed while a known folder before the part was taken to confine it: `/tmp/$$.log` is
+    # `/tmp/../home/pat/.ssh/x.log` when the part holds `../home/pat/.ssh/x`. Name the value first (F=...; cat "$F").
+    why = policy.is_denied_command(pol, cmd, cwd="/tmp")
+    assert why and "set the variable on its own first" in why, cmd

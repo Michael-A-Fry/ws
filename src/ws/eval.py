@@ -4,7 +4,8 @@ Trials run through `ws run`, and new tasks are harvested from your own failed or
 
     ws eval run [--task ID | --set starter|mine] [--arm NAME --job JOB] [--trials N] [--dry-run] [--keep]
     ws eval report [--arm NAME] [--since 90d] [--k N]    the ten metrics; a metric with no data says "not measured"
-    ws eval compare ARM_A ARM_B [--look 1|2]             exact McNemar on paired trials, at most two looks per pair
+    ws eval compare ARM_A ARM_B [--look 1|2] [--allow-mixed]
+                                                         who leads, the 95% interval, whether it is real; two looks
     ws eval harvest [--since 30d]                        propose tasks from failed, timed-out, rated-down, retried runs
     ws eval approve ID | ws eval reject ID               only your command moves a proposal
 
@@ -35,7 +36,12 @@ agent cannot shadow a module it imports. The starter checkers show the pattern (
 judge_model`); the judge call itself is not built yet, so for now a rubric task is always skipped.
 
 `compare` pairs at task level, not trial level (`evalstats.paired_tasks`): a task passes for an arm when most of its
-trials do, a tie fails, and results count only from the job and the task text (hash) each arm used last.
+trials do, a tie fails, and results count only from the job and the task text (hash) each arm used last. It then says
+in words who leads and by how much, the exact 95% interval of the gap, and either "the difference is real at 95%" or
+"too few runs to tell (MDE N points)" (`evalstats.lead_sentence`). Each result line carries a `fingerprint` of how the
+trial was run (models actually used, runner and versions, hashes of the policy, the guards and the job, the job's
+limits, the bare setting); `compare` refuses an arm whose results disagree on one, naming the fields, unless
+`--allow-mixed`, and says when an arm ran in bare mode (hooks skipped, so the gate did not run).
 
 `report` and `compare` count a trial that never started a run (`evalstats.is_setup_error`: status "error" with no run
 record, or a record with no exit code) apart: it is in no metric and no pair, and is listed per arm with its task and
@@ -1049,6 +1055,36 @@ def job_hash(job: jobs.Job, env: dict | None = None) -> str:
     return hashlib.sha256(f"{text}\n--prompt--\n{job.prompt}".encode()).hexdigest()[:16]
 
 
+def _digest(obj) -> str:
+    return hashlib.sha256(json.dumps(obj, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+def fingerprint(job: jobs.Job, rec: dict | None, env: dict | None = None) -> dict:
+    """How this trial was run, for the result line: what `compare` checks before it pools an arm's results.
+
+    `models` are the models the runner reported using (the run record's `models_used`, sorted), not the one the job asked
+    for; with no record they are empty. `runner_version` and `ws_version` come from the record. `policy_hash` is a hash
+    of the policy in force (its dial, sources, gate rules and guards) and `guards_hash` of the guards set alone, so a
+    change to either shows even when the job file did not change; a policy that cannot be read hashes to null. `job_hash`
+    is `job_hash`. `resources` are the job's own limits: its time limit and turn limit. `bare` is the job's bare
+    setting: with it on, a runner that has a bare mode skips hooks, and the gate's hook does not run."""
+    try:
+        pol = policy.load()
+        policy_hash = _digest(dataclasses.asdict(pol))
+        guards_hash = _digest(dataclasses.asdict(pol.guards))
+    except (policy.PolicyError, OSError):
+        policy_hash = guards_hash = None
+    rec = rec or {}
+    used = rec.get("models_used") if isinstance(rec.get("models_used"), list) else []
+    models = sorted({str(m["model"]) for m in used if isinstance(m, dict) and m.get("model")})
+    return {
+        "models": models, "runner": job.runner, "runner_version": rec.get("runner_version"),
+        "ws_version": rec.get("ws_version"), "policy_hash": policy_hash, "guards_hash": guards_hash,
+        "job_hash": job_hash(job, env), "resources": {"timeout_s": job.timeout_s, "max_turns": job.max_turns},
+        "bare": job.bare,
+    }  # fmt: skip
+
+
 def run_trial(task: Task, trial: int, arm: str, job: jobs.Job, batch: str, keep: bool = False) -> dict:
     """One trial through `ws run`: set up a fresh folder, run the job with the task's prompt, then grade and write the
     result. The run record is on disk before grading starts (run.run_job calls the hook after writing it), so a SIGTERM
@@ -1105,7 +1141,8 @@ def _trial_in(task: Task, trial: int, arm: str, job: jobs.Job, batch: str, folde
         result = {
             "schema": SCHEMA_VERSION, "ts": runrecord.iso(datetime.now(UTC)), "batch": batch, "task": task.id,
             "task_hash": task_hash(task), "family": task.family, "kind": task.kind, "trial": trial, "arm": arm,
-            "job": job.name, "job_hash": job_hash(job, env), "run_id": rec["run_id"] if rec else None,
+            "job": job.name, "job_hash": job_hash(job, env), "fingerprint": fingerprint(job, rec, env),
+            "run_id": rec["run_id"] if rec else None,
             "status": rec["status"] if rec else ("refused" if code == 3 else "error"),
             "pass": bool(state["passed"] and not state["note"]),
             "grade": [dataclasses.asdict(v) for v in state["verdicts"]], "note": state["note"], "folder": str(folder),
@@ -1269,10 +1306,11 @@ def cmd_report(args: argparse.Namespace) -> int:
             by_arm[a] = metrics_for(
                 env, [r for r in results if r.get("arm") == a], runs, ratings, all_runs, days, args.k
             )
+    prints = {a: evalstats.fingerprint_spread([r for r in results if r.get("arm") == a]) for a in arms}
     if args.json:
         output.result({
             "since": args.since, "trials": len(results), "arms": arms, "metrics": overall, "by_arm": by_arm,
-            "setup_errors": setup_errors,
+            "setup_errors": setup_errors, "fingerprints": prints,
         })  # fmt: skip
         return 0
     print(f"ws eval report: {len(results)} trials in the last {args.since}; arms: {', '.join(arms) or 'none yet'}")
@@ -1283,6 +1321,12 @@ def cmd_report(args: argparse.Namespace) -> int:
             print(f"{i:>2}. {m['label']}: {m['display']}")
     if setup:
         print(_setup_line(setup_errors))
+    for arm, spread in prints.items():
+        if spread["mixed"]:
+            names = ", ".join(FIELD_NAMES[f] for f in spread["mixed"])
+            print(f"arm {arm}: its results were made different ways ({names} differ); `compare` will not pool them")
+        if spread["bare"]:
+            print(f"arm {arm} ran in bare mode: the runner skipped hooks, so the gate's hook did not run")
     return 0
 
 
@@ -1299,9 +1343,13 @@ def _down_rate(results: list[dict], ratings: dict[str, str]) -> tuple[float | No
     return (rated.count("down") / len(rated) if rated else None), len(rated)
 
 
-def compare_arms(arm_a: str, arm_b: str, results: list[dict], runs: dict, ratings: dict) -> dict:
+def compare_arms(
+    arm_a: str, arm_b: str, results: list[dict], runs: dict, ratings: dict, allow_mixed: bool = False
+) -> dict:
     """Two arms, paired at task level (see `evalstats.paired_tasks`: McNemar needs independent pairs, and the trials of
-    one task are not). The task counts and the trial counts behind them are both in the result."""
+    one task are not). The task counts and the trial counts behind them are both in the result, with the gap and its
+    95% interval, whether it is real, the smallest gap this many tasks could show, and each arm's fingerprint spread.
+    Raises WsError (refused) when one arm's results were made different ways, unless `allow_mixed`."""
     counted, setup = evalstats.split_setup_errors(results, runs)
     ra0, rb0 = _arm_results(counted, arm_a), _arm_results(counted, arm_b)
 
@@ -1324,9 +1372,12 @@ def compare_arms(arm_a: str, arm_b: str, results: list[dict], runs: dict, rating
             "run both arms with the same --trials, then compare",
         )
     ra, rb = pt["used_a"], pt["used_b"]
+    prints = _check_fingerprints({arm_a: ra, arm_b: rb}, allow_mixed)
     n, a_only, b_only = pt["tasks"], pt["a_only"], pt["b_only"]
     down_a, rated_a = _down_rate(ra, ratings)
     down_b, rated_b = _down_rate(rb, ratings)
+    diff = evalstats.paired_difference(a_only, b_only, n)
+    pass_a, pass_b = pt["both"] + a_only, pt["both"] + b_only
     stats = {
         "pairs": n, "tasks": n, "trials_a": pt["trials_a"], "trials_b": pt["trials_b"], "both_pass": pt["both"],
         "a_only": a_only, "b_only": b_only, "both_fail": pt["neither"], "dropped": pt["dropped"],
@@ -1335,26 +1386,99 @@ def compare_arms(arm_a: str, arm_b: str, results: list[dict], runs: dict, rating
         "down_a": down_a, "down_b": down_b, "rated_a": rated_a, "rated_b": rated_b,
         "tokens_a": evalstats.tokens_per_solved(ra, runs), "tokens_b": evalstats.tokens_per_solved(rb, runs),
         "wins_needed": evalstats.wins_needed(a_only + b_only),
+        "interval_points": [diff["low_points"], diff["high_points"]] if diff else None,
+        "real": bool(diff and diff["real"]), "mde_points": evalstats.mde_points(n, a_only + b_only),
+        "interval_a": _share_interval(pass_a, n), "interval_b": _share_interval(pass_b, n),
+        "pass_at_k": {arm_a: _pass_at_k(ra), arm_b: _pass_at_k(rb)},
     }  # fmt: skip
     verdict = evalstats.decide(stats)
     winner = {"A": arm_a, "B": arm_b}.get(verdict["winner"])
     return {
         "arm_a": arm_a, "arm_b": arm_b, **stats, "winner": winner, "why": verdict["why"],
+        "statement": evalstats.lead_sentence(arm_a, arm_b, n, a_only, b_only),
         "quality": evalstats.quality_note(stats),
+        "fingerprint": prints,
         "setup_errors": evalstats.setup_error_report([r for r in setup if r.get("arm") in (arm_a, arm_b)]),
     }  # fmt: skip
+
+
+def _share_interval(passed: int, tasks: int) -> list[float] | None:
+    """The 95% Wilson interval for `passed` of `tasks`, in percentage points."""
+    w = evalstats.wilson(passed, tasks)
+    return [w[0] * 100, w[1] * 100] if w else None
+
+
+def _pass_at_k(results: list[dict]) -> dict | None:
+    """pass^k and pass@k for one arm's results at the most trials every task has (at most 5); None for a single trial."""
+    per_task = list(evalstats.task_rates(results).values())
+    k = min(5, min((n for n, _ in per_task), default=0))
+    if k < 2:
+        return None
+    return {"k": k, "pass_hat_k": evalstats.pass_hat_k(per_task, k), "pass_at_k": evalstats.pass_at_k(per_task, k)}
+
+
+FIELD_NAMES = {
+    "models": "models used", "runner": "runner", "runner_version": "runner version", "ws_version": "ws version",
+    "policy_hash": "policy", "guards_hash": "guards", "job_hash": "job file and prompt", "resources": "limits",
+    "bare": "bare mode",
+}  # fmt: skip
+
+
+def _check_fingerprints(by_arm: dict[str, list[dict]], allow_mixed: bool) -> dict:
+    """The fingerprint block of a comparison, per arm. An arm whose results were not all made the same way is refused
+    (a typed error naming the fields), unless `allow_mixed`, which keeps the block and says so."""
+    arms = {arm: evalstats.fingerprint_spread(rs) for arm, rs in by_arm.items()}
+    mixed = {arm: s["mixed"] for arm, s in arms.items() if s["mixed"]}
+    if mixed and not allow_mixed:
+        said = "; ".join(f"{arm}: {', '.join(FIELD_NAMES[f] for f in fields)}" for arm, fields in mixed.items())
+        raise WsError(
+            "refused",
+            f"the results inside one arm were not all made the same way ({said} differ), so they are not pooled",
+            "run the arm again under one setup, or compare anyway with `--allow-mixed`",
+            details={"mixed": mixed},
+        )
+    return {"allow_mixed": allow_mixed, "mixed": mixed, "arms": arms}
+
+
+def _fingerprint_lines(fp: dict, arm_a: str, arm_b: str) -> list[str]:
+    """The lines a comparison prints about how the arms were run: mixed results pooled on purpose, results with no
+    fingerprint, and an arm run in bare mode."""
+    lines = []
+    for arm, fields in fp.get("mixed", {}).items():
+        names = ", ".join(FIELD_NAMES.get(f, f) for f in fields)
+        lines.append(f"mixed results pooled on purpose (--allow-mixed): {arm} differs in {names}")
+    for arm in (arm_a, arm_b):
+        spread = fp.get("arms", {}).get(arm) or {}
+        if spread.get("without"):
+            lines.append(f"{arm}: {spread['without']} results carry no fingerprint (made before ws recorded one)")
+        if spread.get("bare"):
+            lines.append(f"{arm} ran in bare mode: the runner skipped hooks, so the gate's hook did not run")
+    return lines
 
 
 def _show_compare(c: dict, look: int, replay: bool) -> None:
     print(
         f"ws eval compare: A={c['arm_a']} vs B={c['arm_b']}, look {look} of 2{' (stored, not re-run)' if replay else ''}"
     )
+    for line in _fingerprint_lines(c.get("fingerprint") or {}, c["arm_a"], c["arm_b"]):
+        print(f"  {line}")
     ra, rb = c["pass_rate_a"], c["pass_rate_b"]
     if ra is not None and rb is not None:
+        ia, ib = c.get("interval_a"), c.get("interval_b")
+        span_a = f" (95% interval {ia[0]:.1f}% to {ia[1]:.1f}%)" if ia else ""
+        span_b = f" (95% interval {ib[0]:.1f}% to {ib[1]:.1f}%)" if ib else ""
         print(
             f"  paired tasks {c['tasks']} (from {c['trials_a']} trials of A, {c['trials_b']} of B): "
-            f"A passes {ra * 100:.1f}%, B passes {rb * 100:.1f}% (a task passes when most of its trials do)"
+            f"A passes {ra * 100:.1f}%{span_a}, B passes {rb * 100:.1f}%{span_b} "
+            "(a task passes when most of its trials do)"
         )
+    for label, name in (("A", c["arm_a"]), ("B", c["arm_b"])):
+        pk = (c.get("pass_at_k") or {}).get(name)
+        if pk and pk["pass_hat_k"] is not None:
+            print(
+                f"  {label} at k={pk['k']}: pass^k {pk['pass_hat_k'] * 100:.1f}% (every trial passes), "
+                f"pass@k {pk['pass_at_k'] * 100:.1f}% (at least one passes)"
+            )
     d = c["dropped"]
     left_out = sum(d.values())
     if left_out:
@@ -1366,6 +1490,8 @@ def _show_compare(c: dict, look: int, replay: bool) -> None:
         f"  A only {c['a_only']}, B only {c['b_only']}, both {c['both_pass']}, neither {c['both_fail']}; "
         f"exact McNemar p={c['p']:.4f}"
     )
+    if c.get("statement"):  # absent from looks stored before the interval was worked out
+        print(f"  {c['statement']}")
     for key, name in (("down_a", "thumbs-down rate A"), ("down_b", "thumbs-down rate B"),
                       ("tokens_a", "tokens per solved A"), ("tokens_b", "tokens per solved B")):  # fmt: skip
         v = c[key]
@@ -1410,7 +1536,7 @@ def cmd_compare(args: argparse.Namespace) -> int:
         )
     look = used + 1
     results, runs, ratings, _ = _scope(env, None, timedelta(days=36500))
-    c = compare_arms(a, b, results, runs, ratings)
+    c = compare_arms(a, b, results, runs, ratings, args.allow_mixed)
     if c["pairs"] == 0:
         raise WsError(
             "not_found",
@@ -1725,9 +1851,14 @@ def register(sub) -> None:
     p.add_argument("--k", type=_trials, metavar="K", help="the k of pass^k (default: the fewest trials any task has)")
     p.set_defaults(func=cmd_report)
 
-    c = esub.add_parser("compare", help="two arms on paired trials: exact McNemar, quality veto, then tokens")
+    c = esub.add_parser("compare", help="two arms on paired tasks: who leads, the 95%% interval, and whether it's real")
     c.add_argument("arm_a", metavar="ARM_A")
     c.add_argument("arm_b", metavar="ARM_B")
+    c.add_argument(
+        "--allow-mixed",
+        action="store_true",
+        help="pool results of one arm even when they were made different ways (models, versions, policy, job)",
+    )
     c.add_argument("--look", type=int, choices=(1, 2), help="declare the look; an earlier one is shown from storage")
     c.set_defaults(func=cmd_compare)
 

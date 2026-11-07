@@ -917,10 +917,10 @@ ws eval report [-h] [--arm NAME] [--since SPAN] [--k K]
 
 ### `ws eval compare`
 
-Two arms on paired trials: exact McNemar, quality veto, then tokens.
+Two arms on paired tasks: who leads, the 95% interval, and whether it's real.
 
 ```text
-ws eval compare [-h] [--look {1,2}] ARM_A ARM_B
+ws eval compare [-h] [--look {1,2}] [--allow-mixed] ARM_A ARM_B
 ```
 
 | Argument | Meaning |
@@ -928,6 +928,7 @@ ws eval compare [-h] [--look {1,2}] ARM_A ARM_B
 | `ARM_A` | The first arm (the baseline). |
 | `ARM_B` | The second arm. |
 | `--look LOOK` | Declare the look; an earlier one is shown from storage. One of `1`, `2`. |
+| `--allow-mixed` | Pool results of one arm even when they were made different ways (models, versions, policy, job). |
 
 ### `ws eval harvest`
 

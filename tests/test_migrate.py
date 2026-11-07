@@ -7,8 +7,10 @@ import errno
 import hashlib
 import json
 import os
+import shutil
 import socket
 import stat
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -21,10 +23,13 @@ NOW = datetime(2026, 11, 7, 3, 0, tzinfo=UTC)
 
 
 @pytest.fixture
-def home(tmp_path):
-    h = tmp_path / "h"
+def home():
+    # A short folder: macOS caps a Unix socket path at 104 bytes, and some tests put the broker's socket in this home.
+    root = Path(tempfile.mkdtemp(prefix="wsm", dir="/tmp"))
+    h = root / "h"
     h.mkdir()
-    return h
+    yield h
+    shutil.rmtree(root, ignore_errors=True)
 
 
 @pytest.fixture
@@ -656,9 +661,9 @@ def test_install_then_migrate_then_install_again_changes_nothing_and_uninstall_s
     assert str(cli_home / ".config" / "ws") not in (settings.read_text(encoding="utf-8") if settings.exists() else "")
 
 
-def test_it_refuses_while_a_broker_answers_on_the_socket_the_environment_names(home, env, tmp_path):
+def test_it_refuses_while_a_broker_answers_on_the_socket_the_environment_names(home, env):
     make_old_home(home)
-    sock = tmp_path / "elsewhere" / "broker.sock"
+    sock = home.parent / "elsewhere" / "broker.sock"
     sock.parent.mkdir()
     srv = listening(sock)
     try:

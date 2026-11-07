@@ -49,7 +49,8 @@ The rows below are the plan as it stood before the move to issues. Open rows mov
 ### Phase 3 (core)
 
 - [x] Policy schema + generated gate for Claude Code and OpenCode (PR #9): native deny lists, a fail-closed hook and an
-  OpenCode shim; self-protection of `$WS_HOME`; Rule of Two with named exceptions; known matcher limits in policy.py
+  OpenCode shim; self-protection of `$WS_HOME`; Rule of Two with named exceptions; the matcher's limits are
+  documented in policy.py
 - [x] Secrets store + broker (PR #8): per-run leases to a reverse proxy that injects at the allowed host; `ws secret wall`
   moves the store to its own user with a root-owned copy of ws
 - [x] `ws run` + `runs.jsonl` (PR #11): scrubbed env, broker leases, budget cap, Rule of Two, one record per run

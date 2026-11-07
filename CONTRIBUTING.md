@@ -78,9 +78,18 @@ agents. In short:
 - Sign every commit (SSH or GPG). `main` needs verified commits and a linear history (see `TODO.md` and
   [write-up 1](docs/explanation/write-up-1.md)).
 - One author per commit, and no co-author trailers.
-- Write the subject in the imperative, in about 72 characters or fewer, and put the why in the body.
+- Write the subject as a plain sentence in the imperative, in about 72 characters or fewer, and put the why in the body.
+  No type prefix (`feat:`, `fix:`) or scope is needed.
 - Fill in the pull request template. List the commands you ran with their exit codes, and the gaps.
 - Pull requests are squash-merged.
+
+## Releases
+
+The maintainer cuts releases from `main`. There are three channels (see [Install ws](docs/how-to/install.md#release-channels)):
+`edge` is `main`, `rc` is a `vX.Y.ZrcN` tag published to PyPI as a pre-release, and `stable` is a plain `vX.Y.Z` tag.
+
+- A release tag is never moved or deleted. A fix is a new version.
+- A bad release is yanked on PyPI, never deleted, and the release notes say why.
 
 ## Triage labels
 

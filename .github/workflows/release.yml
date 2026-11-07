@@ -1,6 +1,8 @@
-# Release: a `vX.Y.Z` tag builds the sdist and wheel, writes a SHA-256 for each asset and a CycloneDX SBOM, attests build
+# Release: a `vX.Y.Z` tag (stable) or a `vX.Y.ZrcN` tag (release candidate) builds the sdist and wheel, writes a SHA-256 for each asset and a CycloneDX SBOM, attests build
 # provenance, signs every asset with cosign (keyless), publishes one immutable GitHub release, then uploads to PyPI by
-# trusted publishing. `workflow_dispatch` only does the build job (a dry run) on the ref it was dispatched on: nothing is attested,
+# trusted publishing. A release candidate goes out exactly the same way, marked as a pre-release on GitHub; PyPI
+# treats the rcN version as a pre-release by itself, so pip and uv skip it unless asked (`--prerelease allow`).
+# A bad release is yanked on PyPI and never deleted, and a tag is never moved or deleted. `workflow_dispatch` only does the build job (a dry run) on the ref it was dispatched on: nothing is attested,
 # signed or published, and no tag needs to exist. Version rule: the tag must equal `v` + the version in pyproject.toml, or the build fails; the workflow never
 # rewrites the version, so the sdist, the wheel and the tree at the tag all say the same thing. Each job holds only the
 # permissions it uses. Actions are pinned by commit SHA (version in the comment).
@@ -11,7 +13,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to check against (vX.Y.Z; empty = v + the pyproject version). Builds the dispatched ref, publishes nothing"
+        description: "Tag to check against (vX.Y.Z or vX.Y.ZrcN; empty = v + the pyproject version). Builds the dispatched ref, publishes nothing"
         required: false
         type: string
 permissions: {}
@@ -30,12 +32,13 @@ jobs:
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
       version: ${{ steps.meta.outputs.version }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
     steps:
-      - name: the tag is a plain vX.Y.Z
+      - name: the tag is vX.Y.Z or vX.Y.ZrcN
         run: |
           if [ -z "$TAG" ] && [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then exit 0; fi  # set from pyproject below
-          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "::error::tag '$TAG' is not vX.Y.Z"; exit 1
+          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(rc[0-9]+)?$'; then
+            echo "::error::tag '$TAG' is not vX.Y.Z or vX.Y.ZrcN"; exit 1
           fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -64,8 +67,12 @@ jobs:
             fi
             echo "::warning::this commit is not on main yet; a release from it would be refused"
           fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+          case "$version" in *rc*) prerelease=true ;; *) prerelease=false ;; esac
+          {
+            echo "tag=$TAG"
+            echo "version=$version"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
       - name: stamp the build (src/ws/_build.py, git-ignored; `ws version` reads it)
         run: |
           sha="$(git rev-parse HEAD)"
@@ -76,13 +83,26 @@ jobs:
       - name: release notes from the CHANGELOG section for this version
         env:
           VERSION: ${{ steps.meta.outputs.version }}
+          PRERELEASE: ${{ steps.meta.outputs.prerelease }}
         run: |
-          awk -v h="## [$VERSION]" 'index($0, h) == 1 { f = 1; next } /^## \[/ { f = 0 } /^\[[^]]+\]: / { next } f' \
-            CHANGELOG.md > release-notes.md
+          section() {
+            awk -v h="## [$1]" 'index($0, h) == 1 { f = 1; next } /^## \[/ { f = 0 } /^\[[^]]+\]: / { next } f' CHANGELOG.md
+          }
+          section "$VERSION" > release-notes.md
+          if [ "$PRERELEASE" = true ]; then
+            # a release candidate may have no section of its own: it uses the one for the release it leads to, then Unreleased
+            if ! grep -q '[^[:space:]]' release-notes.md; then section "${VERSION%%rc*}" > release-notes.md; fi
+            if ! grep -q '[^[:space:]]' release-notes.md; then section "Unreleased" > release-notes.md; fi
+          fi
           if ! grep -q '[^[:space:]]' release-notes.md; then
             echo "::error::CHANGELOG.md has no '## [$VERSION]' section with text in it"; exit 1
           fi
-          if grep -q "^## \[$VERSION\].*unreleased" CHANGELOG.md; then
+          if [ "$PRERELEASE" = true ]; then
+            # shellcheck disable=SC2016 # the backticks are Markdown, not a command
+            { printf 'A release candidate for testing. pip and uv skip it unless asked (`--prerelease allow`).\n\n'; cat release-notes.md; } > release-notes.tmp
+            mv release-notes.tmp release-notes.md
+          fi
+          if [ "$PRERELEASE" != true ] && grep -q "^## \[$VERSION\].*unreleased" CHANGELOG.md; then
             if [ "$GITHUB_EVENT_NAME" = "push" ]; then
               echo "::error::CHANGELOG.md still says '## [$VERSION] - unreleased'; put the date in before tagging"; exit 1
             fi
@@ -102,17 +122,19 @@ jobs:
       - name: install the wheel in a clean environment; it reports this commit, and the SBOM is read from that environment
         env:
           VERSION: ${{ steps.meta.outputs.version }}
+          PRERELEASE: ${{ steps.meta.outputs.prerelease }}
         run: |
           uv venv "$RUNNER_TEMP/wheel-env"
           uv pip install --python "$RUNNER_TEMP/wheel-env/bin/python" "dist/ws_aitoolkit-$VERSION-py3-none-any.whl"
           "$RUNNER_TEMP/wheel-env/bin/ws" version --json | tee "$RUNNER_TEMP/version.json"
-          python3 - "$RUNNER_TEMP/version.json" "$(git rev-parse HEAD)" "$VERSION" <<'PY'
+          python3 - "$RUNNER_TEMP/version.json" "$(git rev-parse HEAD)" "$VERSION" "$PRERELEASE" <<'PY'
           import json, sys
           data = json.load(open(sys.argv[1]))["data"]
           assert data["git_sha"] == sys.argv[2], data
           assert data["version"] == sys.argv[3], data
           assert data["install_source"] == "release", data
           assert data["dirty"] is False, data
+          assert data["channel"] == ("rc" if sys.argv[4] == "true" else "stable"), data
           PY
           # cyclonedx-bom is pinned; --exclude-newer holds its own dependencies to versions at least 7 days old
           uvx --exclude-newer "7 days" --from cyclonedx-bom==7.5.0 cyclonedx-py environment \
@@ -203,6 +225,7 @@ jobs:
           name: ${{ needs.build.outputs.tag }}
           body_path: release-notes.md
           draft: false
+          prerelease: ${{ needs.build.outputs.prerelease }}
           fail_on_unmatched_files: true
           files: |
             dist/*.whl
@@ -249,4 +272,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ needs.build.outputs.tag }}
-        run: gh workflow run install-test.yml --ref main -f tag="$TAG" -f latest=true
+          PRERELEASE: ${{ needs.build.outputs.prerelease }}
+        # "latest" installs what a person gets with no flags, which is the stable release; a candidate is installed by its tag
+        run: |
+          if [ "$PRERELEASE" = true ]; then latest=false; else latest=true; fi
+          gh workflow run install-test.yml --ref main -f tag="$TAG" -f latest="$latest"

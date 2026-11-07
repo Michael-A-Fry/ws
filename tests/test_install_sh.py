@@ -79,8 +79,12 @@ class FakeGitHub:
         self.httpd.shutdown()
         self.httpd.server_close()
 
-    def publish(self, tag: str = "v0.1.0", wheel: bytes = b"a wheel", latest: bool = True) -> str:
-        """A release with its wheel, a matching .sha256 and a bundle. Returns the base path of its downloads."""
+    def publish(self, tag: str = "v0.1.0", wheel: bytes = b"a wheel", latest: bool = True, newest: bool = False) -> str:
+        """A release with its wheel, a matching .sha256 and a bundle. Returns the base path of its downloads.
+
+        `latest` makes it the answer to "the latest release" (GitHub never answers with a release candidate there);
+        `newest` makes it the answer to "the newest release of any kind", which the rc channel asks.
+        """
         name = wheel_name(tag)
         base = f"/{SLUG}/releases/download/{tag}/"
         self.routes[base + name] = wheel
@@ -89,6 +93,10 @@ class FakeGitHub:
         if latest:
             self.routes[f"/repos/{SLUG}/releases/latest"] = json.dumps(
                 {"tag_name": tag, "name": tag}, indent=2
+            ).encode()
+        if newest:
+            self.routes[f"/repos/{SLUG}/releases?per_page=1"] = json.dumps(
+                [{"tag_name": tag, "name": tag, "prerelease": "rc" in tag}], indent=2
             ).encode()
         return base
 

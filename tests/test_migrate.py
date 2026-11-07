@@ -654,3 +654,27 @@ def test_install_then_migrate_then_install_again_changes_nothing_and_uninstall_s
     assert "left 0" in out, out
     assert not (cli_home / ".config" / "ws" / "policy.toml").exists()
     assert str(cli_home / ".config" / "ws") not in (settings.read_text(encoding="utf-8") if settings.exists() else "")
+
+
+def test_it_refuses_while_a_broker_answers_on_the_socket_the_environment_names(home, env, tmp_path):
+    make_old_home(home)
+    sock = tmp_path / "elsewhere" / "broker.sock"
+    sock.parent.mkdir()
+    srv = listening(sock)
+    try:
+        with pytest.raises(WsError) as e:
+            migrate.migrate({**env, "WS_BROKER_SOCKET": str(sock)}, now=NOW, refresh=stub_refresh([]))
+    finally:
+        srv.close()
+    assert e.value.kind == "refused" and str(sock) in e.value.message
+
+
+def test_a_move_that_fails_after_the_timers_went_off_says_how_to_switch_them_back_on(home, env, monkeypatch):
+    old = make_old_home(home)
+    unit = old / "timers"
+    unit.mkdir(exist_ok=True)
+    monkeypatch.setattr(migrate, "_timers", lambda p: [unit / "ws-job-a.timer"])
+    monkeypatch.setattr(migrate, "_copy", lambda *a, **k: (_ for _ in ()).throw(OSError(28, "No space left on device")))
+    with pytest.raises(WsError) as e:
+        migrate.migrate(env, now=NOW, refresh=stub_refresh([]), deactivate=lambda t, e: [], reschedule=lambda e: [])
+    assert "ws schedule apply" in e.value.hint and "timers are off" in e.value.hint

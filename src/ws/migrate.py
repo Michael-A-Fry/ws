@@ -323,7 +323,11 @@ def busy(source: Path, env: Mapping[str, str]) -> str:
         socks = sorted(p for p in run.iterdir() if stat.S_ISSOCK(os.lstat(p).st_mode)) if run.is_dir() else []
     except OSError:
         socks = []
-    for sock in socks:
+    from ws import secrets
+
+    with contextlib.suppress(Exception):  # a socket path that can't be worked out is no evidence of a live broker
+        socks.append(secrets.socket_path(dict(env)))  # a broker on a socket the profile or $WS_BROKER_SOCKET names
+    for sock in dict.fromkeys(socks):
         if _answers(sock):
             return f"the secrets broker (or another process) is answering on {sock}"
     return ""
@@ -491,46 +495,53 @@ def migrate(
                 "run `ws schedule apply` to put them back, fix that, then run `ws migrate` again",
                 details={"problems": problems},
             )
-    secrets_root = p.source / "secrets"
-    secret_items = [i for i in p.items if i.src == secrets_root or secrets_root in i.src.parents]
-    held = {id(i) for i in secret_items}
-    rest = Plan(p.state, p.source, [i for i in p.items if id(i) not in held])
     try:
-        _copy(rest, lay)
-    except OSError as e2:
-        raise WsError(
-            "failed",
-            f"could not copy to the new folders: {e2.strerror or type(e2).__name__} ({e2.filename})",
-            "nothing in the old folder was changed; fix that and run `ws migrate` again",
-        ) from e2
-    bad = _verify(rest)
-    if bad:
-        raise WsError(
-            "failed",
-            f"{len(bad)} copy(ies) did not match the source; the old folder is untouched. First: {bad[0]}",
-            "run `ws migrate` again; if it repeats, report it",
-            details={"mismatches": bad},
-        )
-    record = lay.state / INSTALL_MANIFEST
-    if had_install and record.is_file():
+        secrets_root = p.source / "secrets"
+        secret_items = [i for i in p.items if i.src == secrets_root or secrets_root in i.src.parents]
+        held = {id(i) for i in secret_items}
+        rest = Plan(p.state, p.source, [i for i in p.items if id(i) not in held])
         try:
-            doc = json.loads(record.read_text(encoding="utf-8"))
-            if isinstance(doc, dict):
-                _write_private(record, json.dumps(remap_install_record(doc, p.source, lay), indent=2) + "\n")
-        except (OSError, ValueError) as e2:
+            _copy(rest, lay)
+        except OSError as e2:
             raise WsError(
                 "failed",
-                f"could not update the install record in {record}: {e2}",
-                "the old folder is untouched; fix the file and run `ws migrate` again",
+                f"could not copy to the new folders: {e2.strerror or type(e2).__name__} ({e2.filename})",
+                "nothing in the old folder was changed; fix that and run `ws migrate` again",
             ) from e2
-    try:
-        _move_secrets(secret_items, lay)  # the last of the files, by rename: no plaintext copy stays in the old folder
-    except OSError as e2:
-        raise WsError(
-            "failed",
-            f"could not move the secrets store: {e2.strerror or type(e2).__name__} ({e2.filename})",
-            "the old store is whole; fix that and run `ws migrate` again",
-        ) from e2
+        bad = _verify(rest)
+        if bad:
+            raise WsError(
+                "failed",
+                f"{len(bad)} copy(ies) did not match the source; the old folder is untouched. First: {bad[0]}",
+                "run `ws migrate` again; if it repeats, report it",
+                details={"mismatches": bad},
+            )
+        record = lay.state / INSTALL_MANIFEST
+        if had_install and record.is_file():
+            try:
+                doc = json.loads(record.read_text(encoding="utf-8"))
+                if isinstance(doc, dict):
+                    _write_private(record, json.dumps(remap_install_record(doc, p.source, lay), indent=2) + "\n")
+            except (OSError, ValueError) as e2:
+                raise WsError(
+                    "failed",
+                    f"could not update the install record in {record}: {e2}",
+                    "the old folder is untouched; fix the file and run `ws migrate` again",
+                ) from e2
+        try:
+            _move_secrets(
+                secret_items, lay
+            )  # the last of the files, by rename: no plaintext copy stays in the old folder
+        except OSError as e2:
+            raise WsError(
+                "failed",
+                f"could not move the secrets store: {e2.strerror or type(e2).__name__} ({e2.filename})",
+                "the old store is whole; fix that and run `ws migrate` again",
+            ) from e2
+    except WsError as err:
+        if timers:  # they were switched off for the move: say how to put them back
+            err.hint = f"{err.hint}; ws's timers are off: run `ws schedule apply` to switch them back on".lstrip("; ")
+        raise
     when = now or datetime.now(UTC)
     _write_private(lay.state / MANIFEST, json.dumps(_manifest(p, when, renamed), indent=2) + "\n")
     os.rename(p.source, renamed)

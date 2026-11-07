@@ -39,12 +39,18 @@ def generate(runner, out, *extra):
 def check(monkeypatch, capsys, runner, payload, *extra) -> tuple[int, str]:
     raw = payload if isinstance(payload, str) else json.dumps(payload)
     monkeypatch.setattr(sys, "stdin", io.StringIO(raw))
-    code = cli.main(["gate", "check", "--runner", runner, *extra])
+    code = cli.main(["gate", "check", "--runner", runner, *paths.pin_of().args(), *extra])
     return code, capsys.readouterr().err
 
 
 def bash(cmd):
     return {"tool_name": "Bash", "tool_input": {"command": cmd}}
+
+
+def pins(home) -> str:
+    """The `--pin` arguments a hook generated in the `home` fixture carries: its home folder and the one ws folder."""
+    where = {"home": home / "home", **dict.fromkeys(("config", "state", "data", "cache"), home / "wshome")}
+    return shlex.join([a for k, v in where.items() for a in ("--pin", f"{k}={v}")])
 
 
 # --- init --------------------------------------------------------------------------------------------------------
@@ -102,7 +108,8 @@ def test_claude_code_settings(home, tmp_path, capsys):
     policy_file = (home / "wshome" / "policy.toml").resolve()
     # absolute paths: the hook reads this policy wherever the runner starts, and protects this folder
     assert hook["hooks"][0]["command"] == (
-        f"uv run ws gate check --runner claude-code --policy {policy_file} --protect {out.resolve()} || exit 2"
+        f"uv run ws gate check --runner claude-code --policy {policy_file} --protect {out.resolve()} {pins(home)} "
+        "|| exit 2"
     )
     assert f"Edit(/{policy_file})" in deny and f"Edit(/{out.resolve()}/**)" in deny  # a session cannot edit its gate
     wshome = (home / "wshome").resolve()
@@ -153,7 +160,13 @@ def test_opencode_config_and_shim(home, tmp_path):
     assert "__CHECK__" not in shim
     argv = json.loads(shim.split("const CHECK = ")[1].split("\n")[0])
     assert argv[:4] == ["/opt/my ws/bin/ws", "gate", "check", "--runner"] and argv[4] == "opencode"
-    assert argv[5:] == ["--policy", str((home / "wshome" / "policy.toml").resolve()), "--protect", str(out.resolve())]
+    assert argv[5:] == [
+        "--policy",
+        str((home / "wshome" / "policy.toml").resolve()),
+        "--protect",
+        str(out.resolve()),
+        *shlex.split(pins(home)),
+    ]
     assert "tool.execute.before" in shim and "throw new Error" in shim
 
 
@@ -380,6 +393,7 @@ def run_hook(command: str, payload: dict, env) -> subprocess.CompletedProcess:
 
 def test_the_generated_hook_command_allows_denies_and_fails_closed(home, tmp_path, monkeypatch):
     out = tmp_path / "out"
+    write_policy(home, policy.default_toml())
     assert generate("claude-code", out, "--ws-cmd", shlex.join([sys.executable, "-m", "ws"])) == 0
     env = {"PATH": "/usr/bin:/bin", "WS_HOME": str(home / "wshome"), "HOME": str(home / "home")}
     cmd = hook_command(out)

@@ -22,6 +22,12 @@ Which layout is in use, first match wins:
   4. A `~/.ws` folder AND ws's entries in the XDG folders: `layout` raises a typed `WsError` naming both, because ws
      can't tell which holds the truth. `probe` reports it without raising, for `ws doctor` and `ws migrate`.
 
+A generated hook does not trust the environment it runs in. `ws install` writes the layout it resolved (the home folder
+and the four folders, absolute) into the hook's command as `--pin`; at run time `check_pin` compares that with what the
+environment resolves to now and refuses when they differ (a project's settings can set `WS_HOME` or an `XDG_*` variable,
+so the environment is the session's to change), and `pinned` makes the pinned layout the one every `paths` function
+answers with inside its block.
+
 Elsewhere in the code and docs, `<config>`, `<state>`, `<data>` and `<cache>` stand for these four folders.
 
 The table below is the one list of what ws keeps at the top of each folder. `ws migrate` plans from it, the gate's
@@ -31,6 +37,7 @@ Python 3.11+, standard library only; nothing here imports a POSIX-only module.
 
 from __future__ import annotations
 
+import contextlib
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -131,8 +138,23 @@ class Probe:
     owned: tuple[Path, ...]
 
 
+_PINNED: dict[str, str] | None = None  # set by `use_pin`: the environment this process answers with, whatever it has
+
+
+def environ() -> Mapping[str, str]:
+    """The environment ws works from: the pinned layout once `use_pin` has run, else the process's own."""
+    return os.environ if _PINNED is None else _PINNED
+
+
+def merged_environ() -> dict[str, str]:
+    """The process's environment with the pinned layout laid over it (just the environment, when nothing is pinned): for
+    code that reads other variables too (`WS_RELEASE`, `WS_BROKER_SOCKET`) and must still find ws's folders where
+    `ws install` put them."""
+    return {**os.environ, **(_PINNED or {})}
+
+
 def _env(env: Mapping[str, str] | None) -> Mapping[str, str]:
-    return os.environ if env is None else env
+    return environ() if env is None else env
 
 
 def _abs(value: str, e: Mapping[str, str]) -> Path:
@@ -362,3 +384,107 @@ def describe(env: Mapping[str, str] | None = None) -> str:
     return {"legacy": "default (~/.ws, from an earlier ws; run `ws migrate`)", "both": "ambiguous"}.get(
         state, "default (XDG folders)"
     )
+
+
+# --- the pinned layout --------------------------------------------------------------------------------------------
+
+PIN_KEYS = ("home", *KINDS)
+
+
+@dataclass(frozen=True)
+class Pin:
+    """The layout `ws install` resolved, as the home folder and the four folders (absolute)."""
+
+    home: Path
+    config: Path
+    state: Path
+    data: Path
+    cache: Path
+
+    def args(self) -> list[str]:
+        """The `--pin` arguments a generated hook command carries."""
+        return [a for k in PIN_KEYS for a in ("--pin", f"{k}={getattr(self, k)}")]
+
+    def environ(self) -> dict[str, str]:
+        """The environment that resolves to exactly this layout and nothing else."""
+        return {"HOME": str(self.home), **{ENV_DIRS[k]: str(getattr(self, k)) for k in KINDS}}
+
+
+def pin_of(env: Mapping[str, str] | None = None) -> Pin:
+    """The layout this environment resolves to, as a `Pin` (raises like `layout`)."""
+    e = _env(env)
+    lay = layout(e)
+    return Pin(home_dir(e), lay.config, lay.state, lay.data, lay.cache)
+
+
+def read_pin(values: list[str] | None) -> Pin | None:
+    """The `--pin KEY=PATH` arguments of a hook as a `Pin`; None when it has none. All five keys, each an absolute path,
+    or `layout_changed`."""
+    if not values:
+        return None
+    found: dict[str, str] = {}
+    for v in values:
+        key, eq, path = v.partition("=")
+        if not eq or key not in PIN_KEYS or key in found or not os.path.isabs(path):
+            raise WsError(
+                "layout_changed", "this hook's pinned folders cannot be read", "run `ws install` to write them again"
+            )
+        found[key] = os.path.abspath(path)
+    if set(found) != set(PIN_KEYS):
+        raise WsError(
+            "layout_changed", "this hook's pinned folders are incomplete", "run `ws install` to write them again"
+        )
+    return Pin(*(Path(found[k]) for k in PIN_KEYS))
+
+
+def check_pin(pin: Pin | None, env: Mapping[str, str] | None = None) -> None:
+    """Raise `layout_changed` unless the environment resolves to the pinned layout. A hook with no pin is refused too: it
+    was written before ws pinned the layout."""
+    if pin is None:
+        raise WsError(
+            "layout_changed", "this hook does not pin ws's folders", "run `ws install` to write the hooks again"
+        )
+    try:
+        now = pin_of(env)
+    except WsError as e:
+        raise WsError("layout_changed", f"ws's folders cannot be told now ({e.message})", "run `ws install`") from e
+    if now != pin:
+        raise WsError(
+            "layout_changed",
+            "ws's folders changed since install (the environment points them somewhere else)",
+            "run `ws install`, or take the variable out of the project settings",
+        )
+
+
+def add_pin_option(parser) -> None:
+    """The `--pin KEY=PATH` option every command a generated hook runs takes (see `Pin.args`)."""
+    parser.add_argument(
+        "--pin",
+        action="append",
+        metavar="KEY=PATH",
+        help="hook entry: the folders ws install pinned (home, config, state, data, cache); refuses if the environment resolves elsewhere",
+    )
+
+
+@contextlib.contextmanager
+def pinned_by(values: list[str] | None):
+    """Read the hook's `--pin` arguments, refuse (`layout_changed`) unless the environment resolves to them, and answer
+    with them inside the block."""
+    pin = read_pin(values)
+    check_pin(pin)
+    assert pin is not None
+    with pinned(pin):
+        yield
+
+
+@contextlib.contextmanager
+def pinned(pin: Pin):
+    """Inside the block, every `paths` function (and everything that asks the environment through `environ`) answers
+    with the pinned layout, whatever the process's own environment says."""
+    global _PINNED
+    before = _PINNED
+    _PINNED = pin.environ()
+    try:
+        yield
+    finally:
+        _PINNED = before

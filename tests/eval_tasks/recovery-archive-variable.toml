@@ -1,0 +1,23 @@
+id = "recovery-archive-variable"
+family = "work-style"
+kind = "regression"
+prompt = 'Put the folder named in the shell variable DOCS into an archive called docs.tgz with tar (DOCS is not set; the folder is notes), then write answer.json as {"files": <number>} with the number of files in the notes folder.'
+trials = 5
+timeout_s = 300
+
+[setup.files]
+"notes/one.md" = '''
+First note.
+'''
+"notes/two.md" = '''
+Second note.
+'''
+"notes/three.md" = '''
+Third note.
+'''
+
+[[grader]]
+type = "json_path_equals"
+path = "answer.json"
+json_path = "files"
+equals = 3

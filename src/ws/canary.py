@@ -198,8 +198,9 @@ def _hook(runner: str, payload: dict, policy_file: Path, home: Path, env) -> int
     """The exit code of the real hook entry for one payload."""
     child = {k: env[k] for k in ("PATH", "HOME", "LANG") if k in env}
     child["WS_HOME"] = str(home)
+    pin = paths.pin_of(child)
     p = subprocess.run(  # the same isolated command the generated hook uses, from a folder that has no ws/ of its own
-        [*selfcmd.argv(), "gate", "check", "--runner", runner, "--policy", str(policy_file)],
+        [*selfcmd.argv(), "gate", "check", "--runner", runner, "--policy", str(policy_file), *pin.args()],
         input=json.dumps(payload), env=child, capture_output=True, text=True, timeout=30, check=False,
     )  # fmt: skip
     return p.returncode

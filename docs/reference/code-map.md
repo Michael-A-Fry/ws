@@ -59,6 +59,7 @@ below, and `python3 scripts/gen_code_map.py --check` (prek and CI) fails when it
 | `term/` | `ws term`: a browser terminal that behaves like a native one, for reaching a ws machine from a... |
 | `testing/` | Test support that ships with ws: the mock model provider and its scenarios |
 | `ui/` | The shared page toolkit: the ws look as CSS, small HTML components, and the loopback server that... |
+| `unknownpath.py` | A command word with a part the reader cannot resolve, tested against the paths ws protects |
 | `usage.py` | The Console usage check: can ws read the provider's own usage report, the billing truth... |
 | `userconfig.py` | The gate in the runner's own user config: ws's deny rules and hooks added beside yours... |
 | `version.py` | `ws version`: which build is this, where did it come from, and where is it installed |

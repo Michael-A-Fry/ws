@@ -3,18 +3,21 @@
 from __future__ import annotations
 
 import json
+import shlex
 from pathlib import Path
 
 import pytest
 
-from ws import policy
+from ws import paths, policy
 from ws.adapters import claude_code
 
-ALERT = "ws notify alert --runner claude-code || true"
+PIN = paths.Pin(Path("/h"), Path("/c"), Path("/s"), Path("/d"), Path("/k"))
+PINS = shlex.join(PIN.args())
+ALERT = f"ws notify alert --runner claude-code {PINS} || true"
 
 
 def hooks(toml: str = "") -> dict:
-    files = claude_code.generate(policy.loads(toml), ["ws"], Path("/x/out"), Path("/x/policy.toml"))
+    files = claude_code.generate(policy.loads(toml), ["ws"], Path("/x/out"), Path("/x/policy.toml"), pin=PIN)
     return json.loads(files["settings.json"])["hooks"]
 
 
@@ -39,9 +42,9 @@ def test_the_alert_runs_beside_a_guard_hook_on_stop():
 
 
 def test_the_alert_command_follows_the_ws_command_given():
-    files = claude_code.generate(policy.loads(""), ["uv", "run", "ws"], Path("/x/out"), Path("/x/policy.toml"))
+    files = claude_code.generate(policy.loads(""), ["uv", "run", "ws"], Path("/x/out"), Path("/x/policy.toml"), pin=PIN)
     h = json.loads(files["settings.json"])["hooks"]
-    assert commands(h["Notification"]) == ["uv run ws notify alert --runner claude-code || true"]
+    assert commands(h["Notification"]) == [f"uv run ws notify alert --runner claude-code {PINS} || true"]
 
 
 @pytest.mark.parametrize("event", ["Notification", "Stop"])

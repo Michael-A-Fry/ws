@@ -10,7 +10,7 @@ import stat
 
 import pytest
 
-from ws import approvals, cli, gate, jsonl, policy
+from ws import approvals, cli, gate, jsonl, paths, policy
 from ws.approvals import ApprovalError, Bound
 
 NOW = 1_000_000.0
@@ -409,12 +409,14 @@ def test_the_gate_check_exits_4_with_the_claim_inside_the_wall(tmp_path, monkeyp
     (tmp_path / "policy.toml").write_text('[gate]\nask_commands = ["terraform apply*"]\n')
     raw = payload("terraform apply")
     monkeypatch.setattr("sys.stdin", io.StringIO(raw))
-    assert cli.main(["gate", "check", "--runner", "claude-code"]) == gate.DENY  # first try: asks
+    assert (
+        cli.main(["gate", "check", "--runner", "claude-code", *paths.pin_of().args()]) == gate.DENY
+    )  # first try: asks
     bound = Bound("claude-code", "command", "terraform apply", "/work", "sess-1")
     approvals.grant(tmp_path / "approvals", bound.digest()[:12])
     capsys.readouterr()
     monkeypatch.setattr("sys.stdin", io.StringIO(raw))
-    assert cli.main(["gate", "check", "--runner", "claude-code"]) == gate.CLAIM
+    assert cli.main(["gate", "check", "--runner", "claude-code", *paths.pin_of().args()]) == gate.CLAIM
     assert json.loads(capsys.readouterr().out) == {"claim": bound.digest()}
     assert (tmp_path / "approvals" / "granted" / f"{bound.digest()}.json").exists()
 

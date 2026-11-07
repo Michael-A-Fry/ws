@@ -1088,9 +1088,17 @@ class Unknown(dict):
     `unsupported`), so an unknown value never stands in a path as if it were known."""
 
     def __init__(
-        self, values: Mapping[str, str], unknown: Iterable[str] = (), everything: bool = False, keep: Iterable[str] = ()
+        self,
+        values: Mapping[str, str],
+        unknown: Iterable[str] = (),
+        everything: bool = False,
+        keep: Iterable[str] = (),
+        defaults_unread: bool = False,
     ):
         super().__init__(values)
+        # a name the line does not set may still hold a value in the shell's own environment, so `${NAME:-word}` is not
+        # `word`: with this on, the text is left as written and the caller treats it as a part it cannot resolve
+        self.defaults_unread = defaults_unread
         self.unknown = frozenset(unknown)
         self.everything = everything  # after a command that can set any variable, no name has a known value...
         self.keep = frozenset(keep)  # ...except these (the home and working folders, after a sourced file)
@@ -1260,6 +1268,8 @@ def _param(body: str, env: Mapping[str, str], strict: bool = True) -> str | None
     arg = rest[len(op) :] if op in ("-", ":-", "=", ":=", "+", ":+", "?", ":?") else ""
     known = named and name in env
     if not known:
+        if getattr(env, "defaults_unread", False) and op in ("-", ":-", "=", ":="):
+            return None
         return _word(arg, env) if named and op in ("-", ":-", "=", ":=", "+", ":+") else None
     val = env[name]
     if not op:

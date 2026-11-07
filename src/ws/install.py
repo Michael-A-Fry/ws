@@ -389,7 +389,7 @@ def _gate_steps(
             made = userconfig.plan(runner, parsed, policy_file, env, old)
             files = made.files
         else:
-            files = adapter.generate(parsed, ["ws"], out, policy_file)
+            files = adapter.generate(parsed, ["ws"], out, policy_file, pin=paths.pin_of(env))
         steps += [Step(out / name, "file", text, f"{runner} deny rules") for name, text in files.items()]
         if wide:
             steps += _merge_steps(runner, made, old is not None)

@@ -442,6 +442,7 @@ def plan(runner: str, pol: policy.Policy, policy_file: Path, env: Mapping[str, s
     require_stable_interpreter(cmd)
     where = target(runner, env)
     out = _state(env) / "gate" / runner
+    pin = paths.pin_of(env)  # the hooks carry the layout this install resolved
     if entry is not None:
         backup = Path(entry["backup"]) if entry.get("backup") else None
     else:
@@ -453,11 +454,13 @@ def plan(runner: str, pol: policy.Policy, policy_file: Path, env: Mapping[str, s
         notice = _notice(where, backup)
         # `ws gate launch` runs inside the wall, so its file keeps the wide project locks; the user's own config is read
         # by every session, so it gets the narrow set (see USER_LOCKS)
-        files = _tune(adapter.generate(pol, cmd, out, policy_file, protect=protect), notice)
-        ops = _claude_ops(_tune(adapter.generate(pol, cmd, out, policy_file, protect=protect, user_scope=True), notice))
+        files = _tune(adapter.generate(pol, cmd, out, policy_file, protect=protect, pin=pin), notice)
+        ops = _claude_ops(
+            _tune(adapter.generate(pol, cmd, out, policy_file, protect=protect, user_scope=True, pin=pin), notice)
+        )
     else:
         plug = plugin_path(env)
-        files = adapter.generate(pol, cmd, out, policy_file, protect=(str(where), str(plug)))
+        files = adapter.generate(pol, cmd, out, policy_file, protect=(str(where), str(plug)), pin=pin)
         ops = _opencode_ops(files)
         copies[plug] = files[adapter.PLUGIN]
     return GatePlan(files, Merge(runner, where, tuple(ops), backup, tuple(cmd), policy_digest(pol)), copies)

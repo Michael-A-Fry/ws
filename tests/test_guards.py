@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from ws import adapters, approvals, cli, gate, guards, jsonl, policy, session
+from ws import adapters, approvals, cli, gate, guards, jsonl, paths, policy, session
 from ws.adapters import Call, claude_code, opencode
 from ws.guards import Finding, bulk_staging, session_context, syntax_check
 
@@ -51,7 +51,7 @@ def bash(cmd: str) -> dict:
 
 def run_gate(monkeypatch, capsys, sub: str, payload, *extra) -> tuple[int, str, str]:
     monkeypatch.setattr(sys, "stdin", io.StringIO(payload if isinstance(payload, str) else json.dumps(payload)))
-    code = cli.main(["gate", sub, "--runner", "claude-code", *extra])
+    code = cli.main(["gate", sub, "--runner", "claude-code", *paths.pin_of().args(), *extra])
     out = capsys.readouterr()
     return code, out.out, out.err
 
@@ -970,7 +970,7 @@ def test_event_for_a_name_ws_does_not_answer_is_a_quiet_exit_0(home, monkeypatch
 
 def test_a_runner_with_no_event_names_exits_0(home, monkeypatch, capsys):
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"hook_event_name": "Stop"})))
-    assert cli.main(["gate", "event", "--runner", "opencode"]) == 0
+    assert cli.main(["gate", "event", "--runner", "opencode", *paths.pin_of().args()]) == 0
     assert "is not a hook event ws reads" in capsys.readouterr().err
 
 
@@ -1039,6 +1039,10 @@ def generate(p: policy.Policy, **kw) -> dict:
     return json.loads(claude_code.generate(p, ["ws"], _P("out"), _P("wshome/policy.toml"), **kw)["settings.json"])
 
 
+def pins() -> str:
+    return shlex.join(paths.pin_of().args())
+
+
 def commands(group: list[dict]) -> list[str]:
     return [h["command"] for g in group for h in g["hooks"]]
 
@@ -1053,19 +1057,22 @@ def test_with_no_guards_the_hooks_are_the_old_ones():
         "Stop",
     }  # the last two: phone alerts
     assert hooks["PreToolUse"][0]["matcher"] == claude_code.MATCHER
-    assert commands(hooks["SessionStart"]) == ["ws session start --runner claude-code || true"]
+    assert commands(hooks["SessionStart"]) == [f"ws session start --runner claude-code {pins()} || true"]
     assert generate(pol())["env"] == {"WS_GATED_SESSION": "1", "WS_SANDBOXED": "1"}
 
 
 def test_the_default_policy_adds_post_tool_use_and_session_start_events():
     hooks = generate(policy.default_policy())["hooks"]
     assert hooks["PostToolUse"][0]["matcher"] == "Edit|Write|MultiEdit|NotebookEdit"
-    event = "ws gate event --runner claude-code --policy /x/wshome/policy.toml"
+    event = f"ws gate event --runner claude-code --policy /x/wshome/policy.toml {pins()}"
     assert commands(hooks["PostToolUse"]) == [event]  # no `|| exit`: exit 2 here is a message to the model
-    assert commands(hooks["SessionStart"]) == ["ws session start --runner claude-code || true", event + " || true"]
+    assert commands(hooks["SessionStart"]) == [
+        f"ws session start --runner claude-code {pins()} || true",
+        event + " || true",
+    ]
     assert hooks["PostToolUse"][0]["hooks"][0]["timeout"] > 10  # the checkers get 10 seconds
     assert "SubagentStop" not in hooks
-    alert = "ws notify alert --runner claude-code || true"
+    alert = f"ws notify alert --runner claude-code {pins()} || true"
     assert commands(hooks["Stop"]) == [alert] and commands(hooks["Notification"]) == [alert]
 
 
@@ -1175,7 +1182,7 @@ def test_every_generated_hook_but_pre_and_post_tool_use_ends_in_true(monkeypatch
             if name == "PreToolUse":
                 assert cmd.endswith("|| exit 2")
             elif name == "PostToolUse":
-                assert cmd.endswith("--policy /x/wshome/policy.toml")  # exit 2 is the message to the model
+                assert "--policy /x/wshome/policy.toml" in cmd and not cmd.endswith(("|| true", "|| exit 2"))
             else:
                 assert cmd.endswith("|| true"), (name, cmd)
 

@@ -5,12 +5,13 @@ from __future__ import annotations
 import io
 import json
 import os
+import shlex
 import stat
 import sys
 
 import pytest
 
-from ws import adapters, cli, session
+from ws import adapters, cli, paths, session
 
 
 @pytest.fixture
@@ -22,7 +23,7 @@ def home(tmp_path, monkeypatch):
 
 
 def call(monkeypatch, capsys, sub, sid="s1", stdin=None, *extra) -> tuple[int, str]:
-    args = ["session", sub, "--runner", "claude-code", *extra]
+    args = ["session", sub, "--runner", "claude-code", *paths.pin_of().args(), *extra]
     if stdin is None:
         args += ["--session-id", sid]
     else:
@@ -167,8 +168,9 @@ def test_claude_settings_run_the_session_hooks_and_stay_idempotent(home):
     assert first == gen(home, "claude-code")
     hooks = json.loads(first["settings.json"])["hooks"]
     start, nudge = hooks["SessionStart"][0]["hooks"][0], hooks["UserPromptSubmit"][0]["hooks"][0]
-    assert start["command"] == "ws session start --runner claude-code || true"
-    assert nudge["command"] == "ws session nudge --runner claude-code || true"
+    pins = shlex.join(paths.pin_of().args())
+    assert start["command"] == f"ws session start --runner claude-code {pins} || true"
+    assert nudge["command"] == f"ws session nudge --runner claude-code {pins} || true"
     assert start["timeout"] == nudge["timeout"] == 5  # advice must not hold the prompt up
     assert "PreToolUse" in hooks
 

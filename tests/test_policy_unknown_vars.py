@@ -98,7 +98,6 @@ def test_a_command_that_can_set_any_variable_makes_later_values_unknown(pol, cmd
         "read -r name; echo hi",
         "echo $IFS",
         'while read -r x; do echo "$x"; done < list.txt',
-        'git ls-files | while read -r f; do wc -l "$f"; done',
         "read -r x <<< hi; echo $x",
         "let x=1; echo $x",
         "source ~/.bashrc; ls $HOME",

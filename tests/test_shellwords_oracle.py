@@ -16,7 +16,7 @@ import sys
 
 import pytest
 
-from ws import cli, policy
+from ws import cli, paths, policy
 from ws import shellwords as sw
 
 
@@ -242,7 +242,7 @@ def hook(monkeypatch, capsys, cmd: str) -> int:
     """The exit code of `ws gate check --runner claude-code` for a Bash call: 0 allows, 2 refuses."""
     payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": cmd}, "hook_event_name": "PreToolUse"})
     monkeypatch.setattr(sys, "stdin", io.StringIO(payload))
-    code = cli.main(["gate", "check", "--runner", "claude-code"])
+    code = cli.main(["gate", "check", "--runner", "claude-code", *paths.pin_of().args()])
     capsys.readouterr()
     return code
 

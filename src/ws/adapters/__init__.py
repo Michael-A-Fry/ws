@@ -3,7 +3,7 @@
 A module must define:
 
     NAME: str                                   the --runner name, e.g. "claude-code"
-    def generate(policy, ws_cmd, out, policy_file, *, protect=()) -> dict
+    def generate(policy, ws_cmd, out, policy_file, *, protect=(), pin=None) -> dict
                                                 file name (relative to the out dir) -> text; pure, no I/O.
                                                 `ws_cmd` is the argv list that runs ws, e.g. ["ws"]; `out` is the
                                                 folder the files go in and `policy_file` the policy they came from:
@@ -11,6 +11,8 @@ A module must define:
                                                 them (see check_argv for the hook's side of that). `protect` names
                                                 more paths a session may not write (deny rules, the hook's
                                                 --protect arguments, the sandbox's denyWrite).
+                                                `pin` is the `ws.paths.Pin` the hook carries (None: the one this
+                                                environment resolves to); see check_argv.
     def parse(payload) -> Call | list[Call] | None
                                                 a hook payload from that runner, as neutral Call(s); None if the call
                                                 is not one the policy governs; ValueError or TypeError if it cannot be
@@ -34,6 +36,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType, ModuleType
+
+from ws import paths
 
 
 @dataclass(frozen=True)
@@ -77,7 +81,6 @@ def protected_paths(out: Path, policy_file: Path, extra: tuple[str, ...] = ()) -
     it (profile, secrets, jobs, release, runs, logs), every folder ws keeps its files in (in each layout it could use:
     `ws.paths.protected_roots`), and any `extra` path the caller names (a user settings file). Each adapter denies edits
     to all of them natively."""
-    from ws import paths
     from ws.policy import control_paths
 
     found = [
@@ -92,17 +95,24 @@ def protected_paths(out: Path, policy_file: Path, extra: tuple[str, ...] = ()) -
 
 
 def check_argv(
-    ws_cmd: list[str], runner: str, policy_file: Path, out: Path, protect: tuple[str, ...] = ()
+    ws_cmd: list[str],
+    runner: str,
+    policy_file: Path,
+    out: Path,
+    protect: tuple[str, ...] = (),
+    pin: paths.Pin | None = None,
 ) -> list[str]:
     """The command a generated hook or shim runs. The policy and the protected folder are absolute paths, so the hook
     reads the same policy wherever the runner starts and cannot be pointed at another one by the session's cwd. Each
-    `protect` path is one more `--protect`."""
+    `protect` path is one more `--protect`. `--pin` carries the layout `ws install` resolved (the home folder and ws's
+    four folders): the hook uses only that, and refuses when the environment it runs in resolves to another.
+    """
     argv = [*ws_cmd, "gate", "check", "--runner", runner, "--policy", str(policy_file), "--protect", str(out)]
     for p in protect:
         argv += ["--protect", str(p)]
-    return argv
+    return [*argv, *(pin or paths.pin_of()).args()]
 
 
-def event_argv(ws_cmd: list[str], runner: str, policy_file: Path) -> list[str]:
+def event_argv(ws_cmd: list[str], runner: str, policy_file: Path, pin: paths.Pin | None = None) -> list[str]:
     """The command a generated hook runs for the events that are not a tool call's check: `ws gate event`."""
-    return [*ws_cmd, "gate", "event", "--runner", runner, "--policy", str(policy_file)]
+    return [*ws_cmd, "gate", "event", "--runner", runner, "--policy", str(policy_file), *(pin or paths.pin_of()).args()]

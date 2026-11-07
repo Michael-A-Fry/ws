@@ -37,7 +37,7 @@ CASES: dict[str, list[str]] = {
     "init": ["init", "--yes", "--create-notes", "--notes", "{home}/Notes"],
     "gate.init": ["gate", "init"],
     "gate.generate": ["gate", "generate", "--runner", "claude-code", "--out", "{home}/gate"],
-    "gate.replay": ["gate", "replay", "{home}/none.jsonl", "--runner", "claude-code"],
+    "gate.replay": ["gate", "replay", "{home}/none.jsonl", "--runner", "claude-code", "--metrics"],  # the corpus path
     "secret.set": ["secret", "set", "nope"],
     "secret.list": ["secret", "list"],
     "secret.rm": ["secret", "rm", "nope"],
@@ -297,6 +297,40 @@ def test_cwd_is_applied_before_dispatch(box, capsys):
     assert code == 0 and Path(envelope(out)["data"]["cwd"]) == sub.resolve()
     code, out, _ = run(capsys, "status", "--json", f"--cwd={box}")
     assert Path(envelope(out)["data"]["cwd"]) == box.resolve()
+
+
+def corpus_file(box):
+    row = {
+        "id": "c-1",
+        "payload": {"kind": "command", "value": "ls"},
+        "expect": "allow",
+        "source": "control",
+        "why": "an everyday command",
+    }
+    path = box / "corpus.jsonl"
+    path.write_text(json.dumps(row) + "\n")
+    return path
+
+
+def test_a_replayed_corpus_is_one_envelope_with_its_metrics(box, capsys):
+    code, out, _ = run(
+        capsys, "gate", "replay", str(corpus_file(box)), "--runner", "claude-code", "--metrics", "--json"
+    )
+    env = envelope(out)
+    assert code == 0 and env["kind"] == "gate" and env["status"] == output.OK
+    assert env["data"]["rows"] == 1 and env["data"]["metrics"]["confusion"]["allow"]["allow"] == 1
+    assert env["data"]["results"][0]["id"] == "c-1" and env["data"]["differ"] == []
+
+
+def test_a_saved_decision_file_that_cannot_be_written_is_a_typed_io_error(box, capsys):
+    target = box / "missing folder" / "decisions.json"
+    code, out, _ = run(
+        capsys, "gate", "replay", str(corpus_file(box)), "--runner", "claude-code", "--save", str(target), "--json"
+    )
+    env = envelope(out)
+    assert code != 0 and env["status"] == "error" and env["error_kind"] == "io"
+    assert "decisions.json" in env["message"] and env["hint"]
+    assert not target.exists()
 
 
 def test_help_is_json_per_topic(box, capsys):

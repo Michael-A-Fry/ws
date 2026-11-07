@@ -110,7 +110,19 @@ def opencode_wall(tmp_path, wshome, command, flags: tuple[str, ...] = ()):
 # --- the matcher does not see them --------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("name", CASES)
+# Closed by the gate's command reader: a built part followed by a protected path is refused before the wall is needed.
+READER_CLOSED = ["built-path-read"]
+
+
+@pytest.mark.parametrize("name", READER_CLOSED)
+def test_the_reader_refuses_what_it_has_learned(tmp_path, wshome, work, secrets, monkeypatch, name):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    cmd = attacks(wshome, tmp_path / "home", work)[name]
+    protect = (str(wshome / "policy.toml"), *policy.control_paths(wshome))
+    assert policy.is_denied_command(policy.default_policy(), cmd, protect=protect, cwd=str(work)) is not None
+
+
+@pytest.mark.parametrize("name", [c for c in CASES if c not in READER_CLOSED])
 def test_the_matcher_lets_each_bypass_through(tmp_path, wshome, work, secrets, monkeypatch, name):
     """If the matcher ever learns one of these, ws.policy's "Known limits" is out of date: move it to what is closed."""
     monkeypatch.setenv("HOME", str(tmp_path / "home"))

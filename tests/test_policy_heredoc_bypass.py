@@ -10,7 +10,7 @@ import re
 
 import pytest
 
-from ws import policy
+from ws import policy, shellwords
 
 D = "rm" + " -rf /"
 
@@ -254,14 +254,14 @@ def test_a_good_step_beside_a_bad_one_does_not_make_the_bad_body_text(pol):
 
 def test_the_text_the_gate_reads_has_only_the_command_lines_of_an_allowed_shape():
     ok = "cat > a <<'A' && cat >> b <<-'B'\nx\nA\n\ty\n\tB\ntee c <<\"C\"\nz\nC\n"
-    assert policy._without_bodies(ok) == "cat > a <<'A' && cat >> b <<-'B'\ntee c <<\"C\"\n"
-    assert policy._without_bodies("cat <<'E'\nx\nE") == "cat <<'E'\n"  # the closing line needs no new line after it
-    assert policy._without_bodies("cat <<'E'\nx\n") is None  # never closed
-    assert policy._without_bodies("") is None
-    assert policy._without_bodies("\n\n") is None
-    assert policy._without_bodies("cat <<'E'\nx\nE \n") is None  # a trailing space does not close it
-    assert policy._without_bodies("cat <<'E'\nx\n\tE\n") is None  # a tab closes only <<-
-    assert policy._without_bodies("cat <<'Ｅ'\nx\nＥ\n") is None  # full-width letters are not a plain name
+    assert shellwords.without_bodies(ok) == "cat > a <<'A' && cat >> b <<-'B'\ntee c <<\"C\"\n"
+    assert shellwords.without_bodies("cat <<'E'\nx\nE") == "cat <<'E'\n"  # the closing line needs no new line after it
+    assert shellwords.without_bodies("cat <<'E'\nx\n") is None  # never closed
+    assert shellwords.without_bodies("") is None
+    assert shellwords.without_bodies("\n\n") is None
+    assert shellwords.without_bodies("cat <<'E'\nx\nE \n") is None  # a trailing space does not close it
+    assert shellwords.without_bodies("cat <<'E'\nx\n\tE\n") is None  # a tab closes only <<-
+    assert shellwords.without_bodies("cat <<'Ｅ'\nx\nＥ\n") is None  # full-width letters are not a plain name
 
 
 # --- the files a data-only step writes go through the same path checks -----------------------------------------------

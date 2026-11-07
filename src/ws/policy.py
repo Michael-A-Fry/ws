@@ -6,13 +6,16 @@ Stdlib only. Three jobs:
   * load and validate the file (PolicyError names the bad key);
   * `is_denied_command` / `is_denied_read` / `is_denied_search`: the one matcher every hook and shim calls. It is the
     second layer (the runner's own deny rules are the first, a sandbox the real wall): it catches the plausible
-    retries, not every spelling a shell allows;
+    retries, not every spelling a shell allows. It reads a command through ws.shellwords, the one reader every check
+    and guard shares, so a path is recognised however the shell is asked to spell it (quotes, brace groups, `~` and
+    `$HOME`, redirections, the value of an option);
   * `rule_of_two`: refuse a session that holds untrusted input, private data and a way out at the same time.
 
 Known limits of the matcher. It reads command text, so it cannot see:
   * what an interpreter does inside its own program (`python3 -c`, `perl -e`, `node -e`, a script it runs);
   * a script that is downloaded and run in two steps (`curl -o a.sh ... && bash a.sh`);
-  * a path built by a command (`cat "$(echo ~)/.ssh/id_rsa"`), or by a variable set outside the command line;
+  * a path built entirely by a command, or by a variable set outside the command line (a built part followed by a
+    protected path is refused);
   * the version-control tool restoring a protected tracked file (`git -C ~/.ws checkout policy.toml`);
   * OpenCode's `patch` tool, which carries no single file path (its native `edit` rules still apply).
 These stay allowed by the matcher. What closes them is the sandbox (ws.sandbox, and the `sandbox` block the
@@ -83,14 +86,17 @@ A call the policy lets through only with a human's say-so is `ask_commands`: see
 from __future__ import annotations
 
 import contextlib
+import itertools
 import os
 import posixpath
 import re
+import sys
 import tomllib
-import unicodedata
 from dataclasses import dataclass, field, replace
+from functools import lru_cache
 from pathlib import Path
 
+from ws import shellwords
 from ws.profile import ws_home
 
 SCHEMA = 1
@@ -103,6 +109,7 @@ EGRESS_TOOLS = ("web_fetch", "web_search")
 _NAME = re.compile(r"^[A-Za-z0-9_-]+$")
 _HOST = re.compile(r"^(\*\.)?[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?$")
 _MAX_DEPTH = 4
+_TOO_DEEP = "the command nests shells, substitutions or eval too deeply to check; write the inner command out plainly"
 MAX_COMMAND_CHARS = 64 * 1024  # a longer command takes longer to judge than a runner's hook may run
 
 
@@ -247,7 +254,7 @@ outward = []
 [gate]
 deny_commands = {arr(default_deny_commands())}
 # Paths no session may read. `~/` is your home; `**` crosses folders.
-deny_read = ["~/.ssh/**", "~/.gnupg/**", "~/.aws/credentials"]
+deny_read = ["~/.ssh/**", "~/.gnupg/**", "~/.aws/credentials", "~/.config/ws/secrets/**"]
 # Neutral tool names to switch off: {", ".join(KNOWN_TOOLS)}. An allowed web tool counts as a way out (leg C).
 deny_tools = []
 # Commands that run only after you approve that exact call, once: the gate refuses the first try and prints an id; in a
@@ -572,30 +579,7 @@ def rule_of_two(policy: Policy, sources: list[str], job: str | None = None, shel
 # model retries a blocked command (other flags, a wrapper, a pipe, a nested shell, a different path spelling). What it
 # cannot judge it denies or leaves to the layers either side.
 
-_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _FLAGS = re.compile(r"^-[A-Za-z]+$")
-_VAR = re.compile(r"\$\{(\w+)\}|\$(\w+)")
-_KEYWORDS = {"if", "then", "else", "elif", "do", "while", "until", "!", "{", "}", "coproc"}
-# wrapper -> short options that take the next word; _LONG_ARG: long options that do
-_WRAPPERS = {
-    "sudo": {"-u", "-g", "-h", "-p", "-C", "-D", "-R", "-T", "-U"},
-    "doas": {"-u", "-C"},
-    "env": {"-u", "-C"},
-    "command": set(),
-    "builtin": set(),
-    "exec": {"-a"},
-    "nohup": set(),
-    "nice": {"-n"},
-    "ionice": {"-c", "-n", "-p"},
-    "setsid": set(),
-    "stdbuf": {"-i", "-o", "-e"},
-    "timeout": {"-s", "-k"},
-    "time": set(),
-    "watch": {"-n"},
-    "xargs": {"-I", "-n", "-P", "-d", "-E", "-s", "-L", "-a", "-J"},
-    "busybox": set(),
-}
-_LONG_ARG = {"timeout": {"--signal", "--kill-after"}, "sudo": {"--user", "--group", "--host", "--prompt"}}
 _SHELL_NAMES = {"sh", "bash", "zsh", "dash", "ksh", "fish", "ash", "csh", "tcsh"}
 _GIT_ARG_OPTS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env"}
 # Commands whose operands are each judged on their own: `rm -rf / /tmp` is a delete of `/`.
@@ -605,7 +589,6 @@ _ALWAYS_RECURSIVE = {"tar", "find", "zip", "rsync", "tree", "du", "7z", "bsdtar"
 _WRITE_ALL = {"tee", "mv", "rm", "rmdir", "truncate", "chmod", "chown", "chgrp", "touch", "shred", "unlink", "patch"}
 _WRITE_LAST = {"cp", "install", "ln", "rsync", "scp"}
 _INTERP = re.compile(r"^(python[0-9.]*|perl|ruby|node|php)$")
-_PROCSUB = "/dev/fd/63"  # what `<(...)` becomes
 # Probes for "can the shell reach the network": a policy that denies all of them closes the shell as a way out.
 NET_PROBES = (
     "curl http://example.com",
@@ -634,9 +617,23 @@ class _Ctx:
     protect: tuple[str, ...] = ()
     vars: dict[str, str] | None = None
     heredocs: bool = False  # read the command line with here-document bodies left out (a second reading, never alone)
+    budget: shellwords.Budget = field(default_factory=shellwords.Budget)  # shared by every part of one command line
+    oldpwd: str = ""  # the folder before the last `cd` (`cd -`, `~-`, `$OLDPWD`)
+    loops: dict[str, list[str]] | None = None  # a `for` variable and the words it takes in turn
+    unknown: frozenset[str] = frozenset()  # names set more than once, appended to, or set inside a block
+    distrust: bool = False  # a part of the line ran a command that can set any variable: trust no value after it
 
     def fork(self) -> _Ctx:
-        return _Ctx(self.cwd, self.protect, dict(self.vars or {}))
+        return _Ctx(
+            self.cwd,
+            self.protect,
+            dict(self.vars or {}),
+            budget=self.budget,
+            oldpwd=self.oldpwd,
+            loops=self.loops,
+            unknown=self.unknown,
+            distrust=self.distrust,
+        )
 
 
 def _home() -> str:
@@ -650,20 +647,30 @@ def _cwd() -> str:
         return "/"
 
 
+@lru_cache(maxsize=8)
+def _base_env(home: str | None, ws: str | None) -> tuple[tuple[str, str], ...]:
+    """`HOME` and `WS_HOME` as a command word sees them, made once for the environment they come from."""
+    return (("HOME", _home().rstrip("/") or "/"), ("WS_HOME", str(ws_home())))
+
+
+def _env(known: dict[str, str] | None = None, cwd: str = "", oldpwd: str = "") -> dict[str, str]:
+    """The variables a command word may use: `HOME` and `WS_HOME`, the folder the command runs in as `PWD` (and the one
+    before the last `cd` as `OLDPWD`) when it is given, then what earlier parts of the line set."""
+    where = {"PWD": cwd} if cwd else {}
+    if oldpwd:
+        where["OLDPWD"] = oldpwd
+    return {**dict(_base_env(os.environ.get("HOME"), os.environ.get("WS_HOME"))), **where, **(known or {})}
+
+
 def _expand(path: str) -> str:
-    """~, ~user, $HOME, ${HOME}, $WS_HOME and ${WS_HOME} to a real prefix."""
-    home = _home().rstrip("/")
-    for pre in ("${HOME}", "$HOME", "~"):
-        if path == pre or path.startswith(pre + "/"):
-            return home + path[len(pre) :]
-    for pre in ("${WS_HOME}", "$WS_HOME"):
-        if path == pre or path.startswith(pre + "/"):
-            return str(ws_home()).rstrip("/") + path[len(pre) :]
-    return os.path.expanduser(path) if path.startswith("~") else path
+    """~, ~user, $HOME, ${HOME}, $WS_HOME and ${WS_HOME} to a real prefix: a path as a rule or a tool writes it."""
+    return shellwords.expand_path(path, _env()) if path[:1] in ("~", "$") else path
 
 
-def _abs(path: str, cwd: str) -> str:
-    p = _expand(path)
+def _abs(path: str, cwd: str, expand: bool = True) -> str:
+    """The path as an absolute, normalised one. A word of a command was expanded when it was read (a quoted `~` is a
+    folder of that name), so it is passed with `expand=False`; a path from a rule or a tool is expanded here."""
+    p = _expand(path) if expand else path
     if not p.startswith("/"):
         p = posixpath.join(cwd, p)
     return posixpath.normpath(re.sub(r"^/{2,}", "/", p))
@@ -754,523 +761,11 @@ def _git_normal(toks: list[str]) -> list[str]:
     return toks
 
 
-_ANSI_ESCAPES = {"a": "\a", "b": "\b", "e": "\x1b", "E": "\x1b", "f": "\f", "n": "\n", "r": "\r", "t": "\t", "v": "\v"}
-_ANSI_NUMBER = {
-    "x": re.compile(r"[0-9A-Fa-f]{1,2}"),
-    "u": re.compile(r"[0-9A-Fa-f]{1,4}"),
-    "U": re.compile(r"[0-9A-Fa-f]{1,8}"),
-}
-_ANSI_OCTAL = re.compile(r"[0-7]{1,3}")
-
-
-def _ansi_c(seg: str, i: int) -> tuple[str, int]:
-    """The text of a `$'...'` word whose body starts at i, and the index after its closing quote: backslash escapes
-    are decoded as bash does (newline, hex, octal and unicode escapes, `\\'`), so `$'r\\x6d'` is the word `rm`. An
-    escape it does not know stays as written."""
-    out: list[str] = []
-    n = len(seg)
-    while i < n:
-        c = seg[i]
-        if c == "'":
-            return "".join(out), i + 1
-        if c != "\\" or i + 1 >= n:
-            out.append(c)
-            i += 1
-            continue
-        d = seg[i + 1]
-        if d in _ANSI_ESCAPES:
-            out.append(_ANSI_ESCAPES[d])
-            i += 2
-        elif d in "\\'\"?":
-            out.append(d)
-            i += 2
-        elif d in _ANSI_NUMBER and (m := _ANSI_NUMBER[d].match(seg, i + 2)):
-            out.append(chr(min(int(m.group(), 16), 0x10FFFF)))
-            i = m.end()
-        elif d in "01234567":
-            m = _ANSI_OCTAL.match(seg, i + 1)
-            out.append(chr(int(m.group(), 8) & 0xFF))
-            i = m.end()
-        elif d == "c" and i + 2 < n:
-            out.append(chr(ord(seg[i + 2]) & 0x1F))
-            i += 3
-        else:
-            out.append("\\" + d)
-            i += 2
-    return "".join(out), n
-
-
-def _lex(seg: str) -> tuple[list[str], list[tuple[str, str]]]:
-    """Split one shell segment into words (quotes and escapes resolved) and redirections [(op, target)]. A
-    redirection glued to a word (`/>/dev/null`, `<~/.ssh/id`, `2>&1`) is split off it."""
-    words: list[str] = []
-    redirs: list[tuple[str, str]] = []
-    n, i = len(seg), 0
-
-    def word(i: int) -> tuple[str, int]:
-        buf: list[str] = []
-        while i < n:
-            c = seg[i]
-            if c in " \t\r\n<>":
-                break
-            if c == "\\" and i + 1 < n:
-                buf.append(seg[i + 1])
-                i += 2
-            elif c == "'":
-                j = seg.find("'", i + 1)
-                j = n if j < 0 else j
-                buf.append(seg[i + 1 : j])
-                i = j + 1
-            elif seg.startswith("$'", i):
-                text, i = _ansi_c(seg, i + 2)
-                buf.append(text)
-            elif seg.startswith('$"', i):  # locale quoting reads as double quotes
-                i += 1
-            elif c == '"':
-                i += 1
-                while i < n and seg[i] != '"':
-                    if seg[i] == "\\" and i + 1 < n and seg[i + 1] in '"\\$`':
-                        i += 1
-                    buf.append(seg[i])
-                    i += 1
-                i += 1
-            elif seg.startswith("$(", i):
-                j = _close_paren(seg, i + 2)
-                buf.append(seg[i : j + 1])
-                i = j + 1
-            else:
-                buf.append(c)
-                i += 1
-        return "".join(buf), i
-
-    while i < n:
-        c = seg[i]
-        if c in " \t\r\n":
-            i += 1
-        elif c in "<>":
-            for op in ("<<<", "<<-", "<<", "<&", "<>", "<", ">>", ">|", ">&", ">"):
-                if seg.startswith(op, i) and op[0] == c:
-                    break
-            i += len(op)
-            while i < n and seg[i] in " \t":
-                i += 1
-            target, i = word(i)
-            if op.endswith("&") and (target.isdigit() or target == "-"):
-                continue  # 2>&1, <&-
-            redirs.append((op, target))
-        else:
-            start = i
-            w, i = word(i)
-            glued_fd = w.isdigit() and i < n and seg[i] in "<>"
-            if not (glued_fd or (w == "&" and seg[i : i + 1] == ">") or (i == start)):
-                words.append(w)
-    return words, redirs
-
-
-def _strip_wrappers(words: list[str], env: list[str] | None = None) -> tuple[list[str], set[str]]:
-    """Drop leading keywords, VAR=value and exec wrappers (sudo, env, timeout, nice, xargs, busybox ...): what is left
-    is the command that really runs. Also returns the wrappers it removed. If `env` is given, the VAR=value words it
-    drops (a prefix, or the ones `env` sets) are added to it."""
-    toks, seen = list(words), set()
-    while toks:
-        w = toks[0]
-        if w in _KEYWORDS or _ASSIGN.match(w):
-            if env is not None and _ASSIGN.match(w):
-                env.append(w)
-            toks = toks[1:]
-            continue
-        if w.startswith("/") and "/" in w[1:]:
-            w = toks[0] = posixpath.basename(w)  # /usr/bin/rm -> rm
-        if w not in _WRAPPERS:
-            break
-        seen.add(w)
-        arg_opts, i, resplit = _WRAPPERS[w], 1, None
-        while i < len(toks):
-            t = toks[i]
-            if t == "--":
-                i += 1
-                break
-            if w == "env" and t in ("-S", "--split-string"):
-                resplit = toks[i + 1] if i + 1 < len(toks) else ""
-                i += 2
-                break
-            if t.startswith("--"):
-                i += 2 if t in _LONG_ARG.get(w, ()) else 1
-            elif t.startswith("-") and len(t) > 1:
-                i += 2 if "-" + t[-1] in arg_opts else 1  # `-u root`, and the `u` of `-iu root`
-            elif w == "env" and _ASSIGN.match(t):
-                if env is not None:
-                    env.append(t)
-                i += 1
-            else:
-                break
-        if w == "timeout" and i < len(toks):
-            i += 1  # the duration
-        toks = (_lex(resplit)[0] if resplit else []) + toks[i:]
-    return toks, seen
-
-
 def _canon_tokens(tokens: list[str]) -> list[str]:
     if tokens and tokens[0] == "git":
         tokens = _git_normal(tokens)
     tokens = _merge_flags(tokens)
     return [_canon_path(t) if _is_pathlike(t) else t for t in tokens]
-
-
-def _prep(cmd: str) -> str:
-    """Line continuations joined, full-width characters folded, ${IFS} read as the space it is."""
-    cmd = _join_lines(unicodedata.normalize("NFKC", cmd))
-    return re.sub(r"\$\{IFS\}|\$IFS\b", " ", cmd)
-
-
-def _join_lines(cmd: str) -> str:
-    """Backslash-newline pairs removed, as the shell does, except in a comment: a comment ends at its newline whatever
-    precedes it, so a comment's trailing backslash must not swallow the line below. Quotes, `$'...'`, `$(...)` and
-    backticks are tracked so that a `#` inside them is not taken for a comment; an escaped character is a pair."""
-    out: list[str] = []
-    n, i, quote = len(cmd), 0, ""
-    while i < n:
-        c = cmd[i]
-        if quote == "'":  # no escapes inside; a backslash-newline is joined here as it always was
-            if cmd.startswith("\\\n", i):
-                i += 2
-                continue
-            quote = "" if c == "'" else quote
-        elif c == "\\" and i + 1 < n:
-            if cmd[i + 1] != "\n":
-                out.append(cmd[i : i + 2])
-            i += 2
-            continue
-        elif quote == "$'":
-            quote = "" if c == "'" else quote
-        elif cmd.startswith("$(", i) or (c == "`" and _backtick_end(cmd, i) > 0):
-            if c == "`":
-                j, head, tail = _backtick_end(cmd, i), "`", "`"
-            else:
-                j, head, tail = _close_paren(cmd, i + 2), "$(", ")"
-            out += [head, _join_lines(cmd[i + len(head) : j])]
-            if j < n:
-                out.append(tail)
-            i = j + 1
-            continue
-        elif quote == '"':
-            quote = "" if c == '"' else quote
-        elif c == "$" and cmd.startswith("$'", i):
-            quote = "$'"
-            out.append("$")
-            i += 1
-            c = "'"
-        elif c in "'\"":
-            quote = c
-        elif c == "#" and (not out or out[-1][-1:] in (" ", "\t", "\n", ";", "&", "|", "(", ")")):
-            eol = cmd.find("\n", i)
-            eol = n if eol < 0 else eol
-            out.append(cmd[i:eol].rstrip("\\"))  # a trailing backslash would escape the newline in a later scan
-            i = eol
-            continue
-        out.append(c)
-        i += 1
-    return "".join(out)
-
-
-_HEREDOC_WORD = re.compile(r"<<(-?)[ \t]*(?:'([^']*)'|\"([^\"]*)\"|\\?([A-Za-z_][A-Za-z0-9_]*))")
-
-_IFS = re.compile(r"\$\{IFS\}|\$IFS\b")
-
-
-def _folds(command: str) -> bool:
-    """Would _prep change the characters the shell sees (full-width letters read as plain ones, `$IFS` as a space)?
-    Closing words are matched on the text the shell reads, so such a line can't be trusted to close a body."""
-    return unicodedata.normalize("NFKC", command) != command or _IFS.search(command) is not None
-
-
-# The one shape of command whose here-document bodies are left unread, because the shell can only treat them as text:
-# steps of `cat` or `tee`, each with plain-word arguments, at most one `>` or `>>` to a plain-word path and one
-# here-document opener with a quoted name, joined by `;`, `&&` or a new line. Anything else anywhere in the command
-# (a pipe, a group, a function, a variable, a substitution, a comment, an unquoted opener, a here-string, another
-# program) and every body is read as commands.
-_PLAIN = r"[A-Za-z0-9_./,:@%+-]+"
-_OPENER = r"<<-?(?:'[A-Za-z_][A-Za-z0-9_]*'|\"[A-Za-z_][A-Za-z0-9_]*\")"
-_REDIRECT = rf"[ \t]+>>?[ \t]*{_PLAIN}"
-_STEP = re.compile(rf"(?:cat|tee)(?:[ \t]+{_PLAIN})*(?P<r1>{_REDIRECT})?[ \t]+(?P<open>{_OPENER})(?P<r2>{_REDIRECT})?")
-_STEPS = re.compile(r";|&&")
-
-
-def _without_bodies(command: str) -> str | None:
-    """The command with the body and closing line of each here-document taken out, when every line of it is the
-    shape above and every body closes on its exact closing line; None otherwise (read the whole text as commands)."""
-    if _prep(command) != command or "\\\n" in command:
-        return None
-    out: list[str] = []
-    i, n = 0, len(command)
-    while i < n:
-        eol = command.find("\n", i)
-        eol = n if eol < 0 else eol
-        line, i = command[i:eol], eol + 1
-        out.append(line)
-        if not line:
-            continue
-        opened: list[tuple[str, bool]] = []
-        for step in _STEPS.split(line):
-            m = _STEP.fullmatch(step.strip(" \t"))
-            if not m or (m["r1"] and m["r2"]):
-                return None
-            opened.append((m["open"].lstrip("<-")[1:-1], m["open"].startswith("<<-")))
-        i = _after_bodies(command, i, opened)
-        if i is None:
-            return None
-    return "\n".join(out) + "\n" if any(out) else None
-
-
-def _closes(line: str, word: str, indented: bool) -> bool:
-    """Does this line end a here-document? The shell takes the line as it is, word and nothing else; `<<-` also lets
-    leading tabs (only tabs) go."""
-    return (line.lstrip("\t") if indented else line) == word
-
-
-def _arithmetic(body: str) -> bool:
-    """Is the text between `$(` and its closing `)` really `((...))`, shell arithmetic?"""
-    return body.startswith("(") and body.endswith(")")
-
-
-def _after_bodies(cmd: str, i: int, opened: list[tuple[str, bool]]) -> int | None:
-    """The index after the closing lines of the here-documents a line opened (closing word, may be indented), whose
-    bodies start at `i`, the start of the next line. None when one never closes (the shell would take the rest of the
-    text as its body; here that is read as commands, so a typo can't hide a command)."""
-    n = len(cmd)
-    for word, indented in opened:
-        while True:
-            if i >= n:
-                return None
-            eol = cmd.find("\n", i)
-            eol = n if eol < 0 else eol
-            line, i = cmd[i:eol], eol + 1
-            if _closes(line, word, indented):
-                break
-    return i
-
-
-def _scan(
-    cmd: str, heredocs: bool = False, end: dict | None = None, flow: list | None = None
-) -> tuple[list[list[str]], list[str]]:
-    """Split a shell command line. Returns (pipelines, inner): each pipeline is a list of segments (split on |, |&),
-    pipelines are split on ; && || & newline ( ); inner holds the text of $(...), backticks and <(...), which run too.
-    With `heredocs`, the body and closing line of each here-document are left out (that text is data for a program,
-    not commands): a `<<WORD` starts one only outside quotes and comments, and not as `<<<` or a shift in `((...))` or inside `${...}` and `$[...]`, which are one word. If `end` is given,
-    end["quote"] is the quote still open at the end of the text (empty if none). If `flow` is given, it gets the order the
-    line runs in: the index of each pipeline as it ends, and between them the operator that came next (`;`, `&&`, `||`,
-    `&`, `(` or `)`; a newline is `;`)."""
-    pipelines: list[list[str]] = []
-    inner: list[str] = []
-    segs: list[str] = []
-    buf: list[str] = []
-    waiting: list[tuple[str, bool]] = []  # (closing word, may be indented) of the here-documents the line opened
-    nest: list[str] = []  # the closers still owed by the ${...} and $[...] we are inside
-    n, i, quote = len(cmd), 0, ""
-
-    def sub(body: str) -> str:  # the text of a $(...) that is really `$((a<<b))` arithmetic: its `<<` is a shift
-        return body.replace("<<", "< <") if heredocs and _arithmetic(body) else body
-
-    def end_seg() -> None:
-        s = "".join(buf).strip()
-        buf.clear()
-        if s:
-            segs.append(s)
-
-    def end_pipeline(op: str = "") -> None:
-        nonlocal segs
-        end_seg()
-        if segs:
-            pipelines.append(segs)
-            if flow is not None:
-                flow.append(len(pipelines) - 1)
-        segs = []
-        if op and flow is not None:
-            flow.append(op)
-
-    while i < n:
-        c = cmd[i]
-        if c == "\\" and quote != "'" and i + 1 < n:
-            buf.append(cmd[i : i + 2])
-            i += 2
-            continue
-        if quote:
-            if c == quote[-1]:
-                quote = ""
-            elif quote == '"' and c == "`":
-                j = _backtick_end(cmd, i)
-                if j > 0:
-                    inner.append(_unbacktick(cmd[i + 1 : j]))
-            elif quote == '"' and cmd.startswith("$(", i):
-                j = _close_paren(cmd, i + 2)
-                inner.append(sub(cmd[i + 2 : j]))
-            buf.append(c)
-            i += 1
-            continue
-        if c == "$" and cmd[i + 1 : i + 2] in ("{", "["):  # a parameter expansion or $[...] arithmetic: one word
-            nest.append("}" if cmd[i + 1] == "{" else "]")
-            buf.append(cmd[i : i + 2])
-            i += 2
-            continue
-        if nest and c == "[" and nest[-1] == "]":
-            nest.append("]")
-        elif nest and c == nest[-1]:
-            nest.pop()
-        heredocs_here = (
-            heredocs and not nest
-        )  # in ${...} and $[...], `#` and `<<` are operators, not comment or here-doc
-        if heredocs_here and c == "#" and (not buf or buf[-1] in " \t"):  # a comment: not commands, no here-document
-            eol = cmd.find("\n", i)
-            i = n if eol < 0 else eol
-            continue
-        if heredocs_here and c == "<" and cmd.startswith("<<<", i):  # a here-string: its word is data, not a delimiter
-            buf.append("<<<")
-            i += 3
-            continue
-        if heredocs_here and c == "<" and cmd.startswith("<<", i):
-            m = _HEREDOC_WORD.match(cmd, i)
-            if m:
-                waiting.append((m.group(2) or m.group(3) or m.group(4) or "", m.group(1) == "-"))
-                buf.append(m.group(0))
-                i = m.end()
-                continue
-        if heredocs and c == "\n" and waiting:
-            end_pipeline(";")
-            i += 1
-            for word, indented in waiting:  # skip each body, up to and including its closing line
-                while i < n:
-                    eol = cmd.find("\n", i)
-                    eol = n if eol < 0 else eol
-                    line = cmd[i:eol]
-                    i = eol + 1
-                    if _closes(line, word, indented):
-                        break
-            waiting.clear()
-            continue
-        if heredocs_here and c == "(" and cmd.startswith("((", i) and not buf:  # an arithmetic command: `((x<<2))`
-            j = _close_paren(cmd, i + 1)
-            if _arithmetic(cmd[i + 1 : j]):
-                inner.append(sub(cmd[i + 1 : j])[1:-1])
-                i = j + 1
-                continue
-        if c == "$" and cmd.startswith("$'", i):  # ANSI-C quoting: backslash escapes work inside, `\'` included
-            quote = "$'"
-            buf.append("$'")
-            i += 2
-            continue
-        if c in "'\"":
-            quote = c
-            buf.append(c)
-        elif c == "`":
-            j = _backtick_end(cmd, i)
-            j = n if j < 0 else j
-            inner.append(_unbacktick(cmd[i + 1 : j]))
-            buf.append(cmd[i : j + 1])
-            i = j + 1
-            continue
-        elif cmd.startswith("$(", i):
-            j = _close_paren(cmd, i + 2)
-            inner.append(sub(cmd[i + 2 : j]))
-            buf.append(cmd[i : j + 1])
-            i = j + 1
-            continue
-        elif c in "<>" and cmd.startswith("(", i + 1):  # process substitution: a file name to the outer command
-            j = _close_paren(cmd, i + 2)
-            inner.append(cmd[i + 2 : j])
-            buf.append(" " + _PROCSUB + " " if c == "<" else " /dev/null ")
-            i = j + 1
-            continue
-        elif c in ";\n()":
-            end_pipeline(";" if c == "\n" else c)
-        elif c == "&":
-            if i > 0 and cmd[i - 1] in "<>" or cmd[i + 1 : i + 2] == ">":  # 2>&1, &>file
-                buf.append(c)
-            elif cmd[i + 1 : i + 2] == "&":
-                end_pipeline("&&")
-                i += 1
-            else:
-                end_pipeline("&")
-        elif c == "|" and i > 0 and cmd[i - 1] == ">":  # >| (clobber redirect)
-            buf.append(c)
-        elif c == "|":
-            if cmd[i + 1 : i + 2] == "|":
-                end_pipeline("||")
-                i += 1
-            else:
-                end_seg()
-                if cmd[i + 1 : i + 2] == "&":
-                    i += 1
-        else:
-            buf.append(c)
-        i += 1
-    end_pipeline()
-    if end is not None:
-        end["quote"] = quote
-    return pipelines, inner
-
-
-def _backtick_end(cmd: str, i: int) -> int:
-    """Index of the backtick that closes the one at `i`, or -1. A backslash escapes the next character, so an escaped
-    backtick belongs to a command nested inside."""
-    i += 1
-    while i < len(cmd):
-        if cmd[i] == "\\":
-            i += 2
-        elif cmd[i] == "`":
-            return i
-        else:
-            i += 1
-    return -1
-
-
-def _unbacktick(text: str) -> str:
-    """The command inside a backtick pair, as the shell reads it: `\\``, `\\$` and `\\\\` lose their backslash."""
-    return re.sub(r"\\([`$\\])", r"\1", text)
-
-
-def _close_paren(cmd: str, i: int) -> int:
-    """Index of the ')' that closes a '$(' whose body starts at i (the end of the text if it never closes)."""
-    depth, quote = 1, ""
-    while i < len(cmd):
-        c = cmd[i]
-        if c == "\\" and quote != "'":
-            i += 2
-            continue
-        if quote:
-            quote = "" if c == quote[-1] else quote
-        elif c == "$" and cmd.startswith("$'", i):  # ANSI-C quoting: a backslash escapes inside it
-            quote = "$'"
-            i += 1
-        elif c in "'\"":
-            quote = c
-        elif c == "(":
-            depth += 1
-        elif c == ")":
-            depth -= 1
-            if depth == 0:
-                return i
-        i += 1
-    return len(cmd)
-
-
-def _args(toks: list[str]) -> tuple[list[str], list[str]]:
-    """(flags, operands) of a command: anything starting with '-' is a flag until a bare `--`."""
-    flags, operands, after = [], [], False
-    for t in toks[1:]:
-        if after:
-            operands.append(t)
-        elif t == "--":
-            after = True
-        elif t.startswith("-") and len(t) > 1:
-            flags.append(t)
-        else:
-            operands.append(t)
-    return flags, operands
-
-
-def _cluster(flags: list[str], letter: str) -> bool:
-    """Is `letter` in any single-dash flag group (`-c`, `-lc`, `-ec`)?"""
-    return any(f[0] == "-" and f[1:2] != "-" and letter in f[1:] for f in flags)
 
 
 # --- paths: deny_read, protected files ----------------------------------------------------------------------------
@@ -1298,6 +793,11 @@ def _glob_class(pattern: str, i: int) -> tuple[str, int] | None:
     return "[" + ("^" if neg else "") + "".join(parts) + "]", j
 
 
+# macOS file systems are case-insensitive by default: `~/.SSH/ID_RSA` is the same file as `~/.ssh/id_rsa`, so path rules
+# match without regard to case there. (Linux file systems are case-sensitive.)
+CASELESS_PATHS = sys.platform == "darwin"
+
+
 def _glob_regex_path(pattern: str) -> re.Pattern:
     out, i = [], 0
     while i < len(pattern):
@@ -1320,7 +820,7 @@ def _glob_regex_path(pattern: str) -> re.Pattern:
         else:
             out.append(re.escape(c))
         i += 1
-    return re.compile("".join(out) + r"\Z", re.DOTALL)
+    return re.compile("".join(out) + r"\Z", re.DOTALL | (re.IGNORECASE if CASELESS_PATHS else 0))
 
 
 def _path_regex(pattern: str) -> re.Pattern:
@@ -1386,21 +886,55 @@ def _glob_reaches(policy: Policy, token_abs: str) -> str | None:
     return None
 
 
-def _read_hit(policy: Policy, path: str, cwd: str, recursive: bool = False, folder: bool = True) -> str | None:
+@lru_cache(maxsize=16)
+def _rules(deny_read: tuple[str, ...], home: str, ws: str) -> tuple[tuple[str, re.Pattern, str | None], ...]:
+    """Each deny_read rule with its pattern and root, made once for a home and ws home (`home` and `ws` are only the
+    cache key: the expansion reads the same environment)."""
+    return tuple((rule, _path_regex(rule), _rule_root(rule)) for rule in deny_read)
+
+
+_KNOWN_NAMES = ("HOME", "WS_HOME", "PWD", "OLDPWD")
+_UNSET = re.compile(r"\$(?:\{[^}]*\}|\([^)]*\)|[A-Za-z_][A-Za-z0-9_]*)|`[^`]*`")
+
+
+def _unset_hit(policy: Policy, path: str, cwd: str) -> str | None:
+    """A word of a command that still holds a variable or command the reader could not know (`/home/$USER/x`,
+    `$(pwd)/x`) could name a protected path for some value of it. It is refused when what follows the last such part
+    is a protected path under the home folder (`/home/$USER/` then a denied folder), or on its own; a word that is only
+    the variable (`$FILE`) or ends in it says nothing about where it points, and is left alone."""
+    found = [
+        m for m in _UNSET.finditer(path) if m.group().strip("${}") not in _KNOWN_NAMES
+    ]  # (a known name is quoted text)
+    rest = path[found[-1].end() :] if found else ""
+    if not rest.startswith("/"):
+        return None
+    for form in (_home().rstrip("/") + rest, rest):
+        if hit := _read_hit(policy, form, cwd, expand=False):
+            return hit
+    return None
+
+
+def _read_hit(
+    policy: Policy, path: str, cwd: str, recursive: bool = False, folder: bool = True, expand: bool = True
+) -> str | None:
     """The deny_read rule a path falls under, or None. With `folder`, naming the denied folder itself counts; with
-    `recursive`, so does a folder above it (`grep -r x ~` reads `~/.ssh` too)."""
+    `recursive`, so does a folder above it (`grep -r x ~` reads `~/.ssh` too). `expand` is False for a word of a
+    command, which the reader has already expanded."""
     if not policy.gate.deny_read or not path:
         return None
-    p = _abs(path, cwd)
+    p = _abs(path, cwd, expand)
+    resolvable = shellwords.check_path(p)
+    if not expand and ("$" in path or "`" in path) and (hit := _unset_hit(policy, path, cwd)):
+        return hit
     if re.search(r"[*?\[]", p):
         return _glob_reaches(policy, p)
     forms = {p}
-    try:
-        forms.add(os.path.realpath(p))  # a symlink into a denied folder is still that folder
-    except OSError:
-        pass
-    for rule in policy.gate.deny_read:
-        rx, root = _path_regex(rule), _rule_root(rule)
+    if resolvable:
+        try:
+            forms.add(os.path.realpath(p))  # a symlink into a denied folder is still that folder
+        except OSError:
+            pass
+    for rule, rx, root in _rules(policy.gate.deny_read, _home(), os.environ.get("WS_HOME", "")):
         for f in forms:
             if rx.match(f):
                 return rule
@@ -1417,10 +951,13 @@ def _under(paths: tuple[str, ...], path: str, cwd: str, ancestors: bool = False)
     """The protected path that `path` is, or is inside. With `ancestors`, also one that is inside `path`: removing,
     moving or unpacking over a folder takes everything under it too."""
     p = _abs(path, cwd)
-    forms = {p, os.path.realpath(p)}
+    forms = {p, os.path.realpath(p)} if shellwords.check_path(p) else {p}
+    if CASELESS_PATHS:
+        forms = {f.casefold() for f in forms}
     for q in paths:
         qa = _abs(q, cwd)
         for target in {qa, os.path.realpath(qa)}:
+            target = target.casefold() if CASELESS_PATHS else target
             if any(
                 f == target or f.startswith(target + "/") or (ancestors and target.startswith(f + "/")) for f in forms
             ):
@@ -1431,26 +968,7 @@ def _under(paths: tuple[str, ...], path: str, cwd: str, ancestors: bool = False)
 # --- one command line ---------------------------------------------------------------------------------------------
 
 
-def _expand_vars(seg: str, ctx: _Ctx) -> str:
-    known = ctx.vars or {}
-    return _VAR.sub(lambda m: known.get(m.group(1) or m.group(2), m.group(0)), seg) if known else seg
-
-
-_BRACE = re.compile(r"\{([^{}]*,[^{}]*)\}")
 _FETCHERS = {"curl", "wget", "nc", "ncat", "ssh", "scp", "ftp", "fetch"}
-
-
-def _braces(word: str, limit: int = 32) -> list[str]:
-    """`x{1,2}y` -> x1y, x2y (one shell word becomes several)."""
-    m = _BRACE.search(word)
-    if not m:
-        return [word]
-    out: list[str] = []
-    for alt in m.group(1).split(","):
-        out += _braces(word[: m.start()] + alt + word[m.end() :], limit)
-        if len(out) >= limit:
-            break
-    return out[:limit]
 
 
 def _dotted(op: str, cwd: str) -> str:
@@ -1458,22 +976,6 @@ def _dotted(op: str, cwd: str) -> str:
     if op and not op.startswith(("/", "~", "$", "-")) and re.fullmatch(r"[./*]+", op):
         return _canon_path(_abs(op, cwd))
     return op
-
-
-def _opt_values(toks: list[str], letters: str = "", longs: tuple[str, ...] = ()) -> list[str]:
-    """The values given to an option: `-o X`, `-sSLo X` (the option last in a group), `--output X`, `--output=X`."""
-    out = []
-    for i, t in enumerate(toks[1:], 1):
-        nxt = toks[i + 1] if i + 1 < len(toks) else None
-        if t.startswith("--"):
-            for lg in longs:
-                if t == lg and nxt is not None:
-                    out.append(nxt)
-                elif t.startswith(lg + "="):
-                    out.append(t.split("=", 1)[1])
-        elif re.fullmatch(r"-[A-Za-z]+", t) and t[-1] in letters and nxt is not None:
-            out.append(nxt)
-    return out
 
 
 _ADMIN = {"secret", "broker", "approve", "uninstall"}
@@ -1517,8 +1019,8 @@ def _walk(policy: Policy, cmd: str, ctx: _Ctx, depth: int, cands: list[str]) -> 
     """Look at every part of a command line. Fills `cands` with the strings the deny globs are tried on and returns
     the reason at once for the checks that are not globs (pipe into a shell, denied paths, protected files)."""
     if depth > _MAX_DEPTH:
-        raise ValueError("command nests too deeply to check")
-    pipelines, inner = _scan(_prep(cmd), heredocs=ctx.heredocs and depth == 0)
+        raise shellwords.ShellError("too_deep", _TOO_DEEP)
+    pipelines, inner = shellwords.scan(shellwords.prep(cmd), heredocs=ctx.heredocs and depth == 0)
     nested: list[str] = list(inner)
     for segs in pipelines:
         canon_segs = []
@@ -1537,27 +1039,203 @@ def _walk(policy: Policy, cmd: str, ctx: _Ctx, depth: int, cands: list[str]) -> 
     return None
 
 
+_DECLARERS = ("export", "declare", "typeset", "local", "readonly")
+_READ_TAKES = frozenset(["a", "d", "i", "n", "N", "p", "t", "u"])  # the options of `read` that take a value
+_MAX_LOOP_WORDS = 64  # different words a `for` list may hold before a command that uses its variable is refused
+_MAX_LOOP_RUNS = 256  # readings of one command for the words of the `for` loops around it
+
+
+def _read_values(toks: list[str], redirs: list[shellwords.Redirect]) -> dict[str, str]:
+    """The variables `read -r NAME... <<< word` sets: the word split on blanks, the last name taking the rest."""
+    here = [t for op, t in redirs if op == "<<<"]
+    if not here:
+        return {}
+    names: list[str] = []
+    i = 1
+    while i < len(toks):
+        t = toks[i]
+        if t == "--":
+            names += toks[i + 1 :]
+            break
+        if t.startswith("-") and len(t) > 1:
+            i += 2 if t[-1] in _READ_TAKES else 1
+        else:
+            names.append(t)
+            i += 1
+    if not names:
+        return {"REPLY": here[-1]}
+    parts = here[-1].split(None, len(names) - 1)
+    return {n: (parts[k] if k < len(parts) else "") for k, n in enumerate(names) if shellwords.ASSIGN.match(n + "=")}
+
+
+def _loop_words(words: list[str]) -> list[str]:
+    """The words of a `for` list, one reading each: a run of numbers counts as three (it is the same command with
+    other numbers in it), and a list longer than _MAX_LOOP_WORDS is refused."""
+    out: list[str] = []
+    numbers = 0
+    for w in words:
+        if w.isdigit():
+            numbers += 1
+            if numbers > 3:
+                continue
+        if w not in out:
+            out.append(w)
+    if len(out) > _MAX_LOOP_WORDS:
+        raise shellwords.ShellError(
+            "too_many_words",
+            f"a for loop takes more than {_MAX_LOOP_WORDS} different words; use a file and a read loop",
+        )
+    return out
+
+
 def _segment(policy: Policy, seg: str, ctx: _Ctx, in_pipe: bool, cands: list[str]) -> tuple[str | None, str, list[str]]:
+    """One pipeline segment, judged once for each word its `for` variables take (a loop's body runs for every word of
+    its list), and the first refusal returned."""
+    used = [n for n in ctx.loops or {} if re.search(r"\$\{?" + re.escape(n) + r"(?![A-Za-z0-9_])", seg)]
+    if not used:
+        return _segment_once(policy, seg, ctx, in_pipe, cands, {})
+    assert ctx.loops is not None
+    runs = list(itertools.product(*(ctx.loops[n] for n in used)))
+    if len(runs) > _MAX_LOOP_RUNS:
+        raise shellwords.ShellError(
+            "too_many_words", "the for loops around this command take too many word combinations"
+        )
+    nested: list[str] = []
+    last: tuple[str, list[str]] = ("", [])
+    for run in runs:
+        reason, canon, more = _segment_once(policy, seg, ctx, in_pipe, cands, dict(zip(used, run, strict=True)))
+        if reason:
+            return reason, canon, more
+        last = (canon, more)
+        nested += more
+    return None, last[0], nested
+
+
+_APPEND = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\+=")
+_BLOCK_WORDS = ("do", "then", "else", "elif", "{", "(", "!", "time", "if", "while", "until")
+
+
+def _assign(ctx: _Ctx, values: dict[str, str]) -> None:
+    """Record what a part of the line sets. A name set a second time becomes unknown: the reader doesn't follow which
+    assignment ran (a subshell, a branch that didn't run, a pipe stage), so it never guesses."""
+    known = dict(ctx.vars or {})
+    again = {name for name in values if name in known or name in ctx.unknown or ctx.distrust}
+    if ctx.loops:
+        again |= set(values) & set(ctx.loops)
+        ctx.loops = {k: v for k, v in ctx.loops.items() if k not in values}
+    for name in again:
+        known.pop(name, None)
+    known.update({name: value for name, value in values.items() if name not in again})
+    ctx.vars, ctx.unknown = known, ctx.unknown | again
+
+
+def _mark_unknown(ctx: _Ctx, seg: str, words: list[str]) -> None:
+    """Names this part of the line sets in a way the reader doesn't follow become unknown: an append (`X+=`), an
+    assignment inside a block or a loop body, and one written ahead of a command (it lasts for that command only)."""
+    names = {m.group(1) for w in words if (m := _APPEND.match(w))}
+    names |= {m.group(1) for m in re.finditer(r"(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]*)\+=", seg)}
+    rest = list(words)
+    while rest and rest[0] in _BLOCK_WORDS:  # `do X=1`, `then X=1`, `{ X=1`: set inside a block or a loop body
+        rest = rest[1:]
+    lead = list(itertools.takewhile(shellwords.ASSIGN.match, rest))
+    if lead and (len(rest) > len(lead) or len(rest) < len(words)):  # ahead of a command, or inside a block
+        names |= {w.split("=", 1)[0] for w in lead}
+    if words and words[0] in _ENV_WRAPPERS:  # env X=/ cmd, sudo X=/ cmd: set for the command it runs
+        names |= {w.split("=", 1)[0] for w in words[1:] if shellwords.ASSIGN.match(w)}
+    if names:
+        _mark_names(ctx, names)
+
+
+def _mark_names(ctx: _Ctx, names: set[str]) -> None:
+    ctx.vars = {k: v for k, v in (ctx.vars or {}).items() if k not in names}
+    ctx.unknown = ctx.unknown | names
+    if ctx.loops:
+        ctx.loops = {k: v for k, v in ctx.loops.items() if k not in names}
+
+
+_ENV_WRAPPERS = ("env", "sudo", "doas", "run0")
+_SETTERS = frozenset(["eval", "source", ".", "coproc"])  # run text or a file that can set any variable
+_TARGET_SETTERS = frozenset(["read", "mapfile", "readarray", "getopts", "let"])  # set the names they're given
+
+
+def _sets_anything(toks: list[str], seg: str) -> bool:
+    """Whether this part of the line runs a command that can set variables in a way the reader doesn't follow: eval
+    and source text, read and its kin, printf -v, wait -p, a nameref (declare -n), or arithmetic that assigns."""
+    if not toks:
+        return False
+    head, flags = toks[0], [t for t in toks[1:] if t.startswith("-")]
+    if head in _SETTERS:
+        return True
+    if head == "printf" and any(f.startswith("-") and "v" in f[1:] for f in flags):
+        return True
+    if head == "wait" and any("p" in f[1:] for f in flags):
+        return True
+    return head in _DECLARERS and any(not f.startswith("--") and "n" in f[1:] for f in flags)
+
+
+def _targets(toks: list[str]) -> set[str]:
+    """The names `read`, `mapfile`, `readarray`, `getopts` and `let` set: their values come from input or arithmetic,
+    which the reader doesn't follow, so a name that held a value before becomes unknown."""
+    if not toks or toks[0] not in _TARGET_SETTERS:
+        return set()
+    if toks[0] == "let":
+        return {m.group(1) for t in toks[1:] if (m := re.match(r"([A-Za-z_][A-Za-z0-9_]*)\s*[-+*/%&|^<>]*=", t))}
+    names = [t for t in toks[1:] if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", t)]
+    return set(names[1:2]) if toks[0] == "getopts" else set(names)
+
+
+def _distrust(ctx: _Ctx, folders: bool) -> None:
+    """After a command that can set any variable, no value the reader holds is known; with `folders`, the home and
+    working folders aren't either (eval text can set them; a sourced file is trusted to leave them)."""
+    gone = set(ctx.vars or {}) | set(ctx.loops or {}) | ({"HOME", "PWD", "OLDPWD", "WS_HOME"} if folders else set())
+    ctx.unknown = ctx.unknown | gone
+    ctx.vars, ctx.loops, ctx.distrust = {}, {}, True
+
+
+def _segment_once(
+    policy: Policy, seg: str, ctx: _Ctx, in_pipe: bool, cands: list[str], loop_vars: dict[str, str]
+) -> tuple[str | None, str, list[str]]:
     cands.append(" ".join(seg.split()))
-    words, redirs = _lex(_expand_vars(seg, ctx))
-    words = [b for w in words for b in _braces(w)]
+    env = shellwords.Unknown(
+        _env({**(ctx.vars or {}), **loop_vars}, ctx.cwd, ctx.oldpwd),
+        ctx.unknown - set(loop_vars),
+        ctx.distrust,
+        keep={"HOME", "PWD", "OLDPWD", "WS_HOME"} - ctx.unknown,
+    )
+    lexed = shellwords.lex(seg, env, ctx.budget)
+    words, redirs = lexed.words, lexed.redirs
     if not words and not redirs:
         return None, "", []
-    if words and all(_ASSIGN.match(w) for w in words):  # X=/ ; later $X
-        ctx.vars = {**(ctx.vars or {}), **dict(w.split("=", 1) for w in words)}
-    elif len(words) > 3 and words[0] == "for" and words[2] == "in":  # for i in /; do ... $i
-        ctx.vars = {**(ctx.vars or {}), words[1]: words[3]}
-    toks, wrappers = _strip_wrappers(words)
+    _mark_unknown(ctx, seg, words)
+    if words and all(shellwords.ASSIGN.match(w) for w in words):  # X=/ ; later $X
+        _assign(ctx, dict(w.split("=", 1) for w in words))
+    elif len(words) > 3 and words[0] == "for" and words[2] == "in":  # for i in a b; do ... $i
+        listed = _loop_words(words[3:])
+        ctx.loops = {**(ctx.loops or {}), words[1]: listed}
+        ctx.vars = {**(ctx.vars or {}), words[1]: words[-1]}  # what the variable holds once the loop is done
+    nested: list[str] = []
+    dropped: list[str] = []
+    toks, wrappers = shellwords.strip_wrappers(words, lexenv=env, budget=ctx.budget, dropped=dropped, scripts=nested)
+    held = _targets(toks) & (set(ctx.vars or {}) | set(ctx.loops or {}) | set(ctx.unknown))
+    if held:  # read X / let X=.. after X held a value: which value it has now isn't followed
+        _mark_names(ctx, held)
+    if toks and toks[0] in _DECLARERS:  # export X=/ ; declare -x X=/ ; local X=/
+        _assign(ctx, dict(w.split("=", 1) for w in toks[1:] if shellwords.ASSIGN.match(w)))
+    elif toks and toks[0] == "read":  # read -r X <<< /
+        _assign(ctx, _read_values(toks, redirs))
+    if _sets_anything(toks, seg):
+        _distrust(ctx, folders=bool(toks) and toks[0] in ("eval", "coproc"))
     canon = _canon_tokens(toks)
     line = " ".join(canon)
     if line:
         cands.append(line)
     cmd = canon[0] if canon else ""
-    flags, operands = _args(canon)
-    nested: list[str] = []
+    flags, operands = shellwords.split_args(canon)
 
     if cmd in ("cd", "pushd"):
-        ctx.cwd = _abs(operands[0] if operands else "~", ctx.cwd)
+        target = operands[0] if operands else "~"
+        if target != "-" or ctx.oldpwd:
+            ctx.oldpwd, ctx.cwd = ctx.cwd, _abs(ctx.oldpwd if target == "-" else target, ctx.cwd)
     admin = _ws_admin(canon)
     if admin:
         return admin, line, []
@@ -1568,12 +1246,18 @@ def _segment(policy: Policy, seg: str, ctx: _Ctx, in_pipe: bool, cands: list[str
             return "eval of text a network command fetches", line, []
         nested.append(text)
     if cmd in _SHELL_NAMES:
-        reason, nested = _shell(toks, canon, flags, operands, redirs, in_pipe)
+        reason, more = _shell(toks, canon, flags, operands, redirs, in_pipe)
         if reason:
             return reason, line, []
-    if in_pipe and _INTERP.match(cmd) and operands in ([], ["-"]) and not any(_cluster(flags, c) for c in "cemp"):
+        nested += more
+    if (
+        in_pipe
+        and _INTERP.match(cmd)
+        and operands in ([], ["-"])
+        and not any(shellwords.has_flag(flags, c) for c in "cemp")
+    ):
         return "an interpreter is reading its program from a pipe", line, []
-    if cmd in ("source", ".") and _PROCSUB in operands:
+    if cmd in ("source", ".") and shellwords.PROCSUB in operands:
         return "a script is being sourced from a process substitution", line, []
     if cmd in _OPERAND_CMDS:
         cands += [" ".join([cmd, *flags, _dotted(op, ctx.cwd)]) for op in operands[:64]]
@@ -1582,26 +1266,27 @@ def _segment(policy: Policy, seg: str, ctx: _Ctx, in_pipe: bool, cands: list[str
     if (
         "xargs" in wrappers
         and cmd == "rm"
-        and (_cluster(flags, "r") or _cluster(flags, "R"))
+        and (shellwords.has_flag(flags, "r") or shellwords.has_flag(flags, "R"))
         and all(o == "{}" for o in operands)
         and any(p.startswith("rm ") for p in policy.gate.deny_commands)
     ):
         return "recursive rm fed by xargs: the operands cannot be seen, and rm is on the deny list", line, []
 
-    # Paths this command names: operands, --opt=value, redirect targets.
-    named = [*operands, *(f.split("=", 1)[1] for f in flags if "=" in f), *(t for _, t in redirs if t)]
+    # Paths this command names: operands, what a wrapper took (`xargs -a FILE`), the places inside a word a program
+    # reads a path from (`f=@P`, `if=P`, `--opt=P`, `-oP`), redirect targets.
+    named = [*shellwords.split_args(toks)[1], *dropped, *lexed.pieces, *(t for _, t in redirs if t)]
     recursive = (
         cmd in _ALWAYS_RECURSIVE
-        or _cluster(flags, "r")
-        or _cluster(flags, "R")
+        or shellwords.has_flag(flags, "r")
+        or shellwords.has_flag(flags, "R")
         or "--recursive" in flags
         or "--archive" in flags
-        or (cmd in ("cp", "rsync") and _cluster(flags, "a"))
+        or (cmd in ("cp", "rsync") and shellwords.has_flag(flags, "a"))
     )
     if recursive and _searches_cwd(cmd, canon, operands):
         named.append(".")  # `cd ~ && grep -r x`: no path given means here
     for p in named:
-        rule = _read_hit(policy, p, ctx.cwd, recursive=recursive)
+        rule = _read_hit(policy, p, ctx.cwd, recursive=recursive, expand=False)
         if rule:
             return f"command names a path denied by deny_read rule {rule!r}", line, nested
     if ctx.protect:
@@ -1622,9 +1307,9 @@ def _shell(toks, canon, flags, operands, redirs, in_pipe):
     for f in flags:  # `-o pipefail` and `-O extglob` take a word that is not the script
         if f[1:2] != "-" and ("o" in f[1:] or "O" in f[1:]) and operands:
             operands.pop(0)
-    if _PROCSUB in operands:
+    if shellwords.PROCSUB in operands:
         return "a shell is reading its script from a process substitution", nested
-    if _cluster(flags, "c"):
+    if shellwords.has_flag(flags, "c"):
         if operands and operands[0].lstrip().startswith(("$(", "`")):
             return "a shell is running text another command produces", nested
         if operands:
@@ -1633,7 +1318,7 @@ def _shell(toks, canon, flags, operands, redirs, in_pipe):
     else:
         first = operands[0] if operands else None
         stdin = (
-            _cluster(flags, "s")
+            shellwords.has_flag(flags, "s")
             or first is None
             or first in ("-", "/dev/stdin")
             or first.startswith(("/dev/fd/", "/proc/self/fd/"))
@@ -1674,14 +1359,14 @@ def _written(cmd, flags, operands, redirs, canon, toks) -> list[tuple[str, bool]
     """Paths this command writes or removes, as (path, ancestors): redirect targets, operands of the commands that
     write, and where curl, wget, tar, unzip and zip put files. `ancestors` is true where a folder above a protected
     path is just as bad (rm, mv, and unpacking or copying a tree over it)."""
-    out: list[tuple[str, bool]] = [(t, False) for op, t in redirs if op.startswith(">") or op == "<>"]
-    recursive = any(_cluster(flags, c) for c in "rRa")
+    out: list[tuple[str, bool]] = [(t, False) for op, t in redirs if op in shellwords.WRITE_OPS]
+    recursive = any(shellwords.has_flag(flags, c) for c in "rRa")
     if cmd in _WRITE_ALL:
         out += [(o, cmd in ("rm", "rmdir", "mv", "shred", "unlink")) for o in operands]
     elif cmd in _WRITE_LAST:
         deep = recursive or cmd == "rsync"
         out += [(o, deep) for o in operands[-1:]]
-        out += [(v, deep) for v in _opt_values(toks, "t", ("--target-directory",))]
+        out += [(v, deep) for v in shellwords.option_values(toks, "t", ("--target-directory",))]
     elif cmd in ("sed", "perl", "ruby") and any(
         f.startswith("--in-place") or re.match(r"^-[A-Za-z]*i", f) for f in flags
     ):
@@ -1689,12 +1374,12 @@ def _written(cmd, flags, operands, redirs, canon, toks) -> list[tuple[str, bool]
     elif cmd == "dd":
         out += [(o[3:], False) for o in operands if o.startswith("of=")]
     elif cmd == "curl":
-        out += [(v, False) for v in _opt_values(toks, "o", ("--output",))]
+        out += [(v, False) for v in shellwords.option_values(toks, "o", ("--output",))]
         if any(t == "--remote-name" or re.fullmatch(r"-[A-Za-z]*O[A-Za-z]*", t) for t in toks[1:]):
             out.append((".", True))
     elif cmd == "wget":
-        files = _opt_values(toks, "O", ("--output-document",))
-        dirs = _opt_values(toks, "P", ("--directory-prefix",))
+        files = shellwords.option_values(toks, "O", ("--output-document",))
+        dirs = shellwords.option_values(toks, "P", ("--directory-prefix",))
         out += [(v, False) for v in files] + [(v, True) for v in dirs]
         if not files and not dirs:
             out.append((".", True))
@@ -1702,14 +1387,14 @@ def _written(cmd, flags, operands, redirs, canon, toks) -> list[tuple[str, bool]
         if len(toks) > 1 and re.fullmatch(r"[A-Za-z]+", toks[1]):  # old style: tar czf x.tgz
             toks = [toks[0], "-" + toks[1], *toks[2:]]
         modes = "".join(t[1:] for t in toks[1:] if re.fullmatch(r"-[A-Za-z]+", t))
-        archives = _opt_values(toks, "f", ("--file",))
+        archives = shellwords.option_values(toks, "f", ("--file",))
         if "x" in modes:
-            dirs = _opt_values(toks, "C", ("--directory",))
+            dirs = shellwords.option_values(toks, "C", ("--directory",))
             out += [(d, True) for d in dirs or ["."]]
         elif any(m in modes for m in "cru"):
             out += [(a, False) for a in archives]
     elif cmd == "unzip":
-        out += [(d, True) for d in _opt_values(toks, "d") or ["."]]
+        out += [(d, True) for d in shellwords.option_values(toks, "d") or ["."]]
     elif cmd == "zip":
         out += [(o, False) for o in operands[:1]]
     return out
@@ -1747,48 +1432,66 @@ def simple_commands(command: str, _depth: int = 0, *, git_options: bool = False)
     return [words for words, _ in simple_commands_env(command, _depth, git_options=git_options) if words]
 
 
-def _seg_words(seg: str, git_options: bool) -> tuple[list[str], list[str], list[str]]:
-    """(words, assignments, nested command texts) of one pipeline segment: what simple_commands_env reads from it."""
+def _seg_words(
+    seg: str, git_options: bool, budget: shellwords.Budget, known: dict[str, str]
+) -> tuple[list[str], list[str], list[str]]:
+    """(words, assignments, nested command texts) of one pipeline segment: what simple_commands_env reads from it.
+    `known` holds the variables earlier segments of the same line set; a segment of only assignments adds to it."""
     env: list[str] = []
-    toks, _ = _strip_wrappers(_lex(seg)[0], env)
+    nested: list[str] = []
+    lexenv = _env(known)
+    toks, _ = shellwords.strip_wrappers(
+        shellwords.words_of(seg, lexenv, budget), env, lexenv=lexenv, budget=budget, scripts=nested
+    )
     if toks and toks[0] == "git" and not git_options:
         toks = _git_normal(toks)
-    nested: list[str] = []
     if toks and toks[0] == "eval" and len(toks) > 1:  # eval joins its words and runs the text as a command line
         nested.append(" ".join(toks[1:]))
     if toks and toks[0] in _SHELL_NAMES:
-        flags, operands = _args(toks)
-        if _cluster(flags, "c") and operands:
+        flags, operands = shellwords.split_args(toks)
+        if shellwords.has_flag(flags, "c") and operands:
             nested.append(operands[0])
+    if not toks:  # `X=/` on its own: later words may use it
+        known.update(w.split("=", 1) for w in env)
     return toks, env, nested
 
 
 def simple_commands_env(
-    command: str, _depth: int = 0, *, git_options: bool = False
+    command: str, _depth: int = 0, *, git_options: bool = False, _budget: shellwords.Budget | None = None
 ) -> list[tuple[list[str], list[str]]]:
     """simple_commands with the `VAR=value` words each command was given before it (a prefix, or after `env`), as
-    (words, assignments). A line that only sets variables comes back with no words, so a check sees `X=1; cmd`."""
+    (words, assignments). A line that only sets variables comes back with no words, so a check sees `X=1; cmd`.
+    Raises ShellError for a command that expands to more words than the reader allows, nests too deeply or takes
+    too long to read."""
+    with shellwords.time_limit():
+        return _commands_env(command, _depth, git_options, _budget)
+
+
+def _commands_env(
+    command: str, _depth: int, git_options: bool, _budget: shellwords.Budget | None
+) -> list[tuple[list[str], list[str]]]:
     if not isinstance(command, str):
         raise TypeError("command must be text")
     if _depth > _MAX_DEPTH:
-        raise ValueError("command nests too deeply to check")
-    pipelines, inner = _scan(_prep(command), heredocs=not _folds(command))
+        raise shellwords.ShellError("too_deep", _TOO_DEEP)
+    budget = _budget or shellwords.Budget()
+    pipelines, inner = shellwords.scan(shellwords.prep(command), heredocs=not shellwords.folds(command))
     found: list[tuple[list[str], list[str]]] = []
     nested = list(inner)
+    known: dict[str, str] = {}
     for segs in pipelines:
         for seg in segs:
-            toks, env, more = _seg_words(seg, git_options)
-            if not toks and not env:
-                continue
-            found.append((toks, env))
-            nested += more
+            toks, env, more = _seg_words(seg, git_options, budget, known)
+            nested += more  # also where the wrapper took the whole command (`su -c TEXT`): the text runs
+            if toks or env:
+                found.append((toks, env))
     for text in nested:
-        found += simple_commands_env(text, _depth + 1, git_options=git_options)
+        found += _commands_env(text, _depth + 1, git_options, budget)
     return found
 
 
 def simple_commands_flow(
-    command: str, _depth: int = 0, *, git_options: bool = False
+    command: str, _depth: int = 0, *, git_options: bool = False, _budget: shellwords.Budget | None = None
 ) -> list[tuple[list[str], list[str], str, bool]]:
     """simple_commands_env in the order the line runs, for a check that follows where the shell is (a `cd`). Each item
     is (words, assignments, link, piped). A command has the `link` that joins it to the one before (`;`, `&&` or `||`)
@@ -1796,25 +1499,34 @@ def simple_commands_flow(
     structure: `(` opens and `)` closes a subshell (also what a nested `bash -c`, `eval` or `$(...)` runs in; the
     text of a `$(...)` has no known place, so its mark is `(?`), and `&` says the command before it ran in the
     background."""
+    with shellwords.time_limit():
+        return _commands_flow(command, _depth, git_options, _budget)
+
+
+def _commands_flow(
+    command: str, _depth: int, git_options: bool, _budget: shellwords.Budget | None
+) -> list[tuple[list[str], list[str], str, bool]]:
     if not isinstance(command, str):
         raise TypeError("command must be text")
     if _depth > _MAX_DEPTH:
-        raise ValueError("command nests too deeply to check")
+        raise shellwords.ShellError("too_deep", _TOO_DEEP)
+    budget = _budget or shellwords.Budget()
     flow: list = []
-    pipelines, inner = _scan(_prep(command), heredocs=not _folds(command), flow=flow)
+    pipelines, inner = shellwords.scan(shellwords.prep(command), heredocs=not shellwords.folds(command), flow=flow)
     steps: list[tuple[list[str], list[str], str, bool]] = []
     link = ";"
+    known: dict[str, str] = {}
 
     def nest(text: str, mark: str) -> None:
         steps.append(([], [], mark, False))
-        steps.extend(simple_commands_flow(text, _depth + 1, git_options=git_options))
+        steps.extend(_commands_flow(text, _depth + 1, git_options, budget))
         steps.append(([], [], ")", False))
 
     for item in flow:
         if isinstance(item, int):
             segs = pipelines[item]
             for seg in segs:
-                toks, env, more = _seg_words(seg, git_options)
+                toks, env, more = _seg_words(seg, git_options, budget, known)
                 if toks or env:
                     steps.append((toks, env, link, len(segs) > 1))
                 for text in more:
@@ -1837,27 +1549,19 @@ def _readings(command: str) -> list[str]:
 
 
 def _walk_command(policy: Policy, command: str, cwd: str, protect: tuple[str, ...], cands: list[str]) -> str | None:
-    """_walk for a whole command. In the one plain shape _without_bodies accepts, the bodies are text and the lines
+    """_walk for a whole command. In the one plain shape shellwords.without_bodies accepts, the bodies are text and the lines
     around them are judged. Any other command is judged with every body read as commands (so a body can't hide
     anything) and then once more with the bodies left out, so a stray quote in a body can't hide the lines after it."""
-    data = _without_bodies(command)
+    data = shellwords.without_bodies(command)
     if data is not None:
         return _walk(policy, data, _Ctx(cwd, protect), 0, cands)
     for text in _readings(command):
         reason = _walk(policy, text, _Ctx(cwd, protect), 0, cands)
         if reason:
             return reason
-    if "<<" in command and not _folds(command):
+    if "<<" in command and not shellwords.folds(command):
         return _walk(policy, command, _Ctx(cwd, protect, None, True), 0, cands)
     return None
-
-
-def _open_quote(command: str) -> str:
-    """The quote still open at the end of the command text (`'`, `"` or `$'`), or "" if every quote is closed. Comments
-    and here-document bodies are not read: an apostrophe in prose there is not a quote."""
-    end: dict = {}
-    _scan(_prep(command), heredocs=True, end=end)
-    return end.get("quote", "")
 
 
 def is_denied_command(
@@ -1876,11 +1580,13 @@ def is_denied_command(
             f"the command is {len(command):,} characters, too long to check in time (the limit is "
             f"{MAX_COMMAND_CHARS:,}); write it to a file with the Write tool and run that file"
         )
-    quote = _open_quote(command)
-    if quote:
-        return f"the command ends inside an unclosed {quote} quote, so what runs cannot be read; close the quote"
     cands: list[str] = []
-    reason = _walk_command(policy, command, cwd or _cwd(), tuple(protect), cands)
+    try:
+        with shellwords.time_limit():
+            shellwords.require_closed(command)
+            reason = _walk_command(policy, command, cwd or _cwd(), tuple(protect), cands)
+    except shellwords.ShellError as e:  # text the reader will not expand: a refusal, with the kind kept in the error
+        return e.message
     if reason:
         return reason
     for pat in policy.gate.deny_commands:
@@ -1899,7 +1605,8 @@ def needs_approval(policy: Policy, command: str, *, cwd: str | None = None) -> b
     if not policy.gate.ask_commands:
         return False
     cands: list[str] = []
-    _walk_command(policy, command, cwd or _cwd(), (), cands)
+    with shellwords.time_limit():
+        _walk_command(policy, command, cwd or _cwd(), (), cands)
     return any(_glob_regex(_canon_pattern(pat)).match(c) for pat in policy.gate.ask_commands for c in cands)
 
 

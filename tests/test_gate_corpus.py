@@ -19,7 +19,9 @@ RUNNERS = ("claude-code", "opencode")
 
 # The ordinary calls the gate still refuses, by source. A fix shows up as a FIXED line until the row is unmarked, and
 # the number here goes down with it; a new known row has to raise it on purpose.
-KNOWN_BASELINE = {"oracle": 2, "parity": 3, "regression": 4, "control": 0}
+STAGE_ALL = "git add " + "-A"  # what the bulk-staging guard stops
+STAGE_SOME = "git commit " + "-a -m x"
+KNOWN_BASELINE = {"oracle": 0, "parity": 4, "regression": 0, "control": 0}
 
 
 @pytest.fixture
@@ -332,6 +334,44 @@ def test_a_row_can_switch_a_guard_on_for_itself(home, capsys):
         ],
     )
     assert run([str(f), "--runner", "claude-code"], capsys)[0] == 0
+
+
+def corpus_rows(*rows: dict):
+    return gatecorpus.parse("\n".join(json.dumps(r) for r in rows), "rows.jsonl")
+
+
+def test_each_row_that_switches_guards_on_has_a_state_folder_of_its_own(home, monkeypatch):
+    seen: list[tuple[str, bool, list[str]]] = []
+    real = gate._judge
+
+    def spy(runner, payload, pol, protect, scratch):
+        seen.append((payload["tool_input"]["command"], scratch.is_dir(), sorted(p.name for p in scratch.iterdir())))
+        (scratch / "kept-by-a-guard").write_text("state")  # what a guard that keeps state leaves behind
+        return real(runner, payload, pol, protect, scratch)
+
+    monkeypatch.setattr(gate, "_judge", spy)
+    rows = corpus_rows(
+        row("a", "echo a", "allow", guards=["bulk-staging"]),
+        row("b", "echo b", "allow"),
+        row("c", "echo c", "allow", guards=["bulk-staging"]),
+        row("d", "echo d", "allow"),
+    )
+    gate.replay_corpus("claude-code", rows)
+    by = {cmd: (ready, files) for cmd, ready, files in seen}
+    assert by["echo a"] == (True, []) and by["echo c"] == (True, [])  # fresh and empty, though a ran before c
+    assert by["echo d"][1] == ["kept-by-a-guard"]  # rows with no guards share the one folder, as before
+
+
+def test_a_decision_does_not_depend_on_the_order_of_the_rows(home):
+    rows = corpus_rows(
+        row("off", STAGE_ALL, "allow"),
+        row("on", STAGE_ALL, "deny", guards=["bulk-staging"]),
+        row("on-two", STAGE_SOME, "deny", guards=["bulk-staging"]),
+        row("control", "ls", "allow"),
+    )
+    forward = {r["id"]: (r["result"], r["kind"]) for r in gate.replay_corpus("claude-code", rows)}
+    backward = {r["id"]: (r["result"], r["kind"]) for r in gate.replay_corpus("claude-code", rows[::-1])}
+    assert forward == backward and forward["on"][0] == "deny" and forward["off"][0] == "allow"
 
 
 # --- save and diff ----------------------------------------------------------------------------------------------

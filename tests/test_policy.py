@@ -245,8 +245,10 @@ def test_input_it_cannot_judge_raises_so_callers_deny(pol):
     deep = "echo"
     for _ in range(8):
         deep = "bash -c " + shlex.quote(deep)
-    with pytest.raises(ValueError, match="nests too deeply"):
-        policy.is_denied_command(pol, deep)
+    assert "nests" in policy.is_denied_command(pol, deep)  # a typed refusal (ShellError, kind too_deep), not a crash
+    with pytest.raises(policy.shellwords.ShellError) as err:
+        policy.simple_commands(deep)
+    assert err.value.kind == "too_deep"
 
 
 def test_text_inside_quotes_is_not_run_so_not_denied(pol):
@@ -413,17 +415,17 @@ REVIEWER_DENIED = [
     "XX -rf $HOME/",
     'XX -rf "$HOME"',
     "XX -rf ~ ; echo done",
+    'cat "$(echo ~)/.ssh/id_rsa"',  # the part after the unknown $(...) is a protected path under a home folder
 ]
 REVIEWER_GAPS = [
     "python3 -c 'import shutil;shutil.rmtree(\"/\")'",
     "CU x > a; sh a",
     "CU -o a x && bash a",
-    'cat "$(echo ~)/.ssh/id_rsa"',
     "perl -e 'system(\"XX -rf /\")'",
 ]
 
 
-# Known gaps, kept visible: a text matcher cannot see inside an interpreter, a downloaded file or a $(...) path.
+# Known gaps, kept visible: a text matcher cannot see inside an interpreter, or a downloaded file.
 # These stay allowed by the matcher and are left to the runner's own rules and, later, a sandbox.
 
 

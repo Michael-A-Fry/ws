@@ -8,13 +8,38 @@ body of the GitHub release.
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-11-07
+
+A browser terminal that keeps the screen still, a gate that reads commands the way the shell does, and a labelled
+corpus that measures the gate on every change.
+
+### Added
+
+- `ws term`: a terminal in a browser tab, for reaching a session from a phone or another computer. One size owner, so
+  windows never fight over the size; a phone key bar (Esc, Tab, Shift+Tab, Ctrl, arrows, a new line, Ctrl+C, Paste);
+  Shift+Enter makes a new line; a 10 KB paste arrives intact; the on-screen keyboard doesn't resize the grid. It
+  listens on 127.0.0.1 with a per-launch token, takes one window at a time, and reaches other devices through a tunnel
+  you already trust (`--bind` names an address on a private network). `--tmux NAME` sets options on that session only.
+- `ws gate replay FILE... --metrics`: replay a labelled corpus of tool calls (`ws.gate-corpus/1`) and print the
+  confusion matrix, the false-block rate with a 95% interval and the time a check takes. `--save` and `--diff` show
+  every decision a change to the policy or the gate moves; `--expect-changes` lists the ones you meant. CI replays the
+  shipped corpus on Claude Code and OpenCode.
+- Guards: `checkout-pin` (off by default) denies a branch switch, reset, rebase or merge in a checkout that has linked
+  worktrees; `dev-server` (on by default) denies a dev server that listens on every interface and names the flag to
+  add.
+- `[roles.notify] alert_on = "needs-you"`: a phone alert only when a session asks you something or waits on a choice.
+
 ### Changed
 
+- The gate reads every command with one shell-aware reader: quotes, braces, `~` and `$HOME`, redirects, option values,
+  argument files and the commands it wraps. A form it doesn't follow is refused with a hint on how to write the command
+  plainly, and a check has a time limit.
 - The session-context guard's default state files are `STATE.md`, `.state/STATE.md`, `HANDOFF.md` and `TODO.md`. A
   project that keeps its state elsewhere sets `files` under `[guards.session-context]`.
 - Plugins carry their own region rule; there's no default country, and setup asks for one only when an offered plugin
   needs it.
 - The claims guard reads the default branch from `origin/HEAD`, then `init.defaultBranch`, then `main`.
+- The default `deny_read` covers `~/.config/ws/secrets`.
 
 ## [0.1.6] - 2026-11-02
 

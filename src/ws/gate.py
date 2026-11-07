@@ -34,7 +34,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from ws import adapters, approvals, guards, output, policy, sandbox
+from ws import adapters, approvals, guards, output, policy, sandbox, shellwords
 
 if TYPE_CHECKING:
     from ws import gatecorpus
@@ -105,7 +105,24 @@ def check(
     from the launcher. The guards that are on judge the call after the rules: the first deny wins, an approvable one
     asks for approval the same way, and warnings and notes are added to `notes`. `layer`, when given, gets the kind of
     the layer that made a refusal (preflight, rule:KIND, guard:NAME, ask_commands). `home` and `clock` are for the
-    guards (the ws home their state lives in, and the time)."""
+    guards (the ws home their state lives in, and the time). The rules, the guards and the approval check read the
+    command under one clock (see shellwords.time_limit), so a command cannot take them one after another."""
+    with shellwords.time_limit():
+        return _check(runner, raw, pol, protect, approval_root, consume, notes, layer, clock, home)
+
+
+def _check(
+    runner: str,
+    raw: str,
+    pol: policy.Policy,
+    protect: tuple[str, ...],
+    approval_root: Path | None,
+    consume: bool,
+    notes: list[str] | None,
+    layer: list[str] | None,
+    clock,
+    home: Path | None,
+) -> str | approvals.Claim | None:
     payload = json.loads(raw)
     if not isinstance(payload, dict):
         raise TypeError("payload is not a JSON object")
@@ -156,6 +173,11 @@ def check(
 def event(runner: str, raw: str, pol: policy.Policy, *, clock=None, home: Path | None = None) -> tuple[int, str, str]:
     """(exit code, stdout, stderr) for a hook payload of an event that is not a call's check. Raises on a payload it
     cannot read; cmd_event turns that into exit 0 and one line."""
+    with shellwords.time_limit():
+        return _event(runner, raw, pol, clock, home)
+
+
+def _event(runner: str, raw: str, pol: policy.Policy, clock, home: Path | None) -> tuple[int, str, str]:
     payload = json.loads(raw)
     if not isinstance(payload, dict):
         raise TypeError("payload is not a JSON object")
@@ -318,7 +340,9 @@ def _scratch_home(home: Path):
 def replay_corpus(runner: str, rows: list[gatecorpus.Row], policy_file: Path | None = None) -> list[dict]:
     """Each corpus row judged as the live hook would, in scratch `HOME` and `CWD` folders (made here, removed after,
     and the only place a `{HOME}` or `{CWD}` is filled with). The policy is `policy_file`, else the built-in one. A row
-    for another runner is left out. Each result is {id, source, expect, known, result, reason, kind, ms, differs}."""
+    that switches on guards gets a folder of its own for the state they keep, so a decision does not depend on which
+    rows came before it. A row for another runner is left out. Each result is {id, source, expect, known, result,
+    reason, kind, ms, differs}."""
     from ws import gatecorpus  # here, not at the top: the live hook doesn't pay for the corpus code
 
     results = []
@@ -332,12 +356,16 @@ def replay_corpus(runner: str, rows: list[gatecorpus.Row], policy_file: Path | N
             except policy.PolicyError as e:
                 raise WsError("bad_config", str(e), f"fix {policy_file}, or write the default policy") from e
             protect = _protect(policy_file or home / ".ws" / "policy.toml")
-            for row in rows:
+            for n, row in enumerate(rows):
                 payload = gatecorpus.render(row, runner, str(home), str(cwd))
                 if payload is None:
                     continue
                 on = tuple(dict.fromkeys((*pol.guards.on, *row.guards)))
-                judged = _judge(runner, payload, replace(pol, guards=replace(pol.guards, on=on)), protect, home)
+                state = home
+                if row.guards:  # a guard that keeps state starts every row it is switched on for from nothing
+                    state = Path(scratch) / f"guard-state-{n}"
+                    state.mkdir()
+                judged = _judge(runner, payload, replace(pol, guards=replace(pol.guards, on=on)), protect, state)
                 results.append(
                     {
                         "id": row.id,

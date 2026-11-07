@@ -264,7 +264,7 @@ def xterm_hex(n: int) -> str:
 
 
 SPINNER = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
-TAGLINE = "Your memory, skills and rules, in any AI."
+TAGLINE = "Your memory, skills and rules, across your AI coding tools."
 
 # "ws" drawn on a pixel grid: each X is two columns wide and one row tall, so the pixels come out square.
 _W = ("XX.....XX", "XX.....XX", "XX..X..XX", "XX.XXX.XX", "XXXX.XXXX", ".XX...XX.")

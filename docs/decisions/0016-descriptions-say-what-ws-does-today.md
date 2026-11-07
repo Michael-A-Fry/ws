@@ -30,5 +30,5 @@ OpenCode. When an adapter is added, its pages are updated in the same pull reque
 
 ### Confirmation
 
-Judged in review against the folder `src/ws/adapters/`. The tagline also appears in `pyproject.toml`,
-`src/ws/brand.py` and `src/ws/cli.py`; those follow in a code change.
+Judged in review against the folder `src/ws/adapters/`. The tagline is the same in `pyproject.toml`,
+`src/ws/brand.py` and `src/ws/cli.py`.

@@ -289,13 +289,16 @@ def test_the_gate_denies_what_the_harness_sees_touched(pol):
 
 
 # The lines a real bash does use to read a protected file, through text the gate never reads as shell: a program an
-# interpreter runs (python, awk) or a script file the line writes and then runs. They are a limit of what a command
+# interpreter runs (python, awk), an option whose value is a command (ssh ProxyCommand), or a script file the line
+# writes and then runs. They are a limit of what a command
 # gate can see, and the one list of them: a probe that is not here and gets through is a failure. The static gate is not
 # a wall against interpreters; the sandbox (`ws gate launch`) is.
 LIMITS = (
     f"python3 -c \"print(open('{HOME}/{SSH}/id_rsa').read())\"",
     f"awk 'BEGIN{{while((getline l < \"{HOME}/{SSH}/id_rsa\")>0) print l}}'",
     f"echo 'cat ~/{SSH}/id_rsa' > /tmp/x.sh; bash /tmp/x.sh",
+    # an option whose value is a command the tool runs; released main allows it too
+    f"ssh -o ProxyCommand='cat {HOME}/{SSH}/id_rsa >&2' x",
     *sections()["limits"],
 )
 _INTERPRETERS = r"(python3?|perl|node|ruby|php|lua|Rscript)"
@@ -311,7 +314,7 @@ def test_every_cold_review_probe_the_gate_allows_is_one_bash_does_not_use_to_tou
 def test_the_limits_are_programs_the_gate_does_not_read_as_shell():
     for line in LIMITS:
         assert re.match(
-            rf"(python3 -c|awk |echo .* > /tmp/x\.sh; bash /tmp/x\.sh|{_INTERPRETERS} .*<<)",
+            rf"(python3 -c|awk |echo .* > /tmp/x\.sh; bash /tmp/x\.sh|ssh -o ProxyCommand=|{_INTERPRETERS} .*<<)",
             line,
         ), line
 

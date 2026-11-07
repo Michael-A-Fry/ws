@@ -131,11 +131,12 @@ A here-document or here-string is text for whatever reads it. When that's a shel
 `stdin-is-code`. Any other body, a commit message included, is read as commands, whatever its quoting.
 
 The static gate reads shell, so it's a check on shell and not a wall against interpreters. A program that `python`,
-`python3`, `perl`, `node`, `ruby`, `php`, `lua` or `Rscript` runs (from `-c`, a file, or standard input), `awk` code, and
-a script the line writes and then runs are text the gate can't see into: it's the same for a here-document or
-here-string given to one of them. These are the known limits, and `tests/test_gate_oracle.py` lists each as a `LIMIT`
-row. The wall is the sandbox: `ws gate launch --runner R -- argv` starts the runner inside it, and the files and
-folders ws protects are out of reach of every program in the session, whatever it runs.
+`python3`, `perl`, `node`, `ruby`, `php`, `lua` or `Rscript` runs (from `-c`, a file, or standard input), `awk` code,
+an option whose value is a command the tool runs (such as ssh's `ProxyCommand`), and a script the line writes and then
+runs are text the gate can't see into: it's the same for a here-document or here-string given to one of them. These
+are the known limits, and `tests/test_gate_oracle.py` lists each as a `LIMIT` row. The wall is the sandbox:
+`ws gate launch --runner R -- argv` starts the runner inside it, and the files and folders ws protects are out of reach
+of every program in the session, whatever it runs.
 
 ## `[guards]`
 

@@ -596,6 +596,10 @@ _SHELL_NAMES = {
     "yash",
     "posh",
     "lksh",
+    "oksh",
+    "loksh",
+    "pdksh",
+    "hush",
 }
 # A here-document or here-string given to one of these is read as code: a shell runs it (any command whose name ends in
 # `sh`, and `ksh93`), `source` and `.` run it as a script, `eval` runs it as text, `ssh` hands it to the shell on the
@@ -604,8 +608,20 @@ _UNKNOWN_VALUE = "${_WS_UNKNOWN}"  # what a variable holds when a command substi
 _STDIN_IS_CODE = frozenset({*_SHELL_NAMES, "source", ".", "eval", "ssh", "ksh93"})
 
 
+# A program name with its version or build in it is the same program: `bash5.2`, `zsh5`, `sh5`, `bash-static`,
+# `mksh-static`, `python3.12`, `node22`. `_stem` is the name without them (a word that doesn't look like that is its own).
+_VERSIONED = re.compile(r"([A-Za-z]+?)(?:[0-9][0-9.]*)?(?:-static)?")
+
+
+def _stem(word: str) -> str:
+    base = posixpath.basename(word)
+    found = _VERSIONED.fullmatch(base)
+    return found.group(1) if found else base
+
+
 def _reads_stdin_as_code(cmd: str) -> bool:
-    return cmd in _STDIN_IS_CODE or cmd.endswith("sh")
+    name = _stem(cmd)
+    return name in _STDIN_IS_CODE or name.endswith("sh")
 
 
 _GIT_ARG_OPTS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env"}
@@ -1354,11 +1370,17 @@ def _segment_once(
         if fetched and posixpath.basename(fetched.group(1)) in _FETCHERS:
             return "eval of text a network command fetches", line, []
         nested.append(text)
-    if cmd in _SHELL_NAMES:
+    if _stem(cmd) in _SHELL_NAMES:
         reason, more = _shell(toks, canon, flags, operands, redirs, in_pipe)
         if reason:
             return reason, line, []
         nested += more
+    if not ctx.bodies_as_commands and (started := _starts_a_shell(cmd, toks)):
+        why = (
+            f"`{cmd}` starts `{started}`, a shell, and ws cannot read what the shell runs; run `{started}` "
+            "on its own, or write the commands to a file with the Write tool and run the file"
+        )
+        return why, line, []
     if any(op in ("<<", "<<-", "<<<") for op, _ in redirs) and (_reads_stdin_as_code(cmd) or "xargs" in wrappers):
         raise shellwords.ShellError(
             "stdin-is-code",
@@ -1520,6 +1542,64 @@ _FILE_FLAGS = {  # address commands: the options that name a file (their positio
     "ftp": ("", ()),
     "rclone": ("", ("--config", "--files-from", "--filter-from", "--include-from", "--exclude-from")),
 }
+
+
+# --- a command the reader doesn't know, given a shell -----------------------------------------------------------------
+#
+# `taskset 1 sh -c TEXT`, `fakeroot sh`, `chrt 1 bash -c TEXT`, `unshare -r sh`, `ssh-agent sh`, `busybox sh` and `toybox sh`
+# start a shell, and the reader, which looks only at the command a line runs, would take the shell's script for a word of
+# something else. The wrappers it knows (`nice`, `sudo`, `env`, `busybox` ...) are taken off first, so the shell they start
+# is the command that is read. For any other first word the rule is the allowlist's: a command the reader has no entry for,
+# given a word that is a shell, is refused. A word is judged by the name of its file with a version or `-static` taken off
+# (`bash5.2`, `/usr/bin/zsh5`, `mksh-static`, `sh5`), against the shell names the reader already has (`_SHELL_NAMES`; a
+# name that merely ends in `sh` is not enough here, as it is for a here-document, or `push` and `publish` would be shells).
+# Interpreters (`python3`, `node` ...) are not in this rule: run on their own they are a listed limit of the gate, so a
+# launcher that starts one (`uv run python`) goes no further than that.
+#
+# A command is KNOWN when the reader has an entry for it: it is a key of one of the tables above (the exempt commands, the
+# pattern-first and value-flag commands, the commands that remove, write or search, the address commands, the declarers,
+# setters and arithmetic commands), a shell or an interpreter (read on their own), or one of the few the reader names in
+# code (`git`, `find`, `ls`, `du`, `tree`) or that only print, list, show or check the text they are given (`_VIEWERS`).
+# The words of a known command are read as its table says, so a shell named among them is a file or a pattern (`grep
+# bash notes`, `ls /bin/sh`, `man bash`, `shellcheck -s bash x`, `which sh`, `git log -- foo.sh`).
+_VIEWERS = frozenset(
+    ("cat", "less", "more", "man", "file", "stat", "wc", "diff", "cmp", "dirname", "basename", "shellcheck", "shfmt")
+)
+_KNOWN_COMMANDS = frozenset(
+    {
+        *_NO_FILE_CMDS,
+        *_PATTERN_FIRST,
+        *_VALUE_FLAGS,
+        *_OPERAND_CMDS,
+        *_ALWAYS_RECURSIVE,
+        *_WRITE_ALL,
+        *_WRITE_LAST,
+        *_FILE_FLAGS,
+        *_ADDRESS_CMDS,
+        *_FETCHERS,
+        *_DECLARERS,
+        *_ARITH_CMDS,
+        *_SETTERS,
+        *_TARGET_SETTERS,
+        *_STDIN_IS_CODE,
+        *_VIEWERS,
+        "git",
+        "find",
+        "ls",
+        "du",
+        "tree",
+    }
+)
+
+
+def _starts_a_shell(cmd: str, toks: list[str]) -> str | None:
+    """The word of a command the reader doesn't know that is a shell, or None."""
+    if cmd in _KNOWN_COMMANDS or _stem(cmd) in _SHELL_NAMES or _INTERP.match(_stem(cmd)):
+        return None
+    for word in toks[1:]:
+        if _stem(word) in _SHELL_NAMES:
+            return word
+    return None
 
 
 def _opens_files(cmd: str, canon: list[str]) -> bool:
@@ -2078,7 +2158,7 @@ def _seg_words(
         toks = _git_normal(toks)
     if toks and toks[0] == "eval" and len(toks) > 1:  # eval joins its words and runs the text as a command line
         nested.append(" ".join(toks[1:]))
-    if toks and toks[0] in _SHELL_NAMES:
+    if toks and _stem(toks[0]) in _SHELL_NAMES:
         flags, operands = shellwords.split_args(toks)
         if shellwords.has_flag(flags, "c") and operands:
             nested.append(operands[0])

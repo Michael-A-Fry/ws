@@ -728,6 +728,67 @@ def test_every_shell_that_runs_its_standard_input_is_denied_and_the_installed_on
         assert all(run_bash(line, {}).touched for line in lines)
 
 
+# Launchers: programs that start the program they are given as a word. Each row is a launcher, the shell it starts and the
+# program the row needs in the sandbox; the line reads a protected file through the shell's `-c` text. The gate refuses
+# every one. For a launcher that is installed here the real line is then run and seen to read the file (so the refusal
+# is needed); for one that isn't, only the gate's decision is tested (the test id says which).
+LAUNCHER_ROWS = (
+    ("taskset 1", "sh", "taskset"),
+    ("fakeroot", "sh", "fakeroot"),
+    ("unshare -r", "sh", "unshare"),
+    ("ssh-agent", "sh", "ssh-agent"),
+    ("chrt 1", "bash", ""),  # a real-time priority needs a privilege the sandbox has not: the gate decision only
+    ("chrt -o 0", "bash", "chrt"),  # the same launcher in a form an unprivileged process may run
+    ("ionice", "sh", "ionice"),
+    ("setsid", "sh", "setsid"),
+    ("stdbuf -o0", "sh", "stdbuf"),
+    ("flock /tmp/l", "sh", "flock"),
+    ("busybox", "sh", "busybox"),
+    ("toybox", "sh", "toybox"),
+)
+
+
+@pytest.mark.parametrize(
+    "launcher, shell, program",
+    [
+        pytest.param(
+            *row,
+            id=f"{row[0].split()[0]}-{'real-shell' if row[2] and _installed(row[2]) and _installed(row[1]) else 'gate-decision-only'}",
+        )
+        for row in LAUNCHER_ROWS
+    ],
+)
+def test_a_launcher_that_starts_a_shell_is_denied_and_the_installed_ones_do_read_the_file(
+    pol, launcher, shell, program
+):
+    f = f"{HOME}/{SSH}/id_rsa"
+    line = f"{launcher} {shell} -c 'cat {f}'"
+    assert gate(pol, line)
+    if program and _installed(program) and _installed(shell):
+        assert run_line(line, {}, tries=3).touched, line
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        pytest.param(n, id=f"{n}-{'real-shell' if _installed(n) else 'gate-decision-only'}")
+        for n in ("sh5", "bash5.2", "bash-static", "zsh5", "mksh-static")
+    ],
+)
+def test_a_shell_with_a_version_or_build_in_its_name_is_denied_whatever_starts_it(pol, name):
+    f = f"{HOME}/{SSH}/id_rsa"
+    lines = [
+        f"{name} <<< 'cat {f}'",
+        f"{name} <<'EOF'\ncat {f}\nEOF",
+        f"echo 'cat {f}' | {name}",
+        f"taskset 1 {name} -c 'cat {f}'",
+        f"fakeroot {name} <<< 'cat {f}'",
+    ]
+    assert [line for line in lines if gate(pol, line) is None] == []
+    if _installed(name):
+        assert all(run_bash(line, {}).touched for line in lines[:3])
+
+
 # --- the policy's own tables, as lines -----------------------------------------------------------------------------------
 
 

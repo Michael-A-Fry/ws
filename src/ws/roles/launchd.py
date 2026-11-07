@@ -35,7 +35,7 @@ def interval(when: When) -> dict[str, int]:
 
 
 def render(job: Scheduled, env, ws_cmd: list[str]) -> str:
-    environment = paths.env_for(env, persist=True)
+    environment = paths.env_for(env)
     if path := _schedule.path_value(env):
         environment["PATH"] = path
     log = str(_schedule.logs_dir(env) / f"{job.name}.log")

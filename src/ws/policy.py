@@ -344,13 +344,16 @@ def secret_read_rules(home: Path | None = None) -> tuple[str, ...]:
     that one too. With `home`, a policy kept in a folder of its own: that folder's `secrets`, as a single-folder layout.
     Each folder is named as written (made absolute) and as the real path it resolves to, so a ws folder that is a
     symlink is covered whichever way a command spells it. They are added to every policy that is read, so a session
-    can't read them whatever its policy file says; the runners' own rules, the sandbox and the hook all see them."""
+    can't read them whatever its policy file says; the runners' own rules, the sandbox and the hook all see them.
+    Without `home`, each `~/.ws.migrated-*` folder (what `ws migrate` left of the old one) is covered whole too."""
     from ws import secrets  # here, not at the top: it is a command module that imports more than the policy needs
 
     if home is None:
         folders = [*paths.secret_dirs()]
         with contextlib.suppress(Exception):  # a profile that does not read leaves the default folders, always covered
             folders.append(secrets.store_dir().expanduser().absolute())
+        with contextlib.suppress(Exception):
+            folders += paths.migrated_dirs()
     else:
         base = Path(home).expanduser().absolute()
         folders = [base / "secrets"]

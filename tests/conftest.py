@@ -16,13 +16,17 @@ entries of ~/.ssh (names, sizes and change times only; their contents are never 
 
 from __future__ import annotations
 
+import contextlib
 import os
 from pathlib import Path
 
 import pytest
 
-from ws import userconfig
+from ws import approvals, paths, userconfig
 
+# The runners' config variables, the four XDG ones, ws's own folder variables (`WS_HOME` is set per test below) and the
+# marks of a gated session: a test run inside a ws session would otherwise write to the folders that session names, or
+# be refused as a session.
 _CONFIG_VARS = (
     "CLAUDE_CONFIG_DIR",
     "XDG_CONFIG_HOME",
@@ -30,20 +34,36 @@ _CONFIG_VARS = (
     "XDG_STATE_HOME",
     "XDG_CACHE_HOME",
     "OPENCODE_CONFIG",
+    *paths.ENV_DIRS.values(),
+    approvals.ENV_MARKER,
+    approvals.SANDBOX_MARKER,
+    approvals.FD_ENV,
 )
 
 
 _REAL_HOME = Path(os.path.expanduser("~"))
-_REAL_WS_HOME = Path(os.environ.get("WS_HOME") or _REAL_HOME / ".ws")
-_REAL_XDG_CONFIG = _REAL_HOME / ".config" / "ws"  # where ws keeps its files since the XDG layout
-_REAL_XDG_STATE = _REAL_HOME / ".local" / "state" / "ws"
+_OUTER_ENV = dict(os.environ)  # as the shell that started the run had it, before any test changes it
+_WS_FILES = ("install-manifest.json", "profile.toml", "policy.toml")
+
+
+def _real_ws_layouts(outer: dict[str, str], home: Path) -> list[paths.Layout]:
+    """Every layout ws could be using for the real `home`: the one the starting shell's variables name, the XDG folders
+    (with and without its XDG variables) and `~/.ws`."""
+    plain = {"HOME": str(home)}
+    out = [paths.xdg_layout(plain), paths.xdg_layout({**outer, **plain}), paths.Layout("legacy", *[home / ".ws"] * 4)]
+    for env in ({**outer, "HOME": str(home)}, plain):
+        with contextlib.suppress(Exception):  # an unclear layout is still covered by the others
+            out.append(paths.layout(env))
+    return out
+
+
+def _ws_files_to_watch(outer: dict[str, str], home: Path) -> tuple[Path, ...]:
+    found = [lay.path_of(name) for lay in _real_ws_layouts(outer, home) for name in _WS_FILES]
+    return tuple(dict.fromkeys(found))
+
+
 _WATCHED = (
-    _REAL_WS_HOME / "install-manifest.json",
-    _REAL_WS_HOME / "profile.toml",
-    _REAL_WS_HOME / "policy.toml",
-    _REAL_XDG_STATE / "install-manifest.json",
-    _REAL_XDG_CONFIG / "profile.toml",
-    _REAL_XDG_CONFIG / "policy.toml",
+    *_ws_files_to_watch(_OUTER_ENV, _REAL_HOME),
     _REAL_HOME / ".claude" / "settings.json",
     _REAL_HOME / ".claude" / "skills",
     _REAL_HOME / ".config" / "opencode" / "opencode.json",

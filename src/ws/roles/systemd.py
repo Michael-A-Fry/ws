@@ -46,7 +46,7 @@ def on_calendar(when: When) -> str:
 def render(job: Scheduled, env, ws_cmd: list[str]) -> dict[str, str]:
     """{file name: text} for one job."""
     unit = f"{PREFIX}{job.name}"
-    lines = [f"Environment={_quote(f'{k}={v}')}" for k, v in paths.env_for(env, persist=True).items()]
+    lines = [f"Environment={_quote(f'{k}={v}')}" for k, v in paths.env_for(env).items()]
     if path := _schedule.path_value(env):
         lines.append(f"Environment={_quote('PATH=' + path)}")
     exec_start = " ".join(_quote(w, expand=True) for w in [*ws_cmd, *job.argv])

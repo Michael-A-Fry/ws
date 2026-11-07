@@ -3,6 +3,7 @@ in as a dict (or set on the process for the commands that read it), so nothing t
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -13,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from ws import cli, migrate, paths
+from ws import approvals, cli, gate, migrate, paths, policy
 from ws.output import WsError
 
 NOW = datetime(2026, 11, 7, 3, 0, tzinfo=UTC)
@@ -69,6 +70,8 @@ def tree(root: Path) -> dict[str, tuple]:
             out[rel] = ("link", os.readlink(p))
         elif p.is_dir():
             out[rel] = ("dir", stat.S_IMODE(p.stat().st_mode))
+        elif stat.S_ISSOCK(p.lstat().st_mode):
+            out[rel] = ("socket",)
         else:
             out[rel] = ("file", hashlib.sha256(p.read_bytes()).hexdigest(), stat.S_IMODE(p.stat().st_mode))
     return out
@@ -130,7 +133,8 @@ def test_the_move_keeps_every_mode_and_the_secrets_stay_private(home, env):
     for d in (home / ".config" / "ws", state, data, home / ".cache" / "ws"):
         assert stat.S_IMODE(d.stat().st_mode) == 0o700  # ws's own folders start private
     kept = tree(home / ".ws.migrated-20261107")
-    assert kept == before  # the old folder is renamed whole: nothing in it was touched or deleted
+    # the old folder is renamed with nothing touched or deleted, except the secrets store, which moved by rename
+    assert kept == {k: v for k, v in before.items() if k != "secrets" and not k.startswith("secrets/")}
 
 
 def test_the_old_folder_is_renamed_never_deleted_and_a_manifest_lists_what_moved(home, env):
@@ -226,10 +230,23 @@ def test_a_failed_refresh_leaves_the_move_done_and_says_what_to_run(home, env):
     assert (home / ".config" / "ws" / "policy.toml").is_file()
 
 
-def test_timers_are_flagged_for_a_schedule_apply(home, env):
-    make_old_home(home)
-    out = migrate.migrate(env, now=NOW, refresh=stub_refresh([]))
-    assert out["next"] == "ws schedule apply" and "ws schedule apply" in migrate.render(out)
+def test_timers_are_switched_off_for_the_move_and_on_again_after_it(home, env):
+    old = make_old_home(home)
+    write(old / "jobs" / "units" / "ws-daily.timer", "[Timer]\n")
+    seen = []
+
+    def off(files, e):
+        seen.append(("off", [f.name for f in files], old.is_dir()))
+        return []
+
+    def on(e):
+        seen.append(("on", paths.layout(e).mode, old.exists()))
+        return []
+
+    out = migrate.migrate(env, now=NOW, refresh=stub_refresh([]), deactivate=off, reschedule=on)
+    assert seen == [("off", ["ws-daily.timer"], True), ("on", "xdg", False)]
+    assert out["rescheduled"] == 1 and "next" not in out
+    assert "on again" in migrate.render(out)
 
 
 # ---- refusals and repeats ---------------------------------------------------------------------------------------------
@@ -317,6 +334,231 @@ def test_a_file_where_the_old_folder_would_be_is_refused(home, env):
     with pytest.raises(WsError) as e:
         migrate.migrate(env, now=NOW)
     assert e.value.kind == "bad_config"
+
+
+# ---- the secrets store leaves no copy behind ---------------------------------------------------------------------------
+
+
+def files_holding(root: Path, value: bytes) -> list[Path]:
+    return [p for p in root.rglob("*") if p.is_file() and not p.is_symlink() and value in p.read_bytes()]
+
+
+def test_the_secrets_store_is_renamed_so_the_old_folder_keeps_no_copy(home, env):
+    old = make_old_home(home)
+    inode = os.stat(old / "secrets" / "KEY").st_ino
+    migrate.migrate(env, now=NOW, refresh=stub_refresh([]))
+    kept = home / ".ws.migrated-20261107"
+    new = home / ".local" / "share" / "ws" / "secrets"
+    assert not (kept / "secrets").exists() and files_holding(kept, b"not-a-real-value") == []
+    assert (new / "KEY").read_text(encoding="utf-8") == "not-a-real-value"
+    assert os.stat(new / "KEY").st_ino == inode  # the same file, not a copy
+    assert stat.S_IMODE((new / "KEY").stat().st_mode) == 0o600 and stat.S_IMODE(new.stat().st_mode) == 0o700
+
+
+def test_across_filesystems_the_store_is_copied_checked_and_the_old_copy_removed(home, env, monkeypatch):
+    old = make_old_home(home)
+    write(old / "secrets" / "sub" / "TOKEN", "another-not-a-real-value", 0o600)
+    (old / "secrets" / "sub").chmod(0o700)
+    real = os.rename
+
+    def rename(src, dst):
+        if Path(src).name == "secrets":
+            raise OSError(errno.EXDEV, "Invalid cross-device link", str(src))
+        return real(src, dst)
+
+    monkeypatch.setattr(os, "rename", rename)
+    out = migrate.migrate(env, now=NOW, refresh=stub_refresh([]))
+    kept = home / ".ws.migrated-20261107"
+    new = home / ".local" / "share" / "ws" / "secrets"
+    assert out["state"] == "moved" and not (kept / "secrets").exists()
+    assert files_holding(kept, b"not-a-real-value") == []
+    assert (new / "sub" / "TOKEN").read_text(encoding="utf-8") == "another-not-a-real-value"
+    for p, mode in ((new, 0o700), (new / "sub", 0o700), (new / "KEY", 0o600), (new / "sub" / "TOKEN", 0o600)):
+        assert stat.S_IMODE(p.stat().st_mode) == mode, p
+
+
+def test_a_store_that_arrives_wrong_is_not_removed_from_the_old_folder(home, env, monkeypatch):
+    old = make_old_home(home)
+
+    def cross_device(src, dst):
+        raise OSError(errno.EXDEV, "Invalid cross-device link", str(src))
+
+    monkeypatch.setattr(os, "rename", cross_device)
+    real = migrate._copy_file
+
+    def corrupt(item):
+        real(item)
+        if item.src.name == "KEY":
+            item.dst.write_text("not what was there", encoding="utf-8")
+
+    monkeypatch.setattr(migrate, "_copy_file", corrupt)
+    with pytest.raises(WsError) as e:
+        migrate.migrate(env, now=NOW, refresh=stub_refresh([]))
+    assert e.value.kind == "failed" and (old / "secrets" / "KEY").read_text(encoding="utf-8") == "not-a-real-value"
+    assert old.is_dir() and not (home / ".ws.migrated-20261107").exists()
+
+
+def hook(tool, **tool_input):
+    return json.dumps({"tool_name": tool, "tool_input": tool_input})
+
+
+def test_a_session_can_neither_read_nor_write_what_the_move_left_in_the_old_folder(cli_home):
+    make_old_home(cli_home)
+    migrate.migrate({"HOME": str(cli_home)}, now=NOW, refresh=stub_refresh([]))
+    kept = cli_home / ".ws.migrated-20261107"
+    again = cli_home / ".ws.migrated-20261107-2"  # a second move on the same day gets a number
+    again.mkdir()
+    pol = policy.default_policy()
+    protect = gate._protect(paths.config_dir() / "policy.toml")
+    for folder in (kept, again):
+        for call in (
+            hook("Read", file_path=str(folder / "profile.toml")),
+            hook("Bash", command=f"cat {folder}/logs/runs.jsonl"),
+            hook("Grep", pattern="x", path=str(folder)),
+            hook("Write", file_path=str(folder / "new.txt")),
+            hook("Edit", file_path=str(folder / "policy.toml")),
+            hook("Bash", command=f"echo x > {folder}/sessions/a.json"),
+        ):
+            assert gate.check("claude-code", call, pol, protect), (str(folder), call)
+    other = cli_home / ".ws-notes" / "a.txt"  # a name that only looks alike is nobody's concern
+    assert not gate.check("claude-code", hook("Read", file_path=str(other)), pol, protect)
+
+
+def test_the_wall_and_the_runners_rules_name_the_folders_a_move_left(cli_home):
+    make_old_home(cli_home)
+    migrate.migrate({"HOME": str(cli_home)}, now=NOW, refresh=stub_refresh([]))
+    kept = cli_home / ".ws.migrated-20261107"
+    assert kept in paths.protected_roots() and f"{kept}/**" in policy.secret_read_rules()
+    assert str(kept) in gate._protect(paths.config_dir() / "policy.toml")
+
+
+# ---- timers --------------------------------------------------------------------------------------------------------
+
+
+def old_home_with_a_timer(home):
+    old = make_old_home(home)
+    write(old / "jobs" / "units" / "ws-daily.timer", "[Timer]\n")
+    return old
+
+
+def test_a_timer_that_will_not_switch_off_stops_the_move_before_it_starts(home, env):
+    old_home_with_a_timer(home)
+    before = tree(home)
+    calls = []
+    with pytest.raises(WsError) as e:
+        migrate.migrate(
+            env,
+            now=NOW,
+            refresh=stub_refresh([]),
+            deactivate=lambda files, e2: ["systemctl said no"],
+            reschedule=lambda e2: calls.append("on") or [],
+        )
+    assert e.value.kind == "refused" and "ws schedule apply" in e.value.hint
+    assert tree(home) == before and calls == []
+
+
+def test_timers_that_will_not_start_again_are_named_and_the_command_exits_1(home, env):
+    old_home_with_a_timer(home)
+    out = migrate.migrate(
+        env, now=NOW, refresh=stub_refresh([]), deactivate=lambda files, e2: [], reschedule=lambda e2: ["no bus"]
+    )
+    assert out["state"] == "moved" and out["next"] == "ws schedule apply" and out["schedule_error"] == "no bus"
+    assert "ws schedule apply" in migrate.render(out)
+
+
+def test_no_timer_file_means_the_scheduler_is_never_asked(home, env):
+    make_old_home(home)  # only a .service file in jobs/units
+    asked = []
+    out = migrate.migrate(
+        env,
+        now=NOW,
+        refresh=stub_refresh([]),
+        deactivate=lambda files, e2: asked.append(files) or [],
+        reschedule=lambda e2: asked.append("on") or [],
+    )
+    assert out["state"] == "moved" and asked == [] and "rescheduled" not in out
+
+
+def test_the_machines_scheduler_is_switched_off_through_the_runner(home, env):
+    old_home_with_a_timer(home)
+    argvs = []
+
+    def runner(argv):
+        argvs.append(argv)
+        return 0, ""
+
+    migrate.migrate(env, now=NOW, refresh=stub_refresh([]), reschedule=lambda e2: [], runner=runner)
+    assert ["systemctl", "--user", "disable", "--now", "ws-daily.timer", "ws-daily.service"] in argvs
+
+
+def test_the_command_keeps_the_timers_off_only_while_the_files_move(cli_home, capsys, monkeypatch):
+    old = old_home_with_a_timer(cli_home)
+    seen = []
+    monkeypatch.setattr(migrate, "_deactivate", lambda files, e, runner=None: seen.append(("off", old.is_dir())) or [])
+    monkeypatch.setattr(migrate, "_reschedule", lambda e, runner=None: seen.append(("on", old.exists())) or [])
+    monkeypatch.setattr(migrate, "_refresh", lambda e: "0 changes")
+    assert cli.main(["migrate"]) == 0
+    assert seen == [("off", True), ("on", False)]
+    assert "on again" in capsys.readouterr().out
+
+
+# ---- the move won't start under a live broker or session, and its temporary files are its own ---------------------------
+
+
+def listening(path: Path) -> socket.socket:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(str(path))
+    srv.listen(1)
+    return srv
+
+
+def test_it_refuses_while_the_broker_answers_and_changes_nothing(home, env):
+    old = make_old_home(home)
+    srv = listening(old / "run" / "broker.sock")
+    before = tree(home)
+    try:
+        with pytest.raises(WsError) as e:
+            migrate.migrate(env, now=NOW, refresh=stub_refresh([]))
+    finally:
+        srv.close()
+    assert e.value.kind == "refused" and "broker.sock" in e.value.message
+    assert tree(home) == before and not (home / ".config").exists()
+
+
+def test_a_socket_nothing_listens_on_is_a_leftover_and_does_not_stop_the_move(home, env):
+    old = make_old_home(home)
+    listening(old / "run" / "broker.sock").close()  # the file stays, the broker is gone
+    out = migrate.migrate(env, now=NOW, refresh=stub_refresh([]))
+    assert out["state"] == "moved"
+
+
+@pytest.mark.parametrize("marker", [approvals.ENV_MARKER, approvals.SANDBOX_MARKER])
+def test_it_refuses_inside_a_gated_ws_session_but_a_dry_run_still_plans(home, env, marker):
+    make_old_home(home)
+    inside = {**env, marker: "1"}
+    with pytest.raises(WsError) as e:
+        migrate.migrate(inside, now=NOW, refresh=stub_refresh([]))
+    assert e.value.kind == "refused" and "gated ws session" in e.value.message
+    assert not (home / ".config").exists()
+    assert migrate.migrate(inside, dry_run=True, now=NOW)["state"] == "move"
+
+
+def test_a_planted_name_for_a_temporary_file_is_never_written_through(home, env, tmp_path):
+    make_old_home(home)
+    victim = write(tmp_path / "victim.txt", "precious")
+    other = write(tmp_path / "other.txt", "also precious")
+    cfg, state = home / ".config" / "ws", home / ".local" / "state" / "ws"
+    cfg.mkdir(parents=True)
+    state.mkdir(parents=True)
+    os.link(victim, cfg / ".policy.toml.migrate-tmp")  # a second name for a file of the person's
+    os.link(victim, state / ".migrate-manifest.json.migrate-tmp")
+    os.symlink(other, cfg / ".profile.toml.migrate-tmp")
+    out = migrate.migrate(env, now=NOW, refresh=stub_refresh([]))
+    assert out["state"] == "moved"
+    assert victim.read_text(encoding="utf-8") == "precious" and other.read_text(encoding="utf-8") == "also precious"
+    assert (cfg / "policy.toml").read_text(encoding="utf-8") == "[gate]\n"
+    assert json.loads((state / "migrate-manifest.json").read_text(encoding="utf-8"))["schema"] == migrate.SCHEMA
 
 
 # ---- the command ------------------------------------------------------------------------------------------------------

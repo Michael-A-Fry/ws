@@ -135,6 +135,7 @@ def modules_that_write() -> dict[str, set[str]]:
 # Modules that spell out a .jsonl name without writing it: the policy lists ws's logs among the paths a session may
 # not write, the Claude Code adapter reads the runner's own transcript, and the home API names the default path of
 # the asks file it reads (it writes nothing), and ws.paths names ratings.jsonl in its table of where files live.
+# src/ws/paths.py is on the list because it writes no file at all: the name is one row of its table, not a store.
 NAMES_ONLY = {"src/ws/policy.py", "src/ws/adapters/claude_code.py", "src/ws/home/api.py", "src/ws/paths.py"}
 # Files another tool writes and ws only reads (the home API's default sources). Not ws stores, so stores.md doesn't
 # list them; only a NAMES_ONLY module may name one.

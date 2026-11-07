@@ -83,6 +83,7 @@ _XDG = {  # kind -> (variable, default below HOME)
     "cache": ("XDG_CACHE_HOME", ".cache"),
 }
 LEGACY_NAME = ".ws"
+MIGRATED_GLOB = f"{LEGACY_NAME}.migrated-*"  # what `ws migrate` renames the old folder to (a date, then maybe a number)
 _OWNED_KINDS = ("config", "state", "data")  # a cache folder can be made by anything; it does not say ws lives there
 
 
@@ -281,10 +282,20 @@ def old_work_dir(env: Mapping[str, str] | None = None) -> Path:
     return base / "ws" / "work"
 
 
+def migrated_dirs(env: Mapping[str, str] | None = None) -> tuple[Path, ...]:
+    """The folders `ws migrate` left behind (`~/.ws.migrated-DATE`): the old files, kept until you remove them."""
+    home = home_dir(env)
+    try:
+        return tuple(sorted(p for p in home.glob(MIGRATED_GLOB) if p.is_dir() or p.is_symlink()))
+    except OSError:
+        return ()
+
+
 def candidates(env: Mapping[str, str] | None = None) -> tuple[Layout, ...]:
-    """Every layout ws could be using here: the one in use (when it can be told), the XDG folders and `~/.ws`. What guards
-    ws's files covers all of them, so a session can't plant files in the layout that is not in use to confuse the one
-    that is (a `~/.config/ws` beside a `~/.ws` makes the layout ambiguous, which stops ws)."""
+    """Every layout ws could be using here: the one in use (when it can be told), the XDG folders and `~/.ws`, and each
+    `~/.ws.migrated-*` folder a move left. What guards ws's files covers all of them, so a session can't plant files in
+    the layout that is not in use to confuse the one that is (a `~/.config/ws` beside a `~/.ws` makes the layout
+    ambiguous, which stops ws), nor read or change what a move left behind."""
     e = _env(env)
     out: list[Layout] = []
     try:
@@ -293,6 +304,7 @@ def candidates(env: Mapping[str, str] | None = None) -> tuple[Layout, ...]:
         pass  # an unclear layout is still guarded by the other two
     legacy = legacy_dir(e)
     out += [xdg_layout(e), Layout("legacy", legacy, legacy, legacy, legacy)]
+    out += [Layout("legacy", d, d, d, d) for d in migrated_dirs(e)]
     return tuple(out)
 
 
@@ -326,14 +338,14 @@ def control_paths_in(root: Path) -> list[str]:
     return [str(Path(root).expanduser().absolute() / n) for n in CONTROL_NAMES]
 
 
-def env_for(env: Mapping[str, str] | None = None, *, persist: bool = False) -> dict[str, str]:
+def env_for(env: Mapping[str, str] | None = None) -> dict[str, str]:
     """The variables that give a child process this layout, whatever HOME and XDG variables it has: `WS_HOME` for a
-    single folder, else the four `WS_*_DIR` ones. `persist` is for a file that outlives this moment (a timer unit): an
-    earlier ws's `~/.ws` is then not pinned, so the unit follows the files to the XDG folders after `ws migrate`."""
+    single folder (an earlier ws's `~/.ws` too), else the four `WS_*_DIR` ones. A timer unit pins them like any child, so
+    `ws migrate` switches the timers off before the move and writes them again after it."""
     e = _env(env)
     lay = layout(e)
     if lay.mode == "legacy":
-        return {} if persist else {"WS_HOME": str(lay.config)}
+        return {"WS_HOME": str(lay.config)}
     if lay.mode == "single" and len(lay.distinct()) == 1:
         return {"WS_HOME": str(lay.config)}
     return {ENV_DIRS[k]: str(lay.dir(k)) for k in KINDS}

@@ -194,10 +194,9 @@ def test_env_for_gives_a_child_the_same_folders(home, tmp_path):
     assert paths.env_for(env_of(home, WS_HOME=str(tmp_path / "w"))) == {"WS_HOME": str(tmp_path / "w")}
 
 
-def test_env_for_pins_the_old_folder_for_a_child_but_not_for_a_file_that_outlives_it(home):
+def test_env_for_pins_the_old_folder_explicitly(home):
     (home / ".ws").mkdir()
     assert paths.env_for(env_of(home)) == {"WS_HOME": str(home / ".ws")}
-    assert paths.env_for(env_of(home), persist=True) == {}  # a timer unit follows the files after `ws migrate`
 
 
 def test_describe_says_where_the_layout_comes_from(home, tmp_path):

@@ -6,7 +6,6 @@ plugins and where ws keeps its files, WS1xx are the roles (one per role).
 
 from __future__ import annotations
 
-import contextlib
 import os
 import shutil
 import sys
@@ -303,8 +302,10 @@ def run_checks(osi: OSInfo, profile_file: Path, env: dict | None = None, network
         checks.append(_layout_check(env))
     except Exception as e:  # noqa: BLE001 (a broken check must report, not crash the whole doctor)
         checks.append(Check("WS010", "layout", FAIL, f"check crashed ({type(e).__name__})"))
-    with contextlib.suppress(Exception):  # a note about plugins must not stop the rest
+    try:
         checks += _plugins_check(prof, env)
+    except Exception as e:  # noqa: BLE001 (a broken check must report, not crash the whole doctor)
+        checks.append(Check("WS009", "plugins", FAIL, f"check crashed ({type(e).__name__})"))
     roles = prof.get("roles") if isinstance(prof.get("roles"), dict) else {}
     for r in ROLES:
         cfg = roles.get(r.name)

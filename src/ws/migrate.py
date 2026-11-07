@@ -11,12 +11,17 @@ this, and `ws doctor` (WS010) says so. The move, in order:
      every copy by its SHA-256 and every link by its target.
   4. Write a manifest of what moved to `migrate-manifest.json` in the state folder (0600), and move the install record's
      paths to the new folders.
-  5. Rename `~/.ws` to `~/.ws.migrated-DATE`. It is never deleted: remove it yourself once you've looked.
-  6. Refresh what ws put on the machine (`ws install`), because the runners' hooks name the policy by its path.
+  5. Move the secrets store by rename (on one filesystem), so no copy of a secret stays behind. If the data folder is on
+     another filesystem it is copied (0700/0600), checked, and the old copy removed. Then rename `~/.ws` to
+     `~/.ws.migrated-DATE`. That folder is never deleted: remove it yourself once you've looked. The gate and the wall
+     treat it as ws's own, so a session can't read or change what is left in it.
+  6. Refresh what ws put on the machine (`ws install`), because the runners' hooks name the policy by its path, and
+     switch the timers off before the move and on again after it (they name the old folder).
 
 It is safe to run again: a finished move says so, and an interrupted one picks up where it stopped (files already in
 place and equal to their source are left as they are). With `WS_HOME` or a `WS_*_DIR` variable set there is nothing to
-migrate: ws uses the folders you named. Exit 0 when done (or nothing to do), 1 when it was refused or stopped.
+migrate: ws uses the folders you named. Exit 0 when done (or nothing to do), 1 when it was refused or stopped. It refuses while the secrets broker or a gated ws
+session is running, because those hold files that move.
 Python 3.11+, standard library only.
 """
 
@@ -24,9 +29,11 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import hashlib
 import json
 import os
+import socket
 import stat
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -44,7 +51,8 @@ _CHUNK = 1 << 20
 
 @dataclass
 class Item:
-    """One thing to put in place. `kind` is "dir", "file" or "link"; `action` is "copy" or "present" (already there)."""
+    """One thing to put in place. `kind` is "dir", "file" or "link"; `action` is "copy", "present" (already there) or
+    "renamed" (the secrets store, moved whole)."""
 
     src: Path
     dst: Path
@@ -166,10 +174,19 @@ def _unused_name(base: Path) -> Path:
     return Path(f"{base}-{n}")
 
 
+def _open_new(tmp: Path) -> int:
+    """A new file at `tmp`, private (0600), that is never anything that was there: a name left by an interrupted run, or
+    planted (a link, or a second name for another file), is removed first, and `O_EXCL` refuses to open anything but a
+    file this call makes."""
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(tmp)
+    return os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+
+
 def _copy_file(item: Item) -> None:
     dst = item.dst
     tmp = dst.with_name(f".{dst.name}.migrate-tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)  # private until its mode is set
+    fd = _open_new(tmp)  # private until its mode is set
     try:
         with os.fdopen(fd, "wb") as out, open(item.src, "rb") as src:
             while chunk := src.read(_CHUNK):
@@ -229,6 +246,114 @@ def _verify(p: Plan) -> list[str]:
     return bad
 
 
+def _remove_sources(items: list[Item]) -> None:
+    """Take the old copies away once the new ones are checked: files and links first, then folders, deepest first."""
+    for item in items:
+        if item.kind == "dir":
+            with contextlib.suppress(OSError):
+                os.chmod(item.src, 0o700)  # a read-only folder can't have its files removed
+    for item in reversed(items):
+        if item.kind == "dir":
+            with contextlib.suppress(OSError):  # a folder that still holds something ws can't move stays
+                os.rmdir(item.src)
+        else:
+            os.unlink(item.src)
+
+
+def _move_secrets(items: list[Item], lay: paths.Layout) -> None:
+    """Put the secrets store in the data folder without leaving a copy behind: one rename when the data folder is on the
+    same filesystem, else a copy (0700/0600 throughout), a check by hash, then the old copy removed. Raises `WsError`
+    when it can't; the old store is then still whole."""
+    if not items:
+        return
+    top = items[0]
+    if top.kind == "dir" and top.action == "copy":
+        try:
+            _make_roots(lay)
+            os.rename(top.src, top.dst)
+        except OSError as e:
+            if e.errno != errno.EXDEV:
+                raise WsError(
+                    "failed",
+                    f"could not move the secrets store: {e.strerror or type(e).__name__} ({e.filename})",
+                    "nothing was lost; fix that and run `ws migrate` again",
+                ) from e
+        else:
+            for item in items:
+                item.action = "renamed"
+            bad = _verify(Plan("move", top.src.parent, items))
+            if bad:
+                raise WsError("failed", f"the secrets store did not arrive whole. First: {bad[0]}", "report it")
+            return
+    sub = Plan("move", top.src.parent, items)
+    _copy(sub, lay)
+    bad = _verify(sub)
+    if bad:
+        raise WsError(
+            "failed",
+            f"{len(bad)} secrets file(s) did not match the source; the old store is untouched. First: {bad[0]}",
+            "run `ws migrate` again; if it repeats, report it",
+            details={"mismatches": bad},
+        )
+    _remove_sources(items)
+
+
+def _answers(sock: Path) -> bool:
+    """True when something is listening on this Unix socket."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(1.0)
+    try:
+        s.connect(str(sock))
+    except OSError:
+        return False
+    finally:
+        s.close()
+    return True
+
+
+def busy(source: Path, env: Mapping[str, str]) -> str:
+    """Why the move can't start now, or "": this command is running inside a gated ws session, or something (the secrets
+    broker) is answering on a socket in the old folder's `run/`. A socket nothing listens on is a leftover and is ignored."""
+    from ws import approvals
+
+    if env.get(approvals.ENV_MARKER) or env.get(approvals.SANDBOX_MARKER):
+        return "this command is running inside a gated ws session"
+    run = source / "run"
+    try:
+        socks = sorted(p for p in run.iterdir() if stat.S_ISSOCK(os.lstat(p).st_mode)) if run.is_dir() else []
+    except OSError:
+        socks = []
+    for sock in socks:
+        if _answers(sock):
+            return f"the secrets broker (or another process) is answering on {sock}"
+    return ""
+
+
+def _timers(p: Plan) -> list[Path]:
+    """The timer (systemd) and agent (launchd) files ws wrote in the old folder: the units are in `jobs/units/`."""
+    units = p.source / "jobs" / "units"
+    return [
+        i.src for i in p.items if i.kind == "file" and i.src.parent == units and i.src.suffix in (".timer", ".plist")
+    ]
+
+
+def _deactivate(timers: list[Path], env: Mapping[str, str], runner=None) -> list[str]:
+    from ws import roles
+
+    return roles.deactivate_units(timers, dict(env), runner)
+
+
+def _reschedule(env: Mapping[str, str], runner=None) -> list[str]:
+    """`ws schedule apply`: write the unit files again for the folders now in use and switch the timers on. Returns what
+    went wrong."""
+    from ws import install, osinfo
+    from ws.roles import commands
+
+    sched = commands._scheduler(osinfo.detect())
+    install.apply(sched.steps({}, install.answers_from_profile(env), env), env)
+    return sched.activate(env, runner)
+
+
 def _remap(value, mapping: Callable[[str], str]):
     if isinstance(value, str):
         return mapping(value)
@@ -267,10 +392,15 @@ def remap_install_record(doc: dict, source: Path, lay: paths.Layout) -> dict:
 def _write_private(path: Path, text: str) -> None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.migrate-tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(text)
-    os.replace(tmp, path)
+    fd = _open_new(tmp)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
 
 
 def _manifest(p: Plan, now: datetime, renamed: Path) -> dict:
@@ -310,9 +440,14 @@ def migrate(
     dry_run: bool = False,
     now: datetime | None = None,
     refresh: Callable[[Mapping[str, str]], str] | None = None,
+    deactivate: Callable[[list[Path], Mapping[str, str]], list[str]] | None = None,
+    reschedule: Callable[[Mapping[str, str]], list[str]] | None = None,
+    runner: Callable[[list[str]], tuple[int, str]] | None = None,
 ) -> dict:
     """Do the move (or plan it, with `dry_run`). Returns the result as a dict; raises `WsError` when it is refused or a
-    copy fails its check (nothing has been renamed or deleted by then)."""
+    copy fails its check (nothing has been renamed or deleted by then). `deactivate` switches the given timer files off
+    and `reschedule` writes and starts them again after the move; each returns what went wrong. They default to the
+    machine's scheduler, which runs its commands through `runner`."""
     e = os.environ if env is None else env
     p = plan(e)
     data: dict = {"state": p.state, "source": str(p.source), "message": p.message, "dry_run": dry_run}
@@ -338,16 +473,37 @@ def migrate(
     if dry_run:
         data["would_move"] = [{"from": str(i.src), "to": str(i.dst)} for i in p.copies if i.kind != "dir"]
         return data
+    why = busy(p.source, e)
+    if why:
+        raise WsError(
+            "refused",
+            f"{why}; nothing was changed",
+            "stop the broker and any ws session (run `ws migrate` from a plain terminal), then try again",
+        )
     had_install = (p.source / INSTALL_MANIFEST).is_file()
+    timers = _timers(p)
+    if timers:  # a timer names the old folder: stop them now, start them again from the new one
+        problems = deactivate(timers, e) if deactivate else _deactivate(timers, e, runner)
+        if problems:
+            raise WsError(
+                "refused",
+                f"could not switch ws's timers off: {problems[0]}; nothing was moved",
+                "run `ws schedule apply` to put them back, fix that, then run `ws migrate` again",
+                details={"problems": problems},
+            )
+    secrets_root = p.source / "secrets"
+    secret_items = [i for i in p.items if i.src == secrets_root or secrets_root in i.src.parents]
+    held = {id(i) for i in secret_items}
+    rest = Plan(p.state, p.source, [i for i in p.items if id(i) not in held])
     try:
-        _copy(p, lay)
+        _copy(rest, lay)
     except OSError as e2:
         raise WsError(
             "failed",
             f"could not copy to the new folders: {e2.strerror or type(e2).__name__} ({e2.filename})",
             "nothing in the old folder was changed; fix that and run `ws migrate` again",
         ) from e2
-    bad = _verify(p)
+    bad = _verify(rest)
     if bad:
         raise WsError(
             "failed",
@@ -367,6 +523,14 @@ def migrate(
                 f"could not update the install record in {record}: {e2}",
                 "the old folder is untouched; fix the file and run `ws migrate` again",
             ) from e2
+    try:
+        _move_secrets(secret_items, lay)  # the last of the files, by rename: no plaintext copy stays in the old folder
+    except OSError as e2:
+        raise WsError(
+            "failed",
+            f"could not move the secrets store: {e2.strerror or type(e2).__name__} ({e2.filename})",
+            "the old store is whole; fix that and run `ws migrate` again",
+        ) from e2
     when = now or datetime.now(UTC)
     _write_private(lay.state / MANIFEST, json.dumps(_manifest(p, when, renamed), indent=2) + "\n")
     os.rename(p.source, renamed)
@@ -376,9 +540,16 @@ def migrate(
             data["refreshed"] = (refresh or _refresh)(e)
         except Exception as e2:  # noqa: BLE001 (the move is done; say what is left)
             data["refresh_error"] = str(e2)
-    units = p.source / "jobs" / "units"
-    if any(i.src == units or units in i.src.parents for i in p.items):
-        data["next"] = "ws schedule apply"
+    if timers:
+        try:
+            problems = reschedule(e) if reschedule else _reschedule(e, runner)
+        except Exception as e2:  # noqa: BLE001 (the move is done; say what is left)
+            problems = [str(e2)]
+        if problems:
+            data["next"] = "ws schedule apply"
+            data["schedule_error"] = problems[0]
+        else:
+            data["rescheduled"] = len(timers)
     return data
 
 
@@ -405,14 +576,18 @@ def render(data: dict) -> str:
         out.append(f"ws: refreshed the runner hooks and generated files: {data['refreshed']}")
     if "refresh_error" in data:
         out.append(f"ws: could not refresh the runner hooks ({data['refresh_error']}); run `ws install` to finish")
+    if data.get("rescheduled"):
+        out.append("ws: the timers were switched off for the move and are on again from the new folders")
     if data.get("next"):
-        out.append(f"ws: your timers still point at the old folder: run `{data['next']}`")
+        out.append(
+            f"ws: your timers are off or still name the old folder ({data['schedule_error']}): run `{data['next']}`"
+        )
     return "\n".join(out)
 
 
 def cmd_migrate(args: argparse.Namespace) -> int:
     data = migrate(dry_run=args.dry_run)
-    failed = "refresh_error" in data
+    failed = "refresh_error" in data or "schedule_error" in data
     if args.json:
         output.result(data, status=output.ATTENTION if failed else output.OK)
     else:

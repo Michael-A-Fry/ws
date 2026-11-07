@@ -79,6 +79,18 @@ def test_a_bad_job_count_reads_as_a_plural(box):
     assert any(d.startswith("2 job files ws would refuse") for d in details)
 
 
+def test_a_crashed_plugins_check_is_a_failed_line_not_a_silent_gap(box, monkeypatch):
+    def boom(prof, env):
+        raise RuntimeError("planted")
+
+    monkeypatch.setattr(doctor, "_plugins_check", boom)
+    env = {"HOME": str(box), "WS_HOME": str(box / ".ws")}
+    checks = doctor.run_checks(OSI, box / "p.toml", env=env, network=False)
+    line = [c for c in checks if c.id == "WS009"]
+    assert len(line) == 1 and line[0].status == doctor.FAIL and "crashed (RuntimeError)" in line[0].detail
+    assert any(c.id == "WS010" for c in checks) and any(c.id.startswith("WS1") for c in checks)  # the rest still ran
+
+
 def test_ansi_stripped_doctor_output_equals_its_no_color_output(box, capsys, monkeypatch):
     monkeypatch.setenv("FORCE_COLOR", "1")
     cli.main(["doctor", "--offline"])

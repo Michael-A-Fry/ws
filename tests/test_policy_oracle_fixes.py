@@ -2,7 +2,9 @@
 
 Each test here fails on the reader as it was before the round: here-document names read as bash reads them, a `TMPDIR`
 and a `PATH` the line does not set, arithmetic that runs quoted text, a long option written short, the directory stack,
-code that is not resolved, and a `cd` to a name the shell may find somewhere else. A message is text, not a file.
+code that is not resolved, and a `cd` to a name the shell may find somewhere else. A message and the body of a
+here-document are read as any other text is, and a here-document or here-string given to something that runs it is
+code.
 Tests set HOME and WS_HOME to a made-up home folder and read nothing from the machine.
 """
 
@@ -261,7 +263,7 @@ def test_an_existing_child_a_dot_name_and_a_full_path_are_known(pol, tmp_path):
     assert denied(pol, "cd /tmp && cat x") is None
 
 
-# --- a message is text -------------------------------------------------------------------------------------------------
+# --- a message and a here-document body are read like any other text ----------------------------------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -280,8 +282,8 @@ def test_an_existing_child_a_dot_name_and_a_full_path_are_known(pol, tmp_path):
         'git commit -m "fix $THING in /home/$USER/proj"',
     ],
 )
-def test_a_message_is_data_and_nothing_in_a_quoted_one_runs(pol, cmd):
-    assert denied(pol, cmd) is None, cmd
+def test_no_quoting_makes_a_message_or_a_body_data_the_reader_skips(pol, cmd):
+    assert denied(pol, cmd), cmd
 
 
 @pytest.mark.parametrize(
@@ -310,3 +312,57 @@ def test_a_number_the_shell_makes_cannot_hold_a_slash_or_a_dot(pol):
     for ok in ("cat /tmp/$$.log", "curl -sS 'https://example.com/?r='$RANDOM", "cat /tmp/x$((1+2)).txt", "ls /tmp/$#"):
         assert denied(pol, ok) is None, ok
     assert denied(pol, "cat /tmp/$1.log")
+
+
+# --- a here-document or here-string given to something that runs it is code -----------------------------------------------
+
+
+def kind_of(pol, cmd):
+    """The kind of the typed refusal the reader raises for the line (None when it raises none)."""
+    try:
+        with shellwords.time_limit():
+            policy._walk_command(pol, cmd, "/tmp", ("/home/pat/.ws",), [])
+    except shellwords.ShellError as e:
+        return e.kind
+    return None
+
+
+CONSUMERS = ["source /dev/stdin", ". /dev/stdin", "source ./f", "eval", "ssh host", "xargs cat", "xargs -I{} sh -c {}"]
+CONSUMERS += ["bash ./f", "sh -c cat", "zsh ./f", "dash ./f", "ksh ./f", "fish ./f", "env bash ./f", "/bin/sh ./f"]
+
+
+@pytest.mark.parametrize("consumer", CONSUMERS)
+@pytest.mark.parametrize("feed", ["<<< 'cat x'", "<<'EOF'\ncat x\nEOF", "<<EOF\ncat x\nEOF", "<<-EOF\n\tcat x\n\tEOF"])
+def test_stdin_that_is_code_is_a_typed_refusal(pol, consumer, feed):
+    assert kind_of(pol, f"{consumer} {feed}") == "stdin-is-code", (consumer, feed)
+    assert denied(pol, f"{consumer} {feed}")
+
+
+@pytest.mark.parametrize("shell", ["bash", "sh", "zsh", "dash", "ksh", "fish"])
+@pytest.mark.parametrize("flag", ["", "-s", "-s --"])
+def test_a_shell_fed_text_with_or_without_s_is_denied(pol, shell, flag):
+    assert denied(pol, f"{shell} {flag} <<< 'cat x'")
+    assert denied(pol, f"{shell} {flag} <<'EOF'\ncat x\nEOF")
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "cat <<'EOF'\nhello\nEOF",
+        "cat > notes.md <<'EOF'\nhello\nEOF",
+        "grep -c x <<< 'a x b'",
+        "python3 - <<'EOF'\nprint(1)\nEOF",
+        "wc -l <<< 'a'",
+    ],
+)
+def test_text_given_to_a_program_that_only_reads_it_is_not_stdin_is_code(pol, cmd):
+    assert kind_of(pol, cmd) is None and denied(pol, cmd) is None, cmd
+
+
+def test_a_shell_given_the_text_a_command_set_is_refused_in_a_here_document_body_as_it_is_outside_one(pol):
+    for cmd in (
+        'X=$(echo ls); bash -c "$X"',
+        "cat > f <<'EOF'\nX=$(echo ls)\nbash -c \"$X\"\nEOF\nchmod 700 f",
+        "cat > f <<'EOF'\nbody\nEOF\nX=$(echo ls); sh -c \"$X\"",
+    ):
+        assert "another command produces" in (denied(pol, cmd) or ""), cmd

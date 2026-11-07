@@ -359,13 +359,15 @@ def test_temp_is_the_one_the_line_sets_and_neither_the_pin_nor_the_environment(p
     assert policy._produced("mktemp", ctx, policy._env({"TMPDIR": "/var/tmp"})) == "/var/tmp/tmp.XXXXXXXXXX"
 
 
-def test_the_here_document_cat_of_a_message_is_its_text(pol):
-    ok = "git commit -q -m \"$(cat <<'EOF'\nFix the $X thing in dd of=$Y\nEOF\n)\""
-    assert denied(pol, ok) is None
-    unquoted = 'git commit -q -m "$(cat <<EOF\nFix the $X thing\nEOF\n)"'
-    assert denied(pol, unquoted) is None  # a message: $X is text in it, wherever its value comes from
-    assert denied(pol, f'git commit -q -m "$(cat <<EOF\n$(cat /home/pat/{SSH}/id_rsa)\nEOF\n)"')  # but $( ) runs
-    assert denied(pol, "gh pr create --title t --body \"$(cat <<'EOF'\nSee ~/.config and $HOME\nEOF\n)\"") is None
+def test_the_here_document_cat_of_a_message_is_read_like_any_other_text(pol):
+    # a body is read as commands, as it is on a release without this reader: nothing about a message makes it data
+    for cmd in (
+        "git commit -q -m \"$(cat <<'EOF'\nFix the $X thing in dd of=$Y\nEOF\n)\"",
+        'git commit -q -m "$(cat <<EOF\nFix the $X thing\nEOF\n)"',
+        f'git commit -q -m "$(cat <<EOF\n$(cat /home/pat/{SSH}/id_rsa)\nEOF\n)"',
+        "gh pr create --title t --body \"$(cat <<'EOF'\nSee ~/.config and $HOME\nEOF\n)\"",
+    ):
+        assert denied(pol, cmd), cmd
 
 
 # --- what stays allowed, and the reading of here-document bodies -------------------------------------------------

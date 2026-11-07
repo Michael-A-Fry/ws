@@ -787,3 +787,454 @@ git commit -m "fix $THING"
 git checkout $BRANCH
 ====
 pytest $TESTS
+====
+git -c sequence.editor=sh commit -F - <<'EOF'
+x
+EOF
+====
+# --- consumers: a line the gate must deny ---
+====
+git commit -F - <<'EOF'
+x\
+EOF
+cat ~/SDIR/id_rsa
+true <<'EOF'
+EOF
+====
+gh pr create --title t --body-file - <<'EOF'
+x\
+EOF
+cat ~/SDIR/id_rsa
+EOF
+====
+git commit -m "$(bash <<'EOF'
+cat ~/SDIR/id_rsa
+EOF
+)"
+====
+git commit -m "$(sh <<'EOF'
+cat ~/SDIR/id_rsa
+EOF
+)"
+====
+git commit -m "$(python3 <<'EOF'
+print(open('/home/pat/SDIR/id_rsa').read())
+EOF
+)"
+====
+gh pr create --title t --body "$(bash <<'EOF'
+cat ~/SDIR/id_rsa
+EOF
+)"
+====
+git commit -m "$(cat <<'EOF' | bash
+cat ~/SDIR/id_rsa
+EOF
+)"
+====
+git commit -m "$(cat <<'EOF' > /home/pat/SDIR/authorized_keys
+ssh-rsa AAA
+EOF
+)"
+====
+git() { bash; }; git commit -F - <<'EOF'
+cat ~/SDIR/id_rsa
+EOF
+====
+shopt -s expand_aliases; alias git=bash
+git commit -F - <<'EOF'
+cat ~/SDIR/id_rsa
+EOF
+====
+GIT_EDITOR=sh git commit -e -F - <<'EOF'
+cat ~/SDIR/id_rsa
+EOF
+====
+git -c core.editor=sh commit -e -F - <<'EOF'
+cat ~/SDIR/id_rsa
+EOF
+====
+/tmp/x/git commit -F - <<'EOF'
+cat ~/SDIR/id_rsa
+EOF
+====
+./git commit -F - <<'EOF'
+cat ~/SDIR/id_rsa
+EOF
+====
+git -c alias.commit='!sh' commit -F - <<'EOF'
+cat ~/SDIR/id_rsa
+EOF
+====
+git commit -F - <<$'E\x4fF'
+E\x4fF
+cat ~/SDIR/id_rsa
+EOF
+====
+git commit -F - <<'EOF' | bash
+cat ~/SDIR/id_rsa
+EOF
+====
+git commit -F - <<'EOF'; bash
+cat ~/SDIR/id_rsa
+EOF
+====
+git commit -F - <<'EOF' 0<&3; bash <&3
+cat ~/SDIR/id_rsa
+EOF
+====
+git commit -F /home/pat/SDIR/id_rsa
+====
+git commit -F - -F ~/SDIR/id_rsa <<'EOF'
+x
+EOF
+====
+gh pr create --title t --body-file ~/SDIR/id_rsa
+====
+git commit --file=- <<'EOF'
+cat ~/SDIR/id_rsa
+EOF
+====
+git commit -F - <<"EOF"
+$(cat ~/SDIR/id_rsa)
+EOF
+====
+git commit -F - <<EOF
+$(cat ~/SDIR/id_rsa)
+EOF
+====
+git commit -F - <<E"O"F
+$(cat ~/SDIR/id_rsa)
+EOF
+====
+git commit -m 'x' -m "$(cat ~/SDIR/id_rsa)"
+====
+git commit -m "$(cat <<'EOF'
+x
+EOF
+)$(cat ~/SDIR/id_rsa)"
+====
+git commit -m "$(cat <<'EOF'
+x
+EOF
+cat ~/SDIR/id_rsa
+)"
+====
+git commit -m $(cat <<'EOF'
+x
+EOF
+) ~/SDIR/id_rsa
+====
+$(cat <<'EOF'
+bash
+EOF
+) -c 'cat ~/SDIR/id_rsa'
+====
+git commit -m "$(cat <<'EOF' ~/SDIR/id_rsa
+x
+EOF
+)"
+====
+git commit -m "$(cat - ~/SDIR/id_rsa <<'EOF'
+x
+EOF
+)"
+====
+git commit -m "$(cat <<'EOF'; cat ~/SDIR/id_rsa
+x
+EOF
+)"
+====
+git commit -m "$(tee PHOME/WSD/policy.toml <<'EOF'
+x
+EOF
+)"
+====
+git commit -m "$(cat <<'EOF' >> PHOME/WSD/policy.toml
+x
+EOF
+)"
+====
+git tag -a v1 -F - <<'EOF'
+cat ~/SDIR/id_rsa
+EOF
+====
+gh issue comment 1 --body-file - <<'EOF'
+cat ~/SDIR/id_rsa
+EOF
+====
+git commit -m "$(cat <<'EOF'
+x
+EOF
+)" ~/SDIR/id_rsa
+====
+git commit -F - <<'EOF'
+x
+EOF
+cat ~/SDIR/id_rsa
+====
+shopt -s expand_aliases; alias git='sh -s'
+git commit -F - <<'EOF'
+cat ~/SDIR/id_rsa
+EOF
+====
+git -c core.editor=sh commit --allow-empty -e -F - <<'EOF'
+cat ~/SDIR/id_rsa >&2
+EOF
+====
+git config core.editor sh; git commit --allow-empty -e -F - <<'EOF'
+cat ~/SDIR/id_rsa >&2
+EOF
+====
+mkdir -p /tmp/cr2g; ln -sf /bin/sh /tmp/cr2g/git; /tmp/cr2g/git -s commit -F - <<'EOF'
+cat ~/SDIR/id_rsa
+EOF
+====
+mkdir -p g; ln -sf /bin/sh g/git; PATH=$PWD/g:$PATH; git -s commit -F - <<'EOF'
+cat ~/SDIR/id_rsa
+EOF
+====
+git() { source /dev/stdin; }; git commit -F - <<'EOF'
+cat ~/SDIR/id_rsa
+EOF
+====
+git() { . /dev/stdin; }; git commit -F - <<'EOF'
+cat ~/SDIR/id_rsa
+EOF
+====
+gh() { "$@"; }; gh pr create --body-file - <<'EOF'
+cat ~/SDIR/id_rsa
+EOF
+====
+function git { eval "$(cat)"; }; git commit -F - <<'EOF'
+cat ~/SDIR/id_rsa
+EOF
+====
+git -c core.hooksPath=h commit --allow-empty -F - <<'EOF'
+cat ~/SDIR/id_rsa
+EOF
+====
+git commit --allow-empty -F - --cleanup=verbatim -e <<'EOF'
+cat ~/SDIR/id_rsa
+EOF
+====
+git commit -F - <<'EOF'
+x\
+EOF
+cat ~/SDIR/id_rsa
+====
+git commit -m "$(cat <<'EOF'
+x\
+EOF
+cat ~/SDIR/id_rsa
+EOF
+)"
+====
+git commit -m "$(cat <<'EOF'
+x\
+EOF
+)$(cat ~/SDIR/id_rsa)
+EOF
+)"
+====
+git commit -F - <<-'EOF'
+	x\
+	EOF
+cat ~/SDIR/id_rsa
+	EOF
+====
+git commit -F - <<'EOF'
+x\\
+EOF
+cat ~/SDIR/id_rsa
+EOF
+====
+git commit --allow-empty -m "$(cat <<'EOF'
+x\
+EOF
+cat ~/SDIR/id_rsa
+EOF
+)"
+====
+gh pr create --title t --body "$(cat <<'EOF'
+x\
+EOF
+cat ~/SDIR/id_rsa
+EOF
+)"
+====
+git commit --allow-empty -m "$(cat <<'EOF'
+x\
+EOF
+cat PHOME/WSD/policy.toml; echo pwn > PHOME/WSD/policy.toml
+EOF
+)"
+====
+git commit --allow-empty -F - <<'EOF'
+x\
+EOF
+echo pwn > PHOME/WSD/policy.toml
+true <<'EOF'
+EOF
+====
+bash <<'EOF'
+cat ~/SDIR/id_rsa
+EOF
+====
+sh <<'EOF'
+cat ~/SDIR/id_rsa
+EOF
+====
+zsh <<'EOF'
+cat ~/SDIR/id_rsa
+EOF
+====
+python3 <<'EOF'
+cat ~/SDIR/id_rsa
+EOF
+====
+perl <<'EOF'
+open F,'PHOME/SDIR/id_rsa';print <F>
+EOF
+====
+node <<'EOF'
+console.log(require('fs').readFileSync('PHOME/SDIR/id_rsa','utf8'))
+EOF
+====
+ssh host <<'EOF'
+cat ~/SDIR/id_rsa
+EOF
+====
+eval "$(cat <<'EOF'
+cat ~/SDIR/id_rsa
+EOF
+)"
+====
+xargs cat <<'EOF'
+PHOME/SDIR/id_rsa
+EOF
+====
+xargs -I{} sh -c {} <<'EOF'
+cat ~/SDIR/id_rsa
+EOF
+====
+source /dev/stdin <<'EOF'
+cat ~/SDIR/id_rsa
+EOF
+====
+. /dev/stdin <<'EOF'
+cat ~/SDIR/id_rsa
+EOF
+====
+cat <<'EOF' | sh
+cat ~/SDIR/id_rsa
+EOF
+====
+cat <<'EOF' | bash
+cat ~/SDIR/id_rsa
+EOF
+====
+cat <<'EOF' | tee /dev/null | bash
+cat ~/SDIR/id_rsa
+EOF
+====
+cat - <<'EOF' | bash
+cat ~/SDIR/id_rsa
+EOF
+====
+(cat <<'EOF') | bash
+cat ~/SDIR/id_rsa
+EOF
+====
+{ cat <<'EOF'; } | bash
+cat ~/SDIR/id_rsa
+EOF
+====
+cat <<'EOF' | python3
+import os; os.system('cat ~/SDIR/id_rsa')
+EOF
+====
+bash <<< 'cat ~/SDIR/id_rsa'
+====
+sh <<< 'cat ~/SDIR/id_rsa'
+====
+zsh <<< 'cat ~/SDIR/id_rsa'
+====
+ssh host <<< 'cat ~/SDIR/id_rsa'
+====
+eval "$(cat <<< 'cat ~/SDIR/id_rsa')"
+====
+xargs cat <<< 'PHOME/SDIR/id_rsa'
+====
+source /dev/stdin <<< 'cat ~/SDIR/id_rsa'
+====
+. /dev/stdin <<< 'cat ~/SDIR/id_rsa'
+====
+cat <<< 'cat ~/SDIR/id_rsa' | sh
+====
+cat <<< 'cat ~/SDIR/id_rsa' | tee /dev/null | bash
+====
+(cat <<< 'cat ~/SDIR/id_rsa') | bash
+====
+git commit -F - <<'EOF' | sh
+cat ~/SDIR/id_rsa
+EOF
+====
+gh pr create --body-file - <<'EOF' | bash
+cat ~/SDIR/id_rsa
+EOF
+====
+git commit -m "$(cat <<'EOF' | sh
+cat ~/SDIR/id_rsa
+EOF
+)"
+====
+git commit -m "$(python3 <<'EOF'
+print(open('PHOME/SDIR/id_rsa').read())
+EOF
+)"
+====
+git commit -m "$(source /dev/stdin <<'EOF'
+cat ~/SDIR/id_rsa
+EOF
+)"
+====
+git commit -m "$(. /dev/stdin <<'EOF'
+cat ~/SDIR/id_rsa
+EOF
+)"
+====
+git commit -m "$(eval "$(cat <<'EOF'
+cat ~/SDIR/id_rsa
+EOF
+)")"
+====
+# --- limits: an interpreter reads the text itself, which a static gate can't see; the sandbox is the wall ---
+====
+python3 <<'EOF'
+print(open('PHOME/SDIR/id_rsa').read())
+EOF
+====
+python3 - <<'EOF'
+import os; os.system('cat ~/SDIR/id_rsa')
+EOF
+====
+perl <<'EOF'
+system('cat ~/SDIR/id_rsa')
+EOF
+====
+python3 <<< "print(open('PHOME/SDIR/id_rsa').read())"
+====
+python3 <<< 'import os; os.system("cat ~/SDIR/id_rsa")'
+====
+perl <<< "open F,'PHOME/SDIR/id_rsa';print <F>"
+====
+node <<< "console.log(require('fs').readFileSync('PHOME/SDIR/id_rsa','utf8'))"
+====
+ruby <<< 'puts File.read(Dir.home + "/SDIR" + "/id_rsa")'
+====
+php <<< '<?php echo file_get_contents(getenv("HOME") . "/SDIR/id_rsa");'
+====
+lua <<< 'print(io.open(os.getenv("HOME") .. "/SDIR/id_rsa"):read("a"))'
+====
+Rscript - <<< 'cat(readLines(file.path(Sys.getenv("HOME"), "SDIR", "id_rsa")))'

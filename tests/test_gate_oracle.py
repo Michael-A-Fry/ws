@@ -56,6 +56,7 @@ SUBS = {  # the placeholders of the probe files
     "GLOB2": ".ss[h]/id_rsa",
     "BRACE1": "{" + SSH + ",x}/id_rsa",
     "PHOME": HOME,
+    "WSD": ".ws",
 }
 _PLAIN = frozenset(
     [
@@ -239,15 +240,25 @@ def oracle(pol, lines: list[str], workers: int = 8) -> list[str]:
     return [f"{line!r}: {why}" for line, why in bad.items()]
 
 
-def probes() -> list[str]:
-    out = []
+def sections() -> dict[str, list[str]]:
+    """The probe file's lines by section. A block that starts with `# ---` opens a section (`consumers`, `limits`); the
+    lines before the first one are the plain probes."""
+    out: dict[str, list[str]] = {"": []}
+    here = ""
     for block in PROBES.read_text().split("\n====\n"):
         line = block.strip("\n")
-        if line.strip():
-            for key in ("UPTGT", "TGT", "SDIR", "GLOB1", "GLOB2", "BRACE1", "PHOME"):
+        if line.startswith("# ---"):
+            here = line.split(":")[0].removeprefix("# --- ")
+            out.setdefault(here, [])
+        elif line.strip():
+            for key in ("UPTGT", "TGT", "SDIR", "GLOB1", "GLOB2", "BRACE1", "PHOME", "WSD"):
                 line = line.replace(key, SUBS[key])
-            out.append(line)
+            out[here].append(line)
     return out
+
+
+def probes() -> list[str]:
+    return [line for lines in sections().values() for line in lines]
 
 
 # --- the harness is itself tested ----------------------------------------------------------------------------------------
@@ -279,12 +290,15 @@ def test_the_gate_denies_what_the_harness_sees_touched(pol):
 
 # The lines a real bash does use to read a protected file, through text the gate never reads as shell: a program an
 # interpreter runs (python, awk) or a script file the line writes and then runs. They are a limit of what a command
-# gate can see, and the one list of them: a probe that is not here and gets through is a failure.
+# gate can see, and the one list of them: a probe that is not here and gets through is a failure. The static gate is not
+# a wall against interpreters; the sandbox (`ws gate launch`) is.
 LIMITS = (
     f"python3 -c \"print(open('{HOME}/{SSH}/id_rsa').read())\"",
     f"awk 'BEGIN{{while((getline l < \"{HOME}/{SSH}/id_rsa\")>0) print l}}'",
     f"echo 'cat ~/{SSH}/id_rsa' > /tmp/x.sh; bash /tmp/x.sh",
+    *sections()["limits"],
 )
+_INTERPRETERS = r"(python3?|perl|node|ruby|php|lua|Rscript)"
 
 
 def test_every_cold_review_probe_the_gate_allows_is_one_bash_does_not_use_to_touch_a_protected_path(pol):
@@ -296,7 +310,24 @@ def test_every_cold_review_probe_the_gate_allows_is_one_bash_does_not_use_to_tou
 
 def test_the_limits_are_programs_the_gate_does_not_read_as_shell():
     for line in LIMITS:
-        assert re.match(r"(python3 -c|awk |echo .* > /tmp/x\.sh; bash /tmp/x\.sh)", line), line
+        assert re.match(
+            rf"(python3 -c|awk |echo .* > /tmp/x\.sh; bash /tmp/x\.sh|{_INTERPRETERS} .*<<)",
+            line,
+        ), line
+
+
+def test_the_limit_rows_are_interpreters_reading_standard_input_and_the_gate_allows_them(pol):
+    rows = sections()["limits"]
+    assert len(rows) == 11
+    assert all(gate(pol, line) is None for line in rows)
+
+
+def test_every_consumer_of_standard_input_that_runs_what_it_reads_is_denied(pol):
+    """A here-document or here-string fed to a shell, `source`, `eval`, `ssh` or `xargs` is code, and a message is read
+    exactly as any other text: no quoting of the body makes it data."""
+    rows = sections()["consumers"]
+    assert len(rows) > 90
+    assert [line for line in rows if gate(pol, line) is None] == []
 
 
 # --- the policy's own tables, as lines -----------------------------------------------------------------------------------
@@ -390,7 +421,7 @@ def test_the_known_producers_hold_against_bash(pol):
     assert oracle(pol, producer_lines()) == []
 
 
-# --- a message is data, and bash agrees --------------------------------------------------------------------------------
+# --- a message is read like any other text --------------------------------------------------------------------------------
 
 
 def message_lines() -> list[str]:
@@ -430,18 +461,6 @@ def test_a_message_the_gate_allows_is_one_bash_does_not_read_a_protected_file_fo
     if not shutil.which("git"):
         pytest.skip("needs git")
     assert oracle(pol, message_lines()) == []
-
-
-def test_a_message_the_gate_calls_data_is_text_to_git(pol):
-    if not shutil.which("git"):
-        pytest.skip("needs git")
-    p = f"{HOME}/{SSH}/id_rsa"
-    ok = [line for line in message_lines() if gate(pol, line) is None]
-    assert any("<<'EOF'" in line for line in ok) and any("-m 'x $(cat" in line for line in ok)
-    # git is given the text and keeps it: the commit is made (and a FIFO was never opened to make it)
-    one = next(line for line in ok if "-m 'x $(cat" in line)
-    result = run_bash(one + " && git log --format=%B", {})
-    assert not result.touched and f"$(cat {p})" in result.out
 
 
 # --- every long option and every letter of the programs that take addresses -----------------------------------------------

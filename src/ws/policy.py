@@ -582,6 +582,10 @@ def rule_of_two(policy: Policy, sources: list[str], job: str | None = None, shel
 
 _FLAGS = re.compile(r"^-[A-Za-z]+$")
 _SHELL_NAMES = {"sh", "bash", "zsh", "dash", "ksh", "fish", "ash", "csh", "tcsh"}
+# A here-document or here-string given to one of these is read as code: a shell runs it, `source` and `.` run it as a
+# script, `eval` runs it as text, `ssh` hands it to the shell on the other end, and `xargs` builds commands from it.
+_UNKNOWN_VALUE = "${_WS_UNKNOWN}"  # what a variable holds when a command substitution set it: a part no one can read
+_STDIN_IS_CODE = frozenset({*_SHELL_NAMES, "source", ".", "eval", "ssh"})
 _GIT_ARG_OPTS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env"}
 # Commands whose operands are each judged on their own: `rm -rf / /tmp` is a delete of `/`.
 _OPERAND_CMDS = {"rm", "rmdir", "shred", "unlink", "chmod", "chown", "chgrp", "mv"}
@@ -1057,7 +1061,7 @@ def _walk(policy: Policy, cmd: str, ctx: _Ctx, depth: int, cands: list[str]) -> 
     the reason at once for the checks that are not globs (pipe into a shell, denied paths, protected files)."""
     if depth > _MAX_DEPTH:
         raise shellwords.ShellError("too_deep", _TOO_DEEP)
-    pipelines, inner = shellwords.scan(shellwords.prep(cmd), heredocs=ctx.heredocs, message=_message_place)
+    pipelines, inner = shellwords.scan(shellwords.prep(cmd), heredocs=ctx.heredocs)
     nested: list[str] = list(inner)
     ctx.arith = ctx.arith or _ARITH_LINE.search(cmd) is not None
     for segs in pipelines:
@@ -1333,6 +1337,13 @@ def _segment_once(
         if reason:
             return reason, line, []
         nested += more
+    if any(op in ("<<", "<<-", "<<<") for op, _ in redirs) and (cmd in _STDIN_IS_CODE or "xargs" in wrappers):
+        raise shellwords.ShellError(
+            "stdin-is-code",
+            f"{'xargs' if 'xargs' in wrappers else cmd} runs the text of the "
+            "here-document or here-string it is given as code, and ws cannot tell what that is; write it to a file with "
+            "the Write tool and run the file",
+        )
     if (
         in_pipe
         and _INTERP.match(cmd)
@@ -1613,10 +1624,8 @@ def _unknown_refusal(
     only the unresolved part (`cat $X`) is refused for those commands too: it names any file there is. `canon` is the
     command's words as the reader found them: not tidied, because `..` after an unresolved part cannot be taken out."""
     known = frozenset(env)
-    toks, masked = _mask_messages(toks)  # a message is text for the program to keep, not a file it opens
-    canon = toks
     operands, aside = _file_operands(cmd, canon)
-    text = {p for w in (*masked, *aside) for p in shellwords.pieces_of(w, env)}
+    text = {p for w in aside for p in shellwords.pieces_of(w, env)}
     pieces = [p for p in pieces if p not in text]
     is_file = _opens_files(cmd, canon) or (
         # a whole word the reader cannot resolve may be an option (`--file=P`), which the exemption is for words without
@@ -1679,7 +1688,6 @@ def _unknown_refusal(
 
 _MKTEMP_FLAGS = frozenset(("-d", "-u", "-q", "-t", "--directory", "--dry-run", "--quiet"))
 _REALPATH_FLAGS = frozenset(("-m", "-e", "-s", "-f", "--canonicalize", "--canonicalize-missing"))
-_HERE_CAT = re.compile(r"\s*cat\s+<<\s*(['\"]?)(\w+)\1[ \t]*\n(.*?)\n\2\s*\Z", re.DOTALL)
 
 
 def _producer(ctx: _Ctx, env, depth: int = 0) -> Callable[[str], str | None]:
@@ -1696,10 +1704,6 @@ def _produced(inner: str, ctx: _Ctx, env, depth: int = 0) -> str | None:
     `which` and `command -v` print an unknown path; so does the repository root (`core.worktree`, `GIT_WORK_TREE` and
     `GIT_DIR` move it). The caller checks the text against the protected paths like any path the command line spells
     out."""
-    said = _HERE_CAT.match(inner)
-    if said:  # `$(cat <<'EOF' ... EOF)`: the text of the body, as a commit or pull request message is written
-        quoted, body = said.group(1), said.group(3)
-        return body if quoted or not re.search(r"[$`\\]", body) else None
     if depth > 4 or len(inner) > 512 or re.search(r"[;&|<>\n]", inner):
         return None
     try:
@@ -1792,112 +1796,6 @@ def _cdpath_may_apply(ctx: _Ctx, target: str) -> bool:
 
 _URL = re.compile(r"(?!file:)[A-Za-z][A-Za-z0-9+.-]*://")
 HOW_TO_NAME = "write the program out in full (`ls`, not `$CMD`), or run it from a script file"
-# The options whose value is text for the program to keep (the message of a commit or a tag, the title and body of a
-# pull request or an issue), not a file it opens and not a command: the reader does not ask where such a value points. A
-# command substitution in it is a script that runs, and is read as one on its own.
-_MESSAGES: dict[str, tuple[frozenset[str], frozenset[str], str, frozenset[str]]] = {
-    # program: (the first subcommand words, the last ones, the short letters, the long names)
-    "git": (frozenset({""}), frozenset({"commit", "tag", "merge", "notes", "stash"}), "m", frozenset({"--message"})),
-    "gh": (
-        frozenset({"pr", "issue"}),
-        frozenset({"create", "edit", "comment", "close", "reopen", "merge", "review"}),
-        "tbc",
-        frozenset({"--title", "--body", "--subject", "--comment"}),
-    ),
-}
-_PROGRAM_VALUES = frozenset(
-    {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env", "-R"}
-)
-
-
-def _message_command(toks: list[str]) -> tuple[int, str, frozenset[str]] | None:
-    """For a command that keeps a message (see `_MESSAGES`): where its subcommand words end and the options whose value
-    is the message; None for any other command."""
-    spec = _MESSAGES.get(posixpath.basename(toks[0])) if toks else None
-    if not spec:
-        return None
-    first, second, letters, longs = spec
-    words: list[str] = []
-    k = 1
-    while k < len(toks) and len(words) < (
-        1 if first == {""} else 2
-    ):  # the subcommand words, past the program's options
-        t = toks[k]
-        if t in _PROGRAM_VALUES:
-            k += 2
-        elif t.startswith("-") and not words:
-            k += 1
-        elif t.startswith("-"):
-            break
-        else:
-            words.append(t)
-            k += 1
-    if not words or words[-1] not in second or (first != {""} and words[0] not in first):
-        return None
-    return k, letters, longs
-
-
-def _message_place(text: str, kind: str) -> bool:
-    """For the part of a command line before a here-document's opener (`kind` is `stdin`) or before a `$(`: is the next
-    thing a message? `git commit -F -` and `gh pr create --body-file -` read it from standard input, and the body of a
-    quoted here-document fed to them is the message; `git commit -m "$(cat <<'EOF' ...` has it as the value of a message
-    option. A message is text for the program to keep, which the shell never reads."""
-    try:
-        toks = shellwords.words_of(text if kind == "stdin" else text + ('x"' if text.count('"') % 2 else "x"))
-    except shellwords.ShellError:
-        return False
-    found = _message_command(toks)
-    if not found:
-        return False
-    if kind == "value":
-        return len(toks) - 1 in _message_values(toks)
-    file_long = ("--file",) if posixpath.basename(toks[0]) == "git" else ("--file", "--body-file")
-    for j in range(found[0], len(toks)):
-        t, nxt = toks[j], toks[j + 1] if j + 1 < len(toks) else ""
-        if (t in ("-F", *file_long) and nxt == "-") or t in tuple(f"{o}=-" for o in file_long):
-            return True
-    return False
-
-
-def _message_values(toks: list[str]) -> set[int]:
-    """The places in `toks` of the values of a message option of `commit`, `tag`, `merge`, `notes` and `stash` (of the
-    version control program) or `pr|issue create|edit|comment|close|reopen|merge|review` (of its hosting client): `-m
-    TEXT`, `--message TEXT`, `--message=TEXT`, `--title`, `--body` and the like. Only the exact long names count; an
-    abbreviation stays a word the reader asks about."""
-    found = _message_command(toks)
-    if not found:
-        return set()
-    k, letters, longs = found
-    out: set[int] = set()
-    skip = False
-    for j in range(k, len(toks)):
-        t = toks[j]
-        if skip:
-            out.add(j)
-            skip = False
-        elif t == "--":
-            break
-        elif t.startswith("--"):
-            name, eq, _ = t.partition("=")
-            if name in longs:
-                if eq:
-                    out.add(j)
-                else:
-                    skip = True
-        elif re.fullmatch(r"-[A-Za-z]+", t) and t[-1] in letters:
-            skip = True
-    return out
-
-
-def _mask_messages(toks: list[str]) -> tuple[list[str], list[str]]:
-    """`toks` with each message value replaced by a plain word, and the words that were replaced."""
-    at = _message_values(toks)
-    if not at:
-        return toks, []
-    masked = [
-        (t.split("=", 1)[0] + "=msg" if t.startswith("--") else "msg") if j in at else t for j, t in enumerate(toks)
-    ]
-    return masked, [toks[j] for j in sorted(at)]
 
 
 def _substitutions(text: str) -> list[str]:
@@ -1926,17 +1824,15 @@ def _arith_scripts(ctx: _Ctx, cmd: str, flags: list[str], toks: list[str], words
     """The command substitutions that arithmetic runs. A shell evaluates the text it is given by `let`, `declare`,
     `read`, `unset`, `test -v`, `[[ ... ]]`, `$(( ))`, `(( ))` and the like as an expression, and an array subscript in it
     (`a[$(cmd)]`) runs `cmd` even where single quotes kept the shell from reading it. In a line that does arithmetic, or
-    for one of those commands, each word that holds `$(` or a backtick is read as the script it may run. A message value
-    is not text of that kind."""
+    for one of those commands, each word that holds `$(` or a backtick is read as the script it may run."""
     if ctx.bodies_as_commands:
         return []
     sub = bool(flags) and (shellwords.has_flag(flags, "v") or "-R" in flags)
     if not (ctx.arith or cmd in _ARITH_CMDS or (cmd in ("test", "[", "printf") and sub)):
         return []
-    skip = _message_values(toks)
     leading = list(itertools.takewhile(shellwords.ASSIGN.match, words))
     out: list[str] = []
-    for w in [*(t for j, t in enumerate(toks) if j not in skip), *leading]:
+    for w in [*toks, *leading]:
         if "$(" in w or "`" in w:
             out += _substitutions(w)
     return out
@@ -1950,7 +1846,7 @@ def _settled(ctx: _Ctx, env, values: dict[str, str]) -> dict[str, str]:
     for name, value in values.items():
         if "$(" in value or "`" in value:
             items = unknownpath.split(value, frozenset(env), _producer(ctx, env))
-            value = "".join("${_WS_UNKNOWN}" if c is None else c for c in items)
+            value = "".join(_UNKNOWN_VALUE if c is None else c for c in items)
         out[name] = value
     return out
 
@@ -2023,7 +1919,7 @@ def _shell(toks, canon, flags, operands, redirs, in_pipe):
     if shellwords.PROCSUB in operands:
         return "a shell is reading its script from a process substitution", nested
     if shellwords.has_flag(flags, "c"):
-        if operands and operands[0].lstrip().startswith(("$(", "`")):
+        if operands and (operands[0].lstrip().startswith(("$(", "`")) or _UNKNOWN_VALUE in operands[0]):
             return "a shell is running text another command produces", nested
         if operands:
             return None, [*nested, operands[0]]

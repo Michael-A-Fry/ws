@@ -126,6 +126,17 @@ a replacement that reuses the match (`&`), a case change with a pattern, an arit
 `${NAME@P}`, `${!NAME}` for a name the line doesn't set, and a `su` or `script` with no `-c` text to read.
 `tests/test_shellwords_oracle.py` compares the reader with bash on a fixed set of spellings.
 
+A here-document or here-string is text for whatever reads it. When that's a shell (`bash`, `sh`, `zsh`, `dash`, `ksh`,
+`fish`), `source`, `.`, `eval`, `ssh` or `xargs`, the text runs as code, so the command is refused with the reason
+`stdin-is-code`. Any other body, a commit message included, is read as commands, whatever its quoting.
+
+The static gate reads shell, so it's a check on shell and not a wall against interpreters. A program that `python`,
+`python3`, `perl`, `node`, `ruby`, `php`, `lua` or `Rscript` runs (from `-c`, a file, or standard input), `awk` code, and
+a script the line writes and then runs are text the gate can't see into: it's the same for a here-document or
+here-string given to one of them. These are the known limits, and `tests/test_gate_oracle.py` lists each as a `LIMIT`
+row. The wall is the sandbox: `ws gate launch --runner R -- argv` starts the runner inside it, and the files and
+folders ws protects are out of reach of every program in the session, whatever it runs.
+
 ## `[guards]`
 
 Named checks that run beside the `[gate]` rules. The [guards reference](guards.md) describes each one.

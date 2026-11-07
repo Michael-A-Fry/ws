@@ -35,7 +35,7 @@ import posixpath
 import re
 import time
 import unicodedata
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from typing import NamedTuple
 
 MAX_WORDS = 4096  # words that brace expansion may add for one command; more is refused, not slowed down
@@ -56,7 +56,7 @@ WRITE_OPS = (">", ">>", ">|", ">&", "&>", "&>>", "<>")  # redirections that writ
 
 class ShellError(ValueError):
     """Text the reader cannot read or will not expand. `kind` is one of unclosed_quote, too_many_words, too_deep,
-    too_long (a value past MAX_VALUE, a path of too many parts, or too much text from variables), too_slow (past the time limit) and unsupported (an expansion it does not know);
+    too_long (a value past MAX_VALUE, a path of too many parts, or too much text from variables), too_slow (past the time limit), stdin-is-code (a here-document or here-string given to a shell, `source`, `eval`, `ssh` or `xargs`) and unsupported (an expansion it does not know);
     callers branch on it, never on the message."""
 
     def __init__(self, kind: str, message: str):
@@ -371,16 +371,6 @@ def without_bodies(command: str) -> str | None:
     return "\n".join(out) + "\n" if any(out) else None
 
 
-_OPENERS = re.compile(r"[ \t]*<<-?(?:'[A-Za-z_][A-Za-z0-9_]*'|\"[A-Za-z_][A-Za-z0-9_]*\")")
-
-
-def _text_of(body: str) -> str:
-    """A `$(...)` that is only `cat`, with quoted here-documents, is the text of their bodies: what is left to judge is
-    the `cat` (and a redirect it has), with the openers and the bodies taken out. Any other text is returned as it is."""
-    plain = without_bodies(body)
-    return _OPENERS.sub("", plain) if plain is not None else body
-
-
 def _closes(line: str, word: str, indented: bool) -> bool:
     """Does this line end a here-document? The shell takes the line as it is, word and nothing else; `<<-` also lets
     leading tabs (only tabs) go."""
@@ -410,20 +400,12 @@ def _after_bodies(cmd: str, i: int, opened: list[tuple[str, bool]]) -> int | Non
 
 
 def scan(
-    cmd: str,
-    heredocs: bool = False,
-    end: dict | None = None,
-    flow: list | None = None,
-    message: Callable[[str, str], bool] | None = None,
+    cmd: str, heredocs: bool = False, end: dict | None = None, flow: list | None = None
 ) -> tuple[list[list[str]], list[str]]:
     """Split a shell command line. Returns (pipelines, inner): each pipeline is a list of segments (split on |, |&),
     pipelines are split on ; && || & newline ( ); inner holds the text of $(...), backticks and <(...), which run too.
     A comment (a `#` that starts a word, outside quotes and `${...}`) is left out, unless the line holds a `<<` and
-    `heredocs` is off: a body is then read as commands, and a `#` line in it is not a comment. With `message`, a
-    function that is given the text of a segment up to a here-document's opener (and `"stdin"`), the body of a quoted one
-    is left out even then when it says the segment reads its message from standard input (`git commit -F -`); given the
-    text up to a `$(` (and `"value"`), a `$(cat <<'EOF' ... EOF)` that is the value of a message option is left as the
-    plain `cat` it amounts to. With `heredocs`, the body
+    `heredocs` is off: a body is then read as commands, and a `#` line in it is not a comment. With `heredocs`, the body
     and closing line of each here-document are left out too (that text is data for a program, not commands): a `<<WORD` starts one
     only outside quotes and comments, and not as `<<<` or a shift in `((...))` or inside `${...}` and `$[...]`, which are
     one word. If `end` is given, end["quote"] is the quote still open at the end of the text (empty if none). If `flow`
@@ -480,9 +462,7 @@ def scan(
                     continue
             elif quote == '"' and cmd.startswith("$(", i):
                 j = close_paren(cmd, i + 2)
-                inner.append(
-                    _text_of(sub(cmd[i + 2 : j])) if message and message("".join(buf), "value") else sub(cmd[i + 2 : j])
-                )
+                inner.append(sub(cmd[i + 2 : j]))
                 if (
                     j < n
                 ):  # closed: its quotes are its own; if not (a here-document inside), read on character by character
@@ -512,16 +492,14 @@ def scan(
             buf.append("<<<")
             i += 3
             continue
-        if (heredocs_here or (message and not nest)) and c == "<" and cmd.startswith("<<", i):
+        if heredocs_here and c == "<" and cmd.startswith("<<", i):
             opener = heredoc_word(cmd, i)
-            raw = cmd[i + 2 : opener[2]] if opener else ""
-            quoted = any(ch in raw for ch in "'\"\\")
-            if opener and (heredocs_here or (quoted and message and message("".join(buf), "stdin"))):
+            if opener:
                 waiting.append((opener[0], opener[1]))
                 buf.append(cmd[i : opener[2]])
                 i = opener[2]
                 continue
-        if c == "\n" and waiting:
+        if heredocs and c == "\n" and waiting:
             end_pipeline(";")
             i += 1
             for word, indented in waiting:  # skip each body, up to and including its closing line
@@ -561,9 +539,7 @@ def scan(
             continue
         elif cmd.startswith("$(", i):
             j = close_paren(cmd, i + 2)
-            inner.append(
-                _text_of(sub(cmd[i + 2 : j])) if message and message("".join(buf), "value") else sub(cmd[i + 2 : j])
-            )
+            inner.append(sub(cmd[i + 2 : j]))
             buf.append(cmd[i : j + 1])
             i = j + 1
             continue

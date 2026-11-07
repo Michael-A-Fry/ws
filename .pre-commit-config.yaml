@@ -22,6 +22,9 @@ repos:
     rev: v1.7.12.24
     hooks:
       - id: actionlint
+        # actionlint runs shellcheck on each run: step only when shellcheck is on PATH, and skips it silently
+        # otherwise; this makes the local hook check what CI checks
+        additional_dependencies: [shellcheck-py==0.11.0.1]
   - repo: https://github.com/shellcheck-py/shellcheck-py
     rev: v0.11.0.1
     hooks:

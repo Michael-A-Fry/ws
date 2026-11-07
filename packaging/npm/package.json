@@ -1,7 +1,7 @@
 {
   "name": "ws-aitoolkit",
   "version": "0.0.1",
-  "description": "ws: your memory, skills and rules, in any AI. A small CLI that turns one policy.toml into each AI coding tool's config (Claude Code, OpenCode, Codex), answers their hooks, and runs headless jobs. The tool itself is on PyPI: uv tool install ws-aitoolkit.",
+  "description": "ws: your memory, skills and rules, across your AI coding tools. A small CLI that turns one policy.toml into each AI coding tool's config (Claude Code, OpenCode), answers their hooks, and runs headless jobs. The tool itself is on PyPI: uv tool install ws-aitoolkit.",
   "keywords": [
     "claude-code",
     "ai-agents",

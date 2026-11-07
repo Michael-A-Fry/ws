@@ -29,10 +29,10 @@ repos:
   - repo: local
     hooks:
       - id: code-map
-        name: AGENTS.md code map is current (python3 scripts/gen_code_map.py rewrites it)
+        name: code map in docs/reference is current (python3 scripts/gen_code_map.py rewrites it)
         entry: python3 scripts/gen_code_map.py --check
         language: system
-        files: ^(src/ws/.*\.py|AGENTS\.md|scripts/gen_code_map\.py)$
+        files: ^(src/ws/.*\.py|docs/reference/code-map\.md|scripts/gen_code_map\.py)$
         pass_filenames: false
       - id: pii-gate
         name: PII gate (private IPs, tailnet hosts, e-mails, private denylist)

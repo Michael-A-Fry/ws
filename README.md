@@ -1,4 +1,4 @@
-# ws: Your memory, skills and rules, in any AI
+# ws: Your memory, skills and rules, across your AI coding tools
 
 [![PyPI version](https://img.shields.io/pypi/v/ws-aitoolkit)](https://pypi.org/project/ws-aitoolkit/)
 [![Python versions](https://img.shields.io/pypi/pyversions/ws-aitoolkit)](https://pypi.org/project/ws-aitoolkit/)
@@ -111,6 +111,7 @@ reference (the [Diátaxis](https://diataxis.fr/) split).
 | [Draft-only sending](docs/explanation/draft-only-sending.md) | Why ws never sends for you |
 | [Known limits](docs/explanation/known-limits.md) | What ws doesn't protect against yet |
 | [Write-up 1](docs/explanation/write-up-1.md) | The design and what we measured |
+| [Decision records](docs/decisions/README.md) | Why each engine choice was made |
 | [CLI reference](docs/reference/cli.md) | Every command and flag |
 | [Doctor checks](docs/reference/doctor-checks.md) | Every check ID |
 | [Policy reference](docs/reference/policy.md) | Every `policy.toml` key |
@@ -118,6 +119,7 @@ reference (the [Diátaxis](https://diataxis.fr/) split).
 | [Lab reference](docs/reference/lab.md) | The lab machine and the launch matrix |
 | [`ws version --json`](docs/reference/version-json.md) | The fields of the version report |
 | [Principles](docs/reference/principles.md) | The rules ws follows and the check for each |
+| [Code map](docs/reference/code-map.md) | What each module is for |
 
 For contributors: [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), [SUPPORT.md](SUPPORT.md),
 [CHANGELOG.md](CHANGELOG.md) and [AGENTS.md](AGENTS.md).

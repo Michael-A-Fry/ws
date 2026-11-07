@@ -25,8 +25,8 @@ ESCAPED = "&lt;script&gt;alert(1)&lt;/script&gt;"
 # existed and is re-taken when the page changes on purpose (last: the Plugins step is left out when no plugin is built,
 # and a plugin's icon travels with it instead of a table in the script; then: the country field, shown only when an
 # offered plugin has a region rule).
-GOLDEN_SHA256 = "fa4e562a482f9c617f35564d09d292cd2ff5b2377f6c7e318d8e0992dd242788"
-GOLDEN_LEN = 28126
+GOLDEN_SHA256 = "3c394a4b5be7c95d81ef0398c748edf515154801dbc84176fc8ac47056466088"
+GOLDEN_LEN = 28144  # 7 Nov: the tagline changed (the only difference; checked by rendering with the old one)
 
 
 def _fixed():

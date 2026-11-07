@@ -246,7 +246,7 @@ def cmd_help(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = Parser(prog="ws", description="Your memory, skills and rules, in any AI.")
+    p = Parser(prog="ws", description="Your memory, skills and rules, across your AI coding tools.")
     p.add_argument("--version", action="version", version=f"ws {__version__}")
     p.add_argument("--json", action="store_true", help="every command: one JSON envelope on stdout (or WS_OUTPUT=json)")
     p.add_argument("-C", "--cwd", metavar="PATH", help="every command: run as if started in PATH")

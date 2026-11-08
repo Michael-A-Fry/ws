@@ -466,12 +466,17 @@ def read_pin(values: list[str] | None) -> Pin | None:
     return Pin(*(Path(found[k]) for k in PIN_KEYS), Path(found.get(TMP_KEY, "/tmp")))
 
 
+UNPINNED_NOTE = "this hook was written by an earlier ws and does not pin ws's folders; run `ws upgrade --hooks-only` to bring it up to date"
+
+
 def check_pin(pin: Pin | None, env: Mapping[str, str] | None = None) -> None:
     """Raise `layout_changed` unless the environment resolves to the pinned layout. A hook with no pin is refused too: it
-    was written before ws pinned the layout."""
+    was written before ws pinned the layout (`pinned_by(..., allow_unpinned=True)` is the one place that carries on)."""
     if pin is None:
         raise WsError(
-            "layout_changed", "this hook does not pin ws's folders", "run `ws install` to write the hooks again"
+            "layout_changed",
+            "this hook does not pin ws's folders",
+            "run `ws upgrade --hooks-only` to write the hooks again",
         )
     try:
         now = pin_of(env)
@@ -496,14 +501,33 @@ def add_pin_option(parser) -> None:
 
 
 @contextlib.contextmanager
-def pinned_by(values: list[str] | None):
+def pinned_by(values: list[str] | None, *, allow_unpinned: bool = False):
     """Read the hook's `--pin` arguments, refuse (`layout_changed`) unless the environment resolves to them, and answer
-    with them inside the block."""
+    with them inside the block. Yields the notes the caller should show the person: none, or `UNPINNED_NOTE`.
+
+    `allow_unpinned` is for the gate's own hooks (`ws gate check` and `ws gate event`) and only for a hook with no
+    `--pin` at all, one an earlier ws wrote. Refusing it would block every call of every session the
+    moment a newer ws is installed, with the fix (`ws upgrade`) out of reach from inside that session. It runs the whole
+    check, with the note. The layout it resolves to is the one the environment gives now, which is what the earlier ws
+    used on every call; the hook still names its policy file by absolute path, so the rules are the installed ones, and
+    the protected folders cover every layout (`protected_roots`). That is no wider than the release it came from, and it
+    lasts only until `ws upgrade`. A pin that is partial, malformed or different from what the environment resolves to
+    is refused exactly as before, and a layout that cannot be told is a refusal too."""
     pin = read_pin(values)
-    check_pin(pin)
+    notes: tuple[str, ...] = ()
+    if pin is None and allow_unpinned:
+        try:
+            pin = pin_of()
+        except WsError as e:
+            raise WsError(
+                "layout_changed", f"ws's folders cannot be told now ({e.message})", "run `ws migrate` or `ws install`"
+            ) from e
+        notes = (UNPINNED_NOTE,)
+    else:
+        check_pin(pin)
     assert pin is not None
     with pinned(pin):
-        yield
+        yield notes
 
 
 @contextlib.contextmanager

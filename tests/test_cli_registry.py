@@ -15,7 +15,7 @@ from ws import cli
 from ws.output import WsError
 
 # The commands the installed package itself adds, in module-name order; a planted one comes after them.
-SHIPPED = [("msg", "msg"), ("node", "node"), ("queue", "queue"), ("usage", "usage")]
+SHIPPED = [("msg", "msg"), ("node", "node"), ("queue", "queue"), ("upgrade", "upgrade"), ("usage", "usage")]
 
 PLANTED = """\
 COMMAND = "{name}"
@@ -53,7 +53,7 @@ def names(parser=None) -> list[str]:
 
 
 def test_the_installed_package_adds_only_its_own_scanned_commands():
-    assert cli.scanned_commands() == SHIPPED  # a module that wants one sets COMMAND; these four do
+    assert cli.scanned_commands() == SHIPPED  # a module that wants one sets COMMAND; these five do
 
 
 def test_a_planted_module_is_in_help_and_runs(plant, capsys):

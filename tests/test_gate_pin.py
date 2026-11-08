@@ -48,6 +48,7 @@ class Installed:
 
     policy: Path
     pin: list[str]
+    out: str = ""  # the stdout of the last `check`
 
     def check(self, monkeypatch, capsys, cmd: str, pin: list[str] | None = None) -> tuple[int, str]:
         """The hook run in whatever environment the test has set up by now."""
@@ -64,7 +65,9 @@ class Installed:
                 *(self.pin if pin is None else pin),
             ]
         )
-        return code, capsys.readouterr().err
+        seen = capsys.readouterr()
+        self.out = seen.out
+        return code, seen.err
 
 
 @pytest.fixture
@@ -113,9 +116,34 @@ def test_the_forged_folder_is_never_read(box, monkeypatch, capsys, installed):
     assert code == 2 and CHANGED in err
 
 
-def test_a_hook_with_no_pin_is_refused(box, monkeypatch, capsys, installed):
+def test_a_hook_with_no_pin_runs_the_full_check_and_names_the_fix(box, monkeypatch, capsys, installed):
+    """A hook an earlier ws wrote has no pin. It is not refused (that blocks every call of a session that cannot fix it): it
+    allows what the policy allows and denies what it denies, with a note that names `ws upgrade`."""
     code, err = installed.check(monkeypatch, capsys, "ls", pin=[])
-    assert code == 2 and "does not pin" in err and "ws install" in err
+    assert code == 0 and "ws upgrade" in err
+    note = json.loads(installed.out)  # Claude Code shows the systemMessage of one JSON object on stdout of an exit 0
+    assert list(note) == ["systemMessage"] and "ws upgrade" in note["systemMessage"]
+    code, err = installed.check(monkeypatch, capsys, "git push --force origin main", pin=[])
+    assert code == 2 and "blocked" in err and "ws upgrade" in err and installed.out == ""
+
+
+def test_a_pinned_hook_prints_no_note(box, monkeypatch, capsys, installed):
+    code, err = installed.check(monkeypatch, capsys, "ls")
+    assert (code, err, installed.out) == (0, "", "")
+
+
+def test_the_note_is_on_stdout_for_claude_code_only(box, monkeypatch, capsys, installed):
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"tool": "bash", "args": {"command": "ls"}})))
+    code = cli.main(["gate", "check", "--runner", "opencode", "--policy", str(installed.policy)])
+    seen = capsys.readouterr()
+    assert code == 0 and seen.out == "" and "ws upgrade" in seen.err
+
+
+def test_a_hook_with_no_pin_still_fails_closed_when_the_layout_cannot_be_told(box, monkeypatch, capsys, installed):
+    (box / "home" / ".ws").mkdir()  # ~/.ws and the XDG folders both hold ws's files: no single layout
+    (box / "home" / ".ws" / "policy.toml").write_text("")
+    code, err = installed.check(monkeypatch, capsys, "ls", pin=[])
+    assert code == 2 and "cannot be told" in err and installed.out == ""
 
 
 @pytest.mark.parametrize(

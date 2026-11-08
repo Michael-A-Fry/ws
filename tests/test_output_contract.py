@@ -60,6 +60,7 @@ CASES: dict[str, list[str]] = {
     "install": ["install", "--dry-run", "--notes", "{home}/Notes"],
     "migrate": ["migrate", "--dry-run"],
     "uninstall": ["uninstall", "--dry-run"],
+    "upgrade": ["upgrade", "--hooks-only", "--dry-run"],
     "plugin.list": ["plugin", "list"],
     "plugin.add": ["plugin", "add", "nope"],
     "plugin.remove": ["plugin", "remove", "nope"],

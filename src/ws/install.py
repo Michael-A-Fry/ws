@@ -368,6 +368,20 @@ def plan(answers: Answers, env: Mapping[str, str] | None = None, osi=None) -> li
     return steps + _gate_steps(answers, prof, parsed, policy_step.path.resolve(), entries, env)
 
 
+def gate_steps(env: Mapping[str, str] | None = None) -> list[Step]:
+    """Only the runner's gate: its generated files and its user config, as the profile already says, with no answer
+    changed. This is what `ws upgrade` rewrites; the profile, the modules and the folders are left alone. A runner whose
+    user config already holds ws's entries keeps them, current, even when the profile says `launch` (taking them out is
+    `ws install --gate launch`, not an upgrade)."""
+    env = os.environ if env is None else env
+    policy_step, parsed = _policy_step(env)
+    entries, _ = _read_manifest(env)
+    answers = answers_from_profile(env)
+    if answers.runner and _merge_entry(entries, answers.runner, env) is not None:
+        answers = replace(answers, gate="every-session")
+    return _gate_steps(answers, _load_profile(env), parsed, policy_step.path.resolve(), entries, env)
+
+
 def _gate_steps(
     answers: Answers, prof: dict, parsed: policy.Policy, policy_file: Path, entries: Mapping[str, dict], env
 ) -> list[Step]:

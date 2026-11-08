@@ -419,3 +419,21 @@ def test_a_hook_gets_the_tools_folders_and_never_the_session_s_path(monkeypatch)
     monkeypatch.setenv("PATH", "/project/bin:/usr/bin")
     assert "/project/bin" not in paths.tool_path().split(":")
     assert all(d.startswith("/") for d in paths.tool_path().split(":"))
+
+
+def test_only_a_hook_with_no_pin_at_all_may_go_unpinned(home, monkeypatch):
+    """`allow_unpinned` relaxes the missing pin and nothing else: a partial, malformed or different pin is still refused."""
+    for var, val in env_of(home).items():
+        monkeypatch.setenv(var, val)
+    pin = paths.pin_of()
+    with paths.pinned_by(pin.args()[1::2]) as notes:
+        assert notes == ()
+    with paths.pinned_by(None, allow_unpinned=True) as notes:
+        assert notes == (paths.UNPINNED_NOTE,) and "ws upgrade" in notes[0]
+    with pytest.raises(WsError, match="does not pin"), paths.pinned_by(None):
+        pass
+    for bad in (["home=relative"], pin.args()[1::2][1:], ["home=/elsewhere", *pin.args()[3::2]]):
+        for allow in (False, True):
+            with pytest.raises(WsError) as caught, paths.pinned_by(bad, allow_unpinned=allow):
+                pass
+            assert caught.value.kind == "layout_changed"

@@ -21,6 +21,8 @@ The promises, each pinned by a test:
   allows unsandboxed ones, or it re-opens a path the wall holds) is refused, naming each setting and its file, unless you
   keep them on purpose with `--allow-widened-sandbox`; ws then records the choice (`widened_by_user`), and doctor reports
   the wall as widened.
+- The sandbox is not switched on for you. Entries an earlier ws wrote without the block (`WS_SANDBOXED` "0") stay without
+  it, on `ws install` and `ws upgrade` alike, unless the policy file itself says `sandbox = true` (`keeps_sandbox_off`).
 - OpenCode takes the last rule that matches, so ws's `ask` keys go in before its `deny` keys (a later change of policy
   that adds an ask moves it ahead of the denies), and an `ask` that would sit after a `deny` of yours that it overlaps is
   left out: a rule added at the end must never loosen a deny.
@@ -43,6 +45,7 @@ import re
 import shlex
 import subprocess
 import time
+import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -553,6 +556,55 @@ def _kept_widenings(
     return found
 
 
+def had_sandbox(entry: Mapping | None, where: Path) -> bool | None:
+    """Did the ws entries already in the runner's user config come with the sandbox block? False for `WS_SANDBOXED` "0"
+    (an install made before the block was on by default, or with `sandbox = false`), True for "1", None when it can't be
+    told. The manifest record is read first, then the file itself when it holds ws's hooks (a record that was lost). A
+    `WS_SANDBOXED` of the person's own, in a file ws has not written to, says nothing."""
+    for op in (entry or {}).get("added", []):
+        if isinstance(op, dict) and op.get("path") == ["env", "WS_SANDBOXED"]:
+            return op.get("value") == "1"
+    try:
+        doc, _ = load(where)
+    except WsError:
+        return None
+    if not _holds_ws_hooks(doc):
+        return None
+    env = doc.get("env") if isinstance(doc.get("env"), dict) else {}
+    return {"0": False, "1": True}.get(env.get("WS_SANDBOXED"))
+
+
+def _hook_commands(doc: dict) -> list[str]:
+    """Every hook command in a Claude Code settings document, whoever wrote it."""
+    groups = [g for gs in (doc.get("hooks") or {}).values() if isinstance(gs, list) for g in gs]
+    hooks = [h for g in groups if isinstance(g, dict) for h in g.get("hooks") or [] if isinstance(h, dict)]
+    return [h["command"] for h in hooks if isinstance(h.get("command"), str)]
+
+
+def _holds_ws_hooks(doc: dict) -> bool:
+    return isinstance(doc.get("hooks"), dict) and any(_WS_HOOK.search(c) for c in _hook_commands(doc))
+
+
+def _policy_names_sandbox(policy_file: Path) -> bool:
+    """Does the policy file itself have a `sandbox` key under `[gate]`? (`Policy.gate.sandbox` is True by default, and that
+    cannot tell a default from a choice.)"""
+    try:
+        gate = tomllib.loads(policy_file.read_text(encoding="utf-8")).get("gate")
+    except (OSError, ValueError):
+        return False
+    return isinstance(gate, dict) and "sandbox" in gate
+
+
+def keeps_sandbox_off(pol: policy.Policy, policy_file: Path, entry: Mapping | None, where: Path) -> bool:
+    """True when the sandbox stays out of the user config. The block is on by default, but a newer ws must not switch on
+    what the person did not have: ws entries that were written without it keep going without it, unless the policy file
+    says `sandbox = true` itself. A sandbox that cannot start makes Claude Code refuse to start, which is what an
+    unasked-for block did to sessions once."""
+    if not pol.gate.sandbox or _policy_names_sandbox(policy_file):
+        return False
+    return had_sandbox(entry, where) is False
+
+
 def plan(
     runner: str,
     pol: policy.Policy,
@@ -563,11 +615,15 @@ def plan(
 ) -> GatePlan:
     """The generated files and the merge for this runner. Pure but for reading the target (to name the backup). Raises
     the refusal in `wallsettings.refusal` when your Claude Code settings widen the wall and `allow_widened` is false (and
-    an earlier install didn't record them)."""
+    an earlier install didn't record them). Entries an earlier ws wrote without the sandbox block stay without it (see
+    `keeps_sandbox_off`)."""
     adapter = adapters.get(runner)
     cmd = selfcmd.argv()
     require_stable_interpreter(cmd)
     where = target(runner, env)
+    digest = policy_digest(pol)  # of the policy as written, whatever the sandbox does below
+    if runner == "claude-code" and keeps_sandbox_off(pol, policy_file, entry, where):
+        pol = dataclasses.replace(pol, gate=dataclasses.replace(pol.gate, sandbox=False))
     out = _state(env) / "gate" / runner
     pin = paths.pin_of(env)  # the hooks carry the layout this install resolved
     if entry is not None:
@@ -595,7 +651,7 @@ def plan(
         ops = _asks_yours_would_override(_opencode_ops(files), where, entry)
         copies[plug] = files[adapter.PLUGIN]
     kept = tuple(sorted({w.label for w in widened}))
-    return GatePlan(files, Merge(runner, where, tuple(ops), backup, tuple(cmd), policy_digest(pol), kept), copies)
+    return GatePlan(files, Merge(runner, where, tuple(ops), backup, tuple(cmd), digest, kept), copies)
 
 
 def withdrawal(runner: str, env: Mapping[str, str]) -> Merge:
@@ -1049,6 +1105,27 @@ def check(env: Mapping[str, str] | None = None) -> tuple[str, str, str]:
         return WARN, "; ".join([first, *notes]), "run `ws install`"
     detail = f"every session is gated: ws's entries are in {where}"
     return (WARN, "; ".join([detail, *notes]), "") if notes else (OK, detail, "")
+
+
+def hooks_without_pin(env: Mapping[str, str] | None = None) -> list[str]:
+    """The runners whose ws hooks in their user config carry no `--pin`: written by a ws older than the one running, which
+    pinned ws's folders in every hook only later. Each name once, in RUNNERS order. A runner with no ws hooks in its
+    file, or a file that can't be read, is left out (WS008 says what is wrong with the file)."""
+    env = os.environ if env is None else env
+    found: list[str] = []
+    for runner in RUNNERS:
+        try:
+            if runner == "claude-code":
+                doc, _ = load(target(runner, env))
+                old = any(_WS_HOOK.search(c) and "--pin" not in c.split() for c in _hook_commands(doc))
+            else:
+                text = plugin_path(env).read_text(encoding="utf-8")
+                old = '"--pin"' not in text
+        except (WsError, OSError, ValueError, AttributeError, TypeError):
+            continue
+        if old:
+            found.append(runner)
+    return found
 
 
 def _rule(text: str) -> tuple[str, str | None]:

@@ -264,8 +264,10 @@ def _load_policy(args: argparse.Namespace) -> tuple[Path, policy.Policy]:
 def _pinned(args: argparse.Namespace):
     """A hook runs on the layout `ws install` pinned in its command, and on no other: the environment is the session's
     (a project's settings can set WS_HOME or an XDG variable), so it must resolve to the same folders or the call is
-    refused. Inside the block the whole process answers with the pinned layout (see ws.paths.pinned_by)."""
-    return paths.pinned_by(args.pin)
+    refused. Inside the block the whole process answers with the pinned layout (see ws.paths.pinned_by). A hook with no
+    pin at all (an earlier ws wrote it) is not refused: it runs the full check, and the block yields the note that names
+    `ws upgrade`."""
+    return paths.pinned_by(args.pin, allow_unpinned=True)
 
 
 def _reason_of(e: BaseException) -> str:
@@ -319,6 +321,13 @@ def _decision(reason: str | approvals.Claim | None) -> str:
     return "ask" if isinstance(reason, Ask) else "deny"
 
 
+def _warning_out(runner: str, note: str) -> str:
+    """What an allowed call prints on stdout so the person sees `note`. Claude Code does not show the stderr of a hook that
+    exits 0, but it shows the `systemMessage` of one JSON object on stdout, and that changes nothing about the call.
+    Other runners read the exit code and stderr only, so they get nothing here."""
+    return json.dumps({"systemMessage": f"ws: {note}"}) + "\n" if runner == "claude-code" else ""
+
+
 def run_check(args: argparse.Namespace, raw: str, via: str = "direct") -> tuple[int, str, str]:
     """What `ws gate check` does for one payload, as (exit code, stdout, stderr): 0 allow, 2 deny (the reason on
     stderr), 4 a claim for the launcher. Fails closed: any error is a deny. The command and the daemon both call this,
@@ -326,9 +335,12 @@ def run_check(args: argparse.Namespace, raw: str, via: str = "direct") -> tuple[
     notes: list[str] = []
     layer: list[str] = []
     verdicts: list[dict] = []
+    unpinned = False
     began = time.perf_counter()
     try:
-        with _pinned(args):
+        with _pinned(args) as warned:
+            unpinned = bool(warned)
+            notes.extend(warned)
             policy_file, pol = _load_policy(args)
             try:
                 reason = check(
@@ -362,7 +374,7 @@ def run_check(args: argparse.Namespace, raw: str, via: str = "direct") -> tuple[
         reason = _reason_of(e)
     err = "".join(f"ws gate: {note}\n" for note in notes)
     if reason is None:
-        return 0, "", err
+        return 0, _warning_out(args.runner, paths.UNPINNED_NOTE) if unpinned else "", err
     if isinstance(reason, approvals.Claim):
         return CLAIM, json.dumps({"claim": reason.ident}) + "\n", err
     return DENY, "", err + f"ws gate: blocked: {reason}\n"
@@ -374,9 +386,10 @@ def run_event(args: argparse.Namespace, raw: str, via: str = "direct") -> tuple[
     verdicts: list[dict] = []
     began = time.perf_counter()
     try:
-        with _pinned(args):
+        with _pinned(args) as warned:
             _, pol = _load_policy(args)
             code, out, err = event(args.runner, raw, pol, verdicts=verdicts)
+            err = "".join(f"ws gate event: {note}\n" for note in warned) + err
             if verdicts:
                 session, name = _session_of(raw)
                 _log_verdicts(

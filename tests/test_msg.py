@@ -92,6 +92,10 @@ def world(tmp_path, monkeypatch):
     monkeypatch.setenv("WS_HOME", str(tmp_path / "wshome"))
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    # the account's own folders are the test's (the real ones are the system's home, which a test must not touch)
+    monkeypatch.setattr(
+        session, "trusted_env", lambda: {"HOME": str(tmp_path / "home"), "WS_HOME": str(tmp_path / "wshome")}
+    )
     for var in ("WS_RELEASE", "WS_RELEASE_FILE", "TMUX_PANE", session.LAUNCH_ENV):
         monkeypatch.delenv(var, raising=False)
     return World(tmp_path, monkeypatch)
@@ -315,10 +319,13 @@ def test_forged_sender_refused(plain, monkeypatch, capsys, how):
     assert {r[0] for r in plain.rows('SELECT "from" FROM messages')} <= {"bravo"}
 
 
-@pytest.mark.parametrize("var", ["WS_CONFIG_DIR", "XDG_CONFIG_HOME", "WS_HOME"])
+FORGED_VARS = ["WS_CONFIG_DIR", "WS_STATE_DIR", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "WS_HOME", "HOME"]
+
+
+@pytest.mark.parametrize("var", FORGED_VARS)
 def test_forged_policy_location_refused(world, monkeypatch, tmp_path, var):
     """The environment is the command's own to set, so it can't pick the policy or the secrets registry: a session that
-    points ws at an empty config folder still gets the rules of its own (the call is refused, nothing is stored)."""
+    points ws at an empty folder still gets the rules of its own (the call is refused, nothing is stored)."""
     classed(world)
     (world.root / "wshome" / "secrets.toml").write_text('[GITHUB_TOKEN]\nhosts = ["api.example.com"]\n')
     empty = tmp_path / "empty"
@@ -334,8 +341,6 @@ def test_forged_policy_location_refused(world, monkeypatch, tmp_path, var):
             world.who = sender
             with pytest.raises(WsError) as e:
                 msg.send(to, "note", body)
-            # WS_HOME also moves the registry (no caller, refused); XDG_CONFIG_HOME has no say while WS_HOME is set, so the
-            # rules of the real policy answer: either way the message is not stored
             assert e.value.kind in ("refused", "secret_refused"), (var, sender, e.value.message)
     assert world.count() == 0
     world.refused("wall1", "work2", "note", f"free text {token}")  # with the environment as it was: still walled
@@ -343,33 +348,26 @@ def test_forged_policy_location_refused(world, monkeypatch, tmp_path, var):
     assert token.encode() not in b"".join(p.read_bytes() for p in msg.store_path().parent.glob("messages.db*"))
 
 
-def test_forged_policy_location_cannot_read_or_list(world, monkeypatch, tmp_path):
+@pytest.mark.parametrize("var", FORGED_VARS)
+def test_forged_policy_location_changes_no_read_or_list(world, monkeypatch, tmp_path, var):
+    """Under a policy with no classes a walled body would be withheld from its own reader; the real policy hands it over.
+    Pointing the environment at an empty folder changes neither."""
     classed(world)
+    world.send("lead1", "wall1", "note", "for the wall")
     world.send("lead1", "work1", "note", "hello")
     empty = tmp_path / "empty"
     empty.mkdir()
-    world.who = "work1"
     with monkeypatch.context() as m:
-        m.setenv("WS_CONFIG_DIR", str(empty))
-        with pytest.raises(WsError) as e:
-            msg.read(1, "work1")
-        assert e.value.kind == "refused" and "environment" in e.value.message
-        with pytest.raises(WsError):
-            msg.inbox("work1", bodies=True)
-    assert msg.read(1, "work1")["body"] == "hello"
-
-
-def test_a_record_without_a_config_folder_is_refused(plain):
-    path = paths.state_dir() / "sessions" / "alpha.json"
-    data = json.loads(path.read_text())
-    del data["config"]
-    path.write_text(json.dumps(data))
-    err = plain.refused("alpha", "bravo")
-    assert "no record of where its policy is" in err.message and err.hint
+        m.setenv(var, str(empty))
+        world.who = "wall1"
+        assert [x["body"] for x in msg.inbox("wall1", bodies=True)] == ["for the wall"]
+        assert msg.read(1, "wall1")["body"] == "for the wall"
+        world.who = "work1"
+        assert [x["body"] for x in msg.inbox("work1", bodies=True)] == ["hello"]
 
 
 def test_a_forged_policy_location_cannot_start_a_prune(world, monkeypatch, tmp_path):
-    """Tidying runs under the policy the record names; a short retention in a folder the command made up does nothing."""
+    """Tidying runs under the account's policy; a short retention in a folder the command made up does nothing."""
     classed(world)
     world.send("lead1", "work1", "note", "old", now=BASE)
     fake = tmp_path / "fake"
@@ -378,10 +376,88 @@ def test_a_forged_policy_location_cannot_start_a_prune(world, monkeypatch, tmp_p
     world.who = "work1"
     with monkeypatch.context() as m:
         m.setenv("WS_CONFIG_DIR", str(fake))
-        assert [m["id"] for m in msg.inbox("work1", now=BASE + 5 * 86400)] == [
-            1
-        ]  # no policy of the record's: no tidying
-    assert world.count() == 1 and world.rows("SELECT value FROM meta WHERE key='last_prune'") == [(repr(BASE),)]
+        m.setenv("WS_HOME", str(fake))
+        assert [x["id"] for x in msg.inbox("work1", now=BASE + 5 * 86400)] == [1]  # the real class keeps it for 10 days
+    assert world.count() == 1
+
+
+def test_a_forged_registry_and_policy_under_a_forged_ws_home_send_nothing(world, monkeypatch, tmp_path):
+    """The whole of ws's folders is the command's to point elsewhere, so a registry found there proves nothing: a worker
+    that makes its own `lead` and its own walled session, and a permissive policy, in a folder of its own is still the
+    worker the real registry says it is. Nothing is written to the real class store, to the real or the forged shared
+    database, or to any folder the forged policy names."""
+    classed(world)
+    decoy = world.folder("decoy", git=True)
+    forge = tmp_path / "forge"
+    forge.mkdir()
+    (forge / "policy.toml").write_text(
+        textwrap.dedent(
+            f"""
+            [classes.secret]
+            access = "walled"
+            repos = ["{world.root / "walled"}"]
+            inbound = "allowlist"
+            inbound_allow = ["lead", "work1"]
+            [classes.decoy]
+            access = "walled"
+            repos = ["{decoy}"]
+            inbound = "allowlist"
+            inbound_allow = ["lead", "work1"]
+            [classes.open]
+            access = "full"
+            repos = ["{world.root / "open"}"]
+            inbound = "allowlist"
+            inbound_allow = ["lead", "work1"]
+            """
+        )
+    )
+    real_walled = world.root / "walled"
+    token = planted()
+    real_procs = dict(world.procs)
+    for own_runner in (True, False):
+        # the worker's runner is a stamped process in the real registry; its own process is not
+        attacker = world.procs["work1"] if own_runner else session.Proc(901, "t901", 1, "forger")
+        world.procs["forger"] = attacker
+        with monkeypatch.context() as m:
+            m.setenv("WS_HOME", str(forge))
+            m.setenv("HOME", str(forge / "home"))
+            world.session("lead", world.folder("open/fake-lead"), role="lead", proc=attacker)
+            world.session("wall1", world.folder("walled/src"), proc=session.Proc(902, "t902", 1, "claude"))
+            world.session("decoyed", world.folder("decoy/src"), proc=session.Proc(903, "t903", 1, "claude"))
+            assert (forge / "sessions" / "lead.json").exists()  # the forged registry is real: it names a lead
+            world.who = "forger"
+            for to in ("wall1", "decoyed"):
+                with pytest.raises(WsError) as e:
+                    msg.send(to, "note", f"FORGED {token}")
+                assert e.value.kind in ("refused", "not_found"), (
+                    own_runner,
+                    to,
+                    e.value.message,
+                )  # no such session in the real registry
+        world.procs.clear()
+        world.procs.update(
+            real_procs
+        )  # the forged sessions' ids are the real ones' ids: the real processes stay theirs
+        # the real world is as it was: no message, no class store, no `.ws` folder anywhere
+        assert world.count() == 0
+        assert not (forge / "msg").exists() and not list(world.root.rglob(".ws"))
+        assert not class_db(world).exists() and not (decoy / ".ws").exists() and not (real_walled / ".ws").exists()
+    # and the real lead's order still lands, undisturbed by the forged one
+    assert world.send("lead1", "wall1", "note", "REAL ORDER")["id"] == 1
+    world.who = "wall1"
+    got = msg.read(1, "wall1")
+    assert (got["body"], got["from"]) == ("REAL ORDER", "lead1")
+    assert token.encode() not in b"".join(p.read_bytes() for p in msg.store_path().parent.glob("messages.db*"))
+
+
+def test_nothing_in_msg_takes_an_environment():
+    """No function of the public API can be handed an environment, and the layout answers to `session.trusted_env` only."""
+    for name in ("send", "inbox", "sent", "read", "ack", "mark_delivered", "envelopes", "export", "prune", "caller"):
+        assert "env" not in inspect.signature(getattr(msg, name)).parameters, name
+    assert not inspect.signature(msg.store_path).parameters
+    assert not inspect.signature(session.resolve_caller).parameters
+    source = inspect.getsource(msg)
+    assert "merged_environ" not in source and "os.environ" not in source and "policy_path" not in source
 
 
 def test_orphaned_process_cannot_send(plain):
@@ -402,7 +478,10 @@ def test_orphaned_process_cannot_send(plain):
             if os.fork():
                 os._exit(0)
             time.sleep(0.3)  # the parents are gone: this process belongs to init
-        from ws import msg
+        import json
+        from ws import msg, session
+        env = json.loads(sys.argv[3])
+        session.trusted_env = lambda: env  # the test's folders, as the fixture has them in this process
         try:
             res = "sent %d" % msg.send("bravo", "note", "hi")["id"]
         except Exception as e:
@@ -411,10 +490,11 @@ def test_orphaned_process_cannot_send(plain):
         """
     )
     env = {**os.environ}
-    subprocess.run([sys.executable, "-c", script, str(out), "child"], env=env, check=True, timeout=60)
+    folders = json.dumps(session.trusted_env())
+    subprocess.run([sys.executable, "-c", script, str(out), "child", folders], env=env, check=True, timeout=60)
     assert out.read_text() == "sent 1"  # a child of the runner: its sender is alpha
     out.unlink()
-    subprocess.run([sys.executable, "-c", script, str(out), "orphan"], env=env, check=True, timeout=60)
+    subprocess.run([sys.executable, "-c", script, str(out), "orphan", folders], env=env, check=True, timeout=60)
     deadline = time.monotonic() + 15
     while not out.exists() and time.monotonic() < deadline:
         time.sleep(0.05)

@@ -22,6 +22,10 @@ def home(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "userhome"))
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    # the account's own folders are the test's (the real ones are the system's home, which a test must not touch)
+    monkeypatch.setattr(
+        session, "trusted_env", lambda: {"HOME": str(tmp_path / "userhome"), "WS_HOME": str(tmp_path / "wshome")}
+    )
     (tmp_path / "vault").mkdir()
     p = profile_path()
     p.parent.mkdir(parents=True)
@@ -32,10 +36,17 @@ def home(tmp_path, monkeypatch):
     return tmp_path
 
 
+# `python -m ws`, with the account's folders the test's (a child process does not inherit a patched function)
+SERVE = (
+    "import json, sys; from ws import session; env = json.loads(sys.argv[1]); session.trusted_env = lambda: env; "
+    "from ws.cli import main; raise SystemExit(main(['mcp', 'serve']))"
+)
+
+
 class Client:
     def __init__(self):
         self.proc = subprocess.Popen(
-            [sys.executable, "-m", "ws", "mcp", "serve"],
+            [sys.executable, "-c", SERVE, json.dumps(session.trusted_env())],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

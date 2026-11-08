@@ -30,13 +30,19 @@ Who is calling. A shell command has no way to say which session it belongs to, a
 command's own to set, so identity comes from the process tree. `ws session start` is a hook: it stamps the record with
 `runner_pid` and `runner_start`, the runner's process id and the time that process started (the nearest ancestor of the
 hook that is not a shell or a plain launcher such as `env` or `uv`; the start time stops a reused id from matching).
-`resolve_caller(env=None) -> Record | None` walks this process's ancestors, nearest first, and returns the record
+`resolve_caller() -> Record | None` walks this process's ancestors, nearest first, and returns the record
 carrying the first stamp that matches (the newest, when a cleared or resumed session left two for one runner). It works
 unchanged for `ws mcp serve`, which is a child of the runner. A process with no matching ancestor (orphaned, or
 double-forked so that init owns it) is not a session and gets None. Only `start` writes the stamp: `update` keeps it and
-cannot set it. `start` also records `config`, the config folder the hook was pinned to (where the policy and the
-secrets registry live), so that a module deciding what a session may do reads the rules from there and not from an
-environment variable the session's own command can set. The ancestors come from `/proc` on Linux and `ps` on macOS. The keys are additions, so the schema stays 2.
+cannot set it. The ancestors come from `/proc` on Linux and `ps` on macOS. The keys are additions, so the schema stays 2.
+
+Where the registry is. A record found in a folder the caller chose proves nothing: a command that sets `WS_HOME` can
+write its own records, its own policy and its own message database, and every check made against them passes against
+itself. So `resolve_caller` takes no environment, and `trusted_env()` is the one place the folders of anything that
+decides who a caller is or what it may do come from: the account's own home folder from the system's user database
+(`pwd`), with no `WS_HOME`, `WS_*_DIR`, `XDG_*` or `HOME` of the process. `ws msg` builds its whole layout (registry,
+policy, secrets registry, store) from it. A person whose ws folders are set by one of those variables is refused by
+`ws msg` until ws can read the layout from the runner's own start-up environment.
 
 Records are pruned 30 days after their last change (`_KEEP_DAYS`); a data class's `retention_days` is the message
 store's own, not this.
@@ -256,8 +262,6 @@ def _new_record(
     }
     if stamp:
         out["runner_pid"], out["runner_start"] = stamp.pid, stamp.start
-        with contextlib.suppress(WsError):  # a layout that can't be told leaves no pin; a reader then refuses
-            out["config"] = str(paths.config_dir(env))
     return out
 
 
@@ -350,7 +354,6 @@ class Record:
     schema: int = 1
     runner_pid: int | None = None  # the runner process `start` stamped (with runner_start); None on an older record
     runner_start: str | None = None
-    config: str | None = None  # the config folder `start` was pinned to; None on a record without one
 
     @classmethod
     def from_dict(cls, data: dict, session_id: str = "") -> Record:
@@ -363,7 +366,6 @@ class Record:
         schema = data.get("schema")
         pane = data.get("pane")
         pid, began = data.get("runner_pid"), text("runner_start")
-        config = text("config")
         stamped = isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 and bool(began) and len(began) <= 64
         return cls(
             session_id=text("session_id") or session_id,
@@ -383,7 +385,6 @@ class Record:
             schema=schema if isinstance(schema, int) and not isinstance(schema, bool) else 1,
             runner_pid=pid if stamped else None,
             runner_start=began if stamped else None,
-            config=config if stamped and config and os.path.isabs(config) and len(config) <= 4096 else None,
         )
 
     def to_dict(self) -> dict:
@@ -407,8 +408,6 @@ class Record:
             out["nudged"] = True
         if self.runner_pid is not None and self.runner_start is not None:
             out["runner_pid"], out["runner_start"] = self.runner_pid, self.runner_start
-            if self.config:
-                out["config"] = self.config
         return out
 
 
@@ -423,17 +422,37 @@ def read(session_id: str, env: dict | None = None) -> Record | None:
     return Record.from_dict(data, session_id) if data is not None else None
 
 
-def resolve_caller(env: dict | None = None) -> Record | None:
+def trusted_env() -> dict:
+    """The environment every folder is worked out from where ws decides who a caller is or what it may do: only the
+    account's home folder, from the system's user database. The process's own environment is the command's to set
+    (`WS_HOME`, `WS_*_DIR`, `XDG_*` and `HOME` all move the folders), so none of it is read. A `WsError` of kind
+    `refused` when the system has no usable home for this account."""
+    home = None
+    with contextlib.suppress(ImportError, KeyError, OSError, AttributeError):
+        import pwd
+
+        home = pwd.getpwuid(os.getuid()).pw_dir
+    if not home or not os.path.isabs(home):
+        raise WsError(
+            "refused", "ws can't tell this account's home folder", "check the account's entry in the user database"
+        )
+    return {"HOME": home}
+
+
+def resolve_caller() -> Record | None:
     """The session this process belongs to, or None. Walks the ancestors of this process, nearest first, and returns the
     record whose runner stamp (`runner_pid` and `runner_start`) is that ancestor; where a cleared or resumed session left
     more than one record for the same runner process, the newest. Nothing the process was given (an environment variable,
-    an argument, a payload) takes part, so a command cannot name itself as another session. A process that is not under a
-    stamped runner (orphaned, or double-forked and handed to init) is not a session: None. A records folder that cannot be
-    read is None too."""
+    an argument, a payload) takes part, so a command cannot name itself as another session, and the registry is the
+    account's own (`trusted_env`), so it cannot point ws at one it wrote. A process that is not under a stamped runner
+    (orphaned, or double-forked and handed to init) is not a session: None. So is a records folder that cannot be read."""
     chain = _ancestors()
     if not chain:
         return None
-    folder = paths.state_dir(_env(env)) / "sessions"
+    try:
+        folder = paths.state_dir(trusted_env()) / "sessions"
+    except WsError:
+        return None
     found: dict[tuple[int, str], list[Record]] = {}
     try:
         files = sorted(folder.glob("*.json"))

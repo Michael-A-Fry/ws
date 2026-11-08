@@ -27,11 +27,13 @@ that double-forked, or a person's own shell) is not a session, so it can't send,
 `ws msg export` is the same: with no session behind it, it is refused, and a session's export has only the messages it
 sent or was sent, never a walled body. A person's own export of the whole store arrives with the owner path.
 
-The rules (the policy's classes, and the secrets registry for the names a message may not carry) come from the config
-folder the session record names, which `ws session start` took from the hook's pinned layout. The environment never
-chooses them: if `WS_CONFIG_DIR`, `XDG_CONFIG_HOME` or `WS_HOME` now resolves the config folder anywhere else, the call
-is refused, and a record without a config folder (a session started before this was recorded) is refused until the
-session starts again.
+Where it all lives is not up to the caller either. The registry, the policy (the classes), the secrets registry (the
+names a message may not carry) and `messages.db` are all found from the account's own home folder (`ws.session.trusted_env`,
+from the system's user database), and nothing in the process's environment is read: not `WS_HOME`, `WS_*_DIR`, `XDG_*`
+or `HOME`. A command that sets one, and makes its own records, policy and database in the folder it names, is
+still the session the real registry says it is, and writes nothing to the real store or to any repo. No function in
+`ws.msg` takes an environment. A person whose ws folders are set by one of those variables is refused (`ws msg` can't
+tell which session is calling) until ws can read the layout from the runner's own start-up environment.
 
 ## Kinds
 
@@ -120,4 +122,4 @@ wall is not built yet.
 
 `ws.msg` has `send`, `inbox`, `sent`, `read`, `ack`, `mark_delivered`, `envelopes`, `export` and `prune`. Only `send` finds
 its own caller (`caller()`); the others take the session id, which a command gets from `session.resolve_caller` and a hook
-gets from its payload. Functions take `env`, and `now` (the clock) where time matters, so tests can inject both.
+gets from its payload. Functions take `now` (the clock) where time matters, so tests can inject it.

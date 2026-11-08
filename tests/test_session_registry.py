@@ -21,6 +21,7 @@ from ws.home.sources import ws_sessions
 from ws.output import WsError
 
 LEAD = "0123456789abcdef0123456789abcdef"
+REAL_TRUSTED_ENV = session.trusted_env  # before any fixture stands in for it
 
 
 @pytest.fixture
@@ -30,6 +31,10 @@ def home(tmp_path, monkeypatch):
     for var in ("WS_RELEASE", "WS_RELEASE_FILE", "TMUX_PANE", session.LAUNCH_ENV):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(session, "_ancestors", list)  # no runner process unless a test names one
+    # the account's own folders are the test's: the real one is the system's home, which a test must not touch
+    monkeypatch.setattr(
+        session, "trusted_env", lambda: {"HOME": str(tmp_path / "home"), "WS_HOME": str(tmp_path / "wshome")}
+    )
     return tmp_path
 
 
@@ -475,7 +480,7 @@ def test_start_stamps_the_runner_process(home, monkeypatch, capsys):
     rec = session.read("a")
     assert (rec.runner_pid, rec.runner_start) == (30, "s30") and rec.schema == session.SCHEMA_VERSION == 2
     assert rec.to_dict()["runner_pid"] == 30
-    assert raw["config"] == str(home / "wshome") == rec.config  # the config folder the hook was pinned to
+    assert "config" not in raw  # nothing in a record says where the rules are: that is not the record's to say
     chain(monkeypatch, proc(31, "claude"))  # a resumed start is a new runner process: it is stamped again
     start(monkeypatch, capsys, "a")
     assert session.read("a").runner_pid == 31 and session.read("a").rev == 2
@@ -507,27 +512,25 @@ def test_resolve_caller_finds_the_nearest_ancestor(home, monkeypatch, capsys):
     raw["started_at"] = "2020-01-01T00:00:00+00:00"
     (folder(home) / "outer.json").write_text(json.dumps(raw))
     assert session.resolve_caller().session_id == "outer-2"
-    # the env argument picks the registry, as elsewhere
-    assert session.resolve_caller({"WS_HOME": str(home / "elsewhere")}) is None
+    assert not inspect.signature(session.resolve_caller).parameters  # it takes no environment to be told otherwise
 
 
 def test_resolve_caller_none_without_a_match(home, monkeypatch, capsys):
     chain(monkeypatch, proc(300, "claude", start="1111"))
     start(monkeypatch, capsys, "a")
-    env = {"WS_HOME": str(home / "wshome")}
     chain(monkeypatch, proc(5, "bash"), proc(300, "claude", start="2222"))  # the pid was reused: another start time
-    assert session.resolve_caller(env) is None
+    assert session.resolve_caller() is None
     chain(monkeypatch, proc(5, "bash"), proc(301, "claude", start="1111"))
-    assert session.resolve_caller(env) is None
+    assert session.resolve_caller() is None
     chain(monkeypatch)  # no ancestors at all
-    assert session.resolve_caller(env) is None
+    assert session.resolve_caller() is None
     # a record with no stamp, or a damaged one, is never a match
     (folder(home) / "bare.json").write_text(json.dumps({"release": "1", "session_id": "bare"}))
     junk = {"release": "1", "session_id": "j", "runner_pid": "9", "runner_start": 3}
     (folder(home) / "junk.json").write_text(json.dumps(junk))
     (folder(home) / "broken.json").write_text("{nope")
     chain(monkeypatch, proc(9, "claude", start="3"))
-    assert session.resolve_caller(env) is None
+    assert session.resolve_caller() is None
 
 
 def test_resolve_caller_works_for_a_real_child_and_not_a_real_orphan(home, monkeypatch, capsys):
@@ -537,7 +540,7 @@ def test_resolve_caller_works_for_a_real_child_and_not_a_real_orphan(home, monke
     out = home / "out.txt"
     code = textwrap.dedent(
         """
-        import os, sys, time
+        import json, os, sys, time
         out, orphan = sys.argv[1], sys.argv[2] == "orphan"
         if orphan:
             if os.fork():
@@ -547,14 +550,17 @@ def test_resolve_caller_works_for_a_real_child_and_not_a_real_orphan(home, monke
                 os._exit(0)
             time.sleep(0.3)
         from ws import session
+        env = json.loads(sys.argv[3])
+        session.trusted_env = lambda: env  # the test's folders, as the fixture has them in this process
         rec = session.resolve_caller()
         open(out, "w").write(rec.session_id if rec else "none")
         """
     )
-    subprocess.run([sys.executable, "-c", code, str(out), "child"], check=True, timeout=60)
+    env = json.dumps(session.trusted_env())
+    subprocess.run([sys.executable, "-c", code, str(out), "child", env], check=True, timeout=60)
     assert out.read_text() == "me"  # a child of the stamped runner
     out.unlink()
-    subprocess.run([sys.executable, "-c", code, str(out), "orphan"], check=True, timeout=60)
+    subprocess.run([sys.executable, "-c", code, str(out), "orphan", env], check=True, timeout=60)
     deadline = time.monotonic() + 15
     while not out.exists() and time.monotonic() < deadline:
         time.sleep(0.05)
@@ -570,14 +576,10 @@ def test_setters_cannot_set_the_stamp(home, monkeypatch, capsys):
         session.update("a", runner_pid=99)  # type: ignore[call-arg]
     assert session.update("a", state="busy").runner_pid == 30  # an update keeps the stamp it found
     assert on_disk(home, "a")["runner_start"] == "s30"
-    assert on_disk(home, "a")["config"] == str(home / "wshome")  # and the config folder it was pinned to
-    assert "config" not in params
     # a stamp in the hook's own payload is not read: it is the process tree that stamps
     chain(monkeypatch, proc(31, "claude"))
     start(monkeypatch, capsys, "b", payload={"runner_pid": 1, "runner_start": "x", "role": "lead"})
     assert (session.read("b").runner_pid, session.read("b").role) == (31, "worker")
-    start(monkeypatch, capsys, "c", payload={"config": "/elsewhere"})  # nor is the config folder
-    assert session.read("c").config == str(home / "wshome")
     # nudge rewrites the record and carries the stamp over; it does not make one
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"session_id": "a"})))
     assert cli.main(["session", "nudge", *paths.pin_of().args()]) == 0
@@ -588,18 +590,30 @@ def test_setters_cannot_set_the_stamp(home, monkeypatch, capsys):
     assert session.read("fresh").runner_pid is None
 
 
-def test_a_config_folder_is_kept_only_with_a_stamp_and_only_if_absolute(home):
-    folder(home).mkdir(parents=True)
-    base = {"ts": "2026-11-01T00:00:00.000Z", "session_id": "k", "release": "0.1.9", "cwd": "/w"}
-    stamp = {"runner_pid": 7, "runner_start": "s7"}
-    for extra, want in (
-        ({**stamp, "config": "/etc/ws"}, "/etc/ws"),
-        ({**stamp, "config": "relative/dir"}, None),
-        ({**stamp, "config": 5}, None),
-        ({"config": "/etc/ws"}, None),  # no stamp, so no session: the key is not read
+def test_the_registry_is_the_accounts_own_whatever_the_environment_says(home, monkeypatch, tmp_path):
+    """`trusted_env` answers with the system's home for the account and nothing from the process's environment, so a
+    command that sets `WS_HOME`, `WS_*_DIR`, `XDG_*` or `HOME` does not move the registry."""
+    import pwd
+
+    real = pwd.getpwuid(os.getuid()).pw_dir
+    for var, value in (
+        ("WS_HOME", str(tmp_path / "forged")),
+        ("WS_STATE_DIR", str(tmp_path / "forged")),
+        ("WS_CONFIG_DIR", str(tmp_path / "forged")),
+        ("XDG_STATE_HOME", str(tmp_path / "forged")),
+        ("XDG_CONFIG_HOME", str(tmp_path / "forged")),
+        ("HOME", str(tmp_path / "forged")),
     ):
-        (folder(home) / "k.json").write_text(json.dumps({**base, **extra}))
-        assert session.read("k").config == want, extra
+        monkeypatch.setenv(var, value)
+    assert REAL_TRUSTED_ENV() == {"HOME": real}
+    # and a system with no usable home for the account is a typed refusal, and no caller
+    monkeypatch.setattr(pwd, "getpwuid", lambda uid: (_ for _ in ()).throw(KeyError(uid)))
+    with pytest.raises(WsError) as e:
+        REAL_TRUSTED_ENV()
+    assert e.value.kind == "refused"
+    monkeypatch.setattr(session, "trusted_env", REAL_TRUSTED_ENV)
+    chain(monkeypatch, proc(30, "claude"))
+    assert session.resolve_caller() is None
 
 
 def test_old_records_still_read(home):

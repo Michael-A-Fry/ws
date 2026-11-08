@@ -1111,8 +1111,10 @@ def test_protect_adds_a_path_to_the_deny_rules_the_hook_and_the_sandbox():
     assert "/home/u/x" in shim[opencode.PLUGIN] and "/home/u/x" in shim[opencode.CONFIG]
 
 
-def test_opencode_names_every_guard_it_does_not_run_yet():
-    assert set(opencode.UNSUPPORTED_GUARDS) == set(guards.names())
+def test_opencode_names_only_the_guards_one_of_whose_events_it_cannot_reach():
+    # worked out from each guard's EVENTS and KINDS (see tests/test_opencode_parity.py): `claims` reads message calls at pre
+    assert set(opencode.UNSUPPORTED_GUARDS) == {n for n in guards.names() if opencode.guard_gaps(guards.get(n))}
+    assert set(opencode.UNSUPPORTED_GUARDS) == {"claims"}
     assert not hasattr(claude_code, "UNSUPPORTED_GUARDS")
     assert adapters.get("claude-code").EVENT_NAMES["PostToolUse"] == "post"
 

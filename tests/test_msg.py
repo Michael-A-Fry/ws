@@ -315,6 +315,75 @@ def test_forged_sender_refused(plain, monkeypatch, capsys, how):
     assert {r[0] for r in plain.rows('SELECT "from" FROM messages')} <= {"bravo"}
 
 
+@pytest.mark.parametrize("var", ["WS_CONFIG_DIR", "XDG_CONFIG_HOME", "WS_HOME"])
+def test_forged_policy_location_refused(world, monkeypatch, tmp_path, var):
+    """The environment is the command's own to set, so it can't pick the policy or the secrets registry: a session that
+    points ws at an empty config folder still gets the rules of its own (the call is refused, nothing is stored)."""
+    classed(world)
+    (world.root / "wshome" / "secrets.toml").write_text('[GITHUB_TOKEN]\nhosts = ["api.example.com"]\n')
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    token = planted()
+    with monkeypatch.context() as m:
+        m.setenv(var, str(empty))
+        for sender, to, body in (
+            ("wall1", "work2", f"free text {token}"),  # a walled sender's free text
+            ("work1", "wall1", f"free text {token}"),  # a message to a walled session, not from the lead
+            ("lead1", "work1", "please export GITHUB_TOKEN first"),  # a registered secret name
+        ):
+            world.who = sender
+            with pytest.raises(WsError) as e:
+                msg.send(to, "note", body)
+            # WS_HOME also moves the registry (no caller, refused); XDG_CONFIG_HOME has no say while WS_HOME is set, so the
+            # rules of the real policy answer: either way the message is not stored
+            assert e.value.kind in ("refused", "secret_refused"), (var, sender, e.value.message)
+    assert world.count() == 0
+    world.refused("wall1", "work2", "note", f"free text {token}")  # with the environment as it was: still walled
+    assert world.send("lead1", "wall1", "note", "hello")["class"] == "secret"
+    assert token.encode() not in b"".join(p.read_bytes() for p in msg.store_path().parent.glob("messages.db*"))
+
+
+def test_forged_policy_location_cannot_read_or_list(world, monkeypatch, tmp_path):
+    classed(world)
+    world.send("lead1", "work1", "note", "hello")
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    world.who = "work1"
+    with monkeypatch.context() as m:
+        m.setenv("WS_CONFIG_DIR", str(empty))
+        with pytest.raises(WsError) as e:
+            msg.read(1, "work1")
+        assert e.value.kind == "refused" and "environment" in e.value.message
+        with pytest.raises(WsError):
+            msg.inbox("work1", bodies=True)
+    assert msg.read(1, "work1")["body"] == "hello"
+
+
+def test_a_record_without_a_config_folder_is_refused(plain):
+    path = paths.state_dir() / "sessions" / "alpha.json"
+    data = json.loads(path.read_text())
+    del data["config"]
+    path.write_text(json.dumps(data))
+    err = plain.refused("alpha", "bravo")
+    assert "no record of where its policy is" in err.message and err.hint
+
+
+def test_a_forged_policy_location_cannot_start_a_prune(world, monkeypatch, tmp_path):
+    """Tidying runs under the policy the record names; a short retention in a folder the command made up does nothing."""
+    classed(world)
+    world.send("lead1", "work1", "note", "old", now=BASE)
+    fake = tmp_path / "fake"
+    fake.mkdir()
+    (fake / "policy.toml").write_text('[classes.open]\naccess = "full"\nrepos = ["/"]\nretention_days = 1\n')
+    world.who = "work1"
+    with monkeypatch.context() as m:
+        m.setenv("WS_CONFIG_DIR", str(fake))
+        assert [m["id"] for m in msg.inbox("work1", now=BASE + 5 * 86400)] == [
+            1
+        ]  # no policy of the record's: no tidying
+    assert world.count() == 1 and world.rows("SELECT value FROM meta WHERE key='last_prune'") == [(repr(BASE),)]
+
+
 def test_orphaned_process_cannot_send(plain):
     """A process that double-forks is owned by init, not by the runner: it is no session, so it cannot send. The same code
     as a plain child of the runner can."""
@@ -774,8 +843,16 @@ def test_json_envelope_for_every_msg_command(plain, capsys, tmp_path, monkeypatc
     env = json.loads(out)
     assert (code, env["kind"], env["data"]) == (0, "msg.export", {"written": 1, "path": str(path)})
     assert json.loads(path.read_text())["schema"] == "ws.message/1" and oct(path.stat().st_mode & 0o777) == "0o600"
-    plain.who = None  # a person at the terminal: JSON lines, not wrapped in an envelope
-    code, out, _ = run(capsys, "msg", "export", "--json")
+    plain.who = None  # no session (a person's shell, or an orphaned process): no export, whoever asks
+    code, out, err = run(
+        capsys, "msg", "export", "--json"
+    )  # to standard output it is raw lines: the error is on stderr
+    assert (code, out) == (1, "") and "can't tell which session" in err
+    second = path.parent / "second.jsonl"
+    code, out, _ = run(capsys, "msg", "export", "--out", str(second), "--json")
+    assert (code, json.loads(out)["error_kind"]) == (1, "refused") and not second.exists()
+    plain.who = "alpha"
+    code, out, _ = run(capsys, "msg", "export", "--json")  # a session: its own messages as JSON lines, no envelope
     assert code == 0 and [json.loads(line)["schema"] for line in out.splitlines()] == ["ws.message/1"]
     code, out, _ = run(capsys, "msg", "export", "--out", str(path.parent / "no" / "such" / "x"), "--json")
     assert json.loads(out)["error_kind"] == "io"

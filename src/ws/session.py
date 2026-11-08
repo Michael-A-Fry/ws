@@ -34,7 +34,9 @@ hook that is not a shell or a plain launcher such as `env` or `uv`; the start ti
 carrying the first stamp that matches (the newest, when a cleared or resumed session left two for one runner). It works
 unchanged for `ws mcp serve`, which is a child of the runner. A process with no matching ancestor (orphaned, or
 double-forked so that init owns it) is not a session and gets None. Only `start` writes the stamp: `update` keeps it and
-cannot set it. The ancestors come from `/proc` on Linux and `ps` on macOS. The keys are additions, so the schema stays 2.
+cannot set it. `start` also records `config`, the config folder the hook was pinned to (where the policy and the
+secrets registry live), so that a module deciding what a session may do reads the rules from there and not from an
+environment variable the session's own command can set. The ancestors come from `/proc` on Linux and `ps` on macOS. The keys are additions, so the schema stays 2.
 
 Records are pruned 30 days after their last change (`_KEEP_DAYS`); a data class's `retention_days` is the message
 store's own, not this.
@@ -254,6 +256,8 @@ def _new_record(
     }
     if stamp:
         out["runner_pid"], out["runner_start"] = stamp.pid, stamp.start
+        with contextlib.suppress(WsError):  # a layout that can't be told leaves no pin; a reader then refuses
+            out["config"] = str(paths.config_dir(env))
     return out
 
 
@@ -346,6 +350,7 @@ class Record:
     schema: int = 1
     runner_pid: int | None = None  # the runner process `start` stamped (with runner_start); None on an older record
     runner_start: str | None = None
+    config: str | None = None  # the config folder `start` was pinned to; None on a record without one
 
     @classmethod
     def from_dict(cls, data: dict, session_id: str = "") -> Record:
@@ -358,6 +363,7 @@ class Record:
         schema = data.get("schema")
         pane = data.get("pane")
         pid, began = data.get("runner_pid"), text("runner_start")
+        config = text("config")
         stamped = isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 and bool(began) and len(began) <= 64
         return cls(
             session_id=text("session_id") or session_id,
@@ -377,6 +383,7 @@ class Record:
             schema=schema if isinstance(schema, int) and not isinstance(schema, bool) else 1,
             runner_pid=pid if stamped else None,
             runner_start=began if stamped else None,
+            config=config if stamped and config and os.path.isabs(config) and len(config) <= 4096 else None,
         )
 
     def to_dict(self) -> dict:
@@ -400,6 +407,8 @@ class Record:
             out["nudged"] = True
         if self.runner_pid is not None and self.runner_start is not None:
             out["runner_pid"], out["runner_start"] = self.runner_pid, self.runner_start
+            if self.config:
+                out["config"] = self.config
         return out
 
 

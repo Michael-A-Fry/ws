@@ -23,9 +23,15 @@ arguments are read, so a `from` or `class` argument is ignored.
 
 The sender is never an argument. `ws session start` records the runner's process (its id and start time) in the session
 record, and a command is that session when the runner is one of its ancestors. A process that isn't under a runner (one
-that double-forked, or a person's own shell) is not a session, so it can't send, list or read. A person's shell can
-run `ws msg export`, which then writes the whole store without any walled body. A session's export has only the
-messages it sent or was sent.
+that double-forked, or a person's own shell) is not a session, so it can't send, list or read.
+`ws msg export` is the same: with no session behind it, it is refused, and a session's export has only the messages it
+sent or was sent, never a walled body. A person's own export of the whole store arrives with the owner path.
+
+The rules (the policy's classes, and the secrets registry for the names a message may not carry) come from the config
+folder the session record names, which `ws session start` took from the hook's pinned layout. The environment never
+chooses them: if `WS_CONFIG_DIR`, `XDG_CONFIG_HOME` or `WS_HOME` now resolves the config folder anywhere else, the call
+is refused, and a record without a config folder (a session started before this was recorded) is refused until the
+session starts again.
 
 ## Kinds
 

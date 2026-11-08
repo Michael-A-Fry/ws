@@ -11,7 +11,9 @@ Who sends. The sender is never an argument. `send` asks `session.resolve_caller`
 registry entry whose runner process is an ancestor of this one) and refuses when there is none: a flag, an environment
 variable, an MCP argument or a line in the body cannot name a sender. The receiver's data class is looked up from the
 policy by the receiver's folder, at send and again at read; nothing a sender passes is ever read as a class. A policy or
-secrets registry that will not load refuses the send.
+secrets registry that will not load refuses the send. Both are read from the config folder the sender's record names
+(`ws session start` pinned it), never from the environment, which a command can set: a call whose environment points the
+config folder elsewhere is refused. `export` needs a caller too.
 
 Walled classes. A message to a walled or counts-only session keeps its body only in a store inside that session's repo,
 `<repo root>/.ws/messages/<class>.db`, created with a `.gitignore` that ignores everything in the folder; the shared
@@ -70,6 +72,7 @@ HOP_MAX = 8
 STORE_MAX_BYTES = 256 * 1024 * 1024
 BUSY_MS = 5000
 PRUNE_EVERY_S = 3600
+POLICY_FILE, SECRETS_FILE = "policy.toml", "secrets.toml"  # in the config folder
 LIST_DEFAULT, LIST_MAX = 50, 200
 EXPORT_DEFAULT, EXPORT_MAX = 10_000, 100_000
 DEFAULT_RETENTION_DAYS = 30
@@ -425,9 +428,32 @@ def caller(env: dict | None = None) -> session.Record:
     return rec
 
 
-def _policy(env: dict | None) -> policy.Policy:
+def _config_of(rec: session.Record, env: dict) -> Path:
+    """The config folder a session's rules are read from: the one its record says `ws session start` was pinned to. The
+    environment is the command's own to set (`WS_CONFIG_DIR`, `XDG_CONFIG_HOME`, `WS_HOME`), so it never chooses; if it
+    now resolves anywhere else, or the record names no folder, the call is refused rather than run under other rules."""
+    if not rec.config:
+        raise WsError(
+            "refused",
+            f"session {rec.session_id!r} has no record of where its policy is, so ws can't tell its data class",
+            "start the session again so `ws session start` records it",
+        )
     try:
-        return policy.load(policy.policy_path(env))
+        now = paths.config_dir(env)
+    except WsError as e:
+        raise WsError("refused", f"ws's folders can't be told now ({e.message})", e.hint or "fix it") from e
+    if os.path.normpath(now) != os.path.normpath(rec.config):
+        raise WsError(
+            "refused",
+            "ws's config folder is not where this session started (the environment points it somewhere else)",
+            "take WS_CONFIG_DIR, XDG_CONFIG_HOME and WS_HOME out of the command, or start the session again",
+        )
+    return Path(rec.config)
+
+
+def _load_policy(path: Path) -> policy.Policy:
+    try:
+        return policy.load(path)
     except (policy.PolicyError, OSError, ValueError) as e:
         raise WsError(
             "refused",
@@ -436,9 +462,14 @@ def _policy(env: dict | None) -> policy.Policy:
         ) from e
 
 
-def _secret_names(env: dict | None) -> list[str]:
+def _policy(rec: session.Record, env: dict) -> policy.Policy:
+    """The policy of the config folder `rec` started in (see `_config_of`)."""
+    return _load_policy(_config_of(rec, env) / POLICY_FILE)
+
+
+def _secret_names(rec: session.Record, env: dict) -> list[str]:
     try:
-        return sorted(secrets.load_registry(secrets.registry_path(env)))
+        return sorted(secrets.load_registry(_config_of(rec, env) / SECRETS_FILE))
     except (secrets.SecretsError, OSError) as e:
         raise WsError(
             "refused", "ws can't read the secrets registry, so it can't check the message for secret names", "fix it"
@@ -552,8 +583,8 @@ def send(
         )
 
     sender = caller(env)
-    pol = _policy(env)
-    names = _secret_names(env)
+    pol = _policy(sender, env)
+    names = _secret_names(sender, env)
     target = session.read(to, env)
     if target is None:
         raise WsError("not_found", f"no session {to!r}", "the registry has no session with that id")
@@ -587,7 +618,7 @@ def send(
         if conn is None:  # create=True never answers None; this keeps the type honest
             raise _unavailable("unopenable")
         try:
-            _housekeeping(conn, env, now, pol)
+            _housekeeping(conn, now, pol)
             if store and data:
                 _attach_class(conn, store[1])
             conn.execute("BEGIN IMMEDIATE")
@@ -747,13 +778,15 @@ def _window(limit, after) -> tuple[int, int]:
     return _int(limit, "limit", 1, LIST_MAX), _int(after, "after", 0)
 
 
-def _rows(env, where: str, args: tuple, limit: int, now: float | None = None) -> list[sqlite3.Row]:
+def _rows(
+    env, where: str, args: tuple, limit: int, now: float | None = None, pol: policy.Policy | None = None
+) -> list[sqlite3.Row]:
     with _typed():
         conn = _open(env, create=False)
         if conn is None:
             return []
         try:
-            _housekeeping(conn, env, now)
+            _housekeeping(conn, now, pol)
             return conn.execute(f"{_LIST_SQL} WHERE {where} ORDER BY m.id LIMIT ?", (*args, limit)).fetchall()
         finally:
             conn.close()
@@ -764,6 +797,15 @@ def _session(env, session_id: str) -> session.Record:
     if rec is None:
         raise WsError("refused", f"no readable session record for {session_id!r}", "start the session first")
     return rec
+
+
+def _tidy_policy(env: dict, session_id: str) -> policy.Policy | None:
+    """The policy of `session_id`'s record for tidying, or None when it can't be had (tidying is skipped, never a reason
+    to fail the read it rides on)."""
+    try:
+        return _policy(_session(env, session_id), env)
+    except WsError:
+        return None
 
 
 def inbox(
@@ -782,10 +824,11 @@ def inbox(
     env = _env(env)
     limit, after = _window(limit, after)
     where = "r.recipient=? AND m.id>?" + (" AND r.read_ts IS NULL" if unread_only else "")
-    rows = _rows(env, where, (session_id, after), limit, now)
+    rows = _rows(env, where, (session_id, after), limit, now, _tidy_policy(env, session_id))
     out = [_public(r) for r in rows]
     if bodies and rows:
-        reader, pol = _session(env, session_id), _policy(env)
+        reader = _session(env, session_id)
+        pol = _policy(reader, env)
         for item, row in zip(out, rows, strict=True):
             item["body"], item["body_state"] = _body(row, reader, pol)
     return out
@@ -801,7 +844,9 @@ def sent(
 ) -> list[dict]:
     """The messages `session_id` sent (envelopes only), oldest first."""
     limit, after = _window(limit, after)
-    return [_public(r) for r in _rows(_env(env), 'm."from"=? AND m.id>?', (session_id, after), limit, now)]
+    env = _env(env)
+    rows = _rows(env, 'm."from"=? AND m.id>?', (session_id, after), limit, now, _tidy_policy(env, session_id))
+    return [_public(r) for r in rows]
 
 
 def _body(row: sqlite3.Row, reader: session.Record, pol: policy.Policy) -> tuple[str | None, str]:
@@ -831,7 +876,8 @@ def read(message_id: int, session_id: str, *, env: dict | None = None, now: floa
     not exist, is `not_found` (the same answer, so ids can't be probed). A walled body comes only to a reader in that class."""
     env = _env(env)
     mid = _int(message_id, "the message id")
-    reader, pol = _session(env, session_id), _policy(env)
+    reader = _session(env, session_id)
+    pol = _policy(reader, env)
     stamp = jsonl.iso_utc(_t(now))
     with _typed():
         conn = _open(env, create=False)
@@ -937,10 +983,13 @@ def envelopes(*, after: int = 0, limit: int = LIST_DEFAULT, env: dict | None = N
 # --- retention and deletion -----------------------------------------------------------------------------------------
 
 
-def _housekeeping(conn: sqlite3.Connection, env: dict, now: float | None, pol: policy.Policy | None = None) -> None:
-    """Prune when the last prune was an hour ago or more. Tidying is never a reason to fail the call it rides on."""
+def _housekeeping(conn: sqlite3.Connection, now: float | None, pol: policy.Policy | None) -> None:
+    """Prune when the last prune was an hour ago or more, under the policy of the session the call is for (none: no
+    tidying). Tidying is never a reason to fail the call it rides on."""
+    if pol is None:
+        return
     try:
-        _prune(conn, env, _t(now), pol, force=False)
+        _prune(conn, _t(now), pol, force=False)
     except (WsError, sqlite3.Error, OSError):
         return
 
@@ -956,11 +1005,10 @@ def _repo_gone(root: str) -> bool:
     return False
 
 
-def _prune(conn: sqlite3.Connection, env: dict, now: float, pol: policy.Policy | None, *, force: bool) -> dict:
+def _prune(conn: sqlite3.Connection, now: float, pol: policy.Policy, *, force: bool) -> dict:
     last = conn.execute("SELECT value FROM meta WHERE key='last_prune'").fetchone()
     if not force and last is not None and now - float(last["value"]) < PRUNE_EVERY_S:
         return {"ran": False, "expired": 0, "gone": 0}
-    pol = pol or _policy(env)  # a policy that won't load is a prune that doesn't happen: retention can't be known
     touched: set[tuple[str, str]] = set()  # (repo root, class) of walled rows whose bodies may need tidying
     gone = expired = 0
     conn.execute("BEGIN IMMEDIATE")
@@ -1000,14 +1048,16 @@ def _tidy_class_store(root: str, cls: str, pol: policy.Policy, now: float) -> No
 def prune(*, env: dict | None = None, now: float | None = None, force: bool = False) -> dict:
     """Drop messages past their receiving class's `retention_days` (30 with no class), and the rows of walled messages
     whose repo folder is gone (their bodies went with it). Runs at most once an hour unless `force`. Returns `ran`,
-    `expired` and `gone`. A policy that will not load refuses (retention can't be known)."""
+    `expired` and `gone`. A policy that will not load refuses (retention can't be known). This is for ws's own hooks and
+    the person's tools, which read the policy from their layout; a session's calls tidy under the policy its record names."""
     env = _env(env)
+    pol = _load_policy(policy.policy_path(env))
     with _typed():
         conn = _open(env, create=False)
         if conn is None:
             return {"ran": False, "expired": 0, "gone": 0}
         try:
-            return _prune(conn, env, _t(now), None, force=force)
+            return _prune(conn, _t(now), pol, force=force)
         finally:
             conn.close()
 
@@ -1025,7 +1075,8 @@ def export(
 ) -> int:
     """Write messages to `out` (a text stream) as JSON lines, each carrying `schema: "ws.message/1"`, and return how many.
     Never a walled body, for anyone: those rows carry the envelope and `body: null`. With `session_id` only that session's
-    messages (sent or received); without, the whole store (a person at their own terminal). Not written through ws.jsonl: it
+    messages (sent or received); without, the whole store (for ws's own tools and the owner path to come; `ws msg export`
+    always passes the caller's). Not written through ws.jsonl: it
     is an export, not a log."""
     limit = _int(limit, "limit", 1, EXPORT_MAX)
     after = _int(after, "after", 0)
@@ -1124,8 +1175,7 @@ def cmd_read(args: argparse.Namespace) -> int:
 
 
 def cmd_export(args: argparse.Namespace) -> int:
-    who = session.resolve_caller()
-    sid = who.session_id if who else None
+    sid = caller(None).session_id  # no caller, no export: an orphaned process is not a person (the owner path is w5's)
     if args.out is None:
         export(sys.stdout, session_id=sid, after=args.after, limit=args.limit)
         return 0

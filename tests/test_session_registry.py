@@ -475,6 +475,7 @@ def test_start_stamps_the_runner_process(home, monkeypatch, capsys):
     rec = session.read("a")
     assert (rec.runner_pid, rec.runner_start) == (30, "s30") and rec.schema == session.SCHEMA_VERSION == 2
     assert rec.to_dict()["runner_pid"] == 30
+    assert raw["config"] == str(home / "wshome") == rec.config  # the config folder the hook was pinned to
     chain(monkeypatch, proc(31, "claude"))  # a resumed start is a new runner process: it is stamped again
     start(monkeypatch, capsys, "a")
     assert session.read("a").runner_pid == 31 and session.read("a").rev == 2
@@ -569,10 +570,14 @@ def test_setters_cannot_set_the_stamp(home, monkeypatch, capsys):
         session.update("a", runner_pid=99)  # type: ignore[call-arg]
     assert session.update("a", state="busy").runner_pid == 30  # an update keeps the stamp it found
     assert on_disk(home, "a")["runner_start"] == "s30"
+    assert on_disk(home, "a")["config"] == str(home / "wshome")  # and the config folder it was pinned to
+    assert "config" not in params
     # a stamp in the hook's own payload is not read: it is the process tree that stamps
     chain(monkeypatch, proc(31, "claude"))
     start(monkeypatch, capsys, "b", payload={"runner_pid": 1, "runner_start": "x", "role": "lead"})
     assert (session.read("b").runner_pid, session.read("b").role) == (31, "worker")
+    start(monkeypatch, capsys, "c", payload={"config": "/elsewhere"})  # nor is the config folder
+    assert session.read("c").config == str(home / "wshome")
     # nudge rewrites the record and carries the stamp over; it does not make one
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"session_id": "a"})))
     assert cli.main(["session", "nudge", *paths.pin_of().args()]) == 0
@@ -581,6 +586,20 @@ def test_setters_cannot_set_the_stamp(home, monkeypatch, capsys):
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"session_id": "fresh"})))
     assert cli.main(["session", "nudge", *paths.pin_of().args()]) == 0
     assert session.read("fresh").runner_pid is None
+
+
+def test_a_config_folder_is_kept_only_with_a_stamp_and_only_if_absolute(home):
+    folder(home).mkdir(parents=True)
+    base = {"ts": "2026-11-01T00:00:00.000Z", "session_id": "k", "release": "0.1.9", "cwd": "/w"}
+    stamp = {"runner_pid": 7, "runner_start": "s7"}
+    for extra, want in (
+        ({**stamp, "config": "/etc/ws"}, "/etc/ws"),
+        ({**stamp, "config": "relative/dir"}, None),
+        ({**stamp, "config": 5}, None),
+        ({"config": "/etc/ws"}, None),  # no stamp, so no session: the key is not read
+    ):
+        (folder(home) / "k.json").write_text(json.dumps({**base, **extra}))
+        assert session.read("k").config == want, extra
 
 
 def test_old_records_still_read(home):

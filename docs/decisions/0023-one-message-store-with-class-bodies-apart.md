@@ -38,7 +38,9 @@ makes an exception for a reply or a task the sender owns. The viewer and `ws msg
 The sender is the session whose runner process is an ancestor of the caller (`ws.session.resolve_caller`), nearest first.
 Nothing the caller is given takes part. A process with no such ancestor, such as one that double-forked, is not a session
 and can't send. The receiver's class is looked up from the policy by the receiver's folder at send and at read, never
-taken from the message.
+taken from the message. The policy and the secrets registry are read from the config folder the session's record
+names (`ws session start` pins it), and a call whose environment resolves the config folder anywhere else is refused:
+the environment is as much the command's to set as an argument.
 
 An idempotency key is stored as the hash of the sender and the key, so a key that was chosen by one session is not
 text in the shared file. A thread name can't be set on a message to a walled class.

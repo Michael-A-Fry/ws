@@ -8,11 +8,10 @@ decision-makers: maintainer
 
 ## Context and Problem Statement
 
-`ws run` checked the month's spend against the cap before it started, and counted the run afterwards. Two runs that
-started together each saw the same room and both went ahead. A run could spend what its own timeout and turns allowed,
-whatever was left. Nothing held a concurrency limit or the host's memory, and a job that ran from a timer on a login
-(rather than a key) had nothing to say how much of that login was left. A purpose that must never spend more than its share
-(evals against jobs, on one key) had no counter of its own.
+A monthly cap has to hold when runs start together, and a run can spend what its own timeout and turns allow, whatever
+is left. A concurrency limit and the host's memory need the same answer. A job that runs from a timer on a login (rather
+than a key) needs to know how much of that login is left, and a purpose that must never spend more than its share (evals
+against jobs, on one key) needs a counter of its own.
 
 ## Considered Options
 
@@ -32,7 +31,7 @@ cost, in the code that writes its record, and a crash is reaped by the owner's p
 Two decisions inside it. Money that is short resizes the reservation to what is left and that sum is passed to Claude
 Code as `--max-budget-usd` (unless the job says `strict`); OpenCode has no such flag, so there the reservation holds the
 money and only the settle corrects it. And a store that cannot be used (locked, full, unreadable) refuses the run: the
-alternative, running without a reservation, is the very gap this closes.
+alternative, running without a reservation, would be a run no counter holds.
 
 The queue engine is one file of standard-library code (`ws._vendor.sqlqueue`) with claim ids that fence a stale holder,
 idempotency keys and lease expiry. Message delivery is meant to reuse it, so its API is documented in its own docstring.

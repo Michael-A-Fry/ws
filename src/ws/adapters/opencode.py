@@ -10,7 +10,8 @@ before a call the only one that can block.
 
 Also denied: edits of the policy file and of the generated folder, so a session cannot loosen its own gate, and of the
 skills folders OpenCode reads (its own, and the ones it shares with other runners), because a skill is read as
-instructions.
+instructions. The home-level folders are denied by absolute path and as OpenCode sees them from a project (`../...`).
+The project's own `.opencode/skills` is denied too; its `.claude/skills` and `.agents/skills` are the project's own.
 
 Point OpenCode at the output so its global config is never touched, and so a project's own `opencode.json` cannot
 loosen the gate: the inline config (OPENCODE_CONFIG_CONTENT) is read after the global, OPENCODE_CONFIG and project
@@ -48,6 +49,7 @@ _TOOLS = {"web_fetch": "webfetch", "web_search": "websearch"}
 # For ws.sandbox: the env var that names the generated folder. The whole folder is read-only in the wall (OpenCode loads
 # plugin/, tool/, agent/, command/ and opencode.jsonc from it, so a planted file there would outlive the session).
 CONFIG_DIR_ENV = "OPENCODE_CONFIG_DIR"
+ASKS_SCHEMA = 1  # the `schema` of each line the shim appends to the asks file (docs/reference/stores.md)
 
 # OpenCode's plugin hooks and events, as ws.guards names them (checked against the 1.19.4 binary: tool.execute.before,
 # tool.execute.after, chat.message and session.created are plugin hooks or events it fires, and session.idle is the event
@@ -181,6 +183,25 @@ def _protect_forms(path: str, is_out: bool) -> list[str]:
     return [path, f"{path}/**", f"**/{tail}", f"**/{tail}/**"]
 
 
+def _skill_forms(path: str) -> list[str]:
+    """Edit rules for a skills folder in the person's home or config folder: the absolute path, and how OpenCode sees it
+    from a project (`../` first, the last two segments of the path below). A bare `**/.claude/skills` would also catch a
+    project's own `.claude/skills`, which is the project's to change, so the relative forms start with `../`: they only
+    reach a folder outside the project."""
+    tail = "/".join(Path(path).parts[-2:])
+    return [path, f"{path}/**", f"../{tail}", f"../{tail}/**", f"../**/{tail}", f"../**/{tail}/**"]
+
+
+# The skills folders of a project that OpenCode reads on its own (`.opencode/skills`, and the older singular name): they
+# steer the next session as much as a home-level one does. A project's `.claude/skills` and `.agents/skills` are not on
+# the list: they are the project's own, shared with other runners.
+PROJECT_SKILL_FOLDERS = (".opencode/skills", ".opencode/skill")
+
+
+def _project_skill_forms(folder: str) -> list[str]:
+    return [folder, f"{folder}/**", f"**/{folder}", f"**/{folder}/**"]
+
+
 def native_asks(policy: Policy) -> list[str]:
     """The `ask_commands` a runner can enforce from its own rule list (`native_patterns` decides which and in what
     spellings: a pattern only the hook can read is left to the hook), without the patterns the guards add."""
@@ -240,11 +261,17 @@ def generate(
     for p in protected_paths(out, policy_file, protect):
         edit.update(dict.fromkeys(_protect_forms(p, p == str(out)), "deny"))
     for p in skill_folders(pin):  # a skill is read as instructions: a planted one would steer the next session
-        edit.update(dict.fromkeys(_protect_forms(p, False), "deny"))
+        edit.update(dict.fromkeys(_skill_forms(p), "deny"))
+    for folder in PROJECT_SKILL_FOLDERS:
+        edit.update(dict.fromkeys(_project_skill_forms(folder), "deny"))
     permission["edit"] = edit
     for t in policy.gate.deny_tools:
         permission[_TOOLS[t]] = "deny"
-    config = {"$schema": "https://opencode.ai/config.json", "permission": permission}
+    config: dict = {"$schema": "https://opencode.ai/config.json", "permission": permission}
+    if (
+        POLICIES_SINCE is not None
+    ):  # a version whose schema has the key: ws writes it empty until it has a rule to put in
+        config["policies"] = {}
     on = policy.guards.on
     pre_kinds = set(_ALWAYS_PRE) | (guards.kinds_for(on, "pre") & set(PRODUCES))
     post_kinds = guards.kinds_for(on, "post") & set(PRODUCES)
@@ -257,6 +284,7 @@ def generate(
     plugin = plugin.replace("/*__POST_TOOLS__*/ []", json.dumps(_tools_of(post_kinds)))
     plugin = plugin.replace("/*__ADVICE__*/ []", json.dumps([e for e in events if e != "post" or post_kinds]))
     plugin = plugin.replace("/*__ASK__*/ []", json.dumps(asks)).replace('/*__ASKS__*/ ""', json.dumps(asks_file(pin)))
+    plugin = plugin.replace("/*__ASKS_SCHEMA__*/ 0", str(ASKS_SCHEMA))
     return {CONFIG: json.dumps(config, indent=2) + "\n", PLUGIN: plugin, IGNORE: IGNORE_TEXT}
 
 

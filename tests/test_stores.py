@@ -14,6 +14,7 @@ from pathlib import Path
 from ws import canary, gate, jsonl, rating, runrecord, sandbox
 from ws import eval as ws_eval
 from ws import node as ws_node
+from ws.adapters import opencode
 from ws.guards import claims, record_calls
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -36,6 +37,7 @@ SCHEMAS = {
     "gate.jsonl": gate.VERDICT_SCHEMA,
     "wall-report.jsonl": sandbox.WALL_REPORT_SCHEMA,
     "footprint.jsonl": ws_node.SCHEMA_VERSION,
+    "asks.jsonl": opencode.ASKS_SCHEMA,
 }
 
 # Version 2 of the run record, frozen: a later change may add a key to the schema under a new number, never to this one.
@@ -142,8 +144,8 @@ def modules_that_write() -> dict[str, set[str]]:
 # the asks file it reads (it writes nothing), and ws.paths names ratings.jsonl in its table of where files live.
 # src/ws/paths.py is on the list because it writes no file at all: the name is one row of its table, not a store.
 NAMES_ONLY = {"src/ws/policy.py", "src/ws/adapters/claude_code.py", "src/ws/home/api.py", "src/ws/paths.py"}
-# Files another tool writes and ws only reads (the home API's default sources). Not ws stores, so stores.md doesn't
-# list them; only a NAMES_ONLY module may name one.
+# A file the home API names as a default source and does not write: the OpenCode shim (src/ws/adapters/opencode.py) is
+# its writer and stores.md lists it. A NAMES_ONLY module may name it without being a writer.
 FOREIGN = {"asks.jsonl"}
 
 

@@ -57,6 +57,7 @@ folders read-only, and the gate refuses a session's writes to each of them in ei
 | Gate verdicts | `logs/gate.jsonl` | `src/ws/gate.py` | `schema`, `ts`, `runner`, `session`, `event`, `decision` (`allow`, `deny`, `ask`, `claim`), `layer`, `guards` (each `guard`, `result`, `ms`), `ms`, `via` (`direct` or `daemon`) | 1 | `ts` | Rotates at 5 MiB |
 | Wall report | `logs/wall-report.jsonl` | `src/ws/sandbox.py` | `schema`, `ts`, `at`, `project`, `runner`, `incomplete`, `findings`, `notes` | 1 | `ts`, `at` | Rotates at 5 MiB |
 | Node footprint | `node/footprint.jsonl` | `src/ws/node.py` | `schema`, `ts`, `type` (`ws.footprint/1`), `node`, `op` (`intent`, `done`, `removed`), `step`, and on an intent `kind`, `target`, `sha256`, `existed` | 1 | `ts` | Never rotated; removed by `ws node remove` once every change is undone |
+| OpenCode asks | `.claude-usage/asks/asks.jsonl` | `src/ws/adapters/opencode.py` (the shim it generates writes the lines, from OpenCode's permission events) | `schema`, `ts` (epoch milliseconds), `event` (`added`, `answered`), `id`, and on `added` `repo`, `session`, `question`, `options`, `decision`, `source` | 1 | `ts` | Each line starts with a newline; past 8 MiB the file moves to `asks.jsonl.old`, one generation, so it stays under the 64 MiB `ws home` reads |
 | Broker audit | `logs/broker.jsonl` | `src/ws/broker.py` | `t`, `op`, `name`, `purpose`, `host`, `uid`, `pid`, `lease`, `status`, `bytes` | none (reads as 1) | `t` | One file; the broker appends and never rotates it |
 
 Notes:
@@ -68,6 +69,9 @@ Notes:
   `expired`.
 - The node footprint is a ledger, not a log: two lines per change (an `intent` before it, a `done` after), so a crash
   between them is still understood. It is never rotated, because a forgotten change could not be undone.
+- The OpenCode asks file is the one log outside the four folders: it sits where `ws home` reads asks from, which is
+  `[home.sources] asks_jsonl` in the profile, else `.claude-usage/asks/asks.jsonl` below your home folder. Its `ts` is
+  epoch milliseconds, not the RFC 3339 text of the other logs; the reader takes either.
 - The broker audit log predates the convention. It's the one log that doesn't go through `ws.jsonl`, and it has no
   `schema`. Its time key is `t`. A change to it takes a schema number of its own.
 - Ratings sit at the top of the state folder and not in `logs/`. The top holds the control files a session may not write,

@@ -133,11 +133,11 @@ def test_approved_call_runs_once(tmp_path, work):
 
 
 def test_approved_compound_call_runs_once(tmp_path, work):
-    """OpenCode lists every shell segment in one ask (`ls, touch X`); the one segment of ws's is enough to answer it."""
+    """OpenCode lists every shell segment in one ask (`touch X, touch Y`); when every one is ws's, the shim answers it."""
     write_policy(tmp_path, ask=True)
     out = layer(tmp_path, "both")
     target = work / "APPROVED"
-    call = bash(f"ls && touch {target}")
+    call = bash(f"touch {work / 'FIRST_APPROVED'} && touch {target}")
     root = tmp_path / "wshome" / "approvals"
 
     stub, proc = step(tmp_path, out, work, [call], first=True)

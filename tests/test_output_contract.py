@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from ws import cli, output, paths
+from ws import cli, output, paths, session
 
 # Commands that keep their own stdout (a protocol, a hook, the terminal) and so are not wrapped; their errors still are.
 RAW = {
@@ -102,6 +102,10 @@ CASES: dict[str, list[str]] = {
     "node.join": ["node", "join"],
     "node.show": ["node", "show"],
     "node.remove": ["node", "remove"],
+    "msg.send": ["msg", "send", "someone", "hello"],
+    "msg.list": ["msg", "list"],
+    "msg.read": ["msg", "read", "1"],
+    "msg.export": ["msg", "export", "--out", "{home}/messages.jsonl"],
     "term": ["term", "--bind", "0.0.0.0"],  # a typed refusal: the real command stays up until stopped
 }
 
@@ -119,6 +123,7 @@ def box(tmp_path, monkeypatch):
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     monkeypatch.chdir(home)
     monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+    monkeypatch.setattr(session, "trusted_env", lambda: {"HOME": str(home)})  # `ws msg` reads the account's home
     return home
 
 

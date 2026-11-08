@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import shutil
 import subprocess
 import types
@@ -395,8 +394,21 @@ def test_skills_folders_are_edit_denied(tmp_path, box):
         f = str(folder)
         tail = "/".join(folder.parts[-2:])
         assert perm[f] == perm[f + "/**"] == "deny", f
-        assert perm[f"**/{tail}"] == perm[f"**/{tail}/**"] == "deny", f  # how OpenCode sees a path below the project
+        for form in (f"../{tail}", f"../{tail}/**", f"../**/{tail}", f"../**/{tail}/**"):
+            assert perm[form] == "deny", form  # how OpenCode sees a folder outside the project
     assert next(iter(perm.items())) == ("*", "allow")
+
+
+def test_a_projects_own_skills_folders_are_not_caught_by_the_home_level_rules(tmp_path, box):
+    """A bare `**/.claude/skills` would deny a project's own; the rules for the home folders start with `../`. The
+    project's `.opencode/skills` (the one OpenCode reads itself) is denied in the project and in a folder below it."""
+    perm = native("", tmp_path)["edit"]
+    for own in (".claude/skills", ".agents/skills"):
+        inside = [k for k in perm if own in k and not k.startswith(("/", "../"))]
+        assert not inside, (own, inside)
+    for folder in (".opencode/skills", ".opencode/skill"):
+        for form in (folder, f"{folder}/**", f"**/{folder}", f"**/{folder}/**"):
+            assert perm[form] == "deny", form
 
 
 def test_the_skills_folders_follow_the_config_home_the_environment_names(tmp_path, box, monkeypatch):
@@ -404,10 +416,15 @@ def test_the_skills_folders_follow_the_config_home_the_environment_names(tmp_pat
     assert native("", tmp_path)["edit"][str(tmp_path / "xdg" / "opencode" / "skills")] == "deny"
 
 
-def test_a_policies_key_is_emitted_only_when_supported(tmp_path, box):
-    files = opencode.generate(policy.loads(""), ["ws"], tmp_path / "out", tmp_path / "p.toml", pin=paths.pin_of())
-    assert "policies" not in json.loads(files[opencode.CONFIG])
+def test_a_policies_key_is_emitted_only_when_supported(tmp_path, box, monkeypatch):
+    def written() -> dict:
+        files = opencode.generate(policy.loads(""), ["ws"], tmp_path / "out", tmp_path / "p.toml", pin=paths.pin_of())
+        return json.loads(files[opencode.CONFIG])
+
     assert opencode.POLICIES_SINCE is None, "set it only to a version whose schema has a `policies` permission key"
+    assert "policies" not in written()
+    monkeypatch.setattr(opencode, "POLICIES_SINCE", "99.0.0")  # both arms read the constant, so each can fail
+    assert "policies" in written()
     doc = (ROOT / "docs" / "reference" / "gate.md").read_text(encoding="utf-8")
     assert "policies" in doc and "1.19.4" in doc  # the page says which version was checked and what it found
 
@@ -599,29 +616,108 @@ def test_the_generated_folder_still_needs_nothing_written_at_start(tmp_path, box
     assert set(files) == {opencode.CONFIG, opencode.PLUGIN, opencode.IGNORE}
 
 
-def ask_answered(shim: str, patterns: list[str], *, permission: str = "bash", allowed: bool = True) -> bool:
-    """The shim's `asked` decision, mirrored from its JS: `wild` turns each of ws's `ask_commands` into a regex, and the
-    ask is answered when the permission is bash, the gate allowed the call and at least one listed segment matches one."""
-    ask = js_const(shim, "ASK")
+NODE = shutil.which("node")
+TRUE = shutil.which("true")
 
-    def wild(g: str) -> re.Pattern:
-        s = re.sub(r"([.+^${}()|\[\]\\])", r"\\\1", g).replace("*", ".*").replace("?", ".")
-        if s.endswith(" .*"):
-            s = s[:-3] + "( .*)?"
-        return re.compile("^" + s + "$", re.DOTALL)
+# Loads the generated shim in node with a client that records its replies, lets the gate "allow" a bash call (the check
+# command is `true`), raises one permission.asked event for it, and prints the replies. The cases come in on stdin.
+DRIVER = """
+import { pathToFileURL } from "node:url"
+const mod = await import(pathToFileURL(process.argv[2]).href)
+const read = () => new Promise((ok) => { let t = ""; process.stdin.on("data", (d) => (t += d)); process.stdin.on("end", () => ok(t)) })
+const cases = JSON.parse(await read())
+const out = []
+for (const [i, c] of cases.entries()) {
+  const replies = []
+  const hooks = await mod.WsGate({ client: { permission: { reply: async (r) => replies.push(r) } }, directory: "/w" })
+  if (c.allowed) await hooks["tool.execute.before"]({ tool: "bash", callID: "call" + i, sessionID: "s" }, { args: { command: "x" } })
+  const properties = { id: "p" + i, sessionID: "s", permission: c.permission, patterns: c.patterns, tool: { callID: "call" + i } }
+  await hooks.event({ event: { type: "permission.asked", properties } })
+  out.push(replies)
+}
+console.log(JSON.stringify(out))
+"""
 
-    asks = [wild(g) for g in ask]
-    return permission == "bash" and allowed and any(re.match(r, x) for x in patterns for r in asks)
+
+def shim_answers(tmp_path: Path, shim: str, cases: list[dict], asks: Path | None = None) -> list[list[dict]]:
+    """Run the generated shim in node and return, for each case, the replies it gave to the ask."""
+    plugin = tmp_path / "ws-gate.mjs"
+    text = shim.replace(f"const CHECK = {json.dumps(js_const(shim, 'CHECK'))}", f"const CHECK = {json.dumps([TRUE])}")
+    assert text != shim
+    if asks is not None:
+        text = text.replace(
+            f"const ASKS = {json.dumps(js_const(shim, 'ASKS'))}", f"const ASKS = {json.dumps(str(asks))}"
+        )
+    plugin.write_text(text, encoding="utf-8")
+    driver = tmp_path / "driver.mjs"
+    driver.write_text(DRIVER, encoding="utf-8")
+    done = subprocess.run(
+        [NODE, str(driver), str(plugin)],
+        input=json.dumps(cases),
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    return json.loads(done.stdout)
 
 
-def test_a_mixed_segment_ask_is_answered_and_a_foreign_one_is_not(tmp_path, box):
+def ask_case(patterns, *, permission="bash", allowed=True) -> dict:
+    return {"patterns": patterns, "permission": permission, "allowed": allowed}
+
+
+@pytest.mark.skipif(NODE is None or TRUE is None, reason="needs node and a `true` command")
+def test_an_ask_is_answered_once_only_when_every_segment_is_one_of_ws_asks(tmp_path, box):
     shim = shim_for('[gate]\nask_commands = ["touch *APPROVED"]\n', tmp_path)
-    some = "patterns.some((x) => ASK_RE.some((re) => re.test(x)))"
-    assert some in shim and "patterns.every(" not in shim  # the JS this test mirrors
-    assert ask_answered(shim, ["touch /w/APPROVED"])
-    assert ask_answered(shim, ["ls", "touch /w/APPROVED"])  # `ls && touch X`: OpenCode lists every segment
-    assert ask_answered(shim, ["touch /w/APPROVED", "echo hi", "ls"])
-    assert not ask_answered(shim, ["ls", "echo hi"])  # none of ws's rules: the person's own ask
-    assert not ask_answered(shim, ["ls", "touch /w/APPROVED"], allowed=False)  # the gate did not let it through
-    assert not ask_answered(shim, ["touch /w/APPROVED"], permission="edit")
-    assert not ask_answered(shim, [])
+    got = shim_answers(
+        tmp_path,
+        shim,
+        [
+            ask_case(["touch /w/APPROVED"]),  # 0: the one segment is ws's
+            ask_case(["touch /w/APPROVED", "touch /w/MORE_APPROVED"]),  # 1: every segment is ws's
+            ask_case(["ls", "touch /w/APPROVED"]),  # 2: `ls` may be the person's own ask rule: left to them
+            ask_case(["touch /w/APPROVED", "echo hi", "ls"]),  # 3
+            ask_case(["ls", "echo hi"]),  # 4: none of ws's
+            ask_case(["touch /w/APPROVED"], allowed=False),  # 5: the gate did not let the call through
+            ask_case(["touch /w/APPROVED"], permission="edit"),  # 6: not a shell command
+            ask_case([]),  # 7
+        ],
+    )
+    assert got == [[{"requestID": "p0", "reply": "once"}], [{"requestID": "p1", "reply": "once"}]] + [[]] * 6, got
+
+
+def test_the_ask_check_in_the_shim_is_every_not_some(tmp_path, box):
+    """The node test above is skipped without node; this pins the rule in the text itself."""
+    shim = shim_for('[gate]\nask_commands = ["touch *APPROVED"]\n', tmp_path)
+    assert "patterns.every((x) => ASK_RE.some((re) => re.test(x)))" in shim and "patterns.some(" not in shim
+
+
+def asks_after(tmp_path: Path, before: bytes) -> Path:
+    """Put `before` in an asks file, raise one ask through the shim, and return the file's path."""
+    asks = tmp_path / "asks" / "asks.jsonl"
+    asks.parent.mkdir()
+    asks.write_bytes(before)
+    shim = shim_for('[gate]\nask_commands = ["touch *APPROVED"]\n', tmp_path)
+    shim_answers(tmp_path, shim, [ask_case(["touch /w/APPROVED"])], asks=asks)
+    return asks
+
+
+@pytest.mark.skipif(NODE is None or TRUE is None, reason="needs node and a `true` command")
+def test_the_asks_file_is_rotated_before_it_passes_what_the_reader_accepts(tmp_path, box):
+    from ws.home.sources import _files
+
+    asks = asks_after(tmp_path, b"x" * (9 * 1024 * 1024))
+    assert (tmp_path / "asks" / "asks.jsonl.old").stat().st_size == 9 * 1024 * 1024
+    assert asks.stat().st_size < 4096
+    assert [row["event"] for row in _files.iter_jsonl(asks)] == ["added"]  # one reads fine, under the 64 MiB cap
+    assert 9 * 1024 * 1024 < _files.FILE_CAP
+
+
+@pytest.mark.skipif(NODE is None or TRUE is None, reason="needs node and a `true` command")
+def test_a_torn_last_line_in_the_asks_file_costs_only_itself(tmp_path, box):
+    from ws.home.sources import _files
+
+    asks = asks_after(tmp_path, b'{"event": "added", "id": "old", "q')  # the writer died mid-line, no newline
+    rows = list(_files.iter_jsonl(asks))
+    assert [row["id"] for row in rows] == ["p0"]

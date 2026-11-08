@@ -10,8 +10,8 @@ decision-makers: maintainer
 
 The sandbox block became part of what ws writes into a runner's own settings in 0.1.8, on by default. A settings
 file that ws wrote before then has no block (`WS_SANDBOXED` is `0` in it). When a newer ws rewrites such a file, the
-default would add the block. A sandbox that cannot start (no bubblewrap or socat) makes Claude Code refuse to start, so
-an upgrade could turn a working machine into one that cannot open a session, with the person having asked for nothing.
+default would add the block. A sandbox that can't start (no bubblewrap or socat) makes Claude Code refuse to start, so
+an upgrade could turn a working machine into one that can't open a session, with the person having asked for nothing.
 
 ## Considered Options
 
@@ -24,12 +24,12 @@ an upgrade could turn a working machine into one that cannot open a session, wit
 Chosen option: keep what the record says, unless the policy file has a `sandbox` key under `[gate]`
 (`ws.userconfig.keeps_sandbox_off`). The record is the install manifest's `WS_SANDBOXED` entry, or the settings file's
 own value when the file holds ws's hooks and the record is lost. The policy file is read as written, because the loaded
-policy cannot tell a default from a choice. This applies to `ws install` and `ws upgrade` alike, so nothing a person
+policy can't tell a default from a choice. This applies to `ws install` and `ws upgrade` alike, so nothing a person
 does after an upgrade switches the block on behind them.
 
 ### Consequences
 
-- Good, because an upgrade never changes what the sandbox does on a machine that did not have it.
+- Good, because an upgrade never changes what the sandbox does on a machine that didn't have it.
 - Good, because the way to turn it on is one line in the policy, and `ws doctor` WS012 says so.
 - Bad, because a person who recorded `sandbox = false`, then deleted the line expecting the default, stays unsandboxed
   until they write `sandbox = true`. WS012 names that line.

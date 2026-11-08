@@ -11,7 +11,7 @@ Move to a newer release, or remove ws and what it installed.
    ```
 
    It runs the installer (the latest stable release, checked as `install.sh` checks it), then rewrites ws's hooks in
-   your runner's config with the new ws. It is one step because the hooks run whichever ws is installed, and a new ws
+   your runner's config with the new ws. It's one step because the hooks run whichever ws is installed, and a new ws
    under old hooks is the state this avoids. `ws upgrade` can't run inside a session, gated or not: the gate refuses
    the command, and it refuses itself when it sees a session or no terminal.
 
@@ -29,16 +29,16 @@ Move to a newer release, or remove ws and what it installed.
    - **Both worked.** The new ws and the new hooks.
 
    The hook rewrite refreshes the entries of every runner whose config already holds them. If one of those configs
-   can't be merged into now (it is a link, it has comments, or a value of yours is in the way), `ws upgrade --hooks-only`
+   can't be merged into now (it's a link, it has comments, or a value of yours is in the way), `ws upgrade --hooks-only`
    leaves it as it was, says which runner and why, rewrites the others, and exits 1; `ws doctor` names the same runner
-   in `WS013`. Fix what it says and run it again. A runner ws never put entries in is not mentioned. It also takes out an
+   in `WS013`. Fix what it says and run it again. A runner ws never put entries in isn't mentioned. It also takes out an
    older OpenCode plugin that ws put there and has since withdrawn from (the file is still loaded, and ws's record of
    it says so), and says it removed it; a plugin file of your own is never touched.
 
    A release before 0.1.9 has no `ws upgrade`. Run the installer yourself (`curl -fsSL
    https://raw.githubusercontent.com/Michael-A-Fry/ws/main/install.sh | bash`), then run `ws upgrade --hooks-only`.
    Sessions work in between, each call with the note, when ws's folders are the default ones (`~/.ws`, or the XDG
-   folders under your account's home) and the environment does not point them anywhere else. A hook with no pin works
+   folders under your account's home) and the environment doesn't point them anywhere else. A hook with no pin works
    out its folders from your account's home and the policy file it names, never from `HOME` or a ws or XDG variable. A
    custom layout, or any such variable that disagrees, is refused with `ws upgrade --hooks-only` as the fix. `ws doctor`
    shows the same state as `WS013`.

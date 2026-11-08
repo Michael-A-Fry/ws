@@ -571,7 +571,7 @@ gate only: each runner whose config already holds ws's entries gets them refresh
 nothing out, and a config written without the sandbox block stays without it. If the rewrite fails, the runner's config,
 the install record and the OpenCode plugin are put back as they were. Run it in a terminal of your own: a session, gated
 or not, is refused (exit 3), and so is a run with no terminal. Exit 0 when done, 1 when the installer or the rewrite
-failed, 3 when refused, 4 when files could not be put back after a failed rewrite (they are named). See
+failed, 3 when refused, 4 when files couldn't be put back after a failed rewrite (they're named). See
 [Upgrade and uninstall](../how-to/upgrade-and-uninstall.md#upgrade).
 
 ## `ws migrate`

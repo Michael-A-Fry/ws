@@ -1043,6 +1043,11 @@ def pins() -> str:
     return shlex.join(paths.pin_of().args())
 
 
+def through_client(kind: str, command: str) -> str:
+    """`command` (a `ws gate KIND ...` line) as a generated hook runs it: through the thin client."""
+    return shlex.join(adapters.client_argv(kind, shlex.split(command), paths.pin_of()))
+
+
 def commands(group: list[dict]) -> list[str]:
     return [h["command"] for g in group for h in g["hooks"]]
 
@@ -1064,7 +1069,7 @@ def test_with_no_guards_the_hooks_are_the_old_ones():
 def test_the_default_policy_adds_post_tool_use_and_session_start_events():
     hooks = generate(policy.default_policy())["hooks"]
     assert hooks["PostToolUse"][0]["matcher"] == "Edit|Write|MultiEdit|NotebookEdit"
-    event = f"ws gate event --runner claude-code --policy /x/wshome/policy.toml {pins()}"
+    event = through_client("event", f"ws gate event --runner claude-code --policy /x/wshome/policy.toml {pins()}")
     assert commands(hooks["PostToolUse"]) == [event]  # no `|| exit`: exit 2 here is a message to the model
     assert commands(hooks["SessionStart"]) == [
         f"ws session start --runner claude-code {pins()} || true",

@@ -7,6 +7,12 @@
     ws gate replay FILE... --runner R              run recorded payloads against the policy; print allow, deny or ask
     ws gate replay CORPUS... --runner R --metrics  a labelled corpus: confusion matrix, error rates, latency, a decision diff
     ws gate launch --runner R -- ARGV              start a runner inside the sandbox wall (ws.sandbox)
+    ws gate serve                                  the resident gate that answers the hooks (ws.gateserve)
+
+Every generated hook runs the thin client (ws.gateclient), which asks the resident gate and, when that can't answer,
+runs `check` or `event` itself: `run_hook` is the one decision path they share. The order is fixed: the preflight, the
+policy's rules, the guards that are on (lowest PRIORITY first, see ws.guards), then `ask_commands`; the first refusal
+ends it. A hook run that asked a guard or refused a call leaves one line in `logs/gate.jsonl`.
 
 `check` fails closed: a payload it cannot read, a policy that does not load, or any crash is a deny. Exit 4 is not a
 deny: inside the OpenCode wall a granted approval cannot be consumed by the hook, so it prints {"claim": ID} and the shim
@@ -34,7 +40,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from ws import adapters, approvals, guards, output, paths, policy, sandbox, selfcmd, shellwords
+from ws import adapters, approvals, guards, jsonl, output, paths, policy, sandbox, selfcmd, shellwords
 
 if TYPE_CHECKING:
     from ws import gatecorpus
@@ -44,6 +50,12 @@ from ws.output import WsError
 DENY = 2
 CLAIM = 4
 RESULTS = ("allow", "deny", "ask")
+
+CASELESS_ENV = "WS_FORCE_CASELESS_PATHS"
+if os.environ.get(CASELESS_ENV) == "1":
+    # A test knob: run the gate as it runs on a case-insensitive file system (macOS) on any machine, in every process that
+    # imports it, the resident gate included. It can only turn caseless matching on, never off.
+    policy.CASELESS_PATHS = True
 
 
 class Ask(str):
@@ -96,6 +108,7 @@ def check(
     layer: list[str] | None = None,
     clock=None,
     home: Path | None = None,
+    verdicts: list[dict] | None = None,
 ) -> str | approvals.Claim | None:
     """None to allow, else the reason. Raises on anything it cannot judge; cmd_check turns that into a deny.
     A shell command that matches `ask_commands` (and nothing denies) runs only on a granted approval bound to this
@@ -105,9 +118,12 @@ def check(
     asks for approval the same way, and warnings and notes are added to `notes`. `layer`, when given, gets the kind of
     the layer that made a refusal (preflight, rule:KIND, guard:NAME, ask_commands). `home` and `clock` are for the
     guards (the ws home their state lives in, and the time). The rules, the guards and the approval check read the
-    command under one clock (see shellwords.time_limit), so a command cannot take them one after another."""
+    command under one clock (see shellwords.time_limit), so a command cannot take them one after another. The order is
+    fixed: the preflight, then the policy's rules, then the guards that are on (lowest PRIORITY first, see ws.guards),
+    then `ask_commands`; the first refusal ends it and nothing after it is asked. `verdicts`, when given, gets one
+    {guard, result, ms} for each guard that was asked."""
     with shellwords.time_limit():
-        return _check(runner, raw, pol, protect, approval_root, consume, notes, layer, clock, home)
+        return _check(runner, raw, pol, protect, approval_root, consume, notes, layer, clock, home, verdicts)
 
 
 def _check(
@@ -121,6 +137,7 @@ def _check(
     layer: list[str] | None,
     clock,
     home: Path | None,
+    verdicts: list[dict] | None,
 ) -> str | approvals.Claim | None:
     payload = json.loads(raw)
     if not isinstance(payload, dict):
@@ -139,23 +156,29 @@ def _check(
             _mark(layer, f"rule:{call.kind}")
             return reason
     session, cwd = _text(payload, "session_id"), _text(payload, "cwd")
-    for name, call, found in guards.run(pol, "pre", calls, _context(runner, "pre", payload, clock, home)):
-        reason = f"{name}: {found.reason}"
-        if found.action != "deny":
-            if notes is not None:
-                notes.append(reason)
-        elif not found.approvable:
-            _mark(layer, f"guard:{name}")
-            return reason
-        elif approval_root is None:
-            _mark(layer, f"guard:{name}")
-            return Ask(f"{reason}; a person approves it from a gated session, where the approvals folder is reachable")
-        else:
-            bound = approvals.Bound(runner, f"guard:{name}", call.value if call else "", cwd, session)
-            asked = approvals.require(approval_root, bound, consume=consume, why_asked=reason)
-            if asked is not None:
+    stream = guards.stream(pol, "pre", calls, _context(runner, "pre", payload, clock, home), verdicts)
+    try:
+        for name, call, found in stream:
+            reason = f"{name}: {found.reason}"
+            if found.action != "deny":
+                if notes is not None:
+                    notes.append(reason)
+            elif not found.approvable:
                 _mark(layer, f"guard:{name}")
-                return asked
+                return reason
+            elif approval_root is None:
+                _mark(layer, f"guard:{name}")
+                return Ask(
+                    f"{reason}; a person approves it from a gated session, where the approvals folder is reachable"
+                )
+            else:
+                bound = approvals.Bound(runner, f"guard:{name}", call.value if call else "", cwd, session)
+                asked = approvals.require(approval_root, bound, consume=consume, why_asked=reason)
+                if asked is not None:
+                    _mark(layer, f"guard:{name}")
+                    return asked
+    finally:
+        stream.close()  # the guards after a refusal are not asked, and the one that refused is timed
     for call in calls:
         if call.kind == "command" and policy.needs_approval(pol, call.value):
             if approval_root is None:
@@ -169,14 +192,24 @@ def _check(
     return None
 
 
-def event(runner: str, raw: str, pol: policy.Policy, *, clock=None, home: Path | None = None) -> tuple[int, str, str]:
+def event(
+    runner: str,
+    raw: str,
+    pol: policy.Policy,
+    *,
+    clock=None,
+    home: Path | None = None,
+    verdicts: list[dict] | None = None,
+) -> tuple[int, str, str]:
     """(exit code, stdout, stderr) for a hook payload of an event that is not a call's check. Raises on a payload it
-    cannot read; cmd_event turns that into exit 0 and one line."""
+    cannot read; cmd_event turns that into exit 0 and one line. `verdicts` is as for `check`."""
     with shellwords.time_limit():
-        return _event(runner, raw, pol, clock, home)
+        return _event(runner, raw, pol, clock, home, verdicts)
 
 
-def _event(runner: str, raw: str, pol: policy.Policy, clock, home: Path | None) -> tuple[int, str, str]:
+def _event(
+    runner: str, raw: str, pol: policy.Policy, clock, home: Path | None, verdicts: list[dict] | None
+) -> tuple[int, str, str]:
     payload = json.loads(raw)
     if not isinstance(payload, dict):
         raise TypeError("payload is not a JSON object")
@@ -190,7 +223,7 @@ def _event(runner: str, raw: str, pol: policy.Policy, clock, home: Path | None) 
             f"ws gate event: {str(name)[:40]!r} is answered by `ws gate check` or is not a hook event ws reads\n",
         )
     calls = _calls(adapter, payload) if ev == "post" else []
-    found = guards.run(pol, ev, calls, _context(runner, ev, payload, clock, home))
+    found = guards.run(pol, ev, calls, _context(runner, ev, payload, clock, home), verdicts)
     lines = [f"ws gate: {n}: {f.reason}" for n, _, f in found]
     if not lines:
         return 0, "", ""
@@ -253,47 +286,173 @@ def _protect(policy_file: Path, extra: list[str] | None = None) -> tuple[str, ..
     )
 
 
-def cmd_check(args: argparse.Namespace) -> int:
+VERDICT_LOG = "gate.jsonl"
+VERDICT_SCHEMA = 1
+
+
+def _log_verdicts(rec: dict) -> None:
+    """One line in `<state>/logs/gate.jsonl` for a hook run that asked a guard or refused something: what was decided,
+    by which layer, and each guard's verdict. It holds no command, path or message text. A log that can't be written
+    never changes the decision."""
+    try:
+        jsonl.append(paths.state_dir() / "logs" / VERDICT_LOG, jsonl.stamped(rec, VERDICT_SCHEMA))
+    except (OSError, ValueError):
+        pass
+
+
+def _session_of(raw: str) -> tuple[str, str]:
+    """(session id, hook event name) from a payload, "" for either that is missing or not text. Never raises."""
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        return "", ""
+    if not isinstance(payload, dict):
+        return "", ""
+    return _text(payload, "session_id")[:80], _text(payload, "hook_event_name")[:40]
+
+
+def _decision(reason: str | approvals.Claim | None) -> str:
+    if reason is None:
+        return "allow"
+    if isinstance(reason, approvals.Claim):
+        return "claim"
+    return "ask" if isinstance(reason, Ask) else "deny"
+
+
+def run_check(args: argparse.Namespace, raw: str, via: str = "direct") -> tuple[int, str, str]:
+    """What `ws gate check` does for one payload, as (exit code, stdout, stderr): 0 allow, 2 deny (the reason on
+    stderr), 4 a claim for the launcher. Fails closed: any error is a deny. The command and the daemon both call this,
+    so they cannot answer differently. `via` is "direct" or "daemon" in the verdict log."""
     notes: list[str] = []
+    layer: list[str] = []
+    verdicts: list[dict] = []
+    began = time.perf_counter()
     try:
         with _pinned(args):
             policy_file, pol = _load_policy(args)
-            reason = check(
-                args.runner,
-                sys.stdin.read(),
-                pol,
-                _protect(policy_file, args.protect),
-                approvals.approvals_dir(),  # ws's state folder, whatever --policy says: ws approve and ws gate launch use it too
-                consume=approvals.FD_ENV not in os.environ,
-                notes=notes,
-            )
+            try:
+                reason = check(
+                    args.runner,
+                    raw,
+                    pol,
+                    _protect(policy_file, args.protect),
+                    approvals.approvals_dir(),  # ws's state folder, whatever --policy says: ws approve and ws gate launch use it too
+                    consume=approvals.FD_ENV not in os.environ,
+                    notes=notes,
+                    layer=layer,
+                    verdicts=verdicts,
+                )
+            except BaseException as e:  # noqa: BLE001 - fail closed on anything
+                reason, layer = _reason_of(e), ["error"]
+            if verdicts or reason is not None:
+                session, name = _session_of(raw)
+                _log_verdicts(
+                    {
+                        "runner": args.runner,
+                        "session": session,
+                        "event": name or "PreToolUse",
+                        "decision": _decision(reason),
+                        "layer": layer[0] if layer else None,
+                        "guards": verdicts,
+                        "ms": round((time.perf_counter() - began) * 1000, 2),
+                        "via": via,
+                    }
+                )
     except BaseException as e:  # noqa: BLE001 - fail closed on anything, including a broken policy file
         reason = _reason_of(e)
-    for note in notes:
-        print(f"ws gate: {note}", file=sys.stderr)
+    err = "".join(f"ws gate: {note}\n" for note in notes)
     if reason is None:
-        return 0
+        return 0, "", err
     if isinstance(reason, approvals.Claim):
-        print(json.dumps({"claim": reason.ident}))
-        return CLAIM
-    print(f"ws gate: blocked: {reason}", file=sys.stderr)
-    return DENY
+        return CLAIM, json.dumps({"claim": reason.ident}) + "\n", err
+    return DENY, "", err + f"ws gate: blocked: {reason}\n"
 
 
-def cmd_event(args: argparse.Namespace) -> int:
+def run_event(args: argparse.Namespace, raw: str, via: str = "direct") -> tuple[int, str, str]:
+    """What `ws gate event` does for one payload, as (exit code, stdout, stderr). Advice only: any failure is exit 0
+    and one line on stderr."""
+    verdicts: list[dict] = []
+    began = time.perf_counter()
     try:
         with _pinned(args):
             _, pol = _load_policy(args)
-            code, out, err = event(args.runner, sys.stdin.read(), pol)
+            code, out, err = event(args.runner, raw, pol, verdicts=verdicts)
+            if verdicts:
+                session, name = _session_of(raw)
+                _log_verdicts(
+                    {
+                        "runner": args.runner,
+                        "session": session,
+                        "event": name,
+                        "decision": "deny" if code == DENY else "allow",
+                        "layer": None,
+                        "guards": verdicts,
+                        "ms": round((time.perf_counter() - began) * 1000, 2),
+                        "via": via,
+                    }
+                )
     except WsError as e:  # advice only: ws's folders or its policy are not as installed, so the guards do not run
         code, out, err = 0, "", f"ws gate event: skipped ({_reason_of(e)})\n"
     except Exception as e:  # noqa: BLE001 - advice only: a crash here never blocks the session
         code, out, err = 0, "", f"ws gate event: skipped ({type(e).__name__}: {e})\n"
+    return code, out, err
+
+
+def _hook_options(p: argparse.ArgumentParser, names: list[str], protect: bool) -> None:
+    """The options `ws gate check` and `ws gate event` take: one definition for the command and for the daemon."""
+    p.add_argument("--policy", metavar="FILE", help="policy file (default: policy.toml in the config folder)")
+    p.add_argument("--runner", required=True, choices=names)
+    paths.add_pin_option(p)
+    if protect:
+        p.add_argument(
+            "--protect",
+            action="append",
+            metavar="PATH",
+            help="a file or folder of ws's own that a session may not write",
+        )
+
+
+def hook_args(kind: str, argv: list[str]) -> argparse.Namespace:
+    """The options of `ws gate check` or `ws gate event` read from `argv` (what follows the subcommand), by the same
+    definitions the command uses. A bad option raises SystemExit, as it does on the command line."""
+    parser = argparse.ArgumentParser(prog=f"ws gate {kind}", add_help=False)
+    _hook_options(parser, list(adapters.all_adapters()), protect=kind == "check")
+    return parser.parse_args(argv)
+
+
+def run_hook(kind: str, argv: list[str], raw: str, via: str = "direct") -> tuple[int, str, str]:
+    """`ws gate check` (kind "check") or `ws gate event` (kind "event") with these options on this payload, as (exit
+    code, stdout, stderr): the one decision path the command line and the daemon share (see ws.gateserve)."""
+    if kind not in ("check", "event"):
+        raise ValueError(f"unknown hook kind {kind!r}")
+    args = hook_args(kind, argv)
+    return (run_check if kind == "check" else run_event)(args, raw, via)
+
+
+def _emit(result: tuple[int, str, str]) -> int:
+    code, out, err = result
     if out:
         sys.stdout.write(out)
     if err:
         sys.stderr.write(err)
     return code
+
+
+def _stdin_text() -> str:
+    """The payload on stdin. Bytes that aren't text give a payload no JSON reader takes, so `check` denies it and
+    `event` skips it, as for any payload it can't read."""
+    try:
+        return sys.stdin.read()
+    except UnicodeDecodeError:
+        return "\0 not text"
+
+
+def cmd_check(args: argparse.Namespace) -> int:
+    return _emit(run_check(args, _stdin_text()))
+
+
+def cmd_event(args: argparse.Namespace) -> int:
+    return _emit(run_event(args, _stdin_text()))
 
 
 def _replay_line(n: int, line: str) -> tuple[dict, str | None]:
@@ -600,19 +759,18 @@ def register(sub) -> None:
     gen.set_defaults(func=cmd_generate)
 
     c = gs.add_parser("check", help="hook entry: payload on stdin; exit 0 allow, 2 deny")
-    common(c)
-    paths.add_pin_option(c)
-    c.add_argument(
-        "--protect", action="append", metavar="PATH", help="a file or folder of ws's own that a session may not write"
-    )
+    _hook_options(c, names, protect=True)
     c.set_defaults(func=cmd_check, raw=True)  # a hook: the runner reads this command's own stdout, stderr and exit code
 
     e = gs.add_parser(
         "event", help="hook entry: payload on stdin for the guards' other events (after a call, start, stop)"
     )
-    common(e)
-    paths.add_pin_option(e)
+    _hook_options(e, names, protect=False)
     e.set_defaults(func=cmd_event, raw=True)  # a hook: the runner reads this command's own stdout, stderr and exit code
+
+    from ws import gateserve  # here, not at the top: it imports this module
+
+    gateserve.register(gs)
 
     r = gs.add_parser("replay", help="run recorded hook payloads against the policy and print allow, deny or ask")
     r.add_argument(

@@ -9,7 +9,7 @@ import ast
 import re
 from pathlib import Path
 
-from ws import canary, jsonl, rating, runrecord, sandbox
+from ws import canary, gate, jsonl, rating, runrecord, sandbox
 from ws import eval as ws_eval
 from ws.guards import claims, record_calls
 
@@ -30,6 +30,7 @@ SCHEMAS = {
     "looks.jsonl": ws_eval.SCHEMA_VERSION,
     "gate-calls.jsonl": record_calls.SCHEMA_VERSION,
     "claims.jsonl": claims.SCHEMA_VERSION,
+    "gate.jsonl": gate.VERDICT_SCHEMA,
     "wall-report.jsonl": sandbox.WALL_REPORT_SCHEMA,
 }
 

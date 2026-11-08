@@ -42,6 +42,11 @@ python3 scripts/gen_code_map.py      # regenerate docs/reference/code-map.md aft
 python3 scripts/check_docs_integrity.py  # policy files exist, links and anchors resolve, no banned strings
 ```
 
+The suite runs in a random order, and each test has a time limit by size. The seed is printed at the top of a run:
+`--randomly-seed=N` replays it and `-p no:randomly` switches the shuffle off. A test that fails only in some orders, or
+that needs a rerun, is a bug to fix, not to retry. [Testing](docs/reference/testing.md) has the markers, limits, flake
+and quarantine rules, and the tier time report.
+
 The hooks that `prek` runs are listed in `.pre-commit-config.yaml`. CI also runs Vale (the Microsoft package) over the
 README, the docs and the policy files, for errors only; [`.vale.ini`](.vale.ini) sets it up.
 

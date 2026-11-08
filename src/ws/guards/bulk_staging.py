@@ -23,6 +23,7 @@ from ws.guards import Finding, known_keys
 NAME = "bulk-staging"
 EVENTS = ("pre",)
 KINDS = ("command",)
+PRIORITY = 10
 _NATIVE_SUBS = (
     "add -A*",
     "add --a*",

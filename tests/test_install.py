@@ -634,5 +634,10 @@ def test_the_hooks_of_a_launch_install_start_ws_with_an_absolute_isolated_interp
     ws_commands = [c for c in commands if " gate " in c or " notify " in c or " session " in c]
     assert ws_commands
     prefix = shlex.join(selfcmd.argv())
-    assert all(c.startswith(prefix + " ") for c in ws_commands), ws_commands
+    client = shlex.join([selfcmd.argv()[0], "-I", "-S"])
+    for c in ws_commands:
+        if " gate " in c:  # through the thin client: this Python, isolated, and the command it falls back to
+            assert c.startswith(client + " ") and f" -- {prefix} gate " in c, c
+        else:
+            assert c.startswith(prefix + " "), c
     assert all(shlex.split(c)[0].startswith("/") and shlex.split(c)[1] == "-I" for c in ws_commands)

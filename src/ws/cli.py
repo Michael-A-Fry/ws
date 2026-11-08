@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
+import os
+import re
 import sys
 from pathlib import Path
 
+import ws
 from ws import (
     __version__,
     approvals,
@@ -245,6 +249,84 @@ def cmd_help(args: argparse.Namespace) -> int:
     return 0
 
 
+# A module that adds a command says so on a line of its own at the top level: `COMMAND = "name"`. It is found by reading
+# the source text, so modules that do not match are never imported.
+_COMMAND_LINE = re.compile(rb'COMMAND(?:: str)? = "([a-z][a-z0-9-]{0,40})"[ \t]*(?:#[^\r\n]*)?\r?$', re.MULTILINE)
+
+
+def _command_in(text: bytes) -> str | None:
+    """The name in the first top-level `COMMAND = "name"` line of a module's source, or None. Only lines that start with
+    COMMAND are looked at: a plain find over the bytes costs far less than a regex over a whole large module."""
+    start = 0
+    while True:
+        if text.startswith(b"COMMAND", start) and (m := _COMMAND_LINE.match(text, start)):
+            return m.group(1).decode()
+        hit = text.find(b"\nCOMMAND", start)
+        if hit < 0:
+            return None
+        start = hit + 1
+
+
+def scanned_commands() -> list[tuple[str, str]]:
+    """(command, module) for each top-level module of the installed `ws` package that sets `COMMAND = "name"`, in module
+    name order. Only `ws.__path__` is read (never the working directory), and only as text: nothing is imported here."""
+    found = []
+    for folder in ws.__path__:
+        try:
+            entries = sorted(os.scandir(folder), key=lambda e: e.name)
+        except OSError:
+            continue
+        for entry in entries:
+            if not entry.name.endswith(".py") or entry.name.startswith("_"):
+                continue
+            try:
+                with open(entry.path, "rb") as f:
+                    text = f.read()
+            except OSError:
+                continue
+            if name := _command_in(text):
+                found.append((name, entry.name[:-3]))
+    return found
+
+
+def _register_scanned(sub) -> None:
+    """Add the commands of the modules `scanned_commands` finds. A name that is already a command (a built-in, or an
+    earlier scanned module) is refused with both named, so a scanned command never shadows a built-in."""
+    owners: dict[str, str] = {}
+    for name, module in scanned_commands():
+        if name in sub.choices:
+            other = f"module ws.{owners[name]}" if name in owners else "a built-in command"
+            raise WsError(
+                "command_conflict",
+                f"ws.{module} sets COMMAND = {name!r}, but `{name}` is already {other}",
+                f"rename the COMMAND in ws.{module}",
+            )
+        try:
+            mod = importlib.import_module(f"ws.{module}")
+        except Exception as e:  # one module's fault names the module, not a traceback
+            raise WsError(
+                "command_module", f"ws.{module} sets COMMAND but cannot be loaded: {e}", "fix or remove that module"
+            ) from e
+        register = getattr(mod, "register", None)
+        if not callable(register):
+            raise WsError(
+                "command_module",
+                f"ws.{module} sets COMMAND = {name!r} but has no register(sub)",
+                f"add `def register(sub)` to ws.{module}, or remove its COMMAND",
+            )
+        try:
+            register(sub)
+        except argparse.ArgumentError as e:
+            raise WsError("command_conflict", f"ws.{module} could not add its commands: {e}", "rename them") from e
+        if name not in sub.choices:
+            raise WsError(
+                "command_module",
+                f"ws.{module} sets COMMAND = {name!r} but its register(sub) did not add that command",
+                f"make register add `{name}`, or change COMMAND",
+            )
+        owners[name] = module
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = Parser(prog="ws", description="Your memory, skills and rules, across your AI coding tools.")
     p.add_argument("--version", action="version", version=f"ws {__version__}")
@@ -298,6 +380,7 @@ def build_parser() -> argparse.ArgumentParser:
     home_cli.register(sub)
     term_cli.register(sub)
     version.register(sub)
+    _register_scanned(sub)
     return p
 
 

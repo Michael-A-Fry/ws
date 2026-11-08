@@ -97,9 +97,15 @@ release_dir = "~/releases"                 # optional: release claims are off wi
 release_tags = ["v[0-9]+[.][0-9]+([.][0-9]+)*"]   # optional: the shapes of a release name
 ```
 
-A claim is a phrase from `words` (whole words, any case) in the same sentence as a commit-like token: 7 to 40
-lower-case hex characters with at least one digit and one of `a` to `f`. A commit may sit inside the phrase, as in
-`merged abc1234 into main`. The default phrases are about the repository's default branch only, because the check is
+A claim is a phrase from `words` (whole words, any case) and the commit-like token it's about: 7 to 40 lower-case hex
+characters with at least one digit and one of `a` to `f`. A token belongs to a phrase when it sits inside it (`merged
+abc1234 into main`) or beside it with nothing between but a few plain function words and other commit ids: `abc1234 is
+on main`, `pushed the fix abc1234 to main`, `merged into main: abc1234 and def5678`. Any other word between them means
+the sentence is about something else, so the guard doesn't check it: `the ed25519 key is on main`, `session 9f8e7d6c is
+on main`, `abc1234 is a draft and the fix is on main`, `abc1234 differs from released main`, and `pushed p8-item1a
+abc1234` (a branch name between, so it isn't a claim about the default branch) all go through. Dates, run numbers and
+ids with hyphens (`20261107-151146`) have no hex letter or are cut at the hyphen, so they never count as commits. The
+default phrases are about the repository's default branch only, because the check is
 against one ref. ws reads that branch from `git symbolic-ref refs/remotes/origin/HEAD`. A repository with no
 `origin/HEAD` uses its local default branch: `init.defaultBranch`, else `main`. That branch's `origin/` copy is the ref
 when it exists, and the branch itself when it doesn't. Setting `words` or `ref` replaces that part of the default. The
@@ -124,7 +130,8 @@ name only the release that `current` points at: its target folder's name, with o
 names another release is denied, and the reason names `current`'s target. A live claim is also denied when `current` is
 missing, is a folder or file rather than a link, points at nothing or can't be read. A clause with no release name
 isn't checked. Quotes and backticks, negation (`v0.3 isn't live`) and the future (`goes live after the next promote`,
-`will be live`, `once v0.3 is live`) make a clause not a claim, as they do for commits. The guard reads the link and
+`will be live`, `once v0.3 is live`) make a clause not a claim, as they do for commits, and so does a word joined to
+`live` by a hyphen (`v0.3 is live-tested`). The guard reads the link and
 nothing else: it doesn't fetch, use the network or write a file. Commit claims and release claims in one message are
 judged together and the reason names both.
 
@@ -307,7 +314,34 @@ A `deny` marked approvable can be overridden once by you with `ws approve ID` in
 `ask_commands` works: the approval is bound to the runner, the call, the folder and the session. See
 [Approve a command](../how-to/approve-a-command.md). `skill-gate` and `test-weakening` ship with an approvable deny; the others stop the call outright.
 
-The first `deny` in the order of `on` wins. A reason is shown as `guard-name: reason`.
+The first `deny` in the order below wins, and the guards after it aren't asked. A reason is shown as
+`guard-name: reason`.
+
+## The order guards run in
+
+The order is fixed. It doesn't depend on how `[guards] on` lists the guards, and it's the same for every runner and every
+call:
+
+1. The preflight (Claude Code only: a project whose settings open the sandbox).
+2. The policy's own rules: `deny_commands`, `deny_read`, `deny_tools`, the protected files, then the search and write
+   rules.
+3. The guards that are on, lowest priority first, and by name within a priority.
+4. `ask_commands`.
+
+The first refusal ends it. Each guard declares a `PRIORITY`:
+
+| Priority | For | Guards |
+|---|---|---|
+| 0 | A guard that only records, so a call a later guard refuses is on record too | `record-calls` |
+| 10 | A guard that protects the machine or the repository | `bulk-staging`, `checkout-pin`, `dev-server`, `test-weakening` |
+| 20 | A guard that keeps a session honest about its own work | `skill-gate`, `spawn-cap` |
+| 30 | A guard that checks what a message says | `claims` |
+| 90 | Advice after the fact | `session-context`, `syntax-check` |
+
+A guard that declares none runs at 50. Each hook run that asks a guard, or refuses a call, writes one line to
+`logs/gate.jsonl` in the state folder: the decision, the layer that made it (`rule:command`, `guard:NAME`, ...), each
+guard's verdict (`pass`, `note`, `warn`, `deny` or `error`) and how long it took. The line holds no command, path or
+message text. See [stores](stores.md).
 
 ## Events
 
@@ -333,10 +367,12 @@ The settings carry a hook for an event only when a guard that's on runs there:
 | `PostToolUse` running `ws gate event` | A guard that's on runs after a call. The matcher lists the tools for the kinds those guards read. |
 | `SessionStart`, `UserPromptSubmit`, `Stop`, `SubagentStop` running `ws gate event` | A guard that's on runs at that event. |
 
-The `PreToolUse` hook ends `|| exit 2`, so a missing or crashing ws blocks the call. The `PostToolUse` hook has no
-`|| exit`: `ws gate event` exits 2 on purpose after a tool call, and Claude Code shows that message to the model. Every
-other hook command (`SessionStart`, `UserPromptSubmit`, `Stop`, `SubagentStop`) ends `|| true`, so the session carries
-on whatever it returns.
+Each of these hooks runs the thin gate client, which asks the [resident gate](gate.md#the-resident-gate) and runs the
+`ws gate` command itself when that can't answer. The `PreToolUse` hook ends `|| exit 2`, so a missing or crashing ws
+blocks the call. It and the `PostToolUse` hook set `onFailure: "block"`, so a crash or a time-out blocks too. The
+`PostToolUse` hook has no `|| exit`: `ws gate event` exits 2 on purpose after a tool call, and Claude Code shows that
+message to the model. Every other hook command (`SessionStart`, `UserPromptSubmit`, `Stop`, `SubagentStop`) ends
+`|| true`, so the session carries on whatever it returns.
 
 The settings `env` carries `WS_GATED_SESSION=1` and `WS_SANDBOXED=1`. The hook checks a project's own
 `.claude/settings*.json` for keys that open the sandbox in every session except one whose settings set

@@ -1,7 +1,9 @@
 """Claude Code: a settings file with `permissions.deny` (the runner's own rules, the primary layer) plus a PreToolUse
-hook that asks `ws gate check` (the second layer). `claude --bare` skips hooks, so the deny rules must stand alone;
-the hook command ends `|| exit 2` so a missing or crashing ws blocks the call instead of letting it through (any
-other hook failure is non-blocking in Claude Code).
+hook that asks the gate (the second layer). `claude --bare` skips hooks, so the deny rules must stand alone. The hook
+command is the thin client (ws.gateclient), which asks the resident gate (`ws gate serve`) and, when that can't answer,
+runs `ws gate check` itself. It ends `|| exit 2` so a missing or crashing ws blocks the call instead of letting it
+through, and the hook sets `onFailure: "block"` (Claude Code 2.1.295 and newer; `ws doctor` WS011 checks the version), so
+a crash or a time-out blocks it too: without that field any other hook failure is non-blocking in Claude Code.
 
 Also denied: Edit/Write of the policy file and of the generated folder, so a session cannot loosen its own gate.
 
@@ -47,7 +49,7 @@ Guards (ws.guards) add hooks, only for the events and tools the guards that are 
 
 Which hooks can block: PreToolUse (`ws gate check`) denies a call, and its command ends `|| exit 2` so a missing or
 crashing ws blocks too. PostToolUse (`ws gate event`) exits 2 on purpose when a check finds a problem, and Claude Code
-shows that stderr to the model; it carries no `|| exit`. Every other generated hook command (SessionStart,
+shows that stderr to the model; it carries no `|| exit`, and sets `onFailure: "block"` like PreToolUse. Every other generated hook command (SessionStart,
 UserPromptSubmit, Stop, SubagentStop) ends `|| true`, because an exit 2 there would block the person's prompt or keep the
 session going: those hooks add context and findings, and the session carries on whatever they return.
 
@@ -85,7 +87,7 @@ import shlex
 from pathlib import Path
 
 from ws import guards, jobs, paths
-from ws.adapters import Call, check_argv, event_argv, protected_paths
+from ws.adapters import Call, check_argv, client_argv, event_argv, protected_paths
 from ws.approvals import ENV_MARKER, SANDBOX_MARKER, ApprovalError
 from ws.approvals import _read_regular as read_regular
 from ws.policy import Policy, native_patterns, sandbox_read_paths, sandbox_write_paths
@@ -125,7 +127,9 @@ _KIND_TOOLS = {
     "message": ("SendMessage",),
 }
 _EXTRA_PRE_KINDS = ("agent", "skill", "message")  # the PreToolUse matcher covers the other kinds already
-HOOK_TIMEOUT = 20  # seconds: the syntax checkers get 10
+# seconds a hook may take. More than the thin client's worst case (ws.gateclient.WORST_CASE_S: the wait for the daemon,
+# then the check in its own process), or the runner kills a hook that was about to answer and "block" denies the call.
+HOOK_TIMEOUT = 30
 
 # Where this runner keeps what ws installs globally, and where a repo may shadow it (read by ws.globals).
 # kinds: sub-folder -> how a name is taken: "dir" the folder name, "name" the file name, "stem" the name without extension.
@@ -165,9 +169,11 @@ def _matcher(kinds: set[str], base: tuple[str, ...] = ()) -> str:
 
 
 def _event_hook(ws_cmd: list[str], policy_file: Path, pin: paths.Pin, *, may_block: bool = False) -> dict:
-    """A `ws gate event` hook. It ends `|| true` unless it may block (PostToolUse, whose exit 2 reaches the model)."""
-    cmd = shlex.join(event_argv(ws_cmd, NAME, policy_file, pin)) + ("" if may_block else " || true")
-    return {"type": "command", "command": cmd, "timeout": HOOK_TIMEOUT}
+    """A `ws gate event` hook, run through the thin client. It ends `|| true` unless it may block (PostToolUse, whose
+    exit 2 reaches the model); the one that may block also fails closed (`onFailure`), the rest are advice."""
+    argv = client_argv("event", event_argv(ws_cmd, NAME, policy_file, pin), pin)
+    hook = {"type": "command", "command": shlex.join(argv) + ("" if may_block else " || true"), "timeout": HOOK_TIMEOUT}
+    return {**hook, "onFailure": "block"} if may_block else hook
 
 
 def guard_hooks(policy: Policy, ws_cmd: list[str], policy_file: Path, pin: paths.Pin) -> dict:
@@ -314,14 +320,23 @@ def generate(
     deny += [_TOOLS[t] for t in policy.gate.deny_tools]
     pin = pin or paths.pin_of()
     wall = policy.gate.sandbox
-    hook = shlex.join(check_argv(ws_cmd, NAME, policy_file, out, protect, pin)) + " || exit 2"
+    hook = (
+        shlex.join(client_argv("check", check_argv(ws_cmd, NAME, policy_file, out, protect, pin), pin)) + " || exit 2"
+    )
     matcher = _matcher(guards.kinds_for(policy.guards.on, "pre") & set(_EXTRA_PRE_KINDS), tuple(MATCHER.split("|")))
     settings = {
         "permissions": {"deny": list(dict.fromkeys(deny))},
         # `sandbox = false` in the policy: no block, and the marker says so (the hook then skips the preflight)
         **({"sandbox": sandbox_block(policy, out, policy_file, protect)} if wall else {}),
         "env": {ENV_MARKER: "1", SANDBOX_MARKER: "1" if wall else "0"},
-        "hooks": {"PreToolUse": [{"matcher": matcher, "hooks": [{"type": "command", "command": hook}]}]},
+        "hooks": {
+            "PreToolUse": [
+                {
+                    "matcher": matcher,
+                    "hooks": [{"type": "command", "command": hook, "timeout": HOOK_TIMEOUT, "onFailure": "block"}],
+                }
+            ]
+        },
     }
     settings["hooks"].update(session_hooks(ws_cmd, pin))
     for name, ev in (("SessionStart", "start"), ("UserPromptSubmit", "prompt")):

@@ -146,8 +146,34 @@ def _no_real_managed_settings(tmp_path_factory):
 
 
 @pytest.fixture(autouse=True)
+def _no_resident_gate():
+    """A hook command a test runs decides in its own process: no test starts a resident gate (`ws gate serve`) that would
+    outlive it. The tests of the gate daemon (tests/test_gate_daemon.py) start their own in a folder of their own and stop
+    it, so they take the variable back out."""
+    mp = pytest.MonkeyPatch()
+    mp.setenv("WS_GATE_DAEMON", "0")
+    yield
+    mp.undo()
+
+
+@pytest.fixture(autouse=True)
 def _interpreter_is_stable():
     mp = pytest.MonkeyPatch()
     mp.setattr(userconfig, "require_stable_interpreter", lambda cmd: None)
     yield
     mp.undo()
+
+
+@pytest.fixture(autouse=True)
+def _signal_handlers_come_back():
+    """A test that starts a launcher or a server in this process (they set handlers for Ctrl-C and `kill`) must not leave
+    them behind: the next test that sends itself a real SIGINT would find the launcher's handler, not
+    `KeyboardInterrupt`, and wait out its timeout. Each test's handlers are put back after it, whatever the order."""
+    import signal
+
+    names = ("SIGINT", "SIGTERM", "SIGHUP")
+    before = {n: signal.getsignal(getattr(signal, n)) for n in names if hasattr(signal, n)}
+    yield
+    for name, handler in before.items():
+        if handler is not None and signal.getsignal(getattr(signal, name)) != handler:
+            signal.signal(getattr(signal, name), handler)

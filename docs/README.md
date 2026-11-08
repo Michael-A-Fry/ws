@@ -58,6 +58,7 @@ Measure:
 - [Doctor checks](reference/doctor-checks.md): every `WS` ID with its meaning and fix.
 - [Policy](reference/policy.md): every `policy.toml` key.
 - [Guards](reference/guards.md): the named checks, their events and findings, replay.
+- [Hooks](reference/hooks.md): what a hand-built hook set does, and the ws rule or guard that does the same job.
 - [Code map](reference/code-map.md): what each module in `src/ws/` is for, built from its docstring.
 - [Eval](reference/eval.md): task files, graders and the ten metrics.
 - [Stores](reference/stores.md): every log and record file ws writes, its fields, schema and retention.

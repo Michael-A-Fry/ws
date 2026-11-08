@@ -24,6 +24,7 @@ from ws.policy import PolicyError
 NAME = "syntax-check"
 EVENTS = ("post",)
 KINDS = ("write",)
+PRIORITY = 90
 
 TIMEOUT_S = 10
 JS_CHECKER = ("node", "--check")  # for .js, .mjs and .cjs; the file path is added last

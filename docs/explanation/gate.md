@@ -23,7 +23,10 @@ Three layers, each there because the one before it can miss a case.
    `src/ws/adapters/claude_code.py`, `src/ws/adapters/opencode.py`). The runner blocks the call itself, with no help
    from ws.
 2. **The hook or shim.** Claude Code gets a `PreToolUse` hook and OpenCode gets a plugin shim. Both run
-   `ws gate check` on every governed call. The matcher in `src/ws/policy.py` reads the command text one shell segment at
+   `ws gate check` on every governed call, through a thin client that asks one resident process so a call costs
+   milliseconds, and that runs the check itself if the process can't answer (see
+   [the resident gate](../reference/gate.md#the-resident-gate)). The matcher in `src/ws/policy.py` reads the command
+   text one shell segment at
    a time (`a && b`, pipes, `$(...)`, `bash -c "..."`). It normalises flags first, so one `rm -*` rule also covers
    `rm -fr` and `rm -r -f`. Exit code 0 allows the call, and 2 denies it with a reason on standard error.
 3. **The wall.** An operating-system sandbox acts on what a process does, not on how the command line is spelled. See

@@ -16,7 +16,7 @@ Apache-2.0, signed commits, one author per commit.
 |---|---|
 | What a module is for | [docs/reference/code-map.md](docs/reference/code-map.md), built from the module docstrings |
 | Why a design choice was made | [docs/decisions/](docs/decisions/README.md), one record per decision |
-| A CLI command | `src/ws/cli.py` builds the parser; every other module adds its own with `register(sub)` |
+| A CLI command | a top-level module sets `COMMAND = "name"` and exposes `register(sub)`; `src/ws/cli.py` finds it by scanning (the older built-ins are still called by name there) |
 | A doctor check | `src/ws/doctor.py` (IDs are stable: WS0xx machine, WS1xx roles) |
 | What a session may do | `src/ws/policy.py` (parse and validate), `src/ws/gate.py` (decide, per runner) |
 | A new runner or role adapter | add a module to `src/ws/adapters/` or `src/ws/roles/`; the contract is in the folder's `__init__.py` docstring |
@@ -35,6 +35,10 @@ Apache-2.0, signed commits, one author per commit.
 - One module per concern, and its docstring is its contract: what it does, why, and what it promises. The code map is
   built from the first sentence, so write it for a reader skimming a table.
 - Adapters and roles are found by scanning their folder. The directory is the registry; no list to edit.
+- A command module sets `COMMAND = "name"` on a line of its own at the top level and exposes `register(sub)`. `cli.py`
+  reads the source of the installed package's top-level modules (never the working folder), imports only those that
+  match, and calls `register(sub)` in module-name order after the built-ins. A name that is taken is a typed error, so
+  a scanned command never shadows a built-in. No list to edit.
 - Doctor IDs never change meaning once released. Add a new ID rather than reuse one.
 - The gate fails closed: a payload it cannot read, a policy it cannot load or a rule it cannot parse is a deny.
 - Package data (templates, HTML, skill text, schemas) ships as Python strings, because `ws secret wall` copies only

@@ -35,6 +35,7 @@ from ws.guards._paths import matches, relative
 NAME = "test-weakening"
 EVENTS = ("pre",)
 KINDS = ("write",)
+PRIORITY = 10
 
 DEFAULT_PATHS = (
     "**/tests/**",

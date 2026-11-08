@@ -22,5 +22,6 @@ decisions weren't about the engine.
 | [0016](0016-descriptions-say-what-ws-does-today.md) | Descriptions name the runners ws supports today | accepted | 2026-11-07 |
 | [0017](0017-the-gate-fails-closed.md) | The gate and the policy fail closed | accepted | 2026-11-07 |
 | [0018](0018-core-is-standard-library-only.md) | The core uses the Python standard library only | accepted | 2026-11-07 |
+| [0019](0019-one-resident-gate-answers-the-hooks.md) | One resident gate answers the hooks, over a private Unix socket | accepted | 2026-11-08 |
 
 To add one, copy the newest record, take the next number and add a row here.

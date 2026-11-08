@@ -34,6 +34,7 @@ from ws.policy import PolicyError
 NAME = "spawn-cap"
 EVENTS = ("pre", "post", "subagent-stop")
 KINDS = ("agent",)
+PRIORITY = 20
 
 DEFAULT_STALE_S = 1800
 STATE = "spawn-cap"

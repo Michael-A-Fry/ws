@@ -1,12 +1,13 @@
 """`ws doctor`: one line per check, each with a stable ID. Exit 0 only when nothing is failing or unconfigured.
 
 IDs never change meaning once released: WS0xx are the machine, profile, jobs, gate,
-sandbox, plugins and where ws keeps its files, WS1xx are the roles (one per role).
+sandbox, plugins, where ws keeps its files and what the runner needs of its hooks, WS1xx are the roles (one per role).
 """
 
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import sys
 from collections.abc import Callable
@@ -218,6 +219,39 @@ def _plugins_check(prof: dict, env) -> list[Check]:
     return [Check("WS009", "plugins", WARN, detail, f"to hide it, run `ws plugin remove {names[0]}`")]
 
 
+MIN_CLAUDE_HOOKS = (2, 1, 295)  # the first Claude Code that lets a hook say a failure blocks (`onFailure`)
+
+
+def _version_tuple(text: str) -> tuple[int, ...] | None:
+    m = re.match(r"(\d+)\.(\d+)\.(\d+)", text)
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def _hooks_check(prof: dict, env) -> list[Check]:
+    """WS011: Claude Code is new enough for the gate's hooks to block when they fail (`onFailure`, from 2.1.295). Before
+    that a hook that crashes or times out lets the call through. No line unless the profile's runner is Claude Code and
+    `claude` is on PATH (WS101 reports a missing runner)."""
+    from ws import run  # late, like WS101: it reports the version only
+
+    roles = prof.get("roles") if isinstance(prof.get("roles"), dict) else {}
+    runner = roles.get("runner")
+    if not isinstance(runner, dict) or runner.get("adapter") != "claude-code":
+        return []
+    exe = shutil.which(RUNNERS["claude-code"], path=env.get("PATH"))
+    if not exe:
+        return []
+    need = ".".join(map(str, MIN_CLAUDE_HOOKS))
+    version = run.exe_version(exe, dict(env))
+    found = _version_tuple(version) if version else None
+    if found is None:
+        detail = f"can't tell the Claude Code version, and the gate's hooks need {need} or newer to block on a failure"
+        return [Check("WS011", "hooks", WARN, detail, "update Claude Code, then run `ws doctor` again")]
+    if found < MIN_CLAUDE_HOOKS:
+        detail = f"Claude Code {version} lets a hook that fails or times out through; the gate needs {need} or newer"
+        return [Check("WS011", "hooks", FAIL, detail, "update Claude Code")]
+    return [Check("WS011", "hooks", OK, f"Claude Code {version}: a hook that fails blocks the call")]
+
+
 def _layout_check(env) -> Check:
     """WS010: where ws keeps its files. `ok` for the XDG folders or a folder you named; `warn` while they are still in
     `~/.ws` from an earlier ws (nothing moves by itself: `ws migrate` does it); `fail` when both exist, because ws can't
@@ -307,6 +341,10 @@ def run_checks(osi: OSInfo, profile_file: Path, env: dict | None = None, network
         checks.append(_layout_check(env))
     except Exception as e:  # noqa: BLE001 (a broken check must report, not crash the whole doctor)
         checks.append(Check("WS010", "layout", FAIL, f"check crashed ({type(e).__name__})"))
+    try:
+        checks += _hooks_check(prof, env)
+    except Exception as e:  # noqa: BLE001 (a broken check must report, not crash the whole doctor)
+        checks.append(Check("WS011", "hooks", FAIL, f"check crashed ({type(e).__name__})"))
     try:
         checks += _plugins_check(prof, env)
     except Exception as e:  # noqa: BLE001 (a broken check must report, not crash the whole doctor)

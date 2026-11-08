@@ -29,6 +29,7 @@ from ws.policy import PolicyError
 NAME = "session-context"
 EVENTS = ("start",)
 KINDS = ()
+PRIORITY = 90
 
 DEFAULT_FILES = ("STATE.md", ".state/STATE.md", "HANDOFF.md", "TODO.md")
 STATE = "session-context"

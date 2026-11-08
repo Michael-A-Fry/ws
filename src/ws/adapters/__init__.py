@@ -32,12 +32,13 @@ from __future__ import annotations
 
 import importlib
 import pkgutil
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType, ModuleType
 
-from ws import paths
+from ws import gateclient, paths
 
 
 @dataclass(frozen=True)
@@ -116,3 +117,16 @@ def check_argv(
 def event_argv(ws_cmd: list[str], runner: str, policy_file: Path, pin: paths.Pin | None = None) -> list[str]:
     """The command a generated hook runs for the events that are not a tool call's check: `ws gate event`."""
     return [*ws_cmd, "gate", "event", "--runner", runner, "--policy", str(policy_file), *(pin or paths.pin_of()).args()]
+
+
+def client_argv(kind: str, command: list[str], pin: paths.Pin | None = None) -> list[str]:
+    """The command a generated hook or shim runs: the thin client (ws.gateclient) that asks the resident gate and, when
+    it can't answer, runs `command` (what `check_argv` or `event_argv` made, for `kind` "check" or "event") itself. It
+    starts this Python with `-I -S`, so it imports the standard library and not ws."""
+    pin = pin or paths.pin_of()
+    return [sys.executable, "-I", "-S", gateclient_path(), kind, str(pin.state), "--", *command]
+
+
+def gateclient_path() -> str:
+    """Where the thin client file is, as an absolute path."""
+    return str(Path(gateclient.__file__).resolve())

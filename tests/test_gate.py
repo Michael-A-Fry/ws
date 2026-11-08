@@ -108,10 +108,14 @@ def test_claude_code_settings(home, tmp_path, capsys):
     ]
     policy_file = (home / "wshome" / "policy.toml").resolve()
     # absolute paths: the hook reads this policy wherever the runner starts, and protects this folder
-    assert hook["hooks"][0]["command"] == (
-        f"uv run ws gate check --runner claude-code --policy {policy_file} --protect {out.resolve()} {pins(home)} "
-        "|| exit 2"
+    fallback = (
+        f"uv run ws gate check --runner claude-code --policy {policy_file} --protect {out.resolve()} {pins(home)}"
     )
+    # the thin client first (it asks the resident gate), then the command it runs itself when that can't answer
+    assert (
+        hook["hooks"][0]["command"] == shlex.join(adapters.client_argv("check", shlex.split(fallback))) + " || exit 2"
+    )
+    assert hook["hooks"][0]["onFailure"] == "block"  # a crash or a time-out in the hook blocks the call
     assert f"Edit(/{policy_file})" in deny and f"Edit(/{out.resolve()}/**)" in deny  # a session cannot edit its gate
     wshome = (home / "wshome").resolve()
     for name in policy.CONTROL_NAMES:  # nor the rest of ws's control files, nor its run records
@@ -159,7 +163,10 @@ def test_opencode_config_and_shim(home, tmp_path):
     assert perm["webfetch"] == "deny" and "websearch" not in perm
     shim = (out / "plugins" / "ws-gate.js").read_text()
     assert "__CHECK__" not in shim
-    argv = json.loads(shim.split("const CHECK = ")[1].split("\n")[0])
+    client = json.loads(shim.split("const CHECK = ")[1].split("\n")[0])
+    assert client[:3] == [sys.executable, "-I", "-S"] and client[3].endswith("gateclient.py")  # the same thin client
+    assert client[4] == "check" and client[5] == str(paths.pin_of().state) and client[6] == "--"
+    argv = client[7:]
     assert argv[:4] == ["/opt/my ws/bin/ws", "gate", "check", "--runner"] and argv[4] == "opencode"
     assert argv[5:] == [
         "--policy",
@@ -396,7 +403,7 @@ def test_the_generated_hook_command_allows_denies_and_fails_closed(home, tmp_pat
     out = tmp_path / "out"
     write_policy(home, policy.default_toml())
     assert generate("claude-code", out, "--ws-cmd", shlex.join([sys.executable, "-m", "ws"])) == 0
-    env = {"PATH": "/usr/bin:/bin", "WS_HOME": str(home / "wshome"), "HOME": str(home / "home")}
+    env = {"PATH": "/usr/bin:/bin", "WS_HOME": str(home / "wshome"), "HOME": str(home / "home"), "WS_GATE_DAEMON": "0"}
     cmd = hook_command(out)
     assert run_hook(cmd, bash("ls"), env).returncode == 0
     denied = run_hook(cmd, bash(PUSH), env)

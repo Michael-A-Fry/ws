@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import inspect
 import io
 import json
 import os
 import stat
+import subprocess
 import sys
+import textwrap
 import threading
+import time
 
 import pytest
 
@@ -25,6 +29,7 @@ def home(tmp_path, monkeypatch):
     monkeypatch.setenv("WS_HOME", str(tmp_path / "wshome"))
     for var in ("WS_RELEASE", "WS_RELEASE_FILE", "TMUX_PANE", session.LAUNCH_ENV):
         monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(session, "_ancestors", list)  # no runner process unless a test names one
     return tmp_path
 
 
@@ -448,3 +453,144 @@ def test_prepare_and_start_are_refused_from_a_gated_shell():
     pol = policy.default_policy()
     for cmd in ("ws session prepare --role lead", "ws session start --session-id x"):
         assert policy.is_denied_command(pol, cmd), cmd
+
+
+# --- who is calling: the runner stamp and resolve_caller -------------------------------------------------------
+
+
+def proc(pid, name="claude", start=None, ppid=1) -> session.Proc:
+    return session.Proc(pid, start or f"s{pid}", ppid, name)
+
+
+def chain(monkeypatch, *procs):
+    monkeypatch.setattr(session, "_ancestors", lambda: list(procs))
+
+
+def test_start_stamps_the_runner_process(home, monkeypatch, capsys):
+    # hook -> sh -c -> uv -> the runner: the shell and the launcher are passed over
+    chain(monkeypatch, proc(50, "sh"), proc(40, "uv"), proc(30, "claude"), proc(20, "-bash"), proc(10, "tmux"))
+    start(monkeypatch, capsys, "a")
+    raw = on_disk(home, "a")
+    assert (raw["runner_pid"], raw["runner_start"]) == (30, "s30")
+    rec = session.read("a")
+    assert (rec.runner_pid, rec.runner_start) == (30, "s30") and rec.schema == session.SCHEMA_VERSION == 2
+    assert rec.to_dict()["runner_pid"] == 30
+    chain(monkeypatch, proc(31, "claude"))  # a resumed start is a new runner process: it is stamped again
+    start(monkeypatch, capsys, "a")
+    assert session.read("a").runner_pid == 31 and session.read("a").rev == 2
+    chain(monkeypatch, proc(50, "bash"), proc(20, "zsh"))  # nothing that is not a shell: no stamp, and none kept
+    start(monkeypatch, capsys, "a")
+    assert "runner_pid" not in on_disk(home, "a") and session.read("a").runner_pid is None
+
+
+def test_the_real_ancestors_are_this_process_s_parents(home):
+    mine = session.proc_info(os.getpid())
+    assert mine and mine.pid == os.getpid() and mine.ppid == os.getppid() and mine.start
+    assert session.proc_info(os.getpid()) == mine  # the same process reads the same, each time
+    assert session.proc_info(2**22 + 12345) is None
+
+
+def test_resolve_caller_finds_the_nearest_ancestor(home, monkeypatch, capsys):
+    chain(monkeypatch, proc(300, "claude"))
+    start(monkeypatch, capsys, "outer")
+    chain(monkeypatch, proc(200, "claude"))
+    start(monkeypatch, capsys, "inner")
+    chain(monkeypatch, proc(5, "bash"), proc(200, "claude"), proc(6, "bash"), proc(300, "claude"), proc(1, "init"))
+    assert session.resolve_caller().session_id == "inner"  # nearest first
+    chain(monkeypatch, proc(5, "bash"), proc(300, "claude"))
+    assert session.resolve_caller().session_id == "outer"
+    # a cleared session leaves two records for one runner: the newest wins
+    chain(monkeypatch, proc(300, "claude"))
+    start(monkeypatch, capsys, "outer-2")
+    raw = on_disk(home, "outer")
+    raw["started_at"] = "2020-01-01T00:00:00+00:00"
+    (folder(home) / "outer.json").write_text(json.dumps(raw))
+    assert session.resolve_caller().session_id == "outer-2"
+    # the env argument picks the registry, as elsewhere
+    assert session.resolve_caller({"WS_HOME": str(home / "elsewhere")}) is None
+
+
+def test_resolve_caller_none_without_a_match(home, monkeypatch, capsys):
+    chain(monkeypatch, proc(300, "claude", start="1111"))
+    start(monkeypatch, capsys, "a")
+    env = {"WS_HOME": str(home / "wshome")}
+    chain(monkeypatch, proc(5, "bash"), proc(300, "claude", start="2222"))  # the pid was reused: another start time
+    assert session.resolve_caller(env) is None
+    chain(monkeypatch, proc(5, "bash"), proc(301, "claude", start="1111"))
+    assert session.resolve_caller(env) is None
+    chain(monkeypatch)  # no ancestors at all
+    assert session.resolve_caller(env) is None
+    # a record with no stamp, or a damaged one, is never a match
+    (folder(home) / "bare.json").write_text(json.dumps({"release": "1", "session_id": "bare"}))
+    junk = {"release": "1", "session_id": "j", "runner_pid": "9", "runner_start": 3}
+    (folder(home) / "junk.json").write_text(json.dumps(junk))
+    (folder(home) / "broken.json").write_text("{nope")
+    chain(monkeypatch, proc(9, "claude", start="3"))
+    assert session.resolve_caller(env) is None
+
+
+def test_resolve_caller_works_for_a_real_child_and_not_a_real_orphan(home, monkeypatch, capsys):
+    me = session.proc_info(os.getpid())
+    chain(monkeypatch, me)
+    start(monkeypatch, capsys, "me")
+    out = home / "out.txt"
+    code = textwrap.dedent(
+        """
+        import os, sys, time
+        out, orphan = sys.argv[1], sys.argv[2] == "orphan"
+        if orphan:
+            if os.fork():
+                os._exit(0)
+            os.setsid()
+            if os.fork():
+                os._exit(0)
+            time.sleep(0.3)
+        from ws import session
+        rec = session.resolve_caller()
+        open(out, "w").write(rec.session_id if rec else "none")
+        """
+    )
+    subprocess.run([sys.executable, "-c", code, str(out), "child"], check=True, timeout=60)
+    assert out.read_text() == "me"  # a child of the stamped runner
+    out.unlink()
+    subprocess.run([sys.executable, "-c", code, str(out), "orphan"], check=True, timeout=60)
+    deadline = time.monotonic() + 15
+    while not out.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert out.read_text() == "none"  # owned by init: not a person and not a session
+
+
+def test_setters_cannot_set_the_stamp(home, monkeypatch, capsys):
+    chain(monkeypatch, proc(30, "claude"))
+    start(monkeypatch, capsys, "a")
+    params = set(inspect.signature(session.update).parameters)
+    assert params == {"session_id", "state", "last_delivered_outbound", "expect_rev", "env"}
+    with pytest.raises(TypeError):
+        session.update("a", runner_pid=99)  # type: ignore[call-arg]
+    assert session.update("a", state="busy").runner_pid == 30  # an update keeps the stamp it found
+    assert on_disk(home, "a")["runner_start"] == "s30"
+    # a stamp in the hook's own payload is not read: it is the process tree that stamps
+    chain(monkeypatch, proc(31, "claude"))
+    start(monkeypatch, capsys, "b", payload={"runner_pid": 1, "runner_start": "x", "role": "lead"})
+    assert (session.read("b").runner_pid, session.read("b").role) == (31, "worker")
+    # nudge rewrites the record and carries the stamp over; it does not make one
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"session_id": "a"})))
+    assert cli.main(["session", "nudge", *paths.pin_of().args()]) == 0
+    capsys.readouterr()
+    assert session.read("a").runner_pid == 30
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"session_id": "fresh"})))
+    assert cli.main(["session", "nudge", *paths.pin_of().args()]) == 0
+    assert session.read("fresh").runner_pid is None
+
+
+def test_old_records_still_read(home):
+    folder(home).mkdir(parents=True)
+    for name, extra in (("v1", {"schema": 1}), ("v2", {"schema": 2, "role": "lead", "class": "x", "rev": 3})):
+        base = {"ts": "2026-11-01T00:00:00.000Z", "session_id": name, "release": "0.1.8", "cwd": "/w"}
+        (folder(home) / f"{name}.json").write_text(json.dumps({**base, **extra}))
+    old, new = session.read("v1"), session.read("v2")
+    assert (old.runner_pid, old.runner_start, old.role) == (None, None, "worker")
+    assert (new.runner_pid, new.role, new.class_, new.rev) == (None, "lead", "x", 3)
+    assert "runner_pid" not in old.to_dict() and session.SCHEMA_VERSION == 2
+    assert session.update("v2", state="idle").rev == 4 and session.read("v2").runner_pid is None
+    assert session.resolve_caller() is None  # neither is stamped, so neither can be a caller

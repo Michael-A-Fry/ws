@@ -26,6 +26,16 @@ setters, not the file:
     `ws session prepare` and `start` are refused from a gated session's shell (ws.policy), so a worker cannot mint a
     lead or overwrite another record; the hooks that run `start` are not tool calls.
 
+Who is calling. A shell command has no way to say which session it belongs to, and an environment variable is the
+command's own to set, so identity comes from the process tree. `ws session start` is a hook: it stamps the record with
+`runner_pid` and `runner_start`, the runner's process id and the time that process started (the nearest ancestor of the
+hook that is not a shell or a plain launcher such as `env` or `uv`; the start time stops a reused id from matching).
+`resolve_caller(env=None) -> Record | None` walks this process's ancestors, nearest first, and returns the record
+carrying the first stamp that matches (the newest, when a cleared or resumed session left two for one runner). It works
+unchanged for `ws mcp serve`, which is a child of the runner. A process with no matching ancestor (orphaned, or
+double-forked so that init owns it) is not a session and gets None. Only `start` writes the stamp: `update` keeps it and
+cannot set it. The ancestors come from `/proc` on Linux and `ps` on macOS. The keys are additions, so the schema stays 2.
+
 Records are pruned 30 days after their last change (`_KEEP_DAYS`); a data class's `retention_days` is the message
 store's own, not this.
 
@@ -65,6 +75,9 @@ LAUNCH_TTL = 600  # seconds a launch token is good for: shared by `prepare` (wri
 _TOKEN = re.compile(r"^[0-9a-f]{32}$")
 _PANE = re.compile(r"^%[0-9]{1,9}$")
 _UNSET = ...  # `update` leaves a field alone when it is not given (None is a value: it clears the field)
+_SHELLS = frozenset({"sh", "bash", "zsh", "dash", "fish", "ksh", "mksh", "ash", "csh", "tcsh", "busybox"})
+_LAUNCHERS = frozenset({"env", "uv", "uvx", "nohup", "nice", "timeout", "setsid"})  # pass a command on; not the runner
+_MAX_DEPTH = 64  # ancestors looked at: a process tree is never this deep, and a loop must not hang the walk
 
 
 # --- the release ---------------------------------------------------------------------------------------------------
@@ -209,12 +222,21 @@ def _class_name(cwd: str) -> str | None:
     return found.name if found else None
 
 
-def _new_record(session_id: str, release: str, runner: str, cwd: str, env: dict, previous: dict | None = None) -> dict:
+def _new_record(
+    session_id: str,
+    release: str,
+    runner: str,
+    cwd: str,
+    env: dict,
+    previous: dict | None = None,
+    stamp: Proc | None = None,
+) -> dict:
     """A record for a session starting now. The role, the delivery cursor and the revision carry over from `previous` (a
-    resumed, cleared or compacted start for the same id); a new role is only ever set by `start`, from the launch token."""
+    resumed, cleared or compacted start for the same id); a new role is only ever set by `start`, from the launch token.
+    `stamp` is the runner process (`start` passes it; a resumed start stamps the new runner)."""
     now = datetime.now(UTC)
     before = Record.from_dict(previous, session_id) if previous else None
-    return {
+    out = {
         "schema": SCHEMA_VERSION,
         "ts": jsonl.iso_utc(now.timestamp()),
         "session_id": session_id,
@@ -230,6 +252,76 @@ def _new_record(session_id: str, release: str, runner: str, cwd: str, env: dict,
         "last_delivered_outbound": before.last_delivered_outbound if before else None,
         "rev": _rev(previous) + 1,
     }
+    if stamp:
+        out["runner_pid"], out["runner_start"] = stamp.pid, stamp.start
+    return out
+
+
+# --- who is calling: the process tree ------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Proc:
+    """A process as the walk sees it: `start` is a string that is the same for the life of the process and differs for a
+    process that later reuses the id (clock ticks since boot on Linux, `ps` start time elsewhere)."""
+
+    pid: int
+    start: str
+    ppid: int
+    name: str
+
+
+def proc_info(pid: int) -> Proc | None:
+    """The process `pid`, or None when it is gone or cannot be read. `/proc` on Linux, `ps` where there is none."""
+    try:
+        if Path("/proc/self/stat").exists():
+            data = (Path("/proc") / str(pid) / "stat").read_text(encoding="utf-8", errors="replace")
+            name = data[data.index("(") + 1 : data.rindex(")")]
+            rest = data[data.rindex(")") + 2 :].split()  # state, ppid, ... starttime is the 20th after the name
+            return Proc(pid, rest[19], int(rest[1]), name)
+    except (OSError, ValueError, IndexError):
+        return None
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "ppid=,lstart=,comm=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LC_ALL": "C"},
+            check=False,
+        ).stdout
+        parts = out.split(None, 6)  # ppid, then lstart as five words, then the command (which may hold spaces)
+        if len(parts) < 7:
+            return None
+        return Proc(pid, " ".join(parts[1:6]), int(parts[0]), os.path.basename(parts[6].strip()))
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        return None
+
+
+def _ancestors() -> list[Proc]:
+    """This process's ancestors, nearest first (its parent, then that process's parent, and so on to the top)."""
+    out: list[Proc] = []
+    seen = {os.getpid()}
+    pid = os.getppid()
+    while pid > 0 and pid not in seen and len(out) < _MAX_DEPTH:
+        seen.add(pid)
+        proc = proc_info(pid)
+        if proc is None:
+            break
+        out.append(proc)
+        pid = proc.ppid
+    return out
+
+
+def _is_runner(proc: Proc) -> bool:
+    return proc.name.lstrip("-").lower() not in _SHELLS | _LAUNCHERS
+
+
+def runner_process() -> Proc | None:
+    """The runner behind this hook: the nearest ancestor that is not a shell or a plain launcher. None when there is none."""
+    return next((p for p in _ancestors() if _is_runner(p)), None)
 
 
 @dataclass(frozen=True)
@@ -252,6 +344,8 @@ class Record:
     rev: int = 0
     nudged: bool = False
     schema: int = 1
+    runner_pid: int | None = None  # the runner process `start` stamped (with runner_start); None on an older record
+    runner_start: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict, session_id: str = "") -> Record:
@@ -263,6 +357,8 @@ class Record:
         sent_ok = isinstance(sent, dict) and isinstance(sent.get("id"), str) and isinstance(sent.get("ts"), str)
         schema = data.get("schema")
         pane = data.get("pane")
+        pid, began = data.get("runner_pid"), text("runner_start")
+        stamped = isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 and bool(began) and len(began) <= 64
         return cls(
             session_id=text("session_id") or session_id,
             release=text("release") or "",
@@ -279,6 +375,8 @@ class Record:
             rev=_rev(data),
             nudged=data.get("nudged") is True,
             schema=schema if isinstance(schema, int) and not isinstance(schema, bool) else 1,
+            runner_pid=pid if stamped else None,
+            runner_start=began if stamped else None,
         )
 
     def to_dict(self) -> dict:
@@ -300,6 +398,8 @@ class Record:
         }
         if self.nudged:
             out["nudged"] = True
+        if self.runner_pid is not None and self.runner_start is not None:
+            out["runner_pid"], out["runner_start"] = self.runner_pid, self.runner_start
         return out
 
 
@@ -312,6 +412,34 @@ def read(session_id: str, env: dict | None = None) -> Record | None:
     the v2 defaults (role worker, class None, rev 0). A reader treats None as the strictest case."""
     data = _read(_record_path(_env(env), session_id))
     return Record.from_dict(data, session_id) if data is not None else None
+
+
+def resolve_caller(env: dict | None = None) -> Record | None:
+    """The session this process belongs to, or None. Walks the ancestors of this process, nearest first, and returns the
+    record whose runner stamp (`runner_pid` and `runner_start`) is that ancestor; where a cleared or resumed session left
+    more than one record for the same runner process, the newest. Nothing the process was given (an environment variable,
+    an argument, a payload) takes part, so a command cannot name itself as another session. A process that is not under a
+    stamped runner (orphaned, or double-forked and handed to init) is not a session: None. A records folder that cannot be
+    read is None too."""
+    chain = _ancestors()
+    if not chain:
+        return None
+    folder = paths.state_dir(_env(env)) / "sessions"
+    found: dict[tuple[int, str], list[Record]] = {}
+    try:
+        files = sorted(folder.glob("*.json"))
+    except OSError:
+        return None
+    for f in files:
+        data = _read(f)
+        rec = Record.from_dict(data) if data is not None else None
+        if rec and rec.session_id and rec.runner_pid is not None and rec.runner_start is not None:
+            found.setdefault((rec.runner_pid, rec.runner_start), []).append(rec)
+    for proc in chain:
+        hits = found.get((proc.pid, proc.start))
+        if hits:
+            return max(hits, key=lambda r: (r.started_at or "", r.ts or "", r.session_id))
+    return None
 
 
 def update(
@@ -444,7 +572,9 @@ def cmd_start(args: argparse.Namespace) -> int:
                 # always overwrite: a resumed, cleared or compacted session reloads its rules, so it starts again here
                 path = _record_path(env, got[0])
                 with _locked(path.parent):
-                    new = _new_record(got[0], current_release(env), args.runner, got[1], env, _read(path))
+                    new = _new_record(
+                        got[0], current_release(env), args.runner, got[1], env, _read(path), runner_process()
+                    )
                     if role:
                         new["role"] = role
                     _write(path, new)

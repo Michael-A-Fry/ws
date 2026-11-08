@@ -177,8 +177,11 @@ export const WsGate = async ({ client, directory } = {}) => {
   }
   // OpenCode's own `ask` rules, which ws writes for `ask_commands`, are the floor when this shim is not there. When it is,
   // the gate has already had its say, and a call the person approved with `ws approve` is let through: answering that ask
-  // once, and only once, keeps the approved call from being asked a second time. Only an ask whose every pattern is one
-  // of ws's, on a call the gate allowed, is answered; the person's own ask rules are left to them.
+  // once, and only once, keeps the approved call from being asked a second time. OpenCode lists every shell segment of a
+  // compound command in one ask (`ls && touch X` is `ls, touch X`), so an ask is answered when at least one segment is
+  // one of ws's, on a call the gate allowed: the gate has already judged the whole line, the segments that match no rule
+  // of ws's are not the shim's to refuse, and the answer is given once. A bash ask on a call the gate did not allow, and
+  // any ask that is not for a shell command, is left to the person.
   const answer = async (p) => {
     try {
       if (typeof client?.permission?.reply === "function") {
@@ -202,7 +205,7 @@ export const WsGate = async ({ client, directory } = {}) => {
   }
   const asked = async (p) => {
     const patterns = Array.isArray(p.patterns) ? p.patterns.map(String) : []
-    const ours = p.permission === "bash" && patterns.length > 0 && patterns.every((x) => ASK_RE.some((re) => re.test(x)))
+    const ours = p.permission === "bash" && patterns.length > 0 && patterns.some((x) => ASK_RE.some((re) => re.test(x)))
     note({
       event: "added",
       id: p.id,

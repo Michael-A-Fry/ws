@@ -132,6 +132,32 @@ def test_approved_call_runs_once(tmp_path, work):
     assert not target.exists() and "ws approve" in stub.tool_results()[-1], "a second use must be refused"
 
 
+def test_approved_compound_call_runs_once(tmp_path, work):
+    """OpenCode lists every shell segment in one ask (`ls, touch X`); the one segment of ws's is enough to answer it."""
+    write_policy(tmp_path, ask=True)
+    out = layer(tmp_path, "both")
+    target = work / "APPROVED"
+    call = bash(f"ls && touch {target}")
+    root = tmp_path / "wshome" / "approvals"
+
+    stub, proc = step(tmp_path, out, work, [call], first=True)
+    assert not target.exists() and "ws approve" in stub.tool_results()[0], gr.where(proc)
+    pending = sorted((root / "pending").glob("*.json"))
+    assert len(pending) == 1
+    approvals.grant(root, pending[0].stem[:12])
+
+    stub, proc = step(tmp_path, out, work, [call] * 2)
+    assert target.exists(), f"the approved compound call did not run: {stub.tool_results()}\n{gr.where(proc)}"
+    assert "rejected" not in " ".join(stub.tool_results()).lower(), gr.where(proc)
+    assert not list((root / "granted").glob("*.json")), "the approval was not used up"
+    asked = [ln for ln in asks_lines(tmp_path) if ln.get("event") == "added"]
+    assert len(asked) == 1, f"asked more than once: {asked}"
+
+    target.unlink()
+    stub, proc = step(tmp_path, out, work, [call] * 3)
+    assert not target.exists() and "ws approve" in stub.tool_results()[-1], "a second use must be refused"
+
+
 def test_asks_file_gets_open_and_closed_lines(tmp_path, work):
     write_policy(tmp_path, ask=True)
     out = layer(tmp_path, "both")

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import types
@@ -596,3 +597,31 @@ def test_the_shim_answers_an_ask_of_its_own_once_and_never_always(tmp_path, box)
 def test_the_generated_folder_still_needs_nothing_written_at_start(tmp_path, box):
     files = opencode.generate(policy.loads(""), ["ws"], tmp_path / "out", tmp_path / "policy.toml")
     assert set(files) == {opencode.CONFIG, opencode.PLUGIN, opencode.IGNORE}
+
+
+def ask_answered(shim: str, patterns: list[str], *, permission: str = "bash", allowed: bool = True) -> bool:
+    """The shim's `asked` decision, mirrored from its JS: `wild` turns each of ws's `ask_commands` into a regex, and the
+    ask is answered when the permission is bash, the gate allowed the call and at least one listed segment matches one."""
+    ask = js_const(shim, "ASK")
+
+    def wild(g: str) -> re.Pattern:
+        s = re.sub(r"([.+^${}()|\[\]\\])", r"\\\1", g).replace("*", ".*").replace("?", ".")
+        if s.endswith(" .*"):
+            s = s[:-3] + "( .*)?"
+        return re.compile("^" + s + "$", re.DOTALL)
+
+    asks = [wild(g) for g in ask]
+    return permission == "bash" and allowed and any(re.match(r, x) for x in patterns for r in asks)
+
+
+def test_a_mixed_segment_ask_is_answered_and_a_foreign_one_is_not(tmp_path, box):
+    shim = shim_for('[gate]\nask_commands = ["touch *APPROVED"]\n', tmp_path)
+    some = "patterns.some((x) => ASK_RE.some((re) => re.test(x)))"
+    assert some in shim and "patterns.every(" not in shim  # the JS this test mirrors
+    assert ask_answered(shim, ["touch /w/APPROVED"])
+    assert ask_answered(shim, ["ls", "touch /w/APPROVED"])  # `ls && touch X`: OpenCode lists every segment
+    assert ask_answered(shim, ["touch /w/APPROVED", "echo hi", "ls"])
+    assert not ask_answered(shim, ["ls", "echo hi"])  # none of ws's rules: the person's own ask
+    assert not ask_answered(shim, ["ls", "touch /w/APPROVED"], allowed=False)  # the gate did not let it through
+    assert not ask_answered(shim, ["touch /w/APPROVED"], permission="edit")
+    assert not ask_answered(shim, [])

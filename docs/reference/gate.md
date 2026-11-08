@@ -70,8 +70,12 @@ first version whose schema has a permission key of that name.
 
 **Approvals.** The plugin checks first, so a call that needs a person's yes is refused with the `ws approve` line before
 OpenCode would ask. Once it is approved, the plugin lets the call through and OpenCode's own `ask` for it would come next:
-the plugin answers that ask `once` (never for good), but only when the call is one the gate just allowed and every pattern
-in the ask is one of ws's `ask_commands`. Your own `ask` rules are never answered for you. A headless `opencode run`
+the plugin answers that ask `once` (never for good), but only when the call is one the gate just allowed and at least one
+pattern in the ask is one of ws's `ask_commands`. OpenCode lists every shell segment of a compound command in one ask
+(`ls && touch X` is asked as `ls, touch X`), so a segment that matches none of ws's rules does not stop the answer: the
+gate has already judged the whole line, and the shim answers once, so the call runs once and is not asked twice. A bash
+ask on a call the gate did not allow, and an ask for anything but a shell command, is never answered for you. Your own
+`ask` rules are answered only when the same line also holds one of ws's `ask_commands`. A headless `opencode run`
 turns any ask it is not answered for into a refusal ("permission requested ... auto-rejecting"), so with only the rules
 and no plugin an `ask_commands` call is refused, which is the floor.
 

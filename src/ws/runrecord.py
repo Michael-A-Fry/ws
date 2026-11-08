@@ -6,7 +6,10 @@ finishing together never interleave; the file is 0600, rotated at 5 MB (three ol
 from this month) and no string field is longer than 16 KiB. `read` and `ws runs` read across the old files.
 
 Schema 2 added `green` (what the job's verification covers) and `recovered` (the automatic recoveries `ws run` tried).
-Lines written under schema 1 stay in the log and read as they are; callers use `.get` for the two new keys.
+Schema 3 added `purpose` (the budget purpose the job's spend counts against), `stop_reason` (why the run ended, in
+words that do not change: `completed`, `timeout`, `preempted`, `refused:<counter>`, `expired` and so on) and
+`reservation` (what admission reserved before the run started). Lines written under an earlier schema stay in the log
+and read as they are; callers use `.get` for the keys a later schema added.
 """
 
 from __future__ import annotations
@@ -21,7 +24,7 @@ from pathlib import Path
 from ws import jsonl, paths
 from ws.runschema import SCHEMA
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 RUN_TIME_KEYS = ("started_at",)  # the run-record schema allows no `ts`; the start time is its stamp
 KEYS = (
     "schema",
@@ -54,10 +57,13 @@ KEYS = (
     "green",
     "recovered",
     "eval",
+    "purpose",
+    "stop_reason",
+    "reservation",
 )
 GREEN_LEVELS = ("targeted", "package", "full", "merge_ready")
 TOKEN_KEYS = ("input", "output", "cache_creation", "cache_read")
-STATUSES = ("ok", "error", "timeout", "refused")
+STATUSES = ("ok", "error", "timeout", "refused", "preempted", "expired")
 
 
 def runs_path(env: dict | None = None) -> Path:
@@ -186,7 +192,7 @@ def _token_count(rec: dict) -> int | None:
 
 def _started(rec: dict) -> bool:
     """Did the runner start? (A refusal, a missing runner or an unreachable broker spent nothing.)"""
-    if rec.get("status") in ("ok", "timeout"):
+    if rec.get("status") in ("ok", "timeout", "preempted"):
         return True
     return rec.get("status") == "error" and (
         rec.get("exit_code") is not None or str(rec.get("error", "")).startswith("interrupted")
@@ -220,3 +226,20 @@ def month_spend(
         for r in records
         if str(r.get("started_at", "")).startswith(month)
     )
+
+
+def month_spend_by_purpose(
+    records: list[dict],
+    now: datetime | None = None,
+    unknown_run_usd: float | None = None,
+    fallback_usd_per_mtok: float | None = None,
+) -> dict[str | None, float]:
+    """The same spend as `month_spend`, split by the record's `purpose` (None for a record with none, which is every
+    record written before schema 3). One month rule and one costing for the cap and for each purpose's cap."""
+    month = f"{(now or datetime.now(UTC)).astimezone(UTC):%Y-%m}"
+    out: dict[str | None, float] = {}
+    for r in records:
+        if str(r.get("started_at", "")).startswith(month):
+            purpose = r.get("purpose") if isinstance(r.get("purpose"), str) else None
+            out[purpose] = out.get(purpose, 0.0) + record_cost(r, unknown_run_usd, fallback_usd_per_mtok)
+    return out

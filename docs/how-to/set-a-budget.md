@@ -31,14 +31,31 @@ read [The budget](../explanation/budget.md).
 
    Set them above the real price. Spend is then never undercounted.
 
-3. Keep each job tight. The cap is checked before a run, not during it. In the job file, set the limits:
+3. Keep each job tight. In the job file, set the limits, and say how much one run may spend. ws reserves that sum before
+   the run and settles from what the run used. If less than that is left under a cap, the reservation shrinks to what
+   is left and Claude Code is told so with `--max-budget-usd` (add `strict = true` to refuse instead):
 
    ```toml
    timeout_s = 600
    max_turns = 8
+   budget_usd = 1.5
    ```
 
-4. Check the cap without starting a run.
+4. Optional: give each kind of work its own share of the month, in `policy.toml`, and name it in the job. A job is
+   refused at its own purpose's cap whatever room the others have. A purpose the policy does not list makes the job a
+   bad job (exit 2).
+
+   ```toml
+   [budget.purposes]
+   jobs = 40
+   evals = 60
+   ```
+
+   ```toml
+   purpose = "jobs"   # in the job file
+   ```
+
+5. Check the cap without starting a run.
 
    ```sh
    ws run daily --dry-run
@@ -46,13 +63,13 @@ read [The budget](../explanation/budget.md).
 
    The output includes `month_spend_usd`, `monthly_cap_usd` and `would_refuse`.
 
-5. Check the setting with the doctor.
+6. Check the setting with the doctor.
 
    ```sh
    ws doctor
    ```
 
-6. Read the records that add up to the spend.
+7. Read the records that add up to the spend.
 
    ```sh
    ws runs --last 5
@@ -67,12 +84,16 @@ code 3.
 
 ## If a run is refused
 
-`ws run` exits 3 and writes a record with status `refused`. The reason is on standard error. It's one of: no cap,
-spend at
-the cap, a Rule of Two refusal, or a model the runner can't price. For the last, set `allow_unpriced = true` in the job
+`ws run` exits 3 and writes a record with status `refused`. The reason is on standard error, and the record's
+`stop_reason` names the counter (`refused:profile_cap`, `refused:purpose:jobs`, `refused:memory` and so on). It's one of:
+no cap, spend plus the runs in progress at the cap, a purpose at its own cap, a slot or memory that is full, a Rule of
+Two refusal, a model the runner can't price, a deadline that has passed, or a queue database that is locked or full (a run
+never starts without a reservation). For the unpriced model, set `allow_unpriced = true` in the job
 file to run anyway. The run then counts at your fallback price.
 
 ## Limits
 
-A started run can spend what its `timeout_s` and `max_turns` allow. Runs outside `ws run` aren't in the log. See
-[The budget](../explanation/budget.md).
+A run is capped during the run only where the runner has a limit of its own: Claude Code is passed `--max-budget-usd`
+when the reservation was set by `budget_usd` or shrank; OpenCode has no such flag, so there the reservation holds the money
+and the settle, from what the run used, corrects it. A run can still spend what its `timeout_s` and `max_turns` allow.
+Runs outside `ws run` aren't in the log. See [The budget](../explanation/budget.md) and [the queue](../reference/queue.md).

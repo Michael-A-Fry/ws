@@ -46,8 +46,8 @@ folders read-only, and the gate refuses a session's writes to each of them in ei
 
 | Log | Path under its folder | Writer | Fields | Schema | Time key | Kept |
 |---|---|---|---|---|---|---|
-| Run records | `logs/runs.jsonl` | `src/ws/runrecord.py` (for `ws run`) | The keys of the run-record schema (`ws.runschema.SCHEMA`): job, runner, models, tokens, cost, status | 2 | `started_at`, `ended_at` | Rotates at 5 MiB; an old file that holds a record from this or last month stays |
-| Run records, fallback | `logs/runs.fallback.jsonl` | `src/ws/runrecord.py` | The same record, when `runs.jsonl` can't be written | 2 | `started_at`, `ended_at` | Never rotated or locked; `read` includes it |
+| Run records | `logs/runs.jsonl` | `src/ws/runrecord.py` (for `ws run`) | The keys of the run-record schema (`ws.runschema.SCHEMA`): job, runner, models, tokens, cost, status, `purpose`, `stop_reason`, `reservation` | 3 | `started_at`, `ended_at` | Rotates at 5 MiB; an old file that holds a record from this or last month stays |
+| Run records, fallback | `logs/runs.fallback.jsonl` | `src/ws/runrecord.py` | The same record, when `runs.jsonl` can't be written | 3 | `started_at`, `ended_at` | Never rotated or locked; `read` includes it |
 | Ratings | `ratings.jsonl` | `src/ws/rating.py` | `schema`, `ts`, `run_id`, `rating` (`up` or `down`), `note`, `who` | 1 | `ts` | Rotates at 5 MiB; old files and the lock sit in `logs/` |
 | Canary | `logs/canary.jsonl` | `src/ws/canary.py` | `schema`, `ts`, `ws_version`, `ok`, `model`, `runners` | 1 | `ts` | Rotates at 5 MiB |
 | Eval results | `eval/results.jsonl` | `src/ws/eval.py` | `schema`, `ts`, `batch`, `task`, `task_hash`, `family`, `kind`, `trial`, `arm`, `job`, `job_hash`, `run_id`, `status`, `pass`, `grade`, `note`, `folder` | 1 | `ts` | Rotates at 5 MiB |
@@ -56,12 +56,18 @@ folders read-only, and the gate refuses a session's writes to each of them in ei
 | Claims | `logs/claims.jsonl` | `src/ws/guards/claims.py` | `schema`, `ts`, `at`, `runner`, `session`, `ref`, `claims` | 1 | `ts`, `at` | Rotates at 5 MiB |
 | Gate verdicts | `logs/gate.jsonl` | `src/ws/gate.py` | `schema`, `ts`, `runner`, `session`, `event`, `decision` (`allow`, `deny`, `ask`, `claim`), `layer`, `guards` (each `guard`, `result`, `ms`), `ms`, `via` (`direct` or `daemon`) | 1 | `ts` | Rotates at 5 MiB |
 | Wall report | `logs/wall-report.jsonl` | `src/ws/sandbox.py` | `schema`, `ts`, `at`, `project`, `runner`, `incomplete`, `findings`, `notes` | 1 | `ts`, `at` | Rotates at 5 MiB |
+| Node footprint | `node/footprint.jsonl` | `src/ws/node.py` | `schema`, `ts`, `type` (`ws.footprint/1`), `node`, `op` (`intent`, `done`, `removed`), `step`, and on an intent `kind`, `target`, `sha256`, `existed` | 1 | `ts` | Never rotated; removed by `ws node remove` once every change is undone |
 | Broker audit | `logs/broker.jsonl` | `src/ws/broker.py` | `t`, `op`, `name`, `purpose`, `host`, `uid`, `pid`, `lease`, `status`, `bytes` | none (reads as 1) | `t` | One file; the broker appends and never rotates it |
 
 Notes:
 
 - Run records keep `started_at` and `ended_at`. The run-record schema lists its keys and allows no others, so a `ts`
   there is the next schema number.
+- Schema 3 of the run record added `purpose`, `stop_reason` and `reservation`. Schema 2 stays frozen (the test pins its
+  keys) and its lines read as they are: a reader uses `.get` for the three new keys. `status` gained `preempted` and
+  `expired`.
+- The node footprint is a ledger, not a log: two lines per change (an `intent` before it, a `done` after), so a crash
+  between them is still understood. It is never rotated, because a forgotten change could not be undone.
 - The broker audit log predates the convention. It's the one log that doesn't go through `ws.jsonl`, and it has no
   `schema`. Its time key is `t`. A change to it takes a schema number of its own.
 - Ratings sit at the top of the state folder and not in `logs/`. The top holds the control files a session may not write,
@@ -79,6 +85,7 @@ One JSON file per record, written to a temporary name and renamed into place (06
 | Session | `sessions/<id>.json` | `src/ws/session.py` | `schema`, `ts`, `session_id`, `release`, `started_at`, `runner`, `cwd` | 1 | `ts` | Removed 30 days after its last change |
 | Approval, pending and granted | `approvals/pending/<id>.json`, `approvals/granted/<id>.json` | `src/ws/approvals.py` | `schema`, `v`, `ts`, `id`, `bound`, `created`, `granted` | 1 | `ts` (when the file was written) | Expires 10 minutes after it's made; a granted one is deleted when it's used |
 | Seen versions | `versions.json` | `src/ws/canary.py` | `schema`, `runners`, `default_model` | 1 | none | Rewritten when a passing canary sees a change |
+| Subscription limits | `usage/rate_limits.json` | `src/ws/usage.py` | `schema`, `captured_at` (Unix seconds), `five_hour` and `seven_day` (each `used_percentage`, `resets_at`), or `absent` (a tombstone) | 1 | `captured_at` | Replaced by each statusline call; read as unknown after 600 s |
 
 `v` in an approval is the older spelling of `schema`, kept for one release. `created` and `granted` are Unix seconds.
 
@@ -88,3 +95,14 @@ A job with no `cwd` runs in `$XDG_STATE_HOME/ws-work/<run_id>` (default `~/.loca
 folders and not in one, because the wall makes those read-only. `ws uninstall` removes the empty run folders there, then
 `ws-work` once it's empty. A run folder that holds a file stays, with the folder above it. An earlier ws used
 `~/.local/state/ws/work`; `ws uninstall` tidies that too.
+
+## The queue database
+
+`queue/queue.db` in the state folder (folder 0700, file 0600, WAL mode; `src/ws/queue.py`) is the one place ws keeps
+state in SQLite. It holds the queued work (table `work`, the `ws._vendor.sqlqueue` engine) and a receipt for every run
+(table `receipts`): its status (`queued`, `running`, `ok`, `error`, `refused`, `preempted`, `skipped`, `interrupted`,
+`expired`), the UTC month it counts in, what was reserved (money, turns, seconds, memory, lane), who owns it (process id
+and start time), and what it came to when settled (cost, tokens, stop reason). A database file carries its layout
+version in `PRAGMA user_version` (now 1); a later change to the tables takes a new number. The money counted against a
+cap is the month's records in `logs/runs.jsonl` plus the open reservations here, never both for one run. See
+[the queue](queue.md).

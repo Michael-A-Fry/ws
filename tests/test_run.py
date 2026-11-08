@@ -1136,7 +1136,12 @@ def test_sigterm_to_ws_run_kills_the_runner_and_still_writes_the_record(ws):
     assert proc.returncode == 128 + signal.SIGTERM
     (rec,) = ws.records()
     valid(rec)
-    assert rec["status"] == "error" and rec["error"].startswith("interrupted") and rec["job"] == "nosecret"
+    assert (
+        rec["status"] == "preempted"
+        and rec["stop_reason"] == "preempted"
+        and rec["error"].startswith("interrupted")
+        and rec["job"] == "nosecret"
+    )
     assert not alive(ws.saw()["pid"])
 
 
@@ -1488,3 +1493,56 @@ def test_a_run_whose_socket_path_is_too_long_ends_with_the_hint_and_tries_no_rec
     assert cli.main(["run", "daily"]) == 1
     (rec,) = ws.records()
     assert rec["recovered"] == [] and "shorter WS_HOME" in rec["error"] and ws.started == []
+
+
+# --- reserve before the run, settle after it (the queue's own tests are in test_queue.py) ---------------------------
+
+
+def test_the_record_says_what_was_reserved_and_why_the_run_stopped(ws):
+    (ws.home / "policy.toml").write_text("[budget.purposes]\njobs = 10\n", encoding="utf-8")
+    ws.job(extra='purpose = "jobs"\nbudget_usd = 2.5\nmax_turns = 7\n')
+    assert cli.main(["run", "daily"]) == 0
+    (rec,) = ws.records()
+    valid(rec)
+    assert rec["schema"] == 3 and rec["purpose"] == "jobs" and rec["stop_reason"] == "completed"
+    assert rec["reservation"] == {
+        "usd": 2.5, "turns": 7, "seconds": 30.0, "ram_gb": 0.0, "lane": "run", "resized": False,
+        "counters": rec["reservation"]["counters"], "notes": rec["reservation"]["notes"],
+    }  # fmt: skip
+    assert {"profile_cap", "purpose:jobs", "turns", "time", "concurrency"} <= set(rec["reservation"]["counters"])
+    argv = ws.saw()["argv"]
+    assert argv[argv.index("--max-budget-usd") + 1] == "2.5000"  # the job named its budget, so the runner holds to it
+
+
+def test_a_refusal_names_its_counter_in_the_record(ws, capsys):
+    ws.cap(0.5)
+    ws.job(extra="budget_usd = 1.0\nstrict = true\n")
+    assert cli.main(["run", "daily"]) == 3
+    (rec,) = ws.records()
+    valid(rec)
+    assert rec["status"] == "refused" and rec["stop_reason"] == "refused:profile_cap" and rec["reservation"] is None
+    assert "strict" in rec["error"] and not (ws.home / "fake-saw.json").exists()
+
+
+def test_the_checkpoint_name_and_the_grace_reach_the_runner(ws, monkeypatch):
+    graces = []
+    real = run._spawn
+    monkeypatch.setattr(run, "_spawn", lambda *a: graces.append(a[-1]) or real(*a))
+    ws.job(extra='checkpoint = "progress.json"\ngrace_s = 7\n')
+    assert cli.main(["run", "daily"]) == 0
+    assert ws.saw()["env"]["WS_CHECKPOINT"] == "progress.json" and graces == [7]
+
+
+def test_dry_run_reserves_nothing_and_says_what_admission_would_do(ws, capsys):
+    ws.job(extra='deadline = "2020-01-01T00:00:00Z"\n')
+    assert cli.main(["run", "daily", "--dry-run"]) == 3
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["would_refuse"] and "deadline" in plan["would_refuse"] and plan["admission"] == "refuse"
+    assert ws.records() == []
+    ws.job()
+    assert cli.main(["run", "daily", "--dry-run"]) == 0
+    assert json.loads(capsys.readouterr().out)["admission"] == "admit"
+    import sqlite3
+
+    c = sqlite3.connect(ws.home / "queue" / "queue.db")
+    assert c.execute("SELECT COUNT(*) FROM receipts").fetchone()[0] == 0  # a dry run leaves no receipt

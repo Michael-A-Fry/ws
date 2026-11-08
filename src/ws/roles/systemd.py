@@ -39,6 +39,8 @@ def _quote(word: str, expand: bool = False) -> str:
 def on_calendar(when: When) -> str:
     if when.kind == "hourly":
         return "*-*-* *:00:00"
+    if when.kind == "every":
+        return f"*-*-* *:00/{when.every}:00"
     at = f"{when.hour:02d}:{when.minute:02d}:00"
     return f"*-*-* {at}" if when.kind == "daily" else f"{DAYS[when.weekday].capitalize()} *-*-* {at}"
 

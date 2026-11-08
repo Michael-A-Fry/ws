@@ -18,7 +18,8 @@ body of the GitHub release.
 ### Fixed
 
 - A hook that carries no pin on ws's folders (written by an earlier ws) runs the full check and prints a note that
-  names `ws upgrade --hooks-only`, as long as `HOME` is the account's own home folder. A pin that is partial, malformed
+  names `ws upgrade --hooks-only`, as long as ws's folders are where the account's home and the hook's own policy
+  file say they are; otherwise it is refused, with the same command to run. A pin that is partial, malformed
   or different is refused as before.
 - `ws install` and `ws upgrade` leave the sandbox out of a runner config whose ws entries were written without it, until
   the policy says `sandbox = true`.

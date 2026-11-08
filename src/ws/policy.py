@@ -1369,7 +1369,7 @@ def _dotted(op: str, cwd: str) -> str:
     return op
 
 
-_ADMIN = {"secret", "broker", "approve", "uninstall"}
+_ADMIN = {"secret", "broker", "approve", "uninstall", "upgrade"}
 _ADMIN_SUB = {
     ("skills", "adopt"),
     ("skills", "restore"),
@@ -1391,9 +1391,9 @@ def _gate_flag(rest: list[str]) -> bool:
 
 
 def _ws_admin(canon: list[str]) -> str | None:
-    """`ws gate generate|init`, `ws secret ...`, `ws broker ...`, `ws approve ...`, `ws uninstall`, `ws install --gate
-    launch`, `ws skills adopt|restore`, `ws config fallback`, `ws session prepare|start` (also `uv run ws ...`,
-    `python -m ws ...`): a gated session must not regenerate or take off its own gate, touch secrets, approve its own
+    """`ws gate generate|init`, `ws secret ...`, `ws broker ...`, `ws approve ...`, `ws uninstall`, `ws upgrade ...`,
+    `ws install --gate launch`, `ws skills adopt|restore`, `ws config fallback`, `ws session prepare|start` (also
+    `uv run ws ...`, `python -m ws ...`): a gated session must not regenerate or take off its own gate, touch secrets, approve its own
     call, swap what the person installed or mint the role of a session (`prepare`) or overwrite its record (`start`;
     the hooks that run it are not tool calls, so they still work). A plain `ws install` only refreshes, so it stays
     allowed."""

@@ -36,6 +36,7 @@ def box(tmp_path, monkeypatch):
     ):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(paths, "account_home", lambda: home.resolve())  # the account database says this is the home
     cfg = home / ".config" / "ws"
     cfg.mkdir(parents=True)
     (cfg / "policy.toml").write_text(policy.default_toml())
@@ -137,6 +138,39 @@ def test_the_note_is_on_stdout_for_claude_code_only(box, monkeypatch, capsys, in
     code = cli.main(["gate", "check", "--runner", "opencode", "--policy", str(installed.policy)])
     seen = capsys.readouterr()
     assert code == 0 and seen.out == "" and "ws upgrade" in seen.err
+
+
+def test_a_hook_with_no_pin_is_refused_when_home_is_not_the_accounts(box, monkeypatch, capsys, installed):
+    """HOME moves every folder the protected list is built from, so an unpinned hook (which takes its layout from the
+    environment) must not run on a HOME of the session's choosing. A pinned hook is refused too (the pin differs)."""
+    monkeypatch.setenv("HOME", str(box / "forged"))
+    (box / "forged").mkdir()
+    code, err = installed.check(monkeypatch, capsys, "ls", pin=[])
+    assert code == 2 and "HOME is not the account's home" in err and installed.out == ""
+    code, err = installed.check(monkeypatch, capsys, "ls")
+    assert code == 2 and CHANGED in err
+
+
+def test_a_hook_with_no_pin_is_refused_when_the_account_cannot_be_asked(box, monkeypatch, capsys, installed):
+    monkeypatch.setattr(paths, "account_home", lambda: None)  # no `pwd` here
+    code, err = installed.check(monkeypatch, capsys, "ls", pin=[])
+    assert code == 2 and "HOME is not the account's home" in err
+
+
+def test_the_account_home_is_what_the_system_says_not_what_the_environment_says(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert paths.account_home() != tmp_path.resolve()
+    import builtins
+
+    real = builtins.__import__
+
+    def no_pwd(name, *a, **k):
+        if name == "pwd":
+            raise ImportError(name)
+        return real(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", no_pwd)
+    assert paths.account_home() is None
 
 
 def test_a_hook_with_no_pin_still_fails_closed_when_the_layout_cannot_be_told(box, monkeypatch, capsys, installed):

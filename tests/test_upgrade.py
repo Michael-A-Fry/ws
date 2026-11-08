@@ -37,6 +37,7 @@ def box(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("WS_HOME", str(home / ".ws"))
+    monkeypatch.setattr(paths, "account_home", lambda: home.resolve())
     monkeypatch.setenv("WS_GATE_DAEMON", "0")  # a hook decides in its own process, and leaves no daemon behind
     for var in SESSION_VARS:
         monkeypatch.delenv(var, raising=False)  # this suite may itself run inside a session
@@ -57,12 +58,23 @@ def manifest_bytes(box: Path) -> bytes:
     return install.manifest_path().read_bytes()
 
 
+def old_ws_cmd(box: Path) -> list[str]:
+    """How the old hooks start ws: `python -I -m ws`, except that a hook run here is a subprocess and cannot be told what
+    the account database says, so a one-line script stands in for `-m ws` with the account's home fixed to the tmp HOME."""
+    shim = box.parent / "ws_shim.py"
+    shim.write_text(
+        "import sys\nfrom pathlib import Path\nfrom ws import cli, paths\n"
+        f"paths.account_home = lambda: Path({str(box.resolve())!r})\nsys.exit(cli.main(sys.argv[1:]))\n"
+    )
+    return [sys.executable, "-I", str(shim)]
+
+
 def v016_settings(box: Path) -> dict:
     """What 0.1.6 merged into the user's settings: the gate check run straight (`gate check --runner ...`), no `--pin`
     anywhere, the PreToolUse command wrapped to say when ws itself failed, `WS_SANDBOXED=0` and no `sandbox` block. The
     shapes are those of `git show v0.1.6:src/ws/adapters/claude_code.py` (`generate`, `session_hooks`, `alert_hook`) and
     `v0.1.6:src/ws/userconfig.py` (`_tune`, `_claude_ops`)."""
-    cmd = selfcmd.argv()
+    cmd = old_ws_cmd(box)
     policy_file = paths.config_dir() / "policy.toml"
     out = paths.state_dir() / "gate" / "claude-code"
     where = settings_file(box)
@@ -167,9 +179,20 @@ def test_an_old_hook_allows_and_denies_with_a_note(old):
     assert no.returncode == 2 and "blocked" in no.stderr and "ws upgrade" in no.stderr and no.stdout == ""
 
 
+def test_an_old_hook_is_refused_when_its_home_is_forged(old):
+    """The real-world form: the session sets HOME, and the unpinned hook would protect the folders under that HOME."""
+    forged = old.parent / "forged"
+    forged.mkdir()
+    env = {**os.environ, "HOME": str(forged)}
+    got = subprocess.run(
+        ["sh", "-c", hook_command(old)], input=json.dumps(ALLOWED), capture_output=True, text=True, env=env, check=False
+    )
+    assert got.returncode == 2 and "HOME is not the account's home" in got.stderr
+
+
 def test_an_old_hook_denies_what_the_policy_denies_by_the_same_reason_as_a_new_one(old):
     old_no = run_hook(hook_command(old), DENIED)
-    assert upgrade.rewrite(os.environ)[0].changes
+    assert upgrade.rewrite(os.environ).changes
     new_no = run_hook(hook_command(old), DENIED)
     assert old_no.returncode == new_no.returncode == 2
     reason = [line for line in new_no.stderr.splitlines() if "blocked" in line]
@@ -252,15 +275,47 @@ def test_ws_stays_in_a_config_whose_profile_says_launch_and_is_refreshed_there(o
     assert 'gate = "launch"' in profile.read_text()  # the profile is the person's; an upgrade does not rewrite it
 
 
-def test_an_upgrade_never_takes_ws_out_of_a_config(old, capsys, monkeypatch):
-    out = install.Step(
-        settings_file(old), "merge", None, "take ws out", merge=userconfig.withdrawal("claude-code", os.environ)
-    )
-    monkeypatch.setattr(install, "gate_steps", lambda env=None: [out])
-    before = settings_file(old).read_bytes()
-    code, text, _ = upgrade_hooks(capsys)
-    assert code == 0 and "left ws's entries" in text
-    assert settings_file(old).read_bytes() == before
+def test_every_gated_runner_is_refreshed_not_only_the_one_the_profile_names(old, capsys):
+    """The profile names OpenCode now, but Claude Code's config still holds ws's hooks: they are rewritten, not left
+    stale and not taken out, and OpenCode's config is not switched on."""
+    profile = paths.config_dir() / "profile.toml"
+    profile.write_text(profile.read_text().replace('adapter = "claude-code"', 'adapter = "opencode"'))
+    assert userconfig.hooks_without_pin(os.environ) == ["claude-code"]  # doctor names a command that can fix it
+    code, _, err = upgrade_hooks(capsys)
+    assert code == 0, err
+    assert userconfig.hooks_without_pin(os.environ) == [] and hook_command(old)
+    assert not userconfig.target("opencode", os.environ).exists()
+    assert "opencode" not in profile.read_text().replace('adapter = "opencode"', "")
+
+
+def test_doctor_does_not_point_at_a_runner_that_upgrade_would_leave_alone(old, capsys):
+    """Old hooks in a file ws has no record of, for a runner the profile does not name: `ws upgrade` has nothing to rewrite."""
+    install.manifest_path().unlink()
+    profile = paths.config_dir() / "profile.toml"
+    profile.write_text(profile.read_text().replace('adapter = "claude-code"', 'adapter = "opencode"'))
+    assert userconfig.hooks_without_pin(os.environ) == []
+    assert doctor._upgrade_check(os.environ).status == "ok"
+
+
+def test_a_runner_with_hooks_but_no_record_is_adopted_by_the_rewrite(old, capsys):
+    """The install record was lost; the profile still names the runner and the file holds ws's hooks."""
+    install.manifest_path().unlink()
+    assert userconfig.hooks_without_pin(os.environ) == ["claude-code"]
+    code, _, err = upgrade_hooks(capsys)
+    assert code == 0, err
+    assert userconfig.hooks_without_pin(os.environ) == []
+
+
+def test_a_profile_runner_with_no_entries_is_not_switched_on(box, capsys):
+    """A fresh profile that names a runner (gate every-session) but whose config ws never wrote to: only files in ws's own
+    state folder are made."""
+    install_current(box, "--gate", "launch")
+    assert not settings_file(box).exists() or "hooks" not in settings(box)
+    profile = paths.config_dir() / "profile.toml"
+    profile.write_text(profile.read_text().replace('gate = "launch"', 'gate = "every-session"'))
+    code, _, err = upgrade_hooks(capsys)
+    assert code == 0, err
+    assert not settings_file(box).exists() or "hooks" not in settings(box)
 
 
 # --- (c) a tampered pin ------------------------------------------------------------------------------------------------
@@ -360,11 +415,36 @@ def test_a_failure_after_the_write_puts_the_config_and_the_record_back(old, caps
     working_old_pair(old)
 
 
+def test_files_that_could_not_be_put_back_are_named_and_the_exit_is_not_zero(old, capsys, monkeypatch):
+    def fail(*a, **k):
+        monkeypatch.setattr(os, "replace", boom)  # from here on nothing can be written back
+        raise install.InstallError("disk full")
+
+    def boom(*a, **k):
+        raise OSError("read-only file system")
+
+    with monkeypatch.context() as m:
+        m.setattr(install, "_commit", fail)
+        code, _, err = upgrade_hooks(capsys)
+    assert code == 4 and "could not put these back" in err and str(settings_file(old)) in err
+    assert "put the files back as they were" not in err and "disk full" in err
+    assert "--pin" in settings_file(old).read_text()  # and it is the half-written file, as the message says
+
+
+def test_a_failed_rewrite_after_the_swap_with_files_not_put_back_does_not_say_they_were(
+    swapped, old, capsys, monkeypatch
+):
+    monkeypatch.setattr(upgrade, "_run", lambda argv, capture: 4)
+    assert cli.main(["upgrade"]) == 4
+    out = capsys.readouterr().out
+    assert "not put back" in out and "still work" not in out
+
+
 def test_a_rewrite_that_leaves_a_hook_unpinned_is_put_back(old, capsys, monkeypatch):
     before = settings_file(old).read_bytes()
     monkeypatch.setattr(userconfig, "hooks_without_pin", lambda env=None: ["claude-code"])
     code, _, err = upgrade_hooks(capsys)
-    assert code == 1 and "put them back" in err
+    assert code == 1 and "put the files back as they were" in err
     assert settings_file(old).read_bytes() == before
 
 
@@ -455,3 +535,24 @@ def test_doctor_names_ws_upgrade_for_hooks_older_than_the_binary(old, capsys):
 
 def test_doctor_is_ok_with_no_ws_hooks_at_all(box):
     assert doctor._upgrade_check(os.environ).status == "ok"
+
+
+# --- the gate denies it too -------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "ws upgrade",
+        "ws upgrade --hooks-only",
+        "ws upgrade --dry-run",
+        "uv run ws upgrade --hooks-only",
+        "python3 -m ws upgrade",
+        "env -u CLAUDECODE -u WS_SANDBOXED script -qc 'ws upgrade --hooks-only' /dev/null",
+        "env -u CLAUDECODE -u WS_SANDBOXED script -qc 'ws upgrade' /dev/null",
+    ],
+)
+def test_the_gate_denies_ws_upgrade_whatever_the_environment_a_session_builds(line):
+    """The refusal in `ws upgrade` reads an environment and a terminal that a session can arrange; the gate does not."""
+    reason = policy.is_denied_command(policy.default_policy(), line, cwd="/tmp")
+    assert reason and "not for a gated session" in reason, line

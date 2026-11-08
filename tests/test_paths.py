@@ -425,6 +425,7 @@ def test_only_a_hook_with_no_pin_at_all_may_go_unpinned(home, monkeypatch):
     """`allow_unpinned` relaxes the missing pin and nothing else: a partial, malformed or different pin is still refused."""
     for var, val in env_of(home).items():
         monkeypatch.setenv(var, val)
+    monkeypatch.setattr(paths, "account_home", lambda: Path(home).resolve())  # what the account database would say
     pin = paths.pin_of()
     with paths.pinned_by(pin.args()[1::2]) as notes:
         assert notes == ()

@@ -45,7 +45,7 @@ from ws import __version__, approvals, install, output, selfcmd, userconfig
 from ws.output import WsError
 
 COMMAND = "upgrade"
-EXIT_FAILED, EXIT_REFUSED = 1, 3
+EXIT_FAILED, EXIT_REFUSED, EXIT_NOT_RESTORED = 1, 3, 4
 INSTALLER_URL = "https://raw.githubusercontent.com/Michael-A-Fry/ws/main/install.sh"
 _DOWNLOAD_LIMIT = 1 << 20  # bytes: install.sh is about 40 KB
 
@@ -91,8 +91,10 @@ class _Held:
                 held[p] = None
         return cls(held)
 
-    def restore(self) -> None:
-        """Write back what changed. A file that did not exist is left if it is there now: it is ws's own and harmless."""
+    def restore(self) -> list[Path]:
+        """Write back what changed, and return the files that could not be written back (none, when all went well). A file
+        that did not exist is left if it is there now: it is ws's own and harmless."""
+        failed: list[Path] = []
         for p, data in self.files.items():
             if data is None:
                 continue
@@ -104,47 +106,47 @@ class _Held:
                 os.chmod(tmp, p.stat().st_mode & 0o777 if p.exists() else 0o600)
                 os.replace(tmp, p)
             except OSError:
-                continue
+                failed.append(p)
+        return failed
 
 
-def _hook_steps(env: Mapping[str, str]) -> tuple[list[install.Step], list[str]]:
-    """The gate steps, without any that would take ws out of a config (that is `ws install --gate launch`, not an
-    upgrade), and the notes for what was left."""
-    steps, notes = [], []
-    for s in install.gate_steps(env):
-        if s.kind == "merge" and s.merge is not None and not s.merge.ops:
-            notes.append(
-                f"left ws's entries in {s.path} as they are (your profile says `launch`; `ws install` takes them out)"
-            )
-            continue
-        steps.append(s)
-    return steps, notes
+def _put_back(held: _Held, error: BaseException) -> WsError:
+    """The error to raise after a failed rewrite, once the files were put back: it says so only if they were. When some
+    could not be, it names them and where the first copy of the config is, and exits with `EXIT_NOT_RESTORED`."""
+    failed = held.restore()
+    cause = error.message if isinstance(error, WsError) else f"{type(error).__name__}: {error}"
+    if not failed:
+        hint = error.hint if isinstance(error, WsError) and error.hint else "nothing was changed; `ws doctor` says why"
+        return WsError("failed", f"{cause}; ws put the files back as they were", hint)
+    names = ", ".join(str(p) for p in failed)
+    return WsError(
+        "not_restored",
+        f"{cause}; and ws could not put these back as they were: {names}",
+        "the config's first copy is in the backups folder of ws's state: copy it over the file, or run "
+        "`ws install --gate launch` in a terminal of your own, then `ws doctor`",
+        EXIT_NOT_RESTORED,
+    )
 
 
-def rewrite(env: Mapping[str, str], dry_run: bool = False) -> tuple[install.Result, list[str]]:
+def rewrite(env: Mapping[str, str], dry_run: bool = False) -> install.Result:
     """Rewrite the runner's hooks (and the generated gate files) with this ws. On any failure the runner's config, the
-    install record and the OpenCode plugin are put back as they were, and the error is raised."""
-    steps, notes = _hook_steps(env)
+    install record and the OpenCode plugin are put back as they were, and the error is raised; if any could not be put
+    back it is `not_restored` (exit 4) and names them."""
+    steps = install.gate_steps(env)
     if dry_run:
-        return install.apply(steps, env, dry_run=True), notes
+        return install.apply(steps, env, dry_run=True)
     held = _Held.of(
         [install.manifest_path(env), *(s.path for s in steps if s.kind == "merge" or s.path.suffix == ".js")]
     )
     try:
         result = install.apply(steps, env)
-    except BaseException:
-        held.restore()
-        raise
-    rewritten = {s.merge.runner for s in steps if s.kind == "merge" and s.merge is not None and s.merge.ops}
-    left = [r for r in userconfig.hooks_without_pin(env) if r in rewritten]
-    if left:
-        held.restore()
-        raise WsError(
-            "failed",
-            f"the hooks in {', '.join(left)} still carry no pin after the rewrite; ws put them back as they were",
-            "run `ws doctor` and look at WS008",
-        )
-    return result, notes
+        rewritten = {s.merge.runner for s in steps if s.kind == "merge" and s.merge is not None and s.merge.ops}
+        left = [r for r in userconfig.hooks_without_pin(env) if r in rewritten]
+        if left:
+            raise WsError("failed", f"the hooks in {', '.join(left)} still carry no pin after the rewrite", "")
+    except BaseException as e:
+        raise _put_back(held, e) from e
+    return result
 
 
 # ---- swapping the binary ----------------------------------------------------------------------------------------------------
@@ -214,7 +216,7 @@ def _say(args: argparse.Namespace, text: str) -> None:
 
 def _hooks_only(args: argparse.Namespace, env: Mapping[str, str]) -> int:
     try:
-        result, notes = rewrite(env, dry_run=args.dry_run)
+        result = rewrite(env, dry_run=args.dry_run)
     except (install.InstallError, OSError) as e:
         raise WsError("failed", str(e), "nothing was changed; `ws doctor` says what is wrong") from e
     if args.json:
@@ -223,11 +225,11 @@ def _hooks_only(args: argparse.Namespace, env: Mapping[str, str]) -> int:
                 "version": __version__,
                 "hooks": "dry-run" if args.dry_run else "rewritten" if result.changes else "current",
                 "changes": result.changes,
-                "notes": notes,
+                "notes": list(result.notes),
             }
         )
         return 0
-    for note in [*result.notes, *notes]:
+    for note in result.notes:
         print(f"ws: {note}")
     verb = "would make" if args.dry_run else "made"
     print(
@@ -259,6 +261,13 @@ def _both(args: argparse.Namespace, env: Mapping[str, str]) -> int:
         return code or EXIT_FAILED
     _say(args, "installed; now rewriting the hooks with the new ws")
     code = _run(_hooks_argv(), args.json)
+    if code == EXIT_NOT_RESTORED:
+        _say(
+            args,
+            "the new ws is installed, and the hooks rewrite failed in a way that left files that were not put back "
+            "(named above). Fix them as the message says, then run `ws doctor`",
+        )
+        return code
     if code != 0:
         _say(
             args,

@@ -500,6 +500,17 @@ def add_pin_option(parser) -> None:
     )
 
 
+def account_home() -> Path | None:
+    """The home folder the system's account database gives this user, or None when it cannot be asked (no `pwd`, as on
+    native Windows, or no entry). `pwd` is imported here, not at the top, so the module still loads without it."""
+    try:
+        import pwd
+
+        return Path(os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir))
+    except (ImportError, KeyError, OSError):
+        return None
+
+
 @contextlib.contextmanager
 def pinned_by(values: list[str] | None, *, allow_unpinned: bool = False):
     """Read the hook's `--pin` arguments, refuse (`layout_changed`) unless the environment resolves to them, and answer
@@ -509,13 +520,22 @@ def pinned_by(values: list[str] | None, *, allow_unpinned: bool = False):
     `--pin` at all, one an earlier ws wrote. Refusing it would block every call of every session the
     moment a newer ws is installed, with the fix (`ws upgrade`) out of reach from inside that session. It runs the whole
     check, with the note. The layout it resolves to is the one the environment gives now, which is what the earlier ws
-    used on every call; the hook still names its policy file by absolute path, so the rules are the installed ones, and
-    the protected folders cover every layout (`protected_roots`). That is no wider than the release it came from, and it
-    lasts only until `ws upgrade`. A pin that is partial, malformed or different from what the environment resolves to
-    is refused exactly as before, and a layout that cannot be told is a refusal too."""
+    used on every call: `WS_HOME`, an XDG variable or `HOME`. The hook still names its policy file by absolute path, so
+    the rules are the installed ones. The protected folders are those of the layouts that environment can give, and
+    `HOME` moves all of them, so the unpinned path is taken only while `HOME` is the account's own home folder
+    (`account_home`); a different `HOME`, or an account that can't be asked, is refused like a changed pin. It lasts only
+    until `ws upgrade`. A pin that is partial, malformed or different from what the environment resolves to is refused
+    exactly as before, and a layout that cannot be told is a refusal too."""
     pin = read_pin(values)
     notes: tuple[str, ...] = ()
     if pin is None and allow_unpinned:
+        real = account_home()
+        if real is None or Path(os.path.realpath(home_dir())) != real:
+            raise WsError(
+                "layout_changed",
+                "this hook does not pin ws's folders, and HOME is not the account's home folder",
+                "run `ws upgrade --hooks-only` in a terminal of your own",
+            )
         try:
             pin = pin_of()
         except WsError as e:

@@ -550,6 +550,30 @@ ws uninstall [-h] [--dry-run] [-y]
 | `--dry-run` | Show what would be removed. |
 | `-y`, `--yes` | No prompt. |
 
+## `ws upgrade`
+
+Swap ws for a newer release and rewrite the runner's hooks in the same step.
+
+```text
+ws upgrade [-h] [--version TAG] [--channel {stable,rc,edge}] [--installer FILE] [--hooks-only] [--dry-run]
+```
+
+| Argument | Meaning |
+|---|---|
+| `--version TAG` | Install this release (a tag like `v0.2.0`) instead of the latest. |
+| `--channel NAME` | The release channel to follow: `stable`, `rc` or `edge`. |
+| `--installer FILE` | Run this copy of `install.sh` instead of downloading it. |
+| `--hooks-only` | Rewrite the hooks only; a newer ws is already installed. |
+| `--dry-run` | Show what would change; change nothing. |
+
+It runs the installer, then rewrites ws's hooks with the new ws in a new process (`--hooks-only`). The rewrite touches the
+gate only: each runner whose config already holds ws's entries gets them refreshed. It switches nothing on and takes
+nothing out, and a config written without the sandbox block stays without it. If the rewrite fails, the runner's config,
+the install record and the OpenCode plugin are put back as they were. Run it in a terminal of your own: a session, gated
+or not, is refused (exit 3), and so is a run with no terminal. Exit 0 when done, 1 when the installer or the rewrite
+failed, 3 when refused, 4 when files could not be put back after a failed rewrite (they are named). See
+[Upgrade and uninstall](../how-to/upgrade-and-uninstall.md#upgrade).
+
 ## `ws migrate`
 
 Move ws's files from `~/.ws` to the XDG folders. Nothing is deleted.

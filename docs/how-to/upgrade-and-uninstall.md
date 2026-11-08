@@ -12,7 +12,8 @@ Move to a newer release, or remove ws and what it installed.
 
    It runs the installer (the latest stable release, checked as `install.sh` checks it), then rewrites ws's hooks in
    your runner's config with the new ws. It is one step because the hooks run whichever ws is installed, and a new ws
-   under old hooks is the state this avoids. `ws upgrade` can't run inside a session, gated or not, and says so.
+   under old hooks is the state this avoids. `ws upgrade` can't run inside a session, gated or not: the gate refuses
+   the command, and it refuses itself when it sees a session or no terminal.
 
    To pick a release, add `--version vX.Y.Z`. To follow another channel, add `--channel rc` or `--channel edge` (see
    [Release channels](install.md#release-channels)). `--installer FILE` runs a copy of `install.sh` you have checked
@@ -29,7 +30,8 @@ Move to a newer release, or remove ws and what it installed.
 
    A release before 0.1.9 has no `ws upgrade`. Run the installer yourself (`curl -fsSL
    https://raw.githubusercontent.com/Michael-A-Fry/ws/main/install.sh | bash`), then run `ws upgrade --hooks-only`.
-   Sessions work in between, each call with the note. `ws doctor` shows the same state as `WS013`.
+   Sessions work in between, each call with the note, as long as `HOME` is your own home folder; with another `HOME`
+   an unpinned hook is refused. `ws doctor` shows the same state as `WS013`.
 
 2. Check the version and the machine.
 
@@ -52,9 +54,10 @@ run `ws install --gate every-session`. [Known limits](../explanation/known-limit
 what goes into the file and what stays outside the gate.
 
 An upgrade doesn't switch on anything you didn't have. If ws's entries in your config were written without the
-sandbox block (releases before the sandbox was on by default wrote them that way), the block stays out, whether
-`ws upgrade` or `ws install` rewrites them. To turn it on, set `sandbox = true` under `[gate]` in your policy and run
-`ws install`. `ws upgrade` also never takes ws out of a config: `ws install --gate launch` does that.
+sandbox block, the block stays out, whether `ws upgrade` or `ws install` rewrites them, until your policy says
+`sandbox = true` under `[gate]` (then run `ws install`). It also keeps current the entries of every runner whose config
+already holds them, not only the one your profile names. `ws upgrade` also never takes ws out of a config:
+`ws install --gate launch` does that.
 
 Once ws's entries are in your runner's config, a later `ws install` or setup run keeps them there and says so, even when
 that run doesn't name a runner. The install manifest keeps every record, and every key from a newer ws, that a run

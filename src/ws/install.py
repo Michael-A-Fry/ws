@@ -369,17 +369,34 @@ def plan(answers: Answers, env: Mapping[str, str] | None = None, osi=None) -> li
 
 
 def gate_steps(env: Mapping[str, str] | None = None) -> list[Step]:
-    """Only the runner's gate: its generated files and its user config, as the profile already says, with no answer
-    changed. This is what `ws upgrade` rewrites; the profile, the modules and the folders are left alone. A runner whose
-    user config already holds ws's entries keeps them, current, even when the profile says `launch` (taking them out is
-    `ws install --gate launch`, not an upgrade)."""
+    """Only the gate: each runner's generated files and, for every runner whose user config already holds ws's entries,
+    those entries rewritten (whatever runner the profile names now, and whatever its `gate` says). This is what
+    `ws upgrade` applies; the profile, the modules and the folders are left alone. It never switches a config on and never
+    takes ws out of one: the profile's runner gets its entries refreshed only if they are there already (the file holds
+    ws's hooks, with or without the install record), else only its generated files; taking ws out is
+    `ws install --gate launch`."""
     env = os.environ if env is None else env
     policy_step, parsed = _policy_step(env)
+    policy_file = policy_step.path.resolve()
     entries, _ = _read_manifest(env)
     answers = answers_from_profile(env)
-    if answers.runner and _merge_entry(entries, answers.runner, env) is not None:
-        answers = replace(answers, gate="every-session")
-    return _gate_steps(answers, _load_profile(env), parsed, policy_step.path.resolve(), entries, env)
+    if answers.runner:
+        there = _merge_entry(entries, answers.runner, env) is not None or (
+            userconfig.supports(answers.runner) and userconfig.holds_ws_entries(answers.runner, env)
+        )
+        answers = replace(answers, gate="every-session" if there else "launch")
+    steps: list[Step] = []
+    for step in _gate_steps(answers, _load_profile(env), parsed, policy_file, entries, env):
+        entry = _merge_entry(entries, step.merge.runner, env) if step.merge is not None else None
+        if step.kind == "merge" and step.merge is not None and not step.merge.ops and entry is not None:
+            runner = step.merge.runner  # the profile names another runner now: this one's entries stay, current
+            made = userconfig.plan(runner, parsed, policy_file, env, entry)
+            out = _dir("state", env) / "gate" / runner
+            steps += [Step(out / name, "file", text, f"{runner} deny rules") for name, text in made.files.items()]
+            steps += _merge_steps(runner, made, True)
+        else:
+            steps.append(step)
+    return steps
 
 
 def _gate_steps(

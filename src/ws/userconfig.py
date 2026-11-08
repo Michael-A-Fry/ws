@@ -1107,13 +1107,32 @@ def check(env: Mapping[str, str] | None = None) -> tuple[str, str, str]:
     return (WARN, "; ".join([detail, *notes]), "") if notes else (OK, detail, "")
 
 
+def holds_ws_entries(runner: str, env: Mapping[str, str]) -> bool:
+    """Does the runner's user config hold ws's hooks (Claude Code) or its plugin (OpenCode)? Read from the file, whether or
+    not the install record is there."""
+    try:
+        if runner == "claude-code":
+            return _holds_ws_hooks(load(target(runner, env))[0])
+        return plugin_path(env).is_file()
+    except (WsError, OSError):
+        return False
+
+
 def hooks_without_pin(env: Mapping[str, str] | None = None) -> list[str]:
     """The runners whose ws hooks in their user config carry no `--pin`: written by a ws older than the one running, which
     pinned ws's folders in every hook only later. Each name once, in RUNNERS order. A runner with no ws hooks in its
-    file, or a file that can't be read, is left out (WS008 says what is wrong with the file)."""
+    file, or a file that can't be read, is left out (WS008 says what is wrong with the file), and so is one that ws has no
+    record of and the profile does not name: `ws upgrade` rewrites the runners it knows, and this must not point at it for
+    one it would leave alone."""
     env = os.environ if env is None else env
+    try:
+        named = _profile_runner(env)[0]
+    except profile.ProfileError:
+        named = ""
     found: list[str] = []
     for runner in RUNNERS:
+        if runner != named and _manifest_entry(runner, env) is None:
+            continue
         try:
             if runner == "claude-code":
                 doc, _ = load(target(runner, env))

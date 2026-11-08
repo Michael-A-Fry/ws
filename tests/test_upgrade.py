@@ -674,6 +674,10 @@ def older_plugin(box: Path) -> Path:
     text = plug.read_text()
     assert '"--pin"' in text
     plug.write_text(text.replace('"--pin"', '"--no-pin"'))  # the older shape: nothing in it names a pin
+    entries = install._read_manifest()[0]
+    base = {k: dict(v) for k, v in entries.items()}
+    entries[str(plug)]["sha256"] = userconfig._sha(plug.read_bytes())  # as that ws recorded it
+    install._commit(os.environ, base, entries, [])
     return plug
 
 
@@ -716,12 +720,14 @@ def test_upgrade_puts_the_plugin_back_when_the_rewrite_fails_after_taking_it_out
     assert (plug.read_bytes(), manifest_bytes(box)) == before
 
 
-@pytest.mark.parametrize("case", ["theirs", "no record", "not made by ws", "link", "current"])
+@pytest.mark.parametrize("case", ["theirs", "edited", "no record", "not made by ws", "link", "current"])
 def test_upgrade_leaves_a_plugin_of_the_persons_own_alone(box, capsys, case):
     plug = older_plugin(box)
     entries = install._read_manifest()[0]
     if case == "theirs":
         plug.write_text("export default async () => ({})\n")  # their own file, in ws's place
+    elif case == "edited":
+        plug.write_text(plug.read_text() + "// a line of the person's own\n")  # ws's first line, not ws's bytes
     elif case == "no record":
         install.forget([plug])
     elif case == "not made by ws":

@@ -271,7 +271,7 @@ def _hooks_only(args: argparse.Namespace, env: Mapping[str, str]) -> int:
         print(f"ws: {_skipped_line(sk)}")
     if left:
         print(
-            f"ws: the hooks in {', '.join(left)} still have the old form. Do what is named above, "
+            f"ws: the hooks in {', '.join(left)} could not be rewritten this run. Do what is named above, "
             "then run `ws upgrade --hooks-only` again",
             file=sys.stderr,
         )

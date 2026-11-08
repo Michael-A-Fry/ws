@@ -1177,9 +1177,8 @@ def withdrawn_plugin(env: Mapping[str, str]) -> Path | None:
     record holds the file but no merge into the config), and it is an older one that carries no `--pin`: left in place it
     is still loaded, and on a layout that is not the default every call it judges is refused. None for anything else: no
     such record, a file that is not a plain file, one that ws did not make or one that is not ws's own (it must be as ws
-    last wrote it, byte for byte, or begin with the first line ws writes), and one that is current."""
+    last wrote it, byte for byte: an edited file is the person's), and one that is current."""
     from ws import install  # late: ws.install imports this module
-    from ws.adapters.opencode_plugin import SOURCE
 
     plug = plugin_path(env)
     entries, _ = install._read_manifest(env)
@@ -1193,8 +1192,7 @@ def withdrawn_plugin(env: Mapping[str, str]) -> Path | None:
         text = data.decode("utf-8")
     except (OSError, UnicodeDecodeError):
         return None
-    ours = _sha(data) == rec.get("sha256") or text.startswith(SOURCE.split("\n", 1)[0] + "\n")
-    return plug if ours and '"--pin"' not in text else None
+    return plug if _sha(data) == rec.get("sha256") and '"--pin"' not in text else None
 
 
 def _rule(text: str) -> tuple[str, str | None]:

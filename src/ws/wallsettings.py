@@ -260,7 +260,11 @@ def doctor_check(env: Mapping[str, str], kind: str) -> tuple[str, str, str]:
         doc = {}
     have = doc.get("sandbox") if isinstance(doc, dict) else None
     if not (isinstance(have, dict) and have):
-        return WARN, f"unsandboxed: {where} has no sandbox block; {STRICT}; {FOR_FEWER}", "run `ws install`"
+        return (
+            WARN,
+            f"unsandboxed: {where} has no sandbox block; {STRICT}; {FOR_FEWER}",
+            "to switch it on, set sandbox = true under [gate] in the policy, then run `ws install`",
+        )
     block = userconfig.expected_sandbox(pol, pol_file, env)
     problems: list[str] = []
     home = _home(env)

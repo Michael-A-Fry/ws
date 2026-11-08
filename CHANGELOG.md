@@ -8,6 +8,22 @@ body of the GitHub release.
 
 ## [Unreleased]
 
+### Added
+
+- `ws upgrade` swaps ws for a newer release and rewrites the runner's hooks in the same step, from a terminal of your
+  own. A failed rewrite puts the runner's config and the install record back, and the message says which files, if any,
+  it couldn't. The gate refuses the command in a session. Doctor check WS013 reports hooks older than the ws that
+  runs them.
+
+### Fixed
+
+- A hook that carries no pin on ws's folders (written by an earlier ws) runs the full check and prints a note that
+  names `ws upgrade --hooks-only`, as long as ws's folders are where the account's home and the hook's own policy
+  file say they're; otherwise it's refused, with the same command to run. A pin that's partial, malformed
+  or different is refused as before.
+- `ws install` and `ws upgrade` leave the sandbox out of a runner config whose ws entries were written without it, until
+  the policy says `sandbox = true`.
+
 ## [0.1.8] - 2026-11-08
 
 A security release. The runner's sandbox is now on in every install mode and is the boundary; the gate reads more

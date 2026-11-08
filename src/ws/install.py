@@ -95,6 +95,15 @@ class Step:
     carried: bool = False  # kind "merge": an earlier install merged the gate and this plan keeps it
 
 
+@dataclass(frozen=True)
+class Skipped:
+    """A runner whose gate `gate_plan` could not rewrite, left exactly as it was: why, and what to do."""
+
+    runner: str
+    reason: str
+    hint: str
+
+
 @dataclass
 class Result:
     created: list[Path] = field(default_factory=list)
@@ -105,16 +114,19 @@ class Result:
     tidied: list[Path] = field(
         default_factory=list
     )  # empty folders ws removed after taking its items out of a user config
+    removed: list[Path] = field(default_factory=list)  # files `ws upgrade` took out (a withdrawn OpenCode plugin)
+    skipped: list[Skipped] = field(default_factory=list)  # runners `ws upgrade` could not rewrite, and why
 
     @property
     def changes(self) -> int:
-        return len(self.created) + len(self.changed)
+        return len(self.created) + len(self.changed) + len(self.removed)
 
     def summary(self) -> str:
         left = f", {len(self.edited)} left because you edited them" if self.edited else ""
         if self.changes == 0:
             return f"0 changes ({len(self.unchanged)} unchanged{left})"
-        return f"{len(self.created)} created, {len(self.changed)} changed, {len(self.unchanged)} unchanged{left}"
+        gone = f", {len(self.removed)} removed" if self.removed else ""
+        return f"{len(self.created)} created, {len(self.changed)} changed{gone}, {len(self.unchanged)} unchanged{left}"
 
 
 @dataclass
@@ -368,12 +380,65 @@ def plan(answers: Answers, env: Mapping[str, str] | None = None, osi=None) -> li
     return steps + _gate_steps(answers, prof, parsed, policy_step.path.resolve(), entries, env)
 
 
+def gate_steps(env: Mapping[str, str] | None = None) -> list[Step]:
+    """The steps of `gate_plan`, without the runners it could not plan for."""
+    return gate_plan(env)[0]
+
+
+def gate_plan(env: Mapping[str, str] | None = None) -> tuple[list[Step], list[Skipped]]:
+    """Only the gate: each runner's generated files and, for every runner whose user config already holds ws's entries,
+    those entries rewritten (whatever runner the profile names now, and whatever its `gate` says). This is what
+    `ws upgrade` applies; the profile, the modules and the folders are left alone. It never switches a config on and never
+    takes ws out of one: the profile's runner gets its entries refreshed only if they are there already (the file holds
+    ws's hooks, with or without the install record), else only its generated files; taking ws out is
+    `ws install --gate launch`.
+
+    A runner ws has a record of, that the profile does not name, and whose config ws can't merge into now (a link, JSONC,
+    an entry of yours in the way) is left as it is and returned as `Skipped` with the reason, so the caller can say so:
+    its hooks are not rewritten. A runner ws never gated is not in the list."""
+    env = os.environ if env is None else env
+    policy_step, parsed = _policy_step(env)
+    policy_file = policy_step.path.resolve()
+    entries, _ = _read_manifest(env)
+    answers = answers_from_profile(env)
+    if answers.runner:
+        there = _merge_entry(entries, answers.runner, env) is not None or (
+            userconfig.supports(answers.runner) and userconfig.holds_ws_entries(answers.runner, env)
+        )
+        answers = replace(answers, gate="every-session" if there else "launch")
+    steps: list[Step] = []
+    skipped: list[Skipped] = []
+    for step in _gate_steps(answers, _load_profile(env), parsed, policy_file, entries, env, skipped):
+        entry = _merge_entry(entries, step.merge.runner, env) if step.merge is not None else None
+        if step.kind == "merge" and step.merge is not None and not step.merge.ops and entry is not None:
+            runner = step.merge.runner  # the profile names another runner now: this one's entries stay, current
+            try:
+                made = userconfig.plan(runner, parsed, policy_file, env, entry)
+                userconfig.classify(made.merge, entry)  # a link, JSONC or a conflict is raised here, not at the write
+            except WsError as e:  # a config ws can't merge into: left as it is, and said so
+                skipped.append(Skipped(runner, e.message, e.hint))
+                continue
+            out = _dir("state", env) / "gate" / runner
+            steps += [Step(out / name, "file", text, f"{runner} deny rules") for name, text in made.files.items()]
+            steps += _merge_steps(runner, made, True)
+        else:
+            steps.append(step)
+    return steps, skipped
+
+
 def _gate_steps(
-    answers: Answers, prof: dict, parsed: policy.Policy, policy_file: Path, entries: Mapping[str, dict], env
+    answers: Answers,
+    prof: dict,
+    parsed: policy.Policy,
+    policy_file: Path,
+    entries: Mapping[str, dict],
+    env,
+    skipped: list[Skipped] | None = None,
 ) -> list[Step]:
     """The runner's gate files, and its user config merged (every-session) or taken out (anything else). A user config
     that holds ws's items from an earlier install stays merged unless the answers or the profile say `launch`: a plan
-    that names no runner (a setup screen on a machine with none found) leaves it alone and refreshes it."""
+    that names no runner (a setup screen on a machine with none found) leaves it alone and refreshes it. A runner whose
+    fresh merge can't be built is left as it is, and added to `skipped` when the caller passes a list."""
     steps: list[Step] = []
     tbl = _sub(_sub(prof, "roles"), "runner")
     keep: set[str] = set()  # runners whose user config this plan leaves merged
@@ -404,9 +469,9 @@ def _gate_steps(
                 made = userconfig.plan(
                     other, parsed, policy_file, env, _merge_entry(entries, other, env), answers.allow_widened
                 )
-            except (
-                WsError
-            ):  # can't build a fresh merge now: the record stays as it is, and doctor says if it went stale
+            except WsError as e:  # can't build a fresh merge now: the record stays as it is, and the caller is told
+                if skipped is not None:
+                    skipped.append(Skipped(other, e.message, e.hint))
                 continue
             out = _dir("state", env) / "gate" / other
             steps += [Step(out / name, "file", text, f"{other} deny rules") for name, text in made.files.items()]

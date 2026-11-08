@@ -4,15 +4,44 @@ Move to a newer release, or remove ws and what it installed.
 
 ## Upgrade
 
-1. Run the installer again. It takes the latest stable release.
+1. Run `ws upgrade` in a terminal of your own.
 
    ```sh
-   curl -fsSL https://raw.githubusercontent.com/Michael-A-Fry/ws/main/install.sh | bash
+   ws upgrade
    ```
 
-   To pick a release, add `-s -- --version vX.Y.Z` after `bash`. To follow another channel, add `-s -- --channel rc` or
-   `-s -- --channel edge` (see [Release channels](install.md#release-channels)). To check the file first, see
-   [Verify a release](verify-a-release.md).
+   It runs the installer (the latest stable release, checked as `install.sh` checks it), then rewrites ws's hooks in
+   your runner's config with the new ws. It's one step because the hooks run whichever ws is installed, and a new ws
+   under old hooks is the state this avoids. `ws upgrade` can't run inside a session, gated or not: the gate refuses
+   the command, and it refuses itself when it sees a session or no terminal.
+
+   To pick a release, add `--version vX.Y.Z`. To follow another channel, add `--channel rc` or `--channel edge` (see
+   [Release channels](install.md#release-channels)). `--installer FILE` runs a copy of `install.sh` you have checked
+   (see [Verify a release](verify-a-release.md)) instead of downloading it, and `--dry-run` shows the hook changes
+   and installs nothing.
+
+   `ws upgrade` ends in one of three states, and says which:
+
+   - **The installer failed.** You still have the old ws and the old hooks, unchanged.
+   - **The installer worked and the hook rewrite failed.** You have the new ws and your old hooks, put back byte for
+     byte. They still work: a hook an earlier ws wrote has no pin on ws's folders, so the new ws runs the whole check
+     for it and prints a note that names `ws upgrade`. Fix what the message says, then run `ws upgrade --hooks-only`.
+   - **Both worked.** The new ws and the new hooks.
+
+   The hook rewrite refreshes the entries of every runner whose config already holds them. If one of those configs
+   can't be merged into now (it's a link, it has comments, or a value of yours is in the way), `ws upgrade --hooks-only`
+   leaves it as it was, says which runner and why, rewrites the others, and exits 1; `ws doctor` names the same runner
+   in `WS013`. Fix what it says and run it again. A runner ws never put entries in isn't mentioned. It also takes out an
+   older OpenCode plugin that ws put there and has since withdrawn from (the file is still loaded, and ws's record of
+   it says so), and says it removed it; a plugin file of your own is never touched.
+
+   A release before 0.1.9 has no `ws upgrade`. Run the installer yourself (`curl -fsSL
+   https://raw.githubusercontent.com/Michael-A-Fry/ws/main/install.sh | bash`), then run `ws upgrade --hooks-only`.
+   Sessions work in between, each call with the note, when ws's folders are the default ones (`~/.ws`, or the XDG
+   folders under your account's home) and the environment doesn't point them anywhere else. A hook with no pin works
+   out its folders from your account's home and the policy file it names, never from `HOME` or a ws or XDG variable. A
+   custom layout, or any such variable that disagrees, is refused with `ws upgrade --hooks-only` as the fix. `ws doctor`
+   shows the same state as `WS013`.
 
 2. Check the version and the machine.
 
@@ -21,18 +50,24 @@ Move to a newer release, or remove ws and what it installed.
    ws doctor
    ```
 
-3. Bring what ws installed up to date. This rewrites the generated gate files under `~/.local/state/ws/gate/` from your
-   policy, and reports `0 changes` when nothing differs.
+3. Bring the rest of what ws installed up to date. This rewrites the generated gate files under
+   `~/.local/state/ws/gate/` from your policy, and reports `0 changes` when nothing differs.
 
    ```sh
    ws setup --yes
    ```
 
-If your profile has `gate = "every-session"` under `[roles.runner]`, this step also brings ws's entries in your
-runner's own config file (for Claude Code, `~/.claude/settings.json`) up to date, in place. A profile that named a runner
-before this setting existed stays on `launch`, so an upgrade doesn't touch that file. To move to every-session, run
-`ws install --gate every-session`. [Known limits](../explanation/known-limits.md#the-gate-in-every-session) says what goes into the
-file and what stays outside the gate.
+If your profile has `gate = "every-session"` under `[roles.runner]`, `ws upgrade` and this step bring ws's entries in
+your runner's own config file (for Claude Code, `~/.claude/settings.json`) up to date, in place. A profile that named a
+runner before this setting existed stays on `launch`, so an upgrade doesn't touch that file. To move to every-session,
+run `ws install --gate every-session`. [Known limits](../explanation/known-limits.md#the-gate-in-every-session) says
+what goes into the file and what stays outside the gate.
+
+An upgrade doesn't switch on anything you didn't have. If ws's entries in your config were written without the
+sandbox block, the block stays out, whether `ws upgrade` or `ws install` rewrites them, until your policy says
+`sandbox = true` under `[gate]` (then run `ws install`). It also keeps current the entries of every runner whose config
+already holds them, not only the one your profile names. `ws upgrade` also never takes ws out of a config:
+`ws install --gate launch` does that.
 
 Once ws's entries are in your runner's config, a later `ws install` or setup run keeps them there and says so, even when
 that run doesn't name a runner. The install manifest keeps every record, and every key from a newer ws, that a run

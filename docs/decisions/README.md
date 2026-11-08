@@ -25,5 +25,6 @@ decisions weren't about the engine.
 | [0019](0019-one-resident-gate-answers-the-hooks.md) | One resident gate answers the hooks, over a private Unix socket | accepted | 2026-11-08 |
 | [0022](0022-reserve-before-a-run.md) | Reserve before a run, settle after it | accepted | 2026-11-08 |
 | [0023](0023-one-message-store-with-class-bodies-apart.md) | One message store, with the bodies of walled classes kept apart | accepted | 2026-11-08 |
+| [0024](0024-a-config-without-the-sandbox-stays-without-it.md) | A config written without the sandbox stays without it until the policy says so | accepted | 2026-11-09 |
 
 To add one, copy the newest record, take the next number and add a row here.

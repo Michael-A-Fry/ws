@@ -252,6 +252,26 @@ def _hooks_check(prof: dict, env) -> list[Check]:
     return [Check("WS011", "hooks", OK, f"Claude Code {version}: a hook that fails blocks the call")]
 
 
+def _upgrade_check(env) -> Check:
+    """WS013: the hooks in the runner's config are as new as the ws that runs them. A hook written before ws pinned its
+    folders still works (it runs the full check and says so on every call), so this is a `warn`, not a `fail`. A runner
+    whose config can't be read is named too (a link, JSONC): what its hooks carry is not known, and `ws upgrade` leaves
+    it alone."""
+    state = userconfig.hook_state(env)
+    if not state.old and not state.unreadable:
+        return Check("WS013", "upgrade", OK, "ws's hooks are as new as this ws")
+    parts = []
+    if state.old:
+        parts.append(
+            f"the hooks in {', '.join(state.old)} are older than this ws and carry no pin; each call prints a note"
+        )
+    parts += [f"the hooks in {runner} can't be checked: {why}" for runner, why in state.unreadable.items()]
+    fix = "run `ws upgrade --hooks-only` in a terminal of your own (a gated session can't)"
+    if state.unreadable:
+        fix = "make the config a plain JSON file ws can read, then " + fix
+    return Check("WS013", "upgrade", WARN, "; ".join(parts), fix)
+
+
 def _layout_check(env) -> Check:
     """WS010: where ws keeps its files. `ok` for the XDG folders or a folder you named; `warn` while they are still in
     `~/.ws` from an earlier ws (nothing moves by itself: `ws migrate` does it); `fail` when both exist, because ws can't
@@ -337,6 +357,10 @@ def run_checks(osi: OSInfo, profile_file: Path, env: dict | None = None, network
     except Exception as e:  # noqa: BLE001 (a broken check must report, not crash the whole doctor)
         status, detail, fix = FAIL, f"check crashed ({type(e).__name__})", ""
     checks.append(Check("WS012", "sandbox", status, detail, fix))
+    try:
+        checks.append(_upgrade_check(env))
+    except Exception as e:  # noqa: BLE001 (a broken check must report, not crash the whole doctor)
+        checks.append(Check("WS013", "upgrade", FAIL, f"check crashed ({type(e).__name__})"))
     try:
         checks.append(_layout_check(env))
     except Exception as e:  # noqa: BLE001 (a broken check must report, not crash the whole doctor)

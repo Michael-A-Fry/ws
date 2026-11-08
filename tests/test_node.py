@@ -285,15 +285,24 @@ def _container() -> tuple[str, str] | None:
 
 
 def test_install_uninstall_diff_to_zero_in_a_container(tmp_path):
+    """In a container when docker or podman and a local image are there; else on the host, in a home that already holds a file."""
     found = _container()
     if found is None:
-        pytest.skip("needs docker or podman and a local image (set WS_TEST_NODE_IMAGE; this never pulls one)")
-    runtime, image = found
-    argv = [
-        runtime, "run", "--rm", "--network", "none", "-v", f"{ROOT / 'src'}:/ws-src:ro",
-        "-e", "HOME=/tmp/h", "-e", "SNAPS=/tmp/snaps", "-e", "PY=python3", "-e", "PYTHONPATH=/ws-src",
-        "-e", f"SNAPSHOT={SNAPSHOT}", image, "sh", "-c", ROUND_TRIP,
-    ]  # fmt: skip
-    done = subprocess.run(argv, capture_output=True, text=True, timeout=300, check=False)
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / ".profile").write_text("export A=1\n")  # something already there must come through untouched
+        env = round_trip_env(home, tmp_path / "snaps", sys.executable, str(ROOT / "src"))
+        done = subprocess.run(
+            ["sh", "-c", ROUND_TRIP], env=env, capture_output=True, text=True, timeout=120, check=False
+        )
+        assert (home / ".profile").read_text() == "export A=1\n"
+    else:
+        runtime, image = found
+        argv = [
+            runtime, "run", "--rm", "--network", "none", "-v", f"{ROOT / 'src'}:/ws-src:ro",
+            "-e", "HOME=/tmp/h", "-e", "SNAPS=/tmp/snaps", "-e", "PY=python3", "-e", "PYTHONPATH=/ws-src",
+            "-e", f"SNAPSHOT={SNAPSHOT}", image, "sh", "-c", ROUND_TRIP,
+        ]  # fmt: skip
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=300, check=False)
     assert done.returncode == 0, done.stdout + done.stderr
     assert done.stdout.strip().endswith("diff-is-zero")

@@ -8,7 +8,7 @@ body of the GitHub release.
 
 ## [Unreleased]
 
-## [0.1.8] - 2026-11-13
+## [0.1.8] - 2026-11-08
 
 A security release. The runner's sandbox is now on in every install mode and is the boundary; the gate reads more
 command forms that run other text, and is tested against a real shell. ws's files move to the XDG folders.

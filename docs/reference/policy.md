@@ -8,6 +8,10 @@ commands.
 The file is loaded whole or refused. An unknown key, a wrong type or a bad value stops the load, and the message names the
 key. The gate then denies every call (it fails closed). The schema is `1`.
 
+The tables `[classes]`, `[budget.purposes]` and `[autonomy]`, and the `owner` and `expires` keys of `[[exceptions]]`, are
+newer than the rest. A policy that leaves them out loads exactly as before. An older ws refuses a policy that uses them,
+because it doesn't know the keys: that's the intended fail-closed behaviour, so update ws before you add them.
+
 ## Top-level keys
 
 | Key | Type | Default | Meaning |
@@ -185,9 +189,58 @@ Named checks that run beside the `[gate]` rules. The [guards reference](guards.m
 
 A file with no `[guards]` table has no guards on. `bulk-staging` and `record-calls` take no table.
 
+## `[classes.NAME]`
+
+Data classes: which of your repos hold what kind of content, and what a session working in them may do and see. `NAME`
+uses letters, digits, `_` and `-` (`unclassified` is taken). A policy with no `[classes]` table has no classes, and
+everything behaves as it did before. Every table is checked whole; one bad key refuses the file.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `access` | text | required | `full`, `walled` or `counts-only`. |
+| `repos` | list of text | required | Path globs, in the same syntax as `deny_read` (`~/` is your home, `**` crosses folders, a bare name matches at any depth). At least one. A rule that names a folder covers everything under it. |
+| `os_user` | text | none | The POSIX user name sessions of this class must run as. |
+| `allowed_providers` | list of plain names | not set | The model providers a session of this class may use. Left out, the file says nothing and the consumer applies its own default (a walled class gets the strictest); `[]` allows none. |
+| `local_only` | true or false | `false` | Only a model that runs on this machine. |
+| `allowed_hosts` | list of text | `[]` | Hosts the class's sessions may reach. The same syntax as `[gate]` `allow_hosts`. |
+| `readable_by` | list of text | `[]` | The classes whose sessions may read this class's content, or `["*"]` for all. `[]` is nobody. Every name must be a class in the file. |
+| `inbound` | text | `off` for `walled` and `counts-only`, `lead-only` for `full` | Who may send a message in: `off`, `lead-only` or `allowlist`. |
+| `inbound_allow` | list of plain names | `[]` | Who may send in. Required and non-empty when `inbound = "allowlist"`, and refused otherwise. |
+| `retention_days` | integer, 1 to 3650 | `30` | How long the class's messages are kept. A true or false is refused. This is separate from the 30 days ws keeps a session record. |
+
+Which class is a folder in (`class_of(policy, path)` in `src/ws/policy.py`):
+
+- With no `[classes]` table the answer is none, which means "no classes configured."
+- ws looks only at where the path really is, with every symbolic link resolved, so a link into a walled repo counts as
+  that repo whatever class the link itself sits in. A link out of a walled repo to a folder in no class is `unclassified`.
+  It matches without regard to case where the file system ignores it (macOS).
+- If several classes match, the most specific wins: the longest literal folder before the first wildcard. A tie goes to
+  the stricter access (`counts-only`, then `walled`, then `full`), then to the first name in alphabetical order. The
+  file's order never matters.
+- If none matches, the folder is `unclassified`: `counts-only`, nothing inbound, readable by nobody, no hosts. A path
+  ws can't read as a path is `unclassified` too.
+
+## `[budget.purposes]`
+
+A monthly cap in US dollars for each purpose, such as `chat = 20`. A purpose name uses letters, digits, `_` and `-`; a cap
+is a finite number of 0 or more (a true or false is refused). A month is a UTC calendar month, from 00:00Z on the 1st to
+the end of the last day, wherever you are (`budget_month(now)` in `src/ws/policy.py` is that window). A policy with no
+table has no purpose caps.
+
+## `[autonomy]`
+
+How much a session decides on its own. It's separate from the [`[interrupts]`](#interrupts) counts, which cap how often ws
+itself sends you a digest or a push.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `level` | text | `"decide-and-tell"` | `ask`, `decide-and-tell` or `autonomous`. |
+| `interrupts` | text | `"when-broken"` | When a session may interrupt you: `never`, `when-broken` or `daily-summary`. |
+| `always_ask` | list of plain words | `[]` | Things that are asked first at every level, such as `spending` or `data-deletion`. |
+
 ## `[[exceptions]]`
 
-A named Rule of Two exception. Each entry needs all four keys.
+A named Rule of Two exception. The first four keys are required; `owner` and `expires` are optional.
 
 | Key | Type | Meaning |
 |---|---|---|
@@ -195,8 +248,11 @@ A named Rule of Two exception. Each entry needs all four keys.
 | `job` | text | The job the exception covers. |
 | `sources` | list of text | The sources it covers. At least one. Each must be defined under `[sources]`. |
 | `reason` | text | Why. |
+| `owner` | text | Who answers for it. |
+| `expires` | TOML date or offset date-time | When it stops covering. A date such as `2026-12-31` ends at 00:00Z that day; an offset date-time such as `2026-12-31T09:00:00+13:00` ends at that instant. A local date-time (no offset), a time or text is refused, since ws never assumes a timezone. |
 
-The exception applies only when the job name matches and every source the session reads is in `sources`.
+The exception applies only when the job name matches and every source the session reads is in `sources`, and it hasn't
+expired. An expired exception covers nothing, and the refusal says when it ended.
 
 ## What a session may never write
 
@@ -247,3 +303,49 @@ reason = "reads mail, writes only to me"
 ```
 
 The `deny_commands` list is left out of this example, so it's empty. Add your rules after copying the built-in list.
+
+A policy with data classes, purpose caps, an autonomy setting and an exception that lapses:
+
+```toml
+schema = 1
+dial = "prepare"
+
+[sources.mail]
+untrusted = true
+
+[sources.notes]
+sensitive = true
+
+[classes.private]
+access = "walled"
+repos = ["~/code/private/**"]
+allowed_providers = ["anthropic"]
+allowed_hosts = ["api.anthropic.com"]
+readable_by = []
+retention_days = 14
+
+[classes.open]
+access = "full"
+repos = ["~/code/**"]
+readable_by = ["*"]
+
+[budget.purposes]
+chat = 20
+research = 40.5
+
+[autonomy]
+level = "decide-and-tell"
+interrupts = "when-broken"
+always_ask = ["spending", "data-deletion"]
+
+[[exceptions]]
+name = "morning-digest"
+job = "digest"
+sources = ["mail", "notes"]
+reason = "reads mail, writes only to me"
+owner = "me"
+expires = 2027-03-31
+```
+
+Here `~/code/private/x` is `private` (the longer folder beats `~/code/**`), `~/code/other` is `open`, and a folder
+outside `~/code` is `unclassified`.

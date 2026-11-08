@@ -43,6 +43,7 @@ from ws.policy import PolicyError
 NAME = "dev-server"
 EVENTS = ("pre",)
 KINDS = ("command",)
+PRIORITY = 10
 
 _HOST = re.compile(r"[A-Za-z0-9._:\[\]-]+")
 _LOOPBACK = "127.0.0.1"

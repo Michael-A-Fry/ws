@@ -28,6 +28,7 @@ from ws.policy import PolicyError
 NAME = "skill-gate"
 EVENTS = ("pre", "prompt")
 KINDS = ("write", "skill")
+PRIORITY = 20
 
 STATE = "skill-gate"
 DEFAULT_DIRS = {"claude-code": ("~/.claude/skills",)}  # a runner's user skills folder; other runners read none

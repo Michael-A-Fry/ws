@@ -28,7 +28,14 @@ Security = "https://github.com/Michael-A-Fry/ws/blob/main/SECURITY.md"
 ws = "ws.cli:main"
 
 [dependency-groups]
-dev = ["jsonschema==4.26.0", "pytest==9.0.3"]
+# The last three feed the test harness (tests/plugins/ws_harness.py): per-test limits, random order, one marked rerun.
+dev = [
+  "jsonschema==4.26.0",
+  "pytest==9.0.3",
+  "pytest-randomly==5.0.0",
+  "pytest-rerunfailures==16.7",
+  "pytest-timeout==2.4.0",
+]
 
 [build-system]
 requires = ["uv_build>=0.13,<0.14"]
@@ -43,3 +50,8 @@ exclude-newer = "7 days"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# tests/plugins holds ws_harness, the suite's own plugin (sizes and limits, flakes, quarantine, tier report).
+pythonpath = ["tests/plugins"]
+addopts = "-p ws_harness"
+# Dump every thread's stack when a test is stuck for two minutes (noise only; the size limits do the killing).
+faulthandler_timeout = 120

@@ -139,7 +139,7 @@ How ws changes without breaking what it promised.
 |---|---|---|---|---|
 | G1 | Import only the standard library and `ws` in `src/ws`, and list no runtime dependency. | T0 | `tests/test_principles.py::test_src_ws_imports_only_the_standard_library`, `tests/test_cli.py::test_package_has_no_runtime_dependencies` | enforced |
 | G2 | Import POSIX-only modules and names inside functions so native Windows can still run the doctor. | T0 | `tests/test_windows_import.py` | enforced |
-| G3 | Deny when the payload, the policy or a rule can't be read (the gate fails closed). | T0 | `tests/test_gate.py::test_check_fails_closed_on_a_broken_policy_and_on_a_crash` | enforced |
+| G3 | Deny when the payload, the policy or a rule can't be read, or the resident gate can't answer or isn't the user's (the gate fails closed). | T0 | `tests/test_gate.py::test_check_fails_closed_on_a_broken_policy_and_on_a_crash`, `tests/test_gate_daemon.py::test_the_daemon_killed_mid_session_changes_no_answer`, `tests/test_gate_daemon.py::test_a_run_folder_other_users_can_enter_is_not_used`, `tests/test_gate_daemon.py::test_a_peer_that_is_not_this_user_is_not_used`, `tests/test_gate_daemon.py::test_a_stand_in_that_is_not_running_ws_gate_serve_is_not_used` | enforced |
 | G4 | Write the `prepare` dial whenever ws writes a policy or profile for a person. | T0 | `tests/test_output_contract.py::test_setup_yes_and_install_never_write_dial_act` | enforced |
 | G5 | Keep tests from writing into the real runner config on the machine. | T0 | `tests/conftest.py` | enforced |
 | G6 | Pin every GitHub Action by commit SHA. | T0 | `tests/test_workflows.py::test_every_action_is_pinned_by_commit` | enforced |

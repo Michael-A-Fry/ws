@@ -9,6 +9,7 @@ a helper and is not a guard). It defines:
                                "subagent-stop" (a subagent stops)
     KINDS: tuple[str, ...]     the Call kinds it reads on "pre" and "post" (see ws.adapters.Call); a call of any other
                                kind never reaches it. The other events carry no call
+    PRIORITY: int              where it runs among the guards that are on: lowest first, then by name (default 50)
     def config(table: dict, where: str) -> object
                                validate its `[guards.NAME]` table (`{}` when the policy has none) and return what
                                `judge` receives as `cfg`; raise ws.policy.PolicyError naming the key and `where`
@@ -29,6 +30,14 @@ runner, the call, the folder and the session, exactly as `ask_commands` is.
 `Context` carries what a guard may know: the runner, the event, the session id, the folder, the raw payload, `now()`
 (the clock, so a test can set it), `memo` (scratch shared by the guards for one hook run) and `state(name, update)`, a small JSON record of its own for this session, read and
 written under a lock at `<state>/sessions/<session id>.<name>.json` and removed with the session record.
+
+The order is fixed and the same for every runner and every call: the policy's own rules first (`deny_commands`,
+`deny_read` and the rest, see ws.gate), then the guards that are on, lowest `PRIORITY` first and by name within a
+priority, whatever order `[guards] on` lists them in. The first deny stops the run: a guard after it is not asked. The
+bands in use are 0 for a guard that only records (so a refused call is recorded too), 10 for a guard that protects
+the machine or the repository, 20 for one that keeps the session honest about its own work, 30 for one that checks what a
+message says, and 90 for advice after the fact. `stream` and `run` take an optional list that gets one
+`{guard, result, ms}` for each guard that ran, which `ws gate` writes to the verdict log (see docs/reference/stores.md).
 
 A new guard is one module here; nothing else changes. The policy turns a guard on, and `ws gate generate` writes the
 runner hooks for the events and tools the guards that are on need.
@@ -173,9 +182,20 @@ def names() -> tuple[str, ...]:
     return tuple(all_guards())
 
 
+DEFAULT_PRIORITY = 50
+
+
+def priority(guard: ModuleType) -> int:
+    """Where a guard runs among the guards that are on (`PRIORITY`, lowest first)."""
+    value = getattr(guard, "PRIORITY", DEFAULT_PRIORITY)
+    return value if isinstance(value, int) and not isinstance(value, bool) else DEFAULT_PRIORITY
+
+
 def wanted(on: tuple[str, ...], event: str) -> list[ModuleType]:
-    """The guards that are on and run at `event`, in the order the policy lists them."""
-    return [g for g in (get(n) for n in on) if event in g.EVENTS]
+    """The guards that are on and run at `event`, in the one fixed order: lowest `PRIORITY` first, then by name. The
+    order `[guards] on` lists them in does not matter."""
+    chosen = [g for g in (get(n) for n in dict.fromkeys(on)) if event in g.EVENTS]
+    return sorted(chosen, key=lambda g: (priority(g), g.NAME))
 
 
 def kinds_for(on: tuple[str, ...], event: str) -> set[str]:
@@ -188,17 +208,43 @@ def native_deny(on: tuple[str, ...]) -> list[str]:
     return list(dict.fromkeys(p for n in on for p in getattr(get(n), "NATIVE_DENY", ())))
 
 
-def run(pol, event: str, calls: list, ctx: Context) -> list[tuple[str, Any, Finding]]:
-    """Every finding the guards that are on make at `event`, as (guard name, the Call judged or None, Finding), in
-    policy order. On "pre" and "post" each call goes to the guards that read its kind; on the other events the guards
-    get one None call."""
-    out: list[tuple[str, Any, Finding]] = []
+RANK = {"pass": 0, "note": 1, "warn": 2, "deny": 3, "error": 4}
+
+
+def stream(pol, event: str, calls: list, ctx: Context, verdicts: list[dict] | None = None):
+    """The findings of the guards that are on at `event`, one at a time, as (guard name, the Call judged or None,
+    Finding), in the fixed order (see the module docstring). A caller that stops at the first deny never asks the
+    guards after it. On "pre" and "post" each call goes to the guards that read its kind; on the other events the
+    guards get one None call. `verdicts` gets one {guard, result (pass, note, warn, deny or error), ms} as each guard
+    starts, kept up to date as it goes; a guard that raises is `error` and the exception goes on."""
     for g in wanted(pol.guards.on, event):
         cfg = pol.guards.config.get(g.NAME)
-        for call in calls if event in ("pre", "post") else [None]:
-            if call is not None and call.kind not in g.KINDS:
-                continue
-            found = g.judge(call, cfg, ctx)
-            if found is not None:
-                out.append((g.NAME, call, found))
-    return out
+        verdict = {"guard": g.NAME, "result": "pass", "ms": 0.0}
+        if verdicts is not None:
+            verdicts.append(verdict)
+        began = time.perf_counter()
+        try:
+            for call in calls if event in ("pre", "post") else [None]:
+                if call is not None and call.kind not in g.KINDS:
+                    continue
+                found = g.judge(call, cfg, ctx)
+                if found is not None:
+                    if RANK[found.action] > RANK[verdict["result"]]:
+                        verdict["result"] = found.action
+                    verdict["ms"] = round((time.perf_counter() - began) * 1000, 2)
+                    yield g.NAME, call, found
+        except GeneratorExit:  # the caller stopped at this guard's deny: not an error
+            raise
+        except BaseException:
+            verdict["result"] = "error"
+            raise
+        finally:
+            verdict["ms"] = round((time.perf_counter() - began) * 1000, 2)
+
+
+def run(
+    pol, event: str, calls: list, ctx: Context, verdicts: list[dict] | None = None
+) -> list[tuple[str, Any, Finding]]:
+    """Every finding the guards that are on make at `event`, as (guard name, the Call judged or None, Finding), in the
+    fixed order (see the module docstring). No guard is skipped; `stream` is for a caller that stops at a deny."""
+    return list(stream(pol, event, calls, ctx, verdicts))

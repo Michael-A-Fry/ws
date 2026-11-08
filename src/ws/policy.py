@@ -11,6 +11,16 @@ Stdlib only. Three jobs:
     `$HOME`, redirections, the value of an option);
   * `rule_of_two`: refuse a session that holds untrusted input, private data and a way out at the same time.
 
+Interfaces other modules read (each is optional in the file; a policy without them loads as before, and an older ws
+refuses a policy that uses them, which is the fail-closed behaviour wanted):
+  * `Policy.classes` and `class_of(policy, path)`: data classes (`[classes.NAME]`), the `Class` dataclass and the
+    built-in `UNCLASSIFIED` (counts only, nothing inbound, readable by nobody, no hosts). `class_of` answers None when
+    the policy has no classes, so "no classes configured" keeps today's behaviour.
+  * `Policy.budget_purposes`: `[budget.purposes]`, a monthly USD cap per purpose. A month is a UTC calendar month;
+    `budget_month(now)` is that window, for everything that reserves or settles against a cap.
+  * `Policy.autonomy`: `Autonomy(level, interrupts, always_ask)`. Separate from the `[interrupts]` counts.
+  * `RuleException.owner`, `.expires` (an aware UTC datetime) and `.expired(now)`; a date means 00:00Z that day.
+
 Known limits of the matcher. It reads command text, so it cannot see:
   * what an interpreter does inside its own program (`python3 -c`, `perl -e`, `node -e`, a script it runs);
   * a script that is downloaded and run in two steps (`curl -o a.sh ... && bash a.sh`);
@@ -89,6 +99,7 @@ from __future__ import annotations
 
 import contextlib
 import itertools
+import math
 import os
 import posixpath
 import re
@@ -96,6 +107,7 @@ import sys
 import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
+from datetime import UTC, date, datetime
 from functools import lru_cache
 from pathlib import Path
 
@@ -110,6 +122,12 @@ KNOWN_TOOLS = ("web_fetch", "web_search")
 EGRESS_TOOLS = ("web_fetch", "web_search")
 _NAME = re.compile(r"^[A-Za-z0-9_-]+$")
 _HOST = re.compile(r"^(\*\.)?[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?$")
+ACCESS = ("full", "walled", "counts-only")  # a data class's access, loosest first
+INBOUND = ("off", "lead-only", "allowlist")
+AUTONOMY_LEVELS = ("ask", "decide-and-tell", "autonomous")
+AUTONOMY_INTERRUPTS = ("never", "when-broken", "daily-summary")
+_CLASS_RESERVED = "unclassified"  # the name of the built-in class a path in no class gets
+_OS_USER = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,31}$")
 _MAX_DEPTH = 4
 _TOO_DEEP = "the command nests shells, substitutions or eval too deeply to check; write the inner command out plainly"
 MAX_COMMAND_CHARS = 64 * 1024  # a longer command takes longer to judge than a runner's hook may run
@@ -148,8 +166,9 @@ class Gate:
 
 @dataclass(frozen=True)
 class Guards:
-    """The guards that run (ws.guards): `on` is their names in order; `config` maps each to what its `config()` made of
-    its `[guards.NAME]` table. A policy with no `[guards]` has none on."""
+    """The guards that run (ws.guards): `on` is their names; the order they run in is fixed by each guard's PRIORITY, not
+    by this list. `config` maps each to what its `config()` made of its `[guards.NAME]` table. A policy with no
+    `[guards]` has none on."""
 
     on: tuple[str, ...] = ()
     config: dict = field(default_factory=dict)
@@ -157,10 +176,60 @@ class Guards:
 
 @dataclass(frozen=True)
 class RuleException:
+    """A named Rule of Two exception. `expires` is an aware UTC datetime or None (never): a TOML date in the file means
+    00:00Z that day, an offset date-time is taken as written. `owner` is who answers for it (free text, optional)."""
+
     name: str
     job: str
     sources: tuple[str, ...]
     reason: str
+    owner: str | None = None
+    expires: datetime | None = None
+
+    def expired(self, now: datetime) -> bool:
+        """True from the moment `expires` is reached (`now >= expires`). `now` must be timezone-aware: ws compares
+        instants and never assumes a local timezone."""
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("now must be timezone-aware (use datetime.now(UTC))")
+        return self.expires is not None and now >= self.expires
+
+
+@dataclass(frozen=True)
+class Class:
+    """A data class (`[classes.NAME]`): which repos belong to it and what a session working in them may do and see.
+    Consumers read it, they do not re-parse it. `access` is full, walled or counts-only. `allowed_providers` is None
+    when the file does not say (the consumer picks the walled default); `inbound` defaults to off for walled and
+    counts-only and lead-only for full. `readable_by` holds class names, or `*` alone for everyone; () is nobody."""
+
+    name: str
+    access: str
+    repos: tuple[str, ...] = ()
+    os_user: str | None = None
+    allowed_providers: tuple[str, ...] | None = None
+    local_only: bool = False
+    allowed_hosts: tuple[str, ...] = ()
+    readable_by: tuple[str, ...] = ()
+    inbound: str = "off"
+    inbound_allow: tuple[str, ...] = ()
+    retention_days: int = 30
+
+    def readable_by_class(self, reader: str) -> bool:
+        """May a session of class `reader` read this class's content?"""
+        return "*" in self.readable_by or reader in self.readable_by
+
+
+# What a path in no class is: counts only, nothing comes in, nobody else reads it, no network.
+UNCLASSIFIED = Class(_CLASS_RESERVED, "counts-only")
+
+
+@dataclass(frozen=True)
+class Autonomy:
+    """`[autonomy]`: how much a session decides alone (`level`), when it may interrupt the owner (`interrupts`), and the
+    plain words of what is always asked first (`always_ask`). Not the `[interrupts]` counts, which cap ws's own sends."""
+
+    level: str = "decide-and-tell"
+    interrupts: str = "when-broken"
+    always_ask: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -172,6 +241,9 @@ class Policy:
     gate: Gate
     exceptions: tuple[RuleException, ...]
     guards: Guards = Guards()
+    classes: dict[str, Class] = field(default_factory=dict)  # empty = no [classes] table: class_of answers None
+    budget_purposes: dict[str, float] = field(default_factory=dict)  # purpose -> monthly USD cap (UTC calendar month)
+    autonomy: Autonomy = Autonomy()
 
 
 @dataclass(frozen=True)
@@ -406,7 +478,11 @@ def loads(text: str) -> Policy:
         raw = tomllib.loads(text)
     except tomllib.TOMLDecodeError as e:
         raise PolicyError(f"not valid TOML: {e}") from e
-    raw = _table(raw, "policy", {"schema", "dial", "interrupts", "sources", "gate", "exceptions", "guards"})
+    raw = _table(
+        raw,
+        "policy",
+        {"schema", "dial", "interrupts", "sources", "gate", "exceptions", "guards", "classes", "budget", "autonomy"},
+    )
     schema = raw.get("schema", SCHEMA)
     if schema != SCHEMA or isinstance(schema, bool):
         raise PolicyError(f"schema must be {SCHEMA}, not {schema!r}")
@@ -477,7 +553,7 @@ def loads(text: str) -> Policy:
     exceptions: list[RuleException] = []
     for i, e in enumerate(ex_raw, 1):
         where = f"[[exceptions]] #{i} "
-        e = _table(e, where.strip(), {"name", "job", "sources", "reason"})
+        e = _table(e, where.strip(), {"name", "job", "sources", "reason", "owner", "expires"})
         for k in ("name", "job", "reason"):
             if not isinstance(e.get(k), str) or not e[k].strip():
                 raise PolicyError(f"{where}{k} is required (text)")
@@ -491,8 +567,171 @@ def loads(text: str) -> Policy:
                 raise PolicyError(f"{where}sources: unknown source {name!r}")
         if any(x.name == e["name"] for x in exceptions):
             raise PolicyError(f"{where}name {e['name']!r} is used twice")
-        exceptions.append(RuleException(e["name"], e["job"], covered, e["reason"]))
-    return Policy(schema, dial, interrupts, sources, gate, tuple(exceptions), _guards(raw.get("guards", {})))
+        owner = e.get("owner")
+        if "owner" in e and (not isinstance(owner, str) or not owner.strip()):
+            raise PolicyError(f"{where}owner must be non-empty text")
+        expires = _expires(e["expires"], where) if "expires" in e else None
+        exceptions.append(RuleException(e["name"], e["job"], covered, e["reason"], owner, expires))
+    return Policy(
+        schema,
+        dial,
+        interrupts,
+        sources,
+        gate,
+        tuple(exceptions),
+        _guards(raw.get("guards", {})),
+        _classes(raw.get("classes", {})),
+        _purposes(raw.get("budget", {})),
+        _autonomy(raw.get("autonomy", {})),
+    )
+
+
+def _expires(v, where: str) -> datetime:
+    """An exception's `expires`: a TOML date (00:00Z that day) or an offset date-time, as an aware UTC datetime. A local
+    date-time or a time has no instant to compare, so it is refused, and so is text."""
+    if isinstance(v, datetime):  # before date: a datetime is a date too
+        if v.tzinfo is None or v.utcoffset() is None:
+            raise PolicyError(
+                f"{where}expires has no timezone; add an offset or Z (2026-12-31T09:00:00+13:00) or use a date"
+            )
+        return v.astimezone(UTC)
+    if isinstance(v, date):
+        return datetime(v.year, v.month, v.day, tzinfo=UTC)
+    raise PolicyError(f"{where}expires must be a TOML date (2026-12-31) or an offset date-time, not {type(v).__name__}")
+
+
+def _plain_names(d: dict, key: str, where: str) -> tuple[str, ...]:
+    """A list of plain names (letters, digits, `_` and `-`)."""
+    items = _strings(d, key, where)
+    for item in items:
+        if not _NAME.fullmatch(item):
+            raise PolicyError(f"{where}{key}: {item!r} is not a plain name (letters, digits, _ and -)")
+    return items
+
+
+def _classes(raw) -> dict[str, Class]:
+    """`[classes.NAME]`: each table is checked whole; the readable_by names are checked once all the names are known."""
+    if not isinstance(raw, dict):
+        raise PolicyError("[classes] must be a table of tables")
+    out: dict[str, Class] = {}
+    for name, body in raw.items():
+        if not _NAME.fullmatch(name):
+            raise PolicyError(f"[classes]: {name!r} is not a plain name (letters, digits, _ and -)")
+        if name == _CLASS_RESERVED:
+            raise PolicyError(f"[classes]: {name!r} is the built-in class for a path in no class; pick another name")
+        where = f"[classes.{name}] "
+        body = _table(
+            body,
+            where.strip(),
+            {
+                "access",
+                "os_user",
+                "allowed_providers",
+                "local_only",
+                "allowed_hosts",
+                "readable_by",
+                "inbound",
+                "inbound_allow",
+                "retention_days",
+                "repos",
+            },
+        )
+        if "access" not in body:
+            raise PolicyError(f"{where}access is required ({', '.join(ACCESS)})")
+        access = _get(body, "access", str, where, "")
+        if access not in ACCESS:
+            raise PolicyError(f"{where}access must be one of {', '.join(ACCESS)}, not {access!r}")
+        os_user = _get(body, "os_user", str, where, "") if "os_user" in body else None
+        if os_user is not None and not _OS_USER.fullmatch(os_user):
+            raise PolicyError(f"{where}os_user: {os_user!r} is not a user name (letters, digits, _ . -; at most 32)")
+        providers = _plain_names(body, "allowed_providers", where) if "allowed_providers" in body else None
+        hosts = _strings(body, "allowed_hosts", where)
+        for h in hosts:
+            if not _HOST.fullmatch(h):
+                raise PolicyError(
+                    f"{where}allowed_hosts: {h!r} is not a host (a name, `*.name` or an IP, optional :port)"
+                )
+        readable = _strings(body, "readable_by", where)
+        if "*" in readable and len(readable) > 1:
+            raise PolicyError(f'{where}readable_by: "*" means everyone and can not be listed with class names')
+        inbound = _get(body, "inbound", str, where, "lead-only" if access == "full" else "off")
+        if inbound not in INBOUND:
+            raise PolicyError(f"{where}inbound must be one of {', '.join(INBOUND)}, not {inbound!r}")
+        allow = _plain_names(body, "inbound_allow", where)
+        if inbound == "allowlist" and not allow:
+            raise PolicyError(f"{where}inbound_allow is required (at least one name) when inbound is allowlist")
+        if inbound != "allowlist" and allow:
+            raise PolicyError(f"{where}inbound_allow only applies when inbound is allowlist")
+        days = _get(body, "retention_days", int, where, 30)
+        if not 1 <= days <= 3650:
+            raise PolicyError(f"{where}retention_days must be from 1 to 3650, not {days}")
+        repos = _strings(body, "repos", where)
+        if not repos:
+            raise PolicyError(f"{where}repos is required (a non-empty list of path globs)")
+        out[name] = Class(
+            name,
+            access,
+            repos,
+            os_user,
+            providers,
+            _get(body, "local_only", bool, where, False),
+            hosts,
+            readable,
+            inbound,
+            allow,
+            days,
+        )
+    for c in out.values():
+        for r in c.readable_by:
+            if r != "*" and r not in out:
+                raise PolicyError(f"[classes.{c.name}] readable_by: unknown class {r!r}")
+    return out
+
+
+def _purposes(raw) -> dict[str, float]:
+    """`[budget.purposes]`: purpose name -> monthly USD cap (a UTC calendar month), a finite number of 0 or more."""
+    t = _table(raw, "[budget]", {"purposes"})
+    purposes = t.get("purposes", {})
+    if not isinstance(purposes, dict):
+        raise PolicyError("[budget.purposes] must be a table of purpose = monthly USD cap")
+    out: dict[str, float] = {}
+    for name, v in purposes.items():
+        if not _NAME.fullmatch(name):
+            raise PolicyError(f"[budget.purposes]: {name!r} is not a plain name (letters, digits, _ and -)")
+        if isinstance(v, bool) or not isinstance(v, int | float):
+            raise PolicyError(f"[budget.purposes] {name} must be a number (monthly USD)")
+        try:
+            cap = float(v)
+        except OverflowError:
+            cap = math.inf
+        if not math.isfinite(cap) or cap < 0:
+            raise PolicyError(f"[budget.purposes] {name} must be a finite number of 0 or more, not {v!r}")
+        out[name] = cap
+    return out
+
+
+def budget_month(now: datetime) -> tuple[datetime, datetime]:
+    """The window a `[budget.purposes]` cap covers: the UTC calendar month holding `now`, as (start, end) with the start
+    included and the end not (00:00Z on the 1st, to 00:00Z on the 1st of the next month). `now` must be timezone-aware.
+    Everything that reserves or settles spend against a purpose cap uses this one window."""
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware (use datetime.now(UTC))")
+    now = now.astimezone(UTC)
+    start = datetime(now.year, now.month, 1, tzinfo=UTC)
+    end = datetime(now.year + (now.month == 12), now.month % 12 + 1, 1, tzinfo=UTC)
+    return start, end
+
+
+def _autonomy(raw) -> Autonomy:
+    """`[autonomy]`: level, interrupts and the always_ask words. Separate from the `[interrupts]` counts."""
+    t = _table(raw, "[autonomy]", {"level", "interrupts", "always_ask"})
+    level = _get(t, "level", str, "[autonomy] ", "decide-and-tell")
+    if level not in AUTONOMY_LEVELS:
+        raise PolicyError(f"[autonomy] level must be one of {', '.join(AUTONOMY_LEVELS)}, not {level!r}")
+    when = _get(t, "interrupts", str, "[autonomy] ", "when-broken")
+    if when not in AUTONOMY_INTERRUPTS:
+        raise PolicyError(f"[autonomy] interrupts must be one of {', '.join(AUTONOMY_INTERRUPTS)}, not {when!r}")
+    return Autonomy(level, when, tuple(dict.fromkeys(_plain_names(t, "always_ask", "[autonomy] "))))
 
 
 def _guards(raw) -> Guards:
@@ -540,6 +779,64 @@ def _with_secret_reads(pol: Policy, home: Path) -> Policy:
     return replace(pol, gate=replace(pol.gate, deny_read=(*pol.gate.deny_read, *extra))) if extra else pol
 
 
+# --- data classes ------------------------------------------------------------------------------------------------
+
+_STRICTNESS = {a: i for i, a in enumerate(ACCESS)}  # a higher number is stricter
+
+
+def _class_places(path) -> list[str]:
+    """Where `path` really is: every link resolved (never the spelling it was given, so a link cannot make a path look like
+    a looser class), then the folders above it, so a session started in a sub-folder of a repo is in that repo. A trailing
+    `/` form lets `repo/**` cover the repo folder itself."""
+    name = os.path.realpath(os.fspath(path))
+    out = [name.rstrip("/") + "/"]
+    while name and name != "/":
+        out.append(name)
+        name = posixpath.dirname(name)
+    return out
+
+
+def _class_patterns(repos: tuple[str, ...]) -> list[tuple[re.Pattern, int]]:
+    """Each repo glob as (regex, how specific it is). A glob whose literal folder is a link is also read with that link
+    resolved, because the path being classified is. Specific = the length of the literal folder before the first wildcard
+    (a bare name, which matches at any depth, has none)."""
+    out = []
+    for repo in repos:
+        out.append((_path_regex(repo), len(_rule_root(repo) or "")))
+        expanded, root = _expand(repo), _rule_root(repo)
+        if root and expanded.startswith(root) and (real := os.path.realpath(root)) != root:
+            out.append((_glob_regex_path(real + expanded[len(root) :]), len(real)))
+    return out
+
+
+def class_of(pol: Policy, path) -> Class | None:
+    """The data class of a session working at `path`.
+
+    None when the policy has no `[classes]`: nothing is classified and today's behaviour holds. Otherwise the path is
+    resolved with every link followed and matched against every class's `repos` (caseless where CASELESS_PATHS says).
+    Only the real path counts, never the spelling it was given, so a link into a walled repo is that repo whatever
+    class the link itself sits in. The most specific match wins (the longest literal folder before a wildcard); a tie
+    goes to the stricter access (counts-only, then walled, then full) and then to the first name. A path in no class is
+    UNCLASSIFIED, and so is one that cannot be read as a path: the strictest answer, never a guess."""
+    if not pol.classes:
+        return None
+    try:
+        places = _class_places(path)
+        best: tuple[int, int] | None = None
+        found = UNCLASSIFIED
+        for name in sorted(pol.classes):
+            c = pol.classes[name]
+            hits = [spec for rx, spec in _class_patterns(c.repos) if any(rx.match(s) for s in places)]
+            if not hits:
+                continue
+            key = (max(hits), _STRICTNESS[c.access])
+            if best is None or key > best:
+                best, found = key, c
+        return found
+    except (ValueError, OSError):  # an embedded NUL or a path the system will not resolve
+        return UNCLASSIFIED
+
+
 # --- Rule of Two -------------------------------------------------------------------------------------------------
 
 
@@ -548,12 +845,15 @@ def shell_ways_out(policy: Policy) -> list[str]:
     return [p.split()[0] for p in NET_PROBES if is_denied_command(policy, p) is None]
 
 
-def rule_of_two(policy: Policy, sources: list[str], job: str | None = None, shell: bool = True) -> Verdict:
+def rule_of_two(
+    policy: Policy, sources: list[str], job: str | None = None, shell: bool = True, now: datetime | None = None
+) -> Verdict:
     """May a session read `sources` and run `job`? Refused when it would hold untrusted input AND private data AND a
     way out. A way out is an outward act of a source in mode "act" (only when the dial is not "prepare"), an allowed
     egress tool (web_fetch, web_search), or, when the session has a shell (`shell`, default yes), a network command
     the policy does not deny (see shell_ways_out). A named exception lifts the refusal when its job matches and
-    every source the session reads is one it names."""
+    every source the session reads is one it names, and it has not expired: an expired exception covers nothing, and
+    the refusal names when it ended. `now` is an aware datetime (default: now, UTC); tests pass their own clock."""
     for name in sources:
         src = policy.sources.get(name)
         if src is None:
@@ -573,10 +873,15 @@ def rule_of_two(policy: Policy, sources: list[str], job: str | None = None, shel
         f"untrusted input ({', '.join(untrusted)}), private data ({', '.join(sensitive)}) and a way out "
         f"({', '.join(ways_out)}) together"
     )
+    now = datetime.now(UTC) if now is None else now
+    lapsed = ""
     for e in policy.exceptions:
         if job is not None and e.job == job and set(sources) <= set(e.sources):
+            if e.expired(now):
+                lapsed = f"; exception {e.name!r} expired at {e.expires.isoformat(timespec='seconds')}"
+                continue
             return Verdict("exception", f"{why}; allowed by exception {e.name!r}: {e.reason}", e.name)
-    return Verdict("refused", f"Rule of Two: {why}")
+    return Verdict("refused", f"Rule of Two: {why}{lapsed}")
 
 
 # --- the matcher -------------------------------------------------------------------------------------------------
@@ -1065,7 +1370,13 @@ def _dotted(op: str, cwd: str) -> str:
 
 
 _ADMIN = {"secret", "broker", "approve", "uninstall"}
-_ADMIN_SUB = {("skills", "adopt"), ("skills", "restore"), ("config", "fallback")}
+_ADMIN_SUB = {
+    ("skills", "adopt"),
+    ("skills", "restore"),
+    ("config", "fallback"),
+    ("session", "prepare"),  # mints the role a launcher gives a session
+    ("session", "start"),  # writes a session's registry record, role included
+}
 
 
 def _gate_flag(rest: list[str]) -> bool:
@@ -1081,9 +1392,11 @@ def _gate_flag(rest: list[str]) -> bool:
 
 def _ws_admin(canon: list[str]) -> str | None:
     """`ws gate generate|init`, `ws secret ...`, `ws broker ...`, `ws approve ...`, `ws uninstall`, `ws install --gate
-    launch`, `ws skills adopt|restore`, `ws config fallback` (also `uv run ws ...`, `python -m ws ...`): a gated session
-    must not regenerate or take off its own gate, touch secrets, approve its own call or swap what the person installed.
-    A plain `ws install` only refreshes, so it stays allowed."""
+    launch`, `ws skills adopt|restore`, `ws config fallback`, `ws session prepare|start` (also `uv run ws ...`,
+    `python -m ws ...`): a gated session must not regenerate or take off its own gate, touch secrets, approve its own
+    call, swap what the person installed or mint the role of a session (`prepare`) or overwrite its record (`start`;
+    the hooks that run it are not tool calls, so they still work). A plain `ws install` only refreshes, so it stays
+    allowed."""
     for i, t in enumerate(canon):
         if posixpath.basename(t) != "ws" or not (
             i == 0 or canon[i - 1] in ("run", "-m", "--", "exec", "tool") or canon[i - 1].startswith("-")

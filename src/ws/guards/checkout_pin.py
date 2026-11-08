@@ -41,6 +41,7 @@ from ws.policy import PolicyError
 NAME = "checkout-pin"
 EVENTS = ("pre",)
 KINDS = ("command",)
+PRIORITY = 10
 
 _CHECKOUT_VALUE = {"--conflict", "--pathspec-from-file", "-U", "--unified", "--inter-hunk-context"}
 _RESTORE_VALUE = {"--source", "-s", "--pathspec-from-file", "-U", "--unified", "--inter-hunk-context"}

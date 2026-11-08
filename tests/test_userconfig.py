@@ -122,7 +122,8 @@ def test_the_hook_command_is_this_python_never_a_bare_ws(box, capsys):
     do_install(capsys, box)
     commands = [h["command"] for g in settings(box)["hooks"]["PreToolUse"] for h in g["hooks"]]
     ws = next(c for c in commands if "gate check" in c)
-    assert ws.startswith(shlex.join(selfcmd.argv()))
+    assert shlex.join(selfcmd.argv()) in ws  # the fallback the thin client runs when the daemon can't answer
+    assert ws.startswith(shlex.join([selfcmd.argv()[0], "-I", "-S"]))  # and the client itself starts this Python
 
 
 def test_a_second_install_reports_0_changes_and_leaves_every_byte(box, capsys):

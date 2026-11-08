@@ -1,8 +1,14 @@
 """claims: a message that says a commit is merged, pushed or on the default branch names a commit that is. Before a
 message goes to another agent, each claim word (default `on B`, `merged into B`, `merged to B` and `pushed to B`, where B
-is the repository's default branch) that sits in the same sentence as a commit-like token (7 to 40 lower-case hex
-characters, with at least one digit and one of a to f) is checked with `git merge-base --is-ancestor TOKEN REF` in the
-session's folder. REF is the policy's `ref`, else the default branch on `origin`. B and that REF come from
+is the repository's default branch) is matched to the commit-like tokens (7 to 40 lower-case hex characters, with at
+least one digit and one of a to f) it is about, and each such commit is checked with `git merge-base --is-ancestor TOKEN
+REF` in the session's folder. A token belongs to a claim word when it sits inside the phrase (`merged abc1234 into main`)
+or next to it with nothing between but a few plain function words and other commit ids (`abc1234 is on main`, `pushed the
+fix abc1234 to main`, `merged into main: abc1234 and def5678`). Any other word between them means the claim is about
+something else, so a hex-looking word (`the ed25519 key is on main`), a session id, or a draft commit in the same
+sentence as `on main` (`abc1234 is a draft and the fix is on main`) is not checked. A claim word the policy adds, such as
+`pushed`, is matched the same way, so `pushed work abc1234` (a branch name between) is not a claim about the default
+branch. REF is the policy's `ref`, else the default branch on `origin`. B and that REF come from
 `git symbolic-ref refs/remotes/origin/HEAD`; with no `origin/HEAD` they come from the local default branch
 (`init.defaultBranch`, else `main`), taking `origin/B` when that exists and B itself when it doesn't. A commit that isn't
 an ancestor of REF, or isn't a commit in this repository, denies the message and the reason names it; the reason says to
@@ -45,6 +51,7 @@ from ws.policy import PolicyError
 NAME = "claims"
 EVENTS = ("pre", "stop")
 KINDS = ("message",)
+PRIORITY = 30
 
 FALLBACK_BRANCH = "main"  # the default branch of a repository that doesn't say (no origin/HEAD, no init.defaultBranch)
 REMOTE = "origin"
@@ -66,6 +73,87 @@ DEFAULT_WORDS = claim_words(FALLBACK_BRANCH)
 _REF_SHAPE = re.compile(r"[A-Za-z0-9_./@{}^~-]+")
 
 _HEX = re.compile(r"(?<![\w-])[0-9a-f]{7,40}(?![\w-])")
+# The words that may sit between a claim word and the commit it is about. Any other word there (a noun, a name) means the
+# commit is mentioned for another reason.
+_FILLER = frozenset(
+    [
+        "a",
+        "an",
+        "the",
+        "this",
+        "that",
+        "these",
+        "those",
+        "it",
+        "its",
+        "they",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "has",
+        "have",
+        "had",
+        "now",
+        "already",
+        "also",
+        "just",
+        "finally",
+        "then",
+        "still",
+        "safely",
+        "successfully",
+        "both",
+        "all",
+        "and",
+        "which",
+        "who",
+        "commit",
+        "commits",
+        "sha",
+        "shas",
+        "hash",
+        "hashes",
+        "change",
+        "changes",
+        "fix",
+        "fixes",
+        "patch",
+        "patches",
+        "pr",
+        "really",
+        "currently",
+        "yet",
+        "indeed",
+    ]
+)
+_LEAD = frozenset(
+    [
+        "in",
+        "at",
+        "of",
+        "see",
+        "via",
+        "from",
+        "with",
+        "as",
+        "by",
+        "for",
+        "on",
+        "into",
+        "onto",
+        "to",
+        "after",
+        "before",
+        "since",
+    ]
+)
+MAX_GAP_WORDS = 4
+_GAP_BREAK = re.compile(r"[.;!?]")
+_GAP_WORD = re.compile(r"[A-Za-z']+|\d+")
 _SENTENCE = re.compile(r"(?<=[.!?])\s+|\n+")
 _QUOTES = "\"'`‘’“”"
 _NEGATION = {"not", "no", "never", "without"}
@@ -223,11 +311,21 @@ def _names_other_branch(sentence: str, ref: str, branch: str = FALLBACK_BRANCH) 
     return any(n.rstrip(".").lower() not in own for n in named)
 
 
-def _claim_word(sentence: str, words: tuple[str, ...]) -> str | None:
-    """The first claim word in the sentence that is a claim, else None."""
+def _claim_spans(sentence: str, words: tuple[str, ...]) -> list[tuple[str, int, int]]:
+    """[(claim word as written, start, end)] for each place in the sentence a claim word is a claim: not quoted, not
+    negated and not in the future."""
+    found: list[tuple[str, int, int]] = []
     for word in words:
-        # a commit may sit inside the phrase: "merged abc1234 into main"
-        pattern = r"(?<![\w-])" + r"(?:\s+[0-9a-f]{7,40})?\s+".join(re.escape(w) for w in word.split()) + r"(?![\w-])"
+        parts = [f"({re.escape(w)})" for w in word.split()]  # a group for each word, to give the phrase back as written
+        # a commit may sit inside the phrase ("merged abc1234 into main"), and so may a few plain words and a commit
+        # after its verb ("pushed the fix abc1234 to main")
+        inside = r"(?:\s+[0-9a-f]{7,40})?\s+"
+        verb = rf"(?:\s+(?:[0-9a-f]{{7,40}}|{'|'.join(sorted(_FILLER))})){{0,{MAX_GAP_WORDS + 1}}}\s+"
+        pattern = (
+            r"(?<![\w-])"
+            + (parts[0] + verb + inside.join(parts[1:]) if len(parts) > 2 else inside.join(parts))
+            + r"(?![\w-])"
+        )
         for m in re.finditer(pattern, sentence, re.IGNORECASE):
             before, after = sentence[: m.start()], sentence[m.end() :]
             if before[-1:] and after[:1] and before[-1] in _QUOTES and after[0] in _QUOTES:
@@ -235,8 +333,34 @@ def _claim_word(sentence: str, words: tuple[str, ...]) -> str | None:
             previous = _FOUR.findall(before.lower())[-4:]
             if any(w in _NEGATION | _FUTURE or w.endswith(("n't", "'ll")) for w in previous):
                 continue  # "not merged", "isn't pushed", "will be merged", "it'll be on main"
-            return re.sub(r"\s+[0-9a-f]{7,40}(?=\s)", "", m.group(0))  # as written, without a commit inside it
-    return None
+            written = " ".join(m.groups())  # as written, without a commit or a plain word inside it
+            found.append((written, m.start(), m.end()))
+    return sorted(found, key=lambda f: f[1])
+
+
+def _plain_gap(gap: str) -> bool:
+    """Is the text between a claim word and a commit only function words (and other commit ids, as in a list)?"""
+    if _GAP_BREAK.search(gap):
+        return False
+    words = _GAP_WORD.findall(_HEX.sub(" ", gap).lower())
+    return len(words) <= MAX_GAP_WORDS and all(w in _FILLER for w in words)
+
+
+def _binds(sentence: str, span: tuple[str, int, int], token: re.Match) -> bool:
+    """Is this commit-like token what the claim word at `span` is about?"""
+    _, start, end = span
+    if start <= token.start() and token.end() <= end:
+        return True
+    if token.end() <= start:  # the commit comes first: `abc1234 is on main`; what leads into it must be plain too
+        return _plain_gap(sentence[token.end() : start]) and _plain_lead(sentence[: token.start()])
+    return _plain_gap(sentence[end : token.start()])
+
+
+def _plain_lead(before: str) -> bool:
+    """Is the word before a commit-like token one that leads into a commit (`the fix abc1234`, `see abc1234`), and not
+    a name for something else (`session 9f8e7d6c`, `key ed25519`)? The start of the sentence is plain."""
+    words = _GAP_WORD.findall(before.lower())
+    return not words or words[-1] in _FILLER or words[-1] in _LEAD
 
 
 def _has_commit(text: str) -> bool:
@@ -246,17 +370,19 @@ def _has_commit(text: str) -> bool:
 def find_claims(
     text: str, words: tuple[str, ...], ref: str = DEFAULT_REF, branch: str = FALLBACK_BRANCH
 ) -> list[tuple[str, str]]:
-    """[(claim word as written, commit-like token)] for each sentence that has both, in order, without repeats. A
-    sentence that names a branch other than the default `branch` and `ref` is skipped."""
+    """[(claim word as written, commit-like token)] for each claim word and the commit it is about (see the module
+    docstring), in order, without repeats. A sentence that names a branch other than the default `branch` and `ref` is
+    skipped."""
     found: list[tuple[str, str]] = []
     for sentence in _SENTENCE.split(text[:MAX_TEXT]):
-        tokens = [t for t in _HEX.findall(sentence) if _commit_like(t)]
+        tokens = [m for m in _HEX.finditer(sentence) if _commit_like(m.group(0))]
         if not tokens or _names_other_branch(sentence, ref, branch):
             continue
-        word = _claim_word(sentence, words)
-        if word is None:
-            continue
-        found += [(word, t) for t in dict.fromkeys(tokens) if (word, t) not in found]
+        for span in _claim_spans(sentence, words):
+            for token in tokens:
+                pair = (span[0], token.group(0))
+                if pair not in found and _binds(sentence, span, token):
+                    found.append(pair)
     return found
 
 
@@ -379,8 +505,8 @@ def on_ref(cwd: str, sha: str, ref: str, budget: Budget | None = None) -> bool |
 # `(?<!\s)` lets a run of spaces start a match only at its first space, so a long run is read once, not once for each space
 _CLAUSE = re.compile(r"(?<=[.!?])\s+|\n+|(?<!\s)(?:\s*;\s*|\s+(?:but|while|whereas|although)\s+)", re.IGNORECASE)
 _LIVE = re.compile(
-    r"\b(?:is|are|was|were|went|gone|got|been|now|stays|remains)\s+(?:now\s+)?live\b"
-    r"|\blive\s+now\b|\bnow\s+live\b|\blive\s*:"
+    r"\b(?:is|are|was|were|went|gone|got|been|now|stays|remains)\s+(?:now\s+)?live(?![\w-])"
+    r"|\blive\s+now\b|\bnow\s+live(?![\w-])|\blive\s*:"
     r"|\blive\s+(?:release|version|tag)\s+(?:is|=)"
     r"|\bpromoted\b[^;\n]{0,80}?\b(?:to|into)\s+(?:live|prod|production)\b",
     re.IGNORECASE,

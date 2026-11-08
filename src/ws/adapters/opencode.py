@@ -27,7 +27,7 @@ import shlex
 from pathlib import Path
 
 from ws import guards, jobs, paths
-from ws.adapters import Call, check_argv, protected_paths
+from ws.adapters import Call, check_argv, client_argv, protected_paths
 from ws.adapters.opencode_plugin import SOURCE
 from ws.policy import Policy, native_patterns
 
@@ -139,7 +139,8 @@ def generate(
         permission[_TOOLS[t]] = "deny"
     config = {"$schema": "https://opencode.ai/config.json", "permission": permission}
     pin = pin or paths.pin_of()
-    plugin = SOURCE.replace("/*__CHECK__*/ []", json.dumps(check_argv(ws_cmd, NAME, policy_file, out, protect, pin)))
+    check = client_argv("check", check_argv(ws_cmd, NAME, policy_file, out, protect, pin), pin)
+    plugin = SOURCE.replace("/*__CHECK__*/ []", json.dumps(check))
     plugin = plugin.replace("/*__WS__*/ []", json.dumps(ws_cmd)).replace("/*__PIN__*/ []", json.dumps(pin.args()))
     return {CONFIG: json.dumps(config, indent=2) + "\n", PLUGIN: plugin, IGNORE: IGNORE_TEXT}
 

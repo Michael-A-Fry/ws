@@ -740,3 +740,106 @@ def test_git_is_found_on_the_tool_folders_and_not_the_session_path(tmp_path, mon
     cl._git(str(tmp_path), "status")
     assert seen and all(exe != str(fake) and env["PATH"] == paths.tool_path() for exe, env in seen)
     assert not (tmp_path / "ran").exists()  # the planted program never ran
+
+
+# --- words that look like commits, and claim words in plain prose --------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "the ed25519 key is on main",
+        "ed25519 keys live on main",
+        "we signed with ed25519 and the notes are on main",
+        "session 9f8e7d6c5b4a3928 is on main",
+        "uuid 3f2a9c1e-8b4d-4e6f-9a1c-5d7e0b2f4a6c is on main",
+        "checkpoint 20261107-151146 is on main",
+        "run 4812590236 on main failed",
+        "the CI run 4812590236 merged into main",
+        "dated 2026-11-07, 20261107 is on main",
+    ],
+)
+def test_a_hex_looking_word_a_date_or_an_id_is_not_a_commit_claim(text):
+    assert cl.find_claims(text, W) == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "abc1234 differs from released main",
+        "the PR body says merged, and abc1234 is the head",
+        "work continues on main; abc1234 is a draft",
+        "abc1234 is a draft commit; the fix is on main",
+        "abc1234 is a draft and the fix is on main",
+        "I'm on main today, see abc1234 for the plan",
+        "see abc1234 for why the tests differ from what's on main",
+        "pushed p8-item1a abc1234",
+        "pushed the branch p8-item1a abc1234 for review",
+    ],
+)
+def test_a_claim_word_and_a_short_sha_in_one_sentence_are_not_a_claim_unless_they_belong_together(text):
+    assert cl.find_claims(text, W) == []
+
+
+@pytest.mark.parametrize(
+    "text, expect",
+    [
+        ("pushed the fix abc1234 to main", [("pushed to main", "abc1234")]),
+        ("abc1234 was successfully pushed to main", [("pushed to main", "abc1234")]),
+        ("the fix abc1234, which is on main", [("on main", "abc1234")]),
+        ("(abc1234) is on main", [("on main", "abc1234")]),
+        ("commit abc1234 has now been merged into main", [("merged into main", "abc1234")]),
+        (
+            "merged into main: abc1234, def5678 and 0a1b2c3d",
+            [("merged into main", t) for t in ("abc1234", "def5678", "0a1b2c3d")],
+        ),
+    ],
+)
+def test_a_commit_that_belongs_to_a_claim_word_is_still_caught(text, expect):
+    assert cl.find_claims(text, W) == expect
+
+
+def test_a_word_the_policy_adds_is_read_the_same_way():
+    assert cl.find_claims("pushed abc1234", ("pushed",)) == [("pushed", "abc1234")]
+    assert cl.find_claims("pushed work abc1234", ("pushed",)) == []  # a branch name between: pushed where?
+    assert cl.find_claims("pushed p8-item1a abc1234", ("pushed",)) == []
+    assert cl.find_claims("pushed to work, so abc1234 is there", ("pushed",)) == []
+
+
+@needs_git
+def test_nothing_is_asked_of_git_for_a_hex_looking_word_or_a_commit_that_is_not_claimed(repo, monkeypatch):
+    d, _, off = repo
+    monkeypatch.setattr(cl, "on_ref", lambda *a: pytest.fail("git was asked"))
+    assert judge("the ed25519 key is on main", d) is None
+    assert judge(f"{off} is a draft; what is on main is older", d) is None
+    assert judge(f"pushed p8-item1a {off}", d) is None
+    assert judge("differs from released main (session 9f8e7d6c5b4a3928)", d) is None
+
+
+@needs_git
+def test_a_commit_claimed_as_done_is_still_denied_when_it_is_not_on_the_ref(repo):
+    d, on, off = repo
+    assert judge(f"pushed the fix {off} to main", d).action == "deny"
+    assert judge(f"{off} was successfully pushed to main", d).action == "deny"
+    assert judge(f"pushed the fix {on} to main", d) is None
+
+
+@needs_git
+def test_a_short_sha_next_to_a_claim_word_it_does_not_belong_to_is_allowed(repo):
+    d, _, off = repo
+    assert judge(f"{off} is a draft and the fix is on main", d) is None
+
+
+@pytest.mark.parametrize(
+    "text, expect",
+    [
+        ("v1.2 is live-tested", []),
+        ("v1.2 is live-reload ready", []),
+        ("v1.2 is live", ["v1.2"]),
+        ("v1.2 is now live.", ["v1.2"]),
+        ("live data from v1.2 shows up here", []),
+        ("when v1.2 goes live we will tell you", []),
+    ],
+)
+def test_live_in_plain_prose_is_not_a_release_claim(text, expect):
+    assert cl.release_claims(text, cl.DEFAULT_TAGS) == expect

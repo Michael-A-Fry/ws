@@ -194,7 +194,8 @@ def test_every_generated_hook_command_carries_the_pin(box):
     for groups in hooks.values():
         for g in groups:
             for h in g["hooks"]:
-                if "ws" in shlex.split(h["command"])[:1]:
+                words = shlex.split(h["command"])
+                if "ws" in words[:1] or any(w.endswith("gateclient.py") for w in words):
                     seen += 1
                     assert sorted(p.split("=")[0] for p in _pins_in(h["command"])) == sorted(
                         (*paths.PIN_KEYS, paths.TMP_KEY)
@@ -255,8 +256,12 @@ def test_generated_check_commands_are_accepted_by_the_parser(box):
     pol = policy.default_policy()
     files = claude_code.generate(pol, ["ws"], Path("/x/out"), Path("/x/policy.toml"))
     cmd = json.loads(files["settings.json"])["hooks"]["PreToolUse"][0]["hooks"][0]["command"].removesuffix(" || exit 2")
-    args = shlex.split(cmd)[1:]
+    words = shlex.split(cmd)
+    assert words[1:3] == ["-I", "-S"] and words[3].endswith("gateclient.py") and words[4] == "check"  # the thin client
+    fallback = words[words.index("--") + 1 :]  # what it runs itself when the daemon can't answer
+    assert fallback[:3] == ["ws", "gate", "check"]
     parser = cli.build_parser()
-    ns = parser.parse_args(args)
+    ns = parser.parse_args(fallback[1:])
     assert ns.func is gate.cmd_check and paths.read_pin(ns.pin) == paths.pin_of()
+    assert gate.hook_args("check", fallback[3:]).runner == "claude-code"  # and the daemon reads the same options
     assert claude_code.NAME == "claude-code"

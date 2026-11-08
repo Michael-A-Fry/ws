@@ -1,7 +1,8 @@
 """The OpenCode shim plugin, as the JavaScript text `ws gate generate` writes to plugins/ws-gate.js.
 
 Kept as a Python string, not a .js file, because the secret wall copies the ws package as plain .py files only.
-`/*__CHECK__*/ []` is replaced with the argv that runs `ws gate check`; `/*__WS__*/ []` with the argv that runs ws;
+`/*__CHECK__*/ []` is replaced with the argv of the thin gate client (ws.gateclient), which asks the resident gate and runs
+`ws gate check` itself when it can't answer, so OpenCode and Claude Code get the same decision; `/*__WS__*/ []` with the argv that runs ws;
 `/*__PIN__*/ []` with the `--pin` arguments that go on the commands that are not a check (the layout ws install resolved).
 """
 
@@ -110,6 +111,7 @@ export const WsGate = async ({ client, directory } = {}) => {
           cwd: resolve(directory ?? process.cwd(), output.args?.workdir ?? "."), // bash runs in args.workdir, if given
         }),
         encoding: "utf8",
+        timeout: 30000, // ms: more than the client's worst case (ws.gateclient.WORST_CASE_S); a timed-out check is r.error, so blocked
       })
       if (r.status === 4 && !r.error) {
         let id = ""

@@ -19,9 +19,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -158,8 +160,11 @@ def claude_settings(tmp_path, layer: str) -> Path:
     return settings
 
 
-def claude_run(tmp_path, stub, settings, bare: bool, work, sources: str | None = "user") -> subprocess.CompletedProcess:
+def claude_run(
+    tmp_path, stub, settings, bare: bool, work, sources: str | None = "user", extra_env: dict | None = None
+) -> subprocess.CompletedProcess:
     env = base_env(tmp_path)
+    env.update(extra_env or {})
     env.update(
         ANTHROPIC_BASE_URL=stub.url,
         ANTHROPIC_API_KEY="sk-ant-" + "stub" * 8,  # fake, built at run time
@@ -350,3 +355,181 @@ def test_opencode_still_writes_elsewhere(tmp_path, work, layer):
     stub, proc = opencode_go(tmp_path, work, layer, calls)
     assert_paths(expect, proc)
     assert len(stub.tool_results()) == expect["tool_results"]
+
+
+# --- through the resident gate: payload -> client -> daemon -> guards -> reply -----------------------------------------
+#
+# The same hooks, with a real `ws gate serve` running and WS_GATE_DAEMON=1 set on purpose (tests/conftest.py sets it to 0
+# for every other test). Each case needs its runner and skips without it. No subscription or API key is used: the model
+# is the stub. The log (logs/gate.jsonl) says which way each call was answered: "daemon" or "direct".
+
+DAEMON_ENV = {"WS_GATE_DAEMON": "1"}
+
+
+def start_resident_gate(tmp_path) -> subprocess.Popen:
+    """The daemon the generated hooks will find: the same ws command and layout, started before the runner."""
+    from ws import paths
+
+    pin = paths.pin_of()
+    proc = subprocess.Popen(
+        [*selfcmd.argv(), "gate", "serve", *pin.args()],
+        env={**base_env(tmp_path), **DAEMON_ENV},
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    sock = Path(pin.state) / "run" / "gate.sock"
+    for _ in range(400):
+        if sock.exists():
+            return proc
+        if proc.poll() is not None:
+            break
+        time.sleep(0.05)
+    proc.kill()
+    pytest.fail("the resident gate did not start")
+
+
+def verdicts() -> list[dict]:
+    from ws import jsonl, paths
+
+    path = Path(paths.pin_of().state) / "logs" / "gate.jsonl"
+    return jsonl.read(path) if path.exists() else []
+
+
+def stop_resident_gate(proc: subprocess.Popen) -> None:
+    if proc.poll() is None:
+        proc.kill()
+    proc.wait(timeout=10)
+
+
+def killing(stub_class, proc: subprocess.Popen, after: int):
+    """A stub that kills the resident gate once `after` tool results are in: the next call finds it gone."""
+
+    class Killer(stub_class):
+        killed = False
+
+        def next_call(self, offered, results_seen):
+            if results_seen >= after and not self.killed:
+                self.killed = True
+                proc.kill()
+                proc.wait(timeout=10)
+            return super().next_call(offered, results_seen)
+
+    return Killer
+
+
+def is_blocked(result: str) -> bool:
+    return any(w in result.lower() for w in BLOCKED)
+
+
+def check_through_the_gate(stub, proc, work, secrets, killed: bool):
+    """Four calls in one session: a protected read (denied), a benign command (runs), and the same two again."""
+    results = stub.tool_results()
+    assert len(results) == 4, f"the runner did not report all four calls\n{where(proc)}"
+    assert is_blocked(results[0]) and is_blocked(results[2]), results
+    assert not is_blocked(results[1]) and not is_blocked(results[3]), results
+    assert secrets["canary"] not in " ".join(results)
+    assert (work / "ALLOWED").exists() and (work / "ALLOWED2").exists(), where(proc)
+    rows = verdicts()
+    assert {r["decision"] for r in rows} >= {"deny", "allow"}, rows  # a refusal and a guard that let a command through
+    assert rows[0]["via"] == "daemon", rows  # the first call was answered by the resident gate
+    if killed:
+        assert "direct" in {r["via"] for r in rows}, rows  # a call after the kill was decided by the client itself
+    else:
+        assert {r["via"] for r in rows} == {"daemon"}, rows
+
+
+def second_command(work) -> str:
+    return f"touch {work / 'ALLOWED2'} && git status"
+
+
+@pytest.mark.parametrize("killed", [False, True], ids=["daemon-up", "daemon-killed-mid-session"])
+def test_claude_code_through_the_resident_gate(tmp_path, work, secrets, killed):
+    settings = claude_settings(tmp_path, "hook")  # only the hook can block
+    daemon = start_resident_gate(tmp_path)
+    calls = [
+        Call("Read", {"file_path": str(secrets["denied"])}),
+        Call("Bash", {"command": allowed_command(work)}),
+        Call("Read", {"file_path": str(secrets["denied"])}),
+        Call("Bash", {"command": second_command(work)}),
+    ]
+    try:
+        stub = killing(AnthropicStub, daemon, after=2)(calls) if killed else AnthropicStub(calls)
+        with stub:
+            proc = claude_run(tmp_path, stub, settings, False, work, extra_env=DAEMON_ENV)
+    finally:
+        stop_resident_gate(daemon)
+    check_through_the_gate(stub, proc, work, secrets, killed)
+
+
+@pytest.mark.parametrize("killed", [False, True], ids=["daemon-up", "daemon-killed-mid-session"])
+def test_opencode_through_the_resident_gate(tmp_path, work, secrets, killed):
+    out = opencode_config(tmp_path, "shim")  # only the plugin can block
+    daemon = start_resident_gate(tmp_path)
+    calls = [
+        Call("read", {"filePath": str(secrets["denied"])}),
+        Call("bash", {"command": allowed_command(work), "description": "run it"}),
+        Call("read", {"filePath": str(secrets["denied"])}),
+        Call("bash", {"command": second_command(work), "description": "run it"}),
+    ]
+    try:
+        stub = killing(OpenAIStub, daemon, after=2)(calls) if killed else OpenAIStub(calls)
+        with stub:
+            proc = opencode_run(tmp_path, stub, out, work, extra_env=DAEMON_ENV)
+    finally:
+        stop_resident_gate(daemon)
+    check_through_the_gate(stub, proc, work, secrets, killed)
+
+
+# --- onFailure "block" on a real Claude Code ---------------------------------------------------------------------------
+
+
+def claude_version() -> tuple[int, ...]:
+    done = subprocess.run([runner_bin("claude"), "--version"], capture_output=True, text=True, timeout=60, check=False)
+    found = re.match(r"(\d+)\.(\d+)\.(\d+)", done.stdout.strip())
+    return tuple(int(x) for x in found.groups()) if found else (0, 0, 0)
+
+
+FAILING_HOOKS = {
+    "crash": ("sh -c 'exit 1'", None),  # an exit code that is neither 0 nor 2: a hook that died
+    "time-out": ("sleep 30", 1),  # a hook that is killed at its limit
+}
+
+
+def claude_with_failing_hook(tmp_path, work, how: str, on_failure: bool):
+    """The generated PreToolUse hook with its command swapped for one that fails; `on_failure` False removes the setting,
+    which is the control that shows the setting is what blocks."""
+    command, timeout = FAILING_HOOKS[how]
+    settings = claude_settings(tmp_path, "hook")
+    conf = json.loads(settings.read_text())
+    hook = conf["hooks"]["PreToolUse"][0]["hooks"][0]
+    assert hook["onFailure"] == "block"  # ws wrote it
+    hook["command"] = command
+    if timeout is not None:
+        hook["timeout"] = timeout
+    if not on_failure:
+        del hook["onFailure"]
+    settings.write_text(json.dumps(conf))
+    marker = work / "RAN"
+    stub = AnthropicStub([Call("Bash", {"command": f"touch {marker}"})])
+    with stub:
+        proc = claude_run(tmp_path, stub, settings, False, work)
+    return stub, proc, marker
+
+
+@pytest.mark.parametrize("how", sorted(FAILING_HOOKS))
+def test_claude_code_blocks_the_call_when_the_hook_fails_and_says_on_failure_block(tmp_path, work, how):
+    if claude_version() < (2, 1, 295):
+        pytest.skip("onFailure needs Claude Code 2.1.295 or newer")
+    stub, proc, marker = claude_with_failing_hook(tmp_path, work, how, on_failure=True)
+    assert len(stub.tool_results()) == 1, f"the runner did not report the call back\n{where(proc)}"
+    assert not marker.exists(), f"the call ran although its hook failed ({how}): {stub.tool_results()}"
+
+
+@pytest.mark.parametrize("how", sorted(FAILING_HOOKS))
+def test_the_same_failing_hook_without_on_failure_lets_the_call_run(tmp_path, work, how):
+    """The control: without the setting a failed hook is only a warning, so the block above is the setting's doing."""
+    if claude_version() < (2, 1, 295):
+        pytest.skip("onFailure needs Claude Code 2.1.295 or newer")
+    stub, proc, marker = claude_with_failing_hook(tmp_path, work, how, on_failure=False)
+    assert marker.exists(), f"the control did not run: {stub.tool_results()}\n{where(proc)}"

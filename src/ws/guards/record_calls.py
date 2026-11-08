@@ -27,6 +27,7 @@ from ws.guards import Finding, known_keys
 NAME = "record-calls"
 EVENTS = ("pre",)
 KINDS = ("command", "read", "search", "write", "tool", "agent", "skill", "message")
+PRIORITY = 0  # records first, so a call a later guard refuses is on record too
 
 LOG = "gate-calls.jsonl"
 SCHEMA_VERSION = 1

@@ -74,6 +74,8 @@ A command that speaks a protocol on standard output (`ws mcp serve`, `ws gate ch
 | `WS_OUTPUT` | Set to `json` for `--json` on every command. |
 | `WS_BROKER_SOCKET` | The broker socket a client uses. |
 | `WS_GATED_SESSION` | Set inside a gated session. `ws approve` refuses when it's present. |
+| `WS_GATE_DAEMON` | Set to `0` in a hook's environment to make every gate call decide in its own process, with no resident gate (see [The resident gate](gate.md#the-resident-gate)). |
+| `WS_FORCE_CASELESS_PATHS` | Set to `1` to match paths without regard to case in every `ws gate` process, as on macOS. It can only turn that on. For testing the gate on a case-sensitive machine. |
 | `NO_COLOR` | Any non-empty value turns colour off in every command. An empty value is ignored. `--no-color` does the same. |
 | `FORCE_COLOR` | Any value except empty, `0` or `false` (any case) keeps colour on when output goes to a pipe or `TERM=dumb`. `NO_COLOR` and `--no-color` win. |
 | `TERM` | `dumb` turns colour off in every command, and makes `ws setup` print each step once, with no cursor-move or erase codes. |
@@ -186,6 +188,24 @@ ws gate event [-h] [--policy FILE] --runner {claude-code,opencode}
 An event that `ws gate check` answers, or one ws doesn't read, exits 0 with a line on standard error. A payload it can't
 read exits 0 with a line saying it was skipped: this command gives advice and never blocks a session by crashing.
 See [Guards](guards.md).
+
+### `ws gate serve`
+
+The resident gate: one process for each user and state folder that answers every hook call of every session. The first
+hook call that finds none running starts it. See [The resident gate](gate.md#the-resident-gate).
+
+```text
+ws gate serve [-h] [--pin KEY=PATH] [--idle SECONDS] [--stop]
+```
+
+| Argument | Meaning |
+|---|---|
+| `--pin KEY=PATH` | The folders `ws install` pinned (home, config, state, data, cache); the socket goes in `run/` under the state folder. |
+| `--idle SECONDS` | Exit after this long without a request (default 900). |
+| `--stop` | Ask the running daemon to exit. Exit 0 when one was told to, 1 when none is running. |
+
+It runs in the foreground until stopped, idle, or ws is upgraded under it. Exit 1 when the run folder isn't private to
+you or something else sits where the socket goes; the reason is on standard error.
 
 ### `ws gate replay`
 

@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from ws import cli, output, paths
+from ws import cli, output, paths, session
 
 # Commands that keep their own stdout (a protocol, a hook, the terminal) and so are not wrapped; their errors still are.
 RAW = {
@@ -29,6 +29,8 @@ RAW = {
     "session.nudge": "a hook entry",
     "notify.alert": "a hook entry",
     "setup": "a person at a terminal, or the page (setup --yes is covered below)",
+    "queue.slot": "runs the caller's command in a slot: that command's own output and exit code",
+    "usage.statusline": "a statusline command Claude Code pipes JSON to: one line of its own, no envelope",
 }
 
 # What to run for each of the others (in a throwaway HOME): enough to get a real answer or a typed error.
@@ -92,6 +94,18 @@ CASES: dict[str, list[str]] = {
     "eval.approve": ["eval", "approve", "nothing"],
     "eval.reject": ["eval", "reject", "nothing"],
     "home.data": ["home", "data"],
+    "queue.add": ["queue", "add", "nojob"],
+    "queue.list": ["queue", "list"],
+    "queue.show": ["queue", "show", "nope"],
+    "queue.cancel": ["queue", "cancel", "nope"],
+    "queue.run": ["queue", "run"],
+    "node.join": ["node", "join"],
+    "node.show": ["node", "show"],
+    "node.remove": ["node", "remove"],
+    "msg.send": ["msg", "send", "someone", "hello"],
+    "msg.list": ["msg", "list"],
+    "msg.read": ["msg", "read", "1"],
+    "msg.export": ["msg", "export", "--out", "{home}/messages.jsonl"],
     "term": ["term", "--bind", "0.0.0.0"],  # a typed refusal: the real command stays up until stopped
 }
 
@@ -109,6 +123,7 @@ def box(tmp_path, monkeypatch):
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     monkeypatch.chdir(home)
     monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+    monkeypatch.setattr(session, "trusted_env", lambda: {"HOME": str(home)})  # `ws msg` reads the account's home
     return home
 
 

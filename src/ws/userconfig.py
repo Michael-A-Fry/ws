@@ -21,6 +21,9 @@ The promises, each pinned by a test:
   allows unsandboxed ones, or it re-opens a path the wall holds) is refused, naming each setting and its file, unless you
   keep them on purpose with `--allow-widened-sandbox`; ws then records the choice (`widened_by_user`), and doctor reports
   the wall as widened.
+- OpenCode takes the last rule that matches, so ws's `ask` keys go in before its `deny` keys (a later change of policy
+  that adds an ask moves it ahead of the denies), and an `ask` that would sit after a `deny` of yours that it overlaps is
+  left out: a rule added at the end must never loosen a deny.
 - A file ws cannot merge safely (a link, not plain JSON, JSONC with comments) is refused with the reason and the way to
   gate a session without it: `ws gate launch`.
 
@@ -396,18 +399,80 @@ def _sandbox_ops(node: dict, path: list[str]) -> list[dict]:
 
 
 def _opencode_ops(files: Mapping[str, str]) -> list[dict]:
+    """The `ask` and `deny` rules of the generated config, in its order: OpenCode takes the last rule that matches, so
+    the asks are written before the denies and a deny beats an ask on the same command. The catch-all `allow` is yours."""
     conf = json.loads(files["opencode.json"])
     ops: list[dict] = []
     for tool, rules in conf.get("permission", {}).items():
         if isinstance(rules, dict):
-            ops += [
-                {"op": "set", "path": ["permission", tool, pat], "value": "deny"}
-                for pat, act in rules.items()
-                if act == "deny"
-            ]
+            for act in ("ask", "deny"):
+                ops += [
+                    {"op": "set", "path": ["permission", tool, pat], "value": act}
+                    for pat, given in rules.items()
+                    if given == act
+                ]
         elif rules == "deny":
             ops.append({"op": "set", "path": ["permission", tool], "value": "deny"})
     return ops
+
+
+def _wild(pattern: str) -> re.Pattern:
+    """OpenCode's wildcard as a regex: `*` is anything, `?` one character, and a trailing ` *` also matches the bare
+    command."""
+    body = re.escape(pattern).replace(r"\*", ".*").replace(r"\?", ".")
+    if body.endswith(r"\ .*"):
+        body = body[: -len(r"\ .*")] + r"(\ .*)?"
+    return re.compile(body, re.DOTALL)
+
+
+def _asks_yours_would_override(ops: list[dict], where: Path, entry: Mapping | None) -> list[dict]:
+    """`ops` without the `ask` rules that would sit after a `deny` rule of yours that they overlap: a rule added at the end
+    wins in OpenCode, so the ask would loosen your deny. The hook still asks for the approval, so nothing is lost. A file
+    that does not read is left for the merge to refuse."""
+    try:
+        doc, _ = load(where)
+    except WsError:
+        return ops
+    ours = {tuple(op["path"]) for op in (entry or {}).get("added", [])}
+    kept = []
+    for op in ops:
+        path = op["path"]
+        rules = _lookup(doc, path[:2]) if op["value"] == "ask" and len(path) == 3 else None
+        yours = (
+            [pat for pat, act in rules.items() if act == "deny" and (*path[:2], pat) not in ours]
+            if isinstance(rules, dict)
+            else []
+        )
+        if any(_wild(path[2]).fullmatch(k) or _wild(k).fullmatch(path[2]) for k in yours):
+            continue
+        kept.append(op)
+    return kept
+
+
+def _asks_before_denies(doc: dict, added: list) -> None:
+    """Move ws's `ask` keys to just before ws's first `deny` key in the same block when a later change of policy added
+    them after it (a new key goes to the end of the block, and the last match wins). Your keys never move past each
+    other; only ws's own ask keys change place."""
+    blocks = {tuple(op["path"][:2]) for op in added if op["op"] == "set" and len(op["path"]) == 3}
+    for path in blocks:
+        rules = _lookup(doc, list(path))
+        if not isinstance(rules, dict):
+            continue
+        mine = {op["path"][2]: op["value"] for op in added if op["op"] == "set" and tuple(op["path"][:2]) == path}
+        keys = list(rules)
+        denies = [keys.index(k) for k, v in mine.items() if v == "deny" and k in rules]
+        if not denies:
+            continue
+        first = min(denies)
+        late = [k for i, k in enumerate(keys) if mine.get(k) == "ask" and i > first]
+        if not late:
+            continue
+        rest = [k for k in keys if k not in late]
+        at = rest.index(keys[first])
+        order = [*rest[:at], *late, *rest[at:]]
+        moved = {k: rules[k] for k in order}
+        rules.clear()
+        rules.update(moved)
 
 
 def _notice(where: Path, backup: Path | None) -> str:
@@ -527,7 +592,7 @@ def plan(
     else:
         plug = plugin_path(env)
         files = adapter.generate(pol, cmd, out, policy_file, protect=(str(where), str(plug)), pin=pin)
-        ops = _opencode_ops(files)
+        ops = _asks_yours_would_override(_opencode_ops(files), where, entry)
         copies[plug] = files[adapter.PLUGIN]
     kept = tuple(sorted({w.label for w in widened}))
     return GatePlan(files, Merge(runner, where, tuple(ops), backup, tuple(cmd), policy_digest(pol), kept), copies)
@@ -722,6 +787,8 @@ def _merge_once(m: Merge, entry: Mapping | None, made_dirs: list, new_dirs: list
         adopted = bool(old_added)
         old_made = _emptied_by(doc, old_added, m.path)
     new, added, made = update(doc, old_added, old_made, m.ops, m.path)
+    if m.runner == "opencode":
+        _asks_before_denies(new, added)
     if entry is None and not added and not made:
         return None, Outcome("applied")
     first = entry is None and raw is not None and m.backup is not None

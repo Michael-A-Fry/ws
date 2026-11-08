@@ -2,15 +2,19 @@
 
 A module under src/ws that writes a JSON-lines file (through `ws.jsonl`, or to a `.jsonl` path of its own) must appear
 in the page's table with its schema; each line a ws writer produces carries `schema` and `ts`; and a log that used the
-older `at` key writes both. The run-record schema only grows within version 2.
+older `at` key writes both. The run-record schema only grows within a version; version 2 is frozen.
 """
 
 import ast
+import json
 import re
+from datetime import UTC, datetime
 from pathlib import Path
 
 from ws import canary, gate, jsonl, rating, runrecord, sandbox
 from ws import eval as ws_eval
+from ws import node as ws_node
+from ws.adapters import opencode
 from ws.guards import claims, record_calls
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -32,6 +36,8 @@ SCHEMAS = {
     "claims.jsonl": claims.SCHEMA_VERSION,
     "gate.jsonl": gate.VERDICT_SCHEMA,
     "wall-report.jsonl": sandbox.WALL_REPORT_SCHEMA,
+    "footprint.jsonl": ws_node.SCHEMA_VERSION,
+    "asks.jsonl": opencode.ASKS_SCHEMA,
 }
 
 # Version 2 of the run record, frozen: a later change may add a key to the schema under a new number, never to this one.
@@ -138,8 +144,8 @@ def modules_that_write() -> dict[str, set[str]]:
 # the asks file it reads (it writes nothing), and ws.paths names ratings.jsonl in its table of where files live.
 # src/ws/paths.py is on the list because it writes no file at all: the name is one row of its table, not a store.
 NAMES_ONLY = {"src/ws/policy.py", "src/ws/adapters/claude_code.py", "src/ws/home/api.py", "src/ws/paths.py"}
-# Files another tool writes and ws only reads (the home API's default sources). Not ws stores, so stores.md doesn't
-# list them; only a NAMES_ONLY module may name one.
+# A file the home API names as a default source and does not write: the OpenCode shim (src/ws/adapters/opencode.py) is
+# its writer and stores.md lists it. A NAMES_ONLY module may name it without being a writer.
 FOREIGN = {"asks.jsonl"}
 
 
@@ -165,6 +171,7 @@ KNOWN_WRITERS = {
     "src/ws/eval.py",
     "src/ws/canary.py",
     "src/ws/guards/record_calls.py",
+    "src/ws/node.py",
 }
 
 
@@ -240,10 +247,36 @@ def test_stamped_lines_are_rfc_3339_with_a_z_and_read_back_by_when(tmp_path):
     assert jsonl.when({"at": back["at"]}) == back["at"]  # a line from before `ts` reads the same way
 
 
-def test_run_record_schema_2_only_gains_keys():
-    """D4: within one schema number a record only gains fields, so a key that version 2 had is still there."""
-    assert runrecord.SCHEMA_VERSION == 2
+# What version 3 added to version 2. It is not frozen yet: version 3 may still gain keys, never lose these.
+RUN_RECORD_V3_ADDED = ["purpose", "stop_reason", "reservation"]
+
+
+def test_run_record_schema_3_keeps_every_key_of_schema_2():
+    """D4: within one schema number a record only gains fields, and a later number keeps the earlier one's keys."""
+    assert runrecord.SCHEMA_VERSION == 3
     missing = [k for k in RUN_RECORD_V2 if k not in runrecord.KEYS]
-    assert not missing, f"schema 2 lost {missing}: a removed or renamed key takes a new schema number"
-    assert set(runrecord.schema()["required"]) >= set(RUN_RECORD_V2)
-    assert set(runrecord.schema()["properties"]) >= set(RUN_RECORD_V2)
+    assert not missing, f"schema 3 lost {missing}: a removed or renamed key takes a new schema number"
+    assert set(runrecord.schema()["required"]) >= set(RUN_RECORD_V2) | set(RUN_RECORD_V3_ADDED)
+    assert set(runrecord.schema()["properties"]) >= set(RUN_RECORD_V2) | set(RUN_RECORD_V3_ADDED)
+    assert runrecord.KEYS[: len(RUN_RECORD_V2)] == tuple(RUN_RECORD_V2)  # the new keys come after the old ones
+
+
+def test_a_schema_2_line_still_reads(tmp_path):
+    """A line written under schema 2 has none of the three schema 3 keys: it reads, and counts, as it did."""
+    old = {k: None for k in RUN_RECORD_V2}
+    old.update(
+        schema=2,
+        run_id="20260101T000000Z-abcdef",
+        job="j",
+        started_at="2026-11-02T00:00:00.000Z",
+        status="ok",
+        cost_usd=1.5,
+    )
+    log = tmp_path / "logs" / "runs.jsonl"
+    log.parent.mkdir()
+    log.write_text(json.dumps(old) + "\n", encoding="utf-8")
+    (rec,) = runrecord.read(log)
+    assert rec["schema"] == 2 and rec.get("purpose") is None and rec.get("reservation") is None
+    now = datetime(2026, 11, 8, tzinfo=UTC)
+    assert runrecord.month_spend([rec], now) == 1.5
+    assert runrecord.month_spend_by_purpose([rec], now) == {None: 1.5}

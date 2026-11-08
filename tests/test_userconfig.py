@@ -594,12 +594,16 @@ def test_ws008_gate_every_session_with_no_entries_fails(box, capsys):
 
 def test_ws008_names_each_guard_the_runner_does_not_run(box, capsys):
     do_install(capsys, box, runner="opencode")
+    assert "isn't run by" not in ws008(box).detail  # the guards the default policy has on all run on OpenCode
+    pol = box / ".ws" / "policy.toml"
+    pol.write_text(pol.read_text(encoding="utf-8").replace("on = [", 'on = ["claims", ', 1), encoding="utf-8")
     c = ws008(box)
     assert c.status == "warn"
     from ws.adapters import opencode
 
-    on = [g for g in opencode.UNSUPPORTED_GUARDS if g in policy.default_policy().guards.on]
-    assert on and all(f"`{g}` isn't run by opencode" in c.detail for g in on)
+    on = [g for g in opencode.UNSUPPORTED_GUARDS if g in policy.load(pol).guards.on]
+    assert on == ["claims"] and all(f"`{g}` isn't run by opencode" in c.detail for g in on)
+    assert "syntax-check" not in c.detail
 
 
 def test_ws008_a_launch_profile_with_ws_items_still_there_warns(box, capsys):

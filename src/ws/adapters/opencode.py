@@ -2,7 +2,16 @@
 runs `ws gate check` on every governed tool call and throws on a deny (the second layer; it also fails closed: any
 error in the shim blocks the call).
 
-Also denied: edits of the policy file and of the generated folder, so a session cannot loosen its own gate.
+The permission block holds every kind of refusal the policy has: `deny_commands` (with the patterns the guards that are
+on contribute), `deny_read`, `deny_tools` and the protected paths as `deny`, and `ask_commands` as `ask`. OpenCode takes
+the last rule that matches, so each block runs allow-all, then asks, then denies, and a deny beats an ask on the same
+command. The shim runs the guards on OpenCode's own events (see EVENT_NAMES) through the thin client, with the check
+before a call the only one that can block.
+
+Also denied: edits of the policy file and of the generated folder, so a session cannot loosen its own gate, and of the
+skills folders OpenCode reads (its own, and the ones it shares with other runners), because a skill is read as
+instructions. Each is denied by absolute path and by its last two folders at any depth, so a project's own folder of that name is held
+too. The project's own `.opencode/skills` is denied as well.
 
 Point OpenCode at the output so its global config is never touched, and so a project's own `opencode.json` cannot
 loosen the gate: the inline config (OPENCODE_CONFIG_CONTENT) is read after the global, OPENCODE_CONFIG and project
@@ -20,6 +29,7 @@ wall; see IGNORE below for what that needs.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
 import re
@@ -27,8 +37,9 @@ import shlex
 from pathlib import Path
 
 from ws import guards, jobs, paths
-from ws.adapters import Call, check_argv, client_argv, protected_paths
+from ws.adapters import Call, check_argv, client_argv, event_argv, protected_paths
 from ws.adapters.opencode_plugin import SOURCE
+from ws.output import WsError
 from ws.policy import Policy, native_patterns
 
 NAME = "opencode"
@@ -38,8 +49,66 @@ _TOOLS = {"web_fetch": "webfetch", "web_search": "websearch"}
 # For ws.sandbox: the env var that names the generated folder. The whole folder is read-only in the wall (OpenCode loads
 # plugin/, tool/, agent/, command/ and opencode.jsonc from it, so a planted file there would outlive the session).
 CONFIG_DIR_ENV = "OPENCODE_CONFIG_DIR"
-# The guards (ws.guards) the generated shim does not run yet: all of them. `ws doctor` names them when a policy has one on.
-UNSUPPORTED_GUARDS = guards.names()
+ASKS_SCHEMA = 1  # the `schema` of each line the shim appends to the asks file (docs/reference/stores.md)
+
+# OpenCode's plugin hooks and events, as ws.guards names them (checked against the 1.19.4 binary: tool.execute.before,
+# tool.execute.after, chat.message and session.created are plugin hooks or events it fires, and session.idle is the event
+# that ends a turn). OpenCode has one idle event for a root session and a subagent's alike; the shim tells them apart
+# (a child session has a parent) and sends the second as "session.idle.child", ws's own name, never one OpenCode sends.
+EVENT_NAMES = {
+    "tool.execute.before": "pre",
+    "tool.execute.after": "post",
+    "session.created": "start",
+    "chat.message": "prompt",
+    "session.idle": "stop",
+    "session.idle.child": "subagent-stop",
+}
+# The tools a Call kind comes from, in the order a list of them is written. OpenCode has no send-message tool, so no
+# "message" call ever comes from here: a guard that reads only those has nothing to see on this runner.
+KIND_TOOLS = {
+    "command": ("bash",),
+    "read": ("read",),
+    "search": ("grep", "glob", "list"),
+    "write": ("edit", "write", "multiedit", "patch", "apply_patch"),
+    "tool": tuple(_TOOLS.values()),
+    "agent": ("task",),
+    "skill": ("skill",),
+}
+PRODUCES = tuple(KIND_TOOLS)  # the Call kinds `parse` can make
+_ALWAYS_PRE = (
+    "command",
+    "read",
+    "search",
+    "write",
+    "tool",
+)  # checked before every call; the rest only when a guard reads them
+# OpenCode's `policies` key (checked on 1.19.4): the only one there is `experimental.policies`, which governs provider
+# access, not tool calls. ws writes none until a version's schema has a permission key of that name; set this to that
+# version then (docs/reference/gate.md says what was checked).
+POLICIES_SINCE: str | None = None
+
+
+def guard_gaps(guard) -> list[str]:
+    """Why this runner cannot give a guard what it reads, one line for each event it cannot reach: the event has no name
+    in EVENT_NAMES, or (before and after a call) every Call kind the guard reads is one `parse` never makes."""
+    events = set(EVENT_NAMES.values())
+    gaps = []
+    for event in guard.EVENTS:
+        if event not in events:
+            gaps.append(f"{event}: OpenCode has no event ws reads for it")
+        elif event in ("pre", "post") and guard.KINDS and not set(guard.KINDS) & set(PRODUCES):
+            gaps.append(f"{event}: it reads only {', '.join(guard.KINDS)} calls, which OpenCode never makes")
+    return gaps
+
+
+def unsupported_guards() -> tuple[str, ...]:
+    """The guards (ws.guards) one of whose events this runner cannot reach, worked out from what each guard declares
+    against EVENT_NAMES and the kinds `parse` makes, so a new guard needs no edit here."""
+    return tuple(name for name, guard in guards.all_guards().items() if guard_gaps(guard))
+
+
+# The guards the generated shim cannot run. `ws doctor` names them when a policy has one on.
+UNSUPPORTED_GUARDS = unsupported_guards()
 
 
 # OpenCode writes this file into its config folder at start and will not run if it cannot (1.19.4). Written here at
@@ -114,6 +183,59 @@ def _protect_forms(path: str, is_out: bool) -> list[str]:
     return [path, f"{path}/**", f"**/{tail}", f"**/{tail}/**"]
 
 
+def _skill_forms(path: str) -> list[str]:
+    """Edit rules for a skills folder in the person's home or config folder: the absolute path, and its last two segments
+    at any depth, however OpenCode spells the path. That also holds a project's own folder of the same name: a planted
+    skill steers the next session wherever it sits, so the rule errs towards denying."""
+    tail = "/".join(Path(path).parts[-2:])
+    return [path, f"{path}/**", f"**/{tail}", f"**/{tail}/**"]
+
+
+# The skills folders of a project that OpenCode reads on its own (`.opencode/skills`, and the older singular name): they
+# steer the next session as much as a home-level one does.
+PROJECT_SKILL_FOLDERS = (".opencode/skills", ".opencode/skill")
+
+
+def _project_skill_forms(folder: str) -> list[str]:
+    return [folder, f"{folder}/**", f"**/{folder}", f"**/{folder}/**"]
+
+
+def native_asks(policy: Policy) -> list[str]:
+    """The `ask_commands` a runner can enforce from its own rule list (`native_patterns` decides which and in what
+    spellings: a pattern only the hook can read is left to the hook), without the patterns the guards add."""
+    gate = dataclasses.replace(policy.gate, deny_commands=policy.gate.ask_commands)
+    return native_patterns(dataclasses.replace(policy, gate=gate, guards=dataclasses.replace(policy.guards, on=())))
+
+
+def skill_folders(pin: paths.Pin) -> list[str]:
+    """The skills folders OpenCode reads, as absolute paths: its own (both spellings of the folder name) and the ones
+    it shares with other runners (`ws.skills.ALSO_READS`)."""
+    from ws import adapters, install, skills  # here, not at the top: ws.skills imports the adapters
+
+    env = {**paths.environ(), "HOME": str(pin.home)}
+    own = skills.skills_dir(NAME, env)
+    found = [own, own.with_name("skill")]
+    for where in skills.ALSO_READS.get(NAME, ()):
+        found.append(skills.skills_dir(where, env) if where in adapters.all_adapters() else install.expand(where, env))
+    return list(dict.fromkeys(str(p) for p in found))
+
+
+def asks_file(pin: paths.Pin) -> str:
+    """The file the shim appends OpenCode's open permission asks to, for ws home to show: `[home.sources] asks_jsonl` in
+    the profile, else the default under the home folder. A profile that does not read is no reason to fail a generate."""
+    from ws.home import api
+
+    try:
+        env = api.Env.make({**paths.environ(), "HOME": str(pin.home)})
+        return str(env.path("asks_jsonl"))
+    except WsError:
+        return str(pin.home / ".claude-usage" / "asks" / "asks.jsonl")
+
+
+def _tools_of(kinds) -> list[str]:
+    return [t for kind in KIND_TOOLS if kind in kinds for t in KIND_TOOLS[kind]]
+
+
 def generate(
     policy: Policy,
     ws_cmd: list[str],
@@ -124,9 +246,11 @@ def generate(
     pin: paths.Pin | None = None,
 ) -> dict[str, str]:
     protect = tuple(protect)
-    # Last matching rule wins, so the catch-all comes first.
-    bash: dict[str, str] = {"*": "allow"}
-    bash.update(dict.fromkeys(native_patterns(policy), "deny"))
+    pin = pin or paths.pin_of()
+    # Last matching rule wins, so the order is the catch-all, then the asks, then the denies: a deny beats an ask.
+    denies = native_patterns(policy)
+    asks = [p for p in native_asks(policy) if p not in denies]  # one asked and denied is denied
+    bash: dict[str, str] = {"*": "allow", **dict.fromkeys(asks, "ask"), **dict.fromkeys(denies, "deny")}
     permission: dict = {"bash": bash}
     if policy.gate.deny_read:
         rules = {"*": "allow", **dict.fromkeys((f for r in policy.gate.deny_read for f in _read_forms(r)), "deny")}
@@ -134,14 +258,31 @@ def generate(
     edit = {"*": "allow"}  # covers write and patch too; a path may be a file or a folder: cover both
     for p in protected_paths(out, policy_file, protect):
         edit.update(dict.fromkeys(_protect_forms(p, p == str(out)), "deny"))
+    for p in skill_folders(pin):  # a skill is read as instructions: a planted one would steer the next session
+        edit.update(dict.fromkeys(_skill_forms(p), "deny"))
+    for folder in PROJECT_SKILL_FOLDERS:
+        edit.update(dict.fromkeys(_project_skill_forms(folder), "deny"))
     permission["edit"] = edit
     for t in policy.gate.deny_tools:
         permission[_TOOLS[t]] = "deny"
-    config = {"$schema": "https://opencode.ai/config.json", "permission": permission}
-    pin = pin or paths.pin_of()
+    config: dict = {"$schema": "https://opencode.ai/config.json", "permission": permission}
+    if (
+        POLICIES_SINCE is not None
+    ):  # a version whose schema has the key: ws writes it empty until it has a rule to put in
+        config["policies"] = {}
+    on = policy.guards.on
+    pre_kinds = set(_ALWAYS_PRE) | (guards.kinds_for(on, "pre") & set(PRODUCES))
+    post_kinds = guards.kinds_for(on, "post") & set(PRODUCES)
+    events = [ev for ev in ("start", "prompt", "post", "stop", "subagent-stop") if guards.wanted(on, ev)]
     check = client_argv("check", check_argv(ws_cmd, NAME, policy_file, out, protect, pin), pin)
-    plugin = SOURCE.replace("/*__CHECK__*/ []", json.dumps(check))
+    event = client_argv("event", event_argv(ws_cmd, NAME, policy_file, pin), pin)
+    plugin = SOURCE.replace("/*__CHECK__*/ []", json.dumps(check)).replace("/*__EVENT__*/ []", json.dumps(event))
     plugin = plugin.replace("/*__WS__*/ []", json.dumps(ws_cmd)).replace("/*__PIN__*/ []", json.dumps(pin.args()))
+    plugin = plugin.replace("/*__GOVERNED__*/ []", json.dumps(_tools_of(pre_kinds)))
+    plugin = plugin.replace("/*__POST_TOOLS__*/ []", json.dumps(_tools_of(post_kinds)))
+    plugin = plugin.replace("/*__ADVICE__*/ []", json.dumps([e for e in events if e != "post" or post_kinds]))
+    plugin = plugin.replace("/*__ASK__*/ []", json.dumps(asks)).replace('/*__ASKS__*/ ""', json.dumps(asks_file(pin)))
+    plugin = plugin.replace("/*__ASKS_SCHEMA__*/ 0", str(ASKS_SCHEMA))
     return {CONFIG: json.dumps(config, indent=2) + "\n", PLUGIN: plugin, IGNORE: IGNORE_TEXT}
 
 
@@ -159,7 +300,8 @@ def patch_paths(patch: str) -> list[str]:
 
 def parse(payload: dict) -> Call | list[Call] | None:
     """What the shim sends: {"tool": "bash", "args": {"command": ...}}. A patch tool is a write of each file in the
-    patch."""
+    patch; `task` is an agent call and `skill` a skill call, as Claude Code's `Agent` and `Skill` are. The kinds this can
+    make are KIND_TOOLS. A tool it does not know (an MCP tool among them) is None."""
     tool, args = payload.get("tool"), payload.get("args")
     if not isinstance(tool, str) or not isinstance(args, dict):
         raise TypeError("payload has no tool and args")
@@ -168,7 +310,13 @@ def parse(payload: dict) -> Call | list[Call] | None:
     if tool == "read":
         return Call("read", _text(args, "filePath"))
     if tool in ("edit", "write", "multiedit"):
-        return Call("write", _text(args, "filePath"))
+        return Call.of("write", _text(args, "filePath"), tool=tool, **_write_data(tool, args))
+    if tool == "task":
+        found = {k: args[k] for k in ("prompt", "description", "subagent_type") if isinstance(args.get(k), str)}
+        return Call.of("agent", found.get("subagent_type", ""), tool=tool, **found)
+    if tool == "skill":
+        name = args["name"] if isinstance(args.get("name"), str) else ""
+        return Call.of("skill", name, tool=tool, name=name, args="")
     if tool in ("patch", "apply_patch"):
         kept = payload.get(
             "paths"
@@ -186,6 +334,26 @@ def parse(payload: dict) -> Call | list[Call] | None:
     if tool in _NEUTRAL:
         return Call("tool", _NEUTRAL[tool])
     return None
+
+
+def _write_data(tool: str, args: dict) -> dict:
+    """What a write tool gives besides the path, under the names `ws.adapters.Call` documents: `old` and `new` (edit),
+    `content` (write), `edits` (multiedit, a tuple of {old, new}). Only text the tool really sent."""
+    found: dict = {}
+    for key, name in (("oldString", "old"), ("newString", "new"), ("content", "content")):
+        if isinstance(args.get(key), str):
+            found[name] = args[key]
+    edits = args.get("edits")
+    if tool == "multiedit" and isinstance(edits, list):
+        found["edits"] = tuple(
+            {
+                k: e[key] if isinstance(e.get(key), str) else None
+                for k, key in (("old", "oldString"), ("new", "newString"))
+            }
+            for e in edits
+            if isinstance(e, dict)
+        )  # a recorded call (record-calls) holds a size and fingerprint where the text was: None here
+    return found
 
 
 def _text(d: dict, key: str) -> str:

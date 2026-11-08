@@ -10,6 +10,7 @@ below, and `python3 scripts/gen_code_map.py --check` (prek and CI) fails when it
 
 | Where (under `src/ws/`) | What it is |
 |---|---|
+| `_vendor/` | Third-party code that ws carries as one file each, with its licence header kept |
 | `adapters/` | Runner adapters: one module per runner |
 | `approvals.py` | Bound, single-use approvals: how a call the policy marks `ask_commands` gets a human's yes, once |
 | `brand.py` | The ws look in one place: colour tokens by role, the mark, and the rule for when colour is on |
@@ -37,6 +38,8 @@ below, and `python3 scripts/gen_code_map.py --check` (prek and CI) fails when it
 | `memory.py` | Memory module: Markdown files with front matter in a git repo, plus a rebuildable SQLite FTS5 index |
 | `migrate.py` | `ws migrate`: move ws's files from `~/.ws` to the XDG folders (see `ws.paths` for which file... |
 | `modules.py` | Plugins (the modules in the code): the parts of ws you can switch on or off |
+| `msg.py` | `ws msg`: leave a message for another session, on any runner or provider, and read what was left... |
+| `node.py` | A node's footprint: everything `ws node join` puts on this machine is written in a ledger as it... |
 | `notes.py` | Notes module: `ws note` drops a Markdown file into the `_inbox` of your own notes folder (any... |
 | `notesdetect.py` | Find notes you already keep: an Obsidian vault (a folder holding `.obsidian/`) or a Logseq graph... |
 | `osinfo.py` | Which machine are we on: macOS, Linux, Windows via WSL2, or native Windows (not supported; use WSL2) |
@@ -44,6 +47,7 @@ below, and `python3 scripts/gen_code_map.py --check` (prek and CI) fails when it
 | `paths.py` | Where ws keeps its files: four folders that follow the XDG base directory rules, or one folder... |
 | `policy.py` | The policy: one vendor-neutral `policy.toml` that says what a session may do |
 | `profile.py` | The profile: one TOML file per person (machine answers, roles, caps) |
+| `queue.py` | Admission before work: nothing starts until its money, turns, time, a slot and memory are... |
 | `rating.py` | `ws rate`: a thumbs up or down on a run, in one command |
 | `roles/` | Role adapters: one module per (role, adapter) pair |
 | `run.py` | `ws run JOB`: every headless job goes through here and leaves one complete record in `runs.jsonl` |
@@ -62,7 +66,7 @@ below, and `python3 scripts/gen_code_map.py --check` (prek and CI) fails when it
 | `testing/` | Test support that ships with ws: the mock model provider and its scenarios |
 | `ui/` | The shared page toolkit: the ws look as CSS, small HTML components, and the loopback server that... |
 | `unknownpath.py` | A command word with a part the reader cannot resolve, tested against the paths ws protects |
-| `usage.py` | The Console usage check: can ws read the provider's own usage report, the billing truth... |
+| `usage.py` | Usage signals: the provider's usage report, the subscription limits a statusline gives ws, spend... |
 | `userconfig.py` | The gate in the runner's own user config: ws's deny rules and hooks added beside yours... |
 | `version.py` | `ws version`: which build is this, where did it come from, and where is it installed |
 | `wallsettings.py` | What the sandbox settings Claude Code reads say about the wall: the keys that widen it, and `ws... |

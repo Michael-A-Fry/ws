@@ -4,18 +4,21 @@
     ws runs [--last N] [--json]    the last N records (default 10)
 
 The steps: load the job, profile and policy; refuse (exit 3, and still write a record with status "refused") when there
-is no monthly cap, this month's spend is at the cap, the Rule of Two says no, or the runner cannot price the model and
-the job does not say `allow_unpriced = true`; write the runner's gate config into a per-run folder
+is no monthly cap, the Rule of Two says no, or the runner cannot price the model and the job does not say
+`allow_unpriced = true`; reserve (`ws.queue`, one transaction: the monthly cap, the job's purpose cap, turns, time, a slot
+and memory, and a refusal that names the counter that said no); write the runner's gate config into a per-run folder
 `runs/<run_id>/gate` in the state folder (the gate denies the agent writes to `runs/` and `logs/`, so those hold only
 what ws wrote); lease each secret from the broker (the runner only ever holds a placeholder key and the
 lease's base URL); start the runner with a scrubbed environment, the prompt on stdin and the job's timeout; keep its
 output in files in the run folder (capped); read that into the record; release the leases whatever happened, including a
 Ctrl-C or a SIGTERM to `ws run`.
 
-The monthly cap is checked before each run. It is not enforced during one: a run that has started can spend what its
-own timeout and turns allow, so keep `timeout_s` and `max_turns` tight. A run whose cost the runner did not report
-counts at the person's own fallback ([roles.budget] fallback_usd_per_mtok, else unknown_run_usd), so spend is
-never undercounted. ws ships no prices.
+The money is reserved before each run and settled after it, from what the run used (`ws.queue` explains the counters).
+When the room left under a cap is less than the job's estimate, the reservation shrinks to it and Claude Code is
+passed that sum as `--max-budget-usd`, which does enforce it during the run; OpenCode has no such flag, so there the
+reservation holds the money but only the settle, from the actuals, corrects it. A run whose cost the runner did not
+report counts at the person's own fallback ([roles.budget] fallback_usd_per_mtok, else unknown_run_usd), so spend is
+never undercounted. ws ships no prices. A run that ends on SIGTERM (exit 143) is `preempted`: settled at its actuals.
 
 One recovery per known failure: a small table (`RECOVERIES`) names the failures ws can mend, each typed by the
 exception class that reports it, never by its message. Today that is the broker not answering when a secret is leased:
@@ -31,13 +34,14 @@ then `ws-work` once it is empty; a run folder that holds anything stays, and so 
 job wrote is the person's.
 
 Exit: 0 ok, 1 the runner failed or timed out, 2 the job could not be read (a record is written when the job name is
-safe), 3 refused.
+safe), 3 refused (the cap or a purpose cap, the Rule of Two, an expired deadline, a store that cannot be used).
 """
 
 from __future__ import annotations
 
 import argparse
 import contextlib
+import dataclasses
 import json
 import os
 import re
@@ -49,11 +53,13 @@ import sys
 import tempfile
 import threading
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from ws import __version__, adapters, broker, gate, jobs, jsonl, output, paths, policy, runrecord, selfcmd
+from ws import __version__, adapters, broker, gate, jobs, jsonl, output, paths, policy, queue, runrecord, selfcmd
 from ws import secrets as wsecrets
+from ws._vendor import sqlqueue
 from ws.output import WsError
 from ws.profile import ProfileError, load, profile_path
 
@@ -264,12 +270,13 @@ def _signal_group(p: subprocess.Popen, sig: int) -> None:
         os.killpg(p.pid, sig)
 
 
-def _kill(p: subprocess.Popen) -> None:
-    """Stop the runner and everything it started: SIGTERM, a short grace, then SIGKILL to the whole group. The SIGKILL
-    is sent even when the runner itself has gone, because a child that ignores SIGTERM outlives it."""
+def _kill(p: subprocess.Popen, grace_s: float | None = None) -> None:
+    """Stop the runner and everything it started: SIGTERM, a short grace (the job's `grace_s`, else `TERM_GRACE_S`), then
+    SIGKILL to the whole group. The SIGKILL is sent even when the runner itself has gone, because a child that ignores
+    SIGTERM outlives it."""
     _signal_group(p, signal.SIGTERM)
     with contextlib.suppress(subprocess.TimeoutExpired):
-        p.wait(timeout=TERM_GRACE_S)
+        p.wait(timeout=TERM_GRACE_S if grace_s is None else grace_s)
     _signal_group(p, signal.SIGKILL)
     with contextlib.suppress(subprocess.TimeoutExpired):
         p.wait(timeout=5)
@@ -291,7 +298,13 @@ def _pump(src, dest: Path, cap: int, truncated: list[bool]) -> None:
 
 
 def _spawn(
-    argv: list[str], env: dict[str, str], cwd: Path, timeout_s: float, stdin_path: Path | None, out_dir: Path
+    argv: list[str],
+    env: dict[str, str],
+    cwd: Path,
+    timeout_s: float,
+    stdin_path: Path | None,
+    out_dir: Path,
+    grace_s: float | None = None,
 ) -> tuple[int | None, bool, bool]:
     """Run the runner, its prompt from `stdin_path`, its output going to out_dir/stdout.txt and stderr.txt.
     Returns (exit code or None if killed, timed out, output truncated). A runner that overruns, or a `ws run` that is
@@ -319,10 +332,10 @@ def _spawn(
             code = p.wait(timeout=timeout_s)
         except subprocess.TimeoutExpired:
             timed_out = True
-            _kill(p)
+            _kill(p, grace_s)
         _signal_group(p, signal.SIGKILL)  # whatever the runner left behind holds the pipes open
     except BaseException:
-        _kill(p)
+        _kill(p, grace_s)
         raise
     finally:
         for t in threads:
@@ -360,19 +373,19 @@ def _base_record(job: jobs.Job, run_id: str, started: datetime, pol: policy.Poli
         ws_version=__version__,
         allow_unpriced=job.allow_unpriced,
         green=job.green,
+        purpose=job.purpose,
     )
 
 
-def _refusal(prof: dict, verdict: policy.Verdict, spend: float, job: jobs.Job, adapter) -> str | None:
-    cap = _budget(prof)[0]
-    if cap is None:
-        return "no monthly budget cap (WS103): set monthly_cap_usd in [roles.budget] of the profile"
-    if spend >= cap:
-        return f"this month's spend, US${spend:.4f}, is at the monthly cap of US${cap:g}"
+def _refusal(prof: dict, verdict: policy.Verdict, job: jobs.Job, adapter) -> tuple[str, str] | None:
+    """(counter, reason) for the refusals that need no look at the money: no cap set, the Rule of Two, a model the runner
+    cannot price. What the cap and the purpose cap say is admission's (`queue.Ledger.admit`)."""
+    if _budget(prof)[0] is None:
+        return "profile_cap", "no monthly budget cap (WS103): set monthly_cap_usd in [roles.budget] of the profile"
     if not verdict.ok:
-        return verdict.reason
+        return "rule_of_two", verdict.reason
     if not job.allow_unpriced and not getattr(adapter, "priced", lambda _job: True)(job):
-        return (
+        return "unpriced", (
             f"{job.runner} cannot say what {job.model} costs, so the cap could not be kept; set allow_unpriced = true "
             "in the job to run it anyway (it then counts at your fallback price)"
         )
@@ -409,8 +422,8 @@ def _lock_reason(log: Path) -> str | None:
     return None
 
 
-def _refuse(rec: dict, reason: str, path: Path) -> int:
-    rec.update(status="refused", error=reason[:300], ended_at=rec["started_at"], duration_ms=0)
+def _refuse(rec: dict, reason: str, path: Path, stop_reason: str, status: str = "refused") -> int:
+    rec.update(status=status, error=reason[:300], ended_at=rec["started_at"], duration_ms=0, stop_reason=stop_reason)
     _append(path, rec)
     print(f"ws: refused: {reason}", file=sys.stderr)
     print(f"ws: refusal recorded as {rec['run_id']}", file=sys.stderr)
@@ -470,19 +483,41 @@ def _term_becomes_exit():
         signal.signal(signal.SIGTERM, old)
 
 
+@dataclass
+class Queued:
+    """A run that comes from the queue: `run_id` is the receipt that waits for it. `waited` is set when admission said
+    wait (a slot, memory or a turn budget is full): nothing ran and nothing was recorded, and the queue tries again."""
+
+    run_id: str
+    waited: str | None = None
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     with _term_becomes_exit():
         return _run(args)
 
 
-def run_job(args: argparse.Namespace, job: jobs.Job, fields: dict | None = None, hook=None) -> int:
+def run_job(
+    args: argparse.Namespace, job: jobs.Job, fields: dict | None = None, hook=None, queued: Queued | None = None
+) -> int:
     """`ws run` for a job that is already loaded (`ws eval` changes its prompt, folder and limits). `fields` is merged
-    into the record when it is made; `hook(rec)` is called with the finished record just after it is written."""
+    into the record when it is made; `hook(rec)` is called with the finished record just after it is written (and its
+    reservation settled). `queued` is set by the queue's drain."""
     with _term_becomes_exit():
-        return _run(args, job, fields, hook)
+        return _run(args, job, fields, hook, queued)
 
 
-def _run(args: argparse.Namespace, job: jobs.Job | None = None, fields: dict | None = None, hook=None) -> int:
+def _bad_ledger(job: jobs.Job, e: WsError, log: Path, record: bool) -> int:
+    return _bad_job(job.name, e.message, log, job, record)
+
+
+def _run(
+    args: argparse.Namespace,
+    job: jobs.Job | None = None,
+    fields: dict | None = None,
+    hook=None,
+    queued: Queued | None = None,
+) -> int:
     env = os.environ
     home = paths.state_dir(env).absolute()
     log = runrecord.runs_path(env)
@@ -498,8 +533,15 @@ def _run(args: argparse.Namespace, job: jobs.Job | None = None, fields: dict | N
         pol = policy.load()
     except (KeyError, ProfileError, policy.PolicyError) as e:
         return _bad_job(job.name, str(e.args[0] if isinstance(e, KeyError) else e), log, job, record)
-    started = datetime.now(UTC)
-    run_id = runrecord.new_run_id(started)
+    if job.purpose is not None and job.purpose not in pol.budget_purposes:
+        known = ", ".join(sorted(pol.budget_purposes)) or "none"
+        return _bad_job(
+            job.name,
+            f"job {job.name}: purpose {job.purpose!r} is not in [budget.purposes] of the policy (known: {known})",
+            log, job, record,
+        )  # fmt: skip
+    started = datetime.now(UTC)  # the one clock reading of this run: its month, its lease, its deadline check
+    run_id = queued.run_id if queued else runrecord.new_run_id(started)
     run_dir = home / "runs" / run_id
     # no cwd in the job: a fresh empty folder, outside ws's folders (the wall makes those read-only)
     cwd = Path(job.cwd).expanduser() if job.cwd else default_cwd(home, run_id)
@@ -512,50 +554,125 @@ def _run(args: argparse.Namespace, job: jobs.Job | None = None, fields: dict | N
     stdin = bool(getattr(adapter, "PROMPT_VIA_STDIN", False))
     if not stdin:
         argv = [*argv, "--", job.prompt]
-    _, unknown_run_usd, fallback_usd_per_mtok = _budget(prof)
-    lock_reason = _lock_reason(log)  # first: a lock held by another process would stall the read below as well
+    cap, unknown_run_usd, fallback_usd_per_mtok = _budget(prof)
     try:
-        spend = (
-            0.0
-            if lock_reason
-            else runrecord.month_spend(runrecord.read(log), started, unknown_run_usd, fallback_usd_per_mtok)
-        )
-    except OSError as e:
-        print(f"ws: cannot read {log}: {e.strerror or type(e).__name__}", file=sys.stderr)
-        return EXIT_FAILED
+        ledger = queue.ledger_from_profile(prof, home, log)
+    except WsError as e:
+        return _bad_ledger(job, e, log, record)
+    lock_reason = _lock_reason(log)  # first: a lock held by another process would stall the read below as well
+
+    def month_spend() -> queue.Spend:
+        by = runrecord.month_spend_by_purpose(runrecord.read(log), started, unknown_run_usd, fallback_usd_per_mtok)
+        return queue.Spend(sum(by.values()), {k: v for k, v in by.items() if k})
+
     verdict = policy.rule_of_two(pol, list(job.sources), job.name, shell=getattr(adapter, "HAS_SHELL", True))
-    reason = lock_reason or _refusal(prof, verdict, spend, job, adapter)
+    static = _refusal(prof, verdict, job, adapter)
+    req = queue.request_for(
+        job, run_id, cap_usd=cap, unknown_run_usd=unknown_run_usd,
+        purpose_cap_usd=pol.budget_purposes.get(job.purpose) if job.purpose else None, limits=ledger.limits,
+    )  # fmt: skip
     rec = _base_record(job, run_id, started, pol, verdict)
     rec.update(fields or {})
     child_env = _child_env(extra)
     if args.dry_run:
+        try:
+            spend = queue.Spend() if lock_reason else month_spend()
+        except OSError as e:
+            print(f"ws: cannot read {log}: {e.strerror or type(e).__name__}", file=sys.stderr)
+            return EXIT_FAILED
+        verdict_now = None if lock_reason or static else ledger.admit(req, started, lambda: spend, dry=True)
+        would = (
+            lock_reason
+            or (static[1] if static else None)
+            or (verdict_now.reason if verdict_now and verdict_now.kind != "admit" else None)
+        )
         plan = {
             "job": job.name, "runner": job.runner, "argv": argv, "prompt_via": "stdin" if stdin else "argv",
             "cwd": str(cwd or "<a private folder under the temp dir>"), "timeout_s": job.timeout_s, "env": sorted(child_env),
             "secrets": [{"name": s.name, "host": s.host} for s in job.secrets], "policy": rec["policy"],
-            "month_spend_usd": round(spend, 6), "monthly_cap_usd": _budget(prof)[0], "would_refuse": reason,
+            "month_spend_usd": round(spend.total, 6), "monthly_cap_usd": cap, "would_refuse": would,
+            "purpose": job.purpose, "admission": verdict_now.kind if verdict_now else "not asked",
         }  # fmt: skip
         print(json.dumps(plan, indent=2))
-        return EXIT_REFUSED if reason else 0
-    if reason:
-        return _refuse(rec, reason, log)
+        return EXIT_REFUSED if would else 0
+    if lock_reason:
+        return _refuse(rec, lock_reason, log, "refused:run_log_locked")
+    if static:
+        return _refuse(rec, static[1], log, f"refused:{static[0]}")
+    try:
+        decision = ledger.admit(req, started, month_spend)
+    except queue.SpendUnreadable as e:
+        print(f"ws: cannot read {log}: {e}", file=sys.stderr)
+        return EXIT_FAILED
+    if decision.kind == "wait" and queued is not None:
+        queued.waited = decision.counter
+        print(f"ws: {job.name} waits: {decision.reason}", file=sys.stderr)
+        return EXIT_REFUSED
+    if decision.kind != "admit":
+        status = "expired" if decision.counter == "expired" else "refused"
+        return _refuse(rec, decision.reason, log, decision.stop_reason, status)
+    res = decision.reservation
+    rec["reservation"] = res.as_record()
+    if res.max_budget_usd is not None:
+        job = dataclasses.replace(job, max_budget_usd=res.max_budget_usd)
+    if job.checkpoint:
+        extra = {**extra, "WS_CHECKPOINT": job.checkpoint}
+        child_env = _child_env(extra)
     exe = _find_exe(argv[0], child_env)
     if exe is None:
-        rec.update(status="error", error=f"{job.runner}: `{argv[0]}` is not on PATH"[:300], ended_at=rec["started_at"])
-        rec["duration_ms"] = 0
-        _append(log, rec)
+        rec.update(
+            status="error", error=f"{job.runner}: `{argv[0]}` is not on PATH"[:300], ended_at=rec["started_at"],
+            stop_reason="not_found", duration_ms=0,
+        )  # fmt: skip
+        written = _append(log, rec)
+        _settle(ledger, res, rec, written, (unknown_run_usd, fallback_usd_per_mtok))
         print(f"ws: {rec['error']}", file=sys.stderr)
         return EXIT_FAILED
     rec["exe_path"] = exe
-    return _execute(job, adapter, pol, rec, run_dir, cwd, log, exe, stdin, hook)
+    return _execute(
+        job,
+        adapter,
+        pol,
+        rec,
+        run_dir,
+        cwd,
+        log,
+        exe,
+        stdin,
+        hook,
+        (ledger, res, unknown_run_usd, fallback_usd_per_mtok),
+    )
+
+
+# receipt status for each record status (a timeout is an error of the run; a crash or Ctrl-C is an interruption)
+_RECEIPT_STATUS = {"ok": "ok", "refused": "refused", "preempted": "preempted", "expired": "expired"}
+
+
+def _settle(ledger: queue.Ledger, res: queue.Reservation, rec: dict, written: bool, costing: tuple) -> None:
+    """Close the reservation from what the record says the run used (the same costing the cap check uses). Once, and
+    after the record is written. A store that cannot be written now leaves the row to the next reaper, which finds the
+    record by its run id and settles from it, so the spend is neither lost nor counted twice."""
+    status = _RECEIPT_STATUS.get(rec["status"]) or (
+        "interrupted" if rec.get("stop_reason") == "interrupted" else "error"
+    )
+    usd = runrecord.record_cost(rec, *costing)
+    try:
+        ledger.settle(
+            res, status=status, usd=usd, tokens=rec.get("tokens"), stop_reason=rec.get("stop_reason"),
+            now=datetime.now(UTC), record_written=written,
+        )  # fmt: skip
+    except (WsError, sqlqueue.StaleClaim) as e:
+        print(f"ws: could not settle the reservation for {rec['run_id']}: {getattr(e, 'message', e)}", file=sys.stderr)
 
 
 def _execute(
-    job, adapter, pol, rec: dict, run_dir: Path, cwd: Path, log: Path, exe: str, stdin: bool, hook=None
+    job, adapter, pol, rec: dict, run_dir: Path, cwd: Path, log: Path, exe: str, stdin: bool, hook=None, admitted=None
 ) -> int:
+    ledger, res, unknown_run_usd, fallback_usd_per_mtok = admitted
     t0 = time.monotonic()
     leases: list[broker.Lease] = []
     sock = wsecrets.socket_path(os.environ)
+    signalled: BaseException | None = None
     try:
         run_dir.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         run_dir.mkdir(mode=0o700)
@@ -568,6 +685,8 @@ def _execute(
             leases.append(_lease(s, sock, rec))
             rec["secrets_used"].append({"name": s.name, "host": s.host})
         argv, extra = adapter.build_command(job, run_dir, leases[0] if leases else None)
+        if job.checkpoint:
+            extra = {**extra, "WS_CHECKPOINT": job.checkpoint}
         child_env = _child_env(extra)
         argv[0] = exe
         prompt_file = None
@@ -577,7 +696,7 @@ def _execute(
         else:
             argv += ["--", job.prompt]
         rec["runner_version"] = exe_version(exe, child_env) or None
-        code, timed_out, truncated = _spawn(argv, child_env, cwd, job.timeout_s, prompt_file, run_dir)
+        code, timed_out, truncated = _spawn(argv, child_env, cwd, job.timeout_s, prompt_file, run_dir, job.grace_s)
         rec.update(ended_at=runrecord.iso(datetime.now(UTC)), exit_code=code, output_truncated=truncated)
         out, err = _read_back(run_dir / "stdout.txt", leases), _read_back(run_dir / "stderr.txt", leases)
         part = adapter.parse_result(out, err, code)
@@ -585,22 +704,34 @@ def _execute(
         for m in rec["models_used"]:
             m["model"] = m.get("model") or job.model
         if timed_out:
-            rec.update(status="timeout", error=f"stopped after the {job.timeout_s:g} s timeout")
+            rec.update(status="timeout", error=f"stopped after the {job.timeout_s:g} s timeout", stop_reason="timeout")
+        elif code in (143, -signal.SIGTERM):
+            rec.update(status="preempted", error=f"{job.runner} was stopped by SIGTERM", stop_reason="preempted")
         elif code != 0 or part.get("error"):
             last = (err.strip().splitlines() or [""])[-1]
-            rec.update(status="error", error=_short(part.get("error") or f"{job.runner} exited {code}: {last}", leases))
+            rec.update(
+                status="error", stop_reason="runner_error",
+                error=_short(part.get("error") or f"{job.runner} exited {code}: {last}", leases),
+            )  # fmt: skip
         else:
-            rec["status"] = "ok"
+            rec.update(status="ok", stop_reason="completed")
         with contextlib.suppress(Exception):
             rec["transcript_path"] = adapter.transcript_path(rec["session_id"], str(cwd), child_env)
     except broker.BrokerRefused as e:
-        rec.update(status="refused", error=_short(f"broker refused the secret: {e}", leases))
+        rec.update(
+            status="refused", stop_reason="refused:secret", error=_short(f"broker refused the secret: {e}", leases)
+        )
     except broker.BrokerUnavailable as e:
         tried = f" (ws already {rec['recovered'][-1]['action']}, once)" if rec["recovered"] else ""
-        rec.update(status="error", error=_short(f"{e}{tried}; {broker._hint(e)}", leases, 300))
+        rec.update(
+            status="error", stop_reason="broker_unavailable", error=_short(f"{e}{tried}; {broker._hint(e)}", leases, 300)
+        )  # fmt: skip
 
     except Exception as e:  # noqa: BLE001 (whatever went wrong, the run still gets its record)
-        rec.update(status="error", error=_short(f"{type(e).__name__}: {e}", leases))
+        rec.update(status="error", stop_reason="error", error=_short(f"{type(e).__name__}: {e}", leases))
+    except BaseException as e:  # Ctrl-C or SIGTERM: the finally below records it, then it goes on up
+        signalled = e
+        raise
     finally:
         for lease in leases:
             with contextlib.suppress(broker.BrokerError):
@@ -608,9 +739,14 @@ def _execute(
         rec["ended_at"] = rec["ended_at"] or runrecord.iso(datetime.now(UTC))
         rec["duration_ms"] = int((time.monotonic() - t0) * 1000)
         if rec["status"] is None:  # Ctrl-C, SIGTERM or another exit that is not an Exception
-            rec.update(status="error", error="interrupted before the runner finished")
+            sigterm = isinstance(signalled, SystemExit) and signalled.code == 128 + signal.SIGTERM
+            rec.update(
+                status="preempted" if sigterm else "error", stop_reason="preempted" if sigterm else "interrupted",
+                error="interrupted before the runner finished",
+            )  # fmt: skip
             print(f"ws: interrupted; recorded as {rec['run_id']}", file=sys.stderr)
         written = _append(log, rec)
+        _settle(ledger, res, rec, written, (unknown_run_usd, fallback_usd_per_mtok))
         if hook is not None:  # after the write: a signal or a crash in the hook cannot lose the record
             with contextlib.suppress(Exception):
                 hook(rec)

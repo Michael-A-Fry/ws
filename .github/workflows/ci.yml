@@ -60,6 +60,11 @@ jobs:
           /tmp/gitleaks git --redact --exit-code 1 --no-banner --log-opts="HEAD" .  # HEAD only: other branches are theirs
       - name: PII gate over the full history
         run: python3 scripts/pii_gate.py --history
+      - name: Go for the pinact hook, which builds from source and needs a newer Go than the runner has
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.3"
+          cache: false
       - name: hooks (ruff, typos, rumdl, zizmor, pinact, PII gate on every tracked file)
         uses: j178/prek-action@44924fe9ef4a6f88253c4b6b1bf11c689d3ce53d # v3.1.0
         env:

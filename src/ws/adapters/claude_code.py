@@ -7,6 +7,10 @@ a crash or a time-out blocks it too: without that field any other hook failure i
 
 Also denied: Edit/Write of the policy file and of the generated folder, so a session cannot loosen its own gate.
 
+`permissions.disableBypassPermissionsMode` is set to `"disable"` (ws.wallsettings BYPASS_OFF) in both files, so
+`--dangerously-skip-permissions` and a subagent's `permissionMode: bypassPermissions` are refused while a ws-gated
+session runs. A user setting of another value is a conflict, never overwritten (ws.userconfig).
+
 The third layer is Claude Code's own `sandbox` block (the wall; documented keys only, checked on 2.1.308), which
 confines every shell command Claude runs, whatever program it starts:
   * `enabled` with `failIfUnavailable`: if the sandbox cannot start (no bubblewrap or socat), Claude Code refuses to
@@ -51,7 +55,10 @@ Which hooks can block: PreToolUse (`ws gate check`) denies a call, and its comma
 crashing ws blocks too. PostToolUse (`ws gate event`) exits 2 on purpose when a check finds a problem, and Claude Code
 shows that stderr to the model; it carries no `|| exit`, and sets `onFailure: "block"` like PreToolUse. Every other generated hook command (SessionStart,
 UserPromptSubmit, Stop, SubagentStop) ends `|| true`, because an exit 2 there would block the person's prompt or keep the
-session going: those hooks add context and findings, and the session carries on whatever they return.
+session going: those hooks add context and findings, and the session carries on whatever they return. The one
+exception is the message wake hook (`wake_hook`): a Stop hook with `asyncRewake: true` that runs
+`ws msg wait --session-hook`. It runs in the background, so it never blocks a call, and its exit 2 is how an idle
+session is woken, so its command does not end `|| true`. It is left out when the guard `inbox` is not on (messages off).
 
 Notification and Stop also run `ws notify alert --runner claude-code || true`, the phone alert.
 
@@ -86,7 +93,7 @@ import re
 import shlex
 from pathlib import Path
 
-from ws import guards, jobs, paths
+from ws import guards, jobs, paths, wallsettings
 from ws.adapters import Call, check_argv, client_argv, event_argv, protected_paths
 from ws.approvals import ENV_MARKER, SANDBOX_MARKER, ApprovalError
 from ws.approvals import _read_regular as read_regular
@@ -130,6 +137,11 @@ _EXTRA_PRE_KINDS = ("agent", "skill", "message")  # the PreToolUse matcher cover
 # seconds a hook may take. More than the thin client's worst case (ws.gateclient.WORST_CASE_S: the wait for the daemon,
 # then the check in its own process), or the runner kills a hook that was about to answer and "block" denies the call.
 HOOK_TIMEOUT = 30
+# seconds the message wake hook may run: Claude Code still enforces `timeout` on an `asyncRewake` hook (600 by default),
+# and the hook waits as long as the session is idle, so it is a day. `ws msg wait --session-hook` gives up on its own
+# at `msg.HOOK_WAIT_MAX_S`, well before this, or the runner kills a waiter that was about to exit cleanly.
+WAKE_TIMEOUT = 86400
+INBOX_GUARD = "inbox"  # messages are on when this guard is in policy.guards.on
 
 # Where this runner keeps what ws installs globally, and where a repo may shadow it (read by ws.globals).
 # kinds: sub-folder -> how a name is taken: "dir" the folder name, "name" the file name, "stem" the name without extension.
@@ -158,6 +170,13 @@ def alert_hook(ws_cmd: list[str], pin: paths.Pin) -> dict:
     """The phone alert: `ws notify alert` reads the hook payload and always exits 0; `|| true` keeps it advice."""
     cmd = f"{shlex.join(ws_cmd)} notify alert --runner {NAME} {shlex.join(pin.args())} || true"
     return {"type": "command", "command": cmd, "timeout": 5}
+
+
+def wake_hook(ws_cmd: list[str], pin: paths.Pin) -> dict:
+    """The message wake: a Stop hook that runs `ws msg wait --session-hook` in the background (`asyncRewake`), so it never
+    holds up a call, and whose exit 2 wakes an idle session with what it printed. No `|| true`: that would hide the 2."""
+    cmd = f"{shlex.join(ws_cmd)} msg wait --session-hook {shlex.join(pin.args())}"
+    return {"type": "command", "command": cmd, "asyncRewake": True, "timeout": WAKE_TIMEOUT}
 
 
 def _matcher(kinds: set[str], base: tuple[str, ...] = ()) -> str:
@@ -325,7 +344,7 @@ def generate(
     )
     matcher = _matcher(guards.kinds_for(policy.guards.on, "pre") & set(_EXTRA_PRE_KINDS), tuple(MATCHER.split("|")))
     settings = {
-        "permissions": {"deny": list(dict.fromkeys(deny))},
+        "permissions": {"deny": list(dict.fromkeys(deny)), wallsettings.BYPASS_KEY: wallsettings.BYPASS_OFF},
         # `sandbox = false` in the policy: no block, and the marker says so (the hook then skips the preflight)
         **({"sandbox": sandbox_block(policy, out, policy_file, protect)} if wall else {}),
         "env": {ENV_MARKER: "1", SANDBOX_MARKER: "1" if wall else "0"},
@@ -346,6 +365,8 @@ def generate(
         settings["hooks"][name] = groups
     settings["hooks"]["Notification"] = [{"hooks": [alert_hook(ws_cmd, pin)]}]
     settings["hooks"].setdefault("Stop", [{"hooks": []}])[0]["hooks"].append(alert_hook(ws_cmd, pin))
+    if INBOX_GUARD in policy.guards.on:  # messages on: an idle session is woken when one arrives
+        settings["hooks"]["Stop"][0]["hooks"].append(wake_hook(ws_cmd, pin))
     return {FILE: json.dumps(settings, indent=2) + "\n"}
 
 

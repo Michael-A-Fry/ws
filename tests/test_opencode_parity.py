@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from ws import cli, gate, guards, paths, policy, userconfig
+from ws import cli, gate, guards, paths, policy, session, userconfig
 from ws.adapters import claude_code, opencode
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,6 +30,8 @@ def box(tmp_path, monkeypatch):
     monkeypatch.setenv("WS_HOME", str(home / ".ws"))
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     monkeypatch.chdir(home)
+    # the account's own folders are the test's (the guards that read the registry look there, not in the real home)
+    monkeypatch.setattr(session, "trusted_env", lambda: {"HOME": str(home), "WS_HOME": str(home / ".ws")})
     return home
 
 
@@ -168,6 +170,15 @@ def rows(tmp: Path, sha: str = "abc1234def") -> dict[tuple[str, str], list[tuple
             ("", [S("pre", "command", command="python3 -m http.server"), S("pre", "command", command="ls")],
              ["ask", "allow"], work)
         ],
+        ("inbox", "prompt"): [("", [S("prompt", prompt="hello")], [0], work)],  # nothing pending: nothing said
+        ("inbox", "post"): [("", [S("post", "command", command="ls")], [0], work)],
+        ("inbox", "stop"): [("", [S("stop", last="done")], [0], work)],
+        ("pane-close", "pre"): [("", [S("pre", "command", command="ls")], ["allow"], work)],
+        ("presence", "pre"): [("", [S("pre", "command", command="ls")], ["allow"], work)],
+        ("presence", "post"): [("", [S("post", "command", command="ls")], [0], work)],
+        ("presence", "start"): [("", [S("start")], [0], work)],
+        ("presence", "prompt"): [("", [S("prompt", prompt="hello")], [0], work)],
+        ("presence", "stop"): [("", [S("stop", last="done")], [0], work)],
         ("record-calls", "pre"): [("", [S("pre", "command", command="ls")], ["allow"], work)],
         ("session-context", "start"): [("", [S("start")], ["text"], work)],
         ("skill-gate", "pre"): [

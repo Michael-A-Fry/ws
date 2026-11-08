@@ -19,12 +19,22 @@ setters, not the file:
     `WsError` of kind `conflict`, so "the registry changed between check and act" is detectable. It cannot set `role`
     or `class`.
   * `prepare_launch(role) -> token`: the launcher's side of how a role is set. The role comes only from a single-use
-    token (`<state>/sessions/launch/<token>`, mode 0600, good for `LAUNCH_TTL` seconds) written by a process outside the
+    token (`<state>/identity/launch/<token>`, mode 0600, good for `LAUNCH_TTL` seconds) written by a process outside the
     session before the runner starts: `ws session prepare --role R` prints `WS_LAUNCH=<token>` for the launcher to
     export, and `ws session start` claims that token from its own environment and deletes it. An expired, reused,
     missing or forged token gives a worker, and a resumed or compacted start for the same id keeps the role it had.
     `ws session prepare` and `start` are refused from a gated session's shell (ws.policy), so a worker cannot mint a
     lead or overwrite another record; the hooks that run `start` are not tool calls.
+  * `records() -> list[Record]`: every session the identity folder knows, for a reader that must see them all (the pane
+    guard); a record that will not read is a `WsError` of kind `unavailable`, so the reader refuses.
+
+Who a session is. `<state>/sessions` is writable from inside the wall, so nothing in it decides who anyone is. The
+role and the runner stamp are kept in `<state>/identity/<id>.json` (`ws.paths` NAMES; not one of the wall's writable
+folders, and a control path the gate will not let a session write), written only by `ws session start`. `read` and
+`resolve_caller` take `role`, `runner_pid` and `runner_start` from there and from nowhere else: the same keys in the
+`sessions/` file are a copy for readers that only display them, and are ignored here. A start that cannot write the
+identity folder (a hook inside the wall) leaves no identity: that session reads as a worker and `resolve_caller` gives
+None for it, which every reader treats as the strictest case. The launch tokens live in `identity/launch`.
 
 Who is calling. A shell command has no way to say which session it belongs to, and an environment variable is the
 command's own to set, so identity comes from the process tree. `ws session start` is a hook: it stamps the record with
@@ -35,6 +45,14 @@ carrying the first stamp that matches (the newest, when a cleared or resumed ses
 unchanged for `ws mcp serve`, which is a child of the runner. A process with no matching ancestor (orphaned, or
 double-forked so that init owns it) is not a session and gets None. Only `start` writes the stamp: `update` keeps it and
 cannot set it. The ancestors come from `/proc` on Linux and `ps` on macOS. The keys are additions, so the schema stays 2.
+`resolve_caller(session_id)` asks the narrower question "am I under the runner of this session?": the payload of a hook
+names a session, and only the one whose stamped runner is an ancestor answers; a forged id gets None.
+
+The resident gate (`ws.gateserve`) runs a guard in a forked child whose own ancestors are the daemon's, not the
+runner's. The child calls `bind_peer(pid)` with the process id the kernel reports for the hook's connection (not
+anything in the request), and from then on the walk starts at that process. Where the system gives no process id
+(macOS), `bind_peer(None)` makes `resolve_caller` answer None, so a guard that needs to know the caller delivers nothing
+that depends on it.
 
 Where the registry is. A record found in a folder the caller chose proves nothing: a command that sets `WS_HOME` can
 write its own records, its own policy and its own message database, and every check made against them passes against
@@ -80,6 +98,7 @@ ROLES = ("lead", "worker", "reviewer")
 STATES = ("busy", "idle")
 LAUNCH_ENV = "WS_LAUNCH"  # what the launcher exports and `ws session start` claims
 LAUNCH_TTL = 600  # seconds a launch token is good for: shared by `prepare` (writes it) and `start` (claims it)
+IDENTITY = "identity"  # <state>/identity: role and runner stamp, written by `start` only (see the module docstring)
 _TOKEN = re.compile(r"^[0-9a-f]{32}$")
 _PANE = re.compile(r"^%[0-9]{1,9}$")
 _UNSET = ...  # `update` leaves a field alone when it is not given (None is a value: it clears the field)
@@ -173,6 +192,13 @@ def _prune(folder: Path) -> None:
                 f.unlink()
         except OSError:
             continue
+    try:  # an identity goes when its record has gone (or is that old); a record kept alive by hooks keeps its identity
+        for ident in (folder.parent / IDENTITY).glob("*.json"):
+            record = folder / ident.name
+            if not record.exists() or record.stat().st_mtime < cutoff:
+                ident.unlink()
+    except OSError:
+        pass
 
 
 def _read(path: Path) -> dict | None:
@@ -238,10 +264,12 @@ def _new_record(
     env: dict,
     previous: dict | None = None,
     stamp: Proc | None = None,
+    role: str = "worker",
 ) -> dict:
-    """A record for a session starting now. The role, the delivery cursor and the revision carry over from `previous` (a
-    resumed, cleared or compacted start for the same id); a new role is only ever set by `start`, from the launch token.
-    `stamp` is the runner process (`start` passes it; a resumed start stamps the new runner)."""
+    """A record for a session starting now. The delivery cursor and the revision carry over from `previous` (a resumed,
+    cleared or compacted start for the same id). `role` is what `start` found in the identity folder (carried over, or
+    from a launch token); it is written here as a copy for readers that only display it, and `stamp` (the runner
+    process) likewise. Neither copy is read back as authority (see the module docstring)."""
     now = datetime.now(UTC)
     before = Record.from_dict(previous, session_id) if previous else None
     out = {
@@ -253,7 +281,7 @@ def _new_record(
         "runner": runner,
         "cwd": cwd,
         "pane": _pane(env),
-        "role": before.role if before else "worker",
+        "role": role if role in ROLES else "worker",
         "class": _class_name(cwd),
         "state": None,
         "state_ts": None,
@@ -308,11 +336,46 @@ def proc_info(pid: int) -> Proc | None:
         return None
 
 
-def _ancestors() -> list[Proc]:
-    """This process's ancestors, nearest first (its parent, then that process's parent, and so on to the top)."""
+def proc_args(pid: int) -> str | None:
+    """The command line of process `pid`, its words joined by single spaces, or None when it cannot be read. `/proc` on
+    Linux, `ps` where there is none."""
+    try:
+        if Path("/proc/self/stat").exists():
+            raw = (Path("/proc") / str(pid) / "cmdline").read_bytes()
+            return " ".join(raw.decode("utf-8", errors="replace").split("\0")).strip() or None
+    except OSError:
+        return None
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "args=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LC_ALL": "C"},
+            check=False,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.strip() or None
+
+
+def one_shot_run(pid: int | None) -> bool:
+    """True when the process `pid` is a one-shot headless Claude Code run (`claude -p "prompt"`): this process was started
+    by one (its entry point, in the environment Claude Code gives its hooks, is `sdk-cli`), and `pid` was not started to
+    take further input (`--input-format stream-json`, which stays up between turns and can be woken). It ends when its last
+    answer is out, so a waiter would only hold it open. A command line that can't be read counts as one-shot: holding a
+    run open is worse than a missed wake for an unusual host."""
+    if os.environ.get("CLAUDE_CODE_ENTRYPOINT") != "sdk-cli":
+        return False
+    args = proc_args(pid) if pid is not None else None
+    return args is None or not re.search(r"--input-format[= ]+stream-json", args)
+
+
+def _walk(pid: int, seen: set[int]) -> list[Proc]:
+    """The process `pid` and then each parent in turn, nearest first, to the top (or a loop, or a depth no tree has)."""
     out: list[Proc] = []
-    seen = {os.getpid()}
-    pid = os.getppid()
     while pid > 0 and pid not in seen and len(out) < _MAX_DEPTH:
         seen.add(pid)
         proc = proc_info(pid)
@@ -321,6 +384,31 @@ def _ancestors() -> list[Proc]:
         out.append(proc)
         pid = proc.ppid
     return out
+
+
+def _ancestors() -> list[Proc]:
+    """This process's ancestors, nearest first (its parent, then that process's parent, and so on to the top)."""
+    return _walk(os.getppid(), {os.getpid()})
+
+
+_PEER: list[int | None] | None = None  # set in the resident gate's child: [the hook client's process id or None]
+
+
+def bind_peer(pid: int | None) -> None:
+    """For the resident gate's forked child: the hook's own connection came from process `pid` (what the kernel says,
+    never a field of the request), so `resolve_caller` walks up from there instead of from this process. `None` is a
+    system that cannot say (macOS): `resolve_caller` then answers None. It is a module value, not an environment
+    variable, so a request cannot set it."""
+    global _PEER
+    _PEER = [pid]
+
+
+def _chain() -> list[Proc]:
+    """The processes that decide who the caller is: this process's ancestors, or (in the resident gate's child) the hook
+    client and its ancestors."""
+    if _PEER is None:
+        return _ancestors()
+    return [] if _PEER[0] is None else _walk(_PEER[0], {os.getpid()})
 
 
 def _is_runner(proc: Proc) -> bool:
@@ -415,11 +503,86 @@ def _env(env: dict | None) -> dict:
     return paths.merged_environ() if env is None else env
 
 
+def _identity_dir(env: dict) -> Path:
+    return paths.state_dir(env) / IDENTITY
+
+
+def _identity_path(env: dict, session_id: str) -> Path:
+    return _identity_dir(env) / f"{safe_id(session_id)}.json"
+
+
+def _read_identity(path: Path) -> dict | None:
+    """The identity at `path`: {session_id, role, runner_pid, runner_start, started_at, ts}, or None when it is missing,
+    unreadable or not in the shape `start` writes. A role outside ROLES reads as a worker; a stamp that is not whole reads
+    as none."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("session_id"), str) or not data["session_id"]:
+        return None
+    pid, began = data.get("runner_pid"), data.get("runner_start")
+    stamped = isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 and isinstance(began, str)
+    stamped = stamped and 0 < len(began) <= 64
+    return {
+        "session_id": data["session_id"],
+        "role": data["role"] if data.get("role") in ROLES else "worker",
+        "runner_pid": pid if stamped else None,
+        "runner_start": began if stamped else None,
+        "started_at": data["started_at"] if isinstance(data.get("started_at"), str) else "",
+        "ts": data["ts"] if isinstance(data.get("ts"), str) else "",
+    }
+
+
+def _write_identity(env: dict, session_id: str, role: str, stamp: Proc | None, started_at: str) -> None:
+    record: dict = {
+        "schema": 1,
+        "session_id": session_id,
+        "role": role,
+        "started_at": started_at,
+        "ts": jsonl.iso_utc(_now()),
+    }
+    if stamp:
+        record["runner_pid"], record["runner_start"] = stamp.pid, stamp.start
+    _write(_identity_path(env, session_id), record)
+
+
+def _overlay(rec: Record, ident: dict | None) -> Record:
+    """`rec` with the role and runner stamp the identity folder holds, whatever the sessions file says."""
+    if ident is None or ident["session_id"] != rec.session_id:
+        return replace(rec, role="worker", runner_pid=None, runner_start=None)
+    return replace(rec, role=ident["role"], runner_pid=ident["runner_pid"], runner_start=ident["runner_start"])
+
+
 def read(session_id: str, env: dict | None = None) -> Record | None:
     """The record of `session_id`, or None when there is none, it cannot be read or it is corrupt. A v1 record reads with
-    the v2 defaults (role worker, class None, rev 0). A reader treats None as the strictest case."""
-    data = _read(_record_path(_env(env), session_id))
-    return Record.from_dict(data, session_id) if data is not None else None
+    the v2 defaults (role worker, class None, rev 0). The role and runner stamp come from the identity folder only (a
+    session with no identity there reads as a worker with no stamp). A reader treats None as the strictest case."""
+    env = _env(env)
+    data = _read(_record_path(env, session_id))
+    if data is None:
+        return None
+    return _overlay(Record.from_dict(data, session_id), _read_identity(_identity_path(env, session_id)))
+
+
+def records(env: dict | None = None) -> list[Record]:
+    """Every session that has an identity, as `read` gives it. For a reader that must see all of them (the pane guard),
+    so a session whose record will not read is not skipped: it is a `WsError` of kind `unavailable`, as is an identity
+    folder that cannot be listed. No identity folder is no sessions."""
+    env = _env(env)
+    folder = _identity_dir(env)
+    try:
+        files = sorted(folder.glob("*.json"))
+    except OSError as e:
+        raise WsError("unavailable", "the session registry can't be read", "check the state folder") from e
+    out: list[Record] = []
+    for f in files:
+        ident = _read_identity(f)
+        rec = read(ident["session_id"], env) if ident else None
+        if rec is None:
+            raise WsError("unavailable", "a session record in the registry can't be read", "`ws doctor` says where")
+        out.append(rec)
+    return out
 
 
 def trusted_env() -> dict:
@@ -439,34 +602,35 @@ def trusted_env() -> dict:
     return {"HOME": home}
 
 
-def resolve_caller() -> Record | None:
+def resolve_caller(session_id: str | None = None) -> Record | None:
     """The session this process belongs to, or None. Walks the ancestors of this process, nearest first, and returns the
-    record whose runner stamp (`runner_pid` and `runner_start`) is that ancestor; where a cleared or resumed session left
-    more than one record for the same runner process, the newest. Nothing the process was given (an environment variable,
-    an argument, a payload) takes part, so a command cannot name itself as another session, and the registry is the
-    account's own (`trusted_env`), so it cannot point ws at one it wrote. A process that is not under a stamped runner
-    (orphaned, or double-forked and handed to init) is not a session: None. So is a records folder that cannot be read."""
-    chain = _ancestors()
+    record whose runner stamp (`runner_pid` and `runner_start`, kept in the identity folder) is that ancestor; where a
+    cleared or resumed session left more than one for the same runner process, the newest. With `session_id`, only that
+    session can answer: a hook payload names a session, and a process that is not under that session's runner is not it.
+    Nothing the process was given (an environment variable, an argument, a payload) takes part, so a command cannot name
+    itself as another session, and the registry is the account's own (`trusted_env`), so it cannot point ws at one it
+    wrote. A process that is not under a stamped runner (orphaned, or double-forked and handed to init) is not a session:
+    None. So is an identity folder or a record that cannot be read. In the resident gate's child the walk starts at the
+    hook client (`bind_peer`)."""
+    chain = _chain()
     if not chain:
         return None
     try:
-        folder = paths.state_dir(trusted_env()) / "sessions"
-    except WsError:
+        env = trusted_env()
+        files = sorted(_identity_dir(env).glob("*.json"))
+    except (WsError, OSError):
         return None
-    found: dict[tuple[int, str], list[Record]] = {}
-    try:
-        files = sorted(folder.glob("*.json"))
-    except OSError:
-        return None
+    found: dict[tuple[int, str], list[dict]] = {}
     for f in files:
-        data = _read(f)
-        rec = Record.from_dict(data) if data is not None else None
-        if rec and rec.session_id and rec.runner_pid is not None and rec.runner_start is not None:
-            found.setdefault((rec.runner_pid, rec.runner_start), []).append(rec)
+        ident = _read_identity(f)
+        stamped = ident and ident["runner_pid"] is not None and ident["runner_start"] is not None
+        if stamped and (session_id is None or ident["session_id"] == session_id):
+            found.setdefault((ident["runner_pid"], ident["runner_start"]), []).append(ident)
     for proc in chain:
         hits = found.get((proc.pid, proc.start))
         if hits:
-            return max(hits, key=lambda r: (r.started_at or "", r.ts or "", r.session_id))
+            best = max(hits, key=lambda i: (i["started_at"], i["ts"], i["session_id"]))
+            return read(best["session_id"], env)
     return None
 
 
@@ -490,12 +654,13 @@ def update(
         if not (isinstance(sent, dict) and isinstance(sent.get("id"), str) and isinstance(sent.get("ts"), str)):
             raise WsError("bad_input", "last_delivered_outbound must be {id, ts} (text) or None", "pass both keys", 2)
         last_delivered_outbound = {"id": sent["id"], "ts": sent["ts"]}
-    path = _record_path(_env(env), session_id)
+    env = _env(env)
+    path = _record_path(env, session_id)
     with _locked(path.parent):
         data = _read(path)
         if data is None:
             raise WsError("not_found", f"no readable session record for {session_id!r}", "start the session first")
-        rec = Record.from_dict(data, session_id)
+        rec = _overlay(Record.from_dict(data, session_id), _read_identity(_identity_path(env, session_id)))
         if expect_rev is not None and rec.rev != expect_rev:
             raise WsError(
                 "conflict",
@@ -519,7 +684,7 @@ def update(
 
 
 def _launch_dir(env: dict) -> Path:
-    return paths.state_dir(env) / "sessions" / "launch"
+    return _identity_dir(env) / "launch"
 
 
 def prepare_launch(role: str, env: dict | None = None) -> str:
@@ -596,15 +761,20 @@ def cmd_start(args: argparse.Namespace) -> int:
             got = _input(args)
             if got:
                 env = paths.merged_environ()
-                role = _claim_launch(env, env.get(LAUNCH_ENV))  # taken even if it is no good: it works once
+                claimed = _claim_launch(env, env.get(LAUNCH_ENV))  # taken even if it is no good: it works once
                 # always overwrite: a resumed, cleared or compacted session reloads its rules, so it starts again here
                 path = _record_path(env, got[0])
                 with _locked(path.parent):
-                    new = _new_record(
-                        got[0], current_release(env), args.runner, got[1], env, _read(path), runner_process()
-                    )
-                    if role:
-                        new["role"] = role
+                    before = _read_identity(_identity_path(env, got[0]))
+                    role = claimed or (before["role"] if before else "worker")  # a resumed start keeps its role
+                    stamp = runner_process()
+                    new = _new_record(got[0], current_release(env), args.runner, got[1], env, _read(path), stamp, role)
+                    try:
+                        _write_identity(env, got[0], role, stamp, new["started_at"])
+                    except OSError:  # a hook inside the wall can't write here: no identity, so no role and no stamp
+                        new["role"] = "worker"
+                        new.pop("runner_pid", None)
+                        new.pop("runner_start", None)
                     _write(path, new)
                     _prune(path.parent)
     except WsError as e:  # ws's folders are not where this hook was installed to find them: say so, do nothing

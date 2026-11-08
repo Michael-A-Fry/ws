@@ -29,8 +29,24 @@ repos:
     rev: v0.11.0.1
     hooks:
       - id: shellcheck
+  # zizmor audits a workflow for injection, over-wide permissions and cache poisoning (MIT; v1.31.1, 15 Oct 2026). It
+  # runs offline here, so the audits that need the GitHub API are skipped. Scoped to ci.yml: the other workflows have
+  # findings of their own (docs/reference/ci.md lists them) that must not turn the all-files run red.
+  - repo: https://github.com/zizmorcore/zizmor-pre-commit
+    rev: v1.31.1
+    hooks:
+      - id: zizmor
+        files: ^\.github/workflows/ci\.yml$
   - repo: local
     hooks:
+      # pinact checks every action is pinned by commit SHA (MIT; v5.0.2, 25 Oct 2026). It builds from source with Go.
+      - id: pinact
+        name: pinact (every action in the workflows is pinned by commit SHA)
+        entry: pinact run --check
+        language: golang
+        additional_dependencies: ["github.com/suzuki-shunsuke/pinact/v5/cmd/pinact@v5.0.2"]
+        files: ^\.github/workflows/.*\.ya?ml$
+        pass_filenames: false
       - id: code-map
         name: code map in docs/reference is current (python3 scripts/gen_code_map.py rewrites it)
         entry: python3 scripts/gen_code_map.py --check

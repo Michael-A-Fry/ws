@@ -107,6 +107,8 @@ CASES: dict[str, list[str]] = {
     "msg.list": ["msg", "list"],
     "msg.read": ["msg", "read", "1"],
     "msg.export": ["msg", "export", "--out", "{home}/messages.jsonl"],
+    "msg.watch": ["msg", "watch", "--position-now"],
+    "msg.wait": ["msg", "wait", "--timeout", "1"],
     "term": ["term", "--bind", "0.0.0.0"],  # a typed refusal: the real command stays up until stopped
 }
 

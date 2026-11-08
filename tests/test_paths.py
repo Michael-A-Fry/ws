@@ -444,3 +444,15 @@ def test_only_a_hook_with_no_pin_at_all_may_go_unpinned(home, monkeypatch):
             with pytest.raises(WsError) as caught, paths.pinned_by(bad, allow_unpinned=allow):
                 pass
             assert caught.value.kind == "layout_changed"
+
+
+def test_the_identity_folder_is_a_state_entry_and_a_control_path_the_wall_keeps_read_only():
+    """Role and runner stamp live in `identity`, not in `sessions` (which the wall leaves writable)."""
+    from ws import sandbox
+
+    assert "identity" in paths.NAMES["state"] and "identity" in paths.CONTROL_NAMES
+    lay = paths.layout({"WS_HOME": "/w/ws", "HOME": "/w"})
+    assert str(lay.path_of("identity")) == "/w/ws/identity"
+    assert "/w/ws/identity" in paths.control_paths({"WS_HOME": "/w/ws", "HOME": "/w"})
+    assert Path("/w/ws/identity") not in sandbox.writable_holes(Path("/w/ws"))
+    assert Path("/w/ws/sessions") in sandbox.writable_holes(Path("/w/ws"))  # the neighbour it is kept apart from

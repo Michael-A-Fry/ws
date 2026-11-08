@@ -2,7 +2,8 @@
 
 The tests set HOME and WS_HOME to a scratch folder. The systemd timer is switched on and off through an injected runner,
 so no test calls `systemctl`. The container test uses a local image and a container runtime if the machine has them, and
-never pulls.
+never pulls; with `WS_TEST_NODE_REQUIRE=1` (the CI node job) a missing runtime or image is a failure, not a fallback to
+the host.
 """
 
 from __future__ import annotations
@@ -284,9 +285,32 @@ def _container() -> tuple[str, str] | None:
     return (runtime, image) if have.returncode == 0 else None  # a local image only: this never pulls
 
 
+def _container_or_fail() -> tuple[str, str] | None:
+    """The container, or None to fall back to the host. `WS_TEST_NODE_REQUIRE=1` (set in the CI node job) makes a
+    missing runtime or image a failure instead, as `WS_ORACLE_REQUIRE=1` does for the oracle's sandbox."""
+    found = _container()
+    if found is None and os.environ.get("WS_TEST_NODE_REQUIRE") == "1":
+        pytest.fail(
+            "WS_TEST_NODE_REQUIRE=1 but there is no docker or podman with the local image "
+            f"{os.environ.get('WS_TEST_NODE_IMAGE', 'python:3.12-slim')}"
+        )
+    return found
+
+
+def test_a_required_container_that_is_missing_is_a_failure_and_without_the_variable_a_fallback(monkeypatch):
+    monkeypatch.setattr(shutil, "which", lambda name: None)  # no docker, no podman
+    monkeypatch.delenv("WS_TEST_NODE_REQUIRE", raising=False)
+    assert _container_or_fail() is None
+    monkeypatch.setenv("WS_TEST_NODE_REQUIRE", "0")
+    assert _container_or_fail() is None
+    monkeypatch.setenv("WS_TEST_NODE_REQUIRE", "1")
+    with pytest.raises(pytest.fail.Exception, match="WS_TEST_NODE_REQUIRE=1"):
+        _container_or_fail()
+
+
 def test_install_uninstall_diff_to_zero_in_a_container(tmp_path):
     """In a container when docker or podman and a local image are there; else on the host, in a home that already holds a file."""
-    found = _container()
+    found = _container_or_fail()
     if found is None:
         home = tmp_path / "home"
         home.mkdir()

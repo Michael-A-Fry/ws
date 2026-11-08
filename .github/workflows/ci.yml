@@ -1,25 +1,39 @@
-# The required check `ci`: Linux, under 5 minutes. Actions pinned by commit SHA (version in the comment).
-# `term-browser` runs beside it: the web terminal's browser tests, with Chromium installed.
+# The required check `ci`: Linux, hooks, docs, the corpus, the test-integrity check and the suite without the real-shell
+# oracle. The oracle has its own job (`oracle`), the container node diff is `node`, and `term-browser` runs the web
+# terminal's browser tests. `nightly-quarantine` runs on the schedule only. docs/reference/ci.md explains each job.
+# Actions pinned by commit SHA (version in the comment).
+# Every job starts by stamping the time and ends with a budget step (scripts/ci_time_budget.py): the number it is given
+# must equal the job's own timeout-minutes (tests/test_ci_time_budget.py checks that).
 name: ci
 on:
   push:
     branches: [main]
   pull_request:
-permissions: read-all
+    # `edited`: the test-integrity step reads the body, so adding the `test-change:` line it asks for must run it again
+    types: [opened, synchronize, reopened, edited]
+  schedule:
+    - cron: "17 14 * * *" # 14:17 UTC every day, off the hour on purpose: the quarantine job only
+  workflow_dispatch:
+permissions: {}
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 jobs:
   ci:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
-    # the suite runs the real-shell oracle in a sandbox for every row (about 9-10 min); 20 leaves room without hiding a hang
-    timeout-minutes: 20
+    # the suite without the oracle (the oracle job has it); the 75% warning shows what has crept up
+    timeout-minutes: 15
+    permissions:
+      contents: read
     env:
       WS_PII_DENYLIST: ${{ secrets.WS_PII_DENYLIST }}
       # fork pull requests get no secrets: the built-in rules still run, the denylist runs again on merge
       # a fork's pull request, or a copy of the repo without the secret that opts in with the repo variable
       WS_PII_DENYLIST_OPTIONAL: ${{ (github.event.pull_request.head.repo.fork || vars.WS_PII_DENYLIST_OPTIONAL == '1') && '1' || '' }}
     steps:
+      - name: job start stamp
+        run: date +%s > "$RUNNER_TEMP/job-start"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
@@ -28,6 +42,15 @@ jobs:
         with:
           version: "0.13.1"
           enable-cache: true
+      # T1 (scripts/test_integrity.py): a weakened test, an edit to the test machinery or CI, or an edit to tests/holdout/
+      # needs a `test-change:` or `holdout-change:` line in the pull request body. The body and the base reach the script
+      # through env values, never through the command text.
+      - name: test integrity (weakened tests, machinery edits, holdout edits)
+        if: github.event_name == 'pull_request'
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: python3 scripts/test_integrity.py --base "$BASE_SHA"
       - name: gitleaks over the full history
         run: |
           v=8.30.1; sum=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
@@ -37,7 +60,7 @@ jobs:
           /tmp/gitleaks git --redact --exit-code 1 --no-banner --log-opts="HEAD" .  # HEAD only: other branches are theirs
       - name: PII gate over the full history
         run: python3 scripts/pii_gate.py --history
-      - name: hooks (ruff, typos, rumdl, PII gate on every tracked file)
+      - name: hooks (ruff, typos, rumdl, zizmor, pinact, PII gate on every tracked file)
         uses: j178/prek-action@44924fe9ef4a6f88253c4b6b1bf11c689d3ce53d # v3.1.0
         env:
           SKIP: gitleaks # the step above scans the whole history, not just the tree
@@ -57,29 +80,141 @@ jobs:
         run: |
           uv run --locked ws gate replay tests/gate_corpus/*.jsonl --runner claude-code --metrics
           uv run --locked ws gate replay tests/gate_corpus/*.jsonl --runner opencode --metrics
-      # The gate oracle (tests/test_gate_oracle.py) runs a real bash in a bubblewrap sandbox. Ubuntu 24.04 switches off
-      # unprivileged user namespaces for unconfined programs with AppArmor, so the restriction is lifted for this throwaway
-      # runner only; the guard keeps the line harmless on a kernel that has no such setting.
+      # The sandbox tests (test_sandbox, test_wallsettings, test_gate_corpus, test_eval*) use bubblewrap and skip quietly
+      # without it, so it stays in this job as well as in `oracle`. Ubuntu 24.04 switches off unprivileged user namespaces
+      # for unconfined programs with AppArmor, so the restriction is lifted for this throwaway runner only; the guard
+      # keeps the line harmless on a kernel that has no such setting.
+      - name: bubblewrap for the sandbox tests
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          bwrap --version
+      # tests/holdout/ runs here with everything else: no path argument, no --ignore, no --deselect of it.
+      # The two oracle files run in the `oracle` job.
+      - name: tests (the oracle files run in the oracle job)
+        run: >-
+          uv run --locked pytest -q -rs
+          --deselect tests/test_gate_oracle.py
+          --deselect tests/test_shellwords_oracle.py
+      - name: time budget
+        if: always()
+        run: python3 scripts/ci_time_budget.py --job ci --stamp "$RUNNER_TEMP/job-start" --tiers .pytest_cache/d/ws-harness/tiers.jsonl --timeout-minutes 15
+
+  # The real-shell oracle: tests/test_gate_oracle.py runs a real bash in a bubblewrap sandbox for every row (about 9-10
+  # min); tests/test_shellwords_oracle.py compares the command reader with bash itself. WS_ORACLE_REQUIRE=1 makes a
+  # sandbox that can't start a failure, not a skip. It gates a merge only once it is a required check (docs/reference/ci.md).
+  oracle:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      WS_ORACLE_REQUIRE: "1"
+    steps:
+      - name: job start stamp
+        run: date +%s > "$RUNNER_TEMP/job-start"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: "0.13.1"
+          enable-cache: true
       - name: bubblewrap for the gate oracle
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends bubblewrap
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           bwrap --version
-      - name: tests
-        env:
-          WS_ORACLE_REQUIRE: "1" # the oracle can't start a sandbox here = a failure, not a skip
-        run: uv run --locked pytest -q -rs
+      - name: oracle tests (the gate and the command reader against a real bash)
+        run: uv run --locked pytest -q -rs tests/test_gate_oracle.py tests/test_shellwords_oracle.py
+      - name: time budget
+        if: always()
+        run: python3 scripts/ci_time_budget.py --job oracle --stamp "$RUNNER_TEMP/job-start" --tiers .pytest_cache/d/ws-harness/tiers.jsonl --timeout-minutes 20
+
+  # Tests marked `quarantine` (known flakes) are left out of every other run. This runs only them, every night and by
+  # hand. pytest exits 5 when nothing is collected, which here means an empty quarantine: a pass.
+  nightly-quarantine:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: job start stamp
+        run: date +%s > "$RUNNER_TEMP/job-start"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: "0.13.1"
+          enable-cache: true
+      - name: bubblewrap for the sandbox tests
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      - name: quarantined tests
+        run: |
+          code=0
+          uv run --locked pytest -q -rs --run-quarantine -m quarantine || code=$?
+          if [ "$code" -eq 5 ]; then
+            echo "nothing is quarantined: pytest collected no tests, which is a pass"
+            code=0
+          fi
+          exit "$code"
+      - name: time budget
+        if: always()
+        run: python3 scripts/ci_time_budget.py --job nightly-quarantine --stamp "$RUNNER_TEMP/job-start" --timeout-minutes 30
+
+  # `ws node join` then `ws node remove` must leave a fresh home as it was. tests/test_node.py does that in a container
+  # when it finds a runtime and a local image, and on the host when it doesn't. WS_TEST_NODE_REQUIRE=1 makes that
+  # fallback a failure here, so this job always tests the container. The image is pulled by digest, then used locally.
+  node:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      WS_TEST_NODE_IMAGE: python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b
+      WS_TEST_NODE_REQUIRE: "1"
+    steps:
+      - name: job start stamp
+        run: date +%s > "$RUNNER_TEMP/job-start"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: "0.13.1"
+          enable-cache: true
+      - name: pull the pinned image
+        run: docker pull "$WS_TEST_NODE_IMAGE"
+      - name: node tests in the container
+        run: uv run --locked pytest -q -rs tests/test_node.py
+      - name: time budget
+        if: always()
+        run: python3 scripts/ci_time_budget.py --job node --stamp "$RUNNER_TEMP/job-start" --timeout-minutes 10
 
   # The web terminal's browser tests (every control, desktop and phone). They skip where there is no browser, so this
-  # job installs one and sets WS_E2E_REQUIRE=1: a missing browser fails here instead of skipping.
+  # job installs one and sets WS_E2E_REQUIRE=1: a missing browser fails here instead of skipping. It runs every
+  # tests/e2e/test_*_browser.py, so a new browser test file is picked up without editing this job.
   term-browser:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    permissions:
+      contents: read
     env:
       WS_E2E_REQUIRE: "1"
       PLAYWRIGHT_VERSION: "1.64.1" # released 2026-10-22, more than 7 days before it was pinned
     steps:
+      - name: job start stamp
+        run: date +%s > "$RUNNER_TEMP/job-start"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -93,4 +228,7 @@ jobs:
           PLAYWRIGHT_BROWSERS_PATH="$RUNNER_TEMP/ms-playwright" \
             uv run --locked --with "playwright==$PLAYWRIGHT_VERSION" playwright install --with-deps chromium
       - name: browser tests
-        run: uv run --locked --with "playwright==$PLAYWRIGHT_VERSION" pytest -q tests/e2e/test_term_browser.py
+        run: uv run --locked --with "playwright==$PLAYWRIGHT_VERSION" pytest -q tests/e2e/test_*_browser.py
+      - name: time budget
+        if: always()
+        run: python3 scripts/ci_time_budget.py --job term-browser --stamp "$RUNNER_TEMP/job-start" --timeout-minutes 15

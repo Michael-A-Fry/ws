@@ -365,6 +365,11 @@ sandbox = true
 #                    names the flag that keeps it on this machine
 #   checkout-pin     denies git checkout, switch, reset --hard, rebase, merge, pull, cherry-pick and revert in a checkout
 #                    that has linked worktrees (and in any folder named in paths), so work happens in a worktree
+#   inbox            hands a session the messages left for it, as untrusted text, at its next prompt, after a tool call
+#                    and (an urgent one) when it is about to stop; a walled session is told how many, never what
+#   presence         records in the session registry whether a session is busy or idle, from the hooks it already runs
+#   pane-close       closes a tmux window or pane by id only when the registry says it is idle (the lead), or it is the
+#                    session's own pane after its hand-over was delivered
 [guards]
 on = ["syntax-check", "session-context", "dev-server"]
 # [guards.syntax-check]
@@ -383,6 +388,8 @@ on = ["syntax-check", "session-context", "dev-server"]
 # allow_hosts = ["203.0.113.5"]   # optional: addresses a dev server may bind besides loopback (a VPN or tailnet address)
 # [guards.checkout-pin]
 # paths = ["~/code/app"]   # optional: checkouts to pin even with no linked worktree (absolute or ~/)
+# [guards.pane-close]
+# live_socket = "default"   # the tmux socket whose panes are guarded (a path, or a name under the tmux folder); other servers are left alone
 
 # Rule of Two, leg C (a way out): besides a source's outward acts and the web tools above, the SHELL counts as a way
 # out while any of curl, wget, nc, ssh, scp, python -c ... is not in deny_commands. To close it, deny the lot

@@ -22,8 +22,9 @@ The guards the policy turns on (ws.guards) run beside the rules: before a call i
 approvable deny asks for a person's approval as `ask_commands` does, a warning goes to stderr with exit 0), and in
 `event` for the rest. `event` is advice that leaves the session running: after a tool call a deny or warning is the
 reason on stderr with exit 2 (the runner shows it to the model; the call already ran), at session start and on a prompt
-a finding is text on stdout (context for the session), on stop it is a stderr line, and any crash is one stderr line with
-exit 0.
+a finding is text on stdout (context for the session), on stop it is a stderr line (except the inbox guard's: a stopping
+session with an urgent message waiting is told to go on, `{"decision":"block","reason":...}` on stdout), and any crash is
+one stderr line with exit 0.
 """
 
 from __future__ import annotations
@@ -232,6 +233,13 @@ def _event(
         return 0, text, ""
     if ev == "post" and any(f.action in ("deny", "warn") for _, _, f in found):
         return DENY, "", text
+    if ev == "stop":
+        # the one stop finding that is not a stderr line: the inbox guard continues the stopping session with its messages
+        ours = [(n, f) for n, _, f in found if n == "inbox" and f.action == "warn"]
+        if ours:
+            rest = [line for line, (n, _, f) in zip(lines, found, strict=True) if (n, f) not in ours]
+            block = json.dumps({"decision": "block", "reason": "\n".join(f.reason for _, f in ours)})
+            return 0, block + "\n", "".join(line + "\n" for line in rest)
     return 0, "", text
 
 

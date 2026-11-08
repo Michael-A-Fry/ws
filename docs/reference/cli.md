@@ -515,13 +515,113 @@ ws session nudge [-h] [--session-id ID] [--runner RUNNER]
 | `--session-id ID` | The session id (default: session_id in the hook JSON). |
 | `--runner RUNNER` | Which runner is calling (recorded). Default `unknown`. |
 
+## `ws msg`
+
+Messages between sessions: send one, list yours, read one, watch the envelope feed, wait for the next. A message is data
+for the receiver, never an instruction. See [Messages](messages.md).
+
+```text
+ws msg [-h] {send,list,read,watch,wait,export} ...
+```
+
+### `ws msg send`
+
+Send a message; the sender is the session you are in, never an argument.
+
+```text
+ws msg send [-h] [--kind KIND] [--reply-to ID] [--thread NAME] [--key KEY] [--tier {info,urgent,noise}]
+    [--ack-required] SESSION [text]
+```
+
+| Argument | Meaning |
+|---|---|
+| `SESSION` | The recipient's session id. |
+| `text` | The message, or `-` to read standard input. At most 16 KiB. |
+| `--kind KIND` | `note` (default), `ask`, `stop-and-hand-over`, or a fixed kind (`ack`, `done`, `stop-and-hand-over:done`, `ask:pending`, `counts`). |
+| `--reply-to ID` | The message this answers; it joins that thread. |
+| `--thread NAME` | A thread name (letters, digits, `.`, `_`, `:`, `-`). |
+| `--key KEY` | An idempotency key: sending it again returns the first message. |
+| `--tier TIER` | `info`, `urgent` or `noise`. |
+| `--ack-required` | Ask the receiver to acknowledge it. |
+
+### `ws msg list`
+
+Your messages (envelopes only), oldest first.
+
+```text
+ws msg list [-h] [--sent] [--unread] [--after ID] [--limit N]
+```
+
+| Argument | Meaning |
+|---|---|
+| `--sent` | The ones you sent, not the ones left for you. |
+| `--unread` | Only those you have not read. |
+| `--after ID` | Only messages after this id. |
+| `--limit N` | At most N (default 50, up to 200). |
+
+### `ws msg read`
+
+Read one message left for you; the body is shown only to the recipient.
+
+```text
+ws msg read [-h] [--ack] ID
+```
+
+| Argument | Meaning |
+|---|---|
+| `--ack` | Acknowledge it too. |
+
+### `ws msg watch`
+
+The envelope feed (who, what kind, how big; never a body), from a cursor.
+
+```text
+ws msg watch [-h] [--after SEQ] [--position-now] [--limit N]
+```
+
+| Argument | Meaning |
+|---|---|
+| `--after SEQ` | Only rows after this sequence number. |
+| `--position-now` | List nothing; print the cursor for the end of the feed. |
+| `--limit N` | At most N (up to 200). |
+
+### `ws msg wait`
+
+Block until a message that no hook has delivered lands for you.
+
+```text
+ws msg wait [-h] [--timeout SECONDS] [--session-id ID] [--session-hook] [--pin KEY=PATH]
+```
+
+| Argument | Meaning |
+|---|---|
+| `--timeout SECONDS` | Give up after this long (at most 1800; a hook's waiter, 82800). |
+| `--session-id ID` | The session, when its runner hosts several (OpenCode). |
+| `--session-hook` | What a Claude Code `asyncRewake` hook runs: exit 2 with the envelope on standard error when a message lands, and exit 0, silently, in every other case, including a one-shot `claude -p` run. |
+| `--pin KEY=PATH` | Hook entry: the folders `ws install` pinned (`home`, `config`, `state`, `data`, `cache`); refuses if the environment resolves elsewhere. |
+
+### `ws msg export`
+
+Write messages as JSON lines (never a walled body).
+
+```text
+ws msg export [-h] [--out PATH] [--after ID] [--limit N]
+```
+
+| Argument | Meaning |
+|---|---|
+| `--out PATH` | A new file to write (default: standard output). An existing path is refused. |
+| `--after ID` | Only messages after this id. |
+| `--limit N` | At most N (default 10000, up to 100000). |
+
 ## `ws install`
 
 Set up ws on this machine; run it again and it reports 0 changes.
 
 ```text
 ws install [-h] [--stays-on yes|no] [--server ADDRESS|none] [--notes PATH] [--module NAME] [--runner
-    {claude-code,opencode}] [--model ID] [--allow-widened-sandbox] [--cap USD] [-y] [--dry-run]
+    {claude-code,opencode}] [--model ID] [--gate {every-session,launch}] [--allow-widened-sandbox] [--class NAME]
+    [--cap USD] [-y] [--dry-run]
 ```
 
 | Argument | Meaning |
@@ -532,7 +632,9 @@ ws install [-h] [--stays-on yes|no] [--server ADDRESS|none] [--notes PATH] [--mo
 | `--module NAME` | Also switch on a module; repeat for more. |
 | `--runner RUNNER` | The AI tool ws runs jobs with. One of `claude-code`, `opencode`. |
 | `--model ID` | The default model. |
+| `--gate every-session\|launch` | `every-session`: the runner's own user config carries ws's deny rules and hooks, so every session is gated. `launch`: only a session started with `ws gate launch` is. |
 | `--allow-widened-sandbox` | Keep settings of yours that open the sandbox (an excluded command, say); ws records the choice. |
+| `--class NAME` | Print the commands (`sudo` included) and the root-owned managed-settings file for a class with an `os_user`, and write nothing. ws creates no user and places no file. See [Set up a class user](../how-to/set-up-a-class-user.md). |
 | `--cap USD` | Your own monthly spend cap. |
 | `-y`, `--yes` | No prompts. |
 | `--dry-run` | Show what would change; write nothing. |

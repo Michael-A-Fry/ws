@@ -6,6 +6,7 @@ import inspect
 import io
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -40,6 +41,11 @@ def home(tmp_path, monkeypatch):
 
 def folder(home):
     return home / "wshome" / "sessions"
+
+
+def identity(home):
+    """Where the role and the runner stamp live (not in the sessions folder, which the wall leaves writable)."""
+    return home / "wshome" / "identity"
 
 
 def start(monkeypatch, capsys, sid="s1", cwd="/work/here", *extra, payload=None):
@@ -291,9 +297,9 @@ def prepare(role="lead") -> str:
 
 def test_prepare_writes_one_private_single_use_token(home):
     token = prepare("lead")
-    path = folder(home) / "launch" / token
+    path = identity(home) / "launch" / token
     assert len(token) == 32 and stat.S_IMODE(path.stat().st_mode) == 0o600
-    assert stat.S_IMODE((folder(home) / "launch").stat().st_mode) == 0o700
+    assert stat.S_IMODE((identity(home) / "launch").stat().st_mode) == 0o700
     assert json.loads(path.read_text())["role"] == "lead"
     assert prepare("worker") != token
     with pytest.raises(WsError) as e:
@@ -305,11 +311,11 @@ def test_the_command_prints_the_variable_and_json_has_it_too(home, capsys):
     assert cli.main(["session", "prepare", "--role", "reviewer"]) == 0
     out = capsys.readouterr().out
     name, _, token = out.strip().partition("=")
-    assert name == "WS_LAUNCH" and (folder(home) / "launch" / token).is_file()
+    assert name == "WS_LAUNCH" and (identity(home) / "launch" / token).is_file()
     assert cli.main(["session", "prepare", "--role", "lead", "--json"]) == 0
     data = json.loads(capsys.readouterr().out)["data"]
     assert data["role"] == "lead" and data["ttl_seconds"] == session.LAUNCH_TTL == 600
-    assert (folder(home) / "launch" / data["WS_LAUNCH"]).is_file()
+    assert (identity(home) / "launch" / data["WS_LAUNCH"]).is_file()
     assert cli.main(["session", "prepare", "--role", "boss"]) == 2  # argparse refuses an unknown role
     assert cli.main(["session", "prepare"]) == 2
 
@@ -319,8 +325,8 @@ def test_start_claims_the_token_and_deletes_it(home, monkeypatch, capsys):
     monkeypatch.setenv(session.LAUNCH_ENV, token)
     start(monkeypatch, capsys, "s1")
     assert session.read("s1").role == "lead"
-    assert not (folder(home) / "launch" / token).exists()
-    assert list((folder(home) / "launch").iterdir()) == []
+    assert not (identity(home) / "launch" / token).exists()
+    assert list((identity(home) / "launch").iterdir()) == []
 
 
 def test_a_token_works_once(home, monkeypatch, capsys):
@@ -356,7 +362,7 @@ def test_expired_missing_and_forged_tokens_give_worker(home, monkeypatch, capsys
 
 
 def test_a_token_planted_in_the_folder_is_not_taken_on_trust(home, monkeypatch, capsys):
-    launch = folder(home) / "launch"
+    launch = identity(home) / "launch"
     launch.mkdir(parents=True)
     cases = {
         "a" * 32: ({"role": "lead", "created": session._now()}, 0o644),  # not private
@@ -434,7 +440,7 @@ def test_prune_keeps_the_thirty_days_and_leaves_the_launch_folder(home, monkeypa
     os.utime(folder(home) / "old.json", (1, 1))
     start(monkeypatch, capsys, "newer")
     assert not (folder(home) / "old.json").exists() and (folder(home) / "new.json").exists()
-    assert (folder(home) / "launch").is_dir() and session._KEEP_DAYS == 30
+    assert (identity(home) / "launch").is_dir() and session._KEEP_DAYS == 30
 
 
 def test_the_home_page_source_still_reads_v2(home, monkeypatch, capsys):
@@ -508,11 +514,15 @@ def test_resolve_caller_finds_the_nearest_ancestor(home, monkeypatch, capsys):
     # a cleared session leaves two records for one runner: the newest wins
     chain(monkeypatch, proc(300, "claude"))
     start(monkeypatch, capsys, "outer-2")
-    raw = on_disk(home, "outer")
+    raw = json.loads((identity(home) / "outer.json").read_text())
     raw["started_at"] = "2020-01-01T00:00:00+00:00"
-    (folder(home) / "outer.json").write_text(json.dumps(raw))
+    (identity(home) / "outer.json").write_text(json.dumps(raw))
     assert session.resolve_caller().session_id == "outer-2"
-    assert not inspect.signature(session.resolve_caller).parameters  # it takes no environment to be told otherwise
+    assert list(inspect.signature(session.resolve_caller).parameters) == [
+        "session_id"
+    ]  # no environment to be told otherwise
+    assert session.resolve_caller("outer").session_id == "outer"  # asked about one session, only it answers
+    assert session.resolve_caller("inner") is None  # not under inner's runner
 
 
 def test_resolve_caller_none_without_a_match(home, monkeypatch, capsys):
@@ -623,7 +633,91 @@ def test_old_records_still_read(home):
         (folder(home) / f"{name}.json").write_text(json.dumps({**base, **extra}))
     old, new = session.read("v1"), session.read("v2")
     assert (old.runner_pid, old.runner_start, old.role) == (None, None, "worker")
-    assert (new.runner_pid, new.role, new.class_, new.rev) == (None, "lead", "x", 3)
+    assert (new.runner_pid, new.role, new.class_, new.rev) == (None, "worker", "x", 3)  # a role here is only a copy
     assert "runner_pid" not in old.to_dict() and session.SCHEMA_VERSION == 2
     assert session.update("v2", state="idle").rev == 4 and session.read("v2").runner_pid is None
     assert session.resolve_caller() is None  # neither is stamped, so neither can be a caller
+
+
+# --- identity: the role and the stamp are held where the wall keeps them read-only ----------------------------------
+
+
+def test_a_walled_session_cannot_claim_lead(home, monkeypatch, capsys):
+    from ws import sandbox
+
+    chain(monkeypatch, proc(300, "claude"))
+    start(monkeypatch, capsys, "real")  # a worker with a stamp, as any session is
+    # 1. a role and a stamp written into the sessions file (the folder the wall leaves writable) are ignored
+    raw = on_disk(home, "real")
+    raw.update(role="lead", runner_pid=999, runner_start="s999")
+    (folder(home) / "real.json").write_text(json.dumps(raw))
+    assert session.read("real").role == "worker" and session.read("real").runner_pid == 300
+    chain(monkeypatch, proc(999, "claude"))
+    assert session.resolve_caller() is None  # the planted stamp matches nothing
+    # a whole record planted for a session that never started has no identity: a worker, and nobody's caller
+    forged = {**raw, "session_id": "forged", "runner_pid": 777, "runner_start": "s777"}
+    (folder(home) / "forged.json").write_text(json.dumps(forged))
+    chain(monkeypatch, proc(777, "claude"))
+    assert session.read("forged").role == "worker" and session.resolve_caller() is None
+    # 2. a token planted in the old launch folder is not a token
+    old = folder(home) / "launch"
+    old.mkdir()
+    (old / ("a" * 32)).write_text(json.dumps({"role": "lead", "created": session._now()}))
+    (old / ("a" * 32)).chmod(0o600)
+    monkeypatch.setenv(session.LAUNCH_ENV, "a" * 32)
+    chain(monkeypatch, proc(310, "claude"))
+    start(monkeypatch, capsys, "tokened")
+    assert session.read("tokened").role == "worker"
+    # 3. a start that can't write the identity folder (a hook inside the wall) leaves no identity at all
+    monkeypatch.delenv(session.LAUNCH_ENV)
+    shutil.rmtree(identity(home))
+    identity(home).write_text("a file where the folder goes: the nearest thing to a read-only mount")
+    chain(monkeypatch, proc(320, "claude"))
+    start(monkeypatch, capsys, "inside")
+    assert session.read("inside").role == "worker" and session.read("inside").runner_pid is None
+    assert "runner_pid" not in on_disk(home, "inside") and on_disk(home, "inside")["role"] == "worker"
+    assert session.resolve_caller() is None  # the strictest case: not anybody
+    # 4. the identity folder is not one of the wall's writable holes, and the gate treats it as a control path
+    state = home / "wshome"
+    holes = sandbox.writable_holes(state)
+    assert not any(h == state / "identity" or state / "identity" in h.parents for h in holes)
+    assert str(state / "identity") in paths.control_paths({"HOME": str(home), "WS_HOME": str(state)})
+    assert "identity" in paths.NAMES["state"] and "identity" in paths.CONTROL_NAMES
+
+
+def test_a_launch_token_for_lead_gives_the_identity_not_the_sessions_file(home, monkeypatch, capsys):
+    token = prepare("lead")
+    monkeypatch.setenv(session.LAUNCH_ENV, token)
+    chain(monkeypatch, proc(400, "claude"))
+    start(monkeypatch, capsys, "boss")
+    ident = json.loads((identity(home) / "boss.json").read_text())
+    assert (ident["role"], ident["runner_pid"], ident["runner_start"]) == ("lead", 400, "s400")
+    assert session.resolve_caller().role == "lead" and session.resolve_caller("boss").session_id == "boss"
+    assert stat.S_IMODE((identity(home) / "boss.json").stat().st_mode) == 0o600
+    start(monkeypatch, capsys, "boss")  # a resumed start with no token keeps the role
+    assert session.read("boss").role == "lead"
+    assert [r.session_id for r in session.records()] == ["boss"]
+
+
+def test_the_peer_the_gate_binds_is_where_the_walk_starts(home, monkeypatch, capsys):
+    monkeypatch.setattr(session, "_PEER", None)
+    chain(monkeypatch, proc(300, "claude"))
+    start(monkeypatch, capsys, "a")
+    monkeypatch.setattr(session, "_ancestors", list)  # the daemon child's own ancestors hold no runner
+    assert session.resolve_caller() is None
+    table = {50: proc(50, "python", ppid=40), 40: proc(40, "sh", ppid=300), 300: proc(300, "claude", ppid=1)}
+    monkeypatch.setattr(session, "proc_info", lambda pid: table.get(pid))
+    session.bind_peer(50)
+    assert session.resolve_caller().session_id == "a"
+    session.bind_peer(None)  # a system that gives no process id: nobody can be told
+    assert session.resolve_caller() is None
+
+
+def test_records_refuses_a_record_that_will_not_read(home, monkeypatch, capsys):
+    chain(monkeypatch, proc(300, "claude"))
+    start(monkeypatch, capsys, "a")
+    assert [r.session_id for r in session.records()] == ["a"]
+    (folder(home) / "a.json").write_text("{not json")
+    with pytest.raises(WsError) as e:
+        session.records()
+    assert e.value.kind == "unavailable"

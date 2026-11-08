@@ -11,7 +11,7 @@ from what it used. `src/ws/queue.py` is the code; this page is the contract. The
 | `ws queue add JOB [--key K] [--deadline T]` | Queue a run of `jobs/JOB.toml`. The same `--key` again queues nothing new. |
 | `ws queue list [--all] [--last N]` | The receipts: what waits or runs (`--all` adds the finished ones). |
 | `ws queue show RUN_ID` | One receipt. |
-| `ws queue cancel RUN_ID` | Take a queued run out of the queue. A running one is stopped with SIGTERM to its `ws run`. |
+| `ws queue cancel RUN_ID` | Take a queued run out of the queue. A running one, or one a drain has just claimed (`not_cancellable`), is stopped with SIGTERM to its `ws run`. |
 | `ws queue run [--max N]` | Run what is queued, one after another. This is what a timer runs. |
 | `ws queue slot --ram-gb N --lane ui --who join\|writer -- CMD...` | Wait for a slot, run `CMD` in it, give the slot back. Raw: the command's output and exit code are its own. |
 | `ws node join\|show\|remove` | The node's footprint ledger. See [Nodes](#nodes). |
@@ -32,12 +32,13 @@ Every run, from `ws run`, `ws eval` or the queue, goes through one transaction (
 | `turns` | `max_turns` (default 30) | wait: over `max_open_turns` in flight; refuse if the run alone is over |
 | `time` | `timeout_s` | wait: over `max_open_seconds` in flight |
 | `concurrency`, `lane:NAME` | one slot | wait: `max_concurrent` runs at once, and `ui_slots` in the `ui` lane |
-| `memory` | `resources.ram_gb` | wait: MemAvailable must stay at or above `reserve_pct` of the total after it |
+| `memory` | `resources.ram_gb`, when the job declares it | wait: MemAvailable must stay at or above `reserve_pct` of the total after it |
 | `job_running` | one run of a job at a time | wait |
 | `subscription_*` | none | refuse a job on a login when a fresh capture shows a window used up |
 
 A direct `ws run` that would wait is refused (exit 3, `refused:<counter>`). A queued run stays queued and the next drain
-tries again. A system that cannot report memory admits the run, and the reservation says so.
+tries again. A job that declares no `ram_gb` is not held up by memory, and the host's memory is not read for it. A
+system that cannot report memory admits a job that did declare it, and the reservation says so.
 
 **Resize.** If a money counter has room, but less than the estimate, the reservation shrinks to the room (rounded
 down to 0.0001) and `resized` is true. That sum is passed to Claude Code as `--max-budget-usd`. A job with
@@ -63,7 +64,13 @@ bound to the claim that made it; a settle with another claim is refused.
 A reservation whose owner is gone is reaped by the next admission: the owner is gone when its process id is not
 running, or is running with a different start time (the id was reused). Where the system cannot tell, the lease decides
 (the job's timeout plus two minutes). The reaper writes the run's record if it never got to, at the fallback cost,
-and frees the reservation.
+and frees the reservation. A `ws queue slot` that crashed held a place for a command of yours, not a job: it is freed with
+no record and no cost.
+
+Before a drain, a message that was claimed and has nothing running (the drain died) is dealt with as the drain would have:
+a run that finished is marked done and not run again, a refused one fails, a crash or an interruption is retried and
+costs a try (three, then it fails), a preempted one is requeued only if its job is `preemptible`, and nothing comes back
+after its `deadline`.
 
 ## Retries
 
@@ -119,18 +126,25 @@ login is refused (`subscription_login`, exit 3).
 
 Claude Code (2.1.80 and later) pipes `rate_limits.five_hour` and `rate_limits.seven_day` to its statusline command. `ws
 usage statusline` reads that JSON on stdin and stashes it at `usage/rate_limits.json`, or writes a tombstone when the
-payload has none. Admission reads it for a job that uses a login. A capture older than 600 s, a tombstone, a window past
-its reset time and a figure that is not a percentage all read as unknown, never as room. ws never calls the provider's
-OAuth usage endpoint with a login. Putting the command in your Claude Code settings is yours to do; ws does not yet.
+payload has `rate_limits` but no usable window. A payload with no `rate_limits` at all leaves the last capture as it
+is, to age out at 600 s. Admission reads it for a job that uses a login. A capture older than 600 s, a tombstone, a
+window past its reset time and a figure that is not a percentage all read as unknown, never as room. ws never calls
+the provider's OAuth usage endpoint with a login. Putting the command in your Claude Code settings is yours to do; ws
+does not yet.
 
 ## Nodes
 
-`ws node join` writes the queue folder, a node record and a job that runs `ws queue run` every N minutes (5 to 30), and
-with `--timer` on systemd the timer for it. Before each change it writes an `intent` line to the ledger
-(`node/footprint.jsonl`, `type` `ws.footprint/1`), and a `done` line after. `ws node remove` undoes the changes newest
-first: a file only if it still holds what ws wrote, a folder only if ws made it and it is empty, a timer by switching it
-off. What it cannot undo is listed and the exit is 1; run it again after you have looked. When nothing is left the ledger
-goes too.
+`ws node join` writes the queue folder, a node record and a job that runs `ws queue run` every N minutes (5 to 30),
+and with `--timer` on systemd the timer for it (that one timer only: other scheduled jobs are not switched on). Before
+each change it writes an `intent` line to the ledger (`node/footprint.jsonl`, `type` `ws.footprint/1`), and a `done`
+line after. `ws node remove` undoes the changes newest first: a file only if it still holds what ws wrote, a folder
+only if ws made it and it is empty, a timer by switching it off. What it cannot undo is listed and the exit is 1; run
+it again after you have looked. When nothing is left the ledger goes too.
+
+A file is made under a temporary name and put in place whole, so a crash leaves it complete or not there. An `intent`
+whose `done` never came is not left blocking `remove`: the step was never confirmed, so what is at its name is not
+claimed. Running `ws node join` again after a join that stopped part-way finishes the steps that are missing, and adds
+the timer to a node that joined without one.
 
 ## The engine
 

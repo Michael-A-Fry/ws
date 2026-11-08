@@ -306,3 +306,104 @@ def test_install_uninstall_diff_to_zero_in_a_container(tmp_path):
         done = subprocess.run(argv, capture_output=True, text=True, timeout=300, check=False)
     assert done.returncode == 0, done.stdout + done.stderr
     assert done.stdout.strip().endswith("diff-is-zero")
+
+
+# ---- review fixes: atomic files, a half-done join, only the drain's timer ---------------------------------------
+
+
+def test_a_file_is_made_whole_or_not_at_all(box, monkeypatch):
+    """A crash while the file goes into place leaves no file and no temporary one."""
+    steps_seen = []
+    real_link = os.link
+
+    def die(src, dst, **kw):
+        steps_seen.append(dst)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(node.os, "link", die)
+    with pytest.raises(KeyboardInterrupt):
+        node.join()
+    monkeypatch.setattr(node.os, "link", real_link)
+    assert steps_seen and not Path(steps_seen[0]).exists()
+    assert not [p for p in box.rglob("*") if p.name.endswith(".tmp")]
+    assert not node.remove().left
+
+
+def test_an_intent_with_no_done_does_not_block_remove_whatever_is_at_the_name(box, monkeypatch):
+    """The join stopped before the file was made, and a file of someone else's is there now: it is not ws's, and the
+    step is not left behind for ever."""
+    real = node._DO["file"]
+
+    def stop(step):
+        raise KeyboardInterrupt
+
+    monkeypatch.setitem(node._DO, "file", stop)
+    with pytest.raises(KeyboardInterrupt):
+        node.join()
+    monkeypatch.setitem(node._DO, "file", real)
+    (box / "node").mkdir(exist_ok=True)
+    (box / "node" / "node.json").write_text("not ws's, and not what ws would have written\n")
+    result = node.remove()
+    assert not result.left
+    assert (box / "node" / "node.json").read_text().startswith("not ws's")  # and it is left alone
+    assert not (box / "node" / "footprint.jsonl").exists()  # nothing is outstanding, so the ledger went
+
+
+def test_a_join_that_stopped_part_way_is_finished_by_the_next_one(box, monkeypatch):
+    clean = [(s.kind, s.target) for s in node.join()]
+    assert not node.remove().left
+    real = node._DO["file"]
+    count = [0]
+
+    def break_on_second(step):
+        count[0] += 1
+        if count[0] == 2:
+            raise OSError(28, "No space left on device")
+        real(step)
+
+    monkeypatch.setitem(node._DO, "file", break_on_second)
+    with pytest.raises(OSError):
+        node.join()
+    monkeypatch.setitem(node._DO, "file", real)
+    again = node.join()
+    assert [(s.kind, s.target) for s in again] == clean  # the same steps as a clean join, none twice
+    _, steps = node.read_steps(box / "node" / "footprint.jsonl")
+    assert {s.state for s in steps} == {"done"} and len(steps) == len(clean)
+    assert len({s.id for s in steps}) == len(steps)
+    for kind, target in clean:
+        assert Path(target).exists() if kind != "timer" else True
+    assert not node.remove().left
+    assert not (box / "node").exists() and not (box / "jobs").exists()
+
+
+def test_join_with_a_timer_switches_on_the_drain_timer_and_no_other(box):
+    jobs_dir = box / "jobs"
+    jobs_dir.mkdir()
+    jobs_dir.chmod(0o700)
+    (jobs_dir / "other.toml").write_text('command = "queue"\nschedule = "every 15m"\n')  # a job with a timer of its own
+    runs: list[list[str]] = []
+
+    def runner(argv):
+        runs.append(argv)
+        return 0, ""
+
+    steps = node.join(timer=True, runner=runner)
+    timer = [s for s in steps if s.kind == "timer"]
+    assert [s.target for s in timer] == [node.DRAIN_JOB]  # recorded in the ledger
+    text = json.dumps(runs)
+    assert "queue-drain" in text and "other" not in text
+    assert [a for a in runs if a[:3] == ["systemctl", "--user", "enable"]] == [
+        ["systemctl", "--user", "enable", "--now", "ws-queue-drain.timer"]
+    ]
+    _, recorded = node.read_steps(box / "node" / "footprint.jsonl")
+    assert [s.state for s in recorded if s.kind == "timer"] == ["done"]
+
+
+def test_a_node_that_joined_without_a_timer_gets_one_on_the_next_join(box):
+    first = node.join()
+    assert not any(s.kind == "timer" for s in first)
+    runs: list[list[str]] = []
+    again = node.join(timer=True, runner=lambda argv: runs.append(argv) or (0, ""))
+    assert [s.id for s in again[: len(first)]] == [s.id for s in first]  # the steps it had are kept as they are
+    assert [s.kind for s in again[len(first) :]][-1] == "timer" and runs
+    assert not node.remove(runner=lambda argv: (0, "")).left

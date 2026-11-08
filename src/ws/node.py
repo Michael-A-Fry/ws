@@ -139,12 +139,24 @@ def _undo_dir(step: Step) -> str | None:
 
 
 def _do_file(step: Step) -> None:
+    """Make the file whole under a temporary name and put it in place without replacing anything, so a crash leaves the
+    file complete or not there, never half written. A file that appeared at the name meanwhile is left as it is (`remove`
+    deletes it only if its content is the one recorded)."""
     if step.detail.get("existed"):
         return
     p = Path(step.target)
-    fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
-    with os.fdopen(fd, "wb") as fh:
-        fh.write(step.detail["content"].encode("utf-8"))
+    tmp = p.with_name(f".{p.name}.{os.getpid()}.tmp")
+    with contextlib.suppress(FileNotFoundError):
+        tmp.unlink()
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(step.detail["content"].encode("utf-8"))
+        with contextlib.suppress(FileExistsError):
+            os.link(tmp, p)
+    finally:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
 
 
 def _undo_file(step: Step) -> str | None:
@@ -164,11 +176,32 @@ def _undo_file(step: Step) -> str | None:
 
 
 def _do_timer(step: Step, runner: Callable | None, env) -> None:
-    from ws.roles import systemd
+    """Link and enable the one timer this step names (the queue drain's), and nothing else: the other jobs that have a
+    schedule on this machine are not ws node's to switch on."""
+    from ws.roles import _schedule, systemd
 
-    problems = systemd.activate(env, runner)
-    if problems:
-        raise NodeError("timer", "; ".join(problems), "look at `systemctl --user status`, then `ws node remove`")
+    run = runner or _schedule.run_cmd
+    files = systemd.files_for(env, step.target)
+    clash = [f.name for f in files if _schedule.is_foreign(env, f.name, systemd.MARKER)]
+    if clash:
+        raise NodeError(
+            "timer",
+            f"{', '.join(clash)} already exists in {_schedule.user_unit_dir(env)} and isn't ws's",
+            "rename that unit or leave --timer out",
+        )
+    timers = [f.name for f in files if f.suffix == ".timer"]
+    for argv in (
+        ["systemctl", "--user", "link", *map(str, files)],
+        ["systemctl", "--user", "daemon-reload"],
+        ["systemctl", "--user", "enable", "--now", *timers],
+    ):
+        code, out = run(argv)
+        if code:
+            raise NodeError(
+                "timer",
+                f"`{' '.join(argv[:4])}` failed: {out[:200] or code}",
+                "look at `systemctl --user status`, then `ws node remove`",
+            )
 
 
 def _undo_timer(step: Step, runner: Callable | None, env) -> str | None:
@@ -236,10 +269,9 @@ def join(env=None, *, every: int = 10, timer: bool = False, runner: Callable | N
     node that has joined already (a step still in place) is left as it is."""
     env = os.environ if env is None else env
     path = ledger_path(env)
-    _, steps = read_steps(path)
-    if any(s.state != "removed" for s in steps):
-        return [s for s in steps if s.state != "removed"]
-    node_id = f"n-{os.urandom(4).hex()}"
+    known, steps = read_steps(path)
+    live = [s for s in steps if s.state != "removed"]
+    node_id = known if live and known else f"n-{os.urandom(4).hex()}"
     plan = _plan(env, node_id, every, timer)
     if timer:
         from ws import osinfo
@@ -248,19 +280,34 @@ def join(env=None, *, every: int = 10, timer: bool = False, runner: Callable | N
             raise NodeError(
                 "no_timer", "--timer needs systemd on this machine", "leave --timer out and run `ws schedule apply`"
             )
+    have = {(s.kind, s.target): s for s in live}
+    numbers = [int(s.id[1:]) for s in steps if s.id[1:].isdigit()]
+    next_id = max(numbers, default=0) + 1
     made: list[Step] = []
-    for n, (kind, target, detail) in enumerate(plan, 1):
-        step = Step(f"s{n}", kind, target, "intent", detail)
-        stamp = {k: v for k, v in detail.items()}
-        _write(path, _line(node_id, "intent", step.id, kind=kind, target=target, **stamp))
-        if kind == "timer":
-            _do_timer(step, runner, env)
-        else:
-            _DO[kind](step)
+    # a step whose intent is written and whose `done` is not (the join stopped there) is done again: every kind is safe to
+    # repeat; then each step of the plan the ledger doesn't hold yet is added after the ones it has
+    for step in (s for s in live if s.state == "intent"):
+        _make(step, runner, env)
+        _write(path, _line(node_id, "done", step.id))
+        step.state = "done"
+    for kind, target, detail in plan:
+        if (kind, target) in have:
+            continue
+        step = Step(f"s{next_id}", kind, target, "intent", detail)
+        next_id += 1
+        _write(path, _line(node_id, "intent", step.id, kind=kind, target=target, **detail))
+        _make(step, runner, env)
         _write(path, _line(node_id, "done", step.id))
         step.state = "done"
         made.append(step)
-    return made
+    return live + made
+
+
+def _make(step: Step, runner: Callable | None, env) -> None:
+    if step.kind == "timer":
+        _do_timer(step, runner, env)
+    else:
+        _DO[step.kind](step)
 
 
 def remove(env=None, *, runner: Callable | None = None) -> Result:
@@ -281,6 +328,8 @@ def remove(env=None, *, runner: Callable | None = None) -> Result:
                 why = _UNDO[step.kind](step)
         except (OSError, WsError) as e:
             why = getattr(e, "message", None) or f"{type(e).__name__}: {e.strerror or e}"
+        if why and step.state == "intent" and step.kind in ("dir", "file"):
+            why = None  # its `done` was never written, so ws can't claim what is there: it is not ws's, and not in the way
         if isinstance(why, Blocked) and _only_ledger_or_deferred(step, why.names, deferred):
             deferred.append(step)  # it holds nothing but the ledger's folder, or a folder that is itself waiting
             continue

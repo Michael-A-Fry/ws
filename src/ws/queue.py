@@ -316,10 +316,11 @@ class Decision:
 # The host: memory and process identity (both injectable)
 
 
-def read_memory() -> tuple[float, float] | None:
-    """(MemAvailable, MemTotal) in GB from /proc/meminfo, or None where the system does not report them."""
+def read_memory(meminfo: str = "/proc/meminfo") -> tuple[float, float] | None:
+    """(MemAvailable, MemTotal) in GB from /proc/meminfo (or the file `meminfo` names), or None where the system does not
+    report them."""
     try:
-        text = Path("/proc/meminfo").read_text(encoding="ascii", errors="replace")
+        text = Path(meminfo).read_text(encoding="ascii", errors="replace")
     except OSError:
         return None
     kb: dict[str, int] = {}
@@ -448,7 +449,7 @@ class Ledger:
         state: Path,
         *,
         limits: Limits | None = None,
-        memory: Callable[[], tuple[float, float] | None] = read_memory,
+        memory: Callable[[], tuple[float, float] | None] | None = None,
         probe: Callable = proc_probe,
         rate_limits: Callable[[datetime], usage.RateLimits | None] | None = None,
         costing: tuple[float | None, float | None] = (None, None),
@@ -460,7 +461,10 @@ class Ledger:
         self.folder = self.state / "queue"
         self.path = self.folder / "queue.db"
         self.limits = limits or Limits()
-        self.memory, self.probe, self.costing = memory, probe, costing
+        self.memory = (
+            memory if memory is not None else (lambda: read_memory())
+        )  # looked up on use, so a test can swap it
+        self.probe, self.costing = probe, costing
         self.rate_limits = rate_limits or (lambda now: usage.read_rate_limits(self.state, now))
         self.recorded, self.sink, self.clock = recorded, sink, clock
         self._conn: sqlite3.Connection | None = None
@@ -635,10 +639,12 @@ class Ledger:
             )
         counters.append("concurrency")
 
-        mem = self.memory()
-        if mem is None:
+        # memory is a counter only for a run that declared `ram_gb`: one that did not asked for none, and is not held up
+        # by how much is free (the host's own reserve is for the runs that said what they need)
+        mem = self.memory() if req.ram_gb > 0 else None
+        if req.ram_gb > 0 and mem is None:
             notes.append("memory not reported on this system")
-        else:
+        elif mem is not None:
             avail, total = mem
             reserve = total * self.limits.reserve_pct / 100
             headroom = self.limits.join_headroom_gb if req.who == "writer" else 0.0
@@ -841,6 +847,15 @@ class Ledger:
         """A run whose owner is gone. If it got as far as writing its record, settle from that. Otherwise write the record
         it never got to (a started run counts at the fallback cost, as any run with no reported cost does)."""
         run_id, ns = r["run_id"], to_ns(now)
+        if r["who"] is not None:
+            # a `ws queue slot` held the place for a command of the person's, not a job: there is no run record to write
+            # and no money to count, so the slot is only let go
+            c.execute(
+                "UPDATE receipts SET status = 'interrupted', finished_at = ?, settled = 1, actual_usd = 0, "
+                "record_written = 1, stop_reason = 'crashed' WHERE run_id = ? AND settled = 0",
+                (ns, run_id),
+            )
+            return
         unknown_run_usd, fallback = self.costing
         rec = self.recorded(run_id) if self.recorded else None
         written = True
@@ -930,7 +945,13 @@ class Ledger:
                         "not_cancellable", f"{run_id} is {r['status']}, not waiting in the queue",
                         "a running job is stopped with SIGTERM to its `ws run`; ws then settles it", EXIT_FAILED,
                     )  # fmt: skip
-                self.engine().discard(r["message_id"])
+                if not self.engine().discard(
+                    r["message_id"]
+                ):  # a drain has claimed it since: it is no longer the queue's to cancel
+                    raise WsError(
+                        "not_cancellable", f"{run_id} has just been claimed to run",
+                        "wait for it to finish; a running job is stopped with SIGTERM to its `ws run`", EXIT_FAILED,
+                    )  # fmt: skip
                 c.execute(
                     "UPDATE receipts SET status = 'skipped', finished_at = ?, settled = 1, actual_usd = 0, stop_reason = 'cancelled' WHERE run_id = ?",
                     (to_ns(now), run_id),
@@ -983,22 +1004,72 @@ class Ledger:
         ).fetchone()
         return r["run_id"] if r else None
 
-    def recover(self, now: datetime) -> int:
-        """Before a drain: reap dead owners, and put claimed work back that nothing is running (a drain that crashed
-        between claiming and starting) or whose claim outlived `MESSAGE_LEASE_S`. Returns how many came back."""
+    def recover(self, now: datetime, preemptible: Callable[[str], bool] = lambda job: False) -> int:
+        """Before a drain: reap dead owners, then deal with each claimed message that nothing is running (a drain that
+        crashed between claiming and finishing) or whose claim outlived `MESSAGE_LEASE_S`. It is dealt with as the drain
+        would have: a run that finished is marked done and not run again; one that was refused is failed; a crash or an
+        interruption is retried at once, and each costs a try, so after `MAX_RETRIES` it fails; a preempted one is
+        requeued only if its job is preemptible; and nothing comes back after its deadline. Returns how many came back."""
         c = self.conn()
         eng = self.engine()
         with _transaction(c):
             self._reap(c, now)
             back = 0
+            lapsed = {m.message_id for m in eng.list_locked(MESSAGE_LEASE_S)}
             for m in eng.list_locked(ORPHAN_S):
                 alive = c.execute(
                     "SELECT 1 FROM receipts WHERE message_id = ? AND status = 'running'", (m.message_id,)
                 ).fetchone()
-                if not alive:
-                    eng.retry(m.message_id, m.claim_id, delay_s=0, count_try=True)
+                if alive and m.message_id not in lapsed:
+                    continue
+                try:
+                    data = json.loads(m.data)
+                except ValueError:
+                    data = {}
+                job = data.get("job") if isinstance(data, dict) else None
+                last = c.execute(
+                    "SELECT status, stop_reason FROM receipts WHERE message_id = ? AND status != 'running' "
+                    "ORDER BY queued_at DESC, run_id DESC LIMIT 1",
+                    (m.message_id,),
+                ).fetchone()
+                out = _recovered_outcome(last)
+                act = classify(
+                    out,
+                    tries=m.tries,
+                    preemptible=preemptible(job) if isinstance(job, str) else False,
+                    deadline=_parse_deadline(data.get("deadline")) if isinstance(data, dict) else None,
+                    now=now,
+                )
+                if act.kind == "done":
+                    eng.done(m.message_id, m.claim_id)
+                elif act.kind == "fail":
+                    eng.mark_failed(m.message_id, m.claim_id)
+                    waiting = self.queued_row(c, m.message_id)
+                    if waiting:
+                        refused = out.status in ("refused", "expired")
+                        self.end_queued(
+                            waiting, "refused" if refused else "error", out.stop_reason, act.why or "failed", now
+                        )
+                else:
+                    delay = 0 if act.kind == "retry" else act.delay_s  # a crash has already cost the wait
+                    eng.retry(m.message_id, m.claim_id, delay_s=delay, count_try=act.count_try)
                     back += 1
-            return back + eng.retry_expired(MESSAGE_LEASE_S, count_try=True)
+            return back
+
+
+def _recovered_outcome(last: sqlite3.Row | None) -> Outcome:
+    """What the attempt that was cut off came to, from its last settled receipt: the drain that died never classified it."""
+    status = last["status"] if last else None
+    stop = last["stop_reason"] if last else None
+    if status == "ok":
+        return Outcome(0, "ok", stop)
+    if status in ("refused", "expired"):
+        return Outcome(EXIT_REFUSED, status, stop)
+    if status == "preempted":
+        return Outcome(EXIT_FAILED, "preempted", "preempted")
+    if status == "error" and stop and stop != "crashed":
+        return Outcome(EXIT_FAILED, "error", stop)
+    return Outcome(EXIT_FAILED, "interrupted", "interrupted")
 
 
 def _version() -> str:
@@ -1147,7 +1218,7 @@ def drain(
     the class `classify` gives the outcome. Returns one dict per attempt. `runner` is `queue.run_item` in `ws queue run`
     and a stand-in in tests."""
     done: list[dict] = []
-    ledger.recover(ledger.clock())
+    ledger.recover(ledger.clock(), preemptible)
     eng = ledger.engine()
     while limit is None or len(done) < limit:
         msg = eng.pop()

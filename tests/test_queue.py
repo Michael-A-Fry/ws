@@ -660,9 +660,12 @@ def test_rate_limit_stale_reads_as_unknown(tmp_path):
     )
     d = ledger.admit(req(credential="subscription"), T0 + timedelta(seconds=601), spend())
     assert d.kind == "admit" and any("unknown" in n for n in d.reservation.notes)
-    # a payload with no limits writes a tombstone: it reads as unknown, even inside the TTL
-    assert usage.capture_statusline(json.dumps({"model": "x"}), state, T0 + timedelta(seconds=10)) == "tombstone"
-    assert usage.read_rate_limits(state, T0 + timedelta(seconds=11)) is None
+    # a payload that carries no `rate_limits` at all leaves a good capture alone: it is still read, until the TTL ends it
+    assert usage.capture_statusline(json.dumps({"model": "x"}), state, T0 + timedelta(seconds=10)) == "unchanged"
+    assert usage.read_rate_limits(state, T0 + timedelta(seconds=11)).five_hour.used_pct == 100
+    # one that says it has none (`rate_limits` empty, or no usable window) is a tombstone: unknown, even inside the TTL
+    assert usage.capture_statusline(json.dumps({"rate_limits": {}}), state, T0 + timedelta(seconds=12)) == "tombstone"
+    assert usage.read_rate_limits(state, T0 + timedelta(seconds=13)) is None
     # a window past its reset time, and a figure that is not a percentage, are dropped
     both = {
         "rate_limits": {
@@ -1286,3 +1289,167 @@ def test_a_reused_pid_is_told_apart_by_its_start_time():
     assert queue.owner_state(os.getpid(), "1") == "gone"  # the pid is running, but it is not the process that reserved
     assert queue.owner_state(os.getpid(), None) == "unknown"  # no start time on record: the lease decides
     assert queue.owner_state(2**22 + 12345, "1") == "gone"
+
+
+# ---- review fixes: slots, recovery, memory, cancel, and the counters that were not reached --------------------------------
+
+
+@pytest.fixture(autouse=True)
+def no_real_meminfo(monkeypatch):
+    """No test here reads the machine's own /proc/meminfo: a ledger that was not given a reader gets this one."""
+    monkeypatch.setattr(queue, "read_memory", lambda path="/proc/meminfo": (8.0, 16.0))
+
+
+def test_a_ledger_with_no_memory_reader_looks_up_the_module_one_when_it_needs_it(tmp_path):
+    ledger = queue.Ledger(tmp_path / "state", limits=queue.Limits(busy_s=0.2), rate_limits=lambda now: None)
+    assert ledger.memory() == (8.0, 16.0)  # the patched reader, not the host's
+
+
+def test_read_memory_reads_the_file_it_is_given(tmp_path, monkeypatch):
+    monkeypatch.undo()  # this test is about the real reader, pointed at a file of its own
+    good = tmp_path / "meminfo"
+    good.write_text("MemTotal:       16777216 kB\nMemFree:  1 kB\nMemAvailable:    8388608 kB\n")
+    assert queue.read_memory(str(good)) == (8.0, 16.0)
+    good.write_text("MemTotal: 16777216 kB\n")  # no MemAvailable
+    assert queue.read_memory(str(good)) is None
+    assert queue.read_memory(str(tmp_path / "missing")) is None
+
+
+def test_memory_counts_only_for_a_run_that_declared_ram_gb(tmp_path):
+    def never() -> tuple[float, float]:
+        raise AssertionError("memory was read for a run that declared none")
+
+    ledger = make(tmp_path, memory=never)
+    d = ledger.admit(req(), T0, spend())  # no ram_gb: the host's memory is not asked
+    assert d.kind == "admit" and "memory" not in d.reservation.counters and not d.reservation.notes
+    tight = make(tmp_path / "t", host=Host(avail=0.1, total=16.0))
+    assert tight.admit(req(), T0, spend()).kind == "admit"  # a host nearly out of memory does not hold it up
+    assert tight.admit(req(ram_gb=2.0), T0, spend(), dry=True).counter == "memory"  # but a run that needs 2 GB waits
+
+
+def test_a_crashed_slot_writes_no_record_and_charges_nothing(tmp_path):
+    host, sink = Host(), []
+    ledger = make(tmp_path, host=host, costing=(2.0, None), sink=lambda rec: sink.append(rec) or True)
+    slot = req(owner_pid=4200, usd=0.0, turns=0, seconds=0.0, who="join", lane="ui", ram_gb=1.0, credential="local")
+    assert ledger.admit(slot, T0, spend()).kind == "admit"
+    host.procs[4200] = (False, None)  # the `ws queue slot` that held it is gone
+    assert ledger.reap(T0) == 1 and sink == []  # no run record for a command that was never a job
+    row = ledger.receipt(slot.run_id)
+    assert (row["status"], row["actual_usd"], row["settled"], row["stop_reason"]) == ("interrupted", 0, True, "crashed")
+    # and no money is held or counted against the cap for it
+    assert ledger.admit(req(cap_usd=1.0, usd=1.0), T0, spend()).kind == "admit"
+
+
+def enqueue_and_claim(ledger, **kw):
+    run_id, message_id, _ = ledger.enqueue("j", None, T0, **kw)
+    assert ledger.engine().pop() is not None  # claimed, and then the drain died
+    return run_id, message_id
+
+
+def message_status(ledger, message_id) -> int:
+    return int(ledger.engine().get(message_id).status)
+
+
+def test_recovery_gives_up_after_the_tries_a_job_is_allowed(tmp_path):
+    clock = Clock()
+    ledger = make(tmp_path, clock=clock)
+    _, mid = enqueue_and_claim(ledger)
+    for crash in range(queue.MAX_RETRIES):
+        clock.advance(seconds=queue.ORPHAN_S + 1)
+        assert ledger.recover(clock()) == 1, crash  # it comes back, and each crash costs a try
+        assert ledger.engine().get(mid).tries == crash + 1
+        assert ledger.engine().pop() is not None
+    clock.advance(seconds=queue.ORPHAN_S + 1)
+    assert ledger.recover(clock()) == 0  # out of tries: not queued again
+    assert message_status(ledger, mid) == int(sqlqueue.Status.FAILED)
+    assert queue.drain(ledger, lambda item: pytest.fail("it was given up on")) == []
+
+
+def test_recovery_does_not_bring_back_what_is_past_its_deadline(tmp_path):
+    clock = Clock()
+    ledger = make(tmp_path, clock=clock)
+    _, mid = enqueue_and_claim(ledger, deadline=T0 + timedelta(hours=1))
+    clock.advance(hours=2)
+    assert ledger.recover(clock()) == 0
+    assert message_status(ledger, mid) == int(sqlqueue.Status.FAILED)
+    (row,) = ledger.receipts(last=5)
+    assert row["status"] == "error" and row["settled"]  # the receipt ends, it does not wait for ever
+
+
+def test_recovery_requeues_a_preempted_run_only_for_a_preemptible_job(tmp_path):
+    for preemptible, want in ((True, sqlqueue.Status.READY), (False, sqlqueue.Status.FAILED)):
+        clock = Clock()
+        ledger = make(tmp_path / str(preemptible), clock=clock)
+        run_id, mid = enqueue_and_claim(ledger)
+        ledger.conn().execute(
+            "UPDATE receipts SET status = 'preempted', finished_at = 1, settled = 1, stop_reason = 'preempted' WHERE run_id = ?",
+            (run_id,),
+        )
+        clock.advance(seconds=queue.ORPHAN_S + 1)
+        assert ledger.recover(clock(), lambda job, p=preemptible: p) == (1 if preemptible else 0)
+        assert message_status(ledger, mid) == int(want), preemptible
+        if preemptible:
+            assert ledger.engine().get(mid).tries == 0  # a preemption is not the job's fault: no try used
+
+
+def test_recovery_does_not_run_again_a_job_that_finished(tmp_path):
+    clock = Clock()
+    ledger = make(tmp_path, clock=clock)
+    run_id, mid = enqueue_and_claim(ledger)
+    ledger.conn().execute(
+        "UPDATE receipts SET status = 'ok', finished_at = 1, settled = 1, stop_reason = 'completed' WHERE run_id = ?",
+        (run_id,),
+    )
+    clock.advance(seconds=queue.ORPHAN_S + 1)
+    assert ledger.recover(clock()) == 0  # it ran to the end; the drain died before saying so
+    assert message_status(ledger, mid) == int(sqlqueue.Status.DONE)
+
+
+def test_cancel_leaves_a_message_a_drain_has_claimed(tmp_path):
+    ledger = make(tmp_path)
+    run_id, mid = enqueue_and_claim(ledger)
+    with pytest.raises(output.WsError) as e:
+        ledger.cancel(run_id, T0)
+    assert e.value.kind == "not_cancellable"
+    assert ledger.receipt(run_id)["status"] == "queued" and not ledger.receipt(run_id)["settled"]  # not marked skipped
+    assert message_status(ledger, mid) == int(sqlqueue.Status.LOCKED)
+    other, _, _ = ledger.enqueue("k", None, T0)
+    assert ledger.cancel(other, T0) == "k"  # one nobody has claimed still cancels
+
+
+def test_turns_and_time_wait_when_full_and_refuse_when_they_can_never_fit(tmp_path):
+    limits = queue.Limits(busy_s=0.2, max_open_turns=10, max_open_seconds=100.0)
+    ledger = make(tmp_path, limits=limits)
+    assert ledger.admit(req(turns=6, seconds=60.0), T0, spend()).kind == "admit"
+    turns = ledger.admit(req(turns=5, seconds=10.0), T0, spend(), dry=True)
+    assert (turns.kind, turns.counter) == ("wait", "turns") and "6 of 10" in turns.reason
+    time_ = ledger.admit(req(turns=1, seconds=50.0), T0, spend(), dry=True)
+    assert (time_.kind, time_.counter) == ("wait", "time") and "60 of 100" in time_.reason
+    assert ledger.admit(req(turns=4, seconds=40.0), T0, spend(), dry=True).kind == "admit"  # exactly the room left
+    never_turns = ledger.admit(req(turns=11, seconds=1.0), T0, spend(), dry=True)
+    assert (never_turns.kind, never_turns.counter) == ("refuse", "turns") and "alone needs 11" in never_turns.reason
+    never_time = ledger.admit(req(turns=1, seconds=101.0), T0, spend(), dry=True)
+    assert (never_time.kind, never_time.counter) == ("refuse", "time")
+
+
+def test_a_transient_stop_is_retried_through_drain_with_a_backoff(tmp_path):
+    clock = Clock()
+    ledger = make(tmp_path, clock=clock)
+    run_id, mid, _ = ledger.enqueue("j", None, T0)
+    seen = []
+
+    def runner(item):
+        seen.append(item.run_id)
+        return queue.Outcome(1, "error", "timeout") if len(seen) == 1 else queue.Outcome(0, "ok", "completed")
+
+    first = queue.drain(ledger, runner)
+    assert [d["action"] for d in first] == ["retry"] and len(seen) == 1
+    msg = ledger.engine().get(mid)
+    assert (int(msg.status), msg.tries) == (int(sqlqueue.Status.READY), 1)  # back in the queue, one try used
+    assert queue.drain(ledger, runner) == []  # held back for the backoff (30 s)
+    clock.advance(seconds=queue.backoff_s(1) + 1)
+    second = queue.drain(ledger, runner)
+    assert [d["action"] for d in second] == ["done"] and len(seen) == 2
+    assert seen[0] == run_id
+    assert len(ledger.receipts(last=10)) == 2  # the retry has a receipt of its own
+    assert message_status(ledger, mid) == int(sqlqueue.Status.DONE)

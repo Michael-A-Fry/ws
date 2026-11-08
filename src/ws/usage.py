@@ -246,14 +246,18 @@ def _write_atomic(path: Path, doc: dict) -> None:
 
 def capture_statusline(text: str, state: Path, now: datetime | None = None) -> str | None:
     """Stash the `rate_limits` of the JSON a statusline command gets on stdin. Returns "stashed" or "tombstone" for what
-    was written, or None (nothing written) when `text` is not a JSON object. A payload with no usable window writes a
-    tombstone, so data from an earlier plan is not read as current."""
+    was written, "unchanged" when the payload has no `rate_limits` at all, or None (nothing written) when `text` is not a
+    JSON object. Claude Code runs the statusline on every update, and some payloads carry no limits (before the first
+    reply of a session, say), so one of those leaves a good capture as it is and lets the TTL age it out. A payload that
+    has `rate_limits` but no usable window writes a tombstone, so data from an earlier plan is not read as current."""
     try:
         payload = json.loads(text)
     except ValueError:
         return None
     if not isinstance(payload, dict):
         return None
+    if "rate_limits" not in payload:
+        return "unchanged"
     when = (now or datetime.now(UTC)).astimezone(UTC)
     windows = _clean_windows(payload)
     doc = {"schema": RATE_SCHEMA, "captured_at": when.timestamp(), **(windows or {"absent": True})}

@@ -65,10 +65,10 @@ Notes:
 - Run records keep `started_at` and `ended_at`. The run-record schema lists its keys and allows no others, so a `ts`
   there is the next schema number.
 - Schema 3 of the run record added `purpose`, `stop_reason` and `reservation`. Schema 2 stays frozen (the test pins its
-  keys) and its lines read as they are: a reader uses `.get` for the three new keys. `status` gained `preempted` and
+  keys) and its lines read unchanged: a reader uses `.get` for the three new keys. `status` gained `preempted` and
   `expired`.
 - The node footprint is a ledger, not a log: two lines per change (an `intent` before it, a `done` after), so a crash
-  between them is still understood. It is never rotated, because a forgotten change could not be undone.
+  between them is still understood. It's never rotated, because a forgotten change couldn't be undone.
 - The OpenCode asks file is the one log outside the four folders: it sits where `ws home` reads asks from, which is
   `[home.sources] asks_jsonl` in the profile, else `.claude-usage/asks/asks.jsonl` below your home folder. Its `ts` is
   epoch milliseconds, not the RFC 3339 text of the other logs; the reader takes either.

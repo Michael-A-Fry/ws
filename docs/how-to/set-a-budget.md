@@ -32,8 +32,8 @@ read [The budget](../explanation/budget.md).
    Set them above the real price. Spend is then never undercounted.
 
 3. Keep each job tight. In the job file, set the limits, and say how much one run may spend. ws reserves that sum before
-   the run and settles from what the run used. If less than that is left under a cap, the reservation shrinks to what
-   is left and Claude Code is told so with `--max-budget-usd` (add `strict = true` to refuse instead):
+   the run and settles from what the run used. If less than that's left under a cap, the reservation shrinks to the
+   remainder and Claude Code is told so with `--max-budget-usd` (add `strict = true` to refuse instead):
 
    ```toml
    timeout_s = 600
@@ -42,7 +42,7 @@ read [The budget](../explanation/budget.md).
    ```
 
 4. Optional: give each kind of work its own share of the month, in `policy.toml`, and name it in the job. A job is
-   refused at its own purpose's cap whatever room the others have. A purpose the policy does not list makes the job a
+   refused at its own purpose's cap whatever room the others have. A purpose the policy doesn't list makes the job a
    bad job (exit 2).
 
    ```toml
@@ -85,9 +85,9 @@ code 3.
 ## If a run is refused
 
 `ws run` exits 3 and writes a record with status `refused`. The reason is on standard error, and the record's
-`stop_reason` names the counter (`refused:profile_cap`, `refused:purpose:jobs`, `refused:memory` and so on). It's one of:
-no cap, spend plus the runs in progress at the cap, a purpose at its own cap, a slot or memory that is full, a Rule of
-Two refusal, a model the runner can't price, a deadline that has passed, or a queue database that is locked or full (a run
+`stop_reason` names the counter (`refused:profile_cap`, `refused:purpose:jobs`, `refused:memory` and others). It's one of:
+no cap, spend plus the runs in progress at the cap, a purpose at its own cap, a slot or memory that's full, a Rule of
+Two refusal, a model the runner can't price, a deadline that has passed, or a queue database that's locked or full (a run
 never starts without a reservation). For the unpriced model, set `allow_unpriced = true` in the job
 file to run anyway. The run then counts at your fallback price.
 

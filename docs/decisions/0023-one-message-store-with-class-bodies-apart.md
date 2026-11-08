@@ -8,8 +8,8 @@ decision-makers: maintainer
 
 ## Context and Problem Statement
 
-Sessions on different runners and providers need to leave each other messages, and a lead needs to reach a session that
-is busy. Two things make that harder than a mailbox. A session can't be trusted to say who it is, because a shell command
+Sessions on different runners and providers need to leave each other messages, and a lead needs to reach a busy session.
+Two things make that harder than a mailbox. A session can't be trusted to name itself, because a shell command
 can set any environment variable or argument. And a message is a way for data to leave a data class: a walled class's
 text must stay in its zone, while a viewer needs to show who wrote to whom and when.
 
@@ -36,7 +36,7 @@ kinds only, with no text, key or thread name. What may come in is the receiving 
 makes an exception for a reply or a task the sender owns. The viewer and `ws msg watch` read the envelope table only.
 
 The sender is the session whose runner process is an ancestor of the caller (`ws.session.resolve_caller`), nearest first.
-Nothing the caller is given takes part. A process with no such ancestor, such as one that double-forked, is not a session
+Nothing the caller is given takes part. A process with no such ancestor, such as one that double-forked, isn't a session
 and can't send. The receiver's class is looked up from the policy by the receiver's folder at send and at read, never
 taken from the message. The registry, the policy, the secrets registry and the database are found from the account's own
 home folder (`ws.session.trusted_env`, from `pwd`), never from the environment: a command can set `WS_HOME`, `WS_*_DIR`,
@@ -46,7 +46,7 @@ The cost: a person whose ws folders come from one of those variables is refused 
 runner's own start-up environment (`/proc/<pid>/environ`, `ps eww` on macOS), the stronger option left for later.
 
 An idempotency key is stored as the hash of the sender, the recipient and the key, so a key that was chosen by one
-session is not text in the shared file, and the same key to two sessions is two messages. A thread name can't be set
+session isn't text in the shared file, and the same key to two sessions is two messages. A thread name can't be set
 on a message to a walled class.
 
 ### Consequences
@@ -67,7 +67,7 @@ on a message to a walled class.
 - Bad: the repo root of a walled receiver, and the device it was on, are kept in the shared file so `prune` can tell the
   repo is gone and not merely unmounted. The session registry already holds the same folder.
 - Bad: inside the wall the state folder is read-only, so a send from there fails with a typed `unavailable` error.
-  Delivery across the wall is not built yet.
+  Delivery across the wall isn't built yet.
 
 ### Confirmation
 

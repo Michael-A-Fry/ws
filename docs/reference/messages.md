@@ -1,7 +1,7 @@
 # Messages
 
 One message store lets a session leave a message for another, on any runner or provider, and lets a lead reach a session
-that is busy. Delivery at the receiver's next turn is a separate piece; this page covers the store, the commands, the
+that's busy. Delivery at the receiver's next turn is a separate piece; this page covers the store, the commands, the
 `ws mcp serve` tools and the rules. The reasons are in [the decision record](../decisions/0023-one-message-store-with-class-bodies-apart.md).
 The folders are listed on [Stores](stores.md).
 
@@ -23,16 +23,16 @@ arguments are read, so a `from` or `class` argument is ignored.
 
 The sender is never an argument. `ws session start` records the runner's process (its id and start time) in the session
 record, and a command is that session when the runner is one of its ancestors. A process that isn't under a runner (one
-that double-forked, or a person's own shell) is not a session, so it can't send, list or read.
-`ws msg export` is the same: with no session behind it, it is refused (`ws.msg.export` itself refuses a missing session
+that double-forked, or a person's own shell) isn't a session, so it can't send, list or read.
+`ws msg export` is the same: with no session behind it, it's refused (`ws.msg.export` itself refuses a missing session
 id, so no caller can ask it for the whole store), and a session's export has only the messages it sent or was sent,
 never a walled body. A person's own export of the whole store arrives with the owner path.
 
-Where it all lives is not up to the caller either. The registry, the policy (the classes), the secrets registry (the
+Where it all lives isn't up to the caller either. The registry, the policy (the classes), the secrets registry (the
 names a message may not carry) and `messages.db` are all found from the account's own home folder (`ws.session.trusted_env`,
 from the system's user database), and nothing in the process's environment is read: not `WS_HOME`, `WS_*_DIR`, `XDG_*`
 or `HOME`. A command that sets one, and makes its own records, policy and database in the folder it names, is
-still the session the real registry says it is, and writes nothing to the real store or to any repo. No function in
+still the session named in the real registry, and writes nothing to the real store or to any repo. No function in
 `ws.msg` takes an environment. A person whose ws folders are set by one of those variables is refused (`ws msg` can't
 tell which session is calling) until ws can read the layout from the runner's own start-up environment.
 
@@ -53,11 +53,11 @@ With `[classes]`:
 - The receiver's class is found from its working folder at send and again at read. A class a sender supplies is never
   read.
 - The receiving class's `inbound` decides who may send to it: `off` (the default for a walled or counts-only class),
-  `lead-only` (the default for a full class) or `allowlist` with `inbound_allow` naming sessions. A reply is not let in
-  because it is a reply.
+  `lead-only` (the default for a full class) or `allowlist` with `inbound_allow` naming sessions. A reply isn't let in
+  because it's a reply.
 - The one thing the `lead-only` default lets through is a fixed kind (`ack`, `done`, `stop-and-hand-over:done`,
   `ask:pending`, `counts`) sent to a lead in a full class, from any session, a worker or a walled one. It has no text, so
-  nothing leaves a class, and it is how a session says it is done. `off` and `allowlist` are obeyed as written, and a fixed
+  nothing leaves a class, and it's how a session says it's done. `off` and `allowlist` are obeyed as written, and a fixed
   kind is never let into a walled class.
 - A walled or counts-only session sends only the fixed kinds, with no text, no idempotency key and no thread name.
   `--reply-to` may name only a message it sent or was sent.
@@ -71,10 +71,10 @@ With `[classes]`:
 - Export never writes a walled body, for anyone.
 - Retention is the receiving class's `retention_days` (30 with no class). Pruning runs at most once an hour, on the next
   send or list. Deleting a walled repo deletes its bodies with it; `prune` then drops the envelope rows for that repo.
-  A repo ws can't see (no permission, or hidden by the wall) is not treated as deleted, and neither is one whose folder
-  is missing while the folder above it is on another device than the repo was on when its first message was written
+  A repo ws can't see (no permission, or hidden by the wall) isn't treated as deleted, and neither is one whose folder
+  is missing while the folder above it's on another device than the repo was on when its first message was written
   (an unmounted drive leaves an empty mount point behind). `prune` reports those rows as `unconfirmed` and keeps them until
-  retention takes them. A bit of a class store left behind because it could not be reached or written is remembered in
+  retention takes them. A bit of a class store left behind because it couldn't be reached or written is remembered in
   the shared database (`tidy`) and removed on the next prune. The job is dropped only when the store, or the repo, is
   confirmed deleted by the same device check; a repo that may be on an unmounted drive keeps it until the drive is back.
 
@@ -127,12 +127,12 @@ row, its body and its envelope in one transaction, so a failure leaves none of t
 | `refused` | no session is calling; the policy or the secrets registry won't read; the class rules above |
 | `not_found` | no such session, or no such message for you |
 | `bad_input` | a malformed argument, or a body that isn't valid UTF-8 text |
-| `exists` | `export --out` named a path that is already there |
+| `exists` | `export --out` named a path that's already there |
 | `too_large`, `rate_limited`, `hop_limit`, `secret_refused` | the caps above |
 | `unavailable` | the store is locked, full, read-only, can't be opened or is damaged |
 
 Inside the wall the state folder is read-only, so a send from there is `unavailable` (`read-only`). Delivery across the
-wall is not built yet.
+wall isn't built yet.
 
 ## For other modules
 

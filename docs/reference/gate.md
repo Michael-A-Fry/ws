@@ -55,14 +55,14 @@ that asks the gate before every call and runs the guards on OpenCode's other eve
 the guards that are on add) as `deny` under `bash`, `deny_read` under `read`, `grep`, `glob` and `list`, `deny_tools` under
 `webfetch` and `websearch`, the protected paths under `edit`, and `ask_commands` as `ask` under `bash`. OpenCode takes the
 last rule that matches, so each block runs allow-all first, then the asks, then the denies, and a deny beats an ask on the
-same command. A pattern that is both asked and denied is written once, as a deny. A pattern only the hook can read (a pipe,
-a `;`, a `$(`) is left to the hook, as it is for `deny_commands`.
+same command. A pattern that's both asked and denied is written once, as a deny. A pattern only the hook can read (a pipe,
+a `;`, a `$(`) is left to the hook, as it's for `deny_commands`.
 
 `edit` also covers the skills folders OpenCode reads, because a skill is loaded as instructions and a planted one would
 steer the next session: its own (`skills` and `skill` under its config folder) and the ones it shares with Claude Code
 (`~/.claude/skills`) and other tools (`~/.agents/skills`). Each is written as the absolute path and as its last two
 folders at any depth, so a project's own folder of that name is held too: a planted skill steers the next session
-wherever it sits. A project's own `.opencode/skills` is denied too. The plugin's own check does not hold these folders;
+wherever it sits. A project's own `.opencode/skills` is denied too. The plugin's own check doesn't hold these folders;
 the rule does.
 
 **`policies`.** ws writes no `policies` key. In OpenCode 1.19.4 the only `policies` is `experimental.policies`, whose own
@@ -71,15 +71,15 @@ tool calls, and has no rule for a command or a path. `POLICIES_SINCE` in `ws.ada
 first version whose schema has a permission key of that name.
 
 **Approvals.** The plugin checks first, so a call that needs a person's yes is refused with the `ws approve` line before
-OpenCode would ask. Once it is approved, the plugin lets the call through and OpenCode's own `ask` for it would come next:
+OpenCode would ask. Once it's approved, the plugin lets the call through and OpenCode's own `ask` for it would come next:
 the plugin answers that ask `once` (never for good), but only when the call is one the gate just allowed and every
 pattern in the ask is one of ws's `ask_commands`. OpenCode lists every shell segment of a compound command in one ask
-(`ls && touch X` is asked as `ls, touch X`), allowed or not, and its payload does not say which segment asked. A segment
-that is not one of ws's might be your own `ask` rule, so the plugin does not tell them apart: it fails to asking, and
+(`ls && touch X` is asked as `ls, touch X`), allowed or not, and its payload doesn't say which segment asked. A segment
+that's not one of ws's might be your own `ask` rule, so the plugin doesn't tell them apart: it fails to asking, and
 leaves the ask to you. A line that mixes one of ws's `ask_commands` with any other segment is therefore asked by
-OpenCode as well, and so is a bash ask on a call the gate did not allow or an ask for anything but a shell command; none
-of them is ever answered for you. A headless `opencode run` turns any ask it is not answered for into a refusal
-("permission requested ... auto-rejecting"), so with only the rules and no plugin an `ask_commands` call is refused,
+OpenCode as well, and so is a bash ask on a call the gate didn't allow or an ask for anything but a shell command; none
+of them is ever answered for you. A headless `opencode run` turns any ask it's not answered for into a refusal
+(`permission requested ... auto-rejecting`), so with only the rules and no plugin an `ask_commands` call is refused,
 which is the floor.
 
 **The guards.** The plugin runs `ws gate event` through the same thin client as the check, on these OpenCode events:
@@ -95,8 +95,8 @@ which is the floor.
 
 OpenCode sends one `session.idle` for both kinds of session; the plugin tells them apart (a child has a parent) and sends
 `session.idle.child` for the second, a name of ws's own. A call is checked before it runs, and after it runs only for the
-tools a guard that is on reads (`ws gate generate` writes both lists). `task` and `skill` are checked before a call only
-when a guard that is on reads agents or skills. The call is parsed as the same kinds Claude Code's is (a `task` is an
+tools a guard that's on reads (`ws gate generate` writes both lists). `task` and `skill` are checked before a call only
+when a guard that's on reads agents or skills. The call is parsed as the same kinds Claude Code's is (a `task` is an
 `agent`, a `skill` a `skill`, an edit a `write` with the old and new text), so a guard gives the same verdict whichever
 runner sent it. OpenCode has no send-message tool, so no `message` call is ever made there.
 
@@ -107,7 +107,7 @@ what each guard declares (`UNSUPPORTED_GUARDS`), so a new guard needs no edit in
 
 **Asks on `ws home`.** On `permission.asked` and `permission.replied` the plugin appends an `added` line and an `answered`
 line to the asks file (`[home.sources] asks_jsonl` in the profile, else `~/.claude-usage/asks/asks.jsonl`), in the format
-the [home page](home-api.md) reads, so OpenCode's open asks show there. A file it cannot write (the wall keeps most of the
+the [home page](home-api.md) reads, so OpenCode's open asks show there. A file it can't write (the wall keeps most of the
 disk read-only) is skipped.
 
 ## Replay a corpus

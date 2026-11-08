@@ -15,7 +15,7 @@ against jobs, on one key) needs a counter of its own.
 
 ## Considered Options
 
-- Keep the check, and add a lock around "read spend, start run".
+- Keep the check, and add a lock around reading spend and starting the run.
 - Count spend in a service that runs all the time.
 - Reserve in one SQLite database, in one transaction, before any run starts, and settle from what the run used.
 
@@ -28,9 +28,9 @@ flight, a slot in the lane, host memory) and writes the reservation, or says whi
 drain and `ws queue slot` use the same code, so there is one path. A reservation is settled once, from the run's actual
 cost, in the code that writes its record, and a crash is reaped by the owner's process id and start time.
 
-Two decisions inside it. Money that is short resizes the reservation to what is left and that sum is passed to Claude
+Two decisions inside it. Money that's short resizes the reservation to what's left and that sum is passed to Claude
 Code as `--max-budget-usd` (unless the job says `strict`); OpenCode has no such flag, so there the reservation holds the
-money and only the settle corrects it. And a store that cannot be used (locked, full, unreadable) refuses the run: the
+money and only the settle corrects it. And a store that can't be used (locked, full, unreadable) refuses the run: the
 alternative, running without a reservation, would be a run no counter holds.
 
 The queue engine is one file of standard-library code (`ws._vendor.sqlqueue`) with claim ids that fence a stale holder,
@@ -42,12 +42,12 @@ provider.
 ### Consequences
 
 - Good: two admissions racing for the last dollar or the last slot admit one; a spend cap holds for a run that starts
-  late; a purpose cannot take another's room; a run is never started without a reservation.
+  late; a purpose can't take another's room; a run is never started without a reservation.
 - Good: the run record (schema 3) says what was reserved and why a run stopped.
 - Bad: one more file to keep private and one lock to wait for. A locked store refuses a run that would otherwise have
   gone, which is deliberate. For the few milliseconds between a run writing its record and settling its reservation the
   run is counted twice, which only ever errs on the side of keeping the cap.
-- Bad: a run that is not stopped by the runner's own limit (OpenCode, and any run whose estimate was only a default)
+- Bad: a run that's not stopped by the runner's own limit (OpenCode, and any run whose estimate was only a default)
   can still spend past its reservation; the settle then counts what it really spent, and the next admission sees it.
 
 ### Confirmation

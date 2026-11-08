@@ -11,10 +11,26 @@
     green = "targeted"                  optional: what the job's verification covers (targeted | package | full |
                                         merge_ready); written to the run record as `green`
     sources = ["notes"]                 policy sources the job reads (the Rule of Two looks at these)
-    schedule = "daily 03:30"            optional: hourly | daily HH:MM | weekly DAY HH:MM (local time). `ws schedule
-                                        apply` turns it into a systemd timer or a launchd agent.
+    schedule = "daily 03:30"            optional: hourly | daily HH:MM | weekly DAY HH:MM | every Nm (N from 5 to 30),
+                                        in local time. `ws schedule apply` turns it into a systemd timer or a launchd
+                                        agent.
     command = "backup"                  instead of runner, model and prompt: a ws command the schedule runs
-                                        (`ws backup run`). Only `ws schedule` runs these; `ws run` refuses them.
+                                        (`ws backup run`, `ws queue run`). Only `ws schedule` runs these; `ws run`
+                                        refuses them.
+
+    purpose = "jobs"                    optional: the [budget.purposes] name this job's spend counts against
+    budget_usd = 2.0                    optional: the money reserved for one run (default: the profile's unknown_run_usd)
+    strict = false                      true: refuse when the room left is under budget_usd, never run on less
+    max_turns, timeout_s                the turns and seconds reserved are these
+    deadline = "2026-11-10T09:00:00Z"   optional: a UTC time; a run that would start after it ends as `expired`
+    preemptible = false                 true: a SIGTERM (exit 143) is settled and the job requeued, not failed
+    grace_s = 10                        optional: seconds between SIGTERM and SIGKILL when the runner is stopped
+    checkpoint = "progress.json"        optional: a file, relative to cwd, the job resumes from; the runner gets it as
+                                        $WS_CHECKPOINT (use it with a cwd, so the file outlives the run)
+
+    [resources]                         optional: what admission reserves on the host
+    ram_gb = 4                          memory the job will use (default 0)
+    slot = "run"                        the lane it takes a slot in (default run; ui holds one at a time)
 
     [[secrets]]                         the provider credential, leased through the broker
     name = "anthropic"
@@ -35,6 +51,7 @@ import os
 import re
 import tomllib
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 
 from ws import adapters, paths
@@ -58,12 +75,26 @@ KEYS = {
     "runner_options",
     "schedule",
     "command",
+    "resources",
+    "preemptible",
+    "grace_s",
+    "checkpoint",
+    "deadline",
+    "purpose",
+    "budget_usd",
+    "strict",
 }
 GREEN_LEVELS = ("targeted", "package", "full", "merge_ready")  # as runrecord.GREEN_LEVELS
-COMMANDS = {"backup": ("backup", "run")}  # the ws commands a job file may schedule in place of a runner
+COMMANDS = {
+    "backup": ("backup", "run"),
+    "queue": ("queue", "run"),
+}  # the ws commands a job file may schedule in place of a runner
 DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 _DAY_NAMES = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
 _CLOCK = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
+_EVERY = re.compile(r"^(\d{1,2})m$")
+EVERY_MIN, EVERY_MAX = 5, 30  # `every Nm`: minutes between runs
+RESOURCE_KEYS = {"ram_gb", "slot"}
 
 
 class JobError(Exception):
@@ -74,14 +105,17 @@ class JobError(Exception):
 class When:
     """A repeat time in local time. weekday is 0 for Monday to 6 for Sunday; only `weekly` uses it."""
 
-    kind: str  # hourly | daily | weekly
+    kind: str  # hourly | daily | weekly | every
     hour: int = 0
     minute: int = 0
     weekday: int = 0
+    every: int = 0  # minutes between runs; only `every` uses it
 
     def __str__(self) -> str:
         if self.kind == "hourly":
             return "hourly"
+        if self.kind == "every":
+            return f"every {self.every}m"
         at = f"{self.hour:02d}:{self.minute:02d}"
         return f"daily {at}" if self.kind == "daily" else f"weekly {DAYS[self.weekday]} {at}"
 
@@ -91,6 +125,14 @@ class SecretUse:
     name: str
     host: str
     purpose: str = "run"
+
+
+@dataclass(frozen=True)
+class Resources:
+    """What a run reserves on the host: memory in GB (0 reserves none) and the lane whose slot it takes."""
+
+    ram_gb: float = 0.0
+    slot: str = "run"
 
 
 @dataclass(frozen=True)
@@ -109,6 +151,15 @@ class Job:
     secrets: tuple[SecretUse, ...] = ()
     runner_options: dict = field(default_factory=dict)
     schedule: When | None = None
+    resources: Resources = field(default_factory=Resources)
+    preemptible: bool = False
+    grace_s: float | None = None
+    checkpoint: str | None = None
+    deadline: datetime | None = None  # UTC
+    purpose: str | None = None
+    budget_usd: float | None = None
+    strict: bool = False
+    max_budget_usd: float | None = None  # not a file key: admission sets it from the reservation
 
 
 @dataclass(frozen=True)
@@ -146,16 +197,25 @@ def _number(d: dict, key: str, where: str, default, integer: bool = False):
 
 
 def parse_schedule(text: str, where: str) -> When:
-    """`hourly`, `daily HH:MM` or `weekly DAY HH:MM`. Raises JobError naming the key."""
+    """`hourly`, `daily HH:MM`, `weekly DAY HH:MM` or `every Nm` (N from 5 to 30). Raises JobError naming the key."""
     words = text.lower().split()
     if words == ["hourly"]:
         return When("hourly")
+    if len(words) == 2 and words[0] == "every":
+        m = _EVERY.match(words[1])
+        if not m or not EVERY_MIN <= int(m[1]) <= EVERY_MAX:
+            raise JobError(
+                f"{where}: every must be a whole number of minutes from {EVERY_MIN} to {EVERY_MAX}, as in every 10m"
+            )
+        return When("every", every=int(m[1]))
     clock = _CLOCK.match(words[-1]) if words else None
     if clock and len(words) == 2 and words[0] == "daily":
         return When("daily", int(clock[1]), int(clock[2]))
     if clock and len(words) == 3 and words[0] == "weekly" and words[1] in (*DAYS, *_DAY_NAMES):
         return When("weekly", int(clock[1]), int(clock[2]), DAYS.index(words[1][:3]))
-    raise JobError(f"{where}: schedule must be hourly, daily HH:MM or weekly DAY HH:MM (for example weekly mon 09:00)")
+    raise JobError(
+        f"{where}: schedule must be hourly, daily HH:MM, weekly DAY HH:MM or every Nm (for example weekly mon 09:00)"
+    )
 
 
 def _command(d: dict, where: str) -> tuple[str, ...] | None:
@@ -233,6 +293,15 @@ def loads(name: str, text: str, base: Path, where: str | None = None) -> Job:
     options = d.get("runner_options", {})
     if not isinstance(options, dict):
         raise JobError(f"{where}: runner_options must be a table")
+    preemptible = d.get("preemptible", False)
+    if not isinstance(preemptible, bool):
+        raise JobError(f"{where}: preemptible must be true or false")
+    strict = d.get("strict", False)
+    if not isinstance(strict, bool):
+        raise JobError(f"{where}: strict must be true or false")
+    purpose = _string(d, "purpose", where)
+    if purpose is not None and not NAME.match(purpose):
+        raise JobError(f"{where}: purpose {purpose!r} is not a plain name (letters, digits, - and _)")
     return Job(
         name=name,
         runner=runner,
@@ -248,7 +317,55 @@ def loads(name: str, text: str, base: Path, where: str | None = None) -> Job:
         secrets=tuple(secrets),
         runner_options=options,
         schedule=parse_schedule(schedule, f"{where}: schedule") if schedule else None,
+        resources=_resources(d.get("resources"), where),
+        preemptible=preemptible,
+        grace_s=_number(d, "grace_s", where, None),
+        checkpoint=_checkpoint(d, where),
+        deadline=parse_deadline(d.get("deadline"), where),
+        purpose=purpose,
+        budget_usd=_number(d, "budget_usd", where, None),
+        strict=strict,
     )
+
+
+def _resources(v, where: str) -> Resources:
+    """`[resources]`: ram_gb (a number above 0) and slot (a plain name). Raises JobError naming the key."""
+    if v is None:
+        return Resources()
+    if not isinstance(v, dict):
+        raise JobError(f"{where}: resources must be a table")
+    extra = sorted(set(v) - RESOURCE_KEYS)
+    if extra:
+        raise JobError(
+            f"{where}: resources has an unknown key {extra[0]!r} (known: {', '.join(sorted(RESOURCE_KEYS))})"
+        )
+    ram = _number(v, "ram_gb", f"{where}: resources", 0.0) if "ram_gb" in v else 0.0
+    slot = _string(v, "slot", f"{where}: resources") or "run"
+    if not NAME.match(slot):
+        raise JobError(f"{where}: resources slot {slot!r} is not a plain name (letters, digits, - and _)")
+    return Resources(float(ram), slot)
+
+
+def _checkpoint(d: dict, where: str) -> str | None:
+    c = _string(d, "checkpoint", where)
+    if c is not None and (os.path.isabs(c) or ".." in Path(c).parts):
+        raise JobError(f"{where}: checkpoint must be a file name inside the job's cwd, not {c!r}")
+    return c
+
+
+def parse_deadline(v, where: str) -> datetime | None:
+    """`deadline`: a TOML time with an offset, or text such as 2026-11-10T09:00:00Z. Always UTC; a time with no zone is
+    refused, because a deadline read in the wrong zone starts or stops a run hours off."""
+    if v is None:
+        return None
+    if isinstance(v, str):
+        try:
+            v = datetime.fromisoformat(v.strip())
+        except ValueError:
+            v = None
+    if not isinstance(v, datetime) or v.tzinfo is None or v.utcoffset() is None:
+        raise JobError(f"{where}: deadline must be a UTC time with a zone, such as 2026-11-10T09:00:00Z")
+    return v.astimezone(UTC)
 
 
 def check_private(path: Path) -> None:

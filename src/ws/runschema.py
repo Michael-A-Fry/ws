@@ -7,8 +7,8 @@ copy, and `ws canary` checks a sample record against it with a small checker tha
 `null`, never a missing key. Nothing here holds a secret, and the `error` field is short by rule.
 
 The `$id` is a URN, because the schema ships inside ws as this dict and no web address serves it. This schema
-describes version 2 only: a version 1 line has no `green` or `recovered`, and a reader treats a line with no `schema`
-as version 1. Run records carry `started_at` and `ended_at` and no `ts` (the schema forbids extra keys); every other
+describes version 3 only: a version 2 line has no `purpose`, `stop_reason` or `reservation`, a version 1 line has no
+`green` or `recovered` either, and a reader treats a line with no `schema` as version 1. Run records carry `started_at` and `ended_at` and no `ts` (the schema forbids extra keys); every other
 ws log carries `schema` and `ts`. docs/reference/stores.md lists them all.
 """
 
@@ -47,7 +47,7 @@ _TOKENS = {
 
 SCHEMA: dict = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "$id": "urn:ws:schema:run-record:2",
+    "$id": "urn:ws:schema:run-record:3",
     "title": "ws run record",
     "description": (
         "One line of runs.jsonl: what one headless job did, whichever runner ran it. "
@@ -86,13 +86,17 @@ SCHEMA: dict = {
         "green",
         "recovered",
         "eval",
+        "purpose",
+        "stop_reason",
+        "reservation",
     ],
     "properties": {
         "schema": {
-            "const": 2,
+            "const": 3,
             "description": (
-                "Record version. Version 2 added green and recovered; older lines in a log are not rewritten, so a "
-                "reader must cope without them. This schema describes version 2 only."
+                "Record version. Version 2 added green and recovered; version 3 added purpose, stop_reason and "
+                "reservation. Older lines in a log are not rewritten, so a reader must cope without them. This "
+                "schema describes version 3 only."
             ),
         },
         "run_id": {
@@ -126,7 +130,13 @@ SCHEMA: dict = {
             "type": ["integer", "null"],
             "description": "The runner's exit code. Null if it never ran or was killed.",
         },
-        "status": {"enum": ["ok", "error", "timeout", "refused"], "description": "How the run ended."},
+        "status": {
+            "enum": ["ok", "error", "timeout", "refused", "preempted", "expired"],
+            "description": (
+                "How the run ended. preempted: stopped by SIGTERM (143), settled at what it had spent. expired: its "
+                "deadline had passed, so it did not run."
+            ),
+        },
         "error": {
             "type": ["string", "null"],
             "maxLength": 300,
@@ -214,6 +224,39 @@ SCHEMA: dict = {
                 "pass": {"type": ["boolean", "null"]},
             },
             "description": "Set only on a trial of the eval command. pass is null when written: grading comes later.",
+        },
+        "purpose": {
+            "type": ["string", "null"],
+            "description": "The [budget.purposes] name the job's spend counts against. Null when the job names none.",
+        },
+        "stop_reason": {
+            "type": ["string", "null"],
+            "maxLength": 120,
+            "description": (
+                "Why the run ended: completed, timeout, preempted, interrupted, runner_error, broker_unavailable, "
+                "not_found, expired, crashed, or refused:<counter> (the counter that said no). Null on a record "
+                "written before schema 3."
+            ),
+        },
+        "reservation": {
+            "type": ["object", "null"],
+            "additionalProperties": False,
+            "required": ["usd", "turns", "seconds", "ram_gb", "lane", "resized", "counters", "notes"],
+            "properties": {
+                "usd": {"type": "number", "minimum": 0},
+                "turns": {"type": "integer", "minimum": 0},
+                "seconds": {"type": "number", "minimum": 0},
+                "ram_gb": {"type": "number", "minimum": 0},
+                "lane": {"type": "string", "minLength": 1},
+                "resized": {"type": "boolean"},
+                "counters": {"type": "array", "items": {"type": "string"}},
+                "notes": {"type": "array", "items": {"type": "string"}},
+            },
+            "description": (
+                "What admission reserved before the run started: money (usd; resized when the room left was under "
+                "the estimate), turns, seconds, memory and the lane, the counters it reserved against, and notes such "
+                "as 'memory not reported'. Null when the run was never admitted."
+            ),
         },
     },
 }

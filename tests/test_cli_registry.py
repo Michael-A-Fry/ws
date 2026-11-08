@@ -14,6 +14,9 @@ import ws
 from ws import cli
 from ws.output import WsError
 
+# The commands the installed package itself adds, in module-name order; a planted one comes after them.
+SHIPPED = [("node", "node"), ("queue", "queue"), ("usage", "usage")]
+
 PLANTED = """\
 COMMAND = "{name}"
 
@@ -49,13 +52,13 @@ def names(parser=None) -> list[str]:
     return list(cli._subcommands(parser or cli.build_parser()))
 
 
-def test_the_installed_package_adds_no_scanned_command_yet():
-    assert cli.scanned_commands() == []  # a module that wants one sets COMMAND; none does today
+def test_the_installed_package_adds_only_its_own_scanned_commands():
+    assert cli.scanned_commands() == SHIPPED  # a module that wants one sets COMMAND; these three do
 
 
 def test_a_planted_module_is_in_help_and_runs(plant, capsys):
     plant("zzplanted", name="planted-one")
-    assert cli.scanned_commands() == [("planted-one", "zzplanted")]
+    assert cli.scanned_commands() == [*SHIPPED, ("planted-one", "zzplanted")]
     parser = cli.build_parser()
     assert "planted-one" in parser.format_help()
     assert names(parser)[-1] == "planted-one"  # after every built-in
@@ -69,7 +72,7 @@ def test_a_planted_module_is_in_help_and_runs(plant, capsys):
 def test_scanned_commands_are_added_in_module_name_order(plant):
     plant("zz_b", name="beta")
     plant("zz_a", name="alpha")
-    assert cli.scanned_commands() == [("alpha", "zz_a"), ("beta", "zz_b")]
+    assert cli.scanned_commands() == [*SHIPPED, ("alpha", "zz_a"), ("beta", "zz_b")]
     got = names()
     assert got.index("alpha") < got.index("beta") and got.index("version") < got.index("alpha")
 
@@ -129,7 +132,7 @@ def test_only_a_matching_module_is_imported(plant):
     plant(
         "zz_ok", 'COMMAND: str = "typed"  # the annotated form\n\n\ndef register(sub):\n    sub.add_parser("typed")\n'
     )
-    assert cli.scanned_commands() == [("typed", "zz_ok")]
+    assert cli.scanned_commands() == [*SHIPPED, ("typed", "zz_ok")]
     assert "typed" in names()
 
 
@@ -141,7 +144,7 @@ def test_the_working_folder_is_never_scanned(tmp_path, monkeypatch, plant):
     (here / "evil.py").write_text(PLANTED.format(name="evil"))
     monkeypatch.chdir(here)
     monkeypatch.syspath_prepend(str(here))
-    assert cli.scanned_commands() == []
+    assert cli.scanned_commands() == SHIPPED
     assert "evil" not in names()
     assert str(here) not in map(str, ws.__path__)
 
@@ -151,7 +154,7 @@ def test_the_scan_reads_text_only_and_imports_nothing(plant, monkeypatch):
     seen = []
     real = importlib.import_module
     monkeypatch.setattr(importlib, "import_module", lambda n, *a: seen.append(n) or real(n, *a))
-    assert cli.scanned_commands() == [("textual", "zz_text_only")]
+    assert cli.scanned_commands() == [*SHIPPED, ("textual", "zz_text_only")]
     assert seen == []
 
 

@@ -52,7 +52,10 @@ def generate(tmp_path, ws_cmd: str):
 
 def records(tmp_path) -> list[dict]:
     folder = tmp_path / "wshome" / "sessions"
-    return [json.loads(f.read_text()) for f in sorted(folder.glob("*.json"))] if folder.is_dir() else []
+    if not folder.is_dir():
+        return []
+    # a guard's own record for a session is `<id>.<name>.json`; only `<id>.json` is the session record
+    return [json.loads(f.read_text()) for f in sorted(folder.glob("*.json")) if "." not in f.stem]
 
 
 def step(tmp_path, out, work, release: str, again: bool):

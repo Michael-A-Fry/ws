@@ -450,6 +450,8 @@ def build_command(job, run_dir: Path, lease) -> tuple[list[str], dict[str, str]]
         argv.append("--bare")
     if job.max_turns is not None:
         argv += ["--max-turns", str(job.max_turns)]
+    if job.max_budget_usd is not None:
+        argv += ["--max-budget-usd", f"{job.max_budget_usd:.4f}"]
     if tools:
         argv += ["--allowedTools", ",".join(tools)]
     env = jobs.extra_env(job)  # first: what ws sets below always wins

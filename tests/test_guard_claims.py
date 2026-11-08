@@ -328,12 +328,15 @@ def test_replay_of_a_send_message_matches_the_ref(repo, home, capsys):
     assert cli.main(["gate", "replay", str(log), "--runner", "claude-code", "--policy", str(pol)]) == 0
 
 
-def test_claims_reads_messages_and_stops_and_opencode_does_not_run_it():
+def test_claims_reads_messages_and_stops_and_opencode_names_it_for_the_message_it_never_makes():
     mod = guards.get("claims")
     assert mod.EVENTS == ("pre", "stop") and mod.KINDS == ("message",)
     from ws.adapters import opencode
 
-    assert "claims" in opencode.UNSUPPORTED_GUARDS
+    assert (
+        "claims" in opencode.UNSUPPORTED_GUARDS
+    )  # OpenCode has no send-message tool, so its pre event has nothing to read
+    assert [gap.split(":")[0] for gap in opencode.guard_gaps(mod)] == ["pre"]  # its stop event it does reach
 
 
 # --- the log on stop ---------------------------------------------------------------------------------------------

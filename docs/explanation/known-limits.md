@@ -137,7 +137,7 @@ A session that allocates its own terminal and clears the session marker can defe
 ### The resident gate is private to your user, not sealed against your own processes
 
 The hook's client trusts the resident gate (`ws gate serve`) only on a private folder and socket, from a process of your
-user id, and on Linux one that is your interpreter running `-m ws gate serve`. Another user can't answer in its place.
+user id, and on Linux one that's your interpreter running `-m ws gate serve`. Another user can't answer in its place.
 A process of your own user that isn't in the sandbox can stop the daemon and start one that looks right.
 
 - **What it means.** With the sandbox on, the run folder is read-only to the session, so it can't. Without the sandbox,

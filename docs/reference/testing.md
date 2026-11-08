@@ -1,6 +1,6 @@
 # Testing
 
-How the suite keeps time, order and flakes under control. The plugin that does it is `tests/plugins/ws_harness.py`.
+How the suite keeps time, order and flakes under control. The plugin that does it lives in `tests/plugins/ws_harness.py`.
 pyproject loads it for every `pytest` run in this repo (`addopts = "-p ws_harness"`, with `tests/plugins` on
 `pythonpath`), so CI, `ws-test` and the pre-push hook all get it. `tests/test_harness.py` tests it.
 
@@ -39,7 +39,7 @@ size marker, so `-m large` and `-m "not large"` select by size.
 - **Never sleep 60 s or more in a test**, and keep any time a test waits on (a daemon starting, an idle timeout, a
   subprocess `timeout=`) under its size's limit. A wait longer than the limit never gets to finish.
 - **`faulthandler_timeout = 120`** in pyproject makes pytest dump every thread's stack once a test has run for two
-  minutes. It only prints. For a large test it is noise; the size limit does the stopping.
+  minutes. It only prints. For a large test it's noise; the size limit does the stopping.
 
 On Windows pytest-timeout has no signal to use, so it falls back to a thread that ends the whole process on a timeout.
 
@@ -78,7 +78,7 @@ usage error. The run's summary says how many tests were pinned.
 - **A flake event.** When a marked test fails, then passes on the rerun, the harness appends one line to the flake
   report and names the test in the run summary. A test that fails twice fails the run and writes nothing. Fix or
   quarantine a test that shows up here; don't leave the marker on.
-- **Quarantine.** `@pytest.mark.quarantine` keeps a known flake out of the run. It is deselected by default (pytest's
+- **Quarantine.** `@pytest.mark.quarantine` keeps a known flake out of the run. It's deselected by default (pytest's
   `deselected` count, and the `pytest_deselected` hook, include it). `--run-quarantine` runs it with everything else;
   `-m quarantine` runs only it. A quarantined test counts in the `nightly` tier.
 

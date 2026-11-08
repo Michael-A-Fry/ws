@@ -210,7 +210,7 @@ everything behaves as it did before. Every table is checked whole; one bad key r
 
 Which class is a folder in (`class_of(policy, path)` in `src/ws/policy.py`):
 
-- With no `[classes]` table the answer is none, which means "no classes configured".
+- With no `[classes]` table the answer is none, which means "no classes configured."
 - ws looks only at where the path really is, with every symbolic link resolved, so a link into a walled repo counts as
   that repo whatever class the link itself sits in. A link out of a walled repo to a folder in no class is `unclassified`.
   It matches without regard to case where the file system ignores it (macOS).

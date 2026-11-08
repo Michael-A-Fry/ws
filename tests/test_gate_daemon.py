@@ -579,6 +579,7 @@ def test_a_peer_that_is_not_this_user_is_not_used(box, fake, monkeypatch):
     assert [s for s in server.seen if s] == []  # nothing was sent to it
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="only Linux can say which program holds the socket (/proc)")
 def test_a_stand_in_that_is_not_running_ws_gate_serve_is_not_used(box, fake):
     """The same user, a private socket and a reply that echoes the id: still not believed when the process behind it
     is not `-m ws gate serve` (Linux asks /proc). The control is the stand-in that is."""

@@ -607,16 +607,138 @@ def test_a_runner_that_install_withdrew_is_not_gated_again_by_the_plugin_it_left
     assert not install._merge_entry(install._read_manifest()[0], "opencode", os.environ)
 
 
-def test_a_linked_settings_file_of_a_runner_the_profile_does_not_name_is_not_fatal(old, capsys):
-    """Claude Code's config is a link, and the profile names OpenCode now: the rewrite carries on (the file is the one
-    `ws doctor` reports), and it neither follows the link nor changes it."""
+def record(box: Path) -> dict | None:
+    """The install record's entry for Claude Code's settings file."""
+    return install._read_manifest()[0].get(str(settings_file(box)))
+
+
+def name_opencode_in_profile() -> None:
     profile = paths.config_dir() / "profile.toml"
     profile.write_text(profile.read_text().replace('adapter = "claude-code"', 'adapter = "opencode"'))
+
+
+def test_a_linked_settings_file_of_a_runner_the_profile_does_not_name_is_reported_and_exits_1(old, capsys):
+    """Claude Code's config is a link, and the profile names OpenCode now: the file is neither followed nor changed, but
+    the person is told its hooks were not rewritten (exit 1), and `ws doctor` does not say they are fine."""
+    name_opencode_in_profile()
     real = settings_file(old).with_name("real-settings.json")
     real.write_bytes(settings_file(old).read_bytes())
     settings_file(old).unlink()
     settings_file(old).symlink_to(real)
-    before = real.read_bytes()
-    code, _, err = upgrade_hooks(capsys)
+    before = (real.read_bytes(), record(old))
+    code, out, err = upgrade_hooks(capsys)
+    assert code == 1, (out, err)
+    assert "claude-code: not rewritten" in out and "link" in out and "upgrade --hooks-only" in err
+    assert (real.read_bytes(), record(old)) == before and settings_file(old).is_symlink()
+    check = doctor._upgrade_check(os.environ)
+    assert (check.id, check.status) == ("WS013", "warn") and "claude-code" in check.detail
+    code, out, _ = upgrade_hooks(capsys, "--json")
+    assert code == 1 and json.loads(out)["data"]["skipped"][0]["runner"] == "claude-code"
+
+
+def test_a_conflicting_sandbox_switch_of_a_runner_the_profile_does_not_name_is_reported_and_exits_1(old, capsys):
+    name_opencode_in_profile()
+    doc = settings(old)
+    doc["env"]["WS_SANDBOXED"] = "1"  # ws set it to "0"; this is a value of the person's own now
+    settings_file(old).write_text(json.dumps(doc, indent=2) + "\n")
+    before = (settings_file(old).read_bytes(), record(old))
+    code, out, err = upgrade_hooks(capsys)
+    assert code == 1, (out, err)
+    assert "claude-code: not rewritten" in out and "WS_SANDBOXED" in out
+    assert (settings_file(old).read_bytes(), record(old)) == before
+    assert doctor._upgrade_check(os.environ).status == "warn"
+
+
+def test_a_runner_the_person_never_gated_is_not_reported_when_its_config_cannot_be_merged(box, capsys):
+    """No record of Claude Code, the profile names OpenCode, and Claude Code's settings is a link: nothing to say."""
+    opencode_install(box, "--gate", "every-session")
+    real = settings_file(box).with_name("real-settings.json")
+    settings_file(box).parent.mkdir(parents=True, exist_ok=True)
+    real.write_text("{}\n")
+    settings_file(box).symlink_to(real)
+    code, out, err = upgrade_hooks(capsys)
+    assert code == 0, (out, err)
+    assert "claude-code" not in out + err
+    assert doctor._upgrade_check(os.environ).status == "ok"
+
+
+# --- a withdrawn older OpenCode plugin ----------------------------------------------------------------------------------------
+
+
+def older_plugin(box: Path) -> Path:
+    """What an earlier ws left behind after OpenCode was withdrawn: ws's plugin with no pin, still in the install record."""
+    opencode_install(box, "--gate", "every-session")
+    plug = userconfig.plugin_path(os.environ)
+    opencode_install(box, "--gate", "launch")
+    assert plug.is_file() and not install._merge_entry(install._read_manifest()[0], "opencode", os.environ)
+    text = plug.read_text()
+    assert '"--pin"' in text
+    plug.write_text(text.replace('"--pin"', '"--no-pin"'))  # the older shape: nothing in it names a pin
+    return plug
+
+
+def test_upgrade_takes_out_a_withdrawn_older_plugin_and_the_unpinned_refusal_goes(box, monkeypatch, capsys):
+    plug = older_plugin(box)
+    assert userconfig.hooks_without_pin(os.environ) == ["opencode"]
+    assert doctor._upgrade_check(os.environ).status == "warn"
+    code, out, _ = upgrade_hooks(capsys, "--dry-run")
+    assert code == 0 and "would remove" in out and plug.is_file()
+    code, out, err = upgrade_hooks(capsys)
     assert code == 0, err
-    assert real.read_bytes() == before and settings_file(old).is_symlink()
+    assert f"removed {plug}" in out and "1 removed" in out
+    assert not plug.exists() and str(plug) not in install._read_manifest()[0]
+    assert userconfig.hooks_without_pin(os.environ) == []
+    assert doctor._upgrade_check(os.environ).status == "ok"
+    assert not install._merge_entry(install._read_manifest()[0], "opencode", os.environ)  # still withdrawn
+    code, out, _ = upgrade_hooks(capsys)
+    assert code == 0 and "current" in out  # a second run has nothing to do
+
+
+def test_the_plugin_that_upgrade_takes_out_is_the_one_a_custom_layout_refuses(box, monkeypatch):
+    """The unpinned plugin runs `ws gate check` with no pin, which a layout outside the account's folders refuses."""
+    plug = older_plugin(box)
+    policy_file = paths.config_dir() / "policy.toml"
+    custom = box / "custom"
+    custom.mkdir()
+    moved = custom / "policy.toml"
+    moved.write_text(policy_file.read_text())
+    with pytest.raises(userconfig.WsError, match="policy file is not the one"):
+        paths.unpinned_pin(moved)
+    assert userconfig.withdrawn_plugin(os.environ) == plug
+
+
+def test_upgrade_puts_the_plugin_back_when_the_rewrite_fails_after_taking_it_out(box, monkeypatch, capsys):
+    plug = older_plugin(box)
+    before = (plug.read_bytes(), manifest_bytes(box))
+    monkeypatch.setattr(install, "forget", lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+    code = upgrade_hooks(capsys)[0]
+    assert code != 0
+    assert (plug.read_bytes(), manifest_bytes(box)) == before
+
+
+@pytest.mark.parametrize("case", ["theirs", "no record", "not made by ws", "link", "current"])
+def test_upgrade_leaves_a_plugin_of_the_persons_own_alone(box, capsys, case):
+    plug = older_plugin(box)
+    entries = install._read_manifest()[0]
+    if case == "theirs":
+        plug.write_text("export default async () => ({})\n")  # their own file, in ws's place
+    elif case == "no record":
+        install.forget([plug])
+    elif case == "not made by ws":
+        base = {k: dict(v) for k, v in entries.items()}
+        entries[str(plug)]["created_by_ws"] = False
+        install._commit(os.environ, base, entries, [])
+    elif case == "link":
+        mine = plug.with_name("mine.js")
+        mine.write_bytes(plug.read_bytes())
+        plug.unlink()
+        plug.symlink_to(mine)
+    else:
+        plug.write_text(plug.read_text().replace('"--no-pin"', '"--pin"'))
+    assert userconfig.withdrawn_plugin(os.environ) is None
+    before = plug.read_bytes() if plug.is_file() else None
+    capsys.readouterr()
+    code, out, err = upgrade_hooks(capsys)
+    assert code == 0, err
+    assert "removed" not in out and (plug.is_file() or plug.is_symlink())
+    assert (plug.read_bytes() if plug.is_file() else None) == before

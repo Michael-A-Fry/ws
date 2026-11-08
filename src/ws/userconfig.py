@@ -1119,33 +1119,82 @@ def holds_ws_entries(runner: str, env: Mapping[str, str]) -> bool:
         return False
 
 
-def hooks_without_pin(env: Mapping[str, str] | None = None) -> list[str]:
-    """The runners whose ws hooks in their user config carry no `--pin`: written by a ws older than the one running, which
-    pinned ws's folders in every hook only later. Each name once, in RUNNERS order. A runner with no ws hooks in its
-    file, or a file that can't be read, is left out (WS008 says what is wrong with the file), and so is one that ws has no
-    record of and the profile does not name, or an OpenCode plugin with no record (ws withdrew from that config and left
-    the plugin): `ws upgrade` rewrites the runners it knows, and this must not point at it for one it would leave alone."""
+@dataclass
+class HookState:
+    """What `hook_state` found: the runners whose hooks carry no pin, and the ones that could not be looked at (name ->
+    why, with the way on)."""
+
+    old: list[str] = field(default_factory=list)
+    unreadable: dict[str, str] = field(default_factory=dict)
+
+
+def hook_state(env: Mapping[str, str] | None = None) -> HookState:
+    """Look at the hooks ws put in each runner's user config. `old`: the runners whose ws hooks carry no `--pin` (written
+    by a ws older than the one running, which pinned ws's folders in every hook only later), each once, in RUNNERS order.
+    That includes OpenCode when it holds a withdrawn plugin of that kind (`withdrawn_plugin`): `ws upgrade` takes it out.
+    `unreadable`: a runner ws has a record of whose config ws can't read (a link, JSONC, not JSON), so what its hooks
+    carry is not known. Left out of both: a runner with no ws hooks in its file, one that ws has no record of and the
+    profile does not name, and an OpenCode plugin with no record (ws withdrew from that config and left the plugin) that
+    is current: `ws upgrade` rewrites the runners it knows, and this must not point at it for one it would leave alone."""
     env = os.environ if env is None else env
     try:
         named = _profile_runner(env)[0]
     except profile.ProfileError:
         named = ""
-    found: list[str] = []
+    state = HookState()
     for runner in RUNNERS:
-        if _manifest_entry(runner, env) is None and (runner != named or runner == "opencode"):
+        recorded = _manifest_entry(runner, env) is not None
+        if not recorded and (runner != named or runner == "opencode"):
+            if runner == "opencode" and withdrawn_plugin(env) is not None:
+                state.old.append(runner)
             continue
         try:
             if runner == "claude-code":
-                doc, _ = load(target(runner, env))
+                try:
+                    doc, _ = load(target(runner, env))
+                except WsError as e:
+                    if recorded:
+                        state.unreadable[runner] = f"{e.message}. {e.hint}".strip()
+                    continue
                 old = any(_WS_HOOK.search(c) and "--pin" not in c.split() for c in _hook_commands(doc))
             else:
                 text = plugin_path(env).read_text(encoding="utf-8")
                 old = '"--pin"' not in text
-        except (WsError, OSError, ValueError, AttributeError, TypeError):
+        except (OSError, ValueError, AttributeError, TypeError):
             continue
         if old:
-            found.append(runner)
-    return found
+            state.old.append(runner)
+    return state
+
+
+def hooks_without_pin(env: Mapping[str, str] | None = None) -> list[str]:
+    """The runners whose ws hooks carry no `--pin` (`hook_state(env).old`)."""
+    return hook_state(env).old
+
+
+def withdrawn_plugin(env: Mapping[str, str]) -> Path | None:
+    """OpenCode's plugin file, when it is one ws put there, ws has since withdrawn from OpenCode's config (the install
+    record holds the file but no merge into the config), and it is an older one that carries no `--pin`: left in place it
+    is still loaded, and on a layout that is not the default every call it judges is refused. None for anything else: no
+    such record, a file that is not a plain file, one that ws did not make or one that is not ws's own (it must be as ws
+    last wrote it, byte for byte, or begin with the first line ws writes), and one that is current."""
+    from ws import install  # late: ws.install imports this module
+    from ws.adapters.opencode_plugin import SOURCE
+
+    plug = plugin_path(env)
+    entries, _ = install._read_manifest(env)
+    rec = entries.get(str(plug))
+    if _manifest_entry("opencode", env) is not None or not rec or rec.get("kind") != "file":
+        return None
+    if rec.get("created_by_ws") is not True or plug.is_symlink() or not plug.is_file():
+        return None
+    try:
+        data = plug.read_bytes()
+        text = data.decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    ours = _sha(data) == rec.get("sha256") or text.startswith(SOURCE.split("\n", 1)[0] + "\n")
+    return plug if ours and '"--pin"' not in text else None
 
 
 def _rule(text: str) -> tuple[str, str | None]:

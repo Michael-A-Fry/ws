@@ -463,3 +463,50 @@ def test_a_hook_with_no_pin_and_no_policy_file_is_refused(box, monkeypatch, caps
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"tool_name": "Bash", "tool_input": {"command": "ls"}})))
     assert cli.main(["gate", "check", "--runner", "claude-code"]) == 2
     assert UNPINNED_FIX in capsys.readouterr().err
+
+
+def test_a_policy_file_that_is_a_link_into_a_dotfiles_folder_is_the_policy_in_the_accounts_folders(
+    box, monkeypatch, capsys, installed
+):
+    """`ws install` writes `--policy` resolved, so a dotfiles manager's link shows up as the file it points to."""
+    dotfiles = box / "dotfiles" / "ws"
+    dotfiles.mkdir(parents=True)
+    (dotfiles / "policy.toml").write_text(installed.policy.read_text())
+    installed.policy.unlink()
+    installed.policy.symlink_to(dotfiles / "policy.toml")
+    for named in (installed.policy, (dotfiles / "policy.toml").resolve()):
+        hook = Installed(named, [])
+        assert call(hook, monkeypatch, capsys, "ls", pin=[])[0] == 0, named
+        assert "ws upgrade" in json.loads(hook.out)["systemMessage"]
+        code, err = call(hook, monkeypatch, capsys, FORCE_PUSH, pin=[])
+        assert code == 2 and "blocked" in err, named
+    assert paths.unpinned_pin(dotfiles / "policy.toml").config == paths.config_dir()
+
+
+def test_a_policy_file_that_is_not_the_one_in_the_accounts_folders_is_refused(box, monkeypatch, capsys, installed):
+    """Another file in the account's folder, and a file called `policy.toml` that the account's one does not link to."""
+    other = installed.policy.with_name("other.toml")
+    other.write_text(policy.default_toml())
+    stray = box / "dotfiles" / "ws"
+    stray.mkdir(parents=True)
+    (stray / "policy.toml").write_text(policy.default_toml())
+    for named in (other, stray / "policy.toml"):
+        hook = Installed(named, [])
+        code, err = call(hook, monkeypatch, capsys, "ls", pin=[])
+        assert code == 2 and UNPINNED_FIX in err and hook.out == "", named
+
+
+def test_layout_variables_that_name_the_same_folders_by_a_link_are_not_a_forgery(box, monkeypatch, capsys, installed):
+    link = box / "link"
+    link.symlink_to(box / "home")
+    monkeypatch.setenv("HOME", str(link))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(link / ".config"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(link / ".local" / "state"))
+    assert call(installed, monkeypatch, capsys, "ls", pin=[])[0] == 0
+    # a variable that names a really different folder is still refused, link or not
+    other = box / "forged"
+    other.mkdir()
+    (box / "forged-link").symlink_to(other)
+    monkeypatch.setenv("XDG_STATE_HOME", str(box / "forged-link"))
+    code, err = call(installed, monkeypatch, capsys, "ls", pin=[])
+    assert code == 2 and UNPINNED_FIX in err

@@ -528,9 +528,12 @@ def _real(path: Path) -> str:
 def unpinned_pin(policy_file: Path | None) -> Pin:
     """The `Pin` for a hook that carries none (an earlier ws wrote it), worked out without reading the environment's
     layout: the account's home folder (`account_home`, never `HOME`) and the folder of the hook's own `--policy` file. A
-    policy under `<home>/.ws` is the legacy layout, one under `<home>/.config/ws` the default XDG folders, and anything
-    else is refused. A layout variable that is set (`LAYOUT_VARS`) must resolve to those same folders, and `HOME` must be
-    the account's home folder (another spelling of it is fine); the process then answers with the account's own spelling.
+    policy that is `<home>/.ws/policy.toml` is the legacy layout, one that is `<home>/.config/ws/policy.toml` the default
+    XDG folders, and anything else is refused. "Is" means the same file once links are followed: `ws install` writes the
+    policy path resolved, so a policy file that is a link into a dotfiles folder is the file it points to. A layout
+    variable that is set (`LAYOUT_VARS`) must resolve to those same folders (compared as real folders, not as spelled),
+    and `HOME` must be the account's home folder (another spelling of it is fine); the process then answers with the
+    account's own spelling.
     Raises `layout_changed` naming `ws upgrade --hooks-only` for every refusal, including a layout that cannot be told."""
     why = "this hook does not pin ws's folders, and"
     home = account_home()
@@ -545,20 +548,20 @@ def unpinned_pin(policy_file: Path | None) -> Pin:
     except WsError as e:
         raise _unpinned_refusal(f"ws's folders cannot be told now ({e.message})") from e
     legacy = home / LEGACY_NAME
-    here = _real(policy_file.parent)
-    if here == _real(legacy):
+    here = _real(policy_file)
+    if here == _real(legacy / "policy.toml"):
         folders = Layout("legacy", legacy, legacy, legacy, legacy)
     else:
         folders = xdg_layout({"HOME": str(home)})
-        if here != _real(folders.config):
-            raise _unpinned_refusal(f"{why} its policy file is not in the account's own folders")
+        if here != _real(folders.config / "policy.toml"):
+            raise _unpinned_refusal(f"{why} its policy file is not the one in the account's own folders")
     forged = {v: os.environ[v] for v in LAYOUT_VARS if os.environ.get(v)}
     if forged:
         try:
             now = layout({"HOME": str(home), **forged})
         except WsError as e:
             raise _unpinned_refusal(f"ws's folders cannot be told now ({e.message})") from e
-        if tuple(now.dir(k) for k in KINDS) != tuple(folders.dir(k) for k in KINDS):
+        if tuple(_real(now.dir(k)) for k in KINDS) != tuple(_real(folders.dir(k)) for k in KINDS):
             raise _unpinned_refusal(f"{why} the environment points them somewhere other than where its policy is")
     return Pin(home, folders.config, folders.state, folders.data, folders.cache)
 

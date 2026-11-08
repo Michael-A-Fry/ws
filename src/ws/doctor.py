@@ -254,17 +254,22 @@ def _hooks_check(prof: dict, env) -> list[Check]:
 
 def _upgrade_check(env) -> Check:
     """WS013: the hooks in the runner's config are as new as the ws that runs them. A hook written before ws pinned its
-    folders still works (it runs the full check and says so on every call), so this is a `warn`, not a `fail`."""
-    old = userconfig.hooks_without_pin(env)
-    if not old:
+    folders still works (it runs the full check and says so on every call), so this is a `warn`, not a `fail`. A runner
+    whose config can't be read is named too (a link, JSONC): what its hooks carry is not known, and `ws upgrade` leaves
+    it alone."""
+    state = userconfig.hook_state(env)
+    if not state.old and not state.unreadable:
         return Check("WS013", "upgrade", OK, "ws's hooks are as new as this ws")
-    return Check(
-        "WS013",
-        "upgrade",
-        WARN,
-        f"the hooks in {', '.join(old)} are older than this ws and carry no pin; each call prints a note",
-        "run `ws upgrade --hooks-only` in a terminal of your own (a gated session can't)",
-    )
+    parts = []
+    if state.old:
+        parts.append(
+            f"the hooks in {', '.join(state.old)} are older than this ws and carry no pin; each call prints a note"
+        )
+    parts += [f"the hooks in {runner} can't be checked: {why}" for runner, why in state.unreadable.items()]
+    fix = "run `ws upgrade --hooks-only` in a terminal of your own (a gated session can't)"
+    if state.unreadable:
+        fix = "make the config a plain JSON file ws can read, then " + fix
+    return Check("WS013", "upgrade", WARN, "; ".join(parts), fix)
 
 
 def _layout_check(env) -> Check:

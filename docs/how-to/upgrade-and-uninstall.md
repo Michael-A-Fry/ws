@@ -28,6 +28,13 @@ Move to a newer release, or remove ws and what it installed.
      for it and prints a note that names `ws upgrade`. Fix what the message says, then run `ws upgrade --hooks-only`.
    - **Both worked.** The new ws and the new hooks.
 
+   The hook rewrite refreshes the entries of every runner whose config already holds them. If one of those configs
+   can't be merged into now (it is a link, it has comments, or a value of yours is in the way), `ws upgrade --hooks-only`
+   leaves it as it was, says which runner and why, rewrites the others, and exits 1; `ws doctor` names the same runner
+   in `WS013`. Fix what it says and run it again. A runner ws never put entries in is not mentioned. It also takes out an
+   older OpenCode plugin that ws put there and has since withdrawn from (the file is still loaded, and ws's record of
+   it says so), and says it removed it; a plugin file of your own is never touched.
+
    A release before 0.1.9 has no `ws upgrade`. Run the installer yourself (`curl -fsSL
    https://raw.githubusercontent.com/Michael-A-Fry/ws/main/install.sh | bash`), then run `ws upgrade --hooks-only`.
    Sessions work in between, each call with the note, when ws's folders are the default ones (`~/.ws`, or the XDG

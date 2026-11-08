@@ -18,10 +18,15 @@ session. `ws upgrade` does both halves from a terminal of the person's own, and 
 The rewrite runs in a new process of the new binary (`--hooks-only`), never in the process that started the install: the
 files it would import have just been replaced.
 
-The rewrite is `ws install`'s own gate steps (`ws.install.gate_steps`) and nothing else: the profile, the modules and the
-folders are not touched. It never switches on what the person did not have (a config written without the sandbox block
-stays without it, see `ws.userconfig.keeps_sandbox_off`), and never takes ws out of a config (that is
-`ws install --gate launch`).
+The rewrite is `ws install`'s own gate steps (`ws.install.gate_plan`) and nothing else, bar one file: the profile, the
+modules and the folders are not touched. It never switches on what the person did not have (a config written without the
+sandbox block stays without it, see `ws.userconfig.keeps_sandbox_off`), and never takes ws out of a config (that is
+`ws install --gate launch`). The one file is an older OpenCode plugin that ws put there and has since withdrawn from
+(`ws.userconfig.withdrawn_plugin`): it is still loaded, so it is taken out, and said so.
+
+A runner ws gated whose config it can't merge into now (a link, JSONC, a value of the person's in the way) is left as it
+is, named with the reason and the way on, and the exit code is 1: the other runners are rewritten, and the person is
+never told "done" while a runner still has the old hooks.
 
 It is refused inside a gated session, and fails towards refusing. `WS_GATED_SESSION` is left out of the user-scope
 settings so that `ws approve` works from the person's own Claude shell, so the other signs are read as well: the sandbox
@@ -131,16 +136,31 @@ def _put_back(held: _Held, error: BaseException) -> WsError:
 def rewrite(env: Mapping[str, str], dry_run: bool = False) -> install.Result:
     """Rewrite the runner's hooks (and the generated gate files) with this ws. On any failure the runner's config, the
     install record and the OpenCode plugin are put back as they were, and the error is raised; if any could not be put
-    back it is `not_restored` (exit 4) and names them."""
-    steps = install.gate_steps(env)
+    back it is `not_restored` (exit 4) and names them. A runner that could not be rewritten is in `result.skipped`; a
+    withdrawn older OpenCode plugin that was taken out is in `result.removed`."""
+    steps, skipped = install.gate_plan(env)
+    plug = userconfig.withdrawn_plugin(env)
     if dry_run:
-        return install.apply(steps, env, dry_run=True)
+        result = install.apply(steps, env, dry_run=True)
+        result.skipped = skipped
+        result.removed += [plug] if plug else []
+        return result
     held = _Held.of(
-        [install.manifest_path(env), *(s.path for s in steps if s.kind == "merge" or s.path.suffix == ".js")]
+        [
+            install.manifest_path(env),
+            *(s.path for s in steps if s.kind == "merge" or s.path.suffix == ".js"),
+            *([plug] if plug else []),
+        ]
     )
     try:
         result = install.apply(steps, env)
+        result.skipped = skipped
         rewritten = {s.merge.runner for s in steps if s.kind == "merge" and s.merge is not None and s.merge.ops}
+        if plug:
+            plug.unlink()
+            install.forget([plug], env)
+            result.removed.append(plug)
+            rewritten.add("opencode")
         left = [r for r in userconfig.hooks_without_pin(env) if r in rewritten]
         if left:
             raise WsError("failed", f"the hooks in {', '.join(left)} still carry no pin after the rewrite", "")
@@ -214,29 +234,48 @@ def _say(args: argparse.Namespace, text: str) -> None:
     print(f"ws: {text}", file=sys.stderr if args.json else sys.stdout)
 
 
+def _skipped_line(sk: install.Skipped) -> str:
+    return f"{sk.runner}: not rewritten, left as it was: {sk.reason}" + (f". {sk.hint}" if sk.hint else "")
+
+
 def _hooks_only(args: argparse.Namespace, env: Mapping[str, str]) -> int:
     try:
         result = rewrite(env, dry_run=args.dry_run)
     except (install.InstallError, OSError) as e:
         raise WsError("failed", str(e), "nothing was changed; `ws doctor` says what is wrong") from e
+    left = [s.runner for s in result.skipped]
     if args.json:
         output.result(
             {
                 "version": __version__,
                 "hooks": "dry-run" if args.dry_run else "rewritten" if result.changes else "current",
                 "changes": result.changes,
+                "removed": [str(p) for p in result.removed],
+                "skipped": [{"runner": s.runner, "reason": s.reason, "hint": s.hint} for s in result.skipped],
                 "notes": list(result.notes),
             }
         )
-        return 0
+        return EXIT_FAILED if left else 0
     for note in result.notes:
         print(f"ws: {note}")
+    verb = "would remove" if args.dry_run else "removed"
+    for path in result.removed:
+        print(f"ws: {verb} {path} (an older OpenCode plugin that ws put there and had withdrawn)")
     verb = "would make" if args.dry_run else "made"
     print(
         f"ws {__version__}: {verb} {result.summary()}"
         if result.changes
         else f"ws {__version__}: hooks are current ({result.summary()})"
     )
+    for sk in result.skipped:
+        print(f"ws: {_skipped_line(sk)}")
+    if left:
+        print(
+            f"ws: the hooks in {', '.join(left)} still have the old form. Do what is named above, "
+            "then run `ws upgrade --hooks-only` again",
+            file=sys.stderr,
+        )
+        return EXIT_FAILED
     return 0
 
 
@@ -271,8 +310,8 @@ def _both(args: argparse.Namespace, env: Mapping[str, str]) -> int:
     if code != 0:
         _say(
             args,
-            f"the new ws is installed, but the hooks were not rewritten (exit {code}). They are as they were and still "
-            f"work: each call prints a note. Fix what the line above says, then run `ws upgrade --hooks-only`; "
+            f"the new ws is installed, but the hooks were not all rewritten (exit {code}). Any that were not are as they "
+            f"were and still work: each call prints a note. Fix what the line above says, then run `ws upgrade --hooks-only`; "
             f"to go back to ws {before}, run the installer with --version v{before}",
         )
         return EXIT_FAILED

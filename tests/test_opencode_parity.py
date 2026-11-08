@@ -394,52 +394,22 @@ def test_skills_folders_are_edit_denied(tmp_path, box):
         f = str(folder)
         tail = "/".join(folder.parts[-2:])
         assert perm[f] == perm[f + "/**"] == "deny", f
-        for form in (f"../{tail}", f"../{tail}/**", f"../**/{tail}", f"../**/{tail}/**"):
-            assert perm[form] == "deny", form  # how OpenCode sees a folder outside the project
+        for form in (f"**/{tail}", f"**/{tail}/**"):
+            assert perm[form] == "deny", form  # however OpenCode spells the path
     assert next(iter(perm.items())) == ("*", "allow")
 
 
-def test_a_projects_own_skills_folders_are_not_caught_by_the_home_level_rules(tmp_path, box, monkeypatch):
-    """A bare `**/.claude/skills` would deny a project's own; the rules for the home folders start with `../`. The
-    project's `.opencode/skills` (the one OpenCode reads itself) is denied in the project and in a folder below it."""
-    (box / "code" / "proj").mkdir(parents=True)
-    monkeypatch.chdir(box / "code" / "proj")  # a project below home
-    perm = native("", tmp_path)["edit"]
-    for own in (".claude/skills", ".agents/skills"):
-        inside = [k for k in perm if own in k and not k.startswith(("/", "../"))]
-        assert not inside, (own, inside)
-    for folder in (".opencode/skills", ".opencode/skill"):
-        for form in (folder, f"{folder}/**", f"**/{folder}", f"**/{folder}/**"):
-            assert perm[form] == "deny", form
-
-
-def test_a_project_at_home_has_its_home_level_skills_folders_denied_as_plain_relative_paths(tmp_path, box, monkeypatch):
-    """With OpenCode started in the home folder, `.claude/skills/x` is below the project and reaches the permission check
-    as a relative path with no `../`. (How OpenCode 1.19.4 builds an edit pattern was not checked in a live run, so both
-    spellings are denied.)"""
-    monkeypatch.chdir(box)  # the default project is the folder ws is run in
-    perm = native("", tmp_path)["edit"]
-    for rel in (".claude/skills", ".agents/skills", ".config/opencode/skills", ".config/opencode/skill"):
-        assert perm[rel] == perm[f"{rel}/**"] == "deny", rel
-        tail = "/".join(rel.split("/")[-2:])
-        assert perm[f"../{tail}"] == "deny", rel  # and the forms for a project below home are still there
-    files = opencode.generate(
-        policy.loads(""),
-        ["ws"],
-        tmp_path / "out",
-        tmp_path / "policy.toml",
-        pin=paths.pin_of(),
-        project=box / ".config",
-    )
-    below = json.loads(files[opencode.CONFIG])["permission"]["edit"]  # the project is a parent of the config folder
-    assert below["opencode/skills"] == below["opencode/skills/**"] == "deny" and ".claude/skills" not in below
-
-
-def test_a_project_elsewhere_gets_no_bare_relative_form_for_the_home_level_folders(tmp_path, box, monkeypatch):
-    (tmp_path / "proj").mkdir()
-    monkeypatch.chdir(tmp_path / "proj")
-    perm = native("", tmp_path)["edit"]
-    assert not [k for k in perm if "skills" in k and not k.startswith(("/", "../", "**/.opencode", ".opencode"))]
+def test_skills_folders_are_denied_at_any_depth_wherever_opencode_is_started(tmp_path, box, monkeypatch):
+    """OpenCode sees a path relative to the project, so the rule has to hold whichever folder that is."""
+    for start in (box, box / "code" / "proj", tmp_path / "proj"):
+        start.mkdir(parents=True, exist_ok=True)
+        monkeypatch.chdir(start)
+        perm = native("", tmp_path)["edit"]
+        for tail in (".claude/skills", ".agents/skills", "opencode/skills", "opencode/skill"):
+            assert perm[f"**/{tail}"] == perm[f"**/{tail}/**"] == "deny", (start, tail)
+        for folder in (".opencode/skills", ".opencode/skill"):
+            for form in (folder, f"{folder}/**", f"**/{folder}", f"**/{folder}/**"):
+                assert perm[form] == "deny", form
 
 
 def test_the_skills_folders_follow_the_config_home_the_environment_names(tmp_path, box, monkeypatch):

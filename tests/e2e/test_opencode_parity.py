@@ -71,7 +71,7 @@ def step(tmp_path, out, work, calls: list[Call], *, first: bool = False, text: s
 
 def asks_lines(tmp_path) -> list[dict]:
     file = tmp_path / "home" / ".claude-usage" / "asks" / "asks.jsonl"
-    return [json.loads(ln) for ln in file.read_text().splitlines()] if file.is_file() else []
+    return [json.loads(ln) for ln in file.read_text().splitlines() if ln.strip()] if file.is_file() else []
 
 
 # --- the event names, against the binary ----------------------------------------------------------------------------

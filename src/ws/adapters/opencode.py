@@ -10,8 +10,8 @@ before a call the only one that can block.
 
 Also denied: edits of the policy file and of the generated folder, so a session cannot loosen its own gate, and of the
 skills folders OpenCode reads (its own, and the ones it shares with other runners), because a skill is read as
-instructions. The home-level folders are denied by absolute path and as OpenCode sees them from a project (`../...`).
-The project's own `.opencode/skills` is denied too; its `.claude/skills` and `.agents/skills` are the project's own.
+instructions. Each is denied by absolute path and by its last two folders at any depth, so a project's own folder of that name is held
+too. The project's own `.opencode/skills` is denied as well.
 
 Point OpenCode at the output so its global config is never touched, and so a project's own `opencode.json` cannot
 loosen the gate: the inline config (OPENCODE_CONFIG_CONTENT) is read after the global, OPENCODE_CONFIG and project
@@ -183,24 +183,16 @@ def _protect_forms(path: str, is_out: bool) -> list[str]:
     return [path, f"{path}/**", f"**/{tail}", f"**/{tail}/**"]
 
 
-def _skill_forms(path: str, project: Path | None = None) -> list[str]:
-    """Edit rules for a skills folder in the person's home or config folder: the absolute path, and how OpenCode sees it
-    from a project (`../` first, the last two segments of the path below). A bare `**/.claude/skills` would also catch a
-    project's own `.claude/skills`, which is the project's to change, so the relative forms start with `../`: they only
-    reach a folder outside the project. When the project is the folder's parent or an ancestor of it (OpenCode run in the
-    home folder), the folder is inside the project and is seen as a plain relative path, so that path is denied too, and
-    only then."""
+def _skill_forms(path: str) -> list[str]:
+    """Edit rules for a skills folder in the person's home or config folder: the absolute path, and its last two segments
+    at any depth, however OpenCode spells the path. That also holds a project's own folder of the same name: a planted
+    skill steers the next session wherever it sits, so the rule errs towards denying."""
     tail = "/".join(Path(path).parts[-2:])
-    forms = [path, f"{path}/**", f"../{tail}", f"../{tail}/**", f"../**/{tail}", f"../**/{tail}/**"]
-    if project is not None and Path(path).is_relative_to(project) and Path(path) != project:
-        rel = Path(path).relative_to(project).as_posix()
-        forms += [rel, f"{rel}/**"]
-    return forms
+    return [path, f"{path}/**", f"**/{tail}", f"**/{tail}/**"]
 
 
 # The skills folders of a project that OpenCode reads on its own (`.opencode/skills`, and the older singular name): they
-# steer the next session as much as a home-level one does. A project's `.claude/skills` and `.agents/skills` are not on
-# the list: they are the project's own, shared with other runners.
+# steer the next session as much as a home-level one does.
 PROJECT_SKILL_FOLDERS = (".opencode/skills", ".opencode/skill")
 
 
@@ -252,11 +244,9 @@ def generate(
     *,
     protect: tuple[str, ...] = (),
     pin: paths.Pin | None = None,
-    project: Path | None = None,
 ) -> dict[str, str]:
     protect = tuple(protect)
     pin = pin or paths.pin_of()
-    project = Path(project) if project is not None else Path.cwd()  # the folder OpenCode will be started in
     # Last matching rule wins, so the order is the catch-all, then the asks, then the denies: a deny beats an ask.
     denies = native_patterns(policy)
     asks = [p for p in native_asks(policy) if p not in denies]  # one asked and denied is denied
@@ -269,7 +259,7 @@ def generate(
     for p in protected_paths(out, policy_file, protect):
         edit.update(dict.fromkeys(_protect_forms(p, p == str(out)), "deny"))
     for p in skill_folders(pin):  # a skill is read as instructions: a planted one would steer the next session
-        edit.update(dict.fromkeys(_skill_forms(p, project), "deny"))
+        edit.update(dict.fromkeys(_skill_forms(p), "deny"))
     for folder in PROJECT_SKILL_FOLDERS:
         edit.update(dict.fromkeys(_project_skill_forms(folder), "deny"))
     permission["edit"] = edit

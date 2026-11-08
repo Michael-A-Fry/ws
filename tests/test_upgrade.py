@@ -556,3 +556,67 @@ def test_the_gate_denies_ws_upgrade_whatever_the_environment_a_session_builds(li
     """The refusal in `ws upgrade` reads an environment and a terminal that a session can arrange; the gate does not."""
     reason = policy.is_denied_command(policy.default_policy(), line, cwd="/tmp")
     assert reason and "not for a gated session" in reason, line
+
+
+# --- a rewrite only refreshes: it never switches a runner on, never takes ws out, and a bad file is not fatal -------------------
+
+
+def opencode_install(box: Path, *extra: str) -> None:
+    code = cli.main(["install", "--yes", "--runner", "opencode", "--notes", str(box / "Notes"), *extra])
+    assert code == 0
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        lambda text: text,
+        lambda text: text.replace('gate = "every-session"', 'gate = "launch"'),
+        lambda text: text.replace('adapter = "claude-code"', 'adapter = "opencode"'),
+    ],
+    ids=["as installed", "profile says launch", "profile names another runner"],
+)
+def test_gate_steps_never_take_ws_out_of_a_config(old, capsys, edit):
+    """A rewrite refreshes the entries that are there. No step is a withdrawal (a merge with no ops), and applying the
+    steps over a config that is already current leaves its bytes as they are."""
+    profile = paths.config_dir() / "profile.toml"
+    profile.write_text(edit(profile.read_text()))
+    assert upgrade_hooks(capsys)[0] == 0
+    steps = install.gate_steps(os.environ)
+    merges = [s for s in steps if s.kind == "merge"]
+    assert [s.merge.runner for s in merges] == ["claude-code"] and all(s.merge.ops for s in merges)
+    before = (settings_file(old).read_bytes(), manifest_bytes(old))
+    install.apply(steps, os.environ)
+    assert (settings_file(old).read_bytes(), manifest_bytes(old)) == before
+    assert userconfig.hooks_without_pin(os.environ) == [] and hook_command(old)
+
+
+def test_a_runner_that_install_withdrew_is_not_gated_again_by_the_plugin_it_left(box, capsys):
+    opencode_install(box)
+    config = userconfig.target("opencode", os.environ)
+    assert "permission" in config.read_text()
+    opencode_install(box, "--gate", "launch")
+    capsys.readouterr()
+    withdrawn = config.read_bytes() if config.exists() else None
+    assert not install._merge_entry(install._read_manifest()[0], "opencode", os.environ)
+    steps = install.gate_steps(os.environ)
+    assert not [s for s in steps if s.kind == "merge" and s.merge.runner == "opencode" and s.merge.ops]
+    assert userconfig.hooks_without_pin(os.environ) == []  # doctor does not point at an upgrade that would do nothing
+    code, _, err = upgrade_hooks(capsys)
+    assert code == 0, err
+    assert (config.read_bytes() if config.exists() else None) == withdrawn
+    assert not install._merge_entry(install._read_manifest()[0], "opencode", os.environ)
+
+
+def test_a_linked_settings_file_of_a_runner_the_profile_does_not_name_is_not_fatal(old, capsys):
+    """Claude Code's config is a link, and the profile names OpenCode now: the rewrite carries on (the file is the one
+    `ws doctor` reports), and it neither follows the link nor changes it."""
+    profile = paths.config_dir() / "profile.toml"
+    profile.write_text(profile.read_text().replace('adapter = "claude-code"', 'adapter = "opencode"'))
+    real = settings_file(old).with_name("real-settings.json")
+    real.write_bytes(settings_file(old).read_bytes())
+    settings_file(old).unlink()
+    settings_file(old).symlink_to(real)
+    before = real.read_bytes()
+    code, _, err = upgrade_hooks(capsys)
+    assert code == 0, err
+    assert real.read_bytes() == before and settings_file(old).is_symlink()

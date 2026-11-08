@@ -390,7 +390,11 @@ def gate_steps(env: Mapping[str, str] | None = None) -> list[Step]:
         entry = _merge_entry(entries, step.merge.runner, env) if step.merge is not None else None
         if step.kind == "merge" and step.merge is not None and not step.merge.ops and entry is not None:
             runner = step.merge.runner  # the profile names another runner now: this one's entries stay, current
-            made = userconfig.plan(runner, parsed, policy_file, env, entry)
+            try:
+                made = userconfig.plan(runner, parsed, policy_file, env, entry)
+                userconfig.classify(made.merge, entry)  # a link, JSONC or a conflict is raised here, not at the write
+            except WsError:  # a config ws can't merge into: left as it is, and `ws doctor` names it (WS008)
+                continue
             out = _dir("state", env) / "gate" / runner
             steps += [Step(out / name, "file", text, f"{runner} deny rules") for name, text in made.files.items()]
             steps += _merge_steps(runner, made, True)

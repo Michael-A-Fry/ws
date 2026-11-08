@@ -1108,12 +1108,13 @@ def check(env: Mapping[str, str] | None = None) -> tuple[str, str, str]:
 
 
 def holds_ws_entries(runner: str, env: Mapping[str, str]) -> bool:
-    """Does the runner's user config hold ws's hooks (Claude Code) or its plugin (OpenCode)? Read from the file, whether or
-    not the install record is there."""
+    """Does the runner's user config hold ws's entries? Claude Code: its hooks are in the file, whether or not the install
+    record is there. OpenCode: its config carries no mark of ws's (the rules are plain `permission` keys) and the plugin
+    file stays behind when ws withdraws, so only the install record says so. Never a file beside the config."""
     try:
         if runner == "claude-code":
             return _holds_ws_hooks(load(target(runner, env))[0])
-        return plugin_path(env).is_file()
+        return _manifest_entry(runner, env) is not None
     except (WsError, OSError):
         return False
 
@@ -1122,8 +1123,8 @@ def hooks_without_pin(env: Mapping[str, str] | None = None) -> list[str]:
     """The runners whose ws hooks in their user config carry no `--pin`: written by a ws older than the one running, which
     pinned ws's folders in every hook only later. Each name once, in RUNNERS order. A runner with no ws hooks in its
     file, or a file that can't be read, is left out (WS008 says what is wrong with the file), and so is one that ws has no
-    record of and the profile does not name: `ws upgrade` rewrites the runners it knows, and this must not point at it for
-    one it would leave alone."""
+    record of and the profile does not name, or an OpenCode plugin with no record (ws withdrew from that config and left
+    the plugin): `ws upgrade` rewrites the runners it knows, and this must not point at it for one it would leave alone."""
     env = os.environ if env is None else env
     try:
         named = _profile_runner(env)[0]
@@ -1131,7 +1132,7 @@ def hooks_without_pin(env: Mapping[str, str] | None = None) -> list[str]:
         named = ""
     found: list[str] = []
     for runner in RUNNERS:
-        if runner != named and _manifest_entry(runner, env) is None:
+        if _manifest_entry(runner, env) is None and (runner != named or runner == "opencode"):
             continue
         try:
             if runner == "claude-code":

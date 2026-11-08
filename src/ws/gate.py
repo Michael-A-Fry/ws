@@ -265,9 +265,9 @@ def _pinned(args: argparse.Namespace):
     """A hook runs on the layout `ws install` pinned in its command, and on no other: the environment is the session's
     (a project's settings can set WS_HOME or an XDG variable), so it must resolve to the same folders or the call is
     refused. Inside the block the whole process answers with the pinned layout (see ws.paths.pinned_by). A hook with no
-    pin at all (an earlier ws wrote it) is not refused: it runs the full check, and the block yields the note that names
-    `ws upgrade`."""
-    return paths.pinned_by(args.pin, allow_unpinned=True)
+    pin at all (an earlier ws wrote it) is not refused: it runs the full check on the folders its own policy file sits in,
+    and the block yields the note that names `ws upgrade`."""
+    return paths.pinned_by(args.pin, allow_unpinned=True, policy_file=_policy_arg(args))
 
 
 def _reason_of(e: BaseException) -> str:

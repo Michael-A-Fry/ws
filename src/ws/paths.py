@@ -89,6 +89,10 @@ _XDG = {  # kind -> (variable, default below HOME)
     "data": ("XDG_DATA_HOME", ".local/share"),
     "cache": ("XDG_CACHE_HOME", ".cache"),
 }
+OVERRIDE_VARS = ("WS_HOME", *ENV_DIRS.values())  # the variables that name ws's folders outright
+LAYOUT_VARS = (*OVERRIDE_VARS, *(var for var, _ in _XDG.values()))
+"""Every environment variable that moves ws's folders (`layout`, `probe` and `work_dir` read these and no others). A
+hook with no pin refuses when any of them disagrees with the folders it works out for itself (`unpinned_pin`)."""
 LEGACY_NAME = ".ws"
 MIGRATED_GLOB = f"{LEGACY_NAME}.migrated-*"  # what `ws migrate` renames the old folder to (a date, then maybe a number)
 _OWNED_KINDS = ("config", "state", "data")  # a cache folder can be made by anything; it does not say ws lives there
@@ -232,7 +236,7 @@ def probe(env: Mapping[str, str] | None = None) -> Probe:
     xdg = xdg_layout(e)
     legacy = legacy_dir(e)
     owned = _owned_entries(xdg)
-    if e.get("WS_HOME") or any(e.get(v) for v in ENV_DIRS.values()):
+    if any(e.get(v) for v in OVERRIDE_VARS):
         return Probe("single", legacy, xdg, owned)
     has_legacy = legacy.is_dir()
     if has_legacy and owned:
@@ -501,47 +505,81 @@ def add_pin_option(parser) -> None:
 
 
 def account_home() -> Path | None:
-    """The home folder the system's account database gives this user, or None when it cannot be asked (no `pwd`, as on
-    native Windows, or no entry). `pwd` is imported here, not at the top, so the module still loads without it."""
+    """The home folder the system's account database gives this user, as it spells it, or None when it cannot be asked
+    (no `pwd`, as on native Windows, no entry, or an entry that is empty or not an absolute path). `pwd` is imported
+    here, not at the top, so the module still loads without it."""
     try:
         import pwd
 
-        return Path(os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir))
+        raw = pwd.getpwuid(os.getuid()).pw_dir
     except (ImportError, KeyError, OSError):
         return None
+    return Path(os.path.normpath(raw)) if raw and os.path.isabs(raw) else None
+
+
+def _unpinned_refusal(message: str) -> WsError:
+    return WsError("layout_changed", message, "run `ws upgrade --hooks-only` in a terminal of your own")
+
+
+def _real(path: Path) -> str:
+    return os.path.realpath(path)
+
+
+def unpinned_pin(policy_file: Path | None) -> Pin:
+    """The `Pin` for a hook that carries none (an earlier ws wrote it), worked out without reading the environment's
+    layout: the account's home folder (`account_home`, never `HOME`) and the folder of the hook's own `--policy` file. A
+    policy under `<home>/.ws` is the legacy layout, one under `<home>/.config/ws` the default XDG folders, and anything
+    else is refused. A layout variable that is set (`LAYOUT_VARS`) must resolve to those same folders, and `HOME` must be
+    the account's home folder (another spelling of it is fine); the process then answers with the account's own spelling.
+    Raises `layout_changed` naming `ws upgrade --hooks-only` for every refusal, including a layout that cannot be told."""
+    why = "this hook does not pin ws's folders, and"
+    home = account_home()
+    if home is None:
+        raise _unpinned_refusal(f"{why} the account's home folder cannot be told")
+    if _real(home_dir()) != _real(home):
+        raise _unpinned_refusal(f"{why} HOME is not the account's home folder")
+    if policy_file is None:
+        raise _unpinned_refusal(f"{why} it names no policy file to work them out from")
+    try:
+        layout({"HOME": str(home)})  # `~/.ws` and the XDG folders both holding ws's files: no single layout
+    except WsError as e:
+        raise _unpinned_refusal(f"ws's folders cannot be told now ({e.message})") from e
+    legacy = home / LEGACY_NAME
+    here = _real(policy_file.parent)
+    if here == _real(legacy):
+        folders = Layout("legacy", legacy, legacy, legacy, legacy)
+    else:
+        folders = xdg_layout({"HOME": str(home)})
+        if here != _real(folders.config):
+            raise _unpinned_refusal(f"{why} its policy file is not in the account's own folders")
+    forged = {v: os.environ[v] for v in LAYOUT_VARS if os.environ.get(v)}
+    if forged:
+        try:
+            now = layout({"HOME": str(home), **forged})
+        except WsError as e:
+            raise _unpinned_refusal(f"ws's folders cannot be told now ({e.message})") from e
+        if tuple(now.dir(k) for k in KINDS) != tuple(folders.dir(k) for k in KINDS):
+            raise _unpinned_refusal(f"{why} the environment points them somewhere other than where its policy is")
+    return Pin(home, folders.config, folders.state, folders.data, folders.cache)
 
 
 @contextlib.contextmanager
-def pinned_by(values: list[str] | None, *, allow_unpinned: bool = False):
+def pinned_by(values: list[str] | None, *, allow_unpinned: bool = False, policy_file: Path | None = None):
     """Read the hook's `--pin` arguments, refuse (`layout_changed`) unless the environment resolves to them, and answer
     with them inside the block. Yields the notes the caller should show the person: none, or `UNPINNED_NOTE`.
 
     `allow_unpinned` is for the gate's own hooks (`ws gate check` and `ws gate event`) and only for a hook with no
     `--pin` at all, one an earlier ws wrote. Refusing it would block every call of every session the
     moment a newer ws is installed, with the fix (`ws upgrade`) out of reach from inside that session. It runs the whole
-    check, with the note. The layout it resolves to is the one the environment gives now, which is what the earlier ws
-    used on every call: `WS_HOME`, an XDG variable or `HOME`. The hook still names its policy file by absolute path, so
-    the rules are the installed ones. The protected folders are those of the layouts that environment can give, and
-    `HOME` moves all of them, so the unpinned path is taken only while `HOME` is the account's own home folder
-    (`account_home`); a different `HOME`, or an account that can't be asked, is refused like a changed pin. It lasts only
-    until `ws upgrade`. A pin that is partial, malformed or different from what the environment resolves to is refused
-    exactly as before, and a layout that cannot be told is a refusal too."""
+    check, with the note, on a pin that `unpinned_pin` builds from the account's home folder and `policy_file` (the
+    hook's own `--policy`), never from the environment: the environment is the project's to set, which is why a pin
+    exists. A custom layout, or any layout variable that points elsewhere, is refused with the one-line fix
+    (`ws upgrade --hooks-only`). It lasts only until `ws upgrade`. A pin that is partial, malformed or different from what
+    the environment resolves to is refused exactly as before."""
     pin = read_pin(values)
     notes: tuple[str, ...] = ()
     if pin is None and allow_unpinned:
-        real = account_home()
-        if real is None or Path(os.path.realpath(home_dir())) != real:
-            raise WsError(
-                "layout_changed",
-                "this hook does not pin ws's folders, and HOME is not the account's home folder",
-                "run `ws upgrade --hooks-only` in a terminal of your own",
-            )
-        try:
-            pin = pin_of()
-        except WsError as e:
-            raise WsError(
-                "layout_changed", f"ws's folders cannot be told now ({e.message})", "run `ws migrate` or `ws install`"
-            ) from e
+        pin = unpinned_pin(policy_file)
         notes = (UNPINNED_NOTE,)
     else:
         check_pin(pin)

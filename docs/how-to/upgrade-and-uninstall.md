@@ -30,8 +30,11 @@ Move to a newer release, or remove ws and what it installed.
 
    A release before 0.1.9 has no `ws upgrade`. Run the installer yourself (`curl -fsSL
    https://raw.githubusercontent.com/Michael-A-Fry/ws/main/install.sh | bash`), then run `ws upgrade --hooks-only`.
-   Sessions work in between, each call with the note, as long as `HOME` is your own home folder; with another `HOME`
-   an unpinned hook is refused. `ws doctor` shows the same state as `WS013`.
+   Sessions work in between, each call with the note, when ws's folders are the default ones (`~/.ws`, or the XDG
+   folders under your account's home) and the environment does not point them anywhere else. A hook with no pin works
+   out its folders from your account's home and the policy file it names, never from `HOME` or a ws or XDG variable. A
+   custom layout, or any such variable that disagrees, is refused with `ws upgrade --hooks-only` as the fix. `ws doctor`
+   shows the same state as `WS013`.
 
 2. Check the version and the machine.
 

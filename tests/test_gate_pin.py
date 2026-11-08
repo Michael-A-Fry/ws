@@ -8,15 +8,20 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import shlex
+import shutil
 import sys
+import types
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 
-from ws import cli, gate, paths, policy
+from ws import approvals, cli, gate, paths, policy
 from ws.adapters import claude_code, opencode
+
+ACCOUNT_HOME = paths.account_home  # the real one, before a fixture stands in for it
 
 CHANGED = "ws's folders changed since install"
 
@@ -154,7 +159,7 @@ def test_a_hook_with_no_pin_is_refused_when_home_is_not_the_accounts(box, monkey
 def test_a_hook_with_no_pin_is_refused_when_the_account_cannot_be_asked(box, monkeypatch, capsys, installed):
     monkeypatch.setattr(paths, "account_home", lambda: None)  # no `pwd` here
     code, err = installed.check(monkeypatch, capsys, "ls", pin=[])
-    assert code == 2 and "HOME is not the account's home" in err
+    assert code == 2 and "cannot be told" in err and "ws upgrade --hooks-only" in err
 
 
 def test_the_account_home_is_what_the_system_says_not_what_the_environment_says(monkeypatch, tmp_path):
@@ -327,3 +332,134 @@ def test_generated_check_commands_are_accepted_by_the_parser(box):
     assert ns.func is gate.cmd_check and paths.read_pin(ns.pin) == paths.pin_of()
     assert gate.hook_args("check", fallback[3:]).runner == "claude-code"  # and the daemon reads the same options
     assert claude_code.NAME == "claude-code"
+
+
+# --- an unpinned hook builds its pin from the account and its own policy file, never from the environment -------------------
+
+ASK = 'ask_commands = ["terraform apply*"]'
+CALL = "terraform apply"
+UNPINNED_FIX = "ws upgrade --hooks-only"
+FORCE_PUSH = "git push --force origin main"
+
+
+def ask_box(installed: Installed) -> None:
+    text = installed.policy.read_text().replace("ask_commands = []", ASK)
+    assert ASK in text
+    installed.policy.write_text(text)
+
+
+def grant_in(state: Path) -> Path:
+    """What a session could write in a folder of its choosing: a grant for the call `CALL`, bound as the gate binds it."""
+    root = state / "approvals"
+    state.mkdir(parents=True, exist_ok=True)
+    bound = approvals.Bound("claude-code", "command", CALL, "/work", "sess-1")
+    assert approvals.require(root, bound)
+    approvals.grant(root, bound.digest()[:12])
+    return root / "granted" / f"{bound.digest()}.json"
+
+
+def call(installed: Installed, monkeypatch, capsys, command: str, pin: list[str] | None = None) -> tuple[int, str]:
+    payload = {"tool_name": "Bash", "tool_input": {"command": command}, "session_id": "sess-1", "cwd": "/work"}
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+    argv = ["gate", "check", "--runner", "claude-code", "--policy", str(installed.policy)]
+    code = cli.main([*argv, *(installed.pin if pin is None else pin)])
+    seen = capsys.readouterr()
+    installed.out = seen.out
+    return code, seen.err
+
+
+def test_a_grant_in_the_real_folder_is_honoured_by_an_unpinned_hook(box, monkeypatch, capsys, installed):
+    """The control for the forged ones below: the same planted grant, in the account's own state folder."""
+    ask_box(installed)
+    assert call(installed, monkeypatch, capsys, CALL, pin=[])[0] == 2  # asks first
+    grant_in(paths.state_dir())
+    assert call(installed, monkeypatch, capsys, CALL, pin=[])[0] == 0
+
+
+@pytest.mark.parametrize("var", paths.LAYOUT_VARS)
+def test_a_forged_layout_variable_refuses_an_unpinned_hook_and_its_grant_is_not_honoured(
+    box, monkeypatch, capsys, installed, var
+):
+    ask_box(installed)
+    forged = box / "forged"
+    planted = grant_in(paths.layout({"HOME": str(box / "home"), var: str(forged)}).state)  # where the variable points
+    assert planted.is_file()
+    monkeypatch.setenv(var, str(forged))
+    code, err = call(installed, monkeypatch, capsys, CALL, pin=[])
+    assert code == 2 and UNPINNED_FIX in err and installed.out == ""
+    assert planted.is_file()  # not read, so not used up
+    code, err = call(installed, monkeypatch, capsys, "ls", pin=[])
+    assert code == 2 and UNPINNED_FIX in err  # and nothing else is let through on it either
+
+
+def test_the_list_of_layout_variables_is_the_one_paths_reads():
+    """`LAYOUT_VARS` is built from the tables `layout` reads; a variable named anywhere else in the module is a gap."""
+    source = Path(paths.__file__).read_text(encoding="utf-8")
+    named = set(re.findall(r'"(WS_[A-Z]+_DIR|WS_HOME|XDG_[A-Z]+_HOME)"', source))
+    assert named == set(paths.LAYOUT_VARS)
+
+
+def test_layout_variables_that_agree_with_the_policy_folder_are_not_a_forgery(box, monkeypatch, capsys, installed):
+    home = box / "home"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(home / ".local" / "state"))
+    assert call(installed, monkeypatch, capsys, "ls", pin=[])[0] == 0
+
+
+def test_a_symlinked_home_is_the_accounts_home_and_keeps_the_accounts_spelling(box, monkeypatch, capsys, installed):
+    link = box / "link"
+    link.symlink_to(box / "home")
+    monkeypatch.setenv("HOME", str(link))
+    for spelling in (box / "home", link):
+        code, err = call(installed, monkeypatch, capsys, f"cat {spelling}/.ssh/id_rsa", pin=[])
+        assert code == 2 and "blocked" in err, spelling
+    assert call(installed, monkeypatch, capsys, "ls", pin=[])[0] == 0
+    assert paths.unpinned_pin(installed.policy).home == paths.account_home()  # not the spelling HOME gave
+
+
+@pytest.mark.parametrize("pw_dir", ["", ".", "relative/home"])
+def test_an_account_with_no_usable_home_is_refused(box, monkeypatch, capsys, installed, pw_dir):
+    import pwd
+
+    monkeypatch.setattr(paths, "account_home", ACCOUNT_HOME)
+    monkeypatch.setattr(pwd, "getpwuid", lambda uid: types.SimpleNamespace(pw_dir=pw_dir))
+    assert paths.account_home() is None
+    monkeypatch.chdir(box / "home")  # an empty home used to mean the folder ws runs in
+    code, err = call(installed, monkeypatch, capsys, "ls", pin=[])
+    assert code == 2 and UNPINNED_FIX in err
+
+
+def test_a_hook_with_no_pin_on_the_old_folder_layout_runs_the_full_check(box, monkeypatch, capsys):
+    """`~/.ws`: the policy sits under the account's `.ws`, and that is the legacy layout."""
+    home = box / "home"
+    shutil.rmtree(home / ".config")
+    (home / ".ws").mkdir()
+    (home / ".ws" / "policy.toml").write_text(policy.default_toml())
+    installed = Installed(home / ".ws" / "policy.toml", [])
+    assert call(installed, monkeypatch, capsys, "ls", pin=[])[0] == 0
+    assert "ws upgrade" in json.loads(installed.out)["systemMessage"]
+    code, err = call(installed, monkeypatch, capsys, FORCE_PUSH, pin=[])
+    assert code == 2 and "blocked" in err
+    code, err = call(installed, monkeypatch, capsys, f"cat {home}/.ws/secrets/token", pin=[])
+    assert code == 2 and "blocked" in err
+
+
+def test_a_custom_layout_gets_the_refusal_and_its_one_line_fix(box, monkeypatch, capsys, installed):
+    """A policy that is neither in `~/.ws` nor in the default XDG folders: no silent pass, with or without the variable
+    that an earlier ws would have followed."""
+    custom = box / "custom"
+    custom.mkdir()
+    (custom / "policy.toml").write_text(policy.default_toml())
+    moved = Installed(custom / "policy.toml", [])
+    monkeypatch.setenv("WS_HOME", str(custom))
+    code, err = call(moved, monkeypatch, capsys, "ls", pin=[])
+    assert code == 2 and UNPINNED_FIX in err and moved.out == ""
+    monkeypatch.delenv("WS_HOME")
+    code, err = call(moved, monkeypatch, capsys, "ls", pin=[])
+    assert code == 2 and UNPINNED_FIX in err
+
+
+def test_a_hook_with_no_pin_and_no_policy_file_is_refused(box, monkeypatch, capsys):
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"tool_name": "Bash", "tool_input": {"command": "ls"}})))
+    assert cli.main(["gate", "check", "--runner", "claude-code"]) == 2
+    assert UNPINNED_FIX in capsys.readouterr().err

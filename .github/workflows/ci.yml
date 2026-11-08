@@ -12,7 +12,8 @@ concurrency:
 jobs:
   ci:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    # the suite runs the real-shell oracle in a sandbox for every row (about 9-10 min); 20 leaves room without hiding a hang
+    timeout-minutes: 20
     env:
       WS_PII_DENYLIST: ${{ secrets.WS_PII_DENYLIST }}
       # fork pull requests get no secrets: the built-in rules still run, the denylist runs again on merge

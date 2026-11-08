@@ -198,8 +198,9 @@ def _hook(runner: str, payload: dict, policy_file: Path, home: Path, env) -> int
     """The exit code of the real hook entry for one payload."""
     child = {k: env[k] for k in ("PATH", "HOME", "LANG") if k in env}
     child["WS_HOME"] = str(home)
+    pin = paths.pin_of(child)
     p = subprocess.run(  # the same isolated command the generated hook uses, from a folder that has no ws/ of its own
-        [*selfcmd.argv(), "gate", "check", "--runner", runner, "--policy", str(policy_file)],
+        [*selfcmd.argv(), "gate", "check", "--runner", runner, "--policy", str(policy_file), *pin.args()],
         input=json.dumps(payload), env=child, capture_output=True, text=True, timeout=30, check=False,
     )  # fmt: skip
     return p.returncode
@@ -227,7 +228,7 @@ def check_hook_config(adapter, work: Path) -> tuple[str, str]:
     policy_file = work / "policy.toml"
     policy_file.write_text(policy.default_toml(), encoding="utf-8")
     try:
-        files = adapter.generate(policy.loads(policy.default_toml()), ["ws"], work / "gate", policy_file)
+        files = adapter.generate(policy.loads(policy.default_toml()), selfcmd.argv(), work / "gate", policy_file)
         parsed = {name: json.loads(text) for name, text in files.items() if name.endswith(".json")}
     except (policy.PolicyError, ValueError, KeyError, TypeError) as e:
         return FAIL, f"the generated config does not parse ({type(e).__name__})"

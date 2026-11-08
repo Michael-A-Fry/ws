@@ -34,7 +34,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from ws import adapters, approvals, guards, output, paths, policy, sandbox, shellwords
+from ws import adapters, approvals, guards, output, paths, policy, sandbox, selfcmd, shellwords
 
 if TYPE_CHECKING:
     from ws import gatecorpus
@@ -212,6 +212,35 @@ def _policy_arg(args: argparse.Namespace) -> Path | None:
     return Path(args.policy).expanduser().absolute() if args.policy else None
 
 
+def _load_policy(args: argparse.Namespace) -> tuple[Path, policy.Policy]:
+    """The policy file and the policy in it. A file that was named (`--policy`, which every generated hook carries) must
+    be there and load: if it is missing or unreadable that is an error (`policy_missing`), never the default policy.
+    The default applies only when no file was named at all."""
+    named = _policy_arg(args)
+    policy_file = named or policy.policy_path()
+    try:
+        return policy_file, policy.load(policy_file, required=named is not None)
+    except policy.PolicyError as e:
+        raise WsError(
+            "policy_missing" if named is not None and not policy_file.is_file() else "bad_config",
+            str(e),
+            "run `ws install` to write the policy and the hooks again",
+        ) from e
+
+
+def _pinned(args: argparse.Namespace):
+    """A hook runs on the layout `ws install` pinned in its command, and on no other: the environment is the session's
+    (a project's settings can set WS_HOME or an XDG variable), so it must resolve to the same folders or the call is
+    refused. Inside the block the whole process answers with the pinned layout (see ws.paths.pinned_by)."""
+    return paths.pinned_by(args.pin)
+
+
+def _reason_of(e: BaseException) -> str:
+    if isinstance(e, WsError):
+        return f"{e.message}; {e.hint}" if e.hint else e.message
+    return f"could not check this call ({type(e).__name__}: {e}); blocked to be safe"
+
+
 def _protect(policy_file: Path, extra: list[str] | None = None) -> tuple[str, ...]:
     """ws's own files: the policy it reads, the control files beside it, every folder ws keeps its files in (in each layout
     it could use) and what generate wrote (--protect)."""
@@ -227,18 +256,19 @@ def _protect(policy_file: Path, extra: list[str] | None = None) -> tuple[str, ..
 def cmd_check(args: argparse.Namespace) -> int:
     notes: list[str] = []
     try:
-        policy_file = _policy_arg(args) or policy.policy_path()
-        reason = check(
-            args.runner,
-            sys.stdin.read(),
-            policy.load(policy_file),
-            _protect(policy_file, args.protect),
-            approvals.approvals_dir(),  # ws's state folder, whatever --policy says: ws approve and ws gate launch use it too
-            consume=approvals.FD_ENV not in os.environ,
-            notes=notes,
-        )
+        with _pinned(args):
+            policy_file, pol = _load_policy(args)
+            reason = check(
+                args.runner,
+                sys.stdin.read(),
+                pol,
+                _protect(policy_file, args.protect),
+                approvals.approvals_dir(),  # ws's state folder, whatever --policy says: ws approve and ws gate launch use it too
+                consume=approvals.FD_ENV not in os.environ,
+                notes=notes,
+            )
     except BaseException as e:  # noqa: BLE001 - fail closed on anything, including a broken policy file
-        reason = f"could not check this call ({type(e).__name__}: {e}); blocked to be safe"
+        reason = _reason_of(e)
     for note in notes:
         print(f"ws gate: {note}", file=sys.stderr)
     if reason is None:
@@ -252,8 +282,11 @@ def cmd_check(args: argparse.Namespace) -> int:
 
 def cmd_event(args: argparse.Namespace) -> int:
     try:
-        policy_file = _policy_arg(args) or policy.policy_path()
-        code, out, err = event(args.runner, sys.stdin.read(), policy.load(policy_file))
+        with _pinned(args):
+            _, pol = _load_policy(args)
+            code, out, err = event(args.runner, sys.stdin.read(), pol)
+    except WsError as e:  # advice only: ws's folders or its policy are not as installed, so the guards do not run
+        code, out, err = 0, "", f"ws gate event: skipped ({_reason_of(e)})\n"
     except Exception as e:  # noqa: BLE001 - advice only: a crash here never blocks the session
         code, out, err = 0, "", f"ws gate event: skipped ({type(e).__name__}: {e})\n"
     if out:
@@ -355,7 +388,7 @@ def replay_corpus(runner: str, rows: list[gatecorpus.Row], policy_file: Path | N
         cwd.mkdir()
         with _scratch_home(home):
             try:
-                pol = policy.load(policy_file) if policy_file else policy.default_policy()
+                pol = policy.load(policy_file, required=True) if policy_file else policy.default_policy()
             except policy.PolicyError as e:
                 raise WsError("bad_config", str(e), f"fix {policy_file}, or write the default policy") from e
             protect = _protect(policy_file or paths.config_dir() / "policy.toml")
@@ -404,7 +437,7 @@ def cmd_replay(args: argparse.Namespace) -> int:
         raise WsError("bad_input", "give one file of payloads", "several files are for a corpus (rows with an id)")
     policy_file = _policy_arg(args) or policy.policy_path()
     try:
-        pol = policy.load(policy_file)
+        pol = policy.load(policy_file, required=args.policy is not None)
     except policy.PolicyError as e:
         raise WsError("bad_config", str(e), f"fix {policy_file}, or `ws gate init`") from e
     results = replay(args.runner, _read_lines(files[0]), pol, _protect(policy_file))
@@ -505,7 +538,7 @@ def cmd_generate(args: argparse.Namespace) -> int:
             raise WsError("refused", f"{out} is a runner's own config folder", "generate into a separate folder")
     policy_file = _policy_arg(args) or policy.policy_path()
     try:
-        pol = policy.load(policy_file)
+        pol = policy.load(policy_file, required=args.policy is not None)
         adapter = adapters.get(args.runner)
         files = adapter.generate(pol, shlex.split(args.ws_cmd), out, policy_file.resolve())
     except (policy.PolicyError, KeyError, ValueError) as e:
@@ -558,11 +591,17 @@ def register(sub) -> None:
     gen = gs.add_parser("generate", help="write a runner's native deny rules and hook into a folder")
     common(gen)
     gen.add_argument("--out", required=True, metavar="DIR", help="folder to write (never a runner's own config)")
-    gen.add_argument("--ws-cmd", default="ws", metavar="CMD", help="how the hook runs ws (default: ws)")
+    gen.add_argument(
+        "--ws-cmd",
+        default=shlex.join(selfcmd.argv()),
+        metavar="CMD",
+        help="how the hook runs ws (default: this Python, isolated, -m ws)",
+    )
     gen.set_defaults(func=cmd_generate)
 
     c = gs.add_parser("check", help="hook entry: payload on stdin; exit 0 allow, 2 deny")
     common(c)
+    paths.add_pin_option(c)
     c.add_argument(
         "--protect", action="append", metavar="PATH", help="a file or folder of ws's own that a session may not write"
     )
@@ -572,6 +611,7 @@ def register(sub) -> None:
         "event", help="hook entry: payload on stdin for the guards' other events (after a call, start, stop)"
     )
     common(e)
+    paths.add_pin_option(e)
     e.set_defaults(func=cmd_event, raw=True)  # a hook: the runner reads this command's own stdout, stderr and exit code
 
     r = gs.add_parser("replay", help="run recorded hook payloads against the policy and print allow, deny or ask")

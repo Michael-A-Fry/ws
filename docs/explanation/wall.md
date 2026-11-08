@@ -44,6 +44,19 @@ After every walled run, the launcher compares the project with how it was and re
 new or changed git folder, runner config, program loaded on its own in a virtual environment or `node_modules`. It reports
 and deletes nothing. The report goes to standard error and to `~/.local/state/ws/logs/wall-report.jsonl`.
 
+In Claude Code the wall is on by default. `ws install` merges Claude Code's own `sandbox` settings into your
+`settings.json` (the same block `ws gate launch` uses), and that block is the wall for shell commands: the `deny_read`
+paths read as empty and ws's files refuse a write, for every program a command starts. The gate reads the same text
+whether or not the wall is up, and nothing it refuses is allowed because a wall exists: allow-with-log isn't in 0.1.8.
+[`sandbox = false`](../reference/policy.md#gate) under `[gate]` leaves the block out, and the session is then unsandboxed.
+
+Claude Code merges its settings from every file it reads, so another setting can open the block again: `sandbox.enabled`
+set to false, an `excludedCommands` entry, `allowUnsandboxedCommands`, or an `allowRead` or `allowWrite` entry over a
+path the wall holds. `ws install` refuses, naming each setting and its file, unless you keep them on purpose with
+`ws install --allow-widened-sandbox`. ws then records the choice, and `ws doctor` (WS012) reports "wall widened by user"
+for as long as one is there. Settings that ws can't see (a `--settings` flag, a managed policy outside the files
+`ws doctor` reads) can widen the wall too. Doctor reports what it can read.
+
 The wall fails closed. With no bubblewrap, or with unprivileged user namespaces switched off, `ws gate launch` refuses and
 prints the install line. `--no-sandbox` starts the runner bare and says what that gives up, so skipping the wall is a
 visible choice.

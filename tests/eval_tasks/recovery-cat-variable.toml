@@ -1,0 +1,19 @@
+id = "recovery-cat-variable"
+family = "coding"
+kind = "regression"
+prompt = 'The shell variable REPORT is meant to hold the name of the report file, which is report.txt, but it is not set. Read the report with a shell command and write answer.json as {"total": <number>} where the number is the sum of the numbers in report.txt.'
+trials = 5
+timeout_s = 300
+
+[setup.files]
+"report.txt" = '''
+4
+11
+25
+'''
+
+[[grader]]
+type = "json_path_equals"
+path = "answer.json"
+json_path = "total"
+equals = 40

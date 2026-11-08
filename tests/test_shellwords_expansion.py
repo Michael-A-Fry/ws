@@ -16,7 +16,7 @@ import time
 
 import pytest
 
-from ws import cli, policy
+from ws import cli, paths, policy
 from ws import shellwords as sw
 
 
@@ -52,7 +52,7 @@ def hook(monkeypatch, capsys, cmd: str) -> tuple[int, str]:
     """(exit code, what it said on stderr) of `ws gate check --runner claude-code` for a Bash call."""
     payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": cmd}, "hook_event_name": "PreToolUse"})
     monkeypatch.setattr(sys, "stdin", io.StringIO(payload))
-    code = cli.main(["gate", "check", "--runner", "claude-code"])
+    code = cli.main(["gate", "check", "--runner", "claude-code", *paths.pin_of().args()])
     return code, capsys.readouterr().err
 
 
@@ -264,12 +264,20 @@ def test_a_default_or_alternative_is_expanded_as_bash_does(box, word):
 def test_a_path_in_a_default_or_alternative_is_refused_through_the_hook(box, monkeypatch, capsys, form):
     assert refused(monkeypatch, capsys, f"cat {form}/.ssh/id_rsa"), form
     assert refused(monkeypatch, capsys, f"cat {form}/.ssh/id_rsa > /dev/null"), form
-    assert not refused(monkeypatch, capsys, f"cat {form}/proj/a.txt"), form
+    # a name the line does not set may be set outside it, so any value is possible; HOME is known
+    assert refused(monkeypatch, capsys, f"cat {form}/proj/a.txt") is ("NOPE" in form), form
 
 
 def test_a_default_with_nothing_to_do_with_a_path_is_allowed(box, monkeypatch, capsys):
-    assert hook(monkeypatch, capsys, "cat ${NOPE:-work}/a.txt")[0] == 0
     assert hook(monkeypatch, capsys, "echo ${NOPE:-}")[0] == 0
+    assert hook(monkeypatch, capsys, "echo ${NOPE:-work}")[0] == 0
+
+
+def test_a_default_on_a_name_the_line_does_not_set_may_still_be_set_outside(box, monkeypatch, capsys):
+    """The shell's own environment may hold `NOPE`, so `${NOPE:-work}` is not `work` for a command that reads files."""
+    code, err = hook(monkeypatch, capsys, "cat ${NOPE:-work}/a.txt")
+    assert code == 2 and "set the variable on its own first" in err
+    assert hook(monkeypatch, capsys, "NOPE=work; cat ${NOPE:-other}/a.txt")[0] == 0
 
 
 @needs_bash

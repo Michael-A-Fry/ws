@@ -40,8 +40,19 @@ jobs:
         with:
           version: "0.13.1"
           enable-cache: true
+      # The gate oracle (tests/test_gate_oracle.py) runs a real bash in a bubblewrap sandbox: Linux cells install it, lift
+      # the AppArmor restriction on unprivileged user namespaces (this throwaway runner only) and require the oracle.
+      - name: bubblewrap for the gate oracle
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          bwrap --version
       - name: tests
-        run: uv run --locked pytest -q
+        env:
+          WS_ORACLE_REQUIRE: ${{ runner.os == 'Linux' && '1' || '' }} # the oracle can't start a sandbox = a failure, not a skip
+        run: uv run --locked pytest -q -rs
       # bash 3.2 on macOS and bash 5 on Linux both have to read it; --dry-run changes nothing on the runner
       - name: install.sh --help and --dry-run
         run: |
@@ -262,7 +273,9 @@ jobs:
           export PATH="$HOME/.local/bin:$PATH"
           # copy off the Windows drive: a venv on /mnt is slow and loses Unix permissions
           rm -rf "$HOME/ws" && cp -r . "$HOME/ws" && cd "$HOME/ws"
-          uv run --locked pytest -q
+          # the gate oracle needs unprivileged user namespaces; bubblewrap is in the packages above
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          WS_ORACLE_REQUIRE=1 uv run --locked pytest -q -rs
           export WS_HOME="$HOME/wshome"
           set +e; uv run --locked ws doctor --json > /tmp/doctor.json; code=$?; set -e
           uv run --locked python scripts/check_fresh_doctor.py /tmp/doctor.json "$code"

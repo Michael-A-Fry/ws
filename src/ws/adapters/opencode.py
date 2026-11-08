@@ -26,7 +26,7 @@ import re
 import shlex
 from pathlib import Path
 
-from ws import guards, jobs
+from ws import guards, jobs, paths
 from ws.adapters import Call, check_argv, protected_paths
 from ws.adapters.opencode_plugin import SOURCE
 from ws.policy import Policy, native_patterns
@@ -115,7 +115,13 @@ def _protect_forms(path: str, is_out: bool) -> list[str]:
 
 
 def generate(
-    policy: Policy, ws_cmd: list[str], out: Path, policy_file: Path, *, protect: tuple[str, ...] = ()
+    policy: Policy,
+    ws_cmd: list[str],
+    out: Path,
+    policy_file: Path,
+    *,
+    protect: tuple[str, ...] = (),
+    pin: paths.Pin | None = None,
 ) -> dict[str, str]:
     protect = tuple(protect)
     # Last matching rule wins, so the catch-all comes first.
@@ -132,8 +138,9 @@ def generate(
     for t in policy.gate.deny_tools:
         permission[_TOOLS[t]] = "deny"
     config = {"$schema": "https://opencode.ai/config.json", "permission": permission}
-    plugin = SOURCE.replace("/*__CHECK__*/ []", json.dumps(check_argv(ws_cmd, NAME, policy_file, out, protect)))
-    plugin = plugin.replace("/*__WS__*/ []", json.dumps(ws_cmd))
+    pin = pin or paths.pin_of()
+    plugin = SOURCE.replace("/*__CHECK__*/ []", json.dumps(check_argv(ws_cmd, NAME, policy_file, out, protect, pin)))
+    plugin = plugin.replace("/*__WS__*/ []", json.dumps(ws_cmd)).replace("/*__PIN__*/ []", json.dumps(pin.args()))
     return {CONFIG: json.dumps(config, indent=2) + "\n", PLUGIN: plugin, IGNORE: IGNORE_TEXT}
 
 

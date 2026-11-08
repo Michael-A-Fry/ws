@@ -53,9 +53,18 @@ session going: those hooks add context and findings, and the session carries on 
 
 Notification and Stop also run `ws notify alert --runner claude-code || true`, the phone alert.
 
-`env` also carries WS_SANDBOXED=1, which tells the hook this session has the sandbox block above. `preflight` runs for
-every session except one whose settings set WS_SANDBOXED=0, the marker of a settings file written without the sandbox
-block; settings written before the marker existed carry the block and no marker, so `preflight` runs for them.
+The block is on by default, in the settings `ws gate launch` passes and in the ones `ws install` merges into the user's
+own file (ws.userconfig): the policy's `[gate] sandbox = false` is the one switch that leaves it out. `env` then carries
+WS_SANDBOXED=0; otherwise `env` carries WS_SANDBOXED=1, which tells the hook this session has the sandbox block above.
+No hook command turns a refusal into an allow: the sandbox block is the wall for shell commands, and the gate reads the
+same text whether or not it is up.
+`preflight` runs for every session except one whose settings set WS_SANDBOXED=0, the marker of a settings file written
+without the sandbox block; settings written before the marker existed carry the block and no marker, so `preflight` runs
+for them. The
+marker can be trusted where it matters: the file `ws gate launch` passes with `--settings` outranks a project's settings,
+so a project cannot set it back. Every hook command carries `--pin`: the home folder and ws's four folders as `ws install`
+resolved them (see ws.paths). The environment, unlike the command, is the project's to set, so the hook uses the pinned
+folders and refuses when its environment points them elsewhere.
 
 Pass the file with `claude --settings OUT/settings.json`. Nothing in this module writes ~/.claude: `ws install` merges
 the hooks, deny rules and env of this file into the user's own `settings.json` when the profile says
@@ -75,7 +84,7 @@ import re
 import shlex
 from pathlib import Path
 
-from ws import guards, jobs
+from ws import guards, jobs, paths
 from ws.adapters import Call, check_argv, event_argv, protected_paths
 from ws.approvals import ENV_MARKER, SANDBOX_MARKER, ApprovalError
 from ws.approvals import _read_regular as read_regular
@@ -128,21 +137,22 @@ GLOBALS = {
 }
 
 
-def session_hooks(ws_cmd: list[str]) -> dict:
+def session_hooks(ws_cmd: list[str], pin: paths.Pin) -> dict:
     """SessionStart records the release; UserPromptSubmit prints the one-line nudge (its stdout reaches the model).
     `|| true`: this is advice, and an exit 2 from UserPromptSubmit would block the user's prompt."""
     base = shlex.join(ws_cmd)
+    where = shlex.join(pin.args())
 
     def hook(sub: str) -> list[dict]:
-        cmd = f"{base} session {sub} --runner {NAME} || true"
+        cmd = f"{base} session {sub} --runner {NAME} {where} || true"
         return [{"hooks": [{"type": "command", "command": cmd, "timeout": 5}]}]
 
     return {"SessionStart": hook("start"), "UserPromptSubmit": hook("nudge")}
 
 
-def alert_hook(ws_cmd: list[str]) -> dict:
+def alert_hook(ws_cmd: list[str], pin: paths.Pin) -> dict:
     """The phone alert: `ws notify alert` reads the hook payload and always exits 0; `|| true` keeps it advice."""
-    cmd = f"{shlex.join(ws_cmd)} notify alert --runner {NAME} || true"
+    cmd = f"{shlex.join(ws_cmd)} notify alert --runner {NAME} {shlex.join(pin.args())} || true"
     return {"type": "command", "command": cmd, "timeout": 5}
 
 
@@ -154,13 +164,13 @@ def _matcher(kinds: set[str], base: tuple[str, ...] = ()) -> str:
     return "|".join(tools)
 
 
-def _event_hook(ws_cmd: list[str], policy_file: Path, *, may_block: bool = False) -> dict:
+def _event_hook(ws_cmd: list[str], policy_file: Path, pin: paths.Pin, *, may_block: bool = False) -> dict:
     """A `ws gate event` hook. It ends `|| true` unless it may block (PostToolUse, whose exit 2 reaches the model)."""
-    cmd = shlex.join(event_argv(ws_cmd, NAME, policy_file)) + ("" if may_block else " || true")
+    cmd = shlex.join(event_argv(ws_cmd, NAME, policy_file, pin)) + ("" if may_block else " || true")
     return {"type": "command", "command": cmd, "timeout": HOOK_TIMEOUT}
 
 
-def guard_hooks(policy: Policy, ws_cmd: list[str], policy_file: Path) -> dict:
+def guard_hooks(policy: Policy, ws_cmd: list[str], policy_file: Path, pin: paths.Pin) -> dict:
     """The hooks beyond the PreToolUse check and the session hooks: `ws gate event` for each event a guard that is on
     runs at (PostToolUse, Stop, SubagentStop). Returns {event name: [matcher groups]} to merge with the session hooks."""
     on = policy.guards.on
@@ -168,11 +178,11 @@ def guard_hooks(policy: Policy, ws_cmd: list[str], policy_file: Path) -> dict:
     post = guards.kinds_for(on, "post")
     if post:
         hooks["PostToolUse"] = [
-            {"matcher": _matcher(post), "hooks": [_event_hook(ws_cmd, policy_file, may_block=True)]}
+            {"matcher": _matcher(post), "hooks": [_event_hook(ws_cmd, policy_file, pin, may_block=True)]}
         ]
     for name, ev in (("Stop", "stop"), ("SubagentStop", "subagent-stop")):
         if guards.wanted(on, ev):
-            hooks[name] = [{"hooks": [_event_hook(ws_cmd, policy_file)]}]
+            hooks[name] = [{"hooks": [_event_hook(ws_cmd, policy_file, pin)]}]
     return hooks
 
 
@@ -205,20 +215,25 @@ def preflight(payload: dict) -> str | None:
     """A reason to deny every call from this project: a `.claude/settings.json` or `settings.local.json`, in the project
     folder or any folder above it, that turns the sandbox off or opens it up (see the module docstring). The project
     folder is CLAUDE_PROJECT_DIR (set for hooks; Claude reads project settings from there, wherever the session has since
-    changed to), else the payload's cwd. A file that does not parse is ignored, as Claude Code ignores it. A settings
+    changed to) and the payload's cwd. A file that does not parse is ignored, as Claude Code ignores it. A settings
     file that is not a plain file (a link, a FIFO), is too big or cannot be read is a deny: it is read without following a
     link and without blocking, because a hook that hangs fails open (only exit 2 blocks). It is skipped only when the
     settings `env` says WS_SANDBOXED=0 (the marker of settings written without the sandbox block); settings written
-    before the marker existed have the block and no marker, so it runs for them."""
+    before the marker existed have the block and no marker, so it runs for them. Both folders are checked, so one
+    (CLAUDE_PROJECT_DIR is a variable a project's settings could set) cannot hide the other."""
     if os.environ.get(SANDBOX_MARKER) == "0":
         return None
-    project = os.environ.get("CLAUDE_PROJECT_DIR") or payload.get("cwd")
-    if not isinstance(project, str) or not project.startswith("/"):
-        return None
-    home = Path(os.environ.get("HOME") or Path.home())
-    for d in [Path(project), *Path(project).parents]:
-        if d == home:  # ~/.claude/settings.json is the person's own (user scope), not a project's
+    starts = [
+        p
+        for p in (os.environ.get("CLAUDE_PROJECT_DIR"), payload.get("cwd"))
+        if isinstance(p, str) and p.startswith("/")
+    ]
+    home = paths.home_dir()
+    seen: set[Path] = set()
+    for d in [x for start in starts for x in (Path(start), *Path(start).parents)]:
+        if d == home or d in seen:  # ~/.claude/settings.json is the person's own (user scope), not a project's
             continue
+        seen.add(d)
         for name in ("settings.json", "settings.local.json"):
             f = d / ".claude" / name
             if not os.path.lexists(f):
@@ -264,7 +279,9 @@ def for_project(settings: str, project: str) -> str:
     from ws import sandbox  # here, not at the top: ws.sandbox imports the adapters
 
     conf = json.loads(settings)
-    fs = conf.setdefault("sandbox", {}).setdefault("filesystem", {})
+    if "sandbox" not in conf:  # the policy switched the sandbox off: there is no block to add the project's paths to
+        return json.dumps(conf, indent=2) + "\n"
+    fs = conf["sandbox"].setdefault("filesystem", {})
     fs["denyWrite"] = list(dict.fromkeys([*fs.get("denyWrite", []), *sandbox.claude_denied_paths(project)]))
     return json.dumps(conf, indent=2) + "\n"
 
@@ -277,6 +294,7 @@ def generate(
     *,
     protect: tuple[str, ...] = (),
     user_scope: bool = False,
+    pin: paths.Pin | None = None,
 ) -> dict[str, str]:
     protect = tuple(protect)
     deny = [f"Bash({p})" for p in native_patterns(policy)]
@@ -294,22 +312,25 @@ def generate(
                 f"Edit(**/{rel}/**)",
             ]  # at any depth: a runner started in a sub-folder reads that one
     deny += [_TOOLS[t] for t in policy.gate.deny_tools]
-    hook = shlex.join(check_argv(ws_cmd, NAME, policy_file, out, protect)) + " || exit 2"
+    pin = pin or paths.pin_of()
+    wall = policy.gate.sandbox
+    hook = shlex.join(check_argv(ws_cmd, NAME, policy_file, out, protect, pin)) + " || exit 2"
     matcher = _matcher(guards.kinds_for(policy.guards.on, "pre") & set(_EXTRA_PRE_KINDS), tuple(MATCHER.split("|")))
     settings = {
         "permissions": {"deny": list(dict.fromkeys(deny))},
-        "sandbox": sandbox_block(policy, out, policy_file, protect),
-        "env": {ENV_MARKER: "1", SANDBOX_MARKER: "1"},
+        # `sandbox = false` in the policy: no block, and the marker says so (the hook then skips the preflight)
+        **({"sandbox": sandbox_block(policy, out, policy_file, protect)} if wall else {}),
+        "env": {ENV_MARKER: "1", SANDBOX_MARKER: "1" if wall else "0"},
         "hooks": {"PreToolUse": [{"matcher": matcher, "hooks": [{"type": "command", "command": hook}]}]},
     }
-    settings["hooks"].update(session_hooks(ws_cmd))
+    settings["hooks"].update(session_hooks(ws_cmd, pin))
     for name, ev in (("SessionStart", "start"), ("UserPromptSubmit", "prompt")):
         if guards.wanted(policy.guards.on, ev):
-            settings["hooks"][name][0]["hooks"].append(_event_hook(ws_cmd, policy_file))
-    for name, groups in guard_hooks(policy, ws_cmd, policy_file).items():
+            settings["hooks"][name][0]["hooks"].append(_event_hook(ws_cmd, policy_file, pin))
+    for name, groups in guard_hooks(policy, ws_cmd, policy_file, pin).items():
         settings["hooks"][name] = groups
-    settings["hooks"]["Notification"] = [{"hooks": [alert_hook(ws_cmd)]}]
-    settings["hooks"].setdefault("Stop", [{"hooks": []}])[0]["hooks"].append(alert_hook(ws_cmd))
+    settings["hooks"]["Notification"] = [{"hooks": [alert_hook(ws_cmd, pin)]}]
+    settings["hooks"].setdefault("Stop", [{"hooks": []}])[0]["hooks"].append(alert_hook(ws_cmd, pin))
     return {FILE: json.dumps(settings, indent=2) + "\n"}
 
 

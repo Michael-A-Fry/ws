@@ -19,7 +19,9 @@ Known limits of the matcher. It reads command text, so it cannot see:
   * the version-control tool restoring a protected tracked file (`git -C ~/.config/ws checkout policy.toml`);
   * OpenCode's `patch` tool, which carries no single file path (its native `edit` rules still apply).
 These stay allowed by the matcher. What closes them is the sandbox (ws.sandbox, and the `sandbox` block the
-claude-code adapter writes), which acts on what a process does, not on what its command line says:
+claude-code adapter writes, on by default: `[gate] sandbox = false` leaves it out), which acts on what a process does,
+not on what its command line says. It is the boundary and this matcher is defence in depth; the matcher refuses the same
+lines whether or not a sandbox is up:
   * closed, for a shell command, the first four lines above: a write to ws's own files (its folders, the policy, the
     generated folder) fails read-only whatever program makes it, and a read under a deny_read rule finds an empty folder
     or file. The tested cases are in tests/e2e/test_sandbox.py, on both runners, Linux only (bubblewrap). macOS gets a
@@ -92,11 +94,12 @@ import posixpath
 import re
 import sys
 import tomllib
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
 
-from ws import paths, shellwords
+from ws import paths, shellwords, unknownpath
 
 SCHEMA = 1
 DIALS = ("prepare", "allowlist", "act")
@@ -140,6 +143,7 @@ class Gate:
     ask_commands: tuple[str, ...] = ()  # run only with a single-use approval from a human (ws.approvals)
     allow_hosts: tuple[str, ...] = ()  # empty = the policy says nothing about the network
     allow_write: tuple[str, ...] = ()  # folders besides the project a sandboxed session may write (`~/x` or `/x`)
+    sandbox: bool = True  # the runner's own sandbox is switched on in what ws writes (Claude Code); false = unsandboxed
 
 
 @dataclass(frozen=True)
@@ -267,6 +271,9 @@ allow_hosts = []
 # folders, which ws knows). Everything else is read-only inside the wall. Absolute or `~/`, no wildcards. Example:
 # ["~/.npm", "~/.cache/uv"].
 allow_write = []
+# The sandbox is the wall: on by default, it makes ws's own files read-only and hides the deny_read paths from every
+# program a shell command starts, in what ws writes for Claude Code. false = no sandbox block, and `ws doctor` says so.
+sandbox = true
 
 # Guards: small named checks that run beside the rules above. `ws gate generate` writes the runner hooks they need.
 #   syntax-check     after an edit, checks the file by its extension (.py, .json, .toml, .sh, .js) and tells the model the
@@ -438,7 +445,7 @@ def loads(text: str) -> Policy:
     g = _table(
         raw.get("gate", {}),
         "[gate]",
-        {"deny_commands", "deny_read", "deny_tools", "ask_commands", "allow_hosts", "allow_write"},
+        {"deny_commands", "deny_read", "deny_tools", "ask_commands", "allow_hosts", "allow_write", "sandbox"},
     )
     deny_read = _strings(g, "deny_read", "[gate] ")
     gate = Gate(
@@ -448,6 +455,7 @@ def loads(text: str) -> Policy:
         _strings(g, "ask_commands", "[gate] "),
         _strings(g, "allow_hosts", "[gate] "),
         _strings(g, "allow_write", "[gate] "),
+        _get(g, "sandbox", bool, "[gate] ", True),
     )
     for h in gate.allow_hosts:
         if not _HOST.match(h):
@@ -507,10 +515,13 @@ def default_policy() -> Policy:
     return loads(default_toml())
 
 
-def load(path: Path | None = None) -> Policy:
-    """The policy at `path` (default <config>/policy.toml). No file = the built-in defaults."""
+def load(path: Path | None = None, *, required: bool = False) -> Policy:
+    """The policy at `path` (default <config>/policy.toml). No file = the built-in defaults, unless `required`: a policy
+    that was named (a hook's `--policy`) and is not there is an error, never a quiet fall back to the defaults."""
     path = path or policy_path()
     if not path.is_file():
+        if required:
+            raise PolicyError(f"{path}: the policy file is missing or is not a plain file")
         return default_policy()
     try:
         text = path.read_text(encoding="utf-8")
@@ -577,7 +588,49 @@ def rule_of_two(policy: Policy, sources: list[str], job: str | None = None, shel
 # cannot judge it denies or leaves to the layers either side.
 
 _FLAGS = re.compile(r"^-[A-Za-z]+$")
-_SHELL_NAMES = {"sh", "bash", "zsh", "dash", "ksh", "fish", "ash", "csh", "tcsh"}
+_SHELL_NAMES = {
+    "sh",
+    "bash",
+    "zsh",
+    "dash",
+    "ksh",
+    "fish",
+    "ash",
+    "csh",
+    "tcsh",
+    "rbash",
+    "mksh",
+    "yash",
+    "posh",
+    "lksh",
+    "oksh",
+    "loksh",
+    "pdksh",
+    "hush",
+}
+# A here-document or here-string given to one of these is read as code: a shell runs it (any command whose name ends in
+# `sh`, and `ksh93`), `source` and `.` run it as a script, `eval` runs it as text, `ssh` hands it to the shell on the
+# other end, and `xargs` builds commands from it. The names are not a closed list, because shells keep being written.
+_UNKNOWN_VALUE = "${_WS_UNKNOWN}"  # what a variable holds when a command substitution set it: a part no one can read
+_STDIN_IS_CODE = frozenset({*_SHELL_NAMES, "source", ".", "eval", "ssh", "ksh93"})
+
+
+# A program name with its version or build in it is the same program: `bash5.2`, `zsh5`, `sh5`, `bash-static`,
+# `mksh-static`, `python3.12`, `node22`. `_stem` is the name without them (a word that doesn't look like that is its own).
+_VERSIONED = re.compile(r"([A-Za-z]+?)(?:[0-9][0-9.]*)?(?:-static)?")
+
+
+def _stem(word: str) -> str:
+    base = posixpath.basename(word)
+    found = _VERSIONED.fullmatch(base)
+    return found.group(1) if found else base
+
+
+def _reads_stdin_as_code(cmd: str) -> bool:
+    name = _stem(cmd)
+    return name in _STDIN_IS_CODE or name.endswith("sh")
+
+
 _GIT_ARG_OPTS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env"}
 # Commands whose operands are each judged on their own: `rm -rf / /tmp` is a delete of `/`.
 _OPERAND_CMDS = {"rm", "rmdir", "shred", "unlink", "chmod", "chown", "chgrp", "mv"}
@@ -619,22 +672,31 @@ class _Ctx:
     loops: dict[str, list[str]] | None = None  # a `for` variable and the words it takes in turn
     unknown: frozenset[str] = frozenset()  # names set more than once, appended to, or set inside a block
     distrust: bool = False  # a part of the line ran a command that can set any variable: trust no value after it
+    cwd_unknown: bool = False  # a `cd` went to a place the reader could not resolve: a relative path is anywhere
+    bodies_as_commands: bool = (
+        False  # here-document bodies are read as commands here; the other reading judges the rest
+    )
+    arith: bool = False  # the line holds arithmetic, which runs the command substitutions in the text it is given
 
     def fork(self) -> _Ctx:
         return _Ctx(
             self.cwd,
             self.protect,
             dict(self.vars or {}),
+            heredocs=self.heredocs,
             budget=self.budget,
             oldpwd=self.oldpwd,
             loops=self.loops,
             unknown=self.unknown,
             distrust=self.distrust,
+            cwd_unknown=self.cwd_unknown,
+            bodies_as_commands=self.bodies_as_commands,
+            arith=self.arith,
         )
 
 
 def _home() -> str:
-    return os.environ.get("HOME") or str(Path.home())
+    return paths.environ().get("HOME") or str(Path.home())
 
 
 def _cwd() -> str:
@@ -658,7 +720,8 @@ _WS_NAMES = ("WS_HOME", *paths.ENV_DIRS.values())
 
 def _env_key() -> tuple[str | None, ...]:
     """The variables the folders ws uses come from: the cache key for what is worked out from them."""
-    return tuple(os.environ.get(v) for v in _LAYOUT_VARS)
+    env = paths.environ()
+    return (*(env.get(v) for v in _LAYOUT_VARS), str(paths.tmp_dir()))
 
 
 @lru_cache(maxsize=8)
@@ -1043,8 +1106,9 @@ def _walk(policy: Policy, cmd: str, ctx: _Ctx, depth: int, cands: list[str]) -> 
     the reason at once for the checks that are not globs (pipe into a shell, denied paths, protected files)."""
     if depth > _MAX_DEPTH:
         raise shellwords.ShellError("too_deep", _TOO_DEEP)
-    pipelines, inner = shellwords.scan(shellwords.prep(cmd), heredocs=ctx.heredocs and depth == 0)
+    pipelines, inner = shellwords.scan(shellwords.prep(cmd), heredocs=ctx.heredocs)
     nested: list[str] = list(inner)
+    ctx.arith = ctx.arith or _ARITH_LINE.search(cmd) is not None
     for segs in pipelines:
         canon_segs = []
         for idx, seg in enumerate(segs):
@@ -1176,6 +1240,26 @@ def _mark_names(ctx: _Ctx, names: set[str]) -> None:
         ctx.loops = {k: v for k, v in ctx.loops.items() if k not in names}
 
 
+_STACK_ARG = re.compile(r"[+-][0-9]+")
+# Where arithmetic is done on text the line gives: it runs the command substitutions inside an array subscript, quoted or not.
+_ARITH_LINE = re.compile(r"\(\(|\[\[|(?<![\w-])let\s|\b(?:declare|typeset|local)\b[^\n;&|]*\s-\w*i")
+_ARITH_CMDS = frozenset(
+    [
+        "let",
+        "declare",
+        "typeset",
+        "local",
+        "readonly",
+        "export",
+        "read",
+        "unset",
+        "getopts",
+        "mapfile",
+        "readarray",
+        "wait",
+        "[[",
+    ]
+)
 _ENV_WRAPPERS = ("env", "sudo", "doas", "run0")
 _SETTERS = frozenset(["eval", "source", ".", "coproc"])  # run text or a file that can set any variable
 _TARGET_SETTERS = frozenset(["read", "mapfile", "readarray", "getopts", "let"])  # set the names they're given
@@ -1209,7 +1293,8 @@ def _targets(toks: list[str]) -> set[str]:
 
 def _distrust(ctx: _Ctx, folders: bool) -> None:
     """After a command that can set any variable, no value the reader holds is known; with `folders`, the home and
-    working folders aren't either (eval text can set them; a sourced file is trusted to leave them)."""
+    working folders aren't either (eval text and a sourced file can set them, and a sourced file is whatever the
+    project holds)."""
     gone = set(ctx.vars or {}) | set(ctx.loops or {}) | ({"HOME", "PWD", "OLDPWD", *_WS_NAMES} if folders else set())
     ctx.unknown = ctx.unknown | gone
     ctx.vars, ctx.loops, ctx.distrust = {}, {}, True
@@ -1219,19 +1304,25 @@ def _segment_once(
     policy: Policy, seg: str, ctx: _Ctx, in_pipe: bool, cands: list[str], loop_vars: dict[str, str]
 ) -> tuple[str | None, str, list[str]]:
     cands.append(" ".join(seg.split()))
-    env = shellwords.Unknown(
-        _env({**(ctx.vars or {}), **loop_vars}, ctx.cwd, ctx.oldpwd),
-        ctx.unknown - set(loop_vars),
-        ctx.distrust,
-        keep={"HOME", "PWD", "OLDPWD", *_WS_NAMES} - ctx.unknown,
-    )
+
+    def read_env(defaults_unread: bool) -> shellwords.Unknown:
+        return shellwords.Unknown(
+            _env({**(ctx.vars or {}), **loop_vars}, ctx.cwd, ctx.oldpwd),
+            ctx.unknown - set(loop_vars),
+            ctx.distrust,
+            keep={"HOME", "PWD", "OLDPWD", *_WS_NAMES} - ctx.unknown,  # after a command that sets anything but these
+            defaults_unread=defaults_unread,
+        )
+
+    env = read_env(False)  # a default is its word (`${A:-x}` is x), as the checks of named paths have always read it
+    env_u = read_env(True) if "${" in seg else None  # ...and left as written, for the part the reader cannot resolve
     lexed = shellwords.lex(seg, env, ctx.budget)
     words, redirs = lexed.words, lexed.redirs
     if not words and not redirs:
         return None, "", []
     _mark_unknown(ctx, seg, words)
     if words and all(shellwords.ASSIGN.match(w) for w in words):  # X=/ ; later $X
-        _assign(ctx, dict(w.split("=", 1) for w in words))
+        _assign(ctx, _settled(ctx, env, dict(w.split("=", 1) for w in words)))
     elif len(words) > 3 and words[0] == "for" and words[2] == "in":  # for i in a b; do ... $i
         listed = _loop_words(words[3:])
         ctx.loops = {**(ctx.loops or {}), words[1]: listed}
@@ -1243,11 +1334,14 @@ def _segment_once(
     if held:  # read X / let X=.. after X held a value: which value it has now isn't followed
         _mark_names(ctx, held)
     if toks and toks[0] in _DECLARERS:  # export X=/ ; declare -x X=/ ; local X=/
-        _assign(ctx, dict(w.split("=", 1) for w in toks[1:] if shellwords.ASSIGN.match(w)))
+        _assign(ctx, _settled(ctx, env, dict(w.split("=", 1) for w in toks[1:] if shellwords.ASSIGN.match(w))))
     elif toks and toks[0] == "read":  # read -r X <<< /
         _assign(ctx, _read_values(toks, redirs))
     if _sets_anything(toks, seg):
-        _distrust(ctx, folders=bool(toks) and toks[0] in ("eval", "coproc"))
+        # a sourced file or a printf -v can set the home and working folders as eval text can; in the reading that takes a
+        # here-document body for commands, a body line that starts with such a word is prose, and the other reading
+        # judges the real ones
+        _distrust(ctx, folders=not ctx.bodies_as_commands or toks[0] in ("eval", "coproc"))
     canon = _canon_tokens(toks)
     line = " ".join(canon)
     if line:
@@ -1255,24 +1349,52 @@ def _segment_once(
     cmd = canon[0] if canon else ""
     flags, operands = shellwords.split_args(canon)
 
-    if cmd in ("cd", "pushd"):
+    if cmd in ("popd", "dirs") or (cmd == "pushd" and (flags or not operands or _STACK_ARG.fullmatch(operands[0]))):
+        # the directory stack is not followed, so where these leave the shell is not known
+        ctx.cwd_unknown = True
+        _mark_names(ctx, {"PWD", "OLDPWD"})
+    elif cmd in ("cd", "pushd"):
         target = operands[0] if operands else "~"
-        if target != "-" or ctx.oldpwd:
-            ctx.oldpwd, ctx.cwd = ctx.cwd, _abs(ctx.oldpwd if target == "-" else target, ctx.cwd)
+        where = unknownpath.split(target, env, _producer(ctx, env))
+        unread = _unread_cd_target(ctx, seg, env_u) if env_u is not None else None
+        # a default on the target (`cd ${DIR:-.}`) may not be the place the shell goes to
+        unresolved = unread is not None and unknownpath.has_unknown(unknownpath.split(unread, env, _producer(ctx, env)))
+        if unknownpath.has_unknown(where) or unresolved or _cdpath_may_apply(ctx, "".join(where)):
+            # where it goes is not known: nor is a relative path
+            ctx.cwd_unknown = True
+            _mark_names(ctx, {"PWD", "OLDPWD"})
+        elif target != "-" or ctx.oldpwd:
+            ctx.oldpwd, ctx.cwd = ctx.cwd, _abs(ctx.oldpwd if target == "-" else "".join(where), ctx.cwd)
+            if ctx.cwd_unknown and target.startswith(("/", "~")):
+                ctx.cwd_unknown = False  # a full path says where it is
     admin = _ws_admin(canon)
     if admin:
         return admin, line, []
+    nested += _arith_scripts(ctx, cmd, flags, toks, words)
     if cmd == "eval":
         text = " ".join(toks[1:])
         fetched = re.match(r"\s*(?:\$\(|`)\s*(\S+)", text)
         if fetched and posixpath.basename(fetched.group(1)) in _FETCHERS:
             return "eval of text a network command fetches", line, []
         nested.append(text)
-    if cmd in _SHELL_NAMES:
+    if _stem(cmd) in _SHELL_NAMES:
         reason, more = _shell(toks, canon, flags, operands, redirs, in_pipe)
         if reason:
             return reason, line, []
         nested += more
+    if not ctx.bodies_as_commands and (started := _starts_a_shell(cmd, toks)):
+        why = (
+            f"`{cmd}` starts `{started}`, a shell, and ws cannot read what the shell runs; run `{started}` "
+            "on its own, or write the commands to a file with the Write tool and run the file"
+        )
+        return why, line, []
+    if any(op in ("<<", "<<-", "<<<") for op, _ in redirs) and (_reads_stdin_as_code(cmd) or "xargs" in wrappers):
+        raise shellwords.ShellError(
+            "stdin-is-code",
+            f"{'xargs' if 'xargs' in wrappers else cmd} runs the text of the "
+            "here-document or here-string it is given as code, and ws cannot tell what that is; write it to a file with "
+            "the Write tool and run the file",
+        )
     if (
         in_pipe
         and _INTERP.match(cmd)
@@ -1308,16 +1430,589 @@ def _segment_once(
     )
     if recursive and _searches_cwd(cmd, canon, operands):
         named.append(".")  # `cd ~ && grep -r x`: no path given means here
+    written = _written(cmd, flags, operands, redirs, canon, toks) if ctx.protect else []
+    if not ctx.bodies_as_commands:  # text read as a command only to keep a body from hiding one: not a word of the line
+        plain = _written(cmd, *shellwords.split_args(toks), redirs, toks, toks) if ctx.protect else []
+        reason = _unresolved_code(ctx, toks, env) or _unknown_refusal(
+            policy, ctx, cmd, toks, toks, redirs, _call_pieces(lexed, env), dropped, plain, env
+        )
+        if not reason and env_u is not None:  # the same line with each default left as written
+            reason = _unknown_unread(policy, ctx, seg, env_u)
+        if reason:
+            return reason, line, nested
     for p in named:
         rule = _read_hit(policy, p, ctx.cwd, recursive=recursive, expand=False)
         if rule:
             return f"command names a path denied by deny_read rule {rule!r}", line, nested
-    if ctx.protect:
-        for p, ancestors in _written(cmd, flags, operands, redirs, canon, toks):
-            hit = _under(ctx.protect, p, ctx.cwd, ancestors)
-            if hit:
-                return f"command writes to {hit}, which ws protects (policy and generated gate)", line, nested
+    for p, ancestors in written:
+        hit = _under(ctx.protect, p, ctx.cwd, ancestors)
+        if hit:
+            return f"command writes to {hit}, which ws protects (policy and generated gate)", line, nested
     return None, line, nested
+
+
+# --- a part of a path the reader cannot resolve ----------------------------------------------------------------------
+
+HOW_TO_SPELL = 'write the path out in full, or set the variable on its own first (F=notes/report.txt; cat "$F")'
+"""The one-line way out every refusal of an unresolved part carries."""
+
+
+def _names(text: str) -> frozenset[str]:
+    return frozenset(text.split())
+
+
+# The commands that never open the words they are given as files, so a word with a part the reader cannot resolve
+# (`echo $X`, `sleep $N`, `kill $PID`) is not read as a file name. This is the ONE list of exemptions; every other command
+# is read as one that may open any word it is given, however it is spelled (a program no list names included): the
+# list is of what is known to be safe, never of what is known to be dangerous. The value is the short flags (letters) and
+# long flags that make the command open a file after all, which end its exemption.
+_NO_FILE_CMDS: dict[str, tuple[str, tuple[str, ...]]] = {
+    # print or test: the words are text, numbers, names or metadata
+    "echo": ("", ()),
+    "printf": ("v", ()),
+    "true": ("", ()),
+    "false": ("", ()),
+    ":": ("", ()),
+    "test": ("", ()),
+    "[": ("", ()),
+    "[[": ("", ()),
+    "type": ("", ()),
+    "which": ("", ()),
+    "date": ("fr", ("--file", "--reference")),
+    "sleep": ("", ()),
+    "seq": ("", ()),
+    "expr": ("", ()),
+    "kill": ("", ()),
+    "wait": ("", ()),
+    # leave the shell, or set what the shell holds
+    "exit": ("", ()),
+    "return": ("", ()),
+    "shift": ("", ()),
+    "break": ("", ()),
+    "continue": ("", ()),
+    "unset": ("", ()),
+    "export": ("", ()),
+    "declare": ("", ()),
+    "typeset": ("", ()),
+    "local": ("", ()),
+    "readonly": ("", ()),
+    "let": ("", ()),
+    "eval": ("", ()),  # its words are shell text, which is read as a script of its own
+    "read": ("", ()),
+    "getopts": ("", ()),
+    # move the shell about (a `cd` to a place the reader cannot resolve makes relative paths unknown instead)
+    "cd": ("", ()),
+    "pushd": ("", ()),
+    "popd": ("", ()),
+    "pwd": ("", ()),
+    "dirs": ("", ()),
+    # the words of a loop or a case, which are values and not files (what the body does is read on its own)
+    "for": ("", ()),
+    "select": ("", ()),
+    "case": ("", ()),
+}
+_OPTION_TAKERS = frozenset({"date"})  # exempt commands with an option that opens a file: a bare unknown word may be it
+_ADDRESS_CMDS = frozenset(("curl", "wget", "sftp", "ftp", "ssh", "ping", "nc", "ncat", "telnet"))
+_PATTERN_FIRST = frozenset(
+    ("grep", "egrep", "fgrep", "rg", "ag", "ack", "sed", "awk", "gawk", "mawk", "nawk", "jq", "yq")
+)
+_VALUE_FLAGS = {  # short flags that take a number, a pattern or a delimiter, not a file
+    "head": "nc",
+    "tail": "nc",
+    "cut": "dfcb",
+    "sort": "kt",
+    "uniq": "fsw",
+    "fold": "w",
+    "grep": "eABCmdD",
+    "egrep": "eABCmdD",
+    "fgrep": "eABCmdD",
+    "rg": "eABCmgtTjM",
+    "ag": "ABCm",
+    "sed": "e",
+    "awk": "Fv",
+    "gawk": "Fv",
+    "mawk": "Fv",
+    "nawk": "Fv",
+    "split": "abCnl",
+    "truncate": "s",
+    "chmod": "",
+}
+_REDIRECT_FILES = frozenset(("<", ">", ">>", ">|", "&>", "&>>", "<>"))
+
+
+_HAS_PART = re.compile(r"[$`]")
+_FILE_FLAGS = {  # address commands: the options that name a file (their positional words are hosts or URLs)
+    "curl": ("TK", ("--upload-file", "--config")),
+    "wget": ("i", ("--input-file", "--post-file")),
+    "sftp": ("bF", ()),
+    "ssh": ("iF", ()),
+    "ftp": ("", ()),
+    "rclone": ("", ("--config", "--files-from", "--filter-from", "--include-from", "--exclude-from")),
+}
+
+
+# --- a command the reader doesn't know, given a shell -----------------------------------------------------------------
+#
+# `taskset 1 sh -c TEXT`, `fakeroot sh`, `chrt 1 bash -c TEXT`, `unshare -r sh`, `ssh-agent sh`, `busybox sh` and `toybox sh`
+# start a shell, and the reader, which looks only at the command a line runs, would take the shell's script for a word of
+# something else. The wrappers it knows (`nice`, `sudo`, `env`, `busybox` ...) are taken off first, so the shell they start
+# is the command that is read. For any other first word the rule is the allowlist's: a command the reader has no entry for,
+# given a word that is a shell, is refused. A word is judged by the name of its file with a version or `-static` taken off
+# (`bash5.2`, `/usr/bin/zsh5`, `mksh-static`, `sh5`), against the shell names the reader already has (`_SHELL_NAMES`; a
+# name that merely ends in `sh` is not enough here, as it is for a here-document, or `push` and `publish` would be shells).
+# Interpreters (`python3`, `node` ...) are not in this rule: run on their own they are a listed limit of the gate, so a
+# launcher that starts one (`uv run python`) goes no further than that.
+#
+# A command is KNOWN when the reader has an entry for it: it is a key of one of the tables above (the exempt commands, the
+# pattern-first and value-flag commands, the commands that remove, write or search, the address commands, the declarers,
+# setters and arithmetic commands), a shell or an interpreter (read on their own), or one of the few the reader names in
+# code (`git`, `find`, `ls`, `du`, `tree`) or that only print, list, show or check the text they are given (`_VIEWERS`).
+# The words of a known command are read as its table says, so a shell named among them is a file or a pattern (`grep
+# bash notes`, `ls /bin/sh`, `man bash`, `shellcheck -s bash x`, `which sh`, `git log -- foo.sh`).
+_VIEWERS = frozenset(
+    ("cat", "less", "more", "man", "file", "stat", "wc", "diff", "cmp", "dirname", "basename", "shellcheck", "shfmt")
+)
+_KNOWN_COMMANDS = frozenset(
+    {
+        *_NO_FILE_CMDS,
+        *_PATTERN_FIRST,
+        *_VALUE_FLAGS,
+        *_OPERAND_CMDS,
+        *_ALWAYS_RECURSIVE,
+        *_WRITE_ALL,
+        *_WRITE_LAST,
+        *_FILE_FLAGS,
+        *_ADDRESS_CMDS,
+        *_FETCHERS,
+        *_DECLARERS,
+        *_ARITH_CMDS,
+        *_SETTERS,
+        *_TARGET_SETTERS,
+        *_STDIN_IS_CODE,
+        *_VIEWERS,
+        "git",
+        "find",
+        "ls",
+        "du",
+        "tree",
+    }
+)
+
+
+def _starts_a_shell(cmd: str, toks: list[str]) -> str | None:
+    """The word of a command the reader doesn't know that is a shell, or None."""
+    if cmd in _KNOWN_COMMANDS or _stem(cmd) in _SHELL_NAMES or _INTERP.match(_stem(cmd)):
+        return None
+    for word in toks[1:]:
+        if _stem(word) in _SHELL_NAMES:
+            return word
+    return None
+
+
+def _opens_files(cmd: str, canon: list[str]) -> bool:
+    """Whether the words of this command are read as file names: every command except those `_NO_FILE_CMDS` lists, and
+    those only while none of their file-taking flags is given."""
+    exempt = _NO_FILE_CMDS.get(cmd)
+    if exempt is None:
+        return True
+    letters, longs = exempt
+    for t in canon[1:]:
+        if t.startswith("--"):
+            if shellwords.long_option(t.split("=", 1)[0], longs):
+                return True
+        elif t.startswith("-") and len(t) > 1 and any(c in letters for c in t[1:]):
+            return True
+    return False
+
+
+_PROGRAM_TEXT = {  # an interpreter's short flags whose value is the program, not a file
+    "python": "c",
+    "perl": "eE",
+    "ruby": "e",
+    "node": "e",
+    "php": "r",
+}
+
+
+def _value_letters(cmd: str) -> str:
+    interp = re.match(r"(python|perl|ruby|node|php)[0-9.]*$", cmd)
+    return _VALUE_FLAGS.get(cmd, "") + (_PROGRAM_TEXT[interp.group(1)] if interp else "")
+
+
+def _file_operands(cmd: str, canon: list[str]) -> tuple[list[str], list[str]]:
+    """The words of a file command that name files (not its flags, the values of the flags that take a number, a pattern
+    or a program, nor the search pattern or script a grep, sed or awk starts with) and the words set aside, which are
+    text: the places in them a program may read a path from (`a=b`, `<x`) are not files either."""
+    letters = _value_letters(cmd)
+    out: list[str] = []
+    text: list[str] = []
+    ended, skip, has_pattern_flag = False, False, False
+    for t in canon[1:]:
+        if skip:
+            skip = False
+            text.append(t)
+            continue
+        if not ended and t == "--":
+            ended = True
+        elif not ended and t.startswith("-") and len(t) > 1:
+            if t.startswith("--"):
+                has_pattern_flag |= t.split("=")[0] in ("--regexp", "--file", "--expression")
+            elif t[-1] in letters:
+                skip = True
+            has_pattern_flag |= not t.startswith("--") and any(c in t[1:] for c in "ef")
+        else:
+            out.append(t)
+    if cmd in _PATTERN_FIRST and not has_pattern_flag and out:
+        text.append(out[0])
+        out = out[1:]
+    return out, text
+
+
+def _deny_alts(policy: Policy) -> list[tuple[str, tuple]]:
+    """Each deny_read rule with the patterns a path under it can be written as: the rule's glob (a bare name matches at
+    any depth), and the folder the rule is about."""
+    out = []
+    for rule in policy.gate.deny_read:
+        glob = _expand(rule)
+        if not glob.startswith("/"):
+            glob = "**/" + glob.removeprefix("./")
+        alts = unknownpath.tokens(glob)
+        root = _rule_root(rule)
+        if root:
+            alts = (*alts, *unknownpath.literal(root))
+        out.append((rule, alts))
+    return out
+
+
+def _produced_hit(policy: Policy, ctx: _Ctx, text: str, word: str, how: str, written) -> str | None:
+    """A refusal for a word whose command substitutions all printed something known (see `_produced`), when the path
+    it spells is one the policy denies to read or ws protects: the same checks a path written out in full gets."""
+    rule = _read_hit(policy, text, ctx.cwd, recursive=False, expand=False)
+    if rule:
+        return f"command names {word!r}, which is {text}, a path denied by deny_read rule {rule!r}"
+    for p, ancestors in written:
+        if p == word and (hit := _under(ctx.protect, text, ctx.cwd, ancestors)):
+            return f"command writes {word!r}, which is {text}, and that is inside {hit}, which ws protects"
+    return None
+
+
+def _pattern_of(word: str, ctx: _Ctx, known, prod=None) -> list | None:
+    """The word as a pattern with None for what is not known (a glob character counts: it matches anything), absolute;
+    None when it holds nothing unresolved and the folder it is relative to is known."""
+    if word == "~" or word.startswith("~/"):  # the reader writes a path under the home folder as ~/...
+        word = _home().rstrip("/") + word[1:]
+    items = unknownpath.split(word, known, prod)
+    relative = bool(items) and items[0] not in ("/", None)
+    if not unknownpath.has_unknown(items) and not (ctx.cwd_unknown and relative):
+        return None
+    items = unknownpath.unconfined(unknownpath.anchor(items, ctx.cwd, not ctx.cwd_unknown))
+    return [None if c in ("*", "?", "[") else c for c in items]
+
+
+def _protect_hit(items: list, protect: tuple[str, ...], cwd: str, ancestors: bool) -> str | None:
+    for q in protect:
+        qa = _abs(q, cwd)
+        alts = (*unknownpath.literal(qa), *(tuple(("c", c) for c in qa) + (("c", "/"), ("**", "")),))
+        if unknownpath.reaches(items, alts, CASELESS_PATHS):
+            return q
+        if ancestors:
+            cut = [k for k, c in enumerate(qa) if c == "/" and k]
+            if any(unknownpath.reaches(items, unknownpath.literal(qa[:k]), CASELESS_PATHS) for k in cut):
+                return q
+    return None
+
+
+def _unknown_refusal(
+    policy: Policy, ctx: _Ctx, cmd: str, canon, toks, redirs, pieces, dropped, written, env
+) -> str | None:
+    """A refusal for a path word whose value the reader cannot know, when the word could be a path ws protects.
+
+    An allow-list reading: the unresolved part (an unknown variable, a command substitution) stands for any string, and
+    a word that some such string makes a protected path is refused, whatever the shell would really put there. It
+    applies to the commands that read or write the files they are given, and to every redirect target. A word that is
+    only the unresolved part (`cat $X`) is refused for those commands too: it names any file there is. `canon` is the
+    command's words as the reader found them: not tidied, because `..` after an unresolved part cannot be taken out."""
+    known = frozenset(env)
+    operands, aside = _file_operands(cmd, canon)
+    text = {p for w in aside for p in shellwords.pieces_of(w, env)}
+    pieces = [p for p in pieces if p not in text]
+    is_file = _opens_files(cmd, canon) or (
+        # a whole word the reader cannot resolve may be an option (`--file=P`), which the exemption is for words without
+        cmd in _OPTION_TAKERS and any(unknownpath.is_bare(unknownpath.split(t, known, None)) for t in canon[1:])
+    )
+    if not (is_file or redirs or written) or not (policy.gate.deny_read or ctx.protect):
+        return None
+    deny = _deny_alts(policy)
+    words: list[tuple[str, str]] = []  # (word, how the command takes it: operand, piece, flag, redirect or written)
+    if is_file:
+        words += [(w, "operand") for w in operands]
+        words += [(w, "piece") for w in (*dropped, *pieces)]
+        # an option's value glued to its letter (`-o$X`, `-i$X`), which no list of options could name
+        words += [(t[2:], "flag") for t in canon[1:] if re.match(r"-[^-]", t) and len(t) > 2 and _HAS_PART.search(t)]
+        files = _FILE_FLAGS.get(cmd)  # the files they send or read: -T FILE, -K FILE, -b FILE, --post-file FILE
+        if files:
+            words += [(w, "piece") for w in shellwords.option_values(toks, files[0], files[1])]
+    words += [(t, "redirect") for op, t in redirs if t and op in _REDIRECT_FILES]
+    words += [(p, "written") for p, _ in written]
+    prod = _producer(ctx, env)
+    seen: set[tuple[str, str]] = set()
+    for word, how in words:
+        if (word, how) in seen:
+            continue
+        seen.add((word, how))
+        items = unknownpath.split(word, known, prod)
+        if unknownpath.is_bare(items):
+            takes = {"redirect": "a redirect to", "written": f"{cmd} writing to"}.get(how, f"{cmd} the file")
+            return (
+                f"command gives {takes} {word!r}, which ws cannot read: it could be any file, including one ws "
+                f"protects; {HOW_TO_SPELL}"
+            )
+        if how == "operand" and cmd in _ADDRESS_CMDS and "@" not in word and _URL.match(word):
+            continue  # a scheme ahead of the unresolved part: an address, and not the file a bare word could be
+        pattern = _pattern_of(word, ctx, known, prod)
+        if pattern is None:
+            if not unknownpath.has_unknown(items) and ("$(" in word or "`" in word):
+                reason = _produced_hit(policy, ctx, "".join(items), word, how, written)
+                if reason:
+                    return reason
+            continue
+        if len(pattern) > unknownpath.MAX_WORD:
+            return f"a path word is too long to check ({len(pattern)} characters); {HOW_TO_SPELL}"
+        for p, ancestors in written:
+            if p == word and (hit := _protect_hit(pattern, ctx.protect, ctx.cwd, ancestors)):
+                return (
+                    f"command writes {word!r}, which holds a part ws cannot read, and some value of it would be {hit}, "
+                    f"which ws protects; {HOW_TO_SPELL}"
+                )
+        for rule, alts in deny:
+            if unknownpath.reaches(pattern, alts, CASELESS_PATHS):
+                return (
+                    f"command names {word!r}, which holds a part ws cannot read, and some value of it would be a path "
+                    f"denied by deny_read rule {rule!r}; {HOW_TO_SPELL}"
+                )
+    return None
+
+
+# --- what a command prints, when it is known ------------------------------------------------------------------------
+
+_MKTEMP_FLAGS = frozenset(("-d", "-u", "-q", "-t", "--directory", "--dry-run", "--quiet"))
+_REALPATH_FLAGS = frozenset(("-m", "-e", "-s", "-f", "--canonicalize", "--canonicalize-missing"))
+
+
+def _producer(ctx: _Ctx, env, depth: int = 0) -> Callable[[str], str | None]:
+    """The function `unknownpath.split` asks about each `$(...)`: what the command inside prints."""
+    return lambda inner: _produced(inner, ctx, env, depth)
+
+
+def _produced(inner: str, ctx: _Ctx, env, depth: int = 0) -> str | None:
+    """The text a command substitution prints, when the command is one of a short list whose output is a path in a known
+    place and every word it is given is literal or known: `pwd`, `mktemp -p ABS` (or `--tmpdir=ABS`, or the `TMPDIR` the
+    line itself set), `dirname`, `basename`, `readlink -f` and `realpath`. A word it is given that is not known makes its
+    output unknown (None), and so does every other command or option: the caller then reads the part as one it cannot
+    resolve. The shell's own `TMPDIR` and `PATH` are not known (a project's settings can set them), so a bare `mktemp`,
+    `which` and `command -v` print an unknown path; so does the repository root (`core.worktree`, `GIT_WORK_TREE` and
+    `GIT_DIR` move it). The caller checks the text against the protected paths like any path the command line spells
+    out."""
+    if depth > 4 or len(inner) > 512 or re.search(r"[;&|<>\n]", inner):
+        return None
+    try:
+        words = shellwords.lex(inner, env, ctx.budget).words
+    except shellwords.ShellError:
+        return None
+    known = frozenset(env)
+    nested = _producer(ctx, env, depth + 1)
+
+    def literal(word: str) -> str | None:
+        items = unknownpath.split(word, known, nested)
+        return None if unknownpath.has_unknown(items) else "".join(items)
+
+    args = [literal(w) for w in words[1:]]
+    if not words or None in args:
+        return None
+    cmd, argv = words[0], [a for a in args if a is not None]
+    flags = [a for a in argv if a.startswith("-")]
+    ops = [a for a in argv if not a.startswith("-")]
+    here = None if ctx.cwd_unknown else ctx.cwd
+    if cmd == "pwd" and set(flags) <= {"-L", "-P"} and not ops:
+        return here
+    if cmd == "mktemp":
+        return _mktemp(argv, here, env.get("TMPDIR"))
+    if cmd in ("dirname", "basename") and not flags and len(ops) == 1 and ops[0].strip("/") and "\n" not in ops[0]:
+        # (the trailing slashes go first, as the tools do: `dirname /a/b/` is `/a`)
+        return (
+            posixpath.dirname(ops[0].rstrip("/")) or "." if cmd == "dirname" else posixpath.basename(ops[0].rstrip("/"))
+        )
+    if cmd in ("realpath", "readlink") and len(ops) == 1 and set(flags) <= _REALPATH_FLAGS and "\n" not in ops[0]:
+        if cmd == "readlink" and flags != ["-f"]:
+            return None
+        if not ops[0].startswith("/") and here is None:
+            return None
+        return os.path.realpath(posixpath.join(here or "/", ops[0]))
+    return None
+
+
+def _mktemp(argv: list[str], here: str | None, tmpdir: str | None) -> str | None:
+    """Where `mktemp` puts what it makes: the folder given with `-p DIR` or `--tmpdir=DIR` (a full path), the working
+    folder for a template given on its own, or the `TMPDIR` the line itself set (a bare `mktemp`, `-t` and `--tmpdir`
+    use it). Anywhere else it is the shell's own `TMPDIR`, which is not known, and so is any other option (None)."""
+    folder: str | None = None
+    in_tmp = False
+    template = ""
+    skip = False
+    for k, a in enumerate(argv):
+        if skip:
+            skip = False
+        elif a == "-p":
+            folder, skip = (argv[k + 1] if k + 1 < len(argv) else None), True
+            if folder is None or not folder.startswith("/"):
+                return None
+        elif a.startswith("--tmpdir="):
+            folder = a.split("=", 1)[1]
+            if not folder.startswith("/"):
+                return None
+        elif a in ("--tmpdir", "-t"):
+            in_tmp = True
+        elif a.startswith("--suffix=") or a in _MKTEMP_FLAGS:
+            continue
+        elif a.startswith("-") or template:
+            return None
+        else:
+            template = a
+    name = template or "tmp.XXXXXXXXXX"
+    if name.startswith("/"):
+        return posixpath.normpath(name)
+    if folder is None and (in_tmp or not template):
+        if not tmpdir or not tmpdir.startswith("/"):
+            return None
+        folder = tmpdir
+    if folder is None:
+        folder = here
+    return posixpath.normpath(posixpath.join(folder, name)) if folder else None
+
+
+def _cdpath_may_apply(ctx: _Ctx, target: str) -> bool:
+    """Whether `cd TARGET` may go somewhere other than the folder it names under the working folder. A relative name that
+    does not start with `./` or `../` is looked for in each folder of `CDPATH` first, and `CDPATH` (like `cdable_vars`) is
+    set in the shell the runner started, which no hook sees. So such a name is only known to mean the folder beside the
+    working one when that folder is there: a name that is not an existing child of a known working folder is a place the
+    reader cannot resolve. (A folder of that name in a `CDPATH` folder as well is the one limit; `./name` is exact.)"""
+    if target in (".", "..", "-") or target.startswith(("/", "~", "./", "../")):
+        return False
+    if ctx.cwd_unknown or "CDPATH" in ctx.unknown or ctx.distrust:
+        return True
+    return not os.path.isdir(posixpath.join(ctx.cwd, target))
+
+
+_URL = re.compile(r"(?!file:)[A-Za-z][A-Za-z0-9+.-]*://")
+HOW_TO_NAME = "write the program out in full (`ls`, not `$CMD`), or run it from a script file"
+
+
+def _substitutions(text: str) -> list[str]:
+    """The text of every `$(...)` and pair of backticks in `text`, however it is quoted: arithmetic runs the ones in a
+    word that single quotes held back from the shell."""
+    out: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        if text.startswith("$(", i):
+            j = shellwords.close_paren(text, i + 2)
+            out.append(text[i + 2 : j])
+            i = j + 1
+        elif text[i] == "`":
+            j = shellwords.backtick_end(text, i)
+            if j < 0:
+                out.append(text[i + 1 :])
+                break
+            out.append(shellwords.unbacktick(text[i + 1 : j]))
+            i = j + 1
+        else:
+            i += 1
+    return out
+
+
+def _arith_scripts(ctx: _Ctx, cmd: str, flags: list[str], toks: list[str], words: list[str]) -> list[str]:
+    """The command substitutions that arithmetic runs. A shell evaluates the text it is given by `let`, `declare`,
+    `read`, `unset`, `test -v`, `[[ ... ]]`, `$(( ))`, `(( ))` and the like as an expression, and an array subscript in it
+    (`a[$(cmd)]`) runs `cmd` even where single quotes kept the shell from reading it. In a line that does arithmetic, or
+    for one of those commands, each word that holds `$(` or a backtick is read as the script it may run."""
+    if ctx.bodies_as_commands:
+        return []
+    sub = bool(flags) and (shellwords.has_flag(flags, "v") or "-R" in flags)
+    if not (ctx.arith or cmd in _ARITH_CMDS or (cmd in ("test", "[", "printf") and sub)):
+        return []
+    leading = list(itertools.takewhile(shellwords.ASSIGN.match, words))
+    out: list[str] = []
+    for w in [*toks, *leading]:
+        if "$(" in w or "`" in w:
+            out += _substitutions(w)
+    return out
+
+
+def _settled(ctx: _Ctx, env, values: dict[str, str]) -> dict[str, str]:
+    """The values a line sets, with a command substitution in one replaced by what the command prints when that is known
+    (`T=$(mktemp -d -p /tmp)`), else by one unresolved part without a blank in it: a later `$T` is then one word that is
+    not known, and not the words of the command's text."""
+    out = {}
+    for name, value in values.items():
+        if "$(" in value or "`" in value:
+            items = unknownpath.split(value, frozenset(env), _producer(ctx, env))
+            value = "".join(_UNKNOWN_VALUE if c is None else c for c in items)
+        out[name] = value
+    return out
+
+
+def _unresolved_code(ctx: _Ctx, toks: list[str], env) -> str | None:
+    """A refusal for a command word, or the text of an `eval`, that holds a part the reader cannot resolve: it is whatever
+    the shell finds there, any program or any script, and the reader cannot tell what it would run."""
+    if not toks or shellwords.ASSIGN.match(toks[0]):
+        return None
+    known = frozenset(env)
+
+    def unresolved(word: str, made) -> bool:
+        return unknownpath.has_unknown(unknownpath.split(word, known, made))
+
+    if unresolved(toks[0], _producer(ctx, env)):
+        return (
+            f"the program to run is {toks[0]!r}, which holds a part ws cannot read, so ws cannot tell what runs; "
+            f"{HOW_TO_NAME}"
+        )
+    if toks[0] == "eval" and any(unresolved(w, None) for w in toks[1:]):
+        return (
+            "eval would run text that holds a part ws cannot read, so ws cannot tell what runs; "
+            "write the command out instead of eval"
+        )
+    return None
+
+
+def _call_pieces(lexed: shellwords.Lexed, env) -> list[str]:
+    """The places inside the words of a command that a program may read a path from, without those of the `NAME=value`
+    words ahead of it: they set a variable for the command and are not files it is given."""
+    lead = itertools.takewhile(shellwords.ASSIGN.match, lexed.words)
+    own = {p for w in lead for p in shellwords.pieces_of(w, env)}
+    return [p for p in lexed.pieces if p not in own]
+
+
+def _unread_cd_target(ctx: _Ctx, seg: str, env: shellwords.Unknown) -> str | None:
+    """The target of a `cd` or `pushd` in this part of the line with each default left as written, or None."""
+    lexed = shellwords.lex(seg, env, ctx.budget)
+    toks, _ = shellwords.strip_wrappers(lexed.words, lexenv=env, budget=ctx.budget, scripts=[])
+    if not toks or toks[0] not in ("cd", "pushd"):
+        return None
+    operands = shellwords.split_args(toks)[1]
+    return operands[0] if operands else None
+
+
+def _unknown_unread(policy: Policy, ctx: _Ctx, seg: str, env: shellwords.Unknown) -> str | None:
+    """`_unknown_refusal` for a part of the line that holds a default or alternative (`${A:-x}`), read with the default
+    left as written: the shell's own environment may hold `A`, so the word is not `x`. The reading that expands the
+    default stays the one the checks of named paths use."""
+    lexed = shellwords.lex(seg, env, ctx.budget)
+    dropped: list[str] = []
+    toks, _ = shellwords.strip_wrappers(lexed.words, lexenv=env, budget=ctx.budget, dropped=dropped, scripts=[])
+    cmd = toks[0] if toks else ""
+    written = _written(cmd, *shellwords.split_args(toks), lexed.redirs, toks, toks) if ctx.protect else []
+    return _unresolved_code(ctx, toks, env) or _unknown_refusal(
+        policy, ctx, cmd, toks, toks, lexed.redirs, _call_pieces(lexed, env), dropped, written, env
+    )
 
 
 def _shell(toks, canon, flags, operands, redirs, in_pipe):
@@ -1333,7 +2028,7 @@ def _shell(toks, canon, flags, operands, redirs, in_pipe):
     if shellwords.PROCSUB in operands:
         return "a shell is reading its script from a process substitution", nested
     if shellwords.has_flag(flags, "c"):
-        if operands and operands[0].lstrip().startswith(("$(", "`")):
+        if operands and (operands[0].lstrip().startswith(("$(", "`")) or _UNKNOWN_VALUE in operands[0]):
             return "a shell is running text another command produces", nested
         if operands:
             return None, [*nested, operands[0]]
@@ -1470,7 +2165,7 @@ def _seg_words(
         toks = _git_normal(toks)
     if toks and toks[0] == "eval" and len(toks) > 1:  # eval joins its words and runs the text as a command line
         nested.append(" ".join(toks[1:]))
-    if toks and toks[0] in _SHELL_NAMES:
+    if toks and _stem(toks[0]) in _SHELL_NAMES:
         flags, operands = shellwords.split_args(toks)
         if shellwords.has_flag(flags, "c") and operands:
             nested.append(operands[0])
@@ -1578,11 +2273,12 @@ def _walk_command(policy: Policy, command: str, cwd: str, protect: tuple[str, ..
     data = shellwords.without_bodies(command)
     if data is not None:
         return _walk(policy, data, _Ctx(cwd, protect), 0, cands)
+    second = "<<" in command and not shellwords.folds(command)  # the reading that leaves the bodies out
     for text in _readings(command):
-        reason = _walk(policy, text, _Ctx(cwd, protect), 0, cands)
+        reason = _walk(policy, text, _Ctx(cwd, protect, bodies_as_commands=second), 0, cands)
         if reason:
             return reason
-    if "<<" in command and not shellwords.folds(command):
+    if second:
         return _walk(policy, command, _Ctx(cwd, protect, None, True), 0, cands)
     return None
 

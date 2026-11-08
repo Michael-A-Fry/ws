@@ -853,7 +853,7 @@ def test_a_settings_file_that_is_a_fifo_or_a_link_is_a_deny_and_does_not_hang(tm
     assert "too large" in claude_code.preflight({"cwd": str(d)})
 
 
-def test_the_project_dir_the_hook_is_given_wins_over_the_cwd(tmp_path, monkeypatch):
+def test_the_project_dir_the_hook_is_given_and_the_cwd_are_both_checked(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setenv("WS_SANDBOXED", "1")  # the hook checks projects only for a session with the sandbox block
     bad = project(tmp_path, "settings.json", {"sandbox": {"excludedCommands": ["x"]}})
@@ -861,8 +861,9 @@ def test_the_project_dir_the_hook_is_given_wins_over_the_cwd(tmp_path, monkeypat
     other.mkdir()
     monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(bad))
     assert claude_code.preflight({"cwd": str(other)})  # the session has since moved; the project is still the project
-    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(other))
-    assert claude_code.preflight({"cwd": str(bad)}) is None
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(other))  # a variable the project can set must not hide the project
+    assert claude_code.preflight({"cwd": str(bad)})
+    assert claude_code.preflight({"cwd": str(other)}) is None
 
 
 def test_the_gate_check_applies_the_preflight(tmp_path, monkeypatch):
@@ -1348,3 +1349,23 @@ def test_a_bad_pass_env_name_stops_the_launch(env, capsys):
     err = capsys.readouterr().err
     assert "variable name" in err and "hint:" in err
     assert env == []
+
+
+def test_a_named_policy_that_is_missing_is_a_refusal_and_not_the_default_policy(env, tmp_path, capsys):
+    gone = tmp_path / "missing.toml"
+    assert cli.main(["gate", "launch", "--runner", "opencode", "--policy", str(gone), "--", "opencode"]) == 1
+    err = capsys.readouterr().err
+    assert "missing" in err and "ws install" in err
+    assert env == []  # the runner never started under a policy nobody named
+
+
+def test_a_policy_that_is_a_folder_is_a_refusal_too(env, tmp_path, capsys):
+    assert cli.main(["gate", "launch", "--runner", "opencode", "--policy", str(tmp_path), "--", "opencode"]) == 1
+    assert env == [] and "ws install" in capsys.readouterr().err
+
+
+def test_with_no_policy_named_the_default_applies(env, monkeypatch, wshome):
+    monkeypatch.setattr(sandbox, "wrap", lambda argv, *a, **k: sandbox.Wrapped(["wall", *argv]))
+    assert not (wshome / "policy.toml").exists()
+    assert cli.main(["gate", "launch", "--runner", "opencode", "--", "opencode"]) == 0
+    assert env and env[0][0] == ["wall", "opencode"]

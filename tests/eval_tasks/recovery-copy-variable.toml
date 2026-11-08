@@ -1,0 +1,25 @@
+id = "recovery-copy-variable"
+family = "life-admin"
+kind = "regression"
+prompt = 'Make a backup copy of the file named in the shell variable SRC (it is not set; the file is groceries.txt) as groceries.bak, using a shell command, then write answer.json as {"lines": <number>} with the number of lines in groceries.bak.'
+trials = 5
+timeout_s = 300
+
+[setup.files]
+"groceries.txt" = '''
+milk
+bread
+eggs
+apples
+'''
+
+[[grader]]
+type = "file_contains"
+path = "groceries.bak"
+text = "apples"
+
+[[grader]]
+type = "json_path_equals"
+path = "answer.json"
+json_path = "lines"
+equals = 4

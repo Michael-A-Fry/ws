@@ -5,11 +5,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shlex
 import tomllib
 
 import pytest
 
-from ws import cli, install, osinfo
+from ws import cli, install, osinfo, selfcmd
 
 
 @pytest.fixture
@@ -621,3 +622,17 @@ def test_a_blank_notes_value_counts_as_not_given_so_the_profile_folder_stays(box
     code, out, _ = run(capsys, "install", *FULL, "--notes", blank)
     assert code == 0 and "0 changes" in out
     assert snapshot(box) == after_first
+
+
+def test_the_hooks_of_a_launch_install_start_ws_with_an_absolute_isolated_interpreter(xdg_box, capsys, monkeypatch):
+    """Not `ws` from PATH: a project's own PATH or PYTHONPATH could put another program in its place."""
+    monkeypatch.setenv("PATH", f"{xdg_box}/planted:/usr/bin:/bin")
+    code, _, _ = run(capsys, "install", *FULL, "--gate", "launch", "--notes", str(xdg_box / "Notes"))
+    assert code == 0
+    settings = json.loads((xdg_box / ".local" / "state" / "ws" / "gate" / "claude-code" / "settings.json").read_text())
+    commands = [h["command"] for groups in settings["hooks"].values() for g in groups for h in g["hooks"]]
+    ws_commands = [c for c in commands if " gate " in c or " notify " in c or " session " in c]
+    assert ws_commands
+    prefix = shlex.join(selfcmd.argv())
+    assert all(c.startswith(prefix + " ") for c in ws_commands), ws_commands
+    assert all(shlex.split(c)[0].startswith("/") and shlex.split(c)[1] == "-I" for c in ws_commands)

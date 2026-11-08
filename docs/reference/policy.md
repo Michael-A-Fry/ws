@@ -50,6 +50,7 @@ the built-in default, which has the list below.
 | `ask_commands` | list of text | `[]` | Command patterns that run only after you approve that exact call. Same globs as `deny_commands`. A command that also matches `deny_commands` stays denied. |
 | `allow_hosts` | list of text | `[]` | Hosts a session's shell may reach, for runners whose sandbox filters the network (Claude Code). Empty means the policy says nothing about the network. |
 | `allow_write` | list of text | `[]` | Folders besides the project that a walled session may write. |
+| `sandbox` | true or false | `true` | Switch on the runner's own sandbox in what ws writes (Claude Code), both for a session started with `ws gate launch` and for one started the usual way once `ws install` has merged the settings into your file. `false` leaves the block out and marks the session unsandboxed, and `ws doctor` (WS012) says so. |
 
 Rules:
 
@@ -125,6 +126,50 @@ The expansions it doesn't follow are a pattern with a variable, a command, a neg
 a replacement that reuses the match (`&`), a case change with a pattern, an arithmetic offset such as `${NAME:0:(-4)}`,
 `${NAME@P}`, `${!NAME}` for a name the line doesn't set, and a `su` or `script` with no `-c` text to read.
 `tests/test_shellwords_oracle.py` compares the reader with bash on a fixed set of spellings.
+
+A here-document or here-string is text for whatever reads it. When that's a shell (`bash`, `sh`, `zsh`, `dash`, `ksh`,
+`fish`), `source`, `.`, `eval`, `ssh` or `xargs`, the text runs as code, so the command is refused with the reason
+`stdin-is-code`. Any other body, a commit message included, is read as commands, whatever its quoting.
+
+### The sandbox is the boundary
+
+The sandbox is the boundary, and the static gate is defence in depth. The gate reads the text of a command and refuses
+what it can show is wrong, with a reason a person can act on. The sandbox acts on what a program does, whatever its
+command line says: ws's own files are read-only and the `deny_read` paths read as empty for every program a shell
+command starts. It's on by default (`sandbox = true`), and it's the layer a bypass of the gate meets.
+
+The gate's limits are the kinds of text it can't see into. The first four are the `LIMITS` rows in
+`tests/test_gate_oracle.py`:
+
+- An interpreter, and the program it runs from `-c`, a file or standard input.
+- An `awk` program.
+- A script the line writes and then runs.
+- An option whose value is a command the tool runs (ssh's `ProxyCommand`).
+- A launcher that starts an interpreter. The gate refuses a launcher that starts a shell, but what an interpreter does
+  inside its own program is the same limit as the first.
+
+Only the sandbox closes those, so they're closed only in a session that has one.
+
+### When the sandbox isn't up
+
+The sandbox block is the wall for shell commands. The gate reads the same text with it up or not: allow-with-log, where
+a refusal for a path the reader can't resolve becomes a logged allow inside a wall, isn't in 0.1.8. A command refused
+for a part ws can't read stays refused.
+
+`ws doctor` (WS012) reads the settings and says which of these holds. `ok` needs the sandbox block in your settings
+file, its `denyRead` list covering every `deny_read` path the wall can hide (a stale list says to run `ws install`), and
+nothing in your settings or a managed-settings file that widens it. Otherwise it says which, and for an unsandboxed
+session it suggests running under `ws gate launch` for fewer refusals. Linux and WSL2 need bubblewrap and socat
+(`sudo apt install bubblewrap socat`, or `sudo dnf install bubblewrap socat`). macOS has its own, and native Windows has
+none.
+
+The static gate reads shell, so it's a check on shell and not a wall against interpreters. A program that `python`,
+`python3`, `perl`, `node`, `ruby`, `php`, `lua` or `Rscript` runs (from `-c`, a file, or standard input), `awk` code,
+an option whose value is a command the tool runs (such as ssh's `ProxyCommand`), and a script the line writes and then
+runs are text the gate can't see into: it's the same for a here-document or here-string given to one of them. These
+are the known limits, and `tests/test_gate_oracle.py` lists each as a `LIMIT` row. The wall is the sandbox:
+`ws gate launch --runner R -- argv` starts the runner inside it, and the files and folders ws protects are out of reach
+of every program in the session, whatever it runs.
 
 ## `[guards]`
 

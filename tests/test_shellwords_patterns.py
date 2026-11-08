@@ -14,7 +14,7 @@ import sys
 
 import pytest
 
-from ws import cli, policy
+from ws import cli, paths, policy
 from ws import shellwords as sw
 
 
@@ -49,7 +49,7 @@ def box(tmp_path, monkeypatch):
 def hook(monkeypatch, capsys, cmd: str) -> tuple[int, str]:
     payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": cmd}, "hook_event_name": "PreToolUse"})
     monkeypatch.setattr(sys, "stdin", io.StringIO(payload))
-    code = cli.main(["gate", "check", "--runner", "claude-code"])
+    code = cli.main(["gate", "check", "--runner", "claude-code", *paths.pin_of().args()])
     return code, capsys.readouterr().err
 
 

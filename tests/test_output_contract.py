@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from ws import cli, output
+from ws import cli, output, paths
 
 # Commands that keep their own stdout (a protocol, a hook, the terminal) and so are not wrapped; their errors still are.
 RAW = {
@@ -187,7 +187,7 @@ def test_raw_commands_give_their_errors_as_text_on_stderr(box, capsys, monkeypat
     monkeypatch.setattr(
         sys, "stdin", io.StringIO("not json")
     )  # a payload the hook cannot read: denied, reason on stderr
-    code, out, err = run(capsys, "gate", "check", "--runner", "claude-code")
+    code, out, err = run(capsys, "gate", "check", "--runner", "claude-code", *paths.pin_of().args())
     assert code == 2 and out == "" and "blocked" in err
 
 

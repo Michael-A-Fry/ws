@@ -39,7 +39,7 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from ws import __version__, adapters, notesdetect, osinfo, output, paths, policy, profile, roles, userconfig
+from ws import __version__, adapters, notesdetect, osinfo, output, paths, policy, profile, roles, selfcmd, userconfig
 from ws.jobs import JobError
 from ws.output import WsError
 
@@ -78,6 +78,7 @@ class Answers:
     cap: float | None = None  # monthly spend cap in US$
     memory: str = ""  # empty = keep the profile's memory folder, else DEFAULT_MEMORY
     gate: str = ""  # "every-session" | "launch"; empty = keep the profile's, else every-session for a new runner
+    allow_widened: bool = False  # keep settings of yours that widen the sandbox, and record that choice
 
 
 @dataclass(frozen=True)
@@ -386,10 +387,10 @@ def _gate_steps(
         wide = userconfig.supports(runner) and resolve_gate(prof, answers, old is not None) == "every-session"
         out = _dir("state", env) / "gate" / runner
         if wide:
-            made = userconfig.plan(runner, parsed, policy_file, env, old)
+            made = userconfig.plan(runner, parsed, policy_file, env, old, answers.allow_widened)
             files = made.files
         else:
-            files = adapter.generate(parsed, ["ws"], out, policy_file)
+            files = adapter.generate(parsed, selfcmd.argv(), out, policy_file, pin=paths.pin_of(env))
         steps += [Step(out / name, "file", text, f"{runner} deny rules") for name, text in files.items()]
         if wide:
             steps += _merge_steps(runner, made, old is not None)
@@ -400,7 +401,9 @@ def _gate_steps(
                 continue
             keep.add(other)
             try:
-                made = userconfig.plan(other, parsed, policy_file, env, _merge_entry(entries, other, env))
+                made = userconfig.plan(
+                    other, parsed, policy_file, env, _merge_entry(entries, other, env), answers.allow_widened
+                )
             except (
                 WsError
             ):  # can't build a fresh merge now: the record stays as it is, and doctor says if it went stale
@@ -1033,6 +1036,8 @@ def _answers_from_args(args: argparse.Namespace, env: Mapping[str, str]) -> Answ
         if not a.runner:
             raise InstallError("--gate needs a runner: pass --runner (claude-code or opencode)")
         a = replace(a, gate=args.gate)
+    if getattr(args, "allow_widened_sandbox", False):
+        a = replace(a, allow_widened=True)
     return a
 
 
@@ -1174,6 +1179,11 @@ def register(sub) -> None:
         choices=userconfig.GATES,
         help="every-session: the runner's own user config carries ws's deny rules and hooks, so every session is "
         "gated; launch: only a session started with `ws gate launch` is",
+    )
+    i.add_argument(
+        "--allow-widened-sandbox",
+        action="store_true",
+        help="keep settings of yours that open the sandbox (an excluded command, say); ws records the choice",
     )
     i.add_argument("--cap", type=float, metavar="USD", help="a monthly spend cap in US$")
     i.add_argument("-y", "--yes", action="store_true", help="do not ask before writing")

@@ -24,6 +24,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from ws import __version__, jsonl, paths
+from ws.output import WsError
 
 _SAFE_ID = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 _RELEASE = re.compile(r"^[A-Za-z0-9._+-]{1,64}$")  # a release string is printed into the model's context: keep it plain
@@ -156,39 +157,58 @@ def _input(args: argparse.Namespace) -> tuple[str, str] | None:
 
 
 def cmd_start(args: argparse.Namespace) -> int:
-    with contextlib.suppress(Exception):  # advice, not a gate: never fail the host tool
-        got = _input(args)
-        if got:
-            env = dict(os.environ)
-            # always overwrite: a resumed, cleared or compacted session reloads its rules, so it starts again here
-            path = _record_path(env, got[0])
-            _write(path, _new_record(got[0], current_release(env), args.runner, got[1]))
-            _prune(path.parent)
+    try:
+        with paths.pinned_by(args.pin):
+            got = _input(args)
+            if got:
+                env = paths.merged_environ()
+                # always overwrite: a resumed, cleared or compacted session reloads its rules, so it starts again here
+                path = _record_path(env, got[0])
+                _write(path, _new_record(got[0], current_release(env), args.runner, got[1]))
+                _prune(path.parent)
+    except WsError as e:  # ws's folders are not where this hook was installed to find them: say so, do nothing
+        _skipped(e)
+    except Exception:  # noqa: BLE001 - advice, not a gate: never fail the host tool
+        return 0
     return 0
 
 
 def cmd_nudge(args: argparse.Namespace) -> int:
-    with contextlib.suppress(Exception):  # advice, not a gate: never fail the host tool
-        got = _input(args)
-        if not got:
-            return 0
-        env = dict(os.environ)
-        sid, cwd = got
-        path = _record_path(env, sid)
-        now = current_release(env)
-        rec = _read(path)
-        if rec is None:  # none yet, or one we cannot read: record now, say nothing
-            _write(path, _new_record(sid, now, args.runner, cwd))
-            return 0
-        if rec.get("nudged") or not is_newer(now, rec["release"]):
-            return 0
-        rec["nudged"] = True
-        _write(path, rec)  # mark first: if this fails we stay quiet rather than repeat ourselves
-        print(
-            f"ws {now} is out (this session started on {rec['release']}): "
-            "run checkpoint and restart at the next phase boundary."
-        )
+    try:
+        with paths.pinned_by(args.pin):
+            _nudge(args)
+    except WsError as e:
+        _skipped(e)
+    except Exception:  # noqa: BLE001 - advice, not a gate: never fail the host tool
+        return 0
     return 0
+
+
+def _skipped(e: WsError) -> None:
+    with contextlib.suppress(Exception):
+        print(f"ws session: skipped ({e.message}; {e.hint})", file=sys.stderr)
+
+
+def _nudge(args: argparse.Namespace) -> None:
+    got = _input(args)
+    if not got:
+        return
+    env = paths.merged_environ()
+    sid, cwd = got
+    path = _record_path(env, sid)
+    now = current_release(env)
+    rec = _read(path)
+    if rec is None:  # none yet, or one we cannot read: record now, say nothing
+        _write(path, _new_record(sid, now, args.runner, cwd))
+        return
+    if rec.get("nudged") or not is_newer(now, rec["release"]):
+        return
+    rec["nudged"] = True
+    _write(path, rec)  # mark first: if this fails we stay quiet rather than repeat ourselves
+    print(
+        f"ws {now} is out (this session started on {rec['release']}): "
+        "run checkpoint and restart at the next phase boundary."
+    )
 
 
 def register(sub) -> None:
@@ -201,4 +221,5 @@ def register(sub) -> None:
         p = ss.add_parser(name, help=text)
         p.add_argument("--session-id", metavar="ID", help="the session id (default: session_id in the hook JSON)")
         p.add_argument("--runner", default="unknown", help="which runner is calling (recorded)")
+        paths.add_pin_option(p)
         p.set_defaults(func=fn, raw=True)  # hook entries: the runner reads their stdout

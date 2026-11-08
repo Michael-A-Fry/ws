@@ -1,7 +1,7 @@
 """`ws doctor`: one line per check, each with a stable ID. Exit 0 only when nothing is failing or unconfigured.
 
 IDs never change meaning once released: WS0xx are the machine, profile, jobs, gate,
-plugins and where ws keeps its files, WS1xx are the roles (one per role).
+sandbox, plugins and where ws keeps its files, WS1xx are the roles (one per role).
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from ws import __version__, canary, jobs, paths, roles, usage, userconfig
+from ws import __version__, canary, jobs, paths, roles, usage, userconfig, wallsettings
 from ws import globals as ws_globals
 from ws.osinfo import OSInfo
 from ws.profile import ProfileError, load, profile_path
@@ -298,6 +298,11 @@ def run_checks(osi: OSInfo, profile_file: Path, env: dict | None = None, network
         over = []
     fix = "remove that allow rule, or take the deny rule out of the policy and run `ws install`"
     checks += [Check("WS008", "gate", WARN, line, fix) for line in over]
+    try:
+        status, detail, fix = wallsettings.doctor_check(env, osi.kind)
+    except Exception as e:  # noqa: BLE001 (a broken check must report, not crash the whole doctor)
+        status, detail, fix = FAIL, f"check crashed ({type(e).__name__})", ""
+    checks.append(Check("WS012", "sandbox", status, detail, fix))
     try:
         checks.append(_layout_check(env))
     except Exception as e:  # noqa: BLE001 (a broken check must report, not crash the whole doctor)

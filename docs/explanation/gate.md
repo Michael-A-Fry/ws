@@ -70,6 +70,9 @@ The matcher reads text, so it can't see inside a program. These calls pass the m
 - The version-control tool restoring a protected tracked file.
 - OpenCode's `patch` tool, which carries no single file path. Its native `edit` rules still apply.
 
+The sandbox is the boundary and the gate is defence in depth: the gate explains a refusal in words a person can act
+on, and the sandbox is what holds when the text can't be read. A refusal stays a refusal whether or not the sandbox is up.
+
 The wall closes most of these for a shell command. It doesn't close all of them. A `deny_commands` rule isn't enforced
 inside an interpreter: `python3 -c 'os.system("...")'` runs the command, and only the wall's file rules apply to it.
 `allow_hosts` limits the network on Claude Code only. See [Known limits](known-limits.md).

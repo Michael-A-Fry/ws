@@ -16,7 +16,7 @@ import json
 import os
 import sys
 
-from ws import install, jobs, osinfo, output
+from ws import install, jobs, osinfo, output, paths
 from ws.output import WsError
 from ws.profile import ProfileError, load, profile_path
 from ws.roles import _schedule, ntfy, restic
@@ -88,14 +88,19 @@ def cmd_notify_alert(args: argparse.Namespace) -> int:
     says on stderr why nothing went when something is wrong. Any failure counts, including a payload nested deep enough
     to hit the recursion limit, a missing stdin and a broker that is down."""
     try:
-        roles = (load(profile_path()) or {}).get("roles")
-        cfg = roles.get("notify") if isinstance(roles, dict) else None
-        if not isinstance(cfg, dict) or cfg.get("adapter") != ntfy.NAME:
-            return 0  # no phone alerts set up: nothing to do
-        payload = None if sys.stdin.isatty() else json.loads(sys.stdin.read(MAX_PAYLOAD) or "null")
-        line = ntfy.alert(cfg, os.environ, payload, args.runner)
+        # the profile says where the alert goes: read it from the folder `ws install` pinned, never from one the
+        # session's environment names (the hook runs outside the sandbox)
+        with paths.pinned_by(args.pin):
+            roles = (load(profile_path()) or {}).get("roles")
+            cfg = roles.get("notify") if isinstance(roles, dict) else None
+            if not isinstance(cfg, dict) or cfg.get("adapter") != ntfy.NAME:
+                return 0  # no phone alerts set up: nothing to do
+            payload = None if sys.stdin.isatty() else json.loads(sys.stdin.read(MAX_PAYLOAD) or "null")
+            line = ntfy.alert(cfg, paths.merged_environ(), payload, args.runner)
         if line:
             print(f"ws: {line}", file=sys.stderr)
+    except WsError as e:
+        _warn(f"ws: alert not sent ({e.message}; {e.hint})")
     except (ProfileError, ntfy.NotifyError, ValueError, OSError) as e:  # ValueError covers a payload that isn't JSON
         _warn(f"ws: alert not sent: {e}")
     except Exception as e:  # noqa: BLE001  a hook must never fail its session; the type is enough to go on
@@ -245,6 +250,7 @@ def register(sub) -> None:
     p.set_defaults(func=cmd_notify_status)
     p = ns.add_parser("alert", help='hook entry: push "<folder> needs you" or "<folder> finished" (hook JSON on stdin)')
     p.add_argument("--runner", default="unknown", help="the runner whose hook is calling, for example claude-code")
+    paths.add_pin_option(p)
     p.set_defaults(func=cmd_notify_alert)
 
     b = sub.add_parser("backup", help="back up memory, notes and profile with restic, and prove a file restores")

@@ -151,6 +151,11 @@ def test_naming_main_or_the_ref_itself_is_still_a_claim():
     assert cl.find_claims("merged abc1234 into main", W, "origin/work")
 
 
+@pytest.mark.parametrize("sha", ["9667a822be", "be12345", "12be345", "12345be"])
+def test_the_letters_of_a_commit_id_are_not_a_future_form(sha):
+    assert cl.find_claims(f"{sha} is on main", W) == [("on main", sha)]
+
+
 def test_a_negation_more_than_four_words_back_does_not_cancel_the_claim():
     assert cl.find_claims("no problem at all, and then one two three four merged into main abc1234", W)
 

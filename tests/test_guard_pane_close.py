@@ -3,6 +3,7 @@ stand-ins: who may close which window or pane, and every form that is refused.""
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import shutil
 import subprocess
@@ -89,7 +90,7 @@ def child_of(pid: int) -> int:
 def runner_at(pid: int) -> session.Proc:
     proc = session.proc_info(pid)
     assert proc is not None
-    return proc
+    return dataclasses.replace(proc, name="claude")  # tmux starts a pane through a shell, which may not have exec'd yet
 
 
 def ask(command: str, sid: str, cfg=CFG, clock=time.time, cwd: str = "/w"):

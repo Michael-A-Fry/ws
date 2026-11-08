@@ -40,7 +40,7 @@ home folder or another class's. ws prints the commands and the file; you run the
 3. Run the commands it printed, in order: create the account and close its home folder, close your own home folder
    (`chmod 700 "$HOME"`), give the account the repos, then place the file. The file goes in a managed-settings folder
    (`/etc/claude-code/managed-settings.d` on Linux, the `ClaudeCode` folder under `/Library/Application Support` on macOS)
-   as `50-ws-class-NAME.json`, owned by root, readable by everyone and writable by no one else. It is written as
+   as `50-ws-class-NAME.json`, owned by root, readable by everyone and writable by no one else. It's written as
    `50-ws-class-NAME.json.tmp` first and moved into place, so a paste that stops half way leaves nothing Claude Code
    would read.
 
@@ -82,7 +82,7 @@ hidden and inbound is lead-only. A part that isn't ok says which one, and the `f
   the session starts, so setting those changes nothing. Start it as the class's account.
 - WS014 `fail` on the file line: the file is a link, isn't owned by root, someone else can write it (or its folder), or
   the account can't read it (a file nobody else can read means its sessions run without the wall). Run the `fix:` line;
-  it is the command for the problem the line names.
+  it's the command for the problem the line names.
 - More than one class with an account on one machine: Claude Code merges every managed file, so each class's sessions are
   allowed to write the repos of all of them. Keep classes that must not share on separate machines.
 - The inbound row says the file records lead-only. That setting is a record; what lets a session send in is the

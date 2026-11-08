@@ -2,7 +2,7 @@
 
 What `.github/workflows/ci.yml` runs, how long each job may take, and the two lines a pull request body needs when it
 changes the tests. The suite itself (sizes, tiers, quarantine) is in [Testing](testing.md). The other workflows
-(`cli.yml`, `install-test.yml`, `lab.yml`, `release.yml`) are not covered here.
+(`cli.yml`, `install-test.yml`, `lab.yml`, `release.yml`) aren't covered here.
 
 ## The jobs
 
@@ -20,7 +20,7 @@ Bubblewrap is installed in `ci` as well as in `oracle`: `tests/test_sandbox.py` 
 quietly without it.
 
 The oracle and node jobs don't gate a merge until each is added as a required check in the repository's branch rules.
-That is a repository setting, not a file. `ci` is already required, so the test-integrity check and the holdout, which
+That's a repository setting, not a file. `ci` is already required, so the test-integrity check and the holdout, which
 sit inside it, run on every pull request. Neither can stop a pull request that sets out to get past it: on a
 `pull_request` event GitHub runs the workflow and the script from the pull request's own tree, so a change can edit
 them, and the `test-change:` line is written by the author. Read them as a check on honest mistakes, and review changes
@@ -42,8 +42,8 @@ each tier of the harness's time report ([Testing](testing.md)).
 window the runner doesn't use. `tests/test_ci_time_budget.py` reads `ci.yml` as text and fails if they differ, and
 `tests/test_workflows.py` checks that every job starts with the stamp and ends with the budget step.
 
-A job that reaches its limit is stopped by the runner, so its budget step doesn't run. The warning on the runs before it
-is the early sign, which is why it starts at 75% and not at 95%. The limits above are first values: before the split the
+A job that reaches its limit is stopped by the runner, so its budget step doesn't run. The warning on the runs before it's
+the early sign, which is why it starts at 75% and not at 95%. The limits above are first values: before the split the
 one `ci` job had 20 minutes, about half of it the oracle. Change one when the budget lines show where a job has settled,
 and change `N` in the same edit.
 
@@ -72,7 +72,7 @@ body as it was when the run started.
 
 The holdout, `tests/holdout/test_holdout_core.py`, is a small set of core promises checked only by running `ws` as a
 program in a scratch home: the gate refuses a write to a path ws protects, refuses a payload it can't read, and refuses
-to generate rules from a policy that doesn't parse, and `ws doctor --offline` runs. It is kept apart so a change is
+to generate rules from a policy that doesn't parse, and `ws doctor --offline` runs. It's kept apart so a change is
 never shaped to pass it.
 
 Exit codes of the script: 0 nothing to say or every hit has its line, 1 a hit with no line, 2 the check couldn't run.
@@ -87,7 +87,7 @@ old. Two dev-only tools, both MIT licensed and in active use, run in the prek ho
 - zizmor v1.31.1 audits `.github/workflows/ci.yml` for injection through expressions, over-wide permissions and cache
   poisoning. It runs offline in the hook, so the audits that need the GitHub API are skipped there.
 
-zizmor is scoped to `ci.yml`. The other workflows have findings that are not fixed yet:
+zizmor is scoped to `ci.yml`. The other workflows have findings that aren't fixed yet:
 
 | Workflow | Finding |
 |---|---|

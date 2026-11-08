@@ -555,7 +555,7 @@ ws msg list [-h] [--sent] [--unread] [--after ID] [--limit N]
 | Argument | Meaning |
 |---|---|
 | `--sent` | The ones you sent, not the ones left for you. |
-| `--unread` | Only those you have not read. |
+| `--unread` | Only those you haven't read. |
 | `--after ID` | Only messages after this id. |
 | `--limit N` | At most N (default 50, up to 200). |
 

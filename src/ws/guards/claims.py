@@ -330,7 +330,7 @@ def _claim_spans(sentence: str, words: tuple[str, ...]) -> list[tuple[str, int, 
             before, after = sentence[: m.start()], sentence[m.end() :]
             if before[-1:] and after[:1] and before[-1] in _QUOTES and after[0] in _QUOTES:
                 continue  # quoted: the word is being talked about
-            previous = _FOUR.findall(before.lower())[-4:]
+            previous = _FOUR.findall(_HEX.sub(" ", before.lower()))[-4:]  # a commit id's letters are not words
             if any(w in _NEGATION | _FUTURE or w.endswith(("n't", "'ll")) for w in previous):
                 continue  # "not merged", "isn't pushed", "will be merged", "it'll be on main"
             written = " ".join(m.groups())  # as written, without a commit or a plain word inside it

@@ -618,7 +618,7 @@ def test_the_generated_folder_still_needs_nothing_written_at_start(tmp_path, box
 
 
 NODE = shutil.which("node")
-TRUE = shutil.which("true")
+SH = shutil.which("sh")  # the stand-in checker reads its stdin as the real one does, or the shim's write can hit EPIPE
 
 # Loads the generated shim in node with a client that records its replies, lets the gate "allow" a bash call (the check
 # command is `true`), raises one permission.asked event for it, and prints the replies. The cases come in on stdin.
@@ -643,7 +643,10 @@ console.log(JSON.stringify(out))
 def shim_answers(tmp_path: Path, shim: str, cases: list[dict], asks: Path | None = None) -> list[list[dict]]:
     """Run the generated shim in node and return, for each case, the replies it gave to the ask."""
     plugin = tmp_path / "ws-gate.mjs"
-    text = shim.replace(f"const CHECK = {json.dumps(js_const(shim, 'CHECK'))}", f"const CHECK = {json.dumps([TRUE])}")
+    text = shim.replace(
+        f"const CHECK = {json.dumps(js_const(shim, 'CHECK'))}",
+        f"const CHECK = {json.dumps([SH, '-c', 'cat >/dev/null'])}",
+    )
     assert text != shim
     if asks is not None:
         text = text.replace(
@@ -668,7 +671,7 @@ def ask_case(patterns, *, permission="bash", allowed=True) -> dict:
     return {"patterns": patterns, "permission": permission, "allowed": allowed}
 
 
-@pytest.mark.skipif(NODE is None or TRUE is None, reason="needs node and a `true` command")
+@pytest.mark.skipif(NODE is None or SH is None, reason="needs node and a shell")
 def test_an_ask_is_answered_once_only_when_every_segment_is_one_of_ws_asks(tmp_path, box):
     shim = shim_for('[gate]\nask_commands = ["touch *APPROVED"]\n', tmp_path)
     got = shim_answers(
@@ -704,7 +707,7 @@ def asks_after(tmp_path: Path, before: bytes) -> Path:
     return asks
 
 
-@pytest.mark.skipif(NODE is None or TRUE is None, reason="needs node and a `true` command")
+@pytest.mark.skipif(NODE is None or SH is None, reason="needs node and a shell")
 def test_the_asks_file_is_rotated_before_it_passes_what_the_reader_accepts(tmp_path, box):
     from ws.home.sources import _files
 
@@ -715,7 +718,7 @@ def test_the_asks_file_is_rotated_before_it_passes_what_the_reader_accepts(tmp_p
     assert 9 * 1024 * 1024 < _files.FILE_CAP
 
 
-@pytest.mark.skipif(NODE is None or TRUE is None, reason="needs node and a `true` command")
+@pytest.mark.skipif(NODE is None or SH is None, reason="needs node and a shell")
 def test_a_torn_last_line_in_the_asks_file_costs_only_itself(tmp_path, box):
     from ws.home.sources import _files
 

@@ -407,3 +407,18 @@ def test_a_node_that_joined_without_a_timer_gets_one_on_the_next_join(box):
     assert [s.id for s in again[: len(first)]] == [s.id for s in first]  # the steps it had are kept as they are
     assert [s.kind for s in again[len(first) :]][-1] == "timer" and runs
     assert not node.remove(runner=lambda argv: (0, "")).left
+
+
+def test_no_hard_links_is_a_typed_error_for_a_node_file(box, monkeypatch):
+    import errno
+
+    def no_links(src, dst, **kw):
+        raise OSError(errno.EPERM, "Operation not permitted")
+
+    monkeypatch.setattr(node.os, "link", no_links)
+    with pytest.raises(node.NodeError) as e:
+        node.join()
+    assert e.value.kind == "io" and "hard links" in e.value.hint
+    assert not [p for p in box.rglob("*") if p.name.endswith(".tmp")]
+    monkeypatch.undo()
+    assert not node.remove().left  # the half-made step is understood

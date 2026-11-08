@@ -7,6 +7,7 @@ Values that look like a secret are put together at run time.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import inspect
 import io
@@ -1208,3 +1209,55 @@ def test_a_failed_body_removal_is_tried_again_on_the_next_prune(world):
     assert msg.prune(now=BASE + 7 * day, force=True)["ran"] is True  # nothing left to expire, but the body goes now
     assert world.rows("SELECT COUNT(*) FROM bodies", class_db(world)) == [(0,)]
     assert world.rows("SELECT COUNT(*) FROM tidy") == [(0,)]
+
+
+def test_a_body_on_an_unmounted_drive_is_still_tidied_after_it_comes_back(world):
+    classed(world)
+    day = 86400
+    world.send("lead1", "wall1", body=planted(), now=BASE)
+    conn = sqlite3.connect(msg.store_path())
+    conn.execute("UPDATE messages SET store_dev=store_dev+1")  # the repo was on another device than the folder above it
+    conn.commit()
+    conn.close()
+    kept = world.root / "kept"
+    shutil.copytree(world.root / "walled", kept)
+    shutil.rmtree(world.root / "walled")  # the drive is unmounted: the mount point is empty, the repo is not there
+    assert msg.prune(now=BASE + 6 * day, force=True)["expired"] == 1
+    assert world.rows("SELECT COUNT(*) FROM tidy") == [(1,)]  # not confirmed deleted, so the job is kept
+    assert msg.prune(now=BASE + 7 * day, force=True)["ran"] is True
+    assert world.rows("SELECT COUNT(*) FROM tidy") == [(1,)]
+    shutil.copytree(kept, world.root / "walled")  # remounted
+    assert world.rows("SELECT COUNT(*) FROM bodies", class_db(world)) == [(1,)]
+    assert msg.prune(now=BASE + 8 * day, force=True)["ran"] is True
+    assert world.rows("SELECT COUNT(*) FROM bodies", class_db(world)) == [(0,)]
+    assert world.rows("SELECT COUNT(*) FROM tidy") == [(0,)]
+
+
+def test_a_tidy_job_is_dropped_when_the_store_is_confirmed_not_there(world):
+    classed(world)
+    day = 86400
+    world.send("lead1", "wall1", body=planted(), now=BASE)
+    shutil.rmtree(class_db(world).parent)  # the repo is there and the store is not: confirmed
+    assert msg.prune(now=BASE + 6 * day, force=True)["expired"] == 1
+    assert world.rows("SELECT COUNT(*) FROM tidy") == [(0,)]
+
+
+def test_a_repo_that_is_certainly_deleted_leaves_no_tidy_job(world):
+    classed(world)
+    world.send("lead1", "wall1", body=planted(), now=BASE)
+    shutil.rmtree(world.root / "walled")  # same device as the folder above it: certainly deleted
+    assert msg.prune(now=BASE + 6 * 86400, force=True)["gone"] == 1
+    assert world.rows("SELECT COUNT(*) FROM tidy") == [(0,)]
+
+
+def test_no_hard_links_is_a_typed_error_for_the_class_gitignore(world, monkeypatch):
+    classed(world)
+
+    def no_links(src, dst, **kw):
+        raise OSError(errno.EPERM, "Operation not permitted")
+
+    monkeypatch.setattr(msg.os, "link", no_links)
+    err = world.refused("lead1", "wall1", body="a body", kind="io")
+    assert ".gitignore" in err.message and world.count() == 0
+    folder = class_db(world).parent
+    assert not [p for p in folder.iterdir() if p.name.endswith(".tmp")]

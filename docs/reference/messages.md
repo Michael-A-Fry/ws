@@ -75,7 +75,8 @@ With `[classes]`:
   is missing while the folder above it is on another device than the repo was on when its first message was written
   (an unmounted drive leaves an empty mount point behind). `prune` reports those rows as `unconfirmed` and keeps them until
   retention takes them. A bit of a class store left behind because it could not be reached or written is remembered in
-  the shared database (`tidy`) and removed on the next prune.
+  the shared database (`tidy`) and removed on the next prune. The job is dropped only when the store, or the repo, is
+  confirmed deleted by the same device check; a repo that may be on an unmounted drive keeps it until the drive is back.
 
 ## Caps
 

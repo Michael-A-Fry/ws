@@ -152,8 +152,18 @@ def _do_file(step: Step) -> None:
     try:
         with os.fdopen(fd, "wb") as fh:
             fh.write(step.detail["content"].encode("utf-8"))
-        with contextlib.suppress(FileExistsError):
+        try:
             os.link(tmp, p)
+        except FileExistsError:
+            pass  # something got there first: left as it is
+        except (
+            OSError
+        ) as e:  # a filesystem with no hard links, or a refusal: a typed error, with the step's intent in the ledger
+            raise NodeError(
+                "io",
+                f"can't put {p} in place: {e.strerror or type(e).__name__}",
+                "ws needs a filesystem that allows hard links in its folders; `ws node remove` clears what was made",
+            ) from e
     finally:
         with contextlib.suppress(OSError):
             tmp.unlink()

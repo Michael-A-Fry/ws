@@ -281,6 +281,7 @@ _SHARED_SCHEMA = (
     """CREATE TABLE IF NOT EXISTS tidy(
         store TEXT NOT NULL,
         class TEXT NOT NULL,
+        store_dev INTEGER,
         PRIMARY KEY(store, class)) WITHOUT ROWID""",
 )
 _CLASS_SCHEMA = (
@@ -423,8 +424,16 @@ def _prepare_class_folder(db: Path) -> None:
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(IGNORE_TEXT)
-            with contextlib.suppress(FileExistsError):
+            try:
                 os.link(tmp, ignore)  # whoever got there first wins; it is checked below either way
+            except FileExistsError:
+                pass
+            except OSError as e:  # a filesystem with no hard links, or a refusal
+                raise WsError(
+                    "io",
+                    f"can't put the .gitignore in place in {db.parent}: {e.strerror or type(e).__name__}",
+                    "the class folder needs a filesystem that allows hard links",
+                ) from e
         finally:
             with contextlib.suppress(OSError):
                 tmp.unlink()
@@ -1102,7 +1111,7 @@ def _prune(conn: sqlite3.Connection, now: float, pol: policy.Policy, *, force: b
             # the bodies of the rows about to go are written down first, in this transaction, so a removal that fails
             # below is tried again on the next prune and not lost with the rows
             conn.execute(
-                f"INSERT OR IGNORE INTO tidy(store, class) SELECT DISTINCT store, ? {old} AND store IS NOT NULL",
+                f"INSERT OR IGNORE INTO tidy(store, class, store_dev) SELECT DISTINCT store, ?, store_dev {old} AND store IS NOT NULL",
                 (row["class"], row["class"], cutoff),
             )
             expired += conn.execute(f"DELETE {old}", (row["class"], cutoff)).rowcount
@@ -1112,21 +1121,24 @@ def _prune(conn: sqlite3.Connection, now: float, pol: policy.Policy, *, force: b
         with contextlib.suppress(sqlite3.Error):
             conn.execute("ROLLBACK")
         raise
-    for row in conn.execute("SELECT store, class FROM tidy").fetchall():
-        if _tidy_class_store(row["store"], row["class"], pol, now):
+    for row in conn.execute("SELECT store, class, store_dev FROM tidy").fetchall():
+        if _tidy_class_store(row["store"], row["class"], row["store_dev"], pol, now):
             conn.execute("DELETE FROM tidy WHERE store=? AND class=?", (row["store"], row["class"]))
     return {"ran": True, "expired": expired, "gone": gone, "unconfirmed": unconfirmed}
 
 
-def _tidy_class_store(root: str, cls: str, pol: policy.Policy, now: float) -> bool:
-    """Drop the bodies past the class's retention from the store in `root`. True when that is done, or there is nothing
-    to do (the store, or the repo, is not there); False when the store could not be reached or written, so the caller
-    keeps it on its list and tries again on the next prune."""
+def _tidy_class_store(root: str, cls: str, device: int | None, pol: policy.Policy, now: float) -> bool:
+    """Drop the bodies past the class's retention from the store in `root`. True when that is done, or when the store is
+    confirmed not to exist: the repo folder is there without it, or the repo folder is missing and the folder above it is
+    on the device the repo was on (`_repo_gone`). False when the store could not be reached or written, or the repo
+    folder is missing and that can't be confirmed (an unmounted drive), so the caller keeps it on its list and tries
+    again on the next prune."""
     conn = None
     try:
         conn = _class_connect(_class_db(root, cls))
-        if conn is not None:
-            conn.execute("DELETE FROM bodies WHERE sent_ms<?", (int((now - _retention_days(pol, cls) * 86400) * 1000),))
+        if conn is None:
+            return os.path.isdir(root) or _repo_gone(root, device)
+        conn.execute("DELETE FROM bodies WHERE sent_ms<?", (int((now - _retention_days(pol, cls) * 86400) * 1000),))
         return True
     except (sqlite3.Error, OSError, WsError):
         return False

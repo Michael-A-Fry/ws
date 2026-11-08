@@ -60,8 +60,12 @@ a `;`, a `$(`) is left to the hook, as it is for `deny_commands`.
 
 `edit` also covers the skills folders OpenCode reads, because a skill is loaded as instructions and a planted one would
 steer the next session: its own (`skills` and `skill` under its config folder) and the ones it shares with Claude Code
-(`~/.claude/skills`) and other tools (`~/.agents/skills`). Each is written in both spellings OpenCode matches (the absolute
-path, and `**/` and its last two folders). The plugin's own check does not hold these folders; the rule does.
+(`~/.claude/skills`) and other tools (`~/.agents/skills`). Each is written as the absolute path and as OpenCode sees
+it from a project (`../` and its last two folders), so a project's own `.claude/skills` is not caught. When OpenCode is
+started in a folder that holds one of them (the home folder, say), that folder is inside the project and is also denied
+as a plain relative path; how OpenCode 1.19.4 builds an edit pattern was not checked in a live run, so both spellings are
+written. A project's own `.opencode/skills` is denied too. The plugin's own check does not hold these folders; the rule
+does.
 
 **`policies`.** ws writes no `policies` key. In OpenCode 1.19.4 the only `policies` is `experimental.policies`, whose own
 description is "policy statements applied to supported resources, such as provider access": it governs providers, not

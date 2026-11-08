@@ -183,13 +183,19 @@ def _protect_forms(path: str, is_out: bool) -> list[str]:
     return [path, f"{path}/**", f"**/{tail}", f"**/{tail}/**"]
 
 
-def _skill_forms(path: str) -> list[str]:
+def _skill_forms(path: str, project: Path | None = None) -> list[str]:
     """Edit rules for a skills folder in the person's home or config folder: the absolute path, and how OpenCode sees it
     from a project (`../` first, the last two segments of the path below). A bare `**/.claude/skills` would also catch a
     project's own `.claude/skills`, which is the project's to change, so the relative forms start with `../`: they only
-    reach a folder outside the project."""
+    reach a folder outside the project. When the project is the folder's parent or an ancestor of it (OpenCode run in the
+    home folder), the folder is inside the project and is seen as a plain relative path, so that path is denied too, and
+    only then."""
     tail = "/".join(Path(path).parts[-2:])
-    return [path, f"{path}/**", f"../{tail}", f"../{tail}/**", f"../**/{tail}", f"../**/{tail}/**"]
+    forms = [path, f"{path}/**", f"../{tail}", f"../{tail}/**", f"../**/{tail}", f"../**/{tail}/**"]
+    if project is not None and Path(path).is_relative_to(project) and Path(path) != project:
+        rel = Path(path).relative_to(project).as_posix()
+        forms += [rel, f"{rel}/**"]
+    return forms
 
 
 # The skills folders of a project that OpenCode reads on its own (`.opencode/skills`, and the older singular name): they
@@ -246,9 +252,11 @@ def generate(
     *,
     protect: tuple[str, ...] = (),
     pin: paths.Pin | None = None,
+    project: Path | None = None,
 ) -> dict[str, str]:
     protect = tuple(protect)
     pin = pin or paths.pin_of()
+    project = Path(project) if project is not None else Path.cwd()  # the folder OpenCode will be started in
     # Last matching rule wins, so the order is the catch-all, then the asks, then the denies: a deny beats an ask.
     denies = native_patterns(policy)
     asks = [p for p in native_asks(policy) if p not in denies]  # one asked and denied is denied
@@ -261,7 +269,7 @@ def generate(
     for p in protected_paths(out, policy_file, protect):
         edit.update(dict.fromkeys(_protect_forms(p, p == str(out)), "deny"))
     for p in skill_folders(pin):  # a skill is read as instructions: a planted one would steer the next session
-        edit.update(dict.fromkeys(_skill_forms(p), "deny"))
+        edit.update(dict.fromkeys(_skill_forms(p, project), "deny"))
     for folder in PROJECT_SKILL_FOLDERS:
         edit.update(dict.fromkeys(_project_skill_forms(folder), "deny"))
     permission["edit"] = edit

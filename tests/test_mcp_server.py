@@ -101,7 +101,10 @@ def test_initialize_negotiates_the_version_and_lists_tools(client):
     ]
     for t in tools:
         assert t["inputSchema"]["type"] == "object" and t["description"]
-        assert t["inputSchema"].get("required") or t["name"] == "msg_list"  # every tool but the list needs an argument
+        if t["name"] == "msg_list":  # the one tool that needs no argument: it declares none required
+            assert "required" not in t["inputSchema"]
+        else:
+            assert t["inputSchema"]["required"], t["name"]
     assert client.call("ping")["result"] == {}
 
 

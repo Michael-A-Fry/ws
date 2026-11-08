@@ -59,7 +59,7 @@ from ws.output import WsError
 
 COMMAND = "msg"
 SCHEMA = "ws.message/1"
-STORE_VERSION = 1  # PRAGMA user_version of both databases
+STORE_VERSION = 2  # PRAGMA user_version of both databases (2: `store_dev`, `tidy`)
 
 KINDS = ("note", "ask", "stop-and-hand-over", "ack", "done", "stop-and-hand-over:done", "ask:pending", "counts")
 FIXED_KINDS = ("ack", "done", "stop-and-hand-over:done", "ask:pending", "counts")  # all a walled sender may send
@@ -254,7 +254,8 @@ _SHARED_SCHEMA = (
         class TEXT,
         walled INTEGER NOT NULL DEFAULT 0,
         store TEXT,
-        has_body INTEGER NOT NULL DEFAULT 0)""",
+        has_body INTEGER NOT NULL DEFAULT 0,
+        store_dev INTEGER)""",
     """CREATE UNIQUE INDEX IF NOT EXISTS messages_idem ON messages("from", idem) WHERE idem IS NOT NULL""",
     """CREATE INDEX IF NOT EXISTS messages_rate ON messages("from", sent_ms)""",
     """CREATE INDEX IF NOT EXISTS messages_to ON messages("to", id)""",
@@ -277,6 +278,10 @@ _SHARED_SCHEMA = (
         class TEXT,
         size TEXT NOT NULL)""",
     """CREATE INDEX IF NOT EXISTS envelope_by_message ON envelope(message_id)""",
+    """CREATE TABLE IF NOT EXISTS tidy(
+        store TEXT NOT NULL,
+        class TEXT NOT NULL,
+        PRIMARY KEY(store, class)) WITHOUT ROWID""",
 )
 _CLASS_SCHEMA = (
     """CREATE TABLE IF NOT EXISTS {db}bodies(
@@ -330,6 +335,8 @@ def _ensure_schema(conn: sqlite3.Connection, statements: tuple[str, ...], db: st
         if conn.execute(pragma).fetchone()[0] < STORE_VERSION:
             for stmt in statements:
                 conn.execute(stmt.format(db=f"{db.rstrip('.')}." if db else ""))
+            if not db and "store_dev" not in {r[1] for r in conn.execute("PRAGMA table_info(messages)")}:
+                conn.execute("ALTER TABLE messages ADD COLUMN store_dev INTEGER")  # a store made at version 1
             conn.execute(f"{pragma}={STORE_VERSION}")
         conn.execute("COMMIT")
     except BaseException:
@@ -376,14 +383,58 @@ def _class_store(pol: policy.Policy, cls: policy.Class, cwd: str) -> tuple[Path,
     return root, db
 
 
+IGNORE_TEXT = "*\n"  # the `.gitignore` of a class folder: everything in it, itself too, so `git add` cannot take a body
+_SIDECARS = ("-journal", "-wal", "-shm")  # the files SQLite keeps beside a database
+
+
+def _refuse_linked_sidecars(db: Path) -> None:
+    """A link where a `-journal`, `-wal` or `-shm` file of the class store goes would send a write of a body out of the
+    repo; refuse it."""
+    for end in _SIDECARS:
+        if db.with_name(db.name + end).is_symlink():
+            raise WsError(
+                "refused",
+                f"a file beside the class store ({db.name + end}) is a link",
+                "remove it; ws keeps the bodies of a walled class inside its repo",
+            )
+
+
+def _ignore_is_ours(ignore: Path) -> bool:
+    """True when `ignore` is a plain file holding exactly what ws writes."""
+    try:
+        fd = os.open(ignore, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return False
+    with os.fdopen(fd, "rb") as f:
+        return f.read(len(IGNORE_TEXT) + 1) == IGNORE_TEXT.encode()
+
+
 def _prepare_class_folder(db: Path) -> None:
+    """The class folder, private, with a `.gitignore` that ignores everything in it. A `.gitignore` that is already there
+    must be exactly ours: anything else could let `git add` take a body, so it is refused, not trusted. The file is made
+    complete under a temporary name and put in place without replacing one that is there."""
     _private_folder(db.parent)
-    ignore = db.parent / ".gitignore"  # ignores everything in the folder, itself too, so `git add` cannot take a body
-    if not ignore.exists():
-        with contextlib.suppress(FileExistsError):
-            fd = os.open(ignore, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    ignore = db.parent / ".gitignore"
+    if not os.path.lexists(ignore):
+        tmp = db.parent / f".gitignore.{os.getpid()}.tmp"
+        with contextlib.suppress(FileNotFoundError):
+            tmp.unlink()
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write("*\n")
+                f.write(IGNORE_TEXT)
+            with contextlib.suppress(FileExistsError):
+                os.link(tmp, ignore)  # whoever got there first wins; it is checked below either way
+        finally:
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+    if not _ignore_is_ours(ignore):
+        raise WsError(
+            "refused",
+            f"the .gitignore in {db.parent} is not the one ws writes, so a body in this folder could be committed",
+            f"remove it, or make it hold exactly one line, `{IGNORE_TEXT.strip()}`",
+        )
+    _refuse_linked_sidecars(db)
     _private_file(db)
 
 
@@ -398,6 +449,7 @@ def _class_connect(db: Path) -> sqlite3.Connection | None:
     """A class store opened to read or tidy, or None when it is not there."""
     if not db.is_file() or db.is_symlink():
         return None
+    _refuse_linked_sidecars(db)
     return _connect(db, "rw")
 
 
@@ -406,6 +458,14 @@ def _class_connect(db: Path) -> sqlite3.Connection | None:
 
 def _t(now: float | None) -> float:
     return time.time() if now is None else float(now)
+
+
+def _device(path: str | Path) -> int | None:
+    """The device a folder is on, or None when it can't be told."""
+    try:
+        return os.stat(path).st_dev
+    except OSError:
+        return None
 
 
 def _bucket(size: int) -> str:
@@ -492,6 +552,7 @@ def _label(value, what: str) -> str | None:
 
 def _admit(
     sender: session.Record,
+    target: session.Record,
     s_class: policy.Class | None,
     r_class: policy.Class | None,
     kind: str,
@@ -521,7 +582,10 @@ def _admit(
             f"sessions in class {r_class.name!r} take no messages",
             "the class's `inbound` in policy.toml is off; set lead-only or allowlist if that is wanted",
         )
-    if r_class.inbound == "lead-only" and sender.role != "lead":
+    # A fixed kind has no text, so it carries nothing out of a class: the default lets it reach a lead, which is how a
+    # worker or a walled session says `done` or `ack`. A walled receiver is never reached this way (below).
+    to_lead = target.role == "lead" and kind in FIXED_KINDS and not _walled(r_class)
+    if r_class.inbound == "lead-only" and sender.role != "lead" and not to_lead:
         raise WsError("refused", f"class {r_class.name!r} takes messages from the lead only", "ask the lead to send it")
     if r_class.inbound == "allowlist" and sender.session_id not in r_class.inbound_allow:
         raise WsError("refused", f"class {r_class.name!r} takes messages from named sessions only", "this is not one")
@@ -550,7 +614,8 @@ def send(
 ) -> dict:
     """Leave `body` for session `to`. The sender is the session this process is under (`session.resolve_caller`); there
     is no way to pass one. Returns the stored message's `id`, `thread_id`, `hop`, `class`, `size` bucket and `replayed`
-    (True when the same sender's `key` was used before: the first message's id comes back and nothing is stored)."""
+    (True when the same sender's `key` was used before to the same recipient: the first message's id comes back and
+    nothing is stored; the same key to another session is a new message)."""
     signal = _t(now)
     if not isinstance(to, str) or not _SESSION_ID.fullmatch(to):
         raise _bad("the recipient must be a session id")
@@ -565,7 +630,12 @@ def send(
     key, thread = _label(key, "the idempotency key"), _label(thread, "the thread name")
     if reply_to is not None:
         reply_to = _int(reply_to, "reply_to")
-    data = (body or "").encode("utf-8", "replace")
+    try:
+        data = (body or "").encode("utf-8")  # strict: a lone surrogate or bytes that were not UTF-8 are not text
+    except UnicodeEncodeError as e:
+        raise _bad(
+            "the body is not valid UTF-8 text", "send text; binary data and broken encodings can't go in a message"
+        ) from e
     if len(data) > BODY_MAX_BYTES:
         raise WsError(
             "too_large", f"the body is {len(data)} bytes; the most is {BODY_MAX_BYTES}", "send a shorter message", 1
@@ -579,7 +649,7 @@ def send(
         raise WsError("not_found", f"no session {to!r}", "the registry has no session with that id")
     s_class = policy.class_of(pol, sender.cwd)
     r_class = policy.class_of(pol, target.cwd)
-    _admit(sender, s_class, r_class, kind, body, key, thread)
+    _admit(sender, target, s_class, r_class, kind, body, key, thread)
     if kind in ("note", "ask") and not data:
         raise _bad(f"a {kind} needs some text")
 
@@ -600,7 +670,7 @@ def send(
     # a walled receiver's body goes to its repo's own store, never the shared one; the repo is recorded either way, so
     # the rows can be dropped when the repo is deleted
     store = _class_store(pol, r_class, target.cwd) if r_class is not None and _walled(r_class) else None
-    idem = hashlib.sha256(f"{sender.session_id}\0{key}".encode()).hexdigest() if key else None
+    idem = hashlib.sha256(f"{sender.session_id}\0{target.session_id}\0{key}".encode()).hexdigest() if key else None
 
     with _typed():
         conn = _open(create=True)
@@ -679,7 +749,7 @@ def _store_message(conn, parties, content, labels, clock) -> dict:
     walled_body = store is not None
     cur = conn.execute(
         'INSERT INTO messages("from","to",sent,sent_ms,t_signal_ms,t_stored_ms,kind,tier,body,sha256,size_bytes,idem,'
-        "thread_id,reply_to,hop,class,walled,store,has_body) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "thread_id,reply_to,hop,class,walled,store,has_body,store_dev) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             sid,
             target.session_id,
@@ -700,6 +770,7 @@ def _store_message(conn, parties, content, labels, clock) -> dict:
             1 if walled_body else 0,
             str(store[0]) if store else None,
             1 if data else 0,
+            _device(store[0]) if store else None,
         ),
     )
     mid = cur.lastrowid
@@ -875,21 +946,36 @@ def read(message_id: int, session_id: str, *, now: float | None = None) -> dict:
             if row is None:
                 raise _missing(mid)
             body, state = _body(row, reader, pol)
-            conn.execute(
-                "UPDATE recipients SET read_ts=COALESCE(read_ts,?) WHERE message_id=? AND recipient=?",
-                (stamp, mid, session_id),
-            )
-            conn.execute(
-                'UPDATE envelope SET delivered_ts=COALESCE(delivered_ts,?) WHERE message_id=? AND "to"=?',
-                (stamp, mid, session_id),
-            )
+            seen = state in ("present", "none")  # a body that came back withheld or gone has not been read
+            if seen:
+                _stamp_read(conn, mid, session_id, stamp)
         finally:
             conn.close()
     item = _public(row)
-    item["read_ts"] = item["read_ts"] or stamp
-    item["delivered_ts"] = item["delivered_ts"] or stamp
+    if seen:
+        item["read_ts"] = item["read_ts"] or stamp
+        item["delivered_ts"] = item["delivered_ts"] or stamp
     item["body"], item["body_state"] = body, state
     return item
+
+
+def _stamp_read(conn: sqlite3.Connection, mid: int, session_id: str, stamp: str) -> None:
+    """Mark a message read and delivered, both or neither."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(
+            "UPDATE recipients SET read_ts=COALESCE(read_ts,?) WHERE message_id=? AND recipient=?",
+            (stamp, mid, session_id),
+        )
+        conn.execute(
+            'UPDATE envelope SET delivered_ts=COALESCE(delivered_ts,?) WHERE message_id=? AND "to"=?',
+            (stamp, mid, session_id),
+        )
+        conn.execute("COMMIT")
+    except BaseException:
+        with contextlib.suppress(sqlite3.Error):
+            conn.execute("ROLLBACK")
+        raise
 
 
 def _missing(mid: int) -> WsError:
@@ -978,33 +1064,47 @@ def _housekeeping(conn: sqlite3.Connection, now: float | None, pol: policy.Polic
         return
 
 
-def _repo_gone(root: str) -> bool:
-    """True only when the repo folder is certainly not there. A folder we are not allowed to see is not gone."""
+def _repo_gone(root: str, device: int | None) -> bool:
+    """True only when the repo folder is certainly deleted: it is not there, and the folder above it is on the same device
+    the repo was on when its first message was written. An unmounted drive leaves its mount point behind, empty and on
+    the other device, and a folder we are not allowed to see is not there either; neither is gone. With no device
+    recorded (a row from an older store) nothing is confirmed, so the row is kept and reported."""
     try:
         os.stat(root)
     except FileNotFoundError:
-        return Path(root).parent.is_dir()
+        pass
     except OSError:
         return False
-    return False
+    else:
+        return False
+    return device is not None and _device(Path(root).parent) == device
 
 
 def _prune(conn: sqlite3.Connection, now: float, pol: policy.Policy, *, force: bool) -> dict:
     last = conn.execute("SELECT value FROM meta WHERE key='last_prune'").fetchone()
     if not force and last is not None and now - float(last["value"]) < PRUNE_EVERY_S:
-        return {"ran": False, "expired": 0, "gone": 0}
-    touched: set[tuple[str, str]] = set()  # (repo root, class) of walled rows whose bodies may need tidying
-    gone = expired = 0
+        return {"ran": False, "expired": 0, "gone": 0, "unconfirmed": 0}
+    gone = expired = unconfirmed = 0
     conn.execute("BEGIN IMMEDIATE")
     try:
-        for row in conn.execute("SELECT DISTINCT store FROM messages WHERE store IS NOT NULL").fetchall():
-            if _repo_gone(row["store"]):
+        stores = conn.execute("SELECT DISTINCT store, store_dev FROM messages WHERE store IS NOT NULL").fetchall()
+        for row in stores:
+            if _repo_gone(row["store"], row["store_dev"]):
                 gone += conn.execute("DELETE FROM messages WHERE store=?", (row["store"],)).rowcount
+                conn.execute("DELETE FROM tidy WHERE store=?", (row["store"],))
+            elif not os.path.exists(row["store"]):
+                unconfirmed += conn.execute("SELECT COUNT(*) FROM messages WHERE store=?", (row["store"],)).fetchone()[
+                    0
+                ]
         for row in conn.execute("SELECT DISTINCT class FROM messages").fetchall():
             cutoff = int((now - _retention_days(pol, row["class"]) * 86400) * 1000)
             old = "FROM messages WHERE class IS ? AND sent_ms<?"
-            for walled in conn.execute(f"SELECT DISTINCT store {old} AND store IS NOT NULL", (row["class"], cutoff)):
-                touched.add((walled["store"], row["class"]))
+            # the bodies of the rows about to go are written down first, in this transaction, so a removal that fails
+            # below is tried again on the next prune and not lost with the rows
+            conn.execute(
+                f"INSERT OR IGNORE INTO tidy(store, class) SELECT DISTINCT store, ? {old} AND store IS NOT NULL",
+                (row["class"], row["class"], cutoff),
+            )
             expired += conn.execute(f"DELETE {old}", (row["class"], cutoff)).rowcount
         conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('last_prune',?)", (repr(now),))
         conn.execute("COMMIT")
@@ -1012,33 +1112,40 @@ def _prune(conn: sqlite3.Connection, now: float, pol: policy.Policy, *, force: b
         with contextlib.suppress(sqlite3.Error):
             conn.execute("ROLLBACK")
         raise
-    for root, cls in touched:
-        _tidy_class_store(root, cls, pol, now)
-    return {"ran": True, "expired": expired, "gone": gone}
+    for row in conn.execute("SELECT store, class FROM tidy").fetchall():
+        if _tidy_class_store(row["store"], row["class"], pol, now):
+            conn.execute("DELETE FROM tidy WHERE store=? AND class=?", (row["store"], row["class"]))
+    return {"ran": True, "expired": expired, "gone": gone, "unconfirmed": unconfirmed}
 
 
-def _tidy_class_store(root: str, cls: str, pol: policy.Policy, now: float) -> None:
-    """Drop the bodies past the class's retention from the store in `root`, when it can be reached. That covers the
-    messages just expired and any body left by a crash between the two stores. A store that can't be reached is left."""
+def _tidy_class_store(root: str, cls: str, pol: policy.Policy, now: float) -> bool:
+    """Drop the bodies past the class's retention from the store in `root`. True when that is done, or there is nothing
+    to do (the store, or the repo, is not there); False when the store could not be reached or written, so the caller
+    keeps it on its list and tries again on the next prune."""
     conn = None
-    with contextlib.suppress(sqlite3.Error, OSError):
+    try:
         conn = _class_connect(_class_db(root, cls))
         if conn is not None:
             conn.execute("DELETE FROM bodies WHERE sent_ms<?", (int((now - _retention_days(pol, cls) * 86400) * 1000),))
-    if conn is not None:
-        conn.close()
+        return True
+    except (sqlite3.Error, OSError, WsError):
+        return False
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def prune(*, now: float | None = None, force: bool = False) -> dict:
     """Drop messages past their receiving class's `retention_days` (30 with no class), and the rows of walled messages
     whose repo folder is gone (their bodies went with it). Runs at most once an hour unless `force`. Returns `ran`,
-    `expired` and `gone`. A policy that will not load refuses (retention can't be known). Reads the account's own policy
+    `expired`, `gone` and `unconfirmed` (rows whose repo folder is missing but that were kept, because ws can't tell
+    deleted from unmounted). A policy that will not load refuses (retention can't be known). Reads the account's own policy
     (`session.trusted_env`); a session's calls tidy under it too."""
     pol = _load_policy(_config() / POLICY_FILE)
     with _typed():
         conn = _open(create=False)
         if conn is None:
-            return {"ran": False, "expired": 0, "gone": 0}
+            return {"ran": False, "expired": 0, "gone": 0, "unconfirmed": 0}
         try:
             return _prune(conn, _t(now), pol, force=force)
         finally:
@@ -1056,15 +1163,19 @@ def export(
     limit: int = EXPORT_DEFAULT,
 ) -> int:
     """Write messages to `out` (a text stream) as JSON lines, each carrying `schema: "ws.message/1"`, and return how many.
-    Never a walled body, for anyone: those rows carry the envelope and `body: null`. With `session_id` only that session's
-    messages (sent or received); without, the whole store (for ws's own tools and the owner path to come; `ws msg export`
-    always passes the caller's). Not written through ws.jsonl: it
-    is an export, not a log."""
+    Never a walled body, for anyone: those rows carry the envelope and `body: null`. Only the messages `session_id` sent
+    or was sent. With no session id (None, or empty) it refuses with a `refused` error: there is no way to ask this
+    function for the whole store, and a caller that can't be resolved is not a reason to try. Not written through
+    ws.jsonl: it is an export, not a log."""
+    if not isinstance(session_id, str) or not _SESSION_ID.fullmatch(session_id):
+        raise WsError(
+            "refused",
+            "an export needs the session it is for, and none was given",
+            "run it from inside a session; ws can't tell which one a person's shell is",
+        )
     limit = _int(limit, "limit", 1, EXPORT_MAX)
     after = _int(after, "after", 0)
-    where, args = "m.id>?", [after]
-    if session_id is not None:
-        where, args = 'm.id>? AND (m."from"=? OR r.recipient=?)', [after, session_id, session_id]
+    where, args = 'm.id>? AND (m."from"=? OR r.recipient=?)', [after, session_id, session_id]
     with _typed():
         conn = _open(create=False)
         if conn is None:
@@ -1105,7 +1216,10 @@ def _line(m: dict) -> str:
 def cmd_send(args: argparse.Namespace) -> int:
     text = args.text
     if text == "-":
-        text = sys.stdin.read(BODY_MAX_BYTES + 1)
+        try:
+            text = sys.stdin.read(BODY_MAX_BYTES + 1)
+        except UnicodeDecodeError as e:
+            raise _bad("the message on standard input is not valid UTF-8 text", "send text") from e
     result = send(
         args.to,
         args.kind,
@@ -1156,20 +1270,47 @@ def cmd_read(args: argparse.Namespace) -> int:
     return 0
 
 
+def _export_to(path: Path, sid: str, after: int, limit: int) -> int:
+    """Export into a new file at `path`, and only a new one: an existing path (a file, a link, anything) is refused, and
+    nothing is truncated or replaced. The lines go to a temporary file in the same folder first and are put in place only
+    when the export has finished, so a failed export leaves no half-written file at `path`."""
+    if os.path.lexists(path):
+        raise WsError("exists", f"{path} is already there", "give a path that doesn't exist; ws won't overwrite a file")
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    except OSError as e:
+        raise WsError(
+            "io", f"can't write {path}: {e.strerror or 'error'}", "give a path in a folder you can write"
+        ) from e
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            n = export(f, session_id=sid, after=after, limit=limit)
+        try:
+            os.link(tmp, path)  # fails if something appeared at `path` meanwhile; it is never replaced
+        except FileExistsError as e:
+            raise WsError("exists", f"{path} is already there", "give a path that doesn't exist") from e
+        except OSError as e:
+            raise WsError(
+                "io", f"can't write {path}: {e.strerror or 'error'}", "give a path in a folder you can write"
+            ) from e
+    except OSError as e:  # the temporary file could not be written (a full disk)
+        raise WsError(
+            "io", f"can't write {path}: {e.strerror or 'error'}", "free some space or use another path"
+        ) from e
+    finally:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+    return n
+
+
 def cmd_export(args: argparse.Namespace) -> int:
     sid = caller().session_id  # no caller, no export: an orphaned process is not a person (the owner path is w5's)
     if args.out is None:
         export(sys.stdout, session_id=sid, after=args.after, limit=args.limit)
         return 0
     path = Path(args.out).expanduser()
-    try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
-    except OSError as e:
-        raise WsError(
-            "io", f"can't write {path}: {e.strerror or 'error'}", "give a path in a folder you can write"
-        ) from e
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        n = export(f, session_id=sid, after=args.after, limit=args.limit)
+    n = _export_to(path, sid, args.after, args.limit)
     if args.json:
         output.result({"written": n, "path": str(path)})
     else:

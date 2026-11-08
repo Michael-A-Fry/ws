@@ -45,8 +45,9 @@ against the environment's config folder was tried and fails the same way: the re
 The cost: a person whose ws folders come from one of those variables is refused until ws reads the layout from the
 runner's own start-up environment (`/proc/<pid>/environ`, `ps eww` on macOS), the stronger option left for later.
 
-An idempotency key is stored as the hash of the sender and the key, so a key that was chosen by one session is not
-text in the shared file. A thread name can't be set on a message to a walled class.
+An idempotency key is stored as the hash of the sender, the recipient and the key, so a key that was chosen by one
+session is not text in the shared file, and the same key to two sessions is two messages. A thread name can't be set
+on a message to a walled class.
 
 ### Consequences
 
@@ -59,10 +60,12 @@ text in the shared file. A thread name can't be set on a message to a walled cla
   first, the hourly prune removes bodies past their retention, and a read of a message whose body is missing says
   `gone`.
 - Bad: with `[classes]` in the policy, a full class defaults to taking messages from the lead only, so a worker can't
-  reply to the lead until that class says `inbound = "allowlist"` and names the sessions. That is the policy's choice to
-  make, not a rule in the store.
-- Bad: the repo root of a walled receiver is kept in the shared file so `prune` can tell the repo is gone. The session
-  registry already holds the same folder.
+  send it free text until that class says `inbound = "allowlist"` and names the sessions. The one exception is a fixed
+  kind (`ack`, `done`, `counts` and the like, which carry no text) sent to a lead: the default lets it in from any
+  session, a walled one included, so the done and ack flow works with no policy edit. An explicit `off` or `allowlist` is
+  obeyed, and no fixed kind goes into a walled class.
+- Bad: the repo root of a walled receiver, and the device it was on, are kept in the shared file so `prune` can tell the
+  repo is gone and not merely unmounted. The session registry already holds the same folder.
 - Bad: inside the wall the state folder is read-only, so a send from there fails with a typed `unavailable` error.
   Delivery across the wall is not built yet.
 

@@ -228,7 +228,7 @@ def test_export_has_no_walled_body(world, capsys):  # (d)
     token, other = planted(), planted("open")
     world.send("lead1", "wall1", "note", token)
     world.send("lead1", "work1", "note", other)
-    for caller in (None, "lead1", "wall1", "work1"):  # a person at a terminal, the lead, the walled session, a worker
+    for caller in ("lead1", "wall1", "work1"):  # the lead, the walled session, a worker
         world.who = caller
         out = io.StringIO()
         n = msg.export(out, session_id=caller)
@@ -236,7 +236,7 @@ def test_export_has_no_walled_body(world, capsys):  # (d)
         lines = [json.loads(line) for line in out.getvalue().splitlines()]
         assert len(lines) == n and all(line["schema"] == "ws.message/1" for line in lines)
     out = io.StringIO()
-    msg.export(out)
+    msg.export(out, session_id="lead1")
     by_class = {line["class"]: line for line in map(json.loads, out.getvalue().splitlines())}
     assert by_class["secret"]["body"] is None and by_class["secret"]["body_sha256"] is None
     assert by_class["secret"]["body_kept_in_class_store"] is True
@@ -518,7 +518,9 @@ def test_replay_returns_first_id(plain):
     other = plain.send("bravo", "alpha", body="x", key="job-1")  # the key is the sender's own
     assert other["id"] != first["id"]
     # the key is not stored as given
-    assert plain.rows("SELECT idem FROM messages WHERE id=1")[0][0] == hashlib.sha256(b"alpha\0job-1").hexdigest()
+    assert (
+        plain.rows("SELECT idem FROM messages WHERE id=1")[0][0] == hashlib.sha256(b"alpha\0bravo\0job-1").hexdigest()
+    )
     plain.refused("alpha", "bravo", key="has space", kind="bad_input")
 
 
@@ -728,7 +730,7 @@ def test_retention_per_class(world):
     world.send("lead1", "work1", body="open class: 10 days", now=BASE)
     world.send("lead1", "wall1", body="secret class: 5 days", now=BASE)
     day = 86400
-    assert msg.prune(now=BASE + 3 * day, force=True) == {"ran": True, "expired": 0, "gone": 0}
+    assert msg.prune(now=BASE + 3 * day, force=True) == {"ran": True, "expired": 0, "gone": 0, "unconfirmed": 0}
     assert msg.prune(now=BASE + 6 * day, force=True)["expired"] == 1  # the walled one, past its 5 days
     assert world.rows("SELECT class FROM messages") == [("open",)]
     assert world.rows("SELECT COUNT(*) FROM bodies", class_db(world)) == [(0,)]  # its body went too
@@ -782,7 +784,7 @@ def test_a_repo_that_cannot_be_seen_is_not_a_repo_that_is_gone(world, monkeypatc
         raise PermissionError(13, "denied")
 
     monkeypatch.setattr(msg, "os", types.SimpleNamespace(stat=denied))
-    assert msg._repo_gone(str(world.root / "walled")) is False
+    assert msg._repo_gone(str(world.root / "walled"), 1) is False
 
 
 # --- reading ----------------------------------------------------------------------------------------------------------
@@ -840,9 +842,9 @@ def test_lists_are_bounded(plain):
     assert [m["id"] for m in msg.inbox("bravo", limit=2)] == [1, 2]
     assert [m["id"] for m in msg.inbox("bravo", after=4)] == [5]
     out = io.StringIO()
-    assert msg.export(out, limit=3) == 3
+    assert msg.export(out, session_id="bravo", limit=3) == 3
     with pytest.raises(WsError):
-        msg.export(out, limit=msg.EXPORT_MAX + 1)
+        msg.export(out, session_id="bravo", limit=msg.EXPORT_MAX + 1)
 
 
 # --- the classless rules, and a policy that will not load --------------------------------------------------------------
@@ -961,3 +963,248 @@ def test_shared_store_is_private(plain):
     assert (folder.stat().st_mode & 0o777, msg.store_path().stat().st_mode & 0o777) == (0o700, 0o600)
     assert msg.store_path() == paths.state_dir() / "msg" / "messages.db"
     assert sqlite3.connect(msg.store_path()).execute("PRAGMA journal_mode").fetchone() == ("wal",)
+
+
+# --- review fixes: export, text, keys, class folders, read, retention, the lead path ---------------------------------------
+
+
+def classed_by_default(world):
+    """A lead and two workers in a full class that says nothing about `inbound` (so it is lead-only), and one session in a
+    walled class that takes notes from the lead."""
+    open_dir, walled = world.folder("open"), world.folder("walled", git=True)
+    world.policy(
+        f"""
+        [classes.secret]
+        access = "walled"
+        repos = ["{walled}"]
+        inbound = "lead-only"
+        [classes.open]
+        access = "full"
+        repos = ["{open_dir}"]
+        """
+    )
+    world.session("lead1", world.folder("open/lead"), role="lead")
+    world.session("work1", world.folder("open/w1"))
+    world.session("work2", world.folder("open/w2"))
+    world.session("wall1", world.folder("walled/src"))
+    return world
+
+
+def test_an_export_with_no_session_refuses_and_never_reads_the_whole_store(plain):
+    plain.send("alpha", "bravo")
+    for nobody in (None, "", "bad id!", 7):
+        out = io.StringIO()
+        with pytest.raises(WsError) as e:
+            msg.export(out, session_id=nobody)
+        assert e.value.kind == "refused" and out.getvalue() == "", nobody
+    with pytest.raises(WsError):
+        msg.export(io.StringIO())  # the default is not "everything"
+
+
+def test_export_out_refuses_an_existing_path_and_leaves_it_alone(plain, capsys, tmp_path):
+    plain.send("alpha", "bravo")
+    plain.who = "alpha"
+    folder = tmp_path / "exports"
+    folder.mkdir()
+    taken = folder / "taken.jsonl"
+    taken.write_text("precious\n")
+    code, out, _ = run(capsys, "msg", "export", "--out", str(taken), "--json")
+    assert (code, json.loads(out)["error_kind"]) == (1, "exists") and taken.read_text() == "precious\n"
+    dangling = folder / "link.jsonl"
+    dangling.symlink_to(folder / "elsewhere.jsonl")
+    code, out, _ = run(capsys, "msg", "export", "--out", str(dangling), "--json")
+    assert (code, json.loads(out)["error_kind"]) == (1, "exists") and not (folder / "elsewhere.jsonl").exists()
+    assert sorted(p.name for p in folder.iterdir()) == ["link.jsonl", "taken.jsonl"]  # no temporary file left behind
+
+
+def test_a_failed_export_leaves_nothing_at_the_path(plain, capsys, tmp_path, monkeypatch):
+    plain.send("alpha", "bravo")
+    plain.who = "alpha"
+
+    def boom(out, **kw):
+        out.write("half a line")
+        raise WsError("unavailable", "the message store is locked", "try again", 1)
+
+    monkeypatch.setattr(msg, "export", boom)
+    path = tmp_path / "never.jsonl"
+    code, out, _ = run(capsys, "msg", "export", "--out", str(path), "--json")
+    assert (code, json.loads(out)["error_kind"]) == (1, "unavailable")
+    assert list(tmp_path.glob("*never*")) == []  # neither the file nor a temporary one
+
+
+def test_a_body_that_is_not_text_is_a_typed_error(plain, capsys, monkeypatch):
+    for broken in ("lone \ud800 surrogate", "\udcff"):  # what a broken encoding on argv or stdin turns into
+        plain.refused("alpha", "bravo", body=broken, kind="bad_input")
+    assert plain.count() == 0
+
+    class Broken:
+        def read(self, n=-1):
+            raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+    plain.who = "alpha"
+    monkeypatch.setattr(sys, "stdin", Broken())
+    code, out, _ = run(capsys, "msg", "send", "bravo", "-", "--json")
+    assert (code, json.loads(out)["error_kind"]) == (2, "bad_input")
+
+
+def test_a_key_is_the_senders_and_the_recipients(plain):
+    first = plain.send("alpha", "bravo", body="one", key="job-1")
+    other = plain.send("alpha", "carol", body="two", key="job-1")  # the same key, a different session: delivered
+    again = plain.send("alpha", "carol", body="three", key="job-1")
+    assert other["id"] != first["id"] and other["replayed"] is False
+    assert (again["id"], again["replayed"]) == (other["id"], True)
+    assert plain.rows('SELECT "to", body FROM messages ORDER BY id') == [("bravo", "one"), ("carol", "two")]
+
+
+def test_a_gitignore_that_is_not_ours_is_refused(world):
+    classed(world)
+    folder = class_db(world).parent
+    folder.mkdir(parents=True)
+    ignore = folder / ".gitignore"
+    for wrong in ("# nothing\n", "*\n!messages.db\n", "*", ""):
+        ignore.write_text(wrong)
+        err = world.refused("lead1", "wall1", body="a body", kind="refused")
+        assert ".gitignore" in err.message
+    assert world.count() == 0 and not class_db(world).exists()
+    ignore.unlink()
+    ignore.symlink_to(world.root / "somewhere")  # a link, even to a file that says the same thing
+    (world.root / "somewhere").write_text("*\n")
+    world.refused("lead1", "wall1", body="a body", kind="refused")
+    ignore.unlink()
+    assert world.send("lead1", "wall1", body="a body")["id"] == 1  # nothing there: ws writes its own
+    assert ignore.read_text() == "*\n"
+    assert sorted(p.name for p in folder.iterdir() if p.name.startswith(".git")) == [".gitignore"]  # no temporary left
+    assert world.send("lead1", "wall1", body="again")["id"] == 2  # one that is exactly ours is fine
+
+
+def test_a_linked_sidecar_of_a_class_store_is_refused(world):
+    classed(world)
+    world.send("lead1", "wall1", body=planted())
+    db = class_db(world)
+    for end in ("-journal", "-wal", "-shm"):
+        side = db.with_name(db.name + end)
+        side.unlink(missing_ok=True)
+        side.symlink_to(world.root / "outside")
+        world.refused("lead1", "wall1", body="more", kind="refused")
+        with pytest.raises(WsError) as e:
+            msg.read(1, "wall1")
+        assert e.value.kind == "refused"
+        side.unlink()
+    assert msg.read(1, "wall1")["body_state"] == "present"
+
+
+def test_a_gone_body_is_not_stamped_read(world):
+    classed(world)
+    world.send("lead1", "wall1", body=planted())
+    shutil.rmtree(class_db(world).parent)  # the store is gone
+    assert msg.read(1, "wall1")["body_state"] == "gone"
+    assert world.rows("SELECT read_ts FROM recipients") == [(None,)]
+    assert world.rows("SELECT delivered_ts FROM envelope") == [(None,)]
+
+
+def test_a_body_withheld_from_a_reader_outside_the_class_is_not_stamped_read(world):
+    classed(world)
+    world.send("lead1", "wall1", body=planted())
+    classed_policy = (world.root / "wshome" / "policy.toml").read_text()
+    world.policy("")  # the folder is in no class any more: the body is withheld
+    got = msg.read(1, "wall1")
+    assert (got["body_state"], got["body"], got["read_ts"], got["delivered_ts"]) == ("withheld", None, None, None)
+    assert world.rows("SELECT read_ts FROM recipients") == [(None,)]
+    (world.root / "wshome" / "policy.toml").write_text(classed_policy)
+    again = msg.read(1, "wall1")
+    assert again["body_state"] == "present" and again["read_ts"] and again["delivered_ts"]
+
+
+def test_read_stamps_both_or_neither(plain):
+    mid = plain.send("alpha", "bravo", body="x")["id"]
+    shared = sqlite3.connect(msg.store_path())
+    shared.execute("CREATE TRIGGER no_delivery BEFORE UPDATE ON envelope BEGIN SELECT RAISE(ABORT, 'x'); END")
+    shared.commit()
+    shared.close()
+    with pytest.raises(WsError) as e:
+        msg.read(mid, "bravo")
+    assert e.value.kind == "unavailable"
+    assert plain.rows("SELECT read_ts FROM recipients") == [(None,)]  # the first update was rolled back with the second
+
+
+def test_a_row_whose_repo_may_only_be_unmounted_is_kept_and_reported(world):
+    classed(world)
+    world.send("lead1", "wall1", body=planted())
+    world.send("lead1", "wall1", "stop-and-hand-over", None)
+
+    def set_dev(value) -> None:
+        conn = sqlite3.connect(msg.store_path())
+        conn.execute("UPDATE messages SET store_dev=?", (value,))
+        conn.commit()
+        conn.close()
+
+    real = world.rows("SELECT store_dev FROM messages")[0][0]
+    assert isinstance(real, int)
+    set_dev(real + 1)  # the repo was on another device when it was written
+    shutil.rmtree(world.root / "walled")  # the folder is not there and its parent is: an unmounted drive looks so
+    got = msg.prune(now=BASE, force=True)
+    assert (got["gone"], got["unconfirmed"]) == (0, 2) and counts(world) == (2, 2, 2)
+    set_dev(None)  # a row from before the device was kept: nothing is confirmed
+    assert msg.prune(now=BASE, force=True)["gone"] == 0 and counts(world) == (2, 2, 2)
+    set_dev(real)  # the same device as the folder above it: certainly deleted
+    assert msg.prune(now=BASE, force=True)["gone"] == 2 and counts(world) == (0, 0, 0)
+
+
+def test_the_default_lets_a_worker_or_a_walled_session_reach_the_lead_with_a_fixed_kind(world):
+    classed_by_default(world)
+    assert world.send("work1", "lead1", "done", None)["class"] == "open"  # a worker says it is done
+    assert world.send("work1", "lead1", "ack", None)["id"]
+    assert world.send("wall1", "lead1", "counts", None)["id"]  # so does a walled session: no text, so nothing leaves
+    world.refused("work1", "lead1", "note", "free text still needs the lead's say")
+    world.refused("work1", "work2", "done", None)  # only a lead is reached this way
+    assert world.send("lead1", "work1", "note", "from the lead")["id"]  # and the lead reaches anyone
+    assert world.send("lead1", "wall1", "note", "to the walled one")["class"] == "secret"
+
+
+def test_an_explicit_off_or_allowlist_is_still_obeyed(world):
+    open_dir = world.folder("open")
+    world.policy(f'[classes.open]\naccess = "full"\nrepos = ["{open_dir}"]\ninbound = "off"\n')
+    world.session("lead1", world.folder("open/lead"), role="lead")
+    world.session("work1", world.folder("open/w1"))
+    world.refused("work1", "lead1", "done", None)
+    world.policy(
+        f'[classes.open]\naccess = "full"\nrepos = ["{open_dir}"]\ninbound = "allowlist"\ninbound_allow = ["lead1"]\n'
+    )
+    world.refused("work1", "lead1", "done", None)
+
+
+def test_a_reply_is_not_let_in_to_a_walled_session(world):
+    classed(world)  # the walled class takes the lead only
+    first = world.send("wall1", "work1", "counts", None)  # a fixed kind from the walled session to a worker
+    world.refused("work1", "wall1", "note", "a reply", reply_to=first["id"])
+    world.refused("work1", "wall1", "ack", None, reply_to=first["id"])
+    assert world.count() == 1
+
+
+def test_a_walled_session_takes_a_fixed_kind_from_nobody(world):
+    classed(world, walled_inbound="allowlist", walled_allow=("work1", "lead1"))
+    first = world.send("wall1", "work1", "counts", None)
+    assert world.send("work1", "wall1", "note", "named in the list", reply_to=first["id"])["hop"] == 1
+    for sender in ("work1", "lead1"):
+        for kind in ("ack", "done"):  # a reply is not let in because it is a reply: only note, ask and hand-over go in
+            world.refused(sender, "wall1", kind, None, reply_to=first["id"])
+
+
+def test_a_failed_body_removal_is_tried_again_on_the_next_prune(world):
+    classed(world)
+    day = 86400
+    world.send("lead1", "wall1", body=planted(), now=BASE)
+    walled = sqlite3.connect(class_db(world))
+    walled.execute("CREATE TRIGGER stuck BEFORE DELETE ON bodies BEGIN SELECT RAISE(ABORT, 'x'); END")
+    walled.commit()
+    walled.close()
+    assert msg.prune(now=BASE + 6 * day, force=True)["expired"] == 1  # the row goes; the body cannot be removed yet
+    assert world.rows("SELECT COUNT(*) FROM bodies", class_db(world)) == [(1,)]
+    assert world.rows("SELECT COUNT(*) FROM tidy") == [(1,)]  # the shared store remembers it has one to do
+    walled = sqlite3.connect(class_db(world))
+    walled.execute("DROP TRIGGER stuck")
+    walled.commit()
+    walled.close()
+    assert msg.prune(now=BASE + 7 * day, force=True)["ran"] is True  # nothing left to expire, but the body goes now
+    assert world.rows("SELECT COUNT(*) FROM bodies", class_db(world)) == [(0,)]
+    assert world.rows("SELECT COUNT(*) FROM tidy") == [(0,)]

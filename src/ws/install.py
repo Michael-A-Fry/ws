@@ -39,7 +39,20 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from ws import __version__, adapters, notesdetect, osinfo, output, paths, policy, profile, roles, selfcmd, userconfig
+from ws import (
+    __version__,
+    adapters,
+    notesdetect,
+    osinfo,
+    output,
+    paths,
+    policy,
+    profile,
+    roles,
+    selfcmd,
+    userconfig,
+    wallsettings,
+)
 from ws.jobs import JobError
 from ws.output import WsError
 
@@ -1106,8 +1119,56 @@ def _answers_from_args(args: argparse.Namespace, env: Mapping[str, str]) -> Answ
     return a
 
 
+# the install flags that set something; `--class` only prints, so it takes none of them
+_SETTING_FLAGS = ("stays_on", "server", "notes", "module", "runner", "model", "gate", "cap", "allow_widened_sandbox")
+
+
+def class_text(name: str, env: Mapping[str, str]) -> tuple[policy.Class, str]:
+    """(the class, the text `ws install --class NAME` prints). Reads the policy and the system's user database and writes
+    nothing, creating no user. An unknown class, and a class with no `os_user`, are usage errors."""
+    pol_file = policy.policy_path(dict(env))
+    try:
+        pol = policy.load(pol_file)
+    except policy.PolicyError as e:
+        raise WsError("bad_config", str(e), f"fix {pol_file}") from e
+    cls = pol.classes.get(name)
+    if cls is None:
+        known = ", ".join(c.name for c in wallsettings.class_users(pol)) or "none"
+        raise WsError(
+            "usage",
+            f"no class named {name!r} in the policy",
+            f'classes with an os_user: {known}; add [classes.NAME] with os_user = "..." to {pol_file}',
+            2,
+        )
+    if not cls.os_user:
+        raise WsError(
+            "usage",
+            f"class {name!r} has no os_user, so there is no account to set up",
+            f'add os_user = "..." under [classes.{name}] in {pol_file}, then run this again',
+            2,
+        )
+    return cls, wallsettings.install_text(cls, env, osinfo.detect(env=dict(env)).kind)
+
+
+def _cmd_install_class(args: argparse.Namespace) -> int:
+    """`ws install --class NAME`: print the commands and the root-owned file for the class's OS user. Nothing is written."""
+    given = [f"--{k.replace('_', '-')}" for k in _SETTING_FLAGS if getattr(args, k, None) not in (None, False, [])]
+    if given:
+        raise WsError(
+            "usage", f"--class only prints; it can't be used with {', '.join(given)}", "run them separately", 2
+        )
+    cls, text = class_text(args.class_name, os.environ)
+    if args.json:
+        output.result({"class": cls.name, "os_user": cls.os_user, "writes": False, "text": text})
+    else:
+        print(text)
+    return 0
+
+
 def cmd_install(args: argparse.Namespace) -> int:
     env = os.environ
+    if getattr(args, "class_name", None):
+        return _cmd_install_class(args)
     try:
         answers = _answers_from_args(args, env)
         steps = plan(answers, env)
@@ -1249,6 +1310,13 @@ def register(sub) -> None:
         "--allow-widened-sandbox",
         action="store_true",
         help="keep settings of yours that open the sandbox (an excluded command, say); ws records the choice",
+    )
+    i.add_argument(
+        "--class",
+        dest="class_name",
+        metavar="NAME",
+        help="print the commands (sudo included) and the root-owned managed-settings file for a class with an os_user; "
+        "writes nothing and creates no user",
     )
     i.add_argument("--cap", type=float, metavar="USD", help="a monthly spend cap in US$")
     i.add_argument("-y", "--yes", action="store_true", help="do not ask before writing")

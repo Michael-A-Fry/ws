@@ -6,11 +6,13 @@ from __future__ import annotations
 import hashlib
 import json
 import shlex
+import subprocess
 import tomllib
+from pathlib import Path
 
 import pytest
 
-from ws import cli, install, osinfo, selfcmd
+from ws import cli, install, osinfo, policy, selfcmd, wallsettings
 
 
 @pytest.fixture
@@ -641,3 +643,131 @@ def test_the_hooks_of_a_launch_install_start_ws_with_an_absolute_isolated_interp
         else:
             assert c.startswith(prefix + " "), c
     assert all(shlex.split(c)[0].startswith("/") and shlex.split(c)[1] == "-I" for c in ws_commands)
+
+
+# --- ws install --class NAME: prints, writes nothing --------------------------------------------------------------------
+
+CLASS_POLICY = """
+[classes.work]
+access = "walled"
+os_user = "ws-work"
+repos = ["/srv/work/**", "/srv/more"]
+
+[classes.home]
+access = "full"
+repos = ["/srv/home/**"]
+"""
+
+
+def class_box(box, text: str = CLASS_POLICY):
+    pol = box / ".ws" / "policy.toml"
+    pol.parent.mkdir(exist_ok=True)
+    pol.write_text(text, encoding="utf-8")
+    return pol
+
+
+def test_install_class_prints_commands_and_root_file_and_changes_nothing(box, capsys, monkeypatch):
+    class_box(box)
+    pre = snapshot(box)
+
+    def no_process(*a, **k):
+        raise AssertionError("ws must not start a process (no useradd, no sudo)")
+
+    monkeypatch.setattr(subprocess, "run", no_process)
+    monkeypatch.setattr(subprocess, "Popen", no_process)
+    code, out, _ = run(capsys, "install", "--class", "work")
+    assert code == 0
+    target = wallsettings.class_file_path("work", osinfo.detect().kind)
+    assert "sudo" in out and "ws-work" in out and str(target) in out
+    assert f"sudo chown root:{'wheel' if osinfo.detect().kind == 'macos' else 'root'} {target}" in out
+    assert "applies to every account on this machine" in out
+    body = out.split("<<'WS_CLASS_FILE'\n", 1)[1].split("\nWS_CLASS_FILE", 1)[0]
+    conf = json.loads(body)
+    sb = conf["sandbox"]
+    assert conf["permissions"] == {wallsettings.BYPASS_KEY: wallsettings.BYPASS_OFF}
+    assert sb["enabled"] is True and sb["failIfUnavailable"] is True and sb["allowUnsandboxedCommands"] is False
+    assert sb["filesystem"]["allowWrite"][:2] == ["/srv/work", "/srv/more"] and "/tmp" in sb["filesystem"]["allowWrite"]
+    assert sb["filesystem"]["denyRead"] == ["~/"] and sb["filesystem"]["allowRead"] == ["/srv/work", "/srv/more"]
+    assert conf["env"] == {"WS_INBOUND": "lead-only"}
+    assert snapshot(box) == pre  # nothing written, anywhere under the home
+    assert not target.exists() and not target.parent.exists()
+
+
+@pytest.mark.parametrize("repo", ["/srv/work/ops-*", "/srv/work/*", "~/code/*", "/srv/*/work/**", "/srv/work/ops-?"])
+def test_install_class_refuses_a_wildcard_in_a_folder_name(box, capsys, repo):
+    """A glob like `work/ops-*` would put the folder above the repos in the file and the chown; it is a usage error."""
+    class_box(box, f'[classes.work]\naccess = "walled"\nos_user = "ws-work"\nrepos = ["{repo}"]\n')
+    pre = snapshot(box)
+    code = cli.main(["install", "--class", "work", "--json"])
+    err = json.loads(capsys.readouterr().out)
+    assert code == 2 and err["error_kind"] == "usage" and "wildcard in a folder name" in err["message"]
+    assert "sudo" not in json.dumps(err) and snapshot(box) == pre
+
+
+def test_install_class_holds_a_trailing_double_star_as_its_folder_and_nothing_wider(box, capsys):
+    class_box(
+        box, '[classes.work]\naccess = "walled"\nos_user = "ws-work"\nrepos = ["/srv/work/ops/**", "/srv/other"]\n'
+    )
+    code, out, _ = run(capsys, "install", "--class", "work")
+    assert code == 0
+    assert "chown -R ws-work /srv/work/ops\n" in out + "\n" and "chown -R ws-work /srv/other" in out
+    assert "chown -R ws-work /srv/work\n" not in out + "\n" and "chown -R ws-work /srv\n" not in out + "\n"
+
+
+def test_install_class_names_the_macos_paths_from_the_constants(box):
+    pol = policy.loads(CLASS_POLICY)
+    text = wallsettings.install_text(pol.classes["work"], {"HOME": str(box)}, "macos")
+    mac = wallsettings.MANAGED_DIRS[-1]
+    assert f"{mac}/{wallsettings.class_file_name('work')}" in text and "root:wheel" in text and "sysadminctl" in text
+
+
+def test_install_class_json_says_it_writes_nothing(box, capsys):
+    class_box(box)
+    code = cli.main(["install", "--class", "work", "--json"])
+    data = json.loads(capsys.readouterr().out)["data"]
+    assert code == 0 and data["writes"] is False and data["class"] == "work" and "sudo" in data["text"]
+
+
+def test_install_class_rejects_a_class_without_os_user(box, capsys):
+    class_box(box)
+    pre = snapshot(box)
+    code = cli.main(["install", "--class", "home", "--json"])
+    err = json.loads(capsys.readouterr().out)
+    assert code == 2 and err["error_kind"] == "usage" and "os_user" in err["message"] + err["hint"]
+    code = cli.main(["install", "--class", "nothing", "--json"])
+    err = json.loads(capsys.readouterr().out)
+    assert code == 2 and err["error_kind"] == "usage" and "work" in err["hint"]  # names the classes that can be used
+    code = cli.main(["install", "--class", "work", "--runner", "claude-code", "--json"])
+    err = json.loads(capsys.readouterr().out)
+    assert code == 2 and err["error_kind"] == "usage" and "--runner" in err["message"]
+    assert snapshot(box) == pre
+
+
+def test_install_without_class_never_renders_or_places_a_managed_file(box, capsys):
+    class_box(box)
+    assert run(capsys, "install", *FULL, "--notes", str(box / "Notes"))[0] == 0
+    managed = Path(wallsettings.MANAGED_DIRS[0])
+    assert not managed.exists() and not Path(wallsettings.MANAGED_FILES[0]).exists()
+    assert not list(box.rglob("*ws-class-*"))
+
+
+def test_install_class_places_the_file_under_another_name_and_moves_it(box, capsys):
+    """A paste that stops half way must leave no half-written `*.json` in the folder Claude Code reads."""
+    class_box(box)
+    code, out, _ = run(capsys, "install", "--class", "work")
+    assert code == 0
+    target = wallsettings.class_file_path("work", osinfo.detect().kind)
+    staged = f"{target}.tmp"
+    assert f"sudo tee {staged} >/dev/null" in out and f"sudo chmod 644 {staged}" in out
+    assert f"sudo mv {staged} {target}" in out
+    assert f"sudo tee {target} " not in out  # the final name is only ever reached by the move
+    assert out.index(f"sudo chmod 644 {staged}") < out.index("sudo mv ")
+
+
+def test_install_class_gives_the_account_its_own_ws_policy_and_login(box, capsys):
+    class_box(box)
+    code, out, _ = run(capsys, "install", "--class", "work")
+    assert code == 0
+    step = out.split("5. ", 1)[1].split("6. ", 1)[0]
+    assert "sudo -u ws-work -i" in step and "install.sh" in step and "ws setup" in step
+    assert "[classes.work]" in step and "claude" in step and "sign in" in step

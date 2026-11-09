@@ -32,6 +32,7 @@ Apply the safety rules:
 - [Approve a command](how-to/approve-a-command.md): let a command run once, with your yes.
 - [Store a secret](how-to/store-a-secret.md): keep a key where an agent can't read it.
 - [Apply the Rule of Two](how-to/apply-the-rule-of-two.md): refuse a job that could leak private data.
+- [Set up a class user](how-to/set-up-a-class-user.md): give a data class its own operating-system account.
 - [Set a budget](how-to/set-a-budget.md): cap monthly spend.
 - [Send drafts only](how-to/send-drafts-only.md): lower the risk of an agent sending. Not enforced in v0.1.
 
@@ -58,6 +59,8 @@ Measure:
 - [Doctor checks](reference/doctor-checks.md): every `WS` ID with its meaning and fix.
 - [Policy](reference/policy.md): every `policy.toml` key.
 - [Guards](reference/guards.md): the named checks, their events and findings, replay.
+- [Messages](reference/messages.md): the message store, its commands, and how a message reaches a session.
+- [CI](reference/ci.md): each workflow job, its time budget, the test-integrity check and the holdout.
 - [Hooks](reference/hooks.md): what a hand-built hook set does, and the ws rule or guard that does the same job.
 - [Code map](reference/code-map.md): what each module in `src/ws/` is for, built from its docstring.
 - [Eval](reference/eval.md): task files, graders and the ten metrics.

@@ -60,6 +60,14 @@ Step 3 prints `touch: cannot touch '...': Read-only file system` and exits with 
 [Troubleshoot](troubleshoot.md). `--no-sandbox` starts the runner bare and prints what that gives up. Don't use it for
 real work.
 
+## What else the wall settings do
+
+- Bypass mode is off in the settings ws passes to Claude Code and in the ones `ws install` merges into your own file:
+  `permissions.disableBypassPermissionsMode` is `"disable"`, so `--dangerously-skip-permissions` is refused while a
+  gated session runs. If your own file sets that key to anything else, `ws install` refuses and changes nothing; change
+  your value to match.
+- To give a class its own operating-system account, see [Set up a class user](set-up-a-class-user.md).
+
 ## Check the host once
 
 ```sh

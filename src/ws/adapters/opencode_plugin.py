@@ -155,6 +155,14 @@ export const WsGate = async ({ client, directory } = {}) => {
   const promptText = new Map() // session id -> the text the prompt guards printed for the turn in progress
   const sent = new Set() // sessions whose pending text went into the model's context
   const allowed = new Set() // call ids the gate let through, for an ask of ws's own to be answered (see asked)
+  // Messages between sessions (the inbox guard). A waiter per session, `ws msg wait --session-hook`, exits 2 with an
+  // envelope (never a body) when a message lands that no hook has delivered. If the session is idle it is woken with that
+  // line (promptAsync); either way the next model request is given the pending messages, as untrusted data, by the same
+  // prompt guards that run on a user prompt (experimental.chat.messages.transform, which fires on every agent step).
+  const waiters = new Map() // session id -> the waiting child
+  const idleNow = new Set() // sessions between turns
+  const woke = new Map() // session id -> the envelope line a waiter brought, until the session is woken with it
+  const hint = new Set() // sessions with a message waiting that no hook has delivered
   const folder = (id) => dirs.get(id) ?? directory ?? process.cwd()
   const body = (name, id) => ({ hook_event_name: name, session_id: id ?? "", cwd: folder(id) })
   const toast = async (message) => {
@@ -227,10 +235,61 @@ export const WsGate = async ({ client, directory } = {}) => {
     if (ours && p.tool?.callID && allowed.delete(p.tool.callID)) await answer(p) // after the line: the reply closes it
   }
   const closed = (p) => note({ event: "answered", id: p.requestID })
+  // Wake a session with a line of text (OpenCode 1.19.4: client.session.promptAsync; the flat and the path/body form).
+  const wake = async (id, text) => {
+    idleNow.delete(id)
+    const parts = [{ type: "text", text }]
+    try {
+      const r = await client.session.promptAsync({ sessionID: id, parts })
+      if (!r?.error) return
+    } catch {}
+    try {
+      await client.session.promptAsync({ path: { id }, body: { parts } })
+    } catch {}
+  }
+  const watch = (id) => {
+    if (waiters.has(id) || kids.has(id) || !ADVICE.includes("prompt")) return
+    let err = ""
+    const began = Date.now()
+    let child
+    try {
+      child = spawn(WS[0], [...WS.slice(1), "msg", "wait", "--session-hook", "--session-id", id, ...PIN], {
+        stdio: ["ignore", "ignore", "pipe"],
+      })
+    } catch {
+      return
+    }
+    waiters.set(id, child)
+    child.stderr.on("data", (d) => (err = (err + d).slice(0, 2000)))
+    child.on("error", () => waiters.delete(id))
+    child.on("close", async (code) => {
+      if (waiters.get(id) !== child) return
+      waiters.delete(id)
+      if (code === 2 && err.trim()) {
+        hint.add(id)
+        woke.set(id, err.trim().replace(/[\u0000-\u001f\u007f-\u009f]/g, " "))
+        if (idleNow.has(id)) {
+          const text = woke.get(id)
+          woke.delete(id)
+          await wake(id, text)
+        }
+        watch(id)
+      } else if (code === 0 && Date.now() - began > 60000) {
+        watch(id) // it ran out its time: start another; one that ended at once (delivery off, no identity) is left alone
+      }
+    })
+  }
   const forget = (id) => {
-    for (const m of [dirs, startText, promptText]) m.delete(id)
+    for (const m of [dirs, startText, promptText, woke]) m.delete(id)
     kids.delete(id)
     sent.delete(id)
+    hint.delete(id)
+    idleNow.delete(id)
+    const w = waiters.get(id)
+    waiters.delete(id)
+    try {
+      w?.kill()
+    } catch {}
   }
   const idle = async (id) => {
     const line = (ws("nudge", id).stdout || "").trim()
@@ -248,6 +307,15 @@ export const WsGate = async ({ client, directory } = {}) => {
     const pending = [startText.has(id) ? await startText.get(id) : "", promptText.get(id) ?? ""].filter(Boolean)
     if (pending.length && !sent.has(id)) await toast(pending.join("\n"))
     promptText.delete(id)
+    if (!kids.has(id)) {
+      idleNow.add(id)
+      watch(id)
+      if (woke.has(id)) {
+        const text = woke.get(id)
+        woke.delete(id)
+        await wake(id, text)
+      }
+    }
   }
   return {
     event: async ({ event }) => {
@@ -262,6 +330,7 @@ export const WsGate = async ({ client, directory } = {}) => {
           if (event.properties?.info?.parentID) kids.add(id)
           if (typeof event.properties?.info?.directory === "string") dirs.set(id, event.properties.info.directory)
           ws("start", id)
+          watch(id)
           if (!kids.has(id)) {
             startText.set(
               id,
@@ -269,6 +338,7 @@ export const WsGate = async ({ client, directory } = {}) => {
             )
           }
         }
+        if (event.type === "session.status" && event.properties?.status?.type === "busy") idleNow.delete(id)
         if (event.type === "session.idle") await idle(id)
       } catch {}
     },
@@ -278,12 +348,35 @@ export const WsGate = async ({ client, directory } = {}) => {
         const id = input.sessionID
         if (!id || kids.has(id) || !ADVICE.includes("prompt")) return
         promptText.delete(id)
+        idleNow.delete(id)
+        hint.delete(id) // this prompt's guards deliver what is pending
         const text = (output.parts ?? [])
           .filter((x) => x?.type === "text" && !x.synthetic && typeof x.text === "string")
           .map((x) => x.text)
           .join("\n")
         const r = await advice("prompt", { ...body("chat.message", id), prompt: text })
         if (r?.code === 0 && r.out.trim()) promptText.set(id, r.out.trim())
+      } catch {}
+    },
+    // Between steps of a turn: a message a waiter has flagged goes to the model with its next request, through the prompt
+    // guards (the inbox guard hands it over as untrusted data, once). Added as a text part of the latest user message.
+    "experimental.chat.messages.transform": async (_input, output) => {
+      try {
+        const list = output?.messages ?? []
+        const last = [...list].reverse().find((m) => m?.info?.role === "user")
+        const id = last?.info?.sessionID
+        if (!id || kids.has(id) || !ADVICE.includes("prompt") || !hint.delete(id)) return
+        const r = await advice("prompt", { ...body("chat.message", id), prompt: "", between_steps: true })
+        const text = r?.code === 0 ? r.out.trim() : ""
+        if (!text || !Array.isArray(last.parts)) return
+        last.parts.push({
+          id: "prt_ws_" + Date.now().toString(36),
+          sessionID: id,
+          messageID: last.info.id,
+          type: "text",
+          text,
+          synthetic: true,
+        })
       } catch {}
     },
     // Text from the start and prompt guards, added to the system prompt of each request the session makes. OpenCode

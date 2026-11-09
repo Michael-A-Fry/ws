@@ -5,7 +5,9 @@ environment and the folder the hook was started in. The daemon forks a child for
 environment and folder, and has it run exactly what `ws gate check` or `ws gate event` runs (ws.gate.run_hook): the
 policy's rules first, then the guards that are on in their fixed order, the first refusal ending it. The child's exit code, stdout and
 stderr go back as the reply. A fork for each request keeps one call's environment, folder and state out of the next, and
-the modules are loaded once, in the parent, so a call costs a fork and not an import of ws.
+the modules are loaded once, in the parent, so a call costs a fork and not an import of ws. The child also tells
+ws.session which process connected (the peer the kernel reports, not anything in the request), so a guard can tell
+which session the hook belongs to even though the child's own ancestors are the daemon's.
 
 The daemon is started by the first hook call that finds none running. There is one for each state folder; it holds an
 exclusive lock on `<state>/run/gate.lock` (with its process id in it) for as long as it lives. It exits after `--idle`
@@ -155,11 +157,15 @@ def _request(conn: socket.socket) -> dict | None:
 def answer(conn: socket.socket) -> None:
     """Read one request from `conn`, run it as the hook command would and write the reply. Runs in the forked child,
     which never goes back to the loop. No reply for anything it can't run (the client then decides itself)."""
-    from ws import gate
+    from ws import gate, session
 
+    cred = gateclient.peer_cred(conn)
     req = _request(conn)
     if req is None:
         return
+    # who the hook is: the process the kernel says is on the other end, never a field of the request (whose environment
+    # is the caller's to set). A guard that needs the session walks up from there (ws.session.bind_peer).
+    session.bind_peer(cred[0] if cred else None)
     os.environ.clear()
     os.environ.update(req["env"])
     try:

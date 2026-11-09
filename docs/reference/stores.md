@@ -12,7 +12,7 @@ Linux, and a relative `XDG_*` value is ignored. Every path on this page is given
 | Folder | Default | Holds |
 |---|---|---|
 | Config | `$XDG_CONFIG_HOME/ws` (`~/.config/ws`) | What you write: `policy.toml`, `profile.toml`, `secrets.toml` (the registry), `jobs/`, `release`. |
-| State | `$XDG_STATE_HOME/ws` (`~/.local/state/ws`) | What ws writes as it works: `logs/`, `runs/`, `approvals/`, `sessions/`, `gate/`, `wall/`, `backups/`, `run/`, `ratings.jsonl`, `versions.json`, `install-manifest.json`, `migrate-manifest.json`. |
+| State | `$XDG_STATE_HOME/ws` (`~/.local/state/ws`) | What ws writes as it works: `logs/`, `runs/`, `approvals/`, `sessions/`, `identity/`, `gate/`, `wall/`, `backups/`, `run/`, `ratings.jsonl`, `versions.json`, `install-manifest.json`, `migrate-manifest.json`. |
 | Data | `$XDG_DATA_HOME/ws` (`~/.local/share/ws`) | What you'd miss: the secrets store (`secrets/`) and the eval tasks and results (`eval/`). |
 | Cache | `$XDG_CACHE_HOME/ws` (`~/.cache/ws`) | What ws can rebuild: the memory search index (`index/`). |
 
@@ -87,6 +87,8 @@ One JSON file per record, written to a temporary name and renamed into place (06
 | Record | Path under its folder | Writer | Fields | Schema | Time key | Kept |
 |---|---|---|---|---|---|---|
 | Session | `sessions/<id>.json` | `src/ws/session.py` | `schema`, `ts`, `session_id`, `release`, `started_at`, `runner`, `cwd` | 1 | `ts` | Removed 30 days after its last change |
+| Session identity | `identity/<id>.json` | `src/ws/session.py` (`ws session start` only) | `schema`, `session_id`, `role`, `runner_pid`, `runner_start`, `started_at`, `ts` | 1 | `ts` | Removed with the session record. The only place a role or runner stamp is read from. Not one of the wall's writable folders; a control path the gate won't let a session write. `identity/launch/<token>` holds the single-use launch tokens |
+| Guard record | `sessions/<id>.<guard>.json` | `src/ws/guards` | per guard: `inbox` (`seen` claims, `blocks`, `reminded`, `unavailable_said`), `presence` (`seq`, `source`, `state`), `wait` (`woken` message ids) | none | none | Removed with the session record. Ids and counts only, never a message body. `<id>.wait.lock` is the lock of the one `ws msg wait` for a session |
 | Approval, pending and granted | `approvals/pending/<id>.json`, `approvals/granted/<id>.json` | `src/ws/approvals.py` | `schema`, `v`, `ts`, `id`, `bound`, `created`, `granted` | 1 | `ts` (when the file was written) | Expires 10 minutes after it's made; a granted one is deleted when it's used |
 | Seen versions | `versions.json` | `src/ws/canary.py` | `schema`, `runners`, `default_model` | 1 | none | Rewritten when a passing canary sees a change |
 | Subscription limits | `usage/rate_limits.json` | `src/ws/usage.py` | `schema`, `captured_at` (Unix seconds), `five_hour` and `seven_day` (each `used_percentage`, `resets_at`), or `absent` (a tombstone) | 1 | `captured_at` | Replaced by each statusline call; read as unknown after 600 s |

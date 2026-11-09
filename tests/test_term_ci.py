@@ -20,7 +20,10 @@ def job(name: str) -> str:
 def test_ci_has_a_job_that_runs_the_browser_tests_and_fails_if_they_cannot_run():
     text = job("term-browser")
     assert re.search(r'WS_E2E_REQUIRE:\s*"1"', text), "a missing browser must fail there, not skip"
-    assert "tests/e2e/test_term_browser.py" in text
+    assert "tests/e2e/test_*_browser.py" in text, "the job runs every browser test file, by glob"
+    assert BROWSER_TESTS in set(ROOT.glob("tests/e2e/test_*_browser.py")), (
+        "and the glob still finds the terminal's file"
+    )
 
 
 def test_that_job_installs_chromium_from_a_pinned_playwright():

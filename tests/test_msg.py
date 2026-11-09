@@ -453,10 +453,11 @@ def test_a_forged_registry_and_policy_under_a_forged_ws_home_send_nothing(world,
 
 def test_nothing_in_msg_takes_an_environment():
     """No function of the public API can be handed an environment, and the layout answers to `session.trusted_env` only."""
-    for name in ("send", "inbox", "sent", "read", "ack", "mark_delivered", "envelopes", "export", "prune", "caller"):
+    names = ("send", "inbox", "sent", "read", "ack", "mark_delivered", "envelopes", "export", "prune", "caller")
+    for name in (*names, "deliver", "pending", "handover_delivered", "last_delivered_outbound", "watch", "wait"):
         assert "env" not in inspect.signature(getattr(msg, name)).parameters, name
     assert not inspect.signature(msg.store_path).parameters
-    assert not inspect.signature(session.resolve_caller).parameters
+    assert list(inspect.signature(session.resolve_caller).parameters) == ["session_id"]  # a question, never a folder
     source = inspect.getsource(msg)
     assert "merged_environ" not in source and "os.environ" not in source and "policy_path" not in source
 
@@ -1261,3 +1262,185 @@ def test_no_hard_links_is_a_typed_error_for_the_class_gitignore(world, monkeypat
     assert ".gitignore" in err.message and world.count() == 0
     folder = class_db(world).parent
     assert not [p for p in folder.iterdir() if p.name.endswith(".tmp")]
+
+
+# --- more secret rules ---------------------------------------------------------------------------------------------
+
+
+def _hex(n: int) -> str:
+    return secrets.token_hex(n // 2)
+
+
+NEW_SECRETS = {
+    "a Twilio key": lambda: "SK" + _hex(32),
+    "a Mailgun key": lambda: "key-" + _hex(32),
+    "a Shopify token": lambda: "shpat_" + _hex(32),
+    "a DigitalOcean token": lambda: "dop_v1_" + _hex(64),
+    "a Databricks token": lambda: "dapi" + _hex(32),
+    "a Doppler token": lambda: "dp.st." + "A" * 40,
+    "a Linear key": lambda: "lin_api_" + "b" * 40,
+    "a Pulumi token": lambda: "pul-" + _hex(40),
+    "a PyPI token": lambda: "pypi-AgEIcHlwaS5vcmc" + "c" * 60,
+    "a Postman key": lambda: "PMAK-" + _hex(24) + "-" + _hex(34),
+    "a Square token": lambda: "sq0atp-" + "d" * 22,
+    "a Grafana token": lambda: "glsa_" + "e" * 32 + "_" + _hex(8),
+    "a Vault token": lambda: "hvs." + "f" * 30,
+    "a Sentry token": lambda: "sntrys_" + "g" * 50,
+    "a Docker Hub token": lambda: "dckr_pat_" + "h" * 30,
+    "an Atlassian token": lambda: "ATATT3" + "i" * 60,
+    "an age secret key": lambda: "AGE-SECRET-KEY-1" + "Q" * 58,
+    "a Slack webhook": lambda: "https://hooks.slack.com/services/T" + "A" * 9 + "/B" + "B" * 9 + "/" + "c" * 24,
+    "an Azure storage key": lambda: "AccountKey=" + "k" * 44,
+    "a Telegram bot token": lambda: "123456789:" + "t" * 35,
+    "a Discord bot token": lambda: "M" + "d" * 23 + "." + "e" * 6 + "." + "f" * 30,
+    "an AWS secret access key": lambda: "aws_secret_access_key = " + "s" * 40,
+}
+
+
+@pytest.mark.parametrize("what", sorted(NEW_SECRETS))
+def test_more_secret_rules_refuse_a_body_and_never_echo_it(plain, what):
+    value = NEW_SECRETS[what]()
+    assert msg.scan(f"deploy with {value} please") == what
+    err = plain.refused("alpha", "bravo", body=f"deploy with {value} please", kind="secret_refused")
+    assert value not in err.message + err.hint and what in err.message
+    assert plain.count() == 0
+
+
+def test_the_new_rules_leave_ordinary_text_alone():
+    for text in (
+        "key-value store notes, sk is short for skip, the dapi docs, hvs.local is a host, 12:30 meeting at 123456789",
+        "see https://hooks.example.com/services/team/channel and glsa_ is a prefix",
+        "SK1 and pul- and AccountKey=short",
+    ):
+        assert msg.scan(text) is None, text
+
+
+# --- clean text, the envelope feed and its cursor --------------------------------------------------------------------
+
+
+def test_clean_strips_what_a_terminal_would_act_on():
+    dirty = (
+        "a\x1b[31mred\x1b[0m\x1b]0;title\x07b\x00c\x07d\x7fe\x9bf\u202eg\u200bh\u2028i\ufeffj\ue000k\ud800l\tm\rn\nz"
+    )
+    assert msg.clean(dirty) == "aredbcdefghijkl mn z"
+    assert msg.clean(dirty, newlines=True) == "aredbcdefghijkl mn\nz"
+    assert (
+        msg.clean("abcdef", limit=3) == "abc"
+        and msg.clean(None) == ""
+        and msg.clean("plain ünï 日本") == "plain ünï 日本"
+    )
+    assert msg.clean("\x1b[2J\x1b[H" + "x") == "x" and msg.clean("\x1b") == ""
+
+
+def test_watch_shows_only_the_envelope_for_walled_sessions(world):
+    classed(world)
+    body_in = planted("inbound")
+    first = world.send("lead1", "wall1", "note", body_in)
+    world.send("lead1", "work1", "note", planted("elsewhere"))  # not wall1's
+    world.send("wall1", "lead1", "done", None)
+    world.who = "wall1"
+    feed = msg.watch("wall1")
+    assert [e["message_id"] for e in feed["events"]] == [first["id"], 3]  # only rows wall1 sent or was sent
+    assert all(tuple(e) == msg.ENVELOPE_KEYS for e in feed["events"])
+    shown = json.dumps(feed)
+    for text in (body_in, hashlib.sha256(body_in.encode()).hexdigest(), "elsewhere"):
+        assert text not in shown
+    assert {e["class"] for e in feed["events"]} == {"secret", "open"} and feed["loss"] is None
+    assert feed["cursor"] == 3 and feed["tail_seq"] == 3 and feed["pruned_through_seq"] == 0
+
+
+def test_watch_command_prints_the_envelope_and_the_cursor(world, capsys):
+    classed(world)
+    secret = planted()
+    world.send("lead1", "wall1", "note", secret)
+    world.who = "wall1"
+    assert cli.main(["msg", "watch"]) == 0
+    out = capsys.readouterr()
+    assert "lead1 -> wall1  note  S  pending" in out.out and secret not in out.out + out.err
+    assert out.err.strip() == "cursor 1"
+    assert cli.main(["msg", "watch", "--json", "--position-now"]) == 0
+    data = json.loads(capsys.readouterr().out)["data"]
+    assert (data["cursor"], data["events"], data["loss"], data["session"]) == (1, [], None, "wall1")
+
+
+def test_watch_cursor_expired_and_pruned_loss_markers(plain):
+    for n in range(3):
+        plain.send("alpha", "bravo", "note", f"m{n}", now=BASE + n)
+    plain.who = "bravo"
+    feed = msg.watch("bravo", limit=2)
+    assert (feed["cursor"], len(feed["events"]), feed["loss"]) == (2, 2, None)  # pass the cursor back as `after`
+    assert msg.watch("bravo", after=feed["cursor"])["events"][0]["seq"] == 3
+    # retention removes every row; a cursor from before it is told so, and the feed carries on from the end
+    assert msg.prune(now=BASE + 40 * 86400, force=True)["expired"] == 3
+    gone = msg.watch("bravo", after=1)
+    assert gone["loss"] == {"kind": "cursor_expired", "pruned_through_seq": 3}
+    assert (gone["events"], gone["cursor"], gone["pruned_through_seq"], gone["tail_seq"]) == ([], 3, 3, 3)
+    assert msg.watch("bravo", after=3)["loss"] is None  # a cursor at the mark has lost nothing
+    plain.send("alpha", "bravo", "note", "later", now=BASE + 41 * 86400)
+    plain.who = "bravo"
+    late = msg.watch("bravo", after=3)
+    assert [e["seq"] for e in late["events"]] == [4] and late["loss"] is None
+    ahead = msg.watch("bravo", after=99)
+    assert ahead["loss"] == {"kind": "cursor_ahead", "tail_seq": 4} and ahead["events"] == [] and ahead["cursor"] == 4
+    now = msg.watch("bravo", position_now=True)
+    assert (now["cursor"], now["events"], now["loss"]) == (4, [], None)
+    assert plain.rows("SELECT value FROM meta WHERE key='pruned_through_seq'") == [("3",)]  # the mark only goes up
+
+
+def test_watch_on_a_store_nobody_has_made_yet_is_empty(world):
+    assert msg.watch("anyone") == {"cursor": 0, "tail_seq": 0, "pruned_through_seq": 0, "events": [], "loss": None}
+
+
+# --- the delivery queue under the guard ------------------------------------------------------------------------------
+
+
+def test_delivery_state_is_put_in_the_same_commit_as_the_message(plain):
+    sent = plain.send("alpha", "bravo", "note", "queued")
+    assert plain.rows(f"SELECT data, status FROM {msg._dq_table('bravo')}") == [(str(sent["id"]), 0)]
+    again = plain.send("alpha", "bravo", "note", "queued", key="k1")
+    assert plain.send("alpha", "bravo", "note", "queued", key="k1")["replayed"] and again["id"] == 2
+    assert plain.rows(f"SELECT COUNT(*) FROM {msg._dq_table('bravo')}") == [(2,)]  # a replay queues nothing more
+
+
+def test_deliver_catches_up_a_receiver_from_before_the_queue_and_leaves_other_tiers_waiting(plain):
+    plain.send("alpha", "bravo", "note", "info one")
+    plain.send("alpha", "bravo", "ask", "urgent one", tier="urgent")
+    conn = sqlite3.connect(msg.store_path())
+    conn.execute(f"DROP TABLE {msg._dq_table('bravo')}")  # as if the store were made by an earlier ws
+    conn.commit()
+    conn.close()
+    plain.who = "bravo"
+    got = msg.deliver("bravo", tiers=("urgent",))
+    assert [m["body"] for m in got] == ["urgent one"] and got[0]["claim_id"] == 1
+    assert [m["id"] for m in msg.pending("bravo", undelivered=True)] == [1]  # the info one is still waiting its turn
+    again = msg.deliver("bravo")
+    assert [m["body"] for m in again] == ["info one"]
+    assert msg.deliver("bravo") == []
+
+
+def test_deliver_hands_a_walled_receiver_the_envelope_only(world):
+    classed(world)
+    world.send("lead1", "wall1", "note", planted())
+    world.who = "wall1"
+    (got,) = msg.deliver("wall1")
+    assert got["body"] is None and got["body_state"] == "withheld"
+    assert msg.receiver_walled("wall1") is True and msg.receiver_walled("work1") is False
+
+
+def test_reading_a_message_settles_its_delivery_unless_an_ack_is_wanted(plain):
+    one = plain.send("alpha", "bravo", "note", "plain")
+    two = plain.send("alpha", "bravo", "ask", "wants an ack", ack_required=True)
+    plain.who = "bravo"
+    msg.read(one["id"], "bravo")
+    msg.read(two["id"], "bravo")
+    assert plain.rows(f"SELECT data FROM {msg._dq_table('bravo')}") == [(str(two["id"]),)]  # the plain one is gone
+    msg.ack(two["id"], "bravo")
+    assert msg.deliver("bravo") == []
+
+
+def test_prune_drops_finished_queue_tables(plain):
+    plain.send("alpha", "bravo", "note", "x", now=BASE)
+    plain.who = "bravo"
+    assert len(msg.deliver("bravo", now=BASE + 1)) == 1
+    assert msg.prune(now=BASE + 40 * 86400, force=True)["expired"] == 1
+    assert plain.rows("SELECT name FROM sqlite_master WHERE name LIKE 'dq!_%' ESCAPE '!'") == []

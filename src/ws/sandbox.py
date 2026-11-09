@@ -1434,7 +1434,60 @@ def run_plain(cmd: list[str], env: dict) -> int:
     return _wait(proc)
 
 
-def launch_claude(args: argparse.Namespace, argv: list[str], home: Path, env: dict) -> int:
+def real_user() -> str | None:
+    """The account this process runs as, from the system's user database and the effective user id: never `$USER`,
+    `$HOME` or any other environment value, which the caller (or a project's settings) can set. None when the database
+    has no entry for it or this system has none."""
+    try:
+        import pwd  # here, not at the top: POSIX only (tests/test_windows_import.py)
+    except ImportError:
+        return None
+    try:
+        return pwd.getpwuid(os.geteuid()).pw_name
+    except (KeyError, OSError, AttributeError):
+        return None
+
+
+def require_class_user(pol: policy.Policy) -> None:
+    """Refuse to start a session of a class that names an `os_user` unless this process runs as that user. The class is
+    the policy's `class_of` for the real path of the folder the session starts in, and the user is `real_user()`: nothing
+    from the environment is read, so a forged `$USER` or `$HOME` changes nothing. A class with no `os_user`, a policy with
+    no classes and a path in no class are not held to this. Exit 3, with a hint that names the class and not the account."""
+    try:
+        here = os.path.realpath(os.getcwd())
+    except OSError as e:
+        raise WsError(
+            "refused",
+            f"refusing to start: the current folder can't be read ({e.strerror}), so its class is not known",
+            "start it from a project folder",
+            3,
+        ) from e
+    cls = policy.class_of(pol, here)
+    if cls is None or not cls.os_user or real_user() == cls.os_user:
+        return
+    raise WsError(
+        "refused",
+        f"refusing to start: this folder is in class {cls.name!r}, whose sessions run as the OS user set for that class, "
+        "and this process does not",
+        f"start it as the OS user of class {cls.name!r} (`ws install --class {cls.name}` prints how to set that up)",
+        3,
+    )
+
+
+def _launch_policy(args: argparse.Namespace) -> tuple[Path, policy.Policy]:
+    policy_file = Path(args.policy).expanduser().absolute() if args.policy else policy.policy_path()
+    try:
+        pol = policy.load(
+            policy_file, required=args.policy is not None
+        )  # a named policy that is not there is no default
+    except policy.PolicyError as e:
+        raise WsError("bad_config", str(e), f"fix {policy_file}, or run `ws install`") from e
+    return policy_file, pol
+
+
+def launch_claude(
+    args: argparse.Namespace, argv: list[str], home: Path, env: dict, pol: policy.Policy | None = None
+) -> int:
     """`ws gate launch --runner claude-code -- claude ...`: Claude Code's own sandbox, with settings made for THIS
     project at the start of the session. The shared settings (`ws gate generate`, `ws install`) are made once for every
     project, and a sandbox path has no project-relative spelling in a `--settings` file, so they carry the Edit rules but
@@ -1444,6 +1497,7 @@ def launch_claude(args: argparse.Namespace, argv: list[str], home: Path, env: di
     for OpenCode."""
     from ws.adapters import claude_code
 
+    require_class_user(pol if pol is not None else _launch_policy(args)[1])  # before anything is written or started
     out = home / "gate" / "claude-code"
     base = out / claude_code.FILE
     if not base.is_file():
@@ -1488,20 +1542,15 @@ def cmd_launch(args: argparse.Namespace) -> int:
         raise WsError(
             "usage", "give the runner's command after --", "e.g. `ws gate launch --runner opencode -- opencode`"
         )
-    policy_file = Path(args.policy).expanduser().absolute() if args.policy else policy.policy_path()
-    try:
-        pol = policy.load(
-            policy_file, required=args.policy is not None
-        )  # a named policy that is not there is no default
-    except policy.PolicyError as e:
-        raise WsError("bad_config", str(e), f"fix {policy_file}, or run `ws install`") from e
+    policy_file, pol = _launch_policy(args)
+    require_class_user(pol)  # a session of a class with an OS user starts as that user or not at all
     home = paths.state_dir().absolute()  # whatever --policy says, the gate keeps its approvals and sessions here
     pass_env = check_pass_env(args.pass_env)
     if pass_env:
         print(f"ws: note: passing {', '.join(pass_env)} from this shell to {args.runner}", file=sys.stderr)
     env = launch_env(dict(os.environ), runner=args.runner, pass_env=pass_env)
     if args.runner == "claude-code" and not args.no_sandbox:
-        return launch_claude(args, argv, home, env)
+        return launch_claude(args, argv, home, env, pol)
     if args.no_sandbox:
         print(NO_SANDBOX_NOTE.format(runner=args.runner), file=sys.stderr)
         try:

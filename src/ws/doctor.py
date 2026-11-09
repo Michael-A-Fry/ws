@@ -1,7 +1,8 @@
 """`ws doctor`: one line per check, each with a stable ID. Exit 0 only when nothing is failing or unconfigured.
 
 IDs never change meaning once released: WS0xx are the machine, profile, jobs, gate,
-sandbox, plugins, where ws keeps its files and what the runner needs of its hooks, WS1xx are the roles (one per role).
+sandbox, plugins, where ws keeps its files, what the runner needs of its hooks and the OS-user classes, WS1xx are the roles
+(one per role).
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from ws import __version__, canary, jobs, paths, roles, usage, userconfig, wallsettings
+from ws import __version__, canary, jobs, paths, policy, roles, usage, userconfig, wallsettings
 from ws import globals as ws_globals
 from ws.osinfo import OSInfo
 from ws.profile import ProfileError, load, profile_path
@@ -272,6 +273,19 @@ def _upgrade_check(env) -> Check:
     return Check("WS013", "upgrade", WARN, "; ".join(parts), fix)
 
 
+def _class_checks(env, kind: str) -> list[Check]:
+    """WS014: each class with an `os_user` in the policy, one line per part, each judged on its own (the OS user exists, the
+    managed-settings file is there and root-owned, the sandbox is required, unsandboxed commands are off, bypass is off,
+    writes are limited, the home folder is hidden, inbound is lead-only). No line when the policy names no such class, or
+    does not load (WS012 says so). The user and the file are read from the system, never from the environment."""
+    try:
+        pol = policy.load(policy.policy_path(dict(env)))
+    except (policy.PolicyError, OSError):
+        return []
+    rows = wallsettings.class_rows(pol, env, kind)
+    return [Check("WS014", "class", r.status, f"{r.cls}: {r.part}: {r.detail}", r.fix) for r in rows]
+
+
 def _layout_check(env) -> Check:
     """WS010: where ws keeps its files. `ok` for the XDG folders or a folder you named; `warn` while they are still in
     `~/.ws` from an earlier ws (nothing moves by itself: `ws migrate` does it); `fail` when both exist, because ws can't
@@ -361,6 +375,10 @@ def run_checks(osi: OSInfo, profile_file: Path, env: dict | None = None, network
         checks.append(_upgrade_check(env))
     except Exception as e:  # noqa: BLE001 (a broken check must report, not crash the whole doctor)
         checks.append(Check("WS013", "upgrade", FAIL, f"check crashed ({type(e).__name__})"))
+    try:
+        checks += _class_checks(env, osi.kind)
+    except Exception as e:  # noqa: BLE001 (a broken check must report, not crash the whole doctor)
+        checks.append(Check("WS014", "class", FAIL, f"check crashed ({type(e).__name__})"))
     try:
         checks.append(_layout_check(env))
     except Exception as e:  # noqa: BLE001 (a broken check must report, not crash the whole doctor)

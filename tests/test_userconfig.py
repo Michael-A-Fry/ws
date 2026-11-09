@@ -984,6 +984,39 @@ def test_ws_items_with_no_record_are_adopted_so_an_undo_takes_them_out(box, caps
     assert settings(box) == MINE
 
 
+def test_the_message_wake_hook_is_ws_own_for_adoption_the_upgrade_view_and_an_undo(box, capsys, monkeypatch):
+    from types import SimpleNamespace
+
+    from ws import guards
+
+    inbox = SimpleNamespace(
+        NAME="inbox",
+        EVENTS=("pre",),
+        KINDS=("command",),
+        config=lambda table, where: guards.known_keys(table, where),
+        judge=lambda call, cfg, ctx: None,
+    )
+    real = guards.all_guards
+    monkeypatch.setattr(guards, "all_guards", lambda: {**real(), "inbox": inbox})
+    plant(box)
+    do_install(capsys, box)
+    (box / ".ws" / "policy.toml").write_text('[guards]\non = ["inbox"]\n', encoding="utf-8")
+
+    def wake_commands() -> list[str]:
+        return [h["command"] for g in settings(box)["hooks"]["Stop"] for h in g["hooks"] if "msg wait" in h["command"]]
+
+    assert do_install(capsys, box)[0] == 0
+    (cmd,) = wake_commands()
+    assert " msg wait --session-hook " in cmd and "--pin" in cmd and not cmd.endswith("|| true")
+    assert userconfig.hook_state(dict(os.environ)).old == []  # pinned, and read as ws's own: WS013 has nothing to say
+    lose_the_record(box)
+    assert do_install(capsys, box)[0] == 0
+    assert len(wake_commands()) == 1  # adopted in place, no second copy
+    assert settings(box)["hooks"]["Stop"][0] == MINE["hooks"]["Stop"][0]  # theirs first and untouched
+    run(capsys, "uninstall", "--yes")
+    assert settings(box) == MINE  # the wake hook went with the rest
+
+
 def test_a_stale_ws_hook_with_no_record_is_updated_in_place(box, capsys):
     plant(box)
     do_install(capsys, box)

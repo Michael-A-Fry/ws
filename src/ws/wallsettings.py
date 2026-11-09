@@ -8,7 +8,15 @@ it again. This module finds those settings. `ws install` refuses to merge beside
 It reads files; it proves nothing about the host. A settings source ws cannot see (a `--settings` flag, a managed policy
 held outside the files below) can still widen the wall, and WS012 says only what it can read.
 
-Python 3.11+, standard library only.
+A class with an `os_user` (see ws.policy.Class) can also have a managed-settings file of its own, which holds what a
+session of that class may do whoever starts it: the sandbox required, no unsandboxed retry, bypass off, writes in the
+class's repos and scratch only, the home folder unreadable except those repos, inbound lead-only. This module renders
+that file as text (`class_settings`, `install_text`, for `ws install --class`) and judges it (`class_rows`, the WS014
+rows). It never writes it: a managed-settings file is placed by a person with sudo, and it applies to every account on
+the machine, so ws prints it and nothing more. `MANAGED_FILES` and `MANAGED_DIRS` are the only places managed-settings
+paths come from.
+
+Python 3.11+, standard library only (`pwd` is imported inside the functions that need it).
 """
 
 from __future__ import annotations
@@ -16,7 +24,9 @@ from __future__ import annotations
 import json
 import os
 import posixpath
+import shlex
 import shutil
+import stat
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +42,14 @@ MANAGED_FILES = (
     "/Library/Application Support/ClaudeCode/managed-settings.json",
 )
 MANAGED_DIRS = ("/etc/claude-code/managed-settings.d", "/Library/Application Support/ClaudeCode/managed-settings.d")
+
+# `permissions.disableBypassPermissionsMode`: the one spelling of it, in the settings ws generates (launch and user
+# config), in the class file and in the doctor rows. Claude Code accepts only the string "disable".
+BYPASS_KEY = "disableBypassPermissionsMode"
+BYPASS_OFF = "disable"
+INBOUND_ENV = "WS_INBOUND"  # the class file's record of who may send in
+INBOUND_VALUE = "lead-only"
+CLASS_FILE_PREFIX = "50-ws-class-"
 
 INSTALL = "sudo apt install bubblewrap socat (Debian, Ubuntu) or sudo dnf install bubblewrap socat (Fedora)"
 FOR_FEWER = "run under `ws gate launch` for fewer refusals"
@@ -180,13 +198,22 @@ def widenings(doc: Mapping, file: Path, block: Mapping, home: str) -> list[Widen
     return found
 
 
-def scan(settings: Path, block: Mapping, env: Mapping[str, str], *, managed: bool = True) -> list[Widening]:
-    """The widening settings in your settings file and, with `managed`, in every managed-settings file ws can read."""
+def scan(
+    settings: Path,
+    block: Mapping,
+    env: Mapping[str, str],
+    *,
+    managed: bool = True,
+    own: Mapping[Path, dict] | None = None,
+) -> list[Widening]:
+    """The widening settings in your settings file and, with `managed`, in every managed-settings file ws can read. A
+    managed file in `own` (a class file, by path) that holds exactly what ws renders for it is ws's own wall and is not
+    read as a widening; one that differs is read like any other."""
     home = _home(env)
     found: list[Widening] = []
     for f in [settings, *(managed_files() if managed else [])]:
         doc = _read(f)
-        if doc is not None:
+        if doc is not None and not (own and own.get(f) == doc):
             found += widenings(doc, f, block, home)
     return found
 
@@ -276,7 +303,11 @@ def doctor_check(env: Mapping[str, str], kind: str) -> tuple[str, str, str]:
     if stale:
         problems.append(f"denyRead in {where} is stale: it lacks {len(stale)} of the policy's deny_read paths")
         fix = "run `ws install`"
-    found = scan(where, block, env)
+    classes = class_files(pol, env, kind)
+    found = scan(where, block, env, own={f: want for _, f, want in classes})
+    mine = doc if isinstance(doc, dict) else {}
+    for _, _, want in classes:  # a class file in place: what your own settings add beyond it widens it
+        found += [w for w in class_widenings(mine, where, want, home) if w.label not in {x.label for x in found}]
     if found:
         problems.append("wall widened by user: " + "; ".join(f"{w.label} ({w.file})" for w in found))
         fix = fix or (
@@ -285,3 +316,414 @@ def doctor_check(env: Mapping[str, str], kind: str) -> tuple[str, str, str]:
     if problems:
         return WARN, "; ".join(problems), fix
     return OK, f"the sandbox block is in {where} and covers every deny_read path the wall can hide", ""
+
+
+# ---- a class with an OS user: its managed-settings file ----------------------------------------------------------------
+
+PARTS = (
+    "OS user exists",
+    "file present and root-owned",
+    "sandbox required",
+    "unsandboxed commands off",
+    "bypass off",
+    "write limits",
+    "home deny-read",
+    "inbound lead-only",
+)
+
+
+@dataclass(frozen=True)
+class Row:
+    """One part of one class, for the WS014 line: `status` is ok, warn or fail."""
+
+    cls: str
+    part: str
+    status: str
+    detail: str
+    fix: str = ""
+
+
+def _passwd(name: str):
+    """The user database entry for `name`, or None (no such user, or no user database on this system)."""
+    try:
+        import pwd  # here, not at the top: POSIX only
+    except ImportError:
+        return None
+    try:
+        return pwd.getpwnam(name)
+    except (KeyError, ValueError, OverflowError):
+        return None
+
+
+def class_users(pol: policy.Policy) -> list[policy.Class]:
+    """The classes that name an OS user, in name order."""
+    return [c for _, c in sorted(pol.classes.items()) if c.os_user]
+
+
+def class_file_name(name: str) -> str:
+    return f"{CLASS_FILE_PREFIX}{name}.json"
+
+
+def class_dir(kind: str) -> str:
+    """The managed-settings folder a class file goes in on this system: the macOS one there, the first one elsewhere."""
+    if kind == "macos" and len(MANAGED_DIRS) > 1:
+        return MANAGED_DIRS[-1]
+    return MANAGED_DIRS[0]
+
+
+def class_file_path(name: str, kind: str) -> Path:
+    return Path(class_dir(kind)) / class_file_name(name)
+
+
+def scratch_dirs(kind: str) -> tuple[str, ...]:
+    return ("/tmp", "/private/tmp") if kind == "macos" else ("/tmp",)
+
+
+def class_home(cls: policy.Class, kind: str) -> str:
+    """The home folder a `~` in the class's repos means, and the one printed step 1 closes: the class user's own when the
+    system knows the account, else the folder the printed `useradd` or `sysadminctl` makes for it (`/home/NAME`,
+    `/Users/NAME`). Never the home of whoever runs ws: the file and the `chown` must name the same folders before and
+    after the account exists."""
+    user = cls.os_user or ""
+    entry = _passwd(user)
+    if entry is not None and entry.pw_dir:
+        return entry.pw_dir
+    return f"/Users/{user}" if kind == "macos" else f"/home/{user}"
+
+
+def class_roots(cls: policy.Class, home: str) -> list[str]:
+    """The folders the class's `repos` name, absolute: a folder, or a folder followed by a trailing `/**`. A bare name or
+    a pattern that starts with a wildcard names no folder and is left out. A wildcard in a folder's name (`work/ops-*`,
+    `work/*`, `*/work`) would put the folder above the repos in the file and in the `chown`, so it is a usage error."""
+    roots: list[str] = []
+    for glob in cls.repos:
+        text = glob.removesuffix("/**")
+        if _norm(text, home) is None:
+            continue
+        if any(c in text for c in "*?["):
+            raise WsError(
+                "usage",
+                f"class {cls.name!r} has a repo with a wildcard in a folder name ({glob!r}), which a settings file "
+                "and a chown cannot hold without the folder above the repos",
+                'name each repo folder, or the folder that holds them as "/path/**"',
+                2,
+            )
+        root = _norm(text, home)
+        if root and root != "/":
+            roots.append(root)
+    return list(dict.fromkeys(roots))
+
+
+def class_settings(cls: policy.Class, home: str, kind: str) -> dict:
+    """The managed-settings content for a class (see the module docstring). Raises WsError('usage') when the class's
+    repos name no folder to allow writing in."""
+    roots = class_roots(cls, home)
+    if not roots:
+        raise WsError(
+            "usage",
+            f"class {cls.name!r} names no repo folder a settings file can hold "
+            "(its repos are bare names or start with a wildcard)",
+            'give the class a repo as a folder, e.g. repos = ["/srv/work/**"]',
+            2,
+        )
+    return {
+        "permissions": {BYPASS_KEY: BYPASS_OFF},
+        "sandbox": {
+            "enabled": True,
+            "failIfUnavailable": True,
+            "allowUnsandboxedCommands": False,
+            "filesystem": {
+                "allowWrite": [*roots, *scratch_dirs(kind)],
+                "denyRead": ["~/"],
+                "allowRead": list(roots),
+            },
+        },
+        "env": {INBOUND_ENV: INBOUND_VALUE},
+    }
+
+
+def class_file_text(cls: policy.Class, home: str, kind: str) -> str:
+    return json.dumps(class_settings(cls, home, kind), indent=2) + "\n"
+
+
+def install_text(cls: policy.Class, env: Mapping[str, str], kind: str) -> str:
+    """What `ws install --class NAME` prints: the commands to run with sudo, the root-owned file to place and how to check
+    it. Text only; ws runs none of it and writes nothing."""
+    user = cls.os_user or ""
+    q = shlex.quote
+    target = class_file_path(cls.name, kind)
+    staged = f"{target}.tmp"  # not a `*.json`, so Claude Code does not read it while it is half written
+    group = "wheel" if kind == "macos" else "root"
+    user_home = class_home(cls, kind)
+    roots = class_roots(cls, user_home)
+    mine = _home(env)
+    under_mine = [r for r in roots if _within(r, mine)]
+    create = (
+        f"sudo sysadminctl -addUser {q(user)} -password -"
+        if kind == "macos"
+        else f"sudo useradd --create-home --shell /bin/bash {q(user)}"
+    )
+    body = class_file_text(cls, user_home, kind)
+    intro = f"Class {cls.name}: sessions run as the OS user {user}. ws creates no user and writes nothing; run these yourself."
+    warning = (
+        "A managed-settings file applies to every account on this machine, yours included, not only to "
+        f"{user}. Read the file below before you place it. To take it out again: sudo rm {q(str(target))}"
+    )
+    lines = [
+        intro,
+        "",
+        warning,
+        "",
+        "1. Create the account (skip this if it exists) and close its home folder:",
+        f"   {create}",
+        f"   sudo chmod 700 {q(user_home)}",
+        "2. Close your own home folder to other accounts:",
+        '   chmod 700 "$HOME"',
+        "3. Give the account the class's repos (a folder the account can reach: not one under your own home, which step 2",
+        "   closes to it):",
+        *[f"   sudo chown -R {q(user)} {q(r)}" for r in roots],
+        *(
+            [f"   Note: {', '.join(under_mine)} is under your own home ({mine}); use a folder outside it."]
+            if under_mine
+            else []
+        ),
+        "4. Place the managed-settings file, owned by root and writable by no one else. It is written under another name and",
+        "   moved into place, so a paste that stops half way leaves no half-written file where Claude Code reads it:",
+        f"   sudo mkdir -p {q(str(target.parent))}",
+        f"   sudo tee {q(staged)} >/dev/null <<'WS_CLASS_FILE'",
+        *body.rstrip("\n").splitlines(),
+        "WS_CLASS_FILE",
+        f"   sudo chown root:{group} {q(staged)}",
+        f"   sudo chmod 644 {q(staged)}",
+        f"   sudo mv {q(staged)} {q(str(target))}",
+        "5. Give the account its own ws, policy and Claude Code. The ws under your home is out of its reach, and its",
+        "   sessions read their own policy, so the class has to be in that one too:",
+        f"   sudo -u {q(user)} -i",
+        "   curl -fsSL https://raw.githubusercontent.com/Michael-A-Fry/ws/main/install.sh | bash",
+        "   ws setup",
+        f"   (add the same [classes.{cls.name}] table to that account's policy.toml,",
+        "   then run `ws gate generate --runner claude-code`)",
+        "   claude   (sign in once as that account)",
+        "6. Start the class's sessions as that account, from a repo of the class:",
+        "   ws gate launch --runner claude-code -- claude",
+        "7. Check it: `ws doctor` reports each part of the class on its own line (WS014).",
+    ]
+    return "\n".join(lines)
+
+
+def _is_root(st: os.stat_result) -> bool:
+    return st.st_uid == 0
+
+
+def class_file_found(name: str) -> Path | None:
+    """The class's file in a managed-settings folder, if one exists (a link counts: the row says what is wrong)."""
+    for d in MANAGED_DIRS:
+        p = Path(d) / class_file_name(name)
+        if os.path.lexists(p):
+            return p
+    return None
+
+
+def _owner_problem(path: Path) -> tuple[str, str] | None:
+    """(what is wrong, which fix) for a managed file that is not safe to rely on: a link, not root-owned, writable by
+    group or others, not readable by the account that must obey it, or in a folder like that. The fix is one of `link`,
+    `owner`, `mode`, `readable`, `folder` or `look`. None when the file is fine."""
+    try:
+        st = os.lstat(path)
+        up = os.lstat(path.parent)
+    except OSError as e:
+        return f"can't be examined ({e.strerror})", "look"
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        return "is a link or not a plain file", "link"
+    if not _is_root(st):
+        return "is not owned by root, so its owner can change the wall", "owner"
+    if st.st_mode & 0o022:
+        return "is writable by group or others", "mode"
+    if not st.st_mode & 0o004:
+        return (
+            "can't be read by the class's account (no read for others), so its sessions run without the wall",
+            "readable",
+        )
+    if not _is_root(up) or up.st_mode & 0o022:
+        return "sits in a folder that is not root-owned or is writable by group or others", "folder"
+    return None
+
+
+def _owner_fix(path: Path, fix: str, again: str) -> str:
+    """The command that clears the problem `_owner_problem` named (`fix`), or the way to start again."""
+    f, d = shlex.quote(str(path)), shlex.quote(str(path.parent))
+    return {
+        "link": f"sudo rm {f}, then place the file again: {again}",
+        "owner": f"sudo chown root {f}",
+        "mode": f"sudo chmod go-w {f}",
+        "readable": f"sudo chmod 644 {f}",
+        "folder": f"sudo chown root {d} && sudo chmod go-w {d}",
+    }.get(fix, again)
+
+
+def class_files(pol: policy.Policy, env: Mapping[str, str], kind: str) -> list[tuple[policy.Class, Path, dict]]:
+    """(class, its file in place, the settings ws renders for it) for each class with an OS user whose file exists. A
+    class whose repos name no folder has nothing to compare with and is left out."""
+    out = []
+    for cls in class_users(pol):
+        found = class_file_found(cls.name)
+        if found is None:
+            continue
+        try:
+            want = class_settings(cls, class_home(cls, kind), kind)
+        except WsError:
+            continue
+        out.append((cls, found, want))
+    return out
+
+
+def _within(path: str, root: str) -> bool:
+    return path == root or path.startswith(root.rstrip("/") + "/")
+
+
+def class_widenings(doc: Mapping, file: Path, want: Mapping, home: str) -> list[Widening]:
+    """The settings in `doc` (your own file) that go beyond a class file in place: a place to write or read the file does
+    not name, or a bypass setting that is not the class file's. The generic switches (the sandbox off, an excluded
+    command) are `widenings`' to find."""
+    found: list[Widening] = []
+
+    def add(path: tuple[str, ...], item: str, why: str) -> None:
+        found.append(Widening(path, item, file, why))
+
+    sb = doc.get("sandbox")
+    fs_have = sb.get("filesystem") if isinstance(sb, Mapping) else None
+    fs_want = want["sandbox"]["filesystem"]
+    for key, why in (
+        ("allowWrite", "lets a session write where the class file does not (it names the repos and scratch only)"),
+        ("allowRead", "re-opens a folder the class file hides (the home folder, but for the repos)"),
+    ):
+        entries = fs_have.get(key) if isinstance(fs_have, Mapping) else None
+        allowed = [p for p in (_norm(x, home) for x in fs_want.get(key, [])) if p]
+        for e in entries if isinstance(entries, list) else ([entries] if entries else []):
+            p = _norm(e, home)
+            if p is None or not any(_within(p, a) for a in allowed):
+                add(("sandbox", "filesystem", key), str(e), why)
+    perms = doc.get("permissions")
+    if isinstance(perms, Mapping) and BYPASS_KEY in perms and perms[BYPASS_KEY] != BYPASS_OFF:
+        add(
+            ("permissions", BYPASS_KEY),
+            json.dumps(perms[BYPASS_KEY]),
+            "is not the class file's value, so bypass may be on",
+        )
+    return found
+
+
+def class_rows(pol: policy.Policy, env: Mapping[str, str], kind: str) -> list[Row]:
+    """One row per class with an OS user per part (PARTS), each judged on its own. The identity and the file come from the
+    system (the user database, the file's owner and mode), never from the environment. A missing user or file is a
+    `warn` that says which part, a file that is there and wrong is a `fail`."""
+    rows: list[Row] = []
+    for cls in class_users(pol):
+        rows += _rows_for(cls, env, kind)
+    return rows
+
+
+def _rows_for(cls: policy.Class, env: Mapping[str, str], kind: str) -> list[Row]:
+    name = cls.name
+    again = f"`ws install --class {name}` prints the commands and the file"
+
+    def row(part: str, status: str, detail: str, fix: str = "") -> Row:
+        return Row(name, part, status, detail, fix)
+
+    rows: list[Row] = []
+    if _passwd(cls.os_user or "") is None:
+        rows.append(row(PARTS[0], WARN, "the class's OS user is not in this system's user database", again))
+    else:
+        rows.append(row(PARTS[0], OK, "the class's OS user exists"))
+    found = class_file_found(name)
+    if found is None:
+        where = class_file_path(name, kind)
+        rows.append(row(PARTS[1], WARN, f"no managed-settings file for the class at {where}", again))
+        rows += [row(p, WARN, "not checked: no class file in place", again) for p in PARTS[2:7]]
+    else:
+        problem = _owner_problem(found)
+        if problem:
+            rows.append(row(PARTS[1], FAIL, f"{found} {problem[0]}", _owner_fix(found, problem[1], again)))
+        else:
+            rows.append(row(PARTS[1], OK, f"{found} is root-owned and writable by no one else"))
+        doc = _read(found)
+        if doc is None:
+            rows += [row(p, FAIL, f"{found} is not a JSON object Claude Code can read", again) for p in PARTS[2:7]]
+        else:
+            try:
+                want = class_settings(cls, class_home(cls, kind), kind)
+            except WsError as e:
+                rows += [row(p, WARN, e.message, e.hint) for p in PARTS[2:7]]
+            else:
+                rows += _content_rows(name, doc, want, again)
+    rows.append(_inbound_row(cls, found))
+    return rows
+
+
+def _content_rows(name: str, doc: Mapping, want: Mapping, again: str) -> list[Row]:
+    sb = doc.get("sandbox") if isinstance(doc.get("sandbox"), Mapping) else {}
+    fs = sb.get("filesystem") if isinstance(sb.get("filesystem"), Mapping) else {}
+    perms = doc.get("permissions") if isinstance(doc.get("permissions"), Mapping) else {}
+    expect = want["sandbox"]["filesystem"]
+
+    def entries(key: str) -> list:
+        return fs.get(key) if isinstance(fs.get(key), list) else []
+
+    def row(part: str, good: bool, ok: str, bad: str) -> Row:
+        return Row(name, part, OK if good else FAIL, ok if good else bad, "" if good else again)
+
+    extra_w = [str(x) for x in entries("allowWrite") if x not in expect["allowWrite"]]
+    lacks_w = [x for x in expect["allowWrite"] if x not in entries("allowWrite")]
+    extra_r = [str(x) for x in entries("allowRead") if x not in expect["allowRead"]]
+    hidden = "~/" in entries("denyRead")
+    return [
+        row(
+            PARTS[2],
+            sb.get("enabled") is True and sb.get("failIfUnavailable") is True,
+            "the sandbox is on and Claude Code refuses to start without it",
+            "the file does not set sandbox.enabled and sandbox.failIfUnavailable to true",
+        ),
+        row(
+            PARTS[3],
+            sb.get("allowUnsandboxedCommands") is False,
+            "a command the sandbox stops cannot be run again outside it",
+            "the file does not set sandbox.allowUnsandboxedCommands to false",
+        ),
+        row(
+            PARTS[4],
+            perms.get(BYPASS_KEY) == BYPASS_OFF,
+            f"permissions.{BYPASS_KEY} is {BYPASS_OFF!r}",
+            f"the file does not set permissions.{BYPASS_KEY} to {BYPASS_OFF!r}",
+        ),
+        row(
+            PARTS[5],
+            not extra_w and not lacks_w,
+            "writes are limited to the class's repos and scratch",
+            f"allowWrite is wider than the class's repos and scratch: {', '.join(extra_w)}"
+            if extra_w
+            else f"allowWrite lacks {', '.join(lacks_w)}",
+        ),
+        row(
+            PARTS[6],
+            hidden and not extra_r,
+            "the home folder is unreadable except the class's repos",
+            "denyRead does not hide the home folder (~/)"
+            if not hidden
+            else f"allowRead re-opens more than the class's repos: {', '.join(extra_r)}",
+        ),
+    ]
+
+
+def _inbound_row(cls: policy.Class, found: Path | None) -> Row:
+    """The inbound part: the file records lead-only, and the policy's own `inbound` for the class lets no one else in."""
+    part, again = PARTS[7], f"`ws install --class {cls.name}` prints the file"
+    if cls.inbound == "allowlist":
+        fix = f'set inbound = "lead-only" under [classes.{cls.name}] in the policy'
+        return Row(cls.name, part, WARN, "the policy lets named sessions send in (inbound = allowlist)", fix)
+    if found is None:
+        return Row(cls.name, part, WARN, "not checked in the file: no class file in place", again)
+    doc = _read(found)
+    env = doc.get("env") if isinstance(doc, dict) and isinstance(doc.get("env"), Mapping) else {}
+    if env.get(INBOUND_ENV) != INBOUND_VALUE:
+        return Row(cls.name, part, FAIL, f"the file does not set env {INBOUND_ENV} to {INBOUND_VALUE!r}", again)
+    return Row(cls.name, part, OK, f"inbound is {cls.inbound} in the policy and recorded as lead-only in the file")

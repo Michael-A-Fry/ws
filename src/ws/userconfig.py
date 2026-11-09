@@ -6,7 +6,7 @@ The promises, each pinned by a test:
 
 - Yours stays. Your hooks, permissions, env and keys ws does not use are never touched, and their order is kept. ws
   appends its items; it refuses, and changes nothing, when one of your values would be overridden (an `env` key you set
-  to another value).
+  to another value, or `permissions.disableBypassPermissionsMode` set to anything but "disable").
 - Before the first write the file's own bytes go to `backups/` in ws's state folder (mode 0600).
 - The manifest records the items ws added, as exact JSON, the items the release asked for (`wanted_ops`, so doctor can
   see a later release stop asking for one), and the hash of ws's last write.
@@ -66,8 +66,8 @@ _HOOK_SUFFIX = " || exit 2"
 _MISSING = object()
 _LOCK_WAIT = 10.0  # seconds to wait for another ws that holds the lock beside the config
 _WS_HOOK = re.compile(
-    r"\b(gate (check|event)|session (start|nudge)|notify alert)\b.*--runner\b"
-)  # every hook command ws writes
+    r"\b(?:(?:gate (?:check|event)|session (?:start|nudge)|notify alert)\b.*--runner\b|msg wait --session-hook\b)"
+)  # every hook command ws writes (the message wake hook has no --runner)
 
 
 @dataclass(frozen=True)
@@ -381,6 +381,9 @@ def _claude_ops(files: Mapping[str, str]) -> list[dict]:
     ops += [
         {"op": "set", "path": ["env", k], "value": v} for k, v in env.items()
     ]  # WS_SANDBOXED: 1, or 0 with no block
+    bypass = conf.get("permissions", {}).get(wallsettings.BYPASS_KEY)  # one value, here as in the launch settings
+    if bypass is not None:
+        ops.append({"op": "set", "path": ["permissions", wallsettings.BYPASS_KEY], "value": bypass})
     block = conf.get("sandbox")  # the runner's own sandbox: the wall; the policy's `sandbox = false` leaves it out
     if isinstance(block, dict):
         ops += _sandbox_ops(block, ["sandbox"])

@@ -264,3 +264,62 @@ def test_ws012_reports_in_the_doctor_run(box, capsys):
     checks = doctor.run_checks(osinfo.detect(), install.profile_path(), dict(__import__("os").environ), network=False)
     line = next(c for c in checks if c.id == "WS012")
     assert line.status == "ok"
+
+
+# --- a class file in place: what a later user setting adds beyond it -----------------------------------------------------
+
+
+def class_file_in_place(box, monkeypatch, tmp_path):
+    """The policy gets a class with an OS user and the file ws renders for it sits in a managed-settings folder."""
+    import os
+
+    pol = install.policy.policy_path(dict(os.environ))
+    pol.write_text(
+        pol.read_text(encoding="utf-8")
+        + '\n[classes.work]\naccess = "walled"\nos_user = "ws-work"\nrepos = ["/srv/work/**"]\n',
+        encoding="utf-8",
+    )
+    drop = tmp_path / "managed-settings.d"
+    drop.mkdir()
+    monkeypatch.setattr(wallsettings, "MANAGED_DIRS", (str(drop),))
+    cls = install.policy.load(pol).classes["work"]
+    file = drop / wallsettings.class_file_name("work")
+    file.write_text(wallsettings.class_file_text(cls, str(box), "linux"), encoding="utf-8")
+    return file
+
+
+def test_ws012_reports_a_managed_file_widened_by_a_later_user_setting(box, capsys, monkeypatch, tmp_path):
+    user_file(box)
+    assert run_install(capsys, box)[0] == 0
+    file = class_file_in_place(box, monkeypatch, tmp_path)
+    assert ws012(box)[0] == "ok"  # the class file is ws's own wall, and nothing of the person's goes beyond it
+    f = box / ".claude" / "settings.json"
+    conf = json.loads(f.read_text())
+    conf["sandbox"]["filesystem"]["allowWrite"] = ["/srv/work/sub", "/tmp/scratch"]  # inside the repos and scratch
+    f.write_text(json.dumps(conf))
+    assert ws012(box)[0] == "ok"
+    conf["sandbox"]["filesystem"]["allowWrite"] += ["/srv/elsewhere"]
+    conf["sandbox"]["filesystem"]["allowRead"] = ["~/notes"]
+    conf["permissions"][wallsettings.BYPASS_KEY] = "off"
+    f.write_text(json.dumps(conf))
+    status, detail, _ = ws012(box)
+    assert status == "warn" and detail.startswith("wall widened by user: ")
+    assert "sandbox.filesystem.allowWrite /srv/elsewhere" in detail
+    assert "sandbox.filesystem.allowRead ~/notes" in detail
+    assert f"permissions.{wallsettings.BYPASS_KEY}" in detail and str(f) in detail
+    assert "allowWrite /srv/work/sub" not in detail and str(file) not in detail  # the class file itself is not blamed
+    file.unlink()  # without the class file, the allowWrite of the person's is no one's concern but their own
+    assert "allowWrite /srv/elsewhere" not in ws012(box)[1]
+
+
+def test_ws012_reads_a_class_file_that_differs_from_what_ws_renders_like_any_managed_file(
+    box, capsys, monkeypatch, tmp_path
+):
+    user_file(box)
+    assert run_install(capsys, box)[0] == 0
+    file = class_file_in_place(box, monkeypatch, tmp_path)
+    conf = json.loads(file.read_text())
+    conf["sandbox"]["excludedCommands"] = ["npm:*"]
+    file.write_text(json.dumps(conf))
+    status, detail, _ = ws012(box)
+    assert status == "warn" and "sandbox.excludedCommands npm:*" in detail and str(file) in detail

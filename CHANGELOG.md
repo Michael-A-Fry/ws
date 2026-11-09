@@ -14,6 +14,25 @@ body of the GitHub release.
   own. A failed rewrite puts the runner's config and the install record back, and the message says which files, if any,
   it couldn't. The gate refuses the command in a session. Doctor check WS013 reports hooks older than the ws that
   runs them.
+- Messages reach the model. The `inbox` guard hands a session its pending messages at its own turn, as untrusted data
+  that grants no permission; `presence` keeps its busy or idle state; an idle Claude Code session is woken by a Stop hook
+  that runs `ws msg wait --session-hook` (exit 2 only for a delivered message, silent and exit 0 otherwise, and at once
+  under a one-shot `claude -p` run), and an idle OpenCode session by its plugin. A runner with no such hook gets a fixed
+  line typed into its tmux pane. New commands `ws msg watch` and `ws msg wait`; see [Messages](docs/reference/messages.md).
+- The `pane-close` guard: `tmux kill-window` and `kill-pane` on the live server are allowed only as one plain command,
+  by stable id, when the registry says the target is idle (and the caller is the lead) or is the caller's own pane after
+  its hand-over. It reads the command before anything else, including a shell's `-c` text, `eval`, a pipe into a shell
+  and the text that tmux's own commands run, and takes a tmux call that follows another command to be aimed at the live
+  server.
+- `ws install --class NAME` prints the commands and the root-owned managed-settings file for a class whose sessions run
+  as their own OS user, and writes nothing. Doctor check WS014 reports each part of such a class on its own line. A
+  session of the class started as another account is refused (exit 3). See
+  [Set up a class user](docs/how-to/set-up-a-class-user.md).
+- CI is split into jobs with a time budget each: `ci`, `oracle`, `node`, `term-browser` and a nightly quarantine run. A
+  test-integrity check (T1) asks for a `test-change:` line in the pull request body when a test is weakened or the test
+  machinery or CI changes, and a `holdout-change:` line for an edit to `tests/holdout/`. See
+  [CI](docs/reference/ci.md).
+- `ws install --gate every-session|launch` and `ws install --class NAME` are in the CLI reference, with `ws msg`.
 
 ### Fixed
 

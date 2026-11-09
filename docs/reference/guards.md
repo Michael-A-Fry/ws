@@ -36,9 +36,12 @@ or a guard name, and a key in a guard's table that guard doesn't read.
 | `skill-gate` | before a call, and when a prompt is sent | file writes and skill calls | Denies a write to a guarded path until the named skill has run in the session. The paths come from the policy's rules and from each skill's own `gates` front matter. The person can approve the write once. Judges Edit, Write and MultiEdit calls only. |
 | `dev-server` | before a call | shell commands | Denies a development server that listens on every interface or on an address other than loopback: `python -m http.server` with no `--bind`, `php -S 0.0.0.0:PORT`, `serve` with no `-l`, `vite --host`, `flask run --host 0.0.0.0`, `jupyter lab --ip 0.0.0.0`, `rails s -b 0.0.0.0`, `uvicorn --host 0.0.0.0`, `hugo server --bind 0.0.0.0`, `http-server` with no `-a`, `manage.py runserver 0.0.0.0:PORT`, `next dev -H 0.0.0.0`, `streamlit run`, `gunicorn -b 0.0.0.0`, `webpack serve --host 0.0.0.0` and `astro dev --host`. The reason names the flag to add. The person can approve the command once. On by default in the policy `ws gate init` writes. |
 | `checkout-pin` | before a call | shell commands | Denies `git checkout` or `switch` to another branch or commit, `reset --hard`, `--merge` and `--keep`, `rebase`, `merge`, `pull`, `cherry-pick`, `revert`, `am`, `bisect`, `stash pop` and `apply`, a whole-tree restore from another ref and `worktree move` into a checkout that has linked worktrees, or that `paths` names, whichever way the checkout is reached (a folder, `-C`, `--git-dir`, `GIT_DIR`, a `cd`). `git checkout -- FILE`, a restore of files, `commit`, `fetch`, `status`, `log` and a branch switch inside a linked worktree go through. The person can approve the command once. Off until you name it. |
+| `inbox` | when a prompt is sent, after a call, and when Claude Code stops | none | Hands the session the messages left for it, as text marked untrusted, at its own turn: a prompt's output, a warning after a tool call, and (for an `urgent` message) a `{"decision":"block"}` that keeps a stopping Claude Code session going, at most three stops in a row and never for an `info` message. A body is cut to 4000 characters, cleaned for a terminal and flagged when it reads like an instruction; the flags only mark. A walled receiver, a caller that can't be shown to be the session, and a store the wall leaves read-only get a body-free "N unread" line instead (after a call, at most once in two minutes). A message grants no permission: the gate judges every later call as before. Off until you name it. |
+| `presence` | before and after a call, at session start, on a prompt and on a stop | none | Records `busy` or `idle` in the session registry from those hooks, newest report winning, and the latest message the session sent that was delivered. A hook of a sub-agent is skipped. It never says anything and never fails a hook. |
+| `pane-close` | before a call | shell commands | Allows `tmux kill-window` or `kill-pane` on the live tmux server only as one plain command with an `@N` or `%N` target, when the registry says every session in it's idle and the caller is the lead, or it's the caller's own pane after its hand-over was delivered. See [pane-close](#pane-close). |
 | `record-calls` | before a call | every kind | Appends `{schema, ts, at, runner, payload}` (`ts` is the time; `at` is its legacy spelling, kept beside it) to `~/.local/state/ws/logs/gate-calls.jsonl`, one line for each hook run. A file write keeps its path and records the text as `{"bytes", "sha256"}`. `ws gate replay` reads that file. |
 
-`bulk-staging` and `record-calls` take no table. The other guards take one.
+`bulk-staging`, `record-calls`, `inbox` and `presence` take no table. The other guards take one.
 
 `test-weakening` and `skill-gate` judge Edit, Write and MultiEdit calls. A change made through the shell, such as
 `sed -i` or a redirect, or through a notebook edit, isn't seen by them. The sandbox is what stops a write; these guards
@@ -317,6 +320,49 @@ A `deny` marked approvable can be overridden once by you with `ws approve ID` in
 The first `deny` in the order below wins, and the guards after it aren't asked. A reason is shown as
 `guard-name: reason`.
 
+### inbox
+
+The messages are the ones `ws msg` keeps (see [Messages](messages.md)). The session id in a hook's payload is only a
+claim, so a body is handed over only when the hook process descends from the runner of that session. Through the
+resident gate that's the process the kernel reports at the other end of the hook's connection, never a field of the
+request; where the system reports none (macOS) no body goes through the gate and the reminder is all the session gets. A
+hook for another session's id reads no body and marks nothing delivered. The tools a message may be answered with are
+pinned (`msg_send`, `msg_list`, `msg_read`, `msg_ack`): if the tool server offers a different set of message tools,
+bodies are held back and the reminder is given. A stop is continued at most three times in a row (`stop_hook_active`
+carries the count on); only Claude Code has a stop hook that can do it.
+
+### presence
+
+`busy` for a prompt and for the start and end of a tool call, `idle` for a session start and a stop. Each report carries
+its hook's own time as `seq` and a `source`; an older report than the one held is dropped, and one of lower authority
+doesn't override a fresher one of higher authority. A `busy` older than two minutes (the one window every reader uses,
+`presence.STALE_S`) is read as "can't tell," the strictest case; an `idle` stays `idle`. The screen isn't read.
+
+### pane-close
+
+```toml
+[guards.pane-close]
+live_socket = "default"   # optional: the tmux socket whose panes are guarded (a path, or a name under the tmux folder)
+```
+
+A command is judged against the tmux server it will talk to (`-S path`, else `-L name`, else the socket in `$TMUX`,
+else the default). Any server but the live one is a test server and is left alone, but only for one plain command: a
+tmux call that follows another command (a `cd`, `unset` or `export` can change what a relative `-S`, `-L` or `$TMUX`
+means), or is reached through a wrapper, a variable assignment or a shell's text, is taken to be aimed at the live
+server. The live one is `live_socket`, by default this user's default socket, so no list of names is needed. Read-only
+queries go to the command's own socket with `TMUX` unset. Refused whatever the registry says: `-a`, a target by index
+or name, `kill-session` and `kill-server`, a close inside a loop, a command list, a pipe or a command substitution, a
+wrapper (`sudo`, `env`, `xargs`) or variables set in front, a tmux command word that's not plain text (a variable or
+a glob), a registry or tmux that can't be read, a registry that changed while the check ran, and a pane with no
+registered session. The command is read before anything else, so a quote-split spelling is the command it spells. Text
+that's run is read too: a shell's `-c` text, `eval`, a pipe into a shell, the text of `new-window`, `split-window`,
+`new-session`, `respawn-pane`, `display-popup`, `pipe-pane`, `run-shell`, `if-shell`, `send-keys`, `bind-key`,
+`set-hook` and the like, a `#(...)` format, and the file `source-file` names; a kill in any of them is refused. A
+script file a shell is told to run isn't read. The caller is `session.resolve_caller` and the lead is the identity
+folder's role; a window's name, a tmux option, `TMUX_PANE`, the environment and the payload's session id on its own
+decide nothing. A session closes only its own pane, and only once a `done` or `stop-and-hand-over:done` it sent has
+been delivered. Without `tmux` installed it says nothing.
+
 ## The order guards run in
 
 The order is fixed. It doesn't depend on how `[guards] on` lists the guards, and it's the same for every runner and every
@@ -332,11 +378,11 @@ The first refusal ends it. Each guard declares a `PRIORITY`:
 
 | Priority | For | Guards |
 |---|---|---|
-| 0 | A guard that only records, so a call a later guard refuses is on record too | `record-calls` |
-| 10 | A guard that protects the machine or the repository | `bulk-staging`, `checkout-pin`, `dev-server`, `test-weakening` |
+| 0 | A guard that only records, so a call a later guard refuses is on record too | `presence`, `record-calls` |
+| 10 | A guard that protects the machine or the repository | `bulk-staging`, `checkout-pin`, `dev-server`, `pane-close`, `test-weakening` |
 | 20 | A guard that keeps a session honest about its own work | `skill-gate`, `spawn-cap` |
 | 30 | A guard that checks what a message says | `claims` |
-| 90 | Advice after the fact | `session-context`, `syntax-check` |
+| 90 | Advice after the fact | `inbox`, `session-context`, `syntax-check` |
 
 A guard that declares none runs at 50. Each hook run that asks a guard, or refuses a call, writes one line to
 `logs/gate.jsonl` in the state folder: the decision, the layer that made it (`rule:command`, `guard:NAME`, ...), each
@@ -351,7 +397,7 @@ message text. See [stores](stores.md).
 | `post` | `PostToolUse` | A `deny` or `warn` as standard error with exit code 2. A `note` as standard error with exit code 0. |
 | `start` | `SessionStart` | Findings as text on standard output, which Claude Code adds to the session's context. Exit code 0. |
 | `prompt` | `UserPromptSubmit` | Findings as text on standard output. Exit code 0. |
-| `stop` | `Stop` | Findings as lines on standard error. Exit code 0. |
+| `stop` | `Stop` | Findings as lines on standard error. Exit code 0. The one exception is the `inbox` guard's: a stopping Claude Code session with an `urgent` message waiting gets `{"decision":"block","reason":...}` on standard output, so it carries on and reads it. |
 | `subagent-stop` | `SubagentStop` | Findings as lines on standard error. Exit code 0. |
 
 `ws gate event` is advice. A payload it can't read, a policy that doesn't load and a guard that crashes are each one line

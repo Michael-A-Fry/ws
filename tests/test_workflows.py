@@ -80,6 +80,137 @@ def test_every_action_is_pinned_by_commit(workflow: str):
         assert "@" in u and SHA.match(u.split("@", 1)[1]), f"{workflow}: {u} is not pinned by commit"
 
 
+# --- ci.yml: the jobs (docs/reference/ci.md) -------------------------------------------------------------------------
+
+
+def ci_jobs() -> dict[str, str]:
+    """The text of each top-level job in ci.yml, by name, without whole-line comments (the comment above a job would
+    otherwise be read as the end of the job before it)."""
+    body = (WORKFLOWS / "ci.yml").read_text(encoding="utf-8").split("\njobs:\n", 1)[1]
+    body = re.sub(r"^\s*#.*\n", "", body, flags=re.MULTILINE)
+    parts = re.split(r"^  ([A-Za-z0-9_-]+):\n", body, flags=re.MULTILINE)
+    return dict(zip(parts[1::2], parts[2::2], strict=True))
+
+
+def run_commands(job: str) -> list[str]:
+    """The text of each `run:` step of a job (a one-line command, a `|` block or a `>-` block), in order."""
+    out = []
+    lines = job.splitlines()
+    for i, line in enumerate(lines):
+        m = re.match(r"^(\s*)(?:- )?run:\s*(.*)$", line)
+        if not m:
+            continue
+        if m.group(2) not in ("|", ">", ">-"):
+            out.append(m.group(2))
+            continue
+        block = []
+        for later in lines[i + 1 :]:
+            if later.strip() and len(later) - len(later.lstrip()) <= len(m.group(1)):
+                break
+            block.append(later.strip())
+        out.append("\n".join(block))
+    return out
+
+
+def test_ci_job_deselects_the_oracle_and_runs_holdout():
+    text = ci_jobs()["ci"]
+    suite = next(c for c in run_commands(text) if "pytest" in c)
+    assert "--locked pytest -q" in suite
+    deselected = re.findall(r"--deselect\s+(\S+)", suite)
+    assert sorted(deselected) == ["tests/test_gate_oracle.py", "tests/test_shellwords_oracle.py"]
+    # tests/holdout/ is collected with everything else: no path to narrow the run, nothing that drops it
+    assert "--ignore" not in suite and "holdout" not in suite and "-k " not in suite and " -m " not in suite
+    assert not re.search(r"pytest\b[^\n]*\btests?/", suite.replace("--deselect tests/", ""))
+    assert (ROOT / "tests" / "holdout" / "test_holdout_core.py").is_file()
+    assert "WS_ORACLE_REQUIRE" not in text  # it belongs to the job that has the oracle
+    # T1 runs in this job, so it gates a merge with the check that is already required
+    step = text.split("- name: test integrity", 1)[1].split("\n      - ", 1)[0]
+    assert "if: github.event_name == 'pull_request'" in step
+    assert 'scripts/test_integrity.py --base "$BASE_SHA"' in step
+    assert "PR_BODY: ${{ github.event.pull_request.body }}" in step
+    assert "BASE_SHA: ${{ github.event.pull_request.base.sha }}" in step
+    assert "fetch-depth: 0" in text  # the base commit has to be in the clone
+
+
+def test_the_pull_request_body_and_base_never_reach_a_command_text():
+    for name, job in ci_jobs().items():
+        for command in run_commands(job):
+            assert "github.event.pull_request" not in command and "${{" not in command, f"{name}: {command}"
+
+
+def test_oracle_job_has_bubblewrap_and_requires_it():
+    text = ci_jobs()["oracle"]
+    assert re.search(r'WS_ORACLE_REQUIRE:\s*"1"', text)
+    assert "apt-get install -y --no-install-recommends bubblewrap" in text and "bwrap --version" in text
+    suite = next(c for c in run_commands(text) if "pytest" in c)
+    assert "tests/test_gate_oracle.py" in suite and "tests/test_shellwords_oracle.py" in suite
+    assert "--deselect" not in suite and "-k " not in suite
+    assert "runs-on: ubuntu-24.04" in text
+
+
+def test_bubblewrap_stays_in_the_ci_job():
+    """test_sandbox, test_wallsettings, test_gate_corpus and test_eval* use it and skip quietly without it."""
+    text = ci_jobs()["ci"]
+    assert "apt-get install -y --no-install-recommends bubblewrap" in text
+    assert text.index("bubblewrap") < text.index("--deselect"), "installed before the suite runs"
+    for needs in ("test_sandbox.py", "test_eval.py"):  # the ones that name it; others reach it through ws itself
+        source = (ROOT / "tests" / needs).read_text(encoding="utf-8")
+        assert "bubblewrap" in source or "bwrap" in source, f"{needs} no longer uses bubblewrap"
+
+
+def test_nightly_quarantine_and_node_jobs_exist():
+    ci = (WORKFLOWS / "ci.yml").read_text(encoding="utf-8")
+    triggers = [m.group(1) for line in top_level(ci, "on") if (m := re.match(r"^  (\w+):", line))]
+    assert {"schedule", "workflow_dispatch", "push", "pull_request"} <= set(triggers), triggers
+    # the integrity step reads the pull request body: editing it to add the line it asks for has to run it again
+    pr = "\n".join(top_level(ci, "on")).split("pull_request:", 1)[1].split("\n  schedule:", 1)[0]
+    assert re.search(r"types:\s*\[[^\]]*\bedited\b", pr), "pull_request must run again when the body is edited"
+    jobs = ci_jobs()
+    nightly = jobs["nightly-quarantine"]
+    assert "github.event_name == 'schedule'" in nightly and "github.event_name == 'workflow_dispatch'" in nightly
+    assert "pytest -q -rs --run-quarantine -m quarantine" in nightly
+    assert "-eq 5" in nightly, "pytest's exit 5, nothing collected, is a pass"
+    node = jobs["node"]
+    assert re.search(r'WS_TEST_NODE_REQUIRE:\s*"1"', node)
+    assert re.search(r"WS_TEST_NODE_IMAGE:\s*\S+@sha256:[0-9a-f]{64}\s*$", node, re.MULTILINE), (
+        "the image is pinned by digest"
+    )
+    assert "docker pull" in node and "tests/test_node.py" in node
+    # every job but the nightly one is off on the schedule
+    for name, job in jobs.items():
+        if name != "nightly-quarantine":
+            assert "if: github.event_name != 'schedule'" in job, name
+
+
+def test_browser_job_runs_the_glob():
+    text = ci_jobs()["term-browser"]
+    assert "tests/e2e/test_*_browser.py" in text
+    assert list((ROOT / "tests" / "e2e").glob("test_*_browser.py")), "the glob finds a file"
+    assert re.search(r'WS_E2E_REQUIRE:\s*"1"', text)
+
+
+def test_every_job_ends_with_the_budget_step():
+    jobs = ci_jobs()
+    assert set(jobs) == {"ci", "oracle", "nightly-quarantine", "node", "term-browser"}
+    for name, job in jobs.items():
+        steps = re.split(r"^      - ", job.split("\n    steps:\n", 1)[1], flags=re.MULTILINE)[1:]
+        last = steps[-1]
+        assert "if: always()" in last, name
+        assert f"scripts/ci_time_budget.py --job {name} " in last, name
+        assert '--stamp "$RUNNER_TEMP/job-start"' in last, name
+        assert "job-start" in steps[0] and "date +%s" in steps[0], f"{name}: the first step stamps the start time"
+        assert len(re.findall(r"ci_time_budget\.py", job)) == 1, name
+
+
+def test_the_workflow_asks_for_no_more_than_it_reads():
+    text = (WORKFLOWS / "ci.yml").read_text(encoding="utf-8")
+    assert [line.strip() for line in top_level(text, "permissions")] == []  # `permissions: {}` at the top
+    assert re.search(r"^permissions: \{\}$", text, re.MULTILINE)
+    for name, job in ci_jobs().items():
+        assert re.search(r"^    permissions:\n      contents: read$", job, re.MULTILINE), name
+        assert "persist-credentials: false" in job, name
+
+
 def test_cli_workflow_times_the_first_task_on_linux_macos_and_wsl2_and_smokes_windows():
     text = (WORKFLOWS / "cli.yml").read_text(encoding="utf-8")
     block = text.split("  matrix-e2e:", 1)[1].split("\n  wsl:", 1)[0]

@@ -12,6 +12,16 @@
 - `python3 scripts/check_docs_integrity.py`: exit 0
 -->
 
+## Test changes
+
+<!-- CI's test-integrity check (docs/reference/ci.md) fails the pull request when it finds a weakened test (a removed
+assertion, a wider tolerance, a new skip or expected failure) or an edit to the test machinery or CI, and the first line
+below is empty. It does the same for an edit to tests/holdout/ and the second line. Write why after the colon; leave a
+line empty when the check has nothing to say about it. -->
+
+test-change:
+holdout-change:
+
 ## Known gaps
 
 <!-- What you didn't run or didn't cover, and why. Write "none" if there's nothing. -->

@@ -36,7 +36,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from types import ModuleType
 
-from ws import adapters, canary
+from ws import adapters, canary, paths
 from ws.output import WsError
 
 GATE_DECISION_ID = "ws.gate-decision/1"
@@ -332,7 +332,7 @@ GATE_ROWS: tuple[dict, ...] = (
     {"id": "deny-private-key", "kind": "read", "value": "{HOME}/.ssh/id_rsa", "want": "deny", "want_rule": "rule:read"},
     {"id": "deny-key-folder-search", "kind": "search", "value": "{HOME}/.ssh", "want": "deny",
      "want_rule": "rule:search"},
-    {"id": "deny-own-policy-write", "kind": "write", "value": "{HOME}/.ws/policy.toml", "want": "deny",
+    {"id": "deny-own-policy-write", "kind": "write", "value": f"{{HOME}}/{paths.LEGACY_NAME}/policy.toml", "want": "deny",
      "want_rule": "rule:write"},
     {"id": "deny-compound-hides-push", "kind": "command", "value": "ls && git push --force origin main",
      "want": "deny", "want_rule": "rule:command"},

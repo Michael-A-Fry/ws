@@ -1488,7 +1488,7 @@ LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
 # Tools that open a socket themselves and ignore the proxy variables. In a session with an egress plan each is replaced
 # on PATH by a shim that says so and exits 126, so the attempt is a visible event and not a silent timeout.
 SHIM_TOOLS = ("nc", "ncat", "netcat", "telnet", "ssh", "scp", "sftp", "ftp", "socat")
-SHIM_LOG = "egress-denied.jsonl"
+SHIM_LOG = "egress-denied.log"  # one line per refused tool, in the launch's temporary folder; only counted
 # Instance-metadata endpoints (IPv4 as octets, so no address is written out as text: the PII gate would refuse it).
 _METADATA = (
     *(

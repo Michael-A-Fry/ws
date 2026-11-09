@@ -50,8 +50,8 @@ Row ids are the seven above and `live-gate`.
 
 ### Known failures only shrink, and no row skips by default
 
-A row a runner is known to fail is listed in `known_failures`. A listed row that fails is reported `INFO`, so a gap does
-not block other work. A listed row that passes is a `FAILURE` ("stale"): take it off the list. A row that's not listed
+A row a runner is known to fail is listed in `known_failures`. A listed row that fails is reported `INFO`, so a gap doesn't
+block other work. A listed row that passes is a `FAILURE` ("stale"): take it off the list. A row that's not listed
 and fails is a `FAILURE`. So the list can shrink and can't quietly grow without a person writing the id.
 
 A row that can't be asked at all (no payload, no skill payload, no prompt event, no live driver) is a `FAILURE`, not a

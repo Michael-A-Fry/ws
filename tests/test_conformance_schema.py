@@ -96,6 +96,38 @@ def test_the_row_list_matches_the_docs():
     assert "ws.gate-decision/1" in text and "ws.run-event/1" in text
 
 
+def test_a_config_is_read_as_entries_not_searched_as_text():
+    assert conformance.rule_path("Edit(//a/b/**)") == "/a/b" == conformance.rule_path("/a/b/**")
+    assert conformance.rule_path("~/.ssh/**") == "~/.ssh"
+    files = {
+        "c.json": '{"deny": ["Edit(//a/policy.toml)"], "hook": "py -I x.py -- ws gate check --runner r1 --policy /a/p"}',
+        "shim.js": 'const argv = ["ws", "gate", "check", "--runner", "r2"]; // not "gate", "check", "--runner", "r3"',
+    }
+    entries, argvs = conformance.config_entries(files)
+    assert "/a/policy.toml" in entries and "/a" not in entries  # a prefix of an entry is not an entry
+    assert conformance.runs_in_order(argvs, "gate", "check", "--runner", "r1")
+    assert conformance.runs_in_order(argvs, "gate", "check", "--runner", "r2")
+    assert not conformance.runs_in_order(argvs, "gate", "check", "--runner", "r4")
+
+
+def test_the_skill_payload_is_derived_from_what_the_adapter_parses():
+    class Reads:
+        @staticmethod
+        def parse(payload):
+            from ws.adapters import Call
+
+            return Call.of("skill", payload["tool_input"]["name"]) if payload.get("tool_name") == "skill" else None
+
+    class Reads_nothing:
+        @staticmethod
+        def parse(payload):
+            return None
+
+    shape = conformance.derived_skill_payload(Reads)
+    assert shape("x") == {"tool_name": "skill", "tool_input": {"name": "x"}}
+    assert conformance.derived_skill_payload(Reads_nothing) is None
+
+
 def test_the_golden_message_trace_is_in_a_fixed_order():
     steps = [s["step"] for s in conformance.MSG_TRACE]
     assert steps == ["send", "list", "read", "list", "ack"]

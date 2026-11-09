@@ -35,7 +35,8 @@ def box(tmp_path, monkeypatch):
 @pytest.fixture
 def attempt():
     """attempt(exp, row, fn): run `fn`; its AssertionError (or any Exception) is the row failing. The result record is
-    asserted here: SUCCESS, or INFO for a failure the runner lists as known. A skip passes through."""
+    asserted here: SUCCESS, or INFO for a failure the runner lists as known. A skip is allowed only for a row the runner
+    declares unsupported (and says why); a row that cannot be asked otherwise fails."""
 
     def go(exp: conformance.Expect, row: str, fn) -> dict:
         try:
@@ -44,6 +45,8 @@ def attempt():
         except Exception as e:  # noqa: BLE001 - any failure of the row is the row's result
             error = e
         result = conformance.settle(exp, row, error)
+        if result["status"] == "SKIPPED":  # only a row the runner declared unsupported, with its reason
+            pytest.skip(result["details"])
         assert result["status"] in ("SUCCESS", "INFO"), f"{result['name']}: {result['error']}"
         return result
 

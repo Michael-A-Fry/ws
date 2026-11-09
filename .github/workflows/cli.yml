@@ -129,8 +129,8 @@ jobs:
 
   # The runner conformance kit (docs/reference/conformance.md): the same table of rows for every runner adapter, plus the
   # live tier, which runs the real Claude Code and OpenCode against a stub model with only ws's hook able to refuse. No
-  # paid provider. A change to anything agent-facing should pass it; the branch rule that makes it required is a
-  # repository setting, not this file.
+  # paid provider. Not a required check, like the rest of this file: the `paths:` filter above would leave a required
+  # check waiting on a docs-only pull request, and requiring it is a repository setting, not this file.
   conformance:
     name: conformance (ubuntu-24.04, stub model)
     runs-on: ubuntu-24.04

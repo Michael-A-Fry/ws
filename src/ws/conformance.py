@@ -9,16 +9,20 @@ event maps onto the GenAI telemetry attributes), the fixture rows, and the stale
 What a runner is expected to do comes from the adapter, never from a list here. An adapter may define an optional
 `CONFORMANCE` dict; every key has a default derived from what the adapter already has:
 
-    payloads: dict            Call kind -> function(value, data) giving that runner's hook payload for it; default:
-                              the one `ws.gatecorpus` writes for the runner, else the gate rows are skipped
-    skill_payload: callable   name -> the hook payload for a skill call; default: the built-in shape of the runner,
-                              else the skill row checks the file only
+    payloads: dict            Call kind -> function(value, data) giving that runner's whole hook payload for it;
+                              default: the one `ws.gatecorpus` writes for the runner
+    skill_payload: callable   name -> the hook payload for a skill call; default: the first of the payload shapes
+                              in `SKILL_SHAPES` that the adapter's own `parse` reads as a skill call
     model: str                the model a job names for this runner; default `anthropic/claude-haiku-4-5`, a form
                               every ws runner accepts in a job that is refused before the runner starts
     known_failures: tuple     row ids this runner is known to fail today; see `settle`
+    unsupported: dict         row id -> the reason this runner cannot be asked that row
 
-A row that fails and is listed is reported INFO; a row that passes and is listed fails ("stale"), so the list only
-ever shrinks. Result records follow the check shape `{id, name, status, details, error}`.
+A row that cannot be asked of a runner (no payload, no skill payload, no prompt event) is a failure, never a skip,
+unless the runner declares it in `unsupported` with a reason. Only then does the row skip, and the skip says why. A row
+that fails and is listed in `known_failures` is reported INFO; a row that passes while listed there or in `unsupported`
+fails ("stale"), so both lists only ever shrink. Result records follow the check shape `{id, name, status, details,
+error}`.
 
 Nothing here runs a model or reads the network: the live tier of the suite uses the stub models in `tests/e2e`.
 """
@@ -26,6 +30,8 @@ Nothing here runs a model or reads the network: the live tier of the suite uses 
 from __future__ import annotations
 
 import json
+import re
+import shlex
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from types import ModuleType
@@ -39,6 +45,7 @@ DECISIONS = ("allow", "deny", "ask")
 EVENT_KINDS = ("run.start", "model.call", "tool.call", "gate.decision", "run.end")
 STATUSES = ("SUCCESS", "FAILURE", "WARNING", "SKIPPED", "INFO")
 
+LIVE_ROW = "live-gate"  # the one test that drives a real runner; it takes part in `known_failures` and `unsupported`
 ROWS = (
     "gate-parity",
     "sandbox-holds",
@@ -218,10 +225,39 @@ def event_from_record(rec: dict, seq: int = 0) -> list[dict]:
 
 # --- what an adapter is expected to do ---------------------------------------------------------------------------------
 
-_SKILL_PAYLOADS: dict[str, Callable[[str], dict]] = {
-    "claude-code": lambda name: {"tool_name": "Skill", "tool_input": {"skill": name}},
-    "opencode": lambda name: {"tool": "skill", "args": {"name": name}},
-}
+
+def _shape(tool: str, key: str, fields: tuple[str, str]) -> Callable[[str], dict]:
+    return lambda name: {fields[0]: tool, fields[1]: {key: name}}
+
+
+# The hook payload shapes runners send for a tool call: a tool name and its arguments under one of two spellings. The
+# default skill payload is the first of these that the adapter's own `parse` reads as a skill call.
+SKILL_SHAPES: tuple[Callable[[str], dict], ...] = tuple(
+    _shape(tool, key, fields)
+    for tool in ("Skill", "skill")
+    for key in ("skill", "name")
+    for fields in (("tool_name", "tool_input"), ("tool", "args"))
+)
+
+
+class Unsupported(Exception):
+    """Raised by a row that cannot be asked of this runner; `settle` turns it into a failure unless the runner declares
+    the row in `unsupported`, then into a skip that names the reason."""
+
+
+def derived_skill_payload(mod: ModuleType) -> Callable[[str], dict] | None:
+    """The first of `SKILL_SHAPES` the adapter's `parse` reads as a skill call, else None."""
+    if not callable(getattr(mod, "parse", None)):
+        return None
+    for shape in SKILL_SHAPES:
+        try:
+            got = mod.parse(shape("probe"))
+        except (ValueError, TypeError, KeyError):
+            continue
+        calls = [got] if isinstance(got, adapters.Call) else got or []
+        if [(c.kind, c.value) for c in calls] == [("skill", "probe")]:
+            return shape
+    return None
 
 
 MODEL = "anthropic/claude-haiku-4-5"
@@ -237,6 +273,7 @@ class Expect:
     skill_payload: Callable[[str], dict] | None = None
     model: str = MODEL
     known_failures: tuple[str, ...] = ()
+    unsupported: Mapping[str, str] = field(default_factory=dict)  # row id -> why this runner cannot be asked it
 
 
 def expectations(mod: ModuleType) -> Expect:
@@ -244,15 +281,20 @@ def expectations(mod: ModuleType) -> Expect:
     conf = getattr(mod, "CONFORMANCE", None) or {}
     if not isinstance(conf, dict):
         raise TypeError(f"{mod.__name__}.CONFORMANCE must be a dict")
-    unknown = set(conf) - {"payloads", "skill_payload", "model", "known_failures"}
+    unknown = set(conf) - {"payloads", "skill_payload", "model", "known_failures", "unsupported"}
     if unknown:
         raise KeyError(f"{mod.__name__}.CONFORMANCE: unknown key {min(unknown)!r}")
     known = tuple(conf.get("known_failures", ()))
-    if bad := [k for k in known if k not in ROWS]:
+    if bad := [k for k in known if k not in (*ROWS, LIVE_ROW)]:
         raise KeyError(f"{mod.__name__}.CONFORMANCE: known_failures names no row: {bad[0]!r}")
+    unsupported = dict(conf.get("unsupported") or {})
+    if bad := [
+        k for k, why in unsupported.items() if k not in (*ROWS, LIVE_ROW) or not (isinstance(why, str) and why.strip())
+    ]:
+        raise KeyError(f"{mod.__name__}.CONFORMANCE: unsupported needs a row id and a reason: {bad[0]!r}")
     return Expect(
-        mod.NAME, mod, conf.get("payloads") or {}, conf.get("skill_payload") or _SKILL_PAYLOADS.get(mod.NAME),
-        conf.get("model") or MODEL, known,
+        mod.NAME, mod, conf.get("payloads") or {}, conf.get("skill_payload") or derived_skill_payload(mod),
+        conf.get("model") or MODEL, known, unsupported,
     )  # fmt: skip
 
 
@@ -267,8 +309,7 @@ def payload_for(exp: Expect, kind: str, value: str, data: Mapping | None, home: 
     data = dict(data or {})
     own = exp.payloads.get(kind)
     if own is not None:
-        out = own(value, data)
-        return {**out, "cwd": cwd, "session_id": "conformance"} if exp.runner == "claude-code" else out
+        return own(value, data)
     from ws import gatecorpus
 
     row = gatecorpus.Row("conformance", {"kind": kind, "value": value, **data}, "allow", "control", "row")
@@ -353,7 +394,8 @@ def skill_problems(text: str, folder_name: str) -> list[str]:
 
 # --- a golden message round trip ---------------------------------------------------------------------------------------
 # The steps a message takes between two sessions, as the facts each step must leave (never ids or times, which differ
-# between runs). The same trace is replayed through the store and through `ws mcp serve`, so the two doors agree.
+# between runs). The trace is replayed through the message store (`ws.msg`) only; the `mcp-tool-call` row checks that `ws mcp serve`
+# lists the message tools but does not call them.
 
 MSG_TRACE: tuple[dict, ...] = (
     {"step": "send", "as": "alpha", "to": "bravo", "kind": "ask", "body": "is the build green?", "ack_required": True,
@@ -381,10 +423,21 @@ def check(row: str, name: str, status: str, details: str = "", error: str | None
 
 
 def settle(exp: Expect, row: str, error: BaseException | None) -> dict:
-    """The result of one row for one runner. A pass is SUCCESS and a failure is FAILURE, unless the runner lists the row
-    in `known_failures`: then a failure is INFO (known) and a pass is FAILURE (stale: take it off the list)."""
-    known = row in exp.known_failures
+    """The result of one row for one runner. A pass is SUCCESS and a failure is FAILURE, with three exceptions. A row in
+    `known_failures`: a failure is INFO and a pass is FAILURE (stale: take it off the list). A row in `unsupported`: a
+    pass is FAILURE (stale) and anything else is SKIPPED with the declared reason. A row that raised `Unsupported`
+    without being declared is FAILURE: a runner does not go green by not being asked."""
     name = f"{exp.runner}: {row}"
+    if row in exp.unsupported:
+        if error is None:
+            return check(
+                row, name, "FAILURE", error=f"{row} is declared unsupported for {exp.runner} but passes: remove it"
+            )
+        return check(row, name, "SKIPPED", f"unsupported: {exp.unsupported[row]}")
+    known = row in exp.known_failures
+    if isinstance(error, Unsupported):
+        hint = f"declare CONFORMANCE['unsupported'][{row!r}] with a reason, or fix the adapter"
+        return check(row, name, "FAILURE", error=f"{error}; {hint}")
     if error is None:
         if known:
             return check(
@@ -393,3 +446,51 @@ def settle(exp: Expect, row: str, error: BaseException | None) -> dict:
         return check(row, name, "SUCCESS")
     why = f"{type(error).__name__}: {error}"[:300]
     return check(row, name, "INFO" if known else "FAILURE", "known failure" if known else "", why)
+
+
+# --- a generated config, read as data ----------------------------------------------------------------------------------
+
+
+def config_entries(files: Mapping[str, str]) -> tuple[set[str], list[list[str]]]:
+    """What a runner's generated config says, read as data and not searched as text. Returns (entries, argvs): `entries`
+    is every string of every JSON file (object keys and values) reduced by `rule_path`, so a path written as a rule
+    compares equal to the path; `argvs` is every command the config runs: each JSON string split like a shell line, and
+    the string literals of any other file (a plugin's argument list) in the order they appear."""
+    entries: set[str] = set()
+    argvs: list[list[str]] = []
+
+    def walk(node) -> None:
+        if isinstance(node, dict):
+            for k, v in node.items():
+                walk(k)
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+        elif isinstance(node, str):
+            entries.add(rule_path(node))
+            try:
+                argvs.append(shlex.split(node))
+            except ValueError:
+                pass
+
+    for name, text in files.items():
+        if name.endswith(".json"):
+            walk(json.loads(text))
+        else:
+            argvs.append([json.loads(f'"{m}"') for m in re.findall(r'"((?:[^"\\\n]|\\.)*)"', text)])
+    return entries, argvs
+
+
+def rule_path(rule: str) -> str:
+    """The path a permission rule names: `Edit(//x/y/**)`, `/x/y/**` and `/x/y` are all `/x/y`."""
+    m = re.fullmatch(r"[A-Za-z]+\((.*)\)", rule)
+    path = m.group(1) if m else rule
+    path = re.sub(r"^//", "/", path)
+    return path.removesuffix("/**").removesuffix("/") or path
+
+
+def runs_in_order(argvs: list[list[str]], *tokens: str) -> bool:
+    """True when some command in `argvs` holds `tokens` next to each other, in that order."""
+    n = len(tokens)
+    return any(tuple(a[i : i + n]) == tokens for a in argvs for i in range(len(a) - n + 1))

@@ -51,8 +51,8 @@ from ws.profile import dumps
 
 
 def _rows_for(exp: conformance.Expect, wanted: dict) -> tuple[list[gatecorpus.Row], list[dict]]:
-    """The corpus rows for this runner and the fixture rows they came from; a call ws cannot write for this runner is
-    left out (and the test says how many)."""
+    """The corpus rows for this runner and the fixture rows they came from. A call ws cannot write as this runner's
+    payload is `Unsupported`: the row is not quietly smaller for that runner."""
     rows, kept = [], []
     for fx in conformance.GATE_ROWS:
         if bool(fx.get("policy")) != wanted["ask"]:
@@ -60,7 +60,9 @@ def _rows_for(exp: conformance.Expect, wanted: dict) -> tuple[list[gatecorpus.Ro
         data = {k: v for k, v in fx.items() if k in ("content",)}
         payload = conformance.payload_for(exp, fx["kind"], fx["value"], data, "{HOME}", "{CWD}")
         if payload is None:
-            continue
+            raise conformance.Unsupported(
+                f"ws cannot write a {fx['kind']} call as a {exp.runner} payload; give CONFORMANCE['payloads']"
+            )
         rows.append(gatecorpus.Row(fx["id"], payload, fx["want"], "control", fx["id"], False, exp.runner))
         kept.append(fx)
     return rows, kept
@@ -84,11 +86,9 @@ def _decisions(exp: conformance.Expect, box: Path) -> list[tuple[dict, dict]]:
 
 
 def test_gate_parity(exp, box, attempt):
-    pairs = _decisions(exp, box)
-    if not pairs:
-        pytest.skip(f"ws cannot write a neutral call as a {exp.runner} payload; give CONFORMANCE['payloads']")
-
     def row():
+        pairs = _decisions(exp, box)
+        assert len(pairs) == len(conformance.GATE_ROWS), "some fixture rows were not asked"
         for fx, got in pairs:
             where = f"{exp.runner}/{fx['id']}"
             assert got["result"] == fx["want"], f"{where}: {got['result']} ({got['reason']})"
@@ -107,6 +107,8 @@ def test_gate_parity_is_the_same_for_every_runner(box):
     """The table above compares each runner to the fixture; this compares the runners to each other, row by row."""
     seen: dict[str, dict[str, tuple]] = {}
     for name, exp in conformance.all_expectations().items():
+        if "gate-parity" in exp.unsupported:
+            continue  # declared, with its reason, and reported by the table above
         for fx, got in _decisions(exp, box):
             seen.setdefault(fx["id"], {})[name] = (got["result"], got["kind"])
     assert seen, "no runner could be asked any row"
@@ -133,14 +135,16 @@ def test_sandbox_holds(exp, box, attempt):
         out, pfile = box / ".ws" / "gate" / exp.runner, box / ".ws" / "policy.toml"
         files = exp.mod.generate(pol, ["ws"], out, pfile)
         assert files, "the adapter generated nothing"
-        text = "\n".join(files.values())
-        for must in (str(pfile), str(out)):
-            assert must in text, f"{must} (ws's own file) is not protected in the generated config"
+        entries, argvs = conformance.config_entries(files)  # the config read as data: whole entries, not text search
+        for must in (str(pfile), str(out), str(box / ".ws" / "profile.toml")):
+            assert must in entries, f"{must} (a ws file) is not an entry of the generated config"
         for rule in pol.gate.deny_read:
-            folder = rule.removesuffix("/**").removeprefix("~/").removeprefix("$HOME/")
-            if folder.startswith(".") and "*" not in folder:  # a hidden folder in the home: .ssh, .gnupg
-                assert folder in text, f"deny_read {rule} does not reach the generated config"
-        assert "gate" in text and "check" in text and exp.runner in text, "the config does not call `ws gate check`"
+            assert conformance.rule_path(rule) in entries, f"deny_read {rule} is not an entry of the generated config"
+        assert conformance.runs_in_order(argvs, "gate", "check", "--runner", exp.runner), (
+            "the config does not run `ws gate check --runner`"
+        )
+        assert conformance.runs_in_order(argvs, "--policy", str(pfile)), "the hook does not name the policy file"
+        assert conformance.runs_in_order(argvs, "--protect", str(out)), "the hook does not protect its own folder"
         unsupported = set(getattr(exp.mod, "UNSUPPORTED_GUARDS", ()))
         assert unsupported <= set(guards.names()), f"UNSUPPORTED_GUARDS names an unknown guard: {unsupported}"
         # a protected path is refused by the gate too, whatever the runner's native layer does
@@ -200,9 +204,12 @@ def test_budget_refuses(exp, jobbed, capsys, attempt):
         log = _write(home, exp, 2)
         _spend(log, exp.runner, 3.0)
         assert cli.main(["run", "conformance"]) == 3
-        assert "cap" in capsys.readouterr().err
+        assert "monthly cap of US$2" in capsys.readouterr().err
         rec = runrecord.read(log)[-1]
         assert rec["status"] == "refused" and rec["runner"] == exp.runner
+        # the cap's own counter said no: not the unpriced-model refusal (`refused:unpriced`) or any other
+        assert rec["stop_reason"] == "refused:profile_cap", rec["stop_reason"]
+        assert "monthly cap of US$2" in rec["error"]
         assert leases.requested == [], "a lease was asked for before the refusal"
 
     attempt(exp, "budget-refuses", row)
@@ -220,7 +227,7 @@ def test_run_record(exp, jobbed, capsys, attempt):
         errors = [f"{list(e.path)}: {e.message}" for e in RUN_VALIDATOR.iter_errors(rec)]
         assert not errors, errors
         assert rec["status"] == "refused" and rec["runner"] == exp.runner and rec["job"] == "conformance"
-        assert rec["error"] and rec["stop_reason"].startswith("refused:")
+        assert rec["stop_reason"] == "refused:profile_cap" and "WS103" in rec["error"]
         events = conformance.event_from_record(rec)
         assert [e["kind"] for e in events] == ["run.start", "run.end"] and events[1]["status"] == "refused"
         for event in events:
@@ -274,15 +281,16 @@ def test_skill_loads(exp, box, attempt):
         for name, body in ws_skills.SKILLS.items():  # what ws installs for this runner is itself a valid skill
             assert conformance.skill_problems(body, name) == [], name
         if exp.skill_payload is None:
-            pytest.skip(f"no skill payload for {exp.runner}; give CONFORMANCE['skill_payload']")
+            raise conformance.Unsupported(f"no skill payload for {exp.runner} reads as a skill call")
         calls = exp.mod.parse(exp.skill_payload(conformance.SKILL_NAME))
         calls = [calls] if isinstance(calls, adapters.Call) else calls or []
         assert [(c.kind, c.value) for c in calls] == [("skill", conformance.SKILL_NAME)], calls
         # reading the skill file is an ordinary read: the gate does not stand between a runner and its skills
         read = conformance.payload_for(exp, "read", str(folder / ws_skills.FILE), None, str(box), str(box))
-        if read is not None:
-            pol = policy.default_policy()
-            assert gate.check(exp.runner, json.dumps(read), pol, (), None, home=box / ".ws") is None
+        if read is None:
+            raise conformance.Unsupported(f"ws cannot write a read call as a {exp.runner} payload")
+        pol = policy.default_policy()
+        assert gate.check(exp.runner, json.dumps(read), pol, (), None, home=box / ".ws") is None
 
     attempt(exp, "skill-loads", row)
 
@@ -357,8 +365,9 @@ def mcp(box, tmp_path):
 
 def test_mcp_tool_call(exp, mcp, attempt):
     """The tools are there on the FIRST request, before any handshake: a client that connects late and a model that
-    asks at once must not meet an empty list (a runner that connects MCP in the background has been seen to lose them
-    on a fifth of first calls). Only then the handshake, a stable order, and a call that works."""
+    asks at once must not meet an empty list. Only then the handshake, a stable order, and a call that works. The
+    server is runner-neutral, so every runner's row asks the same server; the message tools are listed here, and the
+    message row drives the store directly."""
 
     def row():
         wanted = [t["name"] for t in mcp_server.TOOLS]
@@ -449,7 +458,7 @@ def test_message_round_trip(exp, box, monkeypatch, attempt):
         # delivery: a second message reaches the model at the runner's own prompt event, marked as untrusted data
         names = [k for k, v in getattr(exp.mod, "EVENT_NAMES", {}).items() if v == "prompt"]
         if not names:
-            pytest.skip(f"{exp.runner} has no prompt event to deliver a message at")
+            raise conformance.Unsupported(f"{exp.runner} has no prompt event to deliver a message at")
         sessions.who = "alpha"
         sent = msg.send("bravo", "note", "conformance delivery text")
         sessions.who = "bravo"
@@ -465,8 +474,8 @@ def test_message_round_trip(exp, box, monkeypatch, attempt):
 # --- the live tier -----------------------------------------------------------------------------------------------------
 # The real runner, pointed at a stub model on 127.0.0.1 (no provider, no key), with only ws's hook able to refuse: the
 # native deny list is stripped for Claude Code and the permission block for OpenCode, so what blocks is the gate. The
-# drivers are the end-to-end tests' own (tests/e2e/test_gate_runners.py). A runner with no driver here skips this tier.
-# `known_failures` covers the in-process table only: a live failure is always a failure.
+# drivers are the end-to-end tests' own (tests/e2e/test_gate_runners.py). This is the only part of the table that
+# drives a real runner. A runner with no driver here fails the tier unless it declares `unsupported["live-gate"]`.
 
 
 def _drive_claude(tmp_path, work, calls):
@@ -492,21 +501,39 @@ def live_box(tmp_path, monkeypatch):
     return work
 
 
-def test_live_gate_blocks_and_allows(exp, tmp_path, live_box):
-    if exp.runner not in LIVE:
-        pytest.skip(f"no live driver for {exp.runner}")
-    binary, drive = LIVE[exp.runner]
-    live.runner_bin(binary)  # skips when the runner is not installed, fails under WS_E2E_REQUIRE=1
+def test_live_gate_blocks_and_allows(exp, tmp_path, live_box, attempt):
+    def row():
+        if exp.runner not in LIVE:
+            raise conformance.Unsupported(f"no live driver for {exp.runner} in LIVE")
+        binary, drive = LIVE[exp.runner]
+        live.runner_bin(binary)  # skips when the runner is not installed, fails under WS_E2E_REQUIRE=1
+        calls, expect = live.scenario("denied_command", exp.runner, live_box)
+        stub, proc = drive(tmp_path, live_box, calls)
+        live.assert_all_blocked(stub, proc, calls=expect["tool_results"])
+        live.assert_paths(expect)
+        # the control: a call the policy allows does run through the same hook, so the block above is not vacuous
+        calls, expect = live.scenario("first_task", exp.runner, live_box)
+        stub, proc = drive(tmp_path, live_box, calls)
+        live.assert_paths(expect, proc)
+        assert len(stub.tool_results()) == expect["tool_results"]
 
-    calls, expect = live.scenario("denied_command", exp.runner, live_box)
-    stub, proc = drive(tmp_path, live_box, calls)
-    live.assert_all_blocked(stub, proc, calls=expect["tool_results"])
-    live.assert_paths(expect)
-    # the control: a call the policy allows does run through the same hook, so the block above is not vacuous
-    calls, expect = live.scenario("first_task", exp.runner, live_box)
-    stub, proc = drive(tmp_path, live_box, calls)
-    live.assert_paths(expect, proc)
-    assert len(stub.tool_results()) == expect["tool_results"]
+    attempt(exp, conformance.LIVE_ROW, row)
+
+
+def test_there_are_at_least_two_runners_to_compare():
+    """An empty or one-runner table would exit 0 having compared nothing."""
+    assert len(adapters.all_adapters()) >= 2, sorted(adapters.all_adapters())
+    assert len(conformance.all_expectations()) >= 2
+
+
+def test_a_row_that_cannot_be_asked_fails_unless_declared(exp):
+    ask = conformance.Unsupported("no prompt event")
+    assert conformance.settle(exp, "skill-loads", ask)["status"] == "FAILURE"  # not green by not being asked
+    declared = conformance.Expect(exp.runner, exp.mod, unsupported={"skill-loads": "this runner has no skills"})
+    skipped = conformance.settle(declared, "skill-loads", ask)
+    assert skipped["status"] == "SKIPPED" and "this runner has no skills" in skipped["details"]
+    stale = conformance.settle(declared, "skill-loads", None)
+    assert stale["status"] == "FAILURE" and "remove it" in stale["error"]
 
 
 # --- known failures only shrink ----------------------------------------------------------------------------------------

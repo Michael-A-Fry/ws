@@ -3,28 +3,31 @@
 The runner conformance kit: the same seven questions asked of every runner adapter, so "works on Claude Code" and
 "works on OpenCode" mean the same thing, and a new runner is held to the same bar the day its adapter exists. The suite
 is `tests/conformance/`; the contracts and fixture rows are `src/ws/conformance.py`. CI runs it as the `conformance` job
-in `cli.yml` on Claude Code and OpenCode, with stub models and no paid provider, and a change to anything agent-facing
-should pass it.
+in `cli.yml` on Claude Code and OpenCode, with stub models and no paid provider. It is not a required check: making it
+one is a repository setting, and with that workflow's `paths:` filter a required check would wait forever on a
+docs-only pull request.
 
 ## The rows
 
-One table per runner found by `ws.adapters.all_adapters()`. A row is a test; its id is stable.
+One table per runner found by `ws.adapters.all_adapters()`. A row is a test; its id is stable. Which rows drive a real
+runner: only the live gate test (`live-gate`, below). The seven rows run in-process: they call ws's own code with the
+adapter's generated config and hook payloads, and none of them starts a runner.
 
 | Row | What it asks of the runner |
 |---|---|
 | `gate-parity` | The same neutral calls (a command, a read, a search, a write; denied, allowed and asked) get the same decision from the gate, and the same deciding layer (`want_rule`: `rule:command`, `rule:read`, `rule:search`, `rule:write`, `guard:NAME`, `ask_commands`). Each decision is also written as a `ws.gate-decision/1` record and checked. |
-| `sandbox-holds` | What the adapter generates protects ws's own files (the policy and the generated folder), carries every hidden-folder `deny_read` rule, calls `ws gate check`, and names only guards that exist in `UNSUPPORTED_GUARDS`. The gate itself refuses a write to a protected path. |
-| `budget-refuses` | A job over the monthly cap is refused with exit 3 and a `refused` record, before any runner starts or any lease is asked for. |
+| `sandbox-holds` | The generated config, read as data (every JSON entry, and the argument list of any plugin), names ws's own files (the policy, the profile, the generated folder) and every `deny_read` path as whole entries, runs `ws gate check --runner NAME` with the policy and the protected folder, and names only guards that exist in `UNSUPPORTED_GUARDS`. The gate itself refuses a write to a protected path. |
+| `budget-refuses` | A job over the monthly cap is refused with exit 3 and a `refused` record whose `stop_reason` is the cap's own (`refused:profile_cap`, and the error names the cap), before any runner starts or any lease is asked for. |
 | `run-record` | A refused run still leaves exactly one record, valid against the run-record schema, naming the runner, and it maps onto `ws.run-event/1` events and the pinned telemetry attributes. |
 | `skill-loads` | A `SKILL.md` in the runner's skills folder is valid Agent Skills (name equals folder, kebab case, description under 1024 characters, allowed keys only, under 20,000 bytes), every skill ws ships is too, the runner's own skill call is read as a skill call, and reading a skill file is not stopped by the gate. |
 | `mcp-tool-call` | `ws mcp serve` lists all its tools on the very first request, before any handshake (a runner that connects its MCP servers in the background can start a turn with none of the tools, and the model then answers without them), in a stable order, with valid names; then the handshake, a working tool call and a failing one that says so in its result. |
-| `message-round-trip` | A message sent, listed, read and acknowledged between two sessions leaves the golden trace (`MSG_TRACE`, compared as sorted JSON lines), and a second message reaches the model at the runner's own prompt event, marked as untrusted data. |
+| `message-round-trip` | A message sent, listed, read and acknowledged between two sessions through the message store leaves the golden trace (`MSG_TRACE`, compared as sorted JSON lines; `ws mcp serve`'s message tools are listed by the MCP row, not driven), and a second message reaches the model at the runner's own prompt event, marked as untrusted data. |
 
-On top of the table there is a live tier: the real runner, pointed at a stub model on 127.0.0.1, with only ws's hook
-able to refuse (the native deny list or permission block is stripped). A denied command must be blocked and the control
-call must run. It uses the drivers of `tests/e2e/test_gate_runners.py`, skips when the runner is not installed, and
-fails instead when `WS_E2E_REQUIRE=1`, as CI sets it. The full run record of a real run, with a broker lease, is
-`tests/e2e/test_run_record.py`.
+`live-gate` is the live tier and the only test that drives a real runner: the real binary, pointed at a stub model on
+127.0.0.1, with only ws's hook able to refuse (the native deny list or permission block is stripped). A denied command
+must be blocked and the control call must run. It uses the drivers of `tests/e2e/test_gate_runners.py`, skips when the
+runner is not installed, and fails instead when `WS_E2E_REQUIRE=1`, as CI sets it. The run record of a real run, with a
+broker lease, is `tests/e2e/test_run_record.py`; the `run-record` row above checks a refused run's record only.
 
 The MCP project's own conformance suite is not run: its server mode needs an HTTP server and node, and `ws mcp serve`
 speaks stdio. The stdio checks above (tools present on the first call, deterministic order, name format, errors in the
@@ -37,17 +40,24 @@ what the adapter already has. An adapter may define an optional `CONFORMANCE` di
 
 | Key | Meaning | Default |
 |---|---|---|
-| `payloads` | Call kind to a function `(value, data)` giving the runner's hook payload for it | the payload `ws.gatecorpus` writes for the runner; with neither, the gate rows skip and say so |
-| `skill_payload` | A function from a skill name to the hook payload of a skill call | the built-in shape for Claude Code and OpenCode; with none, the skill row checks the file and the format only |
+| `payloads` | Call kind to a function `(value, data)` giving the runner's whole hook payload for it | the payload `ws.gatecorpus` writes for the runner |
+| `skill_payload` | A function from a skill name to the hook payload of a skill call | the first common payload shape that the adapter's own `parse` reads as a skill call |
 | `model` | The model a job names for this runner | `anthropic/claude-haiku-4-5` |
 | `known_failures` | Row ids this runner fails today | none |
+| `unsupported` | Row id to the reason this runner cannot be asked that row | none |
 
-### Known failures only shrink
+Row ids are the seven above and `live-gate`.
+
+### Known failures only shrink, and no row skips by default
 
 A row a runner is known to fail is listed in `known_failures`. A listed row that fails is reported `INFO`, so a gap does
 not block other work. A listed row that passes is a `FAILURE` ("stale"): take it off the list. A row that is not listed
-and fails is a `FAILURE`. So the list can shrink and cannot quietly grow without a person writing the id. The live tier
-is outside this: a live failure is always a failure.
+and fails is a `FAILURE`. So the list can shrink and cannot quietly grow without a person writing the id.
+
+A row that cannot be asked at all (no payload, no skill payload, no prompt event, no live driver) is a `FAILURE`, not a
+skip: a runner does not go green by not being asked. Only a row the runner declares in `unsupported`, with a reason,
+skips, and the skip says why. A declared row that passes is stale and fails, as above. The table also fails if
+`ws.adapters` finds fewer than two runners, so an empty table cannot pass.
 
 A result is a record `{id, name, status, details, error}` with `status` one of `SUCCESS`, `FAILURE`, `WARNING`,
 `SKIPPED` or `INFO`.

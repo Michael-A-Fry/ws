@@ -10,7 +10,8 @@ held outside the files below) can still widen the wall, and WS012 says only what
 
 A class with an `os_user` (see ws.policy.Class) can also have a managed-settings file of its own, which holds what a
 session of that class may do whoever starts it: the sandbox required, no unsandboxed retry, bypass off, writes in the
-class's repos and scratch only, the home folder unreadable except those repos, inbound lead-only. This module renders
+class's repos and scratch only, the home folder unreadable except those repos, inbound lead-only, and the network
+shut but for the class's own hosts (`network.allowedDomains` with `allowManagedDomainsOnly`). This module renders
 that file as text (`class_settings`, `install_text`, for `ws install --class`) and judges it (`class_rows`, the WS014
 rows). It never writes it: a managed-settings file is placed by a person with sudo, and it applies to every account on
 the machine, so ws prints it and nothing more. `MANAGED_FILES` and `MANAGED_DIRS` are the only places managed-settings
@@ -417,6 +418,8 @@ def class_roots(cls: policy.Class, home: str) -> list[str]:
 def class_settings(cls: policy.Class, home: str, kind: str) -> dict:
     """The managed-settings content for a class (see the module docstring). Raises WsError('usage') when the class's
     repos name no folder to allow writing in."""
+    from ws.sandbox import class_domains  # late: ws.sandbox imports the adapters, which import this module
+
     roots = class_roots(cls, home)
     if not roots:
         raise WsError(
@@ -436,6 +439,14 @@ def class_settings(cls: policy.Class, home: str, kind: str) -> dict:
                 "allowWrite": [*roots, *scratch_dirs(kind)],
                 "denyRead": ["~/"],
                 "allowRead": list(roots),
+            },
+            # Default-deny network: only the class's hosts and its providers' (ws.sandbox.class_domains), and no other
+            # settings file adds one. An egress exception is not in the file (it expires; the file does not).
+            "network": {
+                "allowManagedDomainsOnly": True,
+                "allowedDomains": class_domains(cls),
+                "allowAllUnixSockets": False,
+                "allowLocalBinding": False,
             },
         },
         "env": {INBOUND_ENV: INBOUND_VALUE},
@@ -579,6 +590,20 @@ def class_files(pol: policy.Policy, env: Mapping[str, str], kind: str) -> list[t
 
 def _within(path: str, root: str) -> bool:
     return path == root or path.startswith(root.rstrip("/") + "/")
+
+
+def stale_networks(pol: policy.Policy, env: Mapping[str, str], kind: str) -> list[str]:
+    """The classes (by name) whose managed-settings file in place holds a `network` block other than the one ws renders
+    now: a host added to or taken out of the policy since the file was placed. A class with no file in place is left out
+    (WS014 says so)."""
+    out = []
+    for cls, found, want in class_files(pol, env, kind):
+        doc = _read(found)
+        sb = doc.get("sandbox") if isinstance(doc, dict) else None
+        have = sb.get("network") if isinstance(sb, dict) else None
+        if have != want["sandbox"]["network"]:
+            out.append(cls.name)
+    return out
 
 
 def class_widenings(doc: Mapping, file: Path, want: Mapping, home: str) -> list[Widening]:

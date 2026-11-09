@@ -796,7 +796,6 @@ def test_for_project_writes_the_hosts_as_allowed_domains_and_an_empty_list_reach
 
 
 def test_for_project_with_a_list_and_no_sandbox_block_is_refused_not_ignored(tmp_path):
-    # this used to return the settings unchanged: the class's list went nowhere and the network stayed open
     with pytest.raises(ValueError, match="no sandbox block"):
         claude_code.for_project("{}", str(tmp_path), ["a.example.com"])
     with pytest.raises(ValueError, match="no sandbox block"):

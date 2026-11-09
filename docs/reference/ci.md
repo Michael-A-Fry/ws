@@ -8,7 +8,7 @@ changes the tests. The suite itself (sizes, tiers, quarantine) is in [Testing](t
 
 | Job | Runs on | What it does | Limit |
 |---|---|---|---|
-| `ci` | every push to `main` and every pull request | Test-integrity check, gitleaks, PII gate, hooks (ruff, typos, rumdl, actionlint, zizmor, pinact), docs integrity, Vale, gate replay, then the suite without the two oracle files. `tests/holdout/` runs with the suite. | 20 min |
+| `ci` | every push to `main` and every pull request | Gitleaks, PII gate, hooks (ruff, typos, rumdl, actionlint, zizmor, pinact), docs integrity, Vale, gate replay, then the suite without the two oracle files. `tests/holdout/` runs with the suite. | 20 min |
 | `oracle` | the same | `tests/test_gate_oracle.py` and `tests/test_shellwords_oracle.py`: the gate and the command reader against a real bash, the gate one inside bubblewrap. `WS_ORACLE_REQUIRE=1` turns a sandbox that can't start into a failure. | 20 min |
 | `node` | the same | `tests/test_node.py` with a container: an image pulled by digest and used locally (`WS_TEST_NODE_IMAGE`). `WS_TEST_NODE_REQUIRE=1` turns a missing runtime or image into a failure instead of the fallback to the host. | 10 min |
 | `term-browser` | the same | Every `tests/e2e/test_*_browser.py` with Chromium. `WS_E2E_REQUIRE=1` turns a missing browser into a failure. | 15 min |
@@ -20,11 +20,9 @@ Bubblewrap is installed in `ci` as well as in `oracle`: `tests/test_sandbox.py` 
 quietly without it.
 
 The oracle and node jobs don't gate a merge until each is added as a required check in the repository's branch rules.
-That's a repository setting, not a file. `ci` is already required, so the test-integrity check and the holdout, which
-sit inside it, run on every pull request. Neither can stop a pull request that sets out to get past it: on a
-`pull_request` event GitHub runs the workflow and the script from the pull request's own tree, so a change can edit
-them, and the `test-change:` line is written by the author. Read them as a check on honest mistakes, and review changes
-to the files they watch.
+That's a repository setting, not a file. The `test-integrity` job needs the same setting. `ci` is already required, so
+the holdout, which sits inside it, runs on every pull request; it runs from the pull request's own tree, so a change can
+edit it. Review changes to it.
 
 ## The time budget
 
@@ -49,8 +47,13 @@ and change `N` in the same edit.
 
 ## Test integrity and the holdout
 
-`scripts/test_integrity.py` runs as a step of the `ci` job on pull requests. It compares the tests at the pull request's
-base with the tests at its head and lists:
+`scripts/test_integrity.py` runs in its own workflow, `test-integrity.yml`, on `pull_request_target`. GitHub reads that
+workflow from the base branch, and the job checks out the base, so a pull request can't change the workflow, the script
+or anything the script imports for its own run. The pull request's commits are fetched and only read through git; no
+step may run them. A change to this check takes effect from the next pull request after it lands. The body line is
+still written by the author, so it records why and proves nothing, and assertions are counted per file, so swapping a
+real one for a trivial one isn't seen: read this as a check on honest mistakes. The script compares the tests
+at the pull request's base with the tests at its head and lists:
 
 - an assertion removed, a test removed, or a test file deleted;
 - a tolerance widened, added, or changed to another kind (`approx`, `abs=`, `rel=`, `atol=`, `rtol=`);
@@ -76,7 +79,7 @@ to generate rules from a policy that doesn't parse, and `ws doctor --offline` ru
 never shaped to pass it.
 
 Exit codes of the script: 0 nothing to say or every hit has its line, 1 a hit with no line, 2 the check couldn't run.
-A base commit that isn't in the clone is a failure with exit 2 (the `ci` job fetches the full history).
+A base commit that isn't in the clone is a failure with exit 2 (the workflow fetches the full history).
 
 ## Pinning and the workflow audit
 
@@ -84,10 +87,10 @@ Every action is pinned by commit SHA with its version in a comment, and tools ar
 old. Two dev-only tools, both MIT licensed and in active use, run in the prek hooks and so in `ci`:
 
 - pinact v5.0.2 fails when an action in `.github/workflows/` isn't pinned by SHA. `pinact run` fixes it.
-- zizmor v1.31.1 audits `.github/workflows/ci.yml` for injection through expressions, over-wide permissions and cache
+- zizmor v1.31.1 audits `ci.yml` and `test-integrity.yml` for injection through expressions, over-wide permissions and cache
   poisoning. It runs offline in the hook, so the audits that need the GitHub API are skipped there.
 
-zizmor is scoped to `ci.yml`. The other workflows have findings that aren't fixed yet:
+zizmor is scoped to those two files. The other workflows have findings that aren't fixed yet:
 
 | Workflow | Finding |
 |---|---|

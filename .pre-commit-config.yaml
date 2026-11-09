@@ -36,7 +36,7 @@ repos:
     rev: v1.31.1
     hooks:
       - id: zizmor
-        files: ^\.github/workflows/ci\.yml$
+        files: ^\.github/workflows/(ci|test-integrity)\.yml$
   - repo: local
     hooks:
       # pinact checks every action is pinned by commit SHA (MIT; v5.0.2, 25 Oct 2026). It builds from source with Go.

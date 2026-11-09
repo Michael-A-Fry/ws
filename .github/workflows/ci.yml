@@ -1,4 +1,4 @@
-# The required check `ci`: Linux, hooks, docs, the corpus, the test-integrity check and the suite without the real-shell
+# The required check `ci`: Linux, hooks, docs, the corpus and the suite without the real-shell
 # oracle. The oracle has its own job (`oracle`), the container node diff is `node`, and `term-browser` runs the web
 # terminal's browser tests. `nightly-quarantine` runs on the schedule only. docs/reference/ci.md explains each job.
 # Actions pinned by commit SHA (version in the comment).
@@ -9,8 +9,6 @@ on:
   push:
     branches: [main]
   pull_request:
-    # `edited`: the test-integrity step reads the body, so adding the `test-change:` line it asks for must run it again
-    types: [opened, synchronize, reopened, edited]
   schedule:
     - cron: "17 14 * * *" # 14:17 UTC every day, off the hour on purpose: the quarantine job only
   workflow_dispatch:
@@ -42,15 +40,6 @@ jobs:
         with:
           version: "0.13.1"
           enable-cache: true
-      # T1 (scripts/test_integrity.py): a weakened test, an edit to the test machinery or CI, or an edit to tests/holdout/
-      # needs a `test-change:` or `holdout-change:` line in the pull request body. The body and the base reach the script
-      # through env values, never through the command text.
-      - name: test integrity (weakened tests, machinery edits, holdout edits)
-        if: github.event_name == 'pull_request'
-        env:
-          PR_BODY: ${{ github.event.pull_request.body }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: python3 scripts/test_integrity.py --base "$BASE_SHA"
       - name: gitleaks over the full history
         run: |
           v=8.30.1; sum=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb

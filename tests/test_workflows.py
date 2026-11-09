@@ -123,19 +123,36 @@ def test_ci_job_deselects_the_oracle_and_runs_holdout():
     assert not re.search(r"pytest\b[^\n]*\btests?/", suite.replace("--deselect tests/", ""))
     assert (ROOT / "tests" / "holdout" / "test_holdout_core.py").is_file()
     assert "WS_ORACLE_REQUIRE" not in text  # it belongs to the job that has the oracle
-    # T1 runs in this job, so it gates a merge with the check that is already required
-    step = text.split("- name: test integrity", 1)[1].split("\n      - ", 1)[0]
-    assert "if: github.event_name == 'pull_request'" in step
-    assert 'scripts/test_integrity.py --base "$BASE_SHA"' in step
-    assert "PR_BODY: ${{ github.event.pull_request.body }}" in step
-    assert "BASE_SHA: ${{ github.event.pull_request.base.sha }}" in step
-    assert "fetch-depth: 0" in text  # the base commit has to be in the clone
+    assert "test_integrity.py" not in text  # T1 runs from the base branch (test_t1_runs_only_from_the_base_branch)
+    assert "fetch-depth: 0" in text  # gitleaks and the PII gate read the whole history
 
 
 def test_the_pull_request_body_and_base_never_reach_a_command_text():
     for name, job in ci_jobs().items():
         for command in run_commands(job):
             assert "github.event.pull_request" not in command and "${{" not in command, f"{name}: {command}"
+
+
+def test_t1_runs_only_from_the_base_branch():
+    """A pull request must not be able to change the code that judges it: the trigger reads the workflow from the base,
+    the checkout is the base, and the pull request's commits only ever reach git."""
+    text = (WORKFLOWS / "test-integrity.yml").read_text(encoding="utf-8")
+    code = "\n".join(line.split(" # ", 1)[0] for line in text.splitlines() if not line.lstrip().startswith("#"))
+    triggers = [m.group(1) for line in top_level(text, "on") if (m := re.match(r"^  (\w+):", line))]
+    assert triggers == ["pull_request_target"]
+    assert re.search(r"types:\s*\[[^\]]*\bedited\b", text), "adding the line to the body has to run the check again"
+    assert re.findall(r"uses:\s*(\S+)", code) == ["actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"]
+    assert "ref: ${{ github.sha }}" in code and "persist-credentials: false" in code  # the base branch's tip
+    assert "fetch-depth: 0" in code  # the merge base has to be in the clone
+    assert "secrets." not in code and "write" not in code and "permissions: {}" in code
+    runs = re.findall(r"run:\s*(.+)", code)
+    assert runs == [
+        'git fetch --no-tags origin "refs/pull/$PR_NUMBER/head"',
+        'python3 -I -S scripts/test_integrity.py --base "$BASE_SHA" --head "$HEAD_SHA"',
+    ]  # a step added here runs with the base's rights: it has to be looked at, whatever it is
+    assert "PR_BODY: ${{ github.event.pull_request.body }}" in code
+    assert "BASE_SHA: ${{ github.event.pull_request.base.sha }}" in code
+    assert "HEAD_SHA: ${{ github.event.pull_request.head.sha }}" in code  # the base's sha here would judge nothing
 
 
 def test_oracle_job_has_bubblewrap_and_requires_it():
@@ -162,9 +179,9 @@ def test_nightly_quarantine_and_node_jobs_exist():
     ci = (WORKFLOWS / "ci.yml").read_text(encoding="utf-8")
     triggers = [m.group(1) for line in top_level(ci, "on") if (m := re.match(r"^  (\w+):", line))]
     assert {"schedule", "workflow_dispatch", "push", "pull_request"} <= set(triggers), triggers
-    # the integrity step reads the pull request body: editing it to add the line it asks for has to run it again
+    # nothing in this workflow reads the body, so editing it must not run the whole workflow again
     pr = "\n".join(top_level(ci, "on")).split("pull_request:", 1)[1].split("\n  schedule:", 1)[0]
-    assert re.search(r"types:\s*\[[^\]]*\bedited\b", pr), "pull_request must run again when the body is edited"
+    assert "edited" not in pr
     jobs = ci_jobs()
     nightly = jobs["nightly-quarantine"]
     assert "github.event_name == 'schedule'" in nightly and "github.event_name == 'workflow_dispatch'" in nightly

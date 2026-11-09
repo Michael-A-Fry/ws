@@ -42,11 +42,14 @@ MACHINERY = (
     "conftest.py",
     "tests/**/conftest.py",
     "src/**/conftest.py",
+    "pytest.toml",
+    ".pytest.toml",
     "pytest.ini",
     ".pytest.ini",
     "tox.ini",
     "setup.cfg",
     "tests/plugins/**",
+    "tests/gate_corpus/**",  # rows of expected decisions: no assertion to count, so any edit is declared
     ".github/workflows/**",
     ".pre-commit-config.yaml",
     "scripts/test_integrity.py",
@@ -80,7 +83,8 @@ class Hit:
     needs: str  # TEST_CHANGE or HOLDOUT_CHANGE
 
     def __str__(self) -> str:
-        return f"{self.path}: {self.why}"
+        # a file name is the pull request's text: one with a line break could write its own line in the job's log
+        return f"{self.path.encode('unicode_escape').decode()}: {self.why}"
 
 
 # --- git ---------------------------------------------------------------------------------------------------------------
@@ -112,7 +116,7 @@ def changed(repo: Path, start: str, head: str) -> list[tuple[str, str, str]]:
     """(status letter, old path, new path) for what `head` changed since `start`, renames followed."""
     parts = (
         git(repo, "diff", "--name-status", "-z", "-M", "--no-ext-diff", start, head)
-        .decode("utf-8", "replace")
+        .decode("utf-8", "surrogateescape")  # a name that isn't UTF-8 goes back to git as the same bytes
         .split("\0")
     )
     out, i = [], 0
@@ -127,12 +131,17 @@ def changed(repo: Path, start: str, head: str) -> list[tuple[str, str, str]]:
     return out
 
 
-def blob(repo: Path, rev: str, path: str) -> str:
-    """The file's text at `rev` ("" when there is none). UnicodeDecodeError for a file that isn't text."""
+def blob(repo: Path, rev: str, path: str, must: bool = True) -> str:
+    """The file's text at `rev`. A file that should be there and can't be read is a typed error, never an empty file that
+    compares equal to anything; with `must` False, "" when there is none. UnicodeDecodeError for a file that isn't text."""
     done = subprocess.run(
         ["git", "-C", str(repo), "cat-file", "blob", f"{rev}:{path}"], capture_output=True, check=False
     )
-    return done.stdout.decode("utf-8") if done.returncode == 0 else ""
+    if done.returncode == 0:
+        return done.stdout.decode("utf-8")
+    if must:
+        raise IntegrityError("git", f"can't read {path!r} at {rev}")
+    return ""
 
 
 # --- reading the changes -----------------------------------------------------------------------------------------------
@@ -209,8 +218,8 @@ def check(repo: Path, base: str, head: str = "HEAD") -> list[Hit]:
                 hits.append(Hit(path, "an edit to the holdout set", HOLDOUT_CHANGE))
         if matches(MACHINERY, new) or matches(MACHINERY, old):
             hits.append(Hit(new, "an edit to the test machinery or CI", TEST_CHANGE))
-        elif PYPROJECT in (old, new) and pytest_tables(blob(repo, start, old)) != pytest_tables(
-            blob(repo, head_c, new)
+        elif PYPROJECT in (old, new) and pytest_tables(blob(repo, start, old, must=False)) != pytest_tables(
+            blob(repo, head_c, new, must=False)
         ):
             hits.append(Hit(new, "an edit to the pytest configuration", TEST_CHANGE))
         if not (is_test_file(old) or is_test_file(new)) or status == "A":
@@ -221,7 +230,10 @@ def check(repo: Path, base: str, head: str = "HEAD") -> list[Hit]:
         except UnicodeDecodeError:
             hits.append(Hit(new, "a test file that isn't text, so it was not compared", TEST_CHANGE))
             continue
-        for why in judge_test(old, before, after):
+        whys = judge_test(old, before, after)
+        if status == "D" and not whys and old.endswith(".py"):
+            whys = ["a test file with no assertion lines to count"]
+        for why in whys:
             hits.append(
                 Hit(
                     old if status == "D" else new,

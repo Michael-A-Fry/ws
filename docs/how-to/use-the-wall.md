@@ -75,8 +75,8 @@ With a `[classes]` table in the policy, a session starts with the network shut. 
 name the class and haven't ended. A policy with no classes is as it was: Claude Code asks about a host it doesn't know,
 and OpenCode's network is open.
 
-The list covers what a shell command or another program starts, through the sandbox or the proxy. It does not cover the
-runner's own `WebFetch` tool, which runs inside the runner and not in the sandbox. That is a stated limit: if a class
+The list covers what a shell command or another program starts, through the sandbox or the proxy. It doesn't cover the
+runner's own `WebFetch` tool, which runs inside the runner and not in the sandbox. That's a stated limit: if a class
 must not fetch pages, put `web_fetch` in `deny_tools` in the policy.
 
 ```toml
@@ -121,26 +121,26 @@ expires = 2026-12-31
 What enforces it:
 
 - **Claude Code.** The class's list is written as `sandbox.network.allowedDomains` in the settings copy `ws gate launch`
-  makes for the project (and the run's settings in `ws run`), with `strictAllowlist` on so a host outside it is refused
+  makes for the project (and the run's settings in `ws run`), with `strictAllowlist` on so a host outside it's refused
   and not asked about (Claude Code 2.1.219 or later; an older one asks). An empty list reaches no host. This copy
   can't stop a project's own settings file from adding hosts, so in a class session the preflight hook refuses every
   call from a folder whose `.claude/settings.json` or `settings.local.json` sets `network.allowedDomains`, a proxy
   port, a Unix socket or local binding. A session with no class doesn't apply that rule. The managed-settings file for
   a class user (`ws install --class NAME`) is the stronger form: it holds the class's hosts with
-  `allowManagedDomainsOnly`, so no other file can add one. It is placed by hand, so it carries the class's hosts and
+  `allowManagedDomainsOnly`, so no other file can add one. It's placed by hand, so it carries the class's hosts and
   its providers' but not the exceptions, which end; run `ws install --class NAME` again after you change the list.
 - **Other runners (OpenCode), on Linux.** `ws gate launch` starts a small proxy of its own on 127.0.0.1 and sets the
   proxy variables for the runner, with a password made for that launch, so another session's proxy can't be used from
   inside. The proxy refuses a host that isn't listed, a name that resolves to a private, link-local or cloud-metadata
-  address, and a name that resolves to this machine unless it is a listed model port.
-  **It is the route, not a fence.** Loopback is kept off the proxy (`NO_PROXY`), so a model on this machine is reached
+  address, and a name that resolves to this machine unless it's a listed model port.
+  **It's the route, not a fence.** Loopback is kept off the proxy (`NO_PROXY`), so a model on this machine is reached
   directly, and that means any loopback port is open to the session, including ones another process on the machine
   listens on. A program that ignores the proxy variables and opens a socket itself isn't stopped either. ssh, nc, ncat,
   netcat, telnet, scp, sftp, ftp and socat are replaced on `PATH` inside the wall by a script that says so and exits
   126, and the end-of-run report counts how many requests and tool calls were refused; a tool called by its full path
   isn't caught. What closes the gap is a rule in the host's firewall for the class's OS user; ws doesn't write one (it
   needs root). The proxy checks the destination of a request, not what travels inside it: a `CONNECT` tunnel carries
-  any `Host` header or name, and so does anything sent through it once it is open. A tunnel that is already open when
+  any `Host` header or name, and so does anything sent through it once it's open. A tunnel that's already open when
   an exception ends keeps running until it closes; only new requests are refused.
 - **Other runners, on macOS.** The same proxy, and the sandbox profile denies all outbound connections except to the
   proxy and the model ports, so a program that skips the proxy is stopped (a loopback model port stays open to it).

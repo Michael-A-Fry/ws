@@ -377,6 +377,26 @@ def _base_record(job: jobs.Job, run_id: str, started: datetime, pol: policy.Poli
     )
 
 
+def _egress(pol: policy.Policy, job: jobs.Job):
+    """(plan, refusal) for the data class a run works in: the class of the job's own `cwd` (a job with none runs in a
+    fresh default folder that is in no class, so it gets the strictest), G7 (the model provider the class allows) and
+    the network list the run gets. The plan is None when the policy has no classes: the network is as it was. A refusal
+    is words that name the class only."""
+    from ws import sandbox  # late: only a policy with classes needs it
+
+    cls = None
+    if pol.classes:
+        cls = policy.class_of(pol, os.path.realpath(Path(job.cwd).expanduser())) if job.cwd else policy.UNCLASSIFIED
+    provider = sandbox.job_provider(job.runner, job.model, job.runner_options)
+    why = sandbox.provider_problem(cls, provider)
+    if why:
+        return None, why
+    plan = sandbox.egress_plan(pol, cls, provider)
+    if plan is not None and hasattr(adapters.get(job.runner), "with_hosts") and not pol.gate.sandbox:
+        return None, f"class {plan.cls!r}: its network list is applied by the sandbox, and [gate] sandbox is off"
+    return plan, None
+
+
 def _refusal(prof: dict, verdict: policy.Verdict, job: jobs.Job, adapter) -> tuple[str, str] | None:
     """(counter, reason) for the refusals that need no look at the money: no cap set, the Rule of Two, a model the runner
     cannot price. What the cap and the purpose cap say is admission's (`queue.Ledger.admit`)."""
@@ -567,6 +587,9 @@ def _run(
 
     verdict = policy.rule_of_two(pol, list(job.sources), job.name, shell=getattr(adapter, "HAS_SHELL", True))
     static = _refusal(prof, verdict, job, adapter)
+    egress, why_not = _egress(pol, job)
+    if static is None and why_not:
+        static = ("egress", why_not)
     req = queue.request_for(
         job, run_id, cap_usd=cap, unknown_run_usd=unknown_run_usd,
         purpose_cap_usd=pol.budget_purposes.get(job.purpose) if job.purpose else None, limits=ledger.limits,
@@ -641,6 +664,7 @@ def _run(
         stdin,
         hook,
         (ledger, res, unknown_run_usd, fallback_usd_per_mtok),
+        egress,
     )
 
 
@@ -666,10 +690,12 @@ def _settle(ledger: queue.Ledger, res: queue.Reservation, rec: dict, written: bo
 
 
 def _execute(
-    job, adapter, pol, rec: dict, run_dir: Path, cwd: Path, log: Path, exe: str, stdin: bool, hook=None, admitted=None
-) -> int:
+    job, adapter, pol, rec: dict, run_dir: Path, cwd: Path, log: Path, exe: str, stdin: bool, hook=None, admitted=None,
+    egress=None,
+) -> int:  # fmt: skip
     ledger, res, unknown_run_usd, fallback_usd_per_mtok = admitted
     t0 = time.monotonic()
+    proxy = None
     leases: list[broker.Lease] = []
     sock = wsecrets.socket_path(os.environ)
     signalled: BaseException | None = None
@@ -680,6 +706,8 @@ def _execute(
         rec["cwd"] = str(cwd)
         policy_file = policy.policy_path().absolute()
         files = adapter.generate(pol, selfcmd.argv(), run_dir / "gate", policy_file)
+        if egress is not None and hasattr(adapter, "with_hosts"):  # the runner's own sandbox holds the class's list
+            files = {**files, adapter.FILE: adapter.with_hosts(files[adapter.FILE], egress.domains())}
         gate.write_files(run_dir / "gate", files)
         for s in job.secrets:
             leases.append(_lease(s, sock, rec))
@@ -688,6 +716,12 @@ def _execute(
         if job.checkpoint:
             extra = {**extra, "WS_CHECKPOINT": job.checkpoint}
         child_env = _child_env(extra)
+        if egress is not None and not hasattr(adapter, "with_hosts"):  # a runner with no proxy of its own gets ws's
+            from ws import sandbox
+
+            secret = sandbox.new_secret()
+            proxy = sandbox.EgressProxy(egress, secret=secret)
+            child_env.update(sandbox.proxy_env(proxy.start(), secret))
         argv[0] = exe
         prompt_file = None
         if stdin:
@@ -733,6 +767,13 @@ def _execute(
         signalled = e
         raise
     finally:
+        if proxy is not None:
+            proxy.stop()
+            if proxy.denials:
+                print(
+                    f"ws: egress, class {egress.cls!r}: {len(proxy.denials)} request(s) refused by the allowlist",
+                    file=sys.stderr,
+                )
         for lease in leases:
             with contextlib.suppress(broker.BrokerError):
                 broker.release(lease, socket=sock)

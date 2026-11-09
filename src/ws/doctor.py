@@ -1,7 +1,7 @@
 """`ws doctor`: one line per check, each with a stable ID. Exit 0 only when nothing is failing or unconfigured.
 
 IDs never change meaning once released: WS0xx are the machine, profile, jobs, gate,
-sandbox, plugins, where ws keeps its files, what the runner needs of its hooks and the OS-user classes, WS1xx are the roles
+sandbox, plugins, where ws keeps its files, what the runner needs of its hooks, the OS-user classes and the network of each data class, WS1xx are the roles
 (one per role).
 """
 
@@ -13,6 +13,7 @@ import shutil
 import sys
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from ws import __version__, canary, jobs, paths, policy, roles, usage, userconfig, wallsettings
@@ -286,6 +287,52 @@ def _class_checks(env, kind: str) -> list[Check]:
     return [Check("WS014", "class", r.status, f"{r.cls}: {r.part}: {r.detail}", r.fix) for r in rows]
 
 
+def _egress_checks(env, kind: str, now=None) -> list[Check]:
+    """WS015: the network of each data class, one line per class, from the policy (nothing is probed). `ok` when every
+    host entry can be read by the proxies and no egress exception has lapsed or ends within a week; `warn` otherwise,
+    with the count, never a host name. A class file in place whose network block is not what ws renders now is a `warn`
+    as well. No line when the policy has no classes, or does not load (WS012 says so)."""
+    from ws import sandbox  # late: ws.sandbox imports the adapters
+
+    try:
+        pol = policy.load(policy.policy_path(dict(env)))
+    except (policy.PolicyError, OSError):
+        return []
+    now = datetime.now(UTC) if now is None else now
+    stale = set(wallsettings.stale_networks(pol, env, kind))
+    out = []
+    for name in sorted(pol.classes):
+        cls = pol.classes[name]
+        plan = sandbox.egress_plan(pol, cls, "", now)
+        mine = [x for x in pol.egress_exceptions if name in x.classes]
+        soon = [x.name for x in mine if not x.expired(now) and x.expires - now < timedelta(days=7)]
+        lapsed = [n for n, _ in plan.lapsed]
+        issues = []
+        if plan.dropped:
+            issues.append(f"{plural(len(plan.dropped), 'host entry', 'host entries')} the proxies can't read")
+        if lapsed:
+            issues.append(f"expired exception {', '.join(map(repr, lapsed))} covers nothing")
+        if soon:
+            issues.append(f"exception {', '.join(map(repr, soon))} ends within 7 days")
+        if not pol.gate.sandbox:
+            issues.append(
+                "[gate] sandbox is off, so no network list is applied to Claude Code and its launches are refused"
+            )
+        if name in stale:
+            issues.append("the class file's network list is not what the policy renders now")
+        if issues:
+            fix = (
+                "fix allowed_hosts (a name with a dot, or localhost:PORT), renew or remove the exception, or run "
+                f"`ws install --class {name}`"
+            )
+            out.append(Check("WS015", "egress", WARN, f"{name}: {'; '.join(issues)}", fix))
+        else:
+            n = len(sandbox.class_domains(cls))
+            held = f", {len(plan.granted)} exception(s) in force" if plan.granted else ""
+            out.append(Check("WS015", "egress", OK, f"{name}: network shut but for {n} host(s){held}"))
+    return out
+
+
 def _layout_check(env) -> Check:
     """WS010: where ws keeps its files. `ok` for the XDG folders or a folder you named; `warn` while they are still in
     `~/.ws` from an earlier ws (nothing moves by itself: `ws migrate` does it); `fail` when both exist, because ws can't
@@ -379,6 +426,10 @@ def run_checks(osi: OSInfo, profile_file: Path, env: dict | None = None, network
         checks += _class_checks(env, osi.kind)
     except Exception as e:  # noqa: BLE001 (a broken check must report, not crash the whole doctor)
         checks.append(Check("WS014", "class", FAIL, f"check crashed ({type(e).__name__})"))
+    try:
+        checks += _egress_checks(env, osi.kind)
+    except Exception as e:  # noqa: BLE001 (a broken check must report, not crash the whole doctor)
+        checks.append(Check("WS015", "egress", FAIL, f"check crashed ({type(e).__name__})"))
     try:
         checks.append(_layout_check(env))
     except Exception as e:  # noqa: BLE001 (a broken check must report, not crash the whole doctor)

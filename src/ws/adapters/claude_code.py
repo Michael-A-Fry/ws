@@ -36,7 +36,10 @@ confines every shell command Claude runs, whatever program it starts:
     and its tmp; nothing else) is already an allow-list.
   * `filesystem.denyRead`: the deny_read rules that name a folder or file (ws.policy.sandbox_read_paths).
   * `network.allowedDomains`: the policy's allow_hosts, only when the policy names some. Without them the sandbox
-    asks (interactive) or refuses (`-p`) for a host it has not been told about.
+    asks (interactive) or refuses (`-p`) for a host it has not been told about. A session of a data class started by
+    `ws gate launch` gets its own list instead (for_project): the class's allowed_hosts, its provider's host and the
+    exceptions in force, so a class with none reaches nothing. The class file (ws.wallsettings) holds the same list as
+    managed settings, with `allowManagedDomainsOnly`, so no other settings file adds a host.
   * `autoAllowBashIfSandboxed: false`, set on purpose: with it on, Claude Code runs sandboxed shell commands without
     asking. ws leaves that choice to the person's own permission mode, so a sandboxed command still prompts as before.
 Project settings can widen all of this: in 2.1.308 `sandbox.excludedCommands` merges across settings sources and
@@ -67,6 +70,8 @@ own file (ws.userconfig): the policy's `[gate] sandbox = false` is the one switc
 WS_SANDBOXED=0; otherwise `env` carries WS_SANDBOXED=1, which tells the hook this session has the sandbox block above.
 No hook command turns a refusal into an allow: the sandbox block is the wall for shell commands, and the gate reads the
 same text whether or not it is up.
+`preflight` also counts a project's `network` keys as a widening, but only when `env` carries WS_EGRESS_CLASS=1, which
+`with_hosts` sets in the settings of a data-class session; with no classes the network is as it was.
 `preflight` runs for every session except one whose settings set WS_SANDBOXED=0, the marker of a settings file written
 without the sandbox block; settings written before the marker existed carry the block and no marker, so `preflight` runs
 for them. The
@@ -137,6 +142,9 @@ _EXTRA_PRE_KINDS = ("agent", "skill", "message")  # the PreToolUse matcher cover
 # seconds a hook may take. More than the thin client's worst case (ws.gateclient.WORST_CASE_S: the wait for the daemon,
 # then the check in its own process), or the runner kills a hook that was about to answer and "block" denies the call.
 HOOK_TIMEOUT = 30
+# Set in the `env` of the settings a class session starts with (`with_hosts`), like WS_SANDBOXED: the --settings file
+# outranks a project's, so a project cannot unset it. The hook has no policy to ask, so this is how `preflight` knows.
+EGRESS_MARKER = "WS_EGRESS_CLASS"
 # seconds the message wake hook may run: Claude Code still enforces `timeout` on an `asyncRewake` hook (600 by default),
 # and the hook waits as long as the session is idle, so it is a day. `ws msg wait --session-hook` gives up on its own
 # at `msg.HOOK_WAIT_MAX_S`, well before this, or the runner kills a waiter that was about to exit cleanly.
@@ -269,7 +277,7 @@ def preflight(payload: dict) -> str | None:
                 return f"{f} is not a plain readable settings file ({e}); blocked to be safe"
             except ValueError:
                 continue
-            key = _widens_sandbox(conf)
+            key = _widens_sandbox(conf, os.environ.get(EGRESS_MARKER) == "1")
             if key:
                 return (
                     f"{f} sets sandbox.{key}, which would open the sandbox ws generated: take it out of the project "
@@ -278,7 +286,9 @@ def preflight(payload: dict) -> str | None:
     return None
 
 
-def _widens_sandbox(conf) -> str | None:
+def _widens_sandbox(conf, class_session: bool = False) -> str | None:
+    """The first setting in a project's `conf` that opens the sandbox, or None. The `network` keys count only in a class
+    session (`class_session`): outside one, the policy's network is as it always was and a project may name its own hosts."""
     sb = conf.get("sandbox") if isinstance(conf, dict) else None
     if not isinstance(sb, dict):
         return None
@@ -295,14 +305,43 @@ def _widens_sandbox(conf) -> str | None:
         for k in ("allowRead", "allowWrite"):
             if fs.get(k):
                 return f"filesystem.{k}"
+    net = sb.get("network")
+    if class_session and isinstance(
+        net, dict
+    ):  # a host the generated list does not name, a local port, a socket or a proxy of its own
+        for k in ("allowedDomains", "allowUnixSockets", "httpProxyPort", "socksProxyPort"):
+            if net.get(k):
+                return f"network.{k}"
+        for k in ("allowLocalBinding", "allowAllUnixSockets"):
+            if net.get(k) is True:
+                return f"network.{k} = true"
     return None
 
 
-def for_project(settings: str, project: str) -> str:
+def with_hosts(settings: str, hosts: list[str]) -> str:
+    """The generated settings text with `hosts` (a data class's list: ws.sandbox.EgressPlan.domains) as
+    `network.allowedDomains`, replacing any list in it, and `strictAllowlist` on, so a host outside the list is refused
+    and not asked about (honoured from `--settings`, not from a project file; Claude Code 2.1.219 or later, and an older
+    one asks). An empty list reaches no host at all. ValueError when the settings have no sandbox block, since the list
+    would have nowhere to go: the network would be open and the caller must refuse."""
+    conf = json.loads(settings)
+    if "sandbox" not in conf:
+        raise ValueError("the generated settings have no sandbox block, so the class's network list can not be applied")
+    conf.setdefault("env", {})[EGRESS_MARKER] = "1"  # tells the hook this is a class session (see preflight)
+    net = conf["sandbox"].setdefault("network", {})
+    net["allowedDomains"] = list(hosts)
+    net["strictAllowlist"] = True
+    return json.dumps(conf, indent=2) + "\n"
+
+
+def for_project(settings: str, project: str, hosts: list[str] | None = None) -> str:
     """The generated settings text with the project's locked paths added to the sandbox `denyWrite`, absolute: what
-    `ws gate launch --runner claude-code` starts claude with. The shared settings cannot hold them (see the docstring)."""
+    `ws gate launch --runner claude-code` starts claude with. The shared settings cannot hold them (see the docstring).
+    `hosts`, when given, are applied by `with_hosts` (ValueError if there is no sandbox block to hold them)."""
     from ws import sandbox  # here, not at the top: ws.sandbox imports the adapters
 
+    if hosts is not None:
+        settings = with_hosts(settings, hosts)
     conf = json.loads(settings)
     if "sandbox" not in conf:  # the policy switched the sandbox off: there is no block to add the project's paths to
         return json.dumps(conf, indent=2) + "\n"
@@ -448,6 +487,9 @@ def launch_hint(out: str) -> str:
 # --- ws run: the command line, and the result read back as a run record --------------------------------------------
 
 EXE = "claude"
+# Claude Code connects its MCP servers without waiting by default, so a first model call can start with no MCP tools and
+# answer without them (measured: about 1 in 5 first calls). Headless runs wait for the connection, up to 5 minutes.
+MCP_WAIT_ENV = {"MCP_CONNECTION_NONBLOCKING": "false", "MCP_TIMEOUT": "300000", "MCP_CONNECT_TIMEOUT_MS": "300000"}
 PLACEHOLDER_KEY = "ws-lease-placeholder"  # the runner holds this; the broker swaps in the real key on the way out
 OPTIONS = {"exe", "allowed_tools", "env"}
 PROMPT_VIA_STDIN = True  # `claude -p` reads the prompt from stdin: it stays out of argv and `ps`
@@ -476,7 +518,7 @@ def build_command(job, run_dir: Path, lease) -> tuple[list[str], dict[str, str]]
     if tools:
         argv += ["--allowedTools", ",".join(tools)]
     env = jobs.extra_env(job)  # first: what ws sets below always wins
-    env.update(DISABLE_AUTOUPDATER="1", CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1")
+    env.update(DISABLE_AUTOUPDATER="1", CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1", **MCP_WAIT_ENV)
     if lease is not None:
         env.update(ANTHROPIC_BASE_URL=lease.base_url, ANTHROPIC_API_KEY=PLACEHOLDER_KEY)
     return argv, env

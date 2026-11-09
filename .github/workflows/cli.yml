@@ -1,6 +1,7 @@
 # Phase 2 pass test on three OSs: on a fresh machine `ws doctor` exits non-zero listing every role unconfigured.
 # Phase 3 pass test (gate-e2e): a denied command is blocked on both runners, against a stub model, no paid provider.
 # Phase 4 (gate-e2e): the sandbox wall stops the bypasses the matcher cannot see; the OpenCode session nudge fires.
+# Conformance: every runner adapter is asked the same rows (gate parity, sandbox, budget, run record, skill, MCP, message).
 # Phase 5 (matrix-e2e, wsl, windows-native): the person's path, timed on every cell (install -> first task -> uninstall,
 # scripts/e2e_first_task.sh), and a credential-free smoke with no provider key set. The lab VM cell is lab.yml.
 # Nightly, and on pull requests that touch the CLI. Not a required check: a slow or flaky runner never blocks a PR.
@@ -125,6 +126,44 @@ jobs:
         env:
           WS_E2E_REQUIRE: "1" # missing bubblewrap or a runner fails the job instead of skipping
         run: uv run --locked pytest -q tests/e2e/test_sandbox.py tests/e2e/test_wall_escapes.py tests/e2e/test_wall_loadpaths.py tests/e2e/test_opencode_nudge.py
+
+  # The runner conformance kit (docs/reference/conformance.md): the same table of rows for every runner adapter, plus the
+  # live tier, which runs the real Claude Code and OpenCode against a stub model with only ws's hook able to refuse. No
+  # paid provider. Not a required check, like the rest of this file: the `paths:` filter above would leave a required
+  # check waiting on a docs-only pull request, and requiring it is a repository setting, not this file.
+  conformance:
+    name: conformance (ubuntu-24.04, stub model)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: "0.13.1"
+          enable-cache: true
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+      # Pinned in tests/e2e/runners/package-lock.json, as in gate-e2e.
+      - name: install the runners
+        working-directory: tests/e2e/runners
+        run: |
+          npm ci --ignore-scripts
+          node node_modules/opencode-ai/postinstall.mjs
+          node node_modules/@anthropic-ai/claude-code/install.cjs
+          echo "$PWD/node_modules/.bin" >> "$GITHUB_PATH"
+      # The generated Claude Code settings turn its sandbox on with failIfUnavailable (see gate-e2e for the sysctl).
+      - name: install the sandbox tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bubblewrap socat
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: every runner adapter passes the same rows, and both real runners pass the live tier
+        env:
+          WS_E2E_REQUIRE: "1" # a missing runner fails the job instead of skipping
+        run: uv run --locked pytest -q -rfEs tests/test_conformance_schema.py tests/conformance
 
   # Phase 3 pass test (row 3): a job's run record is complete against its schema on both runners. Same stub model, plus
   # a real broker lease to a stub upstream; no paid provider.

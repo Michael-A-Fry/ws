@@ -68,6 +68,63 @@ real work.
   your value to match.
 - To give a class its own operating-system account, see [Set up a class user](set-up-a-class-user.md).
 
+## Shut the network by class
+
+With a `[classes]` table in the policy, a session starts with the network shut. It can reach the hosts in its class's
+`allowed_hosts`, the host of the model provider it was started with, and the hosts of any `[[egress_exceptions]]` that
+name the class and haven't ended. Nothing else. A policy with no classes is as it was: Claude Code asks about a host it
+doesn't know, and OpenCode's network is open.
+
+```toml
+[classes.work]
+access = "walled"
+repos = ["~/code/work/**"]
+allowed_providers = ["anthropic"]
+allowed_hosts = ["pypi.org", "files.pythonhosted.org", "localhost:11434"]
+
+[[egress_exceptions]]
+name = "vendor-docs"
+classes = ["work"]
+hosts = ["docs.example.net"]
+reason = "reads the vendor docs for the migration"
+owner = "Sam"
+expires = 2026-12-31
+```
+
+- **Hosts.** A name (`pypi.org`), a name under a domain (`*.example.org`, which doesn't cover `example.org` itself) or an
+  address, each with an optional `:port`. A catch-all (`0.0.0.0`), a wildcard over a whole top-level name (`*.com`) or a
+  port outside 1 to 65535 is refused when the policy loads. A name needs a dot, or is `localhost`. A model on this
+  machine is `localhost:PORT` or `127.0.0.1:PORT`, and the port is required.
+- **Exceptions.** `owner` and `expires` are both required, so a grant always ends and has someone behind it. From the
+  moment `expires` is reached the exception covers nothing, and a request it would have covered is refused with its name.
+  A date such as `2026-12-31` ends at 00:00Z that day.
+- **Providers.** `ws gate launch --provider NAME` says which model provider the session uses (Claude Code means
+  `anthropic` unless you say otherwise). A provider outside the class's `allowed_providers` is refused before anything
+  starts, and the refusal names the class only. A walled or counts-only class that doesn't say gets a model on this
+  machine (`local`, `ollama`, `lmstudio`, `vllm`, `llamacpp`) and nothing else; a `full` class gets any. A folder in no
+  class is held to the strictest. `local_only = true` keeps loopback entries and drops the rest.
+
+What enforces it:
+
+- **Claude Code.** The class's list is written as `sandbox.network.allowedDomains` in the settings copy `ws gate launch`
+  makes for the project, and an empty list reaches no host. The managed-settings file for a class user
+  (`ws install --class NAME`) holds the class's hosts with `allowManagedDomainsOnly`, so a project's own settings file
+  can't add one. That file is placed by hand, so it carries the class's hosts and its providers' but not the exceptions,
+  which end; run `ws install --class NAME` again after you change the list.
+- **OpenCode, on Linux.** `ws gate launch` starts a small proxy of its own on 127.0.0.1 and sets the proxy variables for
+  the runner; loopback stays off the proxy, so a model on this machine is reached directly. The proxy refuses a host
+  that isn't listed, a name that resolves to a private, link-local or cloud-metadata address, and a name that resolves to
+  this machine unless it is a listed model port. It is the route, not a fence: a program that ignores the proxy variables
+  and opens a socket itself isn't stopped by the wall alone. ssh, nc, ncat, netcat, telnet, scp, sftp, ftp and socat are
+  replaced on `PATH` inside the wall by a script that says so and exits 126, and the end-of-run report counts how many
+  requests and tool calls were refused. A tool called by its full path isn't caught. What closes that gap is a rule in
+  the host's firewall for the class's OS user; ws doesn't write one (it needs root).
+- **OpenCode, on macOS.** The same proxy, and the sandbox profile denies all outbound connections except to the proxy
+  and the model ports, so a program that skips the proxy is stopped. That profile hasn't been run on a Mac.
+
+`ws doctor` shows one WS015 line per class: `ok` with the number of hosts, or `warn` with the reason (see
+[Doctor checks](../reference/doctor-checks.md)).
+
 ## Check the host once
 
 ```sh

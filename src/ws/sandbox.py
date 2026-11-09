@@ -12,8 +12,9 @@ Why not Anthropic's sandbox-runtime (`srt`, npm @anthropic-ai/sandbox-runtime 0.
 installed and run, and it does stop the escapes below (seccomp on Unix sockets, pid namespace, new session). It was not
 adopted because it takes the network namespace away from the whole runner: every connection must go through its proxy,
 and its own NO_PROXY keeps loopback off the proxy. A local model server (Ollama, vLLM, the e2e stub) then cannot be
-reached at all, which breaks "any provider, including local". With no `allow_hosts` in the policy it also has no way to
-say "network as today". It is a 0.0.x research preview, and a Node dependency to pin on every machine. Its design is
+reached at all, which breaks "any provider, including local" (re-run in November 2026 with the local server's address
+in `allowedDomains`: still refused, since on Linux the sandbox's loopback is its own and `allowLocalBinding` is
+ignored). With no `allow_hosts` in the policy it also has no way to say "network as today". It is a 0.0.x research preview, and a Node dependency to pin on every machine. Its design is
 copied where it fits (the points below); Claude Code, which has the same engine built in, keeps using its own.
 
 Decisions, and why:
@@ -120,8 +121,13 @@ Decisions, and why:
   * Fail closed. No bubblewrap (or no sandbox-exec), or a bubblewrap that cannot start (unprivileged user namespaces
     switched off), refuses to launch with the install line. `--no-sandbox` starts the runner bare and prints what that
     gives up, so skipping the wall is a visible choice, not a silent fallback.
-  * No `--unshare-net`: the runner needs the model's API, local or remote. Host filtering is Claude Code's sandbox proxy
-    only (policy `allow_hosts`); here the network is as today. That is a limit, written in ws.policy's docstring.
+  * No `--unshare-net`: the runner needs the model's API, local or remote, and a model on this machine must stay
+    reachable. A session of a data class (policy `[classes]`) gets default-deny egress instead, in the section on egress
+    below: the class's hosts become Claude Code's `allowedDomains`, and for the other runners ws starts a proxy of its
+    own and sets the proxy variables. On Linux that is the route and not a fence (a program that ignores the variables
+    is not stopped by the wall; the host's firewall for the class's OS user is what closes it, and ws does not write
+    one: it needs root). On macOS the profile also denies every outbound connection but those to the proxy and the model
+    ports. A policy with no classes keeps the network as it was.
   * macOS: `sandbox-exec` with a generated profile, `(allow default)` then `(deny file-write*)` over the protected paths
     and `(deny file-read*)` over the hidden ones, then the two writable holes and the runner's private folders
     re-allowed (the last matching rule wins), the project's locked paths denied again, and
@@ -139,6 +145,7 @@ import contextlib
 import errno
 import glob
 import hashlib
+import ipaddress
 import json
 import os
 import platform
@@ -155,7 +162,9 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import NamedTuple
 
@@ -172,6 +181,12 @@ NO_SANDBOX_NOTE = (
     "see (`python3 -c`, a path built by a command, a script it writes then runs, git restoring a protected file, a "
     "daemon reached over a Unix socket such as tmux) can write ws's own files, including the policy, and read the "
     "denied folders."
+)
+
+
+NO_EGRESS_NOTE = (
+    "ws: --no-sandbox: and no network allowlist either: the class's allowed_hosts are not applied, since they are "
+    "enforced by the wall's proxy."
 )
 
 
@@ -282,6 +297,9 @@ class Plan:
     homes: tuple[
         str, ...
     ] = ()  # the runner's private XDG folders: writable, though they sit inside ws's read-only home
+    net: tuple[int, ...] | None = (
+        None  # macOS: the only loopback ports the runner may connect to; None = network as today
+    )
 
     def read_only(self) -> list[str]:
         return list(dict.fromkeys(os.path.realpath(p) for p in [self.home, *self.protect]))
@@ -376,6 +394,11 @@ def sandbox_exec_profile(plan: Plan) -> str:
     for p in (*plan.sockets, *plan.hidden):
         kind = "literal" if os.path.isfile(p) else "subpath"
         lines.append(f"(deny file-read* ({kind} {_sbpl(p)}))")
+    if (
+        plan.net is not None
+    ):  # the proxy and the local model ports are the only way out; the unix-socket deny stays last
+        lines.append("(deny network-outbound)")
+        lines += [f'(allow network-outbound (remote ip "localhost:{p}"))' for p in plan.net]
     lines.append("(deny network-outbound (remote unix-socket))")
     return "\n".join(lines) + "\n"
 
@@ -401,6 +424,7 @@ def wrap(
     tty: bool = False,
     env: dict | None = None,
     machine: str | None = None,
+    net: tuple[int, ...] | None = None,
 ) -> Wrapped:
     """`argv` inside the sandbox for this OS, with the descriptors that must stay open for it. Raises SandboxError (with
     the install line) when it cannot be built."""
@@ -413,6 +437,7 @@ def wrap(
         tuple(writable),
         tuple(locked),
         tuple(homes),
+        tuple(net) if net is not None else None,
     )
     link = plan.symlinked()
     if link:
@@ -528,6 +553,7 @@ LAUNCH_ENV = (
 RUNNER_ENV = {
     "claude-code": (
         "CLAUDE_CONFIG_DIR", "ANTHROPIC_MODEL", "DISABLE_AUTOUPDATER", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+        "MCP_CONNECTION_NONBLOCKING", "MCP_TIMEOUT", "MCP_CONNECT_TIMEOUT_MS",
     ),
     "opencode": (
         "OPENCODE_CONFIG", "OPENCODE_CONFIG_CONTENT", "OPENCODE_DISABLE_AUTOUPDATE", "OPENCODE_DISABLE_MODELS_FETCH",
@@ -1434,6 +1460,508 @@ def run_plain(cmd: list[str], env: dict) -> int:
     return _wait(proc)
 
 
+# --- egress: the network, shut by default per data class ---------------------------------------------------------------
+#
+# What a session of a class may reach is the class's `allowed_hosts`, the host of the model provider it was started
+# with, and the hosts of the `[[egress_exceptions]]` that name the class and have not expired. Nothing else. The same
+# list feeds two enforcers: Claude Code's own sandbox proxy (as `sandbox.network.allowedDomains`, written by
+# claude_code.for_project and the class file), and, for a runner with no proxy of its own (OpenCode), the small proxy
+# below, which `ws gate launch` starts beside the runner. The proxy is ws's own because the one that exists puts the
+# whole runner in a network namespace of its own, where a model on this machine cannot be reached (top of this file).
+
+# Hosts a named set of services needs, for `explain_host` (a policy lists hosts; it does not name these sets).
+PRESETS = {
+    "claude-code": ("api.anthropic.com", "platform.claude.com"),
+    "openai": ("api.openai.com",),
+    "pypi": ("pypi.org", "files.pythonhosted.org"),
+    "npm": ("registry.npmjs.org",),
+    "github": ("github.com", "api.github.com"),
+    "huggingface": ("huggingface.co", "*.huggingface.co"),
+}
+# The hosts a model provider is reached at, added to the allowlist of a session started with `--provider NAME`.
+PROVIDER_HOSTS = {
+    "anthropic": PRESETS["claude-code"],
+    "openai": PRESETS["openai"],
+    "google": ("generativelanguage.googleapis.com",),
+    "openrouter": ("openrouter.ai",),
+}
+LOCAL_PROVIDERS = ("local", "ollama", "lmstudio", "vllm", "llamacpp")  # a model that runs on this machine
+DEFAULT_PROVIDER = {"claude-code": "anthropic"}  # what a runner talks to unless `--provider` says otherwise
+LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
+# Tools that open a socket themselves and ignore the proxy variables. In a session with an egress plan each is replaced
+# on PATH by a shim that says so and exits 126, so the attempt is a visible event and not a silent timeout.
+SHIM_TOOLS = ("nc", "ncat", "netcat", "telnet", "ssh", "scp", "sftp", "ftp", "socat")
+SHIM_LOG = "egress-denied.jsonl"
+# Instance-metadata endpoints (IPv4 as octets, so no address is written out as text: the PII gate would refuse it).
+_METADATA = (
+    *(
+        ipaddress.ip_network((ipaddress.IPv4Address(bytes(o)), 32))
+        for o in ((169, 254, 169, 254), (100, 100, 100, 200))
+    ),
+    *(ipaddress.ip_network((ipaddress.IPv4Address(bytes(o)), 32)) for o in ((168, 63, 129, 16), (192, 0, 0, 192))),
+    ipaddress.ip_network("fd00:ec2::254/128"),
+    ipaddress.ip_network("fd20:ce::254/128"),
+)
+_NAT64 = ipaddress.ip_network("64:ff9b::/96")
+_LEGACY_IP = re.compile(r"(0x[0-9a-f]+|[0-9]+)(\.(0x[0-9a-f]+|[0-9]+))*")
+
+
+def split_entry(entry: str) -> tuple[str, int | None]:
+    """An allow entry as `(host, port or None)`: lower case, no trailing dot. A port is a number; anything else after the
+    colon leaves the host as written, which `entry_problem` then refuses."""
+    host, _, port = entry.strip().lower().partition(":")
+    return host.rstrip("."), (int(port) if port.isdigit() else None)
+
+
+def _ip(host: str):
+    try:
+        return ipaddress.ip_address(host.strip("[]").split("%")[0])
+    except ValueError:
+        return None
+
+
+def _is_loopback(host: str) -> bool:
+    ip = _ip(host)
+    return host in LOOPBACK_NAMES or (ip is not None and ip.is_loopback)
+
+
+def legacy_literal(host: str) -> bool:
+    """True for a host written as digits and dots (or hex) that is not a plain dotted address: `127.1`, `2130706433`,
+    `0x7f.1`, `0177.0.0.1`. A resolver may read these as an address while a string match sees a name; they are refused."""
+    h = host.lower().rstrip(".")
+    return bool(_LEGACY_IP.fullmatch(h)) and _ip(h) is None
+
+
+def entry_problem(entry: str) -> str | None:
+    """Why `entry` can not be an allow-list entry as the proxies read it, or None. This is the policy's host check plus
+    what the proxies need: a name has a dot (or is `localhost`), a loopback entry names its port, and a host written in
+    a form a resolver reads as an address is refused."""
+    try:
+        policy.check_host(entry, "entry")
+    except policy.PolicyError as e:
+        return str(e).removeprefix("entry: ")
+    host, port = split_entry(entry)
+    if legacy_literal(host.removeprefix("*.")):
+        return f"{entry!r} is an address in a form resolvers read differently; write it as four decimal numbers"
+    if _is_loopback(host):
+        return None if port is not None else f"{entry!r} is loopback: name the port of the model server"
+    if _ip(host) is None and "." not in host:
+        return f"{entry!r} has no dot; the proxies read only fully qualified names (and localhost)"
+    return None
+
+
+def host_matches(host: str, port: int, entry: str) -> bool:
+    """Does the allow entry cover a request to `host:port`? A name matches itself; `*.name` matches every name below it
+    but not `name` and never an address; an entry with a port matches only that port, one without matches any."""
+    pat, pport = split_entry(entry)
+    h = host.strip().lower().rstrip(".").strip("[]")
+    if pport is not None and pport != port:
+        return False
+    if pat.startswith("*."):
+        return _ip(h) is None and h.endswith("." + pat[2:])
+    a, b = _ip(h), _ip(pat)
+    return a == b if a is not None and b is not None else h == pat
+
+
+def blocked_address(ip) -> str | None:
+    """The kind of address `ip` is when a session must not reach it by name, or None for a public one: `metadata`,
+    `unspecified`, `loopback`, `link-local`, `multicast` or `private`. An IPv4 address carried in an IPv6 one (mapped,
+    6to4, the NAT64 prefix) is judged as the IPv4 address it holds."""
+    if isinstance(ip, ipaddress.IPv6Address):
+        inner = ip.ipv4_mapped or ip.sixtofour
+        if inner is None and ip in _NAT64:
+            inner = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+        ip = inner or ip
+    if any(ip in net for net in _METADATA if net.version == ip.version):
+        return "metadata"
+    if ip.is_unspecified:
+        return "unspecified"
+    if ip.is_loopback:
+        return "loopback"
+    if ip.is_link_local:
+        return "link-local"
+    if ip.is_multicast:
+        return "multicast"
+    return None if ip.is_global else "private"
+
+
+@dataclass(frozen=True)
+class Decision:
+    allow: bool
+    reason: str  # the text of a refusal: it never names another host or the class's list
+    via: str = ""  # "class", "exception:NAME" or ""
+
+
+@dataclass(frozen=True)
+class EgressPlan:
+    """What one session may reach. `hosts` is the class's list plus the provider's; `granted` are the exceptions in force
+    (name, hosts) and `lapsed` the ones that name the class but have expired: they cover nothing, and a request they
+    would have covered is refused with their name. `dropped` are entries the proxies can not read (never applied)."""
+
+    cls: str
+    provider: str
+    hosts: tuple[str, ...] = ()
+    granted: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    lapsed: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    dropped: tuple[str, ...] = ()
+
+    def domains(self) -> list[str]:
+        """The list for `sandbox.network.allowedDomains`: every entry in force, once."""
+        return list(dict.fromkeys([*self.hosts, *(h for _, hs in self.granted for h in hs)]))
+
+    def local_ports(self) -> tuple[int, ...]:
+        """The loopback ports of the list: where a model on this machine listens."""
+        found = []
+        for e in self.domains():
+            host, port = split_entry(e)
+            if port is not None and _is_loopback(host):
+                found.append(port)
+        return tuple(dict.fromkeys(found))
+
+    def decide(self, host: str, port: int) -> Decision:
+        h = host.strip().lower().rstrip(".")
+        if not h or isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+            return Decision(False, "not a destination")
+        if legacy_literal(h):
+            return Decision(False, "an address written in a form resolvers read differently")
+        if any(host_matches(h, port, e) for e in self.hosts):
+            return Decision(True, "allowed by the class", "class")
+        for name, hs in self.granted:
+            if any(host_matches(h, port, e) for e in hs):
+                return Decision(True, f"allowed by exception {name!r}", f"exception:{name}")
+        for name, hs in self.lapsed:
+            if any(host_matches(h, port, e) for e in hs):
+                return Decision(False, f"exception {name!r} has expired", f"exception:{name}")
+        return Decision(False, "not in this class's allowlist")
+
+    def address_ok(self, host: str, ip, port: int) -> bool:
+        """May a connection for `host:port` go to `ip`? A public address, yes. A metadata address, never. Loopback only for
+        a loopback name or address on a port the list names (a model server): a name that resolves to loopback (DNS
+        rebinding) is refused. Another non-public address only when `host` is that address, written out in the list."""
+        kind = blocked_address(ip)
+        if kind is None:
+            return True
+        if kind == "metadata":
+            return False
+        h = host.strip().lower().rstrip(".").strip("[]")
+        if kind == "loopback":
+            return (_is_loopback(h) or h.endswith(".localhost")) and port in self.local_ports()
+        return _ip(h) is not None and _ip(h) == ip
+
+
+def egress_plan(pol: policy.Policy, cls: policy.Class | None, provider: str | None, now: datetime | None = None):
+    """The plan for a session of class `cls` using `provider`, or None when the policy has no classes (nothing is
+    classified: today's behaviour). `local_only` keeps loopback entries and nothing else. An exception that names the
+    class is in force until it expires; an expired one is listed in `lapsed` and covers nothing. `now` is aware (UTC)."""
+    if cls is None:
+        return None
+    now = datetime.now(UTC) if now is None else now
+    prov = (provider or "").lower()
+    wanted = [*cls.allowed_hosts, *(() if prov in LOCAL_PROVIDERS else PROVIDER_HOSTS.get(prov, ()))]
+    granted, lapsed = [], []
+    for x in pol.egress_exceptions:
+        if cls.name in x.classes:
+            (lapsed if x.expired(now) else granted).append((x.name, x.hosts))
+
+    def keep(entries) -> tuple[list[str], list[str]]:
+        ok, bad = [], []
+        for e in entries:
+            if cls.local_only and not _is_loopback(split_entry(e)[0]):
+                continue
+            (bad if entry_problem(e) else ok).append(e)
+        return ok, bad
+
+    hosts, dropped = keep(wanted)
+    kept = []
+    for name, hs in granted:
+        ok, bad = keep(hs)
+        dropped += bad
+        kept.append((name, tuple(ok)))
+    return EgressPlan(
+        cls.name,
+        prov,
+        tuple(dict.fromkeys(hosts)),
+        tuple(kept),
+        tuple((n, tuple(hs)) for n, hs in lapsed),
+        tuple(dropped),
+    )
+
+
+def class_domains(cls: policy.Class) -> list[str]:
+    """The hosts a class file (managed settings) holds for `cls`, for the sessions that start with no `--provider`: its
+    `allowed_hosts` and the host of each provider it allows by name, entries the proxies can read only. A class that
+    does not name its providers gets none of theirs, and `local_only` keeps loopback entries and nothing else."""
+    named = () if cls.local_only else (cls.allowed_providers or ())
+    wanted = [*cls.allowed_hosts, *(h for pv in named if pv not in LOCAL_PROVIDERS for h in PROVIDER_HOSTS.get(pv, ()))]
+    keep = [e for e in wanted if not entry_problem(e) and (not cls.local_only or _is_loopback(split_entry(e)[0]))]
+    return list(dict.fromkeys(keep))
+
+
+def provider_problem(cls: policy.Class | None, provider: str | None) -> str | None:
+    """Why a session of `cls` may not use `provider`, or None. The words name the class and nothing else. No classes
+    configured (None) allows anything. A class that does not say (`allowed_providers` unset) allows any provider if it is
+    `full` and only a model on this machine otherwise; `[]` allows none; `local_only` allows only a local model."""
+    if cls is None:
+        return None
+    name = (provider or "").lower()
+    allowed = cls.allowed_providers
+    if allowed is None:
+        allowed = None if cls.access == "full" else LOCAL_PROVIDERS
+    if not name:
+        if allowed is None and not cls.local_only:
+            return None
+        return f"class {cls.name!r} limits the model provider and none was named"
+    if not re.fullmatch(r"[a-z0-9_-]+", name) or (allowed is not None and name not in allowed):
+        return f"class {cls.name!r} does not allow that model provider"
+    if cls.local_only and name not in LOCAL_PROVIDERS:
+        return f"class {cls.name!r} allows only a model that runs on this machine"
+    return None
+
+
+def session_class(pol: policy.Policy) -> policy.Class | None:
+    """The class of the folder a session starts in (None: the policy has no classes). The real path decides; a folder that
+    can't be read is refused (exit 3), never guessed."""
+    try:
+        here = os.path.realpath(os.getcwd())
+    except OSError as e:
+        raise WsError(
+            "refused",
+            f"refusing to start: the current folder can't be read ({e.strerror}), so its class is not known",
+            "start it from a project folder",
+            3,
+        ) from e
+    return policy.class_of(pol, here)
+
+
+def require_provider(cls: policy.Class | None, provider: str | None) -> None:
+    """Refuse (exit 3) a session whose model provider the class does not allow. Before anything is written or started."""
+    why = provider_problem(cls, provider)
+    if why:
+        raise WsError(
+            "refused",
+            f"refusing to start: {why}",
+            "use a provider the class allows (`--provider NAME`), or ask whoever owns the policy to change the class",
+            3,
+        )
+
+
+def explain_host(pol: policy.Policy, cls: policy.Class | None, host: str, port: int = 443, now=None) -> str:
+    """Why a request to `host:port` from a session of `cls` is allowed or refused, and the policy line that would change
+    it. A refusal says which kind it is (the list, an expired exception), and an allowed host says that a 401 or 403 from
+    it is the service's answer and not the proxy's."""
+    plan = egress_plan(pol, cls, "", now)
+    if plan is None:
+        return "no classes are configured, so ws sets no allowlist; the runner's own network rules apply"
+    d = plan.decide(host, port)
+    if d.allow:
+        return f"allowed ({d.reason}); a 401 or 403 from it is the service's own answer, not the proxy's"
+    if d.via:
+        return f"refused: {d.reason}; ask its owner to renew it, or add the host to the class's allowed_hosts"
+    covers = [n for n, hs in PRESETS.items() if any(host_matches(host, port, e) for e in hs)]
+    if covers:
+        add = ", ".join(f'"{h}"' for h in PRESETS[covers[0]])
+        return f"refused: {d.reason}; it is part of the {covers[0]} set: add {add} to allowed_hosts in [classes.{plan.cls}]"
+    return f'refused: {d.reason}; to allow it add "{host}" to allowed_hosts in [classes.{plan.cls}]'
+
+
+class EgressProxy:
+    """A forward proxy on 127.0.0.1 that carries `CONNECT host:port` and plain `http://` requests only to what the plan
+    allows, and connects to an address it has checked itself (so a name that resolves somewhere else a moment later
+    changes nothing). Stdlib only. `denials` collects `(via, reason)` for each refusal; `on_deny(host, port, decision)` is
+    called too. It is the route and not a fence where the operating system does not confine the runner (see the wall)."""
+
+    def __init__(self, plan: EgressPlan, on_deny=None, resolver=None, timeout: float = 15.0):
+        self.plan, self.on_deny, self.timeout = plan, on_deny, timeout
+        self.resolver = resolver or socket.getaddrinfo
+        self.denials: list[tuple[str, str]] = []
+        self._srv: socket.socket | None = None
+        self.port = 0
+
+    def start(self) -> int:
+        srv = socket.create_server(("127.0.0.1", 0))
+        self._srv, self.port = srv, srv.getsockname()[1]
+        threading.Thread(target=self._accept, args=(srv,), daemon=True).start()
+        return self.port
+
+    def stop(self) -> None:
+        srv, self._srv = self._srv, None
+        if srv is not None:
+            with contextlib.suppress(OSError):
+                srv.shutdown(socket.SHUT_RDWR)  # wakes a thread blocked in accept(); close alone does not on Linux
+            srv.close()
+
+    def _accept(self, srv: socket.socket) -> None:
+        srv.settimeout(0.5)  # where shutdown() does not wake accept(), the loop still sees the proxy has stopped
+        while self._srv is srv:
+            try:
+                conn, _ = srv.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            conn.settimeout(None)
+            threading.Thread(target=self._serve, args=(conn,), daemon=True).start()
+
+    def _deny(self, conn: socket.socket, host: str, port: int, d: Decision, status: str = "403 Forbidden") -> None:
+        self.denials.append((d.via or "list", d.reason))
+        if self.on_deny:
+            with contextlib.suppress(Exception):
+                self.on_deny(host, port, d)
+        body = f"ws: {d.reason}\n".encode()
+        head = f"HTTP/1.1 {status}\r\nX-Ws-Egress: refused\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n"
+        with contextlib.suppress(OSError):
+            conn.sendall(head.encode() + body)
+
+    def _dial(self, host: str, port: int) -> socket.socket | str:
+        """A connection to a checked address of `host`, or the reason there is none."""
+        try:
+            infos = self.resolver(host.strip("[]"), port, type=socket.SOCK_STREAM)
+        except OSError:
+            return "does not resolve"
+        why = "no usable address"
+        for family, _, _, _, addr in infos:
+            ip = _ip(addr[0])
+            if ip is None or not self.plan.address_ok(host, ip, port):
+                why = f"resolves to a {blocked_address(ip) or 'refused'} address" if ip is not None else why
+                continue
+            s = socket.socket(family, socket.SOCK_STREAM)
+            s.settimeout(self.timeout)
+            try:
+                s.connect(addr)
+            except OSError:
+                s.close()
+                why = "could not connect"
+                continue
+            s.settimeout(None)
+            return s
+        return why
+
+    def _request(self, lines: list[str]) -> tuple[str, int, bytes | None]:
+        """(host, port, head to send on) of a request; the head is None for CONNECT. ValueError when it is neither."""
+        method, target, version = lines[0].split(" ")
+        if method.upper() == "CONNECT":
+            return (*_split_hostport(target, 443), None)
+        u = urllib.parse.urlsplit(target)
+        if u.scheme != "http" or not u.hostname:
+            raise ValueError(target)
+        path = (u.path or "/") + (f"?{u.query}" if u.query else "")
+        drop = ("proxy-connection", "connection", "proxy-authorization")
+        kept = [x for x in lines[1:] if x.split(":", 1)[0].lower() not in drop]
+        head = "\r\n".join([f"{method} {path} {version}", *kept, "Connection: close"]) + "\r\n\r\n"
+        return u.hostname, u.port or 80, head.encode("latin-1")
+
+    def _serve(self, conn: socket.socket) -> None:
+        up: socket.socket | str | None = None
+        try:
+            conn.settimeout(self.timeout)
+            data = b""
+            while b"\r\n\r\n" not in data:
+                chunk = conn.recv(8192)
+                if not chunk or len(data) > 65536:
+                    return
+                data += chunk
+            top, _, rest = data.partition(b"\r\n\r\n")
+            try:
+                host, port, outgoing = self._request(top.decode("latin-1").split("\r\n"))
+            except ValueError:
+                self._deny(conn, "", 0, Decision(False, "not a proxy request"), "400 Bad Request")
+                return
+            d = self.plan.decide(host, port)
+            if not d.allow:
+                self._deny(conn, host, port, d)
+                return
+            up = self._dial(host, port)
+            if isinstance(up, str):
+                self._deny(conn, host, port, Decision(False, up, "address"))
+                return
+            if outgoing is None:
+                conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                if rest:
+                    up.sendall(rest)
+            else:
+                up.sendall(outgoing + rest)
+            conn.settimeout(None)
+            back = threading.Thread(target=_pipe, args=(up, conn), daemon=True)
+            back.start()
+            _pipe(conn, up)
+            back.join()
+        except OSError:
+            pass
+        finally:
+            for s in (conn, up):
+                if isinstance(s, socket.socket):
+                    with contextlib.suppress(OSError):
+                        s.close()
+
+
+def _pipe(src: socket.socket, dst: socket.socket) -> None:
+    try:
+        while data := src.recv(65536):
+            dst.sendall(data)
+    except OSError:
+        pass
+    finally:
+        with contextlib.suppress(OSError):
+            dst.shutdown(socket.SHUT_WR)
+
+
+def _split_hostport(target: str, default: int) -> tuple[str, int]:
+    """`host:port`, `[v6]:port` or `host` as (host, port); ValueError for anything else."""
+    if target.startswith("["):
+        host, _, port = target[1:].partition("]")
+        port = port.removeprefix(":")
+    else:
+        host, _, port = target.partition(":")
+    if not host or (port and not port.isdigit()):
+        raise ValueError(target)
+    return host, int(port) if port else default
+
+
+def proxy_env(port: int) -> dict:
+    """The variables that send a runner's traffic through the proxy. Loopback stays off it, so a model on this machine is
+    reached directly (the macOS wall allows exactly those ports: `Plan.net`). Both spellings, since tools differ."""
+    url = f"http://127.0.0.1:{port}"
+    env = {k: url for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")}
+    env.update(NO_PROXY="localhost,127.0.0.1,::1", no_proxy="localhost,127.0.0.1,::1", NODE_USE_ENV_PROXY="1")
+    return env
+
+
+def write_deny_shims(folder: str) -> str:
+    """Make `folder/bin` with one script per SHIM_TOOLS name that appends a line to `folder/SHIM_LOG`, says why on stderr
+    and exits 126; return the `bin` path, for the front of PATH. A tool called by its full path is not caught: the
+    proxy and the host's firewall are what stop that."""
+    bin_dir = Path(folder) / "bin"
+    bin_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    log = shlex.quote(str(Path(folder) / SHIM_LOG))
+    for name in SHIM_TOOLS:
+        script = (
+            "#!/bin/sh\n"
+            f'printf \'%s\\n\' \'{{"event":"command_denied","tool":"{name}"}}\' >> {log} 2>/dev/null\n'
+            f"echo 'ws: {name} is blocked in this session: it opens a network connection ws does not filter' >&2\n"
+            "exit 126\n"
+        )
+        shim = bin_dir / name
+        shim.write_text(script, encoding="utf-8")
+        shim.chmod(0o700)
+    return str(bin_dir)
+
+
+def shim_events(folder: str) -> int:
+    """How many times a shim ran in this session."""
+    try:
+        return len((Path(folder) / SHIM_LOG).read_text(encoding="utf-8").splitlines())
+    except OSError:
+        return 0
+
+
+def egress_note(plan: EgressPlan, refused: int, shims: int) -> str | None:
+    """One line for the end-of-run report: how many requests the allowlist refused and how many blocked tools were
+    called. Counts and the class only; no host is named."""
+    if not refused and not shims:
+        return None
+    return f"egress, class {plan.cls!r}: {refused} request(s) refused by the allowlist, {shims} blocked tool call(s)"
+
+
 def real_user() -> str | None:
     """The account this process runs as, from the system's user database and the effective user id: never `$USER`,
     `$HOME` or any other environment value, which the caller (or a project's settings) can set. None when the database
@@ -1453,16 +1981,7 @@ def require_class_user(pol: policy.Policy) -> None:
     the policy's `class_of` for the real path of the folder the session starts in, and the user is `real_user()`: nothing
     from the environment is read, so a forged `$USER` or `$HOME` changes nothing. A class with no `os_user`, a policy with
     no classes and a path in no class are not held to this. Exit 3, with a hint that names the class and not the account."""
-    try:
-        here = os.path.realpath(os.getcwd())
-    except OSError as e:
-        raise WsError(
-            "refused",
-            f"refusing to start: the current folder can't be read ({e.strerror}), so its class is not known",
-            "start it from a project folder",
-            3,
-        ) from e
-    cls = policy.class_of(pol, here)
+    cls = session_class(pol)
     if cls is None or not cls.os_user or real_user() == cls.os_user:
         return
     raise WsError(
@@ -1486,7 +2005,12 @@ def _launch_policy(args: argparse.Namespace) -> tuple[Path, policy.Policy]:
 
 
 def launch_claude(
-    args: argparse.Namespace, argv: list[str], home: Path, env: dict, pol: policy.Policy | None = None
+    args: argparse.Namespace,
+    argv: list[str],
+    home: Path,
+    env: dict,
+    pol: policy.Policy | None = None,
+    plan: EgressPlan | None = None,
 ) -> int:
     """`ws gate launch --runner claude-code -- claude ...`: Claude Code's own sandbox, with settings made for THIS
     project at the start of the session. The shared settings (`ws gate generate`, `ws install`) are made once for every
@@ -1494,7 +2018,8 @@ def launch_claude(
     no project paths. Here the project is known: the locked set (ws.sandbox PROJECT_LOCKED, GIT_LOCKED, the git folders
     git resolves) is added to `denyWrite` in a copy under `<state>/gate/claude-code/projects/`, and `claude --settings`
     is started with it. No bubblewrap: Claude Code's sandbox is the wall. The end-of-run report is the launcher's, as
-    for OpenCode."""
+    for OpenCode. With an egress `plan` the copy also carries the plan's hosts as `network.allowedDomains`, and nothing
+    else is reachable."""
     from ws.adapters import claude_code
 
     require_class_user(pol if pol is not None else _launch_policy(args)[1])  # before anything is written or started
@@ -1514,8 +2039,12 @@ def launch_claude(
     target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     if target.is_symlink():
         target.unlink()
-    target.write_text(claude_code.for_project(base.read_text(encoding="utf-8"), project), encoding="utf-8")
+    target.write_text(
+        claude_code.for_project(base.read_text(encoding="utf-8"), project, plan.domains() if plan else None),
+        encoding="utf-8",
+    )
     cmd = [argv[0], "--settings", str(target), *argv[1:]]
+    env = {**claude_code.MCP_WAIT_ENV, **env}  # the first model call sees its MCP tools; a value the person set wins
     before, note = scan_project(project)
     notes = [note] if note else []
     old = _exit_on_hangup()
@@ -1544,15 +2073,21 @@ def cmd_launch(args: argparse.Namespace) -> int:
         )
     policy_file, pol = _launch_policy(args)
     require_class_user(pol)  # a session of a class with an OS user starts as that user or not at all
+    cls = session_class(pol)
+    provider = args.provider or DEFAULT_PROVIDER.get(args.runner)
+    require_provider(cls, provider)  # G7: a provider outside the class's list is refused, before anything starts
+    plan = egress_plan(pol, cls, provider)  # None while the policy has no classes: the network is as it was
     home = paths.state_dir().absolute()  # whatever --policy says, the gate keeps its approvals and sessions here
     pass_env = check_pass_env(args.pass_env)
     if pass_env:
         print(f"ws: note: passing {', '.join(pass_env)} from this shell to {args.runner}", file=sys.stderr)
     env = launch_env(dict(os.environ), runner=args.runner, pass_env=pass_env)
     if args.runner == "claude-code" and not args.no_sandbox:
-        return launch_claude(args, argv, home, env, pol)
+        return launch_claude(args, argv, home, env, pol, plan)
     if args.no_sandbox:
         print(NO_SANDBOX_NOTE.format(runner=args.runner), file=sys.stderr)
+        if plan is not None:
+            print(NO_EGRESS_NOTE, file=sys.stderr)
         try:
             os.execvpe(argv[0], argv, env)
         except OSError as e:
@@ -1562,7 +2097,7 @@ def cmd_launch(args: argparse.Namespace) -> int:
     if ptrace_scope() in (0, None) and sys.platform == "linux":
         print(PTRACE_NOTE, file=sys.stderr)
     tmp = tempfile.mkdtemp(prefix="ws-wall-")  # the wall's /tmp: the rest of the disk is read-only
-    project, entered, before, notes = "", False, {}, []
+    project, entered, before, notes, proxy = "", False, {}, [], None
     old = _exit_on_hangup()
     try:
         project = project_folder(os.getcwd(), env)
@@ -1571,6 +2106,12 @@ def cmd_launch(args: argparse.Namespace) -> int:
         notes += [note] if note else []
         locked = enter_project(home, project)
         entered = True
+        extra: dict = {}
+        net = None
+        if plan is not None:  # the runner reaches the network through ws's proxy, and the macOS wall shuts the rest
+            proxy = EgressProxy(plan)
+            extra = {**proxy_env(proxy.start()), "PATH": f"{write_deny_shims(tmp)}:{env.get('PATH', '')}"}
+            net = (proxy.port, *plan.local_ports())
         wrapped = wrap(
             argv,
             pol,
@@ -1580,10 +2121,11 @@ def cmd_launch(args: argparse.Namespace) -> int:
             locked=locked,
             homes=list(homes.values()),
             tty=sys.stdin.isatty(),
+            net=net,
         )
         return run_with_broker(
             wrapped.argv,
-            launch_env(env, tmp, homes, args.runner, pass_env, paths.env_for()),
+            {**launch_env(env, tmp, homes, args.runner, pass_env, paths.env_for()), **extra},
             wrapped.pass_fds,
             approvals_dir(home),
         )
@@ -1595,6 +2137,10 @@ def cmd_launch(args: argparse.Namespace) -> int:
         print(f"ws: could not start {shlex.join(argv[:1])}: {e}", file=sys.stderr)
         return 127
     finally:
+        if proxy is not None:
+            proxy.stop()
+            line = egress_note(plan, len(proxy.denials), shim_events(tmp))
+            notes += [line] if line else []
         made = leave_project(home, project) if entered else []
         if entered:
             try:
@@ -1643,6 +2189,12 @@ def add_launch(gs, names: list[str]) -> None:
         action="append",
         metavar="NAME",
         help="an environment variable to hand the runner (repeat for more); the rest of this shell's is left behind",
+    )
+    p.add_argument(
+        "--provider",
+        metavar="NAME",
+        help="the model provider this session uses (default: anthropic for claude-code); a data class limits which "
+        "providers it may use, and its network list gets that provider's host",
     )
     p.add_argument("--no-sandbox", action="store_true", help="start the runner with no wall (says what that gives up)")
     p.add_argument("argv", nargs=argparse.REMAINDER, help="-- then the runner's command line")

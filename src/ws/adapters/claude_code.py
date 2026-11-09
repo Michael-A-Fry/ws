@@ -36,7 +36,10 @@ confines every shell command Claude runs, whatever program it starts:
     and its tmp; nothing else) is already an allow-list.
   * `filesystem.denyRead`: the deny_read rules that name a folder or file (ws.policy.sandbox_read_paths).
   * `network.allowedDomains`: the policy's allow_hosts, only when the policy names some. Without them the sandbox
-    asks (interactive) or refuses (`-p`) for a host it has not been told about.
+    asks (interactive) or refuses (`-p`) for a host it has not been told about. A session of a data class started by
+    `ws gate launch` gets its own list instead (for_project): the class's allowed_hosts, its provider's host and the
+    exceptions in force, so a class with none reaches nothing. The class file (ws.wallsettings) holds the same list as
+    managed settings, with `allowManagedDomainsOnly`, so no other settings file adds a host.
   * `autoAllowBashIfSandboxed: false`, set on purpose: with it on, Claude Code runs sandboxed shell commands without
     asking. ws leaves that choice to the person's own permission mode, so a sandboxed command still prompts as before.
 Project settings can widen all of this: in 2.1.308 `sandbox.excludedCommands` merges across settings sources and
@@ -298,9 +301,11 @@ def _widens_sandbox(conf) -> str | None:
     return None
 
 
-def for_project(settings: str, project: str) -> str:
+def for_project(settings: str, project: str, hosts: list[str] | None = None) -> str:
     """The generated settings text with the project's locked paths added to the sandbox `denyWrite`, absolute: what
-    `ws gate launch --runner claude-code` starts claude with. The shared settings cannot hold them (see the docstring)."""
+    `ws gate launch --runner claude-code` starts claude with. The shared settings cannot hold them (see the docstring).
+    `hosts`, when given (a session of a data class: ws.sandbox.EgressPlan.domains), become `network.allowedDomains`
+    and replace any list in the shared file; an empty list reaches no host at all."""
     from ws import sandbox  # here, not at the top: ws.sandbox imports the adapters
 
     conf = json.loads(settings)
@@ -308,6 +313,8 @@ def for_project(settings: str, project: str) -> str:
         return json.dumps(conf, indent=2) + "\n"
     fs = conf["sandbox"].setdefault("filesystem", {})
     fs["denyWrite"] = list(dict.fromkeys([*fs.get("denyWrite", []), *sandbox.claude_denied_paths(project)]))
+    if hosts is not None:
+        conf["sandbox"].setdefault("network", {})["allowedDomains"] = list(hosts)
     return json.dumps(conf, indent=2) + "\n"
 
 
@@ -448,6 +455,9 @@ def launch_hint(out: str) -> str:
 # --- ws run: the command line, and the result read back as a run record --------------------------------------------
 
 EXE = "claude"
+# Claude Code connects its MCP servers without waiting by default, so a first model call can start with no MCP tools and
+# answer without them (measured: about 1 in 5 first calls). Headless runs wait for the connection, up to 5 minutes.
+MCP_WAIT_ENV = {"MCP_CONNECTION_NONBLOCKING": "false", "MCP_TIMEOUT": "300000", "MCP_CONNECT_TIMEOUT_MS": "300000"}
 PLACEHOLDER_KEY = "ws-lease-placeholder"  # the runner holds this; the broker swaps in the real key on the way out
 OPTIONS = {"exe", "allowed_tools", "env"}
 PROMPT_VIA_STDIN = True  # `claude -p` reads the prompt from stdin: it stays out of argv and `ps`
@@ -476,7 +486,7 @@ def build_command(job, run_dir: Path, lease) -> tuple[list[str], dict[str, str]]
     if tools:
         argv += ["--allowedTools", ",".join(tools)]
     env = jobs.extra_env(job)  # first: what ws sets below always wins
-    env.update(DISABLE_AUTOUPDATER="1", CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1")
+    env.update(DISABLE_AUTOUPDATER="1", CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1", **MCP_WAIT_ENV)
     if lease is not None:
         env.update(ANTHROPIC_BASE_URL=lease.base_url, ANTHROPIC_API_KEY=PLACEHOLDER_KEY)
     return argv, env

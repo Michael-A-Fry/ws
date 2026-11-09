@@ -20,6 +20,8 @@ refuses a policy that uses them, which is the fail-closed behaviour wanted):
     `budget_month(now)` is that window, for everything that reserves or settles against a cap.
   * `Policy.autonomy`: `Autonomy(level, interrupts, always_ask)`. Separate from the `[interrupts]` counts.
   * `RuleException.owner`, `.expires` (an aware UTC datetime) and `.expired(now)`; a date means 00:00Z that day.
+  * `Policy.egress_exceptions`: `[[egress_exceptions]]`, hosts a named class may reach beyond its own `allowed_hosts`.
+    `owner` and `expires` are both required, and one that has expired covers nothing (ws.sandbox reads them).
 
 Known limits of the matcher. It reads command text, so it cannot see:
   * what an interpreter does inside its own program (`python3 -c`, `perl -e`, `node -e`, a script it runs);
@@ -91,7 +93,9 @@ lines whether or not a sandbox is up:
     the worst a child can do with it is waste an approval); Anthropic's sandbox-runtime was evaluated and not adopted
     (see ws.sandbox).
   * `allow_hosts` limits the network on Claude Code only (its sandbox proxy filters by host). The OpenCode wall does not
-    filter the network: bubblewrap can only cut it off whole, which would cut off the model too.
+    filter the network by it: bubblewrap can only cut it off whole, which would cut off the model too. A session of a
+    data class has its own default-deny list (`allowed_hosts`, the provider's host, `[[egress_exceptions]]`), which
+    ws.sandbox applies to every runner: Claude Code's proxy, or ws's own for the others.
 A call the policy lets through only with a human's say-so is `ask_commands`: see ws.approvals.
 """
 
@@ -122,6 +126,31 @@ KNOWN_TOOLS = ("web_fetch", "web_search")
 EGRESS_TOOLS = ("web_fetch", "web_search")
 _NAME = re.compile(r"^[A-Za-z0-9_-]+$")
 _HOST = re.compile(r"^(\*\.)?[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?$")
+_CATCH_ALL = ("0.0.0.0", "0", "::", "*")  # an entry that names every address, however it is spelled
+
+
+def check_host(h: str, where: str) -> None:
+    """One host entry (`[gate] allow_hosts`, a class's `allowed_hosts`, an egress exception's `hosts`): a name, `*.name`
+    or an IP with an optional port from 1 to 65535. A catch-all (the unspecified address) and a wildcard over a top-level
+    name (`*.com`) or over an IP are refused: they open the network to everyone, and the runner's own proxy refuses
+    them too. The message names the table and the entry, never anything else."""
+    if not isinstance(h, str) or not _HOST.fullmatch(h):
+        raise PolicyError(f"{where}: {h!r} is not a host (a name, `*.name` or an IP, optional :port)")
+    name, _, port = h.partition(":")
+    if port and not 1 <= int(port) <= 65535:
+        raise PolicyError(f"{where}: {h!r} has a port outside 1 to 65535")
+    if name in _CATCH_ALL:
+        raise PolicyError(f"{where}: {h!r} would let a session reach every address")
+    if name.startswith("*."):
+        base = name[2:]
+        if "." not in base:
+            raise PolicyError(
+                f"{where}: {h!r} is a wildcard over a whole top-level name; name the domain (`*.example.org`)"
+            )
+        if all(part.isdigit() for part in base.split(".")):
+            raise PolicyError(f"{where}: {h!r} is a wildcard over an IP address, which names nothing")
+
+
 ACCESS = ("full", "walled", "counts-only")  # a data class's access, loosest first
 INBOUND = ("off", "lead-only", "allowlist")
 AUTONOMY_LEVELS = ("ask", "decide-and-tell", "autonomous")
@@ -195,6 +224,23 @@ class RuleException:
 
 
 @dataclass(frozen=True)
+class EgressException:
+    """A named, owned and dated grant of hosts to the sessions of some classes (`[[egress_exceptions]]`). `expires` is an
+    aware UTC datetime, as for RuleException; both `owner` and `expires` are required, so no grant is open-ended."""
+
+    name: str
+    classes: tuple[str, ...]
+    hosts: tuple[str, ...]
+    reason: str
+    owner: str
+    expires: datetime
+
+    def expired(self, now: datetime) -> bool:
+        """True from the moment `expires` is reached (`now >= expires`). `now` must be timezone-aware."""
+        return now >= self.expires
+
+
+@dataclass(frozen=True)
 class Class:
     """A data class (`[classes.NAME]`): which repos belong to it and what a session working in them may do and see.
     Consumers read it, they do not re-parse it. `access` is full, walled or counts-only. `allowed_providers` is None
@@ -244,6 +290,7 @@ class Policy:
     classes: dict[str, Class] = field(default_factory=dict)  # empty = no [classes] table: class_of answers None
     budget_purposes: dict[str, float] = field(default_factory=dict)  # purpose -> monthly USD cap (UTC calendar month)
     autonomy: Autonomy = Autonomy()
+    egress_exceptions: tuple[EgressException, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -488,7 +535,19 @@ def loads(text: str) -> Policy:
     raw = _table(
         raw,
         "policy",
-        {"schema", "dial", "interrupts", "sources", "gate", "exceptions", "guards", "classes", "budget", "autonomy"},
+        {
+            "schema",
+            "dial",
+            "interrupts",
+            "sources",
+            "gate",
+            "exceptions",
+            "guards",
+            "classes",
+            "budget",
+            "autonomy",
+            "egress_exceptions",
+        },
     )
     schema = raw.get("schema", SCHEMA)
     if schema != SCHEMA or isinstance(schema, bool):
@@ -541,8 +600,7 @@ def loads(text: str) -> Policy:
         _get(g, "sandbox", bool, "[gate] ", True),
     )
     for h in gate.allow_hosts:
-        if not _HOST.match(h):
-            raise PolicyError(f"[gate] allow_hosts: {h!r} is not a host (a name, `*.name` or an IP, optional :port)")
+        check_host(h, "[gate] allow_hosts")
     for w in gate.allow_write:
         n = posixpath.normpath(re.sub(r"^(\$HOME|\$\{HOME\})(?=/|$)", "~", w)) if w else ""
         if n in ("", ".", "/", "~") or not n.startswith(("~/", "/")) or re.search(r"[*?\[]", w):
@@ -579,6 +637,7 @@ def loads(text: str) -> Policy:
             raise PolicyError(f"{where}owner must be non-empty text")
         expires = _expires(e["expires"], where) if "expires" in e else None
         exceptions.append(RuleException(e["name"], e["job"], covered, e["reason"], owner, expires))
+    classes = _classes(raw.get("classes", {}))
     return Policy(
         schema,
         dial,
@@ -587,10 +646,44 @@ def loads(text: str) -> Policy:
         gate,
         tuple(exceptions),
         _guards(raw.get("guards", {})),
-        _classes(raw.get("classes", {})),
+        classes,
         _purposes(raw.get("budget", {})),
         _autonomy(raw.get("autonomy", {})),
+        _egress_exceptions(raw.get("egress_exceptions", []), classes),
     )
+
+
+def _egress_exceptions(raw, classes: dict[str, Class]) -> tuple[EgressException, ...]:
+    """`[[egress_exceptions]]`: every key is required, and each class and host must be well formed. An exception with no
+    owner or no expiry is refused, so no grant of hosts is open-ended or nobody's."""
+    if not isinstance(raw, list):
+        raise PolicyError("[[egress_exceptions]] must be an array of tables")
+    out: list[EgressException] = []
+    for i, e in enumerate(raw, 1):
+        where = f"[[egress_exceptions]] #{i} "
+        e = _table(e, where.strip(), {"name", "classes", "hosts", "reason", "owner", "expires"})
+        for k in ("name", "reason", "owner"):
+            if not isinstance(e.get(k), str) or not e[k].strip():
+                raise PolicyError(f"{where}{k} is required (text)")
+        if "expires" not in e:
+            raise PolicyError(f"{where}expires is required (a date or an offset date-time): a grant must end")
+        if "classes" not in e or "hosts" not in e:
+            raise PolicyError(f"{where}classes and hosts are required")
+        if any(x.name == e["name"] for x in out):
+            raise PolicyError(f"{where}name {e['name']!r} is used twice")
+        named = _plain_names(e, "classes", where)
+        if not named:
+            raise PolicyError(f"{where}classes must name at least one class")
+        for c in named:
+            if c not in classes:
+                raise PolicyError(f"{where}classes: unknown class {c!r}")
+        hosts = _strings(e, "hosts", where)
+        if not hosts:
+            raise PolicyError(f"{where}hosts must name at least one host")
+        for h in hosts:
+            check_host(h, f"{where}hosts")
+        out.append(EgressException(e["name"], named, hosts, e["reason"], e["owner"], _expires(e["expires"], where)))
+    return tuple(out)
 
 
 def _expires(v, where: str) -> datetime:
@@ -654,10 +747,7 @@ def _classes(raw) -> dict[str, Class]:
         providers = _plain_names(body, "allowed_providers", where) if "allowed_providers" in body else None
         hosts = _strings(body, "allowed_hosts", where)
         for h in hosts:
-            if not _HOST.fullmatch(h):
-                raise PolicyError(
-                    f"{where}allowed_hosts: {h!r} is not a host (a name, `*.name` or an IP, optional :port)"
-                )
+            check_host(h, f"{where}allowed_hosts")
         readable = _strings(body, "readable_by", where)
         if "*" in readable and len(readable) > 1:
             raise PolicyError(f'{where}readable_by: "*" means everyone and can not be listed with class names')

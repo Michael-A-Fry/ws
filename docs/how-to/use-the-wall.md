@@ -91,36 +91,56 @@ owner = "Sam"
 expires = 2026-12-31
 ```
 
-- **Hosts.** A name (`pypi.org`), a name under a domain (`*.example.org`, which doesn't cover `example.org` itself) or an
-  address, each with an optional `:port`. A catch-all (`0.0.0.0`), a wildcard over a whole top-level name (`*.com`) or a
-  port outside 1 to 65535 is refused when the policy loads. A name needs a dot, or is `localhost`. A model on this
-  machine is `localhost:PORT` or `127.0.0.1:PORT`, and the port is required.
+- **Hosts.** A name (`pypi.org`), a name under a domain (`*.example.org`, which doesn't cover `example.org` itself) or a
+  public address, each with an optional `:port`. This is the format Claude Code's `sandbox.network.allowedDomains`
+  takes (checked against its settings reference in November 2026), so entries go into it as written. Refused when the
+  policy loads: a catch-all (`0.0.0.0`), a wildcard over a whole top-level name (`*.com`) or over an IP, and a port
+  outside 1 to 65535. Left out when a session starts (and WS015 counts them): a name with no dot, a private,
+  link-local or cloud-metadata address, a wildcard over a registry like `*.co.uk`, and a loopback entry with no port. A
+  model on this machine is `localhost:PORT` or `127.0.0.1:PORT`; the port is required. A host written with anything
+  but letters, digits, dots and hyphens is refused at the proxy.
 - **Exceptions.** `owner` and `expires` are both required, so a grant always ends and has someone behind it. From the
-  moment `expires` is reached the exception covers nothing, and a request it would have covered is refused with its name.
-  A date such as `2026-12-31` ends at 00:00Z that day.
+  moment `expires` is reached the exception covers nothing, and a request it would have covered is refused with its
+  name. A date such as `2026-12-31` ends at 00:00Z that day. ws's own proxy judges this on every request, so an
+  exception that ends mid-session stops at that moment. Claude Code's list is written once when the session starts, so
+  there an exception that ends mid-session still holds until the next start.
 - **Providers.** `ws gate launch --provider NAME` says which model provider the session uses (Claude Code means
-  `anthropic` unless you say otherwise). A provider outside the class's `allowed_providers` is refused before anything
+  `anthropic` unless you say otherwise). `ws run` takes it from the runner, the job's `provider` option or the part of
+  the model name before the slash. A provider outside the class's `allowed_providers` is refused before anything
   starts, and the refusal names the class only. A walled or counts-only class that doesn't say gets a model on this
   machine (`local`, `ollama`, `lmstudio`, `vllm`, `llamacpp`) and nothing else; a `full` class gets any. A folder in no
-  class is held to the strictest. `local_only = true` keeps loopback entries and drops the rest.
+  class (and a job with no `cwd`) is held to the strictest. `local_only = true` keeps loopback entries and drops the
+  rest.
+- **No sandbox, no list.** A session of a class is refused (exit 3) with `--no-sandbox`, or with `[gate] sandbox =
+  false` on Claude Code, since the list has nowhere to be applied. WS015 warns of the second.
 
 What enforces it:
 
 - **Claude Code.** The class's list is written as `sandbox.network.allowedDomains` in the settings copy `ws gate launch`
-  makes for the project, and an empty list reaches no host. The managed-settings file for a class user
-  (`ws install --class NAME`) holds the class's hosts with `allowManagedDomainsOnly`, so a project's own settings file
-  can't add one. That file is placed by hand, so it carries the class's hosts and its providers' but not the exceptions,
-  which end; run `ws install --class NAME` again after you change the list.
-- **OpenCode, on Linux.** `ws gate launch` starts a small proxy of its own on 127.0.0.1 and sets the proxy variables for
-  the runner; loopback stays off the proxy, so a model on this machine is reached directly. The proxy refuses a host
-  that isn't listed, a name that resolves to a private, link-local or cloud-metadata address, and a name that resolves to
-  this machine unless it is a listed model port. It is the route, not a fence: a program that ignores the proxy variables
-  and opens a socket itself isn't stopped by the wall alone. ssh, nc, ncat, netcat, telnet, scp, sftp, ftp and socat are
-  replaced on `PATH` inside the wall by a script that says so and exits 126, and the end-of-run report counts how many
-  requests and tool calls were refused. A tool called by its full path isn't caught. What closes that gap is a rule in
-  the host's firewall for the class's OS user; ws doesn't write one (it needs root).
-- **OpenCode, on macOS.** The same proxy, and the sandbox profile denies all outbound connections except to the proxy
-  and the model ports, so a program that skips the proxy is stopped. That profile hasn't been run on a Mac.
+  makes for the project (and the run's settings in `ws run`), with `strictAllowlist` on so a host outside it is refused
+  and not asked about (Claude Code 2.1.219 or later; an older one asks). An empty list reaches no host. This copy
+  can't stop a project's own settings file from adding hosts, so the preflight hook refuses every call from a folder
+  whose `.claude/settings.json` or `settings.local.json` sets `network.allowedDomains`, a proxy port, a Unix socket
+  or local binding. The managed-settings file for a class user (`ws install --class NAME`) is the stronger form: it
+  holds the class's hosts with `allowManagedDomainsOnly`, so no other file can add one. It is placed by hand, so it
+  carries the class's hosts and its providers' but not the exceptions, which end; run `ws install --class NAME` again
+  after you change the list.
+- **Other runners (OpenCode), on Linux.** `ws gate launch` starts a small proxy of its own on 127.0.0.1 and sets the
+  proxy variables for the runner, with a password made for that launch, so another session's proxy can't be used from
+  inside. The proxy refuses a host that isn't listed, a name that resolves to a private, link-local or cloud-metadata
+  address, and a name that resolves to this machine unless it is a listed model port.
+  **It is the route, not a fence.** Loopback is kept off the proxy (`NO_PROXY`), so a model on this machine is reached
+  directly, and that means any loopback port is open to the session, including ones another process on the machine
+  listens on. A program that ignores the proxy variables and opens a socket itself isn't stopped either. ssh, nc, ncat,
+  netcat, telnet, scp, sftp, ftp and socat are replaced on `PATH` inside the wall by a script that says so and exits
+  126, and the end-of-run report counts how many requests and tool calls were refused; a tool called by its full path
+  isn't caught. What closes the gap is a rule in the host's firewall for the class's OS user; ws doesn't write one (it
+  needs root).
+- **Other runners, on macOS.** The same proxy, and the sandbox profile denies all outbound connections except to the
+  proxy and the model ports, so a program that skips the proxy is stopped (a loopback model port stays open to it).
+  That profile hasn't been run on a Mac.
+- **`ws run`.** The same list: in the run's settings for Claude Code, through the proxy for other runners. A run that
+  breaks G7 or has the sandbox off is refused and recorded with `refused:egress`.
 
 `ws doctor` shows one WS015 line per class: `ok` with the number of hosts, or `warn` with the reason (see
 [Doctor checks](../reference/doctor-checks.md)).

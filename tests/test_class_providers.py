@@ -8,6 +8,7 @@ import socket
 from pathlib import Path
 
 import pytest
+from test_run import ws as run_ws  # noqa: F401  (a scratch WS_HOME with a fake claude, for the `ws run` tests below)
 
 from ws import cli, policy, sandbox
 from ws.output import WsError
@@ -170,7 +171,8 @@ def test_launch_in_a_class_runs_the_proxy_beside_the_runner_and_tells_the_wall_t
     assert launch("opencode", "--provider", "local") == 0
     _, _, env = started[0]
     port = int(env["HTTPS_PROXY"].rsplit(":", 1)[1])
-    assert env["HTTP_PROXY"] == env["https_proxy"] == f"http://127.0.0.1:{port}"
+    secret = env["HTTPS_PROXY"].split("@")[0].rsplit(":", 1)[1]
+    assert env["HTTP_PROXY"] == env["https_proxy"] == f"http://ws:{secret}@127.0.0.1:{port}" and len(secret) >= 24
     assert env["NO_PROXY"].startswith("localhost,")
     assert started.seen["net"] == (port, 11434)
     shim_dir = env["PATH"].split(":")[0]
@@ -205,10 +207,39 @@ def test_launch_of_claude_code_in_a_class_with_no_hosts_reaches_nothing(box, sta
     assert conf["sandbox"]["network"]["allowedDomains"] == []
 
 
-def test_a_launch_without_a_wall_says_the_list_is_not_applied(box, started, capsys):
+def test_a_class_session_without_a_wall_is_refused_not_started_with_an_open_network(box, started, capsys):
+    # this used to start the runner with a note; the class's list would have been applied by nothing
     write(box, klass(box, 'allowed_providers = ["local"]\n'))
-    assert launch("opencode", "--provider", "local", "--no-sandbox") == 0
-    assert "no network allowlist" in capsys.readouterr().err
+    for runner in ("opencode", "claude-code"):
+        assert launch(runner, "--provider", "local", "--no-sandbox") == 3
+        err = capsys.readouterr().err
+        assert "class 'work'" in err and "applied by the sandbox" in err
+    assert started == []
+
+
+def test_a_class_session_of_claude_code_is_refused_when_the_policy_has_the_sandbox_off(box, started, capsys):
+    gate = box / "wshome" / "gate" / "claude-code"
+    gate.mkdir(parents=True)
+    (gate / "settings.json").write_text("{}", encoding="utf-8")  # what the generator writes with the sandbox off
+    write(box, "[gate]\nsandbox = false\n" + klass(box, 'allowed_providers = ["anthropic"]\n'))
+    assert launch("claude-code", command=["claude"]) == 3
+    assert "class 'work'" in capsys.readouterr().err and started == []
+
+
+def test_the_generated_settings_with_no_sandbox_block_are_refused_for_a_class(box, started, capsys):
+    gate = box / "wshome" / "gate" / "claude-code"
+    gate.mkdir(parents=True)
+    (gate / "settings.json").write_text("{}", encoding="utf-8")
+    write(
+        box, klass(box, 'allowed_providers = ["anthropic"]\n')
+    )  # the policy says sandbox on; the file on disk is stale
+    assert launch("claude-code", command=["claude"]) == 3
+    assert "no sandbox block" in capsys.readouterr().err and started == []
+
+
+def test_a_policy_without_classes_still_starts_a_session_without_a_wall(box, started):
+    write(box, "")
+    assert launch("opencode", "--no-sandbox") == 0 and started[0][0] == "exec"
 
 
 def test_require_provider_raises_exit_3_with_a_hint_that_names_no_provider():
@@ -217,3 +248,80 @@ def test_require_provider_raises_exit_3_with_a_hint_that_names_no_provider():
         sandbox.require_provider(cls, "anthropic")
     assert e.value.exit_code == 3 and e.value.kind == "refused" and "anthropic" not in e.value.hint
     sandbox.require_provider(cls, "local")
+
+
+# --- ws run ----------------------------------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def ws(run_ws):  # noqa: F811 (a fixture takes the other as its argument)
+    return run_ws
+
+
+def settings_of(ws) -> dict:
+    (rec,) = ws.records()
+    return json.loads((ws.home / "runs" / rec["run_id"] / "gate" / "settings.json").read_text(encoding="utf-8"))
+
+
+def run_policy(ws, tmp_path, body: str, head: str = "") -> Path:
+    work = tmp_path / "work"
+    work.mkdir(exist_ok=True)
+    (ws.home / "policy.toml").write_text(
+        head + f'[classes.work]\naccess = "walled"\nrepos = ["{work}/**"]\n{body}', encoding="utf-8"
+    )
+    return work
+
+
+def test_ws_run_gives_a_class_job_the_class_list_in_the_runs_settings(ws, tmp_path):
+    work = run_policy(ws, tmp_path, 'allowed_providers = ["anthropic"]\nallowed_hosts = ["api.example.com"]\n')
+    ws.job(extra=f'cwd = "{work}"')
+    assert cli.main(["run", "daily"]) == 0
+    net = settings_of(ws)["sandbox"]["network"]
+    assert net["allowedDomains"] == ["api.example.com", "api.anthropic.com", "platform.claude.com"]
+    assert net["strictAllowlist"] is True
+
+
+def test_ws_run_refuses_a_provider_the_class_does_not_allow_and_records_why(ws, tmp_path, capsys):
+    work = run_policy(ws, tmp_path, 'allowed_providers = ["local"]\n')
+    ws.job(extra=f'cwd = "{work}"')
+    assert cli.main(["run", "daily"]) == 3
+    (rec,) = ws.records()
+    assert rec["status"] == "refused" and rec["stop_reason"] == "refused:egress"
+    assert "class 'work'" in rec["error"] and "anthropic" not in rec["error"] and "local" not in rec["error"]
+    assert not (ws.home / "fake-saw.json").exists()  # the runner never started
+
+
+def test_ws_run_holds_a_job_with_no_cwd_to_the_strictest_when_there_are_classes(ws, tmp_path):
+    run_policy(ws, tmp_path, 'allowed_providers = ["anthropic"]\n')
+    ws.job()  # no cwd: a private folder, in no class
+    assert cli.main(["run", "daily"]) == 3
+    (rec,) = ws.records()
+    assert "unclassified" in rec["error"] and rec["stop_reason"] == "refused:egress"
+
+
+def test_ws_run_refuses_a_class_job_when_the_policy_has_the_sandbox_off(ws, tmp_path):
+    work = run_policy(ws, tmp_path, 'allowed_providers = ["anthropic"]\n', head="[gate]\nsandbox = false\n")
+    ws.job(extra=f'cwd = "{work}"')
+    assert cli.main(["run", "daily"]) == 3
+    (rec,) = ws.records()
+    assert "sandbox is off" in rec["error"] and not (ws.home / "fake-saw.json").exists()
+
+
+def test_ws_run_with_no_classes_is_as_it_was(ws):
+    ws.job()
+    assert cli.main(["run", "daily"]) == 0
+    assert "network" not in settings_of(ws)["sandbox"]
+
+
+def test_ws_run_dry_run_says_it_would_refuse(ws, tmp_path, capsys):
+    work = run_policy(ws, tmp_path, 'allowed_providers = ["local"]\n')
+    ws.job(extra=f'cwd = "{work}"')
+    assert cli.main(["run", "daily", "--dry-run"]) == 3
+    assert "does not allow that model provider" in capsys.readouterr().out
+
+
+def test_a_headless_job_names_its_provider_from_the_runner_the_option_or_the_model():
+    assert sandbox.job_provider("claude-code", "claude-haiku-4-5") == "anthropic"
+    assert sandbox.job_provider("opencode", "ollama/llama3", {}) == "ollama"
+    assert sandbox.job_provider("opencode", "ollama/llama3", {"provider": "local"}) == "local"
+    assert sandbox.job_provider("opencode", "bare-model") == ""

@@ -298,23 +298,45 @@ def _widens_sandbox(conf) -> str | None:
         for k in ("allowRead", "allowWrite"):
             if fs.get(k):
                 return f"filesystem.{k}"
+    net = sb.get("network")
+    if isinstance(net, dict):  # a host the generated list does not name, a local port, a socket or a proxy of its own
+        for k in ("allowedDomains", "allowUnixSockets", "httpProxyPort", "socksProxyPort"):
+            if net.get(k):
+                return f"network.{k}"
+        for k in ("allowLocalBinding", "allowAllUnixSockets"):
+            if net.get(k) is True:
+                return f"network.{k} = true"
     return None
+
+
+def with_hosts(settings: str, hosts: list[str]) -> str:
+    """The generated settings text with `hosts` (a data class's list: ws.sandbox.EgressPlan.domains) as
+    `network.allowedDomains`, replacing any list in it, and `strictAllowlist` on, so a host outside the list is refused
+    and not asked about (honoured from `--settings`, not from a project file; Claude Code 2.1.219 or later, and an older
+    one asks). An empty list reaches no host at all. ValueError when the settings have no sandbox block, since the list
+    would have nowhere to go: the network would be open and the caller must refuse."""
+    conf = json.loads(settings)
+    if "sandbox" not in conf:
+        raise ValueError("the generated settings have no sandbox block, so the class's network list can not be applied")
+    net = conf["sandbox"].setdefault("network", {})
+    net["allowedDomains"] = list(hosts)
+    net["strictAllowlist"] = True
+    return json.dumps(conf, indent=2) + "\n"
 
 
 def for_project(settings: str, project: str, hosts: list[str] | None = None) -> str:
     """The generated settings text with the project's locked paths added to the sandbox `denyWrite`, absolute: what
     `ws gate launch --runner claude-code` starts claude with. The shared settings cannot hold them (see the docstring).
-    `hosts`, when given (a session of a data class: ws.sandbox.EgressPlan.domains), become `network.allowedDomains`
-    and replace any list in the shared file; an empty list reaches no host at all."""
+    `hosts`, when given, are applied by `with_hosts` (ValueError if there is no sandbox block to hold them)."""
     from ws import sandbox  # here, not at the top: ws.sandbox imports the adapters
 
+    if hosts is not None:
+        settings = with_hosts(settings, hosts)
     conf = json.loads(settings)
     if "sandbox" not in conf:  # the policy switched the sandbox off: there is no block to add the project's paths to
         return json.dumps(conf, indent=2) + "\n"
     fs = conf["sandbox"].setdefault("filesystem", {})
     fs["denyWrite"] = list(dict.fromkeys([*fs.get("denyWrite", []), *sandbox.claude_denied_paths(project)]))
-    if hosts is not None:
-        conf["sandbox"].setdefault("network", {})["allowedDomains"] = list(hosts)
     return json.dumps(conf, indent=2) + "\n"
 
 

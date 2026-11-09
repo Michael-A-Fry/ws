@@ -95,7 +95,10 @@ lines whether or not a sandbox is up:
   * `allow_hosts` limits the network on Claude Code only (its sandbox proxy filters by host). The OpenCode wall does not
     filter the network by it: bubblewrap can only cut it off whole, which would cut off the model too. A session of a
     data class has its own default-deny list (`allowed_hosts`, the provider's host, `[[egress_exceptions]]`), which
-    ws.sandbox applies to every runner: Claude Code's proxy, or ws's own for the others.
+    ws.sandbox applies in `ws gate launch` and `ws run`: Claude Code's proxy, or ws's own for the others. ws's own is
+    the route and not a fence on Linux (a program that ignores the proxy variables, or reaches a loopback port, is not
+    stopped by it), and the list is fixed at launch for Claude Code, so an exception that ends mid-session still
+    holds there until the next start.
 A call the policy lets through only with a human's say-so is `ask_commands`: see ws.approvals.
 """
 

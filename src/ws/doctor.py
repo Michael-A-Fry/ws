@@ -314,6 +314,10 @@ def _egress_checks(env, kind: str, now=None) -> list[Check]:
             issues.append(f"expired exception {', '.join(map(repr, lapsed))} covers nothing")
         if soon:
             issues.append(f"exception {', '.join(map(repr, soon))} ends within 7 days")
+        if not pol.gate.sandbox:
+            issues.append(
+                "[gate] sandbox is off, so no network list is applied to Claude Code and its launches are refused"
+            )
         if name in stale:
             issues.append("the class file's network list is not what the policy renders now")
         if issues:

@@ -4,7 +4,9 @@ test reaches the network, reads the real HOME or depends on the clock's zone."""
 
 from __future__ import annotations
 
+import base64
 import ipaddress
+import secrets
 import socket
 import subprocess
 import threading
@@ -114,10 +116,19 @@ def test_the_matcher_reads_an_entry_as_the_runner_does(host, port, entry, want):
         ("*.example.org:443", False),
         ("localhost:11434", False),
         ("127.0.0.1:8080", False),
-        ("203.0.113.7", False),
+        ("8.8.8.8", False),
         ("localhost", True),  # a loopback entry names its port
         ("127.0.0.1", True),
         ("intranet", True),  # no dot: the proxies read fully qualified names
+        (META, True),  # a literal metadata or private address is never an entry
+        (TEN, True),
+        (v4(192, 168, 1, 1) + ":8080", True),
+        (v4(169, 254, 1, 1), True),
+        ("*.co.uk", True),  # a whole registry
+        ("*.com.au", True),
+        ("*.example.co.uk", False),
+        ("*.gov.uk", True),
+        ("a b.example.org", True),
         ("*.com", True),  # a whole top-level name
         ("*.1.2.3", True),  # a wildcard over an address
         ("0.0.0.0", True),  # the unspecified address is everyone
@@ -209,9 +220,51 @@ def test_an_exception_ends_at_its_expiry_and_not_before(pol):
     edge = datetime(2099, 1, 1, tzinfo=UTC)
     before = plan_for(pol, "work", now=edge - timedelta(seconds=1))
     after = plan_for(pol, "work", now=edge)
-    assert before.decide("docs.example.net", 443).allow
-    refused = after.decide("docs.example.net", 443)
+    assert before.decide("docs.example.net", 443, edge - timedelta(seconds=1)).allow
+    refused = after.decide("docs.example.net", 443, edge)
     assert not refused.allow and "expired" in refused.reason and "docs-lookup" in refused.reason
+
+
+def test_an_exception_that_ends_during_a_session_stops_covering_at_that_moment(pol):
+    plan = plan_for(pol, "work", now=NOW)  # built when the session started, with the exception in force
+    edge = datetime(2099, 1, 1, tzinfo=UTC)
+    assert plan.decide("docs.example.net", 443, edge - timedelta(seconds=1)).allow
+    late = plan.decide("docs.example.net", 443, edge)
+    assert not late.allow and late.via == "exception:docs-lookup" and "expired" in late.reason
+    assert plan.decide("api.example.com", 443, edge).allow  # the class's own list is not an exception
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "8.8.8.8\x00.example.org",
+        "a.example.org\x00",
+        "a b.example.org",
+        "a" + "@" + "evil.com.example.org",
+        "a/b.example.org",
+        "a%2e.example.org",
+        "a\n.example.org",
+        "ａ.example.org",
+    ],
+)
+def test_a_host_with_characters_a_name_does_not_have_is_refused_even_under_a_wildcard(host):
+    p = policy.loads('[classes.c]\naccess = "walled"\nrepos = ["/srv/c/**"]\nallowed_hosts = ["*.example.org"]\n')
+    plan = sandbox.egress_plan(p, p.classes["c"], "", NOW)
+    assert plan.decide("a.example.org", 443).allow
+    d = plan.decide(host, 443)
+    assert not d.allow and d.reason == "not a destination"
+    assert not sandbox.valid_destination(host)
+
+
+@pytest.mark.parametrize("host", ["example.org", "a-b.example.org", "[::1]", "::1", "2001:db8::1", "1.2.3.4"])
+def test_ordinary_destinations_are_valid(host):
+    assert sandbox.valid_destination(host)
+
+
+@pytest.mark.parametrize("target", ["8.8.8.8\x00.example.org:443", "a b:443", "a:b:443", "[::1:443", "x\u00e9.org:443"])
+def test_a_connect_target_with_odd_characters_does_not_parse(target):
+    with pytest.raises(ValueError):
+        sandbox._split_hostport(target, 443)
 
 
 def test_a_policy_with_no_classes_has_no_plan_and_the_network_is_as_it_was():
@@ -278,20 +331,21 @@ def test_a_name_that_leads_to_loopback_is_refused_unless_it_is_a_named_model_por
     assert not plan.address_ok("a.example.org", lo, 11434)
 
 
-def test_a_cloud_metadata_address_is_never_reached_even_when_listed():
+def test_a_cloud_metadata_address_listed_is_dropped_and_never_dialled():
     p = policy.loads('[classes.c]\naccess = "walled"\nrepos = ["/srv/c/**"]\nallowed_hosts = ["' + META + '"]\n')
     plan = sandbox.egress_plan(p, p.classes["c"], "", NOW)
-    assert plan.decide(META, 80).allow  # the list says so
-    assert not plan.address_ok(META, ipaddress.ip_address(META), 80)  # the dial does not
+    assert plan.dropped == (META,) and not plan.decide(META, 80).allow  # the entry is refused
+    assert not plan.address_ok(META, ipaddress.ip_address(META), 80)  # and the dial would refuse it too
 
 
-def test_a_private_address_is_reached_only_when_it_is_written_out_in_the_list():
+def test_a_private_address_is_never_an_entry_and_a_name_that_resolves_to_one_is_refused():
     p = policy.loads(
         '[classes.c]\naccess = "walled"\nrepos = ["/srv/c/**"]\nallowed_hosts = ["' + TEN + '", "*.lan.example.com"]\n'
     )
     plan = sandbox.egress_plan(p, p.classes["c"], "", NOW)
     ten = ipaddress.ip_address(TEN)
-    assert plan.address_ok(TEN, ten, 443)
+    assert plan.dropped == (TEN,) and not plan.decide(TEN, 443).allow
+    assert plan.address_ok(TEN, ten, 443)  # defence in depth: the dial would take the literal itself, never a name
     assert not plan.address_ok("a.lan.example.com", ten, 443)  # a wildcard name that resolves inside the network
 
 
@@ -304,6 +358,7 @@ class Echo:
     def __init__(self):
         self.srv = socket.create_server(("127.0.0.1", 0))
         self.port = self.srv.getsockname()[1]
+        self.heads: list[bytes] = []
         threading.Thread(target=self._loop, daemon=True).start()
 
     def _loop(self):
@@ -317,6 +372,7 @@ class Echo:
     def _one(self, c):
         with c:
             data = c.recv(4096)
+            self.heads.append(data)
             if data.startswith(b"GET "):
                 c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nmodel")
             elif data:
@@ -349,6 +405,20 @@ def started(plan, **kw):
     return proxy
 
 
+POLICY_LOCAL = """
+[classes.c]
+access = "walled"
+repos = ["/srv/c/**"]
+[[egress_exceptions]]
+name = "model"
+classes = ["c"]
+hosts = ["localhost:{port}"]
+reason = "r"
+owner = "o"
+expires = 2099-01-01
+"""
+
+
 def local_plan(port, *extra, local_only=False):
     toml = (
         f'[classes.c]\naccess = "walled"\nrepos = ["/srv/c/**"]\nlocal_only = {str(local_only).lower()}\n'
@@ -374,6 +444,68 @@ def test_the_proxy_carries_a_plain_http_request_to_a_local_model_port(echo):
         req = f"GET http://localhost:{echo.port}/v1/models HTTP/1.1\r\nHost: localhost\r\nProxy-Connection: keep-alive\r\n\r\n"
         out = talk(proxy, req.encode())
         assert out.startswith(b"HTTP/1.1 200 OK") and out.endswith(b"model")
+    finally:
+        proxy.stop()
+
+
+def test_the_proxy_names_the_checked_host_to_the_server_not_the_one_the_client_wrote(echo):
+    proxy = started(local_plan(echo.port))
+    try:
+        req = (
+            f"GET http://localhost:{echo.port}/x HTTP/1.1\r\nHost: evil.example.com\r\nhost: other.example.net\r\n\r\n"
+        )
+        assert talk(proxy, req.encode()).startswith(b"HTTP/1.1 200")
+        head = echo.heads[-1].decode().lower()
+        assert (
+            f"host: localhost:{echo.port}" in head
+            and "evil.example.com" not in head
+            and "other.example.net" not in head
+        )
+        assert head.count("\r\nhost:") == 1 and "connection: close" in head and head.startswith("get /x http/1.1")
+    finally:
+        proxy.stop()
+
+
+def test_a_connect_to_a_nul_smuggled_name_is_a_bad_request_not_a_wildcard_match(echo):
+    p = policy.loads('[classes.c]\naccess = "walled"\nrepos = ["/srv/c/**"]\nallowed_hosts = ["*.example.org"]\n')
+    seen = []
+    proxy = started(sandbox.egress_plan(p, p.classes["c"], "", NOW), resolver=lambda *a, **k: seen.append(a) or [])
+    try:
+        assert talk(proxy, b"CONNECT 8.8.8.8\x00.example.org:443 HTTP/1.1\r\n\r\n").startswith(b"HTTP/1.1 400")
+        assert talk(proxy, b"GET http://8.8.8.8\x00.example.org/ HTTP/1.1\r\n\r\n").startswith(b"HTTP/1.1 400")
+        assert seen == []  # nothing was resolved
+    finally:
+        proxy.stop()
+
+
+def test_the_proxy_asks_for_the_password_and_takes_only_the_right_one(echo):
+    password = "pw-" + secrets.token_hex(8)  # built at run time
+    proxy = started(local_plan(echo.port), secret=password)
+    connect = f"CONNECT localhost:{echo.port} HTTP/1.1\r\n"
+    try:
+        none = talk(proxy, (connect + "\r\n").encode())
+        assert none.startswith(b"HTTP/1.1 407") and b"Proxy-Authenticate: Basic" in none
+        wrong = base64.b64encode(b"ws:not-it").decode()
+        assert talk(proxy, f"{connect}Proxy-Authorization: Basic {wrong}\r\n\r\n".encode()).startswith(b"HTTP/1.1 407")
+        assert talk(proxy, f"{connect}Proxy-Authorization: Basic !!!\r\n\r\n".encode()).startswith(b"HTTP/1.1 407")
+        right = base64.b64encode(b"ws:" + password.encode()).decode()
+        ok = talk(proxy, f"{connect}Proxy-Authorization: Basic {right}\r\n\r\nhi".encode())
+        assert ok.startswith(b"HTTP/1.1 200") and ok.endswith(b"pong:hi")
+        assert proxy.denials == []  # a missing password is not the allowlist refusing a host
+    finally:
+        proxy.stop()
+
+
+def test_the_proxy_judges_an_exception_at_each_request(echo):
+    clock = [datetime(2098, 12, 31, tzinfo=UTC)]
+    p = policy.loads(POLICY_LOCAL.format(port=echo.port))
+    plan = sandbox.egress_plan(p, p.classes["c"], "", NOW)
+    proxy = started(plan, clock=lambda: clock[0])
+    try:
+        assert talk(proxy, f"CONNECT localhost:{echo.port} HTTP/1.1\r\n\r\n".encode()).startswith(b"HTTP/1.1 200")
+        clock[0] = datetime(2099, 1, 1, tzinfo=UTC)
+        out = talk(proxy, f"CONNECT localhost:{echo.port} HTTP/1.1\r\n\r\n".encode())
+        assert out.startswith(b"HTTP/1.1 403") and b"expired" in out
     finally:
         proxy.stop()
 
@@ -454,6 +586,9 @@ def test_the_proxy_variables_send_everything_but_loopback_through_it():
     env = sandbox.proxy_env(4321)
     for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
         assert env[k] == "http://127.0.0.1:4321"
+    with_secret = sandbox.proxy_env(4321, "pw")
+    assert with_secret["HTTPS_PROXY"] == "http://ws:pw@127.0.0.1:4321"
+    assert sandbox.new_secret() != sandbox.new_secret() and len(sandbox.new_secret()) >= 24
     assert env["NO_PROXY"] == env["no_proxy"] == "localhost,127.0.0.1,::1"
 
 
@@ -603,10 +738,59 @@ def test_for_project_writes_the_hosts_as_allowed_domains_and_an_empty_list_reach
     assert kept["sandbox"]["network"]["allowedDomains"] == ["old.example.com"]  # no plan: the shared list stands
 
 
-def test_for_project_with_the_sandbox_off_adds_nothing(tmp_path):
+def test_for_project_with_a_list_and_no_sandbox_block_is_refused_not_ignored(tmp_path):
+    # this used to return the settings unchanged: the class's list went nowhere and the network stayed open
+    with pytest.raises(ValueError, match="no sandbox block"):
+        claude_code.for_project("{}", str(tmp_path), ["a.example.com"])
+    with pytest.raises(ValueError, match="no sandbox block"):
+        claude_code.with_hosts("{}", [])
     import json
 
-    assert "sandbox" not in json.loads(claude_code.for_project("{}", str(tmp_path), ["a.example.com"]))
+    assert json.loads(claude_code.for_project("{}", str(tmp_path))) == {}  # no list asked for: as it was
+
+
+def test_the_launch_copy_refuses_a_host_outside_its_list_instead_of_asking(tmp_path):
+    import json
+
+    got = json.loads(claude_code.with_hosts('{"sandbox": {"enabled": true}}', ["a.example.com"]))
+    assert got["sandbox"]["network"] == {"allowedDomains": ["a.example.com"], "strictAllowlist": True}
+
+
+@pytest.mark.parametrize(
+    ("net", "named"),
+    [
+        ({"allowedDomains": ["evil.example.com"]}, "network.allowedDomains"),
+        ({"allowUnixSockets": ["/var/run/x.sock"]}, "network.allowUnixSockets"),
+        ({"httpProxyPort": 8080}, "network.httpProxyPort"),
+        ({"socksProxyPort": 1080}, "network.socksProxyPort"),
+        ({"allowLocalBinding": True}, "network.allowLocalBinding = true"),
+        ({"allowAllUnixSockets": True}, "network.allowAllUnixSockets = true"),
+    ],
+)
+def test_a_project_settings_file_that_adds_network_is_a_widening_the_hook_denies(box, monkeypatch, net, named):
+    import json
+
+    monkeypatch.delenv("WS_SANDBOXED", raising=False)
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+    proj = box / "proj"
+    (proj / ".claude").mkdir(parents=True)
+    (proj / ".claude" / "settings.json").write_text(json.dumps({"sandbox": {"network": net}}), encoding="utf-8")
+    why = claude_code.preflight({"cwd": str(proj)})
+    assert why and named in why and "open the sandbox" in why
+
+
+def test_a_project_settings_file_with_a_quiet_network_block_is_not_a_widening(box, monkeypatch):
+    import json
+
+    monkeypatch.delenv("WS_SANDBOXED", raising=False)
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+    proj = box / "proj"
+    (proj / ".claude").mkdir(parents=True)
+    quiet = {
+        "sandbox": {"network": {"allowedDomains": [], "allowLocalBinding": False, "deniedDomains": ["x.example.com"]}}
+    }
+    (proj / ".claude" / "settings.json").write_text(json.dumps(quiet), encoding="utf-8")
+    assert claude_code.preflight({"cwd": str(proj)}) is None
 
 
 def test_the_headless_runner_waits_for_its_mcp_tools():
@@ -674,6 +858,12 @@ def test_ws015_warns_of_an_exception_ending_within_a_week_and_of_unreadable_entr
     (only,) = checks(box, text)
     assert only.status == "warn" and "ends within 7 days" in only.detail
     assert "1 host entry the proxies can't read" in only.detail and "intranet" not in only.detail  # counts, no names
+
+
+def test_ws015_warns_when_the_sandbox_is_off_for_a_class(box):
+    text = '[gate]\nsandbox = false\n[classes.c]\naccess = "walled"\nrepos = ["/srv/c/**"]\n'
+    (only,) = checks(box, text)
+    assert only.status == "warn" and "[gate] sandbox is off" in only.detail and "refused" in only.detail
 
 
 def test_ws015_says_nothing_when_the_policy_does_not_load(box):

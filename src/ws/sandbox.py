@@ -141,16 +141,19 @@ Decisions, and why:
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import errno
 import glob
 import hashlib
+import hmac
 import ipaddress
 import json
 import os
 import platform
 import posixpath
 import re
+import secrets as pysecrets
 import shlex
 import shutil
 import signal
@@ -181,12 +184,6 @@ NO_SANDBOX_NOTE = (
     "see (`python3 -c`, a path built by a command, a script it writes then runs, git restoring a protected file, a "
     "daemon reached over a Unix socket such as tmux) can write ws's own files, including the policy, and read the "
     "denied folders."
-)
-
-
-NO_EGRESS_NOTE = (
-    "ws: --no-sandbox: and no network allowlist either: the class's allowed_hosts are not applied, since they are "
-    "enforced by the wall's proxy."
 )
 
 
@@ -1525,6 +1522,34 @@ def _is_loopback(host: str) -> bool:
     return host in LOOPBACK_NAMES or (ip is not None and ip.is_loopback)
 
 
+_DEST = re.compile(r"[a-z0-9.-]+")
+_SECOND_LEVEL = (
+    "ac",
+    "co",
+    "com",
+    "edu",
+    "go",
+    "gov",
+    "ne",
+    "net",
+    "or",
+    "org",
+)  # registry labels under a country code
+
+
+def valid_destination(host: str) -> bool:
+    """May `host` be looked at as a destination at all? Letters, digits, dots and hyphens, or an IPv6 address (brackets
+    allowed). Anything else (a NUL, a space, `%`, `@`, `/`) is refused before it is matched or resolved, since a resolver
+    may read such a name differently from a matcher: `8.8.8.8\\x00.example.org` is a match for `*.example.org` to one and
+    an address to the other."""
+    h = host.lower().rstrip(".")
+    if h.startswith("[") and h.endswith("]"):
+        h = h[1:-1]
+    if _DEST.fullmatch(h):
+        return True
+    return ":" in h and re.fullmatch(r"[0-9a-f:.]+", h) is not None and _ip(h) is not None
+
+
 def legacy_literal(host: str) -> bool:
     """True for a host written as digits and dots (or hex) that is not a plain dotted address: `127.1`, `2130706433`,
     `0x7f.1`, `0177.0.0.1`. A resolver may read these as an address while a string match sees a name; they are refused."""
@@ -1541,10 +1566,19 @@ def entry_problem(entry: str) -> str | None:
     except policy.PolicyError as e:
         return str(e).removeprefix("entry: ")
     host, port = split_entry(entry)
+    if not valid_destination(host.removeprefix("*.")):
+        return f"{entry!r} has characters a host name does not"
     if legacy_literal(host.removeprefix("*.")):
         return f"{entry!r} is an address in a form resolvers read differently; write it as four decimal numbers"
     if _is_loopback(host):
         return None if port is not None else f"{entry!r} is loopback: name the port of the model server"
+    if (ip := _ip(host)) is not None:
+        kind = blocked_address(ip)
+        if kind is not None:
+            return f"{entry!r} is a {kind} address; a session does not reach those, listed or not"
+    base = host.removeprefix("*.").split(".")
+    if host.startswith("*.") and len(base) == 2 and len(base[1]) == 2 and base[0] in _SECOND_LEVEL:
+        return f"{entry!r} is a wildcard over a whole registry (like *.co.uk); name the domain under it"
     if _ip(host) is None and "." not in host:
         return f"{entry!r} has no dot; the proxies read only fully qualified names (and localhost)"
     return None
@@ -1601,13 +1635,13 @@ class EgressPlan:
     cls: str
     provider: str
     hosts: tuple[str, ...] = ()
-    granted: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    granted: tuple[tuple[str, tuple[str, ...], datetime | None], ...] = ()
     lapsed: tuple[tuple[str, tuple[str, ...]], ...] = ()
     dropped: tuple[str, ...] = ()
 
     def domains(self) -> list[str]:
         """The list for `sandbox.network.allowedDomains`: every entry in force, once."""
-        return list(dict.fromkeys([*self.hosts, *(h for _, hs in self.granted for h in hs)]))
+        return list(dict.fromkeys([*self.hosts, *(h for _, hs, _ in self.granted for h in hs)]))
 
     def local_ports(self) -> tuple[int, ...]:
         """The loopback ports of the list: where a model on this machine listens."""
@@ -1618,16 +1652,23 @@ class EgressPlan:
                 found.append(port)
         return tuple(dict.fromkeys(found))
 
-    def decide(self, host: str, port: int) -> Decision:
-        h = host.strip().lower().rstrip(".")
-        if not h or isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+    def decide(self, host: str, port: int, now: datetime | None = None) -> Decision:
+        """Is a request to `host:port` allowed? An exception is judged at `now` (default: the clock), so one that ends
+        during a session stops covering from that moment."""
+        h = host.lower().rstrip(".")
+        if not isinstance(host, str) or not h or isinstance(port, bool) or not isinstance(port, int):
+            return Decision(False, "not a destination")
+        if not 1 <= port <= 65535 or not valid_destination(h):
             return Decision(False, "not a destination")
         if legacy_literal(h):
             return Decision(False, "an address written in a form resolvers read differently")
         if any(host_matches(h, port, e) for e in self.hosts):
             return Decision(True, "allowed by the class", "class")
-        for name, hs in self.granted:
+        now = datetime.now(UTC) if now is None else now
+        for name, hs, ends in self.granted:
             if any(host_matches(h, port, e) for e in hs):
+                if ends is not None and now >= ends:
+                    return Decision(False, f"exception {name!r} has expired", f"exception:{name}")
                 return Decision(True, f"allowed by exception {name!r}", f"exception:{name}")
         for name, hs in self.lapsed:
             if any(host_matches(h, port, e) for e in hs):
@@ -1661,7 +1702,10 @@ def egress_plan(pol: policy.Policy, cls: policy.Class | None, provider: str | No
     granted, lapsed = [], []
     for x in pol.egress_exceptions:
         if cls.name in x.classes:
-            (lapsed if x.expired(now) else granted).append((x.name, x.hosts))
+            if x.expired(now):
+                lapsed.append((x.name, x.hosts))
+            else:
+                granted.append((x.name, x.hosts, x.expires))
 
     def keep(entries) -> tuple[list[str], list[str]]:
         ok, bad = [], []
@@ -1673,10 +1717,10 @@ def egress_plan(pol: policy.Policy, cls: policy.Class | None, provider: str | No
 
     hosts, dropped = keep(wanted)
     kept = []
-    for name, hs in granted:
+    for name, hs, ends in granted:
         ok, bad = keep(hs)
         dropped += bad
-        kept.append((name, tuple(ok)))
+        kept.append((name, tuple(ok), ends))
     return EgressPlan(
         cls.name,
         prov,
@@ -1685,6 +1729,17 @@ def egress_plan(pol: policy.Policy, cls: policy.Class | None, provider: str | No
         tuple((n, tuple(hs)) for n, hs in lapsed),
         tuple(dropped),
     )
+
+
+def job_provider(runner: str, model: str = "", options: dict | None = None) -> str:
+    """The model provider a headless job uses: the runner's own (claude-code is anthropic), else the job's `provider`
+    option, else the part of `provider/model` before the slash, else none (a limited class then refuses it)."""
+    if runner in DEFAULT_PROVIDER:
+        return DEFAULT_PROVIDER[runner]
+    named = (options or {}).get("provider")
+    if isinstance(named, str) and named:
+        return named
+    return model.split("/", 1)[0] if "/" in model else ""
 
 
 def class_domains(cls: policy.Class) -> list[str]:
@@ -1770,8 +1825,9 @@ class EgressProxy:
     changes nothing). Stdlib only. `denials` collects `(via, reason)` for each refusal; `on_deny(host, port, decision)` is
     called too. It is the route and not a fence where the operating system does not confine the runner (see the wall)."""
 
-    def __init__(self, plan: EgressPlan, on_deny=None, resolver=None, timeout: float = 15.0):
-        self.plan, self.on_deny, self.timeout = plan, on_deny, timeout
+    def __init__(self, plan: EgressPlan, on_deny=None, resolver=None, timeout: float = 15.0, secret=None, clock=None):
+        self.plan, self.on_deny, self.timeout, self.secret = plan, on_deny, timeout, secret
+        self.clock = clock or (lambda: datetime.now(UTC))
         self.resolver = resolver or socket.getaddrinfo
         self.denials: list[tuple[str, str]] = []
         self._srv: socket.socket | None = None
@@ -1845,10 +1901,30 @@ class EgressProxy:
         if u.scheme != "http" or not u.hostname:
             raise ValueError(target)
         path = (u.path or "/") + (f"?{u.query}" if u.query else "")
-        drop = ("proxy-connection", "connection", "proxy-authorization")
+        if not valid_destination(u.hostname):
+            raise ValueError(target)
+        port = u.port or 80
+        drop = ("proxy-connection", "connection", "proxy-authorization", "host")
         kept = [x for x in lines[1:] if x.split(":", 1)[0].lower() not in drop]
-        head = "\r\n".join([f"{method} {path} {version}", *kept, "Connection: close"]) + "\r\n\r\n"
-        return u.hostname, u.port or 80, head.encode("latin-1")
+        shown = f"[{u.hostname}]" if ":" in u.hostname else u.hostname
+        target_host = shown if port == 80 else f"{shown}:{port}"  # the Host the server sees is the one that was checked
+        head = "\r\n".join([f"{method} {path} {version}", f"Host: {target_host}", *kept, "Connection: close"])
+        return u.hostname, port, (head + "\r\n\r\n").encode("latin-1")
+
+    def _authorized(self, lines: list[str]) -> bool:
+        """True when no secret is set, or the request carries it as the password of Basic proxy credentials."""
+        if not self.secret:
+            return True
+        for x in lines[1:]:
+            name, _, value = x.partition(":")
+            if name.strip().lower() == "proxy-authorization":
+                scheme, _, token = value.strip().partition(" ")
+                try:
+                    given = base64.b64decode(token.strip(), validate=True).decode("utf-8").partition(":")[2]
+                except ValueError:
+                    return False
+                return scheme.lower() == "basic" and hmac.compare_digest(given.encode(), str(self.secret).encode())
+        return False
 
     def _serve(self, conn: socket.socket) -> None:
         up: socket.socket | str | None = None
@@ -1861,12 +1937,17 @@ class EgressProxy:
                     return
                 data += chunk
             top, _, rest = data.partition(b"\r\n\r\n")
+            lines = top.decode("latin-1").split("\r\n")
+            if not self._authorized(lines):
+                head = 'HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="ws"\r\n'
+                conn.sendall((head + "Content-Length: 0\r\nConnection: close\r\n\r\n").encode())
+                return
             try:
-                host, port, outgoing = self._request(top.decode("latin-1").split("\r\n"))
+                host, port, outgoing = self._request(lines)
             except ValueError:
                 self._deny(conn, "", 0, Decision(False, "not a proxy request"), "400 Bad Request")
                 return
-            d = self.plan.decide(host, port)
+            d = self.plan.decide(host, port, self.clock())
             if not d.allow:
                 self._deny(conn, host, port, d)
                 return
@@ -1908,19 +1989,28 @@ def _pipe(src: socket.socket, dst: socket.socket) -> None:
 def _split_hostport(target: str, default: int) -> tuple[str, int]:
     """`host:port`, `[v6]:port` or `host` as (host, port); ValueError for anything else."""
     if target.startswith("["):
-        host, _, port = target[1:].partition("]")
+        host, closed, port = target[1:].partition("]")
+        if not closed:
+            raise ValueError(target)
         port = port.removeprefix(":")
     else:
         host, _, port = target.partition(":")
-    if not host or (port and not port.isdigit()):
+    if not host or (port and not (port.isascii() and port.isdigit())) or not valid_destination(host):
         raise ValueError(target)
     return host, int(port) if port else default
 
 
-def proxy_env(port: int) -> dict:
-    """The variables that send a runner's traffic through the proxy. Loopback stays off it, so a model on this machine is
-    reached directly (the macOS wall allows exactly those ports: `Plan.net`). Both spellings, since tools differ."""
-    url = f"http://127.0.0.1:{port}"
+def new_secret() -> str:
+    """A fresh password for one proxy: another session's proxy, or a program that just finds the port, can not use it."""
+    return pysecrets.token_urlsafe(24)
+
+
+def proxy_env(port: int, secret: str | None = None) -> dict:
+    """The variables that send a runner's traffic through the proxy, with `secret` as the password of its credentials.
+    Loopback stays off the proxy, so a model on this machine is reached directly (the macOS wall allows exactly those
+    ports: `Plan.net`): that also means a loopback port the session can reach is not filtered. Both spellings, since
+    tools differ."""
+    url = f"http://ws:{secret}@127.0.0.1:{port}" if secret else f"http://127.0.0.1:{port}"
     env = {k: url for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")}
     env.update(NO_PROXY="localhost,127.0.0.1,::1", no_proxy="localhost,127.0.0.1,::1", NODE_USE_ENV_PROXY="1")
     return env
@@ -2039,10 +2129,13 @@ def launch_claude(
     target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     if target.is_symlink():
         target.unlink()
-    target.write_text(
-        claude_code.for_project(base.read_text(encoding="utf-8"), project, plan.domains() if plan else None),
-        encoding="utf-8",
-    )
+    try:
+        text = claude_code.for_project(base.read_text(encoding="utf-8"), project, plan.domains() if plan else None)
+    except ValueError as e:  # a class's list has nowhere to go: the generated settings have no sandbox block
+        raise WsError(
+            "refused", f"refusing to start claude-code: {e}", "set `[gate] sandbox = true`, `ws install`", 3
+        ) from e
+    target.write_text(text, encoding="utf-8")
     cmd = [argv[0], "--settings", str(target), *argv[1:]]
     env = {**claude_code.MCP_WAIT_ENV, **env}  # the first model call sees its MCP tools; a value the person set wins
     before, note = scan_project(project)
@@ -2077,6 +2170,14 @@ def cmd_launch(args: argparse.Namespace) -> int:
     provider = args.provider or DEFAULT_PROVIDER.get(args.runner)
     require_provider(cls, provider)  # G7: a provider outside the class's list is refused, before anything starts
     plan = egress_plan(pol, cls, provider)  # None while the policy has no classes: the network is as it was
+    if plan is not None and (args.no_sandbox or (args.runner == "claude-code" and not pol.gate.sandbox)):
+        raise WsError(  # a class's network list is applied by the wall; with none, the session would have no list at all
+            "refused",
+            f"refusing to start: this folder is in class {cls.name!r}, whose network list is applied by the sandbox, "
+            "and this session would run without one",
+            "start it without --no-sandbox and with `[gate] sandbox = true` in the policy",
+            3,
+        )
     home = paths.state_dir().absolute()  # whatever --policy says, the gate keeps its approvals and sessions here
     pass_env = check_pass_env(args.pass_env)
     if pass_env:
@@ -2086,8 +2187,6 @@ def cmd_launch(args: argparse.Namespace) -> int:
         return launch_claude(args, argv, home, env, pol, plan)
     if args.no_sandbox:
         print(NO_SANDBOX_NOTE.format(runner=args.runner), file=sys.stderr)
-        if plan is not None:
-            print(NO_EGRESS_NOTE, file=sys.stderr)
         try:
             os.execvpe(argv[0], argv, env)
         except OSError as e:
@@ -2109,8 +2208,9 @@ def cmd_launch(args: argparse.Namespace) -> int:
         extra: dict = {}
         net = None
         if plan is not None:  # the runner reaches the network through ws's proxy, and the macOS wall shuts the rest
-            proxy = EgressProxy(plan)
-            extra = {**proxy_env(proxy.start()), "PATH": f"{write_deny_shims(tmp)}:{env.get('PATH', '')}"}
+            secret = new_secret()
+            proxy = EgressProxy(plan, secret=secret)
+            extra = {**proxy_env(proxy.start(), secret), "PATH": f"{write_deny_shims(tmp)}:{env.get('PATH', '')}"}
             net = (proxy.port, *plan.local_ports())
         wrapped = wrap(
             argv,

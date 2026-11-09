@@ -823,7 +823,7 @@ def test_the_hook_denies_a_folder_whose_project_settings_open_the_sandbox(tmp_pa
 def test_harmless_project_settings_and_the_users_own_settings_are_fine(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setenv("WS_SANDBOXED", "1")  # the hook checks projects only for a session with the sandbox block
-    d = project(tmp_path, "settings.json", {"sandbox": {"network": {"deniedDomains": ["a.b"]}}, "model": "x"})
+    d = project(tmp_path, "settings.json", {"sandbox": {"network": {"allowedDomains": ["a.b"]}}, "model": "x"})
     assert claude_code.preflight({"cwd": str(d)}) is None
     assert claude_code.preflight({"cwd": str(tmp_path / "nowhere")}) is None
     assert claude_code.preflight({}) is None and claude_code.preflight({"cwd": "relative"}) is None

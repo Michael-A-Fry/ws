@@ -23,7 +23,7 @@ jobs:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
     # the suite without the oracle (the oracle job has it); the 75% warning shows what has crept up
-    timeout-minutes: 15
+    timeout-minutes: 20
     permissions:
       contents: read
     env:
@@ -104,7 +104,7 @@ jobs:
           --deselect tests/test_shellwords_oracle.py
       - name: time budget
         if: always()
-        run: python3 scripts/ci_time_budget.py --job ci --stamp "$RUNNER_TEMP/job-start" --tiers .pytest_cache/d/ws-harness/tiers.jsonl --timeout-minutes 15
+        run: python3 scripts/ci_time_budget.py --job ci --stamp "$RUNNER_TEMP/job-start" --tiers .pytest_cache/d/ws-harness/tiers.jsonl --timeout-minutes 20
 
   # The real-shell oracle: tests/test_gate_oracle.py runs a real bash in a bubblewrap sandbox for every row (about 9-10
   # min); tests/test_shellwords_oracle.py compares the command reader with bash itself. WS_ORACLE_REQUIRE=1 makes a

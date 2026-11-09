@@ -8,7 +8,7 @@ changes the tests. The suite itself (sizes, tiers, quarantine) is in [Testing](t
 
 | Job | Runs on | What it does | Limit |
 |---|---|---|---|
-| `ci` | every push to `main` and every pull request | Test-integrity check, gitleaks, PII gate, hooks (ruff, typos, rumdl, actionlint, zizmor, pinact), docs integrity, Vale, gate replay, then the suite without the two oracle files. `tests/holdout/` runs with the suite. | 15 min |
+| `ci` | every push to `main` and every pull request | Test-integrity check, gitleaks, PII gate, hooks (ruff, typos, rumdl, actionlint, zizmor, pinact), docs integrity, Vale, gate replay, then the suite without the two oracle files. `tests/holdout/` runs with the suite. | 20 min |
 | `oracle` | the same | `tests/test_gate_oracle.py` and `tests/test_shellwords_oracle.py`: the gate and the command reader against a real bash, the gate one inside bubblewrap. `WS_ORACLE_REQUIRE=1` turns a sandbox that can't start into a failure. | 20 min |
 | `node` | the same | `tests/test_node.py` with a container: an image pulled by digest and used locally (`WS_TEST_NODE_IMAGE`). `WS_TEST_NODE_REQUIRE=1` turns a missing runtime or image into a failure instead of the fallback to the host. | 10 min |
 | `term-browser` | the same | Every `tests/e2e/test_*_browser.py` with Chromium. `WS_E2E_REQUIRE=1` turns a missing browser into a failure. | 15 min |

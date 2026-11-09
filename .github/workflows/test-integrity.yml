@@ -1,0 +1,35 @@
+# T1, the test-integrity check, from the base branch. `pull_request_target` reads this file from the base, and the job
+# checks out the base, so neither this workflow nor the script nor anything it imports comes from the pull request. The
+# pull request's commits are fetched as data and only read through git. Never add a step that runs, installs or imports
+# anything from them: this trigger runs for a fork's pull request too. docs/reference/ci.md explains the check.
+name: test-integrity
+on:
+  pull_request_target: # zizmor: ignore[dangerous-triggers] the job runs only base code; see the top of this file
+    # `edited`: the check reads the body, so adding the `test-change:` line it asks for has to run it again
+    types: [opened, synchronize, reopened, edited]
+permissions: {}
+concurrency:
+  group: test-integrity-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  test-integrity:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }} # the base branch now: `base.sha` is stale in an `edited` event
+          fetch-depth: 0
+          persist-credentials: false
+      - name: fetch the pull request's commits, as data
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: git fetch --no-tags origin "refs/pull/$PR_NUMBER/head"
+      - name: test integrity (weakened tests, machinery edits, holdout edits)
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 -I -S scripts/test_integrity.py --base "$BASE_SHA" --head "$HEAD_SHA"

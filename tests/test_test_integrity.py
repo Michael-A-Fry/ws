@@ -184,6 +184,8 @@ def test_the_code_that_defines_a_weakened_test_and_every_conftest_are_machinery(
         "src/ws/guards/other.py": "F = 1\n",
         "conftest.py": "G = 1\n",
         "pytest.ini": "H = 1\n",
+        "pytest.toml": "L = 1\n",
+        "tests/gate_corpus/rows.jsonl": "M = 1\n",
         "src/ws/__init__.py": "I = 1\n",
         "src/ws/guards/__init__.py": "J = 1\n",
         "src/ws/approvals.py": "K = 1\n",
@@ -334,3 +336,22 @@ def test_the_check_imports_the_guards_detection_and_does_not_copy_it():
     text = SCRIPT.read_text(encoding="utf-8")
     for pattern in ("_SKIP = ", "_ASSERT = ", "def compare("):
         assert pattern not in text
+
+
+def test_a_deleted_test_file_with_nothing_to_count_is_still_a_hit(repo):
+    base = repo.commit({"tests/test_a.py": "VALUE = 1\n"})
+    repo.commit({"tests/test_a.py": None})
+    assert [h.path for h in repo.hits(base)] == ["tests/test_a.py"]
+
+
+def test_a_file_name_cannot_write_its_own_log_line():
+    hit = ti.Hit("tests/holdout/a\n::notice::passed", "an edit", ti.HOLDOUT_CHANGE)
+    assert "\n" not in str(hit)
+
+
+def test_a_test_file_that_cannot_be_read_is_a_typed_failure(repo):
+    head = repo.commit({"tests/test_a.py": TWO_ASSERTS})
+    with pytest.raises(ti.IntegrityError) as err:
+        ti.blob(repo.path, head, "tests/not_there.py")
+    assert err.value.kind == "git"
+    assert ti.blob(repo.path, head, "tests/not_there.py", must=False) == ""

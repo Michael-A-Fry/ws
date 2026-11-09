@@ -377,15 +377,16 @@ def _base_record(job: jobs.Job, run_id: str, started: datetime, pol: policy.Poli
     )
 
 
-def _egress(pol: policy.Policy, job: jobs.Job, cwd: Path | None):
-    """(plan, refusal) for the data class a run works in: its folder's class (a job with no `cwd` is in no class, so the
-    strictest), G7 (the model provider the class allows) and the network list the run gets. The plan is None when the
-    policy has no classes: the network is as it was. A refusal is words that name the class only."""
+def _egress(pol: policy.Policy, job: jobs.Job):
+    """(plan, refusal) for the data class a run works in: the class of the job's own `cwd` (a job with none runs in a
+    fresh default folder that is in no class, so it gets the strictest), G7 (the model provider the class allows) and
+    the network list the run gets. The plan is None when the policy has no classes: the network is as it was. A refusal
+    is words that name the class only."""
     from ws import sandbox  # late: only a policy with classes needs it
 
     cls = None
     if pol.classes:
-        cls = policy.class_of(pol, os.path.realpath(cwd)) if cwd else policy.UNCLASSIFIED
+        cls = policy.class_of(pol, os.path.realpath(Path(job.cwd).expanduser())) if job.cwd else policy.UNCLASSIFIED
     provider = sandbox.job_provider(job.runner, job.model, job.runner_options)
     why = sandbox.provider_problem(cls, provider)
     if why:
@@ -586,7 +587,7 @@ def _run(
 
     verdict = policy.rule_of_two(pol, list(job.sources), job.name, shell=getattr(adapter, "HAS_SHELL", True))
     static = _refusal(prof, verdict, job, adapter)
-    egress, why_not = _egress(pol, job, cwd)
+    egress, why_not = _egress(pol, job)
     if static is None and why_not:
         static = ("egress", why_not)
     req = queue.request_for(

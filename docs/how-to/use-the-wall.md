@@ -72,8 +72,12 @@ real work.
 
 With a `[classes]` table in the policy, a session starts with the network shut. It can reach the hosts in its class's
 `allowed_hosts`, the host of the model provider it was started with, and the hosts of any `[[egress_exceptions]]` that
-name the class and haven't ended. Nothing else. A policy with no classes is as it was: Claude Code asks about a host it
-doesn't know, and OpenCode's network is open.
+name the class and haven't ended. A policy with no classes is as it was: Claude Code asks about a host it doesn't know,
+and OpenCode's network is open.
+
+The list covers what a shell command or another program starts, through the sandbox or the proxy. It does not cover the
+runner's own `WebFetch` tool, which runs inside the runner and not in the sandbox. That is a stated limit: if a class
+must not fetch pages, put `web_fetch` in `deny_tools` in the policy.
 
 ```toml
 [classes.work]
@@ -105,12 +109,12 @@ expires = 2026-12-31
   exception that ends mid-session stops at that moment. Claude Code's list is written once when the session starts, so
   there an exception that ends mid-session still holds until the next start.
 - **Providers.** `ws gate launch --provider NAME` says which model provider the session uses (Claude Code means
-  `anthropic` unless you say otherwise). `ws run` takes it from the runner, the job's `provider` option or the part of
-  the model name before the slash. A provider outside the class's `allowed_providers` is refused before anything
-  starts, and the refusal names the class only. A walled or counts-only class that doesn't say gets a model on this
-  machine (`local`, `ollama`, `lmstudio`, `vllm`, `llamacpp`) and nothing else; a `full` class gets any. A folder in no
-  class (and a job with no `cwd`) is held to the strictest. `local_only = true` keeps loopback entries and drops the
-  rest.
+  `anthropic` unless you say otherwise). `ws run` takes it from the runner (Claude Code is `anthropic`), else, for an
+  OpenCode job, its `provider` option or the part of the model name before the slash. A provider outside the class's
+  `allowed_providers` is refused before anything starts, and the refusal names the class only. A walled or counts-only
+  class that doesn't say gets a model on this machine (`local`, `ollama`, `lmstudio`, `vllm`, `llamacpp`) and nothing
+  else; a `full` class gets any. A folder in no class (and a job with no `cwd`) is held to the strictest. `local_only =
+  true` keeps loopback entries and drops the rest.
 - **No sandbox, no list.** A session of a class is refused (exit 3) with `--no-sandbox`, or with `[gate] sandbox =
   false` on Claude Code, since the list has nowhere to be applied. WS015 warns of the second.
 
@@ -119,12 +123,12 @@ What enforces it:
 - **Claude Code.** The class's list is written as `sandbox.network.allowedDomains` in the settings copy `ws gate launch`
   makes for the project (and the run's settings in `ws run`), with `strictAllowlist` on so a host outside it is refused
   and not asked about (Claude Code 2.1.219 or later; an older one asks). An empty list reaches no host. This copy
-  can't stop a project's own settings file from adding hosts, so the preflight hook refuses every call from a folder
-  whose `.claude/settings.json` or `settings.local.json` sets `network.allowedDomains`, a proxy port, a Unix socket
-  or local binding. The managed-settings file for a class user (`ws install --class NAME`) is the stronger form: it
-  holds the class's hosts with `allowManagedDomainsOnly`, so no other file can add one. It is placed by hand, so it
-  carries the class's hosts and its providers' but not the exceptions, which end; run `ws install --class NAME` again
-  after you change the list.
+  can't stop a project's own settings file from adding hosts, so in a class session the preflight hook refuses every
+  call from a folder whose `.claude/settings.json` or `settings.local.json` sets `network.allowedDomains`, a proxy
+  port, a Unix socket or local binding. A session with no class doesn't apply that rule. The managed-settings file for
+  a class user (`ws install --class NAME`) is the stronger form: it holds the class's hosts with
+  `allowManagedDomainsOnly`, so no other file can add one. It is placed by hand, so it carries the class's hosts and
+  its providers' but not the exceptions, which end; run `ws install --class NAME` again after you change the list.
 - **Other runners (OpenCode), on Linux.** `ws gate launch` starts a small proxy of its own on 127.0.0.1 and sets the
   proxy variables for the runner, with a password made for that launch, so another session's proxy can't be used from
   inside. The proxy refuses a host that isn't listed, a name that resolves to a private, link-local or cloud-metadata
@@ -135,12 +139,16 @@ What enforces it:
   netcat, telnet, scp, sftp, ftp and socat are replaced on `PATH` inside the wall by a script that says so and exits
   126, and the end-of-run report counts how many requests and tool calls were refused; a tool called by its full path
   isn't caught. What closes the gap is a rule in the host's firewall for the class's OS user; ws doesn't write one (it
-  needs root).
+  needs root). The proxy checks the destination of a request, not what travels inside it: a `CONNECT` tunnel carries
+  any `Host` header or name, and so does anything sent through it once it is open. A tunnel that is already open when
+  an exception ends keeps running until it closes; only new requests are refused.
 - **Other runners, on macOS.** The same proxy, and the sandbox profile denies all outbound connections except to the
   proxy and the model ports, so a program that skips the proxy is stopped (a loopback model port stays open to it).
   That profile hasn't been run on a Mac.
-- **`ws run`.** The same list: in the run's settings for Claude Code, through the proxy for other runners. A run that
-  breaks G7 or has the sandbox off is refused and recorded with `refused:egress`.
+- **`ws run`.** The same list: in the run's settings for Claude Code, through the proxy for other runners. For a
+  runner other than Claude Code, `ws run` gives only the proxy: no wall, no `PATH` shims and no macOS fence, so a
+  program that ignores the proxy variables isn't stopped. A run that breaks G7 or has the sandbox off is refused and
+  recorded with `refused:egress`.
 
 `ws doctor` shows one WS015 line per class: `ok` with the number of hosts, or `warn` with the reason (see
 [Doctor checks](../reference/doctor-checks.md)).

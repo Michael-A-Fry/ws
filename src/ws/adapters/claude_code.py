@@ -70,6 +70,8 @@ own file (ws.userconfig): the policy's `[gate] sandbox = false` is the one switc
 WS_SANDBOXED=0; otherwise `env` carries WS_SANDBOXED=1, which tells the hook this session has the sandbox block above.
 No hook command turns a refusal into an allow: the sandbox block is the wall for shell commands, and the gate reads the
 same text whether or not it is up.
+`preflight` also counts a project's `network` keys as a widening, but only when `env` carries WS_EGRESS_CLASS=1, which
+`with_hosts` sets in the settings of a data-class session; with no classes the network is as it was.
 `preflight` runs for every session except one whose settings set WS_SANDBOXED=0, the marker of a settings file written
 without the sandbox block; settings written before the marker existed carry the block and no marker, so `preflight` runs
 for them. The
@@ -140,6 +142,9 @@ _EXTRA_PRE_KINDS = ("agent", "skill", "message")  # the PreToolUse matcher cover
 # seconds a hook may take. More than the thin client's worst case (ws.gateclient.WORST_CASE_S: the wait for the daemon,
 # then the check in its own process), or the runner kills a hook that was about to answer and "block" denies the call.
 HOOK_TIMEOUT = 30
+# Set in the `env` of the settings a class session starts with (`with_hosts`), like WS_SANDBOXED: the --settings file
+# outranks a project's, so a project cannot unset it. The hook has no policy to ask, so this is how `preflight` knows.
+EGRESS_MARKER = "WS_EGRESS_CLASS"
 # seconds the message wake hook may run: Claude Code still enforces `timeout` on an `asyncRewake` hook (600 by default),
 # and the hook waits as long as the session is idle, so it is a day. `ws msg wait --session-hook` gives up on its own
 # at `msg.HOOK_WAIT_MAX_S`, well before this, or the runner kills a waiter that was about to exit cleanly.
@@ -272,7 +277,7 @@ def preflight(payload: dict) -> str | None:
                 return f"{f} is not a plain readable settings file ({e}); blocked to be safe"
             except ValueError:
                 continue
-            key = _widens_sandbox(conf)
+            key = _widens_sandbox(conf, os.environ.get(EGRESS_MARKER) == "1")
             if key:
                 return (
                     f"{f} sets sandbox.{key}, which would open the sandbox ws generated: take it out of the project "
@@ -281,7 +286,9 @@ def preflight(payload: dict) -> str | None:
     return None
 
 
-def _widens_sandbox(conf) -> str | None:
+def _widens_sandbox(conf, class_session: bool = False) -> str | None:
+    """The first setting in a project's `conf` that opens the sandbox, or None. The `network` keys count only in a class
+    session (`class_session`): outside one, the policy's network is as it always was and a project may name its own hosts."""
     sb = conf.get("sandbox") if isinstance(conf, dict) else None
     if not isinstance(sb, dict):
         return None
@@ -299,7 +306,9 @@ def _widens_sandbox(conf) -> str | None:
             if fs.get(k):
                 return f"filesystem.{k}"
     net = sb.get("network")
-    if isinstance(net, dict):  # a host the generated list does not name, a local port, a socket or a proxy of its own
+    if class_session and isinstance(
+        net, dict
+    ):  # a host the generated list does not name, a local port, a socket or a proxy of its own
         for k in ("allowedDomains", "allowUnixSockets", "httpProxyPort", "socksProxyPort"):
             if net.get(k):
                 return f"network.{k}"
@@ -318,6 +327,7 @@ def with_hosts(settings: str, hosts: list[str]) -> str:
     conf = json.loads(settings)
     if "sandbox" not in conf:
         raise ValueError("the generated settings have no sandbox block, so the class's network list can not be applied")
+    conf.setdefault("env", {})[EGRESS_MARKER] = "1"  # tells the hook this is a class session (see preflight)
     net = conf["sandbox"].setdefault("network", {})
     net["allowedDomains"] = list(hosts)
     net["strictAllowlist"] = True

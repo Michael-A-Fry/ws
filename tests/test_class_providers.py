@@ -299,6 +299,15 @@ def test_ws_run_holds_a_job_with_no_cwd_to_the_strictest_when_there_are_classes(
     assert "unclassified" in rec["error"] and rec["stop_reason"] == "refused:egress"
 
 
+def test_a_job_with_no_cwd_is_unclassified_even_when_its_default_folder_sits_in_a_class(ws, tmp_path, monkeypatch):
+    work = run_policy(ws, tmp_path, 'allowed_providers = ["anthropic"]\n')
+    monkeypatch.setenv("XDG_STATE_HOME", str(work / "state"))  # the default run folder is now inside the class's repos
+    ws.job()  # no cwd
+    assert cli.main(["run", "daily"]) == 3
+    (rec,) = ws.records()
+    assert "unclassified" in rec["error"] and rec["stop_reason"] == "refused:egress"
+
+
 def test_ws_run_refuses_a_class_job_when_the_policy_has_the_sandbox_off(ws, tmp_path):
     work = run_policy(ws, tmp_path, 'allowed_providers = ["anthropic"]\n', head="[gate]\nsandbox = false\n")
     ws.job(extra=f'cwd = "{work}"')

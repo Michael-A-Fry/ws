@@ -234,6 +234,25 @@ def test_an_exception_that_ends_during_a_session_stops_covering_at_that_moment(p
     assert plan.decide("api.example.com", 443, edge).allow  # the class's own list is not an exception
 
 
+def test_one_exception_lapsing_does_not_deny_a_host_another_still_covers():
+    toml = '[classes.c]\naccess = "walled"\nrepos = ["/srv/c/**"]\n'
+    for name, day in (("short", 5), ("long", 25)):
+        toml += (
+            f'[[egress_exceptions]]\nname = "{name}"\nclasses = ["c"]\nhosts = ["docs.example.net"]\n'
+            f'reason = "r"\nowner = "o"\nexpires = 2026-12-{day:02d}\n'
+        )
+    p = policy.loads(toml)
+    plan = sandbox.egress_plan(p, p.classes["c"], "", NOW)
+    mid = datetime(2026, 12, 10, tzinfo=UTC)  # "short" has ended, "long" has not
+    assert plan.decide("docs.example.net", 443, mid).allow
+    assert plan.decide("docs.example.net", 443, mid).via == "exception:long"
+    end = datetime(2026, 12, 26, tzinfo=UTC)
+    gone = plan.decide("docs.example.net", 443, end)
+    assert not gone.allow and "expired" in gone.reason
+    later = sandbox.egress_plan(p, p.classes["c"], "", mid)  # built after "short" lapsed: it is in `lapsed`
+    assert later.decide("docs.example.net", 443, mid).allow
+
+
 @pytest.mark.parametrize(
     "host",
     [
@@ -462,6 +481,44 @@ def test_the_proxy_names_the_checked_host_to_the_server_not_the_one_the_client_w
             and "other.example.net" not in head
         )
         assert head.count("\r\nhost:") == 1 and "connection: close" in head and head.startswith("get /x http/1.1")
+    finally:
+        proxy.stop()
+
+
+@pytest.mark.parametrize("header", ["Host : evil.example.com", "Host\t: evil.example.com", " Host: evil.example.com"])
+def test_a_host_header_with_whitespace_around_its_name_is_dropped_too(echo, header):
+    proxy = started(local_plan(echo.port))
+    try:
+        req = f"GET http://localhost:{echo.port}/x HTTP/1.1\r\n{header}\r\n\r\n"
+        assert talk(proxy, req.encode()).startswith(b"HTTP/1.1 200")
+        head = echo.heads[-1].decode().lower()
+        assert "evil.example.com" not in head and head.count("\r\nhost") == 1
+    finally:
+        proxy.stop()
+
+
+@pytest.mark.parametrize("sneaky", ["X-A: 1\nHost: evil.example.com", "X-A: 1\rHost: evil.example.com"])
+def test_a_bare_line_feed_in_a_header_is_a_bad_request(echo, sneaky):
+    proxy = started(local_plan(echo.port))
+    try:
+        req = f"GET http://localhost:{echo.port}/x HTTP/1.1\r\n{sneaky}\r\n\r\n"
+        assert talk(proxy, req.encode()).startswith(b"HTTP/1.1 400")
+        assert echo.heads == []  # nothing went upstream
+    finally:
+        proxy.stop()
+
+
+def test_a_name_the_resolver_can_not_encode_is_a_logged_denial():
+    p = policy.loads('[classes.c]\naccess = "walled"\nrepos = ["/srv/c/**"]\nallowed_hosts = ["*.example.org"]\n')
+
+    def broken(*a, **k):
+        raise UnicodeError("label empty or too long")
+
+    seen = []
+    proxy = started(sandbox.egress_plan(p, p.classes["c"], "", NOW), resolver=broken, on_deny=lambda *a: seen.append(a))
+    try:
+        assert talk(proxy, b"CONNECT a..example.org:443 HTTP/1.1\r\n\r\n").startswith(b"HTTP/1.1 403")
+        assert len(proxy.denials) == 1 and len(seen) == 1
     finally:
         proxy.stop()
 
@@ -772,6 +829,7 @@ def test_a_project_settings_file_that_adds_network_is_a_widening_the_hook_denies
 
     monkeypatch.delenv("WS_SANDBOXED", raising=False)
     monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+    monkeypatch.setenv(claude_code.EGRESS_MARKER, "1")  # a class session: with_hosts puts this in its settings
     proj = box / "proj"
     (proj / ".claude").mkdir(parents=True)
     (proj / ".claude" / "settings.json").write_text(json.dumps({"sandbox": {"network": net}}), encoding="utf-8")
@@ -779,11 +837,32 @@ def test_a_project_settings_file_that_adds_network_is_a_widening_the_hook_denies
     assert why and named in why and "open the sandbox" in why
 
 
+def test_a_project_settings_file_that_adds_network_is_fine_outside_a_class_session(box, monkeypatch):
+    import json
+
+    monkeypatch.delenv("WS_SANDBOXED", raising=False)
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+    monkeypatch.delenv(claude_code.EGRESS_MARKER, raising=False)  # no classes in the policy: nothing sets it
+    proj = box / "proj"
+    (proj / ".claude").mkdir(parents=True)
+    net = {"allowedDomains": ["registry.npmjs.org"], "allowLocalBinding": True, "httpProxyPort": 8080}
+    (proj / ".claude" / "settings.json").write_text(json.dumps({"sandbox": {"network": net}}), encoding="utf-8")
+    assert claude_code.preflight({"cwd": str(proj)}) is None
+
+
+def test_the_class_settings_carry_the_marker_the_hook_reads():
+    import json
+
+    got = json.loads(claude_code.with_hosts('{"sandbox": {"enabled": true}, "env": {"A": "1"}}', []))
+    assert got["env"] == {"A": "1", claude_code.EGRESS_MARKER: "1"}
+
+
 def test_a_project_settings_file_with_a_quiet_network_block_is_not_a_widening(box, monkeypatch):
     import json
 
     monkeypatch.delenv("WS_SANDBOXED", raising=False)
     monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+    monkeypatch.setenv(claude_code.EGRESS_MARKER, "1")
     proj = box / "proj"
     (proj / ".claude").mkdir(parents=True)
     quiet = {

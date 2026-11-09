@@ -1665,14 +1665,18 @@ class EgressPlan:
         if any(host_matches(h, port, e) for e in self.hosts):
             return Decision(True, "allowed by the class", "class")
         now = datetime.now(UTC) if now is None else now
+        ended = None  # an exception that covers the host but has lapsed: it denies only if no other one is in force
         for name, hs, ends in self.granted:
             if any(host_matches(h, port, e) for e in hs):
                 if ends is not None and now >= ends:
-                    return Decision(False, f"exception {name!r} has expired", f"exception:{name}")
+                    ended = ended or name
+                    continue
                 return Decision(True, f"allowed by exception {name!r}", f"exception:{name}")
         for name, hs in self.lapsed:
             if any(host_matches(h, port, e) for e in hs):
-                return Decision(False, f"exception {name!r} has expired", f"exception:{name}")
+                ended = ended or name
+        if ended:
+            return Decision(False, f"exception {ended!r} has expired", f"exception:{ended}")
         return Decision(False, "not in this class's allowlist")
 
     def address_ok(self, host: str, ip, port: int) -> bool:
@@ -1872,7 +1876,7 @@ class EgressProxy:
         """A connection to a checked address of `host`, or the reason there is none."""
         try:
             infos = self.resolver(host.strip("[]"), port, type=socket.SOCK_STREAM)
-        except OSError:
+        except (OSError, UnicodeError):  # a name the resolver can not encode (an empty label) is a refusal, logged
             return "does not resolve"
         why = "no usable address"
         for family, _, _, _, addr in infos:
@@ -1894,6 +1898,8 @@ class EgressProxy:
 
     def _request(self, lines: list[str]) -> tuple[str, int, bytes | None]:
         """(host, port, head to send on) of a request; the head is None for CONNECT. ValueError when it is neither."""
+        if any("\n" in x or "\r" in x for x in lines):  # a bare LF would start a header the checks below never see
+            raise ValueError("bare line feed")
         method, target, version = lines[0].split(" ")
         if method.upper() == "CONNECT":
             return (*_split_hostport(target, 443), None)
@@ -1905,7 +1911,7 @@ class EgressProxy:
             raise ValueError(target)
         port = u.port or 80
         drop = ("proxy-connection", "connection", "proxy-authorization", "host")
-        kept = [x for x in lines[1:] if x.split(":", 1)[0].lower() not in drop]
+        kept = [x for x in lines[1:] if x.split(":", 1)[0].strip().lower() not in drop]
         shown = f"[{u.hostname}]" if ":" in u.hostname else u.hostname
         target_host = shown if port == 80 else f"{shown}:{port}"  # the Host the server sees is the one that was checked
         head = "\r\n".join([f"{method} {path} {version}", f"Host: {target_host}", *kept, "Connection: close"])

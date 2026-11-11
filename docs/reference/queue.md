@@ -32,7 +32,10 @@ Every run, from `ws run`, `ws eval` or the queue, goes through one transaction (
 | `turns` | `max_turns` (default 30) | wait: over `max_open_turns` in flight; refuse if the run alone is over |
 | `time` | `timeout_s` | wait: over `max_open_seconds` in flight |
 | `concurrency`, `lane:NAME` | one slot | wait: `max_concurrent` runs at once, and `ui_slots` in the `ui` lane |
-| `memory` | `resources.ram_gb`, when the job declares it | wait: MemAvailable must stay at or above `reserve_pct` of the total after it |
+| `memory` | `resources.ram_gb`, when the job declares it | wait: MemAvailable, less `memory_reserved_gb`, must stay at or above `reserve_pct` of the total after it |
+| `parent_budget` | the estimate, as well as the counters above | refuse: no room left in what the parent reserved, less what its other children hold or have spent |
+| `parent_not_running` | none | refuse: the job's `parent_run` isn't a run in progress |
+| `parent_is_child` | none | refuse: the job's `parent_run` is itself a child (one level only) |
 | `job_running` | one run of a job at a time | wait |
 | `subscription_*` | none | refuse a job on a login when a fresh capture shows a window used up |
 
@@ -44,6 +47,15 @@ system that can't report memory admits a job that did declare it, and the reserv
 down to 0.0001) and `resized` is true. That sum is passed to Claude Code as `--max-budget-usd`. A job with
 `strict = true` is refused instead. A reservation that's only the default estimate, with room to spare, passes no flag.
 OpenCode has no such flag: the reservation still holds the money, and the settle corrects it from the actuals.
+
+**Children.** A job with `parent_run` (or `ws run JOB --parent RUN_ID`) may reserve only what's left of the reservation
+of a run in progress: the parent's reserved money, less what the parent's other children hold (running) or have spent
+(settled). It also has to fit the monthly cap and its purpose's cap like any other run, so naming a parent never raises
+either. It resizes to the smallest room among them, or is refused with `strict`. Children are one level deep: a parent
+that's itself a child is refused. While parent and child are both live the same dollars are counted twice, once in each
+reservation. That's conservative on purpose: ws sees the parent's own spend only when the parent settles, so its
+reservation can't stand for the month. A run with no cost reported counts at `runrecord.UNKNOWN_RUN_USD` (US$1), as it
+does everywhere. Turns, time, slots and memory stay counted per run.
 
 **Windows.** A month is the UTC calendar month (`policy.budget_month`). The reservation's month comes from the one
 clock reading of the admission, the run record's `started_at` is that reading, and `runrecord.month_spend` counts by
@@ -87,6 +99,19 @@ The class is chosen from the exit code and the typed stop reason, never from mes
 job file or `--deadline`) in the past ends a run as `expired` without running it; a retry that would start after the deadline
 isn't made.
 
+## Telling you a job has stopped
+
+When a job stops for good, ws sends one short line through the notify role (`[roles.notify]`, adapter `ntfy`), for
+example `nightly stopped: refused:profile_cap`. A stop is a `ws run` that ends refused, expired or failed (not one cut
+short by SIGTERM or Ctrl-C), a queued
+message the queue gives up on (refused, a permanent failure, or out of retries), and a `ws queue slot` that's refused or
+times out (`wait_timeout`). A retry, a requeue and a wait aren't stops, so a job that fails twice and then runs says
+nothing. A run from `ws eval` says nothing, and neither does a reservation reaped after a crash.
+
+With no notify role the line isn't sent. A line that can't be sent is dropped: it never changes the job's exit code,
+status or record. It counts as one alert against `alerts_per_day`, so a burst of stops can't flood the topic, and with
+`alert_text = "plain"` it names no job (`a job stopped: timeout`).
+
 ## Slots and fairness
 
 `ws queue slot` asks for the slot until it's granted, and is never refused for being full. A `join`'s run in a lane is
@@ -106,6 +131,7 @@ Defaults are constants in `queue.py`; `[roles.queue]` in the profile overrides t
 | `max_open_seconds` | 86400 | seconds reserved by runs in flight |
 | `default_turns` | 30 | turns reserved for a job with no `max_turns` |
 | `reserve_pct` | 15 | share of total memory that must stay available |
+| `memory_reserved_gb` | 0 | GB promised to VMs, containers or services that haven't taken it yet; taken off MemAvailable before the `reserve_pct` test |
 | `join_headroom_gb` | 2 | memory kept beside a writer's run for a join's |
 | `ramp_s` | 60 | how long a new run's declared memory counts on top of MemAvailable |
 | `busy_s` | 5 | how long to wait for the store's lock before refusing |
@@ -115,7 +141,8 @@ A wrong key or value is an error that names it (exit 2).
 
 ## Job keys
 
-`resources` (`ram_gb`, `slot`), `preemptible`, `grace_s`, `checkpoint`, `deadline`, `purpose`, `budget_usd`, `strict`.
+`resources` (`ram_gb`, `slot`), `preemptible`, `grace_s`, `checkpoint`, `deadline`, `purpose`, `budget_usd`, `strict`,
+`parent_run`.
 They're described in the `ws.jobs` docstring. `purpose` must be a name in `[budget.purposes]` of the policy or the
 job is a bad job (exit 2).
 

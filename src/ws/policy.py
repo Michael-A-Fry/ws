@@ -99,6 +99,11 @@ lines whether or not a sandbox is up:
     the route and not a fence on Linux (a program that ignores the proxy variables, or reaches a loopback port, is not
     stopped by it), and the list is fixed at launch for Claude Code, so an exception that ends mid-session still
     holds there until the next start.
+  * An MCP tool call (`mcp__SERVER__TOOL`) is judged by the gate on Claude Code: `deny_tools` takes MCP names and globs;
+    a tool `allow_mcp` does not name is asked for (a person approves it, as for `ask_commands`); and the path-like
+    arguments of the call go through `deny_read` and, for a tool whose name says it writes, the protected-write check.
+    OpenCode's hook payload does not say which tools are MCP tools, so there only `deny_tools` is written into its own
+    permission block, for a literal server name.
 A call the policy lets through only with a human's say-so is `ask_commands`: see ws.approvals.
 """
 
@@ -118,7 +123,7 @@ from datetime import UTC, date, datetime
 from functools import lru_cache
 from pathlib import Path
 
-from ws import paths, shellwords, unknownpath
+from ws import agentsession, paths, shellwords, unknownpath
 
 SCHEMA = 1
 DIALS = ("prepare", "allowlist", "act")
@@ -127,6 +132,19 @@ MODES = ("read", "act", "leave")
 KNOWN_TOOLS = ("web_fetch", "web_search")
 # Tools that can carry data out of the session (Rule of Two, leg C).
 EGRESS_TOOLS = ("web_fetch", "web_search")
+# An MCP tool's name as the runner sends it, `mcp__SERVER__TOOL`, or a glob over it (`mcp__SERVER__*`, `mcp__*__delete_*`).
+_MCP_PATTERN = re.compile(r"mcp__[A-Za-z0-9_.*?-]+")
+# The tools `ws mcp serve` offers (tests keep this in step with ws.mcp_server.TOOLS). They are allowed when the policy has
+# no `allow_mcp`; naming one's own list, even an empty one, replaces them.
+MCP_SHIPPED = (
+    "mcp__ws__memory_search",
+    "mcp__ws__memory_add",
+    "mcp__ws__note_capture",
+    "mcp__ws__msg_send",
+    "mcp__ws__msg_read",
+    "mcp__ws__msg_ack",
+    "mcp__ws__msg_list",
+)
 _NAME = re.compile(r"^[A-Za-z0-9_-]+$")
 _HOST = re.compile(r"^(\*\.)?[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?$")
 _CATCH_ALL = ("0.0.0.0", "0", "::", "*")  # an entry that names every address, however it is spelled
@@ -194,6 +212,7 @@ class Gate:
     allow_hosts: tuple[str, ...] = ()  # empty = the policy says nothing about the network
     allow_write: tuple[str, ...] = ()  # folders besides the project a sandboxed session may write (`~/x` or `/x`)
     sandbox: bool = True  # the runner's own sandbox is switched on in what ws writes (Claude Code); false = unsandboxed
+    allow_mcp: tuple[str, ...] | None = None  # MCP tools allowed outright; None = the policy says nothing (MCP_SHIPPED)
 
 
 @dataclass(frozen=True)
@@ -380,7 +399,8 @@ outward = []
 deny_commands = {arr(default_deny_commands())}
 # Paths no session may read. `~/` is your home; `**` crosses folders.
 deny_read = ["~/.ssh/**", "~/.gnupg/**", "~/.aws/credentials", "~/.config/ws/secrets/**", "~/.local/share/ws/secrets/**"]
-# Neutral tool names to switch off: {", ".join(KNOWN_TOOLS)}. An allowed web tool counts as a way out (leg C).
+# Neutral tool names to switch off: {", ".join(KNOWN_TOOLS)}. An allowed web tool counts as a way out (leg C). An MCP
+# tool is named as `mcp__SERVER__TOOL`, and a glob works (`mcp__SERVER__*`, `mcp__*__delete_*`).
 deny_tools = []
 # Commands that run only after you approve that exact call, once: the gate refuses the first try and prints an id; in a
 # terminal of your own (not the session's) run `ws approve ID`, then the session retries the identical call. Same globs
@@ -389,6 +409,11 @@ ask_commands = []
 # Hosts a session's shell may reach, for runners whose sandbox filters the network (Claude Code). Empty = no limit
 # from the policy. Example: ["api.anthropic.com", "github.com", "*.npmjs.org"].
 allow_hosts = []
+# MCP tools a session may call without asking, as `mcp__SERVER__TOOL` or a glob (`mcp__SERVER__*`). An MCP tool this list
+# does not name is asked for: a person approves that exact call, once, as for ask_commands. Leave the key out and only the
+# tools `ws mcp serve` offers are allowed; naming it, even as [], replaces that. deny_tools beats it. Example:
+# ["mcp__ws__*", "mcp__docs__search"].
+# allow_mcp = ["mcp__ws__*"]
 # Folders a sandboxed session may write besides the project folder it starts in (and the runner's own state and cache
 # folders, which ws knows). Everything else is read-only inside the wall. Absolute or `~/`, no wildcards. Example:
 # ["~/.npm", "~/.cache/uv"].
@@ -505,6 +530,17 @@ def control_paths(home: Path) -> list[str]:
     return paths.control_paths_in(home)
 
 
+def valid_mcp_pattern(name) -> bool:
+    """True for an MCP tool name or glob a `[gate]` list may hold: `mcp__` and then letters, digits, `_`, `-`, `.`, `*`
+    and `?`, with no empty part (`mcp__`, `mcp__a____b` and a trailing `__` are refused)."""
+    return (
+        isinstance(name, str)
+        and _MCP_PATTERN.fullmatch(name) is not None
+        and "____" not in name
+        and not name.endswith("__")
+    )
+
+
 def _table(d, where: str, allowed: set[str]) -> dict:
     if not isinstance(d, dict):
         raise PolicyError(f"{where} must be a table")
@@ -590,7 +626,16 @@ def loads(text: str) -> Policy:
     g = _table(
         raw.get("gate", {}),
         "[gate]",
-        {"deny_commands", "deny_read", "deny_tools", "ask_commands", "allow_hosts", "allow_write", "sandbox"},
+        {
+            "deny_commands",
+            "deny_read",
+            "deny_tools",
+            "ask_commands",
+            "allow_hosts",
+            "allow_write",
+            "sandbox",
+            "allow_mcp",
+        },
     )
     deny_read = _strings(g, "deny_read", "[gate] ")
     gate = Gate(
@@ -601,6 +646,7 @@ def loads(text: str) -> Policy:
         _strings(g, "allow_hosts", "[gate] "),
         _strings(g, "allow_write", "[gate] "),
         _get(g, "sandbox", bool, "[gate] ", True),
+        _strings(g, "allow_mcp", "[gate] ") if "allow_mcp" in g else None,
     )
     for h in gate.allow_hosts:
         check_host(h, "[gate] allow_hosts")
@@ -612,8 +658,16 @@ def loads(text: str) -> Policy:
                 "the home folder (after `.` and `..` are resolved)"
             )
     for t in gate.deny_tools:
-        if t not in KNOWN_TOOLS:
-            raise PolicyError(f"[gate] deny_tools: unknown tool {t!r} (known: {', '.join(KNOWN_TOOLS)})")
+        if t not in KNOWN_TOOLS and not valid_mcp_pattern(t):
+            raise PolicyError(
+                f"[gate] deny_tools: unknown tool {t!r} (known: {', '.join(KNOWN_TOOLS)}, or an MCP tool name or glob "
+                "such as `mcp__server__tool` or `mcp__server__*`)"
+            )
+    for t in gate.allow_mcp or ():
+        if not valid_mcp_pattern(t):
+            raise PolicyError(
+                f"[gate] allow_mcp: {t!r} is not an MCP tool name or glob (`mcp__server__tool`, `mcp__server__*`)"
+            )
 
     ex_raw = raw.get("exceptions", [])
     if not isinstance(ex_raw, list):
@@ -1469,16 +1523,6 @@ def _dotted(op: str, cwd: str) -> str:
     return op
 
 
-_ADMIN = {"secret", "broker", "approve", "uninstall", "upgrade"}
-_ADMIN_SUB = {
-    ("skills", "adopt"),
-    ("skills", "restore"),
-    ("config", "fallback"),
-    ("session", "prepare"),  # mints the role a launcher gives a session
-    ("session", "start"),  # writes a session's registry record, role included
-}
-
-
 def _gate_flag(rest: list[str]) -> bool:
     """`--gate launch` / `--gate=launch` (argparse takes any prefix of the flag, from `--g`) on a `ws install` line."""
     for i, t in enumerate(rest):
@@ -1490,26 +1534,136 @@ def _gate_flag(rest: list[str]) -> bool:
     return False
 
 
-def _ws_admin(canon: list[str]) -> str | None:
-    """`ws gate generate|init`, `ws secret ...`, `ws broker ...`, `ws approve ...`, `ws uninstall`, `ws upgrade ...`,
-    `ws install --gate launch`, `ws skills adopt|restore`, `ws config fallback`, `ws session prepare|start` (also
-    `uv run ws ...`, `python -m ws ...`): a gated session must not regenerate or take off its own gate, touch secrets, approve its own
+def _drop_cwd_flag(tokens: list[str]) -> list[str]:
+    """`tokens` without `-C PATH`, `-CPATH`, `-C=PATH`, `--cwd PATH`, `--cwd=PATH` and the prefixes argparse accepts of
+    `--cwd` (`--cw`, `--c`), which `ws` takes anywhere before a bare `--`. This is the only global flag with a value
+    (`--json`, `--no-color` and `--version` take none), so once it is gone the first two words are the subcommand.
+    A flag with no value left at the end is dropped too. Mirrors `output.split_global`, which raises on that and
+    does not know the prefixes."""
+    out: list[str] = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok == "--":
+            out.extend(tokens[i:])
+            break
+        name, eq, _ = tok.partition("=")
+        if name.startswith("-C") and not name.startswith("--") and (len(name) > 2 or eq or tok == "-C"):
+            i += 1 if tok != "-C" else 2
+        elif len(name) >= 3 and name.startswith("--c") and "--cwd".startswith(name):
+            i += 1 if eq else 2
+        else:
+            out.append(tok)
+            i += 1
+    return out
+
+
+def _launched_by_package_runner(canon: list[str]) -> bool:
+    """`uvx ...`, `uv run ...`, `uv tool run ...`, `pipx run ...` and `env ...`: a line whose own words may sit between the
+    launcher and `ws` (`uv run --with pkg ws`, `uvx --from x ws`), which no single word before `ws` gives away."""
+    head = posixpath.basename(canon[0]) if canon else ""
+    return (
+        head
+        in (
+            "uvx",
+            "env",
+            "taskset",
+            "chrt",
+            "ionice",
+            "flock",
+            "setpriv",
+            "unshare",
+            "systemd-run",
+            "screen",
+            "dtach",
+            "abduco",
+        )
+        or (head == "uv" and (canon[1:2] == ["run"] or canon[1:3] == ["tool", "run"]))
+        or (head in ("pipx", "pipenv", "poetry", "hatch", "pdm") and "run" in canon[1:3])
+    )
+
+
+_PY_GLUED_WS = re.compile(r"-[A-Za-z]*m(ws(\.__main__)?)\Z")  # `python3 -mws`, `python -Imws.__main__`
+
+
+def _is_ws_word(canon: list[str], i: int) -> bool:
+    """Whether word `i` names the ws program: `ws`, a path ending in it, or the module after python's `-m`."""
+    word = canon[i]
+    return posixpath.basename(word) == "ws" or (word == "ws.__main__" and i > 0 and canon[i - 1].startswith("-"))
+
+
+_PY_VALUE_FLAGS = frozenset({"-X", "-W"})  # python's flags whose value is the next word
+
+
+def _unglue_python_module(toks: list[str]) -> list[str] | None:
+    """`python3 -mws ...` with the module as a word of its own, or None when the line isn't that. It reads the words as
+    they were written, because normalising flags takes a glued `-mws` apart into letters."""
+    if not (toks and posixpath.basename(toks[0]).startswith(("python", "pypy"))):
+        return None
+    i = 1
+    while i < len(toks) and toks[i].startswith("-"):
+        found = _PY_GLUED_WS.match(toks[i])
+        if found:
+            return [*toks[:i], "-m", found.group(1), *toks[i + 1 :]]
+        i += 2 if toks[i] in _PY_VALUE_FLAGS else 1  # anything after the flags is the script's own words
+    return None
+
+
+def _tmux_admin(toks: list[str]) -> str | None:
+    """An admin command anywhere in a tmux line. tmux runs text from many places (commands chained with `;`, options,
+    hooks, `#()` in a format), so the line is not parsed: quotes and separators are flattened and every word is read. The
+    one word left out is the value of `-t`, a pane's name. A message or title that names an admin command is refused
+    too, which costs a rewording and is why this reads the whole line."""
+    if not (toks and posixpath.basename(toks[0]) == "tmux"):
+        return None
+    words: list[str] = []
+    after_target = False
+    previous = ""
+    for word in toks[1:]:
+        # `-n -t ws ...`: a `-t` straight after another flag is that flag's value, so what follows it is still read
+        is_target = word == "-t" and not previous.startswith("-")
+        if not after_target and not is_target:
+            joined = re.sub(r"""['"\\]""", "", word)  # the shell joins what these split
+            for piece in re.sub(r"""[;&|\n()`#<>{},]+""", " ", joined).split():
+                found = _PY_GLUED_WS.match(piece)
+                words += ["-m", found.group(1)] if found else [piece]
+        after_target = not after_target and is_target
+        previous = word
+    return _ws_admin(words, read_anywhere=True)
+
+
+def _ws_admin(canon: list[str], xargs: bool = False, read_anywhere: bool = False) -> str | None:
+    """`ws gate generate|init`, `ws secret ...`, `ws broker ...`, `ws approve ...`, `ws uninstall`, `ws upgrade`, `ws install
+    --gate launch`, `ws skills adopt|restore`, `ws config fallback`, `ws session prepare|start`, `ws node join|remove`,
+    `ws queue add|cancel|run` (also `uv run ws ...`, `python -m ws ...`): a gated session must not regenerate or take off its own gate, touch secrets, approve its own
     call, swap what the person installed or mint the role of a session (`prepare`) or overwrite its record (`start`;
     the hooks that run it are not tool calls, so they still work). A plain `ws install` only refreshes, so it stays
-    allowed."""
+    allowed. `ws` is read after a launcher's own words (`uv run --with pkg ws`, `uvx --from x ws`) and at the end of
+    a path (`/opt/bin/ws`, `./ws`). The text tmux is told to run is read too, and under `xargs` a `ws` whose subcommand
+    may arrive on the pipe is refused, because it can't be seen. The table of admin commands is `ws.agentsession`, which
+    makes `ws` refuse them too."""
+    gate_words = {b for a, b in agentsession.ADMIN_SUB if a == "gate"}
+    launched = read_anywhere or _launched_by_package_runner(canon)
     for i, t in enumerate(canon):
-        if posixpath.basename(t) != "ws" or not (
-            i == 0 or canon[i - 1] in ("run", "-m", "--", "exec", "tool") or canon[i - 1].startswith("-")
+        if not _is_ws_word(canon, i) or not (
+            i == 0
+            or launched
+            or "/" in t
+            or canon[i - 1] in ("run", "-m", "--", "exec", "tool")
+            or canon[i - 1].startswith("-")
         ):
             continue
-        sub = [x for x in canon[i + 1 :] if not x.startswith("-")][:2]
-        if sub[:1] == ["gate"] and ("generate" in canon[i + 2 :] or "init" in canon[i + 2 :]):
+        rest = _drop_cwd_flag(canon[i + 1 :])
+        sub = [x for x in rest if not x.startswith("-")][:2]
+        if xargs and (i == 0 or canon[i - 1] == "-m"):
+            return "ws under xargs is not for a gated session: the pipe decides its words, so they can't be read"
+        if sub[:1] == ["gate"] and gate_words & set(rest):
             return "ws gate generate/init is not for a gated session: it would rewrite its own gate"
-        if sub[:1] and sub[0] in _ADMIN:
+        if sub[:1] and sub[0] in agentsession.ADMIN:
             return f"ws {sub[0]} is not for a gated session"
-        if tuple(sub[:2]) in _ADMIN_SUB:
+        if tuple(sub[:2]) in agentsession.ADMIN_SUB:
             return f"ws {sub[0]} {sub[1]} is not for a gated session"
-        if sub[:1] == ["install"] and _gate_flag(canon[i + 1 :]):
+        if sub[:1] == ["install"] and _gate_flag(rest):
             return "ws install --gate launch is not for a gated session: it would take off its own gate"
     return None
 
@@ -1780,7 +1934,11 @@ def _segment_once(
             ctx.oldpwd, ctx.cwd = ctx.cwd, _abs(ctx.oldpwd if target == "-" else "".join(where), ctx.cwd)
             if ctx.cwd_unknown and target.startswith(("/", "~")):
                 ctx.cwd_unknown = False  # a full path says where it is
-    admin = _ws_admin(canon)
+    unglued = _unglue_python_module(toks)
+    if toks and posixpath.basename(toks[0]) == "tmux":
+        admin = _tmux_admin(toks)  # the words as written: normalising flags moves them
+    else:
+        admin = _ws_admin(canon, "xargs" in wrappers) or (_ws_admin(unglued) if unglued else None)
     if admin:
         return admin, line, []
     nested += _arith_scripts(ctx, cmd, flags, toks, words)

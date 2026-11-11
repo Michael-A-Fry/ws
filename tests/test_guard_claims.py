@@ -273,19 +273,99 @@ def test_git_time_is_one_budget_for_the_whole_hook(tmp_path, monkeypatch):
     monkeypatch.setattr(cl.subprocess, "run", fake_run)
     note = cl.on_ref(str(tmp_path), "abc1234", "origin/main", budget)
     assert calls == [8.0, 3.0]  # the second call gets only what is left
-    assert isinstance(note, str) and "took more than 8 seconds" in note  # and the third never starts
+    assert isinstance(note, cl.OutOfTime) and "took more than 8 seconds" in note  # and the third never starts
 
 
-def test_a_timeout_in_git_lets_the_message_through_with_a_note(home, monkeypatch):
-    d = home / "d"
-    d.mkdir()
-
+def _slow_git(monkeypatch):
     def slow(argv, **k):
         raise subprocess.TimeoutExpired(argv, k["timeout"])
 
     monkeypatch.setattr(cl.subprocess, "run", slow)
+
+
+def _no_time_at_all(monkeypatch):
+    """Every hook starts with its git time already spent (a slow machine, as under WSL2 on a cold runner)."""
+    real = cl.Budget
+    monkeypatch.setattr(cl, "Budget", lambda: real(0.0))
+
+
+def test_a_timeout_in_git_denies_a_claim_and_the_reason_names_it(home, monkeypatch):
+    d = home / "d"
+    d.mkdir()
+    _slow_git(monkeypatch)
     f = judge("merged abc1234 into main", d)
-    assert f.action == "note" and "claims not checked" in f.reason
+    assert f.action == "deny"
+    assert (
+        "took more than 8 seconds" in f.reason and "abc1234" in f.reason and "denies a claim it can't check" in f.reason
+    )
+
+
+def test_a_budget_that_has_run_out_denies_a_claim_and_never_asks_git(home, monkeypatch):
+    d = home / "d"
+    d.mkdir()
+    _no_time_at_all(monkeypatch)
+    monkeypatch.setattr(cl.subprocess, "run", lambda *a, **k: pytest.fail("git was run with no time left"))
+    f = judge("abc1234 is on main", d)
+    assert f.action == "deny" and "wouldn't run" in f.reason
+
+
+def test_git_that_will_not_start_denies_a_claim(home, monkeypatch):
+    d = home / "d"
+    d.mkdir()
+
+    def broken(argv, **k):
+        raise PermissionError("not executable")
+
+    monkeypatch.setattr(cl.subprocess, "run", broken)
+    assert judge("merged abc1234 into main", d).action == "deny"
+
+
+@needs_git
+def test_a_time_out_part_way_through_denies_even_when_the_first_calls_answered(repo, monkeypatch):
+    d, on, _ = repo
+    real = subprocess.run
+
+    def second_call_hangs(argv, **k):
+        if "merge-base" in argv:
+            raise subprocess.TimeoutExpired(argv, k["timeout"])
+        return real(argv, **k)
+
+    monkeypatch.setattr(cl.subprocess, "run", second_call_hangs)
+    assert judge(f"merged {on} into main", d).action == "deny"  # a true claim, but git did not say so
+
+
+def test_the_default_branch_unknown_for_want_of_time_still_denies_a_claim_about_it(home, monkeypatch):
+    d = home / "d"
+    d.mkdir()
+    _no_time_at_all(monkeypatch)
+    for text in ("merged abc1234 into trunk", "abc1234 is on develop", "pushed the fix abc1234 to release/2"):
+        assert judge(text, d).action == "deny", text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "the ed25519 key is on main",  # a hex-looking word, not a commit that a claim word binds to
+        "abc1234 is a draft and the fix is on main",
+        "committed abc1234 on a branch, not merged",
+        "session 9f8e7d6c is on the server",
+        "we will merge abc1234 into main later",
+        "merged, thanks",
+        "nothing to see here",
+    ],
+)
+def test_true_negatives_still_allow_when_git_is_out_of_time(home, monkeypatch, text):
+    d = home / "d"
+    d.mkdir()
+    _no_time_at_all(monkeypatch)
+    assert judge(text, d) is None
+
+
+def test_a_message_with_no_commit_never_waits_on_git(home, monkeypatch):
+    d = home / "d"
+    d.mkdir()
+    _slow_git(monkeypatch)
+    assert judge("all merged into main, nothing pending", d) is None
 
 
 def test_a_missing_folder_or_no_git_is_a_note(home, monkeypatch):

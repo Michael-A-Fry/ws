@@ -435,13 +435,14 @@ Run a headless job (a file in ~/.config/ws/jobs) and record what it did.
 Run a headless job. The monthly cap is checked before the run, not enforced during it.
 
 ```text
-ws run [-h] [--dry-run] job
+ws run [-h] [--dry-run] [--parent RUN_ID] job
 ```
 
 | Argument | Meaning |
 |---|---|
 | `job` | The job name: ~/.config/ws/jobs/<name>.toml. |
 | `--dry-run` | Show what would start, and whether it would be refused. |
+| `--parent RUN_ID` | Reserve only from what this run in progress has left, on top of the monthly cap. |
 
 ## `ws runs`
 
@@ -1141,6 +1142,7 @@ writable by others, because a job decides what a runner starts with. Every error
 | `green` | text | What the job's verification covers: `targeted`, `package`, `full` or `merge_ready`. |
 | `sources` | list of text | Policy sources the job reads. The Rule of Two looks at these. |
 | `schedule` | text | `hourly`, `daily HH:MM` or `weekly DAY HH:MM`, in local time. `ws schedule apply` turns it into a timer. |
+| `parent_run` | text | The id of a run in progress whose reservation this run spends from. `ws run --parent` sets it for one run. |
 | `command` | text | In place of `runner`, `model` and `prompt`: a ws command that the schedule runs (`backup`). `ws run` refuses these. |
 | `[[secrets]]` | table list | Each has `name`, `host` and `purpose` (default `run`). The broker leases it. |
 | `[runner_options]` | table | Adapter-specific. Claude Code: `allowed_tools`, `env`. OpenCode: `provider`, `env`. |

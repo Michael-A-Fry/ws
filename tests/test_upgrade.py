@@ -748,3 +748,19 @@ def test_upgrade_leaves_a_plugin_of_the_persons_own_alone(box, capsys, case):
     assert code == 0, err
     assert "removed" not in out and (plug.is_file() or plug.is_symlink())
     assert (plug.read_bytes() if plug.is_file() else None) == before
+
+
+def test_under_a_runner_a_terminal_that_is_not_the_runners_own_is_refused(old, capsys, monkeypatch):
+    """No session variable set and a terminal on both ends, but an agent runner above it and not at its terminal."""
+    from ws import agentsession
+
+    for var in SESSION_VARS:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(sys, "stdin", Tty())
+    monkeypatch.setattr(sys, "stdout", Tty())
+    monkeypatch.setattr(agentsession, "read_ancestry", lambda: ["bash", "claude"])
+    monkeypatch.setattr(agentsession, "on_runner_terminal", lambda: False)
+    before = (settings_file(old).read_bytes(), manifest_bytes(old))
+    assert cli.main(["upgrade", "--hooks-only"]) == 3
+    assert "agent session" in capsys.readouterr().err
+    assert (settings_file(old).read_bytes(), manifest_bytes(old)) == before

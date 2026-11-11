@@ -17,8 +17,12 @@ an ancestor of REF, or isn't a commit in this repository, denies the message and
 Not a claim: a claim word in quotes or backticks, one with a negation or a future form in the four words before it
 (`not merged`, `will be pushed`, `once it's merged`), and any sentence that names another branch (`origin/work`, or
 `pushed to work`, `merged into work`), because the check is against one ref. A folder that isn't a repository, no git on
-the machine, a REF that doesn't exist here, or git taking more than 8 seconds in total for one message lets the message
-through with a note. Git runs without lazy fetching (`GIT_NO_LAZY_FETCH=1`), so a check never goes to the network.
+the machine, or a REF that doesn't exist here, lets the message through with a note: there is nothing to check against.
+Git that is there but can't answer is different: git taking more than 8 seconds in total for one message, or failing to
+start, denies a message that makes a claim, and the reason names the time-out (the gate fails closed, ADR 0017: "can't
+tell" is not "true"). If the time ran out before the default branch was known, any phrase of the shape `on B`, `merged
+into B`, `merged to B` or `pushed to B` that a commit binds to counts as a claim. Git runs without lazy fetching
+(`GIT_NO_LAZY_FETCH=1`), so a check never goes to the network.
 
 Release claims are off until `release_dir` is set: a folder whose `current` link points at the promoted release. A clause
 (a sentence cut at `;`, `but`, `while`, `whereas`) that says a release is live or promoted (`v0.2 is live`, `promoted
@@ -390,17 +394,29 @@ def find_claims(
 
 
 class Budget:
-    """The git time one hook may use, shared by every call it makes."""
+    """The git time one hook may use, shared by every call it makes. `failed` is set when git was found but a call to it
+    timed out or wouldn't start: from then on the answer for a claim is "not known", which the guard denies."""
 
     def __init__(self, total: float = GIT_BUDGET_S, clock=time.monotonic) -> None:
         self.total, self.clock, self.start = total, clock, clock()
+        self.failed = False
 
     def left(self) -> float:
         return self.total - (self.clock() - self.start)
 
+    def spent(self) -> bool:
+        """Is git out of time, or did a call to it just fail?"""
+        return self.failed or self.left() <= 0
+
+
+class OutOfTime(str):
+    """The note `on_ref` gives when git was there and didn't answer (out of time, or it wouldn't run). The guard denies
+    it rather than let a claim through unchecked."""
+
 
 def _git_run(cwd: str, *args: str, budget: Budget | None = None) -> subprocess.CompletedProcess | None:
-    """`git -C cwd args`, or None when git can't run (not installed, or out of time). It gets a bare environment: the
+    """`git -C cwd args`, or None when git can't run (not installed; or out of time, or it wouldn't start, which set
+    `budget.failed`). It gets a bare environment: the
     runner's GIT_DIR and the like must not point it somewhere else, and `GIT_NO_LAZY_FETCH=1` keeps a partial clone from
     going to the network."""
     env = {"PATH": paths.tool_path()}  # never the session's PATH: a project can put its own program first
@@ -420,7 +436,8 @@ def _git_run(cwd: str, *args: str, budget: Budget | None = None) -> subprocess.C
             env=env,
             check=False,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError):  # a time-out is a SubprocessError
+        budget.failed = True
         return None
 
 
@@ -470,13 +487,14 @@ def default_target(cwd: str, budget: Budget) -> Target:
     return Target(branch, branch)
 
 
-def _out_of_time(budget: Budget) -> str:
-    return f"git took more than {budget.total:g} seconds, so the commit wasn't checked"
+def _out_of_time(budget: Budget) -> OutOfTime:
+    return OutOfTime(f"git took more than {budget.total:g} seconds or wouldn't run, so the commit wasn't checked")
 
 
 def on_ref(cwd: str, sha: str, ref: str, budget: Budget | None = None) -> bool | str:
     """True when `sha` is an ancestor of `ref` in the repository at `cwd`; False when it isn't (or isn't a commit
-    there); a text note when that can't be known. `budget` is the git time left for this hook."""
+    there); a text note when that can't be known (an `OutOfTime` when git was there and didn't answer). `budget` is the
+    git time left for this hook."""
     if not cwd or not Path(cwd).is_dir():
         return "no folder to check in"
     budget = budget or Budget()
@@ -486,11 +504,11 @@ def on_ref(cwd: str, sha: str, ref: str, budget: Budget | None = None) -> bool |
 
     inside = ask("rev-parse", "--is-inside-work-tree")
     if inside is None:
-        return _out_of_time(budget) if budget.left() <= 0 else "git can't run here"
+        return _out_of_time(budget) if budget.spent() else "git can't run here"
     if inside != 0:
         return "the folder isn't a git repository"
     have = ask("rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")
-    if have is None and budget.left() <= 0:
+    if have is None:
         return _out_of_time(budget)
     if have != 0:
         return f"{ref} doesn't exist in this repository"
@@ -613,14 +631,18 @@ def judge(call, cfg: Config, ctx) -> Finding | None:
     ref, claims = "", []
     if isinstance(text, str) and _has_commit(text):  # a message with no commit-like token never asks git
         ref, claims = _claims_in(text, cfg, ctx.cwd, budget)
-    wrong, notes = [], []
+        if budget.spent():  # git didn't answer before the default branch was known: more phrases may be claims
+            claims += [c for c in blind_claims(text, cfg) if c not in claims]
+    wrong, late, notes = [], [], []
     release = check_releases(text, cfg) if isinstance(text, str) else None
     for word, sha in claims:
-        result = on_ref(ctx.cwd, sha, ref, budget)
+        result = _out_of_time(budget) if budget.spent() else on_ref(ctx.cwd, sha, ref, budget)
         if result is True:
             continue
         if result is False:
             wrong.append(f"{sha} ({word})")
+        elif isinstance(result, OutOfTime):
+            late.append(f"{sha} ({word})")
         elif result not in notes:
             notes.append(result)
     if wrong:
@@ -632,9 +654,40 @@ def judge(call, cfg: Config, ctx) -> Finding | None:
         return Finding("deny", f"{reason} Also: {release}" if release else reason)
     if release:
         return Finding("deny", release)
+    if late:
+        named = ", ".join(late)
+        return Finding("deny", f"claims not checked: {_out_of_time(budget)}. The message says {named}. {LATE_ADVICE}")
     if notes:
         return Finding("note", f"claims not checked: {notes[0]}")
     return None
+
+
+LATE_ADVICE = (
+    "The gate denies a claim it can't check. Send it again once `git status` answers here, or without the claim."
+)
+# the word after "on", "into" or "to" in a claim phrase, when the default branch isn't known
+_BRANCH_AFTER = re.compile(r"\b(?:on|into|to)\s+(?:the\s+)?(?:origin/)?([\w][\w./-]*)", re.IGNORECASE)
+_NOT_A_BRANCH = frozenset(
+    {"a", "an", "the", "my", "your", "our", "his", "her", "their", "this", "that", "it", "me", "you"}
+)
+MAX_GUESSES = 6
+
+
+def blind_claims(text: str, cfg: Config) -> list[tuple[str, str]]:
+    """The claims in `text` when git ran out of time before it could name the default branch: the claim phrases for each
+    word that follows `on`, `into` or `to` (the first few), unless the policy names its own `words`. Used only to decide
+    that something is a claim that can't be checked, never to say it is true or false."""
+    if cfg.words:
+        return []
+    names: list[str] = []
+    for m in _BRANCH_AFTER.finditer(text[:MAX_TEXT]):
+        name = m.group(1).rstrip(".,:;)").lower()
+        if name and name not in _NOT_A_BRANCH and name not in names:
+            names.append(name)
+    found: list[tuple[str, str]] = []
+    for name in names[:MAX_GUESSES]:
+        found += [c for c in find_claims(text, claim_words(name), f"{REMOTE}/{name}", name) if c not in found]
+    return found
 
 
 def _claims_in(text: str, cfg: Config, cwd: str, budget: Budget) -> tuple[str, list[tuple[str, str]]]:

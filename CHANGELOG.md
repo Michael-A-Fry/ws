@@ -8,8 +8,24 @@ body of the GitHub release.
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-11-11
+
+A security release. Upgrade with `ws upgrade` from a terminal of your own. This release removes nothing: no command,
+setting or file format goes away, and a queue store from 0.1.8 is migrated in place.
+
 ### Added
 
+- `ws` refuses its own admin commands inside an agent session (exit 3, "run it in your own terminal"), as well as the
+  gate refusing them on the command line. The admin commands are one table; it now also holds `upgrade`, `node join`
+  and `node remove`, and the `queue` commands that add, cancel or run work. See
+  [decision 0020](docs/decisions/0020-admin-commands-refuse-inside-an-agent-session.md).
+- The gate judges MCP tool calls: `deny_tools` takes MCP names and globs, a tool the new `[gate] allow_mcp` list doesn't
+  name is asked for, and path-like arguments are checked against `deny_read`. See
+  [decision 0021](docs/decisions/0021-the-gate-judges-mcp-tool-calls.md).
+- Queue: `memory_reserved_gb` in `[roles.queue]` keeps memory promised to other machines or services out of the count;
+  one notice through the notify role when a job stops for good; a job may spend from a live parent run
+  (`parent_run`, `ws run --parent`), one level deep, and still meets the monthly and purpose caps.
+- A live test against a local Ollama server, run when `WS_OLLAMA_URL` is set.
 - `ws upgrade` swaps ws for a newer release and rewrites the runner's hooks in the same step, from a terminal of your
   own. A failed rewrite puts the runner's config and the install record back, and the message says which files, if any,
   it couldn't. The gate refuses the command in a session. Doctor check WS013 reports hooks older than the ws that

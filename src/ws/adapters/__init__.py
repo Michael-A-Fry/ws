@@ -46,10 +46,10 @@ class Call:
     """A tool call in runner-neutral terms. kind: "command" (shell), "read" (one file read), "search" (a folder
     searched or listed, recursively), "write" (a file written or edited), "tool" (a neutral tool name from
     ws.policy.KNOWN_TOOLS), "agent" (a subagent started), "skill" (a skill loaded) or "message" (a message sent to
-    another agent). value: the command text, the path, the tool name, the agent type, the skill name or the
+    another agent) or "mcp" (an MCP tool, `mcp__server__tool`). value: the command text, the path, the tool name, the agent type, the skill name or the
     recipient. data: what else the tool gave, read-only: a write has `old`, `new`, `content` or `edits` as the tool
-    supplies them; an agent has `prompt`, `description` and `subagent_type`; a skill has `name`; a message has `text`.
-    The policy judges command, read, search, write and tool calls; the other kinds reach guards only."""
+    supplies them; an agent has `prompt`, `description` and `subagent_type`; a skill has `name`; a message has `text`; an mcp call has `args`, the tool's arguments as sent.
+    The policy judges command, read, search, write, tool and mcp calls; the other kinds reach guards only."""
 
     kind: str
     value: str

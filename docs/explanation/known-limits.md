@@ -127,11 +127,28 @@ command builds, or the version-control tool restoring a protected tracked file.
 
 - **Workaround.** Rely on the wall for these, and keep `ask_commands` for the actions that matter.
 
+### OpenCode can't tell MCP tools from its own
+
+OpenCode names an MCP tool `<server>_<tool>`, and the hook payload is that name and the arguments, with nothing that
+marks it as an MCP tool. So the OpenCode shim checks no MCP call: `allow_mcp` and the path checks on arguments don't
+apply there, and the shim leaves an MCP tool to OpenCode's own permissions.
+
+- **What it means.** A `deny_tools` entry for a literal server (`mcp__server__tool`, `mcp__server__*`) is written into
+  OpenCode's `permission` block as `server_tool` or `server_*`, and OpenCode enforces it. A glob with a wildcard server
+  (`mcp__*__delete_*`) isn't written, because `*_delete_*` would also catch OpenCode's own tools.
+- **Workaround.** Use Claude Code for MCP servers that matter, or set `permission` rules for them in OpenCode's own
+  config.
+
 ### Approvals aren't a defence against a determined session
 
-A session that allocates its own terminal and clears the session marker can defeat the first two `ws approve` checks.
+A command that has left the session's process tree and cleared the session marker can defeat the `ws approve` checks.
 
-- **What it means.** Approvals stop a model approving itself by accident or by a plain instruction.
+- **What it means.** Approvals stop a model approving itself by accident or by a plain instruction. The same holds for
+  the other admin commands (secrets, `gate generate`, `install --gate`): under an agent runner, `ws` accepts only the
+  terminal the runner holds, with the command in its foreground. A command started through a daemon (`tmux new -d`, a
+  double fork, a service manager) has no runner above it, so `ws` can't tell it from your own pane; the matcher reads
+  the spellings it knows. `session start` (the runner's own hook runs it) and `broker serve` (`ws run` starts it) are
+  left to the matcher.
 - **Workaround.** Keep the wall on. It's what stands behind the matcher.
 
 ### The resident gate is private to your user, not sealed against your own processes

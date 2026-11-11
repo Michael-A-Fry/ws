@@ -188,3 +188,66 @@ def test_a_persons_other_bypass_value_is_a_conflict_and_their_own_disable_stays_
     assert cli.main(["uninstall", "--yes"]) in (0, 1)
     capsys.readouterr()
     assert json.loads(f.read_text())["permissions"] == {wallsettings.BYPASS_KEY: "disable"}  # theirs, so it stays
+
+
+# --- OpenCode: ws's denies come last ----------------------------------------------------------------------------------
+
+DENY = {"op": "set", "path": ["permission", "bash", "git push *"], "value": "deny"}
+ASK = {"op": "set", "path": ["permission", "bash", "make deploy"], "value": "ask"}
+DENY2 = {"op": "set", "path": ["permission", "bash", "rm -rf *"], "value": "deny"}
+
+
+def bash_keys(doc: dict) -> list[str]:
+    return list(doc["permission"]["bash"])
+
+
+def test_opencode_ws_denies_come_last_after_a_persons_key_and_broader_allow():
+    mine = {"permission": {"bash": {"git push *": "deny", "*": "allow", "make *": "allow"}}}
+    got, added, _ = userconfig.update(mine, [], [], [ASK, DENY, DENY2], Path("x"))
+    keys = bash_keys(got)
+    assert keys[-2:] == ["git push *", "rm -rf *"]  # the last matching rule is a ws deny, whatever of yours is broader
+    assert keys.index("*") < keys.index("git push *") and keys.index("make *") < keys.index("git push *")
+    assert keys.index("make deploy") < keys.index("git push *")  # an ask stays before ws's first deny
+    assert got["permission"]["bash"]["git push *"] == "deny" and got["permission"]["bash"]["*"] == "allow"
+    assert added == [ASK, DENY2]  # the key that was already yours is not recorded as ws's
+
+
+def test_opencode_denies_stay_last_on_re_apply():
+    mine = {"permission": {"bash": {"git push *": "deny", "*": "allow"}}}
+    ops = [ASK, DENY, DENY2]
+    first, added, made = userconfig.update(mine, [], [], ops, Path("x"))
+    again, added2, made2 = userconfig.update(first, added, made, ops, Path("x"))
+    assert json.dumps(again) == json.dumps(first) and added2 == added and made2 == made  # byte stable
+    first["permission"]["bash"]["later *"] = "allow"  # a broader allow of theirs added after the install
+    moved, _, _ = userconfig.update(first, added, made, ops, Path("x"))
+    assert bash_keys(moved)[-2:] == ["git push *", "rm -rf *"] and "later *" in bash_keys(moved)[:-2]
+    # a new ask from a later policy goes in ahead of the denies too
+    ask2 = {"op": "set", "path": ["permission", "bash", "npm publish *"], "value": "ask"}
+    wider, _, _ = userconfig.update(moved, added, made, [ASK, ask2, DENY, DENY2], Path("x"))
+    keys = bash_keys(wider)
+    assert keys.index("npm publish *") < keys.index("git push *") and keys[-2:] == ["git push *", "rm -rf *"]
+
+
+def test_opencode_withdrawal_leaves_the_persons_key():
+    mine = {"permission": {"bash": {"git push *": "deny", "*": "allow"}}}
+    applied, added, made = userconfig.update(mine, [], [], [ASK, DENY, DENY2], Path("x"))
+    gone, _, _ = userconfig.update(applied, added, made, [], Path("x"))
+    assert gone["permission"]["bash"] == {"*": "allow", "git push *": "deny"}  # theirs stays, and is a deny still
+
+
+def test_opencode_install_puts_every_ws_deny_after_a_persons_broad_allow(box, capsys):
+    f = box / ".config" / "opencode" / "opencode.json"
+    f.parent.mkdir(parents=True)
+    key = policy.default_policy().gate.deny_commands[0]
+    f.write_text(json.dumps({"permission": {"bash": {key: "deny", "*": "allow"}}}))
+    argv = ["install", "--yes", "--runner", "opencode", "--notes", str(box / "Notes")]
+    assert cli.main(argv) == 0
+    capsys.readouterr()
+    rules = json.loads(f.read_text())["permission"]["bash"]
+    after_allow = list(rules.values())[list(rules).index("*") + 1 :]
+    assert after_allow and all(v in ("ask", "deny") for v in after_allow)  # nothing allows after the allow, so ws wins
+    assert list(rules.values())[-1] == "deny" and key in list(rules)[list(rules).index("*") + 1 :]
+    again = f.read_bytes()
+    assert cli.main(argv) == 0
+    capsys.readouterr()
+    assert f.read_bytes() == again

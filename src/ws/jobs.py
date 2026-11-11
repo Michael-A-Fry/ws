@@ -21,6 +21,11 @@
     purpose = "jobs"                    optional: the [budget.purposes] name this job's spend counts against
     budget_usd = 2.0                    optional: the money reserved for one run (default: the profile's unknown_run_usd)
     strict = false                      true: refuse when the room left is under budget_usd, never run on less
+    parent_run = "20261108T030000Z-0a1b2c"
+                                        optional: the id of a run in progress whose reservation this run spends from
+                                        (`ws run JOB --parent ID` sets it for one run). The run may reserve only what the
+                                        parent has left, and must also fit the monthly and purpose caps; a parent that
+                                        has finished, has nothing left or is itself a child (one level only) refuses it.
     max_turns, timeout_s                the turns and seconds reserved are these
     deadline = "2026-11-10T09:00:00Z"   optional: a UTC time; a run that would start after it ends as `expired`
     preemptible = false                 true: a SIGTERM (exit 143) is settled and the job requeued, not failed
@@ -83,6 +88,7 @@ KEYS = {
     "purpose",
     "budget_usd",
     "strict",
+    "parent_run",
 }
 GREEN_LEVELS = ("targeted", "package", "full", "merge_ready")  # as runrecord.GREEN_LEVELS
 COMMANDS = {
@@ -159,6 +165,7 @@ class Job:
     purpose: str | None = None
     budget_usd: float | None = None
     strict: bool = False
+    parent_run: str | None = None
     max_budget_usd: float | None = None  # not a file key: admission sets it from the reservation
 
 
@@ -302,6 +309,9 @@ def loads(name: str, text: str, base: Path, where: str | None = None) -> Job:
     purpose = _string(d, "purpose", where)
     if purpose is not None and not NAME.match(purpose):
         raise JobError(f"{where}: purpose {purpose!r} is not a plain name (letters, digits, - and _)")
+    parent_run = _string(d, "parent_run", where)
+    if parent_run is not None and not NAME.match(parent_run):
+        raise JobError(f"{where}: parent_run {parent_run!r} is not a run id (letters, digits, - and _)")
     return Job(
         name=name,
         runner=runner,
@@ -325,6 +335,7 @@ def loads(name: str, text: str, base: Path, where: str | None = None) -> Job:
         purpose=purpose,
         budget_usd=_number(d, "budget_usd", where, None),
         strict=strict,
+        parent_run=parent_run,
     )
 
 

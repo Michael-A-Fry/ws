@@ -29,9 +29,15 @@ def box(tmp_path):
     return home, ws_home, env
 
 
+# `python -c` boot for a child `ws`: its process tree is read as empty (a test run by an agent sits under a runner)
+NO_RUNNER_ABOVE = (
+    "import sys; from ws import agentsession, cli; agentsession.read_ancestry = list; sys.exit(cli.main(sys.argv[1:]))"
+)
+
+
 def ws(env: dict[str, str], *args: str, stdin: str = "") -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, "-m", "ws", *args],
+        [sys.executable, "-c", NO_RUNNER_ABOVE, *args],
         env=env,
         input=stdin,
         capture_output=True,

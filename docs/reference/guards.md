@@ -117,9 +117,13 @@ isn't in the repository, denies the message and the reason names it. If `ref` ma
 `git fetch` first; the guard never fetches. A claim word in quotes or backticks isn't a claim, and neither is one with a
 negation or a future form in the four words before it (`not merged`, `will be pushed`, `once it's merged`). A sentence
 that names another branch, such as `origin/work` or `pushed to work`, isn't checked either. A folder that isn't a
-repository, a machine with no git, a `ref` that doesn't exist there and git taking more than 8 seconds in total for one
-message each let the message through with a note. Git runs with `GIT_NO_LAZY_FETCH=1`, so a check never goes to the
-network.
+repository, a machine with no git and a `ref` that doesn't exist there each let the message through with a note: there
+is nothing to check against. Git that's there but doesn't answer is a deny, because the gate fails closed
+([ADR 0017](../decisions/0017-the-gate-fails-closed.md)): git taking more than 8 seconds in total for one message, or
+failing to start, denies a message that makes a claim, and the reason names the time-out. If the time ran out before
+the default branch was known, any `on B`, `merged into B`, `merged to B` or `pushed to B` that a commit binds to counts
+as a claim. A message with no claim, and any of the true negatives above, is never held up by a slow git. Git runs with
+`GIT_NO_LAZY_FETCH=1`, so a check never goes to the network.
 
 With `release_dir` set, the guard also checks release claims. `release_dir` is a folder whose `current` link points at
 the promoted release tree; the path is absolute or starts with `~/`. A clause says a release is live when it reads

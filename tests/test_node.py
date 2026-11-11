@@ -243,13 +243,20 @@ ROUND_TRIP = """
 set -eu
 mkdir -p "$HOME" "$SNAPS"
 $PY -c "$SNAPSHOT" "$HOME" > "$SNAPS/before"
-$PY -m ws node join --every 10
-$PY -m ws node show > /dev/null
-$PY -m ws node remove
+$PY -c "$WS_BOOT" node join --every 10
+$PY -c "$WS_BOOT" node show > /dev/null
+$PY -c "$WS_BOOT" node remove
 $PY -c "$SNAPSHOT" "$HOME" > "$SNAPS/after"
 diff "$SNAPS/before" "$SNAPS/after"
 echo diff-is-zero
 """
+
+
+# `ws node join|remove` refuse inside an agent session, and a test run by an agent sits under a runner: the child `ws`
+# reads its process tree as empty
+NO_RUNNER_ABOVE = (
+    "import sys; from ws import agentsession, cli; agentsession.read_ancestry = list; sys.exit(cli.main(sys.argv[1:]))"
+)
 
 
 def round_trip_env(home: Path, snaps: Path, py: str, src: str) -> dict[str, str]:
@@ -260,6 +267,7 @@ def round_trip_env(home: Path, snaps: Path, py: str, src: str) -> dict[str, str]
         "PY": py,
         "PYTHONPATH": src,
         "SNAPSHOT": SNAPSHOT,
+        "WS_BOOT": NO_RUNNER_ABOVE,
         "LANG": "C.UTF-8",
     }
 
@@ -325,7 +333,7 @@ def test_install_uninstall_diff_to_zero_in_a_container(tmp_path):
         argv = [
             runtime, "run", "--rm", "--network", "none", "-v", f"{ROOT / 'src'}:/ws-src:ro",
             "-e", "HOME=/tmp/h", "-e", "SNAPS=/tmp/snaps", "-e", "PY=python3", "-e", "PYTHONPATH=/ws-src",
-            "-e", f"SNAPSHOT={SNAPSHOT}", image, "sh", "-c", ROUND_TRIP,
+            "-e", f"SNAPSHOT={SNAPSHOT}", "-e", f"WS_BOOT={NO_RUNNER_ABOVE}", image, "sh", "-c", ROUND_TRIP,
         ]  # fmt: skip
         done = subprocess.run(argv, capture_output=True, text=True, timeout=300, check=False)
     assert done.returncode == 0, done.stdout + done.stderr

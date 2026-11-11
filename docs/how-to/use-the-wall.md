@@ -66,6 +66,8 @@ real work.
   `permissions.disableBypassPermissionsMode` is `"disable"`, so `--dangerously-skip-permissions` is refused while a
   gated session runs. If your own file sets that key to anything else, `ws install` refuses and changes nothing; change
   your value to match.
+- For OpenCode, ws puts its deny rules after yours in each `permission` block of your config, because OpenCode takes the
+  last rule that matches. A broader `allow` of yours can't sit after a deny ws adds.
 - To give a class its own operating-system account, see [Set up a class user](set-up-a-class-user.md).
 
 ## Shut the network by class

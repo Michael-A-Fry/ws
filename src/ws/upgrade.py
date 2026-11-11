@@ -46,7 +46,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from ws import __version__, approvals, install, output, selfcmd, userconfig
+from ws import __version__, agentsession, approvals, install, output, selfcmd, userconfig
 from ws.output import WsError
 
 COMMAND = "upgrade"
@@ -68,7 +68,8 @@ def session_signs(env: Mapping[str, str]) -> list[str]:
 
 
 def refusal(env: Mapping[str, str], stdin_is_tty: bool) -> str | None:
-    """Why this run is refused, or None. Fails towards refusing: any sign of a session, or no terminal."""
+    """Why this run is refused, or None. Fails towards refusing: any sign of a session, or no terminal. `cmd_upgrade`
+    then makes the check every admin command gets (`ws.agentsession.refusal`: the process tree and whose terminal)."""
     signs = session_signs(env)
     if signs:
         return f"ws upgrade is for a person, not for a session ({signs[0]} is set here)"
@@ -324,7 +325,9 @@ def _both(args: argparse.Namespace, env: Mapping[str, str]) -> int:
 
 def cmd_upgrade(args: argparse.Namespace) -> int:
     env = os.environ
-    why = refusal(env, sys.stdin.isatty() or args.dry_run)
+    why = refusal(env, sys.stdin.isatty() or args.dry_run) or agentsession.refusal(
+        env, sys.stdin.isatty(), sys.stdout.isatty()
+    )
     if why:
         raise WsError("refused", why, "run `ws upgrade` yourself, in a terminal of your own", EXIT_REFUSED)
     if args.hooks_only:

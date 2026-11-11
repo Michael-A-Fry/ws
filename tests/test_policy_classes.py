@@ -531,3 +531,76 @@ def test_admin_refuses_session_prepare_and_start_from_a_gated_shell():
     ):
         assert policy.is_denied_command(pol, cmd), cmd
     assert policy.is_denied_command(pol, "ws session nudge --session-id x") is None
+
+
+_CWD_SPELLINGS = ["-C /tmp", "-C/tmp", "-C=/tmp", "--cwd /tmp", "--cwd=/tmp", "--cw /tmp", "--c=/tmp", "-C . --json"]
+_ADMIN_LINES = [
+    "session prepare --role lead",
+    "session start --session-id x",
+    "secret ask NAME",
+    "gate generate",
+    "gate init",
+    "install --gate launch",
+    "skills adopt x",
+]
+
+
+@pytest.mark.parametrize("line", _ADMIN_LINES)
+@pytest.mark.parametrize("flag", _CWD_SPELLINGS)
+def test_admin_is_refused_whatever_cwd_flag_sits_before_or_inside_the_command(flag, line):
+    """`-C PATH` is a global flag `ws` takes anywhere: its value must not count as a subcommand word."""
+    pol = policy.default_policy()
+    head, _, tail = line.partition(" ")
+    for cmd in (f"ws {flag} {line}", f"uv run ws {flag} {line}", f"ws {head} {flag} {tail}"):
+        assert policy.is_denied_command(pol, cmd), cmd
+
+
+@pytest.mark.parametrize("flag", _CWD_SPELLINGS)
+def test_a_cwd_flag_before_an_allowed_command_stays_allowed(flag):
+    pol = policy.default_policy()
+    assert policy.is_denied_command(pol, f"ws {flag} status") is None
+    assert policy.is_denied_command(pol, f"ws {flag} session nudge --session-id x") is None
+    assert policy.is_denied_command(pol, "ws -C . status") is None
+
+
+_LAUNCHERS = [
+    "ws",
+    "uv run ws",
+    "uv run --with pkg ws",
+    "uv run --no-project --with a --with b ws",
+    "uvx --from x ws",
+    "uvx --from=x --python 3.12 ws",
+    "uvx ws",
+    "uv tool run ws",
+    "pipx run ws",
+    "/abs/path/bin/ws",
+    "./bin/ws",
+    "~/.local/bin/ws",
+    "env -u N ws",
+    "env -u N A=1 B=2 ws",
+    "env A=1 /opt/bin/ws",
+    "python -m ws",
+    "python -I -m ws",
+]
+
+
+@pytest.mark.parametrize("line", _ADMIN_LINES)
+@pytest.mark.parametrize("launcher", _LAUNCHERS)
+def test_admin_is_refused_after_any_launcher_wrapper_or_path(launcher, line):
+    pol = policy.default_policy()
+    for cmd in (f"{launcher} {line}", f"{launcher} -C . {line}"):
+        assert policy.is_denied_command(pol, cmd), cmd
+
+
+@pytest.mark.parametrize("launcher", _LAUNCHERS)
+def test_a_launcher_before_an_allowed_command_stays_allowed(launcher):
+    pol = policy.default_policy()
+    for cmd in (f"{launcher} status", f"{launcher} -C . status", f"{launcher} session nudge --session-id x"):
+        assert policy.is_denied_command(pol, cmd) is None, cmd
+    assert policy.is_denied_command(pol, f"{launcher} install --gate every-session") is None
+
+
+def test_words_that_only_look_like_ws_are_not_read_as_the_command():
+    pol = policy.default_policy()
+    for cmd in ("cat ws secret", "ls ws", "grep -r secret ws", "git add ws"):
+        assert policy.is_denied_command(pol, cmd) is None, cmd

@@ -31,6 +31,8 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import fnmatch
+import hashlib
 import json
 import os
 import shlex
@@ -40,6 +42,7 @@ import time
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
+from urllib.parse import unquote, urlsplit
 
 from ws import adapters, approvals, guards, jsonl, output, paths, policy, sandbox, selfcmd, shellwords
 
@@ -64,8 +67,124 @@ class Ask(str):
     the runner); `replay` tells the two apart by the type."""
 
 
+# --- MCP tool calls ------------------------------------------------------------------------------------------------
+# An MCP tool is named `mcp__SERVER__TOOL` and takes any arguments, so the gate cannot know which of them are paths. It
+# reads as a path: the value of a key that names one, a string that starts like one, and a `file://` address, searched
+# through the arguments to a fixed depth and count (a call past either is a deny).
+
+_DIR_KEYS = frozenset({"dir", "dirs", "directory", "directories", "root", "roots"})
+_PATH_KEYS = _DIR_KEYS | {
+    *("path", "paths", "file", "files", "filepath", "filepaths", "filename", "filenames", "source", "sources"),
+    *("destination", "destinations", "target", "targets", "uri", "uris"),
+}
+_PATH_KEY_ENDS = ("path", "paths", "file", "files", "filename", "dir", "dirs", "directory", "directories", "uri")
+_PATH_STARTS = ("/", "~", "./", "../")
+_WRITE_WORDS = ("write", "edit", "create", "delete", "remove", "move", "rename", "save", "append", "patch", "mkdir")
+_LIST_WORDS = ("list", "search", "find", "glob", "grep", "tree", "walk", "scan")
+MCP_MAX_DEPTH = 8
+MCP_MAX_VALUES = 2000
+_MAX_PATH = 4096  # a longer string is text, read a line at a time
+_MAX_LINES = 256  # a key that names a path holding more lines than this is not judged line by line: it is a deny
+
+
+class _TooLarge(Exception):
+    pass
+
+
+def _path_key(key) -> bool:
+    k = key.lower().replace("_", "").replace("-", "") if isinstance(key, str) else ""
+    return k in _PATH_KEYS or k.endswith(_PATH_KEY_ENDS)
+
+
+def _local_path(text: str) -> str | None:
+    """The path a `file:` address names, `text` itself when it is not an address, or None for any other address."""
+    if text[:5].lower() == "file:":
+        return unquote(urlsplit(text).path) or None
+    return None if "://" in text else text
+
+
+def mcp_paths(args: dict) -> list[tuple[str, bool]]:
+    """The (path, is a folder) an MCP call's arguments name, found as the section above says. Raises _TooLarge past
+    MCP_MAX_DEPTH levels or MCP_MAX_VALUES values."""
+    found: list[tuple[str, bool]] = []
+    seen = 0
+    todo = [(args, False, False, 0)]  # value, under a key that names a path, ... a folder, depth
+    while todo:
+        node, named, folder, depth = todo.pop()
+        seen += 1
+        if seen > MCP_MAX_VALUES or depth > MCP_MAX_DEPTH:
+            raise _TooLarge
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if isinstance(k, str) and k.startswith(_PATH_STARTS):  # a map of path -> content
+                    found.append((k, False))
+                key = k.lower().replace("_", "").replace("-", "") if isinstance(k, str) else ""
+                todo.append((v, _path_key(k), key in _DIR_KEYS, depth + 1))
+        elif isinstance(node, (list, tuple)):
+            todo += [(v, named, folder, depth + 1) for v in node]
+        elif isinstance(node, str):
+            lines = node.splitlines() or [""]
+            if named and len(lines) > _MAX_LINES:
+                raise _TooLarge
+            if not named and (len(node) > _MAX_PATH or len(lines) > 1):
+                continue
+            for line in lines:
+                line = line.strip()
+                if named and len(line) > _MAX_PATH:
+                    raise _TooLarge  # a path too long to read is a deny, not a pass
+                if line and len(line) <= _MAX_PATH and (named or line.startswith(_PATH_STARTS + ("file:",))):
+                    local = _local_path(line)
+                    if local:
+                        found.append((local, folder))
+    return found
+
+
+def _mcp_match(patterns, name: str) -> str | None:
+    return next((p for p in patterns if fnmatch.fnmatchcase(name, p)), None)
+
+
+def _mcp_reason(pol: policy.Policy, call: Call, protect: tuple[str, ...]) -> str | None:
+    """The reason an MCP call is denied (deny_tools, then each path it names against deny_read, and for a tool whose
+    name says it writes, against ws's own files), an `Ask` when `allow_mcp` does not name it, or None."""
+    name = call.value
+    if hit := _mcp_match(pol.gate.deny_tools, name):
+        return f"tool {name} is in deny_tools (matches {hit!r})"
+    args = call.data.get("args")
+    if not isinstance(args, dict):
+        raise TypeError("MCP tool arguments are not an object")
+    try:
+        named = mcp_paths(args)
+    except _TooLarge:
+        return (
+            f"the arguments of {name} nest deeper than {MCP_MAX_DEPTH} levels or hold more than {MCP_MAX_VALUES} values, "
+            "too many to check; blocked to be safe"
+        )
+    lower = name.lower()
+    writes = any(w in lower for w in _WRITE_WORDS)
+    lists = any(w in lower for w in _LIST_WORDS)
+    for path, folder in named:
+        why = (policy.is_denied_search(pol, path) if folder or lists else policy.is_denied_read(pol, path)) or (
+            policy.is_protected_write(protect, path) if writes else None
+        )
+        if why:
+            return f"{name}: {path[:120]!r}: {why}"
+    allowed = pol.gate.allow_mcp if pol.gate.allow_mcp is not None else policy.MCP_SHIPPED
+    if _mcp_match(allowed, name) is None:
+        return Ask(f"MCP tool {name} is not in allow_mcp (add it there to stop being asked)")
+    return None
+
+
+def mcp_bound_value(call: Call) -> str:
+    """What an approval of an MCP call is bound to: the tool and its exact arguments (a long set by its hash)."""
+    args = json.dumps(call.data.get("args"), sort_keys=True, ensure_ascii=True, default=str)
+    if len(args) > 1000:
+        args = f"sha256:{hashlib.sha256(args.encode()).hexdigest()} ({len(args)} characters)"
+    return f"{call.value} {args}"
+
+
 def evaluate(pol: policy.Policy, call: Call, protect: tuple[str, ...] = ()) -> str | None:
-    """The reason a call is denied, or None. The one place a neutral Call meets the policy."""
+    """The reason a call is denied, or None. The one place a neutral Call meets the policy. An MCP call the policy does
+    not name comes back as an `Ask`."""
     if call.kind == "command":
         return policy.is_denied_command(pol, call.value, protect=protect)
     if call.kind == "read":
@@ -76,6 +195,8 @@ def evaluate(pol: policy.Policy, call: Call, protect: tuple[str, ...] = ()) -> s
         return policy.is_protected_write(protect, call.value)
     if call.kind == "tool":
         return f"tool {call.value} is in deny_tools" if call.value in pol.gate.deny_tools else None
+    if call.kind == "mcp":
+        return _mcp_reason(pol, call, protect)
     if call.kind in ("agent", "skill", "message"):
         return None  # the policy has no rule for these; only guards judge them
     raise ValueError(f"unknown call kind {call.kind!r}")
@@ -117,11 +238,12 @@ def check(
     the reason is an `Ask`). With consume=False (inside the wall) a valid grant comes back as a Claim to be claimed
     from the launcher. The guards that are on judge the call after the rules: the first deny wins, an approvable one
     asks for approval the same way, and warnings and notes are added to `notes`. `layer`, when given, gets the kind of
-    the layer that made a refusal (preflight, rule:KIND, guard:NAME, ask_commands). `home` and `clock` are for the
+    the layer that made a refusal (preflight, rule:KIND, guard:NAME, ask_commands, ask_mcp). `home` and `clock` are for the
     guards (the ws home their state lives in, and the time). The rules, the guards and the approval check read the
     command under one clock (see shellwords.time_limit), so a command cannot take them one after another. The order is
     fixed: the preflight, then the policy's rules, then the guards that are on (lowest PRIORITY first, see ws.guards),
-    then `ask_commands`; the first refusal ends it and nothing after it is asked. `verdicts`, when given, gets one
+    then `ask_commands`, then the MCP tools `allow_mcp` does not name (asked for as `ask_commands` is, and logged as an
+    ask); the first refusal ends it and nothing after it is asked. `verdicts`, when given, gets one
     {guard, result, ms} for each guard that was asked."""
     with shellwords.time_limit():
         return _check(runner, raw, pol, protect, approval_root, consume, notes, layer, clock, home, verdicts)
@@ -151,9 +273,12 @@ def _check(
         _mark(layer, "preflight")
         return why
     calls = _calls(adapter, payload)
+    asks: list[tuple[Call, str]] = []  # an MCP call no rule names: the guards judge it first, then a person is asked
     for call in calls:
         reason = evaluate(pol, call, protect)
-        if reason:
+        if isinstance(reason, Ask):
+            asks.append((call, reason))
+        elif reason:
             _mark(layer, f"rule:{call.kind}")
             return reason
     session, cwd = _text(payload, "session_id"), _text(payload, "cwd")
@@ -190,6 +315,15 @@ def _check(
             if asked is not None:
                 _mark(layer, "ask_commands")
             return asked
+    for call, why in asks:
+        if approval_root is None:
+            _mark(layer, "ask_mcp")
+            return why
+        bound = approvals.Bound(runner, call.kind, mcp_bound_value(call), cwd, session)
+        asked = approvals.require(approval_root, bound, consume=consume, why_asked=str(why))
+        if asked is not None:
+            _mark(layer, "ask_mcp")
+            return asked if isinstance(asked, approvals.Claim) else Ask(asked)
     return None
 
 

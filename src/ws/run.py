@@ -1,6 +1,8 @@
 """`ws run JOB`: every headless job goes through here and leaves one complete record in `runs.jsonl`.
 
-    ws run JOB [--dry-run]         run `jobs/JOB.toml` in the config folder; --dry-run shows what would start and starts nothing
+    ws run JOB [--dry-run] [--parent RUN_ID]
+                                   run `jobs/JOB.toml` in the config folder; --dry-run shows what would start and starts nothing;
+                                   --parent spends from the reservation of a run in progress
     ws runs [--last N] [--json]    the last N records (default 10)
 
 The steps: load the job, profile and policy; refuse (exit 3, and still write a record with status "refused") when there
@@ -33,6 +35,10 @@ anyone else, so another user cannot plant one to steer the run. `ws uninstall` r
 then `ws-work` once it is empty; a run folder that holds anything stays, and so does everything above it, because what a
 job wrote is the person's.
 
+A `ws run` typed at the command line that ends refused, expired or failed sends one line through the notify role, if the
+profile has one (`ws.queue.notify_stop`); a run from the queue or an eval does not, because the queue says a stop when it
+gives a message up, not at each retry.
+
 Exit: 0 ok, 1 the runner failed or timed out, 2 the job could not be read (a record is written when the job name is
 safe), 3 refused (the cap or a purpose cap, the Rule of Two, an expired deadline, a store that cannot be used).
 """
@@ -41,6 +47,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import contextvars
 import dataclasses
 import json
 import os
@@ -412,6 +419,17 @@ def _refusal(prof: dict, verdict: policy.Verdict, job: jobs.Job, adapter) -> tup
     return None
 
 
+def _announce_stop(rec: dict) -> None:
+    """For a `ws run` typed at the command line: say once, through the notify role, that the run stopped. Call it after
+    the record is written and the reservation settled. A run that ended `ok`, or was cut short (`preempted`,
+    `interrupted`: SIGTERM, Ctrl-C) is not announced; the person or the scheduler did that."""
+    if not _says_stops.get() or rec.get("status") in (None, "ok", "preempted"):
+        return
+    if rec.get("stop_reason") in ("preempted", "interrupted"):
+        return
+    queue.notify_stop(rec["job"], rec["run_id"], rec.get("stop_reason") or rec["status"])
+
+
 def _append(log: Path, rec: dict) -> bool:
     """Write the record. A log that cannot be written (its lock held, the disk full) gets the record in the fallback
     file instead, with a warning, and that counts as written: the spend is in `runs.fallback.jsonl`, which `read` and
@@ -447,6 +465,7 @@ def _refuse(rec: dict, reason: str, path: Path, stop_reason: str, status: str = 
     _append(path, rec)
     print(f"ws: refused: {reason}", file=sys.stderr)
     print(f"ws: refusal recorded as {rec['run_id']}", file=sys.stderr)
+    _announce_stop(rec)
     return EXIT_REFUSED
 
 
@@ -475,6 +494,7 @@ def _bad_job(name: str, message: str, log: Path, job: jobs.Job | None = None, re
     )
     if _append(log, rec):
         print(f"ws: recorded as {rec['run_id']}", file=sys.stderr)
+    _announce_stop(rec)
     return EXIT_BAD_JOB
 
 
@@ -512,9 +532,18 @@ class Queued:
     waited: str | None = None
 
 
+# True while `ws run` itself runs: its refusals and failures are final, so each is told once through the notify role.
+# A queued run, and an eval's, leave it off: the queue says a stop only when it gives the message up, not at each retry.
+_says_stops: contextvars.ContextVar[bool] = contextvars.ContextVar("ws_run_says_stops", default=False)
+
+
 def cmd_run(args: argparse.Namespace) -> int:
-    with _term_becomes_exit():
-        return _run(args)
+    token = _says_stops.set(True)
+    try:
+        with _term_becomes_exit():
+            return _run(args)
+    finally:
+        _says_stops.reset(token)
 
 
 def run_job(
@@ -560,6 +589,13 @@ def _run(
             f"job {job.name}: purpose {job.purpose!r} is not in [budget.purposes] of the policy (known: {known})",
             log, job, record,
         )  # fmt: skip
+    parent = getattr(args, "parent", None)
+    if parent:
+        if not jobs.NAME.match(parent):
+            return _bad_job(
+                job.name, f"--parent {parent!r} is not a run id (letters, digits, - and _)", log, job, record
+            )
+        job = dataclasses.replace(job, parent_run=parent)
     started = datetime.now(UTC)  # the one clock reading of this run: its month, its lease, its deadline check
     run_id = queued.run_id if queued else runrecord.new_run_id(started)
     run_dir = home / "runs" / run_id
@@ -650,6 +686,7 @@ def _run(
         written = _append(log, rec)
         _settle(ledger, res, rec, written, (unknown_run_usd, fallback_usd_per_mtok))
         print(f"ws: {rec['error']}", file=sys.stderr)
+        _announce_stop(rec)
         return EXIT_FAILED
     rec["exe_path"] = exe
     return _execute(
@@ -788,6 +825,7 @@ def _execute(
             print(f"ws: interrupted; recorded as {rec['run_id']}", file=sys.stderr)
         written = _append(log, rec)
         _settle(ledger, res, rec, written, (unknown_run_usd, fallback_usd_per_mtok))
+        _announce_stop(rec)
         if hook is not None:  # after the write: a signal or a crash in the hook cannot lose the record
             with contextlib.suppress(Exception):
                 hook(rec)
@@ -854,6 +892,11 @@ def register(sub) -> None:
     )
     r.add_argument("job", help="the job name: jobs/<name>.toml in the config folder")
     r.add_argument("--dry-run", action="store_true", help="show what would start, and whether it would be refused")
+    r.add_argument(
+        "--parent",
+        metavar="RUN_ID",
+        help="reserve only from what this run in progress has left (on top of the monthly cap)",
+    )
     r.set_defaults(func=cmd_run)
     s = sub.add_parser("runs", help="show the last records of `ws run`")
     s.add_argument("--last", type=_positive, default=10, metavar="N", help="how many (default 10)")

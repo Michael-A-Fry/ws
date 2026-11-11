@@ -50,8 +50,9 @@ the built-in default, which has the list below.
 |---|---|---|---|
 | `deny_commands` | list of text | `[]` in a file | Shell command patterns no session may run. `ws gate init` writes the [built-in list](#built-in-deny_commands). |
 | `deny_read` | list of text | `[]` in a file | Paths no session may read. `~/` is your home. `**` crosses folders. `ws gate init` writes `~/.ssh/**`, `~/.gnupg/**`, `~/.aws/credentials`, `~/.config/ws/secrets/**` and `~/.local/share/ws/secrets/**`. Whatever the file says, ws also denies reads of its own secrets folder (`secrets/` in the data folder, and the `[roles.secrets] store` folder when the profile names one), for every runner. |
-| `deny_tools` | list of text | `[]` | Neutral tool names to switch off. Known: `web_fetch`, `web_search`. An allowed web tool counts as a way out. |
+| `deny_tools` | list of text | `[]` | Tools to switch off: the neutral names `web_fetch` and `web_search` (an allowed web tool counts as a way out), and MCP tools by name or glob (`mcp__server__tool`, `mcp__server__*`, `mcp__*__delete_*`). |
 | `ask_commands` | list of text | `[]` | Command patterns that run only after you approve that exact call. Same globs as `deny_commands`. A command that also matches `deny_commands` stays denied. |
+| `allow_mcp` | list of text | the tools `ws mcp serve` offers | MCP tools a session may call without being asked, by name or glob (`mcp__ws__*`). An MCP tool this list doesn't name is asked for: a person approves that exact call, once, as for `ask_commands`. `deny_tools` beats it. Leave the key out and only `mcp__ws__memory_search`, `mcp__ws__memory_add` and `mcp__ws__note_capture` are allowed; naming it, even as `[]`, replaces them. |
 | `allow_hosts` | list of text | `[]` | Hosts a session's shell may reach, for runners whose sandbox filters the network (Claude Code). Empty means the policy says nothing about the network. |
 | `allow_write` | list of text | `[]` | Folders besides the project that a walled session may write. |
 | `sandbox` | true or false | `true` | Switch on the runner's own sandbox in what ws writes (Claude Code), both for a session started with `ws gate launch` and for one started the usual way once `ws install` has merged the settings into your file. `false` leaves the block out and marks the session unsandboxed, and `ws doctor` (WS012) says so. |
@@ -73,7 +74,17 @@ Rules:
 - `allow_write` items must be a folder, absolute or under `~/` (`$HOME` is accepted), with no wildcard, not `/` and
   not the
   home folder after `.` and `..` are resolved.
-- `deny_tools` items must be a known tool name.
+- `deny_tools` items must be a known tool name or an MCP tool name or glob. `allow_mcp` items must be an MCP tool name
+  or glob. An MCP name is `mcp__`, then letters, digits and `_ - . * ?`, with no empty part (`mcp__`, `mcp____y` and a
+  trailing `__` are refused). A malformed item refuses the whole policy and names the key. A glob matches the full
+  tool name; `*` matches anything, including `__`.
+- An MCP call's path-like arguments go through `deny_read` (a listing or search tool through the folder rule, so a
+  folder above a denied one is refused) and, for a tool whose name says it writes (write, edit, create, delete, remove,
+  move, rename, save, append, patch, mkdir), through the protected-write check. Path-like means the value of a key
+  that names a path (`path`, `file`, `filename`, `dir`, `directory`, `root`, `source`, `destination`, `target`, `uri`,
+  and a key that ends in one of those words), a string that starts with `/`, `~`, `./` or `../`, and a `file://`
+  address, found in nested lists and maps. Arguments nested more than 8 levels or holding more than 2000 values are a
+  deny.
 
 ### Built-in `deny_commands`
 

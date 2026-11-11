@@ -105,6 +105,7 @@ def test_claude_code_settings(home, tmp_path, capsys):
         "Write",
         "MultiEdit",
         "NotebookEdit",
+        "mcp__.*",  # every MCP tool (tests/test_gate_mcp.py)
     ]
     policy_file = (home / "wshome" / "policy.toml").resolve()
     # absolute paths: the hook reads this policy wherever the runner starts, and protects this folder

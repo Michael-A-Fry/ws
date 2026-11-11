@@ -15,9 +15,17 @@ same code, in one `BEGIN IMMEDIATE` transaction, so a direct run and a queued on
   * money: the profile's monthly cap and, for a job with a `purpose`, that purpose's cap in `[budget.purposes]`. Spend is
     the month's records in `runs.jsonl` plus the open reservations (a settled reservation is not counted again: its
     record is). Every window is the UTC calendar month (`policy.budget_month`), read from one clock reading.
+  * a child's money: a job with a `parent_run` (a run in progress) may reserve only what is left of that run's
+    reservation, less what its other children hold or have spent, and also has to fit the monthly and purpose counters
+    like any run. A parent that is not running, has no room left, or is itself a child refuses it (`parent_not_running`,
+    `parent_budget`, `parent_is_child`: one level only). The child's reservation counts in the monthly and purpose sums
+    beside the parent's own, so while both are live the same dollars are counted twice. That is deliberate and
+    conservative: ws sees a parent's own spend only when it settles, so the parent's reservation cannot stand for the
+    month. A run that reported no cost counts at `runrecord.UNKNOWN_RUN_USD` here as everywhere.
   * turns and seconds in flight, concurrency (per lane: `ui` holds one at a time), and host memory: MemAvailable must stay at
-    or above `reserve_pct` of the total after the job's `ram_gb`. A system that cannot report memory admits, and the
-    reservation says so.
+    or above `reserve_pct` of the total after the job's `ram_gb`. `memory_reserved_gb` (memory promised to VMs, containers
+    or services that have not taken it yet) is taken off MemAvailable before that test. A system that cannot
+    report memory admits, and the reservation says so.
   * the subscription limits Claude Code reports, for a job that uses a login rather than a key: a fresh capture at 100
     percent refuses it; no fresh capture is unknown, and unknown is never room.
 
@@ -36,6 +44,12 @@ at its actuals and requeued (a `preemptible` job, if the deadline allows); a tim
 interruption backs off 30 s, 1 m, 5 m, three tries; anything else is permanent. A deadline that has passed ends a run as
 `expired`, without running it. A queued job must use an API-key credential through `[[secrets]]` or a local provider:
 unattended work never draws on a subscription login.
+
+A job that stops for good (refused, over a cap, a slot wait that timed out, or failed after its tries) sends one short
+line through the notify role, if `[roles.notify]` has an adapter that sends (`notify_stop`). A retry, a requeue and a
+wait are not stops. No notify role is silence, and a notice that cannot be sent is dropped: it never changes what the job
+came to. The line counts as one alert against the adapter's daily allowance. A reservation reaped after a crash is not
+announced.
 
 `add`, `cancel` and `run` are refused in a gated session; `list`, `show` and `slot` are not. Limits default to the
 constants below and are read from `[roles.queue]` in the profile.
@@ -65,7 +79,7 @@ from ws.output import WsError
 from ws.profile import ProfileError, load, profile_path
 
 COMMAND = "queue"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 EXIT_FAILED, EXIT_BAD_JOB, EXIT_REFUSED = 1, 2, 3
 STATUSES = ("queued", "running", "ok", "error", "refused", "preempted", "skipped", "interrupted", "expired")
 ACTIVE = ("queued", "running")
@@ -78,6 +92,7 @@ MAX_OPEN_TURNS = 2000  # turns reserved by runs in flight
 MAX_OPEN_SECONDS = 86400.0  # seconds reserved by runs in flight
 DEFAULT_TURNS = 30  # reserved for a job that names no max_turns
 RESERVE_PCT = 15.0  # MemAvailable must stay at or above this share of the total
+MEMORY_RESERVED_GB = 0.0  # memory promised to others (VMs, containers, services) that have not taken it yet
 JOIN_HEADROOM_GB = 2.0  # memory kept free beside a writer's ui run, for a join's
 RAMP_S = 60.0  # a new run's declared memory counts on top of MemAvailable this long, while it grows into it
 LEASE_SLACK_S = 120.0  # a reservation's lease is the job's timeout plus this
@@ -102,6 +117,7 @@ _LIMIT_KEYS = {
     "max_open_seconds": ("num", MAX_OPEN_SECONDS),
     "default_turns": ("int", DEFAULT_TURNS),
     "reserve_pct": ("pct", RESERVE_PCT),
+    "memory_reserved_gb": ("num0", MEMORY_RESERVED_GB),
     "join_headroom_gb": ("num0", JOIN_HEADROOM_GB),
     "ramp_s": ("num0", RAMP_S),
     "busy_s": ("num0", BUSY_S),
@@ -137,6 +153,7 @@ CREATE TABLE IF NOT EXISTS receipts (
     record_written INTEGER NOT NULL DEFAULT 1,
     stop_reason TEXT,
     note TEXT,
+    parent_run_id TEXT,
     CHECK ((status IN ('queued', 'running')) = (finished_at IS NULL)),
     CHECK (settled = 0 OR finished_at IS NOT NULL)
 );
@@ -191,6 +208,7 @@ class Limits:
     max_open_seconds: float = MAX_OPEN_SECONDS
     default_turns: int = DEFAULT_TURNS
     reserve_pct: float = RESERVE_PCT
+    memory_reserved_gb: float = MEMORY_RESERVED_GB
     join_headroom_gb: float = JOIN_HEADROOM_GB
     ramp_s: float = RAMP_S
     busy_s: float = BUSY_S
@@ -262,6 +280,7 @@ class Request:
     deadline: datetime | None = None
     lease_s: float | None = None
     owner_pid: int | None = None
+    parent_run_id: str | None = None  # a live run whose reservation this one spends from, not the monthly counters
 
 
 @dataclass(frozen=True)
@@ -455,6 +474,7 @@ class Ledger:
         costing: tuple[float | None, float | None] = (None, None),
         recorded: Callable[[str], dict | None] | None = None,
         sink: Callable[[dict], bool] | None = None,
+        on_stop: Callable[[str, str, str], None] | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self.state = Path(state)
@@ -467,6 +487,7 @@ class Ledger:
         self.probe, self.costing = probe, costing
         self.rate_limits = rate_limits or (lambda now: usage.read_rate_limits(self.state, now))
         self.recorded, self.sink, self.clock = recorded, sink, clock
+        self.on_stop = on_stop
         self._conn: sqlite3.Connection | None = None
         self._engine: sqlqueue.SqlQueue | None = None
 
@@ -509,6 +530,9 @@ class Ledger:
                     for stmt in _SCHEMA.split(";"):
                         if stmt.strip():
                             c.execute(stmt)
+                    if "parent_run_id" not in {r[1] for r in c.execute("PRAGMA table_info(receipts)")}:
+                        c.execute("ALTER TABLE receipts ADD COLUMN parent_run_id TEXT")  # a store from schema 1
+                    c.execute("CREATE INDEX IF NOT EXISTS receipts_parent ON receipts(parent_run_id)")
                     c.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         except BaseException:
             c.close()
@@ -595,6 +619,29 @@ class Ledger:
         if req.usd > 0:
             held = "SELECT SUM(reserved_usd) FROM receipts WHERE status = 'running' AND month = ? AND run_id != ?"
             lost = "SELECT SUM(actual_usd) FROM receipts WHERE settled = 1 AND record_written = 0 AND month = ?"
+            if req.parent_run_id is not None:
+                parent = c.execute(
+                    "SELECT status, reserved_usd, parent_run_id FROM receipts WHERE run_id = ?", (req.parent_run_id,)
+                ).fetchone()
+                if parent is not None and parent["parent_run_id"] is not None:
+                    refusals.append(
+                        ("parent_is_child", f"parent run {req.parent_run_id} is itself a child, and children are one level deep",
+                         "name the top run as the parent")
+                    )  # fmt: skip
+                elif parent is None or parent["status"] != "running" or req.parent_run_id == req.run_id:
+                    refusals.append(
+                        ("parent_not_running", f"parent run {req.parent_run_id} is not a run in progress, so there is no reservation to spend from",
+                         "start the child while its parent runs, or remove parent_run")
+                    )  # fmt: skip
+                else:
+                    kin = "FROM receipts WHERE parent_run_id = ? AND run_id != ?"
+                    live = one(f"SELECT SUM(reserved_usd) {kin} AND status = 'running'", req.parent_run_id, req.run_id)
+                    done = one(f"SELECT SUM(actual_usd) {kin} AND settled = 1", req.parent_run_id, req.run_id)
+                    reserved = parent["reserved_usd"]
+                    rooms.append(("parent_budget", reserved - live - done, _parent_reason(reserved, live, done)))
+                    counters.append("parent_budget")
+            # the parent's room is checked as well as, never instead of, the month's and the purpose's: a parent's own spend
+            # is not known while it runs, so the parent's reservation alone cannot stand for the month
             if req.cap_usd is not None:
                 reserved = one(held, month, req.run_id) + one(lost, month)
                 room = req.cap_usd - spend.total - reserved
@@ -646,8 +693,14 @@ class Ledger:
             notes.append("memory not reported on this system")
         elif mem is not None:
             avail, total = mem
+            avail -= self.limits.memory_reserved_gb  # promised to others that have not taken it yet
             reserve = total * self.limits.reserve_pct / 100
             headroom = self.limits.join_headroom_gb if req.who == "writer" else 0.0
+            held_for_others = (
+                f" (after {self.limits.memory_reserved_gb:g} GB held for others)"
+                if self.limits.memory_reserved_gb
+                else ""
+            )
             ramping = one(
                 "SELECT SUM(ram_gb) FROM receipts WHERE status = 'running' AND run_id != ? AND started_at > ?",
                 req.run_id, ns - int(self.limits.ramp_s * 1e9),
@@ -659,7 +712,7 @@ class Ledger:
                 )  # fmt: skip
             elif avail - ramping - req.ram_gb < reserve + headroom:
                 waits.append(
-                    ("memory", f"{avail - ramping:.1f} GB is free; {req.ram_gb:g} GB plus {reserve + headroom:.1f} GB kept free does not fit",
+                    ("memory", f"{avail - ramping:.1f} GB is free{held_for_others}; {req.ram_gb:g} GB plus {reserve + headroom:.1f} GB kept free does not fit",
                      "wait for memory to come back")
                 )  # fmt: skip
             counters.append("memory")
@@ -737,7 +790,7 @@ class Ledger:
                 job=req.job, purpose=req.purpose, lane=req.lane, who=req.who, status="running", month=r.month,
                 started_at=ns, reserved_usd=r.usd, reserved_turns=r.turns, reserved_s=r.seconds, ram_gb=r.ram_gb,
                 resized=int(r.resized), lease_expires_at=lease, owner_pid=pid, owner_start_time=start,
-                claim_id=r.claim_id, note="; ".join(r.notes) or None,
+                claim_id=r.claim_id, note="; ".join(r.notes) or None, parent_run_id=req.parent_run_id,
                 deadline=to_ns(req.deadline) if req.deadline else None,
             )  # fmt: skip
             self._upsert(c, req.run_id, ns, cols)
@@ -819,6 +872,14 @@ class Ledger:
                     raise store_error(e) from e
                 time.sleep(0.2)
         return False  # unreachable
+
+    def stopped(self, job: str, run_id: str, reason: str) -> None:
+        """Say once that a job has stopped for good (`on_stop(job, run_id, reason)`). Never raises, and never changes
+        what the job came to. Call it after the transaction that ended the job, not inside it."""
+        if self.on_stop is None:
+            return
+        with contextlib.suppress(Exception):
+            self.on_stop(job, run_id, reason)
 
     # -- reaping ------------------------------------------------------------------------------------------------
 
@@ -1098,7 +1159,13 @@ def _cap_reason(cap: float, spent: float, reserved: float, purpose: str | None =
     return f"{who}this month's spend, US${spent:.4f}, is at the monthly cap of US${cap:g}"
 
 
+def _parent_reason(reserved: float, live: float, done: float) -> str:
+    return f"the parent reserved US${reserved:g}; its other children hold US${live:.4f} and have spent US${done:.4f}"
+
+
 def _cap_hint(counter: str) -> str:
+    if counter == "parent_budget":
+        return "raise the parent's budget_usd, or lower this job's"
     if counter.startswith("purpose:"):
         return f"raise [budget.purposes] {counter.split(':', 1)[1]} in policy.toml, or wait for the next UTC month"
     return "raise monthly_cap_usd in [roles.budget] of the profile, or wait for the next UTC month"
@@ -1138,7 +1205,7 @@ def request_for(
         job=job.name, run_id=run_id, purpose=job.purpose, usd=float(job.budget_usd or unknown_run_usd or runrecord.UNKNOWN_RUN_USD),
         explicit_usd=job.budget_usd is not None, strict=job.strict, cap_usd=cap_usd, purpose_cap_usd=purpose_cap_usd,
         turns=int(job.max_turns or limits.default_turns), seconds=float(job.timeout_s), ram_gb=job.resources.ram_gb,
-        lane=job.resources.slot, credential=credential_kind(job), deadline=job.deadline,
+        lane=job.resources.slot, credential=credential_kind(job), deadline=job.deadline, parent_run_id=job.parent_run,
     )  # fmt: skip
 
 
@@ -1234,6 +1301,7 @@ def drain(
         item = Item(msg, data["job"], data.get("purpose"), deadline, run_id, ledger)
         outcome = runner(item)
         now = ledger.clock()
+        stop = ""
         act = classify(outcome, tries=msg.tries, preemptible=preemptible(item.job), deadline=deadline, now=now)
         with _transaction(ledger.conn()) as c:
             if act.kind == "done":
@@ -1244,10 +1312,13 @@ def drain(
                 ledger.end_queued(
                     run_id, "refused" if refused else "error", outcome.stop_reason, act.why or "failed", now
                 )
+                stop = outcome.stop_reason or outcome.status or "failed"
             else:
                 eng.retry(msg.message_id, msg.claim_id, delay_s=act.delay_s, count_try=act.count_try)
                 if act.kind != "wait":
                     ledger.new_attempt(c, msg.message_id, item.job, item.purpose, now, deadline)
+        if act.kind == "fail":  # a message that is retried, requeued or waiting has not stopped yet
+            ledger.stopped(item.job, run_id, stop)
         done.append(
             {
                 "run_id": run_id,
@@ -1303,6 +1374,36 @@ def run_item(item: Item) -> Outcome:
 
 
 # ---------------------------------------------------------------------------------------------------------------------
+# Telling the person a job has stopped
+
+
+def notify_stop(
+    job: str, run_id: str, reason: str, *, prof: dict | None = None, env=None, sender=None, now: datetime | None = None
+) -> bool:
+    """One short line through the notify role when a job stops for good: refused, over a cap, a wait that timed out, or
+    failed. True if it was sent. No `[roles.notify]` with the `ntfy` adapter in the profile (`prof`, else the one `env`
+    names) is silence, and so is every failure to send: this never raises and never changes what the job came to. The
+    line counts as one alert against the adapter's daily allowance, so a burst of stops cannot flood the topic, and a
+    dead server costs the alert path's short wait once and then backs off. With `alert_text = "plain"` it names no job."""
+    try:
+        from ws.roles import ntfy  # here, not at the top: the queue runs without a notify role
+
+        env = os.environ if env is None else env
+        if prof is None:
+            prof = load(profile_path(env)) or {}
+        roles = prof.get("roles") if isinstance(prof.get("roles"), dict) else {}
+        cfg = roles.get("notify")
+        if not isinstance(cfg, dict) or cfg.get("adapter") != ntfy.NAME:
+            return False
+        why = " ".join(str(reason).split())[:80]
+        line = "a job stopped" if cfg.get("alert_text") == "plain" else f"{' '.join(job.split())[:64]} stopped"
+        ntfy.send(cfg, env, f"{line}: {why}" if why else line, "ws job", "alert", now, sender)
+        return True
+    except Exception:  # noqa: BLE001  a notice is never worth a job's outcome; NotifyError and CapReached land here too
+        return False
+
+
+# ---------------------------------------------------------------------------------------------------------------------
 # Waiting for a slot
 
 
@@ -1337,9 +1438,11 @@ def wait_for_slot(
             if d.kind == "admit":
                 return d.reservation  # type: ignore[return-value]
             if d.kind == "refuse":
+                ledger.stopped(req.job, req.run_id, d.stop_reason)
                 raise SlotRefused(d)
             waited = (ledger.clock() - t0).total_seconds()
             if timeout_s is not None and waited >= timeout_s:
+                ledger.stopped(req.job, req.run_id, "wait_timeout")
                 raise SlotTimeout(waited, d)
             if d.counter != told:
                 told = d.counter
@@ -1373,6 +1476,7 @@ def ledger_from_profile(prof: dict, state: Path, log: Path) -> Ledger:
         costing=(num("unknown_run_usd"), num("fallback_usd_per_mtok")),
         recorded=lambda rid: next((r for r in runrecord.read(log) if r.get("run_id") == rid), None),
         sink=lambda rec: _write_record(log, rec),
+        on_stop=lambda job, run_id, reason: notify_stop(job, run_id, reason, prof=prof),
     )
 
 

@@ -13,6 +13,7 @@ from pathlib import Path
 import ws
 from ws import (
     __version__,
+    agentsession,
     approvals,
     broker,
     canary,
@@ -398,6 +399,7 @@ def main(argv: list[str] | None = None) -> int:
         if spec is not None:
             return extcmd.launch(spec)
         args = parser.parse_args(rest)
+        agentsession.guard(args)  # an admin command refuses to run inside an agent session, however it was spelled
         # `or g.no_color` keeps `ws setup --no-color` working: the global flag is taken out of argv before the parser
         # sees it, so setup's own flag would otherwise never be set
         args.no_color = bool(getattr(args, "no_color", False)) or g.no_color

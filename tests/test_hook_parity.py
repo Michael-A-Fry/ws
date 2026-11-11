@@ -171,6 +171,44 @@ def test_parity_claims(box):
     assert say(f"committed {off} on a branch, not merged") == "allow"
 
 
+@needs_git
+@pytest.mark.parametrize("how", ["timeout", "budget", "no-start"])
+def test_claims_deny_when_git_cannot_answer_in_time(box, monkeypatch, how):
+    """The WSL2 red: a slow git used up the claims budget and the guard let the message through as "can't tell". The
+    gate fails closed (ADR 0017), so a claim it can't reach git to check is denied, whatever stopped git."""
+    from ws.guards import claims
+
+    repo = box / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    (repo / "a").write_text("1")
+    git(repo, "add", "a")
+    git(repo, "commit", "-q", "-m", "first")
+    on = git(repo, "rev-parse", "--short=10", "HEAD")
+    git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+    pol = policy.loads('[guards]\non = ["claims"]\n')
+
+    def say(text: str) -> str:
+        return verdict(pol, call("SendMessage", cwd=repo, to="lead", message=text))
+
+    def broken(argv, **k):
+        if how == "timeout":
+            raise subprocess.TimeoutExpired(argv, k["timeout"])
+        raise PermissionError("git would not start")
+
+    assert say(f"merged {on} into main") == "allow"  # git answers: a true claim
+    real_budget = claims.Budget
+    with monkeypatch.context() as m:
+        if how == "budget":
+            m.setattr(claims, "Budget", lambda: real_budget(0.0))
+        else:
+            m.setattr(claims.subprocess, "run", broken)
+        assert say(f"merged {on} into main") == "deny"  # the same claim, git not reachable in time
+        assert say(f"{on} is on main") == "deny"
+        assert say("the ed25519 key is on main") == "allow"  # the true negatives never needed git
+        assert say(f"committed {on} on a branch, not merged") == "allow"
+
+
 # --- row 8: session context ---------------------------------------------------------------------------------------
 
 

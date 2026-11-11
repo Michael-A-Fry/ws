@@ -57,11 +57,25 @@ What the policy holds:
 - `deny_commands`: shell command patterns. `*` matches anything. The default list covers recursive deletes of system
   folders, forcing a push, `mkfs`, `dd` to a device, and a shell that reads its script from standard input.
 - `deny_read`: paths no session may read, such as `~/.ssh/**`.
-- `deny_tools`: neutral tool names to switch off (`web_fetch`, `web_search`).
+- `deny_tools`: tools to switch off: the neutral names `web_fetch` and `web_search`, and MCP tools by name or glob.
+- `allow_mcp`: the MCP tools a session may call without being asked.
 - `ask_commands`: commands that run only after you approve that exact call. See [Approvals](approvals.md).
 - `allow_hosts` and `allow_write`: network hosts and extra writable folders for the wall.
 
 The full list of keys is in the [policy reference](../reference/policy.md).
+
+## MCP tools
+
+An MCP tool (a call named `mcp__server__tool`) can do anything its server does, so the gate judges it like any other
+call. A `deny_tools` entry or glob that matches its name denies it. A tool that `allow_mcp` doesn't name is asked for,
+the way `ask_commands` asks: the call is held, `ws approve` shows the tool and its exact arguments, and the identical
+retry runs once. Out of the box only the tools `ws mcp serve` offers are allowed. The arguments are read too: a value
+that looks like a path goes through `deny_read`, and through the protected-write check when the tool's name says it
+writes, so an allowed file tool still can't read a sealed folder. Arguments too deeply nested or too many to read are a
+deny. On Claude Code the hook runs for every MCP tool. OpenCode's hook payload can't tell an MCP tool from a built-in
+one, so there only a `deny_tools` entry with a literal server name is enforced (see
+[known limits](known-limits.md#opencode-cannot-tell-mcp-tools-from-its-own)). The reasoning is in
+[decision 0021](../decisions/0021-the-gate-judges-mcp-tool-calls.md).
 
 ## What the gate doesn't stop
 

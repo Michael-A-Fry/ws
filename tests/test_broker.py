@@ -25,6 +25,10 @@ from ws import broker
 from ws import secrets as wsecrets
 
 VALUE = "planted-" + os.urandom(12).hex()
+# `python -c` boot for a child `ws`: its process tree is read as empty (a test run by an agent sits under a runner)
+NO_RUNNER_ABOVE = (
+    "import sys; from ws import agentsession, cli; agentsession.read_ancestry = list; sys.exit(cli.main(sys.argv[1:]))"
+)
 
 
 class Stub(ThreadingHTTPServer):
@@ -632,7 +636,7 @@ def test_cli_round_trip_through_real_processes(base, stub):
     (home / "secrets.toml").write_text(f'[anthropic]\nhosts = ["{stub.host}"]\n', encoding="utf-8")
     envv = {**os.environ, "WS_HOME": str(home)}
     envv.pop("WS_BROKER_SOCKET", None)
-    ws = [sys.executable, "-m", "ws"]
+    ws = [sys.executable, "-c", NO_RUNNER_ABOVE]  # the process under test: a tree with no runner above it
     r = subprocess.run(
         [*ws, "secret", "set", "anthropic"], input=VALUE + "\n", env=envv, capture_output=True, text=True, check=False
     )

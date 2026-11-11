@@ -106,7 +106,9 @@ from ws.policy import Policy, native_patterns, sandbox_read_paths, sandbox_write
 
 NAME = "claude-code"
 FILE = "settings.json"
-MATCHER = "Bash|Read|Grep|Glob|WebFetch|WebSearch|Edit|Write|MultiEdit|NotebookEdit"
+# `mcp__.*` makes Claude Code read the matcher as a regular expression, which is not anchored: the hook also runs for
+# a tool whose name merely contains one of the others (TodoWrite), and `parse` lets those through.
+MATCHER = "Bash|Read|Grep|Glob|WebFetch|WebSearch|Edit|Write|MultiEdit|NotebookEdit|mcp__.*"
 _TOOLS = {"web_fetch": "WebFetch", "web_search": "WebSearch"}
 _NEUTRAL = {v: k for k, v in _TOOLS.items()}
 # The project files that run as code, at any depth. These are the Edit locks in the user's own settings.json (every
@@ -375,7 +377,8 @@ def generate(
                 f"Edit(**/{rel})",
                 f"Edit(**/{rel}/**)",
             ]  # at any depth: a runner started in a sub-folder reads that one
-    deny += [_TOOLS[t] for t in policy.gate.deny_tools]
+    # an MCP tool named exactly is denied natively too; a glob is the hook's alone (Claude Code's rules have no glob there)
+    deny += [_TOOLS.get(t, t) for t in policy.gate.deny_tools if t in _TOOLS or not re.search(r"[*?]", t)]
     pin = pin or paths.pin_of()
     wall = policy.gate.sandbox
     hook = (
@@ -410,11 +413,16 @@ def generate(
 
 
 def parse(payload: dict) -> Call | list[Call] | None:
-    """A PreToolUse payload: {"tool_name": "Bash", "tool_input": {"command": ...}, ...}."""
+    """A PreToolUse payload: {"tool_name": "Bash", "tool_input": {"command": ...}, ...}. An MCP tool
+    (`mcp__SERVER__TOOL`) is a Call of kind "mcp" holding its arguments."""
     name = payload.get("tool_name")
     inp = payload.get("tool_input")
     if not isinstance(name, str) or not isinstance(inp, dict):
         raise TypeError("payload has no tool_name and tool_input")
+    if name.startswith(
+        "mcp__"
+    ):  # an MCP tool: any arguments, judged by ws.gate (deny_tools, allow_mcp, path-like values)
+        return Call.of("mcp", name, args=inp)
     if name == "Bash":
         return Call("command", _text(inp, "command"))
     if name == "Read":

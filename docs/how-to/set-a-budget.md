@@ -55,7 +55,25 @@ read [The budget](../explanation/budget.md).
    purpose = "jobs"   # in the job file
    ```
 
-5. Check the cap without starting a run.
+5. Optional: let a run's children spend from its budget. A child that names a run in progress as its parent
+   (`parent_run` in the job file, or `ws run child --parent RUN_ID`) is checked against what that run reserved, less what
+   its other children hold or have spent, and also against the monthly and purpose caps like any run, so a parent never
+   raises either. It shrinks to the room left (or is refused with `strict = true`), and is refused if the parent has
+   finished or is itself a child (one level only). While both are live the same dollars count twice; that's
+   deliberate, to stay on the safe side.
+
+6. Optional: tell the queue about memory you have promised elsewhere. Memory for a VM, a container or a service that
+   hasn't taken it yet is still in MemAvailable. Name it, and it's taken off before the check:
+
+   ```toml
+   [roles.queue]
+   memory_reserved_gb = 6
+   ```
+
+7. Optional: hear about a job that stops. With a `[roles.notify]` adapter set up, a run that's refused, goes over a cap,
+   times out waiting for a slot or fails sends one short line. A retry sends nothing, and no notify role means no line.
+
+8. Check the cap without starting a run.
 
    ```sh
    ws run daily --dry-run
@@ -63,30 +81,31 @@ read [The budget](../explanation/budget.md).
 
    The output includes `month_spend_usd`, `monthly_cap_usd` and `would_refuse`.
 
-6. Check the setting with the doctor.
+9. Check the setting with the doctor.
 
    ```sh
    ws doctor
    ```
 
-7. Read the records that add up to the spend.
+10. Read the records that add up to the spend.
 
-   ```sh
-   ws runs --last 5
-   ```
+    ```sh
+    ws runs --last 5
+    ```
 
 ## Success
 
-Step 4 prints `"monthly_cap_usd": 20.0` and `"would_refuse": null`. WS103 shows `ok` with `monthly cap US$20`.
+Step 8 prints `"monthly_cap_usd": 20.0` and `"would_refuse": null`. WS103 shows `ok` with `monthly cap US$20`.
 
-Without a cap, step 4 prints `"would_refuse": "no monthly budget cap (WS103): ..."`, and `ws run daily` exits with
+Without a cap, step 8 prints `"would_refuse": "no monthly budget cap (WS103): ..."`, and `ws run daily` exits with
 code 3.
 
 ## If a run is refused
 
 `ws run` exits 3 and writes a record with status `refused`. The reason is on standard error, and the record's
 `stop_reason` names the counter (`refused:profile_cap`, `refused:purpose:jobs`, `refused:memory` and others). It's one of:
-no cap, spend plus the runs in progress at the cap, a purpose at its own cap, a slot or memory that's full, a Rule of
+no cap, spend plus the runs in progress at the cap, a purpose at its own cap, a slot or memory that's full, a parent
+that has finished or has no budget left for the child (`refused:parent_not_running`, `refused:parent_budget`), a Rule of
 Two refusal, a model the runner can't price, a deadline that has passed, or a queue database that's locked or full (a run
 never starts without a reservation). For the unpriced model, set `allow_unpriced = true` in the job
 file to run anyway. The run then counts at your fallback price.

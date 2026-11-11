@@ -4,9 +4,10 @@
 session (Claude Code's `settings.json`, OpenCode's `opencode.json`), so a session started the usual way is gated too.
 The promises, each pinned by a test:
 
-- Yours stays. Your hooks, permissions, env and keys ws does not use are never touched, and their order is kept. ws
-  appends its items; it refuses, and changes nothing, when one of your values would be overridden (an `env` key you set
-  to another value, or `permissions.disableBypassPermissionsMode` set to anything but "disable").
+- Yours stays. Your hooks, permissions, env and keys ws does not use are never touched, and their order is kept, with
+  one exception (the OpenCode rule order below). ws appends its items; it refuses, and changes nothing, when one of your
+  values would be overridden (an `env` key you set to another value, or `permissions.disableBypassPermissionsMode`
+  set to anything but "disable").
 - Before the first write the file's own bytes go to `backups/` in ws's state folder (mode 0600).
 - The manifest records the items ws added, as exact JSON, the items the release asked for (`wanted_ops`, so doctor can
   see a later release stop asking for one), and the hash of ws's last write.
@@ -23,8 +24,11 @@ The promises, each pinned by a test:
   the wall as widened.
 - The sandbox is not switched on for you. Entries an earlier ws wrote without the block (`WS_SANDBOXED` "0") stay without
   it, on `ws install` and `ws upgrade` alike, unless the policy file itself says `sandbox = true` (`keeps_sandbox_off`).
-- OpenCode takes the last rule that matches, so ws's `ask` keys go in before its `deny` keys (a later change of policy
-  that adds an ask moves it ahead of the denies), and an `ask` that would sit after a `deny` of yours that it overlaps is
+- OpenCode takes the last rule that matches, so ws's denies come last. In a `permission.<tool>` map every key ws denies
+  sits after all of yours, on a first install and on every re-apply. A key of yours that is the same as one ws denies
+  moves to the end with ws's keys (it is a deny already, so your rule only gets stricter); it is not recorded as ws's,
+  so withdrawing leaves it where it is. ws's `ask` keys go in before its first `deny` key (a later change of policy that
+  adds an ask moves it ahead of the denies), and an `ask` that would sit after a `deny` of yours that it overlaps is
   left out: a rule added at the end must never loosen a deny.
 - A file ws cannot merge safely (a link, not plain JSON, JSONC with comments) is refused with the reason and the way to
   gate a session without it: `ws gate launch`.
@@ -267,7 +271,8 @@ def _sweep(node) -> None:
 
 def update(doc: dict, old_added, old_made, ops, where: Path) -> tuple[dict, list, list]:
     """(new doc, the ops that took effect, the containers ws made). Items ws added before are swapped for `ops` in place;
-    an op whose item is already there (yours) takes no effect and is not recorded. `ops` empty takes ws's items out."""
+    an op whose item is already there (yours) takes no effect and is not recorded. In an OpenCode `permission.<tool>` map the
+    keys ws denies then go after all the others (`_denies_last`). `ops` empty takes ws's items out."""
     doc = copy.deepcopy(doc)
     for op in old_added:
         if op["op"] == "append":
@@ -312,6 +317,7 @@ def update(doc: dict, old_added, old_made, ops, where: Path) -> tuple[dict, list
                 )
             added.append(op)
     _sweep(doc)
+    _denies_last(doc, ops)
     kept: list = []
     for m in sorted(made, key=len, reverse=True):
         cur = _lookup(doc, m)
@@ -323,6 +329,26 @@ def update(doc: dict, old_added, old_made, ops, where: Path) -> tuple[dict, list
         else:
             kept.append(m)
     return doc, added, kept
+
+
+def _denies_last(doc: dict, ops) -> None:
+    """OpenCode takes the last rule that matches: put the keys ws denies after every other key of the same
+    `permission.<tool>` map, in the order of `ops`. A key of yours that equals one of them moves with them (it is the same
+    deny, so it only gets stricter), so a broader `allow` of yours can never sit after a deny of ws's."""
+    blocks: dict[tuple, list] = {}
+    for op in ops:
+        path = op["path"]
+        if op["op"] == "set" and len(path) == 3 and path[0] == "permission" and op["value"] == "deny":
+            blocks.setdefault(tuple(path[:2]), []).append(path[2])
+    for path, keys in blocks.items():
+        rules = _lookup(doc, list(path))
+        if not isinstance(rules, dict):
+            continue
+        last = [k for k in dict.fromkeys(keys) if k in rules]
+        order = [*(k for k in rules if k not in last), *last]
+        moved = {k: rules[k] for k in order}
+        rules.clear()
+        rules.update(moved)
 
 
 def present(doc: dict, ops) -> bool:

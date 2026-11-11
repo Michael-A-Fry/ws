@@ -30,8 +30,11 @@ wall; see IGNORE below for what that needs.
 from __future__ import annotations
 
 import dataclasses
+import itertools
 import json
 import math
+import os
+import posixpath
 import re
 import shlex
 from pathlib import Path
@@ -162,6 +165,17 @@ GLOBALS = {
 }
 
 
+def _mcp_name(tool: str) -> str | None:
+    """OpenCode's own name for the MCP tools a `deny_tools` entry names: `mcp__server__tool` is `server_tool`, and the
+    permission block takes `*` in it. Only an entry whose server has no wildcard is written (`mcp__*__x` would be `*_x`,
+    which also catches OpenCode's own tools). The hook cannot tell an MCP tool from a built-in one (the payload is the
+    tool's name and arguments), so this is the whole of what OpenCode enforces for MCP tools."""
+    server, sep, rest = tool.removeprefix("mcp__").partition("__")
+    if not sep or not rest or re.search(r"[*?]", server):
+        return None
+    return f"{server}_{rest}"
+
+
 def _read_forms(rule: str) -> list[str]:
     """OpenCode matches read and edit rules against the path as it sees it (relative to the project, so a file in
     another folder arrives as `../../x/y`), and an absolute rule never matches that (tried on 1.19.4: `~/.ssh/**`
@@ -264,7 +278,10 @@ def generate(
         edit.update(dict.fromkeys(_project_skill_forms(folder), "deny"))
     permission["edit"] = edit
     for t in policy.gate.deny_tools:
-        permission[_TOOLS[t]] = "deny"
+        if t in _TOOLS:
+            permission[_TOOLS[t]] = "deny"
+        elif native := _mcp_name(t):
+            permission[native] = "deny"
     config: dict = {"$schema": "https://opencode.ai/config.json", "permission": permission}
     if (
         POLICIES_SINCE is not None
@@ -301,7 +318,9 @@ def patch_paths(patch: str) -> list[str]:
 def parse(payload: dict) -> Call | list[Call] | None:
     """What the shim sends: {"tool": "bash", "args": {"command": ...}}. A patch tool is a write of each file in the
     patch; `task` is an agent call and `skill` a skill call, as Claude Code's `Agent` and `Skill` are. The kinds this can
-    make are KIND_TOOLS. A tool it does not know (an MCP tool among them) is None."""
+    make are KIND_TOOLS. A tool it does not know (an MCP tool among them) is None. `grep`, `glob` and `list` are a search
+    of their `path` and, for glob's `pattern` and grep's `include`, a read of each place the pattern can name
+    (`pattern_calls`); a pattern that cannot be read raises TypeError, which the gate turns into a deny."""
     tool, args = payload.get("tool"), payload.get("args")
     if not isinstance(tool, str) or not isinstance(args, dict):
         raise TypeError("payload has no tool and args")
@@ -330,10 +349,104 @@ def parse(payload: dict) -> Call | list[Call] | None:
         path = args.get("path")
         if path is not None and not isinstance(path, str):
             raise TypeError("args.path must be text")
-        return Call("search", path or ".")
+        calls = [Call("search", path or ".")]
+        # the glob a tool takes names places of its own: glob's `pattern`, grep's `include` (grep's `pattern` is a regex
+        # over file content, not a path)
+        key = {"glob": "pattern", "grep": "include"}.get(tool)
+        if key is not None:
+            calls += pattern_calls(args.get(key), key, path or ".")
+        return calls
     if tool in _NEUTRAL:
         return Call("tool", _NEUTRAL[tool])
     return None
+
+
+_MAX_ALTERNATIVES = 64  # brace alternatives judged for one pattern; more than this is refused, not guessed at
+_WILD = re.compile(r"[*?\[]")
+_QUOTED = re.compile(r"\\(.)")
+
+
+def _braces(text: str, budget: list[int]) -> list[str]:
+    """The alternatives of a pattern's `{a,b}` groups (nested too), each without braces. A brace that is not closed, or
+    more alternatives than `_MAX_ALTERNATIVES`, raises TypeError: the pattern cannot be read, so it is refused."""
+    start = text.find("{")
+    if start < 0:
+        if "}" in text:
+            raise TypeError("pattern has a closing brace with no opening one")
+        return [text]
+    depth, commas, end = 0, [], -1
+    for i in range(start, len(text)):
+        c = text[i]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                end = i
+                break
+        elif c == "," and depth == 1:
+            commas.append(i)
+    if end < 0:
+        raise TypeError("pattern has an opening brace that is never closed")
+    cuts = [start, *commas, end]
+    out: list[str] = []
+    for a, b in itertools.pairwise(cuts):
+        for head in _braces(text[a + 1 : b], budget):
+            for tail in _braces(text[end + 1 :], budget):
+                budget[0] -= 1
+                if budget[0] < 0:
+                    raise TypeError(f"pattern has more than {_MAX_ALTERNATIVES} brace alternatives")
+                out.append(text[:start] + head + tail)
+    return out
+
+
+def pattern_calls(pattern, name: str, base: str) -> list[Call]:
+    """The calls that judge a glob a search tool was given, as a read of each place it can name: the pattern as written
+    (an absolute one, a `../` one and a `~` one say where they go), and the pattern with its leading folder resolved
+    through any link (`link/*` is the folder the link points at). A relative pattern is taken from `base`, the tool's
+    `path` or the current folder. The pattern is the path-like glob of `glob` and of grep's `include`, not grep's content
+    regex. Nothing for an absent pattern, or one with no `/` or `~` (it names only what is in `base`, which is
+    judged already).
+
+    Raises TypeError, so the call is denied, for a pattern that is not text, holds a NUL, has braces that do not close
+    or too many alternatives, starts its first folder with a `[` class (the folder is not known: `[.][.]/x` is
+    `../x`), or climbs out with `..` after a wildcard. Such a pattern's literal prefix cannot be established."""
+    if pattern is None:
+        return []
+    if not isinstance(pattern, str):
+        raise TypeError(f"args.{name} must be text")
+    if "\0" in pattern:
+        raise TypeError(f"args.{name} has a NUL")
+    text = _QUOTED.sub(r"\1", pattern)  # a backslash only quotes the next character
+    calls: list[Call] = []
+    for alt in _braces(text, [_MAX_ALTERNATIVES]):
+        if "/" not in alt and not alt.startswith("~"):
+            continue
+        absolute = alt.startswith(("/", "~"))
+        segs = alt.split("/")
+        first = next((i for i, g in enumerate(segs) if _WILD.search(g)), len(segs))
+        if first < len(segs) and segs[first].startswith("[") and first == (1 if alt.startswith("/") else 0):
+            raise TypeError(f"args.{name} starts with a bracket class, so its literal prefix is not known")
+        if ".." in segs[first:]:
+            raise TypeError(f"args.{name} climbs out with .. after a wildcard")
+        calls.append(Call("read", alt if absolute else posixpath.join(base, alt)))
+        lead = "/".join(segs[:first])
+        if lead:
+            real = _resolved(lead if absolute else posixpath.join(base, lead))
+            if real is not None:
+                calls.append(Call("read", posixpath.join(real, *segs[first:])))
+    return calls
+
+
+def _resolved(folder: str) -> str | None:
+    """The folder with every link followed (a `~` expanded), when that is a different place from where it is written."""
+    full = os.path.expanduser(folder) if folder.startswith("~") else folder
+    try:
+        real = os.path.realpath(full)
+        written = posixpath.normpath(posixpath.join(os.getcwd(), full))
+    except (OSError, ValueError):
+        return None
+    return real if real != written else None
 
 
 def _write_data(tool: str, args: dict) -> dict:

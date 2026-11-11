@@ -31,7 +31,8 @@ writable at `pending/`). A planted record with the same prefix makes the prefix 
 
 Who may approve: `ws approve` refuses when stdin is not a terminal, and when the session's env marker is set
 (WS_GATED_SESSION, put there by the generated Claude Code settings and by `ws gate launch`). The matcher also denies
-`ws approve` as a shell command. A session that allocates its own pty and unsets the marker defeats the first two; the
+`ws approve` as a shell command, and `ws.cli.main` refuses it under an agent runner with no terminal (ws.agentsession).
+A session that allocates its own pty and unsets the marker defeats the first two; the
 third and the sandbox are what stand then, and this is not a defence against a determined session that can run
 arbitrary programs outside the wall. It stops the model approving itself by accident or by a plain instruction.
 
@@ -67,12 +68,12 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from ws import jsonl, paths
+from ws import agentsession, jsonl, paths
 from ws.output import WsError
 
 SCHEMA_VERSION = 1  # the `schema` of a record in approvals/pending and approvals/granted
 TTL = 600  # seconds a pending or a granted approval lives
-ENV_MARKER = "WS_GATED_SESSION"  # set in a gated session's env; `ws approve` refuses when it is there
+ENV_MARKER = agentsession.ENV_MARKER  # set in a gated session's env; `ws approve` refuses when it is there
 SANDBOX_MARKER = "WS_SANDBOXED"  # set in the env of a session that has ws's sandbox block (the hook checks for it)
 _SHORT = 12  # hex digits of the id shown to a person
 _ID = re.compile(r"^[0-9a-f]{8,64}$")

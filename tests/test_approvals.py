@@ -239,9 +239,9 @@ def test_ws_approve_refuses_inside_a_gated_session(tmp_path, monkeypatch, capsys
     monkeypatch.setenv("WS_HOME", str(tmp_path))
     monkeypatch.setenv(approvals.ENV_MARKER, "1")
     monkeypatch.setattr("sys.stdin.isatty", lambda: True, raising=False)
-    assert cli.main(["approve", "abcdef12", "--yes"]) == 1
+    assert cli.main(["approve", "abcdef12", "--yes"]) == 3
     assert "gated session" in capsys.readouterr().err
-    assert cli.main(["approve", "--list"]) == 1
+    assert cli.main(["approve", "--list"]) == 3
 
 
 def test_ws_approve_grants_at_a_terminal(tmp_path, monkeypatch, capsys):

@@ -26,7 +26,8 @@ With a token, the send goes through a broker lease (the broker adds the Authoriz
 token); without one it is a plain request to the topic.
 
 Session alerts are a third kind, `alert`, counted on their own in the same file against `alerts_per_day`, so a busy
-morning of pushes leaves them room. `ws notify alert --runner R` is the hook entry: a Notification event pushes
+morning of pushes leaves them room. The queue's one-line "a job stopped" notice is sent as an alert too (`ws.queue`).
+`ws notify alert --runner R` is the hook entry: a Notification event pushes
 "<folder> needs you" at high priority and a Stop event pushes "<folder> finished" at default priority. The folder is the
 last part of the session's working directory. With `alert_text = "title"` that is all the topic sees, and it goes to the
 notify server (ntfy.sh or your own) with the push, so a person whose folder names are private sets `alert_text =

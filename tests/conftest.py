@@ -22,7 +22,7 @@ from pathlib import Path
 
 import pytest
 
-from ws import approvals, paths, userconfig
+from ws import agentsession, approvals, paths, userconfig
 
 # The runners' config variables, the four XDG ones, ws's own folder variables (`WS_HOME` is set per test below) and the
 # marks of a gated session: a test run inside a ws session would otherwise write to the folders that session names, or
@@ -128,6 +128,16 @@ def _no_real_config():
     mp = pytest.MonkeyPatch()
     for name in _CONFIG_VARS:
         mp.delenv(name, raising=False)
+    yield
+    mp.undo()
+
+
+@pytest.fixture(autouse=True)
+def _not_under_a_runner():
+    """Admin commands refuse to run under an agent runner with no terminal (ws.agentsession), and a test run by an agent
+    is under one: the real process tree reads as empty. tests/test_admin_in_session.py plants its own."""
+    mp = pytest.MonkeyPatch()
+    mp.setattr(agentsession, "read_ancestry", list)
     yield
     mp.undo()
 

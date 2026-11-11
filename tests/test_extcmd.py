@@ -18,6 +18,11 @@ import pytest
 from ws import cli, extcmd
 from ws.profile import profile_path
 
+# `python -c` boot for a child `ws`: its process tree is read as empty (a test run by an agent sits under a runner)
+NO_RUNNER_ABOVE = (
+    "import sys; from ws import agentsession, cli; agentsession.read_ancestry = list; sys.exit(cli.main(sys.argv[1:]))"
+)
+
 posix_only = pytest.mark.skipif(sys.platform == "win32", reason="the programs here are POSIX shell scripts")
 
 
@@ -408,7 +413,7 @@ def ws(box: Path, *argv: str, extra: dict | None = None) -> subprocess.Completed
         **(extra or {}),
     }
     return subprocess.run(
-        [sys.executable, "-m", "ws", *argv],
+        [sys.executable, "-c", NO_RUNNER_ABOVE, *argv],
         check=False,
         env=env,
         cwd=box / "home",

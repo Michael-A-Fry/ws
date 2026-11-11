@@ -101,7 +101,7 @@ paths. With `[gate] sandbox = false` there is no sandbox block, so nothing is hi
 
 ### Switch it on and off
 
-Run these in a terminal of your own; a session can't (they are admin commands).
+Run these in a terminal of your own; a session can't (they're admin commands).
 
 - **On.** `ws install --runner claude-code` (add `--yes` to skip the question). It first copies your
   `~/.claude/settings.json` to the `backups/` folder in ws's state folder, then writes the generated settings and merges
@@ -153,12 +153,12 @@ The switch on and off, and the upgrade command, were rehearsed in a scratch `HOM
   default list: `api.anthropic.com`, PyPI (`pypi.org`, `files.pythonhosted.org`), the npm registry
   (`registry.npmjs.org`) and crates.io (`crates.io`, `index.crates.io`, `static.crates.io`). A session started with
   `ws gate launch` also gets GitHub (`github.com`, `api.github.com`, `codeload.github.com`, `raw.githubusercontent.com`,
-  `objects.githubusercontent.com`) and `gitlab.com`; a headless `ws run` job does not, because a prompt-injected job that
+  `objects.githubusercontent.com`) and `gitlab.com`; a headless `ws run` job doesn't, because a prompt-injected job that
   can reach a forge can push the project there (name the forge in `allow_hosts` if a job needs it). It only spares the
   prompts: a host on neither list still asks in an interactive session and is refused in
   `claude -p`. `allow_hosts` replaces the list, so name every host you want. A class session never carries it: it gets
   its class's list, and a class with none reaches nothing. With `sandbox = false` there is no block and no list. The list
-  is for sessions ws starts; `ws install` does not add it to your own settings file (Claude Code adds up the lists of
+  is for sessions ws starts; `ws install` doesn't add it to your own settings file (Claude Code adds up the lists of
   every settings scope, so a default host there would also reach a class session). Hosts you name in `allow_hosts` are
   merged into your file, yours first, and the undo takes ws's entries out again.
 - `ws status` shows the sandbox and permission mode in force, read from the settings files; `ws doctor` (WS016) warns when

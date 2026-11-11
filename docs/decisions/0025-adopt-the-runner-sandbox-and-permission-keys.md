@@ -42,7 +42,7 @@ Chosen option: adopt the runner's keys, and add no new parser or control code.
   files to a repository the attacker owns, and a job rarely needs more than the package indexes. A job that does needs
   `allow_hosts`. It only pre-allows: another host still asks, or is refused in `-p`. `allow_hosts` replaces it, a
   class session carries its class's list and never this one, and
-  a policy with `sandbox = false` (ADR 0024) gets no block and no list. The list is not merged into a person's own
+  a policy with `sandbox = false` (ADR 0024) gets no block and no list. The list isn't merged into a person's own
   settings file: Claude Code concatenates array settings across scopes, so a default host there would add itself to a
   class session's list (the class list replaces only the `--settings` copy).
 - `ws status` reads, and never writes, the sandbox and `permissions.defaultMode` in the settings files; WS016 warns when
@@ -68,13 +68,13 @@ merge copies only the keys it names). About one day of work, most of it the new 
   forges too.
 - Bad, because the default hosts are one more list to keep right; a person who wants fewer names every host in
   `allow_hosts`.
-- Bad, because a headless job that clones or pulls from a forge is refused until `allow_hosts` names it. That is the
+- Bad, because a headless job that clones or pulls from a forge is refused until `allow_hosts` names it. That's the
   price of keeping a forge out of reach of a prompt-injected job; the session at a terminal keeps the forges because a
   person sees what it does.
 - Bad, because the plain generated file (`ws gate generate`, used for `claude --settings` without `ws gate launch`) has
-  no forge either, since it is the one list headless jobs read.
+  no forge either, since it's the one list headless jobs read.
 - Bad, because the read block is the runner's: below Claude Code 2.1.257 the key does nothing, and WS016 is the only
-  signal. A class file placed before this change shows a WS014 `read block` warning until it is placed again.
+  signal. A class file placed before this change shows a WS014 `read block` warning until it's placed again.
 
 ### Confirmation
 

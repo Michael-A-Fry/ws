@@ -26,7 +26,7 @@ neither does the `PT_DENY_ATTACH` call in the eval checker.
 ### The sandbox covers shell commands only
 
 Claude Code's sandbox confines the programs a shell command starts. Its own Read, Edit and Write tools, MCP tools and
-hooks don't run in it. They are covered by the permission rules (`permissions.deny`, written from the policy) and by the
+hooks don't run in it. They're covered by the permission rules (`permissions.deny`, written from the policy) and by the
 gate. Reads by Claude's file tools outside the working folders are held by
 `permissions.blockReadsOutsideWorkingDirectories` (Claude Code 2.1.257 and newer), which ws sets in the launch
 settings and in a class's managed-settings file, and never in your own settings file. `[gate] read_outside_project =
@@ -89,10 +89,10 @@ session started another way hides only the `deny_read` paths: an OpenCode sessio
 without `ws gate launch`, whose settings are the ones `ws install` merged into your own file.
 
 - **What it means.** Start Claude Code through `ws gate launch --runner claude-code -- claude` to have the home folder
-  hidden. A tool kept in a folder the defaults don't name can't be read from there until it is in `allow_read`.
+  hidden. A tool kept in a folder the defaults don't name can't be read from there until it's in `allow_read`.
 - **Workaround.** Add the folder to `allow_read` in the policy; the next launch reads it.
 - **Claude Code's own folder.** A shell command reads only `shell-snapshots/`, `skills/` and `plugins/` of it. A script
-  kept elsewhere in that folder can't be read until it is in `allow_read`.
+  kept elsewhere in that folder can't be read until it's in `allow_read`.
 - **A tool's cache folder made during a session.** A folder a tool creates in the home folder after the session starts
   (a new cache, say) can't be read until the session restarts, because the allow list is read at the start.
 - **Where the wall applies.** The home block and `deny_read` cover shell commands through the sandbox and Claude's file

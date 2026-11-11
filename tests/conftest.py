@@ -41,6 +41,30 @@ _CONFIG_VARS = (
 )
 
 
+# What `git rev-parse --local-env-vars` lists. git sets GIT_DIR and its kin for a hook (a pre-push hook runs this suite),
+# and with them every `git -C <scratch repo>` a test runs acts on the outer repository instead: its config, index and
+# refs. They go for the whole run, before any fixture or test module runs git.
+_GIT_REPO_VARS = (
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_GRAFT_FILE",
+    "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_PREFIX",
+    "GIT_INTERNAL_SUPER_PREFIX",
+    "GIT_SHALLOW_FILE",
+    "GIT_COMMON_DIR",
+)
+for _name in _GIT_REPO_VARS:
+    os.environ.pop(_name, None)
+
 _REAL_HOME = Path(os.path.expanduser("~"))
 _OUTER_ENV = dict(os.environ)  # as the shell that started the run had it, before any test changes it
 _WS_FILES = ("install-manifest.json", "profile.toml", "policy.toml")

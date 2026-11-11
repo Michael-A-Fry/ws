@@ -1937,3 +1937,83 @@ def test_the_secret_read_rules_name_the_data_folder_in_use_and_the_policy_loads_
     assert f"{store}/**" in policy.secret_read_rules()
     assert f"{store}/**" in policy.default_policy().gate.deny_read
     assert store == h / ".local" / "share" / "ws" / "secrets"
+
+
+# --- [gate] allow_read: what a launched Claude Code shell may read in the home folder --------------------------------------
+
+BAD_ALLOW_READ = {
+    "a wildcard": '"~/projects/*"',
+    "a bracket": '"~/data[1]"',
+    "the root": '"/"',
+    "the home": '"~"',
+    "the home as a variable": '"$HOME"',
+    "the home after normalising": '"~/a/.."',
+    "above the home": '"~/.."',
+    "a relative path": '"data/shared"',
+    "an empty entry": '""',
+    "a deny_read path": '"~/.ssh"',
+    "inside a deny_read path": '"~/.ssh/keys"',
+    "inside a deny_read path as a variable": '"$HOME/.ssh/keys"',
+    "ws's own secrets": '"~/.local/share/ws/secrets/x"',
+    "inside one spelled with dots": '"~/a/../.ssh/id"',
+}
+
+
+@pytest.mark.parametrize("entry", list(BAD_ALLOW_READ.values()), ids=list(BAD_ALLOW_READ))
+def test_allow_read_is_validated_whole(home, entry):
+    deny = 'deny_read = ["~/.ssh/**", "~/.local/share/ws/secrets/**"]\n'
+    assert policy.loads(f'[gate]\n{deny}allow_read = ["~/ok", "/srv/shared", "$HOME/also"]\n').gate.allow_read == (
+        "~/ok",
+        "/srv/shared",
+        "$HOME/also",
+    )
+    with pytest.raises(PolicyError, match=r"\[gate\] allow_read"):
+        policy.loads(f"[gate]\n{deny}allow_read = [{entry}]\n")
+    with pytest.raises(PolicyError, match="allow_read") as e:  # one bad entry refuses the policy, good ones or not
+        policy.loads(f'[gate]\n{deny}allow_read = ["~/ok", {entry}, "~/fine"]\n')
+    assert entry.strip('"') in str(e.value)  # and it says which entry
+    with pytest.raises(PolicyError, match="allow_read"):
+        policy.loads('[gate]\nallow_read = "~/x"\n')  # a list, not a string
+
+
+def test_allow_read_may_sit_above_a_deny_read_path_and_defaults_to_nothing(home):
+    pol = policy.loads(
+        '[gate]\ndeny_read = ["~/.local/share/ws/secrets/**"]\nallow_read = ["~/.local/share", "~/.config"]\n'
+    )
+    assert pol.gate.allow_read == (
+        "~/.local/share",
+        "~/.config",
+    )  # a folder above ws's secrets is fine: they stay hidden
+    assert policy.default_policy().gate.allow_read == ()
+    assert "allow_read" in policy.default_toml()
+    assert policy.loads(policy.default_toml()) == policy.default_policy()  # the commented line adds nothing
+
+
+def test_allow_read_reaches_the_launch_copy(home, tmp_path):
+    from ws.adapters import claude_code
+
+    (home / "data").mkdir()
+    (home / "shared").mkdir()
+    pol = policy.loads('[gate]\ndeny_read = ["~/.ssh/**"]\nallow_read = ["~/data", "$HOME/shared", "~/not-there"]\n')
+    allow, deny = policy.launch_read_rules(pol)
+    assert allow == ["~/data", "~/shared", "~/not-there"] and "~/.ssh" in deny
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    shared = claude_code.generate(pol, ["ws"], tmp_path / "out", tmp_path / "policy.toml")["settings.json"]
+    got = claude_code.for_project(shared, str(proj), allow_read=allow, deny_read=deny, env={"HOME": str(home)})
+    import json
+
+    fs = json.loads(got)["sandbox"]["filesystem"]
+    assert str(home / "data") in fs["allowRead"] and str(home / "shared") in fs["allowRead"]
+    assert not any(p.endswith("not-there") for p in fs["allowRead"])  # nothing there to read, so nothing to allow
+    assert "allowRead" not in json.loads(shared)["sandbox"]["filesystem"]  # the shared file never carries it
+
+
+def test_an_absolute_home_or_a_folder_above_it_is_refused_whole(home):
+    """`~` is refused, but `/home/u`, `/home` and `/home/u/a/..` open the same folders: all of them are refused."""
+    ok = f'"{home}/ok"'
+    for entry in (home, home.parent, home / "a" / "..", home.parent / "other" / "..", home.parent.parent):
+        with pytest.raises(PolicyError, match="allow_read") as e:
+            policy.loads(f'[gate]\nallow_read = [{ok}, "{entry}", "~/fine"]\n')
+        assert str(entry) in str(e.value)  # it names the entry
+    assert policy.loads(f"[gate]\nallow_read = [{ok}]\n").gate  # a folder inside the home is fine

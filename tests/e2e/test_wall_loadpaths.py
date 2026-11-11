@@ -984,8 +984,12 @@ print("ANCESTORS", " ".join(out))
 """
 
 
-def opencode_reads(tmp_path: Path, name: str, keep_shim: bool) -> list[str]:
+def opencode_reads(tmp_path: Path, monkeypatch, name: str, keep_shim: bool) -> list[str]:
     root = world(tmp_path, name, "")
+    # `generate` runs in this process and pins the folders it sees into the shim; the run's environment is the world's.
+    # They must be the same, as on a real install, or the shim refuses every call ("ws's folders changed").
+    monkeypatch.setenv("WS_HOME", str(root / "wshome"))
+    monkeypatch.setenv("HOME", str(root / "home"))
     (root / "work" / "ancestors.py").write_text(ANCESTORS)
     out = gr.generate(root, "opencode")
     if not keep_shim:
@@ -1001,11 +1005,11 @@ def opencode_reads(tmp_path: Path, name: str, keep_shim: bool) -> list[str]:
     return seen.split("ANCESTORS", 1)[1].split()
 
 
-def test_opencode_is_not_readable_through_proc_mem_from_its_shell_commands_with_the_shim_only(tmp_path):
+def test_opencode_is_not_readable_through_proc_mem_from_its_shell_commands_with_the_shim_only(tmp_path, monkeypatch):
     if not yama_allows():
         pytest.skip("ptrace_scope is above 0 on this host: a child cannot read its parent whatever the shim does")
-    with_shim = opencode_reads(tmp_path, "shim", True)
-    without = opencode_reads(tmp_path, "noshim", False)
+    with_shim = opencode_reads(tmp_path, monkeypatch, "shim", True)
+    without = opencode_reads(tmp_path, monkeypatch, "noshim", False)
     mine = [r for r in with_shim if r.split("=")[0].lower().startswith(("opencode", ".opencode", "bun"))]
     assert mine and all("=errno" in r for r in mine), f"the runner is readable with the shim: {with_shim}"
     control = [r for r in without if r.split("=")[0].lower().startswith(("opencode", ".opencode", "bun"))]

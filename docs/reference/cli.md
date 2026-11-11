@@ -1026,6 +1026,20 @@ ws status [-h]
 A path is listed once per runner. With `--json`, each row has a `folder` key: `true` when the row is a folder (a
 skill folder with no main file), `false` for a file. The text output shows a folder with a trailing `/`.
 
+Two more fields come from Claude Code's settings files, with a line each in the text output:
+
+- `.data.sandbox` is `{enabled, allowUnsandboxedCommands, failIfUnavailable, source}`: booleans, or `null` when the file
+  doesn't say. `source` is the file they were read from: first the runner's user settings when they carry ws's entries
+  (the `WS_SANDBOXED` marker), then `gate/claude-code/settings.json` in ws's state folder, else `null`. Ws entries with
+  no sandbox block (the policy's `sandbox = false`) read `enabled: false`.
+- `.data.permission_mode` is `{mode, source}`: the `permissions.defaultMode` in force and the file that sets it, the
+  highest-precedence file winning (managed, then local and project, then your own). Both are `null` when no file sets
+  one. `bypassPermissions` or `auto` in a project file is skipped, because Claude Code ignores those modes from there. The
+  text output flags `bypassPermissions`. ws never writes `defaultMode`.
+
+Each object gains an `unreadable` list (`"path: why"`) only when a settings file couldn't be read: a link (never
+followed), a file over 1 MB, a file that isn't a JSON object, or a read error. Nothing else of a settings file is shown.
+
 ## `ws eval`
 
 Your own eval: run tasks, read ten metrics, compare two setups, harvest tasks.

@@ -9,6 +9,9 @@ Per runner:
                `ws gate check` hook entry on that runner's own payload shape
   hook_config  the config ws generates for the runner parses and still holds the hook
   run_record   a run record still validates against `runschema` (stdlib check, so no extra dependency)
+  wall         Claude Code only (OpenCode is skipped): the launch settings ws makes for a project still shut the sandbox
+               (on, fail closed, no unsandboxed retry, no excluded commands, no Unix sockets), hide the home folder,
+               re-allow the project, and keep every exact deny_read path hidden
 
 `ws doctor` records the last version it saw of each runner, and the default model id, in `versions.json` in the state folder.
 When one changes it says so in WS101 and runs this (or, with --offline, points here). A change is remembered only when
@@ -249,6 +252,54 @@ def check_hook_config(adapter, work: Path) -> tuple[str, str]:
     return PASS, ", ".join(sorted(files))
 
 
+def _wall_problem(block: dict, home: str, project: str, exact: list[str]) -> str | None:
+    """The first way the launch settings' `sandbox` block is open, or None."""
+    net = block.get("network") if isinstance(block.get("network"), dict) else {}
+    fs = block.get("filesystem") if isinstance(block.get("filesystem"), dict) else {}
+    deny, allow = fs.get("denyRead", []), fs.get("allowRead", [])
+    if net.get("allowAllUnixSockets") or net.get("allowUnixSockets"):
+        return "the network settings allow Unix sockets"
+    if block.get("excludedCommands"):
+        return "the sandbox excludes commands"
+    if block.get("enabled") is not True:
+        return "the sandbox is not enabled"
+    if block.get("failIfUnavailable") is not True:
+        return "the sandbox does not fail closed"
+    if block.get("allowUnsandboxedCommands") is not False:
+        return "an unsandboxed retry is allowed"
+    if home not in deny:
+        return "the home folder is not hidden"
+    if project not in allow:
+        return "the project is not re-allowed"
+    missing = [p for p in exact if p not in deny]
+    if missing:
+        return f"{len(missing)} deny_read path(s) are no longer hidden"
+    return None
+
+
+def check_wall(adapter, env, work: Path) -> tuple[str, str]:
+    """Claude Code's launch settings, made as `ws gate launch` makes them (the generated settings through `for_project`
+    for a project folder in `work`), still hold the wall. ws's own generator is judged here, not the person's policy, so
+    it passes on the default policy. A launch copy that cannot be made is a FAIL that names the kind of error."""
+    if adapter.NAME != "claude-code":
+        return SKIP, f"{adapter.NAME} has no settings file to read the wall from"
+    pol = policy.loads(policy.default_toml())
+    project = work / "project"
+    project.mkdir(exist_ok=True)
+    home = os.path.realpath(env.get("HOME") or str(Path.home()))
+    try:
+        files = adapter.generate(pol, selfcmd.argv(), work / "gate", work / "policy.toml")
+        allow, deny = policy.launch_read_rules(pol)
+        text = adapter.for_project(
+            files["settings.json"], str(project.resolve()), allow_read=allow, deny_read=deny, env=env
+        )
+        block = json.loads(text)["sandbox"]
+    except (WsError, policy.PolicyError, ValueError, KeyError, TypeError, OSError) as e:
+        return FAIL, f"the launch settings could not be made ({getattr(e, 'kind', type(e).__name__)})"
+    problem = _wall_problem(block, home, str(project.resolve()), policy.sandbox_read_paths(pol))
+    return (FAIL, problem) if problem else (PASS, "the home is hidden, the project re-allowed, the sandbox shut")
+
+
 def sample_record() -> dict:
     now = datetime.now(UTC)
     return runrecord.new(
@@ -278,6 +329,7 @@ def canary_runner(runner: str, env, work: Path) -> dict:
         "gate": check_gate(adapter, env, work),
         "hook_config": check_hook_config(adapter, work),
         "run_record": check_run_record(work),
+        "wall": check_wall(adapter, env, work),
     }
     return {
         "version": checks["version"][1]

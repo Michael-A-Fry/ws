@@ -7,6 +7,10 @@ set -euo pipefail
 
 top="$(git rev-parse --show-toplevel)"
 cd "$top"
+# git sets GIT_DIR and its kin for a hook; left in place, every `git -C <scratch repo>` a test runs would act on this
+# clone's own repository instead. The tests find their repositories by folder, as they do anywhere else.
+# shellcheck disable=SC2046
+unset $(git rev-parse --local-env-vars)
 
 if [[ "${WS_SKIP_PREPUSH:-}" == "1" ]]; then
   log="$(git rev-parse --git-path ws-prepush-skips.log)"

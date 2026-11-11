@@ -117,7 +117,7 @@ import posixpath
 import re
 import sys
 import tomllib
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
 from functools import lru_cache
@@ -213,6 +213,8 @@ class Gate:
     allow_write: tuple[str, ...] = ()  # folders besides the project a sandboxed session may write (`~/x` or `/x`)
     sandbox: bool = True  # the runner's own sandbox is switched on in what ws writes (Claude Code); false = unsandboxed
     allow_mcp: tuple[str, ...] | None = None  # MCP tools allowed outright; None = the policy says nothing (MCP_SHIPPED)
+    read_outside_project: bool = False  # false = Claude Code's file tools refuse reads outside the working folders
+    allow_read: tuple[str, ...] = ()  # folders or files besides the project a launched Claude Code shell may read
 
 
 @dataclass(frozen=True)
@@ -421,6 +423,15 @@ allow_write = []
 # The sandbox is the wall: on by default, it makes ws's own files read-only and hides the deny_read paths from every
 # program a shell command starts, in what ws writes for Claude Code. false = no sandbox block, and `ws doctor` says so.
 sandbox = true
+# Claude Code's Read, Grep and Glob tools refuse a path outside the folders the session works in (the sandbox covers
+# shell commands only). true lets them read outside, as Claude Code does by default. Needs Claude Code 2.1.257 to bite.
+read_outside_project = false
+# Folders or files a shell command in a Claude Code session started by `ws gate launch --runner claude-code` may read
+# besides the project folder. That session cannot read your home folder except the project and what common tools need
+# (the runner's own folder, uv, npm and cargo caches, ~/.local/bin, git's config). Absolute or `~/`, no wildcards, and
+# not your home folder, / or a deny_read path. A deny_read path inside one of these stays unreadable. Example:
+# ["~/.nvm", "~/data/shared"].
+# allow_read = []
 
 # Guards: small named checks that run beside the rules above. `ws gate generate` writes the runner hooks they need.
 #   syntax-check     after an edit, checks the file by its extension (.py, .json, .toml, .sh, .js) and tells the model the
@@ -635,6 +646,8 @@ def loads(text: str) -> Policy:
             "allow_write",
             "sandbox",
             "allow_mcp",
+            "read_outside_project",
+            "allow_read",
         },
     )
     deny_read = _strings(g, "deny_read", "[gate] ")
@@ -647,6 +660,8 @@ def loads(text: str) -> Policy:
         _strings(g, "allow_write", "[gate] "),
         _get(g, "sandbox", bool, "[gate] ", True),
         _strings(g, "allow_mcp", "[gate] ") if "allow_mcp" in g else None,
+        _get(g, "read_outside_project", bool, "[gate] ", False),
+        _strings(g, "allow_read", "[gate] "),
     )
     for h in gate.allow_hosts:
         check_host(h, "[gate] allow_hosts")
@@ -657,6 +672,7 @@ def loads(text: str) -> Policy:
                 f"[gate] allow_write: {w!r} must be a folder, absolute or under ~/, with no wildcard, and not / or "
                 "the home folder (after `.` and `..` are resolved)"
             )
+    _check_allow_read(gate)
     for t in gate.deny_tools:
         if t not in KNOWN_TOOLS and not valid_mcp_pattern(t):
             raise PolicyError(
@@ -2900,10 +2916,10 @@ def needs_approval(policy: Policy, command: str, *, cwd: str | None = None) -> b
     return any(_glob_regex(_canon_pattern(pat)).match(c) for pat in policy.gate.ask_commands for c in cands)
 
 
-def sandbox_write_paths(policy: Policy) -> list[str]:
-    """The allow_write folders, `~/x` or `/x` as written (`$HOME` spelled `~`), normalised."""
+def _spell(entries: Iterable[str]) -> list[str]:
+    """Folders or files as `~/x` or `/x` (`$HOME` spelled `~`), normalised, without repeats."""
     out = []
-    for w in policy.gate.allow_write:
+    for w in entries:
         for pre in ("${HOME}", "$HOME"):
             if w.startswith(pre + "/"):
                 w = "~" + w[len(pre) :]
@@ -2911,12 +2927,14 @@ def sandbox_write_paths(policy: Policy) -> list[str]:
     return list(dict.fromkeys(out))
 
 
-def sandbox_read_paths(policy: Policy) -> list[str]:
-    """The deny_read rules a sandbox can enforce by hiding the path: a folder or file, written `~/x` or `/x`, with at
-    most a trailing `**` (`~/.ssh/**` -> `~/.ssh`). A rule with any other wildcard is left to the matcher; so is one
-    that would hide the whole home or the root, which would end the session rather than guard it."""
+def sandbox_write_paths(policy: Policy) -> list[str]:
+    """The allow_write folders, `~/x` or `/x` as written (`$HOME` spelled `~`), normalised."""
+    return _spell(policy.gate.allow_write)
+
+
+def _exact_read_paths(rules: Iterable[str]) -> list[str]:
     out = []
-    for rule in policy.gate.deny_read:
+    for rule in rules:
         r = rule
         for pre in ("${HOME}", "$HOME"):
             if r == pre or r.startswith(pre + "/"):
@@ -2927,6 +2945,50 @@ def sandbox_read_paths(policy: Policy) -> list[str]:
             continue
         out.append(posixpath.normpath(r))
     return list(dict.fromkeys(out))
+
+
+def sandbox_read_paths(policy: Policy) -> list[str]:
+    """The deny_read rules a sandbox can enforce by hiding the path: a folder or file, written `~/x` or `/x`, with at
+    most a trailing `**` (`~/.ssh/**` -> `~/.ssh`). A rule with any other wildcard is left to the matcher; so is one
+    that would hide the whole home or the root, which would end the session rather than guard it."""
+    return _exact_read_paths(policy.gate.deny_read)
+
+
+def launch_read_rules(policy: Policy) -> tuple[list[str], list[str]]:
+    """(allow, deny) for the launch settings of a Claude Code session, which hide the home folder except what is allowed
+    (ws.adapters.claude_code.for_project): the `[gate] allow_read` entries, and the exact deny_read paths that stay
+    hidden inside a folder allowed above them. Both are written `~/x` or `/x`. Only the launch settings take these;
+    `sandbox_read_paths` (what OpenCode's wall and the shared settings hide) is unchanged."""
+    return _spell(policy.gate.allow_read), sandbox_read_paths(policy)
+
+
+def _folder_entry(key: str, entry: str) -> str:
+    """The `[gate]` folder entry as an expanded, normalised absolute path, or a PolicyError naming it: it must be
+    absolute or under `~/`, have no wildcard, and not be `/`, the home folder or a folder above the home (a path that
+    `.` and `..` bring to one of these counts), since that would open the whole home."""
+    n = posixpath.normpath(re.sub(r"^(\$HOME|\$\{HOME\})(?=/|$)", "~", entry)) if entry else ""
+    if n in ("", ".", "/", "~") or not n.startswith(("~/", "/")) or re.search(r"[*?\[]", entry):
+        raise PolicyError(
+            f"[gate] {key}: {entry!r} must be a folder{' or file' if key == 'allow_read' else ''}, absolute or under "
+            "~/, with no wildcard, and not / or the home folder (after `.` and `..` are resolved)"
+        )
+    path = posixpath.normpath(_expand(n))
+    home = posixpath.normpath(_home())
+    if any(path == h or h.startswith(path + "/") for h in {home, posixpath.normpath(os.path.realpath(home))}):
+        raise PolicyError(f"[gate] {key}: {entry!r} is the home folder or a folder above it; name a folder inside it")
+    return path
+
+
+def _check_allow_read(gate: Gate) -> None:
+    """Every `[gate] allow_read` entry is a folder or file ws can name, or the policy is refused whole."""
+    exact = [_expand(p) for p in _exact_read_paths(gate.deny_read)]
+    for a in gate.allow_read:
+        path = _folder_entry("allow_read", a)
+        hit = next((d for d in exact if path == d or path.startswith(d + "/")), None)
+        if hit:
+            raise PolicyError(
+                f"[gate] allow_read: {a!r} is a deny_read path ({hit}) or inside one; remove it from here"
+            )
 
 
 def is_denied_read(policy: Policy, path: str, *, cwd: str | None = None) -> str | None:

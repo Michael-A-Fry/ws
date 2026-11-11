@@ -637,14 +637,16 @@ def forget(paths: Iterable[Path], env: Mapping[str, str] | None = None) -> None:
 # ---- writing ---------------------------------------------------------------------------------------------------------
 
 
-def _write_atomic(path: Path, data: bytes) -> None:
-    """Write beside the target, fsync, set the mode, then rename over it. No temp file survives a failure."""
-    try:
-        mode = stat.S_IMODE(os.stat(path).st_mode)
-    except OSError:
-        umask = os.umask(0)
-        os.umask(umask)
-        mode = 0o666 & ~umask
+def _write_atomic(path: Path, data: bytes, mode: int | None = None) -> None:
+    """Write beside the target, fsync, set the mode, then rename over it. No temp file survives a failure. The mode is
+    `mode` when given, else the target's own, else the umask's."""
+    if mode is None:
+        try:
+            mode = stat.S_IMODE(os.stat(path).st_mode)
+        except OSError:
+            umask = os.umask(0)
+            os.umask(umask)
+            mode = 0o666 & ~umask
     tmp = path.parent / f".{path.name}.{secrets.token_hex(6)}{_TMP_SUFFIX}"
     try:
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)

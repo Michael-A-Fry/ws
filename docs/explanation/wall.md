@@ -44,6 +44,10 @@ After every walled run, the launcher compares the project with how it was and re
 new or changed git folder, runner config, program loaded on its own in a virtual environment or `node_modules`. It reports
 and deletes nothing. The report goes to standard error and to `~/.local/state/ws/logs/wall-report.jsonl`.
 
+In a Claude Code session started with `ws gate launch --runner claude-code -- claude`, the settings also hide your home
+folder from every shell command, except the project and the folders common tools need (`allow_read` adds more); see
+[Use the wall](../how-to/use-the-wall.md#deny-the-home-folder).
+
 In Claude Code the wall is on by default. `ws install` merges Claude Code's own `sandbox` settings into your
 `settings.json` (the same block `ws gate launch` uses), and that block is the wall for shell commands: the `deny_read`
 paths read as empty and ws's files refuse a write, for every program a command starts. The gate reads the same text

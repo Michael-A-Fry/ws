@@ -11,6 +11,7 @@ import pytest
 from test_run import ws as run_ws  # noqa: F401  (a scratch WS_HOME with a fake claude, for the `ws run` tests below)
 
 from ws import cli, policy, sandbox
+from ws.adapters import claude_code
 from ws.output import WsError
 
 
@@ -319,7 +320,12 @@ def test_ws_run_refuses_a_class_job_when_the_policy_has_the_sandbox_off(ws, tmp_
 def test_ws_run_with_no_classes_is_as_it_was(ws):
     ws.job()
     assert cli.main(["run", "daily"]) == 0
-    assert "network" not in settings_of(ws)["sandbox"]
+    # No class: the job gets the generic default list (it used to get no network key), pre-allowed and not enforced, and
+    # never the class marker or `strictAllowlist`, which belong to a class session only.
+    conf = settings_of(ws)
+    assert conf["sandbox"]["network"] == {"allowedDomains": list(claude_code.DEFAULT_DOMAINS)}
+    assert "WS_EGRESS_CLASS" not in conf["env"]
+    assert conf["permissions"]["blockReadsOutsideWorkingDirectories"] is True  # a headless job reads inside its folder
 
 
 def test_ws_run_dry_run_says_it_would_refuse(ws, tmp_path, capsys):

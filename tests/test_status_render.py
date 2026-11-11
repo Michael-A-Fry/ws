@@ -120,3 +120,52 @@ def test_errors_are_a_glyph_and_a_word():
     data = {"repo": "/r", "runners": {}, "errors": ["bad override"]}
     assert status.render(data).splitlines()[-1] == "✗ error: bad override"
     assert strip(status.render(data, Style(brand.FULL))) == status.render(data)
+
+
+# --- the sandbox and permission mode lines -------------------------------------------------------------------------------
+
+SANDBOX = {
+    "enabled": True,
+    "allowUnsandboxedCommands": False,
+    "failIfUnavailable": True,
+    "source": "/h/.claude/settings.json",
+}
+
+
+def lines_of(sandbox, mode) -> list[str]:
+    data = {"repo": "/r", "runners": {}, "errors": [], "sandbox": sandbox, "permission_mode": mode}
+    return status.render(data).splitlines()
+
+
+def test_the_text_has_a_sandbox_line_and_a_permission_mode_line():
+    out = lines_of(SANDBOX, {"mode": "acceptEdits", "source": "/h/.claude/settings.json"})
+    assert "sandbox: on, no retry outside it, Claude Code refuses to start without it (/h/.claude/settings.json)" in out
+    assert "permission mode: acceptEdits (/h/.claude/settings.json)" in out
+
+
+def test_bypass_mode_is_flagged_and_other_modes_are_not():
+    flagged = lines_of(SANDBOX, {"mode": "bypassPermissions", "source": "/h/s.json"})
+    assert "permission mode: bypassPermissions (/h/s.json): nothing asks before it runs" in flagged
+    assert not any("nothing asks" in x for x in lines_of(SANDBOX, {"mode": "plan", "source": "/h/s.json"}))
+    data = {"repo": "/r", "runners": {}, "errors": [], "permission_mode": {"mode": "bypassPermissions", "source": "/s"}}
+    out = status.render(data, Style(brand.FULL))
+    assert "\x1b[" in out and "nothing asks before it runs" in strip(out)  # the colour only reinforces the words
+
+
+def test_a_sandbox_that_may_retry_outside_is_said_so_and_unset_values_read_as_not_set():
+    risky = {**SANDBOX, "allowUnsandboxedCommands": True}
+    assert any("a failed command may retry outside it" in x for x in lines_of(risky, {"mode": None, "source": None}))
+    blank = {"enabled": None, "allowUnsandboxedCommands": None, "failIfUnavailable": None, "source": None}
+    out = lines_of(blank, {"mode": None, "source": None})
+    assert "sandbox: not set" in out and "permission mode: not set (Claude Code asks)" in out
+
+
+def test_an_unreadable_settings_file_is_a_line_of_its_own():
+    mode = {"mode": None, "source": None, "unreadable": ["/p: x"]}
+    out = [strip(x) for x in lines_of({**SANDBOX, "unreadable": ["/h/s.json: too large"]}, mode)]
+    assert "! unreadable: /h/s.json: too large" in out and "! unreadable: /p: x" in out  # a glyph and a word
+
+
+def test_data_from_before_the_fields_existed_still_renders():
+    out = status.render({"repo": "/r", "runners": {}, "errors": []})
+    assert "sandbox:" not in out and "permission mode:" not in out

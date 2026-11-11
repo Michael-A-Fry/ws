@@ -765,8 +765,74 @@ def test_claude_code_settings_turn_the_sandbox_on_and_fail_closed(tmp_path, monk
     assert str(tmp_path / "wshome" / "gate" / "claude-code") in deny
     assert all(str(tmp_path / "wshome" / n) in deny for n in policy.CONTROL_NAMES)
     assert sb["filesystem"]["denyRead"] == ["~/.ssh", "~/.aws/credentials", str(tmp_path / "wshome" / "secrets")]
-    assert "network" not in sb  # the policy names no hosts: it says nothing about the network
+    # The policy names no hosts, so the block carries the short default list (it used to carry no network key at all):
+    # an unattended `claude -p` refuses a host it was not told about, and the runner's API host and the package indexes
+    # are what nearly every job needs. The forges are not in it (ADR 0025). allow_hosts replaces it (next test).
+    assert sb["network"] == {"allowedDomains": list(claude_code.DEFAULT_DOMAINS)}
     assert s["env"] == {"WS_GATED_SESSION": "1", "WS_SANDBOXED": "1"}
+
+
+def test_the_default_domains_are_a_short_generic_list_of_plain_hosts():
+    hosts = claude_code.DEFAULT_DOMAINS
+    assert len(hosts) == len(set(hosts)) <= 15
+    for want in ("api.anthropic.com", "pypi.org", "files.pythonhosted.org", "registry.npmjs.org", "crates.io"):
+        assert want in hosts
+    for forge in ("github.com", "api.github.com", "raw.githubusercontent.com", "gitlab.com"):
+        assert forge not in hosts  # a prompt-injected headless job could push the project there
+    assert "github.com" in claude_code.FORGE_DOMAINS and "gitlab.com" in claude_code.FORGE_DOMAINS
+    assert not set(hosts) & set(claude_code.FORGE_DOMAINS)
+    for h in (*hosts, *claude_code.FORGE_DOMAINS):
+        policy.check_host(h, "default domains")  # a host the proxies can read
+
+
+def test_a_sandbox_off_policy_writes_no_block_and_no_default_domains(tmp_path):
+    s = claude_settings(tmp_path, "[gate]\nsandbox = false\n")  # ADR 0024: no block, no list
+    assert "sandbox" not in s and s["env"]["WS_SANDBOXED"] == "0"
+    assert "allowedDomains" not in json.dumps(s)
+
+
+def test_allow_hosts_replaces_the_default_domains_and_does_not_add_to_them(tmp_path):
+    s = claude_settings(tmp_path, '[gate]\nallow_hosts = ["api.example.org"]\n')
+    assert s["sandbox"]["network"] == {"allowedDomains": ["api.example.org"]}
+
+
+def test_a_class_session_never_carries_the_default_domains(tmp_path):
+    base = json.dumps(claude_settings(tmp_path))
+    assert "pypi.org" in base  # the shared file has the defaults ...
+    for hosts in ([], ["only.example.org"]):
+        net = json.loads(claude_code.with_hosts(base, hosts))["sandbox"]["network"]
+        assert net["allowedDomains"] == hosts and net["strictAllowlist"] is True  # ... and a class gets its own list
+        assert not set(claude_code.DEFAULT_DOMAINS) & set(net["allowedDomains"])
+
+
+def test_the_launch_settings_block_reads_outside_the_working_folders(tmp_path):
+    perms = claude_settings(tmp_path)["permissions"]
+    assert perms["blockReadsOutsideWorkingDirectories"] is True  # a `Read` of a file outside the project is refused
+    assert perms["disableBypassPermissionsMode"] == "disable"  # the neighbour is still there
+
+
+def test_read_outside_project_true_leaves_the_block_out(tmp_path):
+    perms = claude_settings(tmp_path, "[gate]\nread_outside_project = true\n")["permissions"]
+    assert "blockReadsOutsideWorkingDirectories" not in perms
+
+
+def test_the_launch_copy_for_a_project_keeps_the_read_block(tmp_path):
+    shared = json.dumps(claude_settings(tmp_path))
+    copy = json.loads(claude_code.for_project(shared, str(tmp_path / "proj")))
+    assert copy["permissions"]["blockReadsOutsideWorkingDirectories"] is True
+
+
+def test_the_user_scope_settings_never_carry_the_read_block(tmp_path):
+    pol = policy.loads("")
+    out = tmp_path / "wshome" / "gate" / "claude-code"
+    files = claude_code.generate(pol, ["ws"], out, tmp_path / "wshome" / "policy.toml", user_scope=True)
+    assert "blockReadsOutsideWorkingDirectories" not in files["settings.json"]
+
+
+def test_ws_never_writes_a_default_permission_mode(tmp_path):
+    # `permissions.defaultMode` is the person's choice; ws only reports it (`ws status`)
+    for toml in ("", "[gate]\nread_outside_project = true\n", "[gate]\nsandbox = false\n"):
+        assert "defaultMode" not in json.dumps(claude_settings(tmp_path, toml))
 
 
 def test_claude_code_network_follows_allow_hosts(tmp_path):
@@ -818,6 +884,33 @@ def test_the_hook_denies_a_folder_whose_project_settings_open_the_sandbox(tmp_pa
     for cwd in (d, d / "sub"):  # from a folder below the project too
         why = claude_code.preflight({"cwd": str(cwd)})
         assert why and name in why and "sandbox." in why
+
+
+def test_the_preflight_is_a_typed_refusal_whose_hint_names_the_file_and_the_key_to_delete(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("WS_SANDBOXED", "1")
+    d = project(tmp_path, "settings.local.json", {"sandbox": {"excludedCommands": ["python3 *"]}})
+    e = claude_code.preflight_refusal({"cwd": str(d)})
+    f = d / ".claude" / "settings.local.json"
+    assert isinstance(e, WsError) and e.kind == "project_settings_widen_sandbox"
+    assert f"delete `sandbox.excludedCommands` from {f}" in e.hint and e.details["key"] == "sandbox.excludedCommands"
+    assert claude_code.preflight({"cwd": str(d)}) == f"{e.message}. To fix it: {e.hint}"  # the gate still gets a string
+    project(tmp_path, "settings.local.json", {"sandbox": {"enabled": False}})
+    assert claude_code.preflight_refusal({"cwd": str(d)}).hint.startswith(f"delete `sandbox.enabled` from {f}")
+
+
+def test_an_unreadable_project_settings_file_is_its_own_kind_and_the_hint_says_what_to_run(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("WS_SANDBOXED", "1")
+    d = tmp_path / "proj"
+    (d / ".claude").mkdir(parents=True)
+    f = d / ".claude" / "settings.json"
+    f.write_text(" " * (2 << 20))
+    e = claude_code.preflight_refusal({"cwd": str(d)})
+    assert e.kind == "project_settings_unreadable" and "too large" in e.message
+    assert f"rm {f}" in e.hint and str(f) in e.hint
+    f.unlink()
+    assert claude_code.preflight_refusal({"cwd": str(d)}) is None
 
 
 def test_harmless_project_settings_and_the_users_own_settings_are_fine(tmp_path, monkeypatch):

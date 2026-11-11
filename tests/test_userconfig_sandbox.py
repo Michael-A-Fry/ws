@@ -124,7 +124,7 @@ def test_a_user_who_has_set_the_sandbox_off_is_refused_naming_the_key_and_the_fi
     before = f.read_bytes()
     code = cli.main(["install", "--yes", "--json", "--runner", "claude-code", "--notes", str(box / "Notes")])
     out = json.loads(capsys.readouterr().out)
-    assert code == 1 and out["error_kind"] == "refused"
+    assert code == 1 and out["error_kind"] == "sandbox_widened"
     assert "sandbox.enabled" in out["message"] and str(f) in out["message"]
     assert "--allow-widened-sandbox" in out["hint"] and f.read_bytes() == before
 
@@ -181,13 +181,151 @@ def test_a_persons_other_bypass_value_is_a_conflict_and_their_own_disable_stays_
     before = f.read_bytes()
     code = cli.main(["install", "--yes", "--json", "--runner", "claude-code", "--notes", str(box / "Notes")])
     out = json.loads(capsys.readouterr().out)
-    assert code == 1 and out["error_kind"] == "conflict" and wallsettings.BYPASS_KEY in out["message"]
+    assert code == 1 and out["error_kind"] == "sandbox_conflict" and wallsettings.BYPASS_KEY in out["message"]
+    assert f"`permissions.{wallsettings.BYPASS_KEY}`" in out["hint"] and str(f) in out["hint"]  # the key and the file
+    assert '"disable"' in out["hint"] and "`ws install`" in out["hint"]  # the value to set and the command to run
     assert f.read_bytes() == before
     f.write_text(json.dumps({"permissions": {wallsettings.BYPASS_KEY: "disable"}}))
     assert install(capsys, box) == 0
     assert cli.main(["uninstall", "--yes"]) in (0, 1)
     capsys.readouterr()
     assert json.loads(f.read_text())["permissions"] == {wallsettings.BYPASS_KEY: "disable"}  # theirs, so it stays
+
+
+# --- the read block stays out of a person's own file; the default domains are appended and taken out again -----------------
+
+READ_BLOCK = wallsettings.READ_BLOCK_KEY
+
+
+def test_the_read_block_is_never_merged_into_a_persons_own_settings_file(box, capsys):
+    f = box / ".claude" / "settings.json"
+    f.parent.mkdir()
+    f.write_text(json.dumps({"model": "opus"}))
+    assert install(capsys, box) == 0
+    assert READ_BLOCK not in settings(box).get("permissions", {})  # it would bind every Claude Code session they start
+    assert READ_BLOCK not in f.read_text()
+
+
+def test_the_user_file_merge_copies_nothing_but_the_keys_it_names_even_when_the_launch_file_has_the_read_block():
+    files = {"settings.json": json.dumps(generated(policy.default_policy()))}
+    assert generated(policy.default_policy())["permissions"][READ_BLOCK] is True  # the launch file has it ...
+    ops = userconfig._claude_ops(files)
+    assert not [op for op in ops if READ_BLOCK in op["path"]]  # ... and the merge does not copy it
+
+
+def test_a_persons_own_read_block_is_theirs_and_stays_through_install_and_uninstall(box, capsys):
+    f = box / ".claude" / "settings.json"
+    f.parent.mkdir()
+    f.write_text(json.dumps({"permissions": {READ_BLOCK: True}}))
+    assert install(capsys, box) == 0
+    assert settings(box)["permissions"][READ_BLOCK] is True
+    assert cli.main(["uninstall", "--yes"]) in (0, 1)
+    capsys.readouterr()
+    assert json.loads(f.read_text())["permissions"][READ_BLOCK] is True
+
+
+def test_the_default_domains_are_never_merged_into_a_persons_own_file(box, capsys):
+    # Claude Code adds up the allowedDomains of every settings scope it loads. A default host in ~/.claude/settings.json
+    # would therefore be added to a class session's own list (with_hosts replaces it only in the --settings copy).
+    f = box / ".claude" / "settings.json"
+    f.parent.mkdir()
+    mine = ["internal.example.org", "github.com"]
+    f.write_text(json.dumps({"sandbox": {"network": {"allowedDomains": mine}}}))
+    assert install(capsys, box) == 0
+    assert settings(box)["sandbox"]["network"]["allowedDomains"] == mine  # exactly theirs: nothing of ws's added
+    after = f.read_bytes()
+    assert install(capsys, box) == 0 and f.read_bytes() == after  # a second install changes nothing
+    assert cli.main(["uninstall", "--yes"]) in (0, 1)
+    capsys.readouterr()
+    assert json.loads(f.read_text())["sandbox"]["network"]["allowedDomains"] == mine
+
+
+def test_a_file_that_had_no_hosts_gets_none_from_an_install(box, capsys):
+    assert install(capsys, box) == 0
+    conf = settings(box)
+    assert "sandbox" in conf and "network" not in conf["sandbox"]  # the wall is there, the default hosts are not
+    assert "allowedDomains" not in json.dumps(conf)
+    assert cli.main(["uninstall", "--yes"]) in (0, 1)
+    capsys.readouterr()
+    f = box / ".claude" / "settings.json"
+    assert not f.exists() or "allowedDomains" not in f.read_text()
+
+
+def test_a_class_session_gets_only_its_own_hosts_from_the_user_file_and_the_launch_copy_together(box, capsys):
+    # What Claude Code sees for a class session: the user file (loaded for interactive launches and by
+    # `--setting-sources user`) and the --settings copy, with their arrays concatenated.
+    assert install(capsys, box) == 0
+    user_hosts = settings(box).get("sandbox", {}).get("network", {}).get("allowedDomains", [])
+    launch = json.dumps(generated(policy.default_policy()))
+    for hosts in ([], ["only.example.org"]):
+        copy = json.loads(claude_code.with_hosts(launch, hosts))["sandbox"]["network"]["allowedDomains"]
+        assert [*user_hosts, *copy] == hosts  # a class with no hosts reaches nothing
+
+
+def test_the_user_scope_settings_carry_the_persons_hosts_and_never_the_defaults():
+    def block(pol, **kw):
+        files = claude_code.generate(pol, ["ws"], Path("out"), Path("wshome/policy.toml"), **kw)
+        return json.loads(files["settings.json"])["sandbox"]
+
+    own = policy.loads('[gate]\nallow_hosts = ["api.example.org"]\n')
+    assert block(own, user_scope=True)["network"] == {"allowedDomains": ["api.example.org"]}
+    assert "network" not in block(policy.default_policy(), user_scope=True)
+    launch_hosts = block(policy.default_policy())["network"]["allowedDomains"]
+    assert launch_hosts == list(claude_code.DEFAULT_DOMAINS)  # the launch settings still have them
+
+
+def test_an_allow_hosts_policy_merges_its_own_list_and_not_the_defaults(box, capsys):
+    (box / ".ws").mkdir()
+    (box / ".ws" / "policy.toml").write_text('[gate]\nallow_hosts = ["api.example.org"]\n')
+    assert install(capsys, box) == 0
+    assert settings(box)["sandbox"]["network"]["allowedDomains"] == ["api.example.org"]
+
+
+def test_a_policy_with_the_sandbox_off_merges_no_block_no_domains_and_no_read_block(box, capsys):
+    (box / ".ws").mkdir()
+    (box / ".ws" / "policy.toml").write_text("[gate]\nsandbox = false\n")
+    assert install(capsys, box) == 0
+    conf = settings(box)
+    assert "sandbox" not in conf and "allowedDomains" not in json.dumps(conf) and READ_BLOCK not in json.dumps(conf)
+
+
+def test_an_install_that_keeps_the_sandbox_off_adds_no_default_domains_either(box, capsys):
+    (box / ".ws").mkdir()
+    (box / ".ws" / "policy.toml").write_text("[gate]\nsandbox = false\n")
+    assert install(capsys, box) == 0
+    (box / ".ws" / "policy.toml").write_text("[gate]\nallow_hosts = []\n")  # no sandbox key: the default is on ...
+    assert install(capsys, box) == 0
+    conf = settings(box)
+    assert conf["env"]["WS_SANDBOXED"] == "0"  # ... but an install made without the block keeps going without it
+    assert "sandbox" not in conf and "allowedDomains" not in json.dumps(conf)  # keeps_sandbox_off (ADR 0024)
+
+
+def test_ws012_does_not_call_the_default_domains_stale(box, capsys):
+    assert install(capsys, box) == 0
+    _status, detail, _ = wallsettings.doctor_check(dict(__import__("os").environ), "linux")
+    assert "stale" not in detail and "allowedDomains" not in detail  # it compares file paths only
+
+
+def test_a_sandbox_value_of_yours_that_ws_would_change_is_its_own_kind_with_the_key_and_file_in_the_hint(box, capsys):
+    f = box / ".claude" / "settings.json"
+    f.parent.mkdir()
+    f.write_text(json.dumps({"sandbox": {"failIfUnavailable": False}}))
+    before = f.read_bytes()
+    code = cli.main(["install", "--yes", "--json", "--runner", "claude-code", "--notes", str(box / "Notes")])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 1 and out["error_kind"] == "sandbox_conflict" and f.read_bytes() == before
+    assert "`sandbox.failIfUnavailable`" in out["hint"] and str(f) in out["hint"] and "true" in out["hint"]
+
+
+def test_a_sandbox_key_of_the_wrong_shape_is_its_own_kind_and_the_hint_says_which_key_and_file(box, capsys):
+    f = box / ".claude" / "settings.json"
+    f.parent.mkdir()
+    f.write_text(json.dumps({"sandbox": {"filesystem": {"denyWrite": "/x"}}}))  # a list that ws always appends to
+    before = f.read_bytes()
+    code = cli.main(["install", "--yes", "--json", "--runner", "claude-code", "--notes", str(box / "Notes")])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 1 and out["error_kind"] == "sandbox_shape" and f.read_bytes() == before
+    assert "`sandbox.filesystem.denyWrite`" in out["hint"] and str(f) in out["hint"] and "ws install" in out["hint"]
 
 
 # --- OpenCode: ws's denies come last ----------------------------------------------------------------------------------

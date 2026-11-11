@@ -235,9 +235,18 @@ def _container(doc: dict, path, make, made: list, where: Path) -> dict | list:
         if key in cur:
             if not isinstance(cur[key], want):
                 kind = "a list" if want is list else "an object"
+                key = _dotted(path[: i + 1])
+                if path[0] == "sandbox":  # the wall's own block: say which key to fix, in which file, and the command
+                    raise WsError(
+                        "sandbox_shape",
+                        f"{where}: `{key}` is not {kind}, so ws can't add the sandbox settings to it; ws changed nothing",
+                        f"make `{key}` {kind} in {where}, or delete it, then run `ws install` again; or start gated "
+                        "sessions with `ws gate launch`",
+                        details={"file": str(where), "key": key},
+                    )
                 raise WsError(
                     "refused",
-                    f"{where}: `{_dotted(path[: i + 1])}` is not {kind}, so ws can't add to it; ws changed nothing",
+                    f"{where}: `{key}` is not {kind}, so ws can't add to it; ws changed nothing",
                     "start gated sessions with `ws gate launch`, or fix that key",
                 )
             cur = cur[key]
@@ -309,10 +318,22 @@ def update(doc: dict, old_added, old_made, ops, where: Path) -> tuple[dict, list
             elif now == op["value"]:
                 continue
             else:
+                key = _dotted(op["path"])
+                message = (
+                    f"{where}: you have `{key}` as {json.dumps(now)}, and ws needs "
+                    f"{json.dumps(op['value'])}; ws changed nothing"
+                )
+                if op["path"][0] == "sandbox" or tuple(op["path"]) == ("permissions", wallsettings.BYPASS_KEY):
+                    raise WsError(  # a wall setting of yours that ws would have to change
+                        "sandbox_conflict",
+                        message,
+                        f"set `{key}` to {json.dumps(op['value'])} in {where}, or delete it, then run `ws install` "
+                        "again; or start gated sessions with `ws gate launch`",
+                        details={"file": str(where), "key": key},
+                    )
                 raise WsError(
                     "conflict",
-                    f"{where}: you have `{_dotted(op['path'])}` as {json.dumps(now)}, and ws needs "
-                    f"{json.dumps(op['value'])}; ws changed nothing",
+                    message,
                     "change that value to match, or start gated sessions with `ws gate launch`",
                 )
             added.append(op)

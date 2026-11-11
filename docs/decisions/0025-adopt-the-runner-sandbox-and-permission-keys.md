@@ -74,7 +74,7 @@ merge copies only the keys it names). About one day of work, most of it the new 
 - Bad, because the plain generated file (`ws gate generate`, used for `claude --settings` without `ws gate launch`) has
   no forge either, since it's the one list headless jobs read.
 - Bad, because the read block is the runner's: below Claude Code 2.1.257 the key does nothing, and WS016 is the only
-  signal. A class file placed before this change shows a WS014 `read block` warning until it's placed again.
+  signal.
 
 ### Confirmation
 

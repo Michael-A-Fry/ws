@@ -88,3 +88,25 @@ def test_cli_errors_exit_1_without_a_traceback(home, capsys, monkeypatch):
     profile_path().write_text("")
     assert cli.main(["note", "hi"]) == 1
     assert "[roles.notes]" in capsys.readouterr().err
+
+
+def test_a_session_in_a_walled_class_cannot_capture_a_note(home, monkeypatch):
+    repo = home / "work" / "alpha"
+    repo.mkdir(parents=True)
+    (home / "wshome" / "policy.toml").write_text(
+        f'[classes.alpha]\naccess = "walled"\nrepos = ["{repo}/**"]\n', encoding="utf-8"
+    )
+    monkeypatch.chdir(repo)
+    with pytest.raises(notes.WsError) as e:
+        notes.capture("what alpha found", home / "vault", now=WHEN)
+    assert e.value.kind == "refused" and "alpha" in e.value.message and e.value.hint
+    assert not (home / "vault" / "_inbox").exists()
+    monkeypatch.chdir(home)  # a folder in no class is not a walled class
+    assert notes.capture("a person's own", home / "vault", now=WHEN).exists()
+
+
+def test_a_class_is_never_taken_from_an_argument():
+    import inspect
+
+    for fn in (notes.capture, notes.refuse_walled):
+        assert not {"cls", "class_name", "access"} & set(inspect.signature(fn).parameters)

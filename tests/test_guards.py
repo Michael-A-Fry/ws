@@ -1087,15 +1087,15 @@ def test_each_event_gets_a_hook_only_when_a_guard_runs_there(monkeypatch):
     fake_guard(monkeypatch, "e-pre", events=("pre",), kinds=("message", "skill", "read"))
     hooks = generate(pol("e-stop e-post e-pre"))["hooks"]
     assert hooks["PostToolUse"][0]["matcher"] == "Bash|Agent|Task|Skill"
-    assert hooks["PreToolUse"][0]["matcher"] == claude_code.MATCHER + "|Skill|SendMessage"
+    assert hooks["PreToolUse"][0]["matcher"] == claude_code.MATCHER == "*"  # every tool already: no kind adds to it
     assert "gate event" in commands(hooks["SubagentStop"])[0]
     assert [("gate event" in c) for c in commands(hooks["Stop"])] == [True, False]  # then the phone alert
     assert [("gate event" in c) for c in commands(hooks["UserPromptSubmit"])] == [False, True]
 
 
-def test_the_pre_tool_use_matcher_grows_only_for_the_kinds_a_guard_reads(monkeypatch):
+def test_the_pre_tool_use_matcher_is_every_tool_whatever_a_guard_reads(monkeypatch):
     fake_guard(monkeypatch, "e-agent", events=("pre",), kinds=("agent",))
-    assert generate(pol("e-agent"))["hooks"]["PreToolUse"][0]["matcher"] == claude_code.MATCHER + "|Agent|Task"
+    assert generate(pol("e-agent"))["hooks"]["PreToolUse"][0]["matcher"] == claude_code.MATCHER
     assert generate(pol("bulk-staging"))["hooks"]["PreToolUse"][0]["matcher"] == claude_code.MATCHER
 
 

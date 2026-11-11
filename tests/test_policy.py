@@ -4,6 +4,7 @@ Dangerous strings are built at run time from parts (nothing here is ever execute
 
 from __future__ import annotations
 
+import dataclasses
 import shlex
 import time
 
@@ -1435,6 +1436,152 @@ def test_eval_of_fetched_text_and_shell_options_with_arguments():
 def test_the_default_policy_turns_two_guards_on_and_a_policy_with_no_table_turns_none_on():
     assert policy.default_policy().guards.on == ("syntax-check", "session-context", "dev-server")
     assert policy.loads("schema = 1\n").guards == policy.Guards()
+
+
+def test_guard_mode_is_stripped_before_config_and_bad_values_refuse():
+    """`mode` is the policy's own key: a guard whose config() takes no keys still loads with it, config() never sees it,
+    and the mode is kept per guard that is on. A value other than enforce or log refuses the whole policy."""
+    from ws import guards
+
+    got = policy.loads('[guards]\non = ["claims", "bulk-staging"]\n[guards.claims]\nmode = "log"\n').guards
+    assert got.modes == {"claims": "log", "bulk-staging": "enforce"}
+    assert got.config["claims"] == guards.get("claims").config({}, "x")  # the guard's table, without `mode`
+    assert policy.loads('[guards]\non = ["bulk-staging"]\n[guards.bulk-staging]\nmode = "log"\n').guards.modes == {
+        "bulk-staging": "log"
+    }  # a guard that takes no table of its own still takes the mode
+    assert policy.loads("").guards.modes == {}
+    for bad in ('"warn"', '"LOG"', "1", "true", '["log"]', '""'):
+        with pytest.raises(PolicyError, match=r"\[guards\.claims\]: mode must be \"enforce\" or \"log\""):
+            policy.loads(f'[guards]\non = ["claims"]\n[guards.claims]\nmode = {bad}\n')
+    with pytest.raises(PolicyError, match=r"\[guards\.dev-server\]: mode"):  # a guard that is not on is checked too
+        policy.loads('[guards]\non = ["claims"]\n[guards.dev-server]\nmode = "audit"\n')
+    with pytest.raises(PolicyError, match="unknown key 'extra'"):  # the guard's own keys are still its own
+        policy.loads('[guards]\non = ["claims"]\n[guards.claims]\nmode = "log"\nextra = 1\n')
+
+
+def test_the_refusals_the_wall_can_make_redundant_carry_their_kind_in_the_type(pol, tmp_path):
+    """Three refusals are typed (a `str` subclass with a `kind`, as `gate.Ask` is); every other refusal is a plain str.
+    A caller branches on the type, and `wall=True` reads the whole line past the typed ones."""
+    from ws import shellwords
+
+    folder = tmp_path / ("bin-" + "x")
+    cases = {
+        f'for f in $(ls {folder}); do "$f" go; done': policy.UNKNOWN_WORD,
+        'IFS=: read -r a b <<< "x:y"; echo "$a"': policy.SETS_IFS,
+        's=$(mktemp -p .); echo hi > "$s"': policy.UNREAD_WRITE,
+        "$PROGRAM --go": policy.UNKNOWN_WORD,
+    }
+    bare = dataclasses.replace(
+        pol, gate=dataclasses.replace(pol.gate, deny_commands=(), ask_commands=()), guards=policy.Guards()
+    )
+    for command, kind in cases.items():
+        for wall in (False, True):
+            why = policy.is_denied_command(bare, command, cwd=str(tmp_path), wall=wall)
+            assert isinstance(why, policy.Refusal) and why.kind == kind and kind in policy.WALL_REDUNDANT, command
+    # where a rule about a program is set, a word ws cannot read is a plain refusal even with the wall proven
+    for rule in ({"deny_commands": ("make deploy",)}, {"ask_commands": ("make deploy",)}):
+        ruled = dataclasses.replace(bare, gate=dataclasses.replace(bare.gate, **rule))
+        for command in ("$PROGRAM --go", f'for f in $(ls {folder}); do "$f" go; done'):
+            why = policy.is_denied_command(ruled, command, cwd=str(tmp_path), wall=True)
+            assert why and not isinstance(why, policy.Refusal), (rule, command)
+    # so it is where a guard that judges commands is on in enforce mode, and not where that guard only logs
+    for modes, plain in (({}, True), ({"dev-server": "log"}, False)):
+        guarded = dataclasses.replace(
+            bare, guards=policy.Guards(on=("dev-server",), config=pol.guards.config, modes=modes)
+        )
+        why = policy.is_denied_command(guarded, "$PROGRAM --go", cwd=str(tmp_path), wall=True)
+        assert why and isinstance(why, policy.Refusal) is not plain, modes
+    # a read through a variable ws cannot read is a read, not a scratch write: a plain refusal in every mode
+    read = "cat $SOME_DIR/.ssh/id_rsa"
+    for wall in (False, True):
+        why = policy.is_denied_command(pol, read, cwd=str(tmp_path), wall=wall)
+        assert why and not isinstance(why, policy.Refusal)
+    # the other rules are plain, and win over a typed refusal in the same line when the line is read past it
+    for command in ("$PROGRAM --go; cat ~/.ssh/id_rsa", "IFS=: ; cat ~/.ssh/id_rsa", "$PROGRAM --go; rm -rf /"):
+        why = policy.is_denied_command(pol, command, cwd=str(tmp_path), wall=True)
+        assert why and not isinstance(why, policy.Refusal), command
+    # the IFS error keeps its kind, and says which refusal it is in a field of its own
+    with pytest.raises(shellwords.ShellError) as e:
+        shellwords.prep('IFS=: ; echo "$x"')
+    assert e.value.kind == "unsupported" and e.value.rule == shellwords.SETS_IFS
+    with pytest.raises(shellwords.ShellError) as e:
+        shellwords.require_closed("echo 'unclosed")
+    assert e.value.kind == "unclosed_quote" and e.value.rule is None
+
+
+def test_ifs_can_split_reads_quoting_and_nesting(pol, tmp_path):
+    """`shellwords.ifs_can_split` is true when a changed separator could make an expansion split into other words, or
+    when the line sets it somewhere ws cannot follow (inside a quoted body a nested shell runs)."""
+    from ws import shellwords
+
+    v = "IF" + "S"  # built at run time
+    yes = (
+        f"{v}=: ; $c",
+        f"{v}=: ; ${{c}}",
+        f"{v}=: ; echo `ls`",
+        f"{v}=: ; echo $(ls)",
+        f'{v}=: ; echo "$(echo $c)"',
+        f'{v}=: ; echo "`echo $c`"',
+        f"{v}=: ; echo $1 $@ $#",
+        f"c=a:b; {v}=: ; $c",
+        f"{v}=: ; $'x'$c",
+        f"bash -c '{v}=: ; echo hi'",
+        f'bash -c "{v}=: ; echo hi"',
+        f"{v}=: ; cat <<EOT\nx\nEOT",
+        f"{v}=: ; case x in x) echo hi;; esac",
+        f"{v}=: ; echo 'unclosed",
+        f"{v}=: ; echo \\$c ; echo $c",
+    )
+    no = (
+        f"{v}=: ; make deploy",
+        f'{v}=: read -r a b <<< "x:y"; echo "$a"',
+        f"{v}=: ; echo '$c'",
+        f"{v}=: ; echo \\$c",
+        f'{v}=: ; echo "$c" "${{d}}" "$(echo "$e")"',
+        f"{v}=: ; echo hi # it's $c",
+    )
+    for command in yes:
+        assert shellwords.ifs_can_split(command), command
+    for command in no:
+        assert not shellwords.ifs_can_split(command), command
+
+
+def test_a_line_that_sets_the_separator_is_read_past_only_when_it_cannot_split(pol, tmp_path):
+    """With the wall proven, the rest of such a line is judged: a plain refusal from any rule, and a plain refusal too
+    when the line could split (the program it runs is unknown) or the folded line still sets the separator."""
+    from ws import shellwords
+
+    v = "IF" + "S"
+    p = policy.loads('[gate]\ndeny_commands = ["make deploy", "git push*"]\n')
+    cwd = str(tmp_path)
+    for command in (
+        f"{v}=Z; c=makeZdeploy; $c",
+        "\uff29\uff26\uff33=, ; git push origin",
+        "I\\\nFS=, ; git push origin",
+        f"{v}=, ; make deploy",
+    ):
+        why = policy.is_denied_command(p, command, cwd=cwd, wall=True)
+        assert why and not isinstance(why, policy.Refusal), command
+    clean = policy.is_denied_command(p, f'{v}=: read -r a b <<< "x:y"; echo "$a"', cwd=cwd, wall=True)
+    assert isinstance(clean, policy.Refusal) and clean.kind == policy.SETS_IFS
+    # the rename folds the line as the reader does
+    assert shellwords.without_ifs_setting("\uff29\uff26\uff33=, ; echo hi") == "_WS_IFS=, ; echo hi"
+    assert shellwords.without_ifs_setting("I\\\nFS=, ; echo hi") == "_WS_IFS=, ; echo hi"
+
+
+def test_the_template_ships_prose_guards_in_log():
+    text = policy.default_toml()
+    assert policy.default_policy().guards.modes["syntax-check"] == "log"
+    assert (
+        policy.default_policy().guards.modes["dev-server"] == "enforce"
+    )  # a guard of the machine is not a prose guard
+    for name in ("claims", "test-weakening"):
+        assert f'# [guards.{name}]\n# mode = "log"' in text  # in the commented table, for whoever turns the guard on
+    on = text.replace('on = ["syntax-check"', 'on = ["claims", "test-weakening", "syntax-check"')
+    for name in ("claims", "test-weakening"):
+        on = on.replace(f'# [guards.{name}]\n# mode = "log"', f'[guards.{name}]\nmode = "log"')
+    got = policy.loads(on).guards.modes
+    assert got["claims"] == got["test-weakening"] == got["syntax-check"] == "log"
 
 
 @pytest.mark.parametrize(

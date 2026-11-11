@@ -233,7 +233,7 @@ def test_the_claude_code_settings_run_the_hook_for_mcp_tools_and_deny_the_exact_
     files = claude_code.generate(pol, ["ws"], box / "out", box / "wshome" / "policy.toml", pin=paths.pin_of())
     conf = json.loads(files["settings.json"])
     (group,) = conf["hooks"]["PreToolUse"]
-    assert "mcp__.*" in group["matcher"].split("|") and group["hooks"][0]["onFailure"] == "block"
+    assert group["matcher"] == "*" and group["hooks"][0]["onFailure"] == "block"  # every tool, MCP tools among them
     deny = conf["permissions"]["deny"]
     assert "WebFetch" in deny and "mcp__x__y" in deny and not any("*" in d and d.startswith("mcp__") for d in deny)
 

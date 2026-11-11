@@ -164,7 +164,9 @@ def test_a_bad_rule_names_the_key(toml, text):
 
 def test_the_generated_settings_watch_skills_and_prompts(home, pol):
     hooks = json.loads(claude_code.generate(pol, ["ws"], home / "out", home / "p.toml")["settings.json"])["hooks"]
-    assert "Skill" in hooks["PreToolUse"][0]["matcher"]
+    # The gate hook is registered for every tool (claude_code.MATCHER, `*`), not a list of names: a Skill call is gated
+    # because the hook sees all of them, and a tool the runner adds later is gated too.
+    assert hooks["PreToolUse"][0]["matcher"] == claude_code.MATCHER
     assert any("gate event" in h["command"] for g in hooks["UserPromptSubmit"] for h in g["hooks"])
 
 

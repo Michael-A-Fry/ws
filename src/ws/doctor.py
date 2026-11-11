@@ -1,7 +1,7 @@
 """`ws doctor`: one line per check, each with a stable ID. Exit 0 only when nothing is failing or unconfigured.
 
 IDs never change meaning once released: WS0xx are the machine, profile, jobs, gate,
-sandbox, plugins, where ws keeps its files, what the runner needs of its hooks, the OS-user classes, the network of each data class and the settings keys the wall writes, WS1xx are the roles
+sandbox, plugins, where ws keeps its files, what the runner needs of its hooks, the OS-user classes, the network of each data class, the settings keys the wall writes and the guards that ask to log, WS1xx are the roles
 (one per role).
 """
 
@@ -284,7 +284,7 @@ def _upgrade_check(env) -> Check:
 
 def _class_checks(env, kind: str) -> list[Check]:
     """WS014: each class with an `os_user` in the policy, one line per part, each judged on its own (the OS user exists, the
-    managed-settings file is there and root-owned, the sandbox is required, unsandboxed commands are off, bypass is off,
+    class file is there and root-owned, the sandbox is required, unsandboxed commands are off, bypass is off,
     writes are limited, the home folder is hidden, inbound is lead-only). No line when the policy names no such class, or
     does not load (WS012 says so). The user and the file are read from the system, never from the environment."""
     try:
@@ -293,6 +293,63 @@ def _class_checks(env, kind: str) -> list[Check]:
         return []
     rows = wallsettings.class_rows(pol, env, kind)
     return [Check("WS014", "class", r.status, f"{r.cls}: {r.part}: {r.detail}", r.fix) for r in rows]
+
+
+def _review_checks(env, now=None) -> list[Check]:
+    """WS017: each class that sets a `review_date`, one line: `warn` when the date is today or past (`Class.review_due`, UTC:
+    the one judge `ws walls check` also asks), `ok` with the owner and date otherwise. No line for a class with no date, when
+    the policy has no classes, or when it does not load (WS012 says so)."""
+    try:
+        pol = policy.load(policy.policy_path(dict(env)))
+    except (policy.PolicyError, OSError):
+        return []
+    now = datetime.now(UTC) if now is None else now
+    out = []
+    for name in sorted(pol.classes):
+        cls = pol.classes[name]
+        if cls.review_date is None:
+            continue
+        who = f"owner {cls.owner}" if cls.owner else "no owner named"
+        if cls.review_due(now):
+            fix = (
+                f"look at the class, then move review_date under [classes.{name}] to the next review (`ws walls edit`)"
+            )
+            out.append(Check("WS017", "review", WARN, f"{name}: review was due {cls.review_date} ({who})", fix))
+        else:
+            out.append(Check("WS017", "review", OK, f"{name}: next review {cls.review_date} ({who})"))
+    return out
+
+
+_MODE_FIX = {
+    "native-windows": 'run ws inside WSL2 (the wall needs Linux or macOS), or take mode = "log" out of those guards',
+    "no-sandbox-binary": (
+        'install bubblewrap (Linux, WSL2; macOS has sandbox-exec), or take mode = "log" out of those guards'
+    ),
+    "sandbox-off": 'set sandbox = true under [gate] and run `ws install`, or take mode = "log" out of those guards',
+}
+
+
+def _mode_checks(env) -> list[Check]:
+    """WS018: the guards that set `mode = "log"`, one line. `warn` when this machine cannot give the wall (native Windows, no
+    sandbox binary on PATH, or `[gate] sandbox = false`): each of those guards then refuses as in enforce, and the line
+    names them and the one word for why. `ok` when it can (whether the wall holds for a given call is the gate's to say,
+    call by call). No line when no guard asks for log, or when the policy does not load (WS012 says so). It names guards
+    and a reason, never a path."""
+    from ws import gate, guards  # here, not at the top: the gate imports a lot the doctor does not need
+
+    try:
+        pol = policy.load(policy.policy_path(dict(env)))
+    except (policy.PolicyError, OSError):
+        return []
+    asked = guards.requested_log(pol)
+    if not asked:
+        return []
+    names = ", ".join(asked)
+    gap = gate.machine_gap() or ("" if pol.gate.sandbox else "sandbox-off")
+    if gap:
+        detail = f"{names} ask to log what the wall enforces, and the wall cannot apply here ({gap}): they refuse as in enforce"
+        return [Check("WS018", "guard-modes", WARN, detail, _MODE_FIX[gap])]
+    return [Check("WS018", "guard-modes", OK, f"{names} log what the wall enforces, call by call where it is proven")]
 
 
 def _egress_checks(env, kind: str, now=None) -> list[Check]:
@@ -493,6 +550,14 @@ def run_checks(osi: OSInfo, profile_file: Path, env: dict | None = None, network
         checks += _wall_keys_check(env)
     except Exception as e:  # noqa: BLE001 (a broken check must report, not crash the whole doctor)
         checks.append(Check("WS016", "wall-keys", FAIL, f"check crashed ({type(e).__name__})"))
+    try:
+        checks += _review_checks(env)
+    except Exception as e:  # noqa: BLE001 (a broken check must report, not crash the whole doctor)
+        checks.append(Check("WS017", "review", FAIL, f"check crashed ({type(e).__name__})"))
+    try:
+        checks += _mode_checks(env)
+    except Exception as e:  # noqa: BLE001 (a broken check must report, not crash the whole doctor)
+        checks.append(Check("WS018", "guard-modes", FAIL, f"check crashed ({type(e).__name__})"))
     try:
         checks.append(_layout_check(env))
     except Exception as e:  # noqa: BLE001 (a broken check must report, not crash the whole doctor)

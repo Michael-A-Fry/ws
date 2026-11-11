@@ -26,6 +26,10 @@ doesn't exist can each leave it where it was, so a move is judged in every folde
 from a variable or substitution (`git -C "$DIR" ...`, `cd "$(...)"`), and a `GIT_DIR` or `GIT_WORK_TREE` set earlier by
 `export` or `declare`, can't be read, so a command that would move HEAD from there is denied and the reason asks for a
 path. The guard is advice-level: a script run by `bash script.sh` isn't read.
+
+It has no NATIVE_DENY, so every form it denies stays with the hook: what it denies depends on the folder the command runs
+in (a main checkout with linked worktrees, or one `paths` names), and a deny pattern on the command text can't see a
+folder. `git checkout topic` is the normal way to work in a linked worktree, so a pattern for it would refuse that too.
 """
 
 from __future__ import annotations

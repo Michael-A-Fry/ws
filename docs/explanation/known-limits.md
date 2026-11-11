@@ -29,13 +29,40 @@ Claude Code's sandbox confines the programs a shell command starts. Its own Read
 hooks don't run in it. They're covered by the permission rules (`permissions.deny`, written from the policy) and by the
 gate. Reads by Claude's file tools outside the working folders are held by
 `permissions.blockReadsOutsideWorkingDirectories` (Claude Code 2.1.257 and newer), which ws sets in the launch
-settings and in a class's managed-settings file, and never in your own settings file. `[gate] read_outside_project =
+settings and in a class's launch file, and never in your own settings file. `[gate] read_outside_project =
 true` leaves it out. `ws doctor` (WS016) warns when your Claude Code is too old to read it.
 
 - **What it means.** A Read of a path the policy doesn't deny, inside the working folders, is allowed whatever the
   sandbox says. A hook or an MCP server runs with your account's reach.
 - **Workaround.** Put the paths you care about in `deny_read`, which ws writes as both a Read rule and a sandbox
   `denyRead`. Keep MCP tools to the ones `allow_mcp` names.
+
+### What a walled class's settings can't hold, and what an OpenCode session lacks
+
+Claude Code reads `allowManagedHooksOnly`, `allowManagedPermissionRulesOnly` and `sandbox.network.allowManagedDomainsOnly`
+(and `sandbox.filesystem.allowManagedReadPathsOnly`) only from managed settings. In a `--settings` file, which is how
+`ws gate launch` passes a class's launch file, they do nothing, and in the machine-wide managed file they would switch off
+every account's own hooks and permission rules. So ws doesn't write them to the launch file (ADR 0027).
+
+- **What it means.** A project that adds a hook, an MCP server or an allow rule isn't stopped by Claude Code itself. ws
+  refuses to start a walled session, and refuses each call, when a project's `.mcp.json` or `.claude/settings*.json`
+  holds anything outside a short allow-list (the keys and `env` names are in the wall page); the refusal reads the
+  repository's files, so a file created by the session after it starts is caught on the next call, not before it. The
+  check reads a skill's, agent's and command's frontmatter and refuses the keys that run code; it doesn't read their
+  bodies, so a skill's `!command` line stays allowed. The sandbox and the session's permission rules hold it,
+  with `allowed-tools` refused so a skill can't pre-approve it; this check doesn't judge the command.
+- **What it means for OpenCode.** An OpenCode session in a class is walled by ws's own wall: writes only in the project
+  and scratch, the network through ws's proxy (loopback only under `local_only`) and the same MCP rules. That wall hides
+  the `deny_read` paths and not the whole home, so for reads the class's own account and the folder modes are the boundary.
+- **A class's own home folder.** When a class's repos sit inside its home folder, the launch file denies Claude's Read
+  and Edit tools on the dot-folders and the top-level dotfiles there (`~/.*/**` and `~/.*`, so `~/.claude.json` and the
+  shell start files too). The rest of that home, the non-dot files outside the repos, is covered by the class's own
+  account and the folder modes only. The sandbox hides the whole home from shell commands either way.
+- **One class per machine.** One walled class on a machine is the tested shape. Claude Code reads every file in the
+  managed-settings folder for every account, so the managed-settings files of two classes on one machine are read
+  together, and ws doesn't test that. Each launch file is read by its own class's sessions only.
+- **Workaround.** Keep each walled class's repos in a folder only its account can reach, and keep your own home folder
+  closed (`chmod 700`).
 
 ### The secret wall is Linux with systemd only
 
@@ -224,8 +251,9 @@ your runner's own config file, beside yours. It records exactly what it added an
   wider project locks (the whole `.claude` folder, `opencode.json` and the rest of the git folder) apply only to a
   session started with `ws gate launch`, inside the wall. A later undo keeps whatever you added to the config file.
 - **A project can turn the hooks off.** A project's `disableAllHooks` setting turns off every hook for sessions in that
-  project, including ws's gate check. ws's deny rules stay, but they're only part of the gate. Headless jobs from
-  `ws run` load only your user settings, so a project's setting doesn't reach them.
+  project, including ws's gate check. ws's deny rules stay, but they're only part of the gate. A walled class is the
+  exception: the launch file sets `disableAllHooks` false, and the launch check refuses a project that sets it. Headless
+  jobs from `ws run` load only your user settings, so a project's setting doesn't reach them.
 - **A running session keeps the hooks it started with.** Claude Code reads its hooks at start. After `ws install`
   changes the file, start a new session to get the change. A session that began before the gate went in stays ungated
   until you restart it, and one that began before an undo keeps calling the hook until you restart it.

@@ -39,6 +39,14 @@ the machine or the repository, 20 for one that keeps the session honest about it
 message says, and 90 for advice after the fact. `stream` and `run` take an optional list that gets one
 `{guard, result, ms}` for each guard that ran, which `ws gate` writes to the verdict log (see docs/reference/stores.md).
 
+Every guard takes `mode = "enforce"` (the default) or `mode = "log"` in its `[guards.NAME]` table, a key the policy
+reads and `config()` never sees (see ws.policy). The effective mode is log only when log is asked for AND the sandbox
+wall is proven for this call (`Context.wall`: the gate decides, from the platform, the sandbox binary on PATH, ws's own
+settings marker and the adapter's preflight, and `wall_gap` says why not in one fixed word). Then `stream` turns the
+guard's deny into a note and a `would-deny` verdict, so the call goes ahead and the log holds a count; an approvable deny
+asks for no approval. Without the wall the guard refuses exactly as in enforce, and its verdict carries the word. A guard
+asked to log gets no NATIVE_DENY in the runner's list: a runner's own rule can't be logged instead of refused.
+
 A new guard is one module here; nothing else changes. The policy turns a guard on, and `ws gate generate` writes the
 runner hooks for the events and tools the guards that are on need.
 """
@@ -69,6 +77,9 @@ class Finding:
     action: str
     reason: str
     approvable: bool = False
+    would_deny: bool = (
+        False  # set by `stream` alone: a deny the guard's log mode let through (the action is then "note")
+    )
 
     def __post_init__(self) -> None:
         if self.action not in ACTIONS:
@@ -87,9 +98,15 @@ class Context:
     clock: Callable[[], float] = time.time
     home: Path | None = None
     memo: dict = field(default_factory=dict)  # scratch for one hook run, shared by the guards (not kept)
+    wall: Callable[[], str] | None = None  # "" when the sandbox wall is proven for this call, else why not; None = not
 
     def now(self) -> float:
         return self.clock()
+
+    def wall_gap(self) -> str:
+        """Why the wall is not proven for this call, as one of ws.gate.WALL_GAPS, or "" when it is. A context built with no
+        proof (a test, a replay) has none."""
+        return "sandbox-off" if self.wall is None else self.wall()
 
     def state(self, name: str, update: Callable[[dict], dict | None] | None = None) -> dict:
         """This guard's record for this session. With `update`, one locked read-modify-write: `update` gets the
@@ -203,22 +220,38 @@ def kinds_for(on: tuple[str, ...], event: str) -> set[str]:
     return {k for g in wanted(on, event) for k in g.KINDS}
 
 
-def native_deny(on: tuple[str, ...]) -> list[str]:
-    """The deny patterns for a runner's own rule list that the guards that are on contribute."""
-    return list(dict.fromkeys(p for n in on for p in getattr(get(n), "NATIVE_DENY", ())))
+def native_deny(on: tuple[str, ...], modes: dict | None = None) -> list[str]:
+    """The deny patterns for a runner's own rule list that the guards that are on contribute, but not those of a guard
+    whose mode is log: the runner would refuse the call outright, where the guard's mode is to log it when the wall holds
+    (and the hook, which still runs, refuses it where the wall is not proven)."""
+    modes = modes or {}
+    return list(
+        dict.fromkeys(p for n in on if modes.get(n, "enforce") != "log" for p in getattr(get(n), "NATIVE_DENY", ()))
+    )
 
 
-RANK = {"pass": 0, "note": 1, "warn": 2, "deny": 3, "error": 4}
+def requested_log(pol) -> list[str]:
+    """The guards that are on and ask for `mode = "log"`, by name."""
+    return sorted(n for n in pol.guards.on if pol.guards.mode(n) == "log")
+
+
+RANK = {"pass": 0, "note": 1, "warn": 2, "would-deny": 2, "deny": 3, "error": 4}
 
 
 def stream(pol, event: str, calls: list, ctx: Context, verdicts: list[dict] | None = None):
     """The findings of the guards that are on at `event`, one at a time, as (guard name, the Call judged or None,
     Finding), in the fixed order (see the module docstring). A caller that stops at the first deny never asks the
     guards after it. On "pre" and "post" each call goes to the guards that read its kind; on the other events the
-    guards get one None call. `verdicts` gets one {guard, result (pass, note, warn, deny or error), ms} as each guard
-    starts, kept up to date as it goes; a guard that raises is `error` and the exception goes on."""
+    guards get one None call. `verdicts` gets one {guard, result (pass, note, warn, would-deny, deny or error), ms} as
+    each guard starts, kept up to date as it goes; a guard that raises is `error` and the exception goes on.
+
+    A guard whose mode is log (`pol.guards.mode`) has each deny turned into a note when `ctx.wall_gap()` says the wall is
+    proven: the finding is yielded with `would_deny` set (its action is "note", its reason says it was not refused), the
+    verdict is `would-deny` and gains a `count` of them, and nothing is asked of a person. When the wall is not proven the
+    deny goes on as it is, and the verdict gains `gap`, the word `wall_gap` gave."""
     for g in wanted(pol.guards.on, event):
         cfg = pol.guards.config.get(g.NAME)
+        logging = pol.guards.mode(g.NAME) == "log"
         verdict = {"guard": g.NAME, "result": "pass", "ms": 0.0}
         if verdicts is not None:
             verdicts.append(verdict)
@@ -228,8 +261,17 @@ def stream(pol, event: str, calls: list, ctx: Context, verdicts: list[dict] | No
                 if call is not None and call.kind not in g.KINDS:
                     continue
                 found = g.judge(call, cfg, ctx)
+                if found is not None and found.action == "deny" and logging:
+                    gap = ctx.wall_gap()
+                    if gap:
+                        verdict["gap"] = gap  # asked to log, and enforcing: the line says why
+                    else:
+                        found = Finding("note", f"not refused (mode log): {found.reason}", would_deny=True)
+                        verdict["count"] = verdict.get("count", 0) + 1
                 if found is not None:
-                    if RANK[found.action] > RANK[verdict["result"]]:
+                    if found.would_deny:
+                        verdict["result"] = "would-deny"
+                    elif RANK[found.action] > RANK[verdict["result"]]:
                         verdict["result"] = found.action
                     verdict["ms"] = round((time.perf_counter() - began) * 1000, 2)
                     yield g.NAME, call, found

@@ -45,6 +45,33 @@ The first call of a session, and any call made while the daemon is down, takes t
 What each hook of a typical hand-built set does, and which rule or guard here does the same job, is on the
 [hooks page](hooks.md).
 
+## Call kinds
+
+An adapter reads a runner's payload as neutral calls, and the policy and the guards judge those. The kinds are
+`command` (a shell command), `read`, `search`, `write`, `tool` (a neutral tool name such as a web fetch), `agent`,
+`skill`, `message`, `mcp` (an MCP tool, with its arguments) and `other`. The policy has rules for `command`, `read`,
+`search`, `write`, `tool` and `mcp`; the rest reach guards only.
+
+A tool no adapter reads is one `other` call, made by the gate from the tool's name (Claude Code's `tool_name`, the
+OpenCode shim's `tool`, cut to 80 characters). It's allowed, because the policy has no rule for it, and it isn't passed
+over: the hook run leaves one line in the verdict log (below), and `record-calls` records it. A payload that names no
+tool has no call, and one whose tool name or input can't be read is a deny, as before. The Claude Code hook matches
+every tool, so a tool the runner adds later arrives here.
+
+## The verdict log
+
+A hook run that asked a guard, refused a call, let through what a guard in `log` mode would have refused, or met an
+unlisted tool leaves one counts-only line in `<state>/logs/gate.jsonl` (the fields are in [Stores](stores.md)). It
+never holds a command, a path or message text. `guards` has one entry for each guard asked, named for the guard, and
+one for each refusal the OS wall made redundant, named `rule:KIND`; an entry's `result` is `pass`, `note`, `warn`,
+`would-deny`, `deny` or `error`. `would-deny` carries a `count`, and a guard in `log` mode that had to refuse because
+the wall wasn't proven carries a `gap`, one word from the table in
+[Guards](guards.md#modes-enforce-and-log). The write is capped at 1 MiB a file and rotates like every ws log, so a
+reader of the log still sees the old lines. A log that can't be written never changes the decision.
+
+`ws gate replay` and the corpus never prove the wall: they judge every call as a session with no wall would, so the
+answer is the same on any machine.
+
 ## OpenCode
 
 OpenCode is gated by two layers, each enough on its own for what it holds. `ws gate generate --runner opencode` writes

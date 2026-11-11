@@ -21,13 +21,56 @@ files = ["STATE.md", ".state/STATE.md", "HANDOFF.md", "TODO.md"]   # the default
 A policy file with no `[guards]` table has no guards on, so an upgrade changes nothing until you add the table.
 `ws gate init` writes `on = ["syntax-check", "session-context", "dev-server"]` and lists the other guards as comments. A
 name in `on` that ws doesn't know stops the load and the message names it. So does a key in `[guards]` that isn't `on`
-or a guard name, and a key in a guard's table that guard doesn't read.
+or a guard name, and a key in a guard's table that guard doesn't read (`mode` is read by ws for every guard, below).
+
+## Modes: Enforce and log
+
+Every guard's table takes one key of ws's own, `mode`:
+
+```toml
+[guards.claims]
+mode = "log"        # "enforce" (the default) or "log"
+```
+
+Any other value, for any guard (on or not), stops the load and the message names the key. In `enforce` a guard refuses
+as it always did. In `log` a guard that would refuse a call lets it through and writes a count to the verdict log
+(`logs/gate.jsonl`, see [Stores](stores.md)), but **only where the OS wall is proven for that call**. Everywhere else
+the guard refuses exactly as in `enforce`, and its entry in the log line carries the reason as one word in `gap`.
+
+The wall is proven for a call only when all of these hold, and a project can set none of them:
+
+| Reason word | What failed |
+|---|---|
+| `native-windows` | The machine is native Windows, which has no sandbox. Linux, WSL2 and macOS can. |
+| `no-sandbox-binary` | `bwrap` isn't on `PATH` (Linux, WSL2), or `sandbox-exec` isn't (macOS). Nothing is run to find out. |
+| `sandbox-off` | The session's environment doesn't carry ws's marker `WS_SANDBOXED=1`. ws's own settings set it; `0` marks settings written without the sandbox. |
+| `preflight` | The runner's adapter has no preflight, or its preflight refused the call, or a project settings file (in the project folder or any folder above it) puts `WS_SANDBOXED`, ws's gated-session marker or `PATH` in the session's `env`. A project that says the wall is there isn't the wall. |
+| `unsandboxed-call` | The call is marked to run outside the sandbox (`dangerouslyDisableSandbox`). |
+
+When the wall is proven, a deny in `log` mode is yielded as a note and the verdict is `would-deny` with a `count`. An
+approvable deny asks for no approval and consumes none. A guard in `log` gives the runner's own deny list none of its
+`NATIVE_DENY` patterns (the runner would refuse where the guard logs), so with the wall not proven the hook refuses it.
+`ws doctor` (WS018) warns when a guard asks for `log` on a machine where the wall can't apply.
+
+**Refusals the wall makes redundant** follow the same proof, for shell commands only (the sandbox wraps the shell, not
+the file tools): a program word that holds a part ws can't read (`unknown-command-word`), a line that sets `IFS`
+(`sets-ifs`) and a write to a path ws can't read, such as a scratch file `mktemp` made in the project
+(`unread-write`). Where the wall is proven these are allowed and logged as `rule:unknown-command-word`,
+`rule:sets-ifs` and `rule:unread-write`; the rest of the line is judged as before, so a `deny_commands` match, a
+`deny_read` path or a protected write elsewhere in the line is still a deny. A write to a path that spells a protected
+name after a part ws can't read, and a line that sets `IFS` where an expansion outside quotes could split on it, stay
+denies. So does a program word ws can't read where the policy sets any `deny_commands` or `ask_commands` rule, or a
+guard that judges shell commands (`bulk-staging`, `checkout-pin`, `dev-server` and the like) is on in `enforce`: those
+match the program's name, which the wall doesn't enforce, and nothing can match a word ws can't read. With the
+template's `dev-server` in `enforce`, that refusal stays a deny until `dev-server` is set to `log` as well. Every
+other refusal is a deny in every mode. This needs no `mode`: the proof of the wall is the whole condition. The template
+ships `syntax-check` in `log`, and the commented tables for `claims` and `test-weakening` carry `mode = "log"`.
 
 ## The guards
 
 | Guard | Runs | Reads | What it does |
 |---|---|---|---|
-| `bulk-staging` | before a call | shell commands | Stops `git add -A`, `--all` (and a prefix such as `--al`), `.`, `./`, `*`, `:/` and `:(top)`, the same with `git stage`, and `git commit -a`, `-am` and `--all`, with or without git's global options. Stops `git -c alias.NAME=...`, which can define a command that stages everything. `git add file` and `git add -- file` go through. Text in quotes, comments and here-document bodies is data, so `git commit -m "git add -A"` goes through; the text after `eval` and in `bash -c` is a command and is read. The runner's own deny rules carry the plain spellings too. |
+| `bulk-staging` | before a call | shell commands | Stops `git add -A`, `--all` (and a prefix such as `--al`), `.`, `./`, `*`, `:/` and `:(top)`, the same with `git stage`, and `git commit -a`, `-am` and `--all`, with or without git's global options. Stops `git -c alias.NAME=...`, which can define a command that stages everything. `git add file` and `git add -- file` go through. Text in quotes, comments and here-document bodies is data, so `git commit -m "git add -A"` goes through; the text after `eval` and in `bash -c` is a command and is read. The runner's own deny rules carry every form a pattern can say (`add -A*`, `add .`, `add -- .`, `add -u`, `commit -a*` and the rest of the whole-tree names, also behind git's global options); a short-option cluster that holds the letter after others, an option after `-u` or after the message, a literal star, a substitution, `:(top)` and the `GIT_CONFIG_*` variables stay with the hook. Not carried natively by a guard in `log` mode. |
 | `syntax-check` | after a call | file writes | Checks the file the session wrote and tells the model the line that doesn't parse. Python, JSON and TOML are read in process. `.sh` and `.bash` go through `sh -n` or `bash -n`, with a note when the machine has no shell. `.js`, `.mjs` and `.cjs` go through `node --check`, with a note when node isn't installed. |
 | `session-context` | at session start | none | Lists, one line each, which of `files` exist in the project: the git top level above the session's folder, and the main worktree when the session runs in a linked one. Adds a line when an API key bills an interactive session, and once for each ws version in each project, the version and what changed. |
 | `test-weakening` | before a call | file writes | Applies the edit to the test file on disk and compares before and after. Denies a skip or expected-failure marker added to a test that already exists; the person can approve it once. Warns about a test removed, fewer assertion lines, or an always-true assertion added. Judges Edit, Write and MultiEdit calls only. |
@@ -35,7 +78,7 @@ or a guard name, and a key in a guard's table that guard doesn't read.
 | `spawn-cap` | before a call, and when a subagent stops | subagent starts | Denies a subagent start when `max_agents` (default from the machine) are already running in the session. Counts agents started in the background. |
 | `skill-gate` | before a call, and when a prompt is sent | file writes and skill calls | Denies a write to a guarded path until the named skill has run in the session. The paths come from the policy's rules and from each skill's own `gates` front matter. The person can approve the write once. Judges Edit, Write and MultiEdit calls only. |
 | `dev-server` | before a call | shell commands | Denies a development server that listens on every interface or on an address other than loopback: `python -m http.server` with no `--bind`, `php -S 0.0.0.0:PORT`, `serve` with no `-l`, `vite --host`, `flask run --host 0.0.0.0`, `jupyter lab --ip 0.0.0.0`, `rails s -b 0.0.0.0`, `uvicorn --host 0.0.0.0`, `hugo server --bind 0.0.0.0`, `http-server` with no `-a`, `manage.py runserver 0.0.0.0:PORT`, `next dev -H 0.0.0.0`, `streamlit run`, `gunicorn -b 0.0.0.0`, `webpack serve --host 0.0.0.0` and `astro dev --host`. The reason names the flag to add. The person can approve the command once. On by default in the policy `ws gate init` writes. |
-| `checkout-pin` | before a call | shell commands | Denies `git checkout` or `switch` to another branch or commit, `reset --hard`, `--merge` and `--keep`, `rebase`, `merge`, `pull`, `cherry-pick`, `revert`, `am`, `bisect`, `stash pop` and `apply`, a whole-tree restore from another ref and `worktree move` into a checkout that has linked worktrees, or that `paths` names, whichever way the checkout is reached (a folder, `-C`, `--git-dir`, `GIT_DIR`, a `cd`). `git checkout -- FILE`, a restore of files, `commit`, `fetch`, `status`, `log` and a branch switch inside a linked worktree go through. The person can approve the command once. Off until you name it. |
+| `checkout-pin` | before a call | shell commands | Denies `git checkout` or `switch` to another branch or commit, `reset --hard`, `--merge` and `--keep`, `rebase`, `merge`, `pull`, `cherry-pick`, `revert`, `am`, `bisect`, `stash pop` and `apply`, a whole-tree restore from another ref and `worktree move` into a checkout that has linked worktrees, or that `paths` names, whichever way the checkout is reached (a folder, `-C`, `--git-dir`, `GIT_DIR`, a `cd`). `git checkout -- FILE`, a restore of files, `commit`, `fetch`, `status`, `log` and a branch switch inside a linked worktree go through. The person can approve the command once. Every form depends on the folder, so none is in the runner's own deny list: `git checkout topic` is the normal way to work in a linked worktree. Off until you name it. |
 | `inbox` | when a prompt is sent, after a call, and when Claude Code stops | none | Hands the session the messages left for it, as text marked untrusted, at its own turn: a prompt's output, a warning after a tool call, and (for an `urgent` message) a `{"decision":"block"}` that keeps a stopping Claude Code session going, at most three stops in a row and never for an `info` message. A body is cut to 4000 characters, cleaned for a terminal and flagged when it reads like an instruction; the flags only mark. A walled receiver, a caller that can't be shown to be the session, and a store the wall leaves read-only get a body-free "N unread" line instead (after a call, at most once in two minutes). A message grants no permission: the gate judges every later call as before. Off until you name it. |
 | `presence` | before and after a call, at session start, on a prompt and on a stop | none | Records `busy` or `idle` in the session registry from those hooks, newest report winning, and the latest message the session sent that was delivered. A hook of a sub-agent is skipped. It never says anything and never fails a hook. |
 | `pane-close` | before a call | shell commands | Allows `tmux kill-window` or `kill-pane` on the live tmux server only as one plain command with an `@N` or `%N` target, when the registry says every session in it's idle and the caller is the lead, or it's the caller's own pane after its hand-over was delivered. See [pane-close](#pane-close). |

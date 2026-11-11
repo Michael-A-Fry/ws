@@ -684,7 +684,7 @@ def test_install_class_prints_commands_and_root_file_and_changes_nothing(box, ca
     body = out.split("<<'WS_CLASS_FILE'\n", 1)[1].split("\nWS_CLASS_FILE", 1)[0]
     conf = json.loads(body)
     sb = conf["sandbox"]
-    assert conf["permissions"] == {wallsettings.BYPASS_KEY: wallsettings.BYPASS_OFF, wallsettings.READ_BLOCK_KEY: True}
+    assert conf["permissions"] == {wallsettings.BYPASS_KEY: wallsettings.BYPASS_OFF}
     assert sb["enabled"] is True and sb["failIfUnavailable"] is True and sb["allowUnsandboxedCommands"] is False
     assert sb["filesystem"]["allowWrite"][:2] == ["/srv/work", "/srv/more"] and "/tmp" in sb["filesystem"]["allowWrite"]
     assert sb["filesystem"]["denyRead"] == ["~/"] and sb["filesystem"]["allowRead"] == ["/srv/work", "/srv/more"]

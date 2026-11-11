@@ -57,12 +57,17 @@ WRITE_OPS = (">", ">>", ">|", ">&", "&>", "&>>", "<>")  # redirections that writ
 class ShellError(ValueError):
     """Text the reader cannot read or will not expand. `kind` is one of unclosed_quote, too_many_words, too_deep,
     too_long (a value past MAX_VALUE, a path of too many parts, or too much text from variables), too_slow (past the time limit), stdin-is-code (a here-document or here-string given to a shell, `source`, `eval`, `ssh` or `xargs`) and unsupported (an expansion it does not know);
-    callers branch on it, never on the message."""
+    callers branch on it, never on the message. `rule` names which refusal of a kind this is when a caller must tell them
+    apart (`SETS_IFS`, a line that sets the field separator, which is of kind `unsupported`); it is None for the rest."""
 
-    def __init__(self, kind: str, message: str):
+    def __init__(self, kind: str, message: str, rule: str | None = None):
         super().__init__(message)
         self.kind = kind
         self.message = message
+        self.rule = rule
+
+
+SETS_IFS = "sets-ifs"
 
 
 _deadline: contextvars.ContextVar[float | None] = contextvars.ContextVar("ws_shell_deadline", default=None)
@@ -217,15 +222,110 @@ _SETS_IFS = re.compile(
 )
 
 
+_IFS_NAME = re.compile(r"(?<![A-Za-z0-9_${])IFS(?![A-Za-z0-9_])")
+
+
+def _fold(cmd: str) -> str:
+    """The line as the reader sees it: full-width characters folded and line continuations joined. Raises ShellError
+    (kind `too_deep`) for substitutions nested past what the reader follows."""
+    try:
+        return join_lines(unicodedata.normalize("NFKC", cmd))
+    except RecursionError:
+        raise ShellError("too_deep", "the command nests substitutions too deeply to check") from None
+
+
+def without_ifs_setting(cmd: str) -> str:
+    """`cmd`, folded as `prep` folds it, with each bare `IFS` (the variable being set, read into or declared) renamed to
+    one nothing reads, so the rest of the line can be read as written. `prep` refuses a line that sets IFS because later
+    words would split differently; a caller with another reason to go on (the sandbox wall bounds what the words can do)
+    reads the line this way. The fold comes first, so the spelling `prep` found (full-width letters, a backslash-newline
+    inside the name) is the one renamed. `$IFS` and `${IFS}` are left alone, and read as the blank they are by default."""
+    return _IFS_NAME.sub("_WS_IFS", _fold(cmd))
+
+
+_EXPANSION_START = re.compile(r"[A-Za-z0-9_{@*#?!$-]")
+
+
+def ifs_can_split(cmd: str) -> bool:
+    """True when a changed IFS could make `cmd` run something other than what the reader sees: an expansion outside
+    quotes (a variable, a substitution, a backtick) splits on the new separator, so the words it yields are not the ones
+    ws read; or the line sets IFS inside quotes (a body a nested shell runs, which this scan does not follow); or it holds
+    a here-document or a `case`, whose text this scan does not follow. A line with none of these has nothing the
+    separator can split. It reads quotes, `$(...)` and backticks as the shell does, and a comment to its newline; a line
+    it cannot read to the end is True."""
+    cmd = _fold(cmd)
+    if re.search(r"(?<!<)<<(?!<)", cmd) or re.search(r"\bcase\b", cmd):
+        return True
+    n, i, stack, split, quoted = len(cmd), 0, ["c"], False, set()
+    while i < n:
+        if i & 63 == 0:
+            tick()
+        c, top = cmd[i], stack[-1]
+        if top in ("s", "a", "d"):  # inside '...', $'...' or "..."
+            quoted.add(i)
+            if top == "s":
+                if c == "'":
+                    stack.pop()
+            elif c == "\\":
+                i += 1
+                quoted.add(i)
+            elif c == ("'" if top == "a" else '"'):
+                stack.pop()
+            elif top == "d" and cmd.startswith("$(", i):  # a command inside the quotes is read as a command
+                quoted.discard(i)
+                stack.append("(")
+                i += 1
+            elif top == "d" and c == "`":
+                quoted.discard(i)
+                stack.append("`")
+            i += 1
+            continue
+        if c == "\\":  # an escaped character
+            i += 2
+            continue
+        if c == "#" and (i == 0 or cmd[i - 1] in " \t\n;&|("):  # a comment, to its newline
+            end = cmd.find("\n", i)
+            i = n if end < 0 else end
+            continue
+        nxt = cmd[i + 1 : i + 2]
+        if c == "'":
+            stack.append("s")
+        elif c == '"':
+            stack.append("d")
+        elif c == "$" and nxt == "'":
+            stack.append("a")
+            i += 1
+        elif c == "$" and nxt == '"':
+            stack.append("d")
+            i += 1
+        elif c == "$" and nxt == "(":
+            split = True
+            stack.append("(")
+            i += 1
+        elif c == "$" and _EXPANSION_START.match(nxt):
+            split = True
+        elif c == "`":
+            if top == "`":
+                stack.pop()
+            else:
+                split = True
+                stack.append("`")
+        elif c == "(":
+            stack.append("p")
+        elif c == ")" and top in ("(", "p"):
+            stack.pop()
+        i += 1
+    if len(stack) > 1:
+        return True
+    return split or any(m.end() - 1 in quoted for m in re.finditer(_SETS_IFS, cmd))
+
+
 def prep(cmd: str) -> str:
     """Line continuations joined, full-width characters folded, ${IFS} read as the space it is. Raises ShellError (kind
     `too_deep`) for substitutions nested past what the reader follows."""
-    try:
-        cmd = join_lines(unicodedata.normalize("NFKC", cmd))
-    except RecursionError:
-        raise ShellError("too_deep", "the command nests substitutions too deeply to check") from None
+    cmd = _fold(cmd)
     if re.search(_SETS_IFS, cmd):  # a line that sets IFS: an assignment, read into, printf -v, declared
-        raise ShellError("unsupported", f"a line that sets IFS is not followed; {_HOW}")
+        raise ShellError("unsupported", f"a line that sets IFS is not followed; {_HOW}", SETS_IFS)
     return re.sub(r"\$\{IFS\}|\$IFS\b", " ", cmd)
 
 

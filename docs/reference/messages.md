@@ -57,7 +57,8 @@ With `[classes]`:
   read.
 - The receiving class's `inbound` decides who may send to it: `off` (the default for a walled or counts-only class),
   `lead-only` (the default for a full class) or `allowlist` with `inbound_allow` naming sessions. A reply isn't let in
-  because it's a reply.
+  because it's a reply. A walled or counts-only class takes a message only with `inbound = "allowlist"` and the sender's
+  session id in `inbound_allow`: `lead-only` is refused for it too, the lead included.
 - The one thing the `lead-only` default lets through is a fixed kind (`ack`, `done`, `stop-and-hand-over:done`,
   `ask:pending`, `counts`) sent to a lead in a full class, from any session, a worker or a walled one. It has no text, so
   nothing leaves a class, and it's how a session says it's done. `off` and `allowlist` are obeyed as written, and a fixed
@@ -66,6 +67,12 @@ With `[classes]`:
   `--reply-to` may name only a message it sent or was sent.
 - A walled or counts-only session is sent only `note`, `ask` and `stop-and-hand-over`. A thread name can't be set on a
   message to it.
+- Every message addressed to a walled or counts-only class, delivered or refused, writes one row in that class's own
+  store (`inbound_log`, below): the time, the sender, the kind, and whether it came in. A refusal still raises the same
+  typed error after its row is written; if the class store can't be opened or written, the refusal is raised as it
+  would have been and the row is dropped, with nothing half-written left behind. A refused message isn't counted
+  toward `RATE_PER_MINUTE`, as before. A replayed send (the same sender, receiver and idempotency key) delivers nothing
+  and writes no second row.
 - The body of a message to such a session is kept only in `<repo root>/.ws/messages/<class>.db`, where the repo root is
   the nearest folder at or above the receiver's working folder that holds `.git`. It has to be inside the paths the
   class's `repos` cover. The folder holds a `.gitignore` that ignores everything in it. The shared database has the
@@ -106,7 +113,9 @@ A body must be text that encodes as UTF-8: a lone surrogate, or bytes on standar
 
 ## Tables
 
-The shared database is `<state>/msg/messages.db` (the folder 0700, the file 0600, WAL, `PRAGMA user_version` 2).
+The shared database is `<state>/msg/messages.db` (the folder 0700, the file 0600, both owned by the account, WAL,
+`PRAGMA user_version` 3). A session running as a walled class's own user can't open it; the class's sessions read their
+bodies from the class store under their own repo.
 
 | Table | Holds |
 |---|---|
@@ -115,10 +124,19 @@ The shared database is `<state>/msg/messages.db` (the folder 0700, the file 0600
 | `envelope` | `seq`, `message_id`, `from`, `to`, `kind`, `sent`, `delivered_ts`, `class`, `size` (S up to 1 KiB, M up to 4 KiB, L over) |
 | `meta` | `last_prune`, `pruned_through_seq` (the highest envelope `seq` retention has removed) |
 | `dq_<hash>` | one delivery queue per receiver (`ws._vendor.sqlqueue`): `message_id`, `data` (the message id), `status`, `claim_id`, `lock_time`, `tries`; dropped once empty |
-| `tidy` | `store`, `class`: class stores with bodies still to remove |
+| `tidy` | `store`, `class`: class stores with bodies or log rows still to remove |
 
-The viewer and `ws msg watch` read `envelope` only. A class store has one table, `bodies` (`message_id`, `to`, `sent_ms`,
-`body`).
+The viewer and `ws msg watch` read `envelope` only; it has no count column and no field made from a body. A class store
+(`<repo root>/.ws/messages/<class>.db`, `PRAGMA user_version` 3) has two tables:
+
+| Table | Holds |
+|---|---|
+| `bodies` | `message_id`, `to`, `sent_ms`, `body` |
+| `inbound_log` | `id`, `at` (UTC), `sender` (the sender's session id), `class`, `kind`, `decision` (`delivered` or `refused`), `reason` (a refusal's typed error kind, such as `refused` or `secret_refused`; empty when delivered) |
+
+`inbound_log` never holds a body, a hash of one, an idempotency key or a thread name. A store made before the log is given
+the table the next time ws opens it. `prune` drops log rows older than the class's `retention_days` at the same
+at-most-hourly pace as messages; a store with log rows stays on the `tidy` list until its log is empty.
 
 ## How a message reaches the receiver
 
@@ -175,6 +193,7 @@ session inside the wall is limited to the reminder, as above.
 
 `ws.msg` has `send`, `inbox`, `sent`, `read`, `ack`, `mark_delivered`, `envelopes`, `export` and `prune`, and for the
 delivery guard and the viewer `deliver`, `pending`, `handover_delivered`, `last_delivered_outbound`, `receiver_walled`,
-`watch`, `wait`, `wake_pane` and `clean`. Only `send` finds
+`watch`, `wait`, `wake_pane` and `clean`. `ws walls check` also uses `scratch_delivery`, `scratch_envelopes` and
+`class_store_path`: the same delivery and envelope feed on a throw-away database of its own. Only `send` finds
 its own caller (`caller()`); the others take the session id, which a command gets from `session.resolve_caller` and a hook
 gets from its payload. Functions take `now` (the clock) where time matters, so tests can inject it.

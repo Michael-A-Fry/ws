@@ -72,6 +72,7 @@ below, and `python3 scripts/gen_code_map.py --check` (prek and CI) fails when it
 | `usage.py` | Usage signals: the provider's usage report, the subscription limits a statusline gives ws, spend... |
 | `userconfig.py` | The gate in the runner's own user config: ws's deny rules and hooks added beside yours... |
 | `version.py` | `ws version`: which build is this, where did it come from, and where is it installed |
+| `walls.py` | `ws walls`: set up a walled data class as an operating-system boundary, and check that it is in... |
 | `wallsettings.py` | What the sandbox settings Claude Code reads say about the wall: the keys that widen it, and `ws... |
 
 <!-- vale on -->

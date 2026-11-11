@@ -205,10 +205,13 @@ def dump(doc: dict, raw: bytes | None) -> bytes:
     return (text + ("\n" if newline else "")).encode("utf-8")
 
 
-def _write(path: Path, data: bytes) -> None:
+def _write(path: Path, data: bytes, mode: int | None = None) -> None:
     from ws import install  # late: ws.install imports this module
 
-    install._write_atomic(path, data)
+    if mode is None:
+        install._write_atomic(path, data)
+    else:
+        install._write_atomic(path, data, mode)
 
 
 # ---- merging ---------------------------------------------------------------------------------------------------------------
@@ -758,8 +761,8 @@ def _write_backup(m: Merge, raw: bytes) -> None:
 # ---- one writer at a time, and a write that checks what it replaces ---------------------------------------------------------
 
 
-class _Changed(Exception):
-    """The file was changed by someone else between ws reading it and replacing it."""
+class Changed(Exception):
+    """The file was changed by someone else between ws reading it and replacing it (raised by `replace`)."""
 
 
 def _take_lock(fcntl, lock: Path, path: Path) -> int | None:
@@ -833,11 +836,13 @@ def _disk_sha(path: Path) -> str | None:
         return "unreadable"
 
 
-def _replace(path: Path, data: bytes, based_on: bytes | None) -> None:
-    """Replace the file with `data`, if it is still the bytes `based_on` that ws merged into; else raise `_Changed`."""
+def replace(path: Path, data: bytes, based_on: bytes | None, mode: int | None = None) -> None:
+    """Replace the file with `data`, if it is still the bytes `based_on` that ws merged into (None: there was no file);
+    else raise `Changed`. Public so another file ws writes for a person (the policy, in `ws walls`) takes the same lock
+    (`locked`) and the same check. `mode` is the new file's, else the old one's."""
     if _disk_sha(path) != (None if based_on is None else _sha(based_on)):
-        raise _Changed
-    _write(path, data)
+        raise Changed
+    _write(path, data, mode)
 
 
 # ---- adopting what an earlier ws left --------------------------------------------------------------------------------------
@@ -915,8 +920,8 @@ def _merge_once(m: Merge, entry: Mapping | None, made_dirs: list, new_dirs: list
     data = dump(new, raw)
     if data != raw:
         try:
-            _replace(m.path, data, raw)
-        except _Changed:
+            replace(m.path, data, raw)
+        except Changed:
             if first:
                 m.backup.unlink(missing_ok=True)
                 with contextlib.suppress(OSError):
@@ -963,7 +968,7 @@ def apply(m: Merge, entry: Mapping | None, env: Mapping[str, str], held: bool = 
             with contextlib.nullcontext() if held else _locked(m.path):
                 try:
                     return _merge_once(m, entry, made_dirs, new_dirs)
-                except _Changed:
+                except Changed:
                     continue
         raise WsError(
             "conflict",
@@ -1004,17 +1009,17 @@ def _withdraw_once(entry: Mapping, env: Mapping[str, str], path: Path, dry_run: 
         if not dry_run:
             if backup is None:
                 if _disk_sha(path) != _sha(raw):
-                    raise _Changed
+                    raise Changed
                 path.unlink()  # ws made the file
             else:
-                _replace(path, backup.read_bytes(), raw)
+                replace(path, backup.read_bytes(), raw)
                 backup.unlink()
                 removed.append(backup)
         word = "removed (ws made it)" if backup is None else "restored exactly"
         return Outcome("removed" if backup is None else "restored", removed, f"{path}: {word}")
     new, _, _ = update(doc, entry.get("added", []), entry.get("made", []), [], path)
     if not dry_run:
-        _replace(path, dump(new, raw), raw)
+        replace(path, dump(new, raw), raw)
     if not as_written:
         why = "you changed it since"
     elif entry.get("exact") is False:
@@ -1039,7 +1044,7 @@ def withdraw(entry: Mapping, env: Mapping[str, str], dry_run: bool = False, held
         with contextlib.nullcontext() if dry_run or held else _locked(path):
             try:
                 out = _withdraw_once(entry, env, path, dry_run)
-            except _Changed:
+            except Changed:
                 continue
         if out.action in ("restored", "removed") and not dry_run and not held:
             out.removed += _tidy(path, entry, backups_dir(env))  # after the lock file is gone, so the folder is empty

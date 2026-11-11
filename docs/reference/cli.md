@@ -635,7 +635,7 @@ ws install [-h] [--stays-on yes|no] [--server ADDRESS|none] [--notes PATH] [--mo
 | `--model ID` | The default model. |
 | `--gate every-session\|launch` | `every-session`: the runner's own user config carries ws's deny rules and hooks, so every session is gated. `launch`: only a session started with `ws gate launch` is. |
 | `--allow-widened-sandbox` | Keep settings of yours that open the sandbox (an excluded command, say); ws records the choice. |
-| `--class NAME` | Print the commands (`sudo` included) and the root-owned managed-settings file for a class with an `os_user`, and write nothing. ws creates no user and places no file. See [Set up a class user](../how-to/set-up-a-class-user.md). |
+| `--class NAME` | Print the commands (`sudo` included), the two root-owned files for a class with an `os_user` (the managed-settings file and the launch file) and the way to take it all out again, and write nothing. ws creates no user and places no file. The launch file goes in a `ws-classes` folder beside the managed-settings one, which `ws gate launch` reads and Claude Code doesn't. See [Set up a class user](../how-to/set-up-a-class-user.md). |
 | `--cap USD` | Your own monthly spend cap. |
 | `-y`, `--yes` | No prompts. |
 | `--dry-run` | Show what would change; write nothing. |
@@ -813,6 +813,59 @@ ws canary [-h] [--runner {claude-code,opencode}]
 | Argument | Meaning |
 |---|---|
 | `--runner RUNNER` | Default: the profile's runner. One of `claude-code`, `opencode`. |
+
+## `ws walls`
+
+Set up a walled data class as an operating-system boundary, and check that it's in place. A walled class is optional:
+it needs a second account on a Linux or macOS machine. ws never runs `sudo`, creates an account or writes under `/etc`;
+it prints the commands. See [Set up a class user](../how-to/set-up-a-class-user.md) and
+[ADR 0027](../decisions/0027-a-settings-file-per-walled-class.md).
+
+```text
+ws walls [-h] {init,edit,check} ...
+```
+
+### `ws walls init`
+
+Print a `[classes.NAME]` table for a walled class: its own account, an `inbound` of `off`, an owner and a review date.
+
+```text
+ws walls init [-h] [--write] name
+```
+
+| Argument | Meaning |
+|---|---|
+| `name` | The class name: letters, digits, `_` and `-`. A name already in the policy is a usage error (exit 2). |
+| `--write` | Append the table to your `policy.toml`: check the whole new file, then, holding the lock `ws install` takes on a file it writes, copy the old one to `policy.toml.bak-STAMP` (a `-1`, `-2` on a name already taken) and replace it atomically. It refuses a policy that's a link, and one that changed since ws read it (exit 1, `conflict`). It writes the `prepare` dial and never `act`. With no policy file, it starts from the default one. |
+
+### `ws walls edit`
+
+Open your `policy.toml` in `$VISUAL` or `$EDITOR`, on a temporary copy. The whole edited file is checked: an invalid one
+is refused and the original stays as it was (the edit is kept in the temporary folder and the message names it). A valid
+one replaces the file atomically, after a `policy.toml.bak-STAMP` copy, under the same lock and checks as `init --write`:
+if the file changed while the editor was open, or is a link, the edit is refused and kept the same way. It's your own
+edit of your own file, so a dial you set, `act` included, stays set. The temporary copy is removed in every other case.
+Exit 2 with no editor set.
+
+```text
+ws walls edit [-h]
+```
+
+### `ws walls check`
+
+Run the named cases without `sudo`, each checking that a setting is in place (it's not a live test that the runner
+enforces it): inbound refused from outside the class, `Read` or `Edit` of a sealed file refused, a
+class's file not given to another class, hooks run under bypass and under auto, the project check (`.mcp.json` and
+settings files), a project can't switch the hooks off (`disableAllHooks`) or add plugins, per-repo settings only
+narrow, OpenTelemetry content logging off, owner and review date,
+`SendMessage` and `ListAgents` denied, and the class file root-owned. Exit 0 when all pass. Exit 1 with a typed error
+naming the next command when the host isn't set up (no class user, or no class file: the commands and the way out
+are printed, and the host cases are skipped) or when a case fails. With `--json`, the cases are in the envelope
+(`data.cases` on success, `details.cases` on an error).
+
+```text
+ws walls check [-h]
+```
 
 ## `ws rate`
 

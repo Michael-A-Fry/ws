@@ -142,13 +142,11 @@ The switch on and off, and the upgrade command, were rehearsed in a scratch `HOM
   your value to match.
 - File reads stay in the working folders. `permissions.blockReadsOutsideWorkingDirectories` is `true` in the settings ws
   passes to Claude Code (`ws gate launch`, `ws gate generate` and headless `ws run` jobs) and in a class's
-  managed-settings file, so Claude's Read, Grep and Glob tools refuse a path outside the folders the session works in,
+  launch file, so Claude's Read, Grep and Glob tools refuse a path outside the folders the session works in,
   in every permission mode. It needs Claude Code 2.1.257 or newer; `ws doctor` (WS016) warns when yours is older. ws
   never writes it into your own settings file, because it would bind every Claude Code session you start. To let a
   gated session read outside its folders, set `read_outside_project = true` under `[gate]` in the policy and
-  regenerate. A project's own settings can't lift the block: Claude Code applies a `true` from any settings file. A class
-  file placed before this key existed shows a WS014 `read block` warning until you place it again with
-  `ws install --class NAME`.
+  regenerate. A project's own settings can't lift the block: Claude Code applies a `true` from any settings file.
 - Hosts a sandboxed command may reach without asking. When `allow_hosts` names none, the sandbox block carries a short
   default list: `api.anthropic.com`, PyPI (`pypi.org`, `files.pythonhosted.org`), the npm registry
   (`registry.npmjs.org`) and crates.io (`crates.io`, `index.crates.io`, `static.crates.io`). A session started with
@@ -224,10 +222,11 @@ What enforces it:
   and not asked about (Claude Code 2.1.219 or later; an older one asks). An empty list reaches no host. This copy
   can't stop a project's own settings file from adding hosts, so in a class session the preflight hook refuses every
   call from a folder whose `.claude/settings.json` or `settings.local.json` sets `network.allowedDomains`, a proxy
-  port, a Unix socket or local binding. A session with no class doesn't apply that rule. The managed-settings file for
-  a class user (`ws install --class NAME`) is the stronger form: it holds the class's hosts with
-  `allowManagedDomainsOnly`, so no other file can add one. It's placed by hand, so it carries the class's hosts and
-  its providers' but not the exceptions, which end; run `ws install --class NAME` again after you change the list.
+  port, a Unix socket or local binding. A session with no class doesn't apply that rule. The class file for
+  a class user (`ws install --class NAME`) holds the class's hosts too, merged into that copy by `ws gate launch`, with
+  `strictAllowlist`; a walled session is refused when a project file adds a host. It's placed by hand, so it carries
+  the class's hosts and its providers' but not the exceptions, which end; run `ws install --class NAME` again
+  after you change the list.
 - **Other runners (OpenCode), on Linux.** `ws gate launch` starts a small proxy of its own on 127.0.0.1 and sets the
   proxy variables for the runner, with a password made for that launch, so another session's proxy can't be used from
   inside. The proxy refuses a host that isn't listed, a name that resolves to a private, link-local or cloud-metadata

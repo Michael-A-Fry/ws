@@ -8,6 +8,33 @@ body of the GitHub release.
 
 ## [Unreleased]
 
+### Added
+
+- A launch file per walled class. `ws install --class NAME` now prints a second root-owned file, in a `ws-classes` folder
+  beside the managed-settings folder (Claude Code doesn't read it), and `ws gate launch` merges it into the settings it
+  passes with `--settings`: `SendMessage` and `ListAgents` denied, `Read` and `Edit` of the sealed paths denied,
+  `crossSessionInbound` refused, the read block, `disableAllHooks` false, the other classes' repos unreadable and the
+  class's hosts under `strictAllowlist`. A launch with no launch file is refused (exit 3). The managed-settings file is
+  unchanged: it's the file 0.1.9 printed, and a bare `claude` run as the class account is bound by it as before. See
+  [decision 0027](docs/decisions/0027-a-settings-file-per-walled-class.md).
+- A walled class's project is read against an allow-list: a `.claude/settings*.json` may hold only a short list of keys
+  and nine named `env` variables, and a `.mcp.json` may start no MCP server. Anything else is refused at launch, with the
+  key named.
+- A class with `repo_settings` and no `os_user` is refused when the policy loads.
+- A `mode` key in every guard's table: `enforce` (the default) or `log`. In `log` a refusal is counted in the verdict
+  log instead, and only where the OS wall is proven for the call. See
+  [decision 0028](docs/decisions/0028-a-guard-logs-what-the-wall-enforces.md).
+- A walled class takes messages only from its allowlist, and every message to it leaves a log row with no body. Memory
+  and notes refuse a walled caller. `ws walls check` has eight more named cases.
+
+### Changed
+
+- The removal steps `ws install --class NAME` prints paste and run in bash, with each note on a `#` line, and take out
+  the launch file, any half-placed copy and the launch folder.
+- The paths a walled class's launch file seals are built from the ws folders `ws.paths` names, not a fixed `~/.ws`.
+- A tool call no rule names is written to the verdict log, and `bulk-staging`'s deny rules in the runner's settings
+  carry every whole-tree form a pattern can say.
+
 ## [0.1.9] - 2026-11-11
 
 A security release. Upgrade with `ws upgrade` from a terminal of your own. This release removes nothing: no command,

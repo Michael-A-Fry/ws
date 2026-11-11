@@ -79,7 +79,7 @@ def rows(box, pol) -> dict[str, wallsettings.Row]:
 def test_doctor_reports_each_part_of_a_class_separately(box, monkeypatch):
     pol = write_policy(box, me() or CLASS_USER or "someone")
     r = rows(box, pol)  # no file yet: the user may exist, nothing else does
-    assert r["OS user exists"].status == (wallsettings.OK if wallsettings._passwd(me()) else wallsettings.WARN)
+    assert r["OS user exists"].status == (wallsettings.OK if wallsettings.passwd(me()) else wallsettings.WARN)
     assert (
         r["file present and root-owned"].status == "warn"
         and "no managed-settings file" in r["file present and root-owned"].detail
@@ -262,7 +262,7 @@ def test_the_class_comes_from_the_real_path_of_the_folder_not_a_link_name(box, m
 def can_become(user: str) -> str | None:
     """The path of `sudo` when this account may run commands as `user` without a password, else None."""
     sudo = shutil.which("sudo")
-    if not (POSIX and user and sudo and wallsettings._passwd(user) is not None):
+    if not (POSIX and user and sudo and wallsettings.passwd(user) is not None):
         return None
     ok = subprocess.run([sudo, "-n", "-u", user, "true"], check=False, capture_output=True).returncode == 0
     return sudo if ok else None
@@ -325,7 +325,7 @@ def tilde_class(box, user: str = "ws-no-such-user-x") -> policy.Class:
 @pytest.mark.parametrize("kind, home", [("linux", "/home/ws-no-such-user-x"), ("macos", "/Users/ws-no-such-user-x")])
 def test_a_tilde_repo_before_the_account_exists_means_the_home_the_printed_step_makes(box, kind, home):
     cls = tilde_class(box)
-    assert wallsettings._passwd(cls.os_user) is None
+    assert wallsettings.passwd(cls.os_user) is None
     assert wallsettings.class_home(cls, kind) == home
     text = wallsettings.install_text(cls, {"HOME": str(box / "home")}, kind)
     assert f"chown -R ws-no-such-user-x {home}/work" in text and f"chown -R ws-no-such-user-x {home}/other" in text
@@ -354,7 +354,7 @@ def test_the_file_ws_prints_is_the_file_doctor_expects_once_the_account_exists(b
     class Entry:
         pw_dir = "/home/someone"
 
-    monkeypatch.setattr(wallsettings, "_passwd", lambda name: Entry())
+    monkeypatch.setattr(wallsettings, "passwd", lambda name: Entry())
     got = wallsettings.class_rows(
         policy.load(box / "home" / ".ws" / "policy.toml"), {"HOME": str(box / "home")}, "linux"
     )

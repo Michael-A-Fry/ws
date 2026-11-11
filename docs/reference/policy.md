@@ -56,7 +56,7 @@ the built-in default, which has the list below.
 | `allow_hosts` | list of text | `[]` | Hosts a session's shell may reach without asking, for runners whose sandbox filters the network (Claude Code). Empty means the policy names none, and the sandbox block carries a short default list instead (the runner's API host, PyPI, npm and crates.io, with GitHub and GitLab added for a session started with `ws gate launch` but not for a headless job; see [Use the wall](../how-to/use-the-wall.md)). A list here replaces the default. The default is in the settings ws starts a session with, not in your own `~/.claude/settings.json`. With `sandbox = false` there is no list at all. |
 | `allow_write` | list of text | `[]` | Folders besides the project that a walled session may write. |
 | `sandbox` | true or false | `true` | Switch on the runner's own sandbox in what ws writes (Claude Code), both for a session started with `ws gate launch` and for one started the usual way once `ws install` has merged the settings into your file. `false` leaves the block out and marks the session unsandboxed, and `ws doctor` (WS012) says so. |
-| `read_outside_project` | true or false | `false` | The off switch for the read block. With `false`, the settings ws passes to Claude Code (`ws gate launch`, `ws gate generate`, headless `ws run` jobs) set `permissions.blockReadsOutsideWorkingDirectories` to `true`, so Claude's Read, Grep and Glob tools refuse a path outside the working folders in every permission mode (Claude Code 2.1.257 or newer; WS016 checks the version). `true` leaves the key out. It doesn't touch your own settings file, which ws never gives this key, and a class's managed-settings file always carries it. A value that isn't `true` or `false` makes the whole policy fail to load. |
+| `read_outside_project` | true or false | `false` | The off switch for the read block. With `false`, the settings ws passes to Claude Code (`ws gate launch`, `ws gate generate`, headless `ws run` jobs) set `permissions.blockReadsOutsideWorkingDirectories` to `true`, so Claude's Read, Grep and Glob tools refuse a path outside the working folders in every permission mode (Claude Code 2.1.257 or newer; WS016 checks the version). `true` leaves the key out. It doesn't touch your own settings file, which ws never gives this key, and a class's launch file always carries it. A value that isn't `true` or `false` makes the whole policy fail to load. |
 | `allow_read` | list of text | `[]` | Folders or files besides the project that a shell command in a session started with `ws gate launch --runner claude-code` may read. That session can't read your home folder except the project, its git folders and what common tools need; see [Deny the home folder](../how-to/use-the-wall.md#deny-the-home-folder). A `deny_read` path inside one of these stays unreadable. Only that launch reads it: `ws install` doesn't merge it into your own settings file, and OpenCode's wall hides the `deny_read` paths only. |
 
 Rules:
@@ -201,6 +201,7 @@ Named checks that run beside the `[gate]` rules. The [guards reference](guards.m
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `on` | list of text | `[]` | The guards that run, in order. A name ws doesn't know stops the load. `ws gate init` writes `["syntax-check", "session-context", "dev-server"]`. |
+| `[guards.NAME]` `mode` | text | `"enforce"` | `enforce` (refuse as always) or `log` (a refusal becomes a count in the verdict log, only where the OS wall is proven for the call; elsewhere it still refuses). Any other value stops the load. See [the guards reference](guards.md). |
 | `[guards.syntax-check]` `extra` | table of extension to command | `{}` | A checker for an extension, such as `{ yaml = ["yamllint", "-d", "relaxed"] }`. The file path is added as the last argument. |
 | `[guards.session-context]` `files` | list of text | `["STATE.md", ".state/STATE.md", "HANDOFF.md", "TODO.md"]` | Project-relative files to list at session start, when they exist. |
 | `[guards.dev-server]` `allow_hosts` | list of text | `[]` | Hosts and addresses a dev server may bind besides loopback. |
@@ -218,14 +219,58 @@ everything behaves as it did before. Every table is checked whole; one bad key r
 |---|---|---|---|
 | `access` | text | required | `full`, `walled` or `counts-only`. |
 | `repos` | list of text | required | Path globs, in the same syntax as `deny_read` (`~/` is your home, `**` crosses folders, a bare name matches at any depth). At least one. A rule that names a folder covers everything under it. |
-| `os_user` | text | none | The POSIX user name sessions of this class must run as. |
+| `os_user` | text | none | The POSIX user name sessions of this class must run as. A class with one is a walled class with its own settings file: see [Set up a class user](../how-to/set-up-a-class-user.md). |
 | `allowed_providers` | list of plain names | not set | The model providers a session of this class may use. Left out, the file says nothing and the consumer applies its own default (a walled class gets the strictest); `[]` allows none. |
 | `local_only` | true or false | `false` | Only a model that runs on this machine. |
 | `allowed_hosts` | list of text | `[]` | Hosts the class's sessions may reach. The same syntax as `[gate]` `allow_hosts`. |
 | `readable_by` | list of text | `[]` | The classes whose sessions may read this class's content, or `["*"]` for all. `[]` is nobody. Every name must be a class in the file. |
-| `inbound` | text | `off` for `walled` and `counts-only`, `lead-only` for `full` | Who may send a message in: `off`, `lead-only` or `allowlist`. |
+| `inbound` | text | `off` for `walled` and `counts-only`, `lead-only` for `full` | Who may send a message in: `off`, `lead-only` or `allowlist`. This is the class's inbound setting (a schedule's `inbound_from` is this pair, not a second key): a walled class stays `off`, so nobody can send in, until you change it. A walled class takes a message only with `allowlist` and the sender's session id in `inbound_allow`; `lead-only` is refused for it too. Each message to it, delivered or refused, leaves one row in the class's own message store: see [Messages](messages.md). |
 | `inbound_allow` | list of plain names | `[]` | Who may send in. Required and non-empty when `inbound = "allowlist"`, and refused otherwise. |
+| `owner` | non-empty text | none | Who answers for the class. `ws walls check` wants it on a class with an `os_user`. |
+| `review_date` | TOML date | none | When the class is looked at again, such as `2027-03-01`. A text or a date with a time is refused. From that day, in UTC, `ws doctor` (WS017) warns and `ws walls check` fails the owner-and-review-date case. |
+| `repo_settings` | table of tables | none | One table per repo glob of the class (`[classes.NAME.repo_settings."GLOB"]`) that adds denials to the class's launch file for a session started in that repo: `deny` (permission rules such as `"Bash(curl *)"`), `deny_read` and `deny_write` (paths). It can only narrow the launch file. Any other key (an allow, a host, a bypass setting) would widen it and refuses the whole file, naming the key. The glob must be one of the class's `repos`, and the class must name an `os_user`: a table on a class with none is refused at load, because only a walled class has a launch file. |
 | `retention_days` | integer, 1 to 3650 | `30` | How long the class's messages are kept. A true or false is refused. This is separate from the 30 days ws keeps a session record. |
+
+```toml
+[classes.alpha]
+access = "walled"
+os_user = "ws-alpha"
+repos = ["/srv/work/alpha/**"]
+owner = "Your name"
+review_date = 2027-03-01
+
+[classes.alpha.repo_settings."/srv/work/alpha/**"]
+deny = ["Bash(curl *)"]
+deny_read = ["/srv/work/alpha/secrets"]
+```
+
+`ws walls init NAME` prints a table like this, and `ws walls init --write NAME` appends it to your policy: a backup first,
+the whole file checked afterwards, then an atomic replace. It writes the `prepare` dial and never `act`.
+
+`ws walls check` runs one named case for each part of a walled class's boundary and exits 1 when one fails; a case that
+needs a class's file in place is skipped until there is one. Each case names the setting it depends on (`--json` has it),
+so removing that setting makes that case fail.
+
+| Case | Depends on | Needs a class file |
+|---|---|---|
+| `inbound-refused` | `crossSessionInbound` in the class file, `inbound` under `[classes.NAME]` | yes |
+| `sealed-read-refused` | the `Read` and `Edit` denials of the sealed paths | yes |
+| `class-file-not-seen-by-other-class` | the launch's class lookup, `denyRead` of each launch file | yes |
+| `hooks-under-bypass`, `hooks-under-auto` | the gate hook on every tool, and bypass switched off | yes |
+| `project-load-check`, `hooks-not-disabled`, `sandbox-only-narrows` | the class marker, and the keys a project may not set | yes |
+| `per-repo-settings` | `repo_settings` only narrows | no |
+| `otel-off` | the OpenTelemetry content logs off | yes |
+| `owner-and-review-date` | `owner` and `review_date` (the same judge as `ws doctor` WS017) | no |
+| `messaging-denied` | `SendMessage` and `ListAgents` denied | yes |
+| `class-file-root-owned` | the class file's owner and mode | yes |
+| `allowed-sender-delivered` | `inbound = "allowlist"` and `inbound_allow`: a listed sender is delivered, any other is refused, and each leaves a log row | no |
+| `bodies-in-class-store` | the class store under the class's repo; the shared store 0700 and 0600, owned by the account, with no body or hash in it | no |
+| `walled-sends-fixed-kinds` | the fixed kinds a walled session may send, with no body, key or thread | no |
+| `provider-allowlist` | `allowed_providers`, `allowed_hosts` and `local_only`: the launch file's hosts are the class's own and its named providers' | yes |
+| `class-push-refused` | `strictAllowlist` and `allowedDomains` in the launch file: a git push to a host outside the class's list (its remote list) is refused | yes |
+| `memory-notes-refused` | a walled session can't add memory or capture a note, and a search hides another class's files unless `readable_by` allows | no |
+| `walled-card-no-counts` | a walled message's envelope row (what `ws msg watch` and the viewer show) has no count field | no |
+| `tracer-stays-in-class` | a value planted in a walled class reaches no shared message store, memory or notes | no |
 
 Which class is a folder in (`class_of(policy, path)` in `src/ws/policy.py`):
 

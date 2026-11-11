@@ -813,6 +813,48 @@ class GitFacts(NamedTuple):
     dirs: list[str]  # git folders inside the project: the one git finds from here, and its common folder
 
 
+def _git(project: str, *args: str) -> str | None:
+    """`git -C project ARGS` output, or None when git is missing, fails or takes longer than 10 seconds."""
+    try:
+        r = subprocess.run(
+            ["git", "-C", project, *args],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def git_read_folders(project: str) -> list[str]:
+    """The git folder and the common git folder of `project` that sit OUTSIDE it, as real paths: a linked worktree's
+    folder under the main checkout's `.git`, a `--separate-git-dir`. A shell that cannot read the home folder needs them
+    for git to work in the project (the ones inside the project are readable with it). Read with `git rev-parse`, which
+    runs nothing. Empty where git is missing, this is not a repository, `.git` is a link (never run git on one), or git
+    takes longer than 10 seconds. A `.git` file (a linked worktree) is followed out of the project only to a folder under
+    the `worktrees/` folder of the common git folder; a pointer to anywhere else is left out."""
+    real = os.path.realpath(project)
+    dotgit = os.path.join(real, ".git")
+    if os.path.islink(dotgit):
+        return []
+    where = _git(real, "rev-parse", "--absolute-git-dir", "--git-common-dir")
+    if where is None or len(where.splitlines()) != 2:
+        return []
+    found = [os.path.realpath(os.path.join(real, f)) for f in where.splitlines()]
+    if os.path.isfile(dotgit) and not _is_worktree(*found):
+        return []  # a pointer file that names some other folder is not a worktree: it is not followed out of the project
+    return [d for d in dict.fromkeys(found) if os.path.isdir(d) and not _inside(d, real) and d != real]
+
+
+def _is_worktree(git_dir: str, common: str) -> bool:
+    """True when `git_dir` is `<common>/worktrees/<name>`: where `git worktree add` puts a linked worktree's git folder."""
+    parent, name = os.path.split(git_dir)
+    return bool(name) and os.path.basename(parent) == "worktrees" and os.path.dirname(parent) == common
+
+
 def git_facts(project: str) -> GitFacts:
     """What git, started in `project`, would load that is not a plain file under `.git`: the git folders it resolves
     (`rev-parse --absolute-git-dir --git-common-dir`; a `--separate-git-dir` or a worktree can put them anywhere in the
@@ -821,26 +863,12 @@ def git_facts(project: str) -> GitFacts:
     `git rev-parse` and `git config`, which run nothing. `.git` itself is always counted when it is a folder. Empty
     where git is missing, this is not a repository, or git takes longer than 10 seconds."""
 
-    def git(*args: str) -> str | None:
-        try:
-            r = subprocess.run(
-                ["git", "-C", project, *args],
-                capture_output=True,
-                text=True,
-                timeout=10,
-                check=False,
-                stdin=subprocess.DEVNULL,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return None
-        return r.stdout if r.returncode == 0 else None
-
     real = os.path.realpath(project)
     if os.path.islink(os.path.join(real, ".git")):
         return GitFacts(None, [], [])  # never run git on a linked `.git`; lock_project refuses it
     dirs = [os.path.join(real, ".git")] if os.path.isdir(os.path.join(real, ".git")) else []
-    where = git("rev-parse", "--show-toplevel", "--absolute-git-dir", "--git-common-dir")
-    listing = git("config", "--list", "--show-origin", "-z")
+    where = _git(project, "rev-parse", "--show-toplevel", "--absolute-git-dir", "--git-common-dir")
+    listing = _git(project, "config", "--list", "--show-origin", "-z")
     if where is None or listing is None or len(where.splitlines()) != 3:
         return GitFacts(None, [], [d for d in dirs if os.path.isdir(d)])
     top, *folders = where.splitlines()
@@ -2100,6 +2128,40 @@ def _launch_policy(args: argparse.Namespace) -> tuple[Path, policy.Policy]:
     return policy_file, pol
 
 
+def warn_old_runner(exe: str, env: dict, pol: policy.Policy) -> None:
+    """Print the WS016 warning to stderr when the installed runner is older than `wallsettings.MIN_CLAUDE` for a key the
+    wall writes under `pol`, or its version cannot be read: the start goes on (a key an old runner does not know is
+    ignored, which leaves that part of the wall out). Nothing prints when the wall writes no such key or `exe` is not
+    found (the start itself then fails and says so)."""
+    from ws import doctor, run, wallsettings  # here, not at the top: both import this module
+
+    keys = wallsettings.keys_written(pol)
+    path = shutil.which(exe, path=env.get("PATH"))
+    if not keys or not path:
+        return
+    version = run.exe_version(path, env)
+    found = doctor._version_tuple(version) if version else None
+
+    def need(k: str) -> str:
+        return f"{k} (needs {'.'.join(map(str, wallsettings.MIN_CLAUDE[k]))})"
+
+    if found is None:
+        what = ", ".join(need(k) for k in keys)
+        print(
+            f"ws: warning (WS016): can't tell the Claude Code version, and the wall writes keys that need a recent "
+            f"one: {what}. Update Claude Code, then run `ws doctor`.",
+            file=sys.stderr,
+        )
+        return
+    old = [k for k in keys if found < wallsettings.MIN_CLAUDE[k]]
+    if old:
+        print(
+            f"ws: warning (WS016): Claude Code {version} does not read {', '.join(need(k) for k in old)}: that part of "
+            "the wall is not in force. Update Claude Code.",
+            file=sys.stderr,
+        )
+
+
 def launch_claude(
     args: argparse.Namespace,
     argv: list[str],
@@ -2118,7 +2180,9 @@ def launch_claude(
     else is reachable."""
     from ws.adapters import claude_code
 
-    require_class_user(pol if pol is not None else _launch_policy(args)[1])  # before anything is written or started
+    pol = pol if pol is not None else _launch_policy(args)[1]
+    require_class_user(pol)  # before anything is written or started
+    warn_old_runner(argv[0], env, pol)
     out = home / "gate" / "claude-code"
     base = out / claude_code.FILE
     if not base.is_file():
@@ -2136,12 +2200,26 @@ def launch_claude(
     if target.is_symlink():
         target.unlink()
     try:
-        text = claude_code.for_project(base.read_text(encoding="utf-8"), project, plan.domains() if plan else None)
+        allow, deny = policy.launch_read_rules(pol)
+        text = claude_code.for_project(
+            base.read_text(encoding="utf-8"),
+            project,
+            plan.domains() if plan else None,
+            allow_read=allow,
+            deny_read=deny,
+            env=env,
+            forges=plan is None and not pol.gate.allow_hosts,  # the default list only: a person is at this terminal
+        )
     except ValueError as e:  # a class's list has nowhere to go: the generated settings have no sandbox block
         raise WsError(
             "refused", f"refusing to start claude-code: {e}", "set `[gate] sandbox = true`, `ws install`", 3
         ) from e
-    target.write_text(text, encoding="utf-8")
+    from ws import install  # here, not at the top: install imports the adapters this module does
+
+    try:
+        install._write_atomic(target, text.encode("utf-8"), 0o600)  # whole or not at all, and for this person alone
+    except OSError as e:
+        raise WsError("io", f"could not write the launch settings {target}: {e}", "check the folder is writable") from e
     cmd = [argv[0], "--settings", str(target), *argv[1:]]
     env = {**claude_code.MCP_WAIT_ENV, **env}  # the first model call sees its MCP tools; a value the person set wins
     before, note = scan_project(project)

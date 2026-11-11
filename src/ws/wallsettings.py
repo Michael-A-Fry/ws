@@ -10,7 +10,8 @@ held outside the files below) can still widen the wall, and WS012 says only what
 
 A class with an `os_user` (see ws.policy.Class) can also have a managed-settings file of its own, which holds what a
 session of that class may do whoever starts it: the sandbox required, no unsandboxed retry, bypass off, writes in the
-class's repos and scratch only, the home folder unreadable except those repos, inbound lead-only, and the network
+class's repos and scratch only, the home folder unreadable except those repos, file reads held to the working folders
+(`permissions.blockReadsOutsideWorkingDirectories`), inbound lead-only, and the network
 shut but for the class's own hosts (`network.allowedDomains` with `allowManagedDomainsOnly`). This module renders
 that file as text (`class_settings`, `install_text`, for `ws install --class`) and judges it (`class_rows`, the WS014
 rows). It never writes it: a managed-settings file is placed by a person with sudo, and it applies to every account on
@@ -48,6 +49,18 @@ MANAGED_DIRS = ("/etc/claude-code/managed-settings.d", "/Library/Application Sup
 # config), in the class file and in the doctor rows. Claude Code accepts only the string "disable".
 BYPASS_KEY = "disableBypassPermissionsMode"
 BYPASS_OFF = "disable"
+# `permissions.blockReadsOutsideWorkingDirectories` (Claude Code 2.1.257): the file tools refuse a read outside the
+# working folders. In the launch settings and the class file; never in a person's own settings file.
+READ_BLOCK_KEY = "blockReadsOutsideWorkingDirectories"
+# The settings keys the wall writes that only newer Claude Code versions read: dotted key -> first version that does.
+# The one table `ws doctor` WS016 and the e2e skip read; a version is parsed as doctor._version_tuple parses it.
+MIN_CLAUDE = {
+    f"permissions.{READ_BLOCK_KEY}": (2, 1, 257),
+    "sandbox.network.strictAllowlist": (2, 1, 219),  # a data class session only (claude_code.with_hosts)
+    # the launch settings hide the home folder and re-allow the project (claude_code.deny_home). Claude Code 2.1.77 added
+    # the key; 2.1.78 made absolute paths work in the sandbox's folder lists, which every entry written there is.
+    "sandbox.filesystem.allowRead": (2, 1, 78),
+}
 INBOUND_ENV = "WS_INBOUND"  # the class file's record of who may send in
 INBOUND_VALUE = "lead-only"
 CLASS_FILE_PREFIX = "50-ws-class-"
@@ -145,7 +158,8 @@ def expected_paths(block: Mapping, home: str) -> list[str]:
 
 def widenings(doc: Mapping, file: Path, block: Mapping, home: str) -> list[Widening]:
     """The settings in `doc` (the content of `file`) that open the wall `block` describes. Allowlist-shaped: an
-    `allowRead` or `allowWrite` entry that isn't a path ws can resolve counts as one."""
+    `allowRead` or `allowWrite` entry that isn't a path ws can resolve counts as one, and so does an `allowRead` entry at
+    or under the home folder (or above it): the launch settings hide the home and Claude Code merges this entry in."""
     sb = doc.get("sandbox") if isinstance(doc, Mapping) else None
     if not isinstance(sb, Mapping):
         return []
@@ -196,6 +210,13 @@ def widenings(doc: Mapping, file: Path, block: Mapping, home: str) -> list[Widen
                         str(e),
                         "re-opens a path the wall hides or keeps read-only (a deny_read path, or one of ws's own)",
                     )
+                elif key == "allowRead" and _overlaps(p, home):
+                    add(
+                        ("sandbox", "filesystem", key),
+                        str(e),
+                        "re-opens a folder under your home that a session started with `ws gate launch` hides: this "
+                        "file merges into that session's settings, so it would be readable again",
+                    )
     return found
 
 
@@ -220,12 +241,14 @@ def scan(
 
 
 def refusal(found: list[Widening], where: Path) -> WsError:
-    """The refusal `ws install` gives when your settings widen the wall: each setting, its file and what it does."""
+    """The refusal `ws install` gives when your settings widen the wall (kind `sandbox_widened`): each setting, its file and
+    what it does; the hint names what to delete from which file, or the flag that keeps them on purpose."""
     lines = "".join(f"\n  {w.label} ({w.file}): {w.why}" for w in found)
+    delete = "; ".join(f"`{key}` from {file}" for key, file in dict.fromkeys((w.key, w.file) for w in found))
     return WsError(
-        "refused",
+        "sandbox_widened",
         f"{where}: these settings widen the sandbox ws relies on, so ws changed nothing:{lines}",
-        f"take them out and run `ws install` again; or keep them on purpose with `ws install {OVERRIDE}` "
+        f"delete {delete}, then run `ws install` again; or keep them on purpose with `ws install {OVERRIDE}` "
         "(ws records the choice, and `ws doctor` then reports the wall as widened, never ok)",
     )
 
@@ -330,6 +353,7 @@ PARTS = (
     "write limits",
     "home deny-read",
     "inbound lead-only",
+    "read block",  # last, and a `warn` rather than a `fail` when missing: a file an older ws placed lacks it
 )
 
 
@@ -359,6 +383,20 @@ def _passwd(name: str):
 def class_users(pol: policy.Policy) -> list[policy.Class]:
     """The classes that name an OS user, in name order."""
     return [c for _, c in sorted(pol.classes.items()) if c.os_user]
+
+
+def keys_written(pol: policy.Policy) -> list[str]:
+    """The keys of MIN_CLAUDE the wall writes under this policy: the read block unless `read_outside_project` is on (a
+    class file always has it), `allowRead` with a sandbox (the launch settings' deny-home), and `strictAllowlist` when the
+    policy has data classes and a sandbox."""
+    keys = []
+    if not pol.gate.read_outside_project or class_users(pol):
+        keys.append(f"permissions.{READ_BLOCK_KEY}")
+    if pol.gate.sandbox:
+        keys.append("sandbox.filesystem.allowRead")
+    if pol.gate.sandbox and pol.classes:
+        keys.append("sandbox.network.strictAllowlist")
+    return keys
 
 
 def class_file_name(name: str) -> str:
@@ -406,7 +444,9 @@ def class_roots(cls: policy.Class, home: str) -> list[str]:
                 "usage",
                 f"class {cls.name!r} has a repo with a wildcard in a folder name ({glob!r}), which a settings file "
                 "and a chown cannot hold without the folder above the repos",
-                'name each repo folder, or the folder that holds them as "/path/**"',
+                f"edit `repos` under [classes.{cls.name}] in {policy.policy_path()}: name each repo folder, or the "
+                'folder that holds them as "/path/**"; then run `ws install --class '
+                f"{cls.name}` again",
                 2,
             )
         root = _norm(text, home)
@@ -426,11 +466,12 @@ def class_settings(cls: policy.Class, home: str, kind: str) -> dict:
             "usage",
             f"class {cls.name!r} names no repo folder a settings file can hold "
             "(its repos are bare names or start with a wildcard)",
-            'give the class a repo as a folder, e.g. repos = ["/srv/work/**"]',
+            f"edit `repos` under [classes.{cls.name}] in {policy.policy_path()} and give the class a folder, e.g. repos = "
+            f'["/srv/work/**"]; then run `ws install --class {cls.name}` again',
             2,
         )
     return {
-        "permissions": {BYPASS_KEY: BYPASS_OFF},
+        "permissions": {BYPASS_KEY: BYPASS_OFF, READ_BLOCK_KEY: True},
         "sandbox": {
             "enabled": True,
             "failIfUnavailable": True,
@@ -656,6 +697,7 @@ def _rows_for(cls: policy.Class, env: Mapping[str, str], kind: str) -> list[Row]
         return Row(name, part, status, detail, fix)
 
     rows: list[Row] = []
+    reads = row(PARTS[8], WARN, "not checked: no class file in place", again)
     if _passwd(cls.os_user or "") is None:
         rows.append(row(PARTS[0], WARN, "the class's OS user is not in this system's user database", again))
     else:
@@ -673,16 +715,34 @@ def _rows_for(cls: policy.Class, env: Mapping[str, str], kind: str) -> list[Row]
             rows.append(row(PARTS[1], OK, f"{found} is root-owned and writable by no one else"))
         doc = _read(found)
         if doc is None:
-            rows += [row(p, FAIL, f"{found} is not a JSON object Claude Code can read", again) for p in PARTS[2:7]]
+            unreadable = f"{found} is not a JSON object Claude Code can read"
+            rows += [row(p, FAIL, unreadable, again) for p in PARTS[2:7]]
+            reads = row(PARTS[8], FAIL, unreadable, again)
         else:
             try:
                 want = class_settings(cls, class_home(cls, kind), kind)
             except WsError as e:
                 rows += [row(p, WARN, e.message, e.hint) for p in PARTS[2:7]]
+                reads = row(PARTS[8], WARN, e.message, e.hint)
             else:
                 rows += _content_rows(name, doc, want, again)
+                reads = _read_block_row(name, doc, again)
     rows.append(_inbound_row(cls, found))
+    rows.append(reads)
     return rows
+
+
+def _read_block_row(name: str, doc: Mapping, again: str) -> Row:
+    """The read block part: the file sets `permissions.blockReadsOutsideWorkingDirectories` to true. A file placed before
+    ws wrote the key lacks it, which is a `warn` (the rest of the wall holds), never a `fail`."""
+    perms = doc.get("permissions") if isinstance(doc.get("permissions"), Mapping) else {}
+    if perms.get(READ_BLOCK_KEY) is True:
+        return Row(name, PARTS[8], OK, f"permissions.{READ_BLOCK_KEY} is true: file reads stay in the working folders")
+    detail = (
+        f"the file does not set permissions.{READ_BLOCK_KEY} to true (an older ws placed it), so Claude Code's file "
+        "tools can read outside the class's folders"
+    )
+    return Row(name, PARTS[8], WARN, detail, again)
 
 
 def _content_rows(name: str, doc: Mapping, want: Mapping, again: str) -> list[Row]:

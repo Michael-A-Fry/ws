@@ -57,12 +57,14 @@ def test_a_settings_file_with_an_excluded_command_and_an_allowed_read_is_refused
     f = user_file(box, mine)
     before = f.read_bytes()
     code, out = run_install(capsys, box)
-    assert code == 1 and out["error_kind"] == "refused"
+    assert code == 1 and out["error_kind"] == "sandbox_widened"
     assert (
         "sandbox.excludedCommands git:*" in out["message"] and "sandbox.filesystem.allowRead ~/.ssh" in out["message"]
     )
     assert str(f) in out["message"]  # the file, for each
     assert "--allow-widened-sandbox" in out["hint"] and "ws install" in out["hint"]
+    assert "`sandbox.excludedCommands` from " + str(f) in out["hint"]  # what to delete, and from which file
+    assert "`sandbox.filesystem.allowRead` from " + str(f) in out["hint"]
     assert f.read_bytes() == before
     assert not (box / ".ws" / "backups").exists() or not list((box / ".ws" / "backups").iterdir())
 
@@ -121,7 +123,7 @@ def test_ws012_says_stale_when_a_deny_read_path_was_added_after_the_install(box,
 def test_each_widening_key_is_refused_by_name(box, capsys, doc, key):
     f = user_file(box, doc)
     code, out = run_install(capsys, box)
-    assert code == 1 and out["error_kind"] == "refused" and key in out["message"] and str(f) in out["message"]
+    assert code == 1 and out["error_kind"] == "sandbox_widened" and key in out["message"] and str(f) in out["message"]
 
 
 @pytest.mark.parametrize(
@@ -129,7 +131,7 @@ def test_each_widening_key_is_refused_by_name(box, capsys, doc, key):
     [
         {"sandbox": {"excludedCommands": []}},
         {"sandbox": {"enabled": True, "allowUnsandboxedCommands": False}},
-        {"sandbox": {"filesystem": {"allowRead": ["~/work"], "allowWrite": ["~/.cache/mytool"]}}},
+        {"sandbox": {"filesystem": {"allowRead": ["/opt/tools"], "allowWrite": ["~/.cache/mytool"]}}},
         {"model": "opus"},
     ],
 )
@@ -137,6 +139,26 @@ def test_settings_that_leave_the_wall_whole_are_not_refused(box, capsys, doc):
     user_file(box, doc)
     code, _ = run_install(capsys, box)
     assert code == 0
+    assert ws012(box)[0] == "ok"
+
+
+@pytest.mark.parametrize("entry", ["~/work", "$HOME/work/**", "{home}/work"])
+def test_a_user_allow_read_at_or_under_the_home_is_a_widening_and_makes_ws012_not_ok(box, capsys, entry):
+    """The launch settings hide the home and Claude Code merges this file into them, so the entry would re-open it."""
+    entry = entry.format(home=box, parent=box.parent)
+    f = user_file(box, {"sandbox": {"filesystem": {"allowRead": [entry]}}})
+    code, out = run_install(capsys, box)
+    assert code == 1 and out["error_kind"] == "sandbox_widened"
+    assert f"sandbox.filesystem.allowRead {entry}" in out["message"] and "ws gate launch" in out["message"]
+    code, _ = run_install(capsys, box, "--allow-widened-sandbox")
+    assert code == 0
+    status, detail, _ = ws012(box)
+    assert status == "warn" and f"sandbox.filesystem.allowRead {entry}" in detail and str(f) in detail
+
+
+def test_a_user_allow_read_outside_the_home_is_not_a_widening(box, capsys):
+    user_file(box, {"sandbox": {"filesystem": {"allowRead": ["/opt/tools", "/usr/local/share/data"]}}})
+    assert run_install(capsys, box)[0] == 0
     assert ws012(box)[0] == "ok"
 
 
@@ -323,3 +345,135 @@ def test_ws012_reads_a_class_file_that_differs_from_what_ws_renders_like_any_man
     file.write_text(json.dumps(conf))
     status, detail, _ = ws012(box)
     assert status == "warn" and "sandbox.excludedCommands npm:*" in detail and str(file) in detail
+
+
+# --- permissions.blockReadsOutsideWorkingDirectories ---------------------------------------------------------------------
+
+
+def launch_settings(box, toml: str = "") -> dict:
+    """The settings ws generates with user_scope False: the file a launch and a headless run start from."""
+    import os
+
+    from ws import policy
+    from ws.adapters import claude_code
+
+    pol = policy.loads(toml)
+    out = box / ".ws" / "gate" / "claude-code"
+    files = claude_code.generate(pol, ["ws"], out, policy.policy_path(dict(os.environ)))
+    return json.loads(files["settings.json"])
+
+
+def test_the_launch_settings_and_the_class_file_carry_the_read_block(box):
+    assert launch_settings(box)["permissions"][wallsettings.READ_BLOCK_KEY] is True
+    cls = wallsettings.policy.loads(
+        '[classes.work]\naccess = "walled"\nos_user = "ws-work"\nrepos = ["/srv/work/**"]\n'
+    ).classes["work"]
+    assert wallsettings.class_settings(cls, str(box), "linux")["permissions"][wallsettings.READ_BLOCK_KEY] is True
+
+
+def test_launch_off_switch_leaves_the_key_out(box):
+    perms = launch_settings(box, "[gate]\nread_outside_project = true\n")["permissions"]
+    assert wallsettings.READ_BLOCK_KEY not in perms
+    assert perms[wallsettings.BYPASS_KEY] == wallsettings.BYPASS_OFF  # only the read block went
+
+
+def test_the_generate_command_writes_the_key_and_the_off_switch_removes_it(box, capsys):
+    out = box / "gen"
+    (box / ".ws").mkdir(exist_ok=True)
+    (box / ".ws" / "policy.toml").write_text("")
+    args = ["gate", "generate", "--runner", "claude-code", "--out", str(out)]
+    assert cli.main(args) == 0
+    capsys.readouterr()
+    assert json.loads((out / "settings.json").read_text())["permissions"][wallsettings.READ_BLOCK_KEY] is True
+    (box / ".ws" / "policy.toml").write_text("[gate]\nread_outside_project = true\n")
+    assert cli.main(args) == 0
+    capsys.readouterr()
+    assert wallsettings.READ_BLOCK_KEY not in json.loads((out / "settings.json").read_text())["permissions"]
+    (box / ".ws" / "policy.toml").write_text('[gate]\nread_outside_project = "no"\n')
+    assert cli.main(["--json", *args]) == 1  # a policy that does not load is refused, never partly used
+    assert json.loads(capsys.readouterr().out)["error_kind"] == "bad_config"
+
+
+def test_the_read_block_still_holds_with_the_sandbox_off(box):
+    # it governs Claude's own file tools, which the sandbox never covered; only read_outside_project removes it
+    perms = launch_settings(box, "[gate]\nsandbox = false\n")["permissions"]
+    assert perms[wallsettings.READ_BLOCK_KEY] is True
+
+
+@pytest.mark.parametrize("value", ['"yes"', "1", "[true]", '"true"'])
+def test_read_outside_project_of_the_wrong_type_is_a_policy_error(value):
+    from ws import policy
+
+    with pytest.raises(policy.PolicyError, match="read_outside_project must be true or false"):
+        policy.loads(f"[gate]\nread_outside_project = {value}\n")
+    with pytest.raises(policy.PolicyError):  # never a partial load: the other keys do not rescue it
+        policy.loads(f"[gate]\nsandbox = false\nread_outside_project = {value}\n")
+
+
+def test_read_outside_project_is_off_by_default_and_true_is_read():
+    from ws import policy
+
+    assert policy.loads("").gate.read_outside_project is False
+    assert policy.loads("[gate]\nread_outside_project = true\n").gate.read_outside_project is True
+
+
+def class_rows_with(box, monkeypatch, tmp_path, capsys, edit=None):
+    user_file(box)
+    assert run_install(capsys, box)[0] == 0  # writes the policy the class goes into
+    file = class_file_in_place(box, monkeypatch, tmp_path)
+    if edit:
+        conf = json.loads(file.read_text())
+        edit(conf)
+        file.write_text(json.dumps(conf))
+    monkeypatch.setattr(wallsettings, "_is_root", lambda st: True)
+    pol = install.policy.load(install.policy.policy_path(dict(__import__("os").environ)))
+    return {r.part: r for r in wallsettings.class_rows(pol, {"HOME": str(box)}, "linux")}
+
+
+def test_ws014_is_ok_for_a_class_file_that_holds_the_read_block(box, monkeypatch, tmp_path, capsys):
+    row = class_rows_with(box, monkeypatch, tmp_path, capsys)["read block"]
+    assert row.status == "ok" and wallsettings.READ_BLOCK_KEY in row.detail and not row.fix
+
+
+def test_ws014_warns_for_a_class_file_placed_before_the_read_block_and_says_how_to_place_it_again(
+    box, monkeypatch, tmp_path, capsys
+):
+    rows = class_rows_with(
+        box, monkeypatch, tmp_path, capsys, lambda c: c["permissions"].pop(wallsettings.READ_BLOCK_KEY)
+    )
+    row = rows["read block"]
+    assert row.status == "warn" and wallsettings.READ_BLOCK_KEY in row.detail
+    assert "ws install --class work" in row.fix  # never a fail, never a crash
+    assert all(r.status != "fail" for r in rows.values())
+
+
+def test_the_widened_refusal_has_its_own_kind_and_a_hint_that_names_the_key_the_file_and_the_command(box):
+    f = box / ".claude" / "settings.json"
+    found = [wallsettings.Widening(("sandbox", "enabled"), "", f, "turns the sandbox off")]
+    e = wallsettings.refusal(found, f)
+    assert isinstance(e, wallsettings.WsError) and e.kind == "sandbox_widened"
+    assert f"`sandbox.enabled` from {f}" in e.hint and "`ws install`" in e.hint and "--allow-widened-sandbox" in e.hint
+
+
+def test_a_class_with_a_wildcard_repo_or_no_repo_folder_says_which_key_to_edit_and_what_to_run_again(box):
+    from ws import policy
+
+    head = '[classes.work]\naccess = "walled"\nos_user = "ws-work"\n'
+    wild = policy.loads(head + 'repos = ["/srv/ops-*/x"]\n')
+    bare = policy.loads(head + 'repos = ["checkout"]\n')
+    for pol, call in (
+        (wild, lambda c: wallsettings.class_roots(c, str(box))),
+        (bare, lambda c: wallsettings.class_settings(c, str(box), "linux")),
+    ):
+        with pytest.raises(wallsettings.WsError) as e:
+            call(pol.classes["work"])
+        assert e.value.kind == "usage" and e.value.exit_code == 2
+        assert "`repos` under [classes.work]" in e.value.hint and str(policy.policy_path()) in e.value.hint
+        assert "`ws install --class work`" in e.value.hint
+
+
+def test_ws014_does_not_say_ok_when_the_read_block_is_false(box, monkeypatch, tmp_path, capsys):
+    def off(c):
+        c["permissions"][wallsettings.READ_BLOCK_KEY] = False
+
+    assert class_rows_with(box, monkeypatch, tmp_path, capsys, off)["read block"].status == "warn"

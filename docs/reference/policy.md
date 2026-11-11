@@ -53,9 +53,11 @@ the built-in default, which has the list below.
 | `deny_tools` | list of text | `[]` | Tools to switch off: the neutral names `web_fetch` and `web_search` (an allowed web tool counts as a way out), and MCP tools by name or glob (`mcp__server__tool`, `mcp__server__*`, `mcp__*__delete_*`). |
 | `ask_commands` | list of text | `[]` | Command patterns that run only after you approve that exact call. Same globs as `deny_commands`. A command that also matches `deny_commands` stays denied. |
 | `allow_mcp` | list of text | the tools `ws mcp serve` offers | MCP tools a session may call without being asked, by name or glob (`mcp__ws__*`). An MCP tool this list doesn't name is asked for: a person approves that exact call, once, as for `ask_commands`. `deny_tools` beats it. Leave the key out and only `mcp__ws__memory_search`, `mcp__ws__memory_add` and `mcp__ws__note_capture` are allowed; naming it, even as `[]`, replaces them. |
-| `allow_hosts` | list of text | `[]` | Hosts a session's shell may reach, for runners whose sandbox filters the network (Claude Code). Empty means the policy says nothing about the network. |
+| `allow_hosts` | list of text | `[]` | Hosts a session's shell may reach without asking, for runners whose sandbox filters the network (Claude Code). Empty means the policy names none, and the sandbox block carries a short default list instead (the runner's API host, PyPI, npm and crates.io, with GitHub and GitLab added for a session started with `ws gate launch` but not for a headless job; see [Use the wall](../how-to/use-the-wall.md)). A list here replaces the default. The default is in the settings ws starts a session with, not in your own `~/.claude/settings.json`. With `sandbox = false` there is no list at all. |
 | `allow_write` | list of text | `[]` | Folders besides the project that a walled session may write. |
 | `sandbox` | true or false | `true` | Switch on the runner's own sandbox in what ws writes (Claude Code), both for a session started with `ws gate launch` and for one started the usual way once `ws install` has merged the settings into your file. `false` leaves the block out and marks the session unsandboxed, and `ws doctor` (WS012) says so. |
+| `read_outside_project` | true or false | `false` | The off switch for the read block. With `false`, the settings ws passes to Claude Code (`ws gate launch`, `ws gate generate`, headless `ws run` jobs) set `permissions.blockReadsOutsideWorkingDirectories` to `true`, so Claude's Read, Grep and Glob tools refuse a path outside the working folders in every permission mode (Claude Code 2.1.257 or newer; WS016 checks the version). `true` leaves the key out. It does not touch your own settings file, which ws never gives this key, and a class's managed-settings file always carries it. A value that isn't `true` or `false` makes the whole policy fail to load. |
+| `allow_read` | list of text | `[]` | Folders or files besides the project that a shell command in a session started with `ws gate launch --runner claude-code` may read. That session can't read your home folder except the project, its git folders and what common tools need; see [Deny the home folder](../how-to/use-the-wall.md#deny-the-home-folder). A `deny_read` path inside one of these stays unreadable. Only that launch reads it: `ws install` doesn't merge it into your own settings file, and OpenCode's wall hides the `deny_read` paths only. |
 
 Rules:
 
@@ -74,6 +76,12 @@ Rules:
 - `allow_write` items must be a folder, absolute or under `~/` (`$HOME` is accepted), with no wildcard, not `/` and
   not the
   home folder after `.` and `..` are resolved.
+- `allow_read` items must be a folder or file, absolute or under `~/` (`$HOME` is accepted), with no wildcard, not `/`,
+  not the home folder or a folder above it (an absolute spelling, or one that `.` and `..` bring there, counts), and
+  not equal to or inside a `deny_read` path (a path a
+  `deny_read` rule names without a wildcard, with or without a trailing `**`). One bad item refuses the whole policy and
+  names the item. A folder above a `deny_read` path is fine: the denied path stays hidden. An older ws refuses a policy
+  with this key as an unknown key.
 - `deny_tools` items must be a known tool name or an MCP tool name or glob. `allow_mcp` items must be an MCP tool name
   or glob. An MCP name is `mcp__`, then letters, digits and `_ - . * ?`, with no empty part (`mcp__`, `mcp____y` and a
   trailing `__` are refused). A malformed item refuses the whole policy and names the key. A glob matches the full

@@ -19,6 +19,8 @@ fails.
 from __future__ import annotations
 
 import json
+import os
+import re
 import subprocess
 import sys
 
@@ -26,7 +28,8 @@ import pytest
 
 from e2e import test_gate_runners as gr
 from e2e.stubs import AnthropicStub, Call, OpenAIStub
-from ws import policy, sandbox
+from ws import policy, sandbox, wallsettings
+from ws.adapters import claude_code
 
 # reuse the other file's fixtures: the built-in policy at WS_HOME, a project folder, a canary under a fake ~/.ssh
 ws_home = gr.ws_home
@@ -38,8 +41,16 @@ LOOSE = policy.default_toml() + "# an older, looser policy\n"
 WALL = [sys.executable, "-m", "ws", "gate", "launch", "--runner", "opencode"]
 
 
+def no_wall(test):
+    """For a test that needs no bubblewrap (the read block is a permission key, not part of the sandbox)."""
+    test.needs_no_wall = True
+    return test
+
+
 @pytest.fixture(autouse=True)
-def need_wall():
+def need_wall(request):
+    if getattr(request.function, "needs_no_wall", False):
+        return
     if sys.platform != "linux":
         pytest.skip("the wall is tested on Linux (bubblewrap)")
     if not sandbox._bwrap_starts():
@@ -105,6 +116,262 @@ def opencode_wall(tmp_path, wshome, command, flags: tuple[str, ...] = ()):
     with OpenAIStub([call]) as stub:
         proc = gr.opencode_run(tmp_path, stub, out, tmp_path / "work", wrap=[*WALL, *flags, "--"])
     return stub, proc
+
+
+# --- the read block: Claude's own file tools stay in the working folders ------------------------------------------------
+
+READ_BLOCK = f"permissions.{wallsettings.READ_BLOCK_KEY}"
+
+
+def need_a_claude_that_reads_the_key():
+    """Skip, saying why, when the runner is older than the version the shared table gives for the key. A missing runner
+    skips, or fails under WS_E2E_REQUIRE=1, as it does for every other test here (gr.runner_bin)."""
+    found = gr.claude_version()
+    need = wallsettings.MIN_CLAUDE[READ_BLOCK]
+    if found < need:
+        have, first = ".".join(map(str, found)), ".".join(map(str, need))
+        pytest.skip(f"Claude Code {have} is older than {first}, the first to read {READ_BLOCK}")
+
+
+def read_outside(tmp_path, work, allow_outside: bool):
+    """`claude -p` with a stub model that asks to Read a file planted outside the working folder. Only the generated
+    `permissions` block's read key is kept (hooks, deny rules and the sandbox are stripped), so it is the key alone that
+    decides. `allow_outside` is the policy's `read_outside_project`, which is the off switch."""
+    planted = tmp_path / "outside" / "notes.txt"
+    planted.parent.mkdir()
+    marker = "outside-" + os.urandom(6).hex()  # built at run time
+    planted.write_text(marker)
+    text = policy.default_toml()
+    if allow_outside:
+        assert "read_outside_project = false" in text
+        text = text.replace("read_outside_project = false", "read_outside_project = true")
+    (tmp_path / "wshome").mkdir(exist_ok=True)
+    (tmp_path / "wshome" / "policy.toml").write_text(text)
+    settings = gr.generate(tmp_path, "claude-code") / "settings.json"
+    perms = json.loads(settings.read_text())["permissions"]
+    conf = {"permissions": {k: v for k, v in perms.items() if k == wallsettings.READ_BLOCK_KEY}}
+    settings.write_text(json.dumps(conf))
+    with AnthropicStub([Call("Read", {"file_path": str(planted)})]) as stub:
+        proc = gr.claude_run(tmp_path, stub, settings, False, work)
+    return marker, stub, proc, conf
+
+
+@no_wall
+def test_a_read_outside_the_working_folder_is_refused_with_the_key_on(tmp_path, work):
+    need_a_claude_that_reads_the_key()
+    marker, stub, proc, conf = read_outside(tmp_path, work, allow_outside=False)
+    assert conf["permissions"] == {wallsettings.READ_BLOCK_KEY: True}  # the generated settings carry it
+    assert stub.tool_results(), f"the runner never reported the Read back to the model\n{gr.where(proc)}"
+    assert marker not in " ".join(stub.tool_results()), f"the file outside the folder was read\n{gr.where(proc)}"
+
+
+@no_wall
+def test_the_same_read_is_allowed_with_the_off_switch(tmp_path, work):
+    """The control: with `read_outside_project = true` the key is left out and the same stub call reads the file, so the
+    refusal above is the key's and not something else's."""
+    need_a_claude_that_reads_the_key()
+    marker, stub, proc, conf = read_outside(tmp_path, work, allow_outside=True)
+    assert conf["permissions"] == {}  # no key
+    assert marker in " ".join(stub.tool_results()), f"the control read did not happen\n{gr.where(proc)}"
+
+
+# --- deny-home in the launch settings (ADR 0026) ------------------------------------------------------------------------
+
+ALLOW_READ = "sandbox.filesystem.allowRead"
+
+
+def need_a_claude_that_reads_allow_read():
+    """The read block's first version (2.1.257) is newer than allowRead's in the shared table, so the one probe above
+    serves: a Claude Code that reads the block reads allowRead. A missing runner skips, or fails under WS_E2E_REQUIRE=1."""
+    assert wallsettings.MIN_CLAUDE[ALLOW_READ] <= wallsettings.MIN_CLAUDE[READ_BLOCK]
+    need_a_claude_that_reads_the_key()
+
+
+def launch_copy(tmp_path, project, allow_read: tuple[str, ...] = ()) -> dict:
+    """The settings `ws gate launch --runner claude-code` would start claude with for `project`, made the way
+    `launch_claude` makes them, with the permission rules and hooks stripped so the sandbox block alone decides."""
+    (tmp_path / "wshome").mkdir(exist_ok=True)
+    text = policy.default_toml()
+    assert "# allow_read = []" in text
+    (tmp_path / "wshome" / "policy.toml").write_text(
+        text.replace("# allow_read = []", f"allow_read = {json.dumps(allow_read)}")
+    )
+    shared = gr.generate(tmp_path, "claude-code") / "settings.json"
+    pol = policy.load(tmp_path / "wshome" / "policy.toml")
+    allow, deny = policy.launch_read_rules(pol)
+    text = claude_code.for_project(
+        shared.read_text(), str(project.resolve()), allow_read=allow, deny_read=deny, env=gr.base_env(tmp_path)
+    )
+    conf = json.loads(text)
+    del conf["permissions"], conf["hooks"]
+    return conf
+
+
+def run_in_launch_copy(tmp_path, project, command, allow_read: tuple[str, ...] = (), mutate=None):
+    need_a_claude_that_reads_allow_read()
+    conf = launch_copy(tmp_path, project, allow_read)
+    if mutate:
+        mutate(conf)
+    settings = tmp_path / "launch-settings.json"
+    settings.write_text(json.dumps(conf))
+    with AnthropicStub([Call("Bash", {"command": command})]) as stub:
+        proc = gr.claude_run(tmp_path, stub, settings, False, project)
+    return conf, stub, proc
+
+
+def planted(path, text: str | None = None) -> str:
+    """A file with a marker built at run time; returns the marker."""
+    marker = text or "marker-" + os.urandom(6).hex()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(marker)
+    return marker
+
+
+def test_a_shell_cannot_read_the_home_but_reads_the_project(tmp_path):
+    """Inside the tmp HOME (the fake home of the runner): a file planted in it is hidden, the project's file is not. The
+    project is inside that home, so it is the re-allow that shows the control read."""
+    home = tmp_path / "home"
+    project = home / "project"
+    secret = planted(home / "private-notes.txt")
+    deep = planted(home / "Documents" / "deep" / "notes.txt")
+    mine = planted(project / "notes.txt")
+    cmd = f"cat {home}/private-notes.txt; cat {home}/Documents/deep/notes.txt; cat {project}/notes.txt"
+    _, stub, proc = run_in_launch_copy(tmp_path, project, cmd)
+    seen = " ".join(stub.tool_results())
+    assert mine in seen, f"the control read in the project did not happen\n{seen}\n{gr.where(proc)}"
+    assert secret not in seen and deep not in seen, f"the home was read\n{seen}\n{gr.where(proc)}"
+
+
+def test_a_shell_cannot_read_the_ws_secrets_folder_by_default_or_inside_a_folder_allow_read_opens(tmp_path):
+    """`~/.local/share/ws/secrets` is a deny_read path. By default `~/.local/share` is not reachable at all; with it in
+    allow_read the folder is open and the secrets folder inside it stays hidden (an exact deny holds in a wider allow)."""
+    home = tmp_path / "home"
+    project = home / "project"
+    share = home / ".local" / "share"
+    key = planted(share / "ws" / "secrets" / "API_KEY")
+    other = planted(share / "other-tool" / "readme.txt")
+    mine = planted(project / "notes.txt")
+    cmd = f"cat {share}/ws/secrets/API_KEY; cat {share}/other-tool/readme.txt; cat {project}/notes.txt"
+    _, stub, proc = run_in_launch_copy(tmp_path, project, cmd)
+    seen = " ".join(stub.tool_results())
+    assert mine in seen and key not in seen and other not in seen, f"{seen}\n{gr.where(proc)}"
+    _, stub, proc = run_in_launch_copy(tmp_path, project, cmd, allow_read=("~/.local/share",))
+    seen = " ".join(stub.tool_results())
+    assert other in seen, (
+        f"allow_read did not open the folder\n{seen}\n{gr.where(proc)}"
+    )  # the control: it does open it
+    assert mine in seen and key not in seen, f"the secrets folder was read through allow_read\n{seen}\n{gr.where(proc)}"
+
+
+def test_the_same_reads_work_when_the_launch_copy_has_no_deny_home(tmp_path):
+    """The control for the two above: take the home out of denyRead (the settings as they were before ADR 0026) and the
+    same command reads the planted files, so it is deny-home that hid them and not something else in the test."""
+    home = tmp_path / "home"
+    project = home / "project"
+    secret = planted(home / "private-notes.txt")
+    mine = planted(project / "notes.txt")
+
+    def as_before(conf):
+        fs = conf["sandbox"]["filesystem"]
+        fs["denyRead"] = [p for p in fs["denyRead"] if p not in (str(home), str(home.resolve()))]
+        del fs["allowRead"]
+
+    cmd = f"cat {home}/private-notes.txt; cat {project}/notes.txt"
+    _, stub, proc = run_in_launch_copy(tmp_path, project, cmd, mutate=as_before)
+    seen = " ".join(stub.tool_results())
+    assert secret in seen and mine in seen, f"{seen}\n{gr.where(proc)}"
+
+
+# --- host reach: how a command in the sandbox gets to an allowed host (spike) -------------------------------------------
+# The sandbox has no network of its own. Claude Code runs a proxy outside it and bridges the proxy to a port inside, which
+# the shell finds in HTTP_PROXY and HTTPS_PROXY. A program that honours those variables reaches the hosts in
+# `sandbox.network.allowedDomains` and no other; one that does not (a raw socket) reaches nothing. No Unix socket is
+# allowed for any of it: `allowUnixSockets` and `allowAllUnixSockets` are never set. NO_PROXY names the loopback
+# addresses, so a command that wants the proxy to reach a loopback stub says `--noproxy ''` (curl).
+
+
+class Stub:
+    """A web server on 127.0.0.1, on a port the kernel picks, that answers every GET with a marker built at run time."""
+
+    def __init__(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        self.marker = "stub-" + os.urandom(6).hex()
+        marker = self.marker.encode()
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(marker)))
+                self.end_headers()
+                self.wfile.write(marker)
+
+            def log_message(self, *args):
+                pass
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.server.server_address[1]
+
+    def __enter__(self):
+        import threading
+
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        return self
+
+    def __exit__(self, *exc):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def through_the_proxy(url: str) -> str:
+    return f'curl -sS --max-time 8 --noproxy \'\' -x "$HTTP_PROXY" {url}; echo " rc=$?"'
+
+
+def test_a_command_reaches_a_host_in_allowed_domains_through_the_runners_proxy_and_no_other(tmp_path):
+    project = tmp_path / "home" / "project"
+    project.mkdir(parents=True)
+    with Stub() as allowed, Stub() as other:
+
+        def only_the_first(conf):
+            conf["sandbox"]["network"] = {"allowedDomains": [f"127.0.0.1:{allowed.port}"]}
+
+        cmd = "; ".join(
+            [
+                through_the_proxy(f"http://127.0.0.1:{allowed.port}/"),  # on the list
+                through_the_proxy(f"http://127.0.0.1:{other.port}/"),  # same host, a port that is not
+                f"curl -sS --max-time 8 --noproxy '*' http://127.0.0.1:{allowed.port}/; echo \" direct rc=$?\"",
+            ]
+        )
+        conf, stub, proc = run_in_launch_copy(tmp_path, project, cmd, mutate=only_the_first)
+    seen = " ".join(stub.tool_results())
+    net = conf["sandbox"]["network"]
+    assert "allowUnixSockets" not in net and "allowAllUnixSockets" not in net  # no socket was needed
+    assert f"{allowed.marker} rc=0" in seen, f"the allowed stub was not reached\n{seen}\n{gr.where(proc)}"
+    assert other.marker not in seen, f"a port off the list was reached\n{seen}\n{gr.where(proc)}"
+    assert "blocked by network allowlist" in seen.lower(), f"the proxy did not say it refused\n{seen}"
+    assert "direct rc=0" not in seen and "direct rc=7" in seen, (
+        f"a direct connection got out\n{seen}"
+    )  # no route at all
+
+
+REAL_HOSTS = ("github.com", "pypi.org")
+
+
+def test_the_default_hosts_are_reached_through_the_proxy_with_real_servers(tmp_path):
+    """Only with WS_E2E_NETWORK=1 (it needs the internet): the launch copy's default list reaches GitHub and PyPI, and a
+    host that is on no list is refused."""
+    if os.environ.get("WS_E2E_NETWORK") != "1":
+        pytest.skip("WS_E2E_NETWORK=1 is not set: this one talks to github.com and pypi.org")
+    project = tmp_path / "home" / "project"
+    project.mkdir(parents=True)
+    probe = "curl -sS -o /dev/null -w '%s=%%{http_code}\\n' --max-time 20 https://%s/"
+    cmd = "; ".join([*(probe % (h, h) for h in REAL_HOSTS), (probe % ("example.org", "example.org")) + " || true"])
+    conf, stub, proc = run_in_launch_copy(tmp_path, project, cmd)
+    seen = " ".join(stub.tool_results())
+    assert set(REAL_HOSTS) <= set(conf["sandbox"]["network"]["allowedDomains"])
+    for host in REAL_HOSTS:
+        assert re.search(rf"{re.escape(host)}=(200|301|302)", seen), f"{host} was not reached\n{seen}\n{gr.where(proc)}"
+    assert not re.search(r"example\.org=(200|301|302)", seen), f"a host on no list was reached\n{seen}"
 
 
 # --- the matcher does not see them --------------------------------------------------------------------------------

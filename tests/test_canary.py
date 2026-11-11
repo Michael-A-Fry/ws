@@ -15,6 +15,7 @@ import pytest
 
 from ws import canary, cli, doctor, osinfo, runrecord
 from ws.adapters import claude_code
+from ws.output import WsError
 from ws.profile import dumps
 
 VALIDATOR = jsonschema.Draft202012Validator(runrecord.schema())
@@ -122,7 +123,13 @@ def test_a_canary_run_passes_and_leaves_one_line(box, capsys):
     assert line["ok"] is True and line["model"] == "model-a" and line["schema"] == 1
     res = line["runners"]["claude-code"]
     assert res["version"] == "2.5.1" and res["ok"] is True
-    assert res["checks"] == {"version": "pass", "gate": "pass", "hook_config": "pass", "run_record": "pass"}
+    assert res["checks"] == {
+        "version": "pass",
+        "gate": "pass",
+        "hook_config": "pass",
+        "run_record": "pass",
+        "wall": "pass",
+    }
     code, out, _ = run(capsys, "canary", "--json")
     assert code == 0 and json.loads(out)["data"]["details"]["claude-code"]["gate"].startswith("blocks")
     assert len(lines(box)) == 2
@@ -396,3 +403,77 @@ def test_a_canary_log_that_is_a_symlink_is_not_followed(box, capsys, tmp_path):
     (box / ".ws" / "logs" / "canary.jsonl").symlink_to(target)
     run(capsys, "canary", "--runner", "claude-code")  # the append is refused quietly: a canary never fails on its log
     assert target.read_text() == ""
+
+
+# ---- the wall check: the launch settings still hide the home and keep the sandbox shut -----------------------------------
+
+
+def tamper(monkeypatch, change):
+    """claude_code.for_project, with `change(conf)` applied to the settings it makes: an update that broke the wall."""
+    real = claude_code.for_project
+
+    def broken(*args, **kwargs):
+        conf = json.loads(real(*args, **kwargs))
+        change(conf)
+        return json.dumps(conf)
+
+    monkeypatch.setattr(claude_code, "for_project", broken)
+
+
+def drop_home(conf):
+    fs = conf["sandbox"]["filesystem"]
+    fs["denyRead"] = [p for p in fs["denyRead"] if p not in (os.environ["HOME"], os.path.realpath(os.environ["HOME"]))]
+
+
+WALL_BROKEN = {
+    "unix-sockets-all": lambda c: c["sandbox"].setdefault("network", {}).update(allowAllUnixSockets=True),
+    "unix-sockets-listed": lambda c: c["sandbox"].setdefault("network", {}).update(allowUnixSockets=["/run/x"]),
+    "excluded-commands": lambda c: c["sandbox"].update(excludedCommands=["git"]),
+    "enabled-off": lambda c: c["sandbox"].update(enabled=False),
+    "fail-if-unavailable-off": lambda c: c["sandbox"].update(failIfUnavailable=False),
+    "unsandboxed-allowed": lambda c: c["sandbox"].update(allowUnsandboxedCommands=True),
+    "home-missing": drop_home,
+    "project-missing": lambda c: c["sandbox"]["filesystem"].update(allowRead=[]),
+    "exact-deny-missing": lambda c: c["sandbox"]["filesystem"]["denyRead"].remove("~/.ssh"),
+}
+
+
+@pytest.mark.parametrize("name", list(WALL_BROKEN))
+def test_wall_check_fails_when_the_wall_is_opened(box, capsys, monkeypatch, name):
+    fake(box, "claude")
+    tamper(monkeypatch, WALL_BROKEN[name])
+    code, out, _ = run(capsys, "canary", "--runner", "claude-code")
+    assert code == 1 and "fail  wall" in out, out
+    assert lines(box)[0]["runners"]["claude-code"]["checks"]["wall"] == "fail"
+    assert lines(box)[0]["ok"] is False
+
+
+def test_wall_check_passes_on_the_default_policy(box, capsys):
+    fake(box, "claude")
+    code, out, _ = run(capsys, "canary", "--runner", "claude-code")
+    assert code == 0 and "pass  wall" in out, out
+    assert lines(box)[0]["runners"]["claude-code"]["checks"]["wall"] == "pass"
+    (box / "work-1").mkdir()
+    assert canary.check_wall(claude_code, os.environ, box / "work-1")[0] == canary.PASS
+
+
+def test_wall_check_skips_for_opencode(box, capsys):
+    fake(box, "opencode")
+    code, out, _ = run(capsys, "canary", "--runner", "opencode")
+    assert code == 0 and "skip  wall" in out
+    assert lines(box)[0]["runners"]["opencode"]["checks"]["wall"] == "skip"
+
+
+@pytest.mark.parametrize(
+    ("error", "said"),
+    [(WsError("refused", "no", "x"), "refused"), (ValueError("a long message"), "ValueError")],
+)
+def test_wall_check_reports_the_error_kind_when_the_launch_copy_cannot_be_made(box, monkeypatch, error, said):
+    def boom(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(claude_code, "for_project", boom)
+    (box / "work-2").mkdir()
+    status, why = canary.check_wall(claude_code, os.environ, box / "work-2")
+    assert status == canary.FAIL and said in why  # the kind, found by type and not by reading the message
+    assert "long message" not in why

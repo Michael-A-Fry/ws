@@ -1,7 +1,7 @@
 """`ws doctor`: one line per check, each with a stable ID. Exit 0 only when nothing is failing or unconfigured.
 
 IDs never change meaning once released: WS0xx are the machine, profile, jobs, gate,
-sandbox, plugins, where ws keeps its files, what the runner needs of its hooks, the OS-user classes and the network of each data class, WS1xx are the roles
+sandbox, plugins, where ws keeps its files, what the runner needs of its hooks, the OS-user classes, the network of each data class and the settings keys the wall writes, WS1xx are the roles
 (one per role).
 """
 
@@ -229,21 +229,29 @@ def _version_tuple(text: str) -> tuple[int, ...] | None:
     return tuple(int(x) for x in m.groups()) if m else None
 
 
+def _claude_version(env) -> tuple[bool, str | None]:
+    """(is `claude` on PATH, what `claude --version` prints). The one probe WS011 and WS016 share; the version is None
+    when it did not run or printed nothing a version can be read from."""
+    from ws import run  # late, like WS101: it reports the version only
+
+    exe = shutil.which(RUNNERS["claude-code"], path=env.get("PATH"))
+    if not exe:
+        return False, None
+    return True, run.exe_version(exe, dict(env))
+
+
 def _hooks_check(prof: dict, env) -> list[Check]:
     """WS011: Claude Code is new enough for the gate's hooks to block when they fail (`onFailure`, from 2.1.295). Before
     that a hook that crashes or times out lets the call through. No line unless the profile's runner is Claude Code and
     `claude` is on PATH (WS101 reports a missing runner)."""
-    from ws import run  # late, like WS101: it reports the version only
-
     roles = prof.get("roles") if isinstance(prof.get("roles"), dict) else {}
     runner = roles.get("runner")
     if not isinstance(runner, dict) or runner.get("adapter") != "claude-code":
         return []
-    exe = shutil.which(RUNNERS["claude-code"], path=env.get("PATH"))
-    if not exe:
+    installed, version = _claude_version(env)
+    if not installed:
         return []
     need = ".".join(map(str, MIN_CLAUDE_HOOKS))
-    version = run.exe_version(exe, dict(env))
     found = _version_tuple(version) if version else None
     if found is None:
         detail = f"can't tell the Claude Code version, and the gate's hooks need {need} or newer to block on a failure"
@@ -331,6 +339,57 @@ def _egress_checks(env, kind: str, now=None) -> list[Check]:
             held = f", {len(plan.granted)} exception(s) in force" if plan.granted else ""
             out.append(Check("WS015", "egress", OK, f"{name}: network shut but for {n} host(s){held}"))
     return out
+
+
+def _wall_keys_check(env) -> list[Check]:
+    """WS016: Claude Code is new enough to read the settings keys the wall writes (wallsettings.MIN_CLAUDE, the one table of
+    key -> first version; the version is read as WS011 reads it). `ok` when it is, `warn` (update Claude Code) when it is
+    older, or when its version can't be read, and `ok` "not applicable" with no Claude Code on PATH. A second `warn` line
+    when `permissions.defaultMode` is `bypassPermissions` in the settings files in force (ws never writes it)."""
+    installed, version = _claude_version(env)
+    if not installed:
+        return [Check("WS016", "wall-keys", OK, "not applicable: Claude Code is not installed")]
+    try:
+        pol = policy.load(policy.policy_path(dict(env)))
+    except (policy.PolicyError, OSError):
+        pol = policy.default_policy()  # WS012 says the policy doesn't load; judge the keys the default policy writes
+    keys = wallsettings.keys_written(pol)
+    found = _version_tuple(version) if version else None
+    if not keys:
+        out = [Check("WS016", "wall-keys", OK, "the wall writes no settings key that needs a newer Claude Code")]
+        return out + _bypass_lines(env)
+    need = ", ".join(f"{k} ({'.'.join(map(str, wallsettings.MIN_CLAUDE[k]))})" for k in keys)
+    if found is None:
+        detail = f"can't tell the Claude Code version, and the wall writes keys that need a recent one: {need}"
+        out = [Check("WS016", "wall-keys", WARN, detail, "update Claude Code, then run `ws doctor` again")]
+    else:
+        old = [k for k in keys if found < wallsettings.MIN_CLAUDE[k]]
+        if old:
+            what = ", ".join(f"{k} (needs {'.'.join(map(str, wallsettings.MIN_CLAUDE[k]))})" for k in old)
+            detail = f"Claude Code {version} does not read {what}: that part of the wall is not in force"
+            out = [Check("WS016", "wall-keys", WARN, detail, "update Claude Code")]
+        else:
+            n = plural(len(keys), "wall key")
+            out = [Check("WS016", "wall-keys", OK, f"Claude Code {version} reads the {n} ws writes")]
+    return out + _bypass_lines(env)
+
+
+def _bypass_lines(env) -> list[Check]:
+    """The WS016 warning for `permissions.defaultMode: bypassPermissions` in the settings files in force (none otherwise)."""
+    from ws import status  # late: it pulls in the adapters and the globals scan
+
+    cwd = Path.cwd()
+    mode = status.permission_mode(ws_globals.find_repo(cwd) or cwd, dict(env))
+    if mode["mode"] != status.BYPASS_MODE:
+        return []
+    where = mode["source"]
+    detail = (
+        f"permissions.defaultMode is bypassPermissions in {where}: Claude Code runs a tool without asking "
+        "(the gate's deny rules and the sandbox still apply)"
+    )
+    return [
+        Check("WS016", "wall-keys", WARN, detail, f"take defaultMode out of {where}, or set it to a mode that asks")
+    ]
 
 
 def _layout_check(env) -> Check:
@@ -430,6 +489,10 @@ def run_checks(osi: OSInfo, profile_file: Path, env: dict | None = None, network
         checks += _egress_checks(env, osi.kind)
     except Exception as e:  # noqa: BLE001 (a broken check must report, not crash the whole doctor)
         checks.append(Check("WS015", "egress", FAIL, f"check crashed ({type(e).__name__})"))
+    try:
+        checks += _wall_keys_check(env)
+    except Exception as e:  # noqa: BLE001 (a broken check must report, not crash the whole doctor)
+        checks.append(Check("WS016", "wall-keys", FAIL, f"check crashed ({type(e).__name__})"))
     try:
         checks.append(_layout_check(env))
     except Exception as e:  # noqa: BLE001 (a broken check must report, not crash the whole doctor)

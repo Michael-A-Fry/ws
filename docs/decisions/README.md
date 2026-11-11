@@ -28,5 +28,7 @@ decisions weren't about the engine.
 | [0022](0022-reserve-before-a-run.md) | Reserve before a run, settle after it | accepted | 2026-11-08 |
 | [0023](0023-one-message-store-with-class-bodies-apart.md) | One message store, with the bodies of walled classes kept apart | accepted | 2026-11-08 |
 | [0024](0024-a-config-without-the-sandbox-stays-without-it.md) | A config written without the sandbox stays without it until the policy says so | accepted | 2026-11-09 |
+| [0025](0025-adopt-the-runner-sandbox-and-permission-keys.md) | Adopt the runner's own sandbox and permission keys, and write no wall of our own for Claude Code | accepted | 2026-11-12 |
+| [0026](0026-deny-the-home-in-the-launch-settings.md) | Deny the home folder in the Claude Code launch settings, and re-allow the project and what tools need | accepted | 2026-11-12 |
 
 To add one, copy the newest record, take the next number and add a row here.

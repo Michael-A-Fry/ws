@@ -23,6 +23,20 @@ neither does the `PT_DENY_ATTACH` call in the eval checker.
 - **What it means.** On a Mac, treat the wall as unproven. The gate (the runner's deny rules and the hook) still works.
 - **Workaround.** Run sensitive work on Linux or WSL2, or use Claude Code, which has its own sandbox on macOS.
 
+### The sandbox covers shell commands only
+
+Claude Code's sandbox confines the programs a shell command starts. Its own Read, Edit and Write tools, MCP tools and
+hooks don't run in it. They are covered by the permission rules (`permissions.deny`, written from the policy) and by the
+gate. Reads by Claude's file tools outside the working folders are held by
+`permissions.blockReadsOutsideWorkingDirectories` (Claude Code 2.1.257 and newer), which ws sets in the launch
+settings and in a class's managed-settings file, and never in your own settings file. `[gate] read_outside_project =
+true` leaves it out. `ws doctor` (WS016) warns when your Claude Code is too old to read it.
+
+- **What it means.** A Read of a path the policy doesn't deny, inside the working folders, is allowed whatever the
+  sandbox says. A hook or an MCP server runs with your account's reach.
+- **Workaround.** Put the paths you care about in `deny_read`, which ws writes as both a Read rule and a sandbox
+  `denyRead`. Keep MCP tools to the ones `allow_mcp` names.
+
 ### The secret wall is Linux with systemd only
 
 `ws secret wall` prints the steps for Linux with systemd. On macOS and WSL2 it refuses and says it's not built yet.
@@ -66,6 +80,26 @@ program the session starts can also write the `logs/` folder.
 
 - **What it means.** A stuck process can stop your jobs until you clear it.
 - **Workaround.** Find and stop the process that holds the lock, then run again. Use the wall.
+
+### Where the home folder is hidden
+
+In the settings that `ws gate launch --runner claude-code` writes, Claude Code's sandbox hides your home folder from every
+shell command, except the project, its git folders and the folders common tools need (`[gate] allow_read` adds more). A
+session started another way hides only the `deny_read` paths: an OpenCode session, and a Claude Code session started
+without `ws gate launch`, whose settings are the ones `ws install` merged into your own file.
+
+- **What it means.** Start Claude Code through `ws gate launch --runner claude-code -- claude` to have the home folder
+  hidden. A tool kept in a folder the defaults don't name can't be read from there until it is in `allow_read`.
+- **Workaround.** Add the folder to `allow_read` in the policy; the next launch reads it.
+- **Claude Code's own folder.** A shell command reads only `shell-snapshots/`, `skills/` and `plugins/` of it. A script
+  kept elsewhere in that folder can't be read until it is in `allow_read`.
+- **A tool's cache folder made during a session.** A folder a tool creates in the home folder after the session starts
+  (a new cache, say) can't be read until the session restarts, because the allow list is read at the start.
+- **Where the wall applies.** The home block and `deny_read` cover shell commands through the sandbox and Claude's file
+  tools through the permission rules, as in "The sandbox covers shell commands only"; a hook or an MCP server isn't held.
+- **A git folder outside the project.** A project whose `.git` is a file is followed out of the project only into the
+  `worktrees/` folder of its common git folder (a linked worktree). A `--separate-git-dir` folder is left out, so git
+  fails in that project until the folder is in `allow_read`.
 
 ### Reads are denied only for paths that exist at start
 

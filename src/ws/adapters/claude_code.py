@@ -35,8 +35,13 @@ confines every shell command Claude runs, whatever program it starts:
   * `filesystem.allowWrite`: the policy's allow_write, if it names any. Claude Code's own default (the project folder
     and its tmp; nothing else) is already an allow-list.
   * `filesystem.denyRead`: the deny_read rules that name a folder or file (ws.policy.sandbox_read_paths).
-  * `network.allowedDomains`: the policy's allow_hosts, only when the policy names some. Without them the sandbox
-    asks (interactive) or refuses (`-p`) for a host it has not been told about. A session of a data class started by
+  * `network.allowedDomains`: the policy's allow_hosts when it names some, else `DEFAULT_DOMAINS` (the runner's API
+    host and the common package indexes; a session started with `ws gate launch` also gets `FORGE_DOMAINS`, a headless
+    job does not), which only spares the prompts for hosts nearly every project uses:
+    a host on neither list still asks (interactive) or is refused (`-p`). The defaults are in the launch settings
+    only, never in the copy merged into a person's own `~/.claude/settings.json` (`user_scope`): Claude Code adds up
+    the lists of every settings scope, so a default host there would reach a class session too. With the sandbox off
+    there is no block and no list (ADR 0024). A session of a data class started by
     `ws gate launch` gets its own list instead (for_project): the class's allowed_hosts, its provider's host and the
     exceptions in force, so a class with none reaches nothing. The class file (ws.wallsettings) holds the same list as
     managed settings, with `allowManagedDomainsOnly`, so no other settings file adds a host.
@@ -48,7 +53,10 @@ runs pass `--setting-sources user` (ws run and the e2e), so a repo's `.claude/se
 hook (`preflight`) denies, with a plain message, every call made from a folder whose project or local settings turn the
 sandbox off or open it up, because an interactive session cannot be started with that flag by ws.
 The sandbox covers shell commands; Claude's own Read, Edit and Write tools are covered by the permission rules above and
-the hook, not by it. `env` carries WS_GATED_SESSION so `ws approve` knows it is being run from a gated session.
+the hook, not by it. Reads by those tools outside the working folders are held by
+`permissions.blockReadsOutsideWorkingDirectories` (Claude Code 2.1.257 and newer), set in the launch settings and the
+class file, never merged into a person's own settings file; the policy's `[gate] read_outside_project = true` leaves it
+out. Claude Code applies a `true` from any settings file, so a project's own settings cannot lift it. `env` carries WS_GATED_SESSION so `ws approve` knows it is being run from a gated session.
 
 Guards (ws.guards) add hooks, only for the events and tools the guards that are on need: PreToolUse matches more tools
 (Agent, Task, Skill, SendMessage) when a guard reads them; PostToolUse, SubagentStop and the prompt event run
@@ -96,12 +104,14 @@ import math
 import os
 import re
 import shlex
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 
 from ws import guards, jobs, paths, wallsettings
 from ws.adapters import Call, check_argv, client_argv, event_argv, protected_paths
 from ws.approvals import ENV_MARKER, SANDBOX_MARKER, ApprovalError
 from ws.approvals import _read_regular as read_regular
+from ws.output import WsError
 from ws.policy import Policy, native_patterns, sandbox_read_paths, sandbox_write_paths
 
 NAME = "claude-code"
@@ -119,6 +129,28 @@ USER_LOCKS = (
     "Edit(**/.mcp.json)",
     "Edit(**/.git/hooks/**)",
     "Edit(**/.git/config)",
+)
+# Hosts a sandboxed shell may reach without asking when the policy's allow_hosts names none: the runner's API host and
+# the common package indexes. Generic on purpose; allow_hosts replaces it, and a class session carries its class's list
+# instead (`with_hosts`). The forges are not here: a headless job (`ws run`) reads this list as it stands, and a
+# prompt-injected job that can reach a forge can push the project to it (ADR 0025). `FORGE_DOMAINS` are added only for a
+# session started with `ws gate launch` (`for_project`), where a person is at the terminal.
+DEFAULT_DOMAINS = (
+    "api.anthropic.com",
+    "pypi.org",
+    "files.pythonhosted.org",
+    "registry.npmjs.org",
+    "crates.io",
+    "index.crates.io",
+    "static.crates.io",
+)
+FORGE_DOMAINS = (
+    "github.com",
+    "api.github.com",
+    "codeload.github.com",
+    "raw.githubusercontent.com",
+    "objects.githubusercontent.com",
+    "gitlab.com",
 )
 # Claude Code's hook event names, as ws.guards names them.
 EVENT_NAMES = {
@@ -226,8 +258,13 @@ def _path(path: str) -> str:
     return f"/{path}" if path.startswith("/") else path
 
 
-def sandbox_block(policy: Policy, out: Path, policy_file: Path, protect: tuple[str, ...] = ()) -> dict:
-    """The `sandbox` settings: see the module docstring for what each key is for."""
+def sandbox_block(
+    policy: Policy, out: Path, policy_file: Path, protect: tuple[str, ...] = (), *, defaults: bool = True
+) -> dict:
+    """The `sandbox` settings: see the module docstring for what each key is for. `defaults` False (the block merged
+    into a person's own settings file) leaves `DEFAULT_DOMAINS` out: Claude Code concatenates array settings across
+    scopes, so a default host in that file would be added to a class session's own list (`with_hosts` replaces the
+    list only in the `--settings` copy). The person's own allow_hosts still go in, as they always did."""
     home = str(Path(policy_file).parent)
     fs: dict = {"denyWrite": list(dict.fromkeys([home, *protected_paths(out, policy_file, protect)]))}
     if policy.gate.deny_read:
@@ -241,14 +278,23 @@ def sandbox_block(policy: Policy, out: Path, policy_file: Path, protect: tuple[s
         "allowUnsandboxedCommands": False,
         "filesystem": fs,
     }
-    if policy.gate.allow_hosts:
-        block["network"] = {"allowedDomains": list(policy.gate.allow_hosts)}
+    hosts = policy.gate.allow_hosts or (DEFAULT_DOMAINS if defaults else ())
+    if hosts:
+        block["network"] = {"allowedDomains": list(hosts)}
     return block
 
 
 def preflight(payload: dict) -> str | None:
-    """A reason to deny every call from this project: a `.claude/settings.json` or `settings.local.json`, in the project
-    folder or any folder above it, that turns the sandbox off or opens it up (see the module docstring). The project
+    """The reason `preflight_refusal` finds, as the one line the gate prints: the message, then what to delete or run."""
+    e = preflight_refusal(payload)
+    return f"{e.message}. To fix it: {e.hint}" if e else None
+
+
+def preflight_refusal(payload: dict) -> WsError | None:
+    """A reason to deny every call from this project, as a typed error (kind `project_settings_widen_sandbox` or
+    `project_settings_unreadable`, each with a hint naming the file and what to delete): a `.claude/settings.json` or
+    `settings.local.json`, in the project folder or any folder above it, that turns the sandbox off or opens it up (see
+    the module docstring). The project
     folder is CLAUDE_PROJECT_DIR (set for hooks; Claude reads project settings from there, wherever the session has since
     changed to) and the payload's cwd. A file that does not parse is ignored, as Claude Code ignores it. A settings
     file that is not a plain file (a link, a FIFO), is too big or cannot be read is a deny: it is read without following a
@@ -276,14 +322,23 @@ def preflight(payload: dict) -> str | None:
             try:
                 conf = json.loads(read_regular(f, 1 << 20))
             except ApprovalError as e:
-                return f"{f} is not a plain readable settings file ({e}); blocked to be safe"
+                return WsError(
+                    "project_settings_unreadable",
+                    f"{f} is not a plain readable settings file ({e}); blocked to be safe",
+                    f"make it a plain JSON file under 1 MB, or delete it with `rm {shlex.quote(str(f))}`",
+                    details={"file": str(f)},
+                )
             except ValueError:
                 continue
             key = _widens_sandbox(conf, os.environ.get(EGRESS_MARKER) == "1")
             if key:
-                return (
-                    f"{f} sets sandbox.{key}, which would open the sandbox ws generated: take it out of the project "
-                    "settings (ws gated runs start with --setting-sources user and never load it)"
+                name = key.split(" ")[0]  # "enabled = false" -> the key, "network.allowedDomains" as it is
+                return WsError(
+                    "project_settings_widen_sandbox",
+                    f"{f} sets sandbox.{key}, which would open the sandbox ws generated",
+                    f"delete `sandbox.{name}` from {f} (ws gated runs start with --setting-sources user and never "
+                    "load it)",
+                    details={"file": str(f), "key": f"sandbox.{name}"},
                 )
     return None
 
@@ -336,10 +391,123 @@ def with_hosts(settings: str, hosts: list[str]) -> str:
     return json.dumps(conf, indent=2) + "\n"
 
 
-def for_project(settings: str, project: str, hosts: list[str] | None = None) -> str:
+def _xdg(env: Mapping[str, str], var: str, home: str, rel: str) -> str:
+    """An XDG folder as the launching shell has it (absolute values only, as the spec says), else its default."""
+    value = env.get(var, "")
+    return value if value.startswith("/") else os.path.join(home, rel)
+
+
+def _home_spellings(env: Mapping[str, str]) -> list[str]:
+    """The home folder as a real path and, when it differs (a symlinked /home), as it is spelled: both are written to the
+    settings, because the sandbox may meet it either way."""
+    home = env.get("HOME") or str(Path.home())
+    return list(dict.fromkeys([os.path.realpath(home), os.path.normpath(os.path.abspath(home))]))
+
+
+def _under(path: str, folder: str) -> bool:
+    return path == folder or path.startswith(folder.rstrip("/") + "/")
+
+
+# What a sandboxed shell command reads from the runner's state folder (`read_defaults`).
+STATE_READABLE = ("shell-snapshots", "skills", "plugins")
+
+
+def read_defaults(env: Mapping[str, str]) -> tuple[list[str], list[str]]:
+    """(allow, deny) for the home folder's minimum: what a sandboxed shell needs from it to run the common tools, as
+    absolute paths resolved from HOME and the XDG variables of the launching shell. `allow` is the three parts of the
+    runner's state folder a shell command needs (`STATE_READABLE`: `shell-snapshots/`, which every sandboxed command
+    sources, and `skills/` and `plugins/`, which Claude Code's sandboxing page names as what commands need), never the
+    folder whole: its settings, history, transcripts, IDE locks and sign-in file stay unreadable from the shell, and the
+    runner reads its own state outside the sandbox, so that cannot break it. It also holds the uv, npm, cargo, rustup
+    and Go folders, `~/.local/bin` and `~/.local/lib`, git's own config; the rest of `~/.local` is left out, since
+    `~/.local/share` holds other tools' sign-in files. `deny` is the credential files inside those folders. Which of
+    `allow` exist is the caller's to check."""
+    home = os.path.normpath(os.path.abspath(env.get("HOME") or str(Path.home())))
+    config = _xdg(env, "XDG_CONFIG_HOME", home, ".config")
+    cache = _xdg(env, "XDG_CACHE_HOME", home, ".cache")
+    data = _xdg(env, "XDG_DATA_HOME", home, ".local/share")
+    state = env.get("CLAUDE_CONFIG_DIR", "")
+    state = os.path.normpath(state) if state.startswith("/") else os.path.join(home, ".claude")
+    allow = [
+        *(os.path.join(state, part) for part in STATE_READABLE),
+        os.path.join(cache, "uv"),
+        os.path.join(home, ".npm"),
+        os.path.join(home, ".cargo"),
+        os.path.join(home, ".rustup"),
+        os.path.join(home, "go"),
+        os.path.join(cache, "go-build"),
+        os.path.join(home, ".local", "bin"),
+        os.path.join(home, ".local", "lib"),
+        os.path.join(data, "uv"),
+        os.path.join(home, ".gitconfig"),
+        os.path.join(config, "git"),
+    ]
+    deny = [
+        os.path.join(state, ".credentials.json"),
+        os.path.join(home, ".cargo", "credentials"),
+        os.path.join(home, ".cargo", "credentials.toml"),
+        os.path.join(config, "git", "credentials"),
+    ]
+    return allow, deny
+
+
+def _absolute(path: str, home: str) -> str:
+    """`~/x` or `/x` as an absolute path under `home`."""
+    return home + path[1:] if path == "~" or path.startswith("~/") else path
+
+
+def deny_home(
+    conf: dict, project: str, allow_read: Iterable[str], deny_read: Iterable[str], env: Mapping[str, str]
+) -> None:
+    """Add deny-home to the `sandbox.filesystem` of `conf` (a launch copy with a sandbox block): the home folder in
+    `denyRead`, and in `allowRead` the project, its git folders outside it, the defaults of `read_defaults` and the
+    policy's own `allow_read`. Every path is absolute: in a `--settings` file `.` means `~/.claude`, so none is relative.
+    Claude Code keeps an exact `denyRead` path blocked inside a broader `allowRead`, so the deny_read paths and the
+    credential files of the defaults stay hidden (each with its real path too, so a link cannot reach it). An entry is left out when it is not there (nothing to read), or when
+    its real path is the home folder, above it, or a denied path: a link cannot re-open what it names."""
+    from ws import sandbox  # here, not at the top: ws.sandbox imports the adapters
+
+    fs = conf["sandbox"].setdefault("filesystem", {})
+    homes = _home_spellings(env)
+    defaults, credentials = read_defaults(env)
+    exact = [_absolute(p, homes[0]) for p in (*fs.get("denyRead", []), *deny_read)]
+    exact_real = [os.path.realpath(e) for e in exact]  # a link in a deny path must not be read through its real folder
+    denied = [*exact, *exact_real, *(os.path.realpath(c) for c in credentials)]
+
+    def allowed(path: str) -> str | None:
+        real = os.path.realpath(path)
+        if not os.path.lexists(real) or any(real == h or h.startswith(real.rstrip("/") + "/") for h in homes):
+            return None
+        return None if any(_under(real, d) for d in denied) else real
+
+    deny = [*fs.get("denyRead", []), *deny_read, *homes]
+    deny += [_absolute(p, h) for p in (*fs.get("denyRead", []), *deny_read) if p.startswith("~/") for h in homes]
+    deny += [*credentials, *(os.path.realpath(c) for c in credentials), *exact_real]
+    folders = [project, *sandbox.git_read_folders(project), *defaults, *(_absolute(p, homes[0]) for p in allow_read)]
+    fs["denyRead"] = list(dict.fromkeys(deny))
+    fs["allowRead"] = list(dict.fromkeys([*fs.get("allowRead", []), *filter(None, map(allowed, folders))]))
+
+
+def for_project(
+    settings: str,
+    project: str,
+    hosts: list[str] | None = None,
+    *,
+    allow_read: Iterable[str] = (),
+    deny_read: Iterable[str] = (),
+    env: Mapping[str, str] | None = None,
+    forges: bool = False,
+) -> str:
     """The generated settings text with the project's locked paths added to the sandbox `denyWrite`, absolute: what
     `ws gate launch --runner claude-code` starts claude with. The shared settings cannot hold them (see the docstring).
-    `hosts`, when given, are applied by `with_hosts` (ValueError if there is no sandbox block to hold them)."""
+    `hosts`, when given, are applied by `with_hosts` (ValueError if there is no sandbox block to hold them).
+
+    The launch copy also hides the home folder (`deny_home`): `allow_read` is the policy's `[gate] allow_read` and
+    `deny_read` its exact deny_read paths (ws.policy.launch_read_rules), both `~/x` or `/x`; `env` is the launching
+    shell's environment (default: this process's), where HOME and the XDG folders come from. Settings with no sandbox
+    block (`[gate] sandbox = false`, ADR 0024) get none of this. `forges` adds `FORGE_DOMAINS` to the default list the
+    block carries (a session at a terminal; a headless job never has them) and does nothing when the block carries no
+    list or `hosts` replaces it."""
     from ws import sandbox  # here, not at the top: ws.sandbox imports the adapters
 
     if hosts is not None:
@@ -347,8 +515,12 @@ def for_project(settings: str, project: str, hosts: list[str] | None = None) -> 
     conf = json.loads(settings)
     if "sandbox" not in conf:  # the policy switched the sandbox off: there is no block to add the project's paths to
         return json.dumps(conf, indent=2) + "\n"
+    net = conf["sandbox"].get("network")
+    if forges and hosts is None and net and net.get("allowedDomains"):
+        net["allowedDomains"] = list(dict.fromkeys([*net["allowedDomains"], *FORGE_DOMAINS]))
     fs = conf["sandbox"].setdefault("filesystem", {})
     fs["denyWrite"] = list(dict.fromkeys([*fs.get("denyWrite", []), *sandbox.claude_denied_paths(project)]))
+    deny_home(conf, project, allow_read, deny_read, os.environ if env is None else env)
     return json.dumps(conf, indent=2) + "\n"
 
 
@@ -385,10 +557,14 @@ def generate(
         shlex.join(client_argv("check", check_argv(ws_cmd, NAME, policy_file, out, protect, pin), pin)) + " || exit 2"
     )
     matcher = _matcher(guards.kinds_for(policy.guards.on, "pre") & set(_EXTRA_PRE_KINDS), tuple(MATCHER.split("|")))
+    permissions: dict = {"deny": list(dict.fromkeys(deny)), wallsettings.BYPASS_KEY: wallsettings.BYPASS_OFF}
+    if not user_scope and not policy.gate.read_outside_project:
+        # never in a person's own settings file (user_scope): it would bind every Claude Code session they start
+        permissions[wallsettings.READ_BLOCK_KEY] = True
     settings = {
-        "permissions": {"deny": list(dict.fromkeys(deny)), wallsettings.BYPASS_KEY: wallsettings.BYPASS_OFF},
+        "permissions": permissions,
         # `sandbox = false` in the policy: no block, and the marker says so (the hook then skips the preflight)
-        **({"sandbox": sandbox_block(policy, out, policy_file, protect)} if wall else {}),
+        **({"sandbox": sandbox_block(policy, out, policy_file, protect, defaults=not user_scope)} if wall else {}),
         "env": {ENV_MARKER: "1", SANDBOX_MARKER: "1" if wall else "0"},
         "hooks": {
             "PreToolUse": [

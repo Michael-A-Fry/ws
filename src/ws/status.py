@@ -6,6 +6,12 @@ scan as `ws globals check` (src/ws/globals.py); the rules, settings and MCP file
 file that is not there is not listed. Only names and sizes are read, plus the key names of a JSON settings file (which
 hooks and MCP servers it sets); no file content is shown.
 
+Two more facts come from the settings files, each as a small object in the data: `sandbox` (is Claude Code's sandbox on,
+may a command run outside it, does it refuse to start without it, and which file says so) and `permission_mode` (the
+`permissions.defaultMode` in force and its file, the highest-precedence file winning). They are read without following a
+link, capped in size and never shown in full; a file that does not read or parse is named under `unreadable`, not a crash.
+ws never writes `defaultMode`: this only reports it.
+
 A path is listed once per runner, and a skill folder with no main file is shown as a folder (a trailing `/`). The text
 output goes through `style.py`; `--json` is the same data with a `folder` flag on each row.
 """
@@ -18,8 +24,10 @@ import os
 import sys
 from pathlib import Path
 
-from ws import adapters, output
+from ws import adapters, output, paths, wallsettings
 from ws import globals as ws_globals
+from ws.approvals import SANDBOX_MARKER, ApprovalError
+from ws.approvals import _read_regular as read_regular
 from ws.style import Style, pad, plural
 
 # runner -> (kind, name below the user config folder, name below the repo). Kinds: rules, settings, mcp.
@@ -101,6 +109,86 @@ def _once(rows: list[dict]) -> list[dict]:
     return out
 
 
+MAX_SETTINGS_BYTES = 1 << 20
+BYPASS_MODE = "bypassPermissions"
+# Claude Code ignores these modes when a project or local settings file sets them: only the person's own file (or a
+# managed one) can switch them on.
+_PERSONAL_ONLY_MODES = (BYPASS_MODE, "auto")
+
+
+def _settings(path: Path) -> tuple[dict | None, str | None]:
+    """(the settings in `path`, None), or (None, why not): not a plain file (a link, a FIFO), too big, unreadable or not a
+    JSON object. Opened without following a link and without blocking, as the hook does."""
+    try:
+        doc = json.loads(read_regular(path, MAX_SETTINGS_BYTES))
+    except ApprovalError as e:
+        return None, str(e)
+    except ValueError:
+        return None, "not valid JSON"
+    return (doc, None) if isinstance(doc, dict) else (None, "not a JSON object")
+
+
+def _flag(value) -> bool | None:
+    return value if isinstance(value, bool) else None
+
+
+def sandbox_state(env: dict) -> dict:
+    """`{enabled, allowUnsandboxedCommands, failIfUnavailable, source}` from the settings ws generated: the runner's user
+    settings when they carry ws's entries (the WS_SANDBOXED marker), else `<state>/gate/claude-code/settings.json`, else
+    all null. `source` is the file read. A settings file with ws's entries but no sandbox block is `enabled: false`
+    (the policy's `sandbox = false`). A file that does not read is listed under `unreadable` and the next one is tried."""
+    layout = adapters.get("claude-code").GLOBALS
+    user = ws_globals.user_dir(layout, env) / "settings.json"
+    generated = paths.state_dir(env) / "gate" / "claude-code" / "settings.json"
+    state: dict = {"enabled": None, "allowUnsandboxedCommands": None, "failIfUnavailable": None, "source": None}
+    bad: list[str] = []
+    for path, needs_marker in ((user, True), (generated, False)):
+        if not os.path.lexists(path):
+            continue
+        doc, why = _settings(path)
+        if doc is None:
+            bad.append(f"{path}: {why}")
+            continue
+        marker = doc["env"].get(SANDBOX_MARKER) if isinstance(doc.get("env"), dict) else None
+        if needs_marker and marker not in ("0", "1"):
+            continue  # the person's own file, with no ws entries: nothing of ws's to report
+        block = doc.get("sandbox") if isinstance(doc.get("sandbox"), dict) else None
+        state["source"] = str(path)
+        if block is None:
+            state["enabled"] = False
+        else:
+            for key in ("enabled", "allowUnsandboxedCommands", "failIfUnavailable"):
+                state[key] = _flag(block.get(key))
+        break
+    return {**state, **({"unreadable": bad} if bad else {})}
+
+
+def permission_mode(repo: Path, env: dict) -> dict:
+    """`{mode, source}`: the `permissions.defaultMode` in force, from the managed, project (local first) and user settings
+    files, the highest precedence winning. Both null when no file sets one. A project or local file's `bypassPermissions`
+    or `auto` is skipped: Claude Code ignores those modes from there. Files that do not read are under `unreadable`."""
+    layout = adapters.get("claude-code").GLOBALS
+    ranked = [  # lowest precedence first
+        (ws_globals.user_dir(layout, env) / "settings.json", False),
+        (repo / ".claude" / "settings.json", True),
+        (repo / ".claude" / "settings.local.json", True),
+        *((f, False) for f in wallsettings.managed_files()),
+    ]
+    mode, source, bad = None, None, []
+    for path, project in ranked:
+        if not os.path.lexists(path):
+            continue
+        doc, why = _settings(path)
+        if doc is None:
+            bad.append(f"{path}: {why}")
+            continue
+        perms = doc.get("permissions")
+        value = perms.get("defaultMode") if isinstance(perms, dict) else None
+        if isinstance(value, str) and value and not (project and value in _PERSONAL_ONLY_MODES):
+            mode, source = value, str(path)
+    return {"mode": mode, "source": source, **({"unreadable": bad} if bad else {})}
+
+
 def collect(start: Path, env: dict | None = None) -> dict:
     env = dict(os.environ) if env is None else env
     repo = ws_globals.find_repo(start) or start
@@ -130,6 +218,8 @@ def collect(start: Path, env: dict | None = None) -> dict:
         "repo": str(repo),
         "runners": runners,
         "total_bytes": sum(r["bytes"] for rows in runners.values() for r in rows),
+        "sandbox": sandbox_state(env),
+        "permission_mode": permission_mode(repo, env),
         "errors": errors,
     }
 
@@ -149,8 +239,35 @@ def render(data: dict, st: Style | None = None) -> str:
             origin = pad(st.warn(r["origin"]) if r["origin"] == "override" else st.muted(r["origin"]), 8)
             path = r["path"] + ("/" if r.get("folder") else "")
             out.append(f"  {origin} {r['kind']:<9} {r['bytes']:>8,}  {path}{extra}")
+    out += _wall_lines(data, st)
     out += [f"{st.status('fail', 'error')}: {e}" for e in data["errors"]]
     return "\n".join(out)
+
+
+def _wall_lines(data: dict, st: Style) -> list[str]:
+    """The sandbox line and the permission mode line (nothing for data from before they existed). Bypass is flagged."""
+    out: list[str] = []
+    sb = data.get("sandbox")
+    if sb:
+        words = {True: "on", False: "off", None: "not set"}[sb.get("enabled")]
+        retry = {False: "no retry outside it", True: st.warn("a failed command may retry outside it")}
+        if sb.get("allowUnsandboxedCommands") in retry:
+            words += f", {retry[sb['allowUnsandboxedCommands']]}"
+        if sb.get("failIfUnavailable") is True:
+            words += ", Claude Code refuses to start without it"
+        where = f" ({sb['source']})" if sb.get("source") else ""
+        out.append(f"{st.muted('sandbox:')} {words}{where}")
+        out += [f"{st.status('warn', 'unreadable')}: {u}" for u in sb.get("unreadable", [])]
+    pm = data.get("permission_mode")
+    if pm:
+        mode = pm.get("mode")
+        where = f" ({pm['source']})" if pm.get("source") else ""
+        if mode == BYPASS_MODE:
+            out.append(f"{st.muted('permission mode:')} {st.warn(mode)}{where}: nothing asks before it runs")
+        else:
+            out.append(f"{st.muted('permission mode:')} {mode or 'not set (Claude Code asks)'}{where}")
+        out += [f"{st.status('warn', 'unreadable')}: {u}" for u in pm.get("unreadable", [])]
+    return out
 
 
 def cmd_status(args: argparse.Namespace) -> int:

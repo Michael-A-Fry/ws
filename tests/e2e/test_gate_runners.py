@@ -161,7 +161,14 @@ def claude_settings(tmp_path, layer: str) -> Path:
 
 
 def claude_run(
-    tmp_path, stub, settings, bare: bool, work, sources: str | None = "user", extra_env: dict | None = None
+    tmp_path,
+    stub,
+    settings,
+    bare: bool,
+    work,
+    sources: str | None = "user",
+    extra_env: dict | None = None,
+    add_dirs: tuple[Path, ...] = (),
 ) -> subprocess.CompletedProcess:
     env = base_env(tmp_path)
     env.update(extra_env or {})
@@ -182,16 +189,20 @@ def claude_run(
     ]
     if sources:  # as `ws run` does: a repo's own .claude/settings*.json must not widen the generated sandbox
         cmd += ["--setting-sources", sources]
+    for d in (
+        add_dirs
+    ):  # a working directory, so the read block (blockReadsOutsideWorkingDirectories) leaves it to deny_read
+        cmd += ["--add-dir", str(d)]
     if bare:
         cmd.append("--bare")
     return run(cmd, env, work)
 
 
-def claude_go(tmp_path, work, layer: str, calls: list[Call]):
+def claude_go(tmp_path, work, layer: str, calls: list[Call], add_dirs: tuple[Path, ...] = ()):
     settings = claude_settings(tmp_path, layer)
     stub = AnthropicStub(calls)
     with stub:
-        proc = claude_run(tmp_path, stub, settings, layer == "native", work)  # --bare skips hooks
+        proc = claude_run(tmp_path, stub, settings, layer == "native", work, add_dirs=add_dirs)  # --bare skips hooks
     return stub, proc, settings.parent
 
 
@@ -212,14 +223,18 @@ def test_claude_code_still_runs_an_allowed_command(tmp_path, work, layer):
 
 @pytest.mark.parametrize("layer", ["native", "hook"])
 def test_claude_code_cannot_read_a_denied_file(tmp_path, work, secrets, layer):
-    stub, proc, _ = claude_go(tmp_path, work, layer, [Call("Read", {"file_path": str(secrets["denied"])})])
+    stub, proc, _ = claude_go(
+        tmp_path, work, layer, [Call("Read", {"file_path": str(secrets["denied"])})], add_dirs=(tmp_path / "home",)
+    )
     assert_all_blocked(stub, proc)
     assert secrets["canary"] not in " ".join(stub.tool_results())
 
 
 @pytest.mark.parametrize("layer", ["native", "hook"])
 def test_claude_code_still_reads_an_allowed_file(tmp_path, work, secrets, layer):
-    stub, proc, _ = claude_go(tmp_path, work, layer, [Call("Read", {"file_path": str(secrets["ok"])})])
+    stub, proc, _ = claude_go(
+        tmp_path, work, layer, [Call("Read", {"file_path": str(secrets["ok"])})], add_dirs=(tmp_path / "home",)
+    )
     assert secrets["plain"] in " ".join(stub.tool_results()), f"control read failed\n{where(proc)}"
 
 

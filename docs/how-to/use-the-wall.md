@@ -60,12 +60,109 @@ Step 3 prints `touch: cannot touch '...': Read-only file system` and exits with 
 [Troubleshoot](troubleshoot.md). `--no-sandbox` starts the runner bare and prints what that gives up. Don't use it for
 real work.
 
+## Deny the home folder
+
+A Claude Code session started with `ws gate launch --runner claude-code -- claude` can't read your home folder from a
+shell command, except the project and what common tools need. This is Claude Code's own sandbox, set by the copy of the
+settings that `ws gate launch` writes for the project at each start (`sandbox.filesystem.denyRead` and `allowRead`; see
+[decision 0026](../decisions/0026-deny-the-home-in-the-launch-settings.md)). It needs Claude Code 2.1.78 or newer, and
+`ws doctor` (WS016) warns when yours is older.
+
+What a shell command can read in your home folder by default:
+
+- the project folder you started in, and its git folders when they sit outside it (a linked worktree, a separate git
+  folder)
+- three parts of Claude Code's own folder (`~/.claude`, or `CLAUDE_CONFIG_DIR`): `shell-snapshots/`, which every command
+  sources, and `skills/` and `plugins/`. Its settings, history, transcripts and the rest stay hidden
+- the tool folders `~/.cache/uv`, `~/.npm`, `~/.cargo`, `~/.rustup`, `~/go`, `~/.cache/go-build`, `~/.local/bin`,
+  `~/.local/lib` and `~/.local/share/uv`, and git's
+  config (`~/.gitconfig`, `~/.config/git`). The XDG variables of the shell you start from decide where the cache, data and
+  config ones are. A folder that isn't there is left out.
+
+Everything else is hidden, `~/.local/share` included, because it holds other tools' sign-in files. The credential files
+inside the folders above stay hidden too: `~/.cargo/credentials`, `credentials.toml` and git's `credentials` file
+(Claude Code's own `.credentials.json` is named as hidden besides). So do your `deny_read` paths. Write access is as before.
+
+To let sessions read another folder, such as a Node version manager or a shared data folder, name it under `[gate]` in
+the policy and start the session again (the settings are made at each start):
+
+```toml
+[gate]
+allow_read = ["~/.nvm", "~/data/shared"]
+```
+
+An entry is a folder or file, absolute or under `~/`, with no wildcard. A bad entry stops the policy loading, and the
+error names it. An entry can't be your home folder, a folder above it, `/` or a `deny_read` path, or inside one. A
+folder above a `deny_read`
+path is fine: that path stays hidden.
+
+A session started another way (an OpenCode session, or `claude` without `ws gate launch`) hides only the `deny_read`
+paths. With `[gate] sandbox = false` there is no sandbox block, so nothing is hidden.
+
+### Switch it on and off
+
+Run these in a terminal of your own; a session can't (they are admin commands).
+
+- **On.** `ws install --runner claude-code` (add `--yes` to skip the question). It first copies your
+  `~/.claude/settings.json` to the `backups/` folder in ws's state folder, then writes the generated settings and merges
+  ws's block into your file. Sessions started with `ws gate launch --runner claude-code -- claude` then have the home
+  hidden. On a machine that already has ws, install the newer ws, then run `ws upgrade --hooks-only`, which rewrites the
+  generated files with it and downloads nothing.
+- **Off.** `ws uninstall --yes` puts your `~/.claude/settings.json` back byte for byte when you haven't changed it since
+  (if you have, it takes out only ws's entries) and removes the generated settings. `ws gate launch --runner claude-code`
+  then refuses until you run `ws install` again. `ws install --gate launch` is the lighter undo: it takes ws's entries out
+  of your own file, so plain `claude` sessions are no longer gated, and keeps the generated settings, so launched
+  sessions still have the home hidden.
+
+There is no switch for the home alone. To start one session without any wall use `--no-sandbox`, which says what that
+gives up; to leave the sandbox out for good, set `sandbox = false` under `[gate]` and run `ws install` again.
+
+`ws canary --runner claude-code` has a `wall` check: it makes the launch settings as `ws gate launch` makes them and fails
+if the home is no longer hidden, the project isn't re-allowed, a `deny_read` path is missing, or the sandbox gained an
+unsandboxed route (an excluded command, a Unix socket).
+
+### Test notes
+
+The switch on and off, and the upgrade command, were rehearsed in a scratch `HOME` and `WS_HOME` with the sandbox on
+(`tests/test_sandbox_deny_home.py`; nothing touched the real home). The steps, in order:
+
+1. a settings file of the test's own at `~/.claude/settings.json`
+2. `ws install --yes --runner claude-code`: exit 0, the block is in the file, the first copy is under `backups/`, and the
+   launch settings made from the generated file hide the home
+3. `ws upgrade --hooks-only`: exit 0, nothing to rewrite, the block still in the file
+4. `ws uninstall --yes`: your file is back as it was, and the generated settings are gone
+
+`ws upgrade` refuses to run inside an agent session, so the test runs it as a person at a terminal would.
+
 ## What else the wall settings do
 
 - Bypass mode is off in the settings ws passes to Claude Code and in the ones `ws install` merges into your own file:
   `permissions.disableBypassPermissionsMode` is `"disable"`, so `--dangerously-skip-permissions` is refused while a
   gated session runs. If your own file sets that key to anything else, `ws install` refuses and changes nothing; change
   your value to match.
+- File reads stay in the working folders. `permissions.blockReadsOutsideWorkingDirectories` is `true` in the settings ws
+  passes to Claude Code (`ws gate launch`, `ws gate generate` and headless `ws run` jobs) and in a class's
+  managed-settings file, so Claude's Read, Grep and Glob tools refuse a path outside the folders the session works in,
+  in every permission mode. It needs Claude Code 2.1.257 or newer; `ws doctor` (WS016) warns when yours is older. ws
+  never writes it into your own settings file, because it would bind every Claude Code session you start. To let a
+  gated session read outside its folders, set `read_outside_project = true` under `[gate]` in the policy and
+  regenerate. A project's own settings can't lift the block: Claude Code applies a `true` from any settings file. A class
+  file placed before this key existed shows a WS014 `read block` warning until you place it again with
+  `ws install --class NAME`.
+- Hosts a sandboxed command may reach without asking. When `allow_hosts` names none, the sandbox block carries a short
+  default list: `api.anthropic.com`, PyPI (`pypi.org`, `files.pythonhosted.org`), the npm registry
+  (`registry.npmjs.org`) and crates.io (`crates.io`, `index.crates.io`, `static.crates.io`). A session started with
+  `ws gate launch` also gets GitHub (`github.com`, `api.github.com`, `codeload.github.com`, `raw.githubusercontent.com`,
+  `objects.githubusercontent.com`) and `gitlab.com`; a headless `ws run` job does not, because a prompt-injected job that
+  can reach a forge can push the project there (name the forge in `allow_hosts` if a job needs it). It only spares the
+  prompts: a host on neither list still asks in an interactive session and is refused in
+  `claude -p`. `allow_hosts` replaces the list, so name every host you want. A class session never carries it: it gets
+  its class's list, and a class with none reaches nothing. With `sandbox = false` there is no block and no list. The list
+  is for sessions ws starts; `ws install` does not add it to your own settings file (Claude Code adds up the lists of
+  every settings scope, so a default host there would also reach a class session). Hosts you name in `allow_hosts` are
+  merged into your file, yours first, and the undo takes ws's entries out again.
+- `ws status` shows the sandbox and permission mode in force, read from the settings files; `ws doctor` (WS016) warns when
+  `permissions.defaultMode` is `bypassPermissions`. ws never writes `defaultMode`.
 - For OpenCode, ws puts its deny rules after yours in each `permission` block of your config, because OpenCode takes the
   last rule that matches. A broader `allow` of yours can't sit after a deny ws adds.
 - To give a class its own operating-system account, see [Set up a class user](set-up-a-class-user.md).

@@ -74,7 +74,7 @@ that looks like a path goes through `deny_read`, and through the protected-write
 writes, so an allowed file tool still can't read a sealed folder. Arguments too deeply nested or too many to read are a
 deny. On Claude Code the hook runs for every MCP tool. OpenCode's hook payload can't tell an MCP tool from a built-in
 one, so there only a `deny_tools` entry with a literal server name is enforced (see
-[known limits](known-limits.md#opencode-cannot-tell-mcp-tools-from-its-own)). The reasoning is in
+[known limits](known-limits.md#opencode-cant-tell-mcp-tools-from-its-own)). The reasoning is in
 [decision 0021](../decisions/0021-the-gate-judges-mcp-tool-calls.md).
 
 ## What the gate doesn't stop

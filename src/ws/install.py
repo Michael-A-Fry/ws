@@ -637,9 +637,10 @@ def forget(paths: Iterable[Path], env: Mapping[str, str] | None = None) -> None:
 # ---- writing ---------------------------------------------------------------------------------------------------------
 
 
-def _write_atomic(path: Path, data: bytes, mode: int | None = None) -> None:
+def write_atomic(path: Path, data: bytes, mode: int | None = None) -> None:
     """Write beside the target, fsync, set the mode, then rename over it. No temp file survives a failure. The mode is
-    `mode` when given, else the target's own, else the umask's."""
+    `mode` when given, else the target's own, else the umask's. Public: the one whole-or-nothing file write other
+    modules use; `_write_atomic` is the same function, the name this module's own callers (and its tests) patch."""
     if mode is None:
         try:
             mode = stat.S_IMODE(os.stat(path).st_mode)
@@ -660,6 +661,9 @@ def _write_atomic(path: Path, data: bytes, mode: int | None = None) -> None:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
         raise
+
+
+_write_atomic = write_atomic
 
 
 def _same_toml(a: bytes, b: bytes) -> bool:
@@ -1149,7 +1153,7 @@ def class_text(name: str, env: Mapping[str, str]) -> tuple[policy.Class, str]:
             f'add os_user = "..." under [classes.{name}] in {pol_file}, then run this again',
             2,
         )
-    return cls, wallsettings.install_text(cls, env, osinfo.detect(env=dict(env)).kind)
+    return cls, wallsettings.install_text(cls, env, osinfo.detect(env=dict(env)).kind, pol)
 
 
 def _cmd_install_class(args: argparse.Namespace) -> int:

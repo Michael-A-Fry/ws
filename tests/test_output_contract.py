@@ -31,6 +31,7 @@ RAW = {
     "setup": "a person at a terminal, or the page (setup --yes is covered below)",
     "queue.slot": "runs the caller's command in a slot: that command's own output and exit code",
     "usage.statusline": "a statusline command Claude Code pipes JSON to: one line of its own, no envelope",
+    "walls.edit": "opens $EDITOR on a copy of the policy: the terminal is the editor's",
 }
 
 # What to run for each of the others (in a throwaway HOME): enough to get a real answer or a typed error.
@@ -109,6 +110,11 @@ CASES: dict[str, list[str]] = {
     "msg.export": ["msg", "export", "--out", "{home}/messages.jsonl"],
     "msg.watch": ["msg", "watch", "--position-now"],
     "msg.wait": ["msg", "wait", "--timeout", "1"],
+    "walls.init": ["walls", "init", "alpha"],
+    "walls.check": [
+        "walls",
+        "check",
+    ],  # a typed error on a machine with no walled class: not set up, the next command named
     "term": ["term", "--bind", "0.0.0.0"],  # a typed refusal: the real command stays up until stopped
 }
 

@@ -604,3 +604,126 @@ def test_words_that_only_look_like_ws_are_not_read_as_the_command():
     pol = policy.default_policy()
     for cmd in ("cat ws secret", "ls ws", "grep -r secret ws", "git add ws"):
         assert policy.is_denied_command(pol, cmd) is None, cmd
+
+
+# --- owner, review_date, per-repo settings, and who may send in -------------------------------------------------------------
+
+W = 'access = "walled"\nrepos = ["/srv/alpha/**", "/srv/alpha-extra/**"]\n'
+
+
+def test_owner_and_review_date_parse_and_default_to_none_set():
+    got = classes("[classes.a]\n" + W + 'owner = "  A. Person "\nreview_date = 2027-03-01\n')["a"]
+    assert got.owner == "A. Person" and got.review_date == date(2027, 3, 1)
+    plain = classes("[classes.a]\n" + W)["a"]
+    assert (plain.owner, plain.review_date, plain.repo_settings) == ("", None, ())  # an old policy loads as it did
+
+
+@pytest.mark.parametrize(
+    ("extra", "words"),
+    [
+        ('owner = ""\n', ("owner must not be empty",)),
+        ('owner = "   "\n', ("owner must not be empty",)),
+        ("owner = 5\n", ("owner must be text",)),
+        ('review_date = "2027-03-01"\n', ("review_date must be a TOML date",)),
+        ("review_date = 2027-03-01T09:00:00Z\n", ("review_date must be a TOML date",)),  # a time of day is not a date
+        ("review_date = 2027\n", ("review_date must be a TOML date",)),
+        ("review_date = true\n", ("review_date must be a TOML date",)),
+    ],
+)
+def test_a_bad_owner_or_review_date_refuses_the_whole_file(extra, words):
+    refused("[classes.a]\n" + W + extra, *words)
+    refused('[classes.good]\naccess = "full"\nrepos = ["/g"]\n[classes.a]\n' + W + extra, *words)  # not a partial load
+
+
+def test_a_review_is_due_on_its_day_in_utc_whatever_the_clock_is_spelled_in():
+    c = classes("[classes.a]\n" + W + "review_date = 2027-03-01\n")["a"]
+    due = [
+        (datetime(2027, 2, 28, 23, 59, 59, tzinfo=UTC), False),
+        (datetime(2027, 3, 1, 0, 0, tzinfo=UTC), True),
+        (datetime(2027, 3, 1, 8, 0, tzinfo=timezone(timedelta(hours=12))), False),  # 20:00 UTC on 28 Feb
+        (datetime(2027, 2, 28, 20, 0, tzinfo=timezone(timedelta(hours=-5))), True),  # 01:00 UTC on 1 Mar
+        (datetime(2030, 1, 1, tzinfo=UTC), True),
+    ]
+    assert [c.review_due(now) for now, _ in due] == [ok for _, ok in due]
+    with pytest.raises(ValueError):
+        c.review_due(datetime(2027, 3, 1))  # a clock with no timezone is not guessed at
+    assert classes("[classes.a]\n" + W)["a"].review_due(datetime(2099, 1, 1, tzinfo=UTC)) is False  # no date: never due
+
+
+RS = '[classes.a.repo_settings."/srv/alpha/**"]\n'
+OU = 'os_user = "ws-alpha"\n'  # a per-repo table narrows a walled class's file, so the class names an account
+
+
+def test_a_per_repo_table_parses_and_narrows_only_for_a_path_inside_its_glob(tmp_path):
+    c = classes(
+        "[classes.a]\n"
+        + W
+        + OU
+        + RS
+        + 'deny = ["Bash(curl *)"]\ndeny_read = ["/srv/alpha/secret"]\ndeny_write = ["/srv/alpha/frozen"]\n'
+        + '[classes.a.repo_settings."/srv/alpha-extra/**"]\ndeny = ["Bash(wget *)"]\n'
+    )["a"]
+    assert [r.glob for r in c.repo_settings] == ["/srv/alpha/**", "/srv/alpha-extra/**"]
+    got = c.narrowing_for("/srv/alpha/app")
+    assert (got.deny, got.deny_read, got.deny_write) == (
+        ("Bash(curl *)",),
+        ("/srv/alpha/secret",),
+        ("/srv/alpha/frozen",),
+    )
+    assert (
+        c.narrowing_for("/srv/alpha-extra/x").deny == ("Bash(wget *)",)
+        and c.narrowing_for("/srv/alpha-extra/x").deny_read == ()
+    )
+    assert c.narrowing_for("/srv/elsewhere") == policy.RepoSettings("")  # a path in none of the globs: nothing added
+
+
+@pytest.mark.parametrize(
+    "key", ["allow", "allowed_hosts", "allow_write", "allow_read", "permissions", "bypass", "inbound", "env", "hooks"]
+)
+def test_a_per_repo_key_that_would_widen_the_class_file_is_refused_naming_the_key(key):
+    text = "[classes.a]\n" + W + OU + RS + f"{key} = []\n"
+    refused(text, key, "would widen the class file", "may only narrow")
+    refused(
+        '[classes.good]\naccess = "full"\nrepos = ["/g"]\n' + text, key, "would widen"
+    )  # the whole file, never partly
+
+
+def test_a_per_repo_table_must_name_a_repo_glob_of_the_class_and_hold_lists_of_text():
+    refused(
+        "[classes.a]\n" + W + OU + '[classes.a.repo_settings."/srv/other/**"]\ndeny = []\n',
+        "not one of the class's repos",
+    )
+    refused("[classes.a]\n" + W + OU + RS + "deny = [1]\n", "deny must be a list of non-empty text")
+    refused("[classes.a]\n" + W + OU + 'repo_settings = "x"\n', "repo_settings must be a table of tables")
+    refused("[classes.a]\n" + W + OU + 'repo_settings = { "/srv/alpha/**" = 5 }\n', "must be a table")
+
+
+def test_a_whole_policy_file_with_one_bad_class_table_is_not_loaded_at_all(tmp_path):
+    f = tmp_path / "policy.toml"
+    f.write_text(
+        '[classes.good]\naccess = "full"\nrepos = ["/g"]\nowner = "me"\nreview_date = 2027-01-01\n'
+        "[classes.a]\n" + W + OU + RS + 'allow = ["Bash(*)"]\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(PolicyError, match="allow"):
+        policy.load(f)
+
+
+def test_who_may_send_in_is_inbound_and_inbound_allow_and_a_walled_class_defaults_to_nobody():
+    assert classes("[classes.a]\n" + W)["a"].inbound == "off"  # a walled class: nobody can send in unless it says so
+    refused("[classes.a]\n" + W + 'inbound_from = ["x"]\n', "unknown key 'inbound_from'")  # no second spelling of it
+    got = classes("[classes.a]\n" + W + 'inbound = "allowlist"\ninbound_allow = ["lead"]\n')["a"]
+    assert (got.inbound, got.inbound_allow) == ("allowlist", ("lead",))
+
+
+def test_a_class_with_repo_settings_but_no_os_user_is_refused_at_load_naming_the_class_and_the_key():
+    text = "[classes.a]\n" + W + RS + 'deny = ["Bash(curl *)"]\n'
+    with pytest.raises(PolicyError) as e:
+        policy.loads(text)
+    assert "[classes.a] repo_settings needs os_user" in str(e.value)
+    refused(
+        '[classes.good]\naccess = "full"\nrepos = ["/g"]\n' + text, "repo_settings needs os_user"
+    )  # the whole file, never partly
+    ok = classes("[classes.a]\n" + W + OU + RS + 'deny = ["Bash(curl *)"]\n')["a"]
+    assert ok.os_user == "ws-alpha" and ok.repo_settings[0].deny == ("Bash(curl *)",)
+    assert classes("[classes.a]\n" + W)["a"].repo_settings == ()  # no table, no account: as before

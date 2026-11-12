@@ -354,3 +354,77 @@ def test_user_version_is_set_once(home, mem):
     conn.close()
     stats, _ = memory.reindex()
     assert stats.unchanged == 1
+
+
+# ---- walled classes: a walled caller writes nothing to the shared stores, and a search leaves its files out ----------------
+
+
+def classes(home, monkeypatch, where: str = "alpha", extra: str = "") -> Path:
+    """A policy with a walled class alpha and a walled class beta under tmp_path, and the process in `where`'s repo."""
+    alpha, beta = home / "work" / "alpha", home / "work" / "beta"
+    (home / "wshome" / "policy.toml").write_text(
+        f'[classes.alpha]\naccess = "walled"\nrepos = ["{alpha}/**"]\n{extra}\n'
+        f'[classes.beta]\naccess = "walled"\nrepos = ["{beta}/**"]\n',
+        encoding="utf-8",
+    )
+    for d in (alpha, beta, home / "elsewhere"):
+        d.mkdir(parents=True, exist_ok=True)
+    monkeypatch.chdir(home / "work" / where if where in ("alpha", "beta") else home / where)
+    return home / "work"
+
+
+def test_a_session_in_a_walled_class_cannot_add_a_memory_file(home, mem, monkeypatch):
+    classes(home, monkeypatch)
+    with pytest.raises(memory.WsError) as e:
+        memory.add("the class's own content", "Alpha fact")
+    assert e.value.kind == "refused" and "alpha" in e.value.message and e.value.hint
+    assert not any(mem.rglob("*.md"))
+    assert run_git(mem, "status", "--porcelain") == ""  # nothing was staged or committed either
+
+
+def test_a_folder_in_no_class_and_a_policy_with_no_classes_still_add(home, mem, monkeypatch):
+    classes(home, monkeypatch, where="elsewhere")
+    assert memory.add("a person's own fact", "Own").exists()
+    (home / "wshome" / "policy.toml").write_text("", encoding="utf-8")
+    monkeypatch.chdir(home / "work" / "alpha")
+    assert memory.add("no classes at all", "Plain").exists()
+
+
+def test_a_policy_that_will_not_load_refuses_memory_and_notes(home, mem, monkeypatch):
+    classes(home, monkeypatch, where="elsewhere")
+    (home / "wshome" / "policy.toml").write_text('[classes.alpha]\naccess = "nonsense"\n', encoding="utf-8")
+    for call in (lambda: memory.add("x", "T"), lambda: memory.search("x"), lambda: notes.capture("x", home / "vault")):
+        with pytest.raises(memory.WsError) as e:
+            call()
+        assert e.value.kind == "refused"
+    assert not any(mem.rglob("*.md")) and not (home / "vault" / "_inbox").exists()
+
+
+def test_search_leaves_out_a_walled_class_files_for_another_class_unless_readable_by_allows(home, mem, monkeypatch):
+    work = classes(home, monkeypatch, where="beta")
+    (work / "alpha" / "notes.md").write_text("# Alpha plan\nthe quince orchard of alpha\n", encoding="utf-8")
+    marked = home / "vault" / "copied.md"
+    marked.write_text("---\nclass: alpha\n---\nthe quince jam recipe copied from alpha\n", encoding="utf-8")
+    (home / "vault" / "mine.md").write_text("a quince note of my own\n", encoding="utf-8")
+    roots = [("memory", home / "mem"), ("notes", home / "vault"), ("notes", work / "alpha")]
+    monkeypatch.setattr(memory, "configured_roots", lambda env=None: roots)
+    for fts in (True, False):
+        monkeypatch.setattr(memory, "has_fts5", lambda fts=fts: fts)
+        assert sorted(Path(h.path).name for h in memory.search("quince")) == ["mine.md"]  # beta sees neither of alpha's
+    monkeypatch.setattr(memory, "has_fts5", lambda: True)
+    monkeypatch.chdir(work / "alpha")
+    assert sorted(Path(h.path).name for h in memory.search("quince")) == ["copied.md", "mine.md", "notes.md"]  # its own
+    classes(home, monkeypatch, where="beta", extra='readable_by = ["beta"]')  # alpha now lets beta read it
+    assert sorted(Path(h.path).name for h in memory.search("quince")) == ["copied.md", "mine.md", "notes.md"]
+    classes(home, monkeypatch, where="beta", extra='readable_by = ["*"]')
+    assert len(memory.search("quince")) == 3
+
+
+def test_a_page_is_full_after_the_files_left_out(home, mem, monkeypatch):
+    work = classes(home, monkeypatch, where="beta")
+    for n in range(5):
+        (work / "alpha" / f"a{n}.md").write_text("quince quince quince quince\n", encoding="utf-8")
+    (home / "vault" / "mine.md").write_text("one quince\n", encoding="utf-8")
+    roots = [("notes", home / "vault"), ("notes", work / "alpha")]
+    monkeypatch.setattr(memory, "configured_roots", lambda env=None: roots)
+    assert [Path(h.path).name for h in memory.search("quince", limit=2)] == ["mine.md"]  # alpha's five do not crowd it

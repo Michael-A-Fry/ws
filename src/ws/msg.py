@@ -20,8 +20,14 @@ Walled classes. A message to a walled or counts-only session keeps its body only
 `<repo root>/.ws/messages/<class>.db`, created with a `.gitignore` that ignores everything in the folder; the shared
 database gets the envelope, with no body, no hash of a body and no free-text field. A walled or counts-only session sends
 fixed kinds only (`ack`, `done`, `stop-and-hand-over:done`, `ask:pending`, `counts`), no body, no key, no thread name.
-What may come in is the receiving class's `inbound` setting (off, lead-only, or the sessions it names), for the kinds
-`note`, `ask` and `stop-and-hand-over`; there is no rule that lets a reply in, and no owned-task exception. With no
+What may come in is a message of kind `note`, `ask` or `stop-and-hand-over` from a session the receiving class's
+`inbound_allow` names, and only when its `inbound` is `allowlist`: a walled class set to off or lead-only takes nothing,
+the lead included. There is no rule that lets a reply in, and no owned-task exception. Every message addressed to a walled
+class, delivered or refused, leaves one row in the class's own store (`inbound_log`: the UTC time, the sender's session
+id, the class, the kind, `delivered` or `refused`, and a refusal's typed kind), never a body, a hash of one, a key or a
+thread name. A delivered message's row is written in the delivery's own transaction (a class store that cannot be written
+makes it `unavailable`, with nothing half-written); a refusal's row is written after the decision, which a store that
+cannot be written does not change. `prune` drops those rows under the class's `retention_days`. With no
 `[classes]` in the policy none of this applies and any registered session may send to any. Deleting a walled repo
 deletes its bodies with it; `prune` then drops the envelope rows whose repo folder is gone.
 
@@ -58,7 +64,9 @@ the future; `--position-now` starts a feed at the end.
 
 Public API (for the delivery guard and the viewer): `send`, `inbox`, `sent`, `read`, `ack`, `mark_delivered`, `envelopes`,
 `export`, `prune`, `deliver`, `pending`, `handover_delivered`, `last_delivered_outbound`, `watch`, `wait`, `wake_pane`,
-`clean`. Every time is UTC. A `now` argument is the clock (tests inject one).
+`clean`; and, for `ws walls check`, `scratch_delivery`, `scratch_envelopes` and `class_store_path` (the same delivery and the
+same envelope feed on a database of its own, and where a class's bodies go). Every time is UTC. A `now` argument is the
+clock (tests inject one).
 """
 
 from __future__ import annotations
@@ -86,7 +94,7 @@ from ws.output import WsError
 
 COMMAND = "msg"
 SCHEMA = "ws.message/1"
-STORE_VERSION = 2  # PRAGMA user_version of both databases (2: `store_dev`, `tidy`)
+STORE_VERSION = 3  # PRAGMA user_version of both databases (2: `store_dev`, `tidy`; 3: a class store's `inbound_log`)
 
 KINDS = ("note", "ask", "stop-and-hand-over", "ack", "done", "stop-and-hand-over:done", "ask:pending", "counts")
 FIXED_KINDS = ("ack", "done", "stop-and-hand-over:done", "ask:pending", "counts")  # all a walled sender may send
@@ -359,6 +367,15 @@ _CLASS_SCHEMA = (
         "to" TEXT NOT NULL,
         sent_ms INTEGER NOT NULL,
         body TEXT NOT NULL)""",
+    # one body-free row for each message addressed to a walled class: who, what kind, and whether it came in
+    """CREATE TABLE IF NOT EXISTS {db}inbound_log(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        at TEXT NOT NULL,
+        sender TEXT NOT NULL,
+        class TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        decision TEXT NOT NULL,
+        reason TEXT)""",
 )
 
 
@@ -373,10 +390,11 @@ def _limit_size(conn: sqlite3.Connection, schema: str = "main") -> None:
     conn.execute(f"PRAGMA {schema}.max_page_count={max(STORE_MAX_BYTES // page, 64)}")
 
 
-def _open(*, create: bool, readonly: bool = False) -> sqlite3.Connection | None:
+def _open(*, create: bool, readonly: bool = False, path: Path | None = None) -> sqlite3.Connection | None:
     """The shared database, ready to use. With `create` false a store that does not exist is None (nothing sent yet).
-    With `readonly` it is opened read-only and nothing is written (inside the wall the state folder is read-only)."""
-    path = store_path()
+    With `readonly` it is opened read-only and nothing is written (inside the wall the state folder is read-only). `path`
+    is a database of its own, for `scratch_delivery`; every caller that is a session leaves it out."""
+    path = path or store_path()
     if create:
         _private_folder(path.parent)
         _private_file(path)
@@ -406,7 +424,9 @@ def _ensure_schema(conn: sqlite3.Connection, statements: tuple[str, ...], db: st
         if conn.execute(pragma).fetchone()[0] < STORE_VERSION:
             for stmt in statements:
                 conn.execute(stmt.format(db=f"{db.rstrip('.')}." if db else ""))
-            if not db and "store_dev" not in {r[1] for r in conn.execute("PRAGMA table_info(messages)")}:
+            if statements is _SHARED_SCHEMA and "store_dev" not in {
+                r[1] for r in conn.execute("PRAGMA table_info(messages)")
+            }:
                 conn.execute("ALTER TABLE messages ADD COLUMN store_dev INTEGER")  # a store made at version 1
             conn.execute(f"{pragma}={STORE_VERSION}")
         conn.execute("COMMIT")
@@ -452,6 +472,12 @@ def _class_store(pol: policy.Policy, cls: policy.Class, cwd: str) -> tuple[Path,
     if db.parent.parent.is_symlink() or db.parent.is_symlink():
         raise WsError("refused", "the ws folder of the receiving repo, or its messages folder, is a link", "remove it")
     return root, db
+
+
+def class_store_path(pol: policy.Policy, cls: policy.Class, cwd: str) -> Path:
+    """Where the bodies of class `cls` are kept for a receiver working in `cwd`: `<repo root>/.ws/messages/<class>.db`. The
+    errors of `_class_store` (a folder the class does not cover, a link) are raised as they are."""
+    return _class_store(pol, cls, cwd)[1]
 
 
 IGNORE_TEXT = "*\n"  # the `.gitignore` of a class folder: everything in it, itself too, so `git add` cannot take a body
@@ -517,7 +543,35 @@ def _prepare_class_folder(db: Path) -> None:
     _private_file(db)
 
 
-def _attach_class(conn: sqlite3.Connection, db: Path) -> None:
+def _refuse_foreign(db: Path, cls: policy.Class) -> None:
+    """A class store that is another account's file is refused: a write into it would put a row where it can be read or
+    swapped by a stranger. Ours and the class's own `os_user`'s are fine. Where the system has no accounts to ask (no
+    `os.getuid`), nothing is checked."""
+    getuid = getattr(os, "getuid", None)
+    if getuid is None:
+        return
+    try:
+        owner = os.lstat(db).st_uid
+    except FileNotFoundError:
+        return
+    except OSError as e:
+        raise _unavailable(_ERRNO_REASONS.get(e.errno or 0, "unopenable")) from e
+    mine = {getuid()}
+    if cls.os_user:
+        with contextlib.suppress(ImportError, KeyError):
+            import pwd
+
+            mine.add(pwd.getpwnam(cls.os_user).pw_uid)
+    if owner not in mine:
+        raise WsError(
+            "refused",
+            f"the class store {db.name} belongs to another account",
+            "ws keeps the bodies of a walled class in a file its owner or the class's account made; remove it, or fix its owner",
+        )
+
+
+def _attach_class(conn: sqlite3.Connection, db: Path, cls: policy.Class) -> None:
+    _refuse_foreign(db, cls)
     _prepare_class_folder(db)
     conn.execute("ATTACH DATABASE ? AS cls", (_uri(db, "rwc"),))
     _limit_size(conn, "cls")
@@ -629,7 +683,7 @@ def _label(value, what: str) -> str | None:
 # --- send -----------------------------------------------------------------------------------------------------------
 
 
-def _admit(
+def admit(
     sender: session.Record,
     target: session.Record,
     s_class: policy.Class | None,
@@ -660,6 +714,12 @@ def _admit(
             "refused",
             f"sessions in class {r_class.name!r} take no messages",
             "the class's `inbound` in policy.toml is off; set lead-only or allowlist if that is wanted",
+        )
+    if _walled(r_class) and r_class.inbound != "allowlist":
+        raise WsError(
+            "refused",
+            f"class {r_class.name!r} is walled and names no sessions that may send to it",
+            'set inbound = "allowlist" and name the sessions in inbound_allow under that class in policy.toml',
         )
     # A fixed kind has no text, so it carries nothing out of a class: the default lets it reach a lead, which is how a
     # worker or a walled session says `done` or `ack`. A walled receiver is never reached this way (below).
@@ -728,7 +788,62 @@ def send(
         raise WsError("not_found", f"no session {to!r}", "the registry has no session with that id")
     s_class = policy.class_of(pol, sender.cwd)
     r_class = policy.class_of(pol, target.cwd)
-    _admit(sender, target, s_class, r_class, kind, body, key, thread)
+    return _deliver(
+        (sender, target, s_class, r_class, pol, names),
+        (kind, tier, body, data, ack_required),
+        (key, thread, reply_to),
+        (signal, now),
+    )
+
+
+def scratch_delivery(
+    folder: Path,
+    pol: policy.Policy,
+    sender: session.Record,
+    target: session.Record,
+    kind: str = "note",
+    body: str | None = None,
+    *,
+    now: float | None = None,
+) -> dict:
+    """The same checks and writes as `send`, for a sender and a receiver the caller holds, into a shared database of its own
+    at `folder/messages.db` (the account's `messages.db` and the registry are not touched, and no session is asked who is
+    calling). It is how `ws walls check` asks a walled class's flows their questions on a store that is thrown away; a
+    refusal raises and leaves its log row in the class store, as in `send`. Not a way to send a message: it names no
+    session as a sender for anything that is kept."""
+    when = _t(now)
+    text = body or ""
+    return _deliver(
+        (sender, target, policy.class_of(pol, sender.cwd), policy.class_of(pol, target.cwd), pol, []),
+        (kind, "info", text, text.encode("utf-8"), False),
+        (None, None, None),
+        (when, now),
+        folder / "messages.db",
+    )
+
+
+def _deliver(parties, content, labels, clock, shared: Path | None = None) -> dict:
+    """`_send_checked`, and for a message to a walled class that was not delivered, one log row saying so. `shared` is a
+    database of its own (`scratch_delivery`), which also keeps the refusal from telling the account's shared store."""
+    sender, target, _, r_class, pol, _ = parties
+    try:
+        return _send_checked(parties, content, labels, clock, shared)
+    except (
+        WsError
+    ) as e:  # not delivered: for a walled receiver, one body-free row says who tried and why it did not land
+        if _walled(r_class):
+            _record_refusal(pol, sender, target, r_class, content[0], e.kind, clock[0], note=shared is None)
+        raise
+
+
+def _send_checked(parties, content, labels, clock, shared: Path | None = None) -> dict:
+    """The rest of a send once the sender, the receiver and their classes are known: `admit`, the checks of the text and
+    the delivery. Anything it raises is a message that was not delivered."""
+    sender, target, s_class, r_class, pol, names = parties
+    kind, tier, body, data, ack_required = content
+    key, thread, reply_to = labels
+    signal, now = clock
+    admit(sender, target, s_class, r_class, kind, body, key, thread)
     if kind in ("note", "ask") and not data:
         raise _bad(f"a {kind} needs some text")
 
@@ -752,13 +867,13 @@ def send(
     idem = hashlib.sha256(f"{sender.session_id}\0{target.session_id}\0{key}".encode()).hexdigest() if key else None
 
     with _typed():
-        conn = _open(create=True)
+        conn = _open(create=True, path=shared)
         if conn is None:  # create=True never answers None; this keeps the type honest
             raise _unavailable("unopenable")
         try:
             _housekeeping(conn, now, pol)
-            if store and data:
-                _attach_class(conn, store[1])
+            if store:
+                _attach_class(conn, store[1], r_class)
             conn.execute("BEGIN IMMEDIATE")
             try:
                 out = _store_message(
@@ -870,6 +985,11 @@ def _store_message(conn, parties, content, labels, clock) -> dict:
         'INSERT INTO envelope(message_id,"from","to",kind,sent,class,size) VALUES(?,?,?,?,?,?,?)',
         (mid, sid, target.session_id, kind, jsonl.iso_utc(stored), r_class.name if r_class else None, bucket),
     )
+    if walled_body:  # the class's own log row
+        conn.execute(
+            "INSERT INTO cls.inbound_log(at,sender,class,kind,decision,reason) VALUES(?,?,?,?,'delivered',NULL)",
+            (jsonl.iso_utc(stored), sid, r_class.name, kind),
+        )
     _queue(conn, target.session_id, stored).put(str(mid), idempotency_key=str(mid))  # the delivery state, same commit
     return {
         "id": mid,
@@ -879,6 +999,93 @@ def _store_message(conn, parties, content, labels, clock) -> dict:
         "size": bucket,
         "replayed": False,
     }
+
+
+def _record_refusal(
+    pol: policy.Policy,
+    sender: session.Record,
+    target: session.Record,
+    r_class: policy.Class,
+    kind: str,
+    reason: str,
+    signal: float,
+    note: bool = True,
+) -> None:
+    """One log row, in the receiving class's own store, for a message addressed to it that was not delivered: the UTC time,
+    the sender's session id, the class, the kind and `reason` (the typed kind of what stopped it). Never a body, a hash,
+    a key or a thread name. It runs after the decision and changes nothing about it: a store that is not ours, is a
+    link, is locked, read-only or damaged is passed over, and whatever this made on the way is taken away again, so a
+    failure leaves nothing half-written. The shared store is told only that this class store has rows to prune."""
+    try:
+        root, db = _class_store(pol, r_class, target.cwd)
+    except WsError:
+        return
+    made_folder, made_file = not db.parent.exists(), not os.path.lexists(db)
+    made_ws = not db.parent.parent.exists()
+    conn = None
+    try:
+        _refuse_foreign(db, r_class)
+        with _typed():
+            _prepare_class_folder(db)
+            conn = _connect(db, "rwc")
+            _limit_size(conn)
+            _ensure_schema(conn, _CLASS_SCHEMA)
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    "INSERT INTO inbound_log(at,sender,class,kind,decision,reason) VALUES(?,?,?,?,'refused',?)",
+                    (jsonl.iso_utc(signal), sender.session_id, r_class.name, kind, reason),
+                )
+                conn.execute("COMMIT")
+            except BaseException:
+                with contextlib.suppress(sqlite3.Error):
+                    conn.execute("ROLLBACK")
+                raise
+    except (WsError, sqlite3.Error, OSError):
+        if conn is not None:
+            conn.close()
+            conn = None
+        _undo_class_store(db, made_folder, made_file, made_ws)
+        return
+    finally:
+        if conn is not None:
+            conn.close()
+    if note:
+        _note_class_store(root, r_class.name)
+
+
+def _undo_class_store(db: Path, made_folder: bool, made_file: bool, made_ws: bool) -> None:
+    """Take away what a failed log write made: the store (and its journal files) if it was new, the `.gitignore` and the
+    folders if they were new and are left empty. Never anything that was there before."""
+    with contextlib.suppress(OSError):
+        if made_file:
+            for end in ("", *_SIDECARS):
+                db.with_name(db.name + end).unlink(missing_ok=True)
+        if made_folder:
+            (db.parent / ".gitignore").unlink(missing_ok=True)
+            db.parent.rmdir()
+            if made_ws:
+                db.parent.parent.rmdir()
+
+
+def _note_class_store(root: Path, class_name: str) -> None:
+    """Tell the shared store that this class store has log rows, so a prune finds it (a store with refusals only has no
+    message row that would say so). Best effort: the log row is already written, and a prune that misses it tries again
+    when the next row says so."""
+    try:
+        with _typed():
+            conn = _open(create=True)
+            if conn is None:
+                return
+            try:
+                conn.execute(
+                    "INSERT OR IGNORE INTO tidy(store, class, store_dev) VALUES(?,?,?)",
+                    (str(root), class_name, _device(root)),
+                )
+            finally:
+                conn.close()
+    except (WsError, sqlite3.Error, OSError):
+        return
 
 
 # --- read -----------------------------------------------------------------------------------------------------------
@@ -1117,9 +1324,13 @@ def mark_delivered(message_ids: int | Iterable[int], to: str, *, now: float | No
 
 def envelopes(*, after: int = 0, limit: int = LIST_DEFAULT) -> list[dict]:
     """The body-free feed the viewer and `ws msg watch` read: envelope rows after sequence number `after`, oldest first."""
+    return _envelope_rows(None, after, limit)
+
+
+def _envelope_rows(path: Path | None, after: int, limit: int) -> list[dict]:
     limit, after = _window(limit, after)
     with _typed():
-        conn = _open(create=False)
+        conn = _open(create=False, path=path)
         if conn is None:
             return []
         try:
@@ -1131,6 +1342,11 @@ def envelopes(*, after: int = 0, limit: int = LIST_DEFAULT) -> list[dict]:
         finally:
             conn.close()
     return [dict(r) for r in rows]
+
+
+def scratch_envelopes(folder: Path, *, after: int = 0, limit: int = LIST_DEFAULT) -> list[dict]:
+    """`envelopes` for the database `scratch_delivery` made in `folder`."""
+    return _envelope_rows(folder / "messages.db", after, limit)
 
 
 # --- delivery: the queue under the inbox guard -----------------------------------------------------------------------
@@ -1572,6 +1788,10 @@ def _prune(conn: sqlite3.Connection, now: float, pol: policy.Policy, *, force: b
                 unconfirmed += conn.execute("SELECT COUNT(*) FROM messages WHERE store=?", (row["store"],)).fetchone()[
                     0
                 ]
+        conn.execute(  # every walled store with a message has a log to prune, so it is on the list until its log is empty
+            "INSERT OR IGNORE INTO tidy(store, class, store_dev) "
+            "SELECT DISTINCT store, class, store_dev FROM messages WHERE store IS NOT NULL AND class IS NOT NULL"
+        )
         for row in conn.execute("SELECT DISTINCT class FROM messages").fetchall():
             cutoff = int((now - _retention_days(pol, row["class"]) * 86400) * 1000)
             old = "FROM messages WHERE class IS ? AND sent_ms<?"
@@ -1601,13 +1821,18 @@ def _tidy_class_store(root: str, cls: str, device: int | None, pol: policy.Polic
     confirmed not to exist: the repo folder is there without it, or the repo folder is missing and the folder above it is
     on the device the repo was on (`_repo_gone`). False when the store could not be reached or written, or the repo
     folder is missing and that can't be confirmed (an unmounted drive), so the caller keeps it on its list and tries
-    again on the next prune."""
+    again on the next prune. The same retention drops the store's `inbound_log` rows; while any remain this is False, so the
+    entry stays on the shared store's list and the rows are pruned as they age."""
     conn = None
     try:
         conn = _class_connect(_class_db(root, cls))
         if conn is None:
             return os.path.isdir(root) or _repo_gone(root, device)
-        conn.execute("DELETE FROM bodies WHERE sent_ms<?", (int((now - _retention_days(pol, cls) * 86400) * 1000),))
+        days = _retention_days(pol, cls)
+        conn.execute("DELETE FROM bodies WHERE sent_ms<?", (int((now - days * 86400) * 1000),))
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='inbound_log'").fetchone():
+            conn.execute("DELETE FROM inbound_log WHERE at<?", (jsonl.iso_utc(now - days * 86400),))
+            return conn.execute("SELECT COUNT(*) FROM inbound_log").fetchone()[0] == 0
         return True
     except (sqlite3.Error, OSError, WsError):
         return False

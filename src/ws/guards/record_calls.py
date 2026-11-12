@@ -4,7 +4,7 @@ changed policy. It only records: a log it can't write is a
 warning. The log has the bounds every ws log has (ws.jsonl: long fields cut, the file rotates, writers take a lock).
 
 What a line holds: the hook payload as the runner sent it (tool name, folder, session id and the tool's input: a
-command, a path, a search pattern, an agent prompt, a message) with one change. The text a write tool carries is
+command, a path, a search pattern, an agent prompt, a message, an MCP tool's arguments) with one change. The text a write tool carries is
 replaced by its size and fingerprint, `{"bytes": N, "sha256": "..."}`: Write `content`, Edit `old_string` and
 `new_string`, each MultiEdit edit's two strings, NotebookEdit `new_source` (OpenCode's `content`, `oldString`,
 `newString`, `edits` and a patch tool's `patchText` likewise); whatever sits under one of those keys is fingerprinted,
@@ -26,7 +26,7 @@ from ws.guards import Finding, known_keys
 
 NAME = "record-calls"
 EVENTS = ("pre",)
-KINDS = ("command", "read", "search", "write", "tool", "agent", "skill", "message")
+KINDS = ("command", "read", "search", "write", "tool", "agent", "skill", "message", "mcp", "other")
 PRIORITY = 0  # records first, so a call a later guard refuses is on record too
 
 LOG = "gate-calls.jsonl"

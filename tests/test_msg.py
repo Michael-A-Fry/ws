@@ -110,8 +110,9 @@ def plain(world):
     return world
 
 
-def classed(world, allow=("lead1", "work1", "work2", "wall1"), walled_inbound="lead-only", walled_allow=("work1",)):
-    """A lead and two workers in a full class, and one session in a walled repo, under a policy with classes."""
+def classed(world, allow=("lead1", "work1", "work2", "wall1"), walled_inbound="allowlist", walled_allow=("lead1",)):
+    """A lead and two workers in a full class, and one session in a walled repo, under a policy with classes. The walled
+    class lets in only the sessions it names (a walled class takes nothing from a session its allowlist does not name)."""
     open_dir, walled = world.folder("open"), world.folder("walled", git=True)
     world.policy(
         f"""
@@ -161,7 +162,7 @@ def test_walled_free_text_send_refused(world):  # (a)
 
 def test_non_lead_message_to_walled_session_refused(world):  # (b)
     classed(world)
-    world.refused("work1", "wall1")  # lead-only: a worker is not the lead
+    world.refused("work1", "wall1")  # the allowlist names the lead only: a worker is not on it
     assert world.send("lead1", "wall1", "note", "hello")["class"] == "secret"
     for kind in ("ack", "done", "counts", "ask:pending"):
         world.refused("lead1", "wall1", kind, None)  # only note, ask and stop-and-hand-over go in
@@ -176,7 +177,7 @@ def test_walled_inbound_off_by_default_even_for_the_lead(world):
 
 
 def test_walled_inbound_allowlist_names_who_may(world):
-    classed(world, walled_inbound="allowlist")
+    classed(world, walled_inbound="allowlist", walled_allow=("work1",))
     assert world.send("work1", "wall1")["class"] == "secret"  # named
     world.refused("work2", "wall1")  # not named
     err = world.refused("lead1", "wall1")  # and being the lead is no exception
@@ -281,7 +282,8 @@ def test_class_store_must_be_inside_the_class(world):
         [classes.secret]
         access = "walled"
         repos = ["{big}/sub"]
-        inbound = "lead-only"
+        inbound = "allowlist"
+        inbound_allow = ["lead1"]
         [classes.open]
         access = "full"
         repos = ["{world.root}/open"]
@@ -412,7 +414,6 @@ def test_a_forged_registry_and_policy_under_a_forged_ws_home_send_nothing(world,
             """
         )
     )
-    real_walled = world.root / "walled"
     token = planted()
     real_procs = dict(world.procs)
     for own_runner in (True, False):
@@ -439,10 +440,15 @@ def test_a_forged_registry_and_policy_under_a_forged_ws_home_send_nothing(world,
         world.procs.update(
             real_procs
         )  # the forged sessions' ids are the real ones' ids: the real processes stay theirs
-        # the real world is as it was: no message, no class store, no `.ws` folder anywhere
+        # the real world is as it was: no message, no body, nothing in the forged folders or the decoy's repo. The real
+        # worker's own send (when the runner was its own) was refused and logged by the real class: a row, no body.
         assert world.count() == 0
-        assert not (forge / "msg").exists() and not list(world.root.rglob(".ws"))
-        assert not class_db(world).exists() and not (decoy / ".ws").exists() and not (real_walled / ".ws").exists()
+        assert not (forge / "msg").exists() and not (forge / ".ws").exists() and not (decoy / ".ws").exists()
+        if class_db(world).exists():
+            assert world.rows("SELECT COUNT(*) FROM bodies", class_db(world)) == [(0,)]
+            assert [(r[0], r[3]) for r in log_rows(world)] == [
+                ("work1", "refused")
+            ]  # one: the forger with no runner left none
     # and the real lead's order still lands, undisturbed by the forged one
     assert world.send("lead1", "wall1", "note", "REAL ORDER")["id"] == 1
     world.who = "wall1"
@@ -972,14 +978,15 @@ def test_shared_store_is_private(plain):
 
 def classed_by_default(world):
     """A lead and two workers in a full class that says nothing about `inbound` (so it is lead-only), and one session in a
-    walled class that takes notes from the lead."""
+    walled class that takes notes from the lead alone (the one session its allowlist names)."""
     open_dir, walled = world.folder("open"), world.folder("walled", git=True)
     world.policy(
         f"""
         [classes.secret]
         access = "walled"
         repos = ["{walled}"]
-        inbound = "lead-only"
+        inbound = "allowlist"
+        inbound_allow = ["lead1"]
         [classes.open]
         access = "full"
         repos = ["{open_dir}"]
@@ -1444,3 +1451,194 @@ def test_prune_drops_finished_queue_tables(plain):
     assert len(msg.deliver("bravo", now=BASE + 1)) == 1
     assert msg.prune(now=BASE + 40 * 86400, force=True)["expired"] == 1
     assert plain.rows("SELECT name FROM sqlite_master WHERE name LIKE 'dq!_%' ESCAPE '!'") == []
+
+
+# --- the class log: every message to a walled class leaves one body-free row in that class's own store --------------------
+
+LOG_SQL = "SELECT sender, class, kind, decision, reason FROM inbound_log ORDER BY id"
+LOG_COLUMNS = ["id", "at", "sender", "class", "kind", "decision", "reason"]
+
+
+def log_rows(world, name: str = "secret") -> list[tuple]:
+    return world.rows(LOG_SQL, class_db(world, name))
+
+
+def test_a_message_from_a_session_not_on_the_allowlist_is_refused_and_logged(world):
+    classed(world, walled_inbound="allowlist", walled_allow=("work1",))
+    err = world.refused("work2", "wall1", body=planted())  # not named
+    assert err.kind == "refused" and "named sessions" in err.message
+    world.refused("lead1", "wall1", "ask", "a question")  # being the lead is no exception
+    assert log_rows(world) == [
+        ("work2", "secret", "note", "refused", "refused"),
+        ("lead1", "secret", "ask", "refused", "refused"),
+    ]
+    assert world.count() == 0 and world.rows("SELECT COUNT(*) FROM bodies", class_db(world)) == [(0,)]
+    # a walled class that is not on an allowlist takes no one, the lead included, and the row says so
+    text = (world.root / "wshome" / "policy.toml").read_text()
+    world.policy(text.replace('inbound = "allowlist"\ninbound_allow = ["work1"]', 'inbound = "lead-only"', 1))
+    world.refused("lead1", "wall1")
+    assert log_rows(world)[-1] == ("lead1", "secret", "note", "refused", "refused")
+    assert world.count() == 0
+
+
+def test_a_message_from_an_allowed_session_is_delivered_and_logged(world):
+    classed(world, walled_inbound="allowlist", walled_allow=("work1",))
+    body = planted()
+    sent = world.send("work1", "wall1", "note", body)
+    assert sent["class"] == "secret" and sent["replayed"] is False
+    assert log_rows(world) == [("work1", "secret", "note", "delivered", None)]
+    assert world.rows("SELECT body FROM bodies", class_db(world)) == [(body,)]
+    assert world.send("work1", "wall1", "stop-and-hand-over", None)["id"]  # a message with no body is logged too
+    assert [r[2:4] for r in log_rows(world)] == [("note", "delivered"), ("stop-and-hand-over", "delivered")]
+    world.refused("work2", "wall1")
+    assert [r[3] for r in log_rows(world)] == ["delivered", "delivered", "refused"]
+    first = world.send("work1", "wall1", "note", "once", key="same-key")
+    again = world.send("work1", "wall1", "note", "once", key="same-key")  # a replay delivers nothing a second time
+    assert again["replayed"] is True and again["id"] == first["id"]
+    assert len(log_rows(world)) == 4 and world.count() == 3
+
+
+def test_the_class_log_holds_no_body(world):
+    classed(world, walled_inbound="allowlist", walled_allow=("work1",))
+    token = planted()
+    text = f"look at {token} please"
+    world.send("work1", "wall1", "note", text, key="k-" + token[-8:], tier="urgent")
+    world.refused("work2", "wall1", body=text)
+    conn = sqlite3.connect(class_db(world))
+    try:
+        assert [r[1] for r in conn.execute("PRAGMA table_info(inbound_log)")] == LOG_COLUMNS
+        dump = repr(conn.execute("SELECT * FROM inbound_log").fetchall())
+    finally:
+        conn.close()
+    for leak in (token, hashlib.sha256(text.encode()).hexdigest(), "k-" + token[-8:], "urgent"):
+        assert leak not in dump  # no body, no hash of it, no key, no thread name
+    # and the shared database gets no log table and no new envelope column
+    assert not world.rows("SELECT name FROM sqlite_master WHERE name LIKE '%log%'")
+    cols = [r[1] for r in world.rows("PRAGMA table_info(envelope)")]
+    assert cols == ["seq", "message_id", "from", "to", "kind", "sent", "delivered_ts", "class", "size"]
+
+
+def test_the_log_row_carries_a_utc_time(world):
+    classed(world, walled_inbound="allowlist", walled_allow=("work1",))
+    world.send("work1", "wall1", "note", "x", now=BASE)
+    world.refused("work2", "wall1", now=BASE + 5)
+    assert [r[0] for r in world.rows("SELECT at FROM inbound_log ORDER BY id", class_db(world))] == [
+        "2023-11-14T22:14:00.000Z",
+        "2023-11-14T22:14:05.000Z",
+    ]
+
+
+def test_a_refusal_still_raises_when_the_class_store_cannot_be_opened(world, monkeypatch):
+    classed(world, walled_inbound="allowlist", walled_allow=("work1",))
+
+    def locked(*a, **k):
+        raise WsError("unavailable", "the message store is locked", "try again", 1, {"reason": "locked"})
+
+    monkeypatch.setattr(msg, "_ensure_schema", locked)
+    err = world.refused("work2", "wall1")  # the refusal, not the store's trouble: the log never changes the decision
+    assert "named sessions" in err.message
+    assert not (world.root / "walled" / ".ws").exists()  # nothing half-written is left behind
+
+
+def test_a_refusal_into_a_damaged_class_store_still_raises_and_a_delivery_is_unavailable(world):
+    classed(world, walled_inbound="allowlist", walled_allow=("work1",))
+    world.send("work1", "wall1", "note", "x")
+    class_db(world).write_bytes(b"this is not a database" * 400)
+    assert world.refused("work2", "wall1").kind == "refused"
+    assert world.refused("work1", "wall1", kind="unavailable").details["reason"] == "damaged"
+    assert world.count() == 1  # the failed delivery left no row of its own
+
+
+def test_a_read_only_class_store_refuses_as_before_and_a_delivery_is_unavailable(world, monkeypatch):
+    classed(world, walled_inbound="allowlist", walled_allow=("work1",))
+    world.send("work1", "wall1", "note", "x")
+    monkeypatch.setattr(msg, "_OPEN_MODE", "ro")
+    assert world.refused("work2", "wall1").kind == "refused"
+    world.refused("work1", "wall1", kind="unavailable")
+    monkeypatch.setattr(msg, "_OPEN_MODE", None)
+    assert len(log_rows(world)) == 1  # neither wrote a row
+
+
+def test_a_linked_class_folder_or_store_gets_no_log_row_and_the_refusal_stands(world):
+    classed(world, walled_inbound="allowlist", walled_allow=("work1",))
+    elsewhere = world.folder("elsewhere")
+    os.symlink(elsewhere, world.root / "walled" / ".ws")
+    world.refused("work2", "wall1")
+    assert not list(elsewhere.iterdir())
+    (world.root / "walled" / ".ws").unlink()
+    world.send("work1", "wall1", "note", "x")
+    db = class_db(world)
+    moved = db.with_name("moved.db")
+    db.rename(moved)
+    db.symlink_to(moved)  # a link where the store goes
+    assert world.refused("work2", "wall1").kind == "refused"
+    world.refused("work1", "wall1", kind="unavailable")
+    db.unlink()
+    moved.rename(db)
+    assert len(log_rows(world)) == 1
+
+
+def test_another_accounts_class_store_is_refused(world, monkeypatch):
+    classed(world, walled_inbound="allowlist", walled_allow=("work1",))
+    world.send("work1", "wall1", "note", "x")
+    other = os.getuid() + 1
+    monkeypatch.setattr(msg.os, "getuid", lambda: other)  # the file is now another account's
+    err = world.refused("work1", "wall1")
+    assert "another account" in err.message
+    world.refused("work2", "wall1")
+    monkeypatch.undo()
+    assert len(log_rows(world)) == 1  # no row went into a file that is not ours
+
+
+def test_a_class_store_made_before_the_log_gets_the_table_when_it_is_next_used(world):
+    classed(world, walled_inbound="allowlist", walled_allow=("work1",))
+    db = class_db(world)
+    db.parent.mkdir(parents=True)
+    old = sqlite3.connect(db)
+    old.execute(
+        'CREATE TABLE bodies(message_id INTEGER PRIMARY KEY, "to" TEXT NOT NULL, sent_ms INTEGER NOT NULL, '
+        "body TEXT NOT NULL)"
+    )
+    old.execute("PRAGMA user_version=2")
+    old.commit()
+    old.close()
+    world.refused("work2", "wall1")
+    assert log_rows(world) == [("work2", "secret", "note", "refused", "refused")]
+    world.send("work1", "wall1", "note", "x")
+    assert [r[3] for r in log_rows(world)] == ["refused", "delivered"]
+
+
+def test_log_rows_are_pruned_with_the_class_retention_at_the_hourly_pace(world):
+    classed(world, walled_inbound="allowlist", walled_allow=("work1",))
+    day = 86400  # the walled class keeps 5 days
+    world.send("work1", "wall1", "note", "old", now=BASE)
+    world.refused("work2", "wall1", now=BASE + 1)
+    world.send("work1", "wall1", "note", "new", now=BASE + 4 * day)
+    assert len(log_rows(world)) == 3
+    assert msg.prune(now=BASE + 4 * day + 10, force=True)["ran"] is True  # 4 days: all inside the window
+    assert len(log_rows(world)) == 3
+    assert msg.prune(now=BASE + 6 * day, force=True)["ran"] is True
+    assert [(r[0], r[3]) for r in log_rows(world)] == [("work1", "delivered")]  # the two old rows went; the new stays
+    assert msg.prune(now=BASE + 6 * day + 60)["ran"] is False  # not forced: at most hourly
+    world.refused("work2", "wall1", now=BASE + 6 * day + 120)
+    assert len(log_rows(world)) == 2
+    assert msg.prune(now=BASE + 6 * day + 3700)["ran"] is True
+    assert len(log_rows(world)) == 2
+    assert msg.prune(now=BASE + 12 * day, force=True)["ran"] is True
+    assert log_rows(world) == [] and world.rows("SELECT COUNT(*) FROM tidy") == [(0,)]
+
+
+def test_a_store_that_has_only_refusals_is_pruned_too(world):
+    classed(world, walled_inbound="allowlist", walled_allow=("work1",))
+    world.refused("work2", "wall1", now=BASE)
+    assert world.count() == 0 and len(log_rows(world)) == 1
+    msg.prune(now=BASE + 6 * 86400, force=True)
+    assert log_rows(world) == []
+
+
+def test_refused_sends_are_not_counted_toward_the_rate_cap_and_do_not_use_it_up(world):
+    classed(world, walled_inbound="allowlist", walled_allow=("work1",))
+    for n in range(msg.RATE_PER_MINUTE + 2):
+        world.refused("work2", "wall1", now=BASE + n % 50)  # the same fixed minute, over the cap
+    assert world.count() == 0 and len(log_rows(world)) == msg.RATE_PER_MINUTE + 2
+    assert world.send("work2", "work1", "note", "x", now=BASE + 51)["id"]  # work2's own cap is untouched

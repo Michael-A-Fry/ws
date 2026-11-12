@@ -807,14 +807,42 @@ def _inside(path: str, folder: str) -> bool:
     return path.startswith(folder.rstrip("/") + "/")
 
 
+def under_hidden(entries: list[str], hidden: list[str], home: str) -> list[str]:
+    """The `entries` (`~/x` or `/x`) whose real path is one of the `hidden` folders (the same spellings) or inside one:
+    what the launch copy leaves out of `allowRead` because another class's folder is denied. `home` is what `~` means."""
+
+    def real(p: str) -> str:
+        return os.path.realpath(home + p[1:] if p == "~" or p.startswith("~/") else p)
+
+    folders = [real(h) for h in hidden]
+    return [e for e in entries if any(real(e) == f or _inside(real(e), f) for f in folders)]
+
+
 class GitFacts(NamedTuple):
     hooks: str | None  # the core.hooksPath folder, when it is inside the project
     files: list[str]  # config files in the project that git reads (an `[include]` of one)
     dirs: list[str]  # git folders inside the project: the one git finds from here, and its common folder
 
 
+_git_off = False
+
+
+@contextlib.contextmanager
+def no_git():
+    """Within the block every git question below answers as if git were missing and no process starts: for a caller that
+    must start none (`ws walls check`) and asks about a folder's launch settings."""
+    global _git_off
+    before, _git_off = _git_off, True
+    try:
+        yield
+    finally:
+        _git_off = before
+
+
 def _git(project: str, *args: str) -> str | None:
     """`git -C project ARGS` output, or None when git is missing, fails or takes longer than 10 seconds."""
+    if _git_off:
+        return None
     try:
         r = subprocess.run(
             ["git", "-C", project, *args],
@@ -2177,11 +2205,25 @@ def launch_claude(
     git resolves) is added to `denyWrite` in a copy under `<state>/gate/claude-code/projects/`, and `claude --settings`
     is started with it. No bubblewrap: Claude Code's sandbox is the wall. The end-of-run report is the launcher's, as
     for OpenCode. With an egress `plan` the copy also carries the plan's hosts as `network.allowedDomains`, and nothing
-    else is reachable."""
+    else is reachable.
+
+    A session of a walled class (a class with an `os_user`) also gets the class's own launch file (ADR 0027, `ws install
+    --class`), read from `wallsettings.launch_file_path` and merged into that copy, its keys winning: the class is the one
+    `session_class` finds for the real path of the folder, never a name from the environment, and only that class's file is
+    read. The start is refused (exit 3, the hint naming `ws install --class NAME`) when the file is not in place or is not
+    root-owned, and when the project's `.mcp.json` or `.claude/settings*.json` holds anything the allow-list does not name
+    (`wallsettings.project_problem`): a SessionStart hook cannot block, so the refusal is made here, before the runner
+    starts, and again by the hook on every call. The per-repo narrowing the policy gives the class for this folder is
+    applied last, and can only add denials."""
+    from ws import osinfo, wallsettings
     from ws.adapters import claude_code
 
     pol = pol if pol is not None else _launch_policy(args)[1]
     require_class_user(pol)  # before anything is written or started
+    cls = session_class(pol)
+    launch_doc = None
+    if cls is not None and cls.os_user:
+        launch_doc = wallsettings.load_launch_file(cls, osinfo.detect().kind)
     warn_old_runner(argv[0], env, pol)
     out = home / "gate" / "claude-code"
     base = out / claude_code.FILE
@@ -2195,12 +2237,28 @@ def launch_claude(
         project = project_folder(os.getcwd(), env)
     except SandboxError as e:
         raise WsError("refused", f"refusing to start claude-code: {e}", "start it from a project folder") from e
+    if launch_doc is not None:
+        refusal = wallsettings.project_problem([project, os.path.realpath(os.getcwd())], paths.home_dir())
+        if refusal:
+            raise refusal
     target = out / "projects" / f"{project_key(project)}.json"
     target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     if target.is_symlink():
         target.unlink()
     try:
         allow, deny = policy.launch_read_rules(pol)
+        if launch_doc is not None:
+            # The other classes' folders are denied before the allow list is filtered, so no entry (the policy's, or a git
+            # folder) can sit under one: it is dropped, and named, whatever order the merge below would put it in.
+            hidden = wallsettings.read_denied(launch_doc)
+            clash = under_hidden([*allow, *git_read_folders(project)], hidden, env.get("HOME") or str(Path.home()))
+            if clash:
+                print(
+                    f"ws: warning: left out of the readable folders, as it is inside another class's folder: "
+                    f"{', '.join(clash)}",
+                    file=sys.stderr,
+                )
+            deny = [*deny, *hidden]
         text = claude_code.for_project(
             base.read_text(encoding="utf-8"),
             project,
@@ -2214,6 +2272,10 @@ def launch_claude(
         raise WsError(
             "refused", f"refusing to start claude-code: {e}", "set `[gate] sandbox = true`, `ws install`", 3
         ) from e
+    if launch_doc is not None:
+        conf = wallsettings.merge(json.loads(text), launch_doc)
+        conf = wallsettings.narrowed(conf, cls.narrowing_for(os.path.realpath(os.getcwd())))
+        text = json.dumps(conf, indent=2) + "\n"
     from ws import install  # here, not at the top: install imports the adapters this module does
 
     try:

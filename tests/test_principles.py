@@ -20,7 +20,7 @@ PAGE = ROOT / "docs" / "reference" / "principles.md"
 PLANNED_BASELINE = 16
 
 # Every ID the page has published: prefix -> how many. Raise a count when a rule is added; never lower it.
-PUBLISHED = {"B": 7, "TC": 4, "U": 5, "W": 10, "F": 6, "C": 12, "D": 10, "G": 15}
+PUBLISHED = {"B": 7, "TC": 4, "U": 5, "W": 11, "F": 6, "C": 12, "D": 10, "G": 16}
 
 LAYERS = (
     "Brand and tokens",

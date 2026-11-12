@@ -348,7 +348,9 @@ def test_a_subagent_stop_hook_runs_for_the_guard(home):
     pol = policy.loads('[guards]\non = ["spawn-cap"]\n[guards.spawn-cap]\nmax_agents = 1\n')
     files = claude_code.generate(pol, ["ws"], home / "out", home / "p.toml")
     hooks = json.loads(files["settings.json"])["hooks"]
-    assert "SubagentStop" in hooks and "Agent|Task" in hooks["PreToolUse"][0]["matcher"]
+    # PreToolUse is registered for every tool (claude_code.MATCHER, `*`), so an Agent or Task call reaches the guard without
+    # being named; the PostToolUse and SubagentStop hooks that count a start and a stop still name what they need.
+    assert "SubagentStop" in hooks and hooks["PreToolUse"][0]["matcher"] == claude_code.MATCHER
     assert "Agent|Task" in hooks["PostToolUse"][0]["matcher"]
     start_raw = json.dumps(
         {

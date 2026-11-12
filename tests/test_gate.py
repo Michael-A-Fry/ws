@@ -94,19 +94,8 @@ def test_claude_code_settings(home, tmp_path, capsys):
     assert "Read(~/.ssh/**)" in deny
     assert not any("\\*" in d for d in deny)  # no runner has a literal star: those rules are hook-only
     hook = conf["hooks"]["PreToolUse"][0]
-    assert hook["matcher"].split("|") == [
-        "Bash",
-        "Read",
-        "Grep",
-        "Glob",
-        "WebFetch",
-        "WebSearch",
-        "Edit",
-        "Write",
-        "MultiEdit",
-        "NotebookEdit",
-        "mcp__.*",  # every MCP tool (tests/test_gate_mcp.py)
-    ]
+    assert hook["matcher"] == "*"  # every tool, the ones named in the old list and any the runner adds later
+    assert hook["hooks"][0]["onFailure"] == "block"
     policy_file = (home / "wshome" / "policy.toml").resolve()
     # absolute paths: the hook reads this policy wherever the runner starts, and protects this folder
     fallback = (

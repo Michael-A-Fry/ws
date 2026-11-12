@@ -30,5 +30,7 @@ decisions weren't about the engine.
 | [0024](0024-a-config-without-the-sandbox-stays-without-it.md) | A config written without the sandbox stays without it until the policy says so | accepted | 2026-11-09 |
 | [0025](0025-adopt-the-runner-sandbox-and-permission-keys.md) | Adopt the runner's own sandbox and permission keys, and write no wall of our own for Claude Code | accepted | 2026-11-12 |
 | [0026](0026-deny-the-home-in-the-launch-settings.md) | Deny the home folder in the Claude Code launch settings, and re-allow the project and what tools need | accepted | 2026-11-12 |
+| [0027](0027-a-settings-file-per-walled-class.md) | A settings file per walled class, read by the launch, with managed-only keys left out | accepted | 2026-11-12 |
+| [0028](0028-a-guard-logs-what-the-wall-enforces.md) | A guard logs what the wall enforces, only where the wall is proven for the call | accepted | 2026-11-12 |
 
 To add one, copy the newest record, take the next number and add a row here.

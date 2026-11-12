@@ -1,11 +1,18 @@
 """Notes module: `ws note` drops a Markdown file into the `_inbox` of your own notes folder (any app reads it).
 
 ws only adds files here; it never edits or deletes what is already in your notes. No git: the folder is yours.
+
+Walled classes. The notes and memory folders are shared stores, so a session whose class is walled (or counts-only) does
+not write to them: `capture` and `memory.add` refuse it with a typed `refused` error (`refuse_walled`), because a note
+or a memory file would carry the class's content out of its repo. The class is `policy.class_of` of the process's real
+working folder, never an argument; with no `[classes]` in the policy nothing changes, and a policy that will not load
+refuses (the class can't be told). A folder in no class is not a walled class and is not refused.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sys
 import unicodedata
@@ -13,9 +20,57 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from ws import frontmatter, output
+from ws import frontmatter, output, policy
 from ws.output import WsError  # re-exported: memory and the MCP server import it from here
 from ws.profile import ProfileError, load, profile_path
+
+
+def load_policy(env: dict | None = None) -> policy.Policy:
+    """The policy at the config folder of `env` (the process's own when None). One that will not load is a `refused`
+    error: with it unread, the data class of the caller can't be told."""
+    try:
+        return policy.load(policy.policy_path(env))
+    except (policy.PolicyError, OSError, ValueError) as e:
+        raise WsError(
+            "refused",
+            "ws can't read its policy, so it can't tell which data class this session is in",
+            "fix policy.toml (`ws doctor` says where)",
+        ) from e
+
+
+def caller_class(pol: policy.Policy, cwd: str | None = None) -> policy.Class | None:
+    """The data class of the caller: `policy.class_of` of the real working folder of this process (`cwd` is for callers
+    that already hold it). None when the policy has no `[classes]`. A working folder that can't be read is a `refused`
+    error, never a guess."""
+    if not pol.classes:
+        return None
+    try:
+        here = os.getcwd() if cwd is None else cwd
+    except OSError as e:
+        raise WsError(
+            "refused",
+            f"the current folder can't be read ({e.strerror}), so the session's data class is not known",
+            "run it from a project folder",
+        ) from e
+    return policy.class_of(pol, here)
+
+
+def is_walled(cls: policy.Class | None) -> bool:
+    """True for a class a session must not carry content out of: a declared class that is not `full`. A folder in no
+    class (UNCLASSIFIED) is not a class of anyone's, so it is not one."""
+    return cls is not None and cls is not policy.UNCLASSIFIED and cls.access != "full"
+
+
+def refuse_walled(what: str, env: dict | None = None, *, cwd: str | None = None) -> None:
+    """Raise `refused` when the caller's class is walled: `what` ("add a memory file", "capture a note") would put the
+    class's content in a store every class can read."""
+    cls = caller_class(load_policy(env), cwd)
+    if cls is not None and is_walled(cls):
+        raise WsError(
+            "refused",
+            f"a session in the walled class {cls.name!r} can't {what}: the shared store would carry its content out",
+            "keep it in the class's own repo, or leave it out; a walled class's files stay inside the class",
+        )
 
 
 def role_path(role: str, env: dict | None = None) -> Path:
@@ -75,8 +130,10 @@ def capture(
     tags: list[str] | None = None,
     source: str = "cli",
     now: datetime | None = None,
+    env: dict | None = None,
 ) -> Path:
-    """Write one note into root/_inbox and return its path."""
+    """Write one note into root/_inbox and return its path. Refused for a session in a walled class (`refuse_walled`)."""
+    refuse_walled("capture a note", env)
     text = text.strip()
     if not text:
         raise WsError("bad_input", "nothing to note: the text is empty", "give some text, or `-` to read it from stdin")

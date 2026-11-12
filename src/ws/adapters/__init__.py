@@ -15,7 +15,9 @@ A module must define:
                                                 environment resolves to); see check_argv.
     def parse(payload) -> Call | list[Call] | None
                                                 a hook payload from that runner, as neutral Call(s); None if the call
-                                                is not one the policy governs; ValueError or TypeError if it cannot be
+                                                is not one of the kinds below (the gate then makes one Call of kind
+                                                "other" from the payload's tool name, which the policy has no rule
+                                                for: it is allowed and logged); ValueError or TypeError if it cannot be
                                                 read (`ws gate check` then denies: fail closed).
     def launch_hint(out) -> str                 one line: how to start the runner with the generated config.
 
@@ -45,11 +47,14 @@ from ws import gateclient, paths
 class Call:
     """A tool call in runner-neutral terms. kind: "command" (shell), "read" (one file read), "search" (a folder
     searched or listed, recursively), "write" (a file written or edited), "tool" (a neutral tool name from
-    ws.policy.KNOWN_TOOLS), "agent" (a subagent started), "skill" (a skill loaded) or "message" (a message sent to
-    another agent) or "mcp" (an MCP tool, `mcp__server__tool`). value: the command text, the path, the tool name, the agent type, the skill name or the
-    recipient. data: what else the tool gave, read-only: a write has `old`, `new`, `content` or `edits` as the tool
-    supplies them; an agent has `prompt`, `description` and `subagent_type`; a skill has `name`; a message has `text`; an mcp call has `args`, the tool's arguments as sent.
-    The policy judges command, read, search, write, tool and mcp calls; the other kinds reach guards only."""
+    ws.policy.KNOWN_TOOLS), "agent" (a subagent started), "skill" (a skill loaded), "message" (a message sent to
+    another agent), "mcp" (an MCP tool, `mcp__server__tool`) or "other" (a tool no adapter reads, made by the gate from
+    the tool's name alone). value: the command text, the path, the tool name, the agent type, the skill name, the
+    recipient or, for "other", the tool name (capped). data: what else the tool gave, read-only: a write has `old`,
+    `new`, `content` or `edits` as the tool supplies them; an agent has `prompt`, `description` and `subagent_type`; a
+    skill has `name`; a message has `text`; an mcp call has `args`, the tool's arguments as sent; an "other" call has
+    none. The policy judges command, read, search, write, tool and mcp calls, and has no rule for "other" (it is
+    allowed, and one counts-only line in the verdict log says so); the other kinds reach guards only."""
 
     kind: str
     value: str

@@ -135,6 +135,20 @@ def test_a_canary_run_passes_and_leaves_one_line(box, capsys):
     assert len(lines(box)) == 2
 
 
+def test_a_canary_run_passes_with_guards_asked_to_log(box, capsys):
+    """A guard in log mode gives the runner no deny of its own and the hook is unchanged: the canary's checks hold."""
+    fake(box, "claude", "2.5.1")
+    profile(box)
+    (box / ".ws" / "policy.toml").write_text(
+        '[gate]\n[guards]\non = ["syntax-check", "claims", "bulk-staging"]\n'
+        '[guards.syntax-check]\nmode = "log"\n[guards.claims]\nmode = "log"\n[guards.bulk-staging]\nmode = "log"\n'
+    )
+    code, out, _ = run(capsys, "canary")
+    assert code == 0 and "claude-code  ok  2.5.1" in out
+    (line,) = lines(box)
+    assert line["ok"] is True and set(line["runners"]["claude-code"]["checks"].values()) == {"pass"}
+
+
 def test_opencode_is_checked_too(box, capsys):
     fake(box, "opencode", "1.19.4")
     code, out, _ = run(capsys, "canary", "--runner", "opencode")

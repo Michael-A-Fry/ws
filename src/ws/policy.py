@@ -122,6 +122,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
 from functools import lru_cache
 from pathlib import Path
+from typing import Self
 
 from ws import agentsession, paths, shellwords, unknownpath
 
@@ -145,7 +146,7 @@ MCP_SHIPPED = (
     "mcp__ws__msg_ack",
     "mcp__ws__msg_list",
 )
-_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
+NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")  # a usable class, guard or role name: letters, digits, `_` and `-`
 _HOST = re.compile(r"^(\*\.)?[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?$")
 _CATCH_ALL = ("0.0.0.0", "0", "::", "*")  # an entry that names every address, however it is spelled
 
@@ -176,7 +177,9 @@ ACCESS = ("full", "walled", "counts-only")  # a data class's access, loosest fir
 INBOUND = ("off", "lead-only", "allowlist")
 AUTONOMY_LEVELS = ("ask", "decide-and-tell", "autonomous")
 AUTONOMY_INTERRUPTS = ("never", "when-broken", "daily-summary")
-_CLASS_RESERVED = "unclassified"  # the name of the built-in class a path in no class gets
+CLASS_RESERVED = (
+    "unclassified"  # the name of the built-in class a path in no class gets; no `[classes.NAME]` may take it
+)
 _OS_USER = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,31}$")
 _MAX_DEPTH = 4
 _TOO_DEEP = "the command nests shells, substitutions or eval too deeply to check; write the inner command out plainly"
@@ -221,10 +224,16 @@ class Gate:
 class Guards:
     """The guards that run (ws.guards): `on` is their names; the order they run in is fixed by each guard's PRIORITY, not
     by this list. `config` maps each to what its `config()` made of its `[guards.NAME]` table. A policy with no
-    `[guards]` has none on."""
+    `[guards]` has none on. `modes` maps each of them to its `mode`, "enforce" (the default) or "log": a guard asked to log
+    refuses as usual unless the sandbox wall is proven for the call, and then logs what it would have refused
+    (ws.gate and ws.guards decide; this only records what the file asked)."""
 
     on: tuple[str, ...] = ()
     config: dict = field(default_factory=dict)
+    modes: dict = field(default_factory=dict)
+
+    def mode(self, name: str) -> str:
+        return self.modes.get(name, "enforce")
 
 
 @dataclass(frozen=True)
@@ -265,11 +274,30 @@ class EgressException:
 
 
 @dataclass(frozen=True)
+class RepoSettings:
+    """`[classes.NAME.repo_settings."GLOB"]`: what one repo glob of a class adds to its launch file. Only rules that
+    narrow: `deny` (permission rules, as Claude Code spells them), `deny_read` and `deny_write` (paths)."""
+
+    glob: str
+    deny: tuple[str, ...] = ()
+    deny_read: tuple[str, ...] = ()
+    deny_write: tuple[str, ...] = ()
+
+
+# The keys a per-repo table may hold: each only adds a denial. Any other key (an allow, a host, a bypass setting) would
+# widen what the class file holds, so it is a PolicyError naming the key.
+REPO_SETTINGS_KEYS = ("deny", "deny_read", "deny_write")
+
+
+@dataclass(frozen=True)
 class Class:
     """A data class (`[classes.NAME]`): which repos belong to it and what a session working in them may do and see.
     Consumers read it, they do not re-parse it. `access` is full, walled or counts-only. `allowed_providers` is None
     when the file does not say (the consumer picks the walled default); `inbound` defaults to off for walled and
-    counts-only and lead-only for full. `readable_by` holds class names, or `*` alone for everyone; () is nobody."""
+    counts-only and lead-only for full (`inbound` and `inbound_allow` are who may send in: no second key says it).
+    `readable_by` holds class names, or `*` alone for everyone; () is nobody. `owner` and `review_date` say who answers
+    for the class and when it is looked at again (`review_due`); `repo_settings` is one narrowing table per repo glob (a class with it names an `os_user`: the policy refuses it
+    otherwise)."""
 
     name: str
     access: str
@@ -282,14 +310,39 @@ class Class:
     inbound: str = "off"
     inbound_allow: tuple[str, ...] = ()
     retention_days: int = 30
+    owner: str = ""
+    review_date: date | None = None
+    repo_settings: tuple[RepoSettings, ...] = ()
 
     def readable_by_class(self, reader: str) -> bool:
         """May a session of class `reader` read this class's content?"""
         return "*" in self.readable_by or reader in self.readable_by
 
+    def review_due(self, now: datetime) -> bool:
+        """Is the class's review date today or past, in UTC? False when it has none. The one judge of a stale review: the
+        doctor's WS017 and `ws walls check` both call it, with the same `now`, so they never disagree at midnight or in
+        another timezone. `now` must be timezone-aware."""
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("now must be timezone-aware (use datetime.now(UTC))")
+        return self.review_date is not None and now.astimezone(UTC).date() >= self.review_date
+
+    def narrowing_for(self, path) -> RepoSettings:
+        """The per-repo settings (`repo_settings`) of every repo glob of this class that holds `path` (its real path),
+        joined. They only add rules: nothing here can widen what the class file allows."""
+        try:
+            places = _class_places(path)
+        except (ValueError, OSError):
+            return RepoSettings("")
+        hit = [r for r in self.repo_settings if any(_path_regex(r.glob).match(x) for x in places)]
+
+        def join(attr: str) -> tuple[str, ...]:
+            return tuple(dict.fromkeys(x for r in hit for x in getattr(r, attr)))
+
+        return RepoSettings("", join("deny"), join("deny_read"), join("deny_write"))
+
 
 # What a path in no class is: counts only, nothing comes in, nobody else reads it, no network.
-UNCLASSIFIED = Class(_CLASS_RESERVED, "counts-only")
+UNCLASSIFIED = Class(CLASS_RESERVED, "counts-only")
 
 
 @dataclass(frozen=True)
@@ -458,14 +511,21 @@ read_outside_project = false
 #                    session's own pane after its hand-over was delivered
 [guards]
 on = ["syntax-check", "session-context", "dev-server"]
-# [guards.syntax-check]
+# Any guard takes `mode = "enforce"` (the default) or `mode = "log"`. In log, a call the guard would refuse is allowed and
+# logged (counts only, to logs/gate.jsonl) when the sandbox wall is proven for that call; anywhere else it is refused as in
+# enforce, and `ws doctor` (WS018) says when this machine can't give the wall. The prose guards ship in log.
+[guards.syntax-check]
+mode = "log"
 # extra = {{ yaml = ["yamllint", "-d", "relaxed"] }}   # an extension and the checker that gets the file path appended
 # [guards.session-context]
 # files = ["STATE.md", ".state/STATE.md", "HANDOFF.md", "TODO.md"]   # the default; list the state files your projects keep
 # warn_api_key = true   # on by default: a line when ANTHROPIC_API_KEY, not the subscription, bills a session
 # [guards.claims]
+# mode = "log"
 # release_dir = "~/releases"   # a folder whose `current` link names the promoted release; left out, claims are off
 # release_tags = ["v[0-9]+[.][0-9]+([.][0-9]+)*"]   # regexes for a release's name; the default reads v1.2 and v1.2.3
+# [guards.test-weakening]
+# mode = "log"
 # [guards.skill-gate]
 # skill_dirs = ["~/.claude/skills"]   # where skills keep their own `gates`; add rules as [[guards.skill-gate.rules]]
 # [guards.spawn-cap]
@@ -618,7 +678,7 @@ def loads(text: str) -> Policy:
     if not isinstance(srcs, dict):
         raise PolicyError("[sources] must be a table of tables")
     for name, body in srcs.items():
-        if not _NAME.match(name):
+        if not NAME_PATTERN.match(name):
             raise PolicyError(f"[sources]: {name!r} is not a plain name (letters, digits, _ and -)")
         where = f"[sources.{name}] "
         body = _table(body, where.strip(), {"mode", "untrusted", "sensitive", "acts", "outward"})
@@ -777,7 +837,7 @@ def _plain_names(d: dict, key: str, where: str) -> tuple[str, ...]:
     """A list of plain names (letters, digits, `_` and `-`)."""
     items = _strings(d, key, where)
     for item in items:
-        if not _NAME.fullmatch(item):
+        if not NAME_PATTERN.fullmatch(item):
             raise PolicyError(f"{where}{key}: {item!r} is not a plain name (letters, digits, _ and -)")
     return items
 
@@ -788,9 +848,9 @@ def _classes(raw) -> dict[str, Class]:
         raise PolicyError("[classes] must be a table of tables")
     out: dict[str, Class] = {}
     for name, body in raw.items():
-        if not _NAME.fullmatch(name):
+        if not NAME_PATTERN.fullmatch(name):
             raise PolicyError(f"[classes]: {name!r} is not a plain name (letters, digits, _ and -)")
-        if name == _CLASS_RESERVED:
+        if name == CLASS_RESERVED:
             raise PolicyError(f"[classes]: {name!r} is the built-in class for a path in no class; pick another name")
         where = f"[classes.{name}] "
         body = _table(
@@ -807,6 +867,9 @@ def _classes(raw) -> dict[str, Class]:
                 "inbound_allow",
                 "retention_days",
                 "repos",
+                "owner",
+                "review_date",
+                "repo_settings",
             },
         )
         if "access" not in body:
@@ -838,6 +901,18 @@ def _classes(raw) -> dict[str, Class]:
         repos = _strings(body, "repos", where)
         if not repos:
             raise PolicyError(f"{where}repos is required (a non-empty list of path globs)")
+        owner = _get(body, "owner", str, where, "")
+        if "owner" in body and not owner.strip():
+            raise PolicyError(f"{where}owner must not be empty: name who answers for the class")
+        review = body.get("review_date")
+        if "review_date" in body and type(review) is not date:
+            raise PolicyError(f"{where}review_date must be a TOML date such as 2027-03-01, not {review!r}")
+        narrowing = parse_repo_settings(body.get("repo_settings"), repos, where)
+        if narrowing and os_user is None:
+            raise PolicyError(
+                f"{where}repo_settings needs os_user: a per-repo table narrows the settings file of a walled class, and "
+                "a class with no OS user has none"
+            )
         out[name] = Class(
             name,
             access,
@@ -850,12 +925,39 @@ def _classes(raw) -> dict[str, Class]:
             inbound,
             allow,
             days,
+            owner.strip(),
+            review,
+            narrowing,
         )
     for c in out.values():
         for r in c.readable_by:
             if r != "*" and r not in out:
                 raise PolicyError(f"[classes.{c.name}] readable_by: unknown class {r!r}")
     return out
+
+
+def parse_repo_settings(raw, repos: tuple[str, ...], where: str) -> tuple[RepoSettings, ...]:
+    """`[classes.NAME.repo_settings."GLOB"]`: one table per repo glob of the class, each holding only what narrows the class
+    file (REPO_SETTINGS_KEYS). A key that would widen it is refused, naming the key and the glob."""
+    if raw is None:
+        return ()
+    if not isinstance(raw, dict):
+        raise PolicyError(f"{where}repo_settings must be a table of tables, one per repo glob")
+    out = []
+    for glob, body in raw.items():
+        at = f'{where}repo_settings."{glob}" '
+        if glob not in repos:
+            raise PolicyError(f"{at}is not one of the class's repos")
+        if not isinstance(body, dict):
+            raise PolicyError(f"{at}must be a table")
+        for key in body:
+            if key not in REPO_SETTINGS_KEYS:
+                raise PolicyError(
+                    f"{at}{key}: would widen the class file; a per-repo table may only narrow it "
+                    f"({', '.join(REPO_SETTINGS_KEYS)})"
+                )
+        out.append(RepoSettings(glob, *(_strings(body, key, at) for key in REPO_SETTINGS_KEYS)))
+    return tuple(out)
 
 
 def _purposes(raw) -> dict[str, float]:
@@ -866,7 +968,7 @@ def _purposes(raw) -> dict[str, float]:
         raise PolicyError("[budget.purposes] must be a table of purpose = monthly USD cap")
     out: dict[str, float] = {}
     for name, v in purposes.items():
-        if not _NAME.fullmatch(name):
+        if not NAME_PATTERN.fullmatch(name):
             raise PolicyError(f"[budget.purposes]: {name!r} is not a plain name (letters, digits, _ and -)")
         if isinstance(v, bool) or not isinstance(v, int | float):
             raise PolicyError(f"[budget.purposes] {name} must be a number (monthly USD)")
@@ -904,8 +1006,12 @@ def _autonomy(raw) -> Autonomy:
     return Autonomy(level, when, tuple(dict.fromkeys(_plain_names(t, "always_ask", "[autonomy] "))))
 
 
+GUARD_MODES = ("enforce", "log")
+
+
 def _guards(raw) -> Guards:
-    """`[guards]`: `on` names the guards that run; `[guards.NAME]` is that guard's own table, checked by the guard."""
+    """`[guards]`: `on` names the guards that run; `[guards.NAME]` is that guard's own table, checked by the guard once
+    `mode` ("enforce" or "log") is taken off it. Any other value of `mode`, for any guard, refuses the whole policy."""
     from ws import guards  # here, not at the top: the guards import this module
 
     known = guards.names()
@@ -916,8 +1022,18 @@ def _guards(raw) -> Guards:
             raise PolicyError(f"[guards] on: unknown guard {name!r} (known: {', '.join(known)})")
     if len(set(on)) != len(on):
         raise PolicyError("[guards] on: a guard is named twice")
-    config = {name: guards.get(name).config(t.get(name, {}), f"[guards.{name}]") for name in known}
-    return Guards(on, {name: config[name] for name in on})
+    modes, config = {}, {}
+    for name in known:
+        where = f"[guards.{name}]"
+        table = t.get(name, {})
+        if isinstance(table, dict) and "mode" in table:  # the policy's own key: the guard's config() never sees it
+            mode = table["mode"]
+            if mode not in GUARD_MODES:
+                raise PolicyError(f'{where}: mode must be "enforce" or "log", not {mode!r}')
+            modes[name] = mode
+            table = {k: v for k, v in table.items() if k != "mode"}
+        config[name] = guards.get(name).config(table, where)
+    return Guards(on, {name: config[name] for name in on}, {name: modes.get(name, "enforce") for name in on})
 
 
 def default_policy() -> Policy:
@@ -1134,6 +1250,27 @@ NET_PROBES = (
 )
 
 
+class Refusal(str):
+    """The reason `is_denied_command` gives for a refusal the sandbox wall can make redundant, as text like any other
+    reason, with its `kind` carried by the type (as `ws.gate.Ask` carries a request): a caller branches on the kind, never
+    on the words. A refusal of any other kind is a plain `str`."""
+
+    kind: str
+
+    def __new__(cls, text: str, kind: str) -> Self:
+        self = super().__new__(cls, text)
+        self.kind = kind
+        return self
+
+
+UNKNOWN_WORD = "unknown-command-word"  # the program to run holds a part ws cannot read
+SETS_IFS = shellwords.SETS_IFS  # a line that sets IFS, so later words may split anywhere
+UNREAD_WRITE = "unread-write"  # a write to a path ws cannot read, such as a scratch file `mktemp` made in the project
+WALL_REDUNDANT = (UNKNOWN_WORD, SETS_IFS, UNREAD_WRITE)
+"""The refusals a proven wall makes redundant, for a command call: whatever such a command runs or writes, the wall holds
+it to the project and the folders the policy allows, makes ws's own files read-only, and hides the deny_read folders."""
+
+
 @dataclass
 class _Ctx:
     """What earlier parts of the same command line did: the folder (cd), variables, and paths ws protects."""
@@ -1152,6 +1289,9 @@ class _Ctx:
         False  # here-document bodies are read as commands here; the other reading judges the rest
     )
     arith: bool = False  # the line holds arithmetic, which runs the command substitutions in the text it is given
+    soft: list[Refusal] | None = (
+        None  # when a list: a refusal the wall makes redundant is noted here and the walk goes on
+    )
 
     def fork(self) -> _Ctx:
         return _Ctx(
@@ -1167,6 +1307,7 @@ class _Ctx:
             cwd_unknown=self.cwd_unknown,
             bodies_as_commands=self.bodies_as_commands,
             arith=self.arith,
+            soft=self.soft,
         )
 
 
@@ -2020,12 +2161,21 @@ def _segment_once(
     written = _written(cmd, flags, operands, redirs, canon, toks) if ctx.protect else []
     if not ctx.bodies_as_commands:  # text read as a command only to keep a body from hiding one: not a word of the line
         plain = _written(cmd, *shellwords.split_args(toks), redirs, toks, toks) if ctx.protect else []
-        reason = _unresolved_code(ctx, toks, env) or _unknown_refusal(
-            policy, ctx, cmd, toks, toks, redirs, _call_pieces(lexed, env), dropped, plain, env
-        )
-        if not reason and env_u is not None:  # the same line with each default left as written
-            reason = _unknown_unread(policy, ctx, seg, env_u)
-        if reason:
+        checks: list[Callable[[], str | None]] = [
+            lambda: _unresolved_code(ctx, toks, env),
+            lambda: _unknown_refusal(
+                policy, ctx, cmd, toks, toks, redirs, _call_pieces(lexed, env), dropped, plain, env
+            ),
+        ]
+        if env_u is not None:  # the same line with each default left as written
+            checks.append(lambda: _unknown_unread(policy, ctx, seg, env_u))
+        for check in checks:
+            reason = check()
+            if not reason:
+                continue
+            if ctx.soft is not None and isinstance(reason, Refusal) and reason.kind in WALL_REDUNDANT:
+                ctx.soft.append(reason)  # the wall holds what this runs; the rest of the line is still judged
+                continue
             return reason, line, nested
     for p in named:
         rule = _read_hit(policy, p, ctx.cwd, recursive=recursive, expand=False)
@@ -2339,21 +2489,33 @@ def _unknown_refusal(
         files = _FILE_FLAGS.get(cmd)  # the files they send or read: -T FILE, -K FILE, -b FILE, --post-file FILE
         if files:
             words += [(w, "piece") for w in shellwords.option_values(toks, files[0], files[1])]
-    words += [(t, "redirect") for op, t in redirs if t and op in _REDIRECT_FILES]
+    words += [
+        (t, "wredirect" if op in shellwords.WRITE_OPS else "redirect")
+        for op, t in redirs
+        if t and op in _REDIRECT_FILES
+    ]
     words += [(p, "written") for p, _ in written]
     prod = _producer(ctx, env)
     seen: set[tuple[str, str]] = set()
+    soft: str | None = None  # the first wall-redundant refusal: held back, so a later plain one is not hidden by it
     for word, how in words:
         if (word, how) in seen:
             continue
         seen.add((word, how))
         items = unknownpath.split(word, known, prod)
         if unknownpath.is_bare(items):
-            takes = {"redirect": "a redirect to", "written": f"{cmd} writing to"}.get(how, f"{cmd} the file")
-            return (
-                f"command gives {takes} {word!r}, which ws cannot read: it could be any file, including one ws "
-                f"protects; {HOW_TO_SPELL}"
+            takes = {"redirect": "a redirect to", "wredirect": "a redirect to", "written": f"{cmd} writing to"}.get(
+                how, f"{cmd} the file"
             )
+            found = _write_refusal(
+                f"command gives {takes} {word!r}, which ws cannot read: it could be any file, including one ws "
+                f"protects; {HOW_TO_SPELL}",
+                how,
+            )
+            if not isinstance(found, Refusal):
+                return found
+            soft = soft or found
+            continue
         if how == "operand" and cmd in _ADDRESS_CMDS and "@" not in word and _URL.match(word):
             continue  # a scheme ahead of the unresolved part: an address, and not the file a bare word could be
         pattern = _pattern_of(word, ctx, known, prod)
@@ -2367,17 +2529,29 @@ def _unknown_refusal(
             return f"a path word is too long to check ({len(pattern)} characters); {HOW_TO_SPELL}"
         for p, ancestors in written:
             if p == word and (hit := _protect_hit(pattern, ctx.protect, ctx.cwd, ancestors)):
-                return (
+                return (  # a plain refusal: the wall does not stand in for the protected-write rule
                     f"command writes {word!r}, which holds a part ws cannot read, and some value of it would be {hit}, "
                     f"which ws protects; {HOW_TO_SPELL}"
                 )
         for rule, alts in deny:
             if unknownpath.reaches(pattern, alts, CASELESS_PATHS):
-                return (
+                found = _write_refusal(
                     f"command names {word!r}, which holds a part ws cannot read, and some value of it would be a path "
-                    f"denied by deny_read rule {rule!r}; {HOW_TO_SPELL}"
+                    f"denied by deny_read rule {rule!r}; {HOW_TO_SPELL}",
+                    how,
                 )
-    return None
+                if not isinstance(found, Refusal):
+                    return found
+                soft = soft or found
+                break
+    return soft
+
+
+def _write_refusal(text: str, how: str) -> str:
+    """The refusal for a path word ws cannot read, typed `UNREAD_WRITE` when the command only writes it (a redirect that
+    writes, or a file a command writes or removes): the wall allows writes in the project and the folders the policy
+    names, so a scratch file there is no read of a path ws hides. Read through anything else, it is a plain refusal."""
+    return Refusal(text, UNREAD_WRITE) if how in ("wredirect", "written") else text
 
 
 # --- what a command prints, when it is known ------------------------------------------------------------------------
@@ -2558,9 +2732,10 @@ def _unresolved_code(ctx: _Ctx, toks: list[str], env) -> str | None:
         return unknownpath.has_unknown(unknownpath.split(word, known, made))
 
     if unresolved(toks[0], _producer(ctx, env)):
-        return (
+        return Refusal(
             f"the program to run is {toks[0]!r}, which holds a part ws cannot read, so ws cannot tell what runs; "
-            f"{HOW_TO_NAME}"
+            f"{HOW_TO_NAME}",
+            UNKNOWN_WORD,
         )
     if toks[0] == "eval" and any(unresolved(w, None) for w in toks[1:]):
         return (
@@ -2853,32 +3028,44 @@ def _readings(command: str) -> list[str]:
     return [command, command.replace("\\\n", "")] if "\\\n" in command else [command]
 
 
-def _walk_command(policy: Policy, command: str, cwd: str, protect: tuple[str, ...], cands: list[str]) -> str | None:
+def _walk_command(
+    policy: Policy,
+    command: str,
+    cwd: str,
+    protect: tuple[str, ...],
+    cands: list[str],
+    soft: list[Refusal] | None = None,
+) -> str | None:
     """_walk for a whole command. In the one plain shape shellwords.without_bodies accepts, the bodies are text and the lines
     around them are judged. Any other command is judged with every body read as commands (so a body can't hide
     anything) and then once more with the bodies left out, so a stray quote in a body can't hide the lines after it."""
     data = shellwords.without_bodies(command)
     if data is not None:
-        return _walk(policy, data, _Ctx(cwd, protect), 0, cands)
+        return _walk(policy, data, _Ctx(cwd, protect, soft=soft), 0, cands)
     second = "<<" in command and not shellwords.folds(command)  # the reading that leaves the bodies out
     for text in _readings(command):
-        reason = _walk(policy, text, _Ctx(cwd, protect, bodies_as_commands=second), 0, cands)
+        reason = _walk(policy, text, _Ctx(cwd, protect, bodies_as_commands=second, soft=soft), 0, cands)
         if reason:
             return reason
     if second:
-        return _walk(policy, command, _Ctx(cwd, protect, None, True), 0, cands)
+        return _walk(policy, command, _Ctx(cwd, protect, None, True, soft=soft), 0, cands)
     return None
 
 
 def is_denied_command(
-    policy: Policy, command: str, *, protect: tuple[str, ...] = (), cwd: str | None = None
+    policy: Policy, command: str, *, protect: tuple[str, ...] = (), cwd: str | None = None, wall: bool = False
 ) -> str | None:
     """None if the command may run, else the reason. Every shell segment is checked (split on ; && || | & newline,
     $(...), backticks, <(...), `bash -c`), after stripping sudo/env/timeout/xargs wrappers and normalising flags,
     paths, git's global options, `cd` and simple `VAR=value`. Also denied: a shell fed its script by a pipe or
     here-document, a path under deny_read (or the folder itself, or a folder above it used recursively, or a glob
     that reaches it), and a write to a `protect` path (ws's own policy and generated gate files). Raises on input
-    it cannot judge: callers treat that as a deny. This is the second layer; see the note above."""
+    it cannot judge: callers treat that as a deny. This is the second layer; see the note above.
+
+    A refusal the sandbox wall makes redundant (`WALL_REDUNDANT`) comes back as a `Refusal` carrying its kind. With
+    `wall=True` (the caller has proved the wall for this call) the reader goes on past such a refusal and judges the rest
+    of the line: the result is then a plain `str` for any other refusal found, and the first `Refusal` only when the line
+    holds nothing else to refuse, so a caller that lets those through still gets every other rule."""
     if not isinstance(command, str):
         raise TypeError("command must be text")
     if len(command) > MAX_COMMAND_CHARS:
@@ -2887,32 +3074,70 @@ def is_denied_command(
             f"{MAX_COMMAND_CHARS:,}); write it to a file with the Write tool and run that file"
         )
     cands: list[str] = []
+    soft: list[Refusal] | None = [] if wall else None
+    reread = False  # the line is being read a second time, with the separator renamed
+    where = cwd or _cwd()
     try:
         with shellwords.time_limit():
-            shellwords.require_closed(command)
-            reason = _walk_command(policy, command, cwd or _cwd(), tuple(protect), cands)
+            try:
+                shellwords.require_closed(command)
+                reason = _walk_command(policy, command, where, tuple(protect), cands, soft)
+            except shellwords.ShellError as e:
+                if soft is None or e.rule != shellwords.SETS_IFS:
+                    raise
+                if shellwords.ifs_can_split(command):  # an expansion may split into other words: no rule can follow it
+                    return e.message
+                soft.append(Refusal(e.message, SETS_IFS))  # the rest of the line is read with the setting renamed
+                reread = True
+                renamed = shellwords.without_ifs_setting(command)
+                shellwords.require_closed(renamed)
+                reason = _walk_command(policy, renamed, where, tuple(protect), cands, soft)
     except shellwords.ShellError as e:  # text the reader will not expand: a refusal, with the kind kept in the error
-        return e.message
+        # a refusal on the second read is a plain one: the rest of the line was never judged, so the wall cannot stand in
+        return Refusal(e.message, e.rule) if e.rule in WALL_REDUNDANT and not reread else e.message
     if reason:
         return reason
     for pat in policy.gate.deny_commands:
         rx = _glob_regex(_canon_pattern(pat))
         if any(rx.match(c) for c in cands):
             return f"command matches deny_commands rule {pat!r}"
-    return None
+    if soft:
+        unread = next((r for r in soft if r.kind == UNKNOWN_WORD), None)
+        if unread is not None and (policy.gate.deny_commands or policy.gate.ask_commands):
+            # the wall holds where the line writes, not which program it runs, and a rule written about a program cannot
+            # match a word ws cannot read: a plain refusal, so the wall does not stand in for those rules
+            return f"{unread}; a deny_commands or ask_commands rule is set, and it cannot be matched to a program ws cannot read"
+        if unread is not None and (judges := _command_guards_enforcing(policy)):
+            # a guard that refuses commands reads the program word too (`$X git add -A` is git to the shell, not to it)
+            return f"{unread}; guard {judges[0]} refuses commands, and it cannot read a program ws cannot read"
+    return soft[0] if soft else None
+
+
+def _command_guards_enforcing(policy: Policy) -> tuple[str, ...]:
+    """The guards that are on, judge command calls before they run and are in enforce mode. A guard in log mode inside a
+    proven wall would only count what it refuses, and one in the band that only records (PRIORITY 0) refuses nothing,
+    so neither is one of them."""
+    from ws import guards  # here, not at the top: ws.guards imports this module
+
+    return tuple(
+        g.NAME
+        for g in guards.wanted(policy.guards.on, "pre")
+        if "command" in g.KINDS and guards.priority(g) > 0 and policy.guards.mode(g.NAME) != "log"
+    )
 
 
 def needs_approval(policy: Policy, command: str, *, cwd: str | None = None) -> bool:
     """True if some shell segment of the command matches an `ask_commands` rule. It reads the line as
     is_denied_command does (so `bash -c "git push"` asks as `git push` does). Call it after is_denied_command: a
-    command that is denied outright never gets as far as asking."""
+    command that is denied outright never gets as far as asking. A line that is_denied_command read past a refusal the
+    wall makes redundant (a scratch write, say) is read past it here too, so a segment after it still asks."""
     if not isinstance(command, str):
         raise TypeError("command must be text")
     if not policy.gate.ask_commands:
         return False
     cands: list[str] = []
     with shellwords.time_limit():
-        _walk_command(policy, command, cwd or _cwd(), (), cands)
+        _walk_command(policy, command, cwd or _cwd(), (), cands, [])
     return any(_glob_regex(_canon_pattern(pat)).match(c) for pat in policy.gate.ask_commands for c in cands)
 
 
@@ -3030,7 +3255,7 @@ def native_patterns(policy: Policy) -> list[str]:
     for pat in policy.gate.deny_commands:
         if not any(c in pat for c in _HOOK_ONLY):
             out += variants(pat)
-    out += guards.native_deny(policy.guards.on)
+    out += guards.native_deny(policy.guards.on, policy.guards.modes)
     return list(dict.fromkeys(out))
 
 

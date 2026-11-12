@@ -54,12 +54,12 @@ hook (`preflight`) denies, with a plain message, every call made from a folder w
 sandbox off or open it up, because an interactive session cannot be started with that flag by ws.
 The sandbox covers shell commands; Claude's own Read, Edit and Write tools are covered by the permission rules above and
 the hook, not by it. Reads by those tools outside the working folders are held by
-`permissions.blockReadsOutsideWorkingDirectories` (Claude Code 2.1.257 and newer), set in the launch settings and the
-class file, never merged into a person's own settings file; the policy's `[gate] read_outside_project = true` leaves it
+`permissions.blockReadsOutsideWorkingDirectories` (Claude Code 2.1.257 and newer), set in the launch settings and in a class's
+launch file, never merged into a person's own settings file; the policy's `[gate] read_outside_project = true` leaves it
 out. Claude Code applies a `true` from any settings file, so a project's own settings cannot lift it. `env` carries WS_GATED_SESSION so `ws approve` knows it is being run from a gated session.
 
-Guards (ws.guards) add hooks, only for the events and tools the guards that are on need: PreToolUse matches more tools
-(Agent, Task, Skill, SendMessage) when a guard reads them; PostToolUse, SubagentStop and the prompt event run
+The PreToolUse hook matches every tool (`MATCHER`), so it needs no list that grows with the tools. Guards (ws.guards) add
+hooks, only for the events and tools the guards that are on need: PostToolUse, SubagentStop and the prompt event run
 `ws gate event`; SessionStart and Stop run it beside what they already run.
 
 Which hooks can block: PreToolUse (`ws gate check`) denies a call, and its command ends `|| exit 2` so a missing or
@@ -116,9 +116,10 @@ from ws.policy import Policy, native_patterns, sandbox_read_paths, sandbox_write
 
 NAME = "claude-code"
 FILE = "settings.json"
-# `mcp__.*` makes Claude Code read the matcher as a regular expression, which is not anchored: the hook also runs for
-# a tool whose name merely contains one of the others (TodoWrite), and `parse` lets those through.
-MATCHER = "Bash|Read|Grep|Glob|WebFetch|WebSearch|Edit|Write|MultiEdit|NotebookEdit|mcp__.*"
+# The PreToolUse gate hook runs for every tool: `*` matches all (Claude Code's hooks reference, "Matcher patterns"), so a
+# tool the runner adds later is gated too. `parse` knows the tools ws judges and returns None for the rest, which the
+# gate allows; the hook is the layer that is always there, whatever the tool is called.
+MATCHER = "*"
 _TOOLS = {"web_fetch": "WebFetch", "web_search": "WebSearch"}
 _NEUTRAL = {v: k for k, v in _TOOLS.items()}
 # The project files that run as code, at any depth. These are the Edit locks in the user's own settings.json (every
@@ -172,7 +173,6 @@ _KIND_TOOLS = {
     "skill": ("Skill",),
     "message": ("SendMessage",),
 }
-_EXTRA_PRE_KINDS = ("agent", "skill", "message")  # the PreToolUse matcher covers the other kinds already
 # seconds a hook may take. More than the thin client's worst case (ws.gateclient.WORST_CASE_S: the wait for the daemon,
 # then the check in its own process), or the runner kills a hook that was about to answer and "block" denies the call.
 HOOK_TIMEOUT = 30
@@ -301,15 +301,24 @@ def preflight_refusal(payload: dict) -> WsError | None:
     link and without blocking, because a hook that hangs fails open (only exit 2 blocks). It is skipped only when the
     settings `env` says WS_SANDBOXED=0 (the marker of settings written without the sandbox block); settings written
     before the marker existed have the block and no marker, so it runs for them. Both folders are checked, so one
-    (CLAUDE_PROJECT_DIR is a variable a project's settings could set) cannot hide the other."""
-    if os.environ.get(SANDBOX_MARKER) == "0":
-        return None
+    (CLAUDE_PROJECT_DIR is a variable a project's settings could set) cannot hide the other.
+
+    A session of a walled class (the launch file's env carries `wallsettings.WALL_MARKER`, which reaches the hook through
+    the `--settings` file a project's settings cannot outrank) is also checked for what its project adds beyond the launch
+    file: the same rule `ws gate launch` runs before the runner starts (`wallsettings.project_problem`), here on every
+    call, because a project file can appear after the start."""
     starts = [
         p
         for p in (os.environ.get("CLAUDE_PROJECT_DIR"), payload.get("cwd"))
         if isinstance(p, str) and p.startswith("/")
     ]
     home = paths.home_dir()
+    if os.environ.get(wallsettings.WALL_MARKER) == "1":
+        walled = wallsettings.project_problem(starts, home)
+        if walled:
+            return walled
+    if os.environ.get(SANDBOX_MARKER) == "0":
+        return None
     seen: set[Path] = set()
     for d in [x for start in starts for x in (Path(start), *Path(start).parents)]:
         if d == home or d in seen:  # ~/.claude/settings.json is the person's own (user scope), not a project's
@@ -556,7 +565,6 @@ def generate(
     hook = (
         shlex.join(client_argv("check", check_argv(ws_cmd, NAME, policy_file, out, protect, pin), pin)) + " || exit 2"
     )
-    matcher = _matcher(guards.kinds_for(policy.guards.on, "pre") & set(_EXTRA_PRE_KINDS), tuple(MATCHER.split("|")))
     permissions: dict = {"deny": list(dict.fromkeys(deny)), wallsettings.BYPASS_KEY: wallsettings.BYPASS_OFF}
     if not user_scope and not policy.gate.read_outside_project:
         # never in a person's own settings file (user_scope): it would bind every Claude Code session they start
@@ -569,7 +577,7 @@ def generate(
         "hooks": {
             "PreToolUse": [
                 {
-                    "matcher": matcher,
+                    "matcher": MATCHER,
                     "hooks": [{"type": "command", "command": hook, "timeout": HOOK_TIMEOUT, "onFailure": "block"}],
                 }
             ]

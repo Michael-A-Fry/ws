@@ -61,6 +61,47 @@ path the wall holds. `ws install` refuses, naming each setting and its file, unl
 for as long as one is there. Settings that ws can't see (a `--settings` flag, a managed policy outside the files
 `ws doctor` reads) can widen the wall too. Doctor reports what it can read.
 
+## A walled class as an operating-system boundary
+
+A data class with an `os_user` is a walled class, and it's optional: it needs a second account on a Linux or macOS
+machine. Its boundary is built from controls the runner and the OS already have: the class's own account, folder modes
+(your home closed to other accounts), Claude Code's settings keys and its sandbox. ws writes and checks those keys; it
+enforces nothing new.
+
+Each walled class has two root-owned settings files. The managed-settings file is the machine-wide drop-in in Claude
+Code's managed-settings folder, which Claude Code reads for every account on the machine, so a bare `claude` run as the
+class account is bound by it. It holds the sandbox required and no unsandboxed retry; bypass off; writes only in the
+class's repos and scratch; the home folder unreadable except those repos; inbound lead-only; and the network shut but for
+the class's own hosts (`allowedDomains` with `allowManagedDomainsOnly`). The launch file is one per class, in a
+`ws-classes` folder beside the managed-settings folder, which Claude Code doesn't read. `ws gate launch` reads the class's
+launch file and merges it into the settings copy it passes to Claude Code with `--settings`, its keys winning, so a
+session of another class, or of none, is never given it. It holds `Read` and `Edit` denied for the home folder, ws's own
+folders and the other classes' repos; file reads held to the working folders; messages from other sessions refused
+(`crossSessionInbound`, with `SendMessage` and `ListAgents` denied, and `isolatePeerMachines`, which only asks before a
+cross-machine send); `disableAllHooks` false; the other classes' repos unreadable; the network held to the class's hosts
+(`strictAllowlist`); the class marker; and OpenTelemetry prompt and tool-content logging off. A launch with no launch file
+is refused (exit 3). A key Claude Code reads only from managed settings isn't written to the launch file: see
+[ADR 0027](../decisions/0027-a-settings-file-per-walled-class.md). One class per machine is the tested shape: see
+[Known limits](known-limits.md).
+
+A walled session's project is read against an allow-list, because Claude Code reads a repository's `.mcp.json` and
+`.claude/settings*.json` itself. A `.mcp.json` may start no MCP server. A settings file may hold only `model`,
+`permissions` (`deny`, `ask` and a `defaultMode` of `plan` or `default`), `attribution`, `includeCoAuthoredBy`,
+`outputStyle`, `language`, `cleanupPeriodDays`, `respectGitignore`, a `sandbox` table that only narrows (it may add
+denials, and keep the sandbox on; any key that could open it gets refused whatever its value, `enableWeakerNestedSandbox`
+and `enableWeakerNetworkIsolation` included), an `env` of nine named variables, and the schema key; any other key is
+refused, naming it. The check also reads the frontmatter of the project's skills, agents and commands, and refuses a
+`hooks` key, an agent's `mcpServers` or `permissionMode`, and a skill's or command's `allowed-tools`; any
+`.claude/workflows/*.js` is refused. It reads the folder, each folder above it and, for a git worktree, the main
+checkout. A file that exists but doesn't read (empty, not JSON, a header with no closing fence) is refused, not skipped.
+ws refuses before the runner starts (a SessionStart hook can't block) and again on every call. The gate hook is
+registered for every tool and runs under every permission mode, bypass and auto included.
+
+`ws walls check` checks without sudo, case by case, that these settings are in place: it reads the files, the account
+and the modes, and asks the gate's own functions about a probe call. It's not a live test that the runner enforces them.
+It exits 1 when a case fails or the host isn't set up.
+Set-up is [yours to run](../how-to/set-up-a-class-user.md): ws prints the commands and the way out, and runs none of them.
+
 The wall fails closed. With no bubblewrap, or with unprivileged user namespaces switched off, `ws gate launch` refuses and
 prints the install line. `--no-sandbox` starts the runner bare and says what that gives up, so skipping the wall is a
 visible choice.

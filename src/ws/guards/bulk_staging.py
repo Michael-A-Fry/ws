@@ -9,7 +9,15 @@ and `git commit -m msg` go through. Text inside quotes, comments and here-docume
 `git commit -m "git add -A"` and a message passed as a here-document are fine; the text after `eval` and in
 `bash -c '...'` is a command and is read.
 
-The runner's own deny rules carry the plain spellings too (NATIVE_DENY), so they hold with no hook.
+The runner's own deny rules carry every form a pattern on the command text can say (NATIVE_DENY), so those hold with
+no hook: `-A` and `--all` (and the prefixes git reads as it), `-u` and `--update` bare, and each name for the top of the
+tree (`.`, `./`, `./.`, `:/`, `:/.`, `..`) alone, after `--` or after `-u`, for `add` and `stage`; `commit` with `-a` or
+`--all`, or the tree named alone, after `--` or after `-i`; the same behind git's global options; and `git -c alias.`.
+Four forms stay with the hook, because a pattern can't say them without denying a legal command or breaking the rule
+syntax: a short-option cluster that holds the letter after others (`-vA`, `-vam`), an option after `-u` or after the
+message (`add -u -v`, `commit -m msg -a`, where the message may hold the same words), a pathspec that is a literal star,
+a variable or a substitution, or holds parentheses (`:(top)`), and the `GIT_CONFIG_*` variables. A guard asked to log
+(`mode = "log"`) gets none of these in the runner's list: they would refuse where the guard logs.
 """
 
 from __future__ import annotations
@@ -24,26 +32,27 @@ NAME = "bulk-staging"
 EVENTS = ("pre",)
 KINDS = ("command",)
 PRIORITY = 10
-_NATIVE_SUBS = (
-    "add -A*",
-    "add --a*",
-    "add .",
-    "add ./",
-    "add :/",
-    "add -u",
-    "add --u*",
-    "stage -A*",
-    "stage --a*",
-    "stage .",
-    "stage ./",
-    "stage :/",
-    "stage -u",
-    "stage --u*",
-    "commit -a*",
-    "commit --all*",
-    "commit .",
-    "commit -- .",
-)
+_STAGES = ("add", "stage")  # `git stage` is git's own name for `git add`
+_TREE = (".", "./", "./.", ":/", ":/.", "..")  # the names for the top of the tree a pattern can say (no parentheses)
+_UPDATE = tuple("--update"[:n] for n in range(3, 9))  # `--update`, and each prefix of it git reads as it (`--u`...)
+
+
+def _native_subs() -> tuple[str, ...]:
+    """The `git SUB ...` forms (after the global options) that stage everything and that a pattern can say."""
+    subs: list[str] = []
+    for sub in _STAGES:
+        subs += [f"{sub} -A*", f"{sub} --a*", f"{sub} -u", *(f"{sub} {u}" for u in _UPDATE)]
+        for before in ("", "-- ", "-u "):
+            subs += [f"{sub} {before}{t}" for t in _TREE]
+    subs.append("commit -a*")
+    for word in ("--a", "--al", "--all"):  # `--all*` would deny `--allow-empty`
+        subs += [f"commit {word}", f"commit {word} *"]
+    for before in ("", "-- ", "-i "):
+        subs += [f"commit {before}{t}" for t in _TREE]
+    return tuple(subs)
+
+
+_NATIVE_SUBS = _native_subs()
 NATIVE_DENY = (
     *(f"git {sub}" for sub in _NATIVE_SUBS),
     *(f"git -* {sub}" for sub in _NATIVE_SUBS),
@@ -70,7 +79,6 @@ _COMMIT_LONG_VALUE = {
     "--trailer",
     "--pathspec-from-file",
 }
-_STAGES = ("add", "stage")  # `git stage` is git's own name for `git add`
 _MAGIC = re.compile(r":\(([^)]*)\)(.*)", re.DOTALL)
 _EXPANSION = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*|\$\{[^}]*\}|\$\(.*\)|`[^`]*`", re.DOTALL)  # the whole word
 _GIT_ENV = re.compile(r"GIT_CONFIG_(?:PARAMETERS|KEY_[0-9]+)=", re.IGNORECASE)

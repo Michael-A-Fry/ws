@@ -12,7 +12,15 @@
 Every generated hook runs the thin client (ws.gateclient), which asks the resident gate and, when that can't answer,
 runs `check` or `event` itself: `run_hook` is the one decision path they share. The order is fixed: the preflight, the
 policy's rules, the guards that are on (lowest PRIORITY first, see ws.guards), then `ask_commands`; the first refusal
-ends it. A hook run that asked a guard or refused a call leaves one line in `logs/gate.jsonl`.
+ends it. A hook run that asked a guard, refused a call, let a call through that a guard in log mode would have refused, or
+met a tool no adapter reads leaves one counts-only line in `logs/gate.jsonl`.
+
+Where the OS wall is proven for a call (`wall_gap` is empty: not native Windows, the sandbox binary on PATH, ws's own
+settings marker with no project file claiming it, the adapter's preflight clear, the call not marked to run outside the
+sandbox) two things change, and only there. A guard asked for `mode = "log"` logs what it would have refused and the call
+goes ahead (see ws.guards). And a command refused only for a reason the wall makes redundant (policy.WALL_REDUNDANT: the
+program word holds a part ws cannot read, a line that sets IFS, a write to a path ws cannot read) is allowed and logged,
+the rest of the line still judged by every other rule. Anywhere else both are refused as they always were.
 
 `check` fails closed: a payload it cannot read, a policy that does not load, or any crash is a deny. Exit 4 is not a
 deny: inside the OpenCode wall a granted approval cannot be consumed by the hook, so it prints {"claim": ID} and the shim
@@ -36,6 +44,7 @@ import hashlib
 import json
 import os
 import shlex
+import shutil
 import sys
 import tempfile
 import time
@@ -54,6 +63,7 @@ from ws.output import WsError
 DENY = 2
 CLAIM = 4
 RESULTS = ("allow", "deny", "ask")
+MAX_TOOL_NAME = 80  # characters of a tool's name that reach a Call of kind "other" and the log
 
 CASELESS_ENV = "WS_FORCE_CASELESS_PATHS"
 if os.environ.get(CASELESS_ENV) == "1":
@@ -182,11 +192,13 @@ def mcp_bound_value(call: Call) -> str:
     return f"{call.value} {args}"
 
 
-def evaluate(pol: policy.Policy, call: Call, protect: tuple[str, ...] = ()) -> str | None:
+def evaluate(pol: policy.Policy, call: Call, protect: tuple[str, ...] = (), *, wall: bool = False) -> str | None:
     """The reason a call is denied, or None. The one place a neutral Call meets the policy. An MCP call the policy does
-    not name comes back as an `Ask`."""
+    not name comes back as an `Ask`. A command refused for a reason the wall makes redundant comes back as a
+    `policy.Refusal`; with `wall=True` (the wall is proven) the whole line is read past it, see policy.is_denied_command.
+    A call of kind "other" (a tool no adapter reads) has no rule: it is allowed."""
     if call.kind == "command":
-        return policy.is_denied_command(pol, call.value, protect=protect)
+        return policy.is_denied_command(pol, call.value, protect=protect, wall=wall)
     if call.kind == "read":
         return policy.is_denied_read(pol, call.value)
     if call.kind == "search":
@@ -197,19 +209,132 @@ def evaluate(pol: policy.Policy, call: Call, protect: tuple[str, ...] = ()) -> s
         return f"tool {call.value} is in deny_tools" if call.value in pol.gate.deny_tools else None
     if call.kind == "mcp":
         return _mcp_reason(pol, call, protect)
-    if call.kind in ("agent", "skill", "message"):
+    if call.kind in ("agent", "skill", "message", "other"):
         return None  # the policy has no rule for these; only guards judge them
     raise ValueError(f"unknown call kind {call.kind!r}")
 
 
+def tool_name(payload: dict) -> str:
+    """The name of the tool a payload calls (Claude Code's `tool_name`, the OpenCode shim's `tool`), cut to
+    MAX_TOOL_NAME, or "" when it names none."""
+    for key in ("tool_name", "tool"):
+        name = payload.get(key)
+        if isinstance(name, str) and name:
+            return name[:MAX_TOOL_NAME]
+    return ""
+
+
 def _calls(adapter, payload: dict) -> list[Call]:
+    """The Calls of a payload. A tool the adapter does not read (it returns None) is one Call of kind "other" from its
+    name, so it is seen, allowed and logged and not passed over; a payload that names no tool has none."""
     calls = adapter.parse(payload)
-    return [] if calls is None else [calls] if isinstance(calls, Call) else calls
+    if calls is None:
+        name = tool_name(payload)
+        return [Call("other", name)] if name else []
+    return [calls] if isinstance(calls, Call) else calls
 
 
-def _context(runner: str, event: str, payload: dict, clock=None, home: Path | None = None) -> guards.Context:
+# --- the OS wall, proven for one call ------------------------------------------------------------------------------
+# A guard in log mode and a rule the wall makes redundant stand down only where the wall is proven for the call, by things
+# a project cannot set: the platform, the sandbox binary on PATH, the marker ws's own settings carry, and the adapter's
+# preflight. `wall_gap` says which fails, as one of these words (an empty text means the wall is proven).
+WALL_GAPS = ("native-windows", "no-sandbox-binary", "sandbox-off", "unsandboxed-call", "preflight")
+_PROJECT_SETTINGS = ("settings.json", "settings.local.json")
+# What a project's settings `env` must not carry for the marker to count: the marker itself, the gated-session marker and
+# PATH, which could name a `bwrap` of the project's own.
+_FORGEABLE_ENV = (approvals.SANDBOX_MARKER, approvals.ENV_MARKER, "PATH")
+
+
+def _platform() -> str:
+    return sys.platform
+
+
+def machine_gap() -> str:
+    """Why this machine cannot give the wall: "native-windows", "no-sandbox-binary" (no bwrap on PATH on Linux or WSL2, no
+    sandbox-exec on macOS), or "". Nothing is spawned."""
+    system = _platform()
+    if system.startswith(("win", "cygwin", "msys")):
+        return "native-windows"
+    binary = "sandbox-exec" if system == "darwin" else "bwrap"
+    return "" if shutil.which(binary) else "no-sandbox-binary"
+
+
+def _marked_unsandboxed(payload: dict) -> bool:
+    """Does the call say it runs outside the sandbox (`dangerouslyDisableSandbox`, anything but absent or false)?"""
+    given = payload.get("tool_input", payload.get("args"))
+    return isinstance(given, dict) and given.get("dangerouslyDisableSandbox") not in (None, False)
+
+
+def _project_sets_marker(payload: dict) -> bool:
+    """Does a project's own settings file put ws's marker (or PATH) in the session's environment? Read as the adapter's
+    preflight reads them: the project folder and the payload's folder, and every folder above, skipping the person's home
+    (their own settings). A file that is not a plain readable one counts as yes: nothing in that project can be trusted."""
+    starts = [
+        p
+        for p in (os.environ.get("CLAUDE_PROJECT_DIR"), payload.get("cwd"))
+        if isinstance(p, str) and p.startswith("/")
+    ]
+    home = paths.home_dir()
+    seen: set[Path] = set()
+    for d in [x for start in starts for x in (Path(start), *Path(start).parents)]:
+        if d == home or d in seen:
+            continue
+        seen.add(d)
+        for name in _PROJECT_SETTINGS:
+            f = d / ".claude" / name
+            if not os.path.lexists(f):
+                continue
+            try:
+                conf = json.loads(approvals._read_regular(f, 1 << 20))
+            except approvals.ApprovalError:
+                return True
+            except ValueError:
+                continue  # a file that does not parse is ignored, as the runner ignores it
+            env = conf.get("env") if isinstance(conf, dict) else None
+            if isinstance(env, dict) and any(k in env for k in _FORGEABLE_ENV):
+                return True
+    return False
+
+
+def wall_gap(adapter, payload: dict, cleared: bool | None = None) -> str:
+    """Why the wall is not proven for this call (one of WALL_GAPS), or "" when it is. `cleared` says the adapter's preflight
+    ran for this payload and refused nothing; None runs it here. An adapter with no preflight proves nothing."""
+    gap = machine_gap()
+    if gap:
+        return gap
+    if os.environ.get(approvals.SANDBOX_MARKER) != "1":
+        return "sandbox-off"
+    if _marked_unsandboxed(payload):
+        return "unsandboxed-call"
+    if cleared is None:
+        preflight = getattr(adapter, "preflight", None)
+        try:
+            cleared = preflight is not None and not preflight(payload)
+        except Exception:  # noqa: BLE001 - a preflight that cannot run proves nothing
+            cleared = False
+    if not cleared or _project_sets_marker(payload):
+        return "preflight"
+    return ""
+
+
+class _Wall:
+    """`wall_gap` for one call, worked out the first time it is asked for and kept (a call with no guard in log mode and
+    no refusal the wall could make redundant never pays for it)."""
+
+    def __init__(self, adapter, payload: dict, cleared: bool | None, proven: bool = True):
+        self._args = (adapter, payload, cleared)
+        self._proven = proven
+        self._gap: str | None = None
+
+    def __call__(self) -> str:
+        if self._gap is None:
+            self._gap = wall_gap(*self._args) if self._proven else "sandbox-off"
+        return self._gap
+
+
+def _context(runner: str, event: str, payload: dict, clock=None, home: Path | None = None, wall=None) -> guards.Context:
     return guards.Context(
-        runner, event, _text(payload, "session_id"), _text(payload, "cwd"), payload, clock or time.time, home
+        runner, event, _text(payload, "session_id"), _text(payload, "cwd"), payload, clock or time.time, home, wall=wall
     )
 
 
@@ -231,6 +356,8 @@ def check(
     clock=None,
     home: Path | None = None,
     verdicts: list[dict] | None = None,
+    audit: dict | None = None,
+    walled: bool = True,
 ) -> str | approvals.Claim | None:
     """None to allow, else the reason. Raises on anything it cannot judge; cmd_check turns that into a deny.
     A shell command that matches `ask_commands` (and nothing denies) runs only on a granted approval bound to this
@@ -244,9 +371,42 @@ def check(
     fixed: the preflight, then the policy's rules, then the guards that are on (lowest PRIORITY first, see ws.guards),
     then `ask_commands`, then the MCP tools `allow_mcp` does not name (asked for as `ask_commands` is, and logged as an
     ask); the first refusal ends it and nothing after it is asked. `verdicts`, when given, gets one
-    {guard, result, ms} for each guard that was asked."""
+    {guard, result, ms} for each guard that was asked, and one for a rule the wall made redundant (`guard` is
+    `rule:KIND`; `result` is `would-deny` with a `count`, or `deny` with the `gap` that kept the wall out). `audit`, when
+    given, gets `unlisted` for a tool no adapter reads. `walled=False` never proves the wall (a replay: the answer must not
+    depend on the machine it runs on)."""
     with shellwords.time_limit():
-        return _check(runner, raw, pol, protect, approval_root, consume, notes, layer, clock, home, verdicts)
+        return _check(
+            runner, raw, pol, protect, approval_root, consume, notes, layer, clock, home, verdicts, audit, walled
+        )
+
+
+def _wall_redundant(
+    pol: policy.Policy,
+    call: Call,
+    first: policy.Refusal,
+    protect: tuple[str, ...],
+    wall,
+    verdicts: list[dict] | None,
+) -> str | None:
+    """A command refused for a reason the wall makes redundant (`first`). Where the wall is proven the line is read again
+    past that reason, and what else it finds is the answer; a line with nothing else to refuse is allowed (None) and the
+    would-deny is a verdict. Where it is not, `first` stands and the verdict says why the wall was not there."""
+    began = time.perf_counter()
+    gap = wall()
+    answer: str | None = first
+    if not gap:
+        answer = evaluate(pol, call, protect, wall=True)
+        if answer is None or (isinstance(answer, policy.Refusal) and answer.kind in policy.WALL_REDUNDANT):
+            answer = None
+    if verdicts is not None:
+        ms = round((time.perf_counter() - began) * 1000, 2)
+        kind = f"rule:{first.kind}"
+        if answer is None:
+            verdicts.append({"guard": kind, "result": "would-deny", "ms": ms, "count": 1})
+        elif gap:
+            verdicts.append({"guard": kind, "result": "deny", "ms": ms, "gap": gap})
+    return answer
 
 
 def _check(
@@ -261,6 +421,8 @@ def _check(
     clock,
     home: Path | None,
     verdicts: list[dict] | None,
+    audit: dict | None,
+    walled: bool,
 ) -> str | approvals.Claim | None:
     payload = json.loads(raw)
     if not isinstance(payload, dict):
@@ -273,16 +435,27 @@ def _check(
         _mark(layer, "preflight")
         return why
     calls = _calls(adapter, payload)
+    # The preflight ran and refused nothing, which an adapter with a preflight has shown by now: part of the wall's proof.
+    wall = _Wall(adapter, payload, preflight is not None, walled)
+    if audit is not None and any(c.kind == "other" for c in calls):
+        audit["unlisted"] = 1
     asks: list[tuple[Call, str]] = []  # an MCP call no rule names: the guards judge it first, then a person is asked
-    for call in calls:
+    # What the guards and `ask_commands` read: a line that sets the field separator is read with that renamed.
+    readable = list(calls)
+    for i, call in enumerate(calls):
         reason = evaluate(pol, call, protect)
+        if isinstance(reason, policy.Refusal) and call.kind == "command" and reason.kind in policy.WALL_REDUNDANT:
+            kind = reason.kind
+            reason = _wall_redundant(pol, call, reason, protect, wall, verdicts)
+            if reason is None and kind == policy.SETS_IFS:
+                readable[i] = Call("command", shellwords.without_ifs_setting(call.value), call.data)
         if isinstance(reason, Ask):
             asks.append((call, reason))
         elif reason:
             _mark(layer, f"rule:{call.kind}")
             return reason
     session, cwd = _text(payload, "session_id"), _text(payload, "cwd")
-    stream = guards.stream(pol, "pre", calls, _context(runner, "pre", payload, clock, home), verdicts)
+    stream = guards.stream(pol, "pre", readable, _context(runner, "pre", payload, clock, home, wall), verdicts)
     try:
         for name, call, found in stream:
             reason = f"{name}: {found.reason}"
@@ -305,8 +478,8 @@ def _check(
                     return asked
     finally:
         stream.close()  # the guards after a refusal are not asked, and the one that refused is timed
-    for call in calls:
-        if call.kind == "command" and policy.needs_approval(pol, call.value):
+    for call, seen in zip(calls, readable, strict=True):
+        if call.kind == "command" and policy.needs_approval(pol, seen.value):
             if approval_root is None:
                 _mark(layer, "ask_commands")
                 return Ask("this command needs a person's approval, given from a gated session (`ws approve`)")
@@ -358,7 +531,8 @@ def _event(
             f"ws gate event: {str(name)[:40]!r} is answered by `ws gate check` or is not a hook event ws reads\n",
         )
     calls = _calls(adapter, payload) if ev == "post" else []
-    found = guards.run(pol, ev, calls, _context(runner, ev, payload, clock, home), verdicts)
+    wall = _Wall(adapter, payload, None)  # the preflight runs if a guard in log mode has something to say
+    found = guards.run(pol, ev, calls, _context(runner, ev, payload, clock, home, wall), verdicts)
     lines = [f"ws gate: {n}: {f.reason}" for n, _, f in found]
     if not lines:
         return 0, "", ""
@@ -432,16 +606,51 @@ def _protect(policy_file: Path, extra: list[str] | None = None) -> tuple[str, ..
 
 VERDICT_LOG = "gate.jsonl"
 VERDICT_SCHEMA = 1
+# A line is counts and names, so the live file turns over at 1 MiB (jsonl keeps DEFAULT_KEEP old ones, readers span them).
+VERDICT_MAX_BYTES = 1024 * 1024
 
 
 def _log_verdicts(rec: dict) -> None:
-    """One line in `<state>/logs/gate.jsonl` for a hook run that asked a guard or refused something: what was decided,
-    by which layer, and each guard's verdict. It holds no command, path or message text. A log that can't be written
-    never changes the decision."""
+    """One line in `<state>/logs/gate.jsonl` for a hook run that asked a guard, refused something, let through what a
+    guard in log mode would have refused, or met a tool no adapter reads: what was decided, by which layer, the tool's
+    name when the line is about a would-deny or an unlisted tool, and each guard's verdict (`guard` is a guard's name or
+    `rule:KIND`). It holds no command, path or message text. A log that can't be written never changes the decision."""
     try:
-        jsonl.append(paths.state_dir() / "logs" / VERDICT_LOG, jsonl.stamped(rec, VERDICT_SCHEMA))
+        jsonl.append(
+            paths.state_dir() / "logs" / VERDICT_LOG, jsonl.stamped(rec, VERDICT_SCHEMA), max_bytes=VERDICT_MAX_BYTES
+        )
     except (OSError, ValueError):
         pass
+
+
+def _verdict_record(
+    args: argparse.Namespace, raw: str, event: str, decision: str, layer, verdicts, ms, via, audit
+) -> dict:
+    """The verdict-log line for one hook run (see `_log_verdicts`)."""
+    session, name = _session_of(raw)
+    rec = {
+        "runner": args.runner,
+        "session": session,
+        "event": name or event,
+        "decision": decision,
+        "layer": layer,
+        "guards": verdicts,
+        "ms": ms,
+        "via": via,
+        **audit,
+    }
+    if audit or any(v.get("result") == "would-deny" for v in verdicts):
+        rec["tool"] = _tool_of(raw)
+    return rec
+
+
+def _tool_of(raw: str) -> str:
+    """The tool a payload names (see `tool_name`), "" when it names none. Never raises."""
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        return ""
+    return tool_name(payload) if isinstance(payload, dict) else ""
 
 
 def _session_of(raw: str) -> tuple[str, str]:
@@ -477,6 +686,7 @@ def run_check(args: argparse.Namespace, raw: str, via: str = "direct") -> tuple[
     notes: list[str] = []
     layer: list[str] = []
     verdicts: list[dict] = []
+    audit: dict = {}
     unpinned = False
     began = time.perf_counter()
     try:
@@ -495,22 +705,23 @@ def run_check(args: argparse.Namespace, raw: str, via: str = "direct") -> tuple[
                     notes=notes,
                     layer=layer,
                     verdicts=verdicts,
+                    audit=audit,
                 )
             except BaseException as e:  # noqa: BLE001 - fail closed on anything
                 reason, layer = _reason_of(e), ["error"]
-            if verdicts or reason is not None:
-                session, name = _session_of(raw)
+            if verdicts or reason is not None or audit:
                 _log_verdicts(
-                    {
-                        "runner": args.runner,
-                        "session": session,
-                        "event": name or "PreToolUse",
-                        "decision": _decision(reason),
-                        "layer": layer[0] if layer else None,
-                        "guards": verdicts,
-                        "ms": round((time.perf_counter() - began) * 1000, 2),
-                        "via": via,
-                    }
+                    _verdict_record(
+                        args,
+                        raw,
+                        "PreToolUse",
+                        _decision(reason),
+                        layer[0] if layer else None,
+                        verdicts,
+                        round((time.perf_counter() - began) * 1000, 2),
+                        via,
+                        audit,
+                    )
                 )
     except BaseException as e:  # noqa: BLE001 - fail closed on anything, including a broken policy file
         reason = _reason_of(e)
@@ -533,18 +744,18 @@ def run_event(args: argparse.Namespace, raw: str, via: str = "direct") -> tuple[
             code, out, err = event(args.runner, raw, pol, verdicts=verdicts)
             err = "".join(f"ws gate event: {note}\n" for note in warned) + err
             if verdicts:
-                session, name = _session_of(raw)
                 _log_verdicts(
-                    {
-                        "runner": args.runner,
-                        "session": session,
-                        "event": name,
-                        "decision": "deny" if code == DENY else "allow",
-                        "layer": None,
-                        "guards": verdicts,
-                        "ms": round((time.perf_counter() - began) * 1000, 2),
-                        "via": via,
-                    }
+                    _verdict_record(
+                        args,
+                        raw,
+                        "",
+                        "deny" if code == DENY else "allow",
+                        None,
+                        verdicts,
+                        round((time.perf_counter() - began) * 1000, 2),
+                        via,
+                        {},
+                    )
                 )
     except WsError as e:  # advice only: ws's folders or its policy are not as installed, so the guards do not run
         code, out, err = 0, "", f"ws gate event: skipped ({_reason_of(e)})\n"
@@ -632,7 +843,7 @@ def _judge(runner: str, payload: dict, pol: policy.Policy, protect: tuple[str, .
     layer: list[str] = []
     began = time.perf_counter()
     try:
-        reason = check(runner, json.dumps(payload), pol, protect, None, home=scratch, layer=layer)
+        reason = check(runner, json.dumps(payload), pol, protect, None, home=scratch, layer=layer, walled=False)
     except Exception as e:  # noqa: BLE001 - what the live hook would do: a call it cannot judge is a deny
         reason = f"could not check this call ({type(e).__name__}: {e})"
         layer = ["error"]

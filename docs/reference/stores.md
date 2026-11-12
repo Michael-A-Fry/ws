@@ -54,7 +54,7 @@ folders read-only, and the gate refuses a session's writes to each of them in ei
 | Eval looks | `eval/looks.jsonl` | `src/ws/eval.py` | `schema`, `ts`, `pair`, `look`, `result` | 1 | `ts` | Rotates at 5 MiB |
 | Gate calls | `logs/gate-calls.jsonl` | `src/ws/guards/record_calls.py` | `schema`, `ts`, `at`, `runner`, `payload` | 1 | `ts`, `at` | Rotates at 5 MiB |
 | Claims | `logs/claims.jsonl` | `src/ws/guards/claims.py` | `schema`, `ts`, `at`, `runner`, `session`, `ref`, `claims` | 1 | `ts`, `at` | Rotates at 5 MiB |
-| Gate verdicts | `logs/gate.jsonl` | `src/ws/gate.py` | `schema`, `ts`, `runner`, `session`, `event`, `decision` (`allow`, `deny`, `ask`, `claim`), `layer`, `guards` (each `guard`, `result`, `ms`), `ms`, `via` (`direct` or `daemon`) | 1 | `ts` | Rotates at 5 MiB |
+| Gate verdicts | `logs/gate.jsonl` | `src/ws/gate.py` | `schema`, `ts`, `runner`, `session`, `event`, `decision` (`allow`, `deny`, `ask`, `claim`), `layer`, `guards` (each `guard`, a guard's name or `rule:KIND`; `result`, `ms`, and when they apply `count` and `gap`), `ms`, `via` (`direct` or `daemon`), and on a line about a would-deny or an unlisted tool `tool` and `unlisted` | 1 | `ts` | Rotates at 1 MiB |
 | Wall report | `logs/wall-report.jsonl` | `src/ws/sandbox.py` | `schema`, `ts`, `at`, `project`, `runner`, `incomplete`, `findings`, `notes` | 1 | `ts`, `at` | Rotates at 5 MiB |
 | Node footprint | `node/footprint.jsonl` | `src/ws/node.py` | `schema`, `ts`, `type` (`ws.footprint/1`), `node`, `op` (`intent`, `done`, `removed`), `step`, and on an intent `kind`, `target`, `sha256`, `existed` | 1 | `ts` | Never rotated; removed by `ws node remove` once every change is undone |
 | OpenCode asks | `.claude-usage/asks/asks.jsonl` | `src/ws/adapters/opencode.py` (the shim it generates writes the lines, from OpenCode's permission events) | `schema`, `ts` (epoch milliseconds), `event` (`added`, `answered`), `id`, and on `added` `repo`, `session`, `question`, `options`, `decision`, `source` | 1 | `ts` | Each line starts with a newline; past 8 MiB the file moves to `asks.jsonl.old`, one generation, so it stays under the 64 MiB `ws home` reads |
@@ -62,6 +62,12 @@ folders read-only, and the gate refuses a session's writes to each of them in ei
 
 Notes:
 
+- The gate verdict line is counts and names only: it never holds a command, a path or message text. `guards[].result` is
+  `pass`, `note`, `warn`, `would-deny` (a guard in `mode = "log"`, or a rule the OS wall makes redundant, let a call through
+  that it would have refused; `count` says how many), `deny` or `error`. `gap` is a fixed word (`native-windows`,
+  `no-sandbox-binary`, `sandbox-off`, `unsandboxed-call`, `preflight`) and says why a guard asked to log refused instead.
+  `tool` is the tool's name (cut to 80 characters), and `unlisted` is 1 when no adapter reads that tool. The three fields
+  are optional, so a reader uses `.get`; the schema number stays 1.
 - Run records keep `started_at` and `ended_at`. The run-record schema lists its keys and allows no others, so a `ts`
   there is the next schema number.
 - Schema 3 of the run record added `purpose`, `stop_reason` and `reservation`. Schema 2 stays frozen (the test pins its

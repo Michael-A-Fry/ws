@@ -318,7 +318,8 @@ def patch_paths(patch: str) -> list[str]:
 def parse(payload: dict) -> Call | list[Call] | None:
     """What the shim sends: {"tool": "bash", "args": {"command": ...}}. A patch tool is a write of each file in the
     patch; `task` is an agent call and `skill` a skill call, as Claude Code's `Agent` and `Skill` are. The kinds this can
-    make are KIND_TOOLS. A tool it does not know (an MCP tool among them) is None. `grep`, `glob` and `list` are a search
+    make are KIND_TOOLS. A tool it does not know (an MCP tool among them) is None, and the gate then makes one
+    Call of kind "other" from its `tool` name (see ws.gate). `grep`, `glob` and `list` are a search
     of their `path` and, for glob's `pattern` and grep's `include`, a read of each place the pattern can name
     (`pattern_calls`); a pattern that cannot be read raises TypeError, which the gate turns into a deny."""
     tool, args = payload.get("tool"), payload.get("args")

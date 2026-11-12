@@ -2,6 +2,10 @@
 
 The files are the truth. The index (`index/memory.sqlite` in ws's cache folder) only helps search; delete it and the next search
 rebuilds the same one. Search covers memory and your notes folder. ws writes new memory files and never edits one.
+
+Walled classes (see ws.notes): a session in a walled class can't add a memory file, and a search for a caller in a class
+leaves out every file that sits in another walled class's repos, or says `class: NAME` in its front matter for one, unless
+that class's `readable_by` lets the caller's class read it. With no `[classes]` nothing is filtered.
 """
 
 from __future__ import annotations
@@ -14,12 +18,24 @@ import sqlite3
 import subprocess
 import sys
 import uuid
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 
-from ws import frontmatter, output, paths
-from ws.notes import WsError, clean_tags, read_text, role_path, title_slug, write_new
+from ws import frontmatter, output, paths, policy
+from ws.notes import (
+    WsError,
+    caller_class,
+    clean_tags,
+    is_walled,
+    load_policy,
+    read_text,
+    refuse_walled,
+    role_path,
+    title_slug,
+    write_new,
+)
 from ws.profile import ProfileError
 
 KINDS = ("fact", "decision", "preference", "person", "project")
@@ -93,7 +109,8 @@ def add(
     env: dict | None = None,
     now: datetime | None = None,
 ) -> Path:
-    """Write one memory file and commit it. Returns the path."""
+    """Write one memory file and commit it. Returns the path. Refused for a session in a walled class (`refuse_walled`)."""
+    refuse_walled("add a memory file", env)
     if kind not in KINDS:
         raise WsError("bad_input", f"kind must be one of {', '.join(KINDS)}, not {kind!r}")
     text = text.strip()
@@ -346,7 +363,11 @@ def _clean(s: str) -> str:
     return " ".join((s or "").split())
 
 
-def _fts_search(conn: sqlite3.Connection, terms: list[str], limit: int) -> list[Hit]:
+def _fts_search(
+    conn: sqlite3.Connection, terms: list[str], limit: int, keep: Callable[[Path], bool] | None = None
+) -> list[Hit]:
+    """The best `limit` matches. With `keep`, a file it refuses is left out before the limit counts, so a caller never
+    sees one and is still given a full page of the rest."""
     sql = (
         "SELECT f.source, f.path, docs.title, snippet(docs, -1, '[', ']', '...', 14), bm25(docs, 5.0, 1.0, 3.0, 1.0, 0.0)"
         " FROM docs JOIN files f ON f.id = docs.rowid WHERE docs MATCH ?"
@@ -354,19 +375,26 @@ def _fts_search(conn: sqlite3.Connection, terms: list[str], limit: int) -> list[
     )
     for joiner in (" ", " OR "):  # every word first; any word if that finds nothing
         match = joiner.join(f'"{t}"' for t in terms)
-        rows = conn.execute(sql, (match, limit)).fetchall()
-        if rows:
-            return [Hit(s, p, t, _clean(sn), round(-score, 6)) for s, p, t, sn, score in rows]
+        hits: list[Hit] = []
+        for s, path, t, sn, score in conn.execute(sql, (match, limit if keep is None else -1)):
+            if keep is None or keep(Path(path)):
+                hits.append(Hit(s, path, t, _clean(sn), round(-score, 6)))
+                if len(hits) >= limit:
+                    break
+        if hits:
+            return hits
     return []
 
 
-def _scan_search(roots: list[tuple[str, Path]], terms: list[str], limit: int) -> list[Hit]:
+def _scan_search(
+    roots: list[tuple[str, Path]], terms: list[str], limit: int, keep: Callable[[Path], bool] | None = None
+) -> list[Hit]:
     """The no-FTS5 fallback: read every file and count the words. Same shape as the indexed search."""
     docs = []
     seen: set[str] = set()
     for source, root in roots:
         for p in walk(root):
-            if str(p) in seen:
+            if str(p) in seen or (keep is not None and not keep(p)):
                 continue
             try:
                 if p.stat().st_size > MAX_BYTES:
@@ -395,18 +423,53 @@ def _scan_search(roots: list[tuple[str, Path]], terms: list[str], limit: int) ->
     return rank(True) or rank(False)
 
 
+def _marked_class(path: Path) -> str | None:
+    """The class a file's front matter says it comes from (`class: NAME`), or None."""
+    try:
+        if path.stat().st_size > MAX_BYTES:
+            return None
+        mark = frontmatter.parse(path.read_text(encoding="utf-8", errors="replace")).meta.get("class")
+    except (OSError, ValueError):
+        return None
+    return mark.strip() if isinstance(mark, str) and mark.strip() else None
+
+
+def readable_by_caller(env: dict | None = None, *, cwd: str | None = None) -> Callable[[Path], bool] | None:
+    """Which files the caller may be shown: a function of a file's path, or None when every file may be (the policy has no
+    `[classes]`, so nothing is classified). The caller's class is `policy.class_of` of its real working folder. A file that
+    sits in a walled class's repos, or whose front matter says `class: NAME` for one, is shown only to a caller of that
+    class, or of one the class's `readable_by` names (`*` is everyone). A policy that will not load is a `refused` error
+    (`load_policy`)."""
+    pol = load_policy(env)
+    me = caller_class(pol, cwd)
+    if me is None:
+        return None
+
+    def keep(path: Path) -> bool:
+        marked = _marked_class(path)
+        owners = [policy.class_of(pol, path), pol.classes.get(marked) if marked else None]
+        for owner in owners:
+            if is_walled(owner) and owner.name != me.name and not owner.readable_by_class(me.name):
+                return False
+        return True
+
+    return keep
+
+
 def search(query: str, limit: int = 10, env: dict | None = None) -> list[Hit]:
-    """Search memory and notes. A match needs every word; if nothing matches, any word will do."""
+    """Search memory and notes. A match needs every word; if nothing matches, any word will do. A caller in a class never
+    sees a file that belongs to a walled class that does not let it read (`readable_by_caller`)."""
     terms = _terms(query)
     limit = max(1, min(int(limit), 100))
+    keep = readable_by_caller(env)
     roots = configured_roots(env)
     if not has_fts5():
         _warn_no_fts5()
-        return _scan_search(roots, terms, limit)
+        return _scan_search(roots, terms, limit, keep)
 
     def run(conn: sqlite3.Connection) -> list[Hit]:
         refresh(conn, roots)
-        return _fts_search(conn, terms, limit)
+        return _fts_search(conn, terms, limit, keep)
 
     return _with_index(index_path(env), run)
 

@@ -73,9 +73,9 @@ Rules:
   `tee` or `>` names goes through the same path checks as any other write.
 - Every item must be non-empty text.
 - `allow_hosts` items are a name, `*.name` or an IP, with an optional `:port`.
-- `allow_write` items must be a folder, absolute or under `~/` (`$HOME` is accepted), with no wildcard, not `/` and
-  not the
-  home folder after `.` and `..` are resolved.
+- `allow_write` items must be a folder, absolute or under `~/` (`$HOME` is accepted), with no wildcard, not `/`, and
+  neither the home folder nor a folder above it, however it's spelt (an absolute path to the home too), after `.` and
+  `..` are resolved. A policy with such an entry doesn't load, and the error names it.
 - `allow_read` items must be a folder or file, absolute or under `~/` (`$HOME` is accepted), with no wildcard, not `/`,
   not the home folder or a folder above it (an absolute spelling, or one that `.` and `..` bring there, counts), and
   not equal to or inside a `deny_read` path (a path a

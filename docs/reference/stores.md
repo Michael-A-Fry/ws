@@ -60,6 +60,14 @@ folders read-only, and the gate refuses a session's writes to each of them in ei
 | OpenCode asks | `.claude-usage/asks/asks.jsonl` | `src/ws/adapters/opencode.py` (the shim it generates writes the lines, from OpenCode's permission events) | `schema`, `ts` (epoch milliseconds), `event` (`added`, `answered`), `id`, and on `added` `repo`, `session`, `question`, `options`, `decision`, `source` | 1 | `ts` | Each line starts with a newline; past 8 MiB the file moves to `asks.jsonl.old`, one generation, so it stays under the 64 MiB `ws home` reads |
 | Broker audit | `logs/broker.jsonl` | `src/ws/broker.py` | `t`, `op`, `name`, `purpose`, `host`, `uid`, `pid`, `lease`, `status`, `bytes` | none (reads as 1) | `t` | One file; the broker appends and never rotates it |
 
+Where the policy has `[classes]`, a session writes its gate verdicts and calls to `logs/classes/<name>/gate.jsonl`
+and `logs/classes/<name>/gate-calls.jsonl` instead (a folder of no class uses the built-in `unclassified`), in a 0700
+folder. The class is the stricter of the one the session started in (when that folder is in a class) and the folder a
+call says it ran in, so a call can't be kept in full by naming a looser folder. A walled class (with or without an
+`os_user`) or a counts-only one keeps call lines of `schema`, `ts`, `at`, `runner` and `kind`, and no `payload`.
+When the class folder is a link or isn't owned by the running user, nothing is written, and the shared file isn't used
+instead.
+
 Notes:
 
 - The gate verdict line is counts and names only: it never holds a command, a path or message text. `guards[].result` is

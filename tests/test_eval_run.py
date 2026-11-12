@@ -128,7 +128,9 @@ def test_the_trial_runs_in_a_fresh_folder_holding_the_setup_files(rig, capsys):
         assert (
             not Path(s["cwd"]).resolve().is_relative_to(rig.home.resolve())
         )  # the sandbox denies writes under WS_HOME
-        assert s["files"] == ["expenses.csv"]
+        assert [f for f in s["files"] if f not in sandbox.CLAUDE_LOAD_PATHS] == [
+            "expenses.csv"
+        ]  # beside the wall's placeholders
     assert [Path(r["cwd"]).resolve() for r in rig.records()] == [Path(s["cwd"]).resolve() for s in saw]
 
 

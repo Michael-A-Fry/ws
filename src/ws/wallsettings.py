@@ -459,6 +459,42 @@ def class_file_path(name: str, kind: str) -> Path:
     return Path(class_dir(kind)) / class_file_name(name)
 
 
+def ws_drop_ins(kind: str) -> list[Path]:
+    """The ws class drop-ins in place in this system's managed-settings folder (`class_dir`), sorted by name. Claude Code
+    merges every drop-in there for every account on the machine, so a second one binds accounts it was not written for.
+    Only the folder is listed; nothing is read, and a folder that can't be listed is an empty answer."""
+    try:
+        names = os.listdir(class_dir(kind))
+    except OSError:
+        return []
+    return [Path(class_dir(kind)) / n for n in sorted(names) if drop_in_class(n) is not None]
+
+
+def drop_in_class(file_name: str) -> str | None:
+    """The class a drop-in file name (`class_file_name`) is for, or None for any other file."""
+    if not (file_name.startswith(CLASS_FILE_PREFIX) and file_name.endswith(".json")):
+        return None
+    name = file_name[len(CLASS_FILE_PREFIX) : -len(".json")]
+    return name if name and class_file_name(name) == file_name else None
+
+
+def drop_in_warning(found: Iterable[Path], pol: policy.Policy | None, own: str | None = None) -> str | None:
+    """One sentence for a machine whose managed-settings folder carries more class drop-ins than the tested shape (one
+    class per machine), or one for a class the policy doesn't name; None when it is as tested. `own` is the class being set
+    up: its drop-in is not counted against it. Class names only, never a path."""
+    names = sorted({c for p in found if (c := drop_in_class(p.name)) is not None})
+    others = [c for c in names if c != own]
+    unknown = [c for c in others if pol is not None and c not in pol.classes]
+    if not (others and (own is not None or len(names) > 1)) and not unknown:
+        return None
+    shown = ", ".join(others)
+    why = f"no class of this policy: {', '.join(unknown)}; " if unknown else ""
+    return (
+        f"class drop-ins for {shown} are in place in the managed-settings folder, and Claude Code applies every one to "
+        f"every account on this machine ({why}one class per machine is the tested shape)"
+    )
+
+
 def launch_file_name(name: str) -> str:
     return f"{name}.json"
 

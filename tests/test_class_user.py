@@ -239,10 +239,61 @@ def test_launch_lets_the_right_user_and_unclassified_folders_through(box, monkey
     with pytest.raises(WsError):
         sandbox.require_class_user(pol)
     (tmp_path / "elsewhere").mkdir()
-    monkeypatch.chdir(tmp_path / "elsewhere")  # a folder in no class is not held to any account
-    sandbox.require_class_user(pol)
+    monkeypatch.chdir(tmp_path / "elsewhere")
+    monkeypatch.setattr(sandbox, "real_user", lambda: "an-account-no-class-names")
+    sandbox.require_class_user(pol)  # a folder in no class is not held against an account that is no class's
     monkeypatch.chdir(tmp_path / "work" / "app")
     sandbox.require_class_user(policy.loads(""))  # no [classes]: today's behaviour
+
+
+def test_a_class_account_is_refused_in_a_folder_of_no_class(box, monkeypatch, tmp_path):
+    pol = write_policy(box, "someone")
+    monkeypatch.setattr(sandbox, "real_user", lambda: "someone")
+    (tmp_path / "elsewhere").mkdir()
+    monkeypatch.chdir(tmp_path / "elsewhere")
+    with pytest.raises(WsError) as e:
+        sandbox.require_class_user(pol)
+    assert e.value.exit_code == 3 and e.value.kind == "refused"
+    assert "class 'work'" in e.value.message + e.value.hint and "no class" in e.value.message
+    assert "someone" not in e.value.message + e.value.hint  # the class is named, not the account
+    sandbox.require_class_user(pol, str(tmp_path / "work" / "app"))  # its own class's folder is fine, from anywhere
+    with pytest.raises(WsError):
+        sandbox.require_class_user(pol, str(tmp_path / "elsewhere"))  # a job's folder is judged, not this process's
+
+
+def test_a_class_account_is_refused_in_a_different_class_folder(box, monkeypatch, tmp_path):
+    text = (
+        f'[classes.work]\naccess = "walled"\nos_user = "someone"\nrepos = ["{box}/work/**"]\n'
+        f'[classes.other]\naccess = "full"\nrepos = ["{box}/other/**"]\n'
+    )
+    pol_file = box / "home" / ".ws" / "policy.toml"
+    pol_file.parent.mkdir(parents=True, exist_ok=True)
+    pol_file.write_text(text, encoding="utf-8")
+    pol = policy.load(pol_file)
+    (box / "other" / "repo").mkdir(parents=True)
+    monkeypatch.setattr(sandbox, "real_user", lambda: "someone")
+    with pytest.raises(WsError) as e:
+        sandbox.require_class_user(pol, str(box / "other" / "repo"))
+    assert e.value.exit_code == 3 and "class 'other'" in e.value.message and "class 'work'" in e.value.hint
+    assert "someone" not in e.value.message + e.value.hint
+    monkeypatch.setattr(sandbox, "real_user", lambda: "a-different-account")
+    sandbox.require_class_user(pol, str(box / "other" / "repo"))  # the person's own account is not held to this
+
+
+def test_launch_refuses_a_class_account_outside_its_class(box, monkeypatch, capsys, tmp_path):
+    write_policy(box, "someone")
+    monkeypatch.setattr(sandbox, "real_user", lambda: "someone")
+
+    def started(*a, **k):
+        raise AssertionError("nothing may start outside the class")
+
+    monkeypatch.setattr(sandbox, "run_plain", started)
+    monkeypatch.setattr(sandbox, "run_with_broker", started)
+    (tmp_path / "elsewhere").mkdir()
+    monkeypatch.chdir(tmp_path / "elsewhere")
+    for argv in ((), ("--no-sandbox",)):
+        code, out = launch(capsys, box, *argv)
+        assert code == 3 and "class 'work'" in out.err and "no class" in out.err
 
 
 def test_the_class_comes_from_the_real_path_of_the_folder_not_a_link_name(box, monkeypatch):

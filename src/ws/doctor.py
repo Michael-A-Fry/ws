@@ -320,6 +320,25 @@ def _review_checks(env, now=None) -> list[Check]:
     return out
 
 
+def _drop_in_checks(env, kind: str) -> list[Check]:
+    """WS019: the ws class drop-ins in the managed-settings folder. `warn` when more than one is in place, or one is for a
+    class this policy doesn't name: Claude Code applies every drop-in to every account on the machine, and one class per
+    machine is the tested shape. `ok` for a single one the policy names. No line when none is in place. It names classes,
+    never a path. A policy that doesn't load leaves the names unchecked (WS012 says so)."""
+    found = wallsettings.ws_drop_ins(kind)
+    if not found:
+        return []
+    try:
+        pol = policy.load(policy.policy_path(dict(env)))
+    except (policy.PolicyError, OSError):
+        pol = None
+    warning = wallsettings.drop_in_warning(found, pol)
+    if warning:
+        fix = "keep the drop-in of the one class this machine runs and remove the others, or give each class its own machine"
+        return [Check("WS019", "class-drop-ins", WARN, warning, fix)]
+    return [Check("WS019", "class-drop-ins", OK, "one class drop-in is in place, for a class this policy names")]
+
+
 _MODE_FIX = {
     "native-windows": 'run ws inside WSL2 (the wall needs Linux or macOS), or take mode = "log" out of those guards',
     "no-sandbox-binary": (
@@ -558,6 +577,10 @@ def run_checks(osi: OSInfo, profile_file: Path, env: dict | None = None, network
         checks += _mode_checks(env)
     except Exception as e:  # noqa: BLE001 (a broken check must report, not crash the whole doctor)
         checks.append(Check("WS018", "guard-modes", FAIL, f"check crashed ({type(e).__name__})"))
+    try:
+        checks += _drop_in_checks(env, osi.kind)
+    except Exception as e:  # noqa: BLE001 (a broken check must report, not crash the whole doctor)
+        checks.append(Check("WS019", "class-drop-ins", FAIL, f"check crashed ({type(e).__name__})"))
     try:
         checks.append(_layout_check(env))
     except Exception as e:  # noqa: BLE001 (a broken check must report, not crash the whole doctor)

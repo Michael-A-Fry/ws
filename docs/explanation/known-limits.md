@@ -53,14 +53,18 @@ every account's own hooks and permission rules. So ws doesn't write them to the 
   with `allowed-tools` refused so a skill can't pre-approve it; this check doesn't judge the command.
 - **What it means for OpenCode.** An OpenCode session in a class is walled by ws's own wall: writes only in the project
   and scratch, the network through ws's proxy (loopback only under `local_only`) and the same MCP rules. That wall hides
-  the `deny_read` paths and not the whole home, so for reads the class's own account and the folder modes are the boundary.
+  the `deny_read` paths, the class's per-folder `deny_read` and the other classes' folders, and not the whole home, so
+  for the rest of the home the class's own account and the folder modes are the boundary. A project config that names an
+  MCP server or a plugin, or pulls in a file with `{file:`, is refused at start. A `deny_read` entry with a wildcard is
+  left to the matcher, and a per-folder `deny_write` isn't applied to OpenCode.
 - **A class's own home folder.** When a class's repos sit inside its home folder, the launch file denies Claude's Read
   and Edit tools on the dot-folders and the top-level dotfiles there (`~/.*/**` and `~/.*`, so `~/.claude.json` and the
   shell start files too). The rest of that home, the non-dot files outside the repos, is covered by the class's own
   account and the folder modes only. The sandbox hides the whole home from shell commands either way.
 - **One class per machine.** One walled class on a machine is the tested shape. Claude Code reads every file in the
   managed-settings folder for every account, so the managed-settings files of two classes on one machine are read
-  together, and ws doesn't test that. Each launch file is read by its own class's sessions only.
+  together, and ws doesn't test that. Each launch file is read by its own class's sessions only. `ws doctor` (WS019)
+  and `ws install --class NAME` warn when more than one is in place.
 - **Workaround.** Keep each walled class's repos in a folder only its account can reach, and keep your own home folder
   closed (`chmod 700`).
 
@@ -139,7 +143,10 @@ A `deny_read` rule with a wildcard in the middle is enforced by the matcher only
 ### Protected paths that don't exist yet can be created
 
 A protected path inside the project folder or an `allow_write` folder that doesn't exist when the runner starts can be
-created by the session. A program that writes a hard-coded path outside the project fails.
+created by the session. The runner's own load paths are the exception: ws makes an empty placeholder for a missing
+`.claude` or `.mcp.json` (and OpenCode's names, for OpenCode) before the start, so the session can't create one, and
+takes it down after. A load path that's a symbolic link is refused. A program that writes a hard-coded path outside the
+project fails.
 
 - **Workaround.** Create protected files before you start. Add the folder a program needs to `allow_write`.
 

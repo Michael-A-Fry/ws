@@ -58,6 +58,7 @@ from ws import adapters, approvals, guards, jsonl, output, paths, policy, sandbo
 if TYPE_CHECKING:
     from ws import gatecorpus
 from ws.adapters import Call
+from ws.guards import record_calls
 from ws.output import WsError
 
 DENY = 2
@@ -332,10 +333,50 @@ class _Wall:
         return self._gap
 
 
-def _context(runner: str, event: str, payload: dict, clock=None, home: Path | None = None, wall=None) -> guards.Context:
-    return guards.Context(
+def _start_folder() -> str:
+    """The folder the session started in, as the gate's own process knows it (the daemon restores the hook's environment
+    and folder): `CLAUDE_PROJECT_DIR` when it is an absolute path, else the process folder. Never from the payload, which a
+    model can set (OpenCode's `workdir`)."""
+    given = os.environ.get("CLAUDE_PROJECT_DIR")
+    if isinstance(given, str) and given.startswith("/"):
+        return given
+    try:
+        return os.getcwd()
+    except OSError:
+        return ""
+
+
+def _class_of_cwd(pol: policy.Policy, cwd: str) -> policy.Class | None:
+    """The data class of the folder a payload says the session works in: the policy's `class_of` for its real path, and
+    never anything from the environment. None when the policy has no `[classes]`; a payload with no folder is in no class."""
+    if not pol.classes:
+        return None
+    return policy.class_of(pol, os.path.realpath(cwd)) if cwd else policy.UNCLASSIFIED
+
+
+def _class_of_session(pol: policy.Policy, cwd: str) -> policy.Class | None:
+    """The class that decides where a call is logged and whether its payload is kept: the stricter of the class of the
+    folder the payload says the call ran in (a model can point that elsewhere: OpenCode's `workdir`) and the class of the
+    folder the session started in (`_start_folder`), the payload's on a tie. A start folder in no class is not used (the
+    payload folder is judged alone)."""
+    there = _class_of_cwd(pol, cwd)
+    if there is None:
+        return None
+    start = _class_of_cwd(pol, _start_folder())
+    if start is None or start is policy.UNCLASSIFIED:
+        return there
+    return start if policy.ACCESS.index(start.access) > policy.ACCESS.index(there.access) else there
+
+
+def _context(
+    runner: str, event: str, payload: dict, clock=None, home: Path | None = None, wall=None, cls=None
+) -> guards.Context:
+    ctx = guards.Context(
         runner, event, _text(payload, "session_id"), _text(payload, "cwd"), payload, clock or time.time, home, wall=wall
     )
+    if cls is not None:
+        ctx.memo[record_calls.CLASS_KEY] = cls
+    return ctx
 
 
 def _mark(layer: list[str] | None, kind: str) -> None:
@@ -455,7 +496,8 @@ def _check(
             _mark(layer, f"rule:{call.kind}")
             return reason
     session, cwd = _text(payload, "session_id"), _text(payload, "cwd")
-    stream = guards.stream(pol, "pre", readable, _context(runner, "pre", payload, clock, home, wall), verdicts)
+    ctx = _context(runner, "pre", payload, clock, home, wall, _class_of_session(pol, cwd))
+    stream = guards.stream(pol, "pre", readable, ctx, verdicts)
     try:
         for name, call, found in stream:
             reason = f"{name}: {found.reason}"
@@ -532,7 +574,8 @@ def _event(
         )
     calls = _calls(adapter, payload) if ev == "post" else []
     wall = _Wall(adapter, payload, None)  # the preflight runs if a guard in log mode has something to say
-    found = guards.run(pol, ev, calls, _context(runner, ev, payload, clock, home, wall), verdicts)
+    cls = _class_of_session(pol, _text(payload, "cwd"))
+    found = guards.run(pol, ev, calls, _context(runner, ev, payload, clock, home, wall, cls), verdicts)
     lines = [f"ws gate: {n}: {f.reason}" for n, _, f in found]
     if not lines:
         return 0, "", ""
@@ -610,15 +653,19 @@ VERDICT_SCHEMA = 1
 VERDICT_MAX_BYTES = 1024 * 1024
 
 
-def _log_verdicts(rec: dict) -> None:
+def _log_verdicts(rec: dict, cls: policy.Class | None = None) -> None:
     """One line in `<state>/logs/gate.jsonl` for a hook run that asked a guard, refused something, let through what a
     guard in log mode would have refused, or met a tool no adapter reads: what was decided, by which layer, the tool's
     name when the line is about a would-deny or an unlisted tool, and each guard's verdict (`guard` is a guard's name or
-    `rule:KIND`). It holds no command, path or message text. A log that can't be written never changes the decision."""
+    `rule:KIND`). It holds no command, path or message text. A session in a data class `cls` writes to that class's own
+    copy, `logs/classes/<name>/gate.jsonl`, and to no other; if that folder is not the running user's, nothing is
+    written, and the shared log is not used instead. A log that can't be written never changes the decision."""
     try:
-        jsonl.append(
-            paths.state_dir() / "logs" / VERDICT_LOG, jsonl.stamped(rec, VERDICT_SCHEMA), max_bytes=VERDICT_MAX_BYTES
-        )
+        if cls is None:
+            where = paths.state_dir() / "logs" / VERDICT_LOG
+        elif (where := paths.class_log_path(cls.name, VERDICT_LOG)) is None:
+            return
+        jsonl.append(where, jsonl.stamped(rec, VERDICT_SCHEMA), max_bytes=VERDICT_MAX_BYTES)
     except (OSError, ValueError):
         pass
 
@@ -642,6 +689,16 @@ def _verdict_record(
     if audit or any(v.get("result") == "would-deny" for v in verdicts):
         rec["tool"] = _tool_of(raw)
     return rec
+
+
+def _class_of_raw(pol: policy.Policy, raw: str) -> policy.Class | None:
+    """The data class of the folder a raw payload works in (see `_class_of_session`). Never raises: a payload that cannot be
+    read has no folder, which is a path in no class."""
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        payload = None
+    return _class_of_session(pol, _text(payload, "cwd") if isinstance(payload, dict) else "")
 
 
 def _tool_of(raw: str) -> str:
@@ -721,7 +778,8 @@ def run_check(args: argparse.Namespace, raw: str, via: str = "direct") -> tuple[
                         round((time.perf_counter() - began) * 1000, 2),
                         via,
                         audit,
-                    )
+                    ),
+                    _class_of_raw(pol, raw),
                 )
     except BaseException as e:  # noqa: BLE001 - fail closed on anything, including a broken policy file
         reason = _reason_of(e)
@@ -755,7 +813,8 @@ def run_event(args: argparse.Namespace, raw: str, via: str = "direct") -> tuple[
                         round((time.perf_counter() - began) * 1000, 2),
                         via,
                         {},
-                    )
+                    ),
+                    _class_of_raw(pol, raw),
                 )
     except WsError as e:  # advice only: ws's folders or its policy are not as installed, so the guards do not run
         code, out, err = 0, "", f"ws gate event: skipped ({_reason_of(e)})\n"
@@ -947,6 +1006,23 @@ def _read_lines(path: Path) -> list[str]:
         raise WsError("not_found", f"cannot read {path} ({type(e).__name__})", "give a file of payloads") from e
 
 
+def _replay_lines(path: Path) -> list[str]:
+    """The lines of a replay file. The shared record-calls log also stands for each class's copy of it
+    (`logs/classes/<name>/`): their lines that hold a payload follow its own. A class that keeps counts only has none."""
+    lines = _read_lines(path)
+    if os.path.abspath(path) != os.path.abspath(record_calls.log_path()):
+        return lines
+    for extra in paths.class_log_files(record_calls.LOG):
+        for text in _read_lines(extra):
+            try:
+                obj = json.loads(text)
+            except ValueError:
+                continue
+            if isinstance(obj, dict) and "payload" in obj:
+                lines.append(text)
+    return lines
+
+
 def cmd_replay(args: argparse.Namespace) -> int:
     from ws import gatecorpus
 
@@ -965,7 +1041,7 @@ def cmd_replay(args: argparse.Namespace) -> int:
         pol = policy.load(policy_file, required=args.policy is not None)
     except policy.PolicyError as e:
         raise WsError("bad_config", str(e), f"fix {policy_file}, or `ws gate init`") from e
-    results = replay(args.runner, _read_lines(files[0]), pol, _protect(policy_file))
+    results = replay(args.runner, _replay_lines(files[0]), pol, _protect(policy_file))
     differ = [r for r in results if r["differs"]]
     if args.json:
         output.result(

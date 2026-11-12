@@ -1011,6 +1011,17 @@ allowed_hosts = ["localhost:11434", "api.example.com"]
 """
 
 
+def place_class_file(pol, name: str) -> Path:
+    """A class's launch file as `ws install --class` renders it, where the launcher reads it (the caller stands root in)."""
+    cls = pol.classes[name]
+    f = wallsettings.launch_file_path(name, kind())
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(json.dumps(wallsettings.launch_settings(cls, wallsettings.class_home(cls, kind()), kind(), pol)))
+    f.chmod(0o644)
+    f.parent.chmod(0o755)
+    return f
+
+
 def test_a_local_opencode_session_in_a_class_gets_the_same_file_write_network_and_mcp_rules_as_a_claude_session(
     box, monkeypatch, started
 ):
@@ -1023,6 +1034,7 @@ def test_a_local_opencode_session_in_a_class_gets_the_same_file_write_network_an
     cls = pol.classes["alpha"]
     monkeypatch.setattr(sandbox, "real_user", lambda: "ws-alpha")
     monkeypatch.setattr(wallsettings, "_is_root", lambda st: True)
+    place_class_file(pol, "alpha")  # a walled class's OpenCode session reads its launch file, as a Claude one does
     monkeypatch.setenv("PATH", str(box))  # no runner on it: the wall and the launcher are stood in for
     # the Claude session: its class file holds writes to the class's repos and scratch, and loopback-only hosts
     file = wallsettings.class_settings(cls, wallsettings.class_home(cls, kind()), kind())

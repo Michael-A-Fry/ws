@@ -1156,6 +1156,17 @@ def class_text(name: str, env: Mapping[str, str]) -> tuple[policy.Class, str]:
     return cls, wallsettings.install_text(cls, env, osinfo.detect(env=dict(env)).kind, pol)
 
 
+def other_drop_in_warning(cls: policy.Class, env: Mapping[str, str]) -> str | None:
+    """The warning `ws install --class NAME` adds when another class's drop-in is in the managed-settings folder, else None."""
+    pol_file = policy.policy_path(dict(env))
+    try:
+        pol = policy.load(pol_file)
+    except policy.PolicyError:
+        pol = None
+    found = wallsettings.ws_drop_ins(osinfo.detect(env=dict(env)).kind)
+    return wallsettings.drop_in_warning(found, pol, own=cls.name)
+
+
 def _cmd_install_class(args: argparse.Namespace) -> int:
     """`ws install --class NAME`: print the commands and the root-owned file for the class's OS user. Nothing is written."""
     given = [f"--{k.replace('_', '-')}" for k in _SETTING_FLAGS if getattr(args, k, None) not in (None, False, [])]
@@ -1164,10 +1175,14 @@ def _cmd_install_class(args: argparse.Namespace) -> int:
             "usage", f"--class only prints; it can't be used with {', '.join(given)}", "run them separately", 2
         )
     cls, text = class_text(args.class_name, os.environ)
+    warning = other_drop_in_warning(cls, os.environ)
     if args.json:
-        output.result({"class": cls.name, "os_user": cls.os_user, "writes": False, "text": text})
+        data = {"class": cls.name, "os_user": cls.os_user, "writes": False, "text": text}
+        output.result({**data, "warnings": [warning]} if warning else data)
     else:
         print(text)
+        if warning:
+            print(f"ws: warning: {warning}", file=sys.stderr)
     return 0
 
 

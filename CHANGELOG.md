@@ -8,9 +8,11 @@ body of the GitHub release.
 
 ## [Unreleased]
 
+## [0.1.10] - 2026-11-12
+
 ### Added
 
-- A launch file per walled class. `ws install --class NAME` now prints a second root-owned file, in a `ws-classes` folder
+- A launch file per walled class. `ws install --class NAME` prints a second root-owned file, in a `ws-classes` folder
   beside the managed-settings folder (Claude Code doesn't read it), and `ws gate launch` merges it into the settings it
   passes with `--settings`: `SendMessage` and `ListAgents` denied, `Read` and `Edit` of the sealed paths denied,
   `crossSessionInbound` refused, the read block, `disableAllHooks` false, the other classes' repos unreadable and the
@@ -26,9 +28,33 @@ body of the GitHub release.
   [decision 0028](docs/decisions/0028-a-guard-logs-what-the-wall-enforces.md).
 - A walled class takes messages only from its allowlist, and every message to it leaves a log row with no body. Memory
   and notes refuse a walled caller. `ws walls check` has eight more named cases.
+- A session in a data class writes its gate verdict log and call log to `logs/classes/<name>/`, not the shared files.
+  A walled or counts-only class's call log keeps no payload, whether or not the class names an `os_user`, and the
+  class is the stricter of the folder the session started in and the folder a call says it ran in. `ws gate replay` of
+  the shared call log also reads the class copies. Nothing is written when the class log folder isn't the running
+  user's.
+- `ws doctor` WS019 warns when more than one ws class drop-in is in the managed-settings folder, or one is for a class
+  the policy doesn't name (one class per machine is the tested shape). `ws install --class NAME` prints the same warning
+  when another class's drop-in is in place.
+- `ws run` jobs start inside the same wall as a launch: a Claude Code job gets its own launch copy for its project, and
+  an OpenCode job runs under bubblewrap (or `sandbox-exec`) with private data folders and ws's proxy. See
+  [decision 0029](docs/decisions/0029-a-job-runs-inside-the-launch-wall.md).
+- A walled OpenCode start reads the class launch file, hides the other classes' folders and the per-folder `deny_read`,
+  and refuses a project config that names an MCP server or a plugin, or pulls in a file with `{file:`.
 
 ### Changed
 
+- A refusal found while a job's wall is built (a launch file that's missing, a project the runner's check refuses) is
+  recorded `refused:wall`, exit 3, and a clean-up step that fails prints a warning without losing the run record.
+- A job with no way to build the wall is refused as `refused:wall`: an OpenCode job with no bubblewrap or `sandbox-exec`
+  (`[gate] sandbox = false` leaves it bare), a job whose folder is the home folder or above, one whose class launch file
+  is missing, or one whose project holds MCP servers or plugins the class doesn't allow. A class with `[gate] sandbox =
+  false` refuses a job on any runner.
+- An account a class names in `os_user` is refused in a folder of no class or of another class, a job with no folder
+  included.
+- A Claude Code start makes a placeholder for a missing `.claude` or `.mcp.json` and refuses one that's a symbolic link.
+- A policy whose `[gate] allow_write` names the home folder, an absolute spelling of it, or a folder above it
+  refuses to load until the entry is edited. The error names the entry.
 - The removal steps `ws install --class NAME` prints paste and run in bash, with each note on a `#` line, and take out
   the launch file, any half-placed copy and the launch folder.
 - The paths a walled class's launch file seals are built from the ws folders `ws.paths` names, not a fixed `~/.ws`.

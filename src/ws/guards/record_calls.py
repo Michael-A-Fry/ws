@@ -1,7 +1,10 @@
 """record-calls: append each tool call a session makes to `<state>/logs/gate-calls.jsonl` as `{schema, ts, at, runner,
 payload}` (`at` is the legacy spelling of `ts`, kept beside it), so `ws gate replay` can run the same calls against a
 changed policy. It only records: a log it can't write is a
-warning. The log has the bounds every ws log has (ws.jsonl: long fields cut, the file rotates, writers take a lock).
+warning. A session in a data class (`[classes]`) writes to its own copy, `logs/classes/<name>/gate-calls.jsonl`, and
+to no other; a walled class (any, with or without an `os_user`) or a counts-only one keeps `{schema, ts, at, runner, kind}`
+(no `payload`), so its calls are counted and not recorded. If that class folder is not the running user's, nothing is
+written, and the shared log is not used instead. The log has the bounds every ws log has (ws.jsonl: long fields cut, the file rotates, writers take a lock).
 
 What a line holds: the hook payload as the runner sent it (tool name, folder, session id and the tool's input: a
 command, a path, a search pattern, an agent prompt, a message, an MCP tool's arguments) with one change. The text a write tool carries is
@@ -40,8 +43,19 @@ def config(table: dict, where: str) -> None:
     known_keys(table, where)
 
 
+CLASS_KEY = (
+    "class"  # `ctx.memo[CLASS_KEY]`: the `policy.Class` of the session's folder (set by the gate; absent = none)
+)
+
+
 def log_path(home: Path | None = None) -> Path:
     return (home if home is not None else paths.state_dir()) / "logs" / LOG
+
+
+def counts_only(cls) -> bool:
+    """A class whose calls are counted and not recorded: any walled class (whether or not it names an `os_user`) or a
+    counts-only one."""
+    return cls is not None and (bool(cls.os_user) or cls.access != "full")
 
 
 def _fingerprint(value) -> dict:
@@ -96,9 +110,18 @@ def judge(call, cfg, ctx) -> Finding | None:
     ctx.memo[NAME] = True
     now = ctx.now()  # one clock read feeds both `ts` and the legacy `at`
     stamp = datetime.fromtimestamp(now, UTC).isoformat(timespec="seconds")
+    cls = ctx.memo.get(CLASS_KEY)
     try:
-        rec = {"at": stamp, "runner": ctx.runner, "payload": redact(ctx.payload)}  # `at` is legacy; `ts` is the key
-        jsonl.append(log_path(ctx.home), jsonl.stamped(rec, SCHEMA_VERSION, now))
+        if cls is None:
+            where = log_path(ctx.home)
+        elif (where := paths.class_log_path(cls.name, LOG, ctx.home)) is None:
+            return None  # not the running user's folder: nothing is written, here or in the shared log
+        rec = {"at": stamp, "runner": ctx.runner}  # `at` is legacy; `ts` is the key
+        if counts_only(cls):
+            rec["kind"] = call.kind
+        else:
+            rec["payload"] = redact(ctx.payload)
+        jsonl.append(where, jsonl.stamped(rec, SCHEMA_VERSION, now))
     except OSError as e:  # recording is a convenience: a log that cannot be written never stops the call
         return Finding("warn", f"record-calls could not write {LOG} ({type(e).__name__})")
     return None

@@ -133,11 +133,14 @@ def test_a_tracer_planted_in_the_class_reaches_no_shared_sink(world, run_ws, cap
             p.read_bytes() for p in msg.store_path().parent.glob("*") if p.is_file()
         ),
         "a run record": (state / "logs" / "runs.jsonl").read_bytes(),
-        "the gate verdict log": (state / "logs" / gate.VERDICT_LOG).read_bytes(),
+        "the class's own gate verdict log": (
+            state / "logs" / paths.CLASS_LOGS / "alpha" / gate.VERDICT_LOG
+        ).read_bytes(),
         "a session's status output": "".join(outs).encode(),
         "the message feed": feed.encode(),
     }
     assert all(sinks.values()), [name for name, data in sinks.items() if not data]  # every sink was written
+    assert not (state / "logs" / gate.VERDICT_LOG).exists()  # a class's calls are not in the shared verdict log
     for name, data in sinks.items():
         assert value.encode() not in data, name
     # the two sinks that take text from a caller refuse a session of the class

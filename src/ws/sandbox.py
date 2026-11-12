@@ -422,14 +422,16 @@ def wrap(
     env: dict | None = None,
     machine: str | None = None,
     net: tuple[int, ...] | None = None,
+    extra_hidden: list[str] = (),
 ) -> Wrapped:
-    """`argv` inside the sandbox for this OS, with the descriptors that must stay open for it. Raises SandboxError (with
-    the install line) when it cannot be built."""
+    """`argv` inside the sandbox for this OS, with the descriptors that must stay open for it. `extra_hidden` is hidden
+    besides the policy's `deny_read` paths (a walled class's other classes' folders). Raises SandboxError (with the
+    install line) when it cannot be built."""
     system = system or _system()
     plan = Plan(
         home,
         tuple(protect),
-        tuple(hidden_paths(pol, env)),
+        tuple(dict.fromkeys([*hidden_paths(pol, env), *extra_hidden])),
         tuple(socket_dirs(env)),
         tuple(writable),
         tuple(locked),
@@ -508,6 +510,11 @@ PROJECT_LOCKED = (
 # code to git; `commondir` and the pointer files in `worktrees/NAME` decide WHICH folder git reads them from, so a
 # planted `commondir` that names a git folder made in the project is as good as writing the hooks themselves. The
 # placeholder for `commondir` is "." ("this folder"): an empty file makes git die.
+# The project paths Claude Code itself loads settings, hooks and MCP servers from. A Claude session holds them with its
+# own sandbox's `denyWrite`, which can only hold a path that exists, so a missing one is made first (`claude_loaded`).
+# Not the whole of `PROJECT_LOCKED`: the other names there are OpenCode's, and a Claude session leaves no placeholder
+# for them in the person's `git status`.
+CLAUDE_LOAD_PATHS = (".claude", ".mcp.json")
 GIT_LOCKED = (("hooks", DIR), ("config", None), ("config.worktree", ""), ("commondir", ".\n"))
 GIT_WORKTREE_FILES = (("commondir", None), ("gitdir", None), ("config.worktree", ""))  # in worktrees/NAME
 GIT_OTHER_DIRS = ("worktrees", "modules")  # held whole by the Claude Code settings, which cannot name a glob
@@ -595,8 +602,14 @@ def launch_env(
     would be loaded by the next unwalled one, and the report would have to look for them. `layout_env` (from
     `paths.env_for`) tells the runner's hooks where ws's folders are, because `homes` moves the XDG variables they would
     otherwise find them by."""
+    return {**passed_env(env, runner, pass_env), **(layout_env or {}), ENV_MARKER: "1", **wall_env(tmp, homes)}
+
+
+def wall_env(tmp: str | None, homes: dict | None = None) -> dict:
+    """The variables the wall itself sets for a runner in it: TMPDIR and the bytecode cache in the private `tmp`, and the
+    runner's private XDG folders (`homes`)."""
     walled = {"TMPDIR": tmp, "PYTHONPYCACHEPREFIX": f"{tmp}/pycache"} if tmp else {}
-    return {**passed_env(env, runner, pass_env), **(layout_env or {}), ENV_MARKER: "1", **walled, **(homes or {})}
+    return {**walled, **(homes or {})}
 
 
 def ptrace_scope(path: str = "/proc/sys/kernel/yama/ptrace_scope") -> int | None:
@@ -748,7 +761,9 @@ def _seed(data_fd: int, runner: str, real_data: Path, hidden: list[str]) -> None
         os.close(app_fd)
 
 
-def private_homes(home: Path, runner: str, pol: policy.Policy, env: dict, project: str) -> dict[str, str]:
+def private_homes(
+    home: Path, runner: str, pol: policy.Policy, env: dict, project: str, extra_hidden: list[str] = ()
+) -> dict[str, str]:
     """XDG data, state and cache folders for a walled run of `runner` in `project`, as {variable: folder}; {} for a
     runner that keeps no state of its own (one without `wall_writable` in its adapter, which is the marker).
 
@@ -777,7 +792,7 @@ def private_homes(home: Path, runner: str, pol: policy.Policy, env: dict, projec
     root = Path(os.path.realpath(base / runner))
     key, out = project_key(project), {}
     real_data = Path(env.get("XDG_DATA_HOME") or f"{env.get('HOME') or Path.home()}/.local/share") / runner
-    hidden = hidden_paths(pol, env)
+    hidden = [*hidden_paths(pol, env), *extra_hidden]
     for var, kind, per_project in XDG_HOMES:
         folder = root / kind
         folder.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -957,16 +972,19 @@ def lock_wanted(project: str) -> list[tuple[str, str | None]]:
     return list(first.items())
 
 
-def lock_project(project: str) -> tuple[list[str], list[tuple[str, str]]]:
+def lock_project(project: str, names: tuple[str, ...] | None = None) -> tuple[list[str], list[tuple[str, str]]]:
     """(locked, created): the paths for the wall to hold read-only, and the placeholders made so a missing one cannot be
     created inside the wall. bubblewrap can only bind what is there, and a read-only bind of a folder or file that is
     in the way is what stops `mkdir .claude` and `echo '{...}' > .mcp.json`. They are made here, by the launcher, before
     the wall, and removed by `unlock_project` after it (only if still what was made; see `enter_project` for who
     removes them when several sessions share the project). Raises SandboxError for a locked path that is a symbolic
-    link: it could be deleted and replaced by a real folder, which no bind prevents."""
+    link: it could be deleted and replaced by a real folder, which no bind prevents. `names` limits it to those paths of
+    the project (relative to its root, as `PROJECT_LOCKED` spells them); the default is all of `lock_wanted`."""
     locked: list[str] = []
     created: list[tuple[str, str]] = []
     wanted = lock_wanted(project)
+    if names is not None:
+        wanted = [(p, fill) for p, fill in wanted if os.path.relpath(p, project) in names]
     for path, _ in wanted:  # all of them first, so a refusal leaves nothing made
         if os.path.islink(path):
             raise SandboxError(
@@ -1061,16 +1079,17 @@ def _alive(pid: int) -> bool:
     return True
 
 
-def enter_project(home: Path, project: str) -> list[str]:
+def enter_project(home: Path, project: str, names: tuple[str, ...] | None = None) -> list[str]:
     """Lock the project for this launcher and record it. Placeholders are shared: a second walled session in the same
     project finds them and adds its pid, and only the last one out removes them (`leave_project`); the first launcher
     taking them down under a second one would detach the read-only bind in the second's mount namespace. If every
-    launcher the record names is dead (killed), the placeholders it left are taken down first. Returns the locked paths."""
+    launcher the record names is dead (killed), the placeholders it left are taken down first. `names` is passed to
+    `lock_project`. Returns the locked paths."""
     with _project_state(home, project) as state:
         if not state["pids"] and state["created"]:
             unlock_project([tuple(c) for c in state["created"]])
             state["created"] = []
-        locked, created = lock_project(project)
+        locked, created = lock_project(project, names)
         state["created"] += created
         state["pids"].append(os.getpid())
     return locked
@@ -1833,11 +1852,12 @@ def provider_problem(cls: policy.Class | None, provider: str | None) -> str | No
     return None
 
 
-def session_class(pol: policy.Policy) -> policy.Class | None:
+def session_class(pol: policy.Policy, cwd: str | None = None) -> policy.Class | None:
     """The class of the folder a session starts in (None: the policy has no classes). The real path decides; a folder that
-    can't be read is refused (exit 3), never guessed."""
+    can't be read is refused (exit 3), never guessed. `cwd` is the folder the session works in when it is not this
+    process's own (a headless job's); the default is this process's current folder."""
     try:
-        here = os.path.realpath(os.getcwd())
+        here = os.path.realpath(os.getcwd() if cwd is None else cwd)
     except OSError as e:
         raise WsError(
             "refused",
@@ -2128,21 +2148,50 @@ def real_user() -> str | None:
         return None
 
 
-def require_class_user(pol: policy.Policy) -> None:
-    """Refuse to start a session of a class that names an `os_user` unless this process runs as that user. The class is
-    the policy's `class_of` for the real path of the folder the session starts in, and the user is `real_user()`: nothing
-    from the environment is read, so a forged `$USER` or `$HOME` changes nothing. A class with no `os_user`, a policy with
-    no classes and a path in no class are not held to this. Exit 3, with a hint that names the class and not the account."""
-    cls = session_class(pol)
-    if cls is None or not cls.os_user or real_user() == cls.os_user:
-        return
-    raise WsError(
-        "refused",
-        f"refusing to start: this folder is in class {cls.name!r}, whose sessions run as the OS user set for that class, "
-        "and this process does not",
-        f"start it as the OS user of class {cls.name!r} (`ws install --class {cls.name}` prints how to set that up)",
-        3,
-    )
+def classes_of_user(pol: policy.Policy) -> list[policy.Class]:
+    """The classes whose `os_user` is the account this process runs as (`real_user()`), by name. [] for a person's own
+    account, a policy with no classes, and a system whose user database has no entry for this process."""
+    me = real_user()
+    return [c for _, c in sorted(pol.classes.items()) if me and c.os_user == me]
+
+
+def class_user_refusal(pol: policy.Policy, cls: policy.Class | None) -> WsError | None:
+    """Why a session in class `cls` (None: the policy has no classes; `policy.UNCLASSIFIED`: a folder in no class) may
+    not start as this account, or None. Two refusals, both exit 3 and both naming the class, never the account: the
+    class has an `os_user` and this is not it; or this account is the `os_user` of a class and the folder is not in one
+    of those classes (a class account does its work in its class's folders only)."""
+    if cls is not None and cls.os_user and real_user() != cls.os_user:
+        return WsError(
+            "refused",
+            f"refusing to start: this folder is in class {cls.name!r}, whose sessions run as the OS user set for that "
+            "class, and this process does not",
+            f"start it as the OS user of class {cls.name!r} (`ws install --class {cls.name}` prints how to set that up)",
+            3,
+        )
+    mine = classes_of_user(pol)
+    if mine and (cls is None or cls.name not in {c.name for c in mine}):
+        names = ", ".join(repr(c.name) for c in mine)
+        where = "in no class" if cls is None or cls.name == policy.CLASS_RESERVED else f"in class {cls.name!r}"
+        return WsError(
+            "refused",
+            f"refusing to start: this process runs as the OS user of class {names}, whose sessions start in that "
+            f"class's folders only, and this folder is {where}",
+            f"start it from a folder of class {names}, or as your own account",
+            3,
+        )
+    return None
+
+
+def require_class_user(pol: policy.Policy, cwd: str | None = None) -> None:
+    """Refuse to start a session unless this process's account fits the class of the folder it starts in. The class is the
+    policy's `class_of` for the real path of `cwd` (default: the current folder), and the account is `real_user()`:
+    nothing from the environment is read, so a forged `$USER` or `$HOME` changes nothing. A class with an `os_user` is
+    started as that user only; an account that is the `os_user` of a class starts in that class's folders only (a folder
+    of no class, or of another class, is refused). A class with no `os_user`, a policy with no classes and a person's own
+    account are not held to this. Exit 3, with a hint that names the class and not the account (`class_user_refusal`)."""
+    refusal = class_user_refusal(pol, session_class(pol, cwd))
+    if refusal is not None:
+        raise refusal
 
 
 def _launch_policy(args: argparse.Namespace) -> tuple[Path, policy.Policy]:
@@ -2190,6 +2239,220 @@ def warn_old_runner(exe: str, env: dict, pol: policy.Policy) -> None:
         )
 
 
+def class_launch_doc(cls: policy.Class | None) -> dict | None:
+    """The launch file of a walled class (a class with an `os_user`), read and checked by
+    `wallsettings.load_launch_file` (WsError `refused`, exit 3, when it is not in place or not root-owned); None for any
+    other session."""
+    from ws import osinfo, wallsettings
+
+    if cls is not None and cls.os_user:
+        return wallsettings.load_launch_file(cls, osinfo.detect().kind)
+    return None
+
+
+def warn_hidden_clash(clash: list[str], what: str) -> None:
+    """Say, on stderr, which allowed folders (`clash`, from `under_hidden`) sit inside another class's folder and so are
+    not reachable: `what` is what happens to them."""
+    if clash:
+        print(f"ws: warning: {what}, as it is inside another class's folder: {', '.join(clash)}", file=sys.stderr)
+
+
+def class_hidden(launch_doc: dict, cls: policy.Class, cwd: str, env: dict) -> list[str]:
+    """The folders a walled class's session in `cwd` may not read, for a runner that has no sandbox of its own: the other
+    classes' folders in its launch file, and the `deny_read` of the per-repo narrowing the policy gives the class for
+    `cwd`. Real paths, only those that exist and name no wildcard (as `hidden_paths` does for the policy's own)."""
+    from ws import wallsettings
+
+    found = [*wallsettings.read_denied(launch_doc), *cls.narrowing_for(os.path.realpath(cwd)).deny_read]
+    out = []
+    for entry in found:
+        path = expand(entry, env)
+        if path.startswith("/") and not re.search(r"[*?\[]", path) and os.path.lexists(path):
+            out.append(os.path.realpath(path))
+    return list(dict.fromkeys(out))
+
+
+def claude_launch_text(
+    pol: policy.Policy,
+    cls: policy.Class | None,
+    project: str,
+    env: dict,
+    plan: EgressPlan | None,
+    base_text: str,
+    *,
+    cwd: str | None = None,
+    forges: bool = False,
+    launch_doc: dict | None = None,
+) -> str:
+    """The Claude Code settings for a session in `project`: `base_text` (the generated settings) with the project's locked
+    paths, the home-folder denial and the policy's read rules added (`claude_code.for_project`), `plan`'s hosts as the
+    network list (a headless job passes None: its settings carry the list already), the walled class's launch file
+    merged in (its keys win) and last the per-repo narrowing the policy gives the class for `cwd` (default: the current
+    folder), which can only add denials. The other classes' folders (`launch_doc`'s deny list) are denied before the
+    allow list is filtered, so no entry can sit under one: it is dropped, and named. `forges` adds the forge hosts to
+    the default network list (a session at a terminal; never a headless job). Settings with no sandbox block come back
+    as they are. WsError `refused` (exit 3) when a class's list has nowhere to go."""
+    from ws import wallsettings
+    from ws.adapters import claude_code
+
+    try:
+        allow, deny = policy.launch_read_rules(pol)
+        if launch_doc is not None:
+            hidden = wallsettings.read_denied(launch_doc)
+            warn_hidden_clash(
+                under_hidden([*allow, *git_read_folders(project)], hidden, env.get("HOME") or str(Path.home())),
+                "left out of the readable folders",
+            )
+            deny = [*deny, *hidden]
+        text = claude_code.for_project(
+            base_text,
+            project,
+            plan.domains() if plan else None,
+            allow_read=allow,
+            deny_read=deny,
+            env=env,
+            forges=forges,
+        )
+    except ValueError as e:  # a class's list has nowhere to go: the generated settings have no sandbox block
+        raise WsError(
+            "refused", f"refusing to start claude-code: {e}", "set `[gate] sandbox = true`, `ws install`", 3
+        ) from e
+    if launch_doc is not None and cls is not None:
+        conf = wallsettings.merge(json.loads(text), launch_doc)
+        conf = wallsettings.narrowed(conf, cls.narrowing_for(os.path.realpath(os.getcwd() if cwd is None else cwd)))
+        text = json.dumps(conf, indent=2) + "\n"
+    return text
+
+
+def _guarded(what: str, step, *args):
+    """Run one clean-up step; a step that raises is one warning line on stderr and None, so the steps after it still run
+    (a run's lease, record and settle, and a wall's private tmp, never depend on an earlier step having worked)."""
+    try:
+        return step(*args)
+    except Exception as e:  # noqa: BLE001 - clean-up never stops the rest of the clean-up
+        print(f"ws: could not {what} ({type(e).__name__})", file=sys.stderr)
+        return None
+
+
+@contextlib.contextmanager
+def claude_loaded(home: Path, project: str, runner: str = "claude-code"):
+    """Around a Claude Code session in `project`: look at the project (`scan_project`), make the load paths Claude's
+    sandbox holds but cannot hold while they are missing (`CLAUDE_LOAD_PATHS`: `.claude`, `.mcp.json`) and record this
+    launcher in the project's state (`enter_project`, so several sessions share them and the last one out removes
+    them), and on the way out take them down (`leave_project`) and print what the session left (`report_run`). A path
+    that is a link is a SandboxError, before anything is made. Both launch paths use it: `ws gate launch` and `ws run`."""
+    before, note = scan_project(project)
+    notes = [note] if note else []
+    entered = False
+    try:
+        enter_project(home, project, CLAUDE_LOAD_PATHS)
+        entered = True
+        yield
+    finally:
+        if entered:
+            made = _guarded("let go of the project", leave_project, home, project) or []
+            try:
+                after, note = scan_project(project, tuple(made))
+                report_run(home, project, runner, before, after, [*notes, *([note] if note else [])], not notes)
+            except OSError as e:
+                print(f"ws: could not write the wall report: {e}", file=sys.stderr)
+
+
+@dataclass
+class Wall:
+    """What `walled` hands the caller: the runner's command inside the wall, the descriptors to keep open for it, and the
+    variables the wall sets for it (add them to the runner's environment last). `proxy` is the egress proxy, when the
+    session has a plan; `tmp` is the wall's private /tmp."""
+
+    argv: list[str]
+    pass_fds: tuple[int, ...]
+    env: dict
+    tmp: str
+    proxy: EgressProxy | None = None
+
+
+@contextlib.contextmanager
+def walled(
+    argv: list[str],
+    pol: policy.Policy,
+    home: Path,
+    runner: str,
+    project: str,
+    env: dict,
+    plan: EgressPlan | None,
+    *,
+    protect: list[str],
+    allow_write: list[str] = (),
+    cls: policy.Class | None = None,
+    cwd: str | None = None,
+    tty: bool = False,
+):
+    """Around a runner that has no sandbox of its own (OpenCode), the wall `ws gate launch` and `ws run` both put round it.
+    On the way in: a walled class's launch file is read and the project checked against the runner's own
+    `project_problem` (WsError `refused`, exit 3: before anything is made), the other classes' folders and the narrowing's
+    `deny_read` are hidden (an allowed folder inside one is named), the private tmp and the runner's private XDG folders
+    are made, the project is looked at and locked (`enter_project`), the egress proxy is started when `plan` has hosts, and
+    `argv` is wrapped (`wrap`; SandboxError when it cannot be). It yields a `Wall`. On the way out, even on an error: the
+    proxy is stopped, the project is let go of, the end-of-run report is written and the tmp is removed.
+
+    `env` is where the real home and the runner's folders are looked up; `protect` and `allow_write` are the caller's
+    (`protected`, `writable_folders`); `cwd` (default the current folder) is the folder the session starts in, which is
+    what the class narrowing is judged by."""
+    launch_doc = class_launch_doc(cls)
+    hidden: list[str] = []
+    if launch_doc is not None and cls is not None:
+        start = os.getcwd() if cwd is None else cwd
+        problem = getattr(adapters.get(runner), "project_problem", None)
+        refusal = problem([project, os.path.realpath(start)], paths.home_dir()) if problem else None
+        if refusal:
+            raise refusal
+        hidden = class_hidden(launch_doc, cls, start, env)
+        allowed = [*policy.sandbox_write_paths(pol), *policy.launch_read_rules(pol)[0], *allow_write, project]
+        warn_hidden_clash(under_hidden(allowed, hidden, env.get("HOME") or str(Path.home())), "hidden from the session")
+    tmp = tempfile.mkdtemp(prefix="ws-wall-")  # the wall's /tmp: the rest of the disk is read-only
+    entered, before, notes, proxy = False, {}, [], None
+    try:
+        homes = private_homes(home, runner, pol, env, project, hidden)
+        before, note = scan_project(project)
+        notes += [note] if note else []
+        locked = enter_project(home, project)
+        entered = True
+        extra: dict = {}
+        net = None
+        if plan is not None:  # the runner reaches the network through ws's proxy, and the macOS wall shuts the rest
+            secret = new_secret()
+            proxy = EgressProxy(plan, secret=secret)
+            extra = {**proxy_env(proxy.start(), secret), "PATH": f"{write_deny_shims(tmp)}:{env.get('PATH', '')}"}
+            net = (proxy.port, *plan.local_ports())
+        wrapped = wrap(
+            argv,
+            pol,
+            home,
+            protect,
+            writable=writable_folders(pol, runner, project, tmp, list(allow_write), env),
+            locked=locked,
+            homes=list(homes.values()),
+            tty=tty,
+            net=net,
+            extra_hidden=hidden,
+        )
+        yield Wall(wrapped.argv, wrapped.pass_fds, {**wall_env(tmp, homes), **extra}, tmp, proxy)
+    finally:
+        if proxy is not None:
+            _guarded("stop the egress proxy", proxy.stop)
+            line = _guarded("read the egress notes", lambda: egress_note(plan, len(proxy.denials), shim_events(tmp)))
+            notes += [line] if line else []
+        made = (_guarded("let go of the project", leave_project, home, project) or []) if entered else []
+        if entered:
+            try:
+                after, note = scan_project(project, tuple(made))
+                complete = not any("scan stopped" in n for n in notes)
+                report_run(home, project, runner, before, after, [*notes, *([note] if note else [])], complete)
+            except OSError as e:
+                print(f"ws: could not write the wall report: {e}", file=sys.stderr)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def launch_claude(
     args: argparse.Namespace,
     argv: list[str],
@@ -2204,8 +2467,9 @@ def launch_claude(
     no project paths. Here the project is known: the locked set (ws.sandbox PROJECT_LOCKED, GIT_LOCKED, the git folders
     git resolves) is added to `denyWrite` in a copy under `<state>/gate/claude-code/projects/`, and `claude --settings`
     is started with it. No bubblewrap: Claude Code's sandbox is the wall. The end-of-run report is the launcher's, as
-    for OpenCode. With an egress `plan` the copy also carries the plan's hosts as `network.allowedDomains`, and nothing
-    else is reachable.
+    for OpenCode, and so are the placeholders for `.claude` and `.mcp.json` when the project has none (`claude_loaded`).
+    With an egress `plan` the copy also carries the plan's hosts as `network.allowedDomains`, and nothing else is
+    reachable.
 
     A session of a walled class (a class with an `os_user`) also gets the class's own launch file (ADR 0027, `ws install
     --class`), read from `wallsettings.launch_file_path` and merged into that copy, its keys winning: the class is the one
@@ -2214,16 +2478,14 @@ def launch_claude(
     root-owned, and when the project's `.mcp.json` or `.claude/settings*.json` holds anything the allow-list does not name
     (`wallsettings.project_problem`): a SessionStart hook cannot block, so the refusal is made here, before the runner
     starts, and again by the hook on every call. The per-repo narrowing the policy gives the class for this folder is
-    applied last, and can only add denials."""
-    from ws import osinfo, wallsettings
+    applied last, and can only add denials. The copy is made by `claude_launch_text`, which `ws run` uses too."""
+    from ws import wallsettings
     from ws.adapters import claude_code
 
     pol = pol if pol is not None else _launch_policy(args)[1]
     require_class_user(pol)  # before anything is written or started
     cls = session_class(pol)
-    launch_doc = None
-    if cls is not None and cls.os_user:
-        launch_doc = wallsettings.load_launch_file(cls, osinfo.detect().kind)
+    launch_doc = class_launch_doc(cls)
     warn_old_runner(argv[0], env, pol)
     out = home / "gate" / "claude-code"
     base = out / claude_code.FILE
@@ -2245,37 +2507,16 @@ def launch_claude(
     target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     if target.is_symlink():
         target.unlink()
-    try:
-        allow, deny = policy.launch_read_rules(pol)
-        if launch_doc is not None:
-            # The other classes' folders are denied before the allow list is filtered, so no entry (the policy's, or a git
-            # folder) can sit under one: it is dropped, and named, whatever order the merge below would put it in.
-            hidden = wallsettings.read_denied(launch_doc)
-            clash = under_hidden([*allow, *git_read_folders(project)], hidden, env.get("HOME") or str(Path.home()))
-            if clash:
-                print(
-                    f"ws: warning: left out of the readable folders, as it is inside another class's folder: "
-                    f"{', '.join(clash)}",
-                    file=sys.stderr,
-                )
-            deny = [*deny, *hidden]
-        text = claude_code.for_project(
-            base.read_text(encoding="utf-8"),
-            project,
-            plan.domains() if plan else None,
-            allow_read=allow,
-            deny_read=deny,
-            env=env,
-            forges=plan is None and not pol.gate.allow_hosts,  # the default list only: a person is at this terminal
-        )
-    except ValueError as e:  # a class's list has nowhere to go: the generated settings have no sandbox block
-        raise WsError(
-            "refused", f"refusing to start claude-code: {e}", "set `[gate] sandbox = true`, `ws install`", 3
-        ) from e
-    if launch_doc is not None:
-        conf = wallsettings.merge(json.loads(text), launch_doc)
-        conf = wallsettings.narrowed(conf, cls.narrowing_for(os.path.realpath(os.getcwd())))
-        text = json.dumps(conf, indent=2) + "\n"
+    text = claude_launch_text(
+        pol,
+        cls,
+        project,
+        env,
+        plan,
+        base.read_text(encoding="utf-8"),
+        forges=plan is None and not pol.gate.allow_hosts,  # the default list only: a person is at this terminal
+        launch_doc=launch_doc,
+    )
     from ws import install  # here, not at the top: install imports the adapters this module does
 
     try:
@@ -2284,20 +2525,17 @@ def launch_claude(
         raise WsError("io", f"could not write the launch settings {target}: {e}", "check the folder is writable") from e
     cmd = [argv[0], "--settings", str(target), *argv[1:]]
     env = {**claude_code.MCP_WAIT_ENV, **env}  # the first model call sees its MCP tools; a value the person set wins
-    before, note = scan_project(project)
-    notes = [note] if note else []
     old = _exit_on_hangup()
     try:
-        return run_plain(cmd, env)
-    except OSError as e:
-        print(f"ws: could not start {shlex.join(argv[:1])}: {e}", file=sys.stderr)
-        return 127
+        with claude_loaded(home, project, "claude-code"):
+            try:
+                return run_plain(cmd, env)
+            except OSError as e:
+                print(f"ws: could not start {shlex.join(argv[:1])}: {e}", file=sys.stderr)
+                return 127
+    except SandboxError as e:
+        raise WsError("refused", f"refusing to start claude-code: {e}", "start it from a project folder") from e
     finally:
-        try:
-            after, note = scan_project(project)
-            report_run(home, project, "claude-code", before, after, [*notes, *([note] if note else [])], not notes)
-        except OSError as e:
-            print(f"ws: could not write the wall report: {e}", file=sys.stderr)
         for sig, handler in old.items():
             signal.signal(sig, handler)
 
@@ -2341,40 +2579,28 @@ def cmd_launch(args: argparse.Namespace) -> int:
         return 0  # exec does not return; this is for a test that replaces it. --no-sandbox never reaches the wall code
     if ptrace_scope() in (0, None) and sys.platform == "linux":
         print(PTRACE_NOTE, file=sys.stderr)
-    tmp = tempfile.mkdtemp(prefix="ws-wall-")  # the wall's /tmp: the rest of the disk is read-only
-    project, entered, before, notes, proxy = "", False, {}, [], None
     old = _exit_on_hangup()
     try:
         project = project_folder(os.getcwd(), env)
-        homes = private_homes(home, args.runner, pol, env, project)
-        before, note = scan_project(project)
-        notes += [note] if note else []
-        locked = enter_project(home, project)
-        entered = True
-        extra: dict = {}
-        net = None
-        if plan is not None:  # the runner reaches the network through ws's proxy, and the macOS wall shuts the rest
-            secret = new_secret()
-            proxy = EgressProxy(plan, secret=secret)
-            extra = {**proxy_env(proxy.start(), secret), "PATH": f"{write_deny_shims(tmp)}:{env.get('PATH', '')}"}
-            net = (proxy.port, *plan.local_ports())
-        wrapped = wrap(
+        with walled(
             argv,
             pol,
             home,
-            protected(policy_file, args.runner, args.protect),
-            writable=writable_folders(pol, args.runner, project, tmp, args.allow_write or [], env),
-            locked=locked,
-            homes=list(homes.values()),
+            args.runner,
+            project,
+            env,
+            plan,
+            protect=protected(policy_file, args.runner, args.protect),
+            allow_write=args.allow_write or [],
+            cls=cls,
             tty=sys.stdin.isatty(),
-            net=net,
-        )
-        return run_with_broker(
-            wrapped.argv,
-            {**launch_env(env, tmp, homes, args.runner, pass_env, paths.env_for()), **extra},
-            wrapped.pass_fds,
-            approvals_dir(home),
-        )
+        ) as wall:
+            return run_with_broker(
+                wall.argv,
+                {**launch_env(env, None, None, args.runner, pass_env, paths.env_for()), **wall.env},
+                wall.pass_fds,
+                approvals_dir(home),
+            )
     except SandboxError as e:
         raise WsError(
             "refused", f"refusing to start {args.runner} without its wall: {e}", "or `--no-sandbox`, which has none"
@@ -2383,19 +2609,6 @@ def cmd_launch(args: argparse.Namespace) -> int:
         print(f"ws: could not start {shlex.join(argv[:1])}: {e}", file=sys.stderr)
         return 127
     finally:
-        if proxy is not None:
-            proxy.stop()
-            line = egress_note(plan, len(proxy.denials), shim_events(tmp))
-            notes += [line] if line else []
-        made = leave_project(home, project) if entered else []
-        if entered:
-            try:
-                after, note = scan_project(project, tuple(made))
-                complete = not any("scan stopped" in n for n in notes)
-                report_run(home, project, args.runner, before, after, [*notes, *([note] if note else [])], complete)
-            except OSError as e:
-                print(f"ws: could not write the wall report: {e}", file=sys.stderr)
-        shutil.rmtree(tmp, ignore_errors=True)
         for sig, handler in old.items():
             signal.signal(sig, handler)
 

@@ -32,5 +32,6 @@ decisions weren't about the engine.
 | [0026](0026-deny-the-home-in-the-launch-settings.md) | Deny the home folder in the Claude Code launch settings, and re-allow the project and what tools need | accepted | 2026-11-12 |
 | [0027](0027-a-settings-file-per-walled-class.md) | A settings file per walled class, read by the launch, with managed-only keys left out | accepted | 2026-11-12 |
 | [0028](0028-a-guard-logs-what-the-wall-enforces.md) | A guard logs what the wall enforces, only where the wall is proven for the call | accepted | 2026-11-12 |
+| [0029](0029-a-job-runs-inside-the-launch-wall.md) | A headless job runs inside the same wall as a launch, built by the same code | accepted | 2026-11-12 |
 
 To add one, copy the newest record, take the next number and add a row here.

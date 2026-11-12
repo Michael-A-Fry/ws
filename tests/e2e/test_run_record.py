@@ -177,7 +177,9 @@ def test_opencode_record_is_complete(rig):
         assert rec["green"] == "package"
         assert rec["models_used"][0]["model"] == "stub/m"  # filled in from the request: the stream does not name it
         assert rec["num_turns"] == 2 and rec["session_id"].startswith("ses_")
-        assert rec["transcript_path"].endswith("opencode.db") and str(rig.user) in rec["transcript_path"]
+        transcript = Path(rec["transcript_path"])  # the job's own data folder inside the wall, kept after the run
+        assert transcript.name == "opencode.db" and transcript.is_file()
+        assert transcript.resolve().is_relative_to(rig.home.resolve())
         check_no_secret_left_behind(rig, stub, rec)
         assert len(stub.tool_results()) == 1
 

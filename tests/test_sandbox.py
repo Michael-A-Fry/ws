@@ -11,6 +11,7 @@ import signal
 import struct
 import subprocess
 import sys
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -572,6 +573,192 @@ def test_launch_needs_a_command(env):
     assert env == []
 
 
+def two_walled_classes(env, monkeypatch, tmp_path, wshome) -> Path:
+    """Classes alpha and beta, each with its own account and folders under tmp_path/work; alpha's launch file in place; this
+    process is alpha's account and stands in alpha's app folder. Returns beta's folder."""
+    from ws import wallsettings
+
+    (wshome / "policy.toml").write_text(
+        f'[classes.alpha]\naccess = "walled"\nos_user = "ws-alpha"\nrepos = ["{tmp_path}/work/alpha/**"]\n'
+        f'allowed_providers = ["local"]\nlocal_only = true\nallowed_hosts = ["localhost:11434"]\n'
+        f'[classes.beta]\naccess = "walled"\nos_user = "ws-beta"\nrepos = ["{tmp_path}/work/beta/**"]\n'
+        'allowed_providers = ["local"]\n',
+        encoding="utf-8",
+    )
+    pol = policy.load(wshome / "policy.toml")
+    monkeypatch.setattr(sandbox, "real_user", lambda: "ws-alpha")
+    monkeypatch.setattr(wallsettings, "passwd", lambda name: SimpleNamespace(pw_dir=f"/home/{name}") if name else None)
+    monkeypatch.setattr(wallsettings, "launch_dir", lambda kind: str(tmp_path / "launch"))
+    monkeypatch.setattr(wallsettings, "_is_root", lambda st: True)
+    alpha = pol.classes["alpha"]
+    file = wallsettings.launch_file_path("alpha", "linux")
+    file.parent.mkdir(parents=True, exist_ok=True)
+    file.write_text(json.dumps(wallsettings.launch_settings(alpha, "/home/ws-alpha", "linux", pol)), encoding="utf-8")
+    file.chmod(0o644)
+    file.parent.chmod(0o755)
+    beta = tmp_path / "work" / "beta"
+    (beta / "repo").mkdir(parents=True)
+    app = tmp_path / "work" / "alpha" / "app"
+    app.mkdir(parents=True)
+    monkeypatch.chdir(app)
+    monkeypatch.setattr(  # the real wall builder, told this host has bubblewrap that starts
+        sandbox,
+        "wrap",
+        partial(sandbox.wrap, system="linux", machine="x86_64", which=which("bwrap"), probe=lambda: True),
+    )
+    return beta
+
+
+def test_a_walled_opencode_launch_hides_the_other_classes_folders(env, monkeypatch, tmp_path, wshome, capsys):
+    beta = two_walled_classes(env, monkeypatch, tmp_path, wshome)
+    assert cli.main(["gate", "launch", "--runner", "opencode", "--provider", "local", "--", "opencode"]) == 0
+    cmd, e, _ = env[0]
+    assert cmd[cmd.index(str(beta.resolve())) - 1] == "--tmpfs"  # beta's folder is made empty
+    assert cmd[-1] == "opencode" and "@127.0.0.1:" in e["HTTPS_PROXY"]  # and the network list still applies
+    assert "inside another class's folder" not in capsys.readouterr().err  # nothing allowed sits under it
+
+
+def test_a_walled_opencode_launch_names_an_allowed_folder_inside_another_class(
+    env, monkeypatch, tmp_path, wshome, capsys
+):
+    beta = two_walled_classes(env, monkeypatch, tmp_path, wshome)
+    assert (
+        cli.main(
+            [
+                "gate",
+                "launch",
+                "--runner",
+                "opencode",
+                "--provider",
+                "local",
+                "--allow-write",
+                str(beta / "repo"),
+                "--",
+                "opencode",
+            ]
+        )
+        == 0
+    )
+    assert str(beta / "repo") in capsys.readouterr().err
+
+
+def test_a_walled_opencode_launch_applies_the_narrowing_of_its_folder(env, monkeypatch, tmp_path, wshome):
+    beta = two_walled_classes(env, monkeypatch, tmp_path, wshome)
+    secret = tmp_path / "work" / "alpha" / "app" / "private"
+    secret.mkdir()
+    text = (wshome / "policy.toml").read_text(encoding="utf-8")
+    (wshome / "policy.toml").write_text(
+        text.replace(
+            'allowed_hosts = ["localhost:11434"]\n',
+            f'allowed_hosts = ["localhost:11434"]\n[classes.alpha.repo_settings."{tmp_path}/work/alpha/**"]\n'
+            f'deny_read = ["{secret}"]\n',
+        ),
+        encoding="utf-8",
+    )
+    assert cli.main(["gate", "launch", "--runner", "opencode", "--provider", "local", "--", "opencode"]) == 0
+    cmd = env[0][0]
+    assert (
+        cmd[cmd.index(str(secret.resolve())) - 1] == "--tmpfs" and cmd[cmd.index(str(beta.resolve())) - 1] == "--tmpfs"
+    )
+
+
+def test_a_walled_opencode_launch_needs_the_class_launch_file(env, monkeypatch, tmp_path, wshome, capsys):
+    from ws import wallsettings
+
+    two_walled_classes(env, monkeypatch, tmp_path, wshome)
+    monkeypatch.setattr(wallsettings, "launch_dir", lambda kind: str(tmp_path / "nowhere"))
+    assert cli.main(["gate", "launch", "--runner", "opencode", "--provider", "local", "--", "opencode"]) == 3
+    assert "launch file" in capsys.readouterr().err and env == []
+
+
+def test_a_walled_opencode_launch_refuses_a_project_mcp_server_the_class_does_not_allow(
+    env, monkeypatch, tmp_path, wshome, capsys
+):
+    two_walled_classes(env, monkeypatch, tmp_path, wshome)
+    app = tmp_path / "work" / "alpha" / "app"
+    (app / "opencode.json").write_text(
+        json.dumps({"mcp": {"x": {"type": "local", "command": ["y"]}}}), encoding="utf-8"
+    )
+    assert cli.main(["gate", "launch", "--runner", "opencode", "--provider", "local", "--", "opencode"]) == 3
+    err = capsys.readouterr().err
+    assert (
+        "opencode.json" in err and "mcp" in err and env == []
+    )  # refused before the runner, and before anything is made
+    assert not (app / ".claude").exists() and not list((wshome / "wall" / "projects").glob("*.json"))
+
+
+def test_an_unwalled_opencode_launch_does_not_read_the_projects_config(env, monkeypatch, tmp_path, wshome):
+    monkeypatch.setattr(sandbox, "wrap", lambda argv, *a, **k: sandbox.Wrapped(["wall", *argv]))
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / "opencode.json").write_text('{"mcp": {"x": {"command": ["y"]}}}', encoding="utf-8")
+    monkeypatch.chdir(proj)
+    assert cli.main(["gate", "launch", "--runner", "opencode", "--", "opencode"]) == 0  # no class, so no such rule
+
+
+def write_files(root: Path, files: dict[str, str]) -> None:
+    for rel, text in files.items():
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_text(text, encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "files",
+    [
+        {"opencode.json": '{"mcp": {"x": {"command": ["y"]}}}'},
+        {"opencode.jsonc": '{\n  // a comment\n  "plugin": ["some-plugin",],\n}'},
+        {".opencode/opencode.json": '{"plugin": ["p"]}'},
+        {".opencode/opencode.jsonc": '/* c */ {"mcp": {"a": {}}}'},
+        {"tui.json": '{"plugin": ["p"]}'},
+        {"tui.jsonc": '{"plugin": ["p"]} // c'},
+        {".opencode/plugin/a.js": "export default {}"},
+        {".opencode/plugins/a.ts": "export default {}"},
+        {"../opencode.json": '{"mcp": {"x": {}}}'},  # a folder above the project
+    ],
+)
+def test_opencode_project_problem_refuses_anything_that_starts_a_server_or_loads_a_plugin(tmp_path, files):
+    home = tmp_path / "home"
+    proj = tmp_path / "work" / "app"
+    proj.mkdir(parents=True)
+    write_files(proj, files)
+    got = opencode.project_problem([str(proj)], home)
+    assert got is not None and got.kind == "project_load_refused" and got.exit_code == 3
+
+
+def test_opencode_project_problem_lets_a_plain_project_through(tmp_path):
+    home = tmp_path / "home"
+    proj = home / "work" / "app"
+    write_files(
+        proj, {"opencode.json": '{"model": "a/b", "mcp": {}, "plugin": [], // nothing started\n "permission": {}}'}
+    )
+    (proj / ".opencode" / "plugins").mkdir(parents=True)  # an empty plugin folder starts nothing
+    write_files(home, {"opencode.json": '{"mcp": {"x": {}}}'})  # the home folder's own is not the project's
+    assert opencode.project_problem([str(proj), str(proj)], home) is None
+    assert opencode.project_problem([str(tmp_path / "no" / "such")], home) is None  # nothing there is fine
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["{not json", "[1, 2]", '{"a": 1} /* never ends', '{"model": "{file:secret.txt}"}', "\ufeff", ""],
+)
+def test_opencode_project_problem_fails_closed_on_a_config_it_cannot_read(tmp_path, text):
+    proj = tmp_path / "app"
+    write_files(proj, {"opencode.json": text})
+    got = opencode.project_problem([str(proj)], tmp_path / "home")
+    assert got is not None and got.kind == "project_settings_unreadable" and got.exit_code == 3
+
+
+def test_opencode_project_problem_refuses_a_link_where_a_config_or_plugin_folder_should_be(tmp_path):
+    proj = tmp_path / "app"
+    proj.mkdir()
+    (tmp_path / "elsewhere").mkdir()
+    (proj / "opencode.json").symlink_to(tmp_path / "elsewhere" / "none")
+    assert opencode.project_problem([str(proj)], tmp_path / "home").kind == "project_settings_unreadable"
+    (proj / "opencode.json").unlink()
+    (proj / ".opencode").symlink_to(tmp_path / "elsewhere")
+    assert opencode.project_problem([str(proj)], tmp_path / "home").kind == "project_settings_unreadable"
+
+
 def claude_launch_setup(env, monkeypatch, tmp_path, wshome, name: str) -> Path:
     """Generated settings in $WS_HOME as `ws install` leaves them, and a project folder to start from."""
     out = wshome / "gate" / "claude-code"
@@ -607,6 +794,41 @@ def test_claude_code_is_started_with_settings_made_for_this_project_and_no_wrap(
     assert not any(
         str(one.resolve()) in p or str(two.resolve()) in p for p in shared["sandbox"]["filesystem"]["denyWrite"]
     )
+
+
+def test_claude_launch_makes_absent_load_paths_first_and_takes_them_down_after(env, monkeypatch, tmp_path, wshome):
+    proj = claude_launch_setup(env, monkeypatch, tmp_path, wshome, "p")
+    during = {}
+
+    def runner(cmd, e):
+        during.update({n: (proj / n).exists() for n in (".claude", ".mcp.json", ".opencode", "opencode.json")})
+        during["settings"] = json.loads(Path(cmd[2]).read_text())["sandbox"]["filesystem"]["denyWrite"]
+        return 0
+
+    monkeypatch.setattr(sandbox, "run_plain", runner)
+    assert cli.main(["gate", "launch", "--runner", "claude-code", "--", "claude"]) == 0
+    assert during[".claude"] and during[".mcp.json"]  # there for the sandbox to hold, before the runner starts
+    assert not during[".opencode"] and not during["opencode.json"]  # the other runner's names are not littered about
+    assert f"{proj.resolve()}/.claude" in during["settings"] and f"{proj.resolve()}/.mcp.json" in during["settings"]
+    assert not (proj / ".claude").exists() and not (proj / ".mcp.json").exists()  # and gone once it ends
+    assert not list((wshome / "wall" / "projects").glob("*.json"))  # nothing is left recorded for the next start
+
+
+def test_claude_launch_leaves_load_paths_the_project_already_has(env, monkeypatch, tmp_path, wshome):
+    proj = claude_launch_setup(env, monkeypatch, tmp_path, wshome, "p")
+    (proj / ".claude").mkdir()
+    (proj / ".claude" / "note.md").write_text("mine\n")
+    (proj / ".mcp.json").write_text('{"mcpServers": {}}\n')
+    assert cli.main(["gate", "launch", "--runner", "claude-code", "--", "claude"]) == 0
+    assert (proj / ".claude" / "note.md").read_text() == "mine\n" and (proj / ".mcp.json").is_file()
+
+
+def test_claude_launch_refuses_a_load_path_that_is_a_link_before_it_starts(env, monkeypatch, tmp_path, wshome, capsys):
+    proj = claude_launch_setup(env, monkeypatch, tmp_path, wshome, "p")
+    (tmp_path / "elsewhere").mkdir()
+    (proj / ".claude").symlink_to(tmp_path / "elsewhere")
+    assert cli.main(["gate", "launch", "--runner", "claude-code", "--", "claude"]) == 1
+    assert "symbolic link" in capsys.readouterr().err and env == []
 
 
 def test_claude_code_needs_generated_settings_and_a_project_folder(env, monkeypatch, tmp_path, wshome, capsys):

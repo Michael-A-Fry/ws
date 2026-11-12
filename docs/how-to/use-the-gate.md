@@ -88,7 +88,8 @@ With `bulk-staging` on, `git add -A` and `git commit -am` are stopped and `git a
 ## Replay recorded calls
 
 Name `record-calls` in `on` and each tool call a session makes is appended to `~/.local/state/ws/logs/gate-calls.jsonl`.
-After you change a rule, run the recorded calls against it.
+After you change a rule, run the recorded calls against it. With `[classes]` in the policy, each class has its own call
+log under `logs/classes/`, and replaying the shared file reads the class copies that hold a payload too.
 
 ```sh
 ws gate replay ~/.local/state/ws/logs/gate-calls.jsonl --runner claude-code

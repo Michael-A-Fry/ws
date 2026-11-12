@@ -2156,11 +2156,12 @@ def test_allow_read_reaches_the_launch_copy(home, tmp_path):
     assert "allowRead" not in json.loads(shared)["sandbox"]["filesystem"]  # the shared file never carries it
 
 
-def test_an_absolute_home_or_a_folder_above_it_is_refused_whole(home):
+@pytest.mark.parametrize("key", ["allow_read", "allow_write"])
+def test_an_absolute_home_or_a_folder_above_it_is_refused_whole(home, key):
     """`~` is refused, but `/home/u`, `/home` and `/home/u/a/..` open the same folders: all of them are refused."""
     ok = f'"{home}/ok"'
     for entry in (home, home.parent, home / "a" / "..", home.parent / "other" / "..", home.parent.parent):
-        with pytest.raises(PolicyError, match="allow_read") as e:
-            policy.loads(f'[gate]\nallow_read = [{ok}, "{entry}", "~/fine"]\n')
+        with pytest.raises(PolicyError, match=key) as e:
+            policy.loads(f'[gate]\n{key} = [{ok}, "{entry}", "~/fine"]\n')
         assert str(entry) in str(e.value)  # it names the entry
-    assert policy.loads(f"[gate]\nallow_read = [{ok}]\n").gate  # a folder inside the home is fine
+    assert policy.loads(f"[gate]\n{key} = [{ok}]\n").gate  # a folder inside the home is fine

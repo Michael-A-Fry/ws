@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import stat
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -298,6 +299,38 @@ def cache_dir(env: Mapping[str, str] | None = None) -> Path:
 def roots(env: Mapping[str, str] | None = None) -> tuple[Path, ...]:
     """Every distinct ws folder in the layout in use: what the wall makes read-only and the gate refuses writes to."""
     return layout(env).distinct()
+
+
+CLASS_LOGS = "classes"  # under `logs/`: one folder per data class, holding that class's copy of the per-call logs
+
+
+def class_log_path(class_name: str, filename: str, state: Path | None = None) -> Path | None:
+    """`<state>/logs/classes/<class_name>/<filename>`, with the folders made private (0700), or None when it is not
+    safe to write there: the folder cannot be made, is a link or not a folder, or belongs to another user than the one
+    running (the caller then writes nothing; it never falls back to the shared log). `class_name` is a name the policy
+    accepted (letters, digits, `_` and `-`). A platform with no user ids has no owner to check."""
+    base = (state if state is not None else state_dir()) / "logs" / CLASS_LOGS
+    folder = base / class_name
+    try:
+        base.mkdir(mode=0o700, parents=True, exist_ok=True)
+        folder.mkdir(mode=0o700, exist_ok=True)
+        info = os.lstat(folder)
+    except OSError:
+        return None
+    me = getattr(os, "geteuid", None)
+    if not stat.S_ISDIR(info.st_mode) or (me is not None and info.st_uid != me()):
+        return None
+    return folder / filename
+
+
+def class_log_files(filename: str, state: Path | None = None) -> list[Path]:
+    """Each class's copy of the log `filename` that exists now, in class-name order: what a reader of the shared log adds
+    to see every class. Nothing is made."""
+    base = (state if state is not None else state_dir()) / "logs" / CLASS_LOGS
+    try:
+        return [f for d in sorted(base.iterdir()) if (f := d / filename).is_file() and not f.is_symlink()]
+    except OSError:
+        return []
 
 
 def work_dir(env: Mapping[str, str] | None = None) -> Path:

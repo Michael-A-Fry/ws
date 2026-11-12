@@ -312,19 +312,25 @@ def _spawn(
     stdin_path: Path | None,
     out_dir: Path,
     grace_s: float | None = None,
+    pass_fds: tuple[int, ...] = (),
 ) -> tuple[int | None, bool, bool]:
     """Run the runner, its prompt from `stdin_path`, its output going to out_dir/stdout.txt and stderr.txt.
     Returns (exit code or None if killed, timed out, output truncated). A runner that overruns, or a `ws run` that is
-    interrupted, kills the runner's whole process group before anything else happens."""
-    stdin = open(stdin_path, "rb") if stdin_path else subprocess.DEVNULL  # noqa: SIM115
+    interrupted, kills the runner's whole process group before anything else happens. `pass_fds` stay open in the runner
+    (the wall's seccomp program) and are closed here once it has started, or failed to."""
+    stdin = subprocess.DEVNULL
     try:
+        if stdin_path:
+            stdin = open(stdin_path, "rb")  # noqa: SIM115
         p = subprocess.Popen(
             argv, env=env, cwd=cwd, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            start_new_session=True,
+            start_new_session=True, pass_fds=pass_fds,
         )  # fmt: skip
     finally:
-        if stdin_path:
+        if stdin is not subprocess.DEVNULL:
             stdin.close()
+        for fd in pass_fds:
+            os.close(fd)
     flags = [[False], [False]]
     threads = [
         threading.Thread(target=_pump, args=(src, out_dir / name, OUTPUT_CAP, flag), daemon=True)
@@ -384,6 +390,42 @@ def _base_record(job: jobs.Job, run_id: str, started: datetime, pol: policy.Poli
     )
 
 
+def _job_class(pol: policy.Policy, job: jobs.Job) -> policy.Class | None:
+    """The data class a job works in: that of the real path of its own `cwd`; a job with none runs in a fresh default
+    folder that is in no class (`policy.UNCLASSIFIED`, the strictest). None when the policy has no classes."""
+    if not pol.classes:
+        return None
+    return policy.class_of(pol, os.path.realpath(Path(job.cwd).expanduser())) if job.cwd else policy.UNCLASSIFIED
+
+
+def _wall_problem(pol: policy.Policy, job: jobs.Job, adapter, cwd: Path) -> str | None:
+    """Words for why the wall can not be put round a job, or None: the checks a `ws gate launch` makes before it starts a
+    runner, made for the job's `cwd` and not this process's. The account must fit the job's class (a class account runs
+    jobs in its class's folders only, and the default folder is in none); and with the sandbox on, the folder must be a
+    project folder (not the home folder or above it), and for a walled class its launch file must be in place and the
+    project must hold nothing the class does not allow (Claude Code: `wallsettings.project_problem`; a runner that ws
+    puts in its own wall, OpenCode: the adapter's `project_problem`). Static, so `--dry-run` lists it as a refusal."""
+    from ws import sandbox, wallsettings
+
+    cls = _job_class(pol, job)
+    try:
+        refusal = sandbox.class_user_refusal(pol, cls)
+        if refusal is None and pol.gate.sandbox and job.cwd:
+            project = sandbox.project_folder(str(cwd), os.environ)
+            check = (
+                wallsettings.project_problem
+                if hasattr(adapter, "for_project")
+                else getattr(adapter, "project_problem", None)
+            )
+            if check and sandbox.class_launch_doc(cls) is not None:
+                refusal = check([project], paths.home_dir())
+    except sandbox.SandboxError as e:
+        return f"refusing to start {job.runner}: {e}"
+    except WsError as e:
+        refusal = e
+    return f"{refusal.message}; {refusal.hint}" if refusal and refusal.hint else (refusal.message if refusal else None)
+
+
 def _egress(pol: policy.Policy, job: jobs.Job):
     """(plan, refusal) for the data class a run works in: the class of the job's own `cwd` (a job with none runs in a
     fresh default folder that is in no class, so it gets the strictest), G7 (the model provider the class allows) and
@@ -391,15 +433,13 @@ def _egress(pol: policy.Policy, job: jobs.Job):
     is words that name the class only."""
     from ws import sandbox  # late: only a policy with classes needs it
 
-    cls = None
-    if pol.classes:
-        cls = policy.class_of(pol, os.path.realpath(Path(job.cwd).expanduser())) if job.cwd else policy.UNCLASSIFIED
+    cls = _job_class(pol, job)
     provider = sandbox.job_provider(job.runner, job.model, job.runner_options)
     why = sandbox.provider_problem(cls, provider)
     if why:
         return None, why
     plan = sandbox.egress_plan(pol, cls, provider)
-    if plan is not None and hasattr(adapters.get(job.runner), "with_hosts") and not pol.gate.sandbox:
+    if plan is not None and not pol.gate.sandbox:
         return None, f"class {plan.cls!r}: its network list is applied by the sandbox, and [gate] sandbox is off"
     return plan, None
 
@@ -626,6 +666,9 @@ def _run(
     egress, why_not = _egress(pol, job)
     if static is None and why_not:
         static = ("egress", why_not)
+    if static is None:
+        walled = _wall_problem(pol, job, adapter, cwd)
+        static = ("wall", walled) if walled else None
     req = queue.request_for(
         job, run_id, cap_usd=cap, unknown_run_usd=unknown_run_usd,
         purpose_cap_usd=pol.budget_purposes.get(job.purpose) if job.purpose else None, limits=ledger.limits,
@@ -726,14 +769,83 @@ def _settle(ledger: queue.Ledger, res: queue.Reservation, rec: dict, written: bo
         print(f"ws: could not settle the reservation for {rec['run_id']}: {getattr(e, 'message', e)}", file=sys.stderr)
 
 
+def _claude_wall(
+    job, adapter, pol, run_dir: Path, cwd: Path, files: dict[str, str], walls: contextlib.ExitStack
+) -> None:
+    """For Claude Code with the sandbox on, make the run's settings the ones a `ws gate launch` would use for this folder:
+    the project's locked paths and the home-folder denial added, a walled class's launch file merged in
+    (`sandbox.claude_launch_text`), and the project's missing load paths made and let go of with `walls`
+    (`sandbox.claude_loaded`). The file is the run's own copy in `run_dir/gate`; the network list is in it already. Settings
+    with no sandbox block (`[gate] sandbox = false`) stay as they are, and so does any other runner."""
+    if not hasattr(adapter, "for_project") or "sandbox" not in json.loads(files[adapter.FILE]):
+        return
+    from ws import sandbox
+
+    env = _child_env({})
+    cls = _job_class(pol, job)
+    try:
+        project = sandbox.project_folder(str(cwd), env)
+        text = sandbox.claude_launch_text(
+            pol,
+            cls,
+            project,
+            env,
+            None,
+            files[adapter.FILE],
+            cwd=str(cwd),
+            launch_doc=sandbox.class_launch_doc(cls),
+        )
+        gate.write_files(run_dir / "gate", {adapter.FILE: text})
+        walls.enter_context(sandbox.claude_loaded(paths.state_dir(os.environ).absolute(), project, job.runner))
+    except (sandbox.SandboxError, WsError) as e:  # WsError: a launch file or a project the wall refuses
+        raise _WallRefused(f"refusing to start {job.runner}: {e}") from e
+
+
+class _WallRefused(Exception):
+    """The wall could not be put round the runner (no bubblewrap, a link in the project, ...): the run is recorded as
+    `refused:wall` and nothing was started."""
+
+
+def _runner_wall(
+    job, adapter, pol, cwd: Path, argv: list[str], child_env: dict, egress, walls: contextlib.ExitStack
+) -> tuple[list[str], dict, tuple[int, ...]]:
+    """(argv, env, descriptors to keep open) for a runner with no sandbox of its own (OpenCode) with the sandbox on: the
+    same wall `ws gate launch` builds (`sandbox.walled`, held until `walls` is closed). The project is `cwd`; the runner's
+    private XDG folders and TMPDIR are in the environment it gets, and the egress proxy is the one in the wall. Any other
+    runner, or the sandbox off, comes back as it was."""
+    if hasattr(adapter, "for_project") or not pol.gate.sandbox:
+        return argv, child_env, ()
+    from ws import sandbox
+
+    lookup = {**os.environ, **child_env}  # where the real home is, and the generated folder the runner is told to read
+    try:
+        wall = walls.enter_context(
+            sandbox.walled(
+                argv,
+                pol,
+                paths.state_dir(os.environ).absolute(),
+                job.runner,
+                sandbox.project_folder(str(cwd), lookup),
+                lookup,
+                egress,
+                protect=sandbox.protected(policy.policy_path().absolute(), job.runner, None, lookup),
+                cls=_job_class(pol, job),
+                cwd=str(cwd),
+            )
+        )
+    except (sandbox.SandboxError, WsError) as e:  # WsError: `refused` from a launch file or the runner's project check
+        raise _WallRefused(f"refusing to start {job.runner} without its wall: {e}") from e
+    return wall.argv, {**child_env, sandbox.ENV_MARKER: "1", **wall.env}, wall.pass_fds
+
+
 def _execute(
     job, adapter, pol, rec: dict, run_dir: Path, cwd: Path, log: Path, exe: str, stdin: bool, hook=None, admitted=None,
     egress=None,
 ) -> int:  # fmt: skip
     ledger, res, unknown_run_usd, fallback_usd_per_mtok = admitted
     t0 = time.monotonic()
-    proxy = None
     leases: list[broker.Lease] = []
+    walls = contextlib.ExitStack()  # what the wall holds for the run, let go of in the finally below
     sock = wsecrets.socket_path(os.environ)
     signalled: BaseException | None = None
     try:
@@ -746,6 +858,7 @@ def _execute(
         if egress is not None and hasattr(adapter, "with_hosts"):  # the runner's own sandbox holds the class's list
             files = {**files, adapter.FILE: adapter.with_hosts(files[adapter.FILE], egress.domains())}
         gate.write_files(run_dir / "gate", files)
+        _claude_wall(job, adapter, pol, run_dir, cwd, files, walls)
         for s in job.secrets:
             leases.append(_lease(s, sock, rec))
             rec["secrets_used"].append({"name": s.name, "host": s.host})
@@ -753,12 +866,6 @@ def _execute(
         if job.checkpoint:
             extra = {**extra, "WS_CHECKPOINT": job.checkpoint}
         child_env = _child_env(extra)
-        if egress is not None and not hasattr(adapter, "with_hosts"):  # a runner with no proxy of its own gets ws's
-            from ws import sandbox
-
-            secret = sandbox.new_secret()
-            proxy = sandbox.EgressProxy(egress, secret=secret)
-            child_env.update(sandbox.proxy_env(proxy.start(), secret))
         argv[0] = exe
         prompt_file = None
         if stdin:
@@ -767,7 +874,10 @@ def _execute(
         else:
             argv += ["--", job.prompt]
         rec["runner_version"] = exe_version(exe, child_env) or None
-        code, timed_out, truncated = _spawn(argv, child_env, cwd, job.timeout_s, prompt_file, run_dir, job.grace_s)
+        argv, child_env, pass_fds = _runner_wall(job, adapter, pol, cwd, argv, child_env, egress, walls)
+        code, timed_out, truncated = _spawn(
+            argv, child_env, cwd, job.timeout_s, prompt_file, run_dir, job.grace_s, pass_fds
+        )
         rec.update(ended_at=runrecord.iso(datetime.now(UTC)), exit_code=code, output_truncated=truncated)
         out, err = _read_back(run_dir / "stdout.txt", leases), _read_back(run_dir / "stderr.txt", leases)
         part = adapter.parse_result(out, err, code)
@@ -788,6 +898,8 @@ def _execute(
             rec.update(status="ok", stop_reason="completed")
         with contextlib.suppress(Exception):
             rec["transcript_path"] = adapter.transcript_path(rec["session_id"], str(cwd), child_env)
+    except _WallRefused as e:
+        rec.update(status="refused", stop_reason="refused:wall", error=_short(str(e), leases, 300))
     except broker.BrokerRefused as e:
         rec.update(
             status="refused", stop_reason="refused:secret", error=_short(f"broker refused the secret: {e}", leases)
@@ -804,13 +916,10 @@ def _execute(
         signalled = e
         raise
     finally:
-        if proxy is not None:
-            proxy.stop()
-            if proxy.denials:
-                print(
-                    f"ws: egress, class {egress.cls!r}: {len(proxy.denials)} request(s) refused by the allowlist",
-                    file=sys.stderr,
-                )
+        try:
+            walls.close()
+        except Exception as e:  # noqa: BLE001 - the leases, the record and the settle below never wait on the wall
+            print(f"ws: could not release the wall ({type(e).__name__})", file=sys.stderr)
         for lease in leases:
             with contextlib.suppress(broker.BrokerError):
                 broker.release(lease, socket=sock)

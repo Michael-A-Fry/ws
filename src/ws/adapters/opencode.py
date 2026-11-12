@@ -42,6 +42,7 @@ from pathlib import Path
 from ws import guards, jobs, paths
 from ws.adapters import Call, check_argv, client_argv, event_argv, protected_paths
 from ws.adapters.opencode_plugin import SOURCE
+from ws.approvals import ApprovalError
 from ws.output import WsError
 from ws.policy import Policy, native_patterns
 
@@ -483,6 +484,129 @@ def launch_hint(out: str) -> str:
         f'start OpenCode with: OPENCODE_CONFIG_CONTENT="$(cat {q}/{CONFIG})" OPENCODE_CONFIG_DIR={q} '
         "ws gate launch --runner opencode -- opencode"
     )
+
+
+# --- what a project may start in a walled class's session ---------------------------------------------------------
+
+PROJECT_CONFIGS = (  # in a project folder: the files OpenCode reads its configuration from
+    "opencode.json",
+    "opencode.jsonc",
+    ".opencode/opencode.json",
+    ".opencode/opencode.jsonc",
+    "tui.json",
+    "tui.jsonc",
+    ".opencode/tui.json",
+    ".opencode/tui.jsonc",
+)
+PROJECT_KEYS = ("mcp", "plugin")  # a key that starts a program or loads code
+PROJECT_PLUGIN_DIRS = (".opencode/plugin", ".opencode/plugins")
+_STARTS = "starts a program or loads code that OpenCode runs"
+
+
+def _jsonc(text: str) -> str:
+    """`text` without `//` and `/* */` comments and without trailing commas, which OpenCode's configuration allows. Strings
+    are copied as they are. ValueError for a comment that never ends."""
+    out: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == '"':
+            j = i + 1
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            out.append(text[i : j + 1])
+            i = j + 1
+        elif text.startswith("//", i):
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+        elif text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            if j < 0:
+                raise ValueError("a comment that never ends")
+            i = j + 2
+        else:
+            if c in "}]":
+                k = len(out) - 1
+                while k >= 0 and out[k].isspace():
+                    k -= 1
+                if k >= 0 and out[k] == ",":
+                    del out[k]
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def _config_problem(f: Path) -> WsError | None:
+    """The refusal for what one OpenCode configuration file holds or how it reads, or None. Fail closed: a file that is not
+    a plain readable file, does not parse, is not an object, or pulls text in from another file (`{file:...}`, whose
+    content ws does not see) is refused, and so is any non-empty `mcp` or `plugin`."""
+    from ws import wallsettings
+
+    rm = f"`rm {shlex.quote(str(f))}`"
+    try:
+        text = wallsettings._read_text(f)
+        conf = json.loads(_jsonc(text))
+    except ApprovalError as e:
+        return wallsettings._unreadable(
+            f, f"is not a plain readable file ({e})", f"make it a plain JSON file under 1 MB, or delete it with {rm}"
+        )
+    except (ValueError, RecursionError) as e:
+        return wallsettings._unreadable(
+            f, f"does not parse as JSON ({type(e).__name__})", f"make it a JSON object, or delete it with {rm}"
+        )
+    if not isinstance(conf, dict):
+        return wallsettings._unreadable(f, "is not a JSON object", f"make it a JSON object, or delete it with {rm}")
+    if "{file:" in text:
+        return wallsettings._unreadable(
+            f,
+            "takes text from another file, which ws does not read",
+            f"write the value in place, or delete it with {rm}",
+        )
+    for key in PROJECT_KEYS:
+        if conf.get(key):
+            return wallsettings._refused(f, key, _STARTS, f"`{key}` from {f}")
+    return None
+
+
+def project_problem(starts, home: Path) -> WsError | None:
+    """The refusal for a walled class's OpenCode session whose project would start anything, or None: in each start folder
+    and each folder above it (the home folder's own excluded), any `mcp` or `plugin` entry in `opencode.json(c)`,
+    `.opencode/opencode.json(c)` or `tui.json(c)`, and any file in `.opencode/plugin/` or `.opencode/plugins/`. The same
+    rule as for Claude Code's `.mcp.json`: the project starts no server and loads no plugin, whatever the class allows.
+    A kind `project_load_refused` (exit 3) error naming the file; kind `project_settings_unreadable` (exit 3) for a file
+    or folder that is a link, cannot be read or does not parse. An absent file is fine."""
+    from ws import wallsettings
+
+    seen: dict[Path, None] = {}
+    for start in starts:
+        if isinstance(start, str) and start.startswith("/"):
+            seen.update(dict.fromkeys(d for d in (Path(start), *Path(start).parents) if d != home))
+    for d in seen:
+        top = d / ".opencode"
+        if top.is_symlink():
+            hint = f"replace it with a real folder, or delete the link with `rm {shlex.quote(str(top))}`"
+            return wallsettings._unreadable(top, "is a link, not a folder", hint)
+        for rel in PROJECT_CONFIGS:
+            if os.path.lexists(d / rel) and (problem := _config_problem(d / rel)):
+                return problem
+        for rel in PROJECT_PLUGIN_DIRS:
+            folder = d / rel
+            if not os.path.lexists(folder):
+                continue
+            rm = f"`rm -r {shlex.quote(str(folder))}`"
+            if folder.is_symlink() or not folder.is_dir():
+                return wallsettings._unreadable(folder, "is not a plain folder", f"delete it with {rm}")
+            try:
+                first = next(iter(sorted(folder.iterdir())), None)
+            except OSError as e:
+                return wallsettings._unreadable(
+                    folder, f"cannot be listed ({type(e).__name__})", f"delete it with {rm}"
+                )
+            if first is not None:
+                return wallsettings._refused(
+                    first, "a plugin", _STARTS, f"{shlex.quote(str(first))} (or the folder: {rm})"
+                )
+    return None
 
 
 # --- ws run: the command line, and the event stream read back as a run record --------------------------------------

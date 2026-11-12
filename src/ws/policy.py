@@ -726,12 +726,7 @@ def loads(text: str) -> Policy:
     for h in gate.allow_hosts:
         check_host(h, "[gate] allow_hosts")
     for w in gate.allow_write:
-        n = posixpath.normpath(re.sub(r"^(\$HOME|\$\{HOME\})(?=/|$)", "~", w)) if w else ""
-        if n in ("", ".", "/", "~") or not n.startswith(("~/", "/")) or re.search(r"[*?\[]", w):
-            raise PolicyError(
-                f"[gate] allow_write: {w!r} must be a folder, absolute or under ~/, with no wildcard, and not / or "
-                "the home folder (after `.` and `..` are resolved)"
-            )
+        _folder_entry("allow_write", w)
     _check_allow_read(gate)
     for t in gate.deny_tools:
         if t not in KNOWN_TOOLS and not valid_mcp_pattern(t):

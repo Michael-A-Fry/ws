@@ -1528,7 +1528,7 @@ def test_a_refusal_names_its_counter_in_the_record(ws, capsys):
 def test_the_checkpoint_name_and_the_grace_reach_the_runner(ws, monkeypatch):
     graces = []
     real = run._spawn
-    monkeypatch.setattr(run, "_spawn", lambda *a: graces.append(a[-1]) or real(*a))
+    monkeypatch.setattr(run, "_spawn", lambda *a: graces.append(a[6]) or real(*a))
     ws.job(extra='checkpoint = "progress.json"\ngrace_s = 7\n')
     assert cli.main(["run", "daily"]) == 0
     assert ws.saw()["env"]["WS_CHECKPOINT"] == "progress.json" and graces == [7]

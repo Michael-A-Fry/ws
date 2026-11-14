@@ -11,6 +11,10 @@ import pytest
 
 from ws import cli, config_cmd, jobs, policy, profile
 
+CONTRACT = (
+    'timeout_s = 600\non_failure = "alert"\nlog = "file"\nuninstall = "ws schedule remove x"\n'
+    'expected_rate = "1d"\ndata_class = "none"\n'
+)
 GOOD_JOB = 'runner = "claude-code"\nmodel = "m"\nprompt = "hi"\n'
 
 
@@ -104,7 +108,7 @@ def test_doctor_job_check_is_ok_with_no_jobs_or_good_ones(box, capsys):
 
 
 def test_a_schedule_only_job_is_not_a_problem(box):
-    put(box / ".ws" / "jobs" / "backup.toml", 'command = "backup"\nschedule = "daily 03:30"\n')
+    put(box / ".ws" / "jobs" / "backup.toml", 'command = "backup"\nschedule = "daily 03:30"\n' + CONTRACT)
     os.chmod(box / ".ws" / "jobs", 0o700)
     assert jobs.problems(os.environ) == {}
 

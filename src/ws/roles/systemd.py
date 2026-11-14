@@ -6,6 +6,15 @@ The service runs `ws run <name>` (or the job's `command`, for example `ws backup
 `Persistent=true`, so a run missed while the machine was off happens at the next start; on a machine that stays on it
 never fires, so the "stays on?" answer is not needed here.
 
+Every service also gets `TimeoutStartSec=` (the job's `timeout_s` and a margin, so a hung run is killed),
+`OnFailure=ws-alert@%n.service` (one template unit sends the alert), `Slice=ws-jobs.slice` (a shared slice with a CPU
+and memory share, so scheduled work cannot starve the desk) and, for a job with `log = "file"`, `StandardOutput=append:`
+a file in the state logs folder (`ws run` rotates it: 20 MB x 3). The first line of each file says it is generated and
+how to regenerate it.
+
+Swap note: systemd is adopted as it is (OnFailure=, TimeoutStartSec=, Slice=); to swap the scheduler out, add a
+scheduler adapter in this folder (see `launchd.py`) and select it; no list to edit.
+
 The files live in `<config>/jobs/units/`. `activate` runs `systemctl --user link` on them, which puts one symlink per
 file in `~/.config/systemd/user` (outside ws's folders), then enables the timers. `deactivate` (`disable --now`, for the
 timers and the services) takes those links away again, so none is left dangling; `ws schedule remove`, `ws schedule apply` for a job whose schedule is gone, and
@@ -23,6 +32,10 @@ from ws.roles import FAIL, OK, WARN, _schedule
 ROLE, NAME = "scheduler", "systemd"
 PREFIX = "ws-"
 MARKER = "# Written by ws"  # first line of every unit ws writes: the proof a unit in the user folder is its own
+SLICE = "ws-jobs.slice"  # the shared slice every scheduled service runs in
+ALERT = "ws-alert@%n.service"  # OnFailure= target: one template unit, instance = the failed unit's name
+CPU_WEIGHT, MEMORY_HIGH = 50, "75%"  # the share scheduled jobs get: below the default CPUWeight of 100, soft memory cap
+TIMEOUT_MARGIN_S = 30  # TimeoutStartSec= is the job's limit plus this, so `ws run` ends its own run first
 
 
 def _quote(word: str, expand: bool = False) -> str:
@@ -45,6 +58,10 @@ def on_calendar(when: When) -> str:
     return f"*-*-* {at}" if when.kind == "daily" else f"{DAYS[when.weekday].capitalize()} *-*-* {at}"
 
 
+def _header(source: str) -> str:
+    return f"{MARKER}: DO NOT EDIT. Generated from {source}; `ws schedule apply` rewrites it.\n"
+
+
 def render(job: Scheduled, env, ws_cmd: list[str]) -> dict[str, str]:
     """{file name: text} for one job."""
     unit = f"{PREFIX}{job.name}"
@@ -52,18 +69,31 @@ def render(job: Scheduled, env, ws_cmd: list[str]) -> dict[str, str]:
     if path := _schedule.path_value(env):
         lines.append(f"Environment={_quote('PATH=' + path)}")
     exec_start = " ".join(_quote(w, expand=True) for w in [*ws_cmd, *job.argv])
+    source = f"jobs/{job.name}.toml"
+    out = ""
+    if job.log == "file":
+        out = f"StandardOutput=append:{_schedule.logs_dir(env) / (job.name + '.log')}\nStandardError=inherit\n"
     service = (
-        f"{MARKER} from the job file's schedule; `ws schedule apply` rewrites it.\n"
-        f"[Unit]\nDescription=ws job {job.name}\n\n"
-        f"[Service]\nType=oneshot\n{chr(10).join(lines)}\nExecStart={exec_start}\n"
+        _header(source)
+        + f"[Unit]\nDescription=ws job {job.name}\nOnFailure={ALERT}\n\n"
+        + f"[Service]\nType=oneshot\nSlice={SLICE}\n{chr(10).join(lines)}\nExecStart={exec_start}\n"
+        + f"TimeoutStartSec={int(job.timeout_s) + TIMEOUT_MARGIN_S}\n{out}"
     )
     timer = (
-        f"{MARKER} from the job file's schedule; `ws schedule apply` rewrites it.\n"
-        f"[Unit]\nDescription=ws job {job.name} ({job.when})\n\n"
-        f"[Timer]\nOnCalendar={on_calendar(job.when)}\nPersistent=true\n"
-        f"Unit={unit}.service\n\n[Install]\nWantedBy=timers.target\n"
+        _header(source)
+        + f"[Unit]\nDescription=ws job {job.name} ({job.when})\n\n"
+        + f"[Timer]\nOnCalendar={on_calendar(job.when)}\nPersistent=true\n"
+        + f"Unit={unit}.service\n\n[Install]\nWantedBy=timers.target\n"
     )
     return {f"{unit}.service": service, f"{unit}.timer": timer}
+
+
+def render_slice() -> str:
+    """The shared slice: a CPU share and a soft memory cap for every scheduled service."""
+    return (
+        _header("ws's scheduler role")
+        + f"[Unit]\nDescription=ws scheduled jobs\n\n[Slice]\nCPUWeight={CPU_WEIGHT}\nMemoryHigh={MEMORY_HIGH}\n"
+    )
 
 
 def files_for(env, name: str) -> list[Path]:
@@ -75,6 +105,8 @@ def _want(env) -> dict[Path, str]:
     for job in _schedule.scheduled(env):
         for name, text in render(job, env, cmd).items():
             out[_schedule.units_dir(env) / name] = text
+    if out:
+        out[_schedule.units_dir(env) / SLICE] = render_slice()
     return out
 
 
@@ -99,7 +131,7 @@ def check(cfg, osi, env, network):
         )
     if not want:
         return OK, NAME
-    n = len(want) // 2
+    n = sum(p.suffix == ".timer" for p in want)
     jobs_ = f"{n} scheduled job{'' if n == 1 else 's'}"
     old = _schedule.stale(want)
     if old:
@@ -120,6 +152,13 @@ def steps(cfg, answers, env):
                     _schedule.units_dir(env) / name, "file", text, f"systemd {name.rsplit('.', 1)[1]} for {job.name}"
                 )
             )
+    if out:
+        out.append(
+            install.Step(_schedule.units_dir(env) / SLICE, "file", render_slice(), "systemd slice for scheduled jobs")
+        )
+        out.append(
+            install.Step(_schedule.logs_dir(env), "dir", None, "the folder scheduled jobs write their output to")
+        )
     return out
 
 
@@ -146,7 +185,7 @@ def activate(env, runner=None) -> list[str]:
     left_out, problems = _skip_foreign(env, files)
     files = [p for p in files if p.name not in left_out]
     timers = [p for p in files if p.suffix == ".timer"]
-    if not files:
+    if not timers:  # every job clashed: the shared slice alone is not worth linking
         return problems
     for argv in (
         ["systemctl", "--user", "link", *map(str, files)],

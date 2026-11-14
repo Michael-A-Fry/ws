@@ -11,7 +11,19 @@ Per runner:
   run_record   a run record still validates against `runschema` (stdlib check, so no extra dependency)
   wall         Claude Code only (OpenCode is skipped): the launch settings ws makes for a project still shut the sandbox
                (on, fail closed, no unsandboxed retry, no excluded commands, no Unix sockets), hide the home folder,
-               re-allow the project, and keep every exact deny_read path hidden
+               re-allow the project, keep every exact deny_read path hidden, keep the sign-in tokens out of shell
+               commands, and keep Claude's file tools in the working folders
+  probe        Claude Code only: the two probes from Claude Code's sandboxing page, run by the real runner inside those
+               launch settings with a local stub model (no paid call): `touch ~/sandbox-probe-...` must leave no file
+               in the real home (judged on the host: with the home hidden, the wall gives it a throwaway layer), and
+               `curl --noproxy '*' https://example.com` must not connect. The same curl runs on the host first: when the
+               host can't connect either, the network half proves nothing and the check is a skip. Run once for the default launch settings and
+               once per walled class whose launch file this machine has; that file must itself turn the sandbox on,
+               fail closed and allow no unsandboxed retry. Skipped when claude, or the sandbox's own tools, are missing
+  keys         Claude Code only: the installed runner is at least the first version of every settings key the wall
+               writes on the default policy (wallsettings.MIN_CLAUDE, the table WS016 reads); an older one ignores it
+  tokens       Claude Code only: the runner's credentials file is readable by its owner alone, this process carries no
+               sign-in token (CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_OAUTH_TOKEN), and no job file sets one
 
 `ws doctor` records the last version it saw of each runner, and the default model id, in `versions.json` in the state folder.
 When one changes it says so in WS101 and runs this (or, with --offline, points here). A change is remembered only when
@@ -31,13 +43,21 @@ import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
-from ws import __version__, adapters, gate, jsonl, output, paths, policy, runrecord, selfcmd
+from ws import __version__, adapters, gate, jobs, jsonl, output, paths, policy, runrecord, selfcmd
 from ws.output import WsError
 from ws.profile import ProfileError, load, profile_path
 
 SCHEMA_VERSION = 1
 PASS, FAIL, SKIP = "pass", "fail", "skip"
 NO_VERSION = "ran (it printed no version)"
+# The tokens a shell command must never see, as data here so the check doesn't trust the generator it checks; the first
+# two are the runner's sign-in, which no ws process or job may carry.
+TOKEN_NAMES = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+SIGN_IN_TOKENS = TOKEN_NAMES[:2]
+PROBE_TIMEOUT = 180
+SKIP_KEYS = (SKIP, "")  # a placeholder that keeps the rows in order until the version is known
+PROBE_URL = "https://example.com"  # the sandboxing page's own
+CURL_PROBE = f"curl --noproxy '*' -sS -m 10 -o curl-probe.out {PROBE_URL} && echo curl=0 || echo curl=1"
 DENIED = "git push --force origin main"  # in the default deny list; a plain `git push` is not
 ALLOWED = "ls"
 
@@ -274,6 +294,23 @@ def _wall_problem(block: dict, home: str, project: str, exact: list[str]) -> str
     missing = [p for p in exact if p not in deny]
     if missing:
         return f"{len(missing)} deny_read path(s) are no longer hidden"
+    creds = block.get("credentials") if isinstance(block.get("credentials"), dict) else {}
+    entries = creds.get("envVars") if isinstance(creds.get("envVars"), list) else []
+    denied = {e.get("name") for e in entries if isinstance(e, dict) and e.get("mode") == "deny"}
+    loose = [n for n in TOKEN_NAMES if n not in denied]
+    if loose:
+        return f"shell commands can see {loose[0]}"
+    return None
+
+
+def _perm_problem(perms: dict) -> str | None:
+    """The first file-tool block the launch settings' `permissions` lack, or None."""
+    from ws import wallsettings
+    from ws.adapters import claude_code
+
+    for key in (wallsettings.READ_BLOCK_KEY, claude_code.WRITE_BLOCK_KEY):
+        if perms.get(key) is not True:
+            return f"permissions.{key} is not on"
     return None
 
 
@@ -293,11 +330,279 @@ def check_wall(adapter, env, work: Path) -> tuple[str, str]:
         text = adapter.for_project(
             files["settings.json"], str(project.resolve()), allow_read=allow, deny_read=deny, env=env
         )
-        block = json.loads(text)["sandbox"]
+        conf = json.loads(text)
+        block = conf["sandbox"]
     except (WsError, policy.PolicyError, ValueError, KeyError, TypeError, OSError) as e:
         return FAIL, f"the launch settings could not be made ({getattr(e, 'kind', type(e).__name__)})"
     problem = _wall_problem(block, home, str(project.resolve()), policy.sandbox_read_paths(pol))
+    perms = conf.get("permissions") if isinstance(conf.get("permissions"), dict) else {}
+    problem = problem or _perm_problem(perms)
     return (FAIL, problem) if problem else (PASS, "the home is hidden, the project re-allowed, the sandbox shut")
+
+
+def _launch_text(adapter, env, work: Path, project: Path, pol, cls=None, launch_doc=None) -> str:
+    """The launch settings `ws gate launch` would start claude with in `project`, under `pol` (and a walled class)."""
+    from ws import sandbox
+
+    files = adapter.generate(pol, selfcmd.argv(), work / "gate", work / "policy.toml")
+    return sandbox.claude_launch_text(
+        pol, cls, str(project), dict(env), None, files[adapter.FILE], cwd=str(project), launch_doc=launch_doc
+    )
+
+
+def shut_problem(doc: dict) -> str | None:
+    """Why a class's launch file doesn't itself shut the sandbox, or None. Read from the file, not the merged settings:
+    a key taken out of the class's file is the fault this has to see, and the merge would fill it from the default."""
+    box = doc.get("sandbox") if isinstance(doc.get("sandbox"), dict) else {}
+    if box.get("enabled") is not True:
+        return "its launch file doesn't turn the sandbox on"
+    if box.get("failIfUnavailable") is not True:
+        return "its launch file doesn't set sandbox.failIfUnavailable"
+    if box.get("allowUnsandboxedCommands") is not False:
+        return "its launch file allows an unsandboxed retry"
+    return None
+
+
+def probe_settings(text: str) -> str:
+    """The launch settings with the hooks and the deny rules taken out, so that it is the sandbox alone that stops a
+    probe (a probe the gate refused would pass without testing anything)."""
+    conf = json.loads(text)
+    conf.pop("hooks", None)
+    if isinstance(conf.get("permissions"), dict):
+        conf["permissions"].pop("deny", None)
+    return json.dumps(conf, indent=2) + "\n"
+
+
+def _said(said: str, word: str) -> str | None:
+    """The value a probe line printed (`touch=1` gives "1"), matched as a whole line, or None."""
+    found = re.search(rf"^{word}=([01])$", said, re.MULTILINE)
+    return found.group(1) if found else None
+
+
+def judge_probe(said: str, control: str, wrote: bool, net: bool = True) -> str | None:
+    """What the probe's tool results show: None when both probes were stopped and the control ran. `net` False: the
+    host itself can't reach the probe's host, so the network half is not judged."""
+    if not re.search(rf"^{re.escape(control)}$", said, re.MULTILINE):
+        return "the runner ran no command, so the probe could not tell (is the sandbox available here?)"
+    if wrote:  # judged on the host: under deny-home the home is a throwaway layer, so `touch` can exit 0 in the wall
+        return "a shell command wrote outside the working folder"
+    if _said(said, "touch") is None:
+        return "the write probe did not run"
+    if not net:
+        return None
+    curl = _said(said, "curl")
+    if curl == "0":
+        return "a shell command reached the network around the sandbox proxy"
+    if curl is None:
+        return "the network probe did not run"
+    return None
+
+
+def host_reaches(work: Path, env) -> bool:
+    """The network probe's control: the same curl, run on the host. False when the host can't connect either, or has
+    no curl."""
+    exe = shutil.which("curl", path=env.get("PATH"))
+    if not exe:
+        return False
+    argv = [exe, "--noproxy", "*", "-sS", "-m", "10", "-o", str(work / "host-probe.out"), PROBE_URL]
+    try:
+        done = subprocess.run(argv, capture_output=True, timeout=30, check=False, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return done.returncode == 0
+
+
+class NotProbed(Exception):
+    """The runner never asked the model for a turn, so no probe ran (a runner that isn't Claude Code's real CLI)."""
+
+
+def run_probe(exe: str, settings: str, project: Path, work: Path, env, net: bool = True) -> str | None:
+    """Run the docs' two probes in the real runner inside `settings`, with a stub model scripting the calls. None when
+    both were stopped; otherwise what got through, or why the probe could not tell."""
+    from ws.testing.mockprovider import AnthropicStub, Call
+
+    tag = os.urandom(6).hex()  # built at run time, so no earlier run's file can pass for this one
+    target = Path(env.get("HOME") or Path.home()) / f"sandbox-probe-{tag}"
+    control = f"probe-control-{tag}"
+    calls = [
+        Call("Bash", {"command": f"echo {control}"}),
+        # no shell variable in a probe: outside the sandbox the read block asks before a command it can't analyse,
+        # and `-p` then refuses it, so a `$?` would keep the control (no sandbox) from running at all
+        Call("Bash", {"command": f"touch {target} && echo touch=0 || echo touch=1"}),
+        Call("Bash", {"command": CURL_PROBE}),
+    ]
+    sfile = work / "probe-settings.json"
+    sfile.write_text(probe_settings(settings))
+    child = {k: v for k, v in env.items() if not k.startswith(("ANTHROPIC_", "CLAUDE_"))}
+    child.update(
+        ANTHROPIC_API_KEY="sk-ant-" + "probe" * 8,  # a placeholder built at run time: the stub takes any key
+        CLAUDE_CONFIG_DIR=str(work / "claude-config"),
+        CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1",
+        DISABLE_AUTOUPDATER="1",
+    )
+    argv = [exe, "-p", "run the probe", "--settings", str(sfile), "--setting-sources", "user"]
+    argv += ["--allowedTools", "Bash,Bash(curl *)", "--model", "claude-sonnet-4-5", "--no-session-persistence"]
+    results: list[str] = []
+    asked = False
+    try:
+        with AnthropicStub(calls) as stub:
+            child["ANTHROPIC_BASE_URL"] = stub.url
+            subprocess.run(
+                argv, env=child, cwd=project, capture_output=True, text=True, timeout=PROBE_TIMEOUT,
+                stdin=subprocess.DEVNULL, check=False,
+            )  # fmt: skip
+            results = stub.tool_results()
+            asked = bool(stub.requests)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return f"the runner did not finish the probe ({type(e).__name__})"
+    finally:
+        wrote = target.exists()
+        if wrote:
+            target.unlink()
+    if not asked and not wrote:
+        raise NotProbed
+    return judge_probe("\n".join(results), control, wrote, net)
+
+
+def _classes() -> list:
+    """The walled classes of the person's policy (those with an OS user); none when there is no policy to read."""
+    from ws import wallsettings
+
+    try:
+        return wallsettings.class_users(policy.load())
+    except (policy.PolicyError, OSError):
+        return []
+
+
+def check_probe(adapter, env, work: Path) -> tuple[str, str]:
+    """The sandbox, tried for real: see the module docstring. The default launch settings, then each walled class."""
+    from ws import osinfo, sandbox, wallsettings
+
+    if adapter.NAME != "claude-code":
+        return SKIP, f"{adapter.NAME} has no sandbox of its own to probe"
+    exe = shutil.which(adapter.EXE, path=env.get("PATH"))
+    if not exe:
+        return SKIP, f"{adapter.EXE} is not on PATH"
+    why = wallsettings.host_problem(osinfo.detect().kind)
+    if why:
+        return SKIP, f"the sandbox can't run here: {why}"
+
+    project = work / "probe-project"
+    project.mkdir(exist_ok=True)
+    project = project.resolve()
+    pol = policy.loads(policy.default_toml())
+    net = host_reaches(work, env)
+    cases: list[tuple[str, object, dict | None]] = [("default", None, None)]
+    for cls in _classes():
+        try:
+            doc = sandbox.class_launch_doc(cls)
+        except WsError as e:
+            return FAIL, f"class {cls.name}: its launch file can't be read ({e.kind})"
+        if doc is None:
+            continue
+        problem = shut_problem(doc)
+        if problem:
+            return FAIL, f"class {cls.name}: {problem}"
+        cases.append((cls.name, cls, doc))
+    for name, cls, doc in cases:
+        try:
+            text = _launch_text(adapter, env, work, project, pol, cls, doc)
+        except (WsError, policy.PolicyError, ValueError, KeyError, TypeError, OSError) as e:
+            return FAIL, f"{name}: the launch settings could not be made ({getattr(e, 'kind', type(e).__name__)})"
+        try:
+            problem = run_probe(exe, text, project, work, env, net)
+        except NotProbed:
+            return SKIP, f"{name}: {adapter.EXE} never asked the model for a turn, so nothing was probed"
+        if problem:
+            return FAIL, f"{name}: {problem}"
+    names = ", ".join(n for n, _, _ in cases)
+    if not net:
+        return (
+            SKIP,
+            f"the write probe was stopped ({names}); the host can't reach {PROBE_URL}, so the network probe proves nothing",
+        )
+    return PASS, f"write and network probes stopped ({names})"
+
+
+def _credentials_file(env) -> Path:
+    base = env.get("CLAUDE_CONFIG_DIR") or os.path.join(env.get("HOME") or str(Path.home()), ".claude")
+    return Path(base) / ".credentials.json"
+
+
+def _keys(value) -> list[str]:
+    """Every key in a parsed TOML document, at any depth."""
+    if isinstance(value, dict):
+        return [k for key, v in value.items() for k in (key, *_keys(v))]
+    if isinstance(value, list):
+        return [k for v in value for k in _keys(v)]
+    return []
+
+
+def _job_token(text: str) -> str | None:
+    """The first sign-in token a job file sets as a key, at any depth, bare or quoted. A file that doesn't parse is
+    read as text: a `NAME =` key, bare or in quotes, anywhere in it."""
+    import tomllib
+
+    try:
+        keys = set(_keys(tomllib.loads(text)))
+    except tomllib.TOMLDecodeError:
+        keys = None
+    for name in SIGN_IN_TOKENS:
+        if keys is not None and name in keys:
+            return name
+        if keys is None and re.search(rf"(^|[{{,\s])[\"']?{name}[\"']?\s*=", text, re.MULTILINE):
+            return name
+    return None
+
+
+def check_keys(adapter, version: str | None) -> tuple[str, str]:
+    """The runner reads every key the wall writes on the default policy: see the module docstring."""
+    from ws import doctor, wallsettings
+
+    if adapter.NAME != "claude-code":
+        return SKIP, f"{adapter.NAME} has no table of first versions"
+    found = doctor._version_tuple(version or "")
+    if found is None:
+        return FAIL, "the runner's version can't be read, so the keys it reads aren't known"
+    keys = wallsettings.keys_written(policy.loads(policy.default_toml()))
+    old = [k for k in keys if found < wallsettings.MIN_CLAUDE[k]]
+    if old:
+        need = ".".join(map(str, max(wallsettings.MIN_CLAUDE[k] for k in old)))
+        return FAIL, f"{version} ignores {', '.join(old)}: update Claude Code to {need} or newer"
+    return PASS, f"{len(keys)} wall keys, all read by {version}"
+
+
+def check_tokens(adapter, env) -> tuple[str, str]:
+    """No sign-in token where another program could take it: see the module docstring."""
+    if adapter.NAME != "claude-code":
+        return SKIP, f"{adapter.NAME} keeps no Claude Code sign-in"
+    cred = _credentials_file(env)
+    try:
+        mode: int | None = cred.stat().st_mode
+    except FileNotFoundError:
+        mode = None
+    except OSError as e:
+        return FAIL, f"the credentials file can't be checked ({type(e).__name__})"
+    if mode is not None and mode & 0o077:
+        return FAIL, f"{cred} is readable by other users (mode {mode & 0o777:o}): chmod 600 {cred}"
+    carried = [n for n in SIGN_IN_TOKENS if env.get(n)]
+    if carried:
+        return FAIL, f"this process carries {carried[0]}: take it out of the environment ws runs in"
+    home = _home(env)
+    folder = jobs.jobs_dir(dict(env)) if home is not None else None
+    try:
+        found = sorted(p for p in folder.glob("*.toml") if p.is_file()) if folder else []
+    except OSError:
+        found = []
+    for path in found:
+        try:
+            hit = _job_token(path.read_text())
+        except (OSError, UnicodeDecodeError):
+            continue
+        if hit:
+            return FAIL, f"job {path.stem} sets {hit}: take it out of {path}"
+    private = "" if mode is None else ", the credentials file is private"
+    return PASS, f"no sign-in token in the environment or a job file{private}"
 
 
 def sample_record() -> dict:
@@ -330,7 +635,11 @@ def canary_runner(runner: str, env, work: Path) -> dict:
         "hook_config": check_hook_config(adapter, work),
         "run_record": check_run_record(work),
         "wall": check_wall(adapter, env, work),
+        "probe": check_probe(adapter, env, work),
+        "keys": SKIP_KEYS,
+        "tokens": check_tokens(adapter, env),
     }
+    checks["keys"] = check_keys(adapter, checks["version"][1]) if checks["version"][0] == PASS else (SKIP, "no version")
     return {
         "version": checks["version"][1]
         if checks["version"][0] == PASS and checks["version"][1] != NO_VERSION

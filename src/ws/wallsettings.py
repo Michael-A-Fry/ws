@@ -64,6 +64,13 @@ BYPASS_OFF = "disable"
 # `permissions.blockReadsOutsideWorkingDirectories` (Claude Code 2.1.257): the file tools refuse a read outside the
 # working folders. In the launch settings and the launch file; never in a person's own settings file.
 READ_BLOCK_KEY = "blockReadsOutsideWorkingDirectories"
+# Its write twin (2.1.314): Write, Edit and NotebookEdit refuse a path outside the working folders, in every mode.
+WRITE_BLOCK_KEY = "blockWritesOutsideWorkingDirectories"
+# A call that would wait on a prompt is denied instead (2.1.319; user, managed or --settings only): headless jobs.
+UNATTENDED_KEY = "denyInsteadOfPrompting"
+# The credentials the sandbox keeps from shell commands. The settings reference gives 2.1.221 for its `mask` mode and
+# no version for `deny`; 2.1.221 is the earliest it names, and the key is in every binary from 2.1.308 on.
+CREDENTIALS_KEY = "sandbox.credentials"
 # The settings keys the wall writes that only newer Claude Code versions read: dotted key -> first version that does.
 # The one table `ws doctor` WS016 and the e2e skip read; a version is parsed as doctor._version_tuple parses it.
 MIN_CLAUDE = {
@@ -75,6 +82,9 @@ MIN_CLAUDE = {
     # a launch file only: cross-session messaging refused, and the cross-machine approval (any settings file)
     "crossSessionInbound": (2, 1, 224),
     "isolatePeerMachines": (2, 1, 224),
+    f"permissions.{WRITE_BLOCK_KEY}": (2, 1, 314),
+    f"permissions.{UNATTENDED_KEY}": (2, 1, 319),  # a headless job's settings only (claude_code.unattended)
+    CREDENTIALS_KEY: (2, 1, 221),
 }
 INBOUND_ENV = "WS_INBOUND"  # the managed file's record of who may send in
 INBOUND_VALUE = "lead-only"
@@ -428,15 +438,21 @@ def class_users(pol: policy.Policy) -> list[policy.Class]:
     return [c for _, c in sorted(pol.classes.items()) if c.os_user]
 
 
-def keys_written(pol: policy.Policy) -> list[str]:
+def keys_written(pol: policy.Policy, jobs: bool = True) -> list[str]:
     """The keys of MIN_CLAUDE the wall writes under this policy: the read block unless `read_outside_project` is on (a
-    launch file always has it), `allowRead` with a sandbox (the launch settings' deny-home), and `strictAllowlist` when the
-    policy has data classes and a sandbox."""
+    launch file always has it), the write block unless `write_outside_project` is on, `allowRead` and the credentials
+    list with a sandbox (the launch settings' deny-home and token deny), the no-prompt key every headless job gets
+    (`jobs` False, for a session ws launches at a terminal, leaves it out: that session never carries it), and
+    `strictAllowlist` when the policy has data classes and a sandbox."""
     keys = []
     if not pol.gate.read_outside_project or class_users(pol):
         keys.append(f"permissions.{READ_BLOCK_KEY}")
+    if not pol.gate.write_outside_project:
+        keys.append(f"permissions.{WRITE_BLOCK_KEY}")
+    if jobs:
+        keys.append(f"permissions.{UNATTENDED_KEY}")
     if pol.gate.sandbox:
-        keys.append("sandbox.filesystem.allowRead")
+        keys += ["sandbox.filesystem.allowRead", CREDENTIALS_KEY]
     if pol.gate.sandbox and pol.classes:
         keys.append("sandbox.network.strictAllowlist")
     if class_users(pol):

@@ -116,6 +116,16 @@ from ws.policy import Policy, native_patterns, sandbox_read_paths, sandbox_write
 
 NAME = "claude-code"
 FILE = "settings.json"
+# Claude Code's write twin of wallsettings.READ_BLOCK_KEY (settings reference, 2.1.314): Write, Edit and NotebookEdit
+# refuse a path outside the working folders in every permission mode. It doesn't cover shell commands, MCP or hooks.
+WRITE_BLOCK_KEY = wallsettings.WRITE_BLOCK_KEY
+# Deny a tool call that would wait on a permission prompt (2.1.319; user, managed or --settings scope only): set for a
+# headless job (`unattended`), where no one is there to answer.
+UNATTENDED_KEY = wallsettings.UNATTENDED_KEY
+# The runner's sign-in tokens. `sandbox.credentials.envVars` with mode "deny" takes them out of every sandboxed
+# command's environment, so a shell command can't send them anywhere; Claude Code itself keeps them.
+SIGN_IN_TOKENS = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_OAUTH_TOKEN")
+TOKEN_VARS = (*SIGN_IN_TOKENS, "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
 # The PreToolUse gate hook runs for every tool: `*` matches all (Claude Code's hooks reference, "Matcher patterns"), so a
 # tool the runner adds later is gated too. `parse` knows the tools ws judges and returns None for the rest, which the
 # gate allows; the hook is the layer that is always there, whatever the tool is called.
@@ -282,6 +292,8 @@ def sandbox_block(
         "allowUnsandboxedCommands": False,
         "filesystem": fs,
     }
+    if defaults:  # not in a person's own file: Claude Code merges these arrays from every scope
+        block["credentials"] = {"envVars": [{"name": n, "mode": "deny"} for n in TOKEN_VARS]}
     hosts = policy.gate.allow_hosts or (DEFAULT_DOMAINS if defaults else ())
     if hosts:
         block["network"] = {"allowedDomains": list(hosts)}
@@ -401,6 +413,16 @@ def with_hosts(settings: str, hosts: list[str]) -> str:
     net = conf["sandbox"].setdefault("network", {})
     net["allowedDomains"] = list(hosts)
     net["strictAllowlist"] = True
+    return json.dumps(conf, indent=2) + "\n"
+
+
+def unattended(settings: str) -> str:
+    """The generated settings text for a headless job: `permissions.denyInsteadOfPrompting` on, so a tool call that would
+    wait on a prompt is denied at once and the job goes on. Settings that are not a JSON object come back as they are."""
+    conf = json.loads(settings)
+    if not isinstance(conf, dict):
+        return settings
+    conf.setdefault("permissions", {})[UNATTENDED_KEY] = True
     return json.dumps(conf, indent=2) + "\n"
 
 
@@ -573,6 +595,8 @@ def generate(
     if not user_scope and not policy.gate.read_outside_project:
         # never in a person's own settings file (user_scope): it would bind every Claude Code session they start
         permissions[wallsettings.READ_BLOCK_KEY] = True
+    if not user_scope and not policy.gate.write_outside_project:
+        permissions[WRITE_BLOCK_KEY] = True  # the same rule, for Write, Edit and NotebookEdit
     settings = {
         "permissions": permissions,
         # `sandbox = false` in the policy: no block, and the marker says so (the hook then skips the preflight)

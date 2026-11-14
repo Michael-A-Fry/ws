@@ -388,7 +388,11 @@ def test_launch_is_quiet_when_the_runner_is_new_enough_or_the_wall_writes_no_key
     sandbox.warn_old_runner("claude", env, policy.loads(""))
     assert capsys.readouterr().err == ""
     env = stub_claude(box, monkeypatch, "1.0.0")
-    sandbox.warn_old_runner("claude", env, policy.loads("[gate]\nsandbox = false\nread_outside_project = true\n"))
+    sandbox.warn_old_runner(
+        "claude",
+        env,
+        policy.loads("[gate]\nsandbox = false\nread_outside_project = true\nwrite_outside_project = true\n"),
+    )
     assert capsys.readouterr().err == ""
     sandbox.warn_old_runner("claude", {"PATH": str(box / "empty")}, policy.loads(""))  # not found: the start says so
     assert capsys.readouterr().err == ""

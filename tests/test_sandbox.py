@@ -1071,6 +1071,7 @@ def test_only_documented_sandbox_keys_are_used(tmp_path):
         "allowUnsandboxedCommands",
         "filesystem",
         "network",
+        "credentials",
     }
     assert set(sb) <= documented
     assert set(sb["filesystem"]) <= {"allowWrite", "denyWrite", "denyRead", "allowRead"}
@@ -1684,3 +1685,53 @@ def test_with_no_policy_named_the_default_applies(env, monkeypatch, wshome):
     assert not (wshome / "policy.toml").exists()
     assert cli.main(["gate", "launch", "--runner", "opencode", "--", "opencode"]) == 0
     assert env and env[0][0] == ["wall", "opencode"]
+
+
+# --- the write block, unattended jobs and the sign-in tokens (rr-M2) ------------------------------------------------------
+
+
+def test_the_launch_settings_block_writes_outside_the_working_folders(tmp_path):
+    perms = claude_settings(tmp_path)["permissions"]
+    assert perms[claude_code.WRITE_BLOCK_KEY] is True
+    assert claude_code.WRITE_BLOCK_KEY == "blockWritesOutsideWorkingDirectories"  # the documented name
+
+
+def test_write_outside_project_true_leaves_the_write_block_out_and_keeps_the_read_block(tmp_path):
+    perms = claude_settings(tmp_path, "[gate]\nwrite_outside_project = true\n")["permissions"]
+    assert claude_code.WRITE_BLOCK_KEY not in perms
+    assert perms["blockReadsOutsideWorkingDirectories"] is True
+
+
+def test_write_outside_project_of_the_wrong_type_is_a_policy_error():
+    with pytest.raises(policy.PolicyError, match="write_outside_project must be true or false"):
+        policy.loads('[gate]\nwrite_outside_project = "no"\n')
+
+
+def test_the_user_scope_settings_carry_neither_file_block_nor_the_token_list(tmp_path):
+    pol = policy.loads("")
+    out = tmp_path / "wshome" / "gate" / "claude-code"
+    text = claude_code.generate(pol, ["ws"], out, tmp_path / "wshome" / "policy.toml", user_scope=True)["settings.json"]
+    assert claude_code.WRITE_BLOCK_KEY not in text
+    assert "credentials" not in json.loads(text)["sandbox"]  # Claude Code merges these arrays from every scope
+
+
+def test_shell_commands_lose_the_sign_in_tokens(tmp_path):
+    entries = claude_settings(tmp_path)["sandbox"]["credentials"]["envVars"]
+    assert {e["name"] for e in entries} >= {"CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"}
+    assert {e["mode"] for e in entries} == {"deny"}
+
+
+def test_no_sandbox_means_no_token_list(tmp_path):
+    assert "sandbox" not in claude_settings(tmp_path, "[gate]\nsandbox = false\n")
+
+
+def test_unattended_settings_deny_instead_of_prompting(tmp_path):
+    shared = json.dumps(claude_settings(tmp_path))
+    conf = json.loads(claude_code.unattended(shared))
+    assert conf["permissions"]["denyInsteadOfPrompting"] is True
+    assert conf["permissions"]["blockReadsOutsideWorkingDirectories"] is True  # the rest is kept
+    assert "denyInsteadOfPrompting" not in shared  # a session at a terminal still asks
+
+
+def test_unattended_leaves_text_that_is_not_an_object_alone():
+    assert claude_code.unattended("[]") == "[]"

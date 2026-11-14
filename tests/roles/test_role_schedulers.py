@@ -20,6 +20,10 @@ AI_JOB = (
     'runner = "claude-code"\nmodel = "m1"\nprompt = "Summarise."\nschedule = "daily 03:30"\n'
     "max_turns = 5\nbudget_usd = 0.5\n" + CONTRACT
 )
+LINKED_DAILY = [  # what `systemctl link` gets for one job: its units, the shared slice, the alert and dead-man units
+    "ws-alert@.service", "ws-daily.service", "ws-daily.timer", "ws-jobs.slice",
+    "ws-watch-deadman.service", "ws-watch-deadman.timer",
+]  # fmt: skip
 BACKUP_JOB = 'command = "backup"\nschedule = "weekly mon 09:05"\n' + CONTRACT
 
 
@@ -172,20 +176,23 @@ def test_systemd_steps_install_and_uninstall(box, write_job, env, linux):
     steps = systemd.steps({}, install.Answers(stays_on=False), env)
     assert sorted(s.path.name for s in steps) == [
         "logs",
+        "ws-alert@.service",
         "ws-backup.service",
         "ws-backup.timer",
         "ws-daily.service",
         "ws-daily.timer",
         "ws-jobs.slice",
+        "ws-watch-deadman.service",
+        "ws-watch-deadman.timer",
     ]
     assert all(s.path.parent == box / ".ws" / "jobs" / "units" for s in steps if s.path.name != "logs")
     r = install.apply(steps, env)
-    assert len(r.created) >= 5
+    assert len(r.created) >= 8
     assert install.apply(steps, env).changes == 0  # a second run reports 0 changes
     fake = Fake()
     removed = install.uninstall(env, deactivate=lambda paths, e: roles.deactivate_units(paths, e, fake))
     assert not list((box / ".ws" / "jobs" / "units").glob("ws-*"))
-    assert len([p for p in removed.removed if p.name.startswith("ws-")]) == 5
+    assert len([p for p in removed.removed if p.name.startswith("ws-")]) == 8
     # the links systemctl made outside $WS_HOME are undone before the files go
     assert fake.calls[0] == [
         "systemctl",
@@ -196,6 +203,8 @@ def test_systemd_steps_install_and_uninstall(box, write_job, env, linux):
         "ws-backup.service",
         "ws-daily.timer",
         "ws-daily.service",
+        "ws-watch-deadman.timer",
+        "ws-watch-deadman.service",
     ]
     assert removed.problems == []
 
@@ -231,16 +240,9 @@ def test_systemd_activate_argv(box, write_job, env):
     fake, units = Fake(), box / ".ws" / "jobs" / "units"
     assert systemd.activate(env, fake) == []
     assert fake.calls == [
-        [
-            "systemctl",
-            "--user",
-            "link",
-            str(units / "ws-daily.service"),
-            str(units / "ws-daily.timer"),
-            str(units / "ws-jobs.slice"),
-        ],
+        ["systemctl", "--user", "link", *(str(units / n) for n in LINKED_DAILY)],
         ["systemctl", "--user", "daemon-reload"],
-        ["systemctl", "--user", "enable", "--now", "ws-daily.timer"],
+        ["systemctl", "--user", "enable", "--now", "ws-daily.timer", "ws-watch-deadman.timer"],
     ]
 
 
@@ -276,7 +278,10 @@ def test_systemd_activate_links_nothing_over_a_unit_it_did_not_write(box, write_
         "systemctl",
         "--user",
         "link",
+        str(units / "ws-alert@.service"),
         str(units / "ws-jobs.slice"),
+        str(units / "ws-watch-deadman.service"),
+        str(units / "ws-watch-deadman.timer"),
         str(units / "ws-weekly.service"),
         str(units / "ws-weekly.timer"),
     ]
@@ -383,7 +388,9 @@ def test_launchd_plist(env):
     assert plist["Label"] == "ws.job.weekly-digest"
     assert plist["ProgramArguments"] == [*WS, "run", "weekly-digest"]
     assert plist["StartCalendarInterval"] == {"Hour": 9, "Minute": 5, "Weekday": 1}
-    assert plist["EnvironmentVariables"] == {"WS_HOME": env["WS_HOME"], "PATH": "/usr/bin:/bin"}
+    assert plist["EnvironmentVariables"] == {
+        "WS_HOME": env["WS_HOME"], "PATH": "/usr/bin:/bin", "WS_ALERT_ON_EXIT": "1",
+    }  # fmt: skip
     assert plist["StandardOutPath"] == plist["StandardErrorPath"] and plist["StandardOutPath"].endswith(
         "weekly-digest.log"
     )
@@ -475,7 +482,7 @@ def test_cli_list_dry_run_apply_remove(box, write_job, env, linux, capsys, monke
     assert not (box / ".ws" / "jobs" / "units").exists()
 
     code, out, _ = run(capsys, "schedule", "apply")
-    assert code == 0 and "4 unit file(s)" in out and len(fake.calls) == 3
+    assert code == 0 and "7 unit file(s)" in out and len(fake.calls) == 3
     assert fake.calls[0][:3] == ["systemctl", "--user", "link"]
     code, out, _ = run(capsys, "schedule", "apply")
     assert code == 0 and "0 changes" in out
@@ -484,9 +491,8 @@ def test_cli_list_dry_run_apply_remove(box, write_job, env, linux, capsys, monke
     code, out, _ = run(capsys, "schedule", "remove", "daily")
     assert code == 0 and "removed 2 unit file(s)" in out
     assert fake.calls[0] == ["systemctl", "--user", "disable", "--now", "ws-daily.timer", "ws-daily.service"]
-    assert [p.name for p in (box / ".ws" / "jobs" / "units").glob("ws-*")] == [
-        "ws-jobs.slice"
-    ]  # the shared slice stays
+    left = sorted(p.name for p in (box / ".ws" / "jobs" / "units").glob("ws-*"))
+    assert left == sorted(systemd.OWN)  # the shared units stay: slice, alert template, dead-man check
     manifest = (box / ".ws" / "install-manifest.json").read_text()
     assert "ws-daily" not in manifest  # ws removed them itself, so uninstall need not look for them
 
@@ -511,7 +517,7 @@ def test_a_job_whose_schedule_is_gone_loses_its_timer(box, write_job, env, linux
     assert code == 0 and "stopped daily" in out
     assert fake.calls[0] == ["systemctl", "--user", "disable", "--now", "ws-daily.timer", "ws-daily.service"]
     enable = next(c for c in fake.calls if "enable" in c)
-    assert enable[-1:] == ["ws-other.timer"]  # only the job that still has a schedule is switched on
+    assert "ws-other.timer" in enable and "ws-daily.timer" not in enable  # only jobs that still have a schedule
     link = next(c for c in fake.calls if "link" in c)
     assert not any("ws-daily" in a for a in link)
     assert not list((box / ".ws" / "jobs" / "units").glob("ws-daily*"))
@@ -541,12 +547,15 @@ def _sched(**kw):
     return jobs.Scheduled("daily", jobs.parse_schedule("daily 03:30", "t"), ("run", "daily"), **kw)
 
 
-def test_the_service_holds_the_timeout_and_the_slice_and_names_no_unit_that_is_not_generated(env):
+def test_the_service_holds_the_failure_hook_the_timeout_and_the_slice(env):
     svc = systemd.render(_sched(timeout_s=600), env, WS)["ws-daily.service"]
     assert "TimeoutStartSec=630" in svc and "Slice=ws-jobs.slice" in svc
-    assert "OnFailure" not in svc  # the alert unit it would name is generated with the alert command
+    assert "OnFailure=ws-alert@%n.service" in svc
+    assert "ws-alert@.service" in systemd.render_watch(env, WS)  # the unit it names is generated with it
     assert f"StandardOutput=append:{_schedule.logs_dir(env) / 'daily.log'}" in svc
-    assert "StandardOutput" not in systemd.render(_sched(log="journal"), env, WS)["ws-daily.service"]
+    assert 'ExecStopPost=-"/opt/ws/bin/ws" "watch" "rotate" "daily"' in svc  # command jobs rotate too
+    journal = systemd.render(_sched(log="journal"), env, WS)["ws-daily.service"]
+    assert "StandardOutput" not in journal and "ExecStopPost" not in journal
 
 
 def test_a_job_file_with_no_timeout_keeps_the_no_limit_it_had(env):
@@ -570,3 +579,27 @@ def test_the_slice_gives_scheduled_jobs_a_cpu_and_memory_share(env):
 def test_launchd_has_no_hook_in_the_plist_but_runs_in_the_background_class(env):
     plist = plistlib.loads(launchd.render(_sched(), env, WS).encode())
     assert plist["ProcessType"] == "Background" and "OnFailure" not in plist
+
+
+def test_the_alert_template_and_the_deadman_units(env):
+    files = systemd.render_watch(env, WS)
+    assert set(files) == {"ws-alert@.service", "ws-watch-deadman.service", "ws-watch-deadman.timer"}
+    alert, dead = files["ws-alert@.service"], files["ws-watch-deadman.service"]
+    assert 'ExecStart="/opt/ws/bin/ws" "watch" "alert" "%i"' in alert and "OnFailure" not in alert  # no loop
+    assert 'ExecStart="/opt/ws/bin/ws" "watch" "deadman"' in dead and "SuccessExitStatus=3" in dead
+    assert "OnFailure=ws-alert@%n.service" in dead and "Persistent=true" in files["ws-watch-deadman.timer"]
+
+
+def test_the_watch_units_come_with_the_first_job_and_are_not_orphans(box, write_job, env, linux):
+    assert systemd.steps({}, install.Answers(), env) == []  # no jobs, no units
+    write_job("daily", AI_JOB)
+    names = {s.path.name for s in systemd.steps({}, install.Answers(), env)}
+    assert {"ws-alert@.service", "ws-watch-deadman.timer", "ws-watch-deadman.service"} <= names
+    install.apply(systemd.steps({}, install.Answers(), env), env)
+    assert systemd.orphans(env) == []
+    assert systemd.check({}, linux, env, False)[1].startswith("systemd: 1 scheduled job,")
+
+
+def test_a_launchd_plist_tells_ws_run_to_alert_from_its_exit_path(env):
+    plist = plistlib.loads(launchd.render(_sched(), env, WS).encode())
+    assert plist["EnvironmentVariables"]["WS_ALERT_ON_EXIT"] == "1"

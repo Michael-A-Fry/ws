@@ -6,7 +6,7 @@ The service runs `ws run <name>` (or the job's `command`, for example `ws backup
 `Persistent=true`, so a run missed while the machine was off happens at the next start; on a machine that stays on it
 never fires, so the "stays on?" answer is not needed here.
 
-Every service also gets `TimeoutStartSec=` (the job's `timeout_s` and a margin, so a hung run is killed; `infinity`
+Every service also gets `OnFailure=ws-alert@%n.service` (one template unit sends the alert), `TimeoutStartSec=` (the job's `timeout_s` and a margin, so a hung run is killed; `infinity`
 for a file with no `timeout_s`, which is what a oneshot had before, so an upgrade never kills a running job; the
 contract check still flags the file), `Slice=ws-jobs.slice` (a shared slice with a CPU
 and memory share, so scheduled work cannot starve the desk) and, for a job with `log = "file"`, `StandardOutput=append:`
@@ -34,6 +34,10 @@ ROLE, NAME = "scheduler", "systemd"
 PREFIX = "ws-"
 MARKER = "# Written by ws"  # first line of every unit ws writes: the proof a unit in the user folder is its own
 SLICE = "ws-jobs.slice"  # the shared slice every scheduled service runs in
+ALERT = "ws-alert@%n.service"  # OnFailure= target: one template unit, instance = the failed unit's name
+ALERT_TEMPLATE = "ws-alert@.service"
+DEADMAN = "ws-watch-deadman"  # the dead-man check: a timer outside the jobs it watches
+OWN = {SLICE, ALERT_TEMPLATE, f"{DEADMAN}.service", f"{DEADMAN}.timer"}  # units ws writes that are not a job's
 CPU_WEIGHT, MEMORY_HIGH = 50, "75%"  # the share scheduled jobs get: below the default CPUWeight of 100, soft memory cap
 TIMEOUT_MARGIN_S = 30  # TimeoutStartSec= is the job's limit plus this, so `ws run` ends its own run first
 
@@ -65,17 +69,19 @@ def _header(source: str) -> str:
 def render(job: Scheduled, env, ws_cmd: list[str]) -> dict[str, str]:
     """{file name: text} for one job."""
     unit = f"{PREFIX}{job.name}"
-    lines = [f"Environment={_quote(f'{k}={v}')}" for k, v in paths.env_for(env).items()]
-    if path := _schedule.path_value(env):
-        lines.append(f"Environment={_quote('PATH=' + path)}")
+    lines = _env_lines(env)
     exec_start = " ".join(_quote(w, expand=True) for w in [*ws_cmd, *job.argv])
     source = f"jobs/{job.name}.toml"
     out = ""
     if job.log == "file":
-        out = f"StandardOutput=append:{_schedule.logs_dir(env) / (job.name + '.log')}\nStandardError=inherit\n"
+        rotate = " ".join(_quote(w, expand=True) for w in [*ws_cmd, "watch", "rotate", job.name])
+        out = (
+            f"StandardOutput=append:{_schedule.logs_dir(env) / (job.name + '.log')}\nStandardError=inherit\n"
+            f"ExecStopPost=-{rotate}\n"
+        )
     service = (
         _header(source)
-        + f"[Unit]\nDescription=ws job {job.name}\n\n"
+        + f"[Unit]\nDescription=ws job {job.name}\nOnFailure={ALERT}\n\n"
         + f"[Service]\nType=oneshot\nSlice={SLICE}\n{chr(10).join(lines)}\nExecStart={exec_start}\n"
         + f"TimeoutStartSec={'infinity' if job.timeout_s is None else int(job.timeout_s) + TIMEOUT_MARGIN_S}\n{out}"
     )
@@ -86,6 +92,33 @@ def render(job: Scheduled, env, ws_cmd: list[str]) -> dict[str, str]:
         + f"Unit={unit}.service\n\n[Install]\nWantedBy=timers.target\n"
     )
     return {f"{unit}.service": service, f"{unit}.timer": timer}
+
+
+def _env_lines(env) -> list[str]:
+    lines = [f"Environment={_quote(f'{k}={v}')}" for k, v in paths.env_for(env).items()]
+    if path := _schedule.path_value(env):
+        lines.append(f"Environment={_quote('PATH=' + path)}")
+    return lines
+
+
+def render_watch(env, ws_cmd: list[str]) -> dict[str, str]:
+    """The alert template (`ws watch alert %i`, run by every unit's OnFailure=) and the hourly dead-man service and timer.
+    The alert has no OnFailure= of its own (it would loop). The dead-man's exit 3 means "a job is overdue" and it has
+    raised that alert itself, so it is a success to systemd; any other exit (a crash is 1) fails the unit and alerts."""
+    env_text = "\n".join(_env_lines(env))
+    alert = " ".join(_quote(w, expand=True) for w in [*ws_cmd, "watch", "alert"]) + ' "%i"'  # %i is the specifier
+    dead = " ".join(_quote(w, expand=True) for w in [*ws_cmd, "watch", "deadman"])
+    return {
+        ALERT_TEMPLATE: _header("ws's scheduler role")
+        + f"[Unit]\nDescription=ws failure alert for %i\n\n[Service]\nType=oneshot\nSlice={SLICE}\n{env_text}\n"
+        + f"ExecStart={alert}\nTimeoutStartSec=60\n",
+        f"{DEADMAN}.service": _header("ws's scheduler role")
+        + f"[Unit]\nDescription=ws dead-man check: jobs that stopped running\nOnFailure={ALERT}\n\n"
+        + f"[Service]\nType=oneshot\nSlice={SLICE}\n{env_text}\nExecStart={dead}\nSuccessExitStatus=3\nTimeoutStartSec=120\n",
+        f"{DEADMAN}.timer": _header("ws's scheduler role")
+        + "[Unit]\nDescription=ws dead-man check (hourly)\n\n[Timer]\nOnCalendar=*-*-* *:07:00\nPersistent=true\n"
+        + f"Unit={DEADMAN}.service\n\n[Install]\nWantedBy=timers.target\n",
+    }
 
 
 def render_slice() -> str:
@@ -107,12 +140,14 @@ def _want(env) -> dict[Path, str]:
             out[_schedule.units_dir(env) / name] = text
     if out:
         out[_schedule.units_dir(env) / SLICE] = render_slice()
+        for name, text in render_watch(env, cmd).items():
+            out[_schedule.units_dir(env) / name] = text
     return out
 
 
 def orphans(env) -> list[str]:
     """Jobs that have unit files here but no longer have a schedule."""
-    keep = {p.name for p in _want(env)}
+    keep = {p.name for p in _want(env)} | OWN
     files = _schedule.orphans(env, PREFIX, (".service", ".timer"), keep)
     return sorted({p.stem.removeprefix(PREFIX) for p in files})
 
@@ -131,7 +166,7 @@ def check(cfg, osi, env, network):
         )
     if not want:
         return OK, NAME
-    n = sum(p.suffix == ".timer" for p in want)
+    n = sum(p.suffix == ".timer" and p.name not in OWN for p in want)
     jobs_ = f"{n} scheduled job{'' if n == 1 else 's'}"
     old = _schedule.stale(want)
     if old:
@@ -156,6 +191,8 @@ def steps(cfg, answers, env):
         out.append(
             install.Step(_schedule.units_dir(env) / SLICE, "file", render_slice(), "systemd slice for scheduled jobs")
         )
+        for name, text in render_watch(env, cmd).items():
+            out.append(install.Step(_schedule.units_dir(env) / name, "file", text, f"systemd {name} (alert, dead-man)"))
         out.append(
             install.Step(_schedule.logs_dir(env), "dir", None, "the folder scheduled jobs write their output to")
         )
@@ -185,7 +222,7 @@ def activate(env, runner=None) -> list[str]:
     left_out, problems = _skip_foreign(env, files)
     files = [p for p in files if p.name not in left_out]
     timers = [p for p in files if p.suffix == ".timer"]
-    if not timers:  # every job clashed: the shared slice alone is not worth linking
+    if not [p for p in timers if p.name not in OWN]:  # every job clashed: ws's own units alone are not worth linking
         return problems
     for argv in (
         ["systemctl", "--user", "link", *map(str, files)],

@@ -38,6 +38,8 @@ _CONFIG_VARS = (
     approvals.ENV_MARKER,
     approvals.SANDBOX_MARKER,
     approvals.FD_ENV,
+    "INVOCATION_ID",  # set when the suite runs in a systemd unit or scope: ws run would leave the stop to OnFailure=
+    "WS_ALERT_ON_EXIT",
 )
 
 

@@ -32,7 +32,7 @@ jobs:
       matrix:
         os: [ubuntu-24.04, macos-26]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20  # the whole suite on one runner: about 15 minutes
+    timeout-minutes: 40  # the whole suite on one runner: ubuntu 14 min, macos-26 about 23 min (15 Nov: cancelled at 20 with 87% done)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -292,7 +292,7 @@ jobs:
   wsl:
     name: doctor (windows-2025, WSL2 Ubuntu-24.04)
     runs-on: windows-2025
-    timeout-minutes: 25
+    timeout-minutes: 50  # WSL2 ran past 25 min on every PR from #190 (15 Nov); about 2x the measured floor
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

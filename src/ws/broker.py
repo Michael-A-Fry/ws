@@ -14,10 +14,12 @@ No TLS interception and no CA: the tool talks plain HTTP to 127.0.0.1 and the br
 only. Everything fails closed: an unset name, a missing or loose store, an unknown host or an expired lease gives a
 refusal, never a request without the credential or to a different host.
 
-Wire format on the socket: one JSON object per line, one reply per request. Ops: request, release, status, elevate.
+Wire format on the socket: one JSON object per line, one reply per request. Ops: request, release, status, elevate,
+and for the minters (ws.minters) mint, sign and ca_public.
 Refusal codes: unknown_name, unset, host_not_allowed, purpose_not_allowed, caller_refused, store_unreadable, expired,
-run_required, run_refused, not_declared, area_refused, tier_refused, claim_refused, elevation_off, audit_failed, plus
-bad_request (malformed) and busy (too many connections or leases).
+run_required, run_refused, not_declared, area_refused, tier_refused, claim_refused, elevation_off, audit_failed,
+wrong_kind, upstream_refused, upstream_unreachable, plus bad_request (malformed) and busy (too many connections or
+leases).
 
 Run records, the trust anchor for scoped names. A request names only its run id (`run`). The broker reads its own run
 record for that id: one JSON file per run in `<state>/run/records/`, owned by the broker's user (or root), mode 0600 in
@@ -58,9 +60,11 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from ws import __version__, output, paths
 from ws import secrets as wsecrets
+from ws.minters import github_app, ssh_ca
 from ws.output import WsError
 
 CODES = (
@@ -81,7 +85,11 @@ CODES = (
     "claim_refused",
     "elevation_off",
     "audit_failed",
+    "wrong_kind",
+    "upstream_refused",
+    "upstream_unreachable",
 )
+MINT_REUSE_MARGIN_S = 300  # a cached token with less left than this is minted afresh
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$")
 RECORD_KEYS = {"v", "run", "area", "tier", "names", "uid", "expires_at"}
 MAX_RECORD = 65536
@@ -540,6 +548,19 @@ class _Grant:
     elevated: bool = False
 
 
+@dataclass
+class _Minted:
+    name: str
+    run: str
+    elevated: bool
+    token: str
+    options: object
+    expires: float
+
+    def __repr__(self) -> str:  # never the token
+        return f"_Minted({self.name}, {self.run})"
+
+
 def _iso(t: float) -> str:
     return datetime.fromtimestamp(t, UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
@@ -590,6 +611,8 @@ class Broker:
         # Called with each live grant `ws elevate off` drops; a minter that can revoke its upstream token adds one. One
         # that raises counts as a failed revoke and is logged; the grant is dropped either way.
         self.revokers: list = []
+        self._minted: list[_Minted] = []  # tokens a minter issued, kept until they expire, to revoke on `elevate off`
+        self._mint_cache: dict[tuple, tuple[str, float]] = {}  # (name, run, repos, perms) -> (token, expires)
 
     @classmethod
     def from_env(
@@ -762,6 +785,12 @@ class Broker:
                 return self._op_status()
             if op == "elevate":
                 return self._op_elevate(msg, uid, pid)
+            if op == github_app.OP:
+                return self._op_mint(msg, uid, pid)
+            if op == ssh_ca.OP:
+                return self._op_sign(msg, uid, pid)
+            if op == "ca_public":
+                return self._op_ca_public(msg)
         except Exception as e:  # noqa: BLE001 (answer, never crash the thread; the type only, in case a value is near)
             print(f"ws broker: {op} failed ({type(e).__name__})", file=sys.stderr)
             return _refuse("store_unreadable", "the broker could not complete that")
@@ -792,34 +821,14 @@ class Broker:
             return refuse("unknown_name", f"{name} is not in the registry")
         if host not in entry.hosts:
             return refuse("host_not_allowed", f"{name} is not allowed at {host}")
+        if entry.kind != "header":
+            return refuse("wrong_kind", f"{name} is a {entry.kind} entry: ask with the {entry.kind} op, not a lease")
         if entry.purposes and purpose not in entry.purposes:
             return refuse("purpose_not_allowed", f"{name} is not allowed for that purpose")
         now = self.clock()
-        rec: RunRecord | None = None
-        if run_id is None:
-            if entry.scoped or self.require_run:
-                return refuse("run_required", f"{name} is leased only under a run: send the run id")
-            if msg.get("area") is not None or msg.get("tier") is not None:
-                return refuse("claim_refused", "an area or tier is read from the run record, never from a request")
-        else:
-            try:
-                rec = self.run_record(run_id, now)
-            except RecordError as e:
-                return refuse("run_refused", f"no usable run record ({e.kind}): {e}")
-            log.update(area=rec.area, tier=rec.tier)
-            for claim in ("area", "tier"):
-                if msg.get(claim) is not None and msg.get(claim) != getattr(rec, claim):
-                    return refuse("claim_refused", f"the request's {claim} is not the one the run record holds")
-            if rec.uid is not None and rec.uid != uid:
-                return refuse("caller_refused", "this caller is not the one the run record names")
-            if name not in rec.names:
-                return refuse("not_declared", f"{name} is not one of the names this run declared")
-            if entry.area is not None and entry.area != rec.area:
-                return refuse("area_refused", f"{name} belongs to another area")
-            if (entry.tier or wsecrets.DEFAULT_TIER) not in wsecrets.REACH[rec.tier]:
-                return refuse("tier_refused", f"a {rec.tier} run cannot lease {name}")
-        if entry.elevated and not self.elevation_on():
-            return refuse("elevation_off", f"{name} is elevated and `ws elevate off` is in force")
+        rec, why = self._scope(entry, msg, uid, log, now, need_run=False)
+        if why:
+            return refuse(*why)
         try:
             self.store.read(name)
         except FileNotFoundError:
@@ -898,6 +907,174 @@ class Broker:
             "require_run": self.require_run,
         }
 
+    def _scope(
+        self, entry: wsecrets.Entry, msg: dict, uid: int, log: dict, now: float, need_run: bool
+    ) -> tuple[RunRecord | None, tuple[str, str] | None]:
+        """The run record behind a request and None, or (None, (code, reason)) for the refusal. `log` gains the run's
+        area and tier, so the audit line says what the broker read."""
+        name, run_id = entry.name, msg.get("run")
+        if run_id is None:
+            if entry.scoped or self.require_run or need_run:
+                return None, ("run_required", f"{name} is leased only under a run: send the run id")
+            if msg.get("area") is not None or msg.get("tier") is not None:
+                return None, ("claim_refused", "an area or tier is read from the run record, never from a request")
+            rec = None
+        else:
+            try:
+                rec = self.run_record(run_id, now)
+            except RecordError as e:
+                return None, ("run_refused", f"no usable run record ({e.kind}): {e}")
+            log.update(area=rec.area, tier=rec.tier)
+            for claim in ("area", "tier"):
+                if msg.get(claim) is not None and msg.get(claim) != getattr(rec, claim):
+                    return None, ("claim_refused", f"the request's {claim} is not the one the run record holds")
+            if rec.uid is not None and rec.uid != uid:
+                return None, ("caller_refused", "this caller is not the one the run record names")
+            if name not in rec.names:
+                return None, ("not_declared", f"{name} is not one of the names this run declared")
+            if entry.area is not None and entry.area != rec.area:
+                return None, ("area_refused", f"{name} belongs to another area")
+            if (entry.tier or wsecrets.DEFAULT_TIER) not in wsecrets.REACH[rec.tier]:
+                return None, ("tier_refused", f"a {rec.tier} run cannot lease {name}")
+        if entry.elevated and not self.elevation_on():
+            return None, ("elevation_off", f"{name} is elevated and `ws elevate off` is in force")
+        return rec, None
+
+    def _minter_entry(self, msg: dict, op: str, kind: str, log: dict) -> tuple[wsecrets.Entry | None, dict | None]:
+        name = msg.get("name")
+        if not (isinstance(name, str) and wsecrets.NAME_RE.match(name)):
+            return None, self._refuse_logged(op, log, "bad_request", "name must be a secret name")
+        try:
+            entry = wsecrets.load_registry(self.registry).get(name)
+        except wsecrets.SecretsError:
+            return None, self._refuse_logged(op, log, "store_unreadable", "the registry cannot be read")
+        if entry is None:
+            return None, self._refuse_logged(op, log, "unknown_name", f"{name} is not in the registry")
+        if entry.kind != kind:
+            return None, self._refuse_logged(op, log, "wrong_kind", f"{name} is not a {kind} entry")
+        return entry, None
+
+    def _refuse_logged(self, op: str, log: dict, code: str, reason: str) -> dict:
+        self.audit.write(op, code, **log)
+        return _refuse(code, reason)
+
+    def _stored(self, op: str, log: dict, name: str) -> tuple[str | None, dict | None]:
+        try:
+            return self.store.read(name), None
+        except FileNotFoundError:
+            return None, self._refuse_logged(op, log, "unset", f"{name} has no value; run `ws secret set {name}`")
+        except wsecrets.SecretsError as e:
+            return None, self._refuse_logged(op, log, "store_unreadable", str(e))
+
+    def _op_mint(self, msg: dict, uid: int, pid: int) -> dict:
+        """A GitHub App installation token for a run, narrowed to the repos and permissions it asks for."""
+        log = {"name": msg.get("name"), "uid": uid, "pid": pid, "run": msg.get("run"), "host": None}
+        entry, refused = self._minter_entry(msg, "mint", github_app.KIND, log)
+        if refused:
+            return refused
+        assert entry is not None and isinstance(entry.options, github_app.Options)
+        opts = entry.options
+        log["host"] = (urlsplit(opts.api).hostname or "").lower() or None
+        now = self.clock()
+        rec, why = self._scope(entry, msg, uid, log, now, need_run=True)
+        if why:
+            return self._refuse_logged("mint", log, *why)
+        assert rec is not None
+        try:
+            repos, perms = github_app.narrow(opts, msg.get("repos"), msg.get("permissions"))
+        except github_app.MintError as e:
+            return self._refuse_logged("mint", log, e.code, e.reason)
+        log["purpose"] = ("repos=" + ",".join(repos) + " " + ",".join(f"{k}:{v}" for k, v in perms.items()))[:120]
+        key = (entry.name, rec.run, repos, tuple(perms.items()))
+        with self._lock:
+            hit = self._mint_cache.get(key)
+        if hit is not None and hit[1] - now > MINT_REUSE_MARGIN_S:
+            token, expires = hit
+        else:
+            value, refused = self._stored("mint", log, entry.name)
+            if refused:
+                return refused
+            assert value is not None
+            try:
+                token, expires = github_app.mint(opts, value, repos, perms, now, self.allow_plain_http)
+            except github_app.MintError as e:
+                return self._refuse_logged("mint", log, e.code, e.reason)
+            finally:
+                del value
+            with self._lock:
+                self._mint_cache[key] = (token, expires)
+                self._minted.append(_Minted(entry.name, rec.run, entry.elevated, token, opts, expires))
+        if rec.expires_at is not None and rec.expires_at < expires:
+            expires_out = rec.expires_at  # the caller is told the run's end; the token itself cannot be shortened
+        else:
+            expires_out = expires
+        if not self.audit.write("mint", "ok", **log):
+            return _refuse("audit_failed", "the token could not be written to the audit log, so it is not given")
+        return {"ok": True, "token": token, "expires_at": _iso(expires_out)}
+
+    def _op_sign(self, msg: dict, uid: int, pid: int) -> dict:
+        """An SSH certificate for a run's own public key, principals from its tier."""
+        log = {"name": msg.get("name"), "uid": uid, "pid": pid, "run": msg.get("run"), "host": None}
+        entry, refused = self._minter_entry(msg, "sign", ssh_ca.KIND, log)
+        if refused:
+            return refused
+        assert entry is not None and isinstance(entry.options, ssh_ca.Options)
+        rec, why = self._scope(entry, msg, uid, log, self.clock(), need_run=True)
+        if why:
+            return self._refuse_logged("sign", log, *why)
+        assert rec is not None
+        try:
+            ssh_ca.check_public_key(msg.get("public_key"))
+        except ssh_ca.MintError as e:
+            return self._refuse_logged("sign", log, e.code, e.reason)
+        value, refused = self._stored("sign", log, entry.name)
+        if refused:
+            return refused
+        assert value is not None
+        try:
+            out = ssh_ca.sign(entry.options, value, msg["public_key"], rec.run, rec.tier)
+        except ssh_ca.MintError as e:
+            return self._refuse_logged("sign", log, e.code, e.reason)
+        finally:
+            del value
+        log["purpose"] = f"serial={out['serial']} principals={','.join(out['principals'])}"[:120]
+        if not self.audit.write("sign", "ok", **log):
+            return _refuse("audit_failed", "the certificate could not be written to the audit log, so it is not given")
+        return {"ok": True, **out}
+
+    def _op_ca_public(self, msg: dict) -> dict:
+        """The SSH CA's public key, for the host steps. Public, so any allowed caller may ask."""
+        entry, refused = self._minter_entry(msg, "ca_public", ssh_ca.KIND, {"name": msg.get("name")})
+        if refused:
+            return refused
+        assert entry is not None
+        value, refused = self._stored("ca_public", {"name": entry.name}, entry.name)
+        if refused:
+            return refused
+        assert value is not None
+        try:
+            return {"ok": True, "public_key": ssh_ca.ca_public_key(value)}
+        except ssh_ca.MintError as e:
+            return _refuse(e.code, e.reason)
+
+    def _revoke_minted(self) -> tuple[int, int]:
+        """Revoke upstream every token minted for an elevated name; (revoked, failed). The cache forgets them."""
+        with self._lock:
+            mine = [m for m in self._minted if m.elevated]
+            self._minted = [m for m in self._minted if not m.elevated]
+            self._mint_cache = {k: v for k, v in self._mint_cache.items() if v[0] not in {m.token for m in mine}}
+        ok = failed = 0
+        for m in mine:
+            if m.expires <= self.clock():
+                continue
+            try:
+                done = github_app.revoke(m.options, m.token, self.allow_plain_http)
+            except github_app.MintError:
+                done = False
+            ok, failed = (ok + 1, failed) if done else (ok, failed + 1)
+            self.audit.write("revoke", "ok" if done else "failed", name=m.name, run=m.run)
+        return ok, failed
+
     def run_record(self, run_id: object, now: float | None = None) -> RunRecord:
         if self.records is None:
             raise RecordError("missing", "this broker has no run record folder")
@@ -954,6 +1131,8 @@ class Broker:
                 if done:
                     revoked += 1
                     self.audit.write("revoke", "ok", name=g.name, host=g.host, lease=g.id, run=g.run)
+        r_ok, r_failed = self._revoke_minted()
+        revoked, failed = revoked + r_ok, failed + r_failed
         self.audit.write("elevate", "off" if saved else "off_unsaved", uid=uid, pid=pid, bytes=dropped)
         return {
             "ok": True,
@@ -976,6 +1155,8 @@ class Broker:
     def _purge(self, now: float) -> None:
         for k in [k for k, g in self._grants.items() if g.expires <= now]:
             del self._grants[k]
+        self._minted = [m for m in self._minted if m.expires > now]
+        self._mint_cache = {k: v for k, v in self._mint_cache.items() if v[1] > now}
 
     # -- the proxy side
 
@@ -997,7 +1178,7 @@ class Broker:
             entry = wsecrets.load_registry(self.registry).get(g.name)
         except wsecrets.SecretsError as e:
             raise _HttpError(503, "store_unreadable") from e
-        if entry is None or g.host not in entry.hosts:
+        if entry is None or entry.kind != "header" or g.host not in entry.hosts:
             raise _HttpError(403, "host_not_allowed")
         if (g.elevated or entry.elevated) and not self.elevation_on():
             raise _HttpError(403, "elevation_off")

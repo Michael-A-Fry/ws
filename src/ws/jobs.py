@@ -74,6 +74,7 @@ from ws import adapters, paths
 from ws.secrets import HOST_RE, NAME_RE
 
 NAME = re.compile(r"^[A-Za-z0-9_-]+$")
+RESERVED = {"watch-deadman"}  # the name of the scheduler role's own dead-man unit, `ws-watch-deadman`
 DEFAULT_TIMEOUT_S = 900
 KEYS = {
     "runner",
@@ -498,6 +499,8 @@ def _scan(env: dict | None) -> tuple[dict[str, str], dict[str, str]]:
             continue
         try:
             check_private(path)
+            if path.stem in RESERVED:
+                raise JobError(f"{path}: the name {path.stem!r} is reserved for a unit ws writes itself")
             text = path.read_text(encoding="utf-8")
             d = tomllib.loads(text)
             if _command(d, str(path)):  # a schedule-only job: `ws run` refuses it, the timer needs a good schedule
@@ -559,6 +562,8 @@ def scheduled(env: dict | None = None) -> list[Scheduled]:
             raise JobError(f"{path}: {e}") from e
         if "schedule" not in d:
             continue
+        if path.stem in RESERVED:
+            raise JobError(f"{path}: the name {path.stem!r} is reserved for a unit ws writes itself")
         where = str(path)
         command = _command(d, where)
         if command is None:

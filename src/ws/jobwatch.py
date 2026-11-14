@@ -42,6 +42,9 @@ UNIT_RE = re.compile(r"^[A-Za-z0-9_.@:\\-]{1,200}$")
 GRACE = 2.0  # a job is overdue when its last run is older than this many expected gaps
 DROPIN = "10-ws-alert.conf"
 ALERT_UNIT = "ws-alert@%n.service"
+EXIT_OVERDUE = (
+    3  # `ws watch deadman` found a job overdue and alerted: the unit counts it a success (SuccessExitStatus=3)
+)
 
 
 def alerts_path(env=None) -> Path:
@@ -85,15 +88,15 @@ def _notify_cfg(env) -> dict | None:
     return cfg if isinstance(cfg, dict) and cfg.get("adapter") == ntfy.NAME else None
 
 
-def push(env, text: str, plain: str, sender=None) -> bool:
-    """One ntfy line through the notify role (`plain` when alert_text is "plain"). False when nothing could be sent:
-    never raises, because an alert must not fail a unit."""
+def push(env, text: str, plain: str, sender=None) -> bool | None:
+    """One ntfy line through the notify role (`plain` when alert_text is "plain"). True when sent, False when the send
+    failed, None when there is no notify role. Never raises, because an alert must not fail a unit."""
     try:
         from ws.roles import ntfy
 
         cfg = _notify_cfg(env)
         if cfg is None:
-            return False
+            return None
         ntfy.send(cfg, env, plain if cfg.get("alert_text") == "plain" else text, "ws job", "alert", None, sender)
         return True
     except Exception:  # noqa: BLE001  NotifyError and CapReached land here: the not-automatic line already says it
@@ -111,8 +114,8 @@ def alert_unit(
     result, code = status(unit)
     rec = {"event": "unit-failed", "job": job, "unit": unit, "result": result, "exit_status": code}
     sent = push(env, f"{job} failed: {unit} {result}, exit {code}", "a job failed", sender)
-    _write_line(env, {**rec, "pushed": sent})
-    return {**rec, "pushed": sent}
+    _write_line(env, {**rec, "pushed": sent is True})
+    return {**rec, "pushed": sent is True}
 
 
 # ---- the dead-man check ---------------------------------------------------------------------------------------------
@@ -141,8 +144,8 @@ def overdue(env, now: datetime) -> list[dict]:
     its file's modified time."""
     last, found = last_runs(env), []
     for s in jobs.scheduled(env):
-        if s.expected_rate_s is None:
-            continue
+        if s.expected_rate_s is None or s.argv[:1] != ("run",):
+            continue  # a job that runs a ws command leaves no run record under its name: nothing to measure
         since = last.get(s.name)
         if since is None:
             try:
@@ -175,12 +178,14 @@ def deadman(env=None, now: datetime | None = None, sender=None) -> list[dict]:
     nowtold = {}
     for m in misses:
         key = m["last_run"] or "never"
-        nowtold[m["job"]] = key
         if told.get(m["job"]) == key:
+            nowtold[m["job"]] = key
             continue  # already raised for this last run
         text = f"{m['job']} has not run in {m['hours_since']} h (limit {m['limit_hours']} h)"
         sent = push(env, text, "a job has not run", sender)
-        _write_line(env, {"event": "no-run", "job": m["job"], "hours_since": m["hours_since"], "pushed": sent})
+        _write_line(env, {"event": "no-run", "job": m["job"], "hours_since": m["hours_since"], "pushed": sent is True})
+        if sent is not False:  # a failed send is tried again at the next check; no role at all is not retried
+            nowtold[m["job"]] = key
     state = _state_path(env)
     state.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     state.write_text(
@@ -231,7 +236,7 @@ def cmd_deadman(args: argparse.Namespace) -> int:
         print(f"ws: {m['job']} has not run in {m['hours_since']} h (limit {m['limit_hours']} h)")
     if getattr(args, "json", False):
         output.result({"overdue": misses})
-    return 1 if misses else 0
+    return EXIT_OVERDUE if misses else 0
 
 
 def cmd_rotate(args: argparse.Namespace) -> int:

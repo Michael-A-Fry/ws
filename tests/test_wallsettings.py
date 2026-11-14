@@ -434,7 +434,7 @@ def class_rows_with(box, monkeypatch, tmp_path, capsys, edit=None):
 
 def test_ws014_reads_the_managed_settings_file_and_has_the_parts_it_had(box, monkeypatch, tmp_path, capsys):
     rows = class_rows_with(box, monkeypatch, tmp_path, capsys)
-    assert list(rows) == list(wallsettings.PARTS) and len(wallsettings.PARTS) == 10  # no part for the launch file
+    assert list(rows) == list(wallsettings.PARTS) and len(wallsettings.PARTS) == 8  # no part for the launch file
     assert all(r.status == "ok" for p, r in rows.items() if p != "OS user exists"), rows
     managed = Path(wallsettings.MANAGED_DIRS[0]) / wallsettings.class_file_name("work")
     assert str(managed) in rows["file present and root-owned"].detail
@@ -510,27 +510,15 @@ def dotted(doc, at=""):
             yield from dotted(v, f"{at}{k}.")
 
 
-def test_the_managed_settings_file_is_what_0_1_9_wrote_key_for_key_plus_the_write_block_and_the_token_deny(box):
-    """The machine-wide file a bare `claude` run as the class account is bound by: the keys 0.1.9 wrote, and (C360) the
-    write block and the token deny, which a bare run would otherwise not get from the launch copy."""
+def test_the_managed_settings_file_is_what_0_1_9_wrote_key_for_key(box):
+    """The machine-wide file a bare `claude` run as the class account is bound by: the same keys as before the launch file."""
     conf = rendered(two(box), "alpha")
     assert conf == {
-        "permissions": {"disableBypassPermissionsMode": "disable", "blockWritesOutsideWorkingDirectories": True},
+        "permissions": {"disableBypassPermissionsMode": "disable"},
         "sandbox": {
             "enabled": True,
             "failIfUnavailable": True,
             "allowUnsandboxedCommands": False,
-            "credentials": {
-                "envVars": [
-                    {"name": n, "mode": "deny"}
-                    for n in (
-                        "CLAUDE_CODE_OAUTH_TOKEN",
-                        "ANTHROPIC_OAUTH_TOKEN",
-                        "ANTHROPIC_API_KEY",
-                        "ANTHROPIC_AUTH_TOKEN",
-                    )
-                ]
-            },
             "filesystem": {
                 "allowWrite": [f"{box}/work/alpha", "/tmp"],
                 "denyRead": ["~/"],
@@ -568,8 +556,10 @@ def test_the_launch_file_holds_exactly_the_isolation_keys_and_no_managed_only_ke
     assert conf["disableRemoteControl"] is True and conf["disableClaudeAiConnectors"] is True  # G11
     assert conf["crossSessionInbound"] == "refuse" and conf["isolatePeerMachines"] is True
     assert conf["disableAllHooks"] is False  # a project's true would switch the gate hook off; this outranks it
-    assert set(conf["permissions"]) == {"deny", wallsettings.READ_BLOCK_KEY}
+    assert set(conf["permissions"]) == {"deny", wallsettings.READ_BLOCK_KEY, wallsettings.WRITE_BLOCK_KEY}
     assert conf["permissions"][wallsettings.READ_BLOCK_KEY] is True
+    assert conf["permissions"][wallsettings.WRITE_BLOCK_KEY] is True  # C360, in the launch file only
+    assert not wallsettings.tokens_missing(conf)
     deny = conf["permissions"]["deny"]
     assert {"SendMessage", "ListAgents"} <= set(deny)
     for tool in ("Read", "Edit"):  # the home, ws's own folders and the other class's repos, for both tools
@@ -582,6 +572,7 @@ def test_the_launch_file_holds_exactly_the_isolation_keys_and_no_managed_only_ke
     assert set(conf["sandbox"]) == {
         "filesystem",
         "network",
+        "credentials",  # C360: the token deny
         *wallsettings.WEAKER_KEYS,
     }  # no `enabled`, no write list: those are the managed file's; the two weaker-sandbox switches are off
     assert all(conf["sandbox"][k] is False for k in wallsettings.WEAKER_KEYS)

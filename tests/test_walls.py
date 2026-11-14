@@ -33,7 +33,7 @@ NAMES = [
     "owner-and-review-date",
     "messaging-denied",
     "class-file-root-owned",
-    "managed-write-block-and-token-deny",
+    "launch-write-block-and-token-deny",
     "remote-and-connectors-off",
     "headless-job-in-wall",
     "local-model-in-wall",
@@ -402,19 +402,19 @@ MUTATIONS = [
     ("messaging-denied", "ListAgents is allowed", lambda h: h.edit_file("alpha", without_rule("ListAgents"))),
     ("messaging-denied", "SendMessage is allowed", lambda h: h.edit_file("beta", without_rule("SendMessage"))),
     (
-        "managed-write-block-and-token-deny",
-        "the managed file stops blocking writes outside the working folders",
-        lambda h: h.edit_file("alpha", drop(("permissions", wallsettings.WRITE_BLOCK_KEY)), managed=True),
+        "launch-write-block-and-token-deny",
+        "the launch file stops blocking writes outside the working folders",
+        lambda h: h.edit_file("alpha", drop(("permissions", wallsettings.WRITE_BLOCK_KEY))),
     ),
     (
-        "managed-write-block-and-token-deny",
-        "the managed file stops denying one sign-in token",
-        lambda h: h.edit_file("beta", without_token("CLAUDE_CODE_OAUTH_TOKEN"), managed=True),
+        "launch-write-block-and-token-deny",
+        "the launch file stops denying one sign-in token",
+        lambda h: h.edit_file("beta", without_token("CLAUDE_CODE_OAUTH_TOKEN")),
     ),
     (
-        "managed-write-block-and-token-deny",
-        "the managed file has no credentials table",
-        lambda h: h.edit_file("alpha", drop(("sandbox", "credentials")), managed=True),
+        "launch-write-block-and-token-deny",
+        "the launch file has no credentials table",
+        lambda h: h.edit_file("alpha", drop(("sandbox", "credentials"))),
     ),
     (
         "remote-and-connectors-off",
@@ -433,8 +433,11 @@ MUTATIONS = [
     ),
     (
         "headless-job-in-wall",
-        "the generated settings stop blocking writes outside the working folders",
-        lambda h: h.edit_settings(drop(("permissions", wallsettings.WRITE_BLOCK_KEY))),
+        "neither the generated settings nor the launch file block writes outside the working folders",
+        lambda h: (
+            h.edit_settings(drop(("permissions", wallsettings.WRITE_BLOCK_KEY))),
+            h.edit_file("alpha", drop(("permissions", wallsettings.WRITE_BLOCK_KEY))),
+        ),
     ),
     (
         "headless-job-in-wall",
@@ -1145,16 +1148,19 @@ def test_a_local_opencode_session_in_a_class_gets_the_same_file_write_network_an
     assert "mcp__x__y" in claude_deny and oc["x_y"] == "deny"
 
 
-# ---- C360: the managed file holds the write block and the token deny -----------------------------------------------------
+# ---- C360: the launch file holds the write block and the token deny; the managed file is as 0.1.9 wrote it ------------------
 
 
-def test_the_class_managed_file_blocks_writes_and_denies_the_four_tokens():
+def test_the_launch_file_blocks_writes_and_denies_the_four_tokens_and_the_managed_file_has_neither():
     pol = policy.loads(POLICY.format(box="/b"))
     cls = pol.classes["alpha"]
-    doc = wallsettings.class_settings(cls, wallsettings.class_home(cls, "linux"), "linux")
+    home = wallsettings.class_home(cls, "linux")
+    doc = wallsettings.launch_settings(cls, home, "linux", pol)
     assert doc["permissions"][wallsettings.WRITE_BLOCK_KEY] is True
     names = [e["name"] for e in doc["sandbox"]["credentials"]["envVars"] if e["mode"] == "deny"]
     assert names == list(wallsettings.TOKEN_VARS) == list(claude_code.TOKEN_VARS) and len(names) == 4
+    managed = wallsettings.class_settings(cls, home, "linux")  # binds every account: none of the two
+    assert wallsettings.WRITE_BLOCK_KEY not in managed["permissions"] and "credentials" not in managed["sandbox"]
 
 
 @pytest.mark.parametrize(
@@ -1164,26 +1170,10 @@ def test_the_class_managed_file_blocks_writes_and_denies_the_four_tokens():
 )
 def test_a_planted_class_file_missing_the_write_block_or_a_token_deny_fails_walls_check(host, capsys, change):
     assert run(capsys, "check")[0] == 0
-    host.edit_file("alpha", change, managed=True)
+    host.edit_file("alpha", change)
     code, out, err = run(capsys, "check")
-    assert code == 1 and "managed-write-block-and-token-deny" in err
-    assert "fail  managed-write-block-and-token-deny" in out
-
-
-def test_ws014_has_a_failing_row_for_a_managed_file_without_the_write_block_or_the_token_deny(host):
-    pol = policy.load(policy_file())
-
-    def rows() -> dict:
-        return {(r.cls, r.part): r for r in wallsettings.class_rows(pol, dict(os.environ), kind())}
-
-    before = rows()
-    assert before[("alpha", "writes outside blocked")].status == before[("alpha", "tokens denied")].status == "ok"
-    host.edit_file("alpha", drop(("permissions", wallsettings.WRITE_BLOCK_KEY)), managed=True)
-    host.edit_file("alpha", without_token("ANTHROPIC_AUTH_TOKEN"), managed=True)
-    after = rows()
-    assert after[("alpha", "writes outside blocked")].status == "fail"
-    assert after[("alpha", "tokens denied")].status == "fail"
-    assert "ANTHROPIC_AUTH_TOKEN" in after[("alpha", "tokens denied")].detail
+    assert code == 1 and "launch-write-block-and-token-deny" in err
+    assert "fail  launch-write-block-and-token-deny" in out
 
 
 # ---- `ws walls canary`: every case on a planted world ---------------------------------------------------------------------
@@ -1241,8 +1231,9 @@ CANARY_MUTATIONS = [
     ("class-push-refused", "launch_settings", ("sandbox", "network", "strictAllowlist")),
     ("otel-off", "launch_settings", ("env",)),
     ("remote-and-connectors-off", "launch_settings", (wallsettings.CONNECTORS_KEY,)),
-    ("managed-write-block-and-token-deny", "class_settings", ("permissions", wallsettings.WRITE_BLOCK_KEY)),
-    ("managed-write-block-and-token-deny", "class_settings", ("sandbox", "credentials")),
+    ("launch-write-block-and-token-deny", "launch_settings", ("permissions", wallsettings.WRITE_BLOCK_KEY)),
+    ("launch-write-block-and-token-deny", "launch_settings", ("sandbox", "credentials")),
+    ("local-model-in-wall", "launch_settings", (wallsettings.REMOTE_KEY,)),
     ("headless-job-in-wall", "class_settings", ("sandbox", "filesystem", "allowWrite")),
     ("hooks-under-bypass", "class_settings", ("permissions", wallsettings.BYPASS_KEY)),
 ]

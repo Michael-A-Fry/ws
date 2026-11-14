@@ -9,15 +9,16 @@ It reads files; it proves nothing about the host. A settings source ws cannot se
 held outside the files below) can still widen the wall, and WS012 says only what it can read.
 
 A class with an `os_user` (see ws.policy.Class) has two files (ADR 0027). The managed-settings file is the one 0.1.9
-wrote, with two keys added in 0.1.10: a drop-in in the managed-settings folder that Claude Code reads for every account on the machine, so a bare
+wrote, unchanged: a drop-in in the managed-settings folder that Claude Code reads for every account on the machine, so a bare
 `claude` run as the class account is bound by it. It holds the sandbox required, no unsandboxed retry, bypass off, writes in
-the class's repos and scratch only, the home folder unreadable except those repos, file-tool writes outside the working folders blocked, the sign-in
-tokens denied to shell commands, inbound lead-only, and the network shut
+the class's repos and scratch only, the home folder unreadable except those repos, inbound lead-only, and the network shut
 but for the class's own hosts (`network.allowedDomains` with `allowManagedDomainsOnly`). The launch file is new: one per class,
 root-owned, in a `ws-classes` folder beside the managed-settings folder, which Claude Code does not read. `ws gate launch`
 reads it and merges it into the launch copy it passes with `--settings` (`merge`, `load_launch_file`), the launch keys
 winning, so a session of another class or of none never gets it. It holds `Read` and `Edit` denied for the sealed paths,
-file reads held to the working folders (`permissions.blockReadsOutsideWorkingDirectories`), cross-session messaging refused
+file reads and file-tool writes held to the working folders (`permissions.blockReadsOutsideWorkingDirectories` and
+its write twin), the sign-in tokens kept from shell commands (`sandbox.credentials`), Remote Control and the claude.ai
+connectors off, cross-session messaging refused
 (`crossSessionInbound`, a `SendMessage` and `ListAgents` deny, `isolatePeerMachines`), `disableAllHooks` false, the other
 classes' repos unreadable, the class's hosts under `strictAllowlist`, the class marker and the OpenTelemetry content logs
 off. Keys Claude Code reads only from managed settings (`MANAGED_ONLY`) are in neither file: from a `--settings` file they
@@ -73,7 +74,7 @@ UNATTENDED_KEY = "denyInsteadOfPrompting"
 # no version for `deny`; 2.1.221 is the earliest it names, and the key is in every binary from 2.1.308 on.
 CREDENTIALS_KEY = "sandbox.credentials"
 # The runner's sign-in tokens and API keys that `sandbox.credentials.envVars` denies to every sandboxed command (the launch
-# settings, and each class's managed file, which must not lean on the launch copy for them).
+# settings, and each class's launch file, so a class session has them whatever the generated settings say).
 TOKEN_VARS = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
 # The settings keys the wall writes that only newer Claude Code versions read: dotted key -> first version that does.
 # The one table `ws doctor` WS016 and the e2e skip read; a version is parsed as doctor._version_tuple parses it.
@@ -414,8 +415,6 @@ PARTS = (
     "bypass off",
     "write limits",
     "home deny-read",
-    "writes outside blocked",
-    "tokens denied",
     "inbound lead-only",
 )
 # The parts read from the file's content (the last, inbound, is judged with the policy too: `_inbound_row`).
@@ -655,14 +654,11 @@ def class_settings(cls: policy.Class, home: str, kind: str) -> dict:
             2,
         )
     return {
-        # the write block and the token deny are here as well as in the launch copy: a bare `claude` run as the class
-        # account gets no launch copy, and this file is all that binds it
-        "permissions": {BYPASS_KEY: BYPASS_OFF, WRITE_BLOCK_KEY: True},
+        "permissions": {BYPASS_KEY: BYPASS_OFF},
         "sandbox": {
             "enabled": True,
             "failIfUnavailable": True,
             "allowUnsandboxedCommands": False,
-            "credentials": {"envVars": [{"name": n, "mode": "deny"} for n in TOKEN_VARS]},
             "filesystem": {
                 "allowWrite": [*roots, *scratch_dirs(kind)],
                 "denyRead": ["~/"],
@@ -700,8 +696,10 @@ def launch_settings(
 
     sealed = sealed_paths(cls, home, kind, pol, env)
     return {
+        # the write block and the token deny are here, not in the managed file, which binds every account on the machine
         "permissions": {
             READ_BLOCK_KEY: True,
+            WRITE_BLOCK_KEY: True,
             "deny": [*MESSAGING_DENY, *(f"{tool}({s})" for tool in ("Read", "Edit") for s in sealed)],
         },
         CROSS_KEY: CROSS_VALUE,
@@ -712,6 +710,7 @@ def launch_settings(
         "sandbox": {
             # the two switches that weaken the sandbox for a container or a MITM proxy: off, and a project may not set them
             **dict.fromkeys(WEAKER_KEYS, False),
+            "credentials": {"envVars": [{"name": n, "mode": "deny"} for n in TOKEN_VARS]},
             "filesystem": {"denyRead": _other_roots(cls, home, kind, pol)},
             # Default-deny network: the class's hosts and its providers' (ws.sandbox.class_domains); `strictAllowlist`
             # refuses any other host instead of asking. An egress exception is not in the file: it expires, the file does not.
@@ -1499,18 +1498,6 @@ def _content_rows(name: str, doc: Mapping, want: Mapping, again: str) -> list[Ro
             "denyRead does not hide the home folder (~/)"
             if not hidden
             else f"allowRead re-opens more than the class's repos: {', '.join(extra_r)}",
-        ),
-        row(
-            PARTS[7],
-            perms.get(WRITE_BLOCK_KEY) is True,
-            "Write, Edit and NotebookEdit refuse a path outside the working folders",
-            f"the file does not set permissions.{WRITE_BLOCK_KEY} to true",
-        ),
-        row(
-            PARTS[8],
-            not tokens_missing(doc),
-            "the sign-in tokens are kept from every sandboxed command",
-            f"sandbox.credentials.envVars does not deny {', '.join(tokens_missing(doc))}",
         ),
     ]
 

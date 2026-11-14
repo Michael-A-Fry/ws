@@ -890,10 +890,9 @@ are printed, and the host cases are skipped) or when a case fails. With `--json`
 ws walls check [-h]
 ```
 
-The check also asks that the managed-settings file blocks file-tool writes outside the working folders and denies the
-four sign-in token variables to shell commands, that the launch file switches off Remote Control and the claude.ai
-connectors, that a headless job's settings keep its writes in the class, and that a `local_only` class takes only a
-model on this machine.
+The check also asks that the launch file blocks file-tool writes outside the working folders, denies the four sign-in
+token variables to shell commands and switches off Remote Control and the claude.ai connectors, that a headless job's
+settings keep its writes in the class, and that a `local_only` class takes only a model on this machine.
 
 ### `ws walls canary`
 

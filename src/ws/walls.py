@@ -934,20 +934,19 @@ def _case_tracer(ctx: Ctx) -> Outcome:
     )
 
 
-def _case_managed_blocks(ctx: Ctx) -> Outcome:
-    """C360: the managed-settings file itself blocks file-tool writes outside the working folders and keeps the sign-in
-    tokens from shell commands. A bare `claude` run as the class account gets no launch copy, so the launch copy's keys
-    are not enough."""
+def _case_launch_blocks(ctx: Ctx) -> Outcome:
+    """C360: the class's own launch file blocks file-tool writes outside the working folders and keeps the sign-in tokens
+    from shell commands, so a class session has both whatever the generated settings say. They are not in the managed
+    file, which binds every account on the machine."""
 
     def test(cls: policy.Class, doc: dict) -> str | None:
-        managed = ctx.managed.get(cls.name) or {}
         lacks = []
-        if _perms(managed).get(wallsettings.WRITE_BLOCK_KEY) is not True:
+        if _perms(doc).get(wallsettings.WRITE_BLOCK_KEY) is not True:
             lacks.append(f"permissions.{wallsettings.WRITE_BLOCK_KEY} true")
-        missing = wallsettings.tokens_missing(managed)
+        missing = wallsettings.tokens_missing(doc)
         if missing:
             lacks.append(f"sandbox.credentials.envVars deny of {', '.join(missing)}")
-        return f"the managed-settings file does not set {'; '.join(lacks)}" if lacks else None
+        return f"the launch file does not set {'; '.join(lacks)}" if lacks else None
 
     return _each(ctx, test)
 
@@ -996,6 +995,17 @@ def _case_headless(ctx: Ctx) -> Outcome:
     return _each(ctx, test)
 
 
+# The top-level values every class's launch file holds, a local model's class too (a fixed list, not the file ws renders,
+# so a key the renderer drops is a failure here).
+LAUNCH_WALL = {
+    wallsettings.CROSS_KEY: wallsettings.CROSS_VALUE,
+    wallsettings.PEER_KEY: True,
+    wallsettings.HOOKS_KEY: False,
+    wallsettings.REMOTE_KEY: True,
+    wallsettings.CONNECTORS_KEY: True,
+}
+
+
 def _case_local_model(ctx: Ctx) -> Outcome:
     """rr-M3, run as a local-model session: a `local_only` class takes a model on this machine and refuses a hosted
     one, and the local session gets the same wall as a Claude session of the class: its launch file has the same keys,
@@ -1012,8 +1022,13 @@ def _case_local_model(ctx: Ctx) -> Outcome:
         if sandbox.provider_problem(cls, "anthropic") is None:
             bad.append(f"{cls.name}: a hosted provider is allowed for a local_only class")
         doc = ctx.docs.get(cls.name) or {}
-        want = wallsettings.launch_settings(cls, wallsettings.class_home(cls, ctx.kind), ctx.kind, ctx.pol, ctx.env)
-        lacks = sorted(set(want) - set(doc))
+        lacks = [k for k, v in LAUNCH_WALL.items() if doc.get(k) != v]
+        lacks += [
+            f"permissions.{k}"
+            for k in (wallsettings.READ_BLOCK_KEY, wallsettings.WRITE_BLOCK_KEY)
+            if _perms(doc).get(k) is not True
+        ]
+        lacks += [f"deny {t}" for t in wallsettings.MESSAGING_DENY if t not in _deny(doc)]
         if lacks:
             bad.append(f"{cls.name}: the launch file lacks {', '.join(lacks)}")
         far = [
@@ -1054,9 +1069,9 @@ CASES: list[Case] = [
     Case("messaging-denied", _case_messaging, "permissions.deny SendMessage and ListAgents"),
     Case("class-file-root-owned", _case_file_safe, "the class file's owner and mode"),
     Case(
-        "managed-write-block-and-token-deny",
-        _case_managed_blocks,
-        "permissions.blockWritesOutsideWorkingDirectories and sandbox.credentials.envVars in the managed-settings file",
+        "launch-write-block-and-token-deny",
+        _case_launch_blocks,
+        "permissions.blockWritesOutsideWorkingDirectories and sandbox.credentials.envVars in the launch file",
     ),
     Case(
         "remote-and-connectors-off",
@@ -1239,7 +1254,7 @@ COVERS: dict[str, str] = {
     "G11 Remote Control and connectors off": "remote-and-connectors-off",
     "G14 OpenTelemetry content off": "otel-off",
     "G16 owner and review date": "owner-and-review-date",
-    "C360 the managed file's write block and token deny": "managed-write-block-and-token-deny",
+    "C360 the launch file's write block and token deny": "launch-write-block-and-token-deny",
     "rr-M3 a local-model session": "local-model-in-wall",
     "a session outside the area reads or edits nothing sealed": "sealed-read-refused",
 }

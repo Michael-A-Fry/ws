@@ -17,17 +17,16 @@ body of the GitHub release.
   prompt that finds nothing ("continue") is tried again for up to three prompts. `--runner` is accepted and ignored.
 - `ws walls canary` runs the walls cases on a planted world, so it exits 0 on a machine with no class set up and fails
   when a setting the wall writes is missing. It lists the items its cases cover.
-- `ws walls check` has four more cases: the managed file's write block and token deny, Remote Control and connectors
+- `ws walls check` has four more cases: the launch file's write block and token deny, Remote Control and connectors
   off, a headless job's writes held in the class, and a `local_only` class held to a local model.
 - `ws doctor` warns (WS020) when the policy names no data class. The guards reference says which guards are off by
   default and why.
 
 ### Changed
 
-- A walled class's managed-settings file now also blocks file-tool writes outside the working folders and denies the
-  four sign-in token variables to shell commands, so a bare `claude` run as the class account gets both. WS014 has a
-  row for each. Print the file again with `ws install --class NAME` and put it in place.
-- A walled class's launch file sets `disableRemoteControl` and `disableClaudeAiConnectors`.
+- A walled class's launch file also blocks file-tool writes outside the working folders, denies the four sign-in token
+  variables to shell commands, and sets `disableRemoteControl` and `disableClaudeAiConnectors`. The managed-settings
+  file is unchanged. Print the launch file again with `ws install --class NAME` and put it in place.
 - A push alert from a session in a walled or counts-only class is always the plain line ("a session needs you"), with
   no folder name and none of the runner's words, whatever `alert_text` says.
 

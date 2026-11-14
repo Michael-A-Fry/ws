@@ -103,9 +103,10 @@ It exits 1 when a case fails or the host isn't set up.
 `ws walls canary` runs the same cases on a world it plants, with files as ws renders them, so it needs no class set up:
 it shows that what ws writes holds, and `ws walls check` shows that your host holds it.
 
-A bare `claude` run as the class account gets no launch copy, so the class's managed-settings file carries its own write
-block (`permissions.blockWritesOutsideWorkingDirectories`) and its own token deny (`sandbox.credentials.envVars`). The
-launch file also switches off Remote Control and the claude.ai connectors for the class's sessions.
+Each class's launch file carries its own write block (`permissions.blockWritesOutsideWorkingDirectories`) and its own
+token deny (`sandbox.credentials.envVars`), so a class session has both whatever the generated settings say, and it
+switches off Remote Control and the claude.ai connectors. None of these is in the managed-settings file, which Claude
+Code applies to every account on the machine: they'd bind your own sessions too.
 Set-up is [yours to run](../how-to/set-up-a-class-user.md): ws prints the commands and the way out, and runs none of them.
 
 The wall fails closed. With no bubblewrap, or with unprivileged user namespaces switched off, `ws gate launch` refuses and

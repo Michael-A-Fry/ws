@@ -118,10 +118,10 @@ NAME = "claude-code"
 FILE = "settings.json"
 # Claude Code's write twin of wallsettings.READ_BLOCK_KEY (settings reference, 2.1.314): Write, Edit and NotebookEdit
 # refuse a path outside the working folders in every permission mode. It doesn't cover shell commands, MCP or hooks.
-WRITE_BLOCK_KEY = "blockWritesOutsideWorkingDirectories"
+WRITE_BLOCK_KEY = wallsettings.WRITE_BLOCK_KEY
 # Deny a tool call that would wait on a permission prompt (2.1.319; user, managed or --settings scope only): set for a
 # headless job (`unattended`), where no one is there to answer.
-UNATTENDED_KEY = "denyInsteadOfPrompting"
+UNATTENDED_KEY = wallsettings.UNATTENDED_KEY
 # The runner's sign-in tokens. `sandbox.credentials.envVars` with mode "deny" takes them out of every sandboxed
 # command's environment, so a shell command can't send them anywhere; Claude Code itself keeps them.
 SIGN_IN_TOKENS = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_OAUTH_TOKEN")

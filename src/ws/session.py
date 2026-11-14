@@ -182,6 +182,10 @@ def _write(path: Path, record: dict) -> None:
         raise
 
 
+def _ids(v) -> tuple[str, ...]:
+    return tuple(x for x in v if isinstance(x, str) and len(x) <= 128)[:50] if isinstance(v, list) else ()
+
+
 def _prune(folder: Path) -> None:
     """Drop records not touched for 30 days (a session that old is long gone). A guard's own record for a session
     (`<id>.<name>.json`, see ws.guards) goes with it."""
@@ -442,6 +446,8 @@ class Record:
     schema: int = 1
     runner_pid: int | None = None  # the runner process `start` stamped (with runner_start); None on an older record
     runner_start: str | None = None
+    context_loaded: bool = False  # `ws session load` has done the first-prompt load for this start
+    context_ids: tuple[str, ...] = ()  # the ids of the records that load put in front of the session
 
     @classmethod
     def from_dict(cls, data: dict, session_id: str = "") -> Record:
@@ -473,6 +479,8 @@ class Record:
             schema=schema if isinstance(schema, int) and not isinstance(schema, bool) else 1,
             runner_pid=pid if stamped else None,
             runner_start=began if stamped else None,
+            context_loaded=data.get("context_loaded") is True,
+            context_ids=_ids(data.get("context_ids")),
         )
 
     def to_dict(self) -> dict:
@@ -496,6 +504,10 @@ class Record:
             out["nudged"] = True
         if self.runner_pid is not None and self.runner_start is not None:
             out["runner_pid"], out["runner_start"] = self.runner_pid, self.runner_start
+        if self.context_loaded:
+            out["context_loaded"] = True
+        if self.context_ids:
+            out["context_ids"] = list(self.context_ids)
         return out
 
 
@@ -784,6 +796,50 @@ def cmd_start(args: argparse.Namespace) -> int:
     return 0
 
 
+def _payload(args: argparse.Namespace) -> dict:
+    """The hook JSON on stdin (session id, cwd and the prompt text), or {} when there is none. Only `session_id`, `cwd`
+    and `prompt` are read."""
+    if sys.stdin.isatty():
+        return {}
+    data = json.loads(sys.stdin.read() or "{}")
+    return data if isinstance(data, dict) else {}
+
+
+def cmd_load(args: argparse.Namespace) -> int:
+    """Hook entry: print what the session should know (see ws.context_load). Never fails the host tool."""
+    try:
+        with paths.pinned_by(args.pin):
+            data = _payload(args)
+            sid = args.session_id or data.get("session_id")
+            cwd = data.get("cwd") if isinstance(data.get("cwd"), str) else os.getcwd()
+            env = paths.merged_environ()
+            from ws import context_load
+
+            if args.event == "start":
+                out = context_load.at_start(cwd, env)
+            else:
+                if not isinstance(sid, str) or not sid:
+                    return 0
+                path = _record_path(env, sid)
+                with _locked(path.parent):
+                    rec = _read(path)
+                    if rec is None or rec.get("context_loaded"):
+                        return 0  # no record yet, or the first prompt has been served
+                    prompt = args.message if args.message is not None else data.get("prompt")
+                    out = context_load.at_prompt(prompt if isinstance(prompt, str) else "", cwd, env)
+                    mark = {**rec, "context_loaded": True, "rev": _rev(rec) + 1, "ts": jsonl.iso_utc(_now())}
+                    if out.ids:
+                        mark["context_ids"] = out.ids
+                    _write(path, mark)
+            if out.text:
+                print(out.text)
+    except WsError as e:
+        _skipped(e)
+    except Exception:  # noqa: BLE001 - advice, not a gate: never fail the host tool
+        return 0
+    return 0
+
+
 def cmd_prepare(args: argparse.Namespace) -> int:
     token = prepare_launch(args.role)
     if args.json:
@@ -844,6 +900,17 @@ def register(sub) -> None:
         p.add_argument("--runner", default="unknown", help="which runner is calling (recorded)")
         paths.add_pin_option(p)
         p.set_defaults(func=fn, raw=True)  # hook entries: the runner reads their stdout
+    p = ss.add_parser(
+        "load", help="hook entry: print standing preferences, the area card and the records a search finds"
+    )
+    p.add_argument(
+        "--event", choices=("start", "prompt"), required=True, help="start: SessionStart; prompt: the first prompt"
+    )
+    p.add_argument("--message", help="the first prompt (default: prompt in the hook JSON)")
+    p.add_argument("--session-id", metavar="ID", help="the session id (default: session_id in the hook JSON)")
+    p.add_argument("--runner", default="unknown", help="which runner is calling")
+    paths.add_pin_option(p)
+    p.set_defaults(func=cmd_load, raw=True)
     p = ss.add_parser("prepare", help="launcher: print WS_LAUNCH=<token>, a one-use token that gives a session a role")
     p.add_argument("--role", required=True, choices=ROLES, help="the role the session will have")
     p.set_defaults(func=cmd_prepare)

@@ -196,16 +196,20 @@ GLOBALS = {
 
 
 def session_hooks(ws_cmd: list[str], pin: paths.Pin) -> dict:
-    """SessionStart records the release; UserPromptSubmit prints the one-line nudge (its stdout reaches the model).
+    """SessionStart records the release and loads the standing context; UserPromptSubmit prints the one-line nudge and,
+    on the first prompt, the records a search finds (stdout of both reaches the model).
     `|| true`: this is advice, and an exit 2 from UserPromptSubmit would block the user's prompt."""
     base = shlex.join(ws_cmd)
     where = shlex.join(pin.args())
 
-    def hook(sub: str) -> list[dict]:
-        cmd = f"{base} session {sub} --runner {NAME} {where} || true"
-        return [{"hooks": [{"type": "command", "command": cmd, "timeout": 5}]}]
+    def hook(*subs: str) -> list[dict]:
+        cmds = [f"{base} session {sub} --runner {NAME} {where} || true" for sub in subs]
+        return [{"hooks": [{"type": "command", "command": c, "timeout": 5} for c in cmds]}]
 
-    return {"SessionStart": hook("start"), "UserPromptSubmit": hook("nudge")}
+    return {
+        "SessionStart": hook("start", "load --event start"),
+        "UserPromptSubmit": hook("nudge", "load --event prompt"),
+    }
 
 
 def alert_hook(ws_cmd: list[str], pin: paths.Pin) -> dict:

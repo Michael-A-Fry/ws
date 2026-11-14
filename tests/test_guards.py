@@ -1062,7 +1062,10 @@ def test_with_no_guards_the_hooks_are_the_old_ones():
         "Stop",
     }  # the last two: phone alerts
     assert hooks["PreToolUse"][0]["matcher"] == claude_code.MATCHER
-    assert commands(hooks["SessionStart"]) == [f"ws session start --runner claude-code {pins()} || true"]
+    assert commands(hooks["SessionStart"]) == [
+        f"ws session start --runner claude-code {pins()} || true",
+        f"ws session load --event start --runner claude-code {pins()} || true",
+    ]
     assert generate(pol())["env"] == {"WS_GATED_SESSION": "1", "WS_SANDBOXED": "1"}
 
 
@@ -1073,6 +1076,7 @@ def test_the_default_policy_adds_post_tool_use_and_session_start_events():
     assert commands(hooks["PostToolUse"]) == [event]  # no `|| exit`: exit 2 here is a message to the model
     assert commands(hooks["SessionStart"]) == [
         f"ws session start --runner claude-code {pins()} || true",
+        f"ws session load --event start --runner claude-code {pins()} || true",
         event + " || true",
     ]
     assert hooks["PostToolUse"][0]["hooks"][0]["timeout"] > 10  # the checkers get 10 seconds
@@ -1090,7 +1094,7 @@ def test_each_event_gets_a_hook_only_when_a_guard_runs_there(monkeypatch):
     assert hooks["PreToolUse"][0]["matcher"] == claude_code.MATCHER == "*"  # every tool already: no kind adds to it
     assert "gate event" in commands(hooks["SubagentStop"])[0]
     assert [("gate event" in c) for c in commands(hooks["Stop"])] == [True, False]  # then the phone alert
-    assert [("gate event" in c) for c in commands(hooks["UserPromptSubmit"])] == [False, True]
+    assert [("gate event" in c) for c in commands(hooks["UserPromptSubmit"])] == [False, False, True]
 
 
 def test_the_pre_tool_use_matcher_is_every_tool_whatever_a_guard_reads(monkeypatch):

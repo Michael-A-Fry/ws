@@ -198,12 +198,13 @@ class Job:
 @dataclass(frozen=True)
 class Scheduled:
     """A job file with a schedule: `argv` is what follows `ws` on the command line. `timeout_s` is the runtime limit
-    the unit enforces, `expected_rate_s` the gap the dead-man check expects (None when the file gives none)."""
+    the unit enforces (None when the file gives none: the unit then has no limit, as before), `expected_rate_s` the gap
+    the dead-man check will expect (None when the file gives none; nothing reads it yet)."""
 
     name: str
     when: When
     argv: tuple[str, ...]
-    timeout_s: float = DEFAULT_TIMEOUT_S
+    timeout_s: float | None = None
     expected_rate_s: float | None = None
     log: str = "file"
 
@@ -275,6 +276,10 @@ def contract_problems(d: dict, where: str) -> list[str]:
             out.append(f"{where}: {key} must be a non-empty string")
     if "data_class" in d and isinstance(d["data_class"], str) and not NAME.match(d["data_class"]):
         out.append(f"{where}: data_class must be a plain name (letters, digits, - and _)")
+    if "timeout_s" in d and not (
+        isinstance(d["timeout_s"], (int, float)) and not isinstance(d["timeout_s"], bool) and d["timeout_s"] > 0
+    ):
+        out.append(f"{where}: timeout_s must be a number above 0")
     if "expected_rate" in d:
         try:
             parse_rate(str(d["expected_rate"]) if isinstance(d["expected_rate"], str) else "", where)
@@ -506,6 +511,21 @@ def problems(env: dict | None = None) -> dict[str, str]:
     return bad
 
 
+def _contract_values(d: dict, where: str) -> tuple[float | None, float | None]:
+    """(timeout_s, expected_rate in seconds) for the timer. A value that does not parse is the contract check's business
+    (`problems`), not a reason to stop every timer: it is None, as if the file did not give it."""
+    try:
+        timeout = _number(d, "timeout_s", where, None)
+    except JobError:
+        timeout = None
+    try:
+        rate = d.get("expected_rate")
+        rate_s = parse_rate(rate, f"{where}: expected_rate") if isinstance(rate, str) else None
+    except JobError:
+        rate_s = None
+    return timeout, rate_s
+
+
 def scheduled(env: dict | None = None) -> list[Scheduled]:
     """Every job file with a `schedule`, checked the way `ws run` checks it. A missing jobs folder is no jobs; a bad
     file raises JobError (a timer must never run what `ws run` would refuse)."""
@@ -530,14 +550,14 @@ def scheduled(env: dict | None = None) -> list[Scheduled]:
         if command is None:
             loads(path.stem, text, folder, where)  # a runner job must be valid before it gets a timer
         when = parse_schedule(_string(d, "schedule", where) or "", f"{where}: schedule")
-        rate = d.get("expected_rate")
+        timeout_s, rate_s = _contract_values(d, where)
         out.append(
             Scheduled(
                 path.stem,
                 when,
                 command or ("run", path.stem),
-                timeout_s=_number(d, "timeout_s", where, DEFAULT_TIMEOUT_S),
-                expected_rate_s=parse_rate(rate, f"{where}: expected_rate") if isinstance(rate, str) else None,
+                timeout_s=timeout_s,
+                expected_rate_s=rate_s,
                 log=d.get("log") if d.get("log") in LOG_KINDS else "file",
             )
         )

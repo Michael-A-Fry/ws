@@ -2,7 +2,7 @@
 
 `ws run` calls `rotate` when a scheduled run ends. A file over the cap becomes `<name>.log.1` (older ones shift up, the
 oldest goes), with DEBUG and TRACE lines dropped on the way: the floor is INFO, so a chatty job cannot fill the disk
-with what nobody reads. The newest run's log is always whole.
+with what nobody reads. The archives keep INFO and above; the live file is whole until the next rotation.
 
 Swap note: this is a plain rename chain; logrotate or journald limits can replace it, and the unit's `log = "journal"`
 already does.

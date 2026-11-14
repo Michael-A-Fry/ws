@@ -940,6 +940,14 @@ class Scoped:
     def raw_log(self) -> str:
         return self.log.read_text() if self.log.exists() else ""
 
+    def wait_for(self, status: str, within: float = 5.0) -> bool:
+        end = time.monotonic() + within
+        while time.monotonic() < end:
+            if any(a["status"] == status for a in self.audit()):
+                return True
+            time.sleep(0.02)
+        return False
+
 
 @pytest.fixture
 def scoped(base, stub):
@@ -1040,7 +1048,7 @@ def test_run_record_the_lease_ends_with_the_run(scoped):
     assert scoped.get(lease) == 200
     assert broker.remove_run_record(scoped.s.records, "r1") is True
     assert scoped.get(lease) == 403
-    assert scoped.audit()[-1]["status"] == "run_ended"
+    assert scoped.wait_for("run_ended"), "the proxy writes its line after the reply, so wait for it"
     scoped.s.record("r2", "home", "worker", ["work"], expires_at=time.time() + 30)
     lease2 = scoped.lease("work", run="r2")
     assert datetime_from(lease2.expires_at) <= time.time() + 31, "a lease never outlives its run"

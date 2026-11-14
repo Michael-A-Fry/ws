@@ -41,43 +41,30 @@ def test_a_double_tick_runs_once(env):
     assert ran == [1]
 
 
-def test_fences_rise_and_a_lost_holder_does_not_unlock_the_new_one(env):
-    a = joblock.acquire("j", env)
-    old = os.stat(a.path).st_mtime - 1000
-    os.utime(a.path, (old, old))  # a stopped beating
+def test_fences_rise_and_a_clean_release_leaves_no_died_record(env):
     died = []
-    b = joblock.acquire("j", env, on_died=lambda n, o: died.append((n, o)))
-    assert b.fence == a.fence + 1 and len(died) == 1 and died[0][1]["fence"] == a.fence
-    assert a.beat() is False and a.lost  # a sees it lost the lock
+    a = joblock.acquire("j", env, on_died=lambda *x: died.append(x))
     a.release()
-    assert b.path.exists()  # a's release left b's lock alone
+    b = joblock.acquire("j", env, on_died=lambda *x: died.append(x))
+    assert b.fence == a.fence + 1 and died == []
     b.release()
-    assert not b.path.exists()
 
 
-def test_a_killed_holder_is_taken_over_after_the_stale_limit_with_one_died_record(env):
-    h = joblock.acquire("j", env)  # never released: the process is "killed"
-    clock = [os.stat(h.path).st_mtime]
+def test_a_killed_holder_is_taken_over_with_one_died_record(env):
+    h = joblock.acquire("j", env)  # the lock file says "running"
+    os.close(h.fd)  # the process dies: the kernel drops the flock, nothing is written
     died = []
-    with pytest.raises(joblock.Held):
-        joblock.acquire("j", env, now=lambda: clock[0] + joblock.STALE_S - 1)
-    clock[0] += joblock.STALE_S + 1
-    new = joblock.acquire("j", env, now=lambda: clock[0], on_died=lambda *a: died.append(a))
-    assert len(died) == 1
+    new = joblock.acquire("j", env, on_died=lambda *a: died.append(a))
+    assert len(died) == 1 and died[0][1]["fence"] == h.fence and new.fence == h.fence + 1
+    assert new.owns() and not h.owns()
     new.release()
+    joblock.acquire("j", env, on_died=lambda *a: died.append(a)).release()
+    assert len(died) == 1  # a clean end is not a death
 
 
 def test_a_bad_name_is_refused(env):
     with pytest.raises(ValueError):
         joblock.acquire("../x", env)
-
-
-def test_the_heartbeat_touches_the_lock(env):
-    lock = joblock.acquire("j", env)
-    old = os.stat(lock.path).st_mtime - 500
-    os.utime(lock.path, (old, old))
-    assert lock.beat() and os.stat(lock.path).st_mtime > old + 400
-    lock.release()
 
 
 def test_a_log_over_the_cap_rotates_and_keeps_three(tmp_path):
@@ -97,15 +84,16 @@ def test_the_info_floor_drops_debug_and_trace_lines_from_old_logs(tmp_path):
     assert (tmp_path / "j.log.1").read_bytes() == b"INFO start\nWARN odd\nplain line\n"
 
 
-def test_ws_run_skips_when_a_live_run_holds_the_job_and_records_a_died_run_for_a_stale_one(tmp_path, monkeypatch, capsys):
+def test_ws_run_skips_when_a_live_run_holds_the_job_and_records_a_died_run_for_a_dead_one(
+    tmp_path, monkeypatch, capsys
+):
     from ws import cli, runrecord
 
     monkeypatch.setenv("WS_HOME", str(tmp_path / "ws"))
     monkeypatch.setenv("HOME", str(tmp_path))
     held = joblock.acquire("stub", dict(os.environ))
     assert cli.main(["run", "stub"]) == 0 and "already running" in capsys.readouterr().err
-    old = os.stat(held.path).st_mtime - 10 * joblock.STALE_S
-    os.utime(held.path, (old, old))
+    os.close(held.fd)  # the holder dies: the kernel drops the lock
     cli.main(["run", "stub"])  # takes over; the job does not exist, so this run itself errors
     recs = runrecord.read(runrecord.runs_path(dict(os.environ)))
     assert [r["stop_reason"] for r in recs if r["stop_reason"] == "died"] == ["died"]

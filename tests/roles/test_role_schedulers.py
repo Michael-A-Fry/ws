@@ -541,15 +541,17 @@ def _sched(**kw):
     return jobs.Scheduled("daily", jobs.parse_schedule("daily 03:30", "t"), ("run", "daily"), **kw)
 
 
-def test_the_service_holds_the_failure_hook_the_timeout_and_the_slice(env):
+def test_the_service_holds_the_timeout_and_the_slice_and_names_no_unit_that_is_not_generated(env):
     svc = systemd.render(_sched(timeout_s=600), env, WS)["ws-daily.service"]
-    assert "OnFailure=ws-alert@%n.service" in svc and "TimeoutStartSec=630" in svc and "Slice=ws-jobs.slice" in svc
+    assert "TimeoutStartSec=630" in svc and "Slice=ws-jobs.slice" in svc
+    assert "OnFailure" not in svc  # the alert unit it would name is generated with the alert command
     assert f"StandardOutput=append:{_schedule.logs_dir(env) / 'daily.log'}" in svc
     assert "StandardOutput" not in systemd.render(_sched(log="journal"), env, WS)["ws-daily.service"]
 
 
-def test_a_command_job_with_no_timeout_still_gets_the_default_limit(env):
-    assert "TimeoutStartSec=930" in systemd.render(_sched(), env, WS)["ws-daily.service"]
+def test_a_job_file_with_no_timeout_keeps_the_no_limit_it_had(env):
+    """A oneshot has no start timeout; an upgrade must not give an existing job one (it would be killed at 15.5 min)."""
+    assert "TimeoutStartSec=infinity" in systemd.render(_sched(), env, WS)["ws-daily.service"]
 
 
 def test_every_unit_says_it_is_generated_and_keeps_the_marker_first(env):

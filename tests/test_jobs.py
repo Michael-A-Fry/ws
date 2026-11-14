@@ -283,3 +283,17 @@ def test_ws_config_exits_non_zero_on_a_bad_job_file(tmp_path, monkeypatch, capsy
     for k, v in env.items():
         monkeypatch.setenv(k, v)
     assert cli.main(["config"]) != 0
+
+
+def test_a_bad_contract_value_does_not_stop_the_timers(tmp_path):
+    """The check reports it; the timer falls back to "not given" for that file and every other job still schedules."""
+    env = _put(
+        tmp_path, "bad", {**CONTRACT, "timeout_s": '"soon"', "expected_rate": '"often"'}, body='command = "backup"\n'
+    )  # a runner job with a bad timeout_s is one `ws run` refuses, so it gets no timer; a command job is lenient
+    (jobs.jobs_dir(env) / "good.toml").write_text(
+        'command = "backup"\nschedule = "hourly"\ntimeout_s = 60\n', encoding="utf-8"
+    )
+    found = {s.name: s for s in jobs.scheduled(env)}
+    assert set(found) == {"bad", "good"} and found["bad"].timeout_s is None and found["bad"].expected_rate_s is None
+    assert found["good"].timeout_s == 60
+    assert "timeout_s" in jobs.problems(env)["bad"]

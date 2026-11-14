@@ -213,3 +213,9 @@ def test_write_outside_project_takes_the_write_block_out_of_what_is_checked():
     assert (
         f"permissions.{wallsettings.WRITE_BLOCK_KEY}" in on and f"permissions.{wallsettings.WRITE_BLOCK_KEY}" not in off
     )
+
+
+def test_a_launched_session_is_not_checked_for_the_no_prompt_key():
+    pol = policy.default_policy()
+    key = f"permissions.{wallsettings.UNATTENDED_KEY}"
+    assert key in wallsettings.keys_written(pol) and key not in wallsettings.keys_written(pol, jobs=False)

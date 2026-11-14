@@ -438,17 +438,19 @@ def class_users(pol: policy.Policy) -> list[policy.Class]:
     return [c for _, c in sorted(pol.classes.items()) if c.os_user]
 
 
-def keys_written(pol: policy.Policy) -> list[str]:
+def keys_written(pol: policy.Policy, jobs: bool = True) -> list[str]:
     """The keys of MIN_CLAUDE the wall writes under this policy: the read block unless `read_outside_project` is on (a
     launch file always has it), the write block unless `write_outside_project` is on, `allowRead` and the credentials
-    list with a sandbox (the launch settings' deny-home and token deny), the no-prompt key every headless job gets, and
+    list with a sandbox (the launch settings' deny-home and token deny), the no-prompt key every headless job gets
+    (`jobs` False, for a session ws launches at a terminal, leaves it out: that session never carries it), and
     `strictAllowlist` when the policy has data classes and a sandbox."""
     keys = []
     if not pol.gate.read_outside_project or class_users(pol):
         keys.append(f"permissions.{READ_BLOCK_KEY}")
     if not pol.gate.write_outside_project:
         keys.append(f"permissions.{WRITE_BLOCK_KEY}")
-    keys.append(f"permissions.{UNATTENDED_KEY}")
+    if jobs:
+        keys.append(f"permissions.{UNATTENDED_KEY}")
     if pol.gate.sandbox:
         keys += ["sandbox.filesystem.allowRead", CREDENTIALS_KEY]
     if pol.gate.sandbox and pol.classes:

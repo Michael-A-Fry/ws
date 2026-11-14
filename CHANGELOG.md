@@ -15,6 +15,10 @@ body of the GitHub release.
   and the core preferences; a record with an unknown, wrong-case or non-text `class`, or front matter ws can't fully
   read, is dropped. The scan runs before the registry lock, so a big folder can't stall other sessions' hooks. A first
   prompt that finds nothing ("continue") is tried again for up to three prompts. `--runner` is accepted and ignored.
+- The gate's decision log (`logs/gate.jsonl`, or a class's own copy) has a line for every call's check, an allowed one
+  included, with the tool's name. A refusal's line names the rule or layer that said no in `rule` (for example
+  `rule:command` or `guard:claims`), never the reason or the command. A tool no adapter reads is counted as a write
+  (`counted_as: "write"`).
 
 ## [0.1.10] - 2026-11-12
 

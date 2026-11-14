@@ -1475,7 +1475,9 @@ def _destroying_push_note(line: str) -> str:
             "`--force` does"
         )
     if ":" in words:
-        return ": a bare `:` pushes every branch the remote also has, so it counts as a destroying push, as `--force` does"
+        return (
+            ": a bare `:` pushes every branch the remote also has, so it counts as a destroying push, as `--force` does"
+        )
     if "--mirror" in words:
         return ": `--mirror` can delete or overwrite remote refs, so it counts as a destroying push, as `--force` does"
     if any(t.startswith("+") or ":+" in t or re.fullmatch(r"-[A-Za-z]*f[A-Za-z]*", t) for t in words):

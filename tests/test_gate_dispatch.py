@@ -229,13 +229,14 @@ def test_a_refusal_by_a_rule_is_logged_without_the_command(home):
     assert "id_rsa" not in text
 
 
-def test_a_plain_allow_with_no_guard_asked_writes_nothing(home):
+def test_a_plain_allow_with_no_guard_asked_writes_one_line_with_no_rule(home):
     policy_file = home / "wshome" / "policy.toml"
     policy_file.parent.mkdir(parents=True)
     policy_file.write_text("")
     argv = ["--runner", "claude-code", "--policy", str(policy_file), *pin_args()]
     assert gate.run_hook("check", argv, bash("ls"))[0] == 0
-    assert not (paths.state_dir() / "logs" / gate.VERDICT_LOG).exists()
+    (line,) = jsonl.read(paths.state_dir() / "logs" / gate.VERDICT_LOG)
+    assert line["decision"] == "allow" and line["guards"] == [] and "rule" not in line and "unlisted" not in line
 
 
 def test_a_log_that_cannot_be_written_never_changes_the_decision(home, monkeypatch):

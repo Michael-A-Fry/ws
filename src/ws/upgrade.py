@@ -3,6 +3,8 @@
     ws upgrade [--version TAG | --channel NAME]   run the installer, then rewrite the hooks with the new binary
     ws upgrade --hooks-only                       rewrite the hooks only (a newer ws is already installed)
     ws upgrade --dry-run                          say what would change and change nothing
+    ws upgrade --rollback [--version TAG]         put the previous release back (the one the last upgrade came from)
+    ws upgrade --check "COMMAND"                  after the swap, run COMMAND; a non-zero exit rolls the swap back
 
 Why one step. The hooks in a runner's config name the ws that runs them by path, so installing a newer ws also changes
 what every old hook runs. When the newer ws wants something the old hooks lack, the person is stuck: every call of every
@@ -28,6 +30,17 @@ A runner ws gated whose config it can't merge into now (a link, JSONC, a value o
 is, named with the reason and the way on, and the exit code is 1: the other runners are rewritten, and the person is
 never told "done" while a runner still has the old hooks.
 
+Promote and rollback. Every swap is a promote and is recorded in `<state>/upgrade-history.jsonl` (time, verb, from, to).
+`--rollback` reinstalls the release the last promote came from (or `--version`), and rewrites the hooks for it, so one
+command goes each way. Each step of a cut-over has its own watchdog: the installer, the hooks rewrite and the health
+check (`--check`, a command of the person's own: a page that must answer, a service that must be up) each get a time
+limit (`--install-timeout`, 600 seconds, and `--step-timeout`, 120), and a step that runs past it is stopped. A swap
+whose installer or hooks step times out, or whose health check fails or times out, is rolled back at once and recorded
+as `auto-rollback`; a swap whose installer simply fails changed nothing and is not rolled back.
+
+Swap note: the release is whatever the installer installs; to promote from somewhere else (a package manager, a release
+tree), pass `--installer` with your own script that takes `--version TAG`, and keep the history and the watchdog.
+
 It is refused inside a gated session, and fails towards refusing. `WS_GATED_SESSION` is left out of the user-scope
 settings so that `ws approve` works from the person's own Claude shell, so the other signs are read as well: the sandbox
 marker the user config sets in every session, the claim socket, and the variables a runner sets in its own sessions. A
@@ -37,20 +50,25 @@ run without a terminal on stdin is refused too (a session's shell has none), as 
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
 import urllib.request
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
-from ws import __version__, agentsession, approvals, install, output, selfcmd, userconfig
+from ws import __version__, agentsession, approvals, install, output, paths, selfcmd, userconfig
 from ws.output import WsError
 
 COMMAND = "upgrade"
 EXIT_FAILED, EXIT_REFUSED, EXIT_NOT_RESTORED = 1, 3, 4
+EXIT_TIMEOUT = 124  # a step the watchdog stopped (the shell's own code for a timeout)
+INSTALL_TIMEOUT_S, STEP_TIMEOUT_S = 600.0, 120.0  # the watchdog per step: the installer, then the hooks and the check
 INSTALLER_URL = "https://raw.githubusercontent.com/Michael-A-Fry/ws/main/install.sh"
 _DOWNLOAD_LIMIT = 1 << 20  # bytes: install.sh is about 40 KB
 
@@ -196,13 +214,24 @@ def fetch_installer(dest: Path) -> Path:
     return path
 
 
-def _run(argv: list[str], capture: bool) -> int:
-    """Run a command with the person's terminal (stdout and stderr captured and passed to stderr under `--json`)."""
-    if not capture:
-        return subprocess.run(argv, check=False).returncode
-    done = subprocess.run(argv, check=False, capture_output=True, text=True)
-    sys.stderr.write(done.stdout + done.stderr)
-    return done.returncode
+def _run(argv: list[str], capture: bool, timeout: float | None = None) -> int:
+    """Run a command with the person's terminal (stdout and stderr captured and passed to stderr under `--json`). A run
+    that is still going after `timeout` seconds is stopped and EXIT_TIMEOUT returned: the watchdog of one step."""
+    kw = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE, "text": True} if capture else {}
+    p = subprocess.Popen(argv, **kw)
+    try:
+        out, err = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        p.terminate()
+        try:
+            p.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.communicate()
+        return EXIT_TIMEOUT
+    if capture:
+        sys.stderr.write((out or "") + (err or ""))
+    return p.returncode
 
 
 def _installer_argv(script: Path, args: argparse.Namespace) -> list[str]:
@@ -220,11 +249,82 @@ def _hooks_argv() -> list[str]:
 
 
 def swap(args: argparse.Namespace, scratch: Path) -> int:
-    """Run the installer. Returns its exit code."""
+    """Run the installer under its watchdog. Returns its exit code (EXIT_TIMEOUT when it was stopped)."""
     script = Path(args.installer).expanduser() if args.installer else fetch_installer(scratch)
     if not script.is_file():
         raise WsError("failed", f"{script} is not a file", "pass --installer with a copy of install.sh")
-    return _run(_installer_argv(script, args), args.json)
+    limit = getattr(args, "install_timeout", None) or INSTALL_TIMEOUT_S
+    return _run(_installer_argv(script, args), args.json, limit)
+
+
+# ---- history, health check, rollback ----------------------------------------------------------------------------------------
+
+
+def history_path(env: Mapping[str, str]) -> Path:
+    return paths.state_dir(dict(env)) / "upgrade-history.jsonl"
+
+
+def record(env: Mapping[str, str], verb: str, frm: str, to: str | None) -> None:
+    """One line of history. A history that cannot be written never stops an upgrade."""
+    line = json.dumps({"ts": datetime.now(UTC).isoformat(timespec="seconds"), "verb": verb, "from": frm, "to": to})
+    try:
+        path = history_path(env)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+
+
+def history(env: Mapping[str, str]) -> list[dict]:
+    try:
+        lines = history_path(env).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    out = []
+    for line in lines:
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(d, dict):
+            out.append(d)
+    return out
+
+
+def previous_release(env: Mapping[str, str]) -> str | None:
+    """The release the last promote came from, unless a rollback has put it back since."""
+    for d in reversed(history(env)):
+        if d.get("verb") == "promote":
+            return d.get("from")
+        if d.get("verb") in ("rollback", "auto-rollback"):
+            return None
+    return None
+
+
+def _installed_version() -> str | None:
+    """The version of the ws now installed, asked of a new process (this one still runs the old code)."""
+    try:
+        p = subprocess.run([*selfcmd.argv(), "--version"], capture_output=True, text=True, timeout=30, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    words = p.stdout.split()
+    return words[-1] if p.returncode == 0 and words else None
+
+
+def _tag(version: str) -> str:
+    return version if version.startswith("v") else f"v{version}"
+
+
+def reinstall(args: argparse.Namespace, version: str) -> int:
+    """Install `version` and rewrite the hooks for it: the way back. 0 when both steps worked."""
+    ns = argparse.Namespace(**{**vars(args), "version": _tag(version), "channel": None})
+    with tempfile.TemporaryDirectory(prefix="ws-rollback-") as scratch:
+        os.chmod(scratch, 0o700)
+        code = swap(ns, Path(scratch))
+    if code != 0:
+        return code or EXIT_FAILED
+    return _run(_hooks_argv(), args.json, STEP_TIMEOUT_S)
 
 
 # ---- the command ------------------------------------------------------------------------------------------------------------
@@ -296,11 +396,15 @@ def _both(args: argparse.Namespace, env: Mapping[str, str]) -> int:
     with tempfile.TemporaryDirectory(prefix="ws-upgrade-") as scratch:
         os.chmod(scratch, 0o700)
         code = swap(args, Path(scratch))
+    if code == EXIT_TIMEOUT:
+        return _auto_rollback(args, env, before, "the installer ran past its time limit")
     if code != 0:
         _say(args, f"the installer failed (exit {code}); you still have ws {before} and its hooks, unchanged")
         return code or EXIT_FAILED
     _say(args, "installed; now rewriting the hooks with the new ws")
-    code = _run(_hooks_argv(), args.json)
+    code = _run(_hooks_argv(), args.json, STEP_TIMEOUT_S)
+    if code == EXIT_TIMEOUT:
+        return _auto_rollback(args, env, before, "the hooks rewrite ran past its time limit")
     if code == EXIT_NOT_RESTORED:
         _say(
             args,
@@ -316,10 +420,68 @@ def _both(args: argparse.Namespace, env: Mapping[str, str]) -> int:
             f"to go back to ws {before}, run the installer with --version v{before}",
         )
         return EXIT_FAILED
+    check = getattr(args, "check", None)
+    if check:
+        _say(args, f"checking the new release: {check}")
+        try:
+            code = _run(shlex.split(check), args.json, getattr(args, "step_timeout", None) or STEP_TIMEOUT_S)
+        except (OSError, ValueError) as e:
+            code = EXIT_FAILED
+            _say(args, f"the check could not start ({type(e).__name__})")
+        if code != 0:
+            why = "the check ran past its time limit" if code == EXIT_TIMEOUT else f"the check failed (exit {code})"
+            return _auto_rollback(args, env, before, why)
+    record(env, "promote", before, _installed_version())
     if args.json:
-        output.result({"from": before, "binary": "swapped", "hooks": "rewritten"})
+        output.result({"from": before, "binary": "swapped", "hooks": "rewritten", "checked": bool(check)})
     else:
         print(f"ws: upgraded from {before}; the hooks are rewritten")
+    return 0
+
+
+def _auto_rollback(args: argparse.Namespace, env: Mapping[str, str], before: str, why: str) -> int:
+    """A cut-over step went wrong after the swap began: put `before` back at once."""
+    _say(args, f"{why}; going back to ws {before}")
+    code = reinstall(args, before)
+    record(env, "auto-rollback", before, before if code == 0 else None)
+    if code != 0:
+        _say(
+            args,
+            f"going back failed (exit {code}). Run the installer with --version v{before}, then the hooks-only rewrite",
+        )
+        return EXIT_NOT_RESTORED
+    _say(args, f"rolled back: ws {before} and its hooks are back")
+    return EXIT_FAILED
+
+
+def _rollback(args: argparse.Namespace, env: Mapping[str, str]) -> int:
+    target = args.version or previous_release(env)
+    if not target:
+        raise WsError(
+            "failed", "there is no earlier release on record to go back to", "name one with --rollback --version TAG"
+        )
+    before = __version__
+    if args.dry_run:
+        _say(args, f"would reinstall ws {target} (now {before}) and rewrite the hooks for it")
+        return 0
+    tree = selfcmd.unstable()
+    if tree:
+        raise WsError(
+            "refused",
+            f"this ws runs from a place the installer does not manage ({tree})",
+            "install ws with install.sh first",
+            EXIT_REFUSED,
+        )
+    code = reinstall(args, target)
+    if code != 0:
+        record(env, "rollback", before, None)
+        _say(args, f"the rollback to {target} failed (exit {code}); ws and the hooks are as they were or as named above")
+        return EXIT_FAILED if code == EXIT_TIMEOUT else code
+    record(env, "rollback", before, target)
+    if args.json:
+        output.result({"from": before, "to": target, "binary": "swapped", "hooks": "rewritten"})
+    else:
+        print(f"ws: rolled back from {before} to {target}; the hooks are rewritten")
     return 0
 
 
@@ -332,6 +494,8 @@ def cmd_upgrade(args: argparse.Namespace) -> int:
         raise WsError("refused", why, "run `ws upgrade` yourself, in a terminal of your own", EXIT_REFUSED)
     if args.hooks_only:
         return _hooks_only(args, env)
+    if getattr(args, "rollback", False):
+        return _rollback(args, env)
     return _both(args, env)
 
 
@@ -345,4 +509,8 @@ def register(sub) -> None:
     u.add_argument("--installer", metavar="FILE", help="run this copy of install.sh instead of downloading it")
     u.add_argument("--hooks-only", action="store_true", help="rewrite the hooks only; a newer ws is already installed")
     u.add_argument("--dry-run", action="store_true", help="show what would change and change nothing")
+    u.add_argument("--rollback", action="store_true", help="put the previous release back (or --version TAG)")
+    u.add_argument("--check", metavar="COMMAND", help="run this after the swap; a non-zero exit rolls the swap back")
+    u.add_argument("--step-timeout", type=float, metavar="SECONDS", help="limit for the hooks step and the check (120)")
+    u.add_argument("--install-timeout", type=float, metavar="SECONDS", help="limit for the installer (600)")
     u.set_defaults(func=cmd_upgrade)

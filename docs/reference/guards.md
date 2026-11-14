@@ -450,13 +450,57 @@ message text. See [stores](stores.md).
 `ws gate event` is advice. A payload it can't read, a policy that doesn't load and a guard that crashes are each one line
 on standard error and exit code 0. The deny path is `ws gate check`, which fails closed.
 
+## The decision log
+
+Every call's check leaves one line in `logs/gate.jsonl`, an allowed call included, and a session in a data class writes
+its own class's copy and no other (see [Stores](stores.md)). A line holds the session id, the tool's name, the decision,
+each guard's verdict and the time taken. A decision other than `allow` adds `rule`, the id of what said no:
+
+| `rule` | What said no |
+|---|---|
+| `preflight` | The adapter's preflight (a project that widens the sandbox). |
+| `rule:command`, `rule:read`, `rule:search`, `rule:write`, `rule:tool`, `rule:mcp` | The policy's rules for that kind of call (`deny_commands`, `deny_read`, the protected files, `deny_tools`, the MCP lists). |
+| `rule:unknown-command-word`, `rule:sets-ifs`, `rule:unread-write` | A refusal the wall makes redundant, where the wall wasn't proven. |
+| `guard:NAME` | A guard in `enforce`, or in `log` without the wall. |
+| `ask_commands`, `ask_mcp` | A call that waits for a person's approval. |
+| `error` | The check itself failed, so the call is refused to be safe. |
+
+A line never holds the reason text, the command, a path or a message. A tool no adapter reads adds `unlisted: 1` and
+`counted_as: "write"`: what it does is unknown, so a count of writes counts it.
+
+## Hook rules and the runner's own rules
+
+Which hook rule a Claude Code permission rule (`Tool(specifier)`) could replace. Where the column says no rule, the
+hook stays: what it judges depends on something a pattern on the call can't see.
+
+| Hook rule | Claude Code rule that could replace it |
+|---|---|
+| `deny_commands` | `Bash(PATTERN)` in `permissions.deny`, which generate writes for each pattern with no hook-only character |
+| `deny_read` | `Read(PATH)` in `permissions.deny`, and the sandbox's `denyRead` for the shell |
+| `deny_tools` | `WebFetch(*)` or `WebSearch(*)` in `permissions.deny` |
+| protected files | `Edit(PATH)` in `permissions.deny`, and the sandbox's write list for the shell |
+| MCP lists (`allow_mcp`, `ask_mcp`) | `mcp__SERVER__TOOL(*)` in `permissions.allow` or `permissions.ask` |
+| `ask_commands` | no rule: `Bash(PATTERN)` in `permissions.ask` asks, but the hook binds the approval to the session and folder |
+| preflight | no rule: it reads the project's settings files |
+| `unknown-command-word`, `sets-ifs`, `unread-write` | no rule: the sandbox holds what such a line writes |
+| `bulk-staging` | `Bash(git add -A*)` and the rest of its `NATIVE_DENY`; the forms a pattern can't say stay with the hook |
+| `checkout-pin` | no rule: what it denies depends on the folder |
+| `claims` | no rule: it asks git about the commits a message names |
+| `dev-server` | no rule: it reads the flags and the address |
+| `pane-close` | no rule: it reads the session registry |
+| `spawn-cap` | no rule: it counts the agents running; `Agent(NAME)` can deny a named agent, not a count |
+| `skill-gate` | no rule: it waits for a skill run in the session |
+| `test-weakening` | no rule: it compares a test file before and after |
+| `syntax-check` | no rule: it parses the file written |
+| `session-context`, `inbox`, `presence`, `record-calls` | no rule: they never refuse |
+
 ## What `ws gate generate` writes for Claude Code
 
 The settings carry a hook for an event only when a guard that's on runs there:
 
 | Hook | Added when |
 |---|---|
-| `PreToolUse` matcher gains `Agent\|Task`, `Skill` and `SendMessage` | A guard that's on reads agent, skill or message calls before a call. The matcher always has the shell, file, search and web tools. |
+| `PreToolUse` running `ws gate check`, matcher `*` | Always. Every tool reaches the gate, an MCP tool and a tool no adapter reads included. |
 | `PostToolUse` running `ws gate event` | A guard that's on runs after a call. The matcher lists the tools for the kinds those guards read. |
 | `SessionStart`, `UserPromptSubmit`, `Stop`, `SubagentStop` running `ws gate event` | A guard that's on runs at that event. |
 

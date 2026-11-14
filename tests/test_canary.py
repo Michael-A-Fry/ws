@@ -129,6 +129,8 @@ def test_a_canary_run_passes_and_leaves_one_line(box, capsys):
         "hook_config": "pass",
         "run_record": "pass",
         "wall": "pass",
+        "probe": "skip",  # the fakes on PATH leave no sandbox to probe
+        "tokens": "pass",
     }
     code, out, _ = run(capsys, "canary", "--json")
     assert code == 0 and json.loads(out)["data"]["details"]["claude-code"]["gate"].startswith("blocks")
@@ -146,7 +148,7 @@ def test_a_canary_run_passes_with_guards_asked_to_log(box, capsys):
     code, out, _ = run(capsys, "canary")
     assert code == 0 and "claude-code  ok  2.5.1" in out
     (line,) = lines(box)
-    assert line["ok"] is True and set(line["runners"]["claude-code"]["checks"].values()) == {"pass"}
+    assert line["ok"] is True and set(line["runners"]["claude-code"]["checks"].values()) == {"pass", "skip"}
 
 
 def test_opencode_is_checked_too(box, capsys):
@@ -449,6 +451,10 @@ WALL_BROKEN = {
     "home-missing": drop_home,
     "project-missing": lambda c: c["sandbox"]["filesystem"].update(allowRead=[]),
     "exact-deny-missing": lambda c: c["sandbox"]["filesystem"]["denyRead"].remove("~/.ssh"),
+    "tokens-visible": lambda c: c["sandbox"].pop("credentials"),
+    "token-masked-not-denied": lambda c: c["sandbox"]["credentials"]["envVars"][0].update(mode="mask"),
+    "read-block-off": lambda c: c["permissions"].pop("blockReadsOutsideWorkingDirectories"),
+    "write-block-off": lambda c: c["permissions"].pop("blockWritesOutsideWorkingDirectories"),
 }
 
 
@@ -491,3 +497,150 @@ def test_wall_check_reports_the_error_kind_when_the_launch_copy_cannot_be_made(b
     status, why = canary.check_wall(claude_code, os.environ, box / "work-2")
     assert status == canary.FAIL and said in why  # the kind, found by type and not by reading the message
     assert "long message" not in why
+
+
+# ---- the probe: the docs' two probes, run by the runner ------------------------------------------------------------------
+
+
+def test_the_probe_skips_where_the_sandbox_cannot_run(box, capsys):
+    fake(box, "claude")  # PATH holds only the fakes, so bubblewrap and socat are missing too
+    code, out, _ = run(capsys, "canary", "--runner", "claude-code")
+    assert code == 0 and "skip  probe" in out, out
+
+
+def test_the_probe_skips_a_runner_that_never_calls_the_model(box, monkeypatch, tmp_path):
+    fake(box, "claude")
+    monkeypatch.setattr("ws.wallsettings.host_problem", lambda kind, which=None: None)
+    (box / "w").mkdir()
+    status, why = canary.check_probe(claude_code, os.environ, box / "w")
+    assert status == canary.SKIP and "never asked the model" in why
+
+
+CONTROL = "probe-control-abc"
+
+
+@pytest.mark.parametrize(
+    ("said", "wrote", "problem"),
+    [
+        (f"{CONTROL}\ntouch=1\ncurl=6", False, None),
+        (f"{CONTROL}\ntouch=0\ncurl=6", False, None),  # the hidden home is a throwaway layer: judged on the host
+        (f"{CONTROL}\ntouch=0\ncurl=6", True, "wrote outside"),
+        (f"{CONTROL}\ntouch=1\ncurl=0", False, "reached the network"),
+        (f"{CONTROL}\ntouch=1", False, "network probe did not run"),
+        (f"{CONTROL}\ncurl=6", False, "write probe did not run"),
+        ("touch=1\ncurl=6", False, "ran no command"),
+    ],
+)
+def test_the_probe_is_judged_on_what_got_through(said, wrote, problem):
+    found = canary.judge_probe(said, CONTROL, wrote)
+    assert (found is None) if problem is None else (problem in found), found
+
+
+SHUT = {"sandbox": {"enabled": True, "failIfUnavailable": True, "allowUnsandboxedCommands": False}}
+
+
+def planted_class(monkeypatch, doc):
+    """One walled class whose launch file is `doc`, and a sandbox that can run (the probe itself is not reached)."""
+    cls = type("Cls", (), {"name": "work", "os_user": "ws-work"})()
+    monkeypatch.setattr(canary, "_classes", lambda: [cls])
+    monkeypatch.setattr("ws.sandbox.class_launch_doc", lambda c: doc)
+    monkeypatch.setattr("ws.wallsettings.host_problem", lambda kind, which=None: None)
+    monkeypatch.setattr(canary, "run_probe", lambda *a, **k: None)
+    monkeypatch.setattr(canary, "_launch_text", lambda *a, **k: "{}")
+
+
+@pytest.mark.parametrize(
+    ("key", "said"),
+    [
+        ("failIfUnavailable", "failIfUnavailable"),
+        ("enabled", "turn the sandbox on"),
+        ("allowUnsandboxedCommands", "unsandboxed retry"),
+    ],
+)
+def test_a_class_launch_file_with_a_wall_key_taken_out_fails_the_probe(box, capsys, monkeypatch, key, said):
+    fake(box, "claude")
+    doc = {"sandbox": {k: v for k, v in SHUT["sandbox"].items() if k != key}}
+    planted_class(monkeypatch, doc)
+    code, out, _ = run(capsys, "canary", "--runner", "claude-code")
+    assert code == 1 and "fail  probe" in out and said in out, out
+
+
+def test_a_class_launch_file_that_shuts_the_sandbox_is_probed(box, monkeypatch):
+    fake(box, "claude")
+    planted_class(monkeypatch, SHUT)
+    (box / "w").mkdir()
+    status, why = canary.check_probe(claude_code, os.environ, box / "w")
+    assert status == canary.PASS and "default, work" in why, why
+
+
+def test_a_class_launch_file_that_cannot_be_read_fails_with_its_kind(box, monkeypatch):
+    fake(box, "claude")
+    planted_class(monkeypatch, SHUT)
+
+    def refused(cls):
+        raise WsError("refused", "not root-owned", "x")
+
+    monkeypatch.setattr("ws.sandbox.class_launch_doc", refused)
+    (box / "w").mkdir()
+    status, why = canary.check_probe(claude_code, os.environ, box / "w")
+    assert status == canary.FAIL and "refused" in why
+
+
+def test_probe_settings_leave_only_the_sandbox_to_stop_it():
+    text = json.dumps({"hooks": {"PreToolUse": []}, "permissions": {"deny": ["Bash(x)"], "y": 1}, "sandbox": {}})
+    conf = json.loads(canary.probe_settings(text))
+    assert "hooks" not in conf and conf["permissions"] == {"y": 1} and conf["sandbox"] == {}
+
+
+# ---- tokens: the runner's sign-in stays with the runner (ls-12) -------------------------------------------------------
+
+
+def test_tokens_pass_with_a_private_credentials_file(box, capsys):
+    fake(box, "claude")
+    cred = box / ".claude" / ".credentials.json"
+    cred.parent.mkdir()
+    cred.write_text("{}")
+    cred.chmod(0o600)
+    code, out, _ = run(capsys, "canary", "--runner", "claude-code")
+    assert code == 0 and "pass  tokens" in out and "credentials file is private" in out, out
+
+
+def test_a_credentials_file_others_can_read_fails(box, capsys):
+    fake(box, "claude")
+    cred = box / ".claude" / ".credentials.json"
+    cred.parent.mkdir()
+    cred.write_text("{}")
+    cred.chmod(0o644)
+    code, out, _ = run(capsys, "canary", "--runner", "claude-code")
+    assert code == 1 and "fail  tokens" in out and "chmod 600" in out, out
+
+
+@pytest.mark.parametrize("name", ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_OAUTH_TOKEN"])
+def test_a_sign_in_token_in_the_environment_fails(box, capsys, monkeypatch, name):
+    fake(box, "claude")
+    monkeypatch.setenv(name, "planted-" + os.urandom(4).hex())  # built at run time
+    code, out, _ = run(capsys, "canary", "--runner", "claude-code")
+    assert code == 1 and "fail  tokens" in out and name in out, out
+    assert "planted-" not in out  # the value is never printed
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        '[runner_options.env]\nCLAUDE_CODE_OAUTH_TOKEN = "x"\n',
+        'runner_options = { env = { ANTHROPIC_OAUTH_TOKEN = "x" } }\n',
+    ],
+)
+def test_a_job_that_plants_a_sign_in_token_fails(box, capsys, line):
+    fake(box, "claude")
+    folder = box / ".ws" / "jobs"
+    folder.mkdir(parents=True)
+    (folder / "nightly.toml").write_text('runner = "claude-code"\n' + line)
+    code, out, _ = run(capsys, "canary", "--runner", "claude-code")
+    assert code == 1 and "fail  tokens" in out and "job nightly" in out, out
+
+
+def test_tokens_skip_for_opencode(box, capsys):
+    fake(box, "opencode")
+    code, out, _ = run(capsys, "canary", "--runner", "opencode")
+    assert code == 0 and "skip  tokens" in out and "skip  probe" in out, out

@@ -916,6 +916,8 @@ def _execute(
         files = adapter.generate(pol, selfcmd.argv(), run_dir / "gate", policy_file)
         if egress is not None and hasattr(adapter, "with_hosts"):  # the runner's own sandbox holds the class's list
             files = {**files, adapter.FILE: adapter.with_hosts(files[adapter.FILE], egress.domains())}
+        if hasattr(adapter, "unattended"):  # no one is there to answer a prompt: deny it instead of waiting
+            files = {**files, adapter.FILE: adapter.unattended(files[adapter.FILE])}
         gate.write_files(run_dir / "gate", files)
         _claude_wall(job, adapter, pol, run_dir, cwd, files, walls)
         for s in job.secrets:

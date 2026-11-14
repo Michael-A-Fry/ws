@@ -16,9 +16,12 @@ Per runner:
   probe        Claude Code only: the two probes from Claude Code's sandboxing page, run by the real runner inside those
                launch settings with a local stub model (no paid call): `touch ~/sandbox-probe-...` must leave no file
                in the real home (judged on the host: with the home hidden, the wall gives it a throwaway layer), and
-               `curl --noproxy '*' https://example.com` must not connect. Run once for the default launch settings and
+               `curl --noproxy '*' https://example.com` must not connect. The same curl runs on the host first: when the
+               host can't connect either, the network half proves nothing and the check is a skip. Run once for the default launch settings and
                once per walled class whose launch file this machine has; that file must itself turn the sandbox on,
                fail closed and allow no unsandboxed retry. Skipped when claude, or the sandbox's own tools, are missing
+  keys         Claude Code only: the installed runner is at least the first version of every settings key the wall
+               writes on the default policy (wallsettings.MIN_CLAUDE, the table WS016 reads); an older one ignores it
   tokens       Claude Code only: the runner's credentials file is readable by its owner alone, this process carries no
                sign-in token (CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_OAUTH_TOKEN), and no job file sets one
 
@@ -52,7 +55,9 @@ NO_VERSION = "ran (it printed no version)"
 TOKEN_NAMES = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
 SIGN_IN_TOKENS = TOKEN_NAMES[:2]
 PROBE_TIMEOUT = 180
-CURL_PROBE = "curl --noproxy '*' -sS -m 10 -o curl-probe.out https://example.com && echo curl=0 || echo curl=1"
+SKIP_KEYS = (SKIP, "")  # a placeholder that keeps the rows in order until the version is known
+PROBE_URL = "https://example.com"  # the sandboxing page's own
+CURL_PROBE = f"curl --noproxy '*' -sS -m 10 -o curl-probe.out {PROBE_URL} && echo curl=0 || echo curl=1"
 DENIED = "git push --force origin main"  # in the default deny list; a plain `git push` is not
 ALLOWED = "ls"
 
@@ -368,26 +373,50 @@ def probe_settings(text: str) -> str:
     return json.dumps(conf, indent=2) + "\n"
 
 
-def judge_probe(said: str, control: str, wrote: bool) -> str | None:
-    """What the probe's tool results show: None when both probes were stopped and the control ran."""
-    if control not in said:
+def _said(said: str, word: str) -> str | None:
+    """The value a probe line printed (`touch=1` gives "1"), matched as a whole line, or None."""
+    found = re.search(rf"^{word}=([01])$", said, re.MULTILINE)
+    return found.group(1) if found else None
+
+
+def judge_probe(said: str, control: str, wrote: bool, net: bool = True) -> str | None:
+    """What the probe's tool results show: None when both probes were stopped and the control ran. `net` False: the
+    host itself can't reach the probe's host, so the network half is not judged."""
+    if not re.search(rf"^{re.escape(control)}$", said, re.MULTILINE):
         return "the runner ran no command, so the probe could not tell (is the sandbox available here?)"
     if wrote:  # judged on the host: under deny-home the home is a throwaway layer, so `touch` can exit 0 in the wall
         return "a shell command wrote outside the working folder"
-    if "touch=" not in said:
+    if _said(said, "touch") is None:
         return "the write probe did not run"
-    if "curl=0" in said:
+    if not net:
+        return None
+    curl = _said(said, "curl")
+    if curl == "0":
         return "a shell command reached the network around the sandbox proxy"
-    if "curl=" not in said:
+    if curl is None:
         return "the network probe did not run"
     return None
+
+
+def host_reaches(work: Path, env) -> bool:
+    """The network probe's control: the same curl, run on the host. False when the host can't connect either, or has
+    no curl."""
+    exe = shutil.which("curl", path=env.get("PATH"))
+    if not exe:
+        return False
+    argv = [exe, "--noproxy", "*", "-sS", "-m", "10", "-o", str(work / "host-probe.out"), PROBE_URL]
+    try:
+        done = subprocess.run(argv, capture_output=True, timeout=30, check=False, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return done.returncode == 0
 
 
 class NotProbed(Exception):
     """The runner never asked the model for a turn, so no probe ran (a runner that isn't Claude Code's real CLI)."""
 
 
-def run_probe(exe: str, settings: str, project: Path, work: Path, env) -> str | None:
+def run_probe(exe: str, settings: str, project: Path, work: Path, env, net: bool = True) -> str | None:
     """Run the docs' two probes in the real runner inside `settings`, with a stub model scripting the calls. None when
     both were stopped; otherwise what got through, or why the probe could not tell."""
     from ws.testing.mockprovider import AnthropicStub, Call
@@ -432,9 +461,7 @@ def run_probe(exe: str, settings: str, project: Path, work: Path, env) -> str | 
             target.unlink()
     if not asked and not wrote:
         raise NotProbed
-    if not shutil.which("curl", path=env.get("PATH")):  # without it the network probe fails for the wrong reason
-        return "curl is not installed, so the network probe can't run: install it"
-    return judge_probe("\n".join(results), control, wrote)
+    return judge_probe("\n".join(results), control, wrote, net)
 
 
 def _classes() -> list:
@@ -464,6 +491,7 @@ def check_probe(adapter, env, work: Path) -> tuple[str, str]:
     project.mkdir(exist_ok=True)
     project = project.resolve()
     pol = policy.loads(policy.default_toml())
+    net = host_reaches(work, env)
     cases: list[tuple[str, object, dict | None]] = [("default", None, None)]
     for cls in _classes():
         try:
@@ -482,12 +510,18 @@ def check_probe(adapter, env, work: Path) -> tuple[str, str]:
         except (WsError, policy.PolicyError, ValueError, KeyError, TypeError, OSError) as e:
             return FAIL, f"{name}: the launch settings could not be made ({getattr(e, 'kind', type(e).__name__)})"
         try:
-            problem = run_probe(exe, text, project, work, env)
+            problem = run_probe(exe, text, project, work, env, net)
         except NotProbed:
             return SKIP, f"{name}: {adapter.EXE} never asked the model for a turn, so nothing was probed"
         if problem:
             return FAIL, f"{name}: {problem}"
-    return PASS, f"write and network probes stopped ({', '.join(n for n, _, _ in cases)})"
+    names = ", ".join(n for n, _, _ in cases)
+    if not net:
+        return (
+            SKIP,
+            f"the write probe was stopped ({names}); the host can't reach {PROBE_URL}, so the network probe proves nothing",
+        )
+    return PASS, f"write and network probes stopped ({names})"
 
 
 def _credentials_file(env) -> Path:
@@ -495,12 +529,47 @@ def _credentials_file(env) -> Path:
     return Path(base) / ".credentials.json"
 
 
+def _keys(value) -> list[str]:
+    """Every key in a parsed TOML document, at any depth."""
+    if isinstance(value, dict):
+        return [k for key, v in value.items() for k in (key, *_keys(v))]
+    if isinstance(value, list):
+        return [k for v in value for k in _keys(v)]
+    return []
+
+
 def _job_token(text: str) -> str | None:
-    """The first sign-in token a job file's text sets (a `NAME =` key anywhere in it, inline tables too)."""
+    """The first sign-in token a job file sets as a key, at any depth, bare or quoted. A file that doesn't parse is
+    read as text: a `NAME =` key, bare or in quotes, anywhere in it."""
+    import tomllib
+
+    try:
+        keys = set(_keys(tomllib.loads(text)))
+    except tomllib.TOMLDecodeError:
+        keys = None
     for name in SIGN_IN_TOKENS:
-        if re.search(rf"(^|[{{,\s]){name}\s*=", text, re.MULTILINE):
+        if keys is not None and name in keys:
+            return name
+        if keys is None and re.search(rf"(^|[{{,\s])[\"']?{name}[\"']?\s*=", text, re.MULTILINE):
             return name
     return None
+
+
+def check_keys(adapter, version: str | None) -> tuple[str, str]:
+    """The runner reads every key the wall writes on the default policy: see the module docstring."""
+    from ws import doctor, wallsettings
+
+    if adapter.NAME != "claude-code":
+        return SKIP, f"{adapter.NAME} has no table of first versions"
+    found = doctor._version_tuple(version or "")
+    if found is None:
+        return FAIL, "the runner's version can't be read, so the keys it reads aren't known"
+    keys = wallsettings.keys_written(policy.loads(policy.default_toml()))
+    old = [k for k in keys if found < wallsettings.MIN_CLAUDE[k]]
+    if old:
+        need = ".".join(map(str, max(wallsettings.MIN_CLAUDE[k] for k in old)))
+        return FAIL, f"{version} ignores {', '.join(old)}: update Claude Code to {need} or newer"
+    return PASS, f"{len(keys)} wall keys, all read by {version}"
 
 
 def check_tokens(adapter, env) -> tuple[str, str]:
@@ -567,8 +636,10 @@ def canary_runner(runner: str, env, work: Path) -> dict:
         "run_record": check_run_record(work),
         "wall": check_wall(adapter, env, work),
         "probe": check_probe(adapter, env, work),
+        "keys": SKIP_KEYS,
         "tokens": check_tokens(adapter, env),
     }
+    checks["keys"] = check_keys(adapter, checks["version"][1]) if checks["version"][0] == PASS else (SKIP, "no version")
     return {
         "version": checks["version"][1]
         if checks["version"][0] == PASS and checks["version"][1] != NO_VERSION

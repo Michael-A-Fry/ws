@@ -527,3 +527,30 @@ def test_the_same_write_happens_with_the_off_switch(tmp_path, work):
     target, _stub, proc, conf = write_outside(tmp_path, work, allow_outside=True)
     assert conf["permissions"] == {}
     assert target.exists(), f"the control write did not happen\n{gr.where(proc)}"
+
+
+def test_the_network_probe_connects_with_the_sandbox_taken_out(tmp_path):
+    """The network half's control: the same curl, with no sandbox block, connects. Skips when the host can't reach the
+    probe's host at all, since the probe then proves nothing (as `ws canary` does). Only with WS_E2E_NETWORK=1."""
+    from ws import canary
+
+    if os.environ.get("WS_E2E_NETWORK") != "1":
+        pytest.skip("WS_E2E_NETWORK=1 is not set: this one talks to example.com")
+    (tmp_path / "host").mkdir()
+    if not canary.host_reaches(tmp_path / "host", gr.base_env(tmp_path)):
+        pytest.skip(f"this host can't reach {canary.PROBE_URL}")
+    problem = _probe_case(tmp_path, lambda c: c.pop("sandbox"))
+    assert problem is not None and "wrote outside" in problem, problem  # the write half gets through first
+    work = tmp_path / "net"
+    project = work / "project"
+    project.mkdir(parents=True)
+    env = gr.base_env(tmp_path)
+    text = canary._launch_text(claude_code, env, work, project.resolve(), policy.loads(policy.default_toml()))
+    conf = json.loads(canary.probe_settings(text))  # hooks and deny rules out, as the probe has them
+    conf.pop("sandbox")
+    with AnthropicStub([Call("Bash", {"command": canary.CURL_PROBE})]) as stub:
+        settings = work / "s.json"
+        settings.write_text(json.dumps(conf))
+        proc = gr.claude_run(tmp_path, stub, settings, False, project, extra_env={"HOME": env["HOME"]})
+    said = "\n".join(stub.tool_results())
+    assert canary._said(said, "curl") == "0", f"the control curl did not connect\n{gr.where(proc)}"

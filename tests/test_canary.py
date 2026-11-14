@@ -36,7 +36,7 @@ def box(tmp_path, monkeypatch):
     return home
 
 
-def fake(box, exe: str, version: str | None = "1.0.0") -> None:
+def fake(box, exe: str, version: str | None = "3.0.0") -> None:
     """A runner on PATH that prints `<version> (Fake)` for --version; None = it exits 1."""
     path = box.parent / "bin" / exe
     body = "sys.exit(1)" if version is None else f'print("{version} (Fake)")'
@@ -130,6 +130,7 @@ def test_a_canary_run_passes_and_leaves_one_line(box, capsys):
         "run_record": "pass",
         "wall": "pass",
         "probe": "skip",  # the fakes on PATH leave no sandbox to probe
+        "keys": "pass",
         "tokens": "pass",
     }
     code, out, _ = run(capsys, "canary", "--json")
@@ -148,7 +149,10 @@ def test_a_canary_run_passes_with_guards_asked_to_log(box, capsys):
     code, out, _ = run(capsys, "canary")
     assert code == 0 and "claude-code  ok  2.5.1" in out
     (line,) = lines(box)
-    assert line["ok"] is True and set(line["runners"]["claude-code"]["checks"].values()) == {"pass", "skip"}
+    assert line["ok"] is True and {
+        k: v for k, v in line["runners"]["claude-code"]["checks"].items() if k != "probe"
+    } == dict.fromkeys(("version", "gate", "hook_config", "run_record", "wall", "keys", "tokens"), "pass")
+    assert line["runners"]["claude-code"]["checks"]["probe"] == "skip"  # the fakes leave no sandbox to probe
 
 
 def test_opencode_is_checked_too(box, capsys):
@@ -235,28 +239,28 @@ def test_nothing_is_written_when_ws_has_no_home_yet(tmp_path, monkeypatch, capsy
 
 def test_observe_remembers_and_reports_a_change(box):
     env = dict(os.environ)
-    assert canary.observe(env, "claude-code", "1.0.0", "m1") == []  # first sighting is not a change
+    assert canary.observe(env, "claude-code", "3.0.0", "m1") == []  # first sighting is not a change
     path = box / ".ws" / "versions.json"
-    assert json.loads(path.read_text())["runners"]["claude-code"]["version"] == "1.0.0"
-    assert canary.observe(env, "claude-code", "1.0.0", "m1") == []
-    assert canary.observe(env, "claude-code", "1.1.0", "m1", record=False) == ["claude-code 1.1.0, was 1.0.0"]
-    assert json.loads(path.read_text())["runners"]["claude-code"]["version"] == "1.0.0"  # not recorded
-    assert canary.observe(env, "claude-code", "1.1.0", "m2") == [
-        "claude-code 1.1.0, was 1.0.0",
+    assert json.loads(path.read_text())["runners"]["claude-code"]["version"] == "3.0.0"
+    assert canary.observe(env, "claude-code", "3.0.0", "m1") == []
+    assert canary.observe(env, "claude-code", "3.1.0", "m1", record=False) == ["claude-code 3.1.0, was 3.0.0"]
+    assert json.loads(path.read_text())["runners"]["claude-code"]["version"] == "3.0.0"  # not recorded
+    assert canary.observe(env, "claude-code", "3.1.0", "m2") == [
+        "claude-code 3.1.0, was 3.0.0",
         "default model m2, was m1",
     ]
-    assert canary.observe(env, "claude-code", "1.1.0", "m2") == []
+    assert canary.observe(env, "claude-code", "3.1.0", "m2") == []
     data = json.loads(path.read_text())
-    assert data["default_model"] == "m2" and data["runners"]["claude-code"]["version"] == "1.1.0"
+    assert data["default_model"] == "m2" and data["runners"]["claude-code"]["version"] == "3.1.0"
 
 
 def test_observe_keeps_each_runner_apart_and_ignores_a_missing_version(box):
     env = dict(os.environ)
-    canary.observe(env, "claude-code", "1.0.0", None)
+    canary.observe(env, "claude-code", "3.0.0", None)
     canary.observe(env, "opencode", "9.0.0", None)
     assert canary.observe(env, "claude-code", None, None) == []
     runners = json.loads((box / ".ws" / "versions.json").read_text())["runners"]
-    assert runners == {"claude-code": {"version": "1.0.0"}, "opencode": {"version": "9.0.0"}}
+    assert runners == {"claude-code": {"version": "3.0.0"}, "opencode": {"version": "9.0.0"}}
 
 
 def test_observe_does_not_make_ws_home_or_write_for_a_bare_environment(box, tmp_path):
@@ -267,8 +271,8 @@ def test_observe_does_not_make_ws_home_or_write_for_a_bare_environment(box, tmp_
 
 def test_a_damaged_versions_file_is_replaced_not_fatal(box):
     (box / ".ws" / "versions.json").write_text("{nope")
-    assert canary.observe(dict(os.environ), "claude-code", "1.0.0", "m") == []
-    assert json.loads((box / ".ws" / "versions.json").read_text())["runners"]["claude-code"]["version"] == "1.0.0"
+    assert canary.observe(dict(os.environ), "claude-code", "3.0.0", "m") == []
+    assert json.loads((box / ".ws" / "versions.json").read_text())["runners"]["claude-code"]["version"] == "3.0.0"
 
 
 # ---- doctor ------------------------------------------------------------------------------------------------------------
@@ -280,13 +284,13 @@ def ws101(box, network):
 
 
 def test_doctor_records_versions_and_only_reports_versions_when_nothing_changed(box):
-    fake(box, "claude", "1.0.0")
+    fake(box, "claude", "3.0.0")
     profile(box)
     c = ws101(box, network=True)
-    assert c.status == "ok" and "claude-code 1.0.0" in c.detail and "changed" not in c.detail
+    assert c.status == "ok" and "claude-code 3.0.0" in c.detail and "changed" not in c.detail
     assert json.loads((box / ".ws" / "versions.json").read_text()) == {
         "schema": 1,
-        "runners": {"claude-code": {"version": "1.0.0"}},
+        "runners": {"claude-code": {"version": "3.0.0"}},
         "default_model": "model-a",
     }
     assert "changed" not in ws101(box, network=True).detail
@@ -294,14 +298,14 @@ def test_doctor_records_versions_and_only_reports_versions_when_nothing_changed(
 
 
 def test_doctor_says_so_and_runs_the_canary_when_the_runner_changed(box):
-    fake(box, "claude", "1.0.0")
+    fake(box, "claude", "3.0.0")
     profile(box)
     ws101(box, network=True)
-    fake(box, "claude", "1.1.0")
+    fake(box, "claude", "3.1.0")
     c = ws101(box, network=True)
-    assert c.status == "ok" and "changed since last seen (claude-code 1.1.0, was 1.0.0): canary passed" in c.detail
+    assert c.status == "ok" and "changed since last seen (claude-code 3.1.0, was 3.0.0): canary passed" in c.detail
     (line,) = lines(box)
-    assert line["ok"] is True and line["runners"]["claude-code"]["version"] == "1.1.0"
+    assert line["ok"] is True and line["runners"]["claude-code"]["version"] == "3.1.0"
     assert "changed" not in ws101(box, network=True).detail  # said once
 
 
@@ -315,24 +319,24 @@ def test_a_changed_default_model_is_noticed_too(box):
 
 
 def test_offline_doctor_points_to_the_command_instead_of_running_it(box):
-    fake(box, "claude", "1.0.0")
+    fake(box, "claude", "3.0.0")
     profile(box)
     ws101(box, network=False)
-    fake(box, "claude", "2.0.0")
+    fake(box, "claude", "4.0.0")
     c = ws101(box, network=False)
-    assert c.status == "ok" and "changed since last seen (claude-code 2.0.0, was 1.0.0): run `ws canary`" in c.detail
+    assert c.status == "ok" and "changed since last seen (claude-code 4.0.0, was 3.0.0): run `ws canary`" in c.detail
     assert lines(box) == []
     # not remembered, so the note stays until a canary passes
     assert "run `ws canary`" in ws101(box, network=False).detail
     assert "run `ws canary`" in ws101(box, network=False).detail
-    assert json.loads((box / ".ws" / "versions.json").read_text())["runners"]["claude-code"]["version"] == "1.0.0"
+    assert json.loads((box / ".ws" / "versions.json").read_text())["runners"]["claude-code"]["version"] == "3.0.0"
 
 
 def test_ws_canary_passing_is_what_remembers_the_new_version(box, capsys, monkeypatch):
-    fake(box, "claude", "1.0.0")
+    fake(box, "claude", "3.0.0")
     profile(box)
     ws101(box, network=False)
-    fake(box, "claude", "2.0.0")
+    fake(box, "claude", "4.0.0")
     assert "run `ws canary`" in ws101(box, network=False).detail
     with monkeypatch.context() as broken:
         broken.setattr(claude_code, "generate", lambda *a, **k: {"settings.json": "{"})
@@ -340,12 +344,12 @@ def test_ws_canary_passing_is_what_remembers_the_new_version(box, capsys, monkey
     assert "run `ws canary`" in ws101(box, network=False).detail  # a failing canary remembers nothing
     assert run(capsys, "canary")[0] == 0
     versions = json.loads((box / ".ws" / "versions.json").read_text())
-    assert versions["runners"]["claude-code"]["version"] == "2.0.0"
+    assert versions["runners"]["claude-code"]["version"] == "4.0.0"
     assert "changed" not in ws101(box, network=False).detail
 
 
 def test_canary_jsonl_is_private_and_versions_json_leaves_no_temp_file(box, capsys, monkeypatch):
-    fake(box, "claude", "1.0.0")
+    fake(box, "claude", "3.0.0")
     assert run(capsys, "canary", "--runner", "claude-code")[0] == 0
     assert oct((box / ".ws" / "logs" / "canary.jsonl").stat().st_mode & 0o777) == "0o600"
     canary.observe(dict(os.environ), "claude-code", "3.0.0", "m")
@@ -365,20 +369,20 @@ def test_a_failed_write_of_versions_json_cleans_up_its_temp_file(box, monkeypatc
         raise OSError("disk full")
 
     monkeypatch.setattr(os, "replace", boom)
-    canary.observe(dict(os.environ), "claude-code", "1.0.0", "m")  # does not raise
+    canary.observe(dict(os.environ), "claude-code", "3.0.0", "m")  # does not raise
     assert list((box / ".ws").iterdir()) == []
 
 
 def test_a_failing_canary_fails_ws101_and_is_run_again_next_time(box, monkeypatch):
-    fake(box, "claude", "1.0.0")
+    fake(box, "claude", "3.0.0")
     profile(box)
     ws101(box, network=True)
-    fake(box, "claude", "1.1.0")
+    fake(box, "claude", "3.1.0")
     with monkeypatch.context() as broken:
         broken.setattr(claude_code, "generate", lambda *a, **k: {"settings.json": "{"})
         c = ws101(box, network=True)
         assert c.status == "fail" and "canary failed" in c.detail and "hook_config" in c.detail
-        assert json.loads((box / ".ws" / "versions.json").read_text())["runners"]["claude-code"]["version"] == "1.0.0"
+        assert json.loads((box / ".ws" / "versions.json").read_text())["runners"]["claude-code"]["version"] == "3.0.0"
         assert ws101(box, network=True).status == "fail"  # still not remembered
     c = ws101(box, network=True)
     assert c.status == "ok" and "canary passed" in c.detail
@@ -388,10 +392,10 @@ def test_doctor_does_not_write_without_a_ws_home(tmp_path, monkeypatch):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     exe = bin_dir / "claude"
-    exe.write_text(f'#!{sys.executable}\nprint("1.0.0")\n')
+    exe.write_text(f'#!{sys.executable}\nprint("3.0.0")\n')
     exe.chmod(0o755)
     status, detail = doctor._runner({"adapter": "claude-code"}, osinfo.detect(), {"PATH": str(bin_dir)}, True)
-    assert status == "ok" and "1.0.0" in detail
+    assert status == "ok" and "3.0.0" in detail
     home = tmp_path / "h"
     env = {"PATH": str(bin_dir), "HOME": str(home)}
     assert doctor._runner({"adapter": "claude-code"}, osinfo.detect(), env, True)[0] == "ok"
@@ -400,7 +404,7 @@ def test_doctor_does_not_write_without_a_ws_home(tmp_path, monkeypatch):
 
 def test_an_old_canary_log_in_ws_home_is_set_aside_not_trusted(box, capsys):
     """A session could write `$WS_HOME/canary.jsonl`, so its lines must never become part of the new log."""
-    fake(box, "claude", "1.0.0")
+    fake(box, "claude", "3.0.0")
     old = box / ".ws" / "canary.jsonl"
     old.write_text('{"schema": 1, "ok": true, "old": true}\n')
     assert run(capsys, "canary", "--runner", "claude-code")[0] == 0
@@ -412,7 +416,7 @@ def test_an_old_canary_log_in_ws_home_is_set_aside_not_trusted(box, capsys):
 
 
 def test_a_canary_log_that_is_a_symlink_is_not_followed(box, capsys, tmp_path):
-    fake(box, "claude", "1.0.0")
+    fake(box, "claude", "3.0.0")
     target = tmp_path / "elsewhere.jsonl"
     target.write_text("")
     (box / ".ws" / "logs").mkdir()
@@ -522,13 +526,13 @@ CONTROL = "probe-control-abc"
 @pytest.mark.parametrize(
     ("said", "wrote", "problem"),
     [
-        (f"{CONTROL}\ntouch=1\ncurl=6", False, None),
-        (f"{CONTROL}\ntouch=0\ncurl=6", False, None),  # the hidden home is a throwaway layer: judged on the host
-        (f"{CONTROL}\ntouch=0\ncurl=6", True, "wrote outside"),
+        (f"{CONTROL}\ntouch=1\ncurl=1", False, None),
+        (f"{CONTROL}\ntouch=0\ncurl=1", False, None),  # the hidden home is a throwaway layer: judged on the host
+        (f"{CONTROL}\ntouch=0\ncurl=1", True, "wrote outside"),
         (f"{CONTROL}\ntouch=1\ncurl=0", False, "reached the network"),
         (f"{CONTROL}\ntouch=1", False, "network probe did not run"),
-        (f"{CONTROL}\ncurl=6", False, "write probe did not run"),
-        ("touch=1\ncurl=6", False, "ran no command"),
+        (f"{CONTROL}\ncurl=1", False, "write probe did not run"),
+        ("touch=1\ncurl=1", False, "ran no command"),
     ],
 )
 def test_the_probe_is_judged_on_what_got_through(said, wrote, problem):
@@ -546,6 +550,7 @@ def planted_class(monkeypatch, doc):
     monkeypatch.setattr("ws.sandbox.class_launch_doc", lambda c: doc)
     monkeypatch.setattr("ws.wallsettings.host_problem", lambda kind, which=None: None)
     monkeypatch.setattr(canary, "run_probe", lambda *a, **k: None)
+    monkeypatch.setattr(canary, "host_reaches", lambda work, env: True)
     monkeypatch.setattr(canary, "_launch_text", lambda *a, **k: "{}")
 
 
@@ -644,3 +649,51 @@ def test_tokens_skip_for_opencode(box, capsys):
     fake(box, "opencode")
     code, out, _ = run(capsys, "canary", "--runner", "opencode")
     assert code == 0 and "skip  tokens" in out and "skip  probe" in out, out
+
+
+@pytest.mark.parametrize(
+    ("said", "problem"),
+    [
+        (f"{CONTROL}\ntouch=1\nno curl=0 here", "network probe did not run"),  # a whole line, not a substring
+        (f"{CONTROL}\nXtouch=1\ncurl=1", "write probe did not run"),
+        (f"echo {CONTROL}\ntouch=1\ncurl=1", "ran no command"),
+    ],
+)
+def test_the_probe_reads_whole_lines(said, problem):
+    assert problem in (canary.judge_probe(said, CONTROL, False) or "")
+
+
+def test_a_host_that_cannot_connect_leaves_the_network_half_unjudged():
+    assert canary.judge_probe(f"{CONTROL}\ntouch=1\ncurl=0", CONTROL, False, net=False) is None
+
+
+def test_a_probe_is_a_skip_when_the_host_cannot_connect_either(box, monkeypatch):
+    fake(box, "claude")
+    planted_class(monkeypatch, SHUT)
+    monkeypatch.setattr(canary, "host_reaches", lambda work, env: False)
+    (box / "w").mkdir()
+    status, why = canary.check_probe(claude_code, os.environ, box / "w")
+    assert status == canary.SKIP and "can't reach" in why
+
+
+def test_an_old_runner_fails_the_keys_row_naming_what_it_ignores(box, capsys):
+    fake(box, "claude", "2.1.311")
+    code, out, _ = run(capsys, "canary", "--runner", "claude-code")
+    assert code == 1 and "fail  keys" in out and "blockWritesOutsideWorkingDirectories" in out, out
+    assert "2.1.319" in out  # the version to update to: the newest key it misses
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '[runner_options.env]\n"CLAUDE_CODE_OAUTH_TOKEN" = "x"\n',
+        "[runner_options.env]\n'ANTHROPIC_OAUTH_TOKEN' = 'x'\n",
+        'not toml [ "CLAUDE_CODE_OAUTH_TOKEN" = 1\n',
+    ],
+)
+def test_a_quoted_token_key_in_a_job_is_found(text):
+    assert canary._job_token(text) in canary.SIGN_IN_TOKENS
+
+
+def test_a_token_name_in_a_value_is_not_a_key():
+    assert canary._job_token('note = "never set CLAUDE_CODE_OAUTH_TOKEN = here"\n') is None

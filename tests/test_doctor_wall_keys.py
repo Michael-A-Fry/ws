@@ -47,7 +47,7 @@ def ws016(env) -> list[doctor.Check]:
     return doctor._wall_keys_check(env)
 
 
-@pytest.mark.parametrize("version", ["2.1.257", "2.1.321", "2.2.0", "3.0.0", "2.1.321-beta"])
+@pytest.mark.parametrize("version", ["2.1.321", "2.2.0", "3.0.0", "2.1.321-beta"])
 def test_a_claude_code_that_reads_the_wall_keys_is_ok(claude, version):
     seen, env = claude
     seen["version"] = version
@@ -85,16 +85,24 @@ def test_the_table_is_the_one_the_check_and_the_adapter_use(claude):
     seen["version"] = "2.1.256"  # one below the table's version: the check reads the table, not a number of its own
     assert ws016(env)[0].status == "warn"
     seen["version"] = ".".join(map(str, wallsettings.MIN_CLAUDE[READ_BLOCK]))
+    assert READ_BLOCK not in ws016(env)[0].detail  # read at its own version; the newer keys still warn
+    seen["version"] = ".".join(map(str, max(wallsettings.MIN_CLAUDE.values())))
     assert ws016(env)[0].status == "ok"
 
 
 def test_a_policy_that_leaves_the_block_out_has_no_key_for_an_old_claude_code_to_miss(claude, box):
     # with the sandbox off too: with it on, the launch settings write allowRead (the next test)
     seen, env = claude
-    seen["version"] = "2.0.0"
-    (box / "home" / ".ws" / "policy.toml").write_text("[gate]\nread_outside_project = true\nsandbox = false\n")
+    # every headless job still gets the no-prompt key, so that one is the only key left to check
+    seen["version"] = "2.1.319"
+    (box / "home" / ".ws" / "policy.toml").write_text(
+        "[gate]\nread_outside_project = true\nwrite_outside_project = true\nsandbox = false\n"
+    )
     (check,) = ws016(env)
-    assert check.status == "ok" and "no settings key" in check.detail
+    assert check.status == "ok", check.detail
+    assert wallsettings.keys_written(
+        policy.loads("[gate]\nread_outside_project = true\nwrite_outside_project = true\nsandbox = false\n")
+    ) == [f"permissions.{wallsettings.UNATTENDED_KEY}"]
 
 
 def test_the_launch_settings_deny_home_key_is_in_the_table_and_checked_with_the_sandbox_on(claude, box):
@@ -106,7 +114,7 @@ def test_the_launch_settings_deny_home_key_is_in_the_table_and_checked_with_the_
     assert check.status == "warn" and ALLOW_READ in check.detail and "2.1.78" in check.detail
     assert READ_BLOCK not in check.detail and check.fix == "update Claude Code"
     seen["version"] = "2.1.78"
-    assert ws016(env)[0].status == "ok"
+    assert ALLOW_READ not in ws016(env)[0].detail  # read from 2.1.78; the newer keys are named on their own
     assert ALLOW_READ not in wallsettings.keys_written(policy.loads("[gate]\nsandbox = false\n"))
     assert ALLOW_READ in wallsettings.keys_written(policy.default_policy())
 
@@ -184,3 +192,24 @@ def test_the_line_is_in_the_doctor_and_in_the_reference(claude, box):
     assert "WS016" in ids
     page = (Path(__file__).resolve().parents[1] / "docs" / "reference" / "doctor-checks.md").read_text(encoding="utf-8")
     assert "| WS016 | wall-keys |" in page
+
+
+def test_the_write_block_the_no_prompt_key_and_the_credentials_list_are_checked(claude):
+    """2.1.311 reads none of the three (the binary has none of the names): WS016 says so, naming each."""
+    seen, env = claude
+    seen["version"] = "2.1.311"
+    (check,) = ws016(env)
+    assert check.status == "warn"
+    assert "permissions.blockWritesOutsideWorkingDirectories" in check.detail and "2.1.314" in check.detail
+    assert "permissions.denyInsteadOfPrompting" in check.detail and "2.1.319" in check.detail
+    assert "sandbox.credentials" not in check.detail  # 2.1.221 is older than 2.1.311
+    seen["version"] = "2.1.220"
+    assert "sandbox.credentials" in ws016(env)[0].detail
+
+
+def test_write_outside_project_takes_the_write_block_out_of_what_is_checked():
+    on = wallsettings.keys_written(policy.default_policy())
+    off = wallsettings.keys_written(policy.loads("[gate]\nwrite_outside_project = true\n"))
+    assert (
+        f"permissions.{wallsettings.WRITE_BLOCK_KEY}" in on and f"permissions.{wallsettings.WRITE_BLOCK_KEY}" not in off
+    )

@@ -11,7 +11,7 @@ import re
 from datetime import UTC, datetime
 from pathlib import Path
 
-from ws import canary, gate, jobwatch, jsonl, rating, runrecord, sandbox
+from ws import canary, gate, jobwatch, jsonl, rating, runrecord, sandbox, upgrade
 from ws import eval as ws_eval
 from ws import node as ws_node
 from ws.adapters import opencode
@@ -39,6 +39,7 @@ SCHEMAS = {
     "footprint.jsonl": ws_node.SCHEMA_VERSION,
     "asks.jsonl": opencode.ASKS_SCHEMA,
     "alerts.jsonl": jobwatch.SCHEMA_VERSION,
+    "upgrade-history.jsonl": upgrade.HISTORY_SCHEMA,
 }
 
 # Version 2 of the run record, frozen: a later change may add a key to the schema under a new number, never to this one.

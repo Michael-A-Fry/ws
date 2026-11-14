@@ -77,7 +77,7 @@ def render(job: Scheduled, env, ws_cmd: list[str]) -> dict[str, str]:
         rotate = " ".join(_quote(w, expand=True) for w in [*ws_cmd, "watch", "rotate", job.name])
         out = (
             f"StandardOutput=append:{_schedule.logs_dir(env) / (job.name + '.log')}\nStandardError=inherit\n"
-            f"ExecStopPost={rotate}\n"
+            f"ExecStopPost=-{rotate}\n"
         )
     service = (
         _header(source)
@@ -103,8 +103,8 @@ def _env_lines(env) -> list[str]:
 
 def render_watch(env, ws_cmd: list[str]) -> dict[str, str]:
     """The alert template (`ws watch alert %i`, run by every unit's OnFailure=) and the hourly dead-man service and timer.
-    The alert has no OnFailure= of its own (it would loop). The dead-man's exit 1 means "a job is overdue" and it has
-    raised that alert itself, so it is a success to systemd; a crash is not, and does alert."""
+    The alert has no OnFailure= of its own (it would loop). The dead-man's exit 3 means "a job is overdue" and it has
+    raised that alert itself, so it is a success to systemd; any other exit (a crash is 1) fails the unit and alerts."""
     env_text = "\n".join(_env_lines(env))
     alert = " ".join(_quote(w, expand=True) for w in [*ws_cmd, "watch", "alert"]) + ' "%i"'  # %i is the specifier
     dead = " ".join(_quote(w, expand=True) for w in [*ws_cmd, "watch", "deadman"])
@@ -114,7 +114,7 @@ def render_watch(env, ws_cmd: list[str]) -> dict[str, str]:
         + f"ExecStart={alert}\nTimeoutStartSec=60\n",
         f"{DEADMAN}.service": _header("ws's scheduler role")
         + f"[Unit]\nDescription=ws dead-man check: jobs that stopped running\nOnFailure={ALERT}\n\n"
-        + f"[Service]\nType=oneshot\nSlice={SLICE}\n{env_text}\nExecStart={dead}\nSuccessExitStatus=1\nTimeoutStartSec=120\n",
+        + f"[Service]\nType=oneshot\nSlice={SLICE}\n{env_text}\nExecStart={dead}\nSuccessExitStatus=3\nTimeoutStartSec=120\n",
         f"{DEADMAN}.timer": _header("ws's scheduler role")
         + "[Unit]\nDescription=ws dead-man check (hourly)\n\n[Timer]\nOnCalendar=*-*-* *:07:00\nPersistent=true\n"
         + f"Unit={DEADMAN}.service\n\n[Install]\nWantedBy=timers.target\n",
@@ -222,7 +222,7 @@ def activate(env, runner=None) -> list[str]:
     left_out, problems = _skip_foreign(env, files)
     files = [p for p in files if p.name not in left_out]
     timers = [p for p in files if p.suffix == ".timer"]
-    if not timers:  # every job clashed: the shared slice alone is not worth linking
+    if not [p for p in timers if p.name not in OWN]:  # every job clashed: ws's own units alone are not worth linking
         return problems
     for argv in (
         ["systemctl", "--user", "link", *map(str, files)],

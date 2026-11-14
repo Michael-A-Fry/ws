@@ -401,3 +401,15 @@ def test_run_record_cli_takes_repos_and_permissions(base, monkeypatch):
     bad = cli.build_parser().parse_args([*argv, "--perm", "contents=owner"])
     with pytest.raises(broker.WsError):
         broker.cmd_run_record(bad)
+
+
+def test_a_name_retiered_to_elevated_after_minting_loses_its_token_on_elevate_off(app):
+    app.s.record("r1", "home", "lead-elevated", ["github-app"], **GRANT)
+    token = app.mint()["token"]  # minted as a worker name: not elevated then
+    text = app.s.registry.read_text()
+    assert 'tier = "worker"' in text
+    app.s.registry.write_text(text.replace('tier = "worker"', 'tier = "lead-elevated"'))
+    out = broker.elevate(False, app.sock)
+    assert out["revoked"] == 1 and app.fake.revoked == [token]
+    assert app.broker._minted == [] and app.broker._mint_cache == {}
+    assert app.refused().code == "elevation_off"

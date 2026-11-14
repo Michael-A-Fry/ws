@@ -1126,8 +1126,10 @@ class Broker:
         return ok, failed
 
     def _revoke_minted(self) -> tuple[int, int]:
-        """Revoke upstream every token minted for an elevated name; (revoked, failed). The cache forgets them."""
-        return self._revoke_all(self._take_minted(lambda m: m.elevated))
+        """Revoke upstream every token minted for a name that was elevated when minted or is elevated now; (revoked,
+        failed). The cache forgets them."""
+        now_elevated = self._elevated_names()  # the registry's tier now: a name re-tiered after minting is caught too
+        return self._revoke_all(self._take_minted(lambda m: m.elevated or m.name in now_elevated))
 
     def reap_minted(self) -> tuple[int, int]:
         """Revoke the tokens of runs that have ended (their record removed, expired or no longer trusted, or no longer
@@ -1233,7 +1235,7 @@ class Broker:
             return {e.name for e in wsecrets.load_registry(self.registry).values() if e.elevated}
         except wsecrets.SecretsError:
             with self._lock:
-                return {g.name for g in self._grants.values()}
+                return {g.name for g in self._grants.values()} | {m.name for m in self._minted}
 
     def _purge(self, now: float) -> None:
         for k in [k for k, g in self._grants.items() if g.expires <= now]:

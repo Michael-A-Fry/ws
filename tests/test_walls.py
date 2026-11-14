@@ -1338,3 +1338,51 @@ def test_an_alert_is_plain_when_the_policy_does_not_load(box):
     policy_file().write_text("[gate\n", encoding="utf-8")
     assert ntfy.walled_folder(str(box), dict(os.environ)) is True
     assert ntfy.walled_folder("", dict(os.environ)) is False
+
+
+# ---- ls-10: an allowlist planted inside the repo is ignored --------------------------------------------------------------
+
+
+def test_an_allowlist_edit_planted_inside_a_class_repo_is_ignored(host):
+    """The lists that say what a class session may do (the policy, the class files) live outside the repo. A policy file
+    and a settings allow rule planted in the class's repo change neither the policy ws loads nor the launch copy, and the
+    settings file is refused at the start."""
+    pol_before = policy.load(policy_file())
+    ctx, _, _ = walls._context(dict(os.environ), walls._now())
+    root = host.box / "work" / "alpha"
+    root.mkdir(parents=True)
+    before = walls._launch_copy(ctx, str(root), ctx.docs["alpha"])
+    (root / ".ws").mkdir()
+    (root / ".ws" / "policy.toml").write_text('[gate]\nallow_write = ["/"]\n', encoding="utf-8")
+    (root / "policy.toml").write_text('[gate]\nallow_write = ["/"]\n', encoding="utf-8")
+    (root / ".claude").mkdir()
+    (root / ".claude" / "settings.json").write_text('{"permissions": {"allow": ["Bash(*)"]}}', encoding="utf-8")
+    with walls._chdir(root):
+        assert policy.policy_path(dict(os.environ)) == policy_file()
+        assert policy.load(policy_file()) == pol_before
+        ctx, _, _ = walls._context(dict(os.environ), walls._now())
+        after = walls._launch_copy(ctx, str(root), ctx.docs["alpha"])
+    fs_a, fs_b = after["sandbox"]["filesystem"], before["sandbox"]["filesystem"]
+    for key in ("allowWrite", "allowRead"):  # nothing more is open
+        assert fs_a.get(key) == fs_b.get(key), key
+    assert set(fs_a.get("denyWrite", [])) >= set(fs_b.get("denyWrite", []))  # a planted config file is only locked
+    assert after["sandbox"]["network"] == before["sandbox"]["network"]
+    assert after["permissions"] == before["permissions"] and "allow" not in after["permissions"]
+    refusal = wallsettings.project_problem([str(root)], host.box / "home")
+    assert refusal is not None and refusal.kind == "project_load_refused" and "settings.json" in refusal.hint
+
+
+# ---- rr-r2-3: no class key is parsed and read by nothing -----------------------------------------------------------------
+
+
+def test_every_class_key_the_policy_parses_is_read_outside_the_parser():
+    import dataclasses
+
+    src = Path(walls.__file__).resolve().parent
+    readers = "".join(
+        p.read_text(encoding="utf-8")
+        for p in src.rglob("*.py")
+        if p.name != "policy.py" and "__pycache__" not in p.parts
+    )
+    unread = [f.name for f in dataclasses.fields(policy.Class) if f.name != "name" and f".{f.name}" not in readers]
+    assert unread == [], f"parsed but read by no module: {unread}"

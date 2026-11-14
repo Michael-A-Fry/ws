@@ -113,6 +113,42 @@ The wall fails closed. With no bubblewrap, or with unprivileged user namespaces 
 prints the install line. `--no-sandbox` starts the runner bare and says what that gives up, so skipping the wall is a
 visible choice.
 
+## The boundaries, and who holds each side
+
+ws draws five boundaries. Each one has a side you control and a side a session, a model or another machine controls.
+
+```mermaid
+flowchart LR
+  you["You: policy, root files, accounts"]
+  subgraph host["Your machine"]
+    own["Your own sessions"]
+    subgraph cls["A walled class: its own account"]
+      cs["Class session: Claude Code or a local model"]
+    end
+    broker["Secrets broker: not a model"]
+    lm["Local model server on loopback"]
+  end
+  node["Another machine you joined"]
+  term["A browser terminal"]
+  you -->|"writes"| cls
+  own -.->|"messages refused, folders unreadable"| cs
+  cs -->|"loopback only under local_only"| lm
+  cs -.->|"asks for a lease, never sees the store"| broker
+  node -.->|"a ledger it can undo"| host
+  term -.->|"a terminal, not a session"| own
+```
+
+For each, Shostack's four questions: what are we working on, what can go wrong, what are we doing about it, and did we
+do a good job.
+
+| Boundary | Who controls each side | What can go wrong | What ws does | How you know it holds |
+|---|---|---|---|---|
+| A walled class | You hold the policy, the root-owned class files and the account; the session holds only its repos | A session reads another class's folder, sends a message out, or reaches a host the class doesn't list | Its own account, a managed file and a launch file, messaging tools denied, a host allowlist | `ws walls canary` on any machine; `ws walls check` on yours |
+| A local model in a class | You choose `local_only`; the model gets what the class gives a Claude session | A local session gets less of the wall than a Claude one, or a hosted model is used instead | The same launch file, loopback only, a hosted provider refused before it starts | The `local-model-in-wall` case |
+| The secrets broker | You paste values; the broker holds the store; a session holds a lease at most | A session reads a value or keeps one past the run | The broker is the only process that holds values; a job gets a lease | `ws doctor`, and the broker's own log |
+| Another machine | You join it; the other machine keeps its own account | A join leaves something behind that can't be taken out | Every change a join makes is written in a ledger as it's made | `ws node show` lists it, and `ws node remove` takes it out |
+| A browser terminal | You hold the sign-in; the browser holds a terminal | A page in the browser drives a session | `ws term` refuses to listen on every interface | Its tests, and the typed refusal of `--bind 0.0.0.0` |
+
 ## What the wall doesn't stop
 
 - **The network.** The wall leaves the network as it's, because the runner needs its model. `allow_hosts` filters hosts

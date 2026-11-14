@@ -311,7 +311,7 @@ The secrets broker: agents ask it to use a key and never see the value.
 Run the broker (a Unix socket and a loopback lease proxy).
 
 ```text
-ws broker serve [-h] [--socket PATH] [--group GROUP] [--port PORT] [--lease-ttl SECONDS]
+ws broker serve [-h] [--socket PATH] [--group GROUP] [--port PORT] [--lease-ttl SECONDS] [--require-run]
 ```
 
 | Argument | Meaning |
@@ -320,13 +320,14 @@ ws broker serve [-h] [--socket PATH] [--group GROUP] [--port PORT] [--lease-ttl 
 | `--group GROUP` | Also serve members of this group (socket folder becomes 0750). |
 | `--port PORT` | Lease proxy port on 127.0.0.1 (default: any free one). |
 | `--lease-ttl SECONDS` | Longest lease (default 3600). |
+| `--require-run` | Every lease needs a run record, scoped name or not (also [roles.secrets] require_run = true). |
 
 ### `ws broker request`
 
 Ask for a lease and print it as JSON (for scripts).
 
 ```text
-ws broker request [-h] --purpose PURPOSE --host HOST [--ttl SECONDS] [--socket PATH] name
+ws broker request [-h] --purpose PURPOSE --host HOST [--ttl SECONDS] [--run RUN_ID] [--socket PATH] name
 ```
 
 | Argument | Meaning |
@@ -335,6 +336,7 @@ ws broker request [-h] --purpose PURPOSE --host HOST [--ttl SECONDS] [--socket P
 | `--purpose PURPOSE` | What the lease is for; it must be in the registry entry's `purposes`. Required. |
 | `--host HOST` | The host the lease may reach. Required. |
 | `--ttl SECONDS` | Ask for a shorter lease. |
+| `--run RUN_ID` | The run the lease is for (its run record says what it may have). |
 | `--socket PATH` | The broker's socket (default: from the profile, else `~/.local/state/ws/run/broker.sock`). |
 
 ### `ws broker status`
@@ -347,6 +349,52 @@ ws broker status [-h] [--socket PATH]
 
 | Argument | Meaning |
 |---|---|
+| `--socket PATH` | The broker's socket (default: from the profile, else `~/.local/state/ws/run/broker.sock`). |
+
+### `ws broker run-record`
+
+Write, show or remove a run record (what one run may lease).
+
+```text
+ws broker run-record write [-h] --area AREA --tier {walled,worker,lead,lead-elevated} [--name NAME] [--uid UID]
+                           [--ttl SECONDS] [--dir PATH] run
+ws broker run-record show [-h] [--dir PATH] run
+ws broker run-record rm [-h] [--dir PATH] run
+```
+
+| Argument | Meaning |
+|---|---|
+| `run` | The run ID. |
+| `--area AREA` | The run's area. Required for `write`. |
+| `--tier TIER` | The run's tier. Required for `write`. |
+| `--name NAME` | A secret name the run declares (repeat). |
+| `--uid UID` | Only this caller uid may lease under the run. |
+| `--ttl SECONDS` | The run ends after this; its leases with it. |
+| `--dir PATH` | The record folder (default `~/.local/state/ws/run/records`). |
+
+### `ws broker audit-copy`
+
+Copy the audit log off this machine (a job runs it daily).
+
+```text
+ws broker audit-copy [-h] [--to DEST]
+```
+
+| Argument | Meaning |
+|---|---|
+| `--to DEST` | A folder or user@host:folder (default [roles.secrets] audit_copy). |
+
+## `ws elevate`
+
+The kill switch for elevated secrets: `ws elevate off` refuses them at once.
+
+```text
+ws elevate [-h] [--socket PATH] {off,on,status}
+```
+
+| Argument | Meaning |
+|---|---|
+| `{off,on,status}` | Off: refuse and revoke; on: allow again (from your own terminal only); status. |
 | `--socket PATH` | The broker's socket (default: from the profile, else `~/.local/state/ws/run/broker.sock`). |
 
 ## `ws note`

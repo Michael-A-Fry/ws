@@ -274,7 +274,7 @@ ws doctor
 
 If WS007 warns, set `kernel.yama.ptrace_scope = 1`. The line is in the check's `fix` text.
 
-## Swap note: the runner's sandbox, and the Claude Code version it needs
+## Swap note: The runner's sandbox, and the Claude Code version it needs
 
 The wall for Claude Code is Claude Code's own sandbox and permission keys (`sandbox.*`,
 `permissions.blockReadsOutsideWorkingDirectories`, `permissions.disableBypassPermissionsMode`). ws writes the keys and

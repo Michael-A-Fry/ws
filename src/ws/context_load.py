@@ -210,7 +210,9 @@ def search(recs: list[Rec], message: str, limit: int = MAX_HITS) -> list[Rec]:
         conn = sqlite3.connect(":memory:")
         try:
             conn.execute("CREATE VIRTUAL TABLE d USING fts5(title, body, tokenize='porter unicode61')")
-            conn.executemany("INSERT INTO d(rowid, title, body) VALUES (?,?,?)", [(i, r.title, r.body) for i, r in enumerate(recs)])
+            conn.executemany(
+                "INSERT INTO d(rowid, title, body) VALUES (?,?,?)", [(i, r.title, r.body) for i, r in enumerate(recs)]
+            )
             for joiner in (" ", " OR "):
                 q = joiner.join(f'"{t}"' for t in terms)
                 rows = conn.execute(

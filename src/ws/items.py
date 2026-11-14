@@ -299,6 +299,7 @@ KINDS: dict[str, Kind] = dict(
         _logrow("eval-result", "eval", "Eval results", _DATA("eval", "results")),
         _logrow("eval-look", "eval", "Eval looks", _DATA("eval", "looks")),
         _logrow("job-alert", "jobwatch", "Job alerts", _state("logs", "alerts")),
+        _logrow("upgrade", "upgrade", "Upgrade history", _state("upgrade-history")),
         # never the payload, the claims text, the question or the broker's host:
         _logrow(
             "gate-call",
@@ -370,7 +371,17 @@ LINK_SPEC: dict[str, tuple[tuple[str, str, str], ...]] = {
     "area": (("supersedes", "area", "supersedes"),),
     **{
         k: ()
-        for k in ("canary", "eval-result", "eval-look", "gate-call", "verdict", "wall-report", "footprint", "job-alert")
+        for k in (
+            "canary",
+            "eval-result",
+            "eval-look",
+            "gate-call",
+            "verdict",
+            "wall-report",
+            "footprint",
+            "job-alert",
+            "upgrade",
+        )
     },
     **{k: () for k in ("broker", "session", "approval", "versions", "limits", "view")},  # points at nothing, said
 }

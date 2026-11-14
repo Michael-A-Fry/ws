@@ -20,6 +20,7 @@ below, and `python3 scripts/gen_code_map.py --check` (prek and CI) fails when it
 | `cli.py` | The `ws` command |
 | `config_cmd.py` | `ws config`: every file ws reads, where its path came from, and the keys it sets |
 | `conformance.py` | The runner conformance kit: what every runner adapter must do the same way, as data and a few... |
+| `context_load.py` | Context loader: what a session is told when it starts, and what the first prompt adds, from one... |
 | `devices.py` | `ws device add`: the one line that links a second machine to this one |
 | `doctor.py` | `ws doctor`: one line per check, each with a stable ID |
 | `eval.py` | `ws eval`: your own eval, with TOML tasks, deterministic graders, ten metrics and an exact A/B... |

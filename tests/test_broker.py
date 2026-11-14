@@ -1086,7 +1086,7 @@ def test_elevate_off_refuses_elevated_leases_drops_live_ones_and_revokes(scoped)
     other = scoped.lease("leadkey", run="r-el")
     assert scoped.get(live) == 200
     out = broker.elevate(False, scoped.sock)
-    assert out == {"elevated": False, "dropped": 1, "revoked": 1, "revoke_failed": 0}
+    assert out == {"elevated": False, "saved": True, "dropped": 1, "revoked": 1, "revoke_failed": 0}
     assert revoked == ["rootish"]
     assert scoped.get(live) == 403, "the live elevated lease is gone at once"
     assert scoped.get(other) == 200, "a lead name is not elevated"
@@ -1137,7 +1137,7 @@ def test_elevate_cli_with_no_broker_sets_the_file_and_on_is_refused_in_a_session
 
     monkeypatch.setenv("WS_HOME", str(base))
     monkeypatch.setenv("HOME", str(base))
-    monkeypatch.setenv("WS_BROKER_SOCKET", str(base / "none.sock"))
+    monkeypatch.delenv("WS_BROKER_SOCKET", raising=False)
     ns = cli.build_parser().parse_args(["elevate", "off"])
     assert broker.cmd_elevate(ns) == 0
     assert broker.read_elevation(broker.elevate_path(), os.geteuid()) is False
@@ -1188,3 +1188,88 @@ def test_audit_copy_to_a_folder_and_to_an_scp_target(base):
     assert seen[0][-1] == "store.example:logs/broker-box.jsonl"
     with pytest.raises(broker.WsError):
         broker.audit_copy(log, str(base / "missing"), "box")
+
+
+# ---------------------------------------------------------------- cold review: the kill switch never fails open
+
+
+def test_elevate_must1_with_no_broker_it_refuses_rather_than_write_a_switch_the_broker_never_reads(base, monkeypatch):
+    from ws import cli
+
+    monkeypatch.setenv("WS_HOME", str(base))
+    monkeypatch.setenv("HOME", str(base))
+    monkeypatch.setenv("WS_BROKER_SOCKET", str(base / "none.sock"))
+    with pytest.raises(broker.WsError) as e:
+        broker.cmd_elevate(cli.build_parser().parse_args(["elevate", "off"]))
+    assert e.value.kind == "unavailable" and "not this user's to write" in e.value.message
+    assert "sudo -u ws-broker" in e.value.hint
+    assert not broker.elevate_path().exists(), "no switch written where the broker would not look"
+    monkeypatch.delenv("WS_BROKER_SOCKET")
+    store = wsecrets.store_dir()
+    store.mkdir(parents=True, mode=0o700)
+    real = os.geteuid
+    monkeypatch.setattr(broker.os, "geteuid", lambda: real() + 1)  # the store now reads as another user's: walled
+    assert "belongs to another user" in broker._not_this_users_broker(None)
+
+
+def test_elevate_must2_a_switch_file_that_cannot_be_written_still_turns_elevation_off(scoped):
+    scoped.s.record("r-el", "home", "lead-elevated", ["rootish"])
+    live = scoped.lease("rootish", run="r-el")
+    scoped.s.elevate_file.mkdir()  # a folder where the file should be: every write fails
+    out = broker.elevate(False, scoped.sock)
+    assert out["saved"] is False and out["dropped"] == 1 and out["elevated"] is False
+    assert scoped.get(live) == 403
+    assert refusal(scoped.lease, "rootish", run="r-el").code == "elevation_off"
+    assert broker.status(scoped.sock)["elevated"] is False
+    assert "off_unsaved" in [a["status"] for a in scoped.audit() if a["op"] == "elevate"]
+    e = refusal(broker.elevate, True, scoped.sock)
+    assert e.code == "store_unreadable", "on needs the file; it stays off"
+    assert scoped.broker.elevation_on() is False
+
+
+def test_elevate_must2_two_writes_at_once_never_share_a_temp_file(base):
+    import concurrent.futures
+
+    f = base / "elevate.json"
+    with concurrent.futures.ThreadPoolExecutor(8) as ex:
+        list(ex.map(lambda i: broker.write_elevation(f, i % 2 == 0), range(64)))
+    assert broker.read_elevation(f, os.geteuid()) in (True, False)
+    assert [p.name for p in base.iterdir()] == ["elevate.json"]
+
+
+def test_elevate_on_refuses_when_its_audit_line_cannot_be_written(scoped):
+    broker.elevate(False, scoped.sock)
+    scoped.log.unlink()
+    scoped.log.mkdir()
+    assert refusal(broker.elevate, True, scoped.sock).code == "audit_failed"
+    assert scoped.broker.elevation_on() is False
+
+
+def test_elevate_a_name_retiered_to_elevated_after_its_lease_is_still_stopped(scoped):
+    scoped.s.record("r-el", "home", "lead-elevated", ["leadkey"])
+    live = scoped.lease("leadkey", run="r-el")
+    text = scoped.s.registry.read_text()
+    marked = f'[leadkey]\nhosts = ["{scoped.host}"]\ntier = "lead"'
+    assert marked in text
+    scoped.s.registry.write_text(text.replace(marked, marked.replace('"lead"', '"lead-elevated"')))
+    assert broker.elevate(False, scoped.sock)["dropped"] == 1, "the registry's tier now, not the grant's"
+    assert scoped.get(live) == 403
+
+
+def test_run_record_rewritten_with_another_area_tier_or_uid_ends_the_leases_under_it(scoped):
+    for change in ({"area": "money"}, {"tier": "lead"}, {"uid": os.geteuid() + 1}):
+        scoped.s.record("r1", "home", "worker", ["work"])
+        live = scoped.lease("work", run="r1")
+        assert scoped.get(live) == 200
+        kw = {"area": "home", "tier": "worker"} | change
+        scoped.s.record("r1", kw.pop("area"), kw.pop("tier"), ["work"], **kw)
+        assert scoped.get(live) == 403, change
+
+
+def test_run_record_a_symlinked_record_folder_is_refused(scoped, base):
+    scoped.s.record("r1", "home", "worker", ["work"])
+    real = base / "elsewhere"
+    scoped.s.records.rename(real)
+    scoped.s.records.symlink_to(real)
+    e = refusal(scoped.lease, "work", run="r1")
+    assert e.code == "run_refused" and "symlink" in e.reason

@@ -246,26 +246,34 @@ def read_run_record(folder: Path, run_id: object, own_uid: int, now: float | Non
     Raises RecordError."""
     if not (isinstance(run_id, str) and RUN_ID_RE.match(run_id)):
         raise RecordError("malformed", "the run id is not a run id (letters, digits, '.', '-' and '_')")
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
     try:
-        _check_private(folder.stat(), own_uid, "the run record folder", True)
+        dfd = os.open(folder, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nofollow)
     except FileNotFoundError as e:
         raise RecordError("missing", "there are no run records") from e
     except OSError as e:
-        raise RecordError("untrusted", "the run record folder cannot be read") from e
+        raise RecordError("untrusted", "the run record folder cannot be opened (a symlink is refused)") from e
     try:
-        fd = os.open(folder / run_id, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    except FileNotFoundError as e:
-        raise RecordError("missing", "no run record for that run") from e
-    except OSError as e:
-        raise RecordError("untrusted", "the run record cannot be opened (a symlink is refused)") from e
-    try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode):
-            raise RecordError("untrusted", "the run record is not a regular file")
-        _check_private(st, own_uid, "the run record", False)
-        data = os.read(fd, MAX_RECORD + 1)
+        dst = os.fstat(dfd)
+        if not stat.S_ISDIR(dst.st_mode):
+            raise RecordError("untrusted", "the run record folder is not a folder")
+        _check_private(dst, own_uid, "the run record folder", True)
+        try:
+            fd = os.open(run_id, os.O_RDONLY | nofollow, dir_fd=dfd)  # the checked folder, not a path a swap can move
+        except FileNotFoundError as e:
+            raise RecordError("missing", "no run record for that run") from e
+        except OSError as e:
+            raise RecordError("untrusted", "the run record cannot be opened (a symlink is refused)") from e
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise RecordError("untrusted", "the run record is not a regular file")
+            _check_private(st, own_uid, "the run record", False)
+            data = os.read(fd, MAX_RECORD + 1)
+        finally:
+            os.close(fd)
     finally:
-        os.close(fd)
+        os.close(dfd)
     if len(data) > MAX_RECORD:
         raise RecordError("malformed", "the run record is too big")
     try:
@@ -344,7 +352,7 @@ def read_elevation(path: Path, own_uid: int) -> bool:
 
 def write_elevation(path: Path, on: bool) -> None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{os.urandom(6).hex()}.tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -578,6 +586,7 @@ class Broker:
         self.records = records  # the run record folder; None means none, so every scoped name is refused
         self.elevate_file = elevate_file  # the kill switch's file; None means elevation is never switched off
         self.require_run = require_run  # every lease needs a run record, scoped name or not
+        self._forced_off = False  # `elevate off` held in memory, so a switch file that cannot be written still bites
         # Called with each live grant `ws elevate off` drops; a minter that can revoke its upstream token adds one. One
         # that raises counts as a failed revoke and is logged; the grant is dropped either way.
         self.revokers: list = []
@@ -895,6 +904,8 @@ class Broker:
         return read_run_record(self.records, run_id, self.own_uid, self.clock() if now is None else now)
 
     def elevation_on(self) -> bool:
+        if self._forced_off:
+            return False
         return True if self.elevate_file is None else read_elevation(self.elevate_file, self.own_uid)
 
     def _op_elevate(self, msg: dict, uid: int, pid: int) -> dict:
@@ -904,33 +915,63 @@ class Broker:
         if state == "on" and uid != self.own_uid:
             self.audit.write("elevate", "caller_refused", uid=uid, pid=pid)
             return _refuse("caller_refused", "only the broker's own user turns elevation back on")
-        if self.elevate_file is None:
-            return _refuse("store_unreadable", "this broker has no elevation file")
-        try:
-            write_elevation(self.elevate_file, state == "on")
-        except OSError:
-            self.audit.write("elevate", "store_unreadable", uid=uid, pid=pid)
-            return _refuse("store_unreadable", "the elevation file cannot be written")
+        if state == "on":
+            if self.elevate_file is None:
+                return _refuse("store_unreadable", "this broker has no elevation file")
+            if not self.audit.write("elevate", "on", uid=uid, pid=pid):
+                return _refuse("audit_failed", "the audit line could not be written, so elevation stays off")
+            try:
+                write_elevation(self.elevate_file, True)
+            except OSError:
+                self.audit.write("elevate", "store_unreadable", uid=uid, pid=pid)
+                return _refuse("store_unreadable", "the elevation file cannot be written, so elevation stays off")
+            self._forced_off = False
+            return {"ok": True, "elevated": True, "saved": True, "dropped": 0, "revoked": 0, "revoke_failed": 0}
+        # off: in memory at once, so nothing below can fail open; the file only makes it outlast a restart
+        self._forced_off = True
+        saved = False
+        if self.elevate_file is not None:
+            try:
+                write_elevation(self.elevate_file, False)
+                saved = True
+            except OSError:
+                self.audit.write("elevate", "store_unreadable", uid=uid, pid=pid)
         dropped = revoked = failed = 0
-        if state == "off":
+        elevated_now = self._elevated_names()
+        with self._lock:
+            gone = [(k, g) for k, g in self._grants.items() if g.elevated or g.name in elevated_now]
+            for k, _ in gone:
+                del self._grants[k]
+        for _, g in gone:
+            dropped += 1
+            for revoke in self.revokers:
+                try:
+                    done = revoke(g)
+                except Exception:  # noqa: BLE001 (a revoker's failure is counted and logged, never fatal)
+                    failed += 1
+                    self.audit.write("revoke", "failed", name=g.name, host=g.host, lease=g.id, run=g.run)
+                    continue
+                if done:
+                    revoked += 1
+                    self.audit.write("revoke", "ok", name=g.name, host=g.host, lease=g.id, run=g.run)
+        self.audit.write("elevate", "off" if saved else "off_unsaved", uid=uid, pid=pid, bytes=dropped)
+        return {
+            "ok": True,
+            "elevated": False,
+            "saved": saved,
+            "dropped": dropped,
+            "revoked": revoked,
+            "revoke_failed": failed,
+        }
+
+    def _elevated_names(self) -> set[str]:
+        """The names the registry marks elevated now. A registry that cannot be read: every live grant's name, so a
+        kill switch pulled while the registry is broken still drops everything."""
+        try:
+            return {e.name for e in wsecrets.load_registry(self.registry).values() if e.elevated}
+        except wsecrets.SecretsError:
             with self._lock:
-                gone = [(k, g) for k, g in self._grants.items() if g.elevated]
-                for k, _ in gone:
-                    del self._grants[k]
-            for _, g in gone:
-                dropped += 1
-                for revoke in self.revokers:
-                    try:
-                        done = revoke(g)
-                    except Exception:  # noqa: BLE001 (a revoker's failure is counted and logged, never fatal)
-                        failed += 1
-                        self.audit.write("revoke", "failed", name=g.name, host=g.host, lease=g.id, run=g.run)
-                        continue
-                    if done:
-                        revoked += 1
-                        self.audit.write("revoke", "ok", name=g.name, host=g.host, lease=g.id, run=g.run)
-        self.audit.write("elevate", state, uid=uid, pid=pid, bytes=dropped)
-        return {"ok": True, "elevated": state == "on", "dropped": dropped, "revoked": revoked, "revoke_failed": failed}
+                return {g.name for g in self._grants.values()}
 
     def _purge(self, now: float) -> None:
         for k in [k for k, g in self._grants.items() if g.expires <= now]:
@@ -958,8 +999,10 @@ class Broker:
             raise _HttpError(503, "store_unreadable") from e
         if entry is None or g.host not in entry.hosts:
             raise _HttpError(403, "host_not_allowed")
-        if g.elevated and not self.elevation_on():
+        if (g.elevated or entry.elevated) and not self.elevation_on():
             raise _HttpError(403, "elevation_off")
+        if g.run is None and entry.scoped:
+            raise _HttpError(403, "run_required")  # the name was scoped after the lease was given
         if g.run is not None:
             try:
                 rec = self.run_record(g.run)
@@ -967,6 +1010,12 @@ class Broker:
                 raise _HttpError(403, "run_ended") from e
             if g.name not in rec.names:
                 raise _HttpError(403, "not_declared")
+            if (rec.area, rec.tier) != (g.area, g.tier) or (rec.uid is not None and rec.uid != g.uid):
+                raise _HttpError(403, "run_ended")  # the record was rewritten: the leases under the old one end
+            if entry.area is not None and entry.area != rec.area:
+                raise _HttpError(403, "area_refused")
+            if (entry.tier or wsecrets.DEFAULT_TIER) not in wsecrets.REACH[rec.tier]:
+                raise _HttpError(403, "tier_refused")
         try:
             value = self.store.read(g.name)
         except FileNotFoundError as e:
@@ -1468,14 +1517,28 @@ def cmd_elevate(args: argparse.Namespace) -> int:
     except BrokerUnavailable as e:
         if not e.not_running:
             raise WsError("unavailable", str(e), _hint(e)) from e
+        why = _not_this_users_broker(args.socket)
+        if why:
+            raise WsError(
+                "unavailable",
+                f"no broker is answering, and its switch is not this user's to write: {why}",
+                "start the broker, or run this as the broker's user: "
+                f"`sudo -u {wsecrets.WALL_USER} env WS_HOME={wsecrets.WALL_HOME} {wsecrets.WALL_BIN} elevate off`",
+            ) from e
         try:
             write_elevation(elevate_path(), on)
         except OSError as e2:
             raise WsError("failed", f"no broker running, and {elevate_path()} cannot be written") from e2
-        out = {"elevated": on, "broker": False, "dropped": 0, "revoked": 0, "revoke_failed": 0}
+        out = {"elevated": on, "broker": False, "saved": True, "dropped": 0, "revoked": 0, "revoke_failed": 0}
     if args.json:
         output.result(out)
         return 0
+    if not out.get("saved", True):
+        print(
+            "ws: elevation is off in the running broker, but the switch file could not be saved: a restart would"
+            " turn it back on. Fix the broker's state folder, then run `ws elevate off` again.",
+            file=sys.stderr,
+        )
     if on:
         print("ws: elevation is on: elevated names can be leased again by runs whose tier reaches them")
     elif out["broker"]:
@@ -1485,7 +1548,27 @@ def cmd_elevate(args: argparse.Namespace) -> int:
         )
     else:
         print(f"ws: elevation is off (no broker running; {elevate_path()} says so for when one starts)")
-    return 1 if out.get("revoke_failed") else 0
+    return 1 if out.get("revoke_failed") or not out.get("saved", True) else 0
+
+
+def _not_this_users_broker(socket_flag: str | None) -> str:
+    """Why the switch file this user would write is not the one the broker reads ("" when it is): the broker is behind
+    the wall, or is named by a socket the profile, the environment or the flag points elsewhere."""
+    try:
+        cfg = wsecrets._profile_secrets(None)
+    except wsecrets.SecretsError:
+        return "the profile cannot be read"
+    store = wsecrets.store_dir(None, cfg)
+    try:
+        if store.stat().st_uid != os.geteuid():
+            return f"the store {store} belongs to another user (the broker runs behind the wall)"
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return f"the store {store} cannot be read from here"
+    if socket_flag or os.environ.get("WS_BROKER_SOCKET") or cfg.get("socket"):
+        return "the broker's socket is set explicitly, so its state folder may not be this user's"
+    return ""
 
 
 def register_elevate(sub) -> None:

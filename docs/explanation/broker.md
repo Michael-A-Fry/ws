@@ -74,6 +74,10 @@ WSL2 it's not built yet, and `ws doctor` (WS104) stays at warn.
 ## What the broker doesn't stop
 
 - **A same-user store.** Until you run the secret wall, a program running as you can read the store files. WS104 warns.
+- **Tiers, areas and `ws elevate on` without the wall.** Run records and the switch file sit in the broker's state
+  folder. Until the wall puts that folder under its own user, a session running as you can write its own run record
+  (any tier, any area) or the switch file. The checks then stop mistakes, not a session that means harm.
+  `ws elevate off` still works from anywhere: pulling the switch only ever takes access away.
 - **A secret the agent already has.** The broker can't take back a key that's in the environment, a file the agent can
   read or its prompt. `ws gate launch` starts the runner with a short list of environment variables, not the whole
   shell's; a variable you name with `--pass-env` is the agent's.

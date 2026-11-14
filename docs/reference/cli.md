@@ -535,8 +535,8 @@ It reads one folder of plain files: `WS_CONTEXT_DIR`, else `context` in the data
 area card print at start, with the index lines of the session's own class, under 10,000 characters. The first prompt
 adds up to five current records a full-text search on the message finds, and the session record keeps their ids. A
 prompt that finds nothing is tried again on the next one, up to three prompts. A walled session sees only its own
-class's records and the core preferences. A record whose `class` is not a known policy class, or whose front matter ws
-can't fully read, is never loaded. Each file is read to 256 KB. It is advice: an unreadable folder or policy loads less,
+class's records and the core preferences. A record whose `class` isn't a known policy class, or whose front matter ws
+can't fully read, is never loaded. Each file is read to 256 KB. It's advice: an unreadable folder or policy loads less,
 and it never fails the runner. See `src/ws/context_load.py` for the folder layout.
 
 ## `ws msg`

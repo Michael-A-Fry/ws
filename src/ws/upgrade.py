@@ -475,7 +475,9 @@ def _rollback(args: argparse.Namespace, env: Mapping[str, str]) -> int:
     code = reinstall(args, target)
     if code != 0:
         record(env, "rollback", before, None)
-        _say(args, f"the rollback to {target} failed (exit {code}); ws and the hooks are as they were or as named above")
+        _say(
+            args, f"the rollback to {target} failed (exit {code}); ws and the hooks are as they were or as named above"
+        )
         return EXIT_FAILED if code == EXIT_TIMEOUT else code
     record(env, "rollback", before, target)
     if args.json:

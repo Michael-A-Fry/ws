@@ -51,7 +51,7 @@ A log line with no id of its own gets `h` and 12 hex digits of its content, so t
 
 ## Get, list, views
 
-- `items.get("run:ID")` returns the item or None. A kind not in the table, or a ref that is not `kind:id`, is a typed
+- `items.get("run:ID")` returns the item or None. A kind not in the table, or a ref that isn't `kind:id`, is a typed
   error (`unknown-kind`, `bad-ref`).
 - `items.list(kind, where, sort, group)` goes through the reader. `where` is equality on fields and nothing else; `sort`
   is a field name (`-field` descends); `group` gives a dict by that field. It returns at most 300 rows. There is no
@@ -64,11 +64,11 @@ A log line with no id of its own gets `h` and 12 hex digits of its content, so t
 One SQLite table `links(from_ref, rel, to_ref)` in the cache folder (`items/links.db`), deleted and rebuilt from the
 stores on each run and never patched. `rel` is one of `supersedes`, `source`, `about`, `used`, `added`, `produced`,
 `parent`. `items.rebuild_index()` rebuilds it; `items.linked(ref, db, rel, inbound)` answers "what does this point at" and
-"what points here". Rebuilding from nothing gives the same table as the live one.
+"what points here." Rebuilding from nothing gives the same table as the live one.
 
-Links from the logs are soft: a session record is removed after 30 days, so a run that points at one is not a fault. A
+Links from the logs are soft: a session record is removed after 30 days, so a run that points at one isn't a fault. A
 link from an area, a register row or a view is strict: `items.check` exits 1 when it points at nothing (a row whose `area`
-is not in the table, a `needs` that names no row).
+isn't in the table, a `needs` that names no row).
 
 ## Areas and register rows
 
@@ -93,7 +93,7 @@ sha256 of its bytes) is the one the caller saw. A moved revision gives outcome `
 revision, so the caller decides again; a lock held too long is tried up to three times. Outcomes: `ok`, `conflict`,
 `refused`, `invalid`, `missing`, `busy` (the lock was held through all three tries; nothing was written). The actor
 goes in `changed_by`. The human-only rule trusts the actor string the caller passes (an empty `person:` is refused),
-so it is advisory until a session has an identity ws can check. Append-only kinds never use it.
+so it's advisory until a session has an identity ws can check. Append-only kinds never use it.
 
 ## Add a record kind
 
@@ -101,7 +101,7 @@ Every place that must spell a kind fails silently if you forget one: a kind with
 says nothing; a kind no page lists is invisible to a reader. Do these, then run `uv run --locked pytest -q
 tests/test_items.py`, which fails for each place that lacks the kind (`items.registry_gaps`):
 
-1. Add the store to [stores](stores.md) if it is a new file, and give the row a name there.
+1. Add the store to [stores](stores.md) if it's a new file, and give the row a name there.
 2. Add the `Kind` row to `KINDS`: module, store name, id pattern, truth or derived, one write rule, reader.
 3. Add the kind to `LINK_SPEC`: `(rel, target kind, field)` triples, or `()` for a kind that points at nothing.
 4. Add the row to the kinds table on this page.
@@ -114,5 +114,5 @@ add yours wherever it turns up.
 
 `items.extract_commitments(text)` finds what a text promises (open checkboxes, `TODO:` and `follow-up:` lines, lines that
 say something must be done). `items.recall(cases)` is its eval: a seeded set the extractor must find, reported as recall.
-`items.ledger_rows(text, source)` gives the rows an `items.jsonl` ledger would hold. ws does not write that file yet; its
+`items.ledger_rows(text, source)` gives the rows an `items.jsonl` ledger would hold. ws doesn't write that file yet; its
 row on the stores page comes with the writer.

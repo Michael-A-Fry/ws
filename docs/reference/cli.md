@@ -357,7 +357,7 @@ Write, show or remove a run record (what one run may lease).
 
 ```text
 ws broker run-record write [-h] --area AREA --tier {walled,worker,lead,lead-elevated} [--name NAME] [--uid UID]
-                           [--ttl SECONDS] [--dir PATH] run
+                           [--ttl SECONDS] [--repo REPO] [--perm NAME=LEVEL] [--dir PATH] run
 ws broker run-record show [-h] [--dir PATH] run
 ws broker run-record rm [-h] [--dir PATH] run
 ```
@@ -370,6 +370,8 @@ ws broker run-record rm [-h] [--dir PATH] run
 | `--name NAME` | A secret name the run declares (repeat). |
 | `--uid UID` | Only this caller uid may lease under the run. |
 | `--ttl SECONDS` | The run ends after this; its leases with it. |
+| `--repo REPO` | A repository a minted GitHub token may cover (repeat). |
+| `--perm NAME=LEVEL` | The most a minted token may hold (repeat). |
 | `--dir PATH` | The record folder (default `~/.local/state/ws/run/records`). |
 
 ### `ws broker audit-copy`

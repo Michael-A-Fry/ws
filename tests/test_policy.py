@@ -685,6 +685,7 @@ FORCING = [
     f"{GIT} push --mirror",
     f"{GIT} push origin :feature",
     f"{GIT} push --delete origin feature",
+    f"{GIT} push --prune origin main",
     f"cd sub && {GIT} -C .. push -f",
 ]
 
@@ -692,6 +693,30 @@ FORCING = [
 @pytest.mark.parametrize("cmd", FORCING)
 def test_a_forcing_push_is_caught_however_it_is_spelled(pol, cmd):
     assert policy.is_denied_command(pol, cmd), cmd
+
+
+@pytest.mark.parametrize(
+    ("cmd", "named"),
+    [
+        (f"{GIT} push origin --delete scratch", "deleting a remote branch or tag"),
+        (f"{GIT} push -d origin scratch", "deleting a remote branch or tag"),
+        (f"{GIT} push origin :scratch", "deleting a remote branch or tag"),
+        (f"{GIT} push --mirror", "`--mirror`"),
+        (f"{GIT} push origin +main", "this spelling forces the push"),
+        (f"{GIT} push --prune origin refs/heads/*:refs/heads/*", "`--prune` deletes"),
+        (f"{GIT} push origin :", "a bare `:`"),
+    ],
+)
+def test_a_refused_destroying_push_names_what_it_does(pol, cmd, named):
+    """C64: a push with no `--force` in it is refused under the force rule, and the refusal says why it counts."""
+    reason = str(policy.is_denied_command(pol, cmd))
+    assert "deny_commands rule 'git push*--force*'" in reason, reason
+    assert named in reason, reason
+
+
+def test_a_literal_force_push_refusal_adds_nothing(pol):
+    reason = str(policy.is_denied_command(pol, f"{GIT} push --force origin main"))
+    assert reason == "command matches deny_commands rule 'git push*--force*'", reason
 
 
 @pytest.mark.parametrize(
@@ -1163,7 +1188,6 @@ PROBE_ALLOWED = [
     "GIT PUSH -v origin feat",
     "GIT PUSH origin v1.0",
     'GIT commit -m "fix: avoid +x" && GIT PUSH',
-    "GIT PUSH --prune origin",
     "GIT PUSH --all",
     "GIT PUSH origin 'refs/heads/*:refs/heads/*'",
     "GIT PUSH --push-option=x origin feat",

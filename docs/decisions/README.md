@@ -34,5 +34,6 @@ decisions weren't about the engine.
 | [0028](0028-a-guard-logs-what-the-wall-enforces.md) | A guard logs what the wall enforces, only where the wall is proven for the call | accepted | 2026-11-12 |
 | [0029](0029-a-job-runs-inside-the-launch-wall.md) | A headless job runs inside the same wall as a launch, built by the same code | accepted | 2026-11-12 |
 | [0030](0030-a-scheduled-job-keeps-a-run-contract.md) | A scheduled job keeps a run contract: six lines, a fenced lock and a capped log | accepted | 2026-11-14 |
+| [0031](0031-an-upgrade-keeps-a-way-back-and-a-watchdog-per-step.md) | An upgrade keeps a way back and a watchdog on each step | accepted | 2026-11-14 |
 
 To add one, copy the newest record, take the next number and add a row here.

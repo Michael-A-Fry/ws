@@ -41,6 +41,7 @@ COMMAND = "watch"
 UNIT_RE = re.compile(r"^[A-Za-z0-9_.@:\\-]{1,200}$")
 GRACE = 2.0  # a job is overdue when its last run is older than this many expected gaps
 DROPIN = "10-ws-alert.conf"
+SCHEMA_VERSION = 1  # of a line in alerts.jsonl
 ALERT_UNIT = "ws-alert@%n.service"
 EXIT_OVERDUE = (
     3  # `ws watch deadman` found a job overdue and alerted: the unit counts it a success (SuccessExitStatus=3)
@@ -73,7 +74,9 @@ def unit_status(unit: str) -> tuple[str, str]:
 def _write_line(env, rec: dict) -> None:
     path = alerts_path(env)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    line = json.dumps({"schema": 1, "ts": runrecord.iso(datetime.now(UTC)), "kind": "not-automatic", **rec})
+    line = json.dumps(
+        {"schema": SCHEMA_VERSION, "ts": runrecord.iso(datetime.now(UTC)), "kind": "not-automatic", **rec}
+    )
     fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
     with os.fdopen(fd, "a", encoding="utf-8") as f:
         f.write(line + "\n")

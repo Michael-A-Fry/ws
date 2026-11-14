@@ -130,7 +130,7 @@ def _items(v) -> list[str]:
 
 def card(cwd: str, base: Path) -> str:
     """The area card, at most `CARD_LINES` lines. A folder in no area gets the inbox card and one line saying so."""
-    name, row, rows = area_of(cwd, base)
+    _name, row, rows = area_of(cwd, base)
     if not rows:
         return ""
     live = [a for a in rows if a.get("state", "live") == "live"]

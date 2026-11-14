@@ -515,8 +515,11 @@ def rebuild_index(env: dict | None = None, kinds: dict[str, Kind] | None = None,
         conn.execute("CREATE INDEX links_to ON links (to_ref)")
         conn.executemany("INSERT INTO links VALUES (?, ?, ?)", rows)
         conn.commit()
-    finally:
+    except BaseException:
         conn.close()
+        tmp.unlink(missing_ok=True)
+        raise
+    conn.close()
     os.replace(tmp, db)
     return len(rows)
 
@@ -582,7 +585,7 @@ VALIDATORS: dict[str, Callable[..., builtins.list[str]]] = {"area": validate_are
 
 @dataclass(frozen=True)
 class Change:
-    outcome: str  # ok, conflict, refused, invalid, missing
+    outcome: str  # ok, conflict, refused, invalid, missing, busy (the lock was held through every try)
     rev: str | None = None  # the item's revision now
     state: dict | None = None  # the item as it is now (the fresh state on a conflict)
     problems: tuple[str, ...] = ()
@@ -639,8 +642,16 @@ def _dump(doc: dict) -> bytes:
 def _write_atomic(p: Path, data: bytes) -> None:
     fd, tmp = tempfile.mkstemp(dir=p.parent, prefix=p.name + ".", suffix=".tmp")
     try:
+        try:
+            mode = p.stat().st_mode & 0o7777
+        except OSError:
+            mode = None
         with os.fdopen(fd, "wb") as f:
             f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        if mode is not None:
+            os.chmod(tmp, mode)
         os.replace(tmp, p)
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
@@ -671,7 +682,7 @@ def change(
         raise ItemError("bad-field", "a change names its actor", "person:NAME or an agent's name")
     if not isinstance(delta, dict) or "id" in delta or "changed_by" in delta:
         raise ItemError("bad-field", "a delta is a dict of fields; id and changed_by are not fields to set")
-    if any(f in k.human_only for f in delta) and not actor.startswith(PERSON):
+    if any(f in k.human_only for f in delta) and not (actor.startswith(PERSON) and actor[len(PERSON) :].strip()):
         return Change(
             "refused",
             problems=tuple(f"{f} changes only with a person as the actor" for f in delta if f in k.human_only),
@@ -713,11 +724,11 @@ def change(
             continue
     try:
         data = p.read_bytes()
-        return Change("conflict", _rev(data), json.loads(data))
+        return Change("busy", _rev(data), json.loads(data), ("the item's lock was held too long; try again",))
     except OSError:
         return Change("missing")
     except ValueError:
-        return Change("invalid", _rev(data), None, ("the record is not valid JSON",))
+        return Change("busy", _rev(data), None, ("the item's lock was held too long; try again",))
 
 
 def bare_write(ref: str, delta: dict, env: dict | None = None, read: dict | None = None) -> None:
@@ -896,6 +907,9 @@ def main(argv: builtins.list[str] | None = None) -> int:
             return 0
     except WsError as e:
         print(f"{e.kind}: {e.message}", file=sys.stderr)
+        return 1
+    except (OSError, sqlite3.Error) as e:
+        print(f"store: {type(e).__name__}: {e}", file=sys.stderr)
         return 1
     print("usage: python -m ws.items check | get KIND:ID | list KIND [FIELD=VALUE ...] | rebuild", file=sys.stderr)
     return 2

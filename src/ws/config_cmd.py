@@ -75,6 +75,9 @@ def collect(env: dict | None = None) -> dict:
     warnings = [
         f"{f['name']}: `{d['key']}` is deprecated; use `{d['replacement']}`" for f in files for d in f["deprecated"]
     ]
+    warnings += [
+        f"job:{n}: still runs, but lacks the run contract: {why}" for n, why in jobs.contract_gaps(env).items()
+    ]
     folders = {k: str(lay.dir(k)) for k in paths.KINDS}
     return {"folders": folders, "origin": origin, "files": files, "warnings": warnings}
 

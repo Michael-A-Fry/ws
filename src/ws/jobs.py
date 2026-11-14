@@ -47,8 +47,8 @@
 The job files and their folder must belong to you and not be writable by anyone else: a job decides what a runner is
 started with, so `ws run` refuses one that someone else could have changed. `prompt_file` must be inside the folder.
 
-    [the run contract]                  a job file with a `schedule` must also carry (`jobs.problems` checks, `ws config`
-                                        and `ws doctor` report it; `ws run` and the timer still run what loads):
+    [the run contract]                  a job file with a `schedule` must also carry (`jobs.contract_gaps` finds the gaps, `ws config`
+                                        and `ws doctor` warn; `ws run` and the timer still run what loads):
     timeout_s = 900                     1. maximum runtime, written in the file (a unit kills the run at this limit)
     on_failure = "alert"                2. failure hook: "alert" (the unit's OnFailure= runs the alert unit)
     log = "file"                        3. where output goes: "file" (size-capped, in the state logs folder) or "journal"
@@ -482,17 +482,17 @@ def load(name: str, env: dict | None = None) -> Job:
     return loads(name, text, folder, where=str(path))
 
 
-def problems(env: dict | None = None) -> dict[str, str]:
-    """name -> what is wrong, for each job file that `ws run` would refuse. A bad job never stops the others: this
-    lists it (doctor does), and `load` still gives every good job. An unusable jobs folder is one entry, "(folder)"."""
+def _scan(env: dict | None) -> tuple[dict[str, str], dict[str, str]]:
+    """(load problems, contract gaps) by job name. A job with a load problem has no gap entry: it is refused first."""
     folder = jobs_dir(env)
     if not folder.is_dir():
-        return {}
+        return {}, {}
     try:
         check_private(folder)
     except JobError as e:
-        return {"(folder)": str(e)}
+        return {"(folder)": str(e)}, {}
     bad: dict[str, str] = {}
+    gaps: dict[str, str] = {}
     for path in sorted(folder.glob("*.toml")):
         if not NAME.match(path.stem):
             continue
@@ -505,10 +505,24 @@ def problems(env: dict | None = None) -> dict[str, str]:
             else:
                 loads(path.stem, text, folder, str(path))
             if "schedule" in d and (lacks := contract_problems(d, str(path))):
-                bad[path.stem] = "; ".join(lacks)
+                gaps[path.stem] = "; ".join(lacks)
         except (JobError, OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
             bad[path.stem] = str(e)
-    return bad
+    return bad, gaps
+
+
+def problems(env: dict | None = None, contract: bool = False) -> dict[str, str]:
+    """name -> what is wrong, for each job file that `ws run` would refuse. A bad job never stops the others: this
+    lists it (doctor does), and `load` still gives every good job. An unusable jobs folder is one entry, "(folder)".
+    With `contract=True` the run contract's gaps (see `contract_gaps`) are listed too, as problems."""
+    bad, gaps = _scan(env)
+    return {**gaps, **bad} if contract else bad
+
+
+def contract_gaps(env: dict | None = None) -> dict[str, str]:
+    """name -> what a scheduled job file that loads lacks of the run contract. `ws run` and the timer still run it, so
+    `ws config` and `ws doctor` show these as warnings, not failures."""
+    return _scan(env)[1]
 
 
 def _contract_values(d: dict, where: str) -> tuple[float | None, float | None]:

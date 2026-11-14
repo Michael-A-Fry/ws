@@ -143,7 +143,8 @@ part of the wall off for every later session, so pick the narrower one:
 - **The safe choice.** Answer no, then add the one folder the task needs: `--add-dir PATH` when you start the session,
   or `/add-dir PATH` inside it. The session can read that folder, and nothing else outside its own.
 - **To undo an allow you saved.** In the session, run `/permissions`, find the rule the answer saved and remove it.
-  `ws status` shows the read block and the permission mode in force.
+  `/permissions` also lists the rules in force, and `ws doctor` (WS016) says whether your Claude Code is new enough to
+  read the block.
 
 On native Windows the sandbox isn't enforced, so this block is the only wall on reads by Claude's file tools there, and
 a shell command can still read anywhere.
@@ -280,6 +281,6 @@ The wall for Claude Code is Claude Code's own sandbox and permission keys (`sand
 checks them; it has no sandbox of its own for Claude Code. To swap it for another sandbox, follow the steps in
 [the decision record](../decisions/0025-adopt-the-runner-sandbox-and-permission-keys.md#swapping-the-runners-sandbox-for-another).
 
-Claude Code 2.1.321 or newer is the version to run the wall on. To roll back, pin the version you had before you
-upgraded. On the machine this was last tested on that was 2.1.311: `claude install 2.1.311`. `ws doctor` (WS016) says
-which keys an older version doesn't read.
+The wall was last tested on Claude Code 2.1.321, and `ws doctor` (WS016) checks the first version each key needs;
+nothing makes you run 2.1.321. To roll back after an upgrade, pin the version you had before it. On the machine this was
+tested on that was 2.1.311: `claude install 2.1.311`.

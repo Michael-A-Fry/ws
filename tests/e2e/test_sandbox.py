@@ -454,3 +454,76 @@ def test_opencode_wall_keeps_the_gate_able_to_ask(tmp_path, wshome, work, secret
     assert (work / "CONTROL").exists(), gr.where(proc)
     assert (sub / "p").exists() and (wshome / "sessions" / "s").exists(), gr.where(proc)
     assert not (wshome / "approvals" / "granted-by-session").exists()
+
+
+# --- the docs' own probe, through `ws canary` (C250 adv-A1/A2) --------------------------------------------------------------
+
+
+def _probe_case(tmp_path, change=None):
+    from ws import canary
+
+    exe = gr.runner_bin("claude")
+    work = tmp_path / "probe"
+    project = work / "project"
+    project.mkdir(parents=True)
+    project = project.resolve()
+    env = gr.base_env(tmp_path)  # a home of the test's own: the probe's touch lands there, never in the real one
+    text = canary._launch_text(claude_code, env, work, project, policy.loads(policy.default_toml()))
+    if change:
+        conf = json.loads(text)
+        change(conf)
+        text = json.dumps(conf)
+    return canary.run_probe(exe, text, project, work, env)
+
+
+def test_the_docs_probe_is_stopped_in_the_launch_settings(tmp_path):
+    assert _probe_case(tmp_path) is None
+
+
+def test_the_docs_probe_gets_through_with_the_sandbox_taken_out(tmp_path):
+    """The control: the same probe with no sandbox block writes into the real home, so the pass above is the wall's."""
+    problem = _probe_case(tmp_path, lambda c: c.pop("sandbox"))
+    assert problem is not None and "wrote outside" in problem, problem
+
+
+# --- the write block: Claude's own file tools write only in the working folders (rr-M2) ---------------------------------
+
+WRITE_BLOCK_FIRST = (2, 1, 314)  # the settings reference: blockWritesOutsideWorkingDirectories needs 2.1.314
+
+
+def write_outside(tmp_path, work, allow_outside: bool):
+    """`claude -p` with a stub model that asks to Write a file outside the working folder. Only the generated
+    `permissions` block's write key is kept, so it is the key alone that decides; `allow_outside` is the off switch."""
+    found = gr.claude_version()
+    if found < WRITE_BLOCK_FIRST:
+        pytest.skip(f"Claude Code {'.'.join(map(str, found))} is older than 2.1.314, the first to read the write block")
+    target = tmp_path / "outside" / ("written-" + os.urandom(6).hex())  # built at run time
+    target.parent.mkdir()
+    text = policy.default_toml()
+    if allow_outside:
+        assert "write_outside_project = false" in text
+        text = text.replace("write_outside_project = false", "write_outside_project = true")
+    (tmp_path / "wshome").mkdir(exist_ok=True)
+    (tmp_path / "wshome" / "policy.toml").write_text(text)
+    settings = gr.generate(tmp_path, "claude-code") / "settings.json"
+    perms = json.loads(settings.read_text())["permissions"]
+    conf = {"permissions": {k: v for k, v in perms.items() if k == claude_code.WRITE_BLOCK_KEY}}
+    settings.write_text(json.dumps(conf))
+    with AnthropicStub([Call("Write", {"file_path": str(target), "content": "x"})]) as stub:
+        proc = gr.claude_run(tmp_path, stub, settings, False, work)
+    return target, stub, proc, conf
+
+
+@no_wall
+def test_a_write_outside_the_working_folder_is_refused_with_the_key_on(tmp_path, work):
+    target, stub, proc, conf = write_outside(tmp_path, work, allow_outside=False)
+    assert conf["permissions"] == {claude_code.WRITE_BLOCK_KEY: True}
+    assert stub.tool_results(), f"the runner never reported the Write back to the model\n{gr.where(proc)}"
+    assert not target.exists(), f"the file outside the folder was written\n{gr.where(proc)}"
+
+
+@no_wall
+def test_the_same_write_happens_with_the_off_switch(tmp_path, work):
+    target, _stub, proc, conf = write_outside(tmp_path, work, allow_outside=True)
+    assert conf["permissions"] == {}
+    assert target.exists(), f"the control write did not happen\n{gr.where(proc)}"

@@ -92,8 +92,8 @@ validates it with the kind's validator and writes by temp file and rename, under
 sha256 of its bytes) is the one the caller saw. A moved revision gives outcome `conflict` with the fresh state and its
 revision, so the caller decides again; a lock held too long is tried up to three times. Outcomes: `ok`, `conflict`,
 `refused`, `invalid`, `missing`, `busy` (the lock was held through all three tries; nothing was written). The actor
-goes in `changed_by`. The human-only rule trusts the actor string the caller passes (an empty `person:` is refused), so it is
-advisory until a session has an identity ws can check. Append-only kinds never use it.
+goes in `changed_by`. The human-only rule trusts the actor string the caller passes (an empty `person:` is refused),
+so it is advisory until a session has an identity ws can check. Append-only kinds never use it.
 
 ## Add a record kind
 

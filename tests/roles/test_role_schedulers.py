@@ -12,8 +12,15 @@ from ws import cli, install, jobs, osinfo, roles
 from ws.roles import _schedule, launchd, systemd
 
 WS = ["/opt/ws/bin/ws"]
-AI_JOB = 'runner = "claude-code"\nmodel = "m1"\nprompt = "Summarise."\nschedule = "daily 03:30"\n'
-BACKUP_JOB = 'command = "backup"\nschedule = "weekly mon 09:05"\n'
+CONTRACT = (
+    'timeout_s = 600\non_failure = "alert"\nlog = "file"\nuninstall = "ws schedule remove x"\n'
+    'expected_rate = "1d"\ndata_class = "none"\n'
+)
+AI_JOB = (
+    'runner = "claude-code"\nmodel = "m1"\nprompt = "Summarise."\nschedule = "daily 03:30"\n'
+    "max_turns = 5\nbudget_usd = 0.5\n" + CONTRACT
+)
+BACKUP_JOB = 'command = "backup"\nschedule = "weekly mon 09:05"\n' + CONTRACT
 
 
 @pytest.fixture(autouse=True)
@@ -164,19 +171,21 @@ def test_systemd_steps_install_and_uninstall(box, write_job, env, linux):
     write_job("backup", BACKUP_JOB)
     steps = systemd.steps({}, install.Answers(stays_on=False), env)
     assert sorted(s.path.name for s in steps) == [
+        "logs",
         "ws-backup.service",
         "ws-backup.timer",
         "ws-daily.service",
         "ws-daily.timer",
+        "ws-jobs.slice",
     ]
-    assert all(s.path.parent == box / ".ws" / "jobs" / "units" for s in steps)
+    assert all(s.path.parent == box / ".ws" / "jobs" / "units" for s in steps if s.path.name != "logs")
     r = install.apply(steps, env)
-    assert len(r.created) >= 4
+    assert len(r.created) >= 5
     assert install.apply(steps, env).changes == 0  # a second run reports 0 changes
     fake = Fake()
     removed = install.uninstall(env, deactivate=lambda paths, e: roles.deactivate_units(paths, e, fake))
     assert not list((box / ".ws" / "jobs" / "units").glob("ws-*"))
-    assert len([p for p in removed.removed if p.name.startswith("ws-")]) == 4
+    assert len([p for p in removed.removed if p.name.startswith("ws-")]) == 5
     # the links systemctl made outside $WS_HOME are undone before the files go
     assert fake.calls[0] == [
         "systemctl",
@@ -222,7 +231,14 @@ def test_systemd_activate_argv(box, write_job, env):
     fake, units = Fake(), box / ".ws" / "jobs" / "units"
     assert systemd.activate(env, fake) == []
     assert fake.calls == [
-        ["systemctl", "--user", "link", str(units / "ws-daily.service"), str(units / "ws-daily.timer")],
+        [
+            "systemctl",
+            "--user",
+            "link",
+            str(units / "ws-daily.service"),
+            str(units / "ws-daily.timer"),
+            str(units / "ws-jobs.slice"),
+        ],
         ["systemctl", "--user", "daemon-reload"],
         ["systemctl", "--user", "enable", "--now", "ws-daily.timer"],
     ]
@@ -260,6 +276,7 @@ def test_systemd_activate_links_nothing_over_a_unit_it_did_not_write(box, write_
         "systemctl",
         "--user",
         "link",
+        str(units / "ws-jobs.slice"),
         str(units / "ws-weekly.service"),
         str(units / "ws-weekly.timer"),
     ]
@@ -458,7 +475,7 @@ def test_cli_list_dry_run_apply_remove(box, write_job, env, linux, capsys, monke
     assert not (box / ".ws" / "jobs" / "units").exists()
 
     code, out, _ = run(capsys, "schedule", "apply")
-    assert code == 0 and "2 unit file(s)" in out and len(fake.calls) == 3
+    assert code == 0 and "4 unit file(s)" in out and len(fake.calls) == 3
     assert fake.calls[0][:3] == ["systemctl", "--user", "link"]
     code, out, _ = run(capsys, "schedule", "apply")
     assert code == 0 and "0 changes" in out
@@ -467,7 +484,9 @@ def test_cli_list_dry_run_apply_remove(box, write_job, env, linux, capsys, monke
     code, out, _ = run(capsys, "schedule", "remove", "daily")
     assert code == 0 and "removed 2 unit file(s)" in out
     assert fake.calls[0] == ["systemctl", "--user", "disable", "--now", "ws-daily.timer", "ws-daily.service"]
-    assert not list((box / ".ws" / "jobs" / "units").glob("ws-*"))
+    assert [p.name for p in (box / ".ws" / "jobs" / "units").glob("ws-*")] == [
+        "ws-jobs.slice"
+    ]  # the shared slice stays
     manifest = (box / ".ws" / "install-manifest.json").read_text()
     assert "ws-daily" not in manifest  # ws removed them itself, so uninstall need not look for them
 
@@ -513,3 +532,39 @@ def test_cli_apply_on_a_machine_without_a_scheduler(box, capsys, monkeypatch):
     monkeypatch.setattr(osinfo, "detect", lambda *a, **k: osinfo.OSInfo("wsl", "ubuntu 24.04", "x86_64", "none", True))
     code, _, err = run(capsys, "schedule", "apply")
     assert code == 1 and "no scheduler" in err
+
+
+# ---- the run contract in the units -------------------------------------------------------------------------------------
+
+
+def _sched(**kw):
+    return jobs.Scheduled("daily", jobs.parse_schedule("daily 03:30", "t"), ("run", "daily"), **kw)
+
+
+def test_the_service_holds_the_failure_hook_the_timeout_and_the_slice(env):
+    svc = systemd.render(_sched(timeout_s=600), env, WS)["ws-daily.service"]
+    assert "OnFailure=ws-alert@%n.service" in svc and "TimeoutStartSec=630" in svc and "Slice=ws-jobs.slice" in svc
+    assert f"StandardOutput=append:{_schedule.logs_dir(env) / 'daily.log'}" in svc
+    assert "StandardOutput" not in systemd.render(_sched(log="journal"), env, WS)["ws-daily.service"]
+
+
+def test_a_command_job_with_no_timeout_still_gets_the_default_limit(env):
+    assert "TimeoutStartSec=930" in systemd.render(_sched(), env, WS)["ws-daily.service"]
+
+
+def test_every_unit_says_it_is_generated_and_keeps_the_marker_first(env):
+    files = systemd.render(_sched(), env, WS)
+    for text in (*files.values(), systemd.render_slice()):
+        first = text.splitlines()[0]
+        assert first.startswith(systemd.MARKER) and "DO NOT EDIT" in first and "ws schedule apply" in first
+    assert "jobs/daily.toml" in files["ws-daily.timer"].splitlines()[0]
+
+
+def test_the_slice_gives_scheduled_jobs_a_cpu_and_memory_share(env):
+    text = systemd.render_slice()
+    assert "CPUWeight=50" in text and "MemoryHigh=75%" in text
+
+
+def test_launchd_has_no_hook_in_the_plist_but_runs_in_the_background_class(env):
+    plist = plistlib.loads(launchd.render(_sched(), env, WS).encode())
+    assert plist["ProcessType"] == "Background" and "OnFailure" not in plist

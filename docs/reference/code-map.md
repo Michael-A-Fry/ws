@@ -36,6 +36,8 @@ below, and `python3 scripts/gen_code_map.py --check` (prek and CI) fails when it
 | `home/` | ws home: one read-only data API (`ws.home.api`) that every home area, app and script reads through |
 | `install.py` | `ws install` and `ws uninstall`: the engine that plans, writes and undoes what ws puts on a machine |
 | `items.py` | One item layer over the stores ws already has: a `kind:id` reference, one table of kinds, `get`... |
+| `joblock.py` | A job's run lock: a file with a heartbeat and a fence number, not a pid |
+| `joblog.py` | A job's log file, kept small: at most `KEEP` files of `MAX_BYTES`, and nothing below INFO in the... |
 | `jobs.py` | Job files: `jobs/<name>.toml` in ws's config folder, one headless job each, run with `ws run <name>` |
 | `jsonl.py` | Bounded, locked JSON-lines logs: one object per line, a size limit with rotation, and no lost lines |
 | `mcp_server.py` | `ws mcp serve`: a small MCP server over stdio, so any runner can search and add to memory and... |

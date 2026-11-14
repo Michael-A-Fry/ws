@@ -118,8 +118,20 @@ There is no switch for the home alone. To start one session without any wall use
 gives up; to leave the sandbox out for good, set `sandbox = false` under `[gate]` and run `ws install` again.
 
 `ws canary --runner claude-code` has a `wall` check: it makes the launch settings as `ws gate launch` makes them and fails
-if the home is no longer hidden, the project isn't re-allowed, a `deny_read` path is missing, or the sandbox gained an
-unsandboxed route (an excluded command, a Unix socket).
+if the home is no longer hidden, the project isn't re-allowed, a `deny_read` path is missing, the sandbox gained an
+unsandboxed route (an excluded command, a Unix socket), a sign-in token is visible to shell commands, or the read or
+write block is off.
+
+It also has a `probe` check, which runs the two probes from Claude Code's sandboxing page with the real runner inside
+those settings and a local stub model, so no paid call is made: `touch ~/sandbox-probe-...` must leave no file in your
+home, and `curl --noproxy '*' https://example.com` must not connect. It runs once for the default settings and once for
+each walled class whose launch file is on the machine, and that file must itself set `sandbox.enabled` and
+`failIfUnavailable` to `true` and `allowUnsandboxedCommands` to `false`. It's skipped where the sandbox can't run
+(no bubblewrap or socat). A class's probe runs as you, with the class's settings, not as the class's own user.
+
+The `tokens` check fails when the runner's credentials file can be read by other users, when the process running ws
+carries `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_OAUTH_TOKEN`, or when a job file sets one. Check any tool you adopt the
+same way: `grep -rn 'CLAUDE_CODE_OAUTH_TOKEN\|ANTHROPIC_OAUTH_TOKEN\|\.credentials\.json' <its source>`.
 
 ### Test notes
 
@@ -161,6 +173,16 @@ a shell command can still read anywhere.
   never writes it into your own settings file, because it would bind every Claude Code session you start. To let a
   gated session read outside its folders, set `read_outside_project = true` under `[gate]` in the policy and
   regenerate. A project's own settings can't lift the block: Claude Code applies a `true` from any settings file.
+- File writes stay in the working folders too. `permissions.blockWritesOutsideWorkingDirectories` is `true` in the same
+  settings, so Claude's Write, Edit and NotebookEdit tools refuse a path outside them in every permission mode
+  (Claude Code 2.1.314 or newer). It doesn't cover shell commands; the sandbox does. `write_outside_project = true`
+  under `[gate]` leaves it out.
+- Shell commands don't see the runner's sign-in. The sandbox block lists `CLAUDE_CODE_OAUTH_TOKEN`,
+  `ANTHROPIC_OAUTH_TOKEN`, `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` under `sandbox.credentials.envVars` with
+  mode `deny`, so Claude Code takes them out of every sandboxed command's environment and keeps them for itself. It's
+  in the settings ws passes to Claude Code, not merged into your own file.
+- A headless `ws run` job doesn't wait on a prompt. Its settings set `permissions.denyInsteadOfPrompting` (Claude Code
+  2.1.319 or newer), so a call that would ask is denied and the job carries on. A session at a terminal still asks.
 - Hosts a sandboxed command may reach without asking. When `allow_hosts` names none, the sandbox block carries a short
   default list: `api.anthropic.com`, PyPI (`pypi.org`, `files.pythonhosted.org`), the npm registry
   (`registry.npmjs.org`) and crates.io (`crates.io`, `index.crates.io`, `static.crates.io`). A session started with

@@ -460,3 +460,22 @@ def test_spawn_closes_the_descriptors_when_the_prompt_file_cannot_be_opened(tmp_
     os.close(w)
     with pytest.raises(OSError):
         os.fstat(r)
+
+
+def test_a_claude_job_denies_a_call_instead_of_waiting_on_a_prompt(ws, tmp_path):
+    """No one is there to answer: the job's settings carry denyInsteadOfPrompting, with the file blocks kept."""
+    ws.job(extra=f'cwd = "{project(tmp_path)}"')
+    assert cli.main(["run", "daily"]) == 0
+    perms = settings_of(ws)["permissions"]
+    assert perms["denyInsteadOfPrompting"] is True
+    assert (
+        perms["blockWritesOutsideWorkingDirectories"] is True and perms["blockReadsOutsideWorkingDirectories"] is True
+    )
+    assert settings_of(ws)["sandbox"]["credentials"]["envVars"]  # the tokens stay out of the job's shell commands
+
+
+def test_a_job_with_the_sandbox_off_still_does_not_wait_on_a_prompt(ws, tmp_path):
+    (ws.home / "policy.toml").write_text("[gate]\nsandbox = false\n", encoding="utf-8")
+    ws.job(extra=f'cwd = "{project(tmp_path)}"')
+    assert cli.main(["run", "daily"]) == 0
+    assert settings_of(ws)["permissions"]["denyInsteadOfPrompting"] is True

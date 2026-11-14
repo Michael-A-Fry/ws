@@ -218,6 +218,7 @@ class Gate:
     allow_mcp: tuple[str, ...] | None = None  # MCP tools allowed outright; None = the policy says nothing (MCP_SHIPPED)
     read_outside_project: bool = False  # false = Claude Code's file tools refuse reads outside the working folders
     allow_read: tuple[str, ...] = ()  # folders or files besides the project a launched Claude Code shell may read
+    write_outside_project: bool = False  # false = Claude Code's Write, Edit and NotebookEdit refuse paths outside them
 
 
 @dataclass(frozen=True)
@@ -479,6 +480,9 @@ sandbox = true
 # Claude Code's Read, Grep and Glob tools refuse a path outside the folders the session works in (the sandbox covers
 # shell commands only). true lets them read outside, as Claude Code does by default. Needs Claude Code 2.1.257 to bite.
 read_outside_project = false
+# The same for Claude Code's Write, Edit and NotebookEdit tools, in every permission mode. true lets them write outside
+# the working folders. Needs Claude Code 2.1.314 to bite.
+write_outside_project = false
 # Folders or files a shell command in a Claude Code session started by `ws gate launch --runner claude-code` may read
 # besides the project folder. That session cannot read your home folder except the project and what common tools need
 # (the runner's own folder, uv, npm and cargo caches, ~/.local/bin, git's config). Absolute or `~/`, no wildcards, and
@@ -708,6 +712,7 @@ def loads(text: str) -> Policy:
             "allow_mcp",
             "read_outside_project",
             "allow_read",
+            "write_outside_project",
         },
     )
     deny_read = _strings(g, "deny_read", "[gate] ")
@@ -722,6 +727,7 @@ def loads(text: str) -> Policy:
         _strings(g, "allow_mcp", "[gate] ") if "allow_mcp" in g else None,
         _get(g, "read_outside_project", bool, "[gate] ", False),
         _strings(g, "allow_read", "[gate] "),
+        _get(g, "write_outside_project", bool, "[gate] ", False),
     )
     for h in gate.allow_hosts:
         check_host(h, "[gate] allow_hosts")

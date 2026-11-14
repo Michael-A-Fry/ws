@@ -229,3 +229,26 @@ def test_the_hook_to_rule_map_has_a_row_for_every_guard_each_with_a_rule_or_no_r
     for row in rows:
         replace = row.split("|")[2]
         assert "no rule" in replace or re.search(r"`[A-Za-z_*]+\(", replace), row
+
+
+def test_a_guard_that_speaks_after_a_call_logs_its_own_name_as_the_rule(box):
+    pol = box / "policy.toml"
+    pol.write_text('[guards]\non = ["syntax-check"]\n[guards.syntax-check]\nmode = "enforce"\n', encoding="utf-8")
+    broken = box / "proj" / "bad.json"
+    broken.write_text("{not json", encoding="utf-8")
+    p = payload(box, "Write", {"file_path": str(broken), "content": "{not json"})
+    p["hook_event_name"] = "PostToolUse"
+    argv = ["--runner", "claude-code", "--policy", str(pol), *paths.pin_of().args()]
+    code, _, _ = gate.run_event(gate.hook_args("event", argv), json.dumps(p))
+    assert code == gate.DENY
+    (line,) = shared()
+    assert line["decision"] == "deny" and line["rule"] == "guard:syntax-check"
+
+
+def test_a_policy_that_cannot_load_still_leaves_a_deny_line_with_no_session_or_tool(box):
+    pol = box / "policy.toml"
+    pol.write_text("[gate\n", encoding="utf-8")
+    code, _, _ = run(payload(box, "Bash", {"command": "ls"}), str(pol))
+    assert code == gate.DENY
+    (line,) = shared()
+    assert line["decision"] == "deny" and line["rule"] == "error" and line["session"] == "" and line["tool"] == ""

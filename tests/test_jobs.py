@@ -208,3 +208,78 @@ def test_job_env_allows_ordinary_names_and_refuses_odd_ones():
     }
     with pytest.raises(ValueError, match="not a variable name"):
         jobs.extra_env(load(GOOD + '[runner_options]\nenv = { "A B" = "x" }\n'))
+
+
+# ---- the run contract ---------------------------------------------------------------------------------------------
+
+CONTRACT = {
+    "timeout_s": "600",
+    "on_failure": '"alert"',
+    "log": '"file"',
+    "uninstall": '"ws schedule remove x"',
+    "expected_rate": '"1d"',
+    "data_class": '"none"',
+}
+MODEL_CAPS = {"max_turns": "5", "budget_usd": "0.5"}
+
+
+def _put(tmp_path, name, keys, body='runner = "claude-code"\nmodel = "m"\nprompt = "hi"\n'):
+    home = tmp_path / "wsh"
+    (home / "jobs").mkdir(parents=True, exist_ok=True)
+    os.chmod(home / "jobs", 0o700)
+    text = body + 'schedule = "daily 03:30"\n' + "".join(f"{k} = {v}\n" for k, v in keys.items())
+    (home / "jobs" / f"{name}.toml").write_text(text, encoding="utf-8")
+    return {"WS_HOME": str(home), "HOME": str(tmp_path)}
+
+
+def test_a_scheduled_job_with_the_contract_and_caps_passes(tmp_path):
+    env = _put(tmp_path, "ok", {**CONTRACT, **MODEL_CAPS})
+    assert jobs.problems(env) == {}
+    (s,) = jobs.scheduled(env)
+    assert s.timeout_s == 600 and s.expected_rate_s == 86400 and s.log == "file"
+
+
+@pytest.mark.parametrize("missing", sorted(CONTRACT))
+def test_each_of_the_six_lines_is_required(tmp_path, missing):
+    env = _put(tmp_path, "j", {**{k: v for k, v in CONTRACT.items() if k != missing}, **MODEL_CAPS})
+    assert missing in jobs.problems(env)["j"]
+
+
+@pytest.mark.parametrize("missing", ["max_turns", "budget_usd"])
+def test_a_model_job_needs_a_turn_limit_and_a_spend_cap(tmp_path, missing):
+    env = _put(tmp_path, "j", {**CONTRACT, **{k: v for k, v in MODEL_CAPS.items() if k != missing}})
+    assert missing in jobs.problems(env)["j"]
+
+
+def test_a_command_job_needs_the_six_lines_but_no_caps(tmp_path):
+    ok = _put(tmp_path, "c", CONTRACT, body='command = "backup"\n')
+    assert jobs.problems(ok) == {}
+    bad = _put(tmp_path, "c", {}, body='command = "backup"\n')
+    assert all(k in jobs.problems(bad)["c"] for k in CONTRACT)
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [("on_failure", '"email"'), ("log", '"nowhere"'), ("expected_rate", '"often"'), ("expected_rate", '"0d"'),
+     ("data_class", '"a b"'), ("uninstall", '""')],
+)  # fmt: skip
+def test_a_bad_contract_value_names_the_key(tmp_path, key, value):
+    env = _put(tmp_path, "j", {**CONTRACT, **MODEL_CAPS, key: value})
+    assert key in jobs.problems(env)["j"]
+
+
+def test_an_unscheduled_job_is_not_held_to_the_contract(tmp_path):
+    home = tmp_path / "wsh"
+    (home / "jobs").mkdir(parents=True)
+    os.chmod(home / "jobs", 0o700)
+    (home / "jobs" / "manual.toml").write_text(GOOD, encoding="utf-8")
+    assert jobs.problems({"WS_HOME": str(home), "HOME": str(tmp_path)}) == {}
+
+
+def test_ws_config_exits_non_zero_on_a_bad_job_file(tmp_path, monkeypatch, capsys):
+    from ws import cli
+
+    env = _put(tmp_path, "j", {})
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    assert cli.main(["config"]) != 0

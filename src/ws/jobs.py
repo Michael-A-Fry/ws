@@ -47,6 +47,17 @@
 The job files and their folder must belong to you and not be writable by anyone else: a job decides what a runner is
 started with, so `ws run` refuses one that someone else could have changed. `prompt_file` must be inside the folder.
 
+    [the run contract]                  a job file with a `schedule` must also carry (`jobs.problems` checks, `ws config`
+                                        and `ws doctor` report it; `ws run` and the timer still run what loads):
+    timeout_s = 900                     1. maximum runtime, written in the file (a unit kills the run at this limit)
+    on_failure = "alert"                2. failure hook: "alert" (the unit's OnFailure= runs the alert unit)
+    log = "file"                        3. where output goes: "file" (size-capped, in the state logs folder) or "journal"
+    uninstall = "ws schedule remove X"  4. the command that takes the job off the machine
+    expected_rate = "1d"                5. the gap between runs the job should keep: 30m, 6h, 1d, 7d (the dead-man check
+                                        raises an alert when no run record is newer than twice this)
+    data_class = "internal"             6. the data class the job works in (a name from the policy's classes, or "none")
+    A job with a runner must also set max_turns and budget_usd (the turn limit and the spend cap for one run).
+
 Every error names the key.
 """
 
@@ -89,7 +100,17 @@ KEYS = {
     "budget_usd",
     "strict",
     "parent_run",
+    "on_failure",
+    "log",
+    "uninstall",
+    "expected_rate",
+    "data_class",
 }
+CONTRACT_KEYS = ("timeout_s", "on_failure", "log", "uninstall", "expected_rate", "data_class")  # the six lines
+ON_FAILURE = ("alert",)
+LOG_KINDS = ("file", "journal")
+_RATE = re.compile(r"^(\d{1,4})([mhd])$")
+_RATE_UNITS = {"m": 60, "h": 3600, "d": 86400}
 GREEN_LEVELS = ("targeted", "package", "full", "merge_ready")  # as runrecord.GREEN_LEVELS
 COMMANDS = {
     "backup": ("backup", "run"),
@@ -166,16 +187,25 @@ class Job:
     budget_usd: float | None = None
     strict: bool = False
     parent_run: str | None = None
+    on_failure: str | None = None
+    log: str | None = None
+    uninstall: str | None = None
+    expected_rate: str | None = None
+    data_class: str | None = None
     max_budget_usd: float | None = None  # not a file key: admission sets it from the reservation
 
 
 @dataclass(frozen=True)
 class Scheduled:
-    """A job file with a schedule: `argv` is what follows `ws` on the command line."""
+    """A job file with a schedule: `argv` is what follows `ws` on the command line. `timeout_s` is the runtime limit
+    the unit enforces, `expected_rate_s` the gap the dead-man check expects (None when the file gives none)."""
 
     name: str
     when: When
     argv: tuple[str, ...]
+    timeout_s: float = DEFAULT_TIMEOUT_S
+    expected_rate_s: float | None = None
+    log: str = "file"
 
 
 def jobs_dir(env: dict | None = None) -> Path:
@@ -223,6 +253,40 @@ def parse_schedule(text: str, where: str) -> When:
     raise JobError(
         f"{where}: schedule must be hourly, daily HH:MM, weekly DAY HH:MM or every Nm (for example weekly mon 09:00)"
     )
+
+
+def parse_rate(text: str, where: str) -> float:
+    """`expected_rate`: a whole number and m, h or d (30m, 6h, 1d). Seconds. Raises JobError naming the key."""
+    m = _RATE.match(text.strip().lower())
+    if not m or int(m[1]) < 1:
+        raise JobError(f"{where}: expected_rate must be a whole number of m, h or d, as in 30m, 6h or 1d")
+    return int(m[1]) * _RATE_UNITS[m[2]]
+
+
+def contract_problems(d: dict, where: str) -> list[str]:
+    """What a job file with a schedule lacks of the run contract (the six lines; for a runner job also max_turns and
+    budget_usd). Empty when it meets it. Each message names the key."""
+    out = [f"{where}: {k} is required by the run contract" for k in CONTRACT_KEYS if k not in d]
+    for key, allowed in (("on_failure", ON_FAILURE), ("log", LOG_KINDS)):
+        if key in d and d[key] not in allowed:
+            out.append(f"{where}: {key} must be one of {', '.join(allowed)}")
+    for key in ("uninstall", "data_class"):
+        if key in d and not (isinstance(d[key], str) and d[key].strip()):
+            out.append(f"{where}: {key} must be a non-empty string")
+    if "data_class" in d and isinstance(d["data_class"], str) and not NAME.match(d["data_class"]):
+        out.append(f"{where}: data_class must be a plain name (letters, digits, - and _)")
+    if "expected_rate" in d:
+        try:
+            parse_rate(str(d["expected_rate"]) if isinstance(d["expected_rate"], str) else "", where)
+        except JobError as e:
+            out.append(str(e))
+    if "command" not in d:
+        out += [
+            f"{where}: {k} is required for a job with a runner (its turn limit and spend cap)"
+            for k in ("max_turns", "budget_usd")
+            if k not in d
+        ]
+    return out
 
 
 def _command(d: dict, where: str) -> tuple[str, ...] | None:
@@ -336,6 +400,11 @@ def loads(name: str, text: str, base: Path, where: str | None = None) -> Job:
         budget_usd=_number(d, "budget_usd", where, None),
         strict=strict,
         parent_run=parent_run,
+        on_failure=_string(d, "on_failure", where),
+        log=_string(d, "log", where),
+        uninstall=_string(d, "uninstall", where),
+        expected_rate=_string(d, "expected_rate", where),
+        data_class=_string(d, "data_class", where),
     )
 
 
@@ -430,6 +499,8 @@ def problems(env: dict | None = None) -> dict[str, str]:
                 parse_schedule(_string(d, "schedule", str(path)) or "", f"{path}: schedule")
             else:
                 loads(path.stem, text, folder, str(path))
+            if "schedule" in d and (lacks := contract_problems(d, str(path))):
+                bad[path.stem] = "; ".join(lacks)
         except (JobError, OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
             bad[path.stem] = str(e)
     return bad
@@ -459,7 +530,17 @@ def scheduled(env: dict | None = None) -> list[Scheduled]:
         if command is None:
             loads(path.stem, text, folder, where)  # a runner job must be valid before it gets a timer
         when = parse_schedule(_string(d, "schedule", where) or "", f"{where}: schedule")
-        out.append(Scheduled(path.stem, when, command or ("run", path.stem)))
+        rate = d.get("expected_rate")
+        out.append(
+            Scheduled(
+                path.stem,
+                when,
+                command or ("run", path.stem),
+                timeout_s=_number(d, "timeout_s", where, DEFAULT_TIMEOUT_S),
+                expected_rate_s=parse_rate(rate, f"{where}: expected_rate") if isinstance(rate, str) else None,
+                log=d.get("log") if d.get("log") in LOG_KINDS else "file",
+            )
+        )
     return out
 
 

@@ -41,6 +41,7 @@ def interval(when: When) -> dict[str, int] | list[dict[str, int]]:
 
 def render(job: Scheduled, env, ws_cmd: list[str]) -> str:
     environment = paths.env_for(env)
+    environment["WS_ALERT_ON_EXIT"] = "1"  # launchd has no OnFailure=: `ws run` sends the alert from its own exit path
     if path := _schedule.path_value(env):
         environment["PATH"] = path
     log = str(_schedule.logs_dir(env) / f"{job.name}.log")

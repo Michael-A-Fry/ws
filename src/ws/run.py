@@ -72,6 +72,7 @@ from ws import (
     joblock,
     joblog,
     jobs,
+    jobwatch,
     jsonl,
     output,
     paths,
@@ -482,6 +483,7 @@ def _announce_stop(rec: dict) -> None:
         return
     if rec.get("stop_reason") in ("preempted", "interrupted"):
         return
+    _told.append(rec["job"])
     queue.notify_stop(rec["job"], rec["run_id"], rec.get("stop_reason") or rec["status"])
 
 
@@ -592,6 +594,16 @@ class Queued:
 _says_stops: contextvars.ContextVar[bool] = contextvars.ContextVar("ws_run_says_stops", default=False)
 
 
+_told: list[str] = []  # jobs whose stop was already pushed in this process
+
+
+def _alert_on_exit(name: str, code: int) -> None:
+    """launchd has no OnFailure=, so a scheduled run (WS_ALERT_ON_EXIT=1 in its plist) that failed and was not already
+    pushed as a stop sends the failure alert itself."""
+    if code and os.environ.get("WS_ALERT_ON_EXIT") == "1" and name not in _told:
+        jobwatch.alert_unit(f"ws.job.{name}", os.environ, status=lambda _u: ("exit-code", str(code)), job=name)
+
+
 def _died(name: str, old: dict) -> None:
     """One record for a run whose holder stopped beating: it never finished, and nothing else would say so."""
     now = datetime.now(UTC)
@@ -616,7 +628,9 @@ def cmd_run(args: argparse.Namespace) -> int:
                 return 0
             try:
                 with _term_becomes_exit():
-                    return _run(args)
+                    code = _run(args)
+                _alert_on_exit(name, code)
+                return code
             finally:
                 joblog.rotate(Path(os.path.abspath(paths.state_dir(os.environ))) / "logs" / f"{name}.log")
     finally:

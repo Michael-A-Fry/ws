@@ -28,8 +28,8 @@ what loads, so an upgrade never stops a job in the night; a bad `timeout_s` or `
 and falls back to "not given" for the timer. Each generated service carries `TimeoutStartSec=` (the job's limit and a
 margin, or `infinity` for a file with no `timeout_s`, which is what a oneshot had before), and a shared slice with a
 CPU and
-memory share; each timer is `Persistent=true`. `on_failure = "alert"` declares the failure hook; the unit's `OnFailure=`
-and the alert unit it names arrive together with the alert command, so no unit names a missing one. Nothing reads
+memory share; each timer is `Persistent=true`. `on_failure = "alert"` declares the failure hook; each service's
+`OnFailure=` names the alert unit, which is generated with it. Nothing reads
 `expected_rate` yet; the dead-man check does.
 
 A run holds an advisory `flock` on a lock file, with a fence number in the file, not a pid and not a heartbeat. The
@@ -43,8 +43,9 @@ below INFO.
 ### Consequences
 
 - Good: no scheduler to maintain; a stub that hangs, fails or doubles is a test.
-- Bad: a scheduled job file written before this fails the check until it gets the six lines (it still runs).
-- Jobs that run a ws command on a schedule (backup, queue) don't rotate their log yet; only `ws run` does.
+- Bad: a scheduled job file written before this is a warning until it gets the six lines (it still runs).
+- Each service rotates its log after it stops (`ExecStopPost=`, `ws watch rotate`), so jobs that run a ws command
+rotate too.
 
 ### Confirmation
 
@@ -54,3 +55,12 @@ below INFO.
 `tests/test_joblock.py` checks a double tick runs once, a dead holder is taken over with one died record, and the log
 cap. `tests/test_joblock_race.py` races real processes: one winner, one died record, and a live holder is never taken
 over.
+
+### The alert and the dead-man check
+
+`OnFailure=ws-alert@%n.service` runs `ws watch alert`, which writes one `not-automatic` line to `logs/alerts.jsonl` and
+one ntfy line through the notify role; both carry the job name, unit and exit status, never a log line. An hourly
+`ws-watch-deadman.timer`, a unit outside the jobs it watches, raises one alert for each job with no run record in twice
+its `expected_rate`, and the next only after the job has run and gone overdue again. It runs on the machine it watches,
+so it can't see that machine down. launchd has no `OnFailure=`, so `ws run` sends the alert from its own exit path.
+`tests/test_jobwatch.py` pins each of these.

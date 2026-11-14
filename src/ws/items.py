@@ -8,7 +8,7 @@ command or a question. The link index is a SQLite table `(from_ref, rel, to_ref)
 stores on each run and never patched. `change` is the one write path for a gated kind: re-read, apply, validate, write by
 temp file and rename under a lock only when the item's revision (sha256 of its bytes) is the one the caller saw, else
 hand back the fresh state. Saved views are TOML records resolved at read time. `docs/reference/items.md` has the model
-and the add-a-kind guide. Ideas only from Macro (AGPL); no code.
+and the add-a-kind guide.
 """
 
 from __future__ import annotations
@@ -40,6 +40,7 @@ TRIES = 3
 VIEW_VERSION = 1
 PERSON = "person:"  # an actor that starts with this is a person; any other actor is an agent
 _REF = re.compile(r"^([a-z][a-z-]*):(\S+)$")
+_SAFE_ID = re.compile(r"[A-Za-z0-9._-]+")
 
 
 class ItemError(WsError):
@@ -149,8 +150,9 @@ def _messages(env: dict) -> Iterable[dict]:
     from ws import msg
 
     after = 0
+    db = paths.state_dir(env) / "msg" / "messages.db"  # the root `env` names, not whatever the process env says
     while True:  # the body-free feed, a page at a time: never a body
-        page = msg.envelopes(after=after, limit=200)
+        page = msg._envelope_rows(db, after, 200)
         for e in page:
             yield {**e, "id": e["message_id"]}
         if len(page) < 200:
@@ -548,7 +550,15 @@ def _rev(data: bytes) -> str:
 def _item_path(kind: Kind, ident: str, env: dict) -> Path:
     if kind.name != "area":
         raise ItemError("not-gated", f"no change path for {kind.name}", "only a gated kind with a record file has one")
-    return _areas_dir(env) / f"{ident}.json"
+    if not _SAFE_ID.fullmatch(ident) or ".." in ident:
+        raise ItemError(
+            "bad-ref", f"not a safe id: {ident!r}", "an id is letters, digits, dot, dash and underscore, no '..'"
+        )
+    base = _areas_dir(env)
+    p = base / f"{ident}.json"
+    if p.resolve().parent != base.resolve():
+        raise ItemError("bad-ref", f"id leaves the areas folder: {ident!r}")
+    return p
 
 
 def validate_area(doc: dict, ident: str = "", names: Iterable[str] = ()) -> builtins.list[str]:
@@ -676,8 +686,16 @@ def change(
             _between()
         try:
             with _Lock(p):
-                data = p.read_bytes()  # re-read under the lock: this is the state the write is checked against
-                doc = json.loads(data)
+                try:
+                    data = p.read_bytes()  # re-read under the lock: this is the state the write is checked against
+                except OSError:
+                    return Change("missing")
+                try:
+                    doc = json.loads(data)
+                except ValueError:
+                    return Change("invalid", _rev(data), None, ("the record is not valid JSON",))
+                if not isinstance(doc, dict):
+                    return Change("invalid", _rev(data), None, ("the record is not an object",))
                 if _rev(data) != expected_rev:
                     return Change("conflict", _rev(data), doc)
                 new = {**doc, **{f: v for f, v in delta.items() if v is not None}, "changed_by": actor}
@@ -693,8 +711,13 @@ def change(
                 return Change("ok", _rev(out), new)
         except TimeoutError:
             continue
-    data = p.read_bytes()
-    return Change("conflict", _rev(data), json.loads(data))
+    try:
+        data = p.read_bytes()
+        return Change("conflict", _rev(data), json.loads(data))
+    except OSError:
+        return Change("missing")
+    except ValueError:
+        return Change("invalid", _rev(data), None, ("the record is not valid JSON",))
 
 
 def bare_write(ref: str, delta: dict, env: dict | None = None, read: dict | None = None) -> None:

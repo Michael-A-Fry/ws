@@ -1,5 +1,5 @@
 """The item layer: kinds table, get/list, the rebuilt link index, the checked change path, views, the register fields
-and the extractor eval. The trials TA1 to TA3 of the macro-follow answer run here and print their numbers (-s)."""
+and the extractor eval. The trials TA1 to TA3 run here and print their numbers (-s)."""
 
 import json
 import re
@@ -439,3 +439,53 @@ def test_the_extractor_finds_the_seeded_set(capsys):
     assert r["planted"] == 8 and r["recall"] >= 0.9
     rows = items.ledger_rows("TODO: a thing", "notes.md")
     assert rows[0]["text"] == "a thing" and rows == items.ledger_rows("TODO: a thing", "notes.md")
+
+
+def test_change_refuses_a_path_traversal_id(env, tmp_path):
+    put_area(env)
+    outside = tmp_path / "home" / "x.json"
+    outside.write_text('{"name": "X", "rank": 1}')
+    for ident in ("../../x", "..", "a/b", "a..b", "x y"):
+        with pytest.raises(items.ItemError) as e:
+            items.change(f"area:{ident}", {"rank": 2}, "r", "person:m", env)
+        assert e.value.kind == "bad-ref"
+    assert json.loads(outside.read_text()) == {"name": "X", "rank": 1}
+
+
+def test_item_path_stays_in_areas_dir(env, tmp_path):
+    d = items._areas_dir(env)
+    d.mkdir(parents=True)
+    (tmp_path / "elsewhere").mkdir()
+    (d / "link").symlink_to(tmp_path / "elsewhere")
+    with pytest.raises(items.ItemError):
+        items._item_path(items.KINDS["area"], "link/../x", env)
+    (d / "sneak.json").symlink_to(tmp_path / "elsewhere" / "t.json")
+    assert items._item_path(items.KINDS["area"], "ok-1.v2", env).parent == d
+
+
+def test_change_on_corrupt_or_vanished_file_is_a_result(env):
+    put_area(env)
+    p = items._areas_dir(env) / "a1.json"
+    rev = items._rev(p.read_bytes())
+
+    def corrupt():
+        p.write_text("{not json")
+
+    r = items.change("area:a1", {"rank": 2}, rev, "person:m", env, _between=corrupt)
+    assert r.outcome == "invalid"
+
+    def vanish():
+        p.unlink()
+
+    put_area(env, "a2")
+    p2 = items._areas_dir(env) / "a2.json"
+    rev2 = items._rev(p2.read_bytes())
+    r = items.change("area:a2", {"rank": 2}, rev2, "person:m", env, _between=p2.unlink)
+    assert r.outcome == "missing"
+
+
+def test_messages_honours_env_root(env, tmp_path):
+    other = tmp_path / "other"
+    other.mkdir()
+    e2 = {"HOME": str(other), "WS_HOME": str(other)}
+    assert list(items._messages(e2)) == []

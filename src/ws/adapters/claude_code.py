@@ -124,8 +124,8 @@ WRITE_BLOCK_KEY = wallsettings.WRITE_BLOCK_KEY
 UNATTENDED_KEY = wallsettings.UNATTENDED_KEY
 # The runner's sign-in tokens. `sandbox.credentials.envVars` with mode "deny" takes them out of every sandboxed
 # command's environment, so a shell command can't send them anywhere; Claude Code itself keeps them.
-SIGN_IN_TOKENS = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_OAUTH_TOKEN")
-TOKEN_VARS = (*SIGN_IN_TOKENS, "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+TOKEN_VARS = wallsettings.TOKEN_VARS
+SIGN_IN_TOKENS = TOKEN_VARS[:2]
 # The PreToolUse gate hook runs for every tool: `*` matches all (Claude Code's hooks reference, "Matcher patterns"), so a
 # tool the runner adds later is gated too. `parse` knows the tools ws judges and returns None for the rest, which the
 # gate allows; the hook is the layer that is always there, whatever the tool is called.

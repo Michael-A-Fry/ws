@@ -31,7 +31,8 @@ morning of pushes leaves them room. The queue's one-line "a job stopped" notice 
 "<folder> needs you" at high priority and a Stop event pushes "<folder> finished" at default priority. The folder is the
 last part of the session's working directory. With `alert_text = "title"` that is all the topic sees, and it goes to the
 notify server (ntfy.sh or your own) with the push, so a person whose folder names are private sets `alert_text =
-"plain"`, which sends "a session needs you" or "a session finished" and no folder name. "full" adds the runner's own
+"plain"`, which sends "a session needs you" or "a session finished" and no folder name. A session whose folder is in a walled
+or counts-only class always gets the plain line, whatever `alert_text` says. "full" adds the runner's own
 message to the folder. The hook wiring that calls `ws notify alert` is added by the runner adapter, not here.
 
 `alert_on` says which events alert. "every-stop" pushes for each Notification and each Stop. "needs-you" pushes for each
@@ -530,6 +531,22 @@ def _line(text: object, limit: int) -> str:
     return _CONTROL.sub(" ", text).strip()[:limit] if isinstance(text, str) else ""
 
 
+def walled_folder(cwd: str, env) -> bool:
+    """True when `cwd` is in a class whose access is not `full` (a walled or counts-only class the policy names), and
+    when that can't be told: a policy that doesn't load. False with no folder, no classes, or a folder in no class."""
+    if not cwd:
+        return False
+    try:
+        pol = policy.load(policy.policy_path(env))
+    except policy.PolicyError:
+        return True
+    try:
+        cls = policy.class_of(pol, cwd)
+    except (OSError, ValueError):
+        return True
+    return cls is not None and cls is not policy.UNCLASSIFIED and cls.access != "full"
+
+
 def alert(cfg: dict, env, payload: object, runner: str, now: datetime | None = None, sender=None) -> str | None:
     """Push the alert a hook payload asks for. Returns the line from `send`, or None when there is nothing to send: a
     payload that isn't a Notification or Stop event, a headless session, session_alerts set to false, or (with alert_on =
@@ -550,6 +567,8 @@ def alert(cfg: dict, env, payload: object, runner: str, now: datetime | None = N
     if mode not in ALERT_MODES:
         raise NotifyError('alert_text must be "title", "full" or "plain"')
     cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else ""
+    if mode != "plain" and walled_folder(cwd, env):
+        mode = "plain"  # a walled class's folder name, or a runner's words from it, never leaves for the notify server
     folder = _line(os.path.basename(cwd.rstrip("/\\")), MAX_FOLDER) or "session"
     message = f"a session {said}" if mode == "plain" else f"{folder} {said}"
     if mode == "full" and (extra := _line(payload.get("message"), MAX_RUNNER_MESSAGE)):

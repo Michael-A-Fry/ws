@@ -120,6 +120,7 @@ CASES: dict[str, list[str]] = {
         "walls",
         "check",
     ],  # a typed error on a machine with no walled class: not set up, the next command named
+    "walls.canary": ["walls", "canary"],  # every case on a planted world: exit 0 with no class set up
     "term": ["term", "--bind", "0.0.0.0"],  # a typed refusal: the real command stays up until stopped
 }
 

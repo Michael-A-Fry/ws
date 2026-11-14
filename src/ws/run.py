@@ -483,8 +483,10 @@ def _announce_stop(rec: dict) -> None:
         return
     if rec.get("stop_reason") in ("preempted", "interrupted"):
         return
-    _told.append(rec["job"])
-    queue.notify_stop(rec["job"], rec["run_id"], rec.get("stop_reason") or rec["status"])
+    if os.environ.get("INVOCATION_ID"):
+        return  # started by systemd: the unit fails and its OnFailure= alerts, so one stop is one push, not two
+    if queue.notify_stop(rec["job"], rec["run_id"], rec.get("stop_reason") or rec["status"]):
+        _told.append(rec["job"])
 
 
 def _append(log: Path, rec: dict) -> bool:
@@ -600,7 +602,9 @@ _told: list[str] = []  # jobs whose stop was already pushed in this process
 def _alert_on_exit(name: str, code: int) -> None:
     """launchd has no OnFailure=, so a scheduled run (WS_ALERT_ON_EXIT=1 in its plist) that failed and was not already
     pushed as a stop sends the failure alert itself."""
-    if code and os.environ.get("WS_ALERT_ON_EXIT") == "1" and name not in _told:
+    if (
+        code and code != 143 and os.environ.get("WS_ALERT_ON_EXIT") == "1" and name not in _told
+    ):  # 143: the scheduler stopped it
         jobwatch.alert_unit(f"ws.job.{name}", os.environ, status=lambda _u: ("exit-code", str(code)), job=name)
 
 
@@ -626,12 +630,16 @@ def cmd_run(args: argparse.Namespace) -> int:
             if lock is None:  # a live run holds it: one tick, one run
                 print(f"ws: {name} is already running; this start is skipped", file=sys.stderr)
                 return 0
+            code = 1  # what a run that raised counts as
             try:
                 with _term_becomes_exit():
                     code = _run(args)
-                _alert_on_exit(name, code)
                 return code
+            except SystemExit as e:
+                code = e.code if isinstance(e.code, int) else 1
+                raise
             finally:
+                _alert_on_exit(name, code)
                 joblog.rotate(Path(os.path.abspath(paths.state_dir(os.environ))) / "logs" / f"{name}.log")
     finally:
         _says_stops.reset(token)

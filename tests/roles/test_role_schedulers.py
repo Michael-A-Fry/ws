@@ -294,8 +294,7 @@ def test_systemd_activate_runs_nothing_when_every_job_clashes(box, write_job, en
     install.apply(systemd.steps({}, install.Answers(), env), env)
     (_user_dir(box) / "ws-daily.service").symlink_to(box / "elsewhere.service")  # a link into some other place
     fake = Fake()
-    assert len(systemd.activate(env, fake)) == 1
-    assert not any("ws-daily" in a for c in fake.calls for a in c)  # the clashing job is left alone
+    assert len(systemd.activate(env, fake)) == 1 and fake.calls == []
 
 
 def test_systemd_activate_accepts_its_own_link_and_a_file_with_its_marker(box, write_job, env):
@@ -554,7 +553,7 @@ def test_the_service_holds_the_failure_hook_the_timeout_and_the_slice(env):
     assert "OnFailure=ws-alert@%n.service" in svc
     assert "ws-alert@.service" in systemd.render_watch(env, WS)  # the unit it names is generated with it
     assert f"StandardOutput=append:{_schedule.logs_dir(env) / 'daily.log'}" in svc
-    assert 'ExecStopPost="/opt/ws/bin/ws" "watch" "rotate" "daily"' in svc  # command jobs rotate too
+    assert 'ExecStopPost=-"/opt/ws/bin/ws" "watch" "rotate" "daily"' in svc  # command jobs rotate too
     journal = systemd.render(_sched(log="journal"), env, WS)["ws-daily.service"]
     assert "StandardOutput" not in journal and "ExecStopPost" not in journal
 
@@ -587,7 +586,7 @@ def test_the_alert_template_and_the_deadman_units(env):
     assert set(files) == {"ws-alert@.service", "ws-watch-deadman.service", "ws-watch-deadman.timer"}
     alert, dead = files["ws-alert@.service"], files["ws-watch-deadman.service"]
     assert 'ExecStart="/opt/ws/bin/ws" "watch" "alert" "%i"' in alert and "OnFailure" not in alert  # no loop
-    assert 'ExecStart="/opt/ws/bin/ws" "watch" "deadman"' in dead and "SuccessExitStatus=1" in dead
+    assert 'ExecStart="/opt/ws/bin/ws" "watch" "deadman"' in dead and "SuccessExitStatus=3" in dead
     assert "OnFailure=ws-alert@%n.service" in dead and "Persistent=true" in files["ws-watch-deadman.timer"]
 
 

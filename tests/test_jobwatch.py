@@ -48,8 +48,10 @@ class Sender:
 
 
 def job(env, name="stub", rate="1h"):
+    """A scheduled job that runs through `ws run`, so its runs leave records under its name."""
     (jobs.jobs_dir(env) / f"{name}.toml").write_text(
-        f'command = "backup"\nschedule = "hourly"\n{CONTRACT.replace("1h", rate)}', encoding="utf-8"
+        'runner = "claude-code"\nmodel = "m"\nprompt = "p"\nschedule = "hourly"\n' + CONTRACT.replace("1h", rate),
+        encoding="utf-8",
     )
 
 
@@ -91,7 +93,7 @@ def test_plain_alert_text_names_no_job(env):
 
 def test_no_notify_role_is_a_line_only_and_never_raises(env):
     rec = jobwatch.alert_unit("ws-daily.service", env, status=lambda u: ("exit-code", "1"))
-    assert rec["pushed"] is False and len(lines(env)) == 1
+    assert rec["pushed"] is False and len(lines(env)) == 1  # nothing was pushed: there is no role
 
 
 def test_a_bad_unit_name_is_refused(env):
@@ -153,13 +155,13 @@ def test_a_job_with_no_expected_rate_is_not_watched(env):
     assert jobwatch.deadman(env, datetime.now(UTC) + timedelta(days=9), Sender()) == []
 
 
-def test_the_cli_exits_1_while_a_job_is_overdue(env, capsys):
+def test_the_cli_exits_3_while_a_job_is_overdue(env, capsys):
     from ws import cli
 
     job(env)
     assert cli.main(["watch", "deadman"]) == 0
     os.utime(jobs.jobs_dir(env) / "stub.toml", (1, 1))  # the file is old, the job never ran
-    assert cli.main(["watch", "deadman"]) == 1
+    assert cli.main(["watch", "deadman"]) == 3
     assert "stub has not run" in capsys.readouterr().out
 
 
@@ -211,3 +213,80 @@ def test_watch_rotate_rotates_an_oversize_log_and_leaves_a_small_one(env, capsys
 
     joblog.rotate(log, max_bytes=5)
     assert (log.parent / "stub.log.1").exists()
+
+
+def test_a_job_that_runs_a_ws_command_is_not_measured_by_run_records(env):
+    """Command jobs leave no run record under their name: they would be overdue forever."""
+    (jobs.jobs_dir(env) / "bk.toml").write_text(
+        f'command = "backup"\nschedule = "hourly"\n{CONTRACT}', encoding="utf-8"
+    )
+    os.utime(jobs.jobs_dir(env) / "bk.toml", (1, 1))
+    assert jobwatch.overdue(env, datetime.now(UTC)) == []
+
+
+def test_overdue_has_its_own_exit_code_and_a_crash_does_not_share_it(env, capsys, monkeypatch):
+    from ws import cli
+    from ws.roles import systemd
+
+    job(env)
+    os.utime(jobs.jobs_dir(env) / "stub.toml", (1, 1))
+    assert cli.main(["watch", "deadman"]) == jobwatch.EXIT_OVERDUE == 3
+    unit = systemd.render_watch(env, ["/opt/ws/bin/ws"])["ws-watch-deadman.service"]
+    assert "SuccessExitStatus=3" in unit and "SuccessExitStatus=1" not in unit
+    monkeypatch.setattr(jobwatch, "deadman", lambda *a, **k: (_ for _ in ()).throw(jobs.JobError("boom")))
+    assert cli.main(["watch", "deadman"]) == 1  # a failure is exit 1: the unit fails and its OnFailure= alerts
+
+
+def test_a_failed_send_is_tried_again_at_the_next_check_but_no_role_is_not(env):
+    job(env)
+    now = datetime(2026, 11, 14, 12, tzinfo=UTC)
+    record(env, "stub", now - timedelta(hours=3))
+    jobwatch.deadman(env, now, Sender())  # no notify role: not retried
+    notify(env)
+
+    class Down(Sender):
+        def __call__(self, url, body, headers):
+            raise OSError("down")
+
+    s = Sender()
+    jobwatch.deadman(env, now + timedelta(hours=1), s)
+    assert s.sent == []  # told already (no role at the time): one alert per last run
+    (jobs.jobs_dir(env) / "other.toml").write_text(
+        'runner = "claude-code"\nmodel = "m"\nprompt = "p"\nschedule = "hourly"\n' + CONTRACT, encoding="utf-8"
+    )
+    os.utime(jobs.jobs_dir(env) / "other.toml", (1, 1))
+    jobwatch.deadman(env, now + timedelta(hours=2), Down())  # the send fails: not marked told
+    jobwatch.deadman(env, now + timedelta(hours=3), s)
+    assert len(s.sent) == 1 and "other" in s.sent[0]  # tried again, and went
+
+
+def test_a_job_file_cannot_take_the_name_of_the_dead_man_unit(env):
+    (jobs.jobs_dir(env) / "watch-deadman.toml").write_text(
+        f'command = "backup"\nschedule = "hourly"\n{CONTRACT}', encoding="utf-8"
+    )
+    with pytest.raises(jobs.JobError, match="reserved"):
+        jobs.scheduled(env)
+    assert "reserved" in jobs.problems(env)["watch-deadman"]
+
+
+def test_a_stop_under_systemd_is_one_push_not_two(env, monkeypatch):
+    from ws import queue, run
+
+    sent = []
+    monkeypatch.setattr(queue, "notify_stop", lambda *a, **k: sent.append(a) or True)
+    token = run._says_stops.set(True)
+    try:
+        rec = {"job": "stub", "run_id": "r1", "status": "error", "stop_reason": "x"}
+        monkeypatch.setenv("INVOCATION_ID", "abc")
+        run._announce_stop(rec)
+        assert sent == []  # the unit fails and OnFailure= alerts
+        monkeypatch.delenv("INVOCATION_ID")
+        monkeypatch.setattr(run, "_told", [])
+        run._announce_stop(rec)
+        assert len(sent) == 1 and run._told == ["stub"]
+        monkeypatch.setattr(run, "_told", [])
+        monkeypatch.setattr(queue, "notify_stop", lambda *a, **k: False)  # nothing went out: still not "told"
+        run._announce_stop(rec)
+        assert run._told == []
+    finally:
+        run._says_stops.reset(token)

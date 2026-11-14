@@ -62,5 +62,8 @@ over.
 one ntfy line through the notify role; both carry the job name, unit and exit status, never a log line. An hourly
 `ws-watch-deadman.timer`, a unit outside the jobs it watches, raises one alert for each job with no run record in twice
 its `expected_rate`, and the next only after the job has run and gone overdue again. It runs on the machine it watches,
-so it can't see that machine down. launchd has no `OnFailure=`, so `ws run` sends the alert from its own exit path.
+so it can't see that machine down. It measures jobs that run through `ws run` (they leave run records under their
+name), not jobs that run a ws command, and exits 3 when it found one overdue (the unit counts that a success; any
+other exit fails the unit and alerts). A failed send is retried at the next check. launchd has no `OnFailure=`, so
+`ws run` sends the alert from its own exit path.
 `tests/test_jobwatch.py` pins each of these.

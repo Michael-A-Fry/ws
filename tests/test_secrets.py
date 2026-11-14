@@ -11,6 +11,7 @@ import stat
 from pathlib import Path
 
 import pytest
+from helpers.stub_secrets import StubSecrets
 
 from ws import broker, cli, doctor, osinfo
 from ws import secrets as wsecrets
@@ -677,3 +678,77 @@ def test_wall_refuses_paths_with_control_characters(tmp_path, capsys, monkeypatc
         monkeypatch.setattr(wsecrets, "store_dir", lambda *a, **k: bad / "s")
     code, out, err = run(capsys, "secret", "wall")
     assert code == 1 and out == "" and "control character" in err
+
+
+# ---------------------------------------------------------------- tiers, areas and the store against the registry
+
+
+def test_tier_and_area_are_read_and_make_a_name_scoped(tmp_path):
+    s = StubSecrets(tmp_path)
+    s.register("plain", ["api.example.com"], value=False)
+    s.register("deep", ["api.example.com"], value=False, tier="lead-elevated", area="home")
+    reg = wsecrets.load_registry(s.registry)
+    assert not reg["plain"].scoped and reg["plain"].tier is None
+    assert reg["deep"].scoped and reg["deep"].elevated and reg["deep"].area == "home"
+    assert set(wsecrets.REACH) == set(wsecrets.TIERS)
+    assert all(t in wsecrets.REACH[t] for t in wsecrets.TIERS), "a tier reaches its own names"
+    assert not any("walled" in wsecrets.REACH[t] for t in wsecrets.TIERS if t != "walled")
+
+
+@pytest.mark.parametrize(
+    "extra,why",
+    [
+        ('tier = "god"', "tier must be one of"),
+        ('area = "Home Area"', "area must be"),
+        ('teir = "lead"', "unknown keys: teir"),  # a typo never leaves a name silently unscoped
+    ],
+)
+def test_a_bad_tier_area_or_unknown_key_refuses_the_whole_registry(tmp_path, extra, why):
+    p = tmp_path / "secrets.toml"
+    p.write_text(f'[ok]\nhosts = ["a.example.com"]\n\n[bad]\nhosts = ["a.example.com"]\n{extra}\n')
+    with pytest.raises(wsecrets.SecretsError, match=why):
+        wsecrets.load_registry(p)
+
+
+def test_health_names_a_store_value_with_no_registry_row(tmp_path):
+    s = StubSecrets(tmp_path)
+    s.register("kept", ["api.example.com"])
+    s.store.write("orphan", "planted-" + os.urandom(6).hex())
+    problems, _ = wsecrets.health(s.registry, s.store)
+    assert problems == ["orphan is in the store but not in the registry"]
+    assert wsecrets.unregistered(wsecrets.load_registry(s.registry), s.store) == ["orphan"]
+
+
+def test_the_stub_secrets_helper_plants_fresh_values_and_finds_leaks(tmp_path):
+    s = StubSecrets(tmp_path)
+    v = s.register("k", ["api.example.com"])
+    assert v and v.startswith("planted-") and s.store.read("k") == v
+    assert s.leaked(f"oops {v}") == ["k"] and s.leaked("nothing here") == []
+    assert StubSecrets(tmp_path / "b").register("k", ["api.example.com"]) != v
+
+
+# Reading a credential straight from the environment skips the broker: the value is then in the process, its children
+# and /proc/<pid>/environ. Only the broker and the store may name such a variable through os.environ or os.getenv.
+_SECRET_ENV = re.compile(
+    r"""os\.(?:environ(?:\.get)?\s*[\[(]|getenv\s*\()\s*["'][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSW|CREDENTIAL)[A-Z0-9_]*["']"""
+)
+_MAY_READ_SECRET_ENV = {"broker.py", "secrets.py"}
+
+
+def test_no_raw_environment_read_of_a_secret_outside_the_broker():
+    src = Path(wsecrets.__file__).resolve().parent
+    hits = []
+    for f in sorted(src.rglob("*.py")):
+        if f.name in _MAY_READ_SECRET_ENV and f.parent == src:
+            continue
+        for n, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
+            if _SECRET_ENV.search(line):
+                hits.append(f"{f.relative_to(src)}:{n}")
+    assert hits == [], f"lease it through the broker instead: {hits}"
+
+
+def test_the_secret_env_lint_catches_the_shapes_it_should():
+    for bad in ('os.environ["GITHUB_TOKEN"]', "os.environ.get('API_KEY')", 'os.getenv("DB_PASSWORD")'):
+        assert _SECRET_ENV.search(bad), bad
+    for fine in ('os.environ["HOME"]', 'env.get("ANTHROPIC_API_KEY")', 'os.environ.get("WS_HOME")'):
+        assert not _SECRET_ENV.search(fine), fine

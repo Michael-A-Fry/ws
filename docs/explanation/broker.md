@@ -36,6 +36,34 @@ Callers are checked with `SO_PEERCRED` on Linux and `LOCAL_PEERCRED` on macOS. O
 `--group` are served. `ws run` leases each secret named in a job file and releases the leases whatever happened,
 including Ctrl-C.
 
+### Run records, tiers and areas
+
+A user ID says who is calling, not what that caller should have. Any program running as that user can reach the
+socket. So a registry name can be **scoped** with a `tier` (`walled`, `worker`, `lead`, `lead-elevated`) and an
+`area`. A scoped name is leased only under a **run record**: a file the broker trusts, written before the run starts,
+one per run in the broker's own state folder (`run/records/`, 0600 in a 0700 folder, owned by the broker's user). It
+holds the run's area, its tier and the names it declared.
+
+A request names only its run ID. The broker reads the area and tier from the record, never from the request, and a
+request that claims a different area or tier is refused (`claim_refused`). It then refuses a name the run didn't
+declare (`not_declared`), a name from another area (`area_refused`) and a name the run's tier doesn't reach
+(`tier_refused`). `lead` reaches `worker` names, `lead-elevated` reaches both, and `walled` reaches only `walled` names,
+which no other tier reaches. A lease ends with its run: the proxy reads the record again on every request, so removing
+the record (`ws broker run-record rm`) or letting it expire ends every lease issued under it.
+
+Names with no `tier` or `area` keep the older rule, so existing setups go on working. `ws broker serve --require-run`
+(or `require_run = true` under `[roles.secrets]`) makes every lease need a run record.
+
+### The audit log and the kill switch
+
+Every grant and every refusal writes one line to `logs/broker.jsonl`: the name, host, run, area, tier and outcome,
+never a value. A grant whose line can't be written is refused (`audit_failed`). `ws broker audit-copy` copies the log
+to a folder or an `scp` target named by `audit_copy` under `[roles.secrets]`, so a copy lives off the machine.
+
+`ws elevate off` refuses every `lead-elevated` name at once, drops the live leases for them and asks each minter that
+can revoke its upstream token to do so. Any caller may pull the switch; only the broker's own user, from a terminal,
+puts it back with `ws elevate on`. A switch file that can't be read or trusted counts as off.
+
 ### The secret wall
 
 By default the store belongs to you, so a program that runs as you can read the files. `ws secret wall` prints the
@@ -59,4 +87,5 @@ See [Known limits](known-limits.md).
 
 ## Do it
 
-Follow [Store a secret](../how-to/store-a-secret.md).
+Follow [Store a secret](../how-to/store-a-secret.md), then
+[Use short-lived credentials](../how-to/use-short-lived-credentials.md) to scope names to runs.

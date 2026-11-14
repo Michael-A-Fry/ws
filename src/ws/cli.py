@@ -358,6 +358,7 @@ def build_parser() -> argparse.ArgumentParser:
     gate.register(sub)
     secrets.register(sub)
     broker.register(sub)
+    broker.register_elevate(sub)
     notes.register(sub)
     memory.register(sub)
     mcp_server.register(sub)

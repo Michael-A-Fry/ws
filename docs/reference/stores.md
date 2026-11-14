@@ -60,7 +60,7 @@ folders read-only, and the gate refuses a session's writes to each of them in ei
 | OpenCode asks | `.claude-usage/asks/asks.jsonl` | `src/ws/adapters/opencode.py` (the shim it generates writes the lines, from OpenCode's permission events) | `schema`, `ts` (epoch milliseconds), `event` (`added`, `answered`), `id`, and on `added` `repo`, `session`, `question`, `options`, `decision`, `source` | 1 | `ts` | Each line starts with a newline; past 8 MiB the file moves to `asks.jsonl.old`, one generation, so it stays under the 64 MiB `ws home` reads |
 | Job alerts | `logs/alerts.jsonl` | `src/ws/jobwatch.py` (`ws watch`) | `schema`, `ts`, `kind` (`not-automatic`), `event` (`unit-failed`, `no-run`), `job`, `pushed`; on `unit-failed` `unit`, `result`, `exit_status`; on `no-run` `hours_since` | 1 | `ts` | Never rotated; one line per alert |
 | Upgrade history | `upgrade-history.jsonl` | `src/ws/upgrade.py` (`ws upgrade`) | `schema`, `ts`, `verb` (`promote`, `rollback`, `auto-rollback`), `from`, `to` (none when a rollback failed) | 1 | `ts` | Never rotated: the last promote is the way back |
-| Broker audit | `logs/broker.jsonl` | `src/ws/broker.py` | `t`, `op`, `name`, `purpose`, `host`, `uid`, `pid`, `lease`, `status`, `bytes` | none (reads as 1) | `t` | One file; the broker appends and never rotates it |
+| Broker audit | `logs/broker.jsonl` | `src/ws/broker.py` | `t`, `op` (`request`, `release`, `proxy`, `elevate`, `revoke`), `name`, `purpose`, `host`, `uid`, `pid`, `lease`, `run`, `area`, `tier`, `status`, `bytes` | none (reads as 1) | `t` | One file; the broker appends and never rotates it. `ws broker audit-copy` copies it off the machine |
 
 Where the policy has `[classes]`, a session writes its gate verdicts and calls to `logs/classes/<name>/gate.jsonl`
 and `logs/classes/<name>/gate-calls.jsonl` instead (a folder of no class uses the built-in `unclassified`), in a 0700
@@ -89,7 +89,10 @@ Notes:
   `[home.sources] asks_jsonl` in the profile, else `.claude-usage/asks/asks.jsonl` below your home folder. Its `ts` is
   epoch milliseconds, not the RFC 3339 text of the other logs; the reader takes either.
 - The broker audit log predates the convention. It's the one log that doesn't go through `ws.jsonl`, and it has no
-  `schema`. Its time key is `t`. A change to it takes a schema number of its own.
+  `schema`. Its time key is `t`. A change to it takes a schema number of its own. `run`, `area` and `tier` were added
+  without one: they're new keys that older readers skip, and no old key changed meaning.
+- The broker's run records (`run/records/<run id>`, one JSON object each, 0600 in a 0700 folder) and its kill switch
+  (`elevate.json`) sit in the broker's own state folder. They're control files, not logs: one writer, no history.
 - Ratings sit at the top of the state folder and not in `logs/`. The top holds the control files a session may not write,
   and the person's verdicts sit with them, so an agent can't mark its own work. `logs/` is where a session may be able
   to write.

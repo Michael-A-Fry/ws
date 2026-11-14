@@ -23,7 +23,9 @@ You type the value yourself, in your own terminal. Never paste a key into an AI 
    ```
 
    For a bearer token, use `header = "authorization"` and `format = "Bearer {value}"`. Leave `purposes` out to allow any.
-   Keep `hosts` to the one host that needs the key.
+   Keep `hosts` to the one host that needs the key. To lease it only to runs that declare it, add a `tier` and an
+   `area` ([Use short-lived credentials](use-short-lived-credentials.md)). An unknown key in a table refuses the whole
+   registry, so a typo never leaves a name unscoped.
 
 2. Store the value. ws asks for it without showing it. It reads standard input instead when there is no terminal.
 

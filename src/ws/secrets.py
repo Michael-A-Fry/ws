@@ -6,6 +6,13 @@ The registry (`secrets.toml` in the config folder) is not secret. It says which 
     hosts = ["api.anthropic.com"]
     header = "x-api-key"            # or "authorization" with format = "Bearer {value}"
     purposes = ["run"]              # empty or missing = any purpose
+    tier = "worker"                 # optional: walled | worker | lead | lead-elevated (see below)
+    area = "home"                   # optional: only runs of this area may lease it
+
+A name with a `tier` or an `area` is scoped: the broker leases it only to a run whose broker-side run record (ws.broker)
+declares it, in a tier that reaches it and in the same area. `lead-elevated` names are the elevated ones that
+`ws elevate off` stops at once. A name with neither is unscoped and keeps the older rule (any allowed caller), unless the
+broker is started with `--require-run`.
 
 The store holds the values: one file per name, mode 0600, in a directory of mode 0700. Agents never read it. The broker
 (ws.broker) reads it and injects the value at the one allowed host. A value is never printed, logged or put in an error.
@@ -42,6 +49,18 @@ WALL_SOCKET = "/run/ws-broker/broker.sock"
 WALL_BIN = "/opt/ws/bin/ws"  # a root-owned launcher: the broker never runs code a normal user can write
 WALL_LIB = "/opt/ws/lib"
 SAFE_PATH = re.compile(r"^[A-Za-z0-9_./+-]+$")
+AREA_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
+# The tiers, lowest first. A run's tier reaches the names of the tiers in REACH; `walled` reaches only walled names, and
+# nothing reaches up into it, so a walled class's keys never leave its own runs.
+TIERS = ("walled", "worker", "lead", "lead-elevated")
+REACH = {
+    "walled": frozenset({"walled"}),
+    "worker": frozenset({"worker"}),
+    "lead": frozenset({"worker", "lead"}),
+    "lead-elevated": frozenset({"worker", "lead", "lead-elevated"}),
+}
+ELEVATED = "lead-elevated"
+DEFAULT_TIER = "worker"  # the tier of a name that has none, when a run asks for it
 
 
 class SecretsError(Exception):
@@ -55,6 +74,17 @@ class Entry:
     header: str = "x-api-key"
     format: str = "{value}"
     purposes: tuple[str, ...] = field(default_factory=tuple)
+    tier: str | None = None
+    area: str | None = None
+
+    @property
+    def scoped(self) -> bool:
+        """True when only a run record that declares it may lease it."""
+        return self.tier is not None or self.area is not None
+
+    @property
+    def elevated(self) -> bool:
+        return self.tier == ELEVATED
 
 
 def registry_path(env: dict | None = None) -> Path:
@@ -127,7 +157,15 @@ def _entry(path: Path, name: str, t: dict) -> Entry:
     if not isinstance(fmt, str) or fmt.count("{value}") != 1 or re.search(r"[\x00-\x1f\x7f]", fmt):
         raise SecretsError(f"{path}: [{name}] format must contain {{value}} once, on one line")
     purposes = _str_list(path, name, "purposes", t.get("purposes", []))
-    return Entry(name=name, hosts=hosts, header=header, format=fmt, purposes=purposes)
+    tier, area = t.get("tier"), t.get("area")
+    if tier is not None and tier not in TIERS:
+        raise SecretsError(f"{path}: [{name}] tier must be one of {', '.join(TIERS)}")
+    if area is not None and not (isinstance(area, str) and AREA_RE.match(area)):
+        raise SecretsError(f"{path}: [{name}] area must be a short lower-case name (letters, digits, - and _)")
+    unknown = set(t) - {"hosts", "header", "format", "purposes", "tier", "area"}
+    if unknown:
+        raise SecretsError(f"{path}: [{name}] has unknown keys: {', '.join(sorted(unknown))}")
+    return Entry(name=name, hosts=hosts, header=header, format=fmt, purposes=purposes, tier=tier, area=area)
 
 
 def check_value(value: str) -> str:
@@ -249,7 +287,15 @@ def health(reg_path: Path, store: Store) -> tuple[list[str], int | None]:
         owner = store.path.stat().st_uid
     except FileNotFoundError:
         return [*problems, f"no store at {store.path}"], None
+    if not any(p.startswith("registry unreadable") for p in problems):
+        problems += [f"{n} is in the store but not in the registry" for n in unregistered(reg, store)]
     return [*problems, *store.loose()], owner
+
+
+def unregistered(reg: dict[str, Entry], store: Store) -> list[str]:
+    """Names with a value in the store and no registry entry: a value nothing may lease, or a registry that lost a row.
+    Raises PermissionError if the store belongs to another user."""
+    return [n for n in store.names() if n not in reg]
 
 
 def owner_name(uid: int) -> str:

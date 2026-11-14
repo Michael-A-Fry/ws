@@ -5,8 +5,7 @@
 The plist uses StartCalendarInterval, which launchd runs late if the Mac was asleep at the time (several missed
 firings become one). That is the catch-up a laptop needs, so the "stays on?" answer changes nothing here. A Mac that was powered
 off at the time does not catch up: launchd has no setting for it, and RunAtLoad would run the job at every login.
-launchd has no OnFailure=: there the alert is sent by `ws run`'s own exit path, so the plist carries no hook; it does
-carry `ProcessType=Background` (launchd's share for scheduled work). Swap note: to replace launchd, add a scheduler
+The plist carries `ProcessType=Background` (launchd's share for scheduled work). Swap note: to replace launchd, add a scheduler
 adapter beside this one.
 `activate` bootstraps the agents into the user's GUI domain through an injectable runner; tests check the argv.
 """

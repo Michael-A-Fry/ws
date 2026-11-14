@@ -6,8 +6,9 @@ The service runs `ws run <name>` (or the job's `command`, for example `ws backup
 `Persistent=true`, so a run missed while the machine was off happens at the next start; on a machine that stays on it
 never fires, so the "stays on?" answer is not needed here.
 
-Every service also gets `TimeoutStartSec=` (the job's `timeout_s` and a margin, so a hung run is killed),
-`OnFailure=ws-alert@%n.service` (one template unit sends the alert), `Slice=ws-jobs.slice` (a shared slice with a CPU
+Every service also gets `TimeoutStartSec=` (the job's `timeout_s` and a margin, so a hung run is killed; `infinity`
+for a file with no `timeout_s`, which is what a oneshot had before, so an upgrade never kills a running job; the
+contract check still flags the file), `Slice=ws-jobs.slice` (a shared slice with a CPU
 and memory share, so scheduled work cannot starve the desk) and, for a job with `log = "file"`, `StandardOutput=append:`
 a file in the state logs folder (`ws run` rotates it: 20 MB x 3). The first line of each file says it is generated and
 how to regenerate it.
@@ -33,7 +34,6 @@ ROLE, NAME = "scheduler", "systemd"
 PREFIX = "ws-"
 MARKER = "# Written by ws"  # first line of every unit ws writes: the proof a unit in the user folder is its own
 SLICE = "ws-jobs.slice"  # the shared slice every scheduled service runs in
-ALERT = "ws-alert@%n.service"  # OnFailure= target: one template unit, instance = the failed unit's name
 CPU_WEIGHT, MEMORY_HIGH = 50, "75%"  # the share scheduled jobs get: below the default CPUWeight of 100, soft memory cap
 TIMEOUT_MARGIN_S = 30  # TimeoutStartSec= is the job's limit plus this, so `ws run` ends its own run first
 
@@ -75,9 +75,9 @@ def render(job: Scheduled, env, ws_cmd: list[str]) -> dict[str, str]:
         out = f"StandardOutput=append:{_schedule.logs_dir(env) / (job.name + '.log')}\nStandardError=inherit\n"
     service = (
         _header(source)
-        + f"[Unit]\nDescription=ws job {job.name}\nOnFailure={ALERT}\n\n"
+        + f"[Unit]\nDescription=ws job {job.name}\n\n"
         + f"[Service]\nType=oneshot\nSlice={SLICE}\n{chr(10).join(lines)}\nExecStart={exec_start}\n"
-        + f"TimeoutStartSec={int(job.timeout_s) + TIMEOUT_MARGIN_S}\n{out}"
+        + f"TimeoutStartSec={'infinity' if job.timeout_s is None else int(job.timeout_s) + TIMEOUT_MARGIN_S}\n{out}"
     )
     timer = (
         _header(source)

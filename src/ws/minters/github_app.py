@@ -27,9 +27,13 @@ The first is git's credential helper protocol (git reads the token from stdout, 
 `gh` with GH_TOKEN set in its own environment only. Swap note: a fine-grained personal access token with an expiry, kept
 in the store under the same name with the plain header kind, does the same job with no App, and nothing else changes.
 
-Signing: EMSA-PKCS1-v1_5 with SHA-256 (RFC 8017 section 9.2) over a PKCS#1 or PKCS#8 RSA key. It is not constant time;
-the key never leaves the broker's process and the only input an attacker controls is not the signed message, which the
-broker builds itself.
+Signing: EMSA-PKCS1-v1_5 with SHA-256 (RFC 8017 section 9.2) over a PKCS#1 or PKCS#8 RSA key, blinded with a fresh
+random factor per signature (a caller can make the broker sign as often as it likes, so the time a signature takes must
+not depend on the key), and checked with the public exponent before it is used.
+
+The run record, not the caller, says what a token may cover: `repos` and `permissions` in the record (`ws broker
+run-record write --repo ws --perm contents=write`). A request may narrow below both the record and the entry, never
+above either. A run's tokens end with it: when its record goes, the broker revokes them upstream.
 """
 
 from __future__ import annotations
@@ -39,6 +43,7 @@ import base64
 import hashlib
 import http.client
 import json
+import math
 import os
 import re
 import sys
@@ -118,15 +123,30 @@ def parse(path: Path, name: str, t: dict) -> Options:
 EXTRA_KEYS = frozenset({"app_id", "installation_id", "repos", "permissions", "api"})
 
 
-def narrow(opts: Options, repos: object, permissions: object) -> tuple[tuple[str, ...], dict[str, str]]:
-    """The repos and permissions a run asked for, checked against the entry's. No permissions asked: the entry's own.
-    Raises MintError("bad_request") for a malformed ask and MintError("not_declared") for one above the entry."""
+def narrow(
+    opts: Options,
+    repos: object,
+    permissions: object,
+    run_repos: tuple[str, ...],
+    run_permissions: dict[str, str],
+) -> tuple[tuple[str, ...], dict[str, str]]:
+    """The repos and permissions a caller asked for, checked against both the entry's and the run record's: the caller
+    never widens what the run was given. No permissions asked: the most both allow. Raises MintError("bad_request") for
+    a malformed ask and MintError("not_declared") for one above the entry or the run."""
     if not (isinstance(repos, list) and repos and all(isinstance(r, str) and REPO_RE.match(r) for r in repos)):
         raise MintError("bad_request", "repos must be a list of repository names, at least one")
-    extra = sorted(set(repos) - set(opts.repos))
+    if not run_repos or not run_permissions:
+        raise MintError("not_declared", "the run record gives this run no repos or permissions for a token")
+    extra = sorted(set(repos) - (set(opts.repos) & set(run_repos)))
     if extra:
-        raise MintError("not_declared", f"the entry does not allow {', '.join(extra)}")
-    cap = opts.permission_map()
+        raise MintError("not_declared", f"the entry and the run do not both allow {', '.join(extra)}")
+    entry_cap = opts.permission_map()
+    cap = {
+        k: min(entry_cap[k], run_permissions[k], key=LEVELS.__getitem__)
+        for k in sorted(set(entry_cap) & set(run_permissions))
+    }
+    if not cap:
+        raise MintError("not_declared", "the entry and the run record share no permission")
     if permissions is None:
         return tuple(dict.fromkeys(repos)), cap
     if not (isinstance(permissions, dict) and permissions):
@@ -135,7 +155,7 @@ def narrow(opts: Options, repos: object, permissions: object) -> tuple[tuple[str
         if not (isinstance(k, str) and PERMISSION_RE.match(k)) or v not in LEVELS:
             raise MintError("bad_request", "permissions must be an object of name to read, write or admin")
         if k not in cap or LEVELS[v] > LEVELS[cap[k]]:
-            raise MintError("not_declared", f"the entry does not allow {k}: {v}")
+            raise MintError("not_declared", f"the entry and the run do not both allow {k}: {v}")
     return tuple(dict.fromkeys(repos)), dict(sorted(permissions.items()))
 
 
@@ -231,7 +251,16 @@ def sign_rs256(key: RsaKey, message: bytes) -> bytes:
     if k < len(t) + 11:
         raise MintError("store_unreadable", "the App key is too short")
     em = b"\x00\x01" + b"\xff" * (k - len(t) - 3) + b"\x00" + t
-    return pow(int.from_bytes(em, "big"), key.d, key.n).to_bytes(k, "big")
+    m = int.from_bytes(em, "big")
+    # Blinding: sign m * r^e and divide by r, so the time the private power takes says nothing about m or d.
+    while True:
+        r = int.from_bytes(os.urandom(k), "big") % key.n
+        if r > 1 and math.gcd(r, key.n) == 1:
+            break
+    s = pow(m * pow(r, key.e, key.n) % key.n, key.d, key.n) * pow(r, -1, key.n) % key.n
+    if pow(s, key.e, key.n) != m:  # a fault never leaves the broker as a signature
+        raise MintError("store_unreadable", "the App key gave a bad signature")
+    return s.to_bytes(k, "big")
 
 
 def _b64url(data: bytes) -> str:
@@ -435,7 +464,9 @@ def setup_steps(name: str = "github-app") -> str:
    rm ~/Downloads/<app>.pem
 
    (macOS: base64 -i ~/Downloads/<app>.pem | ws secret set {name})
-6. Declare the name in the job's run record, then point git at the helper:
+6. Declare the name, the repos and the permissions in the job's run record (the launcher writes it; by hand:
+   ws broker run-record write RUN --area <area> --tier worker --name {name} --repo <repo> --perm contents=write),
+   then point git at the helper:
 
    git config --global credential.https://github.com.helper \\
      '!python3 -m ws.minters.github_app credential --name {name} --run "$WS_RUN_ID" --repo <repo>'

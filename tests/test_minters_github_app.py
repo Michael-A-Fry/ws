@@ -23,6 +23,8 @@ from ws import secrets as wsecrets
 from ws.minters import github_app as gh
 
 INSTALLATION = 4242
+# what a run record gives a run to mint for: both repos, and the entry's own permissions
+GRANT = {"repos": ("ws", "notes"), "permissions": (("contents", "write"), ("pull_requests", "write"))}
 
 
 def _make_pem(folder: Path) -> bytes:
@@ -203,7 +205,7 @@ def test_the_signature_matches_openssl(pem, tmp_path):
 
 
 def test_a_run_gets_a_token_narrowed_to_its_repos_and_permissions(app):
-    app.s.record("r1", "home", "worker", ["github-app"])
+    app.s.record("r1", "home", "worker", ["github-app"], **GRANT)
     out = app.mint(permissions={"contents": "read"})
     assert out["token"].startswith("ghs_") and out["expires_at"].endswith("Z")
     sent = app.fake.minted[-1]
@@ -214,7 +216,7 @@ def test_a_run_gets_a_token_narrowed_to_its_repos_and_permissions(app):
 
 
 def test_a_token_is_reused_within_its_life_and_never_logged(app):
-    app.s.record("r1", "home", "worker", ["github-app"])
+    app.s.record("r1", "home", "worker", ["github-app"], **GRANT)
     t1, t2 = app.mint()["token"], app.mint()["token"]
     assert t1 == t2 and len(app.fake.minted) == 1
     log = app.raw_log()
@@ -226,7 +228,7 @@ def test_a_token_is_reused_within_its_life_and_never_logged(app):
 
 
 def test_asks_beyond_the_entry_or_the_run_are_refused(app):
-    app.s.record("r1", "home", "worker", ["github-app"])
+    app.s.record("r1", "home", "worker", ["github-app"], **GRANT)
     assert app.refused(repos=("secret-repo",)).code == "not_declared"
     assert app.refused(permissions={"administration": "write"}).code == "not_declared"
     assert app.refused(permissions={"contents": "admin"}).code == "not_declared"
@@ -237,22 +239,22 @@ def test_asks_beyond_the_entry_or_the_run_are_refused(app):
     assert e.value.code == "run_required"
     app.s.record("r2", "home", "worker", ["other"])
     assert app.refused(run="r2").code == "not_declared"
-    app.s.record("r3", "money", "worker", ["github-app"])
+    app.s.record("r3", "money", "worker", ["github-app"], **GRANT)
     assert app.refused(run="r3").code == "area_refused"
-    app.s.record("r4", "home", "walled", ["github-app"])
+    app.s.record("r4", "home", "walled", ["github-app"], **GRANT)
     assert app.refused(run="r4").code == "tier_refused"
     assert app.fake.minted == [], "nothing refused reached GitHub"
 
 
 def test_a_lease_request_for_a_minter_entry_is_refused(app):
-    app.s.record("r1", "home", "worker", ["github-app"])
+    app.s.record("r1", "home", "worker", ["github-app"], **GRANT)
     with pytest.raises(broker.BrokerRefused) as e:
         broker.request("github-app", "run", "api.github.com", socket=app.sock, run="r1")
     assert e.value.code in ("host_not_allowed", "wrong_kind")
 
 
 def test_github_refusing_is_a_refusal_with_no_token(app):
-    app.s.record("r1", "home", "worker", ["github-app"])
+    app.s.record("r1", "home", "worker", ["github-app"], **GRANT)
     app.fake.status = 422
     e = app.refused()
     assert e.code == "upstream_refused" and "422" in e.reason
@@ -261,7 +263,7 @@ def test_github_refusing_is_a_refusal_with_no_token(app):
 def test_elevate_off_revokes_tokens_minted_for_an_elevated_app(base, fake, pem):
     a = App(base, fake, pem, tier="lead-elevated")
     try:
-        a.s.record("r1", "home", "lead-elevated", ["github-app"])
+        a.s.record("r1", "home", "lead-elevated", ["github-app"], **GRANT)
         token = a.mint()["token"]
         out = broker.elevate(False, a.sock)
         assert out["revoked"] == 1 and out["revoke_failed"] == 0
@@ -273,7 +275,7 @@ def test_elevate_off_revokes_tokens_minted_for_an_elevated_app(base, fake, pem):
 
 
 def test_the_git_credential_helper_answers_github_only_and_prints_no_reason_text(app, monkeypatch, capsys):
-    app.s.record("r1", "home", "worker", ["github-app"])
+    app.s.record("r1", "home", "worker", ["github-app"], **GRANT)
     args = ["credential", "--name", "github-app", "--run", "r1", "--socket", str(app.sock)]
     monkeypatch.setattr("sys.stdin", io.StringIO("protocol=https\nhost=github.com\npath=me/ws.git\n\n"))
     assert gh.main([*args, "get"]) == 0
@@ -321,3 +323,81 @@ def test_the_setup_steps_name_every_field_and_run_nothing():
     ):
         assert must in text, must
     assert "\\\n" in text, "the git config line continues with one backslash"
+
+
+# ---------------------------------------------------------------- cold review: the run, not the caller, bounds a token
+
+
+def test_must2_the_run_record_not_the_caller_bounds_repos_and_permissions(app):
+    app.s.record("r1", "home", "worker", ["github-app"], repos=("ws",), permissions=(("contents", "read"),))
+    assert app.refused(repos=("notes",)).code == "not_declared", "the entry allows notes, the run does not"
+    assert app.refused(permissions={"contents": "write"}).code == "not_declared", "the run gives read only"
+    assert app.refused(permissions={"pull_requests": "write"}).code == "not_declared"
+    assert app.mint()["token"].startswith("ghs_")
+    assert app.fake.minted[-1]["body"] == {"repositories": ["ws"], "permissions": {"contents": "read"}}
+    app.s.record("r2", "home", "worker", ["github-app"])
+    assert app.refused(run="r2").code == "not_declared", "a record with no repos gives no token"
+    assert len(app.fake.minted) == 1
+
+
+def test_must1_a_token_minted_while_elevate_off_lands_is_revoked_and_refused(base, fake, pem, monkeypatch):
+    a = App(base, fake, pem, tier="lead-elevated")
+    try:
+        a.s.record("r1", "home", "lead-elevated", ["github-app"], **GRANT)
+        real = gh.mint
+
+        def slow_mint(*args, **kw):
+            out = real(*args, **kw)
+            broker.write_elevation(a.s.elevate_file, False)  # the switch is pulled while GitHub answers
+            return out
+
+        monkeypatch.setattr(gh, "mint", slow_mint)
+        assert a.refused().code == "elevation_off"
+        assert fake.revoked == [fake.minted[-1]["token"]], "the late token was revoked upstream"
+        assert a.broker._minted == [] and a.broker._mint_cache == {}
+        assert fake.minted[-1]["token"] not in a.raw_log()
+    finally:
+        a.broker.stop()
+
+
+def test_must3_a_runs_tokens_are_revoked_when_its_record_goes(app):
+    app.s.record("r1", "home", "worker", ["github-app"], **GRANT)
+    token = app.mint()["token"]
+    assert broker.remove_run_record(app.s.records, "r1")
+    assert app.broker.reap_minted() == (1, 0)
+    assert app.fake.revoked == [token]
+    assert app.broker._minted == [] and app.broker._mint_cache == {}
+    app.s.record("r1", "home", "worker", ["github-app"], **GRANT)
+    assert app.mint()["token"] != token, "a new run with the same id gets a fresh token, never the dead one"
+    assert [json.loads(x)["status"] for x in app.raw_log().splitlines() if json.loads(x)["op"] == "revoke"] == ["ok"]
+
+
+def test_must3_a_record_that_drops_the_name_ends_its_tokens_too(app):
+    app.s.record("r1", "home", "worker", ["github-app"], **GRANT)
+    token = app.mint()["token"]
+    app.s.record("r1", "home", "worker", ["other"], **GRANT)
+    assert app.broker.reap_minted() == (1, 0) and app.fake.revoked == [token]
+
+
+def test_signing_is_blinded_and_still_deterministic(pem, monkeypatch):
+    k = gh.load_key(base64.b64encode(pem).decode())
+    seen = []
+    real = os.urandom
+    monkeypatch.setattr(gh.os, "urandom", lambda n: seen.append(n) or real(n))
+    assert gh.sign_rs256(k, b"x") == gh.sign_rs256(k, b"x"), "PKCS#1 v1.5 is deterministic, blinding or not"
+    assert seen and all(n == k.size for n in seen), "a fresh blinding factor per signature"
+
+
+def test_run_record_cli_takes_repos_and_permissions(base, monkeypatch):
+    from ws import cli
+
+    monkeypatch.setenv("WS_HOME", str(base))
+    monkeypatch.setenv("HOME", str(base))
+    argv = ["broker", "run-record", "write", "r1", "--area", "home", "--tier", "worker", "--name", "github-app"]
+    ns = cli.build_parser().parse_args([*argv, "--repo", "ws", "--perm", "contents=read"])
+    assert broker.cmd_run_record(ns) == 0
+    rec = broker.read_run_record(broker.records_dir(), "r1", os.geteuid())
+    assert rec.repos == ("ws",) and rec.permissions == (("contents", "read"),)
+    bad = cli.build_parser().parse_args([*argv, "--perm", "contents=owner"])
+    with pytest.raises(broker.WsError):
+        broker.cmd_run_record(bad)

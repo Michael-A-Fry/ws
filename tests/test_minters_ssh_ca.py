@@ -139,10 +139,10 @@ def test_refusals_never_sign(ca):
     ]
 
 
-def test_a_tier_with_no_principals_gets_no_certificate():
+def test_a_tier_with_no_principals_gets_no_certificate(tmp_path):
     opts = ssh_ca.Options(principals=(("lead", ("ws-audit",)),))
     with pytest.raises(ssh_ca.MintError) as e:
-        ssh_ca.sign(opts, "unused", "ssh-ed25519 AAAA", "r1", "worker")
+        ssh_ca.sign(opts, "unused", "ssh-ed25519 AAAA", "r1", "worker", tmp_path)
     assert e.value.code == "tier_refused"
 
 
@@ -200,3 +200,33 @@ def test_the_registry_checks_the_ca_entry(tmp_path):
     assert e.options.for_tier("lead") == ("x",) and e.options.validity_s == 900
     problems, _ = wsecrets.health(p, wsecrets.Store(tmp_path / "s"))
     assert not any("no hosts" in x for x in problems), "a minter entry needs no hosts"
+
+
+def test_the_ca_key_is_written_under_the_brokers_own_folder_not_tmp(ca, monkeypatch):
+    made = []
+    real = tempfile.mkdtemp
+
+    def spy(*a, **k):
+        made.append(k.get("dir"))
+        return real(*a, **k)
+
+    monkeypatch.setattr(ssh_ca.tempfile, "mkdtemp", spy)
+    ca.s.record("r1", "home", "lead", ["ssh-ca"])
+    ca.sign()
+    assert made == [ca.broker.work_dir()]
+    assert ca.broker.work_dir().stat().st_mode & 0o777 == 0o700
+    assert str(ca.broker.work_dir()).startswith(str(ca.s.records.parent))
+
+
+def test_a_loose_key_folder_is_refused(ca):
+    ca.s.record("r1", "home", "lead", ["ssh-ca"])
+    ca.broker.work_dir().mkdir(mode=0o700, parents=True, exist_ok=True)
+    ca.broker.work_dir().chmod(0o755)
+    assert ca.refused().code == "store_unreadable"
+
+
+def test_validity_is_capped_at_15_minutes(tmp_path):
+    p = tmp_path / "secrets.toml"
+    p.write_text('[c]\nkind = "ssh-ca"\nprincipals = { lead = ["x"] }\nvalidity_s = 901\n')
+    with pytest.raises(wsecrets.SecretsError, match="60 to 900"):
+        wsecrets.load_registry(p)

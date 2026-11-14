@@ -90,8 +90,9 @@ CODES = (
     "upstream_unreachable",
 )
 MINT_REUSE_MARGIN_S = 300  # a cached token with less left than this is minted afresh
+REAP_EVERY_S = 30.0  # how often the broker looks for runs that ended with tokens still live
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$")
-RECORD_KEYS = {"v", "run", "area", "tier", "names", "uid", "expires_at"}
+RECORD_KEYS = {"v", "run", "area", "tier", "names", "uid", "expires_at", "repos", "permissions"}
 MAX_RECORD = 65536
 DEFAULT_TTL_S = 3600
 MAX_CONNECTIONS = 16
@@ -197,6 +198,8 @@ class RunRecord:
     names: tuple[str, ...]
     uid: int | None = None  # when set, only this caller uid may lease under the run
     expires_at: float | None = None  # when set, the run (and every lease under it) is over at this time
+    repos: tuple[str, ...] = ()  # the repositories a minted GitHub token may cover; none means no token
+    permissions: tuple[tuple[str, str], ...] = ()  # the most a minted token may hold, as (name, level)
 
     def to_json(self) -> dict:
         d: dict = {"v": 1, "run": self.run, "area": self.area, "tier": self.tier, "names": list(self.names)}
@@ -204,6 +207,10 @@ class RunRecord:
             d["uid"] = self.uid
         if self.expires_at is not None:
             d["expires_at"] = _iso(self.expires_at)
+        if self.repos:
+            d["repos"] = list(self.repos)
+        if self.permissions:
+            d["permissions"] = dict(self.permissions)
         return d
 
 
@@ -245,7 +252,28 @@ def _parse_record(raw: object, run_id: str) -> RunRecord:
         if when.tzinfo is None:
             raise RecordError("malformed", "the run record's expires_at must carry a time zone (Z for UTC)")
         expires = when.timestamp()
-    return RunRecord(run=run, area=area, tier=tier, names=tuple(names), uid=uid, expires_at=expires)
+    repos = raw.get("repos", [])
+    if not (isinstance(repos, list) and all(isinstance(r, str) and github_app.REPO_RE.match(r) for r in repos)):
+        raise RecordError("malformed", "the run record's repos must be a list of repository names")
+    perms = raw.get("permissions", {})
+    if not (
+        isinstance(perms, dict)
+        and all(
+            isinstance(k, str) and github_app.PERMISSION_RE.match(k) and v in github_app.LEVELS
+            for k, v in perms.items()
+        )
+    ):
+        raise RecordError("malformed", "the run record's permissions must map names to read, write or admin")
+    return RunRecord(
+        run=run,
+        area=area,
+        tier=tier,
+        names=tuple(names),
+        uid=uid,
+        expires_at=expires,
+        repos=tuple(repos),
+        permissions=tuple(sorted(perms.items())),
+    )
 
 
 def read_run_record(folder: Path, run_id: object, own_uid: int, now: float | None = None) -> RunRecord:
@@ -662,6 +690,8 @@ class Broker:
             raise
         assert self._unix is not None
         threading.Thread(target=self._unix.serve_forever, args=(0.05,), daemon=True, name="ws-broker-socket").start()
+        self._stopped.clear()
+        threading.Thread(target=self._reaper, daemon=True, name="ws-broker-reaper").start()
         return self
 
     def stop(self) -> None:
@@ -976,12 +1006,15 @@ class Broker:
         opts = entry.options
         log["host"] = (urlsplit(opts.api).hostname or "").lower() or None
         now = self.clock()
+        self.reap_minted()
         rec, why = self._scope(entry, msg, uid, log, now, need_run=True)
         if why:
             return self._refuse_logged("mint", log, *why)
         assert rec is not None
         try:
-            repos, perms = github_app.narrow(opts, msg.get("repos"), msg.get("permissions"))
+            repos, perms = github_app.narrow(
+                opts, msg.get("repos"), msg.get("permissions"), rec.repos, dict(rec.permissions)
+            )
         except github_app.MintError as e:
             return self._refuse_logged("mint", log, e.code, e.reason)
         log["purpose"] = ("repos=" + ",".join(repos) + " " + ",".join(f"{k}:{v}" for k, v in perms.items()))[:120]
@@ -1002,8 +1035,15 @@ class Broker:
             finally:
                 del value
             with self._lock:
-                self._mint_cache[key] = (token, expires)
-                self._minted.append(_Minted(entry.name, rec.run, entry.elevated, token, opts, expires))
+                late = entry.elevated and not self.elevation_on()
+                if not late:
+                    self._mint_cache[key] = (token, expires)
+                    self._minted.append(_Minted(entry.name, rec.run, entry.elevated, token, opts, expires))
+            if late:  # `ws elevate off` came while GitHub was answering: the token never leaves the broker
+                self._revoke_one(_Minted(entry.name, rec.run, entry.elevated, token, opts, expires))
+                return self._refuse_logged(
+                    "mint", log, "elevation_off", f"{entry.name} is elevated and was switched off"
+                )
         if rec.expires_at is not None and rec.expires_at < expires:
             expires_out = rec.expires_at  # the caller is told the run's end; the token itself cannot be shortened
         else:
@@ -1032,7 +1072,7 @@ class Broker:
             return refused
         assert value is not None
         try:
-            out = ssh_ca.sign(entry.options, value, msg["public_key"], rec.run, rec.tier)
+            out = ssh_ca.sign(entry.options, value, msg["public_key"], rec.run, rec.tier, self.work_dir())
         except ssh_ca.MintError as e:
             return self._refuse_logged("sign", log, e.code, e.reason)
         finally:
@@ -1053,27 +1093,70 @@ class Broker:
             return refused
         assert value is not None
         try:
-            return {"ok": True, "public_key": ssh_ca.ca_public_key(value)}
+            return {"ok": True, "public_key": ssh_ca.ca_public_key(value, self.work_dir())}
         except ssh_ca.MintError as e:
             return _refuse(e.code, e.reason)
 
-    def _revoke_minted(self) -> tuple[int, int]:
-        """Revoke upstream every token minted for an elevated name; (revoked, failed). The cache forgets them."""
+    def _take_minted(self, which) -> list[_Minted]:
+        """Remove the minted tokens `which(m)` picks from the list and the cache, under the lock, and return them."""
         with self._lock:
-            mine = [m for m in self._minted if m.elevated]
-            self._minted = [m for m in self._minted if not m.elevated]
-            self._mint_cache = {k: v for k, v in self._mint_cache.items() if v[0] not in {m.token for m in mine}}
+            mine = [m for m in self._minted if which(m)]
+            gone = {m.token for m in mine}
+            self._minted = [m for m in self._minted if m.token not in gone]
+            self._mint_cache = {k: v for k, v in self._mint_cache.items() if v[0] not in gone}
+        return mine
+
+    def _revoke_one(self, m: _Minted) -> bool:
+        try:
+            done = github_app.revoke(m.options, m.token, self.allow_plain_http)
+        except github_app.MintError:
+            done = False
+        self.audit.write("revoke", "ok" if done else "failed", name=m.name, run=m.run)
+        return done
+
+    def _revoke_all(self, mine: list[_Minted]) -> tuple[int, int]:
         ok = failed = 0
         for m in mine:
             if m.expires <= self.clock():
                 continue
-            try:
-                done = github_app.revoke(m.options, m.token, self.allow_plain_http)
-            except github_app.MintError:
-                done = False
-            ok, failed = (ok + 1, failed) if done else (ok, failed + 1)
-            self.audit.write("revoke", "ok" if done else "failed", name=m.name, run=m.run)
+            if self._revoke_one(m):
+                ok += 1
+            else:
+                failed += 1
         return ok, failed
+
+    def _revoke_minted(self) -> tuple[int, int]:
+        """Revoke upstream every token minted for an elevated name; (revoked, failed). The cache forgets them."""
+        return self._revoke_all(self._take_minted(lambda m: m.elevated))
+
+    def reap_minted(self) -> tuple[int, int]:
+        """Revoke the tokens of runs that have ended (their record removed, expired or no longer trusted, or no longer
+        declaring the name). The reaper thread calls it; so does every mint. (revoked, failed)."""
+        with self._lock:
+            runs = {(m.run, m.name) for m in self._minted}
+        ended = set()
+        for run, name in runs:
+            try:
+                if name not in self.run_record(run).names:
+                    ended.add((run, name))
+            except RecordError:
+                ended.add((run, name))
+        if not ended:
+            return 0, 0
+        return self._revoke_all(self._take_minted(lambda m: (m.run, m.name) in ended))
+
+    def _reaper(self) -> None:
+        while not self._stopped.wait(REAP_EVERY_S):
+            try:
+                self.reap_minted()
+            except Exception as e:  # noqa: BLE001 (the reaper keeps going; the type only)
+                print(f"ws broker: the token reaper failed ({type(e).__name__})", file=sys.stderr)
+
+    def work_dir(self) -> Path:
+        """A private folder of the broker's own for a minter's short-lived key files: never the shared temp folder."""
+        if self.records is None:
+            raise ssh_ca.MintError("store_unreadable", "this broker has no state folder for key files")
+        return self.records.parent / "minter"
 
     def run_record(self, run_id: object, now: float | None = None) -> RunRecord:
         if self.records is None:
@@ -1567,6 +1650,10 @@ def cmd_run_record(args: argparse.Namespace) -> int:
                 if not args.ttl > 0:
                     raise WsError("bad_input", "--ttl must be above 0", "seconds the run may lease for", 2)
                 expires = time.time() + args.ttl
+            perms = {}
+            for item in args.perm or ():
+                k, _, v = item.partition("=")
+                perms[k] = v
             rec = RunRecord(
                 run=args.run,
                 area=args.area,
@@ -1574,6 +1661,8 @@ def cmd_run_record(args: argparse.Namespace) -> int:
                 names=tuple(dict.fromkeys(args.name or ())),
                 uid=args.uid,
                 expires_at=expires,
+                repos=tuple(dict.fromkeys(args.repo or ())),
+                permissions=tuple(sorted(perms.items())),
             )
             where = write_run_record(folder, rec)
             out: dict = {"run": rec.run, "written": str(where), **rec.to_json()}
@@ -1799,6 +1888,10 @@ def register(sub) -> None:
     w.add_argument("--name", action="append", metavar="NAME", help="a secret name the run declares (repeat)")
     w.add_argument("--uid", type=int, help="only this caller uid may lease under the run")
     w.add_argument("--ttl", type=float, metavar="SECONDS", help="the run ends after this; its leases with it")
+    w.add_argument(
+        "--repo", action="append", metavar="REPO", help="a repository a minted GitHub token may cover (repeat)"
+    )
+    w.add_argument("--perm", action="append", metavar="NAME=LEVEL", help="the most a minted token may hold (repeat)")
     for verb, text in (("show", "print a run record"), ("rm", "end a run: remove its record and its leases")):
         r = rsub.add_parser(verb, help=text)
         r.add_argument("run")

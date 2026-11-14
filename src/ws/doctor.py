@@ -534,6 +534,11 @@ def run_checks(osi: OSInfo, profile_file: Path, env: dict | None = None, network
             detail = f"{plural(len(bad_jobs), 'job file')} ws would refuse ({', '.join(bad_jobs)}): {first}"
             fix = "fix or remove that job file; the other jobs still run"
             checks.append(Check("WS006", "jobs", FAIL, detail, fix))
+        elif gaps := jobs.contract_gaps(env):
+            first = next(iter(gaps.values()))
+            detail = f"{plural(len(gaps), 'scheduled job file')} still run but lack the run contract ({', '.join(gaps)}): {first}"
+            fix = "add the six lines and, for a runner job, max_turns and budget_usd (see the job file reference)"
+            checks.append(Check("WS006", "jobs", WARN, detail, fix))
         else:
             checks.append(Check("WS006", "jobs", OK, "every job file loads"))
     checks.append(_ptrace_check(osi))

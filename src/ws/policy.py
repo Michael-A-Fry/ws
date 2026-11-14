@@ -117,6 +117,7 @@ import posixpath
 import re
 import sys
 import tomllib
+import unicodedata
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
@@ -1108,15 +1109,32 @@ def _class_patterns(repos: tuple[str, ...]) -> list[tuple[re.Pattern, int]]:
 CANARY_PREFIX = "ws-walls-tracer-"
 
 
+# The dash family (hyphen, non-breaking hyphen, figure dash, en and em dash, horizontal bar, minus, small and fullwidth
+# hyphen-minus) all read as "-" for a term match.
+_DASHES = dict.fromkeys(map(ord, "\u2010\u2011\u2012\u2013\u2014\u2015\u2212\ufe58\ufe63\uff0d"), "-")
+
+
+def _fold(text: str) -> str:
+    """Text as a term match reads it: NFKC (fullwidth letters, a non-breaking space), the format characters dropped
+    (a zero-width space or joiner inside a word), the dash family made "-", then casefolded. Letters that only look
+    the same in another script (a Cyrillic "а" for a Latin "a") are not caught."""
+    text = unicodedata.normalize("NFKC", text)
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
+    return text.translate(_DASHES).casefold()
+
+
 def _has_term(text: str, term: str) -> bool:
-    """Is `term` in `text` as a whole term (caseless; a letter or digit on either side is a different word)?"""
-    return re.search(rf"(?<!\w){re.escape(term.casefold())}(?!\w)", text) is not None
+    """Is `term` in `text` (both `_fold`ed) as a whole term? Between the term's words any run of white space, `_` or `-`
+    counts as the one space; a letter or digit on either side makes it another word, and `_` does not."""
+    words = _fold(term).split()
+    body = r"[\s_-]+".join(re.escape(w) for w in words)
+    return re.search(rf"(?<![^\W_]){body}(?![^\W_])", text) is not None
 
 
 def term_problem(pol: Policy, own: Class | None, text: str) -> str | None:
     """Why a prompt bound for a hosted model may not leave, or None: it carries a canary token, or a `terms` entry of a
     class that is not `full` and is not the session's own class. The words name the class, never the term."""
-    low = text.casefold()
+    low = _fold(text)
     if CANARY_PREFIX in low:
         return "the prompt carries a canary token planted in a walled class"
     for name, cls in sorted(pol.classes.items()):

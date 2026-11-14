@@ -1456,6 +1456,33 @@ def test_the_term_check_names_the_class_skips_full_classes_and_the_callers_own()
     assert policy.term_problem(pol, pol.classes["alpha"], "WS-WALLS-TRACER-x") is not None  # a token, whoever sends it
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "kestrel\nridge",
+        "kestrel  ridge",
+        "kestrel\u00a0ridge",
+        "kestrel_ridge",
+        "kestrel-ridge",
+        "\uff2b\uff45\uff53\uff54\uff52\uff45\uff4c ridge",  # fullwidth
+        "kes\u200btrel ridge",  # a zero-width space inside a word
+        "KR\u20112207",  # a non-breaking hyphen
+        "KR\u20132207",  # an en dash
+        "see KR-2207_v2",  # an underscore after the term is not a letter
+        "the_kestrel ridge_notes",
+    ],
+)
+def test_a_term_is_caught_through_spacing_unicode_tricks_and_underscores(text):
+    pol = policy.loads(TERM_POLICY.format(root="/r"))
+    assert policy.term_problem(pol, pol.classes["open"], text) == "the prompt carries a term of class 'alpha'", text
+
+
+@pytest.mark.parametrize("text", ["kestrels ridge", "kestrel ridges", "KR-22070", "xKR-2207", "kestrel, ridge"])
+def test_a_longer_word_or_other_punctuation_is_another_term(text):
+    pol = policy.loads(TERM_POLICY.format(root="/r"))
+    assert policy.term_problem(pol, pol.classes["open"], text) is None, text
+
+
 @pytest.mark.parametrize("term", ["ab", " Kestrel", ""])
 def test_a_term_shorter_than_3_characters_or_with_an_outer_space_stops_the_load(term):
     with pytest.raises(policy.PolicyError, match="terms"):

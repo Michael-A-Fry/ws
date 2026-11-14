@@ -58,6 +58,41 @@ To understand the rule first, read [The secrets broker](../explanation/broker.md
 6. Use the kill switch. `ws elevate off` refuses every `lead-elevated` name at once and drops their live leases. Any
    session may run it. `ws elevate on`, from your own terminal, allows them again. `ws elevate status` says which.
 
+## Mint GitHub tokens instead of storing one
+
+The broker can hold a GitHub App's private key and mint 1-hour installation tokens, narrowed to the repos and
+permissions a run asks for (never more than the entry allows). `python3 -m ws.minters.github_app setup-steps` prints
+the browser steps to make and install the App and the registry table to add. Then point git at the helper, and run
+`gh` through it, so the token never reaches the session's output:
+
+```sh
+git config --global credential.https://github.com.helper \
+  '!python3 -m ws.minters.github_app credential --name github-app --run "$WS_RUN_ID" --repo ws'
+python3 -m ws.minters.github_app gh --name github-app --run "$WS_RUN_ID" --repo ws -- pr create --fill
+```
+
+`ws elevate off` revokes upstream every token minted for an elevated App entry.
+
+## Sign SSH certificates instead of handing out keys
+
+The broker can hold an SSH certificate authority key and sign a session's own public key for 15 minutes, with the
+principals the entry gives the run's tier:
+
+```toml
+[ssh-ca]
+kind = "ssh-ca"
+principals = { lead = ["ws-audit"], "lead-elevated" = ["ws-admin"] }
+tier = "lead"
+area = "home"
+```
+
+Store the CA key with `base64 -w0 ws_user_ca | ws secret set ssh-ca`. A session asks with
+`python3 -m ws.minters.ssh_ca sign --name ssh-ca --run "$WS_RUN_ID" --key ~/.ssh/id_ed25519.pub`, which writes
+`id_ed25519-cert.pub` beside the key. `python3 -m ws.minters.ssh_ca host-steps --name ssh-ca --user USER --principal P`
+prints the `sshd` lines for a host to trust the CA. Run them only on hosts agents may reach: a host without the CA line
+can't be opened by any certificate. There's no revocation; a certificate is short instead, and `ws elevate off` stops
+new ones for elevated entries at once.
+
 ## Check it worked
 
 - A lease for a name the run didn't declare is refused with `not_declared`, one line in `logs/broker.jsonl`.

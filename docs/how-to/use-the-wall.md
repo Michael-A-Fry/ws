@@ -134,6 +134,20 @@ The switch on and off, and the upgrade command, were rehearsed in a scratch `HOM
 
 `ws upgrade` refuses to run inside an agent session, so the test runs it as a person at a terminal would.
 
+## When Claude Code asks to read outside the working folders
+
+With the read block on, Claude Code stops before its Read, Grep or Glob tool reads a path outside the folders the
+session works in, and asks. One of the answers keeps allowing such reads from then on. That one answer switches this
+part of the wall off for every later session, so pick the narrower one:
+
+- **The safe choice.** Answer no, then add the one folder the task needs: `--add-dir PATH` when you start the session,
+  or `/add-dir PATH` inside it. The session can read that folder, and nothing else outside its own.
+- **To undo an allow you saved.** In the session, run `/permissions`, find the rule the answer saved and remove it.
+  `ws status` shows the read block and the permission mode in force.
+
+On native Windows the sandbox isn't enforced, so this block is the only wall on reads by Claude's file tools there, and
+a shell command can still read anywhere.
+
 ## What else the wall settings do
 
 - Bypass mode is off in the settings ws passes to Claude Code and in the ones `ws install` merges into your own file:
@@ -258,3 +272,14 @@ ws doctor
 ```
 
 If WS007 warns, set `kernel.yama.ptrace_scope = 1`. The line is in the check's `fix` text.
+
+## Swap note: the runner's sandbox, and the Claude Code version it needs
+
+The wall for Claude Code is Claude Code's own sandbox and permission keys (`sandbox.*`,
+`permissions.blockReadsOutsideWorkingDirectories`, `permissions.disableBypassPermissionsMode`). ws writes the keys and
+checks them; it has no sandbox of its own for Claude Code. To swap it for another sandbox, follow the steps in
+[the decision record](../decisions/0025-adopt-the-runner-sandbox-and-permission-keys.md#swapping-the-runners-sandbox-for-another).
+
+Claude Code 2.1.321 or newer is the version to run the wall on. To roll back, pin the version you had before you
+upgraded. On the machine this was last tested on that was 2.1.311: `claude install 2.1.311`. `ws doctor` (WS016) says
+which keys an older version doesn't read.

@@ -1456,6 +1456,25 @@ def _git_normal(toks: list[str]) -> list[str]:
     return toks
 
 
+def _destroying_push_note(line: str) -> str:
+    """What a refusal adds when a push that never wrote `--force` was read as one (`_git_normal`): the delete, the mirror
+    or the forcing spelling it holds, so the person sees which part of their command the force rule caught."""
+    toks = line.split()
+    if toks[:2] != ["git", "push"] or toks.count("--force") != 1 or toks[-1] != "--force":
+        return ""
+    words = toks[2:-1]
+    if any(t in ("--delete", "-d") or (t.startswith(":") and len(t) > 1) for t in words):
+        return (
+            ": deleting a remote branch or tag counts as a destroying push, as `--force` does; delete it from a terminal "
+            "of your own"
+        )
+    if "--mirror" in words:
+        return ": `--mirror` can delete or overwrite remote refs, so it counts as a destroying push, as `--force` does"
+    if any(t.startswith("+") or ":+" in t or re.fullmatch(r"-[A-Za-z]*f[A-Za-z]*", t) for t in words):
+        return ": this spelling forces the push, as `--force` does"
+    return ""
+
+
 def _canon_tokens(tokens: list[str]) -> list[str]:
     if tokens and tokens[0] == "git":
         tokens = _git_normal(tokens)
@@ -3094,8 +3113,9 @@ def is_denied_command(
         return reason
     for pat in policy.gate.deny_commands:
         rx = _glob_regex(_canon_pattern(pat))
-        if any(rx.match(c) for c in cands):
-            return f"command matches deny_commands rule {pat!r}"
+        hit = next((c for c in cands if rx.match(c)), None)
+        if hit is not None:
+            return f"command matches deny_commands rule {pat!r}{_destroying_push_note(hit)}"
     if soft:
         unread = next((r for r in soft if r.kind == UNKNOWN_WORD), None)
         if unread is not None and (policy.gate.deny_commands or policy.gate.ask_commands):

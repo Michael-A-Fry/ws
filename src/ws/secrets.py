@@ -76,6 +76,8 @@ class Entry:
     purposes: tuple[str, ...] = field(default_factory=tuple)
     tier: str | None = None
     area: str | None = None
+    kind: str = "header"  # header: the broker adds it to requests; else a minter in ws.minters makes a credential
+    options: object = None  # the minter's own keys, parsed by it
 
     @property
     def scoped(self) -> bool:
@@ -144,7 +146,17 @@ def _str_list(path: Path, name: str, key: str, v: object) -> tuple[str, ...]:
     return tuple(v)
 
 
+def _minters() -> dict:
+    from ws.minters import github_app, ssh_ca
+
+    return {m.KIND: m for m in (github_app, ssh_ca)}
+
+
 def _entry(path: Path, name: str, t: dict) -> Entry:
+    kind = t.get("kind", "header")
+    minters = _minters()
+    if kind != "header" and kind not in minters:
+        raise SecretsError(f"{path}: [{name}] kind must be header or one of {', '.join(sorted(minters))}")
     hosts = tuple(h.lower() for h in _str_list(path, name, "hosts", t.get("hosts", [])))
     for h in hosts:
         if not HOST_RE.match(h):
@@ -162,10 +174,26 @@ def _entry(path: Path, name: str, t: dict) -> Entry:
         raise SecretsError(f"{path}: [{name}] tier must be one of {', '.join(TIERS)}")
     if area is not None and not (isinstance(area, str) and AREA_RE.match(area)):
         raise SecretsError(f"{path}: [{name}] area must be a short lower-case name (letters, digits, - and _)")
-    unknown = set(t) - {"hosts", "header", "format", "purposes", "tier", "area"}
+    allowed = {"hosts", "header", "format", "purposes", "tier", "area", "kind"}
+    options = None
+    if kind != "header":
+        allowed = {"tier", "area", "kind", "purposes"} | minters[kind].EXTRA_KEYS
+    unknown = set(t) - allowed
     if unknown:
         raise SecretsError(f"{path}: [{name}] has unknown keys: {', '.join(sorted(unknown))}")
-    return Entry(name=name, hosts=hosts, header=header, format=fmt, purposes=purposes, tier=tier, area=area)
+    if kind != "header":
+        options = minters[kind].parse(path, name, t)
+    return Entry(
+        name=name,
+        hosts=hosts,
+        header=header,
+        format=fmt,
+        purposes=purposes,
+        tier=tier,
+        area=area,
+        kind=kind,
+        options=options,
+    )
 
 
 def check_value(value: str) -> str:
@@ -282,7 +310,9 @@ def health(reg_path: Path, store: Store) -> tuple[list[str], int | None]:
     except SecretsError as e:
         problems.append(f"registry unreadable: {e}")
         reg = {}
-    problems += [f"{e.name} has no hosts, so it can never be used" for e in reg.values() if not e.hosts]
+    problems += [
+        f"{e.name} has no hosts, so it can never be used" for e in reg.values() if e.kind == "header" and not e.hosts
+    ]
     try:
         owner = store.path.stat().st_uid
     except FileNotFoundError:

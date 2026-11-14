@@ -14,10 +14,12 @@ No TLS interception and no CA: the tool talks plain HTTP to 127.0.0.1 and the br
 only. Everything fails closed: an unset name, a missing or loose store, an unknown host or an expired lease gives a
 refusal, never a request without the credential or to a different host.
 
-Wire format on the socket: one JSON object per line, one reply per request. Ops: request, release, status, elevate.
+Wire format on the socket: one JSON object per line, one reply per request. Ops: request, release, status, elevate,
+and for the minters (ws.minters) mint, sign and ca_public.
 Refusal codes: unknown_name, unset, host_not_allowed, purpose_not_allowed, caller_refused, store_unreadable, expired,
-run_required, run_refused, not_declared, area_refused, tier_refused, claim_refused, elevation_off, audit_failed, plus
-bad_request (malformed) and busy (too many connections or leases).
+run_required, run_refused, not_declared, area_refused, tier_refused, claim_refused, elevation_off, audit_failed,
+wrong_kind, upstream_refused, upstream_unreachable, plus bad_request (malformed) and busy (too many connections or
+leases).
 
 Run records, the trust anchor for scoped names. A request names only its run id (`run`). The broker reads its own run
 record for that id: one JSON file per run in `<state>/run/records/`, owned by the broker's user (or root), mode 0600 in
@@ -58,9 +60,11 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from ws import __version__, output, paths
 from ws import secrets as wsecrets
+from ws.minters import github_app, ssh_ca
 from ws.output import WsError
 
 CODES = (
@@ -81,9 +85,14 @@ CODES = (
     "claim_refused",
     "elevation_off",
     "audit_failed",
+    "wrong_kind",
+    "upstream_refused",
+    "upstream_unreachable",
 )
+MINT_REUSE_MARGIN_S = 300  # a cached token with less left than this is minted afresh
+REAP_EVERY_S = 30.0  # how often the broker looks for runs that ended with tokens still live
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$")
-RECORD_KEYS = {"v", "run", "area", "tier", "names", "uid", "expires_at"}
+RECORD_KEYS = {"v", "run", "area", "tier", "names", "uid", "expires_at", "repos", "permissions"}
 MAX_RECORD = 65536
 DEFAULT_TTL_S = 3600
 MAX_CONNECTIONS = 16
@@ -189,6 +198,8 @@ class RunRecord:
     names: tuple[str, ...]
     uid: int | None = None  # when set, only this caller uid may lease under the run
     expires_at: float | None = None  # when set, the run (and every lease under it) is over at this time
+    repos: tuple[str, ...] = ()  # the repositories a minted GitHub token may cover; none means no token
+    permissions: tuple[tuple[str, str], ...] = ()  # the most a minted token may hold, as (name, level)
 
     def to_json(self) -> dict:
         d: dict = {"v": 1, "run": self.run, "area": self.area, "tier": self.tier, "names": list(self.names)}
@@ -196,6 +207,10 @@ class RunRecord:
             d["uid"] = self.uid
         if self.expires_at is not None:
             d["expires_at"] = _iso(self.expires_at)
+        if self.repos:
+            d["repos"] = list(self.repos)
+        if self.permissions:
+            d["permissions"] = dict(self.permissions)
         return d
 
 
@@ -237,7 +252,28 @@ def _parse_record(raw: object, run_id: str) -> RunRecord:
         if when.tzinfo is None:
             raise RecordError("malformed", "the run record's expires_at must carry a time zone (Z for UTC)")
         expires = when.timestamp()
-    return RunRecord(run=run, area=area, tier=tier, names=tuple(names), uid=uid, expires_at=expires)
+    repos = raw.get("repos", [])
+    if not (isinstance(repos, list) and all(isinstance(r, str) and github_app.REPO_RE.match(r) for r in repos)):
+        raise RecordError("malformed", "the run record's repos must be a list of repository names")
+    perms = raw.get("permissions", {})
+    if not (
+        isinstance(perms, dict)
+        and all(
+            isinstance(k, str) and github_app.PERMISSION_RE.match(k) and v in github_app.LEVELS
+            for k, v in perms.items()
+        )
+    ):
+        raise RecordError("malformed", "the run record's permissions must map names to read, write or admin")
+    return RunRecord(
+        run=run,
+        area=area,
+        tier=tier,
+        names=tuple(names),
+        uid=uid,
+        expires_at=expires,
+        repos=tuple(repos),
+        permissions=tuple(sorted(perms.items())),
+    )
 
 
 def read_run_record(folder: Path, run_id: object, own_uid: int, now: float | None = None) -> RunRecord:
@@ -540,6 +576,19 @@ class _Grant:
     elevated: bool = False
 
 
+@dataclass
+class _Minted:
+    name: str
+    run: str
+    elevated: bool
+    token: str
+    options: object
+    expires: float
+
+    def __repr__(self) -> str:  # never the token
+        return f"_Minted({self.name}, {self.run})"
+
+
 def _iso(t: float) -> str:
     return datetime.fromtimestamp(t, UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
@@ -590,6 +639,8 @@ class Broker:
         # Called with each live grant `ws elevate off` drops; a minter that can revoke its upstream token adds one. One
         # that raises counts as a failed revoke and is logged; the grant is dropped either way.
         self.revokers: list = []
+        self._minted: list[_Minted] = []  # tokens a minter issued, kept until they expire, to revoke on `elevate off`
+        self._mint_cache: dict[tuple, tuple[str, float]] = {}  # (name, run, repos, perms) -> (token, expires)
 
     @classmethod
     def from_env(
@@ -639,6 +690,8 @@ class Broker:
             raise
         assert self._unix is not None
         threading.Thread(target=self._unix.serve_forever, args=(0.05,), daemon=True, name="ws-broker-socket").start()
+        self._stopped.clear()
+        threading.Thread(target=self._reaper, daemon=True, name="ws-broker-reaper").start()
         return self
 
     def stop(self) -> None:
@@ -762,6 +815,12 @@ class Broker:
                 return self._op_status()
             if op == "elevate":
                 return self._op_elevate(msg, uid, pid)
+            if op == github_app.OP:
+                return self._op_mint(msg, uid, pid)
+            if op == ssh_ca.OP:
+                return self._op_sign(msg, uid, pid)
+            if op == "ca_public":
+                return self._op_ca_public(msg)
         except Exception as e:  # noqa: BLE001 (answer, never crash the thread; the type only, in case a value is near)
             print(f"ws broker: {op} failed ({type(e).__name__})", file=sys.stderr)
             return _refuse("store_unreadable", "the broker could not complete that")
@@ -792,34 +851,14 @@ class Broker:
             return refuse("unknown_name", f"{name} is not in the registry")
         if host not in entry.hosts:
             return refuse("host_not_allowed", f"{name} is not allowed at {host}")
+        if entry.kind != "header":
+            return refuse("wrong_kind", f"{name} is a {entry.kind} entry: ask with the {entry.kind} op, not a lease")
         if entry.purposes and purpose not in entry.purposes:
             return refuse("purpose_not_allowed", f"{name} is not allowed for that purpose")
         now = self.clock()
-        rec: RunRecord | None = None
-        if run_id is None:
-            if entry.scoped or self.require_run:
-                return refuse("run_required", f"{name} is leased only under a run: send the run id")
-            if msg.get("area") is not None or msg.get("tier") is not None:
-                return refuse("claim_refused", "an area or tier is read from the run record, never from a request")
-        else:
-            try:
-                rec = self.run_record(run_id, now)
-            except RecordError as e:
-                return refuse("run_refused", f"no usable run record ({e.kind}): {e}")
-            log.update(area=rec.area, tier=rec.tier)
-            for claim in ("area", "tier"):
-                if msg.get(claim) is not None and msg.get(claim) != getattr(rec, claim):
-                    return refuse("claim_refused", f"the request's {claim} is not the one the run record holds")
-            if rec.uid is not None and rec.uid != uid:
-                return refuse("caller_refused", "this caller is not the one the run record names")
-            if name not in rec.names:
-                return refuse("not_declared", f"{name} is not one of the names this run declared")
-            if entry.area is not None and entry.area != rec.area:
-                return refuse("area_refused", f"{name} belongs to another area")
-            if (entry.tier or wsecrets.DEFAULT_TIER) not in wsecrets.REACH[rec.tier]:
-                return refuse("tier_refused", f"a {rec.tier} run cannot lease {name}")
-        if entry.elevated and not self.elevation_on():
-            return refuse("elevation_off", f"{name} is elevated and `ws elevate off` is in force")
+        rec, why = self._scope(entry, msg, uid, log, now, need_run=False)
+        if why:
+            return refuse(*why)
         try:
             self.store.read(name)
         except FileNotFoundError:
@@ -898,6 +937,229 @@ class Broker:
             "require_run": self.require_run,
         }
 
+    def _scope(
+        self, entry: wsecrets.Entry, msg: dict, uid: int, log: dict, now: float, need_run: bool
+    ) -> tuple[RunRecord | None, tuple[str, str] | None]:
+        """The run record behind a request and None, or (None, (code, reason)) for the refusal. `log` gains the run's
+        area and tier, so the audit line says what the broker read."""
+        name, run_id = entry.name, msg.get("run")
+        if run_id is None:
+            if entry.scoped or self.require_run or need_run:
+                return None, ("run_required", f"{name} is leased only under a run: send the run id")
+            if msg.get("area") is not None or msg.get("tier") is not None:
+                return None, ("claim_refused", "an area or tier is read from the run record, never from a request")
+            rec = None
+        else:
+            try:
+                rec = self.run_record(run_id, now)
+            except RecordError as e:
+                return None, ("run_refused", f"no usable run record ({e.kind}): {e}")
+            log.update(area=rec.area, tier=rec.tier)
+            for claim in ("area", "tier"):
+                if msg.get(claim) is not None and msg.get(claim) != getattr(rec, claim):
+                    return None, ("claim_refused", f"the request's {claim} is not the one the run record holds")
+            if rec.uid is not None and rec.uid != uid:
+                return None, ("caller_refused", "this caller is not the one the run record names")
+            if name not in rec.names:
+                return None, ("not_declared", f"{name} is not one of the names this run declared")
+            if entry.area is not None and entry.area != rec.area:
+                return None, ("area_refused", f"{name} belongs to another area")
+            if (entry.tier or wsecrets.DEFAULT_TIER) not in wsecrets.REACH[rec.tier]:
+                return None, ("tier_refused", f"a {rec.tier} run cannot lease {name}")
+        if entry.elevated and not self.elevation_on():
+            return None, ("elevation_off", f"{name} is elevated and `ws elevate off` is in force")
+        return rec, None
+
+    def _minter_entry(self, msg: dict, op: str, kind: str, log: dict) -> tuple[wsecrets.Entry | None, dict | None]:
+        name = msg.get("name")
+        if not (isinstance(name, str) and wsecrets.NAME_RE.match(name)):
+            return None, self._refuse_logged(op, log, "bad_request", "name must be a secret name")
+        try:
+            entry = wsecrets.load_registry(self.registry).get(name)
+        except wsecrets.SecretsError:
+            return None, self._refuse_logged(op, log, "store_unreadable", "the registry cannot be read")
+        if entry is None:
+            return None, self._refuse_logged(op, log, "unknown_name", f"{name} is not in the registry")
+        if entry.kind != kind:
+            return None, self._refuse_logged(op, log, "wrong_kind", f"{name} is not a {kind} entry")
+        return entry, None
+
+    def _refuse_logged(self, op: str, log: dict, code: str, reason: str) -> dict:
+        self.audit.write(op, code, **log)
+        return _refuse(code, reason)
+
+    def _stored(self, op: str, log: dict, name: str) -> tuple[str | None, dict | None]:
+        try:
+            return self.store.read(name), None
+        except FileNotFoundError:
+            return None, self._refuse_logged(op, log, "unset", f"{name} has no value; run `ws secret set {name}`")
+        except wsecrets.SecretsError as e:
+            return None, self._refuse_logged(op, log, "store_unreadable", str(e))
+
+    def _op_mint(self, msg: dict, uid: int, pid: int) -> dict:
+        """A GitHub App installation token for a run, narrowed to the repos and permissions it asks for."""
+        log = {"name": msg.get("name"), "uid": uid, "pid": pid, "run": msg.get("run"), "host": None}
+        entry, refused = self._minter_entry(msg, "mint", github_app.KIND, log)
+        if refused:
+            return refused
+        assert entry is not None and isinstance(entry.options, github_app.Options)
+        opts = entry.options
+        log["host"] = (urlsplit(opts.api).hostname or "").lower() or None
+        now = self.clock()
+        self.reap_minted()
+        rec, why = self._scope(entry, msg, uid, log, now, need_run=True)
+        if why:
+            return self._refuse_logged("mint", log, *why)
+        assert rec is not None
+        try:
+            repos, perms = github_app.narrow(
+                opts, msg.get("repos"), msg.get("permissions"), rec.repos, dict(rec.permissions)
+            )
+        except github_app.MintError as e:
+            return self._refuse_logged("mint", log, e.code, e.reason)
+        log["purpose"] = ("repos=" + ",".join(repos) + " " + ",".join(f"{k}:{v}" for k, v in perms.items()))[:120]
+        key = (entry.name, rec.run, repos, tuple(perms.items()))
+        with self._lock:
+            hit = self._mint_cache.get(key)
+        if hit is not None and hit[1] - now > MINT_REUSE_MARGIN_S:
+            token, expires = hit
+        else:
+            value, refused = self._stored("mint", log, entry.name)
+            if refused:
+                return refused
+            assert value is not None
+            try:
+                token, expires = github_app.mint(opts, value, repos, perms, now, self.allow_plain_http)
+            except github_app.MintError as e:
+                return self._refuse_logged("mint", log, e.code, e.reason)
+            finally:
+                del value
+            with self._lock:
+                late = entry.elevated and not self.elevation_on()
+                if not late:
+                    self._mint_cache[key] = (token, expires)
+                    self._minted.append(_Minted(entry.name, rec.run, entry.elevated, token, opts, expires))
+            if late:  # `ws elevate off` came while GitHub was answering: the token never leaves the broker
+                self._revoke_one(_Minted(entry.name, rec.run, entry.elevated, token, opts, expires))
+                return self._refuse_logged(
+                    "mint", log, "elevation_off", f"{entry.name} is elevated and was switched off"
+                )
+        if rec.expires_at is not None and rec.expires_at < expires:
+            expires_out = rec.expires_at  # the caller is told the run's end; the token itself cannot be shortened
+        else:
+            expires_out = expires
+        if not self.audit.write("mint", "ok", **log):
+            return _refuse("audit_failed", "the token could not be written to the audit log, so it is not given")
+        return {"ok": True, "token": token, "expires_at": _iso(expires_out)}
+
+    def _op_sign(self, msg: dict, uid: int, pid: int) -> dict:
+        """An SSH certificate for a run's own public key, principals from its tier."""
+        log = {"name": msg.get("name"), "uid": uid, "pid": pid, "run": msg.get("run"), "host": None}
+        entry, refused = self._minter_entry(msg, "sign", ssh_ca.KIND, log)
+        if refused:
+            return refused
+        assert entry is not None and isinstance(entry.options, ssh_ca.Options)
+        rec, why = self._scope(entry, msg, uid, log, self.clock(), need_run=True)
+        if why:
+            return self._refuse_logged("sign", log, *why)
+        assert rec is not None
+        try:
+            ssh_ca.check_public_key(msg.get("public_key"))
+        except ssh_ca.MintError as e:
+            return self._refuse_logged("sign", log, e.code, e.reason)
+        value, refused = self._stored("sign", log, entry.name)
+        if refused:
+            return refused
+        assert value is not None
+        try:
+            out = ssh_ca.sign(entry.options, value, msg["public_key"], rec.run, rec.tier, self.work_dir())
+        except ssh_ca.MintError as e:
+            return self._refuse_logged("sign", log, e.code, e.reason)
+        finally:
+            del value
+        log["purpose"] = f"serial={out['serial']} principals={','.join(out['principals'])}"[:120]
+        if not self.audit.write("sign", "ok", **log):
+            return _refuse("audit_failed", "the certificate could not be written to the audit log, so it is not given")
+        return {"ok": True, **out}
+
+    def _op_ca_public(self, msg: dict) -> dict:
+        """The SSH CA's public key, for the host steps. Public, so any allowed caller may ask."""
+        entry, refused = self._minter_entry(msg, "ca_public", ssh_ca.KIND, {"name": msg.get("name")})
+        if refused:
+            return refused
+        assert entry is not None
+        value, refused = self._stored("ca_public", {"name": entry.name}, entry.name)
+        if refused:
+            return refused
+        assert value is not None
+        try:
+            return {"ok": True, "public_key": ssh_ca.ca_public_key(value, self.work_dir())}
+        except ssh_ca.MintError as e:
+            return _refuse(e.code, e.reason)
+
+    def _take_minted(self, which) -> list[_Minted]:
+        """Remove the minted tokens `which(m)` picks from the list and the cache, under the lock, and return them."""
+        with self._lock:
+            mine = [m for m in self._minted if which(m)]
+            gone = {m.token for m in mine}
+            self._minted = [m for m in self._minted if m.token not in gone]
+            self._mint_cache = {k: v for k, v in self._mint_cache.items() if v[0] not in gone}
+        return mine
+
+    def _revoke_one(self, m: _Minted) -> bool:
+        try:
+            done = github_app.revoke(m.options, m.token, self.allow_plain_http)
+        except github_app.MintError:
+            done = False
+        self.audit.write("revoke", "ok" if done else "failed", name=m.name, run=m.run)
+        return done
+
+    def _revoke_all(self, mine: list[_Minted]) -> tuple[int, int]:
+        ok = failed = 0
+        for m in mine:
+            if m.expires <= self.clock():
+                continue
+            if self._revoke_one(m):
+                ok += 1
+            else:
+                failed += 1
+        return ok, failed
+
+    def _revoke_minted(self) -> tuple[int, int]:
+        """Revoke upstream every token minted for a name that was elevated when minted or is elevated now; (revoked,
+        failed). The cache forgets them."""
+        now_elevated = self._elevated_names()  # the registry's tier now: a name re-tiered after minting is caught too
+        return self._revoke_all(self._take_minted(lambda m: m.elevated or m.name in now_elevated))
+
+    def reap_minted(self) -> tuple[int, int]:
+        """Revoke the tokens of runs that have ended (their record removed, expired or no longer trusted, or no longer
+        declaring the name). The reaper thread calls it; so does every mint. (revoked, failed)."""
+        with self._lock:
+            runs = {(m.run, m.name) for m in self._minted}
+        ended = set()
+        for run, name in runs:
+            try:
+                if name not in self.run_record(run).names:
+                    ended.add((run, name))
+            except RecordError:
+                ended.add((run, name))
+        if not ended:
+            return 0, 0
+        return self._revoke_all(self._take_minted(lambda m: (m.run, m.name) in ended))
+
+    def _reaper(self) -> None:
+        while not self._stopped.wait(REAP_EVERY_S):
+            try:
+                self.reap_minted()
+            except Exception as e:  # noqa: BLE001 (the reaper keeps going; the type only)
+                print(f"ws broker: the token reaper failed ({type(e).__name__})", file=sys.stderr)
+
+    def work_dir(self) -> Path:
+        """A private folder of the broker's own for a minter's short-lived key files: never the shared temp folder."""
+        if self.records is None:
+            raise ssh_ca.MintError("store_unreadable", "this broker has no state folder for key files")
+        return self.records.parent / "minter"
+
     def run_record(self, run_id: object, now: float | None = None) -> RunRecord:
         if self.records is None:
             raise RecordError("missing", "this broker has no run record folder")
@@ -954,6 +1216,8 @@ class Broker:
                 if done:
                     revoked += 1
                     self.audit.write("revoke", "ok", name=g.name, host=g.host, lease=g.id, run=g.run)
+        r_ok, r_failed = self._revoke_minted()
+        revoked, failed = revoked + r_ok, failed + r_failed
         self.audit.write("elevate", "off" if saved else "off_unsaved", uid=uid, pid=pid, bytes=dropped)
         return {
             "ok": True,
@@ -971,11 +1235,13 @@ class Broker:
             return {e.name for e in wsecrets.load_registry(self.registry).values() if e.elevated}
         except wsecrets.SecretsError:
             with self._lock:
-                return {g.name for g in self._grants.values()}
+                return {g.name for g in self._grants.values()} | {m.name for m in self._minted}
 
     def _purge(self, now: float) -> None:
         for k in [k for k, g in self._grants.items() if g.expires <= now]:
             del self._grants[k]
+        self._minted = [m for m in self._minted if m.expires > now]
+        self._mint_cache = {k: v for k, v in self._mint_cache.items() if v[1] > now}
 
     # -- the proxy side
 
@@ -997,7 +1263,7 @@ class Broker:
             entry = wsecrets.load_registry(self.registry).get(g.name)
         except wsecrets.SecretsError as e:
             raise _HttpError(503, "store_unreadable") from e
-        if entry is None or g.host not in entry.hosts:
+        if entry is None or entry.kind != "header" or g.host not in entry.hosts:
             raise _HttpError(403, "host_not_allowed")
         if (g.elevated or entry.elevated) and not self.elevation_on():
             raise _HttpError(403, "elevation_off")
@@ -1386,6 +1652,10 @@ def cmd_run_record(args: argparse.Namespace) -> int:
                 if not args.ttl > 0:
                     raise WsError("bad_input", "--ttl must be above 0", "seconds the run may lease for", 2)
                 expires = time.time() + args.ttl
+            perms = {}
+            for item in args.perm or ():
+                k, _, v = item.partition("=")
+                perms[k] = v
             rec = RunRecord(
                 run=args.run,
                 area=args.area,
@@ -1393,6 +1663,8 @@ def cmd_run_record(args: argparse.Namespace) -> int:
                 names=tuple(dict.fromkeys(args.name or ())),
                 uid=args.uid,
                 expires_at=expires,
+                repos=tuple(dict.fromkeys(args.repo or ())),
+                permissions=tuple(sorted(perms.items())),
             )
             where = write_run_record(folder, rec)
             out: dict = {"run": rec.run, "written": str(where), **rec.to_json()}
@@ -1618,6 +1890,10 @@ def register(sub) -> None:
     w.add_argument("--name", action="append", metavar="NAME", help="a secret name the run declares (repeat)")
     w.add_argument("--uid", type=int, help="only this caller uid may lease under the run")
     w.add_argument("--ttl", type=float, metavar="SECONDS", help="the run ends after this; its leases with it")
+    w.add_argument(
+        "--repo", action="append", metavar="REPO", help="a repository a minted GitHub token may cover (repeat)"
+    )
+    w.add_argument("--perm", action="append", metavar="NAME=LEVEL", help="the most a minted token may hold (repeat)")
     for verb, text in (("show", "print a run record"), ("rm", "end a run: remove its record and its leases")):
         r = rsub.add_parser(verb, help=text)
         r.add_argument("run")

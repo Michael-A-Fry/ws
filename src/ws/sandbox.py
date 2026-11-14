@@ -2212,7 +2212,7 @@ def warn_old_runner(exe: str, env: dict, pol: policy.Policy) -> None:
     found (the start itself then fails and says so)."""
     from ws import doctor, run, wallsettings  # here, not at the top: both import this module
 
-    keys = wallsettings.keys_written(pol)
+    keys = wallsettings.keys_written(pol, jobs=False)  # a launched session never carries the no-prompt key
     path = shutil.which(exe, path=env.get("PATH"))
     if not keys or not path:
         return

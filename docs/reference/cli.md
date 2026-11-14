@@ -890,6 +890,25 @@ are printed, and the host cases are skipped) or when a case fails. With `--json`
 ws walls check [-h]
 ```
 
+The check also asks that the managed-settings file blocks file-tool writes outside the working folders and denies the
+four sign-in token variables to shell commands, that the launch file switches off Remote Control and the claude.ai
+connectors, that a headless job's settings keep its writes in the class, and that a `local_only` class takes only a
+model on this machine.
+
+### `ws walls canary`
+
+Run every case of `ws walls check` but the one that reads a file's owner on disk, on a world it plants under ws's own
+state folder: three walled classes with accounts that don't exist, their managed and launch files as
+`ws install --class` renders them, and the settings `ws install` generates. It needs no account, no root file and no
+class of yours, so it runs on any machine and in CI. It then lists the items the cases cover (an inbound message, a
+headless job, a planted token, a push to a remote outside the class, and the walled-session gaps G3 to G16 that are
+built). Exit 0 when every case passes; exit 1 with a typed error naming the cases when a setting the wall writes is
+missing. It proves what ws writes, not that a set-up host holds it: that's `ws walls check`.
+
+```text
+ws walls canary [-h]
+```
+
 ## `ws rate`
 
 Give a run a thumbs up or down.

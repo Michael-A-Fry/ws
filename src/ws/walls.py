@@ -16,6 +16,11 @@ classes are optional: they need a second account on a Linux or macOS machine.
     is not a live test of the runner. Exit 0 when all pass; exit 1 when the host is not set up (it prints the commands,
     and the way to take it all out again) or a case fails, with a typed error naming the next command.
 
+  * `ws walls canary` runs every case but the on-disk owner check on a world planted under ws's probe folder (three
+    walled classes with accounts that don't exist, their files as ws renders them, the generated settings), so it needs
+    no set-up host; it then lists what the cases cover (`COVERS`). Exit 0 when all pass, exit 1 when a setting the wall
+    writes is missing.
+
 `CASES` is a plain module-level table of (name, check function, the setting the case depends on, whether it needs the class
 file): a later task adds a row and nothing else. Creating accounts and root-owned files is your step; this module never
 runs sudo, `useradd` or `chown`, and writes nothing under `/etc`.
@@ -106,8 +111,9 @@ class Ctx:
     env: Mapping[str, str]
     now: datetime
     classes: list[policy.Class] = field(default_factory=list)  # the classes the host cases run for: set up, with a file
-    docs: dict[str, dict] = field(default_factory=dict)
+    docs: dict[str, dict] = field(default_factory=dict)  # each class's launch file
     base: dict | None = None
+    managed: dict[str, dict] = field(default_factory=dict)  # each class's managed-settings file
 
 
 class Case(NamedTuple):
@@ -302,8 +308,7 @@ def _hook_registered(ctx: Ctx) -> str | None:
 def _case_hooks_bypass(ctx: Ctx) -> Outcome:
     def test(cls: policy.Class, doc: dict) -> str | None:
         # the bypass key is the managed-settings file's (a bare `claude` run is bound by it), not the launch file's
-        found = wallsettings.class_file_found(cls.name)
-        have = _perms(wallsettings.read(found) or {}).get(wallsettings.BYPASS_KEY) if found else None
+        have = _perms(ctx.managed.get(cls.name) or {}).get(wallsettings.BYPASS_KEY)
         if have != wallsettings.BYPASS_OFF:
             key = f"permissions.{wallsettings.BYPASS_KEY}"
             return f"the managed-settings file does not set {key} to {wallsettings.BYPASS_OFF!r}"
@@ -796,7 +801,8 @@ def _case_push_refused(ctx: Ctx) -> Outcome:
         if plan is None or plan.decide(PROBE_REMOTE, 443).allow:
             return f"ws's egress plan lets a push to {PROBE_REMOTE} through"
         plain = [h for h in cls.allowed_hosts if not sandbox.entry_problem(h) and not h.startswith("*.")]
-        if plain and not plan.decide(sandbox.split_entry(plain[0])[0], 443).allow:
+        host, port = sandbox.split_entry(plain[0]) if plain else ("", None)
+        if plain and not plan.decide(host, port or 443).allow:
             return f"ws's egress plan refuses {plain[0]}, a remote the class lists"
         return None
 
@@ -928,6 +934,98 @@ def _case_tracer(ctx: Ctx) -> Outcome:
     )
 
 
+def _case_managed_blocks(ctx: Ctx) -> Outcome:
+    """C360: the managed-settings file itself blocks file-tool writes outside the working folders and keeps the sign-in
+    tokens from shell commands. A bare `claude` run as the class account gets no launch copy, so the launch copy's keys
+    are not enough."""
+
+    def test(cls: policy.Class, doc: dict) -> str | None:
+        managed = ctx.managed.get(cls.name) or {}
+        lacks = []
+        if _perms(managed).get(wallsettings.WRITE_BLOCK_KEY) is not True:
+            lacks.append(f"permissions.{wallsettings.WRITE_BLOCK_KEY} true")
+        missing = wallsettings.tokens_missing(managed)
+        if missing:
+            lacks.append(f"sandbox.credentials.envVars deny of {', '.join(missing)}")
+        return f"the managed-settings file does not set {'; '.join(lacks)}" if lacks else None
+
+    return _each(ctx, test)
+
+
+def _case_remote_off(ctx: Ctx) -> Outcome:
+    """G11: a class session can't be driven from Remote Control and fetches no claude.ai connector."""
+
+    def test(cls: policy.Class, doc: dict) -> str | None:
+        on = [k for k in (wallsettings.REMOTE_KEY, wallsettings.CONNECTORS_KEY) if doc.get(k) is not True]
+        return f"the launch file does not set {', '.join(on)} to true" if on else None
+
+    return _each(ctx, test)
+
+
+def _case_headless(ctx: Ctx) -> Outcome:
+    """A headless job of the class (`ws run`, attack S1) gets the settings a launch gets, plus the no-prompt key: the
+    generated settings made unattended, made into the launch copy for a class folder, the launch file merged in. In them a
+    write outside the job's folders fails: the file tools' write block is on, the shell's writes are held to the class's
+    repos and scratch by the managed file, no command runs outside the sandbox, and a call that would wait on a prompt
+    is denied instead."""
+    from ws.adapters import claude_code
+
+    if ctx.base is None:
+        return Outcome(False, "no generated Claude Code settings to read (run `ws install`)")
+
+    def test(cls: policy.Class, doc: dict) -> str | None:
+        roots = wallsettings.class_roots(cls, wallsettings.class_home(cls, ctx.kind))
+        if not roots:
+            return "the class names no repo folder"
+        job = wallsettings.merge(json.loads(claude_code.unattended(json.dumps(_launch_copy(ctx, roots[0], {})))), doc)
+        perms, sb = _perms(job), job.get("sandbox") if isinstance(job.get("sandbox"), Mapping) else {}
+        bad = []
+        if perms.get(wallsettings.WRITE_BLOCK_KEY) is not True:
+            bad.append(f"permissions.{wallsettings.WRITE_BLOCK_KEY} is not true")
+        if perms.get(wallsettings.UNATTENDED_KEY) is not True:
+            bad.append(f"permissions.{wallsettings.UNATTENDED_KEY} is not true")
+        if sb.get("allowUnsandboxedCommands") is not False:
+            bad.append("sandbox.allowUnsandboxedCommands is not false")
+        managed = ctx.managed.get(cls.name) or {}
+        writes = ((managed.get("sandbox") or {}).get("filesystem") or {}).get("allowWrite") or []
+        outside = [w for w in writes if w not in roots and w not in wallsettings.scratch_dirs(ctx.kind)]
+        if not writes or outside:
+            bad.append("the managed file's allowWrite is not the class's repos and scratch")
+        return "a job's settings: " + "; ".join(bad) if bad else None
+
+    return _each(ctx, test)
+
+
+def _case_local_model(ctx: Ctx) -> Outcome:
+    """rr-M3, run as a local-model session: a `local_only` class takes a model on this machine and refuses a hosted
+    one, and the local session gets the same wall as a Claude session of the class: its launch file has the same keys,
+    and its network is loopback only."""
+    from ws import sandbox
+
+    local = [c for c in ctx.classes if c.local_only]
+    if not local:
+        return Outcome(True, "no local_only class in the policy (`ws walls canary` plants one)")
+    bad = []
+    for cls in local:
+        if sandbox.provider_problem(cls, "local") is not None:
+            bad.append(f"{cls.name}: a local model is refused")
+        if sandbox.provider_problem(cls, "anthropic") is None:
+            bad.append(f"{cls.name}: a hosted provider is allowed for a local_only class")
+        doc = ctx.docs.get(cls.name) or {}
+        want = wallsettings.launch_settings(cls, wallsettings.class_home(cls, ctx.kind), ctx.kind, ctx.pol, ctx.env)
+        lacks = sorted(set(want) - set(doc))
+        if lacks:
+            bad.append(f"{cls.name}: the launch file lacks {', '.join(lacks)}")
+        far = [
+            h
+            for h in _network(doc).get("allowedDomains") or []
+            if sandbox.split_entry(str(h))[0] not in sandbox.LOOPBACK_NAMES
+        ]
+        if far:
+            bad.append(f"{cls.name}: a local session can reach {', '.join(map(str, far))}")
+    return Outcome(not bad, "; ".join(bad) or "a local model session gets the class's wall and loopback only")
+
+
 CASES: list[Case] = [
     Case("inbound-refused", _case_inbound, "crossSessionInbound, [classes.NAME] inbound"),
     Case("sealed-read-refused", _case_sealed, "permissions.deny Read() and Edit() of the sealed paths"),
@@ -955,6 +1053,24 @@ CASES: list[Case] = [
     Case("owner-and-review-date", _case_owner_review, "owner and review_date under [classes.NAME]", host=False),
     Case("messaging-denied", _case_messaging, "permissions.deny SendMessage and ListAgents"),
     Case("class-file-root-owned", _case_file_safe, "the class file's owner and mode"),
+    Case(
+        "managed-write-block-and-token-deny",
+        _case_managed_blocks,
+        "permissions.blockWritesOutsideWorkingDirectories and sandbox.credentials.envVars in the managed-settings file",
+    ),
+    Case(
+        "remote-and-connectors-off",
+        _case_remote_off,
+        "disableRemoteControl and disableClaudeAiConnectors in the launch file",
+    ),
+    Case(
+        "headless-job-in-wall",
+        _case_headless,
+        "permissions.denyInsteadOfPrompting for a job, the write block, the managed file's allowWrite",
+    ),
+    Case(
+        "local-model-in-wall", _case_local_model, "[classes.NAME] local_only, the launch file's keys and loopback hosts"
+    ),
     Case(
         "allowed-sender-delivered",
         _case_allowed_sender,
@@ -1020,8 +1136,9 @@ def _context(env: Mapping[str, str], now: datetime) -> tuple[Ctx, list[policy.Cl
         else:
             missing.append(cls)
     docs = {c.name: _read_json(wallsettings.launch_file_path(c.name, kind)) or {} for c in ready}
+    managed = {c.name: _read_json(found) or {} for c in ready if (found := wallsettings.class_file_found(c.name))}
     base = _read_json(paths.state_dir(env) / "gate" / "claude-code" / "settings.json")
-    return Ctx(pol, kind, env, now, ready, docs, base), ready, missing
+    return Ctx(pol, kind, env, now, ready, docs, base, managed), ready, missing
 
 
 def run_cases(ctx: Ctx, cases: list[Case] | None = None) -> list[dict]:
@@ -1101,6 +1218,106 @@ def cmd_check(args: argparse.Namespace) -> int:
         1,
         data,
     )
+
+
+# ---- the canary: every case on a planted world -----------------------------------------------------------------------------
+
+# What `ws walls canary` proves, each item with the case that proves it. A case fails when the setting it names is removed
+# (tests/test_walls.py removes each one). Two items share the tracer: G4 asks for the planted token over every shared sink.
+COVERS: dict[str, str] = {
+    "inbound message from outside the class": "inbound-refused",
+    "headless job writes outside its workspace": "headless-job-in-wall",
+    "canary token reaches no shared sink": "tracer-stays-in-class",
+    "push to a non-class remote": "class-push-refused",
+    "G3 message bodies stay in the class": "bodies-in-class-store",
+    "G4 a token over every shared sink": "tracer-stays-in-class",
+    "G5 tool-filled cards": "walled-sends-fixed-kinds",
+    "G6 messaging tools denied": "messaging-denied",
+    "G7 provider allowlist": "provider-allowlist",
+    "G8 class-gated memory and notes": "memory-notes-refused",
+    "G10 no counts but buckets": "walled-card-no-counts",
+    "G11 Remote Control and connectors off": "remote-and-connectors-off",
+    "G14 OpenTelemetry content off": "otel-off",
+    "G16 owner and review date": "owner-and-review-date",
+    "C360 the managed file's write block and token deny": "managed-write-block-and-token-deny",
+    "rr-M3 a local-model session": "local-model-in-wall",
+    "a session outside the area reads or edits nothing sealed": "sealed-read-refused",
+}
+# Cases that read the host itself (a file's owner and mode on disk): `ws walls check` runs them, the canary can't.
+HOST_ONLY = ("class-file-root-owned",)
+CANARY_CLASSES = ("canary", "canary-other", "canary-local")  # names of the planted classes, none of them anyone's
+
+
+def canary_policy(root: Path, now: datetime) -> str:
+    """The planted policy: three walled classes with their own (nonexistent) accounts and repos under `root`, an owner and
+    a review date; the first names a provider and a remote host, the last is `local_only` with a loopback model host."""
+    review = (now.astimezone(UTC) + timedelta(days=30)).date().isoformat()
+    extra = {
+        "canary": 'allowed_providers = ["anthropic"]\nallowed_hosts = ["git.example.com"]\n',
+        "canary-other": "",
+        "canary-local": 'local_only = true\nallowed_hosts = ["localhost:11434"]\n',
+    }
+    return "".join(
+        f'[classes.{name}]\naccess = "walled"\nos_user = "ws-{name}"\nrepos = [{json.dumps(f"{root}/{name}/**")}]\n'
+        f'inbound = "lead-only"\nowner = "canary"\nreview_date = {review}\n{extra[name]}\n'
+        for name in CANARY_CLASSES
+    )
+
+
+@contextlib.contextmanager
+def canary_context(env: Mapping[str, str], now: datetime) -> Iterator[Ctx]:
+    """A context for every case on a world planted under ws's probe folder: the canary policy, each class's managed and
+    launch files as `ws install --class` renders them, and the generated settings `ws install` writes. No account, no
+    file under /etc and no real store is read or written. Removed after."""
+    from ws import selfcmd
+    from ws.adapters import claude_code
+
+    kind = osinfo.detect().kind
+    with _probe_folder(env) as root:
+        pol_file = root / "policy.toml"
+        pol_file.write_text(canary_policy(root, now), encoding="utf-8")
+        pol = policy.load(pol_file)
+        classes = wallsettings.class_users(pol)
+        docs, managed = {}, {}
+        for cls in classes:
+            home = wallsettings.class_home(cls, kind)
+            docs[cls.name] = wallsettings.launch_settings(cls, home, kind, pol, env)
+            managed[cls.name] = wallsettings.class_settings(cls, home, kind)
+        files = claude_code.generate(pol, selfcmd.argv(), root / "gate", pol_file)
+        yield Ctx(pol, kind, env, now, classes, docs, json.loads(files[claude_code.FILE]), managed)
+
+
+def canary_cases() -> list[Case]:
+    return [c for c in CASES if c.name not in HOST_ONLY]
+
+
+def cmd_canary(args: argparse.Namespace) -> int:
+    env = dict(os.environ)
+    with canary_context(env, _now()) as ctx:
+        cases = run_cases(ctx, canary_cases())
+    status = {c["name"]: c["status"] for c in cases}
+    covers = [{"item": item, "case": name, "status": status.get(name, "missing")} for item, name in COVERS.items()]
+    failed = [c for c in cases if c["status"] != "pass"]
+    data = {"cases": cases, "covers": covers}
+    if args.json:
+        if not failed:
+            output.result(data)
+    else:
+        _print_cases(cases)
+        for c in covers:
+            print(f"{c['status']:<5} covers  {c['item']}  ({c['case']})")
+    if failed:
+        names = ", ".join(c["name"] for c in failed)
+        raise WsError(
+            "walls_canary_failed",
+            f"{len(failed)} case(s) fail on the planted world: {names}",
+            "a setting the wall writes is missing; the detail of each is above (`ws walls canary --json` has them all)",
+            1,
+            data,
+        )
+    if not args.json:
+        print(f"ws: {len(cases)} cases hold on a planted world, covering {len(covers)} items")
+    return 0
 
 
 # ---- init and edit -------------------------------------------------------------------------------------------------------
@@ -1356,3 +1573,9 @@ def register(sub) -> None:
         help="check the walled classes' settings are in place, without sudo (exit 1: not set up, or a case fails)",
     )
     c.set_defaults(func=cmd_check)
+
+    k = ws_.add_parser(
+        "canary",
+        help="run every case on a planted world, no account or root file needed (exit 1: a setting the wall writes is missing)",
+    )
+    k.set_defaults(func=cmd_canary)

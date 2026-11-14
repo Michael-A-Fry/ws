@@ -33,6 +33,10 @@ NAMES = [
     "owner-and-review-date",
     "messaging-denied",
     "class-file-root-owned",
+    "managed-write-block-and-token-deny",
+    "remote-and-connectors-off",
+    "headless-job-in-wall",
+    "local-model-in-wall",
     "allowed-sender-delivered",
     "bodies-in-class-store",
     "walled-sends-fixed-kinds",
@@ -42,7 +46,7 @@ NAMES = [
     "walled-card-no-counts",
     "tracer-stays-in-class",
 ]
-FLOW_NAMES = NAMES[13:]  # the cases about what leaves a walled class through ws's own stores: tests/test_walls_flows.py
+FLOW_NAMES = NAMES[17:]  # the cases about what leaves a walled class through ws's own stores: tests/test_walls_flows.py
 
 POLICY = """
 [classes.alpha]
@@ -226,6 +230,27 @@ def other_hook(doc: dict) -> None:
         g["matcher"] = "Bash|Read"  # the old list: a tool it does not name is not gated
 
 
+def without_token(name: str):
+    def change(doc: dict) -> None:
+        cred = doc["sandbox"]["credentials"]
+        cred["envVars"] = [e for e in cred["envVars"] if e["name"] != name]
+
+    return change
+
+
+def a_local_class(h, then) -> None:
+    """Add a local_only class with its files in place (the host has none), then apply `then`."""
+    h.edit_policy(
+        "[classes.beta]",
+        f'[classes.gamma]\naccess = "walled"\nos_user = "ws-gamma"\nrepos = ["{h.box}/work/gamma/**"]\n'
+        'local_only = true\nallowed_hosts = ["localhost:11434"]\nowner = "gamma lead"\nreview_date = 2027-06-01\n\n'
+        "[classes.beta]",
+    )
+    h.place("gamma")
+    assert results()["local-model-in-wall"]["status"] == "pass"
+    then(h)
+
+
 MUTATIONS = [
     (
         "inbound-refused",
@@ -376,6 +401,66 @@ MUTATIONS = [
     ),
     ("messaging-denied", "ListAgents is allowed", lambda h: h.edit_file("alpha", without_rule("ListAgents"))),
     ("messaging-denied", "SendMessage is allowed", lambda h: h.edit_file("beta", without_rule("SendMessage"))),
+    (
+        "managed-write-block-and-token-deny",
+        "the managed file stops blocking writes outside the working folders",
+        lambda h: h.edit_file("alpha", drop(("permissions", wallsettings.WRITE_BLOCK_KEY)), managed=True),
+    ),
+    (
+        "managed-write-block-and-token-deny",
+        "the managed file stops denying one sign-in token",
+        lambda h: h.edit_file("beta", without_token("CLAUDE_CODE_OAUTH_TOKEN"), managed=True),
+    ),
+    (
+        "managed-write-block-and-token-deny",
+        "the managed file has no credentials table",
+        lambda h: h.edit_file("alpha", drop(("sandbox", "credentials")), managed=True),
+    ),
+    (
+        "remote-and-connectors-off",
+        "Remote Control is not switched off",
+        lambda h: h.edit_file("alpha", drop((wallsettings.REMOTE_KEY,))),
+    ),
+    (
+        "remote-and-connectors-off",
+        "the claude.ai connectors are not switched off",
+        lambda h: h.edit_file("beta", lambda d: d.update({wallsettings.CONNECTORS_KEY: False})),
+    ),
+    (
+        "headless-job-in-wall",
+        "a job is not made unattended",
+        lambda h: h.mp.setattr(claude_code, "unattended", lambda settings: settings),
+    ),
+    (
+        "headless-job-in-wall",
+        "the generated settings stop blocking writes outside the working folders",
+        lambda h: h.edit_settings(drop(("permissions", wallsettings.WRITE_BLOCK_KEY))),
+    ),
+    (
+        "headless-job-in-wall",
+        "the managed file lets shell commands write outside the class",
+        lambda h: h.edit_file("alpha", lambda d: d["sandbox"]["filesystem"]["allowWrite"].append("/srv"), managed=True),
+    ),
+    (
+        "local-model-in-wall",
+        "a local_only class takes a hosted provider",
+        lambda h: a_local_class(h, lambda h: h.mp.setattr(sandbox, "provider_problem", lambda cls, provider: None)),
+    ),
+    (
+        "local-model-in-wall",
+        "the local class's launch file can reach a hosted model",
+        lambda h: a_local_class(
+            h,
+            lambda h: h.edit_file(
+                "gamma", lambda d: d["sandbox"]["network"]["allowedDomains"].append("api.anthropic.com")
+            ),
+        ),
+    ),
+    (
+        "local-model-in-wall",
+        "the local class's launch file lacks the messaging refusal",
+        lambda h: a_local_class(h, lambda h: h.edit_file("gamma", drop(("crossSessionInbound",)))),
+    ),
     (
         "class-file-root-owned",
         "the file is writable by others",
@@ -1058,3 +1143,207 @@ def test_a_local_opencode_session_in_a_class_gets_the_same_file_write_network_an
     ]["deny"]
     oc = json.loads(opencode.generate(pol, ["ws"], box / "o", policy_file())[opencode.CONFIG])["permission"]
     assert "mcp__x__y" in claude_deny and oc["x_y"] == "deny"
+
+
+# ---- C360: the managed file holds the write block and the token deny -----------------------------------------------------
+
+
+def test_the_class_managed_file_blocks_writes_and_denies_the_four_tokens():
+    pol = policy.loads(POLICY.format(box="/b"))
+    cls = pol.classes["alpha"]
+    doc = wallsettings.class_settings(cls, wallsettings.class_home(cls, "linux"), "linux")
+    assert doc["permissions"][wallsettings.WRITE_BLOCK_KEY] is True
+    names = [e["name"] for e in doc["sandbox"]["credentials"]["envVars"] if e["mode"] == "deny"]
+    assert names == list(wallsettings.TOKEN_VARS) == list(claude_code.TOKEN_VARS) and len(names) == 4
+
+
+@pytest.mark.parametrize(
+    "change",
+    [drop(("permissions", wallsettings.WRITE_BLOCK_KEY)), without_token("ANTHROPIC_API_KEY")],
+    ids=["no write block", "a token not denied"],
+)
+def test_a_planted_class_file_missing_the_write_block_or_a_token_deny_fails_walls_check(host, capsys, change):
+    assert run(capsys, "check")[0] == 0
+    host.edit_file("alpha", change, managed=True)
+    code, out, err = run(capsys, "check")
+    assert code == 1 and "managed-write-block-and-token-deny" in err
+    assert "fail  managed-write-block-and-token-deny" in out
+
+
+def test_ws014_has_a_failing_row_for_a_managed_file_without_the_write_block_or_the_token_deny(host):
+    pol = policy.load(policy_file())
+
+    def rows() -> dict:
+        return {(r.cls, r.part): r for r in wallsettings.class_rows(pol, dict(os.environ), kind())}
+
+    before = rows()
+    assert before[("alpha", "writes outside blocked")].status == before[("alpha", "tokens denied")].status == "ok"
+    host.edit_file("alpha", drop(("permissions", wallsettings.WRITE_BLOCK_KEY)), managed=True)
+    host.edit_file("alpha", without_token("ANTHROPIC_AUTH_TOKEN"), managed=True)
+    after = rows()
+    assert after[("alpha", "writes outside blocked")].status == "fail"
+    assert after[("alpha", "tokens denied")].status == "fail"
+    assert "ANTHROPIC_AUTH_TOKEN" in after[("alpha", "tokens denied")].detail
+
+
+# ---- `ws walls canary`: every case on a planted world ---------------------------------------------------------------------
+
+REQUIRED = ("inbound message", "headless job", "canary token", "non-class remote", "G3 ", "G4 ", "G5 ", "G7 ", "G8 ",
+            "G10 ", "G11 ", "G14 ", "G16 ")  # fmt: skip
+
+
+def test_canary_exits_0_on_a_host_with_no_class_set_up(box, capsys):
+    code, out, _ = run(capsys, "canary")
+    assert code == 0, out
+    assert "fail" not in out and out.strip().endswith(f"covering {len(walls.COVERS)} items")
+
+
+def test_canary_counts_at_least_13_items_each_with_a_case_it_runs(box, capsys):
+    items = list(walls.COVERS)
+    assert len(items) >= 13
+    for want in REQUIRED:
+        assert any(want in item for item in items), want
+    run_names = {c.name for c in walls.canary_cases()}
+    assert set(walls.COVERS.values()) <= run_names
+    assert run_names == set(NAMES) - set(walls.HOST_ONLY)
+    code, out, _ = run(capsys, "canary", "--json")
+    env = json.loads(out)
+    data = env["data"]
+    assert (
+        code == 0
+        and env["kind"] == "walls.canary"
+        and len(data["covers"]) == len(items)
+        and {c["status"] for c in data["covers"]} == {"pass"}
+    )
+
+
+def test_canary_reads_no_class_file_in_place_and_plants_only_its_own_classes(box, monkeypatch, capsys):
+    monkeypatch.setattr(wallsettings, "class_file_found", lambda name: pytest.fail("the canary read a class file"))
+    monkeypatch.setattr(wallsettings, "launch_file_found", lambda name, k: pytest.fail("the canary read a launch file"))
+    assert run(capsys, "canary")[0] == 0
+    assert set(policy.loads(walls.canary_policy(Path("/r"), NOW)).classes) == set(walls.CANARY_CLASSES)
+
+
+def _without(where: str, *key: str):
+    real = getattr(wallsettings, where)
+
+    def patched(*a, **k):
+        doc = real(*a, **k)
+        drop(key)(doc)
+        return doc
+
+    return patched
+
+
+CANARY_MUTATIONS = [
+    ("inbound-refused", "launch_settings", ("crossSessionInbound",)),
+    ("messaging-denied", "launch_settings", ("permissions", "deny")),
+    ("class-push-refused", "launch_settings", ("sandbox", "network", "strictAllowlist")),
+    ("otel-off", "launch_settings", ("env",)),
+    ("remote-and-connectors-off", "launch_settings", (wallsettings.CONNECTORS_KEY,)),
+    ("managed-write-block-and-token-deny", "class_settings", ("permissions", wallsettings.WRITE_BLOCK_KEY)),
+    ("managed-write-block-and-token-deny", "class_settings", ("sandbox", "credentials")),
+    ("headless-job-in-wall", "class_settings", ("sandbox", "filesystem", "allowWrite")),
+    ("hooks-under-bypass", "class_settings", ("permissions", wallsettings.BYPASS_KEY)),
+]
+
+
+@pytest.mark.parametrize(
+    ("case", "where", "key"), CANARY_MUTATIONS, ids=[f"{c} via {w}" for c, w, _ in CANARY_MUTATIONS]
+)
+def test_canary_fails_when_the_wall_stops_writing_a_setting(box, monkeypatch, capsys, case, where, key):
+    monkeypatch.setattr(wallsettings, where, _without(where, *key))
+    code, out, err = run(capsys, "canary")
+    assert code == 1 and case in err and f"fail  {case}" in out
+
+
+def test_canary_fails_when_a_local_only_class_takes_a_hosted_model(box, monkeypatch, capsys):
+    monkeypatch.setattr(sandbox, "provider_problem", lambda cls, provider: None)
+    code, out, _ = run(capsys, "canary")
+    assert code == 1 and "fail  local-model-in-wall" in out
+
+
+# ---- C213 / rr-r2-3: a local_only class refuses a hosted model where the call is made, with one record --------------------
+
+from test_run import ws as run_ws  # noqa: F401  (a scratch WS_HOME with a fake claude, for `ws run`)
+
+
+def test_a_local_only_class_refuses_a_job_on_a_hosted_provider_and_records_exactly_one_refusal(run_ws, tmp_path):  # noqa: F811
+    work = tmp_path / "work"
+    work.mkdir()
+    (run_ws.home / "policy.toml").write_text(
+        f'[classes.work]\naccess = "walled"\nrepos = ["{work}/**"]\nlocal_only = true\n', encoding="utf-8"
+    )
+    run_ws.job(extra=f'cwd = "{work}"')  # the fake claude: Anthropic's hosted models
+    assert cli.main(["run", "daily"]) == 3
+    (rec,) = run_ws.records()  # exactly one line, and it is the refusal
+    assert rec["status"] == "refused" and rec["stop_reason"] == "refused:egress"
+    assert "class 'work'" in rec["error"] and "anthropic" not in rec["error"]
+    assert not (run_ws.home / "fake-saw.json").exists()  # the runner never started
+
+
+# ---- pa-10: the doctor warns when the policy names no data class ---------------------------------------------------------
+
+
+def test_doctor_warns_when_the_policy_has_no_data_classes(box):
+    policy_file().write_text('[gate]\ndeny_commands = ["x*"]\n', encoding="utf-8")
+    (check,) = doctor._classes_check(dict(os.environ))
+    assert (check.id, check.role, check.status) == ("WS020", "data-classes", "warn") and check.fix
+
+
+def test_doctor_is_ok_about_data_classes_when_the_policy_names_some(host):
+    (check,) = doctor._classes_check(dict(os.environ))
+    assert (check.id, check.status) == ("WS020", "ok") and "2 data class(es)" in check.detail
+
+
+def test_ws020_is_in_the_doctor_reference():
+    page = (Path(__file__).resolve().parents[1] / "docs" / "reference" / "doctor-checks.md").read_text(encoding="utf-8")
+    assert "| WS020 | data-classes |" in page
+
+
+# ---- pa-11: an alert from a walled class's folder is the plain line ------------------------------------------------------
+
+
+class _Sender:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, url, body, headers):
+        self.calls.append((body, headers))
+        return 200
+
+
+@pytest.mark.parametrize("mode", ["title", "full"])
+def test_an_alert_from_a_walled_folder_sends_no_folder_name_whatever_alert_text_says(host, mode):
+    from ws.roles import ntfy
+
+    folder = host.box / "work" / "alpha" / "secret-case-folder"
+    folder.mkdir(parents=True)
+    cfg = {"adapter": "ntfy", "url": "https://ntfy.example.org/t", "alert_text": mode}
+    payload = {"hook_event_name": "Notification", "cwd": str(folder), "message": "about secret-case-folder"}
+    sender = _Sender()
+    ntfy.alert(cfg, dict(os.environ), payload, "claude-code", now=NOW, sender=sender)
+    ((body, headers),) = sender.calls
+    text = body.decode() + json.dumps(headers)
+    assert "secret-case-folder" not in text and "alpha" not in text and "a session needs you" in body.decode()
+
+
+def test_an_alert_from_a_folder_in_no_class_keeps_its_folder_name(host):
+    from ws.roles import ntfy
+
+    folder = host.box / "elsewhere" / "my-app"
+    folder.mkdir(parents=True)
+    cfg = {"adapter": "ntfy", "url": "https://ntfy.example.org/t"}
+    sender = _Sender()
+    ntfy.alert(
+        cfg, dict(os.environ), {"hook_event_name": "Notification", "cwd": str(folder)}, "c", now=NOW, sender=sender
+    )
+    assert "my-app" in sender.calls[0][0].decode()
+
+
+def test_an_alert_is_plain_when_the_policy_does_not_load(box):
+    from ws.roles import ntfy
+
+    policy_file().write_text("[gate\n", encoding="utf-8")
+    assert ntfy.walled_folder(str(box), dict(os.environ)) is True
+    assert ntfy.walled_folder("", dict(os.environ)) is False

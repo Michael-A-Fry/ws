@@ -60,16 +60,16 @@ import tempfile
 import urllib.request
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import NamedTuple
 
-from ws import __version__, agentsession, approvals, install, output, paths, selfcmd, userconfig
+from ws import __version__, agentsession, approvals, install, jsonl, output, paths, selfcmd, userconfig
 from ws.output import WsError
 
 COMMAND = "upgrade"
 EXIT_FAILED, EXIT_REFUSED, EXIT_NOT_RESTORED = 1, 3, 4
 EXIT_TIMEOUT = 124  # a step the watchdog stopped (the shell's own code for a timeout)
+HISTORY_SCHEMA = 1  # of a line in upgrade-history.jsonl
 INSTALL_TIMEOUT_S, STEP_TIMEOUT_S = 600.0, 120.0  # the watchdog per step: the installer, then the hooks and the check
 INSTALLER_URL = "https://raw.githubusercontent.com/Michael-A-Fry/ws/main/install.sh"
 _DOWNLOAD_LIMIT = 1 << 20  # bytes: install.sh is about 40 KB
@@ -308,13 +308,10 @@ def history_path(env: Mapping[str, str]) -> Path:
 
 
 def record(env: Mapping[str, str], verb: str, frm: str, to: str | None) -> None:
-    """One line of history. A history that cannot be written never stops an upgrade."""
-    line = json.dumps({"ts": datetime.now(UTC).isoformat(timespec="seconds"), "verb": verb, "from": frm, "to": to})
+    """One line of history, in one file that is never rotated (the way back must stay on record). A history that
+    cannot be written never stops an upgrade."""
     try:
-        path = history_path(env)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as f:
-            f.write(line + "\n")
+        jsonl.append_plain(history_path(env), jsonl.stamped({"verb": verb, "from": frm, "to": to}, HISTORY_SCHEMA))
     except OSError:
         pass
 

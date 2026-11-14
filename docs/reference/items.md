@@ -29,6 +29,7 @@ gate call has no payload, an approval has no bound command, an OpenCode ask has 
 | `eval-result` | `eval` | Eval results | `h[0-9a-f]{12}` | truth | append-only |
 | `eval-look` | `eval` | Eval looks | `h[0-9a-f]{12}` | truth | append-only |
 | `job-alert` | `jobwatch` | Job alerts | `h[0-9a-f]{12}` | truth | append-only |
+| `upgrade` | `upgrade` | Upgrade history | `h[0-9a-f]{12}` | truth | append-only |
 | `gate-call` | `guards.record_calls` | Gate calls | `h[0-9a-f]{12}` | truth | append-only |
 | `claim` | `guards.claims` | Claims | `h[0-9a-f]{12}` | truth | append-only |
 | `verdict` | `gate` | Gate verdicts | `h[0-9a-f]{12}` | truth | append-only |

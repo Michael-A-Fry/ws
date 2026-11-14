@@ -64,7 +64,22 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from ws import __version__, adapters, broker, gate, jobs, jsonl, output, paths, policy, queue, runrecord, selfcmd
+from ws import (
+    __version__,
+    adapters,
+    broker,
+    gate,
+    joblock,
+    joblog,
+    jobs,
+    jsonl,
+    output,
+    paths,
+    policy,
+    queue,
+    runrecord,
+    selfcmd,
+)
 from ws import secrets as wsecrets
 from ws._vendor import sqlqueue
 from ws.output import WsError
@@ -577,11 +592,33 @@ class Queued:
 _says_stops: contextvars.ContextVar[bool] = contextvars.ContextVar("ws_run_says_stops", default=False)
 
 
+def _died(name: str, old: dict) -> None:
+    """One record for a run whose holder stopped beating: it never finished, and nothing else would say so."""
+    now = datetime.now(UTC)
+    rec = runrecord.new(
+        run_id=runrecord.new_run_id(now), job=name, started_at=runrecord.iso(now), ended_at=runrecord.iso(now),
+        status="error", stop_reason="died", duration_ms=0, ws_version=__version__,
+        error=f"the previous run of {name} (fence {old.get('fence', '?')}) stopped without finishing: its lock went stale",
+    )  # fmt: skip
+    _append(runrecord.runs_path(os.environ), rec)
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     token = _says_stops.set(True)
+    name = getattr(args, "job", None)
     try:
-        with _term_becomes_exit():
-            return _run(args)
+        if args.dry_run or not isinstance(name, str) or not jobs.NAME.match(name):
+            with _term_becomes_exit():
+                return _run(args)
+        with joblock.hold(name, os.environ, on_died=_died) as lock:
+            if lock is None:  # a live run holds it: one tick, one run
+                print(f"ws: {name} is already running; this start is skipped", file=sys.stderr)
+                return 0
+            try:
+                with _term_becomes_exit():
+                    return _run(args)
+            finally:
+                joblog.rotate(Path(os.path.abspath(paths.state_dir(os.environ))) / "logs" / f"{name}.log")
     finally:
         _says_stops.reset(token)
 

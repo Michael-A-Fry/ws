@@ -208,3 +208,128 @@ def test_job_env_allows_ordinary_names_and_refuses_odd_ones():
     }
     with pytest.raises(ValueError, match="not a variable name"):
         jobs.extra_env(load(GOOD + '[runner_options]\nenv = { "A B" = "x" }\n'))
+
+
+# ---- the run contract ---------------------------------------------------------------------------------------------
+
+CONTRACT = {
+    "timeout_s": "600",
+    "on_failure": '"alert"',
+    "log": '"file"',
+    "uninstall": '"ws schedule remove x"',
+    "expected_rate": '"1d"',
+    "data_class": '"none"',
+}
+MODEL_CAPS = {"max_turns": "5", "budget_usd": "0.5"}
+
+
+def _put(tmp_path, name, keys, body='runner = "claude-code"\nmodel = "m"\nprompt = "hi"\n'):
+    home = tmp_path / "wsh"
+    (home / "jobs").mkdir(parents=True, exist_ok=True)
+    os.chmod(home / "jobs", 0o700)
+    text = body + 'schedule = "daily 03:30"\n' + "".join(f"{k} = {v}\n" for k, v in keys.items())
+    (home / "jobs" / f"{name}.toml").write_text(text, encoding="utf-8")
+    return {"WS_HOME": str(home), "HOME": str(tmp_path)}
+
+
+def test_a_scheduled_job_with_the_contract_and_caps_passes(tmp_path):
+    env = _put(tmp_path, "ok", {**CONTRACT, **MODEL_CAPS})
+    assert jobs.problems(env, contract=True) == {}
+    (s,) = jobs.scheduled(env)
+    assert s.timeout_s == 600 and s.expected_rate_s == 86400 and s.log == "file"
+
+
+@pytest.mark.parametrize("missing", sorted(CONTRACT))
+def test_each_of_the_six_lines_is_required(tmp_path, missing):
+    env = _put(tmp_path, "j", {**{k: v for k, v in CONTRACT.items() if k != missing}, **MODEL_CAPS})
+    assert missing in jobs.problems(env, contract=True)["j"]
+
+
+@pytest.mark.parametrize("missing", ["max_turns", "budget_usd"])
+def test_a_model_job_needs_a_turn_limit_and_a_spend_cap(tmp_path, missing):
+    env = _put(tmp_path, "j", {**CONTRACT, **{k: v for k, v in MODEL_CAPS.items() if k != missing}})
+    assert missing in jobs.problems(env, contract=True)["j"]
+
+
+def test_a_command_job_needs_the_six_lines_but_no_caps(tmp_path):
+    ok = _put(tmp_path, "c", CONTRACT, body='command = "backup"\n')
+    assert jobs.problems(ok, contract=True) == {}
+    bad = _put(tmp_path, "c", {}, body='command = "backup"\n')
+    assert all(k in jobs.problems(bad, contract=True)["c"] for k in CONTRACT)
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [("on_failure", '"email"'), ("log", '"nowhere"'), ("expected_rate", '"often"'), ("expected_rate", '"0d"'),
+     ("data_class", '"a b"'), ("uninstall", '""')],
+)  # fmt: skip
+def test_a_bad_contract_value_names_the_key(tmp_path, key, value):
+    env = _put(tmp_path, "j", {**CONTRACT, **MODEL_CAPS, key: value})
+    assert key in jobs.problems(env, contract=True)["j"]
+
+
+def test_an_unscheduled_job_is_not_held_to_the_contract(tmp_path):
+    home = tmp_path / "wsh"
+    (home / "jobs").mkdir(parents=True)
+    os.chmod(home / "jobs", 0o700)
+    (home / "jobs" / "manual.toml").write_text(GOOD, encoding="utf-8")
+    assert jobs.problems({"WS_HOME": str(home), "HOME": str(tmp_path)}) == {}
+
+
+def test_ws_config_exits_non_zero_on_a_job_file_ws_refuses(tmp_path, monkeypatch, capsys):
+    from ws import cli
+
+    env = _put(tmp_path, "j", {}, body='runner = "claude-code"\nmodel = "m"\n')  # no prompt
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    assert cli.main(["config"]) != 0
+
+
+def test_a_bad_contract_value_does_not_stop_the_timers(tmp_path):
+    """The check reports it; the timer falls back to "not given" for that file and every other job still schedules."""
+    env = _put(
+        tmp_path, "bad", {**CONTRACT, "timeout_s": '"soon"', "expected_rate": '"often"'}, body='command = "backup"\n'
+    )  # a runner job with a bad timeout_s is one `ws run` refuses, so it gets no timer; a command job is lenient
+    (jobs.jobs_dir(env) / "good.toml").write_text(
+        'command = "backup"\nschedule = "hourly"\ntimeout_s = 60\n', encoding="utf-8"
+    )
+    found = {s.name: s for s in jobs.scheduled(env)}
+    assert set(found) == {"bad", "good"} and found["bad"].timeout_s is None and found["bad"].expected_rate_s is None
+    assert found["good"].timeout_s == 60
+    assert "timeout_s" in jobs.problems(env, contract=True)["bad"]
+
+
+def test_a_pre_contract_job_loads_and_is_a_gap_not_a_problem(tmp_path):
+    """The upgrade must not turn every older scheduled job file into a failure."""
+    env = _put(tmp_path, "old", {})
+    assert jobs.problems(env) == {} and "max_turns" in jobs.contract_gaps(env)["old"]
+    assert "max_turns" in jobs.problems(env, contract=True)["old"]
+
+
+def test_a_job_that_does_not_load_is_a_problem_and_not_also_a_gap(tmp_path):
+    env = _put(tmp_path, "broken", {}, body='runner = "claude-code"\nmodel = "m"\n')  # no prompt
+    assert "prompt" in jobs.problems(env)["broken"] and jobs.contract_gaps(env) == {}
+
+
+def test_ws_config_warns_about_gaps_and_exits_0(tmp_path, monkeypatch, capsys):
+    from ws import cli
+
+    for k, v in _put(tmp_path, "old", {}).items():
+        monkeypatch.setenv(k, v)
+    assert cli.main(["config"]) == 0
+    out = capsys.readouterr().out
+    assert "job:old" in out and "lacks the run contract" in out
+
+
+def test_doctor_warns_about_gaps_and_fails_for_a_job_ws_refuses(tmp_path, monkeypatch, capsys):
+    from ws import cli
+
+    for k, v in _put(tmp_path, "old", {}).items():
+        monkeypatch.setenv(k, v)
+    cli.main(["doctor", "--offline", "--json"])
+    ws006 = {c["id"]: c for c in json.loads(capsys.readouterr().out)["data"]["checks"]}["WS006"]
+    assert ws006["status"] == "warn" and "lack the run contract" in ws006["detail"]
+    _put(tmp_path, "broken", {}, body='runner = "claude-code"\nmodel = "m"\n')
+    cli.main(["doctor", "--offline", "--json"])
+    ws006 = {c["id"]: c for c in json.loads(capsys.readouterr().out)["data"]["checks"]}["WS006"]
+    assert ws006["status"] == "fail" and "broken" in ws006["detail"]

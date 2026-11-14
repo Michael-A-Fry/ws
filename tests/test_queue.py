@@ -26,6 +26,11 @@ from ws.adapters import claude_code
 from ws.profile import dumps
 from ws.roles import launchd, systemd
 
+CONTRACT = (
+    'timeout_s = 600\non_failure = "alert"\nlog = "file"\nuninstall = "ws schedule remove x"\n'
+    'expected_rate = "1d"\ndata_class = "none"\n'
+)
+
 FIXTURES = Path(__file__).parent / "fixtures"
 T0 = datetime(2026, 11, 8, 3, 0, 0, tzinfo=UTC)
 URL = "http://127.0.0.1:1/l/" + "T" * 43
@@ -753,7 +758,9 @@ def test_a_queue_drain_job_file_gets_a_timer(tmp_path, monkeypatch):
     home = tmp_path / "wshome"
     (home / "jobs").mkdir(parents=True)
     monkeypatch.setenv("WS_HOME", str(home))
-    (home / "jobs" / "drain.toml").write_text('command = "queue"\nschedule = "every 15m"\n', encoding="utf-8")
+    (home / "jobs" / "drain.toml").write_text(
+        'command = "queue"\nschedule = "every 15m"\n' + CONTRACT, encoding="utf-8"
+    )
     os.chmod(home / "jobs", 0o700)
     (found,) = jobs.scheduled()
     assert found.argv == ("queue", "run") and found.when.every == 15

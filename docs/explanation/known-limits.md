@@ -37,6 +37,34 @@ true` leaves it out. `ws doctor` (WS016) warns when your Claude Code is too old 
 - **Workaround.** Put the paths you care about in `deny_read`, which ws writes as both a Read rule and a sandbox
   `denyRead`. Keep MCP tools to the ones `allow_mcp` names.
 
+### The Protect claim holds only while the sandbox is on
+
+ws says a walled session can't write ws's own files or read your denied paths. That holds only while the sandbox is
+on in the settings the session starts with (`sandbox.enabled` and `failIfUnavailable` both `true`, and for a class, in
+its root-owned managed file) and `ws canary --runner claude-code` passes. With `sandbox = false`, `--no-sandbox`, or a
+platform where Claude Code doesn't enforce its sandbox (native Windows), the gate and the permission rules are the only
+layer, and they read text.
+
+### Third-party MCP servers, plugins and skills (accepted risk, OWASP ASI04)
+
+An MCP server, a plugin or a skill you install is code or instructions from someone else, and it runs with the reach
+its layer gives it: an MCP server and a hook run outside the sandbox with your account's reach. ws doesn't pin or
+check what a skill says until the skill-trust pin is built. Until then this is an accepted risk (OWASP Top 10 for
+agentic applications, ASI04: agentic supply chain).
+
+- **What it means.** A server or plugin that turns hostile after an update isn't stopped by the sandbox.
+- **Workaround.** Name only the MCP tools you use in `allow_mcp`, install plugins and skills from sources you trust,
+  and read a skill's diff before you update it.
+
+### tmux and other daemons aren't reachable from inside the wall
+
+A shell command in the wall can't talk to your tmux server (`tmux list-sessions` fails with `Operation not
+permitted`), or to screen, `systemd-run --user` or docker. This is on purpose: a daemon on a host socket runs outside
+the wall, so `tmux run-shell` or `tmux new-window` from inside it would run a command as you, with no sandbox.
+
+- **What it means.** Session tooling that drives tmux has to run outside the walled session.
+- **Workaround.** Run it from a terminal of your own, or from a session started without the wall.
+
 ### What a walled class's settings can't hold, and what an OpenCode session lacks
 
 Claude Code reads `allowManagedHooksOnly`, `allowManagedPermissionRulesOnly` and `sandbox.network.allowManagedDomainsOnly`

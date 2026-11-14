@@ -53,7 +53,10 @@ jobs:
       - name: tests
         env:
           WS_ORACLE_REQUIRE: ${{ runner.os == 'Linux' && '1' || '' }} # the oracle can't start a sandbox = a failure, not a skip
-        run: uv run --locked pytest -q -rs
+          # macOS runners are slower: core-tier times in the last six runs were 764 to 1004 s against the 900 s default
+          # (tests/plugins/ws_harness.py), so macOS gets 1200 s; Linux keeps the default
+          CORE_BUDGET: ${{ runner.os == 'macOS' && '1200' || '900' }}
+        run: uv run --locked pytest -q -rs -o ws_tier_budget_core="$CORE_BUDGET"
       # bash 3.2 on macOS and bash 5 on Linux both have to read it; --dry-run changes nothing on the runner
       - name: install.sh --help and --dry-run
         run: |

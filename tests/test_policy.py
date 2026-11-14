@@ -685,6 +685,7 @@ FORCING = [
     f"{GIT} push --mirror",
     f"{GIT} push origin :feature",
     f"{GIT} push --delete origin feature",
+    f"{GIT} push --prune origin main",
     f"cd sub && {GIT} -C .. push -f",
 ]
 
@@ -702,6 +703,8 @@ def test_a_forcing_push_is_caught_however_it_is_spelled(pol, cmd):
         (f"{GIT} push origin :scratch", "deleting a remote branch or tag"),
         (f"{GIT} push --mirror", "`--mirror`"),
         (f"{GIT} push origin +main", "this spelling forces the push"),
+        (f"{GIT} push --prune origin refs/heads/*:refs/heads/*", "`--prune` deletes"),
+        (f"{GIT} push origin :", "a bare `:`"),
     ],
 )
 def test_a_refused_destroying_push_names_what_it_does(pol, cmd, named):
@@ -1185,7 +1188,6 @@ PROBE_ALLOWED = [
     "GIT PUSH -v origin feat",
     "GIT PUSH origin v1.0",
     'GIT commit -m "fix: avoid +x" && GIT PUSH',
-    "GIT PUSH --prune origin",
     "GIT PUSH --all",
     "GIT PUSH origin 'refs/heads/*:refs/heads/*'",
     "GIT PUSH --push-option=x origin feat",

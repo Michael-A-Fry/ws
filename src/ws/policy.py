@@ -1442,14 +1442,15 @@ def git_split(toks: list[str]) -> tuple[list[str], list[str]]:
 
 def _git_normal(toks: list[str]) -> list[str]:
     """Drop git's global options (`-C dir`, `-c k=v`, `--git-dir=...`) so the subcommand is where a rule expects it;
-    spell any forcing or destroying push (`-f`, `-uf`, `+refspec`, `:ref`, `--mirror`, `--delete`) as `--force`."""
+    spell any forcing or destroying push (`-f`, `-uf`, `+refspec`, `:ref`, `--mirror`, `--delete`, `--prune`) as
+    `--force`."""
     toks = git_split(toks)[1]
     forcing = len(toks) > 1 and toks[1] == "push" and "--force" not in toks
     if forcing and any(
         re.fullmatch(r"-[A-Za-z]*f[A-Za-z]*", t)
         or t.startswith(("+", ":"))
         or ":+" in t
-        or t in ("--mirror", "--delete", "-d")
+        or t in ("--mirror", "--delete", "-d", "--prune")
         for t in toks[2:]
     ):
         toks.append("--force")
@@ -1468,6 +1469,13 @@ def _destroying_push_note(line: str) -> str:
             ": deleting a remote branch or tag counts as a destroying push, as `--force` does; delete it from a terminal "
             "of your own"
         )
+    if "--prune" in words:
+        return (
+            ": `--prune` deletes the remote branches that have no local twin, so it counts as a destroying push, as "
+            "`--force` does"
+        )
+    if ":" in words:
+        return ": a bare `:` pushes every branch the remote also has, so it counts as a destroying push, as `--force` does"
     if "--mirror" in words:
         return ": `--mirror` can delete or overwrite remote refs, so it counts as a destroying push, as `--force` does"
     if any(t.startswith("+") or ":+" in t or re.fullmatch(r"-[A-Za-z]*f[A-Za-z]*", t) for t in words):

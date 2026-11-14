@@ -53,6 +53,7 @@ import argparse
 import json
 import os
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
@@ -61,6 +62,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import NamedTuple
 
 from ws import __version__, agentsession, approvals, install, output, paths, selfcmd, userconfig
 from ws.output import WsError
@@ -214,24 +216,65 @@ def fetch_installer(dest: Path) -> Path:
     return path
 
 
-def _run(argv: list[str], capture: bool, timeout: float | None = None) -> int:
+class Ran(NamedTuple):
+    """How one step ended: its exit code, and whether the watchdog stopped it (then `code` is EXIT_TIMEOUT)."""
+
+    code: int
+    timed_out: bool = False
+
+
+def _signal_group(p: subprocess.Popen, hard: bool) -> None:
+    """TERM (or KILL) the step's whole process group, so a child it started dies with it; a plain terminate where
+    there are no process groups."""
+    killpg = getattr(os, "killpg", None)
+    try:
+        if killpg is None:
+            p.kill() if hard else p.terminate()
+        else:
+            killpg(p.pid, signal.SIGKILL if hard else signal.SIGTERM)
+    except OSError:  # the group is already gone
+        pass
+
+
+def _stop(p: subprocess.Popen) -> None:
+    """Stop a step and everything it started: TERM, then KILL, each with a bounded wait. A process that left the group
+    and still holds the pipe cannot hang this: the pipes are closed and the step is left to the kernel."""
+    for hard in (False, True):
+        _signal_group(p, hard)
+        try:
+            p.communicate(timeout=10)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+    for f in (p.stdout, p.stderr):
+        if f is not None:
+            f.close()
+    try:
+        p.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _run(argv: list[str], capture: bool, timeout: float | None = None) -> Ran:
     """Run a command with the person's terminal (stdout and stderr captured and passed to stderr under `--json`). A run
-    that is still going after `timeout` seconds is stopped and EXIT_TIMEOUT returned: the watchdog of one step."""
+    that is still going after `timeout` seconds is stopped with every process it started: the watchdog of one step."""
     kw = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE, "text": True} if capture else {}
-    p = subprocess.Popen(argv, **kw)
+    p = subprocess.Popen(argv, start_new_session=True, **kw)  # its own group, so the watchdog can stop all of it
     try:
         out, err = p.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        p.terminate()
-        try:
-            p.communicate(timeout=10)
-        except subprocess.TimeoutExpired:
-            p.kill()
-            p.communicate()
-        return EXIT_TIMEOUT
+        _stop(p)
+        return Ran(EXIT_TIMEOUT, timed_out=True)
+    except BaseException:  # Ctrl-C reaches ws, not the step's own session: stop the step too
+        _stop(p)
+        raise
     if capture:
         sys.stderr.write((out or "") + (err or ""))
-    return p.returncode
+    return Ran(p.returncode)
+
+
+def _step_limit(args: argparse.Namespace) -> float:
+    return getattr(args, "step_timeout", None) or STEP_TIMEOUT_S
 
 
 def _installer_argv(script: Path, args: argparse.Namespace) -> list[str]:
@@ -248,8 +291,8 @@ def _hooks_argv() -> list[str]:
     return [*selfcmd.argv(), "upgrade", "--hooks-only"]
 
 
-def swap(args: argparse.Namespace, scratch: Path) -> int:
-    """Run the installer under its watchdog. Returns its exit code (EXIT_TIMEOUT when it was stopped)."""
+def swap(args: argparse.Namespace, scratch: Path) -> Ran:
+    """Run the installer under its watchdog."""
     script = Path(args.installer).expanduser() if args.installer else fetch_installer(scratch)
     if not script.is_file():
         raise WsError("failed", f"{script} is not a file", "pass --installer with a copy of install.sh")
@@ -297,7 +340,7 @@ def previous_release(env: Mapping[str, str]) -> str | None:
     for d in reversed(history(env)):
         if d.get("verb") == "promote":
             return d.get("from")
-        if d.get("verb") in ("rollback", "auto-rollback"):
+        if d.get("verb") in ("rollback", "auto-rollback") and d.get("to"):  # one that failed put nothing back
             return None
     return None
 
@@ -316,15 +359,15 @@ def _tag(version: str) -> str:
     return version if version.startswith("v") else f"v{version}"
 
 
-def reinstall(args: argparse.Namespace, version: str) -> int:
-    """Install `version` and rewrite the hooks for it: the way back. 0 when both steps worked."""
+def reinstall(args: argparse.Namespace, version: str) -> Ran:
+    """Install `version` and rewrite the hooks for it: the way back. Code 0 when both steps worked."""
     ns = argparse.Namespace(**{**vars(args), "version": _tag(version), "channel": None})
     with tempfile.TemporaryDirectory(prefix="ws-rollback-") as scratch:
         os.chmod(scratch, 0o700)
-        code = swap(ns, Path(scratch))
-    if code != 0:
-        return code or EXIT_FAILED
-    return _run(_hooks_argv(), args.json, STEP_TIMEOUT_S)
+        ran = swap(ns, Path(scratch))
+    if ran.code != 0:
+        return ran
+    return _run(_hooks_argv(), args.json, _step_limit(args))
 
 
 # ---- the command ------------------------------------------------------------------------------------------------------------
@@ -395,16 +438,18 @@ def _both(args: argparse.Namespace, env: Mapping[str, str]) -> int:
         )
     with tempfile.TemporaryDirectory(prefix="ws-upgrade-") as scratch:
         os.chmod(scratch, 0o700)
-        code = swap(args, Path(scratch))
-    if code == EXIT_TIMEOUT:
+        ran = swap(args, Path(scratch))
+    if ran.timed_out:
         return _auto_rollback(args, env, before, "the installer ran past its time limit")
+    code = ran.code
     if code != 0:
         _say(args, f"the installer failed (exit {code}); you still have ws {before} and its hooks, unchanged")
         return code or EXIT_FAILED
     _say(args, "installed; now rewriting the hooks with the new ws")
-    code = _run(_hooks_argv(), args.json, STEP_TIMEOUT_S)
-    if code == EXIT_TIMEOUT:
+    ran = _run(_hooks_argv(), args.json, _step_limit(args))
+    if ran.timed_out:
         return _auto_rollback(args, env, before, "the hooks rewrite ran past its time limit")
+    code = ran.code
     if code == EXIT_NOT_RESTORED:
         _say(
             args,
@@ -424,12 +469,12 @@ def _both(args: argparse.Namespace, env: Mapping[str, str]) -> int:
     if check:
         _say(args, f"checking the new release: {check}")
         try:
-            code = _run(shlex.split(check), args.json, getattr(args, "step_timeout", None) or STEP_TIMEOUT_S)
+            ran = _run(shlex.split(check), args.json, _step_limit(args))
         except (OSError, ValueError) as e:
-            code = EXIT_FAILED
+            ran = Ran(EXIT_FAILED)
             _say(args, f"the check could not start ({type(e).__name__})")
-        if code != 0:
-            why = "the check ran past its time limit" if code == EXIT_TIMEOUT else f"the check failed (exit {code})"
+        if ran.code != 0:
+            why = "the check ran past its time limit" if ran.timed_out else f"the check failed (exit {ran.code})"
             return _auto_rollback(args, env, before, why)
     record(env, "promote", before, _installed_version())
     if args.json:
@@ -442,7 +487,7 @@ def _both(args: argparse.Namespace, env: Mapping[str, str]) -> int:
 def _auto_rollback(args: argparse.Namespace, env: Mapping[str, str], before: str, why: str) -> int:
     """A cut-over step went wrong after the swap began: put `before` back at once."""
     _say(args, f"{why}; going back to ws {before}")
-    code = reinstall(args, before)
+    code = reinstall(args, before).code
     record(env, "auto-rollback", before, before if code == 0 else None)
     if code != 0:
         _say(
@@ -472,13 +517,14 @@ def _rollback(args: argparse.Namespace, env: Mapping[str, str]) -> int:
             "install ws with install.sh first",
             EXIT_REFUSED,
         )
-    code = reinstall(args, target)
-    if code != 0:
+    ran = reinstall(args, target)
+    if ran.code != 0:
         record(env, "rollback", before, None)
         _say(
-            args, f"the rollback to {target} failed (exit {code}); ws and the hooks are as they were or as named above"
+            args,
+            f"the rollback to {target} failed (exit {ran.code}); ws and the hooks are as they were or as named above",
         )
-        return EXIT_FAILED if code == EXIT_TIMEOUT else code
+        return EXIT_FAILED if ran.timed_out else ran.code
     record(env, "rollback", before, target)
     if args.json:
         output.result({"from": before, "to": target, "binary": "swapped", "hooks": "rewritten"})

@@ -434,7 +434,7 @@ def test_files_that_could_not_be_put_back_are_named_and_the_exit_is_not_zero(old
 def test_a_failed_rewrite_after_the_swap_with_files_not_put_back_does_not_say_they_were(
     swapped, old, capsys, monkeypatch
 ):
-    monkeypatch.setattr(upgrade, "_run", lambda argv, capture, timeout=None: 4)
+    monkeypatch.setattr(upgrade, "_run", lambda argv, capture, timeout=None: upgrade.Ran(4))
     assert cli.main(["upgrade"]) == 4
     out = capsys.readouterr().out
     assert "not put back" in out and "still work" not in out
@@ -456,11 +456,11 @@ def swapped(old, monkeypatch):
     """The installer and the new binary's rewrite are stand-ins; the rewrite is the real one, run in this process."""
     calls: list[list[str]] = []
     monkeypatch.setattr(selfcmd, "unstable", lambda cmd=None: None)
-    monkeypatch.setattr(upgrade, "swap", lambda args, scratch: calls.append(["swap"]) or 0)
+    monkeypatch.setattr(upgrade, "swap", lambda args, scratch: calls.append(["swap"]) or upgrade.Ran(0))
 
     def run(argv, capture, timeout=None):
         calls.append(["hooks"])
-        return cli.main(argv[len(selfcmd.argv()) :])
+        return upgrade.Ran(cli.main(argv[len(selfcmd.argv()) :]))
 
     monkeypatch.setattr(upgrade, "_run", run)
     return calls
@@ -474,7 +474,7 @@ def test_upgrade_swaps_then_rewrites(swapped, old, capsys):
 
 
 def test_a_failed_installer_leaves_the_old_binary_and_the_old_hooks(swapped, old, capsys, monkeypatch):
-    monkeypatch.setattr(upgrade, "swap", lambda args, scratch: 7)
+    monkeypatch.setattr(upgrade, "swap", lambda args, scratch: upgrade.Ran(7))
     before = (settings_file(old).read_bytes(), manifest_bytes(old))
     assert cli.main(["upgrade"]) == 7
     assert "unchanged" in capsys.readouterr().out
@@ -484,7 +484,7 @@ def test_a_failed_installer_leaves_the_old_binary_and_the_old_hooks(swapped, old
 
 
 def test_a_failed_rewrite_after_the_swap_says_which_pair_the_person_has(swapped, old, capsys, monkeypatch):
-    monkeypatch.setattr(upgrade, "_run", lambda argv, capture, timeout=None: 1)
+    monkeypatch.setattr(upgrade, "_run", lambda argv, capture, timeout=None: upgrade.Ran(1))
     before = (settings_file(old).read_bytes(), manifest_bytes(old))
     assert cli.main(["upgrade"]) == 1
     out = capsys.readouterr().out
@@ -821,7 +821,7 @@ def test_a_failing_health_check_rolls_the_swap_back(cutover, old, capsys, monkey
 
     def run(argv, capture, timeout=None):
         seen.append(argv)
-        return 1 if argv[0] == "healthprobe" else cli.main(argv[len(selfcmd.argv()) :])
+        return upgrade.Ran(1 if argv[0] == "healthprobe" else cli.main(argv[len(selfcmd.argv()) :]))
 
     monkeypatch.setattr(upgrade, "_run", run)
     assert cli.main(["upgrade", "--check", "healthprobe --now"]) == 1
@@ -833,7 +833,7 @@ def test_a_failing_health_check_rolls_the_swap_back(cutover, old, capsys, monkey
 
 
 def test_a_passing_health_check_keeps_the_swap(cutover, old, monkeypatch):
-    monkeypatch.setattr(upgrade, "_run", lambda argv, capture, timeout=None: 0)
+    monkeypatch.setattr(upgrade, "_run", lambda argv, capture, timeout=None: upgrade.Ran(0))
     assert cli.main(["upgrade", "--check", "healthprobe"]) == 0
     assert cutover == [None] and _history()[0][0] == "promote"
 
@@ -843,7 +843,9 @@ def test_a_hooks_step_that_runs_past_its_limit_rolls_back(cutover, old, capsys, 
 
     def run(argv, capture, timeout=None):
         calls.append(argv[-1])
-        return upgrade.EXIT_TIMEOUT if len(calls) == 1 else 0  # the first hooks rewrite hangs; the way back works
+        return (
+            upgrade.Ran(upgrade.EXIT_TIMEOUT, True) if len(calls) == 1 else upgrade.Ran(0)
+        )  # the first hooks rewrite hangs; the way back works
 
     monkeypatch.setattr(upgrade, "_run", run)
     assert cli.main(["upgrade"]) == 1
@@ -852,20 +854,22 @@ def test_a_hooks_step_that_runs_past_its_limit_rolls_back(cutover, old, capsys, 
 
 
 def test_an_installer_past_its_limit_rolls_back_but_one_that_fails_does_not(cutover, old, capsys, monkeypatch):
-    codes = iter([upgrade.EXIT_TIMEOUT, 0])
+    codes = iter([upgrade.Ran(upgrade.EXIT_TIMEOUT, True), upgrade.Ran(0)])
     monkeypatch.setattr(upgrade, "swap", lambda args, scratch: cutover.append(args.version) or next(codes))
-    monkeypatch.setattr(upgrade, "_run", lambda argv, capture, timeout=None: 0)
+    monkeypatch.setattr(upgrade, "_run", lambda argv, capture, timeout=None: upgrade.Ran(0))
     assert cli.main(["upgrade"]) == 1
     assert cutover == [None, f"v{__version__}"] and _history()[0][0] == "auto-rollback"
     cutover.clear()
-    monkeypatch.setattr(upgrade, "swap", lambda args, scratch: cutover.append(args.version) or 7)
+    monkeypatch.setattr(upgrade, "swap", lambda args, scratch: cutover.append(args.version) or upgrade.Ran(7))
     assert cli.main(["upgrade"]) == 7
     assert cutover == [None] and len(_history()) == 1  # a plain failure changed nothing: no rollback, no record
 
 
 def test_a_rollback_that_fails_says_how_to_finish_by_hand(cutover, old, capsys, monkeypatch):
-    monkeypatch.setattr(upgrade, "_run", lambda argv, capture, timeout=None: 1 if argv[0] == "healthprobe" else 0)
-    codes = iter([0, 5])
+    monkeypatch.setattr(
+        upgrade, "_run", lambda argv, capture, timeout=None: upgrade.Ran(1 if argv[0] == "healthprobe" else 0)
+    )
+    codes = iter([upgrade.Ran(0), upgrade.Ran(5)])
     monkeypatch.setattr(upgrade, "swap", lambda args, scratch: next(codes))
     assert cli.main(["upgrade", "--check", "healthprobe"]) == upgrade.EXIT_NOT_RESTORED
     assert "going back failed" in capsys.readouterr().out
@@ -876,19 +880,93 @@ def test_the_watchdog_stops_a_step_that_hangs():
     import time
 
     t = time.monotonic()
-    assert upgrade._run([sys.executable, "-c", "import time; time.sleep(60)"], False, timeout=1) == upgrade.EXIT_TIMEOUT
+    assert upgrade._run([sys.executable, "-c", "import time; time.sleep(60)"], False, timeout=1) == (
+        upgrade.EXIT_TIMEOUT,
+        True,
+    )
     assert time.monotonic() - t < 20
-    assert upgrade._run([sys.executable, "-c", "raise SystemExit(3)"], False, timeout=30) == 3
+    assert upgrade._run([sys.executable, "-c", "raise SystemExit(3)"], False, timeout=30) == (3, False)
+    assert upgrade._run([sys.executable, "-c", "raise SystemExit(124)"], False, timeout=30) == (124, False)
 
 
 def test_the_installer_gets_its_own_longer_limit(tmp_path, monkeypatch):
     import argparse
 
     got = []
-    monkeypatch.setattr(upgrade, "_run", lambda argv, capture, timeout=None: got.append(timeout) or 0)
+    monkeypatch.setattr(upgrade, "_run", lambda argv, capture, timeout=None: got.append(timeout) or upgrade.Ran(0))
     installer = tmp_path / "install.sh"
     installer.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
     ns = argparse.Namespace(installer=str(installer), version=None, channel=None, json=False)
     upgrade.swap(ns, tmp_path)
     upgrade.swap(argparse.Namespace(**{**vars(ns), "install_timeout": 5.0}), tmp_path)
     assert got == [upgrade.INSTALL_TIMEOUT_S, 5.0]
+
+
+_SPAWNS = """
+import subprocess, sys, time
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+open(sys.argv[1], "w").write(str(child.pid))
+time.sleep(120)
+"""
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    try:  # a zombie (killed, not yet reaped by init) counts as gone
+        return open(f"/proc/{pid}/stat").read().split(") ")[1][0] != "Z"
+    except OSError:
+        return True
+
+
+@pytest.mark.skipif(not hasattr(os, "killpg"), reason="process groups are POSIX")
+@pytest.mark.parametrize("capture", [False, True])
+def test_the_watchdog_stops_what_the_step_started_too(tmp_path, capture):
+    """A step whose child holds the pipe (`--json` captures it) would keep communicate() waiting: the whole group goes."""
+    import sys
+    import time
+
+    pidfile = tmp_path / "child.pid"
+    t = time.monotonic()
+    ran = upgrade._run([sys.executable, "-c", _SPAWNS, str(pidfile)], capture, timeout=2)
+    assert ran.timed_out and ran.code == upgrade.EXIT_TIMEOUT
+    assert time.monotonic() - t < 30
+    child = int(pidfile.read_text())
+    for _ in range(50):
+        if not _alive(child):
+            break
+        time.sleep(0.1)
+    assert not _alive(child)
+
+
+def test_a_step_that_exits_124_itself_is_a_failure_not_a_timeout(cutover, old, capsys, monkeypatch):
+    monkeypatch.setattr(upgrade, "_run", lambda argv, capture, timeout=None: upgrade.Ran(124))
+    assert cli.main(["upgrade"]) == upgrade.EXIT_FAILED
+    assert cutover == [None] and _history() == []  # no rollback: it was not stopped
+    assert "ran past its time limit" not in capsys.readouterr().out
+
+
+def test_the_hooks_step_and_the_way_back_take_the_step_timeout(cutover, old, monkeypatch):
+    got = []
+
+    def run(argv, capture, timeout=None):
+        got.append((argv[0], timeout))
+        return upgrade.Ran(1 if argv[0] == "healthprobe" else 0)
+
+    monkeypatch.setattr(upgrade, "_run", run)
+    assert cli.main(["upgrade", "--step-timeout", "7", "--check", "healthprobe"]) == 1
+    assert [t for _, t in got] == [7.0, 7.0, 7.0]  # the hooks rewrite, the check, the rewrite on the way back
+    got.clear()
+    monkeypatch.setattr(upgrade, "_run", lambda argv, capture, timeout=None: got.append(timeout) or upgrade.Ran(0))
+    assert cli.main(["upgrade"]) == 0
+    assert got == [upgrade.STEP_TIMEOUT_S]
+
+
+def test_a_failed_rollback_does_not_hide_the_release_to_go_back_to(old):
+    upgrade.record(os.environ, "promote", "1.0.0", "2.0.0")
+    upgrade.record(os.environ, "rollback", "2.0.0", None)  # it failed: nothing was put back
+    assert upgrade.previous_release(os.environ) == "1.0.0"
+    upgrade.record(os.environ, "rollback", "2.0.0", "1.0.0")
+    assert upgrade.previous_release(os.environ) is None

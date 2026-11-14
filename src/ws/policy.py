@@ -314,6 +314,7 @@ class Class:
     owner: str = ""
     review_date: date | None = None
     repo_settings: tuple[RepoSettings, ...] = ()
+    terms: tuple[str, ...] = ()  # words that name the class's content: a prompt to a hosted model may not carry them
 
     def readable_by_class(self, reader: str) -> bool:
         """May a session of class `reader` read this class's content?"""
@@ -871,6 +872,7 @@ def _classes(raw) -> dict[str, Class]:
                 "owner",
                 "review_date",
                 "repo_settings",
+                "terms",
             },
         )
         if "access" not in body:
@@ -908,6 +910,10 @@ def _classes(raw) -> dict[str, Class]:
         review = body.get("review_date")
         if "review_date" in body and type(review) is not date:
             raise PolicyError(f"{where}review_date must be a TOML date such as 2027-03-01, not {review!r}")
+        terms = _strings(body, "terms", where)
+        for t in terms:
+            if len(t.strip()) < 3 or t != t.strip():
+                raise PolicyError(f"{where}terms: each term is at least 3 characters with no space at either end")
         narrowing = parse_repo_settings(body.get("repo_settings"), repos, where)
         if narrowing and os_user is None:
             raise PolicyError(
@@ -929,6 +935,7 @@ def _classes(raw) -> dict[str, Class]:
             owner.strip(),
             review,
             narrowing,
+            terms,
         )
     for c in out.values():
         for r in c.readable_by:
@@ -1094,6 +1101,39 @@ def _class_patterns(repos: tuple[str, ...]) -> list[tuple[re.Pattern, int]]:
         if root and expanded.startswith(root) and (real := os.path.realpath(root)) != root:
             out.append((_glob_regex_path(real + expanded[len(root) :]), len(real)))
     return out
+
+
+# The start of the value `ws walls` plants in a class to prove it stays there (its tracer); one more term no prompt to a
+# hosted model may carry.
+CANARY_PREFIX = "ws-walls-tracer-"
+
+
+def _has_term(text: str, term: str) -> bool:
+    """Is `term` in `text` as a whole term (caseless; a letter or digit on either side is a different word)?"""
+    return re.search(rf"(?<!\w){re.escape(term.casefold())}(?!\w)", text) is not None
+
+
+def term_problem(pol: Policy, own: Class | None, text: str) -> str | None:
+    """Why a prompt bound for a hosted model may not leave, or None: it carries a canary token, or a `terms` entry of a
+    class that is not `full` and is not the session's own class. The words name the class, never the term."""
+    low = text.casefold()
+    if CANARY_PREFIX in low:
+        return "the prompt carries a canary token planted in a walled class"
+    for name, cls in sorted(pol.classes.items()):
+        if cls.access == "full" or (own is not None and own.name == name):
+            continue
+        if any(_has_term(low, t) for t in cls.terms):
+            return f"the prompt carries a term of class {name!r}"
+    return None
+
+
+# The second net: word pairs that look like a person's name (two capitalised words). It reports and refuses nothing.
+_NAME_LIKE = re.compile(r"\b[A-Z][a-z]{1,30}(?:[ '-][A-Z][a-z]{1,30})+\b")
+
+
+def name_spots(text: str) -> list[str]:
+    """The name-like word pairs in `text`, in order, once each: a second net beside `terms`, for a report only."""
+    return list(dict.fromkeys(m.group(0) for m in _NAME_LIKE.finditer(text)))
 
 
 def class_of(pol: Policy, path) -> Class | None:

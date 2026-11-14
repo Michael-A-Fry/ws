@@ -19,6 +19,9 @@ body of the GitHub release.
   when a setting the wall writes is missing. It lists the items its cases cover.
 - `ws walls check` has four more cases: the launch file's write block and token deny, Remote Control and connectors
   off, a headless job's writes held in the class, and a `local_only` class held to a local model.
+- `terms` under `[classes.NAME]`: `ws run` refuses a job whose prompt carries one of a walled class's terms (or a
+  canary token) when its model is hosted and the job isn't in that class, with one `refused:term` record that names the
+  class and not the term. A second net counts name-like word pairs on stderr and refuses nothing.
 - `ws doctor` warns (WS020) when the policy names no data class. The guards reference says which guards are off by
   default and why.
 

@@ -509,7 +509,7 @@ def _case_file_safe(ctx: Ctx) -> Outcome:
 
 PROBE_OTHER = "ws-walls-other"  # a session id no class lists
 PROBE_REMOTE = "push.example.invalid"  # a git remote no class lists: a push to it is a connection to this host
-PROBE_BODY = "ws-walls-tracer-"  # the start of the value planted at run time, which has a random tail
+PROBE_BODY = policy.CANARY_PREFIX  # the start of the value planted at run time, which has a random tail
 FIXED_KINDS = (
     "ack",
     "done",

@@ -460,6 +460,23 @@ def _egress(pol: policy.Policy, job: jobs.Job):
     return plan, None
 
 
+def _term_leak(pol: policy.Policy, job: jobs.Job) -> str | None:
+    """rr-r4-68: a job's prompt bound for a hosted model may not carry a walled class's term or a canary token
+    (`policy.term_problem`, words that name the class only). A model on this machine gets the prompt as it is. The second
+    net (`policy.name_spots`) is counted on stderr, never refused and never written down."""
+    from ws import sandbox  # late: only a policy with classes needs it
+
+    if not pol.classes or sandbox.job_provider(job.runner, job.model, job.runner_options) in sandbox.LOCAL_PROVIDERS:
+        return None
+    why = policy.term_problem(pol, _job_class(pol, job), job.prompt or "")
+    if why is None and (n := len(policy.name_spots(job.prompt or ""))):
+        print(
+            f"ws: note: the prompt has {n} name-like word pair(s); `terms` under [classes] refuses the ones you name",
+            file=sys.stderr,
+        )
+    return why
+
+
 def _refusal(prof: dict, verdict: policy.Verdict, job: jobs.Job, adapter) -> tuple[str, str] | None:
     """(counter, reason) for the refusals that need no look at the money: no cap set, the Rule of Two, a model the runner
     cannot price. What the cap and the purpose cap say is admission's (`queue.Ledger.admit`)."""
@@ -725,6 +742,9 @@ def _run(
     egress, why_not = _egress(pol, job)
     if static is None and why_not:
         static = ("egress", why_not)
+    if static is None:
+        leaks = _term_leak(pol, job)
+        static = ("term", leaks) if leaks else None
     if static is None:
         walled = _wall_problem(pol, job, adapter, cwd)
         static = ("wall", walled) if walled else None

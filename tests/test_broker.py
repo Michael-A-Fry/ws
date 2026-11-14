@@ -20,6 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
+from helpers.stub_secrets import StubSecrets
 
 from ws import broker
 from ws import secrets as wsecrets
@@ -881,3 +882,394 @@ def test_a_connection_with_no_room_does_not_hold_up_the_accept_loop(base, stub, 
         silent.close()
     finally:
         e.broker.stop()
+
+
+# ---------------------------------------------------------------- run records, tiers, areas and the kill switch
+
+
+class Scoped:
+    """A broker with a run record folder and a kill switch, over stub secrets."""
+
+    def __init__(self, base: Path, stub: Stub):
+        self.stub, self.s = stub, StubSecrets(base)
+        self.host = stub.host
+        self.log = base / "logs" / "broker.jsonl"
+        self.sock = base / "run" / "b.sock"
+        self.s.register("open", [self.host])  # unscoped: the older rule
+        self.s.register("work", [self.host], tier="worker", area="home")
+        self.s.register("leadkey", [self.host], tier="lead", area="home")
+        self.s.register("rootish", [self.host], tier="lead-elevated", area="home")
+        self.s.register("walledkey", [self.host], tier="walled", area="fiu")
+        self.s.register("otherarea", [self.host], tier="worker", area="money")
+        self.broker: broker.Broker | None = None
+
+    def start(self, **kw) -> broker.Broker:
+        self.broker = broker.Broker(
+            self.sock,
+            self.s.registry,
+            self.s.store,
+            log_path=self.log,
+            allow_plain_http=True,
+            records=self.s.records,
+            elevate_file=self.s.elevate_file,
+            **kw,
+        ).start()
+        return self.broker
+
+    def lease(self, name: str, run: str | None = None, **extra) -> broker.Lease:
+        if extra:  # a hand-made request, to plant claims the client function never sends
+            reply = broker._client_call(
+                {"op": "request", "name": name, "purpose": "run", "host": self.host, "run": run, **extra}, self.sock
+            )
+            r = reply["lease"]
+            return broker.Lease(r["lease"], r["base_url"], r["header"], r["expires_at"])
+        return broker.request(name, "run", self.host, socket=self.sock, run=run)
+
+    def get(self, lease: broker.Lease) -> int:
+        hostport, _, prefix = lease.base_url.removeprefix("http://").partition("/")
+        c = http.client.HTTPConnection(hostport, timeout=10)
+        c.request("GET", "/" + prefix + "/v1/x")
+        r = c.getresponse()
+        r.read()
+        c.close()
+        return r.status
+
+    def audit(self) -> list[dict]:
+        return [json.loads(x) for x in self.log.read_text().splitlines()] if self.log.exists() else []
+
+    def raw_log(self) -> str:
+        return self.log.read_text() if self.log.exists() else ""
+
+    def wait_for(self, status: str, within: float = 5.0) -> bool:
+        end = time.monotonic() + within
+        while time.monotonic() < end:
+            if any(a["status"] == status for a in self.audit()):
+                return True
+            time.sleep(0.02)
+        return False
+
+
+@pytest.fixture
+def scoped(base, stub):
+    sc = Scoped(base, stub)
+    sc.start()
+    yield sc
+    sc.broker.stop()
+
+
+def test_tier_a_name_outside_the_run_records_tier_is_refused_with_one_audit_line_and_no_value(scoped):
+    scoped.s.record("r-worker", "home", "worker", ["work", "leadkey"])
+    before = len(scoped.audit())
+    e = refusal(scoped.lease, "leadkey", run="r-worker")
+    assert e.code == "tier_refused"
+    lines = scoped.audit()[before:]
+    assert len(lines) == 1, lines
+    assert lines[0]["status"] == "tier_refused" and lines[0]["name"] == "leadkey"
+    assert lines[0]["run"] == "r-worker" and lines[0]["tier"] == "worker" and lines[0]["area"] == "home"
+    assert scoped.s.leaked(scoped.raw_log() + str(e)) == []
+    assert scoped.get(scoped.lease("work", run="r-worker")) == 200  # the name its tier reaches is fine
+
+
+def test_tier_reach_lead_reaches_worker_and_walled_reaches_only_walled(scoped):
+    scoped.s.record("r-lead", "home", "lead", ["work", "leadkey", "rootish"])
+    assert scoped.get(scoped.lease("work", run="r-lead")) == 200
+    assert scoped.get(scoped.lease("leadkey", run="r-lead")) == 200
+    assert refusal(scoped.lease, "rootish", run="r-lead").code == "tier_refused"
+    scoped.s.record("r-wall", "fiu", "walled", ["walledkey", "open"])
+    assert scoped.get(scoped.lease("walledkey", run="r-wall")) == 200
+    assert refusal(scoped.lease, "open", run="r-wall").code == "tier_refused", "an unscoped name is worker tier"
+    scoped.s.record("r-up", "fiu", "lead-elevated", ["walledkey"])
+    assert refusal(scoped.lease, "walledkey", run="r-up").code == "tier_refused", "nothing reaches into walled"
+
+
+def test_tier_a_forged_request_claim_is_refused(scoped):
+    scoped.s.record("r-worker", "home", "worker", ["work", "leadkey"])
+    e = refusal(scoped.lease, "leadkey", run="r-worker", tier="lead")
+    assert e.code == "claim_refused"
+    assert refusal(scoped.lease, "work", run="r-worker", area="money").code == "claim_refused"
+    assert refusal(scoped.lease, "open", run=None, tier="lead").code == "claim_refused"
+    assert scoped.get(scoped.lease("work", run="r-worker", tier="worker", area="home")) == 200, "a true claim is fine"
+    assert [a["status"] for a in scoped.audit()].count("claim_refused") == 3
+
+
+def test_run_record_an_undeclared_name_with_a_valid_run_is_refused(scoped):
+    scoped.s.record("r1", "home", "lead", ["work"])
+    assert refusal(scoped.lease, "leadkey", run="r1").code == "not_declared"
+    assert refusal(scoped.lease, "open", run="r1").code == "not_declared", "an unscoped name too, once a run is named"
+
+
+def test_run_record_no_run_id_is_refused_for_a_scoped_name_and_with_require_run(scoped, base, stub):
+    assert refusal(scoped.lease, "work").code == "run_required"
+    assert scoped.lease("open").header == "x-api-key", "unscoped names keep the older rule by default"
+    scoped.broker.stop()
+    scoped.start(require_run=True)
+    assert refusal(scoped.lease, "open").code == "run_required"
+    assert scoped.broker._op_status()["require_run"] is True
+
+
+def test_run_record_area_b_asking_for_area_a_is_refused_with_one_line(scoped):
+    scoped.s.record("r-b", "home", "worker", ["otherarea"])
+    before = len(scoped.audit())
+    assert refusal(scoped.lease, "otherarea", run="r-b").code == "area_refused"
+    lines = scoped.audit()[before:]
+    assert [x["status"] for x in lines] == ["area_refused"]
+
+
+def test_run_record_unknown_loose_symlinked_or_wrong_records_are_refused(scoped):
+    assert refusal(scoped.lease, "work", run="nosuch").code == "run_refused"
+    assert refusal(scoped.lease, "work", run="../escape").code == "run_refused"
+    scoped.s.record("loose", "home", "worker", ["work"])
+    (scoped.s.records / "loose").chmod(0o644)
+    assert "untrusted" in refusal(scoped.lease, "work", run="loose").reason
+    scoped.s.record("real", "home", "lead", ["leadkey"])
+    (scoped.s.records / "link").symlink_to(scoped.s.records / "real")
+    assert refusal(scoped.lease, "leadkey", run="link").code == "run_refused"
+    (scoped.s.records / "other").write_text(
+        json.dumps({"v": 1, "run": "real", "area": "home", "tier": "lead", "names": []})
+    )
+    (scoped.s.records / "other").chmod(0o600)
+    assert "another run" in refusal(scoped.lease, "leadkey", run="other").reason
+    (scoped.s.records / "extra").write_text(
+        json.dumps({"v": 1, "run": "extra", "area": "home", "tier": "lead", "names": ["leadkey"], "admin": True})
+    )
+    (scoped.s.records / "extra").chmod(0o600)
+    assert refusal(scoped.lease, "leadkey", run="extra").code == "run_refused", "an unknown key is not ignored"
+    scoped.s.record("ok", "home", "worker", ["work"])
+    scoped.s.records.chmod(0o755)
+    try:
+        assert refusal(scoped.lease, "work", run="ok").code == "run_refused", "a loose folder is not trusted"
+    finally:
+        scoped.s.records.chmod(0o700)
+
+
+def test_run_record_the_lease_ends_with_the_run(scoped):
+    scoped.s.record("r1", "home", "worker", ["work"])
+    lease = scoped.lease("work", run="r1")
+    assert scoped.get(lease) == 200
+    assert broker.remove_run_record(scoped.s.records, "r1") is True
+    assert scoped.get(lease) == 403
+    assert scoped.wait_for("run_ended"), "the proxy writes its line after the reply, so wait for it"
+    scoped.s.record("r2", "home", "worker", ["work"], expires_at=time.time() + 30)
+    lease2 = scoped.lease("work", run="r2")
+    assert datetime_from(lease2.expires_at) <= time.time() + 31, "a lease never outlives its run"
+    scoped.s.record("r3", "home", "worker", ["work"], expires_at=time.time() - 1)
+    assert "ended" in refusal(scoped.lease, "work", run="r3").reason
+
+
+def datetime_from(iso: str) -> float:
+    from datetime import datetime
+
+    return datetime.fromisoformat(iso).timestamp()
+
+
+def test_run_record_a_caller_the_record_does_not_name_is_refused(scoped):
+    scoped.s.record("r1", "home", "worker", ["work"], uid=os.geteuid() + 1)
+    assert refusal(scoped.lease, "work", run="r1").code == "caller_refused"
+    scoped.s.record("r2", "home", "worker", ["work"], uid=os.geteuid())
+    assert scoped.get(scoped.lease("work", run="r2")) == 200
+
+
+def test_run_record_a_grant_whose_audit_line_cannot_be_written_is_refused(scoped):
+    scoped.s.record("r1", "home", "worker", ["work"])
+    scoped.log.unlink(missing_ok=True)
+    scoped.log.mkdir(parents=True)  # a folder where the log should be: every write fails
+    e = refusal(scoped.lease, "work", run="r1")
+    assert e.code == "audit_failed"
+    assert scoped.broker._grants == {}
+
+
+def test_elevate_off_refuses_elevated_leases_drops_live_ones_and_revokes(scoped):
+    scoped.s.record("r-el", "home", "lead-elevated", ["rootish", "leadkey"])
+    revoked: list[str] = []
+    scoped.broker.revokers.append(lambda g: revoked.append(g.name) or True)
+    live = scoped.lease("rootish", run="r-el")
+    other = scoped.lease("leadkey", run="r-el")
+    assert scoped.get(live) == 200
+    out = broker.elevate(False, scoped.sock)
+    assert out == {"elevated": False, "saved": True, "dropped": 1, "revoked": 1, "revoke_failed": 0}
+    assert revoked == ["rootish"]
+    assert scoped.get(live) == 403, "the live elevated lease is gone at once"
+    assert scoped.get(other) == 200, "a lead name is not elevated"
+    e = refusal(scoped.lease, "rootish", run="r-el")
+    assert e.code == "elevation_off"
+    assert [a["status"] for a in scoped.audit() if a["op"] in ("elevate", "revoke")] == ["ok", "off"]
+    assert scoped.s.leaked(scoped.raw_log()) == []
+    assert broker.status(scoped.sock)["elevated"] is False
+    assert broker.elevate(True, scoped.sock)["elevated"] is True
+    assert scoped.get(scoped.lease("rootish", run="r-el")) == 200
+
+
+def test_elevate_a_failing_revoker_is_counted_and_the_lease_still_dropped(scoped):
+    scoped.s.record("r-el", "home", "lead-elevated", ["rootish"])
+
+    def boom(g):
+        raise RuntimeError("upstream down")
+
+    scoped.broker.revokers.append(boom)
+    live = scoped.lease("rootish", run="r-el")
+    assert broker.elevate(False, scoped.sock)["revoke_failed"] == 1
+    assert scoped.get(live) == 403
+    assert any(a["op"] == "revoke" and a["status"] == "failed" for a in scoped.audit())
+
+
+def test_elevate_an_unreadable_or_foreign_switch_file_counts_as_off(scoped):
+    scoped.s.record("r-el", "home", "lead-elevated", ["rootish"])
+    scoped.s.elevate_file.write_text("not json")
+    assert refusal(scoped.lease, "rootish", run="r-el").code == "elevation_off"
+    scoped.s.elevate_file.write_text(json.dumps({"elevated": "on"}))
+    scoped.s.elevate_file.chmod(0o666)
+    assert refusal(scoped.lease, "rootish", run="r-el").code == "elevation_off", "a file others can write is off"
+    scoped.s.elevate_file.chmod(0o600)
+    assert scoped.get(scoped.lease("rootish", run="r-el")) == 200
+
+
+def test_elevate_on_is_only_for_the_brokers_own_user(scoped):
+    b = scoped.broker
+    r = b.dispatch(json.dumps({"op": "elevate", "state": "off"}).encode(), b.own_uid + 1, 1)
+    assert r["ok"] is True, "anyone allowed may pull the switch"
+    r = b.dispatch(json.dumps({"op": "elevate", "state": "on"}).encode(), b.own_uid + 1, 1)
+    assert r == {"ok": False, "code": "caller_refused", "reason": "only the broker's own user turns elevation back on"}
+    assert b.elevation_on() is False
+
+
+def test_elevate_cli_with_no_broker_sets_the_file_and_on_is_refused_in_a_session(base, monkeypatch, capsys):
+    from ws import agentsession, cli
+
+    monkeypatch.setenv("WS_HOME", str(base))
+    monkeypatch.setenv("HOME", str(base))
+    monkeypatch.delenv("WS_BROKER_SOCKET", raising=False)
+    ns = cli.build_parser().parse_args(["elevate", "off"])
+    assert broker.cmd_elevate(ns) == 0
+    assert broker.read_elevation(broker.elevate_path(), os.geteuid()) is False
+    assert "no broker running" in capsys.readouterr().out
+    monkeypatch.setenv(agentsession.ENV_MARKER, "1")
+    with pytest.raises(broker.WsError) as e:
+        broker.cmd_elevate(cli.build_parser().parse_args(["elevate", "on"]))
+    assert e.value.exit_code == 3
+    assert broker.cmd_elevate(cli.build_parser().parse_args(["elevate", "off"])) == 0, "off works from a session"
+
+
+def test_run_record_cli_writes_shows_and_removes(base, monkeypatch, capsys):
+    from ws import cli
+
+    monkeypatch.setenv("WS_HOME", str(base))
+    monkeypatch.setenv("HOME", str(base))
+    p = cli.build_parser()
+    argv = ["broker", "run-record", "write", "r9", "--area", "home", "--tier", "worker", "--name", "work"]
+    assert broker.cmd_run_record(p.parse_args([*argv, "--name", "work", "--ttl", "60"])) == 0
+    rec = broker.read_run_record(broker.records_dir(), "r9", os.geteuid())
+    assert rec.names == ("work",) and rec.tier == "worker" and rec.expires_at is not None
+    assert (broker.records_dir() / "r9").stat().st_mode & 0o777 == 0o600
+    assert broker.records_dir().stat().st_mode & 0o777 == 0o700
+    assert broker.cmd_run_record(p.parse_args(["broker", "run-record", "show", "r9"])) == 0
+    assert '"tier": "worker"' in capsys.readouterr().out
+    assert broker.cmd_run_record(p.parse_args(["broker", "run-record", "rm", "r9"])) == 0
+    with pytest.raises(broker.WsError):
+        broker.cmd_run_record(p.parse_args(["broker", "run-record", "show", "r9"]))
+    with pytest.raises(broker.WsError):
+        p.parse_args([*argv[:6], "--tier", "god"])
+
+
+def test_audit_copy_to_a_folder_and_to_an_scp_target(base):
+    log = base / "broker.jsonl"
+    log.write_text('{"op": "request"}\n')
+    dest = base / "offbox"
+    dest.mkdir()
+    assert broker.audit_copy(log, str(dest), "my box") == log.stat().st_size
+    assert (dest / "broker-my-box.jsonl").read_text() == log.read_text()
+    assert (dest / "broker-my-box.jsonl").stat().st_mode & 0o777 == 0o600
+    seen = []
+
+    class Done:
+        returncode = 0
+
+    broker.audit_copy(log, "store.example:logs", "box", run=lambda argv, **k: seen.append(argv) or Done())
+    assert seen[0][:5] == ["scp", "-q", "-B", "-o", "BatchMode=yes"]
+    assert seen[0][-1] == "store.example:logs/broker-box.jsonl"
+    with pytest.raises(broker.WsError):
+        broker.audit_copy(log, str(base / "missing"), "box")
+
+
+# ---------------------------------------------------------------- cold review: the kill switch never fails open
+
+
+def test_elevate_must1_with_no_broker_it_refuses_rather_than_write_a_switch_the_broker_never_reads(base, monkeypatch):
+    from ws import cli
+
+    monkeypatch.setenv("WS_HOME", str(base))
+    monkeypatch.setenv("HOME", str(base))
+    monkeypatch.setenv("WS_BROKER_SOCKET", str(base / "none.sock"))
+    with pytest.raises(broker.WsError) as e:
+        broker.cmd_elevate(cli.build_parser().parse_args(["elevate", "off"]))
+    assert e.value.kind == "unavailable" and "not this user's to write" in e.value.message
+    assert "sudo -u ws-broker" in e.value.hint
+    assert not broker.elevate_path().exists(), "no switch written where the broker would not look"
+    monkeypatch.delenv("WS_BROKER_SOCKET")
+    store = wsecrets.store_dir()
+    store.mkdir(parents=True, mode=0o700)
+    real = os.geteuid
+    monkeypatch.setattr(broker.os, "geteuid", lambda: real() + 1)  # the store now reads as another user's: walled
+    assert "belongs to another user" in broker._not_this_users_broker(None)
+
+
+def test_elevate_must2_a_switch_file_that_cannot_be_written_still_turns_elevation_off(scoped):
+    scoped.s.record("r-el", "home", "lead-elevated", ["rootish"])
+    live = scoped.lease("rootish", run="r-el")
+    scoped.s.elevate_file.mkdir()  # a folder where the file should be: every write fails
+    out = broker.elevate(False, scoped.sock)
+    assert out["saved"] is False and out["dropped"] == 1 and out["elevated"] is False
+    assert scoped.get(live) == 403
+    assert refusal(scoped.lease, "rootish", run="r-el").code == "elevation_off"
+    assert broker.status(scoped.sock)["elevated"] is False
+    assert "off_unsaved" in [a["status"] for a in scoped.audit() if a["op"] == "elevate"]
+    e = refusal(broker.elevate, True, scoped.sock)
+    assert e.code == "store_unreadable", "on needs the file; it stays off"
+    assert scoped.broker.elevation_on() is False
+
+
+def test_elevate_must2_two_writes_at_once_never_share_a_temp_file(base):
+    import concurrent.futures
+
+    f = base / "elevate.json"
+    with concurrent.futures.ThreadPoolExecutor(8) as ex:
+        list(ex.map(lambda i: broker.write_elevation(f, i % 2 == 0), range(64)))
+    assert broker.read_elevation(f, os.geteuid()) in (True, False)
+    assert [p.name for p in base.iterdir()] == ["elevate.json"]
+
+
+def test_elevate_on_refuses_when_its_audit_line_cannot_be_written(scoped):
+    broker.elevate(False, scoped.sock)
+    scoped.log.unlink()
+    scoped.log.mkdir()
+    assert refusal(broker.elevate, True, scoped.sock).code == "audit_failed"
+    assert scoped.broker.elevation_on() is False
+
+
+def test_elevate_a_name_retiered_to_elevated_after_its_lease_is_still_stopped(scoped):
+    scoped.s.record("r-el", "home", "lead-elevated", ["leadkey"])
+    live = scoped.lease("leadkey", run="r-el")
+    text = scoped.s.registry.read_text()
+    marked = f'[leadkey]\nhosts = ["{scoped.host}"]\ntier = "lead"'
+    assert marked in text
+    scoped.s.registry.write_text(text.replace(marked, marked.replace('"lead"', '"lead-elevated"')))
+    assert broker.elevate(False, scoped.sock)["dropped"] == 1, "the registry's tier now, not the grant's"
+    assert scoped.get(live) == 403
+
+
+def test_run_record_rewritten_with_another_area_tier_or_uid_ends_the_leases_under_it(scoped):
+    for change in ({"area": "money"}, {"tier": "lead"}, {"uid": os.geteuid() + 1}):
+        scoped.s.record("r1", "home", "worker", ["work"])
+        live = scoped.lease("work", run="r1")
+        assert scoped.get(live) == 200
+        kw = {"area": "home", "tier": "worker"} | change
+        scoped.s.record("r1", kw.pop("area"), kw.pop("tier"), ["work"], **kw)
+        assert scoped.get(live) == 403, change
+
+
+def test_run_record_a_symlinked_record_folder_is_refused(scoped, base):
+    scoped.s.record("r1", "home", "worker", ["work"])
+    real = base / "elsewhere"
+    scoped.s.records.rename(real)
+    scoped.s.records.symlink_to(real)
+    e = refusal(scoped.lease, "work", run="r1")
+    assert e.code == "run_refused" and "symlink" in e.reason

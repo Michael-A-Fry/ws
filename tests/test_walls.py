@@ -1344,9 +1344,9 @@ def test_an_alert_is_plain_when_the_policy_does_not_load(box):
 
 
 def test_an_allowlist_edit_planted_inside_a_class_repo_is_ignored(host):
-    """The lists that say what a class session may do (the policy, the class files) live outside the repo. A policy file
-    and a settings allow rule planted in the class's repo change neither the policy ws loads nor the launch copy, and the
-    settings file is refused at the start."""
+    """The lists that say what a class session may do (the policy, the class files) live outside the repo. A settings allow
+    rule planted in the class's repo widens nothing in the launch copy and is refused at the start. The planted policy.toml
+    half is a regression guard only: ws has never read a policy from the working folder, and this pins that."""
     pol_before = policy.load(policy_file())
     ctx, _, _ = walls._context(dict(os.environ), walls._now())
     root = host.box / "work" / "alpha"
@@ -1377,12 +1377,20 @@ def test_an_allowlist_edit_planted_inside_a_class_repo_is_ignored(host):
 
 def test_every_class_key_the_policy_parses_is_read_outside_the_parser():
     import dataclasses
+    import io
+    import re
+    import tokenize
+
+    def code_only(path: Path) -> str:
+        """The module's source with comments and strings dropped, so a key named only in a docstring does not count."""
+        toks = tokenize.generate_tokens(io.StringIO(path.read_text(encoding="utf-8")).readline)
+        return " ".join(t.string for t in toks if t.type not in (tokenize.COMMENT, tokenize.STRING))
 
     src = Path(walls.__file__).resolve().parent
-    readers = "".join(
-        p.read_text(encoding="utf-8")
-        for p in src.rglob("*.py")
-        if p.name != "policy.py" and "__pycache__" not in p.parts
+    readers = " ".join(
+        code_only(p) for p in src.rglob("*.py") if p.name != "policy.py" and "__pycache__" not in p.parts
     )
-    unread = [f.name for f in dataclasses.fields(policy.Class) if f.name != "name" and f".{f.name}" not in readers]
+    fields = [f.name for f in dataclasses.fields(policy.Class) if f.name != "name"]
+    via = {"readable_by": "readable_by_class", "repo_settings": "narrowing_for"}  # read through Class's own method
+    unread = [n for n in fields if not re.search(rf"\.\s*({n}|{via.get(n, n)})\b", readers)]
     assert unread == [], f"parsed but read by no module: {unread}"

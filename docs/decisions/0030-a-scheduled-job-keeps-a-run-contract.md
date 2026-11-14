@@ -22,7 +22,8 @@ must a job file say before it may have a timer, and what must every run guarante
 
 Chosen option: adopt the init system. A job file with a `schedule` must carry six lines: `timeout_s` (maximum runtime),
 `on_failure` (the failure hook), `log`, `uninstall`, `expected_rate` and `data_class`; a job with a runner also needs
-`max_turns` and `budget_usd`. `ws config` and `ws doctor` report a file without them; `ws run` and the timer still run
+`max_turns` and `budget_usd`. `ws config` and `ws doctor` warn about a file without them (a warning, exit 0, not a
+failure); `ws run` and the timer still run
 what loads, so an upgrade never stops a job in the night; a bad `timeout_s` or `expected_rate` is the check's business
 and falls back to "not given" for the timer. Each generated service carries `TimeoutStartSec=` (the job's limit and a
 margin, or `infinity` for a file with no `timeout_s`, which is what a oneshot had before), and a shared slice with a

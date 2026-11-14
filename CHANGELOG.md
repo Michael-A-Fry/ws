@@ -8,6 +8,14 @@ body of the GitHub release.
 
 ## [Unreleased]
 
+### Added
+
+- `ws session load` puts standing preferences, an area card and, on the first prompt, the records a search finds in front
+  of a session, from one folder of plain files (`WS_CONTEXT_DIR`). A walled session sees only its own class's records
+  and the core preferences; a record with an unknown, wrong-case or non-text `class`, or front matter ws can't fully
+  read, is dropped. The scan runs before the registry lock, so a big folder can't stall other sessions' hooks. A first
+  prompt that finds nothing ("continue") is tried again for up to three prompts. `--runner` is accepted and ignored.
+
 ## [0.1.10] - 2026-11-12
 
 ### Added

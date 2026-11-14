@@ -132,3 +132,101 @@ def test_the_hook_loads_once_and_records_the_ids(box, monkeypatch, capsys):
     assert run("prompt", {**base, "prompt": "quince jelly again"}) == ""
     saved = json.loads((box / "wshome" / "sessions" / "s1.json").read_text())
     assert saved["context_ids"] == ["r-quince"] and saved["context_loaded"] is True
+
+
+@pytest.mark.parametrize(
+    "line",
+    ["class: [alpha]", "class: Alpha", "class: nosuchclass", "class: {a: b}", "class: 7"],
+)
+def test_a_class_that_is_not_a_known_policy_class_drops_the_record_for_everyone(box, line):
+    rec(box, "r-bad", "zebra secret", x="y")
+    p = box / "ctx" / "records" / "r-bad.md"
+    p.write_text(p.read_text().replace("x: y", line), encoding="utf-8")
+    assert context_load.at_prompt("zebra", str(box / "work" / "a")).ids == []
+    assert context_load.at_prompt("zebra", str(box / "work" / "alpha")).ids == []
+
+
+def test_a_record_whose_front_matter_is_not_fully_understood_is_dropped(box):
+    rec(box, "r-odd", "zebra odd", note="|")
+    p = box / "ctx" / "records" / "r-odd.md"
+    p.write_text("---\nid: r-odd\nstatus: current\nnested:\n  a: b\nlist: &x\n---\nzebra odd\n", encoding="utf-8")
+    assert context_load.at_prompt("zebra", str(box / "work" / "a")).ids == []
+
+
+def test_a_walled_session_sees_the_core_preferences_but_no_shared_record_or_other_core_file(box):
+    rec(box, "r-open", "zebra public notes")
+    rec(box, "r-wall", "zebra walled notes", **{"class": "alpha"})
+    (box / "ctx" / "core" / "glossary.md").write_text("zebra means stripes.\n", encoding="utf-8")
+    (box / "ctx" / "core" / "preferences.md").write_text("Prefer zebra answers.\n", encoding="utf-8")
+    ids = context_load.at_prompt("zebra", str(box / "work" / "alpha")).ids
+    assert "r-wall" in ids and "preferences" in ids and "r-open" not in ids and "glossary" not in ids
+
+
+def test_an_unrelated_prompt_finds_nothing_even_with_common_words(box):
+    rec(box, "r-q", "Quince jelly needs a long slow set with the sugar.")
+    assert context_load.at_prompt("what should we do about the weather", str(box / "work" / "a")).ids == []
+    assert context_load.at_prompt("continue", str(box / "work" / "a")).ids == []
+
+
+def test_a_bad_section_loads_less_not_nothing_and_a_huge_file_is_capped(box, monkeypatch):
+    monkeypatch.setattr(context_load, "card", lambda *a, **k: 1 / 0)
+    assert "Prefer short" in context_load.at_start(str(box / "work" / "a")).text
+    big = box / "ctx" / "core" / "preferences.md"
+    big.write_text("x" * (context_load.MAX_BYTES * 3), encoding="utf-8")
+    assert len(context_load._read(big)) <= context_load.MAX_BYTES
+
+
+def test_a_mixed_type_rank_does_not_break_the_card(box):
+    (box / "ctx" / "areas.toml").write_text(
+        '[[area]]\nname = "a"\nrank = "high"\n[[area]]\nname = "b"\nrank = 2\n', encoding="utf-8"
+    )
+    assert context_load.card(str(box), box / "ctx").startswith("Area:")
+
+
+def _hook(box, monkeypatch, capsys, event, payload):
+    pin = paths.pin_of().args()
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+    assert cli.main(["session", "load", "--event", event, *pin]) == 0
+    return capsys.readouterr().out
+
+
+def _start_session(box, monkeypatch, capsys, base):
+    pin = paths.pin_of().args()
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(base)))
+    assert cli.main(["session", "start", "--runner", "claude-code", *pin]) == 0
+    capsys.readouterr()
+
+
+def test_a_first_prompt_that_finds_nothing_retries_up_to_three_prompts_then_is_done(box, monkeypatch, capsys):
+    rec(box, "r-quince", "Quince jelly needs a long slow set.")
+    base = {"session_id": "s2", "cwd": str(box / "work" / "a")}
+    _start_session(box, monkeypatch, capsys, base)
+    saved = box / "wshome" / "sessions" / "s2.json"
+    assert _hook(box, monkeypatch, capsys, "prompt", {**base, "prompt": "continue"}) == ""
+    assert json.loads(saved.read_text()).get("context_loaded") is not True
+    assert "r-quince" in _hook(box, monkeypatch, capsys, "prompt", {**base, "prompt": "quince jelly"})
+    assert json.loads(saved.read_text())["context_loaded"] is True
+    base3 = {"session_id": "s3", "cwd": str(box / "work" / "a")}
+    _start_session(box, monkeypatch, capsys, base3)
+    for _ in range(3):
+        _hook(box, monkeypatch, capsys, "prompt", {**base3, "prompt": "continue"})
+    assert json.loads((box / "wshome" / "sessions" / "s3.json").read_text())["context_loaded"] is True
+    assert _hook(box, monkeypatch, capsys, "prompt", {**base3, "prompt": "quince jelly"}) == ""
+
+
+def test_a_slow_scan_does_not_hold_the_registry_lock(box, monkeypatch, capsys):
+    from ws import session
+
+    base = {"session_id": "s4", "cwd": str(box / "work" / "a")}
+    _start_session(box, monkeypatch, capsys, base)
+    held = []
+
+    def slow(message, cwd, env=None):
+        with session._locked(session._record_path(paths.merged_environ(), "s4").parent) as _:
+            pass  # would deadlock (flock is per open file description) if cmd_load held the lock around the scan
+        held.append(True)
+        return context_load.Loaded()
+
+    monkeypatch.setattr(context_load, "at_prompt", slow)
+    _hook(box, monkeypatch, capsys, "prompt", {**base, "prompt": "anything"})
+    assert held

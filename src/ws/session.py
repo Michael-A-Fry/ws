@@ -821,13 +821,24 @@ def cmd_load(args: argparse.Namespace) -> int:
                 if not isinstance(sid, str) or not sid:
                     return 0
                 path = _record_path(env, sid)
+                rec = _read(path)
+                if rec is None or rec.get("context_loaded"):
+                    return 0  # no record yet, or the first prompt has been served
+                prompt = args.message if args.message is not None else data.get("prompt")
+                # the scan and the search run before the registry lock: a big folder must not stall other sessions' hooks
+                out = context_load.at_prompt(prompt if isinstance(prompt, str) else "", cwd, env)
                 with _locked(path.parent):
                     rec = _read(path)
                     if rec is None or rec.get("context_loaded"):
-                        return 0  # no record yet, or the first prompt has been served
-                    prompt = args.message if args.message is not None else data.get("prompt")
-                    out = context_load.at_prompt(prompt if isinstance(prompt, str) else "", cwd, env)
-                    mark = {**rec, "context_loaded": True, "rev": _rev(rec) + 1, "ts": jsonl.iso_utc(_now())}
+                        return 0
+                    tries = rec.get("context_tries")
+                    tries = (tries if isinstance(tries, int) and not isinstance(tries, bool) else 0) + 1
+                    mark = {**rec, "rev": _rev(rec) + 1, "ts": jsonl.iso_utc(_now())}
+                    if out.ids or tries >= context_load.MAX_TRIES:
+                        mark.pop("context_tries", None)
+                        mark["context_loaded"] = True
+                    else:
+                        mark["context_tries"] = tries  # nothing found yet ("continue"): try the next prompt
                     if out.ids:
                         mark["context_ids"] = out.ids
                     _write(path, mark)
@@ -908,7 +919,7 @@ def register(sub) -> None:
     )
     p.add_argument("--message", help="the first prompt (default: prompt in the hook JSON)")
     p.add_argument("--session-id", metavar="ID", help="the session id (default: session_id in the hook JSON)")
-    p.add_argument("--runner", default="unknown", help="which runner is calling")
+    p.add_argument("--runner", default="unknown", help="accepted and ignored (hooks pass it for symmetry)")
     paths.add_pin_option(p)
     p.set_defaults(func=cmd_load, raw=True)
     p = ss.add_parser("prepare", help="launcher: print WS_LAUNCH=<token>, a one-use token that gives a session a role")

@@ -516,6 +516,29 @@ ws session nudge [-h] [--session-id ID] [--runner RUNNER]
 | `--session-id ID` | The session id (default: session_id in the hook JSON). |
 | `--runner RUNNER` | Which runner is calling (recorded). Default `unknown`. |
 
+### `ws session load`
+
+Hook entry: print standing preferences, the area card and the records a search finds.
+
+```text
+ws session load [-h] --event {start,prompt} [--message MESSAGE] [--session-id ID] [--runner RUNNER]
+```
+
+| Argument | Meaning |
+|---|---|
+| `--event {start,prompt}` | `start`: SessionStart. `prompt`: the first prompt. |
+| `--message MESSAGE` | The first prompt (default: prompt in the hook JSON). |
+| `--session-id ID` | The session id (default: session_id in the hook JSON). |
+| `--runner RUNNER` | Accepted and ignored. |
+
+It reads one folder of plain files: `WS_CONTEXT_DIR`, else `context` in the data folder. `core/preferences.md` and an
+area card print at start, with the index lines of the session's own class, under 10,000 characters. The first prompt
+adds up to five current records a full-text search on the message finds, and the session record keeps their ids. A
+prompt that finds nothing is tried again on the next one, up to three prompts. A walled session sees only its own
+class's records and the core preferences. A record whose `class` is not a known policy class, or whose front matter ws
+can't fully read, is never loaded. Each file is read to 256 KB. It is advice: an unreadable folder or policy loads less,
+and it never fails the runner. See `src/ws/context_load.py` for the folder layout.
+
 ## `ws msg`
 
 Messages between sessions: send one, list yours, read one, watch the envelope feed, wait for the next. A message is data

@@ -12,13 +12,16 @@ The folder is `WS_CONTEXT_DIR`, else `<data>/context`:
 - `records/**/*.md`: front matter `id`, `status`, `title`, and optionally `class` and `area`.
 - `areas.toml`: `[[area]]` with `name`, `folders`, `rank`, `state` (live, dormant, inbox) and optionally `now`, `left`, `dated`.
 
-The wall: a walled session sees its own class's index and records and the shared core, nothing of another class. A shared
-session never sees a record or index line of a walled class. A policy that will not load is the strictest case: core only.
+The wall: a walled session sees its own class's index and records and the shared core's preferences (never the other
+core files or a shared record), nothing of another class. A shared session never sees a record or index line of a walled
+class. A record whose `class` is present but is not a string naming a known policy class, or whose front matter was not
+fully understood, is dropped for everyone. A policy that will not load is the strictest case: core only.
 An area: a record that names an area is offered only to a session working in that area; one that names none is shared.
 """
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import sqlite3
@@ -30,6 +33,76 @@ from ws import frontmatter, paths
 
 BUDGET = 10_000  # characters printed at one event
 MAX_HITS = 5
+MAX_BYTES = 256 * 1024  # most read from any one file
+MAX_RECORDS = 2000  # most record files scanned
+MAX_TRIES = 3  # prompts a first-prompt load retries when it finds nothing
+_STOP = frozenset(
+    [
+        "the",
+        "and",
+        "for",
+        "with",
+        "that",
+        "this",
+        "you",
+        "your",
+        "are",
+        "was",
+        "were",
+        "have",
+        "has",
+        "had",
+        "not",
+        "but",
+        "can",
+        "could",
+        "would",
+        "should",
+        "will",
+        "just",
+        "how",
+        "what",
+        "when",
+        "where",
+        "why",
+        "who",
+        "which",
+        "from",
+        "into",
+        "about",
+        "please",
+        "continue",
+        "okay",
+        "thanks",
+        "thank",
+        "yes",
+        "let",
+        "one",
+        "all",
+        "any",
+        "more",
+        "some",
+        "then",
+        "than",
+        "them",
+        "they",
+        "their",
+        "there",
+        "here",
+        "its",
+        "our",
+        "out",
+        "get",
+        "got",
+        "make",
+        "need",
+        "want",
+        "like",
+        "also",
+        "very",
+    ]
+)
+MIN_OR_TERMS = 2  # the OR fallback needs a record to match this many distinct terms
 CARD_LINES = 5
 _TERM = re.compile(r"\w+")
 _MARK = "\n[ws context: cut at the size limit]\n"
@@ -42,6 +115,7 @@ class Who:
     walled: str | None = None
     known: bool = True
     walls: frozenset[str] = frozenset()  # every walled class name in the policy
+    classes: frozenset[str] = frozenset()  # every class name in the policy
     area: str | None = None
 
 
@@ -69,7 +143,8 @@ def root(env: dict | None = None) -> Path:
 
 def _read(p: Path) -> str:
     try:
-        return p.read_text(encoding="utf-8", errors="replace")
+        with p.open("rb") as f:
+            return f.read(MAX_BYTES).decode("utf-8", errors="replace")
     except OSError:
         return ""
 
@@ -81,6 +156,7 @@ def who_is(cwd: str, env: dict | None = None) -> Who:
     w = Who()
     try:
         pol = policy.load()
+        w.classes = frozenset(pol.classes)
         w.walls = frozenset(n for n, c in pol.classes.items() if c.access != "full")
         found = policy.class_of(pol, cwd)
         if found is policy.UNCLASSIFIED:
@@ -128,13 +204,18 @@ def _items(v) -> list[str]:
     return [str(x) for x in v] if isinstance(v, list) else ([str(v)] if v else [])
 
 
+def _rank_key(a: dict) -> tuple[int, float]:
+    r = a.get("rank")
+    return (0, float(r)) if isinstance(r, (int, float)) and not isinstance(r, bool) else (1, 0.0)
+
+
 def card(cwd: str, base: Path) -> str:
     """The area card, at most `CARD_LINES` lines. A folder in no area gets the inbox card and one line saying so."""
     _name, row, rows = area_of(cwd, base)
     if not rows:
         return ""
     live = [a for a in rows if a.get("state", "live") == "live"]
-    ranked = sorted(live, key=lambda a: (a.get("rank") is None, a.get("rank", 0)))
+    ranked = sorted(live, key=_rank_key)
     lines: list[str] = []
     if row is None:
         row = next((a for a in rows if a.get("state") == "inbox" or a.get("name") == "inbox"), {"name": "inbox"})
@@ -170,25 +251,45 @@ def _allowed(r: Rec, who: Who) -> bool:
     return r.area is None or r.area == who.area
 
 
+def _record_class(meta: dict, who: Who) -> tuple[bool, str | None]:
+    """(ok, class). A `class` key that is present must be a string naming a known policy class, or the record is dropped."""
+    if "class" not in meta:
+        return True, None
+    c = meta["class"]
+    if isinstance(c, str) and c in who.classes:
+        return True, c
+    return False, None
+
+
 def records(base: Path, who: Who) -> list[Rec]:
-    """Current records this caller may see. A walled session sees only its own class's; core files are searchable by all."""
+    """Current records this caller may see. A walled session sees only its own class's, plus the core's preferences."""
     out: list[Rec] = []
+    if not who.known:
+        return out
     for sub in ("records", "core"):
         folder = base / sub
         if not folder.is_dir():
             continue
-        for p in sorted(folder.rglob("*.md")):
+        for n, p in enumerate(sorted(folder.rglob("*.md"))):
+            if n >= MAX_RECORDS:
+                break
+            if sub == "core" and who.walled and p.name != "preferences.md":
+                continue
             doc = frontmatter.parse(_read(p))
+            if not doc.clean:
+                continue
             m = doc.meta
             if sub == "records" and str(m.get("status", "")).lower() != "current":
                 continue
+            ok, cls = _record_class(m, who) if sub == "records" else (True, None)
+            if not ok:
+                continue
+            area = m.get("area") if isinstance(m.get("area"), str) and sub == "records" else None
             rid = str(m.get("id") or p.stem)
-            cls = m.get("class") if isinstance(m.get("class"), str) else None
-            area = m.get("area") if isinstance(m.get("area"), str) else None
-            if sub == "core":
-                cls = area = None
             r = Rec(rid, str(m.get("title") or p.stem), doc.body.strip(), str(p), cls, area)
-            if _allowed(r, who):
+            if sub == "core" and who.walled:
+                out.append(r)  # the shared core's preferences: the one shared thing a walled session sees
+            elif _allowed(r, who):
                 out.append(r)
     return out
 
@@ -196,9 +297,14 @@ def records(base: Path, who: Who) -> list[Rec]:
 def _terms(text: str) -> list[str]:
     seen: list[str] = []
     for t in _TERM.findall(text.lower()):
-        if len(t) > 2 and t not in seen:
+        if len(t) > 2 and t not in _STOP and t not in seen:
             seen.append(t)
     return seen[:24]
+
+
+def _hits(r: Rec, terms: list[str]) -> int:
+    text = f"{r.title} {r.body}".lower()
+    return sum(t in text for t in terms)
 
 
 def search(recs: list[Rec], message: str, limit: int = MAX_HITS) -> list[Rec]:
@@ -216,16 +322,21 @@ def search(recs: list[Rec], message: str, limit: int = MAX_HITS) -> list[Rec]:
             for joiner in (" ", " OR "):
                 q = joiner.join(f'"{t}"' for t in terms)
                 rows = conn.execute(
-                    "SELECT rowid FROM d WHERE d MATCH ? ORDER BY bm25(d, 5.0, 1.0), rowid LIMIT ?", (q, limit)
+                    "SELECT rowid FROM d WHERE d MATCH ? ORDER BY bm25(d, 5.0, 1.0), rowid LIMIT ?", (q, limit * 4)
                 ).fetchall()
+                if joiner == " OR " and len(terms) >= MIN_OR_TERMS:
+                    rows = [(i,) for (i,) in rows if _hits(recs[i], terms) >= MIN_OR_TERMS]
+                elif joiner == " OR ":
+                    rows = []
                 if rows:
-                    return [recs[i] for (i,) in rows]
+                    return [recs[i] for (i,) in rows[:limit]]
             return []
         finally:
             conn.close()
     except sqlite3.Error:
-        scored = [(sum(t in f"{r.title} {r.body}".lower() for t in terms), i) for i, r in enumerate(recs)]
-        return [recs[i] for s, i in sorted(scored, key=lambda x: (-x[0], x[1])) if s][:limit]
+        need = min(MIN_OR_TERMS, len(terms))
+        scored = [(_hits(r, terms), i) for i, r in enumerate(recs)]
+        return [recs[i] for s, i in sorted(scored, key=lambda x: (-x[0], x[1])) if s >= need][:limit]
 
 
 def _index_lines(base: Path, who: Who) -> str:
@@ -251,16 +362,19 @@ def at_start(cwd: str, env: dict | None = None) -> Loaded:
     """SessionStart: standing preferences, the area card, the index lines of the caller's class. Under `BUDGET`."""
     base = root(env)
     who = who_is(cwd, env)
-    parts = []
-    prefs = _read(base / "core" / "preferences.md")
-    if prefs.strip():
-        parts.append("Standing preferences:\n" + frontmatter.parse(prefs).body.strip())
-    c = card(cwd, base)
-    if c:
-        parts.append(c)
-    idx = _index_lines(base, who)
-    if idx:
-        parts.append("Index:\n" + idx)
+    parts: list[str] = []
+    for build in (
+        lambda: (
+            "Standing preferences:\n" + frontmatter.parse(_read(base / "core" / "preferences.md")).body.strip()
+            if _read(base / "core" / "preferences.md").strip()
+            else ""
+        ),
+        lambda: card(cwd, base),
+        lambda: "Index:\n" + idx if (idx := _index_lines(base, who)) else "",
+    ):
+        with contextlib.suppress(Exception):  # one bad section loads less, never nothing
+            if part := build():
+                parts.append(part)
     return Loaded(_fit("\n\n".join(parts)) if parts else "")
 
 
@@ -268,7 +382,10 @@ def at_prompt(message: str, cwd: str, env: dict | None = None) -> Loaded:
     """First prompt: the current records a search on the message finds, with their ids. Under `BUDGET`."""
     base = root(env)
     who = who_is(cwd, env)
-    hits = search(records(base, who), message)
+    try:
+        hits = search(records(base, who), message)
+    except Exception:  # noqa: BLE001 - advice, not a gate
+        hits = []
     if not hits:
         return Loaded()
     body = "\n\n".join(f"[{r.id}] {r.title}\n{r.body}" for r in hits)

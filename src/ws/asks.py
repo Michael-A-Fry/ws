@@ -14,6 +14,7 @@ answered from here. A token-shaped secret is refused outright. Notify is not bui
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -43,6 +44,7 @@ LIMITS = {
     "session": 100,
 }
 MAX_OPTIONS = 6
+LOCK_WAIT_S = 30.0  # how long a writer waits for `asks.lock` before it gives up
 MAX_BYTES = 8 * 1024 * 1024  # a log turns over here, well under the 64 MiB `ws home` reads
 DEFAULT_WAIT = 540  # seconds: under a 10-minute tool limit
 RANK = {a: i for i, a in enumerate(policy.ACCESS)}  # a higher number is stricter
@@ -146,7 +148,50 @@ def _now() -> tuple[int, str]:
     return int(t * 1000), jsonl.iso_utc(t)
 
 
-def _write(env, event: dict) -> None:
+@contextlib.contextmanager
+def _store_lock(env=None):
+    """Hold `asks.lock`, the lock beside the store that the older `ws-ask` program also takes around its read-then-append,
+    so a check and the write that follows it are one step against every writer of this file. `ws.jsonl` still takes its
+    own lock inside each append. Raises WsError `unavailable` if the lock stays held or the folder cannot be used."""
+    path = store_path(env)
+    try:
+        import fcntl
+    except ImportError:  # no flock here (native Windows): the append's own lock is all there is
+        yield
+        return
+    fd = None
+    try:
+        fresh = not path.parent.exists()
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if fresh:
+            os.chmod(path.parent, 0o700)
+        fd = os.open(path.parent / "asks.lock", os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        deadline = time.monotonic() + LOCK_WAIT_S
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise OSError("asks.lock stayed locked") from None
+                time.sleep(0.02)
+    except OSError as e:
+        if fd is not None:
+            os.close(fd)
+        raise WsError(
+            "unavailable", f"cannot use the asks store ({e})", f"check that {path.parent} is yours and writable", 1
+        ) from e
+    try:
+        yield
+    finally:
+        os.close(fd)
+
+
+def _write(env, event: dict, held: bool = False) -> None:
+    """Append one event. Pass `held=True` when the caller already holds `_store_lock`."""
+    if not held:
+        with _store_lock(env):
+            return _write(env, event, True)
     path = store_path(env)
     ms, at = _now()
     rec = {"schema": SCHEMA, "ts": ms, "at": at, **event}
@@ -156,11 +201,9 @@ def _write(env, event: dict) -> None:
         raise WsError(
             "unavailable", f"cannot write the asks store ({e})", f"check that {path.parent} is yours and writable", 1
         ) from e
-    try:
+    with contextlib.suppress(OSError):
         if os.name == "posix":
             os.chmod(path.parent, 0o700)  # a folder made earlier by something else is narrowed too
-    except OSError:
-        pass
 
 
 def records(env=None) -> list[dict]:
@@ -168,6 +211,18 @@ def records(env=None) -> list[dict]:
         return jsonl.read(store_path(env))
     except (OSError, jsonl.LockTimeout):
         return []
+
+
+def _ms(value) -> int | None:
+    """A time in epoch milliseconds: a number as it is, or the older program's RFC 3339 text (`...Z`); None if neither."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(datetime.fromisoformat(value).timestamp() * 1000)
+        except (ValueError, OverflowError, OSError):
+            return None
+    return None
 
 
 def fold(recs: list[dict]) -> dict[str, dict]:
@@ -181,7 +236,8 @@ def fold(recs: list[dict]) -> dict[str, dict]:
         if event == "added":
             if ident not in asks:
                 asks[ident] = {
-                    **{k: v for k, v in r.items() if k != "event"},
+                    **{k: v for k, v in r.items() if k not in ("event", "v")},
+                    "ts": _ms(r.get("ts")),
                     "status": "open",
                     "answer": None,
                     "closed_ts": None,
@@ -203,13 +259,12 @@ def fold(recs: list[dict]) -> dict[str, dict]:
                 }
             )
         elif event in CLOSED and ask["status"] in ("open", "answered") and (event == "done" or ask["status"] == "open"):
-            ask["status"], ask["closed_ts"] = event, r.get("ts")
+            ask["status"], ask["closed_ts"] = event, _ms(r.get("ts"))
     return asks
 
 
 def _ts(ask: dict) -> int:
-    v = ask.get("ts")
-    return int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else 0
+    return _ms(ask.get("ts")) or 0
 
 
 def load(env=None) -> dict[str, dict]:
@@ -334,36 +389,37 @@ def add(fields: dict, cwd: str, env=None) -> tuple[str, bool, dict]:
         question, options, decision, free_text = OPAQUE, [], "", False
     stored_key = _hash(key) if key and redacted else key
 
-    ids = load(e)
-    if key:
-        for a in ids.values():
-            if a["status"] == "open" and a.get("dedupe_key") in (key, _hash(key)):
-                return a["id"], False, a
-    ms, _ = _now()
-    stamp = datetime.fromtimestamp(ms / 1000, UTC).strftime("%Y%m%dT%H%M%S")
-    while True:
-        ident = f"a{stamp}-" + "".join(_random.choice("abcdefghijklmnopqrstuvwxyz0123456789") for _ in range(4))
-        if ident not in ids:
-            break
-    event = {
-        "event": "added",
-        "id": ident,
-        "repo": repo,
-        "cwd": cwd if not redacted else "",
-        "session": _session(fields.get("session"), e),
-        "question": question,
-        "options": options,
-        "free_text_allowed": free_text,
-        "decision": decision,
-        "source": "permission" if fields.get("source") == "permission" else "session",
-        "dedupe_key": stored_key,
-        "flows": FLOWS[access],
-        "redacted": redacted,
-    }
-    if redacted:
-        event["redacted_why"] = reason
-    _write(e, event)
-    return ident, True, event
+    with _store_lock(e):
+        ids = load(e)
+        if key:
+            for a in ids.values():
+                if a["status"] == "open" and a.get("dedupe_key") in (key, _hash(key)):
+                    return a["id"], False, a
+        ms, _ = _now()
+        stamp = datetime.fromtimestamp(ms / 1000, UTC).strftime("%Y%m%dT%H%M%S")
+        while True:
+            ident = f"a{stamp}-" + "".join(_random.choice("abcdefghijklmnopqrstuvwxyz0123456789") for _ in range(4))
+            if ident not in ids:
+                break
+        event = {
+            "event": "added",
+            "id": ident,
+            "repo": repo,
+            "cwd": cwd if not redacted else "",
+            "session": _session(fields.get("session"), e),
+            "question": question,
+            "options": options,
+            "free_text_allowed": free_text,
+            "decision": decision,
+            "source": "permission" if fields.get("source") == "permission" else "session",
+            "dedupe_key": stored_key,
+            "flows": FLOWS[access],
+            "redacted": redacted,
+        }
+        if redacted:
+            event["redacted_why"] = reason
+        _write(e, event, held=True)
+        return ident, True, event
 
 
 # --- answer ----------------------------------------------------------------------------------------------------------
@@ -381,25 +437,32 @@ def pick(ask: dict, words: str) -> tuple[str | None, int | None]:
 
 
 def answer(ident: str, words: str, via: str = "cli", env=None) -> dict:
-    ask = get(ident, env)
-    if view(ask, env)["opaque"]:
-        raise WsError(
-            "opaque", "Open the session to answer this ask.", "this ask is not shown here: answer it in its session", 1
-        )
-    if ask["status"] != "open":
-        raise WsError("not_open", f"ask is {ask['status']}", "", 1)
-    text, idx = pick(ask, words)
-    if idx is not None:
-        text = ask["options"][idx]["label"]
-    else:
-        if not ask.get("free_text_allowed", True):
-            raise WsError("refused", "this ask takes one of its options, not free text", "", 1)
-        text = _text("answer", text, LIMITS["answer"], True)
-        _refuse_secret("answer", text)
-    ms, _ = _now()
-    reply = {"text": text, "option_index": idx, "via": via, "ts": ms}
-    _write(_env(env), {"event": "answered", "id": ident, "answer": reply})
-    return reply
+    """Answer an open ask. The check that it is still open and the write are one step under the store lock, so two
+    answers to one ask cannot both succeed."""
+    e = _env(env)
+    with _store_lock(e):
+        ask = get(ident, e)
+        if view(ask, e)["opaque"]:
+            raise WsError(
+                "opaque",
+                "Open the session to answer this ask.",
+                "this ask is not shown here: answer it in its session",
+                1,
+            )
+        if ask["status"] != "open":
+            raise WsError("not_open", f"ask is {ask['status']}", "", 1)
+        text, idx = pick(ask, words)
+        if idx is not None:
+            text = ask["options"][idx]["label"]
+        else:
+            if not ask.get("free_text_allowed", True):
+                raise WsError("refused", "this ask takes one of its options, not free text", "", 1)
+            text = _text("answer", text, LIMITS["answer"], True)
+            _refuse_secret("answer", text)
+        ms, _ = _now()
+        reply = {"text": text, "option_index": idx, "via": via, "ts": ms}
+        _write(e, {"event": "answered", "id": ident, "answer": reply}, held=True)
+        return reply
 
 
 # --- commands --------------------------------------------------------------------------------------------------------

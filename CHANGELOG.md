@@ -11,7 +11,7 @@ body of the GitHub release.
 ### Added
 
 - `ws ask` is one queue of questions from every session to their person: `add`, `list`, `get` and `answer`, in the file
-  `ws home` already reads asks from. An ask whose repo is not in a full-access class, or that hits the sensitive-terms
+  `ws home` already reads asks from. An ask whose repo isn't in a full-access class, or that hits the sensitive-terms
   file, is stored with no text; a token-shaped secret is refused; the class is checked again on every read. See
   [Asks](docs/reference/asks.md).
 - `ws session load` puts standing preferences, an area card and, on the first prompt, the records a search finds in front

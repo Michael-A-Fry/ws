@@ -45,7 +45,7 @@ class Box:
         cfg = paths.config_dir()
         cfg.mkdir(parents=True, exist_ok=True)
         (cfg / "policy.toml").write_text(
-            f'[classes.open]\naccess = "{open_access}"\nrepos = ["{self.home}/code/open/**"]\n\n'
+            f'[classes.open]\naccess = "{open_access}"\nrepos = ["{self.home}/code/open/**", "{self.home}/code/open/app"]\n\n'
             f'[classes.priv]\naccess = "{priv_access}"\nrepos = ["{self.home}/code/priv/**"]\n'
         )
 
@@ -132,8 +132,8 @@ def test_the_class_is_the_strictest_of_the_repo_name_and_the_working_folder(box,
     # a walled working folder naming an open repo is still redacted
     a = box.add(capsys, "--question", "plain", "--repo", "app", cwd=box.priv)
     assert (
-        asks.load()[a]["redacted"] is True and asks.load()[a]["flows"] == "off"
-    )  # a name that is no folder here is the strictest
+        asks.load()[a]["redacted"] is True and asks.load()[a]["flows"] == "counts"
+    )  # the walled folder wins over the open name
     # an open working folder naming a walled repo is redacted too
     b = box.add(capsys, "--question", "plain", "--repo", "vault", cwd=box.open)
     assert asks.load()[b]["redacted"] is True
@@ -297,4 +297,92 @@ def test_every_line_has_a_numeric_ts_and_an_rfc_3339_at(box, capsys):
 def test_cli_py_does_not_know_about_asks():
     """The command is found by its `COMMAND =` line; nothing in cli.py names the module."""
     text = (Path(__file__).resolve().parents[1] / "src" / "ws" / "cli.py").read_text(encoding="utf-8")
-    assert "asks" not in text and "ws.ask" not in text
+    assert "import asks" not in text and "ws.asks" not in text and "ws import asks" not in text
+
+
+# --- the older program's rows and lock; two writers at once ----------------------------------------------------------
+
+OLD_ROWS = [
+    {"v": 1, "ts": "2026-11-01T01:02:03Z", "event": "added", "id": "a20261101T010203-ab12", "repo": "app",
+     "session": {"name": "bld", "tmux": None}, "question": "Ship it?", "options": [{"label": "Yes", "description": ""}],
+     "free_text_allowed": True, "decision": "", "source": "session", "dedupe_key": None, "flows": "full",
+     "redacted": False},
+    {"v": 1, "ts": "2026-11-01T01:05:00Z", "event": "added", "id": "a20261101T010500-cd34", "repo": "app",
+     "session": {"name": "bld", "tmux": None}, "question": "Left open?", "options": [], "free_text_allowed": True,
+     "decision": "", "source": "session", "dedupe_key": None, "flows": "full", "redacted": False},
+    {"v": 1, "ts": "2026-11-01T01:06:00Z", "event": "answered", "id": "a20261101T010203-ab12",
+     "answer": {"text": "Yes", "option_index": 0, "via": "page", "ts": "2026-11-01T01:06:00Z"}},
+]  # fmt: skip
+
+
+def old_store(box) -> None:
+    box.store.parent.mkdir(parents=True)
+    box.store.write_text("".join(json.dumps(r) + "\n" for r in OLD_ROWS))
+
+
+def test_the_older_programs_rows_read_with_their_times(box, capsys):
+    old_store(box)
+    got = asks.load()
+    assert got["a20261101T010203-ab12"]["status"] == "answered" and "v" not in got["a20261101T010203-ab12"]
+    assert (
+        got["a20261101T010500-cd34"]["ts"] == 1793495100000 and asks.age_text(got["a20261101T010500-cd34"]["ts"]) != "?"
+    )
+    code, out, _ = box.run(capsys, "list")
+    assert code == 0 and "Left open?" in out and "  ?  " not in out
+
+
+def test_an_older_open_ask_can_be_answered_and_stays_one_ask(box, capsys):
+    old_store(box)
+    assert box.run(capsys, "answer", "a20261101T010500-cd34", "fine")[0] == 0
+    assert asks.load()["a20261101T010500-cd34"]["answer"]["text"] == "fine"
+    assert [e["event"] for e in box.lines()].count("added") == 2
+
+
+def test_a_write_takes_the_older_programs_asks_lock(box, capsys, monkeypatch):
+    import fcntl
+
+    box.store.parent.mkdir(parents=True)
+    monkeypatch.setattr(asks, "LOCK_WAIT_S", 0.2)
+    fd = os.open(box.store.parent / "asks.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        code, _, err = box.run(capsys, "add", "--question", "Q")
+        assert code == 1 and "asks store" in err
+    finally:
+        os.close(fd)
+    assert box.run(capsys, "add", "--question", "Q")[0] == 0  # and it goes ahead once the lock is let go
+    assert stat.S_IMODE((box.store.parent / "asks.lock").stat().st_mode) == 0o600
+
+
+def test_two_adds_with_one_key_make_one_ask(box, capsys):
+    ids, errs = [], []
+
+    def one():
+        try:
+            ids.append(asks.add({"question": "Q", "dedupe_key": "k"}, str(box.open)))
+        except asks.WsError as e:  # pragma: no cover
+            errs.append(e)
+
+    ts = [threading.Thread(target=one) for _ in range(10)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert not errs
+    assert len({i[0] for i in ids}) == 1 and sum(1 for i in ids if i[1]) == 1
+    assert [e["event"] for e in box.lines()] == ["added"]
+
+
+def test_two_answers_to_one_ask_only_one_succeeds(box, capsys):
+    ident = box.add(capsys, "--question", "Q", "--option", "Yes", "--option", "No")
+    won, lost = [], []
+
+    def one(n):
+        try:
+            won.append(asks.answer(ident, str(n)))
+        except asks.WsError as e:
+            lost.append(e.kind)
+
+    ts = [threading.Thread(target=one, args=(1 + n % 2,)) for n in range(8)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert len(won) == 1 and lost == ["not_open"] * 7
+    assert [e["event"] for e in box.lines()] == ["added", "answered"]

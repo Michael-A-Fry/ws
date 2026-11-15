@@ -47,6 +47,7 @@ def test_no_variable_of_an_outer_repository_reaches_a_test():
 
 
 @needs_git
+@pytest.mark.medium  # it starts a whole pytest run: its size is the 300 s limit, not the 60 s of a unit test
 def test_a_run_with_an_outer_git_dir_writes_only_to_its_own_scratch_repo(tmp_path):
     outer = tmp_path / "outer"
     git("init", "-q", "--bare", str(outer))

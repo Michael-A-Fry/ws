@@ -13,6 +13,7 @@ import stat
 import sys
 import threading
 import time
+import tokenize
 from pathlib import Path
 
 import pytest
@@ -134,6 +135,9 @@ def test_the_class_is_the_strictest_of_the_repo_name_and_the_working_folder(box,
     assert (
         asks.load()[a]["redacted"] is True and asks.load()[a]["flows"] == "counts"
     )  # the walled folder wins over the open name
+    # a name that is no class and no folder here is the strictest, even from an open folder
+    u = box.add(capsys, "--question", "plain", "--repo", "nowhere", cwd=box.open)
+    assert asks.load()[u]["redacted"] is True and asks.load()[u]["flows"] == "off"
     # an open working folder naming a walled repo is redacted too
     b = box.add(capsys, "--question", "plain", "--repo", "vault", cwd=box.open)
     assert asks.load()[b]["redacted"] is True
@@ -297,7 +301,8 @@ def test_every_line_has_a_numeric_ts_and_an_rfc_3339_at(box, capsys):
 def test_cli_py_does_not_know_about_asks():
     """The command is found by its `COMMAND =` line; nothing in cli.py names the module."""
     text = (Path(__file__).resolve().parents[1] / "src" / "ws" / "cli.py").read_text(encoding="utf-8")
-    assert "import asks" not in text and "ws.asks" not in text and "ws import asks" not in text
+    names = {t.string for t in tokenize.generate_tokens(io.StringIO(text).readline) if t.type == tokenize.NAME}
+    assert "asks" not in names and "ws.asks" not in text
 
 
 # --- the older program's rows and lock; two writers at once ----------------------------------------------------------

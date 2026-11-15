@@ -53,11 +53,13 @@ class OpenBaoStore:
             token_file,
         )
         self.path = token_file  # what `health` stats: the token file, so a loose one is reported
-        self._open = opener or urllib.request.build_opener(_NoRedirect).open
+        # no proxy: an environment proxy would see the token (urllib does not bypass loopback); no redirect: it would carry it on
+        self._open = opener or urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect).open
 
     def _token(self) -> str:
         try:
-            with self.token_file.open("rb") as fh:
+            fd = os.open(self.token_file, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0))
+            with os.fdopen(fd, "rb") as fh:  # O_NONBLOCK: a FIFO in its place cannot hang the read
                 st = os.fstat(fh.fileno())
                 if not stat.S_ISREG(st.st_mode) or st.st_mode & 0o077:
                     raise wsecrets.SecretsError("the OpenBao token file is open to other users")
@@ -133,11 +135,7 @@ def store_from_cfg(cfg: dict, env=None, opener=None) -> OpenBaoStore:
         if not isinstance(v, str) or not v:
             raise wsecrets.SecretsError(f"[roles.secrets] {k} is needed for the openbao adapter")
     u = urllib.parse.urlsplit(addr)
-    if u.scheme == "https":
-        pass
-    elif u.scheme == "http" and (u.hostname or "") in _LOOPBACK:
-        pass
-    else:
+    if not (u.scheme == "https" or (u.scheme == "http" and (u.hostname or "") in _LOOPBACK)):
         raise wsecrets.SecretsError("[roles.secrets] addr must be https (http only for a loopback address)")
     if not u.hostname or u.username or u.password:
         raise wsecrets.SecretsError("[roles.secrets] addr must be a plain host address")

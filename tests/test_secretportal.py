@@ -142,6 +142,52 @@ def test_nothing_in_src_docs_or_tests_reads_the_old_registry_file():
     assert hits == []
 
 
-def test_a_gated_session_is_refused_ask_wait_and_prompt():
-    for sub in ("ask", "wait", "prompt"):
-        assert agentsession.admin_name(f"secret.{sub}", SimpleNamespace()) == "secret"
+def test_a_gated_session_may_run_ask_and_wait_but_the_prompt_stays_for_a_person():
+    for sub in ("ask", "wait"):
+        assert agentsession.admin_name(f"secret.{sub}", SimpleNamespace()) is None
+    assert agentsession.admin_name("secret.prompt", SimpleNamespace()) == "secret"
+    under_a_runner = ["claude", "bash"]
+    env = {agentsession.ENV_MARKER: "1"}
+    for sub, code in (("ask", None), ("wait", None), ("prompt", 3), ("set", 3)):
+        ns = SimpleNamespace(ws_command=f"secret.{sub}")
+        try:
+            agentsession.guard(ns, env=env, stdin_tty=False, stdout_tty=False, ancestry=lambda: under_a_runner)
+            got = None
+        except WsError as e:
+            got = e.exit_code
+        assert got == code, sub
+
+
+def test_wait_stops_when_the_prompt_window_was_closed(home, monkeypatch):
+    monkeypatch.setattr(secretportal.time, "sleep", lambda s: None)
+    secretportal._write_marker("demo", "asked")
+    monkeypatch.setattr(secretportal, "STALE_AFTER_S", -1.0)
+    monkeypatch.setattr(secretportal, "_window_gone", lambda n: True)
+    with pytest.raises(WsError, match="was closed"):
+        secretportal.cmd_wait(_ns("demo"))
+    monkeypatch.setattr(secretportal, "_window_gone", lambda n: False)
+    with pytest.raises(WsError) as e:
+        secretportal.cmd_wait(_ns("demo", timeout=0))
+    assert e.value.kind == "timeout"
+
+
+def test_window_gone_reads_tmux_window_names(monkeypatch):
+    monkeypatch.setattr(secretportal.shutil, "which", lambda n: "/usr/bin/tmux")
+
+    def run(out, code=0):
+        return lambda argv, **kw: subprocess.CompletedProcess(argv, code, out, "")
+
+    monkeypatch.setattr(secretportal.subprocess, "run", run("main\nsecret:demo\n"))
+    assert secretportal._window_gone("demo") is False
+    monkeypatch.setattr(secretportal.subprocess, "run", run("main\n"))
+    assert secretportal._window_gone("demo") is True
+    monkeypatch.setattr(secretportal.subprocess, "run", run("", 1))  # tmux not answering: do not guess
+    assert secretportal._window_gone("demo") is False
+
+
+def test_the_prompt_window_says_where_the_value_will_go(home, monkeypatch, capsys):
+    monkeypatch.setattr(secretportal.time, "sleep", lambda s: None)
+    monkeypatch.setattr(getpass, "getpass", lambda prompt="": VALUE)
+    secretportal.cmd_prompt(_ns("demo"))
+    out = capsys.readouterr().out
+    assert str(wsecrets.store_dir()) in out and VALUE not in out

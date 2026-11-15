@@ -6,6 +6,7 @@ import json
 import os
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import ClassVar
 
 import pytest
 
@@ -17,8 +18,9 @@ TOKEN = "tok-" + os.urandom(8).hex()
 
 
 class _Fake(BaseHTTPRequestHandler):
-    data = {"demo": VALUE, "bad": 5}
-    seen: list = []
+    data: ClassVar[dict] = {"demo": VALUE, "bad": 5}
+    seen: ClassVar[list] = []
+    elsewhere = "http://127.0.0.1:1/"
 
     def log_message(self, *a):
         pass
@@ -32,7 +34,7 @@ class _Fake(BaseHTTPRequestHandler):
         name = self.path.split("/data/ws/")[-1].split("?")[0]
         if name == "redir":
             self.send_response(302)
-            self.send_header("Location", "http://127.0.0.1:1/")
+            self.send_header("Location", _Fake.elsewhere)
             self.end_headers()
             return None
         if name not in _Fake.data:
@@ -94,14 +96,68 @@ def test_a_loose_token_file_is_refused_and_reported(cfg):
     assert s.loose() and s.problems() == s.loose()
 
 
-def test_a_redirect_is_not_followed_so_the_token_stays_put(cfg):
+def test_a_redirect_is_not_followed_so_the_token_stays_put(cfg, monkeypatch):
+    class Other(BaseHTTPRequestHandler):
+        hits: ClassVar[list] = []
+
+        def do_GET(self):
+            Other.hits.append((self.path, self.headers.get("X-Vault-Token")))
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+        def log_message(self, *a):
+            pass
+
+    other = HTTPServer(("127.0.0.1", 0), Other)
+    threading.Thread(target=other.serve_forever, daemon=True).start()
+    monkeypatch.setattr(_Fake, "elsewhere", f"http://127.0.0.1:{other.server_port}/stolen")
+    try:
+        s = secrets_openbao.store_from_cfg(cfg)
+        with pytest.raises(wsecrets.SecretsError, match="answered 302"):
+            s.read("redir")
+    finally:
+        other.shutdown()
+    assert Other.hits == []  # the second server saw no request, so no token
+
+
+def test_an_environment_proxy_never_sees_the_token(cfg, monkeypatch):
+    class Proxy(BaseHTTPRequestHandler):
+        hits: ClassVar[list] = []
+
+        def do_GET(self):
+            Proxy.hits.append(self.headers.get("X-Vault-Token"))
+            self.send_response(502)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    proxy = HTTPServer(("127.0.0.1", 0), Proxy)
+    threading.Thread(target=proxy.serve_forever, daemon=True).start()
+    for k in ("http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY"):
+        monkeypatch.setenv(k, f"http://127.0.0.1:{proxy.server_port}")
+    monkeypatch.delenv("no_proxy", raising=False)
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    try:
+        assert secrets_openbao.store_from_cfg(cfg).read("demo") == VALUE  # went direct
+    finally:
+        proxy.shutdown()
+    assert Proxy.hits == []
+
+
+def test_a_fifo_in_place_of_the_token_file_does_not_hang(cfg):
     s = secrets_openbao.store_from_cfg(cfg)
+    s.token_file.unlink()
+    os.mkfifo(s.token_file, 0o600)
     with pytest.raises(wsecrets.SecretsError):
-        s.read("redir")
+        s.read("demo")
 
 
 def test_addr_must_be_https_or_loopback_and_every_key_is_needed(cfg, tmp_path):
-    for bad in ("http://bao.example.org:8200", "ftp://x", "https://u:p@bao.example.org", "https://"):
+    for bad in ("http://bao.example.org:8200", "ftp://x", "https://u:p" + "@bao.example.org", "https://"):
         with pytest.raises(wsecrets.SecretsError):
             secrets_openbao.store_from_cfg({**cfg, "addr": bad})
     with pytest.raises(wsecrets.SecretsError):

@@ -3,7 +3,8 @@
 `ask NAME` opens a new tmux window whose only job is a no-echo prompt for NAME, on that window's own tty. The value is
 read there and written to the store; it is never in an argument list, an environment variable, a log, an audit line or
 any reply. `wait NAME` blocks until the prompt has stored it (or was cancelled, or the time ran out). Both are admin
-commands, so a gated session is refused before this code runs (ws.agentsession.ADMIN).
+commands that show no value, so a gated session may run them (ws.agentsession.SESSION_OK); only a person's terminal
+runs `prompt`, which is where the value is typed, and the window says which store it will write to.
 
 The window command carries the name only. A small marker file in the state folder says when a prompt was opened and how it
 ended; it holds no value. Without tmux, `ws secret set NAME` does the same on the terminal you are in.
@@ -28,7 +29,12 @@ from ws.output import WsError
 
 POLL_S = 0.5
 DEFAULT_WAIT_S = 900.0
-_ENV_KEPT = ("HOME", *paths.OVERRIDE_VARS, "WS_BROKER_SOCKET")  # the folders the window must use, as this shell has them
+STALE_AFTER_S = 3.0  # a window opened this recently may not be listed yet
+_ENV_KEPT = (
+    "HOME",
+    *paths.OVERRIDE_VARS,
+    "WS_BROKER_SOCKET",
+)  # the folders the window must use, as this shell has them
 
 
 def asks_dir(env: dict | None = None) -> Path:
@@ -55,6 +61,20 @@ def _read_marker(name: str, env: dict | None = None) -> dict:
     except (OSError, ValueError):
         return {}
     return d if isinstance(d, dict) else {}
+
+
+def _window_gone(name: str) -> bool:
+    """True when tmux answers and no window of that name is left: the person closed the prompt without answering."""
+    tmux = shutil.which("tmux")
+    if not tmux:
+        return False
+    try:
+        r = subprocess.run(
+            [tmux, "list-windows", "-a", "-F", "#{window_name}"], capture_output=True, text=True, timeout=5, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return r.returncode == 0 and f"secret:{name}" not in r.stdout.split("\n")
 
 
 def window_command(name: str, env: dict | None = None) -> str:
@@ -106,6 +126,7 @@ def cmd_prompt(args) -> int:
     try:
         if name not in wsecrets.load_registry(wsecrets.registry_path()):
             raise wsecrets.SecretsError(f"{name!r} is not registered")
+        print(f"Storing {name} in {wsecrets.store_dir()}")
         try:
             value = getpass.getpass(f"Value for {name} (not shown; Enter stores it, Ctrl-C cancels): ")
         except (EOFError, KeyboardInterrupt):
@@ -129,7 +150,10 @@ def cmd_wait(args) -> int:
     _marker(name)
     deadline = time.monotonic() + args.timeout
     while True:
-        state = _read_marker(name).get("state")
+        marker = _read_marker(name)
+        state = marker.get("state")
+        if state == "asked" and time.time() - float(marker.get("at") or 0) > STALE_AFTER_S and _window_gone(name):
+            raise WsError("failed", f"the prompt window for {name} was closed", f"ask again: `ws secret ask {name}`")
         if state == "stored":
             if args.json:
                 output.result({"name": name, "stored": True})

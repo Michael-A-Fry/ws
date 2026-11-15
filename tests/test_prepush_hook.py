@@ -17,15 +17,16 @@ HOOK = Path(__file__).resolve().parents[1] / ".github" / "hooks" / "pre-push"
 pytestmark = pytest.mark.skipif(sys.platform == "win32" or not shutil.which("bash"), reason="needs bash")
 
 
-def fake(bin_dir: Path, name: str, log: Path, then_exec: bool = False) -> None:
+def fake(bin_dir: Path, name: str, log: Path, then_exec: bool = False, exit_code: int = 0) -> None:
     body = f'#!/usr/bin/env bash\nprintf "%s\\n" "{name} $*" >> "{log}"\n'
     if then_exec:
-        body += 'shift 2\nexec "$@"\n'  # drop its own two arguments, then run the command it wraps'
+        body += 'shift 2\nexec "$@"\n'  # drop its own two arguments, then run the command it wraps
+    body += f"exit {exit_code}\n"
     (bin_dir / name).write_text(body, encoding="utf-8")
     (bin_dir / name).chmod(0o755)
 
 
-def run_hook(tmp_path: Path, wrap: str | None) -> list[str]:
+def run_hook(tmp_path: Path, wrap: str | None, uv_exit: int = 0, expect_rc: int = 0) -> list[str]:
     repo, bin_dir, log = tmp_path / "repo", tmp_path / "bin", tmp_path / "calls.log"
     repo.mkdir()
     bin_dir.mkdir()
@@ -36,13 +37,13 @@ def run_hook(tmp_path: Path, wrap: str | None) -> list[str]:
     if wrap is not None:
         env["WS_PREPUSH_WRAP"] = wrap
     subprocess.run([git, "init", "-q", str(repo)], check=True, env=env)
-    for name in ("uv", "uvx"):
-        fake(bin_dir, name, log)
+    fake(bin_dir, "uvx", log)
+    fake(bin_dir, "uv", log, exit_code=uv_exit)
     fake(bin_dir, "queue-wrap", log, then_exec=True)
     done = subprocess.run(
         [shutil.which("bash"), str(HOOK)], cwd=repo, env=env, capture_output=True, text=True, check=False
     )
-    assert done.returncode == 0, done.stderr
+    assert done.returncode == expect_rc, done.stderr
     return log.read_text(encoding="utf-8").splitlines()
 
 
@@ -61,3 +62,12 @@ def test_the_wrapper_runs_the_suite_and_only_the_suite(tmp_path):
         "queue-wrap --wait 60m uv run --locked pytest -q",
         "uv run --locked pytest -q",
     ]
+
+
+def test_a_failing_suite_fails_the_push_through_the_wrapper(tmp_path):
+    calls = run_hook(tmp_path, "queue-wrap --wait 60m", uv_exit=3, expect_rc=3)
+    assert calls[-1] == "uv run --locked pytest -q"
+
+
+def test_a_spaces_only_wrap_is_the_same_as_unset(tmp_path):
+    assert run_hook(tmp_path, "   ") == ["uvx prek run --all-files", "uv run --locked pytest -q"]

@@ -65,7 +65,7 @@ checks, so skipping only moves the failure.
 
 On a machine where several test runs share the cores, a suite raced by others can miss a timing test's deadline. Set
 `WS_PREPUSH_WRAP` to a command that queues the run, and the hook starts the suite through it (split on spaces; `prek`
-runs as it is). For example `WS_PREPUSH_WRAP="flock /tmp/tests.lock" git push`. Unset or empty, nothing changes.
+runs unwrapped). For example `WS_PREPUSH_WRAP="flock /tmp/tests.lock" git push`. Unset or empty, nothing changes.
 
 ## Rules for a change
 

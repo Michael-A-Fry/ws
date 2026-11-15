@@ -30,6 +30,8 @@ memory) that is the worker count, else xdist counts the cores itself. `-n 4` or 
   tests share a worker is replayed with `-n 0` and the same seed first, then with the same `-n`.
 - A test must not depend on another test's files, ports, environment or working folder. Use `tmp_path` and the
   fixtures in `tests/conftest.py`, which give every test its own `HOME` and `WS_HOME`.
+- Without pytest-xdist (`-p no:xdist`, or the dev group not installed) the run stops with a usage error that says so.
+  To run in one process without it, override the option: `pytest -o addopts='-p ws_harness'`.
 - The tier report and the flake log are written by the controller, from the workers' results.
 - To go back to one process, remove `pytest-xdist` from the `dev` group and `-n auto` from `addopts`; nothing else
   depends on it.

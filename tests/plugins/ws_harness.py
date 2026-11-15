@@ -206,13 +206,33 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         parser.addini(f"ws_tier_budget_{tier}", f"Seconds the {tier} tier may take (default {seconds}).", default="")
 
 
-@pytest.hookimpl(tryfirst=True)  # a first result wins, and xdist's own count would otherwise be asked first
+@pytest.hookimpl(
+    tryfirst=True, optionalhook=True
+)  # a first result wins, and xdist's own count would otherwise be asked first
 def pytest_xdist_auto_num_workers(config: pytest.Config) -> int | None:
     """How many workers `-n auto` starts: the cap ws-test worked out from the machine (WS_TEST_MAX_N) when it set one,
     else None, which leaves xdist's own count. A bare run on a laptop and a pre-push run under ws-test thus both
     do the right thing without a flag. A value that is not a whole number above 0 is ignored."""
     raw = os.environ.get("WS_TEST_MAX_N", "").strip()
-    return int(raw) if raw.isdigit() and int(raw) > 0 else None
+    return int(raw) if raw.isdecimal() and int(raw) > 0 else None
+
+
+def _xdist_loaded(pm: pytest.PytestPluginManager) -> bool:
+    """True when pytest-xdist is registered and not switched off (-p no:xdist leaves a blocked, empty entry)."""
+    return pm.get_plugin("xdist") is not None and not pm.is_blocked("xdist")
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_load_initial_conftests(early_config: pytest.Config) -> None:
+    """The ini `addopts` asks for `-n`; without pytest-xdist pytest would stop on "unrecognized arguments: -n", before
+    any plugin could explain. This runs first, so it can."""
+    asks_for_workers = re.search(r"(^|\s)-n(\s|\d|=|$)", " ".join(early_config.getini("addopts")))
+    if asks_for_workers and not _xdist_loaded(early_config.pluginmanager):
+        raise pytest.UsageError(
+            "ws_harness needs pytest-xdist (addopts carries -n auto) and it is not loaded: run `uv sync --locked` to "
+            "install the dev group, or take `-p no:xdist` off the command line. To run without workers instead, "
+            "pass `-o addopts='-p ws_harness'`."
+        )
 
 
 @pytest.hookimpl(tryfirst=True)

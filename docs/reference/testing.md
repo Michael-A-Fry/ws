@@ -4,8 +4,9 @@ How the suite keeps time, order and flakes under control. The plugin that does i
 pyproject loads it for every `pytest` run in this repo (`addopts = "-p ws_harness"`, with `tests/plugins` on
 `pythonpath`), so CI, `ws-test` and the pre-push hook all get it. `tests/test_harness.py` tests it.
 
-The harness builds on four pinned packages in the `dev` group: pytest-timeout (per-test limits), pytest-randomly
-(random order, the seed line), pytest-rerunfailures (the `flaky` marker) and pytest-xdist (parallel workers). It adds the policy they leave open. If any
+The harness builds on four pinned packages in the `dev` group: pytest-timeout (per-test limits),
+pytest-randomly (random order, the seed line), pytest-rerunfailures (the `flaky` marker) and pytest-xdist
+(parallel workers). It adds the policy they leave open. If any
 of them is missing or switched off, the run stops with a usage error. It never carries on without limits.
 
 ## Run the suite

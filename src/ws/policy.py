@@ -1156,7 +1156,9 @@ def _has_term(text: str, term: str) -> bool:
     return bool(words) and re.search(_term_pattern(words), _fold(text)) is not None
 
 
-_CANARY = _term_pattern(term_words(CANARY_PREFIX), whole=False)
+# The real token only: the prefix's words with any separator or none, then the 16 hex digits `ws walls` plants after it.
+# Prose about the tracer ("the ws walls tracer code") is not a token, and a letter straight before one does not hide it.
+_CANARY = rf"{_SEP.join(map(re.escape, term_words(CANARY_PREFIX)))}[\W_]*[0-9a-f]{{16}}(?![0-9a-f])"
 
 
 def term_problem(pol: Policy, own: Class | None, text: str) -> str | None:

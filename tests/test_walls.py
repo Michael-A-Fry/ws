@@ -1421,7 +1421,7 @@ def term_world(run_ws, tmp_path, where: str, prompt: str):  # noqa: F811
 
 @pytest.mark.parametrize(
     "prompt",
-    ["summarise the kestrel ridge notes", "see KR-2207 first", "look at ws-walls-tracer-ab12cd"],
+    ["summarise the kestrel ridge notes", "see KR-2207 first", "look at ws-walls-tracer-0123456789abcdef"],
     ids=["term in another case", "a code term", "a canary token"],
 )
 def test_a_planted_class_term_in_an_outgoing_prompt_is_refused_with_one_record(run_ws, tmp_path, prompt):  # noqa: F811
@@ -1453,7 +1453,9 @@ def test_the_term_check_names_the_class_skips_full_classes_and_the_callers_own()
     )
     assert policy.term_problem(pol, pol.classes["alpha"], "about kestrel ridge") is None
     assert policy.term_problem(pol, None, "the wide view") is None  # a full class's terms are never checked
-    assert policy.term_problem(pol, pol.classes["alpha"], "WS-WALLS-TRACER-x") is not None  # a token, whoever sends it
+    assert (
+        policy.term_problem(pol, pol.classes["alpha"], "WS-WALLS-TRACER-0123456789abcdef") is not None
+    )  # a token, whoever sends it
 
 
 @pytest.mark.parametrize(
@@ -1514,7 +1516,15 @@ def test_a_term_with_a_hyphen_or_underscore_matches_any_separator(text, caught):
 
 
 @pytest.mark.parametrize(
-    "text", ["ws_walls_tracer_ab12", "ws walls tracer ab12", "WS-WALLS-TRACER-ab12", "ws\u200bwalls-tracer-x"]
+    "text",
+    [
+        "ws_walls_tracer_0123456789abcdef",
+        "ws walls tracer 0123456789abcdef",
+        "WS-WALLS-TRACER-0123456789ABCDEF",
+        "ws\u200bwalls-tracer-0123456789abcdef",
+        "aws-walls-tracer-0123456789abcdef",  # a letter straight before it does not hide it
+        "see ws-walls-tracer-0123456789abcdef.",
+    ],
 )
 def test_the_canary_prefix_is_caught_with_any_separator(text):
     pol = policy.loads(TERM_POLICY.format(root="/r"))
@@ -1587,3 +1597,66 @@ def test_a_second_net_catch_is_a_count_on_stderr_never_the_words(run_ws, tmp_pat
     assert run_ws.saw()["stdin"] == "write to Jane Smith"  # counted, not refused
     err = capsys.readouterr().err
     assert "1 name-like word pair" in err and "Jane" not in err
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "review the ws walls tracer code",
+        "ws-walls-tracers doc",
+        "ws-walls-tracer-abc",  # too short to be a token
+        "ws-walls-tracer-0123456789abcdef0",  # one hex digit too many
+    ],
+)
+def test_prose_about_the_tracer_is_not_a_canary_token(text):
+    pol = policy.loads(TERM_POLICY.format(root="/r"))
+    assert policy.term_problem(pol, pol.classes["open"], text) is None, text
+
+
+def test_a_token_ws_walls_plants_is_one_the_check_catches():
+    pol = policy.loads(TERM_POLICY.format(root="/r"))
+    token = walls._plant()
+    assert (
+        policy.term_problem(pol, None, f"see {token}") == "the prompt carries a canary token planted in a walled class"
+    )
+
+
+# ---- the term check counts a job as hosted unless every model call stays on this machine ---------------------------------
+
+from ws import jobs
+
+
+def _job(model: str = "ollama/llama3", provider=None, secrets: str = "") -> jobs.Job:
+    opts = f"[runner_options]\nprovider = {provider}\n" if provider is not None else ""
+    return jobs.loads(
+        "j", f'runner = "opencode"\nmodel = "{model}"\nprompt = "kestrel ridge"\n{secrets}{opts}', Path(".")
+    )
+
+
+@pytest.mark.parametrize(
+    ("job", "local"),
+    [
+        (lambda: _job(), True),  # a local provider by name, no endpoint named
+        (lambda: _job(provider='{ options = { baseURL = "http://127.0.0.1:11434/v1" } }'), True),
+        (lambda: _job(provider='{ options = { baseURL = "http://localhost:11434/v1" } }'), True),
+        (lambda: _job(provider='{ options = { baseURL = "https://api.example.com/v1" } }'), False),
+        (lambda: _job(provider='{ options = { baseURL = "http://[::1]:8080" } }'), True),
+        (lambda: _job(model="anthropic/claude-haiku-4-5"), False),
+        (lambda: _job(secrets='[[secrets]]\nname = "model-key"\nhost = "api.example.com"\n'), False),
+    ],
+    ids=["local name", "loopback IP", "localhost", "hosted baseURL", "IPv6 loopback", "hosted provider", "a lease"],
+)
+def test_a_job_is_local_only_when_every_endpoint_is_loopback(job, local):
+    from ws import run as wsrun
+
+    j = job()
+    assert wsrun._job_is_local(j, sandbox.job_provider(j.runner, j.model, j.runner_options)) is local
+
+
+def test_a_local_named_job_with_a_hosted_endpoint_gets_the_term_check():
+    from ws import run as wsrun
+
+    pol = policy.loads(TERM_POLICY.format(root="/r"))
+    hosted = _job(provider='{ options = { baseURL = "https://api.example.com/v1" } }')
+    assert wsrun._term_leak(pol, hosted) == "the prompt carries a term of class 'alpha'"
+    assert wsrun._term_leak(pol, _job()) is None  # a truly local model gets the prompt as it is

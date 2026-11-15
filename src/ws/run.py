@@ -460,13 +460,50 @@ def _egress(pol: policy.Policy, job: jobs.Job):
     return plan, None
 
 
+def _urls(value) -> list[str]:
+    """Every string in `value` (a table, a list or a string, nested) that names a URL with a scheme."""
+    if isinstance(value, str):
+        return [value] if "://" in value else []
+    if isinstance(value, dict):
+        return [u for v in value.values() for u in _urls(v)]
+    if isinstance(value, list):
+        return [u for v in value for u in _urls(v)]
+    return []
+
+
+def _loopback_url(url: str) -> bool:
+    import ipaddress
+    import urllib.parse
+
+    try:
+        host = urllib.parse.urlsplit(url).hostname or ""
+    except ValueError:
+        return False
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return host == "localhost"
+
+
+def _job_is_local(job: jobs.Job, provider: str) -> bool:
+    """Does every model call of the job stay on this machine? Only when its provider is a local one by name, it takes no
+    secret lease (a lease's address is the broker, which forwards to a hosted host), and every URL its `provider` table
+    names is loopback. Anything else counts as hosted."""
+    from ws import sandbox
+
+    if provider not in sandbox.LOCAL_PROVIDERS or job.secrets:
+        return False
+    block = (job.runner_options or {}).get("provider")
+    return all(_loopback_url(u) for u in _urls(block))
+
+
 def _term_leak(pol: policy.Policy, job: jobs.Job) -> str | None:
     """rr-r4-68: a job's prompt bound for a hosted model may not carry a walled class's term or a canary token
     (`policy.term_problem`, words that name the class only). A model on this machine gets the prompt as it is. The second
     net (`policy.name_spots`) is counted on stderr, never refused and never written down."""
     from ws import sandbox  # late: only a policy with classes needs it
 
-    if not pol.classes or sandbox.job_provider(job.runner, job.model, job.runner_options) in sandbox.LOCAL_PROVIDERS:
+    if not pol.classes or _job_is_local(job, sandbox.job_provider(job.runner, job.model, job.runner_options)):
         return None
     why = policy.term_problem(pol, _job_class(pol, job), job.prompt or "")
     if why is None and (n := len(policy.name_spots(job.prompt or ""))):

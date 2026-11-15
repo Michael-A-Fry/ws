@@ -262,7 +262,8 @@ ws secret set [-h] name
 ### `ws secret ask`
 
 Open a tmux window with a no-echo prompt for a registered name; the value goes straight to the store. Needs a tmux
-session. An AI session may run it (it shows no value). The older command `ws-secret` takes the same arguments.
+session. An AI session may run it (it shows no value). The older command `ws-secret` takes the same
+arguments.
 
 ```text
 ws secret ask [-h] name

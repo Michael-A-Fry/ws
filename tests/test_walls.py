@@ -1497,11 +1497,20 @@ def test_a_term_is_caught_through_format_characters_and_combining_marks(text):
     assert policy.term_problem(pol, pol.classes["open"], text) == "the prompt carries a term of class 'alpha'", text
 
 
-@pytest.mark.parametrize("text", ["the foo bar plan", "the foo_bar plan", "the foo-bar plan", "the foobar_x plan"])
-def test_a_term_with_a_hyphen_or_underscore_matches_any_separator(text):
+@pytest.mark.parametrize(
+    ("text", "caught"),
+    [
+        ("the foo bar plan", True),
+        ("the foo_bar plan", True),
+        ("the foo-bar plan", True),
+        ("the foobar plan", True),  # no separator at all
+        ("the foobar_x plan", True),  # an underscore after it is not a letter
+        ("the foobarx plan", False),  # a letter after it is another word
+    ],
+)
+def test_a_term_with_a_hyphen_or_underscore_matches_any_separator(text, caught):
     pol = policy.loads(TERM_POLICY.format(root="/r").replace('"KR-2207"]', '"KR-2207", "foo_bar"]'))
-    got = policy.term_problem(pol, pol.classes["open"], text)
-    assert (got is not None) == ("foobar" not in text), text
+    assert (policy.term_problem(pol, pol.classes["open"], text) is not None) is caught, text
 
 
 @pytest.mark.parametrize(
@@ -1521,7 +1530,35 @@ def test_a_term_that_folds_to_fewer_than_3_letters_stops_the_load(term):
         policy.loads(f'[classes.a]\naccess = "walled"\nrepos = ["/a/**"]\nterms = [{json.dumps(term)}]\n')
 
 
-@pytest.mark.parametrize("text", ["kestrels ridge", "kestrel ridges", "KR-22070", "xKR-2207", "kestrel, ridge"])
+@pytest.mark.parametrize(
+    "text",
+    [
+        "kes\u200btrel\u200bridge",  # a zero-width space inside a word and another as the separator
+        "k\u200be\u200bs\u200bt\u200br\u200be\u200bl\u200br\u200bi\u200bd\u200bg\u200be",
+        "kestrel\u034fridge",  # a combining grapheme joiner as the only separator
+        "kestrel\ufe0fridge",  # a variation selector
+        "kestrel\u1ab0ridge",  # a combining doubled circumflex
+        "kestrel\u20ddridge",  # an enclosing circle
+        "kestrel\x00ridge",  # control characters
+        "kes\x00trel ridge",
+        "kestrel\x08ridge",
+        "kestrel\x7fridge",
+        "kestrel\u3164ridge",  # a Hangul filler
+        "kestrel\uffa0ridge",  # a halfwidth Hangul filler
+        "kestrel\u2800ridge",  # a blank braille pattern
+        "kestrel.ridge",  # email style
+        "kestrel,ridge",
+        "kestrel/ridge",
+        "kestrel, ridge",
+        "KR.2207",
+    ],
+)
+def test_a_term_is_caught_through_invisible_separators_controls_fillers_and_punctuation(text):
+    pol = policy.loads(TERM_POLICY.format(root="/r"))
+    assert policy.term_problem(pol, pol.classes["open"], text) == "the prompt carries a term of class 'alpha'", text
+
+
+@pytest.mark.parametrize("text", ["kestrels ridge", "kestrel ridges", "KR-22070", "xKR-2207", "kestrel bird ridge"])
 def test_a_longer_word_or_other_punctuation_is_another_term(text):
     pol = policy.loads(TERM_POLICY.format(root="/r"))
     assert policy.term_problem(pol, pol.classes["open"], text) is None, text

@@ -153,20 +153,32 @@ def git(cwd, *args) -> str:
     return done.stdout.strip()
 
 
+def commit_with_readable_sha(repo, name: str, text: str) -> str:
+    """Commit `text` to `name` and return its short sha, retrying with a new message until the sha has a digit and a
+    letter a to f, which is all the claims guard reads as a commit (a hash is random, so one in ~100 would not)."""
+    for n in range(50):
+        (repo / name).write_text(text)
+        git(repo, "add", name)
+        git(repo, "commit", "-q", "--allow-empty", "-m", f"c{n}")
+        sha = git(repo, "rev-parse", "--short=10", "HEAD")
+        if any(c.isdigit() for c in sha) and any(c in "abcdef" for c in sha):
+            return sha
+        git(repo, "reset", "-q", "--hard", "HEAD~1")
+    raise AssertionError("no commit with a readable sha in 50 tries")
+
+
 @needs_git
 def test_parity_claims(box):
     repo = box / "repo"
     repo.mkdir()
     git(repo, "init", "-q", "-b", "main")
-    (repo / "a").write_text("1")
-    git(repo, "add", "a")
-    git(repo, "commit", "-q", "-m", "first")
-    on = git(repo, "rev-parse", "--short=10", "HEAD")
+    (repo / "seed").write_text("0")
+    git(repo, "add", "seed")
+    git(repo, "commit", "-q", "-m", "seed")
+    on = commit_with_readable_sha(repo, "a", "1")
     git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
     git(repo, "checkout", "-q", "-b", "work")
-    (repo / "a").write_text("2")
-    git(repo, "commit", "-q", "-am", "second")
-    off = git(repo, "rev-parse", "--short=10", "HEAD")
+    off = commit_with_readable_sha(repo, "a", "2")
     pol = policy.loads('[guards]\non = ["claims"]\n')
 
     def say(text: str) -> str:

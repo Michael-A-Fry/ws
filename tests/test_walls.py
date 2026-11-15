@@ -1477,6 +1477,50 @@ def test_a_term_is_caught_through_spacing_unicode_tricks_and_underscores(text):
     assert policy.term_problem(pol, pol.classes["open"], text) == "the prompt carries a term of class 'alpha'", text
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "kestrel\u200bridge",  # a zero-width space as the only separator
+        "kestrel\u00adridge",  # a soft hyphen
+        "kestrel\u2060ridge",  # a word joiner
+        "kestrel\u200cridge",  # a zero-width non-joiner
+        "kestrel\u061cridge",  # an Arabic letter mark
+        "kes\u200btrel ridge",  # and still one inside a word
+        "kestrel ri\u0307dge",  # a combining dot
+        "kestre\u0335l ridge",  # a combining strike-through
+        "k\u00e9strel ridge",  # an accented letter
+        "\u0130STANBUL docks",  # a dotted capital I
+    ],
+)
+def test_a_term_is_caught_through_format_characters_and_combining_marks(text):
+    pol = policy.loads(TERM_POLICY.format(root="/r").replace('"KR-2207"]', '"KR-2207", "Istanbul docks"]'))
+    assert policy.term_problem(pol, pol.classes["open"], text) == "the prompt carries a term of class 'alpha'", text
+
+
+@pytest.mark.parametrize("text", ["the foo bar plan", "the foo_bar plan", "the foo-bar plan", "the foobar_x plan"])
+def test_a_term_with_a_hyphen_or_underscore_matches_any_separator(text):
+    pol = policy.loads(TERM_POLICY.format(root="/r").replace('"KR-2207"]', '"KR-2207", "foo_bar"]'))
+    got = policy.term_problem(pol, pol.classes["open"], text)
+    assert (got is not None) == ("foobar" not in text), text
+
+
+@pytest.mark.parametrize(
+    "text", ["ws_walls_tracer_ab12", "ws walls tracer ab12", "WS-WALLS-TRACER-ab12", "ws\u200bwalls-tracer-x"]
+)
+def test_the_canary_prefix_is_caught_with_any_separator(text):
+    pol = policy.loads(TERM_POLICY.format(root="/r"))
+    assert (
+        policy.term_problem(pol, pol.classes["alpha"], text)
+        == "the prompt carries a canary token planted in a walled class"
+    )
+
+
+@pytest.mark.parametrize("term", ["\u200b\u200b\u200b", "a-_b", "\u00ad\u00ad\u00adx"])
+def test_a_term_that_folds_to_fewer_than_3_letters_stops_the_load(term):
+    with pytest.raises(policy.PolicyError, match="terms"):
+        policy.loads(f'[classes.a]\naccess = "walled"\nrepos = ["/a/**"]\nterms = [{json.dumps(term)}]\n')
+
+
 @pytest.mark.parametrize("text", ["kestrels ridge", "kestrel ridges", "KR-22070", "xKR-2207", "kestrel, ridge"])
 def test_a_longer_word_or_other_punctuation_is_another_term(text):
     pol = policy.loads(TERM_POLICY.format(root="/r"))

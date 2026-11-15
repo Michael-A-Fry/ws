@@ -913,8 +913,10 @@ def _classes(raw) -> dict[str, Class]:
             raise PolicyError(f"{where}review_date must be a TOML date such as 2027-03-01, not {review!r}")
         terms = _strings(body, "terms", where)
         for t in terms:
-            if len(t.strip()) < 3 or t != t.strip():
-                raise PolicyError(f"{where}terms: each term is at least 3 characters with no space at either end")
+            if len(t.strip()) < 3 or t != t.strip() or len("".join(term_words(t))) < 3:
+                raise PolicyError(
+                    f"{where}terms: each term is at least 3 letters or digits once folded, with no space at either end"
+                )
         narrowing = parse_repo_settings(body.get("repo_settings"), repos, where)
         if narrowing and os_user is None:
             raise PolicyError(
@@ -1114,33 +1116,66 @@ CANARY_PREFIX = "ws-walls-tracer-"
 _DASHES = dict.fromkeys(map(ord, "\u2010\u2011\u2012\u2013\u2014\u2015\u2212\ufe58\ufe63\uff0d"), "-")
 
 
-def _fold(text: str) -> str:
-    """Text as a term match reads it: NFKC (fullwidth letters, a non-breaking space), the format characters dropped
-    (a zero-width space or joiner inside a word), the dash family made "-", then casefolded. Letters that only look
-    the same in another script (a Cyrillic "а" for a Latin "a") are not caught."""
-    text = unicodedata.normalize("NFKC", text)
-    text = "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
-    return text.translate(_DASHES).casefold()
+def _no_marks(text: str) -> str:
+    """`text` with its combining marks (Unicode Mn and Me: an accent, a dot, a strike-through) taken off the letters."""
+    return unicodedata.normalize(
+        "NFC", "".join(ch for ch in unicodedata.normalize("NFKD", text) if unicodedata.category(ch) not in ("Mn", "Me"))
+    )
+
+
+def _fold(text: str, format_as: str = "") -> str:
+    """Text as a term match reads it: NFKC (fullwidth letters, a non-breaking space), the combining marks taken off, each
+    format character (a zero-width space, a soft hyphen, a word joiner) made `format_as`, the dash family made "-", then
+    casefolded with the marks taken off again (a dotted capital I folds to "i"). Letters that only look the same in
+    another script (a Cyrillic "а" for a Latin "a") are not caught."""
+    text = _no_marks(unicodedata.normalize("NFKC", text))
+    text = "".join(format_as if unicodedata.category(ch) == "Cf" else ch for ch in text)
+    return _no_marks(text.translate(_DASHES).casefold())
+
+
+_SEP = r"[\s_-]+"  # between a term's words: any run of white space, `_` or `-`
+
+
+def term_words(term: str) -> list[str]:
+    """The words of a term as the match reads them: folded, then split on white space, `_` and `-`."""
+    return [w for w in re.split(_SEP, _fold(term)) if w]
+
+
+def _term_pattern(words: list[str], whole: bool = True) -> str:
+    """The pattern for `words` with any separator between them; a letter or digit on either side makes it another word
+    (`_` does not). `whole` False leaves the end open, for a prefix."""
+    tail = r"(?![^\W_])" if whole else ""
+    return rf"(?<![^\W_]){_SEP.join(re.escape(w) for w in words)}{tail}"
+
+
+def _term_readings(text: str) -> tuple[str, str]:
+    """The two ways the match reads `text`: a format character as a space (it may sit between two words) and as nothing
+    (it may sit inside one)."""
+    return _fold(text, " "), _fold(text)
 
 
 def _has_term(text: str, term: str) -> bool:
-    """Is `term` in `text` (both `_fold`ed) as a whole term? Between the term's words any run of white space, `_` or `-`
-    counts as the one space; a letter or digit on either side makes it another word, and `_` does not."""
-    words = _fold(term).split()
-    body = r"[\s_-]+".join(re.escape(w) for w in words)
-    return re.search(rf"(?<![^\W_]){body}(?![^\W_])", text) is not None
+    """Is `term` in `text` as a whole term, in either reading of `text` (`_term_readings`)? Between the term's words any run
+    of white space, `_` or `-` counts as one space."""
+    words = term_words(term)
+    if not words:
+        return False
+    pattern = _term_pattern(words)
+    return any(re.search(pattern, r) is not None for r in _term_readings(text))
+
+
+_CANARY = _term_pattern(term_words(CANARY_PREFIX), whole=False)
 
 
 def term_problem(pol: Policy, own: Class | None, text: str) -> str | None:
     """Why a prompt bound for a hosted model may not leave, or None: it carries a canary token, or a `terms` entry of a
     class that is not `full` and is not the session's own class. The words name the class, never the term."""
-    low = _fold(text)
-    if CANARY_PREFIX in low:
+    if any(re.search(_CANARY, r) is not None for r in _term_readings(text)):
         return "the prompt carries a canary token planted in a walled class"
     for name, cls in sorted(pol.classes.items()):
         if cls.access == "full" or (own is not None and own.name == name):
             continue
-        if any(_has_term(low, t) for t in cls.terms):
+        if any(_has_term(text, t) for t in cls.terms):
             return f"the prompt carries a term of class {name!r}"
     return None
 

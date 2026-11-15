@@ -71,8 +71,9 @@ refuses a job whose policy needs one, so a gap is a refusal and never a silent a
 
 `tests/test_hook_parity.py` reads `docs/reference/hook-parity.toml`. A `covered` row must name a test in that file, and
 each test sends one sample call that a hand-built hook would stop (and one it would let through) to the ws side. The
-tests fail if a row has no test or a bad status or fail mode, if a hook in an inventory has no row, if a test has no
-row, or if this page isn't what the script writes from the table.
+tests fail if a row has no test or a bad status or fail mode, if a test has no row, or if this page isn't what the
+script writes from the table. Checking a real hook inventory is up to whoever keeps one: `missing(names)` returns the
+names that no row has, so a private check can call it with its own list.
 
 A row can move from `estate` or `dropped` to `covered` when ws grows the rule. Moving the other way needs a reason in
 the row.

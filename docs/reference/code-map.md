@@ -44,6 +44,7 @@ below, and `python3 scripts/gen_code_map.py --check` (prek and CI) fails when it
 | `mcp_server.py` | `ws mcp serve`: a small MCP server over stdio, so any runner can search and add to memory and... |
 | `memory.py` | Memory module: Markdown files with front matter in a git repo, plus a rebuildable SQLite FTS5 index |
 | `migrate.py` | `ws migrate`: move ws's files from `~/.ws` to the XDG folders (see `ws.paths` for which file... |
+| `minters/` | Minters: the broker turns a long-lived key it holds into a short-lived, narrowed credential for... |
 | `modules.py` | Plugins (the modules in the code): the parts of ws you can switch on or off |
 | `msg.py` | `ws msg`: leave a message for another session, on any runner or provider, and read what was left... |
 | `node.py` | A node's footprint: everything `ws node join` puts on this machine is written in a ledger as it... |

@@ -50,4 +50,5 @@ text), `event` and `id`. `added` carries the ask; `answered` carries `answer` (`
 `ts`). Status is folded from the events: open, then answered, then done; or open, then withdrawn. Lines from the OpenCode
 shim (no `answer`, no `at`) fold the same way. New keys and event kinds were added to the file; none changed meaning.
 
-Exit codes: 0 fine, 1 refused (a secret, already answered, a wall, a store that cannot be written), 2 usage or an unknown id.
+Exit codes: 0 fine, 1 refused (a secret, already answered, a wall, a store that cannot be written), 2 usage or an
+unknown id.

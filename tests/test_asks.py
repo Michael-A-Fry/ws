@@ -404,3 +404,191 @@ def test_two_answers_to_one_ask_only_one_succeeds(box, capsys, monkeypatch):
     [t.join() for t in ts]
     assert len(won) == 1 and lost == ["not_open"] * 7
     assert [e["event"] for e in box.lines()] == ["added", "answered"]
+
+
+# --- wait, done, withdraw ----------------------------------------------------------------------------------------------
+
+
+def test_wait_returns_the_answer_when_it_comes(box, capsys, monkeypatch):
+    monkeypatch.setattr(asks, "POLL_S", 0.02)
+    ident = box.add(capsys, "--question", "Q", "--option", "Yes", "--option", "No")
+    threading.Timer(0.2, lambda: asks.answer(ident, "2")).start()
+    code, out, _ = box.run(capsys, "wait", ident, "--timeout", "10")
+    assert code == 0 and out.strip() == "No"
+
+
+def test_wait_times_out_with_exit_3_and_still_open(box, capsys, monkeypatch):
+    monkeypatch.setattr(asks, "POLL_S", 0.02)
+    ident = box.add(capsys, "--question", "Q")
+    code, out, _ = box.run(capsys, "wait", ident, "--timeout", "0.1")
+    assert code == 3 and out.strip() == "still open"
+
+
+@pytest.mark.parametrize("verb", ["withdraw", "done"])
+def test_wait_on_a_closed_ask_with_no_answer_is_exit_4(box, capsys, verb):
+    ident = box.add(capsys, "--question", "Q")
+    box.run(capsys, verb, ident)
+    code, out, _ = box.run(capsys, "wait", ident, "--timeout", "1")
+    assert code == 4 and out.strip() == ("withdrawn" if verb == "withdraw" else "done")
+
+
+def test_wait_with_an_unknown_id_is_2_and_a_negative_timeout_is_2(box, capsys):
+    assert box.run(capsys, "wait", "nope")[0] == 2
+    ident = box.add(capsys, "--question", "Q")
+    assert box.run(capsys, "wait", ident, "--timeout", "-1")[0] == 2
+
+
+def test_wait_sees_an_answer_already_there(box, capsys):
+    ident = box.add(capsys, "--question", "Q")
+    box.run(capsys, "answer", ident, "yes")
+    code, out, _ = box.run(capsys, "wait", ident, "--timeout", "0")
+    assert code == 0 and out.strip() == "yes"
+
+
+def test_withdraw_closes_an_open_ask_and_is_a_no_op_after(box, capsys):
+    ident = box.add(capsys, "--question", "Q")
+    assert box.run(capsys, "withdraw", ident)[1].strip() == "withdrawn"
+    assert box.run(capsys, "list")[1].strip() == ""
+    assert box.run(capsys, "withdraw", ident)[1].strip() == "withdrawn"
+    assert box.run(capsys, "done", ident)[1].strip() == "withdrawn"  # a withdrawn ask is not done
+    assert [e["event"] for e in box.lines()] == ["added", "withdrawn"]
+    assert box.run(capsys, "answer", ident, "x")[0] == 1  # and it can no longer be answered
+
+
+def test_done_closes_open_and_answered_asks_and_is_a_no_op_after(box, capsys):
+    a = box.add(capsys, "--question", "A")
+    b = box.add(capsys, "--question", "B")
+    box.run(capsys, "answer", b, "yes")
+    assert box.run(capsys, "done", a)[1].strip() == "done"
+    assert box.run(capsys, "done", b)[1].strip() == "done"
+    assert box.run(capsys, "done", b)[1].strip() == "done"
+    assert box.run(capsys, "withdraw", b)[1].strip() == "done"
+    assert [e["event"] for e in box.lines()] == ["added", "added", "answered", "done", "done"]
+    assert asks.load()[b]["answer"]["text"] == "yes"  # the answer stays on a done ask
+
+
+def test_done_and_withdraw_on_an_unknown_id_are_2(box, capsys):
+    assert box.run(capsys, "done", "nope")[0] == 2
+    assert box.run(capsys, "withdraw", "nope")[0] == 2
+
+
+def test_ws_home_stops_showing_a_done_ask(box, capsys):
+    from ws.home import api
+    from ws.home.sources import asks_jsonl
+
+    ident = box.add(capsys, "--question", "Q")
+    env = api.Env.make({"HOME": str(box.home), "WS_HOME": str(box.home / ".ws")})
+    assert [a.id for a in asks_jsonl.read("asks", env)] == [ident]
+    box.run(capsys, "done", ident)
+    assert asks_jsonl.read("asks", env) == []
+
+
+# --- import ----------------------------------------------------------------------------------------------------------
+
+OLD = [
+    {"v": 1, "ts": "2026-11-01T01:02:03Z", "event": "added", "id": "a20261101T010203-ab12", "repo": "app",
+     "session": {"name": "bld", "tmux": "w:1"}, "rc_url": None, "question": "Ship it?",
+     "options": [{"label": "Yes", "description": "go"}, {"label": "No", "description": ""}],
+     "free_text_allowed": True, "decision": "the release", "source": "session", "dedupe_key": "k", "flows": "full",
+     "redacted": False},
+    {"v": 1, "ts": "2026-11-01T01:05:00Z", "event": "answered", "id": "a20261101T010203-ab12",
+     "answer": {"text": "Yes", "option_index": 0, "via": "page", "ts": "2026-11-01T01:05:00Z"}},
+    {"v": 1, "ts": "2026-11-02T00:00:00Z", "event": "added", "id": "a20261102T000000-cd34", "repo": "vault",
+     "session": {"name": "", "tmux": None}, "rc_url": None, "question": "Open the session to see this ask.",
+     "options": [], "free_text_allowed": False, "decision": "", "source": "session", "dedupe_key": "sha256:abc",
+     "flows": "counts", "redacted": True},
+    {"v": 1, "ts": "2026-11-03T00:00:00Z", "event": "added", "id": "a20261103T000000-ef56", "repo": "app",
+     "session": {"name": "x", "tmux": None}, "rc_url": None, "question": "Left open?", "options": [],
+     "free_text_allowed": True, "decision": "", "source": "session", "dedupe_key": None, "flows": "full",
+     "redacted": False},
+    {"v": 1, "ts": "2026-11-03T00:10:00Z", "event": "withdrawn", "id": "a20261103T000000-ef56"},
+]  # fmt: skip
+
+
+def old_file(tmp_path, extra: str = "") -> Path:
+    p = tmp_path / "old-asks.jsonl"
+    p.write_text("\n".join(json.dumps(r) for r in OLD) + "\n" + extra)
+    return p
+
+
+def test_import_converts_the_old_rows_into_events(box, capsys, tmp_path):
+    code, out, _ = box.run(capsys, "import", str(old_file(tmp_path)))
+    assert code == 0 and "imported 5 event(s); 0 already there; 0 skipped" in out
+    got = asks.load()
+    first = got["a20261101T010203-ab12"]
+    assert first["status"] == "answered" and first["answer"]["text"] == "Yes" and first["answer"]["via"] == "page"
+    assert first["ts"] == 1793494923000 and first["at"] == "2026-11-01T01:02:03.000Z" and "v" not in first
+    assert got["a20261103T000000-ef56"]["status"] == "withdrawn"
+    assert [e["schema"] for e in box.lines()] == [asks.SCHEMA] * 5
+
+
+def test_import_twice_adds_nothing_the_second_time(box, capsys, tmp_path):
+    src = old_file(tmp_path)
+    box.run(capsys, "import", str(src))
+    count = len(box.lines())
+    code, out, _ = box.run(capsys, "import", str(src))
+    assert code == 0 and "imported 0 event(s); 5 already there" in out
+    assert len(box.lines()) == count == 5
+
+
+def test_a_redacted_row_stays_redacted_and_gains_no_text(box, capsys, tmp_path):
+    box.run(capsys, "import", str(old_file(tmp_path)))
+    ask = asks.load()["a20261102T000000-cd34"]
+    assert ask["redacted"] is True and ask["question"] == asks.OPAQUE and ask["options"] == []
+    shown = asks.view(ask)
+    assert shown["opaque"] is True and shown["dedupe_key"] is None
+    assert box.run(capsys, "answer", ask["id"], "yes")[0] == 1
+
+
+def test_a_row_without_an_explicit_redacted_false_is_imported_redacted(box, capsys, tmp_path):
+    row = {k: v for k, v in OLD[3].items() if k != "redacted"} | {"id": "a20261104T000000-aa11"}
+    p = tmp_path / "o.jsonl"
+    p.write_text(json.dumps(row) + "\n")
+    box.run(capsys, "import", str(p))
+    assert asks.load()["a20261104T000000-aa11"]["redacted"] is True
+
+
+def test_dry_run_writes_nothing_and_says_what_it_would_do(box, capsys, tmp_path):
+    code, out, _ = box.run(capsys, "import", str(old_file(tmp_path)), "--dry-run")
+    assert code == 0 and "would import 5 event(s)" in out
+    assert not box.store.exists() and not box.store.parent.exists()
+
+
+def test_import_skips_bad_rows_and_closings_of_unknown_asks(box, capsys, tmp_path):
+    junk = 'not json\n{"v": 2, "event": "added", "id": "zz", "ts": "2026-11-01T00:00:00Z"}\n'
+    junk += json.dumps({"v": 1, "ts": "2026-11-01T00:00:00Z", "event": "done", "id": "ghost"}) + "\n"
+    code, out, _ = box.run(capsys, "import", str(old_file(tmp_path, junk)))
+    assert code == 0 and "imported 5 event(s); 0 already there; 3 skipped" in out
+
+
+def test_import_of_a_missing_file_is_a_usage_error(box, capsys, tmp_path):
+    assert box.run(capsys, "import", str(tmp_path / "none.jsonl"))[0] == 2
+
+
+def test_imported_asks_are_what_ws_home_reads(box, capsys, tmp_path):
+    from ws.home import api
+    from ws.home.sources import asks_jsonl
+
+    box.run(capsys, "import", str(old_file(tmp_path)))
+    got = asks_jsonl.read("asks", api.Env.make({"HOME": str(box.home), "WS_HOME": str(box.home / ".ws")}))
+    assert [a.id for a in got] == ["a20261102T000000-cd34"]  # the redacted one is the only one still open
+
+
+def test_ask_help_exits_0(box, capsys):
+    with pytest.raises(SystemExit) as e:
+        cli.main(["ask", "--help"])
+    assert e.value.code == 0
+    assert "import" in capsys.readouterr().out
+
+
+def test_notify_is_a_hook_that_does_nothing_by_default(box, capsys):
+    assert asks.NOTIFY_HOOK is None
+
+
+def test_the_notify_hook_runs_once_for_a_new_ask_and_gets_no_text_of_a_redacted_one(box, capsys, monkeypatch):
+    seen = []
+    monkeypatch.setattr(asks, "NOTIFY_HOOK", seen.append)
+    box.add(capsys, "--question", "plain", "--dedupe-key", "k")
+    box.add(capsys, "--question", "plain", "--dedupe-key", "k")  # the same open ask: no second call
+    box.add(capsys, "--question", "uses secretproject")
+    assert len(seen) == 2 and seen[1]["question"] == asks.OPAQUE

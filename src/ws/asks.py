@@ -46,6 +46,8 @@ LIMITS = {
 MAX_OPTIONS = 6
 LOCK_WAIT_S = 30.0  # how long a writer waits for `asks.lock` before it gives up
 MAX_BYTES = 8 * 1024 * 1024  # a log turns over here, well under the 64 MiB `ws home` reads
+DEFAULT_WAIT = 540  # seconds: under a 10-minute tool limit
+POLL_S = 1.0  # how often `wait` looks at the store
 RANK = {a: i for i, a in enumerate(policy.ACCESS)}  # a higher number is stricter
 FLOWS = {"full": "full", "walled": "counts", "counts-only": "off"}  # the old program's `flows_back`, by policy access
 _ID = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
@@ -508,6 +510,9 @@ def cmd_add(args) -> int:
             sess[k] = v
     fields["session"] = sess
     ident, created, event = add(fields, args.cwd or os.getcwd())
+    if created and NOTIFY_HOOK is not None:
+        with contextlib.suppress(Exception):  # a notification never fails the ask
+            NOTIFY_HOOK(event)  # it gets the stored event: a redacted ask has no text in it
     if args.json:
         output.result({"id": ident, "created": created, "redacted": bool(event.get("redacted"))})
     else:
@@ -563,6 +568,145 @@ def cmd_answer(args) -> int:
     return 0
 
 
+# --- wait, done, withdraw ----------------------------------------------------------------------------------------------
+
+
+def close(ident: str, kind: str, env=None) -> str:
+    """Close an ask: `done` (an open or answered one) or `withdrawn` (an open one). On an ask that is already closed it
+    writes nothing and reports its status. Returns the status."""
+    ask = get(ident, env)
+    if ask["status"] in ("open", "answered") and (kind == "done" or ask["status"] == "open"):
+        _write(_env(env), {"event": kind, "id": ident})
+        return kind
+    return ask["status"]
+
+
+def cmd_close(args) -> int:
+    status = close(args.id, "done" if args.ask_command == "done" else "withdrawn")
+    if args.json:
+        output.result({"id": args.id, "status": status})
+    else:
+        print(status)
+    return 0
+
+
+def _stamp(env):
+    try:
+        st = store_path(env).stat()
+        return st.st_mtime_ns, st.st_size
+    except OSError:
+        return None
+
+
+def cmd_wait(args) -> int:
+    """Block until the ask is answered, polling the store. 0 and the answer; 3 and `still open` at the timeout; 4 and the
+    status when it was withdrawn or done with no answer."""
+    if args.timeout < 0:
+        raise WsError("usage", "--timeout must be 0 or more", "", 2)
+    deadline = time.monotonic() + args.timeout
+    get(args.id)
+    stamp, code, shown = object(), 3, "still open"
+    while True:
+        now = _stamp(None)
+        if now != stamp:
+            stamp = now
+            ask = get(args.id)
+            if ask["answer"]:
+                code, shown = 0, ask["answer"].get("text") or ""
+                break
+            if ask["status"] in CLOSED:
+                code, shown = 4, ask["status"]
+                break
+        left = deadline - time.monotonic()
+        if left <= 0:
+            break
+        time.sleep(min(POLL_S, left))
+    if args.json:
+        output.result(
+            {"id": args.id, "outcome": shown if code != 0 else "answered", "answer": shown if code == 0 else None},
+            status=output.OK if code == 0 else output.ATTENTION,
+        )
+    else:
+        print(shown)
+    return code
+
+
+# --- import ----------------------------------------------------------------------------------------------------------
+
+
+def _epoch_ms(value) -> int | None:
+    try:
+        return int(datetime.fromisoformat(str(value)).timestamp() * 1000)
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def convert(row: dict) -> dict | None:
+    """One row of the older asks file (`v` 1, an ISO `ts` ending in Z, events `added`, `answered`, `withdrawn`, `done`) as
+    an event of this store, or None when it is not one. A redacted row stays as it was stored: nothing is put back."""
+    ident, event, ms = row.get("id"), row.get("event"), _epoch_ms(row.get("ts"))
+    if row.get("v") != 1 or event not in EVENTS or not isinstance(ident, str) or not _ID.match(ident) or ms is None:
+        return None
+    out = {k: v for k, v in row.items() if k not in ("v", "ts")}
+    out.update(schema=SCHEMA, ts=ms, at=jsonl.iso_utc(ms / 1000))
+    if event == "added":
+        if not isinstance(row.get("question"), str) or not isinstance(row.get("options"), list):
+            return None
+        out["redacted"] = row.get("redacted") is not False
+    elif event == "answered":
+        a = row.get("answer")
+        if not isinstance(a, dict):
+            return None
+        out["answer"] = {**a, "ts": _epoch_ms(a.get("ts")) or ms}
+    return out
+
+
+def import_file(path: Path, dry_run: bool = False, env=None) -> dict:
+    """Convert an older asks file into events here. A row already imported (same event and id) is skipped, so a second run
+    adds nothing; a row that is not valid, or closes an ask that is not there, is counted and skipped. Dry run writes
+    nothing."""
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        raise WsError(
+            "usage", f"cannot read {path}: {e.strerror or e}", "give the path of an asks.jsonl file", 2
+        ) from e
+    have = {(r.get("event"), r.get("id")) for r in records(env)}
+    known = {i for e, i in have if e == "added"}
+    done = {"imported": 0, "existing": 0, "skipped": 0, "dry_run": dry_run}
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            done["skipped"] += 1
+            continue
+        ev = convert(row) if isinstance(row, dict) else None
+        if ev is None or (ev["event"] != "added" and ev["id"] not in known):
+            done["skipped"] += 1
+        elif (ev["event"], ev["id"]) in have:
+            done["existing"] += 1
+        else:
+            if not dry_run:
+                _write(_env(env), ev)
+            have.add((ev["event"], ev["id"]))
+            if ev["event"] == "added":
+                known.add(ev["id"])
+            done["imported"] += 1
+    return done
+
+
+def cmd_import(args) -> int:
+    got = import_file(Path(args.path), args.dry_run)
+    if args.json:
+        output.result(got)
+    else:
+        verb = "would import" if args.dry_run else "imported"
+        print(f"{verb} {got['imported']} event(s); {got['existing']} already there; {got['skipped']} skipped")
+    return 0
+
+
 def register(sub) -> None:
     p = sub.add_parser("ask", help="leave a question for a person and read back the answer (one queue, every session)")
     s = p.add_subparsers(dest="ask_command", required=True)
@@ -594,3 +738,18 @@ def register(sub) -> None:
     an.add_argument("id")
     an.add_argument("text", nargs="+")
     an.set_defaults(func=cmd_answer)
+
+    w = s.add_parser("wait", help="block until answered; 0 and the answer, 3 timed out, 4 withdrawn or done")
+    w.add_argument("id")
+    w.add_argument("--timeout", type=float, default=DEFAULT_WAIT, metavar="SECONDS")
+    w.set_defaults(func=cmd_wait)
+
+    for name in ("done", "withdraw"):
+        c = s.add_parser(name, help=f"{name} an ask (a no-op that prints the status if it is already closed)")
+        c.add_argument("id")
+        c.set_defaults(func=cmd_close)
+
+    im = s.add_parser("import", help="convert an older asks file into events here (safe to run twice)")
+    im.add_argument("path")
+    im.add_argument("--dry-run", action="store_true", help="say what would be imported; write nothing")
+    im.set_defaults(func=cmd_import)

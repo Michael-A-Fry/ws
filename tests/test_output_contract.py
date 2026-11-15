@@ -133,6 +133,10 @@ CASES: dict[str, list[str]] = {
     "ask.list": ["ask", "list"],
     "ask.get": ["ask", "get", "nope"],
     "ask.answer": ["ask", "answer", "nope", "yes"],
+    "ask.wait": ["ask", "wait", "nope"],
+    "ask.done": ["ask", "done", "nope"],
+    "ask.withdraw": ["ask", "withdraw", "nope"],
+    "ask.import": ["ask", "import", "{home}/none.jsonl"],
     "term": ["term", "--bind", "0.0.0.0"],  # a typed refusal: the real command stays up until stopped
 }
 

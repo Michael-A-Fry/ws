@@ -20,9 +20,8 @@ A module must define:
                                                 for: it is allowed and logged); ValueError or TypeError if it cannot be
                                                 read (`ws gate check` then denies: fail closed).
     CANNOT_CHECK: dict[str, str]                REQUIRED: a check name -> why this runner cannot enforce it ("mcp", "allow_hosts",
-                                                "guard:NAME"); `{}` when it can do all. A job whose policy needs one is
-                                                refused once `ws run` calls ws.conformance.refuse_cannot_check (wired
-                                                after the walls change merges).
+                                                "guard:NAME"); `{}` when it can do all. `ws run` refuses a job whose policy needs
+                                                one (ws.conformance.refuse_cannot_check).
     def launch_hint(out) -> str                 one line: how to start the runner with the generated config.
 
 and, optionally:

@@ -784,3 +784,31 @@ def test_every_adapter_declares_cannot_check_as_a_dict_of_reasons():
     for name, mod in adapters.all_adapters().items():
         gaps = getattr(mod, "CANNOT_CHECK", None)
         assert isinstance(gaps, dict) and all(isinstance(v, str) and v for v in gaps.values()), name
+
+
+# --- `ws run` refuses the planted job ---------------------------------------------------------------------------------
+
+from test_run import ws as run_ws  # noqa: F401  (a scratch WS_HOME with a fake runner, for the `ws run` tests)
+
+
+def _opencode_job(run_ws, policy_text):  # noqa: F811
+    (run_ws.home / "policy.toml").write_text(policy_text, encoding="utf-8")
+    (run_ws.home / "jobs" / "daily.toml").write_text(
+        'runner = "opencode"\nmodel = "anthropic/claude-haiku-4-5"\nprompt = "ok"\ntimeout_s = 30\n', encoding="utf-8"
+    )
+
+
+def test_ws_run_refuses_an_opencode_job_whose_policy_allows_an_mcp_tool(run_ws, capsys):  # noqa: F811
+    _opencode_job(run_ws, '[gate]\nallow_mcp = ["mcp__docs__search"]\n')
+    assert cli.main(["run", "daily"]) == 3
+    err = capsys.readouterr().err
+    assert "CANNOT_CHECK" in err and "mcp" in err
+    (rec,) = run_ws.records()
+    assert rec["status"] == "refused" and rec["stop_reason"] == "refused:cannot_check"
+
+
+def test_ws_run_does_not_refuse_the_same_policy_for_claude_code(run_ws):  # noqa: F811
+    _opencode_job(run_ws, '[gate]\nallow_mcp = ["mcp__docs__search"]\n')
+    run_ws.job()  # the stock claude-code job
+    cli.main(["run", "daily"])
+    assert all(r["stop_reason"] != "refused:cannot_check" for r in run_ws.records())

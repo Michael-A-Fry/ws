@@ -63,6 +63,10 @@ If you already use your own `core.hooksPath`, copy the hook into it or call it f
 `WS_SKIP_PREPUSH=1`. That appends a line to `.git/ws-prepush-skips.log`, so a skip is never silent. CI runs the same
 checks, so skipping only moves the failure.
 
+On a machine where several test runs share the cores, a suite raced by others can miss a timing test's deadline. Set
+`WS_PREPUSH_WRAP` to a command that queues the run, and the hook starts the suite through it (split on spaces; `prek`
+runs as it is). For example `WS_PREPUSH_WRAP="flock /tmp/tests.lock" git push`. Unset or empty, nothing changes.
+
 ## Rules for a change
 
 [AGENTS.md](AGENTS.md) ("Conventions" and "Anti-patterns") is the source of truth, and it applies to people as much as

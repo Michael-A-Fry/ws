@@ -27,6 +27,8 @@ body of the GitHub release.
   (`counted_as: "write"`). A check that fails before the policy loads still leaves a deny line (rule `error`, with no
   session id or tool name), a guard that speaks after a call names itself, the live file turns over at 5 MiB instead of
   1 MiB, and a hook waits at most 0.2 seconds for the log's lock.
+- The pre-push hook runs the suite through `WS_PREPUSH_WRAP` when it's set (a command that queues test runs on a busy
+  machine), so a push's suite doesn't race the others. Unset, it runs as before.
 
 ### Changed
 

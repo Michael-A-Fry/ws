@@ -456,7 +456,16 @@ outward = []
 [gate]
 deny_commands = {arr(default_deny_commands())}
 # Paths no session may read. `~/` is your home; `**` crosses folders.
-deny_read = ["~/.ssh/**", "~/.gnupg/**", "~/.aws/credentials", "~/.config/ws/secrets/**", "~/.local/share/ws/secrets/**"]
+deny_read = [
+  "~/.ssh/**", "~/.gnupg/**", "~/.aws/credentials", "~/.config/ws/secrets/**", "~/.local/share/ws/secrets/**",
+  # a project's local secrets (a bare name matches at any depth; `.env.example` stays readable)
+  ".env", ".env.local", ".env.development", ".env.production", ".env.staging",
+  # signed-in browser profiles: cookies and saved logins
+  "~/.config/google-chrome/**", "~/.config/chromium/**", "~/.config/BraveSoftware/**", "~/.config/microsoft-edge/**",
+  "~/.mozilla/**", "~/Library/Application Support/Google/Chrome/**", "~/Library/Application Support/Firefox/**",
+  # the GitHub CLI's stored token (a session uses the broker's short-lived one)
+  "~/.config/gh/hosts.yml",
+]
 # Neutral tool names to switch off: {", ".join(KNOWN_TOOLS)}. An allowed web tool counts as a way out (leg C). An MCP
 # tool is named as `mcp__SERVER__TOOL`, and a glob works (`mcp__SERVER__*`, `mcp__*__delete_*`).
 deny_tools = []

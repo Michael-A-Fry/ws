@@ -41,7 +41,8 @@ You type the value yourself, in your own terminal. Never paste a key into an AI 
    folder only, so a session cannot steer where the value goes: `ask` refuses when `WS_HOME`, `HOME` or an `XDG_*`
    variable points ws's folders anywhere but your account's own. The value goes to the store your account's profile
    names (`[roles.secrets] store`), or the default one; the window prints which before you type.
-   The older `ws-secret ask NAME` and `ws-secret wait NAME` still work (the same commands); plan to move to `ws secret` before it is removed, 30 days after AI_Workspace is switched off.
+   The older `ws-secret ask NAME` and `ws-secret wait NAME` still work (the same commands);
+   plan to move to `ws secret` before it is removed, 30 days after AI_Workspace is switched off.
 
 3. Check that it's set. The list shows names, hosts, state and owner. It never shows a value.
 

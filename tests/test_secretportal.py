@@ -163,7 +163,7 @@ def test_the_window_runs_with_no_session_environment_and_only_the_account_home(a
     monkeypatch.setenv("WS_HOME", str(planted))
     monkeypatch.setenv("XDG_DATA_HOME", str(planted))
     cmd = secretportal.window_command("demo")
-    assert cmd.startswith("env -i HOME=")
+    assert cmd.startswith("/usr/bin/env -i HOME=")
     assert str(planted) not in cmd and "WS_HOME" not in cmd and "XDG" not in cmd
     assert f"HOME={acct}" in cmd and "secret prompt demo" in cmd
 
@@ -189,14 +189,29 @@ def test_the_prompt_takes_its_store_from_the_account_not_from_the_session_enviro
     assert VALUE not in "\n".join(p.read_text(errors="replace") for p in planted.rglob("*") if p.is_file())
 
 
-def test_the_prompt_refuses_a_store_outside_the_accounts_own_folders(account, monkeypatch):
+def test_the_prompt_honours_the_store_the_accounts_own_profile_names(account, monkeypatch, tmp_path):
     acct, planted = account
-    prof = acct / ".ws" / "profile.toml"
-    prof.write_text(f'[roles.secrets]\nstore = "{planted / "elsewhere"}"\n')
+    chosen = tmp_path / "chosen-store"
+    (acct / ".ws" / "profile.toml").write_text(f'[roles.secrets]\nstore = "{chosen}"\n')
+    # a session's own profile in its own folder says nothing
+    (planted / "profile.toml").write_text(f'[roles.secrets]\nstore = "{planted / "elsewhere"}"\n')
+    monkeypatch.setenv("WS_HOME", str(planted))
     monkeypatch.setattr(secretportal.time, "sleep", lambda s: None)
     monkeypatch.setattr(getpass, "getpass", lambda prompt="": VALUE)
-    assert secretportal.cmd_prompt(_ns("demo")) == 1
+    assert secretportal.cmd_prompt(_ns("demo")) == 0
+    assert (chosen / "demo").read_text() == VALUE
     assert not (planted / "elsewhere").exists()
+
+
+def test_wait_reads_the_accounts_markers_not_the_sessions(account, monkeypatch):
+    acct, planted = account
+    marker = acct / ".ws" / "secret-asks" / "demo.json"
+    marker.parent.mkdir(parents=True)
+    marker.write_text(json.dumps({"name": "demo", "state": "stored"}))
+    monkeypatch.setenv("WS_HOME", str(planted))  # a planted "stored" marker would be read if this were followed
+    (planted / "secret-asks").mkdir()
+    (planted / "secret-asks" / "demo.json").write_text(json.dumps({"name": "demo", "state": "cancelled"}))
+    assert secretportal.cmd_wait(_ns("demo")) == 0
 
 
 def test_nothing_in_src_docs_or_tests_reads_the_old_registry_file():

@@ -107,9 +107,8 @@ def window_command(name: str) -> str:
     if why:
         raise WsError("refused", f"ws runs from {why}", "ask from the installed ws, in your own terminal")
     env = [f"HOME={shlex.quote(trusted_env()['HOME'])}", f"PATH={shlex.quote(paths.tool_path())}", "PYTHONUTF8=1"]
-    return (
-        shlex.join(["env", "-i"]) + " " + " ".join(env) + " " + shlex.join([*selfcmd.argv(), "secret", "prompt", name])
-    )
+    # `/usr/bin/env` by path: a session can set tmux's global PATH
+    return "/usr/bin/env -i " + " ".join(env) + " " + shlex.join([*selfcmd.argv(), "secret", "prompt", name])
 
 
 def cmd_ask(args) -> int:
@@ -179,8 +178,8 @@ def _prompt(args) -> int:
     try:
         if name not in wsecrets.load_registry(wsecrets.registry_path()):
             raise wsecrets.SecretsError(f"{name!r} is not registered")
-        if wsecrets.store_dir() not in paths.secret_dirs():
-            raise wsecrets.SecretsError("the store is not in the account's own ws folders")
+        # the store is the one the account's own profile names (`[roles.secrets] store`, in the gate-protected config
+        # folder: the person's choice) or the default one; never a session's variable, which `_trusted` ignores
         print(f"Storing {name} in {wsecrets.store_dir()}")
         try:
             value = getpass.getpass(f"Value for {name} (not shown; Enter stores it, Ctrl-C cancels): ")

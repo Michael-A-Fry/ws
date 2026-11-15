@@ -54,13 +54,13 @@ folders read-only, and the gate refuses a session's writes to each of them in ei
 | Eval looks | `eval/looks.jsonl` | `src/ws/eval.py` | `schema`, `ts`, `pair`, `look`, `result` | 1 | `ts` | Rotates at 5 MiB |
 | Gate calls | `logs/gate-calls.jsonl` | `src/ws/guards/record_calls.py` | `schema`, `ts`, `at`, `runner`, `payload` | 1 | `ts`, `at` | Rotates at 5 MiB |
 | Claims | `logs/claims.jsonl` | `src/ws/guards/claims.py` | `schema`, `ts`, `at`, `runner`, `session`, `ref`, `claims` | 1 | `ts`, `at` | Rotates at 5 MiB |
-| Gate verdicts | `logs/gate.jsonl` | `src/ws/gate.py` | `schema`, `ts`, `runner`, `session`, `event`, `decision` (`allow`, `deny`, `ask`, `claim`), `layer`, `guards` (each `guard`, a guard's name or `rule:KIND`; `result`, `ms`, and when they apply `count` and `gap`), `ms`, `via` (`direct` or `daemon`), and on a line about a would-deny or an unlisted tool `tool` and `unlisted` | 1 | `ts` | Rotates at 1 MiB |
+| Gate verdicts | `logs/gate.jsonl` | `src/ws/gate.py` | `schema`, `ts`, `runner`, `session`, `event`, `decision` (`allow`, `deny`, `ask`, `claim`), `layer`, `guards` (each `guard`, a guard's name or `rule:KIND`; `result`, `ms`, and when they apply `count` and `gap`), `ms`, `via` (`direct` or `daemon`), `tool`, on a decision other than `allow` a `rule` (the id of the rule or layer that said no, never its reason), and for a tool no adapter reads `unlisted` and `counted_as` (`write`). One line per call's check, allow included | 1 | `ts` | Rotates at 5 MiB |
 | Wall report | `logs/wall-report.jsonl` | `src/ws/sandbox.py` | `schema`, `ts`, `at`, `project`, `runner`, `incomplete`, `findings`, `notes` | 1 | `ts`, `at` | Rotates at 5 MiB |
 | Node footprint | `node/footprint.jsonl` | `src/ws/node.py` | `schema`, `ts`, `type` (`ws.footprint/1`), `node`, `op` (`intent`, `done`, `removed`), `step`, and on an intent `kind`, `target`, `sha256`, `existed` | 1 | `ts` | Never rotated; removed by `ws node remove` once every change is undone |
 | OpenCode asks | `.claude-usage/asks/asks.jsonl` | `src/ws/adapters/opencode.py` (the shim it generates writes the lines, from OpenCode's permission events) | `schema`, `ts` (epoch milliseconds), `event` (`added`, `answered`), `id`, and on `added` `repo`, `session`, `question`, `options`, `decision`, `source` | 1 | `ts` | Each line starts with a newline; past 8 MiB the file moves to `asks.jsonl.old`, one generation, so it stays under the 64 MiB `ws home` reads |
 | Job alerts | `logs/alerts.jsonl` | `src/ws/jobwatch.py` (`ws watch`) | `schema`, `ts`, `kind` (`not-automatic`), `event` (`unit-failed`, `no-run`), `job`, `pushed`; on `unit-failed` `unit`, `result`, `exit_status`; on `no-run` `hours_since` | 1 | `ts` | Never rotated; one line per alert |
 | Upgrade history | `upgrade-history.jsonl` | `src/ws/upgrade.py` (`ws upgrade`) | `schema`, `ts`, `verb` (`promote`, `rollback`, `auto-rollback`), `from`, `to` (none when a rollback failed) | 1 | `ts` | Never rotated: the last promote is the way back |
-| Broker audit | `logs/broker.jsonl` | `src/ws/broker.py` | `t`, `op`, `name`, `purpose`, `host`, `uid`, `pid`, `lease`, `status`, `bytes` | none (reads as 1) | `t` | One file; the broker appends and never rotates it |
+| Broker audit | `logs/broker.jsonl` | `src/ws/broker.py` | `t`, `op` (`request`, `release`, `proxy`, `elevate`, `revoke`, `mint`, `sign`, `ca_public`; on `mint` and `sign` the `purpose` holds the repos and permissions, or the serial and principals), `name`, `purpose`, `host`, `uid`, `pid`, `lease`, `run`, `area`, `tier`, `status`, `bytes` | none (reads as 1) | `t` | One file; the broker appends and never rotates it. `ws broker audit-copy` copies it off the machine |
 
 Where the policy has `[classes]`, a session writes its gate verdicts and calls to `logs/classes/<name>/gate.jsonl`
 and `logs/classes/<name>/gate-calls.jsonl` instead (a folder of no class uses the built-in `unclassified`), in a 0700
@@ -89,7 +89,10 @@ Notes:
   `[home.sources] asks_jsonl` in the profile, else `.claude-usage/asks/asks.jsonl` below your home folder. Its `ts` is
   epoch milliseconds, not the RFC 3339 text of the other logs; the reader takes either.
 - The broker audit log predates the convention. It's the one log that doesn't go through `ws.jsonl`, and it has no
-  `schema`. Its time key is `t`. A change to it takes a schema number of its own.
+  `schema`. Its time key is `t`. A change to it takes a schema number of its own. `run`, `area` and `tier` were added
+  without one: they're new keys that older readers skip, and no old key changed meaning.
+- The broker's run records (`run/records/<run id>`, one JSON object each, 0600 in a 0700 folder) and its kill switch
+  (`elevate.json`) sit in the broker's own state folder. They're control files, not logs: one writer, no history.
 - Ratings sit at the top of the state folder and not in `logs/`. The top holds the control files a session may not write,
   and the person's verdicts sit with them, so an agent can't mark its own work. `logs/` is where a session may be able
   to write.

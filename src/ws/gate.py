@@ -480,6 +480,7 @@ def _check(
     wall = _Wall(adapter, payload, preflight is not None, walled)
     if audit is not None and any(c.kind == "other" for c in calls):
         audit["unlisted"] = 1
+        audit["counted_as"] = UNLISTED_COUNTS_AS
     asks: list[tuple[Call, str]] = []  # an MCP call no rule names: the guards judge it first, then a person is asked
     # What the guards and `ask_commands` read: a line that sets the field separator is read with that renamed.
     readable = list(calls)
@@ -493,7 +494,8 @@ def _check(
         if isinstance(reason, Ask):
             asks.append((call, reason))
         elif reason:
-            _mark(layer, f"rule:{call.kind}")
+            # the rule's id: the refusal's own kind where it has one, else the kind of call the policy's rules judged
+            _mark(layer, f"rule:{reason.kind}" if isinstance(reason, policy.Refusal) else f"rule:{call.kind}")
             return reason
     session, cwd = _text(payload, "session_id"), _text(payload, "cwd")
     ctx = _context(runner, "pre", payload, clock, home, wall, _class_of_session(pol, cwd))
@@ -647,27 +649,35 @@ def _protect(policy_file: Path, extra: list[str] | None = None) -> tuple[str, ..
     )
 
 
+# A tool no adapter reads is counted as a write: what it does is unknown, so its line says the worst kind of call it could
+# be, and a reader counting writes (a job's switch at draft, a release's audit) counts it.
+UNLISTED_COUNTS_AS = "write"
 VERDICT_LOG = "gate.jsonl"
 VERDICT_SCHEMA = 1
-# A line is counts and names, so the live file turns over at 1 MiB (jsonl keeps DEFAULT_KEEP old ones, readers span them).
-VERDICT_MAX_BYTES = 1024 * 1024
+# A line is counts and names, one per call's check (several thousand a day). The live file turns over at jsonl's own
+# default, and with the DEFAULT_KEEP old files (readers span them) that holds days of calls, enough for a day's measure.
+VERDICT_MAX_BYTES = jsonl.DEFAULT_MAX_BYTES
+# How long a hook waits for the log's lock. The line is advice; the call never waits on it for long.
+VERDICT_LOCK_S = 0.2
 
 
 def _log_verdicts(rec: dict, cls: policy.Class | None = None) -> None:
-    """One line in `<state>/logs/gate.jsonl` for a hook run that asked a guard, refused something, let through what a
-    guard in log mode would have refused, or met a tool no adapter reads: what was decided, by which layer, the tool's
-    name when the line is about a would-deny or an unlisted tool, and each guard's verdict (`guard` is a guard's name or
-    `rule:KIND`). It holds no command, path or message text. A session in a data class `cls` writes to that class's own
+    """One line in `<state>/logs/gate.jsonl` for each call's check, allow included, and for an event a guard was asked
+    about: what was decided, by which layer, the session id, the tool's name, each guard's verdict (`guard` is a guard's
+    name or `rule:KIND`), and on a decision other than allow a `rule`, the id of the rule or layer that said no
+    (`rule:KIND`, `guard:NAME`, `ask_commands`, `ask_mcp`, `preflight`, `error`). A tool no adapter reads adds
+    `unlisted: 1` and `counted_as: "write"`. It holds no command, path, reason or message text. A session in a data class `cls` writes to that class's own
     copy, `logs/classes/<name>/gate.jsonl`, and to no other; if that folder is not the running user's, nothing is
     written, and the shared log is not used instead. A log that can't be written never changes the decision."""
-    try:
+    # a log is advice: no error in it (a layout ws cannot tell, a held lock) changes the exit code
+    with contextlib.suppress(Exception):
         if cls is None:
             where = paths.state_dir() / "logs" / VERDICT_LOG
         elif (where := paths.class_log_path(cls.name, VERDICT_LOG)) is None:
             return
-        jsonl.append(where, jsonl.stamped(rec, VERDICT_SCHEMA), max_bytes=VERDICT_MAX_BYTES)
-    except (OSError, ValueError):
-        pass
+        jsonl.append(
+            where, jsonl.stamped(rec, VERDICT_SCHEMA), max_bytes=VERDICT_MAX_BYTES, lock_timeout_s=VERDICT_LOCK_S
+        )
 
 
 def _verdict_record(
@@ -684,11 +694,22 @@ def _verdict_record(
         "guards": verdicts,
         "ms": ms,
         "via": via,
+        "tool": _tool_of(raw),
         **audit,
     }
-    if audit or any(v.get("result") == "would-deny" for v in verdicts):
-        rec["tool"] = _tool_of(raw)
+    if (
+        decision != "allow"
+    ):  # the id of the rule or layer that said no (never its reason text, which may hold the command)
+        rec["rule"] = layer or "error"
     return rec
+
+
+def _event_layer(verdicts: list[dict]) -> str | None:
+    """The layer of an event that exited 2: the first guard whose verdict said deny, warn or error (`guard:NAME`)."""
+    for v in verdicts:
+        if v.get("result") in ("deny", "warn", "error"):
+            return f"guard:{v['guard']}"
+    return None
 
 
 def _class_of_raw(pol: policy.Policy, raw: str) -> policy.Class | None:
@@ -766,23 +787,27 @@ def run_check(args: argparse.Namespace, raw: str, via: str = "direct") -> tuple[
                 )
             except BaseException as e:  # noqa: BLE001 - fail closed on anything
                 reason, layer = _reason_of(e), ["error"]
-            if verdicts or reason is not None or audit:
-                _log_verdicts(
-                    _verdict_record(
-                        args,
-                        raw,
-                        "PreToolUse",
-                        _decision(reason),
-                        layer[0] if layer else None,
-                        verdicts,
-                        round((time.perf_counter() - began) * 1000, 2),
-                        via,
-                        audit,
-                    ),
-                    _class_of_raw(pol, raw),
-                )
+            # every decision, allow included, one line per hook run: a block rate needs the passes
+            _log_verdicts(
+                _verdict_record(
+                    args,
+                    raw,
+                    "PreToolUse",
+                    _decision(reason),
+                    layer[0] if layer else None,
+                    verdicts,
+                    round((time.perf_counter() - began) * 1000, 2),
+                    via,
+                    audit,
+                ),
+                _class_of_raw(pol, raw),
+            )
     except BaseException as e:  # noqa: BLE001 - fail closed on anything, including a broken policy file
         reason = _reason_of(e)
+        # No policy, so no class: the shared log gets the deny with no session id or tool name, which a class keeps apart.
+        with contextlib.suppress(Exception):  # the deny stands whatever the log does
+            ms = round((time.perf_counter() - began) * 1000, 2)
+            _log_verdicts(_verdict_record(args, "", "PreToolUse", "deny", "error", [], ms, via, {}))
     err = "".join(f"ws gate: {note}\n" for note in notes)
     if reason is None:
         return 0, _warning_out(args.runner, paths.UNPINNED_NOTE) if unpinned else "", err
@@ -808,7 +833,7 @@ def run_event(args: argparse.Namespace, raw: str, via: str = "direct") -> tuple[
                         raw,
                         "",
                         "deny" if code == DENY else "allow",
-                        None,
+                        _event_layer(verdicts) if code == DENY else None,
                         verdicts,
                         round((time.perf_counter() - began) * 1000, 2),
                         via,

@@ -72,7 +72,8 @@ def test_a_known_tool_leaves_no_unlisted_line(box):
     plain = box / "plain.toml"
     plain.write_text("[gate]\n")  # no guard on, so none is asked
     assert run("claude-code", payload, plain)[0] == 0
-    assert verdict_lines() == []  # an ordinary allowed call with no guard asked writes nothing
+    (line,) = verdict_lines()  # an ordinary allowed call is logged, and not as unlisted
+    assert line["decision"] == "allow" and "unlisted" not in line and "counted_as" not in line
 
 
 def test_a_planted_mcp_call_reaches_the_gate_and_is_recorded(box):

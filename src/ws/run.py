@@ -492,16 +492,19 @@ def _loopback_url(url: str) -> bool:
 def _job_is_local(job: jobs.Job, provider: str) -> bool:
     """Does every model call of the job stay on this machine? Only when its provider is a local one by name, it takes no
     secret lease (a lease's address is the broker, which forwards to a hosted host), its `provider` table uses no
-    `{env:...}` or `{file:...}` substitution, every base URL in it is a literal loopback URL and every other URL in it is
+    `{env:...}` or `{file:...}` substitution (in a key or a value), every base URL in it is a literal loopback URL and every other URL in it is
     loopback. Anything else counts as hosted."""
     from ws import sandbox
 
     if provider not in sandbox.LOCAL_PROVIDERS or job.secrets:
         return False
-    for key, value in _strings((job.runner_options or {}).get("provider")):
+    block = (job.runner_options or {}).get("provider")
+    # opencode substitutes in the raw text before it parses it, so a key can carry one as well as a value
+    raw = json.dumps(block, default=str)
+    if any(s in raw for s in _SUBSTITUTIONS):
+        return False
+    for key, value in _strings(block):
         text = value if isinstance(value, str) else ""
-        if any(s in text for s in _SUBSTITUTIONS):
-            return False
         if key.lower() in _BASE_KEYS and not _loopback_url(text):
             return False
         if "://" in text and not _loopback_url(text):

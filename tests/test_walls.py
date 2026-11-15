@@ -1645,6 +1645,8 @@ def _job(model: str = "ollama/llama3", provider=None, secrets: str = "") -> jobs
         (lambda: _job(provider='{ options = { baseURL = "{env:BASE}" } }'), False),
         (lambda: _job(provider='{ options = { baseURL = "{file:~/base.txt}" } }'), False),
         (lambda: _job(provider='{ options = { headers = { X = "{env:HOST}" } } }'), False),
+        (lambda: _job(provider='{ options = { "{env:INJ}" = 1 } }'), False),
+        (lambda: _job(provider='{ models = { "{file:~/m.txt}" = { name = "m" } } }'), False),
         (lambda: _job(provider='{ options = { baseURL = "127.0.0.1:11434" } }'), False),  # not a literal URL
         (lambda: _job(provider="{ options = { base_url = 11434 } }"), False),
     ],
@@ -1659,6 +1661,8 @@ def _job(model: str = "ollama/llama3", provider=None, secrets: str = "") -> jobs
         "env substitution",
         "file substitution",
         "substitution elsewhere",
+        "substitution in a key",
+        "file substitution in a models key",
         "baseURL with no scheme",
         "baseURL not a string",
     ],
@@ -1694,6 +1698,20 @@ def test_an_env_substituted_hosted_base_url_gets_the_term_check():
         'runner = "opencode"\nmodel = "ollama/llama3"\nprompt = "kestrel ridge"\n'
         '[runner_options]\nprovider = { options = { baseURL = "{env:BASE}" } }\n'
         'env = { BASE = "https://api.example.com/v1" }\n',
+        Path("."),
+    )
+    assert wsrun._term_leak(pol, job) == "the prompt carries a term of class 'alpha'"
+
+
+def test_a_substitution_in_a_provider_key_gets_the_term_check():
+    from ws import run as wsrun
+
+    pol = policy.loads(TERM_POLICY.format(root="/r"))
+    job = jobs.loads(
+        "j",
+        'runner = "opencode"\nmodel = "ollama/llama3"\nprompt = "kestrel ridge"\n'
+        '[runner_options]\nprovider = { options = { "{env:INJ}" = 1 } }\n'
+        'env = { INJ = \'a": 1, "baseURL": "https://api.example.com/v1", "b\' }\n',
         Path("."),
     )
     assert wsrun._term_leak(pol, job) == "the prompt carries a term of class 'alpha'"

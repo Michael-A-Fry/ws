@@ -1605,7 +1605,6 @@ def test_a_second_net_catch_is_a_count_on_stderr_never_the_words(run_ws, tmp_pat
         "review the ws walls tracer code",
         "ws-walls-tracers doc",
         "ws-walls-tracer-abc",  # too short to be a token
-        "ws-walls-tracer-0123456789abcdef0",  # one hex digit too many
     ],
 )
 def test_prose_about_the_tracer_is_not_a_canary_token(text):
@@ -1643,8 +1642,26 @@ def _job(model: str = "ollama/llama3", provider=None, secrets: str = "") -> jobs
         (lambda: _job(provider='{ options = { baseURL = "http://[::1]:8080" } }'), True),
         (lambda: _job(model="anthropic/claude-haiku-4-5"), False),
         (lambda: _job(secrets='[[secrets]]\nname = "model-key"\nhost = "api.example.com"\n'), False),
+        (lambda: _job(provider='{ options = { baseURL = "{env:BASE}" } }'), False),
+        (lambda: _job(provider='{ options = { baseURL = "{file:~/base.txt}" } }'), False),
+        (lambda: _job(provider='{ options = { headers = { X = "{env:HOST}" } } }'), False),
+        (lambda: _job(provider='{ options = { baseURL = "127.0.0.1:11434" } }'), False),  # not a literal URL
+        (lambda: _job(provider="{ options = { base_url = 11434 } }"), False),
     ],
-    ids=["local name", "loopback IP", "localhost", "hosted baseURL", "IPv6 loopback", "hosted provider", "a lease"],
+    ids=[
+        "local name",
+        "loopback IP",
+        "localhost",
+        "hosted baseURL",
+        "IPv6 loopback",
+        "hosted provider",
+        "a lease",
+        "env substitution",
+        "file substitution",
+        "substitution elsewhere",
+        "baseURL with no scheme",
+        "baseURL not a string",
+    ],
 )
 def test_a_job_is_local_only_when_every_endpoint_is_loopback(job, local):
     from ws import run as wsrun
@@ -1660,3 +1677,23 @@ def test_a_local_named_job_with_a_hosted_endpoint_gets_the_term_check():
     hosted = _job(provider='{ options = { baseURL = "https://api.example.com/v1" } }')
     assert wsrun._term_leak(pol, hosted) == "the prompt carries a term of class 'alpha'"
     assert wsrun._term_leak(pol, _job()) is None  # a truly local model gets the prompt as it is
+
+
+@pytest.mark.parametrize("after", ["backup", "\u200bdeadline", "0", "f"])
+def test_a_canary_token_with_hex_after_it_is_still_caught(after):
+    pol = policy.loads(TERM_POLICY.format(root="/r"))
+    assert policy.term_problem(pol, None, f"see ws-walls-tracer-0123456789abcdef{after}") is not None
+
+
+def test_an_env_substituted_hosted_base_url_gets_the_term_check():
+    from ws import run as wsrun
+
+    pol = policy.loads(TERM_POLICY.format(root="/r"))
+    job = jobs.loads(
+        "j",
+        'runner = "opencode"\nmodel = "ollama/llama3"\nprompt = "kestrel ridge"\n'
+        '[runner_options]\nprovider = { options = { baseURL = "{env:BASE}" } }\n'
+        'env = { BASE = "https://api.example.com/v1" }\n',
+        Path("."),
+    )
+    assert wsrun._term_leak(pol, job) == "the prompt carries a term of class 'alpha'"

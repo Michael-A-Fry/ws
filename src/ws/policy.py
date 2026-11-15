@@ -1158,7 +1158,8 @@ def _has_term(text: str, term: str) -> bool:
 
 # The real token only: the prefix's words with any separator or none, then the 16 hex digits `ws walls` plants after it.
 # Prose about the tracer ("the ws walls tracer code") is not a token, and a letter straight before one does not hide it.
-_CANARY = rf"{_SEP.join(map(re.escape, term_words(CANARY_PREFIX)))}[\W_]*[0-9a-f]{{16}}(?![0-9a-f])"
+# Nothing is checked after the 16 digits: whatever follows (a hex letter, a word) never hides a token.
+_CANARY = rf"{_SEP.join(map(re.escape, term_words(CANARY_PREFIX)))}[\W_]*[0-9a-f]{{16}}"
 
 
 def term_problem(pol: Policy, own: Class | None, text: str) -> str | None:

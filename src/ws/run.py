@@ -460,15 +460,19 @@ def _egress(pol: policy.Policy, job: jobs.Job):
     return plan, None
 
 
-def _urls(value) -> list[str]:
-    """Every string in `value` (a table, a list or a string, nested) that names a URL with a scheme."""
-    if isinstance(value, str):
-        return [value] if "://" in value else []
+def _strings(value, key: str = "") -> list[tuple[str, object]]:
+    """Every leaf of `value` (a table, a list or a scalar, nested) with the key of the table it sits under."""
     if isinstance(value, dict):
-        return [u for v in value.values() for u in _urls(v)]
+        return [s for k, v in value.items() for s in _strings(v, str(k))]
     if isinstance(value, list):
-        return [u for v in value for u in _urls(v)]
-    return []
+        return [s for v in value for s in _strings(v, key)]
+    return [(key, value)]
+
+
+# opencode fills these in from the environment or a file when it loads its config, so the value ws reads is not the one
+# the runner calls: a provider block that uses one is never known to stay on this machine.
+_SUBSTITUTIONS = ("{env:", "{file:")
+_BASE_KEYS = ("baseurl", "base_url")
 
 
 def _loopback_url(url: str) -> bool:
@@ -487,14 +491,22 @@ def _loopback_url(url: str) -> bool:
 
 def _job_is_local(job: jobs.Job, provider: str) -> bool:
     """Does every model call of the job stay on this machine? Only when its provider is a local one by name, it takes no
-    secret lease (a lease's address is the broker, which forwards to a hosted host), and every URL its `provider` table
-    names is loopback. Anything else counts as hosted."""
+    secret lease (a lease's address is the broker, which forwards to a hosted host), its `provider` table uses no
+    `{env:...}` or `{file:...}` substitution, every base URL in it is a literal loopback URL and every other URL in it is
+    loopback. Anything else counts as hosted."""
     from ws import sandbox
 
     if provider not in sandbox.LOCAL_PROVIDERS or job.secrets:
         return False
-    block = (job.runner_options or {}).get("provider")
-    return all(_loopback_url(u) for u in _urls(block))
+    for key, value in _strings((job.runner_options or {}).get("provider")):
+        text = value if isinstance(value, str) else ""
+        if any(s in text for s in _SUBSTITUTIONS):
+            return False
+        if key.lower() in _BASE_KEYS and not _loopback_url(text):
+            return False
+        if "://" in text and not _loopback_url(text):
+            return False
+    return True
 
 
 def _term_leak(pol: policy.Policy, job: jobs.Job) -> str | None:

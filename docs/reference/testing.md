@@ -23,7 +23,7 @@ uv run --locked pytest -q -n 0                  # one process, no workers (a deb
 
 `addopts` carries `-n auto`, so every run is parallel, with no flag to remember. The harness answers xdist's
 `pytest_xdist_auto_num_workers` hook: when `WS_TEST_MAX_N` is set (`ws-test` sets it from the machine's cores and
-memory) that is the worker count, else xdist counts the cores itself. `-n 4` or `-n 0` on the command line wins.
+memory) that's the worker count, else xdist counts the cores itself. `-n 4` or `-n 0` on the command line wins.
 
 - One seed covers all workers: pytest-randomly sends the controller's seed to each, so `--randomly-seed=N` replays a
   failure. The order inside a worker follows from the seed and the distribution, so a failure that depends on which

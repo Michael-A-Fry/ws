@@ -33,6 +33,12 @@ You type the value yourself, in your own terminal. Never paste a key into an AI 
    ws secret set anthropic
    ```
 
+   To paste it into its own window instead, from inside tmux: `ws secret ask anthropic` opens a window with a prompt that
+   shows nothing as you paste, and `ws secret wait anthropic` blocks until it is stored. The value never goes through
+   a command line, the environment, a log or the reply. A gated AI session cannot run either command, so you or a
+   script you run do it. The older `ws-secret ask NAME` and `ws-secret wait NAME` still work (the same commands);
+   plan to move to `ws secret` before it is removed, 30 days after AI_Workspace is switched off.
+
 3. Check that it's set. The list shows names, hosts, state and owner. It never shows a value.
 
    ```sh

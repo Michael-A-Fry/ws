@@ -34,7 +34,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ws import osinfo, output, paths
+from ws import osinfo, output, paths, secretportal
 from ws.output import WsError
 from ws.profile import ProfileError, load, profile_path
 
@@ -299,6 +299,23 @@ class Store:
         return out
 
 
+def open_store(env: dict | None = None):
+    """The store the broker reads: the folder in the data directory, or the OpenBao backend when the profile's secrets role is `openbao`."""
+    cfg = _profile_secrets(env)
+    if cfg.get("adapter") == "openbao":
+        from ws.roles import secrets_openbao  # lazy: the role imports this module
+
+        return secrets_openbao.store_from_cfg(cfg, env)
+    return Store(store_dir(env, cfg))
+
+
+def local_store(env: dict | None = None) -> Store:
+    """The store that setting and the prompt write to. Not the OpenBao backend: its values are written in OpenBao."""
+    if _profile_secrets(env).get("adapter") == "openbao":
+        raise SecretsError("this profile keeps values in OpenBao: write them there (`bao kv put`), not with ws")
+    return Store(store_dir(env))
+
+
 def health(reg_path: Path, store: Store) -> tuple[list[str], int | None]:
     """What is wrong with the registry and the store, as plain sentences (never a value), and the store's owner uid.
     Raises PermissionError if the store belongs to another user: the caller then asks the broker."""
@@ -313,6 +330,14 @@ def health(reg_path: Path, store: Store) -> tuple[list[str], int | None]:
     problems += [
         f"{e.name} has no hosts, so it can never be used" for e in reg.values() if e.kind == "header" and not e.hosts
     ]
+    if getattr(store, "remote", False):  # a backend with no folder: its own checks, and the token file's owner
+        if not any(p.startswith("registry unreadable") for p in problems):
+            with contextlib.suppress(SecretsError):
+                problems += [f"{n} is in the store but not in the registry" for n in unregistered(reg, store)]
+        owner = None
+        with contextlib.suppress(OSError):
+            owner = store.path.stat().st_uid
+        return [*problems, *store.problems()], owner
     try:
         owner = store.path.stat().st_uid
     except FileNotFoundError:
@@ -387,7 +412,7 @@ def cmd_set(args: argparse.Namespace) -> int:
                 2,
             )
         value = check_value(_read_value(args.name))
-        Store(store_dir()).write(args.name, value)
+        local_store().write(args.name, value)
     except (SecretsError, EOFError) as e:
         raise WsError("failed", str(e) or "no value given", "see `ws help secret`") from e
     except PermissionError as e:
@@ -465,7 +490,7 @@ def cmd_import(args: argparse.Namespace) -> int:
                 2,
             )
         value = check_value(_env_value(src, args.var))
-        Store(store_dir()).write(args.name, value)
+        local_store().write(args.name, value)
     except SecretsError as e:
         raise WsError(
             "failed",
@@ -806,5 +831,6 @@ def register(sub) -> None:
     p = ssub.add_parser("rm", help="remove a stored value")
     p.add_argument("name")
     p.set_defaults(func=cmd_rm)
+    secretportal.register(ssub)
     p = ssub.add_parser("wall", help="print the one-time sudo steps that put the store behind its own system user")
     p.set_defaults(func=cmd_wall)

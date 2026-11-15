@@ -48,6 +48,9 @@ CASES: dict[str, list[str]] = {
     "secret.rm": ["secret", "rm", "nope"],
     "secret.import": ["secret", "import", "nope", "--from-env", "missing.env"],
     "secret.wall": ["secret", "wall"],
+    "secret.ask": ["secret", "ask", "nope"],
+    "secret.wait": ["secret", "wait", "nope", "--timeout", "0"],
+    "secret.prompt": ["secret", "prompt", "nope"],
     "broker.request": ["broker", "request", "x", "--purpose", "p", "--host", "h", "--socket", "{home}/none.sock"],
     "broker.status": ["broker", "status", "--socket", "{home}/none.sock"],
     "broker.run-record.write": [

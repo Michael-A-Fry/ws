@@ -117,6 +117,7 @@ import posixpath
 import re
 import sys
 import tomllib
+import unicodedata
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
@@ -314,6 +315,7 @@ class Class:
     owner: str = ""
     review_date: date | None = None
     repo_settings: tuple[RepoSettings, ...] = ()
+    terms: tuple[str, ...] = ()  # words that name the class's content: a prompt to a hosted model may not carry them
 
     def readable_by_class(self, reader: str) -> bool:
         """May a session of class `reader` read this class's content?"""
@@ -871,6 +873,7 @@ def _classes(raw) -> dict[str, Class]:
                 "owner",
                 "review_date",
                 "repo_settings",
+                "terms",
             },
         )
         if "access" not in body:
@@ -908,6 +911,12 @@ def _classes(raw) -> dict[str, Class]:
         review = body.get("review_date")
         if "review_date" in body and type(review) is not date:
             raise PolicyError(f"{where}review_date must be a TOML date such as 2027-03-01, not {review!r}")
+        terms = _strings(body, "terms", where)
+        for t in terms:
+            if len(t.strip()) < 3 or t != t.strip() or len("".join(term_words(t))) < 3:
+                raise PolicyError(
+                    f"{where}terms: each term is at least 3 letters or digits once folded, with no space at either end"
+                )
         narrowing = parse_repo_settings(body.get("repo_settings"), repos, where)
         if narrowing and os_user is None:
             raise PolicyError(
@@ -929,6 +938,7 @@ def _classes(raw) -> dict[str, Class]:
             owner.strip(),
             review,
             narrowing,
+            terms,
         )
     for c in out.values():
         for r in c.readable_by:
@@ -1094,6 +1104,84 @@ def _class_patterns(repos: tuple[str, ...]) -> list[tuple[re.Pattern, int]]:
         if root and expanded.startswith(root) and (real := os.path.realpath(root)) != root:
             out.append((_glob_regex_path(real + expanded[len(root) :]), len(real)))
     return out
+
+
+# The start of the value `ws walls` plants in a class to prove it stays there (its tracer); one more term no prompt to a
+# hosted model may carry.
+CANARY_PREFIX = "ws-walls-tracer-"
+
+
+# The dash family (hyphen, non-breaking hyphen, figure dash, en and em dash, horizontal bar, minus, small and fullwidth
+# hyphen-minus) all read as "-" for a term match.
+# Characters that show nothing and are not a category the drop below catches: the Hangul fillers and the blank braille
+# pattern (letters and symbols to Unicode, blank on screen).
+_FILLERS = frozenset("\u115f\u1160\u3164\uffa0\u2800")
+_INVISIBLE = ("Cf", "Cc", "Mn", "Me")  # format, control and combining characters
+
+
+def _fold(text: str) -> str:
+    """Text as a term match reads it: NFKD (fullwidth letters and an accent split from its letter), every invisible
+    character dropped (a format or control character, a combining mark, a filler: `_INVISIBLE`, `_FILLERS`), then NFC and
+    casefold, with the marks casefolding adds dropped too (a dotted capital I folds to "i"). Letters that only look the
+    same in another script (a Cyrillic "а" for a Latin "a") are not caught."""
+
+    def drop(t: str) -> str:
+        t = unicodedata.normalize("NFKD", t)
+        return "".join(ch for ch in t if unicodedata.category(ch) not in _INVISIBLE and ch not in _FILLERS)
+
+    return unicodedata.normalize("NFC", drop(unicodedata.normalize("NFC", drop(text)).casefold()))
+
+
+# Between a term's words: any run of characters that are not a letter or digit, or none (an invisible separator was
+# dropped, so "john smith" also matches "johnsmith").
+_SEP = r"[\W_]*"
+
+
+def term_words(term: str) -> list[str]:
+    """The words of a term as the match reads them: folded, then split on every run of characters that are not a letter
+    or digit."""
+    return [w for w in re.split(r"[\W_]+", _fold(term)) if w]
+
+
+def _term_pattern(words: list[str], whole: bool = True) -> str:
+    """The pattern for `words` with any separator, or none, between them; a letter or digit on either side makes it
+    another word (`_` does not). `whole` False leaves the end open, for a prefix."""
+    tail = r"(?![^\W_])" if whole else ""
+    return rf"(?<![^\W_]){_SEP.join(re.escape(w) for w in words)}{tail}"
+
+
+def _has_term(text: str, term: str) -> bool:
+    """Is `term` in `text` (`_fold`ed) as a whole term? See `_term_pattern`."""
+    words = term_words(term)
+    return bool(words) and re.search(_term_pattern(words), _fold(text)) is not None
+
+
+# The real token only: the prefix's words with any separator or none, then the 16 hex digits `ws walls` plants after it.
+# Prose about the tracer ("the ws walls tracer code") is not a token, and a letter straight before one does not hide it.
+# Nothing is checked after the 16 digits: whatever follows (a hex letter, a word) never hides a token.
+_CANARY = rf"{_SEP.join(map(re.escape, term_words(CANARY_PREFIX)))}[\W_]*[0-9a-f]{{16}}"
+
+
+def term_problem(pol: Policy, own: Class | None, text: str) -> str | None:
+    """Why a prompt bound for a hosted model may not leave, or None: it carries a canary token, or a `terms` entry of a
+    class that is not `full` and is not the session's own class. The words name the class, never the term."""
+    if re.search(_CANARY, _fold(text)) is not None:
+        return "the prompt carries a canary token planted in a walled class"
+    for name, cls in sorted(pol.classes.items()):
+        if cls.access == "full" or (own is not None and own.name == name):
+            continue
+        if any(_has_term(text, t) for t in cls.terms):
+            return f"the prompt carries a term of class {name!r}"
+    return None
+
+
+# The second net: word pairs that look like a person's name (two capitalised words). It reports and refuses nothing.
+_NAME_LIKE = re.compile(r"\b[A-Z][a-z]{1,30}(?:[ '-][A-Z][a-z]{1,30})+\b")
+
+
+def name_spots(text: str) -> list[str]:
+    """The name-like word pairs in `text`, in order, once each: a second net beside `terms`, for a report only."""
+    return list(dict.fromkeys(m.group(0) for m in _NAME_LIKE.finditer(text)))
 
 
 def class_of(pol: Policy, path) -> Class | None:

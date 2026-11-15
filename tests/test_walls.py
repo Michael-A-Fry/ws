@@ -1391,6 +1391,327 @@ def test_every_class_key_the_policy_parses_is_read_outside_the_parser():
         code_only(p) for p in src.rglob("*.py") if p.name != "policy.py" and "__pycache__" not in p.parts
     )
     fields = [f.name for f in dataclasses.fields(policy.Class) if f.name != "name"]
-    via = {"readable_by": "readable_by_class", "repo_settings": "narrowing_for"}  # read through Class's own method
+    # read through Class's own method, or through the policy function the call site asks
+    via = {"readable_by": "readable_by_class", "repo_settings": "narrowing_for", "terms": "term_problem"}
     unread = [n for n in fields if not re.search(rf"\.\s*({n}|{via.get(n, n)})\b", readers)]
     assert unread == [], f"parsed but read by no module: {unread}"
+
+
+# ---- rr-r4-68: a walled class's term, or a canary token, never leaves in a prompt to a hosted model ----------------------
+
+TERM_POLICY = """
+[classes.open]
+access = "full"
+repos = ["{root}/open/**"]
+
+[classes.alpha]
+access = "walled"
+repos = ["{root}/alpha/**"]
+allowed_providers = ["anthropic"]
+terms = ["Kestrel Ridge", "KR-2207"]
+"""
+
+
+def term_world(run_ws, tmp_path, where: str, prompt: str):  # noqa: F811
+    for name in ("open", "alpha"):
+        (tmp_path / name).mkdir(exist_ok=True)
+    (run_ws.home / "policy.toml").write_text(TERM_POLICY.format(root=tmp_path), encoding="utf-8")
+    run_ws.job(prompt=prompt, extra=f'cwd = "{tmp_path / where}"')
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    ["summarise the kestrel ridge notes", "see KR-2207 first", "look at ws-walls-tracer-0123456789abcdef"],
+    ids=["term in another case", "a code term", "a canary token"],
+)
+def test_a_planted_class_term_in_an_outgoing_prompt_is_refused_with_one_record(run_ws, tmp_path, prompt):  # noqa: F811
+    term_world(run_ws, tmp_path, "open", prompt)
+    assert cli.main(["run", "daily"]) == 3
+    (rec,) = run_ws.records()
+    assert rec["status"] == "refused" and rec["stop_reason"] == "refused:term"
+    assert "kestrel" not in rec["error"].lower() and "2207" not in rec["error"] and "tracer-ab" not in rec["error"]
+    assert not (run_ws.home / "fake-saw.json").exists()  # the runner never started
+
+
+def test_the_class_own_job_and_a_prompt_with_no_term_are_not_refused(run_ws, tmp_path):  # noqa: F811
+    # the fake runner answers only "ok", so a prompt that is let through ends as an error after the runner started
+    for where, prompt in (("alpha", "summarise the Kestrel Ridge notes"), ("open", "the kestrels nesting notes")):
+        term_world(run_ws, tmp_path, where, prompt)  # the class's own job; a longer word is another word
+        cli.main(["run", "daily"])
+        assert run_ws.saw()["stdin"] == prompt  # the runner started with the prompt as it was
+        (run_ws.home / "fake-saw.json").unlink()
+    assert [r["stop_reason"] for r in run_ws.records()].count("refused:term") == 0
+
+
+def test_the_term_check_names_the_class_skips_full_classes_and_the_callers_own():
+    pol = policy.loads(
+        TERM_POLICY.format(root="/r") + '\n[classes.wide]\naccess = "full"\nrepos = ["/w/**"]\nterms = ["Wide"]\n'
+    )
+    assert (
+        policy.term_problem(pol, pol.classes["open"], "about kestrel ridge")
+        == "the prompt carries a term of class 'alpha'"
+    )
+    assert policy.term_problem(pol, pol.classes["alpha"], "about kestrel ridge") is None
+    assert policy.term_problem(pol, None, "the wide view") is None  # a full class's terms are never checked
+    assert (
+        policy.term_problem(pol, pol.classes["alpha"], "WS-WALLS-TRACER-0123456789abcdef") is not None
+    )  # a token, whoever sends it
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "kestrel\nridge",
+        "kestrel  ridge",
+        "kestrel\u00a0ridge",
+        "kestrel_ridge",
+        "kestrel-ridge",
+        "\uff2b\uff45\uff53\uff54\uff52\uff45\uff4c ridge",  # fullwidth
+        "kes\u200btrel ridge",  # a zero-width space inside a word
+        "KR\u20112207",  # a non-breaking hyphen
+        "KR\u20132207",  # an en dash
+        "see KR-2207_v2",  # an underscore after the term is not a letter
+        "the_kestrel ridge_notes",
+    ],
+)
+def test_a_term_is_caught_through_spacing_unicode_tricks_and_underscores(text):
+    pol = policy.loads(TERM_POLICY.format(root="/r"))
+    assert policy.term_problem(pol, pol.classes["open"], text) == "the prompt carries a term of class 'alpha'", text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "kestrel\u200bridge",  # a zero-width space as the only separator
+        "kestrel\u00adridge",  # a soft hyphen
+        "kestrel\u2060ridge",  # a word joiner
+        "kestrel\u200cridge",  # a zero-width non-joiner
+        "kestrel\u061cridge",  # an Arabic letter mark
+        "kes\u200btrel ridge",  # and still one inside a word
+        "kestrel ri\u0307dge",  # a combining dot
+        "kestre\u0335l ridge",  # a combining strike-through
+        "k\u00e9strel ridge",  # an accented letter
+        "\u0130STANBUL docks",  # a dotted capital I
+    ],
+)
+def test_a_term_is_caught_through_format_characters_and_combining_marks(text):
+    pol = policy.loads(TERM_POLICY.format(root="/r").replace('"KR-2207"]', '"KR-2207", "Istanbul docks"]'))
+    assert policy.term_problem(pol, pol.classes["open"], text) == "the prompt carries a term of class 'alpha'", text
+
+
+@pytest.mark.parametrize(
+    ("text", "caught"),
+    [
+        ("the foo bar plan", True),
+        ("the foo_bar plan", True),
+        ("the foo-bar plan", True),
+        ("the foobar plan", True),  # no separator at all
+        ("the foobar_x plan", True),  # an underscore after it is not a letter
+        ("the foobarx plan", False),  # a letter after it is another word
+    ],
+)
+def test_a_term_with_a_hyphen_or_underscore_matches_any_separator(text, caught):
+    pol = policy.loads(TERM_POLICY.format(root="/r").replace('"KR-2207"]', '"KR-2207", "foo_bar"]'))
+    assert (policy.term_problem(pol, pol.classes["open"], text) is not None) is caught, text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "ws_walls_tracer_0123456789abcdef",
+        "ws walls tracer 0123456789abcdef",
+        "WS-WALLS-TRACER-0123456789ABCDEF",
+        "ws\u200bwalls-tracer-0123456789abcdef",
+        "aws-walls-tracer-0123456789abcdef",  # a letter straight before it does not hide it
+        "see ws-walls-tracer-0123456789abcdef.",
+    ],
+)
+def test_the_canary_prefix_is_caught_with_any_separator(text):
+    pol = policy.loads(TERM_POLICY.format(root="/r"))
+    assert (
+        policy.term_problem(pol, pol.classes["alpha"], text)
+        == "the prompt carries a canary token planted in a walled class"
+    )
+
+
+@pytest.mark.parametrize("term", ["\u200b\u200b\u200b", "a-_b", "\u00ad\u00ad\u00adx"])
+def test_a_term_that_folds_to_fewer_than_3_letters_stops_the_load(term):
+    with pytest.raises(policy.PolicyError, match="terms"):
+        policy.loads(f'[classes.a]\naccess = "walled"\nrepos = ["/a/**"]\nterms = [{json.dumps(term)}]\n')
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "kes\u200btrel\u200bridge",  # a zero-width space inside a word and another as the separator
+        "k\u200be\u200bs\u200bt\u200br\u200be\u200bl\u200br\u200bi\u200bd\u200bg\u200be",
+        "kestrel\u034fridge",  # a combining grapheme joiner as the only separator
+        "kestrel\ufe0fridge",  # a variation selector
+        "kestrel\u1ab0ridge",  # a combining doubled circumflex
+        "kestrel\u20ddridge",  # an enclosing circle
+        "kestrel\x00ridge",  # control characters
+        "kes\x00trel ridge",
+        "kestrel\x08ridge",
+        "kestrel\x7fridge",
+        "kestrel\u3164ridge",  # a Hangul filler
+        "kestrel\uffa0ridge",  # a halfwidth Hangul filler
+        "kestrel\u2800ridge",  # a blank braille pattern
+        "kestrel.ridge",  # email style
+        "kestrel,ridge",
+        "kestrel/ridge",
+        "kestrel, ridge",
+        "KR.2207",
+    ],
+)
+def test_a_term_is_caught_through_invisible_separators_controls_fillers_and_punctuation(text):
+    pol = policy.loads(TERM_POLICY.format(root="/r"))
+    assert policy.term_problem(pol, pol.classes["open"], text) == "the prompt carries a term of class 'alpha'", text
+
+
+@pytest.mark.parametrize("text", ["kestrels ridge", "kestrel ridges", "KR-22070", "xKR-2207", "kestrel bird ridge"])
+def test_a_longer_word_or_other_punctuation_is_another_term(text):
+    pol = policy.loads(TERM_POLICY.format(root="/r"))
+    assert policy.term_problem(pol, pol.classes["open"], text) is None, text
+
+
+@pytest.mark.parametrize("term", ["ab", " Kestrel", ""])
+def test_a_term_shorter_than_3_characters_or_with_an_outer_space_stops_the_load(term):
+    with pytest.raises(policy.PolicyError, match="terms"):
+        policy.loads(f'[classes.a]\naccess = "walled"\nrepos = ["/a/**"]\nterms = [{json.dumps(term)}]\n')
+
+
+def test_the_second_net_reports_its_catches_and_refuses_nothing(capsys):
+    text = "Met Jane Smith and Ana O'Neil about the report. The Board meets Tuesday."
+    catches = policy.name_spots(text)
+    print(f"second net caught {len(catches)}: {catches}")  # the report the test gives
+    # It catches capitalised word runs, not names: "Met Jane Smith" holds a name, "The Board" is no person, and
+    # "Ana O'Neil" slips through. That is why it only reports, and `terms` is the net that refuses.
+    assert catches == ["Met Jane Smith", "The Board"]
+    pol = policy.loads(TERM_POLICY.format(root="/r"))
+    assert policy.term_problem(pol, None, text) is None
+
+
+def test_a_second_net_catch_is_a_count_on_stderr_never_the_words(run_ws, tmp_path, capsys):  # noqa: F811
+    term_world(run_ws, tmp_path, "open", "write to Jane Smith")
+    cli.main(["run", "daily"])
+    assert run_ws.saw()["stdin"] == "write to Jane Smith"  # counted, not refused
+    err = capsys.readouterr().err
+    assert "1 name-like word pair" in err and "Jane" not in err
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "review the ws walls tracer code",
+        "ws-walls-tracers doc",
+        "ws-walls-tracer-abc",  # too short to be a token
+    ],
+)
+def test_prose_about_the_tracer_is_not_a_canary_token(text):
+    pol = policy.loads(TERM_POLICY.format(root="/r"))
+    assert policy.term_problem(pol, pol.classes["open"], text) is None, text
+
+
+def test_a_token_ws_walls_plants_is_one_the_check_catches():
+    pol = policy.loads(TERM_POLICY.format(root="/r"))
+    token = walls._plant()
+    assert (
+        policy.term_problem(pol, None, f"see {token}") == "the prompt carries a canary token planted in a walled class"
+    )
+
+
+# ---- the term check counts a job as hosted unless every model call stays on this machine ---------------------------------
+
+from ws import jobs
+
+
+def _job(model: str = "ollama/llama3", provider=None, secrets: str = "") -> jobs.Job:
+    opts = f"[runner_options]\nprovider = {provider}\n" if provider is not None else ""
+    return jobs.loads(
+        "j", f'runner = "opencode"\nmodel = "{model}"\nprompt = "kestrel ridge"\n{secrets}{opts}', Path(".")
+    )
+
+
+@pytest.mark.parametrize(
+    ("job", "local"),
+    [
+        (lambda: _job(), True),  # a local provider by name, no endpoint named
+        (lambda: _job(provider='{ options = { baseURL = "http://127.0.0.1:11434/v1" } }'), True),
+        (lambda: _job(provider='{ options = { baseURL = "http://localhost:11434/v1" } }'), True),
+        (lambda: _job(provider='{ options = { baseURL = "https://api.example.com/v1" } }'), False),
+        (lambda: _job(provider='{ options = { baseURL = "http://[::1]:8080" } }'), True),
+        (lambda: _job(model="anthropic/claude-haiku-4-5"), False),
+        (lambda: _job(secrets='[[secrets]]\nname = "model-key"\nhost = "api.example.com"\n'), False),
+        (lambda: _job(provider='{ options = { baseURL = "{env:BASE}" } }'), False),
+        (lambda: _job(provider='{ options = { baseURL = "{file:~/base.txt}" } }'), False),
+        (lambda: _job(provider='{ options = { headers = { X = "{env:HOST}" } } }'), False),
+        (lambda: _job(provider='{ options = { "{env:INJ}" = 1 } }'), False),
+        (lambda: _job(provider='{ models = { "{file:~/m.txt}" = { name = "m" } } }'), False),
+        (lambda: _job(provider='{ options = { baseURL = "127.0.0.1:11434" } }'), False),  # not a literal URL
+        (lambda: _job(provider="{ options = { base_url = 11434 } }"), False),
+    ],
+    ids=[
+        "local name",
+        "loopback IP",
+        "localhost",
+        "hosted baseURL",
+        "IPv6 loopback",
+        "hosted provider",
+        "a lease",
+        "env substitution",
+        "file substitution",
+        "substitution elsewhere",
+        "substitution in a key",
+        "file substitution in a models key",
+        "baseURL with no scheme",
+        "baseURL not a string",
+    ],
+)
+def test_a_job_is_local_only_when_every_endpoint_is_loopback(job, local):
+    from ws import run as wsrun
+
+    j = job()
+    assert wsrun._job_is_local(j, sandbox.job_provider(j.runner, j.model, j.runner_options)) is local
+
+
+def test_a_local_named_job_with_a_hosted_endpoint_gets_the_term_check():
+    from ws import run as wsrun
+
+    pol = policy.loads(TERM_POLICY.format(root="/r"))
+    hosted = _job(provider='{ options = { baseURL = "https://api.example.com/v1" } }')
+    assert wsrun._term_leak(pol, hosted) == "the prompt carries a term of class 'alpha'"
+    assert wsrun._term_leak(pol, _job()) is None  # a truly local model gets the prompt as it is
+
+
+@pytest.mark.parametrize("after", ["backup", "\u200bdeadline", "0", "f"])
+def test_a_canary_token_with_hex_after_it_is_still_caught(after):
+    pol = policy.loads(TERM_POLICY.format(root="/r"))
+    assert policy.term_problem(pol, None, f"see ws-walls-tracer-0123456789abcdef{after}") is not None
+
+
+def test_an_env_substituted_hosted_base_url_gets_the_term_check():
+    from ws import run as wsrun
+
+    pol = policy.loads(TERM_POLICY.format(root="/r"))
+    job = jobs.loads(
+        "j",
+        'runner = "opencode"\nmodel = "ollama/llama3"\nprompt = "kestrel ridge"\n'
+        '[runner_options]\nprovider = { options = { baseURL = "{env:BASE}" } }\n'
+        'env = { BASE = "https://api.example.com/v1" }\n',
+        Path("."),
+    )
+    assert wsrun._term_leak(pol, job) == "the prompt carries a term of class 'alpha'"
+
+
+def test_a_substitution_in_a_provider_key_gets_the_term_check():
+    from ws import run as wsrun
+
+    pol = policy.loads(TERM_POLICY.format(root="/r"))
+    job = jobs.loads(
+        "j",
+        'runner = "opencode"\nmodel = "ollama/llama3"\nprompt = "kestrel ridge"\n'
+        '[runner_options]\nprovider = { options = { "{env:INJ}" = 1 } }\n'
+        'env = { INJ = \'a": 1, "baseURL": "https://api.example.com/v1", "b\' }\n',
+        Path("."),
+    )
+    assert wsrun._term_leak(pol, job) == "the prompt carries a term of class 'alpha'"

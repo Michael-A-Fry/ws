@@ -6,6 +6,8 @@ import importlib.util
 import os
 from pathlib import Path
 
+import pytest
+
 # by path: `import conftest` can pick up tests/roles/conftest.py instead
 _spec = importlib.util.spec_from_file_location("ws_tests_conftest", Path(__file__).with_name("conftest.py"))
 assert _spec and _spec.loader
@@ -29,6 +31,7 @@ def test_the_tripwire_sees_a_change_to_a_watched_file(tmp_path, monkeypatch):
     assert conftest._real_home_stamp() != before
 
 
+@pytest.mark.medium  # it starts a whole pytest run: its size is the 300 s limit, not the 60 s of a unit test
 def test_a_ws_folder_variable_from_the_outer_shell_does_not_reach_a_test(tmp_path):
     """Run a one-test suite with this conftest, from a shell that names ws's folders (as a ws session does)."""
     import subprocess

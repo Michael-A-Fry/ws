@@ -22,11 +22,16 @@ from ws.ui import server as ui_server
 KEY = base64.b64encode(b"the sample nonce").decode()
 
 
+# A wait ends the moment its condition holds, so this bound is only ever spent by a test that is going to fail; it is
+# long enough that a loaded machine (or a slow disk at teardown) cannot turn a pass into a timeout.
+WAIT_S = 30.0
+
+
 class Conn:
     """A raw WebSocket client: sends the upgrade by hand and speaks masked frames."""
 
     def __init__(self, port: int, host: str = "127.0.0.1"):
-        self.sock = socket.create_connection((host, port), timeout=5)
+        self.sock = socket.create_connection((host, port), timeout=WAIT_S)
         self.rf = self.sock.makefile("rb")
         self.status = ""
         self.headers: dict[str, str] = {}
@@ -100,7 +105,7 @@ class Running:
         return c
 
     def get(self, path: str, *, host: str | None = None, token: bool = True, headers: dict | None = None):
-        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=WAIT_S)
         q = f"?t={self.token}" if token else ""
         conn.putrequest("GET", path + q, skip_host=True)
         conn.putheader("Host", host or self.host)
@@ -115,7 +120,7 @@ class Running:
     def stop(self) -> None:
         self.session.close()
         self.server.stop()
-        self.thread.join(5)
+        self.thread.join(WAIT_S)
 
 
 @pytest.fixture
@@ -131,7 +136,7 @@ def run():
         r.stop()
 
 
-def until(cond, seconds: float = 3.0) -> None:
+def until(cond, seconds: float = WAIT_S) -> None:
     end = time.monotonic() + seconds
     while time.monotonic() < end:
         if cond():
@@ -474,7 +479,7 @@ def test_a_program_that_cant_start_is_reported_to_the_page(run):
         c.close()
     finally:
         server.stop()
-        t.join(5)
+        t.join(WAIT_S)
 
 
 # -- staying up while someone is attached

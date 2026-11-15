@@ -79,8 +79,8 @@ By default the broker reads ws's own store (one 0600 file per name) and no vault
 address only). Everything else is unchanged: registry, tiers, areas, run records, leases and the audit log. Values are
 written in OpenBao, and `ws secret set` refuses under that role. ws installs nothing for it.
 
-Swap note: a backend is one module in `src/ws/roles/` with `read`, `names`, `loose` and `problems`. Go back to the
-default by removing the `adapter` line; values do not move by themselves.
+Swap note: another store is one module in `src/ws/roles/` with `read`, `names`, `loose` and `problems`. Go back to the
+default by removing the `adapter` line; values don't move by themselves.
 
 ## What the broker doesn't stop
 

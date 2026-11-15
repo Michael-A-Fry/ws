@@ -7,8 +7,7 @@ moment as RFC 3339 text, which `ws.jsonl` needs for its stamp. Every write goes 
 
 A repo's data class decides what the store may hold: the strictest of the named repo's class and the working folder's
 (from the policy), or any hit on the sensitive-terms file, stores the ask redacted (no text, no options, a hashed dedupe
-key). The class is checked again when an ask is read, so a repo walled after it was asked shows as opaque and cannot be
-answered from here. A token-shaped secret is refused outright. Notify is not built: `NOTIFY_HOOK` does nothing.
+key). The class is checked again when an ask is read, so a repo walled after it was asked shows as opaque. A token-shaped secret is refused outright. Notify is not built: `NOTIFY_HOOK` does nothing.
 """
 
 from __future__ import annotations
@@ -38,7 +37,6 @@ LIMITS = {
     "label": 80,
     "description": 300,
     "decision": 300,
-    "answer": 2000,
     "dedupe_key": 300,
     "repo": 100,
     "session": 100,
@@ -422,49 +420,6 @@ def add(fields: dict, cwd: str, env=None) -> tuple[str, bool, dict]:
         return ident, True, event
 
 
-# --- answer ----------------------------------------------------------------------------------------------------------
-
-
-def pick(ask: dict, words: str) -> tuple[str | None, int | None]:
-    """(text, 0-based option) for what was typed: a 1-based number or a label in any case picks an option."""
-    t, opts = words.strip(), ask.get("options") or []
-    if t.isdigit() and 1 <= int(t) <= len(opts):
-        return None, int(t) - 1
-    for n, o in enumerate(opts):
-        if o["label"].casefold() == t.casefold():
-            return None, n
-    return t, None
-
-
-def answer(ident: str, words: str, via: str = "cli", env=None) -> dict:
-    """Answer an open ask. The check that it is still open and the write are one step under the store lock, so two
-    answers to one ask cannot both succeed."""
-    e = _env(env)
-    with _store_lock(e):
-        ask = get(ident, e)
-        if view(ask, e)["opaque"]:
-            raise WsError(
-                "opaque",
-                "Open the session to answer this ask.",
-                "this ask is not shown here: answer it in its session",
-                1,
-            )
-        if ask["status"] != "open":
-            raise WsError("not_open", f"ask is {ask['status']}", "", 1)
-        text, idx = pick(ask, words)
-        if idx is not None:
-            text = ask["options"][idx]["label"]
-        else:
-            if not ask.get("free_text_allowed", True):
-                raise WsError("refused", "this ask takes one of its options, not free text", "", 1)
-            text = _text("answer", text, LIMITS["answer"], True)
-            _refuse_secret("answer", text)
-        ms, _ = _now()
-        reply = {"text": text, "option_index": idx, "via": via, "ts": ms}
-        _write(e, {"event": "answered", "id": ident, "answer": reply}, held=True)
-        return reply
-
-
 # --- commands --------------------------------------------------------------------------------------------------------
 
 
@@ -565,15 +520,6 @@ def cmd_get(args) -> int:
     return 0
 
 
-def cmd_answer(args) -> int:
-    reply = answer(args.id, " ".join(args.text))
-    if args.json:
-        output.result({"id": args.id, "answer": reply})
-    else:
-        print(f"answered: {reply['text']}")
-    return 0
-
-
 def register(sub) -> None:
     p = sub.add_parser("ask", help="leave a question for a person and read back the answer (one queue, every session)")
     s = p.add_subparsers(dest="ask_command", required=True)
@@ -600,8 +546,3 @@ def register(sub) -> None:
     g = s.add_parser("get", help="one ask: status and answer")
     g.add_argument("id")
     g.set_defaults(func=cmd_get)
-
-    an = s.add_parser("answer", help="answer with an option label (any case), a 1-based number, or free text")
-    an.add_argument("id")
-    an.add_argument("text", nargs="+")
-    an.set_defaults(func=cmd_answer)

@@ -76,37 +76,37 @@ def box(tmp_path, monkeypatch):
     return Box(tmp_path, monkeypatch)
 
 
-def test_round_trip_add_list_answer_by_number_label_and_text(box, capsys):
+def answered(ident: str, text: str = "fine") -> None:
+    """An answer as another writer leaves it: `ws ask answer` is not in this change."""
+    reply = {"text": text, "option_index": None, "via": "test", "ts": 1}
+    asks._write(None, {"event": "answered", "id": ident, "answer": reply})
+
+
+def test_round_trip_add_list_get(box, capsys):
     a = box.add(capsys, "--question", "Ship it?", "--option", "Yes|go now", "--option", "No", "--session", "bld")
     b = box.add(capsys, "--question", "Which?", "--option", "Red", "--option", "Blue")
     c = box.add(capsys, "--question", "Why?")
     code, out, _ = box.run(capsys, "list")
     assert code == 0 and [ln.split()[0] for ln in out.splitlines()] == [a, b, c]
     assert "Ship it?" in out
-    assert box.run(capsys, "answer", a, "2")[1].strip() == "answered: No"
-    assert box.run(capsys, "answer", b, "BLUE")[1].strip() == "answered: Blue"
-    assert box.run(capsys, "answer", c, "because", "reasons")[1].strip() == "answered: because reasons"
-    assert box.run(capsys, "list")[1].strip() == ""  # none open now
+    answered(a)
+    assert [ln.split()[0] for ln in box.run(capsys, "list")[1].splitlines()] == [b, c]  # an answered ask is not open
     code, out, _ = box.run(capsys, "list", "--all")
-    assert [ln.split()[1] for ln in out.splitlines()] == ["answered"] * 3
-    got = asks.load()
-    assert got[a]["answer"]["option_index"] == 1 and got[b]["answer"]["option_index"] == 1
-    assert got[c]["answer"]["option_index"] is None and got[a]["session"]["name"] == "bld"
+    assert [ln.split()[1] for ln in out.splitlines()] == ["answered", "open", "open"]
+    assert asks.load()[a]["session"]["name"] == "bld"
     code, out, _ = box.run(capsys, "get", a)
-    assert "1. Yes (Recommended) - go now" in out and "answer: No  (option 2, via cli)" in out
-    assert box.run(capsys, "answer", a, "1")[0] == 1  # already answered
+    assert "1. Yes (Recommended) - go now" in out and "answer: fine  (free text, via test)" in out
 
 
 def test_an_unknown_id_is_a_usage_error(box, capsys):
     assert box.run(capsys, "get", "nope")[0] == 2
-    assert box.run(capsys, "answer", "nope", "x")[0] == 2
 
 
 def test_the_same_open_dedupe_key_returns_its_id_and_adds_nothing(box, capsys):
     a = box.add(capsys, "--question", "Q", "--dedupe-key", "k1")
     assert box.add(capsys, "--question", "Q again", "--dedupe-key", "k1") == a
     assert len(box.lines()) == 1
-    box.run(capsys, "answer", a, "fine")
+    answered(a)
     assert box.add(capsys, "--question", "Q", "--dedupe-key", "k1") != a  # an answered ask no longer dedupes
 
 
@@ -209,27 +209,16 @@ def test_a_token_shaped_secret_is_refused_and_stored_nowhere(box, capsys):
         code, _, err = box.run(capsys, "add", *flags)
         assert code == 1 and token not in err and "secret" in err
     assert not box.store.exists()
-    ident = box.add(capsys, "--question", "ok", "--option", "x")
-    code, _, err = box.run(capsys, "answer", ident, token)
-    assert code == 1 and token not in err and token not in box.store.read_text()
 
 
 def test_the_class_is_checked_again_when_an_ask_is_read(box, capsys):
     ident = box.add(capsys, "--question", "Readable now?", "--option", "Yes")
     assert "Readable now?" in box.run(capsys, "list")[1]
     box.policy(priv_access="walled", open_access="walled")  # the repo is walled after it was asked
-    code, out, _ = box.run(capsys, "list")
+    out = box.run(capsys, "list")[1]
     assert asks.OPAQUE in out and "Readable now?" not in out
-    code, out, _ = box.run(capsys, "get", ident)
+    out = box.run(capsys, "get", ident)[1]
     assert asks.OPAQUE in out and "Readable now?" not in out and "Yes" not in out
-    code, _, err = box.run(capsys, "answer", ident, "1")
-    assert code == 1 and "Open the session" in err
-    assert [e["event"] for e in box.lines()] == ["added"]  # nothing was answered
-
-
-def test_a_redacted_ask_cannot_be_answered_here(box, capsys):
-    ident = box.add(capsys, "--question", "secretproject?")
-    assert box.run(capsys, "answer", ident, "yes")[0] == 1
 
 
 def test_the_folder_is_private_and_so_is_the_file(box, capsys):
@@ -336,13 +325,6 @@ def test_the_older_programs_rows_read_with_their_times(box, capsys):
     assert code == 0 and "Left open?" in out and "  ?  " not in out
 
 
-def test_an_older_open_ask_can_be_answered_and_stays_one_ask(box, capsys):
-    old_store(box)
-    assert box.run(capsys, "answer", "a20261101T010500-cd34", "fine")[0] == 0
-    assert asks.load()["a20261101T010500-cd34"]["answer"]["text"] == "fine"
-    assert [e["event"] for e in box.lines()].count("added") == 2
-
-
 def test_a_write_takes_the_older_programs_asks_lock(box, capsys, monkeypatch):
     import fcntl
 
@@ -386,21 +368,3 @@ def test_two_adds_with_one_key_make_one_ask(box, capsys, monkeypatch):
     assert not errs
     assert len({i[0] for i in ids}) == 1 and sum(1 for i in ids if i[1]) == 1
     assert [e["event"] for e in box.lines()] == ["added"]
-
-
-def test_two_answers_to_one_ask_only_one_succeeds(box, capsys, monkeypatch):
-    ident = box.add(capsys, "--question", "Q", "--option", "Yes", "--option", "No")
-    slow_between_check_and_write(monkeypatch)
-    won, lost = [], []
-
-    def one(n):
-        try:
-            won.append(asks.answer(ident, str(n)))
-        except asks.WsError as e:
-            lost.append(e.kind)
-
-    ts = [threading.Thread(target=one, args=(1 + n % 2,)) for n in range(8)]
-    [t.start() for t in ts]
-    [t.join() for t in ts]
-    assert len(won) == 1 and lost == ["not_open"] * 7
-    assert [e["event"] for e in box.lines()] == ["added", "answered"]

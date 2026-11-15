@@ -13,6 +13,7 @@ ended; it holds no value. Without tmux, `ws secret set NAME` does the same on th
 from __future__ import annotations
 
 import argparse
+import contextlib
 import getpass
 import json
 import os
@@ -30,11 +31,6 @@ from ws.output import WsError
 POLL_S = 0.5
 DEFAULT_WAIT_S = 900.0
 STALE_AFTER_S = 3.0  # a window opened this recently may not be listed yet
-_ENV_KEPT = (
-    "HOME",
-    *paths.OVERRIDE_VARS,
-    "WS_BROKER_SOCKET",
-)  # the folders the window must use, as this shell has them
 
 
 def asks_dir(env: dict | None = None) -> Path:
@@ -77,14 +73,71 @@ def _window_gone(name: str) -> bool:
     return r.returncode == 0 and f"secret:{name}" not in r.stdout.split("\n")
 
 
-def window_command(name: str, env: dict | None = None) -> str:
-    """The shell text the new window runs: the name and the folders to use, never a value."""
-    env = os.environ if env is None else env
-    keep = [f"{k}={shlex.quote(env[k])}" for k in _ENV_KEPT if env.get(k)]
-    return "env " + " ".join([*keep, shlex.join([*selfcmd.argv(), "secret", "prompt", name])])
+def trusted_env() -> dict[str, str]:
+    """The environment the person's own ws folders come from: the account's home folder from the system's account
+    database, and no layout variable. A session can set `WS_HOME`, `HOME`, an `XDG_*` variable or a tmux environment, so
+    nothing here, in the window or in the prompt reads them."""
+    home = paths.account_home()
+    if home is None:
+        raise WsError("refused", "the account's home folder cannot be told", "run it in a terminal of your own")
+    return {"HOME": str(home)}
+
+
+def _real_dirs(env) -> tuple[str, ...]:
+    lay = paths.layout(env)
+    return tuple(os.path.realpath(lay.dir(k)) for k in paths.KINDS)
+
+
+@contextlib.contextmanager
+def _trusted():
+    """Inside the block every ws folder is the account's own, whatever this process's environment says."""
+    env = trusted_env()
+    try:
+        pin = paths.pin_of(env)
+    except WsError as e:
+        raise WsError("refused", f"the account's ws folders cannot be told ({e.message})", e.hint or "") from e
+    with paths.pinned(pin):
+        yield env
+
+
+def window_command(name: str) -> str:
+    """The shell text the new window runs: `env -i` with the account's home and nothing else from the session, the ws
+    this one is (refused when it runs from a folder that comes and goes), the name, never a value."""
+    why = selfcmd.unstable()
+    if why:
+        raise WsError("refused", f"ws runs from {why}", "ask from the installed ws, in your own terminal")
+    env = [f"HOME={shlex.quote(trusted_env()['HOME'])}", f"PATH={shlex.quote(paths.tool_path())}", "PYTHONUTF8=1"]
+    return (
+        shlex.join(["env", "-i"]) + " " + " ".join(env) + " " + shlex.join([*selfcmd.argv(), "secret", "prompt", name])
+    )
 
 
 def cmd_ask(args) -> int:
+    with _trusted():
+        try:
+            same = _real_dirs(os.environ) == _real_dirs(trusted_env())
+        except WsError:  # the session's variables name a layout that cannot be told: not the account's own
+            same = False
+        if not same:
+            raise WsError(
+                "refused",
+                "this session's ws folders are not the account's own (WS_HOME, HOME or an XDG variable points elsewhere)",
+                "ask from your own terminal, or take the variable out of the session",
+            )
+        return _ask(args)
+
+
+def cmd_prompt(args) -> int:
+    with _trusted():
+        return _prompt(args)
+
+
+def cmd_wait(args) -> int:
+    with _trusted():
+        return _wait(args)
+
+
+def _ask(args) -> int:
     reg = wsecrets.load_registry(wsecrets.registry_path())
     name = args.name
     _marker(name)
@@ -119,13 +172,15 @@ def cmd_ask(args) -> int:
     return 0
 
 
-def cmd_prompt(args) -> int:
+def _prompt(args) -> int:
     """Runs inside the new window: read the value with no echo, store it, record how it ended."""
     name = args.name
     _marker(name)
     try:
         if name not in wsecrets.load_registry(wsecrets.registry_path()):
             raise wsecrets.SecretsError(f"{name!r} is not registered")
+        if wsecrets.store_dir() not in paths.secret_dirs():
+            raise wsecrets.SecretsError("the store is not in the account's own ws folders")
         print(f"Storing {name} in {wsecrets.store_dir()}")
         try:
             value = getpass.getpass(f"Value for {name} (not shown; Enter stores it, Ctrl-C cancels): ")
@@ -145,7 +200,7 @@ def cmd_prompt(args) -> int:
     return 0
 
 
-def cmd_wait(args) -> int:
+def _wait(args) -> int:
     name = args.name
     _marker(name)
     deadline = time.monotonic() + args.timeout

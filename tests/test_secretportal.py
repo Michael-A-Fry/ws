@@ -24,6 +24,9 @@ def home(tmp_path, monkeypatch):
     h.mkdir()
     monkeypatch.setenv("WS_HOME", str(h))
     monkeypatch.delenv("WS_BROKER_SOCKET", raising=False)
+    # the account's own folders are the test's folders; the tests below that plant a different one say so
+    monkeypatch.setattr(secretportal, "trusted_env", lambda: {"HOME": str(tmp_path), "WS_HOME": str(h)})
+    monkeypatch.setattr(secretportal.selfcmd, "unstable", lambda cmd=None: None)
     cfg = wsecrets.registry_path()
     cfg.parent.mkdir(parents=True, exist_ok=True)
     cfg.write_text('[demo]\nhosts = ["api.example.com"]\n')
@@ -123,6 +126,77 @@ def test_prompt_cancel_and_a_bad_value_are_recorded_not_stored(home, monkeypatch
 def test_a_bad_name_never_reaches_a_path(home):
     with pytest.raises(WsError):
         secretportal.cmd_wait(_ns("../x"))
+
+
+@pytest.fixture
+def account(tmp_path, monkeypatch):
+    """The account's own folders (no variable), and a session whose environment points them at its own folder."""
+    acct = tmp_path / "acct"
+    (acct / ".ws").mkdir(parents=True)
+    (acct / ".ws" / "secrets.toml").write_text('[demo]\nhosts = ["api.example.com"]\n')
+    monkeypatch.setattr(secretportal.paths, "account_home", lambda: acct)
+    monkeypatch.setattr(secretportal.selfcmd, "unstable", lambda cmd=None: None)
+    monkeypatch.delenv("WS_BROKER_SOCKET", raising=False)
+    for v in secretportal.paths.LAYOUT_VARS:
+        monkeypatch.delenv(v, raising=False)
+    monkeypatch.setenv("HOME", str(acct))
+    planted = tmp_path / "planted"
+    (planted).mkdir()
+    (planted / "secrets.toml").write_text('[demo]\nhosts = ["api.example.com"]\n')
+    return acct, planted
+
+
+def test_a_session_with_its_own_ws_folders_cannot_ask(account, monkeypatch):
+    _, planted = account
+    monkeypatch.setenv("TMUX", "x")
+    monkeypatch.setattr(secretportal.shutil, "which", lambda n: "/usr/bin/tmux")
+    for var, val in (("WS_HOME", str(planted)), ("HOME", str(planted))):
+        with monkeypatch.context() as m:
+            m.setenv(var, val)
+            with pytest.raises(WsError) as e:
+                secretportal.cmd_ask(_ns("demo"))
+            assert e.value.kind == "refused", var
+
+
+def test_the_window_runs_with_no_session_environment_and_only_the_account_home(account, monkeypatch):
+    acct, planted = account
+    monkeypatch.setenv("WS_HOME", str(planted))
+    monkeypatch.setenv("XDG_DATA_HOME", str(planted))
+    cmd = secretportal.window_command("demo")
+    assert cmd.startswith("env -i HOME=")
+    assert str(planted) not in cmd and "WS_HOME" not in cmd and "XDG" not in cmd
+    assert f"HOME={acct}" in cmd and "secret prompt demo" in cmd
+
+
+def test_the_window_is_refused_from_a_ws_that_runs_from_a_folder_that_comes_and_goes(account, monkeypatch):
+    monkeypatch.setattr(secretportal.selfcmd, "unstable", lambda cmd=None: "/x/.venv/bin/python is inside a .venv")
+    with pytest.raises(WsError) as e:
+        secretportal.window_command("demo")
+    assert e.value.kind == "refused"
+
+
+def test_the_prompt_takes_its_store_from_the_account_not_from_the_session_environment(account, monkeypatch):
+    acct, planted = account
+    monkeypatch.setenv(
+        "WS_HOME", str(planted)
+    )  # the session's variable, which the window never gets and which is ignored
+    monkeypatch.setenv("HOME", str(planted))
+    monkeypatch.setattr(secretportal.time, "sleep", lambda s: None)
+    monkeypatch.setattr(getpass, "getpass", lambda prompt="": VALUE)
+    assert secretportal.cmd_prompt(_ns("demo")) == 0
+    assert (acct / ".ws" / "secrets" / "demo").read_text() == VALUE
+    assert not (planted / "secrets").exists()
+    assert VALUE not in "\n".join(p.read_text(errors="replace") for p in planted.rglob("*") if p.is_file())
+
+
+def test_the_prompt_refuses_a_store_outside_the_accounts_own_folders(account, monkeypatch):
+    acct, planted = account
+    prof = acct / ".ws" / "profile.toml"
+    prof.write_text(f'[roles.secrets]\nstore = "{planted / "elsewhere"}"\n')
+    monkeypatch.setattr(secretportal.time, "sleep", lambda s: None)
+    monkeypatch.setattr(getpass, "getpass", lambda prompt="": VALUE)
+    assert secretportal.cmd_prompt(_ns("demo")) == 1
+    assert not (planted / "elsewhere").exists()
 
 
 def test_nothing_in_src_docs_or_tests_reads_the_old_registry_file():

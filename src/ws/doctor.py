@@ -320,6 +320,22 @@ def _review_checks(env, now=None) -> list[Check]:
     return out
 
 
+def _classes_check(env) -> list[Check]:
+    """WS020: whether the policy names any data class. `warn` when it has no `[classes]`: then nothing is classified, no
+    data class's network or provider limit applies, and the guards that are off by default stay off (the policy reference
+    says which and why). `ok` with the number of classes otherwise. No line when the policy does not load (WS012 says so)."""
+    try:
+        pol = policy.load(policy.policy_path(dict(env)))
+    except (policy.PolicyError, OSError):
+        return []
+    if not pol.classes:
+        fix = "name your data classes under [classes] in the policy (`ws walls init NAME` prints a walled one to start from)"
+        detail = "the policy has no data classes, so no folder is classified and no class limit applies"
+        return [Check("WS020", "data-classes", WARN, detail, fix)]
+    walled = sum(1 for c in pol.classes.values() if c.access != "full")
+    return [Check("WS020", "data-classes", OK, f"{len(pol.classes)} data class(es), {walled} not full access")]
+
+
 def _drop_in_checks(env, kind: str) -> list[Check]:
     """WS019: the ws class drop-ins in the managed-settings folder. `warn` when more than one is in place, or one is for a
     class this policy doesn't name: Claude Code applies every drop-in to every account on the machine, and one class per
@@ -582,6 +598,10 @@ def run_checks(osi: OSInfo, profile_file: Path, env: dict | None = None, network
         checks += _mode_checks(env)
     except Exception as e:  # noqa: BLE001 (a broken check must report, not crash the whole doctor)
         checks.append(Check("WS018", "guard-modes", FAIL, f"check crashed ({type(e).__name__})"))
+    try:
+        checks += _classes_check(env)
+    except Exception as e:  # noqa: BLE001 (a broken check must report, not crash the whole doctor)
+        checks.append(Check("WS020", "data-classes", FAIL, f"check crashed ({type(e).__name__})"))
     try:
         checks += _drop_in_checks(env, osi.kind)
     except Exception as e:  # noqa: BLE001 (a broken check must report, not crash the whole doctor)

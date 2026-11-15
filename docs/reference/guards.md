@@ -23,6 +23,26 @@ A policy file with no `[guards]` table has no guards on, so an upgrade changes n
 name in `on` that ws doesn't know stops the load and the message names it. So does a key in `[guards]` that isn't `on`
 or a guard name, and a key in a guard's table that guard doesn't read (`mode` is read by ws for every guard, below).
 
+### Off by default, and why
+
+Every guard but the three `ws gate init` turns on is off until you name it, because each one costs something on every
+call or changes how a session works:
+
+| Guard | Why it's off by default |
+|---|---|
+| `bulk-staging` | It refuses habits many people rely on (`git add -A`, `git commit -a`). |
+| `test-weakening` | It reads the test file before and after each edit, which costs time on a big file. |
+| `claims` | It asks git about each commit a message names, and only helps when agents report to one another. |
+| `spawn-cap` | Its cap suits one machine; a wrong cap stops subagents a person meant to start. |
+| `skill-gate` | It needs skills with `gates` front matter, which most setups don't have. |
+| `checkout-pin` | It only helps with linked worktrees, and it refuses branch moves you may want. |
+| `inbox` | It needs `ws msg` messages between sessions. |
+| `presence` | It writes the session registry on every hook; only the lead and `pane-close` read it. |
+| `pane-close` | It only matters to a lead that closes other sessions' panes. |
+| `record-calls` | It writes every call's payload to a log on disk. Keep it off in a walled class. |
+
+`ws doctor` warns (WS020) when the policy names no data class, since then no class limit applies.
+
 ## Modes: Enforce and log
 
 Every guard's table takes one key of ws's own, `mode`:

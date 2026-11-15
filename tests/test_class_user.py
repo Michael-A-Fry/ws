@@ -84,7 +84,7 @@ def test_doctor_reports_each_part_of_a_class_separately(box, monkeypatch):
         r["file present and root-owned"].status == "warn"
         and "no managed-settings file" in r["file present and root-owned"].detail
     )
-    assert all(r[p].status == "warn" for p in wallsettings.PARTS[2:7])
+    assert all(r[p].status == "warn" for p in wallsettings.CONTENT_PARTS)
     place(box, pol, monkeypatch)
     r = rows(box, pol)
     assert {p: x.status for p, x in r.items() if p != "OS user exists"} == dict.fromkeys(wallsettings.PARTS[1:], "ok")

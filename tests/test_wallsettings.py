@@ -548,13 +548,18 @@ def test_the_launch_file_holds_exactly_the_isolation_keys_and_no_managed_only_ke
         "crossSessionInbound",
         "isolatePeerMachines",
         "disableAllHooks",
+        "disableRemoteControl",
+        "disableClaudeAiConnectors",
         "sandbox",
         "env",
     }
+    assert conf["disableRemoteControl"] is True and conf["disableClaudeAiConnectors"] is True  # G11
     assert conf["crossSessionInbound"] == "refuse" and conf["isolatePeerMachines"] is True
     assert conf["disableAllHooks"] is False  # a project's true would switch the gate hook off; this outranks it
-    assert set(conf["permissions"]) == {"deny", wallsettings.READ_BLOCK_KEY}
+    assert set(conf["permissions"]) == {"deny", wallsettings.READ_BLOCK_KEY, wallsettings.WRITE_BLOCK_KEY}
     assert conf["permissions"][wallsettings.READ_BLOCK_KEY] is True
+    assert conf["permissions"][wallsettings.WRITE_BLOCK_KEY] is True  # C360, in the launch file only
+    assert not wallsettings.tokens_missing(conf)
     deny = conf["permissions"]["deny"]
     assert {"SendMessage", "ListAgents"} <= set(deny)
     for tool in ("Read", "Edit"):  # the home, ws's own folders and the other class's repos, for both tools
@@ -567,6 +572,7 @@ def test_the_launch_file_holds_exactly_the_isolation_keys_and_no_managed_only_ke
     assert set(conf["sandbox"]) == {
         "filesystem",
         "network",
+        "credentials",  # C360: the token deny
         *wallsettings.WEAKER_KEYS,
     }  # no `enabled`, no write list: those are the managed file's; the two weaker-sandbox switches are off
     assert all(conf["sandbox"][k] is False for k in wallsettings.WEAKER_KEYS)

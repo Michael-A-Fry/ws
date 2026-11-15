@@ -16,7 +16,9 @@ but for the class's own hosts (`network.allowedDomains` with `allowManagedDomain
 root-owned, in a `ws-classes` folder beside the managed-settings folder, which Claude Code does not read. `ws gate launch`
 reads it and merges it into the launch copy it passes with `--settings` (`merge`, `load_launch_file`), the launch keys
 winning, so a session of another class or of none never gets it. It holds `Read` and `Edit` denied for the sealed paths,
-file reads held to the working folders (`permissions.blockReadsOutsideWorkingDirectories`), cross-session messaging refused
+file reads and file-tool writes held to the working folders (`permissions.blockReadsOutsideWorkingDirectories` and
+its write twin), the sign-in tokens kept from shell commands (`sandbox.credentials`), Remote Control and the claude.ai
+connectors off, cross-session messaging refused
 (`crossSessionInbound`, a `SendMessage` and `ListAgents` deny, `isolatePeerMachines`), `disableAllHooks` false, the other
 classes' repos unreadable, the class's hosts under `strictAllowlist`, the class marker and the OpenTelemetry content logs
 off. Keys Claude Code reads only from managed settings (`MANAGED_ONLY`) are in neither file: from a `--settings` file they
@@ -71,6 +73,9 @@ UNATTENDED_KEY = "denyInsteadOfPrompting"
 # The credentials the sandbox keeps from shell commands. The settings reference gives 2.1.221 for its `mask` mode and
 # no version for `deny`; 2.1.221 is the earliest it names, and the key is in every binary from 2.1.308 on.
 CREDENTIALS_KEY = "sandbox.credentials"
+# The runner's sign-in tokens and API keys that `sandbox.credentials.envVars` denies to every sandboxed command (the launch
+# settings, and each class's launch file, so a class session has them whatever the generated settings say).
+TOKEN_VARS = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
 # The settings keys the wall writes that only newer Claude Code versions read: dotted key -> first version that does.
 # The one table `ws doctor` WS016 and the e2e skip read; a version is parsed as doctor._version_tuple parses it.
 MIN_CLAUDE = {
@@ -99,6 +104,10 @@ HOOKS_KEY = "disableAllHooks"
 PEER_KEY = (
     "isolatePeerMachines"  # belt only: SendMessage is denied, so this is the second wall for a cross-machine send
 )
+# Remote Control and the claude.ai connectors (Claude Code's settings reference: both any file, boolean): off for a class
+# session, written in the launch file so a session of another account keeps its own (G11).
+REMOTE_KEY = "disableRemoteControl"
+CONNECTORS_KEY = "disableClaudeAiConnectors"
 MESSAGING_DENY = ("SendMessage", "ListAgents")  # the real cross-session control: the tools are not there to call
 # OpenTelemetry content logs: prompts and tool details stay out of any telemetry a class session sends (Claude Code reads
 # the off value `0` from a --settings file, and a project file may only turn them off too). In the launch file.
@@ -408,6 +417,8 @@ PARTS = (
     "home deny-read",
     "inbound lead-only",
 )
+# The parts read from the file's content (the last, inbound, is judged with the policy too: `_inbound_row`).
+CONTENT_PARTS = PARTS[2:-1]
 
 
 @dataclass(frozen=True)
@@ -685,16 +696,21 @@ def launch_settings(
 
     sealed = sealed_paths(cls, home, kind, pol, env)
     return {
+        # the write block and the token deny are here, not in the managed file, which binds every account on the machine
         "permissions": {
             READ_BLOCK_KEY: True,
+            WRITE_BLOCK_KEY: True,
             "deny": [*MESSAGING_DENY, *(f"{tool}({s})" for tool in ("Read", "Edit") for s in sealed)],
         },
         CROSS_KEY: CROSS_VALUE,
         PEER_KEY: True,
         HOOKS_KEY: False,
+        REMOTE_KEY: True,
+        CONNECTORS_KEY: True,
         "sandbox": {
             # the two switches that weaken the sandbox for a container or a MITM proxy: off, and a project may not set them
             **dict.fromkeys(WEAKER_KEYS, False),
+            "credentials": {"envVars": [{"name": n, "mode": "deny"} for n in TOKEN_VARS]},
             "filesystem": {"denyRead": _other_roots(cls, home, kind, pol)},
             # Default-deny network: the class's hosts and its providers' (ws.sandbox.class_domains); `strictAllowlist`
             # refuses any other host instead of asking. An egress exception is not in the file: it expires, the file does not.
@@ -1411,7 +1427,7 @@ def _rows_for(cls: policy.Class, env: Mapping[str, str], kind: str) -> list[Row]
     if found is None:
         where = class_file_path(name, kind)
         rows.append(row(PARTS[1], WARN, f"no managed-settings file for the class at {where}", again))
-        rows += [row(p, WARN, "not checked: no class file in place", again) for p in PARTS[2:7]]
+        rows += [row(p, WARN, "not checked: no class file in place", again) for p in CONTENT_PARTS]
     else:
         problem = owner_problem(found)
         if problem:
@@ -1420,12 +1436,12 @@ def _rows_for(cls: policy.Class, env: Mapping[str, str], kind: str) -> list[Row]
             rows.append(row(PARTS[1], OK, f"{found} is root-owned and writable by no one else"))
         doc = read(found)
         if doc is None:
-            rows += [row(p, FAIL, f"{found} is not a JSON object Claude Code can read", again) for p in PARTS[2:7]]
+            rows += [row(p, FAIL, f"{found} is not a JSON object Claude Code can read", again) for p in CONTENT_PARTS]
         else:
             try:
                 want = class_settings(cls, class_home(cls, kind), kind)
             except WsError as e:
-                rows += [row(p, WARN, e.message, e.hint) for p in PARTS[2:7]]
+                rows += [row(p, WARN, e.message, e.hint) for p in CONTENT_PARTS]
             else:
                 rows += _content_rows(name, doc, want, again)
     rows.append(_inbound_row(cls, found))
@@ -1486,9 +1502,19 @@ def _content_rows(name: str, doc: Mapping, want: Mapping, again: str) -> list[Ro
     ]
 
 
+def tokens_missing(doc: Mapping) -> list[str]:
+    """The names of TOKEN_VARS a settings document does not deny to sandboxed commands (`sandbox.credentials.envVars`
+    entries with mode "deny"), in TOKEN_VARS order."""
+    sb = doc.get("sandbox") if isinstance(doc.get("sandbox"), Mapping) else {}
+    cred = sb.get("credentials") if isinstance(sb.get("credentials"), Mapping) else {}
+    entries = cred.get("envVars") if isinstance(cred.get("envVars"), list) else []
+    denied = {e.get("name") for e in entries if isinstance(e, Mapping) and e.get("mode") == "deny"}
+    return [n for n in TOKEN_VARS if n not in denied]
+
+
 def _inbound_row(cls: policy.Class, found: Path | None) -> Row:
     """The inbound part: the file records lead-only, and the policy's own `inbound` for the class lets no one else in."""
-    part, again = PARTS[7], f"`ws install --class {cls.name}` prints the file"
+    part, again = PARTS[-1], f"`ws install --class {cls.name}` prints the file"
     if cls.inbound == "allowlist":
         fix = f'set inbound = "lead-only" under [classes.{cls.name}] in the policy'
         return Row(cls.name, part, WARN, "the policy lets named sessions send in (inbound = allowlist)", fix)

@@ -209,6 +209,7 @@ Named checks that run beside the `[gate]` rules. The [guards reference](guards.m
 | `[guards.checkout-pin]` `paths` | list of text | `[]` | Checkouts to pin besides those with linked worktrees. Absolute or `~/`. |
 
 A file with no `[guards]` table has no guards on. `bulk-staging` and `record-calls` take no table.
+Which guards are off by default, and why: [the guards reference](guards.md#off-by-default-and-why).
 
 ## `[classes.NAME]`
 

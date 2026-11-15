@@ -354,7 +354,19 @@ def test_a_write_takes_the_older_programs_asks_lock(box, capsys, monkeypatch):
     assert stat.S_IMODE((box.store.parent / "asks.lock").stat().st_mode) == 0o600
 
 
-def test_two_adds_with_one_key_make_one_ask(box, capsys):
+def slow_between_check_and_write(monkeypatch):
+    """Both writers get past their check before either writes, unless the lock keeps them apart."""
+    real = asks._now
+
+    def slow():
+        time.sleep(0.05)
+        return real()
+
+    monkeypatch.setattr(asks, "_now", slow)
+
+
+def test_two_adds_with_one_key_make_one_ask(box, capsys, monkeypatch):
+    slow_between_check_and_write(monkeypatch)
     ids, errs = [], []
 
     def one():
@@ -371,8 +383,9 @@ def test_two_adds_with_one_key_make_one_ask(box, capsys):
     assert [e["event"] for e in box.lines()] == ["added"]
 
 
-def test_two_answers_to_one_ask_only_one_succeeds(box, capsys):
+def test_two_answers_to_one_ask_only_one_succeeds(box, capsys, monkeypatch):
     ident = box.add(capsys, "--question", "Q", "--option", "Yes", "--option", "No")
+    slow_between_check_and_write(monkeypatch)
     won, lost = [], []
 
     def one(n):

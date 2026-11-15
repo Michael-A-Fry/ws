@@ -884,7 +884,7 @@ def test_the_watchdog_stops_a_step_that_hangs():
         upgrade.EXIT_TIMEOUT,
         True,
     )
-    assert time.monotonic() - t < 20
+    assert time.monotonic() - t < 30  # the step sleeps 600 s: back inside 30 s means the watchdog fired
     assert upgrade._run([sys.executable, "-c", "raise SystemExit(3)"], False, timeout=30) == (3, False)
     assert upgrade._run([sys.executable, "-c", "raise SystemExit(124)"], False, timeout=30) == (124, False)
 

@@ -750,6 +750,7 @@ def _planted(extra: str):
     [
         ('allow_mcp = ["mcp__docs__search"]', "mcp"),
         ('deny_tools = ["mcp__*__delete_*"]', "mcp"),
+        ('deny_tools = ["mcp__docs"]', "mcp"),  # a whole server has no OpenCode rule: not a silent allow
         ('allow_hosts = ["example.com"]', "allow_hosts"),
     ],
 )

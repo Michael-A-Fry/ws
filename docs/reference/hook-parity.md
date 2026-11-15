@@ -64,8 +64,9 @@ off or on in `[guards] on`, like the rest.
 The table does not change when the runner does. One adapter module owns the translation: `src/ws/adapters/claude_code.py`
 or `src/ws/adapters/opencode.py` turns the policy into that runner's own config and parses that runner's hook payload
 into a neutral call, and `ws gate` judges the call. To move to a third runner, add a module to `src/ws/adapters/` (the
-contract is in that folder's docstring) and list in its `CANNOT_CHECK` every check it cannot enforce; `ws run` then
-refuses a job whose policy needs one, so a gap is a refusal and never a silent allow.
+contract is in that folder's docstring) and list in its `CANNOT_CHECK` every check it cannot enforce; a job whose
+policy needs one is then refused (once `ws run` calls `refuse_cannot_check`, which lands with the walls change), so a gap
+is a refusal and never a silent allow.
 
 ## How the rows are kept true
 

@@ -19,14 +19,15 @@ A module must define:
                                                 "other" from the payload's tool name, which the policy has no rule
                                                 for: it is allowed and logged); ValueError or TypeError if it cannot be
                                                 read (`ws gate check` then denies: fail closed).
+    CANNOT_CHECK: dict[str, str]                REQUIRED: a check name -> why this runner cannot enforce it ("mcp", "allow_hosts",
+                                                "guard:NAME"); `{}` when it can do all. A job whose policy needs one is
+                                                refused once `ws run` calls ws.conformance.refuse_cannot_check (wired
+                                                after the walls change merges).
     def launch_hint(out) -> str                 one line: how to start the runner with the generated config.
 
 and, optionally:
 
     UNSUPPORTED_GUARDS: tuple[str, ...]         guard names (ws.guards) this runner's generated config does not run.
-    CANNOT_CHECK: dict[str, str]                a check name -> why this runner cannot enforce it ("mcp", "allow_hosts",
-                                                "guard:NAME"); `ws run` refuses a job whose policy needs one (see
-                                                ws.conformance.refuse_cannot_check). Absent or empty = it can do all.
     EVENT_NAMES: dict[str, str]                 the runner's hook event name -> a ws.guards event ("pre", "post",
                                                 "start", "prompt", "stop", "subagent-stop"), for `ws gate event`.
 

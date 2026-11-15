@@ -337,9 +337,9 @@ def test_every_hook_row_is_covered_by_a_test_or_says_why_not():
 
 
 def test_a_hook_in_an_inventory_with_no_row_is_found():
-    names = [r["id"] for r in table()]
-    assert gen.missing(names) == []
-    assert gen.missing([*names, "dummy-hook"]) == ["dummy-hook"]  # planted: this is the red case
+    assert gen.missing(["dummy-hook"]) == ["dummy-hook"]  # planted: a hook the table does not know is red
+    assert gen.missing([table()[0]["id"]]) == []
+    assert gen.missing([], rows=[]) == []
 
 
 def test_the_page_is_what_the_script_writes_from_the_table():

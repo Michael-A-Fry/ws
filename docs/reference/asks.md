@@ -11,6 +11,10 @@ ws ask add --question "Ship it?" --option "Yes|tests are green" --option "No" --
 ws ask list                      # open asks, oldest first
 ws ask get ID
 ws ask answer ID 2               # an option's number (1-based), its label in any case, or free text
+ws ask wait ID --timeout 600     # block until answered
+ws ask done ID                   # the session has acted on it (an open or answered ask)
+ws ask withdraw ID               # the session no longer needs it (an open ask)
+ws ask import OLD.jsonl --dry-run
 ```
 
 The first `--option` is the recommendation. An open ask with the same `--dedupe-key` returns its id and adds nothing.
@@ -51,8 +55,30 @@ text), `event` and `id`. `added` carries the ask; `answered` carries `answer` (`
 shim (no `answer`, no `at`) fold the same way, and so do the rows of the older `ws-ask` program (`v` 1, `ts` as
 RFC 3339 text), which are read with their times. New keys and event kinds were added to the file; none changed meaning.
 
+## Wait, done, withdraw
+
+`wait` polls the store each second and prints the answer (exit 0). At the timeout (default 540 seconds, under a
+ten-minute tool limit) it prints `still open` and exits 3. An ask that was withdrawn or done with no answer prints its
+status and exits 4. `done` and `withdraw` print the new status; on an ask that's already closed they write nothing and
+print its status. An unknown id is exit 2 for all three.
+
+## Import
+
+`ws ask import PATH` converts an older asks file (`v` 1 lines with an RFC 3339 `ts`) into events here: `ts` becomes epoch
+milliseconds, `v` is dropped, and the ask's own fields are kept. Run it twice and the count is the same: a row already
+there (same event and id) is skipped. A row that isn't valid, or closes an ask that isn't there, is counted as skipped.
+A row that doesn't say `redacted: false` comes in redacted, and a redacted row keeps its stored text (none). `--dry-run`
+writes nothing, not even the folder. The older file isn't read after that.
+
+## Notify
+
+Notify isn't built. `ws.asks.NOTIFY_HOOK` is a function a later release or a local patch may set; `ws ask add` calls it
+once for a new ask with the stored event (a redacted ask has no text in it). By default it does nothing. Because the
+store is plain JSON lines, anything that reads them (a script, a page, a phone push) can replace this command without
+a migration.
+
 Exit codes: 0 fine, 1 refused (a secret, already answered, a wall, a store that can't be written), 2 usage or an
-unknown id.
+unknown id; `wait` also 3 (timed out) and 4 (closed with no answer).
 
 ## The older program
 

@@ -1,2 +1,4 @@
 # Shell scripts must keep LF: a Windows checkout with autocrlf would break bash.
 *.sh text eol=lf
+# Git hooks have no extension; they are bash too (15 Nov: CRLF broke `set -o pipefail` in the WSL doctor).
+.github/hooks/* text eol=lf

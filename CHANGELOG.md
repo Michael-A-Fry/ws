@@ -21,6 +21,12 @@ body of the GitHub release.
   off, a headless job's writes held in the class, and a `local_only` class held to a local model.
 - `ws doctor` warns (WS020) when the policy names no data class. The guards reference says which guards are off by
   default and why.
+- The gate's decision log (`logs/gate.jsonl`, or a class's own copy) has a line for every call's check, an allowed one
+  included, with the tool's name. A refusal's line names the rule or layer that said no in `rule` (for example
+  `rule:command` or `guard:claims`), never the reason or the command. A tool no adapter reads is counted as a write
+  (`counted_as: "write"`). A check that fails before the policy loads still leaves a deny line (rule `error`, with no
+  session id or tool name), a guard that speaks after a call names itself, the live file turns over at 5 MiB instead of
+  1 MiB, and a hook waits at most 0.2 seconds for the log's lock.
 
 ### Changed
 
@@ -29,6 +35,8 @@ body of the GitHub release.
   file is unchanged. Print the launch file again with `ws install --class NAME` and put it in place.
 - A push alert from a session in a walled or counts-only class is always the plain line ("a session needs you"), with
   no folder name and none of the runner's words, whatever `alert_text` says.
+- In the decision log, a refusal the wall makes redundant, refused because the wall wasn't proven, now has the layer
+  `rule:unknown-command-word`, `rule:sets-ifs` or `rule:unread-write` where it was `rule:command`.
 
 ### Fixed
 

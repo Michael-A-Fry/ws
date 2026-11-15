@@ -1,9 +1,10 @@
-"""docs/reference/hooks.md maps each hook of a hand-built set to the ws rule or guard that does the same job. Each
+"""docs/reference/hook-parity.toml (shown as hook-parity.md) maps each hook of a hand-built set to the ws rule or guard that does the same job. Each
 `covered` row has a test here that sends the same sample call to the ws side, through the real hook entry, and checks that
 it is stopped (and that its harmless neighbour is not). The last test keeps the page and these tests in step."""
 
 from __future__ import annotations
 
+import importlib.util
 import io
 import json
 import re
@@ -15,10 +16,17 @@ from pathlib import Path
 import pytest
 
 from ws import cli, gate, paths, policy
-from ws.adapters import claude_code
+from ws.adapters import claude_code, opencode
+
+ROOT0 = Path(__file__).resolve().parents[1]
+_spec = importlib.util.spec_from_file_location("gen_hook_parity", ROOT0 / "scripts" / "gen_hook_parity.py")
+gen = importlib.util.module_from_spec(_spec)
+sys.modules["gen_hook_parity"] = gen
+_spec.loader.exec_module(gen)
 
 ROOT = Path(__file__).resolve().parents[1]
-PAGE = ROOT / "docs" / "reference" / "hooks.md"
+PAGE = ROOT / "docs" / "reference" / "hook-parity.md"
+DATA = ROOT / "docs" / "reference" / "hook-parity.toml"
 needs_git = pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
 
 
@@ -304,33 +312,52 @@ def test_parity_phone_alert(box, monkeypatch, capsys):
 # --- the page and these tests agree ------------------------------------------------------------------------------
 
 
-def rows() -> list[list[str]]:
-    found = []
-    for line in PAGE.read_text(encoding="utf-8").splitlines():
-        cells = [c.strip() for c in line.strip().strip("|").split("|")]
-        if re.fullmatch(r"\d+", cells[0]) and len(cells) == 5:
-            found.append(cells)
-    return found
+def table() -> list[dict]:
+    return gen.load()
 
 
 def test_every_hook_row_is_covered_by_a_test_or_says_why_not():
-    table = rows()
-    assert [r[0] for r in table] == [str(n) for n in range(1, 23)]  # the 22 hooks, in order
+    rows = table()
+    assert len({r["id"] for r in rows}) == len(rows), "duplicate row id"
     mine = {n for n in globals() if n.startswith("test_parity_")}
     named = set()
-    for number, what, ws, status, proof in table:
-        assert what and ws, number
-        if status == "covered":
-            test = proof.strip("`")
-            assert test in mine, f"row {number} names {test}, which is not in tests/test_hook_parity.py"
-            named.add(test)
+    for r in rows:
+        assert r["what"] and r["ws"], r["id"]
+        assert r["status"] in gen.STATUSES and r["fail"] in gen.FAILS, r["id"]
+        if r["status"] == "covered":
+            assert r["test"] in mine, f"row {r['id']} names {r['test']}, which is not in tests/test_hook_parity.py"
+            named.add(r["test"])
         else:
-            assert status == "estate (personal)" or re.fullmatch(r"dropped \(reason: .+\)", status), (number, status)
-            assert proof == "none" or proof.startswith("none:"), number
+            assert r["test"] == "none", r["id"]
+            if r["status"] == "planned":
+                assert r.get("wave") in ("1", "2a", "2b", "3"), r["id"]
+            if r["status"] == "dropped":
+                assert "reason" in r["ws"] or "no " in r["ws"], r["id"]
     assert named == mine, f"tests with no row on the page: {sorted(mine - named)}"
 
 
+def test_a_hook_in_an_inventory_with_no_row_is_found():
+    names = [r["id"] for r in table()]
+    assert gen.missing(names) == []
+    assert gen.missing([*names, "dummy-hook"]) == ["dummy-hook"]  # planted: this is the red case
+
+
+def test_the_page_is_what_the_script_writes_from_the_table():
+    assert PAGE.read_text(encoding="utf-8") == gen.render()
+    assert PAGE.read_text(encoding="utf-8").startswith("<!-- GENERATED")
+
+
 def test_the_page_names_no_person_host_or_private_setup():
-    text = PAGE.read_text(encoding="utf-8")
+    text = PAGE.read_text(encoding="utf-8") + DATA.read_text(encoding="utf-8")
     assert not re.search(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", text) and "@" not in text
     assert "/home/" not in text and "/Users/" not in text
+
+
+def test_generated_runner_configs_say_do_not_edit(box):
+    pol = policy.default_policy()
+    made = claude_code.generate(pol, ["ws"], box / "out", box / "w" / "policy.toml")
+    made.update(opencode.generate(pol, ["ws"], box / "out", box / "w" / "policy.toml"))
+    for name, text in made.items():
+        if name == ".gitignore":
+            continue
+        assert "DO NOT EDIT" in text.splitlines()[0] or "DO NOT EDIT" in json.loads(text).get("_generated", ""), name

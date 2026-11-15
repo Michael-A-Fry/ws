@@ -736,3 +736,50 @@ def test_a_torn_last_line_in_the_asks_file_costs_only_itself(tmp_path, box):
     asks = asks_after(tmp_path, b'{"event": "added", "id": "old", "q')  # the writer died mid-line, no newline
     rows = list(_files.iter_jsonl(asks))
     assert [row["id"] for row in rows] == ["p0"]
+
+
+# --- a policy that needs a check this runner cannot do is refused (CANNOT_CHECK) ------------------------------------
+
+
+def _planted(extra: str):
+    return policy.loads(f"[gate]\n{extra}\n")
+
+
+@pytest.mark.parametrize(
+    "extra, check",
+    [
+        ('allow_mcp = ["mcp__docs__search"]', "mcp"),
+        ('deny_tools = ["mcp__*__delete_*"]', "mcp"),
+        ('allow_hosts = ["example.com"]', "allow_hosts"),
+    ],
+)
+def test_opencode_refuses_a_policy_that_needs_a_check_it_cannot_do(extra, check):
+    from ws import conformance
+    from ws.output import WsError
+
+    with pytest.raises(WsError) as e:
+        conformance.refuse_cannot_check(_planted(extra), "opencode")
+    assert e.value.exit_code == 3 and e.value.kind == "cannot_check"
+    assert "CANNOT_CHECK" in e.value.message and check in e.value.message
+    conformance.refuse_cannot_check(_planted(extra), "claude-code")  # the same policy is fine where it can be checked
+
+
+def test_opencode_refuses_an_unsupported_guard_that_is_on_and_not_otherwise():
+    from ws import conformance
+    from ws.output import WsError
+
+    on = policy.loads('[guards]\non = ["claims"]\n')
+    with pytest.raises(WsError, match="guard:claims"):
+        conformance.refuse_cannot_check(on, "opencode")
+    conformance.refuse_cannot_check(policy.default_policy(), "opencode")
+    conformance.refuse_cannot_check(
+        _planted('deny_tools = ["mcp__docs__delete"]'), "opencode"
+    )  # exact name: native deny
+
+
+def test_every_adapter_declares_cannot_check_as_a_dict_of_reasons():
+    from ws import adapters
+
+    for name, mod in adapters.all_adapters().items():
+        gaps = getattr(mod, "CANNOT_CHECK", None)
+        assert isinstance(gaps, dict) and all(isinstance(v, str) and v for v in gaps.values()), name

@@ -24,6 +24,9 @@ A module must define:
 and, optionally:
 
     UNSUPPORTED_GUARDS: tuple[str, ...]         guard names (ws.guards) this runner's generated config does not run.
+    CANNOT_CHECK: dict[str, str]                a check name -> why this runner cannot enforce it ("mcp", "allow_hosts",
+                                                "guard:NAME"); `ws run` refuses a job whose policy needs one (see
+                                                ws.conformance.refuse_cannot_check). Absent or empty = it can do all.
     EVENT_NAMES: dict[str, str]                 the runner's hook event name -> a ws.guards event ("pre", "post",
                                                 "start", "prompt", "stop", "subagent-stop"), for `ws gate event`.
 

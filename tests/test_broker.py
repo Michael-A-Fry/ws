@@ -1273,3 +1273,45 @@ def test_run_record_a_symlinked_record_folder_is_refused(scoped, base):
     scoped.s.records.symlink_to(real)
     e = refusal(scoped.lease, "work", run="r1")
     assert e.code == "run_refused" and "symlink" in e.reason
+
+
+# -- per-secret lease limit and lease count in the audit line (F-B10)
+
+
+def _ttl_registry(env, ttl: str) -> None:
+    env.write_registry(f'[anthropic]\nhosts = ["{env.stub.host}"]\nttl = {ttl}\n')
+
+
+def _expires_in(env, lease) -> float:
+    import calendar
+
+    return calendar.timegm(time.strptime(lease.expires_at, "%Y-%m-%dT%H:%M:%SZ")) - env.now
+
+
+def test_a_secrets_own_ttl_caps_its_lease_and_a_longer_ask_cannot_beat_it(env):
+    _ttl_registry(env, "120")
+    assert 118 <= _expires_in(env, env.lease()) <= 121  # no ask: the secret's own limit
+    assert 118 <= _expires_in(env, env.lease(ttl_s=3000)) <= 121  # a longer ask is cut to it
+    assert 28 <= _expires_in(env, env.lease(ttl_s=30)) <= 31  # a shorter ask is kept
+
+
+def test_a_secret_without_ttl_gets_the_brokers_limit_which_is_one_hour_by_default(env):
+    assert broker.DEFAULT_TTL_S == 3600
+    assert 3598 <= _expires_in(env, env.lease()) <= 3601
+
+
+@pytest.mark.parametrize("bad", ["0", "-5", '"60"', "true", "86401"])
+def test_a_bad_ttl_in_the_registry_refuses_the_whole_registry(env, bad):
+    _ttl_registry(env, bad)
+    with pytest.raises(wsecrets.SecretsError, match="ttl"):
+        wsecrets.load_registry(env.registry)
+
+
+def test_the_request_audit_line_counts_that_names_open_leases(env):
+    for _ in range(3):
+        env.lease()
+    env.lease(name="github")
+    ok = [a for a in env.audit() if a["op"] == "request" and a["status"] == "ok"]
+    assert [a["leases"] for a in ok if a["name"] == "anthropic"] == [1, 2, 3]
+    assert [a["leases"] for a in ok if a["name"] == "github"] == [1]
+    assert VALUE not in env.log.read_text()

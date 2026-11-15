@@ -541,6 +541,8 @@ class Audit:
             "status": status,
             "bytes": f.get("bytes"),
         }
+        if isinstance(f.get("leases"), int) and not isinstance(f.get("leases"), bool):
+            rec["leases"] = f["leases"]  # open leases of that name, this one included
         line = (json.dumps(rec, ensure_ascii=True) + "\n").encode()
         try:
             with self._lock:
@@ -866,7 +868,8 @@ class Broker:
         except wsecrets.SecretsError as e:
             return refuse("store_unreadable", str(e))
         token = base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip("=")
-        expires = now + min(float(ttl), self.max_ttl_s) if ttl is not None else now + self.max_ttl_s
+        limit = min(self.max_ttl_s, entry.ttl) if entry.ttl is not None else self.max_ttl_s  # the secret's own limit
+        expires = now + min(float(ttl), limit) if ttl is not None else now + limit
         if rec is not None and rec.expires_at is not None:
             expires = min(expires, rec.expires_at)  # a lease never outlives its run
         grant = _Grant(
@@ -888,7 +891,8 @@ class Broker:
             if len(self._grants) >= MAX_LEASES:
                 return refuse("busy", "too many open leases; release some")
             self._grants[_key(token)] = grant
-        if not self.audit.write("request", "ok", lease=grant.id, **log):
+            open_now = sum(1 for g in self._grants.values() if g.name == name)  # this lease included
+        if not self.audit.write("request", "ok", lease=grant.id, leases=open_now, **log):
             with self._lock:
                 self._grants.pop(_key(token), None)
             return _refuse("audit_failed", "the grant could not be written to the audit log, so it is not given")

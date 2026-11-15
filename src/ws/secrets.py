@@ -42,6 +42,7 @@ NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
 HOST_RE = re.compile(r"^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?(:[0-9]{1,5})?$")
 HEADER_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 MAX_VALUE = 8192
+MAX_TTL_S = 86400  # a per-secret lease limit above a day is a typo
 WALL_USER = "ws-broker"
 WALL_GROUP = "ws-clients"
 WALL_HOME = "/var/lib/ws-broker"
@@ -77,6 +78,7 @@ class Entry:
     tier: str | None = None
     area: str | None = None
     kind: str = "header"  # header: the broker adds it to requests; else a minter in ws.minters makes a credential
+    ttl: float | None = None  # longest lease of this name, seconds; None: the broker's own limit (one hour by default)
     options: object = None  # the minter's own keys, parsed by it
 
     @property
@@ -174,7 +176,10 @@ def _entry(path: Path, name: str, t: dict) -> Entry:
         raise SecretsError(f"{path}: [{name}] tier must be one of {', '.join(TIERS)}")
     if area is not None and not (isinstance(area, str) and AREA_RE.match(area)):
         raise SecretsError(f"{path}: [{name}] area must be a short lower-case name (letters, digits, - and _)")
-    allowed = {"hosts", "header", "format", "purposes", "tier", "area", "kind"}
+    ttl = t.get("ttl")
+    if ttl is not None and (isinstance(ttl, bool) or not isinstance(ttl, (int, float)) or not 0 < ttl <= MAX_TTL_S):
+        raise SecretsError(f"{path}: [{name}] ttl must be a number of seconds above 0 and at most {MAX_TTL_S}")
+    allowed = {"hosts", "header", "format", "purposes", "tier", "area", "kind", "ttl"}
     options = None
     if kind != "header":
         allowed = {"tier", "area", "kind", "purposes"} | minters[kind].EXTRA_KEYS
@@ -192,6 +197,7 @@ def _entry(path: Path, name: str, t: dict) -> Entry:
         tier=tier,
         area=area,
         kind=kind,
+        ttl=float(ttl) if ttl is not None else None,
         options=options,
     )
 

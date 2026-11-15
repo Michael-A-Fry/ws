@@ -2,6 +2,8 @@
 # Runs the checks CI runs, on your machine, before a push leaves it.
 # Turn it on once per clone:  git config core.hooksPath .github/hooks
 # Skip it for one push:       WS_SKIP_PREPUSH=1 git push
+# Run the suite through a wrapper: WS_PREPUSH_WRAP="your-lock-command --flag" git push (split on spaces; for a machine
+# that queues test runs, so a push's suite doesn't race the others). Unset, the suite runs as it is.
 # A skip is never silent: it adds a line to .git/ws-prepush-skips.log (the log of the worktree's git dir).
 set -euo pipefail
 
@@ -22,5 +24,13 @@ fi
 echo "pre-push: uvx prek run --all-files" >&2
 uvx prek run --all-files >&2
 
-echo "pre-push: uv run --locked pytest -q" >&2
-uv run --locked pytest -q >&2
+wrap=()
+if [[ -n "${WS_PREPUSH_WRAP:-}" ]]; then
+  read -r -a wrap <<<"$WS_PREPUSH_WRAP"
+fi
+suite=(uv run --locked pytest -q)
+if ((${#wrap[@]})); then
+  suite=("${wrap[@]}" "${suite[@]}")
+fi
+echo "pre-push: ${suite[*]}" >&2
+"${suite[@]}" >&2

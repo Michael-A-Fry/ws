@@ -139,6 +139,8 @@ def plant(tmp: Path) -> str:
     (work / "STATE.md").write_text("state\n")
     (work / "tests" / "test_x.py").write_text(TEST_OLD)
     (work / "bad.py").write_text("def f(:\n")
+    (work / ".claude" / "agents").mkdir(parents=True)  # the agent type the rows use has a definition, with no isolation
+    (work / ".claude" / "agents" / "worker.md").write_text("---\nname: worker\n---\nWork.\n")
     (tmp / "main" / ".git" / "worktrees" / "wt").mkdir(parents=True)
     if shutil.which("git") is None:
         return "abc1234def"
@@ -500,7 +502,7 @@ def test_the_check_keeps_its_long_bound_and_advice_gets_a_short_one(tmp_path, bo
 def test_the_session_and_folder_in_every_payload_come_from_the_hook_input(tmp_path, box):
     shim = shim_for('[guards]\non = ["syntax-check", "session-context", "skill-gate", "claims"]\n', tmp_path)
     assert "session_id: input.sessionID" in shim
-    assert 'resolve(directory ?? process.cwd(), output.args?.workdir ?? ".")' in shim
+    assert 'resolve(directory ?? process.cwd(), input.tool === "bash" ? (output.args?.workdir ?? ".") : ".")' in shim
     # the payload is built from named fields: the tool's arguments only ever sit under `args` and `tool_input`
     assert "...input.args" not in shim and "...output.args" not in shim and "...args," not in shim
 

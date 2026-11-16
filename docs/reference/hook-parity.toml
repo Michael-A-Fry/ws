@@ -41,7 +41,7 @@ test = "test_parity_sealed_folders"
 [[hook]]
 id = "guardrail-files"
 what = "Lets the files that hold the guardrails be edited only by the session that owns them"
-ws = "ws protects its own policy, settings, hooks and folders from the edit tools and from shell redirects; the `config-guard` guard does the same for files and folders you name, edited only from the owner folders you list"
+ws = "ws protects its own policy, settings, hooks and folders from the edit tools and from shell redirects; the `config-guard` guard covers the edit tools for files and folders you name, edited only from the owner folders you list (a write through a link or to a file with more than one name is refused too); shell redirects to them are for the sandbox's write-deny list, which the guard doesn't judge"
 status = "covered"
 fail = "blocks"
 test = "test_parity_guardrail_files, test_parity_config_guard"

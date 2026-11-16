@@ -324,25 +324,37 @@ def test_parity_phone_alert(box, monkeypatch, capsys):
 # --- launch from the main checkout, and config-guard ---------------------------------------------------------------
 
 
-def test_parity_launch_from_main(box):
-    main, wt = box / "main", box / "wt"
-    (main / ".git").mkdir(parents=True)
-    wt.mkdir()
-    (wt / ".git").write_text("gitdir: x\n")
+@needs_git
+def test_parity_launch_from_main(box, monkeypatch):
+    from test_guard_launch_config import real_repos
+
+    main, wt = real_repos(box)
     on = '[guards]\non = ["guard-launch"]\n'
-    assert hook(box, on, call("Workflow", cwd=wt, name="w")) == 2  # a workflow from a linked worktree
-    assert hook(box, on, call("Agent", cwd=wt, prompt="p", isolation="worktree")) == 2
-    assert hook(box, on, call("Workflow", cwd=main, name="w")) == 0
-    assert hook(box, on, call("Agent", cwd=wt, prompt="p")) == 0  # not isolated: allowed
+
+    def go(where, *a, **k):
+        monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(where))  # the folder the session started in
+        return hook(box, on, call(*a, cwd=where, **k))
+
+    assert go(wt, "Workflow", name="w") == 2  # a workflow from a linked worktree
+    assert go(wt, "Agent", prompt="p", isolation="worktree") == 2
+    assert go(main, "Workflow", name="w") == 0
+    assert go(wt, "Agent", prompt="p") == 0  # not isolated: allowed
+    (box / "plain").mkdir()
+    (box / "plain" / ".git").mkdir()  # a planted .git folder is not a repository
+    assert go(box / "plain", "Workflow", name="w") == 2
 
 
-def test_parity_config_guard(box):
+def test_parity_config_guard(box, monkeypatch):
     (box / "g").mkdir()
     (box / "mine").mkdir()
     on = f'[guards]\non = ["config-guard"]\n[guards.config-guard]\npaths = ["{box / "g"}"]\nowners = ["{box / "mine"}"]\n'
     edit = {"file_path": str(box / "g" / "settings.json"), "content": "x"}
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(box))
     assert hook(box, on, call("Write", cwd=box, **edit)) == 2  # not the owner's folder
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(box / "mine"))
     assert hook(box, on, call("Write", cwd=box / "mine", **edit)) == 0
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(box))
+    assert hook(box, on, call("Write", cwd=box / "mine", **edit)) == 2  # the call moved itself into the owner's folder
 
 
 # --- the page and these tests agree ------------------------------------------------------------------------------

@@ -7,7 +7,7 @@ moment as RFC 3339 text, which `ws.jsonl` needs for its stamp. Every write goes 
 
 A repo's data class decides what the store may hold: the strictest of the named repo's class and the working folder's or
 any hit on the sensitive-terms file, stores the ask redacted (no text, no options, a hashed dedupe key). The class is
-checked again when an ask is read, so a repo walled since shows as opaque. A token- shaped secret is refused outright.
+checked again when an ask is read, so a repo walled since shows as opaque. A secret-shaped token is refused outright.
 """
 
 from __future__ import annotations

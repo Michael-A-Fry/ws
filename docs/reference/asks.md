@@ -50,8 +50,7 @@ text), `event` and `id`. `added` carries the ask; `answered` carries `answer` (`
 shim (no `answer`, no `at`) fold the same way, and so do the rows of the older `ws-ask` program (`v` 1, `ts` as
 RFC 3339 text), which are read with their times. New keys and event kinds were added to the file; none changed meaning.
 
-Exit codes: 0 fine, 1 refused (a secret, a store that can't be written), 2 usage or an
-unknown id.
+Exit codes: 0 fine, 1 refused (a secret, a store that can't be written), 2 usage or an unknown id.
 
 ## The older program
 

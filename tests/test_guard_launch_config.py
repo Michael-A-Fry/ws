@@ -54,6 +54,8 @@ def box(tmp_path, monkeypatch):
         real_repos(tmp_path)
     for name in ("plain", "owner", "guarded"):
         (tmp_path / name).mkdir()
+    if shutil.which("git"):
+        git(tmp_path / "owner", "init", "-q", "-b", "main")  # an owner is the root of a repository
     return tmp_path
 
 
@@ -81,10 +83,10 @@ def run(box, text, body, *extra, start=None):
 LAUNCH = '[guards]\non = ["guard-launch"]\n'
 
 
-def config_policy(box, extra=""):
+def config_policy(box, extra="", owner=None):
     return (
         f'[guards]\non = ["config-guard"]\n[guards.config-guard]\npaths = ["{box / "guarded"}"]\n'
-        f'owners = ["{box / "owner"}"]\n{extra}'
+        f'owners = ["{owner or box / "owner"}"]\n{extra}'
     )
 
 
@@ -236,6 +238,7 @@ def test_a_linked_worktree_whose_git_file_was_rewritten_is_not_a_main_checkout(b
     assert run(box, LAUNCH, payload("Workflow", box / "wt", name="x")) == 2
 
 
+@needs_git
 def test_a_cd_into_a_symlinked_folder_does_not_make_a_write_through_it_pass(box):
     """Re-review blocker 1: the model's `cd` moves the payload folder; only the start folder's own links are exempt."""
     decoy = box / "plain" / "decoy"
@@ -247,6 +250,62 @@ def test_a_cd_into_a_symlinked_folder_does_not_make_a_write_through_it_pass(box)
     assert run(box, text, payload("Write", box / "plain", file_path=str(box / "plain" / "lnk" / "x"), content="x")) == 2
 
 
+def edit_from(box, cwd, owner, *, start=None) -> int:
+    """The exit code of a Write to the guarded folder, from a session in `cwd` whose owner list is `owner`."""
+    target = box / "guarded" / "settings.json"
+    return run(
+        box, config_policy(box, owner=owner), payload("Write", cwd, file_path=str(target), content="x"), start=start
+    )
+
+
+@needs_git
+def test_the_main_checkout_owns_and_so_does_a_folder_inside_it(box):
+    main = box / "main"
+    (main / "sub" / "deeper").mkdir(parents=True)
+    assert edit_from(box, main, main) == 0
+    assert edit_from(box, main / "sub", main) == 0  # its repository root is the owner
+    assert edit_from(box, main / "sub" / "deeper", main) == 0
+
+
+@needs_git
+def test_a_linked_worktree_does_not_own_even_when_it_is_kept_under_the_owner(box):
+    main = box / "main"
+    under = main / ".claude" / "worktrees" / "builder"
+    git(main, "worktree", "add", "-q", "-b", "under", str(under))
+    assert edit_from(box, under, main) == 2  # inside the owner's folder, but a root of its own
+    assert edit_from(box, under, main, start=under) == 2
+    assert edit_from(box, box / "wt", main) == 2  # the linked worktree kept elsewhere
+    assert edit_from(box, box / "wt", box / "wt") == 2  # not even when named as an owner: only a main checkout owns
+    assert (
+        edit_from(box, main, main, start=under) == 2
+    )  # a call that says it is in the owner, from a session that started in a worktree
+
+
+@needs_git
+def test_a_folder_outside_git_does_not_own_and_a_folder_that_names_no_root_does_not(box):
+    assert edit_from(box, box / "plain", box / "main") == 2
+    assert edit_from(box, box / "main", box / "plain") == 2  # an owner that is not a repository's root matches nothing
+    assert edit_from(box, box / "main", box / "main" / "nope") == 2  # an owner that is not there matches nothing
+
+
+@needs_git
+def test_when_git_cannot_say_the_session_is_not_an_owner(box, monkeypatch):
+    from ws.guards import _git
+
+    main = box / "main"
+    assert edit_from(box, main, main) == 0
+    monkeypatch.setattr(_git, "lines", lambda *a, **k: None)
+    assert edit_from(box, main, main) == 2  # fail closed
+
+
+@needs_git
+def test_an_owner_named_through_a_link_is_the_same_root(box):
+    link = box / "linked-main"
+    link.symlink_to(box / "main")
+    assert edit_from(box, box / "main", link) == 0
+
+
+@needs_git
 def test_config_guard_edits_only_by_the_owner(box):
     target = box / "guarded" / "settings.json"
     other = box / "plain" / "notes.txt"
@@ -267,6 +326,7 @@ def test_config_guard_edits_only_by_the_owner(box):
     )
 
 
+@needs_git
 def test_config_guard_judges_the_folder_the_session_started_in_too(box):
     """BLOCKER 1: a call that says it runs in an owner's folder, from a session that started elsewhere, is refused."""
     target = box / "guarded" / "settings.json"
@@ -276,6 +336,7 @@ def test_config_guard_judges_the_folder_the_session_started_in_too(box):
     assert run(box, text, body, start=box / "plain") == 2
 
 
+@needs_git
 def test_config_guard_joins_a_relative_path_to_the_sessions_folder(box):
     """NIT 8: a relative path is the file in the call's folder, not in the gate's."""
     text = config_policy(box)
@@ -283,6 +344,7 @@ def test_config_guard_joins_a_relative_path_to_the_sessions_folder(box):
     assert run(box, text, payload("Write", box / "plain", file_path="notes.txt", content="x"), start=box) == 0
 
 
+@needs_git
 def test_config_guard_denies_an_empty_or_relative_folder(box):
     text = config_policy(box)
     target = str(box / "guarded" / "settings.json")
@@ -291,6 +353,7 @@ def test_config_guard_denies_an_empty_or_relative_folder(box):
     assert run(box, text, payload("Write", "", file_path="notes.txt", content="x"), start=box / "owner") == 2
 
 
+@needs_git
 @pytest.mark.parametrize("caseless, want", [(True, 2), (False, 0)])
 def test_config_guard_compares_without_case_where_the_platform_does(box, monkeypatch, caseless, want):
     """SHOULD 3: on macOS `Guarded/Settings.json` is the guarded file."""
@@ -299,6 +362,7 @@ def test_config_guard_compares_without_case_where_the_platform_does(box, monkeyp
     assert run(box, config_policy(box), payload("Write", box / "plain", file_path=shouted, content="x")) == want
 
 
+@needs_git
 def test_config_guard_refuses_a_write_through_a_link_from_outside_an_owner(box):
     """SHOULD 6: a link on the way can be moved onto a guarded file between the check and the write."""
     decoy = box / "plain" / "decoy"
@@ -310,6 +374,7 @@ def test_config_guard_refuses_a_write_through_a_link_from_outside_an_owner(box):
     assert run(box, text, payload("Write", box / "owner", file_path=str(box / "plain" / "hop" / "x"), content="x")) == 0
 
 
+@needs_git
 @pytest.mark.skipif(not hasattr(os, "link"), reason="needs hard links")
 def test_config_guard_refuses_a_file_with_more_than_one_name(box):
     """SHOULD 5: a hard link to a guarded file isn't under the guarded folder."""
@@ -395,3 +460,110 @@ def test_a_guard_in_log_mode_lets_the_call_go_where_the_wall_is_proven(box, monk
     body = payload("Workflow", box / "plain", name="x")
     assert run(box, LAUNCH + '[guards.guard-launch]\nmode = "log"\n', body) == 0
     assert run(box, LAUNCH, body) == 2  # the default is enforce
+
+
+@needs_git
+def test_a_repository_whose_core_worktree_points_at_the_owner_does_not_own(box):
+    """(a) A session can set core.worktree in its own repository's config; `--show-toplevel` then reports the owner's folder."""
+    main, spoof = box / "main", box / "spoof"
+    spoof.mkdir()
+    git(spoof, "init", "-q", "-b", "main")
+    assert edit_from(box, spoof, main) == 2
+    git(spoof, "config", "core.worktree", str(main))
+    assert edit_from(box, spoof, main) == 2
+    assert edit_from(box, spoof, main, start=spoof) == 2
+
+
+@needs_git
+def test_a_linked_worktree_with_a_worktree_level_core_worktree_does_not_own(box):
+    """(b) extensions.worktreeConfig plus `git config --worktree core.worktree <owner>` in a linked worktree kept under the owner."""
+    main = box / "main"
+    under = main / ".claude" / "worktrees" / "spoofed"
+    git(main, "worktree", "add", "-q", "-b", "spoofed", str(under))
+    git(main, "config", "extensions.worktreeConfig", "true")
+    git(under, "config", "--worktree", "core.worktree", str(main))
+    assert edit_from(box, under, main) == 2
+
+
+@needs_git
+def test_a_nested_repository_whose_core_worktree_points_at_the_owner_does_not_own(box):
+    """(c) A repository nested in the owner's folder, with core.worktree set to the owner."""
+    main = box / "main"
+    nested = main / "nested"
+    nested.mkdir()
+    git(nested, "init", "-q", "-b", "main")
+    git(nested, "config", "core.worktree", str(main))
+    assert edit_from(box, nested, main) == 2
+
+
+@needs_git
+def test_a_worktree_whose_git_file_is_removed_does_not_own_before_or_after_a_prune(box):
+    """(i) `rm .git` in a worktree under the owner: git walks up to the owner's .git, and `git worktree list` still shows it as prunable."""
+    main = box / "main"
+    under = main / ".claude" / "worktrees" / "i"
+    git(main, "worktree", "add", "-q", "-b", "i", str(under))
+    (under / ".git").unlink()
+    assert edit_from(box, under, main) == 2
+    git(main, "worktree", "prune")
+    assert edit_from(box, under, main) == 2  # gone from the list: still refused by where it is kept
+
+
+@needs_git
+def test_a_worktree_elsewhere_whose_git_file_is_removed_is_not_an_owner(box):
+    main = box / "main"
+    elsewhere = box / "wt-elsewhere"
+    git(main, "worktree", "add", "-q", "-b", "e", str(elsewhere))
+    (elsewhere / ".git").unlink()
+    assert edit_from(box, elsewhere, main) == 2
+
+
+@needs_git
+def test_a_worktree_whose_git_file_names_the_owners_git_folder_does_not_own(box):
+    """(j) The .git file rewritten to the owner's own folder, then core.worktree set in the shared config."""
+    main = box / "main"
+    under = main / ".claude" / "worktrees" / "j"
+    git(main, "worktree", "add", "-q", "-b", "j", str(under))
+    (under / ".git").write_text(f"gitdir: {main / '.git'}\n")
+    git(main, "config", "core.worktree", str(main))
+    assert edit_from(box, under, main) == 2
+    elsewhere = box / "wt-j"
+    git(main, "worktree", "add", "-q", "-b", "j2", str(elsewhere))
+    (elsewhere / ".git").write_text(f"gitdir: {main / '.git'}\n")
+    assert edit_from(box, elsewhere, main) == 2
+
+
+@needs_git
+def test_the_guard_launch_check_refuses_the_same_two_breaks(box):
+    from ws.guards import guard_launch
+
+    main = box / "main"
+    under = main / ".claude" / "worktrees" / "g"
+    git(main, "worktree", "add", "-q", "-b", "g", str(under))
+    assert guard_launch.is_main_checkout(str(main))
+    (under / ".git").unlink()
+    assert not guard_launch.is_main_checkout(str(under))
+    git(main, "worktree", "prune")
+    assert not guard_launch.is_main_checkout(str(under))
+
+
+@needs_git
+def test_a_link_on_dot_claude_does_not_hide_a_pruned_worktree(box):
+    main = box / "main"
+    under = main / ".claude" / "worktrees" / "w"
+    git(main, "worktree", "add", "-q", "-b", "w", str(under))
+    (under / ".git").unlink()
+    git(main, "worktree", "prune")
+    (main / ".claude").rename(main / "x")
+    (main / ".claude").symlink_to(main / "x")
+    assert edit_from(box, under, main) == 2
+    assert edit_from(box, main / "x" / "worktrees" / "w", main) == 2  # the resolved spelling too
+
+
+def test_the_location_checks_fold_case_where_the_platform_does(monkeypatch):
+    from ws import policy
+    from ws.guards import _git
+
+    monkeypatch.setattr(policy, "CASELESS_PATHS", True)
+    assert _git._inside("/Repo/.Claude/Worktrees/W", "/repo/.claude/worktrees")
+    monkeypatch.setattr(policy, "CASELESS_PATHS", False)
+    assert not _git._inside("/Repo/.Claude/Worktrees/W", "/repo/.claude/worktrees")

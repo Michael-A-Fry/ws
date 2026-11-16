@@ -1197,6 +1197,7 @@ Set these in the `[roles.notify]` table of `profile.toml`, beside `adapter = "nt
 | `alert_text` | What an alert says. `"title"` (default) sends the folder name with the event, such as `FOLDER needs you`. `"full"` adds the runner's own message after it. `"plain"` sends `a session needs you` with no folder name, for private folder names. |
 | `alerts_per_day` | The daily allowance for session alerts, a whole number, 0 or more (default 50). Counted apart from pushes and the digest. |
 | `alert_on` | Which events alert. `"needs-you"` sends for each Notification (a permission or an answer is wanted) and for a Stop whose last message asks something; a plain finished turn sends nothing. `"every-stop"` sends for every Notification and every Stop. A key that isn't there means `"every-stop"`, so a config from before the key behaves as it did; set `"needs-you"` in a new one. |
+| `hub_url` | The hub's address, https only (no login, query or fragment); anything else is refused by `ws doctor` and by the alert. With it, a needs-you or finished alert carries ntfy's Click header, `<hub_url>/chat/<session id>`, so a tap opens the hub at that session. ntfy can't know where the hub is, so this is needed; it replaces no setting. Unset, alerts are as before. No link goes out for a session id that isn't letters, digits and hyphens, or for a session in a walled or counts-only class. Job-end pushes carry no link yet. |
 
 The folder name goes to the notify server (ntfy.sh or your own) with the push. Each send writes
 `~/.local/state/ws/logs/notify-last.json`.

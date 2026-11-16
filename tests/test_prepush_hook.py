@@ -22,16 +22,23 @@ TIMEOUT = "timeout 300 " if shutil.which("timeout") else ""
 pytestmark = pytest.mark.skipif(sys.platform == "win32" or not shutil.which("bash"), reason="needs bash")
 
 
-def fake(bin_dir: Path, name: str, log: Path, then_exec: bool = False, exit_code: int = 0) -> None:
+def fake(bin_dir: Path, name: str, log: Path, then_exec: bool = False, exit_code: int = 0, drop: int = 2) -> None:
     body = f'#!/usr/bin/env bash\nprintf "%s\\n" "{name} $*" >> "{log}"\n'
     if then_exec:
-        body += 'shift 2\nexec "$@"\n'  # drop its own two arguments, then run the command it wraps
+        body += f'shift {drop}\nexec "$@"\n'  # drop its own arguments, then run the command it wraps
     body += f"exit {exit_code}\n"
     (bin_dir / name).write_text(body, encoding="utf-8")
     (bin_dir / name).chmod(0o755)
 
 
-def run_hook(tmp_path: Path, wrap: str | None, uv_exit: int = 0, expect_rc: int = 0) -> list[str]:
+def run_hook(
+    tmp_path: Path,
+    wrap: str | None,
+    uv_exit: int = 0,
+    expect_rc: int = 0,
+    with_ws_test: bool = False,
+    full: bool = False,
+) -> list[str]:
     repo, bin_dir, log = tmp_path / "repo", tmp_path / "bin", tmp_path / "calls.log"
     repo.mkdir()
     bin_dir.mkdir()
@@ -41,10 +48,14 @@ def run_hook(tmp_path: Path, wrap: str | None, uv_exit: int = 0, expect_rc: int 
     env.update(PATH=f"{bin_dir}{os.pathsep}{os.path.dirname(git)}{os.pathsep}/usr/bin:/bin", HOME=str(tmp_path))
     if wrap is not None:
         env["WS_PREPUSH_WRAP"] = wrap
+    if full:
+        env["WS_PREPUSH_FULL"] = "1"
     subprocess.run([git, "init", "-q", str(repo)], check=True, env=env)
     fake(bin_dir, "uvx", log)
     fake(bin_dir, "uv", log, exit_code=uv_exit)
     fake(bin_dir, "queue-wrap", log, then_exec=True)
+    if with_ws_test:
+        fake(bin_dir, "ws-test", log, then_exec=True, drop=4)  # --light --node local --
     done = subprocess.run(
         [shutil.which("bash"), str(HOOK)], cwd=repo, env=env, capture_output=True, text=True, check=False
     )
@@ -72,6 +83,32 @@ def test_the_wrapper_runs_the_tests_and_only_the_tests(tmp_path):
 def test_failing_tests_fail_the_push_through_the_wrapper(tmp_path):
     calls = run_hook(tmp_path, "queue-wrap --wait 60m", uv_exit=3, expect_rc=3)
     assert calls[-1] == CAPPED_SMOKE
+
+
+def test_ws_test_on_the_path_is_the_default_wrapper(tmp_path):
+    calls = run_hook(tmp_path, None, with_ws_test=True)
+    assert calls == [
+        "uvx prek run --all-files",
+        "ws-test --light --node local -- " + TIMEOUT + CAPPED_SMOKE,
+        CAPPED_SMOKE,
+    ]
+
+
+def test_a_whole_suite_run_uses_the_full_class_and_spaces_only_counts_as_unset(tmp_path):
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    full = run_hook(tmp_path / "a", None, with_ws_test=True, full=True)
+    assert full[1] == "ws-test --full --node local -- " + SUITE
+    spaces = run_hook(tmp_path / "b", "   ", with_ws_test=True)
+    assert spaces[1].startswith("ws-test --light --node local -- ")
+
+
+def test_an_explicit_wrap_beats_ws_test_and_an_empty_one_turns_it_off(tmp_path):
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    calls = run_hook(tmp_path / "a", "queue-wrap --wait 60m", with_ws_test=True)
+    assert calls[1].startswith("queue-wrap --wait 60m ")
+    assert run_hook(tmp_path / "b", "", with_ws_test=True) == ["uvx prek run --all-files", CAPPED_SMOKE]
 
 
 def test_a_spaces_only_wrap_is_the_same_as_unset(tmp_path):

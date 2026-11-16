@@ -11,7 +11,7 @@ import re
 from datetime import UTC, datetime
 from pathlib import Path
 
-from ws import canary, gate, jobcmd, jobwatch, jsonl, rating, runrecord, sandbox, upgrade
+from ws import canary, connectors, gate, jobcmd, jobwatch, jsonl, rating, runrecord, sandbox, upgrade
 from ws import eval as ws_eval
 from ws import node as ws_node
 from ws import secrets as wsecrets
@@ -43,6 +43,7 @@ SCHEMAS = {
     "upgrade-history.jsonl": upgrade.HISTORY_SCHEMA,
     "secrets-audit.jsonl": wsecrets.AUDIT_SCHEMA,
     "jobs-installed.jsonl": jobcmd.LOG_SCHEMA,
+    "connector-calls.jsonl": connectors.SCHEMA_VERSION,
 }
 
 # Version 2 of the run record, frozen: a later change may add a key to the schema under a new number, never to this one.

@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from ws import cli, gate, paths, policy
+from ws import cli, gate, guards, paths, policy
 from ws.adapters import claude_code, opencode
 
 ROOT0 = Path(__file__).resolve().parents[1]
@@ -201,10 +201,10 @@ def test_claims_deny_when_git_cannot_answer_in_time(box, monkeypatch, how):
     repo = box / "repo"
     repo.mkdir()
     git(repo, "init", "-q", "-b", "main")
-    (repo / "a").write_text("1")
-    git(repo, "add", "a")
-    git(repo, "commit", "-q", "-m", "first")
-    on = git(repo, "rev-parse", "--short=10", "HEAD")
+    (repo / "seed").write_text("0")
+    git(repo, "add", "seed")
+    git(repo, "commit", "-q", "-m", "seed")
+    on = commit_with_readable_sha(repo, "a", "1")  # the guard reads only an id with a digit and a letter a to f
     git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
     pol = policy.loads('[guards]\non = ["claims"]\n')
 
@@ -355,6 +355,71 @@ def test_parity_config_guard(box, monkeypatch):
     assert hook(box, on, call("Write", cwd=box / "mine", **edit)) == 0
     monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(box))
     assert hook(box, on, call("Write", cwd=box / "mine", **edit)) == 2  # the call moved itself into the owner's folder
+
+
+# --- wave 2b: force-push, env files, scheduled branch moves, syntax -----------------------------------------------
+
+
+def test_parity_force_push_main(box):
+    for command in (
+        "git push --force origin main",
+        "git push origin :main",
+        "git push -d origin main",
+        "git push --delete origin main",
+        "git -C repo push origin :main",
+    ):
+        assert hook(box, None, call("Bash", command=command)) == gate.DENY, command
+    for command in ("git push origin main", "git push origin work", "git push origin HEAD:work", "git status"):
+        assert hook(box, None, call("Bash", command=command)) == 0, command
+
+
+def test_parity_env_file_write(box):
+    for command in (
+        "echo KEY=1 > .env",
+        "echo KEY=1 >> app/.env",
+        "echo KEY=1 >.env.local",
+        "printf x | tee .env.production",
+        "echo KEY=1 > /srv/app/.env",
+    ):
+        assert hook(box, None, call("Bash", command=command)) == gate.DENY, command
+    for command in ("cat .env.example", "echo KEY=1 > .env.example", "ls -a", "grep KEY notes.txt > out.txt"):
+        assert hook(box, None, call("Bash", command=command)) == 0, command
+
+
+@needs_git
+def test_parity_scheduled_branch_move(box, monkeypatch):
+    """The checkout-pin guard holds a main checkout that has linked worktrees in place, whoever runs the command (a
+    timer's job included), so a job can't move its branch."""
+    from test_guard_launch_config import real_repos
+
+    main, _ = real_repos(box)
+    on = '[guards]\non = ["checkout-pin"]\n'
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(main))
+    for command in ("git checkout side", "git switch -c other", "git reset --hard HEAD~1", "git pull"):
+        assert hook(box, on, call("Bash", cwd=main, command=command)) == gate.DENY, command
+    for command in ("git status", "git log -1", "git add f"):
+        assert hook(box, on, call("Bash", cwd=main, command=command)) == 0, command
+
+
+def test_parity_syntax_check(box):
+    pol = policy.loads('[guards]\non = ["syntax-check"]\n')
+    conf = json.loads(claude_code.generate(pol, ["ws"], box / "out", box / "w" / "policy.toml")["settings.json"])
+    pre = conf["hooks"].get("PreToolUse", [])
+    assert not any("syntax-check" in h["command"] for g in pre for h in g["hooks"])
+    post = [h["command"] for g in conf["hooks"]["PostToolUse"] for h in g["hooks"]]
+    assert post  # only after the call ran, so a finding reaches the model and can't block the call
+    (box / "bad.py").write_text("def f(:\n")
+    (box / "good.py").write_text("def f():\n    return 1\n")
+    guard = guards.get("syntax-check")
+    ctx = guards.Context("claude-code", "post", "s1", str(box), {})
+
+    def judged(name):
+        raw = json.loads(call("Write", cwd=box, file_path=str(box / name), content="x"))
+        return guard.judge(claude_code.parse(raw), guard.config({}, "w"), ctx)
+
+    found = judged("bad.py")
+    assert found is not None and found.action == "deny"
+    assert judged("good.py") is None
 
 
 # --- the page and these tests agree ------------------------------------------------------------------------------

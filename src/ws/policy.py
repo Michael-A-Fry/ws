@@ -392,6 +392,9 @@ _SYSTEM_DIRS = ("bin", "boot", "dev", "etc", "lib", "lib64", "proc", "root", "sb
 _SHELLS = ("sh", "bash", "zsh", "dash")
 
 
+SECRET_ENV_FILES = (".env", ".env.local", ".env.production", ".env.development")
+
+
 def default_deny_commands() -> list[str]:
     """The built-in deny list. `*` matches anything; `\\*` is a literal star. Flags are normalised before matching
     (see _canon_tokens), so `rm -rf` here also covers `rm -fr`, `rm -r -f` and `rm -Rf`."""
@@ -399,6 +402,12 @@ def default_deny_commands() -> list[str]:
     out += [f"rm -* /{d}*" for d in _SYSTEM_DIRS]
     # A forcing push in any spelling (-f, -uf, +refspec, --force-with-lease), with or without git's global options.
     out += ["git push*--force*", "git push* -f*", "git -* push*--force*", "git -* push* -f*"]
+    # Deleting a remote branch (`--delete`, `-d`, or an empty source as in `origin :main`) is as final as forcing one.
+    out += ["git push*--delete*", "git push* -d *", "git push* :*", "git -* push*--delete*", "git -* push* -d *"]
+    out += ["git -* push* :*"]
+    # A shell writing a file that holds secrets (`.env`, `.env.local`, ...): a redirect to it, or `tee` into it.
+    for name in SECRET_ENV_FILES:
+        out += [f"*> {name}", f"*>> {name}", f"*>{name}", f"*>*/{name}", f"*>>*/{name}", f"tee*{name}"]
     out += ["mkfs*", "dd*of=/dev/*"]
     # A shell reading its script from stdin is the end of `curl ... | sh` (and of `echo ... | sh`). Written as a
     # plain command so the runner's own deny list, which splits pipes, catches it too.

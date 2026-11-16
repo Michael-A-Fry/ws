@@ -18,6 +18,12 @@ from ws import shellwords as sw
 KEY = "~/.ssh/id_rsa"
 
 
+def cpu() -> float:
+    """This thread's CPU time. The reader's limit is CPU time (sw.TIME_LIMIT), so "well under the deadline" is too: on a
+    busy runner (WSL2, 16 Nov) the wall clock also counts the time spent waiting for a core."""
+    return time.thread_time()
+
+
 @pytest.fixture
 def box(tmp_path, monkeypatch):
     home = tmp_path / "home"
@@ -48,20 +54,20 @@ LONG_LINES = {
 @pytest.mark.parametrize("name", list(LONG_LINES))
 def test_a_long_path_is_refused_in_well_under_the_deadline(box, monkeypatch, capsys, name):
     cmd = LONG_LINES[name][: policy.MAX_COMMAND_CHARS]
-    began = time.perf_counter()
+    began = cpu()
     reason = policy.is_denied_command(policy.default_policy(), cmd, cwd=str(box[1]))
-    assert time.perf_counter() - began < 1, name
+    assert cpu() - began < 1, name
     assert reason, name
-    began = time.perf_counter()
+    began = cpu()
     code, _ = hook(monkeypatch, capsys, cmd)
-    assert code == 2 and time.perf_counter() - began < 1.5, name
+    assert code == 2 and cpu() - began < 1.5, name
 
 
 def test_a_long_path_that_is_short_once_written_out_is_read_quickly(box):
-    began = time.perf_counter()
+    began = cpu()
     assert policy.is_denied_command(policy.default_policy(), "cat " + "/." * 30000, cwd=str(box[1])) is None
     assert policy.is_denied_command(policy.default_policy(), "cat ~/" + "x/.." * 15000 + KEY[1:], cwd=str(box[1]))
-    assert time.perf_counter() - began < 1
+    assert cpu() - began < 1
 
 
 def test_a_path_of_too_many_parts_is_a_typed_refusal_and_one_at_the_cap_is_read(box):
@@ -112,16 +118,16 @@ def test_each_path_resolved_keeps_the_deadline(box, monkeypatch):
 
 
 def test_a_glob_of_many_parts_is_refused_not_walked(box, monkeypatch, capsys):
-    began = time.perf_counter()
+    began = cpu()
     code, _ = hook(monkeypatch, capsys, "cat ~/" + "**/" * 20000 + "x")
-    assert code == 2 and time.perf_counter() - began < 1.5
+    assert code == 2 and cpu() - began < 1.5
 
 
 def test_variables_that_add_more_than_a_megabyte_are_refused_not_built(box, monkeypatch, capsys):
     cmd = "X=" + "a" * 30000 + '; echo "' + "$X" * 9000 + '"'
-    began = time.perf_counter()
+    began = cpu()
     reason = policy.is_denied_command(policy.default_policy(), cmd[: policy.MAX_COMMAND_CHARS])
-    assert reason and "characters" in reason and time.perf_counter() - began < 1
+    assert reason and "characters" in reason and cpu() - began < 1
     with pytest.raises(sw.ShellError) as err, sw.time_limit():
         sw.lex("echo " + "$X" * 100, {"X": "a" * (sw.MAX_EXPANDED // 50)})
     assert err.value.kind == "too_long"

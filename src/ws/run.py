@@ -669,6 +669,8 @@ class Queued:
 
     run_id: str
     waited: str | None = None
+    run_key: str | None = None
+    chain_depth: int | None = None
 
 
 # True while `ws run` itself runs: its refusals and failures are final, so each is told once through the notify role.
@@ -819,6 +821,9 @@ def _run(
     )  # fmt: skip
     rec = _base_record(job, run_id, started, pol, verdict)
     rec.update(fields or {})
+    if queued is not None:
+        rec.update(run_key=queued.run_key, chain_depth=queued.chain_depth)
+        extra = {**extra, **queue.chain_env(queued.run_id, queued.chain_depth)}
     child_env = _child_env(extra)
     if args.dry_run:
         try:
@@ -1013,6 +1018,8 @@ def _execute(
             leases += adapter.run_leases(run_dir)
         if job.checkpoint:
             extra = {**extra, "WS_CHECKPOINT": job.checkpoint}
+        if rec.get("chain_depth") is not None:  # a queued run: what it queues is one link deeper in its chain
+            extra = {**extra, **queue.chain_env(rec["run_id"], rec["chain_depth"])}
         child_env = _child_env(extra)
         argv[0] = exe
         prompt_file = None

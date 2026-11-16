@@ -400,3 +400,15 @@ def test_a_link_is_refused_before_any_approval_is_used(home, tmp_path, capsys, m
     from ws import approvals
 
     assert approvals.pending(approvals.approvals_dir()) == []
+
+
+def test_an_open_jobs_folder_is_refused_before_any_approval_is_used(home, tmp_path, capsys, monkeypatch):
+    folder = jobs.jobs_dir()
+    folder.mkdir(mode=0o700)
+    folder.chmod(0o777)
+    monkeypatch.setattr(jobcmd, "_in_session", lambda env: True)
+    code, _, err = run(capsys, "job", "add", str(src(tmp_path)))
+    assert code == 3 and "can be written by others" in err
+    from ws import approvals
+
+    assert approvals.pending(approvals.approvals_dir()) == []

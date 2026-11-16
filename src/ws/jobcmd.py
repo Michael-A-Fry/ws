@@ -359,6 +359,11 @@ def cmd_add(args: argparse.Namespace) -> int:
             return 0
         if diff and not args.json:
             print(diff, end="" if diff.endswith("\n") else "\n")
+    if folder.exists():  # before any approval is used: a folder ws won't write to must not burn a person's yes
+        try:
+            jobs.check_private(folder)
+        except jobs.JobError as e:
+            raise WsError("refused", str(e), "fix the jobs folder, then add the job again", 3) from e
     widened = widening(_power(d), base, _installed(folder, name))
     approved = False
     if widened and _in_session(env):

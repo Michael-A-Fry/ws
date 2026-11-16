@@ -1,6 +1,6 @@
 [project]
 name = "ws-aitoolkit"
-version = "0.1.10"
+version = "0.1.11"
 description = "Your memory, skills and rules, across your AI coding tools."
 readme = "README.md"
 license = "Apache-2.0"

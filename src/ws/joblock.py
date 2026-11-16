@@ -5,8 +5,10 @@ it dies (a kill, an out-of-memory stop, a power cut). So there is no heartbeat t
 is suspended or slow still holds the lock, and a run that is gone never does. A second runner of the same job finds the
 lock held and skips (coalesce: a double tick runs the job once).
 
-The file stays in place. Each holder writes `{"fence", "pid", "running": true}` when it takes the lock and
-`"running": false` when it lets go cleanly. A new holder that finds `"running": true` has taken over from a holder that
+The file stays in place. Each holder writes `{"fence", "pid", "running": true, "started_at", "run_id"}` when it takes
+the lock (`started_at` the UTC time it took it, `run_id` the run it holds the lock for, or null) and `"running": false`
+when it lets go cleanly. A file an older ws wrote has no `started_at` or `run_id`; it still reads, and a death found in
+it has no known start. A new holder that finds `"running": true` has taken over from a holder that
 died: it calls `on_died` once (it holds the lock exclusively, so no other runner can see the same file in that state) and
 takes the next fence number. A holder whose fence is no longer the file's has been taken over and must stop writing.
 
@@ -26,7 +28,8 @@ import contextlib
 import json
 import os
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 
 from ws import jobs, paths
@@ -41,6 +44,7 @@ class Lock:
     path: Path
     fence: int
     fd: int | None = None
+    held: dict = field(default_factory=dict)  # what the holder wrote when it took the lock
 
     def owns(self) -> bool:
         """True while the file still carries this holder's fence (False after a takeover)."""
@@ -52,7 +56,7 @@ class Lock:
             return
         try:
             if self.owns():
-                _write(self.fd, {"fence": self.fence, "pid": os.getpid(), "running": False})
+                _write(self.fd, {**self.held, "fence": self.fence, "pid": os.getpid(), "running": False})
         finally:
             with contextlib.suppress(OSError):
                 os.close(self.fd)  # closing the descriptor releases the flock
@@ -81,9 +85,12 @@ def acquire(
     name: str,
     env: dict | None = None,
     on_died: Callable[[str, dict], None] | None = None,
+    run_id: str | None = None,
+    now: datetime | None = None,
 ) -> Lock:
-    """Take the lock of job `name`. Raises Held when a live holder has it. When the file says the last holder was still
-    running, that holder died: `on_died(name, what the file said)` is called once and the fence goes up by one."""
+    """Take the lock of job `name` for run `run_id`. Raises Held when a live holder has it. When the file says the last
+    holder was still running, that holder died: `on_died(name, what the file said)` is called once (with its
+    `started_at` and `run_id` when it wrote them) and the fence goes up by one."""
     if not jobs.NAME.match(name):
         raise ValueError(f"{name!r} is not a job name")
     d = locks_dir(env)
@@ -102,19 +109,35 @@ def acquire(
     old = _read(path)
     fence = old.get("fence", 0)
     fence = fence + 1 if isinstance(fence, int) and fence >= 0 else 1
-    _write(fd, {"fence": fence, "pid": os.getpid(), "running": True})
+    held = {"started_at": _iso(now or datetime.now(UTC)), "run_id": run_id}
+    _write(fd, {"fence": fence, "pid": os.getpid(), "running": True, **held})
     if old.get("running") is True and on_died:
         with contextlib.suppress(Exception):  # a record that cannot be written must not stop the run
             on_died(name, old)
-    return Lock(path, fence, fd)
+    return Lock(path, fence, fd, held)
+
+
+def _iso(t: datetime) -> str:
+    return t.astimezone(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")  # as runrecord.iso
+
+
+def started_of(rec: dict) -> datetime | None:
+    """The UTC time a holder took the lock, from what its file said; None for a file without one (an older ws)."""
+    try:
+        t = datetime.fromisoformat(str(rec["started_at"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+    return t if t.tzinfo else None
 
 
 @contextlib.contextmanager
-def hold(name: str, env: dict | None = None, on_died: Callable[[str, dict], None] | None = None):
+def hold(
+    name: str, env: dict | None = None, on_died: Callable[[str, dict], None] | None = None, run_id: str | None = None
+):
     """`with hold(name) as lock:` runs the body holding the lock; `lock` is None when a live holder has it (the caller
     skips: one tick, one run)."""
     try:
-        lock = acquire(name, env, on_died=on_died)
+        lock = acquire(name, env, on_died=on_died, run_id=run_id)
     except Held:
         yield None
         return

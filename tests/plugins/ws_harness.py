@@ -46,6 +46,9 @@ DEFAULT_LIMITS = {"small": 60, "medium": 300, "large": 900}  # seconds per test;
 TIERS = ("core", "gate", "nightly")
 # Initial values, deliberately generous: w3-ci-budget tunes them from the tier report. Ini ws_tier_budget_<name>.
 DEFAULT_BUDGETS = {"core": 900, "gate": 1200, "nightly": 3600}
+# A tier over its budget warns; only one past this many times its budget fails the run (when CI is set). A slow runner
+# day must not turn a green suite red, and a real slowdown of 2x still does.
+OVER_FAIL_FACTOR = 2
 
 # Paths are relative to the pytest rootdir, with "/" and fnmatch patterns ("*" also matches "/"). The first match wins.
 # A test in no row is small. An explicit size marker on the test beats this table.
@@ -120,6 +123,19 @@ def tier_for_path(path: str) -> str:
 def ci_is_set(env: dict[str, str] | os._Environ[str] = os.environ) -> bool:
     """CI counts as set when it is not empty, `0` or `false` (any case)."""
     return env.get("CI", "").strip().lower() not in ("", "0", "false")
+
+
+def budget_verdict(duration: float, budget: float) -> str:
+    """`ok` within the budget, `warn` over it up to `OVER_FAIL_FACTOR` times it, `fail` past that."""
+    if duration <= budget:
+        return "ok"
+    if duration <= budget * OVER_FAIL_FACTOR:
+        return "warn"
+    return "fail"
+
+
+def github_actions_is_set(env: dict[str, str] | os._Environ[str] = os.environ) -> bool:
+    return env.get("GITHUB_ACTIONS", "").strip().lower() == "true"
 
 
 def _rel(config: pytest.Config, path: Path) -> str:
@@ -279,7 +295,8 @@ class Harness:
         self.flaked: list[str] = []
         self.pinned = 0
         self.notes: list[str] = []
-        self.over: list[str] = []
+        self.over: list[str] = []  # past OVER_FAIL_FACTOR times the budget: fails the run when CI is set
+        self.warned: list[str] = []  # over the budget, within OVER_FAIL_FACTOR times it: a warning only
 
     # -- where the files go
     def _target(self, option: str, name: str) -> Path | None:
@@ -416,8 +433,12 @@ class Harness:
         ]
         self._write("ws_tier_report", "tiers.jsonl", rows, "tier report")
         for row in rows:
-            if row["duration_s"] > row["budget_s"]:  # type: ignore[operator]
-                self.over.append(f"{row['tier']} tier over budget ({row['duration_s']} s of {row['budget_s']} s)")
+            verdict = budget_verdict(row["duration_s"], row["budget_s"])  # type: ignore[arg-type]
+            message = f"{row['tier']} tier over budget ({row['duration_s']} s of {row['budget_s']} s)"
+            if verdict == "fail":
+                self.over.append(f"{message}, past {OVER_FAIL_FACTOR}x")
+            elif verdict == "warn":
+                self.warned.append(message)
         if self.over and ci_is_set() and session.exitstatus == pytest.ExitCode.OK:
             session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
@@ -432,6 +453,10 @@ class Harness:
             line("ws-harness: " + "; ".join(f"{t} {len(self.nodes[t])} tests {self.seconds[t]:.1f} s" for t in ran))
         for message in self.notes:
             line(f"ws-harness: {message}")
+        for message in self.warned:
+            line(f"ws-harness: {message}; a warning, it fails only past {OVER_FAIL_FACTOR}x", yellow=True)
+            if github_actions_is_set():
+                line(f"::warning title=ws-harness::{message}")
         for message in self.over:
             failing = "failing the run (CI is set)" if ci_is_set() else "not failing the run (CI is not set)"
             line(f"ws-harness: {message}; {failing}", red=ci_is_set(), yellow=not ci_is_set())

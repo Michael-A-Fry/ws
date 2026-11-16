@@ -237,15 +237,24 @@ def _signal_group(p: subprocess.Popen, hard: bool) -> None:
 
 
 def _stop(p: subprocess.Popen) -> None:
-    """Stop a step and everything it started: TERM, then KILL, each with a bounded wait. A process that left the group
-    and still holds the pipe cannot hang this: the pipes are closed and the step is left to the kernel."""
-    for hard in (False, True):
-        _signal_group(p, hard)
-        try:
-            p.communicate(timeout=10)
-            return
-        except subprocess.TimeoutExpired:
-            continue
+    """Stop a step and everything it started: TERM, a bounded grace, then KILL to the whole group. The KILL is sent even
+    when the step itself has gone, because a child that ignores TERM, or that the TERM did not stop, outlives it. A
+    process that left the group and still holds the pipe cannot hang this: the pipes are closed and the step is left to
+    the kernel."""
+    _signal_group(p, hard=False)
+    try:
+        p.communicate(timeout=10)
+        reaped = True
+    except subprocess.TimeoutExpired:
+        reaped = False
+    _signal_group(p, hard=True)
+    if reaped:
+        return
+    try:
+        p.communicate(timeout=10)
+        return
+    except subprocess.TimeoutExpired:
+        pass
     for f in (p.stdout, p.stderr):
         if f is not None:
             f.close()

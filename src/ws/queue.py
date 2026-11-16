@@ -6,6 +6,8 @@
     ws queue show RUN_ID                        one receipt
     ws queue cancel RUN_ID                      take a queued run out of the queue
     ws queue run [--max N]                      run what is queued, one after another (what a timer runs)
+    ws queue tick JOB [--slot T] [--no-coalesce] [--skip-missed S]
+                                                a schedule's tick: queue the job's run for slot T, at most once
     ws queue slot --ram-gb N --lane ui --who join|writer -- CMD...
                                                 wait for a slot, run CMD in it, give the slot back
 
@@ -67,6 +69,17 @@ drain cannot read or run (unreadable data, a runner that raised) is failed with 
 the drain goes on to the next: one bad item never fails the batch. A store or disk error is not one item's: it
 stops the drain.
 
+Chains and ticks. A queued run's runner gets its run id and depth (`WS_CHAIN_PARENT`, `WS_CHAIN_DEPTH`); a job
+queued from inside it is one link deeper, taken from the parent's receipt so a child cannot reset it, and the depth
+goes in its receipt and record (the `add` command itself refuses in an agent session, so chains come from scripts and
+watchers); past `chain_cap` (default 3) it is refused, typed
+`chain_cap`, and said once. A person's `ws queue add` is depth 0: a human action resets the chain. `on_event` is how
+a watcher queues a run for an event, and it drops an event that ws's own action caused, so a watcher never feeds on
+itself. `tick` is a schedule's tick, in one transaction under the store's write lock: it advances the job's last slot
+before it queues anything (a second tick for the same slot, or an older one, does nothing, so a double tick runs
+once), skips a slot more than `skip_missed` seconds late when the job says so, and with `coalesce_if_active` (the
+default) queues nothing while a run of the job is waiting or running.
+
 `add`, `cancel` and `run` are refused in a gated session; `list`, `show` and `slot` are not. Limits default to the
 constants below and are read from `[roles.queue]` in the profile.
 """
@@ -95,7 +108,7 @@ from ws.output import WsError
 from ws.profile import ProfileError, load, profile_path
 
 COMMAND = "queue"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 EXIT_FAILED, EXIT_BAD_JOB, EXIT_REFUSED = 1, 2, 3
 STATUSES = ("queued", "running", "ok", "error", "refused", "preempted", "skipped", "interrupted", "expired")
 ACTIVE = ("queued", "running")
@@ -118,6 +131,9 @@ POLL_S = 5.0  # between looks, while waiting for a slot
 ORPHAN_S = 120.0  # a claimed message with no running receipt this long is released
 MESSAGE_LEASE_S = 24 * 3600.0
 MIN_RESERVE_USD = 0.0001
+CHAIN_CAP = 3  # how many jobs deep a chain of jobs that queue jobs may go
+CHAIN_ENV = "WS_CHAIN_DEPTH"  # set for a queued run's runner: the depth of the run that is running
+CHAIN_PARENT_ENV = "WS_CHAIN_PARENT"  # and its run id, so what it queues takes its depth from the ledger, not the env
 
 # Retries
 BACKOFF_S = (30, 60, 300, 900, 3600)
@@ -141,6 +157,7 @@ _LIMIT_KEYS = {
     "ramp_s": ("num0", RAMP_S),
     "busy_s": ("num0", BUSY_S),
     "poll_s": ("num", POLL_S),
+    "chain_cap": ("int", CHAIN_CAP),
 }
 
 _SCHEMA = f"""
@@ -174,12 +191,15 @@ CREATE TABLE IF NOT EXISTS receipts (
     note TEXT,
     parent_run_id TEXT,
     run_key TEXT,
+    chain_depth INTEGER,
+    told_at INTEGER,
     CHECK ((status IN ('queued', 'running')) = (finished_at IS NULL)),
     CHECK (settled = 0 OR finished_at IS NOT NULL)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS receipts_one_running ON receipts(job) WHERE status = 'running';
 CREATE INDEX IF NOT EXISTS receipts_month ON receipts(month, status);
 CREATE INDEX IF NOT EXISTS receipts_message ON receipts(message_id);
+CREATE TABLE IF NOT EXISTS ticks (job TEXT PRIMARY KEY, last_slot INTEGER NOT NULL);
 """
 
 
@@ -231,6 +251,7 @@ class Limits:
     memory_reserved_gb: float = MEMORY_RESERVED_GB
     join_headroom_gb: float = JOIN_HEADROOM_GB
     ramp_s: float = RAMP_S
+    chain_cap: int = CHAIN_CAP
     busy_s: float = BUSY_S
     poll_s: float = POLL_S
 
@@ -509,7 +530,8 @@ class Ledger:
         self.rate_limits = rate_limits or (lambda now: usage.read_rate_limits(self.state, now))
         self.recorded, self.sink, self.clock = recorded, sink, clock
         self.on_stop = on_stop
-        self._reaped: list[tuple[str, str, datetime]] = []  # (job, run_id, started) reaped in a transaction
+        # (job, run_id, started, owner pid, queued) reaped in a transaction; queued: a drain ran it, not its own `ws run`
+        self._reaped: list[tuple[str, str, datetime, int | None, bool]] = []
         self.already_told = already_told
         self._conn: sqlite3.Connection | None = None
         self._engine: sqlqueue.SqlQueue | None = None
@@ -540,8 +562,17 @@ class Ledger:
             raise OSError(f"{self.folder} is not a folder")
         if st.st_mode & 0o077:
             os.chmod(self.folder, 0o700)
-        fd = os.open(self.path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
-        os.close(fd)
+        # Make the file 0600 only when it is new. Never open and close a database file that may already be open here:
+        # closing any descriptor of a file drops every POSIX lock this process holds on it, including the locks of a
+        # live SQLite connection, and another process then takes itself for the last one and removes the WAL index.
+        try:
+            os.close(os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600))
+        except FileExistsError:
+            st = os.lstat(self.path)
+            if stat.S_ISLNK(st.st_mode):
+                raise OSError(f"{self.path} is a symbolic link") from None
+            if st.st_mode & 0o077:
+                os.chmod(self.path, 0o600)  # a chmod, unlike a close, leaves every lock where it is
         c = sqlite3.connect(str(self.path), isolation_level=None, timeout=self.limits.busy_s, check_same_thread=False)
         try:
             c.row_factory = sqlite3.Row
@@ -555,8 +586,13 @@ class Ledger:
                             c.execute(stmt)
                     if "parent_run_id" not in {r[1] for r in c.execute("PRAGMA table_info(receipts)")}:
                         c.execute("ALTER TABLE receipts ADD COLUMN parent_run_id TEXT")  # a store from schema 1
-                    if "run_key" not in {r[1] for r in c.execute("PRAGMA table_info(receipts)")}:
+                    have = {r[1] for r in c.execute("PRAGMA table_info(receipts)")}
+                    if "run_key" not in have:
                         c.execute("ALTER TABLE receipts ADD COLUMN run_key TEXT")  # a store from schema 2
+                    if "chain_depth" not in have:
+                        c.execute("ALTER TABLE receipts ADD COLUMN chain_depth INTEGER")  # a store from schema 3
+                    if "told_at" not in have:
+                        c.execute("ALTER TABLE receipts ADD COLUMN told_at INTEGER")  # a store from schema 4
                     c.execute("CREATE INDEX IF NOT EXISTS receipts_parent ON receipts(parent_run_id)")
                     c.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         except BaseException:
@@ -899,34 +935,47 @@ class Ledger:
                 time.sleep(0.2)
         return False  # unreachable
 
-    def stopped(self, job: str, run_id: str, reason: str) -> None:
-        """Say once that a job has stopped for good (`on_stop(job, run_id, reason)`). Never raises, and never changes
-        what the job came to. Call it after the transaction that ended the job, not inside it."""
+    def stopped(self, job: str, run_id: str, reason: str) -> bool:
+        """Say once that a job has stopped for good (`on_stop(job, run_id, reason)`). True when the notice went (on_stop
+        said so); False when there is none, it was not sent (a cap, a server down) or it failed. Never raises, and never
+        changes what the job came to. Call it after the transaction that ended the job, not inside it."""
         if self.on_stop is None:
-            return
-        with contextlib.suppress(Exception):
-            self.on_stop(job, run_id, reason)
+            return False
+        try:
+            return self.on_stop(job, run_id, reason) is True
+        except Exception:  # noqa: BLE001
+            return False
 
     # -- reaping ------------------------------------------------------------------------------------------------
 
     def reap(self, now: datetime) -> int:
         """Release every reservation whose owner is gone. Returns how many."""
+        return self.reap_report(now)[0]
+
+    def reap_report(self, now: datetime) -> tuple[int, list[dict]]:
+        """`reap`, and each run it told the person about: job, run_id, owner_pid and queued (a drain ran it)."""
         with _transaction(self.conn()) as c:
             n = self._reap(c, now)
-        self._tell_reaped()
-        return n
+        return n, self._tell_reaped()
 
-    def _tell_reaped(self) -> None:
+    def _tell_reaped(self) -> list[dict]:
         """Say once for each run reaped as `outcome_unknown` in the transaction that has just committed. (A rolled-back
         reap is forgotten here too: the next reaper finds the run again and tells it then.) A job whose failure was
         already alerted since the run started (`already_told`: the scheduler's OnFailure= alert for the same kill) is
-        not told twice."""
+        not told twice. Returns what was told (the notice went): job, run id, the process that held it and whether a
+        drain ran it."""
         told, self._reaped = self._reaped, []
-        for job, run_id, started in told:
+        out: list[dict] = []
+        for job, run_id, started, owner_pid, queued in told:
             with contextlib.suppress(Exception):
                 if self.already_told is not None and self.already_told(job, started):
                     continue
-            self.stopped(job, run_id, "outcome_unknown: the process that held it was gone before it finished")
+            if not self.stopped(job, run_id, "outcome_unknown: the process that held it was gone before it finished"):
+                continue  # not sent: nobody was told, so no other notice may stand down for it
+            with contextlib.suppress(sqlite3.Error):
+                self.conn().execute("UPDATE receipts SET told_at = ? WHERE run_id = ?", (to_ns(self.clock()), run_id))
+            out.append({"job": job, "run_id": run_id, "owner_pid": owner_pid, "queued": queued})
+        return out
 
     def _reap(self, c: sqlite3.Connection, now: datetime) -> int:
         self._reaped = []  # one transaction's worth: what a rolled-back one queued is found and told again
@@ -970,7 +1019,7 @@ class Ledger:
             last = started + timedelta(seconds=float(r["reserved_s"] or 0)) if r["reserved_s"] else now
             rec = runrecord.unknown_outcome(
                 run_id, r["job"], started, min(now, last), purpose=r["purpose"], ws_version=_version(),
-                run_key=r["run_key"], why=why,
+                run_key=r["run_key"], chain_depth=r["chain_depth"], why=why,
             )  # fmt: skip
             written = bool(self.sink(rec)) if self.sink else False
         usd = runrecord.record_cost(rec, unknown_run_usd, fallback)
@@ -983,7 +1032,7 @@ class Ledger:
             (status, ns, usd, int(written), rec.get("stop_reason") or "owner_gone", run_id),
         )
         if lost and cur.rowcount == 1:
-            self._reaped.append((r["job"], run_id, started))
+            self._reaped.append((r["job"], run_id, started, r["owner_pid"], r["message_id"] is not None))
 
     # -- queued work --------------------------------------------------------------------------------------------
 
@@ -996,10 +1045,23 @@ class Ledger:
         deadline: datetime | None = None,
         *,
         trigger: str | None = None,
+        chain_depth: int = 0,
+        chain_parent: str | None = None,
     ) -> tuple[str, str, bool]:
         """Add a run of job file `job` to the queue. Returns (run_id, message_id, replay). The same `key` again returns
         the first one and adds nothing. `trigger` (the event or message id that started it) makes the key the run key,
-        `run_key(job, trigger)`; give one or the other."""
+        `run_key(job, trigger)`; give one or the other. `chain_depth` is how many queued runs led to this one; with
+        `chain_parent` (the run that queues it) the depth is that run's own, from its receipt, plus one, whatever the
+        caller says, so a child cannot reset its chain. Past the cap it is refused (`chain_cap`, exit 3), said once."""
+        if chain_parent is not None:
+            chain_depth = max(chain_depth, self.parent_depth(chain_parent) + 1)
+        if chain_depth > self.limits.chain_cap:
+            self.stopped(job, "", f"chain_cap: {chain_depth} jobs deep, over the cap of {self.limits.chain_cap}")
+            raise WsError(
+                "chain_cap", f"{job} would be {chain_depth} jobs deep in a chain, over the cap of {self.limits.chain_cap}",
+                "a person can queue it (a human action resets the chain), or raise chain_cap in [roles.queue]",
+                EXIT_REFUSED,
+            )  # fmt: skip
         if trigger is not None:
             if key is not None:
                 raise WsError("bad_input", "give a trigger or a key, not both", "--trigger ID or --key K", 2)
@@ -1009,6 +1071,7 @@ class Ledger:
                 "job": job,
                 "purpose": purpose,
                 "deadline": runrecord.iso(deadline) if deadline else None,
+                **({"chain_depth": chain_depth} if chain_depth else {}),
             },
             sort_keys=True,
         )
@@ -1044,14 +1107,90 @@ class Ledger:
         """A queued receipt for the next run of a message (each attempt is one receipt and one run record). Every attempt
         carries the message's run key, when it has one."""
         run_id = runrecord.new_run_id(now)
-        key = c.execute(f"SELECT idempotency_key FROM {WORK_TABLE} WHERE message_id = ?", (message_id,)).fetchone()
+        m = c.execute(f"SELECT idempotency_key, data FROM {WORK_TABLE} WHERE message_id = ?", (message_id,)).fetchone()
+        data = (_message_data(m[1]) if m else None) or {}
         c.execute(
-            "INSERT INTO receipts (run_id, job, purpose, status, month, queued_at, message_id, deadline, run_key) "
-            "VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?)",
+            "INSERT INTO receipts (run_id, job, purpose, status, month, queued_at, message_id, deadline, run_key, "
+            "chain_depth) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)",
             (run_id, job, purpose, month_of(now), to_ns(now), message_id, to_ns(deadline) if deadline else None,
-             key[0] if key else None),
+             m[0] if m else None, _depth(data.get("chain_depth", 0))),
         )  # fmt: skip
         return run_id
+
+    def parent_depth(self, run_id: str) -> int:
+        """The chain depth on a run's receipt; a run the ledger does not know, or one from before depths, is 0."""
+        try:
+            r = self.conn().execute("SELECT chain_depth FROM receipts WHERE run_id = ?", (run_id,)).fetchone()
+        except sqlite3.Error as e:
+            raise store_error(e) from e
+        return _depth(r[0]) or 0 if r else 0
+
+    def on_event(
+        self,
+        job: str,
+        purpose: str | None,
+        event_id: str,
+        now: datetime,
+        *,
+        by_ws: bool,
+        chain_depth: int = 0,
+        chain_parent: str | None = None,
+    ) -> tuple[str, str, bool] | None:
+        """A watcher's run for one event: once per (job, event) through the run key, one link deeper than the run that
+        queues it. None, and nothing queued, for an event that ws's own action caused (`by_ws`): a watcher never
+        reacts to what ws did."""
+        if by_ws:
+            return None
+        return self.enqueue(
+            job, purpose, now, trigger=event_id, chain_depth=chain_depth, chain_parent=chain_parent
+        )  # fmt: skip
+
+    def tick(
+        self,
+        job: str,
+        purpose: str | None,
+        slot: datetime,
+        now: datetime,
+        *,
+        coalesce_if_active: bool = True,
+        skip_missed_s: float | None = None,
+        chain_depth: int = 0,
+        chain_parent: str | None = None,
+    ) -> tuple[str, str | None]:
+        """A schedule's tick for `slot`. Returns (what happened, run_id): `queued`, `replay`, `already` (this slot or a
+        later one has been ticked), `missed` (more than `skip_missed_s` late) or `coalesced` (a run of the job is
+        waiting or running). The slot is advanced before anything is queued, in the same transaction, and dead owners
+        are reaped first, so a run that was killed does not hold the next slot off."""
+        ns = to_ns(slot)
+        result: tuple[str, str | None]
+        try:
+            with _transaction(self.conn()) as c:
+                self._reap(c, now)  # a killed run's stale `running` receipt must not coalesce this slot away
+                last = c.execute("SELECT last_slot FROM ticks WHERE job = ?", (job,)).fetchone()
+                if last is not None and ns <= last[0]:
+                    result = ("already", None)
+                else:
+                    c.execute(
+                        "INSERT INTO ticks (job, last_slot) VALUES (?, ?) ON CONFLICT(job) DO UPDATE SET last_slot = ?",
+                        (job, ns, ns),
+                    )
+                    active = c.execute(
+                        "SELECT 1 FROM receipts WHERE job = ? AND status IN ('queued', 'running') LIMIT 1", (job,)
+                    ).fetchone()
+                    if skip_missed_s is not None and (now - slot).total_seconds() > skip_missed_s:
+                        result = ("missed", None)
+                    elif coalesce_if_active and active:
+                        result = ("coalesced", None)
+                    else:
+                        run_id, _, replay = self.enqueue(
+                            job, purpose, now, trigger=f"tick-{slot.astimezone(UTC):%Y%m%dT%H%M%SZ}",
+                            chain_depth=chain_depth, chain_parent=chain_parent,
+                        )  # fmt: skip
+                        result = ("replay" if replay else "queued", run_id)
+        except (sqlite3.Error, OSError) as e:
+            raise store_error(e) from e
+        self._tell_reaped()
+        return result
 
     def cancel(self, run_id: str, now: datetime) -> str:
         """Take a queued run out of the queue. Returns the job name. Raises WsError for one that is not queued."""
@@ -1114,6 +1253,23 @@ class Ledger:
             ]
         except sqlite3.Error as e:
             raise store_error(e) from e
+
+    def reaped_of(self, owner_pid: int, since: datetime) -> list[dict]:
+        """The queued runs held by process `owner_pid` that a reaper settled as gone and told (the notice went) since
+        `since`, whoever reaped them: job, run_id, owner_pid, queued."""
+        try:
+            rows = (
+                self.conn()
+                .execute(
+                    "SELECT job, run_id, owner_pid FROM receipts WHERE owner_pid = ? AND message_id IS NOT NULL "
+                    "AND stop_reason = 'owner_gone' AND told_at IS NOT NULL AND finished_at >= ?",
+                    (int(owner_pid), to_ns(since)),
+                )
+                .fetchall()
+            )
+        except sqlite3.Error as e:
+            raise store_error(e) from e
+        return [{"job": r["job"], "run_id": r["run_id"], "owner_pid": r["owner_pid"], "queued": True} for r in rows]
 
     def receipt(self, run_id: str) -> dict | None:
         try:
@@ -1246,20 +1402,8 @@ def _cap_hint(counter: str) -> str:
 
 
 def credential_kind(job: jobs.Job) -> str:
-    """`api_key` when the job leases a key through `[[secrets]]`, `local` when its provider is on this machine, else
-    `subscription`: the runner would use whatever login it is signed in with."""
-    if job.secrets:
-        return "api_key"
-    provider = job.runner_options.get("provider") if isinstance(job.runner_options.get("provider"), dict) else {}
-    options = provider.get("options") if isinstance(provider.get("options"), dict) else {}
-    base = options.get("baseURL") or options.get("base_url")
-    if isinstance(base, str):
-        from urllib.parse import urlsplit
-
-        with contextlib.suppress(ValueError):
-            if (urlsplit(base).hostname or "").lower() in ("127.0.0.1", "localhost", "::1"):
-                return "local"
-    return "subscription"
+    """`api_key`, `local` or `subscription`: what the job's runner would sign in with (`jobs.credential_kind`)."""
+    return jobs.credential_kind(job)
 
 
 def request_for(
@@ -1280,6 +1424,31 @@ def request_for(
 
 
 RUN_KEY_MAX = 200
+
+
+def _depth(v) -> int | None:
+    return v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else None
+
+
+def chain_env(run_id: str, depth: int | None) -> dict[str, str]:
+    """What a queued run's runner is given, so whatever it queues is one link deeper: its run id and its depth."""
+    return {CHAIN_PARENT_ENV: run_id, CHAIN_ENV: str(depth or 0)}
+
+
+def chain_depth_from_env(env=None) -> int:
+    """The depth of a run queued from here: one more than the queued run this process runs inside (`WS_CHAIN_DEPTH`),
+    or 0 when there is none, which is a person's or a timer's action and starts a new chain. Only a fallback: with
+    `chain_parent_from_env` the ledger takes the depth from the parent's receipt."""
+    env = os.environ if env is None else env
+    v = env.get(CHAIN_ENV, "")
+    return int(v) + 1 if v.isdigit() else 0
+
+
+def chain_parent_from_env(env=None) -> str | None:
+    """The run id of the queued run this process runs inside, or None."""
+    env = os.environ if env is None else env
+    v = env.get(CHAIN_PARENT_ENV, "")
+    return v if v and all(ch.isalnum() or ch in "-_" for ch in v) else None
 
 
 def run_key(job: str, trigger: str) -> str:
@@ -1356,6 +1525,7 @@ class Item:
     run_id: str
     ledger: Ledger | None = None
     run_key: str | None = None
+    chain_depth: int = 0
 
 
 def drain(
@@ -1385,7 +1555,10 @@ def drain(
             run_id = ledger.queued_row(c, msg.message_id) or ledger.new_attempt(
                 c, msg.message_id, data["job"], data.get("purpose"), now, deadline
             )
-        item = Item(msg, data["job"], data.get("purpose"), deadline, run_id, ledger, msg.idempotency_key)
+        item = Item(
+            msg, data["job"], data.get("purpose"), deadline, run_id, ledger, msg.idempotency_key,
+            _depth(data.get("chain_depth")) or 0,
+        )  # fmt: skip
         try:
             outcome = runner(item)
         except (sqlite3.Error, StoreError, OSError):
@@ -1522,7 +1695,7 @@ def run_item(item: Item) -> Outcome:
     if item.deadline is not None:
         job = dataclasses.replace(job, deadline=item.deadline)
     got: list[dict] = []
-    queued = run.Queued(item.run_id)
+    queued = run.Queued(item.run_id, run_key=item.run_key, chain_depth=item.chain_depth)
     code = run.run_job(argparse.Namespace(job=job.name, dry_run=False), job, None, got.append, queued)
     if queued.waited:
         return Outcome(code, None, None, queued.waited)
@@ -1641,6 +1814,20 @@ def ledger_from_profile(prof: dict, state: Path, log: Path) -> Ledger:
     )
 
 
+def drain_jobs(env=None) -> tuple[str, ...]:
+    """The scheduled jobs whose units drain the queue and so run queued jobs, any job's, in their own process: a
+    `command = "queue"` job, and every runner job whose timer ticks and then drains (`ws queue tick JOB --run`).
+    Empty when the job files cannot be read."""
+
+    def drains(s: jobs.Scheduled) -> bool:
+        return tuple(s.argv[:2]) == jobs.COMMANDS["queue"] or (s.argv[:2] == ("queue", "tick") and "--run" in s.argv)
+
+    try:
+        return tuple(s.name for s in jobs.scheduled(env) if drains(s))
+    except Exception:  # noqa: BLE001  a job folder that does not read only means the unit's own alert goes
+        return ()
+
+
 def unit_alerted(job: str, since: datetime, path: Path) -> bool:
     """Has the scheduler already alerted a failure of `job` since `since`? (`ws watch alert`, which a unit's
     OnFailure= runs, writes a line in its alerts log for each failed unit.) False when the file is missing
@@ -1722,8 +1909,9 @@ def cmd_add(args: argparse.Namespace) -> int:
         raise WsError("bad_input", str(e), "for example --deadline 2026-11-10T09:00:00Z", 2) from e
     ledger = ledger_for_env()
     run_id, message_id, replay = ledger.enqueue(
-        job.name, job.purpose, now, args.key, deadline, trigger=getattr(args, "trigger", None)
-    )
+        job.name, job.purpose, now, args.key, deadline, trigger=getattr(args, "trigger", None),
+        chain_depth=chain_depth_from_env(), chain_parent=chain_parent_from_env(),
+    )  # fmt: skip
     if args.json:
         output.result({"run_id": run_id, "job": job.name, "message_id": message_id, "replay": replay})
     else:
@@ -1774,8 +1962,11 @@ def cmd_run(args: argparse.Namespace) -> int:
     ledger = ledger_for_env()
     from ws import run
 
-    with run._term_becomes_exit():
-        results = drain(ledger, run_item, limit=args.max, preemptible=_preemptible)
+    try:
+        with run._term_becomes_exit():
+            results = drain(ledger, run_item, limit=args.max, preemptible=_preemptible)
+    finally:
+        ledger.close()
     failed = [r for r in results if r["action"] == "fail"]
     if args.json:
         output.result({"attempts": results, "failed": len(failed)})
@@ -1784,6 +1975,55 @@ def cmd_run(args: argparse.Namespace) -> int:
         for r in results:
             print(f"  {r['run_id']}  {r['job']}  {r['action']}" + (f"  ({r['why']})" if r["why"] else ""))
     return EXIT_FAILED if failed else 0
+
+
+def cmd_tick(args: argparse.Namespace) -> int:
+    _refuse_in_session("queue tick")
+    now = datetime.now(UTC)
+    try:
+        job = jobs.load(args.job)
+        if args.slot == "schedule":  # what a timer passes: systemd and launchd do not say which time they fired for
+            if job.schedule is None:
+                raise jobs.JobError(f"job {job.name}: --slot schedule needs a schedule in the job file")
+            slot = jobs.latest_slot(job.schedule, now)
+        else:
+            slot = jobs.parse_deadline(args.slot, "--slot") if args.slot else now.replace(second=0, microsecond=0)
+    except jobs.JobError as e:
+        raise _bad_job(str(e)) from e
+    if credential_kind(job) == "subscription":
+        raise WsError(
+            "subscription_login", f"{job.name} would use a subscription login, and unattended work never does",
+            "give the job an API key through [[secrets]], or a local provider in runner_options", EXIT_REFUSED,
+        )  # fmt: skip
+    coalesce = job.coalesce_if_active and not args.no_coalesce  # the flag overrides the job's key for one tick
+    skip = args.skip_missed if args.skip_missed is not None else job.skip_missed_s
+    what, run_id = ledger_for_env().tick(
+        job.name, job.purpose, slot, now, coalesce_if_active=coalesce, skip_missed_s=skip,
+        chain_depth=chain_depth_from_env(), chain_parent=chain_parent_from_env(),
+    )  # fmt: skip
+    if args.json and not args.run:
+        output.result({"job": job.name, "slot": runrecord.iso(slot), "result": what, "run_id": run_id})
+    elif not args.json:
+        print(f"ws: {job.name} {runrecord.iso(slot)}: {what}" + (f" ({run_id})" if run_id else ""))
+    if args.run:  # the timer's second half: drain what is queued, this slot's run among it
+        return cmd_run(argparse.Namespace(max=None, json=args.json))
+    return 0
+
+
+def cmd_reap(args: argparse.Namespace) -> int:
+    """What the reaper timer runs every two minutes: a run whose process is gone (SIGKILL, OOM, power loss) gets its
+    `outcome_unknown` record and its one notice now, not at the next admission or drain."""
+    _refuse_in_session("queue reap")
+    ledger = ledger_for_env()
+    try:
+        n, told = ledger.reap_report(ledger.clock())
+    finally:
+        ledger.close()
+    if args.json:
+        output.result({"reaped": n, "told": [{"job": t["job"], "run_id": t["run_id"]} for t in told]})
+    else:
+        print(f"ws: reaped {n} run(s) whose process was gone" + (f"; told {len(told)}" if told else ""))
+    return 0
 
 
 def _preemptible(name: str) -> bool:
@@ -1878,6 +2118,29 @@ def register(sub) -> None:
     c.add_argument("run_id")
     c.set_defaults(func=cmd_cancel)
 
+    t = qs.add_parser("tick", help="a schedule's tick: queue the job's run for one slot, at most once")
+    t.add_argument("job", help="the job name: jobs/<name>.toml in the config folder")
+    t.add_argument(
+        "--slot", metavar="T",
+        help="the slot: a UTC time such as 2026-11-10T03:00:00Z, or `schedule` for the latest time of the job's "
+        "schedule at or before now (what its timer passes); default this minute",
+    )  # fmt: skip
+    t.add_argument(
+        "--no-coalesce", action="store_true",
+        help="queue it even while a run of the job waits or runs (overrides coalesce_if_active)",
+    )  # fmt: skip
+    t.add_argument(
+        "--skip-missed", metavar="S", type=_non_negative,
+        help="skip a slot that is more than S seconds late (overrides the job's skip_missed)",
+    )  # fmt: skip
+    t.add_argument(
+        "--run", action="store_true", help="then drain the queue, as the queue's run command does (the timer's)"
+    )
+    t.set_defaults(func=cmd_tick)
+    rp = qs.add_parser(
+        "reap", help="record and tell the runs whose process is gone, now (what the reaper timer runs every 2 minutes)"
+    )
+    rp.set_defaults(func=cmd_reap)
     r = qs.add_parser("run", help="run what is queued, one after another (what the scheduler runs)")
     r.add_argument(
         "--max", type=_positive_int, metavar="N", help="stop after N attempts (default: until the queue is empty)"

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -290,3 +292,126 @@ def test_a_stop_under_systemd_is_one_push_not_two(env, monkeypatch):
         assert run._told == []
     finally:
         run._says_stops.reset(token)
+
+
+# ---- a killed drain: one notice, naming the job it cut off (C499 item 7) --------------------------------------------
+
+
+def _drain_with_a_killed_run(env, monkeypatch):
+    """A drain job, and a queued run of `nightly` whose process was SIGKILLed. Returns (the dead pid, the run id, the
+    jobs the queue told)."""
+    from ws import queue
+
+    (jobs.jobs_dir(env) / "drain.toml").write_text(
+        'command = "queue"\nschedule = "every 10m"\n' + CONTRACT, encoding="utf-8"
+    )
+    told: list[str] = []
+    monkeypatch.setattr(queue, "notify_stop", lambda job, run_id, reason, **kw: told.append(job) or True)
+    victim = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        ledger = queue.ledger_for_env(env)
+        run_id, _, _ = ledger.enqueue("nightly", None, datetime.now(UTC))
+        req = queue.Request(job="nightly", run_id=run_id, cap_usd=100.0, usd=1.0, owner_pid=victim.pid)
+        assert ledger.admit(req, datetime.now(UTC), lambda: queue.Spend(0.0, {})).kind == "admit"
+        ledger.close()
+    finally:
+        victim.kill()
+        victim.wait()
+    return victim.pid, run_id, told
+
+
+def test_planted_sigkill_of_the_drain_is_one_notice_naming_the_reaped_job(env, monkeypatch):
+    notify(env)
+    pid, run_id, told = _drain_with_a_killed_run(env, monkeypatch)
+    s = Sender()
+    rec = jobwatch.alert_unit("ws-drain.service", env, status=lambda u: ("signal", "9"), sender=s, pid_of=lambda u: pid)
+    assert told == ["nightly"] and s.sent == []  # the queue's notice names nightly; the drain's own push is not sent
+    assert rec["reaped"] == [{"job": "nightly", "run_id": run_id}] and rec["pushed"] is False
+    assert lines(env)[-1]["job"] == "drain" and lines(env)[-1]["reaped"] == rec["reaped"]
+
+
+def test_a_drain_failure_that_cut_nothing_off_is_pushed_as_usual(env, monkeypatch):
+    notify(env)
+    (jobs.jobs_dir(env) / "drain.toml").write_text(
+        'command = "queue"\nschedule = "every 10m"\n' + CONTRACT, encoding="utf-8"
+    )
+    s = Sender()
+    rec = jobwatch.alert_unit(
+        "ws-drain.service", env, status=lambda u: ("exit-code", "1"), sender=s, pid_of=lambda u: 1
+    )
+    assert len(s.sent) == 1 and "drain failed" in s.sent[0] and rec["pushed"] is True and "reaped" not in rec
+
+
+def test_a_run_another_process_held_does_not_mute_the_drains_push(env, monkeypatch):
+    """The reaper tells the run it found (another process held it), and the drain's own failure is still pushed."""
+    notify(env)
+    _pid, _run_id, told = _drain_with_a_killed_run(env, monkeypatch)
+    s = Sender()
+    rec = jobwatch.alert_unit(
+        "ws-drain.service", env, status=lambda u: ("exit-code", "1"), sender=s, pid_of=lambda u: 1
+    )
+    assert told == ["nightly"] and len(s.sent) == 1 and rec["pushed"] is True
+
+
+def test_a_job_that_ticks_the_queue_is_watched_by_the_deadman(env):
+    text = (
+        'runner = "claude-code"\nmodel = "m"\nprompt = "p"\nschedule = "hourly"\n' + CONTRACT
+        + '[[secrets]]\nname = "anthropic"\nhost = "api.anthropic.com"\n'
+    )  # fmt: skip
+    (jobs.jobs_dir(env) / "keyed.toml").write_text(text, encoding="utf-8")
+    (s,) = jobs.scheduled(env)
+    assert s.argv[:2] == ("queue", "tick") and s.records
+    record(env, "keyed", datetime.now(UTC) - timedelta(hours=3))
+    assert [m["job"] for m in jobwatch.overdue(env, datetime.now(UTC))] == ["keyed"]
+
+
+def test_a_kill_the_reaper_timer_told_first_is_not_pushed_again_by_the_drains_alert(env, monkeypatch):
+    from ws import queue
+
+    notify(env)
+    pid, run_id, told = _drain_with_a_killed_run(env, monkeypatch)
+    ledger = queue.ledger_for_env(env)
+    assert ledger.reap(ledger.clock()) == 1 and told == ["nightly"]  # the 2-minute reaper got there first
+    ledger.close()
+    s = Sender()
+    rec = jobwatch.alert_unit("ws-drain.service", env, status=lambda u: ("signal", "9"), sender=s, pid_of=lambda u: pid)
+    assert s.sent == [] and told == ["nightly"] and rec["reaped"] == [{"job": "nightly", "run_id": run_id}]
+
+
+def test_a_unit_that_is_not_a_drain_never_asks_for_its_pid(env):
+    asked: list[str] = []
+    jobwatch.alert_unit(
+        "ws-daily.service", env, status=lambda u: ("exit-code", "1"), pid_of=lambda u: asked.append(u) or 1
+    )
+    assert asked == []
+
+
+def test_planted_kill_of_a_tick_unit_running_another_jobs_run_is_one_notice_naming_that_job(env, monkeypatch):
+    """Every runner job's timer ticks and then drains, so job A's unit may be running B's queued run when it is
+    killed: one notice, the queue's, naming B; no "A failed" beside it."""
+    notify(env)
+    keyed = (
+        'runner = "claude-code"\nmodel = "m"\nprompt = "p"\nschedule = "hourly"\nmax_turns = 3\nbudget_usd = 1\n'
+        + CONTRACT + '[[secrets]]\nname = "anthropic"\nhost = "api.anthropic.com"\n'
+    )  # fmt: skip
+    (jobs.jobs_dir(env) / "alpha.toml").write_text(keyed, encoding="utf-8")
+    pid, run_id, told = _drain_with_a_killed_run(env, monkeypatch)
+    s = Sender()
+    rec = jobwatch.alert_unit("ws-alpha.service", env, status=lambda u: ("signal", "9"), sender=s, pid_of=lambda u: pid)
+    assert told == ["nightly"] and s.sent == [] and rec["reaped"] == [{"job": "nightly", "run_id": run_id}]
+
+
+def test_a_reaped_run_whose_notice_did_not_go_leaves_the_drains_push_in_place(env, monkeypatch):
+    """The queue's notice for the killed run was not sent (the daily cap, or the server down): nobody was told, so the
+    drain unit's own push goes, and the run counts as told for no one."""
+    from ws import queue
+
+    notify(env)
+    pid, _run_id, told = _drain_with_a_killed_run(env, monkeypatch)
+    monkeypatch.setattr(queue, "notify_stop", lambda job, run_id, reason, **kw: told.append(job) and False)
+    s = Sender()
+    rec = jobwatch.alert_unit("ws-drain.service", env, status=lambda u: ("signal", "9"), sender=s, pid_of=lambda u: pid)
+    assert told == ["nightly"] and len(s.sent) == 1 and rec["pushed"] is True and "reaped" not in rec
+    ledger = queue.ledger_for_env(env)
+    assert ledger.reaped_of(pid, datetime.now(UTC) - timedelta(hours=1)) == []  # a later alert finds nothing told
+    ledger.close()

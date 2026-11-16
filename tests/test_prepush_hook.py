@@ -25,7 +25,8 @@ pytestmark = pytest.mark.skipif(sys.platform == "win32" or not shutil.which("bas
 def fake(bin_dir: Path, name: str, log: Path, then_exec: bool = False, exit_code: int = 0, drop: int = 2) -> None:
     body = f'#!/usr/bin/env bash\nprintf "%s\\n" "{name} $*" >> "{log}"\n'
     if then_exec:
-        body += f'shift {drop}\nexec "$@"\n'  # drop its own arguments, then run the command it wraps
+        # drop its own arguments (a fixed count, or up to the first --), then run the command it wraps
+        body += f'shift {drop}\nexec "$@"\n' if drop else 'while [ "$1" != "--" ]; do shift; done\nshift\nexec "$@"\n'
     body += f"exit {exit_code}\n"
     (bin_dir / name).write_text(body, encoding="utf-8")
     (bin_dir / name).chmod(0o755)
@@ -55,7 +56,7 @@ def run_hook(
     fake(bin_dir, "uv", log, exit_code=uv_exit)
     fake(bin_dir, "queue-wrap", log, then_exec=True)
     if with_ws_test:
-        fake(bin_dir, "ws-test", log, then_exec=True, drop=4)  # --light --node local --
+        fake(bin_dir, "ws-test", log, then_exec=True, drop=0)  # up to the --
     done = subprocess.run(
         [shutil.which("bash"), str(HOOK)], cwd=repo, env=env, capture_output=True, text=True, check=False
     )
@@ -89,7 +90,7 @@ def test_ws_test_on_the_path_is_the_default_wrapper(tmp_path):
     calls = run_hook(tmp_path, None, with_ws_test=True)
     assert calls == [
         "uvx prek run --all-files",
-        "ws-test --light --node local -- " + TIMEOUT + CAPPED_SMOKE,
+        "ws-test --light --mem 3G --node local -- " + TIMEOUT + CAPPED_SMOKE,
         CAPPED_SMOKE,
     ]
 
@@ -100,7 +101,7 @@ def test_a_whole_suite_run_uses_the_full_class_and_spaces_only_counts_as_unset(t
     full = run_hook(tmp_path / "a", None, with_ws_test=True, full=True)
     assert full[1] == "ws-test --full --node local -- " + SUITE
     spaces = run_hook(tmp_path / "b", "   ", with_ws_test=True)
-    assert spaces[1].startswith("ws-test --light --node local -- ")
+    assert spaces[1].startswith("ws-test --light --mem 3G --node local -- ")
 
 
 def test_an_explicit_wrap_beats_ws_test_and_an_empty_one_turns_it_off(tmp_path):
@@ -134,6 +135,9 @@ BASE_FILES = {
     "tests/test_cli.py": "",
     "tests/test_cli_registry.py": "",
     "README.md": "hi\n",
+    "src/ws/pk/__init__.py": "import importlib\n\nimportlib.import_module('ws.pk.leaf')\n",
+    "src/ws/pk/leaf.py": "Q = 1\n",
+    "tests/test_pk.py": "from ws import pk\n",
     **{f"tests/test_d{i}.py": "from ws import d\n" for i in range(41)},
 }
 
@@ -146,6 +150,7 @@ def run_selected(
     fake_uv: bool = True,
     expect_rc: int = 0,
     expect_log: bool = True,
+    with_ws_test: bool = False,
 ) -> tuple[list[str], str]:
     """A scratch repo with modules a, b (imports a), c and a test for each, on a base commit that is `origin/main`.
     `change` is then committed on top: path -> new text, or None to delete. Returns the fake uv calls and stderr."""
@@ -182,6 +187,8 @@ def run_selected(
     fake(bin_dir, "uvx", log)
     if fake_uv:
         fake(bin_dir, "uv", log)
+    if with_ws_test:
+        fake(bin_dir, "ws-test", log, then_exec=True, drop=0)
     done = subprocess.run(
         [shutil.which("bash"), str(HOOK)], cwd=repo, env=env, capture_output=True, text=True, check=False
     )
@@ -196,9 +203,30 @@ def test_a_one_module_change_runs_its_tests_only(tmp_path):
     assert "1 test file(s)" in err
 
 
+def test_the_memory_ceiling_follows_the_set(tmp_path):
+    for name in ("small", "e2e", "many", "full"):
+        (tmp_path / name).mkdir()
+    new_test = "def test_x():\n    pass\n"
+    _, err = run_selected(tmp_path / "small", {"src/ws/c.py": "Y = 2\n"}, with_ws_test=True)
+    assert "ws-test --light --mem 3G --node local -- " in err
+    _, err = run_selected(tmp_path / "e2e", {"tests/e2e/test_new.py": new_test}, with_ws_test=True)
+    assert "ws-test --light --mem 6G --node local -- " in err
+    many = {f"tests/test_new{i}.py": new_test for i in range(41)}
+    _, err = run_selected(tmp_path / "many", many, with_ws_test=True)
+    assert "ws-test --light --mem 6G --node local -- " in err
+    _, err = run_selected(tmp_path / "full", {"src/ws/c.py": "Y = 2\n"}, {"WS_PREPUSH_FULL": "1"}, with_ws_test=True)
+    assert "ws-test --full --node local -- " in err
+    assert "--mem" not in err
+
+
 def test_a_module_change_runs_the_tests_of_what_imports_it(tmp_path):
     calls, _ = run_selected(tmp_path, {"src/ws/a.py": "X = 2\n"})
     assert calls[-1] == f"{SUITE} tests/test_a.py tests/test_b.py"
+
+
+def test_a_module_a_package_finds_by_scanning_selects_the_tests_that_import_the_package(tmp_path):
+    calls, _ = run_selected(tmp_path, {"src/ws/pk/leaf.py": "Q = 2\n"})
+    assert calls[-1] == f"{SUITE} tests/test_pk.py"
 
 
 def test_a_new_test_file_is_always_selected(tmp_path):
@@ -282,6 +310,38 @@ def test_a_capped_set_that_hits_the_cap_fails_the_push(tmp_path):
         tmp_path, {"pyproject.toml": "x = 1\n"}, {"WS_PREPUSH_CAP": "1"}, fake_uv=False, expect_rc=124, expect_log=False
     )
     assert "is not a pass" in err
+    assert "its 1 s cap" in err
+    assert "WS_PREPUSH_CAP=<seconds>" in err
+
+
+@pytest.mark.skipif(not shutil.which("timeout"), reason="needs timeout")
+def test_the_cap_is_300_s_at_least_and_grows_6_s_a_file(tmp_path):
+    (tmp_path / "small").mkdir()
+    (tmp_path / "big").mkdir()
+    (tmp_path / "set").mkdir()
+    _, err = run_selected(tmp_path / "small", {"pyproject.toml": "x = 1\n"})
+    assert "timeout 300 uv " in err
+    new_tests = {f"tests/test_new{i}.py": "def test_x():\n    pass\n" for i in range(70)}
+    _, err = run_selected(tmp_path / "big", {"pyproject.toml": "x = 1\n", **new_tests})
+    assert "timeout 438 uv " in err  # 3 smoke + 70 new files = 73 files
+    _, err = run_selected(tmp_path / "set", {"pyproject.toml": "x = 1\n", **new_tests}, {"WS_PREPUSH_CAP": "77"})
+    assert "timeout 77 uv " in err
+
+
+@pytest.mark.skipif(not shutil.which("timeout"), reason="needs timeout")
+@pytest.mark.parametrize("bad", ["abc", "0", "-5", "1.5", "10s"])
+def test_a_bad_cap_warns_and_uses_the_computed_one(tmp_path, bad):
+    calls, err = run_selected(tmp_path, {"pyproject.toml": "x = 1\n"}, {"WS_PREPUSH_CAP": bad})
+    assert f"WS_PREPUSH_CAP='{bad}' is not a whole number" in err
+    assert "timeout 300 uv " in err
+    assert calls[-1] == CAPPED_SMOKE
+
+
+@pytest.mark.skipif(not shutil.which("timeout"), reason="needs timeout")
+def test_the_cap_stops_growing_at_1800_s(tmp_path):
+    new_tests = {f"tests/test_new{i}.py": "def test_x():\n    pass\n" for i in range(320)}
+    _, err = run_selected(tmp_path, {"pyproject.toml": "x = 1\n", **new_tests})
+    assert "timeout 1800 uv " in err
 
 
 @pytest.mark.skipif(not shutil.which("timeout"), reason="needs timeout")

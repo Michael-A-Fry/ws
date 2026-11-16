@@ -10,6 +10,16 @@ body of the GitHub release.
 
 ### Added
 
+- `ws queue reap`, run by a new reaper timer every 2 minutes (`ws-queue-reap.timer` on systemd,
+  `ws.job.queue-reap` on launchd). ws records and tells a run killed with nothing else starting after
+  it within minutes, not at the next run.
+- A `monthly D HH:MM` schedule (D from 1 to 28), on both schedulers.
+- `command = "script"` jobs: `script` names a reviewed script and `script_sha256` its hash. The timer runs
+  `ws schedule script JOB`, which refuses a script that changed or that others could write, and runs the bytes it
+  hashed.
+- The backup job file takes `extra_sources`, more folders or files the restic backup takes.
+- Job keys `coalesce_if_active` and `skip_missed`. Today's `ws queue tick` flags are the defaults, and the flags still
+  override them for one tick.
 - Vale runs before each commit (the upstream `vale` hook at v3.25.1, the version CI downloads), over the same files and
   with the same style as CI's Vale step. It syncs the style package only when it's missing, so a fresh clone passes.
 - The e2e first-task script prints the pending systemd jobs and the process list when a SIGTERM reaches it from
@@ -17,19 +27,46 @@ body of the GitHub release.
 
 ### Changed
 
-- The pre-push hook runs the tests through `ws-test --light --node local --` (`--full` for `WS_PREPUSH_FULL=1`) when
+- A job timer with an API key or a local provider runs `ws queue tick JOB --slot schedule --run` in place of
+  `ws run JOB`. The slot is worked out from the job's own schedule, the latest time at or before the fire, so a late
+  catch-up fire gets the slot it was for. A job on a subscription login keeps `ws run JOB`, since the queue never runs
+  one.
+- Run records carry the runner's own stop subtype (`stop_subtype`: claude's `subtype`, opencode's last finish reason)
+  and the approval switch (`approval.switch`, the policy dial). A run whose process died while it held its job lock
+  is recorded as the reaper records one: `outcome_unknown`, under its own run id, with its real duration.
+- When a drain unit's kill cuts off a queued run it was running, `ws watch alert` lets the queue's notice, which names
+  the cut-off job, stand in for the unit's own push. Any other drain failure is pushed as before.
+- CI's macOS core-tier time budget is back to 900 s, the same as Linux. A tier over its budget now warns and only a run
+  past twice the budget fails, so macOS warns over 900 s and fails over 1800 s, as before.
+- The pre-push cap on a capped set grows with the set: 6 s a file, at least 300 s and at most 1800 s, so a large
+  selection doesn't hit 300 s with no failure. `WS_PREPUSH_CAP` still sets it, and the timeout message names it.
+- The pre-push hook runs the tests through `ws-test --light --mem 3G --node local --` (6G with e2e tests or over 40
+  files in the set; `--full` for `WS_PREPUSH_FULL=1`) when
   `ws-test` is on the PATH and `WS_PREPUSH_WRAP` is unset or only spaces, so a busy machine queues the push's tests
   (for up to `WS_TEST_WAIT`, 45 minutes) and caps their workers instead of timing them out. `WS_PREPUSH_WRAP=` (empty)
   runs them bare.
+- `config-guard` decides who owns a protected file by the root of the repository the session is in, not by a folder
+  prefix: the main checkout and any folder inside it own it; a linked worktree doesn't, even one kept under the owner,
+  and a folder outside git doesn't, nor does a repository whose `core.worktree` points elsewhere. If git can't say,
+  the session isn't an owner. A folder kept under `.claude/worktrees/`, or under any worktree git lists, never owns.
+  An `owners` entry is now the root of a repository's main checkout.
 
 ### Fixed
 
+- The launchd scheduler switches off only the agents it loaded. Each plist now carries `WsWrittenBy: ws`, and
+  `ws schedule`, `ws uninstall` and `ws schedule apply` boot out a `ws.job.*` label only when `launchctl print` shows
+  it was loaded from a plist under `jobs/units/` or one with that key. A label someone else loaded is left alone and
+  named in the problems, as the systemd scheduler already does with a unit it didn't write.
 - The command reader's time limit counts its own CPU time, not the wall clock, so a busy or slow machine (a CI runner,
   WSL2) no longer refuses an ordinary long command, such as `touch f{1..4000}`, as too slow to read. The wall clock still
   stops a read that waits, at three times the limit.
 - Flaky tests: the reveal-link test waits on the push itself instead of 5 s of polling; the tests that check the reader
   is quick measure its CPU time too, as the limit does; and the live conformance row that drives two real runner
   sessions is sized large, like the end-to-end tests it matches, not small (60 s).
+- `ws upgrade`'s step watchdog sends KILL to the step's whole process group after the TERM grace even when the step
+  itself has already exited, as `ws run` does. Before, a child that ignored TERM, or that the TERM didn't stop, kept
+  running after the upgrade. The kill tests for both now wait on the process's exit (a pidfd where there is one), not
+  one check or a 5 s poll.
 
 ## [0.1.11] - 2026-11-17
 
@@ -82,6 +119,8 @@ body of the GitHub release.
   no folder name and none of the runner's words, whatever `alert_text` says.
 - In the decision log, a refusal the wall makes redundant, refused because the wall wasn't proven, now has the layer
   `rule:unknown-command-word`, `rule:sets-ifs` or `rule:unread-write` where it was `rule:command`.
+- A test tier over its time budget now warns (a summary line, and a `::warning::` on GitHub Actions); only a tier past
+  twice its budget fails the run in CI, so a slow runner can't turn a green suite red.
 
 ### Fixed
 

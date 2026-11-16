@@ -537,6 +537,41 @@ Serve memory_search, memory_add and note_capture over stdio.
 ws mcp serve [-h]
 ```
 
+## `ws connector`
+
+Zone MCP servers (`[connectors.NAME]` in the [policy](policy.md#connectorsname)): list them, start a session with one,
+and the hook that judges and logs each call. See [Plug in a zone MCP server](../how-to/plug-in-zone-mcp.md).
+
+### `ws connector list`
+
+The policy's connectors, and whether a session in this folder may read each.
+
+```text
+ws connector list [-h]
+```
+
+### `ws connector launch`
+
+Start Claude Code (through `ws gate launch`) with the named connectors wired in, for this launch only. An admin command:
+a session can't run it.
+
+```text
+ws connector launch [-h] [-c NAME] ...
+```
+
+| Argument | Meaning |
+|---|---|
+| `-c NAME`, `--connector NAME` | A connector to plug in (repeatable). |
+| `cmd` | `--` then the runner's command line (`claude ...`). |
+
+### `ws connector audit`
+
+Hook entry: judge one MCP call against its connector's allowlist and log it. Exit 2 refuses the call.
+
+```text
+ws connector audit [-h] [--policy FILE] [--pin KEY=PATH]
+```
+
 ## `ws run`
 
 Run a headless job (a file in ~/.config/ws/jobs) and record what it did.
@@ -1196,6 +1231,19 @@ ws schedule apply [-h] [--dry-run]
 |---|---|
 | `--dry-run` | Show what would change; write and run nothing. |
 
+### `ws schedule script`
+
+Run a script job's reviewed script now. This is what its timer runs. It's refused (exit 3) unless the script is yours,
+closed to other writers and hashes to `script_sha256`. The bytes that were hashed are what runs: ws runs a private copy,
+kept under its own state folder, in the script's own folder, with `WS_SCRIPT_PATH` set to its real path. Only the
+script is hashed. A file it sources or runs by a relative path is outside the review, so name what it calls by
+absolute path, and keep those files closed to other writers too. The output and exit code are the script's.
+Past the job's `timeout_s` it's stopped and the exit code is 124.
+
+```text
+ws schedule script [-h] job
+```
+
 ### `ws schedule remove`
 
 Stop one job's timer and delete its unit files.
@@ -1397,9 +1445,14 @@ writable by others, because a job decides what a runner starts with. Every error
 | `allow_unpriced` | true or false | Run even if the runner can't price the model. Default `false`. |
 | `green` | text | What the job's verification covers: `targeted`, `package`, `full` or `merge_ready`. |
 | `sources` | list of text | Policy sources the job reads. The Rule of Two looks at these. |
-| `schedule` | text | `hourly`, `daily HH:MM` or `weekly DAY HH:MM`, in local time. `ws schedule apply` turns it into a timer. |
+| `schedule` | text | `hourly`, `daily HH:MM`, `weekly DAY HH:MM`, `monthly D HH:MM` (D from 1 to 28) or `every Nm`, in local time. `ws schedule apply` turns it into a timer. A job with an API key or a local provider ticks the queue (`ws queue tick JOB --slot schedule --run`). A job on a subscription login keeps `ws run JOB`. |
+| `coalesce_if_active` | true or false | A tick while a run of the job waits or runs queues nothing. Default `true`. `ws queue tick --no-coalesce` overrides it. |
+| `skip_missed` | number | Seconds: a tick later than this after its slot is skipped. Default: never skipped. `ws queue tick --skip-missed` overrides it. |
 | `parent_run` | text | The id of a run in progress whose reservation this run spends from. `ws run --parent` sets it for one run. |
-| `command` | text | In place of `runner`, `model` and `prompt`: a ws command that the schedule runs (`backup`). `ws run` refuses these. |
+| `command` | text | In place of `runner`, `model` and `prompt`: a ws command that the schedule runs (`backup`, `queue` or `script`). `ws run` refuses these. |
+| `extra_sources` | list of text | With `command = "backup"`: more folders or files to back up, absolute or under `~`. |
+| `script` | text | With `command = "script"`: the script the timer runs through `ws schedule script JOB`, absolute or under `~`. It must be yours and closed to other writers. |
+| `script_sha256` | text | With `command = "script"`: the script's sha256. ws refuses a script that no longer hashes to it, so a change needs a new review. |
 | `[[secrets]]` | table list | Each has `name`, `host` and `purpose` (default `run`). The broker leases it. |
 | `[runner_options]` | table | Adapter-specific. Claude Code: `allowed_tools`, `env`. OpenCode: `provider`, `env`. |
 

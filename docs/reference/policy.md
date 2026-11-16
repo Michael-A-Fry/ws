@@ -106,6 +106,13 @@ The default list, which `ws gate init` writes:
 - A shell that reads its script from standard input: `sh`, `sh -s*` and `sh -`, and the same three for `bash`, `zsh` and
   `dash`.
 
+Not a pattern, so it isn't in the list: a shell command that writes a file that holds secrets is refused whatever the
+policy says. The reader looks at the target of each redirect and the operand of each writing command (`tee`, `cp`, `mv`,
+`sed -i`, `dd of=`) by file name: `.env`, `.envrc` and `.env.NAME` (a template such as `.env.example` is free). Quoting, a
+heredoc and a variable set earlier on the line change nothing, and a target the reader can't know is refused. `notes.env`
+isn't a secret file, and nor is an option's value such as `--config prod.env`. An interpreter that opens the file itself
+isn't read.
+
 ### How a command is read
 
 One reader, `src/ws/shellwords.py`, turns a command line into the words a shell would run. Every check on a command

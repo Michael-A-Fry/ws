@@ -1543,12 +1543,16 @@ def _git_normal(toks: list[str]) -> list[str]:
     `--force`."""
     toks = git_split(toks)[1]
     forcing = len(toks) > 1 and toks[1] == "push" and "--force" not in toks
-    if forcing and any(
-        re.fullmatch(r"-[A-Za-z]*f[A-Za-z]*", t)
-        or t.startswith(("+", ":"))
-        or ":+" in t
-        or t in ("--mirror", "--delete", "-d", "--prune")
-        for t in toks[2:]
+    if (
+        forcing
+        and any(
+            re.fullmatch(r"-[A-Za-z]*f[A-Za-z]*", t)
+            or t.startswith(("+", ":"))
+            or ":+" in t
+            or re.fullmatch(r"-[A-Za-z0-9]*d[A-Za-z0-9]*", t)  # -d, -qd, -dq: delete
+            or t in ("--mirror", "--delete", "--prune")
+            for t in toks[2:]
+        )
     ):
         toks.append("--force")
     return toks
@@ -1561,7 +1565,10 @@ def _destroying_push_note(line: str) -> str:
     if toks[:2] != ["git", "push"] or toks.count("--force") != 1 or toks[-1] != "--force":
         return ""
     words = toks[2:-1]
-    if any(t in ("--delete", "-d") or (t.startswith(":") and len(t) > 1) for t in words):
+    if any(
+        t == "--delete" or re.fullmatch(r"-[A-Za-z0-9]*d[A-Za-z0-9]*", t) or (t.startswith(":") and len(t) > 1)
+        for t in words
+    ):
         return (
             ": deleting a remote branch or tag counts as a destroying push, as `--force` does; delete it from a terminal "
             "of your own"
@@ -2308,6 +2315,12 @@ def _segment_once(
         hit = _under(ctx.protect, p, ctx.cwd, ancestors)
         if hit:
             return f"command writes to {hit}, which ws protects (policy and generated gate)", line, nested
+    for p, _ in written or _written(cmd, flags, operands, redirs, canon, toks):
+        if reason := _secret_env_write(p, env, ctx):
+            if ctx.soft is not None and isinstance(reason, Refusal) and reason.kind in WALL_REDUNDANT:
+                ctx.soft.append(reason)  # the wall holds what this runs; the rest of the line is still judged
+                continue
+            return reason, line, nested
     return None, line, nested
 
 
@@ -2956,6 +2969,36 @@ def _find_deletes(canon: list[str], cwd: str) -> list[str]:
             break
         starts.append(t)
     return [f"rm -fr {_dotted(p, cwd)}" for p in (starts or ["."])]
+
+
+ENV_TEMPLATE_SUFFIXES = ("example", "sample", "template", "dist", "defaults")
+
+
+def is_secret_env_name(base: str) -> bool:
+    """Is a file name `.env`, `.envrc`, or `.env.NAME` where NAME isn't a template's word (`.env.example`)? By name alone, so
+    `notes.env` and `prod.env` are not."""
+    name = base.casefold() if CASELESS_PATHS else base
+    if name in (".env", ".envrc"):
+        return True
+    head, dot, tail = name.partition(".env.")
+    return not head and bool(dot) and bool(tail) and tail.rsplit(".", 1)[-1] not in ENV_TEMPLATE_SUFFIXES
+
+
+def _secret_env_write(path: str, env, ctx) -> str | Refusal | None:
+    """A refusal when the command writes a file that holds secrets (see `is_secret_env_name`): a redirect target, or an
+    operand of a command that writes (`tee`, `cp`, `mv`, `sed -i`). Read from the words the shell would see, so
+    quoting, a heredoc, a variable set earlier on the line and a trailing redirect change nothing. A name with a part
+    the reader cannot know (an unset variable) is refused, since it could be any file."""
+    base = path.rsplit("/", 1)[-1]
+    if unknownpath.has_unknown(unknownpath.split(base, frozenset(env), _producer(ctx, env))):
+        return _write_refusal(
+            f"command writes {path!r}, which holds a part ws cannot read, and it could be a secret .env file; "
+            f"{HOW_TO_SPELL}",
+            "wredirect",
+        )
+    if is_secret_env_name(base):
+        return f"command writes {path!r}, a file that holds secrets; edit it yourself, in a terminal of your own"
+    return None
 
 
 def _written(cmd, flags, operands, redirs, canon, toks) -> list[tuple[str, bool]]:

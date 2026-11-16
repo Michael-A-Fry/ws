@@ -4,8 +4,9 @@ How the suite keeps time, order and flakes under control. The plugin that does i
 pyproject loads it for every `pytest` run in this repo (`addopts = "-p ws_harness"`, with `tests/plugins` on
 `pythonpath`), so CI, `ws-test` and the pre-push hook all get it. `tests/test_harness.py` tests it.
 
-The harness builds on three pinned packages in the `dev` group: pytest-timeout (per-test limits), pytest-randomly
-(random order, the seed line) and pytest-rerunfailures (the `flaky` marker). It adds the policy they leave open. If any
+The harness builds on four pinned packages in the `dev` group: pytest-timeout (per-test limits),
+pytest-randomly (random order, the seed line), pytest-rerunfailures (the `flaky` marker) and pytest-xdist
+(parallel workers). It adds the policy they leave open. If any
 of them is missing or switched off, the run stops with a usage error. It never carries on without limits.
 
 ## Run the suite
@@ -15,7 +16,25 @@ uv run --locked pytest -q                       # the whole suite, in a random o
 uv run --locked pytest -q --randomly-seed=1234  # the same order again
 uv run --locked pytest -q -p no:randomly        # file order, no shuffle
 uv run --locked pytest -q --run-quarantine      # also the quarantined tests
+uv run --locked pytest -q -n 0                  # one process, no workers (a debugger, or a failure to step through)
 ```
+
+## Parallel workers
+
+`addopts` carries `-n auto`, so every run is parallel, with no flag to remember. The harness answers xdist's
+`pytest_xdist_auto_num_workers` hook: when `WS_TEST_MAX_N` is set (`ws-test` sets it from the machine's cores and
+memory) that's the worker count, else xdist counts the cores itself. `-n 4` or `-n 0` on the command line wins.
+
+- One seed covers all workers: pytest-randomly sends the controller's seed to each, so `--randomly-seed=N` replays a
+  failure. The order inside a worker follows from the seed and the distribution, so a failure that depends on which
+  tests share a worker is replayed with `-n 0` and the same seed first, then with the same `-n`.
+- A test must not depend on another test's files, ports, environment or working folder. Use `tmp_path` and the
+  fixtures in `tests/conftest.py`, which give every test its own `HOME` and `WS_HOME`.
+- Without pytest-xdist (`-p no:xdist`, or the dev group not installed) the run stops with a usage error that says so.
+  To run in one process without it, override the option: `pytest -o addopts='-p ws_harness'`.
+- The tier report and the flake log are written by the controller, from the workers' results.
+- To go back to one process, remove `pytest-xdist` from the `dev` group and `-n auto` from `addopts`; nothing else
+  depends on it.
 
 ## Size markers and limits
 

@@ -1688,8 +1688,9 @@ def test_a_reaped_run_carries_its_run_key(tmp_path):
 
 
 def test_planted_stale_holder_no_overwrite(tmp_path):
-    """A drain that stalls past its lease comes back after the message ran again: it changes neither the newer
-    attempt's receipt nor the message, and its late record for the reaped run does not replace the reaper's."""
+    """A drain that stalls past its lease comes back after the message was taken from it (reaped as outcome_unknown and
+    failed by recovery): it changes neither the receipts nor the message. Its late record is its run's true outcome,
+    counted once, with the reaper's line kept as the alert trail."""
     host = Host()
     log = tmp_path / "logs" / "runs.jsonl"
     ledger = make(tmp_path, host=host, sink=lambda rec: queue._write_record(log, rec))
@@ -1703,8 +1704,8 @@ def test_planted_stale_holder_no_overwrite(tmp_path):
     host.procs[4500] = (None, None)  # this host cannot tell; the lease has run out, so the run is reaped
     later = T0 + timedelta(hours=25)
     ledger.clock = lambda: later
-    newer = queue.drain(ledger, lambda item: queue.Outcome(0, "ok", "completed"))
-    assert [d["action"] for d in newer] == ["done"] and newer[0]["run_id"] != run_id
+    assert queue.drain(ledger, lambda item: queue.Outcome(0, "ok", "completed")) == []  # not run again
+    assert message_status(ledger, mid) == int(sqlqueue.Status.FAILED)
     # the stalled holder wakes and finishes the way a drain would
     late = runrecord.new(
         run_id=run_id, job="j", started_at=runrecord.iso(T0), ended_at=runrecord.iso(later), status="ok",
@@ -1716,12 +1717,12 @@ def test_planted_stale_holder_no_overwrite(tmp_path):
     act = queue.classify(queue.Outcome(0, "ok", "completed"), tries=0, preemptible=False, deadline=None, now=later)
     with pytest.raises(sqlqueue.StaleClaim):
         queue._finish(ledger, ledger.engine(), stalled, item, run_id, queue.Outcome(0, "ok"), act, later, None)
-    assert message_status(ledger, mid) == int(sqlqueue.Status.DONE)
+    assert message_status(ledger, mid) == int(sqlqueue.Status.FAILED)
     assert ledger.receipts(last=10) == before  # no receipt changed
     assert {r["run_id"]: r["status"] for r in before}[run_id] == "interrupted"
     mine = [r for r in runrecord.read(log) if r["run_id"] == run_id]
-    assert [r["status"] for r in mine] == ["outcome_unknown"]  # the late ok does not stand in for it
-    assert len(jsonl_lines(log)) == 2  # both are kept in the file
+    assert [r["status"] for r in mine] == ["ok"]  # the run's own late record is its true outcome, counted once
+    assert [r["status"] for r in jsonl_lines(log)] == ["outcome_unknown", "ok"]  # the alert trail stays in the file
 
 
 def jsonl_lines(path) -> list[dict]:
@@ -1785,8 +1786,9 @@ def test_a_schema_2_store_gains_the_run_key_column(tmp_path):
     assert {r["run_key"] for r in again.receipts(last=5)} == {None, "j:t1"}
 
 
-@pytest.mark.parametrize(("trigger", "action"), [(None, "fail"), ("evt-7", "retry")])
-def test_a_killed_run_is_run_again_only_when_it_has_a_run_key(tmp_path, trigger, action):
+@pytest.mark.parametrize("trigger", [None, "evt-7"])
+def test_a_killed_run_is_never_run_again_by_recovery(tmp_path, trigger):
+    """It may have acted, and a rerun cannot yet skip what it did, so it is failed with or without a run key."""
     host, clock = Host(), Clock()
     ledger = make(tmp_path, host=host, clock=clock, sink=lambda rec: True)
     run_id, mid, _ = ledger.enqueue("j", None, T0, trigger=trigger)
@@ -1799,6 +1801,55 @@ def test_a_killed_run_is_run_again_only_when_it_has_a_run_key(tmp_path, trigger,
     host.procs[4800] = (False, None)
     clock.advance(seconds=queue.ORPHAN_S + 1)
     ledger.recover(clock.now)
-    want = sqlqueue.Status.FAILED if action == "fail" else sqlqueue.Status.READY
-    assert message_status(ledger, mid) == int(want)
+    assert message_status(ledger, mid) == int(sqlqueue.Status.FAILED)
     assert ledger.receipt(run_id)["stop_reason"] == "owner_gone"
+
+
+def test_a_run_that_raised_after_admission_is_recorded_and_charged(tmp_path):
+    log = tmp_path / "logs" / "runs.jsonl"
+    told: list[str] = []
+    ledger = make(
+        tmp_path, costing=(2.0, None), sink=lambda rec: queue._write_record(log, rec),
+        recorded=lambda rid: next((r for r in runrecord.read(log) if r["run_id"] == rid), None),
+        on_stop=lambda job, run_id, why: told.append(why),
+    )  # fmt: skip
+    ledger.enqueue("spender", None, T0)
+
+    def runner(item):
+        d = ledger.admit(req(job=item.job, run_id=item.run_id, cap_usd=100.0), T0, spend())
+        assert d.kind == "admit"
+        raise RuntimeError("after it had started")
+
+    (out,) = queue.drain(ledger, runner)
+    assert out["action"] == "fail"
+    (rec,) = runrecord.read(log)
+    assert (rec["status"], rec["error"]) == ("outcome_unknown", "the run raised RuntimeError")
+    row = ledger.receipt(out["run_id"])
+    assert (row["actual_usd"], row["settled"], row["note"]) == (2.0, True, "the run raised RuntimeError")
+    assert told == ["bad_item: the run raised RuntimeError"]  # one notice, not two
+
+
+def test_a_store_error_in_a_run_stops_the_drain_and_is_not_one_items_failure(tmp_path):
+    ledger = make(tmp_path)
+    run_id, mid, _ = ledger.enqueue("j", None, T0)
+
+    def runner(item):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    with pytest.raises(sqlite3.OperationalError):
+        queue.drain(ledger, runner)
+    assert message_status(ledger, mid) == int(sqlqueue.Status.LOCKED)  # left for recovery, not failed
+    assert ledger.receipt(run_id)["status"] == "queued"
+
+
+def test_a_finished_receipt_keeps_its_note(tmp_path):
+    ledger = make(tmp_path)
+    ledger.enqueue("j", None, T0)
+    msg = ledger.engine().pop()
+    with queue._transaction(ledger.conn()) as c:
+        rid = ledger.queued_row(c, msg.message_id)
+        c.execute(
+            "UPDATE receipts SET status = 'ok', finished_at = 1, settled = 1, note = 'its own' WHERE run_id = ?", (rid,)
+        )
+    queue._fail_bad(ledger, msg, "j", "late", T0, rid)
+    assert ledger.receipt(rid)["note"] == "its own"

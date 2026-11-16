@@ -552,13 +552,13 @@ def cmd_rm(args: argparse.Namespace) -> int:
 
 
 AUDIT_LOG = "secrets-audit.jsonl"
+AUDIT_SCHEMA = 1  # the `schema` of a line in logs/secrets-audit.jsonl
 
 
 def _audit(action: str, name: str, result: str) -> None:
     """One line in `<state>/logs/secrets-audit.jsonl` per generate and reveal: who, which name, when, what came of it.
     Never a value, a link or a token. Best effort: a full disk does not undo a value that was stored."""
     import getpass as _getpass
-    from datetime import UTC, datetime
 
     from ws import agentsession, jsonl
 
@@ -571,9 +571,7 @@ def _audit(action: str, name: str, result: str) -> None:
     except OSError:
         session = True
     rec = {
-        "schema": 1,
         "type": "ws.secret-audit/1",
-        "ts": datetime.now(UTC).isoformat(timespec="seconds"),
         "action": action,
         "name": name,
         "result": result,
@@ -581,7 +579,7 @@ def _audit(action: str, name: str, result: str) -> None:
         "in_session": session,
     }
     with contextlib.suppress(OSError):
-        jsonl.append(paths.state_dir() / "logs" / AUDIT_LOG, rec)
+        jsonl.append(paths.state_dir() / "logs" / AUDIT_LOG, jsonl.stamped(rec, AUDIT_SCHEMA))
 
 
 def _registered(name: str) -> Entry:

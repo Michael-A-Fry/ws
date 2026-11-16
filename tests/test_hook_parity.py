@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from ws import cli, gate, paths, policy
+from ws import cli, gate, guards, paths, policy
 from ws.adapters import claude_code, opencode
 
 ROOT0 = Path(__file__).resolve().parents[1]
@@ -201,10 +201,10 @@ def test_claims_deny_when_git_cannot_answer_in_time(box, monkeypatch, how):
     repo = box / "repo"
     repo.mkdir()
     git(repo, "init", "-q", "-b", "main")
-    (repo / "a").write_text("1")
-    git(repo, "add", "a")
-    git(repo, "commit", "-q", "-m", "first")
-    on = git(repo, "rev-parse", "--short=10", "HEAD")
+    (repo / "seed").write_text("0")
+    git(repo, "add", "seed")
+    git(repo, "commit", "-q", "-m", "seed")
+    on = commit_with_readable_sha(repo, "a", "1")  # the guard reads only an id with a digit and a letter a to f
     git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
     pol = policy.loads('[guards]\non = ["claims"]\n')
 
@@ -355,6 +355,208 @@ def test_parity_config_guard(box, monkeypatch):
     assert hook(box, on, call("Write", cwd=box / "mine", **edit)) == 0
     monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(box))
     assert hook(box, on, call("Write", cwd=box / "mine", **edit)) == 2  # the call moved itself into the owner's folder
+
+
+# --- wave 2b: force-push, env files, scheduled branch moves, syntax -----------------------------------------------
+
+
+PUSH_DENIED = (
+    "git push --force origin main",
+    "git push origin :trunk",
+    "git push origin ':trunk'",
+    'git push origin ":trunk"',
+    "git push origin refs/heads/x :trunk",
+    "git push -d origin trunk",
+    "git push origin -d trunk",
+    "git push origin trunk -d",
+    "git push --delete origin trunk",
+    "git push origin --delete trunk",
+    "git push -qd origin trunk",  # combined flags: -d among others
+    "git push -dq origin trunk",
+    "git push --prune origin 'refs/heads/*:refs/heads/*'",
+    "git push --mirror origin",
+    "git -C repo push origin :trunk",
+    "git -c a=b push origin :trunk",
+    "git --no-pager push -d origin trunk",
+    "/usr/bin/git push origin :trunk",
+    "command git push origin :trunk",
+    "env git push origin :trunk",
+    "sudo git push origin :trunk",
+    "bash -c 'git push origin :trunk'",
+    "cd /tmp && git push origin :trunk",
+    "true; git push origin :trunk",
+    "git push origin -d trunk 2>&1",
+)
+PUSH_ALLOWED = (
+    "git push origin trunk",
+    "git push origin HEAD:work",
+    "git push origin trunk:trunk",
+    "git push -u origin feature",
+    "git push --dry-run origin trunk",
+    "git push origin v1.0 --tags",
+    "git push origin -o ci.skip trunk",
+    "git push origin --follow-tags trunk",
+    "git branch -d topic",
+    'git push origin "refs/heads/a:refs/heads/b"',
+    'git push origin trunk; echo ":done"',
+    "git push --set-upstream origin dev",
+    "git push origin feature-d",
+    "git push origin -- trunk",
+    'git push origin trunk -o "msg :x"',
+    "git push origin trunk 2>&1 | grep -v ' -d '",
+    "git push origin trunk && git branch -d trunk",
+    "git push origin trunk -o 'ci.message=fix :x'",
+    "git push origin -o -d trunk",  # the value of -o is not a flag
+    "git push --push-option -d origin trunk",
+    "git status",
+)
+
+
+def test_parity_force_push_main(box):
+    """Every forcing or deleting push spelling is refused, whatever it pushes to; an ordinary push is free. A remote ref
+    deleted through the host's own API (`gh api -X DELETE`) is a network call this list doesn't read."""
+    for command in PUSH_DENIED:
+        assert hook(box, None, call("Bash", command=command)) == gate.DENY, command
+    for command in PUSH_ALLOWED:
+        assert hook(box, None, call("Bash", command=command)) == 0, command
+
+
+ENV_DENIED = (
+    "echo KEY=1 > .env",
+    'echo KEY=1 > ".env"',
+    "echo KEY=1 > '.env'",
+    "echo KEY=1 > .env 2>/dev/null",  # a trailing redirect
+    "echo KEY=1 >.env; ls",
+    "echo KEY=1 > ./.env",
+    "echo KEY=1 >> app/.env",
+    "echo KEY=1 > /srv/app/.env",
+    "echo KEY=1 > $PWD/.env",
+    "F=.env; echo KEY=1 > $F",  # a variable set on the line
+    'echo KEY=1 > .e""nv',
+    "echo KEY=1 1> .env",
+    "echo KEY=1 &> .env",
+    "echo KEY=1 >| .env",
+    ">.env",
+    "echo x 2>&1 >.env",
+    "{ echo x; } > .env",
+    "(echo x) > .env",
+    "exec 3> .env",
+    "cat > .env <<'X'\nKEY=1\nX",  # a heredoc
+    "cat > .env <<X\nKEY=1\nX",
+    "cat <<X > .env\nKEY=1\nX",
+    "tee .env <<X\nKEY=1\nX",
+    "printf x | tee .env",
+    "printf x | tee -a .env",
+    "printf x | tee .env > /dev/null",
+    "printf x | sudo tee .env",
+    'printf x | tee ".env"',
+    "printf x | tee .env.local >/dev/null",
+    "printf x | tee .env.production",
+    "printf x | tee .env out.txt",  # a second operand
+    "printf x | tee out.txt .env",
+    "cp /tmp/x .env",
+    "mv /tmp/x .env",
+    "sed -i s/a/b/ .env",
+    "dd of=.env",
+    "bash -c 'echo x > .env'",
+    "echo x > .env.test",
+    "echo x > .envrc",
+    "echo x > $UNSET_NAME",  # a name the reader cannot know could be any file
+    'echo x > "$UNSET_DIR/$UNSET_NAME"',
+    "echo x > .e*",  # the shell expands a glob or a brace into a name the reader never sees
+    "echo x > .en?",
+    "cp /tmp/x .e[n]v",
+    "cp x .{y,env}",  # the reader expands a brace itself; the last name is the one written
+    "cp ../other/.env .",  # a copy into a folder writes folder/<the source's name>
+    "cp /tmp/.env ./",
+    "cp ../o/.env app/",
+    "cp -t . ../o/.env",
+    "cp -t app ../o/.env",
+    "mv ../o/.env .",
+    "rm .env",  # new: removing it is refused too, as `rm` writes its operands
+    "sort -o .env in.txt",
+    "sort --output=.env in.txt",
+    "awk -i inplace '{print}' .env",
+    "tar xf a.tar .env",
+    "split in.txt .env.",
+    "ed .env",
+)
+ENV_ALLOWED = (
+    "cat .env.example",
+    "echo KEY=1 > .env.example",
+    "echo KEY=1 > .env.sample",
+    "grep KEY .env",
+    "grep KEY .env > out.txt",
+    "make 2>&1 | grep .env",
+    "ls > files.txt && cat .env",
+    "source .env",
+    "diff .env .env.example > d.txt",
+    "echo x > notes.env",
+    "cat x | tee build.log",
+    "cat .env | tee copy.txt",
+    "cat x | tee teeth.envy",
+    "printf x | tee log.txt | grep .env",
+    "make 2>&1 | tee build.log | grep -c .env",
+    "python app.py 2>/dev/null --config prod.env",
+    "docker compose --env-file .env up 2>&1",
+    "echo x > .env2",
+    "ls -a",
+    "grep KEY notes.txt > out.txt",
+)
+
+
+def test_parity_env_file_write(box):
+    """A write to `.env`, or to `.env.NAME` other than a template's, is refused: read from the lexed redirect targets and
+    the operands of a writing command by file name, so quoting, a heredoc, a variable on the line, a trailing redirect or
+    a second `tee` operand change nothing. `notes.env` and an option's value `prod.env` are not writes to it. Not covered:
+    an interpreter that opens the file itself (`python3 -c "open('.env', 'w')"`)."""
+    # The default policy also refuses to READ `.env` (deny_read), so a command like `grep KEY .env` is refused for that
+    # reason, not this one. The free cases are about the write rule alone: they run under a policy with no read rules.
+    no_read_rules = "[gate]\ndeny_read = []\n"
+    for command in ENV_DENIED:
+        assert hook(box, None, call("Bash", command=command)) == gate.DENY, command
+        assert hook(box, no_read_rules, call("Bash", command=command)) == gate.DENY, command  # the write rule alone
+    for command in ENV_ALLOWED:
+        assert hook(box, no_read_rules, call("Bash", command=command)) == 0, command
+    # and the default policy still refuses the read of the secret file, by its own rule. It is passed as text: a policy
+    # file written by the calls above is what a call with no policy would read from this test's home.
+    assert hook(box, policy.default_toml(), call("Bash", command="grep KEY .env")) == gate.DENY
+
+
+@needs_git
+def test_parity_scheduled_branch_move(box, monkeypatch):
+    """The checkout-pin guard holds a main checkout that has linked worktrees in place, whoever runs the command (a
+    timer's job included), so a job can't move its branch."""
+    from test_guard_launch_config import real_repos
+
+    main, _ = real_repos(box)
+    on = '[guards]\non = ["checkout-pin"]\n'
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(main))
+    for command in ("git checkout side", "git switch -c other", "git reset --hard HEAD~1", "git pull"):
+        assert hook(box, on, call("Bash", cwd=main, command=command)) == gate.DENY, command
+    for command in ("git status", "git log -1", "git add f"):
+        assert hook(box, on, call("Bash", cwd=main, command=command)) == 0, command
+
+
+def test_parity_syntax_check(box):
+    pol = policy.loads('[guards]\non = ["syntax-check"]\n')
+    conf = json.loads(claude_code.generate(pol, ["ws"], box / "out", box / "w" / "policy.toml")["settings.json"])
+    pre = conf["hooks"].get("PreToolUse", [])
+    assert not any("syntax-check" in h["command"] for g in pre for h in g["hooks"])
+    post = [h["command"] for g in conf["hooks"]["PostToolUse"] for h in g["hooks"]]
+    assert post  # only after the call ran, so a finding reaches the model and can't block the call
+    (box / "bad.py").write_text("def f(:\n")
+    (box / "good.py").write_text("def f():\n    return 1\n")
+    guard = guards.get("syntax-check")
+    ctx = guards.Context("claude-code", "post", "s1", str(box), {})
+
+    def judged(name):
+        raw = json.loads(call("Write", cwd=box, file_path=str(box / name), content="x"))
+        return guard.judge(claude_code.parse(raw), guard.config({}, "w"), ctx)
+
+    found = judged("bad.py")
+    assert found is not None and found.action == "deny"
+    assert judged("good.py") is None
 
 
 # --- the page and these tests agree ------------------------------------------------------------------------------

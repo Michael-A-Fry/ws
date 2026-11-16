@@ -93,6 +93,9 @@ MATCHER_ONLY = [
 ]
 MATCHER_ALLOWS = [
     "ws status",
+    "ws secret ask NAME",  # shows no value: a session may open the prompt window for a person
+    "ws secret wait NAME",
+    "uv run ws secret wait NAME --timeout 60",
     "tmux new -d 'ws status'",
     "tmux list-panes",
     "script -qc 'ws status' /dev/null",
@@ -192,6 +195,17 @@ def test_the_matcher_reads_launchers_module_forms_and_the_text_tmux_runs(line):
 @pytest.mark.parametrize("line", MATCHER_ALLOWS)
 def test_the_matcher_leaves_commands_that_are_not_admin(line):
     assert not policy.is_denied_command(policy.default_policy(), line), line
+
+
+def test_a_session_may_run_secret_ask_and_wait_but_not_the_prompt_or_the_value_commands(tmp_path, monkeypatch):
+    pol = policy.default_policy()
+    for word in ("prompt", "set", "import", "rm", "wall", "list"):
+        assert policy.is_denied_command(pol, f"ws secret {word} NAME"), word
+        assert refused(argparse.Namespace(ws_command=f"secret.{word}")) is not None, word
+    for word in ("ask", "wait"):
+        assert refused(argparse.Namespace(ws_command=f"secret.{word}")) is None, word
+    # a name that only starts like one of them is still refused
+    assert policy.is_denied_command(pol, "ws secret asked NAME")
 
 
 def test_the_refusal_is_one_typed_error_in_the_json_envelope(tmp_path, monkeypatch, capsys):

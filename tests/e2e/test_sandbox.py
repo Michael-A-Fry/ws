@@ -554,3 +554,33 @@ def test_the_network_probe_connects_with_the_sandbox_taken_out(tmp_path):
         proc = gr.claude_run(tmp_path, stub, settings, False, project, extra_env={"HOME": env["HOME"]})
     said = "\n".join(stub.tool_results())
     assert canary._said(said, "curl") == "0", f"the control curl did not connect\n{gr.where(proc)}"
+
+
+def test_a_walled_shell_and_a_process_it_orphans_cannot_read_the_person_token(tmp_path):
+    """The person send (ADR 0023) rests on this: the token is in the secrets folder, which the launch wall hides. A
+    process that leaves the runner's tree (`setsid -f`, as nohup, at and cron also do) is still inside the same mount
+    namespace, so it cannot read the token either, and `person_proof` is False for it; outside the wall it is True."""
+    from ws import session
+
+    home = tmp_path / "home"
+    project = home / "project"
+    env = {"HOME": str(home)}
+    secrets_dir = home / ".local" / "share" / "ws" / "secrets"
+    secrets_dir.mkdir(parents=True)  # made at install, so it exists when the wall is built and can be hidden
+    token = session.init_person_token(env)
+    assert token.parent == secrets_dir and session.person_proof(env), "the control: outside the wall the proof holds"
+    src = os.path.dirname(os.path.dirname(os.path.abspath(policy.__file__)))
+    probe = (
+        f"import sys; sys.path.insert(0, {src!r}); from ws import session; "
+        f"print('PROOF', session.person_proof({{'HOME': {str(home)!r}}}))"
+    )
+    cmd = (
+        f"(test -r {token} && echo DIRECT_READ || echo DIRECT_HIDDEN); "
+        f'setsid -f sh -c "{sys.executable} -I -c \\"{probe}\\" > {project}/orphan.out 2>&1"; '
+        f"sleep 4; cat {project}/orphan.out"
+    )
+    project.mkdir(parents=True, exist_ok=True)
+    _, stub, proc = run_in_launch_copy(tmp_path, project, cmd)
+    seen = " ".join(stub.tool_results())
+    assert "DIRECT_HIDDEN" in seen and "DIRECT_READ" not in seen, f"{seen}\n{gr.where(proc)}"
+    assert "PROOF False" in seen, f"the orphan proved itself a person, or did not run\n{seen}\n{gr.where(proc)}"

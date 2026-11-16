@@ -460,6 +460,75 @@ def _egress(pol: policy.Policy, job: jobs.Job):
     return plan, None
 
 
+def _strings(value, key: str = "") -> list[tuple[str, object]]:
+    """Every leaf of `value` (a table, a list or a scalar, nested) with the key of the table it sits under."""
+    if isinstance(value, dict):
+        return [s for k, v in value.items() for s in _strings(v, str(k))]
+    if isinstance(value, list):
+        return [s for v in value for s in _strings(v, key)]
+    return [(key, value)]
+
+
+# opencode fills these in from the environment or a file when it loads its config, so the value ws reads is not the one
+# the runner calls: a provider block that uses one is never known to stay on this machine.
+_SUBSTITUTIONS = ("{env:", "{file:")
+_BASE_KEYS = ("baseurl", "base_url")
+
+
+def _loopback_url(url: str) -> bool:
+    import ipaddress
+    import urllib.parse
+
+    try:
+        host = urllib.parse.urlsplit(url).hostname or ""
+    except ValueError:
+        return False
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return host == "localhost"
+
+
+def _job_is_local(job: jobs.Job, provider: str) -> bool:
+    """Does every model call of the job stay on this machine? Only when its provider is a local one by name, it takes no
+    secret lease (a lease's address is the broker, which forwards to a hosted host), its `provider` table uses no
+    `{env:...}` or `{file:...}` substitution (in a key or a value), every base URL in it is a literal loopback URL and every other URL in it is
+    loopback. Anything else counts as hosted."""
+    from ws import sandbox
+
+    if provider not in sandbox.LOCAL_PROVIDERS or job.secrets:
+        return False
+    block = (job.runner_options or {}).get("provider")
+    # opencode substitutes in the raw text before it parses it, so a key can carry one as well as a value
+    raw = json.dumps(block, default=str)
+    if any(s in raw for s in _SUBSTITUTIONS):
+        return False
+    for key, value in _strings(block):
+        text = value if isinstance(value, str) else ""
+        if key.lower() in _BASE_KEYS and not _loopback_url(text):
+            return False
+        if "://" in text and not _loopback_url(text):
+            return False
+    return True
+
+
+def _term_leak(pol: policy.Policy, job: jobs.Job) -> str | None:
+    """rr-r4-68: a job's prompt bound for a hosted model may not carry a walled class's term or a canary token
+    (`policy.term_problem`, words that name the class only). A model on this machine gets the prompt as it is. The second
+    net (`policy.name_spots`) is counted on stderr, never refused and never written down."""
+    from ws import sandbox  # late: only a policy with classes needs it
+
+    if not pol.classes or _job_is_local(job, sandbox.job_provider(job.runner, job.model, job.runner_options)):
+        return None
+    why = policy.term_problem(pol, _job_class(pol, job), job.prompt or "")
+    if why is None and (n := len(policy.name_spots(job.prompt or ""))):
+        print(
+            f"ws: note: the prompt has {n} name-like word pair(s); `terms` under [classes] refuses the ones you name",
+            file=sys.stderr,
+        )
+    return why
+
+
 def _refusal(prof: dict, verdict: policy.Verdict, job: jobs.Job, adapter) -> tuple[str, str] | None:
     """(counter, reason) for the refusals that need no look at the money: no cap set, the Rule of Two, a model the runner
     cannot price. What the cap and the purpose cap say is admission's (`queue.Ledger.admit`)."""
@@ -516,6 +585,17 @@ def _lock_reason(log: Path) -> str | None:
         )
     except OSError:
         return None  # a log that cannot be opened at all is reported by the read below
+    return None
+
+
+def _cannot_check(pol: policy.Policy, job: jobs.Job) -> tuple[str, str] | None:
+    """("cannot_check", why) when the policy needs a check this job's runner cannot do (its adapter's CANNOT_CHECK)."""
+    from ws import conformance
+
+    try:
+        conformance.refuse_cannot_check(pol, job.runner)
+    except WsError as e:
+        return ("cannot_check", e.message)
     return None
 
 
@@ -725,6 +805,11 @@ def _run(
     egress, why_not = _egress(pol, job)
     if static is None and why_not:
         static = ("egress", why_not)
+    if static is None:
+        leaks = _term_leak(pol, job)
+        static = ("term", leaks) if leaks else None
+    if static is None:
+        static = _cannot_check(pol, job)
     if static is None:
         walled = _wall_problem(pol, job, adapter, cwd)
         static = ("wall", walled) if walled else None

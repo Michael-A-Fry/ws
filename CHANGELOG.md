@@ -19,6 +19,9 @@ body of the GitHub release.
   when a setting the wall writes is missing. It lists the items its cases cover.
 - `ws walls check` has four more cases: the launch file's write block and token deny, Remote Control and connectors
   off, a headless job's writes held in the class, and a `local_only` class held to a local model.
+- `terms` under `[classes.NAME]`: `ws run` refuses a job whose prompt carries one of a walled class's terms (or a
+  canary token) when its model is hosted and the job isn't in that class, with one `refused:term` record that names the
+  class and not the term. A second net counts name-like word pairs on stderr and refuses nothing.
 - `ws doctor` warns (WS020) when the policy names no data class. The guards reference says which guards are off by
   default and why.
 - The gate's decision log (`logs/gate.jsonl`, or a class's own copy) has a line for every call's check, an allowed one
@@ -27,6 +30,8 @@ body of the GitHub release.
   (`counted_as: "write"`). A check that fails before the policy loads still leaves a deny line (rule `error`, with no
   session id or tool name), a guard that speaks after a call names itself, the live file turns over at 5 MiB instead of
   1 MiB, and a hook waits at most 0.2 seconds for the log's lock.
+- The pre-push hook runs the suite through `WS_PREPUSH_WRAP` when it's set (a command that queues test runs on a busy
+  machine), so a push's suite doesn't race the others. Unset, it runs as before.
 
 ### Changed
 

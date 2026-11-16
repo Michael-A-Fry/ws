@@ -1131,7 +1131,9 @@ class Ledger:
         """Before a drain: reap dead owners, then deal with each claimed message that nothing is running (a drain that
         crashed between claiming and finishing) or whose claim outlived `MESSAGE_LEASE_S`. It is dealt with as the drain
         would have: a run that finished is marked done and not run again; one that was refused is failed; a crash or an
-        interruption is retried at once, and each costs a try, so after `MAX_RETRIES` it fails; a preempted one is
+        interruption is retried at once, and each costs a try, so after `MAX_RETRIES` it fails (a run whose holder was
+        killed mid-run is retried only when its message has a run key: otherwise it is failed, and the reaper's notice
+        is the word on it); a preempted one is
         requeued only if its job is preemptible; and nothing comes back after its deadline. Returns how many came back."""
         c = self.conn()
         eng = self.engine()
@@ -1156,6 +1158,10 @@ class Ledger:
                     (m.message_id,),
                 ).fetchone()
                 out = _recovered_outcome(last)
+                if last is not None and last["stop_reason"] in LOST_STOPS and not m.idempotency_key:
+                    # killed mid-run with no run key: running it again could do its work twice, so the reaper's
+                    # notice stands and the message is failed; a job with a run key is safe to run again
+                    out = Outcome(EXIT_FAILED, "error", "owner_gone")
                 act = classify(
                     out,
                     tries=m.tries,

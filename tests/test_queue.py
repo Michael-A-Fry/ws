@@ -1783,3 +1783,22 @@ def test_a_schema_2_store_gains_the_run_key_column(tmp_path):
     again = make(tmp_path)
     assert again.enqueue("j", None, T0, trigger="t1")[2] is False
     assert {r["run_key"] for r in again.receipts(last=5)} == {None, "j:t1"}
+
+
+@pytest.mark.parametrize(("trigger", "action"), [(None, "fail"), ("evt-7", "retry")])
+def test_a_killed_run_is_run_again_only_when_it_has_a_run_key(tmp_path, trigger, action):
+    host, clock = Host(), Clock()
+    ledger = make(tmp_path, host=host, clock=clock, sink=lambda rec: True)
+    run_id, mid, _ = ledger.enqueue("j", None, T0, trigger=trigger)
+    ledger.engine().pop()
+    ledger.conn().execute(
+        "UPDATE receipts SET status = 'running', started_at = ?, owner_pid = 4800, owner_start_time = 'K', "
+        "lease_expires_at = ? WHERE run_id = ?",
+        (queue.to_ns(T0), queue.to_ns(T0 + timedelta(hours=1)), run_id),
+    )
+    host.procs[4800] = (False, None)
+    clock.advance(seconds=queue.ORPHAN_S + 1)
+    ledger.recover(clock.now)
+    want = sqlqueue.Status.FAILED if action == "fail" else sqlqueue.Status.READY
+    assert message_status(ledger, mid) == int(want)
+    assert ledger.receipt(run_id)["stop_reason"] == "owner_gone"

@@ -11,11 +11,13 @@ import io
 import json
 import os
 import shlex
+import signal
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+from helpers.procs import wait_gone
 
 from ws import __version__, approvals, cli, doctor, install, paths, policy, selfcmd, upgrade, userconfig
 from ws.adapters import claude_code
@@ -910,17 +912,6 @@ time.sleep(120)
 """
 
 
-def _alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    try:  # a zombie (killed, not yet reaped by init) counts as gone
-        return open(f"/proc/{pid}/stat").read().split(") ")[1][0] != "Z"
-    except OSError:
-        return True
-
-
 @pytest.mark.skipif(not hasattr(os, "killpg"), reason="process groups are POSIX")
 @pytest.mark.parametrize("capture", [False, True])
 def test_the_watchdog_stops_what_the_step_started_too(tmp_path, capture):
@@ -933,12 +924,44 @@ def test_the_watchdog_stops_what_the_step_started_too(tmp_path, capture):
     ran = upgrade._run([sys.executable, "-c", _SPAWNS, str(pidfile)], capture, timeout=2)
     assert ran.timed_out and ran.code == upgrade.EXIT_TIMEOUT
     assert time.monotonic() - t < 30
-    child = int(pidfile.read_text())
-    for _ in range(50):
-        if not _alive(child):
-            break
-        time.sleep(0.1)
-    assert not _alive(child)
+    assert wait_gone(int(pidfile.read_text())), "the step's child survived the watchdog"
+
+
+_SPAWNS_STUBBORN = """
+import os, subprocess, sys, time
+child = (
+    "import os, signal, sys, time\\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\\n"
+    "open(sys.argv[1] + '.tmp', 'w').write(str(os.getpid()))\\nos.replace(sys.argv[1] + '.tmp', sys.argv[1])\\n"
+    "time.sleep(120)"
+)
+subprocess.Popen([sys.executable, "-c", child, sys.argv[1]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+time.sleep(120)
+"""
+
+
+@pytest.mark.skipif(not hasattr(os, "killpg"), reason="process groups are POSIX")
+@pytest.mark.parametrize("capture", [False, True])
+def test_a_child_that_ignores_term_is_killed_even_once_the_step_has_gone(tmp_path, capture):
+    """The step dies on TERM; its child ignores TERM and holds no pipe, so nothing keeps the stop waiting for it. The
+    group still gets KILL after the grace, or the child would outlive the upgrade."""
+    import sys
+    import time
+
+    pidfile = tmp_path / "child.pid"
+    kw = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE, "text": True} if capture else {}
+    p = subprocess.Popen([sys.executable, "-c", _SPAWNS_STUBBORN, str(pidfile)], start_new_session=True, **kw)
+    try:
+        end = time.monotonic() + 30
+        while not pidfile.exists():  # the child is running and ignores TERM before the stop starts
+            assert time.monotonic() < end and p.poll() is None, "the step never started its child"
+            time.sleep(0.02)
+        upgrade._stop(p)
+    finally:
+        if p.poll() is None:
+            p.kill()
+            p.communicate()
+    assert p.returncode == -signal.SIGTERM  # the step itself went on the TERM
+    assert wait_gone(int(pidfile.read_text())), "the child that ignores TERM survived the stop"
 
 
 def test_a_step_that_exits_124_itself_is_a_failure_not_a_timeout(cutover, old, capsys, monkeypatch):

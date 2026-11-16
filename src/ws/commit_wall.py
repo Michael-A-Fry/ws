@@ -40,7 +40,7 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
-from ws import output, paths
+from ws import output, paths, selfcmd
 from ws.output import WsError
 
 COMMAND = "commit-wall"
@@ -275,7 +275,7 @@ def cmd_check(args: argparse.Namespace) -> int:
 def ws_argv() -> list[str]:
     """The command a hook runs for ws."""
     found = shutil.which("ws")
-    return [found] if found else [sys.executable, "-m", "ws"]
+    return [found] if found else selfcmd.argv()  # isolated, so a `ws/` folder in the repository is never run
 
 
 def _repo_id(repo: str) -> str:

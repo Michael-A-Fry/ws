@@ -2,8 +2,14 @@
 # Runs the checks CI runs, on your machine, before a push leaves it.
 # Turn it on once per clone:  git config core.hooksPath .github/hooks
 # Skip it for one push:       WS_SKIP_PREPUSH=1 git push
-# Run the suite through a wrapper: WS_PREPUSH_WRAP="your-lock-command --flag" git push (split on spaces; for a machine
-# that queues test runs, so a push's suite doesn't race the others). Unset, the suite runs as it is.
+# Which tests: those the change can affect (scripts/affected_tests.py); CI runs the whole suite on every pull request
+# and is required to merge. A change that maps to more than 40 test files, or touches a path that reaches every test
+# (pyproject.toml, uv.lock, a conftest.py, tests/plugins/, .github/), runs a capped set instead: the smoke set, every
+# changed or added test and the tests importing a changed module directly, stopped after WS_PREPUSH_CAP seconds
+# (default 300). Nothing mapped, or no usable selector, runs the smoke set, never zero.
+# WS_PREPUSH_FULL=1 runs the whole suite here (logged like a skip).
+# Run the tests through a wrapper: WS_PREPUSH_WRAP="your-lock-command --flag" git push (split on spaces; for a machine
+# that queues test runs, so a push's tests don't race the others). Unset, they run as they are.
 # A skip is never silent: it adds a line to .git/ws-prepush-skips.log (the log of the worktree's git dir).
 set -euo pipefail
 
@@ -14,9 +20,12 @@ cd "$top"
 # shellcheck disable=SC2046
 unset $(git rev-parse --local-env-vars)
 
+log="$(git rev-parse --git-path ws-prepush-skips.log)"
+branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
+stamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
 if [[ "${WS_SKIP_PREPUSH:-}" == "1" ]]; then
-  log="$(git rev-parse --git-path ws-prepush-skips.log)"
-  printf '%s skipped pre-push on %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(git rev-parse --abbrev-ref HEAD)" >>"$log"
+  printf '%s skipped pre-push on %s\n' "$stamp" "$branch" >>"$log"
   echo "pre-push: skipped because WS_SKIP_PREPUSH=1 (logged in $log)" >&2
   exit 0
 fi
@@ -28,9 +37,55 @@ wrap=()
 if [[ -n "${WS_PREPUSH_WRAP:-}" ]]; then
   read -r -a wrap <<<"$WS_PREPUSH_WRAP"
 fi
+
+smoke=(tests/test_cli.py tests/test_cli_registry.py tests/test_prepush_hook.py)
 suite=(uv run --locked pytest -q)
-if ((${#wrap[@]})); then
+limit=()
+kind="SELECT"
+targets=()
+
+if [[ "${WS_PREPUSH_FULL:-}" == "1" ]]; then
+  kind="FULL"
+  printf '%s full suite forced on %s (WS_PREPUSH_FULL=1)\n' "$stamp" "$branch" >>"$log"
+else
+  git fetch -q origin main 2>/dev/null || true
+  picked=""
+  if [[ -f scripts/affected_tests.py ]]; then
+    picked="$(python3 -I scripts/affected_tests.py --base origin/main 2>/dev/null)" || picked=""
+  fi
+  head_line="$(head -n1 <<<"$picked")"
+  case "$head_line" in
+    SELECT | SMOKE | CAPPED*)
+      kind="$head_line"
+      # a while loop, not mapfile: macOS ships bash 3.2, which has no mapfile
+      while IFS= read -r line; do
+        [[ -n "$line" ]] && targets+=("$line")
+      done < <(tail -n +2 <<<"$picked")
+      ;;
+    *)
+      echo "pre-push: no usable selection (${head_line:-no selector}); running the smoke set" >&2
+      kind="SMOKE"
+      ;;
+  esac
+  count="${#targets[@]}"
+  if [[ "$count" == 0 ]]; then
+    targets=("${smoke[@]}")
+  fi
+  suite+=("${targets[@]}")
+  if [[ "$kind" == CAPPED* ]] && command -v timeout >/dev/null 2>&1; then
+    limit=(timeout "${WS_PREPUSH_CAP:-300}")
+  fi
+  echo "pre-push: $kind: ${#targets[@]} test file(s); CI runs the whole suite (WS_PREPUSH_FULL=1 runs it here)" >&2
+fi
+
+if [[ "${#wrap[@]}" != 0 ]]; then
   suite=("${wrap[@]}" "${suite[@]}")
 fi
 echo "pre-push: ${suite[*]}" >&2
-"${suite[@]}" >&2
+rc=0
+"${limit[@]+"${limit[@]}"}" "${suite[@]}" >&2 || rc=$?
+if [[ "$rc" == 124 && "${#limit[@]}" != 0 ]]; then
+  echo "pre-push: stopped the capped set after ${WS_PREPUSH_CAP:-300} s with no failure; CI runs the rest" >&2
+  rc=0
+fi
+exit "$rc"

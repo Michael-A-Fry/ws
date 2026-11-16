@@ -53,6 +53,10 @@ body of the GitHub release.
 
 ### Fixed
 
+- The launchd scheduler switches off only the agents it loaded. Each plist now carries `WsWrittenBy: ws`, and
+  `ws schedule`, `ws uninstall` and `ws schedule apply` boot out a `ws.job.*` label only when `launchctl print` shows
+  it was loaded from a plist under `jobs/units/` or one with that key. A label someone else loaded is left alone and
+  named in the problems, as the systemd scheduler already does with a unit it didn't write.
 - The command reader's time limit counts its own CPU time, not the wall clock, so a busy or slow machine (a CI runner,
   WSL2) no longer refuses an ordinary long command, such as `touch f{1..4000}`, as too slow to read. The wall clock still
   stops a read that waits, at three times the limit.

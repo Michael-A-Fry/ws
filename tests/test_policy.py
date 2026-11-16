@@ -2399,3 +2399,24 @@ def test_ssh_through_sshpass_a_quoted_file_list_or_a_hidden_askpass_is_denied(po
 def test_sshpass_with_bundled_flags_still_runs_a_plain_ssh(pol, home):
     assert policy.is_denied_command(pol, "sshpass -vp pw ssh -p 22 h uptime") is None
     assert policy.is_denied_command(pol, "export X=1; ssh h ls") is None
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "sshpass -p pw env -S 'SSH_ASKPASS=/tmp/x ssh h ls'",
+        "env -S 'SSH_ASKPASS=/tmp/x ssh h ls'",
+        "sshpass -p pw env SSH_ASKPASS_REQUIRE=force ssh h ls",
+        "slogin -oProxyCommand=bash h",
+        "sshpass -p pw slogin -oProxyCommand=bash h",
+        "read -r SSH_ASKPASS_REQUIRE < /tmp/f; export SSH_ASKPASS_REQUIRE; ssh h ls",
+        "export SSH_ASKPASS_REQUIRE=force; ssh h ls",
+    ],
+)
+def test_ssh_by_another_name_or_an_askpass_set_any_way_is_denied(pol, home, cmd):
+    assert policy.is_denied_command(pol, cmd)
+
+
+def test_slogin_and_an_env_string_with_a_plain_ssh_still_run(pol, home):
+    assert policy.is_denied_command(pol, "slogin -p 22 h uptime") is None
+    assert policy.is_denied_command(pol, "env -S 'LC_ALL=C ssh h ls'") is None

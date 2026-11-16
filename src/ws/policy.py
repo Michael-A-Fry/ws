@@ -2234,7 +2234,10 @@ def _segment_once(
         ctx.vars = {**(ctx.vars or {}), words[1]: words[-1]}  # what the variable holds once the loop is done
     nested: list[str] = []
     dropped: list[str] = []
-    toks, wrappers = shellwords.strip_wrappers(words, lexenv=env, budget=ctx.budget, dropped=dropped, scripts=nested)
+    set_env: list[str] = []  # the NAME=value words set for the command: a prefix, `env`, an `env -S` string
+    toks, wrappers = shellwords.strip_wrappers(
+        words, set_env, lexenv=env, budget=ctx.budget, dropped=dropped, scripts=nested
+    )
     held = _targets(toks) & (set(ctx.vars or {}) | set(ctx.loops or {}) | set(ctx.unknown) | _SSH_ENV)
     if held:  # read X / let X=.. after X held a value (or set ssh's askpass): which value it has now isn't followed
         _mark_names(ctx, held)
@@ -2287,7 +2290,7 @@ def _segment_once(
         return ssh_why, line, []
     if ssh_toks is not None:
         ssh_opts, ssh_host, ssh_remote = _ssh_argv(ssh_toks)
-        if reason := _ssh_refusal(policy, ctx, ssh_opts, [*words[: max(0, len(words) - len(toks))], *ssh_prefix]):
+        if reason := _ssh_refusal(policy, ctx, ssh_opts, [*set_env, *ssh_prefix]):
             return reason, line, []
         cut, here = _ssh_remote(policy, seg, ssh_opts, ssh_host, ssh_remote, wrappers | ({cmd} - {"ssh"}), redirs)
         if here:  # a remote command to this machine runs outside the wall: judged as the local command it is
@@ -2529,8 +2532,9 @@ _SSH_PLAIN = (  # ssh_config(5) keywords that run nothing on this machine (lower
 )
 _SSH_KEYS = frozenset((*_SSH_FILE_KEYS, *_SSH_PLAIN.split()))
 _SSH_OPTION = re.compile(r"\s*([A-Za-z0-9]+)\s*(?:=\s*|\s+|\Z)(.*)", re.DOTALL)
+_SSH_NAMES = frozenset(("ssh", "slogin"))  # slogin is ssh under another name
 _SSH_ENV = frozenset(("SSH_ASKPASS", "SSH_ASKPASS_REQUIRE"))  # an askpass setting: a program ssh runs
-_SSH_ASKPASS = re.compile(r"SSH_ASKPASS(?:_REQUIRE)?=")
+_SSH_ASKPASS = re.compile(r"SSH_ASKPASS")  # any word that sets an askpass name, however it is spelled
 _SSH_HOST = re.compile(r"(?:ssh://)?(?:[^@/]*@)?(\[[^\]]*\]|[^:/]*)")
 _SSH_RENAMES = re.compile(
     r"\s*canonicali[sz]ehostname|\s*canonicaldomains", re.IGNORECASE
@@ -2659,7 +2663,7 @@ def _ssh_toks(
     """ssh's words when this command runs ssh (ssh itself, `autossh` with its own `-M` taken off, or the ssh `sshpass`
     runs, wrappers and all), the words a wrapper set ahead of it, and a refusal for an sshpass whose program is not an
     ssh ws can read. (None, [], None) for any other command."""
-    if cmd == "ssh":
+    if cmd in _SSH_NAMES:
         return toks, [], None
     if cmd not in _SSH_WRAPPERS:
         return None, [], None
@@ -2678,9 +2682,10 @@ def _ssh_toks(
     if cmd == "autossh":
         return ["ssh", *out, *toks[i:]], [], None
     rest = toks[i:]
-    inner, _ = shellwords.strip_wrappers(rest, lexenv=env, budget=budget, scripts=[]) if rest else ([], set())
-    if inner and inner[0] == "ssh":
-        return inner, rest[: max(0, len(rest) - len(inner))], None
+    assigns: list[str] = []  # what a wrapper sets for the program, `env -S` strings included
+    inner = shellwords.strip_wrappers(rest, assigns, lexenv=env, budget=budget, scripts=[])[0] if rest else []
+    if inner and inner[0] in _SSH_NAMES:
+        return inner, [*assigns, *rest[: max(0, len(rest) - len(inner))]], None
     return None, [], "sshpass runs a program ws does not read here; run ssh under sshpass directly, or use a key"
 
 
@@ -2688,7 +2693,7 @@ def _ssh_refusal(policy: Policy, ctx: _Ctx, opts: list[tuple[str, str]], prefix:
     """A refusal for an ssh option that runs or loads a local program or file, names a path deny_read covers, or
     writes to a path ws protects."""
     how = "; connect without it (put what it is for in a script file and run that)"
-    held = "SSH_ASKPASS" in (ctx.vars or {}) or "SSH_ASKPASS" in ctx.unknown or ctx.distrust
+    held = bool(_SSH_ENV & (set(ctx.vars or {}) | set(ctx.unknown))) or ctx.distrust
     if held or any(_SSH_ASKPASS.match(w) for w in prefix):
         return f"ssh may be given an askpass program, which runs on this machine and ws cannot read{how}"
     for letter, value in opts:

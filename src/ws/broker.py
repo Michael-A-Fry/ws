@@ -541,6 +541,8 @@ class Audit:
             "status": status,
             "bytes": f.get("bytes"),
         }
+        if isinstance(f.get("leases"), int) and not isinstance(f.get("leases"), bool):
+            rec["leases"] = f["leases"]  # open leases of that name, this one included
         line = (json.dumps(rec, ensure_ascii=True) + "\n").encode()
         try:
             with self._lock:
@@ -574,6 +576,22 @@ class _Grant:
     area: str | None = None
     tier: str | None = None
     elevated: bool = False
+    issued: float = 0.0  # when the lease was given: the registry's `ttl`, read fresh, counts from here
+
+
+PLAIN_PATH_RE = re.compile(r"^/[A-Za-z0-9._~/-]*$")
+
+
+def path_allowed(prefixes: tuple[str, ...], path: str) -> bool:
+    """True when the proxy may forward `path` for a name that lists `prefixes` (none listed: any path). With a list, the
+    whole path must be plain (letters, digits and `._~/-`: no `%`, `;`, backslash or control character, which a server
+    may read as a `..` or a slash), have no `.` or `..` part, and sit under a prefix on a folder boundary (`/v1` allows
+    `/v1` and `/v1/x`, not `/v1x`)."""
+    if not prefixes:
+        return True
+    if not PLAIN_PATH_RE.match(path) or any(p in (".", "..") for p in path.split("/")):
+        return False
+    return any(path == pre.rstrip("/") or path.startswith(pre if pre.endswith("/") else pre + "/") for pre in prefixes)
 
 
 @dataclass
@@ -866,7 +884,8 @@ class Broker:
         except wsecrets.SecretsError as e:
             return refuse("store_unreadable", str(e))
         token = base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip("=")
-        expires = now + min(float(ttl), self.max_ttl_s) if ttl is not None else now + self.max_ttl_s
+        limit = min(self.max_ttl_s, entry.ttl) if entry.ttl is not None else self.max_ttl_s  # the secret's own limit
+        expires = now + min(float(ttl), limit) if ttl is not None else now + limit
         if rec is not None and rec.expires_at is not None:
             expires = min(expires, rec.expires_at)  # a lease never outlives its run
         grant = _Grant(
@@ -882,13 +901,15 @@ class Broker:
             area=rec.area if rec is not None else None,
             tier=rec.tier if rec is not None else None,
             elevated=entry.elevated,
+            issued=now,
         )
         with self._lock:
             self._purge(now)
             if len(self._grants) >= MAX_LEASES:
                 return refuse("busy", "too many open leases; release some")
             self._grants[_key(token)] = grant
-        if not self.audit.write("request", "ok", lease=grant.id, **log):
+            open_now = sum(1 for g in self._grants.values() if g.name == name)  # this lease included
+        if not self.audit.write("request", "ok", lease=grant.id, leases=open_now, **log):
             with self._lock:
                 self._grants.pop(_key(token), None)
             return _refuse("audit_failed", "the grant could not be written to the audit log, so it is not given")
@@ -1257,7 +1278,7 @@ class Broker:
                 raise _HttpError(403, "expired")
             return g
 
-    def credential(self, g: _Grant) -> tuple[str, str]:
+    def credential(self, g: _Grant, path: str = "/") -> tuple[str, str]:
         """(header name, header value) for a grant, read fresh so a removed or changed secret takes effect at once."""
         try:
             entry = wsecrets.load_registry(self.registry).get(g.name)
@@ -1265,6 +1286,10 @@ class Broker:
             raise _HttpError(503, "store_unreadable") from e
         if entry is None or entry.kind != "header" or g.host not in entry.hosts:
             raise _HttpError(403, "host_not_allowed")
+        if not path_allowed(entry.paths, path):  # the registry as it is now: a tightened list bites open leases too
+            raise _HttpError(403, "path_not_allowed")
+        if entry.ttl is not None and self.clock() >= g.issued + entry.ttl:
+            raise _HttpError(403, "expired")  # a shortened ttl ends open leases at once
         if (g.elevated or entry.elevated) and not self.elevation_on():
             raise _HttpError(403, "elevation_off")
         if g.run is None and entry.scoped:
@@ -1451,7 +1476,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             if not m:
                 raise _HttpError(404, "not_found")
             grant = b.grant_for(m.group(1))
-            header, value = b.credential(grant)
+            header, value = b.credential(grant, m.group(2) or "/")
             target = (m.group(2) or "/") + (f"?{query}" if query else "")
             body = self._read_body()
             self._deadline.cancel()  # the request is in; the reply may take as long as the model does

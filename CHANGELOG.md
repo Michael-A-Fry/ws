@@ -36,6 +36,8 @@ body of the GitHub release.
   is recorded as the reaper records one: `outcome_unknown`, under its own run id, with its real duration.
 - When a drain unit's kill cuts off a queued run it was running, `ws watch alert` lets the queue's notice, which names
   the cut-off job, stand in for the unit's own push. Any other drain failure is pushed as before.
+- CI's macOS core-tier time budget is back to 900 s, the same as Linux. A tier over its budget now warns and only a run
+  past twice the budget fails, so macOS warns over 900 s and fails over 1800 s, as before.
 - The pre-push cap on a capped set grows with the set: 6 s a file, at least 300 s and at most 1800 s, so a large
   selection doesn't hit 300 s with no failure. `WS_PREPUSH_CAP` still sets it, and the timeout message names it.
 - The pre-push hook runs the tests through `ws-test --light --mem 3G --node local --` (6G with e2e tests or over 40
@@ -109,6 +111,8 @@ body of the GitHub release.
   no folder name and none of the runner's words, whatever `alert_text` says.
 - In the decision log, a refusal the wall makes redundant, refused because the wall wasn't proven, now has the layer
   `rule:unknown-command-word`, `rule:sets-ifs` or `rule:unread-write` where it was `rule:command`.
+- A test tier over its time budget now warns (a summary line, and a `::warning::` on GitHub Actions); only a tier past
+  twice its budget fails the run in CI, so a slow runner can't turn a green suite red.
 
 ### Fixed
 

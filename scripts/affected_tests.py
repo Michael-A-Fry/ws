@@ -128,6 +128,15 @@ def deps(mod: str) -> frozenset[str]:
     return frozenset(imports_of(tree, mod, path.name == "__init__.py")) - {mod}
 
 
+@cache
+def scanned_packages() -> frozenset[str]:
+    """Packages whose `__init__` finds its modules by scanning the folder (`importlib.import_module`): importing the
+    package reaches every module in it, which no import line shows."""
+    return frozenset(
+        m for m, p in src_modules().items() if p.name == "__init__.py" and "import_module(" in p.read_text("utf-8")
+    )
+
+
 def closure(roots: set[str]) -> set[str]:
     seen: set[str] = set()
     todo = list(roots)
@@ -137,6 +146,10 @@ def closure(roots: set[str]) -> set[str]:
             continue
         seen.add(m)
         todo.extend(deps(m))
+        if m in scanned_packages():
+            todo.extend(x for x in src_modules() if x.startswith(m + "."))
+        if m == "ws.cli":  # cli.py scans the top-level modules for commands
+            todo.extend(command_modules())
         parent = m.rpartition(".")[0]
         if parent in src_modules():  # importing ws.a.b runs ws/a/__init__.py
             todo.append(parent)
@@ -168,6 +181,8 @@ def test_info(path: Path) -> tuple[str, set[str], set[str]]:
             and re.search(rf"\b{re.escape(helper.stem)}\b", text)
         ):
             roots |= imports_of(ast.parse(helper.read_text(encoding="utf-8")), helper.stem, False)
+    if CLI_MARKERS.search(text):  # a test that spawns the CLI reaches what cli.py reaches, with every command module
+        roots |= {"ws.cli", "ws.__main__"} & set(src_modules())
     return text, closure(roots), roots
 
 

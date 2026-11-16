@@ -34,6 +34,8 @@ RAW = {
     "schedule.script": "runs the job's reviewed script: the script's own output and exit code",
     "usage.statusline": "a statusline command Claude Code pipes JSON to: one line of its own, no envelope",
     "walls.edit": "opens $EDITOR on a copy of the policy: the terminal is the editor's",
+    "connector.audit": "a hook: the runner reads its stderr and exit code",
+    "connector.launch": "hands the terminal to the runner",
 }
 
 # What to run for each of the others (in a throwaway HOME): enough to get a real answer or a typed error.
@@ -73,6 +75,7 @@ CASES: dict[str, list[str]] = {
     "memory.reindex": ["memory", "reindex"],
     "run": ["run", "nojob", "--dry-run"],
     "runs": ["runs"],
+    "connector.list": ["connector", "list"],
     "globals.check": ["globals", "check", "--repo", "{home}"],
     "globals.manifest": ["globals", "manifest"],
     "install": ["install", "--dry-run", "--notes", "{home}/Notes"],

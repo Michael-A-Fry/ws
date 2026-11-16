@@ -39,7 +39,8 @@ python3 scripts/ci_time_budget.py --job NAME --stamp "$RUNNER_TEMP/job-start" --
 
 and prints how much of the limit the job used. Above 75% it prints a `::warning`, which shows on the run's summary page.
 It never fails a job. A missing, empty or unreadable stamp prints one line and exits 0. `--tiers PATH` adds one line for
-each tier of the harness's time report ([Testing](testing.md)).
+each tier of the harness's time report ([Testing](testing.md)). The tier budgets themselves are the harness's: a tier
+over its budget warns, and only one past twice it fails the test step ([Testing](testing.md#tiers-and-the-time-report)).
 
 `N` is a second copy of the job's own `timeout-minutes`. The two have to agree, or the warning is measured against a
 window the runner doesn't use. `tests/test_ci_time_budget.py` reads `ci.yml` as text and fails if they differ, and

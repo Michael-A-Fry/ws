@@ -118,8 +118,11 @@ every test in a tier, and appends one line per tier that ran.
 The budgets are initial values and generous on purpose: w3-ci-budget tunes them from the report. Set them with the ini
 options `ws_tier_budget_core`, `ws_tier_budget_gate` and `ws_tier_budget_nightly` (seconds, zero or more).
 
-A tier over its budget prints a line in the summary. The run fails (exit code 1) only when the `CI` environment variable
-is set and isn't empty, `0` or `false` (any case). A partial run (one file, `-k`) adds up only what it ran.
+A tier over its budget is a warning: a line in the summary and, when `GITHUB_ACTIONS` is `true`, a `::warning::`
+annotation on the run. Only a tier past twice its budget (`OVER_FAIL_FACTOR`) fails the run (exit code 1), and only
+when the `CI` environment variable is set and isn't empty, `0` or `false` (any case). A slow runner on a busy day
+can't turn a green suite red; a real 2x slowdown still does. A budget of `0` fails any time spent. A partial run (one
+file, `-k`) adds up only what it ran.
 
 ### Where the files go
 

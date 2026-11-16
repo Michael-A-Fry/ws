@@ -31,6 +31,7 @@ Apply the safety rules:
 - [Use the wall](how-to/use-the-wall.md): start a session in a sandbox.
 - [Approve a command](how-to/approve-a-command.md): let a command run once, with your yes.
 - [Store a secret](how-to/store-a-secret.md): keep a key where an agent can't read it.
+- [Plug in a zone MCP server](how-to/plug-in-zone-mcp.md): give one agent a service's tools, read-only and logged.
 - [Apply the Rule of Two](how-to/apply-the-rule-of-two.md): refuse a job that could leak private data.
 - [Set up a class user](how-to/set-up-a-class-user.md): give a data class its own operating-system account.
 - [Set a budget](how-to/set-a-budget.md): cap monthly spend.

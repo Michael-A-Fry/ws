@@ -184,7 +184,7 @@ _KIND_TOOLS = {
     "search": ("Grep", "Glob"),
     "tool": ("WebFetch", "WebSearch"),
     "write": ("Edit", "Write", "MultiEdit", "NotebookEdit"),
-    "agent": ("Agent", "Task"),
+    "agent": ("Agent", "Task", "Workflow"),
     "skill": ("Skill",),
     "message": ("SendMessage",),
 }
@@ -653,8 +653,10 @@ def parse(payload: dict) -> Call | list[Call] | None:
         return Call.of("write", _text(inp, "file_path"), tool=name, **_write_data(name, inp))
     if name == "NotebookEdit":
         return Call.of("write", _text(inp, "notebook_path"), tool=name, **_write_data(name, inp))
-    if name in ("Agent", "Task"):
-        found = {k: inp[k] for k in ("prompt", "description", "subagent_type") if isinstance(inp.get(k), str)}
+    if name in ("Agent", "Task", "Workflow"):  # a workflow starts agents too; `isolation` says where they work
+        found = {
+            k: inp[k] for k in ("prompt", "description", "subagent_type", "isolation") if isinstance(inp.get(k), str)
+        }
         return Call.of("agent", found.get("subagent_type", ""), tool=name, **found)
     if name == "Skill":
         skill = inp.get("skill") if isinstance(inp.get("skill"), str) else _optional(inp, "name") or ""

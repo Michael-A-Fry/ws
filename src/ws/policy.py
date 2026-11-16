@@ -544,6 +544,9 @@ write_outside_project = false
 #   presence         records in the session registry whether a session is busy or idle, from the hooks it already runs
 #   pane-close       closes a tmux window or pane by id only when the registry says it is idle (the lead), or it is the
 #                    session's own pane after its hand-over was delivered
+#   config-guard     denies an edit of a file or folder you list (`paths`) unless the session is in one of its `owners`
+#                    folders (or you approve it once); does nothing until you name the paths
+#   guard-launch     denies starting a workflow, or an agent that asks for a worktree, from anywhere but the main checkout
 [guards]
 on = ["syntax-check", "session-context", "dev-server"]
 # Any guard takes `mode = "enforce"` (the default) or `mode = "log"`. In log, a call the guard would refuse is allowed and

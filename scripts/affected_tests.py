@@ -21,7 +21,7 @@ import ast
 import re
 import subprocess
 import sys
-from functools import lru_cache
+from functools import cache
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -70,7 +70,7 @@ def module_of(path: Path) -> str:
     return ".".join(parts)
 
 
-@lru_cache(maxsize=None)
+@cache
 def src_modules() -> dict[str, Path]:
     return {module_of(p): p for p in SRC.rglob("*.py")}
 
@@ -103,7 +103,7 @@ def imports_of(tree: ast.AST, here: str, is_pkg: bool) -> set[str]:
     return out
 
 
-@lru_cache(maxsize=None)
+@cache
 def deps(mod: str) -> frozenset[str]:
     """Direct ws imports of one src module."""
     path = src_modules()[mod]
@@ -126,10 +126,10 @@ def closure(roots: set[str]) -> set[str]:
     return seen
 
 
-@lru_cache(maxsize=None)
+@cache
 def command_modules() -> frozenset[str]:
     return frozenset(
-        m for m, p in src_modules().items() if re.search(r'^COMMAND = "', p.read_text(encoding="utf-8"), re.M)
+        m for m, p in src_modules().items() if re.search(r'^COMMAND = "', p.read_text(encoding="utf-8"), re.MULTILINE)
     )
 
 
@@ -190,9 +190,9 @@ def select(mod: list[str], added: list[str], gone: list[str]) -> tuple[str, list
         if changed_mods & reach:
             chosen.add(rel[t])
         for m in changed_mods:  # what imports cannot see (a CLI test, a scanned folder): tests that name the module
-            if CLI_MARKERS.search(text) or m in command_modules() or m.count(".") > 1:
-                if re.search(rf"\b{re.escape(m.rpartition('.')[2])}\b", text):
-                    chosen.add(rel[t])
+            by_word = CLI_MARKERS.search(text) or m in command_modules() or m.count(".") > 1
+            if by_word and re.search(rf"\b{re.escape(m.rpartition('.')[2])}\b", text):
+                chosen.add(rel[t])
         for p in other:
             if any(w in text for w in words_for(p)):
                 chosen.add(rel[t])
@@ -209,7 +209,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         mod, added, gone = (a.files, [], []) if a.files is not None else changed(a.base)
         kind, tests = select(mod, added, gone)
-    except Exception as e:  # the hook treats any failure as "run everything"; say why
+    except Exception as e:  # noqa: BLE001  the hook treats any failure as "run everything"; say why
         print(f"FULL: selector error: {type(e).__name__}: {e}")
         return 0
     print(kind)

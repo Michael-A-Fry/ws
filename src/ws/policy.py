@@ -118,6 +118,7 @@ import re
 import sys
 import tomllib
 import unicodedata
+import urllib.parse
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
@@ -359,6 +360,31 @@ class Autonomy:
 
 
 @dataclass(frozen=True)
+class Connector:
+    """A zone's MCP server ws may plug into a session that names it (`[connectors.NAME]`; ws.connectors wires it).
+
+    `name` is the MCP server name, so its tools reach the runner as `mcp__NAME__TOOL`. Exactly one of `url` (http or
+    https; streamable HTTP) or `command` (a stdio server: argv). `cls` is the data class of what it returns ("" = none):
+    a session whose class may not read that class is refused it. `read_only` (the default) refuses a tool whose name
+    says it changes something, and the `*` wildcard. `token` is the name of a secret the broker holds, never a value; the
+    runner reaches the server through a broker lease, so it never holds the token. `tools` is the allowlist, bare names:
+    the gate allows `mcp__NAME__TOOL` for each one (as if `[gate] allow_mcp` named it), and every other tool of the
+    server is refused by the connector's own hook."""
+
+    name: str
+    url: str
+    command: tuple[str, ...]
+    cls: str
+    read_only: bool
+    token: str
+    tools: tuple[str, ...]
+    description: str = ""
+
+    def tool_names(self) -> tuple[str, ...]:
+        return tuple(f"mcp__{self.name}__{t}" for t in self.tools)
+
+
+@dataclass(frozen=True)
 class Policy:
     schema: int
     dial: str
@@ -371,6 +397,9 @@ class Policy:
     budget_purposes: dict[str, float] = field(default_factory=dict)  # purpose -> monthly USD cap (UTC calendar month)
     autonomy: Autonomy = Autonomy()
     egress_exceptions: tuple[EgressException, ...] = ()
+    connectors: dict[str, Connector] = field(
+        default_factory=dict
+    )  # [connectors.NAME]: zone MCP servers (ws.connectors)
 
 
 @dataclass(frozen=True)
@@ -663,6 +692,7 @@ def loads(text: str) -> Policy:
             "budget",
             "autonomy",
             "egress_exceptions",
+            "connectors",
         },
     )
     schema = raw.get("schema", SCHEMA)
@@ -774,6 +804,11 @@ def loads(text: str) -> Policy:
         expires = _expires(e["expires"], where) if "expires" in e else None
         exceptions.append(RuleException(e["name"], e["job"], covered, e["reason"], owner, expires))
     classes = _classes(raw.get("classes", {}))
+    connectors = _connectors(raw.get("connectors", {}), classes)
+    if connectors:  # a connector's tools are allowed by the gate as if `allow_mcp` named them (deny_tools still wins)
+        base = gate.allow_mcp if gate.allow_mcp is not None else MCP_SHIPPED
+        derived = tuple(t for c in connectors.values() for t in c.tool_names())
+        gate = replace(gate, allow_mcp=tuple(dict.fromkeys([*base, *derived])))
     return Policy(
         schema,
         dial,
@@ -786,7 +821,71 @@ def loads(text: str) -> Policy:
         _purposes(raw.get("budget", {})),
         _autonomy(raw.get("autonomy", {})),
         _egress_exceptions(raw.get("egress_exceptions", []), classes),
+        connectors,
     )
+
+
+# A tool name a read-only connector may not allow: one whose words say it changes something.
+_WRITE_VERBS = frozenset(
+    {
+        *("write", "create", "update", "delete", "remove", "set", "put", "post", "send", "insert", "drop", "exec"),
+        *("execute", "run", "move", "rename", "patch", "edit", "add", "upsert", "replace", "import", "transfer"),
+        *("pay", "approve", "cancel"),
+    }
+)
+_TOOL_NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
+_SECRET_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")  # as ws.secrets NAME_RE
+
+
+def _connectors(raw, classes: dict[str, Class]) -> dict[str, Connector]:
+    """`[connectors.NAME]`: each table is checked whole, against the classes already read. See `Connector`."""
+    if not isinstance(raw, dict):
+        raise PolicyError("[connectors] must be a table of tables")
+    out: dict[str, Connector] = {}
+    for name, body in raw.items():
+        where = f"[connectors.{name}] "
+        if not NAME_PATTERN.match(name) or "__" in name or name == "ws":
+            raise PolicyError(
+                f"[connectors]: {name!r} is not a usable server name (letters, digits, _ and -, no __, not ws)"
+            )
+        body = _table(body, where.strip(), {"url", "command", "class", "read_only", "token", "tools", "description"})
+        url = _get(body, "url", str, where, "")
+        command = _strings(body, "command", where)
+        if bool(url) == bool(command):
+            raise PolicyError(f"{where}give exactly one of url (an http or https address) or command (a list)")
+        if url:
+            u = urllib.parse.urlsplit(url)
+            if u.scheme not in ("http", "https") or not u.hostname or u.username or u.password or u.fragment:
+                raise PolicyError(f"{where}url must be http:// or https://, with a host and no user or #fragment")
+        token = _get(body, "token", str, where, "")
+        if token and not url:
+            raise PolicyError(f"{where}token is for a url connector; a command connector looks after its own auth")
+        if token and not _SECRET_NAME.match(token):
+            raise PolicyError(
+                f"{where}token must be a secret's name (a letter, then letters, digits, _ and -), never a value"
+            )
+        if token and urllib.parse.urlsplit(url).scheme == "http" and urllib.parse.urlsplit(url).hostname != "127.0.0.1":
+            raise PolicyError(f"{where}a token goes only over https (or to 127.0.0.1): use an https url")
+        cls = _get(body, "class", str, where, "")
+        if cls and cls not in classes:
+            raise PolicyError(f"{where}class: unknown class {cls!r} (name one from [classes])")
+        read_only = _get(body, "read_only", bool, where, True)
+        tools = _strings(body, "tools", where)
+        if not tools:
+            raise PolicyError(f"{where}tools must name at least one tool the connector may call")
+        for t in tools:
+            if not (_TOOL_NAME.match(t) or (not read_only and t == "*")):
+                raise PolicyError(f"{where}tools: {t!r} is not a tool name (letters, digits, _ . -)")
+            words = {w.lower() for w in re.split(r"[^A-Za-z0-9]+|(?<=[a-z])(?=[A-Z])", t) if w}
+            if read_only and words & _WRITE_VERBS:
+                raise PolicyError(
+                    f"{where}tools: {t!r} sounds like it changes something, and the connector is read_only "
+                    "(set read_only = false to allow it, as a reviewed change)"
+                )
+        out[name] = Connector(
+            name, url, command, cls, read_only, token, tools, _get(body, "description", str, where, "")
+        )
+    return out
 
 
 def _egress_exceptions(raw, classes: dict[str, Class]) -> tuple[EgressException, ...]:

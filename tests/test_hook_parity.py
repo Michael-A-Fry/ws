@@ -510,10 +510,17 @@ def test_parity_env_file_write(box):
     the operands of a writing command by file name, so quoting, a heredoc, a variable on the line, a trailing redirect or
     a second `tee` operand change nothing. `notes.env` and an option's value `prod.env` are not writes to it. Not covered:
     an interpreter that opens the file itself (`python3 -c "open('.env', 'w')"`)."""
+    # The default policy also refuses to READ `.env` (deny_read), so a command like `grep KEY .env` is refused for that
+    # reason, not this one. The free cases are about the write rule alone: they run under a policy with no read rules.
+    no_read_rules = "[gate]\ndeny_read = []\n"
     for command in ENV_DENIED:
         assert hook(box, None, call("Bash", command=command)) == gate.DENY, command
+        assert hook(box, no_read_rules, call("Bash", command=command)) == gate.DENY, command  # the write rule alone
     for command in ENV_ALLOWED:
-        assert hook(box, None, call("Bash", command=command)) == 0, command
+        assert hook(box, no_read_rules, call("Bash", command=command)) == 0, command
+    # and the default policy still refuses the read of the secret file, by its own rule. It is passed as text: a policy
+    # file written by the calls above is what a call with no policy would read from this test's home.
+    assert hook(box, policy.default_toml(), call("Bash", command="grep KEY .env")) == gate.DENY
 
 
 @needs_git

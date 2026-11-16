@@ -11,7 +11,7 @@ DOC = Path(__file__).parent.parent / "docs" / "how-to" / "store-a-secret.md"
 
 
 def _block() -> str:
-    m = re.search(r"## Check them on a schedule.*?```toml\n(.*?)```", DOC.read_text(encoding="utf-8"), re.S)
+    m = re.search(r"## Check them on a schedule.*?```toml\n(.*?)```", DOC.read_text(encoding="utf-8"), re.DOTALL)
     assert m, "the how-to has lost its scheduled-audit job"
     return m.group(1)
 

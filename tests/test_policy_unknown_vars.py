@@ -113,7 +113,7 @@ def test_common_lines_with_those_commands_are_still_allowed(pol, cmd):
     [
         "source ~/.bashrc; ls $HOME",
         ". venv/bin/activate; cd $HOME/proj",
-        "source .env && cd ~ && ls",
+        "source ./vars.sh && cd ~ && ls",
         "source ./f; cat ~/notes.txt",
     ],
 )
@@ -139,3 +139,9 @@ def test_on_a_case_insensitive_platform_path_rules_match_without_regard_to_case(
         denied = policy.is_denied_command(policy.default_policy(), "cat ~/.SSH/ID_RSA", cwd="/tmp")
         assert bool(denied) is caseless, caseless
     policy._rules.cache_clear()
+
+
+def test_sourcing_a_denied_env_file_is_refused_for_the_denied_path_first(pol):
+    # `.env` is in the default deny_read, and that reason is the one to give: the person fixes it by not reading the file
+    why = policy.is_denied_command(pol, "source .env && cd ~ && ls", cwd="/tmp")
+    assert why and "deny_read" in why and "'.env'" in why

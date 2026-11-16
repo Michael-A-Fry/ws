@@ -2103,7 +2103,7 @@ def _segment(policy: Policy, seg: str, ctx: _Ctx, in_pipe: bool, cands: list[str
     return None, last[0], nested
 
 
-_APPEND = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\+=")
+_APPEND = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)(?:\[[^]]*\]\+?|\+)=")  # X+=, X[k]=, X[k]+=: not followed
 _NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _BLOCK_WORDS = ("do", "then", "else", "elif", "{", "(", "!", "time", "if", "while", "until")
 

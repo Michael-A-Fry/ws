@@ -2220,3 +2220,29 @@ def test_assign_name_takes_off_the_plus():
     assert shellwords.ASSIGN.match("A+=1") and shellwords.ASSIGN.match("A=1")
     assert not shellwords.ASSIGN.match("+=1") and not shellwords.ASSIGN.match("A++=1")
     assert shellwords.assign_name("A+=1") == "A" == shellwords.assign_name("A=x=y")
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "A[0]=1 git push --force origin main",
+        "A[0]+=1 git push --force origin main",
+        "A[k]=1 git push --force origin main",
+        "A['k']=1 git push --force origin main",
+        "B=2 A[0]=1 git push --force origin main",
+        "env a.b=1 git push --force origin main",
+        "env a-b=1 git push --force origin main",
+        "env -- A=1 git push --force origin main",
+        "env -- a.b=1 git push --force origin main",
+        "sudo a.b=1 git push --force origin main",
+        "sudo -u root a-b=1 rm -rf /",
+    ],
+)
+def test_a_subscript_or_any_env_setting_ahead_of_a_command_is_an_assignment(pol, home, cmd):
+    assert policy.is_denied_command(pol, cmd)
+
+
+def test_assign_name_takes_off_a_subscript():
+    assert shellwords.assign_name("A[0]+=1") == "A" == shellwords.assign_name("A[k=v]=1")
+    assert policy.is_denied_command(policy.default_policy(), "A[0]=1 git status") is None
+    assert policy.is_denied_command(policy.default_policy(), "env a.b=1 git status") is None

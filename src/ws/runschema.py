@@ -89,6 +89,12 @@ SCHEMA: dict = {
         "purpose",
         "stop_reason",
         "reservation",
+        "stop_subtype",
+        "fault",
+        "retry_after_s",
+        "approval",
+        "run_key",
+        "chain_depth",
     ],
     "properties": {
         "schema": {
@@ -131,10 +137,12 @@ SCHEMA: dict = {
             "description": "The runner's exit code. Null if it never ran or was killed.",
         },
         "status": {
-            "enum": ["ok", "error", "timeout", "refused", "preempted", "expired"],
+            "enum": ["ok", "error", "timeout", "refused", "preempted", "expired", "outcome_unknown"],
             "description": (
                 "How the run ended. preempted: stopped by SIGTERM (143), settled at what it had spent. expired: its "
-                "deadline had passed, so it did not run."
+                "deadline had passed, so it did not run. outcome_unknown: the process that held it was gone before it "
+                "finished (SIGKILL, OOM, power loss), so what it did is not known; it counts as a run that started. "
+                "A turn or budget stop is never ok."
             ),
         },
         "error": {
@@ -234,8 +242,9 @@ SCHEMA: dict = {
             "maxLength": 120,
             "description": (
                 "Why the run ended: completed, timeout, preempted, interrupted, runner_error, broker_unavailable, "
-                "not_found, expired, crashed, or refused:<counter> (the counter that said no). Null on a record "
-                "written before schema 3."
+                "not_found, expired, crashed (before outcome_unknown), owner_gone, max_turns, max_budget, skipped, "
+                "nothing_to_do, upstream:<unavailable|rate_limited|invalid>, or refused:<counter> (the counter that "
+                "said no). Null on a record written before schema 3."
             ),
         },
         "reservation": {
@@ -257,6 +266,40 @@ SCHEMA: dict = {
                 "the estimate), turns, seconds, memory and the lane, the counters it reserved against, and notes such "
                 "as 'memory not reported'. Null when the run was never admitted."
             ),
+        },
+        "stop_subtype": {
+            "type": ["string", "null"],
+            "maxLength": 120,
+            "description": "The runner's own word for how it stopped (Claude Code's result subtype), kept as it said it.",
+        },
+        "fault": {
+            "enum": ["provider", None],
+            "description": "provider: the model's service failed the run (unavailable, rate-limited, invalid request).",
+        },
+        "retry_after_s": {
+            "type": ["number", "null"],
+            "minimum": 0,
+            "description": "The wait the provider asked for before a retry, when it named one.",
+        },
+        "approval": {
+            "type": ["object", "null"],
+            "additionalProperties": False,
+            "required": ["switch", "quote"],
+            "properties": {"switch": _TEXT_OR_NULL, "quote": _TEXT_OR_NULL},
+            "description": (
+                "The approval a run acted under at act-and-tell: the switch setting and the words of the permission, "
+                "so an audit reads who allowed what. Null when the run needed none."
+            ),
+        },
+        "run_key": {
+            "type": ["string", "null"],
+            "maxLength": 200,
+            "description": "The run key (job and trigger): a second run with the same key has no further effect.",
+        },
+        "chain_depth": {
+            "type": ["integer", "null"],
+            "minimum": 0,
+            "description": "How many jobs started this one: 0 for a person's or a timer's run; a chain stops at its cap.",
         },
     },
 }

@@ -90,6 +90,8 @@ body of the GitHub release.
   no folder name and none of the runner's words, whatever `alert_text` says.
 - In the decision log, a refusal the wall makes redundant, refused because the wall wasn't proven, now has the layer
   `rule:unknown-command-word`, `rule:sets-ifs` or `rule:unread-write` where it was `rule:command`.
+- A test tier over its time budget now warns (a summary line, and a `::warning::` on GitHub Actions); only a tier past
+  twice its budget fails the run in CI, so a slow runner can't turn a green suite red.
 
 ### Fixed
 

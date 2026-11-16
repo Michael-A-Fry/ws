@@ -563,18 +563,50 @@ def test_over_budget_fails_the_run_only_when_ci_is_set(pytester, monkeypatch, ci
         monkeypatch.delenv("CI", raising=False)
     else:
         monkeypatch.setenv("CI", ci)
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
     result = run(pytester, "-o", "ws_tier_budget_core=0")
     result.assert_outcomes(passed=1)
-    result.stdout.fnmatch_lines(["*core*over budget*"])
+    result.stdout.fnmatch_lines(["*core*over budget*past 2x*"])
+    assert "::warning" not in result.stdout.str()
     assert result.ret == (pytest.ExitCode.TESTS_FAILED if fails else pytest.ExitCode.OK)
+
+
+@pytest.mark.parametrize(("factor", "verdict"), [(0.9, "ok"), (1.0, "ok"), (1.5, "warn"), (2.0, "warn"), (2.5, "fail")])
+def test_budget_verdict_warns_over_the_budget_and_fails_only_past_twice_it(factor, verdict):
+    assert ws_harness.OVER_FAIL_FACTOR == 2
+    assert ws_harness.budget_verdict(100 * factor, 100) == verdict
+
+
+def test_a_zero_budget_fails_any_time_spent():
+    assert (ws_harness.budget_verdict(0, 0), ws_harness.budget_verdict(0.001, 0)) == ("ok", "fail")
+
+
+@pytest.mark.parametrize(("actions", "annotated"), [("true", True), (None, False)])
+def test_over_budget_within_twice_it_warns_and_passes_even_in_ci(pytester, monkeypatch, actions, annotated):
+    # The test takes about 1.5 s against a 1 s budget: half a second of room either side of the warn band (1 s, 2 s].
+    write(pytester, "tests/test_a.py", "import time\n\n\ndef test_1():\n    time.sleep(1.5)\n")
+    monkeypatch.setenv("CI", "true")
+    if actions is None:
+        monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    else:
+        monkeypatch.setenv("GITHUB_ACTIONS", actions)
+    result = run(pytester, "-o", "ws_tier_budget_core=1")
+    result.assert_outcomes(passed=1)
+    assert result.ret == pytest.ExitCode.OK
+    result.stdout.fnmatch_lines(["ws-harness: core tier over budget*; a warning, it fails only past 2x"])
+    out = result.stdout.str()
+    assert ("::warning title=ws-harness::core tier over budget" in out) is annotated
+    assert "failing the run" not in out
 
 
 def test_within_budget_prints_no_over_budget_line_even_in_ci(pytester, monkeypatch):
     write(pytester, "tests/test_a.py", "def test_1():\n    pass\n")
     monkeypatch.setenv("CI", "true")
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
     result = run(pytester)
     assert result.ret == 0
     assert "over budget" not in result.stdout.str()
+    assert "::warning" not in result.stdout.str()
 
 
 def test_a_bad_budget_is_a_usage_error(pytester):

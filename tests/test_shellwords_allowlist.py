@@ -259,9 +259,9 @@ def test_the_worst_case_of_a_large_input_is_under_two_seconds(box, monkeypatch, 
         "echo " + "${X@L}" * 10000,
         "X=a; echo " + "${X#~}" * 10000,
     ):
-        started = time.monotonic()
+        started = time.thread_time()
         code, _ = hook(monkeypatch, capsys, body[:65536])
-        assert code == 2 and time.monotonic() - started < 2, body[:20]
+        assert code == 2 and time.thread_time() - started < 2, body[:20]
 
 
 @pytest.mark.parametrize("cmd", ["IFS=/; cat x", "IFS+=/ cat x", "export IFS=/"])

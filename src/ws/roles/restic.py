@@ -157,7 +157,10 @@ def password(cfg: dict, env) -> str:
     try:
         return store.read(name)
     except FileNotFoundError as e:
-        raise BackupError(f"{name} has no value; run `ws secret set {name}` (and add [{name}] to secrets.toml)") from e
+        raise BackupError(
+            f'{name} has no value; add [{name}] with source = "generate" to secrets.toml, then '
+            f"`ws secret generate {name}` (or `ws secret set {name}` to use your own)"
+        ) from e
     except wsecrets.SecretsError as e:
         if _walled(store.path):  # Store.read reports a closed store as SecretsError, never PermissionError
             raise BackupError(

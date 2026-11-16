@@ -331,17 +331,39 @@ def _header(text: str) -> str:
     return _CONTROL.sub(" ", text).encode("ascii", "replace").decode("ascii")[:200]
 
 
+MAX_CLICK = 2000
+
+
+def click_url(url: str) -> str:
+    """The link a push opens when tapped (ntfy's Click header): one http or https URL with a host, ASCII only (a header
+    is sent as latin-1, and an IDN host goes in as punycode), on one line, no spaces, at most 2000 characters. Raises
+    NotifyError."""
+    from urllib.parse import urlsplit
+
+    bad = NotifyError("--click must be one http or https link, with a host, no spaces, under 2000 characters")
+    if not isinstance(url, str) or not url.isascii() or len(url) > MAX_CLICK or _CONTROL.search(url) or " " in url:
+        raise bad
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        raise bad from None
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise bad
+    return url
+
+
 def deliver(
     cfg: dict, env, title: str, message: str, send=None, priority: str | None = None, click: str | None = None
 ) -> None:
-    """One message to the topic, through a broker lease if a token is named. Raises NotifyError."""
+    """One message to the topic, through a broker lease if a token is named. `click` is the link a tap opens.
+    Raises NotifyError."""
     send = send or post
     url, host, topic = target(cfg)
     headers = {"Title": _header(title), "Content-Type": "text/plain; charset=utf-8"}
     if priority:
         headers["Priority"] = priority
-    if click:
-        headers["Click"] = _header(click)
+    if click is not None:
+        headers["Click"] = click_url(click)
     body = message.encode("utf-8")
     name = token_name(cfg)
     lease = None
@@ -443,6 +465,8 @@ def send(
         raise NotifyError(f"kind must be push, digest or alert, not {kind!r}")
     if not message.strip():
         raise NotifyError("nothing to send: the message is empty")
+    if click is not None:
+        click_url(click)  # refused before anything is counted
     cap = cap_for(kind, cfg, env)
     day = today(zone(cfg, env), now)
     where = "alerts_per_day in [roles.notify]" if kind == "alert" else "[interrupts] in your policy"

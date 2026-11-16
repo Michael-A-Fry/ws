@@ -56,6 +56,28 @@ if prompt == "term":
 if prompt == "fail":
     print("boom", file=sys.stderr)
     sys.exit(2)
+if prompt.startswith("chain:"):
+    # what a script or watcher inside a queued run does to queue the next link: the ledger (the CLI add refuses in
+    # any agent session)
+    import subprocess
+    env = dict(os.environ)
+    if prompt == "chain:reset":
+        env["WS_CHAIN_DEPTH"] = "0"  # a run that tries to start its chain again
+    child = chr(10).join([
+        "import sys",
+        "from datetime import UTC, datetime",
+        "from ws import queue",
+        "try:",
+        "    queue.ledger_for_env().enqueue('chainer', None, datetime.now(UTC),",
+        "        chain_depth=queue.chain_depth_from_env(), chain_parent=queue.chain_parent_from_env())",
+        "except queue.WsError as e:",
+        "    sys.exit(e.exit_code)",
+    ])
+    r = subprocess.run([sys.executable, "-c", child], env=env)
+    with open(os.path.join(os.environ["WS_HOME"], "chain-saw.jsonl"), "a") as f:
+        saw = dict(depth=os.environ.get("WS_CHAIN_DEPTH"), parent=os.environ.get("WS_CHAIN_PARENT"), rc=r.returncode)
+        f.write(json.dumps(saw) + chr(10))
+    sys.stdout.write(ok)
 """
 
 
@@ -1916,39 +1938,42 @@ def test_a_disk_error_after_admission_is_failed_as_killed_once(tmp_path):
 # ---- chains and ticks (h-L4-19/20, ls-4) -----------------------------------------------------------------------------
 
 
-def test_planted_chain_cap(tmp_path):
-    """A job queued from inside a queued run is one link deeper; past the cap it is refused and said once; a person's
-    add starts again at 0."""
+@pytest.mark.parametrize("mode", ["chain:go", "chain:reset"])
+def test_planted_chain_cap(box, capsys, mode):
+    """Through the queue's drain and a real runner process whose child queues the next link through the ledger: each
+    link is one deeper, the one past the cap is refused (exit 3), and a runner that sets its own depth back to 0 does
+    not reset the chain, because the ledger takes the depth from the parent's receipt."""
+    write_job(box, name="chainer", prompt=mode)
+    (box / "profile.toml").write_text(
+        dumps({"roles": {"budget": {"monthly_cap_usd": 20}, "queue": {"chain_cap": 2}}}), encoding="utf-8"
+    )
+    code, _ = call(capsys, "queue", "add", "chainer")
+    assert code == 0
+    for _ in range(5):
+        cli.main(["queue", "run", "--json"])
+        capsys.readouterr()
+    saw = [json.loads(x) for x in (box / "chain-saw.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert [s["depth"] for s in saw] == ["0", "1", "2"]
+    assert [s["rc"] for s in saw] == [0, 0, queue.EXIT_REFUSED]
+    ledger = queue.ledger_for_env()
+    rows = sorted(ledger.receipts(last=10), key=lambda r: r["queued_at"])
+    assert [r["chain_depth"] for r in rows] == [0, 1, 2]
+    assert all(s["parent"] == r["run_id"] for s, r in zip(saw, rows, strict=True))
+    recs = [r for r in runrecord.read(runrecord.runs_path()) if r["job"] == "chainer"]
+    assert sorted(r["chain_depth"] for r in recs) == [0, 1, 2]  # the normal run record carries it too
+
+
+def test_a_chain_takes_its_depth_from_the_parent_not_the_caller(tmp_path):
     told: list[str] = []
     ledger = make(tmp_path, limits=queue.Limits(busy_s=0.2, chain_cap=2), on_stop=lambda j, r, why: told.append(why))
-    depths: list[int] = []
-    seen_env: list[str | None] = []
-
-    def runner(item):
-        depths.append(item.chain_depth)
-        seen_env.append(os.environ.get(queue.CHAIN_ENV))
-        nxt = queue.chain_depth_from_env()
-        try:
-            ledger.enqueue("loop", None, T0, trigger=f"step-{nxt}", chain_depth=nxt)
-        except output.WsError as e:
-            assert e.kind == "chain_cap" and e.exit_code == queue.EXIT_REFUSED
-        return queue.Outcome(0, "ok", "completed")
-
-    ledger.enqueue("loop", None, T0, trigger="start", chain_depth=queue.chain_depth_from_env({}))
-
-    def run_one(item):  # what run_item does around the run: the depth is in the environment while it runs
-        old = os.environ.get(queue.CHAIN_ENV)
-        os.environ[queue.CHAIN_ENV] = str(item.chain_depth)
-        try:
-            return runner(item)
-        finally:
-            os.environ.pop(queue.CHAIN_ENV, None) if old is None else os.environ.__setitem__(queue.CHAIN_ENV, old)
-
-    queue.drain(ledger, run_one)
-    assert depths == [0, 1, 2] and seen_env == ["0", "1", "2"]
+    parent, _, _ = ledger.enqueue("loop", None, T0, trigger="a", chain_depth=2)
+    with pytest.raises(output.WsError) as e:
+        ledger.enqueue("loop", None, T0, trigger="b", chain_depth=0, chain_parent=parent)  # claims 0; it is 3
+    assert e.value.kind == "chain_cap" and e.value.exit_code == queue.EXIT_REFUSED
     assert len(told) == 1 and told[0].startswith("chain_cap: 3 jobs deep")
-    assert {r["chain_depth"] for r in ledger.receipts(last=10)} == {0, 1, 2}
+    assert ledger.parent_depth("20261108T030000Z-ffffff") == 0  # a parent the ledger does not know
     assert queue.chain_depth_from_env({}) == 0 and queue.chain_depth_from_env({queue.CHAIN_ENV: "x"}) == 0
+    assert queue.chain_parent_from_env({queue.CHAIN_PARENT_ENV: "../x"}) is None
     assert ledger.enqueue("loop", None, T0, trigger="by-hand")[2] is False  # a human action resets the chain
 
 
@@ -2008,3 +2033,23 @@ def test_ws_queue_tick_command(box, capsys):
     assert code == 0 and out["data"]["result"] == "queued"
     code, out = call(capsys, "queue", "tick", "daily", "--slot", "2026-11-10T03:00:00Z")
     assert code == 0 and out["data"]["result"] == "already"
+
+
+def test_planted_tick_after_a_kill_runs_the_slot(tmp_path):
+    """A run of the job killed while it ran leaves a stale `running` receipt; the next tick reaps it first, so its
+    slot is queued, not coalesced away, and the kill is told once."""
+    host = Host()
+    told: list[str] = []
+    ledger = make(tmp_path, host=host, sink=lambda rec: True, on_stop=lambda job, run_id, why: told.append(why))
+    what, run_id = ledger.tick("nightly", None, T0, T0)
+    assert what == "queued"
+    ledger.conn().execute(
+        "UPDATE receipts SET status = 'running', started_at = ?, owner_pid = 4900, owner_start_time = 'N', "
+        "lease_expires_at = ? WHERE run_id = ?",
+        (queue.to_ns(T0), queue.to_ns(T0 + timedelta(hours=1)), run_id),
+    )
+    host.procs[4900] = (False, None)  # SIGKILL: the process is gone
+    nxt = T0 + timedelta(days=1)
+    assert ledger.tick("nightly", None, nxt, nxt)[0] == "queued"
+    assert ledger.receipt(run_id)["stop_reason"] == "owner_gone"
+    assert len(told) == 1 and told[0].startswith("outcome_unknown")

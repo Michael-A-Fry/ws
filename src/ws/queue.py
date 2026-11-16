@@ -69,8 +69,10 @@ drain cannot read or run (unreadable data, a runner that raised) is failed with 
 the drain goes on to the next: one bad item never fails the batch. A store or disk error is not one item's: it
 stops the drain.
 
-Chains and ticks. A job queued from inside a queued run (`WS_CHAIN_DEPTH` in its environment) is one link deeper
-than that run, and the depth goes in its receipt and record; past `chain_cap` (default 3) it is refused, typed
+Chains and ticks. A queued run's runner gets its run id and depth (`WS_CHAIN_PARENT`, `WS_CHAIN_DEPTH`); a job
+queued from inside it is one link deeper, taken from the parent's receipt so a child cannot reset it, and the depth
+goes in its receipt and record (the `add` command itself refuses in an agent session, so chains come from scripts and
+watchers); past `chain_cap` (default 3) it is refused, typed
 `chain_cap`, and said once. A person's `ws queue add` is depth 0: a human action resets the chain. `on_event` is how
 a watcher queues a run for an event, and it drops an event that ws's own action caused, so a watcher never feeds on
 itself. `tick` is a schedule's tick, in one transaction under the store's write lock: it advances the job's last slot
@@ -130,7 +132,8 @@ ORPHAN_S = 120.0  # a claimed message with no running receipt this long is relea
 MESSAGE_LEASE_S = 24 * 3600.0
 MIN_RESERVE_USD = 0.0001
 CHAIN_CAP = 3  # how many jobs deep a chain of jobs that queue jobs may go
-CHAIN_ENV = "WS_CHAIN_DEPTH"  # set for a queued run: the depth of the run that is running
+CHAIN_ENV = "WS_CHAIN_DEPTH"  # set for a queued run's runner: the depth of the run that is running
+CHAIN_PARENT_ENV = "WS_CHAIN_PARENT"  # and its run id, so what it queues takes its depth from the ledger, not the env
 
 # Retries
 BACKOFF_S = (30, 60, 300, 900, 3600)
@@ -1017,11 +1020,15 @@ class Ledger:
         *,
         trigger: str | None = None,
         chain_depth: int = 0,
+        chain_parent: str | None = None,
     ) -> tuple[str, str, bool]:
         """Add a run of job file `job` to the queue. Returns (run_id, message_id, replay). The same `key` again returns
         the first one and adds nothing. `trigger` (the event or message id that started it) makes the key the run key,
-        `run_key(job, trigger)`; give one or the other. `chain_depth` is how many queued runs led to this one; past
-        the cap it is refused (`chain_cap`, exit 3) and said once."""
+        `run_key(job, trigger)`; give one or the other. `chain_depth` is how many queued runs led to this one; with
+        `chain_parent` (the run that queues it) the depth is that run's own, from its receipt, plus one, whatever the
+        caller says, so a child cannot reset its chain. Past the cap it is refused (`chain_cap`, exit 3), said once."""
+        if chain_parent is not None:
+            chain_depth = max(chain_depth, self.parent_depth(chain_parent) + 1)
         if chain_depth > self.limits.chain_cap:
             self.stopped(job, "", f"chain_cap: {chain_depth} jobs deep, over the cap of {self.limits.chain_cap}")
             raise WsError(
@@ -1084,14 +1091,33 @@ class Ledger:
         )  # fmt: skip
         return run_id
 
+    def parent_depth(self, run_id: str) -> int:
+        """The chain depth on a run's receipt; a run the ledger does not know, or one from before depths, is 0."""
+        try:
+            r = self.conn().execute("SELECT chain_depth FROM receipts WHERE run_id = ?", (run_id,)).fetchone()
+        except sqlite3.Error as e:
+            raise store_error(e) from e
+        return _depth(r[0]) or 0 if r else 0
+
     def on_event(
-        self, job: str, purpose: str | None, event_id: str, now: datetime, *, by_ws: bool, chain_depth: int = 0
+        self,
+        job: str,
+        purpose: str | None,
+        event_id: str,
+        now: datetime,
+        *,
+        by_ws: bool,
+        chain_depth: int = 0,
+        chain_parent: str | None = None,
     ) -> tuple[str, str, bool] | None:
-        """A watcher's run for one event: once per (job, event) through the run key. None, and nothing queued, for an
-        event that ws's own action caused (`by_ws`): a watcher never reacts to what ws did."""
+        """A watcher's run for one event: once per (job, event) through the run key, one link deeper than the run that
+        queues it. None, and nothing queued, for an event that ws's own action caused (`by_ws`): a watcher never
+        reacts to what ws did."""
         if by_ws:
             return None
-        return self.enqueue(job, purpose, now, trigger=event_id, chain_depth=chain_depth)
+        return self.enqueue(
+            job, purpose, now, trigger=event_id, chain_depth=chain_depth, chain_parent=chain_parent
+        )  # fmt: skip
 
     def tick(
         self,
@@ -1102,35 +1128,43 @@ class Ledger:
         *,
         coalesce_if_active: bool = True,
         skip_missed_s: float | None = None,
+        chain_depth: int = 0,
+        chain_parent: str | None = None,
     ) -> tuple[str, str | None]:
         """A schedule's tick for `slot`. Returns (what happened, run_id): `queued`, `replay`, `already` (this slot or a
         later one has been ticked), `missed` (more than `skip_missed_s` late) or `coalesced` (a run of the job is
-        waiting or running). The slot is advanced before anything is queued, in the same transaction."""
+        waiting or running). The slot is advanced before anything is queued, in the same transaction, and dead owners
+        are reaped first, so a run that was killed does not hold the next slot off."""
         ns = to_ns(slot)
+        result: tuple[str, str | None]
         try:
             with _transaction(self.conn()) as c:
+                self._reap(c, now)  # a killed run's stale `running` receipt must not coalesce this slot away
                 last = c.execute("SELECT last_slot FROM ticks WHERE job = ?", (job,)).fetchone()
                 if last is not None and ns <= last[0]:
-                    return "already", None
-                c.execute(
-                    "INSERT INTO ticks (job, last_slot) VALUES (?, ?) ON CONFLICT(job) DO UPDATE SET last_slot = ?",
-                    (job, ns, ns),
-                )
-                if skip_missed_s is not None and (now - slot).total_seconds() > skip_missed_s:
-                    return "missed", None
-                if (
-                    coalesce_if_active
-                    and c.execute(
+                    result = ("already", None)
+                else:
+                    c.execute(
+                        "INSERT INTO ticks (job, last_slot) VALUES (?, ?) ON CONFLICT(job) DO UPDATE SET last_slot = ?",
+                        (job, ns, ns),
+                    )
+                    active = c.execute(
                         "SELECT 1 FROM receipts WHERE job = ? AND status IN ('queued', 'running') LIMIT 1", (job,)
                     ).fetchone()
-                ):
-                    return "coalesced", None
-                run_id, _, replay = self.enqueue(
-                    job, purpose, now, trigger=f"tick-{slot.astimezone(UTC):%Y%m%dT%H%M%SZ}"
-                )
-                return ("replay" if replay else "queued"), run_id
+                    if skip_missed_s is not None and (now - slot).total_seconds() > skip_missed_s:
+                        result = ("missed", None)
+                    elif coalesce_if_active and active:
+                        result = ("coalesced", None)
+                    else:
+                        run_id, _, replay = self.enqueue(
+                            job, purpose, now, trigger=f"tick-{slot.astimezone(UTC):%Y%m%dT%H%M%SZ}",
+                            chain_depth=chain_depth, chain_parent=chain_parent,
+                        )  # fmt: skip
+                        result = ("replay" if replay else "queued", run_id)
         except (sqlite3.Error, OSError) as e:
             raise store_error(e) from e
+        self._tell_reaped()
+        return result
 
     def cancel(self, run_id: str, now: datetime) -> str:
         """Take a queued run out of the queue. Returns the job name. Raises WsError for one that is not queued."""
@@ -1365,12 +1399,25 @@ def _depth(v) -> int | None:
     return v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else None
 
 
+def chain_env(run_id: str, depth: int | None) -> dict[str, str]:
+    """What a queued run's runner is given, so whatever it queues is one link deeper: its run id and its depth."""
+    return {CHAIN_PARENT_ENV: run_id, CHAIN_ENV: str(depth or 0)}
+
+
 def chain_depth_from_env(env=None) -> int:
     """The depth of a run queued from here: one more than the queued run this process runs inside (`WS_CHAIN_DEPTH`),
-    or 0 when there is none, which is a person's or a timer's action and starts a new chain."""
+    or 0 when there is none, which is a person's or a timer's action and starts a new chain. Only a fallback: with
+    `chain_parent_from_env` the ledger takes the depth from the parent's receipt."""
     env = os.environ if env is None else env
     v = env.get(CHAIN_ENV, "")
     return int(v) + 1 if v.isdigit() else 0
+
+
+def chain_parent_from_env(env=None) -> str | None:
+    """The run id of the queued run this process runs inside, or None."""
+    env = os.environ if env is None else env
+    v = env.get(CHAIN_PARENT_ENV, "")
+    return v if v and all(ch.isalnum() or ch in "-_" for ch in v) else None
 
 
 def run_key(job: str, trigger: str) -> str:
@@ -1617,16 +1664,8 @@ def run_item(item: Item) -> Outcome:
     if item.deadline is not None:
         job = dataclasses.replace(job, deadline=item.deadline)
     got: list[dict] = []
-    queued = run.Queued(item.run_id)
-    before = os.environ.get(CHAIN_ENV)
-    os.environ[CHAIN_ENV] = str(item.chain_depth)  # what this run queues is one link deeper
-    try:
-        code = run.run_job(argparse.Namespace(job=job.name, dry_run=False), job, None, got.append, queued)
-    finally:
-        if before is None:
-            os.environ.pop(CHAIN_ENV, None)
-        else:
-            os.environ[CHAIN_ENV] = before
+    queued = run.Queued(item.run_id, run_key=item.run_key, chain_depth=item.chain_depth)
+    code = run.run_job(argparse.Namespace(job=job.name, dry_run=False), job, None, got.append, queued)
     if queued.waited:
         return Outcome(code, None, None, queued.waited)
     rec = got[0] if got else {}
@@ -1826,7 +1865,7 @@ def cmd_add(args: argparse.Namespace) -> int:
     ledger = ledger_for_env()
     run_id, message_id, replay = ledger.enqueue(
         job.name, job.purpose, now, args.key, deadline, trigger=getattr(args, "trigger", None),
-        chain_depth=chain_depth_from_env(),
+        chain_depth=chain_depth_from_env(), chain_parent=chain_parent_from_env(),
     )  # fmt: skip
     if args.json:
         output.result({"run_id": run_id, "job": job.name, "message_id": message_id, "replay": replay})
@@ -1878,8 +1917,11 @@ def cmd_run(args: argparse.Namespace) -> int:
     ledger = ledger_for_env()
     from ws import run
 
-    with run._term_becomes_exit():
-        results = drain(ledger, run_item, limit=args.max, preemptible=_preemptible)
+    try:
+        with run._term_becomes_exit():
+            results = drain(ledger, run_item, limit=args.max, preemptible=_preemptible)
+    finally:
+        ledger.close()
     failed = [r for r in results if r["action"] == "fail"]
     if args.json:
         output.result({"attempts": results, "failed": len(failed)})
@@ -1904,8 +1946,9 @@ def cmd_tick(args: argparse.Namespace) -> int:
             "give the job an API key through [[secrets]], or a local provider in runner_options", EXIT_REFUSED,
         )  # fmt: skip
     what, run_id = ledger_for_env().tick(
-        job.name, job.purpose, slot, now, coalesce_if_active=not args.no_coalesce, skip_missed_s=args.skip_missed
-    )
+        job.name, job.purpose, slot, now, coalesce_if_active=not args.no_coalesce, skip_missed_s=args.skip_missed,
+        chain_depth=chain_depth_from_env(), chain_parent=chain_parent_from_env(),
+    )  # fmt: skip
     if args.json:
         output.result({"job": job.name, "slot": runrecord.iso(slot), "result": what, "run_id": run_id})
     else:

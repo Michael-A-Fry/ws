@@ -360,3 +360,20 @@ esac
     assert (tmp_path / "jit.in").read_text(encoding="utf-8") == jit  # on stdin
     assert jit not in "\n".join(calls) and jit not in r.stdout + r.stderr  # never on a command line
     assert (tmp_path / "count").read_text(encoding="utf-8").strip() == "4"  # 502, no answer, 200, then 404
+
+
+def test_cli_required_waits_for_every_other_job_and_reports_even_when_they_skip():
+    text = (WORKFLOWS / "cli.yml").read_text(encoding="utf-8")
+    jobs = [m.group(1) for line in top_level(text, "jobs") if (m := re.match(r"^  ([a-z0-9_-]+):\s*$", line))]
+    assert "cli-required" in jobs and "changes" in jobs
+    block = text[text.index("\n  cli-required:") :]
+    needs = re.search(r"^    needs: \[([^\]]*)\]", block, re.MULTILINE)
+    assert needs, "cli-required has no inline needs list"
+    assert {n.strip() for n in needs.group(1).split(",")} == set(jobs) - {"cli-required"}
+    assert re.search(r"^    if: always\(\)", block, re.MULTILINE)
+
+
+def test_the_change_detection_fails_closed_when_the_diff_cannot_be_read():
+    text = (WORKFLOWS / "cli.yml").read_text(encoding="utf-8")
+    step = text[text.index("- id: diff") : text.index("\n  doctor:")]
+    assert 'if ! files="$(git diff --name-only' in step and "exit 1" in step

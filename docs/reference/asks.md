@@ -12,6 +12,7 @@ ws ask list                      # open asks, oldest first
 ws ask get ID
 ws ask answer ID 2               # an option's number (1-based), its label in any case, or free text
 ws ask wait ID --timeout 600     # block until answered
+ws ask note ID "also src/b.py"   # add to an open or answered ask; earlier text stays as it was
 ws ask done ID                   # the session has acted on it (an open or answered ask)
 ws ask withdraw ID               # the session no longer needs it (an open ask)
 ws ask import OLD.jsonl --dry-run
@@ -53,9 +54,23 @@ The old program's `flows_back` maps to the policy's `access`: `full` is `full`, 
 
 Each line has `schema` (1), `ts` (epoch milliseconds, as the OpenCode shim writes it), `at` (the same moment as RFC 3339
 text), `event` and `id`. `added` carries the ask; `answered` carries `answer` (`text`, `option_index` or null, `via`,
-`ts`). Status is folded from the events: open, then answered, then done; or open, then withdrawn. Lines from the OpenCode
-shim (no `answer`, no `at`) fold the same way, and so do the rows of the older `ws-ask` program (`v` 1, `ts` as
-RFC 3339 text), which are read with their times. New keys and event kinds were added to the file; none changed meaning.
+`ts`); `noted` carries `note` (the text) and `redacted`, and `redacted_why` when it's redacted. Status is folded from
+the events: open, then answered, then done; or open, then withdrawn. Lines from the OpenCode shim (no `answer`, no
+`at`) fold the same way, and so do the rows of the older `ws-ask` program (`v` 1, `ts` as RFC 3339 text), which are
+read with their times. `import` takes only the older program's four events, never `noted`. New keys and event kinds
+were added to the file; none changed meaning.
+
+## Note
+
+An ask can't be edited, so `ws ask note ID TEXT` appends a note to it instead, for example a file that joins an open
+review ask. It works on an open or answered ask; on a done or withdrawn one it's refused (exit 1, `not_open`), and an
+unknown id is exit 2 (`unknown_ask`). A note never changes the question, the options or an earlier note.
+
+A note gets the checks a question gets: at most 2000 characters, a token-shaped secret is refused (exit 1) and stored
+nowhere, and it's stored with no text (`Open the session to see this ask.`) when the ask is redacted or shows as opaque
+here, when there's no sensitive-terms file, or when a sensitive term matches. `ws ask note` says why on standard error.
+`get` prints the notes oldest first, `list` counts them, and both give them under `notes` in JSON (`text`, `ts`,
+`redacted`); an opaque ask, or a note stored redacted, shows `text` as null.
 
 ## Wait, done, withdraw
 

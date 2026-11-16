@@ -8,6 +8,11 @@ body of the GitHub release.
 
 ## [Unreleased]
 
+### Added
+
+- Vale runs before each commit (the upstream `vale` hook at v3.25.1, the version CI downloads), over the same files and
+  with the same style as CI's Vale step. It syncs the style package only when it's missing, so a fresh clone passes.
+
 ## [0.1.11] - 2026-11-17
 
 ### Removed

@@ -36,7 +36,7 @@ uv sync
 
 ```sh
 uv run --locked pytest -q            # the whole suite (tests/e2e skips without runners)
-uvx prek run --all-files             # gitleaks, ruff, typos, rumdl, actionlint, shellcheck, PII gate, globals, code map
+uvx prek run --all-files             # gitleaks, ruff, typos, rumdl, actionlint, shellcheck, Vale, PII, globals, code map
 uv run --locked ws doctor --offline  # the installed tool checking itself; exit 1 for unconfigured roles is expected
 python3 scripts/gen_code_map.py      # regenerate docs/reference/code-map.md after a module docstring changes
 python3 scripts/check_docs_integrity.py  # policy files exist, links and anchors resolve, no banned strings
@@ -47,8 +47,9 @@ The suite runs in a random order, and each test has a time limit by size. The se
 that needs a rerun, is a bug to fix, not to retry. [Testing](docs/reference/testing.md) has the markers, limits, flake
 and quarantine rules, and the tier time report.
 
-The hooks that `prek` runs are listed in `.pre-commit-config.yaml`. CI also runs Vale (the Microsoft package) over the
-README, the docs and the policy files, for errors only; [`.vale.ini`](.vale.ini) sets it up.
+The hooks that `prek` runs are listed in `.pre-commit-config.yaml`. Vale (the Microsoft package, errors only) is one of
+them, over the files CI lints: the README, the docs and the policy files, so a prose error fails at commit, not in CI.
+[`.vale.ini`](.vale.ini) sets it up, and the hook runs `vale sync` the first time, when the style package is missing.
 
 ## Releasing
 

@@ -731,8 +731,11 @@ def test_registry_b2_owner_and_mode_are_checked_only_when_an_owner_is_given(tmp_
         assert "ok" in wsecrets.load_registry(p), "a reader that names no owner reads it as before"
     p.chmod(0o644)
     assert "ok" in wsecrets.load_registry(p, owner_uid=me)
-    with pytest.raises(wsecrets.RegistryUntrusted, match="belongs to uid"):
-        wsecrets.load_registry(p, owner_uid=me + 12345)
+    if me != 0:  # root's own file is trusted by any reader, so as root the file is never foreign
+        with pytest.raises(wsecrets.RegistryUntrusted, match="belongs to uid"):
+            wsecrets.load_registry(p, owner_uid=me + 12345)
+    foreign = os.stat_result((0o100644, 0, 0, 1, 4242, 0, 0, 0, 0, 0))
+    assert "belongs to uid 4242" in (wsecrets.registry_problem(foreign, 4243) or "")
     assert (
         issubclass(wsecrets.RegistryUntrusted, wsecrets.SecretsError) and wsecrets.RegistryUntrusted.kind == "untrusted"
     )

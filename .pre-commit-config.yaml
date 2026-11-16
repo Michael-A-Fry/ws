@@ -37,6 +37,16 @@ repos:
     hooks:
       - id: zizmor
         files: ^\.github/workflows/(ci|test-integrity)\.yml$
+  # Vale, the prose lint CI runs over the README, docs and policy files (MIT; v3.25.1, the version ci.yml downloads).
+  # Errors only and the Microsoft style, both from .vale.ini. The wrapper runs `vale sync` only when the git-ignored
+  # style package is missing, so a fresh clone and CI's prek step pass. `files` matches CI's list.
+  - repo: https://github.com/vale-cli/vale
+    rev: d7a379da688e3ec07138ef94e4f0f0889954d617 # v3.25.1
+    hooks:
+      - id: vale
+        entry: sh scripts/vale_hook.sh
+        require_serial: true # one process, so a fresh clone syncs the styles once, not in each parallel batch
+        files: ^(README\.md|docs/.*|SECURITY\.md|SUPPORT\.md|CONTRIBUTING\.md|CHANGELOG\.md)$
   - repo: local
     hooks:
       # pinact checks every action is pinned by commit SHA (MIT; v5.0.2, 25 Oct 2026). It builds from source with Go.

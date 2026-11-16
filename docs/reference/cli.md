@@ -292,7 +292,7 @@ ws secret generate [-h] [--replace] name
 Show a generated value once, on your own device, through a one-time page.
 
 ```text
-ws secret reveal [-h] [--owner LOGIN] [--bind ADDR] [--minutes MINUTES] [--again] name
+ws secret reveal [-h] [--owner LOGIN] [--bind ADDR] [--minutes MINUTES] [--again] [--notify] name
 ```
 
 | Argument | Meaning |
@@ -302,6 +302,7 @@ ws secret reveal [-h] [--owner LOGIN] [--bind ADDR] [--minutes MINUTES] [--again
 | `--bind ADDR` | The one tailnet address to listen on (default: `tailscale ip -4`). |
 | `--minutes MINUTES` | How long the link works, at most 15 (default 15). |
 | `--again` | Show a value that was already shown once. |
+| `--notify` | Push the link to your phone through `[roles.notify]`, so you tap it there. The link goes through your ntfy server; only your own device can open it, once. |
 
 Exit 0 when the value was shown, 1 when the link expired unused.
 
@@ -1055,12 +1056,15 @@ ws notify test [-h]
 Send a push, or a digest with --digest, if today's cap allows.
 
 ```text
-ws notify send [-h] [--title TITLE] [--digest] message
+ws notify send [-h] [--from-file PATH] [--fresh MINUTES] [--click URL] [--title TITLE] [--digest] [message]
 ```
 
 | Argument | Meaning |
 |---|---|
-| `message` | The message text. |
+| `message` | The message text (or `--from-file`). |
+| `--from-file PATH` | Send the first line with text in this file, such as the summary a job wrote (at most 300 characters). |
+| `--fresh MINUTES` | With `--from-file`: send only if the file changed in the last MINUTES, so an old summary is never sent as news (exit 0, 0 sent). |
+| `--click URL` | The link the push opens when tapped, such as your drafts folder (http or https). |
 | `--title TITLE` | The push title (default `ws`). |
 | `--digest` | The one daily digest, not a push. |
 

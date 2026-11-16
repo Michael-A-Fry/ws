@@ -655,6 +655,27 @@ _NO_OWNER = (
 )
 
 
+def _push_link(name: str, url: str, minutes: int) -> None:
+    """Push the reveal link through the notify role, so the person taps it on their phone. A failed push is a warning:
+    the link is still printed, and the page still serves its one use."""
+    from ws.roles import commands, ntfy
+
+    try:
+        cfg = commands._role("notify", "ntfy")
+        ntfy.send(
+            cfg,
+            os.environ,
+            f"Tap to see {name} once, on this device, within {minutes} minutes. Have your password manager ready.",
+            f"ws: {name}",
+            "push",
+            click=url,
+        )
+    except (ValueError, ntfy.NotifyError) as e:
+        print(f"ws: the link was not pushed ({e}); open it from here instead", file=sys.stderr)
+        return
+    print("ws: pushed the link to your phone", file=sys.stderr)
+
+
 def cmd_reveal(args: argparse.Namespace) -> int:
     """Serve the reveal-once page for a generated value (ws.reveal), print its link, wait for one use or expiry."""
     import ipaddress
@@ -718,6 +739,8 @@ def cmd_reveal(args: argparse.Namespace) -> int:
             f"ws: open that link on your own device within {minutes} minute{'' if minutes == 1 else 's'}; it shows {args.name} once",
             file=sys.stderr,
         )
+    if args.notify:
+        _push_link(args.name, url, minutes)
     _audit("reveal", args.name, "started")
     result = page.serve(minutes * 60)
     _audit("reveal", args.name, result)
@@ -1009,6 +1032,7 @@ def register(sub) -> None:
     p.add_argument("--bind", metavar="ADDR", help="the one tailnet address to listen on (default: tailscale ip -4)")
     p.add_argument("--minutes", type=int, default=15, help="how long the link works, at most 15 (default 15)")
     p.add_argument("--again", action="store_true", help="show a value that was already shown once")
+    p.add_argument("--notify", action="store_true", help="push the link to your phone ([roles.notify]); tap to open")
     p.add_argument("--allow-loopback", action="store_true", help=argparse.SUPPRESS)  # a box with no tailscale; tests
     p.set_defaults(func=cmd_reveal)
     p = ssub.add_parser("list", help="names, hosts, set/unset and owner; never values")

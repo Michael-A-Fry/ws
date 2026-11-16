@@ -81,7 +81,7 @@ NOT_GUARDED = HOOK_RUN | WS_SPAWNED | SELF_CHECKED  # the commands `guard` lets 
 
 # The two `ws secret` forms a session may run, exactly as written here and nothing near them: neither shows it a value
 # nor replaces one. `secret generate NAME` (no --replace) makes a value for a name that has none; `secret reveal NAME`
-# (optionally --again and --minutes N; no --owner, --bind or the loopback mode) serves the owner's own device only. A
+# (optionally --again, --notify and --minutes N; no --owner, --bind or the loopback mode) serves the owner's own device only. A
 # walled class's session gets neither. Every other `ws secret` stays admin. `ws.policy` (the matcher) reads the words
 # through `session_secret_words`, and `guard` reads the parsed command through `session_secret_args`.
 WALL_MARKER = "WS_WALLED_CLASS"  # as ws.wallsettings.WALL_MARKER (a test pins that they match)
@@ -105,7 +105,7 @@ def session_secret_words(words: list[str], env: Mapping[str, str]) -> bool:
         if flag in seen:
             return False
         seen.add(flag)
-        if flag == "--again":
+        if flag in ("--again", "--notify"):
             continue
         if flag == "--minutes" and rest and _MINUTES.match(rest[0]):
             rest.pop(0)

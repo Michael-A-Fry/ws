@@ -63,8 +63,9 @@ the release.
 The repo ships `.github/hooks/pre-push`. It runs `prek`, then the tests your change can affect, before a push leaves
 your machine. A change that maps to more than 40 test files, or touches `pyproject.toml`, `uv.lock`, a `conftest.py`,
 `tests/plugins/` or `.github/`, runs a short set instead (the smoke set, your changed tests and the tests importing a
-changed module), stopped after 300 seconds (`WS_PREPUSH_CAP`). CI runs the whole suite on every pull request and is
-required to merge; `WS_PREPUSH_FULL=1` runs it here too (logged). Turn the hook on once:
+changed module), stopped after 6 seconds a file, at least 300 and at most 1800 (`WS_PREPUSH_CAP` sets it). CI runs the
+whole suite on every pull request and is required to merge; `WS_PREPUSH_FULL=1` runs it here too (logged). Turn the
+hook on once:
 
 ```sh
 git config core.hooksPath .github/hooks

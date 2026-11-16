@@ -122,7 +122,7 @@ def judge(call, cfg: Config, ctx) -> Finding | None:
         return None
     if is_protected:
         return _deny(call, owners, "")
-    if _through_a_link(written, folders):
+    if _through_a_link(written, [_start_folder()]):  # only the start folder's own path is exempt: `cd` can't add one
         return _deny(call, owners, "a link on the way to it could be moved onto a guarded file in the same turn")
     if _hard_linked(written):
         return _deny(call, owners, "it is a file with more than one name, so it may be a guarded one")

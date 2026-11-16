@@ -164,6 +164,60 @@ def test_a_project_definition_in_a_folder_above_the_session_is_read(box):
     assert run(box, LAUNCH, payload("Agent", sub, prompt="p", subagent_type="iso")) == 2
 
 
+@needs_git
+def test_a_decoy_definition_cannot_hide_the_one_that_asks_for_a_worktree(box):
+    """Re-review blocker 2: Claude Code matches an agent by the `name:` in its front matter, not by its file name."""
+    agents = box / "home" / ".claude" / "agents"
+    agents.mkdir(parents=True)
+    (agents / "refactorer.md").write_text("---\nname: other\n---\nDecoy.\n")
+    (agents / "zz.md").write_text("---\nname: refactorer\nisolation: worktree\n---\nReal.\n")
+    ask = payload("Agent", box / "wt", prompt="p", subagent_type="refactorer")
+    assert run(box, LAUNCH, ask) == 2
+    assert run(box, LAUNCH, payload("Agent", box / "main", prompt="p", subagent_type="refactorer")) == 0
+
+
+@needs_git
+@pytest.mark.parametrize(
+    "front",
+    [
+        "name: iso\nisolation: worktree  # a comment after the value\n",
+        "name: iso\ndescription: |\n  one\n---\n  two\nisolation: worktree\n",
+        "name: 'iso'\nIsolation: \"worktree\"\n",
+    ],
+)
+def test_the_isolation_line_is_found_through_comments_and_odd_layouts(box, front):
+    agents = box / "wt" / ".claude" / "agents"
+    agents.mkdir(parents=True)
+    (agents / "a.md").write_text(f"---\n{front}---\nbody\n")
+    assert run(box, LAUNCH, payload("Agent", box / "wt", prompt="p", subagent_type="iso")) == 2
+
+
+@needs_git
+def test_a_definition_that_overrides_a_built_in_name_is_read_first(box):
+    agents = box / "home" / ".claude" / "agents"
+    agents.mkdir(parents=True)
+    (agents / "explore.md").write_text("---\nname: Explore\nisolation: worktree\n---\n")
+    assert run(box, LAUNCH, payload("Agent", box / "wt", prompt="p", subagent_type="Explore")) == 2
+
+
+@needs_git
+def test_a_linked_worktree_whose_git_file_was_rewritten_is_not_a_main_checkout(box):
+    """Re-review should 3: `.git` rewritten to name the main repository makes git say git-dir equals common-dir."""
+    (box / "wt" / ".git").write_text(f"gitdir: {box / 'main' / '.git'}\n")
+    assert run(box, LAUNCH, payload("Workflow", box / "wt", name="x")) == 2
+
+
+def test_a_cd_into_a_symlinked_folder_does_not_make_a_write_through_it_pass(box):
+    """Re-review blocker 1: the model's `cd` moves the payload folder; only the start folder's own links are exempt."""
+    decoy = box / "plain" / "decoy"
+    decoy.mkdir()
+    (box / "plain" / "lnk").symlink_to(decoy)
+    text = config_policy(box)
+    body = payload("Write", box / "plain" / "lnk", file_path=str(box / "plain" / "lnk" / "x"), content="x")
+    assert run(box, text, body, start=box / "plain") == 2
+    assert run(box, text, payload("Write", box / "plain", file_path=str(box / "plain" / "lnk" / "x"), content="x")) == 2
+
+
 def test_config_guard_edits_only_by_the_owner(box):
     target = box / "guarded" / "settings.json"
     other = box / "plain" / "notes.txt"

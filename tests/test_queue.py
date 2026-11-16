@@ -410,8 +410,8 @@ def test_stale_owner_reaped_only_on_pid_and_start(tmp_path):
     status = {r["run_id"]: r["status"] for r in ledger.receipts(last=10)}
     assert status[alive] == "running" and status[nostart] == "running"  # the lease has not run out
     assert status[reused] == "interrupted" and status[dead] == "interrupted"
-    assert {r["stop_reason"] for r in sink} == {"crashed"} and len(sink) == 2
-    assert all(r["status"] == "error" and r["error"].startswith("interrupted") for r in sink)
+    assert {r["stop_reason"] for r in sink} == {"owner_gone"} and len(sink) == 2
+    assert all(r["status"] == "outcome_unknown" and r["duration_ms"] == 0 for r in sink)  # found gone at its start
     assert runrecord.record_cost(sink[0], 2.0, None) == 2.0  # counted at the fallback, like any run with no cost
     ledger.clock = lambda: T0 + timedelta(hours=2)
     assert ledger.reap(T0 + timedelta(hours=2)) == 1  # the unknown one, once its lease is over
@@ -1279,10 +1279,9 @@ def test_a_crash_between_reserve_and_start_does_not_strand_the_reservation(box, 
     ledger.conn().execute("UPDATE receipts SET owner_pid = ?", (dead.pid,))  # its owner has died
     assert cli.main(["run", "daily"]) == 0  # the same job runs: the dead one is reaped first, not waited for
     recs = runrecord.read(runrecord.runs_path())
-    crashed = next(r for r in recs if r["stop_reason"] == "crashed")
-    assert (
-        crashed["status"] == "error" and crashed["job"] == "daily" and crashed["run_id"] == stranded.reservation.run_id
-    )
+    crashed = next(r for r in recs if r["stop_reason"] == "owner_gone")
+    assert crashed["status"] == "outcome_unknown" and crashed["job"] == "daily"
+    assert crashed["run_id"] == stranded.reservation.run_id
     rows = {r["run_id"]: r for r in queue.ledger_for_env().receipts(last=5)}
     assert rows[crashed["run_id"]]["status"] == "interrupted" and rows[crashed["run_id"]]["record_written"]
     assert {r["status"] for r in rows.values()} == {"interrupted", "ok"}
@@ -1460,3 +1459,139 @@ def test_a_transient_stop_is_retried_through_drain_with_a_backoff(tmp_path):
     assert seen[0] == run_id
     assert len(ledger.receipts(last=10)) == 2  # the retry has a receipt of its own
     assert message_status(ledger, mid) == int(sqlqueue.Status.DONE)
+
+
+# ---- planted failure drills (ar-T3, pc-K22): a killed run is never silent, a normal one never alerts ------------------
+
+HOLDER = """
+import os, sys, time
+from datetime import UTC, datetime
+from ws import queue
+state, job, run_id = sys.argv[1:4]
+ledger = queue.Ledger(state, limits=queue.Limits(max_concurrent=50, busy_s=10.0), memory=lambda: None,
+                      rate_limits=lambda now: None)
+d = ledger.admit(queue.Request(job=job, run_id=run_id, cap_usd=100.0, usd=1.0, turns=5, seconds=600.0), datetime.now(UTC),
+                 lambda: queue.Spend(0.0, {}))
+print(d.kind, flush=True)
+time.sleep(120)
+"""
+
+
+def planted_kills(tmp_path, n: int) -> tuple[list[str], float]:
+    """`n` real processes each hold a reservation and are killed with SIGKILL: no handler runs, no record is written.
+    Returns their run ids and the wall-clock time of the last kill."""
+    import signal
+    import subprocess
+    import time
+
+    ids = [f"20261108T030000Z-{0xA00000 + i:06x}" for i in range(n)]
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-c", HOLDER, str(tmp_path / "state"), f"killed{i}", rid],
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        for i, rid in enumerate(ids)
+    ]
+    try:
+        assert [p.stdout.readline().strip() for p in procs] == ["admit"] * n
+    finally:
+        for p in procs:
+            p.send_signal(signal.SIGKILL)
+        for p in procs:
+            p.wait()
+            p.stdout.close()
+    assert all(p.returncode == -signal.SIGKILL for p in procs)
+    return ids, time.time()
+
+
+def alerting(tmp_path, **kw):
+    alerts: list[tuple[str, str, str, float]] = []
+    sink: list[dict] = []
+    import time
+
+    ledger = queue.Ledger(
+        tmp_path / "state", limits=queue.Limits(max_concurrent=50, busy_s=10.0), memory=lambda: None,
+        rate_limits=lambda now: None, costing=(2.0, None), sink=lambda rec: sink.append(rec) or True,
+        on_stop=lambda job, run_id, why: alerts.append((job, run_id, why, time.time())), **kw,
+    )  # fmt: skip
+    return ledger, alerts, sink
+
+
+@pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="no /proc: the owner check needs a process table")
+def test_planted_sigkill_outcome_unknown(tmp_path):
+    ids, _ = planted_kills(tmp_path, 1)
+    ledger, _, sink = alerting(tmp_path)
+    assert ledger.reap(datetime.now(UTC)) == 1
+    (rec,) = sink
+    assert (rec["run_id"], rec["status"], rec["stop_reason"]) == (ids[0], "outcome_unknown", "owner_gone")
+    assert rec["duration_ms"] > 0 and rec["exit_code"] is None  # ended minus started, not 0
+    assert runrecord.record_cost(rec, 2.0, None) == 2.0
+    row = ledger.receipt(ids[0])
+    assert (row["status"], row["stop_reason"], row["actual_usd"], row["settled"]) == (
+        "interrupted",
+        "owner_gone",
+        2.0,
+        True,
+    )
+
+
+def test_planted_sigkill_duration_is_capped_at_the_runs_timeout(tmp_path):
+    host = Host()
+    clock = Clock()
+    ledger, _, sink = alerting(tmp_path, probe=host.probe, clock=clock)
+    r = req(owner_pid=4300, seconds=60.0)
+    assert ledger.admit(r, T0, spend()).kind == "admit"
+    host.procs[4300] = (False, None)
+    assert ledger.reap(T0 + timedelta(minutes=30)) == 1  # found long after: it cannot have run past its timeout
+    assert sink[0]["duration_ms"] == 60_000 and sink[0]["ended_at"] == "2026-11-08T03:01:00.000Z"
+
+
+@pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="no /proc: the owner check needs a process table")
+def test_planted_sigkill_one_alert(tmp_path):
+    """ar-T3: 10 planted SIGKILL runs give 10 alerts within 5 minutes, one each, however many processes reap."""
+    import time
+
+    ids, killed_at = planted_kills(tmp_path, 10)
+    ledger, alerts, sink = alerting(tmp_path)
+    other, other_alerts, _ = alerting(tmp_path)  # a second process looking at the same store
+    assert ledger.reap(datetime.now(UTC)) == 10
+    assert other.reap(datetime.now(UTC)) == 0 and ledger.reap(datetime.now(UTC)) == 0
+    assert other.admit(req(cap_usd=100.0), datetime.now(UTC), spend()).kind == "admit"  # admission reaps too
+    assert sorted(a[1] for a in alerts) == sorted(ids) and other_alerts == []
+    assert all(a[2].startswith("outcome_unknown") for a in alerts)
+    assert max(a[3] for a in alerts) - killed_at < 300 and time.time() - killed_at < 300
+    assert len(sink) == 10 and {r["status"] for r in sink} == {"outcome_unknown"}
+
+
+def test_planted_normal_runs_no_alert(tmp_path):
+    """ar-T3: 0 false alerts over 50 normal runs, settled directly and through a drain, with reaps between them."""
+    ledger, alerts, sink = alerting(tmp_path, clock=Clock())
+    for i in range(25):
+        r = req(job=f"normal{i}", cap_usd=1000.0)
+        d = ledger.admit(r, T0, spend())
+        assert d.kind == "admit"
+        ledger.reap(T0)
+        ledger.settle(d.reservation, status="ok", usd=0.01, tokens=None, stop_reason="completed", now=T0)
+    for i in range(25):
+        ledger.enqueue(f"queued{i}", None, T0)
+    out = queue.drain(ledger, lambda item: queue.Outcome(0, "ok", "completed"))
+    assert len(out) == 25 and {d["action"] for d in out} == {"done"}
+    assert ledger.reap(T0) == 0
+    assert alerts == [] and sink == []
+
+
+def test_planted_new_status_reads_old_reader(tmp_path):
+    """A record with the new status and fields reads through the reader today's ws uses, the new fields ignored; and a
+    store reaped by today's ws (receipt `crashed`) is still recovered as an interruption."""
+    log = tmp_path / "logs" / "runs.jsonl"
+    rec = runrecord.unknown_outcome("20261108T030000Z-0000aa", "j", T0, T0 + timedelta(seconds=9), ws_version="0")
+    rec.update(approval={"switch": "act-and-tell", "quote": "go"}, run_key="j:m1", chain_depth=0)
+    runrecord.append(log, rec)
+    old_keys = runrecord.KEYS[: runrecord.KEYS.index("reservation") + 1]
+    (line,) = [json.loads(x) for x in log.read_text(encoding="utf-8").splitlines()]
+    old_view = {k: line[k] for k in old_keys}  # what a reader that knows only the earlier keys takes from it
+    assert old_view["status"] == "outcome_unknown" and old_view["duration_ms"] == 9000
+    assert old_view["run_id"] == rec["run_id"] and old_view["stop_reason"] == "owner_gone"
+    assert queue._recovered_outcome({"status": "interrupted", "stop_reason": "crashed"}).stop_reason == "interrupted"
+    assert queue._recovered_outcome({"status": "interrupted", "stop_reason": "owner_gone"}).stop_reason == "interrupted"

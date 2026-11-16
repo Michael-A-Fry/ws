@@ -38,8 +38,10 @@ or unreadable, the run is refused: it never starts without a reservation.
 
 A run settles once, from what it used, in the path that writes its record (status, cost, tokens, stop reason). Settling
 twice changes nothing, and only the claim that reserved can settle: no command settles or frees a reservation for
-someone else. A crash leaves a row whose owner (process id and start time) is gone; the next admission reaps it, writes
-the run's record at the fallback cost and releases the reservation. Retries: exit 3 never; 143 is `preempted`, settled
+someone else. A crash leaves a row whose owner (process id and start time) is gone; the next admission or drain
+reaps it, writes the run's record (status `outcome_unknown`, its duration from start to the moment it was found gone
+or its timeout, whichever is sooner) at the fallback cost, releases the reservation and says so once through
+`on_stop`. Retries: exit 3 never; 143 is `preempted`, settled
 at its actuals and requeued (a `preemptible` job, if the deadline allows); a timeout, an unreachable broker or an
 interruption backs off 30 s, 1 m, 5 m, three tries; anything else is permanent. A deadline that has passed ends a run as
 `expired`, without running it. A queued job must use an API-key credential through `[[secrets]]` or a local provider:
@@ -48,8 +50,9 @@ unattended work never draws on a subscription login.
 A job that stops for good (refused, over a cap, a slot wait that timed out, or failed after its tries) sends one short
 line through the notify role, if `[roles.notify]` has an adapter that sends (`notify_stop`). A retry, a requeue and a
 wait are not stops. No notify role is silence, and a notice that cannot be sent is dropped: it never changes what the job
-came to. The line counts as one alert against the adapter's daily allowance. A reservation reaped after a crash is not
-announced.
+came to. The line counts as one alert against the adapter's daily allowance. A run reaped after a SIGKILL, OOM or
+power loss is announced once (`outcome_unknown`), by whichever process reaped it; one that had written its own record
+is not.
 
 `add`, `cancel` and `run` are refused in a gated session; `list`, `show` and `slot` are not. Limits default to the
 constants below and are read from `[roles.queue]` in the profile.
@@ -109,6 +112,9 @@ MAX_RETRIES = 3
 WAIT_RETRY_S = 30
 PREEMPT_REQUEUE_S = 30
 TRANSIENT_STOPS = frozenset({"timeout", "broker_unavailable", "interrupted"})
+LOST_STOPS = frozenset(
+    {"owner_gone", "crashed"}
+)  # a run whose holder was gone; `crashed` is the pre-outcome_unknown word
 
 _LIMIT_KEYS = {
     "max_concurrent": ("int", MAX_CONCURRENT),
@@ -488,6 +494,7 @@ class Ledger:
         self.rate_limits = rate_limits or (lambda now: usage.read_rate_limits(self.state, now))
         self.recorded, self.sink, self.clock = recorded, sink, clock
         self.on_stop = on_stop
+        self._reaped: list[tuple[str, str]] = []  # (job, run_id) reaped inside a transaction, told after it
         self._conn: sqlite3.Connection | None = None
         self._engine: sqlqueue.SqlQueue | None = None
 
@@ -575,7 +582,8 @@ class Ledger:
                 decision = self._evaluate(c, req, now, month_spend)
                 if not dry:
                     decision = self._apply(c, req, decision, now)
-                return decision
+            self._tell_reaped()
+            return decision
         except StoreError as e:
             return Decision("refuse", e.kind, e.message, e.hint)
         except (sqlite3.Error, OSError) as e:
@@ -886,9 +894,19 @@ class Ledger:
     def reap(self, now: datetime) -> int:
         """Release every reservation whose owner is gone. Returns how many."""
         with _transaction(self.conn()) as c:
-            return self._reap(c, now)
+            n = self._reap(c, now)
+        self._tell_reaped()
+        return n
+
+    def _tell_reaped(self) -> None:
+        """Say once for each run reaped as `outcome_unknown` in the transaction that has just committed. (A rolled-back
+        reap is forgotten here too: the next reaper finds the run again and tells it then.)"""
+        told, self._reaped = self._reaped, []
+        for job, run_id in told:
+            self.stopped(job, run_id, "outcome_unknown: the process that held it was gone before it finished")
 
     def _reap(self, c: sqlite3.Connection, now: datetime) -> int:
+        self._reaped = []  # one transaction's worth: what a rolled-back one queued is found and told again
         ns = to_ns(now)
         n = 0
         for r in c.execute("SELECT * FROM receipts WHERE status = 'running'").fetchall():
@@ -906,7 +924,8 @@ class Ledger:
 
     def _reap_one(self, c: sqlite3.Connection, r: sqlite3.Row, now: datetime) -> None:
         """A run whose owner is gone. If it got as far as writing its record, settle from that. Otherwise write the record
-        it never got to (a started run counts at the fallback cost, as any run with no reported cost does)."""
+        it never got to, `outcome_unknown` (a started run counts at the fallback cost, as any run with no reported cost
+        does), and queue one notice for after the transaction. The `settled = 0` guard makes one reaper the winner."""
         run_id, ns = r["run_id"], to_ns(now)
         if r["who"] is not None:
             # a `ws queue slot` held the place for a command of the person's, not a job: there is no run record to write
@@ -920,22 +939,25 @@ class Ledger:
         unknown_run_usd, fallback = self.costing
         rec = self.recorded(run_id) if self.recorded else None
         written = True
-        if rec is None:
-            rec = runrecord.new(
-                run_id=run_id, job=r["job"], started_at=runrecord.iso(from_ns(r["started_at"] or r["queued_at"])),
-                ended_at=runrecord.iso(now), duration_ms=0, status="error", purpose=r["purpose"], stop_reason="crashed",
-                error="interrupted: the process that held this run was gone before it finished", ws_version=_version(),
-            )  # fmt: skip
+        lost = rec is None
+        if lost:
+            started = from_ns(r["started_at"] or r["queued_at"]) or now
+            last = started + timedelta(seconds=float(r["reserved_s"] or 0)) if r["reserved_s"] else now
+            rec = runrecord.unknown_outcome(
+                run_id, r["job"], started, min(now, last), purpose=r["purpose"], ws_version=_version()
+            )
             written = bool(self.sink(rec)) if self.sink else False
         usd = runrecord.record_cost(rec, unknown_run_usd, fallback)
         status = {"ok": "ok", "refused": "refused", "preempted": "preempted", "expired": "expired"}.get(
-            rec.get("status"), "interrupted" if rec.get("stop_reason") == "crashed" else "error"
+            rec.get("status"), "interrupted" if rec.get("stop_reason") in LOST_STOPS else "error"
         )
-        c.execute(
+        cur = c.execute(
             "UPDATE receipts SET status = ?, finished_at = ?, settled = 1, actual_usd = ?, record_written = ?, stop_reason = ? "
             "WHERE run_id = ? AND settled = 0",
-            (status, ns, usd, int(written), rec.get("stop_reason") or "crashed", run_id),
+            (status, ns, usd, int(written), rec.get("stop_reason") or "owner_gone", run_id),
         )
+        if lost and cur.rowcount == 1:
+            self._reaped.append((r["job"], run_id))
 
     # -- queued work --------------------------------------------------------------------------------------------
 
@@ -1115,7 +1137,8 @@ class Ledger:
                     delay = 0 if act.kind == "retry" else act.delay_s  # a crash has already cost the wait
                     eng.retry(m.message_id, m.claim_id, delay_s=delay, count_try=act.count_try)
                     back += 1
-            return back
+        self._tell_reaped()
+        return back
 
 
 def _recovered_outcome(last: sqlite3.Row | None) -> Outcome:
@@ -1128,7 +1151,7 @@ def _recovered_outcome(last: sqlite3.Row | None) -> Outcome:
         return Outcome(EXIT_REFUSED, status, stop)
     if status == "preempted":
         return Outcome(EXIT_FAILED, "preempted", "preempted")
-    if status == "error" and stop and stop != "crashed":
+    if status == "error" and stop and stop not in LOST_STOPS:
         return Outcome(EXIT_FAILED, "error", stop)
     return Outcome(EXIT_FAILED, "interrupted", "interrupted")
 

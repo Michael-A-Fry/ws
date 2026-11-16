@@ -13,7 +13,8 @@ body of the GitHub release.
 - `config-guard` decides who owns a protected file by the root of the repository the session is in, not by a folder
   prefix: the main checkout and any folder inside it own it; a linked worktree doesn't, even one kept under the owner,
   and a folder outside git doesn't, nor does a repository whose `core.worktree` points elsewhere. If git can't say,
-  the session isn't an owner. An `owners` entry is now the root of a repository's main checkout.
+  the session isn't an owner. A folder kept under `.claude/worktrees/`, or under any worktree git lists, never owns.
+  An `owners` entry is now the root of a repository's main checkout.
 
 ### Fixed
 

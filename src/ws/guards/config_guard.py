@@ -4,8 +4,9 @@
 (absolute or `~/`, each the root of a repository's main checkout). A session is an owner when the folder it is in lies inside a
 main checkout whose root (`git rev-parse --show-toplevel`) is exactly one of the owners: the main checkout and any folder inside
 it, but not a linked worktree of it, even one kept under it, not a folder outside any repository, and not a repository whose
-`core.worktree` points somewhere else (a session can set that in its own repository's config). If git can't say, the session is
-not an owner. A write tool call (Edit, Write, MultiEdit, NotebookEdit) whose real
+`core.worktree` points somewhere else (a session can set that in its own repository's config). A folder under `<root>/.claude/worktrees/` or under a worktree git lists (a prunable one too)
+never owns. This is defence in depth, not containment: a session that can write inside the owner's tree isn't fully contained by this check
+alone. If git can't say, the session is not an owner. A write tool call (Edit, Write, MultiEdit, NotebookEdit) whose real
 path is a protected file, or inside a protected folder, is denied unless the session is an owner, and the reason names the owners.
 Links are followed on both sides, so a path through a symlink is the file it points at. A path that can't be resolved
 to a real one is a deny. The person can approve the edit once.

@@ -494,3 +494,53 @@ def test_a_nested_repository_whose_core_worktree_points_at_the_owner_does_not_ow
     git(nested, "init", "-q", "-b", "main")
     git(nested, "config", "core.worktree", str(main))
     assert edit_from(box, nested, main) == 2
+
+
+@needs_git
+def test_a_worktree_whose_git_file_is_removed_does_not_own_before_or_after_a_prune(box):
+    """(i) `rm .git` in a worktree under the owner: git walks up to the owner's .git, and `git worktree list` still shows it as prunable."""
+    main = box / "main"
+    under = main / ".claude" / "worktrees" / "i"
+    git(main, "worktree", "add", "-q", "-b", "i", str(under))
+    (under / ".git").unlink()
+    assert edit_from(box, under, main) == 2
+    git(main, "worktree", "prune")
+    assert edit_from(box, under, main) == 2  # gone from the list: still refused by where it is kept
+
+
+@needs_git
+def test_a_worktree_elsewhere_whose_git_file_is_removed_is_not_an_owner(box):
+    main = box / "main"
+    elsewhere = box / "wt-elsewhere"
+    git(main, "worktree", "add", "-q", "-b", "e", str(elsewhere))
+    (elsewhere / ".git").unlink()
+    assert edit_from(box, elsewhere, main) == 2
+
+
+@needs_git
+def test_a_worktree_whose_git_file_names_the_owners_git_folder_does_not_own(box):
+    """(j) The .git file rewritten to the owner's own folder, then core.worktree set in the shared config."""
+    main = box / "main"
+    under = main / ".claude" / "worktrees" / "j"
+    git(main, "worktree", "add", "-q", "-b", "j", str(under))
+    (under / ".git").write_text(f"gitdir: {main / '.git'}\n")
+    git(main, "config", "core.worktree", str(main))
+    assert edit_from(box, under, main) == 2
+    elsewhere = box / "wt-j"
+    git(main, "worktree", "add", "-q", "-b", "j2", str(elsewhere))
+    (elsewhere / ".git").write_text(f"gitdir: {main / '.git'}\n")
+    assert edit_from(box, elsewhere, main) == 2
+
+
+@needs_git
+def test_the_guard_launch_check_refuses_the_same_two_breaks(box):
+    from ws.guards import guard_launch
+
+    main = box / "main"
+    under = main / ".claude" / "worktrees" / "g"
+    git(main, "worktree", "add", "-q", "-b", "g", str(under))
+    assert guard_launch.is_main_checkout(str(main))
+    (under / ".git").unlink()
+    assert not guard_launch.is_main_checkout(str(under))
+    git(main, "worktree", "prune")
+    assert not guard_launch.is_main_checkout(str(under))

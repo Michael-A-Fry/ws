@@ -38,10 +38,16 @@ def lines(folder: str, *args: str) -> list[str] | None:
     return done.stdout.splitlines() if done.returncode == 0 else None
 
 
+def _inside(path: str, folder: str) -> bool:
+    return path == folder or path.startswith(folder.rstrip("/") + "/")
+
+
 def main_toplevel(folder: str) -> str | None:
     """The root of the main checkout `folder` is in, or None. Main means git's own folder is `<root>/.git` and is the common one, so a linked
     worktree is not, and neither is a repository whose `core.worktree` (or a rewritten `.git` file) points somewhere else, which a session
-    can set in its own repository's config; and `folder` itself must lie inside the root git names."""
+    can set in its own repository's config; and `folder` itself must lie inside the root git names. Two refusals by location, because a session that can write inside the
+    owner's tree can rewrite a worktree's `.git` file or remove it, and git then walks up to the owner's: a folder under `<root>/.claude/worktrees/`, and a
+    folder under any worktree `git worktree list` registers besides the main one (a prunable one too). That is defence in depth, not containment."""
     if not folder or not os.path.isabs(folder) or not os.path.isdir(folder):
         return None
     got = lines(folder, "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir", "--show-toplevel")
@@ -51,4 +57,14 @@ def main_toplevel(folder: str) -> str | None:
     here = os.path.realpath(folder)
     if git_dir != common or git_dir != os.path.join(top, ".git"):
         return None
-    return top if here == top or here.startswith(top.rstrip("/") + "/") else None
+    if not _inside(here, top) or _inside(here, os.path.join(top, ".claude", "worktrees")):
+        return None  # by location: a folder kept where linked worktrees are kept never counts, even after its worktree is pruned
+    listed = lines(top, "worktree", "list", "--porcelain")
+    if listed is None:
+        return None
+    others = [os.path.realpath(ln[len("worktree ") :]) for ln in listed if ln.startswith("worktree ")][
+        1:
+    ]  # the first is the main one
+    if any(_inside(here, w) for w in others):
+        return None  # a registered linked worktree (a prunable one too, whose .git was removed or rewritten) is not the main checkout
+    return top

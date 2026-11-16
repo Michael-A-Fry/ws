@@ -478,6 +478,41 @@ Serve memory_search, memory_add and note_capture over stdio.
 ws mcp serve [-h]
 ```
 
+## `ws connector`
+
+Zone MCP servers (`[connectors.NAME]` in the [policy](policy.md#connectorsname)): list them, start a session with one,
+and the hook that judges and logs each call. See [Plug in a zone MCP server](../how-to/plug-in-zone-mcp.md).
+
+### `ws connector list`
+
+The policy's connectors, and whether a session in this folder may read each.
+
+```text
+ws connector list [-h]
+```
+
+### `ws connector launch`
+
+Start Claude Code (through `ws gate launch`) with the named connectors wired in, for this launch only. An admin command:
+a session can't run it.
+
+```text
+ws connector launch [-h] [-c NAME] ...
+```
+
+| Argument | Meaning |
+|---|---|
+| `-c NAME`, `--connector NAME` | A connector to plug in (repeatable). |
+| `cmd` | `--` then the runner's command line (`claude ...`). |
+
+### `ws connector audit`
+
+Hook entry: judge one MCP call against its connector's allowlist and log it. Exit 2 refuses the call.
+
+```text
+ws connector audit [-h] [--policy FILE] [--pin KEY=PATH]
+```
+
 ## `ws run`
 
 Run a headless job (a file in ~/.config/ws/jobs) and record what it did.

@@ -107,12 +107,13 @@ import shlex
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 
-from ws import guards, jobs, paths, wallsettings
+from ws import connectors, guards, jobs, paths, wallsettings
 from ws.adapters import Call, check_argv, client_argv, event_argv, protected_paths
 from ws.approvals import ENV_MARKER, SANDBOX_MARKER, ApprovalError
 from ws.approvals import _read_regular as read_regular
 from ws.output import WsError
 from ws.policy import Policy, native_patterns, sandbox_read_paths, sandbox_write_paths
+from ws.policy import load as load_policy
 
 NAME = "claude-code"
 FILE = "settings.json"
@@ -617,6 +618,10 @@ def generate(
             settings["hooks"][name][0]["hooks"].append(_event_hook(ws_cmd, policy_file, pin))
     for name, groups in guard_hooks(policy, ws_cmd, policy_file, pin).items():
         settings["hooks"][name] = groups
+    if group := connectors.hook_group(
+        policy, ws_cmd, policy_file, pin, HOOK_TIMEOUT
+    ):  # each connector call judged and logged
+        settings["hooks"]["PreToolUse"].append(group)
     settings["hooks"]["Notification"] = [{"hooks": [alert_hook(ws_cmd, pin)]}]
     settings["hooks"].setdefault("Stop", [{"hooks": []}])[0]["hooks"].append(alert_hook(ws_cmd, pin))
     if INBOX_GUARD in policy.guards.on:  # messages on: an idle session is woken when one arrives
@@ -711,7 +716,7 @@ EXE = "claude"
 # answer without them (measured: about 1 in 5 first calls). Headless runs wait for the connection, up to 5 minutes.
 MCP_WAIT_ENV = {"MCP_CONNECTION_NONBLOCKING": "false", "MCP_TIMEOUT": "300000", "MCP_CONNECT_TIMEOUT_MS": "300000"}
 PLACEHOLDER_KEY = "ws-lease-placeholder"  # the runner holds this; the broker swaps in the real key on the way out
-OPTIONS = {"exe", "allowed_tools", "env"}
+OPTIONS = {"exe", "allowed_tools", "env", "connectors"}
 PROMPT_VIA_STDIN = True  # `claude -p` reads the prompt from stdin: it stays out of argv and `ps`
 
 
@@ -735,13 +740,45 @@ def build_command(job, run_dir: Path, lease) -> tuple[list[str], dict[str, str]]
         argv += ["--max-turns", str(job.max_turns)]
     if job.max_budget_usd is not None:
         argv += ["--max-budget-usd", f"{job.max_budget_usd:.4f}"]
+    env = jobs.extra_env(job)  # first: what ws sets below always wins
+    if names := jobs.string_list(job, "connectors"):
+        argv, tools = _connectors(job, names, run_dir, argv, tools)
+        env.update({connectors.AGENT_ENV: job.name, connectors.WIRED_ENV: ",".join(dict.fromkeys(names))})
     if tools:
         argv += ["--allowedTools", ",".join(tools)]
-    env = jobs.extra_env(job)  # first: what ws sets below always wins
     env.update(DISABLE_AUTOUPDATER="1", CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1", **MCP_WAIT_ENV)
     if lease is not None:
         env.update(ANTHROPIC_BASE_URL=lease.base_url, ANTHROPIC_API_KEY=PLACEHOLDER_KEY)
     return argv, env
+
+
+def _connectors(job, names: list[str], run_dir: Path, argv: list[str], tools: list[str]):
+    """runner_options.connectors: the MCP config for this run only (ws.connectors), and allowed_tools narrowed to their
+    allowlists. ws.run asks for the command once to check the job, before the run folder exists, and again to start it,
+    after the gate files are written: only the second leases a token and writes the config. Raises ValueError."""
+    try:
+        pol = load_policy()
+        conns = connectors.pick(pol, names, connectors.session_class(pol, job.cwd))
+        tools = connectors.narrow(conns, tools)
+        if not (run_dir / "gate").is_dir():
+            return [*argv, "--mcp-config", str(run_dir / "gate" / "mcp.json"), "--strict-mcp-config"], tools
+        ttl = float(job.timeout_s) + 120 if job.timeout_s else None  # a little past the run's own limit
+        wiring = connectors.wire(conns, run_dir / "gate", connectors.default_lessor(ttl_s=ttl))
+    except WsError as e:
+        raise ValueError(f"runner_options.connectors: {e.message}") from e
+    _RUN_LEASES[str(run_dir)] = wiring.leases
+    return [*argv, *wiring.argv], tools
+
+
+_RUN_LEASES: dict[
+    str, list
+] = {}  # run folder -> the connector leases its command took (ws.run releases and redacts them)
+
+
+def run_leases(run_dir: Path) -> list:
+    """The connector leases `build_command` took for this run, handed over once: ws.run releases them when the run
+    ends and keeps their addresses out of what it stores, as for its own leases."""
+    return _RUN_LEASES.pop(str(run_dir), [])
 
 
 def _int(v) -> int | None:

@@ -25,6 +25,9 @@ body of the GitHub release.
   `done`, `withdraw` and `import` (an older asks file, safe to run twice), in the file `ws home` already reads asks
   from. An ask whose repo isn't in a full-access class, or that hits the sensitive-terms file, is stored with no text;
   a token-shaped secret is refused; the class is checked again on every read. See [Asks](docs/reference/asks.md).
+- `ws ask note ID TEXT` appends a note to an open or answered ask (a new `noted` event; earlier text is never
+  rewritten), with the checks a question gets: a secret is refused, and a note on a redacted ask, or with a sensitive
+  term, keeps no text. Notes show in `ws ask get` and `ws ask list`, JSON included.
 - `ws session load` puts standing preferences, an area card and, on the first prompt, the records a search finds in front
   of a session, from one folder of plain files (`WS_CONTEXT_DIR`). A walled session sees only its own class's records
   and the core preferences; a record with an unknown, wrong-case or non-text `class`, or front matter ws can't fully

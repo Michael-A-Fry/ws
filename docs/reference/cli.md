@@ -782,6 +782,113 @@ ws msg export [-h] [--out PATH] [--after ID] [--limit N]
 | `--after ID` | Only messages after this id. |
 | `--limit N` | At most N (default 10000, up to 100000). |
 
+## `ws ask`
+
+Leave a question for a person and read back the answer: one queue across every session. See [Asks](asks.md).
+
+```text
+ws ask [-h] {add,list,get,answer,wait,note,done,withdraw,import} ...
+```
+
+### `ws ask add`
+
+Add an ask and print its id; the first `--option` is the recommendation.
+
+```text
+ws ask add [-h] [--question TEXT] [--option LABEL|DESCRIPTION] [--decision TEXT] [--free-text | --no-free-text]
+    [--repo NAME] [--cwd DIR] [--session NAME] [--tmux TARGET] [--dedupe-key KEY] [--stdin]
+```
+
+| Argument | Meaning |
+|---|---|
+| `--question TEXT` | The question (at most 2000 characters). |
+| `--option LABEL\|DESCRIPTION` | An option; repeat for more (at most 6). |
+| `--decision TEXT` | What the answer decides. |
+| `--free-text`, `--no-free-text` | Whether an answer may be free text (default: it may). |
+| `--repo NAME` | The repo it's about (default: the working folder's name). |
+| `--cwd DIR` | The folder the ask comes from (default: this one). |
+| `--session NAME` | Who asks (default `$WS_SESSION_NAME`). |
+| `--tmux TARGET` | The tmux target to go to. |
+| `--dedupe-key KEY` | An open ask with this key is returned, not added. |
+| `--stdin` | Read the ask from standard input as one JSON object. |
+
+### `ws ask list`
+
+Open asks, oldest first, with a count of their notes.
+
+```text
+ws ask list [-h] [--all]
+```
+
+| Argument | Meaning |
+|---|---|
+| `--all` | Every status. |
+
+### `ws ask get`
+
+One ask: its status, answer and notes. An unknown id is exit 2.
+
+```text
+ws ask get [-h] id
+```
+
+### `ws ask answer`
+
+Answer with an option label (any case), a 1-based number, or free text.
+
+```text
+ws ask answer [-h] id text [text ...]
+```
+
+### `ws ask wait`
+
+Block until answered: 0 and the answer, 3 timed out, 4 withdrawn or done.
+
+```text
+ws ask wait [-h] [--timeout SECONDS] id
+```
+
+| Argument | Meaning |
+|---|---|
+| `--timeout SECONDS` | Give up after this long (default 540). |
+
+### `ws ask note`
+
+Add a note to an open or answered ask; it's appended, and nothing earlier is changed. A done or withdrawn ask is exit 1
+(`not_open`), an unknown id exit 2. The note is checked and redacted as a question is.
+
+```text
+ws ask note [-h] id text [text ...]
+```
+
+### `ws ask done`
+
+The session has acted on it (an open or answered ask); a no-op that prints the status if it's already closed.
+
+```text
+ws ask done [-h] id
+```
+
+### `ws ask withdraw`
+
+The session no longer needs it (an open ask); a no-op that prints the status if it's already closed.
+
+```text
+ws ask withdraw [-h] id
+```
+
+### `ws ask import`
+
+Convert an older asks file into events here (safe to run twice).
+
+```text
+ws ask import [-h] [--dry-run] path
+```
+
+| Argument | Meaning |
+|---|---|
+| `--dry-run` | Say what would be imported; write nothing. |
+
 ## `ws install`
 
 Set up ws on this machine; run it again and it reports 0 changes.

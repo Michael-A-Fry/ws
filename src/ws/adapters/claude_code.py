@@ -805,6 +805,9 @@ def parse_result(stdout: str, stderr: str, exit_code: int | None) -> dict:
         "duration_api_ms": _int(r.get("duration_api_ms")),
         "num_turns": _int(r.get("num_turns")),
         "error": error,
+        # claude's own word for how it stopped (success, error_max_turns, error_max_budget_usd, ...), kept as it said
+        # it: the run record turns an `ok` with a turn or budget stop into an error (runrecord.checked)
+        "stop_subtype": r["subtype"][:64] if isinstance(r.get("subtype"), str) and r["subtype"] else None,
     }
 
 

@@ -132,7 +132,15 @@ def test_reveal_notify_pushes_the_link_once_and_still_serves(box, write_profile,
     assert cli.main(["secret", "generate", "backup-password"]) == 0
     value = wsecrets.Store(wsecrets.store_dir()).read("backup-password")
     s = Sender()
-    monkeypatch.setattr(ntfy, "post", s)
+    pushed = threading.Event()  # the push comes after the page is made: once it is set, both are there
+
+    def post(*a):
+        try:
+            return s(*a)
+        finally:
+            pushed.set()
+
+    monkeypatch.setattr(ntfy, "post", post)
     made = []
     real = reveal.make_page
     monkeypatch.setattr(reveal, "make_page", lambda *a, **k: made.append(real(*a, **k)) or made[-1])
@@ -144,10 +152,12 @@ def test_reveal_notify_pushes_the_link_once_and_still_serves(box, write_profile,
         daemon=True,
     )
     t.start()
-    for _ in range(100):
-        if made and s.calls:
-            break
-        t.join(0.05)
+    # wait on the push itself, not a fixed number of polls: a loaded macOS runner took over 5 s to get there (16 Nov).
+    # The cap only stops a hang; a reveal that ends without pushing fails at once with its exit code.
+    give_up = time.monotonic() + 120
+    while not pushed.wait(0.05):
+        assert t.is_alive() or pushed.is_set(), f"the reveal ended without pushing the link (exit {box_.get('code')})"
+        assert time.monotonic() < give_up, "the reveal neither pushed the link nor ended"
     page = made[0]
     (_, body, headers) = s.calls[0]
     assert headers["Click"].endswith(f"/{page.token}") and value.encode() not in body

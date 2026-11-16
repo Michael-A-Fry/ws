@@ -237,14 +237,26 @@ def fallback_count(path: Path) -> int:
 
 def read(path: Path) -> list[dict]:
     """Every record, oldest first, across the rotated files and then the fallback file. A line that is not a JSON object
-    is skipped, so one bad write never hides the rest. No log is no records; one that exists but cannot be read raises
-    OSError. Fallback records are merged in by end time, since they were written later than the log's lines around
-    them."""
+    is skipped, so one bad write never hides the rest, and a run with both an `outcome_unknown` record and its own
+    reads as its own (`superseded_dropped`). No log is no records; one that exists but cannot be read raises OSError. Fallback
+    records are merged in by end time, since they were written later than the log's lines around them."""
     recs = jsonl.read(path)
     extra = jsonl.read_plain(fallback_path(path))
-    if not extra:
+    if extra:
+        recs = sorted([*recs, *extra], key=lambda r: str(r.get("ended_at") or r.get("started_at") or ""))
+    return superseded_dropped(recs)
+
+
+def superseded_dropped(recs: list[dict]) -> list[dict]:
+    """The records with each `outcome_unknown` one left out when its run also has a real record. The reaper writes
+    outcome_unknown because it cannot tell what the run did; a record the run's holder writes for it later (it was
+    stalled, not gone) is the true outcome. The file keeps both, the outcome_unknown line as the alert trail, and
+    reading counts the run once, by its own record."""
+    real = {r.get("run_id") for r in recs if r.get("status") != "outcome_unknown"}
+    lost = {r.get("run_id") for r in recs if r.get("status") == "outcome_unknown"}
+    if not real & lost:
         return recs
-    return sorted([*recs, *extra], key=lambda r: str(r.get("ended_at") or r.get("started_at") or ""))
+    return [r for r in recs if r.get("status") != "outcome_unknown" or r.get("run_id") not in real]
 
 
 # What a run counts against the cap when the runner did not say what it cost. ws ships no prices (they go stale), so

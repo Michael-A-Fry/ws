@@ -10,6 +10,8 @@
     alerts_per_day = 50                           optional: the daily allowance for session alerts
     alert_on = "needs-you"                        optional: "needs-you" alerts when a session needs you, "every-stop"
                                                   alerts on every finished turn (what the key's absence means)
+    hub_url = "https://hub.example.org"           optional (https only): the hub's address. With it, a needs-you or
+                                                  finished alert opens the hub at that session when tapped
 
 The interruption cap governs ws's own sends, and only those. The numbers come from `[interrupts]` in policy.toml (1
 digest and 3 pushes a day unless you changed them) and are counted in `<state>/logs/notify-count.json`: `logs` is a
@@ -47,6 +49,11 @@ message never asks, and neither does a message that ends in a code block, so und
 last message alerts on its Notification events only. A key that is absent means "every-stop", so a config written before the key keeps its behaviour; set
 "needs-you" in a new one.
 
+`hub_url` adds ntfy's Click header, `<hub_url>/chat/<session id>`, to a session alert, so a tap opens the hub at that
+session. It is needed because ntfy cannot know where the hub is, and it replaces no setting. Unset, nothing changes.
+An alert gets no Click when the session id is not letters, digits and hyphens, at most 64 (SESSION_ID), or when the session's folder is not known, or when the session's folder
+is in a walled or counts-only class (its id stays out of the push). The reason goes to stderr.
+
 An alert must not hold a session up. The whole send (broker lease included) gets 3 seconds, and runs in a daemon thread
 so a stuck connection is left behind when the time is up. The alert takes the counter lock without waiting: if another
 send holds it, this alert is skipped and recorded as `busy`. After a failed send, alerts pause for 5 minutes (read from
@@ -69,6 +76,7 @@ import json
 import os
 import re
 import socket
+import sys
 import threading
 import urllib.error
 import urllib.parse
@@ -117,6 +125,7 @@ ALERT_BACKOFF = timedelta(minutes=5)  # after a failed send, alerts wait this lo
 FAIL_CODES = ("timeout", "refused", "error")  # plus http_<status>; "busy", "backoff" and "cap" are not send failures
 _local = threading.local()  # .timeout is set on the thread that sends an alert
 _TOPIC = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+SESSION_ID = re.compile(r"[A-Za-z0-9-]{1,64}")  # the form ws already enforces for a Claude Code session id
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 
 
@@ -149,6 +158,20 @@ def target(cfg: dict) -> tuple[str, str, str]:
     if not wsecrets.HOST_RE.match(host):
         raise NotifyError("url has a host name ws cannot use")
     return f"https://{host}/{topic}", host, topic
+
+
+def hub_url(cfg: dict) -> str | None:
+    """`hub_url` of [roles.notify]: an https address with no login, query or fragment, or None when unset. Raises
+    NotifyError for anything else."""
+    v = cfg.get("hub_url")
+    if v is None:
+        return None
+    if isinstance(v, str) and not re.fullmatch(r"[\x21-\x7e]+", v):  # urlsplit drops \n, \r and \t: refuse them first
+        v = None
+    u = urllib.parse.urlsplit(v) if isinstance(v, str) else None
+    if u is None or u.scheme != "https" or not u.hostname or u.username or u.password or u.query or u.fragment:
+        raise NotifyError("hub_url must be an https address with no login, query or fragment")
+    return v.rstrip("/")
 
 
 def token_name(cfg: dict) -> str | None:
@@ -576,6 +599,27 @@ def walled_folder(cwd: str, env) -> bool:
     return cls is not None and cls is not policy.UNCLASSIFIED and cls.access != "full"
 
 
+def click_link(cfg: dict, payload: dict, cwd: str, env) -> str | None:
+    """The Click target for a session alert: `<hub_url>/chat/<session id>`, or None when hub_url is unset, the id does
+    not match SESSION_ID or the folder is walled (the reason goes to stderr)."""
+    base = hub_url(cfg)
+    if base is None:
+        return None
+    if not cwd:
+        print("ws: alert has no click link: the session's folder is unknown, so it cannot be checked", file=sys.stderr)
+        return None
+    sid = payload.get("session_id")
+    if not isinstance(sid, str) or not SESSION_ID.fullmatch(sid):
+        print(
+            "ws: alert has no click link: the session id is missing or not letters, digits and hyphens", file=sys.stderr
+        )
+        return None
+    if walled_folder(cwd, env):
+        print("ws: alert has no click link: the session's folder is in a walled class", file=sys.stderr)
+        return None
+    return f"{base}/chat/{sid}"
+
+
 def alert(cfg: dict, env, payload: object, runner: str, now: datetime | None = None, sender=None) -> str | None:
     """Push the alert a hook payload asks for. Returns the line from `send`, or None when there is nothing to send: a
     payload that isn't a Notification or Stop event, a headless session, session_alerts set to false, or (with alert_on =
@@ -602,7 +646,8 @@ def alert(cfg: dict, env, payload: object, runner: str, now: datetime | None = N
     message = f"a session {said}" if mode == "plain" else f"{folder} {said}"
     if mode == "full" and (extra := _line(payload.get("message"), MAX_RUNNER_MESSAGE)):
         message = f"{message}: {extra}"
-    return send(cfg, env, message, f"ws {_line(runner, 32)}".strip(), "alert", now, sender, priority)
+    click = click_link(cfg, payload, cwd, env)
+    return send(cfg, env, message, f"ws {_line(runner, 32)}".strip(), "alert", now, sender, priority, click)
 
 
 def send_test(cfg: dict, env, now: datetime | None = None, sender=None) -> str:
@@ -617,6 +662,7 @@ def check(cfg, osi, env, network):
     except NotifyError as e:
         return FAIL, str(e)
     try:
+        hub_url(cfg)
         cap, tz = caps(env, cfg), zone(cfg, env)
     except NotifyError as e:
         return FAIL, str(e)

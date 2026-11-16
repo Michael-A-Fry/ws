@@ -15,6 +15,22 @@ body of the GitHub release.
 - The e2e first-task script prints the pending systemd jobs and the process list when a SIGTERM reaches it from
   outside, so a CI runner stopped mid-job says who stopped it.
 
+### Changed
+
+- The pre-push hook runs the tests through `ws-test --light --node local --` (`--full` for `WS_PREPUSH_FULL=1`) when
+  `ws-test` is on the PATH and `WS_PREPUSH_WRAP` is unset or only spaces, so a busy machine queues the push's tests
+  (for up to `WS_TEST_WAIT`, 45 minutes) and caps their workers instead of timing them out. `WS_PREPUSH_WRAP=` (empty)
+  runs them bare.
+
+### Fixed
+
+- The command reader's time limit counts its own CPU time, not the wall clock, so a busy or slow machine (a CI runner,
+  WSL2) no longer refuses an ordinary long command, such as `touch f{1..4000}`, as too slow to read. The wall clock still
+  stops a read that waits, at three times the limit.
+- Flaky tests: the reveal-link test waits on the push itself instead of 5 s of polling; the tests that check the reader
+  is quick measure its CPU time too, as the limit does; and the live conformance row that drives two real runner
+  sessions is sized large, like the end-to-end tests it matches, not small (60 s).
+
 ## [0.1.11] - 2026-11-17
 
 ### Removed

@@ -560,8 +560,14 @@ class Ledger:
             raise OSError(f"{self.folder} is not a folder")
         if st.st_mode & 0o077:
             os.chmod(self.folder, 0o700)
-        fd = os.open(self.path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
-        os.close(fd)
+        # Make the file 0600 only when it is new. Never open and close a database file that may already be open here:
+        # closing any descriptor of a file drops every POSIX lock this process holds on it, including the locks of a
+        # live SQLite connection, and another process then takes itself for the last one and removes the WAL index.
+        try:
+            os.close(os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600))
+        except FileExistsError:
+            if stat.S_ISLNK(os.lstat(self.path).st_mode):
+                raise OSError(f"{self.path} is a symbolic link") from None
         c = sqlite3.connect(str(self.path), isolation_level=None, timeout=self.limits.busy_s, check_same_thread=False)
         try:
             c.row_factory = sqlite3.Row

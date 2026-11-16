@@ -1,6 +1,7 @@
 """Admission before work: nothing starts until its money, turns, time, a slot and memory are reserved, and every run settles from what it used.
 
-    ws queue add JOB [--key K] [--deadline T]   put a job file's run in the queue (unattended work)
+    ws queue add JOB [--trigger ID | --key K] [--deadline T]
+                                                put a job file's run in the queue (unattended work)
     ws queue list [--all] [--last N]            the receipts: queued, running and finished, newest first
     ws queue show RUN_ID                        one receipt
     ws queue cancel RUN_ID                      take a queued run out of the queue
@@ -38,8 +39,10 @@ or unreadable, the run is refused: it never starts without a reservation.
 
 A run settles once, from what it used, in the path that writes its record (status, cost, tokens, stop reason). Settling
 twice changes nothing, and only the claim that reserved can settle: no command settles or frees a reservation for
-someone else. A crash leaves a row whose owner (process id and start time) is gone; the next admission reaps it, writes
-the run's record at the fallback cost and releases the reservation. Retries: exit 3 never; 143 is `preempted`, settled
+someone else. A crash leaves a row whose owner (process id and start time) is gone; the next admission or drain
+reaps it, writes the run's record (status `outcome_unknown`, its duration from start to the moment it was found gone
+or its timeout, whichever is sooner) at the fallback cost, releases the reservation and says so once through
+`on_stop`. Retries: exit 3 never; 143 is `preempted`, settled
 at its actuals and requeued (a `preemptible` job, if the deadline allows); a timeout, an unreachable broker or an
 interruption backs off 30 s, 1 m, 5 m, three tries; anything else is permanent. A deadline that has passed ends a run as
 `expired`, without running it. A queued job must use an API-key credential through `[[secrets]]` or a local provider:
@@ -48,8 +51,21 @@ unattended work never draws on a subscription login.
 A job that stops for good (refused, over a cap, a slot wait that timed out, or failed after its tries) sends one short
 line through the notify role, if `[roles.notify]` has an adapter that sends (`notify_stop`). A retry, a requeue and a
 wait are not stops. No notify role is silence, and a notice that cannot be sent is dropped: it never changes what the job
-came to. The line counts as one alert against the adapter's daily allowance. A reservation reaped after a crash is not
-announced.
+came to. The line counts as one alert against the adapter's daily allowance. A run reaped after a SIGKILL, OOM or
+power loss is announced once (`outcome_unknown`), by whichever process reaped it; one that had written its own record
+is not, and nor is one whose unit the scheduler already alerted (`ws watch alert` wrote a line for the job since the
+run started). The reap runs at the next admission or drain, so a killed run is told when the next job on the machine
+starts, not at the kill.
+
+One net effect per trigger: `enqueue(trigger=ID)` (`--trigger`) gives the run the key `<job>:<ID>`, the run key, for
+the event or message that started it. The ledger keeps it, not the caller: the same key again, queued, running or long
+finished, adds nothing and answers with the first run. A drain that comes back late, after its claim was taken over
+(its lease ran out and the message ran again), finishes nothing: the newer attempt's receipt and record stand. Its
+own late record is the true outcome of its run, so `runrecord.read` counts that and keeps the `outcome_unknown` one in
+the file only as the alert trail. One item a
+drain cannot read or run (unreadable data, a runner that raised) is failed with its reason in the receipt's note, and
+the drain goes on to the next: one bad item never fails the batch. A store or disk error is not one item's: it
+stops the drain.
 
 `add`, `cancel` and `run` are refused in a gated session; `list`, `show` and `slot` are not. Limits default to the
 constants below and are read from `[roles.queue]` in the profile.
@@ -79,7 +95,7 @@ from ws.output import WsError
 from ws.profile import ProfileError, load, profile_path
 
 COMMAND = "queue"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 EXIT_FAILED, EXIT_BAD_JOB, EXIT_REFUSED = 1, 2, 3
 STATUSES = ("queued", "running", "ok", "error", "refused", "preempted", "skipped", "interrupted", "expired")
 ACTIVE = ("queued", "running")
@@ -109,6 +125,9 @@ MAX_RETRIES = 3
 WAIT_RETRY_S = 30
 PREEMPT_REQUEUE_S = 30
 TRANSIENT_STOPS = frozenset({"timeout", "broker_unavailable", "interrupted"})
+LOST_STOPS = frozenset(
+    {"owner_gone", "crashed"}
+)  # a run whose holder was gone; `crashed` is the pre-outcome_unknown word
 
 _LIMIT_KEYS = {
     "max_concurrent": ("int", MAX_CONCURRENT),
@@ -154,6 +173,7 @@ CREATE TABLE IF NOT EXISTS receipts (
     stop_reason TEXT,
     note TEXT,
     parent_run_id TEXT,
+    run_key TEXT,
     CHECK ((status IN ('queued', 'running')) = (finished_at IS NULL)),
     CHECK (settled = 0 OR finished_at IS NOT NULL)
 );
@@ -475,6 +495,7 @@ class Ledger:
         recorded: Callable[[str], dict | None] | None = None,
         sink: Callable[[dict], bool] | None = None,
         on_stop: Callable[[str, str, str], None] | None = None,
+        already_told: Callable[[str, datetime], bool] | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self.state = Path(state)
@@ -488,6 +509,8 @@ class Ledger:
         self.rate_limits = rate_limits or (lambda now: usage.read_rate_limits(self.state, now))
         self.recorded, self.sink, self.clock = recorded, sink, clock
         self.on_stop = on_stop
+        self._reaped: list[tuple[str, str, datetime]] = []  # (job, run_id, started) reaped in a transaction
+        self.already_told = already_told
         self._conn: sqlite3.Connection | None = None
         self._engine: sqlqueue.SqlQueue | None = None
 
@@ -532,6 +555,8 @@ class Ledger:
                             c.execute(stmt)
                     if "parent_run_id" not in {r[1] for r in c.execute("PRAGMA table_info(receipts)")}:
                         c.execute("ALTER TABLE receipts ADD COLUMN parent_run_id TEXT")  # a store from schema 1
+                    if "run_key" not in {r[1] for r in c.execute("PRAGMA table_info(receipts)")}:
+                        c.execute("ALTER TABLE receipts ADD COLUMN run_key TEXT")  # a store from schema 2
                     c.execute("CREATE INDEX IF NOT EXISTS receipts_parent ON receipts(parent_run_id)")
                     c.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         except BaseException:
@@ -575,7 +600,8 @@ class Ledger:
                 decision = self._evaluate(c, req, now, month_spend)
                 if not dry:
                     decision = self._apply(c, req, decision, now)
-                return decision
+            self._tell_reaped()
+            return decision
         except StoreError as e:
             return Decision("refuse", e.kind, e.message, e.hint)
         except (sqlite3.Error, OSError) as e:
@@ -886,9 +912,24 @@ class Ledger:
     def reap(self, now: datetime) -> int:
         """Release every reservation whose owner is gone. Returns how many."""
         with _transaction(self.conn()) as c:
-            return self._reap(c, now)
+            n = self._reap(c, now)
+        self._tell_reaped()
+        return n
+
+    def _tell_reaped(self) -> None:
+        """Say once for each run reaped as `outcome_unknown` in the transaction that has just committed. (A rolled-back
+        reap is forgotten here too: the next reaper finds the run again and tells it then.) A job whose failure was
+        already alerted since the run started (`already_told`: the scheduler's OnFailure= alert for the same kill) is
+        not told twice."""
+        told, self._reaped = self._reaped, []
+        for job, run_id, started in told:
+            with contextlib.suppress(Exception):
+                if self.already_told is not None and self.already_told(job, started):
+                    continue
+            self.stopped(job, run_id, "outcome_unknown: the process that held it was gone before it finished")
 
     def _reap(self, c: sqlite3.Connection, now: datetime) -> int:
+        self._reaped = []  # one transaction's worth: what a rolled-back one queued is found and told again
         ns = to_ns(now)
         n = 0
         for r in c.execute("SELECT * FROM receipts WHERE status = 'running'").fetchall():
@@ -904,9 +945,10 @@ class Ledger:
         )
         return n
 
-    def _reap_one(self, c: sqlite3.Connection, r: sqlite3.Row, now: datetime) -> None:
+    def _reap_one(self, c: sqlite3.Connection, r: sqlite3.Row, now: datetime, why: str = "") -> None:
         """A run whose owner is gone. If it got as far as writing its record, settle from that. Otherwise write the record
-        it never got to (a started run counts at the fallback cost, as any run with no reported cost does)."""
+        it never got to, `outcome_unknown` (a started run counts at the fallback cost, as any run with no reported cost
+        does), and queue one notice for after the transaction. The `settled = 0` guard makes one reaper the winner."""
         run_id, ns = r["run_id"], to_ns(now)
         if r["who"] is not None:
             # a `ws queue slot` held the place for a command of the person's, not a job: there is no run record to write
@@ -920,30 +962,48 @@ class Ledger:
         unknown_run_usd, fallback = self.costing
         rec = self.recorded(run_id) if self.recorded else None
         written = True
+        started = from_ns(r["started_at"] or r["queued_at"]) or now
+        # lost: no record, or the outcome_unknown one a reaper wrote before its transaction rolled back (the record is
+        # outside the database, so it stays; the notice was never sent, so it is owed)
+        lost = rec is None or rec.get("status") == "outcome_unknown"
         if rec is None:
-            rec = runrecord.new(
-                run_id=run_id, job=r["job"], started_at=runrecord.iso(from_ns(r["started_at"] or r["queued_at"])),
-                ended_at=runrecord.iso(now), duration_ms=0, status="error", purpose=r["purpose"], stop_reason="crashed",
-                error="interrupted: the process that held this run was gone before it finished", ws_version=_version(),
+            last = started + timedelta(seconds=float(r["reserved_s"] or 0)) if r["reserved_s"] else now
+            rec = runrecord.unknown_outcome(
+                run_id, r["job"], started, min(now, last), purpose=r["purpose"], ws_version=_version(),
+                run_key=r["run_key"], why=why,
             )  # fmt: skip
             written = bool(self.sink(rec)) if self.sink else False
         usd = runrecord.record_cost(rec, unknown_run_usd, fallback)
         status = {"ok": "ok", "refused": "refused", "preempted": "preempted", "expired": "expired"}.get(
-            rec.get("status"), "interrupted" if rec.get("stop_reason") == "crashed" else "error"
+            rec.get("status"), "interrupted" if rec.get("stop_reason") in LOST_STOPS else "error"
         )
-        c.execute(
+        cur = c.execute(
             "UPDATE receipts SET status = ?, finished_at = ?, settled = 1, actual_usd = ?, record_written = ?, stop_reason = ? "
             "WHERE run_id = ? AND settled = 0",
-            (status, ns, usd, int(written), rec.get("stop_reason") or "crashed", run_id),
+            (status, ns, usd, int(written), rec.get("stop_reason") or "owner_gone", run_id),
         )
+        if lost and cur.rowcount == 1:
+            self._reaped.append((r["job"], run_id, started))
 
     # -- queued work --------------------------------------------------------------------------------------------
 
     def enqueue(
-        self, job: str, purpose: str | None, now: datetime, key: str | None = None, deadline: datetime | None = None
+        self,
+        job: str,
+        purpose: str | None,
+        now: datetime,
+        key: str | None = None,
+        deadline: datetime | None = None,
+        *,
+        trigger: str | None = None,
     ) -> tuple[str, str, bool]:
         """Add a run of job file `job` to the queue. Returns (run_id, message_id, replay). The same `key` again returns
-        the first one and adds nothing."""
+        the first one and adds nothing. `trigger` (the event or message id that started it) makes the key the run key,
+        `run_key(job, trigger)`; give one or the other."""
+        if trigger is not None:
+            if key is not None:
+                raise WsError("bad_input", "give a trigger or a key, not both", "--trigger ID or --key K", 2)
+            key = run_key(job, trigger)
         data = json.dumps(
             {
                 "job": job,
@@ -981,12 +1041,16 @@ class Ledger:
         now: datetime,
         deadline: datetime | None = None,
     ) -> str:
-        """A queued receipt for the next run of a message (each attempt is one receipt and one run record)."""
+        """A queued receipt for the next run of a message (each attempt is one receipt and one run record). Every attempt
+        carries the message's run key, when it has one."""
         run_id = runrecord.new_run_id(now)
+        key = c.execute(f"SELECT idempotency_key FROM {WORK_TABLE} WHERE message_id = ?", (message_id,)).fetchone()
         c.execute(
-            "INSERT INTO receipts (run_id, job, purpose, status, month, queued_at, message_id, deadline) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?)",
-            (run_id, job, purpose, month_of(now), to_ns(now), message_id, to_ns(deadline) if deadline else None),
-        )
+            "INSERT INTO receipts (run_id, job, purpose, status, month, queued_at, message_id, deadline, run_key) "
+            "VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?)",
+            (run_id, job, purpose, month_of(now), to_ns(now), message_id, to_ns(deadline) if deadline else None,
+             key[0] if key else None),
+        )  # fmt: skip
         return run_id
 
     def cancel(self, run_id: str, now: datetime) -> str:
@@ -1069,7 +1133,8 @@ class Ledger:
         """Before a drain: reap dead owners, then deal with each claimed message that nothing is running (a drain that
         crashed between claiming and finishing) or whose claim outlived `MESSAGE_LEASE_S`. It is dealt with as the drain
         would have: a run that finished is marked done and not run again; one that was refused is failed; a crash or an
-        interruption is retried at once, and each costs a try, so after `MAX_RETRIES` it fails; a preempted one is
+        interruption is retried at once, and each costs a try, so after `MAX_RETRIES` it fails (a run whose holder was
+        killed mid-run is not run again: it may have acted, so it is failed and the reaper's notice is the word on it); a preempted one is
         requeued only if its job is preemptible; and nothing comes back after its deadline. Returns how many came back."""
         c = self.conn()
         eng = self.engine()
@@ -1094,6 +1159,10 @@ class Ledger:
                     (m.message_id,),
                 ).fetchone()
                 out = _recovered_outcome(last)
+                if last is not None and last["stop_reason"] in LOST_STOPS:
+                    # killed mid-run: it may have acted, and the run does not yet get its run key to skip what it
+                    # did, so running it again could do the work twice. The reaper's notice stands; it is failed.
+                    out = Outcome(EXIT_FAILED, "error", "owner_gone")
                 act = classify(
                     out,
                     tries=m.tries,
@@ -1115,7 +1184,8 @@ class Ledger:
                     delay = 0 if act.kind == "retry" else act.delay_s  # a crash has already cost the wait
                     eng.retry(m.message_id, m.claim_id, delay_s=delay, count_try=act.count_try)
                     back += 1
-            return back
+        self._tell_reaped()
+        return back
 
 
 def _recovered_outcome(last: sqlite3.Row | None) -> Outcome:
@@ -1128,7 +1198,7 @@ def _recovered_outcome(last: sqlite3.Row | None) -> Outcome:
         return Outcome(EXIT_REFUSED, status, stop)
     if status == "preempted":
         return Outcome(EXIT_FAILED, "preempted", "preempted")
-    if status == "error" and stop and stop != "crashed":
+    if status == "error" and stop and stop not in LOST_STOPS:
         return Outcome(EXIT_FAILED, "error", stop)
     return Outcome(EXIT_FAILED, "interrupted", "interrupted")
 
@@ -1209,6 +1279,19 @@ def request_for(
     )  # fmt: skip
 
 
+RUN_KEY_MAX = 200
+
+
+def run_key(job: str, trigger: str) -> str:
+    """The run key of `job` started by `trigger` (an event or message id): `<job>:<trigger>`. One net effect per key."""
+    if not isinstance(trigger, str) or not trigger.strip() or any(ch.isspace() or ord(ch) < 32 for ch in trigger):
+        raise WsError("bad_input", f"trigger {trigger!r} is not an id", "an event or message id, with no spaces", 2)
+    key = f"{job}:{trigger}"
+    if len(key) > RUN_KEY_MAX:
+        raise WsError("bad_input", f"the run key is {len(key)} characters", f"keep it to {RUN_KEY_MAX}", 2)
+    return key
+
+
 def backoff_s(n: int) -> int:
     """Seconds to wait before retry number `n` (1 is the first): 30 s, 1 m, 5 m, 15 m, then 60 m."""
     return BACKOFF_S[min(max(n, 1), len(BACKOFF_S)) - 1]
@@ -1272,6 +1355,7 @@ class Item:
     deadline: datetime | None
     run_id: str
     ledger: Ledger | None = None
+    run_key: str | None = None
 
 
 def drain(
@@ -1292,32 +1376,35 @@ def drain(
         if msg is None:
             break
         now = ledger.clock()
-        data = json.loads(msg.data)
+        data = _message_data(msg.data)
+        if data is None:  # one item nobody can read: failed with its reason, and the batch goes on
+            done.append(_fail_bad(ledger, msg, "unreadable", "the queued data is not a job", now))
+            continue
         deadline = _parse_deadline(data.get("deadline"))
         with _transaction(ledger.conn()) as c:
             run_id = ledger.queued_row(c, msg.message_id) or ledger.new_attempt(
                 c, msg.message_id, data["job"], data.get("purpose"), now, deadline
             )
-        item = Item(msg, data["job"], data.get("purpose"), deadline, run_id, ledger)
-        outcome = runner(item)
+        item = Item(msg, data["job"], data.get("purpose"), deadline, run_id, ledger, msg.idempotency_key)
+        try:
+            outcome = runner(item)
+        except (sqlite3.Error, StoreError, OSError):
+            raise  # the store or the disk, not this item: the drain stops and the claim comes back through recovery
+        except Exception as e:  # noqa: BLE001  one item that raises is that item's failure, not the batch's
+            done.append(_fail_bad(ledger, msg, item.job, f"the run raised {type(e).__name__}", ledger.clock(), run_id))
+            continue
         now = ledger.clock()
-        stop = ""
         act = classify(outcome, tries=msg.tries, preemptible=preemptible(item.job), deadline=deadline, now=now)
-        with _transaction(ledger.conn()) as c:
-            if act.kind == "done":
-                eng.done(msg.message_id, msg.claim_id)
-            elif act.kind == "fail":
-                eng.mark_failed(msg.message_id, msg.claim_id)
-                refused = outcome.status in ("refused", "expired")  # (a run that did start has settled its own receipt)
-                ledger.end_queued(
-                    run_id, "refused" if refused else "error", outcome.stop_reason, act.why or "failed", now
-                )
-                stop = outcome.stop_reason or outcome.status or "failed"
-            else:
-                eng.retry(msg.message_id, msg.claim_id, delay_s=act.delay_s, count_try=act.count_try)
-                if act.kind != "wait":
-                    ledger.new_attempt(c, msg.message_id, item.job, item.purpose, now, deadline)
+        try:
+            _finish(ledger, eng, msg, item, run_id, outcome, act, now, deadline)
+        except sqlqueue.StaleClaim:
+            # this drain came back after its claim was taken over: the newer attempt owns the message, its receipt
+            # and its record, and nothing here may change them
+            done.append({"run_id": run_id, "job": item.job, "action": "superseded", "code": outcome.code,
+                         "status": outcome.status, "why": "the claim was taken over while it ran"})  # fmt: skip
+            continue
         if act.kind == "fail":  # a message that is retried, requeued or waiting has not stopped yet
+            stop = outcome.stop_reason or outcome.status or "failed"
             ledger.stopped(item.job, run_id, stop)
         done.append(
             {
@@ -1330,6 +1417,76 @@ def drain(
             }
         )
     return done
+
+
+def _message_data(text: str) -> dict | None:
+    """A queued message's data, or None when it is not a job (not JSON, not an object, no job name)."""
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("job"), str) or not data["job"]:
+        return None
+    return data
+
+
+def _fail_bad(
+    ledger: Ledger, msg: sqlqueue.Message, job: str, why: str, now: datetime, run_id: str | None = None
+) -> dict:
+    """Move one item that could not be run to failed, with its reason in the receipt's note, and say so once. One that
+    was admitted is recorded and charged as a reaped run is (its own record if it wrote one, else outcome_unknown at the
+    fallback cost), so spend before the failure still counts. A receipt that has already finished keeps its note, and
+    a claim that was taken over in the meantime is left to its new holder, with nothing said. A run that had already
+    settled ok marks its message done, with no notice."""
+    try:
+        with _transaction(ledger.conn()) as c:
+            rid = (
+                run_id or ledger.queued_row(c, msg.message_id) or ledger.new_attempt(c, msg.message_id, job, None, now)
+            )
+            row = c.execute("SELECT * FROM receipts WHERE run_id = ?", (rid,)).fetchone()
+            if row is not None and row["status"] == "ok" and row["settled"]:
+                # the run finished and settled ok before something after it raised: its work is done, not failed
+                ledger.engine().done(msg.message_id, msg.claim_id)
+                return {"run_id": rid, "job": job, "action": "done", "code": 0, "status": "ok", "why": why}
+            ledger.engine().mark_failed(msg.message_id, msg.claim_id)
+            changed = False
+            if row is not None and row["status"] == "running" and row["who"] is None and not row["settled"]:
+                # it was admitted and may have spent: its record (or an outcome_unknown one) and the fallback cost,
+                # exactly as a reaped run's; the one notice is this function's
+                ledger._reap_one(c, row, now, why)
+                ledger._reaped = []
+                changed = True
+            else:
+                changed = (
+                    c.execute(
+                        "UPDATE receipts SET status = 'error', finished_at = ?, settled = 1, actual_usd = 0, "
+                        "stop_reason = 'bad_item' WHERE run_id = ? AND status = 'queued'",
+                        (to_ns(now), rid),
+                    ).rowcount
+                    == 1
+                )
+            if changed:
+                c.execute("UPDATE receipts SET note = ? WHERE run_id = ?", (why[:300], rid))
+    except sqlqueue.StaleClaim:
+        return {"run_id": run_id, "job": job, "action": "superseded", "code": EXIT_FAILED, "status": None, "why": why}
+    ledger.stopped(job, rid, f"bad_item: {why}")
+    return {"run_id": rid, "job": job, "action": "fail", "code": EXIT_FAILED, "status": "error", "why": why}
+
+
+def _finish(ledger, eng, msg, item, run_id, outcome, act, now, deadline) -> None:
+    """Finish the claim by the class `classify` gave the outcome, in one transaction. Raises StaleClaim when the claim
+    is no longer this drain's."""
+    with _transaction(ledger.conn()) as c:
+        if act.kind == "done":
+            eng.done(msg.message_id, msg.claim_id)
+        elif act.kind == "fail":
+            eng.mark_failed(msg.message_id, msg.claim_id)
+            refused = outcome.status in ("refused", "expired")  # (a run that did start has settled its own receipt)
+            ledger.end_queued(run_id, "refused" if refused else "error", outcome.stop_reason, act.why or "failed", now)
+        else:
+            eng.retry(msg.message_id, msg.claim_id, delay_s=act.delay_s, count_try=act.count_try)
+            if act.kind != "wait":
+                ledger.new_attempt(c, msg.message_id, item.job, item.purpose, now, deadline)
 
 
 def _parse_deadline(v) -> datetime | None:
@@ -1470,6 +1627,9 @@ def ledger_from_profile(prof: dict, state: Path, log: Path) -> Ledger:
         v = budget.get(key)
         return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and 0 < v < math.inf else None
 
+    from ws import jobwatch  # here, not at the top: only a machine ledger reads the scheduler's alerts
+
+    alerts = state / "logs" / jobwatch.alerts_path().name  # what `ws watch alert` writes; the queue only reads it
     return Ledger(
         state,
         limits=Limits.from_profile(prof),
@@ -1477,7 +1637,31 @@ def ledger_from_profile(prof: dict, state: Path, log: Path) -> Ledger:
         recorded=lambda rid: next((r for r in runrecord.read(log) if r.get("run_id") == rid), None),
         sink=lambda rec: _write_record(log, rec),
         on_stop=lambda job, run_id, reason: notify_stop(job, run_id, reason, prof=prof),
+        already_told=lambda job, since: unit_alerted(job, since, alerts),
     )
+
+
+def unit_alerted(job: str, since: datetime, path: Path) -> bool:
+    """Has the scheduler already alerted a failure of `job` since `since`? (`ws watch alert`, which a unit's
+    OnFailure= runs, writes a line in its alerts log for each failed unit.) False when the file is missing
+    or unreadable: then the reaper's notice is the only one."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+    for line in reversed(lines):
+        try:
+            a = json.loads(line)
+            ts = datetime.fromisoformat(str(a.get("ts")))
+        except (ValueError, AttributeError):
+            continue
+        if ts.tzinfo is None:
+            continue
+        if ts < since:
+            return False  # lines are appended in time order: nothing older can be about this run
+        if a.get("job") == job and a.get("event") == "unit-failed":
+            return True
+    return False
 
 
 def ledger_for_env(env=None) -> Ledger:
@@ -1537,7 +1721,9 @@ def cmd_add(args: argparse.Namespace) -> int:
     except jobs.JobError as e:
         raise WsError("bad_input", str(e), "for example --deadline 2026-11-10T09:00:00Z", 2) from e
     ledger = ledger_for_env()
-    run_id, message_id, replay = ledger.enqueue(job.name, job.purpose, now, args.key, deadline)
+    run_id, message_id, replay = ledger.enqueue(
+        job.name, job.purpose, now, args.key, deadline, trigger=getattr(args, "trigger", None)
+    )
     if args.json:
         output.result({"run_id": run_id, "job": job.name, "message_id": message_id, "replay": replay})
     else:
@@ -1669,7 +1855,11 @@ def register(sub) -> None:
         "add", help="queue a run of a job file (unattended work: it needs an API key or a local provider)"
     )
     a.add_argument("job", help="the job name: jobs/<name>.toml in the config folder")
-    a.add_argument("--key", metavar="K", help="an idempotency key: adding the same key again queues nothing new")
+    which = a.add_mutually_exclusive_group()
+    which.add_argument(
+        "--trigger", metavar="ID", help="the event or message id that started it: one net effect per job and id"
+    )
+    which.add_argument("--key", metavar="K", help="an idempotency key: adding the same key again queues nothing new")
     a.add_argument(
         "--deadline", metavar="T", help="a UTC time such as 2026-11-10T09:00:00Z; later than that it expires"
     )

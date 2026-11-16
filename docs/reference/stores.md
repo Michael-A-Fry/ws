@@ -48,7 +48,7 @@ folders read-only, and the gate refuses a session's writes to each of them in ei
 |---|---|---|---|---|---|---|
 | Secret audit | `logs/secrets-audit.jsonl` | `src/ws/secrets.py` (generate, reveal) | `type` (`ws.secret-audit/1`), action (generate, reveal), name, result, user, in_session; never a value, link or token | 1 | `ts` | Rotates at 5 MiB |
 | Job installs | `logs/jobs-installed.jsonl` | `src/ws/jobcmd.py` (`ws job add`, `ws job remove`) | `type` (`ws.job-install/1`), action (add, replace, remove), job, sha256, widened, approved, in_session; never the prompt | 1 | `ts` | Rotates at 5 MiB |
-| Run records | `logs/runs.jsonl` | `src/ws/runrecord.py` (for `ws run`) | The keys of the run-record schema (`ws.runschema.SCHEMA`): job, runner, models, tokens, cost, status, `purpose`, `stop_reason`, `reservation` | 3 | `started_at`, `ended_at` | Rotates at 5 MiB; an old file that holds a record from this or last month stays |
+| Run records | `logs/runs.jsonl` | `src/ws/runrecord.py` (for `ws run`) | The keys of the run-record schema (`ws.runschema.SCHEMA`): job, runner, models, tokens, cost, status (`outcome_unknown` for a run whose holder was killed), `purpose`, `stop_reason`, `reservation`, `stop_subtype`, `fault`, `retry_after_s`, `approval`, `run_key`, `chain_depth` | 3 | `started_at`, `ended_at` | Rotates at 5 MiB; an old file that holds a record from this or last month stays |
 | Run records, fallback | `logs/runs.fallback.jsonl` | `src/ws/runrecord.py` | The same record, when `runs.jsonl` can't be written | 3 | `started_at`, `ended_at` | Never rotated or locked; `read` includes it |
 | Ratings | `ratings.jsonl` | `src/ws/rating.py` | `schema`, `ts`, `run_id`, `rating` (`up` or `down`), `note`, `who` | 1 | `ts` | Rotates at 5 MiB; old files and the lock sit in `logs/` |
 | Canary | `logs/canary.jsonl` | `src/ws/canary.py` | `schema`, `ts`, `ws_version`, `ok`, `model`, `runners` | 1 | `ts` | Rotates at 5 MiB |
@@ -85,6 +85,12 @@ Notes:
 - Schema 3 of the run record added `purpose`, `stop_reason` and `reservation`. Schema 2 stays frozen (the test pins its
   keys) and its lines read unchanged: a reader uses `.get` for the three new keys. `status` gained `preempted` and
   `expired`.
+- Schema 3 later gained, without a new number (a record only gains keys): `stop_subtype`, `fault`, `retry_after_s`,
+  `approval`, `run_key` and `chain_depth`, and `status` gained `outcome_unknown`. A reaped run is written as
+  `outcome_unknown` with stop reason `owner_gone`; lines written before as `error` with stop reason `crashed` read as
+  they are. Known rollback cost: a ws from before `outcome_unknown` counts such a record at US$0 against the cap (it
+  doesn't know the status as a run that started), so while rolled back each reaped run's fallback cost goes
+  uncounted. The test `test_a_reaped_record_under_the_reader_before_outcome_unknown` pins the size.
 - The node footprint is a ledger, not a log: two lines per change (an `intent` before it, a `done` after), so a crash
   between them is still understood. It's never rotated, because a forgotten change couldn't be undone.
 - The asks file is the one log outside the four folders: it sits where `ws home` reads asks from, which is
@@ -130,7 +136,8 @@ folders and not in one, because the wall makes those read-only. `ws uninstall` r
 state in SQLite. It holds the queued work (table `work`, the `ws._vendor.sqlqueue` engine) and a receipt for every run
 (table `receipts`): its status (`queued`, `running`, `ok`, `error`, `refused`, `preempted`, `skipped`, `interrupted`,
 `expired`), the UTC month it counts in, what was reserved (money, turns, seconds, memory, lane), who owns it (process id
-and start time), and what it came to when settled (cost, tokens, stop reason). A database file carries its layout
-version in `PRAGMA user_version` (now 1); a later change to the tables takes a new number. The money counted against a
-cap is the month's records in `logs/runs.jsonl` plus the open reservations here, never both for one run. See
-[the queue](queue.md).
+and start time), what it came to when settled (cost, tokens, stop reason) and its run key (`run_key`). A database
+file carries its layout version in `PRAGMA user_version` (now 3: 2 added `parent_run_id`, 3 `run_key`); a later
+change to the tables takes a new number, and an older file gains the new columns when it's opened. The money
+counted against a cap is the month's records in `logs/runs.jsonl` plus the open reservations here, never both for
+one run. See [the queue](queue.md).

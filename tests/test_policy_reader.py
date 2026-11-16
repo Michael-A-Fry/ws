@@ -8,6 +8,7 @@ from __future__ import annotations
 import io
 import json
 import sys
+import time
 
 import pytest
 
@@ -253,10 +254,15 @@ def test_the_read_limit_is_cpu_time_so_a_loaded_machine_is_not_refused(monkeypat
     assert err.value.kind == "too_slow"
 
 
-def test_the_cpu_limit_refuses_a_read_that_works_too_long():
+def test_the_cpu_limit_refuses_a_read_that_works_too_long(monkeypatch):
+    """The wall clock is frozen, so only the CPU limit can end the read; a real-time cap fails the test instead."""
+    real = time.monotonic
+    monkeypatch.setattr(sw, "time", _Clock())
+    give_up = real() + 5
     with pytest.raises(sw.ShellError) as err, sw.time_limit(0.05):
-        while True:
+        while real() < give_up:
             sw.tick()
+        pytest.fail("the CPU limit never ended the read")
     assert err.value.kind == "too_slow"
 
 

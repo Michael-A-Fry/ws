@@ -25,6 +25,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from ws import install, jobs, osinfo, output, paths
@@ -275,6 +276,20 @@ def cmd_schedule_apply(args: argparse.Namespace) -> int:
     return 1 if problems else 0
 
 
+SCRIPT_COPY_MAX_AGE_S = 2 * 86400  # a copy this old was left by a run that was killed (a clean one removes its own)
+
+
+def _sweep(folder: Path, before: float) -> None:
+    """Remove the `run-*` copies older than `before` that a killed run left in `folder`. Never raises."""
+    import shutil
+
+    with contextlib.suppress(OSError):
+        for d in folder.glob("run-*"):
+            with contextlib.suppress(OSError):
+                if d.is_dir() and not d.is_symlink() and d.stat().st_mtime < before:
+                    shutil.rmtree(d, ignore_errors=True)
+
+
 SCRIPT_EXIT_TIMEOUT = 124  # as timeout(1): the script ran past the job's timeout_s and was killed
 
 
@@ -323,6 +338,7 @@ def cmd_schedule_script(args: argparse.Namespace) -> int:
     private = paths.state_dir(env) / "scripts"  # ws's own state folder, not a temp folder others share
     private.mkdir(mode=0o700, parents=True, exist_ok=True)
     private.chmod(0o700)
+    _sweep(private, time.time() - SCRIPT_COPY_MAX_AGE_S)
     with tempfile.TemporaryDirectory(prefix="run-", dir=private) as tmp:
         copy = Path(tmp) / path.name  # the reviewed bytes, where nobody else can swap them before they run
         fd = os.open(copy, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o700)

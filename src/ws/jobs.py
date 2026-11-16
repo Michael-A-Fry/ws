@@ -305,53 +305,52 @@ def parse_schedule(text: str, where: str) -> When:
 def latest_slot(when: When, now: datetime, tz=None) -> datetime:
     """The latest time of the schedule at or before `now`, in UTC: the slot a timer's fire is for. A timer that fires
     late (a catch-up after the machine was off, or asleep) still gets the slot it was for, not the minute it ran in.
-    The schedule is wall-clock time in `tz` (default this machine's zone), as systemd and launchd read it."""
+    The schedule is wall-clock time in `tz` (default this machine's zone, read through the C library as systemd and
+    launchd read it). Slots are compared as instants, never as wall clocks, so a daylight-saving change cannot move
+    one: in the hour the clocks go back, `hourly` and `every` get a slot for each pass (each is a real hour), while a
+    `daily`, `weekly` or `monthly` time that happens twice is one slot, its first; a time the clocks skip is no slot
+    that day, so the one before stands."""
     local = now.astimezone(tz).replace(tzinfo=None)  # the wall clock
-    slot = local.replace(second=0, microsecond=0)
-    if when.kind == "hourly":
-        slot = slot.replace(minute=0)
-    elif when.kind == "every":
-        slot = slot.replace(minute=slot.minute - slot.minute % when.every)
-    else:
-        slot = slot.replace(hour=when.hour, minute=when.minute)
-        if when.kind == "daily" and slot > local:
-            slot -= timedelta(days=1)
-        elif when.kind == "weekly":
-            slot -= timedelta(days=(slot.weekday() - when.weekday) % 7)
-            if slot > local:
-                slot -= timedelta(days=7)
-        elif when.kind == "monthly":
-            slot = slot.replace(day=when.day)
-            if slot > local:
-                slot = slot.replace(year=slot.year - (slot.month == 1), month=slot.month - 1 or 12)
-    # the wall-clock slot read back in its zone. Across a daylight-saving change a wall-clock time can be two instants
-    # (the hour the clocks go back: both folds) or none (the hour they skip): the slot is the latest instant at or
-    # before now, so an hourly job in the repeated hour gets its second 02:00, not the first one again
-    out = _latest_at_or_before(slot, tz, now)
-    if out is None and when.kind in ("daily", "weekly", "monthly"):
-        # a wall-clock time the clocks skipped today (a spring-forward gap) reads as later than now: the slot before
+    if when.kind in ("hourly", "every"):
+        wall = local.replace(second=0, microsecond=0)
+        wall = wall.replace(minute=0 if when.kind == "hourly" else wall.minute - wall.minute % when.every)
+        ok = [t for t in _instants(wall, tz) if t <= now and _shows(t, wall, tz)]
+        return max(ok) if ok else min(_instants(wall, tz))
+    wall = local.replace(hour=when.hour, minute=when.minute, second=0, microsecond=0)
+    if when.kind == "weekly":
+        wall -= timedelta(days=(wall.weekday() - when.weekday) % 7)
+    elif when.kind == "monthly":
+        wall = wall.replace(day=when.day)
+    for _ in range(3):  # this period's slot, else the one before (it was later than now, or the clocks skipped it)
+        first = _first_instant(wall, tz)
+        if first is not None and first <= now:
+            return first
         if when.kind == "monthly":
-            slot = slot.replace(year=slot.year - (slot.month == 1), month=slot.month - 1 or 12)
+            wall = wall.replace(year=wall.year - (wall.month == 1), month=wall.month - 1 or 12)
         else:
-            slot -= timedelta(days=1 if when.kind == "daily" else 7)
-        out = _latest_at_or_before(slot, tz, now)
-    return out if out is not None else min(_instants(slot, tz))
+            wall -= timedelta(days=1 if when.kind == "daily" else 7)
+    return min(_instants(wall, tz))  # not reached for a real zone: two periods running cannot both be skipped
 
 
 def _instants(wall: datetime, tz) -> set[datetime]:
-    """The UTC instants a wall-clock time is in `tz` (None: this machine's zone, read by the C library, which keeps the
-    fold as a ZoneInfo does): one, or two in the hour the clocks go back."""
+    """The UTC readings of a wall-clock time in `tz` (None: this machine's zone, read by the C library, which keeps the
+    fold as a ZoneInfo does), one per fold: two in the hour the clocks go back; for a time the clocks skip, readings
+    that are not that time at all (`_shows` drops them)."""
     return {
         (wall.replace(fold=f).astimezone() if tz is None else wall.replace(tzinfo=tz, fold=f)).astimezone(UTC)
         for f in (0, 1)
     }
 
 
-def _latest_at_or_before(wall: datetime, tz, now: datetime) -> datetime | None:
-    """The latest instant of `wall` at or before `now`; one that does not read back as `wall` (a time the clocks
-    skipped) is not a slot."""
-    ok = [t for t in _instants(wall, tz) if t <= now and t.astimezone(tz).replace(tzinfo=None) == wall]
-    return max(ok) if ok else None
+def _shows(t: datetime, wall: datetime, tz) -> bool:
+    """True when the clocks in `tz` show `wall` at instant `t`."""
+    return t.astimezone(tz).replace(tzinfo=None) == wall.replace(fold=0)
+
+
+def _first_instant(wall: datetime, tz) -> datetime | None:
+    """The first instant the clocks show `wall`; None when they skip it."""
+    real = [t for t in _instants(wall, tz) if _shows(t, wall, tz)]
+    return min(real) if real else None
 
 
 def parse_rate(text: str, where: str) -> float:

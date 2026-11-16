@@ -108,7 +108,7 @@ from ws.output import WsError
 from ws.profile import ProfileError, load, profile_path
 
 COMMAND = "queue"
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 EXIT_FAILED, EXIT_BAD_JOB, EXIT_REFUSED = 1, 2, 3
 STATUSES = ("queued", "running", "ok", "error", "refused", "preempted", "skipped", "interrupted", "expired")
 ACTIVE = ("queued", "running")
@@ -192,6 +192,7 @@ CREATE TABLE IF NOT EXISTS receipts (
     parent_run_id TEXT,
     run_key TEXT,
     chain_depth INTEGER,
+    told_at INTEGER,
     CHECK ((status IN ('queued', 'running')) = (finished_at IS NULL)),
     CHECK (settled = 0 OR finished_at IS NOT NULL)
 );
@@ -590,6 +591,8 @@ class Ledger:
                         c.execute("ALTER TABLE receipts ADD COLUMN run_key TEXT")  # a store from schema 2
                     if "chain_depth" not in have:
                         c.execute("ALTER TABLE receipts ADD COLUMN chain_depth INTEGER")  # a store from schema 3
+                    if "told_at" not in have:
+                        c.execute("ALTER TABLE receipts ADD COLUMN told_at INTEGER")  # a store from schema 4
                     c.execute("CREATE INDEX IF NOT EXISTS receipts_parent ON receipts(parent_run_id)")
                     c.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         except BaseException:
@@ -932,13 +935,16 @@ class Ledger:
                 time.sleep(0.2)
         return False  # unreachable
 
-    def stopped(self, job: str, run_id: str, reason: str) -> None:
-        """Say once that a job has stopped for good (`on_stop(job, run_id, reason)`). Never raises, and never changes
-        what the job came to. Call it after the transaction that ended the job, not inside it."""
+    def stopped(self, job: str, run_id: str, reason: str) -> bool:
+        """Say once that a job has stopped for good (`on_stop(job, run_id, reason)`). True when the notice went (on_stop
+        said so); False when there is none, it was not sent (a cap, a server down) or it failed. Never raises, and never
+        changes what the job came to. Call it after the transaction that ended the job, not inside it."""
         if self.on_stop is None:
-            return
-        with contextlib.suppress(Exception):
-            self.on_stop(job, run_id, reason)
+            return False
+        try:
+            return self.on_stop(job, run_id, reason) is True
+        except Exception:  # noqa: BLE001
+            return False
 
     # -- reaping ------------------------------------------------------------------------------------------------
 
@@ -956,14 +962,18 @@ class Ledger:
         """Say once for each run reaped as `outcome_unknown` in the transaction that has just committed. (A rolled-back
         reap is forgotten here too: the next reaper finds the run again and tells it then.) A job whose failure was
         already alerted since the run started (`already_told`: the scheduler's OnFailure= alert for the same kill) is
-        not told twice. Returns what was told: job, run id, the process that held it and whether a drain ran it."""
+        not told twice. Returns what was told (the notice went): job, run id, the process that held it and whether a
+        drain ran it."""
         told, self._reaped = self._reaped, []
         out: list[dict] = []
         for job, run_id, started, owner_pid, queued in told:
             with contextlib.suppress(Exception):
                 if self.already_told is not None and self.already_told(job, started):
                     continue
-            self.stopped(job, run_id, "outcome_unknown: the process that held it was gone before it finished")
+            if not self.stopped(job, run_id, "outcome_unknown: the process that held it was gone before it finished"):
+                continue  # not sent: nobody was told, so no other notice may stand down for it
+            with contextlib.suppress(sqlite3.Error):
+                self.conn().execute("UPDATE receipts SET told_at = ? WHERE run_id = ?", (to_ns(self.clock()), run_id))
             out.append({"job": job, "run_id": run_id, "owner_pid": owner_pid, "queued": queued})
         return out
 
@@ -1245,14 +1255,14 @@ class Ledger:
             raise store_error(e) from e
 
     def reaped_of(self, owner_pid: int, since: datetime) -> list[dict]:
-        """The queued runs held by process `owner_pid` that a reaper settled as gone since `since` (whoever reaped them,
-        and so told them): job, run_id, owner_pid, queued."""
+        """The queued runs held by process `owner_pid` that a reaper settled as gone and told (the notice went) since
+        `since`, whoever reaped them: job, run_id, owner_pid, queued."""
         try:
             rows = (
                 self.conn()
                 .execute(
                     "SELECT job, run_id, owner_pid FROM receipts WHERE owner_pid = ? AND message_id IS NOT NULL "
-                    "AND stop_reason = 'owner_gone' AND finished_at >= ?",
+                    "AND stop_reason = 'owner_gone' AND told_at IS NOT NULL AND finished_at >= ?",
                     (int(owner_pid), to_ns(since)),
                 )
                 .fetchall()

@@ -844,6 +844,11 @@ def test_schedule_script_is_refused_in_a_gated_session(box, write_job, capsys, m
         ("hourly", "2027-04-03T13:05:00", "2027-04-03T13:00:00"),  # the first 02:00 (NZDT)
         ("hourly", "2027-04-03T14:05:00", "2027-04-03T14:00:00"),  # the second 02:00 (NZST): a run, not lost
         ("every 5m", "2027-04-03T14:07:00", "2027-04-03T14:05:00"),
+        # a daily time inside the repeated hour is one slot, its first pass: never two runs in one day
+        ("daily 02:30", "2027-04-03T13:20:00", "2027-04-02T13:30:00"),  # first pass, before 02:30: yesterday's
+        ("daily 02:30", "2027-04-03T13:40:00", "2027-04-03T13:30:00"),  # first pass, after 02:30
+        ("daily 02:30", "2027-04-03T14:10:00", "2027-04-03T13:30:00"),  # second pass, before 02:30 again
+        ("daily 02:30", "2027-04-03T14:40:00", "2027-04-03T13:30:00"),  # second pass, after: the same slot
     ],
 )
 def test_the_machines_own_zone_keeps_the_fold(local_zone, when, now, want):
@@ -860,3 +865,35 @@ def test_the_script_runs_from_a_private_copy_under_the_state_folder(box, write_j
     state = box / ".ws"  # WS_HOME: the state folder here
     assert copy.startswith(str(state)) and "/scripts/run-" in copy
     assert ((state / "scripts").stat().st_mode & 0o777) == 0o700 and not list((state / "scripts").iterdir())
+
+
+@pytest.mark.parametrize(
+    ("when", "now", "want"),
+    [  # New York's clocks jump 02:00 -> 03:00 at 2026-03-08T07:00Z: 02:30 is not a time that day
+        ("daily 02:30", "2026-03-08T06:50:00", "2026-03-07T07:30:00"),  # 01:50 EST: yesterday's
+        ("daily 02:30", "2026-03-08T07:40:00", "2026-03-07T07:30:00"),  # 03:40 EDT: still yesterday's, no slot today
+        ("daily 02:30", "2026-03-09T06:40:00", "2026-03-09T06:30:00"),  # the next day: 02:30 EDT
+        ("daily 16:00", "2026-06-01T12:00:00", "2026-05-31T20:00:00"),
+        ("weekly mon 09:00", "2026-06-02T12:00:00", "2026-06-01T13:00:00"),
+    ],
+)
+def test_a_daily_slot_across_the_spring_gap(local_zone, when, now, want):
+    local_zone(NEW_YORK)
+    got = jobs.latest_slot(jobs.parse_schedule(when, "t"), datetime.fromisoformat(now).replace(tzinfo=UTC))
+    assert got == datetime.fromisoformat(want).replace(tzinfo=UTC)
+
+
+def test_a_copy_left_by_a_killed_script_run_is_swept(box, write_job):
+    import os
+
+    path, sha = _private_script(box, "#!/bin/sh\nexit 0\n")
+    write_job("upkeep", script_job(path, sha))
+    scripts = box / ".ws" / "scripts"
+    scripts.mkdir(mode=0o700)
+    old, fresh = scripts / "run-old", scripts / "run-fresh"
+    for d in (old, fresh):
+        d.mkdir()
+        (d / "upkeep.sh").write_text("x")
+    os.utime(old, (1, 1))  # left by a SIGKILL long ago
+    assert cli.main(["schedule", "script", "upkeep"]) == 0
+    assert not old.exists() and fresh.exists()  # a fresh one may belong to a run still going

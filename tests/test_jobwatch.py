@@ -399,3 +399,19 @@ def test_planted_kill_of_a_tick_unit_running_another_jobs_run_is_one_notice_nami
     s = Sender()
     rec = jobwatch.alert_unit("ws-alpha.service", env, status=lambda u: ("signal", "9"), sender=s, pid_of=lambda u: pid)
     assert told == ["nightly"] and s.sent == [] and rec["reaped"] == [{"job": "nightly", "run_id": run_id}]
+
+
+def test_a_reaped_run_whose_notice_did_not_go_leaves_the_drains_push_in_place(env, monkeypatch):
+    """The queue's notice for the killed run was not sent (the daily cap, or the server down): nobody was told, so the
+    drain unit's own push goes, and the run counts as told for no one."""
+    from ws import queue
+
+    notify(env)
+    pid, _run_id, told = _drain_with_a_killed_run(env, monkeypatch)
+    monkeypatch.setattr(queue, "notify_stop", lambda job, run_id, reason, **kw: told.append(job) and False)
+    s = Sender()
+    rec = jobwatch.alert_unit("ws-drain.service", env, status=lambda u: ("signal", "9"), sender=s, pid_of=lambda u: pid)
+    assert told == ["nightly"] and len(s.sent) == 1 and rec["pushed"] is True and "reaped" not in rec
+    ledger = queue.ledger_for_env(env)
+    assert ledger.reaped_of(pid, datetime.now(UTC) - timedelta(hours=1)) == []  # a later alert finds nothing told
+    ledger.close()

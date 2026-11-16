@@ -2269,10 +2269,18 @@ def _segment_once(
         admin = _ws_admin(canon, "xargs" in wrappers) or (_ws_admin(unglued) if unglued else None)
     if admin:
         return admin, line, []
+    local_seg = seg  # the part of the line that runs here
     if cmd == "ssh":
-        ssh_opts = _ssh_argv(toks)[0]
+        ssh_opts, ssh_host, ssh_remote = _ssh_argv(toks)
         if reason := _ssh_refusal(policy, ctx, ssh_opts, words[: max(0, len(words) - len(toks))]):
             return reason, line, []
+        cut, here = _ssh_remote(policy, seg, ssh_opts, ssh_host, ssh_remote, wrappers)
+        if here:  # a remote command to this machine runs outside the wall: judged as the local command it is
+            nested.append(" ".join(ssh_remote))
+        if cut is not None:  # a single-quoted remote command to a named host: its words are not local file words
+            local_seg, toks = seg[:cut], toks[:-1]
+            lexed = shellwords.lex(local_seg, env, ctx.budget)
+            redirs = lexed.redirs
     nested += _arith_scripts(ctx, cmd, flags, toks, words)
     if cmd == "eval":
         text = " ".join(toks[1:])
@@ -2343,7 +2351,7 @@ def _segment_once(
             ),
         ]
         if env_u is not None:  # the same line with each default left as written
-            checks.append(lambda: _unknown_unread(policy, ctx, seg, env_u))
+            checks.append(lambda: _unknown_unread(policy, ctx, local_seg, env_u))
         for check in checks:
             reason = check()
             if not reason:
@@ -2530,6 +2538,75 @@ def _ssh_argv(toks: list[str]) -> tuple[list[tuple[str, str]], str | None, list[
         else:
             break
     return opts, host, toks[i:]
+
+
+def _ssh_host_name(word: str) -> str:
+    """The host an ssh destination names: `user@host`, `ssh://user@host:port/`, `[::1]`; lower case, no final dot."""
+    url = word.startswith("ssh://")
+    w = word[6:].partition("/")[0] if url else word
+    w = w.rpartition("@")[2]
+    if w.startswith("["):
+        w = w[1:].partition("]")[0]
+    elif url and w.count(":") == 1:
+        w = w.partition(":")[0]
+    return w.rstrip(".").lower()
+
+
+def _is_this_machine(name: str) -> bool:
+    """Whether an ssh host is (or may be) this machine: loopback, the unspecified address, or this machine's own name.
+    A name is compared by its first label, so the full and tailnet names count too. No lookup is made."""
+    import ipaddress
+    import socket
+
+    if not name or name in ("localhost", "ip6-localhost", "ip6-loopback") or name.endswith(".localhost"):
+        return True
+    try:
+        ip = ipaddress.ip_address(name)
+        ip = getattr(ip, "ipv4_mapped", None) or ip
+        return ip.is_loopback or ip.is_unspecified
+    except ValueError:
+        pass
+    if re.fullmatch(r"[0-9a-fx.]+", name):  # what the C library also reads as an address: 127.1, 0x7f.1, 2130706433
+        try:
+            if socket.inet_aton(name)[0] in (0, 127):
+                return True
+        except OSError:
+            pass
+    return name.split(".")[0] == socket.gethostname().lower().rstrip(".").split(".")[0]
+
+
+def _named_host(policy: Policy, name: str) -> bool:
+    """Whether the policy names this host: `[gate] allow_hosts` or a class's `allowed_hosts`, a port aside."""
+    entries = (*policy.gate.allow_hosts, *(h for c in policy.classes.values() for h in c.allowed_hosts))
+    for entry in entries:
+        e = entry.partition(":")[0].lower()
+        if name == e or (e.startswith("*.") and name.endswith(e[1:])):
+            return True
+    return False
+
+
+def _ssh_remote(
+    policy: Policy, seg: str, opts: list[tuple[str, str]], host: str | None, remote: list[str], wrappers: set[str]
+) -> tuple[int | None, bool]:
+    """How an ssh line's remote command is judged: (where the line ends without it, when it is read as remote; whether
+    it runs on this machine, so it is judged as a local command too)."""
+    hosts = [
+        host or "",
+        *(
+            m.group(2).strip()
+            for o, v in opts
+            if o == "o" and (m := _SSH_OPTION.match(v)) and m.group(1).lower() == "hostname"
+        ),
+    ]
+    if any(_HAS_PART.search(h) for h in hosts):
+        return None, False
+    names = [_ssh_host_name(h) for h in hosts]
+    if any(_is_this_machine(n) for n in names):
+        return None, bool(remote)
+    m = _SINGLE_QUOTED_END.search(seg)
+    if "xargs" in wrappers or len(remote) != 1 or not m or m.group(1) != remote[0]:
+        return None, False
+    return (m.start(1) - 1, False) if all(_named_host(policy, n) for n in names) else (None, False)
 
 
 def _ssh_refusal(policy: Policy, ctx: _Ctx, opts: list[tuple[str, str]], prefix: list[str]) -> str | None:

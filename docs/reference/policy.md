@@ -162,6 +162,13 @@ know are refused. So are `-F` (other than `none`), `-I`, `-E` and an askpass pro
 a certificate or a known-hosts list go through `deny_read`. ssh's escape characters need an interactive terminal,
 which a shell call doesn't have.
 
+A remote command runs on the far host, so `ssh pve.example.org 'ls $X'` isn't refused for `$X` when the policy names
+the host (`[gate] allow_hosts`, or a class's `allowed_hosts`) and the command is one word wholly in single quotes. The
+local rules still apply to anything else: double quotes or `$'...'` (the local shell expands those), unquoted words,
+a host the policy doesn't name, a host word with `$`, and `xargs ssh`. A remote command to this machine (loopback,
+`localhost` or its own name) runs outside the sandbox, so it's judged as the local command it is. ws doesn't read
+`~/.ssh/config`, so a named alias whose `HostName` is this machine is yours to avoid.
+
 ### The sandbox is the boundary
 
 The sandbox is the boundary, and the static gate is defence in depth. The gate reads the text of a command and refuses

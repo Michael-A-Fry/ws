@@ -8,6 +8,14 @@ body of the GitHub release.
 
 ## [Unreleased]
 
+### Fixed
+
+- The gate: ssh options that run or load local files are now judged (an `-o` keyword ws doesn't know runs nothing
+  here is refused, and so are `-F`, `-I`, `-E` and an askpass program), through any wrapper (`sudo`, `timeout`,
+  `command`, a full path). Plain options (`-p`, `-l`, `-J`, `-o Port=...`) run as before.
+- The gate: a remote command written wholly in single quotes to a host the policy names is read as remote, so a `$VAR`,
+  loop or `$(...)` in it is no longer refused. A remote command to this machine is judged as a local one.
+
 ## [0.1.11] - 2026-11-17
 
 ### Removed
@@ -62,9 +70,6 @@ body of the GitHub release.
 
 ### Fixed
 
-- The gate: ssh options that run or load local files are now judged (an `-o` keyword ws doesn't know runs nothing
-  here is refused, and so are `-F`, `-I`, `-E` and an askpass program), through any wrapper (`sudo`, `timeout`,
-  `command`, a full path). Plain options (`-p`, `-l`, `-J`, `-o Port=...`) run as before.
 - The `class-push-refused` case asked about a listed remote on port 443 even when the entry names its own port.
 
 ## [0.1.10] - 2026-11-12

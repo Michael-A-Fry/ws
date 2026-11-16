@@ -2259,3 +2259,74 @@ def test_ssh_argv_reads_options_before_and_after_the_host():
     assert opts == [("v", ""), ("p", "22"), ("o", "X=1"), ("l", "u")]
     assert host == "h" and remote == ["ls", "-o", "y"]
     assert policy._ssh_argv(["ssh", "--", "h", "-o", "x"])[1:] == ("h", ["-o", "x"])
+
+
+# --- ssh: a single-quoted remote command to a named host is remote -------------------------------------------------
+
+
+@pytest.fixture
+def named(home, monkeypatch):
+    import socket
+
+    monkeypatch.setattr(socket, "gethostname", lambda: "box")
+    pol = policy.default_policy()
+    return dataclasses.replace(
+        pol, gate=dataclasses.replace(pol.gate, allow_hosts=("pve.example.org", "*.lan.example"))
+    )
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "ssh pve.example.org 'ls $X'",
+        "/usr/bin/ssh pve.example.org 'ls $X'",
+        "command ssh pve.example.org 'ls $X'",
+        "sudo ssh pve.example.org 'ls $X'",
+        "timeout 5 ssh pve.example.org 'ls $X'",
+        "ssh -p 22 -l me pve.example.org 'cat $(ls /etc)'",
+        "ssh nas.lan.example 'for f in a b; do cat $f; done'",
+        "ssh pve.example.org 'cat $HOME/x | grep y > /tmp/z'",
+    ],
+)
+def test_a_single_quoted_remote_command_to_a_named_host_is_remote(named, cmd):
+    assert policy.is_denied_command(named, cmd) is None
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "ssh other.example.org 'ls $X'",  # a host the policy does not name
+        "ssh localhost 'ls $X'",
+        "ssh 127.0.0.1 'ls $X'",
+        "ssh 127.1 'ls $X'",
+        "ssh ::1 'ls $X'",
+        "ssh me@localhost 'ls $X'",
+        "ssh ssh://me@127.0.0.1:22 'ls $X'",
+        "ssh box.tail.example 'ls $X'",  # this machine's own name
+        "ssh -o HostName=127.0.0.1 pve.example.org 'ls $X'",
+        "ssh $H 'ls $X'",
+        'ssh pve.example.org "ls $X"',  # double quotes: the local shell expands it
+        'ssh pve.example.org "cat $(cat ~/.ssh/id_LOCAL)"',
+        "ssh pve.example.org $'ls $X'",
+        "ssh pve.example.org x'ls $X'",
+        "ssh pve.example.org 'ls $X' more",
+        "ssh pve.example.org ls $X",
+        "ssh pve.example.org cat ~/.ssh/id_rsa",
+        "xargs ssh pve.example.org 'ls $X'",
+        "ssh -oProxyCommand=bash pve.example.org 'ls $X'",
+        "ssh -F /tmp/evil pve.example.org 'ls $X'",
+        "ssh localhost 'cat ~/.ssh/id_rsa'",  # this machine: judged as the local command it is
+        "ssh 127.0.0.1 cat ~/.ssh/id_rsa",
+    ],
+)
+def test_any_other_remote_command_keeps_the_local_rules(named, cmd):
+    assert policy.is_denied_command(named, cmd)
+
+
+def test_a_host_a_class_names_counts_too(home):
+    pol = policy.loads(
+        '[gate]\ndeny_read = ["~/.ssh/**"]\n'
+        '[classes.lab]\naccess = "full"\nrepos = ["~/code/lab/**"]\nallowed_hosts = ["pve.example.org"]\nowner = "me"\n'
+    )
+    assert policy.is_denied_command(pol, "ssh pve.example.org 'ls $X'") is None
+    assert policy.is_denied_command(policy.default_policy(), "ssh pve.example.org 'ls $X'")

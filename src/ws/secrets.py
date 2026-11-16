@@ -181,7 +181,9 @@ def _entry(path: Path, name: str, t: dict) -> Entry:
     req_paths = _str_list(path, name, "paths", t.get("paths", []))
     for pre in req_paths:
         if not PATH_PREFIX_RE.match(pre) or any(seg in (".", "..") for seg in pre.split("/")):
-            raise SecretsError(f"{path}: [{name}] {pre!r} is not a path prefix (start with /, no ? # %, no . or .. part)")
+            raise SecretsError(
+                f"{path}: [{name}] {pre!r} is not a path prefix (start with /, no ? # %, no . or .. part)"
+            )
     ttl = t.get("ttl")
     if ttl is not None and (isinstance(ttl, bool) or not isinstance(ttl, (int, float)) or not 0 < ttl <= MAX_TTL_S):
         raise SecretsError(f"{path}: [{name}] ttl must be a number of seconds above 0 and at most {MAX_TTL_S}")

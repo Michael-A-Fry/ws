@@ -21,6 +21,7 @@ from pathlib import Path
 
 import jsonschema
 import pytest
+from helpers.procs import alive, wait_gone
 
 from ws import broker, cli, doctor, jobs, osinfo, policy, run, runrecord
 from ws.adapters import claude_code, opencode
@@ -1074,20 +1075,6 @@ def test_exe_version_gives_up_after_its_timeout(ws):
 # --- killing, signals, output ----------------------------------------------------------------------------------------
 
 
-def alive(pid: int) -> bool:
-    try:
-        state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
-    except OSError:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
-        return True
-    return state != "Z"  # a zombie is dead; it only waits to be reaped
-
-
 def wait_for(path: Path, seconds: float = 20.0) -> None:
     end = time.monotonic() + seconds
     while not path.exists():
@@ -1107,7 +1094,8 @@ def test_a_child_that_ignores_sigterm_does_not_survive_the_timeout(ws, monkeypat
     elapsed = time.monotonic() - t0
     assert (code, timed_out, truncated) == (None, True, False)
     assert elapsed < 1.5 + 1.0 + 1.0, f"took {elapsed:.1f} s"
-    assert not alive(int((ws.home / "grandchild.pid").read_text())), "the grandchild survived"
+    # The group got SIGKILL, but on a loaded machine the grandchild takes a moment to die: wait on its exit.
+    assert wait_gone(int((ws.home / "grandchild.pid").read_text())), "the grandchild survived"
     assert not alive(ws.saw()["pid"])
 
 
@@ -1127,15 +1115,6 @@ deadline = time.monotonic() + 20
 while not os.path.exists(pidfile) and time.monotonic() < deadline:  # leave only once the grandchild is running
     time.sleep(0.01)
 """
-
-
-def wait_gone(pid: int, seconds: float = 10.0) -> bool:
-    end = time.monotonic() + seconds
-    while alive(pid):
-        if time.monotonic() >= end:
-            return False
-        time.sleep(0.02)
-    return True
 
 
 def test_a_grandchild_left_behind_by_a_runner_that_exits_is_killed_too(ws, tmp_path):

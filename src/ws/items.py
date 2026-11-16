@@ -333,7 +333,7 @@ KINDS: dict[str, Kind] = dict(
             _state("node", "footprint"),
             ("schema", "ts", "type", "node", "op", "step", "kind"),
         ),
-        _logrow("ask", "adapters.opencode", "Asks", _ASKS, ("schema", "ts", "event", "id", "repo", "session"), "id"),
+        _logrow("ask", "adapters.opencode", "Asks", _ASKS, ("schema", "ts", "event", "id", "repo"), "id"),
         _logrow(
             "broker",
             "broker",
@@ -373,8 +373,8 @@ LINK_SPEC: dict[str, tuple[tuple[str, str, str], ...]] = {
     "claim": (("about", "session", "session"),),
     "guard-record": (("about", "session", "session"),),
     "identity": (("about", "session", "id"),),
-    "ask": (("about", "session", "session"),),
-    "connector-call": (("about", "session", "session"),),
+    "ask": (),  # the session is a name and a tmux target, not an id: no link, and a walled ask keeps no name
+    "connector-call": (("about", "session", "session"),),  # the runner's session id from the hook payload
     "row": (("about", "area", "area"), ("used", "row", "needs")),
     "area": (("supersedes", "area", "supersedes"),),
     **{

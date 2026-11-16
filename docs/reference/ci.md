@@ -24,6 +24,11 @@ That's a repository setting, not a file. The `test-integrity` job needs the same
 the holdout, which sits inside it, runs on every pull request; it runs from the pull request's own tree, so a change can
 edit it. Review changes to it.
 
+`cli.yml` runs on every pull request. Its `changes` job checks whether the CLI is touched, the real jobs (the suite on
+Linux and macOS, the WSL2 leg, the e2e jobs, the secret wall) skip when it isn't, and `cli-required` always runs. It
+fails if any job failed or was cancelled and passes when jobs were skipped, so it's the one check to require for the
+macOS and WSL2 legs.
+
 ## The time budget
 
 Each job's first step writes the time it started into `$RUNNER_TEMP/job-start`. Its last step (`if: always()`) runs

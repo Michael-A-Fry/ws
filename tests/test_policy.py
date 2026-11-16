@@ -2420,3 +2420,35 @@ def test_ssh_by_another_name_or_an_askpass_set_any_way_is_denied(pol, home, cmd)
 def test_slogin_and_an_env_string_with_a_plain_ssh_still_run(pol, home):
     assert policy.is_denied_command(pol, "slogin -p 22 h uptime") is None
     assert policy.is_denied_command(pol, "env -S 'LC_ALL=C ssh h ls'") is None
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "ssh -J jump.example.org -o \"HostName=x';true;'\" h ls",
+        "ssh -o ProxyJump=jump.example.org -o \"HostName=x';true;'\" h ls",
+        "ssh -J \"j';true;'\" h ls",
+        'ssh -o "ProxyJump=j;true" h ls',
+        "ssh -J jump.example.org \"h';true;'\" ls",
+        "ssh -o 'HostName x$(true)' h ls",
+    ],
+)
+def test_a_host_ssh_puts_in_a_local_command_is_plain_text_or_refused(pol, home, cmd):
+    assert policy.is_denied_command(pol, cmd)
+
+
+def test_plain_jumps_and_host_names_still_run(pol, home):
+    for cmd in (
+        "ssh -J me@jump.example.org:2222,jump2.example.org h ls",
+        "ssh -o ProxyJump=jump.example.org -o HostName=10.0.0.5 h ls",
+        "ssh -o HostName=[fe80::1%eth0] h ls",
+    ):
+        assert policy.is_denied_command(pol, cmd) is None, cmd
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    ["PATH=/tmp/d:$PATH ssh pve.example.org 'ls $X'", "export PATH=/tmp/d; ssh pve.example.org 'ls $X'"],
+)
+def test_a_path_set_on_the_line_keeps_the_local_rules(named, cmd):
+    assert policy.is_denied_command(named, cmd)

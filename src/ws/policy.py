@@ -2290,9 +2290,14 @@ def _segment_once(
         return ssh_why, line, []
     if ssh_toks is not None:
         ssh_opts, ssh_host, ssh_remote = _ssh_argv(ssh_toks)
-        if reason := _ssh_refusal(policy, ctx, ssh_opts, [*set_env, *ssh_prefix]):
+        if reason := _ssh_refusal(policy, ctx, ssh_opts, [*set_env, *ssh_prefix], ssh_host):
             return reason, line, []
-        cut, here = _ssh_remote(policy, seg, ssh_opts, ssh_host, ssh_remote, wrappers | ({cmd} - {"ssh"}), redirs)
+        # a PATH set for the line may make `ssh` another program: its remote command is not read as remote
+        path_set = any(_SETS_PATH.match(w) for w in [*set_env, *ssh_prefix]) or "PATH" in (ctx.vars or {})
+        path_set = path_set or "PATH" in ctx.unknown or ctx.distrust
+        cut, here = _ssh_remote(
+            policy, seg, ssh_opts, ssh_host, ssh_remote, wrappers | ({cmd} - {"ssh"}), redirs, strict=path_set
+        )
         if here:  # a remote command to this machine runs outside the wall: judged as the local command it is
             nested.append(" ".join(ssh_remote))
         if cut is not None:  # a single-quoted remote command to a named host: its words are not local file words
@@ -2532,6 +2537,9 @@ _SSH_PLAIN = (  # ssh_config(5) keywords that run nothing on this machine (lower
 )
 _SSH_KEYS = frozenset((*_SSH_FILE_KEYS, *_SSH_PLAIN.split()))
 _SSH_OPTION = re.compile(r"\s*([A-Za-z0-9]+)\s*(?:=\s*|\s+|\Z)(.*)", re.DOTALL)
+_SSH_PLAIN_HOST = re.compile(r"[A-Za-z0-9._:%\[\]@-]+")  # what a host, user@host or [v6]:port is written with
+_SSH_JUMPS = re.compile(r"[A-Za-z0-9._:%\[\]@,-]+")  # a comma list of them, for -J and ProxyJump
+_SETS_PATH = re.compile(r"PATH(?![A-Za-z0-9_])")
 _SSH_NAMES = frozenset(("ssh", "slogin"))  # slogin is ssh under another name
 _SSH_ENV = frozenset(("SSH_ASKPASS", "SSH_ASKPASS_REQUIRE"))  # an askpass setting: a program ssh runs
 _SSH_ASKPASS = re.compile(r"SSH_ASKPASS")  # any word that sets an askpass name, however it is spelled
@@ -2626,6 +2634,7 @@ def _ssh_remote(
     remote: list[str],
     wrappers: set[str],
     redirs: list[shellwords.Redirect],
+    strict: bool = False,
 ) -> tuple[int | None, bool]:
     """How an ssh line's remote command is judged: (where the line ends without it, when it is read as remote; whether
     it runs on this machine, so it is judged as a local command too)."""
@@ -2643,7 +2652,8 @@ def _ssh_remote(
     if any(_is_this_machine(n) for n in names):
         return None, bool(remote)
     if (
-        wrappers & {"xargs", *_SSH_WRAPPERS}
+        strict
+        or wrappers & {"xargs", *_SSH_WRAPPERS}
         or len(remote) != 1
         or redirs
         or any(_SSH_RENAMES.match(v) for o, v in opts if o == "o")
@@ -2689,13 +2699,25 @@ def _ssh_toks(
     return None, [], "sshpass runs a program ws does not read here; run ssh under sshpass directly, or use a key"
 
 
-def _ssh_refusal(policy: Policy, ctx: _Ctx, opts: list[tuple[str, str]], prefix: list[str]) -> str | None:
+def _ssh_refusal(
+    policy: Policy, ctx: _Ctx, opts: list[tuple[str, str]], prefix: list[str], host: str | None = None
+) -> str | None:
     """A refusal for an ssh option that runs or loads a local program or file, names a path deny_read covers, or
     writes to a path ws protects."""
     how = "; connect without it (put what it is for in a script file and run that)"
     held = bool(_SSH_ENV & (set(ctx.vars or {}) | set(ctx.unknown))) or ctx.distrust
     if held or any(_SSH_ASKPASS.match(w) for w in prefix):
         return f"ssh may be given an askpass program, which runs on this machine and ws cannot read{how}"
+    # ssh writes a jump's host into the proxy command it starts here, so a host it is given is plain text or refused
+    hosts = [("-J", v, True) for o, v in opts if o == "J"]
+    for o, v in opts:
+        if o == "o" and (m := _SSH_OPTION.match(v)) and m.group(1).lower() in ("hostname", "proxyjump"):
+            hosts.append((m.group(1), m.group(2).strip(), m.group(1).lower() == "proxyjump"))
+    if any(jump for _, _, jump in hosts) and host is not None:
+        hosts.append(("the host", host, False))
+    for what, value, jump in hosts:
+        if not (_SSH_JUMPS if jump else _SSH_PLAIN_HOST).fullmatch(value):
+            return f"ssh {what} {value!r} holds characters a host name does not have, and ssh puts it in a local command{how}"
     for letter, value in opts:
         if letter == "F" and value not in ("none", "/dev/null"):
             return f"ssh -F loads a config file, which can run local programs ws cannot read{how}"

@@ -681,6 +681,7 @@ PERSON_TOKEN = ".person-token"  # in the secrets folder, so every launch wall hi
 PERSON_DIGEST = (
     "person.sha256"  # in the identity folder: read-only to a walled session, so a planted token never matches
 )
+BOOT_ID = "/proc/sys/kernel/random/boot_id"  # changes at every boot; macOS has none, where a person send is refused
 _PERSON_USER = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
 
@@ -728,14 +729,30 @@ def _own_private_file(path: Path) -> str | None:
         os.close(fd)
 
 
+def _boot_id() -> str:
+    try:
+        return Path(BOOT_ID).read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
 def init_person_token(env: dict | None = None) -> Path:
     """Make a new per-boot person token: a random file under the secrets folder (0600) and its digest in the identity
-    folder. Run from the person's own terminal at hub start (`ws msg person-token`); a walled session can write neither
-    folder. Replaces the old pair, so an earlier token stops working. Returns the token's path."""
+    folder (with this boot's id, so a token from an earlier boot is no proof). Run from the person's own terminal at hub
+    start (`ws msg person-token`); a walled session can write neither folder. Replaces the old pair, so an earlier token
+    stops working. The secrets folder must already exist: a wall hides a folder only if it is there when the runner
+    starts, so a folder made now would not be hidden from sessions already running. Returns the token's path."""
     env = trusted_env() if env is None else env
     token_path, digest_path = _person_paths(env)
+    if not token_path.parent.is_dir():
+        raise WsError(
+            "refused",
+            f"{token_path.parent} does not exist, so a running session's wall would not hide a token made in it",
+            f"make it first (mkdir -m 700 {token_path.parent}), then start your sessions again",
+        )
     token = secrets.token_hex(32)
-    for path, text in ((token_path, token), (digest_path, hashlib.sha256(token.encode()).hexdigest())):
+    digest = hashlib.sha256(token.encode()).hexdigest()
+    for path, text in ((token_path, token), (digest_path, f"{digest} {_boot_id()}")):
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
@@ -757,7 +774,10 @@ def person_proof(env: dict | None = None) -> bool:
     token, digest = _own_private_file(token_path), _own_private_file(digest_path)
     if not token or not digest or not re.fullmatch(r"[0-9a-f]{64}", token):
         return False
-    return hmac.compare_digest(hashlib.sha256(token.encode()).hexdigest(), digest)
+    want, _, boot = digest.partition(" ")
+    if boot != _boot_id():
+        return False
+    return hmac.compare_digest(hashlib.sha256(token.encode()).hexdigest(), want)
 
 
 def asked_by() -> str:

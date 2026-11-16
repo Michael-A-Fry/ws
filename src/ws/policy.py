@@ -785,6 +785,10 @@ def loads(text: str) -> Policy:
         expires = _expires(e["expires"], where) if "expires" in e else None
         exceptions.append(RuleException(e["name"], e["job"], covered, e["reason"], owner, expires))
     classes = _classes(raw.get("classes", {}))
+    msg_table = _msg(raw.get("msg", {}))
+    for c in classes.values():
+        if not msg_table.person_send and any(n.startswith("person:") for n in c.inbound_allow):
+            raise PolicyError(f"[classes.{c.name}] inbound_allow names a person: set [msg] person_send = true first")
     return Policy(
         schema,
         dial,
@@ -797,7 +801,7 @@ def loads(text: str) -> Policy:
         _purposes(raw.get("budget", {})),
         _autonomy(raw.get("autonomy", {})),
         _egress_exceptions(raw.get("egress_exceptions", []), classes),
-        _msg(raw.get("msg", {})),
+        msg_table,
     )
 
 

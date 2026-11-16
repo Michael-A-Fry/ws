@@ -632,13 +632,14 @@ def caller() -> session.Record:
 def person_record(pol: policy.Policy) -> session.Record:
     """The sender of a person's own send: a synthetic `person:<account user>` record, never registered, built only here.
     It is made only with positive proof (ADR 0023, "A person sends"): `[msg] person_send` on, the sandbox wall on in the
-    policy, not in the resident gate (macOS gives it no process id), and the per-boot token readable and matching. No
+    policy, not macOS (its Seatbelt profile has not been run for this) and not the resident gate, and the per-boot token readable and matching. No
     runner ancestor is not proof: an orphaned or double-forked agent process has none. Anything less is the `refused`
     error a caller-less send always gave. Its role is `lead` (above one, since it is the person) and it has no class;
     a walled receiver still takes it only when `inbound_allow` names it."""
     try:
         user = session.account_user()
-        proven = pol.msg.person_send and pol.gate.sandbox and not session.peer_bound() and session.person_proof()
+        proven = pol.msg.person_send and pol.gate.sandbox and sys.platform != "darwin"
+        proven = proven and not session.peer_bound() and session.person_proof()
     except WsError:
         proven = False
     if not proven:
@@ -803,14 +804,16 @@ def send(
         )
 
     sender = session.resolve_caller()
+    if sender is None and not allow_person:
+        caller()  # raises: no caller, and this entry takes no person path
     pol = _policy()
     if sender is None:
-        sender = person_record(pol) if allow_person else caller()
+        sender = person_record(pol)
     names = _secret_names()
     target = session.read(to, _env())
     if target is None:
         raise WsError("not_found", f"no session {to!r}", "the registry has no session with that id")
-    s_class = policy.class_of(pol, sender.cwd) if sender.runner != "person" else None
+    s_class = policy.class_of(pol, sender.cwd) if not sender.session_id.startswith(session.PERSON) else None
     r_class = policy.class_of(pol, target.cwd)
     return _deliver(
         (sender, target, s_class, r_class, pol, names),

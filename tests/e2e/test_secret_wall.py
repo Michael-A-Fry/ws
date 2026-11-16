@@ -27,6 +27,9 @@ import pytest
 
 from ws import broker
 
+# One system-wide wall user and home (/var/lib/ws-broker) serves every test here: they run in one xdist worker, in order.
+pytestmark = pytest.mark.xdist_group("secret-wall")
+
 BROKER_USER, DEV_USER, OTHER_USER, GROUP = "ws-broker", "ws-dev", "ws-other", "ws-clients"
 WALL_HOME = Path("/var/lib/ws-broker")
 WALL_BIN = "/opt/ws/bin/ws"

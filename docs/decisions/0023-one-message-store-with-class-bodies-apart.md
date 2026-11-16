@@ -69,14 +69,14 @@ on a message to a walled class.
 - Bad: inside the wall the state folder is read-only, so a send from there fails with a typed `unavailable` error.
   Delivery across the wall isn't built yet.
 
-### Amendment: a person sends (hub chat 1b)
+### Amendment: A person sends (hub chat 1b)
 
 Context: the person who owns the account sends from the hub or a plain terminal, and the record must say who wrote
 (traceability, audit). Until now a send with no calling session was refused, which is also what an agent that has
 escaped its ancestry gets. "No runner ancestor" is therefore not proof of a person: `setsid -f`, `nohup`,
 `systemd-run --user`, `at`, `tmux new-window` and cron all give an agent process whose ancestors hold no runner.
 
-Decision: a person send needs positive proof, and a switch that is off by default.
+Decision: a person send needs positive proof, and a switch that's off by default.
 
 - `[msg] person_send` in policy.toml (default `false`) is the rollback: off, the behaviour is exactly the earlier one.
   A new key is needed because no existing setting says "this account lets its person send"; `[classes]` is about
@@ -99,14 +99,14 @@ Decision: a person send needs positive proof, and a switch that is off by defaul
   to the identity file (the authority) and the session record; a resumed start keeps it; an older record reads as
   `unknown`. `ws session show ID` prints it. The record is the audit trail; there is no new log.
 
-What this stops, and what it does not. The token is only as private as the wall that hides it:
+What this stops, and what it doesn't. The token is only as private as the wall that hides it:
 
 - It stops: an agent in a launch wall (the secrets folder hidden, the identity folder read-only) from sending as the
   person, by any ancestry escape, and from minting its own proof.
-- It does not stop: a session with the wall off (`--no-sandbox`) running as the same OS user, which can read the token.
-  So with `[gate] sandbox = false` the person send is refused; ws cannot see a `--no-sandbox` launch under a policy that
-  says on. On macOS, and where the process id of a hook cannot be had (`bind_peer(None)`), a person send is refused.
-- The full fix is a separate OS user per class (C111), so a session cannot read the account's files at all. Until then
+- It doesn't stop: a session with the wall off (`--no-sandbox`) running as the same OS user, which can read the token.
+  So with `[gate] sandbox = false` the person send is refused; ws can't see a `--no-sandbox` launch under a policy that
+  says on. On macOS, and where the process id of a hook can't be had (`bind_peer(None)`), a person send is refused.
+- The full fix is a separate OS user per class (C111), so a session can't read the account's files at all. Until then
   this is a wall-dependent control.
 
 | Case | Result | Test |

@@ -35,12 +35,12 @@ never a walled body. A person's own export of the whole store arrives with the o
 
 ## A person sends
 
-The person who owns this account can send from the hub or a plain terminal, as `person:<account user>`. It is off by
+The person who owns this account can send from the hub or a plain terminal, as `person:<account user>`. It's off by
 default: set `[msg] person_send = true` in policy.toml, and run `ws msg person-token` at hub start (the secrets folder
 must already exist; it writes `<data>/secrets/.person-token`, 0600, and a digest in `<state>/identity/person.sha256`).
 A send with no calling session then reads the token and checks it against the digest. The token sits in the secrets
 folder, which every launch wall hides, so an agent that has left its runner's process tree (`setsid`, `nohup`,
-`systemd-run --user`, `at`, `tmux new-window`, cron) has no token and is refused. Having no runner ancestor is not
+`at`, cron: still inside the wall) has no token and is refused. Having no runner ancestor isn't
 proof. The send is refused when the policy has `[gate] sandbox = false`, and on macOS (until its sandbox profile is
 run for this). Same-user agents with the wall off can read the token; separate OS users per class (C111) is the full
 fix. The body goes in with `-`; the caps and the secret scan are the same, and the person has a rate cap of its own

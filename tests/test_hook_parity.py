@@ -201,10 +201,9 @@ def test_claims_deny_when_git_cannot_answer_in_time(box, monkeypatch, how):
     repo = box / "repo"
     repo.mkdir()
     git(repo, "init", "-q", "-b", "main")
-    (repo / "a").write_text("1")
-    git(repo, "add", "a")
-    git(repo, "commit", "-q", "-m", "first")
-    on = git(repo, "rev-parse", "--short=10", "HEAD")
+    # a readable sha: about one in 110 is all digits, which the guard never reads as a commit, so the claim would be
+    # allowed with git working or not (the macOS red of 16 Nov; the three cases share a sha when made in one second)
+    on = commit_with_readable_sha(repo, "a", "1")
     git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
     pol = policy.loads('[guards]\non = ["claims"]\n')
 

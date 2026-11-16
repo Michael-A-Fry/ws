@@ -1091,7 +1091,7 @@ def test_each_event_gets_a_hook_only_when_a_guard_runs_there(monkeypatch):
     fake_guard(monkeypatch, "e-post", events=("post",), kinds=("agent", "skill", "command"))
     fake_guard(monkeypatch, "e-pre", events=("pre",), kinds=("message", "skill", "read"))
     hooks = generate(pol("e-stop e-post e-pre"))["hooks"]
-    assert hooks["PostToolUse"][0]["matcher"] == "Bash|Agent|Task|Skill"
+    assert hooks["PostToolUse"][0]["matcher"] == "Bash|Agent|Task|Workflow|Skill"
     assert hooks["PreToolUse"][0]["matcher"] == claude_code.MATCHER == "*"  # every tool already: no kind adds to it
     assert "gate event" in commands(hooks["SubagentStop"])[0]
     assert [("gate event" in c) for c in commands(hooks["Stop"])] == [True, False]  # then the phone alert

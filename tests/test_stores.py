@@ -37,7 +37,7 @@ SCHEMAS = {
     "gate.jsonl": gate.VERDICT_SCHEMA,
     "wall-report.jsonl": sandbox.WALL_REPORT_SCHEMA,
     "footprint.jsonl": ws_node.SCHEMA_VERSION,
-    "asks.jsonl": opencode.ASKS_SCHEMA,
+    "asks.jsonl": opencode.ASKS_SCHEMA,  # `ws ask` writes the same number: see the test below
     "alerts.jsonl": jobwatch.SCHEMA_VERSION,
     "upgrade-history.jsonl": upgrade.HISTORY_SCHEMA,
 }
@@ -174,6 +174,7 @@ KNOWN_WRITERS = {
     "src/ws/canary.py",
     "src/ws/guards/record_calls.py",
     "src/ws/node.py",
+    "src/ws/asks.py",
 }
 
 
@@ -234,7 +235,7 @@ def test_the_page_names_ts_as_the_time_key_of_every_log_that_has_one():
 
 def test_a_log_that_has_at_in_the_page_writes_ts_and_at_with_the_same_moment():
     legacy = {n for n, r in listed().items() if "`at`" in r["Time key"]}
-    assert legacy == {"gate-calls.jsonl", "claims.jsonl", "wall-report.jsonl"}
+    assert legacy == {"gate-calls.jsonl", "claims.jsonl", "wall-report.jsonl", "asks.jsonl"}
     for name in legacy:
         assert "`at`" in listed()[name]["Fields"] and "`ts`" in listed()[name]["Fields"]
 
@@ -282,3 +283,9 @@ def test_a_schema_2_line_still_reads(tmp_path):
     now = datetime(2026, 11, 8, tzinfo=UTC)
     assert runrecord.month_spend([rec], now) == 1.5
     assert runrecord.month_spend_by_purpose([rec], now) == {None: 1.5}
+
+
+def test_ws_ask_writes_the_schema_number_the_opencode_shim_does():
+    from ws import asks
+
+    assert asks.SCHEMA == opencode.ASKS_SCHEMA

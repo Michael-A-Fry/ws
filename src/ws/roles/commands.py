@@ -279,14 +279,50 @@ def cmd_schedule_apply(args: argparse.Namespace) -> int:
 SCRIPT_COPY_MAX_AGE_S = 2 * 86400  # a copy this old was left by a run that was killed (a clean one removes its own)
 
 
+HELD = ".held"  # in each run-* copy folder: flock-held for as long as the run (ws or the script) lives
+
+
+def _hold(folder: Path) -> int | None:
+    """Take the lock that says this copy is in use; the descriptor goes to the script too, so the lock lasts while
+    either lives (the kernel drops it when both are gone). None where there is no flock (the copy is then swept by age
+    alone)."""
+    try:
+        import fcntl
+    except ImportError:
+        return None
+    fd = os.open(folder / HELD, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
+def _in_use(folder: Path) -> bool:
+    """True while a run holds this copy's lock (a live script job with no timeout may run for days)."""
+    try:
+        import fcntl
+    except ImportError:
+        return False
+    try:
+        fd = os.open(folder / HELD, os.O_RDWR)
+    except OSError:
+        return False  # no lock file: a copy from before the lock, or one whose run died before taking it
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return False
+    except OSError:
+        return True
+    finally:
+        os.close(fd)
+
+
 def _sweep(folder: Path, before: float) -> None:
-    """Remove the `run-*` copies older than `before` that a killed run left in `folder`. Never raises."""
+    """Remove the `run-*` copies older than `before` that a killed run left in `folder`, never one a live run still
+    holds. Never raises."""
     import shutil
 
     with contextlib.suppress(OSError):
         for d in folder.glob("run-*"):
             with contextlib.suppress(OSError):
-                if d.is_dir() and not d.is_symlink() and d.stat().st_mtime < before:
+                if d.is_dir() and not d.is_symlink() and d.stat().st_mtime < before and not _in_use(d):
                     shutil.rmtree(d, ignore_errors=True)
 
 
@@ -340,6 +376,7 @@ def cmd_schedule_script(args: argparse.Namespace) -> int:
     private.chmod(0o700)
     _sweep(private, time.time() - SCRIPT_COPY_MAX_AGE_S)
     with tempfile.TemporaryDirectory(prefix="run-", dir=private) as tmp:
+        held = _hold(Path(tmp))  # a sweep by another run leaves this copy alone while it is in use
         copy = Path(tmp) / path.name  # the reviewed bytes, where nobody else can swap them before they run
         fd = os.open(copy, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o700)
         with os.fdopen(fd, "wb") as f:
@@ -347,7 +384,7 @@ def cmd_schedule_script(args: argparse.Namespace) -> int:
         try:
             code = subprocess.run(
                 [str(copy)], cwd=path.parent, env={**env, "WS_SCRIPT_PATH": str(path)}, stdin=subprocess.DEVNULL,
-                timeout=timeout, check=False,
+                timeout=timeout, check=False, pass_fds=() if held is None else (held,),
             ).returncode  # fmt: skip
         except subprocess.TimeoutExpired:
             print(f"ws: {args.job}: the script ran past its {timeout:g} s timeout and was stopped", file=sys.stderr)
@@ -355,6 +392,9 @@ def cmd_schedule_script(args: argparse.Namespace) -> int:
         except OSError as e:
             raise WsError("failed", f"job {args.job}: cannot start {path}: {e.strerror or type(e).__name__}",
                           "give it a #! line; a state folder mounted noexec also stops it", 1) from e  # fmt: skip
+        finally:
+            if held is not None:
+                os.close(held)
     code = 128 - code if code < 0 else code  # killed by signal N: 128+N, as a shell says it
     if code and env.get("WS_ALERT_ON_EXIT") == "1":  # launchd has no OnFailure=: the failure alert is sent from here
         from ws import jobwatch

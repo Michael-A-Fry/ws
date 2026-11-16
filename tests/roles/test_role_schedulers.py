@@ -970,3 +970,28 @@ def test_a_copy_left_by_a_killed_script_run_is_swept(box, write_job):
     os.utime(old, (1, 1))  # left by a SIGKILL long ago
     assert cli.main(["schedule", "script", "upkeep"]) == 0
     assert not old.exists() and fresh.exists()  # a fresh one may belong to a run still going
+
+
+def test_the_sweep_leaves_an_old_copy_a_live_run_still_holds(box, write_job):
+    """A script job with no timeout may run for days: its copy is old but held, so the sweep leaves it."""
+    import os
+
+    from ws.roles import commands
+
+    path, sha = _private_script(box, "#!/bin/sh\nexit 0\n")
+    write_job("upkeep", script_job(path, sha))
+    scripts = box / ".ws" / "scripts"
+    scripts.mkdir(mode=0o700)
+    live, dead = scripts / "run-live", scripts / "run-dead"
+    for d in (live, dead):
+        d.mkdir()
+        (d / "upkeep.sh").write_text("x")
+        (d / commands.HELD).write_text("")
+    fd = commands._hold(live)  # the long run, still going
+    try:
+        for d in (live, dead):
+            os.utime(d, (1, 1))
+        assert cli.main(["schedule", "script", "upkeep"]) == 0
+        assert live.exists() and not dead.exists()
+    finally:
+        os.close(fd)

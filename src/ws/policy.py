@@ -2269,6 +2269,10 @@ def _segment_once(
         admin = _ws_admin(canon, "xargs" in wrappers) or (_ws_admin(unglued) if unglued else None)
     if admin:
         return admin, line, []
+    if cmd == "ssh":
+        ssh_opts = _ssh_argv(toks)[0]
+        if reason := _ssh_refusal(policy, ctx, ssh_opts, words[: max(0, len(words) - len(toks))]):
+            return reason, line, []
     nested += _arith_scripts(ctx, cmd, flags, toks, words)
     if cmd == "eval":
         text = " ".join(toks[1:])
@@ -2453,10 +2457,105 @@ _FILE_FLAGS = {  # address commands: the options that name a file (their positio
     "curl": ("TK", ("--upload-file", "--config")),
     "wget": ("i", ("--input-file", "--post-file")),
     "sftp": ("bF", ()),
-    "ssh": ("iF", ()),
+    "ssh": ("iFEIS", ()),
     "ftp": ("", ()),
     "rclone": ("", ("--config", "--files-from", "--filter-from", "--include-from", "--exclude-from")),
 }
+
+
+# --- ssh: the options that run or load local files, and a remote command that is remote ------------------------------
+#
+# ssh runs some of its own options on this machine: a proxy or local command, a known-hosts command, a `Match exec`, a
+# PKCS#11 or security-key library, an askpass program, a config file (which can hold any of those). The gate cannot read
+# what they run, so they are refused (fail closed): an `-o` keyword is allowed only when it is on the list below. The
+# files ssh reads for a key or a known-hosts list are judged as reads. ssh(1) reads options before the host and again
+# right after it, with the value letters `_SSH_VALUE`; what follows is the remote command.
+#
+# The remote command runs on the far host, so a `$VAR`, a loop or a `$(...)` in it is not a local word. It is read as
+# remote only when it is one word written wholly in single quotes (the local shell expands nothing in it), the host is
+# one the policy names (`[gate] allow_hosts`, a class's `allowed_hosts`), the host is not this machine (loopback, its own
+# name), and nothing else on the line is refused. A remote command to this machine is judged as the local command it is.
+# Escape characters (`~C`, `~!`) need an interactive terminal, which an agent's shell call does not have: out of scope.
+_SSH_VALUE = "BbcDEeFIiJLlmOoPpQRSWw"
+_SSH_FILE_KEYS = frozenset(
+    ("identityfile", "certificatefile", "userknownhostsfile", "globalknownhostsfile", "revokedhostkeys")
+)
+_SSH_PLAIN = (  # ssh_config(5) keywords that run nothing on this machine (lower case: ssh ignores case)
+    "addkeystoagent addressfamily batchmode bindaddress bindinterface canonicaldomains canonicalizefallbacklocal "
+    "canonicalizehostname canonicalizemaxdots canonicalizepermittedcnames casignaturealgorithms channeltimeout "
+    "checkhostip ciphers clearallforwardings compression connectionattempts connecttimeout controlpersist "
+    "dynamicforward enableescapecommandline escapechar exitonforwardfailure fingerprinthash "
+    "forkafterauthentication forwardagent forwardx11 forwardx11timeout forwardx11trusted gatewayports "
+    "gssapiauthentication gssapidelegatecredentials hashknownhosts hostbasedacceptedalgorithms "
+    "hostbasedauthentication hostkeyalgorithms hostkeyalias hostname identitiesonly ignoreunknown ipqos "
+    "kbdinteractiveauthentication kbdinteractivedevices kexalgorithms localforward loglevel logverbose macs "
+    "nohostauthenticationforlocalhost numberofpasswordprompts obscurekeystroketiming passwordauthentication "
+    "permitremoteopen port preferredauthentications proxyjump proxyusefdpass pubkeyacceptedalgorithms "
+    "pubkeyauthentication rekeylimit remoteforward requesttty requiredrsasize serveralivecountmax "
+    "serveraliveinterval sessiontype stdinnull streamlocalbindmask streamlocalbindunlink stricthostkeychecking "
+    "syslogfacility tag tcpkeepalive tunnel tunneldevice updatehostkeys user verifyhostkeydns visualhostkey"
+)
+_SSH_KEYS = frozenset((*_SSH_FILE_KEYS, *_SSH_PLAIN.split()))
+_SSH_OPTION = re.compile(r"\s*([A-Za-z0-9]+)\s*(?:=\s*|\s+|\Z)(.*)", re.DOTALL)
+_SSH_ASKPASS = re.compile(r"SSH_ASKPASS(?:_REQUIRE)?=")
+_SSH_HOST = re.compile(r"(?:ssh://)?(?:[^@/]*@)?(\[[^\]]*\]|[^:/]*)")
+_SINGLE_QUOTED_END = re.compile(r"(?:\A|[ \t])'([^']*)'[ \t]*\Z")  # a last word written wholly in single quotes
+
+
+def _ssh_argv(toks: list[str]) -> tuple[list[tuple[str, str]], str | None, list[str]]:
+    """ssh's options as (letter, value), its host and the words of its remote command, read as ssh(1) reads them."""
+    opts: list[tuple[str, str]] = []
+    host: str | None = None
+    i, n = 1, len(toks)
+    while i < n:
+        t = toks[i]
+        if t == "--":
+            if host is None and i + 1 < n:
+                host, i = toks[i + 1], i + 1
+            i += 1
+            break
+        if t.startswith("-") and len(t) > 1:
+            for k, c in enumerate(t[1:], 1):
+                if c in _SSH_VALUE:
+                    if k + 1 < len(t):
+                        opts.append((c, t[k + 1 :]))
+                    else:
+                        i += 1
+                        opts.append((c, toks[i] if i < n else ""))
+                    break
+                opts.append((c, ""))
+            i += 1
+        elif host is None:
+            host, i = t, i + 1
+        else:
+            break
+    return opts, host, toks[i:]
+
+
+def _ssh_refusal(policy: Policy, ctx: _Ctx, opts: list[tuple[str, str]], prefix: list[str]) -> str | None:
+    """A refusal for an ssh option that runs or loads a local program or file, or names a path deny_read covers."""
+    how = "; connect without it (put what it is for in a script file and run that)"
+    if any(_SSH_ASKPASS.match(w) for w in prefix) or "SSH_ASKPASS" in (ctx.vars or {}):
+        return f"ssh is given an askpass program, which runs on this machine and ws cannot read{how}"
+    for letter, value in opts:
+        if letter == "F" and value not in ("none", "/dev/null"):
+            return f"ssh -F loads a config file, which can run local programs ws cannot read{how}"
+        if letter in "IE" and not (letter == "E" and value == "/dev/null"):
+            what = "loads a PKCS#11 library" if letter == "I" else "writes its log to a local file"
+            return f"ssh -{letter} {what}, which ws does not judge{how}"
+        files = [value] if letter in "iS" else []
+        if letter == "o":
+            m = _SSH_OPTION.match(value)
+            key = m.group(1).lower() if m else ""
+            if key not in _SSH_KEYS:
+                return f"ssh option {key or value!r} runs or loads a local program or file, or is not one ws knows{how}"
+            files = [m.group(2).strip().strip("\"'")] if key in _SSH_FILE_KEYS else []
+        for f in files:
+            if _HAS_PART.search(f) or "%" in f:
+                return f"ssh is given the file {f!r}, which holds a part ws cannot read; {HOW_TO_SPELL}"
+            if rule := _read_hit(policy, f, ctx.cwd, expand=letter == "o"):
+                return f"command names a path denied by deny_read rule {rule!r}"
+    return None
 
 
 # --- a command the reader doesn't know, given a shell -----------------------------------------------------------------

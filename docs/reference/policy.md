@@ -155,6 +155,13 @@ A here-document or here-string is text for whatever reads it. When that's a shel
 `fish`), `source`, `.`, `eval`, `ssh` or `xargs`, the text runs as code, so the command is refused with the reason
 `stdin-is-code`. Any other body, a commit message included, is read as commands, whatever its quoting.
 
+ssh options that run or load local files are judged. An `-o` keyword runs only when it's one ws knows runs nothing
+here (`Port`, `User`, `ConnectTimeout`, `StrictHostKeyChecking` and the like); a proxy, local or known-hosts command,
+`Match`, a provider library, an agent or control socket, `SendEnv`, `SetEnv`, `Include` and any keyword ws doesn't
+know are refused. So are `-F` (other than `none`), `-I`, `-E` and an askpass program. The files ssh reads for a key,
+a certificate or a known-hosts list go through `deny_read`. ssh's escape characters need an interactive terminal,
+which a shell call doesn't have.
+
 ### The sandbox is the boundary
 
 The sandbox is the boundary, and the static gate is defence in depth. The gate reads the text of a command and refuses
@@ -162,13 +169,13 @@ what it can show is wrong, with a reason a person can act on. The sandbox acts o
 command line says: ws's own files are read-only and the `deny_read` paths read as empty for every program a shell
 command starts. It's on by default (`sandbox = true`), and it's the layer a bypass of the gate meets.
 
-The gate's limits are the kinds of text it can't see into. The first four are the `LIMITS` rows in
+The gate's limits are the kinds of text it can't see into. The first three are the `LIMITS` rows in
 `tests/test_gate_oracle.py`:
 
 - An interpreter, and the program it runs from `-c`, a file or standard input.
 - An `awk` program.
 - A script the line writes and then runs.
-- An option whose value is a command the tool runs (ssh's `ProxyCommand`).
+- An option whose value is a command another tool runs (rsync's `-e`, scp's `-o`). ssh's own are refused (see below).
 - A launcher that starts an interpreter. The gate refuses a launcher that starts a shell, but what an interpreter does
   inside its own program is the same limit as the first.
 
@@ -189,7 +196,7 @@ none.
 
 The static gate reads shell, so it's a check on shell and not a wall against interpreters. A program that `python`,
 `python3`, `perl`, `node`, `ruby`, `php`, `lua` or `Rscript` runs (from `-c`, a file, or standard input), `awk` code,
-an option whose value is a command the tool runs (such as ssh's `ProxyCommand`), and a script the line writes and then
+an option whose value is a command another tool runs (such as rsync's `-e`), and a script the line writes and then
 runs are text the gate can't see into: it's the same for a here-document or here-string given to one of them. These
 are the known limits, and `tests/test_gate_oracle.py` lists each as a `LIMIT` row. The wall is the sandbox:
 `ws gate launch --runner R -- argv` starts the runner inside it, and the files and folders ws protects are out of reach

@@ -2189,3 +2189,73 @@ def test_an_absolute_home_or_a_folder_above_it_is_refused_whole(home, key):
             policy.loads(f'[gate]\n{key} = [{ok}, "{entry}", "~/fine"]\n')
         assert str(entry) in str(e.value)  # it names the entry
     assert policy.loads(f"[gate]\n{key} = [{ok}]\n").gate  # a folder inside the home is fine
+
+
+# --- ssh: the options that run or load local files ---------------------------------------------------------------
+
+SSH_LOCAL_EXEC = [
+    "ssh -o ProxyCommand='sh -c x' host ls",
+    "ssh -oProxyCommand=bash host ls",
+    "ssh -o proxycommand=bash host ls",
+    "ssh -o 'ProxyCommand bash' host ls",
+    "ssh -vo ProxyCommand=bash host ls",
+    "ssh host -o ProxyCommand=bash ls",
+    "ssh -o LocalCommand='touch /tmp/p' -o PermitLocalCommand=yes host ls",
+    "ssh -o KnownHostsCommand='touch /tmp/p' host ls",
+    "ssh -o Match='exec true' host ls",
+    "ssh -o RemoteCommand=ls host",
+    "ssh -o PKCS11Provider=/tmp/l.so host ls",
+    "ssh -o SecurityKeyProvider=/tmp/l.so host ls",
+    "ssh -o IdentityAgent=/tmp/a host ls",
+    "ssh -o ControlPath=/tmp/c -o ControlMaster=yes host ls",
+    "ssh -o SendEnv=X host ls",
+    "ssh -o SetEnv=X=1 host ls",
+    "ssh -o Include=/tmp/x host ls",
+    "ssh -o XAuthLocation=/tmp/x host ls",
+    "ssh -o NoSuchKeyword=1 host ls",
+    "ssh -F /tmp/evil host ls",
+    "ssh -E ~/.bashrc host ls",
+    "ssh -I /tmp/lib.so host ls",
+    "ssh -o 'IdentityFile ~/.ssh/id_rsa' host ls",
+    "ssh -o IdentityFile=%d/.ssh/id_rsa host ls",
+    "ssh -S ~/.ssh/ctl host ls",
+    "SSH_ASKPASS=/tmp/x ssh host ls",
+    "env SSH_ASKPASS_REQUIRE=force ssh host ls",
+    "sudo SSH_ASKPASS=/tmp/x ssh host ls",
+    "/usr/bin/ssh -oProxyCommand=bash host ls",
+    "command ssh -oProxyCommand=bash host ls",
+    "sudo ssh -oProxyCommand=bash host ls",
+    "timeout 5 ssh -oProxyCommand=bash host ls",
+    "xargs ssh -oProxyCommand=bash host",
+]
+
+
+@pytest.mark.parametrize("cmd", SSH_LOCAL_EXEC)
+def test_ssh_options_that_run_or_load_local_files_are_denied(pol, home, cmd):
+    assert policy.is_denied_command(pol, cmd)
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "ssh host ls",
+        "ssh -v -p 2222 -l me host uptime",
+        "ssh -o Port=2222 -o StrictHostKeyChecking=accept-new host ls",
+        "ssh -o 'ConnectTimeout 5' -o BatchMode=yes host ls",
+        "ssh -F none host ls",
+        "ssh -J jump.example.org host ls",
+        "ssh -L 8080:localhost:80 -N host",
+        "ssh -S /tmp/ctl -O check host",
+        "ssh -o UserKnownHostsFile=/dev/null host ls",
+        "ssh host -- ls -o x",
+    ],
+)
+def test_plain_ssh_options_still_run(pol, home, cmd):
+    assert policy.is_denied_command(pol, cmd) is None
+
+
+def test_ssh_argv_reads_options_before_and_after_the_host():
+    opts, host, remote = policy._ssh_argv(["ssh", "-vp", "22", "-oX=1", "h", "-l", "u", "ls", "-o", "y"])
+    assert opts == [("v", ""), ("p", "22"), ("o", "X=1"), ("l", "u")]
+    assert host == "h" and remote == ["ls", "-o", "y"]
+    assert policy._ssh_argv(["ssh", "--", "h", "-o", "x"])[1:] == ("h", ["-o", "x"])

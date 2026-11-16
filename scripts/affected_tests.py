@@ -49,20 +49,33 @@ def git(*args: str) -> str:
 
 
 def changed(base: str) -> tuple[list[str], list[str], list[str]]:
-    """(modified or added paths, added paths, renamed or deleted paths) of HEAD against the merge-base with `base`."""
+    """(modified or added paths, added paths, renamed or deleted paths) of the commits on HEAD that `base` lacks.
+
+    It reads HEAD, not the refs a push names, and the test files as they are on disk. NUL-separated output keeps a
+    path with a space, a quote or a newline in it whole."""
     mb = git("merge-base", base, "HEAD").strip()
     mod, added, gone = [], [], []
-    for line in git("diff", "--name-status", "-M", f"{mb}..HEAD").splitlines():
-        parts = line.split("\t")
-        status = parts[0][0]
-        if status in "RD":
-            gone.append(parts[1])
+    tokens = git("diff", "--name-status", "-z", "-M", "-C", f"{mb}..HEAD").split("\0")
+    i = 0
+    while i < len(tokens) and tokens[i]:
+        status = tokens[i][0]
+        if status in "RC":  # two paths: the old one, then the new one
+            old, new = tokens[i + 1], tokens[i + 2]
+            i += 3
+            mod.append(new)
             if status == "R":
-                mod.append(parts[2])
+                gone.append(old)
+            else:
+                added.append(new)
+            continue
+        path = tokens[i + 1]
+        i += 2
+        if status == "D":
+            gone.append(path)
         else:
-            mod.append(parts[1])
+            mod.append(path)
             if status == "A":
-                added.append(parts[1])
+                added.append(path)
     return mod, added, gone
 
 

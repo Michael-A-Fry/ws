@@ -6,7 +6,11 @@
 # and is required to merge. A change that maps to more than 40 test files, or touches a path that reaches every test
 # (pyproject.toml, uv.lock, a conftest.py, tests/plugins/, .github/), runs a capped set instead: the smoke set, every
 # changed or added test and the tests importing a changed module directly, stopped after WS_PREPUSH_CAP seconds
-# (default 300). Nothing mapped, or no usable selector, runs the smoke set, never zero.
+# (default 300, counted from when the tests start, after any wrapper; it needs `timeout`, which macOS lacks by default,
+# so there the capped set has no cap). A capped set that hits the cap fails the push: raise WS_PREPUSH_CAP, or skip the
+# hook, and CI runs the rest. Nothing mapped runs the smoke set, never zero; a selector that fails runs the smoke set
+# plus the changed tests and the tests named for a changed module. The change is HEAD against origin/main, not the refs
+# a push names.
 # WS_PREPUSH_FULL=1 runs the whole suite here (logged like a skip).
 # Run the tests through a wrapper: WS_PREPUSH_WRAP="your-lock-command --flag" git push (split on spaces; for a machine
 # that queues test runs, so a push's tests don't race the others). Unset, they run as they are.
@@ -48,7 +52,11 @@ if [[ "${WS_PREPUSH_FULL:-}" == "1" ]]; then
   kind="FULL"
   printf '%s full suite forced on %s (WS_PREPUSH_FULL=1)\n' "$stamp" "$branch" >>"$log"
 else
-  git fetch -q origin main 2>/dev/null || true
+  fetch=(git fetch -q origin main)
+  if command -v timeout >/dev/null 2>&1; then
+    fetch=(timeout 20 "${fetch[@]}")
+  fi
+  GIT_TERMINAL_PROMPT=0 "${fetch[@]}" 2>/dev/null || true
   picked=""
   if [[ -f scripts/affected_tests.py ]]; then
     picked="$(python3 -I scripts/affected_tests.py --base origin/main 2>/dev/null)" || picked=""
@@ -63,8 +71,20 @@ else
       done < <(tail -n +2 <<<"$picked")
       ;;
     *)
-      echo "pre-push: no usable selection (${head_line:-no selector}); running the smoke set" >&2
-      kind="SMOKE"
+      echo "pre-push: no usable selection (${head_line:-no selector}); running the smoke set and what the names say" >&2
+      kind="CAPPED: no usable selection"
+      # the changed tests, and tests/test_<stem>.py for each changed src/ws/<stem>.py, by name alone
+      names="$(git diff --name-only origin/main...HEAD 2>/dev/null || true)"
+      while read -r line; do
+        case "$line" in
+          tests/*test_*.py) [[ -f "$line" ]] && targets+=("$line") ;;
+          src/ws/*.py)
+            stem="$(basename "$line" .py)"
+            [[ -f "tests/test_${stem}.py" ]] && targets+=("tests/test_${stem}.py")
+            ;;
+        esac
+      done <<<"$names"
+      targets+=("${smoke[@]}")
       ;;
   esac
   count="${#targets[@]}"
@@ -72,20 +92,27 @@ else
     targets=("${smoke[@]}")
   fi
   suite+=("${targets[@]}")
-  if [[ "$kind" == CAPPED* ]] && command -v timeout >/dev/null 2>&1; then
-    limit=(timeout "${WS_PREPUSH_CAP:-300}")
+  if [[ "$kind" == CAPPED* ]]; then
+    suite+=(-x) # the first failure ends the capped run, so the cap never hides one
+    if command -v timeout >/dev/null 2>&1; then
+      limit=(timeout "${WS_PREPUSH_CAP:-300}")
+    fi
   fi
   echo "pre-push: $kind: ${#targets[@]} test file(s); CI runs the whole suite (WS_PREPUSH_FULL=1 runs it here)" >&2
 fi
 
+# the cap sits inside the wrapper: time spent queued behind other runs doesn't count against it
+if [[ "${#limit[@]}" != 0 ]]; then
+  suite=("${limit[@]}" "${suite[@]}")
+fi
 if [[ "${#wrap[@]}" != 0 ]]; then
   suite=("${wrap[@]}" "${suite[@]}")
 fi
 echo "pre-push: ${suite[*]}" >&2
 rc=0
-"${limit[@]+"${limit[@]}"}" "${suite[@]}" >&2 || rc=$?
+"${suite[@]}" >&2 || rc=$?
 if [[ "$rc" == 124 && "${#limit[@]}" != 0 ]]; then
-  echo "pre-push: stopped the capped set after ${WS_PREPUSH_CAP:-300} s with no failure; CI runs the rest" >&2
-  rc=0
+  echo "pre-push: the capped set hit the ${WS_PREPUSH_CAP:-300} s cap before it finished, so it is not a pass." >&2
+  echo "pre-push: raise WS_PREPUSH_CAP, or WS_SKIP_PREPUSH=1 (logged); CI runs the whole suite." >&2
 fi
 exit "$rc"

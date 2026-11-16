@@ -54,6 +54,6 @@ exclude-newer = "7 days"
 testpaths = ["tests"]
 # tests/plugins holds ws_harness, the suite's own plugin (sizes and limits, flakes, quarantine, tier report).
 pythonpath = ["tests/plugins"]
-addopts = "-p ws_harness -n auto"
+addopts = "-p ws_harness -n auto --dist loadgroup"
 # Dump every thread's stack when a test is stuck for two minutes (noise only; the size limits do the killing).
 faulthandler_timeout = 120

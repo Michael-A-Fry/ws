@@ -72,7 +72,7 @@ def test_the_table_is_sound():
 def test_every_store_on_the_stores_page_has_a_kinds_row():
     covered = {s for k in items.KINDS.values() for s in k.stores}
     page = page_stores()
-    assert len(page) == 23  # counted first: 16 logs, 6 record files, the queue database
+    assert len(page) == 24  # counted first: 17 logs, 6 record files, the queue database
     assert page <= covered, sorted(page - covered)
     assert "The messages database" in covered  # not on the stores page yet
 

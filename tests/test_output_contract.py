@@ -47,6 +47,8 @@ CASES: dict[str, list[str]] = {
     "secret.list": ["secret", "list"],
     "secret.rm": ["secret", "rm", "nope"],
     "secret.generate": ["secret", "generate", "nope"],
+    "job.add": ["job", "add", "{home}/none.toml"],
+    "job.remove": ["job", "remove", "nope"],
     "secret.reveal": ["secret", "reveal", "nope"],
     "secret.import": ["secret", "import", "nope", "--from-env", "missing.env"],
     "secret.wall": ["secret", "wall"],

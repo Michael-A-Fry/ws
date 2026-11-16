@@ -1939,6 +1939,8 @@ def _ws_admin(canon: list[str], xargs: bool = False, read_anywhere: bool = False
             return "ws gate generate/init is not for a gated session: it would rewrite its own gate"
         if tuple(sub[:2]) in agentsession.SESSION_OK:
             continue
+        if sub[:1] == ["secret"] and agentsession.session_secret_words(rest, os.environ):
+            continue  # the two exact forms a session may run (ws.agentsession)
         if sub[:1] and sub[0] in agentsession.ADMIN:
             return f"ws {sub[0]} is not for a gated session"
         if tuple(sub[:2]) in agentsession.ADMIN_SUB:

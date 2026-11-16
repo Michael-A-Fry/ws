@@ -17,10 +17,12 @@ ws ask withdraw ID               # the session no longer needs it (an open ask)
 ws ask import OLD.jsonl --dry-run
 ```
 
-The first `--option` is the recommendation. An open ask with the same `--dedupe-key` returns its id and adds nothing.
-`--stdin` reads the ask from standard input as one JSON object (`question`, `options`, `decision`, `repo`, `session`,
-`dedupe_key`, `free_text_allowed`); a flag overrides it. `--cwd DIR` says where the ask comes from (default: here).
-`--json` (global) gives one envelope. There is no "asked by" field: `session` says who asked.
+A label (any case) is tried before a number, so an option labelled "2" isn't read as the second one. A free-text
+answer is scanned like a question: a secret or a sensitive term refuses it (exit 1). The first `--option` is the
+recommendation. An open ask with the same `--dedupe-key` returns its id and adds nothing. `--stdin` reads the ask from
+standard input as one JSON object (`question`, `options`, `decision`, `repo`, `session`, `dedupe_key`,
+`free_text_allowed`); a flag overrides it. `--cwd DIR` says where the ask comes from (default: here). `--json`
+(global) gives one envelope. There is no "asked by" field: `session` says who asked.
 
 ## What an ask may hold (the wall)
 

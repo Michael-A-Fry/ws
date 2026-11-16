@@ -17,6 +17,7 @@ import argparse
 import contextlib
 import hashlib
 import json
+import math
 import os
 import re
 import secrets as _random
@@ -425,14 +426,23 @@ def add(fields: dict, cwd: str, env=None) -> tuple[str, bool, dict]:
 # --- answer ----------------------------------------------------------------------------------------------------------
 
 
+def _labels(ask: dict) -> list:
+    """The option labels as text, in order; an option that is not a label and a description gives None in its place."""
+    return [
+        o.get("label") if isinstance(o, dict) and isinstance(o.get("label"), str) else None
+        for o in ask.get("options") or []
+    ]
+
+
 def pick(ask: dict, words: str) -> tuple[str | None, int | None]:
-    """(text, 0-based option) for what was typed: a 1-based number or a label in any case picks an option."""
-    t, opts = words.strip(), ask.get("options") or []
-    if t.isdigit() and 1 <= int(t) <= len(opts):
-        return None, int(t) - 1
-    for n, o in enumerate(opts):
-        if o["label"].casefold() == t.casefold():
+    """(text, 0-based option) for what was typed. A label (any case) comes first, so an option labelled "2" is not read as
+    the second one; otherwise a 1-based number picks an option; anything else is free text."""
+    t, labels = words.strip(), _labels(ask)
+    for n, label in enumerate(labels):
+        if label is not None and label.casefold() == t.casefold():
             return None, n
+    if t.isascii() and t.isdigit() and 1 <= int(t) <= len(labels) and labels[int(t) - 1] is not None:
+        return None, int(t) - 1
     return t, None
 
 
@@ -459,6 +469,14 @@ def answer(ident: str, words: str, via: str = "cli", env=None) -> dict:
                 raise WsError("refused", "this ask takes one of its options, not free text", "", 1)
             text = _text("answer", text, LIMITS["answer"], True)
             _refuse_secret("answer", text)
+            terms = terms_regex(e)
+            if terms is None or terms.search(text):  # as for a question: no file, or a hit, and it is not stored
+                raise WsError(
+                    "refused",
+                    "this answer holds a sensitive term, or there is no terms file",
+                    "answer it in the session",
+                    1,
+                )
         ms, _ = _now()
         reply = {"text": text, "option_index": idx, "via": via, "ts": ms}
         _write(e, {"event": "answered", "id": ident, "answer": reply}, held=True)
@@ -578,11 +596,12 @@ def cmd_answer(args) -> int:
 def close(ident: str, kind: str, env=None) -> str:
     """Close an ask: `done` (an open or answered one) or `withdrawn` (an open one). On an ask that is already closed it
     writes nothing and reports its status. Returns the status."""
-    ask = get(ident, env)
-    if ask["status"] in ("open", "answered") and (kind == "done" or ask["status"] == "open"):
-        _write(_env(env), {"event": kind, "id": ident})
-        return kind
-    return ask["status"]
+    with _store_lock(env):
+        ask = get(ident, env)
+        if ask["status"] in ("open", "answered") and (kind == "done" or ask["status"] == "open"):
+            _write(_env(env), {"event": kind, "id": ident}, held=True)
+            return kind
+        return ask["status"]
 
 
 def cmd_close(args) -> int:
@@ -605,8 +624,8 @@ def _stamp(env):
 def cmd_wait(args) -> int:
     """Block until the ask is answered, polling the store. 0 and the answer; 3 and `still open` at the timeout; 4 and the
     status when it was withdrawn or done with no answer."""
-    if args.timeout < 0:
-        raise WsError("usage", "--timeout must be 0 or more", "", 2)
+    if not math.isfinite(args.timeout) or args.timeout < 0:
+        raise WsError("usage", "--timeout must be a number, 0 or more", "", 2)
     deadline = time.monotonic() + args.timeout
     get(args.id)
     stamp, code, shown = object(), 3, "still open"
@@ -648,7 +667,10 @@ def convert(row: dict) -> dict | None:
     out = {k: v for k, v in row.items() if k not in ("v", "ts")}
     out.update(schema=SCHEMA, ts=ms, at=jsonl.iso_utc(ms / 1000))
     if event == "added":
-        if not isinstance(row.get("question"), str) or not isinstance(row.get("options"), list):
+        opts = row.get("options")
+        if not isinstance(row.get("question"), str) or not isinstance(opts, list):
+            return None
+        if not all(isinstance(o, dict) and isinstance(o.get("label"), str) for o in opts):
             return None
         out["redacted"] = row.get("redacted") is not False
         if out["redacted"]:  # a redacted ask stores no text, whatever the older file kept
@@ -675,29 +697,37 @@ def import_file(path: Path, dry_run: bool = False, env=None) -> dict:
         raise WsError(
             "usage", f"cannot read {path}: {e.strerror or e}", "give the path of an asks.jsonl file", 2
         ) from e
-    have = {(r.get("event"), r.get("id")) for r in records(env)}
-    known = {i for e, i in have if e == "added"}
+    e = _env(env)
     done = {"imported": 0, "existing": 0, "skipped": 0, "dry_run": dry_run}
-    for line in text.splitlines():
-        if not line.strip():
-            continue
-        try:
-            row = json.loads(line)
-        except ValueError:
-            done["skipped"] += 1
-            continue
-        ev = convert(row) if isinstance(row, dict) else None
-        if ev is None or (ev["event"] != "added" and ev["id"] not in known):
-            done["skipped"] += 1
-        elif (ev["event"], ev["id"]) in have:
-            done["existing"] += 1
-        else:
-            if not dry_run:
-                _write(_env(env), ev)
-            have.add((ev["event"], ev["id"]))
-            if ev["event"] == "added":
-                known.add(ev["id"])
-            done["imported"] += 1
+    with contextlib.nullcontext() if dry_run else _store_lock(e):  # the whole import is one step against other writers
+        recs = records(e)
+        have = {(r.get("event"), r.get("id")) for r in recs}
+        known = {i for ev, i in have if ev == "added"}
+        hidden = {i for i, a in fold(recs).items() if a.get("redacted") is not False}
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError:
+                done["skipped"] += 1
+                continue
+            ev = convert(row) if isinstance(row, dict) else None
+            if ev is None or (ev["event"] != "added" and ev["id"] not in known):
+                done["skipped"] += 1
+            elif (ev["event"], ev["id"]) in have:
+                done["existing"] += 1
+            else:
+                if ev["event"] == "added" and ev["redacted"]:
+                    hidden.add(ev["id"])
+                if ev["event"] == "answered" and ev["id"] in hidden:  # a redacted ask keeps no answer text either
+                    ev["answer"] = dict(ev["answer"], text=None)
+                if not dry_run:
+                    _write(e, ev, held=True)
+                have.add((ev["event"], ev["id"]))
+                if ev["event"] == "added":
+                    known.add(ev["id"])
+                done["imported"] += 1
     return done
 
 

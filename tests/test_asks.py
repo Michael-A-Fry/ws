@@ -641,3 +641,80 @@ def test_wait_does_not_print_the_answer_once_the_repo_is_walled(box, capsys):
     answered(ident, "planted-answer-text")
     box.policy(priv_access="walled", open_access="walled")
     assert "planted-answer-text" not in box.run(capsys, "wait", ident, "--timeout", "1")[1]
+
+
+# --- review follow-ups: pick, terms in answers, the import lock, old answers, nan ----------------------------------------
+
+
+def test_an_answer_with_a_superscript_digit_is_free_text_not_a_crash(box, capsys):
+    ident = box.add(capsys, "--question", "Q", "--option", "Yes", "--option", "No")
+    code, out, _ = box.run(capsys, "answer", ident, "²")
+    assert code == 0 and out.strip() == "answered: ²" and asks.load()[ident]["answer"]["option_index"] is None
+
+
+def test_options_that_are_not_labels_do_not_crash_an_answer(box, capsys):
+    ident = box.add(capsys, "--question", "Q")
+    asks._write(None, {"event": "added", "id": "odd1", "repo": "app", "cwd": str(box.open), "question": "Q", "flows": "full",
+                       "options": ["plain-string", {"description": "no label"}, None], "redacted": False})  # fmt: skip
+    code, out, _ = box.run(capsys, "answer", "odd1", "1")
+    assert code == 0 and out.strip() == "answered: 1" and ident
+
+
+def test_a_label_beats_a_number(box, capsys):
+    ident = box.add(capsys, "--question", "Q", "--option", "2", "--option", "1")
+    box.run(capsys, "answer", ident, "2")
+    assert asks.load()[ident]["answer"]["option_index"] == 0  # the option labelled "2", not the second one
+
+
+def test_a_free_text_answer_with_a_sensitive_term_is_refused_and_not_stored(box, capsys):
+    ident = box.add(capsys, "--question", "Q")
+    code, _, err = box.run(capsys, "answer", ident, "about secretproject")
+    assert code == 1 and "secretproject" not in err and "secretproject" not in box.store.read_text()
+    assert [e["event"] for e in box.lines()] == ["added"]
+    assert box.run(capsys, "answer", ident, "fine")[0] == 0  # a plain answer still goes in
+
+
+def hold_lock(box):
+    import fcntl
+
+    box.store.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(box.store.parent / "asks.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
+def test_import_done_and_withdraw_wait_for_the_asks_lock(box, capsys, monkeypatch, tmp_path):
+    ident = box.add(capsys, "--question", "Q")
+    monkeypatch.setattr(asks, "LOCK_WAIT_S", 0.2)
+    fd = hold_lock(box)
+    try:
+        assert box.run(capsys, "import", str(old_file(tmp_path)))[0] == 1
+        assert box.run(capsys, "done", ident)[0] == 1
+        assert box.run(capsys, "withdraw", ident)[0] == 1
+        assert box.run(capsys, "import", str(old_file(tmp_path)), "--dry-run")[0] == 0  # a dry run takes no lock
+    finally:
+        os.close(fd)
+    assert [e["event"] for e in box.lines()] == ["added"]
+
+
+def test_an_old_answer_to_a_redacted_ask_comes_in_with_no_text(box, capsys, tmp_path):
+    rows = [OLD[2], {"v": 1, "ts": "2026-11-02T00:05:00Z", "event": "answered", "id": OLD[2]["id"],
+                     "answer": {"text": "leaky-answer", "option_index": None, "via": "page", "ts": "2026-11-02T00:05:00Z"}}]  # fmt: skip
+    p = tmp_path / "o.jsonl"
+    p.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    code = box.run(capsys, "import", str(p))[0]
+    assert code == 0 and "leaky-answer" not in box.store.read_text()
+    assert box.run(capsys, "wait", OLD[2]["id"], "--timeout", "1")[1].strip() == "(hidden)"
+
+
+def test_an_old_row_with_options_that_are_not_labels_is_skipped(box, capsys, tmp_path):
+    row = OLD[0] | {"options": ["just-a-string"]}
+    p = tmp_path / "o.jsonl"
+    p.write_text(json.dumps(row) + "\n")
+    assert "1 skipped" in box.run(capsys, "import", str(p))[1]
+
+
+def test_wait_with_a_timeout_of_nan_or_inf_is_a_usage_error(box, capsys):
+    ident = box.add(capsys, "--question", "Q")
+    assert box.run(capsys, "wait", ident, "--timeout", "nan")[0] == 2
+    assert box.run(capsys, "wait", ident, "--timeout", "inf")[0] == 2

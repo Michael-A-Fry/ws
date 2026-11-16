@@ -1,3 +1,4 @@
+# ruff: noqa: F811
 """A person sends a `ws msg` from outside any session, and the session prepare step records who asked (hub chat 1b).
 
 The registry stand-ins are test_msg's. A caller-less process is `world.who = None`: no stamped runner among its ancestors,

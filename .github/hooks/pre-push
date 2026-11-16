@@ -106,6 +106,10 @@ else
     suite+=(-x) # the first failure ends the capped run, so the cap never hides one
     # the cap only has to catch a hang, so it grows with the set: 6 s a file, at least 300 s, at most 1800 s
     cap="${WS_PREPUSH_CAP:-}"
+    if [[ -n "$cap" && ! "$cap" =~ ^[1-9][0-9]*$ ]]; then
+      echo "pre-push: WS_PREPUSH_CAP='$cap' is not a whole number of seconds above 0; using the computed cap" >&2
+      cap=""
+    fi
     if [[ -z "$cap" ]]; then
       cap=$((${#targets[@]} * 6))
       ((cap < 300)) && cap=300

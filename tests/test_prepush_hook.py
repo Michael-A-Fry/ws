@@ -301,6 +301,15 @@ def test_the_cap_is_300_s_at_least_and_grows_6_s_a_file(tmp_path):
 
 
 @pytest.mark.skipif(not shutil.which("timeout"), reason="needs timeout")
+@pytest.mark.parametrize("bad", ["abc", "0", "-5", "1.5", "10s"])
+def test_a_bad_cap_warns_and_uses_the_computed_one(tmp_path, bad):
+    calls, err = run_selected(tmp_path, {"pyproject.toml": "x = 1\n"}, {"WS_PREPUSH_CAP": bad})
+    assert f"WS_PREPUSH_CAP='{bad}' is not a whole number" in err
+    assert "timeout 300 uv " in err
+    assert calls[-1] == CAPPED_SMOKE
+
+
+@pytest.mark.skipif(not shutil.which("timeout"), reason="needs timeout")
 def test_the_cap_stops_growing_at_1800_s(tmp_path):
     new_tests = {f"tests/test_new{i}.py": "def test_x():\n    pass\n" for i in range(320)}
     _, err = run_selected(tmp_path, {"pyproject.toml": "x = 1\n", **new_tests})

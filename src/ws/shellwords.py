@@ -14,7 +14,7 @@ A command line is read the way a shell reads it, so a path is recognised however
 
 What it promises. A shell word that is quoted is the text between the quotes: `'{a,b}'` is one word and `'~/x'` names a
 folder called `~`. Expansion is bounded: a `Budget` caps the words that brace expansion may make for one command, a
-value that an operator works on may not be longer than `MAX_VALUE`, and `time_limit` puts a deadline on the whole read.
+value that an operator works on may not be longer than `MAX_VALUE`, and `time_limit` puts a deadline on the whole read (CPU time, with a wall-clock backstop).
 A command that goes over, or text it cannot read or an expansion it does not know, raises `ShellError` with a `kind`;
 callers treat that as a refusal and never as an allow. `${...}` is an allowlist (`OPERATORS`): a body or operator that is
 not listed is refused with a hint on how to write it plainly, never passed through as written. It reads text only: what a command substitution prints, or a
@@ -33,6 +33,7 @@ import itertools
 import os
 import posixpath
 import re
+import threading
 import time
 import unicodedata
 from collections.abc import Iterable, Iterator, Mapping
@@ -42,7 +43,12 @@ MAX_WORDS = 4096  # words that brace expansion may add for one command; more is 
 MAX_BRACE_DEPTH = 64  # nested brace groups in one word
 # Characters in a variable that `%`, `#`, `/` and `:` work on; a longer one is refused, not slowed down.
 MAX_VALUE = 4096
-TIME_LIMIT = 1.0  # seconds the reader may take over one command line, well inside a runner's hook time-out
+# Seconds of the reader's own CPU time over one command line. CPU time, not the wall clock: a loaded or slow machine
+# (a CI runner, WSL2) shares its cores, and time the reader spends waiting for one is not work the line made it do.
+TIME_LIMIT = 1.0
+# The wall clock still stops a read that waits (on the file system, say) at this many times TIME_LIMIT, well inside a
+# runner's hook time-out.
+WALL_FACTOR = 3.0
 # A path the checks resolve (to follow links) may have this many parts, and one command line this many paths: past that
 # the line is refused. Resolving a path costs more than its length (a part at a time), so the work is bounded here and
 # not by the clock alone. The kernel opens nothing longer than MAX_PATH_CHARS, so a longer word is not resolved.
@@ -70,20 +76,25 @@ class ShellError(ValueError):
 SETS_IFS = "sets-ifs"
 
 
-_deadline: contextvars.ContextVar[float | None] = contextvars.ContextVar("ws_shell_deadline", default=None)
+# (the thread that set it, its CPU-time deadline, the wall-clock deadline)
+_deadline: contextvars.ContextVar[tuple[int, float, float] | None] = contextvars.ContextVar(
+    "ws_shell_deadline", default=None
+)
 _paths: contextvars.ContextVar[list[int] | None] = contextvars.ContextVar("ws_shell_paths", default=None)
 _text: contextvars.ContextVar[list[int] | None] = contextvars.ContextVar("ws_shell_text", default=None)
 
 
 @contextlib.contextmanager
 def time_limit(seconds: float | None = None) -> Iterator[None]:
-    """Everything the reader does inside this block must finish within `seconds` (TIME_LIMIT when not given), or it
-    raises ShellError (kind `too_slow`). A block inside another keeps the outer clock; with none, the reader is not
-    timed. A check calls this once around a whole command line."""
+    """Everything the reader does inside this block must finish within `seconds` of its thread's CPU time (TIME_LIMIT
+    when not given), and within WALL_FACTOR times that on the wall clock, or it raises ShellError (kind `too_slow`). A
+    block inside another keeps the outer clock; with none, the reader is not timed. A check calls this once around a
+    whole command line."""
     if _deadline.get() is not None:
         yield
         return
-    token = _deadline.set(time.monotonic() + (TIME_LIMIT if seconds is None else seconds))
+    limit = TIME_LIMIT if seconds is None else seconds
+    token = _deadline.set((threading.get_ident(), time.thread_time() + limit, time.monotonic() + limit * WALL_FACTOR))
     counted, grown = _paths.set([0]), _text.set([0])
     try:
         yield
@@ -96,7 +107,11 @@ def time_limit(seconds: float | None = None) -> Iterator[None]:
 def tick() -> None:
     """Called from the loops that can run long: raises ShellError (kind `too_slow`) once the deadline has passed."""
     limit = _deadline.get()
-    if limit is not None and time.monotonic() > limit:
+    if limit is None:
+        return
+    owner, cpu, wall = limit
+    # another thread's CPU time says nothing about this one's (a context copied into a new thread): the wall clock only
+    if time.monotonic() > wall or (owner == threading.get_ident() and time.thread_time() > cpu):
         raise ShellError("too_slow", "the command takes too long to read; split it into smaller commands")
 
 

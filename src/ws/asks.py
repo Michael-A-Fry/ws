@@ -5,9 +5,10 @@ below the home folder), so there is one asks store and not two. It is append-onl
 `answered`, `done` and `withdrawn`. `ts` is epoch milliseconds, as the OpenCode shim writes it, and `at` is the same
 moment as RFC 3339 text, which `ws.jsonl` needs for its stamp. Every write goes through `ws.jsonl`'s lock.
 
-A repo's data class decides what the store may hold: the strictest of the named repo's class and the working folder's or
-any hit on the sensitive-terms file, stores the ask redacted (no text, no options, a hashed dedupe key). The class is
-checked again when an ask is read, so a repo walled since shows as opaque. A secret-shaped token is refused outright.
+A repo's data class decides what the store may hold: the strictest of the named repo's class and the working folder's
+(from the policy), or any hit on the sensitive-terms file, stores the ask redacted (no text, no options, a hashed dedupe
+key). The class is checked again when an ask is read, so a repo walled after it was asked shows as opaque and cannot be
+answered from here. A token-shaped secret is refused outright. Notify is not built: `NOTIFY_HOOK` does nothing.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import argparse
 import contextlib
 import hashlib
 import json
+import math
 import os
 import re
 import secrets as _random
@@ -37,6 +39,7 @@ LIMITS = {
     "label": 80,
     "description": 300,
     "decision": 300,
+    "answer": 2000,
     "dedupe_key": 300,
     "repo": 100,
     "session": 100,
@@ -44,6 +47,9 @@ LIMITS = {
 MAX_OPTIONS = 6
 LOCK_WAIT_S = 30.0  # how long a writer waits for `asks.lock` before it gives up
 MAX_BYTES = 8 * 1024 * 1024  # a log turns over here, well under the 64 MiB `ws home` reads
+DEFAULT_WAIT = 540  # seconds: under a 10-minute tool limit
+POLL_S = 1.0  # how often `wait` looks at the store
+NOTIFY_HOOK = None  # a function(ask) a later release may set; nothing is sent by default
 RANK = {a: i for i, a in enumerate(policy.ACCESS)}  # a higher number is stricter
 FLOWS = {"full": "full", "walled": "counts", "counts-only": "off"}  # the old program's `flows_back`, by policy access
 _ID = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
@@ -280,12 +286,13 @@ def view(ask: dict, env=None, pol=None) -> dict:
     decision, session name, answer text and dedupe key."""
     pol = pol if pol is not None else _policy(_env(env))
     repo = ask.get("repo") if isinstance(ask.get("repo"), str) else "?"
-    now = _name_access(pol, repo, str(ask.get("cwd") or ""))
+    cwd = str(ask.get("cwd") or "")
+    now = _strictest(_name_access(pol, repo, cwd), _access(pol, cwd) if cwd else "full")
     out = dict(ask)
     # only an explicit `redacted: false` is visible, as in `ws home`: a line that doesn't say is treated as redacted
     out["opaque"] = ask.get("redacted") is not False or ask.get("flows", "full") != "full" or now != "full"
     if out["opaque"]:
-        out.update(question=OPAQUE, options=[], decision="", free_text_allowed=False, dedupe_key=None)
+        out.update(question=OPAQUE, options=[], decision="", free_text_allowed=False, dedupe_key=None, cwd="")
         if isinstance(ask.get("session"), dict):
             out["session"] = dict(ask["session"], name="")
         if isinstance(ask.get("answer"), dict):
@@ -398,7 +405,9 @@ def add(fields: dict, cwd: str, env=None) -> tuple[str, bool, dict]:
             "id": ident,
             "repo": repo,
             "cwd": cwd if not redacted else "",
-            "session": _session(fields.get("session"), e),
+            "session": dict(_session(fields.get("session"), e), name="")
+            if redacted
+            else _session(fields.get("session"), e),
             "question": question,
             "options": options,
             "free_text_allowed": free_text,
@@ -412,6 +421,66 @@ def add(fields: dict, cwd: str, env=None) -> tuple[str, bool, dict]:
             event["redacted_why"] = reason
         _write(e, event, held=True)
         return ident, True, event
+
+
+# --- answer ----------------------------------------------------------------------------------------------------------
+
+
+def _labels(ask: dict) -> list:
+    """The option labels as text, in order; an option that is not a label and a description gives None in its place."""
+    return [
+        o.get("label") if isinstance(o, dict) and isinstance(o.get("label"), str) else None
+        for o in ask.get("options") or []
+    ]
+
+
+def pick(ask: dict, words: str) -> tuple[str | None, int | None]:
+    """(text, 0-based option) for what was typed. A label (any case) comes first, so an option labelled "2" is not read as
+    the second one; otherwise a 1-based number picks an option; anything else is free text."""
+    t, labels = words.strip(), _labels(ask)
+    for n, label in enumerate(labels):
+        if label is not None and label.casefold() == t.casefold():
+            return None, n
+    if t.isascii() and t.isdigit() and 1 <= int(t) <= len(labels) and labels[int(t) - 1] is not None:
+        return None, int(t) - 1
+    return t, None
+
+
+def answer(ident: str, words: str, via: str = "cli", env=None) -> dict:
+    """Answer an open ask. The check that it is still open and the write are one step under the store lock, so two
+    answers to one ask cannot both succeed."""
+    e = _env(env)
+    with _store_lock(e):
+        ask = get(ident, e)
+        if view(ask, e)["opaque"]:
+            raise WsError(
+                "opaque",
+                "Open the session to answer this ask.",
+                "this ask is not shown here: answer it in its session",
+                1,
+            )
+        if ask["status"] != "open":
+            raise WsError("not_open", f"ask is {ask['status']}", "", 1)
+        text, idx = pick(ask, words)
+        if idx is not None:
+            text = ask["options"][idx]["label"]
+        else:
+            if not ask.get("free_text_allowed", True):
+                raise WsError("refused", "this ask takes one of its options, not free text", "", 1)
+            text = _text("answer", text, LIMITS["answer"], True)
+            _refuse_secret("answer", text)
+            terms = terms_regex(e)
+            if terms is None or terms.search(text):  # as for a question: no file, or a hit, and it is not stored
+                raise WsError(
+                    "refused",
+                    "this answer holds a sensitive term, or there is no terms file",
+                    "answer it in the session",
+                    1,
+                )
+        ms, _ = _now()
+        reply = {"text": text, "option_index": idx, "via": via, "ts": ms}
+        _write(e, {"event": "answered", "id": ident, "answer": reply}, held=True)
+        return reply
 
 
 # --- commands --------------------------------------------------------------------------------------------------------
@@ -463,6 +532,9 @@ def cmd_add(args) -> int:
             sess[k] = v
     fields["session"] = sess
     ident, created, event = add(fields, args.cwd or os.getcwd())
+    if created and NOTIFY_HOOK is not None:
+        with contextlib.suppress(Exception):  # a notification never fails the ask
+            NOTIFY_HOOK(event)  # it gets the stored event: a redacted ask has no text in it
     if args.json:
         output.result({"id": ident, "created": created, "redacted": bool(event.get("redacted"))})
     else:
@@ -509,6 +581,166 @@ def cmd_get(args) -> int:
     return 0
 
 
+def cmd_answer(args) -> int:
+    reply = answer(args.id, " ".join(args.text))
+    if args.json:
+        output.result({"id": args.id, "answer": reply})
+    else:
+        print(f"answered: {reply['text']}")
+    return 0
+
+
+# --- wait, done, withdraw ----------------------------------------------------------------------------------------------
+
+
+def close(ident: str, kind: str, env=None) -> str:
+    """Close an ask: `done` (an open or answered one) or `withdrawn` (an open one). On an ask that is already closed it
+    writes nothing and reports its status. Returns the status."""
+    with _store_lock(env):
+        ask = get(ident, env)
+        if ask["status"] in ("open", "answered") and (kind == "done" or ask["status"] == "open"):
+            _write(_env(env), {"event": kind, "id": ident}, held=True)
+            return kind
+        return ask["status"]
+
+
+def cmd_close(args) -> int:
+    status = close(args.id, "done" if args.ask_command == "done" else "withdrawn")
+    if args.json:
+        output.result({"id": args.id, "status": status})
+    else:
+        print(status)
+    return 0
+
+
+def _stamp(env):
+    try:
+        st = store_path(env).stat()
+        return st.st_mtime_ns, st.st_size
+    except OSError:
+        return None
+
+
+def cmd_wait(args) -> int:
+    """Block until the ask is answered, polling the store. 0 and the answer; 3 and `still open` at the timeout; 4 and the
+    status when it was withdrawn or done with no answer."""
+    if not math.isfinite(args.timeout) or args.timeout < 0:
+        raise WsError("usage", "--timeout must be a number, 0 or more", "", 2)
+    deadline = time.monotonic() + args.timeout
+    get(args.id)
+    stamp, code, shown = object(), 3, "still open"
+    while True:
+        now = _stamp(None)
+        if now != stamp:
+            stamp = now
+            ask = get(args.id)
+            if ask["answer"]:
+                text = view(ask)["answer"].get("text")  # an opaque ask's answer text is hidden here as in `get`
+                code, shown = 0, text if text is not None else "(hidden)"
+                break
+            if ask["status"] in CLOSED:
+                code, shown = 4, ask["status"]
+                break
+        left = deadline - time.monotonic()
+        if left <= 0:
+            break
+        time.sleep(min(POLL_S, left))
+    if args.json:
+        output.result(
+            {"id": args.id, "outcome": shown if code != 0 else "answered", "answer": shown if code == 0 else None},
+            status=output.OK if code == 0 else output.ATTENTION,
+        )
+    else:
+        print(shown)
+    return code
+
+
+# --- import ----------------------------------------------------------------------------------------------------------
+
+
+def convert(row: dict) -> dict | None:
+    """One row of the older asks file (`v` 1, an ISO `ts` ending in Z, events `added`, `answered`, `withdrawn`, `done`) as
+    an event of this store, or None when it is not one. A redacted row stays as it was stored: nothing is put back."""
+    ident, event, ms = row.get("id"), row.get("event"), _ms(row.get("ts"))
+    if row.get("v") != 1 or event not in EVENTS or not isinstance(ident, str) or not _ID.match(ident) or ms is None:
+        return None
+    out = {k: v for k, v in row.items() if k not in ("v", "ts")}
+    out.update(schema=SCHEMA, ts=ms, at=jsonl.iso_utc(ms / 1000))
+    if event == "added":
+        opts = row.get("options")
+        if not isinstance(row.get("question"), str) or not isinstance(opts, list):
+            return None
+        if not all(isinstance(o, dict) and isinstance(o.get("label"), str) for o in opts):
+            return None
+        out["redacted"] = row.get("redacted") is not False
+        if out["redacted"]:  # a redacted ask stores no text, whatever the older file kept
+            key = row.get("dedupe_key")
+            out.update(question=OPAQUE, options=[], decision="", free_text_allowed=False, cwd="")
+            out["dedupe_key"] = key if not isinstance(key, str) or key.startswith("sha256:") else _hash(key)
+            if isinstance(row.get("session"), dict):
+                out["session"] = dict(row["session"], name="")
+    elif event == "answered":
+        a = row.get("answer")
+        if not isinstance(a, dict):
+            return None
+        out["answer"] = {**a, "ts": _ms(a.get("ts")) or ms}
+    return out
+
+
+def import_file(path: Path, dry_run: bool = False, env=None) -> dict:
+    """Convert an older asks file into events here. A row already imported (same event and id) is skipped, so a second run
+    adds nothing; a row that is not valid, or closes an ask that is not there, is counted and skipped. Dry run writes
+    nothing."""
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        raise WsError(
+            "usage", f"cannot read {path}: {e.strerror or e}", "give the path of an asks.jsonl file", 2
+        ) from e
+    e = _env(env)
+    done = {"imported": 0, "existing": 0, "skipped": 0, "dry_run": dry_run}
+    with contextlib.nullcontext() if dry_run else _store_lock(e):  # the whole import is one step against other writers
+        recs = records(e)
+        have = {(r.get("event"), r.get("id")) for r in recs}
+        known = {i for ev, i in have if ev == "added"}
+        hidden = {i for i, a in fold(recs).items() if a.get("redacted") is not False}
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError:
+                done["skipped"] += 1
+                continue
+            ev = convert(row) if isinstance(row, dict) else None
+            if ev is None or (ev["event"] != "added" and ev["id"] not in known):
+                done["skipped"] += 1
+            elif (ev["event"], ev["id"]) in have:
+                done["existing"] += 1
+            else:
+                if ev["event"] == "added" and ev["redacted"]:
+                    hidden.add(ev["id"])
+                if ev["event"] == "answered" and ev["id"] in hidden:  # a redacted ask keeps no answer text either
+                    ev["answer"] = dict(ev["answer"], text=None)
+                if not dry_run:
+                    _write(e, ev, held=True)
+                have.add((ev["event"], ev["id"]))
+                if ev["event"] == "added":
+                    known.add(ev["id"])
+                done["imported"] += 1
+    return done
+
+
+def cmd_import(args) -> int:
+    got = import_file(Path(args.path), args.dry_run)
+    if args.json:
+        output.result(got)
+    else:
+        verb = "would import" if args.dry_run else "imported"
+        print(f"{verb} {got['imported']} event(s); {got['existing']} already there; {got['skipped']} skipped")
+    return 0
+
+
 def register(sub) -> None:
     p = sub.add_parser("ask", help="leave a question for a person and read back the answer (one queue, every session)")
     s = p.add_subparsers(dest="ask_command", required=True)
@@ -535,3 +767,23 @@ def register(sub) -> None:
     g = s.add_parser("get", help="one ask: status and answer")
     g.add_argument("id")
     g.set_defaults(func=cmd_get)
+
+    an = s.add_parser("answer", help="answer with an option label (any case), a 1-based number, or free text")
+    an.add_argument("id")
+    an.add_argument("text", nargs="+")
+    an.set_defaults(func=cmd_answer)
+
+    w = s.add_parser("wait", help="block until answered; 0 and the answer, 3 timed out, 4 withdrawn or done")
+    w.add_argument("id")
+    w.add_argument("--timeout", type=float, default=DEFAULT_WAIT, metavar="SECONDS")
+    w.set_defaults(func=cmd_wait)
+
+    for name in ("done", "withdraw"):
+        c = s.add_parser(name, help=f"{name} an ask (a no-op that prints the status if it is already closed)")
+        c.add_argument("id")
+        c.set_defaults(func=cmd_close)
+
+    im = s.add_parser("import", help="convert an older asks file into events here (safe to run twice)")
+    im.add_argument("path")
+    im.add_argument("--dry-run", action="store_true", help="say what would be imported; write nothing")
+    im.set_defaults(func=cmd_import)

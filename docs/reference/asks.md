@@ -36,8 +36,8 @@ An ask is stored plainly only when everything below says it may be.
   exact case as a whole word. A missing or unreadable file redacts every ask (fail safe); a readable file with no term
   says there are none. Create it with one comment line to turn the default off.
 - **Redaction.** A redacted ask stores no text: the question is `Open the session to see this ask.`, no options, no
-  decision, no free text, and a dedupe key is stored as `sha256:...`. The repo and session are kept so the person knows
-  where to go. `ws ask add` says why on standard error.
+  decision, no free text, no folder and no session name, and a dedupe key is stored as `sha256:...`. The repo and the
+  tmux target are kept so the person knows where to go. `ws ask add` says why on standard error.
 - **Secrets.** A token-shaped secret in an ask, an option, a dedupe key or an answer is refused (exit 1) and stored
   nowhere. The scan is the one `ws msg` uses.
 - **Read again.** The class is checked again whenever an ask is read: one whose repo is no longer full shows as "Open the

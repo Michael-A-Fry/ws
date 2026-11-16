@@ -285,12 +285,13 @@ def view(ask: dict, env=None, pol=None) -> dict:
     decision, session name, answer text and dedupe key."""
     pol = pol if pol is not None else _policy(_env(env))
     repo = ask.get("repo") if isinstance(ask.get("repo"), str) else "?"
-    now = _name_access(pol, repo, str(ask.get("cwd") or ""))
+    cwd = str(ask.get("cwd") or "")
+    now = _strictest(_name_access(pol, repo, cwd), _access(pol, cwd) if cwd else "full")
     out = dict(ask)
     # only an explicit `redacted: false` is visible, as in `ws home`: a line that doesn't say is treated as redacted
     out["opaque"] = ask.get("redacted") is not False or ask.get("flows", "full") != "full" or now != "full"
     if out["opaque"]:
-        out.update(question=OPAQUE, options=[], decision="", free_text_allowed=False, dedupe_key=None)
+        out.update(question=OPAQUE, options=[], decision="", free_text_allowed=False, dedupe_key=None, cwd="")
         if isinstance(ask.get("session"), dict):
             out["session"] = dict(ask["session"], name="")
         if isinstance(ask.get("answer"), dict):
@@ -403,7 +404,9 @@ def add(fields: dict, cwd: str, env=None) -> tuple[str, bool, dict]:
             "id": ident,
             "repo": repo,
             "cwd": cwd if not redacted else "",
-            "session": _session(fields.get("session"), e),
+            "session": dict(_session(fields.get("session"), e), name="")
+            if redacted
+            else _session(fields.get("session"), e),
             "question": question,
             "options": options,
             "free_text_allowed": free_text,
@@ -635,17 +638,10 @@ def cmd_wait(args) -> int:
 # --- import ----------------------------------------------------------------------------------------------------------
 
 
-def _epoch_ms(value) -> int | None:
-    try:
-        return int(datetime.fromisoformat(str(value)).timestamp() * 1000)
-    except (ValueError, OverflowError, OSError):
-        return None
-
-
 def convert(row: dict) -> dict | None:
     """One row of the older asks file (`v` 1, an ISO `ts` ending in Z, events `added`, `answered`, `withdrawn`, `done`) as
     an event of this store, or None when it is not one. A redacted row stays as it was stored: nothing is put back."""
-    ident, event, ms = row.get("id"), row.get("event"), _epoch_ms(row.get("ts"))
+    ident, event, ms = row.get("id"), row.get("event"), _ms(row.get("ts"))
     if row.get("v") != 1 or event not in EVENTS or not isinstance(ident, str) or not _ID.match(ident) or ms is None:
         return None
     out = {k: v for k, v in row.items() if k not in ("v", "ts")}
@@ -654,11 +650,17 @@ def convert(row: dict) -> dict | None:
         if not isinstance(row.get("question"), str) or not isinstance(row.get("options"), list):
             return None
         out["redacted"] = row.get("redacted") is not False
+        if out["redacted"]:  # a redacted ask stores no text, whatever the older file kept
+            key = row.get("dedupe_key")
+            out.update(question=OPAQUE, options=[], decision="", free_text_allowed=False, cwd="")
+            out["dedupe_key"] = key if not isinstance(key, str) or key.startswith("sha256:") else _hash(key)
+            if isinstance(row.get("session"), dict):
+                out["session"] = dict(row["session"], name="")
     elif event == "answered":
         a = row.get("answer")
         if not isinstance(a, dict):
             return None
-        out["answer"] = {**a, "ts": _epoch_ms(a.get("ts")) or ms}
+        out["answer"] = {**a, "ts": _ms(a.get("ts")) or ms}
     return out
 
 

@@ -592,3 +592,29 @@ def test_the_notify_hook_runs_once_for_a_new_ask_and_gets_no_text_of_a_redacted_
     box.add(capsys, "--question", "plain", "--dedupe-key", "k")  # the same open ask: no second call
     box.add(capsys, "--question", "uses secretproject")
     assert len(seen) == 2 and seen[1]["question"] == asks.OPAQUE
+
+
+def test_a_redacted_row_comes_in_with_no_text_at_all(box, capsys, tmp_path):
+    row = {k: v for k, v in OLD[3].items() if k != "redacted"} | {"id": "a20261104T000000-bb22"}
+    row |= {"question": "leaky-question", "decision": "leaky-decision", "dedupe_key": "leaky-key", "cwd": "/leaky/dir"}
+    row |= {"options": [{"label": "leaky-label", "description": ""}], "session": {"name": "leaky-name", "tmux": None}}
+    p = tmp_path / "o.jsonl"
+    p.write_text(json.dumps(row) + "\n")
+    box.run(capsys, "import", str(p))
+    stored = box.store.read_text()
+    assert "leaky" not in stored and asks.OPAQUE in stored and "sha256:" in stored
+
+
+def test_an_opaque_view_drops_the_folder_and_a_redacted_ask_keeps_no_session_name(box, capsys):
+    ident = box.add(capsys, "--question", "uses secretproject", "--session", "who", cwd=box.open)
+    assert box.lines()[0]["session"]["name"] == "" and box.lines()[0]["cwd"] == ""
+    ok = box.add(capsys, "--question", "plain", "--session", "who", cwd=box.open)
+    box.policy(priv_access="walled", open_access="walled")
+    assert asks.view(asks.get(ok))["cwd"] == "" and asks.view(asks.get(ident))["cwd"] == ""
+
+
+def test_reading_uses_the_strictest_of_the_name_and_the_folder_as_adding_does(box, capsys):
+    ident = box.add(capsys, "--question", "plain", "--repo", "app", cwd=box.open)
+    assert asks.view(asks.get(ident))["opaque"] is False
+    box.policy(priv_access="walled", open_access="walled")  # the folder is walled now; the name still says open
+    assert asks.view(asks.get(ident))["opaque"] is True

@@ -1334,6 +1334,9 @@ def test_a_name_with_paths_forwards_only_those_and_the_stub_never_sees_the_rest(
     for bad in ("/v1/other", "/v1/messagesX", "/", "/v1/../etc", "/v1/messages/%2e%2e/admin", "/v1/messages%2fx"):
         assert env.call(bad, lease=lease)[0] == 403, bad
     assert len(env.stub.seen) == seen  # a refused path never reached the upstream
+    end = time.monotonic() + 5
+    while time.monotonic() < end and not any(a["status"] == "path_not_allowed" for a in env.audit()):
+        time.sleep(0.02)
     assert any(a["op"] == "proxy" and a["status"] == "path_not_allowed" for a in env.audit())
 
 
@@ -1378,4 +1381,7 @@ def test_tightening_paths_or_ttl_in_the_registry_bites_leases_already_open(env):
     _ttl_registry(env, "100")
     env.now += 150  # the lease itself runs for an hour, the registry now says 100 s
     assert env.call("/v1/messages", lease=lease)[0] == 403
+    end = time.monotonic() + 5  # the proxy answers first and writes its audit row after: wait for the row
+    while time.monotonic() < end and not any(a["op"] == "proxy" and a["status"] == "expired" for a in env.audit()):
+        time.sleep(0.02)
     assert any(a["op"] == "proxy" and a["status"] == "expired" for a in env.audit())

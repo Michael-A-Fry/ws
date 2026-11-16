@@ -544,3 +544,26 @@ def test_the_guard_launch_check_refuses_the_same_two_breaks(box):
     assert not guard_launch.is_main_checkout(str(under))
     git(main, "worktree", "prune")
     assert not guard_launch.is_main_checkout(str(under))
+
+
+@needs_git
+def test_a_link_on_dot_claude_does_not_hide_a_pruned_worktree(box):
+    main = box / "main"
+    under = main / ".claude" / "worktrees" / "w"
+    git(main, "worktree", "add", "-q", "-b", "w", str(under))
+    (under / ".git").unlink()
+    git(main, "worktree", "prune")
+    (main / ".claude").rename(main / "x")
+    (main / ".claude").symlink_to(main / "x")
+    assert edit_from(box, under, main) == 2
+    assert edit_from(box, main / "x" / "worktrees" / "w", main) == 2  # the resolved spelling too
+
+
+def test_the_location_checks_fold_case_where_the_platform_does(monkeypatch):
+    from ws import policy
+    from ws.guards import _git
+
+    monkeypatch.setattr(policy, "CASELESS_PATHS", True)
+    assert _git._inside("/Repo/.Claude/Worktrees/W", "/repo/.claude/worktrees")
+    monkeypatch.setattr(policy, "CASELESS_PATHS", False)
+    assert not _git._inside("/Repo/.Claude/Worktrees/W", "/repo/.claude/worktrees")

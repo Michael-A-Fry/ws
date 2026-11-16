@@ -38,7 +38,14 @@ def lines(folder: str, *args: str) -> list[str] | None:
     return done.stdout.splitlines() if done.returncode == 0 else None
 
 
+def _fold(p: str) -> str:
+    from ws import policy
+
+    return p.casefold() if policy.CASELESS_PATHS else p
+
+
 def _inside(path: str, folder: str) -> bool:
+    path, folder = _fold(path), _fold(folder)
     return path == folder or path.startswith(folder.rstrip("/") + "/")
 
 
@@ -57,8 +64,10 @@ def main_toplevel(folder: str) -> str | None:
     here = os.path.realpath(folder)
     if git_dir != common or git_dir != os.path.join(top, ".git"):
         return None
-    if not _inside(here, top) or _inside(here, os.path.join(top, ".claude", "worktrees")):
-        return None  # by location: a folder kept where linked worktrees are kept never counts, even after its worktree is pruned
+    kept = os.path.join(top, ".claude", "worktrees")
+    literal = os.path.normpath(folder)
+    if not _inside(here, top) or any(_inside(f, k) for f in (here, literal) for k in (kept, os.path.realpath(kept))):
+        return None  # by location (the folder as written and as resolved, against the folder as written and as resolved: a link on .claude can't hide it): a folder kept where linked worktrees are kept never counts, even after its worktree is pruned
     listed = lines(top, "worktree", "list", "--porcelain")
     if listed is None:
         return None

@@ -15,7 +15,8 @@
 # WS_PREPUSH_FULL=1 runs the whole suite here (logged like a skip).
 # Run the tests through a wrapper: WS_PREPUSH_WRAP="your-lock-command --flag" git push (split on spaces; for a machine
 # that queues test runs, so a push's tests don't race the others). Unset (or only spaces), the hook uses
-# `ws-test --light --node local --` when ws-test is on PATH (`--full` for WS_PREPUSH_FULL=1): it queues for a slot, up
+# `ws-test --light --mem 3G --node local --` when ws-test is on PATH (6G with e2e tests or over 40 files in the set;
+# `--full` for WS_PREPUSH_FULL=1): it queues for a slot, up
 # to WS_TEST_WAIT (45 minutes), and caps xdist's workers, so a busy machine doesn't time the tests out. Without ws-test
 # they run bare. Set but empty (WS_PREPUSH_WRAP= git push), they always run bare.
 # A skip is never silent: it adds a line to .git/ws-prepush-skips.log (the log of the worktree's git dir).
@@ -133,7 +134,17 @@ if [[ "$auto_wrap" == 1 ]]; then
   if [[ "$kind" == FULL ]]; then
     wrap=(ws-test --full --node local --)
   else
-    wrap=(ws-test --light --node local --)
+    # memory scales with the set: 3G for a small one; 6G with e2e runners in it or past 40 files (103 files with the
+    # runners hit 3G and were OOM-killed); never more than 8G
+    mem=3G
+    if [[ "${#targets[@]}" -gt 40 ]]; then
+      mem=6G
+    else
+      for target in "${targets[@]}"; do
+        [[ "$target" == tests/e2e || "$target" == tests/e2e/* ]] && mem=6G
+      done
+    fi
+    wrap=(ws-test --light --mem "$mem" --node local --)
   fi
 fi
 if [[ "${#wrap[@]}" != 0 ]]; then

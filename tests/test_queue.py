@@ -1664,6 +1664,26 @@ def test_planted_sigkill_already_alerted_by_the_scheduler_is_not_told_again(tmp_
     assert queue.unit_alerted("x", T0, tmp_path / "missing.jsonl") is False
 
 
+def test_planted_sigkill_after_an_unrelated_drain_failure_is_still_told(tmp_path):
+    """A drain unit fails whenever a queued job exits non-zero. Such a failure, under the drain job's name, says nothing
+    about a queued run that is killed later: that run's notice still goes, naming it."""
+    host = Host()
+    alerts: list[str] = []
+    told = tmp_path / "state" / "logs" / "alerts.jsonl"
+    ledger = make(
+        tmp_path, host=host, sink=lambda rec: True, on_stop=lambda job, run_id, why: alerts.append(job),
+        already_told=lambda job, since: queue.unit_alerted(job, since, told),
+    )  # fmt: skip
+    queued_id, _, _ = ledger.enqueue("nightly", None, T0)
+    assert ledger.admit(req(job="nightly", run_id=queued_id, owner_pid=4800), T0, spend()).kind == "admit"
+    told.parent.mkdir(parents=True, exist_ok=True)
+    line = {"schema": 1, "ts": "2026-11-08T03:00:05.000Z", "event": "unit-failed", "job": "drain"}  # another job failed
+    told.write_text(json.dumps(line) + "\n", encoding="utf-8")
+    host.procs[4800] = (False, None)
+    assert ledger.reap(T0 + timedelta(minutes=1)) == 1
+    assert alerts == ["nightly"]
+
+
 # ---- one net effect (rr-L3, h-L1-17/18, h-L4-5) ----------------------------------------------------------------------
 
 

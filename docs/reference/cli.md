@@ -1043,7 +1043,8 @@ ws commit-wall uninstall [-h] [--repo REPO]
 Scan the staged diff, or a commit message with `--stage commit-msg FILE`, now. Exit 1 on a hit.
 
 ```text
-ws commit-wall check [-h] [--stage {pre-commit,commit-msg,pre-push}] [--repo REPO] [--remote REMOTE] [--wall-dir WALL_DIR] [file]
+ws commit-wall check [-h] [--stage {pre-commit,commit-msg,pre-push}] [--repo REPO] [--remote REMOTE]
+    [--wall-dir WALL_DIR] [file]
 ```
 
 | Argument | Meaning |
@@ -1056,7 +1057,8 @@ ws commit-wall check [-h] [--stage {pre-commit,commit-msg,pre-push}] [--repo REP
 
 ### `ws commit-wall status`
 
-The number of patterns and exceptions, and the repositories the wall is on for. A repository it recorded whose `core.hooksPath` no longer points at the wall is listed as not on, and the command exits 1.
+The number of patterns and exceptions, and the repositories the wall is on for. A repository it recorded whose `core.hooksPath`
+no longer points at the wall is listed as not on, and the command exits 1.
 
 ```text
 ws commit-wall status [-h]

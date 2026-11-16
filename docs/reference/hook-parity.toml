@@ -217,7 +217,7 @@ test = "test_parity_scheduled_branch_move"
 [[hook]]
 id = "commit-wall"
 what = "Scans the staged diff and the commit message for patterns the person supplies"
-ws = "`ws commit-wall`, installed by `core.hooksPath`: the added lines of the staged diff and the commit message are checked against patterns the person supplies (ws ships none); a merge is scanned for the lines new to it, nothing is skipped (every file is read as text, file names and the whole message included), a check with no pattern refuses, `git am` and a push are checked too (a commit made with no commit hook is caught when it is pushed), an exceptions file only a person edits lets a line through, and a hook that can't run ws blocks the commit"
+ws = "`ws commit-wall`, installed by `core.hooksPath`: the added lines of the staged diff and the commit message are checked against patterns the person supplies (ws ships none); a merge is scanned for the lines new to it, nothing is skipped (every file is read as text, file names and the whole message included), a check with no pattern refuses, `git am` and a push are checked too (a commit made with no commit hook is caught at the push), an exceptions file only a person edits lets a line through, and a hook that can't run ws blocks the commit"
 status = "covered"
 fail = "blocks"
 test = "test_parity_commit_wall"

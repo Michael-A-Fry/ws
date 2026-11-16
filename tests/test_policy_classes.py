@@ -537,7 +537,7 @@ _CWD_SPELLINGS = ["-C /tmp", "-C/tmp", "-C=/tmp", "--cwd /tmp", "--cwd=/tmp", "-
 _ADMIN_LINES = [
     "session prepare --role lead",
     "session start --session-id x",
-    "secret ask NAME",
+    "secret set NAME",
     "gate generate",
     "gate init",
     "install --gate launch",

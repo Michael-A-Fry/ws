@@ -49,7 +49,7 @@ the built-in default, which has the list below.
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `deny_commands` | list of text | `[]` in a file | Shell command patterns no session may run. `ws gate init` writes the [built-in list](#built-in-deny_commands). |
-| `deny_read` | list of text | `[]` in a file | Paths no session may read. `~/` is your home. `**` crosses folders. `ws gate init` writes `~/.ssh/**`, `~/.gnupg/**`, `~/.aws/credentials`, `~/.config/ws/secrets/**` and `~/.local/share/ws/secrets/**`. Whatever the file says, ws also denies reads of its own secrets folder (`secrets/` in the data folder, and the `[roles.secrets] store` folder when the profile names one), for every runner. |
+| `deny_read` | list of text | `[]` in a file | Paths no session may read. `~/` is your home. `**` crosses folders. `ws gate init` writes `~/.ssh/**`, `~/.gnupg/**`, `~/.aws/credentials`, `~/.config/ws/secrets/**` and `~/.local/share/ws/secrets/**`, then `.env`, `.envrc` and the `.env.local`, `.env.*.local`, `.env.development`, `.env.production`, `.env.staging` and `.env.test` forms (at any depth; `.env.example` stays readable), the signed-in profile folders of Chrome (and Beta), Chromium, Vivaldi, Brave, Edge and Firefox on Linux, snap, Flatpak and macOS, and `~/.config/gh/hosts.yml`. A bare name such as `.env` has no folder to hide, so the sandbox can't hide it: the rule stops a command or tool that names the file, but a recursive search that names only a folder (`grep -r KEY .`, `rg -uu KEY`) still reads it. Keep real secrets out of the project folder. A policy written before that has only the first five: add the rest to its `deny_read` by hand (the list in the template that `ws gate init` prints is the one to copy). Whatever the file says, ws also denies reads of its own secrets folder (`secrets/` in the data folder, and the `[roles.secrets] store` folder when the profile names one), for every runner. |
 | `deny_tools` | list of text | `[]` | Tools to switch off: the neutral names `web_fetch` and `web_search` (an allowed web tool counts as a way out), and MCP tools by name or glob (`mcp__server__tool`, `mcp__server__*`, `mcp__*__delete_*`). |
 | `ask_commands` | list of text | `[]` | Command patterns that run only after you approve that exact call. Same globs as `deny_commands`. A command that also matches `deny_commands` stays denied. |
 | `allow_mcp` | list of text | the tools `ws mcp serve` offers | MCP tools a session may call without being asked, by name or glob (`mcp__ws__*`). An MCP tool this list doesn't name is asked for: a person approves that exact call, once, as for `ask_commands`. `deny_tools` beats it. Leave the key out and only `mcp__ws__memory_search`, `mcp__ws__memory_add` and `mcp__ws__note_capture` are allowed; naming it, even as `[]`, replaces them. |
@@ -313,6 +313,12 @@ itself sends you a digest or a push.
 | `level` | text | `"decide-and-tell"` | `ask`, `decide-and-tell` or `autonomous`. |
 | `interrupts` | text | `"when-broken"` | When a session may interrupt you: `never`, `when-broken` or `daily-summary`. |
 | `always_ask` | list of plain words | `[]` | Things that are asked first at every level, such as `spending` or `data-deletion`. |
+
+## `[msg]`
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `person_send` | true or false | `false` | Lets the person who owns the account send a `ws msg` from outside any session, as `person:<user>`, when the per-boot token proves it ([messages](messages.md#a-person-sends)). Off is the whole rollback. A class's `inbound_allow` may name `person:<user>`. |
 
 ## `[[exceptions]]`
 

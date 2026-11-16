@@ -52,8 +52,12 @@ RUNNERS = frozenset({"claude", "opencode", "codex", "gemini", "goose"})
 _INTERPRETERS = frozenset({"node", "nodejs", "bun", "deno"})  # a script runner: the program is the next word
 
 # The admin commands, one table. `ADMIN` is a first word with any subcommand; `ADMIN_SUB` a first and second word.
+# `SESSION_OK` is the exception: commands under an admin word that a session may run, because they hold and show no
+# value: `secret ask` opens a prompt window for a person, `secret wait` blocks until it is filled. The prompt itself
+# (`secret prompt`), `set`, `import`, `rm` and `wall` stay for a person.
 # `install` is admin only with `--gate` (anything but every-session): see `admin_name`.
 ADMIN = frozenset({"secret", "broker", "approve", "uninstall", "upgrade"})
+SESSION_OK = frozenset({("secret", "ask"), ("secret", "wait")})
 ADMIN_SUB = frozenset(
     {
         ("gate", "init"),
@@ -62,6 +66,7 @@ ADMIN_SUB = frozenset(
         ("skills", "restore"),
         ("config", "fallback"),
         ("session", "prepare"),  # mints the role a launcher gives a session
+        ("msg", "person-token"),  # mints the proof of a person's own send
         ("session", "start"),  # writes a session's registry record, role included
         ("node", "join"),  # changes the machine's own files
         ("node", "remove"),
@@ -146,6 +151,8 @@ def admin_name(command: str, args: object) -> str | None:
     topic = getattr(args, "topic", None)
     if len(parts) == 1 and isinstance(topic, str):
         parts.append(topic)
+    if tuple(parts[:2]) in SESSION_OK:
+        return None
     if parts[0] in ADMIN:
         return parts[0]
     if tuple(parts[:2]) in ADMIN_SUB:

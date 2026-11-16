@@ -1,6 +1,6 @@
 [project]
 name = "ws-aitoolkit"
-version = "0.1.10"
+version = "0.1.11"
 description = "Your memory, skills and rules, across your AI coding tools."
 readme = "README.md"
 license = "Apache-2.0"
@@ -26,6 +26,7 @@ Security = "https://github.com/Michael-A-Fry/ws/blob/main/SECURITY.md"
 
 [project.scripts]
 ws = "ws.cli:main"
+ws-secret = "ws.secretportal:shim"
 
 [dependency-groups]
 # The last four feed the test harness (tests/plugins/ws_harness.py): per-test limits, random order, one marked rerun,

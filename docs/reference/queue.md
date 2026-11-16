@@ -13,14 +13,15 @@ from what it used. `src/ws/queue.py` is the code; this page is the contract. The
 | `ws queue show RUN_ID` | One receipt. |
 | `ws queue cancel RUN_ID` | Take a queued run out of the queue. A running one, or one a drain has just claimed (`not_cancellable`), is stopped with SIGTERM to its `ws run`. |
 | `ws queue run [--max N]` | Run what's queued, one after another. This is what a timer runs. |
-| `ws queue tick JOB [--slot T] [--no-coalesce] [--skip-missed S]` | A schedule's tick: queue the run for slot T at most once (a double tick runs once), not while a run of the job waits or runs, and not when the slot is more than S seconds late. |
+| `ws queue tick JOB [--slot T\|schedule] [--no-coalesce] [--skip-missed S] [--run]` | A schedule's tick: queue the run for slot T at most once (a double tick runs once), not while a run of the job waits or runs, and not when the slot is more than S seconds late. `--slot schedule` is the latest time of the job's schedule at or before now, which is what a timer passes, so a late catch-up fire gets the slot it missed. The job's `coalesce_if_active` and `skip_missed` keys set the defaults, and the flags override them. `--run` then drains the queue: a job timer runs `ws queue tick JOB --slot schedule --run`. |
+| `ws queue reap` | Record and tell, now, each run whose process is gone. The reaper timer runs it every 2 minutes, so a SIGKILL with nothing else starting after it's told within minutes. |
 | `ws queue slot --ram-gb N --lane ui --who join\|writer -- CMD...` | Wait for a slot, run `CMD` in it, give the slot back. Raw: the command's output and exit code are its own. |
 | `ws node join\|show\|remove` | The node's footprint ledger. See [Nodes](#nodes). |
 | `ws usage statusline` | The statusline command that stashes the subscription limits. See [Subscription limits](#subscription-limits). |
 
-`add`, `cancel`, `run` and `ws node join|remove` are refused in a gated session (`WS_GATED_SESSION` set). `list`,
-`show` and `slot` aren't. No command settles or frees a reservation: that's done by the run that holds it, or by the
-reaper when the run is gone.
+`add`, `cancel`, `run`, `tick`, `reap` and `ws node join|remove` are refused in a gated session (`WS_GATED_SESSION`
+set). `list`, `show` and `slot` aren't. No command settles or frees a reservation: that's done by the run that holds
+it, or by the reaper when the run is gone.
 
 ## What's reserved
 
@@ -74,7 +75,8 @@ A run settles once, after its record is written, with the cost that record count
 `not_found`, `crashed` (reaped), `expired`, or `refused:<counter>`. Settling again changes nothing. A reservation is
 bound to the claim that made it; a settle with another claim is refused.
 
-A reservation whose owner is gone is reaped by the next admission: the owner is gone when its process id isn't
+A reservation whose owner is gone is reaped by the next admission, or by the reaper timer (`ws queue reap` every 2
+minutes), whichever comes first: the owner is gone when its process id isn't
 running, or is running with a different start time (the id was reused). Where the system can't tell, the lease decides
 (the job's timeout plus two minutes). The reaper writes the run's record if it never got to, at the fallback cost,
 and frees the reservation. A `ws queue slot` that crashed held a place for a command of yours, not a job: it's freed with

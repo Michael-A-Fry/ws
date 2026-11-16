@@ -13,6 +13,7 @@ import os
 import plistlib
 import sqlite3
 import stat
+import subprocess
 import sys
 import threading
 from datetime import UTC, datetime, timedelta, timezone
@@ -2073,6 +2074,100 @@ def test_planted_tick_after_a_kill_runs_the_slot(tmp_path):
     assert ledger.tick("nightly", None, nxt, nxt)[0] == "queued"
     assert ledger.receipt(run_id)["stop_reason"] == "owner_gone"
     assert len(told) == 1 and told[0].startswith("outcome_unknown")
+
+
+# ---- the reaper timer and the timer's tick (C499 items 8 and 10) -----------------------------------------------------
+
+
+def test_planted_sigkill_with_no_further_admit_is_told_by_one_reaper_tick(box, capsys, monkeypatch):
+    """A run SIGKILLed with nothing else starting after it: the reaper timer's `ws queue reap` (every 2 minutes) records
+    it and sends its one notice at its next tick, against the real process table; the tick after says nothing."""
+    told: list[tuple[str, str]] = []
+    monkeypatch.setattr(queue, "notify_stop", lambda job, run_id, reason, **kw: told.append((job, run_id)) or True)
+    victim = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        ledger = queue.ledger_for_env()
+        r = req(job="nightly", owner_pid=victim.pid)
+        assert ledger.admit(r, datetime.now(UTC), spend()).kind == "admit"
+        ledger.close()
+    finally:
+        victim.kill()
+        victim.wait()
+    code, out = call(capsys, "queue", "reap")
+    assert code == 0 and out["data"]["reaped"] == 1 and told == [("nightly", r.run_id)]
+    assert out["data"]["told"] == [{"job": "nightly", "run_id": r.run_id}]
+    (rec,) = runrecord.read(runrecord.runs_path(dict(os.environ)))
+    assert (rec["run_id"], rec["status"]) == (r.run_id, "outcome_unknown")
+    code, out = call(capsys, "queue", "reap")
+    assert code == 0 and out["data"]["reaped"] == 0 and len(told) == 1
+
+
+def test_queue_reap_is_refused_in_a_gated_session(box, capsys, monkeypatch):
+    monkeypatch.setenv("WS_GATED_SESSION", "1")
+    code, out = call(capsys, "queue", "reap")
+    assert code == 3 and out["error_kind"] == "refused"
+
+
+def test_the_timers_slot_is_the_latest_time_of_the_schedule_even_when_it_fires_late(box, capsys, monkeypatch):
+    """systemd and launchd do not say which time they fired for, so `--slot schedule` works it out from the job's own
+    schedule: a catch-up fire hours late (Persistent=true after the machine was off) still ticks the slot it missed,
+    and a second fire for the same slot queues nothing."""
+    write_job(box, extra='schedule = "daily 03:00"')
+    fired = datetime.now().astimezone().replace(hour=9, minute=41, second=7, microsecond=0)  # six hours late
+    monkeypatch.setattr(queue, "datetime", _Frozen(fired.astimezone(UTC)))
+    want = runrecord.iso(fired.replace(hour=3, minute=0, second=0).astimezone(UTC))
+    code, out = call(capsys, "queue", "tick", "daily", "--slot", "schedule")
+    assert code == 0 and out["data"]["slot"] == want and out["data"]["result"] == "queued"
+    code, out = call(capsys, "queue", "tick", "daily", "--slot", "schedule", "--no-coalesce")
+    assert code == 0 and out["data"]["result"] == "already"  # the same slot: never the minute it fired in
+
+
+def test_slot_schedule_needs_a_schedule(box, capsys):
+    write_job(box)
+    code, out = call(capsys, "queue", "tick", "daily", "--slot", "schedule")
+    assert code == 2 and "needs a schedule" in out["message"]
+
+
+def test_the_jobs_own_keys_set_coalescing_and_skipping_and_the_flags_override_them(box, capsys, monkeypatch):
+    seen: list[dict] = []
+    real = queue.Ledger.tick
+
+    def spy(self, job, purpose, slot, now, **kw):
+        seen.append(kw)
+        return real(self, job, purpose, slot, now, **kw)
+
+    monkeypatch.setattr(queue.Ledger, "tick", spy)
+    write_job(box, extra="coalesce_if_active = false\nskip_missed = 600")
+    assert call(capsys, "queue", "tick", "daily", "--slot", "2026-11-10T03:00:00Z")[0] == 0
+    assert (seen[-1]["coalesce_if_active"], seen[-1]["skip_missed_s"]) == (False, 600.0)
+    write_job(box)  # neither key: today's defaults
+    assert call(capsys, "queue", "tick", "daily", "--slot", "2026-11-10T04:00:00Z")[0] == 0
+    assert (seen[-1]["coalesce_if_active"], seen[-1]["skip_missed_s"]) == (True, None)
+    args = ("--slot", "2026-11-10T05:00:00Z", "--no-coalesce", "--skip-missed", "30")
+    assert call(capsys, "queue", "tick", "daily", *args)[0] == 0
+    assert (seen[-1]["coalesce_if_active"], seen[-1]["skip_missed_s"]) == (False, 30.0)
+
+
+def test_tick_run_drains_after_queueing(box, capsys, monkeypatch):
+    ran: list[str] = []
+    monkeypatch.setattr(queue, "run_item", lambda item: ran.append(item.job) or queue.Outcome(0, "ok", "completed"))
+    write_job(box)
+    code = cli.main(["queue", "tick", "daily", "--slot", "2026-11-10T03:00:00Z", "--run"])
+    out = capsys.readouterr().out
+    assert code == 0 and ran == ["daily"] and "daily 2026-11-10T03:00:00.000Z: queued" in out and "1 attempt" in out
+
+
+class _Frozen:
+    """`queue.datetime` with a fixed now (everything else passes through to the real class)."""
+
+    def __init__(self, now):
+        self._now = now
+
+    def now(self, tz=None):
+        return self._now.astimezone(tz) if tz else self._now
+
+    def __getattr__(self, name):
+        return getattr(datetime, name)
 
 
 def test_opening_a_second_ledger_never_closes_a_descriptor_of_the_open_database(tmp_path, monkeypatch):

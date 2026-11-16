@@ -48,7 +48,9 @@ if prompt == "stubborn":
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     child = (
         "import os, signal, time\\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\\n"
-        "open(os.path.join(os.environ['WS_HOME'], 'grandchild.pid'), 'w').write(str(os.getpid()))\\ntime.sleep(60)"
+        "pidfile = os.path.join(os.environ['WS_HOME'], 'grandchild.pid')\\n"
+        "open(pidfile + '.tmp', 'w').write(str(os.getpid()))\\nos.replace(pidfile + '.tmp', pidfile)\\n"  # whole or absent
+        "time.sleep(60)"
     )
     subprocess.Popen([sys.executable, "-c", child])
     time.sleep(60)

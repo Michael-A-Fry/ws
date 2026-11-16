@@ -563,7 +563,9 @@ def test_resolve_caller_works_for_a_real_child_and_not_a_real_orphan(home, monke
         env = json.loads(sys.argv[3])
         session.trusted_env = lambda: env  # the test's folders, as the fixture has them in this process
         rec = session.resolve_caller()
-        open(out, "w").write(rec.session_id if rec else "none")
+        with open(out + ".tmp", "w") as f:
+            f.write(rec.session_id if rec else "none")
+        os.replace(out + ".tmp", out)  # atomic: the test waits for `out` to exist, so it must never see it empty
         """
     )
     env = json.dumps(session.trusted_env())

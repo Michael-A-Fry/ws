@@ -55,6 +55,7 @@ folders read-only, and the gate refuses a session's writes to each of them in ei
 | Eval results | `eval/results.jsonl` | `src/ws/eval.py` | `schema`, `ts`, `batch`, `task`, `task_hash`, `family`, `kind`, `trial`, `arm`, `job`, `job_hash`, `run_id`, `status`, `pass`, `grade`, `note`, `folder` | 1 | `ts` | Rotates at 5 MiB |
 | Eval looks | `eval/looks.jsonl` | `src/ws/eval.py` | `schema`, `ts`, `pair`, `look`, `result` | 1 | `ts` | Rotates at 5 MiB |
 | Gate calls | `logs/gate-calls.jsonl` | `src/ws/guards/record_calls.py` | `schema`, `ts`, `at`, `runner`, `payload` | 1 | `ts`, `at` | Rotates at 5 MiB |
+| Connector calls | `logs/connector-calls.jsonl` | `src/ws/connectors.py` (`ws connector audit`, the PreToolUse hook on a connector's server) | `schema`, `ts`, `agent` (a job's name, a launch's `--agent`, else `session`), `session`, `connector`, `tool`, `decision` (`allow`, `deny`), `rule` (the `[connectors.NAME] tools` entry that decided), `arg_keys` (the argument names, never their values). One line per call; a line that can't be written makes the call a deny | 1 | `ts` | Rotates at 5 MiB |
 | Claims | `logs/claims.jsonl` | `src/ws/guards/claims.py` | `schema`, `ts`, `at`, `runner`, `session`, `ref`, `claims` | 1 | `ts`, `at` | Rotates at 5 MiB |
 | Gate verdicts | `logs/gate.jsonl` | `src/ws/gate.py` | `schema`, `ts`, `runner`, `session`, `event`, `decision` (`allow`, `deny`, `ask`, `claim`), `layer`, `guards` (each `guard`, a guard's name or `rule:KIND`; `result`, `ms`, and when they apply `count` and `gap`), `ms`, `via` (`direct` or `daemon`), `tool`, on a decision other than `allow` a `rule` (the id of the rule or layer that said no, never its reason), and for a tool no adapter reads `unlisted` and `counted_as` (`write`). One line per call's check, allow included | 1 | `ts` | Rotates at 5 MiB |
 | Wall report | `logs/wall-report.jsonl` | `src/ws/sandbox.py` | `schema`, `ts`, `at`, `project`, `runner`, `incomplete`, `findings`, `notes` | 1 | `ts`, `at` | Rotates at 5 MiB |
@@ -136,8 +137,9 @@ folders and not in one, because the wall makes those read-only. `ws uninstall` r
 state in SQLite. It holds the queued work (table `work`, the `ws._vendor.sqlqueue` engine) and a receipt for every run
 (table `receipts`): its status (`queued`, `running`, `ok`, `error`, `refused`, `preempted`, `skipped`, `interrupted`,
 `expired`), the UTC month it counts in, what was reserved (money, turns, seconds, memory, lane), who owns it (process id
-and start time), what it came to when settled (cost, tokens, stop reason) and its run key (`run_key`). A database
-file carries its layout version in `PRAGMA user_version` (now 3: 2 added `parent_run_id`, 3 `run_key`); a later
-change to the tables takes a new number, and an older file gains the new columns when it's opened. The money
-counted against a cap is the month's records in `logs/runs.jsonl` plus the open reservations here, never both for
-one run. See [the queue](queue.md).
+and start time), what it came to when settled (cost, tokens, stop reason), its run key and its chain depth. Table
+`ticks` holds each scheduled job's last ticked slot. A database file carries its layout version in
+`PRAGMA user_version` (now 4: 2 added `parent_run_id`, 3 `run_key`, 4 `chain_depth` and `ticks`); a later change to
+the tables takes a new number, and an older file gains the new columns when it's opened. The money counted against
+a cap is the month's records in `logs/runs.jsonl` plus the open reservations here, never both for one run. See
+[the queue](queue.md).

@@ -61,7 +61,7 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from ws import (
@@ -399,6 +399,9 @@ def _base_record(job: jobs.Job, run_id: str, started: datetime, pol: policy.Poli
         started_at=runrecord.iso(started),
         cwd=job.cwd and str(Path(job.cwd).expanduser()),
         policy={"dial": pol.dial, "rule_of_two": _rule_label(verdict)},
+        # the switch a run acts under is the policy's dial (a job file has none of its own); the gate spends approvals
+        # inside the runner, so the words of one are not known here yet: null until the gate hands them back
+        approval={"switch": pol.dial, "quote": None},
         ws_version=__version__,
         allow_unpriced=job.allow_unpriced,
         green=job.green,
@@ -691,14 +694,31 @@ def _alert_on_exit(name: str, code: int) -> None:
 
 
 def _died(name: str, old: dict) -> None:
-    """One record for a run whose holder stopped beating: it never finished, and nothing else would say so."""
+    """One record for a run whose holder died holding the job's lock: it never finished, and nothing else may say so.
+    The same `outcome_unknown` record the queue's reaper writes (`runrecord.unknown_outcome`), under the dead run's own
+    id, with its real duration (from when it took the lock to now, or to its timeout if that is sooner). None of it when
+    the reaper has written that run's record already. A run that got as far as admission is told once, by the reaper
+    that settles its receipt; one killed before it (no receipt) has this record and no notice. A lock file from an older
+    ws has no start or run id, so its record has no duration."""
+    env = os.environ
+    log = runrecord.runs_path(env)
     now = datetime.now(UTC)
-    rec = runrecord.new(
-        run_id=runrecord.new_run_id(now), job=name, started_at=runrecord.iso(now), ended_at=runrecord.iso(now),
-        status="error", stop_reason="died", duration_ms=0, ws_version=__version__,
-        error=f"the previous run of {name} (fence {old.get('fence', '?')}) stopped without finishing: its lock went stale",
-    )  # fmt: skip
-    _append(runrecord.runs_path(os.environ), rec)
+    rid = old.get("run_id") if isinstance(old.get("run_id"), str) and jobs.NAME.match(old["run_id"]) else None
+    with contextlib.suppress(OSError, ValueError):
+        if rid and any(r.get("run_id") == rid for r in runrecord.read(log)):
+            return  # the reaper (or the run itself) wrote it
+    started = joblock.started_of(old)
+    ended = now
+    with contextlib.suppress(Exception):
+        if started is not None:
+            ended = min(now, started + timedelta(seconds=float(jobs.load(name, env).timeout_s)))
+    why = f"the previous run of {name} (fence {old.get('fence', '?')}) was gone before it finished: it held the lock"
+    rec = runrecord.unknown_outcome(
+        rid or runrecord.new_run_id(now), name, started or now, ended, ws_version=__version__, why=why
+    )
+    if started is None:
+        rec["duration_ms"] = None  # an older lock file: when it started is not known
+    _append(log, rec)
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -708,14 +728,15 @@ def cmd_run(args: argparse.Namespace) -> int:
         if args.dry_run or not isinstance(name, str) or not jobs.NAME.match(name):
             with _term_becomes_exit():
                 return _run(args)
-        with joblock.hold(name, os.environ, on_died=_died) as lock:
+        run_id = runrecord.new_run_id()  # in the lock file too, so a death found there is recorded under this id
+        with joblock.hold(name, os.environ, on_died=_died, run_id=run_id) as lock:
             if lock is None:  # a live run holds it: one tick, one run
                 print(f"ws: {name} is already running; this start is skipped", file=sys.stderr)
                 return 0
             code = 1  # what a run that raised counts as
             try:
                 with _term_becomes_exit():
-                    code = _run(args)
+                    code = _run(args, run_id=run_id)
                 return code
             except SystemExit as e:
                 code = e.code if isinstance(e.code, int) else 1
@@ -747,6 +768,7 @@ def _run(
     fields: dict | None = None,
     hook=None,
     queued: Queued | None = None,
+    run_id: str | None = None,
 ) -> int:
     env = os.environ
     home = paths.state_dir(env).absolute()
@@ -778,7 +800,7 @@ def _run(
             )
         job = dataclasses.replace(job, parent_run=parent)
     started = datetime.now(UTC)  # the one clock reading of this run: its month, its lease, its deadline check
-    run_id = queued.run_id if queued else runrecord.new_run_id(started)
+    run_id = queued.run_id if queued else run_id or runrecord.new_run_id(started)
     run_dir = home / "runs" / run_id
     # no cwd in the job: a fresh empty folder, outside ws's folders (the wall makes those read-only)
     cwd = Path(job.cwd).expanduser() if job.cwd else default_cwd(home, run_id)
@@ -1014,6 +1036,8 @@ def _execute(
             leases.append(_lease(s, sock, rec))
             rec["secrets_used"].append({"name": s.name, "host": s.host})
         argv, extra = adapter.build_command(job, run_dir, leases[0] if leases else None)
+        if hasattr(adapter, "run_leases"):  # leases the adapter took itself (a connector's token): released below too
+            leases += adapter.run_leases(run_dir)
         if job.checkpoint:
             extra = {**extra, "WS_CHECKPOINT": job.checkpoint}
         if rec.get("chain_depth") is not None:  # a queued run: what it queues is one link deeper in its chain

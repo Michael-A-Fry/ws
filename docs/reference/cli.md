@@ -525,6 +525,41 @@ ws run [-h] [--dry-run] [--parent RUN_ID] job
 | `--dry-run` | Show what would start, and whether it would be refused. |
 | `--parent RUN_ID` | Reserve only from what this run in progress has left, on top of the monthly cap. |
 
+A job put in place by `ws job add` is pinned: `ws run` refuses it if its file or prompt_file changed since.
+
+## `ws job`
+
+Add a job file (checked, copied and pinned) or remove one. Every add, replace and remove writes one line to
+`jobs-installed.jsonl` in the state folder's `logs/`.
+
+### `ws job add`
+
+Check a job file, copy it into the jobs folder and pin its sha256.
+
+```text
+ws job add [-h] [--replace] [--no-apply] path
+```
+
+| Argument | Meaning |
+|---|---|
+| `path` | The job file, `NAME.toml`. Its `prompt_file` (a file name next to it) is copied with it. |
+| `--replace` | Replace an installed job of the same name. The diff is shown first. |
+| `--no-apply` | Don't run `ws schedule apply` afterwards. |
+
+It refuses (exit 3) a tool outside `[gate] allow_mcp`, the built-in tools that write or run commands (Write, Edit,
+MultiEdit, NotebookEdit, Bash), a `[[secrets]]` name, host or purpose the registry doesn't allow, `runner_options` env,
+exe or provider, and a `budget_usd` above `monthly_cap_usd` or the purpose's cap. A job that doesn't load is a usage
+error (exit 2). Inside an agent session, a job that adds a secret, tool, schedule, command or higher budget than the
+installed jobs have needs `ws approve` once; a same-power fix doesn't.
+
+### `ws job remove`
+
+Stop a job's timer, delete what `ws job add` copied and drop its pin.
+
+```text
+ws job remove [-h] name
+```
+
 ## `ws runs`
 
 Show the last records of `ws run`.

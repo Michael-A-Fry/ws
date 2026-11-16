@@ -53,6 +53,12 @@ repos:
         language: system
         files: ^(src/ws/.*\.py|docs/reference/code-map\.md|scripts/gen_code_map\.py)$
         pass_filenames: false
+      - id: hook-parity
+        name: hook parity page is current (python3 scripts/gen_hook_parity.py rewrites it)
+        entry: python3 scripts/gen_hook_parity.py --check
+        language: system
+        files: ^(docs/reference/hook-parity\.(toml|md)|scripts/gen_hook_parity\.py)$
+        pass_filenames: false
       - id: pii-gate
         name: PII gate (private IPs, tailnet hosts, e-mails, private denylist)
         entry: python3 scripts/pii_gate.py

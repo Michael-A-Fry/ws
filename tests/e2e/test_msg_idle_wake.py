@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import socket
 import subprocess
 import sys
 import time
@@ -79,7 +80,11 @@ def test_an_idle_claude_code_session_starts_a_turn_when_a_message_lands(tmp_path
 
 def test_an_idle_opencode_session_starts_a_turn_when_a_message_lands(tmp_path, work, monkeypatch):
     out, extra = setup(tmp_path, "opencode", monkeypatch)
-    port = 4300 + os.getpid() % 500
+    with (
+        socket.socket() as probe
+    ):  # a free port from the system, not one derived from the pid (two workers could share it)
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
     with OpenAIStub([], final_text="all done") as stub:
         env = gr.base_env(tmp_path) | extra
         home = tmp_path / "home"

@@ -77,14 +77,20 @@ def tmux(monkeypatch):
 CFG = pane_close.Config(live_socket="live")
 
 
-def child_of(pid: int) -> int:
-    end = time.monotonic() + 5
+def children_of(pid: int, count: int = 1) -> list[int]:
+    """The children of `pid`, once there are `count` of them (a shell forks them after tmux has returned). The wait
+    ends as soon as they exist, so its bound is only spent by a test that is going to fail."""
+    end = time.monotonic() + 30
     while time.monotonic() < end:
         out = subprocess.run(["pgrep", "-P", str(pid)], capture_output=True, text=True, check=False).stdout.split()
-        if out:
-            return int(out[0])
+        if len(out) >= count:
+            return [int(x) for x in out]
         time.sleep(0.05)
-    raise AssertionError("no child process")
+    raise AssertionError(f"fewer than {count} child processes")
+
+
+def child_of(pid: int) -> int:
+    return children_of(pid)[0]
 
 
 def runner_at(pid: int) -> session.Proc:
@@ -278,11 +284,11 @@ def test_a_session_closes_its_own_pane_only_after_its_hand_over_is_delivered(wor
 def test_a_pane_shared_with_another_session_is_not_closed_as_its_own(world, tmux):  # noqa: F811
     tmux.server("live")
     pane, _, pid = tmux.window("live", "bash -c 'sleep 600 & sleep 600 & wait'")
-    kids = subprocess.run(["pgrep", "-P", str(pid)], capture_output=True, text=True, check=False).stdout.split()
+    kids = children_of(pid, 2)
     assert len(kids) == 2
     world.session("lead1", world.folder("lead"), role="lead")
-    world.session("one", world.folder("one"), proc=runner_at(int(kids[0])))
-    world.session("two", world.folder("two"), proc=runner_at(int(kids[1])))
+    world.session("one", world.folder("one"), proc=runner_at(kids[0]))
+    world.session("two", world.folder("two"), proc=runner_at(kids[1]))
     sent = world.send("one", "lead1", "done", None)
     world.who = "lead1"
     msg.read(sent["id"], "lead1")

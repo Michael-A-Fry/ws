@@ -1,9 +1,10 @@
-"""docs/reference/hooks.md maps each hook of a hand-built set to the ws rule or guard that does the same job. Each
+"""docs/reference/hook-parity.toml (shown as hook-parity.md) maps each hook of a hand-built set to the ws rule or guard that does the same job. Each
 `covered` row has a test here that sends the same sample call to the ws side, through the real hook entry, and checks that
 it is stopped (and that its harmless neighbour is not). The last test keeps the page and these tests in step."""
 
 from __future__ import annotations
 
+import importlib.util
 import io
 import json
 import re
@@ -15,10 +16,17 @@ from pathlib import Path
 import pytest
 
 from ws import cli, gate, paths, policy
-from ws.adapters import claude_code
+from ws.adapters import claude_code, opencode
+
+ROOT0 = Path(__file__).resolve().parents[1]
+_spec = importlib.util.spec_from_file_location("gen_hook_parity", ROOT0 / "scripts" / "gen_hook_parity.py")
+gen = importlib.util.module_from_spec(_spec)
+sys.modules["gen_hook_parity"] = gen
+_spec.loader.exec_module(gen)
 
 ROOT = Path(__file__).resolve().parents[1]
-PAGE = ROOT / "docs" / "reference" / "hooks.md"
+PAGE = ROOT / "docs" / "reference" / "hook-parity.md"
+DATA = ROOT / "docs" / "reference" / "hook-parity.toml"
 needs_git = pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
 
 
@@ -145,20 +153,32 @@ def git(cwd, *args) -> str:
     return done.stdout.strip()
 
 
+def commit_with_readable_sha(repo, name: str, text: str) -> str:
+    """Commit `text` to `name` and return its short sha, retrying with a new message until the sha has a digit and a
+    letter a to f, which is all the claims guard reads as a commit (a hash is random, so one in ~100 would not)."""
+    for n in range(50):
+        (repo / name).write_text(text)
+        git(repo, "add", name)
+        git(repo, "commit", "-q", "--allow-empty", "-m", f"c{n}")
+        sha = git(repo, "rev-parse", "--short=10", "HEAD")
+        if any(c.isdigit() for c in sha) and any(c in "abcdef" for c in sha):
+            return sha
+        git(repo, "reset", "-q", "--hard", "HEAD~1")
+    raise AssertionError("no commit with a readable sha in 50 tries")
+
+
 @needs_git
 def test_parity_claims(box):
     repo = box / "repo"
     repo.mkdir()
     git(repo, "init", "-q", "-b", "main")
-    (repo / "a").write_text("1")
-    git(repo, "add", "a")
-    git(repo, "commit", "-q", "-m", "first")
-    on = git(repo, "rev-parse", "--short=10", "HEAD")
+    (repo / "seed").write_text("0")
+    git(repo, "add", "seed")
+    git(repo, "commit", "-q", "-m", "seed")
+    on = commit_with_readable_sha(repo, "a", "1")
     git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
     git(repo, "checkout", "-q", "-b", "work")
-    (repo / "a").write_text("2")
-    git(repo, "commit", "-q", "-am", "second")
-    off = git(repo, "rev-parse", "--short=10", "HEAD")
+    off = commit_with_readable_sha(repo, "a", "2")
     pol = policy.loads('[guards]\non = ["claims"]\n')
 
     def say(text: str) -> str:
@@ -301,36 +321,92 @@ def test_parity_phone_alert(box, monkeypatch, capsys):
     assert cli.main(["notify", "alert", "--runner", "claude-code", *paths.pin_of().args()]) == 0  # no channel: silent
 
 
+# --- launch from the main checkout, and config-guard ---------------------------------------------------------------
+
+
+@needs_git
+def test_parity_launch_from_main(box, monkeypatch):
+    from test_guard_launch_config import real_repos
+
+    main, wt = real_repos(box)
+    on = '[guards]\non = ["guard-launch"]\n'
+
+    def go(where, *a, **k):
+        monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(where))  # the folder the session started in
+        return hook(box, on, call(*a, cwd=where, **k))
+
+    assert go(wt, "Workflow", name="w") == 2  # a workflow from a linked worktree
+    assert go(wt, "Agent", prompt="p", isolation="worktree") == 2
+    assert go(main, "Workflow", name="w") == 0
+    assert go(wt, "Agent", prompt="p") == 0  # not isolated: allowed
+    (box / "plain").mkdir()
+    (box / "plain" / ".git").mkdir()  # a planted .git folder is not a repository
+    assert go(box / "plain", "Workflow", name="w") == 2
+
+
+def test_parity_config_guard(box, monkeypatch):
+    (box / "g").mkdir()
+    (box / "mine").mkdir()
+    on = f'[guards]\non = ["config-guard"]\n[guards.config-guard]\npaths = ["{box / "g"}"]\nowners = ["{box / "mine"}"]\n'
+    edit = {"file_path": str(box / "g" / "settings.json"), "content": "x"}
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(box))
+    assert hook(box, on, call("Write", cwd=box, **edit)) == 2  # not the owner's folder
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(box / "mine"))
+    assert hook(box, on, call("Write", cwd=box / "mine", **edit)) == 0
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(box))
+    assert hook(box, on, call("Write", cwd=box / "mine", **edit)) == 2  # the call moved itself into the owner's folder
+
+
 # --- the page and these tests agree ------------------------------------------------------------------------------
 
 
-def rows() -> list[list[str]]:
-    found = []
-    for line in PAGE.read_text(encoding="utf-8").splitlines():
-        cells = [c.strip() for c in line.strip().strip("|").split("|")]
-        if re.fullmatch(r"\d+", cells[0]) and len(cells) == 5:
-            found.append(cells)
-    return found
+def table() -> list[dict]:
+    return gen.load()
 
 
 def test_every_hook_row_is_covered_by_a_test_or_says_why_not():
-    table = rows()
-    assert [r[0] for r in table] == [str(n) for n in range(1, 23)]  # the 22 hooks, in order
+    rows = table()
+    assert len({r["id"] for r in rows}) == len(rows), "duplicate row id"
     mine = {n for n in globals() if n.startswith("test_parity_")}
     named = set()
-    for number, what, ws, status, proof in table:
-        assert what and ws, number
-        if status == "covered":
-            test = proof.strip("`")
-            assert test in mine, f"row {number} names {test}, which is not in tests/test_hook_parity.py"
-            named.add(test)
+    for r in rows:
+        assert r["what"] and r["ws"], r["id"]
+        assert r["status"] in gen.STATUSES and r["fail"] in gen.FAILS, r["id"]
+        if r["status"] == "covered":
+            for name in r["test"].split(", "):
+                assert name in mine, f"row {r['id']} names {name}, which is not in tests/test_hook_parity.py"
+                named.add(name)
         else:
-            assert status == "estate (personal)" or re.fullmatch(r"dropped \(reason: .+\)", status), (number, status)
-            assert proof == "none" or proof.startswith("none:"), number
+            assert r["test"] == "none", r["id"]
+            if r["status"] == "planned":
+                assert r.get("wave") in ("1", "2a", "2b", "3"), r["id"]
+            if r["status"] == "dropped":
+                assert "reason" in r["ws"] or "no " in r["ws"], r["id"]
     assert named == mine, f"tests with no row on the page: {sorted(mine - named)}"
 
 
+def test_a_hook_in_an_inventory_with_no_row_is_found():
+    assert gen.missing(["dummy-hook"]) == ["dummy-hook"]  # planted: a hook the table does not know is red
+    assert gen.missing([table()[0]["id"]]) == []
+    assert gen.missing([], rows=[]) == []
+
+
+def test_the_page_is_what_the_script_writes_from_the_table():
+    assert PAGE.read_text(encoding="utf-8") == gen.render()
+    assert PAGE.read_text(encoding="utf-8").startswith("<!-- GENERATED")
+
+
 def test_the_page_names_no_person_host_or_private_setup():
-    text = PAGE.read_text(encoding="utf-8")
+    text = PAGE.read_text(encoding="utf-8") + DATA.read_text(encoding="utf-8")
     assert not re.search(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", text) and "@" not in text
     assert "/home/" not in text and "/Users/" not in text
+
+
+def test_generated_runner_configs_say_do_not_edit(box):
+    pol = policy.default_policy()
+    made = claude_code.generate(pol, ["ws"], box / "out", box / "w" / "policy.toml")
+    made.update(opencode.generate(pol, ["ws"], box / "out", box / "w" / "policy.toml"))
+    for name, text in made.items():
+        if name == ".gitignore":
+            continue
+        assert "DO NOT EDIT" in text.splitlines()[0] or "DO NOT EDIT" in json.loads(text).get("_generated", ""), name

@@ -139,6 +139,8 @@ def plant(tmp: Path) -> str:
     (work / "STATE.md").write_text("state\n")
     (work / "tests" / "test_x.py").write_text(TEST_OLD)
     (work / "bad.py").write_text("def f(:\n")
+    (work / ".claude" / "agents").mkdir(parents=True)  # the agent type the rows use has a definition, with no isolation
+    (work / ".claude" / "agents" / "worker.md").write_text("---\nname: worker\n---\nWork.\n")
     (tmp / "main" / ".git" / "worktrees" / "wt").mkdir(parents=True)
     if shutil.which("git") is None:
         return "abc1234def"
@@ -166,6 +168,13 @@ def rows(tmp: Path, sha: str = "abc1234def") -> dict[tuple[str, str], list[tuple
         ],
         ("claims", "pre"): [],  # OpenCode has no send-message tool: nothing can reach this event there
         ("claims", "stop"): [("", [S("stop", last=f"merged {sha} into main")], [0], work)],
+        ("config-guard", "pre"): [
+            (f'[guards.config-guard]\npaths = ["{work}/guarded"]\nowners = ["{main}"]\n',
+             [S("pre", "write", path=str(work / "guarded" / "s.json"), content="x"),
+              S("pre", "write", path=str(work / "free.txt"), content="x")],
+             ["ask", "allow"], work)
+        ],
+        ("guard-launch", "pre"): [("", [S("pre", "agent")], ["allow"], work)],  # a task call asks for no isolation
         ("dev-server", "pre"): [
             ("", [S("pre", "command", command="python3 -m http.server"), S("pre", "command", command="ls")],
              ["ask", "allow"], work)
@@ -493,7 +502,7 @@ def test_the_check_keeps_its_long_bound_and_advice_gets_a_short_one(tmp_path, bo
 def test_the_session_and_folder_in_every_payload_come_from_the_hook_input(tmp_path, box):
     shim = shim_for('[guards]\non = ["syntax-check", "session-context", "skill-gate", "claims"]\n', tmp_path)
     assert "session_id: input.sessionID" in shim
-    assert 'resolve(directory ?? process.cwd(), output.args?.workdir ?? ".")' in shim
+    assert 'resolve(directory ?? process.cwd(), input.tool === "bash" ? (output.args?.workdir ?? ".") : ".")' in shim
     # the payload is built from named fields: the tool's arguments only ever sit under `args` and `tool_input`
     assert "...input.args" not in shim and "...output.args" not in shim and "...args," not in shim
 
@@ -736,3 +745,79 @@ def test_a_torn_last_line_in_the_asks_file_costs_only_itself(tmp_path, box):
     asks = asks_after(tmp_path, b'{"event": "added", "id": "old", "q')  # the writer died mid-line, no newline
     rows = list(_files.iter_jsonl(asks))
     assert [row["id"] for row in rows] == ["p0"]
+
+
+# --- a policy that needs a check this runner cannot do is refused (CANNOT_CHECK) ------------------------------------
+
+
+def _planted(extra: str):
+    return policy.loads(f"[gate]\n{extra}\n")
+
+
+@pytest.mark.parametrize(
+    "extra, check",
+    [
+        ('allow_mcp = ["mcp__docs__search"]', "mcp"),
+        ('deny_tools = ["mcp__*__delete_*"]', "mcp"),
+        ('deny_tools = ["mcp__docs"]', "mcp"),  # a whole server has no OpenCode rule: not a silent allow
+        ('allow_hosts = ["example.com"]', "allow_hosts"),
+    ],
+)
+def test_opencode_refuses_a_policy_that_needs_a_check_it_cannot_do(extra, check):
+    from ws import conformance
+    from ws.output import WsError
+
+    with pytest.raises(WsError) as e:
+        conformance.refuse_cannot_check(_planted(extra), "opencode")
+    assert e.value.exit_code == 3 and e.value.kind == "cannot_check"
+    assert "CANNOT_CHECK" in e.value.message and check in e.value.message
+    conformance.refuse_cannot_check(_planted(extra), "claude-code")  # the same policy is fine where it can be checked
+
+
+def test_opencode_refuses_an_unsupported_guard_that_is_on_and_not_otherwise():
+    from ws import conformance
+    from ws.output import WsError
+
+    on = policy.loads('[guards]\non = ["claims"]\n')
+    with pytest.raises(WsError, match="guard:claims"):
+        conformance.refuse_cannot_check(on, "opencode")
+    conformance.refuse_cannot_check(policy.default_policy(), "opencode")
+    conformance.refuse_cannot_check(
+        _planted('deny_tools = ["mcp__docs__delete"]'), "opencode"
+    )  # exact name: native deny
+
+
+def test_every_adapter_declares_cannot_check_as_a_dict_of_reasons():
+    from ws import adapters
+
+    for name, mod in adapters.all_adapters().items():
+        gaps = getattr(mod, "CANNOT_CHECK", None)
+        assert isinstance(gaps, dict) and all(isinstance(v, str) and v for v in gaps.values()), name
+
+
+# --- `ws run` refuses the planted job ---------------------------------------------------------------------------------
+
+from test_run import ws as run_ws  # noqa: F401  (a scratch WS_HOME with a fake runner, for the `ws run` tests)
+
+
+def _opencode_job(run_ws, policy_text):  # noqa: F811
+    (run_ws.home / "policy.toml").write_text(policy_text, encoding="utf-8")
+    (run_ws.home / "jobs" / "daily.toml").write_text(
+        'runner = "opencode"\nmodel = "anthropic/claude-haiku-4-5"\nprompt = "ok"\ntimeout_s = 30\n', encoding="utf-8"
+    )
+
+
+def test_ws_run_refuses_an_opencode_job_whose_policy_allows_an_mcp_tool(run_ws, capsys):  # noqa: F811
+    _opencode_job(run_ws, '[gate]\nallow_mcp = ["mcp__docs__search"]\n')
+    assert cli.main(["run", "daily"]) == 3
+    err = capsys.readouterr().err
+    assert "CANNOT_CHECK" in err and "mcp" in err
+    (rec,) = run_ws.records()
+    assert rec["status"] == "refused" and rec["stop_reason"] == "refused:cannot_check"
+
+
+def test_ws_run_does_not_refuse_the_same_policy_for_claude_code(run_ws):  # noqa: F811
+    _opencode_job(run_ws, '[gate]\nallow_mcp = ["mcp__docs__search"]\n')
+    run_ws.job()  # the stock claude-code job
+    cli.main(["run", "daily"])
+    assert all(r["stop_reason"] != "refused:cannot_check" for r in run_ws.records())

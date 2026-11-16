@@ -115,6 +115,10 @@ from ws.output import WsError
 from ws.policy import Policy, native_patterns, sandbox_read_paths, sandbox_write_paths
 
 NAME = "claude-code"
+GENERATED_NOTE = "DO NOT EDIT: written by `ws gate generate` from policy.toml; change the policy and run it again"
+CANNOT_CHECK: dict[
+    str, str
+] = {}  # it enforces every check a policy can ask for (see ws.conformance.refuse_cannot_check)
 FILE = "settings.json"
 # Claude Code's write twin of wallsettings.READ_BLOCK_KEY (settings reference, 2.1.314): Write, Edit and NotebookEdit
 # refuse a path outside the working folders in every permission mode. It doesn't cover shell commands, MCP or hooks.
@@ -179,7 +183,7 @@ _KIND_TOOLS = {
     "search": ("Grep", "Glob"),
     "tool": ("WebFetch", "WebSearch"),
     "write": ("Edit", "Write", "MultiEdit", "NotebookEdit"),
-    "agent": ("Agent", "Task"),
+    "agent": ("Agent", "Task", "Workflow"),
     "skill": ("Skill",),
     "message": ("SendMessage",),
 }
@@ -598,6 +602,7 @@ def generate(
     if not user_scope and not policy.gate.write_outside_project:
         permissions[WRITE_BLOCK_KEY] = True  # the same rule, for Write, Edit and NotebookEdit
     settings = {
+        "_generated": GENERATED_NOTE,
         "permissions": permissions,
         # `sandbox = false` in the policy: no block, and the marker says so (the hook then skips the preflight)
         **({"sandbox": sandbox_block(policy, out, policy_file, protect, defaults=not user_scope)} if wall else {}),
@@ -643,8 +648,10 @@ def parse(payload: dict) -> Call | list[Call] | None:
         return Call.of("write", _text(inp, "file_path"), tool=name, **_write_data(name, inp))
     if name == "NotebookEdit":
         return Call.of("write", _text(inp, "notebook_path"), tool=name, **_write_data(name, inp))
-    if name in ("Agent", "Task"):
-        found = {k: inp[k] for k in ("prompt", "description", "subagent_type") if isinstance(inp.get(k), str)}
+    if name in ("Agent", "Task", "Workflow"):  # a workflow starts agents too; `isolation` says where they work
+        found = {
+            k: inp[k] for k in ("prompt", "description", "subagent_type", "isolation") if isinstance(inp.get(k), str)
+        }
         return Call.of("agent", found.get("subagent_type", ""), tool=name, **found)
     if name == "Skill":
         skill = inp.get("skill") if isinstance(inp.get("skill"), str) else _optional(inp, "name") or ""

@@ -61,7 +61,7 @@ Measure:
 - [Guards](reference/guards.md): the named checks, their events and findings, replay.
 - [Messages](reference/messages.md): the message store, its commands, and how a message reaches a session.
 - [CI](reference/ci.md): each workflow job, its time budget, the test-integrity check and the holdout.
-- [Hooks](reference/hooks.md): what a hand-built hook set does, and the ws rule or guard that does the same job.
+- [Hooks](reference/hook-parity.md): what a hand-built hook set does, and the ws rule or guard that does the same job.
 - [Code map](reference/code-map.md): what each module in `src/ws/` is for, built from its docstring.
 - [Eval](reference/eval.md): task files, graders and the ten metrics.
 - [Stores](reference/stores.md): every log and record file ws writes, its fields, schema and retention.

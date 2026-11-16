@@ -47,6 +47,7 @@ def test_no_variable_of_an_outer_repository_reaches_a_test():
 
 
 @needs_git
+@pytest.mark.medium  # it starts a whole pytest run: its size is the 300 s limit, not the 60 s of a unit test
 def test_a_run_with_an_outer_git_dir_writes_only_to_its_own_scratch_repo(tmp_path):
     outer = tmp_path / "outer"
     git("init", "-q", "--bare", str(outer))
@@ -66,13 +67,18 @@ def test_a_run_with_an_outer_git_dir_writes_only_to_its_own_scratch_repo(tmp_pat
         "spec.loader.exec_module(importlib.util.module_from_spec(spec))  # the suite's own clearing runs on import\n"
     )
     env = dict(os.environ, GIT_DIR=str(outer), GIT_INDEX_FILE=str(outer / "index"))
-    proc = subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-p", "no:xdist", str(probe)],
-        env=env,
-        capture_output=True,
-        text=True,
-        cwd=probe,
-        check=False,  # the return code is asserted below, with the output
-    )
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-p", "no:xdist", str(probe)],
+            env=env,
+            stdin=subprocess.DEVNULL,  # a pipe from the outer run (an xdist worker, a git hook) is not this run's to read
+            capture_output=True,
+            text=True,
+            cwd=probe,
+            check=False,  # the return code is asserted below, with the output
+            timeout=240,  # inside the 300 s limit, so a stuck run fails with what it printed, not with a bare timeout
+        )
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(f"the inner pytest run did not finish in {exc.timeout} s: {exc.stdout!r} {exc.stderr!r}")
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert (outer / "config").read_text() == before, "the outer repository's config was written"

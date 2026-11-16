@@ -13,7 +13,9 @@
 # a push names.
 # WS_PREPUSH_FULL=1 runs the whole suite here (logged like a skip).
 # Run the tests through a wrapper: WS_PREPUSH_WRAP="your-lock-command --flag" git push (split on spaces; for a machine
-# that queues test runs, so a push's tests don't race the others). Unset, they run as they are.
+# that queues test runs, so a push's tests don't race the others). Unset, the hook uses `ws-test --light --node local --`
+# when ws-test is on PATH (it queues for a slot and caps xdist's workers, so a busy machine doesn't time the tests out),
+# and runs them bare when it isn't. Set but empty (WS_PREPUSH_WRAP= git push), they always run bare.
 # A skip is never silent: it adds a line to .git/ws-prepush-skips.log (the log of the worktree's git dir).
 set -euo pipefail
 
@@ -40,6 +42,10 @@ uvx prek run --all-files >&2
 wrap=()
 if [[ -n "${WS_PREPUSH_WRAP:-}" ]]; then
   read -r -a wrap <<<"$WS_PREPUSH_WRAP"
+elif [[ -z "${WS_PREPUSH_WRAP+set}" ]] && command -v ws-test >/dev/null 2>&1; then
+  # a light slot: the e2e files are in the set, which ws-test would class as UI (refused in a worktree, never sent to a
+  # node); --node local keeps the run here, where the working folder is, not a bundle of tracked files elsewhere
+  wrap=(ws-test --light --node local --)
 fi
 
 smoke=(tests/test_cli.py tests/test_cli_registry.py tests/test_prepush_hook.py)

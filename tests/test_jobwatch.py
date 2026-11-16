@@ -363,3 +363,24 @@ def test_a_job_that_ticks_the_queue_is_watched_by_the_deadman(env):
     assert s.argv[:2] == ("queue", "tick") and s.records
     record(env, "keyed", datetime.now(UTC) - timedelta(hours=3))
     assert [m["job"] for m in jobwatch.overdue(env, datetime.now(UTC))] == ["keyed"]
+
+
+def test_a_kill_the_reaper_timer_told_first_is_not_pushed_again_by_the_drains_alert(env, monkeypatch):
+    from ws import queue
+
+    notify(env)
+    pid, run_id, told = _drain_with_a_killed_run(env, monkeypatch)
+    ledger = queue.ledger_for_env(env)
+    assert ledger.reap(ledger.clock()) == 1 and told == ["nightly"]  # the 2-minute reaper got there first
+    ledger.close()
+    s = Sender()
+    rec = jobwatch.alert_unit("ws-drain.service", env, status=lambda u: ("signal", "9"), sender=s, pid_of=lambda u: pid)
+    assert s.sent == [] and told == ["nightly"] and rec["reaped"] == [{"job": "nightly", "run_id": run_id}]
+
+
+def test_a_unit_that_is_not_a_drain_never_asks_for_its_pid(env):
+    asked: list[str] = []
+    jobwatch.alert_unit(
+        "ws-daily.service", env, status=lambda u: ("exit-code", "1"), pid_of=lambda u: asked.append(u) or 1
+    )
+    assert asked == []

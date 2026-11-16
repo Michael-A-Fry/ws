@@ -309,6 +309,13 @@ def checked_script(name: str, env) -> tuple[Path, bytes, float | None]:
 
 def cmd_schedule_script(args: argparse.Namespace) -> int:
     env = os.environ
+    from ws import approvals
+
+    if env.get(approvals.ENV_MARKER):  # a timer's command: it runs outside any session's wall
+        raise WsError(
+            "refused", f"ws schedule script is not for a gated session ({approvals.ENV_MARKER} is set here)",
+            "run it yourself, in your own terminal, or let its timer run it", 3,
+        )  # fmt: skip
     path, data, timeout = checked_script(args.job, env)
     with tempfile.TemporaryDirectory(prefix="ws-script-") as tmp:
         copy = Path(tmp) / path.name  # the reviewed bytes, where nobody else can swap them before they run
@@ -325,7 +332,7 @@ def cmd_schedule_script(args: argparse.Namespace) -> int:
             code = SCRIPT_EXIT_TIMEOUT
         except OSError as e:
             raise WsError("failed", f"job {args.job}: cannot start {path}: {e.strerror or type(e).__name__}",
-                          "give it a #! line and make it executable (chmod u+x)", 1) from e  # fmt: skip
+                          "give it a #! line; a temp folder mounted noexec also stops it (set TMPDIR)", 1) from e  # fmt: skip
     code = 128 - code if code < 0 else code  # killed by signal N: 128+N, as a shell says it
     if code and env.get("WS_ALERT_ON_EXIT") == "1":  # launchd has no OnFailure=: the failure alert is sent from here
         from ws import jobwatch

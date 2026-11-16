@@ -1244,6 +1244,23 @@ class Ledger:
         except sqlite3.Error as e:
             raise store_error(e) from e
 
+    def reaped_of(self, owner_pid: int, since: datetime) -> list[dict]:
+        """The queued runs held by process `owner_pid` that a reaper settled as gone since `since` (whoever reaped them,
+        and so told them): job, run_id, owner_pid, queued."""
+        try:
+            rows = (
+                self.conn()
+                .execute(
+                    "SELECT job, run_id, owner_pid FROM receipts WHERE owner_pid = ? AND message_id IS NOT NULL "
+                    "AND stop_reason = 'owner_gone' AND finished_at >= ?",
+                    (int(owner_pid), to_ns(since)),
+                )
+                .fetchall()
+            )
+        except sqlite3.Error as e:
+            raise store_error(e) from e
+        return [{"job": r["job"], "run_id": r["run_id"], "owner_pid": r["owner_pid"], "queued": True} for r in rows]
+
     def receipt(self, run_id: str) -> dict | None:
         try:
             r = self.conn().execute("SELECT * FROM receipts WHERE run_id = ?", (run_id,)).fetchone()

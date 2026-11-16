@@ -32,7 +32,7 @@ import os
 import re
 import subprocess
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from ws import joblog, jobs, output, paths, runrecord
@@ -121,19 +121,29 @@ def main_pid(unit: str) -> int | None:
     return pid if pid > 0 else None
 
 
-def reap_for_drain(job: str, env) -> list[dict]:
-    """For a unit that drains the queue (a `command = "queue"` job): reap now and return each run the reaper told the
-    person about (job, run_id, owner_pid, queued). The drain runs queued jobs in its own process, so when its unit
-    fails because it was killed, the runs it held are gone too, and the reaper's notice names them. Empty for any other
-    job, and when the queue cannot be read (then the unit's own alert is the notice)."""
+REAPED_WINDOW = timedelta(minutes=15)  # a reaper tick that told a drain's kill before its OnFailure= alert ran
+
+
+def reap_for_drain(job: str, env, pid_of_unit: Callable[[], int | None] = lambda: None) -> list[dict]:
+    """For a unit that drains the queue (a `command = "queue"` job): reap now and return each queued run held by `pid`
+    (the unit's own process) that a reaper told the person about, now or in the last few minutes (the reaper timer
+    may have got there first): job, run_id, owner_pid, queued. The drain runs queued jobs in its own process, so when
+    its unit fails because it was killed, the runs it held are gone too, and the reaper's notice names them. Empty for
+    any other job, with no pid, and when the queue cannot be read (then the unit's own alert is the notice)."""
     from ws import queue  # here, not at the top: queue reads this module's alerts file
 
     if job not in queue.drain_jobs(env):
         return []
+    pid = pid_of_unit()  # asked only for a drain: it is a systemctl call
+    if pid is None:
+        return []
     try:
         ledger = queue.ledger_for_env(env)
         try:
-            return ledger.reap_report(ledger.clock())[1]
+            now = ledger.clock()
+            told = [t for t in ledger.reap_report(now)[1] if t.get("owner_pid") == pid and t.get("queued")]
+            seen = {t["run_id"] for t in told}
+            return told + [t for t in ledger.reaped_of(pid, now - REAPED_WINDOW) if t["run_id"] not in seen]
         finally:
             ledger.close()
     except Exception:  # noqa: BLE001  an alert must not fail: the unit's own push goes instead
@@ -146,7 +156,7 @@ def alert_unit(
     status: Callable[[str], tuple[str, str]] = unit_status,
     sender=None,
     job: str | None = None,
-    reap: Callable[[str, object], list[dict]] = reap_for_drain,
+    reap: Callable[..., list[dict]] = reap_for_drain,
     pid_of: Callable[[str], int | None] = main_pid,
 ) -> dict:
     """Record and push one failed-unit alert. Returns what was written. For a drain unit whose kill cut off a queued run
@@ -160,9 +170,7 @@ def alert_unit(
     job = job or job_of(unit)
     result, code = status(unit)
     rec = {"event": "unit-failed", "job": job, "unit": unit, "result": result, "exit_status": code}
-    told = reap(job, env)
-    pid = pid_of(unit) if told else None
-    mine = [t for t in told if t.get("queued") and pid is not None and t.get("owner_pid") == pid]
+    mine = reap(job, env, lambda: pid_of(unit))
     if mine:
         rec["reaped"] = [{"job": t["job"], "run_id": t["run_id"]} for t in mine]
         _write_line(env, {**rec, "pushed": False})

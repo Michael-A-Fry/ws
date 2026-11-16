@@ -689,7 +689,7 @@ def test_monthly_on_both_schedulers():
 def test_the_reaper_runs_every_two_minutes_on_both_schedulers(box, write_job, env):
     files = systemd.render_watch(env, WS)
     assert 'ExecStart="/opt/ws/bin/ws" "queue" "reap"' in files["ws-queue-reap.service"]
-    assert "OnFailure=ws-alert@%n.service" in files["ws-queue-reap.service"]
+    assert "OnFailure=" not in files["ws-queue-reap.service"]  # a broken queue must not alert every two minutes
     assert "OnCalendar=*-*-* *:00/2:00" in files["ws-queue-reap.timer"]
     plist = plistlib.loads(launchd.render_reaper(env, WS).encode())
     assert plist["ProgramArguments"] == [*WS, "queue", "reap"] and plist["StartInterval"] == 120
@@ -792,3 +792,32 @@ def test_schedule_script_stops_a_script_past_its_timeout(box, write_job, capsys)
     path, sha = _private_script(box, "#!/bin/sh\nsleep 30\n")
     write_job("upkeep", script_job(path, sha).replace("timeout_s = 600", "timeout_s = 0.5"))
     assert cli.main(["schedule", "script", "upkeep"]) == 124 and "timeout" in capsys.readouterr().err
+
+
+def test_a_slot_the_clocks_skipped_is_the_one_before():
+    """daily 02:30 on the morning New York's clocks jump from 02:00 to 03:00: there is no 02:30 today, so the latest
+    slot at or before 03:00:30 is yesterday's, never one later than now."""
+    zoneinfo = pytest.importorskip("zoneinfo")
+    try:
+        ny = zoneinfo.ZoneInfo("America/New_York")
+    except zoneinfo.ZoneInfoNotFoundError:
+        pytest.skip("no time zone data here")
+    now = datetime(2026, 3, 8, 7, 0, 30, tzinfo=UTC)  # 03:00:30 EDT, just after the jump
+    got = jobs.latest_slot(jobs.parse_schedule("daily 02:30", "t"), now, ny)
+    assert got <= now and got == datetime(2026, 3, 7, 7, 30, tzinfo=UTC)  # 02:30 EST the day before
+
+
+def test_every_tick_unit_gets_the_longest_runner_limit(box, write_job, env):
+    """A tick unit drains the whole queue, so it may be running another job's longer run: its limit is the longest."""
+    write_job("daily", KEYED_JOB)
+    write_job("long", KEYED_JOB.replace("timeout_s = 600", "timeout_s = 3000").replace("daily 03:30", "daily 04:00"))
+    write_job("sub", AI_JOB)  # `ws run` keeps its own limit
+    got = {s.name: s for s in jobs.scheduled(env)}
+    assert got["daily"].timeout_s == got["long"].timeout_s == 3000 and got["sub"].timeout_s == 600
+
+
+def test_schedule_script_is_refused_in_a_gated_session(box, write_job, capsys, monkeypatch):
+    path, sha = _private_script(box, "#!/bin/sh\nexit 0\n")
+    write_job("upkeep", script_job(path, sha))
+    monkeypatch.setenv("WS_GATED_SESSION", "1")
+    assert cli.main(["schedule", "script", "upkeep"]) == 3 and "gated session" in capsys.readouterr().err

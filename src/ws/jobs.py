@@ -84,7 +84,7 @@ import json
 import os
 import re
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -325,7 +325,19 @@ def latest_slot(when: When, now: datetime, tz=None) -> datetime:
             if slot > local:
                 slot = slot.replace(year=slot.year - (slot.month == 1), month=slot.month - 1 or 12)
     # the wall-clock slot read back in its zone, so across a daylight-saving change the offset is the slot's own
-    return (slot.astimezone() if tz is None else slot.replace(tzinfo=tz)).astimezone(UTC)
+    out = _utc(slot, tz)
+    if out > now and when.kind in ("daily", "weekly", "monthly"):
+        # a wall-clock time the clocks skipped today (a spring-forward gap) reads as later than now: the slot before
+        if when.kind == "monthly":
+            slot = slot.replace(year=slot.year - (slot.month == 1), month=slot.month - 1 or 12)
+        else:
+            slot -= timedelta(days=1 if when.kind == "daily" else 7)
+        out = _utc(slot, tz)
+    return out
+
+
+def _utc(wall: datetime, tz) -> datetime:
+    return (wall.astimezone() if tz is None else wall.replace(tzinfo=tz)).astimezone(UTC)
 
 
 def parse_rate(text: str, where: str) -> float:
@@ -791,13 +803,18 @@ def scheduled(env: dict | None = None) -> list[Scheduled]:
             Scheduled(
                 path.stem,
                 when,
-                command or ("queue", "tick", path.stem, "--slot", "schedule", "--run"),
+                command or _tick(path.stem),
                 timeout_s=timeout_s,
                 expected_rate_s=rate_s,
                 log=d.get("log") if d.get("log") in LOG_KINDS else "file",
             )
         )
-    return out
+    # a tick unit drains the whole queue, so it may be running another job's run when its own limit comes: each gets
+    # the longest limit of them (no limit if one has none), so systemd never kills a drain in the middle of a run
+    ticks = [s for s in out if s.argv[:2] == ("queue", "tick")]
+    limits = [s.timeout_s for s in ticks]
+    longest = None if None in limits or not limits else max(limits)
+    return [replace(s, timeout_s=longest) if s in ticks else s for s in out]
 
 
 def credential_kind(job: Job) -> str:
@@ -817,6 +834,10 @@ def credential_kind(job: Job) -> str:
         except ValueError:
             pass
     return "subscription"
+
+
+def _tick(name: str) -> tuple[str, ...]:  # what a runner job's timer runs
+    return ("queue", "tick", name, "--slot", "schedule", "--run")
 
 
 def check_options(job: Job, allowed: set[str]) -> None:

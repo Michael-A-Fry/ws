@@ -128,7 +128,8 @@ def render_watch(env, ws_cmd: list[str]) -> dict[str, str]:
         + "[Unit]\nDescription=ws dead-man check (hourly)\n\n[Timer]\nOnCalendar=*-*-* *:07:00\nPersistent=true\n"
         + f"Unit={DEADMAN}.service\n\n[Install]\nWantedBy=timers.target\n",
         f"{REAPER}.service": _header("ws's scheduler role")
-        + f"[Unit]\nDescription=ws queue reaper: record and tell runs whose process is gone\nOnFailure={ALERT}\n\n"
+        # no OnFailure=: a queue that cannot be read would alert every two minutes; the next run's admission says so
+        + "[Unit]\nDescription=ws queue reaper: record and tell runs whose process is gone\n\n"
         + f"[Service]\nType=oneshot\nSlice={SLICE}\n{env_text}\nExecStart={reap}\nTimeoutStartSec=120\n",
         f"{REAPER}.timer": _header("ws's scheduler role")
         + f"[Unit]\nDescription=ws queue reaper (every {REAP_EVERY_MIN} minutes)\n\n"

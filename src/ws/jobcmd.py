@@ -71,7 +71,7 @@ def _power(d: dict) -> Power:
     p = Power()
     for s in d.get("secrets") or []:
         if isinstance(s, dict):
-            p.secrets.add(f"{s.get('name')}@{str(s.get('host', '')).lower()}")
+            p.secrets.add(f"{s.get('name')}@{str(s.get('host', '')).lower()} for {s.get('purpose') or 'run'}")
     opts = d.get("runner_options") if isinstance(d.get("runner_options"), dict) else {}
     tools = opts.get("allowed_tools") if isinstance(opts.get("allowed_tools"), list) else []
     p.tools = {t for t in tools if isinstance(t, str)}
@@ -82,28 +82,26 @@ def _power(d: dict) -> Power:
     return p
 
 
-def widening(new: Power, base: Power | None, installed: list[Power]) -> list[str]:
-    """What `new` adds. Against `base` (the job it replaces) when there is one, else against every installed job."""
-    if base is not None:
-        have_s, have_t, have_c = base.secrets, base.tools, {base.command} - {None}
-        budget = base.budget
-        sched_new = new.schedule is not None and new.schedule != base.schedule
-    else:
-        have_s = set().union(*(p.secrets for p in installed)) if installed else set()
-        have_t = set().union(*(p.tools for p in installed)) if installed else set()
-        have_c = {p.command for p in installed} - {None}
-        budgets = [p.budget for p in installed if p.budget is not None]
-        budget = max(budgets) if budgets else None
-        sched_new = new.schedule is not None
-    out = [f"secret {s}" for s in sorted(new.secrets - have_s)]
-    out += [f"tool {t}" for t in sorted(new.tools - have_t)]
-    if sched_new:
+def _against(new: Power, base: Power, schedule_is_new: bool) -> list[str]:
+    out = [f"secret {s}" for s in sorted(new.secrets - base.secrets)]
+    out += [f"tool {t}" for t in sorted(new.tools - base.tools)]
+    if new.schedule is not None and (schedule_is_new or new.schedule != base.schedule):
         out.append(f"schedule {new.schedule}")
-    if new.command is not None and new.command not in have_c:
+    if new.command is not None and new.command != base.command:
         out.append(f"command {new.command}")
-    if new.budget is not None and (budget is None or new.budget > budget):
+    if new.budget is not None and (base.budget is None or new.budget > base.budget):
         out.append(f"budget_usd {new.budget:g}")
     return out
+
+
+def widening(new: Power, base: Power | None, installed: list[Power]) -> list[str]:
+    """What `new` adds. Against `base` (the job it replaces) when there is one. A new job is held against each installed
+    job on its own and the closest one counts, so it cannot gather one job's secret and another's tool unasked; its
+    timer is always new."""
+    if base is not None:
+        return _against(new, base, schedule_is_new=False)
+    options = [_against(new, p, schedule_is_new=True) for p in installed] or [_against(new, Power(), True)]
+    return min(options, key=len)
 
 
 def _tool_problem(tool: str, allow_mcp: tuple[str, ...]) -> str | None:
@@ -195,6 +193,22 @@ def _installed(folder: Path, skip: str | None) -> list[Power]:
     return out
 
 
+def _taken(folder: Path, pins: dict[str, dict], name: str) -> set[str]:
+    """The files of every other job: their .toml, the files their pins list and the prompt_file each names."""
+    out = {p.name for p in folder.glob("*.toml") if p.stem != name} if folder.is_dir() else set()
+    for other, pin in pins.items():
+        if other != name and isinstance(pin.get("files"), list):
+            out |= {f for f in pin["files"] if isinstance(f, str)}
+    for p in folder.glob("*.toml") if folder.is_dir() else ():
+        if p.stem == name:
+            continue
+        with contextlib.suppress(OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+            pf = tomllib.loads(p.read_text(encoding="utf-8")).get("prompt_file")
+            if isinstance(pf, str):
+                out.add(pf)
+    return out | {jobs.PINS}
+
+
 def _write_private(path: Path, data: bytes) -> None:
     """A new file, mode 0600, then an atomic rename over the old one."""
     tmp = path.parent / f".{path.name}.{os.getpid()}.{pysecrets.token_hex(4)}.tmp"
@@ -257,8 +271,13 @@ def _read_source(src: Path) -> tuple[str, bytes, dict, tuple[str, bytes] | None]
     prompt = None
     pf = d.get("prompt_file")
     if pf is not None:
-        if not isinstance(pf, str) or Path(pf).name != pf or pf.startswith(".") or not pf:
-            raise WsError("bad_input", f"{src}: prompt_file must be a file name next to the job file", "", 2)
+        if not isinstance(pf, str) or not pf or Path(pf).name != pf or pf.startswith(".") or pf.endswith(".toml"):
+            raise WsError(
+                "bad_input",
+                f"{src}: prompt_file must be a file name next to the job file, not a .toml or a dot file",
+                "",
+                2,
+            )
         try:
             prompt = (pf, (src.parent / pf).read_bytes())
         except OSError as e:
@@ -301,6 +320,17 @@ def cmd_add(args: argparse.Namespace) -> int:
     folder = jobs.jobs_dir(env)
     dest = folder / f"{name}.toml"
     sha = jobs.digest(raw, prompt)
+    try:
+        pins = jobs.read_pins(folder) if folder.is_dir() else {}
+    except jobs.JobError as e:
+        raise WsError("bad_config", str(e), "fix or remove the pins file, then add the job again") from e
+    if prompt is not None and prompt[0] in _taken(folder, pins, name):
+        raise WsError(
+            "refused", f"prompt_file {prompt[0]} is another job's file; ws will not write over it", "rename it", 3
+        )
+    for f in [dest] + ([folder / prompt[0]] if prompt else []):
+        if f.is_symlink():
+            raise WsError("refused", f"{f} is a link; ws will not write through it", "remove the link", 3)
     replacing = dest.exists()
     old_text = ""
     base: Power | None = None
@@ -323,8 +353,8 @@ def cmd_add(args: argparse.Namespace) -> int:
                 f"job {name} is installed already" + ("" if diff else " and is the same"),
                 f"`ws job add {args.path} --replace` puts the change above in",
             )
-        pin = jobs.read_pins(folder).get(name) if folder.is_dir() else None
-        if pin is not None and pin.get("sha256") == sha:
+        pin = pins.get(name)
+        if pin is not None and pin.get("sha256") == sha and jobs.file_digest(folder, name) == sha:
             print(f"ws: job {name} is installed and unchanged (0 changes)")
             return 0
         if diff and not args.json:
@@ -340,10 +370,6 @@ def cmd_add(args: argparse.Namespace) -> int:
             )
         approved = True
 
-    if prompt is not None and (folder / prompt[0]).is_symlink():
-        raise WsError("refused", f"{folder / prompt[0]} is a link; ws will not write through it", "remove the link", 3)
-    if dest.is_symlink():
-        raise WsError("refused", f"{dest} is a link; ws will not write through it", "remove the link", 3)
     try:
         folder.mkdir(mode=0o700, parents=True, exist_ok=True)
         jobs.check_private(folder)
@@ -351,6 +377,12 @@ def cmd_add(args: argparse.Namespace) -> int:
         if prompt is not None:
             _write_private(folder / prompt[0], prompt[1])
         _write_private(dest, raw)
+        old = pins.get(name, {}).get("files", [])
+        keep = {dest.name, *([prompt[0]] if prompt else [])} | _taken(folder, pins, name)
+        for f in old if isinstance(old, list) else []:
+            if isinstance(f, str) and Path(f).name == f and f not in keep:
+                with contextlib.suppress(FileNotFoundError):
+                    (folder / f).unlink()  # the prompt_file the replaced job had, which nothing uses now
         pins[name] = {
             "sha256": sha,
             "files": [dest.name] + ([prompt[0]] if prompt else []),
@@ -428,9 +460,10 @@ def cmd_remove(args: argparse.Namespace) -> int:
             except (ValueError, OSError) as e:
                 stopped = f"; its timer could not be stopped ({e}): run `ws schedule remove {name}`"
     files = pin.get("files", [dest.name]) if pin else [dest.name]
+    shared = _taken(folder, pins, name)
     removed = []
     for f in files:
-        if not isinstance(f, str) or Path(f).name != f:
+        if not isinstance(f, str) or Path(f).name != f or f in shared:
             continue
         with contextlib.suppress(FileNotFoundError):
             (folder / f).unlink()

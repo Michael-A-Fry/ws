@@ -249,7 +249,10 @@ def test_widening_against_the_job_replaced():
 
 def test_widening_of_a_new_job_against_every_installed_one():
     installed = [P(tools={"Read"}, budget=1.0), P(secrets={"a@h"}, budget=3.0)]
-    assert jobcmd.widening(P(tools={"Read"}, secrets={"a@h"}, budget=2.0), None, installed) == []
+    assert jobcmd.widening(P(tools={"Read"}, budget=1.0), None, installed) == []
+    assert jobcmd.widening(P(secrets={"a@h"}, budget=2.0), None, installed) == []
+    # one job's tool and another's secret together is a combination no installed job has
+    assert jobcmd.widening(P(tools={"Read"}, secrets={"a@h"}, budget=1.0), None, installed) != []
     assert jobcmd.widening(P(schedule="daily 07:00"), None, installed) == ["schedule daily 07:00"]
     assert jobcmd.widening(P(command="backup"), None, installed) == ["command backup"]
 
@@ -323,3 +326,77 @@ def test_add_runs_schedule_apply_for_a_scheduled_job(home, tmp_path, capsys, mon
     assert "2 written" in out
     assert run(capsys, "job", "add", str(s), "--replace", "--no-apply")[0] == 0
     assert calls == [1]
+
+
+# ---- the review's cases -----------------------------------------------------------------------------------------------
+
+
+def test_a_prompt_file_may_not_name_another_jobs_file(home, tmp_path, capsys):
+    folder = jobs.jobs_dir()
+    folder.mkdir(mode=0o700)
+    victim = 'runner = "claude-code"\nmodel = "m"\nprompt = "hi"\n'
+    (folder / "victim.toml").write_text(victim, encoding="utf-8")
+    code, _, err = run(
+        capsys, "job", "add", str(src(tmp_path, JOB.replace('"triage.md"', '"victim.toml"'), prompt=None))
+    )
+    assert code == 2 and "not a .toml" in err
+    assert (folder / "victim.toml").read_text(encoding="utf-8") == victim
+    for bad in (".pins.json", ".hidden"):
+        code, _, err = run(
+            capsys, "job", "add", str(src(tmp_path, JOB.replace('"triage.md"', f'"{bad}"'), prompt=None))
+        )
+        assert code == 2, bad
+
+
+def test_a_prompt_file_may_not_be_another_jobs_prompt(home, tmp_path, capsys):
+    assert run(capsys, "job", "add", str(src(tmp_path)))[0] == 0
+    other = src(tmp_path, JOB, name="second")  # names triage.md, which job triage owns
+    code, _, err = run(capsys, "job", "add", str(other))
+    assert code == 3 and "another job's file" in err
+    assert (jobs.jobs_dir() / "triage.md").read_text(encoding="utf-8") == "Sort the mail.\n"
+
+
+def test_a_damaged_pins_file_on_replace_is_a_typed_error(home, tmp_path, capsys):
+    s = src(tmp_path)
+    assert run(capsys, "job", "add", str(s))[0] == 0
+    (jobs.jobs_dir() / jobs.PINS).write_text("{nope", encoding="utf-8")
+    code, _, err = run(capsys, "job", "add", str(s), "--replace")
+    assert code == 1 and "every job is refused" in err
+
+
+def test_replace_repairs_a_tampered_copy(home, tmp_path, capsys):
+    s = src(tmp_path)
+    assert run(capsys, "job", "add", str(s))[0] == 0
+    f = jobs.jobs_dir() / "triage.toml"
+    f.write_text(JOB + "# changed\n", encoding="utf-8")
+    code, out, err = run(capsys, "job", "add", str(s), "--replace")
+    assert code == 0 and "0 changes" not in out, err
+    assert jobs.load("triage").name == "triage"
+
+
+def test_replace_with_a_new_prompt_name_removes_the_old_prompt(home, tmp_path, capsys):
+    assert run(capsys, "job", "add", str(src(tmp_path)))[0] == 0
+    s = src(tmp_path, JOB.replace('"triage.md"', '"sort.md"'), prompt=None)
+    (s.parent / "sort.md").write_text("Sort.\n", encoding="utf-8")
+    assert run(capsys, "job", "add", str(s), "--replace")[0] == 0
+    folder = jobs.jobs_dir()
+    assert not (folder / "triage.md").exists() and (folder / "sort.md").is_file()
+    assert jobs.read_pins(folder)["triage"]["files"] == ["triage.toml", "sort.md"]
+
+
+def test_a_purpose_change_counts_as_more_power(home):
+    a = jobcmd._power({"secrets": [{"name": "v", "host": "h", "purpose": "run"}]})
+    b = jobcmd._power({"secrets": [{"name": "v", "host": "h", "purpose": "review"}]})
+    assert jobcmd.widening(b, a, []) != []
+
+
+def test_a_link_is_refused_before_any_approval_is_used(home, tmp_path, capsys, monkeypatch):
+    folder = jobs.jobs_dir()
+    folder.mkdir(mode=0o700)
+    (folder / "triage.toml").symlink_to(tmp_path / "elsewhere.toml")
+    monkeypatch.setattr(jobcmd, "_in_session", lambda env: True)
+    code, _, err = run(capsys, "job", "add", str(src(tmp_path)))
+    assert code == 3 and "is a link" in err
+    from ws import approvals
+
+    assert approvals.pending(approvals.approvals_dir()) == []

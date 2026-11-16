@@ -375,3 +375,114 @@ def test_the_first_commit_of_a_new_repository_is_scanned(box):
     (fresh / "f.txt").write_text("fine\n")
     git(fresh, "add", "f.txt")
     assert check(fresh) == 0
+
+
+def wired(repo):
+    configure()
+    assert cli.main(["commit-wall", "install", "--repo", str(repo)]) == 0
+
+
+@needs_git
+@pytest.mark.parametrize("where", ["subject", "body", "content"])
+def test_git_am_runs_the_wall(repo, box, where):
+    configure()
+    git(repo, "checkout", "-q", "-b", "side")
+    (repo / "p.txt").write_text(f"{PLANT}\n" if where == "content" else "fine\n")
+    git(repo, "add", "p.txt")
+    msg = {"subject": f"adds {PLANT}", "body": f"adds p\n\nthanks {PLANT}", "content": "adds p"}[where]
+    git(repo, "commit", "-q", "-m", msg, "--no-verify")
+    patch = git(repo, "format-patch", "-1", "--stdout")
+    (box / "p.patch").write_text(patch)
+    git(repo, "checkout", "-q", "main")
+    wired(repo)
+    out = git(repo, "am", str(box / "p.patch"), check=False)
+    assert out.startswith("1\n") and "commit wall" in out, out  # refused by the wall, not by something else
+    git(repo, "am", "--abort", check=False)
+    assert not (repo / "p.txt").exists()  # nothing was applied
+
+
+@needs_git
+def test_a_clean_patch_applies_through_the_wall(repo, box):
+    configure()
+    git(repo, "checkout", "-q", "-b", "side")
+    (repo / "p.txt").write_text("fine\n")
+    git(repo, "add", "p.txt")
+    git(repo, "commit", "-q", "-m", "adds p")
+    (box / "p.patch").write_text(git(repo, "format-patch", "-1", "--stdout"))
+    git(repo, "checkout", "-q", "main")
+    wired(repo)
+    assert git(repo, "am", str(box / "p.patch"), check=False).startswith("0\n")
+
+
+def remote_for(repo, box):
+    bare = box / "remote.git"
+    git(box, "init", "-q", "--bare", str(bare))
+    git(repo, "remote", "add", "origin", str(bare))
+    return bare
+
+
+@needs_git
+def test_a_push_scans_commits_made_without_a_commit_hook_stash_and_commit_tree(repo, box):
+    wired(repo)
+    remote_for(repo, box)
+    assert git(repo, "push", "-q", "origin", "main", check=False).startswith("0\n")  # nothing planted yet
+    # (1) a stash whose message holds the pattern, fast-forwarded to
+    (repo / "a.txt").write_text("hello\nchanged\n")
+    git(repo, "stash", "push", "-q", "-m", f"note {PLANT}")
+    git(repo, "merge", "-q", "--ff-only", "stash@{0}")
+    out = git(repo, "push", "origin", "main", check=False)
+    assert out.startswith("1\n") and "commit wall" in out and PLANT not in out.lower()
+    git(repo, "reset", "-q", "--hard", "HEAD~1")
+    # (2) commit-tree with the pattern in the message
+    tree = git(repo, "write-tree").strip()
+    sha = git(repo, "commit-tree", "-p", "HEAD", "-m", f"note {PLANT}", tree).strip()
+    git(repo, "merge", "-q", "--ff-only", sha)
+    assert git(repo, "push", "origin", "main", check=False).startswith("1\n")
+    git(repo, "reset", "-q", "--hard", "HEAD~1")
+    # (3) commit-tree with the pattern in the content and a clean message
+    (repo / "b.txt").write_text(f"{PLANT}\n")
+    git(repo, "add", "b.txt")
+    tree = git(repo, "write-tree").strip()
+    git(repo, "reset", "-q", "--hard")
+    sha = git(repo, "commit-tree", "-p", "HEAD", "-m", "clean message", tree).strip()
+    git(repo, "merge", "-q", "--ff-only", sha)
+    out = git(repo, "push", "origin", "main", check=False)
+    assert out.startswith("1\n") and "b.txt" in out
+    git(repo, "reset", "-q", "--hard", "HEAD~1")
+    assert git(repo, "push", "origin", "main", check=False).startswith("0\n")  # back to clean: goes through
+
+
+@needs_git
+def test_a_push_of_a_new_branch_is_scanned_and_an_old_pre_push_still_runs(repo, box):
+    configure()
+    old = box / "oldhooks"
+    old.mkdir()
+    (old / "pre-push").write_text(f"#!/bin/sh\ncat > {box / 'seen'}\necho OLD-PRE-PUSH >&2\nexit 0\n")
+    (old / "pre-push").chmod(0o755)
+    git(repo, "config", "--local", "core.hooksPath", str(old))
+    assert cli.main(["commit-wall", "install", "--repo", str(repo)]) == 0
+    remote_for(repo, box)
+    out = git(repo, "push", "origin", "main", check=False)
+    assert out.startswith("0\n") and "OLD-PRE-PUSH" in out
+    assert "refs/heads/main" in (box / "seen").read_text()  # the old hook still got git's input on stdin
+    git(repo, "checkout", "-q", "-b", "topic")
+    (repo / "t.txt").write_text(f"{PLANT}\n")
+    git(repo, "add", "t.txt")
+    git(repo, "commit", "-q", "-m", "plant", "--no-verify")
+    assert git(repo, "push", "origin", "topic", check=False).startswith("1\n")
+    git(repo, "push", "origin", "--delete", "topic", check=False)  # a deletion sends nothing: not scanned
+
+
+@needs_git
+def test_status_says_when_hooks_path_does_not_point_at_the_wall(repo, capsys):
+    wired(repo)
+    assert cli.main(["commit-wall", "status"]) == 0
+    capsys.readouterr()
+    git(repo, "config", "--local", "core.hooksPath", "/dev/null")
+    assert cli.main(["commit-wall", "status"]) == 1
+    err = capsys.readouterr().err
+    assert "NOT ON" in err and "points elsewhere" in err
+    assert cli.main(["commit-wall", "status", "--json"]) == 1
+    assert json.loads(capsys.readouterr().out)["data"]["not_wired"][0]["why"] == "core.hooksPath points elsewhere"
+    git(repo, "config", "--local", "--unset", "core.hooksPath")
+    assert cli.main(["commit-wall", "status"]) == 1

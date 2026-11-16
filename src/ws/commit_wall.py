@@ -10,7 +10,9 @@ that branch, and was scanned or excepted there) is left out; the same text in an
 file is read as text (`--text --no-textconv`, so a NUL byte, a `-diff` attribute or padding can't hide a line), the lines are split
 on newlines only, invalid UTF-8 is read as it is, and the file names are scanned too. Text is matched as written and again
 after Unicode NFKC normalisation. A commit message is scanned in full, `#` lines included (`-m` and `--cleanup=verbatim` keep
-them). `--stage commit-msg FILE` scans the message in FILE. With no pattern (`patterns.toml` missing or empty) the check
+them). `--stage commit-msg FILE` scans the message in FILE. `--stage pre-push` reads the lines git gives a pre-push hook and scans the
+content and message of every commit the push would send, which catches a commit made with no commit hook (`git stash` then a
+fast-forward, `git commit-tree`). `git am` runs `applypatch-msg` (the message) and `pre-applypatch` (the staged patch). With no pattern (`patterns.toml` missing or empty) the check
 refuses: a wall with nothing to look for is a gap, not a pass.
 
 `<config>/commit-wall/exceptions.toml` lists what to let through, as `[[allow]]` tables with any of `pattern` (its
@@ -40,6 +42,7 @@ import shlex
 import shutil
 import stat
 import subprocess
+import sys
 import tomllib
 import unicodedata
 from dataclasses import dataclass
@@ -52,7 +55,7 @@ COMMAND = "commit-wall"
 
 FOLDER = "commit-wall"
 GIT_SECONDS = 30
-HOOKS = ("pre-commit", "pre-merge-commit", "commit-msg")
+HOOKS = ("pre-commit", "pre-merge-commit", "commit-msg", "applypatch-msg", "pre-applypatch", "pre-push")
 EXCEPTIONS_HEADER = (
     "# Only a person adds to this file. A session that edits it is working around the commit wall.\n"
     "# Each [[allow]] needs at least one of: pattern (a pattern's name), path (a glob), text (a substring of the line).\n"
@@ -254,6 +257,47 @@ def staged_lines(repo: str) -> list[tuple[str, int, str]]:
     return lines + named
 
 
+ZERO = "0" * 40
+
+
+def pushed_hits(
+    repo: str, remote: str, stdin: str, patterns: list[Pattern], allows: list[Allow]
+) -> tuple[list[Hit], int]:
+    """Scan the content and message of every commit the push lines (git's pre-push input) would send. A new branch is every
+    commit not already on a remote-tracking branch of `remote`; an update is `<remote sha>..<local sha>`, or the same as a new
+    branch when the remote's commit isn't here. A deletion sends nothing."""
+    hits: list[Hit] = []
+    scanned = 0
+    for row in stdin.splitlines():
+        parts = row.split()
+        if len(parts) != 4 or set(parts[1]) == {"0"}:
+            continue
+        local, remote_sha = parts[1], parts[3]
+        known = set(remote_sha) != {"0"} and _run(repo, "cat-file", "-e", f"{remote_sha}^{{commit}}").returncode == 0
+        floor = [remote_sha] if known else [f"--remotes={remote}"]
+        for sha in _git(repo, "rev-list", local, "--not", *floor).split():
+            body = _git(repo, "log", "-1", "--format=%B", sha)
+            lines = [(f"(message of {sha[:10]})", i, tx) for i, tx in enumerate(body.split("\n"), 1)]
+            parent = bool(_git(repo, "rev-list", "--parents", "-1", sha).split()[1:])
+            diff = _diff(
+                repo,
+                "diff-tree",
+                "--no-commit-id",
+                "-r",
+                "-p",
+                *(["-m", "--first-parent"] if parent else ["--root"]),
+                sha,
+            )
+            lines += added_lines(diff)
+            names = _git(
+                repo, "diff-tree", "--no-commit-id", "-r", "--name-only", "--no-renames", "-z", "--root", sha
+            ).split("\0")
+            lines += [(n, 0, n) for n in names if n]
+            scanned += len(lines)
+            hits += [Hit(f"{sha[:10]} {h.where}", h.line, h.pattern) for h in scan(lines, patterns, allows)]
+    return hits, scanned
+
+
 def message_lines(file: str) -> list[tuple[str, int, str]]:
     try:
         text = _decode(Path(file).read_bytes())
@@ -285,6 +329,9 @@ def cmd_check(args: argparse.Namespace) -> int:
             "add a [[pattern]] to it (see its header), or run `ws commit-wall uninstall`",
             1,
         )
+    if args.stage == "pre-push":
+        hits, scanned = pushed_hits(repo, args.remote or "", sys.stdin.read(), patterns, allows)
+        return _report(args, hits, len(patterns), scanned, base)
     if args.stage == "commit-msg":
         if not args.file:
             raise WsError(
@@ -293,10 +340,13 @@ def cmd_check(args: argparse.Namespace) -> int:
         lines = message_lines(args.file)
     else:
         lines = staged_lines(repo)
-    hits = scan(lines, patterns, allows)
+    return _report(args, scan(lines, patterns, allows), len(patterns), len(lines), base)
+
+
+def _report(args: argparse.Namespace, hits: list[Hit], n_patterns: int, scanned: int, base: Path) -> int:
     data = {
-        "patterns": len(patterns),
-        "scanned_lines": len(lines),
+        "patterns": n_patterns,
+        "scanned_lines": scanned,
         "hits": [{"where": h.where, "line": h.line, "pattern": h.pattern} for h in hits],
     }
     if hits:
@@ -346,20 +396,25 @@ def _write_prior(data: dict, env=None) -> None:
 
 
 def _script(name: str, ws: list[str], prior_dir: str, wall_dir: Path) -> str:
-    """One hook of ours: the check (for pre-commit, pre-merge-commit and commit-msg), then the hook the repository had. The check
-    is told which config folder to read, so a different WS_HOME in the committing shell can't make it read an empty one."""
-    run = ""
+    """One hook of ours: the check, then the hook the repository had. The check is told which config folder to read, so a different
+    WS_HOME in the committing shell can't make it read an empty one. Which check each hook runs: the staged diff for pre-commit,
+    pre-merge-commit and pre-applypatch; the message file for commit-msg and applypatch-msg; the pushed commits for pre-push."""
+    head = "#!/bin/sh\n# written by `ws commit-wall install`; `ws commit-wall uninstall` removes it\n"
     check = f"{shlex.join(ws)} commit-wall check --wall-dir {shlex.quote(str(wall_dir))}"
-    if name in ("pre-commit", "pre-merge-commit"):
+    old = f"{shlex.quote(prior_dir)}/{name}"
+    if name == "pre-push":  # git feeds the refs on stdin: keep them for the check and for the hook the repository had
+        return (
+            f'{head}tmp=$(mktemp) || exit 1\ncat > "$tmp"\n'
+            f'{check} --stage pre-push --remote "$1" < "$tmp" || {{ rm -f "$tmp"; exit 1; }}\n'
+            f'old={old}\nif [ -x "$old" ]; then "$old" "$@" < "$tmp"; rc=$?; rm -f "$tmp"; exit $rc; fi\n'
+            'rm -f "$tmp"\nexit 0\n'
+        )
+    run = ""
+    if name in ("pre-commit", "pre-merge-commit", "pre-applypatch"):
         run = f"{check} --stage pre-commit || exit 1\n"
-    elif name == "commit-msg":
+    elif name in ("commit-msg", "applypatch-msg"):
         run = f'{check} --stage commit-msg "$1" || exit 1\n'
-    return (
-        "#!/bin/sh\n# written by `ws commit-wall install`; `ws commit-wall uninstall` removes it\n"
-        f"{run}"
-        f"old={shlex.quote(prior_dir)}/{name}\n"
-        '[ -x "$old" ] && exec "$old" "$@"\nexit 0\n'
-    )
+    return f'{head}{run}old={old}\n[ -x "$old" ] && exec "$old" "$@"\nexit 0\n'
 
 
 def _hook_names(prior_dir: str) -> list[str]:
@@ -432,29 +487,43 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
     return 0
 
 
+def _wired(rid: str, repo: str) -> str:
+    """'' when the repository's core.hooksPath really is the wall's folder, else what is wrong."""
+    got = _run(repo, "config", "--local", "--type=path", "--get", "core.hooksPath")
+    if got.returncode != 0:
+        return "core.hooksPath is not set" if got.returncode == 1 else "the repository can't be read"
+    here = os.path.realpath(folder() / "hooks" / rid)
+    return (
+        ""
+        if os.path.realpath(os.path.join(repo, _decode(got.stdout).strip())) == here
+        else "core.hooksPath points elsewhere"
+    )
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     patterns, allows = load_patterns(), load_exceptions()
-    data = {
-        "patterns": len(patterns),
-        "exceptions": len(allows),
-        "repos": sorted(v["repo"] for v in _read_prior().values()),
-    }
+    on, broken = [], []
+    for rid, v in sorted(_read_prior().items()):
+        why = _wired(rid, v["repo"])
+        (broken if why else on).append({"repo": v["repo"], "why": why} if why else v["repo"])
+    data = {"patterns": len(patterns), "exceptions": len(allows), "repos": sorted(on), "not_wired": broken}
     if args.json:
         output.result(data)
     else:
-        print(
-            f"ws: {data['patterns']} pattern(s), {data['exceptions']} exception(s), on for {len(data['repos'])} repo(s)"
-        )
+        print(f"ws: {data['patterns']} pattern(s), {data['exceptions']} exception(s), on for {len(on)} repo(s)")
         for r in data["repos"]:
             print(f"  {r}")
-    return 0
+        for b in broken:
+            print(f"  NOT ON: {b['repo']} ({b['why']}): run `ws commit-wall install` there", file=sys.stderr)
+    return 1 if broken else 0
 
 
 def register(sub) -> None:
     c = sub.add_parser("commit-wall", help="refuse a commit whose added lines or message match a pattern you supplied")
     cs = c.add_subparsers(dest="commit_wall_command", required=True)
     k = cs.add_parser("check", help="scan the staged diff (or a commit message) now; exit 1 on a hit")
-    k.add_argument("--stage", choices=("pre-commit", "commit-msg"), default="pre-commit")
+    k.add_argument("--stage", choices=("pre-commit", "commit-msg", "pre-push"), default="pre-commit")
+    k.add_argument("--remote", help="--stage pre-push: the remote name git gives the hook")
     k.add_argument("--repo", default=".", help="the repository (default: here)")
     k.add_argument("--wall-dir", help="the config folder to read (the hooks pass the one they were installed with)")
     k.add_argument("file", nargs="?", help="the message file, for --stage commit-msg")

@@ -1011,7 +1011,7 @@ ws ships no pattern: the wall reads `<config>/commit-wall/patterns.toml` (a `[[p
 (`[[allow]]` with any of `pattern`, `path` and `text`; only a person adds to it, and the gate refuses a session's writes
 to the folder). A hit prints the file, the line and the pattern's name, never the matched text. A merge is scanned for
 the lines new to the merge, nothing is skipped (every file is read as text, file names and the whole message included),
-a check with no pattern refuses, and a hook that can't run `ws` blocks the commit.
+a check with no pattern refuses, `git am` and a push are checked too, and a hook that can't run `ws` blocks the commit.
 
 ### `ws commit-wall install`
 
@@ -1043,19 +1043,20 @@ ws commit-wall uninstall [-h] [--repo REPO]
 Scan the staged diff, or a commit message with `--stage commit-msg FILE`, now. Exit 1 on a hit.
 
 ```text
-ws commit-wall check [-h] [--stage {pre-commit,commit-msg}] [--repo REPO] [--wall-dir WALL_DIR] [file]
+ws commit-wall check [-h] [--stage {pre-commit,commit-msg,pre-push}] [--repo REPO] [--remote REMOTE] [--wall-dir WALL_DIR] [file]
 ```
 
 | Argument | Meaning |
 |---|---|
-| `--stage STAGE` | `pre-commit` (the staged diff, default) or `commit-msg`. |
+| `--stage STAGE` | `pre-commit` (the staged diff, default), `commit-msg` or `pre-push` (the commits a push would send, read from stdin). |
 | `--repo REPO` | The repository (default: here). |
+| `--remote REMOTE` | `--stage pre-push`: the remote name git gives the hook. |
 | `--wall-dir WALL_DIR` | The config folder to read (the hooks pass the one they were installed with). |
 | `file` | The message file, for `--stage commit-msg`. |
 
 ### `ws commit-wall status`
 
-The number of patterns and exceptions, and the repositories the wall is on for.
+The number of patterns and exceptions, and the repositories the wall is on for. A repository it recorded whose `core.hooksPath` no longer points at the wall is listed as not on, and the command exits 1.
 
 ```text
 ws commit-wall status [-h]

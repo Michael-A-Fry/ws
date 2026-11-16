@@ -62,6 +62,12 @@ decides who a caller is or what it may do come from: the account's own home fold
 policy, secrets registry, store) from it. A person whose ws folders are set by one of those variables is refused by
 `ws msg` until ws can read the layout from the runner's own start-up environment.
 
+Who asked, and the person. `requested_by` (the asking session's id, `person:<user>` or `unknown`) rides in the launch
+token (`asked_by` works it out in the launcher step, never from an argument) and is kept in the identity file; the copy in
+`sessions/` is for display. The person has positive proof only by reading the per-boot token in the secrets folder (hidden
+by every launch wall) that matches the digest in the identity folder (`init_person_token`, `person_proof`); no runner
+ancestor proves nothing. See ADR 0023.
+
 Records are pruned 30 days after their last change (`_KEEP_DAYS`); a data class's `retention_days` is the message
 store's own, not this.
 
@@ -75,6 +81,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -100,6 +107,9 @@ LAUNCH_ENV = "WS_LAUNCH"  # what the launcher exports and `ws session start` cla
 LAUNCH_TTL = 600  # seconds a launch token is good for: shared by `prepare` (writes it) and `start` (claims it)
 IDENTITY = "identity"  # <state>/identity: role and runner stamp, written by `start` only (see the module docstring)
 _TOKEN = re.compile(r"^[0-9a-f]{32}$")
+UNKNOWN = "unknown"  # `requested_by` of a session whose launch said nothing, and of a record from before the field
+PERSON = "person:"  # the sender prefix of the person who owns the account (never a session id: they hold no colon)
+_REQUESTED_BY = re.compile(r"^(unknown|person:[A-Za-z0-9._-]{1,64}|[A-Za-z0-9._-]{1,128})$")
 _PANE = re.compile(r"^%[0-9]{1,9}$")
 _UNSET = ...  # `update` leaves a field alone when it is not given (None is a value: it clears the field)
 _SHELLS = frozenset({"sh", "bash", "zsh", "dash", "fish", "ksh", "mksh", "ash", "csh", "tcsh", "busybox"})
@@ -448,6 +458,7 @@ class Record:
     runner_start: str | None = None
     context_loaded: bool = False  # `ws session load` has done the first-prompt load for this start
     context_ids: tuple[str, ...] = ()  # the ids of the records that load put in front of the session
+    requested_by: str = UNKNOWN  # who asked for this session: the launching session's id, `person:<user>` or unknown
 
     @classmethod
     def from_dict(cls, data: dict, session_id: str = "") -> Record:
@@ -481,6 +492,7 @@ class Record:
             runner_start=began if stamped else None,
             context_loaded=data.get("context_loaded") is True,
             context_ids=_ids(data.get("context_ids")),
+            requested_by=_asker(data.get("requested_by")),
         )
 
     def to_dict(self) -> dict:
@@ -508,7 +520,13 @@ class Record:
             out["context_loaded"] = True
         if self.context_ids:
             out["context_ids"] = list(self.context_ids)
+        if self.requested_by != UNKNOWN:
+            out["requested_by"] = self.requested_by
         return out
+
+
+def _asker(value) -> str:
+    return value if isinstance(value, str) and _REQUESTED_BY.fullmatch(value) else UNKNOWN
 
 
 def _env(env: dict | None) -> dict:
@@ -543,10 +561,13 @@ def _read_identity(path: Path) -> dict | None:
         "runner_start": began if stamped else None,
         "started_at": data["started_at"] if isinstance(data.get("started_at"), str) else "",
         "ts": data["ts"] if isinstance(data.get("ts"), str) else "",
+        "requested_by": _asker(data.get("requested_by")),
     }
 
 
-def _write_identity(env: dict, session_id: str, role: str, stamp: Proc | None, started_at: str) -> None:
+def _write_identity(
+    env: dict, session_id: str, role: str, stamp: Proc | None, started_at: str, requested_by: str = UNKNOWN
+) -> None:
     record: dict = {
         "schema": 1,
         "session_id": session_id,
@@ -556,14 +577,22 @@ def _write_identity(env: dict, session_id: str, role: str, stamp: Proc | None, s
     }
     if stamp:
         record["runner_pid"], record["runner_start"] = stamp.pid, stamp.start
+    if requested_by != UNKNOWN:
+        record["requested_by"] = requested_by
     _write(_identity_path(env, session_id), record)
 
 
 def _overlay(rec: Record, ident: dict | None) -> Record:
     """`rec` with the role and runner stamp the identity folder holds, whatever the sessions file says."""
     if ident is None or ident["session_id"] != rec.session_id:
-        return replace(rec, role="worker", runner_pid=None, runner_start=None)
-    return replace(rec, role=ident["role"], runner_pid=ident["runner_pid"], runner_start=ident["runner_start"])
+        return replace(rec, role="worker", runner_pid=None, runner_start=None, requested_by=UNKNOWN)
+    return replace(
+        rec,
+        role=ident["role"],
+        runner_pid=ident["runner_pid"],
+        runner_start=ident["runner_start"],
+        requested_by=ident["requested_by"],
+    )
 
 
 def read(session_id: str, env: dict | None = None) -> Record | None:
@@ -646,6 +675,126 @@ def resolve_caller(session_id: str | None = None) -> Record | None:
     return None
 
 
+# --- the person: positive proof that no agent is calling --------------------------------------------------------------
+
+PERSON_TOKEN = ".person-token"  # in the secrets folder, so every launch wall hides it (policy.secret_read_rules)
+PERSON_DIGEST = (
+    "person.sha256"  # in the identity folder: read-only to a walled session, so a planted token never matches
+)
+BOOT_ID = "/proc/sys/kernel/random/boot_id"  # changes at every boot; macOS has none, where a person send is refused
+_PERSON_USER = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+
+def peer_bound() -> bool:
+    """True in the resident gate's child (`bind_peer`): a hook, never a person's shell."""
+    return _PEER is not None
+
+
+def account_user() -> str:
+    """The account's user name, from the system's user database (never an environment variable). A `WsError` of kind
+    `refused` when there is none or it is not a plain name."""
+    name = None
+    with contextlib.suppress(ImportError, KeyError, OSError, AttributeError):
+        import pwd
+
+        name = pwd.getpwuid(os.getuid()).pw_name
+    if not name or not _PERSON_USER.fullmatch(name):
+        raise WsError("refused", "ws can't tell this account's user name", "check the account's user database entry")
+    return name
+
+
+def _person_paths(env: dict) -> tuple[Path, Path]:
+    return paths.layout(env).path_of("secrets") / PERSON_TOKEN, _identity_dir(env) / PERSON_DIGEST
+
+
+def _own_private_file(path: Path) -> str | None:
+    """The text of a plain file this account owns and nobody else can read, opened without following a link; else None."""
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if (
+            not stat.S_ISREG(st.st_mode)
+            or st.st_uid != getattr(os, "geteuid", lambda: st.st_uid)()
+            or st.st_mode & 0o077
+        ):
+            return None
+        with os.fdopen(fd, "r", encoding="utf-8", closefd=False) as f:
+            return f.read(256).strip()
+    except (OSError, ValueError):
+        return None
+    finally:
+        os.close(fd)
+
+
+def _boot_id() -> str:
+    try:
+        return Path(BOOT_ID).read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def init_person_token(env: dict | None = None) -> Path:
+    """Make a new per-boot person token: a random file under the secrets folder (0600) and its digest in the identity
+    folder (with this boot's id, so a token from an earlier boot is no proof). Run from the person's own terminal at hub
+    start (`ws msg person-token`); a walled session can write neither folder. Replaces the old pair, so an earlier token
+    stops working. The secrets folder must already exist: a wall hides a folder only if it is there when the runner
+    starts, so a folder made now would not be hidden from sessions already running. Returns the token's path."""
+    env = trusted_env() if env is None else env
+    token_path, digest_path = _person_paths(env)
+    if not token_path.parent.is_dir():
+        raise WsError(
+            "refused",
+            f"{token_path.parent} does not exist, so a running session's wall would not hide a token made in it",
+            f"make it first (mkdir -m 700 {token_path.parent}), then start your sessions again",
+        )
+    token = secrets.token_hex(32)
+    digest = hashlib.sha256(token.encode()).hexdigest()
+    for path, text in ((token_path, token), (digest_path, f"{digest} {_boot_id()}")):
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text + "\n")
+        os.replace(tmp, path)
+    return token_path
+
+
+def person_proof(env: dict | None = None) -> bool:
+    """True when this process can read the person token and it matches the digest in the identity folder. Having no
+    runner ancestor proves nothing (an orphaned or double-forked agent process has none); reading a file the launch wall
+    hides, whose digest a session cannot rewrite, does. False for anything missing, unreadable, loose or mismatched."""
+    try:
+        env = trusted_env() if env is None else env
+        token_path, digest_path = _person_paths(env)
+    except WsError:
+        return False
+    token, digest = _own_private_file(token_path), _own_private_file(digest_path)
+    if not token or not digest or not re.fullmatch(r"[0-9a-f]{64}", token):
+        return False
+    want, _, boot = digest.partition(" ")
+    if boot != _boot_id():
+        return False
+    return hmac.compare_digest(hashlib.sha256(token.encode()).hexdigest(), want)
+
+
+def asked_by() -> str:
+    """Who is asking for the session being prepared: the calling session's id, or `person:<user>` when the policy has
+    `[msg] person_send` on, the wall is on and the person proof passes, else `unknown`. Never an argument."""
+    with contextlib.suppress(Exception):  # who asked is a record, not a gate: any error is "unknown"
+        rec = resolve_caller()
+        if rec is not None:
+            return rec.session_id
+        from ws import policy
+
+        pol = policy.load(paths.config_dir(trusted_env()) / "policy.toml")
+        if pol.msg.person_send and pol.gate.sandbox and not peer_bound() and person_proof():
+            return PERSON + account_user()
+    return UNKNOWN
+
+
 def update(
     session_id: str,
     *,
@@ -699,10 +848,11 @@ def _launch_dir(env: dict) -> Path:
     return _identity_dir(env) / "launch"
 
 
-def prepare_launch(role: str, env: dict | None = None) -> str:
+def prepare_launch(role: str, env: dict | None = None, requested_by: str = UNKNOWN) -> str:
     """The launcher's side: write a single-use token for a session that will start with `role` and return it. The caller
     exports it as `WS_LAUNCH` before it starts the runner. The file is private (0600), names the role and the time, and
-    is good for `LAUNCH_TTL` seconds; older leftovers are cleared here."""
+    is good for `LAUNCH_TTL` seconds; older leftovers are cleared here. `requested_by` (who asked for the session, see
+    `asked_by`) rides in it and lands on the record at start."""
     if role not in ROLES:
         raise WsError(
             "usage", f"role must be one of {', '.join(ROLES)}, not {role!r}", "pass lead, worker or reviewer", 2
@@ -718,12 +868,18 @@ def prepare_launch(role: str, env: dict | None = None) -> str:
     token = secrets.token_hex(16)
     fd = os.open(folder / token, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(json.dumps({"role": role, "created": now}) + "\n")
+        f.write(json.dumps({"role": role, "created": now, "requested_by": _asker(requested_by)}) + "\n")
     return token
 
 
 def _claim_launch(env: dict, token: str | None) -> str | None:
-    """The role a launch token carries, or None. The token is taken (renamed away, then deleted) whether or not it is
+    """The role a launch token carries, or None (see `_claim_launch_data`)."""
+    got = _claim_launch_data(env, token)
+    return got[0] if got else None
+
+
+def _claim_launch_data(env: dict, token: str | None) -> tuple[str, str] | None:
+    """(role, requested_by) a launch token carries, or None. The token is taken (renamed away, then deleted) whether or not it is
     good, so it works once: a second start with it, a forged name, a token past its time, one that is not a plain file of
     ours or one that is not private all give None, which `start` reads as worker."""
     if not token or not _TOKEN.fullmatch(token):
@@ -744,7 +900,7 @@ def _claim_launch(env: dict, token: str | None) -> str | None:
         role = data.get("role") if isinstance(data, dict) else None
         if isinstance(created, bool) or not isinstance(created, int | float) or role not in ROLES:
             return None
-        return role if 0 <= _now() - created <= LAUNCH_TTL else None
+        return (role, _asker(data.get("requested_by"))) if 0 <= _now() - created <= LAUNCH_TTL else None
     except (OSError, ValueError):
         return None
     finally:
@@ -773,18 +929,22 @@ def cmd_start(args: argparse.Namespace) -> int:
             got = _input(args)
             if got:
                 env = paths.merged_environ()
-                claimed = _claim_launch(env, env.get(LAUNCH_ENV))  # taken even if it is no good: it works once
+                claimed = _claim_launch_data(env, env.get(LAUNCH_ENV))  # taken even if it is no good: it works once
                 # always overwrite: a resumed, cleared or compacted session reloads its rules, so it starts again here
                 path = _record_path(env, got[0])
                 with _locked(path.parent):
                     before = _read_identity(_identity_path(env, got[0]))
-                    role = claimed or (before["role"] if before else "worker")  # a resumed start keeps its role
+                    role = claimed[0] if claimed else (before["role"] if before else "worker")  # a resume keeps it
+                    asker = claimed[1] if claimed else (before["requested_by"] if before else UNKNOWN)
                     stamp = runner_process()
                     new = _new_record(got[0], current_release(env), args.runner, got[1], env, _read(path), stamp, role)
+                    if asker != UNKNOWN:
+                        new["requested_by"] = asker  # a copy for readers; `read` takes it from the identity folder
                     try:
-                        _write_identity(env, got[0], role, stamp, new["started_at"])
+                        _write_identity(env, got[0], role, stamp, new["started_at"], asker)
                     except OSError:  # a hook inside the wall can't write here: no identity, so no role and no stamp
                         new["role"] = "worker"
+                        new.pop("requested_by", None)
                         new.pop("runner_pid", None)
                         new.pop("runner_start", None)
                     _write(path, new)
@@ -852,9 +1012,10 @@ def cmd_load(args: argparse.Namespace) -> int:
 
 
 def cmd_prepare(args: argparse.Namespace) -> int:
-    token = prepare_launch(args.role)
+    asker = asked_by()
+    token = prepare_launch(args.role, requested_by=asker)
     if args.json:
-        output.result({LAUNCH_ENV: token, "role": args.role, "ttl_seconds": LAUNCH_TTL})
+        output.result({LAUNCH_ENV: token, "role": args.role, "ttl_seconds": LAUNCH_TTL, "requested_by": asker})
     else:
         print(f"{LAUNCH_ENV}={token}")
     return 0
@@ -899,6 +1060,22 @@ def _nudge(args: argparse.Namespace) -> None:
     )
 
 
+def cmd_show(args: argparse.Namespace) -> int:
+    rec = read(args.session_id, trusted_env())
+    if rec is None:
+        raise WsError(
+            "not_found", f"no session {args.session_id!r}", "the registry has no readable record with that id"
+        )
+    fields = {k: v for k, v in rec.to_dict().items() if k not in ("schema", "ts")}
+    fields["requested_by"] = rec.requested_by  # always shown: an old record says unknown
+    if args.json:
+        output.result(fields)
+    else:
+        for k, v in fields.items():
+            print(f"{k}: {v}")
+    return 0
+
+
 def register(sub) -> None:
     s = sub.add_parser("session", help="record the release a session started on; nudge once if ws has moved on")
     ss = s.add_subparsers(dest="session_command", required=True)
@@ -925,3 +1102,6 @@ def register(sub) -> None:
     p = ss.add_parser("prepare", help="launcher: print WS_LAUNCH=<token>, a one-use token that gives a session a role")
     p.add_argument("--role", required=True, choices=ROLES, help="the role the session will have")
     p.set_defaults(func=cmd_prepare)
+    p = ss.add_parser("show", help="print a session's record, including who asked for it (`requested_by`)")
+    p.add_argument("session_id", metavar="SESSION")
+    p.set_defaults(func=cmd_show)

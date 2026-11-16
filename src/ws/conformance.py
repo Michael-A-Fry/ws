@@ -494,3 +494,38 @@ def runs_in_order(argvs: list[list[str]], *tokens: str) -> bool:
     """True when some command in `argvs` holds `tokens` next to each other, in that order."""
     n = len(tokens)
     return any(tuple(a[i : i + n]) == tokens for a in argvs for i in range(len(a) - n + 1))
+
+
+def _hook_only_mcp(tool: str) -> bool:
+    """Is this `deny_tools` entry an MCP name only a hook can enforce? A runner's own rule takes `mcp__SERVER__TOOL` with
+    a plain server; a whole server (`mcp__docs`), or a glob in the server part, has no such rule."""
+    if not tool.startswith("mcp__"):
+        return False
+    server, sep, rest = tool.removeprefix("mcp__").partition("__")
+    return not (sep and rest) or bool(re.search(r"[*?]", server))
+
+
+def checks_needed(policy) -> set[str]:
+    """The checks a policy asks a runner for, by the names an adapter's `CANNOT_CHECK` uses: "mcp" (an `allow_mcp` list, or
+    a `deny_tools` MCP glob, which only the hook can judge), "allow_hosts", and "guard:NAME" for each guard that is on."""
+    need = {f"guard:{g}" for g in policy.guards.on}
+    if policy.gate.allow_hosts:
+        need.add("allow_hosts")
+    if policy.gate.allow_mcp is not None or any(_hook_only_mcp(t) for t in policy.gate.deny_tools):
+        need.add("mcp")
+    return need
+
+
+def refuse_cannot_check(policy, runner: str) -> None:
+    """Raise a typed refusal (exit 3, kind `cannot_check`) when the policy needs a check this runner's adapter lists in
+    `CANNOT_CHECK`, naming each gap: a job that would run unchecked never starts. Every adapter must declare the list."""
+    gaps = adapters.get(runner).CANNOT_CHECK  # required of every adapter (see the contract)
+    hit = sorted(checks_needed(policy) & set(gaps))
+    if hit:
+        raise WsError(
+            "cannot_check",
+            "CANNOT_CHECK: " + "; ".join(f"{runner} cannot check {n} ({gaps[n]})" for n in hit),
+            hint="drop that rule from the policy, or run the job on a runner that can check it",
+            exit_code=3,
+            details={"runner": runner, "checks": hit},
+        )

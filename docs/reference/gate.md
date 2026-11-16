@@ -43,7 +43,7 @@ hook: median 308 ms and 95th percentile 364 ms with a process for each call, 45 
 The first call of a session, and any call made while the daemon is down, takes the slower path.
 
 What each hook of a typical hand-built set does, and which rule or guard here does the same job, is on the
-[hooks page](hooks.md).
+[hooks page](hook-parity.md).
 
 ## Call kinds
 

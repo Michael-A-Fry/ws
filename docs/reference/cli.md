@@ -1010,8 +1010,8 @@ ws ships no pattern: the wall reads `<config>/commit-wall/patterns.toml` (a `[[p
 `terms`, literal and any case, or a Python `regex`) and lets through what `<config>/commit-wall/exceptions.toml` lists
 (`[[allow]]` with any of `pattern`, `path` and `text`; only a person adds to it, and the gate refuses a session's writes
 to the folder). A hit prints the file, the line and the pattern's name, never the matched text. A merge is scanned for
-the lines new to the merge, a file over 1 MB or a binary one is skipped and the skip is printed, and a hook that can't run
-`ws` blocks the commit.
+the lines new to the merge, nothing is skipped (every file is read as text, file names and the whole message included),
+a check with no pattern refuses, and a hook that can't run `ws` blocks the commit.
 
 ### `ws commit-wall install`
 
@@ -1043,13 +1043,14 @@ ws commit-wall uninstall [-h] [--repo REPO]
 Scan the staged diff, or a commit message with `--stage commit-msg FILE`, now. Exit 1 on a hit.
 
 ```text
-ws commit-wall check [-h] [--stage {pre-commit,commit-msg}] [--repo REPO] [file]
+ws commit-wall check [-h] [--stage {pre-commit,commit-msg}] [--repo REPO] [--wall-dir WALL_DIR] [file]
 ```
 
 | Argument | Meaning |
 |---|---|
 | `--stage STAGE` | `pre-commit` (the staged diff, default) or `commit-msg`. |
 | `--repo REPO` | The repository (default: here). |
+| `--wall-dir WALL_DIR` | The config folder to read (the hooks pass the one they were installed with). |
 | `file` | The message file, for `--stage commit-msg`. |
 
 ### `ws commit-wall status`

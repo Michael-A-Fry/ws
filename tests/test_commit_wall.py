@@ -128,12 +128,14 @@ def test_a_regex_pattern_and_a_bad_config(repo):
 
 
 @needs_git
-def test_the_commit_message_is_scanned_and_git_comments_are_not(repo, box):
+def test_the_whole_commit_message_is_scanned_hash_lines_too(repo, box):
     configure()
     msg = box / "msg"
     msg.write_text(f"Fix it\n\nthanks {PLANT}\n")
     assert check(repo, "--stage", "commit-msg", str(msg)) == 1
-    msg.write_text(f"Fix it\n# {PLANT} is a comment git adds\n")
+    msg.write_text(f"Fix it\n# {PLANT} starts with a hash, and -m and --cleanup=verbatim keep such lines\n")
+    assert check(repo, "--stage", "commit-msg", str(msg)) == 1
+    msg.write_text("Fix it\n# a comment git adds\n")
     assert check(repo, "--stage", "commit-msg", str(msg)) == 0
 
 
@@ -156,15 +158,148 @@ def test_a_merge_scans_only_the_lines_new_to_the_merge(repo):
 
 
 @needs_git
-def test_a_file_over_1_mb_is_skipped_and_said_so(repo, capsys):
+def test_nothing_is_skipped_big_files_nul_bytes_and_no_diff_attributes_are_scanned(repo, capsys):
     configure()
-    (repo / "big.txt").write_text((PLANT + "\n") * 80000)  # over 1 MB
+    (repo / "big.txt").write_text("x" * 1_200_000 + "\n" + PLANT + "\n")  # padded past 1 MB
     git(repo, "add", "big.txt")
+    assert check(repo) == 1
+    git(repo, "reset", "-q")
+    (repo / "nul.dat").write_bytes(b"\0\0" + PLANT.encode() + b"\n")  # a NUL byte makes git call it binary
+    git(repo, "add", "nul.dat")
+    assert check(repo) == 1
+    git(repo, "reset", "-q")
+    (repo / ".gitattributes").write_text("marked.txt -diff\n")
+    (repo / "marked.txt").write_text(PLANT + "\n")
+    git(repo, "add", ".gitattributes", "marked.txt")
+    assert check(repo) == 1
+    assert "wall skipped" not in capsys.readouterr().err
+
+
+@needs_git
+def test_an_added_line_that_starts_with_two_plus_signs_is_still_a_line(repo):
+    configure()
+    (repo / "a.txt").write_text(f"hello\n++ {PLANT}\n")  # the diff shows it as `+++ ...`, a header's shape
+    git(repo, "add", "a.txt")
+    assert check(repo) == 1
+
+
+@needs_git
+@pytest.mark.parametrize("sep", ["\x0c", "\r", "\u2028", "\x1c", "\x85"])
+def test_lines_split_on_newlines_only(repo, sep):
+    configure('[[pattern]]\nname = "span"\nregex = "ab.cd"\n')
+    (repo / "a.txt").write_text(f"hello\nab{sep}cd\n", encoding="utf-8", newline="")
+    git(repo, "add", "a.txt")
+    assert check(repo) == 1
+
+
+@needs_git
+def test_invalid_utf8_is_read_as_it_is_and_does_not_crash(repo):
+    configure()
+    (repo / "a.txt").write_bytes(b"hello\n\xff\xfe" + PLANT.encode() + b"\n")
+    git(repo, "add", "a.txt")
+    assert check(repo) == 1
+
+
+@needs_git
+@pytest.mark.parametrize("setting", ["diff.noprefix", "diff.mnemonicPrefix"])
+def test_diff_prefix_settings_do_not_change_the_paths(repo, capsys, setting):
+    configure()
+    git(repo, "config", setting, "true")
+    (repo / "a.txt").write_text(f"hello\n{PLANT}\n")
+    git(repo, "add", "a.txt")
+    assert check(repo) == 1
+    assert "a.txt:2" in capsys.readouterr().err
+
+
+@needs_git
+def test_file_names_and_normalised_text_are_scanned(repo):
+    configure()
+    (repo / f"{PLANT}.txt").write_text("fine\n")
+    git(repo, "add", f"{PLANT}.txt")
+    assert check(repo) == 1  # the name alone
+    git(repo, "reset", "-q")
+    (repo / f"{PLANT}.txt").unlink()
+    wide = "".join(chr(ord(c) + 0xFEE0) if c.isascii() and c.isalpha() else c for c in PLANT)  # fullwidth letters
+    assert wide != PLANT
+    (repo / "a.txt").write_text(f"hello\n{wide}\n")
+    git(repo, "add", "a.txt")
+    assert check(repo) == 1  # NFKC folds it back
+
+
+@needs_git
+def test_a_merge_leaves_out_a_line_only_when_the_other_side_added_it_to_the_same_file(repo):
+    configure()
+    git(repo, "checkout", "-q", "-b", "side")
+    (repo / "side.txt").write_text(f"{PLANT}\n")
+    git(repo, "add", "side.txt")
+    git(repo, "commit", "-q", "-m", "side", "--no-verify")
+    git(repo, "checkout", "-q", "main")
+    (repo / "main.txt").write_text("main work\n")
+    git(repo, "add", "main.txt")
+    git(repo, "commit", "-q", "-m", "main work")
+    git(repo, "merge", "--no-commit", "--no-ff", "side")
     assert check(repo) == 0
-    assert "skipped big.txt" in capsys.readouterr().err
-    assert check(repo, "--json") == 0
-    out = json.loads(capsys.readouterr().out)
-    assert out["data"]["skipped"] == [{"path": "big.txt", "why": "over 1 MB"}]
+    (repo / "elsewhere.txt").write_text(f"{PLANT}\n")  # the same text, in another file
+    git(repo, "add", "elsewhere.txt")
+    assert check(repo) == 1
+
+
+@needs_git
+def test_with_no_pattern_the_check_refuses(repo):
+    configure("# nothing here\n")
+    (repo / "a.txt").write_text("hello\nclean\n")
+    git(repo, "add", "a.txt")
+    assert check(repo) == 1
+    (commit_wall.folder() / "patterns.toml").unlink()
+    assert check(repo) == 1  # missing, too
+
+
+@needs_git
+def test_the_hooks_carry_their_config_folder_and_a_different_ws_home_cannot_empty_it(repo, box, monkeypatch):
+    configure()
+    assert cli.main(["commit-wall", "install", "--repo", str(repo)]) == 0
+    hooks = Path(git(repo, "config", "--local", "core.hooksPath").strip())
+    assert {"pre-commit", "pre-merge-commit", "commit-msg"} <= {f.name for f in hooks.iterdir()}
+    assert "--wall-dir" in (hooks / "pre-commit").read_text()
+    other = box / "elsewhere"
+    other.mkdir()
+    monkeypatch.setenv("WS_HOME", str(other))  # the committing shell points ws somewhere with no patterns
+    (repo / "a.txt").write_text(f"hello\n{PLANT}\n")
+    git(repo, "add", "a.txt")
+    assert git(repo, "commit", "-m", "x", check=False).startswith("1\n")
+
+
+@needs_git
+def test_a_hooks_path_with_a_tilde_is_expanded_and_restored_as_written(repo, box):
+    configure()
+    old = box / "home" / "oldhooks"
+    old.mkdir()
+    (old / "pre-commit").write_text("#!/bin/sh\necho OLD-HOOK >&2\nexit 0\n")
+    (old / "pre-commit").chmod(0o755)
+    git(repo, "config", "--local", "core.hooksPath", "~/oldhooks")
+    assert cli.main(["commit-wall", "install", "--repo", str(repo)]) == 0
+    (repo / "a.txt").write_text("hello\nclean\n")
+    git(repo, "add", "a.txt")
+    assert "OLD-HOOK" in git(repo, "commit", "-m", "fine", check=False)  # the ~ path was found
+    assert cli.main(["commit-wall", "uninstall", "--repo", str(repo)]) == 0
+    assert git(repo, "config", "--local", "--get", "core.hooksPath").strip() == "~/oldhooks"
+
+
+@needs_git
+@pytest.mark.parametrize("install_from, uninstall_from", [("repo", "wt"), ("wt", "repo")])
+def test_a_repository_and_its_worktrees_share_one_record(repo, box, install_from, uninstall_from):
+    configure()
+    wt = box / "wt"
+    git(repo, "worktree", "add", "-q", "-b", "other", str(wt))
+    where = {"repo": repo, "wt": wt}
+    assert cli.main(["commit-wall", "install", "--repo", str(where[install_from])]) == 0
+    here = git(repo, "config", "--local", "core.hooksPath").strip()
+    assert (
+        cli.main(["commit-wall", "install", "--repo", str(where[uninstall_from])]) == 1
+    )  # already on, seen from either
+    assert cli.main(["commit-wall", "uninstall", "--repo", str(where[uninstall_from])]) == 0
+    assert git(repo, "config", "--local", "--get", "core.hooksPath", check=False).startswith("1\n")
+    assert not Path(here).exists()  # no hooksPath left pointing at a deleted folder
 
 
 @needs_git
@@ -225,3 +360,18 @@ def test_installing_twice_is_refused_and_the_folder_is_a_control_path(repo, box)
     assert cli.main(["commit-wall", "install", "--repo", str(repo)]) == 0
     assert cli.main(["commit-wall", "install", "--repo", str(repo)]) == 1
     assert str(commit_wall.folder()) in paths.control_paths()  # a session can't write the patterns or exceptions
+
+
+@needs_git
+def test_the_first_commit_of_a_new_repository_is_scanned(box):
+    configure()
+    fresh = box / "fresh"
+    fresh.mkdir()
+    git(fresh, "init", "-q", "-b", "main")
+    (fresh / "f.txt").write_text(f"{PLANT}\n")
+    git(fresh, "add", "f.txt")
+    assert check(fresh) == 1
+    git(fresh, "reset", "-q")
+    (fresh / "f.txt").write_text("fine\n")
+    git(fresh, "add", "f.txt")
+    assert check(fresh) == 0

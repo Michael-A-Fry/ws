@@ -1,0 +1,244 @@
+# The hook parity table: one row per class of hook a hand-built set has (a user-level hook that ...), what replaced it in ws,
+# and what it does when it crashes or cannot decide. docs/reference/hook-parity.md is generated from this file
+# (python3 scripts/gen_hook_parity.py); tests/test_hook_parity.py reads it. Humans edit this file, never the page.
+#
+# status: covered (a ws rule or guard does it; `test` names the test), planned (a later wave builds it; `wave` says which),
+#         estate (one person's own setup; `ws` says why), dropped (`ws` says why).
+# fail:   blocks (a crash or doubt denies the call) or never-blocks (the hook only advises or records).
+
+[[hook]]
+id = "irreversible-shell"
+what = "Blocks irreversible shell commands: recursive deletes of system folders, forced pushes, disk formatting"
+ws = "`[gate] deny_commands` (the default list covers these; add your own patterns)"
+status = "covered"
+fail = "blocks"
+test = "test_parity_irreversible_shell_commands"
+
+[[hook]]
+id = "credential-reads"
+what = "Blocks reads of credential files and key stores, by a shell command or by a file tool"
+ws = "`[gate] deny_read`, applied to shell words, Read, Grep and Glob alike"
+status = "covered"
+fail = "blocks"
+test = "test_parity_credential_reads"
+
+[[hook]]
+id = "terminal-session-keys"
+what = "Stops one session sending keystrokes to, or killing, another terminal-multiplexer session"
+ws = "A `deny_commands` pattern you add (such as `tmux kill-*`); which sessions to protect depends on how you work"
+status = "estate"
+fail = "blocks"
+test = "none"
+
+[[hook]]
+id = "sealed-folders"
+what = "Keeps a session out of folders sealed off for a class of repository (reads and writes)"
+ws = "`[gate] deny_read` and `allow_write`, and the sandbox's `denyRead`; the list of sealed folders is yours"
+status = "covered"
+fail = "blocks"
+test = "test_parity_sealed_folders"
+
+[[hook]]
+id = "guardrail-files"
+what = "Lets the files that hold the guardrails be edited only by the session that owns them"
+ws = "ws protects its own policy, settings, hooks and folders from the edit tools and from shell redirects"
+status = "covered"
+fail = "blocks"
+test = "test_parity_guardrail_files"
+
+[[hook]]
+id = "bulk-staging"
+what = "Blocks staging the whole tree (`git add -A`, `git add .`, `git commit -a`)"
+ws = "the `bulk-staging` guard"
+status = "covered"
+fail = "blocks"
+test = "test_parity_bulk_staging"
+
+[[hook]]
+id = "claims"
+what = "Checks a claim that a commit is merged or pushed before the message goes"
+ws = "the `claims` guard"
+status = "covered"
+fail = "blocks"
+test = "test_parity_claims"
+
+[[hook]]
+id = "session-context"
+what = "Tells a new session which state and hand-off files exist"
+ws = "the `session-context` guard"
+status = "covered"
+fail = "never-blocks"
+test = "test_parity_session_context"
+
+[[hook]]
+id = "skill-gate"
+what = "Makes a session load a skill before it writes certain files"
+ws = "the `skill-gate` guard"
+status = "covered"
+fail = "blocks"
+test = "test_parity_skill_gate"
+
+[[hook]]
+id = "spawn-cap"
+what = "Caps how many subagents run at once"
+ws = "the `spawn-cap` guard"
+status = "covered"
+fail = "blocks"
+test = "test_parity_spawn_cap"
+
+[[hook]]
+id = "resume-cap"
+what = "Stops a conductor resuming a subagent that has grown past a token limit or been resumed twice"
+ws = "none (dropped, reason: no replay row or incident asked for it)"
+status = "dropped"
+fail = "never-blocks"
+test = "none"
+
+[[hook]]
+id = "test-weakening"
+what = "Stops a session making tests pass by skipping or weakening them"
+ws = "the `test-weakening` guard"
+status = "covered"
+fail = "blocks"
+test = "test_parity_test_weakening"
+
+[[hook]]
+id = "launch-from-main"
+what = "Refuses to launch isolated agents or workflows from anywhere but a repository's main checkout"
+ws = "none; it depends on the workflow tool and the folder layout in use"
+status = "estate"
+fail = "blocks"
+test = "none"
+
+[[hook]]
+id = "workflow-fresh"
+what = "Checks that a workflow definition is current before it runs"
+ws = "none; it belongs to one workflow tool"
+status = "estate"
+fail = "never-blocks"
+test = "none"
+
+[[hook]]
+id = "phone-alert"
+what = "Pushes a phone notification when a session needs input or finishes"
+ws = "`ws notify alert`, written into the Notification and Stop hooks by `ws install`"
+status = "covered"
+fail = "never-blocks"
+test = "test_parity_phone_alert"
+
+[[hook]]
+id = "permission-queue"
+what = "Puts a permission prompt in a personal queue and closes it when answered"
+ws = "none; the queue is one person's tool (the alert in row 15 still fires)"
+status = "estate"
+fail = "never-blocks"
+test = "none"
+
+[[hook]]
+id = "event-feed"
+what = "Sends session events to a personal dashboard"
+ws = "none; the dashboard is one person's"
+status = "estate"
+fail = "never-blocks"
+test = "none"
+
+[[hook]]
+id = "corrections"
+what = "Captures corrections the person makes, for later review"
+ws = "none; the review process is one person's"
+status = "estate"
+fail = "never-blocks"
+test = "none"
+
+[[hook]]
+id = "trigger-phrases"
+what = "Detects trigger phrases in a prompt and routes them"
+ws = "none; the phrases and routes are one person's"
+status = "estate"
+fail = "never-blocks"
+test = "none"
+
+[[hook]]
+id = "incident-nudge"
+what = "Nudges after an incident"
+ws = "none; it names one person's incident process"
+status = "estate"
+fail = "never-blocks"
+test = "none"
+
+[[hook]]
+id = "usage-log"
+what = "Logs token usage for a personal dashboard"
+ws = "none; `ws run` writes a [run record](stores.md) for each headless job, and interactive usage stays in the runner's own transcript"
+status = "estate"
+fail = "never-blocks"
+test = "none"
+
+[[hook]]
+id = "status-line"
+what = "Draws a custom status line"
+ws = "none; the status line is the runner's own setting"
+status = "estate"
+fail = "never-blocks"
+test = "none"
+
+[[hook]]
+id = "syntax-check"
+what = "Checks that a file parses right after a session writes it"
+ws = "the `syntax-check` guard (a finding is a message to the model, never a block)"
+status = "planned"
+fail = "never-blocks"
+wave = "2b"
+test = "none"
+
+[[hook]]
+id = "force-push-main"
+what = "Blocks a force-push to, or deletion of, the main branch on a remote"
+ws = "a `deny_commands` rule or a guard, decided in wave 2b"
+status = "planned"
+fail = "blocks"
+wave = "2b"
+test = "none"
+
+[[hook]]
+id = "env-file-write"
+what = "Blocks a shell command that writes a secret `.env` file"
+ws = "a `deny_commands` rule or a guard, decided in wave 2b"
+status = "planned"
+fail = "blocks"
+wave = "2b"
+test = "none"
+
+[[hook]]
+id = "scheduled-branch-move"
+what = "Blocks a headless job moving the branch of a main checkout"
+ws = "a guard that reads the job marker, decided in wave 2b"
+status = "planned"
+fail = "blocks"
+wave = "2b"
+test = "none"
+
+[[hook]]
+id = "commit-wall"
+what = "Scans the staged diff and the commit message for patterns the person supplies"
+ws = "a commit hook installed by `core.hooksPath` (wave 3)"
+status = "planned"
+fail = "blocks"
+wave = "3"
+test = "none"
+
+[[hook]]
+id = "test-run-discipline"
+what = "Requires test commands to run in the foreground through a wrapper that serialises and bounds them"
+ws = "none; the wrapper is one person's tool (a `deny_commands` pattern can ask for yours)"
+status = "estate"
+fail = "blocks"
+test = "none"
+
+[[hook]]
+id = "duplicate-session"
+what = "Warns when two live sessions share a session id or a folder"
+ws = "none; it reads one person's session files"
+status = "estate"
+fail = "never-blocks"
+test = "none"

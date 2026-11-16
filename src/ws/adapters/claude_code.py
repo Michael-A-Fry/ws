@@ -115,6 +115,10 @@ from ws.output import WsError
 from ws.policy import Policy, native_patterns, sandbox_read_paths, sandbox_write_paths
 
 NAME = "claude-code"
+GENERATED_NOTE = "DO NOT EDIT: written by `ws gate generate` from policy.toml; change the policy and run it again"
+CANNOT_CHECK: dict[
+    str, str
+] = {}  # it enforces every check a policy can ask for (see ws.conformance.refuse_cannot_check)
 FILE = "settings.json"
 # Claude Code's write twin of wallsettings.READ_BLOCK_KEY (settings reference, 2.1.314): Write, Edit and NotebookEdit
 # refuse a path outside the working folders in every permission mode. It doesn't cover shell commands, MCP or hooks.
@@ -598,6 +602,7 @@ def generate(
     if not user_scope and not policy.gate.write_outside_project:
         permissions[WRITE_BLOCK_KEY] = True  # the same rule, for Write, Edit and NotebookEdit
     settings = {
+        "_generated": GENERATED_NOTE,
         "permissions": permissions,
         # `sandbox = false` in the policy: no block, and the marker says so (the hook then skips the preflight)
         **({"sandbox": sandbox_block(policy, out, policy_file, protect, defaults=not user_scope)} if wall else {}),

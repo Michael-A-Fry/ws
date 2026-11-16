@@ -588,6 +588,17 @@ def _lock_reason(log: Path) -> str | None:
     return None
 
 
+def _cannot_check(pol: policy.Policy, job: jobs.Job) -> tuple[str, str] | None:
+    """("cannot_check", why) when the policy needs a check this job's runner cannot do (its adapter's CANNOT_CHECK)."""
+    from ws import conformance
+
+    try:
+        conformance.refuse_cannot_check(pol, job.runner)
+    except WsError as e:
+        return ("cannot_check", e.message)
+    return None
+
+
 def _refuse(rec: dict, reason: str, path: Path, stop_reason: str, status: str = "refused") -> int:
     rec.update(status=status, error=reason[:300], ended_at=rec["started_at"], duration_ms=0, stop_reason=stop_reason)
     _append(path, rec)
@@ -797,6 +808,8 @@ def _run(
     if static is None:
         leaks = _term_leak(pol, job)
         static = ("term", leaks) if leaks else None
+    if static is None:
+        static = _cannot_check(pol, job)
     if static is None:
         walled = _wall_problem(pol, job, adapter, cwd)
         static = ("wall", walled) if walled else None

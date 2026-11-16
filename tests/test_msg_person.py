@@ -14,7 +14,7 @@ import os
 import sys
 
 import pytest
-from test_msg import World, classed, world  # noqa: F401, F811 - the fixture, imported for the same stand-ins
+from test_msg import World, classed, world  # noqa: F401 - the fixture, imported for the same stand-ins
 
 from ws import cli, msg, paths, policy, session
 from ws.output import WsError

@@ -13,9 +13,10 @@
 # a push names.
 # WS_PREPUSH_FULL=1 runs the whole suite here (logged like a skip).
 # Run the tests through a wrapper: WS_PREPUSH_WRAP="your-lock-command --flag" git push (split on spaces; for a machine
-# that queues test runs, so a push's tests don't race the others). Unset, the hook uses `ws-test --light --node local --`
-# when ws-test is on PATH (it queues for a slot and caps xdist's workers, so a busy machine doesn't time the tests out),
-# and runs them bare when it isn't. Set but empty (WS_PREPUSH_WRAP= git push), they always run bare.
+# that queues test runs, so a push's tests don't race the others). Unset (or only spaces), the hook uses
+# `ws-test --light --node local --` when ws-test is on PATH (`--full` for WS_PREPUSH_FULL=1): it queues for a slot, up
+# to WS_TEST_WAIT (45 minutes), and caps xdist's workers, so a busy machine doesn't time the tests out. Without ws-test
+# they run bare. Set but empty (WS_PREPUSH_WRAP= git push), they always run bare.
 # A skip is never silent: it adds a line to .git/ws-prepush-skips.log (the log of the worktree's git dir).
 set -euo pipefail
 
@@ -42,10 +43,12 @@ uvx prek run --all-files >&2
 wrap=()
 if [[ -n "${WS_PREPUSH_WRAP:-}" ]]; then
   read -r -a wrap <<<"$WS_PREPUSH_WRAP"
-elif [[ -z "${WS_PREPUSH_WRAP+set}" ]] && command -v ws-test >/dev/null 2>&1; then
-  # a light slot: the e2e files are in the set, which ws-test would class as UI (refused in a worktree, never sent to a
-  # node); --node local keeps the run here, where the working folder is, not a bundle of tracked files elsewhere
-  wrap=(ws-test --light --node local --)
+fi
+# unset, or only spaces, means "your machine's default": ws-test when it's on PATH. Set but empty means bare.
+auto_wrap=0
+if [[ "${#wrap[@]}" == 0 && (-n "${WS_PREPUSH_WRAP:-}" || -z "${WS_PREPUSH_WRAP+set}") ]] &&
+  command -v ws-test >/dev/null 2>&1; then
+  auto_wrap=1
 fi
 
 smoke=(tests/test_cli.py tests/test_cli_registry.py tests/test_prepush_hook.py)
@@ -110,6 +113,16 @@ fi
 # the cap sits inside the wrapper: time spent queued behind other runs doesn't count against it
 if [[ "${#limit[@]}" != 0 ]]; then
   suite=("${limit[@]}" "${suite[@]}")
+fi
+if [[ "$auto_wrap" == 1 ]]; then
+  # --light for a selected or capped set: the e2e files in it would be guessed as UI (refused in a worktree, never sent
+  # to a node). --full for the whole suite, which needs the full class's memory and lock, or light's cap would OOM it.
+  # --node local keeps the run here, where the working folder is, not a bundle of tracked files elsewhere.
+  if [[ "$kind" == FULL ]]; then
+    wrap=(ws-test --full --node local --)
+  else
+    wrap=(ws-test --light --node local --)
+  fi
 fi
 if [[ "${#wrap[@]}" != 0 ]]; then
   suite=("${wrap[@]}" "${suite[@]}")

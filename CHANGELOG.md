@@ -8,9 +8,10 @@ body of the GitHub release.
 
 ## [Unreleased]
 
-- The pre-push hook runs the tests through `ws-test --light --node local --` when `ws-test` is on the PATH and
-  `WS_PREPUSH_WRAP` is unset, so a busy machine queues the push's tests and caps their workers instead of timing them
-  out. `WS_PREPUSH_WRAP=` (empty) runs them bare.
+- The pre-push hook runs the tests through `ws-test --light --node local --` (`--full` for `WS_PREPUSH_FULL=1`) when
+  `ws-test` is on the PATH and `WS_PREPUSH_WRAP` is unset or only spaces, so a busy machine queues the push's tests
+  (for up to `WS_TEST_WAIT`, 45 minutes) and caps their workers instead of timing them out. `WS_PREPUSH_WRAP=` (empty)
+  runs them bare.
 
 ## [0.1.11] - 2026-11-17
 

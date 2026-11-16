@@ -32,7 +32,12 @@ def fake(bin_dir: Path, name: str, log: Path, then_exec: bool = False, exit_code
 
 
 def run_hook(
-    tmp_path: Path, wrap: str | None, uv_exit: int = 0, expect_rc: int = 0, with_ws_test: bool = False
+    tmp_path: Path,
+    wrap: str | None,
+    uv_exit: int = 0,
+    expect_rc: int = 0,
+    with_ws_test: bool = False,
+    full: bool = False,
 ) -> list[str]:
     repo, bin_dir, log = tmp_path / "repo", tmp_path / "bin", tmp_path / "calls.log"
     repo.mkdir()
@@ -43,6 +48,8 @@ def run_hook(
     env.update(PATH=f"{bin_dir}{os.pathsep}{os.path.dirname(git)}{os.pathsep}/usr/bin:/bin", HOME=str(tmp_path))
     if wrap is not None:
         env["WS_PREPUSH_WRAP"] = wrap
+    if full:
+        env["WS_PREPUSH_FULL"] = "1"
     subprocess.run([git, "init", "-q", str(repo)], check=True, env=env)
     fake(bin_dir, "uvx", log)
     fake(bin_dir, "uv", log, exit_code=uv_exit)
@@ -85,6 +92,15 @@ def test_ws_test_on_the_path_is_the_default_wrapper(tmp_path):
         "ws-test --light --node local -- " + TIMEOUT + CAPPED_SMOKE,
         CAPPED_SMOKE,
     ]
+
+
+def test_a_whole_suite_run_uses_the_full_class_and_spaces_only_counts_as_unset(tmp_path):
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    full = run_hook(tmp_path / "a", None, with_ws_test=True, full=True)
+    assert full[1] == "ws-test --full --node local -- " + SUITE
+    spaces = run_hook(tmp_path / "b", "   ", with_ws_test=True)
+    assert spaces[1].startswith("ws-test --light --node local -- ")
 
 
 def test_an_explicit_wrap_beats_ws_test_and_an_empty_one_turns_it_off(tmp_path):

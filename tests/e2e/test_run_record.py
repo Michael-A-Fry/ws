@@ -108,6 +108,11 @@ def host_of(stub) -> str:
     return stub.url.removeprefix("http://")
 
 
+# Fields a plain run that went well leaves null: no runner subtype yet (the adapters do not pass it on), no fault, no
+# provider wait, no approval, no run key (a direct run has no trigger) and no chain.
+NULL_UNLESS_SET = {"stop_subtype", "fault", "retry_after_s", "approval", "run_key", "chain_depth"}
+
+
 def check_complete(rec: dict, may_be_null: set[str]) -> None:
     errors = [f"{list(e.path)}: {e.message}" for e in VALIDATOR.iter_errors(rec)]
     assert not errors, errors
@@ -145,7 +150,7 @@ def test_claude_code_bare_record_is_complete(rig):
         )  # fmt: skip
         assert cli.main(["run", "claude-job"]) == 0
         (rec,) = rig.records()
-        check_complete(rec, may_be_null={"error", "eval", "purpose"})
+        check_complete(rec, may_be_null={"error", "eval", "purpose"} | NULL_UNLESS_SET)
         assert rec["green"] == "targeted" and rec["recovered"] == [] and rec["schema"] == 3
         assert rec["runner"] == "claude-code" and rec["model_requested"] == "claude-sonnet-4-5"
         assert rec["models_used"][0]["model"] == "claude-sonnet-4-5"
@@ -172,7 +177,7 @@ def test_opencode_record_is_complete(rig):
         assert cli.main(["run", "oc-job"]) == 0
         (rec,) = rig.records()
         # the stub has no price list, so OpenCode reports no cost; the stream has no API time and no model name
-        check_complete(rec, may_be_null={"error", "duration_api_ms", "cost_usd", "eval", "purpose"})
+        check_complete(rec, may_be_null={"error", "duration_api_ms", "cost_usd", "eval", "purpose"} | NULL_UNLESS_SET)
         assert rec["runner"] == "opencode" and rec["cost_basis"] == "unpriced" and rec["allow_unpriced"] is True
         assert rec["green"] == "package"
         assert rec["models_used"][0]["model"] == "stub/m"  # filled in from the request: the stream does not name it

@@ -10,6 +10,14 @@ Schema 3 added `purpose` (the budget purpose the job's spend counts against), `s
 words that do not change: `completed`, `timeout`, `preempted`, `refused:<counter>`, `expired` and so on) and
 `reservation` (what admission reserved before the run started). Lines written under an earlier schema stay in the log
 and read as they are; callers use `.get` for the keys a later schema added.
+
+Schema 3 later gained, without a new number (a record only gains fields): the status `outcome_unknown` (the process
+that held the run was gone before it finished: SIGKILL, OOM, power loss; what it did is not known), `stop_subtype`
+(the runner's own word for how it stopped, kept as it said it), `fault` (`provider` when the model's service failed:
+unavailable, rate-limited or refused the request as invalid), `retry_after_s`, `approval` (the switch setting and the
+words of the permission a run acted under), `run_key` (one net effect per job and trigger) and `chain_depth` (how many
+jobs started this one). Two rules hold at `append`, the one door every record goes through: a turn or budget stop is
+never `ok`, and an `ok` names no fault.
 """
 
 from __future__ import annotations
@@ -60,10 +68,27 @@ KEYS = (
     "purpose",
     "stop_reason",
     "reservation",
+    "stop_subtype",
+    "fault",
+    "retry_after_s",
+    "approval",
+    "run_key",
+    "chain_depth",
 )
 GREEN_LEVELS = ("targeted", "package", "full", "merge_ready")
 TOKEN_KEYS = ("input", "output", "cache_creation", "cache_read")
-STATUSES = ("ok", "error", "timeout", "refused", "preempted", "expired")
+STATUSES = ("ok", "error", "timeout", "refused", "preempted", "expired", "outcome_unknown")
+FAULTS = ("provider",)
+UPSTREAM = ("unavailable", "rate_limited", "invalid")  # the provider's failures, typed by the adapter, never by text
+EXPECTED = ("skipped", "nothing_to_do")  # a job that had nothing to do came to what it should: ok, not an error
+# A runner's stop subtype that means it ran out of something before its work was done, and the stop reason it becomes.
+LIMIT_SUBTYPES = {
+    "error_max_turns": "max_turns",
+    "error_max_budget_usd": "max_budget",
+    "max_turns": "max_turns",
+    "max_budget": "max_budget",
+}
+OK_SUBTYPES = (None, "success")
 
 
 def runs_path(env: dict | None = None) -> Path:
@@ -113,6 +138,56 @@ def new(**fields) -> dict:
     return rec
 
 
+def upstream(kind: str, retry_after_s: float | None = None, error: str | None = None) -> dict:
+    """The fields of a run the provider failed (`kind` from UPSTREAM, typed by the adapter): an error that is the
+    provider's fault, with the wait it asked for when it named one. Merge them into the record."""
+    if kind not in UPSTREAM:
+        raise ValueError(f"not an upstream failure: {kind!r} (known: {', '.join(UPSTREAM)})")
+    wait = float(retry_after_s) if _finite(retry_after_s) else None
+    return {"status": "error", "stop_reason": f"upstream:{kind}", "fault": "provider", "retry_after_s": wait,
+            "error": (error or f"the provider said {kind.replace('_', ' ')}")[:300]}  # fmt: skip
+
+
+def expected(kind: str) -> dict:
+    """The fields of a run that came to an expected outcome (`skipped`, `nothing_to_do`): ok, with that stop reason."""
+    if kind not in EXPECTED:
+        raise ValueError(f"not an expected outcome: {kind!r} (known: {', '.join(EXPECTED)})")
+    return {"status": "ok", "stop_reason": kind, "fault": None}
+
+
+def unknown_outcome(
+    run_id: str, job: str, started: datetime, ended: datetime, *, purpose: str | None = None, why: str = "", **fields
+) -> dict:
+    """The record of a run whose holder was gone before it finished (SIGKILL, OOM, power loss): status
+    `outcome_unknown`, the real duration from start to `ended` (the last moment it could have been running), and no
+    claim about what it did. One builder, so every place that finds such a run writes the same shape."""
+    ended = max(ended, started)
+    return new(
+        run_id=run_id, job=job, started_at=iso(started), ended_at=iso(ended), status="outcome_unknown",
+        duration_ms=int((ended - started).total_seconds() * 1000), purpose=purpose, stop_reason="owner_gone",
+        error=(why or "the process that held this run was gone before it finished; what it did is not known")[:300],
+        **fields,
+    )  # fmt: skip
+
+
+def checked(rec: dict) -> dict:
+    """The record with the two rules applied: an `ok` whose runner stopped on a turn or budget limit (or on any subtype
+    that is not success) becomes an error with the limit as its stop reason, and an `ok` carries no fault. A record that
+    is already an error keeps its status and gains the limit as its stop reason. Returns a copy; `rec` is unchanged."""
+    rec = dict(rec)
+    sub = rec.get("stop_subtype")
+    if rec.get("status") == "ok" and sub not in OK_SUBTYPES:
+        rec.update(
+            status="error", stop_reason=LIMIT_SUBTYPES.get(sub, "runner_error"),
+            error=rec.get("error") or f"the runner stopped: {sub}"[:300],
+        )  # fmt: skip
+    elif sub in LIMIT_SUBTYPES and rec.get("stop_reason") in (None, "runner_error"):
+        rec["stop_reason"] = LIMIT_SUBTYPES[sub]
+    if rec.get("status") == "ok":
+        rec["fault"] = None
+    return rec
+
+
 def _this_month(rec: dict) -> bool:
     """A record from this UTC month or the last: rotation keeps any file that holds one. (Only this month counts against
     the cap; last month's are kept a little longer so a month boundary, or a clock a day out, never loses the spend.)"""
@@ -134,6 +209,7 @@ def append(path: Path, rec: dict, **limits) -> Path:
     missing = [k for k in KEYS if k not in rec]
     if missing:
         raise ValueError(f"run record is missing {', '.join(missing)}")
+    rec = checked(rec)
     try:
         jsonl.append(path, rec, keep_if=_this_month, time_keys=RUN_TIME_KEYS, **limits)
     except OSError as e:
@@ -192,7 +268,7 @@ def _token_count(rec: dict) -> int | None:
 
 def _started(rec: dict) -> bool:
     """Did the runner start? (A refusal, a missing runner or an unreachable broker spent nothing.)"""
-    if rec.get("status") in ("ok", "timeout", "preempted"):
+    if rec.get("status") in ("ok", "timeout", "preempted", "outcome_unknown"):
         return True
     return rec.get("status") == "error" and (
         rec.get("exit_code") is not None or str(rec.get("error", "")).startswith("interrupted")

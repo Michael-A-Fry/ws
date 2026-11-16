@@ -7,7 +7,7 @@ moment as RFC 3339 text, which `ws.jsonl` needs for its stamp. Every write goes 
 
 A repo's data class decides what the store may hold: the strictest of the named repo's class and the working folder's
 (from the policy), or any hit on the sensitive-terms file, stores the ask redacted (no text, no options, a hashed dedupe
-key). The class is checked again when an ask is read, so a repo walled after it was asked shows as opaque. A token-shaped secret is refused outright. Notify is not built: `NOTIFY_HOOK` does nothing.
+key). The class is checked again when an ask is read, so a repo walled after it was asked shows as opaque. A token-shaped secret is refused outright.
 """
 
 from __future__ import annotations
@@ -44,10 +44,8 @@ LIMITS = {
 MAX_OPTIONS = 6
 LOCK_WAIT_S = 30.0  # how long a writer waits for `asks.lock` before it gives up
 MAX_BYTES = 8 * 1024 * 1024  # a log turns over here, well under the 64 MiB `ws home` reads
-DEFAULT_WAIT = 540  # seconds: under a 10-minute tool limit
 RANK = {a: i for i, a in enumerate(policy.ACCESS)}  # a higher number is stricter
 FLOWS = {"full": "full", "walled": "counts", "counts-only": "off"}  # the old program's `flows_back`, by policy access
-NOTIFY_HOOK = None  # a function(ask) a later release may set; nothing is sent by default
 _ID = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
 _TARGET = re.compile(r"\A[A-Za-z0-9_.:@%=+][A-Za-z0-9_.:@%=+-]*\Z")  # a tmux target: no leading '-'
 
@@ -261,10 +259,6 @@ def fold(recs: list[dict]) -> dict[str, dict]:
     return asks
 
 
-def _ts(ask: dict) -> int:
-    return _ms(ask.get("ts")) or 0
-
-
 def load(env=None) -> dict[str, dict]:
     return fold(records(env))
 
@@ -432,15 +426,10 @@ def age_text(ts) -> str:
     if not isinstance(ts, (int, float)) or isinstance(ts, bool):
         return "?"
     s = max(0, int(time.time() - ts / 1000))
-    return (
-        f"{s}s"
-        if s < 90
-        else f"{round(s / 60)}m"
-        if s < 5400
-        else f"{round(s / 3600)}h"
-        if s < 172800
-        else f"{round(s / 86400)}d"
-    )
+    for limit, size, unit in ((90, 1, "s"), (5400, 60, "m"), (172800, 3600, "h")):
+        if s < limit:
+            return f"{round(s / size)}{unit}"
+    return f"{round(s / 86400)}d"
 
 
 def _parse_option(raw: str) -> dict:
@@ -485,7 +474,7 @@ def cmd_add(args) -> int:
 
 def cmd_list(args) -> int:
     pol = _policy(_env())
-    asks = sorted(load().values(), key=_ts)
+    asks = sorted(load().values(), key=lambda a: a["ts"] or 0)
     rows = [view(a, pol=pol) for a in asks if args.all or a["status"] == "open"]
     if args.json:
         output.result({"asks": rows})

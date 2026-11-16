@@ -136,8 +136,9 @@ folders and not in one, because the wall makes those read-only. `ws uninstall` r
 state in SQLite. It holds the queued work (table `work`, the `ws._vendor.sqlqueue` engine) and a receipt for every run
 (table `receipts`): its status (`queued`, `running`, `ok`, `error`, `refused`, `preempted`, `skipped`, `interrupted`,
 `expired`), the UTC month it counts in, what was reserved (money, turns, seconds, memory, lane), who owns it (process id
-and start time), what it came to when settled (cost, tokens, stop reason) and its run key (`run_key`). A database
-file carries its layout version in `PRAGMA user_version` (now 3: 2 added `parent_run_id`, 3 `run_key`); a later
-change to the tables takes a new number, and an older file gains the new columns when it's opened. The money
-counted against a cap is the month's records in `logs/runs.jsonl` plus the open reservations here, never both for
-one run. See [the queue](queue.md).
+and start time), what it came to when settled (cost, tokens, stop reason), its run key and its chain depth. Table
+`ticks` holds each scheduled job's last ticked slot. A database file carries its layout version in
+`PRAGMA user_version` (now 4: 2 added `parent_run_id`, 3 `run_key`, 4 `chain_depth` and `ticks`); a later change to
+the tables takes a new number, and an older file gains the new columns when it's opened. The money counted against
+a cap is the month's records in `logs/runs.jsonl` plus the open reservations here, never both for one run. See
+[the queue](queue.md).

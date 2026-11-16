@@ -46,6 +46,8 @@ folders read-only, and the gate refuses a session's writes to each of them in ei
 
 | Log | Path under its folder | Writer | Fields | Schema | Time key | Kept |
 |---|---|---|---|---|---|---|
+| Secret audit | `logs/secrets-audit.jsonl` | `src/ws/secrets.py` (generate, reveal) | `type` (`ws.secret-audit/1`), action (generate, reveal), name, result, user, in_session; never a value, link or token | 1 | `ts` | Rotates at 5 MiB |
+| Job installs | `logs/jobs-installed.jsonl` | `src/ws/jobcmd.py` (`ws job add`, `ws job remove`) | `type` (`ws.job-install/1`), action (add, replace, remove), job, sha256, widened, approved, in_session; never the prompt | 1 | `ts` | Rotates at 5 MiB |
 | Run records | `logs/runs.jsonl` | `src/ws/runrecord.py` (for `ws run`) | The keys of the run-record schema (`ws.runschema.SCHEMA`): job, runner, models, tokens, cost, status, `purpose`, `stop_reason`, `reservation` | 3 | `started_at`, `ended_at` | Rotates at 5 MiB; an old file that holds a record from this or last month stays |
 | Run records, fallback | `logs/runs.fallback.jsonl` | `src/ws/runrecord.py` | The same record, when `runs.jsonl` can't be written | 3 | `started_at`, `ended_at` | Never rotated or locked; `read` includes it |
 | Ratings | `ratings.jsonl` | `src/ws/rating.py` | `schema`, `ts`, `run_id`, `rating` (`up` or `down`), `note`, `who` | 1 | `ts` | Rotates at 5 MiB; old files and the lock sit in `logs/` |

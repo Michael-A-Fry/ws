@@ -274,6 +274,38 @@ ws secret import [-h] --from-env PATH [--var VAR] [--delete-source] name
 | `--var VAR` | Which variable, when the file has several lines. |
 | `--delete-source` | Remove the env file after the value is stored. |
 
+### `ws secret generate`
+
+Make a strong random value for a `source = "generate"` name (never shown).
+
+```text
+ws secret generate [-h] [--replace] name
+```
+
+| Argument | Meaning |
+|---|---|
+| `name` | A name registered in `secrets.toml` with `source = "generate"`. |
+| `--replace` | Make a new value even if one is stored. |
+
+### `ws secret reveal`
+
+Show a generated value once, on your own device, through a one-time page.
+
+```text
+ws secret reveal [-h] [--owner LOGIN] [--bind ADDR] [--minutes MINUTES] [--again] [--notify] name
+```
+
+| Argument | Meaning |
+|---|---|
+| `name` | A name registered with `source = "generate"` that has a value. |
+| `--owner LOGIN` | The tailnet login (or its start) whose device may open it; default `owner` in `[roles.secrets]`, which has no default. |
+| `--bind ADDR` | The one tailnet address to listen on (default: `tailscale ip -4`). |
+| `--minutes MINUTES` | How long the link works, at most 15 (default 15). |
+| `--again` | Show a value that was already shown once. |
+| `--notify` | Push the link to your phone through `[roles.notify]`, so you tap it there. The link goes through your ntfy server; only your own device can open it, once. |
+
+Exit 0 when the value was shown, 1 when the link expired unused.
+
 ### `ws secret list`
 
 Names, hosts, set/unset and owner; never values.
@@ -528,6 +560,41 @@ ws run [-h] [--dry-run] [--parent RUN_ID] job
 | `job` | The job name: ~/.config/ws/jobs/<name>.toml. |
 | `--dry-run` | Show what would start, and whether it would be refused. |
 | `--parent RUN_ID` | Reserve only from what this run in progress has left, on top of the monthly cap. |
+
+A job put in place by `ws job add` is pinned: `ws run` refuses it if its file or prompt_file changed since.
+
+## `ws job`
+
+Add a job file (checked, copied and pinned) or remove one. Every add, replace and remove writes one line to
+`jobs-installed.jsonl` in the state folder's `logs/`.
+
+### `ws job add`
+
+Check a job file, copy it into the jobs folder and pin its sha256.
+
+```text
+ws job add [-h] [--replace] [--no-apply] path
+```
+
+| Argument | Meaning |
+|---|---|
+| `path` | The job file, `NAME.toml`. Its `prompt_file` (a file name next to it) is copied with it. |
+| `--replace` | Replace an installed job of the same name. The diff is shown first. |
+| `--no-apply` | Don't run `ws schedule apply` afterwards. |
+
+It refuses (exit 3) a tool outside `[gate] allow_mcp`, the built-in tools that write or run commands (Write, Edit,
+MultiEdit, NotebookEdit, Bash), a `[[secrets]]` name, host or purpose the registry doesn't allow, `runner_options` env,
+exe or provider, and a `budget_usd` above `monthly_cap_usd` or the purpose's cap. A job that doesn't load is a usage
+error (exit 2). Inside an agent session, a job that adds a secret, tool, schedule, command or higher budget than the
+installed jobs have needs `ws approve` once; a same-power fix doesn't.
+
+### `ws job remove`
+
+Stop a job's timer, delete what `ws job add` copied and drop its pin.
+
+```text
+ws job remove [-h] name
+```
 
 ## `ws runs`
 
@@ -1024,12 +1091,15 @@ ws notify test [-h]
 Send a push, or a digest with --digest, if today's cap allows.
 
 ```text
-ws notify send [-h] [--title TITLE] [--digest] message
+ws notify send [-h] [--from-file PATH] [--fresh MINUTES] [--click URL] [--title TITLE] [--digest] [message]
 ```
 
 | Argument | Meaning |
 |---|---|
-| `message` | The message text. |
+| `message` | The message text (or `--from-file`). |
+| `--from-file PATH` | Send the first line with text in this file, such as the summary a job wrote (at most 300 characters). |
+| `--fresh MINUTES` | With `--from-file`: send only if the file changed in the last MINUTES, so an old summary is never sent as news (exit 0, 0 sent). |
+| `--click URL` | The link the push opens when tapped, such as your drafts folder (http or https). |
 | `--title TITLE` | The push title (default `ws`). |
 | `--digest` | The one daily digest, not a push. |
 

@@ -324,6 +324,8 @@ KINDS: dict[str, Kind] = dict(
             ("schema", "ts", "agent", "session", "connector", "tool", "decision", "rule"),
         ),
         _logrow("wall-report", "sandbox", "Wall report", _state("logs", "wall-report")),
+        _logrow("secret-audit", "secrets", "Secret audit", _state("logs", "secrets-audit")),
+        _logrow("job-install", "jobcmd", "Job installs", _state("logs", "jobs-installed")),
         _logrow(
             "footprint",
             "node",
@@ -384,6 +386,8 @@ LINK_SPEC: dict[str, tuple[tuple[str, str, str], ...]] = {
             "gate-call",
             "verdict",
             "wall-report",
+            "secret-audit",
+            "job-install",
             "footprint",
             "job-alert",
             "upgrade",

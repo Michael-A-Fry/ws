@@ -11,9 +11,10 @@ import re
 from datetime import UTC, datetime
 from pathlib import Path
 
-from ws import canary, connectors, gate, jobwatch, jsonl, rating, runrecord, sandbox, upgrade
+from ws import canary, connectors, gate, jobcmd, jobwatch, jsonl, rating, runrecord, sandbox, upgrade
 from ws import eval as ws_eval
 from ws import node as ws_node
+from ws import secrets as wsecrets
 from ws.adapters import opencode
 from ws.guards import claims, record_calls
 
@@ -40,6 +41,8 @@ SCHEMAS = {
     "asks.jsonl": opencode.ASKS_SCHEMA,  # `ws ask` writes the same number: see the test below
     "alerts.jsonl": jobwatch.SCHEMA_VERSION,
     "upgrade-history.jsonl": upgrade.HISTORY_SCHEMA,
+    "secrets-audit.jsonl": wsecrets.AUDIT_SCHEMA,
+    "jobs-installed.jsonl": jobcmd.LOG_SCHEMA,
     "connector-calls.jsonl": connectors.SCHEMA_VERSION,
 }
 

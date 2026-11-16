@@ -8,6 +8,20 @@ body of the GitHub release.
 
 ## [Unreleased]
 
+### Added
+
+- Vale runs before each commit (the upstream `vale` hook at v3.25.1, the version CI downloads), over the same files and
+  with the same style as CI's Vale step. It syncs the style package only when it's missing, so a fresh clone passes.
+- The e2e first-task script prints the pending systemd jobs and the process list when a SIGTERM reaches it from
+  outside, so a CI runner stopped mid-job says who stopped it.
+
+### Changed
+
+- The pre-push hook runs the tests through `ws-test --light --node local --` (`--full` for `WS_PREPUSH_FULL=1`) when
+  `ws-test` is on the PATH and `WS_PREPUSH_WRAP` is unset or only spaces, so a busy machine queues the push's tests
+  (for up to `WS_TEST_WAIT`, 45 minutes) and caps their workers instead of timing them out. `WS_PREPUSH_WRAP=` (empty)
+  runs them bare.
+
 ### Fixed
 
 - The gate: ssh options that run or load local files are now judged (an `-o` keyword ws doesn't know runs nothing

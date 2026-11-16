@@ -566,8 +566,11 @@ class Ledger:
         try:
             os.close(os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600))
         except FileExistsError:
-            if stat.S_ISLNK(os.lstat(self.path).st_mode):
+            st = os.lstat(self.path)
+            if stat.S_ISLNK(st.st_mode):
                 raise OSError(f"{self.path} is a symbolic link") from None
+            if st.st_mode & 0o077:
+                os.chmod(self.path, 0o600)  # a chmod, unlike a close, leaves every lock where it is
         c = sqlite3.connect(str(self.path), isolation_level=None, timeout=self.limits.busy_s, check_same_thread=False)
         try:
             c.row_factory = sqlite3.Row

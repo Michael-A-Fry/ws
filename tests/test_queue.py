@@ -2053,3 +2053,32 @@ def test_planted_tick_after_a_kill_runs_the_slot(tmp_path):
     assert ledger.tick("nightly", None, nxt, nxt)[0] == "queued"
     assert ledger.receipt(run_id)["stop_reason"] == "owner_gone"
     assert len(told) == 1 and told[0].startswith("outcome_unknown")
+
+
+def test_opening_a_second_ledger_never_closes_a_descriptor_of_the_open_database(tmp_path, monkeypatch):
+    """Closing any descriptor of a file drops every POSIX lock the process holds on it, a live connection's too
+    (C507: a child that wrote the queue then took itself for the last connection and removed the WAL index)."""
+    first = make(tmp_path)
+    first.enqueue("j", None, T0)  # the database exists and this process holds a connection to it
+    db = os.path.realpath(first.path)
+    opened: dict[int, str] = {}
+    closed_db: list[int] = []
+    real_open, real_close = os.open, os.close
+
+    def spy_open(path, flags, *a, **kw):
+        fd = real_open(path, flags, *a, **kw)
+        opened[fd] = os.path.realpath(path)
+        return fd
+
+    def spy_close(fd):
+        if opened.pop(fd, None) == db:
+            closed_db.append(fd)
+        return real_close(fd)
+
+    monkeypatch.setattr(queue.os, "open", spy_open)
+    monkeypatch.setattr(queue.os, "close", spy_close)
+    second = make(tmp_path)
+    second.conn()
+    assert closed_db == []
+    monkeypatch.undo()
+    assert first.receipts(last=5) and second.receipts(last=5)

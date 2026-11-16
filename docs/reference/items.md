@@ -34,6 +34,8 @@ gate call has no payload, an approval has no bound command, an OpenCode ask has 
 | `claim` | `guards.claims` | Claims | `h[0-9a-f]{12}` | truth | append-only |
 | `verdict` | `gate` | Gate verdicts | `h[0-9a-f]{12}` | truth | append-only |
 | `wall-report` | `sandbox` | Wall report | `h[0-9a-f]{12}` | truth | append-only |
+| `secret-audit` | `secrets` | Secret audit | `h[0-9a-f]{12}` | truth | append-only |
+| `job-install` | `jobcmd` | Job installs | `h[0-9a-f]{12}` | truth | append-only |
 | `footprint` | `node` | Node footprint | `h[0-9a-f]{12}` | truth | append-only |
 | `ask` | `adapters.opencode` | OpenCode asks | `\S+` | truth | append-only |
 | `broker` | `broker` | Broker audit | `h[0-9a-f]{12}` | truth | append-only |

@@ -209,7 +209,7 @@ test = "test_parity_env_file_write"
 [[hook]]
 id = "scheduled-branch-move"
 what = "Blocks a headless job moving the branch of a main checkout"
-ws = "the `checkout-pin` guard: a main checkout that has linked worktrees stays where it is for any session, a timer's job included, so no job marker is needed"
+ws = "the `checkout-pin` guard: no session, a timer's job included, can move the branch of a main checkout that has linked worktrees, so no job marker is needed"
 status = "covered"
 fail = "blocks"
 test = "test_parity_scheduled_branch_move"

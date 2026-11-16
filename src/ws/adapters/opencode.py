@@ -47,6 +47,7 @@ from ws.output import WsError
 from ws.policy import Policy, native_patterns
 
 NAME = "opencode"
+GENERATED_NOTE = "DO NOT EDIT: written by `ws gate generate` from policy.toml; change the policy and run it again"
 CONFIG = "opencode.json"
 PLUGIN = "plugins/ws-gate.js"
 _TOOLS = {"web_fetch": "webfetch", "web_search": "websearch"}
@@ -113,6 +114,14 @@ def unsupported_guards() -> tuple[str, ...]:
 
 # The guards the generated shim cannot run. `ws doctor` names them when a policy has one on.
 UNSUPPORTED_GUARDS = unsupported_guards()
+
+# Checks a policy can ask for that this runner cannot enforce; `ws run` refuses such a job (conformance.refuse_cannot_check).
+# A guard is "guard:NAME" and comes from UNSUPPORTED_GUARDS, so a new guard needs no edit here.
+CANNOT_CHECK = {
+    "mcp": "the hook cannot tell an MCP tool from a built-in one, so allow_mcp and deny_tools globs are not enforced",
+    "allow_hosts": "the OpenCode wall does not filter the network by host",
+    **{f"guard:{g}": "the generated shim cannot run this guard" for g in UNSUPPORTED_GUARDS},
+}
 
 
 # OpenCode writes this file into its config folder at start and will not run if it cannot (1.19.4). Written here at
@@ -283,7 +292,11 @@ def generate(
             permission[_TOOLS[t]] = "deny"
         elif native := _mcp_name(t):
             permission[native] = "deny"
-    config: dict = {"$schema": "https://opencode.ai/config.json", "permission": permission}
+    config: dict = {
+        "$schema": "https://opencode.ai/config.json",
+        "_generated": GENERATED_NOTE,
+        "permission": permission,
+    }
     if (
         POLICIES_SINCE is not None
     ):  # a version whose schema has the key: ws writes it empty until it has a rule to put in
@@ -301,7 +314,7 @@ def generate(
     plugin = plugin.replace("/*__ADVICE__*/ []", json.dumps([e for e in events if e != "post" or post_kinds]))
     plugin = plugin.replace("/*__ASK__*/ []", json.dumps(asks)).replace('/*__ASKS__*/ ""', json.dumps(asks_file(pin)))
     plugin = plugin.replace("/*__ASKS_SCHEMA__*/ 0", str(ASKS_SCHEMA))
-    return {CONFIG: json.dumps(config, indent=2) + "\n", PLUGIN: plugin, IGNORE: IGNORE_TEXT}
+    return {CONFIG: json.dumps(config, indent=2) + "\n", PLUGIN: f"// {GENERATED_NOTE}\n{plugin}", IGNORE: IGNORE_TEXT}
 
 
 _PATCH_PATH = re.compile(r"^\*\*\* (?:Add File|Update File|Delete File|Move to):[ \t]*(\S.*?)[ \t\r]*$", re.MULTILINE)

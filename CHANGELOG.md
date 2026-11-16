@@ -17,6 +17,8 @@ body of the GitHub release.
 
 ### Changed
 
+- The pre-push cap on a capped set grows with the set: 6 s a file, at least 300 s and at most 1800 s, so a large
+  selection doesn't hit 300 s with no failure. `WS_PREPUSH_CAP` still sets it, and the timeout message names it.
 - The pre-push hook runs the tests through `ws-test --light --mem 3G --node local --` (6G with e2e tests or over 40
   files in the set; `--full` for `WS_PREPUSH_FULL=1`) when
   `ws-test` is on the PATH and `WS_PREPUSH_WRAP` is unset or only spaces, so a busy machine queues the push's tests

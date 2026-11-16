@@ -1911,3 +1911,100 @@ def test_a_disk_error_after_admission_is_failed_as_killed_once(tmp_path):
     assert [r["status"] for r in runrecord.read(log)] == ["outcome_unknown"]
     assert len(told) == 1
     assert queue.drain(ledger, lambda item: queue.Outcome(0, "ok", "completed")) == []
+
+
+# ---- chains and ticks (h-L4-19/20, ls-4) -----------------------------------------------------------------------------
+
+
+def test_planted_chain_cap(tmp_path):
+    """A job queued from inside a queued run is one link deeper; past the cap it is refused and said once; a person's
+    add starts again at 0."""
+    told: list[str] = []
+    ledger = make(tmp_path, limits=queue.Limits(busy_s=0.2, chain_cap=2), on_stop=lambda j, r, why: told.append(why))
+    depths: list[int] = []
+    seen_env: list[str | None] = []
+
+    def runner(item):
+        depths.append(item.chain_depth)
+        seen_env.append(os.environ.get(queue.CHAIN_ENV))
+        nxt = queue.chain_depth_from_env()
+        try:
+            ledger.enqueue("loop", None, T0, trigger=f"step-{nxt}", chain_depth=nxt)
+        except output.WsError as e:
+            assert e.kind == "chain_cap" and e.exit_code == queue.EXIT_REFUSED
+        return queue.Outcome(0, "ok", "completed")
+
+    ledger.enqueue("loop", None, T0, trigger="start", chain_depth=queue.chain_depth_from_env({}))
+
+    def run_one(item):  # what run_item does around the run: the depth is in the environment while it runs
+        old = os.environ.get(queue.CHAIN_ENV)
+        os.environ[queue.CHAIN_ENV] = str(item.chain_depth)
+        try:
+            return runner(item)
+        finally:
+            os.environ.pop(queue.CHAIN_ENV, None) if old is None else os.environ.__setitem__(queue.CHAIN_ENV, old)
+
+    queue.drain(ledger, run_one)
+    assert depths == [0, 1, 2] and seen_env == ["0", "1", "2"]
+    assert len(told) == 1 and told[0].startswith("chain_cap: 3 jobs deep")
+    assert {r["chain_depth"] for r in ledger.receipts(last=10)} == {0, 1, 2}
+    assert queue.chain_depth_from_env({}) == 0 and queue.chain_depth_from_env({queue.CHAIN_ENV: "x"}) == 0
+    assert ledger.enqueue("loop", None, T0, trigger="by-hand")[2] is False  # a human action resets the chain
+
+
+def test_a_watcher_ignores_events_caused_by_ws(tmp_path):
+    ledger = make(tmp_path)
+    assert ledger.on_event("watch", None, "commit-1", T0, by_ws=True) is None
+    first = ledger.on_event("watch", None, "commit-2", T0, by_ws=False)
+    assert first is not None and first[2] is False
+    assert ledger.on_event("watch", None, "commit-2", T0, by_ws=False)[2] is True  # once per event
+    assert [r["run_key"] for r in ledger.receipts(last=5)] == ["watch:commit-2"]
+
+
+def test_planted_double_tick_runs_once(tmp_path):
+    """Two ticks for the same slot, from two processes at the same moment, queue one run; it runs once."""
+    slot = T0
+    results: list[tuple[str, str | None]] = []
+    barrier = threading.Barrier(2)
+
+    def tick():
+        ledger = make(tmp_path, limits=queue.Limits(busy_s=5.0))
+        barrier.wait()
+        results.append(ledger.tick("nightly", None, slot, T0))
+        ledger.close()
+
+    threads = [threading.Thread(target=tick) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sorted(r[0] for r in results) == ["already", "queued"]
+    ledger = make(tmp_path)
+    ran: list[str] = []
+    queue.drain(ledger, lambda item: ran.append(item.run_key) or queue.Outcome(0, "ok", "completed"))
+    assert ran == ["nightly:tick-20261108T030000Z"]
+    assert ledger.tick("nightly", None, slot - timedelta(days=1), T0) == ("already", None)  # an older slot too
+
+
+def test_a_tick_coalesces_while_a_run_is_active_and_skips_a_missed_slot(tmp_path):
+    ledger = make(tmp_path)
+    assert ledger.tick("j", None, T0, T0)[0] == "queued"
+    assert ledger.tick("j", None, T0 + timedelta(hours=1), T0 + timedelta(hours=1)) == ("coalesced", None)
+    assert (
+        ledger.tick("j", None, T0 + timedelta(hours=2), T0 + timedelta(hours=2), coalesce_if_active=False)[0]
+        == "queued"
+    )
+    late = T0 + timedelta(hours=3)
+    assert ledger.tick("k", None, late, late + timedelta(minutes=30), skip_missed_s=600) == ("missed", None)
+    assert ledger.tick("k", None, late, late) == ("already", None)  # the missed slot was still advanced past
+    assert (
+        ledger.tick("k", None, late + timedelta(hours=1), late + timedelta(hours=1), skip_missed_s=600)[0] == "queued"
+    )
+
+
+def test_ws_queue_tick_command(box, capsys):
+    write_job(box)
+    code, out = call(capsys, "queue", "tick", "daily", "--slot", "2026-11-10T03:00:00Z")
+    assert code == 0 and out["data"]["result"] == "queued"
+    code, out = call(capsys, "queue", "tick", "daily", "--slot", "2026-11-10T03:00:00Z")
+    assert code == 0 and out["data"]["result"] == "already"

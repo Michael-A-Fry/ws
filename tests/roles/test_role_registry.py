@@ -29,7 +29,7 @@ def test_the_named_adapters_are_all_there():
     assert got["scheduler"] == {"systemd", "launchd"}
     assert got["notify"] == {"ntfy", "none"}
     assert got["backup"] == {"restic"}
-    assert got["secrets"] == {"ws-secret", "sops-age", "env"}
+    assert got["secrets"] == {"ws-secret", "sops-age", "env", "openbao"}
 
 
 def test_get_names_what_is_known():

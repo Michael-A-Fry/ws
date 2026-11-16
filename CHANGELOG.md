@@ -12,6 +12,8 @@ body of the GitHub release.
 
 - Vale runs before each commit (the upstream `vale` hook at v3.25.1, the version CI downloads), over the same files and
   with the same style as CI's Vale step. It syncs the style package only when it's missing, so a fresh clone passes.
+- The e2e first-task script prints the pending systemd jobs and the process list when a SIGTERM reaches it from
+  outside, so a CI runner stopped mid-job says who stopped it.
 
 ## [0.1.11] - 2026-11-17
 

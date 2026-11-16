@@ -447,7 +447,21 @@ main() {
     return 0
 }
 
+# A SIGTERM from outside (a CI runner's service being stopped, a machine shutting down) says who sent it before the
+# clean-up: on a systemd machine the pending jobs name the unit being stopped, and the process list shows what else is
+# still running. Printed first and fast, while the CI log is still being read.
+on_term() {
+    trap - TERM
+    echo "e2e: SIGTERM from outside the script, at $(date -u +%H:%M:%S.%N | cut -c1-12)Z" >&2
+    if command -v systemctl > /dev/null 2>&1; then
+        systemctl list-jobs --no-pager 2>&1 | head -n 20 | sed 's/^/    jobs: /' >&2
+    fi
+    ps -eo pid,ppid,pgid,user,etimes,args 2> /dev/null | cut -c1-160 | head -n 60 | sed 's/^/    ps: /' >&2
+    exit 143
+}
+
 trap cleanup EXIT
+trap on_term TERM
 main
 rc=$?
 # steps that run inside run_step cannot set these in this shell when they are subshells; they are not (functions run

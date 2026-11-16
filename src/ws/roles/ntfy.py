@@ -51,7 +51,7 @@ last message alerts on its Notification events only. A key that is absent means 
 
 `hub_url` adds ntfy's Click header, `<hub_url>/chat/<session id>`, to a session alert, so a tap opens the hub at that
 session. It is needed because ntfy cannot know where the hub is, and it replaces no setting. Unset, nothing changes.
-An alert gets no Click when the session id is not letters, digits and hyphens (SESSION_ID), or when the session's folder
+An alert gets no Click when the session id is not letters, digits and hyphens, at most 64 (SESSION_ID), or when the session's folder is not known, or when the session's folder
 is in a walled or counts-only class (its id stays out of the push). The reason goes to stderr.
 
 An alert must not hold a session up. The whole send (broker lease included) gets 3 seconds, and runs in a daemon thread
@@ -125,7 +125,7 @@ ALERT_BACKOFF = timedelta(minutes=5)  # after a failed send, alerts wait this lo
 FAIL_CODES = ("timeout", "refused", "error")  # plus http_<status>; "busy", "backoff" and "cap" are not send failures
 _local = threading.local()  # .timeout is set on the thread that sends an alert
 _TOPIC = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
-SESSION_ID = re.compile(r"[A-Za-z0-9-]+")  # the form ws already enforces for a Claude Code session id
+SESSION_ID = re.compile(r"[A-Za-z0-9-]{1,64}")  # the form ws already enforces for a Claude Code session id
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 
 
@@ -166,6 +166,8 @@ def hub_url(cfg: dict) -> str | None:
     v = cfg.get("hub_url")
     if v is None:
         return None
+    if isinstance(v, str) and not re.fullmatch(r"[\x21-\x7e]+", v):  # urlsplit drops \n, \r and \t: refuse them first
+        v = None
     u = urllib.parse.urlsplit(v) if isinstance(v, str) else None
     if u is None or u.scheme != "https" or not u.hostname or u.username or u.password or u.query or u.fragment:
         raise NotifyError("hub_url must be an https address with no login, query or fragment")
@@ -578,6 +580,9 @@ def click_link(cfg: dict, payload: dict, cwd: str, env) -> str | None:
     not match SESSION_ID or the folder is walled (the reason goes to stderr)."""
     base = hub_url(cfg)
     if base is None:
+        return None
+    if not cwd:
+        print("ws: alert has no click link: the session's folder is unknown, so it cannot be checked", file=sys.stderr)
         return None
     sid = payload.get("session_id")
     if not isinstance(sid, str) or not SESSION_ID.fullmatch(sid):

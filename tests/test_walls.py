@@ -1359,9 +1359,24 @@ def test_no_hub_url_means_no_click(host):
     assert "Click" not in _click_alert(host, {}, {"session_id": "ab-12"})
 
 
-@pytest.mark.parametrize("sid", ["a/b", "..", "a..b", "a.b", "", None])
+@pytest.mark.parametrize("sid", ["a/b", "..", "a..b", "a.b", "", None, "a" * 65])
 def test_a_bad_session_id_gets_no_click(host, sid):
     assert "Click" not in _click_alert(host, {"hub_url": "https://hub.example.org"}, {"session_id": sid})
+
+
+def test_an_unknown_folder_gets_no_click(host):
+    from ws.roles import ntfy
+
+    cfg = {"adapter": "ntfy", "url": "https://ntfy.example.org/t", "hub_url": "https://hub.example.org"}
+    payload = {"hook_event_name": "Notification", "session_id": "ab-12"}
+    sender = _Sender()
+    ntfy.alert(cfg, dict(os.environ), payload, "c", now=NOW, sender=sender)
+    assert "Click" not in sender.calls[0][1]
+
+
+def test_a_64_character_id_keeps_its_click(host):
+    h = _click_alert(host, {"hub_url": "https://hub.example.org"}, {"session_id": "a" * 64})
+    assert h["Click"].endswith("a" * 64)
 
 
 def test_a_walled_session_gets_no_click(host):
@@ -1370,7 +1385,17 @@ def test_a_walled_session_gets_no_click(host):
 
 
 @pytest.mark.parametrize(
-    "bad", ["http://hub.example.org", "hub.example.org", "https://u:p" + chr(64) + "hub.example.org", 5]
+    "bad",
+    [
+        "http://hub.example.org",
+        "hub.example.org",
+        "https://u:p" + chr(64) + "hub.example.org",
+        5,
+        "https://hub.example.org\nX-Evil: 1",
+        "https://hub.example.org\t",
+        "https://hub.example.org/\u00e9",
+        "https://hub .example.org",
+    ],
 )
 def test_a_bad_hub_url_is_refused(host, bad):
     from ws.roles import ntfy

@@ -357,6 +357,30 @@ def test_parity_config_guard(box, monkeypatch):
     assert hook(box, on, call("Write", cwd=box / "mine", **edit)) == 2  # the call moved itself into the owner's folder
 
 
+@needs_git
+def test_parity_commit_wall(box, monkeypatch):
+    """The commit wall refuses a staged line or a message that matches a pattern the person supplied, and a line the
+    exceptions file names goes through (the fuller cases are in tests/test_commit_wall.py)."""
+    from ws import commit_wall
+
+    monkeypatch.setenv("WS_HOME", str(box / "w"))
+    plant = "zz" + "planted" + "-name"
+    folder = commit_wall.folder()
+    folder.mkdir(parents=True)
+    (folder / "patterns.toml").write_text(f'[[pattern]]\nname = "plant"\nterms = ["{plant}"]\n')
+    repo = box / "wallrepo"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    (repo / "f.txt").write_text(f"a line with {plant}\n")
+    git(repo, "add", "f.txt")
+    assert cli.main(["commit-wall", "check", "--repo", str(repo)]) == 1
+    (folder / "exceptions.toml").write_text('[[allow]]\npattern = "plant"\npath = "f.txt"\n')
+    assert cli.main(["commit-wall", "check", "--repo", str(repo)]) == 0
+    msg = box / "msg"
+    msg.write_text(f"subject {plant}\n")
+    assert cli.main(["commit-wall", "check", "--repo", str(repo), "--stage", "commit-msg", str(msg)]) == 1
+
+
 # --- the page and these tests agree ------------------------------------------------------------------------------
 
 

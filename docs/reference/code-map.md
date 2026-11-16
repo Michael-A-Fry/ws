@@ -19,6 +19,7 @@ below, and `python3 scripts/gen_code_map.py --check` (prek and CI) fails when it
 | `broker.py` | The secrets broker: a small process that is not an LLM and holds the store, so agents never see... |
 | `canary.py` | `ws canary`: a few small checks that a runner's update did not break what ws relies on |
 | `cli.py` | The `ws` command |
+| `commit_wall.py` | commit-wall: a commit hook that refuses a commit whose added lines or message hold a pattern you... |
 | `config_cmd.py` | `ws config`: every file ws reads, where its path came from, and the keys it sets |
 | `conformance.py` | The runner conformance kit: what every runner adapter must do the same way, as data and a few... |
 | `context_load.py` | Context loader: what a session is told when it starts, and what the first prompt adds, from one... |

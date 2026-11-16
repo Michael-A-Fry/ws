@@ -51,7 +51,7 @@ covered row runs in the same fixed order: the policy's rules first, then the gua
 | 24 | `force-push-main` | Blocks a force-push to, or deletion of, the main branch on a remote | a `deny_commands` rule or a guard, decided in wave 2b | planned (wave 2b) | blocks | none |
 | 25 | `env-file-write` | Blocks a shell command that writes a secret `.env` file | a `deny_commands` rule or a guard, decided in wave 2b | planned (wave 2b) | blocks | none |
 | 26 | `scheduled-branch-move` | Blocks a headless job moving the branch of a main checkout | a guard that reads the job marker, decided in wave 2b | planned (wave 2b) | blocks | none |
-| 27 | `commit-wall` | Scans the staged diff and the commit message for patterns the person supplies | a commit hook installed by `core.hooksPath` (wave 3) | planned (wave 3) | blocks | none |
+| 27 | `commit-wall` | Scans the staged diff and the commit message for patterns the person supplies | `ws commit-wall`, installed by `core.hooksPath`: the added lines of the staged diff and the commit message are checked against patterns the person supplies (ws ships none); a merge is scanned for the lines new to it, a file over 1 MB is skipped and said so, an exceptions file only a person edits lets a line through, and a hook that can't run ws blocks the commit | covered | blocks | `test_parity_commit_wall` |
 | 28 | `test-run-discipline` | Requires test commands to run in the foreground through a wrapper that serialises and bounds them | none; the wrapper is one person's tool (a `deny_commands` pattern can ask for yours) | estate | blocks | none |
 | 29 | `duplicate-session` | Warns when two live sessions share a session id or a folder | none; it reads one person's session files | estate | never-blocks | none |
 

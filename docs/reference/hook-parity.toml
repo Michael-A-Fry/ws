@@ -221,11 +221,10 @@ test = "none"
 [[hook]]
 id = "commit-wall"
 what = "Scans the staged diff and the commit message for patterns the person supplies"
-ws = "a commit hook installed by `core.hooksPath` (wave 3)"
-status = "planned"
+ws = "`ws commit-wall`, installed by `core.hooksPath`: the added lines of the staged diff and the commit message are checked against patterns the person supplies (ws ships none); a merge is scanned for the lines new to it, a file over 1 MB is skipped and said so, an exceptions file only a person edits lets a line through, and a hook that can't run ws blocks the commit"
+status = "covered"
 fail = "blocks"
-wave = "3"
-test = "none"
+test = "test_parity_commit_wall"
 
 [[hook]]
 id = "test-run-discipline"

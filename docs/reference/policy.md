@@ -102,6 +102,10 @@ The default list, which `ws gate init` writes:
 - Recursive deletes of `/`, `/*`, `~`, `~/*`, `/home`, `/Users`, and of the system folders `/bin`, `/boot`, `/dev`, `/etc`,
   `/lib`, `/lib64`, `/proc`, `/root`, `/sbin`, `/sys`, `/usr`, `/System` and `/Library`. Written as `rm -* PATH`.
 - A forcing push in any spelling: `git push*--force*`, `git push* -f*`, and both with git's global options.
+- Deleting a remote branch: `git push*--delete*`, `git push* -d *` and `git push* :*` (an empty source), with git's global
+  options too.
+- A shell writing a file that holds secrets: a redirect (`>` or `>>`) or `tee` into `.env`, `.env.local`,
+  `.env.production` or `.env.development`. An `.env.example` is free.
 - `mkfs*` and `dd*of=/dev/*`.
 - A shell that reads its script from standard input: `sh`, `sh -s*` and `sh -`, and the same three for `bash`, `zsh` and
   `dash`.

@@ -501,6 +501,7 @@ def live_box(tmp_path, monkeypatch):
     return work
 
 
+@pytest.mark.large  # two real runner sessions, as in tests/e2e: 49 s alone, past the 60 s small limit under load
 def test_live_gate_blocks_and_allows(exp, tmp_path, live_box, attempt):
     def row():
         if exp.runner not in LIVE:

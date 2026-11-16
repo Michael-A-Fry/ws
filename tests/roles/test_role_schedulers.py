@@ -794,16 +794,31 @@ def test_schedule_script_stops_a_script_past_its_timeout(box, write_job, capsys)
     assert cli.main(["schedule", "script", "upkeep"]) == 124 and "timeout" in capsys.readouterr().err
 
 
-def test_a_slot_the_clocks_skipped_is_the_one_before():
+@pytest.fixture
+def local_zone(monkeypatch):
+    """Set this process's own zone for one test, as a POSIX TZ rule (no time zone database needed), and put it back.
+    The production path (tz=None) reads the zone through the C library, as systemd and launchd do."""
+    import time
+
+    def set_zone(rule: str) -> None:
+        monkeypatch.setenv("TZ", rule)
+        time.tzset()
+
+    yield set_zone
+    monkeypatch.undo()
+    time.tzset()
+
+
+NEW_YORK = "EST5EDT,M3.2.0,M11.1.0"  # clocks jump 02:00 -> 03:00 on 2026-03-08 (07:00Z)
+AUCKLAND = "NZST-12NZDT,M9.5.0,M4.1.0/3"  # clocks go back 03:00 NZDT -> 02:00 NZST at 2027-04-03T14:00Z
+
+
+def test_a_slot_the_clocks_skipped_is_the_one_before(local_zone):
     """daily 02:30 on the morning New York's clocks jump from 02:00 to 03:00: there is no 02:30 today, so the latest
     slot at or before 03:00:30 is yesterday's, never one later than now."""
-    zoneinfo = pytest.importorskip("zoneinfo")
-    try:
-        ny = zoneinfo.ZoneInfo("America/New_York")
-    except zoneinfo.ZoneInfoNotFoundError:
-        pytest.skip("no time zone data here")
+    local_zone(NEW_YORK)
     now = datetime(2026, 3, 8, 7, 0, 30, tzinfo=UTC)  # 03:00:30 EDT, just after the jump
-    got = jobs.latest_slot(jobs.parse_schedule("daily 02:30", "t"), now, ny)
+    got = jobs.latest_slot(jobs.parse_schedule("daily 02:30", "t"), now)
     assert got <= now and got == datetime(2026, 3, 7, 7, 30, tzinfo=UTC)  # 02:30 EST the day before
 
 
@@ -823,24 +838,6 @@ def test_schedule_script_is_refused_in_a_gated_session(box, write_job, capsys, m
     assert cli.main(["schedule", "script", "upkeep"]) == 3 and "gated session" in capsys.readouterr().err
 
 
-@pytest.fixture
-def auckland(monkeypatch):
-    """This process's own zone set to New Zealand for one test (the production path reads it through the C library)."""
-    import time
-
-    if not hasattr(time, "tzset"):
-        pytest.skip("no tzset on this platform")
-    monkeypatch.setenv("TZ", "Pacific/Auckland")
-    time.tzset()
-    if time.localtime(1806761100).tm_isdst != 0:  # 2027-04-03T14:05Z is after the clocks go back
-        monkeypatch.undo()
-        time.tzset()
-        pytest.skip("no time zone data for Pacific/Auckland here")
-    yield
-    monkeypatch.undo()
-    time.tzset()
-
-
 @pytest.mark.parametrize(
     ("when", "now", "want"),
     [  # New Zealand's clocks go back from 03:00 NZDT to 02:00 NZST at 2027-04-03T14:00Z: 02:00 to 03:00 happens twice
@@ -849,7 +846,8 @@ def auckland(monkeypatch):
         ("every 5m", "2027-04-03T14:07:00", "2027-04-03T14:05:00"),
     ],
 )
-def test_the_machines_own_zone_keeps_the_fold(auckland, when, now, want):
+def test_the_machines_own_zone_keeps_the_fold(local_zone, when, now, want):
+    local_zone(AUCKLAND)
     got = jobs.latest_slot(jobs.parse_schedule(when, "t"), datetime.fromisoformat(now).replace(tzinfo=UTC))
     assert got == datetime.fromisoformat(want).replace(tzinfo=UTC)
 

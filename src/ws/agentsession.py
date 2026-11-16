@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import os
 import posixpath
+import re
 import sys
 from collections.abc import Callable, Mapping
 
@@ -77,6 +78,60 @@ WS_SPAWNED = frozenset({("broker", "serve")})
 # ...and `upgrade` makes its own check first (every sign of a session, a terminal) and then `refusal`, in ws.upgrade.
 SELF_CHECKED = frozenset({("upgrade",)})
 NOT_GUARDED = HOOK_RUN | WS_SPAWNED | SELF_CHECKED  # the commands `guard` lets through to their own code
+
+# The two `ws secret` forms a session may run, exactly as written here and nothing near them: neither shows it a value
+# nor replaces one. `secret generate NAME` (no --replace) makes a value for a name that has none; `secret reveal NAME`
+# (optionally --again, --notify and --minutes N; no --owner, --bind or the loopback mode) serves the owner's own device only. A
+# walled class's session gets neither. Every other `ws secret` stays admin. `ws.policy` (the matcher) reads the words
+# through `session_secret_words`, and `guard` reads the parsed command through `session_secret_args`.
+WALL_MARKER = "WS_WALLED_CLASS"  # as ws.wallsettings.WALL_MARKER (a test pins that they match)
+_SECRET_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+_MINUTES = re.compile(r"^[1-9][0-9]?$")
+
+
+def session_secret_words(words: list[str], env: Mapping[str, str]) -> bool:
+    """True when the words after `ws` (a `-C` folder already dropped) are one of the two session forms, exactly."""
+    if env.get(WALL_MARKER):
+        return False
+    w = words[1:] if words[:1] == ["--json"] else list(words)
+    if len(w) == 3 and w[:2] == ["secret", "generate"]:
+        return bool(_SECRET_NAME.match(w[2]))
+    if len(w) < 3 or w[:2] != ["secret", "reveal"] or not _SECRET_NAME.match(w[2]):
+        return False
+    rest = w[3:]
+    seen: set[str] = set()
+    while rest:
+        flag = rest.pop(0)
+        if flag in seen:
+            return False
+        seen.add(flag)
+        if flag in ("--again", "--notify"):
+            continue
+        if flag == "--minutes" and rest and _MINUTES.match(rest[0]):
+            rest.pop(0)
+            continue
+        return False
+    return True
+
+
+def session_secret_args(command: str, args: object, env: Mapping[str, str]) -> bool:
+    """The same rule, on a command `ws` has parsed: `secret.generate` without --replace, `secret.reveal` without --owner,
+    --bind or the loopback mode, a valid name, and not in a walled class's session."""
+    if env.get(WALL_MARKER):
+        return False
+    name = getattr(args, "name", None)
+    if not isinstance(name, str) or not _SECRET_NAME.match(name):
+        return False
+    if command == "secret.generate":
+        return getattr(args, "replace", True) is False
+    if command == "secret.reveal":
+        return (
+            getattr(args, "allow_loopback", True) is False
+            and getattr(args, "owner", "x") is None
+            and getattr(args, "bind", "x") is None
+        )
+    return False
+
 
 _HOPS = 64  # most ancestors read before the walk stops
 _TOO_DEEP = "a process tree too deep to read"  # the walk's last name when it stopped with processes still above it
@@ -315,6 +370,8 @@ def guard(
     command = getattr(args, "ws_command", "")
     name = admin_name(command, args)
     if name is None or tuple(command.split(".")[:2]) in NOT_GUARDED:
+        return
+    if session_secret_args(command, args, os.environ if env is None else env):
         return
     why = refusal(
         os.environ if env is None else env,

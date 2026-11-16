@@ -1235,7 +1235,9 @@ ws schedule apply [-h] [--dry-run]
 
 Run a script job's reviewed script now. This is what its timer runs. It's refused (exit 3) unless the script is yours,
 closed to other writers and hashes to `script_sha256`. The bytes that were hashed are what runs: ws runs a private copy,
-in the script's own folder, with `WS_SCRIPT_PATH` set to its real path. The output and exit code are the script's.
+kept under its own state folder, in the script's own folder, with `WS_SCRIPT_PATH` set to its real path. Only the
+script is hashed. A file it sources or runs by a relative path is outside the review, so name what it calls by
+absolute path, and keep those files closed to other writers too. The output and exit code are the script's.
 Past the job's `timeout_s` it's stopped and the exit code is 124.
 
 ```text

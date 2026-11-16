@@ -1805,10 +1805,15 @@ def ledger_from_profile(prof: dict, state: Path, log: Path) -> Ledger:
 
 
 def drain_jobs(env=None) -> tuple[str, ...]:
-    """The scheduled jobs that drain the queue (`command = "queue"`): their units run queued jobs in their own process.
+    """The scheduled jobs whose units drain the queue and so run queued jobs, any job's, in their own process: a
+    `command = "queue"` job, and every runner job whose timer ticks and then drains (`ws queue tick JOB --run`).
     Empty when the job files cannot be read."""
+
+    def drains(s: jobs.Scheduled) -> bool:
+        return tuple(s.argv[:2]) == jobs.COMMANDS["queue"] or (s.argv[:2] == ("queue", "tick") and "--run" in s.argv)
+
     try:
-        return tuple(s.name for s in jobs.scheduled(env) if tuple(s.argv[:2]) == jobs.COMMANDS["queue"])
+        return tuple(s.name for s in jobs.scheduled(env) if drains(s))
     except Exception:  # noqa: BLE001  a job folder that does not read only means the unit's own alert goes
         return ()
 

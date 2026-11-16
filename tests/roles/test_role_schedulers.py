@@ -821,3 +821,44 @@ def test_schedule_script_is_refused_in_a_gated_session(box, write_job, capsys, m
     write_job("upkeep", script_job(path, sha))
     monkeypatch.setenv("WS_GATED_SESSION", "1")
     assert cli.main(["schedule", "script", "upkeep"]) == 3 and "gated session" in capsys.readouterr().err
+
+
+@pytest.fixture
+def auckland(monkeypatch):
+    """This process's own zone set to New Zealand for one test (the production path reads it through the C library)."""
+    import time
+
+    if not hasattr(time, "tzset"):
+        pytest.skip("no tzset on this platform")
+    monkeypatch.setenv("TZ", "Pacific/Auckland")
+    time.tzset()
+    if time.localtime(1806761100).tm_isdst != 0:  # 2027-04-03T14:05Z is after the clocks go back
+        monkeypatch.undo()
+        time.tzset()
+        pytest.skip("no time zone data for Pacific/Auckland here")
+    yield
+    monkeypatch.undo()
+    time.tzset()
+
+
+@pytest.mark.parametrize(
+    ("when", "now", "want"),
+    [  # New Zealand's clocks go back from 03:00 NZDT to 02:00 NZST at 2027-04-03T14:00Z: 02:00 to 03:00 happens twice
+        ("hourly", "2027-04-03T13:05:00", "2027-04-03T13:00:00"),  # the first 02:00 (NZDT)
+        ("hourly", "2027-04-03T14:05:00", "2027-04-03T14:00:00"),  # the second 02:00 (NZST): a run, not lost
+        ("every 5m", "2027-04-03T14:07:00", "2027-04-03T14:05:00"),
+    ],
+)
+def test_the_machines_own_zone_keeps_the_fold(auckland, when, now, want):
+    got = jobs.latest_slot(jobs.parse_schedule(when, "t"), datetime.fromisoformat(now).replace(tzinfo=UTC))
+    assert got == datetime.fromisoformat(want).replace(tzinfo=UTC)
+
+
+def test_the_script_runs_from_a_private_copy_under_the_state_folder(box, write_job, capfd):
+    path, sha = _private_script(box, '#!/bin/sh\necho "copy at $0"\n')
+    write_job("upkeep", script_job(path, sha))
+    assert cli.main(["schedule", "script", "upkeep"]) == 0
+    copy = capfd.readouterr().out.split("copy at ", 1)[1].strip()
+    state = box / ".ws"  # WS_HOME: the state folder here
+    assert copy.startswith(str(state)) and "/scripts/run-" in copy
+    assert ((state / "scripts").stat().st_mode & 0o777) == 0o700 and not list((state / "scripts").iterdir())

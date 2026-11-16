@@ -384,3 +384,18 @@ def test_a_unit_that_is_not_a_drain_never_asks_for_its_pid(env):
         "ws-daily.service", env, status=lambda u: ("exit-code", "1"), pid_of=lambda u: asked.append(u) or 1
     )
     assert asked == []
+
+
+def test_planted_kill_of_a_tick_unit_running_another_jobs_run_is_one_notice_naming_that_job(env, monkeypatch):
+    """Every runner job's timer ticks and then drains, so job A's unit may be running B's queued run when it is
+    killed: one notice, the queue's, naming B; no "A failed" beside it."""
+    notify(env)
+    keyed = (
+        'runner = "claude-code"\nmodel = "m"\nprompt = "p"\nschedule = "hourly"\nmax_turns = 3\nbudget_usd = 1\n'
+        + CONTRACT + '[[secrets]]\nname = "anthropic"\nhost = "api.anthropic.com"\n'
+    )  # fmt: skip
+    (jobs.jobs_dir(env) / "alpha.toml").write_text(keyed, encoding="utf-8")
+    pid, run_id, told = _drain_with_a_killed_run(env, monkeypatch)
+    s = Sender()
+    rec = jobwatch.alert_unit("ws-alpha.service", env, status=lambda u: ("signal", "9"), sender=s, pid_of=lambda u: pid)
+    assert told == ["nightly"] and s.sent == [] and rec["reaped"] == [{"job": "nightly", "run_id": run_id}]

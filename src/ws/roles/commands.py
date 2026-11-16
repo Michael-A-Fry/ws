@@ -7,7 +7,10 @@
     ws schedule list|apply|remove   timers for the job files that have a `schedule`
     ws schedule script NAME         run a `command = "script"` job's reviewed script (what its timer runs): refused
                                     unless the script is yours, closed to other writers and hashes to script_sha256;
-                                    the bytes that were hashed are what runs (a private copy), in the script's folder
+                                    the bytes that were hashed are what runs (a private copy under ws's state folder),
+                                    in the script's folder. Only the script is hashed: a file it sources or runs by a
+                                    path of its own is outside the review, so a script should call only what it names
+                                    by absolute path and trusts.
 
 Each reads its adapter's settings from `[roles.<role>]` of the profile. Messages never hold a secret.
 """
@@ -317,7 +320,10 @@ def cmd_schedule_script(args: argparse.Namespace) -> int:
             "run it yourself, in your own terminal, or let its timer run it", 3,
         )  # fmt: skip
     path, data, timeout = checked_script(args.job, env)
-    with tempfile.TemporaryDirectory(prefix="ws-script-") as tmp:
+    private = paths.state_dir(env) / "scripts"  # ws's own state folder, not a temp folder others share
+    private.mkdir(mode=0o700, parents=True, exist_ok=True)
+    private.chmod(0o700)
+    with tempfile.TemporaryDirectory(prefix="run-", dir=private) as tmp:
         copy = Path(tmp) / path.name  # the reviewed bytes, where nobody else can swap them before they run
         fd = os.open(copy, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o700)
         with os.fdopen(fd, "wb") as f:
@@ -332,7 +338,7 @@ def cmd_schedule_script(args: argparse.Namespace) -> int:
             code = SCRIPT_EXIT_TIMEOUT
         except OSError as e:
             raise WsError("failed", f"job {args.job}: cannot start {path}: {e.strerror or type(e).__name__}",
-                          "give it a #! line; a temp folder mounted noexec also stops it (set TMPDIR)", 1) from e  # fmt: skip
+                          "give it a #! line; a state folder mounted noexec also stops it", 1) from e  # fmt: skip
     code = 128 - code if code < 0 else code  # killed by signal N: 128+N, as a shell says it
     if code and env.get("WS_ALERT_ON_EXIT") == "1":  # launchd has no OnFailure=: the failure alert is sent from here
         from ws import jobwatch

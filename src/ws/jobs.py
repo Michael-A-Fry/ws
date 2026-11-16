@@ -324,20 +324,34 @@ def latest_slot(when: When, now: datetime, tz=None) -> datetime:
             slot = slot.replace(day=when.day)
             if slot > local:
                 slot = slot.replace(year=slot.year - (slot.month == 1), month=slot.month - 1 or 12)
-    # the wall-clock slot read back in its zone, so across a daylight-saving change the offset is the slot's own
-    out = _utc(slot, tz)
-    if out > now and when.kind in ("daily", "weekly", "monthly"):
+    # the wall-clock slot read back in its zone. Across a daylight-saving change a wall-clock time can be two instants
+    # (the hour the clocks go back: both folds) or none (the hour they skip): the slot is the latest instant at or
+    # before now, so an hourly job in the repeated hour gets its second 02:00, not the first one again
+    out = _latest_at_or_before(slot, tz, now)
+    if out is None and when.kind in ("daily", "weekly", "monthly"):
         # a wall-clock time the clocks skipped today (a spring-forward gap) reads as later than now: the slot before
         if when.kind == "monthly":
             slot = slot.replace(year=slot.year - (slot.month == 1), month=slot.month - 1 or 12)
         else:
             slot -= timedelta(days=1 if when.kind == "daily" else 7)
-        out = _utc(slot, tz)
-    return out
+        out = _latest_at_or_before(slot, tz, now)
+    return out if out is not None else min(_instants(slot, tz))
 
 
-def _utc(wall: datetime, tz) -> datetime:
-    return (wall.astimezone() if tz is None else wall.replace(tzinfo=tz)).astimezone(UTC)
+def _instants(wall: datetime, tz) -> set[datetime]:
+    """The UTC instants a wall-clock time is in `tz` (None: this machine's zone, read by the C library, which keeps the
+    fold as a ZoneInfo does): one, or two in the hour the clocks go back."""
+    return {
+        (wall.replace(fold=f).astimezone() if tz is None else wall.replace(tzinfo=tz, fold=f)).astimezone(UTC)
+        for f in (0, 1)
+    }
+
+
+def _latest_at_or_before(wall: datetime, tz, now: datetime) -> datetime | None:
+    """The latest instant of `wall` at or before `now`; one that does not read back as `wall` (a time the clocks
+    skipped) is not a slot."""
+    ok = [t for t in _instants(wall, tz) if t <= now and t.astimezone(tz).replace(tzinfo=None) == wall]
+    return max(ok) if ok else None
 
 
 def parse_rate(text: str, where: str) -> float:

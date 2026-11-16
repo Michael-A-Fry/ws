@@ -25,7 +25,8 @@ pytestmark = pytest.mark.skipif(sys.platform == "win32" or not shutil.which("bas
 def fake(bin_dir: Path, name: str, log: Path, then_exec: bool = False, exit_code: int = 0, drop: int = 2) -> None:
     body = f'#!/usr/bin/env bash\nprintf "%s\\n" "{name} $*" >> "{log}"\n'
     if then_exec:
-        body += f'shift {drop}\nexec "$@"\n'  # drop its own arguments, then run the command it wraps
+        # drop its own arguments (a fixed count, or up to the first --), then run the command it wraps
+        body += f'shift {drop}\nexec "$@"\n' if drop else 'while [ "$1" != "--" ]; do shift; done\nshift\nexec "$@"\n'
     body += f"exit {exit_code}\n"
     (bin_dir / name).write_text(body, encoding="utf-8")
     (bin_dir / name).chmod(0o755)
@@ -55,7 +56,7 @@ def run_hook(
     fake(bin_dir, "uv", log, exit_code=uv_exit)
     fake(bin_dir, "queue-wrap", log, then_exec=True)
     if with_ws_test:
-        fake(bin_dir, "ws-test", log, then_exec=True, drop=4)  # --light --node local --
+        fake(bin_dir, "ws-test", log, then_exec=True, drop=0)  # up to the --
     done = subprocess.run(
         [shutil.which("bash"), str(HOOK)], cwd=repo, env=env, capture_output=True, text=True, check=False
     )
@@ -89,7 +90,7 @@ def test_ws_test_on_the_path_is_the_default_wrapper(tmp_path):
     calls = run_hook(tmp_path, None, with_ws_test=True)
     assert calls == [
         "uvx prek run --all-files",
-        "ws-test --light --node local -- " + TIMEOUT + CAPPED_SMOKE,
+        "ws-test --light --mem 3G --node local -- " + TIMEOUT + CAPPED_SMOKE,
         CAPPED_SMOKE,
     ]
 
@@ -100,7 +101,7 @@ def test_a_whole_suite_run_uses_the_full_class_and_spaces_only_counts_as_unset(t
     full = run_hook(tmp_path / "a", None, with_ws_test=True, full=True)
     assert full[1] == "ws-test --full --node local -- " + SUITE
     spaces = run_hook(tmp_path / "b", "   ", with_ws_test=True)
-    assert spaces[1].startswith("ws-test --light --node local -- ")
+    assert spaces[1].startswith("ws-test --light --mem 3G --node local -- ")
 
 
 def test_an_explicit_wrap_beats_ws_test_and_an_empty_one_turns_it_off(tmp_path):
@@ -146,6 +147,7 @@ def run_selected(
     fake_uv: bool = True,
     expect_rc: int = 0,
     expect_log: bool = True,
+    with_ws_test: bool = False,
 ) -> tuple[list[str], str]:
     """A scratch repo with modules a, b (imports a), c and a test for each, on a base commit that is `origin/main`.
     `change` is then committed on top: path -> new text, or None to delete. Returns the fake uv calls and stderr."""
@@ -182,6 +184,8 @@ def run_selected(
     fake(bin_dir, "uvx", log)
     if fake_uv:
         fake(bin_dir, "uv", log)
+    if with_ws_test:
+        fake(bin_dir, "ws-test", log, then_exec=True, drop=0)
     done = subprocess.run(
         [shutil.which("bash"), str(HOOK)], cwd=repo, env=env, capture_output=True, text=True, check=False
     )
@@ -194,6 +198,22 @@ def test_a_one_module_change_runs_its_tests_only(tmp_path):
     calls, err = run_selected(tmp_path, {"src/ws/c.py": "Y = 2\n"})
     assert calls[-1] == f"{SUITE} tests/test_c.py"
     assert "1 test file(s)" in err
+
+
+def test_the_memory_ceiling_follows_the_set(tmp_path):
+    for name in ("small", "e2e", "many", "full"):
+        (tmp_path / name).mkdir()
+    new_test = "def test_x():\n    pass\n"
+    _, err = run_selected(tmp_path / "small", {"src/ws/c.py": "Y = 2\n"}, with_ws_test=True)
+    assert "ws-test --light --mem 3G --node local -- " in err
+    _, err = run_selected(tmp_path / "e2e", {"tests/e2e/test_new.py": new_test}, with_ws_test=True)
+    assert "ws-test --light --mem 6G --node local -- " in err
+    many = {f"tests/test_new{i}.py": new_test for i in range(41)}
+    _, err = run_selected(tmp_path / "many", many, with_ws_test=True)
+    assert "ws-test --light --mem 6G --node local -- " in err
+    _, err = run_selected(tmp_path / "full", {"src/ws/c.py": "Y = 2\n"}, {"WS_PREPUSH_FULL": "1"}, with_ws_test=True)
+    assert "ws-test --full --node local -- " in err
+    assert "--mem" not in err
 
 
 def test_a_module_change_runs_the_tests_of_what_imports_it(tmp_path):

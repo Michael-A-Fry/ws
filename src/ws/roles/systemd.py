@@ -2,7 +2,10 @@
 
     jobs/<name>.toml  with  schedule = "daily 03:30"   ->   ws-<name>.service + ws-<name>.timer
 
-The service runs `ws run <name>` (or the job's `command`, for example `ws backup run`). Every timer gets
+The service of a job with a runner runs `ws queue tick <name> --slot schedule --run`: it queues the slot the timer
+fired for (the latest time of the schedule at or before now, since systemd does not pass the time) and drains the
+queue. A job that would use a subscription login, which the queue never runs, keeps `ws run <name>`. A job with a
+`command` runs that (for example `ws backup run`). `ws-queue-reap.timer` runs `ws queue reap` every two minutes. Every timer gets
 `Persistent=true`, so a run missed while the machine was off happens at the next start; on a machine that stays on it
 never fires, so the "stays on?" answer is not needed here.
 
@@ -37,7 +40,9 @@ SLICE = "ws-jobs.slice"  # the shared slice every scheduled service runs in
 ALERT = "ws-alert@%n.service"  # OnFailure= target: one template unit, instance = the failed unit's name
 ALERT_TEMPLATE = "ws-alert@.service"
 DEADMAN = "ws-watch-deadman"  # the dead-man check: a timer outside the jobs it watches
-OWN = {SLICE, ALERT_TEMPLATE, f"{DEADMAN}.service", f"{DEADMAN}.timer"}  # units ws writes that are not a job's
+REAPER = "ws-queue-reap"  # `ws queue reap` every 2 minutes: a killed run is told within minutes, not at the next run
+REAP_EVERY_MIN = 2
+OWN = {SLICE, ALERT_TEMPLATE, f"{DEADMAN}.service", f"{DEADMAN}.timer", f"{REAPER}.service", f"{REAPER}.timer"}
 CPU_WEIGHT, MEMORY_HIGH = 50, "75%"  # the share scheduled jobs get: below the default CPUWeight of 100, soft memory cap
 TIMEOUT_MARGIN_S = 30  # TimeoutStartSec= is the job's limit plus this, so `ws run` ends its own run first
 
@@ -59,6 +64,8 @@ def on_calendar(when: When) -> str:
     if when.kind == "every":
         return f"*-*-* *:00/{when.every}:00"
     at = f"{when.hour:02d}:{when.minute:02d}:00"
+    if when.kind == "monthly":
+        return f"*-*-{when.day:02d} {at}"
     return f"*-*-* {at}" if when.kind == "daily" else f"{DAYS[when.weekday].capitalize()} *-*-* {at}"
 
 
@@ -102,12 +109,14 @@ def _env_lines(env) -> list[str]:
 
 
 def render_watch(env, ws_cmd: list[str]) -> dict[str, str]:
-    """The alert template (`ws watch alert %i`, run by every unit's OnFailure=) and the hourly dead-man service and timer.
+    """The alert template (`ws watch alert %i`, run by every unit's OnFailure=), the hourly dead-man service and timer, and
+    the queue reaper's (`ws queue reap` every two minutes, so a run killed with no further admission is told in minutes).
     The alert has no OnFailure= of its own (it would loop). The dead-man's exit 3 means "a job is overdue" and it has
     raised that alert itself, so it is a success to systemd; any other exit (a crash is 1) fails the unit and alerts."""
     env_text = "\n".join(_env_lines(env))
     alert = " ".join(_quote(w, expand=True) for w in [*ws_cmd, "watch", "alert"]) + ' "%i"'  # %i is the specifier
     dead = " ".join(_quote(w, expand=True) for w in [*ws_cmd, "watch", "deadman"])
+    reap = " ".join(_quote(w, expand=True) for w in [*ws_cmd, "queue", "reap"])
     return {
         ALERT_TEMPLATE: _header("ws's scheduler role")
         + f"[Unit]\nDescription=ws failure alert for %i\n\n[Service]\nType=oneshot\nSlice={SLICE}\n{env_text}\n"
@@ -118,6 +127,13 @@ def render_watch(env, ws_cmd: list[str]) -> dict[str, str]:
         f"{DEADMAN}.timer": _header("ws's scheduler role")
         + "[Unit]\nDescription=ws dead-man check (hourly)\n\n[Timer]\nOnCalendar=*-*-* *:07:00\nPersistent=true\n"
         + f"Unit={DEADMAN}.service\n\n[Install]\nWantedBy=timers.target\n",
+        f"{REAPER}.service": _header("ws's scheduler role")
+        + f"[Unit]\nDescription=ws queue reaper: record and tell runs whose process is gone\nOnFailure={ALERT}\n\n"
+        + f"[Service]\nType=oneshot\nSlice={SLICE}\n{env_text}\nExecStart={reap}\nTimeoutStartSec=120\n",
+        f"{REAPER}.timer": _header("ws's scheduler role")
+        + f"[Unit]\nDescription=ws queue reaper (every {REAP_EVERY_MIN} minutes)\n\n"
+        + f"[Timer]\nOnCalendar=*-*-* *:00/{REAP_EVERY_MIN}:00\nAccuracySec=15s\n"
+        + f"Unit={REAPER}.service\n\n[Install]\nWantedBy=timers.target\n",
     }
 
 

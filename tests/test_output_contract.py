@@ -31,6 +31,7 @@ RAW = {
     "notify.alert": "a hook entry",
     "setup": "a person at a terminal, or the page (setup --yes is covered below)",
     "queue.slot": "runs the caller's command in a slot: that command's own output and exit code",
+    "schedule.script": "runs the job's reviewed script: the script's own output and exit code",
     "usage.statusline": "a statusline command Claude Code pipes JSON to: one line of its own, no envelope",
     "walls.edit": "opens $EDITOR on a copy of the policy: the terminal is the editor's",
 }
@@ -123,6 +124,7 @@ CASES: dict[str, list[str]] = {
     "queue.cancel": ["queue", "cancel", "nope"],
     "queue.run": ["queue", "run"],
     "queue.tick": ["queue", "tick", "nojob"],
+    "queue.reap": ["queue", "reap"],
     "node.join": ["node", "join"],
     "node.show": ["node", "show"],
     "node.remove": ["node", "remove"],

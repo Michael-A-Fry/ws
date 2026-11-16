@@ -11,12 +11,24 @@
     green = "targeted"                  optional: what the job's verification covers (targeted | package | full |
                                         merge_ready); written to the run record as `green`
     sources = ["notes"]                 policy sources the job reads (the Rule of Two looks at these)
-    schedule = "daily 03:30"            optional: hourly | daily HH:MM | weekly DAY HH:MM | every Nm (N from 5 to 30),
-                                        in local time. `ws schedule apply` turns it into a systemd timer or a launchd
-                                        agent.
+    schedule = "daily 03:30"            optional: hourly | daily HH:MM | weekly DAY HH:MM | monthly D HH:MM (D from 1
+                                        to 28) | every Nm (N from 5 to 30), in local time. `ws schedule apply` turns it
+                                        into a systemd timer or a launchd agent. The timer queues the slot and drains the
+                                        queue (`ws queue tick NAME --slot schedule --run`): the slot is the latest time
+                                        of the schedule at or before the fire, so a late catch-up fire gets its own slot.
+    coalesce_if_active = true           a tick while a run of the job waits or runs queues nothing (default true;
+                                        `ws queue tick --no-coalesce` overrides it for one tick)
+    skip_missed = 3600                  optional: a tick more than this many seconds after its slot is skipped, not run
+                                        (default: never skipped; `ws queue tick --skip-missed S` overrides it)
     command = "backup"                  instead of runner, model and prompt: a ws command the schedule runs
-                                        (`ws backup run`, `ws queue run`). Only `ws schedule` runs these; `ws run`
-                                        refuses them.
+                                        (`ws backup run`, `ws queue run`, or `script`). Only `ws schedule` runs these;
+                                        `ws run` refuses them.
+    extra_sources = ["~/.ws"]           with command = "backup": more folders or files the backup takes, beside the
+                                        memory, notes and profile (absolute, or under ~)
+    script = "~/bin/upkeep.sh"          with command = "script": the reviewed script the timer runs (`ws schedule
+    script_sha256 = "<64 hex>"          script NAME`), absolute or under ~, yours and closed to other writers, and its
+                                        sha256: a script that no longer hashes to it is refused, so a change needs a
+                                        new review (and, for a pinned job, a new `ws job add`)
 
     purpose = "jobs"                    optional: the [budget.purposes] name this job's spend counts against
     budget_usd = 2.0                    optional: the money reserved for one run (default: the profile's unknown_run_usd)
@@ -73,14 +85,14 @@ import os
 import re
 import tomllib
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from ws import adapters, paths
 from ws.secrets import HOST_RE, NAME_RE
 
 NAME = re.compile(r"^[A-Za-z0-9_-]+$")
-RESERVED = {"watch-deadman"}  # the name of the scheduler role's own dead-man unit, `ws-watch-deadman`
+RESERVED = {"watch-deadman", "queue-reap"}  # the scheduler role's own units: `ws-watch-deadman`, `ws-queue-reap`
 DEFAULT_TIMEOUT_S = 900
 KEYS = {
     "runner",
@@ -112,6 +124,11 @@ KEYS = {
     "uninstall",
     "expected_rate",
     "data_class",
+    "coalesce_if_active",
+    "skip_missed",
+    "extra_sources",
+    "script",
+    "script_sha256",
 }
 CONTRACT_KEYS = ("timeout_s", "on_failure", "log", "uninstall", "expected_rate", "data_class")  # the six lines
 ON_FAILURE = ("alert",)
@@ -122,11 +139,15 @@ GREEN_LEVELS = ("targeted", "package", "full", "merge_ready")  # as runrecord.GR
 COMMANDS = {
     "backup": ("backup", "run"),
     "queue": ("queue", "run"),
+    "script": ("schedule", "script"),  # the job's name follows: `ws schedule script NAME`
 }  # the ws commands a job file may schedule in place of a runner
+COMMAND_ONLY = {"extra_sources": "backup", "script": "script", "script_sha256": "script"}  # key -> the command it needs
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 _DAY_NAMES = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
 _CLOCK = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 _EVERY = re.compile(r"^(\d{1,2})m$")
+MONTH_DAY_MAX = 28  # `monthly D`: a day every month has
 EVERY_MIN, EVERY_MAX = 5, 30  # `every Nm`: minutes between runs
 RESOURCE_KEYS = {"ram_gb", "slot"}
 
@@ -139,11 +160,12 @@ class JobError(Exception):
 class When:
     """A repeat time in local time. weekday is 0 for Monday to 6 for Sunday; only `weekly` uses it."""
 
-    kind: str  # hourly | daily | weekly | every
+    kind: str  # hourly | daily | weekly | monthly | every
     hour: int = 0
     minute: int = 0
     weekday: int = 0
     every: int = 0  # minutes between runs; only `every` uses it
+    day: int = 0  # day of the month, 1 to 28; only `monthly` uses it
 
     def __str__(self) -> str:
         if self.kind == "hourly":
@@ -151,6 +173,8 @@ class When:
         if self.kind == "every":
             return f"every {self.every}m"
         at = f"{self.hour:02d}:{self.minute:02d}"
+        if self.kind == "monthly":
+            return f"monthly {self.day} {at}"
         return f"daily {at}" if self.kind == "daily" else f"weekly {DAYS[self.weekday]} {at}"
 
 
@@ -199,6 +223,8 @@ class Job:
     uninstall: str | None = None
     expected_rate: str | None = None
     data_class: str | None = None
+    coalesce_if_active: bool = True
+    skip_missed_s: float | None = None
     max_budget_usd: float | None = None  # not a file key: admission sets it from the reservation
 
 
@@ -214,6 +240,11 @@ class Scheduled:
     timeout_s: float | None = None
     expected_rate_s: float | None = None
     log: str = "file"
+
+    @property
+    def records(self) -> bool:
+        """True for a job with a runner: its runs leave run records under its name (a ws command's do not)."""
+        return self.argv[:2] == ("queue", "tick") or self.argv[:1] == ("run",)
 
 
 def jobs_dir(env: dict | None = None) -> Path:
@@ -242,7 +273,8 @@ def _number(d: dict, key: str, where: str, default, integer: bool = False):
 
 
 def parse_schedule(text: str, where: str) -> When:
-    """`hourly`, `daily HH:MM`, `weekly DAY HH:MM` or `every Nm` (N from 5 to 30). Raises JobError naming the key."""
+    """`hourly`, `daily HH:MM`, `weekly DAY HH:MM`, `monthly D HH:MM` (D from 1 to 28) or `every Nm` (N from 5 to 30).
+    Raises JobError naming the key."""
     words = text.lower().split()
     if words == ["hourly"]:
         return When("hourly")
@@ -258,9 +290,42 @@ def parse_schedule(text: str, where: str) -> When:
         return When("daily", int(clock[1]), int(clock[2]))
     if clock and len(words) == 3 and words[0] == "weekly" and words[1] in (*DAYS, *_DAY_NAMES):
         return When("weekly", int(clock[1]), int(clock[2]), DAYS.index(words[1][:3]))
+    if clock and len(words) == 3 and words[0] == "monthly":
+        if not (words[1].isdigit() and 1 <= int(words[1]) <= MONTH_DAY_MAX):
+            raise JobError(
+                f"{where}: monthly needs a day from 1 to {MONTH_DAY_MAX} (a day every month has), as in monthly 1 04:00"
+            )
+        return When("monthly", int(clock[1]), int(clock[2]), day=int(words[1]))
     raise JobError(
-        f"{where}: schedule must be hourly, daily HH:MM, weekly DAY HH:MM or every Nm (for example weekly mon 09:00)"
+        f"{where}: schedule must be hourly, daily HH:MM, weekly DAY HH:MM, monthly D HH:MM or every Nm "
+        "(for example weekly mon 09:00)"
     )
+
+
+def latest_slot(when: When, now: datetime, tz=None) -> datetime:
+    """The latest time of the schedule at or before `now`, in UTC: the slot a timer's fire is for. A timer that fires
+    late (a catch-up after the machine was off, or asleep) still gets the slot it was for, not the minute it ran in.
+    The schedule is wall-clock time in `tz` (default this machine's zone), as systemd and launchd read it."""
+    local = now.astimezone(tz).replace(tzinfo=None)  # the wall clock
+    slot = local.replace(second=0, microsecond=0)
+    if when.kind == "hourly":
+        slot = slot.replace(minute=0)
+    elif when.kind == "every":
+        slot = slot.replace(minute=slot.minute - slot.minute % when.every)
+    else:
+        slot = slot.replace(hour=when.hour, minute=when.minute)
+        if when.kind == "daily" and slot > local:
+            slot -= timedelta(days=1)
+        elif when.kind == "weekly":
+            slot -= timedelta(days=(slot.weekday() - when.weekday) % 7)
+            if slot > local:
+                slot -= timedelta(days=7)
+        elif when.kind == "monthly":
+            slot = slot.replace(day=when.day)
+            if slot > local:
+                slot = slot.replace(year=slot.year - (slot.month == 1), month=slot.month - 1 or 12)
+    # the wall-clock slot read back in its zone, so across a daylight-saving change the offset is the slot's own
+    return (slot.astimezone() if tz is None else slot.replace(tzinfo=tz)).astimezone(UTC)
 
 
 def parse_rate(text: str, where: str) -> float:
@@ -292,6 +357,11 @@ def contract_problems(d: dict, where: str) -> list[str]:
             parse_rate(str(d["expected_rate"]) if isinstance(d["expected_rate"], str) else "", where)
         except JobError as e:
             out.append(str(e))
+    if d.get("command") == "script":
+        try:
+            script_of(d, where)
+        except JobError as e:
+            out.append(str(e))
     if "command" not in d:
         out += [
             f"{where}: {k} is required for a job with a runner (its turn limit and spend cap)"
@@ -303,11 +373,68 @@ def contract_problems(d: dict, where: str) -> list[str]:
 
 def _command(d: dict, where: str) -> tuple[str, ...] | None:
     c = _string(d, "command", where)
+    for key, needs in COMMAND_ONLY.items():
+        if key in d and c != needs:
+            raise JobError(f"{where}: {key} goes only in a job with command = {needs!r}")
     if c is None:
         return None
     if c not in COMMANDS:
         raise JobError(f"{where}: command {c!r} is not known (known: {', '.join(COMMANDS)})")
     return COMMANDS[c]
+
+
+def _home_path(v, key: str, where: str, env: dict | None = None) -> Path:
+    """An absolute path, or one under ~ (the home folder of `env`, default this process's). Raises JobError naming
+    `key`."""
+    if not isinstance(v, str) or not v.strip() or "\0" in v:
+        raise JobError(f"{where}: {key} must be a non-empty path")
+    if v.startswith("~/") or v == "~":
+        home = (env or os.environ).get("HOME") or str(Path.home())
+        v = home + v[1:]
+    if not os.path.isabs(v):
+        raise JobError(f"{where}: {key} must be an absolute path or start with ~/, not {v!r}")
+    return Path(os.path.normpath(v))
+
+
+def script_of(d: dict, where: str, env: dict | None = None) -> tuple[Path, str]:
+    """(the script's path, the sha256 it must hash to) of a `command = "script"` job. Raises JobError naming the key."""
+    if "script" not in d:
+        raise JobError(f"{where}: script is required for a job with command = 'script'")
+    path = _home_path(d["script"], "script", where, env)
+    sha = d.get("script_sha256")
+    if not (isinstance(sha, str) and _SHA256.match(sha)):
+        raise JobError(f"{where}: script_sha256 must be the script's sha256, 64 lowercase hex digits (sha256sum)")
+    return path, sha
+
+
+def extra_sources(d: dict, where: str, env: dict | None = None) -> list[Path]:
+    """`extra_sources` of a `command = "backup"` job: absolute paths (or under ~). Raises JobError naming the key."""
+    v = d.get("extra_sources", [])
+    if not isinstance(v, list):
+        raise JobError(f"{where}: extra_sources must be a list of paths")
+    return [_home_path(x, "extra_sources", where, env) for x in v]
+
+
+def command_job(name: str, env: dict | None = None) -> dict:
+    """The table of the `command =` job `name`, read the way the timers read it (yours, closed to other writers, its pin
+    held, its command keys valid). Raises JobError naming what is wrong; FileNotFoundError when there is no such file."""
+    folder = jobs_dir(env)
+    path = folder / f"{name}.toml"
+    if not NAME.match(name):
+        raise JobError(f"job {name}: a job name is letters, digits, - and _")
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    check_private(folder)
+    check_private(path)
+    try:
+        raw = path.read_bytes()
+        d = tomllib.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
+        raise JobError(f"{path}: {e}") from e
+    check_pin(folder, name, raw)
+    if _command(d, str(path)) is None:
+        raise JobError(f"{path}: this job has a runner, not a command")
+    return d
 
 
 def loads(name: str, text: str, base: Path, where: str | None = None) -> Job:
@@ -388,6 +515,14 @@ def loads(name: str, text: str, base: Path, where: str | None = None) -> Job:
     parent_run = _string(d, "parent_run", where)
     if parent_run is not None and not NAME.match(parent_run):
         raise JobError(f"{where}: parent_run {parent_run!r} is not a run id (letters, digits, - and _)")
+    coalesce = d.get("coalesce_if_active", True)
+    if not isinstance(coalesce, bool):
+        raise JobError(f"{where}: coalesce_if_active must be true or false")
+    skip = d.get("skip_missed")
+    if skip is not None and (
+        isinstance(skip, bool) or not isinstance(skip, (int, float)) or not 0 <= skip < float("inf")
+    ):
+        raise JobError(f"{where}: skip_missed must be a number of seconds, 0 or more")
     return Job(
         name=name,
         runner=runner,
@@ -417,6 +552,8 @@ def loads(name: str, text: str, base: Path, where: str | None = None) -> Job:
         uninstall=_string(d, "uninstall", where),
         expected_rate=_string(d, "expected_rate", where),
         data_class=_string(d, "data_class", where),
+        coalesce_if_active=coalesce,
+        skip_missed_s=float(skip) if skip is not None else None,
     )
 
 
@@ -640,20 +777,46 @@ def scheduled(env: dict | None = None) -> list[Scheduled]:
         where = str(path)
         command = _command(d, where)
         if command is None:
-            loads(path.stem, text, folder, where)  # a runner job must be valid before it gets a timer
+            job = loads(path.stem, text, folder, where)  # a runner job must be valid before it gets a timer
+            if credential_kind(job) == "subscription":  # the queue never runs one: it keeps `ws run` as before
+                command = ("run", path.stem)
+        elif command == COMMANDS["script"]:
+            script_of(d, where, env)
+            command = (*command, path.stem)
+        elif command == COMMANDS["backup"]:
+            extra_sources(d, where, env)
         when = parse_schedule(_string(d, "schedule", where) or "", f"{where}: schedule")
         timeout_s, rate_s = _contract_values(d, where)
         out.append(
             Scheduled(
                 path.stem,
                 when,
-                command or ("run", path.stem),
+                command or ("queue", "tick", path.stem, "--slot", "schedule", "--run"),
                 timeout_s=timeout_s,
                 expected_rate_s=rate_s,
                 log=d.get("log") if d.get("log") in LOG_KINDS else "file",
             )
         )
     return out
+
+
+def credential_kind(job: Job) -> str:
+    """`api_key` when the job leases a key through `[[secrets]]`, `local` when its provider is on this machine, else
+    `subscription`: the runner would use whatever login it is signed in with."""
+    if job.secrets:
+        return "api_key"
+    provider = job.runner_options.get("provider") if isinstance(job.runner_options.get("provider"), dict) else {}
+    options = provider.get("options") if isinstance(provider.get("options"), dict) else {}
+    base = options.get("baseURL") or options.get("base_url")
+    if isinstance(base, str):
+        from urllib.parse import urlsplit
+
+        try:
+            if (urlsplit(base).hostname or "").lower() in ("127.0.0.1", "localhost", "::1"):
+                return "local"
+        except ValueError:
+            pass
+    return "subscription"
 
 
 def check_options(job: Job, allowed: set[str]) -> None:

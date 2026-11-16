@@ -4,7 +4,8 @@ that give a unit ws does not own the same hook.
     ws watch alert UNIT        what `ws-alert@.service` runs when UNIT fails (`OnFailure=ws-alert@%n.service`): one line
                                in `<state>/logs/alerts.jsonl` (kind "not-automatic") and one ntfy line through the notify
                                role. Both carry the job name, the unit and the exit status, never a log line: a walled
-                               job's log must not leave the box.
+                               job's log must not leave the box. A drain unit (`command = "queue"`) reaps first: when
+                               its kill cut off queued runs, the queue's notice, which names them, is the one push.
     ws watch deadman           for each scheduled job with an `expected_rate`, raise one alert when no run record is
                                newer than twice that rate. Exit 1 while any job is overdue. Run hourly by
                                `ws-watch-deadman.timer`, a unit outside the jobs it watches.
@@ -106,16 +107,66 @@ def push(env, text: str, plain: str, sender=None) -> bool | None:
         return False
 
 
+def main_pid(unit: str) -> int | None:
+    """The process systemd started for `unit` (ExecMainPID; it stays readable after the unit failed). None when it
+    cannot be read."""
+    try:
+        p = subprocess.run(
+            ["systemctl", "--user", "show", "-p", "ExecMainPID", "--value", unit],
+            capture_output=True, text=True, timeout=15, check=False, stdin=subprocess.DEVNULL,
+        )  # fmt: skip
+        pid = int(p.stdout.strip())
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    return pid if pid > 0 else None
+
+
+def reap_for_drain(job: str, env) -> list[dict]:
+    """For a unit that drains the queue (a `command = "queue"` job): reap now and return each run the reaper told the
+    person about (job, run_id, owner_pid, queued). The drain runs queued jobs in its own process, so when its unit
+    fails because it was killed, the runs it held are gone too, and the reaper's notice names them. Empty for any other
+    job, and when the queue cannot be read (then the unit's own alert is the notice)."""
+    from ws import queue  # here, not at the top: queue reads this module's alerts file
+
+    if job not in queue.drain_jobs(env):
+        return []
+    try:
+        ledger = queue.ledger_for_env(env)
+        try:
+            return ledger.reap_report(ledger.clock())[1]
+        finally:
+            ledger.close()
+    except Exception:  # noqa: BLE001  an alert must not fail: the unit's own push goes instead
+        return []
+
+
 def alert_unit(
-    unit: str, env=None, status: Callable[[str], tuple[str, str]] = unit_status, sender=None, job: str | None = None
+    unit: str,
+    env=None,
+    status: Callable[[str], tuple[str, str]] = unit_status,
+    sender=None,
+    job: str | None = None,
+    reap: Callable[[str, object], list[dict]] = reap_for_drain,
+    pid_of: Callable[[str], int | None] = main_pid,
 ) -> dict:
-    """Record and push one failed-unit alert. Returns what was written."""
+    """Record and push one failed-unit alert. Returns what was written. For a drain unit whose kill cut off a queued run
+    it was running itself (reaped now, its owner the unit's own process), the reaper's notice, which names that job,
+    stands in for the push: one notice per kill, naming the job that was cut off, not the drain. Any other failure of
+    the unit (a queued job that exited non-zero, or runs some other process held) is pushed as usual. The line is
+    written either way, with what was reaped."""
     env = os.environ if env is None else env
     if not UNIT_RE.match(unit):
         raise ValueError(f"{unit!r} is not a unit name")
     job = job or job_of(unit)
     result, code = status(unit)
     rec = {"event": "unit-failed", "job": job, "unit": unit, "result": result, "exit_status": code}
+    told = reap(job, env)
+    pid = pid_of(unit) if told else None
+    mine = [t for t in told if t.get("queued") and pid is not None and t.get("owner_pid") == pid]
+    if mine:
+        rec["reaped"] = [{"job": t["job"], "run_id": t["run_id"]} for t in mine]
+        _write_line(env, {**rec, "pushed": False})
+        return {**rec, "pushed": False}
     sent = push(env, f"{job} failed: {unit} {result}, exit {code}", "a job failed", sender)
     _write_line(env, {**rec, "pushed": sent is True})
     return {**rec, "pushed": sent is True}
@@ -147,7 +198,7 @@ def overdue(env, now: datetime) -> list[dict]:
     its file's modified time."""
     last, found = last_runs(env), []
     for s in jobs.scheduled(env):
-        if s.expected_rate_s is None or s.argv[:1] != ("run",):
+        if s.expected_rate_s is None or not s.records:
             continue  # a job that runs a ws command leaves no run record under its name: nothing to measure
         since = last.get(s.name)
         if since is None:
@@ -226,7 +277,11 @@ def cmd_alert(args: argparse.Namespace) -> int:
         rec = alert_unit(args.unit)
     except ValueError as e:
         raise WsError("invalid_unit", str(e), "pass the failed unit's name, as OnFailure= does", 2) from e
-    print(f"ws: alert for {rec['job']} ({'pushed' if rec['pushed'] else 'not pushed: see alerts.jsonl'})")
+    if rec.get("reaped"):
+        names = ", ".join(sorted({r["job"] for r in rec["reaped"]}))
+        print(f"ws: alert for {rec['job']}: the queue's notice named the run(s) it cut off ({names})")
+    else:
+        print(f"ws: alert for {rec['job']} ({'pushed' if rec['pushed'] else 'not pushed: see alerts.jsonl'})")
     return 0
 
 

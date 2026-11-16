@@ -529,7 +529,8 @@ class Ledger:
         self.rate_limits = rate_limits or (lambda now: usage.read_rate_limits(self.state, now))
         self.recorded, self.sink, self.clock = recorded, sink, clock
         self.on_stop = on_stop
-        self._reaped: list[tuple[str, str, datetime]] = []  # (job, run_id, started) reaped in a transaction
+        # (job, run_id, started, owner pid, queued) reaped in a transaction; queued: a drain ran it, not its own `ws run`
+        self._reaped: list[tuple[str, str, datetime, int | None, bool]] = []
         self.already_told = already_told
         self._conn: sqlite3.Connection | None = None
         self._engine: sqlqueue.SqlQueue | None = None
@@ -943,22 +944,28 @@ class Ledger:
 
     def reap(self, now: datetime) -> int:
         """Release every reservation whose owner is gone. Returns how many."""
+        return self.reap_report(now)[0]
+
+    def reap_report(self, now: datetime) -> tuple[int, list[dict]]:
+        """`reap`, and each run it told the person about: job, run_id, owner_pid and queued (a drain ran it)."""
         with _transaction(self.conn()) as c:
             n = self._reap(c, now)
-        self._tell_reaped()
-        return n
+        return n, self._tell_reaped()
 
-    def _tell_reaped(self) -> None:
+    def _tell_reaped(self) -> list[dict]:
         """Say once for each run reaped as `outcome_unknown` in the transaction that has just committed. (A rolled-back
         reap is forgotten here too: the next reaper finds the run again and tells it then.) A job whose failure was
         already alerted since the run started (`already_told`: the scheduler's OnFailure= alert for the same kill) is
-        not told twice."""
+        not told twice. Returns what was told: job, run id, the process that held it and whether a drain ran it."""
         told, self._reaped = self._reaped, []
-        for job, run_id, started in told:
+        out: list[dict] = []
+        for job, run_id, started, owner_pid, queued in told:
             with contextlib.suppress(Exception):
                 if self.already_told is not None and self.already_told(job, started):
                     continue
             self.stopped(job, run_id, "outcome_unknown: the process that held it was gone before it finished")
+            out.append({"job": job, "run_id": run_id, "owner_pid": owner_pid, "queued": queued})
+        return out
 
     def _reap(self, c: sqlite3.Connection, now: datetime) -> int:
         self._reaped = []  # one transaction's worth: what a rolled-back one queued is found and told again
@@ -1015,7 +1022,7 @@ class Ledger:
             (status, ns, usd, int(written), rec.get("stop_reason") or "owner_gone", run_id),
         )
         if lost and cur.rowcount == 1:
-            self._reaped.append((r["job"], run_id, started))
+            self._reaped.append((r["job"], run_id, started, r["owner_pid"], r["message_id"] is not None))
 
     # -- queued work --------------------------------------------------------------------------------------------
 
@@ -1368,20 +1375,8 @@ def _cap_hint(counter: str) -> str:
 
 
 def credential_kind(job: jobs.Job) -> str:
-    """`api_key` when the job leases a key through `[[secrets]]`, `local` when its provider is on this machine, else
-    `subscription`: the runner would use whatever login it is signed in with."""
-    if job.secrets:
-        return "api_key"
-    provider = job.runner_options.get("provider") if isinstance(job.runner_options.get("provider"), dict) else {}
-    options = provider.get("options") if isinstance(provider.get("options"), dict) else {}
-    base = options.get("baseURL") or options.get("base_url")
-    if isinstance(base, str):
-        from urllib.parse import urlsplit
-
-        with contextlib.suppress(ValueError):
-            if (urlsplit(base).hostname or "").lower() in ("127.0.0.1", "localhost", "::1"):
-                return "local"
-    return "subscription"
+    """`api_key`, `local` or `subscription`: what the job's runner would sign in with (`jobs.credential_kind`)."""
+    return jobs.credential_kind(job)
 
 
 def request_for(
@@ -1792,6 +1787,15 @@ def ledger_from_profile(prof: dict, state: Path, log: Path) -> Ledger:
     )
 
 
+def drain_jobs(env=None) -> tuple[str, ...]:
+    """The scheduled jobs that drain the queue (`command = "queue"`): their units run queued jobs in their own process.
+    Empty when the job files cannot be read."""
+    try:
+        return tuple(s.name for s in jobs.scheduled(env) if tuple(s.argv[:2]) == jobs.COMMANDS["queue"])
+    except Exception:  # noqa: BLE001  a job folder that does not read only means the unit's own alert goes
+        return ()
+
+
 def unit_alerted(job: str, since: datetime, path: Path) -> bool:
     """Has the scheduler already alerted a failure of `job` since `since`? (`ws watch alert`, which a unit's
     OnFailure= runs, writes a line in its alerts log for each failed unit.) False when the file is missing
@@ -1946,7 +1950,12 @@ def cmd_tick(args: argparse.Namespace) -> int:
     now = datetime.now(UTC)
     try:
         job = jobs.load(args.job)
-        slot = jobs.parse_deadline(args.slot, "--slot") if args.slot else now.replace(second=0, microsecond=0)
+        if args.slot == "schedule":  # what a timer passes: systemd and launchd do not say which time they fired for
+            if job.schedule is None:
+                raise jobs.JobError(f"job {job.name}: --slot schedule needs a schedule in the job file")
+            slot = jobs.latest_slot(job.schedule, now)
+        else:
+            slot = jobs.parse_deadline(args.slot, "--slot") if args.slot else now.replace(second=0, microsecond=0)
     except jobs.JobError as e:
         raise _bad_job(str(e)) from e
     if credential_kind(job) == "subscription":
@@ -1954,14 +1963,34 @@ def cmd_tick(args: argparse.Namespace) -> int:
             "subscription_login", f"{job.name} would use a subscription login, and unattended work never does",
             "give the job an API key through [[secrets]], or a local provider in runner_options", EXIT_REFUSED,
         )  # fmt: skip
+    coalesce = job.coalesce_if_active and not args.no_coalesce  # the flag overrides the job's key for one tick
+    skip = args.skip_missed if args.skip_missed is not None else job.skip_missed_s
     what, run_id = ledger_for_env().tick(
-        job.name, job.purpose, slot, now, coalesce_if_active=not args.no_coalesce, skip_missed_s=args.skip_missed,
+        job.name, job.purpose, slot, now, coalesce_if_active=coalesce, skip_missed_s=skip,
         chain_depth=chain_depth_from_env(), chain_parent=chain_parent_from_env(),
     )  # fmt: skip
-    if args.json:
+    if args.json and not args.run:
         output.result({"job": job.name, "slot": runrecord.iso(slot), "result": what, "run_id": run_id})
-    else:
+    elif not args.json:
         print(f"ws: {job.name} {runrecord.iso(slot)}: {what}" + (f" ({run_id})" if run_id else ""))
+    if args.run:  # the timer's second half: drain what is queued, this slot's run among it
+        return cmd_run(argparse.Namespace(max=None, json=args.json))
+    return 0
+
+
+def cmd_reap(args: argparse.Namespace) -> int:
+    """What the reaper timer runs every two minutes: a run whose process is gone (SIGKILL, OOM, power loss) gets its
+    `outcome_unknown` record and its one notice now, not at the next admission or drain."""
+    _refuse_in_session("queue reap")
+    ledger = ledger_for_env()
+    try:
+        n, told = ledger.reap_report(ledger.clock())
+    finally:
+        ledger.close()
+    if args.json:
+        output.result({"reaped": n, "told": [{"job": t["job"], "run_id": t["run_id"]} for t in told]})
+    else:
+        print(f"ws: reaped {n} run(s) whose process was gone" + (f"; told {len(told)}" if told else ""))
     return 0
 
 
@@ -2060,13 +2089,26 @@ def register(sub) -> None:
     t = qs.add_parser("tick", help="a schedule's tick: queue the job's run for one slot, at most once")
     t.add_argument("job", help="the job name: jobs/<name>.toml in the config folder")
     t.add_argument(
-        "--slot", metavar="T", help="the slot, a UTC time such as 2026-11-10T03:00:00Z (default: this minute)"
-    )
-    t.add_argument("--no-coalesce", action="store_true", help="queue it even while a run of the job waits or runs")
+        "--slot", metavar="T",
+        help="the slot: a UTC time such as 2026-11-10T03:00:00Z, or `schedule` for the latest time of the job's "
+        "schedule at or before now (what its timer passes); default this minute",
+    )  # fmt: skip
     t.add_argument(
-        "--skip-missed", metavar="S", type=_non_negative, help="skip a slot that is more than S seconds late"
+        "--no-coalesce", action="store_true",
+        help="queue it even while a run of the job waits or runs (overrides coalesce_if_active)",
+    )  # fmt: skip
+    t.add_argument(
+        "--skip-missed", metavar="S", type=_non_negative,
+        help="skip a slot that is more than S seconds late (overrides the job's skip_missed)",
+    )  # fmt: skip
+    t.add_argument(
+        "--run", action="store_true", help="then drain the queue, as the queue's run command does (the timer's)"
     )
     t.set_defaults(func=cmd_tick)
+    rp = qs.add_parser(
+        "reap", help="record and tell the runs whose process is gone, now (what the reaper timer runs every 2 minutes)"
+    )
+    rp.set_defaults(func=cmd_reap)
     r = qs.add_parser("run", help="run what is queued, one after another (what the scheduler runs)")
     r.add_argument(
         "--max", type=_positive_int, metavar="N", help="stop after N attempts (default: until the queue is empty)"

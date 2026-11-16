@@ -7,6 +7,8 @@ firings become one). That is the catch-up a laptop needs, so the "stays on?" ans
 off at the time does not catch up: launchd has no setting for it, and RunAtLoad would run the job at every login.
 The plist carries `ProcessType=Background` (launchd's share for scheduled work). Swap note: to replace launchd, add a scheduler
 adapter beside this one.
+A job with a runner runs `ws queue tick <name> --slot schedule --run` (queue the slot it fired for, then drain); one
+that would use a subscription login keeps `ws run <name>`. `ws.job.queue-reap` runs `ws queue reap` every two minutes.
 `activate` bootstraps the agents into the user's GUI domain through an injectable runner; tests check the argv.
 """
 
@@ -36,6 +38,8 @@ def interval(when: When) -> dict[str, int] | list[dict[str, int]]:
     if when.kind == "every":
         return [{"Minute": m} for m in range(0, 60, when.every)]
     d = {"Hour": when.hour, "Minute": when.minute}
+    if when.kind == "monthly":
+        return {**d, "Day": when.day}
     return d if when.kind == "daily" else {**d, "Weekday": (when.weekday + 1) % 7}
 
 
@@ -57,13 +61,34 @@ def render(job: Scheduled, env, ws_cmd: list[str]) -> str:
     return plistlib.dumps(plist, sort_keys=True).decode("utf-8")
 
 
+REAPER = "queue-reap"  # ws.job.queue-reap: `ws queue reap` every 2 minutes (a reserved job name, so no file takes it)
+REAP_EVERY_S = 120
+
+
+def render_reaper(env, ws_cmd: list[str]) -> str:
+    """The queue reaper's agent: `ws queue reap` every two minutes, so a run killed with no further admission is told
+    in minutes. launchd has no OnFailure=; a reaper that fails is found again at its next fire."""
+    environment = paths.env_for(env)
+    if path := _schedule.path_value(env):
+        environment["PATH"] = path
+    log = str(_schedule.logs_dir(env) / f"{REAPER}.log")
+    plist = {
+        "Label": label(REAPER), "ProgramArguments": [*ws_cmd, "queue", "reap"], "EnvironmentVariables": environment,
+        "StartInterval": REAP_EVERY_S, "ProcessType": "Background", "StandardOutPath": log, "StandardErrorPath": log,
+    }  # fmt: skip
+    return plistlib.dumps(plist, sort_keys=True).decode("utf-8")
+
+
 def files_for(env, name: str) -> list[Path]:
     return [_schedule.units_dir(env) / f"{label(name)}.plist"]
 
 
 def _want(env) -> dict[Path, str]:
     cmd = _schedule.ws_command(env)
-    return {_schedule.units_dir(env) / f"{label(j.name)}.plist": render(j, env, cmd) for j in _schedule.scheduled(env)}
+    out = {_schedule.units_dir(env) / f"{label(j.name)}.plist": render(j, env, cmd) for j in _schedule.scheduled(env)}
+    if out:  # the reaper goes with the jobs: with none scheduled it is an orphan, switched off and removed like one
+        out[_schedule.units_dir(env) / f"{label(REAPER)}.plist"] = render_reaper(env, cmd)
+    return out
 
 
 def orphans(env) -> list[str]:
@@ -84,7 +109,8 @@ def check(cfg, osi, env, network):
         return WARN, f"{NAME}: agents for {', '.join(gone)}, which no longer have a schedule: run `ws schedule apply`"
     if not want:
         return OK, NAME
-    jobs_ = f"{len(want)} scheduled job{'' if len(want) == 1 else 's'}"
+    n = sum(p.stem != label(REAPER) for p in want)
+    jobs_ = f"{n} scheduled job{'' if n == 1 else 's'}"
     old = _schedule.stale(want)
     if old:
         return (

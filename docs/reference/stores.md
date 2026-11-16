@@ -105,7 +105,7 @@ One JSON file per record, written to a temporary name and renamed into place (06
 
 | Record | Path under its folder | Writer | Fields | Schema | Time key | Kept |
 |---|---|---|---|---|---|---|
-| Session | `sessions/<id>.json` | `src/ws/session.py` | `schema`, `ts`, `session_id`, `release`, `started_at`, `runner`, `cwd` | 1 | `ts` | Removed 30 days after its last change |
+| Session | `sessions/<id>.json` | `src/ws/session.py` | `schema`, `ts`, `session_id`, `release`, `started_at`, `runner`, `cwd`, and when known `requested_by` (the asking session's id or `person:<user>`; its authority is `identity/<id>.json`) | 1 | `ts` | Removed 30 days after its last change |
 | Session identity | `identity/<id>.json` | `src/ws/session.py` (`ws session start` only) | `schema`, `session_id`, `role`, `runner_pid`, `runner_start`, `started_at`, `ts` | 1 | `ts` | Removed with the session record. The only place a role or runner stamp is read from. Not one of the wall's writable folders; a control path the gate won't let a session write. `identity/launch/<token>` holds the single-use launch tokens |
 | Guard record | `sessions/<id>.<guard>.json` | `src/ws/guards` | per guard: `inbox` (`seen` claims, `blocks`, `reminded`, `unavailable_said`), `presence` (`seq`, `source`, `state`), `wait` (`woken` message ids) | none | none | Removed with the session record. Ids and counts only, never a message body. `<id>.wait.lock` is the lock of the one `ws msg wait` for a session |
 | Approval, pending and granted | `approvals/pending/<id>.json`, `approvals/granted/<id>.json` | `src/ws/approvals.py` | `schema`, `v`, `ts`, `id`, `bound`, `created`, `granted` | 1 | `ts` (when the file was written) | Expires 10 minutes after it's made; a granted one is deleted when it's used |

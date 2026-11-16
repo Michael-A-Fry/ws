@@ -14,6 +14,7 @@ The folders are listed on [Stores](stores.md).
 | `ws msg read ID` | One message left for you, with its text, marked read. `--ack` acknowledges it too. |
 | `ws msg export` | JSON lines of the messages you sent or were sent, to standard output or `--out PATH`. `--out` writes a new file (0600) and refuses a path that exists; the lines go to a temporary file first and are put in place when the export is complete. `--after ID`, `--limit N` (up to 100000). |
 | `ws msg watch` | The envelope feed for you (who, what kind, how big, delivered or not; never a body), cleaned for a terminal. `--after SEQ` carries on from a cursor, `--position-now` lists nothing and prints the cursor for the end, `--limit N`. It says `cursor_expired` when retention removed rows past your cursor (`pruned_through_seq` is the last removed) and `cursor_ahead` for a cursor beyond the end. |
+| `ws msg person-token` | Makes the per-boot token that lets you send from your own terminal (see "A person sends"). Refused inside a session. |
 | `ws msg wait` | Blocks until a message that no hook has delivered lands for you, then prints the envelope line. `--timeout SECONDS` (at most 1800), `--session-id ID` where one runner hosts several sessions. `--session-hook` is what a Claude Code `asyncRewake` hook runs: exit 2 with the envelope on standard error when a message lands (that wakes an idle session), exit 0 in every other case (it gives up, delivery is off, another waiter already runs for the session, it can't tell who it's, the store fails, or the run is a one-shot headless `claude -p`), because a hook's exit 2 wakes the session. It waits up to 23 hours, and exits within a second of its runner going. |
 
 Every command takes `--json`. `ws msg export` to standard output prints the lines themselves, without an envelope. The
@@ -26,10 +27,24 @@ arguments are read, so a `from` or `class` argument is ignored.
 
 The sender is never an argument. `ws session start` records the runner's process (its id and start time) in the session
 record, and a command is that session when the runner is one of its ancestors. A process that isn't under a runner (one
-that double-forked, or a person's own shell) isn't a session, so it can't send, list or read.
+that double-forked, or a person's own shell) isn't a session, so it can't list or read, and it can send only as the
+person (next section).
 `ws msg export` is the same: with no session behind it, it's refused (`ws.msg.export` itself refuses a missing session
 id, so no caller can ask it for the whole store), and a session's export has only the messages it sent or was sent,
 never a walled body. A person's own export of the whole store arrives with the owner path.
+
+## A person sends
+
+The person who owns this account can send from the hub or a plain terminal, as `person:<account user>`. It is off by
+default: set `[msg] person_send = true` in policy.toml, and run `ws msg person-token` at hub start (it writes
+`<data>/secrets/.person-token`, 0600, and a digest in `<state>/identity/person.sha256`). A send with no calling session
+then reads the token and checks it against the digest. The token sits in the secrets folder, which every launch wall
+hides, so an agent that has left its runner's process tree (`setsid`, `nohup`, `systemd-run --user`, `at`,
+`tmux new-window`, cron) has no token and is refused. Having no runner ancestor is not proof. The send is refused when
+the policy has `[gate] sandbox = false`, and on macOS (no process id for a hook). Same-user agents with the wall off can
+read the token; separate OS users per class (C111) is the full fix. The body goes in with `-`; the caps and the secret
+scan are the same, and the person has a rate cap of its own (20 a minute). A walled class takes it only when its
+`inbound_allow` names `person:<user>`. `ws msg watch` and the lists show the sender as `person:<user>`. See ADR 0023.
 
 Where it all lives isn't up to the caller either. The registry, the policy (the classes), the secrets registry (the
 names a message may not carry) and `messages.db` are all found from the account's own home folder (`ws.session.trusted_env`,

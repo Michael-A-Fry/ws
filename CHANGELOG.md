@@ -10,6 +10,10 @@ body of the GitHub release.
 
 ### Added
 
+- A person can send a `ws msg` from the hub or a plain terminal, recorded as `person:<user>`, behind `[msg] person_send`
+  (off by default) and a per-boot token under the secrets folder (`ws msg person-token`); an agent that escapes its
+  process ancestry has no token and is refused. The launcher step that makes a session's launch token records who asked
+  for it (`requested_by`), and `ws session show` prints it. See ADR 0023.
 - `ws session load` puts standing preferences, an area card and, on the first prompt, the records a search finds in front
   of a session, from one folder of plain files (`WS_CONTEXT_DIR`). A walled session sees only its own class's records
   and the core preferences; a record with an unknown, wrong-case or non-text `class`, or front matter ws can't fully

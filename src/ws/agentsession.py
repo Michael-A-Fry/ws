@@ -61,6 +61,7 @@ ADMIN_SUB = frozenset(
         ("skills", "restore"),
         ("config", "fallback"),
         ("session", "prepare"),  # mints the role a launcher gives a session
+        ("msg", "person-token"),  # mints the proof of a person's own send
         ("session", "start"),  # writes a session's registry record, role included
         ("node", "join"),  # changes the machine's own files
         ("node", "remove"),

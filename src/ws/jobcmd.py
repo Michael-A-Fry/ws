@@ -53,6 +53,7 @@ COMMAND = "job"
 WRITE_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"})
 REFUSED_OPTIONS = ("env", "exe", "provider")
 LOG_NAME = "jobs-installed.jsonl"
+LOG_SCHEMA = 1  # the `schema` of a line in logs/jobs-installed.jsonl
 _TOOL_BASE = re.compile(r"^([A-Za-z0-9_.*-]+)")
 
 
@@ -231,9 +232,7 @@ def _save_pins(folder: Path, pins: dict[str, dict]) -> None:
 
 def _log(env, action: str, name: str, sha: str | None, widened: list[str], approved: bool) -> None:
     rec = {
-        "schema": 1,
         "type": "ws.job-install/1",
-        "ts": datetime.now(UTC).isoformat(timespec="seconds"),
         "action": action,
         "job": name,
         "sha256": sha,
@@ -241,7 +240,7 @@ def _log(env, action: str, name: str, sha: str | None, widened: list[str], appro
         "approved": approved,
         "in_session": _in_session(env),
     }
-    jsonl.append(paths.state_dir(env) / "logs" / LOG_NAME, rec)
+    jsonl.append(paths.state_dir(env) / "logs" / LOG_NAME, jsonl.stamped(rec, LOG_SCHEMA))
 
 
 def _in_session(env) -> bool:

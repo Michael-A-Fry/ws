@@ -616,7 +616,8 @@ def cmd_wait(args) -> int:
             stamp = now
             ask = get(args.id)
             if ask["answer"]:
-                code, shown = 0, ask["answer"].get("text") or ""
+                text = view(ask)["answer"].get("text")  # an opaque ask's answer text is hidden here as in `get`
+                code, shown = 0, text if text is not None else "(hidden)"
                 break
             if ask["status"] in CLOSED:
                 code, shown = 4, ask["status"]

@@ -618,3 +618,26 @@ def test_reading_uses_the_strictest_of_the_name_and_the_folder_as_adding_does(bo
     assert asks.view(asks.get(ident))["opaque"] is False
     box.policy(priv_access="walled", open_access="walled")  # the folder is walled now; the name still says open
     assert asks.view(asks.get(ident))["opaque"] is True
+
+
+def answered(ident: str, text: str) -> None:
+    """An answer as another writer leaves it: `ws ask answer` refuses an opaque ask, so write the event directly."""
+    asks._write(
+        None, {"event": "answered", "id": ident, "answer": {"text": text, "option_index": None, "via": "test", "ts": 1}}
+    )
+
+
+def test_wait_does_not_print_the_answer_to_an_opaque_ask(box, capsys):
+    ident = box.add(capsys, "--question", "uses secretproject")  # stored redacted
+    answered(ident, "planted-answer-text")
+    code, out, err = box.run(capsys, "wait", ident, "--timeout", "1")
+    assert code == 0 and "planted-answer-text" not in out + err and out.strip() == "(hidden)"
+    code, out, _ = box.run(capsys, "wait", ident, "--timeout", "1", "--json")
+    assert code == 0 and "planted-answer-text" not in out
+
+
+def test_wait_does_not_print_the_answer_once_the_repo_is_walled(box, capsys):
+    ident = box.add(capsys, "--question", "plain")
+    answered(ident, "planted-answer-text")
+    box.policy(priv_access="walled", open_access="walled")
+    assert "planted-answer-text" not in box.run(capsys, "wait", ident, "--timeout", "1")[1]

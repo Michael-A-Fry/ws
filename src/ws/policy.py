@@ -2057,7 +2057,7 @@ def _read_values(toks: list[str], redirs: list[shellwords.Redirect]) -> dict[str
     if not names:
         return {"REPLY": here[-1]}
     parts = here[-1].split(None, len(names) - 1)
-    return {n: (parts[k] if k < len(parts) else "") for k, n in enumerate(names) if shellwords.ASSIGN.match(n + "=")}
+    return {n: (parts[k] if k < len(parts) else "") for k, n in enumerate(names) if _NAME.fullmatch(n)}
 
 
 def _loop_words(words: list[str]) -> list[str]:
@@ -2104,6 +2104,7 @@ def _segment(policy: Policy, seg: str, ctx: _Ctx, in_pipe: bool, cands: list[str
 
 
 _APPEND = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\+=")
+_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _BLOCK_WORDS = ("do", "then", "else", "elif", "{", "(", "!", "time", "if", "while", "until")
 
 
@@ -2131,9 +2132,9 @@ def _mark_unknown(ctx: _Ctx, seg: str, words: list[str]) -> None:
         rest = rest[1:]
     lead = list(itertools.takewhile(shellwords.ASSIGN.match, rest))
     if lead and (len(rest) > len(lead) or len(rest) < len(words)):  # ahead of a command, or inside a block
-        names |= {w.split("=", 1)[0] for w in lead}
+        names |= {shellwords.assign_name(w) for w in lead}
     if words and words[0] in _ENV_WRAPPERS:  # env X=/ cmd, sudo X=/ cmd: set for the command it runs
-        names |= {w.split("=", 1)[0] for w in words[1:] if shellwords.ASSIGN.match(w)}
+        names |= {shellwords.assign_name(w) for w in words[1:] if shellwords.ASSIGN.match(w)}
     if names:
         _mark_names(ctx, names)
 
@@ -2227,7 +2228,8 @@ def _segment_once(
         return None, "", []
     _mark_unknown(ctx, seg, words)
     if words and all(shellwords.ASSIGN.match(w) for w in words):  # X=/ ; later $X
-        _assign(ctx, _settled(ctx, env, dict(w.split("=", 1) for w in words)))
+        # an append (`X+=`) is left out: `_mark_unknown` has made its name unknown
+        _assign(ctx, _settled(ctx, env, dict(w.split("=", 1) for w in words if not _APPEND.match(w))))
     elif len(words) > 3 and words[0] == "for" and words[2] == "in":  # for i in a b; do ... $i
         listed = _loop_words(words[3:])
         ctx.loops = {**(ctx.loops or {}), words[1]: listed}
@@ -2239,7 +2241,9 @@ def _segment_once(
     if held:  # read X / let X=.. after X held a value: which value it has now isn't followed
         _mark_names(ctx, held)
     if toks and toks[0] in _DECLARERS:  # export X=/ ; declare -x X=/ ; local X=/
-        _assign(ctx, _settled(ctx, env, dict(w.split("=", 1) for w in toks[1:] if shellwords.ASSIGN.match(w))))
+        sets = [w for w in toks[1:] if shellwords.ASSIGN.match(w)]
+        _mark_names(ctx, {shellwords.assign_name(w) for w in sets if _APPEND.match(w)})  # export X+=: not followed
+        _assign(ctx, _settled(ctx, env, dict(w.split("=", 1) for w in sets if not _APPEND.match(w))))
     elif toks and toks[0] == "read":  # read -r X <<< /
         _assign(ctx, _read_values(toks, redirs))
     if _sets_anything(toks, seg):
@@ -3196,7 +3200,10 @@ def _seg_words(
         if shellwords.has_flag(flags, "c") and operands:
             nested.append(operands[0])
     if not toks:  # `X=/` on its own: later words may use it
-        known.update(w.split("=", 1) for w in env)
+        known.update(w.split("=", 1) for w in env if not _APPEND.match(w))
+        for w in env:
+            if _APPEND.match(w):
+                known.pop(shellwords.assign_name(w), None)  # an append's value isn't followed
     return toks, env, nested
 
 

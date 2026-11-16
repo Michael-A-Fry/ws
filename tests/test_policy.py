@@ -10,7 +10,7 @@ import time
 
 import pytest
 
-from ws import policy
+from ws import policy, shellwords
 from ws.policy import PolicyError
 
 RM = "rm"
@@ -2189,3 +2189,34 @@ def test_an_absolute_home_or_a_folder_above_it_is_refused_whole(home, key):
             policy.loads(f'[gate]\n{key} = [{ok}, "{entry}", "~/fine"]\n')
         assert str(entry) in str(e.value)  # it names the entry
     assert policy.loads(f"[gate]\n{key} = [{ok}]\n").gate  # a folder inside the home is fine
+
+
+# --- NAME+=value is an assignment, as bash reads it ---------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "A+=1 git push --force origin main",
+        "A+=1 B=2 git push --force origin main",
+        "A=1 B+=2 rm -rf /",
+        "sudo A+=1 git push -f origin main",
+        "env A+=1 git push --force origin main",
+        "A+=1 cat ~/.ssh/id_rsa",
+        "A+=1 bash",
+    ],
+)
+def test_an_append_ahead_of_a_command_is_an_assignment(pol, home, cmd):
+    assert policy.is_denied_command(pol, cmd)
+
+
+def test_an_append_leaves_the_value_unknown(pol, home):
+    assert policy.is_denied_command(pol, "D=/tmp; D+=/../$HOME/.ssh; cat $D/id_rsa")
+    assert policy.is_denied_command(pol, "export D=/tmp; export D+=/../$HOME/.ssh; cat $D/id_rsa")
+    assert policy.is_denied_command(pol, "A+=1 git status") is None
+
+
+def test_assign_name_takes_off_the_plus():
+    assert shellwords.ASSIGN.match("A+=1") and shellwords.ASSIGN.match("A=1")
+    assert not shellwords.ASSIGN.match("+=1") and not shellwords.ASSIGN.match("A++=1")
+    assert shellwords.assign_name("A+=1") == "A" == shellwords.assign_name("A=x=y")

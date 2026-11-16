@@ -178,7 +178,12 @@ class Lexed(NamedTuple):
     pieces: list[str]
 
 
-ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\+?=")  # NAME=value, and NAME+=value, which bash also reads
+
+
+def assign_name(word: str) -> str:
+    """The name an assignment word sets: `A` for `A=x` and for `A+=x`."""
+    return word.split("=", 1)[0].removesuffix("+")
 
 
 # --- text: line continuations, here-documents, segments --------------------------------------------------------------

@@ -8,8 +8,19 @@ body of the GitHub release.
 
 ## [Unreleased]
 
+## [0.1.11] - 2026-11-17
+
+### Removed
+
+- `docs/reference/hooks.md`: the hook table is now data, documented with hook parity (#208). Nothing else is removed;
+  this release adds 18,597 lines net (19,001 in, 404 out, 30 commits since 0.1.10).
+
 ### Added
 
+- A person can send a `ws msg` from the hub or a plain terminal, recorded as `person:<user>`, behind `[msg] person_send`
+  (off by default) and a per-boot token under the secrets folder (`ws msg person-token`); an agent that escapes its
+  process ancestry has no token and is refused. The launcher step that makes a session's launch token records who asked
+  for it (`requested_by`), and `ws session show` prints it. See ADR 0023.
 - `ws ask` is one queue of questions from every session to their person: `add`, `list`, `get`, `answer`, `wait`,
   `done`, `withdraw` and `import` (an older asks file, safe to run twice), in the file `ws home` already reads asks
   from. An ask whose repo isn't in a full-access class, or that hits the sensitive-terms file, is stored with no text;
@@ -420,5 +431,6 @@ withdrawn on the day it was published; 0.1.0 isn't available from GitHub or PyPI
 - The lab VM cell of the install test hasn't run yet.
 - PyPI publishing waits on a trusted publisher being set up; until then the GitHub release is the install route.
 
-[Unreleased]: https://github.com/Michael-A-Fry/ws/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/Michael-A-Fry/ws/compare/v0.1.11...HEAD
+[0.1.11]: https://github.com/Michael-A-Fry/ws/compare/v0.1.10...v0.1.11
 [0.1.1]: https://github.com/Michael-A-Fry/ws/commits/v0.1.1

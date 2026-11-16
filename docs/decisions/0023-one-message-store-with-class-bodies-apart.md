@@ -69,8 +69,64 @@ on a message to a walled class.
 - Bad: inside the wall the state folder is read-only, so a send from there fails with a typed `unavailable` error.
   Delivery across the wall isn't built yet.
 
+### Amendment: A person sends (hub chat 1b)
+
+Context: the person who owns the account sends from the hub or a plain terminal, and the record must say who wrote
+(traceability, audit). Until now a send with no calling session was refused, which is also what an agent that has
+escaped its ancestry gets. "No runner ancestor" is therefore not proof of a person: `setsid -f`, `nohup`,
+`systemd-run --user`, `at`, `tmux new-window` and cron all give an agent process whose ancestors hold no runner.
+
+Decision: a person send needs positive proof, and a switch that's off by default.
+
+- `[msg] person_send` in policy.toml (default `false`) is the rollback: off, the behaviour is exactly the earlier one.
+  A new key is needed because no existing setting says "this account lets its person send"; `[classes]` is about
+  sessions and `[gate]` about what a session may do (DEC-059: a key that replaces no setting says why).
+- On, a send with no calling session is a person send only when the process can read the per-boot token
+  (`<data>/secrets/.person-token`, 0600, made by `ws msg person-token` from the person's own terminal at hub start)
+  and it matches the digest, with this boot's id, in `<state>/identity/person.sha256`. The token sits in the secrets
+  folder, which every policy already adds to `deny_read` (`policy.secret_read_rules`), so every launch wall hides it
+  from a session. The digest sits in the identity folder, which is read-only inside the wall, so a token an agent plants
+  (the hidden folder is an empty overlay it can write to) never matches. A loose, linked or foreign-owned file is no
+  proof. `ws msg person-token` is an admin command, refused inside a session.
+- The sender is recorded as `person:<account user>` (the user from the system's user database). `admit()` gets a
+  synthetic, never-registered record built in one function (`msg.person_record`), with role `lead` and no class, and its
+  own rate cap (`PERSON_RATE_PER_MINUTE`, 20) apart from the per-session one. Walls are unchanged: a walled class takes
+  it only if its `inbound_allow` names `person:<user>`; the default is refused. The caps, the secret scan and the walled
+  kinds apply as before. Only the command line takes this path; `ws mcp serve` never does.
+- The envelope rows, `ws msg watch` and the list show `person:<user>`.
+- The launcher step `ws session prepare` (what `ws dispatch` calls) writes `requested_by` into the launch token: the
+  calling session's id, or `person:<user>` only when the same proof passes, else `unknown`. The start hook copies it
+  to the identity file (the authority) and the session record; a resumed start keeps it; an older record reads as
+  `unknown`. `ws session show ID` prints it. The record is the audit trail; there is no new log.
+
+What this stops, and what it doesn't. The token is only as private as the wall that hides it:
+
+- It stops: an agent in a launch wall (the secrets folder hidden, the identity folder read-only) from sending as the
+  person, by any ancestry escape, and from minting its own proof.
+- It doesn't stop: a session with the wall off (`--no-sandbox`) running as the same OS user, which can read the token.
+  So with `[gate] sandbox = false` the person send is refused; ws can't see a `--no-sandbox` launch under a policy that
+  says on. On macOS, and where the process id of a hook can't be had (`bind_peer(None)`), a person send is refused.
+- The full fix is a separate OS user per class (C111), so a session can't read the account's files at all. Until then
+  this is a wall-dependent control.
+
+| Case | Result | Test |
+|---|---|---|
+| a walled shell, and a process it orphans with `setsid -f` (so also what nohup, `at` and cron give: still inside the wall's mount namespace) | the token is hidden and `person_proof` is False | `tests/e2e/test_sandbox.py::test_a_walled_shell_and_a_process_it_orphans_cannot_read_the_person_token` |
+| no runner ancestor and no token readable | refused | `test_no_runner_ancestor_without_the_token_is_refused` |
+| a token the agent writes itself | refused: no matching digest | `test_planted_token_without_the_digest_is_refused` |
+| a token from an earlier boot | refused | `test_a_token_from_an_earlier_boot_is_no_proof` |
+| policy says `sandbox = false`; macOS; the resident gate's child | refused | `test_no_wall_in_policy_refuses`, `test_macos_is_refused_until_its_profile_is_run`, `test_the_resident_gate_child_is_never_a_person` |
+
+Not tested, so stated as open: `systemd-run --user` and `tmux new-window` start a process from another daemon, which
+may sit outside the launch wall's mount namespace; if it does it can read the token. The e2e case doesn't cover them.
+Also open: the policy's `sandbox = true` is intent, not fact. A session launched with `--no-sandbox` under a policy
+that says on can read the token, and ws doesn't yet stamp "walled" on the identity record to refuse while such a
+session is live (it needs the launcher, a follow-up with C111). The token's folder must exist when a runner starts for
+the wall to hide it, so `ws msg person-token` refuses to make that folder; the install makes it.
+
 ### Confirmation
 
+`tests/test_msg_person.py` (the person path and who asked),
 `tests/test_msg.py` (the walled-class rules, the canary read of the whole shared file, export, forged senders and class
 headers, replay, the caps, the typed store failures, retention, deletion), `tests/test_session_registry.py` (the runner
 stamp and `resolve_caller`, including a real orphaned process) and `tests/test_mcp_server.py` (the tools and the bounded

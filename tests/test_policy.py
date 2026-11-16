@@ -2372,3 +2372,30 @@ def test_the_known_hosts_file_is_a_write(pol, home):
     assert policy.is_denied_command(pol, "ssh -o UserKnownHostsFile=/tmp/kh host ls", protect=(target,)) is None
     assert policy.is_denied_command(pol, "autossh -M 0 host ls") is None
     assert policy.is_denied_command(pol, "sshpass -e ssh host ls") is None
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "sshpass -vp pw ssh -oProxyCommand=bash h",
+        "sshpass -ppw ssh -oProxyCommand=bash h",
+        "sshpass env ssh -oProxyCommand=bash h",
+        "sshpass env SSH_ASKPASS=/tmp/x ssh h ls",
+        "sshpass command ssh -oProxyCommand=bash h",
+        "sshpass timeout 5 ssh -oProxyCommand=bash h",
+        "sshpass -p pw scp a h:b",  # a program other than ssh: not read
+        "sshpass -p pw",
+        "ssh -o 'UserKnownHostsFile \"/srv/x y/../p/policy.toml\"' h ls",
+        "ssh -o 'UserKnownHostsFile /srv/x\\ y/p' h ls",
+        "read -r SSH_ASKPASS < /tmp/f; export SSH_ASKPASS; ssh h ls",
+        "export $(echo SSH_ASKPASS=/tmp/x); ssh h ls",
+        "export ${A}=/tmp/x; ssh h ls",
+    ],
+)
+def test_ssh_through_sshpass_a_quoted_file_list_or_a_hidden_askpass_is_denied(pol, home, cmd):
+    assert policy.is_denied_command(pol, cmd)
+
+
+def test_sshpass_with_bundled_flags_still_runs_a_plain_ssh(pol, home):
+    assert policy.is_denied_command(pol, "sshpass -vp pw ssh -p 22 h uptime") is None
+    assert policy.is_denied_command(pol, "export X=1; ssh h ls") is None

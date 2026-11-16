@@ -2235,10 +2235,12 @@ def _segment_once(
     nested: list[str] = []
     dropped: list[str] = []
     toks, wrappers = shellwords.strip_wrappers(words, lexenv=env, budget=ctx.budget, dropped=dropped, scripts=nested)
-    held = _targets(toks) & (set(ctx.vars or {}) | set(ctx.loops or {}) | set(ctx.unknown))
-    if held:  # read X / let X=.. after X held a value: which value it has now isn't followed
+    held = _targets(toks) & (set(ctx.vars or {}) | set(ctx.loops or {}) | set(ctx.unknown) | _SSH_ENV)
+    if held:  # read X / let X=.. after X held a value (or set ssh's askpass): which value it has now isn't followed
         _mark_names(ctx, held)
-    if toks and toks[0] in _DECLARERS:  # export X=/ ; declare -x X=/ ; local X=/
+    if toks and toks[0] in _DECLARERS and any(_HAS_PART.search(w) and not shellwords.ASSIGN.match(w) for w in toks[1:]):
+        _distrust(ctx, folders=True)  # export ${A}=x ; export $(cat env): a name ws cannot read, so any variable
+    elif toks and toks[0] in _DECLARERS:  # export X=/ ; declare -x X=/ ; local X=/
         _assign(ctx, _settled(ctx, env, dict(w.split("=", 1) for w in toks[1:] if shellwords.ASSIGN.match(w))))
     elif toks and toks[0] == "read":  # read -r X <<< /
         _assign(ctx, _read_values(toks, redirs))
@@ -2280,9 +2282,12 @@ def _segment_once(
     if admin:
         return admin, line, []
     local_seg = seg  # the part of the line that runs here
-    if (ssh_toks := _ssh_toks(cmd, toks)) is not None:
+    ssh_toks, ssh_prefix, ssh_why = _ssh_toks(cmd, toks, env, ctx.budget)
+    if ssh_why:
+        return ssh_why, line, []
+    if ssh_toks is not None:
         ssh_opts, ssh_host, ssh_remote = _ssh_argv(ssh_toks)
-        if reason := _ssh_refusal(policy, ctx, ssh_opts, words[: max(0, len(words) - len(toks))]):
+        if reason := _ssh_refusal(policy, ctx, ssh_opts, [*words[: max(0, len(words) - len(toks))], *ssh_prefix]):
             return reason, line, []
         cut, here = _ssh_remote(policy, seg, ssh_opts, ssh_host, ssh_remote, wrappers | ({cmd} - {"ssh"}), redirs)
         if here:  # a remote command to this machine runs outside the wall: judged as the local command it is
@@ -2524,6 +2529,7 @@ _SSH_PLAIN = (  # ssh_config(5) keywords that run nothing on this machine (lower
 )
 _SSH_KEYS = frozenset((*_SSH_FILE_KEYS, *_SSH_PLAIN.split()))
 _SSH_OPTION = re.compile(r"\s*([A-Za-z0-9]+)\s*(?:=\s*|\s+|\Z)(.*)", re.DOTALL)
+_SSH_ENV = frozenset(("SSH_ASKPASS", "SSH_ASKPASS_REQUIRE"))  # an askpass setting: a program ssh runs
 _SSH_ASKPASS = re.compile(r"SSH_ASKPASS(?:_REQUIRE)?=")
 _SSH_HOST = re.compile(r"(?:ssh://)?(?:[^@/]*@)?(\[[^\]]*\]|[^:/]*)")
 _SSH_RENAMES = re.compile(
@@ -2647,26 +2653,35 @@ def _ssh_remote(
     return (m.start(1) - 1, False) if all(_named_host(policy, n) for n in names) else (None, False)
 
 
-def _ssh_toks(cmd: str, toks: list[str]) -> list[str] | None:
-    """ssh's words when this command runs ssh: ssh itself, `autossh` (ssh's options and its own `-M`), or `sshpass`
-    before an ssh. None for any other command."""
+def _ssh_toks(
+    cmd: str, toks: list[str], env, budget: shellwords.Budget
+) -> tuple[list[str] | None, list[str], str | None]:
+    """ssh's words when this command runs ssh (ssh itself, `autossh` with its own `-M` taken off, or the ssh `sshpass`
+    runs, wrappers and all), the words a wrapper set ahead of it, and a refusal for an sshpass whose program is not an
+    ssh ws can read. (None, [], None) for any other command."""
     if cmd == "ssh":
-        return toks
+        return toks, [], None
     if cmd not in _SSH_WRAPPERS:
-        return None
-    own, out, i = _SSH_WRAPPERS[cmd], [], 1
-    while i < len(toks):
+        return None, [], None
+    own, i = _SSH_WRAPPERS[cmd], 1
+    out: list[str] = []
+    while i < len(toks) and toks[i].startswith("-") and len(toks[i]) > 1:  # getopt: `-vp pw`, `-ppw`, `-e`
         t = toks[i]
-        if cmd == "sshpass" and not (t.startswith("-") and len(t) > 1):
-            rest = toks[i:]
-            return rest if posixpath.basename(rest[0]) == "ssh" else None
-        if len(t) == 2 and t[0] == "-" and t[1] in own:
-            i += 2
-            continue
-        if not (len(t) > 2 and t[0] == "-" and t[1] in own):  # `-M20000`, `-pSECRET`: the wrapper's own, dropped
-            out.append(t)
         i += 1
-    return None if cmd == "sshpass" else ["ssh", *out]
+        if t == "--":
+            break
+        k = next((k for k, c in enumerate(t[1:], 1) if c in own), 0)
+        if k and k + 1 == len(t):
+            i += 1  # the value is the next word
+        if cmd == "autossh" and not k:
+            out.append(t)  # an ssh option: autossh passes it on
+    if cmd == "autossh":
+        return ["ssh", *out, *toks[i:]], [], None
+    rest = toks[i:]
+    inner, _ = shellwords.strip_wrappers(rest, lexenv=env, budget=budget, scripts=[]) if rest else ([], set())
+    if inner and inner[0] == "ssh":
+        return inner, rest[: max(0, len(rest) - len(inner))], None
+    return None, [], "sshpass runs a program ws does not read here; run ssh under sshpass directly, or use a key"
 
 
 def _ssh_refusal(policy: Policy, ctx: _Ctx, opts: list[tuple[str, str]], prefix: list[str]) -> str | None:
@@ -2688,7 +2703,9 @@ def _ssh_refusal(policy: Policy, ctx: _Ctx, opts: list[tuple[str, str]], prefix:
             key = m.group(1).lower() if m else ""
             if key not in _SSH_KEYS:
                 return f"ssh option {key or value!r} runs or loads a local program or file, or is not one ws knows{how}"
-            files = [f.strip("\"'") for f in m.group(2).split()] if key in _SSH_FILE_KEYS else []  # a list, for some
+            if key in _SSH_FILE_KEYS and re.search(r"[\"'\\]", m.group(2)):
+                return f"ssh is given a file list with quotes or a backslash, which ws does not split; {HOW_TO_SPELL}"
+            files = m.group(2).split() if key in _SSH_FILE_KEYS else []  # a list, for some
         for f in files:
             if _HAS_PART.search(f) or "%" in f:
                 return f"ssh is given the file {f!r}, which holds a part ws cannot read; {HOW_TO_SPELL}"

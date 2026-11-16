@@ -157,7 +157,7 @@ def test_info(path: Path) -> tuple[str, set[str]]:
 def words_for(path: str) -> list[str]:
     """What a test's text would say if it read this file: the path, its basename, its parent folder."""
     p = Path(path)
-    out = [path, p.name]
+    out = [path] + ([p.name] if "." in p.name else [])
     if len(p.parts) > 1 and p.parent.as_posix() not in {"src/ws", "tests", "."}:
         out.append(p.parent.as_posix() + "/")
     return out
@@ -189,9 +189,14 @@ def select(mod: list[str], added: list[str], gone: list[str]) -> tuple[str, list
     for t, (text, reach) in info.items():
         if changed_mods & reach:
             chosen.add(rel[t])
-        for m in changed_mods:  # what imports cannot see (a CLI test, a scanned folder): tests that name the module
-            by_word = CLI_MARKERS.search(text) or m in command_modules() or m.count(".") > 1
-            if by_word and re.search(rf"\b{re.escape(m.rpartition('.')[2])}\b", text):
+        for m in changed_mods:  # what imports cannot see (a CLI test, a scanned folder): the module named as a path or
+            # dotted name, or as a quoted string (a command name); never a bare common word
+            leaf = re.escape(m.rpartition(".")[2])
+            sub = re.escape(m.removeprefix("ws.").replace(".", "/"))
+            by_name = rf"\bws\.{re.escape(m.removeprefix('ws.'))}\b|src/ws/{sub}\b"
+            quoted = rf"""["']{leaf}["']"""
+            scanned = CLI_MARKERS.search(text) or m in command_modules() or m.count(".") > 1
+            if re.search(by_name, text) or (scanned and re.search(quoted, text)):
                 chosen.add(rel[t])
         for p in other:
             if any(w in text for w in words_for(p)):

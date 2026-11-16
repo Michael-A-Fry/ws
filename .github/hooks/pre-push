@@ -4,6 +4,10 @@
 # Skip it for one push:       WS_SKIP_PREPUSH=1 git push
 # Run the suite through a wrapper: WS_PREPUSH_WRAP="your-lock-command --flag" git push (split on spaces; for a machine
 # that queues test runs, so a push's suite doesn't race the others). Unset, the suite runs as it is.
+# Which tests: the ones the change can affect (scripts/affected_tests.py); CI runs the whole suite on every pull request.
+# The whole suite runs here instead when a path that reaches every test changed (pyproject.toml, uv.lock, a conftest.py,
+# tests/plugins/, .github/, the selector), a file was renamed or deleted, the selector is missing or fails, the selected
+# set will not collect, or WS_PREPUSH_FULL=1 (logged like a skip). Nothing to select runs a short smoke set, never zero.
 # A skip is never silent: it adds a line to .git/ws-prepush-skips.log (the log of the worktree's git dir).
 set -euo pipefail
 
@@ -28,7 +32,47 @@ wrap=()
 if [[ -n "${WS_PREPUSH_WRAP:-}" ]]; then
   read -r -a wrap <<<"$WS_PREPUSH_WRAP"
 fi
+
+log="$(git rev-parse --git-path ws-prepush-skips.log)"
+run_full="" reason=""
+if [[ "${WS_PREPUSH_FULL:-}" == "1" ]]; then
+  run_full=1 reason="WS_PREPUSH_FULL=1"
+  printf '%s full suite forced on %s (WS_PREPUSH_FULL=1)\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(git rev-parse --abbrev-ref HEAD)" >>"$log"
+fi
+
+targets=()
+if [[ -z "$run_full" ]]; then
+  git fetch -q origin main 2>/dev/null || true
+  base=origin/main
+  if [[ ! -f scripts/affected_tests.py ]]; then
+    run_full=1 reason="no selector in this checkout"
+  elif ! picked="$(python3 -I scripts/affected_tests.py --base "$base" 2>/dev/null)" || [[ -z "$picked" ]]; then
+    run_full=1 reason="the selector failed"
+  else
+    kind="$(head -n1 <<<"$picked")"
+    case "$kind" in
+      SELECT | SMOKE) mapfile -t targets < <(tail -n +2 <<<"$picked") ;;
+      *) run_full=1 reason="${kind#FULL: }" ;;
+    esac
+    if [[ -z "$run_full" && ${#targets[@]} -eq 0 ]]; then
+      run_full=1 reason="the selector named no tests"
+    fi
+  fi
+fi
+
 suite=(uv run --locked pytest -q)
+if [[ -z "$run_full" ]]; then
+  # a collection error in the selected set means the map is wrong or the change broke an import: run everything
+  if ! "${suite[@]}" --collect-only -q "${targets[@]}" >/dev/null 2>&1; then
+    run_full=1 reason="the selected tests did not collect"
+  fi
+fi
+if [[ -z "$run_full" ]]; then
+  suite+=("${targets[@]}")
+  echo "pre-push: $kind: ${#targets[@]} test file(s) the change can affect (WS_PREPUSH_FULL=1 runs all)" >&2
+else
+  echo "pre-push: the whole suite: $reason" >&2
+fi
 if ((${#wrap[@]})); then
   suite=("${wrap[@]}" "${suite[@]}")
 fi

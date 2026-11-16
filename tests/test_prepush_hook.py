@@ -71,3 +71,147 @@ def test_a_failing_suite_fails_the_push_through_the_wrapper(tmp_path):
 
 def test_a_spaces_only_wrap_is_the_same_as_unset(tmp_path):
     assert run_hook(tmp_path, "   ") == ["uvx prek run --all-files", "uv run --locked pytest -q"]
+
+
+# --- which tests: the selector (scripts/affected_tests.py) and what the hook does with its answer ---------------------
+
+SELECTOR = HOOK.parents[2] / "scripts" / "affected_tests.py"
+SUITE = "uv run --locked pytest -q"
+BASE_FILES = {
+    "src/ws/__init__.py": "",
+    "src/ws/a.py": "X = 1\n",
+    "src/ws/b.py": "from ws import a\n",
+    "src/ws/c.py": "Y = 1\n",
+    "tests/test_a.py": "from ws import a\n",
+    "tests/test_b.py": "from ws import b\n",
+    "tests/test_c.py": "from ws import c\n",
+    "tests/test_prepush_hook.py": "",
+    "tests/test_cli.py": "",
+    "tests/test_cli_registry.py": "",
+    "README.md": "hi\n",
+}
+
+
+def run_selected(
+    tmp_path: Path,
+    change: dict[str, str | None],
+    extra_env: dict[str, str] | None = None,
+    selector: bool = True,
+    fake_uv: bool = True,
+) -> tuple[list[str], str]:
+    """A scratch repo with modules a, b (imports a), c and a test for each, on a base commit that is `origin/main`.
+    `change` is then committed on top: path -> new text, or None to delete. Returns the fake uv calls and stderr."""
+    repo, bin_dir, log = tmp_path / "repo", tmp_path / "bin", tmp_path / "calls.log"
+    bin_dir.mkdir(exist_ok=True)
+    git = shutil.which("git")
+    assert git, "git is needed"
+    for rel, text in BASE_FILES.items():
+        (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+        (repo / rel).write_text(text, encoding="utf-8")
+    if selector:
+        (repo / "scripts").mkdir()
+        shutil.copy(SELECTOR, repo / "scripts" / "affected_tests.py")
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("GIT_", "WS_PREPUSH"))}
+    env.update(PATH=f"{bin_dir}{os.pathsep}{os.path.dirname(git)}{os.pathsep}/usr/bin:/bin", HOME=str(tmp_path))
+    env.update(extra_env or {})
+
+    def g(*args: str) -> None:
+        cfg = ["-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false"]
+        subprocess.run([git, "-C", str(repo), *cfg, *args], check=True, env=env, capture_output=True)
+
+    g("init", "-q", "-b", "work")
+    g("add", "-A")
+    g("commit", "-q", "-m", "base")
+    g("update-ref", "refs/remotes/origin/main", "HEAD")
+    for rel, text in change.items():
+        if text is None:
+            (repo / rel).unlink()
+        else:
+            (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+            (repo / rel).write_text(text, encoding="utf-8")
+    g("add", "-A")
+    g("commit", "-q", "-m", "change")
+    fake(bin_dir, "uvx", log)
+    if fake_uv:
+        fake(bin_dir, "uv", log)
+    done = subprocess.run(
+        [shutil.which("bash"), str(HOOK)], cwd=repo, env=env, capture_output=True, text=True, check=False
+    )
+    assert done.returncode == 0, done.stderr
+    return [c for c in log.read_text(encoding="utf-8").splitlines() if c.startswith("uv ")], done.stderr
+
+
+def test_a_one_module_change_runs_its_tests_only(tmp_path):
+    calls, err = run_selected(tmp_path, {"src/ws/c.py": "Y = 2\n"})
+    assert calls[-1] == f"{SUITE} tests/test_c.py"
+    assert "1 test file(s)" in err
+
+
+def test_a_module_change_runs_the_tests_of_what_imports_it(tmp_path):
+    calls, _ = run_selected(tmp_path, {"src/ws/a.py": "X = 2\n"})
+    assert calls[-1] == f"{SUITE} tests/test_a.py tests/test_b.py"
+
+
+def test_a_new_test_file_is_always_selected(tmp_path):
+    calls, _ = run_selected(tmp_path, {"tests/test_new.py": "def test_x():\n    pass\n"})
+    assert calls[-1] == f"{SUITE} tests/test_new.py"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "pyproject.toml",
+        "uv.lock",
+        "tests/conftest.py",
+        "tests/sub/conftest.py",
+        "tests/plugins/ws_harness.py",
+        ".github/workflows/ci.yml",
+        "scripts/affected_tests.py",
+    ],
+)
+def test_a_force_full_path_runs_everything(tmp_path, path):
+    calls, err = run_selected(tmp_path, {path: "x = 1\n"})
+    assert calls[-1] == SUITE
+    assert "the whole suite" in err
+
+
+def test_a_deleted_file_runs_everything(tmp_path):
+    calls, err = run_selected(tmp_path, {"src/ws/c.py": None})
+    assert calls[-1] == SUITE
+    assert "renamed or deleted" in err
+
+
+def test_nothing_to_select_runs_the_smoke_set_never_zero(tmp_path):
+    calls, err = run_selected(tmp_path, {"README.md": "changed\n"})
+    assert calls[-1] == f"{SUITE} tests/test_cli.py tests/test_cli_registry.py tests/test_prepush_hook.py"
+    assert "SMOKE" in err
+
+
+def test_a_selector_that_errors_runs_everything(tmp_path):
+    calls, err = run_selected(tmp_path, {"src/ws/c.py": "def broken(:\n"})
+    assert calls[-1] == SUITE
+    assert "selector error" in err
+
+
+def test_no_selector_in_the_checkout_runs_everything(tmp_path):
+    calls, err = run_selected(tmp_path, {"src/ws/c.py": "Y = 2\n"}, selector=False)
+    assert calls[-1] == SUITE
+    assert "no selector" in err
+
+
+def test_a_collection_error_in_the_selected_set_runs_everything(tmp_path):
+    # the fake uv fails only the collect-only call, as pytest does for a test that will not import
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    body = '#!/usr/bin/env bash\nprintf "%s\\n" "uv $*" >> "$LOG"\n[[ "$*" == *--collect-only* ]] && exit 2\nexit 0\n'
+    (bin_dir / "uv").write_text(body, encoding="utf-8")
+    (bin_dir / "uv").chmod(0o755)
+    calls, err = run_selected(tmp_path, {"src/ws/c.py": "Y = 2\n"}, {"LOG": str(tmp_path / "calls.log")}, fake_uv=False)
+    assert calls[-1] == SUITE
+    assert "did not collect" in err
+
+
+def test_a_forced_full_run_is_logged_and_runs_everything(tmp_path):
+    calls, _ = run_selected(tmp_path, {"src/ws/c.py": "Y = 2\n"}, {"WS_PREPUSH_FULL": "1"})
+    assert calls[-1] == SUITE
+    assert "WS_PREPUSH_FULL=1" in (tmp_path / "repo" / ".git" / "ws-prepush-skips.log").read_text(encoding="utf-8")

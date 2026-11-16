@@ -556,6 +556,7 @@ mode = "log"
 # mode = "log"
 # release_dir = "~/releases"   # a folder whose `current` link names the promoted release; left out, claims are off
 # release_tags = ["v[0-9]+[.][0-9]+([.][0-9]+)*"]   # regexes for a release's name; the default reads v1.2 and v1.2.3
+# repos = ["~/code/other-repo"]   # other repositories whose default branch (on a URL remote) can vouch for a commit
 # [guards.test-weakening]
 # mode = "log"
 # [guards.skill-gate]

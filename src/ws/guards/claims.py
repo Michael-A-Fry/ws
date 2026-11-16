@@ -14,6 +14,14 @@ branch. REF is the policy's `ref`, else the default branch on `origin`. B and th
 an ancestor of REF, or isn't a commit in this repository, denies the message and the reason names it; the reason says to
 `git fetch` first when REF may be out of date.
 
+A commit that isn't on REF in the session's repository is looked for in the policy's `repos` before the message is
+denied (never in a folder the message names: anyone who can write a message can make a folder that vouches for a
+commit). A listed repository vouches only when its `origin` is a URL (not a folder on this machine), its
+`refs/remotes/origin/HEAD` names the branch the message claims, and the commit is an ancestor of that remote-tracking
+branch. A clone of a clone, a repository with no remote, one that has only a local branch, and one whose default branch
+has another name never vouch, and neither does one git can't answer for in time. A commit none has still denies the
+message.
+
 Not a claim: a claim word in quotes or backticks, one with a negation or a future form in the four words before it
 (`not merged`, `will be pushed`, `once it's merged`), and any sentence that names another branch (`origin/work`, or
 `pushed to work`, `merged into work`), because the check is against one ref. A folder that isn't a repository, no git on
@@ -176,17 +184,24 @@ class Config:
     ref: str = ""  # "" = the default branch on origin
     release_dir: str = ""  # "" = release claims are off
     release_tags: tuple[str, ...] = DEFAULT_TAGS
+    repos: tuple[
+        str, ...
+    ] = ()  # other repositories a claim may be about, besides the session's and those named in the text
 
 
 def config(table: dict, where: str) -> Config:
-    known_keys(table, where, ("words", "ref", "release_dir", "release_tags"))
+    known_keys(table, where, ("words", "ref", "release_dir", "release_tags", "repos"))
     words = text_list(table, "words", where)
     if "words" in table and not words:
         raise PolicyError(f"{where}: words must name at least one claim word")
     ref = table.get("ref", "")
     if "ref" in table and not _ref_ok(ref):
         raise PolicyError(f"{where}: ref must be a branch, tag or remote branch name such as origin/main")
-    return Config(words, ref, _release_dir(table, where), _release_tags(table, where))
+    repos = text_list(table, "repos", where)
+    for r in repos:
+        if not (r.startswith(("/", "~/")) or r == "~") or "\n" in r or "\0" in r:
+            raise PolicyError(f"{where}: repos must be absolute paths or start with ~/")
+    return Config(words, ref, _release_dir(table, where), _release_tags(table, where), repos)
 
 
 def _ref_ok(ref: object) -> bool:
@@ -518,6 +533,60 @@ def on_ref(cwd: str, sha: str, ref: str, budget: Budget | None = None) -> bool |
     return found == 0
 
 
+MAX_OTHER_REPOS = 6
+_LOCAL_URL = ("/", ".", "~", "file:")
+
+
+def other_repos(cfg: Config, cwd: str, budget: Budget) -> list[str]:
+    """The top folders of the policy's `repos`, without the session's own repository and each once, at most six. Only the
+    policy names a repository here: a path in a message never does, because anyone who can write the message can make a
+    folder of their own that vouches for a commit. A folder that isn't a repository, or that git can't answer for in
+    time, is left out."""
+    home = os.path.expanduser("~")
+    seen = {_top(cwd, budget)} if cwd else set()
+    found: list[str] = []
+    for raw in cfg.repos:
+        if budget.left() <= 0 or len(found) >= MAX_OTHER_REPOS:
+            break
+        top = _top(raw.replace("~", home, 1) if raw.startswith("~") else raw, budget)
+        if top and top not in seen:
+            seen.add(top)
+            found.append(top)
+    return found
+
+
+def _top(folder: str, budget: Budget) -> str | None:
+    return _git_text(folder, "rev-parse", "--show-toplevel", budget=budget)
+
+
+def _remote_default(repo: str, budget: Budget) -> str | None:
+    """The default branch another repository's own `origin` says it has: from `refs/remotes/origin/HEAD`, with no local
+    fallback, and only when `origin` is a URL and not a folder on this machine (a clone of a clone, or a scratch
+    repository with a remote made to say what it likes, isn't a record of what the real default branch holds)."""
+    url = _git_text(repo, "remote", "get-url", REMOTE, budget=budget)
+    if not url or url.startswith(_LOCAL_URL):
+        return None
+    head = _git_text(repo, "symbolic-ref", "--short", f"refs/remotes/{REMOTE}/HEAD", budget=budget)
+    prefix = f"{REMOTE}/"
+    if head and head.startswith(prefix) and _ref_ok(head) and len(head) > len(prefix):
+        return head.removeprefix(prefix)
+    return None
+
+
+def elsewhere(result, sha: str, ref: str, cfg: Config, cwd: str, budget: Budget):
+    """`result` (what `on_ref` said for the session's repository), unless a repository in the policy's `repos` has the
+    commit on the branch the message claims. That repository's own default branch (from its `origin`, a URL) has to be
+    the claimed one, and its remote-tracking ref has to exist: a repository with no remote, one whose `origin` is a
+    folder here, or one whose default branch is another one never vouches. The reason `result` gave stays when none does."""
+    if result is True or budget.spent():
+        return result
+    claimed = ref.removeprefix(f"{REMOTE}/")
+    for repo in other_repos(cfg, cwd, budget):
+        if _remote_default(repo, budget) == claimed and on_ref(repo, sha, f"{REMOTE}/{claimed}", budget) is True:
+            return True
+    return result
+
+
 # --- release claims ------------------------------------------------------------------------------------------------
 
 # `(?<!\s)` lets a run of spaces start a match only at its first space, so a long run is read once, not once for each space
@@ -637,6 +706,7 @@ def judge(call, cfg: Config, ctx) -> Finding | None:
     release = check_releases(text, cfg) if isinstance(text, str) else None
     for word, sha in claims:
         result = _out_of_time(budget) if budget.spent() else on_ref(ctx.cwd, sha, ref, budget)
+        result = elsewhere(result, sha, ref, cfg, ctx.cwd, budget)
         if result is True:
             continue
         if result is False:

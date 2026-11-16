@@ -16,6 +16,8 @@ body of the GitHub release.
 - Two flaky tests: the claims test that git can't answer in time now makes a commit whose id the guard reads as a commit
   (about one in 110 is all digits, and it was allowed either way), and the reveal-link test waits on the push itself
   instead of 5 s of polling. The tests that check the reader is quick measure its CPU time too, as the limit does.
+  The live conformance row that drives two real runner sessions is sized large, like the end-to-end tests it
+  matches, not small (60 s).
 
 ## [0.1.11] - 2026-11-17
 

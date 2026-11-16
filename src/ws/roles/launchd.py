@@ -108,12 +108,21 @@ def steps(cfg, answers, env):
     return out if len(out) > 1 else []
 
 
+NOT_FOUND = 113  # `launchctl print`'s exit for a label the domain does not hold
+
+
+class PrintFailed(Exception):
+    """`launchctl print` failed for a reason other than "not found", so whether ws loaded the label is unknown."""
+
+
 def _loaded_from(domain: str, lbl: str, runner) -> tuple[bool, str | None]:
-    """(loaded?, the plist path `launchctl print` names for it). Not loaded is (False, None); loaded with no path line
-    it can read is (True, None)."""
+    """(loaded?, the plist path `launchctl print` names for it). Not loaded (exit 113) is (False, None); loaded with no
+    path line it can read is (True, None). Any other failure raises PrintFailed."""
     code, out = runner(["launchctl", "print", f"{domain}/{lbl}"])
-    if code:
+    if code == NOT_FOUND:
         return False, None
+    if code:
+        raise PrintFailed(f"`launchctl print` failed for {lbl}: {out[:200] or code}; left alone")
     for line in out.splitlines():
         key, sep, value = line.strip().partition(" = ")
         if sep and key == "path" and value.strip():
@@ -138,8 +147,12 @@ def _is_own(env, path: str | None) -> bool:
 
 
 def _foreign(env, domain: str, lbl: str, runner) -> tuple[bool, str]:
-    """(loaded?, a problem line when the label is loaded from a plist ws did not write, else "")."""
-    loaded, path = _loaded_from(domain, lbl, runner)
+    """(loaded?, a problem line when the label is loaded from a plist ws did not write or `launchctl print` failed,
+    else "")."""
+    try:
+        loaded, path = _loaded_from(domain, lbl, runner)
+    except PrintFailed as e:
+        return True, str(e)
     if not loaded or _is_own(env, path):
         return loaded, ""
     return True, f"{lbl} is loaded from {path or 'a plist launchctl does not name'}, which ws did not write: left alone"

@@ -511,6 +511,15 @@ def test_launchd_bootstrap_failure_is_reported(box, write_job, env):
     assert len(problems) == 1 and "ws.job.daily" in problems[0] and "Bootstrap failed" in problems[0]
 
 
+def test_launchd_print_failing_for_another_reason_is_a_problem_not_a_skip(box, write_job, env):
+    write_job("daily", AI_JOB)
+    install.apply(launchd.steps({}, install.Answers(), env), env)
+    fake = Fake(code=1, out="Operation not permitted")
+    for problems in (launchd.deactivate(["daily"], env, fake, uid=1), launchd.activate(env, fake, uid=1)):
+        assert len(problems) == 1 and "ws.job.daily" in problems[0] and "Operation not permitted" in problems[0]
+    assert all(c[1] == "print" for c in fake.calls)
+
+
 def test_launchd_check(box, write_job, env, linux, mac):
     assert launchd.check({}, linux, env, False)[0] == "fail"
     assert launchd.check({}, mac, env, False) == ("ok", "launchd")

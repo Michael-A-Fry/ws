@@ -41,6 +41,23 @@ class Fake:
         return self.code, self.out
 
 
+class Launchctl(Fake):
+    """A fake runner whose `launchctl print` answers like launchd: `path = <plist>` for a loaded label, exit 113 else."""
+
+    def __init__(self, loaded: dict[str, str] | None = None):
+        super().__init__()
+        self.loaded = loaded or {}
+
+    def __call__(self, argv):
+        self.calls.append(argv)
+        if argv[:2] == ["launchctl", "print"]:
+            lbl = argv[2].rsplit("/", 1)[-1]
+            if lbl in self.loaded:
+                return 0, f"gui/501/{lbl} = {{\n\tactive count = 0\n\tpath = {self.loaded[lbl]}\n\tstate = waiting\n}}"
+            return 113, f'Could not find service "{lbl}" in domain for user gui: 501'
+        return 0, ""
+
+
 # ---- the schedule key ------------------------------------------------------------------------------------------------
 
 
@@ -226,7 +243,7 @@ def test_uninstall_leaves_launchd_and_systemd_alone_when_there_are_no_units(box,
 
 def test_deactivate_units_picks_the_adapter_by_file(box, env):
     units = box / ".ws" / "jobs" / "units"
-    fake = Fake()
+    fake = Launchctl({"ws.job.b": str(units / "ws.job.b.plist")})
     paths = [units / "ws-a.service", units / "ws-a.timer", units / "ws.job.b.plist", box / "elsewhere" / "ws-c.timer"]
     roles.deactivate_units(paths, env, fake)
     assert ["systemctl", "--user", "disable", "--now", "ws-a.timer", "ws-a.service"] in fake.calls
@@ -415,16 +432,59 @@ def test_launchd_steps_install_and_activate(box, write_job, env):
     assert [s.path.name for s in steps if s.kind == "file"] == ["ws.job.daily.plist"]
     assert install.apply(steps, env).changes >= 1
     assert install.apply(steps, env).changes == 0
-    fake, plist = Fake(), box / ".ws" / "jobs" / "units" / "ws.job.daily.plist"
+    plist = box / ".ws" / "jobs" / "units" / "ws.job.daily.plist"
+    assert plistlib.loads(plist.read_bytes())["WsWrittenBy"] == "ws"
+    fake = Launchctl()  # not loaded yet: nothing to boot out
     assert launchd.activate(env, fake, uid=501) == []
     assert fake.calls == [
+        ["launchctl", "print", "gui/501/ws.job.daily"],
+        ["launchctl", "bootstrap", "gui/501", str(plist)],
+    ]
+    fake = Launchctl({"ws.job.daily": str(plist)})  # loaded from ws's own plist: booted out, then loaded again
+    assert launchd.activate(env, fake, uid=501) == []
+    assert fake.calls[1:] == [
         ["launchctl", "bootout", "gui/501/ws.job.daily"],
         ["launchctl", "bootstrap", "gui/501", str(plist)],
     ]
-    fake = Fake()
+    fake = Launchctl({"ws.job.daily": str(plist)})
     assert launchd.deactivate(["daily"], env, fake, uid=501) == [] and fake.calls == [
-        ["launchctl", "bootout", "gui/501/ws.job.daily"]
+        ["launchctl", "print", "gui/501/ws.job.daily"],
+        ["launchctl", "bootout", "gui/501/ws.job.daily"],
     ]
+    fake = Launchctl()
+    assert launchd.deactivate(["daily"], env, fake, uid=501) == [] and fake.calls == [
+        ["launchctl", "print", "gui/501/ws.job.daily"]
+    ]
+
+
+def test_launchd_leaves_a_label_it_did_not_load_alone(box, write_job, env):
+    write_job("daily", AI_JOB)
+    install.apply(launchd.steps({}, install.Answers(), env), env)
+    own = box / ".ws" / "jobs" / "units" / "ws.job.daily.plist"
+    stranger = box / "Library" / "LaunchAgents" / "ws.job.backup.plist"
+    stranger.parent.mkdir(parents=True)
+    stranger.write_bytes(plistlib.dumps({"Label": "ws.job.backup", "ProgramArguments": ["/bin/true"]}))
+    fake = Launchctl({"ws.job.daily": str(own), "ws.job.backup": str(stranger), "ws.job.odd": ""})
+    problems = launchd.deactivate(["backup", "daily", "odd"], env, fake, uid=501)
+    bootouts = [c for c in fake.calls if c[1] == "bootout"]
+    assert bootouts == [["launchctl", "bootout", "gui/501/ws.job.daily"]]
+    assert len(problems) == 2 and "ws.job.backup" in problems[0] and str(stranger) in problems[0]
+    assert "ws.job.odd" in problems[1] and "left alone" in problems[1]
+    fake = Launchctl({"ws.job.daily": str(stranger)})  # a stranger holds ws's label: activate neither boots nor loads
+    problems = launchd.activate(env, fake, uid=501)
+    assert len(problems) == 1 and "ws.job.daily" in problems[0]
+    assert [c[1] for c in fake.calls] == ["print"]
+
+
+def test_launchd_owns_an_agent_loaded_from_a_home_that_moved(box, write_job, env):
+    write_job("daily", AI_JOB)
+    install.apply(launchd.steps({}, install.Answers(), env), env)
+    moved = box / "old-home" / "jobs" / "units" / "ws.job.daily.plist"
+    moved.parent.mkdir(parents=True)
+    moved.write_bytes((box / ".ws" / "jobs" / "units" / "ws.job.daily.plist").read_bytes())  # carries WsWrittenBy
+    fake = Launchctl({"ws.job.daily": str(moved)})
+    assert launchd.deactivate(["daily"], env, fake, uid=501) == []
+    assert ["launchctl", "bootout", "gui/501/ws.job.daily"] in fake.calls
 
 
 def test_launchd_warns_about_an_agent_with_no_schedule(box, write_job, env, mac):

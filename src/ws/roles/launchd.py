@@ -8,6 +8,9 @@ off at the time does not catch up: launchd has no setting for it, and RunAtLoad 
 The plist carries `ProcessType=Background` (launchd's share for scheduled work). Swap note: to replace launchd, add a scheduler
 adapter beside this one.
 `activate` bootstraps the agents into the user's GUI domain through an injectable runner; tests check the argv.
+Every plist carries `WsWrittenBy: ws`. `activate` and `deactivate` boot out a loaded `ws.job.*` label only when
+`launchctl print` shows it was loaded from a plist ws wrote (one under `jobs/units/`, or one carrying that key); a label
+someone else loaded is left alone and named in the problems, as the systemd adapter does with a unit it did not write.
 """
 
 from __future__ import annotations
@@ -22,6 +25,7 @@ from ws.roles import FAIL, OK, WARN, _schedule
 
 ROLE, NAME = "scheduler", "launchd"
 PREFIX = "ws.job."
+WRITTEN_BY = "WsWrittenBy"  # the key in every plist ws writes: the proof a loaded agent is its own
 
 
 def label(name: str) -> str:
@@ -53,6 +57,7 @@ def render(job: Scheduled, env, ws_cmd: list[str]) -> str:
         "ProcessType": "Background",  # launchd's low-priority class: the scheduled-work share systemd gets from a slice
         "StandardOutPath": log,
         "StandardErrorPath": log,
+        WRITTEN_BY: "ws",
     }
     return plistlib.dumps(plist, sort_keys=True).decode("utf-8")
 
@@ -103,13 +108,56 @@ def steps(cfg, answers, env):
     return out if len(out) > 1 else []
 
 
+def _loaded_from(domain: str, lbl: str, runner) -> tuple[bool, str | None]:
+    """(loaded?, the plist path `launchctl print` names for it). Not loaded is (False, None); loaded with no path line
+    it can read is (True, None)."""
+    code, out = runner(["launchctl", "print", f"{domain}/{lbl}"])
+    if code:
+        return False, None
+    for line in out.splitlines():
+        key, sep, value = line.strip().partition(" = ")
+        if sep and key == "path" and value.strip():
+            return True, value.strip()
+    return True, None
+
+
+def _is_own(env, path: str | None) -> bool:
+    """True when this plist is one ws wrote: it sits under this config folder's `jobs/units/` (links resolved), or it
+    reads as a plist carrying `WsWrittenBy: ws` (an agent loaded from a home that has since moved)."""
+    if not path:
+        return False
+    p = Path(path)
+    for folder in {_schedule.units_dir(env), Path(os.path.realpath(_schedule.units_dir(env)))}:
+        if p.is_relative_to(folder) or Path(os.path.realpath(p)).is_relative_to(folder):
+            return True
+    try:
+        data = plistlib.loads(p.read_bytes())
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        return False
+    return isinstance(data, dict) and data.get(WRITTEN_BY) == "ws"
+
+
+def _foreign(env, domain: str, lbl: str, runner) -> tuple[bool, str]:
+    """(loaded?, a problem line when the label is loaded from a plist ws did not write, else "")."""
+    loaded, path = _loaded_from(domain, lbl, runner)
+    if not loaded or _is_own(env, path):
+        return loaded, ""
+    return True, f"{lbl} is loaded from {path or 'a plist launchctl does not name'}, which ws did not write: left alone"
+
+
 def activate(env, runner=None, uid: int | None = None) -> list[str]:
-    """Load every agent ws wrote: bootout first (so a changed plist is picked up), then bootstrap. Returns what went wrong."""
+    """Load every agent ws wrote: bootout first (so a changed plist is picked up), then bootstrap. A label someone else
+    has loaded is left alone and named. Returns what went wrong."""
     runner = runner or _schedule.run_cmd
     domain = f"gui/{os.getuid() if uid is None else uid}"
     problems = []
     for plist in sorted(_want(env)):
-        runner(["launchctl", "bootout", f"{domain}/{plist.stem}"])  # not loaded yet is not a problem
+        loaded, clash = _foreign(env, domain, plist.stem, runner)
+        if clash:
+            problems.append(clash)
+            continue
+        if loaded:
+            runner(["launchctl", "bootout", f"{domain}/{plist.stem}"])
         code, out = runner(["launchctl", "bootstrap", domain, str(plist)])
         if code:
             problems.append(f"`launchctl bootstrap` failed for {plist.stem}: {out[:200] or code}")
@@ -117,10 +165,17 @@ def activate(env, runner=None, uid: int | None = None) -> list[str]:
 
 
 def deactivate(names: list[str], env, runner=None, uid: int | None = None) -> list[str]:
+    """Boot out these jobs' agents, each only if `launchctl print` shows ws loaded it from a plist of its own. A label
+    that is not loaded needs nothing; one someone else loaded is left alone and named. Returns what went wrong."""
     runner = runner or _schedule.run_cmd
     domain = f"gui/{os.getuid() if uid is None else uid}"
     problems = []
     for n in names:
+        loaded, clash = _foreign(env, domain, label(n), runner)
+        if clash:
+            problems.append(clash)
+        if clash or not loaded:
+            continue
         code, out = runner(["launchctl", "bootout", f"{domain}/{label(n)}"])
         if code:
             problems.append(f"`launchctl bootout` failed for {label(n)}: {out[:200] or code}")

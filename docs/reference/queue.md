@@ -8,11 +8,12 @@ from what it used. `src/ws/queue.py` is the code; this page is the contract. The
 
 | Command | What it does |
 |---|---|
-| `ws queue add JOB [--key K] [--deadline T]` | Queue a run of `jobs/JOB.toml`. The same `--key` again queues nothing new. |
+| `ws queue add JOB [--trigger ID \| --key K] [--deadline T]` | Queue a run of `jobs/JOB.toml`. The same `--key`, or the same `--trigger` for the same job (the run key), again queues nothing new, even after it has run. |
 | `ws queue list [--all] [--last N]` | The receipts: what waits or runs (`--all` adds the finished ones). |
 | `ws queue show RUN_ID` | One receipt. |
 | `ws queue cancel RUN_ID` | Take a queued run out of the queue. A running one, or one a drain has just claimed (`not_cancellable`), is stopped with SIGTERM to its `ws run`. |
 | `ws queue run [--max N]` | Run what's queued, one after another. This is what a timer runs. |
+| `ws queue tick JOB [--slot T] [--no-coalesce] [--skip-missed S]` | A schedule's tick: queue the run for slot T at most once (a double tick runs once), not while a run of the job waits or runs, and not when the slot is more than S seconds late. |
 | `ws queue slot --ram-gb N --lane ui --who join\|writer -- CMD...` | Wait for a slot, run `CMD` in it, give the slot back. Raw: the command's output and exit code are its own. |
 | `ws node join\|show\|remove` | The node's footprint ledger. See [Nodes](#nodes). |
 | `ws usage statusline` | The statusline command that stashes the subscription limits. See [Subscription limits](#subscription-limits). |

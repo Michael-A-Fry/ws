@@ -8,14 +8,29 @@ body of the GitHub release.
 
 ## [Unreleased]
 
+### Added
+
+- Vale runs before each commit (the upstream `vale` hook at v3.25.1, the version CI downloads), over the same files and
+  with the same style as CI's Vale step. It syncs the style package only when it's missing, so a fresh clone passes.
+- The e2e first-task script prints the pending systemd jobs and the process list when a SIGTERM reaches it from
+  outside, so a CI runner stopped mid-job says who stopped it.
+
 ### Changed
 
 - CI's macOS core-tier time budget is back to 900 s, the same as Linux. A tier over its budget now warns and only a run
   past twice the budget fails, so macOS warns over 900 s and fails over 1800 s, as before.
-- The pre-push hook runs the tests through `ws-test --light --node local --` (`--full` for `WS_PREPUSH_FULL=1`) when
+- The pre-push cap on a capped set grows with the set: 6 s a file, at least 300 s and at most 1800 s, so a large
+  selection doesn't hit 300 s with no failure. `WS_PREPUSH_CAP` still sets it, and the timeout message names it.
+- The pre-push hook runs the tests through `ws-test --light --mem 3G --node local --` (6G with e2e tests or over 40
+  files in the set; `--full` for `WS_PREPUSH_FULL=1`) when
   `ws-test` is on the PATH and `WS_PREPUSH_WRAP` is unset or only spaces, so a busy machine queues the push's tests
   (for up to `WS_TEST_WAIT`, 45 minutes) and caps their workers instead of timing them out. `WS_PREPUSH_WRAP=` (empty)
   runs them bare.
+- `config-guard` decides who owns a protected file by the root of the repository the session is in, not by a folder
+  prefix: the main checkout and any folder inside it own it; a linked worktree doesn't, even one kept under the owner,
+  and a folder outside git doesn't, nor does a repository whose `core.worktree` points elsewhere. If git can't say,
+  the session isn't an owner. A folder kept under `.claude/worktrees/`, or under any worktree git lists, never owns.
+  An `owners` entry is now the root of a repository's main checkout.
 
 ### Fixed
 
@@ -77,6 +92,8 @@ body of the GitHub release.
   no folder name and none of the runner's words, whatever `alert_text` says.
 - In the decision log, a refusal the wall makes redundant, refused because the wall wasn't proven, now has the layer
   `rule:unknown-command-word`, `rule:sets-ifs` or `rule:unread-write` where it was `rule:command`.
+- A test tier over its time budget now warns (a summary line, and a `::warning::` on GitHub Actions); only a tier past
+  twice its budget fails the run in CI, so a slow runner can't turn a green suite red.
 
 ### Fixed
 

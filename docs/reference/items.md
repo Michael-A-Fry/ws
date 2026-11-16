@@ -33,6 +33,7 @@ gate call has no payload, an approval has no bound command, an OpenCode ask has 
 | `gate-call` | `guards.record_calls` | Gate calls | `h[0-9a-f]{12}` | truth | append-only |
 | `claim` | `guards.claims` | Claims | `h[0-9a-f]{12}` | truth | append-only |
 | `verdict` | `gate` | Gate verdicts | `h[0-9a-f]{12}` | truth | append-only |
+| `connector-call` | `connectors` | Connector calls | `h[0-9a-f]{12}` | truth | append-only |
 | `wall-report` | `sandbox` | Wall report | `h[0-9a-f]{12}` | truth | append-only |
 | `secret-audit` | `secrets` | Secret audit | `h[0-9a-f]{12}` | truth | append-only |
 | `job-install` | `jobcmd` | Job installs | `h[0-9a-f]{12}` | truth | append-only |

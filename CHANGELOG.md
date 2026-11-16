@@ -10,6 +10,47 @@ body of the GitHub release.
 
 ### Added
 
+- Vale runs before each commit (the upstream `vale` hook at v3.25.1, the version CI downloads), over the same files and
+  with the same style as CI's Vale step. It syncs the style package only when it's missing, so a fresh clone passes.
+- The e2e first-task script prints the pending systemd jobs and the process list when a SIGTERM reaches it from
+  outside, so a CI runner stopped mid-job says who stopped it.
+
+### Changed
+
+- The pre-push cap on a capped set grows with the set: 6 s a file, at least 300 s and at most 1800 s, so a large
+  selection doesn't hit 300 s with no failure. `WS_PREPUSH_CAP` still sets it, and the timeout message names it.
+- The pre-push hook runs the tests through `ws-test --light --node local --` (`--full` for `WS_PREPUSH_FULL=1`) when
+  `ws-test` is on the PATH and `WS_PREPUSH_WRAP` is unset or only spaces, so a busy machine queues the push's tests
+  (for up to `WS_TEST_WAIT`, 45 minutes) and caps their workers instead of timing them out. `WS_PREPUSH_WRAP=` (empty)
+  runs them bare.
+- `config-guard` decides who owns a protected file by the root of the repository the session is in, not by a folder
+  prefix: the main checkout and any folder inside it own it; a linked worktree doesn't, even one kept under the owner,
+  and a folder outside git doesn't, nor does a repository whose `core.worktree` points elsewhere. If git can't say,
+  the session isn't an owner. A folder kept under `.claude/worktrees/`, or under any worktree git lists, never owns.
+  An `owners` entry is now the root of a repository's main checkout.
+
+### Fixed
+
+- The command reader's time limit counts its own CPU time, not the wall clock, so a busy or slow machine (a CI runner,
+  WSL2) no longer refuses an ordinary long command, such as `touch f{1..4000}`, as too slow to read. The wall clock still
+  stops a read that waits, at three times the limit.
+- Flaky tests: the reveal-link test waits on the push itself instead of 5 s of polling; the tests that check the reader
+  is quick measure its CPU time too, as the limit does; and the live conformance row that drives two real runner
+  sessions is sized large, like the end-to-end tests it matches, not small (60 s).
+
+## [0.1.11] - 2026-11-17
+
+### Removed
+
+- `docs/reference/hooks.md`: the hook table is now data, documented with hook parity (#208). Nothing else is removed;
+  this release adds 18,597 lines net (19,001 in, 404 out, 30 commits since 0.1.10).
+
+### Added
+
+- A person can send a `ws msg` from the hub or a plain terminal, recorded as `person:<user>`, behind `[msg] person_send`
+  (off by default) and a per-boot token under the secrets folder (`ws msg person-token`); an agent that escapes its
+  process ancestry has no token and is refused. The launcher step that makes a session's launch token records who asked
+  for it (`requested_by`), and `ws session show` prints it. See ADR 0023.
 - `ws ask` is one queue of questions from every session to their person: `add`, `list`, `get`, `answer`, `wait`,
   `done`, `withdraw` and `import` (an older asks file, safe to run twice), in the file `ws home` already reads asks
   from. An ask whose repo isn't in a full-access class, or that hits the sensitive-terms file, is stored with no text;
@@ -420,5 +461,6 @@ withdrawn on the day it was published; 0.1.0 isn't available from GitHub or PyPI
 - The lab VM cell of the install test hasn't run yet.
 - PyPI publishing waits on a trusted publisher being set up; until then the GitHub release is the install route.
 
-[Unreleased]: https://github.com/Michael-A-Fry/ws/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/Michael-A-Fry/ws/compare/v0.1.11...HEAD
+[0.1.11]: https://github.com/Michael-A-Fry/ws/compare/v0.1.10...v0.1.11
 [0.1.1]: https://github.com/Michael-A-Fry/ws/commits/v0.1.1

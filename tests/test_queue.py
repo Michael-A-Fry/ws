@@ -56,6 +56,28 @@ if prompt == "term":
 if prompt == "fail":
     print("boom", file=sys.stderr)
     sys.exit(2)
+if prompt.startswith("chain:"):
+    # what a script or watcher inside a queued run does to queue the next link: the ledger (the CLI add refuses in
+    # any agent session)
+    import subprocess
+    env = dict(os.environ)
+    if prompt == "chain:reset":
+        env["WS_CHAIN_DEPTH"] = "0"  # a run that tries to start its chain again
+    child = chr(10).join([
+        "import sys",
+        "from datetime import UTC, datetime",
+        "from ws import queue",
+        "try:",
+        "    queue.ledger_for_env().enqueue('chainer', None, datetime.now(UTC),",
+        "        chain_depth=queue.chain_depth_from_env(), chain_parent=queue.chain_parent_from_env())",
+        "except queue.WsError as e:",
+        "    sys.exit(e.exit_code)",
+    ])
+    r = subprocess.run([sys.executable, "-c", child], env=env)
+    with open(os.path.join(os.environ["WS_HOME"], "chain-saw.jsonl"), "a") as f:
+        saw = dict(depth=os.environ.get("WS_CHAIN_DEPTH"), parent=os.environ.get("WS_CHAIN_PARENT"), rc=r.returncode)
+        f.write(json.dumps(saw) + chr(10))
+    sys.stdout.write(ok)
 """
 
 
@@ -410,8 +432,8 @@ def test_stale_owner_reaped_only_on_pid_and_start(tmp_path):
     status = {r["run_id"]: r["status"] for r in ledger.receipts(last=10)}
     assert status[alive] == "running" and status[nostart] == "running"  # the lease has not run out
     assert status[reused] == "interrupted" and status[dead] == "interrupted"
-    assert {r["stop_reason"] for r in sink} == {"crashed"} and len(sink) == 2
-    assert all(r["status"] == "error" and r["error"].startswith("interrupted") for r in sink)
+    assert {r["stop_reason"] for r in sink} == {"owner_gone"} and len(sink) == 2
+    assert all(r["status"] == "outcome_unknown" and r["duration_ms"] == 0 for r in sink)  # found gone at its start
     assert runrecord.record_cost(sink[0], 2.0, None) == 2.0  # counted at the fallback, like any run with no cost
     ledger.clock = lambda: T0 + timedelta(hours=2)
     assert ledger.reap(T0 + timedelta(hours=2)) == 1  # the unknown one, once its lease is over
@@ -1279,10 +1301,9 @@ def test_a_crash_between_reserve_and_start_does_not_strand_the_reservation(box, 
     ledger.conn().execute("UPDATE receipts SET owner_pid = ?", (dead.pid,))  # its owner has died
     assert cli.main(["run", "daily"]) == 0  # the same job runs: the dead one is reaped first, not waited for
     recs = runrecord.read(runrecord.runs_path())
-    crashed = next(r for r in recs if r["stop_reason"] == "crashed")
-    assert (
-        crashed["status"] == "error" and crashed["job"] == "daily" and crashed["run_id"] == stranded.reservation.run_id
-    )
+    crashed = next(r for r in recs if r["stop_reason"] == "owner_gone")
+    assert crashed["status"] == "outcome_unknown" and crashed["job"] == "daily"
+    assert crashed["run_id"] == stranded.reservation.run_id
     rows = {r["run_id"]: r for r in queue.ledger_for_env().receipts(last=5)}
     assert rows[crashed["run_id"]]["status"] == "interrupted" and rows[crashed["run_id"]]["record_written"]
     assert {r["status"] for r in rows.values()} == {"interrupted", "ok"}
@@ -1460,3 +1481,604 @@ def test_a_transient_stop_is_retried_through_drain_with_a_backoff(tmp_path):
     assert seen[0] == run_id
     assert len(ledger.receipts(last=10)) == 2  # the retry has a receipt of its own
     assert message_status(ledger, mid) == int(sqlqueue.Status.DONE)
+
+
+# ---- planted failure drills (ar-T3, pc-K22): a killed run is never silent, a normal one never alerts ------------------
+
+HOLDER = """
+import os, sys, time
+from datetime import UTC, datetime
+from ws import queue
+state, job, run_id = sys.argv[1:4]
+ledger = queue.Ledger(state, limits=queue.Limits(max_concurrent=50, busy_s=10.0), memory=lambda: None,
+                      rate_limits=lambda now: None)
+d = ledger.admit(queue.Request(job=job, run_id=run_id, cap_usd=100.0, usd=1.0, turns=5, seconds=600.0), datetime.now(UTC),
+                 lambda: queue.Spend(0.0, {}))
+print(d.kind, flush=True)
+time.sleep(120)
+"""
+
+
+def planted_kills(tmp_path, n: int) -> tuple[list[str], float]:
+    """`n` real processes each hold a reservation and are killed with SIGKILL: no handler runs, no record is written.
+    Returns their run ids and the wall-clock time of the last kill."""
+    import signal
+    import subprocess
+    import time
+
+    ids = [f"20261108T030000Z-{0xA00000 + i:06x}" for i in range(n)]
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-c", HOLDER, str(tmp_path / "state"), f"killed{i}", rid],
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        for i, rid in enumerate(ids)
+    ]
+    try:
+        assert [p.stdout.readline().strip() for p in procs] == ["admit"] * n
+    finally:
+        for p in procs:
+            p.send_signal(signal.SIGKILL)
+        for p in procs:
+            p.wait()
+            p.stdout.close()
+    assert all(p.returncode == -signal.SIGKILL for p in procs)
+    return ids, time.time()
+
+
+def alerting(tmp_path, **kw):
+    alerts: list[tuple[str, str, str, float]] = []
+    sink: list[dict] = []
+    import time
+
+    ledger = queue.Ledger(
+        tmp_path / "state", limits=queue.Limits(max_concurrent=50, busy_s=10.0), memory=lambda: None,
+        rate_limits=lambda now: None, costing=(2.0, None), sink=lambda rec: sink.append(rec) or True,
+        on_stop=lambda job, run_id, why: alerts.append((job, run_id, why, time.time())), **kw,
+    )  # fmt: skip
+    return ledger, alerts, sink
+
+
+@pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="no /proc: the owner check needs a process table")
+def test_planted_sigkill_outcome_unknown(tmp_path):
+    ids, _ = planted_kills(tmp_path, 1)
+    ledger, _, sink = alerting(tmp_path)
+    assert ledger.reap(datetime.now(UTC)) == 1
+    (rec,) = sink
+    assert (rec["run_id"], rec["status"], rec["stop_reason"]) == (ids[0], "outcome_unknown", "owner_gone")
+    assert rec["duration_ms"] > 0 and rec["exit_code"] is None  # ended minus started, not 0
+    assert runrecord.record_cost(rec, 2.0, None) == 2.0
+    row = ledger.receipt(ids[0])
+    assert (row["status"], row["stop_reason"], row["actual_usd"], row["settled"]) == (
+        "interrupted",
+        "owner_gone",
+        2.0,
+        True,
+    )
+
+
+def test_planted_sigkill_duration_is_capped_at_the_runs_timeout(tmp_path):
+    host = Host()
+    clock = Clock()
+    ledger, _, sink = alerting(tmp_path, probe=host.probe, clock=clock)
+    r = req(owner_pid=4300, seconds=60.0)
+    assert ledger.admit(r, T0, spend()).kind == "admit"
+    host.procs[4300] = (False, None)
+    assert ledger.reap(T0 + timedelta(minutes=30)) == 1  # found long after: it cannot have run past its timeout
+    assert sink[0]["duration_ms"] == 60_000 and sink[0]["ended_at"] == "2026-11-08T03:01:00.000Z"
+
+
+@pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="no /proc: the owner check needs a process table")
+def test_planted_sigkill_one_alert(tmp_path):
+    """ar-T3: 10 planted SIGKILL runs give 10 alerts within 5 minutes, one each, however many processes reap."""
+    import time
+
+    ids, killed_at = planted_kills(tmp_path, 10)
+    ledger, alerts, sink = alerting(tmp_path)
+    other, other_alerts, _ = alerting(tmp_path)  # a second process looking at the same store
+    assert ledger.reap(datetime.now(UTC)) == 10
+    assert other.reap(datetime.now(UTC)) == 0 and ledger.reap(datetime.now(UTC)) == 0
+    assert other.admit(req(cap_usd=100.0), datetime.now(UTC), spend()).kind == "admit"  # admission reaps too
+    assert sorted(a[1] for a in alerts) == sorted(ids) and other_alerts == []
+    assert all(a[2].startswith("outcome_unknown") for a in alerts)
+    assert max(a[3] for a in alerts) - killed_at < 300 and time.time() - killed_at < 300
+    assert len(sink) == 10 and {r["status"] for r in sink} == {"outcome_unknown"}
+
+
+def test_planted_normal_runs_no_alert(tmp_path):
+    """ar-T3: 0 false alerts over 50 normal runs, settled directly and through a drain, with reaps between them."""
+    ledger, alerts, sink = alerting(tmp_path, clock=Clock())
+    for i in range(25):
+        r = req(job=f"normal{i}", cap_usd=1000.0)
+        d = ledger.admit(r, T0, spend())
+        assert d.kind == "admit"
+        ledger.reap(T0)
+        ledger.settle(d.reservation, status="ok", usd=0.01, tokens=None, stop_reason="completed", now=T0)
+    for i in range(25):
+        ledger.enqueue(f"queued{i}", None, T0)
+    out = queue.drain(ledger, lambda item: queue.Outcome(0, "ok", "completed"))
+    assert len(out) == 25 and {d["action"] for d in out} == {"done"}
+    assert ledger.reap(T0) == 0
+    assert alerts == [] and sink == []
+
+
+def test_planted_new_status_reads_old_reader(tmp_path):
+    """A record with the new status and fields reads through the reader today's ws uses, the new fields ignored; and a
+    store reaped by today's ws (receipt `crashed`) is still recovered as an interruption."""
+    log = tmp_path / "logs" / "runs.jsonl"
+    rec = runrecord.unknown_outcome("20261108T030000Z-0000aa", "j", T0, T0 + timedelta(seconds=9), ws_version="0")
+    rec.update(approval={"switch": "act-and-tell", "quote": "go"}, run_key="j:m1", chain_depth=0)
+    runrecord.append(log, rec)
+    old_keys = runrecord.KEYS[: runrecord.KEYS.index("reservation") + 1]
+    (line,) = [json.loads(x) for x in log.read_text(encoding="utf-8").splitlines()]
+    old_view = {k: line[k] for k in old_keys}  # what a reader that knows only the earlier keys takes from it
+    assert old_view["status"] == "outcome_unknown" and old_view["duration_ms"] == 9000
+    assert old_view["run_id"] == rec["run_id"] and old_view["stop_reason"] == "owner_gone"
+    assert queue._recovered_outcome({"status": "interrupted", "stop_reason": "crashed"}).stop_reason == "interrupted"
+    assert queue._recovered_outcome({"status": "interrupted", "stop_reason": "owner_gone"}).stop_reason == "interrupted"
+
+
+def test_planted_sigkill_rollback_still_alerts_once(tmp_path):
+    """A reaper whose transaction rolls back after it wrote the record: the next reaper owes the notice, sends it once,
+    and writes no second record."""
+    host = Host()
+    log = tmp_path / "logs" / "runs.jsonl"
+    alerts: list[str] = []
+    ledger = make(
+        tmp_path, host=host, sink=lambda rec: queue._write_record(log, rec),
+        recorded=lambda rid: next((r for r in runrecord.read(log) if r["run_id"] == rid), None),
+        on_stop=lambda job, run_id, why: alerts.append(run_id),
+    )  # fmt: skip
+    r = req(owner_pid=4600)
+    assert ledger.admit(r, T0, spend()).kind == "admit"
+    host.procs[4600] = (False, None)
+    with pytest.raises(RuntimeError), queue._transaction(ledger.conn()) as c:
+        ledger._reap(c, T0)
+        raise RuntimeError("the store went away before the commit")
+    assert ledger.receipt(r.run_id)["status"] == "running" and len(runrecord.read(log)) == 1 and alerts == []
+    assert ledger.reap(T0) == 1 and ledger.reap(T0) == 0
+    assert alerts == [r.run_id] and len(runrecord.read(log)) == 1
+
+
+def test_planted_sigkill_already_alerted_by_the_scheduler_is_not_told_again(tmp_path):
+    host = Host()
+    alerts: list[str] = []
+    told = tmp_path / "state" / "logs" / "alerts.jsonl"
+    ledger = make(
+        tmp_path, host=host, sink=lambda rec: True, on_stop=lambda job, run_id, why: alerts.append(job),
+        already_told=lambda job, since: queue.unit_alerted(job, since, told),
+    )  # fmt: skip
+    nightly, other = req(job="nightly", owner_pid=4700), req(job="other", owner_pid=4701)
+    for x in (nightly, other):
+        assert ledger.admit(x, T0, spend()).kind == "admit"
+    told.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        {"schema": 1, "ts": "2026-11-07T00:00:00.000Z", "event": "unit-failed", "job": "other"},  # an older failure
+        {"schema": 1, "ts": "2026-11-08T03:00:05.000Z", "event": "unit-failed", "job": "nightly"},  # this kill
+    ]
+    told.write_text("".join(json.dumps(x) + "\n" for x in lines) + "not json\n", encoding="utf-8")
+    host.procs[4700] = host.procs[4701] = (False, None)
+    assert ledger.reap(T0 + timedelta(minutes=1)) == 2
+    assert alerts == ["other"]  # nightly's OnFailure= already said it; other's alert was for an earlier run
+    assert queue.unit_alerted("x", T0, tmp_path / "missing.jsonl") is False
+
+
+# ---- one net effect (rr-L3, h-L1-17/18, h-L4-5) ----------------------------------------------------------------------
+
+
+def test_planted_run_key_one_effect(tmp_path):
+    """The same (job, trigger) queued again, while it waits, while it runs and after it has finished, runs once."""
+    clock = Clock()
+    ledger = make(tmp_path, clock=clock)
+    first = ledger.enqueue("watch", None, T0, trigger="msg-41")
+    assert first[2] is False and ledger.enqueue("watch", None, T0, trigger="msg-41") == (first[0], first[1], True)
+    assert ledger.enqueue("other", None, T0, trigger="msg-41")[2] is False  # a key is per job
+    ran: list[str] = []
+
+    def runner(item):
+        ran.append(item.run_key)
+        assert ledger.enqueue("watch", None, T0, trigger="msg-41")[2] is True  # again while it runs
+        return queue.Outcome(0, "ok", "completed")
+
+    queue.drain(ledger, runner)
+    clock.advance(days=40)
+    assert ledger.enqueue("watch", None, clock.now, trigger="msg-41")[2] is True  # and long after it finished
+    assert queue.drain(ledger, runner) == []
+    assert sorted(ran) == ["other:msg-41", "watch:msg-41"]
+    rows = [r for r in ledger.receipts(last=10) if r["job"] == "watch"]
+    assert len(rows) == 1 and rows[0]["run_key"] == "watch:msg-41"
+    with pytest.raises(output.WsError):
+        ledger.enqueue("watch", None, T0, key="k", trigger="t")
+    with pytest.raises(output.WsError):
+        queue.run_key("watch", "two words")
+
+
+def test_a_reaped_run_carries_its_run_key(tmp_path):
+    host = Host()
+    sink: list[dict] = []
+    ledger = make(tmp_path, host=host, sink=lambda rec: sink.append(rec) or True)
+    run_id, _, _ = ledger.enqueue("watch", None, T0, trigger="evt-9")
+    ledger.conn().execute(
+        "UPDATE receipts SET status = 'running', started_at = ?, owner_pid = 4400, owner_start_time = 'X', "
+        "lease_expires_at = ? WHERE run_id = ?",
+        (queue.to_ns(T0), queue.to_ns(T0 + timedelta(hours=1)), run_id),
+    )
+    host.procs[4400] = (False, None)
+    assert ledger.reap(T0 + timedelta(seconds=5)) == 1
+    assert sink[0]["run_key"] == "watch:evt-9" and sink[0]["duration_ms"] == 5000
+
+
+def test_planted_stale_holder_no_overwrite(tmp_path):
+    """A drain that stalls past its lease comes back after the message was taken from it (reaped as outcome_unknown and
+    failed by recovery): it changes neither the receipts nor the message. Its late record is its run's true outcome,
+    counted once, with the reaper's line kept as the alert trail."""
+    host = Host()
+    log = tmp_path / "logs" / "runs.jsonl"
+    ledger = make(tmp_path, host=host, sink=lambda rec: queue._write_record(log, rec))
+    run_id, mid, _ = ledger.enqueue("j", None, T0, trigger="evt-1")
+    stalled = ledger.engine().pop()
+    ledger.conn().execute(
+        "UPDATE receipts SET status = 'running', started_at = ?, owner_pid = 4500, owner_start_time = 'S', "
+        "lease_expires_at = ? WHERE run_id = ?",
+        (queue.to_ns(T0), queue.to_ns(T0), run_id),
+    )
+    host.procs[4500] = (None, None)  # this host cannot tell; the lease has run out, so the run is reaped
+    later = T0 + timedelta(hours=25)
+    ledger.clock = lambda: later
+    assert queue.drain(ledger, lambda item: queue.Outcome(0, "ok", "completed")) == []  # not run again
+    assert message_status(ledger, mid) == int(sqlqueue.Status.FAILED)
+    # the stalled holder wakes and finishes the way a drain would
+    late = runrecord.new(
+        run_id=run_id, job="j", started_at=runrecord.iso(T0), ended_at=runrecord.iso(later), status="ok",
+        stop_reason="completed", cost_usd=0.25, ws_version="0",
+    )  # fmt: skip
+    runrecord.append(log, late)
+    before = ledger.receipts(last=10)
+    item = queue.Item(stalled, "j", None, None, run_id, ledger, stalled.idempotency_key)
+    act = queue.classify(queue.Outcome(0, "ok", "completed"), tries=0, preemptible=False, deadline=None, now=later)
+    with pytest.raises(sqlqueue.StaleClaim):
+        queue._finish(ledger, ledger.engine(), stalled, item, run_id, queue.Outcome(0, "ok"), act, later, None)
+    assert message_status(ledger, mid) == int(sqlqueue.Status.FAILED)
+    assert ledger.receipts(last=10) == before  # no receipt changed
+    assert {r["run_id"]: r["status"] for r in before}[run_id] == "interrupted"
+    mine = [r for r in runrecord.read(log) if r["run_id"] == run_id]
+    assert [r["status"] for r in mine] == ["ok"]  # the run's own late record is its true outcome, counted once
+    assert [r["status"] for r in jsonl_lines(log)] == ["outcome_unknown", "ok"]  # the alert trail stays in the file
+
+
+def jsonl_lines(path) -> list[dict]:
+    return [json.loads(x) for x in path.read_text(encoding="utf-8").splitlines() if x.strip()]
+
+
+def test_a_drain_whose_claim_was_taken_over_says_superseded_and_goes_on(tmp_path):
+    ledger = make(tmp_path)
+    ledger.enqueue("a", None, T0)
+    ledger.enqueue("b", None, T0)
+
+    def runner(item):
+        if item.job == "a":  # while it runs, its claim is taken over (its lease ran out elsewhere)
+            ledger.engine().retry(item.message.message_id, item.message.claim_id)
+            ledger.engine().pop()
+        return queue.Outcome(0, "ok", "completed")
+
+    out = queue.drain(ledger, runner, limit=2)
+    assert [(d["job"], d["action"]) for d in out] == [("a", "superseded"), ("b", "done")]
+
+
+def test_planted_bad_item_to_failed(tmp_path):
+    """One unreadable item and one whose run raises are failed with a reason; the good ones either side still run."""
+    told: list[tuple[str, str, str]] = []
+    ledger = make(tmp_path, on_stop=lambda job, run_id, why: told.append((job, run_id, why)))
+    ledger.enqueue("good1", None, T0)
+    bad = ledger.engine().put("not json at all")
+    ledger.enqueue("raises", None, T0)
+    ledger.enqueue("good2", None, T0)
+    ran: list[str] = []
+
+    def runner(item):
+        if item.job == "raises":
+            raise RuntimeError("boom")
+        ran.append(item.job)
+        return queue.Outcome(0, "ok", "completed")
+
+    out = queue.drain(ledger, runner)
+    assert ran == ["good1", "good2"]
+    assert [(d["job"], d["action"]) for d in out] == [
+        ("good1", "done"), ("unreadable", "fail"), ("raises", "fail"), ("good2", "done"),
+    ]  # fmt: skip
+    assert message_status(ledger, bad.message_id) == int(sqlqueue.Status.FAILED)
+    rows = {r["job"]: r for r in ledger.receipts(last=10)}
+    assert (rows["unreadable"]["status"], rows["unreadable"]["stop_reason"]) == ("error", "bad_item")
+    assert rows["unreadable"]["note"] == "the queued data is not a job"
+    assert rows["raises"]["note"] == "the run raised RuntimeError" and rows["raises"]["settled"]
+    assert [t[0] for t in told] == ["unreadable", "raises"] and all(t[2].startswith("bad_item") for t in told)
+    assert queue.drain(ledger, runner) == []  # nothing comes back
+
+
+def test_a_schema_2_store_gains_the_run_key_column(tmp_path):
+    ledger = make(tmp_path)
+    ledger.enqueue("j", None, T0)
+    c = ledger.conn()
+    c.execute("ALTER TABLE receipts DROP COLUMN run_key")
+    c.execute("PRAGMA user_version = 2")
+    ledger.close()
+    again = make(tmp_path)
+    assert again.enqueue("j", None, T0, trigger="t1")[2] is False
+    assert {r["run_key"] for r in again.receipts(last=5)} == {None, "j:t1"}
+
+
+@pytest.mark.parametrize("trigger", [None, "evt-7"])
+def test_a_killed_run_is_never_run_again_by_recovery(tmp_path, trigger):
+    """It may have acted, and a rerun cannot yet skip what it did, so it is failed with or without a run key."""
+    host, clock = Host(), Clock()
+    ledger = make(tmp_path, host=host, clock=clock, sink=lambda rec: True)
+    run_id, mid, _ = ledger.enqueue("j", None, T0, trigger=trigger)
+    ledger.engine().pop()
+    ledger.conn().execute(
+        "UPDATE receipts SET status = 'running', started_at = ?, owner_pid = 4800, owner_start_time = 'K', "
+        "lease_expires_at = ? WHERE run_id = ?",
+        (queue.to_ns(T0), queue.to_ns(T0 + timedelta(hours=1)), run_id),
+    )
+    host.procs[4800] = (False, None)
+    clock.advance(seconds=queue.ORPHAN_S + 1)
+    ledger.recover(clock.now)
+    assert message_status(ledger, mid) == int(sqlqueue.Status.FAILED)
+    assert ledger.receipt(run_id)["stop_reason"] == "owner_gone"
+
+
+def test_a_run_that_raised_after_admission_is_recorded_and_charged(tmp_path):
+    log = tmp_path / "logs" / "runs.jsonl"
+    told: list[str] = []
+    ledger = make(
+        tmp_path, costing=(2.0, None), sink=lambda rec: queue._write_record(log, rec),
+        recorded=lambda rid: next((r for r in runrecord.read(log) if r["run_id"] == rid), None),
+        on_stop=lambda job, run_id, why: told.append(why),
+    )  # fmt: skip
+    ledger.enqueue("spender", None, T0)
+
+    def runner(item):
+        d = ledger.admit(req(job=item.job, run_id=item.run_id, cap_usd=100.0), T0, spend())
+        assert d.kind == "admit"
+        raise RuntimeError("after it had started")
+
+    (out,) = queue.drain(ledger, runner)
+    assert out["action"] == "fail"
+    (rec,) = runrecord.read(log)
+    assert (rec["status"], rec["error"]) == ("outcome_unknown", "the run raised RuntimeError")
+    row = ledger.receipt(out["run_id"])
+    assert (row["actual_usd"], row["settled"], row["note"]) == (2.0, True, "the run raised RuntimeError")
+    assert told == ["bad_item: the run raised RuntimeError"]  # one notice, not two
+
+
+def test_a_store_error_in_a_run_stops_the_drain_and_is_not_one_items_failure(tmp_path):
+    ledger = make(tmp_path)
+    run_id, mid, _ = ledger.enqueue("j", None, T0)
+
+    def runner(item):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    with pytest.raises(sqlite3.OperationalError):
+        queue.drain(ledger, runner)
+    assert message_status(ledger, mid) == int(sqlqueue.Status.LOCKED)  # left for recovery, not failed
+    assert ledger.receipt(run_id)["status"] == "queued"
+
+
+def test_a_finished_receipt_keeps_its_note(tmp_path):
+    ledger = make(tmp_path)
+    ledger.enqueue("j", None, T0)
+    msg = ledger.engine().pop()
+    with queue._transaction(ledger.conn()) as c:
+        rid = ledger.queued_row(c, msg.message_id)
+        c.execute(
+            "UPDATE receipts SET status = 'ok', finished_at = 1, settled = 1, note = 'its own' WHERE run_id = ?", (rid,)
+        )
+    queue._fail_bad(ledger, msg, "j", "late", T0, rid)
+    assert ledger.receipt(rid)["note"] == "its own"
+
+
+def test_a_run_that_settled_ok_before_something_raised_is_done(tmp_path):
+    told: list[str] = []
+    ledger = make(tmp_path, on_stop=lambda job, run_id, why: told.append(why))
+    run_id, mid, _ = ledger.enqueue("j", None, T0)
+
+    def runner(item):
+        d = ledger.admit(req(job=item.job, run_id=item.run_id, cap_usd=100.0), T0, spend())
+        ledger.settle(d.reservation, status="ok", usd=0.1, tokens=None, stop_reason="completed", now=T0)
+        raise RuntimeError("after the run had settled")
+
+    assert [d["action"] for d in queue.drain(ledger, runner)] == ["done"]
+    assert message_status(ledger, mid) == int(sqlqueue.Status.DONE) and told == []
+    assert ledger.receipt(run_id)["status"] == "ok"
+
+
+def test_a_store_error_before_admission_comes_back_and_runs(tmp_path):
+    clock = Clock()
+    ledger = make(tmp_path, clock=clock)
+    run_id, _, _ = ledger.enqueue("j", None, T0)
+    with pytest.raises(sqlite3.OperationalError):
+        queue.drain(ledger, lambda item: (_ for _ in ()).throw(sqlite3.OperationalError("disk I/O error")))
+    clock.advance(seconds=queue.ORPHAN_S + 1)
+    assert ledger.recover(clock.now) == 1
+    out = queue.drain(ledger, lambda item: queue.Outcome(0, "ok", "completed"))
+    assert [d["action"] for d in out] == ["done"] and out[0]["run_id"] == run_id
+
+
+def test_a_disk_error_after_admission_is_failed_as_killed_once(tmp_path):
+    """The drain exits on the error; recovery reaps the run: one fallback charge, one outcome_unknown, one notice."""
+    host, clock = Host(), Clock()
+    log = tmp_path / "logs" / "runs.jsonl"
+    told: list[str] = []
+    ledger = make(
+        tmp_path, host=host, clock=clock, costing=(2.0, None), sink=lambda rec: queue._write_record(log, rec),
+        recorded=lambda rid: next((r for r in runrecord.read(log) if r["run_id"] == rid), None),
+        on_stop=lambda job, rid, why: told.append(why),
+    )  # fmt: skip
+    run_id, mid, _ = ledger.enqueue("j", None, T0)
+
+    def runner(item):
+        assert ledger.admit(req(job=item.job, run_id=item.run_id), T0, spend()).kind == "admit"
+        raise OSError("disk full")
+
+    with pytest.raises(OSError):
+        queue.drain(ledger, runner)
+    row = ledger.receipt(run_id)
+    assert row["status"] == "running"
+    host.procs[row["owner_pid"]] = (False, None)  # the drain process has exited
+    clock.advance(seconds=queue.ORPHAN_S + 1)
+    assert ledger.recover(clock.now) == 0
+    assert message_status(ledger, mid) == int(sqlqueue.Status.FAILED)
+    row = ledger.receipt(run_id)
+    assert row["settled"] and row["actual_usd"] == 2.0 and row["stop_reason"] == "owner_gone"
+    assert [r["status"] for r in runrecord.read(log)] == ["outcome_unknown"]
+    assert len(told) == 1
+    assert queue.drain(ledger, lambda item: queue.Outcome(0, "ok", "completed")) == []
+
+
+# ---- chains and ticks (h-L4-19/20, ls-4) -----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("mode", ["chain:go", "chain:reset"])
+def test_planted_chain_cap(box, capsys, mode):
+    """Through the queue's drain and a real runner process whose child queues the next link through the ledger: each
+    link is one deeper, the one past the cap is refused (exit 3), and a runner that sets its own depth back to 0 does
+    not reset the chain, because the ledger takes the depth from the parent's receipt."""
+    write_job(box, name="chainer", prompt=mode)
+    (box / "profile.toml").write_text(
+        dumps({"roles": {"budget": {"monthly_cap_usd": 20}, "queue": {"chain_cap": 2}}}), encoding="utf-8"
+    )
+    code, _ = call(capsys, "queue", "add", "chainer")
+    assert code == 0
+    for _ in range(5):
+        cli.main(["queue", "run", "--json"])
+        capsys.readouterr()
+    saw = [json.loads(x) for x in (box / "chain-saw.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert [s["depth"] for s in saw] == ["0", "1", "2"]
+    assert [s["rc"] for s in saw] == [0, 0, queue.EXIT_REFUSED]
+    ledger = queue.ledger_for_env()
+    rows = sorted(ledger.receipts(last=10), key=lambda r: r["queued_at"])
+    assert [r["chain_depth"] for r in rows] == [0, 1, 2]
+    assert all(s["parent"] == r["run_id"] for s, r in zip(saw, rows, strict=True))
+    recs = [r for r in runrecord.read(runrecord.runs_path()) if r["job"] == "chainer"]
+    assert sorted(r["chain_depth"] for r in recs) == [0, 1, 2]  # the normal run record carries it too
+
+
+def test_a_chain_takes_its_depth_from_the_parent_not_the_caller(tmp_path):
+    told: list[str] = []
+    ledger = make(tmp_path, limits=queue.Limits(busy_s=0.2, chain_cap=2), on_stop=lambda j, r, why: told.append(why))
+    parent, _, _ = ledger.enqueue("loop", None, T0, trigger="a", chain_depth=2)
+    with pytest.raises(output.WsError) as e:
+        ledger.enqueue("loop", None, T0, trigger="b", chain_depth=0, chain_parent=parent)  # claims 0; it is 3
+    assert e.value.kind == "chain_cap" and e.value.exit_code == queue.EXIT_REFUSED
+    assert len(told) == 1 and told[0].startswith("chain_cap: 3 jobs deep")
+    assert ledger.parent_depth("20261108T030000Z-ffffff") == 0  # a parent the ledger does not know
+    assert queue.chain_depth_from_env({}) == 0 and queue.chain_depth_from_env({queue.CHAIN_ENV: "x"}) == 0
+    assert queue.chain_parent_from_env({queue.CHAIN_PARENT_ENV: "../x"}) is None
+    assert ledger.enqueue("loop", None, T0, trigger="by-hand")[2] is False  # a human action resets the chain
+
+
+def test_a_watcher_ignores_events_caused_by_ws(tmp_path):
+    ledger = make(tmp_path)
+    assert ledger.on_event("watch", None, "commit-1", T0, by_ws=True) is None
+    first = ledger.on_event("watch", None, "commit-2", T0, by_ws=False)
+    assert first is not None and first[2] is False
+    assert ledger.on_event("watch", None, "commit-2", T0, by_ws=False)[2] is True  # once per event
+    assert [r["run_key"] for r in ledger.receipts(last=5)] == ["watch:commit-2"]
+
+
+def test_planted_double_tick_runs_once(tmp_path):
+    """Two ticks for the same slot, from two processes at the same moment, queue one run; it runs once."""
+    slot = T0
+    results: list[tuple[str, str | None]] = []
+    barrier = threading.Barrier(2)
+
+    def tick():
+        ledger = make(tmp_path, limits=queue.Limits(busy_s=5.0))
+        barrier.wait()
+        results.append(ledger.tick("nightly", None, slot, T0))
+        ledger.close()
+
+    threads = [threading.Thread(target=tick) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sorted(r[0] for r in results) == ["already", "queued"]
+    ledger = make(tmp_path)
+    ran: list[str] = []
+    queue.drain(ledger, lambda item: ran.append(item.run_key) or queue.Outcome(0, "ok", "completed"))
+    assert ran == ["nightly:tick-20261108T030000Z"]
+    assert ledger.tick("nightly", None, slot - timedelta(days=1), T0) == ("already", None)  # an older slot too
+
+
+def test_a_tick_coalesces_while_a_run_is_active_and_skips_a_missed_slot(tmp_path):
+    ledger = make(tmp_path)
+    assert ledger.tick("j", None, T0, T0)[0] == "queued"
+    assert ledger.tick("j", None, T0 + timedelta(hours=1), T0 + timedelta(hours=1)) == ("coalesced", None)
+    assert (
+        ledger.tick("j", None, T0 + timedelta(hours=2), T0 + timedelta(hours=2), coalesce_if_active=False)[0]
+        == "queued"
+    )
+    late = T0 + timedelta(hours=3)
+    assert ledger.tick("k", None, late, late + timedelta(minutes=30), skip_missed_s=600) == ("missed", None)
+    assert ledger.tick("k", None, late, late) == ("already", None)  # the missed slot was still advanced past
+    assert (
+        ledger.tick("k", None, late + timedelta(hours=1), late + timedelta(hours=1), skip_missed_s=600)[0] == "queued"
+    )
+
+
+def test_ws_queue_tick_command(box, capsys):
+    write_job(box)
+    code, out = call(capsys, "queue", "tick", "daily", "--slot", "2026-11-10T03:00:00Z")
+    assert code == 0 and out["data"]["result"] == "queued"
+    code, out = call(capsys, "queue", "tick", "daily", "--slot", "2026-11-10T03:00:00Z")
+    assert code == 0 and out["data"]["result"] == "already"
+
+
+def test_planted_tick_after_a_kill_runs_the_slot(tmp_path):
+    """A run of the job killed while it ran leaves a stale `running` receipt; the next tick reaps it first, so its
+    slot is queued, not coalesced away, and the kill is told once."""
+    host = Host()
+    told: list[str] = []
+    ledger = make(tmp_path, host=host, sink=lambda rec: True, on_stop=lambda job, run_id, why: told.append(why))
+    what, run_id = ledger.tick("nightly", None, T0, T0)
+    assert what == "queued"
+    ledger.conn().execute(
+        "UPDATE receipts SET status = 'running', started_at = ?, owner_pid = 4900, owner_start_time = 'N', "
+        "lease_expires_at = ? WHERE run_id = ?",
+        (queue.to_ns(T0), queue.to_ns(T0 + timedelta(hours=1)), run_id),
+    )
+    host.procs[4900] = (False, None)  # SIGKILL: the process is gone
+    nxt = T0 + timedelta(days=1)
+    assert ledger.tick("nightly", None, nxt, nxt)[0] == "queued"
+    assert ledger.receipt(run_id)["stop_reason"] == "owner_gone"
+    assert len(told) == 1 and told[0].startswith("outcome_unknown")
+
+
+def test_opening_a_second_ledger_never_closes_a_descriptor_of_the_open_database(tmp_path, monkeypatch):
+    """Closing any descriptor of a file drops every POSIX lock the process holds on it, a live connection's too
+    (C507: a child that wrote the queue then took itself for the last connection and removed the WAL index)."""
+    first = make(tmp_path)
+    first.enqueue("j", None, T0)  # the database exists and this process holds a connection to it
+    db = os.path.realpath(first.path)
+    opened: dict[int, str] = {}
+    closed_db: list[int] = []
+    real_open, real_close = os.open, os.close
+
+    def spy_open(path, flags, *a, **kw):
+        fd = real_open(path, flags, *a, **kw)
+        opened[fd] = os.path.realpath(path)
+        return fd
+
+    def spy_close(fd):
+        if opened.pop(fd, None) == db:
+            closed_db.append(fd)
+        return real_close(fd)
+
+    monkeypatch.setattr(queue.os, "open", spy_open)
+    monkeypatch.setattr(queue.os, "close", spy_close)
+    second = make(tmp_path)
+    second.conn()
+    assert closed_db == []
+    monkeypatch.undo()
+    assert first.receipts(last=5) and second.receipts(last=5)

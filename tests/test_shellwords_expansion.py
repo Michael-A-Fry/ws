@@ -109,17 +109,17 @@ def test_a_cut_of_a_value_is_what_bash_cuts(box, op, pat):
 
 def test_a_cut_with_many_stars_does_not_back_up(box):
     value = "a" * 3000
-    began = time.perf_counter()
+    began = time.thread_time()
     got = sw.lex("${X#*a*a*a*a*a*b}", {"X": value}).words
-    assert got == [value] and time.perf_counter() - began < 1
+    assert got == [value] and time.thread_time() - began < 1
 
 
 def test_repeated_cuts_of_a_long_value_are_read_in_well_under_a_second(box, monkeypatch, capsys):
     cmd = "X=" + "ab" * 2000 + "; echo " + "${X##*b} " * 2000
     assert 20_000 < len(cmd) < policy.MAX_COMMAND_CHARS
-    began = time.perf_counter()
+    began = time.thread_time()
     assert policy.is_denied_command(policy.default_policy(), cmd) is None
-    assert time.perf_counter() - began < 1
+    assert time.thread_time() - began < 1
     assert hook(monkeypatch, capsys, cmd)[0] == 0
 
 

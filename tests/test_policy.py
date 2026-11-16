@@ -1377,16 +1377,16 @@ def test_the_same_forms_elsewhere_are_fine(cmd):
         "ws gate init",
         "ws gate generate --runner opencode --out /x",
         "ws gate --policy /x generate --runner opencode --out /y",
-        "ws secret ask NAME",
-        "ws secret wait NAME",
+        "ws secret set NAME",
+        "ws secret rm NAME",
         "ws broker start",
         "uv run ws gate init",
-        "uv run --locked ws secret ask X",
+        "uv run --locked ws secret set X",
         "python3 -m ws gate generate --runner opencode --out /x",
         "/usr/local/bin/ws broker stop",
         "sudo ws gate init",
         "echo hi && ws gate init",
-        "bash -c 'ws secret ask X'",
+        "bash -c 'ws secret set X'",
     ],
 )
 def test_a_gated_session_cannot_run_ws_admin_commands(cmd):
@@ -1860,9 +1860,9 @@ def test_a_glob_that_cannot_reach_a_denied_folder_is_allowed(dotws, cmd):
 
 def test_a_command_over_the_size_limit_is_denied_quickly_with_a_way_out(pol):
     big = "echo " + "word " * (1024 * 1024 // 5)  # about 1 MB
-    start = time.monotonic()
+    start = time.thread_time()
     reason = policy.is_denied_command(pol, big)
-    assert time.monotonic() - start < 1
+    assert time.thread_time() - start < 1
     assert reason and "too long to check" in reason and "Write tool" in reason
 
 

@@ -36,7 +36,7 @@ uv sync
 
 ```sh
 uv run --locked pytest -q            # the whole suite (tests/e2e skips without runners)
-uvx prek run --all-files             # gitleaks, ruff, typos, rumdl, actionlint, shellcheck, PII gate, globals, code map
+uvx prek run --all-files             # gitleaks, ruff, typos, rumdl, actionlint, shellcheck, Vale, PII, globals, code map
 uv run --locked ws doctor --offline  # the installed tool checking itself; exit 1 for unconfigured roles is expected
 python3 scripts/gen_code_map.py      # regenerate docs/reference/code-map.md after a module docstring changes
 python3 scripts/check_docs_integrity.py  # policy files exist, links and anchors resolve, no banned strings
@@ -47,16 +47,25 @@ The suite runs in a random order, and each test has a time limit by size. The se
 that needs a rerun, is a bug to fix, not to retry. [Testing](docs/reference/testing.md) has the markers, limits, flake
 and quarantine rules, and the tier time report.
 
-The hooks that `prek` runs are listed in `.pre-commit-config.yaml`. CI also runs Vale (the Microsoft package) over the
-README, the docs and the policy files, for errors only; [`.vale.ini`](.vale.ini) sets it up.
+The hooks that `prek` runs are listed in `.pre-commit-config.yaml`. Vale (the Microsoft package, errors only) is one of
+them, over the files CI lints: the README, the docs and the policy files, so a prose error fails at commit, not in CI.
+[`.vale.ini`](.vale.ini) sets it up, and the hook runs `vale sync` the first time, when the style package is missing.
+
+## Releasing
+
+Run the whole suite before you tag: `WS_PREPUSH_FULL=1 git push` runs it through the hook, or call
+`uv run --locked pytest -q` yourself. The pre-push hook alone runs only the tests a change can affect. The release
+workflow then runs the whole suite again (its `tests` job) before it builds or publishes anything, and a red suite stops
+the release.
 
 ## Pre-push hook
 
 The repo ships `.github/hooks/pre-push`. It runs `prek`, then the tests your change can affect, before a push leaves
 your machine. A change that maps to more than 40 test files, or touches `pyproject.toml`, `uv.lock`, a `conftest.py`,
 `tests/plugins/` or `.github/`, runs a short set instead (the smoke set, your changed tests and the tests importing a
-changed module), stopped after 300 seconds (`WS_PREPUSH_CAP`). CI runs the whole suite on every pull request and is
-required to merge; `WS_PREPUSH_FULL=1` runs it here too (logged). Turn the hook on once:
+changed module), stopped after 6 seconds a file, at least 300 and at most 1800 (`WS_PREPUSH_CAP` sets it). CI runs the
+whole suite on every pull request and is required to merge; `WS_PREPUSH_FULL=1` runs it here too (logged). Turn the
+hook on once:
 
 ```sh
 git config core.hooksPath .github/hooks
@@ -68,7 +77,9 @@ checks, so skipping only moves the failure.
 
 On a machine where several test runs share the cores, a suite raced by others can miss a timing test's deadline. Set
 `WS_PREPUSH_WRAP` to a command that queues the run, and the hook starts the suite through it (split on spaces; `prek`
-runs unwrapped). For example `WS_PREPUSH_WRAP="flock /tmp/tests.lock" git push`. Unset or empty, nothing changes.
+runs unwrapped). For example `WS_PREPUSH_WRAP="flock /tmp/tests.lock" git push`. Unset, the hook uses
+`ws-test --light --node local --` when `ws-test` is on your PATH, and runs the tests bare when it isn't. Set but empty
+(`WS_PREPUSH_WRAP= git push`), they always run bare.
 
 ## Rules for a change
 

@@ -227,6 +227,39 @@ def test_substitutions_nested_too_deeply_are_refused_with_a_reason(pol):
     assert reason and ("too deeply" in reason or "takes too long" in reason)
 
 
+class _Clock:
+    """The wall clock moved by hand; the CPU clock is the real one (a loaded machine: time passes, no work is done)."""
+
+    def __init__(self):
+        self.wall = 1000.0
+
+    def monotonic(self):
+        return self.wall
+
+    thread_time = staticmethod(__import__("time").thread_time)
+
+
+def test_the_read_limit_is_cpu_time_so_a_loaded_machine_is_not_refused(monkeypatch):
+    """The WSL2 red of 16 Nov: `touch f{1..4000}` (about a third of the limit of work) was refused as too slow on a busy
+    runner. Time spent waiting for a core isn't the line's work; only the wall-clock backstop counts it."""
+    clock = _Clock()
+    monkeypatch.setattr(sw, "time", clock)
+    with sw.time_limit(1.0):
+        clock.wall += 1.5  # past the limit on the wall clock, with almost no CPU used
+        sw.tick()  # not refused
+        clock.wall += sw.WALL_FACTOR * 1.0  # past the backstop: a read that waits is still stopped
+        with pytest.raises(sw.ShellError) as err:
+            sw.tick()
+    assert err.value.kind == "too_slow"
+
+
+def test_the_cpu_limit_refuses_a_read_that_works_too_long():
+    with pytest.raises(sw.ShellError) as err, sw.time_limit(0.05):
+        while True:
+            sw.tick()
+    assert err.value.kind == "too_slow"
+
+
 def test_a_deeply_nested_group_is_refused_not_a_crash(pol):
     reason = policy.is_denied_command(pol, "echo " + "{a," * 100 + "b" + "}" * 100)
     assert reason and "nest" in reason

@@ -1,4 +1,5 @@
 # One Python regex per line; a matching line is skipped by scripts/pii_gate.py. Keep each one narrow.
 ^    for n in \("10\.0\.0\.0/8", "172\.16\.0\.0/12", "192\.168\.0\.0/16", "100\.64\.0\.0/10", "169\.254\.0\.0/16"\)$
 ^Signed-off-by: dependabot\[bot\] <support@github\.com>$
+^\ \ \ \ for\ bad\ in\ \("http://bao\.example\.org:8200",\ "ftp://x",\ "https://u:p@bao\.example\.org",\ "https://"\):$
 ^TAILNET = \(ipaddress\.ip_network\("100\.64\.0\.0/10"\), ipaddress\.ip_network\("fd7a:115c:a1e0::/48"\)\)$

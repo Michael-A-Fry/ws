@@ -110,6 +110,7 @@ A call the policy lets through only with a human's say-so is `ask_commands`: see
 from __future__ import annotations
 
 import contextlib
+import fnmatch
 import itertools
 import math
 import os
@@ -147,6 +148,7 @@ MCP_SHIPPED = (
     "mcp__ws__msg_ack",
     "mcp__ws__msg_list",
 )
+_PERSON_NAME = re.compile(r"^person:[A-Za-z0-9._-]{1,64}$")
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")  # a usable class, guard or role name: letters, digits, `_` and `-`
 _HOST = re.compile(r"^(\*\.)?[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?$")
 _CATCH_ALL = ("0.0.0.0", "0", "::", "*")  # an entry that names every address, however it is spelled
@@ -359,6 +361,14 @@ class Autonomy:
 
 
 @dataclass(frozen=True)
+class Msg:
+    """`[msg]`: `person_send` lets the person who owns this account send a `ws msg` from outside any session (ADR 0023,
+    "A person sends"). Off by default; off is the whole rollback."""
+
+    person_send: bool = False
+
+
+@dataclass(frozen=True)
 class Policy:
     schema: int
     dial: str
@@ -371,6 +381,7 @@ class Policy:
     budget_purposes: dict[str, float] = field(default_factory=dict)  # purpose -> monthly USD cap (UTC calendar month)
     autonomy: Autonomy = Autonomy()
     egress_exceptions: tuple[EgressException, ...] = ()
+    msg: Msg = Msg()
 
 
 @dataclass(frozen=True)
@@ -456,7 +467,20 @@ outward = []
 [gate]
 deny_commands = {arr(default_deny_commands())}
 # Paths no session may read. `~/` is your home; `**` crosses folders.
-deny_read = ["~/.ssh/**", "~/.gnupg/**", "~/.aws/credentials", "~/.config/ws/secrets/**", "~/.local/share/ws/secrets/**"]
+deny_read = [
+  "~/.ssh/**", "~/.gnupg/**", "~/.aws/credentials", "~/.config/ws/secrets/**", "~/.local/share/ws/secrets/**",
+  # a project's local secrets (a bare name matches at any depth; `.env.example` stays readable)
+  ".env", ".env.local", ".env.*.local", ".env.development", ".env.production", ".env.staging", ".env.test", ".envrc",
+  # signed-in browser profiles: cookies and saved logins (Linux, snap, Flatpak, macOS)
+  "~/.config/google-chrome/**", "~/.config/google-chrome-beta/**", "~/.config/chromium/**", "~/.config/vivaldi/**",
+  "~/.config/BraveSoftware/**", "~/.config/microsoft-edge/**", "~/.mozilla/**", "~/snap/firefox/common/.mozilla/**",
+  "~/snap/chromium/**", "~/.var/app/*/config/**", "~/Library/Application Support/Google/Chrome/**",
+  "~/Library/Application Support/Google/Chrome Beta/**", "~/Library/Application Support/Firefox/**",
+  "~/Library/Application Support/BraveSoftware/**", "~/Library/Application Support/Microsoft Edge/**",
+  "~/Library/Application Support/Vivaldi/**",
+  # the GitHub CLI's stored token (a session uses the broker's short-lived one)
+  "~/.config/gh/hosts.yml",
+]
 # Neutral tool names to switch off: {", ".join(KNOWN_TOOLS)}. An allowed web tool counts as a way out (leg C). An MCP
 # tool is named as `mcp__SERVER__TOOL`, and a glob works (`mcp__SERVER__*`, `mcp__*__delete_*`).
 deny_tools = []
@@ -533,6 +557,7 @@ mode = "log"
 # mode = "log"
 # release_dir = "~/releases"   # a folder whose `current` link names the promoted release; left out, claims are off
 # release_tags = ["v[0-9]+[.][0-9]+([.][0-9]+)*"]   # regexes for a release's name; the default reads v1.2 and v1.2.3
+# repos = ["~/code/other-repo"]   # other repositories whose default branch (on a URL remote) can vouch for a commit
 # [guards.test-weakening]
 # mode = "log"
 # [guards.skill-gate]
@@ -666,6 +691,7 @@ def loads(text: str) -> Policy:
             "budget",
             "autonomy",
             "egress_exceptions",
+            "msg",
         },
     )
     schema = raw.get("schema", SCHEMA)
@@ -777,6 +803,10 @@ def loads(text: str) -> Policy:
         expires = _expires(e["expires"], where) if "expires" in e else None
         exceptions.append(RuleException(e["name"], e["job"], covered, e["reason"], owner, expires))
     classes = _classes(raw.get("classes", {}))
+    msg_table = _msg(raw.get("msg", {}))
+    for c in classes.values():
+        if not msg_table.person_send and any(n.startswith("person:") for n in c.inbound_allow):
+            raise PolicyError(f"[classes.{c.name}] inbound_allow names a person: set [msg] person_send = true first")
     return Policy(
         schema,
         dial,
@@ -789,6 +819,7 @@ def loads(text: str) -> Policy:
         _purposes(raw.get("budget", {})),
         _autonomy(raw.get("autonomy", {})),
         _egress_exceptions(raw.get("egress_exceptions", []), classes),
+        msg_table,
     )
 
 
@@ -848,6 +879,17 @@ def _plain_names(d: dict, key: str, where: str) -> tuple[str, ...]:
     return items
 
 
+def _allow_names(body: dict, where: str) -> tuple[str, ...]:
+    """`inbound_allow`: plain names, or `person:<account user>` (the sender `ws msg` records for a person's own send)."""
+    items = _strings(body, "inbound_allow", where)
+    for item in items:
+        if not (NAME_PATTERN.fullmatch(item) or _PERSON_NAME.fullmatch(item)):
+            raise PolicyError(
+                f"{where}inbound_allow: {item!r} is not a plain name (letters, digits, _ and -) or person:<user>"
+            )
+    return items
+
+
 def _classes(raw) -> dict[str, Class]:
     """`[classes.NAME]`: each table is checked whole; the readable_by names are checked once all the names are known."""
     if not isinstance(raw, dict):
@@ -897,7 +939,7 @@ def _classes(raw) -> dict[str, Class]:
         inbound = _get(body, "inbound", str, where, "lead-only" if access == "full" else "off")
         if inbound not in INBOUND:
             raise PolicyError(f"{where}inbound must be one of {', '.join(INBOUND)}, not {inbound!r}")
-        allow = _plain_names(body, "inbound_allow", where)
+        allow = _allow_names(body, where)
         if inbound == "allowlist" and not allow:
             raise PolicyError(f"{where}inbound_allow is required (at least one name) when inbound is allowlist")
         if inbound != "allowlist" and allow:
@@ -1018,6 +1060,12 @@ def _autonomy(raw) -> Autonomy:
     if when not in AUTONOMY_INTERRUPTS:
         raise PolicyError(f"[autonomy] interrupts must be one of {', '.join(AUTONOMY_INTERRUPTS)}, not {when!r}")
     return Autonomy(level, when, tuple(dict.fromkeys(_plain_names(t, "always_ask", "[autonomy] "))))
+
+
+def _msg(raw) -> Msg:
+    """`[msg]`: `person_send` (true or false)."""
+    t = _table(raw, "[msg]", {"person_send"})
+    return Msg(_get(t, "person_send", bool, "[msg] ", False))
 
 
 GUARD_MODES = ("enforce", "log")
@@ -1543,12 +1591,17 @@ def _git_normal(toks: list[str]) -> list[str]:
     `--force`."""
     toks = git_split(toks)[1]
     forcing = len(toks) > 1 and toks[1] == "push" and "--force" not in toks
-    if forcing and any(
-        re.fullmatch(r"-[A-Za-z]*f[A-Za-z]*", t)
-        or t.startswith(("+", ":"))
-        or ":+" in t
-        or t in ("--mirror", "--delete", "-d", "--prune")
-        for t in toks[2:]
+    if (
+        forcing
+        and any(
+            re.fullmatch(r"-[A-Za-z]*f[A-Za-z]*", t)
+            or t.startswith(("+", ":"))
+            or ":+" in t
+            or re.fullmatch(r"-[A-Za-z0-9]*d[A-Za-z0-9]*", t)  # -d, -qd, -dq: delete
+            or t in ("--mirror", "--delete", "--prune")
+            for i, t in enumerate(toks[2:], 2)
+            if toks[i - 1] not in ("-o", "--push-option")  # an option's value (`-o -d`) is not a flag
+        )
     ):
         toks.append("--force")
     return toks
@@ -1561,7 +1614,10 @@ def _destroying_push_note(line: str) -> str:
     if toks[:2] != ["git", "push"] or toks.count("--force") != 1 or toks[-1] != "--force":
         return ""
     words = toks[2:-1]
-    if any(t in ("--delete", "-d") or (t.startswith(":") and len(t) > 1) for t in words):
+    if any(
+        t == "--delete" or re.fullmatch(r"-[A-Za-z0-9]*d[A-Za-z0-9]*", t) or (t.startswith(":") and len(t) > 1)
+        for t in words
+    ):
         return (
             ": deleting a remote branch or tag counts as a destroying push, as `--force` does; delete it from a terminal "
             "of your own"
@@ -1937,6 +1993,8 @@ def _ws_admin(canon: list[str], xargs: bool = False, read_anywhere: bool = False
             return "ws under xargs is not for a gated session: the pipe decides its words, so they can't be read"
         if sub[:1] == ["gate"] and gate_words & set(rest):
             return "ws gate generate/init is not for a gated session: it would rewrite its own gate"
+        if tuple(sub[:2]) in agentsession.SESSION_OK:
+            continue
         if sub[:1] == ["secret"] and agentsession.session_secret_words(rest, os.environ):
             continue  # the two exact forms a session may run (ws.agentsession)
         if sub[:1] and sub[0] in agentsession.ADMIN:
@@ -2308,6 +2366,15 @@ def _segment_once(
         hit = _under(ctx.protect, p, ctx.cwd, ancestors)
         if hit:
             return f"command writes to {hit}, which ws protects (policy and generated gate)", line, nested
+    for p, _ in [
+        *(written or _written(cmd, flags, operands, redirs, canon, toks)),
+        *_copied_in(cmd, operands, toks, ctx),
+    ]:
+        if reason := _secret_env_write(p, env, ctx):
+            if ctx.soft is not None and isinstance(reason, Refusal) and reason.kind in WALL_REDUNDANT:
+                ctx.soft.append(reason)  # the wall holds what this runs; the rest of the line is still judged
+                continue
+            return reason, line, nested
     return None, line, nested
 
 
@@ -2958,6 +3025,71 @@ def _find_deletes(canon: list[str], cwd: str) -> list[str]:
     return [f"rm -fr {_dotted(p, cwd)}" for p in (starts or ["."])]
 
 
+_GLOB_CHARS = re.compile(r"[*?\[]")
+_ENV_SAMPLE_NAMES = (".env", ".envrc", ".env.local", ".env.production", ".env.development", ".env.staging")
+
+
+def _glob_may_name_a_secret_env(base: str) -> bool:
+    """Could the shell turn this word into a secret env file's name? A glob written with its leading dot (`.e*`,
+    `.en?`, `.e[n]v`, `.*`) can; one without it (`*`) can't, since a glob skips dotfiles unless it names the dot."""
+    if not _GLOB_CHARS.search(base) or not base.startswith("."):
+        return False
+    return any(fnmatch.fnmatchcase(n, base) for n in _ENV_SAMPLE_NAMES)
+
+
+ENV_TEMPLATE_SUFFIXES = ("example", "sample", "template", "dist", "defaults")
+
+
+def is_secret_env_name(base: str) -> bool:
+    """Is a file name `.env`, `.envrc`, or `.env.NAME` where NAME isn't a template's word (`.env.example`)? By name alone, so
+    `notes.env` and `prod.env` are not."""
+    name = base.casefold() if CASELESS_PATHS else base
+    if name in (".env", ".envrc"):
+        return True
+    head, dot, tail = name.partition(".env.")
+    return not head and bool(dot) and bool(tail) and tail.rsplit(".", 1)[-1] not in ENV_TEMPLATE_SUFFIXES
+
+
+def _secret_env_write(path: str, env, ctx) -> str | Refusal | None:
+    """A refusal when the command writes a file that holds secrets (see `is_secret_env_name`): a redirect target, or an
+    operand of a command that writes (`tee`, `cp`, `mv`, `sed -i`). Read from the words the shell would see, so
+    quoting, a heredoc, a variable set earlier on the line and a trailing redirect change nothing. A name with a part
+    the reader cannot know (an unset variable) is refused, since it could be any file."""
+    base = path.rsplit("/", 1)[-1]
+    # text read as a command only to keep a body from hiding one is not a word of the line: a name in it that can't be
+    # read is not a refusal (a here-document's prose), though a plain `.env` in it still is
+    if not ctx.bodies_as_commands and (
+        _glob_may_name_a_secret_env(base)
+        or unknownpath.has_unknown(unknownpath.split(base, frozenset(env), _producer(ctx, env)))
+    ):
+        return _write_refusal(
+            f"command writes {path!r}, which holds a part ws cannot read, and it could be a secret .env file; "
+            f"{HOW_TO_SPELL}",
+            "wredirect",
+        )
+    if is_secret_env_name(base):
+        return f"command writes {path!r}, a file that holds secrets; edit it yourself, in a terminal of your own"
+    return None
+
+
+def _copied_in(cmd: str, operands: list[str], toks: list[str], ctx) -> list[tuple[str, bool]]:
+    """What `cp A DIR`, `cp -t DIR A` and the like write inside a folder: DIR/<each source's name>. Only for a
+    destination that is a folder (it exists, or is written with a trailing slash, or comes from `-t`)."""
+    if cmd not in _WRITE_LAST:
+        return []
+    target = shellwords.option_values(toks, "t", ("--target-directory",))
+    if target:
+        dest, sources = target[0], operands
+    elif len(operands) >= 2:
+        dest, sources = operands[-1], operands[:-1]
+    else:
+        return []
+    where = dest if os.path.isabs(dest) else os.path.join(ctx.cwd or ".", dest)
+    if not (target or dest.endswith("/") or dest in (".", "..") or os.path.isdir(where)):
+        return []
+    return [(os.path.join(dest, s.rstrip("/").rsplit("/", 1)[-1]), False) for s in sources if s]
+
+
 def _written(cmd, flags, operands, redirs, canon, toks) -> list[tuple[str, bool]]:
     """Paths this command writes or removes, as (path, ancestors): redirect targets, operands of the commands that
     write, and where curl, wget, tar, unzip and zip put files. `ancestors` is true where a folder above a protected
@@ -2976,6 +3108,14 @@ def _written(cmd, flags, operands, redirs, canon, toks) -> list[tuple[str, bool]
         out += [(o, False) for o in operands]
     elif cmd == "dd":
         out += [(o[3:], False) for o in operands if o.startswith("of=")]
+    elif cmd == "sort":
+        out += [(v, False) for v in shellwords.option_values(toks, "o", ("--output",))]
+    elif cmd in ("awk", "gawk") and any(a == "inplace" for a in toks[1:]):
+        out += [(o, False) for o in operands[1:]]  # the first operand is the program
+    elif cmd in ("ed", "ex"):
+        out += [(o, False) for o in operands]
+    elif cmd == "split":
+        out += [(o + "aa", False) for o in operands[1:]]  # the pieces are PREFIXaa, PREFIXab, ...
     elif cmd == "curl":
         out += [(v, False) for v in shellwords.option_values(toks, "o", ("--output",))]
         if any(t == "--remote-name" or re.fullmatch(r"-[A-Za-z]*O[A-Za-z]*", t) for t in toks[1:]):
@@ -2994,6 +3134,7 @@ def _written(cmd, flags, operands, redirs, canon, toks) -> list[tuple[str, bool]
         if "x" in modes:
             dirs = shellwords.option_values(toks, "C", ("--directory",))
             out += [(d, True) for d in dirs or ["."]]
+            out += [(o, False) for o in operands if o not in archives]  # the members named, extracted by name
         elif any(m in modes for m in "cru"):
             out += [(a, False) for a in archives]
     elif cmd == "unzip":

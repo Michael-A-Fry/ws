@@ -1,9 +1,11 @@
 """config-guard: the files that hold the guardrails are edited only by the session that owns them.
 
-`paths` lists files and folders to protect (absolute or `~/`); `owners` lists the folders whose sessions may edit them
-(absolute or `~/`; a session is in one when its folder is that folder or inside it, a linked worktree kept elsewhere is
-a different place). A write tool call (Edit, Write, MultiEdit, NotebookEdit) whose real path is a protected file, or
-inside a protected folder, is denied unless the session's folder is an owner's, and the reason names the owner folders.
+`paths` lists files and folders to protect (absolute or `~/`); `owners` lists the repositories whose sessions may edit them
+(absolute or `~/`, each the root of a repository's working tree). A session is an owner when the root of the repository its
+folder is in (`git rev-parse --show-toplevel`) is exactly one of the owners: the main checkout, and any folder inside it, but
+not a linked worktree of it, even one kept under it (a linked worktree has a root of its own), and not a folder outside any
+repository. If git can't say, the session is not an owner. A write tool call (Edit, Write, MultiEdit, NotebookEdit) whose real
+path is a protected file, or inside a protected folder, is denied unless the session is an owner, and the reason names the owners.
 Links are followed on both sides, so a path through a symlink is the file it points at. A path that can't be resolved
 to a real one is a deny. The person can approve the edit once.
 
@@ -28,7 +30,7 @@ import stat
 from dataclasses import dataclass
 
 from ws import policy
-from ws.guards import Finding, known_keys, text_list
+from ws.guards import Finding, _git, known_keys, text_list
 from ws.policy import PolicyError
 
 NAME = "config-guard"
@@ -75,11 +77,14 @@ def _start_folder() -> str:
 
 
 def _owns(folder: str, cfg: Config) -> bool:
-    """Is `folder` (an absolute path) inside one of the owner folders?"""
+    """Is the repository that `folder` (an absolute path) is in one of the owners, by its root and not by a folder prefix? A linked
+    worktree has a root of its own, so it is not its main checkout's, and git not answering is a no."""
     if not folder or not os.path.isabs(folder):
         return False
-    here = _real(folder)
-    return any(_inside(here, _real(o)) for o in cfg.owners)
+    top = _git.toplevel(folder)
+    if top is None:
+        return False
+    return _real(top) in {_real(o) for o in cfg.owners}
 
 
 def _through_a_link(path: str, folders: list[str]) -> bool:
@@ -136,6 +141,6 @@ def _deny(call, owners: str, why: str) -> Finding:
     return Finding(
         "deny",
         f"config-guard: {call.value} holds guardrails and is edited only by the session that owns it{extra} "
-        f"(owner folders: {owners}). Start a session there to change it.",
+        f"(owner repositories: {owners}). Start a session in one of them to change it.",
         approvable=True,
     )

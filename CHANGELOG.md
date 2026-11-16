@@ -8,6 +8,12 @@ body of the GitHub release.
 
 ## [Unreleased]
 
+### Changed
+
+- `config-guard` decides who owns a protected file by the root of the repository the session is in, not by a folder prefix: the main checkout and
+  any folder inside it own it; a linked worktree doesn't, even one kept under the owner, and a folder outside git doesn't. If git can't say, the
+  session isn't an owner. An `owners` entry is now the root of a repository's working tree.
+
 ### Fixed
 
 - The command reader's time limit counts its own CPU time, not the wall clock, so a busy or slow machine (a CI runner,

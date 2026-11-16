@@ -50,10 +50,12 @@ def box(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("WS_HOME", str(home / ".ws"))
     monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
-    if shutil.which("git"):
-        real_repos(tmp_path)
+    if not shutil.which("git"):
+        pytest.skip("needs git: the guards ask it which repository a folder is in")
+    real_repos(tmp_path)
     for name in ("plain", "owner", "guarded"):
         (tmp_path / name).mkdir()
+    git(tmp_path / "owner", "init", "-q", "-b", "main")  # an owner is the root of a repository
     return tmp_path
 
 
@@ -81,10 +83,10 @@ def run(box, text, body, *extra, start=None):
 LAUNCH = '[guards]\non = ["guard-launch"]\n'
 
 
-def config_policy(box, extra=""):
+def config_policy(box, extra="", owner=None):
     return (
         f'[guards]\non = ["config-guard"]\n[guards.config-guard]\npaths = ["{box / "guarded"}"]\n'
-        f'owners = ["{box / "owner"}"]\n{extra}'
+        f'owners = ["{owner or box / "owner"}"]\n{extra}'
     )
 
 
@@ -245,6 +247,56 @@ def test_a_cd_into_a_symlinked_folder_does_not_make_a_write_through_it_pass(box)
     body = payload("Write", box / "plain" / "lnk", file_path=str(box / "plain" / "lnk" / "x"), content="x")
     assert run(box, text, body, start=box / "plain") == 2
     assert run(box, text, payload("Write", box / "plain", file_path=str(box / "plain" / "lnk" / "x"), content="x")) == 2
+
+
+def edit_from(box, cwd, owner, *, start=None) -> int:
+    """The exit code of a Write to the guarded folder, from a session in `cwd` whose owner list is `owner`."""
+    target = box / "guarded" / "settings.json"
+    return run(
+        box, config_policy(box, owner=owner), payload("Write", cwd, file_path=str(target), content="x"), start=start
+    )
+
+
+def test_the_main_checkout_owns_and_so_does_a_folder_inside_it(box):
+    main = box / "main"
+    (main / "sub" / "deeper").mkdir(parents=True)
+    assert edit_from(box, main, main) == 0
+    assert edit_from(box, main / "sub", main) == 0  # its repository root is the owner
+    assert edit_from(box, main / "sub" / "deeper", main) == 0
+
+
+def test_a_linked_worktree_does_not_own_even_when_it_is_kept_under_the_owner(box):
+    main = box / "main"
+    under = main / ".claude" / "worktrees" / "builder"
+    git(main, "worktree", "add", "-q", "-b", "under", str(under))
+    assert edit_from(box, under, main) == 2  # inside the owner's folder, but a root of its own
+    assert edit_from(box, under, main, start=under) == 2
+    assert edit_from(box, box / "wt", main) == 2  # the linked worktree kept elsewhere
+    assert edit_from(box, box / "wt", box / "wt") == 0  # unless it is named as an owner itself
+    assert (
+        edit_from(box, main, main, start=under) == 2
+    )  # a call that says it is in the owner, from a session that started in a worktree
+
+
+def test_a_folder_outside_git_does_not_own_and_a_folder_that_names_no_root_does_not(box):
+    assert edit_from(box, box / "plain", box / "main") == 2
+    assert edit_from(box, box / "main", box / "plain") == 2  # an owner that is not a repository's root matches nothing
+    assert edit_from(box, box / "main", box / "main" / "nope") == 2  # an owner that is not there matches nothing
+
+
+def test_when_git_cannot_say_the_session_is_not_an_owner(box, monkeypatch):
+    from ws.guards import _git
+
+    main = box / "main"
+    assert edit_from(box, main, main) == 0
+    monkeypatch.setattr(_git, "lines", lambda *a, **k: None)
+    assert edit_from(box, main, main) == 2  # fail closed
+
+
+def test_an_owner_named_through_a_link_is_the_same_root(box):
+    link = box / "linked-main"
+    link.symlink_to(box / "main")
+    assert edit_from(box, box / "main", link) == 0
 
 
 def test_config_guard_edits_only_by_the_owner(box):

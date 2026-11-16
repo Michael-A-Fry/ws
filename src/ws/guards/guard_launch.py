@@ -29,17 +29,15 @@ from __future__ import annotations
 
 import os
 import re
-import subprocess
 from pathlib import Path
 
-from ws.guards import Finding, known_keys
+from ws.guards import Finding, _git, known_keys
 
 NAME = "guard-launch"
 EVENTS = ("pre",)
 KINDS = ("agent",)
 PRIORITY = 10
 
-GIT_SECONDS = 5
 BUILT_IN_AGENTS = frozenset(
     {"", "general-purpose", "explore", "plan", "claude", "claude-code-guide", "statusline-setup", "output-style-setup"}
 )
@@ -51,32 +49,11 @@ def config(table: dict, where: str) -> None:
     known_keys(table, where, ())
 
 
-def _git_env() -> dict[str, str]:
-    drop = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY")
-    return {**{k: v for k, v in os.environ.items() if k not in drop}, "GIT_NO_LAZY_FETCH": "1"}
-
-
-def _git(folder: str, *args: str) -> list[str] | None:
-    """The lines `git -C folder args` prints, or None when it fails, isn't there or takes too long."""
-    try:
-        done = subprocess.run(
-            ["git", "-C", folder, *args],
-            capture_output=True,
-            text=True,
-            timeout=GIT_SECONDS,
-            env=_git_env(),
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return done.stdout.splitlines() if done.returncode == 0 else None
-
-
 def is_main_checkout(folder: str) -> bool:
     """True when `folder` is inside the main checkout of a git repository, as git says."""
     if not folder or not os.path.isabs(folder) or not os.path.isdir(folder):
         return False
-    got = _git(folder, "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir", "--show-toplevel")
+    got = _git.lines(folder, "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir", "--show-toplevel")
     if got is None or len(got) != 3:
         return False
     git_dir, common, top = (os.path.realpath(x) for x in got)

@@ -237,14 +237,25 @@ def fallback_count(path: Path) -> int:
 
 def read(path: Path) -> list[dict]:
     """Every record, oldest first, across the rotated files and then the fallback file. A line that is not a JSON object
-    is skipped, so one bad write never hides the rest. No log is no records; one that exists but cannot be read raises
-    OSError. Fallback records are merged in by end time, since they were written later than the log's lines around
-    them."""
+    is skipped, so one bad write never hides the rest, and a run written as `outcome_unknown` reads as that record
+    alone (`superseded_dropped`). No log is no records; one that exists but cannot be read raises OSError. Fallback
+    records are merged in by end time, since they were written later than the log's lines around them."""
     recs = jsonl.read(path)
     extra = jsonl.read_plain(fallback_path(path))
-    if not extra:
+    if extra:
+        recs = sorted([*recs, *extra], key=lambda r: str(r.get("ended_at") or r.get("started_at") or ""))
+    return superseded_dropped(recs)
+
+
+def superseded_dropped(recs: list[dict]) -> list[dict]:
+    """The records with each `outcome_unknown` run's late ones left out. When ws has written a run as outcome_unknown
+    (its holder was found gone and the run was settled), a record the old holder writes for that run afterwards (it
+    was not gone after all, only stalled) cannot stand in for it: the file keeps both, and reading takes the reaper's,
+    so the run counts once."""
+    lost = {r.get("run_id") for r in recs if r.get("status") == "outcome_unknown"}
+    if not lost:
         return recs
-    return sorted([*recs, *extra], key=lambda r: str(r.get("ended_at") or r.get("started_at") or ""))
+    return [r for r in recs if r.get("run_id") not in lost or r.get("status") == "outcome_unknown"]
 
 
 # What a run counts against the cap when the runner did not say what it cost. ws ships no prices (they go stale), so

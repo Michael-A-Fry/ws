@@ -14,7 +14,7 @@ import pytest
 
 HOOK = Path(__file__).resolve().parents[1] / ".github" / "hooks" / "pre-push"
 
-SMOKE_ARGS = "uv run --locked pytest -q tests/test_cli.py tests/test_cli_registry.py tests/test_prepush_hook.py -x"
+SMOKE_ARGS = "uv run --locked pytest -q tests/test_cli.py tests/test_cli_registry.py tests/test_prepush_hook.py"
 SMOKE_RUN = SMOKE_ARGS  # a run of the smoke set alone
 CAPPED_SMOKE = SMOKE_ARGS + " -x"  # a capped run stops at the first failure
 TIMEOUT = "timeout 300 " if shutil.which("timeout") else ""

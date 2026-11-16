@@ -366,6 +366,15 @@ first output and attention minutes, because the run record has no fields for the
 - **Trust on first use of the root-owned `/opt/ws` copy** closes when you install from a signed release tag. See
   [Verify a release](../how-to/verify-a-release.md).
 
+## Asks
+
+### Any session can read and answer any ask
+
+`ws ask` has no per-session ownership, as the program before it had none. Any session on the machine can `list`,
+`answer`, `done` or `withdraw` any ask, and `wait` prints the answer to an ask whose text `get` hides (a redacted ask
+or one whose repo is walled now). The wall decides what an ask may store and show, not who may act on it. Don't put
+anything in an answer that you wouldn't give every session on the machine.
+
 ## Small defects (P3)
 
 - Tests leak `WS_OUTPUT` and `WS_GATED_SESSION` from the environment. This affects contributors, not users.

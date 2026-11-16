@@ -344,9 +344,11 @@ def test_parity_launch_from_main(box, monkeypatch):
     assert go(box / "plain", "Workflow", name="w") == 2
 
 
+@needs_git
 def test_parity_config_guard(box, monkeypatch):
     (box / "g").mkdir()
     (box / "mine").mkdir()
+    git(box / "mine", "init", "-q", "-b", "main")  # an owner is the root of a repository
     on = f'[guards]\non = ["config-guard"]\n[guards.config-guard]\npaths = ["{box / "g"}"]\nowners = ["{box / "mine"}"]\n'
     edit = {"file_path": str(box / "g" / "settings.json"), "content": "x"}
     monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(box))

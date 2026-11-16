@@ -63,8 +63,9 @@ the release.
 The repo ships `.github/hooks/pre-push`. It runs `prek`, then the tests your change can affect, before a push leaves
 your machine. A change that maps to more than 40 test files, or touches `pyproject.toml`, `uv.lock`, a `conftest.py`,
 `tests/plugins/` or `.github/`, runs a short set instead (the smoke set, your changed tests and the tests importing a
-changed module), stopped after 300 seconds (`WS_PREPUSH_CAP`). CI runs the whole suite on every pull request and is
-required to merge; `WS_PREPUSH_FULL=1` runs it here too (logged). Turn the hook on once:
+changed module), stopped after 6 seconds a file, at least 300 and at most 1800 (`WS_PREPUSH_CAP` sets it). CI runs the
+whole suite on every pull request and is required to merge; `WS_PREPUSH_FULL=1` runs it here too (logged). Turn the
+hook on once:
 
 ```sh
 git config core.hooksPath .github/hooks
@@ -77,8 +78,8 @@ checks, so skipping only moves the failure.
 On a machine where several test runs share the cores, a suite raced by others can miss a timing test's deadline. Set
 `WS_PREPUSH_WRAP` to a command that queues the run, and the hook starts the suite through it (split on spaces; `prek`
 runs unwrapped). For example `WS_PREPUSH_WRAP="flock /tmp/tests.lock" git push`. Unset, the hook uses
-`ws-test --light --node local --` when `ws-test` is on your PATH, and runs the tests bare when it isn't. Set but empty
-(`WS_PREPUSH_WRAP= git push`), they always run bare.
+`ws-test --light --mem 3G --node local --` (6G with e2e tests or over 40 files in the set) when `ws-test` is on your
+PATH, and runs the tests bare when it isn't. Set but empty (`WS_PREPUSH_WRAP= git push`), they always run bare.
 
 ## Rules for a change
 

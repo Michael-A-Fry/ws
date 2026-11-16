@@ -23,8 +23,12 @@ You type the value yourself, in your own terminal. Never paste a key into an AI 
    ```
 
    For a bearer token, use `header = "authorization"` and `format = "Bearer {value}"`. Leave `purposes` out to allow any.
-   Keep `hosts` to the one host that needs the key. To lease it only to runs that declare it, add a `tier` and an
-   `area` ([Use short-lived credentials](use-short-lived-credentials.md)). An unknown key in a table refuses the whole
+   Keep `hosts` to the one host that needs the key. `paths = ["/v1/messages"]` limits the broker to those request paths
+   (a prefix on a folder boundary; anything else gets a 403 and never reaches the host).
+   With `paths` set, a request path may hold only letters, digits and `._~/-`, and the list can't be empty. A change to
+   `paths` or `ttl` bites open leases too. `ttl = 600` ends this name's
+   leases after 600 seconds (an hour is the default, a day the most). To lease it only to runs that declare it, add a
+   `tier` and an `area` ([Use short-lived credentials](use-short-lived-credentials.md)). An unknown key in a table refuses the whole
    registry, so a typo never leaves a name unscoped.
 
 2. Store the value. ws asks for it without showing it. It reads standard input instead when there is no terminal.
@@ -108,6 +112,29 @@ value) to `logs/secrets-audit.jsonl` in the state folder.
 
 `ws secret list` shows the name with the state `set`. `ws doctor` shows WS104 `ok` after the wall (`warn` before it:
 "same-user boundary"). A job that names the secret runs without the key appearing in its environment or its run record.
+
+## Check them on a schedule
+
+A weekly job that has the runner read `ws doctor` and say what's wrong with the store, never a value. Save it as
+`~/.config/ws/jobs/secrets-audit.toml`, then `ws schedule apply`:
+
+```toml
+runner = "claude-code"
+model = "claude-haiku-4-5"
+prompt = """
+Run `ws doctor --offline`. Report only the secrets checks (WS104 and neighbours) that are not ok,
+one line each. Never print or open a secret value.
+"""
+max_turns = 4
+budget_usd = 0.25
+schedule = "weekly mon 09:00"
+timeout_s = 600
+on_failure = "alert"
+log = "file"
+uninstall = "ws schedule remove secrets-audit"
+expected_rate = "7d"
+data_class = "none"
+```
 
 ## Remove or replace
 

@@ -752,3 +752,26 @@ def test_the_secret_env_lint_catches_the_shapes_it_should():
         assert _SECRET_ENV.search(bad), bad
     for fine in ('os.environ["HOME"]', 'env.get("ANTHROPIC_API_KEY")', 'os.environ.get("WS_HOME")'):
         assert not _SECRET_ENV.search(fine), fine
+
+
+def test_a_second_write_of_the_same_value_changes_nothing_and_a_second_delete_is_a_no_op(tmp_path):
+    import os
+    import stat
+
+    s = wsecrets.Store(tmp_path / "store")
+    value = "planted-" + os.urandom(8).hex()
+    s.write("anthropic", value)
+    first = (
+        (s.path / "anthropic").read_bytes(),
+        stat.S_IMODE((s.path / "anthropic").stat().st_mode),
+        sorted(os.listdir(s.path)),
+    )
+    s.write("anthropic", value)
+    second = (
+        (s.path / "anthropic").read_bytes(),
+        stat.S_IMODE((s.path / "anthropic").stat().st_mode),
+        sorted(os.listdir(s.path)),
+    )
+    assert first == second and first[1] == 0o600 and first[2] == ["anthropic"]  # no stray temp file either
+    assert s.delete("anthropic") is True and s.delete("anthropic") is False
+    assert s.names() == []

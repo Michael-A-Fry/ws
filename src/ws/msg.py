@@ -103,6 +103,9 @@ TIERS = ("info", "urgent", "noise")
 
 BODY_MAX_BYTES = 16 * 1024
 RATE_PER_MINUTE = 30
+PERSON_RATE_PER_MINUTE = (
+    20  # the person's own cap, apart from the per-session one: a stuck script must not flood a lead
+)
 RATE_WINDOW_S = 60  # one fixed window, from the store's own clock
 HOP_MAX = 8
 STORE_MAX_BYTES = 256 * 1024 * 1024
@@ -620,10 +623,28 @@ def caller() -> session.Record:
         raise WsError(
             "refused",
             "ws can't tell which session is calling",
-            "run it from inside a session (or through its `ws mcp serve`); a person's shell has no send path yet. "
+            "run it from inside a session (or through its `ws mcp serve`); a person's own send needs `[msg] person_send = true` in policy.toml and `ws msg person-token`. "
             "The registry is looked for in the account's own ws folders, whatever WS_HOME or XDG_* say",
         )
     return rec
+
+
+def person_record(pol: policy.Policy) -> session.Record:
+    """The sender of a person's own send: a synthetic `person:<account user>` record, never registered, built only here.
+    It is made only with positive proof (ADR 0023, "A person sends"): `[msg] person_send` on, the sandbox wall on in the
+    policy, not macOS (its Seatbelt profile has not been run for this) and not the resident gate, and the per-boot token readable and matching. No
+    runner ancestor is not proof: an orphaned or double-forked agent process has none. Anything less is the `refused`
+    error a caller-less send always gave. Its role is `lead` (above one, since it is the person) and it has no class;
+    a walled receiver still takes it only when `inbound_allow` names it."""
+    try:
+        user = session.account_user()
+        proven = pol.msg.person_send and pol.gate.sandbox and sys.platform != "darwin"
+        proven = proven and not session.peer_bound() and session.person_proof()
+    except WsError:
+        proven = False
+    if not proven:
+        return caller()  # raises the same refusal as before
+    return session.Record(session_id=session.PERSON + user, release="", role="lead", runner="person")
 
 
 def _config() -> Path:
@@ -750,9 +771,11 @@ def send(
     tier: str = "info",
     ack_required: bool = False,
     now: float | None = None,
+    allow_person: bool = False,
 ) -> dict:
     """Leave `body` for session `to`. The sender is the session this process is under (`session.resolve_caller`); there
-    is no way to pass one. Returns the stored message's `id`, `thread_id`, `hop`, `class`, `size` bucket and `replayed`
+    is no way to pass one. With no caller, `allow_person` (the command line only, never `ws mcp serve`) lets the person
+    who owns the account send as `person:<user>` when `person_record` finds the proof. Returns the stored message's `id`, `thread_id`, `hop`, `class`, `size` bucket and `replayed`
     (True when the same sender's `key` was used before to the same recipient: the first message's id comes back and
     nothing is stored; the same key to another session is a new message)."""
     signal = _t(now)
@@ -780,13 +803,17 @@ def send(
             "too_large", f"the body is {len(data)} bytes; the most is {BODY_MAX_BYTES}", "send a shorter message", 1
         )
 
-    sender = caller()
+    sender = session.resolve_caller()
+    if sender is None and not allow_person:
+        caller()  # raises: no caller, and this entry takes no person path
     pol = _policy()
+    if sender is None:
+        sender = person_record(pol)
     names = _secret_names()
     target = session.read(to, _env())
     if target is None:
         raise WsError("not_found", f"no session {to!r}", "the registry has no session with that id")
-    s_class = policy.class_of(pol, sender.cwd)
+    s_class = policy.class_of(pol, sender.cwd) if not sender.session_id.startswith(session.PERSON) else None
     r_class = policy.class_of(pol, target.cwd)
     return _deliver(
         (sender, target, s_class, r_class, pol, names),
@@ -920,10 +947,9 @@ def _store_message(conn, parties, content, labels, clock) -> dict:
     (recent,) = conn.execute(
         'SELECT COUNT(*) FROM messages WHERE "from"=? AND sent_ms>=?', (sid, int(window * 1000))
     ).fetchone()
-    if recent >= RATE_PER_MINUTE:
-        raise WsError(
-            "rate_limited", f"{sid!r} has sent {RATE_PER_MINUTE} messages this minute", "wait for the next minute", 1
-        )
+    cap = PERSON_RATE_PER_MINUTE if sid.startswith(session.PERSON) else RATE_PER_MINUTE
+    if recent >= cap:
+        raise WsError("rate_limited", f"{sid!r} has sent {cap} messages this minute", "wait for the next minute", 1)
     hop, thread_id = 0, thread
     if reply_to is not None:
         parent = conn.execute(
@@ -1935,6 +1961,7 @@ def cmd_send(args: argparse.Namespace) -> int:
         reply_to=args.reply_to,
         tier=args.tier,
         ack_required=args.ack_required,
+        allow_person=True,
     )
     woke = None if result["replayed"] else _wake_after_send(args.to)
     if woke is not None:
@@ -1949,6 +1976,17 @@ def cmd_send(args: argparse.Namespace) -> int:
                 f"ws: could not wake {args.to} ({woke['reason']}); it reads the message at its next turn",
                 file=sys.stderr,
             )
+    return 0
+
+
+def cmd_person_token(args: argparse.Namespace) -> int:
+    if session.resolve_caller() is not None:
+        raise WsError("refused", "a session can't make the person's token", "run it from your own terminal")
+    where = session.init_person_token()
+    if args.json:
+        output.result({"token": str(where)})
+    else:
+        print(f"made {where} (0600; the launch wall hides it from sessions)")
     return 0
 
 
@@ -2173,6 +2211,12 @@ def register(sub) -> None:
     s.add_argument("--tier", choices=TIERS, default="info")
     s.add_argument("--ack-required", action="store_true", help="ask the receiver to acknowledge it")
     s.set_defaults(func=cmd_send)
+
+    t = ms.add_parser(
+        "person-token",
+        help="make the per-boot token that proves a send is yours, not an agent's (run from your own terminal)",
+    )
+    t.set_defaults(func=cmd_person_token)
 
     ls = ms.add_parser("list", help="your messages (envelopes only), oldest first")
     ls.add_argument("--sent", action="store_true", help="the ones you sent, not the ones left for you")

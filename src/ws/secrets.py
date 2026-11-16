@@ -47,6 +47,7 @@ NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
 HOST_RE = re.compile(r"^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?(:[0-9]{1,5})?$")
 HEADER_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 MAX_VALUE = 8192
+MAX_TTL_S = 86400  # a per-secret lease limit above a day is a typo
 WALL_USER = "ws-broker"
 WALL_GROUP = "ws-clients"
 WALL_HOME = "/var/lib/ws-broker"
@@ -54,6 +55,7 @@ WALL_SOCKET = "/run/ws-broker/broker.sock"
 WALL_BIN = "/opt/ws/bin/ws"  # a root-owned launcher: the broker never runs code a normal user can write
 WALL_LIB = "/opt/ws/lib"
 SAFE_PATH = re.compile(r"^[A-Za-z0-9_./+-]+$")
+PATH_PREFIX_RE = re.compile(r"^/[A-Za-z0-9._~/-]*$")
 AREA_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
 # The tiers, lowest first. A run's tier reaches the names of the tiers in REACH; `walled` reaches only walled names, and
 # nothing reaches up into it, so a walled class's keys never leave its own runs.
@@ -84,6 +86,8 @@ class Entry:
     tier: str | None = None
     area: str | None = None
     kind: str = "header"  # header: the broker adds it to requests; else a minter in ws.minters makes a credential
+    paths: tuple[str, ...] = ()  # request paths the broker forwards for this name (prefixes); empty: any path
+    ttl: float | None = None  # longest lease of this name, seconds; None: the broker's own limit (one hour by default)
     options: object = None  # the minter's own keys, parsed by it
     source: str = "paste"  # paste: a person brings the value; generate: `ws secret generate` makes it
 
@@ -182,12 +186,25 @@ def _entry(path: Path, name: str, t: dict) -> Entry:
         raise SecretsError(f"{path}: [{name}] tier must be one of {', '.join(TIERS)}")
     if area is not None and not (isinstance(area, str) and AREA_RE.match(area)):
         raise SecretsError(f"{path}: [{name}] area must be a short lower-case name (letters, digits, - and _)")
+    req_paths = _str_list(path, name, "paths", t.get("paths", []))
+    if "paths" in t and not req_paths:
+        raise SecretsError(
+            f"{path}: [{name}] paths is empty: leave the key out to allow any path, or list the prefixes"
+        )
+    for pre in req_paths:
+        if not PATH_PREFIX_RE.match(pre) or any(seg in (".", "..") for seg in pre.split("/")):
+            raise SecretsError(
+                f"{path}: [{name}] {pre!r} is not a path prefix (start with /; letters, digits and ._~/- only; no . or .. part)"
+            )
+    ttl = t.get("ttl")
+    if ttl is not None and (isinstance(ttl, bool) or not isinstance(ttl, (int, float)) or not 0 < ttl <= MAX_TTL_S):
+        raise SecretsError(f"{path}: [{name}] ttl must be a number of seconds above 0 and at most {MAX_TTL_S}")
     source = t.get("source", "paste")
     if source not in SOURCES:
         raise SecretsError(f"{path}: [{name}] source must be paste or generate")
     if source == "generate" and kind != "header":
         raise SecretsError(f"{path}: [{name}] a {kind} credential is brought by a person; source must be paste")
-    allowed = {"hosts", "header", "format", "purposes", "tier", "area", "kind", "source"}
+    allowed = {"hosts", "header", "format", "purposes", "tier", "area", "kind", "source", "ttl", "paths"}
     options = None
     if kind != "header":
         allowed = {"tier", "area", "kind", "purposes", "source"} | minters[kind].EXTRA_KEYS
@@ -205,6 +222,8 @@ def _entry(path: Path, name: str, t: dict) -> Entry:
         tier=tier,
         area=area,
         kind=kind,
+        paths=req_paths,
+        ttl=float(ttl) if ttl is not None else None,
         options=options,
         source=source,
     )

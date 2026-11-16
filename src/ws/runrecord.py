@@ -173,7 +173,8 @@ def unknown_outcome(
 def checked(rec: dict) -> dict:
     """The record with the two rules applied: an `ok` whose runner stopped on a turn or budget limit (or on any subtype
     that is not success) becomes an error with the limit as its stop reason, and an `ok` carries no fault. A record that
-    is already an error keeps its status and gains the limit as its stop reason. Returns `rec`."""
+    is already an error keeps its status and gains the limit as its stop reason. Returns a copy; `rec` is unchanged."""
+    rec = dict(rec)
     sub = rec.get("stop_subtype")
     if rec.get("status") == "ok" and sub not in OK_SUBTYPES:
         rec.update(

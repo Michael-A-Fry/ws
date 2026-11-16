@@ -1595,3 +1595,48 @@ def test_planted_new_status_reads_old_reader(tmp_path):
     assert old_view["run_id"] == rec["run_id"] and old_view["stop_reason"] == "owner_gone"
     assert queue._recovered_outcome({"status": "interrupted", "stop_reason": "crashed"}).stop_reason == "interrupted"
     assert queue._recovered_outcome({"status": "interrupted", "stop_reason": "owner_gone"}).stop_reason == "interrupted"
+
+
+def test_planted_sigkill_rollback_still_alerts_once(tmp_path):
+    """A reaper whose transaction rolls back after it wrote the record: the next reaper owes the notice, sends it once,
+    and writes no second record."""
+    host = Host()
+    log = tmp_path / "logs" / "runs.jsonl"
+    alerts: list[str] = []
+    ledger = make(
+        tmp_path, host=host, sink=lambda rec: queue._write_record(log, rec),
+        recorded=lambda rid: next((r for r in runrecord.read(log) if r["run_id"] == rid), None),
+        on_stop=lambda job, run_id, why: alerts.append(run_id),
+    )  # fmt: skip
+    r = req(owner_pid=4600)
+    assert ledger.admit(r, T0, spend()).kind == "admit"
+    host.procs[4600] = (False, None)
+    with pytest.raises(RuntimeError), queue._transaction(ledger.conn()) as c:
+        ledger._reap(c, T0)
+        raise RuntimeError("the store went away before the commit")
+    assert ledger.receipt(r.run_id)["status"] == "running" and len(runrecord.read(log)) == 1 and alerts == []
+    assert ledger.reap(T0) == 1 and ledger.reap(T0) == 0
+    assert alerts == [r.run_id] and len(runrecord.read(log)) == 1
+
+
+def test_planted_sigkill_already_alerted_by_the_scheduler_is_not_told_again(tmp_path):
+    host = Host()
+    alerts: list[str] = []
+    told = tmp_path / "state" / "logs" / "alerts.jsonl"
+    ledger = make(
+        tmp_path, host=host, sink=lambda rec: True, on_stop=lambda job, run_id, why: alerts.append(job),
+        already_told=lambda job, since: queue.unit_alerted(job, since, told),
+    )  # fmt: skip
+    nightly, other = req(job="nightly", owner_pid=4700), req(job="other", owner_pid=4701)
+    for x in (nightly, other):
+        assert ledger.admit(x, T0, spend()).kind == "admit"
+    told.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        {"schema": 1, "ts": "2026-11-07T00:00:00.000Z", "event": "unit-failed", "job": "other"},  # an older failure
+        {"schema": 1, "ts": "2026-11-08T03:00:05.000Z", "event": "unit-failed", "job": "nightly"},  # this kill
+    ]
+    told.write_text("".join(json.dumps(x) + "\n" for x in lines) + "not json\n", encoding="utf-8")
+    host.procs[4700] = host.procs[4701] = (False, None)
+    assert ledger.reap(T0 + timedelta(minutes=1)) == 2
+    assert alerts == ["other"]  # nightly's OnFailure= already said it; other's alert was for an earlier run
+    assert queue.unit_alerted("x", T0, tmp_path / "missing.jsonl") is False

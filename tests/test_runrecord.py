@@ -147,3 +147,34 @@ def test_a_new_record_reads_through_the_plain_line_reader(tmp_path):
     runrecord.append(log, runrecord.unknown_outcome(RID, "j", T0, T0 + timedelta(seconds=3)))
     (got,) = jsonl.read(log)
     assert got["status"] == "outcome_unknown" and got["duration_ms"] == 3000
+
+
+# The cost rules of ws before `outcome_unknown` (main at e9dcf61), frozen here to measure what a rollback costs.
+def _old_started(rec: dict) -> bool:
+    if rec.get("status") in ("ok", "timeout", "preempted"):
+        return True
+    return rec.get("status") == "error" and (
+        rec.get("exit_code") is not None or str(rec.get("error", "")).startswith("interrupted")
+    )
+
+
+def _old_record_cost(rec: dict, unknown_run_usd: float | None = None) -> float:
+    if runrecord._finite(rec.get("cost_usd")):
+        return float(rec["cost_usd"])
+    if not _old_started(rec):
+        return 0.0
+    return float(unknown_run_usd or runrecord.UNKNOWN_RUN_USD)
+
+
+def test_a_reaped_record_under_the_reader_before_outcome_unknown():
+    """Known rollback cost (docs/reference/stores.md): the old rules read the record but count it at US$0; these rules
+    count it at the fallback. The old reap shape counts the same under both."""
+    new = runrecord.unknown_outcome(RID, "j", T0, T0 + timedelta(seconds=9), ws_version="0")
+    assert _old_record_cost(new, 2.0) == 0.0 and runrecord.record_cost(new, 2.0) == 2.0
+    old = dict(new, status="error", stop_reason="crashed", error="interrupted: the process ... was gone")
+    assert _old_record_cost(old, 2.0) == runrecord.record_cost(old, 2.0) == 2.0
+
+
+def test_checked_leaves_the_callers_record_alone():
+    mine = rec(status="ok", stop_subtype="error_max_turns")
+    assert runrecord.checked(mine)["status"] == "error" and mine["status"] == "ok"

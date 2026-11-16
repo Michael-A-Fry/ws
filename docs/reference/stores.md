@@ -88,7 +88,9 @@ Notes:
 - Schema 3 later gained, without a new number (a record only gains keys): `stop_subtype`, `fault`, `retry_after_s`,
   `approval`, `run_key` and `chain_depth`, and `status` gained `outcome_unknown`. A reaped run is written as
   `outcome_unknown` with stop reason `owner_gone`; lines written before as `error` with stop reason `crashed` read as
-  they are.
+  they are. Known rollback cost: a ws from before `outcome_unknown` counts such a record at US$0 against the cap (it
+  does not know the status as a run that started), so while rolled back each reaped run's fallback cost goes
+  uncounted. The test `test_a_reaped_record_under_the_reader_before_outcome_unknown` pins the size.
 - The node footprint is a ledger, not a log: two lines per change (an `intent` before it, a `done` after), so a crash
   between them is still understood. It's never rotated, because a forgotten change couldn't be undone.
 - The asks file is the one log outside the four folders: it sits where `ws home` reads asks from, which is

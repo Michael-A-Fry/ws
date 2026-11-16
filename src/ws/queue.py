@@ -52,7 +52,9 @@ line through the notify role, if `[roles.notify]` has an adapter that sends (`no
 wait are not stops. No notify role is silence, and a notice that cannot be sent is dropped: it never changes what the job
 came to. The line counts as one alert against the adapter's daily allowance. A run reaped after a SIGKILL, OOM or
 power loss is announced once (`outcome_unknown`), by whichever process reaped it; one that had written its own record
-is not.
+is not, and nor is one whose unit the scheduler already alerted (`ws watch alert` wrote a line for the job since the
+run started). The reap runs at the next admission or drain, so a killed run is told when the next job on the machine
+starts, not at the kill.
 
 `add`, `cancel` and `run` are refused in a gated session; `list`, `show` and `slot` are not. Limits default to the
 constants below and are read from `[roles.queue]` in the profile.
@@ -481,6 +483,7 @@ class Ledger:
         recorded: Callable[[str], dict | None] | None = None,
         sink: Callable[[dict], bool] | None = None,
         on_stop: Callable[[str, str, str], None] | None = None,
+        already_told: Callable[[str, datetime], bool] | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self.state = Path(state)
@@ -494,7 +497,8 @@ class Ledger:
         self.rate_limits = rate_limits or (lambda now: usage.read_rate_limits(self.state, now))
         self.recorded, self.sink, self.clock = recorded, sink, clock
         self.on_stop = on_stop
-        self._reaped: list[tuple[str, str]] = []  # (job, run_id) reaped inside a transaction, told after it
+        self._reaped: list[tuple[str, str, datetime]] = []  # (job, run_id, started) reaped in a transaction
+        self.already_told = already_told
         self._conn: sqlite3.Connection | None = None
         self._engine: sqlqueue.SqlQueue | None = None
 
@@ -900,9 +904,14 @@ class Ledger:
 
     def _tell_reaped(self) -> None:
         """Say once for each run reaped as `outcome_unknown` in the transaction that has just committed. (A rolled-back
-        reap is forgotten here too: the next reaper finds the run again and tells it then.)"""
+        reap is forgotten here too: the next reaper finds the run again and tells it then.) A job whose failure was
+        already alerted since the run started (`already_told`: the scheduler's OnFailure= alert for the same kill) is
+        not told twice."""
         told, self._reaped = self._reaped, []
-        for job, run_id in told:
+        for job, run_id, started in told:
+            with contextlib.suppress(Exception):
+                if self.already_told is not None and self.already_told(job, started):
+                    continue
             self.stopped(job, run_id, "outcome_unknown: the process that held it was gone before it finished")
 
     def _reap(self, c: sqlite3.Connection, now: datetime) -> int:
@@ -939,9 +948,11 @@ class Ledger:
         unknown_run_usd, fallback = self.costing
         rec = self.recorded(run_id) if self.recorded else None
         written = True
-        lost = rec is None
-        if lost:
-            started = from_ns(r["started_at"] or r["queued_at"]) or now
+        started = from_ns(r["started_at"] or r["queued_at"]) or now
+        # lost: no record, or the outcome_unknown one a reaper wrote before its transaction rolled back (the record is
+        # outside the database, so it stays; the notice was never sent, so it is owed)
+        lost = rec is None or rec.get("status") == "outcome_unknown"
+        if rec is None:
             last = started + timedelta(seconds=float(r["reserved_s"] or 0)) if r["reserved_s"] else now
             rec = runrecord.unknown_outcome(
                 run_id, r["job"], started, min(now, last), purpose=r["purpose"], ws_version=_version()
@@ -957,7 +968,7 @@ class Ledger:
             (status, ns, usd, int(written), rec.get("stop_reason") or "owner_gone", run_id),
         )
         if lost and cur.rowcount == 1:
-            self._reaped.append((r["job"], run_id))
+            self._reaped.append((r["job"], run_id, started))
 
     # -- queued work --------------------------------------------------------------------------------------------
 
@@ -1493,6 +1504,9 @@ def ledger_from_profile(prof: dict, state: Path, log: Path) -> Ledger:
         v = budget.get(key)
         return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and 0 < v < math.inf else None
 
+    from ws import jobwatch  # here, not at the top: only a machine ledger reads the scheduler's alerts
+
+    alerts = state / "logs" / jobwatch.alerts_path().name  # what `ws watch alert` writes; the queue only reads it
     return Ledger(
         state,
         limits=Limits.from_profile(prof),
@@ -1500,7 +1514,31 @@ def ledger_from_profile(prof: dict, state: Path, log: Path) -> Ledger:
         recorded=lambda rid: next((r for r in runrecord.read(log) if r.get("run_id") == rid), None),
         sink=lambda rec: _write_record(log, rec),
         on_stop=lambda job, run_id, reason: notify_stop(job, run_id, reason, prof=prof),
+        already_told=lambda job, since: unit_alerted(job, since, alerts),
     )
+
+
+def unit_alerted(job: str, since: datetime, path: Path) -> bool:
+    """Has the scheduler already alerted a failure of `job` since `since`? (`ws watch alert`, which a unit's
+    OnFailure= runs, writes a line in its alerts log for each failed unit.) False when the file is missing
+    or unreadable: then the reaper's notice is the only one."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+    for line in reversed(lines):
+        try:
+            a = json.loads(line)
+            ts = datetime.fromisoformat(str(a.get("ts")))
+        except (ValueError, AttributeError):
+            continue
+        if ts.tzinfo is None:
+            continue
+        if ts < since:
+            return False  # lines are appended in time order: nothing older can be about this run
+        if a.get("job") == job and a.get("event") == "unit-failed":
+            return True
+    return False
 
 
 def ledger_for_env(env=None) -> Ledger:

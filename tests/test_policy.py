@@ -2439,8 +2439,8 @@ def test_a_host_ssh_puts_in_a_local_command_is_plain_text_or_refused(pol, home, 
 
 def test_plain_jumps_and_host_names_still_run(pol, home):
     for cmd in (
-        "ssh -J me@jump.example.org:2222,jump2.example.org h ls",
-        "ssh -o ProxyJump=jump.example.org -o HostName=10.0.0.5 h ls",
+        "ssh -J jump.example.org:2222,jump2.example.org h ls",
+        "ssh -o ProxyJump=jump.example.org -o HostName=192.0.2.5 h ls",
         "ssh -o HostName=[fe80::1%eth0] h ls",
     ):
         assert policy.is_denied_command(pol, cmd) is None, cmd

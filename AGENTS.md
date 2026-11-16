@@ -79,5 +79,5 @@ uvx prek run --all-files             # gitleaks, ruff, typos, rumdl, actionlint,
 uv run --locked ws doctor --offline  # the installed tool checking itself; exit 1 for unconfigured roles is expected
 python3 scripts/gen_code_map.py      # regenerate docs/reference/code-map.md after changing a module docstring
 python3 scripts/check_docs_integrity.py  # links, anchors, policy files
-git config core.hooksPath .github/hooks  # once: prek and the affected tests before each push (WS_SKIP_PREPUSH=1 skips, logged)
+git config core.hooksPath .github/hooks  # once: prek and the affected tests before each push (WS_SKIP_PREPUSH=1 skips)
 ```

@@ -1014,6 +1014,8 @@ def _execute(
             leases.append(_lease(s, sock, rec))
             rec["secrets_used"].append({"name": s.name, "host": s.host})
         argv, extra = adapter.build_command(job, run_dir, leases[0] if leases else None)
+        if hasattr(adapter, "run_leases"):  # leases the adapter took itself (a connector's token): released below too
+            leases += adapter.run_leases(run_dir)
         if job.checkpoint:
             extra = {**extra, "WS_CHECKPOINT": job.checkpoint}
         if rec.get("chain_depth") is not None:  # a queued run: what it queues is one link deeper in its chain

@@ -16,6 +16,7 @@ from ws.output import WsError
 
 # The commands the installed package itself adds, in module-name order; a planted one comes after them.
 SHIPPED = [
+    ("ask", "asks"),
     ("watch", "jobwatch"),
     ("msg", "msg"),
     ("node", "node"),

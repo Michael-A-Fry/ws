@@ -97,6 +97,9 @@ BASE_FILES = {
     "tests/test_cli.py": "",
     "tests/test_cli_registry.py": "",
     "README.md": "hi\n",
+    "src/ws/pk/__init__.py": "import importlib\n\nimportlib.import_module('ws.pk.leaf')\n",
+    "src/ws/pk/leaf.py": "Q = 1\n",
+    "tests/test_pk.py": "from ws import pk\n",
     **{f"tests/test_d{i}.py": "from ws import d\n" for i in range(41)},
 }
 
@@ -162,6 +165,11 @@ def test_a_one_module_change_runs_its_tests_only(tmp_path):
 def test_a_module_change_runs_the_tests_of_what_imports_it(tmp_path):
     calls, _ = run_selected(tmp_path, {"src/ws/a.py": "X = 2\n"})
     assert calls[-1] == f"{SUITE} tests/test_a.py tests/test_b.py"
+
+
+def test_a_module_a_package_finds_by_scanning_selects_the_tests_that_import_the_package(tmp_path):
+    calls, _ = run_selected(tmp_path, {"src/ws/pk/leaf.py": "Q = 2\n"})
+    assert calls[-1] == f"{SUITE} tests/test_pk.py"
 
 
 def test_a_new_test_file_is_always_selected(tmp_path):

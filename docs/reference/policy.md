@@ -300,7 +300,7 @@ job names it in `runner_options.connectors`; a person starts a session with it t
 | `url` | text | none | The server's address, `https://` (or `http://127.0.0.1` for a server on this machine). Streamable HTTP. Give `url` or `command`, not both. |
 | `command` | list of text | none | A stdio server: the program and its arguments. It looks after its own auth. |
 | `class` | text | none | The data class of what it returns, a name from `[classes]`. A session of another class gets it only when that class's `readable_by` names the session's class. With none, any session may have it. |
-| `read_only` | true or false | `true` | Refuses a tool whose name says it changes something (`create`, `update`, `delete`, `send`, `pay` and the like) and the `*` wildcard. Setting it to `false` is a reviewed change. |
+| `read_only` | true or false | `true` | Refuses a tool whose name has a word that says it changes something (`create`, `update`, `delete`, `send`, `pay` and the like) and the `*` wildcard. It reads the name only, so it catches slips, not a server that lies: make the server itself read-only too. Setting it to `false` is a reviewed change. |
 | `token` | text | none | The name of the secret that opens the server (`url` only), never a value. The registry entry allows it at the url's host; the runner reaches the server through a [broker](../explanation/broker.md) lease, so it never holds the token. Only over `https`, or to `127.0.0.1`. |
 | `tools` | list of text | required | The allowlist, bare tool names. At least one. |
 | `description` | text | `""` | A line for `ws connector list`. |

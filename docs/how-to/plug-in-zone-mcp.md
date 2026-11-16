@@ -68,7 +68,16 @@ is any MCP server: an app of your own on your network, or a vendor's.
   one host and ends with the run or the launch. The runner holds the lease address, as it holds its model lease, so the
   server's own log is the second record of who called it.
 - A tool the list doesn't name is refused by the connector's hook, whoever started the session, and the refusal is
-  logged.
+  logged. So is a listed tool in a session ws didn't wire it into (a server of the same name from your own MCP config),
+  and one in a folder whose class may not read the connector's class.
+
+## Limits
+
+- The allowlist and the log cover calls made through the runner's MCP client. A session that reads the lease address
+  can call the server another way while the lease lasts, so make the server itself read-only and have it log each call:
+  the server is the last word on what it does.
+- A lease lasts as long as the broker allows (an hour by default). A longer interactive session loses the connector
+  when its lease ends; start it again.
 
 ## Swap it out
 

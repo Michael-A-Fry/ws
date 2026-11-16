@@ -44,6 +44,7 @@ COMMAND = "connector"
 LOG = "connector-calls.jsonl"
 SCHEMA_VERSION = 1
 PURPOSE = "connector"  # the purpose a connector's token is leased for (a registry entry may limit a name to it)
+WIRED_ENV = "WS_CONNECTORS"  # the connectors ws wired into this run or launch, comma-separated (a job can't set WS_*)
 AGENT_ENV = "WS_CONNECTOR_AGENT"  # who the audit line names: a job's name, or the `--agent` a launch was given
 MAX_ARG_KEYS = 32
 DENY = 2  # the hook's exit for a refused call (Claude Code shows its stderr to the model)
@@ -183,10 +184,10 @@ def narrow(conns: list[policy.Connector], asked: list[str]) -> list[str]:
     """A job's own `allowed_tools` with the connectors' allowlists added. Raises ValueError for a tool of a connector's
     server that its allowlist does not name (least agency: the allowlist is the most a run gets)."""
     allowed = {t for c in conns for t in c.tool_names()}
-    prefixes = {f"mcp__{c.name}__": c for c in conns}
     for t in asked:
-        for pre, c in prefixes.items():
-            if t.startswith(pre) and t not in allowed:
+        for c in conns:
+            pre = f"mcp__{c.name}"
+            if t == pre or (t.startswith(pre + "__") and t not in allowed and "*" not in c.tools):
                 raise ValueError(f"runner_options.allowed_tools: {t} is not in [connectors.{c.name}] tools")
     return list(dict.fromkeys([*asked, *sorted(allowed)]))
 
@@ -213,6 +214,12 @@ def audit(payload: Mapping, pol: policy.Policy, env: Mapping[str, str]) -> tuple
     conn, ok, rule = decide(pol, tool)
     if conn is None:
         return True, ""
+    wired = {n for n in env.get(WIRED_ENV, "").split(",") if n}
+    cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) and payload.get("cwd") else os.getcwd()
+    if ok and conn.name not in wired:  # a server of that name the person's own config brought: not ws's wiring
+        ok, rule = False, f"[connectors.{conn.name}] is not wired into this session (ws connector launch, or a job)"
+    elif ok and (why := refusal(pol, conn, session_class(pol, cwd))):
+        ok, rule = False, why
     args = payload.get("tool_input")
     keys = sorted(str(k) for k in args)[:MAX_ARG_KEYS] if isinstance(args, dict) else []
     rec = {
@@ -240,9 +247,10 @@ def cmd_audit(args) -> int:
         with paths.pinned_by(args.pin):
             payload = json.loads(sys.stdin.read() or "{}")
             if not isinstance(payload, dict):
-                raise ValueError("payload is not an object")
-            ok, why = audit(payload, policy.load(Path(args.policy) if args.policy else None), os.environ)
-    except (ValueError, OSError, policy.PolicyError, WsError) as e:
+                raise TypeError("payload is not an object")
+            pol = policy.load(Path(args.policy) if args.policy else None, required=True)
+            ok, why = audit(payload, pol, os.environ)
+    except (ValueError, TypeError, OSError, policy.PolicyError, WsError) as e:
         print(f"ws connector: refused, the call could not be judged ({type(e).__name__})", file=sys.stderr)
         return DENY
     if not ok:
@@ -314,18 +322,27 @@ def cmd_launch(args) -> int:
         raise WsError("usage", "connectors are wired for Claude Code only", "ws connector launch -c NAME -- claude", 2)
     pol = policy.load()
     conns = pick(pol, args.connector or [], session_class(pol, os.getcwd()))
+    import signal
+
     from ws import selfcmd
 
     wiring = wire(conns, paths.state_dir() / "run" / "connectors", default_lessor())
+    before = signal.getsignal(signal.SIGTERM)
+    signal.signal(signal.SIGTERM, _terminated)  # a stopped launcher still releases its leases and its config
     try:
         argv = [*selfcmd.argv(), "gate", "launch", "--runner", "claude-code", "--", *cmd, *wiring.argv]
         argv += ["--allowedTools", ",".join(wiring.tools)]
-        env = {**os.environ, AGENT_ENV: _agent_of(cmd)}
+        env = {**os.environ, AGENT_ENV: _agent_of(cmd), WIRED_ENV: ",".join(c.name for c in conns)}
         return subprocess.run(argv, env=env, check=False).returncode
     finally:
+        signal.signal(signal.SIGTERM, before)
         release(wiring)
         with contextlib.suppress(OSError):
             Path(wiring.argv[1]).unlink()
+
+
+def _terminated(signum, frame) -> None:
+    raise SystemExit(128 + signum)
 
 
 def register(sub) -> None:

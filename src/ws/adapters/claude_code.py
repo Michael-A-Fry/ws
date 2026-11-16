@@ -743,7 +743,7 @@ def build_command(job, run_dir: Path, lease) -> tuple[list[str], dict[str, str]]
     env = jobs.extra_env(job)  # first: what ws sets below always wins
     if names := jobs.string_list(job, "connectors"):
         argv, tools = _connectors(job, names, run_dir, argv, tools)
-        env[connectors.AGENT_ENV] = job.name
+        env.update({connectors.AGENT_ENV: job.name, connectors.WIRED_ENV: ",".join(dict.fromkeys(names))})
     if tools:
         argv += ["--allowedTools", ",".join(tools)]
     env.update(DISABLE_AUTOUPDATER="1", CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1", **MCP_WAIT_ENV)
@@ -766,7 +766,19 @@ def _connectors(job, names: list[str], run_dir: Path, argv: list[str], tools: li
         wiring = connectors.wire(conns, run_dir / "gate", connectors.default_lessor(ttl_s=ttl))
     except WsError as e:
         raise ValueError(f"runner_options.connectors: {e.message}") from e
+    _RUN_LEASES[str(run_dir)] = wiring.leases
     return [*argv, *wiring.argv], tools
+
+
+_RUN_LEASES: dict[
+    str, list
+] = {}  # run folder -> the connector leases its command took (ws.run releases and redacts them)
+
+
+def run_leases(run_dir: Path) -> list:
+    """The connector leases `build_command` took for this run, handed over once: ws.run releases them when the run
+    ends and keeps their addresses out of what it stores, as for its own leases."""
+    return _RUN_LEASES.pop(str(run_dir), [])
 
 
 def _int(v) -> int | None:

@@ -830,7 +830,8 @@ _WRITE_VERBS = frozenset(
     {
         *("write", "create", "update", "delete", "remove", "set", "put", "post", "send", "insert", "drop", "exec"),
         *("execute", "run", "move", "rename", "patch", "edit", "add", "upsert", "replace", "import", "transfer"),
-        *("pay", "approve", "cancel"),
+        *("pay", "approve", "cancel", "submit", "publish", "save", "upload", "trigger", "invoke", "merge", "refund"),
+        *("withdraw", "append", "clear", "reset", "revoke", "grant", "deposit", "commit", "push", "apply"),
     }
 )
 _TOOL_NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
@@ -844,9 +845,10 @@ def _connectors(raw, classes: dict[str, Class]) -> dict[str, Connector]:
     out: dict[str, Connector] = {}
     for name, body in raw.items():
         where = f"[connectors.{name}] "
-        if not NAME_PATTERN.match(name) or "__" in name or name == "ws":
+        if not NAME_PATTERN.match(name) or "__" in name or name == "ws" or name[0] == "_" or name[-1] == "_":
             raise PolicyError(
-                f"[connectors]: {name!r} is not a usable server name (letters, digits, _ and -, no __, not ws)"
+                f"[connectors]: {name!r} is not a usable server name (letters, digits, _ and -; no __, no _ at either "
+                "end, not ws)"
             )
         body = _table(body, where.strip(), {"url", "command", "class", "read_only", "token", "tools", "description"})
         url = _get(body, "url", str, where, "")
@@ -855,6 +857,10 @@ def _connectors(raw, classes: dict[str, Class]) -> dict[str, Connector]:
             raise PolicyError(f"{where}give exactly one of url (an http or https address) or command (a list)")
         if url:
             u = urllib.parse.urlsplit(url)
+            try:
+                u.port  # noqa: B018 (a port past 65535, or not a number, raises here)
+            except ValueError:
+                raise PolicyError(f"{where}url has a port that is not a number from 0 to 65535") from None
             if u.scheme not in ("http", "https") or not u.hostname or u.username or u.password or u.fragment:
                 raise PolicyError(f"{where}url must be http:// or https://, with a host and no user or #fragment")
         token = _get(body, "token", str, where, "")
@@ -874,9 +880,11 @@ def _connectors(raw, classes: dict[str, Class]) -> dict[str, Connector]:
         if not tools:
             raise PolicyError(f"{where}tools must name at least one tool the connector may call")
         for t in tools:
-            if not (_TOOL_NAME.match(t) or (not read_only and t == "*")):
+            if not ((_TOOL_NAME.match(t) and t[0] != "_") or (not read_only and t == "*")):
                 raise PolicyError(f"{where}tools: {t!r} is not a tool name (letters, digits, _ . -)")
+            # a heuristic on the name's words (and their plurals): the allowlist is the control, this catches slips
             words = {w.lower() for w in re.split(r"[^A-Za-z0-9]+|(?<=[a-z])(?=[A-Z])", t) if w}
+            words |= {w[:-1] for w in words if w.endswith("s")} | {w[:-2] for w in words if w.endswith("es")}
             if read_only and words & _WRITE_VERBS:
                 raise PolicyError(
                     f"{where}tools: {t!r} sounds like it changes something, and the connector is read_only "

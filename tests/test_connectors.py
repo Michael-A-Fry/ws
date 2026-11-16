@@ -76,7 +76,7 @@ def test_the_gate_allows_a_listed_tool_and_still_asks_for_another(tmp_path):
         ('url = "https://a.test/"\ncommand = ["x"]\ntools = ["a"]', "exactly one"),
         ('tools = ["a"]', "exactly one"),
         ('url = "ftp://a.test/"\ntools = ["a"]', "http"),
-        ('url = "https://u:p@a.test/"\ntools = ["a"]', "no user"),
+        ('url = "https://u:p' + chr(64) + 'a.test/"\ntools = ["a"]', "no user"),
         ('url = "http://a.test/"\ntoken = "T"\ntools = ["a"]', "https"),
         ('command = ["srv"]\ntoken = "T"\ntools = ["a"]', "own auth"),
         ('url = "https://a.test/"\ntoken = "sk-live 123"\ntools = ["a"]', "never a value"),
@@ -169,15 +169,17 @@ def test_allowed_tools_gain_the_allowlist_and_may_not_go_past_it(tmp_path):
 # --- the audit hook ----------------------------------------------------------------------------------------------------
 
 
-def payload(tool: str, **args) -> dict:
-    return {"tool_name": tool, "tool_input": args, "session_id": "s1", "hook_event_name": "PreToolUse"}
+def payload(tool: str, cwd: Path | None = None, **args) -> dict:
+    p = {"tool_name": tool, "tool_input": args, "session_id": "s1", "hook_event_name": "PreToolUse"}
+    return {**p, "cwd": str(cwd)} if cwd else p
 
 
 def test_each_call_is_one_line_with_names_not_values(tmp_path):
     pol = pol_of(tmp_path)
-    env = {connectors.AGENT_ENV: "planner"}
-    assert connectors.audit(payload("mcp__ledger__balances", account="ACME-SECRET-42"), pol, env) == (True, "")
-    ok, why = connectors.audit(payload("mcp__ledger__pay_bill", amount=10), pol, env)
+    env = {connectors.AGENT_ENV: "planner", connectors.WIRED_ENV: "ledger"}
+    here = tmp_path / "planner"
+    assert connectors.audit(payload("mcp__ledger__balances", here, account="ACME-SECRET-42"), pol, env) == (True, "")
+    ok, why = connectors.audit(payload("mcp__ledger__pay_bill", here, amount=10), pol, env)
     assert not ok and "pay_bill" in why
     assert connectors.audit(payload("mcp__other__thing"), pol, env) == (True, "")  # not a connector's: no line
     lines = jsonl.read(connectors.log_path())
@@ -201,6 +203,7 @@ def test_a_line_that_cannot_be_written_is_a_deny(tmp_path, monkeypatch):
 
 
 def test_the_hook_command_fails_closed(tmp_path, monkeypatch, capsys):
+    (tmp_path / "planner").mkdir()
     policy.policy_path().parent.mkdir(parents=True, exist_ok=True)
     policy.policy_path().write_text(classes(tmp_path) + HTTP, encoding="utf-8")
     pin = paths.pin_of().args()[1::2]
@@ -210,6 +213,8 @@ def test_the_hook_command_fails_closed(tmp_path, monkeypatch, capsys):
 
     a = A()
     a.pin, a.policy = pin, None
+    monkeypatch.setenv(connectors.WIRED_ENV, "ledger")
+    monkeypatch.chdir(tmp_path / "planner")
     for text, code in [
         (json.dumps(payload("mcp__ledger__balances")), 0),
         (json.dumps(payload("mcp__ledger__pay_bill")), 2),
@@ -306,18 +311,16 @@ def test_launch_wires_gate_launch_and_cleans_up(tmp_path, monkeypatch):
 
     monkeypatch.setattr(connectors.subprocess, "run", run)
 
-    class A:
-        connector = ["ledger"]
-        cmd = ["--", "claude", "--agent", "finance"]
-
-    assert connectors.cmd_launch(A()) == 0
+    a = type("A", (), {})()
+    a.connector, a.cmd = ["ledger"], ["--", "claude", "--agent", "finance"]
+    assert connectors.cmd_launch(a) == 0
     assert seen["argv"][seen["argv"].index("gate") : seen["argv"].index("gate") + 4] == [
         "gate", "launch", "--runner", "claude-code"
     ]  # fmt: skip
     assert seen["agent"] == "finance" and released == ["l1"] and not seen["cfg"].exists()
-    A.cmd = ["--", "opencode"]
+    a.cmd = ["--", "opencode"]
     with pytest.raises(WsError, match="Claude Code only"):
-        connectors.cmd_launch(A())
+        connectors.cmd_launch(a)
 
 
 def test_no_secret_value_or_lease_token_reaches_the_audit_log(tmp_path):
@@ -325,3 +328,56 @@ def test_no_secret_value_or_lease_token_reaches_the_audit_log(tmp_path):
     connectors.audit(payload("mcp__ledger__balances", q="x"), pol_of(tmp_path), {})
     text = connectors.log_path().read_text(encoding="utf-8")
     assert "LEDGER_TOKEN" not in text and "/l/TOKEN" not in text
+
+
+def test_the_hook_refuses_a_listed_tool_in_a_session_ws_did_not_wire_or_whose_class_may_not_read(tmp_path):
+    pol = pol_of(tmp_path)
+    ok, why = connectors.audit(payload("mcp__ledger__balances", tmp_path / "planner"), pol, {})
+    assert not ok and "not wired" in why  # a server named ledger that the person's own config brought
+    wired = {connectors.WIRED_ENV: "ledger"}
+    ok, why = connectors.audit(payload("mcp__ledger__balances", tmp_path / "other"), pol, wired)
+    assert not ok and "may not read" in why
+    assert [x["decision"] for x in jsonl.read(connectors.log_path())] == ["deny", "deny"]
+
+
+def test_the_hook_refuses_when_its_policy_file_is_gone(tmp_path, monkeypatch):
+    a = type("A", (), {})()
+    a.pin, a.policy = paths.pin_of().args()[1::2], str(tmp_path / "gone.toml")
+    monkeypatch.setattr("sys.stdin", __import__("io").StringIO(json.dumps(payload("mcp__ledger__balances"))))
+    assert connectors.cmd_audit(a) == 2
+
+
+def test_a_jobs_leases_are_handed_to_the_run_to_release(tmp_path, monkeypatch):
+    (tmp_path / "planner").mkdir()
+    policy.policy_path().parent.mkdir(parents=True, exist_ok=True)
+    policy.policy_path().write_text(classes(tmp_path) + HTTP, encoding="utf-8")
+    monkeypatch.setattr(connectors, "default_lessor", lambda ttl_s=None, sock=None: fake_lessor([]))
+    run_dir = tmp_path / "runs" / "r2"
+    (run_dir / "gate").mkdir(parents=True)
+    _, env = claude_code.build_command(job_in(tmp_path / "planner"), run_dir, None)
+    assert env[connectors.WIRED_ENV] == "ledger"
+    assert [x.lease for x in claude_code.run_leases(run_dir)] == ["l1"] and claude_code.run_leases(run_dir) == []
+
+
+@pytest.mark.parametrize(
+    ("extra", "says"),
+    [
+        ('[connectors.c_]\ncommand = ["x"]\ntools = ["a"]\n', "server name"),
+        ('[connectors.c]\ncommand = ["x"]\ntools = ["_t"]\n', "not a tool name"),
+        ('[connectors.c]\nurl = "https://a.test:99999/"\ntools = ["a"]\n', "port"),
+        ('[connectors.c]\ncommand = ["x"]\ntools = ["submits"]\n', "read_only"),
+    ],
+)
+def test_names_that_would_be_ambiguous_or_wrong_are_refused(tmp_path, extra, says):
+    with pytest.raises(policy.PolicyError, match=says):
+        pol_of(tmp_path, extra)
+
+
+def test_allowed_tools_may_not_name_the_whole_server(tmp_path):
+    conns = list(pol_of(tmp_path).connectors.values())
+    with pytest.raises(ValueError, match="mcp__ledger "):
+        connectors.narrow(conns, ["mcp__ledger"])
+    wide = list(
+        pol_of(tmp_path, '[connectors.w]\ncommand = ["x"]\nread_only = false\ntools = ["*"]\n').connectors.values()
+    )
+    assert "mcp__w__anything" in connectors.narrow(wide, ["mcp__w__anything"])

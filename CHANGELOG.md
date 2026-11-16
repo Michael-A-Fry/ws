@@ -35,7 +35,9 @@ body of the GitHub release.
   session id or tool name), a guard that speaks after a call names itself, the live file turns over at 5 MiB instead of
   1 MiB, and a hook waits at most 0.2 seconds for the log's lock.
 - The pre-push hook runs the suite through `WS_PREPUSH_WRAP` when it's set (a command that queues test runs on a busy
-  machine), so a push's suite doesn't race the others. Unset, it runs as before.
+  machine), so a push's tests don't race the others.
+- The pre-push hook runs the tests a change can affect (`scripts/affected_tests.py`), not the whole suite, which CI runs
+  and requires. A big or reach-everything change runs a capped set (300 s); `WS_PREPUSH_FULL=1` runs everything.
 
 ### Changed
 

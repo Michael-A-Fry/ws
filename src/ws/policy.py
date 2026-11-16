@@ -407,7 +407,7 @@ def default_deny_commands() -> list[str]:
     out += ["git -* push* :*"]
     # A shell writing a file that holds secrets (`.env`, `.env.local`, ...): a redirect to it, or `tee` into it.
     for name in SECRET_ENV_FILES:
-        out += [f"*> {name}", f"*>> {name}", f"*>{name}", f"*>*/{name}", f"*>>*/{name}", f"tee*{name}"]
+        out += [f"*>*{name}", f"tee*{name}"]  # `>*` covers `>`, `>>` and a path in front of the name
     out += ["mkfs*", "dd*of=/dev/*"]
     # A shell reading its script from stdin is the end of `curl ... | sh` (and of `echo ... | sh`). Written as a
     # plain command so the runner's own deny list, which splits pipes, catches it too.

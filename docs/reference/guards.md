@@ -161,12 +161,13 @@ words = ["on trunk", "merged into trunk", "merged to trunk", "pushed to trunk"] 
 ref = "origin/trunk"                       # optional
 release_dir = "~/releases"                 # optional: release claims are off without it
 release_tags = ["v[0-9]+[.][0-9]+([.][0-9]+)*"]   # optional: the shapes of a release name
-repos = ["~/code/other-repo"]              # optional: more repositories a claim may be about
+repos = ["~/code/other-repo"]              # optional: other repositories whose default branch can vouch for a commit
 ```
 
-A commit that isn't on the ref in the session's own repository is looked for in the other repositories the message
-names (an absolute or `~/` path written in it) and in `repos`, each against its own default branch (or `ref`). It passes
-when one of them has it there; a commit none has still denies the message.
+A commit that isn't on the ref in the session's own repository is looked for in the repositories in `repos` (never in
+a folder the message names). A listed repository vouches only when its `origin` is a URL, its `origin/HEAD` names the
+branch the message claims, and the commit is on that remote-tracking branch; a clone of a clone, a repository with no
+remote and one with only a local branch never do. A commit none has still denies the message.
 
 A claim is a phrase from `words` (whole words, any case) and the commit-like token it's about: 7 to 40 lower-case hex
 characters with at least one digit and one of `a` to `f`. A token belongs to a phrase when it sits inside it (`merged

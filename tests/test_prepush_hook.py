@@ -282,6 +282,29 @@ def test_a_capped_set_that_hits_the_cap_fails_the_push(tmp_path):
         tmp_path, {"pyproject.toml": "x = 1\n"}, {"WS_PREPUSH_CAP": "1"}, fake_uv=False, expect_rc=124, expect_log=False
     )
     assert "is not a pass" in err
+    assert "its 1 s cap" in err
+    assert "WS_PREPUSH_CAP=<seconds>" in err
+
+
+@pytest.mark.skipif(not shutil.which("timeout"), reason="needs timeout")
+def test_the_cap_is_300_s_at_least_and_grows_6_s_a_file(tmp_path):
+    (tmp_path / "small").mkdir()
+    (tmp_path / "big").mkdir()
+    (tmp_path / "set").mkdir()
+    _, err = run_selected(tmp_path / "small", {"pyproject.toml": "x = 1\n"})
+    assert "timeout 300 uv " in err
+    new_tests = {f"tests/test_new{i}.py": "def test_x():\n    pass\n" for i in range(70)}
+    _, err = run_selected(tmp_path / "big", {"pyproject.toml": "x = 1\n", **new_tests})
+    assert "timeout 438 uv " in err  # 3 smoke + 70 new files = 73 files
+    _, err = run_selected(tmp_path / "set", {"pyproject.toml": "x = 1\n", **new_tests}, {"WS_PREPUSH_CAP": "77"})
+    assert "timeout 77 uv " in err
+
+
+@pytest.mark.skipif(not shutil.which("timeout"), reason="needs timeout")
+def test_the_cap_stops_growing_at_1800_s(tmp_path):
+    new_tests = {f"tests/test_new{i}.py": "def test_x():\n    pass\n" for i in range(320)}
+    _, err = run_selected(tmp_path, {"pyproject.toml": "x = 1\n", **new_tests})
+    assert "timeout 1800 uv " in err
 
 
 @pytest.mark.skipif(not shutil.which("timeout"), reason="needs timeout")

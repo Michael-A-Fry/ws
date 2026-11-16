@@ -6,7 +6,8 @@
 # and is required to merge. A change that maps to more than 40 test files, or touches a path that reaches every test
 # (pyproject.toml, uv.lock, a conftest.py, tests/plugins/, .github/), runs a capped set instead: the smoke set, every
 # changed or added test and the tests importing a changed module directly, stopped after WS_PREPUSH_CAP seconds
-# (default 300, counted from when the tests start, after any wrapper; it needs `timeout`, which macOS lacks by default,
+# (default 6 s a file, at least 300 and at most 1800; counted from when the tests start, after any wrapper; it needs
+# `timeout`, which macOS lacks by default,
 # so there the capped set has no cap). A capped set that hits the cap fails the push: raise WS_PREPUSH_CAP, or skip the
 # hook, and CI runs the rest. Nothing mapped runs the smoke set, never zero; a selector that fails runs the smoke set
 # plus the changed tests and the tests named for a changed module. The change is HEAD against origin/main, not the refs
@@ -103,8 +104,15 @@ else
   suite+=("${targets[@]}")
   if [[ "$kind" == CAPPED* ]]; then
     suite+=(-x) # the first failure ends the capped run, so the cap never hides one
+    # the cap only has to catch a hang, so it grows with the set: 6 s a file, at least 300 s, at most 1800 s
+    cap="${WS_PREPUSH_CAP:-}"
+    if [[ -z "$cap" ]]; then
+      cap=$((${#targets[@]} * 6))
+      ((cap < 300)) && cap=300
+      ((cap > 1800)) && cap=1800
+    fi
     if command -v timeout >/dev/null 2>&1; then
-      limit=(timeout "${WS_PREPUSH_CAP:-300}")
+      limit=(timeout "$cap")
     fi
   fi
   echo "pre-push: $kind: ${#targets[@]} test file(s); CI runs the whole suite (WS_PREPUSH_FULL=1 runs it here)" >&2
@@ -131,7 +139,7 @@ echo "pre-push: ${suite[*]}" >&2
 rc=0
 "${suite[@]}" >&2 || rc=$?
 if [[ "$rc" == 124 && "${#limit[@]}" != 0 ]]; then
-  echo "pre-push: the capped set hit the ${WS_PREPUSH_CAP:-300} s cap before it finished, so it is not a pass." >&2
-  echo "pre-push: raise WS_PREPUSH_CAP, or WS_SKIP_PREPUSH=1 (logged); CI runs the whole suite." >&2
+  echo "pre-push: the capped set hit its ${cap} s cap before it finished, so it is not a pass." >&2
+  echo "pre-push: raise it with WS_PREPUSH_CAP=<seconds>, or WS_SKIP_PREPUSH=1 (logged); CI runs the whole suite." >&2
 fi
 exit "$rc"

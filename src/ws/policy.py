@@ -147,6 +147,7 @@ MCP_SHIPPED = (
     "mcp__ws__msg_ack",
     "mcp__ws__msg_list",
 )
+_PERSON_NAME = re.compile(r"^person:[A-Za-z0-9._-]{1,64}$")
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")  # a usable class, guard or role name: letters, digits, `_` and `-`
 _HOST = re.compile(r"^(\*\.)?[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?$")
 _CATCH_ALL = ("0.0.0.0", "0", "::", "*")  # an entry that names every address, however it is spelled
@@ -359,6 +360,14 @@ class Autonomy:
 
 
 @dataclass(frozen=True)
+class Msg:
+    """`[msg]`: `person_send` lets the person who owns this account send a `ws msg` from outside any session (ADR 0023,
+    "A person sends"). Off by default; off is the whole rollback."""
+
+    person_send: bool = False
+
+
+@dataclass(frozen=True)
 class Policy:
     schema: int
     dial: str
@@ -371,6 +380,7 @@ class Policy:
     budget_purposes: dict[str, float] = field(default_factory=dict)  # purpose -> monthly USD cap (UTC calendar month)
     autonomy: Autonomy = Autonomy()
     egress_exceptions: tuple[EgressException, ...] = ()
+    msg: Msg = Msg()
 
 
 @dataclass(frozen=True)
@@ -456,7 +466,20 @@ outward = []
 [gate]
 deny_commands = {arr(default_deny_commands())}
 # Paths no session may read. `~/` is your home; `**` crosses folders.
-deny_read = ["~/.ssh/**", "~/.gnupg/**", "~/.aws/credentials", "~/.config/ws/secrets/**", "~/.local/share/ws/secrets/**"]
+deny_read = [
+  "~/.ssh/**", "~/.gnupg/**", "~/.aws/credentials", "~/.config/ws/secrets/**", "~/.local/share/ws/secrets/**",
+  # a project's local secrets (a bare name matches at any depth; `.env.example` stays readable)
+  ".env", ".env.local", ".env.*.local", ".env.development", ".env.production", ".env.staging", ".env.test", ".envrc",
+  # signed-in browser profiles: cookies and saved logins (Linux, snap, Flatpak, macOS)
+  "~/.config/google-chrome/**", "~/.config/google-chrome-beta/**", "~/.config/chromium/**", "~/.config/vivaldi/**",
+  "~/.config/BraveSoftware/**", "~/.config/microsoft-edge/**", "~/.mozilla/**", "~/snap/firefox/common/.mozilla/**",
+  "~/snap/chromium/**", "~/.var/app/*/config/**", "~/Library/Application Support/Google/Chrome/**",
+  "~/Library/Application Support/Google/Chrome Beta/**", "~/Library/Application Support/Firefox/**",
+  "~/Library/Application Support/BraveSoftware/**", "~/Library/Application Support/Microsoft Edge/**",
+  "~/Library/Application Support/Vivaldi/**",
+  # the GitHub CLI's stored token (a session uses the broker's short-lived one)
+  "~/.config/gh/hosts.yml",
+]
 # Neutral tool names to switch off: {", ".join(KNOWN_TOOLS)}. An allowed web tool counts as a way out (leg C). An MCP
 # tool is named as `mcp__SERVER__TOOL`, and a glob works (`mcp__SERVER__*`, `mcp__*__delete_*`).
 deny_tools = []
@@ -667,6 +690,7 @@ def loads(text: str) -> Policy:
             "budget",
             "autonomy",
             "egress_exceptions",
+            "msg",
         },
     )
     schema = raw.get("schema", SCHEMA)
@@ -778,6 +802,10 @@ def loads(text: str) -> Policy:
         expires = _expires(e["expires"], where) if "expires" in e else None
         exceptions.append(RuleException(e["name"], e["job"], covered, e["reason"], owner, expires))
     classes = _classes(raw.get("classes", {}))
+    msg_table = _msg(raw.get("msg", {}))
+    for c in classes.values():
+        if not msg_table.person_send and any(n.startswith("person:") for n in c.inbound_allow):
+            raise PolicyError(f"[classes.{c.name}] inbound_allow names a person: set [msg] person_send = true first")
     return Policy(
         schema,
         dial,
@@ -790,6 +818,7 @@ def loads(text: str) -> Policy:
         _purposes(raw.get("budget", {})),
         _autonomy(raw.get("autonomy", {})),
         _egress_exceptions(raw.get("egress_exceptions", []), classes),
+        msg_table,
     )
 
 
@@ -849,6 +878,17 @@ def _plain_names(d: dict, key: str, where: str) -> tuple[str, ...]:
     return items
 
 
+def _allow_names(body: dict, where: str) -> tuple[str, ...]:
+    """`inbound_allow`: plain names, or `person:<account user>` (the sender `ws msg` records for a person's own send)."""
+    items = _strings(body, "inbound_allow", where)
+    for item in items:
+        if not (NAME_PATTERN.fullmatch(item) or _PERSON_NAME.fullmatch(item)):
+            raise PolicyError(
+                f"{where}inbound_allow: {item!r} is not a plain name (letters, digits, _ and -) or person:<user>"
+            )
+    return items
+
+
 def _classes(raw) -> dict[str, Class]:
     """`[classes.NAME]`: each table is checked whole; the readable_by names are checked once all the names are known."""
     if not isinstance(raw, dict):
@@ -898,7 +938,7 @@ def _classes(raw) -> dict[str, Class]:
         inbound = _get(body, "inbound", str, where, "lead-only" if access == "full" else "off")
         if inbound not in INBOUND:
             raise PolicyError(f"{where}inbound must be one of {', '.join(INBOUND)}, not {inbound!r}")
-        allow = _plain_names(body, "inbound_allow", where)
+        allow = _allow_names(body, where)
         if inbound == "allowlist" and not allow:
             raise PolicyError(f"{where}inbound_allow is required (at least one name) when inbound is allowlist")
         if inbound != "allowlist" and allow:
@@ -1019,6 +1059,12 @@ def _autonomy(raw) -> Autonomy:
     if when not in AUTONOMY_INTERRUPTS:
         raise PolicyError(f"[autonomy] interrupts must be one of {', '.join(AUTONOMY_INTERRUPTS)}, not {when!r}")
     return Autonomy(level, when, tuple(dict.fromkeys(_plain_names(t, "always_ask", "[autonomy] "))))
+
+
+def _msg(raw) -> Msg:
+    """`[msg]`: `person_send` (true or false)."""
+    t = _table(raw, "[msg]", {"person_send"})
+    return Msg(_get(t, "person_send", bool, "[msg] ", False))
 
 
 GUARD_MODES = ("enforce", "log")
@@ -1938,6 +1984,8 @@ def _ws_admin(canon: list[str], xargs: bool = False, read_anywhere: bool = False
             return "ws under xargs is not for a gated session: the pipe decides its words, so they can't be read"
         if sub[:1] == ["gate"] and gate_words & set(rest):
             return "ws gate generate/init is not for a gated session: it would rewrite its own gate"
+        if tuple(sub[:2]) in agentsession.SESSION_OK:
+            continue
         if sub[:1] == ["secret"] and agentsession.session_secret_words(rest, os.environ):
             continue  # the two exact forms a session may run (ws.agentsession)
         if sub[:1] and sub[0] in agentsession.ADMIN:

@@ -8,9 +8,10 @@ commands.
 The file is loaded whole or refused. An unknown key, a wrong type or a bad value stops the load, and the message names the
 key. The gate then denies every call (it fails closed). The schema is `1`.
 
-The tables `[classes]`, `[budget.purposes]` and `[autonomy]`, and the `owner` and `expires` keys of `[[exceptions]]`, are
-newer than the rest. A policy that leaves them out loads exactly as before. An older ws refuses a policy that uses them,
-because it doesn't know the keys: that's the intended fail-closed behaviour, so update ws before you add them.
+The tables `[classes]`, `[connectors]`, `[budget.purposes]` and `[autonomy]`, and the `owner` and `expires` keys of
+`[[exceptions]]`, are newer than the rest. A policy that leaves them out loads exactly as before. An older ws refuses a
+policy that uses them, because it doesn't know the keys: that's the intended fail-closed behaviour, so update ws before
+you add them.
 
 ## Top-level keys
 
@@ -286,6 +287,28 @@ Which class is a folder in (`class_of(policy, path)` in `src/ws/policy.py`):
   file's order never matters.
 - If none matches, the folder is `unclassified`: `counts-only`, nothing inbound, readable by nobody, no hosts. A path
   ws can't read as a path is `unclassified` too.
+
+## `[connectors.NAME]`
+
+A zone's MCP server that a job or a session may plug in, the way you'd plug in a third-party app. `NAME` is the MCP
+server name, so its tools reach the runner as `mcp__NAME__TOOL`: letters, digits, `_` and `-`, no `__`, and not `ws`. A
+job names it in `runner_options.connectors`; a person starts a session with it through
+[`ws connector launch`](cli.md#ws-connector-launch). See [Plug in a zone MCP server](../how-to/plug-in-zone-mcp.md).
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `url` | text | none | The server's address, `https://` (or `http://127.0.0.1` for a server on this machine). Streamable HTTP. Give `url` or `command`, not both. |
+| `command` | list of text | none | A stdio server: the program and its arguments. It looks after its own auth. |
+| `class` | text | none | The data class of what it returns, a name from `[classes]`. A session of another class gets it only when that class's `readable_by` names the session's class. With none, any session may have it. |
+| `read_only` | true or false | `true` | Refuses a tool whose name has a word that says it changes something (`create`, `update`, `delete`, `send`, `pay` and the like) and the `*` wildcard. It reads the name only, so it catches slips, not a server that lies: make the server itself read-only too. Setting it to `false` is a reviewed change. |
+| `token` | text | none | The name of the secret that opens the server (`url` only), never a value. The registry entry allows it at the url's host; the runner reaches the server through a [broker](../explanation/broker.md) lease, so it never holds the token. Only over `https`, or to `127.0.0.1`. |
+| `tools` | list of text | required | The allowlist, bare tool names. At least one. |
+| `description` | text | `""` | A line for `ws connector list`. |
+
+The gate allows `mcp__NAME__TOOL` for each listed tool as if [`allow_mcp`](#gate) named it (on top of the shipped
+`mcp__ws__*` names when the policy has no `allow_mcp` of its own); `deny_tools` still wins. Any other tool of the server
+is refused by the connector's own hook, and every call, allowed or refused, is a line in
+[`logs/connector-calls.jsonl`](stores.md#json-lines-logs).
 
 ## `[budget.purposes]`
 

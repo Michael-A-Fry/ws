@@ -316,6 +316,13 @@ KINDS: dict[str, Kind] = dict(
             ("schema", "ts", "at", "runner", "session", "ref"),
         ),
         _logrow("verdict", "gate", "Gate verdicts", _state("logs", "gate")),
+        _logrow(
+            "connector-call",
+            "connectors",
+            "Connector calls",
+            _state("logs", "connector-calls"),
+            ("schema", "ts", "agent", "session", "connector", "tool", "decision", "rule"),
+        ),
         _logrow("wall-report", "sandbox", "Wall report", _state("logs", "wall-report")),
         _logrow(
             "footprint",
@@ -365,6 +372,7 @@ LINK_SPEC: dict[str, tuple[tuple[str, str, str], ...]] = {
     "guard-record": (("about", "session", "session"),),
     "identity": (("about", "session", "id"),),
     "ask": (("about", "session", "session"),),
+    "connector-call": (("about", "session", "session"),),
     "row": (("about", "area", "area"), ("used", "row", "needs")),
     "area": (("supersedes", "area", "supersedes"),),
     **{

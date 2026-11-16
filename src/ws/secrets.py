@@ -134,12 +134,38 @@ def socket_path(env: dict | None = None, cfg: dict | None = None) -> Path:
     return paths.state_dir(env) / "run" / "broker.sock"
 
 
-def load_registry(path: Path) -> dict[str, Entry]:
-    """The registry. A missing file is an empty registry; a file that does not parse, or a bad entry, raises."""
+class RegistryUntrusted(SecretsError):
+    """The registry file could be changed by someone other than its reader: owned by another user, or group or world
+    writable. The broker refuses it whole (code `registry_untrusted`) rather than trust the names and hosts in it."""
+
+    kind = "untrusted"
+
+
+def registry_problem(st: os.stat_result, owner_uid: int) -> str | None:
+    """Why a registry with this stat cannot be trusted by `owner_uid`, or None. Root's file is trusted too."""
+    if st.st_uid not in (owner_uid, 0):
+        return f"it belongs to uid {st.st_uid}, not the broker's user or root"
+    if st.st_mode & 0o022:
+        return f"it can be written by group or others (mode {st.st_mode & 0o777:04o}; run chmod go-w on it)"
+    return None
+
+
+def load_registry(path: Path, owner_uid: int | None = None) -> dict[str, Entry]:
+    """The registry. A missing file is an empty registry; a file that does not parse, or a bad entry, raises.
+    With `owner_uid` (the broker's), a file owned by another user or open to group or world writes raises
+    RegistryUntrusted. The check is on the opened file, so a swap between the check and the read cannot slip past."""
     if not path.is_file():
         return {}
     try:
-        raw = tomllib.loads(path.read_text(encoding="utf-8"))
+        if owner_uid is None:
+            text = path.read_text(encoding="utf-8")
+        else:
+            with path.open("rb") as f:
+                why = registry_problem(os.fstat(f.fileno()), owner_uid)
+                if why:
+                    raise RegistryUntrusted(f"{path}: {why}")
+                text = f.read().decode("utf-8")
+        raw = tomllib.loads(text)
     except (tomllib.TOMLDecodeError, UnicodeDecodeError, OSError) as e:
         raise SecretsError(f"{path}: {e}") from e
     out: dict[str, Entry] = {}
@@ -349,14 +375,15 @@ def local_store(env: dict | None = None) -> Store:
     return Store(store_dir(env))
 
 
-def health(reg_path: Path, store: Store) -> tuple[list[str], int | None]:
+def health(reg_path: Path, store: Store, owner_uid: int | None = None) -> tuple[list[str], int | None]:
     """What is wrong with the registry and the store, as plain sentences (never a value), and the store's owner uid.
+    With `owner_uid`, a registry that user could not trust (load_registry) is a problem too.
     Raises PermissionError if the store belongs to another user: the caller then asks the broker."""
     problems = []
     if not reg_path.is_file():
         problems.append(f"no registry at {reg_path}")
     try:
-        reg = load_registry(reg_path)
+        reg = load_registry(reg_path, owner_uid=owner_uid)
     except SecretsError as e:
         problems.append(f"registry unreadable: {e}")
         reg = {}

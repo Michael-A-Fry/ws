@@ -719,6 +719,31 @@ def test_health_names_a_store_value_with_no_registry_row(tmp_path):
     assert wsecrets.unregistered(wsecrets.load_registry(s.registry), s.store) == ["orphan"]
 
 
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="POSIX owners and modes")
+def test_registry_b2_owner_and_mode_are_checked_only_when_an_owner_is_given(tmp_path):
+    p = tmp_path / "secrets.toml"
+    p.write_text('[ok]\nhosts = ["a.example.com"]\n')
+    me = os.geteuid()
+    for mode in (0o664, 0o646):
+        p.chmod(mode)
+        with pytest.raises(wsecrets.RegistryUntrusted, match="group or others"):
+            wsecrets.load_registry(p, owner_uid=me)
+        assert "ok" in wsecrets.load_registry(p), "a reader that names no owner reads it as before"
+    p.chmod(0o644)
+    assert "ok" in wsecrets.load_registry(p, owner_uid=me)
+    with pytest.raises(wsecrets.RegistryUntrusted, match="belongs to uid"):
+        wsecrets.load_registry(p, owner_uid=me + 12345)
+    assert (
+        issubclass(wsecrets.RegistryUntrusted, wsecrets.SecretsError) and wsecrets.RegistryUntrusted.kind == "untrusted"
+    )
+    assert wsecrets.load_registry(tmp_path / "missing.toml", owner_uid=me) == {}
+    st = os.stat_result((0o100644, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+    assert wsecrets.registry_problem(st, me) is None, "root's file is trusted"
+    p.chmod(0o664)
+    problems, _ = wsecrets.health(p, wsecrets.Store(tmp_path / "store"), owner_uid=me)
+    assert any("group or others" in x for x in problems)
+
+
 def test_the_stub_secrets_helper_plants_fresh_values_and_finds_leaks(tmp_path):
     s = StubSecrets(tmp_path)
     v = s.register("k", ["api.example.com"])

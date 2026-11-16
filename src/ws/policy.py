@@ -2271,11 +2271,11 @@ def _segment_once(
     if admin:
         return admin, line, []
     local_seg = seg  # the part of the line that runs here
-    if cmd == "ssh":
-        ssh_opts, ssh_host, ssh_remote = _ssh_argv(toks)
+    if (ssh_toks := _ssh_toks(cmd, toks)) is not None:
+        ssh_opts, ssh_host, ssh_remote = _ssh_argv(ssh_toks)
         if reason := _ssh_refusal(policy, ctx, ssh_opts, words[: max(0, len(words) - len(toks))]):
             return reason, line, []
-        cut, here = _ssh_remote(policy, seg, ssh_opts, ssh_host, ssh_remote, wrappers)
+        cut, here = _ssh_remote(policy, seg, ssh_opts, ssh_host, ssh_remote, wrappers | ({cmd} - {"ssh"}), redirs)
         if here:  # a remote command to this machine runs outside the wall: judged as the local command it is
             nested.append(" ".join(ssh_remote))
         if cut is not None:  # a single-quoted remote command to a named host: its words are not local file words
@@ -2508,6 +2508,10 @@ _SSH_KEYS = frozenset((*_SSH_FILE_KEYS, *_SSH_PLAIN.split()))
 _SSH_OPTION = re.compile(r"\s*([A-Za-z0-9]+)\s*(?:=\s*|\s+|\Z)(.*)", re.DOTALL)
 _SSH_ASKPASS = re.compile(r"SSH_ASKPASS(?:_REQUIRE)?=")
 _SSH_HOST = re.compile(r"(?:ssh://)?(?:[^@/]*@)?(\[[^\]]*\]|[^:/]*)")
+_SSH_RENAMES = re.compile(
+    r"\s*canonicali[sz]ehostname|\s*canonicaldomains", re.IGNORECASE
+)  # the host may become another
+_SSH_WRAPPERS = {"autossh": "M", "sshpass": "pfdP"}  # programs that run ssh, and their own options that take a value
 _SINGLE_QUOTED_END = re.compile(r"(?:\A|[ \t])'([^']*)'[ \t]*\Z")  # a last word written wholly in single quotes
 
 
@@ -2587,7 +2591,13 @@ def _named_host(policy: Policy, name: str) -> bool:
 
 
 def _ssh_remote(
-    policy: Policy, seg: str, opts: list[tuple[str, str]], host: str | None, remote: list[str], wrappers: set[str]
+    policy: Policy,
+    seg: str,
+    opts: list[tuple[str, str]],
+    host: str | None,
+    remote: list[str],
+    wrappers: set[str],
+    redirs: list[shellwords.Redirect],
 ) -> tuple[int | None, bool]:
     """How an ssh line's remote command is judged: (where the line ends without it, when it is read as remote; whether
     it runs on this machine, so it is judged as a local command too)."""
@@ -2604,17 +2614,50 @@ def _ssh_remote(
     names = [_ssh_host_name(h) for h in hosts]
     if any(_is_this_machine(n) for n in names):
         return None, bool(remote)
+    if (
+        wrappers & {"xargs", *_SSH_WRAPPERS}
+        or len(remote) != 1
+        or redirs
+        or any(_SSH_RENAMES.match(v) for o, v in opts if o == "o")
+    ):
+        return None, False
     m = _SINGLE_QUOTED_END.search(seg)
-    if "xargs" in wrappers or len(remote) != 1 or not m or m.group(1) != remote[0]:
+    # with no redirect, here-string or here-document anywhere on the line, the last word of the text is the last word
+    # the lexer gave, which is the remote command: a match of the text alone would also take a redirect's target
+    if not m or m.group(1) != remote[0] or re.search(r"[<>]", seg[: m.start(1)]):
         return None, False
     return (m.start(1) - 1, False) if all(_named_host(policy, n) for n in names) else (None, False)
 
 
+def _ssh_toks(cmd: str, toks: list[str]) -> list[str] | None:
+    """ssh's words when this command runs ssh: ssh itself, `autossh` (ssh's options and its own `-M`), or `sshpass`
+    before an ssh. None for any other command."""
+    if cmd == "ssh":
+        return toks
+    if cmd not in _SSH_WRAPPERS:
+        return None
+    own, out, i = _SSH_WRAPPERS[cmd], [], 1
+    while i < len(toks):
+        t = toks[i]
+        if cmd == "sshpass" and not (t.startswith("-") and len(t) > 1):
+            rest = toks[i:]
+            return rest if posixpath.basename(rest[0]) == "ssh" else None
+        if len(t) == 2 and t[0] == "-" and t[1] in own:
+            i += 2
+            continue
+        if not (len(t) > 2 and t[0] == "-" and t[1] in own):  # `-M20000`, `-pSECRET`: the wrapper's own, dropped
+            out.append(t)
+        i += 1
+    return None if cmd == "sshpass" else ["ssh", *out]
+
+
 def _ssh_refusal(policy: Policy, ctx: _Ctx, opts: list[tuple[str, str]], prefix: list[str]) -> str | None:
-    """A refusal for an ssh option that runs or loads a local program or file, or names a path deny_read covers."""
+    """A refusal for an ssh option that runs or loads a local program or file, names a path deny_read covers, or
+    writes to a path ws protects."""
     how = "; connect without it (put what it is for in a script file and run that)"
-    if any(_SSH_ASKPASS.match(w) for w in prefix) or "SSH_ASKPASS" in (ctx.vars or {}):
-        return f"ssh is given an askpass program, which runs on this machine and ws cannot read{how}"
+    held = "SSH_ASKPASS" in (ctx.vars or {}) or "SSH_ASKPASS" in ctx.unknown or ctx.distrust
+    if held or any(_SSH_ASKPASS.match(w) for w in prefix):
+        return f"ssh may be given an askpass program, which runs on this machine and ws cannot read{how}"
     for letter, value in opts:
         if letter == "F" and value not in ("none", "/dev/null"):
             return f"ssh -F loads a config file, which can run local programs ws cannot read{how}"
@@ -2627,12 +2670,15 @@ def _ssh_refusal(policy: Policy, ctx: _Ctx, opts: list[tuple[str, str]], prefix:
             key = m.group(1).lower() if m else ""
             if key not in _SSH_KEYS:
                 return f"ssh option {key or value!r} runs or loads a local program or file, or is not one ws knows{how}"
-            files = [m.group(2).strip().strip("\"'")] if key in _SSH_FILE_KEYS else []
+            files = [f.strip("\"'") for f in m.group(2).split()] if key in _SSH_FILE_KEYS else []  # a list, for some
         for f in files:
             if _HAS_PART.search(f) or "%" in f:
                 return f"ssh is given the file {f!r}, which holds a part ws cannot read; {HOW_TO_SPELL}"
             if rule := _read_hit(policy, f, ctx.cwd, expand=letter == "o"):
                 return f"command names a path denied by deny_read rule {rule!r}"
+            # ssh adds the host's key to its known-hosts file before it logs in: a write
+            if letter == "o" and key == "userknownhostsfile" and (hit := _under(ctx.protect, f, ctx.cwd)):
+                return f"command writes to {hit}, which ws protects (policy and generated gate)"
     return None
 
 

@@ -2330,3 +2330,45 @@ def test_a_host_a_class_names_counts_too(home):
     )
     assert policy.is_denied_command(pol, "ssh pve.example.org 'ls $X'") is None
     assert policy.is_denied_command(policy.default_policy(), "ssh pve.example.org 'ls $X'")
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "ssh pve.example.org '$HOME/.ws/policy.toml' > '$HOME/.ws/policy.toml'",
+        "ssh pve.example.org '$HOME/.ws/policy.toml' >> '$HOME/.ws/policy.toml'",
+        "ssh pve.example.org '$HOME/.ws/policy.toml' 2> '$HOME/.ws/policy.toml'",
+        "ssh pve.example.org 'cat $X' < ~/.ssh/id_rsa",
+        "ssh pve.example.org 'x' <<< 'x'",
+        "ssh pve.example.org > out 'ls $X'",
+        "ssh -o CanonicalizeHostname=yes -o CanonicalDomains=localhost pve.example.org 'ls $X'",
+        "sshpass -p x ssh pve.example.org 'ls $X'",
+        "autossh -M 0 pve.example.org 'ls $X'",
+    ],
+)
+def test_a_redirect_or_a_renamed_host_keeps_the_local_rules(named, home, cmd):
+    assert policy.is_denied_command(named, cmd, protect=(f"{home}/.ws/policy.toml",))
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "sshpass -p x ssh -oProxyCommand=bash host ls",
+        "sshpass -e ssh -o LocalCommand=x -o PermitLocalCommand=yes host ls",
+        "autossh -M 20000 -oProxyCommand=bash host",
+        "autossh -M20000 -F /tmp/evil host",
+        "printf -v SSH_ASKPASS /tmp/x; export SSH_ASKPASS; ssh host ls",
+        "export SSH_ASKPASS=/tmp/x; ssh host ls",
+    ],
+)
+def test_ssh_run_by_another_program_or_after_an_askpass_setting_is_judged(pol, home, cmd):
+    assert policy.is_denied_command(pol, cmd)
+
+
+def test_the_known_hosts_file_is_a_write(pol, home):
+    target = f"{home}/.ws/policy.toml"
+    cmd = f"ssh -o UserKnownHostsFile={target} host ls"
+    assert "protects" in policy.is_denied_command(pol, cmd, protect=(target,))
+    assert policy.is_denied_command(pol, "ssh -o UserKnownHostsFile=/tmp/kh host ls", protect=(target,)) is None
+    assert policy.is_denied_command(pol, "autossh -M 0 host ls") is None
+    assert policy.is_denied_command(pol, "sshpass -e ssh host ls") is None

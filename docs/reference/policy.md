@@ -159,13 +159,16 @@ ssh options that run or load local files are judged. An `-o` keyword runs only w
 here (`Port`, `User`, `ConnectTimeout`, `StrictHostKeyChecking` and the like); a proxy, local or known-hosts command,
 `Match`, a provider library, an agent or control socket, `SendEnv`, `SetEnv`, `Include` and any keyword ws doesn't
 know are refused. So are `-F` (other than `none`), `-I`, `-E` and an askpass program. The files ssh reads for a key,
-a certificate or a known-hosts list go through `deny_read`. ssh's escape characters need an interactive terminal,
+a certificate or a known-hosts list go through `deny_read`, and `UserKnownHostsFile`, which ssh writes to, through the
+protected-write check. ssh's escape characters need an interactive terminal,
 which a shell call doesn't have.
 
 A remote command runs on the far host, so `ssh pve.example.org 'ls $X'` isn't refused for `$X` when the policy names
 the host (`[gate] allow_hosts`, or a class's `allowed_hosts`) and the command is one word wholly in single quotes. The
 local rules still apply to anything else: double quotes or `$'...'` (the local shell expands those), unquoted words,
-a host the policy doesn't name, a host word with `$`, and `xargs ssh`. A remote command to this machine (loopback,
+a host the policy doesn't name, a host word with `$`, a line with any redirect, here-string or here-document, an
+`-o CanonicalizeHostname` or `CanonicalDomains` (the host can become another), and ssh run by `xargs`, `sshpass` or
+`autossh` (whose ssh options are judged as ssh's own). A remote command to this machine (loopback,
 `localhost` or its own name) runs outside the sandbox, so it's judged as the local command it is. ws doesn't read
 `~/.ssh/config`, so a named alias whose `HostName` is this machine is yours to avoid.
 

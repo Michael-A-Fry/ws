@@ -50,6 +50,13 @@ and quarantine rules, and the tier time report.
 The hooks that `prek` runs are listed in `.pre-commit-config.yaml`. CI also runs Vale (the Microsoft package) over the
 README, the docs and the policy files, for errors only; [`.vale.ini`](.vale.ini) sets it up.
 
+## Releasing
+
+Run the whole suite before you tag: `WS_PREPUSH_FULL=1 git push` runs it through the hook, or call
+`uv run --locked pytest -q` yourself. The pre-push hook alone runs only the tests a change can affect. The release
+workflow then runs the whole suite again (its `tests` job) before it builds or publishes anything, and a red suite stops
+the release.
+
 ## Pre-push hook
 
 The repo ships `.github/hooks/pre-push`. It runs `prek`, then the tests your change can affect, before a push leaves

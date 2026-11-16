@@ -71,6 +71,17 @@ one-time `sudo` steps that move the store to its own system user (`ws-broker`) a
 it. After that, the agent's user can't read the store at all. The wall is built for Linux with systemd. On macOS and
 WSL2 it's not built yet, and `ws doctor` (WS104) stays at warn.
 
+### Where values are read from
+
+By default the broker reads ws's own store (one 0600 file per name) and no vault is needed. An optional role,
+`[roles.secrets] adapter = "openbao"`, reads the same names from an OpenBao (or Vault) KV v2 mount instead
+(`addr`, `mount`, `prefix`, `token_file`; the token file must be mode 0600 and yours, and `http` is allowed for a loopback
+address only). Everything else is unchanged: registry, tiers, areas, run records, leases and the audit log. Values are
+written in OpenBao, and `ws secret set` refuses under that role. ws installs nothing for it.
+
+Swap note: another store is one module in `src/ws/roles/` with `read`, `names`, `loose` and `problems`. Go back to the
+default by removing the `adapter` line; values don't move by themselves.
+
 ## What the broker doesn't stop
 
 - **A same-user store.** Until you run the secret wall, a program running as you can read the store files. WS104 warns.
@@ -84,7 +95,7 @@ WSL2 it's not built yet, and `ws doctor` (WS104) stays at warn.
 - **A value used for its own host.** A lease lets a session make requests to the allowed host, so it can use the key
   there. Scope the registry to the narrowest host and purpose.
 - **Secrets the broker doesn't read yet.** The `sops-age` role is named in the profile and checked by `ws doctor`, but
-  the broker doesn't read from it. Use `ws-secret`.
+  the broker doesn't read from it. Use the default store, or the optional OpenBao role below.
 - **Notify caps.** The daily push cap counts ws's own sends only. Notify leases aren't counted in the broker.
 
 See [Known limits](known-limits.md).

@@ -259,6 +259,33 @@ ws secret set [-h] name
 |---|---|
 | `name` | A name registered in `secrets.toml`. |
 
+### `ws secret ask`
+
+Open a tmux window with a no-echo prompt for a registered name; the value goes straight to the store. Needs a tmux
+session. An AI session may run it (it shows no value). The older command `ws-secret` takes the same
+arguments.
+
+```text
+ws secret ask [-h] name
+```
+
+| Argument | Meaning |
+|---|---|
+| `name` | A name registered in `secrets.toml`. |
+
+### `ws secret wait`
+
+Block until `ask` has stored the value. Exit 1 if the prompt was cancelled, failed or the time ran out.
+
+```text
+ws secret wait [-h] [--timeout SECONDS] name
+```
+
+| Argument | Meaning |
+|---|---|
+| `name` | A name registered in `secrets.toml`. |
+| `--timeout SECONDS` | How long to wait (default 900). |
+
 ### `ws secret import`
 
 Store a value for a registered name from an env file (VAR=value).

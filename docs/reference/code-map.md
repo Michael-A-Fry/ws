@@ -65,6 +65,7 @@ below, and `python3 scripts/gen_code_map.py --check` (prek and CI) fails when it
 | `runrecord.py` | The run record: one JSON line per headless job in `<state>/logs/runs.jsonl`, the same shape for... |
 | `runschema.py` | The JSON Schema (draft 2020-12) of one run record, as a Python dict: the shape of a line in... |
 | `sandbox.py` | The sandbox as the real wall: `ws gate launch --runner R -- argv` starts a runner inside an... |
+| `secretportal.py` | `ws secret ask` and `ws secret wait`: a person pastes a secret into its own terminal window, and... |
 | `secrets.py` | The secrets registry and store, and `ws secret` |
 | `selfcmd.py` | How ws starts itself with this Python: `python -I -m ws`, so a folder named `ws/` in the working... |
 | `session.py` | `ws session`: tell a long-running session once when ws has been updated under it |

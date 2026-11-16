@@ -37,6 +37,17 @@ You type the value yourself, in your own terminal. Never paste a key into an AI 
    ws secret set anthropic
    ```
 
+   To paste it into its own window instead, from inside tmux: `ws secret ask anthropic` opens a window with a prompt that
+   shows nothing as you paste, and `ws secret wait anthropic` blocks until it's stored. The value never goes through
+   a command line, the environment, a log or the reply. An AI session may run both, because neither shows a value;
+   the typing happens in the window, and the window names the store it will write to. Only you can use `set`,
+   `import`, `rm` and the window's own prompt. The window starts with an empty environment and your account's home
+   folder only, so a session can't steer where the value goes: `ask` refuses when `WS_HOME`, `HOME` or an `XDG_*`
+   variable points ws's folders anywhere but your account's own. The value goes to the store your account's profile
+   names (`[roles.secrets] store`), or the default one; the window prints which before you type.
+   The older `ws-secret ask NAME` and `ws-secret wait NAME` still work (the same commands);
+   plan to move to `ws secret` before it's removed, 30 days after AI_Workspace is switched off.
+
 3. Check that it's set. The list shows names, hosts, state and owner. It never shows a value.
 
    ```sh

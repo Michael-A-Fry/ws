@@ -677,7 +677,7 @@ class Broker:
         return cls(
             sock,
             wsecrets.registry_path(env),
-            wsecrets.Store(wsecrets.store_dir(env)),
+            wsecrets.open_store(env),
             group=group,
             log_path=paths.state_dir(env) / "logs" / "broker.jsonl",
             max_ttl_s=ttl,

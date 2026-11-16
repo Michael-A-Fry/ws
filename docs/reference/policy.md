@@ -305,6 +305,12 @@ itself sends you a digest or a push.
 | `interrupts` | text | `"when-broken"` | When a session may interrupt you: `never`, `when-broken` or `daily-summary`. |
 | `always_ask` | list of plain words | `[]` | Things that are asked first at every level, such as `spending` or `data-deletion`. |
 
+## `[msg]`
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `person_send` | true or false | `false` | Lets the person who owns the account send a `ws msg` from outside any session, as `person:<user>`, when the per-boot token proves it ([messages](messages.md#a-person-sends)). Off is the whole rollback. A class's `inbound_allow` may name `person:<user>`. |
+
 ## `[[exceptions]]`
 
 A named Rule of Two exception. The first four keys are required; `owner` and `expires` are optional.

@@ -10,6 +10,10 @@ body of the GitHub release.
 
 ### Added
 
+- A person can send a `ws msg` from the hub or a plain terminal, recorded as `person:<user>`, behind `[msg] person_send`
+  (off by default) and a per-boot token under the secrets folder (`ws msg person-token`); an agent that escapes its
+  process ancestry has no token and is refused. The launcher step that makes a session's launch token records who asked
+  for it (`requested_by`), and `ws session show` prints it. See ADR 0023.
 - `ws ask` is one queue of questions from every session to their person: `add`, `list`, `get`, `answer`, `wait`,
   `done`, `withdraw` and `import` (an older asks file, safe to run twice), in the file `ws home` already reads asks
   from. An ask whose repo isn't in a full-access class, or that hits the sensitive-terms file, is stored with no text;

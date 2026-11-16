@@ -51,20 +51,28 @@ def cmd_notify_test(args: argparse.Namespace) -> int:
 
 
 LINE_MAX = 300  # the most of a summary file's first line that goes in a push
+LINES_READ = 200  # how many lines are looked at for one with text
 
 
 def first_line(path: str, fresh_min: float | None = None) -> str | None:
     """The first line with text in `path`, trimmed to LINE_MAX characters. None when `fresh_min` is given and the file
     is older than that many minutes (a summary from an earlier run is not news). Raises ValueError (safe to print)."""
+    import stat
     import time
     from pathlib import Path
 
     f = Path(path).expanduser()
     try:
-        if fresh_min is not None and time.time() - f.stat().st_mtime > fresh_min * 60:
+        st = f.stat()
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError(f"{f} is not a file")
+        if fresh_min is not None and time.time() - st.st_mtime > fresh_min * 60:
             return None
         with f.open("r", encoding="utf-8", errors="replace") as fh:
-            for line in fh:
+            for _ in range(LINES_READ):
+                line = fh.readline(LINE_MAX * 4)  # bounded: a file with no line break can't fill memory
+                if not line:
+                    break
                 if line.strip():
                     return " ".join(line.split())[:LINE_MAX]
     except OSError as e:
@@ -78,6 +86,8 @@ def cmd_notify_send(args: argparse.Namespace) -> int:
         raise WsError("usage", "give a message or --from-file PATH, not both", 'e.g. `ws notify send "done"`', 2)
     if args.fresh is not None and args.from_file is None:
         raise WsError("usage", "--fresh goes with --from-file", "", 2)
+    if args.fresh is not None and not (0 < args.fresh < float("inf")):
+        raise WsError("usage", "--fresh takes a number of minutes above 0", "", 2)
     message = args.message
     if args.from_file is not None:
         try:

@@ -312,12 +312,13 @@ MAX_CLICK = 2000
 
 
 def click_url(url: str) -> str:
-    """The link a push opens when tapped (ntfy's Click header): one http or https URL with a host, on one line, no
-    spaces, at most 2000 characters. Raises NotifyError."""
+    """The link a push opens when tapped (ntfy's Click header): one http or https URL with a host, ASCII only (a header
+    is sent as latin-1, and an IDN host goes in as punycode), on one line, no spaces, at most 2000 characters. Raises
+    NotifyError."""
     from urllib.parse import urlsplit
 
     bad = NotifyError("--click must be one http or https link, with a host, no spaces, under 2000 characters")
-    if not isinstance(url, str) or len(url) > MAX_CLICK or _CONTROL.search(url) or " " in url:
+    if not isinstance(url, str) or not url.isascii() or len(url) > MAX_CLICK or _CONTROL.search(url) or " " in url:
         raise bad
     try:
         parts = urlsplit(url)

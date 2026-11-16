@@ -171,3 +171,28 @@ def test_notify_is_allowed_in_the_session_form():
     assert agentsession.session_secret_words(["secret", "reveal", "x", "--notify"], {})
     assert agentsession.session_secret_words(["secret", "reveal", "x", "--notify", "--again", "--minutes", "5"], {})
     assert not agentsession.session_secret_words(["secret", "reveal", "x", "--notify", "--notify"], {})
+
+
+# ---- the review's cases -----------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("bad", ["http://exaĀmple.com/", "https://a.example.org/ ", "https://a.example.org/\xa0"])
+def test_click_must_be_ascii(bad):
+    with pytest.raises(ntfy.NotifyError):
+        ntfy.click_url(bad)
+
+
+def test_first_line_refuses_what_is_not_a_file_and_bounds_a_long_line(tmp_path):
+    with pytest.raises(ValueError, match="not a file"):
+        commands.first_line(str(tmp_path))
+    f = tmp_path / "one-long-line"
+    f.write_text("y" * (commands.LINE_MAX * 50), encoding="utf-8")
+    assert commands.first_line(str(f)) == "y" * commands.LINE_MAX
+
+
+@pytest.mark.parametrize("fresh", ["-1", "0", "nan", "inf"])
+def test_fresh_must_be_minutes_above_zero(box, write_profile, tmp_path, fresh):
+    write_profile({"roles": {"notify": CFG}})
+    f = tmp_path / "s.md"
+    f.write_text("x\n", encoding="utf-8")
+    assert cli.main(["notify", "send", "--from-file", str(f), "--fresh", fresh]) == 2

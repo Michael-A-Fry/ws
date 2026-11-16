@@ -1829,6 +1829,28 @@ def test_a_schema_2_store_gains_the_run_key_column(tmp_path):
     assert {r["run_key"] for r in again.receipts(last=5)} == {None, "j:t1"}
 
 
+def test_a_schema_4_store_gains_the_told_at_column(tmp_path):
+    """A queue written before told_at: it opens, keeps its rows, gains the column, and a reaped run's notice is
+    recorded in it."""
+    host = Host()
+    ledger = make(tmp_path, host=host, sink=lambda rec: True, on_stop=lambda job, run_id, why: True)
+    old_id = ledger.enqueue("j", None, T0)[0]
+    c = ledger.conn()
+    c.execute("ALTER TABLE receipts DROP COLUMN told_at")
+    c.execute("PRAGMA user_version = 4")
+    ledger.close()
+    again = make(tmp_path, host=host, sink=lambda rec: True, on_stop=lambda job, run_id, why: True)
+    cols = {r[1] for r in again.conn().execute("PRAGMA table_info(receipts)")}
+    assert "told_at" in cols and again.conn().execute("PRAGMA user_version").fetchone()[0] == queue.SCHEMA_VERSION == 5
+    assert again.receipt(old_id) is not None
+    r = req(owner_pid=4990)
+    assert again.admit(r, T0, spend()).kind == "admit"
+    host.procs[4990] = (False, None)
+    assert again.reap(T0) == 1
+    told = again.conn().execute("SELECT told_at FROM receipts WHERE run_id = ?", (r.run_id,)).fetchone()[0]
+    assert told is not None and again.reaped_of(4990, T0 - timedelta(hours=1)) == []  # a direct run, not a queued one
+
+
 @pytest.mark.parametrize("trigger", [None, "evt-7"])
 def test_a_killed_run_is_never_run_again_by_recovery(tmp_path, trigger):
     """It may have acted, and a rerun cannot yet skip what it did, so it is failed with or without a run key."""

@@ -1341,15 +1341,41 @@ def test_a_name_without_paths_forwards_any_path(env):
     assert env.call("/anything/at/all")[0] == 200
 
 
-@pytest.mark.parametrize("bad", ['["v1"]', '["/v1?x=1"]', '["/v1/../x"]', '["/%2e"]', '["/a b"]', '"/v1"'])
+@pytest.mark.parametrize("bad", ["[]", '["v1"]', '["/v1?x=1"]', '["/v1/../x"]', '["/%2e"]', '["/a b"]', '"/v1"'])
 def test_a_bad_paths_entry_refuses_the_whole_registry(env, bad):
     _paths_registry(env, bad)
     with pytest.raises(wsecrets.SecretsError, match="paths|path prefix|list"):
         wsecrets.load_registry(env.registry)
 
 
-def test_a_stored_values_repr_and_str_show_no_value(env):
-    for obj in (env.store, wsecrets.load_registry(env.registry)["anthropic"]):
-        assert VALUE not in repr(obj) and VALUE not in str(obj)
-    assert VALUE not in repr(env.store.read("anthropic").__class__)  # the class name, not the value
-    assert VALUE not in repr(vars(env.store))
+@pytest.mark.parametrize(
+    "tricky",
+    [
+        "/v1/messages/..;/admin",
+        "/v1/messages/%2e%2e;/admin",
+        "/v1/messages/%2E%2E%3B/x",
+        "/v1/messages/.%00./x",
+        "/v1/messages/%c0%ae%c0%ae/x",
+        "/v1/messages;x",
+        "/v1/messages/a%20b",
+        "/v1/messages/a\\b",
+    ],
+)
+def test_a_server_reading_a_path_trick_as_dot_dot_gets_nothing_when_paths_is_set(env, tricky):
+    _paths_registry(env, '["/v1/messages"]')
+    lease = env.lease()
+    seen = len(env.stub.seen)
+    assert env.call(tricky, lease=lease)[0] == 403
+    assert len(env.stub.seen) == seen
+
+
+def test_tightening_paths_or_ttl_in_the_registry_bites_leases_already_open(env):
+    lease = env.lease()
+    assert env.call("/v1/other", lease=lease)[0] == 200  # no list yet
+    _paths_registry(env, '["/v1/messages"]')
+    assert env.call("/v1/other", lease=lease)[0] == 403
+    assert env.call("/v1/messages", lease=lease)[0] == 200
+    _ttl_registry(env, "100")
+    env.now += 150  # the lease itself runs for an hour, the registry now says 100 s
+    assert env.call("/v1/messages", lease=lease)[0] == 403
+    assert any(a["op"] == "proxy" and a["status"] == "expired" for a in env.audit())

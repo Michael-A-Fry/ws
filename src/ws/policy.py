@@ -459,10 +459,14 @@ deny_commands = {arr(default_deny_commands())}
 deny_read = [
   "~/.ssh/**", "~/.gnupg/**", "~/.aws/credentials", "~/.config/ws/secrets/**", "~/.local/share/ws/secrets/**",
   # a project's local secrets (a bare name matches at any depth; `.env.example` stays readable)
-  ".env", ".env.local", ".env.development", ".env.production", ".env.staging",
-  # signed-in browser profiles: cookies and saved logins
-  "~/.config/google-chrome/**", "~/.config/chromium/**", "~/.config/BraveSoftware/**", "~/.config/microsoft-edge/**",
-  "~/.mozilla/**", "~/Library/Application Support/Google/Chrome/**", "~/Library/Application Support/Firefox/**",
+  ".env", ".env.local", ".env.*.local", ".env.development", ".env.production", ".env.staging", ".env.test", ".envrc",
+  # signed-in browser profiles: cookies and saved logins (Linux, snap, Flatpak, macOS)
+  "~/.config/google-chrome/**", "~/.config/google-chrome-beta/**", "~/.config/chromium/**", "~/.config/vivaldi/**",
+  "~/.config/BraveSoftware/**", "~/.config/microsoft-edge/**", "~/.mozilla/**", "~/snap/firefox/common/.mozilla/**",
+  "~/snap/chromium/**", "~/.var/app/*/config/**", "~/Library/Application Support/Google/Chrome/**",
+  "~/Library/Application Support/Google/Chrome Beta/**", "~/Library/Application Support/Firefox/**",
+  "~/Library/Application Support/BraveSoftware/**", "~/Library/Application Support/Microsoft Edge/**",
+  "~/Library/Application Support/Vivaldi/**",
   # the GitHub CLI's stored token (a session uses the broker's short-lived one)
   "~/.config/gh/hosts.yml",
 ]

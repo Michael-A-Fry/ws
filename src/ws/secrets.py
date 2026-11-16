@@ -50,7 +50,7 @@ WALL_SOCKET = "/run/ws-broker/broker.sock"
 WALL_BIN = "/opt/ws/bin/ws"  # a root-owned launcher: the broker never runs code a normal user can write
 WALL_LIB = "/opt/ws/lib"
 SAFE_PATH = re.compile(r"^[A-Za-z0-9_./+-]+$")
-PATH_PREFIX_RE = re.compile(r"^/[A-Za-z0-9._~!$&'()*+,;=:@/-]*$")
+PATH_PREFIX_RE = re.compile(r"^/[A-Za-z0-9._~/-]*$")
 AREA_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
 # The tiers, lowest first. A run's tier reaches the names of the tiers in REACH; `walled` reaches only walled names, and
 # nothing reaches up into it, so a walled class's keys never leave its own runs.
@@ -179,10 +179,14 @@ def _entry(path: Path, name: str, t: dict) -> Entry:
     if area is not None and not (isinstance(area, str) and AREA_RE.match(area)):
         raise SecretsError(f"{path}: [{name}] area must be a short lower-case name (letters, digits, - and _)")
     req_paths = _str_list(path, name, "paths", t.get("paths", []))
+    if "paths" in t and not req_paths:
+        raise SecretsError(
+            f"{path}: [{name}] paths is empty: leave the key out to allow any path, or list the prefixes"
+        )
     for pre in req_paths:
         if not PATH_PREFIX_RE.match(pre) or any(seg in (".", "..") for seg in pre.split("/")):
             raise SecretsError(
-                f"{path}: [{name}] {pre!r} is not a path prefix (start with /, no ? # %, no . or .. part)"
+                f"{path}: [{name}] {pre!r} is not a path prefix (start with /; letters, digits and ._~/- only; no . or .. part)"
             )
     ttl = t.get("ttl")
     if ttl is not None and (isinstance(ttl, bool) or not isinstance(ttl, (int, float)) or not 0 < ttl <= MAX_TTL_S):

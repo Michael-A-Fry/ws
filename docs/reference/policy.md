@@ -108,10 +108,12 @@ The default list, which `ws gate init` writes:
 
 Not a pattern, so it isn't in the list: a shell command that writes a file that holds secrets is refused whatever the
 policy says. The reader looks at the target of each redirect and the operand of each writing command (`tee`, `cp`, `mv`,
-`sed -i`, `dd of=`) by file name: `.env`, `.envrc` and `.env.NAME` (a template such as `.env.example` is free). Quoting, a
-heredoc and a variable set earlier on the line change nothing, and a target the reader can't know is refused. `notes.env`
-isn't a secret file, and nor is an option's value such as `--config prod.env`. An interpreter that opens the file itself
-isn't read.
+`rm`, `sed -i`, `dd of=`, `sort -o`, `awk -i inplace`, `ed`, `split`, `tar x`) by file name: `.env`, `.envrc` and
+`.env.NAME` (a template such as `.env.example` is free). A copy into a folder counts as a write of the folder's file of
+the source's name (`cp ../x/.env .`). Quoting, a heredoc and a variable set earlier on the line change nothing, and a
+target the reader can't know is refused: an unset variable, or a glob that can name one (`.e*`, `.en?`). `notes.env`
+isn't a secret file, and nor is an option's value such as `--config prod.env`. Not read: an interpreter that opens the
+file itself, `find -exec`, and `git checkout` or `git restore` of the file.
 
 ### How a command is read
 

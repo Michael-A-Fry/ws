@@ -406,6 +406,8 @@ PUSH_ALLOWED = (
     "git push origin trunk 2>&1 | grep -v ' -d '",
     "git push origin trunk && git branch -d trunk",
     "git push origin trunk -o 'ci.message=fix :x'",
+    "git push origin -o -d trunk",  # the value of -o is not a flag
+    "git push --push-option -d origin trunk",
     "git status",
 )
 
@@ -461,6 +463,23 @@ ENV_DENIED = (
     "echo x > .envrc",
     "echo x > $UNSET_NAME",  # a name the reader cannot know could be any file
     'echo x > "$UNSET_DIR/$UNSET_NAME"',
+    "echo x > .e*",  # the shell expands a glob or a brace into a name the reader never sees
+    "echo x > .en?",
+    "cp /tmp/x .e[n]v",
+    "cp x .{y,env}",  # the reader expands a brace itself; the last name is the one written
+    "cp ../other/.env .",  # a copy into a folder writes folder/<the source's name>
+    "cp /tmp/.env ./",
+    "cp ../o/.env app/",
+    "cp -t . ../o/.env",
+    "cp -t app ../o/.env",
+    "mv ../o/.env .",
+    "rm .env",  # new: removing it is refused too, as `rm` writes its operands
+    "sort -o .env in.txt",
+    "sort --output=.env in.txt",
+    "awk -i inplace '{print}' .env",
+    "tar xf a.tar .env",
+    "split in.txt .env.",
+    "ed .env",
 )
 ENV_ALLOWED = (
     "cat .env.example",

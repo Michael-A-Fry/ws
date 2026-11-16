@@ -110,6 +110,7 @@ A call the policy lets through only with a human's say-so is `ask_commands`: see
 from __future__ import annotations
 
 import contextlib
+import fnmatch
 import itertools
 import math
 import os
@@ -1551,7 +1552,8 @@ def _git_normal(toks: list[str]) -> list[str]:
             or ":+" in t
             or re.fullmatch(r"-[A-Za-z0-9]*d[A-Za-z0-9]*", t)  # -d, -qd, -dq: delete
             or t in ("--mirror", "--delete", "--prune")
-            for t in toks[2:]
+            for i, t in enumerate(toks[2:], 2)
+            if toks[i - 1] not in ("-o", "--push-option")  # an option's value (`-o -d`) is not a flag
         )
     ):
         toks.append("--force")
@@ -2315,7 +2317,10 @@ def _segment_once(
         hit = _under(ctx.protect, p, ctx.cwd, ancestors)
         if hit:
             return f"command writes to {hit}, which ws protects (policy and generated gate)", line, nested
-    for p, _ in written or _written(cmd, flags, operands, redirs, canon, toks):
+    for p, _ in [
+        *(written or _written(cmd, flags, operands, redirs, canon, toks)),
+        *_copied_in(cmd, operands, toks, ctx),
+    ]:
         if reason := _secret_env_write(p, env, ctx):
             if ctx.soft is not None and isinstance(reason, Refusal) and reason.kind in WALL_REDUNDANT:
                 ctx.soft.append(reason)  # the wall holds what this runs; the rest of the line is still judged
@@ -2971,6 +2976,18 @@ def _find_deletes(canon: list[str], cwd: str) -> list[str]:
     return [f"rm -fr {_dotted(p, cwd)}" for p in (starts or ["."])]
 
 
+_GLOB_CHARS = re.compile(r"[*?\[]")
+_ENV_SAMPLE_NAMES = (".env", ".envrc", ".env.local", ".env.production", ".env.development", ".env.staging")
+
+
+def _glob_may_name_a_secret_env(base: str) -> bool:
+    """Could the shell turn this word into a secret env file's name? A glob written with its leading dot (`.e*`,
+    `.en?`, `.e[n]v`, `.*`) can; one without it (`*`) can't, since a glob skips dotfiles unless it names the dot."""
+    if not _GLOB_CHARS.search(base) or not base.startswith("."):
+        return False
+    return any(fnmatch.fnmatchcase(n, base) for n in _ENV_SAMPLE_NAMES)
+
+
 ENV_TEMPLATE_SUFFIXES = ("example", "sample", "template", "dist", "defaults")
 
 
@@ -2990,7 +3007,9 @@ def _secret_env_write(path: str, env, ctx) -> str | Refusal | None:
     quoting, a heredoc, a variable set earlier on the line and a trailing redirect change nothing. A name with a part
     the reader cannot know (an unset variable) is refused, since it could be any file."""
     base = path.rsplit("/", 1)[-1]
-    if unknownpath.has_unknown(unknownpath.split(base, frozenset(env), _producer(ctx, env))):
+    if _glob_may_name_a_secret_env(base) or unknownpath.has_unknown(
+        unknownpath.split(base, frozenset(env), _producer(ctx, env))
+    ):
         return _write_refusal(
             f"command writes {path!r}, which holds a part ws cannot read, and it could be a secret .env file; "
             f"{HOW_TO_SPELL}",
@@ -2999,6 +3018,24 @@ def _secret_env_write(path: str, env, ctx) -> str | Refusal | None:
     if is_secret_env_name(base):
         return f"command writes {path!r}, a file that holds secrets; edit it yourself, in a terminal of your own"
     return None
+
+
+def _copied_in(cmd: str, operands: list[str], toks: list[str], ctx) -> list[tuple[str, bool]]:
+    """What `cp A DIR`, `cp -t DIR A` and the like write inside a folder: DIR/<each source's name>. Only for a
+    destination that is a folder (it exists, or is written with a trailing slash, or comes from `-t`)."""
+    if cmd not in _WRITE_LAST:
+        return []
+    target = shellwords.option_values(toks, "t", ("--target-directory",))
+    if target:
+        dest, sources = target[0], operands
+    elif len(operands) >= 2:
+        dest, sources = operands[-1], operands[:-1]
+    else:
+        return []
+    where = dest if os.path.isabs(dest) else os.path.join(ctx.cwd or ".", dest)
+    if not (target or dest.endswith("/") or dest in (".", "..") or os.path.isdir(where)):
+        return []
+    return [(os.path.join(dest, s.rstrip("/").rsplit("/", 1)[-1]), False) for s in sources if s]
 
 
 def _written(cmd, flags, operands, redirs, canon, toks) -> list[tuple[str, bool]]:
@@ -3019,6 +3056,14 @@ def _written(cmd, flags, operands, redirs, canon, toks) -> list[tuple[str, bool]
         out += [(o, False) for o in operands]
     elif cmd == "dd":
         out += [(o[3:], False) for o in operands if o.startswith("of=")]
+    elif cmd == "sort":
+        out += [(v, False) for v in shellwords.option_values(toks, "o", ("--output",))]
+    elif cmd in ("awk", "gawk") and any(a == "inplace" for a in toks[1:]):
+        out += [(o, False) for o in operands[1:]]  # the first operand is the program
+    elif cmd in ("ed", "ex"):
+        out += [(o, False) for o in operands]
+    elif cmd == "split":
+        out += [(o + "aa", False) for o in operands[1:]]  # the pieces are PREFIXaa, PREFIXab, ...
     elif cmd == "curl":
         out += [(v, False) for v in shellwords.option_values(toks, "o", ("--output",))]
         if any(t == "--remote-name" or re.fullmatch(r"-[A-Za-z]*O[A-Za-z]*", t) for t in toks[1:]):
@@ -3037,6 +3082,7 @@ def _written(cmd, flags, operands, redirs, canon, toks) -> list[tuple[str, bool]
         if "x" in modes:
             dirs = shellwords.option_values(toks, "C", ("--directory",))
             out += [(d, True) for d in dirs or ["."]]
+            out += [(o, False) for o in operands if o not in archives]  # the members named, extracted by name
         elif any(m in modes for m in "cru"):
             out += [(a, False) for a in archives]
     elif cmd == "unzip":

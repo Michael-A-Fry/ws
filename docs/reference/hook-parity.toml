@@ -201,7 +201,7 @@ test = "test_parity_force_push_main"
 [[hook]]
 id = "env-file-write"
 what = "Blocks a shell command that writes a secret `.env` file"
-ws = "the policy reader: the target of every redirect and the operand of every writing command (`tee`, `cp`, `mv`, `sed -i`, `dd of=`) is checked by file name against `.env`, `.envrc` and `.env.NAME` (a template such as `.env.example` is free), after quoting, heredocs and variables set on the line are resolved; a target the reader can't know is refused. An interpreter that opens the file itself isn't read"
+ws = "the policy reader: the target of every redirect and the operand of every writing command (`tee`, `cp`, `mv`, `sed -i`, `dd of=`) is checked by file name against `.env`, `.envrc` and `.env.NAME` (a template such as `.env.example` is free), after quoting, heredocs and variables set on the line are resolved; a target the reader can't know is refused. A glob that can name one (`.e*`, `.en?`) and a copy into a folder (`cp ../x/.env .`) are read; `rm .env` is refused too. Not read: an interpreter that opens the file itself, `find -exec`, and `git checkout`/`git restore` of the file"
 status = "covered"
 fail = "blocks"
 test = "test_parity_env_file_write"

@@ -32,6 +32,7 @@ You type the value yourself, in your own terminal. Never paste a key into an AI 
    registry, so a typo never leaves a name unscoped.
    The broker reads the registry only if it's yours and closed to group and world writes. If an editor or a umask of
    002 left it `0664`, run `chmod go-w ~/.config/ws/secrets.toml` (the broker answers `registry_untrusted` until then).
+   The same goes for its folder. A symlinked registry is refused as well: keep the file itself in the config folder.
 
 2. Store the value. ws asks for it without showing it. It reads standard input instead when there is no terminal.
 

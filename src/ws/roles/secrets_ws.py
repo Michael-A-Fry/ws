@@ -14,7 +14,9 @@ ROLE, NAME = "secrets", "ws-secret"
 def check(cfg, osi, env, network):
     store, sock = wsecrets.Store(wsecrets.store_dir(env, cfg)), wsecrets.socket_path(env, cfg)
     try:
-        problems, owner = wsecrets.health(wsecrets.registry_path(env), store)
+        problems, owner = wsecrets.health(
+            wsecrets.registry_path(env), store, owner_uid=getattr(os, "geteuid", lambda: None)()
+        )
     except PermissionError:  # the store belongs to another user: only the broker can vouch for it
         problems, owner = None, None
     try:

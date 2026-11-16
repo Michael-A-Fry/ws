@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import getpass
 import hashlib
 import os
@@ -150,21 +151,45 @@ def registry_problem(st: os.stat_result, owner_uid: int) -> str | None:
     return None
 
 
+def _read_trusted(path: Path, owner_uid: int) -> str | None:
+    """The registry's text as `owner_uid` may trust it, or None when there is no file. Raises RegistryUntrusted,
+    OSError or UnicodeDecodeError."""
+    try:
+        pst = os.stat(path.parent)
+    except FileNotFoundError:
+        return None
+    if pst.st_mode & 0o022:
+        raise RegistryUntrusted(f"{path}: its folder can be written by group or others, so the file could be swapped")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        if e.errno == errno.ELOOP:
+            raise RegistryUntrusted(f"{path}: it is a symlink; put the file itself there") from e
+        raise
+    with os.fdopen(fd, "rb") as f:
+        st = os.fstat(f.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            raise RegistryUntrusted(f"{path}: it is not a regular file")
+        why = registry_problem(st, owner_uid)
+        if why:
+            raise RegistryUntrusted(f"{path}: {why}")
+        return f.read().decode("utf-8")
+
+
 def load_registry(path: Path, owner_uid: int | None = None) -> dict[str, Entry]:
     """The registry. A missing file is an empty registry; a file that does not parse, or a bad entry, raises.
-    With `owner_uid` (the broker's), a file owned by another user or open to group or world writes raises
-    RegistryUntrusted. The check is on the opened file, so a swap between the check and the read cannot slip past."""
-    if not path.is_file():
+    With `owner_uid` (the broker's), RegistryUntrusted for a symlink, anything but a regular file, a folder group or
+    world can write, or a file owned by another user or open to group or world writes. The checks are on the opened
+    file (no symlink followed, never blocking on a FIFO), so a swap between the check and the read cannot slip past."""
+    if owner_uid is None and not path.is_file():
         return {}
     try:
-        if owner_uid is None:
-            text = path.read_text(encoding="utf-8")
-        else:
-            with path.open("rb") as f:
-                why = registry_problem(os.fstat(f.fileno()), owner_uid)
-                if why:
-                    raise RegistryUntrusted(f"{path}: {why}")
-                text = f.read().decode("utf-8")
+        text = path.read_text(encoding="utf-8") if owner_uid is None else _read_trusted(path, owner_uid)
+        if text is None:
+            return {}
         raw = tomllib.loads(text)
     except (tomllib.TOMLDecodeError, UnicodeDecodeError, OSError) as e:
         raise SecretsError(f"{path}: {e}") from e

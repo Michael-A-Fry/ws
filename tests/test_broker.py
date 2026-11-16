@@ -1443,6 +1443,25 @@ def test_registry_b2_an_open_lease_stops_when_the_registry_is_opened_to_others(e
     assert env.call(lease=lease)[0] == 200
 
 
+def test_registry_b2_a_symlinked_registry_or_a_writable_folder_is_refused(env):
+    real = env.base / "elsewhere.toml"
+    env.registry.rename(real)
+    env.registry.symlink_to(real)
+    before = len(env.audit())
+    assert refusal(env.lease).code == "registry_untrusted"
+    assert [a["status"] for a in env.audit()[before:]] == ["registry_untrusted"]
+    env.registry.unlink()
+    real.rename(env.registry)
+    folder = env.registry.parent
+    mode = folder.stat().st_mode & 0o777
+    folder.chmod(mode | 0o020)
+    try:
+        assert refusal(env.lease).code == "registry_untrusted"
+    finally:
+        folder.chmod(mode)
+    assert env.call()[0] == 200
+
+
 def test_registry_b2_minters_refuse_an_untrusted_registry(scoped):
     scoped.s.registry.chmod(0o664)
     before = len(scoped.audit())

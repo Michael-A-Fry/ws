@@ -108,9 +108,9 @@ def host_of(stub) -> str:
     return stub.url.removeprefix("http://")
 
 
-# Fields a plain run that went well leaves null: no runner subtype yet (the adapters do not pass it on), no fault, no
-# provider wait, no approval, no run key (a direct run has no trigger) and no chain.
-NULL_UNLESS_SET = {"stop_subtype", "fault", "retry_after_s", "approval", "run_key", "chain_depth"}
+# Fields a plain run that went well leaves null: no fault, no provider wait, no run key (a direct run has no trigger) and
+# no chain. Its stop subtype (the runner's own word) and its approval switch (the policy dial) are always set.
+NULL_UNLESS_SET = {"fault", "retry_after_s", "run_key", "chain_depth"}
 
 
 def check_complete(rec: dict, may_be_null: set[str]) -> None:

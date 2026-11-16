@@ -6,6 +6,7 @@ older `at` key writes both. The run-record schema only grows within a version; v
 """
 
 import ast
+import functools
 import json
 import re
 from datetime import UTC, datetime
@@ -117,6 +118,7 @@ def writer_modules(row: dict[str, str]) -> set[str]:
     return set(re.findall(r"`(src/ws/[\w/]+\.py)`", row["Writer"]))
 
 
+@functools.cache  # an ast parse of every module under src/ws: once per session, not once per call
 def modules_that_write() -> dict[str, set[str]]:
     """Module path -> the `.jsonl` names it spells out in code (docstrings and comments left out), for every module
     under src/ws that spells one out or calls `jsonl.append` or `jsonl.append_plain`."""
@@ -210,12 +212,12 @@ def test_ws_jsonl_is_imported_only_as_plain_jsonl_so_the_scan_can_see_the_calls(
 
 
 def test_each_listed_writer_module_exists_and_each_log_is_named_in_its_writer():
+    named = modules_that_write()
     for name, row in listed().items():
         mods = writer_modules(row)
         assert mods, f"{name} has no Writer module"
         for m in mods:
             assert (ROOT / m).is_file(), f"{name}: {m} is not a file"
-        named = modules_that_write()
         # runs.fallback.jsonl is built from runs.jsonl's name, so only the other logs are spelled out in their writer
         assert "fallback" in name or any(name in named.get(m, set()) for m in mods), f"{name} is not named in {mods}"
 

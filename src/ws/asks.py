@@ -5,10 +5,9 @@ below the home folder), so there is one asks store and not two. It is append-onl
 `answered`, `done` and `withdrawn`. `ts` is epoch milliseconds, as the OpenCode shim writes it, and `at` is the same
 moment as RFC 3339 text, which `ws.jsonl` needs for its stamp. Every write goes through `ws.jsonl`'s lock.
 
-A repo's data class decides what the store may hold: the strictest of the named repo's class and the working folder's
-(from the policy), or any hit on the sensitive-terms file, stores the ask redacted (no text, no options, a hashed dedupe
-key). The class is checked again when an ask is read, so a repo walled after it was asked shows as opaque. A token-
-shaped secret is refused outright.
+A repo's data class decides what the store may hold: the strictest of the named repo's class and the working folder's or
+any hit on the sensitive-terms file, stores the ask redacted (no text, no options, a hashed dedupe key). The class is
+checked again when an ask is read, so a repo walled since shows as opaque. A token- shaped secret is refused outright.
 """
 
 from __future__ import annotations

@@ -317,6 +317,7 @@ KINDS: dict[str, Kind] = dict(
         ),
         _logrow("verdict", "gate", "Gate verdicts", _state("logs", "gate")),
         _logrow("wall-report", "sandbox", "Wall report", _state("logs", "wall-report")),
+        _logrow("secret-audit", "secrets", "Secret audit", _state("logs", "secrets-audit")),
         _logrow(
             "footprint",
             "node",
@@ -378,6 +379,7 @@ LINK_SPEC: dict[str, tuple[tuple[str, str, str], ...]] = {
             "gate-call",
             "verdict",
             "wall-report",
+            "secret-audit",
             "footprint",
             "job-alert",
             "upgrade",

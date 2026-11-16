@@ -28,7 +28,7 @@ from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from ws import paths, tailnet
+from ws import brand, paths, tailnet
 from ws.secrets import NAME_RE, SecretsError, Store
 
 LIFETIME_S = 15 * 60
@@ -72,12 +72,11 @@ _PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex">
 <title>ws: one-time value</title>
 <style nonce="{nonce}">
-:root{{color-scheme:light dark;--bg:#fafaf7;--fg:#1b1d21;--mute:#5d6470;--box:#eef0ec;--edge:#c9cdc4;--act:#1f5fbf}}
-@media (prefers-color-scheme:dark){{:root{{--bg:#111418;--fg:#e6e9ee;--mute:#9aa4b1;--box:#1b2027;--edge:#39424e;--act:#7fb0ff}}}}
-body{{margin:0;background:var(--bg);color:var(--fg);font:17px/1.45 system-ui,sans-serif}}
-main{{max-width:32rem;margin:0 auto;padding:24px 16px}}h1{{font-size:21px;margin:0 0 8px}}p{{color:var(--mute);margin:0 0 14px}}
-button{{width:100%;padding:15px;border:0;border-radius:10px;background:var(--act);color:var(--bg);font-size:17px;font-weight:600}}
-code{{display:block;padding:14px;border-radius:10px;background:var(--box);border:1px solid var(--edge);
+{palette}
+body{{margin:0;background:var(--bg);color:var(--text);font:17px/1.45 system-ui,sans-serif}}
+main{{max-width:32rem;margin:0 auto;padding:24px 16px}}h1{{font-size:21px;margin:0 0 8px}}p{{color:var(--muted);margin:0 0 14px}}
+button{{width:100%;padding:15px;border:0;border-radius:10px;background:var(--accent);color:var(--on-accent);font-size:17px;font-weight:600}}
+code{{display:block;padding:14px;border-radius:10px;background:var(--panel);border:1px solid var(--line2);
 font:16px/1.4 ui-monospace,monospace;word-break:break-all;user-select:all;margin:0 0 14px}}
 </style></head><body><main>{body}</main></body></html>"""
 
@@ -89,7 +88,7 @@ def _csp(nonce: str) -> str:
 def _send(handler: BaseHTTPRequestHandler, code: int, body: str) -> None:
     """One whole response with the page headers. Separate so a test can watch what goes out and when."""
     nonce = secrets.token_urlsafe(12)
-    data = _PAGE.format(nonce=nonce, body=body).encode("utf-8")
+    data = _PAGE.format(nonce=nonce, body=body, palette=brand.css()).encode("utf-8")
     handler.send_response(code)
     handler.send_header("Content-Type", "text/html; charset=utf-8")
     handler.send_header("Content-Length", str(len(data)))

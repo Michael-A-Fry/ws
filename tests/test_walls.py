@@ -1332,6 +1332,56 @@ def test_an_alert_from_a_folder_in_no_class_keeps_its_folder_name(host):
     assert "my-app" in sender.calls[0][0].decode()
 
 
+# ---- up-push-click: the Click header on a session alert ----------------------------------------------------------------
+
+
+def _click_alert(host, cfg_extra, payload_extra, event="Notification", folder="elsewhere/my-app"):
+    from ws.roles import ntfy
+
+    d = host.box / folder
+    d.mkdir(parents=True, exist_ok=True)
+    cfg = {"adapter": "ntfy", "url": "https://ntfy.example.org/t", **cfg_extra}
+    payload = {"hook_event_name": event, "cwd": str(d), "last_assistant_message": "which one?", **payload_extra}
+    sender = _Sender()
+    ntfy.alert(cfg, dict(os.environ), payload, "c", now=NOW, sender=sender)
+    return sender.calls[0][1] if sender.calls else None
+
+
+@pytest.mark.parametrize("event", ["Notification", "Stop"])
+def test_hub_url_adds_a_click_to_the_session(host, event):
+    h = _click_alert(
+        host, {"hub_url": "https://hub.example.org/", "alert_on": "needs-you"}, {"session_id": "ab-12"}, event
+    )
+    assert h["Click"] == "https://hub.example.org/chat/ab-12"
+
+
+def test_no_hub_url_means_no_click(host):
+    assert "Click" not in _click_alert(host, {}, {"session_id": "ab-12"})
+
+
+@pytest.mark.parametrize("sid", ["a/b", "..", "a..b", "a.b", "", None])
+def test_a_bad_session_id_gets_no_click(host, sid):
+    assert "Click" not in _click_alert(host, {"hub_url": "https://hub.example.org"}, {"session_id": sid})
+
+
+def test_a_walled_session_gets_no_click(host):
+    h = _click_alert(host, {"hub_url": "https://hub.example.org"}, {"session_id": "ab-12"}, folder="work/alpha/case")
+    assert "Click" not in h
+
+
+@pytest.mark.parametrize(
+    "bad", ["http://hub.example.org", "hub.example.org", "https://u:p" + chr(64) + "hub.example.org", 5]
+)
+def test_a_bad_hub_url_is_refused(host, bad):
+    from ws.roles import ntfy
+
+    with pytest.raises(ntfy.NotifyError):
+        _click_alert(host, {"hub_url": bad}, {"session_id": "ab-12"})
+    assert (
+        ntfy.check({"url": "https://ntfy.example.org/t", "hub_url": bad}, None, dict(os.environ), False)[0] == ntfy.FAIL
+    )
+
+
 def test_an_alert_is_plain_when_the_policy_does_not_load(box):
     from ws.roles import ntfy
 

@@ -480,7 +480,7 @@ def test_the_sign_in_is_copied_in_and_the_real_one_cannot_be_written(tmp_path):
 def test_a_sign_in_the_policy_hides_is_not_copied(tmp_path):
     root = world(tmp_path, "w", "")
     (root / "wshome" / "policy.toml").write_text(
-        policy.default_toml().replace('deny_read = ["', 'deny_read = ["~/.local/share/opencode/**", "', 1)
+        policy.default_toml().replace("deny_read = [", 'deny_read = ["~/.local/share/opencode/**",', 1)
     )
     real = root / "home" / ".local" / "share" / "opencode"
     real.mkdir(parents=True)

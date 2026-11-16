@@ -1273,3 +1273,115 @@ def test_run_record_a_symlinked_record_folder_is_refused(scoped, base):
     scoped.s.records.symlink_to(real)
     e = refusal(scoped.lease, "work", run="r1")
     assert e.code == "run_refused" and "symlink" in e.reason
+
+
+# -- per-secret lease limit and lease count in the audit line (F-B10)
+
+
+def _ttl_registry(env, ttl: str) -> None:
+    env.write_registry(f'[anthropic]\nhosts = ["{env.stub.host}"]\nttl = {ttl}\n')
+
+
+def _expires_in(env, lease) -> float:
+    import calendar
+
+    return calendar.timegm(time.strptime(lease.expires_at, "%Y-%m-%dT%H:%M:%SZ")) - env.now
+
+
+def test_a_secrets_own_ttl_caps_its_lease_and_a_longer_ask_cannot_beat_it(env):
+    _ttl_registry(env, "120")
+    assert 118 <= _expires_in(env, env.lease()) <= 121  # no ask: the secret's own limit
+    assert 118 <= _expires_in(env, env.lease(ttl_s=3000)) <= 121  # a longer ask is cut to it
+    assert 28 <= _expires_in(env, env.lease(ttl_s=30)) <= 31  # a shorter ask is kept
+
+
+def test_a_secret_without_ttl_gets_the_brokers_limit_which_is_one_hour_by_default(env):
+    assert broker.DEFAULT_TTL_S == 3600
+    assert 3598 <= _expires_in(env, env.lease()) <= 3601
+
+
+@pytest.mark.parametrize("bad", ["0", "-5", '"60"', "true", "86401"])
+def test_a_bad_ttl_in_the_registry_refuses_the_whole_registry(env, bad):
+    _ttl_registry(env, bad)
+    with pytest.raises(wsecrets.SecretsError, match="ttl"):
+        wsecrets.load_registry(env.registry)
+
+
+def test_the_request_audit_line_counts_that_names_open_leases(env):
+    for _ in range(3):
+        env.lease()
+    env.lease(name="github")
+    ok = [a for a in env.audit() if a["op"] == "request" and a["status"] == "ok"]
+    assert [a["leases"] for a in ok if a["name"] == "anthropic"] == [1, 2, 3]
+    assert [a["leases"] for a in ok if a["name"] == "github"] == [1]
+    assert VALUE not in env.log.read_text()
+
+
+# -- a path allow list per name (B3), and the stored value's repr (rr-M5)
+
+
+def _paths_registry(env, allowed: str) -> None:
+    env.write_registry(f'[anthropic]\nhosts = ["{env.stub.host}"]\npaths = {allowed}\n')
+
+
+def test_a_name_with_paths_forwards_only_those_and_the_stub_never_sees_the_rest(env):
+    _paths_registry(env, '["/v1/messages", "/v1/models/"]')
+    lease = env.lease()
+    assert env.call("/v1/messages", lease=lease)[0] == 200
+    assert env.call("/v1/messages/batch", lease=lease)[0] == 200  # inside the prefix
+    assert env.call("/v1/models/x", lease=lease)[0] == 200
+    seen = len(env.stub.seen)
+    for bad in ("/v1/other", "/v1/messagesX", "/", "/v1/../etc", "/v1/messages/%2e%2e/admin", "/v1/messages%2fx"):
+        assert env.call(bad, lease=lease)[0] == 403, bad
+    assert len(env.stub.seen) == seen  # a refused path never reached the upstream
+    end = time.monotonic() + 5
+    while time.monotonic() < end and not any(a["status"] == "path_not_allowed" for a in env.audit()):
+        time.sleep(0.02)
+    assert any(a["op"] == "proxy" and a["status"] == "path_not_allowed" for a in env.audit())
+
+
+def test_a_name_without_paths_forwards_any_path(env):
+    assert env.call("/anything/at/all")[0] == 200
+
+
+@pytest.mark.parametrize("bad", ["[]", '["v1"]', '["/v1?x=1"]', '["/v1/../x"]', '["/%2e"]', '["/a b"]', '"/v1"'])
+def test_a_bad_paths_entry_refuses_the_whole_registry(env, bad):
+    _paths_registry(env, bad)
+    with pytest.raises(wsecrets.SecretsError, match="paths|path prefix|list"):
+        wsecrets.load_registry(env.registry)
+
+
+@pytest.mark.parametrize(
+    "tricky",
+    [
+        "/v1/messages/..;/admin",
+        "/v1/messages/%2e%2e;/admin",
+        "/v1/messages/%2E%2E%3B/x",
+        "/v1/messages/.%00./x",
+        "/v1/messages/%c0%ae%c0%ae/x",
+        "/v1/messages;x",
+        "/v1/messages/a%20b",
+        "/v1/messages/a\\b",
+    ],
+)
+def test_a_server_reading_a_path_trick_as_dot_dot_gets_nothing_when_paths_is_set(env, tricky):
+    _paths_registry(env, '["/v1/messages"]')
+    lease = env.lease()
+    seen = len(env.stub.seen)
+    assert env.call(tricky, lease=lease)[0] == 403
+    assert len(env.stub.seen) == seen
+
+
+def test_tightening_paths_or_ttl_in_the_registry_bites_leases_already_open(env):
+    lease = env.lease()
+    assert env.call("/v1/other", lease=lease)[0] == 200  # no list yet
+    _paths_registry(env, '["/v1/messages"]')
+    assert env.call("/v1/other", lease=lease)[0] == 403
+    assert env.call("/v1/messages", lease=lease)[0] == 200
+    _ttl_registry(env, "100")
+    env.now += 150  # the lease itself runs for an hour, the registry now says 100 s
+    assert env.call("/v1/messages", lease=lease)[0] == 403
+    end = time.monotonic() + 5  # the proxy answers first and writes its audit row after: wait for the row
+    while time.monotonic() < end and not any(a["op"] == "proxy" and a["status"] == "expired" for a in env.audit()):
+        time.sleep(0.02)
+    assert any(a["op"] == "proxy" and a["status"] == "expired" for a in env.audit())

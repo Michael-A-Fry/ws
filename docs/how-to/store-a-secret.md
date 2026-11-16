@@ -61,6 +61,32 @@ You type the value yourself, in your own terminal. Never paste a key into an AI 
    user: `ws secret set` prints the exact command. The broker's copy of the registry is owned by root, so a later change
    to `secrets.toml` needs the `install -o root` line that `ws secret wall` printed.
 
+## A value ws makes itself
+
+Some secrets are only ever needed by ws, such as the backup password restic uses. Nobody needs to type or paste those.
+Mark the name `source = "generate"` (it needs no hosts) and let ws make it:
+
+```toml
+[restic-password]
+source = "generate"
+```
+
+```sh
+ws secret generate restic-password
+```
+
+The value is 256 random bits, written atomically with mode 0600 and never printed. A second run refuses, because a new
+value would lock you out of what the old one protects; `--replace` makes one anyway.
+
+You still want a copy somewhere safe, for a restore on a new machine. `ws secret reveal restic-password` prints a link
+to a page that shows it once, on your own device:
+
+- the page listens on this machine's one Tailscale address, and only a device logged in as `owner` (set it in
+  `[roles.secrets]` of your profile, for example `owner = "name@"`; there is no default) with no tags gets it;
+- opening the link shows a **Show** button, not the value, so a link preview can't use it up;
+- after **Show**, the page is closed for good, nothing is cached and nothing is logged;
+- an unused link stops working after 15 minutes. `--again` shows a value a second time.
+
 ## Success
 
 `ws secret list` shows the name with the state `set`. `ws doctor` shows WS104 `ok` after the wall (`warn` before it:

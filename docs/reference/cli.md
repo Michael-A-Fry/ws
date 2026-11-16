@@ -274,6 +274,37 @@ ws secret import [-h] --from-env PATH [--var VAR] [--delete-source] name
 | `--var VAR` | Which variable, when the file has several lines. |
 | `--delete-source` | Remove the env file after the value is stored. |
 
+### `ws secret generate`
+
+Make a strong random value for a `source = "generate"` name (never shown).
+
+```text
+ws secret generate [-h] [--replace] name
+```
+
+| Argument | Meaning |
+|---|---|
+| `name` | A name registered in `secrets.toml` with `source = "generate"`. |
+| `--replace` | Make a new value even if one is stored. |
+
+### `ws secret reveal`
+
+Show a generated value once, on your own device, through a one-time page.
+
+```text
+ws secret reveal [-h] [--owner LOGIN] [--bind ADDR] [--minutes MINUTES] [--again] name
+```
+
+| Argument | Meaning |
+|---|---|
+| `name` | A name registered with `source = "generate"` that has a value. |
+| `--owner LOGIN` | The tailnet login (or its start) whose device may open it; default `owner` in `[roles.secrets]`, which has no default. |
+| `--bind ADDR` | The one tailnet address to listen on (default: `tailscale ip -4`). |
+| `--minutes MINUTES` | How long the link works, at most 15 (default 15). |
+| `--again` | Show a value that was already shown once. |
+
+Exit 0 when the value was shown, 1 when the link expired unused.
+
 ### `ws secret list`
 
 Names, hosts, set/unset and owner; never values.

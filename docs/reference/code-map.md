@@ -57,6 +57,7 @@ below, and `python3 scripts/gen_code_map.py --check` (prek and CI) fails when it
 | `profile.py` | The profile: one TOML file per person (machine answers, roles, caps) |
 | `queue.py` | Admission before work: nothing starts until its money, turns, time, a slot and memory are... |
 | `rating.py` | `ws rate`: a thumbs up or down on a run, in one command |
+| `reveal.py` | The reveal-once page: a value ws generated, shown to its owner one time, on their own device... |
 | `roles/` | Role adapters: one module per (role, adapter) pair |
 | `run.py` | `ws run JOB`: every headless job goes through here and leaves one complete record in `runs.jsonl` |
 | `runrecord.py` | The run record: one JSON line per headless job in `<state>/logs/runs.jsonl`, the same shape for... |
@@ -70,6 +71,7 @@ below, and `python3 scripts/gen_code_map.py --check` (prek and CI) fails when it
 | `skills/` | The skills ws ships (`align`, `checkpoint`, `taste-gate`, `dataviz`, `resume`, `ship`) and how... |
 | `status.py` | `ws status`: for each runner, every rules, skill, hook and MCP file it will load here, with... |
 | `style.py` | The terminal style every `ws` command prints with: a status glyph and word, headings, key/value... |
+| `tailnet.py` | The tailnet checks a one-shot phone page uses: which address it may listen on, and whether a... |
 | `term/` | `ws term`: a browser terminal that behaves like a native one, for reaching a ws machine from a... |
 | `testing/` | Test support that ships with ws: the mock model provider and its scenarios |
 | `ui/` | The shared page toolkit: the ws look as CSS, small HTML components, and the loopback server that... |

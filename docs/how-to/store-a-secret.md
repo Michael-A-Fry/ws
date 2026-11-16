@@ -87,6 +87,12 @@ to a page that shows it once, on your own device:
 - after **Show**, the page is closed for good, nothing is cached and nothing is logged;
 - an unused link stops working after 15 minutes. `--again` shows a value a second time.
 
+An AI session may run exactly two of these for you, so you never type them: `ws secret generate NAME` (never with
+`--replace`) and `ws secret reveal NAME` (with `--again` or `--minutes N` at most, and only on the tailnet). Neither lets
+the session see a value: the page refuses this machine's own addresses. Every other `ws secret` command stays yours, a
+walled class's session gets neither, and each generate and reveal writes a line (who, which name, when; never the
+value) to `logs/secrets-audit.jsonl` in the state folder.
+
 ## Success
 
 `ws secret list` shows the name with the state `set`. `ws doctor` shows WS104 `ok` after the wall (`warn` before it:

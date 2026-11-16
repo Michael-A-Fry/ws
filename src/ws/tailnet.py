@@ -65,6 +65,22 @@ def whois_ok(ip: str, owner: str | None, run: Callable[[list[str]], str] = _run)
     return isinstance(login, str) and login.startswith(owner) and not tags
 
 
+def own_addresses(run: Callable[[list[str]], str] = _run) -> set[str]:
+    """This machine's own tailnet addresses (`tailscale ip`, IPv4 and IPv6). A page refuses a client at one of them: a
+    program on this machine (an agent session, say) must not pass for the owner's phone. Empty on any error."""
+    out: set[str] = set()
+    try:
+        lines = run(["tailscale", "ip"]).splitlines()
+    except (OSError, subprocess.SubprocessError):
+        return out
+    for line in lines:
+        try:
+            out.add(str(ipaddress.ip_address(line.strip())))
+        except ValueError:
+            continue
+    return out
+
+
 def headers(csp: str) -> list[tuple[str, str]]:
     """The headers every page response carries: no-store, no referrer, no framing, nosniff and the page's own CSP."""
     return [

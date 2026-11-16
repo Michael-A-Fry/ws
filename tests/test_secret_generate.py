@@ -386,3 +386,193 @@ def test_generate_replace_clears_the_shown_marker(generated, capsys):
     (folder / "backup-password").write_text("x", encoding="utf-8")
     assert run(capsys, "secret", "generate", "backup-password", "--replace")[0] == 0
     assert not reveal.consumed("backup-password", folder)
+
+
+# ---- the reviewer's two cases -----------------------------------------------------------------------------------------
+
+
+def test_a_page_that_loses_the_marker_race_finishes_at_once(generated):
+    p = Page(Path())
+    folder = reveal.marker_dir()
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "backup-password").write_text("x", encoding="utf-8")  # another page showed it a moment ago
+    status, _, body = p.req("POST")
+    assert status == 410 and generated not in body
+    p.thread.join(5)
+    assert not p.thread.is_alive() and p.page.result == "taken"
+
+
+def test_a_failed_read_shows_nothing_and_leaves_no_marker(generated, monkeypatch):
+    p = Page(Path())
+
+    def broken(self, name):
+        raise wsecrets.SecretsError("a store file does not hold a usable value")
+
+    monkeypatch.setattr(wsecrets.Store, "read", broken)
+    status, _, body = p.req("POST")
+    assert status == 410 and "Nothing to show" in body
+    p.thread.join(5)
+    assert p.page.result == "failed"
+    assert not reveal.consumed("backup-password", reveal.marker_dir()), "nothing was shown, so a new link may show it"
+
+
+def test_own_addresses_reads_tailscale_ip_and_is_empty_on_error():
+    assert tailnet.own_addresses(run=lambda argv: f"{TS4}\n{TS6}\nnoise\n") == {TS4, TS6}
+
+    def boom(argv):
+        raise OSError("no tailscale")
+
+    assert tailnet.own_addresses(run=boom) == set()
+
+
+# ---- the two forms a session may run (lead ruling on DEC-099) ---------------------------------------------------------
+
+from ws import agentsession, policy, wallsettings
+
+ALLOWED_WORDS = [
+    ["secret", "generate", "backup-password"],
+    ["--json", "secret", "generate", "backup-password"],
+    ["secret", "reveal", "backup-password"],
+    ["secret", "reveal", "backup-password", "--again"],
+    ["secret", "reveal", "backup-password", "--minutes", "5"],
+    ["secret", "reveal", "backup-password", "--again", "--minutes", "15"],
+]
+REFUSED_WORDS = [
+    ["secret", "generate", "backup-password", "--replace"],
+    ["secret", "generate", "--replace", "backup-password"],
+    ["secret", "generate", "a", "b"],
+    ["secret", "generate", "-x"],
+    ["secret", "generate"],
+    ["secret", "reveal", "backup-password", "--allow-loopback"],
+    ["secret", "reveal", "backup-password", "--owner", "someone@"],
+    ["secret", "reveal", "backup-password", "--bind", "127.0.0.1"],
+    ["secret", "reveal", "backup-password", "--minutes", "0"],
+    ["secret", "reveal", "backup-password", "--minutes"],
+    ["secret", "reveal", "backup-password", "--again", "--again"],
+    ["secret", "reveal"],
+    ["secret", "list"],
+    ["secret", "list", "--values"],
+    ["secret", "set", "backup-password"],
+    ["secret", "rm", "backup-password"],
+    ["secret", "import", "backup-password", "--from-env", "x.env"],
+    ["secret", "wall"],
+    ["secret", "generated", "backup-password"],
+]
+
+
+def test_the_wall_marker_is_the_walls_own():
+    assert agentsession.WALL_MARKER == wallsettings.WALL_MARKER
+
+
+@pytest.mark.parametrize("words", ALLOWED_WORDS, ids=" ".join)
+def test_a_session_may_run_the_two_exact_forms(words, monkeypatch):
+    monkeypatch.delenv(agentsession.WALL_MARKER, raising=False)
+    assert agentsession.session_secret_words(words, {})
+    assert not policy.is_denied_command(policy.default_policy(), "ws " + " ".join(words))
+    assert not policy.is_denied_command(policy.default_policy(), "uv run ws " + " ".join(words))
+
+
+@pytest.mark.parametrize("words", REFUSED_WORDS, ids=" ".join)
+def test_every_neighbour_stays_admin(words, monkeypatch):
+    monkeypatch.delenv(agentsession.WALL_MARKER, raising=False)
+    assert not agentsession.session_secret_words(words, {})
+    assert policy.is_denied_command(policy.default_policy(), "ws " + " ".join(words))
+
+
+@pytest.mark.parametrize("words", ALLOWED_WORDS, ids=" ".join)
+def test_a_walled_session_gets_neither(words, monkeypatch):
+    monkeypatch.setenv(agentsession.WALL_MARKER, "1")
+    assert not agentsession.session_secret_words(words, {agentsession.WALL_MARKER: "1"})
+    assert policy.is_denied_command(policy.default_policy(), "ws " + " ".join(words))
+
+
+def test_a_compound_line_is_read_whole(monkeypatch):
+    monkeypatch.delenv(agentsession.WALL_MARKER, raising=False)
+    pol = policy.default_policy()
+    assert policy.is_denied_command(pol, "ws secret generate backup-password && ws secret list")
+    assert policy.is_denied_command(pol, "ws secret generate backup-password; ws secret rm vendor")
+
+
+def _guarded(argv, env):
+    import argparse as _argparse
+
+    parser = cli.build_parser()
+    ns = parser.parse_args(argv)
+    if not getattr(ns, "ws_command", None):
+        ns.ws_command = ".".join(a for a in argv[:2])
+    agentsession.guard(ns, env=env, stdin_tty=False, stdout_tty=False, ancestry=lambda: ["bash", "claude"])
+    return _argparse
+
+
+@pytest.mark.parametrize(
+    ("argv", "ok"),
+    [
+        (["secret", "generate", "backup-password"], True),
+        (["secret", "generate", "backup-password", "--replace"], False),
+        (["secret", "reveal", "backup-password"], True),
+        (["secret", "reveal", "backup-password", "--again", "--minutes", "5"], True),
+        (["secret", "reveal", "backup-password", "--allow-loopback"], False),
+        (["secret", "reveal", "backup-password", "--owner", "x@"], False),
+        (["secret", "reveal", "backup-password", "--bind", "127.0.0.1"], False),
+        (["secret", "list"], False),
+        (["secret", "set", "backup-password"], False),
+    ],
+)
+def test_ws_itself_applies_the_same_rule(argv, ok, home):
+    from ws.output import WsError
+
+    for env, want in (({}, ok), ({agentsession.WALL_MARKER: "1"}, False)):
+        try:
+            _guarded(argv, env)
+            passed = True
+        except WsError as e:
+            assert e.exit_code == 3
+            passed = False
+        assert passed is want, (argv, env)
+
+
+# ---- the audit line -------------------------------------------------------------------------------------------------
+
+
+def audit_lines():
+    p = wsecrets.paths.state_dir() / "logs" / wsecrets.AUDIT_LOG
+    return [json.loads(x) for x in p.read_text(encoding="utf-8").splitlines()] if p.is_file() else []
+
+
+def test_generate_and_reveal_each_write_an_audit_line_and_never_the_value(generated, capsys):
+    (line,) = audit_lines()
+    assert (line["action"], line["name"], line["result"]) == ("generate", "backup-password", "made")
+    assert line["user"] and isinstance(line["in_session"], bool) and line["ts"]
+    made = []
+    real = reveal.make_page
+
+    def spy(*a, **k):
+        made.append(real(*a, **k))
+        return made[-1]
+
+    import unittest.mock
+
+    with unittest.mock.patch.object(reveal, "make_page", spy):
+        t = threading.Thread(
+            target=lambda: cli.main(["secret", "reveal", "backup-password", "--allow-loopback", "--minutes", "1"]),
+            daemon=True,
+        )
+        t.start()
+        for _ in range(100):
+            if made:
+                break
+            t.join(0.05)
+        c = http.client.HTTPConnection("127.0.0.1", made[0].server.server_address[1], timeout=10)
+        c.request("POST", f"/{made[0].token}", body=b"")
+        c.getresponse().read()
+        t.join(10)
+    out = capsys.readouterr()
+    lines = audit_lines()
+    assert [(x["action"], x["result"]) for x in lines] == [
+        ("generate", "made"),
+        ("reveal", "started"),
+        ("reveal", "revealed"),
+    ]
+    log = (wsecrets.paths.state_dir() / "logs" / wsecrets.AUDIT_LOG).read_text(encoding="utf-8")
+    assert generated not in log and made[0].token not in log
+    assert generated not in out.out + out.err

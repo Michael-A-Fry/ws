@@ -101,7 +101,8 @@ def _send(handler: BaseHTTPRequestHandler, code: int, body: str) -> None:
 
 class Page:
     """One reveal page. `serve(lifetime)` blocks until it is used or expires, then shuts the server down and returns
-    the result: "revealed", "expired" or "stopped"."""
+    the result: "revealed", "expired", "stopped", "failed" (the store could not be read; nothing was shown) or "taken"
+    (another page showed it first)."""
 
     def __init__(self, name: str, store: Store, folder: Path, allowed: Callable[[str], bool]):
         self.name = name
@@ -140,17 +141,26 @@ class Page:
 
     def reveal(self, handler: BaseHTTPRequestHandler) -> None:
         """Answer the Show button: mark used (in memory and on disk), then send the value, once."""
+        gone = "<h1>Already used</h1><p>This page has done its job. Nothing more here.</p>"
         with self.lock:
-            if self.used or not _mark(self.name, self.folder):
-                self.used = True
-                return _send(handler, 410, "<h1>Already used</h1><p>This page has done its job. Nothing more here.</p>")
+            if self.used:
+                return _send(handler, 410, gone)
             self.used = True
+            if not _mark(self.name, self.folder):  # another page or process showed it first: this one is finished
+                self.result = "taken"
+                try:
+                    return _send(handler, 410, gone)
+                finally:
+                    self.done.set()
             try:
                 value: str | None = self.store.read(self.name)
             except (FileNotFoundError, SecretsError):
+                clear(self.name, self.folder)  # nothing left the machine, so a new link may show it
                 self.result = "failed"
-                self.done.set()
-                return _send(handler, 410, "<h1>Nothing to show</h1><p>ws could not read the value.</p>")
+                try:
+                    return _send(handler, 410, "<h1>Nothing to show</h1><p>ws could not read the value.</p>")
+                finally:
+                    self.done.set()
             self.result = "revealed"
         body = (
             f"<h1>{html.escape(self.name)}</h1>"

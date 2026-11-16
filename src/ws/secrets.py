@@ -551,6 +551,39 @@ def cmd_rm(args: argparse.Namespace) -> int:
     return 0
 
 
+AUDIT_LOG = "secrets-audit.jsonl"
+
+
+def _audit(action: str, name: str, result: str) -> None:
+    """One line in `<state>/logs/secrets-audit.jsonl` per generate and reveal: who, which name, when, what came of it.
+    Never a value, a link or a token. Best effort: a full disk does not undo a value that was stored."""
+    import getpass as _getpass
+    from datetime import UTC, datetime
+
+    from ws import agentsession, jsonl
+
+    try:
+        who = _getpass.getuser()
+    except (OSError, KeyError):
+        who = "?"
+    try:
+        session = agentsession.refusal(os.environ, sys.stdin.isatty(), sys.stdout.isatty()) is not None
+    except OSError:
+        session = True
+    rec = {
+        "schema": 1,
+        "type": "ws.secret-audit/1",
+        "ts": datetime.now(UTC).isoformat(timespec="seconds"),
+        "action": action,
+        "name": name,
+        "result": result,
+        "user": who,
+        "in_session": session,
+    }
+    with contextlib.suppress(OSError):
+        jsonl.append(paths.state_dir() / "logs" / AUDIT_LOG, rec)
+
+
 def _registered(name: str) -> Entry:
     reg = load_registry(registry_path())
     if name not in reg:
@@ -588,6 +621,7 @@ def cmd_generate(args: argparse.Namespace) -> int:
             )
         store.write(args.name, pysecrets.token_urlsafe(GENERATE_BYTES))
         reveal.clear(args.name, reveal.marker_dir())
+        _audit("generate", args.name, "replaced" if had else "made")
     except SecretsError as e:
         raise WsError("failed", str(e), "see `ws help secret`") from e
     except PermissionError as e:
@@ -659,12 +693,16 @@ def cmd_reveal(args: argparse.Namespace) -> int:
     if not loopback and owner is None:
         raise WsError("usage", "no owner is set, so no device would be let in", _NO_OWNER, 2)
 
+    own = set() if loopback else {addr, *tailnet.own_addresses()}
+
     def allowed(ip: str) -> bool:
         if loopback:  # only with --allow-loopback (bind_ok refuses loopback otherwise): this machine's own clients
             try:
                 return ipaddress.ip_address(ip).is_loopback
             except ValueError:
                 return False
+        if ip in own:  # a program on this machine is not the owner's device, whoever tailscale says it is
+            return False
         return tailnet.whois_ok(ip, owner)
 
     try:
@@ -679,10 +717,12 @@ def cmd_reveal(args: argparse.Namespace) -> int:
     print(url, file=sys.stderr if args.json else sys.stdout, flush=True)  # --json: stdout holds only the envelope
     if not args.json:
         print(
-            f"ws: open that link on your own device within {minutes} minutes; it shows {args.name} once",
+            f"ws: open that link on your own device within {minutes} minute{'' if minutes == 1 else 's'}; it shows {args.name} once",
             file=sys.stderr,
         )
+    _audit("reveal", args.name, "started")
     result = page.serve(minutes * 60)
+    _audit("reveal", args.name, result)
     if args.json:
         output.result({"name": args.name, "url": url, "result": result})
     elif result == "revealed":

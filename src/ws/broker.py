@@ -60,7 +60,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from ws import __version__, output, paths
 from ws import secrets as wsecrets
@@ -576,6 +576,22 @@ class _Grant:
     area: str | None = None
     tier: str | None = None
     elevated: bool = False
+    paths: tuple[str, ...] = ()  # request-path prefixes the proxy forwards; empty: any
+
+
+def path_allowed(prefixes: tuple[str, ...], path: str) -> bool:
+    """True when the proxy may forward `path` for a grant whose name lists `prefixes` (none listed: any path). A prefix
+    matches on a folder boundary (`/v1` allows `/v1` and `/v1/x`, not `/v1x`). An encoded slash or backslash, or a `.` or
+    `..` part, is refused: it could climb out of the prefix once the upstream decodes it."""
+    if not prefixes:
+        return True
+    low = path.lower()
+    if "%2f" in low or "%5c" in low or "\\" in path:
+        return False
+    parts = unquote(path).split("/")
+    if any(p in (".", "..") for p in parts):
+        return False
+    return any(path == pre.rstrip("/") or path.startswith(pre if pre.endswith("/") else pre + "/") for pre in prefixes)
 
 
 @dataclass
@@ -885,6 +901,7 @@ class Broker:
             area=rec.area if rec is not None else None,
             tier=rec.tier if rec is not None else None,
             elevated=entry.elevated,
+            paths=entry.paths,
         )
         with self._lock:
             self._purge(now)
@@ -1455,6 +1472,8 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             if not m:
                 raise _HttpError(404, "not_found")
             grant = b.grant_for(m.group(1))
+            if not path_allowed(grant.paths, m.group(2) or "/"):
+                raise _HttpError(403, "path_not_allowed")
             header, value = b.credential(grant)
             target = (m.group(2) or "/") + (f"?{query}" if query else "")
             body = self._read_body()

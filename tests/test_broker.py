@@ -1315,3 +1315,41 @@ def test_the_request_audit_line_counts_that_names_open_leases(env):
     assert [a["leases"] for a in ok if a["name"] == "anthropic"] == [1, 2, 3]
     assert [a["leases"] for a in ok if a["name"] == "github"] == [1]
     assert VALUE not in env.log.read_text()
+
+
+# -- a path allow list per name (B3), and the stored value's repr (rr-M5)
+
+
+def _paths_registry(env, allowed: str) -> None:
+    env.write_registry(f'[anthropic]\nhosts = ["{env.stub.host}"]\npaths = {allowed}\n')
+
+
+def test_a_name_with_paths_forwards_only_those_and_the_stub_never_sees_the_rest(env):
+    _paths_registry(env, '["/v1/messages", "/v1/models/"]')
+    lease = env.lease()
+    assert env.call("/v1/messages", lease=lease)[0] == 200
+    assert env.call("/v1/messages/batch", lease=lease)[0] == 200  # inside the prefix
+    assert env.call("/v1/models/x", lease=lease)[0] == 200
+    seen = len(env.stub.seen)
+    for bad in ("/v1/other", "/v1/messagesX", "/", "/v1/../etc", "/v1/messages/%2e%2e/admin", "/v1/messages%2fx"):
+        assert env.call(bad, lease=lease)[0] == 403, bad
+    assert len(env.stub.seen) == seen  # a refused path never reached the upstream
+    assert any(a["op"] == "proxy" and a["status"] == "path_not_allowed" for a in env.audit())
+
+
+def test_a_name_without_paths_forwards_any_path(env):
+    assert env.call("/anything/at/all")[0] == 200
+
+
+@pytest.mark.parametrize("bad", ['["v1"]', '["/v1?x=1"]', '["/v1/../x"]', '["/%2e"]', '["/a b"]', '"/v1"'])
+def test_a_bad_paths_entry_refuses_the_whole_registry(env, bad):
+    _paths_registry(env, bad)
+    with pytest.raises(wsecrets.SecretsError, match="paths|path prefix|list"):
+        wsecrets.load_registry(env.registry)
+
+
+def test_a_stored_values_repr_and_str_show_no_value(env):
+    for obj in (env.store, wsecrets.load_registry(env.registry)["anthropic"]):
+        assert VALUE not in repr(obj) and VALUE not in str(obj)
+    assert VALUE not in repr(env.store.read("anthropic").__class__)  # the class name, not the value
+    assert VALUE not in repr(vars(env.store))

@@ -494,7 +494,9 @@ def test_orphaned_process_cannot_send(plain):
             res = "sent %d" % msg.send("bravo", "note", "hi")["id"]
         except Exception as e:
             res = type(e).__name__ + ":" + getattr(e, "kind", "")
-        open(out, "w").write(res)
+        with open(out + ".tmp", "w") as f:
+            f.write(res)
+        os.replace(out + ".tmp", out)  # atomic: the test waits for `out` to exist, so it must never see it empty
         """
     )
     env = {**os.environ}

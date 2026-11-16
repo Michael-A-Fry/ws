@@ -53,6 +53,8 @@ body of the GitHub release.
 
 ### Fixed
 
+- Flaky tests: the two orphan tests (`test_msg.py`, `test_session_registry.py`) write their result file whole, through
+  a temporary file and a rename. Before, the test could find the file created but still empty, and fail with `''`.
 - The launchd scheduler switches off only the agents it loaded. Each plist now carries `WsWrittenBy: ws`, and
   `ws schedule`, `ws uninstall` and `ws schedule apply` boot out a `ws.job.*` label only when `launchctl print` shows
   it was loaded from a plist under `jobs/units/` or one with that key. A label someone else loaded is left alone and

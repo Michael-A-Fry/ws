@@ -326,9 +326,7 @@ KINDS: dict[str, Kind] = dict(
             _state("node", "footprint"),
             ("schema", "ts", "type", "node", "op", "step", "kind"),
         ),
-        _logrow(
-            "ask", "adapters.opencode", "OpenCode asks", _ASKS, ("schema", "ts", "event", "id", "repo", "session"), "id"
-        ),
+        _logrow("ask", "adapters.opencode", "Asks", _ASKS, ("schema", "ts", "event", "id", "repo", "session"), "id"),
         _logrow(
             "broker",
             "broker",

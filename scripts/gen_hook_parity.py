@@ -90,7 +90,7 @@ def render(rows: list[dict] | None = None) -> str:
     ]
     for n, r in enumerate(rows, 1):
         status = r["status"] + (f" (wave {r['wave']})" if r["status"] == "planned" else "")
-        test = f"`{r['test']}`" if r["test"] != "none" else "none"
+        test = ", ".join(f"`{t}`" for t in r["test"].split(", ")) if r["test"] != "none" else "none"
         lines.append(f"| {n} | `{r['id']}` | {r['what']} | {r['ws']} | {status} | {r['fail']} | {test} |")
     return HEAD + "\n".join(lines) + "\n" + TAIL
 

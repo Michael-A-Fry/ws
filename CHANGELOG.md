@@ -13,11 +13,9 @@ body of the GitHub release.
 - The command reader's time limit counts its own CPU time, not the wall clock, so a busy or slow machine (a CI runner,
   WSL2) no longer refuses an ordinary long command, such as `touch f{1..4000}`, as too slow to read. The wall clock still
   stops a read that waits, at three times the limit.
-- Two flaky tests: the claims test that git can't answer in time now makes a commit whose id the guard reads as a commit
-  (about one in 110 is all digits, and it was allowed either way), and the reveal-link test waits on the push itself
-  instead of 5 s of polling. The tests that check the reader is quick measure its CPU time too, as the limit does.
-  The live conformance row that drives two real runner sessions is sized large, like the end-to-end tests it
-  matches, not small (60 s).
+- Flaky tests: the reveal-link test waits on the push itself instead of 5 s of polling; the tests that check the reader
+  is quick measure its CPU time too, as the limit does; and the live conformance row that drives two real runner
+  sessions is sized large, like the end-to-end tests it matches, not small (60 s).
 
 ## [0.1.11] - 2026-11-17
 

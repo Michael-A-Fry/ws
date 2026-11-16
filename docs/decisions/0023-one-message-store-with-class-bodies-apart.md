@@ -118,9 +118,9 @@ What this stops, and what it doesn't. The token is only as private as the wall t
 | policy says `sandbox = false`; macOS; the resident gate's child | refused | `test_no_wall_in_policy_refuses`, `test_macos_is_refused_until_its_profile_is_run`, `test_the_resident_gate_child_is_never_a_person` |
 
 Not tested, so stated as open: `systemd-run --user` and `tmux new-window` start a process from another daemon, which
-may sit outside the launch wall's mount namespace; if it does it can read the token. The e2e case does not cover them.
+may sit outside the launch wall's mount namespace; if it does it can read the token. The e2e case doesn't cover them.
 Also open: the policy's `sandbox = true` is intent, not fact. A session launched with `--no-sandbox` under a policy
-that says on can read the token, and ws does not yet stamp "walled" on the identity record to refuse while such a
+that says on can read the token, and ws doesn't yet stamp "walled" on the identity record to refuse while such a
 session is live (it needs the launcher, a follow-up with C111). The token's folder must exist when a runner starts for
 the wall to hide it, so `ws msg person-token` refuses to make that folder; the install makes it.
 

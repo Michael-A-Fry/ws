@@ -1043,15 +1043,13 @@ ws commit-wall uninstall [-h] [--repo REPO]
 Scan the staged diff, or a commit message with `--stage commit-msg FILE`, now. Exit 1 on a hit.
 
 ```text
-ws commit-wall check [-h] [--stage {pre-commit,commit-msg,pre-push}] [--repo REPO] [--remote REMOTE]
-    [--wall-dir WALL_DIR] [file]
+ws commit-wall check [-h] [--stage {pre-commit,commit-msg,pre-push}] [--repo REPO] [--wall-dir WALL_DIR] [file]
 ```
 
 | Argument | Meaning |
 |---|---|
 | `--stage STAGE` | `pre-commit` (the staged diff, default), `commit-msg` or `pre-push` (the commits a push would send, read from stdin). |
 | `--repo REPO` | The repository (default: here). |
-| `--remote REMOTE` | `--stage pre-push`: the remote name git gives the hook. |
 | `--wall-dir WALL_DIR` | The config folder to read (the hooks pass the one they were installed with). |
 | `file` | The message file, for `--stage commit-msg`. |
 

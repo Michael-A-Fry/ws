@@ -11,8 +11,10 @@ file is read as text (`--text --no-textconv`, so a NUL byte, a `-diff` attribute
 on newlines only, invalid UTF-8 is read as it is, and the file names are scanned too. Text is matched as written and again
 after Unicode NFKC normalisation. A commit message is scanned in full, `#` lines included (`-m` and `--cleanup=verbatim` keep
 them). `--stage commit-msg FILE` scans the message in FILE. `--stage pre-push` reads the lines git gives a pre-push hook and scans the
-content and message of every commit the push would send, which catches a commit made with no commit hook (`git stash` then a
-fast-forward, `git commit-tree`). `git am` runs `applypatch-msg` (the message) and `pre-applypatch` (the staged patch). With no pattern (`patterns.toml` missing or empty) the check
+ref names, tag messages and the content and message of every commit the push would send, which catches a commit made with no
+commit hook (`git stash` then a fast-forward, `git commit-tree`). Which commits are new comes only from the push's own lines and
+from the commits the wall passed before (`passed.txt`, in its own folder): a remote-tracking ref in the repository can be planted,
+so it counts for nothing. A tree pushed directly is refused. `git am` runs `applypatch-msg` (the message) and `pre-applypatch` (the staged patch). With no pattern (`patterns.toml` missing or empty) the check
 refuses: a wall with nothing to look for is a gap, not a pass.
 
 `<config>/commit-wall/exceptions.toml` lists what to let through, as `[[allow]]` tables with any of `pattern` (its
@@ -161,10 +163,11 @@ def _allowed(allows: list[Allow], path: str, pattern: str, text: str) -> bool:
     )
 
 
-def _run(repo: str, *args: str) -> subprocess.CompletedProcess:
+def _run(repo: str, *args: str, stdin: bytes | None = None) -> subprocess.CompletedProcess:
     try:
         return subprocess.run(
             ["git", "-c", "core.quotePath=false", "-C", repo, *args],
+            input=stdin,
             capture_output=True,
             timeout=GIT_SECONDS,
             check=False,
@@ -257,25 +260,83 @@ def staged_lines(repo: str) -> list[tuple[str, int, str]]:
     return lines + named
 
 
-ZERO = "0" * 40
+PASSED = "passed.txt"  # commits the wall has scanned and let through a push, one per line, in the wall's own (protected) folder
+
+
+def _passed(base: Path) -> list[str]:
+    try:
+        return [x for x in (base / PASSED).read_text(encoding="utf-8").split() if re.fullmatch(r"[0-9a-f]{40,64}", x)]
+    except OSError:
+        return []
+
+
+def _present(repo: str, shas: list[str]) -> list[str]:
+    """The commits among `shas` this repository has (git refuses a `^sha` it doesn't know)."""
+    if not shas:
+        return []
+    done = _run(repo, "cat-file", "--batch-check", stdin=("\n".join(shas) + "\n").encode())
+    rows = _decode(done.stdout).splitlines()
+    return [s for s, row in zip(shas, rows, strict=False) if row.split()[1:2] == ["commit"]]
+
+
+def _peel(repo: str, sha: str) -> tuple[list[tuple[str, int, str]], str | None, str]:
+    """(lines, commit, refusal): the lines of each tag message on the way from `sha` to what it points at and of a blob it points at,
+    the commit it ends at, and why it can't be scanned (a tree pushed directly). A tag on a tag is followed."""
+    lines: list[tuple[str, int, str]] = []
+    for _ in range(20):
+        kind = _git(repo, "cat-file", "-t", sha).strip()
+        if kind == "commit":
+            return lines, sha, ""
+        if kind == "tag":
+            text = _git(repo, "cat-file", "tag", sha)
+            lines += [(f"(tag {sha[:10]})", i, tx) for i, tx in enumerate(text.split("\n"), 1)]
+            target = next(
+                (x.split()[1] for x in text.split("\n") if x.startswith("object ") and len(x.split()) > 1), ""
+            )
+            if not target:
+                return lines, None, f"tag {sha[:10]} names no object"
+            sha = target
+        elif kind == "blob":
+            body = _git(repo, "cat-file", "blob", sha)
+            return lines + [(f"(blob {sha[:10]})", i, tx) for i, tx in enumerate(body.split("\n"), 1)], None, ""
+        else:
+            return lines, None, f"a {kind} object ({sha[:10]}) is pushed directly and can't be scanned"
+    return lines, None, "a chain of more than 20 tags"
 
 
 def pushed_hits(
-    repo: str, remote: str, stdin: str, patterns: list[Pattern], allows: list[Allow]
+    repo: str, stdin: str, patterns: list[Pattern], allows: list[Allow], base: Path
 ) -> tuple[list[Hit], int]:
-    """Scan the content and message of every commit the push lines (git's pre-push input) would send. A new branch is every
-    commit not already on a remote-tracking branch of `remote`; an update is `<remote sha>..<local sha>`, or the same as a new
-    branch when the remote's commit isn't here. A deletion sends nothing."""
+    """Scan what the push lines (git's pre-push input) would send: the ref names, each tag's message, a blob a tag points at, and the
+    content, message and file names of every commit. Which commits are new is decided only from what the push itself says (the
+    remote's own commit ids on its lines) and from the commits this wall has passed before (`passed.txt`): a remote-tracking ref in
+    the repository is something a session can plant, so it counts for nothing. A tree pushed directly is refused. Commits scanned
+    clean are added to `passed.txt`. A deletion sends nothing."""
     hits: list[Hit] = []
     scanned = 0
-    for row in stdin.splitlines():
-        parts = row.split()
-        if len(parts) != 4 or set(parts[1]) == {"0"}:
+    rows = [r.split() for r in stdin.splitlines() if len(r.split()) == 4]
+    floor = _present(repo, sorted({r[3] for r in rows if set(r[3]) != {"0"}} | set(_passed(base))))
+    floor_input = ("\n".join(f"^{s}" for s in floor) + "\n").encode()
+    sent: list[str] = []
+    for local_ref, local, remote_ref, _remote_sha in rows:
+        names = [("(ref name)", 0, local_ref), ("(ref name)", 0, remote_ref)]
+        hits += scan(names, patterns, allows)
+        scanned += 2
+        if set(local) == {"0"}:
             continue
-        local, remote_sha = parts[1], parts[3]
-        known = set(remote_sha) != {"0"} and _run(repo, "cat-file", "-e", f"{remote_sha}^{{commit}}").returncode == 0
-        floor = [remote_sha] if known else [f"--remotes={remote}"]
-        for sha in _git(repo, "rev-list", local, "--not", *floor).split():
+        tag_lines, commit, refusal = _peel(repo, local)
+        hits += scan(tag_lines, patterns, allows)
+        scanned += len(tag_lines)
+        if refusal:
+            hits.append(Hit(f"({local_ref})", 0, "(unscanned object)"))
+        if commit is None:
+            continue
+        done = _run(repo, "rev-list", commit, "--stdin", stdin=floor_input)
+        if done.returncode:
+            raise WsError(
+                "not_a_repository", _decode(done.stderr).strip() or "git rev-list failed", "run it in a repository", 1
+            )
+        for sha in _decode(done.stdout).split():
             body = _git(repo, "log", "-1", "--format=%B", sha)
             lines = [(f"(message of {sha[:10]})", i, tx) for i, tx in enumerate(body.split("\n"), 1)]
             parent = bool(_git(repo, "rev-list", "--parents", "-1", sha).split()[1:])
@@ -289,12 +350,22 @@ def pushed_hits(
                 sha,
             )
             lines += added_lines(diff)
-            names = _git(
+            files = _git(
                 repo, "diff-tree", "--no-commit-id", "-r", "--name-only", "--no-renames", "-z", "--root", sha
             ).split("\0")
-            lines += [(n, 0, n) for n in names if n]
+            lines += [(n, 0, n) for n in files if n]
             scanned += len(lines)
-            hits += [Hit(f"{sha[:10]} {h.where}", h.line, h.pattern) for h in scan(lines, patterns, allows)]
+            found = [Hit(f"{sha[:10]} {h.where}", h.line, h.pattern) for h in scan(lines, patterns, allows)]
+            hits += found
+            if not found:
+                sent.append(sha)
+    if not hits and sent:
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+            with open(base / PASSED, "a", encoding="utf-8") as f:
+                f.write("\n".join(sent) + "\n")
+        except OSError:
+            pass  # the next push scans them again: slower, never weaker
     return hits, scanned
 
 
@@ -330,7 +401,7 @@ def cmd_check(args: argparse.Namespace) -> int:
             1,
         )
     if args.stage == "pre-push":
-        hits, scanned = pushed_hits(repo, args.remote or "", sys.stdin.read(), patterns, allows)
+        hits, scanned = pushed_hits(repo, sys.stdin.read(), patterns, allows, base)
         return _report(args, hits, len(patterns), scanned, base)
     if args.stage == "commit-msg":
         if not args.file:
@@ -405,7 +476,7 @@ def _script(name: str, ws: list[str], prior_dir: str, wall_dir: Path) -> str:
     if name == "pre-push":  # git feeds the refs on stdin: keep them for the check and for the hook the repository had
         return (
             f'{head}tmp=$(mktemp) || exit 1\ncat > "$tmp"\n'
-            f'{check} --stage pre-push --remote "$1" < "$tmp" || {{ rm -f "$tmp"; exit 1; }}\n'
+            f'{check} --stage pre-push < "$tmp" || {{ rm -f "$tmp"; exit 1; }}\n'
             f'old={old}\nif [ -x "$old" ]; then "$old" "$@" < "$tmp"; rc=$?; rm -f "$tmp"; exit $rc; fi\n'
             'rm -f "$tmp"\nexit 0\n'
         )
@@ -488,16 +559,22 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
 
 
 def _wired(rid: str, repo: str) -> str:
-    """'' when the repository's core.hooksPath really is the wall's folder, else what is wrong."""
-    got = _run(repo, "config", "--local", "--type=path", "--get", "core.hooksPath")
-    if got.returncode != 0:
-        return "core.hooksPath is not set" if got.returncode == 1 else "the repository can't be read"
+    """'' when git would run the wall's hooks in the repository and in each of its worktrees, else what is wrong. Judged by
+    `rev-parse --git-path hooks`, which already follows core.hooksPath wherever it was set (an include, a worktree's own config)."""
     here = os.path.realpath(folder() / "hooks" / rid)
-    return (
-        ""
-        if os.path.realpath(os.path.join(repo, _decode(got.stdout).strip())) == here
-        else "core.hooksPath points elsewhere"
-    )
+    listed = _run(repo, "worktree", "list", "--porcelain")
+    if listed.returncode:
+        return "the repository can't be read"
+    trees = [x[len("worktree ") :] for x in _decode(listed.stdout).split("\n") if x.startswith("worktree ")] or [repo]
+    for tree in trees:
+        if not os.path.isdir(tree):
+            continue  # a worktree whose folder is gone runs nothing
+        got = _run(tree, "rev-parse", "--path-format=absolute", "--git-path", "hooks")
+        if got.returncode:
+            return f"git can't say where {tree} runs its hooks"
+        if os.path.realpath(_decode(got.stdout).strip()) != here:
+            return f"{tree} runs its hooks from {_decode(got.stdout).strip()}, not the wall's folder"
+    return ""
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -523,7 +600,6 @@ def register(sub) -> None:
     cs = c.add_subparsers(dest="commit_wall_command", required=True)
     k = cs.add_parser("check", help="scan the staged diff (or a commit message) now; exit 1 on a hit")
     k.add_argument("--stage", choices=("pre-commit", "commit-msg", "pre-push"), default="pre-commit")
-    k.add_argument("--remote", help="--stage pre-push: the remote name git gives the hook")
     k.add_argument("--repo", default=".", help="the repository (default: here)")
     k.add_argument("--wall-dir", help="the config folder to read (the hooks pass the one they were installed with)")
     k.add_argument("file", nargs="?", help="the message file, for --stage commit-msg")

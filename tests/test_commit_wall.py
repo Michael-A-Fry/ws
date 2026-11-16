@@ -481,8 +481,89 @@ def test_status_says_when_hooks_path_does_not_point_at_the_wall(repo, capsys):
     git(repo, "config", "--local", "core.hooksPath", "/dev/null")
     assert cli.main(["commit-wall", "status"]) == 1
     err = capsys.readouterr().err
-    assert "NOT ON" in err and "points elsewhere" in err
+    assert "NOT ON" in err and "not the wall's folder" in err
     assert cli.main(["commit-wall", "status", "--json"]) == 1
-    assert json.loads(capsys.readouterr().out)["data"]["not_wired"][0]["why"] == "core.hooksPath points elsewhere"
+    assert json.loads(capsys.readouterr().out)["data"]["not_wired"][0]["why"].endswith("not the wall's folder")
     git(repo, "config", "--local", "--unset", "core.hooksPath")
     assert cli.main(["commit-wall", "status"]) == 1
+
+
+@needs_git
+def test_a_push_scans_tags_a_tag_message_a_blob_and_refuses_a_tree(repo, box):
+    wired(repo)
+    remote_for(repo, box)
+    assert git(repo, "push", "-q", "origin", "main", check=False).startswith("0\n")
+    git(repo, "tag", "-a", "v1", "-m", f"release {PLANT}")
+    out = git(repo, "push", "origin", "v1", check=False)
+    assert out.startswith("1\n") and "commit wall" in out and PLANT not in out.lower()
+    git(repo, "tag", "-a", "v2", "-m", "clean notes")
+    assert git(repo, "push", "origin", "v2", check=False).startswith(
+        "0\n"
+    )  # an annotated tag with a clean message goes
+    (repo / "planted.txt").write_text(f"{PLANT}\n")
+    blob = git(repo, "hash-object", "-w", "planted.txt").strip()
+    git(repo, "tag", "blobtag", blob)
+    assert git(repo, "push", "origin", "blobtag", check=False).startswith("1\n")
+    git(repo, "tag", "treetag", "HEAD^{tree}")
+    out = git(repo, "push", "origin", "treetag", check=False)
+    assert out.startswith("1\n") and "unscanned" in out
+
+
+@needs_git
+def test_a_planted_remote_tracking_ref_does_not_hide_commits_from_a_push(repo, box):
+    wired(repo)
+    remote_for(repo, box)
+    git(repo, "checkout", "-q", "-b", "topic")
+    (repo / "t.txt").write_text(f"{PLANT}\n")
+    git(repo, "add", "t.txt")
+    git(repo, "commit", "-q", "-m", "plant", "--no-verify")
+    sha = git(repo, "rev-parse", "HEAD").strip()
+    git(repo, "update-ref", "refs/remotes/origin/zz", sha)  # a session says the remote already has it
+    out = git(repo, "push", "origin", "topic", check=False)
+    assert out.startswith("1\n") and "t.txt" in out
+
+
+@needs_git
+def test_commits_the_wall_passed_before_are_not_scanned_again(repo, box):
+    wired(repo)
+    remote_for(repo, box)
+    assert git(repo, "push", "-q", "origin", "main", check=False).startswith("0\n")
+    passed = (commit_wall.folder() / "passed.txt").read_text().split()
+    assert git(repo, "rev-parse", "HEAD").strip() in passed
+    git(repo, "checkout", "-q", "-b", "later")
+    (repo / "l.txt").write_text("fine\n")
+    git(repo, "add", "l.txt")
+    git(repo, "commit", "-q", "-m", "later")
+    assert git(repo, "push", "origin", "later", check=False).startswith(
+        "0\n"
+    )  # a new branch: only its new commit is read
+
+
+@needs_git
+def test_the_ref_names_a_push_sends_are_scanned(repo, box):
+    wired(repo)
+    remote_for(repo, box)
+    git(repo, "branch", f"{PLANT}-x")
+    out = git(repo, "push", "origin", f"{PLANT}-x", check=False)
+    assert out.startswith("1\n") and "ref name" in out
+
+
+@needs_git
+def test_status_sees_a_hooks_path_set_by_an_include_or_a_worktrees_own_config(repo, box, capsys):
+    wired(repo)
+    assert cli.main(["commit-wall", "status"]) == 0
+    capsys.readouterr()
+    (box / "inc.cfg").write_text("[core]\n\thooksPath = /dev/null\n")
+    git(repo, "config", "--local", "include.path", str(box / "inc.cfg"))  # read after the wall's own setting: it wins
+    assert git(repo, "config", "--get", "core.hooksPath").strip() == "/dev/null"
+    assert cli.main(["commit-wall", "status"]) == 1
+    assert "NOT ON" in capsys.readouterr().err
+    git(repo, "config", "--local", "--unset", "include.path")
+    assert cli.main(["commit-wall", "status"]) == 0
+    capsys.readouterr()
+    wt = box / "wt"
+    git(repo, "worktree", "add", "-q", "-b", "other", str(wt))
+    git(repo, "config", "--local", "extensions.worktreeConfig", "true")
+    git(wt, "config", "--worktree", "core.hooksPath", "/dev/null")  # only that worktree is unguarded
+    assert cli.main(["commit-wall", "status"]) == 1
+    assert str(wt) in capsys.readouterr().err

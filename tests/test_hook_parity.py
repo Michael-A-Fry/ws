@@ -321,6 +321,30 @@ def test_parity_phone_alert(box, monkeypatch, capsys):
     assert cli.main(["notify", "alert", "--runner", "claude-code", *paths.pin_of().args()]) == 0  # no channel: silent
 
 
+# --- launch from the main checkout, and config-guard ---------------------------------------------------------------
+
+
+def test_parity_launch_from_main(box):
+    main, wt = box / "main", box / "wt"
+    (main / ".git").mkdir(parents=True)
+    wt.mkdir()
+    (wt / ".git").write_text("gitdir: x\n")
+    on = '[guards]\non = ["guard-launch"]\n'
+    assert hook(box, on, call("Workflow", cwd=wt, name="w")) == 2  # a workflow from a linked worktree
+    assert hook(box, on, call("Agent", cwd=wt, prompt="p", isolation="worktree")) == 2
+    assert hook(box, on, call("Workflow", cwd=main, name="w")) == 0
+    assert hook(box, on, call("Agent", cwd=wt, prompt="p")) == 0  # not isolated: allowed
+
+
+def test_parity_config_guard(box):
+    (box / "g").mkdir()
+    (box / "mine").mkdir()
+    on = f'[guards]\non = ["config-guard"]\n[guards.config-guard]\npaths = ["{box / "g"}"]\nowners = ["{box / "mine"}"]\n'
+    edit = {"file_path": str(box / "g" / "settings.json"), "content": "x"}
+    assert hook(box, on, call("Write", cwd=box, **edit)) == 2  # not the owner's folder
+    assert hook(box, on, call("Write", cwd=box / "mine", **edit)) == 0
+
+
 # --- the page and these tests agree ------------------------------------------------------------------------------
 
 
@@ -337,8 +361,9 @@ def test_every_hook_row_is_covered_by_a_test_or_says_why_not():
         assert r["what"] and r["ws"], r["id"]
         assert r["status"] in gen.STATUSES and r["fail"] in gen.FAILS, r["id"]
         if r["status"] == "covered":
-            assert r["test"] in mine, f"row {r['id']} names {r['test']}, which is not in tests/test_hook_parity.py"
-            named.add(r["test"])
+            for name in r["test"].split(", "):
+                assert name in mine, f"row {r['id']} names {name}, which is not in tests/test_hook_parity.py"
+                named.add(name)
         else:
             assert r["test"] == "none", r["id"]
             if r["status"] == "planned":

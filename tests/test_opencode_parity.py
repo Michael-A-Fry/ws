@@ -166,6 +166,13 @@ def rows(tmp: Path, sha: str = "abc1234def") -> dict[tuple[str, str], list[tuple
         ],
         ("claims", "pre"): [],  # OpenCode has no send-message tool: nothing can reach this event there
         ("claims", "stop"): [("", [S("stop", last=f"merged {sha} into main")], [0], work)],
+        ("config-guard", "pre"): [
+            (f'[guards.config-guard]\npaths = ["{work}/guarded"]\nowners = ["{main}"]\n',
+             [S("pre", "write", path=str(work / "guarded" / "s.json"), content="x"),
+              S("pre", "write", path=str(work / "free.txt"), content="x")],
+             ["ask", "allow"], work)
+        ],
+        ("guard-launch", "pre"): [("", [S("pre", "agent")], ["allow"], work)],  # a task call asks for no isolation
         ("dev-server", "pre"): [
             ("", [S("pre", "command", command="python3 -m http.server"), S("pre", "command", command="ls")],
              ["ask", "allow"], work)

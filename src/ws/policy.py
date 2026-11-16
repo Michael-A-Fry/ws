@@ -3007,8 +3007,11 @@ def _secret_env_write(path: str, env, ctx) -> str | Refusal | None:
     quoting, a heredoc, a variable set earlier on the line and a trailing redirect change nothing. A name with a part
     the reader cannot know (an unset variable) is refused, since it could be any file."""
     base = path.rsplit("/", 1)[-1]
-    if _glob_may_name_a_secret_env(base) or unknownpath.has_unknown(
-        unknownpath.split(base, frozenset(env), _producer(ctx, env))
+    # text read as a command only to keep a body from hiding one is not a word of the line: a name in it that can't be
+    # read is not a refusal (a here-document's prose), though a plain `.env` in it still is
+    if not ctx.bodies_as_commands and (
+        _glob_may_name_a_secret_env(base)
+        or unknownpath.has_unknown(unknownpath.split(base, frozenset(env), _producer(ctx, env)))
     ):
         return _write_refusal(
             f"command writes {path!r}, which holds a part ws cannot read, and it could be a secret .env file; "

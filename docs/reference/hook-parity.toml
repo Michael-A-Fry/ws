@@ -41,10 +41,10 @@ test = "test_parity_sealed_folders"
 [[hook]]
 id = "guardrail-files"
 what = "Lets the files that hold the guardrails be edited only by the session that owns them"
-ws = "ws protects its own policy, settings, hooks and folders from the edit tools and from shell redirects"
+ws = "ws protects its own policy, settings, hooks and folders from the edit tools and from shell redirects; the `config-guard` guard covers the edit tools for files and folders you name, edited only from the owner folders you list (a write through a link or to a file with more than one name is refused too); shell redirects to them are for the sandbox's write-deny list, which the guard doesn't judge"
 status = "covered"
 fail = "blocks"
-test = "test_parity_guardrail_files"
+test = "test_parity_guardrail_files, test_parity_config_guard"
 
 [[hook]]
 id = "bulk-staging"
@@ -105,10 +105,10 @@ test = "test_parity_test_weakening"
 [[hook]]
 id = "launch-from-main"
 what = "Refuses to launch isolated agents or workflows from anywhere but a repository's main checkout"
-ws = "none; it depends on the workflow tool and the folder layout in use"
-status = "estate"
+ws = "the `guard-launch` guard: a workflow, or an agent that asks for a worktree, starts only from a repository's main checkout"
+status = "covered"
 fail = "blocks"
-test = "none"
+test = "test_parity_launch_from_main"
 
 [[hook]]
 id = "workflow-fresh"

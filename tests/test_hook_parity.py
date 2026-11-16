@@ -321,6 +321,42 @@ def test_parity_phone_alert(box, monkeypatch, capsys):
     assert cli.main(["notify", "alert", "--runner", "claude-code", *paths.pin_of().args()]) == 0  # no channel: silent
 
 
+# --- launch from the main checkout, and config-guard ---------------------------------------------------------------
+
+
+@needs_git
+def test_parity_launch_from_main(box, monkeypatch):
+    from test_guard_launch_config import real_repos
+
+    main, wt = real_repos(box)
+    on = '[guards]\non = ["guard-launch"]\n'
+
+    def go(where, *a, **k):
+        monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(where))  # the folder the session started in
+        return hook(box, on, call(*a, cwd=where, **k))
+
+    assert go(wt, "Workflow", name="w") == 2  # a workflow from a linked worktree
+    assert go(wt, "Agent", prompt="p", isolation="worktree") == 2
+    assert go(main, "Workflow", name="w") == 0
+    assert go(wt, "Agent", prompt="p") == 0  # not isolated: allowed
+    (box / "plain").mkdir()
+    (box / "plain" / ".git").mkdir()  # a planted .git folder is not a repository
+    assert go(box / "plain", "Workflow", name="w") == 2
+
+
+def test_parity_config_guard(box, monkeypatch):
+    (box / "g").mkdir()
+    (box / "mine").mkdir()
+    on = f'[guards]\non = ["config-guard"]\n[guards.config-guard]\npaths = ["{box / "g"}"]\nowners = ["{box / "mine"}"]\n'
+    edit = {"file_path": str(box / "g" / "settings.json"), "content": "x"}
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(box))
+    assert hook(box, on, call("Write", cwd=box, **edit)) == 2  # not the owner's folder
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(box / "mine"))
+    assert hook(box, on, call("Write", cwd=box / "mine", **edit)) == 0
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(box))
+    assert hook(box, on, call("Write", cwd=box / "mine", **edit)) == 2  # the call moved itself into the owner's folder
+
+
 # --- the page and these tests agree ------------------------------------------------------------------------------
 
 
@@ -337,8 +373,9 @@ def test_every_hook_row_is_covered_by_a_test_or_says_why_not():
         assert r["what"] and r["ws"], r["id"]
         assert r["status"] in gen.STATUSES and r["fail"] in gen.FAILS, r["id"]
         if r["status"] == "covered":
-            assert r["test"] in mine, f"row {r['id']} names {r['test']}, which is not in tests/test_hook_parity.py"
-            named.add(r["test"])
+            for name in r["test"].split(", "):
+                assert name in mine, f"row {r['id']} names {name}, which is not in tests/test_hook_parity.py"
+                named.add(name)
         else:
             assert r["test"] == "none", r["id"]
             if r["status"] == "planned":

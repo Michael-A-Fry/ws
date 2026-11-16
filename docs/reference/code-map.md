@@ -14,6 +14,7 @@ below, and `python3 scripts/gen_code_map.py --check` (prek and CI) fails when it
 | `adapters/` | Runner adapters: one module per runner |
 | `agentsession.py` | Admin commands refuse to run inside an agent session: ws itself checks, whatever way the command... |
 | `approvals.py` | Bound, single-use approvals: how a call the policy marks `ask_commands` gets a human's yes, once |
+| `asks.py` | `ws ask`: a session leaves a question for its person, who answers it later; one queue across... |
 | `brand.py` | The ws look in one place: colour tokens by role, the mark, and the rule for when colour is on |
 | `broker.py` | The secrets broker: a small process that is not an LLM and holds the store, so agents never see... |
 | `canary.py` | `ws canary`: a few small checks that a runner's update did not break what ws relies on |

@@ -4,19 +4,12 @@
 # Conformance: every runner adapter is asked the same rows (gate parity, sandbox, budget, run record, skill, MCP, message).
 # Phase 5 (matrix-e2e, wsl, windows-native): the person's path, timed on every cell (install -> first task -> uninstall,
 # scripts/e2e_first_task.sh), and a credential-free smoke with no provider key set. The lab VM cell is lab.yml.
-# Nightly, and on pull requests that touch the CLI. Not a required check: a slow or flaky runner never blocks a PR.
+# Nightly, and on every pull request: the `changes` job decides whether the CLI is touched, the real jobs wait for it and
+# skip when it isn't, and `cli-required` always runs and is the one check the repository requires (a skipped job counts as
+# fine there, a failed or cancelled one does not). Requiring it is a repository setting, not this file.
 name: cli
 on:
   pull_request:
-    paths:
-      - "src/**"
-      - "tests/**"
-      - "scripts/check_fresh_doctor.py"
-      - "install.sh"
-      - "scripts/e2e_first_task.sh"
-      - "pyproject.toml"
-      - "uv.lock"
-      - ".github/workflows/cli.yml"
   schedule:
     - cron: "17 14 * * *" # 02:17 or 03:17 in Auckland
   workflow_dispatch:
@@ -25,7 +18,39 @@ concurrency:
   group: cli-${{ github.ref }}
   cancel-in-progress: true
 jobs:
+  # Does this pull request touch what the CLI jobs test? Always runs. A pull request that touches only docs skips the real
+  # jobs, and `cli-required` still reports, so a required check never waits on a job that was never created.
+  changes:
+    name: changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      relevant: ${{ steps.diff.outputs.relevant }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: diff
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ "$EVENT" != "pull_request" ]; then echo "relevant=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          # fail closed: a diff that cannot be read (a missing sha, a shallow history) must not look like "nothing changed"
+          if ! files="$(git diff --name-only "$BASE_SHA...$HEAD_SHA")"; then
+            echo "could not diff $BASE_SHA...$HEAD_SHA" >&2
+            exit 1
+          fi
+          if printf '%s\n' "$files" | grep -Eq '^(src/|tests/|scripts/check_fresh_doctor\.py$|install\.sh$|scripts/e2e_first_task\.sh$|pyproject\.toml$|uv\.lock$|\.github/workflows/cli\.yml$)'; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "relevant=false" >> "$GITHUB_OUTPUT"
+          fi
   doctor:
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
     name: doctor (${{ matrix.os }})
     strategy:
       fail-fast: false
@@ -54,8 +79,10 @@ jobs:
         env:
           WS_ORACLE_REQUIRE: ${{ runner.os == 'Linux' && '1' || '' }} # the oracle can't start a sandbox = a failure, not a skip
           # macOS runners are slower: core-tier times in the last six runs were 764 to 1004 s against the 900 s default
-          # (tests/plugins/ws_harness.py), so macOS gets 1200 s; Linux keeps the default
-          CORE_BUDGET: ${{ runner.os == 'macOS' && '1200' || '900' }}
+          # (tests/plugins/ws_harness.py). With the suite in parallel (#210) the summed times read 1304 and 1316 s on the hook PR and
+          # 1248 s on another, and 1439 s on #211 (16 Nov), every test passing: 1500 left a 4% margin, so macOS gets 1800 s;
+          # Linux keeps the default; a run past 1800 fails
+          CORE_BUDGET: ${{ runner.os == 'macOS' && '1800' || '900' }}
         run: uv run --locked pytest -q -rs -o ws_tier_budget_core="$CORE_BUDGET"
       # bash 3.2 on macOS and bash 5 on Linux both have to read it; --dry-run changes nothing on the runner
       - name: install.sh --help and --dry-run
@@ -86,6 +113,8 @@ jobs:
           PY
 
   gate-e2e:
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
     name: gate e2e (ubuntu-24.04, stub model)
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -132,9 +161,10 @@ jobs:
 
   # The runner conformance kit (docs/reference/conformance.md): the same table of rows for every runner adapter, plus the
   # live tier, which runs the real Claude Code and OpenCode against a stub model with only ws's hook able to refuse. No
-  # paid provider. Not a required check, like the rest of this file: the `paths:` filter above would leave a required
-  # check waiting on a docs-only pull request, and requiring it is a repository setting, not this file.
+  # paid provider. It is covered by `cli-required` like the rest of this file.
   conformance:
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
     name: conformance (ubuntu-24.04, stub model)
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -171,6 +201,8 @@ jobs:
   # Phase 3 pass test (row 3): a job's run record is complete against its schema on both runners. Same stub model, plus
   # a real broker lease to a stub upstream; no paid provider.
   run-e2e:
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
     name: run record e2e (ubuntu-24.04, stub model)
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -203,6 +235,8 @@ jobs:
   # whose upstream sees the injected header. The wall is built by running the commands `ws secret wall` prints (this
   # runner has passwordless sudo and systemd), then the pass test runs against that result.
   secret-wall:
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
     name: secret wall (ubuntu-24.04)
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -242,6 +276,8 @@ jobs:
   # mock provider (no network model, no real key), on a throw-away HOME and a WS_HOME with a space in its path. The
   # timing file is the artifact; the summary line goes to the job summary. /bin/bash is bash 3.2 on macOS.
   matrix-e2e:
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
     name: first task e2e (${{ matrix.os }}, mock model)
     strategy:
       fail-fast: false
@@ -293,6 +329,8 @@ jobs:
           if-no-files-found: warn
 
   wsl:
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
     name: doctor (windows-2025, WSL2 Ubuntu-24.04)
     runs-on: windows-2025
     timeout-minutes: 50  # WSL2 ran past 25 min on every PR from #190 (15 Nov); about 2x the measured floor
@@ -353,6 +391,8 @@ jobs:
           if-no-files-found: warn
 
   windows-native:
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
     name: doctor (windows-2025 native, points at WSL2)
     runs-on: windows-2025
     timeout-minutes: 15
@@ -377,3 +417,20 @@ jobs:
           WS_SMOKE_CMD: uv run --locked ws
           WS_E2E_CELL: windows-2025-native
         run: bash scripts/e2e_first_task.sh --smoke
+
+  # The one check the repository requires for this workflow. Runs even when the jobs above were skipped or failed.
+  cli-required:
+    name: cli-required
+    if: always()
+    needs: [changes, doctor, gate-e2e, conformance, run-e2e, secret-wall, matrix-e2e, wsl, windows-native]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: every job that ran passed (a skipped one is fine)
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "results: $RESULTS"
+          case " $RESULTS " in
+            *" failure "* | *" cancelled "*) echo "a job failed or was cancelled"; exit 1 ;;
+          esac

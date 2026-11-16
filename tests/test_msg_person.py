@@ -21,6 +21,7 @@ from ws.output import WsError
 
 ON = "[msg]\nperson_send = true\n"
 USER = session.PERSON + session.account_user()
+not_on_macos = pytest.mark.skipif(sys.platform == "darwin", reason="a person send is refused on macOS")
 T0 = 1_700_000_040.0  # the start of a rate window
 
 
@@ -54,6 +55,7 @@ def test_off_is_todays_behaviour(world):
         person_send(world)
 
 
+@not_on_macos
 def test_person_send_records_the_person(world):
     alone(world)
     token()
@@ -166,6 +168,7 @@ def test_a_session_still_sends_as_itself_even_with_the_token(world):
         msg.send("alpha", "note", "x")
 
 
+@not_on_macos
 def test_a_walled_class_refuses_the_person_by_default_and_takes_a_named_one(world):
     classed(world)
     plain = (world.root / "wshome" / "policy.toml").read_text()
@@ -182,6 +185,7 @@ def test_a_walled_class_refuses_the_person_by_default_and_takes_a_named_one(worl
         person_send(world, "wall1", "ack", "x")
 
 
+@not_on_macos
 def test_the_person_has_a_rate_cap_of_its_own(world):
     alone(world)
     token()
@@ -193,6 +197,7 @@ def test_the_person_has_a_rate_cap_of_its_own(world):
     assert world.send("lead1", "alpha", now=T0)["id"]  # a session's own count is separate
 
 
+@not_on_macos
 def test_secret_scan_and_caps_still_apply(world):
     alone(world)
     token()
@@ -204,6 +209,7 @@ def test_secret_scan_and_caps_still_apply(world):
     assert e.value.kind == "too_large"
 
 
+@not_on_macos
 def test_cli_send_from_stdin_as_the_person(world, monkeypatch):
     alone(world)
     token()

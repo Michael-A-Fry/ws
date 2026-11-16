@@ -78,6 +78,37 @@ def test_sources_are_memory_notes_and_profile(box, env, setup):
     assert restic.sources(env) == [mem, box / ".ws" / "profile.toml"]
 
 
+def _backup_job(box, text: str) -> Path:
+    folder = box / ".ws" / "jobs"
+    folder.mkdir(exist_ok=True, mode=0o700)
+    f = folder / "backup.toml"
+    f.write_text('command = "backup"\nschedule = "daily 03:00"\n' + text, encoding="utf-8")
+    f.chmod(0o600)
+    return f
+
+
+def test_the_backup_job_adds_extra_sources(box, env, setup):
+    _cfg, mem, notes = setup
+    extra = box / ".ws-state"
+    extra.mkdir()
+    _backup_job(box, f'extra_sources = ["~/.ws-state", "{box / "gone"}"]\n')
+    assert restic.sources(env) == [
+        mem,
+        notes,
+        box / ".ws" / "profile.toml",
+        extra,
+    ]  # one that does not exist is left out
+
+
+def test_a_bad_backup_job_refuses_rather_than_backing_up_less_or_more(box, env, setup):
+    _backup_job(box, 'extra_sources = ["relative/path"]\n')
+    with pytest.raises(restic.BackupError, match="extra_sources"):
+        restic.sources(env)
+    _backup_job(box, f'extra_sources = ["{box}"]\n').chmod(0o666)
+    with pytest.raises(restic.BackupError, match="written by others"):
+        restic.sources(env)
+
+
 def test_backup_runs_restic_with_the_password_only_in_its_environment(box, env, setup):
     cfg, mem, notes = setup
     fake = FakeRestic()

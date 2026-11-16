@@ -1,6 +1,7 @@
 """The commands the role adapters bring: `ws notify`, `ws backup` and `ws schedule`.
 
     ws notify test|send|status      a test push, a push or digest, today's count against the caps
+    ws notify send --from-file F --click URL   the first line of a summary, with a link a tap opens
     ws notify alert                 hook entry: "<folder> needs you" or "<folder> finished" to your phone
     ws backup init|run|verify       make the restic repository, back up, prove a file restores
     ws schedule list|apply|remove   timers for the job files that have a `schedule`
@@ -49,9 +50,44 @@ def cmd_notify_test(args: argparse.Namespace) -> int:
     return _notify(lambda cfg: ntfy.send_test(cfg, os.environ))
 
 
+LINE_MAX = 300  # the most of a summary file's first line that goes in a push
+
+
+def first_line(path: str, fresh_min: float | None = None) -> str | None:
+    """The first line with text in `path`, trimmed to LINE_MAX characters. None when `fresh_min` is given and the file
+    is older than that many minutes (a summary from an earlier run is not news). Raises ValueError (safe to print)."""
+    import time
+    from pathlib import Path
+
+    f = Path(path).expanduser()
+    try:
+        if fresh_min is not None and time.time() - f.stat().st_mtime > fresh_min * 60:
+            return None
+        with f.open("r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if line.strip():
+                    return " ".join(line.split())[:LINE_MAX]
+    except OSError as e:
+        raise ValueError(f"{f} cannot be read ({e.strerror or type(e).__name__})") from e
+    raise ValueError(f"{f} has no line with text in it")
+
+
 def cmd_notify_send(args: argparse.Namespace) -> int:
     kind = "digest" if args.digest else "push"
-    return _notify(lambda cfg: ntfy.send(cfg, os.environ, args.message, args.title, kind))
+    if (args.message is None) == (args.from_file is None):
+        raise WsError("usage", "give a message or --from-file PATH, not both", 'e.g. `ws notify send "done"`', 2)
+    if args.fresh is not None and args.from_file is None:
+        raise WsError("usage", "--fresh goes with --from-file", "", 2)
+    message = args.message
+    if args.from_file is not None:
+        try:
+            message = first_line(args.from_file, args.fresh)
+        except ValueError as e:
+            raise WsError("failed", str(e), "the job that writes the summary may not have run") from e
+        if message is None:
+            print(f"ws: not sent: {args.from_file} is older than {args.fresh:g} minutes (0 sent)")
+            return 0
+    return _notify(lambda cfg: ntfy.send(cfg, os.environ, message, args.title, kind, click=args.click))
 
 
 def cmd_notify_status(args: argparse.Namespace) -> int:
@@ -242,7 +278,10 @@ def register(sub) -> None:
     p = ns.add_parser("test", help="send a test push (it counts against the daily cap)")
     p.set_defaults(func=cmd_notify_test)
     p = ns.add_parser("send", help="send a push, or a digest with --digest, if today's cap allows")
-    p.add_argument("message")
+    p.add_argument("message", nargs="?", help="the text (or --from-file)")
+    p.add_argument("--from-file", metavar="PATH", help="send the first line with text in this file, such as a summary")
+    p.add_argument("--fresh", type=float, metavar="MINUTES", help="with --from-file: send only if the file is newer")
+    p.add_argument("--click", metavar="URL", help="the link the push opens when tapped (http or https)")
     p.add_argument("--title", default="ws")
     p.add_argument("--digest", action="store_true", help="the one daily digest, not a push")
     p.set_defaults(func=cmd_notify_send)

@@ -13,6 +13,8 @@ platform whose file names ignore case, names are compared without case. A write 
 with more than one name, is denied to a session that isn't an owner, because a link can be moved onto a guarded file
 between the check and the write (a link the session's folder is itself behind, such as /tmp, doesn't count). This guard
 judges the edit tools only: a shell redirect to a guarded file is for the sandbox's write-deny list, not this guard.
+The same list, and not the link rule, covers a folder swapped for a link after the check, by a command that runs in the
+background.
 
 With no `paths` the guard does nothing: ws names no file of its own here (its own policy and settings are held by the
 gate and the sandbox). It has no NATIVE_DENY because who owns a file depends on the session's folder, which a runner's

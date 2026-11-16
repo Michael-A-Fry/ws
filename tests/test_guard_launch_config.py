@@ -193,6 +193,35 @@ def test_the_isolation_line_is_found_through_comments_and_odd_layouts(box, front
 
 
 @needs_git
+@pytest.mark.parametrize(
+    "front",
+    [
+        'name: iso\n"isolation": worktree\n',
+        "name: iso\nisolation: >-\n  worktree\n",
+        "name: iso\nisolation: !!str worktree\n",
+        "name: iso\ndescription: " + "x" * 70000 + "\nisolation: worktree\n",
+    ],
+    ids=["quoted-key", "folded-value", "str-tag", "key-past-the-bytes-read"],
+)
+def test_the_isolation_key_is_found_in_every_yaml_spelling(box, front):
+    """Third review: a quoted key, a folded value, a tag and a description long enough to push the key past what is read
+    all still ask for a worktree."""
+    agents = box / "wt" / ".claude" / "agents"
+    agents.mkdir(parents=True)
+    (agents / "a.md").write_text(f"---\n{front}---\nbody\n")
+    assert run(box, LAUNCH, payload("Agent", box / "wt", prompt="p", subagent_type="iso")) == 2
+    assert run(box, LAUNCH, payload("Agent", box / "main", prompt="p", subagent_type="iso")) == 0
+
+
+@needs_git
+def test_a_body_that_only_mentions_worktrees_does_not_make_an_agent_isolated(box):
+    agents = box / "wt" / ".claude" / "agents"
+    agents.mkdir(parents=True)
+    (agents / "a.md").write_text("---\nname: plain\ndescription: reads\n---\nUse a git worktree for scratch work.\n")
+    assert run(box, LAUNCH, payload("Agent", box / "wt", prompt="p", subagent_type="plain")) == 0
+
+
+@needs_git
 def test_a_definition_that_overrides_a_built_in_name_is_read_first(box):
     agents = box / "home" / ".claude" / "agents"
     agents.mkdir(parents=True)

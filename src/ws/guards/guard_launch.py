@@ -91,9 +91,11 @@ def _start_folder() -> str:
 
 
 MAX_AGENT_FILES = 400
-MAX_AGENT_BYTES = 16384
-_NAME_LINE = re.compile(r"^name\s*:\s*[\"']?([^\"'#\s]+)", re.MULTILINE)
-_WORKTREE_LINE = re.compile(r"^isolation\s*:\s*[\"']?worktree\b", re.MULTILINE | re.IGNORECASE)
+MAX_AGENT_BYTES = 65536
+_YAML_VALUE = r"\s*:\s*(?:!!\w+\s+)?[>|]?[-+]?\s*[\"']?"  # an optional tag, folded or literal marker, and quote
+_NAME_LINE = re.compile(r"^[\"']?name[\"']?" + _YAML_VALUE + r"([^\"'#\s]+)", re.MULTILINE)
+_WORKTREE_LINE = re.compile(r"^[\"']?isolation[\"']?" + _YAML_VALUE + r"worktree\b", re.MULTILINE | re.IGNORECASE)
+_FRONT_END = re.compile(r"^---\s*$", re.MULTILINE)
 
 
 def _agent_folders(folder: str) -> list[Path]:
@@ -124,7 +126,13 @@ def _definitions(name: str, folder: str) -> tuple[bool, bool]:
             if named and named.group(1) != name:
                 continue
             found = True
-            asks = asks or bool(_WORKTREE_LINE.search(head))
+            # Any doubt is "asks": the key in any YAML spelling, `worktree` anywhere in the front matter, or no closing
+            # `---` within what was read (the front matter is longer than we looked at).
+            close = _FRONT_END.search(head, 3) if head.startswith("---") else None
+            front = head[: close.start()] if close else head
+            asks = asks or bool(
+                _WORKTREE_LINE.search(head) or "worktree" in front.lower() or (head.startswith("---") and not close)
+            )
     return found, asks
 
 

@@ -161,7 +161,12 @@ words = ["on trunk", "merged into trunk", "merged to trunk", "pushed to trunk"] 
 ref = "origin/trunk"                       # optional
 release_dir = "~/releases"                 # optional: release claims are off without it
 release_tags = ["v[0-9]+[.][0-9]+([.][0-9]+)*"]   # optional: the shapes of a release name
+repos = ["~/code/other-repo"]              # optional: more repositories a claim may be about
 ```
+
+A commit that isn't on the ref in the session's own repository is looked for in the other repositories the message
+names (an absolute or `~/` path written in it) and in `repos`, each against its own default branch (or `ref`). It passes
+when one of them has it there; a commit none has still denies the message.
 
 A claim is a phrase from `words` (whole words, any case) and the commit-like token it's about: 7 to 40 lower-case hex
 characters with at least one digit and one of `a` to `f`. A token belongs to a phrase when it sits inside it (`merged

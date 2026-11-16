@@ -14,6 +14,11 @@ branch. REF is the policy's `ref`, else the default branch on `origin`. B and th
 an ancestor of REF, or isn't a commit in this repository, denies the message and the reason names it; the reason says to
 `git fetch` first when REF may be out of date.
 
+A commit that isn't on REF in the session's repository is looked for in the other repositories the message names before
+the message is denied: a folder written in the message as an absolute or `~/` path (the repository it is in), and the
+folders in the policy's `repos`. Each is checked against its own default branch (or the policy's `ref`). The commit
+passes when any of them has it on that branch; a commit none has still denies the message.
+
 Not a claim: a claim word in quotes or backticks, one with a negation or a future form in the four words before it
 (`not merged`, `will be pushed`, `once it's merged`), and any sentence that names another branch (`origin/work`, or
 `pushed to work`, `merged into work`), because the check is against one ref. A folder that isn't a repository, no git on
@@ -176,17 +181,24 @@ class Config:
     ref: str = ""  # "" = the default branch on origin
     release_dir: str = ""  # "" = release claims are off
     release_tags: tuple[str, ...] = DEFAULT_TAGS
+    repos: tuple[
+        str, ...
+    ] = ()  # other repositories a claim may be about, besides the session's and those named in the text
 
 
 def config(table: dict, where: str) -> Config:
-    known_keys(table, where, ("words", "ref", "release_dir", "release_tags"))
+    known_keys(table, where, ("words", "ref", "release_dir", "release_tags", "repos"))
     words = text_list(table, "words", where)
     if "words" in table and not words:
         raise PolicyError(f"{where}: words must name at least one claim word")
     ref = table.get("ref", "")
     if "ref" in table and not _ref_ok(ref):
         raise PolicyError(f"{where}: ref must be a branch, tag or remote branch name such as origin/main")
-    return Config(words, ref, _release_dir(table, where), _release_tags(table, where))
+    repos = text_list(table, "repos", where)
+    for r in repos:
+        if not (r.startswith(("/", "~/")) or r == "~") or "\n" in r or "\0" in r:
+            raise PolicyError(f"{where}: repos must be absolute paths or start with ~/")
+    return Config(words, ref, _release_dir(table, where), _release_tags(table, where), repos)
 
 
 def _ref_ok(ref: object) -> bool:
@@ -518,6 +530,47 @@ def on_ref(cwd: str, sha: str, ref: str, budget: Budget | None = None) -> bool |
     return found == 0
 
 
+_PATH_IN_TEXT = re.compile(r"(?<![\w.~/-])(~?/[\w.@+-]+(?:/[\w.@+-]+)*)")
+MAX_OTHER_REPOS = 6
+
+
+def other_repos(text: str, cfg: Config, cwd: str, budget: Budget) -> list[str]:
+    """The top folders of the other repositories a message may be about: the repository each absolute or `~/` path in
+    the text is in (the nearest folder that exists, at most six paths), then the policy's `repos`; never the session's
+    own, and each once. A path that isn't in a repository, or a repository git can't answer for in time, is left out."""
+    home = os.path.expanduser("~")
+    named = [m.group(1) for m in _PATH_IN_TEXT.finditer(text[:MAX_TEXT])][:MAX_OTHER_REPOS]
+    seen = {_top(cwd, budget)} if cwd else set()
+    found: list[str] = []
+    for raw in [*named, *cfg.repos]:
+        if budget.left() <= 0:
+            break
+        folder = Path(raw.replace("~", home, 1) if raw.startswith("~") else raw)
+        while not folder.is_dir() and folder != folder.parent:
+            folder = folder.parent
+        top = _top(str(folder), budget)
+        if top and top not in seen:
+            seen.add(top)
+            found.append(top)
+    return found
+
+
+def _top(folder: str, budget: Budget) -> str | None:
+    return _git_text(folder, "rev-parse", "--show-toplevel", budget=budget)
+
+
+def elsewhere(result, sha: str, text: str, cfg: Config, cwd: str, budget: Budget):
+    """`result` (what `on_ref` said for the session's repository), unless another repository the message names has the
+    commit on its default branch (or the policy's `ref`), when it is True."""
+    if result is True or budget.spent():
+        return result
+    for repo in other_repos(text, cfg, cwd, budget):
+        ref = cfg.ref or default_target(repo, budget).ref
+        if on_ref(repo, sha, ref, budget) is True:
+            return True
+    return result
+
+
 # --- release claims ------------------------------------------------------------------------------------------------
 
 # `(?<!\s)` lets a run of spaces start a match only at its first space, so a long run is read once, not once for each space
@@ -637,6 +690,7 @@ def judge(call, cfg: Config, ctx) -> Finding | None:
     release = check_releases(text, cfg) if isinstance(text, str) else None
     for word, sha in claims:
         result = _out_of_time(budget) if budget.spent() else on_ref(ctx.cwd, sha, ref, budget)
+        result = elsewhere(result, sha, text, cfg, ctx.cwd, budget)
         if result is True:
             continue
         if result is False:

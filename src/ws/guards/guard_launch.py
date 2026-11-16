@@ -50,15 +50,9 @@ def config(table: dict, where: str) -> None:
 
 
 def is_main_checkout(folder: str) -> bool:
-    """True when `folder` is inside the main checkout of a git repository, as git says."""
-    if not folder or not os.path.isabs(folder) or not os.path.isdir(folder):
-        return False
-    got = _git.lines(folder, "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir", "--show-toplevel")
-    if got is None or len(got) != 3:
-        return False
-    git_dir, common, top = (os.path.realpath(x) for x in got)
-    own = git_dir == os.path.join(top, ".git")  # a rewritten `.git` file points at another repository's folder
-    return git_dir == common and own and "/.claude/worktrees/" not in top + "/"
+    """True when `folder` is inside the main checkout of a git repository, as git says, and not under `.claude/worktrees/`."""
+    top = _git.main_toplevel(folder)
+    return top is not None and "/.claude/worktrees/" not in top + "/"
 
 
 def _start_folder() -> str:

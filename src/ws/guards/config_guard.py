@@ -1,10 +1,11 @@
 """config-guard: the files that hold the guardrails are edited only by the session that owns them.
 
 `paths` lists files and folders to protect (absolute or `~/`); `owners` lists the repositories whose sessions may edit them
-(absolute or `~/`, each the root of a repository's working tree). A session is an owner when the root of the repository its
-folder is in (`git rev-parse --show-toplevel`) is exactly one of the owners: the main checkout, and any folder inside it, but
-not a linked worktree of it, even one kept under it (a linked worktree has a root of its own), and not a folder outside any
-repository. If git can't say, the session is not an owner. A write tool call (Edit, Write, MultiEdit, NotebookEdit) whose real
+(absolute or `~/`, each the root of a repository's main checkout). A session is an owner when the folder it is in lies inside a
+main checkout whose root (`git rev-parse --show-toplevel`) is exactly one of the owners: the main checkout and any folder inside
+it, but not a linked worktree of it, even one kept under it, not a folder outside any repository, and not a repository whose
+`core.worktree` points somewhere else (a session can set that in its own repository's config). If git can't say, the session is
+not an owner. A write tool call (Edit, Write, MultiEdit, NotebookEdit) whose real
 path is a protected file, or inside a protected folder, is denied unless the session is an owner, and the reason names the owners.
 Links are followed on both sides, so a path through a symlink is the file it points at. A path that can't be resolved
 to a real one is a deny. The person can approve the edit once.
@@ -77,11 +78,11 @@ def _start_folder() -> str:
 
 
 def _owns(folder: str, cfg: Config) -> bool:
-    """Is the repository that `folder` (an absolute path) is in one of the owners, by its root and not by a folder prefix? A linked
-    worktree has a root of its own, so it is not its main checkout's, and git not answering is a no."""
+    """Is `folder` (an absolute path) inside the main checkout of an owner, by the checkout's root and not by a folder prefix? A linked
+    worktree isn't a main checkout, nor is a repository whose `core.worktree` points elsewhere, and git not answering is a no."""
     if not folder or not os.path.isabs(folder):
         return False
-    top = _git.toplevel(folder)
+    top = _git.main_toplevel(folder)
     if top is None:
         return False
     return _real(top) in {_real(o) for o in cfg.owners}

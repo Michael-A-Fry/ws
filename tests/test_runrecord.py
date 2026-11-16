@@ -178,3 +178,13 @@ def test_a_reaped_record_under_the_reader_before_outcome_unknown():
 def test_checked_leaves_the_callers_record_alone():
     mine = rec(status="ok", stop_subtype="error_max_turns")
     assert runrecord.checked(mine)["status"] == "error" and mine["status"] == "ok"
+
+
+def test_a_lone_outcome_unknown_record_is_read_and_a_real_one_wins_over_it(tmp_path):
+    log = log_in(tmp_path)
+    runrecord.append(log, runrecord.unknown_outcome(RID, "j", T0, T0 + timedelta(seconds=1), ws_version="0"))
+    other = "20261108T030001Z-000001"
+    runrecord.append(log, runrecord.unknown_outcome(other, "j", T0, T0, ws_version="0"))
+    runrecord.append(log, rec(run_id=other, status="ok", stop_reason="completed", cost_usd=0.5))
+    got = {(r["run_id"], r["status"]) for r in runrecord.read(log)}
+    assert got == {(RID, "outcome_unknown"), (other, "ok")}

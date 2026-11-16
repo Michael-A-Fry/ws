@@ -15,6 +15,12 @@ body of the GitHub release.
   `command`, a full path). Plain options (`-p`, `-l`, `-J`, `-o Port=...`) run as before.
 - The gate: a remote command written wholly in single quotes to a host the policy names is read as remote: the gate no
   longer refuses a `$VAR`, loop or `$(...)` in it. A remote command to this machine is judged as a local one.
+- The command reader's time limit counts its own CPU time, not the wall clock, so a busy or slow machine (a CI runner,
+  WSL2) no longer refuses an ordinary long command, such as `touch f{1..4000}`, as too slow to read. The wall clock still
+  stops a read that waits, at three times the limit.
+- Flaky tests: the reveal-link test waits on the push itself instead of 5 s of polling; the tests that check the reader
+  is quick measure its CPU time too, as the limit does; and the live conformance row that drives two real runner
+  sessions is sized large, like the end-to-end tests it matches, not small (60 s).
 
 ## [0.1.11] - 2026-11-17
 

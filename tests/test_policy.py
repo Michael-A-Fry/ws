@@ -1860,9 +1860,9 @@ def test_a_glob_that_cannot_reach_a_denied_folder_is_allowed(dotws, cmd):
 
 def test_a_command_over_the_size_limit_is_denied_quickly_with_a_way_out(pol):
     big = "echo " + "word " * (1024 * 1024 // 5)  # about 1 MB
-    start = time.monotonic()
+    start = time.thread_time()
     reason = policy.is_denied_command(pol, big)
-    assert time.monotonic() - start < 1
+    assert time.thread_time() - start < 1
     assert reason and "too long to check" in reason and "Write tool" in reason
 
 

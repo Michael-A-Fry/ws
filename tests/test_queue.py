@@ -1853,3 +1853,61 @@ def test_a_finished_receipt_keeps_its_note(tmp_path):
         )
     queue._fail_bad(ledger, msg, "j", "late", T0, rid)
     assert ledger.receipt(rid)["note"] == "its own"
+
+
+def test_a_run_that_settled_ok_before_something_raised_is_done(tmp_path):
+    told: list[str] = []
+    ledger = make(tmp_path, on_stop=lambda job, run_id, why: told.append(why))
+    run_id, mid, _ = ledger.enqueue("j", None, T0)
+
+    def runner(item):
+        d = ledger.admit(req(job=item.job, run_id=item.run_id, cap_usd=100.0), T0, spend())
+        ledger.settle(d.reservation, status="ok", usd=0.1, tokens=None, stop_reason="completed", now=T0)
+        raise RuntimeError("after the run had settled")
+
+    assert [d["action"] for d in queue.drain(ledger, runner)] == ["done"]
+    assert message_status(ledger, mid) == int(sqlqueue.Status.DONE) and told == []
+    assert ledger.receipt(run_id)["status"] == "ok"
+
+
+def test_a_store_error_before_admission_comes_back_and_runs(tmp_path):
+    clock = Clock()
+    ledger = make(tmp_path, clock=clock)
+    run_id, _, _ = ledger.enqueue("j", None, T0)
+    with pytest.raises(sqlite3.OperationalError):
+        queue.drain(ledger, lambda item: (_ for _ in ()).throw(sqlite3.OperationalError("disk I/O error")))
+    clock.advance(seconds=queue.ORPHAN_S + 1)
+    assert ledger.recover(clock.now) == 1
+    out = queue.drain(ledger, lambda item: queue.Outcome(0, "ok", "completed"))
+    assert [d["action"] for d in out] == ["done"] and out[0]["run_id"] == run_id
+
+
+def test_a_disk_error_after_admission_is_failed_as_killed_once(tmp_path):
+    """The drain exits on the error; recovery reaps the run: one fallback charge, one outcome_unknown, one notice."""
+    host, clock = Host(), Clock()
+    log = tmp_path / "logs" / "runs.jsonl"
+    told: list[str] = []
+    ledger = make(
+        tmp_path, host=host, clock=clock, costing=(2.0, None), sink=lambda rec: queue._write_record(log, rec),
+        recorded=lambda rid: next((r for r in runrecord.read(log) if r["run_id"] == rid), None),
+        on_stop=lambda job, rid, why: told.append(why),
+    )  # fmt: skip
+    run_id, mid, _ = ledger.enqueue("j", None, T0)
+
+    def runner(item):
+        assert ledger.admit(req(job=item.job, run_id=item.run_id), T0, spend()).kind == "admit"
+        raise OSError("disk full")
+
+    with pytest.raises(OSError):
+        queue.drain(ledger, runner)
+    row = ledger.receipt(run_id)
+    assert row["status"] == "running"
+    host.procs[row["owner_pid"]] = (False, None)  # the drain process has exited
+    clock.advance(seconds=queue.ORPHAN_S + 1)
+    assert ledger.recover(clock.now) == 0
+    assert message_status(ledger, mid) == int(sqlqueue.Status.FAILED)
+    row = ledger.receipt(run_id)
+    assert row["settled"] and row["actual_usd"] == 2.0 and row["stop_reason"] == "owner_gone"
+    assert [r["status"] for r in runrecord.read(log)] == ["outcome_unknown"]
+    assert len(told) == 1
+    assert queue.drain(ledger, lambda item: queue.Outcome(0, "ok", "completed")) == []

@@ -1436,14 +1436,19 @@ def _fail_bad(
     """Move one item that could not be run to failed, with its reason in the receipt's note, and say so once. One that
     was admitted is recorded and charged as a reaped run is (its own record if it wrote one, else outcome_unknown at the
     fallback cost), so spend before the failure still counts. A receipt that has already finished keeps its note, and
-    a claim that was taken over in the meantime is left to its new holder, with nothing said."""
+    a claim that was taken over in the meantime is left to its new holder, with nothing said. A run that had already
+    settled ok marks its message done, with no notice."""
     try:
         with _transaction(ledger.conn()) as c:
-            ledger.engine().mark_failed(msg.message_id, msg.claim_id)
             rid = (
                 run_id or ledger.queued_row(c, msg.message_id) or ledger.new_attempt(c, msg.message_id, job, None, now)
             )
             row = c.execute("SELECT * FROM receipts WHERE run_id = ?", (rid,)).fetchone()
+            if row is not None and row["status"] == "ok" and row["settled"]:
+                # the run finished and settled ok before something after it raised: its work is done, not failed
+                ledger.engine().done(msg.message_id, msg.claim_id)
+                return {"run_id": rid, "job": job, "action": "done", "code": 0, "status": "ok", "why": why}
+            ledger.engine().mark_failed(msg.message_id, msg.claim_id)
             changed = False
             if row is not None and row["status"] == "running" and row["who"] is None and not row["settled"]:
                 # it was admitted and may have spent: its record (or an outcome_unknown one) and the fallback cost,

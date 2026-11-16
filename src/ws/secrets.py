@@ -8,6 +8,11 @@ The registry (`secrets.toml` in the config folder) is not secret. It says which 
     purposes = ["run"]              # empty or missing = any purpose
     tier = "worker"                 # optional: walled | worker | lead | lead-elevated (see below)
     area = "home"                   # optional: only runs of this area may lease it
+    source = "paste"                # optional: paste (a person brings it; the default) or generate (ws makes it)
+
+A `source = "generate"` name is one only ws needs to know, such as a backup password: `ws secret generate NAME` makes a
+strong random value and nobody types or pastes it. It needs no hosts. `ws secret reveal NAME` shows it to its owner
+once, on their own device (ws.reveal), so they can keep a copy for a restore.
 
 A name with a `tier` or an `area` is scoped: the broker leases it only to a run whose broker-side run record (ws.broker)
 declares it, in a tier that reaches it and in the same area. `lead-elevated` names are the elevated ones that
@@ -61,6 +66,8 @@ REACH = {
 }
 ELEVATED = "lead-elevated"
 DEFAULT_TIER = "worker"  # the tier of a name that has none, when a run asks for it
+SOURCES = ("paste", "generate")
+GENERATE_BYTES = 32  # 256 bits of randomness, URL-safe base64: 43 characters
 
 
 class SecretsError(Exception):
@@ -78,6 +85,7 @@ class Entry:
     area: str | None = None
     kind: str = "header"  # header: the broker adds it to requests; else a minter in ws.minters makes a credential
     options: object = None  # the minter's own keys, parsed by it
+    source: str = "paste"  # paste: a person brings the value; generate: `ws secret generate` makes it
 
     @property
     def scoped(self) -> bool:
@@ -174,10 +182,15 @@ def _entry(path: Path, name: str, t: dict) -> Entry:
         raise SecretsError(f"{path}: [{name}] tier must be one of {', '.join(TIERS)}")
     if area is not None and not (isinstance(area, str) and AREA_RE.match(area)):
         raise SecretsError(f"{path}: [{name}] area must be a short lower-case name (letters, digits, - and _)")
-    allowed = {"hosts", "header", "format", "purposes", "tier", "area", "kind"}
+    source = t.get("source", "paste")
+    if source not in SOURCES:
+        raise SecretsError(f"{path}: [{name}] source must be paste or generate")
+    if source == "generate" and kind != "header":
+        raise SecretsError(f"{path}: [{name}] a {kind} credential is brought by a person; source must be paste")
+    allowed = {"hosts", "header", "format", "purposes", "tier", "area", "kind", "source"}
     options = None
     if kind != "header":
-        allowed = {"tier", "area", "kind", "purposes"} | minters[kind].EXTRA_KEYS
+        allowed = {"tier", "area", "kind", "purposes", "source"} | minters[kind].EXTRA_KEYS
     unknown = set(t) - allowed
     if unknown:
         raise SecretsError(f"{path}: [{name}] has unknown keys: {', '.join(sorted(unknown))}")
@@ -193,6 +206,7 @@ def _entry(path: Path, name: str, t: dict) -> Entry:
         area=area,
         kind=kind,
         options=options,
+        source=source,
     )
 
 
@@ -311,7 +325,9 @@ def health(reg_path: Path, store: Store) -> tuple[list[str], int | None]:
         problems.append(f"registry unreadable: {e}")
         reg = {}
     problems += [
-        f"{e.name} has no hosts, so it can never be used" for e in reg.values() if e.kind == "header" and not e.hosts
+        f"{e.name} has no hosts, so it can never be used"
+        for e in reg.values()
+        if e.kind == "header" and not e.hosts and e.source != "generate"
     ]
     try:
         owner = store.path.stat().st_uid
@@ -533,6 +549,211 @@ def cmd_rm(args: argparse.Namespace) -> int:
         return 0
     print(f"ws: removed {args.name}" if gone else f"ws: {args.name} was not set (0 changes)")
     return 0
+
+
+AUDIT_LOG = "secrets-audit.jsonl"
+AUDIT_SCHEMA = 1  # the `schema` of a line in logs/secrets-audit.jsonl
+
+
+def _audit(action: str, name: str, result: str) -> None:
+    """One line in `<state>/logs/secrets-audit.jsonl` per generate and reveal: who, which name, when, what came of it.
+    Never a value, a link or a token. Best effort: a full disk does not undo a value that was stored."""
+    import getpass as _getpass
+
+    from ws import agentsession, jsonl
+
+    try:
+        who = _getpass.getuser()
+    except (OSError, KeyError):
+        who = "?"
+    try:
+        session = agentsession.refusal(os.environ, sys.stdin.isatty(), sys.stdout.isatty()) is not None
+    except OSError:
+        session = True
+    rec = {
+        "type": "ws.secret-audit/1",
+        "action": action,
+        "name": name,
+        "result": result,
+        "user": who,
+        "in_session": session,
+    }
+    with contextlib.suppress(OSError):
+        jsonl.append(paths.state_dir() / "logs" / AUDIT_LOG, jsonl.stamped(rec, AUDIT_SCHEMA))
+
+
+def _registered(name: str) -> Entry:
+    reg = load_registry(registry_path())
+    if name not in reg:
+        raise WsError(
+            "not_found",
+            f"{name!r} is not in {registry_path()}",
+            f'add it first, e.g.\n    [{name}]\n    source = "generate"',
+            2,
+        )
+    return reg[name]
+
+
+def cmd_generate(args: argparse.Namespace) -> int:
+    """Make a strong random value for a `source = "generate"` name and store it (atomic, mode 0600). Never printed."""
+    import secrets as pysecrets
+
+    from ws import reveal
+
+    store = Store(store_dir())
+    try:
+        entry = _registered(args.name)
+        if entry.source != "generate":
+            raise WsError(
+                "usage",
+                f"{args.name} is a value a person brings (source = {entry.source!r}), so ws cannot make it",
+                f'set it with `ws secret set {args.name}`, or mark it source = "generate" in {registry_path()}',
+                2,
+            )
+        had = args.name in store.names()
+        if had and not args.replace:
+            raise WsError(
+                "refused",
+                f"{args.name} already has a value; a new one would lock out whatever uses the old one",
+                f"`ws secret generate {args.name} --replace` makes a new one anyway",
+            )
+        store.write(args.name, pysecrets.token_urlsafe(GENERATE_BYTES))
+        reveal.clear(args.name, reveal.marker_dir())
+        _audit("generate", args.name, "replaced" if had else "made")
+    except SecretsError as e:
+        raise WsError("failed", str(e), "see `ws help secret`") from e
+    except PermissionError as e:
+        raise WsError(
+            "refused",
+            f"the store {store_dir()} belongs to another user",
+            f"run it as that user: `{wall_hint('generate', args.name)}`",
+        ) from e
+    if args.json:
+        output.result({"name": args.name, "generated": True, "replaced": had})
+        return 0
+    print(
+        f"ws: generated {args.name} ({GENERATE_BYTES * 8} bits; {'replaced the old value; ' if had else ''}"
+        f"never shown). To keep a copy: `ws secret reveal {args.name}`"
+    )
+    return 0
+
+
+def _owner(args: argparse.Namespace) -> str | None:
+    """--owner, else `owner` in [roles.secrets]: the tailnet login (or its start) whose device may open a page."""
+    if args.owner:
+        return args.owner
+    try:
+        o = _profile_secrets(None).get("owner")
+    except SecretsError:
+        return None
+    return o if isinstance(o, str) and o else None
+
+
+_NO_OWNER = (
+    'set `owner` in [roles.secrets] of your profile to your tailnet login (or its start, such as "name@"), '
+    "or pass --owner"
+)
+
+
+def _push_link(name: str, url: str, minutes: int) -> None:
+    """Push the reveal link through the notify role, so the person taps it on their phone. A failed push is a warning:
+    the link is still printed, and the page still serves its one use."""
+    from ws.roles import commands, ntfy
+
+    try:
+        cfg = commands._role("notify", "ntfy")
+        ntfy.send(
+            cfg,
+            os.environ,
+            f"Tap to see {name} once, on this device, within {minutes} minutes. Have your password manager ready.",
+            f"ws: {name}",
+            "push",
+            click=url,
+        )
+    except (ValueError, ntfy.NotifyError) as e:
+        print(f"ws: the link was not pushed ({e}); open it from here instead", file=sys.stderr)
+        return
+    print("ws: pushed the link to your phone", file=sys.stderr)
+
+
+def cmd_reveal(args: argparse.Namespace) -> int:
+    """Serve the reveal-once page for a generated value (ws.reveal), print its link, wait for one use or expiry."""
+    import ipaddress
+
+    from ws import reveal, tailnet
+
+    try:
+        entry = _registered(args.name)
+    except SecretsError as e:
+        raise WsError("bad_config", str(e), f"fix {registry_path()}") from e
+    if entry.source != "generate":
+        raise WsError(
+            "usage",
+            f"{args.name} is a value a person brought, so they have it already; reveal shows only what ws generated",
+            "",
+            2,
+        )
+    owner = _owner(args)
+    if args.bind:
+        addr = args.bind.strip()
+    elif args.allow_loopback:
+        addr = "127.0.0.1"
+    else:
+        if owner is None:
+            raise WsError("usage", "no owner is set, so no device would be let in", _NO_OWNER, 2)
+        try:
+            addr = tailnet.tailnet_ip()
+        except tailnet.TailnetError as e:
+            raise WsError("unavailable", str(e), "start tailscale, or name the address with --bind") from e
+    try:
+        loopback = ipaddress.ip_address(addr).is_loopback
+    except ValueError:
+        loopback = False
+    if not loopback and owner is None:
+        raise WsError("usage", "no owner is set, so no device would be let in", _NO_OWNER, 2)
+
+    own = set() if loopback else {addr, *tailnet.own_addresses()}
+
+    def allowed(ip: str) -> bool:
+        if loopback:  # only with --allow-loopback (bind_ok refuses loopback otherwise): this machine's own clients
+            try:
+                return ipaddress.ip_address(ip).is_loopback
+            except ValueError:
+                return False
+        if ip in own:  # a program on this machine is not the owner's device, whoever tailscale says it is
+            return False
+        return tailnet.whois_ok(ip, owner)
+
+    try:
+        page = reveal.make_page(
+            args.name, addr, Store(store_dir()), allowed=allowed, allow_loopback=args.allow_loopback, again=args.again
+        )
+    except reveal.RevealError as e:
+        raise WsError("failed", str(e)) from e
+    host, port = page.server.server_address[:2]
+    url = f"http://{f'[{host}]' if ':' in host else host}:{port}/{page.token}"
+    minutes = max(1, min(args.minutes, reveal.LIFETIME_S // 60))
+    print(url, file=sys.stderr if args.json else sys.stdout, flush=True)  # --json: stdout holds only the envelope
+    if not args.json:
+        print(
+            f"ws: open that link on your own device within {minutes} minute{'' if minutes == 1 else 's'}; it shows {args.name} once",
+            file=sys.stderr,
+        )
+    if args.notify:
+        _push_link(args.name, url, minutes)
+    _audit("reveal", args.name, "started")
+    result = page.serve(minutes * 60)
+    _audit("reveal", args.name, result)
+    if args.json:
+        output.result({"name": args.name, "url": url, "result": result})
+    elif result == "revealed":
+        print(f"ws: shown {args.name} once; the page is closed")
+    else:
+        print(
+            f"ws: {args.name} was not shown ({result}); `ws secret reveal {args.name}` makes a new link",
+            file=sys.stderr,
+        )
+    return 0 if result == "revealed" else 1
 
 
 def wall_hint(verb: str, name: str) -> str:
@@ -801,6 +1022,19 @@ def register(sub) -> None:
     p.add_argument("--var", metavar="VAR", help="which variable, when the file has several lines")
     p.add_argument("--delete-source", action="store_true", help="remove the env file after the value is stored")
     p.set_defaults(func=cmd_import)
+    p = ssub.add_parser("generate", help='make a strong random value for a source = "generate" name (never shown)')
+    p.add_argument("name")
+    p.add_argument("--replace", action="store_true", help="make a new value even if one is stored")
+    p.set_defaults(func=cmd_generate)
+    p = ssub.add_parser("reveal", help="show a generated value once, on your own device, through a one-time page")
+    p.add_argument("name")
+    p.add_argument("--owner", metavar="LOGIN", help="the tailnet login (or its start) whose device may open it")
+    p.add_argument("--bind", metavar="ADDR", help="the one tailnet address to listen on (default: tailscale ip -4)")
+    p.add_argument("--minutes", type=int, default=15, help="how long the link works, at most 15 (default 15)")
+    p.add_argument("--again", action="store_true", help="show a value that was already shown once")
+    p.add_argument("--notify", action="store_true", help="push the link to your phone ([roles.notify]); tap to open")
+    p.add_argument("--allow-loopback", action="store_true", help=argparse.SUPPRESS)  # a box with no tailscale; tests
+    p.set_defaults(func=cmd_reveal)
     p = ssub.add_parser("list", help="names, hosts, set/unset and owner; never values")
     p.set_defaults(func=cmd_list)
     p = ssub.add_parser("rm", help="remove a stored value")

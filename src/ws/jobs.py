@@ -47,6 +47,10 @@
 The job files and their folder must belong to you and not be writable by anyone else: a job decides what a runner is
 started with, so `ws run` refuses one that someone else could have changed. `prompt_file` must be inside the folder.
 
+A job put in place by `ws job add` (ws.jobcmd) is pinned: `.pins.json` in the jobs folder holds the sha256 of its file
+and its prompt_file, and `ws run`, the timers and doctor refuse a pinned job whose files no longer hash to the pin.
+A job written by hand and never added has no pin and loads as before. A pins file that cannot be read refuses every job.
+
     [the run contract]                  a job file with a `schedule` must also carry (`jobs.contract_gaps` finds the gaps, `ws config`
                                         and `ws doctor` warn; `ws run` and the timer still run what loads):
     timeout_s = 900                     1. maximum runtime, written in the file (a unit kills the run at this limit)
@@ -63,6 +67,8 @@ Every error names the key.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
 import tomllib
@@ -466,6 +472,67 @@ def check_private(path: Path) -> None:
         raise JobError(f"{path} can be written by others (mode {st.st_mode & 0o777:04o}); run `chmod go-w {path}`")
 
 
+PINS = ".pins.json"
+PINS_SCHEMA = 1
+
+
+def digest(text: bytes, prompt: tuple[str, bytes] | None = None) -> str:
+    """The sha256 a job is pinned to: its file's bytes and, if it has one, its prompt_file's name and bytes."""
+    h = hashlib.sha256(b"ws-job-pin-1\0" + len(text).to_bytes(8, "big") + text)
+    if prompt is not None:
+        name = prompt[0].encode("utf-8")
+        h.update(len(name).to_bytes(8, "big") + name + len(prompt[1]).to_bytes(8, "big") + prompt[1])
+    return h.hexdigest()
+
+
+def read_pins(folder: Path) -> dict[str, dict]:
+    """name -> pin record from `.pins.json`. No file is no pins; a file that is not ours, is open to writers or does not
+    parse raises JobError, so a damaged pin file refuses every job instead of letting a changed one through."""
+    path = folder / PINS
+    if not path.exists() and not path.is_symlink():
+        return {}
+    check_private(path)
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError) as e:
+        raise JobError(f"{path} cannot be read ({type(e).__name__}); every job is refused until it is fixed") from e
+    jobs_ = doc.get("jobs") if isinstance(doc, dict) else None
+    if not isinstance(jobs_, dict) or not all(
+        isinstance(k, str) and isinstance(v, dict) and isinstance(v.get("sha256"), str) for k, v in jobs_.items()
+    ):
+        raise JobError(f"{path} is not a pins file; every job is refused until it is fixed")
+    return jobs_
+
+
+def file_digest(folder: Path, name: str, text: bytes | None = None) -> str:
+    """The digest of the job `name` as it is on disk now (its file and its prompt_file, if it names one)."""
+    path = folder / f"{name}.toml"
+    raw = path.read_bytes() if text is None else text
+    try:
+        d = tomllib.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return digest(raw)
+    pf = d.get("prompt_file")
+    if not isinstance(pf, str):
+        return digest(raw)
+    try:
+        return digest(raw, (pf, (folder / pf).read_bytes()))
+    except OSError:
+        return digest(raw, (pf, b""))
+
+
+def check_pin(folder: Path, name: str, text: bytes | None = None) -> None:
+    """Raises JobError when `name` is pinned and its files no longer hash to the pin."""
+    pin = read_pins(folder).get(name)
+    if pin is None:
+        return
+    if file_digest(folder, name, text) != pin["sha256"]:
+        raise JobError(
+            f"job {name} was changed after `ws job add` pinned it; ws will not run a job nobody reviewed. "
+            f"Put the change in with `ws job add PATH --replace`, or `ws job remove {name}`"
+        )
+
+
 def load(name: str, env: dict | None = None) -> Job:
     """The job `name` from the jobs folder. The folder and the file must be yours and closed to other writers."""
     folder = jobs_dir(env)
@@ -477,9 +544,11 @@ def load(name: str, env: dict | None = None) -> Job:
     check_private(folder)
     check_private(path)
     try:
-        text = path.read_text(encoding="utf-8")
+        raw = path.read_bytes()
+        text = raw.decode("utf-8")
     except (OSError, UnicodeDecodeError) as e:
         raise JobError(f"{path}: {e}") from e
+    check_pin(folder, name, raw)
     return loads(name, text, folder, where=str(path))
 
 
@@ -501,7 +570,9 @@ def _scan(env: dict | None) -> tuple[dict[str, str], dict[str, str]]:
             check_private(path)
             if path.stem in RESERVED:
                 raise JobError(f"{path}: the name {path.stem!r} is reserved for a unit ws writes itself")
-            text = path.read_text(encoding="utf-8")
+            raw = path.read_bytes()
+            check_pin(folder, path.stem, raw)
+            text = raw.decode("utf-8")
             d = tomllib.loads(text)
             if _command(d, str(path)):  # a schedule-only job: `ws run` refuses it, the timer needs a good schedule
                 parse_schedule(_string(d, "schedule", str(path)) or "", f"{path}: schedule")
@@ -556,10 +627,12 @@ def scheduled(env: dict | None = None) -> list[Scheduled]:
             continue
         check_private(path)
         try:
-            text = path.read_text(encoding="utf-8")
+            raw = path.read_bytes()
+            text = raw.decode("utf-8")
             d = tomllib.loads(text)
         except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
             raise JobError(f"{path}: {e}") from e
+        check_pin(folder, path.stem, raw)
         if "schedule" not in d:
             continue
         if path.stem in RESERVED:

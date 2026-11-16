@@ -14,6 +14,10 @@ body of the GitHub release.
   (off by default) and a per-boot token under the secrets folder (`ws msg person-token`); an agent that escapes its
   process ancestry has no token and is refused. The launcher step that makes a session's launch token records who asked
   for it (`requested_by`), and `ws session show` prints it. See ADR 0023.
+- `ws ask` is one queue of questions from every session to their person: `add`, `list` and `get`, in the file
+  `ws home` already reads asks from. An ask whose repo isn't in a full-access class, or that hits the sensitive-terms
+  file, is stored with no text; a token-shaped secret is refused; the class is checked again on every read. See
+  [Asks](docs/reference/asks.md).
 - `ws session load` puts standing preferences, an area card and, on the first prompt, the records a search finds in front
   of a session, from one folder of plain files (`WS_CONTEXT_DIR`). A walled session sees only its own class's records
   and the core preferences; a record with an unknown, wrong-case or non-text `class`, or front matter ws can't fully

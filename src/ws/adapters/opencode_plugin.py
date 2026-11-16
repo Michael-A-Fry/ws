@@ -399,7 +399,7 @@ export const WsGate = async ({ client, directory } = {}) => {
           tool: input.tool,
           args: output.args ?? {},
           session_id: input.sessionID ?? "",
-          cwd: resolve(directory ?? process.cwd(), output.args?.workdir ?? "."), // bash runs in args.workdir, if given
+          cwd: resolve(directory ?? process.cwd(), input.tool === "bash" ? (output.args?.workdir ?? ".") : "."), // only bash runs in args.workdir
         }),
         encoding: "utf8",
         timeout: 30000, // ms: more than the client's worst case (ws.gateclient.WORST_CASE_S); a timed-out check is r.error, so blocked

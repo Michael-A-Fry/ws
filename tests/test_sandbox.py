@@ -1206,7 +1206,9 @@ def test_the_opencode_shim_sends_the_session_and_resolved_workdir_and_can_claim(
     files = opencode.generate(policy.loads(""), ["ws"], tmp_path / "out", tmp_path / "policy.toml")
     shim = files[opencode.PLUGIN]
     assert "session_id: input.sessionID" in shim
-    assert 'resolve(directory ?? process.cwd(), output.args?.workdir ?? ".")' in shim  # bash runs in args.workdir
+    assert (
+        'resolve(directory ?? process.cwd(), input.tool === "bash" ? (output.args?.workdir ?? ".") : ".")' in shim
+    )  # bash runs in args.workdir
     assert "r.status === 4" in shim and "WS_APPROVAL_FD" in shim and "claim ${id} ${nonce}" in shim
     assert "randomUUID()" in shim and "ok ${nonce}" in shim  # a fresh nonce per request, echoed in the answer
     assert "bun:ffi" in shim and "fcntl" in shim  # the descriptor is marked close-on-exec

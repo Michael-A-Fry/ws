@@ -48,6 +48,7 @@ LOCK_WAIT_S = 30.0  # how long a writer waits for `asks.lock` before it gives up
 MAX_BYTES = 8 * 1024 * 1024  # a log turns over here, well under the 64 MiB `ws home` reads
 DEFAULT_WAIT = 540  # seconds: under a 10-minute tool limit
 POLL_S = 1.0  # how often `wait` looks at the store
+NOTIFY_HOOK = None  # a function(ask) a later release may set; nothing is sent by default
 RANK = {a: i for i, a in enumerate(policy.ACCESS)}  # a higher number is stricter
 FLOWS = {"full": "full", "walled": "counts", "counts-only": "off"}  # the old program's `flows_back`, by policy access
 _ID = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")

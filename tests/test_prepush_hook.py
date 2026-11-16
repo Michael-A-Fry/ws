@@ -14,6 +14,8 @@ import pytest
 
 HOOK = Path(__file__).resolve().parents[1] / ".github" / "hooks" / "pre-push"
 
+SMOKE_RUN = "uv run --locked pytest -q tests/test_cli.py tests/test_cli_registry.py tests/test_prepush_hook.py"
+
 pytestmark = pytest.mark.skipif(sys.platform == "win32" or not shutil.which("bash"), reason="needs bash")
 
 
@@ -48,29 +50,29 @@ def run_hook(tmp_path: Path, wrap: str | None, uv_exit: int = 0, expect_rc: int 
 
 
 def test_unset_the_suite_runs_as_it_always_did(tmp_path):
-    assert run_hook(tmp_path, None) == ["uvx prek run --all-files", "uv run --locked pytest -q"]
+    assert run_hook(tmp_path, None) == ["uvx prek run --all-files", SMOKE_RUN]
 
 
 def test_an_empty_wrap_is_the_same_as_unset(tmp_path):
-    assert run_hook(tmp_path, "") == ["uvx prek run --all-files", "uv run --locked pytest -q"]
+    assert run_hook(tmp_path, "") == ["uvx prek run --all-files", SMOKE_RUN]
 
 
 def test_the_wrapper_runs_the_suite_and_only_the_suite(tmp_path):
     calls = run_hook(tmp_path, "queue-wrap --wait 60m")
     assert calls == [
         "uvx prek run --all-files",
-        "queue-wrap --wait 60m uv run --locked pytest -q",
-        "uv run --locked pytest -q",
+        "queue-wrap --wait 60m " + SMOKE_RUN,
+        SMOKE_RUN,
     ]
 
 
 def test_a_failing_suite_fails_the_push_through_the_wrapper(tmp_path):
     calls = run_hook(tmp_path, "queue-wrap --wait 60m", uv_exit=3, expect_rc=3)
-    assert calls[-1] == "uv run --locked pytest -q"
+    assert calls[-1] == SMOKE_RUN
 
 
 def test_a_spaces_only_wrap_is_the_same_as_unset(tmp_path):
-    assert run_hook(tmp_path, "   ") == ["uvx prek run --all-files", "uv run --locked pytest -q"]
+    assert run_hook(tmp_path, "   ") == ["uvx prek run --all-files", SMOKE_RUN]
 
 
 # --- which tests: the selector (scripts/affected_tests.py) and what the hook does with its answer ---------------------
@@ -86,9 +88,13 @@ BASE_FILES = {
     "tests/test_b.py": "from ws import b\n",
     "tests/test_c.py": "from ws import c\n",
     "tests/test_prepush_hook.py": "",
+    "src/ws/d.py": "Z = 1\n",
+    "src/ws/e.py": "from ws import d\n",
+    "tests/test_e.py": "from ws import e\n",
     "tests/test_cli.py": "",
     "tests/test_cli_registry.py": "",
     "README.md": "hi\n",
+    **{f"tests/test_d{i}.py": "from ws import d\n" for i in range(41)},
 }
 
 
@@ -116,7 +122,7 @@ def run_selected(
     env.update(extra_env or {})
 
     def g(*args: str) -> None:
-        cfg = ["-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false"]
+        cfg = ["-c", "user.name=t", "-c", "user.email=noreply", "-c", "commit.gpgsign=false"]
         subprocess.run([git, "-C", str(repo), *cfg, *args], check=True, env=env, capture_output=True)
 
     g("init", "-q", "-b", "work")
@@ -166,52 +172,68 @@ def test_a_new_test_file_is_always_selected(tmp_path):
         "tests/sub/conftest.py",
         "tests/plugins/ws_harness.py",
         ".github/workflows/ci.yml",
-        "scripts/affected_tests.py",
     ],
 )
-def test_a_force_full_path_runs_everything(tmp_path, path):
+def test_a_path_that_reaches_every_test_runs_the_capped_set_not_the_suite(tmp_path, path):
     calls, err = run_selected(tmp_path, {path: "x = 1\n"})
-    assert calls[-1] == SUITE
-    assert "the whole suite" in err
+    assert calls[-1] == SMOKE_RUN
+    assert "CAPPED" in err
 
 
-def test_a_deleted_file_runs_everything(tmp_path):
+def test_the_capped_set_adds_changed_tests_and_direct_importers(tmp_path):
+    calls, _ = run_selected(
+        tmp_path, {"pyproject.toml": "x = 1\n", "src/ws/a.py": "X = 2\n", "tests/test_c.py": "# c\n"}
+    )
+    # test_a imports a; test_b only reaches a through b (one hop, not the closure); test_c changed
+    assert (
+        calls[-1]
+        == f"{SUITE} tests/test_a.py tests/test_c.py tests/test_cli.py tests/test_cli_registry.py tests/test_prepush_hook.py"
+    )
+
+
+def test_a_deleted_file_runs_the_capped_set(tmp_path):
     calls, err = run_selected(tmp_path, {"src/ws/c.py": None})
-    assert calls[-1] == SUITE
+    assert calls[-1] == SMOKE_RUN
     assert "renamed or deleted" in err
+
+
+def test_more_than_forty_affected_files_run_the_capped_set(tmp_path):
+    calls, err = run_selected(tmp_path, {"src/ws/d.py": "Z = 2\n"})
+    assert "CAPPED" in err
+    # 41 tests import d directly; test_e reaches it through e only, so it is left to CI
+    assert "tests/test_e.py" not in calls[-1]
+    assert "tests/test_d0.py" in calls[-1]
 
 
 def test_nothing_to_select_runs_the_smoke_set_never_zero(tmp_path):
     calls, err = run_selected(tmp_path, {"README.md": "changed\n"})
-    assert calls[-1] == f"{SUITE} tests/test_cli.py tests/test_cli_registry.py tests/test_prepush_hook.py"
+    assert calls[-1] == SMOKE_RUN
     assert "SMOKE" in err
 
 
-def test_a_selector_that_errors_runs_everything(tmp_path):
+def test_a_selector_that_errors_runs_the_smoke_set(tmp_path):
     calls, err = run_selected(tmp_path, {"src/ws/c.py": "def broken(:\n"})
-    assert calls[-1] == SUITE
-    assert "selector error" in err
+    assert calls[-1] == SMOKE_RUN
+    assert "no usable selection" in err
 
 
-def test_no_selector_in_the_checkout_runs_everything(tmp_path):
+def test_no_selector_in_the_checkout_runs_the_smoke_set(tmp_path):
     calls, err = run_selected(tmp_path, {"src/ws/c.py": "Y = 2\n"}, selector=False)
-    assert calls[-1] == SUITE
-    assert "no selector" in err
+    assert calls[-1] == SMOKE_RUN
+    assert "no usable selection" in err
 
 
-def test_a_collection_error_in_the_selected_set_runs_everything(tmp_path):
-    # the fake uv fails only the collect-only call, as pytest does for a test that will not import
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    body = '#!/usr/bin/env bash\nprintf "%s\\n" "uv $*" >> "$LOG"\n[[ "$*" == *--collect-only* ]] && exit 2\nexit 0\n'
-    (bin_dir / "uv").write_text(body, encoding="utf-8")
-    (bin_dir / "uv").chmod(0o755)
-    calls, err = run_selected(tmp_path, {"src/ws/c.py": "Y = 2\n"}, {"LOG": str(tmp_path / "calls.log")}, fake_uv=False)
-    assert calls[-1] == SUITE
-    assert "did not collect" in err
-
-
-def test_a_forced_full_run_is_logged_and_runs_everything(tmp_path):
+def test_a_forced_full_run_is_logged_and_runs_the_whole_suite(tmp_path):
     calls, _ = run_selected(tmp_path, {"src/ws/c.py": "Y = 2\n"}, {"WS_PREPUSH_FULL": "1"})
     assert calls[-1] == SUITE
     assert "WS_PREPUSH_FULL=1" in (tmp_path / "repo" / ".git" / "ws-prepush-skips.log").read_text(encoding="utf-8")
+
+
+@pytest.mark.skipif(not shutil.which("timeout"), reason="needs timeout")
+def test_the_capped_set_stops_at_the_cap_and_leaves_the_rest_to_ci(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "uv").write_text("#!/usr/bin/env bash\nexec sleep 20\n", encoding="utf-8")
+    (bin_dir / "uv").chmod(0o755)
+    _, err = run_selected(tmp_path, {"pyproject.toml": "x = 1\n"}, {"WS_PREPUSH_CAP": "1"}, fake_uv=False)
+    assert "stopped the capped set after 1 s" in err

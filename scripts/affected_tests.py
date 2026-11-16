@@ -2,13 +2,14 @@
 """Pick the test files a change can affect, so a push runs those and CI runs the whole suite.
 
 The default is a static import map: each test file is mapped to the `ws` modules it imports, followed transitively
-through `src/ws`. What imports cannot see is added by a table in this file (FORCE_FULL, CLI_ROOTS) and by a word
-search: a changed non-Python file or a changed module name selects every test whose source mentions it. Anything the
-map cannot judge selects everything (exit 0, first line `FULL: <reason>`), never nothing.
+through `src/ws`. What imports cannot see is added by a table in this file (the reach-everything paths, the CLI
+markers) and by name search: a changed non-Python file's path, or a changed module's path or dotted name, selects
+every test that mentions it. Anything the map cannot judge gives the short capped set, never nothing.
 
-Output, one thing per line on stdout: `FULL: <reason>`, or `SELECT` followed by test paths, or `SMOKE` when the change
-touches no test (docs only). Exit 0 whenever it answered; 2 on a usage error. The hook treats any other exit, an
-empty answer, or a crash as "run everything".
+Output, one thing per line on stdout. `SELECT` then test paths; `SMOKE` then the smoke set when nothing maps;
+`CAPPED: <why>` then a short set (smoke, changed tests, direct importers) when the change maps to more than 40 files or touches a path that can
+reach every test; `ERROR: <why>` when it failed. The whole suite is CI's job and is never an answer. Exit 0 whenever it
+answered.
 
     python3 scripts/affected_tests.py --base origin/main
     python3 scripts/affected_tests.py --files src/ws/gate.py docs/x.md
@@ -28,13 +29,16 @@ ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src" / "ws"
 TESTS = ROOT / "tests"
 
-# A change to any of these can reach every test through the harness, the lock or the CI wiring: run the lot.
+# A change to any of these can reach every test through the harness, the lock or the CI wiring: the capped set, then CI runs the lot.
 FORCE_FULL_PREFIXES = ("pyproject.toml", "uv.lock", "tests/plugins/", ".github/", "scripts/affected_tests.py")
 FORCE_FULL_NAMES = ("conftest.py",)
 
 # A test that starts `python -m ws` or calls the CLI reaches commands through cli.py's scan, which no import shows.
 # Such a test is selected by a changed module whose name its text mentions (a command name is its module name).
 CLI_MARKERS = re.compile(r'"-m",\s*"ws"|-m ws\b|\bws\.cli\b|\bcli\.main\b|run_ws\(|\bws_cli\b')
+
+# A change that maps to more files than this runs the capped set instead (CI runs the rest).
+MAX_SELECTED = 40
 
 # Docs-only and similar changes that no test reads still run a short named set rather than nothing.
 SMOKE = ("tests/test_cli.py", "tests/test_cli_registry.py", "tests/test_prepush_hook.py")
@@ -137,8 +141,9 @@ def test_files() -> list[Path]:
     return sorted(TESTS.rglob("test_*.py"))
 
 
-def test_info(path: Path) -> tuple[str, set[str]]:
-    """The test's source text and the ws modules its imports reach (its own, its siblings' helper imports, conftest)."""
+def test_info(path: Path) -> tuple[str, set[str], set[str]]:
+    """The test's source text, the ws modules its imports reach (transitively) and the ones it imports directly (its
+    own, plus its local helpers')."""
     text = path.read_text(encoding="utf-8")
     here = path.stem
     roots = imports_of(ast.parse(text), here, False)
@@ -150,8 +155,7 @@ def test_info(path: Path) -> tuple[str, set[str]]:
             and re.search(rf"\b{re.escape(helper.stem)}\b", text)
         ):
             roots |= imports_of(ast.parse(helper.read_text(encoding="utf-8")), helper.stem, False)
-    reach = closure(roots)
-    return text, reach
+    return text, closure(roots), roots
 
 
 def words_for(path: str) -> list[str]:
@@ -163,17 +167,21 @@ def words_for(path: str) -> list[str]:
     return out
 
 
-def select(mod: list[str], added: list[str], gone: list[str]) -> tuple[str, list[str]]:
-    if gone:
-        return "FULL: a file was renamed or deleted: " + gone[0], []
+def select(mod: list[str], added: list[str], gone: list[str], cap: int = MAX_SELECTED) -> tuple[str, list[str]]:
+    """(`SELECT`, tests) when the change maps to at most `cap` files; `SMOKE` when it maps to none; otherwise
+    (`CAPPED: <why>`, tests): the smoke set, every changed or added test and the tests that import a changed module
+    directly (one hop). The whole suite is CI's job, so nothing here ever returns it."""
     allp = mod + added
+    why = ""
+    if gone:
+        why = "a file was renamed or deleted: " + gone[0]
     for p in allp:
         if p.startswith(FORCE_FULL_PREFIXES) or Path(p).name in FORCE_FULL_NAMES:
-            return f"FULL: {p} can reach every test", []
-    tests = [t for t in test_files()]
-    rel = {t: t.relative_to(ROOT).as_posix() for t in tests}
+            why = why or f"{p} can reach every test"
+    rel = {t: t.relative_to(ROOT).as_posix() for t in test_files()}
     chosen: set[str] = set()
-    info = {t: test_info(t) for t in tests}
+    near: set[str] = {p for p in allp if p in rel.values()}  # changed or added tests
+    info = {t: test_info(t) for t in rel}
     changed_mods: set[str] = set()
     other: list[str] = []
     for p in allp:
@@ -181,14 +189,13 @@ def select(mod: list[str], added: list[str], gone: list[str]) -> tuple[str, list
             chosen.add(p)
         elif p.startswith("src/ws/") and p.endswith(".py"):
             changed_mods.add(module_of(ROOT / p))
-        elif p.startswith("tests/") and p.endswith(".py"):
-            # a helper, not a test: every test that names it
-            other.append(p)
         else:
-            other.append(p)
-    for t, (text, reach) in info.items():
+            other.append(p)  # a helper, a fixture, a doc: every test that names its path
+    for t, (text, reach, direct) in info.items():
         if changed_mods & reach:
             chosen.add(rel[t])
+        if changed_mods & direct:
+            near.add(rel[t])
         for m in changed_mods:  # what imports cannot see (a CLI test, a scanned folder): the module named as a path or
             # dotted name, or as a quoted string (a command name); never a bare common word
             leaf = re.escape(m.rpartition(".")[2])
@@ -198,11 +205,18 @@ def select(mod: list[str], added: list[str], gone: list[str]) -> tuple[str, list
             scanned = CLI_MARKERS.search(text) or m in command_modules() or m.count(".") > 1
             if re.search(by_name, text) or (scanned and re.search(quoted, text)):
                 chosen.add(rel[t])
+                near.add(rel[t])
         for p in other:
             if any(w in text for w in words_for(p)):
                 chosen.add(rel[t])
+                near.add(rel[t])
+    smoke = [s for s in SMOKE if (ROOT / s).exists()]
+    if not why and len(chosen) > cap:
+        why = f"{len(chosen)} test files could be affected (more than {cap})"
+    if why:
+        return f"CAPPED: {why}", sorted(set(smoke) | near)
     if not chosen:
-        return "SMOKE", [s for s in SMOKE if (ROOT / s).exists()]
+        return "SMOKE", smoke
     return "SELECT", sorted(chosen)
 
 
@@ -215,7 +229,7 @@ def main(argv: list[str] | None = None) -> int:
         mod, added, gone = (a.files, [], []) if a.files is not None else changed(a.base)
         kind, tests = select(mod, added, gone)
     except Exception as e:  # noqa: BLE001  the hook treats any failure as "run everything"; say why
-        print(f"FULL: selector error: {type(e).__name__}: {e}")
+        print(f"ERROR: selector error: {type(e).__name__}: {e}")
         return 0
     print(kind)
     for t in tests:

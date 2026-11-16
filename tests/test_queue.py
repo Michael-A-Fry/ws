@@ -1664,45 +1664,24 @@ def test_planted_sigkill_already_alerted_by_the_scheduler_is_not_told_again(tmp_
     assert queue.unit_alerted("x", T0, tmp_path / "missing.jsonl") is False
 
 
-def test_planted_sigkill_of_the_drain_is_one_notice_not_one_per_name(tmp_path):
-    """The drain runs a queued job in its own process, so a SIGKILL of the drain fails the drain's unit (its alert is
-    under the drain job's name) and leaves the queued run to the reaper. That unit alert is the notice: the reaper says
-    nothing more for the queued run. A direct `ws run` of another job killed at the same time is still told."""
+def test_planted_sigkill_after_an_unrelated_drain_failure_is_still_told(tmp_path):
+    """A drain unit fails whenever a queued job exits non-zero. Such a failure, under the drain job's name, says nothing
+    about a queued run that is killed later: that run's notice still goes, naming it."""
     host = Host()
     alerts: list[str] = []
     told = tmp_path / "state" / "logs" / "alerts.jsonl"
     ledger = make(
         tmp_path, host=host, sink=lambda rec: True, on_stop=lambda job, run_id, why: alerts.append(job),
         already_told=lambda job, since: queue.unit_alerted(job, since, told),
-        drain_told=lambda since: queue.unit_alerted("drain", since, told),
     )  # fmt: skip
     queued_id, _, _ = ledger.enqueue("nightly", None, T0)
     assert ledger.admit(req(job="nightly", run_id=queued_id, owner_pid=4800), T0, spend()).kind == "admit"
-    assert ledger.admit(req(job="direct", owner_pid=4801), T0, spend()).kind == "admit"
     told.parent.mkdir(parents=True, exist_ok=True)
-    line = {"schema": 1, "ts": "2026-11-08T03:00:05.000Z", "event": "unit-failed", "job": "drain"}
+    line = {"schema": 1, "ts": "2026-11-08T03:00:05.000Z", "event": "unit-failed", "job": "drain"}  # another job failed
     told.write_text(json.dumps(line) + "\n", encoding="utf-8")
-    host.procs[4800] = host.procs[4801] = (False, None)
-    assert ledger.reap(T0 + timedelta(minutes=1)) == 2
-    assert alerts == ["direct"]
-
-
-def test_the_drain_jobs_are_the_scheduled_queue_commands(tmp_path, monkeypatch):
-    monkeypatch.setenv("WS_HOME", str(tmp_path / "ws"))
-    monkeypatch.setenv("HOME", str(tmp_path))
-    d = tmp_path / "ws" / "jobs"
-    d.mkdir(parents=True, mode=0o700)
-    contract = (
-        'timeout_s = 600\non_failure = "alert"\nlog = "file"\nuninstall = "x"\nexpected_rate = "1h"\ndata_class = "x"\n'
-    )
-    (d / "drain.toml").write_text('command = "queue"\nschedule = "every 10m"\n' + contract, encoding="utf-8")
-    (d / "backups.toml").write_text('command = "backup"\nschedule = "daily 03:00"\n' + contract, encoding="utf-8")
-    for f in d.iterdir():
-        f.chmod(0o600)
-    assert queue.drain_jobs() == ("drain",)
-    (d / "broken.toml").write_text("not = [toml", encoding="utf-8")
-    (d / "broken.toml").chmod(0o600)
-    assert queue.drain_jobs() == ()  # a folder that does not read costs only the dedupe
+    host.procs[4800] = (False, None)
+    assert ledger.reap(T0 + timedelta(minutes=1)) == 1
+    assert alerts == ["nightly"]
 
 
 # ---- one net effect (rr-L3, h-L1-17/18, h-L4-5) ----------------------------------------------------------------------

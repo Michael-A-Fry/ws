@@ -56,7 +56,7 @@ wait are not stops. No notify role is silence, and a notice that cannot be sent 
 came to. The line counts as one alert against the adapter's daily allowance. A run reaped after a SIGKILL, OOM or
 power loss is announced once (`outcome_unknown`), by whichever process reaped it; one that had written its own record
 is not, and nor is one whose unit the scheduler already alerted (`ws watch alert` wrote a line for the job since the
-run started; for a queued run, a line for the drain job whose unit ran it). The reap runs at the next admission or drain, so a killed run is told when the next job on the machine
+run started). The reap runs at the next admission or drain, so a killed run is told when the next job on the machine
 starts, not at the kill.
 
 One net effect per trigger: `enqueue(trigger=ID)` (`--trigger`) gives the run the key `<job>:<ID>`, the run key, for
@@ -516,7 +516,6 @@ class Ledger:
         sink: Callable[[dict], bool] | None = None,
         on_stop: Callable[[str, str, str], None] | None = None,
         already_told: Callable[[str, datetime], bool] | None = None,
-        drain_told: Callable[[datetime], bool] | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self.state = Path(state)
@@ -530,9 +529,8 @@ class Ledger:
         self.rate_limits = rate_limits or (lambda now: usage.read_rate_limits(self.state, now))
         self.recorded, self.sink, self.clock = recorded, sink, clock
         self.on_stop = on_stop
-        # (job, run_id, started, queued) reaped in a transaction; queued: a drain ran it, not a `ws run` of its own
-        self._reaped: list[tuple[str, str, datetime, bool]] = []
-        self.already_told, self.drain_told = already_told, drain_told
+        self._reaped: list[tuple[str, str, datetime]] = []  # (job, run_id, started) reaped in a transaction
+        self.already_told = already_told
         self._conn: sqlite3.Connection | None = None
         self._engine: sqlqueue.SqlQueue | None = None
 
@@ -954,14 +952,11 @@ class Ledger:
         """Say once for each run reaped as `outcome_unknown` in the transaction that has just committed. (A rolled-back
         reap is forgotten here too: the next reaper finds the run again and tells it then.) A job whose failure was
         already alerted since the run started (`already_told`: the scheduler's OnFailure= alert for the same kill) is
-        not told twice, and nor is a queued run whose drain's unit was alerted since it started (`drain_told`: the drain
-        runs the job in its own process, so its unit's alert, under the drain job's name, is the alert for this kill)."""
+        not told twice."""
         told, self._reaped = self._reaped, []
-        for job, run_id, started, queued in told:
+        for job, run_id, started in told:
             with contextlib.suppress(Exception):
                 if self.already_told is not None and self.already_told(job, started):
-                    continue
-                if queued and self.drain_told is not None and self.drain_told(started):
                     continue
             self.stopped(job, run_id, "outcome_unknown: the process that held it was gone before it finished")
 
@@ -1020,7 +1015,7 @@ class Ledger:
             (status, ns, usd, int(written), rec.get("stop_reason") or "owner_gone", run_id),
         )
         if lost and cur.rowcount == 1:
-            self._reaped.append((r["job"], run_id, started, r["message_id"] is not None))
+            self._reaped.append((r["job"], run_id, started))
 
     # -- queued work --------------------------------------------------------------------------------------------
 
@@ -1794,24 +1789,13 @@ def ledger_from_profile(prof: dict, state: Path, log: Path) -> Ledger:
         sink=lambda rec: _write_record(log, rec),
         on_stop=lambda job, run_id, reason: notify_stop(job, run_id, reason, prof=prof),
         already_told=lambda job, since: unit_alerted(job, since, alerts),
-        drain_told=lambda since: any(unit_alerted(d, since, alerts) for d in drain_jobs()),
     )
-
-
-def drain_jobs(env=None) -> tuple[str, ...]:
-    """The scheduled jobs that drain the queue (`command = "queue"`): their units run queued jobs in their own process.
-    Empty when the job files cannot be read."""
-    try:
-        return tuple(s.name for s in jobs.scheduled(env) if tuple(s.argv[:2]) == jobs.COMMANDS["queue"])
-    except Exception:  # noqa: BLE001  a job folder that does not read only costs the dedupe
-        return ()
 
 
 def unit_alerted(job: str, since: datetime, path: Path) -> bool:
     """Has the scheduler already alerted a failure of `job` since `since`? (`ws watch alert`, which a unit's
-    OnFailure= runs, writes a line in its alerts log for each failed unit, under the unit's job: for a queued run
-    that is the drain job, see `drain_jobs`.) False when the file is missing or unreadable: then the reaper's notice
-    is the only one."""
+    OnFailure= runs, writes a line in its alerts log for each failed unit.) False when the file is missing
+    or unreadable: then the reaper's notice is the only one."""
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except OSError:

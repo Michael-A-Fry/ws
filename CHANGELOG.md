@@ -53,6 +53,8 @@ body of the GitHub release.
 
 ### Fixed
 
+- Flaky tests: the two orphan tests (`test_msg.py`, `test_session_registry.py`) write their result file whole, through
+  a temporary file and a rename. Before, the test could find the file created but still empty, and fail with `''`.
 - The launchd scheduler switches off only the agents it loaded. Each plist now carries `WsWrittenBy: ws`, and
   `ws schedule`, `ws uninstall` and `ws schedule apply` boot out a `ws.job.*` label only when `launchctl print` shows
   it was loaded from a plist under `jobs/units/` or one with that key. A label someone else loaded is left alone and
@@ -63,6 +65,10 @@ body of the GitHub release.
 - Flaky tests: the reveal-link test waits on the push itself instead of 5 s of polling; the tests that check the reader
   is quick measure its CPU time too, as the limit does; and the live conformance row that drives two real runner
   sessions is sized large, like the end-to-end tests it matches, not small (60 s).
+- `ws upgrade`'s step watchdog sends KILL to the step's whole process group after the TERM grace even when the step
+  itself has already exited, as `ws run` does. Before, a child that ignored TERM, or that the TERM didn't stop, kept
+  running after the upgrade. The kill tests for both now wait on the process's exit (a pidfd where there is one), not
+  one check or a 5 s poll.
 
 ## [0.1.11] - 2026-11-17
 

@@ -28,6 +28,9 @@ memory) that's the worker count, else xdist counts the cores itself. `-n 4` or `
 - One seed covers all workers: pytest-randomly sends the controller's seed to each, so `--randomly-seed=N` replays a
   failure. The order inside a worker follows from the seed and the distribution, so a failure that depends on which
   tests share a worker is replayed with `-n 0` and the same seed first, then with the same `-n`.
+- `--dist loadgroup` is in addopts: tests marked `@pytest.mark.xdist_group("name")` (or a file-wide `pytestmark`) run
+  on one worker, in order. Use it only for a test that needs a system-wide resource, as `tests/e2e/test_secret_wall.py`
+  does with its one wall user and home, and say why next to the marker.
 - A test must not depend on another test's files, ports, environment or working folder. Use `tmp_path` and the
   fixtures in `tests/conftest.py`, which give every test its own `HOME` and `WS_HOME`.
 - Without pytest-xdist (`-p no:xdist`, or the dev group not installed) the run stops with a usage error that says so.

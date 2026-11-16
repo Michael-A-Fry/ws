@@ -17,6 +17,8 @@ body of the GitHub release.
 
 ### Changed
 
+- CI's macOS core-tier time budget is back to 900 s, the same as Linux. A tier over its budget now warns and only a run
+  past twice the budget fails, so macOS warns over 900 s and fails over 1800 s, as before.
 - The pre-push cap on a capped set grows with the set: 6 s a file, at least 300 s and at most 1800 s, so a large
   selection doesn't hit 300 s with no failure. `WS_PREPUSH_CAP` still sets it, and the timeout message names it.
 - The pre-push hook runs the tests through `ws-test --light --mem 3G --node local --` (6G with e2e tests or over 40

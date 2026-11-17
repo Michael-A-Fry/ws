@@ -2,7 +2,7 @@
 
 The store is `asks.jsonl`, the file `ws home` already reads (`[home.sources] asks_jsonl`, else `.claude-usage/asks/`
 below the home folder), so there is one asks store and not two. It is append-only events, folded into asks: `added`,
-`answered`, `done` and `withdrawn`. `ts` is epoch milliseconds, as the OpenCode shim writes it, and `at` is the same
+`answered`, `noted`, `done` and `withdrawn`. A note adds text to an open or answered ask and never rewrites what is there. `ts` is epoch milliseconds, as the OpenCode shim writes it, and `at` is the same
 moment as RFC 3339 text, which `ws.jsonl` needs for its stamp. Every write goes through `ws.jsonl`'s lock.
 
 A repo's data class decides what the store may hold: the strictest of the named repo's class and the working folder's
@@ -32,7 +32,8 @@ from ws.output import WsError
 COMMAND = "ask"
 SCHEMA = 1
 OPAQUE = "Open the session to see this ask."
-EVENTS = ("added", "answered", "withdrawn", "done")
+EVENTS = ("added", "answered", "noted", "withdrawn", "done")
+OLD_EVENTS = ("added", "answered", "withdrawn", "done")  # what the older asks file had: `import` takes only these
 CLOSED = ("withdrawn", "done")
 LIMITS = {
     "question": 2000,
@@ -40,6 +41,7 @@ LIMITS = {
     "description": 300,
     "decision": 300,
     "answer": 2000,
+    "note": 2000,
     "dedupe_key": 300,
     "repo": 100,
     "session": 100,
@@ -229,7 +231,7 @@ def _ms(value) -> int | None:
 
 def fold(recs: list[dict]) -> dict[str, dict]:
     """Events folded into asks by id, in file order. Each ask is its `added` fields plus `status` (open, answered, done,
-    withdrawn), `answer` and `closed_ts`. A line that does not apply (unknown id, bad event) is skipped, never raised."""
+    withdrawn), `answer`, `notes` (oldest first) and `closed_ts`. A line that does not apply (unknown id, bad event) is skipped, never raised."""
     asks: dict[str, dict] = {}
     for r in recs:
         ident, event = r.get("id"), r.get("event")
@@ -242,6 +244,7 @@ def fold(recs: list[dict]) -> dict[str, dict]:
                     "ts": _ms(r.get("ts")),
                     "status": "open",
                     "answer": None,
+                    "notes": [],
                     "closed_ts": None,
                 }
             continue
@@ -258,6 +261,15 @@ def fold(recs: list[dict]) -> dict[str, dict]:
                     "text": r.get("decision") if isinstance(r.get("decision"), str) else None,
                     "option_index": None,
                     "via": "runner",
+                }
+            )
+        elif event == "noted" and ask["status"] in ("open", "answered"):
+            text = r.get("note")
+            ask["notes"].append(
+                {
+                    "text": text if isinstance(text, str) else None,
+                    "ts": _ms(r.get("ts")),
+                    "redacted": r.get("redacted") is not False,
                 }
             )
         elif event in CLOSED and ask["status"] in ("open", "answered") and (event == "done" or ask["status"] == "open"):
@@ -283,12 +295,13 @@ def _hash(key: str) -> str:
 def view(ask: dict, env=None, pol=None) -> dict:
     """The ask as a reader may see it. It is opaque when it was stored redacted, its class when added was not full, or the
     class of its repo now is not full; an opaque view keeps the id, repo, status and times and drops the text, options,
-    decision, session name, answer text and dedupe key."""
+    decision, session name, answer text, note text and dedupe key. A note stored redacted shows no text either."""
     pol = pol if pol is not None else _policy(_env(env))
     repo = ask.get("repo") if isinstance(ask.get("repo"), str) else "?"
     cwd = str(ask.get("cwd") or "")
     now = _strictest(_name_access(pol, repo, cwd), _access(pol, cwd) if cwd else "full")
     out = dict(ask)
+    notes = ask.get("notes") if isinstance(ask.get("notes"), list) else []
     # only an explicit `redacted: false` is visible, as in `ws home`: a line that doesn't say is treated as redacted
     out["opaque"] = ask.get("redacted") is not False or ask.get("flows", "full") != "full" or now != "full"
     if out["opaque"]:
@@ -297,6 +310,7 @@ def view(ask: dict, env=None, pol=None) -> dict:
             out["session"] = dict(ask["session"], name="")
         if isinstance(ask.get("answer"), dict):
             out["answer"] = dict(ask["answer"], text=None)
+    out["notes"] = [dict(n, text=None) if out["opaque"] or n.get("redacted") is not False else dict(n) for n in notes]
     return out
 
 
@@ -483,6 +497,38 @@ def answer(ident: str, words: str, via: str = "cli", env=None) -> dict:
         return reply
 
 
+# --- note ------------------------------------------------------------------------------------------------------------
+
+
+def note(ident: str, words: str, env=None) -> dict:
+    """Append a note to an open or answered ask; earlier text is never rewritten. The note gets the checks a question
+    gets: a length limit, a token-shaped secret refused, and stored with no text when the ask is redacted or opaque, its
+    class now is not full, there is no sensitive-terms file, or a sensitive term matches. Raises WsError: `unknown_ask`
+    (exit 2), `not_open` (done or withdrawn, exit 1), `secret` or `refused` (exit 1), `usage` (exit 2)."""
+    e = _env(env)
+    text = _text("note", words, LIMITS["note"], True)
+    _refuse_secret("note", text)
+    with _store_lock(e):
+        ask = get(ident, e)
+        if ask["status"] not in ("open", "answered"):
+            raise WsError("not_open", f"ask is {ask['status']}", "a done or withdrawn ask takes no notes", 1)
+        terms = terms_regex(e)
+        reason = (
+            "the ask is not shown here"
+            if view(ask, e)["opaque"]
+            else "no sensitive-terms file"
+            if terms is None
+            else "a sensitive term"
+            if terms.search(text)
+            else ""
+        )
+        event = {"event": "noted", "id": ident, "note": OPAQUE if reason else text, "redacted": bool(reason)}
+        if reason:
+            event["redacted_why"] = reason
+        _write(e, event, held=True)
+        return event
+
+
 # --- commands --------------------------------------------------------------------------------------------------------
 
 
@@ -556,6 +602,7 @@ def cmd_list(args) -> int:
             [x["id"]]
             + ([x["status"]] if args.all else [])
             + [age_text(x.get("ts")), str(x.get("repo")), _line(x["question"], 80)]
+            + ([f"[{len(x['notes'])} note{'s' if len(x['notes']) != 1 else ''}]"] if x.get("notes") else [])
         )
         print("  ".join(cols))
     return 0
@@ -578,6 +625,19 @@ def cmd_get(args) -> int:
         a = x["answer"]
         how = f"option {a['option_index'] + 1}" if a.get("option_index") is not None else "free text"
         print(f"answer: {a.get('text') if a.get('text') is not None else '(hidden)'}  ({how}, via {a.get('via')})")
+    for n in x.get("notes") or []:
+        print(f"note ({age_text(n.get('ts'))} ago): {n['text'] if n.get('text') is not None else '(hidden)'}")
+    return 0
+
+
+def cmd_note(args) -> int:
+    event = note(args.id, " ".join(args.text))
+    if args.json:
+        output.result({"id": args.id, "redacted": event["redacted"]})
+    else:
+        print("noted")
+    if event["redacted"]:
+        print(f"ws: stored redacted ({event['redacted_why']})", file=sys.stderr)
     return 0
 
 
@@ -662,7 +722,7 @@ def convert(row: dict) -> dict | None:
     """One row of the older asks file (`v` 1, an ISO `ts` ending in Z, events `added`, `answered`, `withdrawn`, `done`) as
     an event of this store, or None when it is not one. A redacted row stays as it was stored: nothing is put back."""
     ident, event, ms = row.get("id"), row.get("event"), _ms(row.get("ts"))
-    if row.get("v") != 1 or event not in EVENTS or not isinstance(ident, str) or not _ID.match(ident) or ms is None:
+    if row.get("v") != 1 or event not in OLD_EVENTS or not isinstance(ident, str) or not _ID.match(ident) or ms is None:
         return None
     out = {k: v for k, v in row.items() if k not in ("v", "ts")}
     out.update(schema=SCHEMA, ts=ms, at=jsonl.iso_utc(ms / 1000))
@@ -777,6 +837,11 @@ def register(sub) -> None:
     w.add_argument("id")
     w.add_argument("--timeout", type=float, default=DEFAULT_WAIT, metavar="SECONDS")
     w.set_defaults(func=cmd_wait)
+
+    nt = s.add_parser("note", help="add a note to an open or answered ask (appended; nothing earlier is changed)")
+    nt.add_argument("id")
+    nt.add_argument("text", nargs="+")
+    nt.set_defaults(func=cmd_note)
 
     for name in ("done", "withdraw"):
         c = s.add_parser(name, help=f"{name} an ask (a no-op that prints the status if it is already closed)")

@@ -1109,6 +1109,66 @@ ws skills restore [-h] [--runner {claude-code,opencode}] {align,checkpoint,taste
 | `name` | The skill to restore. One of `align`, `checkpoint`, `taste-gate`, `dataviz`, `resume`, `ship`. |
 | `--runner RUNNER` | The runner (default: every runner found). One of `claude-code`, `opencode`. |
 
+## `ws commit-wall`
+
+Refuse a commit whose added lines or message match a pattern you supplied.
+
+ws ships no pattern: the wall reads `<config>/commit-wall/patterns.toml` (a `[[pattern]]` table has a `name` and either
+`terms`, literal and any case, or a Python `regex`) and lets through what `<config>/commit-wall/exceptions.toml` lists
+(`[[allow]]` with any of `pattern`, `path` and `text`; only a person adds to it, and the gate refuses a session's writes
+to the folder). A hit prints the file, the line and the pattern's name, never the matched text. A merge is scanned for
+the lines new to the merge, nothing is skipped (every file is read as text, file names and the whole message included),
+a check with no pattern refuses, `git am` and a push are checked too, and a hook that can't run `ws` blocks the commit.
+
+### `ws commit-wall install`
+
+Point a repository's `core.hooksPath` at ws's own `pre-commit` and `commit-msg`, recording the old value. The repository's
+other hooks are forwarded and its old `pre-commit` and `commit-msg` run after the check passes.
+
+```text
+ws commit-wall install [-h] [--repo REPO]
+```
+
+| Argument | Meaning |
+|---|---|
+| `--repo REPO` | The repository (default: here). |
+
+### `ws commit-wall uninstall`
+
+Put the recorded `core.hooksPath` back, or remove the setting when there was none.
+
+```text
+ws commit-wall uninstall [-h] [--repo REPO]
+```
+
+| Argument | Meaning |
+|---|---|
+| `--repo REPO` | The repository (default: here). |
+
+### `ws commit-wall check`
+
+Scan the staged diff, or a commit message with `--stage commit-msg FILE`, now. Exit 1 on a hit.
+
+```text
+ws commit-wall check [-h] [--stage {pre-commit,commit-msg,pre-push}] [--repo REPO] [--wall-dir WALL_DIR] [file]
+```
+
+| Argument | Meaning |
+|---|---|
+| `--stage STAGE` | `pre-commit` (the staged diff, default), `commit-msg` or `pre-push` (the commits a push would send, read from stdin). |
+| `--repo REPO` | The repository (default: here). |
+| `--wall-dir WALL_DIR` | The config folder to read (the hooks pass the one they were installed with). |
+| `file` | The message file, for `--stage commit-msg`. |
+
+### `ws commit-wall status`
+
+The number of patterns and exceptions, and the repositories the wall is on for. A repository it recorded whose `core.hooksPath`
+no longer points at the wall is listed as not on, and the command exits 1.
+
+```text
+ws commit-wall status [-h]
+```
+
 ## `ws canary`
 
 Check a runner still works with ws after an update (no model is called).

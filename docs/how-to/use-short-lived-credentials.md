@@ -105,3 +105,5 @@ new ones for elevated entries at once.
   user. A symlink is refused.
 - *claim_refused*: the request named an area or tier. The broker reads those from the record only.
 - *audit_failed*: the broker couldn't write its audit line, so it didn't give the lease. Check the `logs/` folder.
+- *registry_untrusted*: the registry is a symlink, belongs to another user, or it or its folder is open to group or
+  world writes. Put the file itself back, owned by you, and run `chmod go-w` on it and its folder.

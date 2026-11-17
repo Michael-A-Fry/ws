@@ -798,6 +798,7 @@ def test_control_paths_are_ws_homes_files_and_folders(tmp_path):
         "secrets.toml",
         "jobs",
         "release",
+        "commit-wall",
         "runs",
         "logs",
         "sessions",

@@ -88,7 +88,7 @@ LIMIT_SUBTYPES = {
     "max_turns": "max_turns",
     "max_budget": "max_budget",
 }
-OK_SUBTYPES = (None, "success")
+OK_SUBTYPES = (None, "success", "stop")  # claude says success, opencode stop
 
 
 def runs_path(env: dict | None = None) -> Path:

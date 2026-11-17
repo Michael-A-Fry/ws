@@ -6,7 +6,10 @@
     password_secret = "restic-password"    the secret's name in ws's store (default), or
     password_file = "/path/to/file"        a file only you can read
 
-`ws backup run` backs up the three; `ws backup verify` is the proof it can come back: it restores one random file from
+The backup job file (jobs/backup.toml, `command = "backup"`) may add `extra_sources = ["~/.ws", "/srv/notes"]`:
+more folders or files, absolute or under ~, backed up beside them.
+
+`ws backup run` backs up the three and the extra sources; `ws backup verify` is the proof it can come back: it restores one random file from
 the latest snapshot into a temporary folder and compares its SHA-256 with the live file. A file that changed since the
 snapshot is skipped, not counted. `ws doctor` warns until a verify has passed in the last 30 days.
 
@@ -108,8 +111,25 @@ def shown(repo: str) -> str:
     return _USERINFO.sub("", repo)
 
 
+BACKUP_JOB = "backup"  # the job file whose `extra_sources` the backup takes (jobs/backup.toml, which `steps` writes)
+
+
+def extra_sources(env) -> list[Path]:
+    """The backup job's `extra_sources` (jobs/backup.toml): more folders or files to back up. None without the file. A
+    job file that is not yours, is open to other writers, fails its pin or names a bad path is refused (BackupError):
+    what a backup takes is not widened by a file nobody reviewed."""
+    try:
+        d = jobs.command_job(BACKUP_JOB, env)
+        return jobs.extra_sources(d, f"jobs/{BACKUP_JOB}.toml", env)
+    except FileNotFoundError:
+        return []
+    except jobs.JobError as e:
+        raise BackupError(str(e)) from e
+
+
 def sources(env) -> list[Path]:
-    """What is backed up: the memory folder, the notes folder and the profile, whichever exist."""
+    """What is backed up: the memory folder, the notes folder and the profile, whichever exist, and the backup job's
+    `extra_sources` that exist."""
     prof = _profile(env)
     roles = prof.get("roles") if isinstance(prof.get("roles"), dict) else {}
     out = []
@@ -119,6 +139,7 @@ def sources(env) -> list[Path]:
         if isinstance(p, str) and p:
             out.append(install.expand(p, env))
     out.append(profile_path(env).absolute())
+    out += extra_sources(env)
     return [p for p in dict.fromkeys(out) if p.exists()]
 
 

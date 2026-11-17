@@ -50,7 +50,7 @@ KINDS = ("config", "state", "data", "cache")
 
 # The entries ws keeps at the top of each folder (a name is a file or a folder).
 NAMES: dict[str, tuple[str, ...]] = {
-    "config": ("policy.toml", "profile.toml", "secrets.toml", "jobs", "release"),
+    "config": ("policy.toml", "profile.toml", "secrets.toml", "jobs", "release", "commit-wall"),
     "state": (
         "logs",
         "runs",
@@ -77,6 +77,7 @@ CONTROL_NAMES = (
     "secrets.toml",
     "jobs",
     "release",
+    "commit-wall",
     "runs",
     "logs",
     "sessions",

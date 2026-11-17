@@ -18,8 +18,9 @@ Wire format on the socket: one JSON object per line, one reply per request. Ops:
 and for the minters (ws.minters) mint, sign and ca_public.
 Refusal codes: unknown_name, unset, host_not_allowed, purpose_not_allowed, caller_refused, store_unreadable, expired,
 run_required, run_refused, not_declared, area_refused, tier_refused, claim_refused, elevation_off, audit_failed,
-wrong_kind, upstream_refused, upstream_unreachable, plus bad_request (malformed) and busy (too many connections or
-leases).
+wrong_kind, registry_untrusted, upstream_refused, upstream_unreachable, plus bad_request (malformed) and busy (too
+many connections or leases). The registry itself is trusted only when it belongs to the broker's user or root and is
+closed to group and world writes; any other is refused whole (registry_untrusted).
 
 Run records, the trust anchor for scoped names. A request names only its run id (`run`). The broker reads its own run
 record for that id: one JSON file per run in `<state>/run/records/`, owned by the broker's user (or root), mode 0600 in
@@ -86,6 +87,7 @@ CODES = (
     "elevation_off",
     "audit_failed",
     "wrong_kind",
+    "registry_untrusted",
     "upstream_refused",
     "upstream_unreachable",
 )
@@ -861,7 +863,9 @@ class Broker:
         if not wsecrets.NAME_RE.match(name) or not wsecrets.HOST_RE.match(host) or len(purpose) > 200:
             return refuse("bad_request", "bad name, host or purpose")
         try:
-            reg = wsecrets.load_registry(self.registry)
+            reg = self.load_registry()
+        except wsecrets.RegistryUntrusted:
+            return refuse("registry_untrusted", "the registry can be changed by another user, so it is not trusted")
         except wsecrets.SecretsError:
             return refuse("store_unreadable", "the registry cannot be read")
         entry = reg.get(name)
@@ -939,7 +943,7 @@ class Broker:
 
     def _op_status(self) -> dict:
         try:
-            problems, owner = wsecrets.health(self.registry, self.store)
+            problems, owner = wsecrets.health(self.registry, self.store, owner_uid=self.own_uid)
         except OSError:
             problems, owner = ["the broker cannot read its own store"], None
         with self._lock:
@@ -996,7 +1000,11 @@ class Broker:
         if not (isinstance(name, str) and wsecrets.NAME_RE.match(name)):
             return None, self._refuse_logged(op, log, "bad_request", "name must be a secret name")
         try:
-            entry = wsecrets.load_registry(self.registry).get(name)
+            entry = self.load_registry().get(name)
+        except wsecrets.RegistryUntrusted:
+            return None, self._refuse_logged(
+                op, log, "registry_untrusted", "the registry can be changed by another user, so it is not trusted"
+            )
         except wsecrets.SecretsError:
             return None, self._refuse_logged(op, log, "store_unreadable", "the registry cannot be read")
         if entry is None:
@@ -1181,6 +1189,11 @@ class Broker:
             raise ssh_ca.MintError("store_unreadable", "this broker has no state folder for key files")
         return self.records.parent / "minter"
 
+    def load_registry(self) -> dict[str, wsecrets.Entry]:
+        """The registry, trusted only if it is this broker's user's (or root's) and closed to group and world writes
+        (B2): a file another user can edit could add a host and send a key there. Raises SecretsError."""
+        return wsecrets.load_registry(self.registry, owner_uid=self.own_uid)
+
     def run_record(self, run_id: object, now: float | None = None) -> RunRecord:
         if self.records is None:
             raise RecordError("missing", "this broker has no run record folder")
@@ -1253,7 +1266,7 @@ class Broker:
         """The names the registry marks elevated now. A registry that cannot be read: every live grant's name, so a
         kill switch pulled while the registry is broken still drops everything."""
         try:
-            return {e.name for e in wsecrets.load_registry(self.registry).values() if e.elevated}
+            return {e.name for e in self.load_registry().values() if e.elevated}
         except wsecrets.SecretsError:
             with self._lock:
                 return {g.name for g in self._grants.values()} | {m.name for m in self._minted}
@@ -1281,7 +1294,9 @@ class Broker:
     def credential(self, g: _Grant, path: str = "/") -> tuple[str, str]:
         """(header name, header value) for a grant, read fresh so a removed or changed secret takes effect at once."""
         try:
-            entry = wsecrets.load_registry(self.registry).get(g.name)
+            entry = self.load_registry().get(g.name)
+        except wsecrets.RegistryUntrusted as e:
+            raise _HttpError(503, "registry_untrusted") from e
         except wsecrets.SecretsError as e:
             raise _HttpError(503, "store_unreadable") from e
         if entry is None or entry.kind != "header" or g.host not in entry.hosts:

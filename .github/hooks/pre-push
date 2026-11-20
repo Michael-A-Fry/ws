@@ -19,6 +19,10 @@
 # `--full` for WS_PREPUSH_FULL=1): it queues for a slot, up
 # to WS_TEST_WAIT (45 minutes), and caps xdist's workers, so a busy machine doesn't time the tests out. Without ws-test
 # they run bare. Set but empty (WS_PREPUSH_WRAP= git push), they always run bare.
+# Signatures: before any test, `git log --format='%H %G?'` over the commits being sent. An unsigned one (N) refuses the
+# push, because the repository takes signed commits only and the pull request would sit blocked; one git cannot check
+# (E), whose key it does not know (U) or that is signed but has no signers file to check against is a warning. Nothing runs when CI is set, and no network call is made. It reads
+# the refs git gives a pre-push hook on stdin, so a new branch is checked back to what the remote already has.
 # A skip is never silent: it adds a line to .git/ws-prepush-skips.log (the log of the worktree's git dir).
 set -euo pipefail
 
@@ -37,6 +41,40 @@ if [[ "${WS_SKIP_PREPUSH:-}" == "1" ]]; then
   printf '%s skipped pre-push on %s\n' "$stamp" "$branch" >>"$log"
   echo "pre-push: skipped because WS_SKIP_PREPUSH=1 (logged in $log)" >&2
   exit 0
+fi
+
+# the refs being pushed arrive on stdin: <local ref> <local sha> <remote ref> <remote sha>
+zero="0000000000000000000000000000000000000000"
+unsigned=()
+if [[ -z "${CI:-}" && ! -t 0 ]]; then
+  while read -r _ local_sha _ remote_sha; do
+    [[ -z "$local_sha" || "$local_sha" =~ ^0+$ ]] && continue # a delete sends no commits
+    if [[ "$remote_sha" =~ ^0+$ ]]; then
+      range=("$local_sha" --not "--remotes=${1:-}")
+      [[ -z "${1:-}" ]] && range=("$local_sha" --not --remotes)
+    else
+      range=("${remote_sha}..${local_sha}")
+    fi
+    while read -r sha status; do
+      case "$status" in
+        N)
+          # git also says N for an ssh signature it has no signers file to check: a signed commit has a gpgsig header
+          if git cat-file commit "$sha" 2>/dev/null | grep -q '^gpgsig'; then
+            echo "pre-push: warning: ${sha:0:12} is signed but git cannot check it (no signers file?)" >&2
+          else
+            unsigned+=("$sha")
+          fi
+          ;;
+        E | U) echo "pre-push: warning: ${sha:0:12} has a signature git cannot check (status $status)" >&2 ;;
+      esac
+    done < <(git log --format='%H %G?' "${range[@]}" 2>/dev/null || true)
+  done
+fi
+if [[ "${#unsigned[@]}" != 0 ]]; then
+  echo "pre-push: refused: ${#unsigned[@]} commit(s) being pushed are not signed:" >&2
+  printf '  %s\n' "${unsigned[@]:0:10}" >&2
+  echo "pre-push: sign them (git rebase --exec 'git commit --amend --no-edit -S' <base>), or WS_SKIP_PREPUSH=1 git push (logged)" >&2
+  exit 1
 fi
 
 echo "pre-push: uvx prek run --all-files" >&2

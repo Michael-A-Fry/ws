@@ -718,3 +718,91 @@ def test_wait_with_a_timeout_of_nan_or_inf_is_a_usage_error(box, capsys):
     ident = box.add(capsys, "--question", "Q")
     assert box.run(capsys, "wait", ident, "--timeout", "nan")[0] == 2
     assert box.run(capsys, "wait", ident, "--timeout", "inf")[0] == 2
+
+
+# --- note ------------------------------------------------------------------------------------------------------------
+
+
+def notes_json(box, capsys, ident: str) -> tuple[list, list]:
+    """The notes of one ask as `get --json` and `list --all --json` show them."""
+    got = json.loads(box.run(capsys, "get", ident, "--json")[1])["data"]["notes"]
+    rows = json.loads(box.run(capsys, "list", "--all", "--json")[1])["data"]["asks"]
+    return got, next(r for r in rows if r["id"] == ident)["notes"]
+
+
+def test_a_note_on_an_open_and_an_answered_ask_is_appended_in_order(box, capsys):
+    ident = box.add(capsys, "--question", "Review these?", "--option", "Yes")
+    code, out, _ = box.run(capsys, "note", ident, "also", "src/b.py")
+    assert code == 0 and out.strip() == "noted"
+    box.run(capsys, "answer", ident, "Yes")
+    assert box.run(capsys, "note", ident, "and docs/c.md")[0] == 0
+    got, listed = notes_json(box, capsys, ident)
+    assert [n["text"] for n in got] == ["also src/b.py", "and docs/c.md"] == [n["text"] for n in listed]
+    assert all(isinstance(n["ts"], int) for n in got)
+    assert [e["event"] for e in box.lines()] == ["added", "noted", "answered", "noted"]
+    assert box.lines()[0]["question"] == "Review these?"  # the ask itself is never rewritten
+    out = box.run(capsys, "get", ident)[1]
+    assert out.index("also src/b.py") < out.index("and docs/c.md")
+    assert "[2 notes]" in box.run(capsys, "list", "--all")[1]
+
+
+@pytest.mark.parametrize("verb", ["done", "withdraw"])
+def test_a_note_on_a_closed_ask_is_refused(box, capsys, verb):
+    ident = box.add(capsys, "--question", "Q?")
+    box.run(capsys, verb, ident)
+    code, out, _ = box.run(capsys, "note", ident, "late", "--json")
+    assert code == 1 and json.loads(out)["error_kind"] == "not_open"
+    assert "noted" not in [e["event"] for e in box.lines()]
+
+
+def test_a_note_on_an_unknown_ask_is_a_usage_error(box, capsys):
+    code, out, _ = box.run(capsys, "note", "nope", "x", "--json")
+    assert code == 2 and json.loads(out)["error_kind"] == "unknown_ask"
+
+
+def test_a_token_shaped_note_is_refused_and_stored_nowhere(box, capsys):
+    token = "ghp_" + "a1B2c3D4" * 5
+    ident = box.add(capsys, "--question", "Q?")
+    code, _, err = box.run(capsys, "note", ident, f"use {token}")
+    assert code == 1 and "secret" in err and token not in err
+    assert token not in box.store.read_text()
+
+
+def test_a_note_that_is_too_long_is_refused(box, capsys):
+    ident = box.add(capsys, "--question", "Q?")
+    assert box.run(capsys, "note", ident, "x" * (asks.LIMITS["note"] + 1))[0] == 1
+
+
+def test_a_note_on_a_redacted_ask_keeps_no_text(box, capsys):
+    ident = box.add(capsys, "--question", "about secretproject")
+    code, _, err = box.run(capsys, "note", ident, "plain words here")
+    assert code == 0 and "stored redacted" in err
+    assert "plain words here" not in box.store.read_text()
+    got, listed = notes_json(box, capsys, ident)
+    assert len(got) == len(listed) == 1 and got[0]["text"] is None is listed[0]["text"]
+    assert "plain words here" not in box.run(capsys, "get", ident)[1]
+
+
+def test_a_note_with_a_sensitive_term_keeps_no_text_on_a_plain_ask(box, capsys):
+    ident = box.add(capsys, "--question", "Plain?")
+    assert box.run(capsys, "note", ident, "the ACME deal")[0] == 0
+    assert "ACME" not in box.store.read_text()
+    got, _ = notes_json(box, capsys, ident)
+    assert got[0]["text"] is None and got[0]["redacted"] is True
+
+
+def test_a_note_written_before_the_repo_was_walled_is_hidden_after(box, capsys):
+    ident = box.add(capsys, "--question", "Plain?")
+    box.run(capsys, "note", ident, "visible note")
+    box.policy(priv_access="walled", open_access="walled")
+    got, listed = notes_json(box, capsys, ident)
+    assert got[0]["text"] is None and listed[0]["text"] is None
+    box.run(capsys, "note", ident, "after the wall")
+    assert "after the wall" not in box.store.read_text()
+
+
+def test_import_does_not_take_noted_rows(box, capsys, tmp_path):
+    row = {"v": 1, "ts": "2026-11-01T02:00:00Z", "event": "noted", "id": "a20261101T010203-ab12", "note": "x"}
+    code, out, _ = box.run(capsys, "import", str(old_file(tmp_path, json.dumps(row) + "\n")))
+    assert code == 0 and "1 skipped" in out
+    assert "noted" not in [e["event"] for e in box.lines()]

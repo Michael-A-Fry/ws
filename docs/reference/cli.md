@@ -817,6 +817,113 @@ ws msg export [-h] [--out PATH] [--after ID] [--limit N]
 | `--after ID` | Only messages after this id. |
 | `--limit N` | At most N (default 10000, up to 100000). |
 
+## `ws ask`
+
+Leave a question for a person and read back the answer: one queue across every session. See [Asks](asks.md).
+
+```text
+ws ask [-h] {add,list,get,answer,wait,note,done,withdraw,import} ...
+```
+
+### `ws ask add`
+
+Add an ask and print its id; the first `--option` is the recommendation.
+
+```text
+ws ask add [-h] [--question TEXT] [--option LABEL|DESCRIPTION] [--decision TEXT] [--free-text | --no-free-text]
+    [--repo NAME] [--cwd DIR] [--session NAME] [--tmux TARGET] [--dedupe-key KEY] [--stdin]
+```
+
+| Argument | Meaning |
+|---|---|
+| `--question TEXT` | The question (at most 2000 characters). |
+| `--option LABEL\|DESCRIPTION` | An option; repeat for more (at most 6). |
+| `--decision TEXT` | What the answer decides. |
+| `--free-text`, `--no-free-text` | Whether an answer may be free text (default: it may). |
+| `--repo NAME` | The repo it's about (default: the working folder's name). |
+| `--cwd DIR` | The folder the ask comes from (default: this one). |
+| `--session NAME` | Who asks (default `$WS_SESSION_NAME`). |
+| `--tmux TARGET` | The tmux target to go to. |
+| `--dedupe-key KEY` | An open ask with this key is returned, not added. |
+| `--stdin` | Read the ask from standard input as one JSON object. |
+
+### `ws ask list`
+
+Open asks, oldest first, with a count of their notes.
+
+```text
+ws ask list [-h] [--all]
+```
+
+| Argument | Meaning |
+|---|---|
+| `--all` | Every status. |
+
+### `ws ask get`
+
+One ask: its status, answer and notes. An unknown id is exit 2.
+
+```text
+ws ask get [-h] id
+```
+
+### `ws ask answer`
+
+Answer with an option label (any case), a 1-based number, or free text.
+
+```text
+ws ask answer [-h] id text [text ...]
+```
+
+### `ws ask wait`
+
+Block until answered: 0 and the answer, 3 timed out, 4 withdrawn or done.
+
+```text
+ws ask wait [-h] [--timeout SECONDS] id
+```
+
+| Argument | Meaning |
+|---|---|
+| `--timeout SECONDS` | Give up after this long (default 540). |
+
+### `ws ask note`
+
+Add a note to an open or answered ask; it's appended, and nothing earlier is changed. A done or withdrawn ask is exit 1
+(`not_open`), an unknown id exit 2. The note is checked and redacted as a question is.
+
+```text
+ws ask note [-h] id text [text ...]
+```
+
+### `ws ask done`
+
+The session has acted on it (an open or answered ask); a no-op that prints the status if it's already closed.
+
+```text
+ws ask done [-h] id
+```
+
+### `ws ask withdraw`
+
+The session no longer needs it (an open ask); a no-op that prints the status if it's already closed.
+
+```text
+ws ask withdraw [-h] id
+```
+
+### `ws ask import`
+
+Convert an older asks file into events here (safe to run twice).
+
+```text
+ws ask import [-h] [--dry-run] path
+```
+
+| Argument | Meaning |
+|---|---|
+| `--dry-run` | Say what would be imported; write nothing. |
+
 ## `ws install`
 
 Set up ws on this machine; run it again and it reports 0 changes.
@@ -1001,6 +1108,66 @@ ws skills restore [-h] [--runner {claude-code,opencode}] {align,checkpoint,taste
 |---|---|
 | `name` | The skill to restore. One of `align`, `checkpoint`, `taste-gate`, `dataviz`, `resume`, `ship`. |
 | `--runner RUNNER` | The runner (default: every runner found). One of `claude-code`, `opencode`. |
+
+## `ws commit-wall`
+
+Refuse a commit whose added lines or message match a pattern you supplied.
+
+ws ships no pattern: the wall reads `<config>/commit-wall/patterns.toml` (a `[[pattern]]` table has a `name` and either
+`terms`, literal and any case, or a Python `regex`) and lets through what `<config>/commit-wall/exceptions.toml` lists
+(`[[allow]]` with any of `pattern`, `path` and `text`; only a person adds to it, and the gate refuses a session's writes
+to the folder). A hit prints the file, the line and the pattern's name, never the matched text. A merge is scanned for
+the lines new to the merge, nothing is skipped (every file is read as text, file names and the whole message included),
+a check with no pattern refuses, `git am` and a push are checked too, and a hook that can't run `ws` blocks the commit.
+
+### `ws commit-wall install`
+
+Point a repository's `core.hooksPath` at ws's own `pre-commit` and `commit-msg`, recording the old value. The repository's
+other hooks are forwarded and its old `pre-commit` and `commit-msg` run after the check passes.
+
+```text
+ws commit-wall install [-h] [--repo REPO]
+```
+
+| Argument | Meaning |
+|---|---|
+| `--repo REPO` | The repository (default: here). |
+
+### `ws commit-wall uninstall`
+
+Put the recorded `core.hooksPath` back, or remove the setting when there was none.
+
+```text
+ws commit-wall uninstall [-h] [--repo REPO]
+```
+
+| Argument | Meaning |
+|---|---|
+| `--repo REPO` | The repository (default: here). |
+
+### `ws commit-wall check`
+
+Scan the staged diff, or a commit message with `--stage commit-msg FILE`, now. Exit 1 on a hit.
+
+```text
+ws commit-wall check [-h] [--stage {pre-commit,commit-msg,pre-push}] [--repo REPO] [--wall-dir WALL_DIR] [file]
+```
+
+| Argument | Meaning |
+|---|---|
+| `--stage STAGE` | `pre-commit` (the staged diff, default), `commit-msg` or `pre-push` (the commits a push would send, read from stdin). |
+| `--repo REPO` | The repository (default: here). |
+| `--wall-dir WALL_DIR` | The config folder to read (the hooks pass the one they were installed with). |
+| `file` | The message file, for `--stage commit-msg`. |
+
+### `ws commit-wall status`
+
+The number of patterns and exceptions, and the repositories the wall is on for. A repository it recorded whose `core.hooksPath`
+no longer points at the wall is listed as not on, and the command exits 1.
+
+```text
+ws commit-wall status [-h]
+```
 
 ## `ws canary`
 
@@ -1231,6 +1398,19 @@ ws schedule apply [-h] [--dry-run]
 |---|---|
 | `--dry-run` | Show what would change; write and run nothing. |
 
+### `ws schedule script`
+
+Run a script job's reviewed script now. This is what its timer runs. It's refused (exit 3) unless the script is yours,
+closed to other writers and hashes to `script_sha256`. The bytes that were hashed are what runs: ws runs a private copy,
+kept under its own state folder, in the script's own folder, with `WS_SCRIPT_PATH` set to its real path. Only the
+script is hashed. A file it sources or runs by a relative path is outside the review, so name what it calls by
+absolute path, and keep those files closed to other writers too. The output and exit code are the script's.
+Past the job's `timeout_s` it's stopped and the exit code is 124.
+
+```text
+ws schedule script [-h] job
+```
+
 ### `ws schedule remove`
 
 Stop one job's timer and delete its unit files.
@@ -1432,9 +1612,14 @@ writable by others, because a job decides what a runner starts with. Every error
 | `allow_unpriced` | true or false | Run even if the runner can't price the model. Default `false`. |
 | `green` | text | What the job's verification covers: `targeted`, `package`, `full` or `merge_ready`. |
 | `sources` | list of text | Policy sources the job reads. The Rule of Two looks at these. |
-| `schedule` | text | `hourly`, `daily HH:MM` or `weekly DAY HH:MM`, in local time. `ws schedule apply` turns it into a timer. |
+| `schedule` | text | `hourly`, `daily HH:MM`, `weekly DAY HH:MM`, `monthly D HH:MM` (D from 1 to 28) or `every Nm`, in local time. `ws schedule apply` turns it into a timer. A job with an API key or a local provider ticks the queue (`ws queue tick JOB --slot schedule --run`). A job on a subscription login keeps `ws run JOB`. |
+| `coalesce_if_active` | true or false | A tick while a run of the job waits or runs queues nothing. Default `true`. `ws queue tick --no-coalesce` overrides it. |
+| `skip_missed` | number | Seconds: a tick later than this after its slot is skipped. Default: never skipped. `ws queue tick --skip-missed` overrides it. |
 | `parent_run` | text | The id of a run in progress whose reservation this run spends from. `ws run --parent` sets it for one run. |
-| `command` | text | In place of `runner`, `model` and `prompt`: a ws command that the schedule runs (`backup`). `ws run` refuses these. |
+| `command` | text | In place of `runner`, `model` and `prompt`: a ws command that the schedule runs (`backup`, `queue` or `script`). `ws run` refuses these. |
+| `extra_sources` | list of text | With `command = "backup"`: more folders or files to back up, absolute or under `~`. |
+| `script` | text | With `command = "script"`: the script the timer runs through `ws schedule script JOB`, absolute or under `~`. It must be yours and closed to other writers. |
+| `script_sha256` | text | With `command = "script"`: the script's sha256. ws refuses a script that no longer hashes to it, so a change needs a new review. |
 | `[[secrets]]` | table list | Each has `name`, `host` and `purpose` (default `run`). The broker leases it. |
 | `[runner_options]` | table | Adapter-specific. Claude Code: `allowed_tools`, `env`. OpenCode: `provider`, `env`. |
 

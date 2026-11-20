@@ -21,6 +21,7 @@ from pathlib import Path
 
 import jsonschema
 import pytest
+from helpers.procs import alive, wait_gone
 
 from ws import broker, cli, doctor, jobs, osinfo, policy, run, runrecord
 from ws.adapters import claude_code, opencode
@@ -47,7 +48,9 @@ if prompt == "stubborn":
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     child = (
         "import os, signal, time\\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\\n"
-        "open(os.path.join(os.environ['WS_HOME'], 'grandchild.pid'), 'w').write(str(os.getpid()))\\ntime.sleep(60)"
+        "pidfile = os.path.join(os.environ['WS_HOME'], 'grandchild.pid')\\n"
+        "open(pidfile + '.tmp', 'w').write(str(os.getpid()))\\nos.replace(pidfile + '.tmp', pidfile)\\n"  # whole or absent
+        "time.sleep(60)"
     )
     subprocess.Popen([sys.executable, "-c", child])
     time.sleep(60)
@@ -173,6 +176,7 @@ def test_a_run_leaves_one_complete_record(ws, capsys, tmp_path):
     assert rec["session_id"] and rec["duration_api_ms"] == 82 and rec["duration_ms"] >= 0
     assert rec["secrets_used"] == [{"name": "anthropic", "host": "api.anthropic.com"}]
     assert rec["policy"] == {"dial": "prepare", "rule_of_two": "ok"}
+    assert rec["approval"] == {"switch": "prepare", "quote": None}  # the dial; the quote waits on the gate
     assert rec["cwd"] == str(tmp_path / "userhome" / ".local" / "state" / "ws-work" / rec["run_id"])
     assert stat.S_IMODE(ws.log.stat().st_mode) == 0o600
     assert ws.leases.requested == [("anthropic", "run", "api.anthropic.com")]
@@ -593,12 +597,24 @@ def test_output_that_is_not_a_result_is_an_error_with_nulls(ws):
     assert rec["session_id"] is None and rec["cost_usd"] is None and rec["tokens"]["input"] is None
 
 
+def test_the_approval_switch_is_the_policy_dial(ws, monkeypatch):
+    import dataclasses
+
+    real = policy.load
+    monkeypatch.setattr(policy, "load", lambda *a, **k: dataclasses.replace(real(*a, **k), dial="allowlist"))
+    ws.job()
+    assert cli.main(["run", "daily"]) == 0
+    (rec,) = ws.records()
+    assert valid(rec)["approval"] == {"switch": "allowlist", "quote": None} and rec["policy"]["dial"] == "allowlist"
+
+
 def test_a_runner_reported_error_keeps_the_numbers(ws):
     ws.job(prompt="max-turns")
     assert cli.main(["run", "daily"]) == 1
     (rec,) = ws.records()
     valid(rec)
     assert rec["status"] == "error" and "maximum number of turns" in rec["error"] and rec["tokens"]["input"] == 10
+    assert (rec["stop_subtype"], rec["stop_reason"]) == ("error_max_turns", "max_turns")
 
 
 def test_a_missing_runner_is_an_error_record(ws, monkeypatch):
@@ -880,6 +896,30 @@ def test_claude_parse_never_raises():
         assert isinstance(claude_code.parse_result(junk, "stderr tail", 1), dict)
 
 
+@pytest.mark.parametrize(
+    ("fixture", "subtype", "status", "stop_reason"),
+    [
+        ("claude-result-ok.json", "success", "ok", "completed"),
+        ("claude-result-max-turns.json", "error_max_turns", "error", "max_turns"),
+        ("claude-result-max-budget.json", "error_max_budget_usd", "error", "max_budget"),
+    ],
+)
+def test_claude_parse_keeps_the_stop_subtype_and_the_record_rule_reads_it(fixture, subtype, status, stop_reason):
+    p = claude_code.parse_result((FIXTURES / fixture).read_text(encoding="utf-8"), "", 0)
+    assert p["stop_subtype"] == subtype
+    # what run._execute does with it: an ok unless the runner said an error; append's rule then names the limit
+    rec = runrecord.new(
+        job="j", status="error" if p["error"] else "ok", stop_reason="runner_error" if p["error"] else "completed"
+    )
+    run._merge(rec, p)
+    assert rec["stop_subtype"] == subtype
+    out = runrecord.checked(rec)
+    assert (out["status"], out["stop_reason"]) == (status, stop_reason)
+    # a runner that exits 0 with a limit stop and no error flag is still not ok
+    if subtype != "success":
+        assert runrecord.checked({**rec, "status": "ok", "stop_reason": "completed"})["status"] == "error"
+
+
 def test_claude_transcript_slug_rule(tmp_path):
     cwd = "/tmp/a_b.c d/é"
     folder = tmp_path / "cfg" / "projects" / "-tmp-a-b-c-d--"
@@ -918,6 +958,23 @@ def test_opencode_parse_prices_a_priced_model_and_reads_errors():
     assert err["models_used"] == [] and err["cost_usd"] is None
     for junk in ("", "[]", "{", '{"type": "step_finish", "part": 1}'):
         assert isinstance(opencode.parse_result(junk, "", 1), dict)
+
+
+def test_opencode_parse_keeps_the_last_finish_reason_as_the_stop_subtype():
+    ok = opencode.parse_result((FIXTURES / "opencode-events-ok.jsonl").read_text(encoding="utf-8"), "", 0)
+    assert ok["stop_subtype"] == "stop"
+    rec = runrecord.new(job="j", status="ok", stop_reason="completed")
+    run._merge(rec, ok)
+    assert runrecord.checked(rec)["status"] == "ok"  # opencode's "stop" is its success
+    step = {"type": "step_finish", "sessionID": "ses_x", "part": {"reason": "tool-calls", "tokens": {"input": 1}}}
+    cut = {**step, "part": {**step["part"], "reason": "length"}}
+    p = opencode.parse_result(json.dumps(step) + "\n" + json.dumps(cut) + "\n", "", 0)
+    assert p["stop_subtype"] == "length"  # the last step's, not the first
+    rec = runrecord.new(job="j", status="ok", stop_reason="completed")
+    run._merge(rec, p)
+    assert (runrecord.checked(rec)["status"], runrecord.checked(rec)["stop_reason"]) == ("error", "runner_error")
+    err = opencode.parse_result((FIXTURES / "opencode-events-error.jsonl").read_text(encoding="utf-8"), "", 1)
+    assert err["stop_subtype"] is None  # no step finished
 
 
 def test_opencode_transcript_is_the_session_database(tmp_path):
@@ -1020,20 +1077,6 @@ def test_exe_version_gives_up_after_its_timeout(ws):
 # --- killing, signals, output ----------------------------------------------------------------------------------------
 
 
-def alive(pid: int) -> bool:
-    try:
-        state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
-    except OSError:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
-        return True
-    return state != "Z"  # a zombie is dead; it only waits to be reaped
-
-
 def wait_for(path: Path, seconds: float = 20.0) -> None:
     end = time.monotonic() + seconds
     while not path.exists():
@@ -1053,7 +1096,8 @@ def test_a_child_that_ignores_sigterm_does_not_survive_the_timeout(ws, monkeypat
     elapsed = time.monotonic() - t0
     assert (code, timed_out, truncated) == (None, True, False)
     assert elapsed < 1.5 + 1.0 + 1.0, f"took {elapsed:.1f} s"
-    assert not alive(int((ws.home / "grandchild.pid").read_text())), "the grandchild survived"
+    # The group got SIGKILL, but on a loaded machine the grandchild takes a moment to die: wait on its exit.
+    assert wait_gone(int((ws.home / "grandchild.pid").read_text())), "the grandchild survived"
     assert not alive(ws.saw()["pid"])
 
 
@@ -1073,15 +1117,6 @@ deadline = time.monotonic() + 20
 while not os.path.exists(pidfile) and time.monotonic() < deadline:  # leave only once the grandchild is running
     time.sleep(0.01)
 """
-
-
-def wait_gone(pid: int, seconds: float = 10.0) -> bool:
-    end = time.monotonic() + seconds
-    while alive(pid):
-        if time.monotonic() >= end:
-            return False
-        time.sleep(0.02)
-    return True
 
 
 def test_a_grandchild_left_behind_by_a_runner_that_exits_is_killed_too(ws, tmp_path):

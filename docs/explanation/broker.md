@@ -51,6 +51,12 @@ declare (`not_declared`), a name from another area (`area_refused`) and a name t
 which no other tier reaches. A lease ends with its run: the proxy reads the record again on every request, so removing
 the record (`ws broker run-record rm`) or letting it expire ends every lease issued under it.
 
+The registry is trusted the same way: the broker reads it only if it belongs to the broker's user (or root) and no
+group or other user can write it or its folder. It must be the file itself: a symlink or anything but a regular file
+is refused too. Anyone who can edit the registry can add a host and have a key sent there, so any other file is
+refused whole (`registry_untrusted`, one audit line), for new leases, minted tokens and open leases alike.
+The broker's status names the problem.
+
 Names with no `tier` or `area` keep the older rule, so existing setups go on working. `ws broker serve --require-run`
 (or `require_run = true` under `[roles.secrets]`) makes every lease need a run record.
 

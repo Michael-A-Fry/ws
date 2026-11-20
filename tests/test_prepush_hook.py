@@ -505,7 +505,9 @@ def test_a_signature_git_cannot_check_is_a_warning_not_a_refusal(tmp_path):
 def test_a_signed_commit_with_no_signers_file_is_a_warning_not_an_unsigned_refusal(tmp_path):
     repo, env, cfg = _signing_repo(tmp_path)
     signed = _commit(repo, env, cfg, "a", True)
-    subprocess.run([shutil.which("git"), "-C", str(repo), "config", "--unset", "gpg.ssh.allowedSignersFile"], env=env)
+    subprocess.run(
+        [shutil.which("git"), "-C", str(repo), "config", "--unset", "gpg.ssh.allowedSignersFile"], check=True, env=env
+    )
     done = _push_to_hook(repo, env, f"refs/heads/work {signed} refs/heads/work {ZERO}\n")
     assert done.returncode == 0, done.stderr  # git says N here, but the commit carries a signature
     assert "signed but git cannot check it" in done.stderr

@@ -44,7 +44,6 @@ if [[ "${WS_SKIP_PREPUSH:-}" == "1" ]]; then
 fi
 
 # the refs being pushed arrive on stdin: <local ref> <local sha> <remote ref> <remote sha>
-zero="0000000000000000000000000000000000000000"
 unsigned=()
 if [[ -z "${CI:-}" && ! -t 0 ]]; then
   while read -r _ local_sha _ remote_sha; do

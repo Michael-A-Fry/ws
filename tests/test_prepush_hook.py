@@ -423,13 +423,13 @@ def _signing_repo(tmp_path: Path) -> tuple[Path, dict[str, str], list[str]]:
     subprocess.run([keygen, "-q", "-t", "ed25519", "-N", "", "-f", str(key)], check=True)
     pub = key.with_suffix(".pub").read_text(encoding="utf-8").split()
     signers = tmp_path / "signers"
-    signers.write_text(f"t@example.invalid {pub[0]} {pub[1]}\n", encoding="utf-8")
+    signers.write_text(f"* {pub[0]} {pub[1]}\n", encoding="utf-8")
     env = {k: v for k, v in os.environ.items() if not k.startswith(("GIT_", "WS_PREPUSH", "CI"))}
     env.update(PATH=f"{bin_dir}{os.pathsep}{os.path.dirname(git)}{os.pathsep}/usr/bin:/bin", HOME=str(tmp_path))
     env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull)
     fake(bin_dir, "uvx", tmp_path / "calls.log")
     fake(bin_dir, "uv", tmp_path / "calls.log")
-    cfg = ["-c", "user.name=t", "-c", "user.email=t@example.invalid"]
+    cfg = ["-c", "user.name=t", "-c", "user.email=noreply"]
     subprocess.run([git, "init", "-q", "-b", "work", str(repo)], check=True, env=env)
     for k, v in (("gpg.format", "ssh"), ("user.signingkey", str(key)), ("gpg.ssh.allowedSignersFile", str(signers))):
         subprocess.run([git, "-C", str(repo), "config", k, v], check=True, env=env)  # the hook's git reads these too

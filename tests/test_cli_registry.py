@@ -19,6 +19,7 @@ SHIPPED = [
     ("ask", "asks"),
     ("cards", "cards"),
     ("commit-wall", "commit_wall"),
+    ("connect", "connectcmd"),
     ("connector", "connectors"),
     ("dispatch", "dispatch"),
     ("job", "jobcmd"),

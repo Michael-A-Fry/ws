@@ -124,6 +124,12 @@ One JSON file per record, written to a temporary name and renamed into place (06
 
 `v` in an approval is the older spelling of `schema`, kept for one release. `created` and `granted` are Unix seconds.
 
+`connect/<flow id>.json` (`src/ws/connect/engine.py`, for `ws connect`) is the state of one connect flow: one JSON file,
+0600 in a 0700 folder, replaced as the walk goes and removed by `ws connect <id> --revoke`. Fields: `schema`
+(`ws.connect-state/1`), `ts`, `flow`, `status`, `steps` (each step id: `status`, `at`), `config` (the identity label, the
+stable unique id and any bound chat id: never a secret) and `nonce` (`value`, `expires_ts`; `--diagnose` redacts it). It
+has no row in the table above because it isn't one of the kinds `ws items` lists; see [Connect flows](connect.md#state).
+
 ## Where the work folders go
 
 A job with no `cwd` runs in `$XDG_STATE_HOME/ws-work/<run_id>` (default `~/.local/state/ws-work/<run_id>`), beside ws's

@@ -23,6 +23,8 @@ below, and `python3 scripts/gen_code_map.py --check` (prek and CI) fails when it
 | `commit_wall.py` | commit-wall: a commit hook that refuses a commit whose added lines or message hold a pattern you... |
 | `config_cmd.py` | `ws config`: every file ws reads, where its path came from, and the keys it sets |
 | `conformance.py` | The runner conformance kit: what every runner adapter must do the same way, as data and a few... |
+| `connect/` | Connect flows: the one format for the steps only a person can do, and the engine that walks them |
+| `connectcmd.py` | `ws connect`: walk the steps only a person can do to connect an integration, or show them to an... |
 | `connectors.py` | Connectors: plug a zone's MCP server (`[connectors.NAME]` in the policy) into one run or one... |
 | `context_load.py` | Context loader: what a session is told when it starts, and what the first prompt adds, from one... |
 | `devices.py` | `ws device add`: the one line that links a second machine to this one |

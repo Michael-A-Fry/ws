@@ -56,6 +56,7 @@ CASES: dict[str, list[str]] = {
     "commit-wall.install": ["commit-wall", "install", "--repo", "{home}"],
     "commit-wall.uninstall": ["commit-wall", "uninstall", "--repo", "{home}"],
     "commit-wall.status": ["commit-wall", "status"],
+    "dispatch": ["dispatch", "nope", "go", "--code-root", "{home}"],
     "secret.reveal": ["secret", "reveal", "nope"],
     "secret.import": ["secret", "import", "nope", "--from-env", "missing.env"],
     "secret.wall": ["secret", "wall"],

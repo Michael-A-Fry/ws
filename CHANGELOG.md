@@ -10,6 +10,9 @@ body of the GitHub release.
 
 ### Added
 
+- `ws dispatch REPO PROMPT`: start a runner's session in a new tmux window in a repository's folder, with
+  `--name`, `--model`, `--runner` and `--dry-run`. Each flag and the prompt reach the runner as separate arguments.
+  The code root is `WS_CODE_ROOT`, else `[dispatch] code_root` in the profile, else `~/code`.
 - `ws queue reap`, run by a new reaper timer every 2 minutes (`ws-queue-reap.timer` on systemd,
   `ws.job.queue-reap` on launchd). ws records and tells a run killed with nothing else starting after
   it within minutes, not at the next run.

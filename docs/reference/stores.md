@@ -119,11 +119,16 @@ One JSON file per record, written to a temporary name and renamed into place (06
 | Session identity | `identity/<id>.json` | `src/ws/session.py` (`ws session start` only) | `schema`, `session_id`, `role`, `runner_pid`, `runner_start`, `started_at`, `ts` | 1 | `ts` | Removed with the session record. The only place a role or runner stamp is read from. Not one of the wall's writable folders; a control path the gate won't let a session write. `identity/launch/<token>` holds the single-use launch tokens |
 | Guard record | `sessions/<id>.<guard>.json` | `src/ws/guards` | per guard: `inbox` (`seen` claims, `blocks`, `reminded`, `unavailable_said`), `presence` (`seq`, `source`, `state`), `wait` (`woken` message ids) | none | none | Removed with the session record. Ids and counts only, never a message body. `<id>.wait.lock` is the lock of the one `ws msg wait` for a session |
 | Approval, pending and granted | `approvals/pending/<id>.json`, `approvals/granted/<id>.json` | `src/ws/approvals.py` | `schema`, `v`, `ts`, `id`, `bound`, `created`, `granted` | 1 | `ts` (when the file was written) | Expires 10 minutes after it's made; a granted one is deleted when it's used |
-| Connect flow state | `connect/<flow id>.json` | `src/ws/connect/engine.py` (`ws connect`) | `schema` (`ws.connect-state/1`), `ts`, `flow`, `status`, `steps` (each step id: `status`, `at`), `config` (the identity label, the stable unique id and any bound chat id: never a secret), `nonce` (`value`, `expires_ts`; `--diagnose` redacts it) | 1 | `ts` | Removed by `ws connect <id> --revoke`; replaced as the walk goes |
 | Seen versions | `versions.json` | `src/ws/canary.py` | `schema`, `runners`, `default_model` | 1 | none | Rewritten when a passing canary sees a change |
 | Subscription limits | `usage/rate_limits.json` | `src/ws/usage.py` | `schema`, `captured_at` (Unix seconds), `five_hour` and `seven_day` (each `used_percentage`, `resets_at`), or `absent` (a tombstone) | 1 | `captured_at` | Replaced by each statusline call; read as unknown after 600 s |
 
 `v` in an approval is the older spelling of `schema`, kept for one release. `created` and `granted` are Unix seconds.
+
+`connect/<flow id>.json` (`src/ws/connect/engine.py`, for `ws connect`) is the state of one connect flow: one JSON file,
+0600 in a 0700 folder, replaced as the walk goes and removed by `ws connect <id> --revoke`. Fields: `schema`
+(`ws.connect-state/1`), `ts`, `flow`, `status`, `steps` (each step id: `status`, `at`), `config` (the identity label, the
+stable unique id and any bound chat id: never a secret) and `nonce` (`value`, `expires_ts`; `--diagnose` redacts it). It
+has no row in the table above because it isn't one of the kinds `ws items` lists; see [Connect flows](connect.md#state).
 
 ## Where the work folders go
 

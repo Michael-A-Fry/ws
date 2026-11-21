@@ -294,14 +294,19 @@ def _folders(sess: _Session) -> list[dict]:
     return out
 
 
-def _op_list(sess: _Session, opts: Options, args: dict) -> dict:
+def _no_args(opts: Options, args: dict) -> dict:
+    return {}
+
+
+def _op_list(sess: _Session, opts: Options, a: dict) -> dict:
     folders = _folders(sess)
     drafts = [f["name"] for f in folders if "\\Drafts" in f["flags"]]
     return {"folders": folders, "gmail": _is_gmail(sess), "drafts": drafts[0] if drafts else opts.drafts_folder}
 
 
-def _op_search(sess: _Session, opts: Options, args: dict) -> dict:
+def _check_search(opts: Options, args: dict) -> dict:
     folder = args.get("folder", "INBOX")
+    _quoted_folder(folder)
     since, query, unseen = args.get("since"), args.get("query"), args.get("unseen", False)
     crit = ["ALL"]
     if since is not None:
@@ -313,15 +318,20 @@ def _op_search(sess: _Session, opts: Options, args: dict) -> dict:
         raise ImapError("bad_request", "unseen must be true or false")
     if unseen:
         crit.append("UNSEEN")
-    if query is not None:
-        if not (isinstance(query, str) and QUERY_RE.match(query)):
-            raise ImapError("bad_request", 'query must be printable ASCII without " or \\, at most 200 characters')
-        crit.append(f'{"X-GM-RAW" if _is_gmail(sess) else "TEXT"} "{query}"')
-    uv = _open(sess, folder, readonly=True)
+    if query is not None and not (isinstance(query, str) and QUERY_RE.match(query)):
+        raise ImapError("bad_request", 'query must be printable ASCII without " or \\, at most 200 characters')
+    return {"folder": folder, "crit": crit, "query": query}
+
+
+def _op_search(sess: _Session, opts: Options, a: dict) -> dict:
+    crit = list(a["crit"])
+    if a["query"] is not None:
+        crit.append(f'{"X-GM-RAW" if _is_gmail(sess) else "TEXT"} "{a["query"]}"')
+    uv = _open(sess, a["folder"], readonly=True)
     typ, dat = sess.uid("SEARCH", " ".join(crit))
     _ok(typ, "the search")
     uids = sorted((int(x) for x in (dat[0] or b"").split() if x.isdigit()), reverse=True)
-    return {"folder": folder, "uidvalidity": uv, "uids": uids[:MAX_RESULTS], "total": len(uids)}
+    return {"folder": a["folder"], "uidvalidity": uv, "uids": uids[:MAX_RESULTS], "total": len(uids)}
 
 
 META_RE = {
@@ -332,14 +342,23 @@ META_RE = {
 }
 
 
-def _op_fetch(sess: _Session, opts: Options, args: dict) -> dict:
-    uid = _uid_arg(args)
+def _check_uid(args: dict) -> dict:
+    folder = args.get("folder", "INBOX")
+    _quoted_folder(folder)
+    return {"folder": folder, "uid": _uid_arg(args), "uidvalidity": args["uidvalidity"]}
+
+
+def _check_fetch(opts: Options, args: dict) -> dict:
     part = args.get("part", "full")
     if part not in ("full", "headers"):
         raise ImapError("bad_request", "part must be full or headers")
-    folder = args.get("folder", "INBOX")
-    uv = _open(sess, folder, readonly=True, uidvalidity=args["uidvalidity"])
-    typ, dat = sess.uid("FETCH", uid, _fetch_items(_is_gmail(sess), part))
+    return {**_check_uid(args), "part": part}
+
+
+def _op_fetch(sess: _Session, opts: Options, a: dict) -> dict:
+    uid = a["uid"]
+    uv = _open(sess, a["folder"], readonly=True, uidvalidity=a["uidvalidity"])
+    typ, dat = sess.uid("FETCH", uid, _fetch_items(_is_gmail(sess), a["part"]))
     _ok(typ, "the fetch")
     meta, raw = b"", None
     for item in dat:
@@ -353,7 +372,7 @@ def _op_fetch(sess: _Session, opts: Options, args: dict) -> dict:
     found = {k: r.search(meta) for k, r in META_RE.items()}
     size = int(found["size"].group(1)) if found["size"] else len(raw)
     out = {
-        "folder": folder,
+        "folder": a["folder"],
         "uidvalidity": uv,
         "uid": int(uid),
         "raw": base64.b64encode(raw[:MAX_FETCH]).decode(),
@@ -368,45 +387,65 @@ def _op_fetch(sess: _Session, opts: Options, args: dict) -> dict:
     return out
 
 
-def _op_label(sess: _Session, opts: Options, args: dict) -> dict:
-    uid = _uid_arg(args)
+def _check_label(opts: Options, args: dict) -> dict:
     label = args.get("label")
     if label not in LABELS:
         raise ImapError("bad_request", f"label must be one of {', '.join(LABELS)}")
-    folder = args.get("folder", "INBOX")
-    _open(sess, folder, readonly=False, uidvalidity=args["uidvalidity"])
+    return {**_check_uid(args), "label": label}
+
+
+def _op_label(sess: _Session, opts: Options, a: dict) -> dict:
+    uid, label = a["uid"], a["label"]
+    _open(sess, a["folder"], readonly=False, uidvalidity=a["uidvalidity"])
     if _is_gmail(sess):
         typ, _ = sess.uid("STORE", uid, "+X-GM-LABELS", f'("{encode_mutf7(label)}")')
     else:
         typ, _ = sess.uid("STORE", uid, "+FLAGS", f"({label})")
     _ok(typ, "the label")
-    return {"folder": folder, "uid": int(uid), "label": label}
+    return {"folder": a["folder"], "uid": int(uid), "label": label}
 
 
 def check_draft(opts: Options, data: bytes) -> None:
     """Refuse (bad_request) a draft that is not one plain-text part from the entry's user with the ws marker."""
     if len(data) > MAX_DRAFT:
         raise ImapError("bad_request", f"a draft is at most {MAX_DRAFT} bytes")
-    msg = BytesParser(policy=policy.default).parsebytes(data)
-    names = {k.lower() for k in msg}
-    if names - DRAFT_HEADERS:
-        raise ImapError("bad_request", "a draft has only From, To, Cc, Subject, Date and threading headers")
-    if msg.is_multipart() or msg.get_content_type() != "text/plain" or msg.get_filename():
-        raise ImapError("bad_request", "a draft is one plain-text part, no attachments")
-    if msg.get("X-WS-Draft") != "1":
-        raise ImapError("bad_request", "a draft carries X-WS-Draft: 1")
-    if opts.user.lower() not in str(msg.get("From", "")).lower():
-        raise ImapError("bad_request", "a draft is from the mailbox's own user")
-    if not msg.get_content().lstrip("﻿").startswith(DRAFT_MARKER):
+    try:
+        msg = BytesParser(policy=policy.default).parsebytes(data)
+        names = [k.lower() for k in msg]
+        if set(names) - DRAFT_HEADERS:
+            raise ImapError("bad_request", "a draft has only From, To, Cc, Subject, Date and threading headers")
+        if len(names) != len(set(names)):
+            raise ImapError("bad_request", "a draft has each header at most once")
+        if msg.is_multipart() or msg.get_content_type() != "text/plain" or msg.get_filename():
+            raise ImapError("bad_request", "a draft is one plain-text part, no attachments")
+        if msg.get("X-WS-Draft") != "1":
+            raise ImapError("bad_request", "a draft carries X-WS-Draft: 1")
+        sender = msg["From"]
+        addrs = getattr(sender, "addresses", ()) if sender is not None else ()
+        if len(addrs) != 1 or addrs[0].addr_spec.lower() != opts.user.lower():
+            raise ImapError("bad_request", "a draft is from the mailbox's own user, one address")
+        body = msg.get_content()
+    except ImapError:
+        raise
+    except Exception:  # noqa: BLE001 (a bad charset, encoding or header: the draft is refused, never a crash)
+        raise ImapError("bad_request", "the draft could not be read as a plain-text message") from None
+    if not body.lstrip("\ufeff").startswith(DRAFT_MARKER):
         raise ImapError("bad_request", "a draft starts with the ws marker line")
 
 
-def _op_draft(sess: _Session, opts: Options, args: dict) -> dict:
+def _check_draft_args(opts: Options, args: dict) -> dict:
+    message = args.get("message")
+    if not isinstance(message, str) or not message:
+        raise ImapError("bad_request", "message must be base64 of the draft")
     try:
-        data = base64.b64decode(args.get("message") or "", validate=True)
-    except (ValueError, TypeError):
+        data = base64.b64decode(message, validate=True)
+    except ValueError:
         raise ImapError("bad_request", "message must be base64 of the draft") from None
     check_draft(opts, data)
+    return {"data": data}
+
+
+def _op_draft(sess: _Session, opts: Options, a: dict) -> dict:
     folders = _folders(sess)
     marked = [f["name"] for f in folders if "\\Drafts" in f["flags"]]
     known = {f["name"] for f in folders}
@@ -414,7 +453,7 @@ def _op_draft(sess: _Session, opts: Options, args: dict) -> dict:
     if folder is None:
         raise ImapError("no_drafts_folder", "no folder is marked \\Drafts: set drafts_folder on the entry")
     sess.ws_drafts = _quoted_folder(folder)
-    typ, dat = sess.append(sess.ws_drafts, DRAFT_FLAGS, None, data)
+    typ, dat = sess.append(sess.ws_drafts, DRAFT_FLAGS, None, a["data"])
     _ok(typ, "the draft")
     m = re.search(rb"\[APPENDUID (\d+) (\d+)\]", dat[0] if dat and isinstance(dat[0], bytes) else b"")
     out: dict = {"folder": folder}
@@ -427,16 +466,19 @@ def _op_draft(sess: _Session, opts: Options, args: dict) -> dict:
 class Op:
     needs: str  # one of NEEDS; the entry's `allow` must list it
     imap: frozenset[str]  # the IMAP commands it may send, besides SESSION_COMMANDS ("UID X" for a UID command)
+    check: Callable[
+        [Options, dict], dict
+    ]  # checks the caller's args before anything is dialled; the handler gets its result
     handler: Callable[[_Session, Options, dict], dict]
 
 
 # The only operations. A new one is a new row here (and its need in NEEDS); tests pin this table exactly.
 OPS: dict[str, Op] = {
-    "list": Op("read", frozenset({"LIST"}), _op_list),
-    "search": Op("read", frozenset({"EXAMINE", "UID SEARCH"}), _op_search),
-    "fetch": Op("read", frozenset({"EXAMINE", "UID FETCH"}), _op_fetch),
-    "label": Op("label", frozenset({"SELECT", "UID STORE"}), _op_label),
-    "draft": Op("draft", frozenset({"LIST", "APPEND"}), _op_draft),
+    "list": Op("read", frozenset({"LIST"}), _no_args, _op_list),
+    "search": Op("read", frozenset({"EXAMINE", "UID SEARCH"}), _check_search, _op_search),
+    "fetch": Op("read", frozenset({"EXAMINE", "UID FETCH"}), _check_fetch, _op_fetch),
+    "label": Op("label", frozenset({"SELECT", "UID STORE"}), _check_label, _op_label),
+    "draft": Op("draft", frozenset({"LIST", "APPEND"}), _check_draft_args, _op_draft),
 }
 
 
@@ -458,6 +500,7 @@ def run(opts: Options, password: str, cmd: str, args: object, cafile: str | None
         args = {}
     if not isinstance(args, dict):
         raise ImapError("bad_request", "args must be an object")
+    checked = op.check(opts, args)  # before anything is dialled: a bad request never reaches the server
     ctx = ssl.create_default_context(cafile=cafile)
     deadline = time.monotonic() + CALL_DEADLINE_S
     sess = None
@@ -472,7 +515,7 @@ def run(opts: Options, password: str, cmd: str, args: object, cafile: str | None
             sess.login(opts.user, password)
         except imaplib.IMAP4.error as e:
             raise ImapError("upstream_refused", f"the mail server refused the login{_login_code(e)}") from None
-        out = op.handler(sess, opts, args)
+        out = op.handler(sess, opts, checked)
         if "raw" in out and password.encode() in base64.b64decode(out["raw"]):  # a server never should; still
             out["raw"] = base64.b64encode(
                 base64.b64decode(out["raw"]).replace(password.encode(), b"[removed]")

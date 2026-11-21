@@ -1181,6 +1181,9 @@ class Broker:
             out = imap.run(opts, value, cmd, msg.get("args"), cafile=self.imap_cafile)
         except imap.ImapError as e:
             return self._refuse_logged("imap", log, e.code, e.reason)
+        except Exception as e:  # noqa: BLE001 (the "begin" line gets its outcome; the type only, never the text)
+            print(f"ws broker: imap failed ({type(e).__name__})", file=sys.stderr)
+            return self._refuse_logged("imap", log, "store_unreadable", "the broker could not complete that")
         finally:
             del value
         if not self.audit.write("imap", "ok", bytes=len(out.get("raw", "")) or None, **log):

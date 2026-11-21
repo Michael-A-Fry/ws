@@ -249,11 +249,40 @@ def test_a_draft_lands_in_drafts_flagged_draft_and_nothing_else_moves(box):
         ).decode(),
         base64.b64encode(b"x" * (imap.MAX_DRAFT + 1)).decode(),
         "not base64!",
+        draft(extra="Content-Type: text/html\r\n"),  # a second Content-Type after text/plain
+        draft(extra="To: evil@example.com\r\n"),  # any header twice
+        draft(user=f'"{USER}" <other@example.com>'),  # the user only as a display name
+        draft(user=f"{USER}, other@example.com"),  # two senders
+        base64.b64encode(
+            f"From: {USER}\r\nX-WS-Draft: 1\r\nContent-Type: text/plain; charset=bogus\r\n\r\n"
+            f"{imap.DRAFT_MARKER}\r\n".encode()
+        ).decode(),  # an unknown charset: a refusal, not a crash
     ],
 )
-def test_a_draft_that_is_not_plain_ours_and_marked_is_refused(box, msg):
-    assert box.refused("draft", message=msg).code == "bad_request"
+def test_a_draft_that_is_not_plain_ours_and_marked_is_refused_before_dialling(box, msg):
+    e = box.refused("draft", message=msg)
+    assert e.code == "bad_request"
     assert box.fake.folders["[Gmail]/Drafts"].messages == []
+    assert box.fake.log == [] and box.fake.dialled == []  # checked before the server was dialled
+    statuses = [json.loads(x)["status"] for x in box.raw_log().splitlines()]
+    assert statuses == ["begin", "bad_request"]  # the begin line always gets its outcome
+
+
+@pytest.mark.parametrize(
+    "cmd,args",
+    [
+        ("search", {"since": "22/11/2026"}),
+        ("search", {"query": 'a" OR ALL'}),
+        ("search", {"folder": 'IN"BOX'}),
+        ("fetch", {"uid": "1", "uidvalidity": 7}),
+        ("fetch", {"uid": 1, "uidvalidity": 7, "part": "BODY[]"}),
+        ("label", {"uid": 1, "uidvalidity": 7, "label": "\\Trash"}),
+        ("draft", {}),
+    ],
+)
+def test_bad_arguments_are_refused_before_dialling(box, cmd, args):
+    assert box.refused(cmd, **args).code == "bad_request"
+    assert box.fake.dialled == [] and box.fake.log == []
 
 
 def test_no_drafts_folder_is_refused_never_guessed(base, certs, monkeypatch):

@@ -50,7 +50,16 @@ What each hook of a typical hand-built set does, and which rule or guard here do
 An adapter reads a runner's payload as neutral calls, and the policy and the guards judge those. The kinds are
 `command` (a shell command), `read`, `search`, `write`, `tool` (a neutral tool name such as a web fetch), `agent`,
 `skill`, `message`, `mcp` (an MCP tool, with its arguments) and `other`. The policy has rules for `command`, `read`,
-`search`, `write`, `tool` and `mcp`; the rest reach guards only.
+`search`, `write`, `tool` and `mcp`; the rest reach guards only, with one exception: the message wall.
+
+A `message` call (Claude Code's `SendMessage`) from a session in a walled or counts-only class is refused, whatever the
+target and whatever route the runner would carry it on: a socket on this machine, or a Remote Control bridge to
+another. Such a session talks to other sessions through `ws msg` alone. The rule is `rule:message_wall` in the verdict
+log, and a folder in a full class or in no named class is left alone. ws refuses at the sender because the sender's call
+is the one place it sees every route. A receiver refuses what reaches it only through its runner's own
+`crossSessionInbound` setting, which ws writes into each class's launch file (a class with an `os_user`).
+`ws walls check` runs `no-message-crossings`, which fails on any send-message call a walled class's verdict log shows
+as allowed.
 
 A tool no adapter reads is one `other` call, made by the gate from the tool's name (Claude Code's `tool_name`, the
 OpenCode shim's `tool`, cut to 80 characters). It's allowed, because the policy has no rule for it, and it isn't passed
@@ -140,7 +149,7 @@ disk read-only) is skipped.
 ## Replay a corpus
 
 ```sh
-ws gate replay FILE... --runner claude-code [--policy FILE] [--metrics] [--save OUT.json]
+ws gate replay FILE... --runner claude-code [--policy FILE] [--metrics [--p95-budget-ms MS]] [--save OUT.json]
     [--diff OLD.json [--expect-changes FILE]] [--json]
 ```
 
@@ -191,13 +200,16 @@ live hook.
 
 1. A 3 by 3 confusion matrix: rows are what you expected, columns are what the gate said.
 2. The false-block rate: of the calls that should be allowed, how many were denied or held for approval. It shows the
-   count, the total and a Wilson 95% interval.
+   count, the total and a Wilson 95% interval, then the same as false blocks per 100 calls that should run.
 3. The miss rate: of the calls that should be denied or held, how many were allowed.
 4. Softened: of the calls that should be denied, how many came back as an ask.
 5. One row for each `source`, with rows, differences, known rows, false blocks and misses.
-6. The 50th and 95th percentile of the time `check()` took, in milliseconds. It's printed and never gated.
+6. The 50th and 95th percentile of the time `check()` took, in milliseconds: the 95th is what the gate adds to a tool
+   call. Over the budget, the run exits 1. The budget is `--p95-budget-ms MS`, default 50 (`gatecorpus.P95_BUDGET_MS`,
+   about 14 times the corpus's own p95 when it was set, so a slow CI runner passes and a tenfold slowdown doesn't).
 
-With `--json`, the same numbers are under `metrics`, with every row's decision, reason, the kind of layer that made the
+With `--json`, the same numbers are under `metrics` (with `false_blocks_per_100`, `latency_ms.budget` and
+`over_budget`), with every row's decision, reason, the kind of layer that made the
 decision (`rule:command`, `guard:NAME`, `ask_commands`, `preflight` or `error`) and its time under `results`.
 
 ### The ratchet

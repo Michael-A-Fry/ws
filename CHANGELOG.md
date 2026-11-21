@@ -10,6 +10,11 @@ body of the GitHub release.
 
 ### Added
 
+- The message wall: the gate refuses a send-message call from a session in a walled or counts-only class, on
+  every route (this machine or a Remote Control bridge). Such a session talks to others through `ws msg`.
+  `ws walls check` gains `no-message-crossings`, which fails on any such call a class's verdict log shows allowed.
+- `ws gate replay --metrics` gives false blocks per 100 calls and exits 1 when check()'s p95 is over a budget
+  (`--p95-budget-ms`, default 50).
 - `ws dispatch REPO PROMPT`: start a runner's session in a new tmux window in a repository's folder, with
   `--name`, `--model`, `--runner` and `--dry-run`. Each flag and the prompt reach the runner as separate arguments.
   The code root is `WS_CODE_ROOT`, else `[dispatch] code_root` in the profile, else `~/code`.

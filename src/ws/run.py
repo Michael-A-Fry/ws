@@ -611,8 +611,16 @@ def _refuse(rec: dict, reason: str, path: Path, stop_reason: str, status: str = 
     return EXIT_REFUSED
 
 
-def _bad_job(name: str, message: str, log: Path, job: jobs.Job | None = None, record: bool = True) -> int:
-    """A job that cannot run still leaves a record (status "error"), when its name is safe to write down."""
+def _bad_job(
+    name: str,
+    message: str,
+    log: Path,
+    job: jobs.Job | None = None,
+    record: bool = True,
+    stop_reason: str | None = None,
+) -> int:
+    """A job that cannot run still leaves a record (status "error"), when its name is safe to write down.
+    `stop_reason` is set for a cause a reader branches on (`no_model`); other bad jobs leave it null, as before."""
     print(f"ws: {message}", file=sys.stderr)
     if not record:
         return EXIT_BAD_JOB
@@ -634,6 +642,8 @@ def _bad_job(name: str, message: str, log: Path, job: jobs.Job | None = None, re
         allow_unpriced=bool(job and job.allow_unpriced),
         green=job.green if job else None,
     )
+    if stop_reason is not None:
+        rec["stop_reason"] = stop_reason
     if _append(log, rec):
         print(f"ws: recorded as {rec['run_id']}", file=sys.stderr)
     _announce_stop(rec)
@@ -778,7 +788,8 @@ def _run(
         try:
             job = jobs.load(args.job, env)
         except jobs.JobError as e:
-            return _bad_job(args.job, str(e), log, record=record)
+            why = "no_model" if e.kind == "no_model" else None  # the run record tells a missing model apart
+            return _bad_job(args.job, str(e), log, record=record, stop_reason=why)
     try:
         adapter = adapters.get(job.runner)
         prof = load(profile_path(env)) or {}

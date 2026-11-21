@@ -139,11 +139,40 @@ def test_bare_config_is_still_the_status_view(home, capsys):
     assert "ws folder" in capsys.readouterr().out
 
 
-def test_a_session_may_not_raise_its_own_cap_but_may_read_models():
-    budget = cli.build_parser().parse_args(["config", "budget", "30"])
-    model = cli.build_parser().parse_args(["config", "model"])
-    assert agentsession.admin_name("config", budget) == "config budget"
-    assert agentsession.admin_name("config", model) is None
+def test_a_session_may_set_neither_the_cap_nor_the_models_but_may_list_them():
+    assert agentsession.admin_name("config", cli.build_parser().parse_args(["config", "budget", "30"])) == (
+        "config budget"
+    )
+    for argv in (["config", "model", "m", "--yes"], ["config", "model", "jobs", "m"], ["config", "model", "m"]):
+        assert agentsession.admin_name("config", cli.build_parser().parse_args(argv)) == "config model", argv
+    assert agentsession.admin_name("config", cli.build_parser().parse_args(["config", "model"])) is None
+
+
+@pytest.mark.parametrize("argv", [["install", "--cap", "999"], ["install", "--cap", "5", "--dry-run"]])
+def test_install_with_a_cap_is_admin(argv):
+    assert agentsession.admin_name("install", cli.build_parser().parse_args(argv)) == "install --cap"
+
+
+def test_install_without_a_cap_or_gate_is_still_not_admin():
+    assert agentsession.admin_name("install", cli.build_parser().parse_args(["install", "--dry-run"])) is None
+
+
+@pytest.mark.parametrize(
+    "argv", [["config", "budget", "999", "--yes"], ["config", "model", "m", "--yes"], ["install", "--cap", "999"]]
+)
+def test_guard_refuses_the_setters_under_a_runner_with_no_terminal(argv, home):
+    ns = cli.build_parser().parse_args(argv)
+    with pytest.raises(WsError) as e:
+        agentsession.guard(ns, env={}, stdin_tty=False, stdout_tty=False, ancestry=lambda: ["claude"])
+    assert e.value.kind == "refused" and e.value.exit_code == 3
+    assert not (home / "profile.toml").exists()
+
+
+def test_a_refused_run_with_no_model_says_so_in_its_stop_reason(ws):
+    (ws.home / "jobs" / "daily.toml").write_text(NO_MODEL_JOB.format(extra=""), encoding="utf-8")
+    assert cli.main(["run", "daily"]) == 2
+    (rec,) = ws.records()
+    assert rec["stop_reason"] == "no_model" and rec["status"] == "error"
 
 
 def test_parse_usd():

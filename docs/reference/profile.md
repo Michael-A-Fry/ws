@@ -63,5 +63,8 @@ prompt = "Draft the weekly notes."
 
 Each setter prints the one key it changes (`[models] default: (unset) -> "claude-haiku-4-5"`) and asks before writing.
 `--yes` writes without asking; `--dry-run` prints the change and writes nothing. Setting a key to the value it already
-has writes nothing. After a write the setter prints the command that puts the old value back. `ws config budget` is an
-admin command: an agent session can't run it, so a session never raises its own cap.
+has writes nothing. After a write the setter prints the command that puts the old value back.
+
+The setters are admin commands: an agent session can't run `ws config budget`, `ws config model` with a value, or
+`ws install --cap`, so a session never sets its own cap or picks the models its jobs run on. The bare `ws config model`
+listing stays open to sessions. A run refused for having no model has `stop_reason` `no_model` in its run record.

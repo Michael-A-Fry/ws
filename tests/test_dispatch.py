@@ -103,7 +103,11 @@ def test_help_prints_and_changes_nothing(box, fake, capsys):
 def test_dry_run_starts_nothing(box, fake, capsys):
     assert cli.main(["--json", "dispatch", "r", "--name", "Fix The Login", "--dry-run", "go"]) == 0
     data = json.loads(capsys.readouterr().out)["data"]
-    assert data["window"] == "fix-the-login" and data["started"] is False and data["argv"][1:] == ["--name", "fix-the-login", "--remote-control=fix-the-login", "go"]
+    assert (
+        data["window"] == "fix-the-login"
+        and data["started"] is False
+        and data["argv"][1:] == ["--name", "fix-the-login", "--remote-control=fix-the-login", "go"]
+    )
     assert fake.calls == []
 
 

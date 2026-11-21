@@ -94,7 +94,7 @@ from ws import adapters, paths, profile
 from ws.secrets import HOST_RE, NAME_RE
 
 NAME = re.compile(r"^[A-Za-z0-9_-]+$")
-RESERVED = {"watch-deadman", "queue-reap"}  # the scheduler role's own units: `ws-watch-deadman`, `ws-queue-reap`
+RESERVED = {"watch-deadman", "queue-reap", "watch-panes"}  # the scheduler role's own units, `ws-NAME`
 DEFAULT_TIMEOUT_S = 900
 KEYS = {
     "runner",

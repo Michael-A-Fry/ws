@@ -12,7 +12,8 @@ the line number), so a rewritten ledger cannot give a clean count. The line kind
 
 - `proposal`: `{id, event_kind, area, about}`; `event_kind` is one of `dig`, `reframe`, `correct`, `follow-up`,
   `not-automatic`.
-- `confirm` and `dismiss`: `{proposal_id}`. The latest of these for a proposal decides it.
+- `confirm` and `dismiss`: `{proposal_id}`. The latest of these for a proposal decides it, wherever
+  it sits in the ledger.
 - `job-run`: `{job, run_id, status, expected_at}`; `status` is `ok`, `failed` or `missed`. A `failed` or `missed` run
   is one `not-automatic` step-in, counted once per `run_id` however often it is logged. The counter never invents an
   expected run: a missed run is one the job runtime wrote down as missed.
@@ -107,9 +108,9 @@ def _when(value: object) -> datetime | None:
         return None
     try:
         t = datetime.fromisoformat(value)
-    except ValueError:
+        return (t if t.tzinfo else t.replace(tzinfo=UTC)).astimezone(UTC)
+    except (ValueError, OverflowError):  # not a time, or one that can't be moved to UTC
         return None
-    return (t if t.tzinfo else t.replace(tzinfo=UTC)).astimezone(UTC)
 
 
 def load_config(path: str | None = None, environ: dict[str, str] | None = None) -> Config:
@@ -170,10 +171,12 @@ def read_ledger(path: Path) -> list[Line]:
         ) from None
     lines: list[Line] = []
     prev, n = GENESIS, 0
-    for n, raw in enumerate((ln for ln in blob.split(b"\n") if ln), 1):
+    for n, raw in enumerate(blob.split(b"\n"), 1):  # n is the file's own line number
+        if not raw:
+            continue  # a blank line is not part of the chain, as the ledger helper reads it
         try:
             entry = json.loads(raw)
-        except ValueError:
+        except (ValueError, RecursionError):
             entry = None
         if not isinstance(entry, dict):
             raise _broken(path, n, "not a JSON object")
@@ -236,7 +239,7 @@ def events(lines: Iterable[Line], now: datetime) -> tuple[list[Event], int, list
                     runs[rid] = Event(at, "not-automatic", area, f"job-run:{rid}")
         elif ln.kind == "":
             skipped.append(f"line {ln.n}: no usable kind or ts")
-        # any other kind (version-closed, aiw-off, ...) is not a step-in
+        # any other kind is not a step-in
     found: list[Event] = []
     still_open = 0
     for pid, ln in proposals.items():

@@ -1278,9 +1278,9 @@ in order). `$WS_PASSTEST_LEDGER` overrides `ledger`. ws has no built-in ledger p
 1 (`no_ledger`).
 
 Rules. A proposal counts when a `confirm` names it, or once it has been open 7 days with no `confirm` or `dismiss`; the
-latest decision wins. A `failed` or `missed` job run is one `not-automatic` step-in per `run_id`, in the week of its
-`expected_at`. The trend is the least-squares slope of the weekly totals: rising above +0.5 a week, falling below −0.5,
-flat in between. Nothing starts the count over.
+latest decision wins, and it falls in the week of the proposal, not of the confirm. A `failed` or `missed` job run
+is one `not-automatic` step-in per `run_id`, in the week of its `expected_at`. The trend is the least-squares slope of
+the weekly totals: rising above +0.5 a week, falling below −0.5, flat in between. Nothing starts the count over.
 
 ### Pass-test ledger lines
 

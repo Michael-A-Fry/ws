@@ -208,3 +208,46 @@ def test_nothing_in_it_writes_a_reset_line_or_writes_at_all(env, capsys, monkeyp
     src = inspect.getsource(passtest)
     for writer in ("reset", "write_text", "write_bytes", "os.open", '"a"', '"w"', "'a'", "'w'", ".write("):
         assert writer not in src, writer
+
+
+def test_a_wrong_start_to_the_chain_is_refused_at_line_1(tmp_path):
+    led = plant(tmp_path / "ledger.jsonl", prop(MON, "a", "dig"))
+    led.write_bytes(led.read_bytes().replace(passtest.GENESIS.encode(), b"1" * 64, 1))
+    with pytest.raises(WsError) as e:
+        passtest.read_ledger(led)
+    assert e.value.details == {"line": 1}
+
+
+def test_a_blank_line_is_read_past_and_line_numbers_are_the_files_own(tmp_path):
+    led = plant(tmp_path / "ledger.jsonl", prop(MON, "a", "dig"))
+    first, second, _ = led.read_bytes().split(b"\n")
+    led.write_bytes(first.replace(b'"about":"x"', b'"about":"y"') + b"\n\n" + second + b"\n")
+    with pytest.raises(WsError) as e:
+        passtest.read_ledger(led)
+    assert e.value.details == {"line": 3}
+    led.write_bytes(first + b"\n\n" + second + b"\n")
+    assert [ln.n for ln in passtest.read_ledger(led)] == [1, 3]
+
+
+def test_the_week_turns_at_monday_midnight_utc_and_the_window_has_edges(tmp_path):
+    sun = MON.replace(hour=0) - timedelta(seconds=1)
+    rows = prop(sun, "sun", "dig") + prop(MON.replace(hour=0), "mon", "dig")
+    rows += prop(MON - timedelta(weeks=4), "early", "dig")  # one week before a 4-week window
+    c = counted(tmp_path, rows)
+    assert c.totals == [0, 0, 1, 1] and c.weeks[0] == MON.replace(hour=0) - timedelta(weeks=3)
+    one = counted(tmp_path, rows, weeks=1)
+    assert one.totals == [1] and one.trend == "flat"
+
+
+def test_a_time_out_of_range_is_skipped_not_a_crash(tmp_path):
+    rows = [
+        (MON, "job-run", {"job": "j", "run_id": "r", "status": "failed", "expected_at": "9999-12-31T23:59:59-05:00"})
+    ]
+    assert counted(tmp_path, rows).totals == [0, 0, 0, 1]  # falls back to the line's own ts
+    assert passtest._when("0001-01-01T00:00:00+05:00") is None
+
+
+@pytest.mark.parametrize("weeks", ["-1", str(passtest.MAX_WEEKS + 1)])
+def test_weeks_outside_the_range_are_usage_errors(env, capsys, monkeypatch, weeks):
+    monkeypatch.setenv(passtest.LEDGER_ENV, str(plant(env / "l.jsonl", [])))
+    assert cli.main(["passtest", "events", "--weeks", weeks]) == 2

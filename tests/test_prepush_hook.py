@@ -528,13 +528,13 @@ def _git(repo: Path, env: dict[str, str], *args: str, text: str | None = None) -
     return done.stdout.strip()
 
 
-def _forged(repo: Path, env: dict[str, str], parent: str | None) -> str:
+def _forged(repo: Path, env: dict[str, str], parent: str | None, header: str = "gpgsig") -> str:
     """A commit whose header carries an ssh-looking `gpgsig` block that no key made."""
     tree = _git(repo, env, "write-tree")
     who = "t <noreply> 1700000000 +0000"
     lines = [f"tree {tree}"] + ([f"parent {parent}"] if parent else []) + [f"author {who}", f"committer {who}"]
     lines += [
-        "gpgsig -----BEGIN SSH SIGNATURE-----",
+        f"{header} -----BEGIN SSH SIGNATURE-----",
         " bm90IGEgc2lnbmF0dXJl",
         " -----END SSH SIGNATURE-----",
         "",
@@ -599,3 +599,12 @@ def test_a_ci_skip_is_logged_like_a_hook_skip(tmp_path):
     _push_to_hook(repo, env, f"refs/heads/work {unsigned} refs/heads/work {ZERO}\n", CI="true")
     log = (repo / ".git" / "ws-prepush-skips.log").read_text(encoding="utf-8")
     assert "skipped the signature check" in log and "CI is set" in log
+
+
+def test_a_forged_header_git_cannot_read_as_any_signature_is_refused(tmp_path):
+    repo, env, _cfg = _signing_repo(tmp_path)
+    (repo / "a").write_text("a", encoding="utf-8")
+    _git(repo, env, "add", "-A")
+    sha = _forged(repo, env, None, header="gpgsig-sha256")  # git says N for this one, on both checks
+    done = _push_to_hook(repo, env, f"refs/heads/work {sha} refs/heads/work {ZERO}\n")
+    assert done.returncode == 1 and sha in done.stderr

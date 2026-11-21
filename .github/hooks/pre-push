@@ -21,7 +21,7 @@
 # they run bare. Set but empty (WS_PREPUSH_WRAP= git push), they always run bare.
 # Signatures: before any test, `git log --format='%H %G?'` over the commits being sent. An unsigned one (N) refuses the
 # push, because the repository takes signed commits only and the pull request would sit blocked; one git cannot check
-# (E), whose key it does not know (U) or that is signed but has no signers file to check against is a warning; a bad (B) or revoked (R) one refuses. A
+# (E), whose key it does not know (U) or that is signed but has no signers file to check against is a warning; a bad (B) or revoked (R) one, or a signature header git cannot read, refuses. A
 # push whose commits git cannot list refuses too. Nothing is checked when CI is set (one line goes in the skip log, as for WS_SKIP_PREPUSH), and no network call is made. It reads
 # the refs git gives a pre-push hook on stdin, so a new branch is checked back to what the remote already has.
 # A skip is never silent: it adds a line to .git/ws-prepush-skips.log (the log of the worktree's git dir).
@@ -64,8 +64,8 @@ recheck() {
     trap 'rm -f "$empty_signers"' EXIT
   fi
   case "$(git -c "gpg.ssh.allowedSignersFile=$empty_signers" log -1 --format='%G?' "$sha" 2>/dev/null || true)" in
-    B | R) refused+=("$sha") ;;
-    *) echo "pre-push: warning: ${sha:0:12} is signed but git cannot check it here (no signers file?)" >&2 ;;
+    U | E) echo "pre-push: warning: ${sha:0:12} is signed but git cannot check it here (no signers file?)" >&2 ;;
+    *) refused+=("$sha") ;; # B, R, or N again: a header git cannot read as any signature is not one
   esac
 }
 

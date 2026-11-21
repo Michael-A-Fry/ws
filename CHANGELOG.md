@@ -8,6 +8,16 @@ body of the GitHub release.
 
 ## [Unreleased]
 
+### Added
+
+- `ws sync`: fetch every git repository under the code root, 4 at a time, each fetch killed (with its helpers)
+  and named past `--timeout-s` (default 120); exit 1 when any failed or timed out.
+
+### Changed
+
+- `ws dispatch` passes the model as one argument, `--model=M`, so a model name that starts with `-` can't become a
+  flag, and its code root expands `~` only for your own home (`~` or `~/...`).
+
 ## [0.1.11.3] - 2026-11-22
 
 ### Added

@@ -1309,7 +1309,10 @@ def write_opencode_job(ws, top="", options=""):
 
 
 def test_a_runner_that_cannot_price_the_model_is_refused_unless_the_job_allows_it(ws, capsys):
-    write_opencode_job(ws, options='provider = { npm = "@ai-sdk/openai-compatible", models = { m = { name = "m" } } }')
+    write_opencode_job(
+        ws,
+        options='provider = { npm = "@ai-sdk/openai-compatible", options = { baseURL = "http://127.0.0.1:8080/v1" }, models = { m = { name = "m" } } }',
+    )
     assert cli.main(["run", "oc"]) == 3
     assert "allow_unpriced" in capsys.readouterr().err
     (rec,) = ws.records()
@@ -1318,13 +1321,16 @@ def test_a_runner_that_cannot_price_the_model_is_refused_unless_the_job_allows_i
     write_opencode_job(
         ws,
         top="allow_unpriced = true",
-        options='provider = { npm = "@ai-sdk/openai-compatible", models = { m = { name = "m" } } }',
+        options='provider = { npm = "@ai-sdk/openai-compatible", options = { baseURL = "http://127.0.0.1:8080/v1" }, models = { m = { name = "m" } } }',
     )
     assert cli.main(["run", "oc", "--dry-run"]) == 0
 
 
 def test_a_provider_block_whose_models_carry_a_cost_is_priced(ws):
-    write_opencode_job(ws, options='provider = { models = { m = { name = "m", cost = { input = 1, output = 2 } } } }')
+    write_opencode_job(
+        ws,
+        options='provider = { npm = "@ai-sdk/openai-compatible", options = { baseURL = "http://127.0.0.1:8080/v1" }, models = { m = { name = "m", cost = { input = 1, output = 2 } } } }',
+    )
     assert cli.main(["run", "oc", "--dry-run"]) == 0
     write_opencode_job(ws)  # no provider block: one of OpenCode's own, which come with prices
     assert cli.main(["run", "oc", "--dry-run"]) == 0

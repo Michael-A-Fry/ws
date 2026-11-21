@@ -26,6 +26,10 @@ A module must define:
 
 and, optionally:
 
+    def option_problems(options, *, leased) -> list[str]
+                                                `ws job add`'s checks of runner_options values, each naming its key
+                                                (`leased`: the job takes a [[secrets]] lease); the adapter's own
+                                                build_command runs the same checks at `ws run`.
     UNSUPPORTED_GUARDS: tuple[str, ...]         guard names (ws.guards) this runner's generated config does not run.
     EVENT_NAMES: dict[str, str]                 the runner's hook event name -> a ws.guards event ("pre", "post",
                                                 "start", "prompt", "stop", "subagent-stop"), for `ws gate event`.

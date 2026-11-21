@@ -8,6 +8,18 @@ body of the GitHub release.
 
 ## [Unreleased]
 
+### Added
+
+- An OpenCode job can name a model server on this machine or the local network in `runner_options.provider`, and
+  `ws job add` takes it: an allowlisted `@ai-sdk/openai-compatible` table whose `baseURL` is `localhost` or a literal
+  loopback, private or CGNAT address. It replaces a provider block in a project `opencode.json`, which a job no longer
+  reads.
+
+### Changed
+
+- A hand-written OpenCode job whose `provider` table names a public or non-literal address, another npm package, or a
+  key outside the allowlist (such as `apiKey` or `headers`) is now refused at `ws run`, with the reason.
+
 ## [0.1.11.3] - 2026-11-22
 
 ### Added

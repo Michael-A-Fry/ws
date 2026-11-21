@@ -1344,7 +1344,9 @@ def test_a_name_without_paths_forwards_any_path(env):
     assert env.call("/anything/at/all")[0] == 200
 
 
-@pytest.mark.parametrize("bad", ["[]", '["v1"]', '["/v1?x=1"]', '["/v1/../x"]', '["/%2e"]', '["/a b"]', '"/v1"', '["/v1\\n"]'])
+@pytest.mark.parametrize(
+    "bad", ["[]", '["v1"]', '["/v1?x=1"]', '["/v1/../x"]', '["/%2e"]', '["/a b"]', '"/v1"', '["/v1\\n"]']
+)
 def test_a_bad_paths_entry_refuses_the_whole_registry(env, bad):
     _paths_registry(env, bad)
     with pytest.raises(wsecrets.SecretsError, match="paths|path prefix|list"):

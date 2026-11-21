@@ -19,6 +19,7 @@ from ws import policy as policy_mod
 def box(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setenv("WS_HOME", str(tmp_path / "wshome"))
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
     for d in ("home", "wshome", "house", "money", "open", "count", "plain"):
         (tmp_path / d).mkdir()
     text = (
@@ -43,8 +44,16 @@ def send(folder, to: str, text: str = "hello") -> dict:
 
 
 def run(payload: dict, pol: str) -> tuple[int, str, str]:
+    """The hook's answer, for a session that started where the payload works unless a test set CLAUDE_PROJECT_DIR."""
     argv = ["--runner", "claude-code", "--policy", pol, *paths.pin_of().args()]
-    return gate.run_check(gate.hook_args("check", argv), json.dumps(payload))
+    set_here = "CLAUDE_PROJECT_DIR" not in os.environ
+    if set_here:
+        os.environ["CLAUDE_PROJECT_DIR"] = payload["cwd"]
+    try:
+        return gate.run_check(gate.hook_args("check", argv), json.dumps(payload))
+    finally:
+        if set_here:
+            del os.environ["CLAUDE_PROJECT_DIR"]
 
 
 @pytest.mark.parametrize(
@@ -130,3 +139,14 @@ def test_a_crossing_from_before_the_wall_shipped_is_history(box):
     before = (walls.CROSSINGS_SINCE - timedelta(days=1)).timestamp()
     jsonl.append(plant, jsonl.stamped({"tool": "SendMessage", "decision": "allow", "session": "old"}, 1, before))
     assert case.check(ctx).ok
+
+
+def test_a_session_started_unclassified_cannot_send_from_a_full_folder(box, monkeypatch):
+    tmp, pol = box
+    tree = tmp / "house-wt" / "feature"  # started in a walled repo's sibling worktree, no class names it
+    tree.mkdir(parents=True)
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tree))
+    code, _, err = run(send(tmp / "open", "anyone"), pol)  # then working in a full class's folder
+    assert code == 2 and "unclassified" in err
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp / "open"))  # started there: free to send
+    assert run(send(tmp / "open", "anyone"), pol)[0] == 0

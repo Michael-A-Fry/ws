@@ -378,6 +378,16 @@ def message_wall(cls: policy.Class | None, calls: list[Call]) -> str | None:
     return None
 
 
+def _message_class(pol: policy.Policy, cls: policy.Class | None) -> policy.Class | None:
+    """The class the message wall judges: the session's (`_class_of_session`), unless the session started in a folder no
+    class names. That start counts as unclassified (the strictest) here, so a session begun in a walled repo's worktree
+    or a new repo can't send by moving its working folder into a full class."""
+    if cls is None:
+        return None
+    start = _class_of_cwd(pol, _start_folder())
+    return start if start is policy.UNCLASSIFIED else cls
+
+
 def _class_of_session(pol: policy.Policy, cwd: str) -> policy.Class | None:
     """The class that decides where a call is logged and whether its payload is kept: the stricter of the class of the
     folder the payload says the call ran in (a model can point that elsewhere: OpenCode's `workdir`) and the class of the
@@ -523,7 +533,7 @@ def _check(
             return reason
     session, cwd = _text(payload, "session_id"), _text(payload, "cwd")
     cls = _class_of_session(pol, cwd)
-    if why := message_wall(cls, calls):
+    if why := message_wall(_message_class(pol, cls), calls):
         _mark(layer, "rule:message_wall")
         return why
     ctx = _context(runner, "pre", payload, clock, home, wall, cls)

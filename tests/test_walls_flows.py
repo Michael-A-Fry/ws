@@ -20,7 +20,7 @@ from test_msg import World, world  # noqa: F401  (the fixture is used by name)
 from test_run import ws as run_ws  # noqa: F401  (a scratch WS_HOME with a fake claude, for the run record)
 from test_walls import FLOW_NAMES, NAMES, box, host, kind, policy_file  # noqa: F401
 
-from ws import cli, gate, mcp_server, memory, msg, notes, paths, policy, sandbox, walls, wallsettings
+from ws import cli, gate, jsonl, mcp_server, memory, msg, notes, paths, policy, sandbox, walls, wallsettings
 from ws.output import WsError
 
 
@@ -429,7 +429,20 @@ MUTATIONS = [
         "a walled caller may add and capture",
         lambda h: h.mp.setattr(notes, "is_walled", lambda cls: False),
     ),
+    (
+        "no-message-crossings",
+        "the gate's message wall is off",
+        lambda h: h.mp.setattr(gate, "message_wall", lambda *a: None),
+    ),
+    ("no-message-crossings", "a send went out of a walled class", lambda h: plant_crossing()),
 ]
+
+
+def plant_crossing() -> None:
+    """A verdict-log line of a send-message call the gate let out of a walled class (as an older gate would have)."""
+    walled = min(n for n, c in policy.load(policy_file()).classes.items() if c.access != "full")
+    log = paths.state_dir() / "logs" / "classes" / walled / gate.VERDICT_LOG
+    jsonl.append(log, jsonl.stamped({"tool": "SendMessage", "decision": "allow", "session": "s9"}, 1))
 
 
 def one(name: str) -> dict:

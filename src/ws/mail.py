@@ -61,8 +61,10 @@ MAX_RECIPIENTS = 10
 MAX_REFERENCES = 20
 MAILBOX_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
 UID_RE = re.compile(r"^([a-z0-9][a-z0-9_-]{0,39}):([1-9][0-9]{0,9})-([1-9][0-9]{0,9})$")
-# Anything that could pass for one of as_text's own lines: <<< (also as HTML entities), then "ws mail", any case.
-FORGED_RE = re.compile(r"(?:<|&lt;?|&#0*60;?|&#x0*3c;?){3}\s*ws\s*mail", re.IGNORECASE)
+# Anything that could pass for one of as_text's own lines: <<< (also as HTML entities), then "ws mail", any case, with
+# any whitespace between the < units and between the letters ("< < < w s mail" reads the same to a model).
+_LT = r"(?:<|&lt;?|&#0*60;?|&#x0*3c;?)"
+FORGED_RE = re.compile(rf"{_LT}(?:\s*{_LT}){{2}}\s*" + r"\s*".join("wsmail"), re.IGNORECASE)
 MSGID_RE = re.compile(r"<[^<>\s\"\\]{1,250}>")
 _RE_PREFIX = re.compile(r"^\s*re\s*:", re.IGNORECASE)
 
@@ -286,6 +288,13 @@ class Mail:
         if entry is None or entry.kind != imap.KIND or not isinstance(entry.options, imap.Options):
             raise MailError("bad_registry", f"{box.name}: {box.secret} is not a registry entry of kind imap")
         return entry.options.user
+
+    def folders(self, mailbox: str) -> dict:
+        """A read-only login and LIST: {"mailbox", "folders": [names], "gmail", "drafts"} ("drafts" None = none found)."""
+        box = self._box(mailbox)
+        r = self._call(box, "list", {})
+        names = [f["name"] for f in r.get("folders", [])]
+        return {"mailbox": box.name, "folders": names, "gmail": bool(r.get("gmail")), "drafts": r.get("drafts")}
 
     def search(
         self, mailbox: str, query: str | None = None, since: str | _dt.date | None = None, unseen: bool = False

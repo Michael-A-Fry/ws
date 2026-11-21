@@ -24,6 +24,7 @@ SHIPPED = [
     ("dispatch", "dispatch"),
     ("job", "jobcmd"),
     ("watch", "jobwatch"),
+    ("mail", "mailcmd"),
     ("msg", "msg"),
     ("node", "node"),
     ("passtest", "passtest"),

@@ -20,7 +20,7 @@ What it does about one, in full.
     dialog's first meaningful line. The episode ends when the dialog goes, and the next one is a new push.
   * The only key it ever sends is `Escape`, and only to a pane that shows the Remote Control status dialog (all of "Remote
     Control", "Disconnect this session" and "Esc to continue" present), once the dialog has been up a minute and is read
-    again just before. Esc there only closes the box. It logs that (`<state>/logs/panes.jsonl`) and pushes once. It never
+    again just before. Esc there only closes the box. It logs that (a line in `<state>/logs/alerts.jsonl`) and pushes once. It never
     presses anything on any other dialog: a question, a permission or a plan is the person's to answer, and a push is all
     it does about them. `press_escape` is the one place a key is sent, and a test pins that.
 
@@ -47,7 +47,7 @@ from ws.output import WsError
 from ws.profile import ProfileError, load, profile_path
 from ws.term import tmux
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 1  # of the state file
 DIALOG_PATTERNS = (
     "Enter to select",
     "Esc to cancel",
@@ -99,10 +99,6 @@ class Report:
     dialogs: list[dict] = field(default_factory=list)
     pressed: list[str] = field(default_factory=list)
     pushed: list[str] = field(default_factory=list)
-
-
-def log_path(env=None) -> Path:
-    return paths.state_dir(env) / "logs" / "panes.jsonl"
 
 
 def state_path(env=None) -> Path:
@@ -235,12 +231,9 @@ def write_state(env, panes: dict[str, dict]) -> None:
 
 
 def _log(env, rec: dict) -> None:
-    path = log_path(env)
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    line = json.dumps({"schema": SCHEMA_VERSION, "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), **rec})
-    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-    with os.fdopen(fd, "a", encoding="utf-8") as f:
-        f.write(line + "\n")
+    """One line in the scheduler's alerts log (`<state>/logs/alerts.jsonl`, kind "not-automatic"), beside the job alerts:
+    one place to look for what ws told the person without being asked."""
+    jobwatch._write_line(env, rec)
 
 
 # --- one run ---------------------------------------------------------------------------------------------------------

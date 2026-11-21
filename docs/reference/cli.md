@@ -1570,7 +1570,7 @@ episode through the notify role (the alert cap applies), naming the window, its 
 dialog's first line. The episode ends when the dialog goes.
 
 The only key it ever sends is `Escape`, to a pane showing the Remote Control status box (it holds Remote Control,
-Disconnect this session and Esc to continue) once it has been up a minute; it logs that to `logs/panes.jsonl` and
+Disconnect this session and Esc to continue) once it has been up a minute; it logs that to `logs/alerts.jsonl` and
 pushes once. It never presses anything on any other dialog: a question is yours to answer. `ws-watch-panes.timer` runs it
 every minute (systemd, or `ws.job.watch-panes` on launchd) once any job is scheduled; with no scheduled job, run
 `ws watch panes` from your own timer or cron. It does nothing without tmux or a running server. State is

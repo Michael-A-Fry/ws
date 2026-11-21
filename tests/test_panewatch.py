@@ -8,7 +8,7 @@ import os
 
 import pytest
 
-from ws import cli, panewatch, paths
+from ws import cli, jobwatch, panewatch, paths
 from ws.output import WsError
 from ws.profile import dumps, profile_path
 from ws.roles import ntfy
@@ -272,7 +272,7 @@ def test_a_failed_send_is_tried_again_and_a_missing_role_is_not(env):
     later = watch(env, t2, 212 * MIN, good)
     assert first.pushed == [] and later.pushed == ["%4"] and len(good.sent) == 1
     assert watch(env, t2, 213 * MIN, good).pushed == []
-    events = [json.loads(x) for x in panewatch.log_path(env).read_text().splitlines()]
+    events = [json.loads(x) for x in jobwatch.alerts_path(env).read_text().splitlines()]
     assert [e["event"] for e in events] == ["dialog-stuck"] * 4 and events[-1]["pushed"] is False
 
 
@@ -303,7 +303,7 @@ def test_escape_goes_only_to_the_remote_control_box_after_a_minute_and_once(env)
     assert report.pressed == ["%5"]
     assert t.keys() == [["send-keys", "-t", "%5", "Escape"]]
     assert len(s.sent) == 1 and "ws-lead" in s.sent[0] and "@9" in s.sent[0] and "Remote Control" in s.sent[0]
-    events = [json.loads(x) for x in panewatch.log_path(env).read_text().splitlines()]
+    events = [json.loads(x) for x in jobwatch.alerts_path(env).read_text().splitlines()]
     assert events[0]["event"] == "escape-sent" and events[0]["pane"] == "%5" and events[0]["pushed"] is True
     watch(env, t, start + 120, s)  # the box is gone: the episode is over, nothing more is sent
     assert len(t.keys()) == 1 and len(s.sent) == 1 and panewatch.read_state(env) == {}

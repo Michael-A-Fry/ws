@@ -670,12 +670,21 @@ def build_command(job, run_dir: Path, lease) -> tuple[list[str], dict[str, str]]
     # opencode.json into the inline one, and an empty inline `mcp` does not remove a server they name (checked on
     # 1.19.4). So the run gets an empty config folder and the project config is switched off.
     # Isolate, don't list paths (DEC-093): OpenCode reads MCP servers, plugins, tools and remote config from its home
-    # folder, the five XDG folders, the project and /etc/opencode, and a server named in an empty inline `mcp` is not
-    # removed by it. So the run gets HOME and the XDG folders as fresh empty folders under its run folder, the project
+    # folder, the XDG folders, the project and /etc/opencode, and a server named in an empty inline `mcp` is not
+    # removed by it. So the run gets HOME and four XDG folders as fresh empty folders under its run folder, the project
     # config is off, and /etc/opencode is refused. The provider credential and base URL come only from the lease in
     # the inline config; no auth.json is copied (a local provider needs none).
     for name in ("opencode.json", "opencode.jsonc"):
-        if (ETC_OPENCODE / name).exists():
+        try:
+            os.stat(ETC_OPENCODE / name)  # not Path.exists: that reads a permission error as "absent"
+            present = True
+        except (FileNotFoundError, NotADirectoryError):
+            present = False
+        except OSError as e:  # unreadable: it cannot be shown to be absent, so the run is refused, not crashed
+            raise ValueError(
+                f"{ETC_OPENCODE} cannot be read ({type(e).__name__}): make it readable or remove it"
+            ) from e
+        if present:
             raise ValueError(
                 f"{ETC_OPENCODE / name} exists and OpenCode applies it after ws's config: remove it, or run on claude-code"
             )
@@ -689,6 +698,10 @@ def build_command(job, run_dir: Path, lease) -> tuple[list[str], dict[str, str]]
         env[var] = str(fresh / rel)
         if Path(run_dir).is_dir():  # the run's folder is there once its gate files are written
             (fresh / rel).mkdir(parents=True, exist_ok=True)
+    if Path(run_dir).is_dir():
+        wall_prepare(
+            {"HOME": str(fresh), "XDG_CONFIG_HOME": env["XDG_CONFIG_HOME"]}
+        )  # the config folder OpenCode needs at start
     env.update(HOME=str(fresh), OPENCODE_DISABLE_PROJECT_CONFIG="true")
     if offline:  # no model-list fetch or language-server download: for a stub or an air-gapped machine
         env.update(OPENCODE_DISABLE_MODELS_FETCH="true", OPENCODE_DISABLE_LSP_DOWNLOAD="true")

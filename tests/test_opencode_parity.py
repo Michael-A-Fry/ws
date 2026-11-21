@@ -837,7 +837,7 @@ def test_an_opencode_job_gets_a_config_with_zero_mcp_servers_and_no_other_config
     _argv, env = opencode.build_command(_job_for(), tmp_path, None)
     assert json.loads(env["OPENCODE_CONFIG_CONTENT"])["mcp"] == {}
     assert env["OPENCODE_DISABLE_PROJECT_CONFIG"] == "true"
-    assert env["HOME"] == str(tmp_path / "oc-home") and not any((tmp_path / "oc-home" / ".config").iterdir())
+    assert env["HOME"] == str(tmp_path / "oc-home") and not list((tmp_path / "oc-home" / ".config").rglob("*.json*"))
 
 
 def test_an_opencode_job_that_names_an_mcp_server_is_refused(tmp_path):
@@ -880,7 +880,11 @@ def test_an_opencode_job_runs_with_a_fresh_empty_home_and_xdg_so_planted_sources
     assert env["HOME"] == str(fresh)
     for var in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"):
         folder = Path(env[var])
-        assert folder.is_dir() and fresh in folder.parents and not any(folder.iterdir()), var
+        assert folder.is_dir() and fresh in folder.parents, var
+        assert [f.relative_to(folder).as_posix() for f in folder.rglob("*") if f.is_file()] in (
+            [],
+            ["opencode/.gitignore"],
+        ), var
     assert not (fresh / ".opencode").exists() and not list(fresh.rglob("auth.json"))
     assert str(home) not in json.dumps(env)  # nothing of the real home reaches the runner
 
@@ -890,6 +894,7 @@ def test_an_opencode_job_is_refused_when_etc_opencode_has_a_config(tmp_path, mon
 
     etc = tmp_path / "etc"
     etc.mkdir()
+    (etc / "opencode.json").write_text('{"mcp": {"evil": {"type": "local", "command": ["true"]}}}')
     (etc / "opencode.jsonc").write_text('{"mcp": {"evil": {"type": "local", "command": ["true"]}}}')
     monkeypatch.setattr(opencode, "ETC_OPENCODE", etc)
     (tmp_path / "run" / "gate").mkdir(parents=True)
@@ -903,3 +908,19 @@ def test_an_opencode_job_with_no_etc_config_is_not_refused(tmp_path, monkeypatch
     monkeypatch.setattr(opencode, "ETC_OPENCODE", tmp_path / "no-etc")
     (tmp_path / "run" / "gate").mkdir(parents=True)
     opencode.build_command(_job_for(), tmp_path / "run", None)
+
+
+def test_an_unreadable_etc_opencode_refuses_cleanly(tmp_path, monkeypatch):
+    from ws.adapters import opencode
+
+    etc = tmp_path / "etc"
+    etc.mkdir()
+    (etc / "opencode.json").write_text("{}")
+    monkeypatch.setattr(opencode, "ETC_OPENCODE", etc)
+    etc.chmod(0)
+    try:
+        (tmp_path / "run" / "gate").mkdir(parents=True)
+        with pytest.raises(ValueError, match="cannot be read|exists"):
+            opencode.build_command(_job_for(), tmp_path / "run", None)
+    finally:
+        etc.chmod(0o700)

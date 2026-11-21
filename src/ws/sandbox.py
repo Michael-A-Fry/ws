@@ -2386,6 +2386,7 @@ def walled(
     cls: policy.Class | None = None,
     cwd: str | None = None,
     tty: bool = False,
+    run_homes: dict[str, str] | None = None,
 ):
     """Around a runner that has no sandbox of its own (OpenCode), the wall `ws gate launch` and `ws run` both put round it.
     On the way in: a walled class's launch file is read and the project checked against the runner's own
@@ -2397,7 +2398,10 @@ def walled(
 
     `env` is where the real home and the runner's folders are looked up; `protect` and `allow_write` are the caller's
     (`protected`, `writable_folders`); `cwd` (default the current folder) is the folder the session starts in, which is
-    what the class narrowing is judged by."""
+    what the class narrowing is judged by. `run_homes` ({XDG variable: folder}) is a job's own per-run data, state and cache
+    folders: the wall binds those writable instead of the persistent private ones (`private_homes`), which a job never
+    reads, seeds or changes (a sign-in or remote config kept there must not reach a later run, and the person's walled
+    session keeps its own)."""
     launch_doc = class_launch_doc(cls)
     hidden: list[str] = []
     if launch_doc is not None and cls is not None:
@@ -2412,7 +2416,12 @@ def walled(
     tmp = tempfile.mkdtemp(prefix="ws-wall-")  # the wall's /tmp: the rest of the disk is read-only
     entered, before, notes, proxy = False, {}, [], None
     try:
-        homes = private_homes(home, runner, pol, env, project, hidden)
+        if run_homes is not None:
+            homes = {var: str(Path(folder)) for var, folder in run_homes.items()}
+            for folder in homes.values():
+                Path(folder).mkdir(mode=0o700, parents=True, exist_ok=True)
+        else:
+            homes = private_homes(home, runner, pol, env, project, hidden)
         before, note = scan_project(project)
         notes += [note] if note else []
         locked = enter_project(home, project)

@@ -676,9 +676,16 @@ def build_command(job, run_dir: Path, lease) -> tuple[list[str], dict[str, str]]
     # the inline config; no auth.json is copied (a local provider needs none).
     for name in ("opencode.json", "opencode.jsonc"):
         if (ETC_OPENCODE / name).exists():
-            raise ValueError(f"{ETC_OPENCODE / name} exists and OpenCode applies it after ws's config: remove it, or run on claude-code")
+            raise ValueError(
+                f"{ETC_OPENCODE / name} exists and OpenCode applies it after ws's config: remove it, or run on claude-code"
+            )
     fresh = Path(run_dir) / "oc-home"
-    for var, rel in (("XDG_CONFIG_HOME", ".config"), ("XDG_DATA_HOME", ".local/share"), ("XDG_STATE_HOME", ".local/state"), ("XDG_CACHE_HOME", ".cache")):
+    for var, rel in (
+        ("XDG_CONFIG_HOME", ".config"),
+        ("XDG_DATA_HOME", ".local/share"),
+        ("XDG_STATE_HOME", ".local/state"),
+        ("XDG_CACHE_HOME", ".cache"),
+    ):
         env[var] = str(fresh / rel)
         if Path(run_dir).is_dir():  # the run's folder is there once its gate files are written
             (fresh / rel).mkdir(parents=True, exist_ok=True)

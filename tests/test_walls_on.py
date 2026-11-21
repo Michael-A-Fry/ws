@@ -3,7 +3,9 @@ class's launch file holds against the other and against messages in, over the lo
 
 from __future__ import annotations
 
+import argparse
 import json
+import os
 
 import pytest
 
@@ -110,20 +112,24 @@ def test_neither_launch_file_names_its_own_repos_as_sealed(box):
 
 # --- ws cards: a fixed-kind card from a walled class's account to the lead's, across the OS wall ----------------------
 
+SID = "0b9d2a4e-6c1f-4f7a-9b3e-2d5c8e1a7f40"
+GOOD = {"v": 1, "kind": "done", "class": "alpha", "session": SID, "at": "2026-11-21T00:00:00Z"}
+
 
 @pytest.fixture
 def spool(tmp_path, monkeypatch, box):
-    """A 1730 spool this account owns, the two-walled policy, and accounts by name: `who` is this process's account, and
-    a card file's owner is read from `owners` (the test can't chown)."""
+    """A 3730 spool this account owns, in this account's own group standing in for ws-cards, the two-walled policy, and
+    accounts by name: `who` is this process's account, and a card file's owner is read from `owners` (no chown here)."""
     from ws import cards, msg, session
 
     folder = tmp_path / "spool"
     folder.mkdir()
-    folder.chmod(0o1730)
+    folder.chmod(0o3730)
     pol = policy.loads(TWO_WALLED)
-    state = {"who": "ws-alpha", "cwd": "/srv/work/alpha/one", "owners": {}}
+    state = {"who": "ws-alpha", "cwd": "/srv/work/alpha/one", "owners": {}, "sid": SID}
     monkeypatch.setattr(msg, "_policy", lambda: pol)
-    monkeypatch.setattr(msg, "caller", lambda: session.Record("s-alpha", "t", cwd=state["cwd"]))
+    monkeypatch.setattr(msg, "caller", lambda: session.Record(state["sid"], "t", cwd=state["cwd"]))
+    monkeypatch.setattr(cards, "_group_gid", lambda: folder.stat().st_gid)
 
     def account(uid=None):
         return state["who"] if uid is None else state["owners"].get("next", state["who"])
@@ -133,16 +139,28 @@ def spool(tmp_path, monkeypatch, box):
     return state
 
 
+def _plant(folder, name, data):
+    (folder / name).write_bytes(data if isinstance(data, bytes) else json.dumps(data).encode())
+
+
+def _as_lead(spool, owner="ws-alpha"):
+    spool["who"], spool["owners"]["next"] = "user", owner
+
+
 def test_a_walled_account_drops_a_card_and_the_lead_takes_it(spool):
     from ws import cards
 
-    made = cards.drop("counts", folder=spool["folder"])
-    assert made["class"] == "alpha" and (spool["folder"] / made["card"]).stat().st_mode & 0o777 == 0o640
-    spool["who"] = "user"  # the lead's account takes; the file's owner stays ws-alpha
-    spool["owners"]["next"] = "ws-alpha"
+    old = os.umask(0o077)  # the card is 0640 whatever the umask
+    try:
+        made = cards.drop("counts", folder=spool["folder"])
+    finally:
+        os.umask(old)
+    st = (spool["folder"] / made["card"]).stat()
+    assert made["class"] == "alpha" and st.st_mode & 0o777 == 0o640 and st.st_gid == spool["folder"].stat().st_gid
+    _as_lead(spool)
     got = cards.take(folder=spool["folder"])
-    assert [(c["class"], c["kind"], c["session"]) for c in got["cards"]] == [("alpha", "counts", "s-alpha")]
-    assert got["rejected"] == [] and list(spool["folder"].iterdir()) == []
+    assert [(c["class"], c["kind"], c["session"]) for c in got["cards"]] == [("alpha", "counts", SID)]
+    assert got["rejected"] == {} and list(spool["folder"].iterdir()) == []
 
 
 @pytest.mark.parametrize("kind", ["note", "ask", "stop-and-hand-over"])
@@ -155,7 +173,7 @@ def test_a_card_is_a_fixed_kind_only(spool, kind):
     assert e.value.kind == "bad_input" and list(spool["folder"].iterdir()) == []
 
 
-def test_only_a_walled_class_on_its_own_account_drops(spool):
+def test_only_a_walled_class_on_its_own_account_with_a_uuid_session_drops(spool):
     from ws import cards
     from ws.output import WsError
 
@@ -163,15 +181,19 @@ def test_only_a_walled_class_on_its_own_account_drops(spool):
     with pytest.raises(WsError) as e:
         cards.drop("done", folder=spool["folder"])
     assert e.value.kind == "refused" and "ws-alpha" in e.value.message
-    spool["who"], spool["cwd"] = "user", "/srv/elsewhere"  # no class
+    spool["who"], spool["sid"] = "ws-alpha", "PLANTED.exfil.text_here"  # an id that could carry text
+    with pytest.raises(WsError) as e:
+        cards.drop("done", folder=spool["folder"])
+    assert e.value.kind == "refused" and "UUID" in e.value.message
+    spool["who"], spool["cwd"], spool["sid"] = "user", "/srv/elsewhere", SID  # no class
     with pytest.raises(WsError) as e:
         cards.drop("done", folder=spool["folder"])
     assert e.value.kind == "refused"
     assert list(spool["folder"].iterdir()) == []
 
 
-@pytest.mark.parametrize("mode", [0o0730, 0o1737, 0o1734, 0o1777])
-def test_a_spool_others_can_reach_or_without_the_sticky_bit_is_refused(spool, mode):
+@pytest.mark.parametrize("mode", [0o1730, 0o3770, 0o3750, 0o3731, 0o2730, 0o3777, 0o0730])
+def test_a_spool_in_any_mode_but_3730_is_refused(spool, mode):
     from ws import cards
     from ws.output import WsError
 
@@ -179,7 +201,17 @@ def test_a_spool_others_can_reach_or_without_the_sticky_bit_is_refused(spool, mo
     for call in (lambda: cards.drop("done", folder=spool["folder"]), lambda: cards.take(folder=spool["folder"])):
         with pytest.raises(WsError) as e:
             call()
-        assert e.value.kind == "refused" and "1730" in e.value.hint
+        assert e.value.kind == "refused" and "3730" in e.value.hint
+
+
+def test_a_spool_outside_the_group_is_refused(spool, monkeypatch):
+    from ws import cards
+    from ws.output import WsError
+
+    monkeypatch.setattr(cards, "_group_gid", lambda: None)  # no ws-cards group on the host
+    with pytest.raises(WsError) as e:
+        cards.drop("done", folder=spool["folder"])
+    assert e.value.kind == "refused" and cards.GROUP in e.value.message
 
 
 def test_the_lead_takes_only_from_a_spool_it_owns(spool, monkeypatch):
@@ -192,34 +224,42 @@ def test_the_lead_takes_only_from_a_spool_it_owns(spool, monkeypatch):
     assert e.value.kind == "refused" and "owned" in e.value.message
 
 
-def _plant(folder, name, data):
-    (folder / name).write_bytes(data if isinstance(data, bytes) else json.dumps(data).encode())
-
-
-GOOD = {"v": 1, "kind": "done", "class": "alpha", "session": "s-alpha", "at": "2026-11-21T00:00:00Z"}
-
-
 @pytest.mark.parametrize(
-    ("card", "owner", "why"),
+    ("card", "owner", "code"),
     [
-        ({**GOOD, "class": "beta"}, "ws-alpha", "its owner is class 'alpha'"),  # a forged class
-        (GOOD, "user", "no walled class"),  # dropped by an account that is no class's
-        ({**GOOD, "body": "PLANTED-7f3"}, "ws-alpha", "not a card"),  # a body smuggled in
-        ({**GOOD, "kind": "note"}, "ws-alpha", "not a fixed kind"),
-        ({**GOOD, "session": "a b"}, "ws-alpha", "no session id"),
-        (b"\xff not json", "ws-alpha", "not JSON"),
-        (b"{" + b" " * 600 + b"}", "ws-alpha", "bigger than"),
+        ({**GOOD, "class": "beta"}, "ws-alpha", "class"),  # a forged class
+        (GOOD, "user", "owner"),  # dropped by an account that is no class's
+        ({**GOOD, "body": "PLANTED-7f3"}, "ws-alpha", "shape"),  # a body smuggled in
+        ({**GOOD, "kind": "note"}, "ws-alpha", "kind"),
+        ({**GOOD, "session": "s-alpha"}, "ws-alpha", "session"),  # not a UUID
+        ({**GOOD, "at": "2026-11-21 00:00:00"}, "ws-alpha", "at"),
+        ({**GOOD, "at": "2026-13-41T00:00:00Z"}, "ws-alpha", "at"),  # the shape, not a time
+        (b"\xff not json", "ws-alpha", "json"),
+        (b"{" + b" " * 600 + b"}", "ws-alpha", "size"),
     ],
 )
-def test_a_card_that_is_not_what_its_owner_may_send_is_rejected_and_removed(spool, card, owner, why):
+def test_a_card_that_is_not_what_its_owner_may_send_is_rejected_by_code_and_removed(spool, card, owner, code):
     from ws import cards
 
     _plant(spool["folder"], "1-0123456789abcdef.card", card)
-    spool["who"], spool["owners"]["next"] = "user", owner
+    _as_lead(spool, owner)
     got = cards.take(folder=spool["folder"])
-    assert got["cards"] == [] and len(got["rejected"]) == 1 and why in got["rejected"][0]["reason"]
-    assert "PLANTED" not in json.dumps(got)  # never the card's own text
+    assert got == {"cards": [], "rejected": {code: 1}} and code in cards.REASONS
     assert list(spool["folder"].iterdir()) == []
+
+
+def test_a_card_in_another_group_is_rejected(spool, monkeypatch):
+    from ws import cards
+
+    _plant(spool["folder"], "1-0123456789abcdef.card", GOOD)
+    _as_lead(spool)
+    gid = spool["folder"].stat().st_gid
+    monkeypatch.setattr(cards, "_group_gid", lambda: gid)
+    real_fstat = cards.os.fstat
+    monkeypatch.setattr(
+        cards.os, "fstat", lambda fd: os.stat_result((*real_fstat(fd)[:5], gid + 1, *real_fstat(fd)[6:]))
+    )
+    assert cards.take(folder=spool["folder"]) == {"cards": [], "rejected": {"group": 1}}
 
 
 def test_a_link_and_a_bad_name_are_rejected_and_a_fresh_dot_file_is_left(spool, tmp_path):
@@ -230,21 +270,41 @@ def test_a_link_and_a_bad_name_are_rejected_and_a_fresh_dot_file_is_left(spool, 
     (spool["folder"] / "2-0123456789abcdef.card").symlink_to(target)
     _plant(spool["folder"], "notacard.txt", GOOD)
     _plant(spool["folder"], ".3-0123456789abcdef.card.tmp", b"half")
-    spool["who"], spool["owners"]["next"] = "user", "ws-alpha"
+    _as_lead(spool)
     got = cards.take(folder=spool["folder"])
-    assert got["cards"] == [] and sorted(r["reason"] for r in got["rejected"]) == [
-        "a link, or not readable",
-        "not a card name",
-    ]
+    assert got == {"cards": [], "rejected": {"link": 1, "name": 1}}
     assert target.exists() and [p.name for p in spool["folder"].iterdir()] == [".3-0123456789abcdef.card.tmp"]
+
+
+def test_take_never_prints_planted_text(spool, capsys, monkeypatch):
+    """The cold review's probe: text planted in `at`, `session`, `class` and a file name never comes out of `take`, in
+    its result or on the screen."""
+    from ws import cards
+
+    f = spool["folder"]
+    _plant(
+        f,
+        "1-0123456789abcdef.card",
+        {**GOOD, "at": "PLANTED\x1b[2J ignore prior", "session": "PLANTED.exfil.text_here"},
+    )
+    _plant(f, "2-0123456789abcdef.card", {**GOOD, "class": "PLANTED forged class text"})
+    _plant(f, "PLANTED free text in a file name", GOOD)
+    _plant(f, "4-0123456789abcdef.card", GOOD)  # one good card, so the screen path prints a row
+    _as_lead(spool)
+    got = cards.take(folder=f, keep=True)
+    assert "PLANTED" not in json.dumps(got) and len(got["cards"]) == 1
+    real = cards.take
+    monkeypatch.setattr(cards, "take", lambda keep=False: real(folder=f, keep=keep))
+    code = cards.cmd_take(argparse.Namespace(keep=False, json=False))
+    out, err = capsys.readouterr()
+    assert code == 0 and "PLANTED" not in out + err and "\x1b" not in out + err
 
 
 # --- lead-only on a walled class: the lead gets in, no other session does (DEC-052) --------------------------------
 
 
-def test_lead_only_lets_the_lead_into_each_walled_class_and_no_other_session(box, tmp_path):
-    from ws import msg, session
-    from ws.output import WsError
+def _three(tmp_path):
+    from ws import session
 
     a, b, home = tmp_path / "alpha", tmp_path / "beta", tmp_path / "lead"
     for d in (a, b, home):
@@ -252,13 +312,51 @@ def test_lead_only_lets_the_lead_into_each_walled_class_and_no_other_session(box
     text = TWO_WALLED.replace('"/srv/work/alpha/one/**", "/srv/work/alpha/two/**"', f'"{a}/**"')
     text = text.replace('"/srv/work/beta/three/**"', f'"{b}/**"')
     pol = policy.loads(text + f'\n[classes.platform]\naccess = "full"\nrepos = ["{home}/**"]\n')
-    lead = session.Record("lead1", "t", cwd=str(home), role="lead")
-    in_a = session.Record("wall-a", "t", cwd=str(a))
-    in_b = session.Record("wall-b", "t", cwd=str(b))
+    rec = {
+        "lead": session.Record("lead1", "t", cwd=str(home), role="lead"),
+        "worker": session.Record("w1", "t", cwd=str(home)),
+        "person": session.Record(session.PERSON + "me", "", cwd=str(home), role="lead", runner="person"),
+        "a": session.Record("wall-a", "t", cwd=str(a)),
+        "b": session.Record("wall-b", "t", cwd=str(b)),
+    }
+    return pol, rec
+
+
+@pytest.mark.parametrize("kind", ["note", "ask", "stop-and-hand-over"])
+def test_lead_only_lets_the_lead_into_each_walled_class_and_refuses_a_worker(box, tmp_path, kind):
+    """The kinds a walled class takes in: lead-only is then the only rule that decides, and it decides on the role."""
+    from ws import msg
+    from ws.output import WsError
+
+    pol, r = _three(tmp_path)
     shared = tmp_path / "shared"
-    for target in (in_a, in_b):
-        assert msg.scratch_delivery(shared, pol, lead, target, "note", "from the lead")["id"]
-    for sender, target in ((in_a, in_b), (in_b, in_a), (session.Record("w1", "t", cwd=str(home)), in_a)):
+    for target in (r["a"], r["b"]):
+        assert msg.scratch_delivery(
+            shared, pol, r["lead"], target, kind, "from the lead" if kind != "stop-and-hand-over" else None
+        )["id"]
         with pytest.raises(WsError) as e:
-            msg.scratch_delivery(shared, pol, sender, target, "ack" if sender.cwd != str(home) else "note", None)
+            msg.scratch_delivery(shared, pol, r["worker"], target, kind, "x" if kind != "stop-and-hand-over" else None)
+        assert e.value.kind == "refused" and "from the lead only" in e.value.message
+
+
+def test_the_persons_own_send_stays_out_of_a_lead_only_walled_class(box, tmp_path):
+    """The person reaches a walled class through its own sessions, not `ws msg` (lead ruling, 21 Nov)."""
+    from ws import msg
+    from ws.output import WsError
+
+    pol, r = _three(tmp_path)
+    with pytest.raises(WsError) as e:
+        msg.scratch_delivery(tmp_path / "shared", pol, r["person"], r["a"], "note", "from the person")
+    assert e.value.kind == "refused" and "not the person's own send" in e.value.message
+
+
+@pytest.mark.parametrize("kind", ["note", "ask", "stop-and-hand-over", "ack", "done", "counts"])
+def test_no_kind_goes_from_one_walled_class_to_the_other(box, tmp_path, kind):
+    from ws import msg
+    from ws.output import WsError
+
+    pol, r = _three(tmp_path)
+    for sender, target in ((r["a"], r["b"]), (r["b"], r["a"])):
+        with pytest.raises(WsError) as e:
+            msg.scratch_delivery(tmp_path / "shared", pol, sender, target, kind, None)
         assert e.value.kind == "refused"

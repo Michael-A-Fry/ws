@@ -1490,6 +1490,7 @@ def test_a_message_from_a_session_not_on_the_allowlist_is_refused_and_logged(wor
     world.policy(text.replace('inbound = "allowlist"\ninbound_allow = ["work1"]', 'inbound = "off"', 1))
     world.refused("lead1", "wall1")
     assert log_rows(world)[-1] == ("lead1", "secret", "note", "refused", "refused")
+    assert world.count() == 1  # still only the lead's note from lead-only
 
 
 def test_a_message_from_an_allowed_session_is_delivered_and_logged(world):

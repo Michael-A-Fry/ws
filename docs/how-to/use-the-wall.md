@@ -163,10 +163,11 @@ a shell command can still read anywhere.
 
 ## What else the wall settings do
 
-- Bypass mode is off in the settings ws passes to Claude Code and in the ones `ws install` merges into your own file:
-  `permissions.disableBypassPermissionsMode` is `"disable"`, so `--dangerously-skip-permissions` is refused while a
-  gated session runs. If your own file sets that key to anything else, `ws install` refuses and changes nothing; change
-  your value to match.
+- Bypass mode is off in the settings ws passes to Claude Code (`ws gate launch`, `ws gate generate`, headless jobs)
+  and in a class's managed file: `permissions.disableBypassPermissionsMode` is `"disable"`, so
+  `--dangerously-skip-permissions` is refused while a gated session runs. `ws install` and an upgrade never write that
+  key into your own `settings.json`: your bypass setting stays as you have it, and `ws install` prints one line saying
+  so. An earlier release (0.1.11) did write it; the next `ws install` takes that entry out again.
 - File reads stay in the working folders. `permissions.blockReadsOutsideWorkingDirectories` is `true` in the settings ws
   passes to Claude Code (`ws gate launch`, `ws gate generate` and headless `ws run` jobs) and in a class's
   launch file, so Claude's Read, Grep and Glob tools refuse a path outside the folders the session works in,

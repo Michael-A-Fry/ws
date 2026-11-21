@@ -62,6 +62,13 @@ body of the GitHub release.
 
 ### Fixed
 
+- `ws install` and an upgrade no longer write `permissions.disableBypassPermissionsMode` into your own Claude Code
+  `settings.json`: your bypass setting stays as you have it, and `ws install` prints a line saying so. The entry release
+  0.1.11 wrote there comes out on the next `ws install`. The settings `ws gate launch` passes and a class's managed
+  file still hold bypass off.
+- The pre-push hook refuses a push that carries an unsigned commit (`git log --format='%G?'` shows `N`), before the
+  tests run, warns on a signature git can't check, and refuses a bad or revoked one or a push whose commits git can't
+  list. It does nothing when `CI` is set (one line goes in the skip log).
 - The gate: ssh options that run or load local files are now judged (an `-o` keyword ws doesn't know runs nothing
   here is refused, and so are `-F`, `-I`, `-E` and an askpass program), through any wrapper (`sudo`, `timeout`,
   `command`, a full path). Plain options (`-p`, `-l`, `-J`, `-o Port=...`) run as before.

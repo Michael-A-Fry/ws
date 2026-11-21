@@ -153,19 +153,17 @@ def test_the_hook_pins_and_the_block_use_the_same_protected_folders(box, capsys)
 # --- bypass off: one value, in the launch settings, the user's file and the doctor rows ------------------------------
 
 
-def test_bypass_off_is_in_user_and_launch_settings_and_comes_out_on_withdraw(box, capsys):
+def test_bypass_off_is_in_the_launch_settings_but_never_written_to_a_persons_own_file(box, capsys):
     assert wallsettings.BYPASS_KEY == "disableBypassPermissionsMode" and wallsettings.BYPASS_OFF == "disable"
     conf = generated(policy.default_policy())  # what ws gate generate writes: the launch settings are made from it
     assert conf["permissions"][wallsettings.BYPASS_KEY] == "disable"
-    shared = claude_code.generate(policy.default_policy(), ["ws"], Path("out"), Path("p"), user_scope=True)
-    assert json.loads(shared["settings.json"])["permissions"][wallsettings.BYPASS_KEY] == "disable"
     launch = json.loads(claude_code.for_project(json.dumps(conf), "/work/app"))
     assert launch["permissions"][wallsettings.BYPASS_KEY] == "disable"
     f = box / ".claude" / "settings.json"
     f.parent.mkdir()
     f.write_text(json.dumps({"permissions": {"deny": ["Bash(curl:*)"]}}))
     assert install(capsys, box) == 0
-    assert settings(box)["permissions"][wallsettings.BYPASS_KEY] == "disable"
+    assert wallsettings.BYPASS_KEY not in settings(box)["permissions"]  # no key before, none after
     after = f.read_bytes()
     assert install(capsys, box) == 0 and f.read_bytes() == after  # a second run changes nothing
     assert cli.main(["uninstall", "--yes"]) in (0, 1)
@@ -174,22 +172,42 @@ def test_bypass_off_is_in_user_and_launch_settings_and_comes_out_on_withdraw(box
     assert wallsettings.BYPASS_KEY not in left["permissions"] and left["permissions"]["deny"] == ["Bash(curl:*)"]
 
 
-def test_a_persons_other_bypass_value_is_a_conflict_and_their_own_disable_stays_theirs(box, capsys):
+@pytest.mark.parametrize("value", ["disable", "off", "enable"])
+def test_an_upgrade_leaves_a_persons_own_bypass_value_as_it_was(box, capsys, value):
     f = box / ".claude" / "settings.json"
     f.parent.mkdir()
-    f.write_text(json.dumps({"permissions": {wallsettings.BYPASS_KEY: "off"}}))
-    before = f.read_bytes()
-    code = cli.main(["install", "--yes", "--json", "--runner", "claude-code", "--notes", str(box / "Notes")])
-    out = json.loads(capsys.readouterr().out)
-    assert code == 1 and out["error_kind"] == "sandbox_conflict" and wallsettings.BYPASS_KEY in out["message"]
-    assert f"`permissions.{wallsettings.BYPASS_KEY}`" in out["hint"] and str(f) in out["hint"]  # the key and the file
-    assert '"disable"' in out["hint"] and "`ws install`" in out["hint"]  # the value to set and the command to run
-    assert f.read_bytes() == before
-    f.write_text(json.dumps({"permissions": {wallsettings.BYPASS_KEY: "disable"}}))
+    f.write_text(json.dumps({"permissions": {wallsettings.BYPASS_KEY: value}}))
+    assert install(capsys, box) == 0  # no sandbox_conflict: the key is not ws's to set
+    assert settings(box)["permissions"][wallsettings.BYPASS_KEY] == value
     assert install(capsys, box) == 0
     assert cli.main(["uninstall", "--yes"]) in (0, 1)
     capsys.readouterr()
-    assert json.loads(f.read_text())["permissions"] == {wallsettings.BYPASS_KEY: "disable"}  # theirs, so it stays
+    assert json.loads(f.read_text())["permissions"] == {wallsettings.BYPASS_KEY: value}
+
+
+def test_an_upgrade_takes_out_the_bypass_entry_an_earlier_ws_wrote_and_says_it_left_bypass_alone(box, capsys):
+    f = box / ".claude" / "settings.json"
+    f.parent.mkdir()
+    f.write_text(json.dumps({"permissions": {"deny": ["Bash(curl:*)"]}}))
+    assert install(capsys, box) == 0
+    # what ws 0.1.11 left: its own record, and the key it had written
+    path = box / ".ws" / "install-manifest.json"
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    op = {"op": "set", "path": ["permissions", wallsettings.BYPASS_KEY], "value": "disable"}
+    for e in doc["entries"]:
+        if e.get("kind") == "merge":
+            e["added"].append(op)
+            e["wanted_ops"].append(op)
+            e["wanted"] = userconfig.wanted(e["wanted_ops"])
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    conf = settings(box)
+    conf["permissions"][wallsettings.BYPASS_KEY] = "disable"
+    f.write_text(json.dumps(conf))
+    code = cli.main(["install", "--yes", "--runner", "claude-code", "--notes", str(box / "Notes")])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert wallsettings.BYPASS_KEY not in settings(box)["permissions"]
+    assert f"left `permissions.{wallsettings.BYPASS_KEY}` as it was" in out
 
 
 # --- the read block stays out of a person's own file; the default domains are appended and taken out again -----------------

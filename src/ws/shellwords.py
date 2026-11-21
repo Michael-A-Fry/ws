@@ -178,8 +178,10 @@ class Lexed(NamedTuple):
     pieces: list[str]
 
 
-# NAME=value, NAME+=value and NAME[KEY]=value (or +=): bash reads each as a setting ahead of a command
-ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?\+?=")
+# NAME=value and NAME+=value. A word that starts NAME[ is an array setting, which the reader does not follow:
+# policy refuses it as a command word (`ARRAY_WORD`) instead of matching its brackets
+ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\+?=")
+ARRAY_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\[")
 
 
 def assign_name(word: str) -> str:
@@ -188,10 +190,10 @@ def assign_name(word: str) -> str:
     return m.group(0) if m else word.split("=", 1)[0]
 
 
-def _env_setting(t: str) -> bool:
-    """A word `env` or `sudo` takes as a variable setting: any `X=Y` with the `=` past its first character, whatever
-    the name holds (GNU env sets `a.b=1` and `a-b=1` too)."""
-    return "=" in t[1:]
+def _env_setting(t: str, prog: str) -> bool:
+    """A word `env` or `sudo` takes as a variable setting. For env, any word with an `=` in it, whatever the name
+    holds or if it is empty (GNU env sets `a.b=1`, `a-b=1` and `=1` too); for sudo, an `=` past the first character."""
+    return "=" in (t if prog == "env" else t[1:])
 
 
 # --- text: line continuations, here-documents, segments --------------------------------------------------------------
@@ -906,21 +908,23 @@ def strip_wrappers(
             elif t.startswith("-") and len(t) > 1:
                 exec_form = exec_form or (w == "watch" and "x" in t[1:])
                 i += 2 if "-" + t[-1] in arg_opts else 1  # `-u root`, and the `u` of `-iu root`
-            elif w in ("env", "sudo") and _env_setting(t):
+            elif w in ("env", "sudo") and _env_setting(t, w):
                 if env is not None:
                     env.append(t)
                 i += 1
             else:
                 break
         if w in ("env", "sudo") and not resplit:  # after `--` too: env still reads X=Y as a setting
-            while i < len(toks) and _env_setting(toks[i]):
+            while i < len(toks) and _env_setting(toks[i], w):
                 if env is not None:
                     env.append(toks[i])
                 i += 1
         if i < len(toks):
             i += _POSITIONAL.get(w, 0)
         if dropped is not None:
-            dropped += [t for t in toks[1:i] if not t.startswith("-") and not ASSIGN.match(t) and not _env_setting(t)]
+            dropped += [
+                t for t in toks[1:i] if not t.startswith("-") and not ASSIGN.match(t) and not _env_setting(t, w)
+            ]
         if resplit and scripts is not None:
             scripts.append(resplit)
         if w == "watch" and not exec_form and i < len(toks):  # watch gives its words to `sh -c` joined
@@ -928,7 +932,8 @@ def strip_wrappers(
                 scripts.append(" ".join(toks[i:]))
             toks = []
             break
-        toks = (words_of(resplit, lexenv, budget) if resplit else []) + toks[i:]
+        # the words of an `env -S` string are env's own arguments: its options and settings come first
+        toks = (["env", *words_of(resplit, lexenv, budget)] if resplit else []) + toks[i:]
     return toks, seen
 
 

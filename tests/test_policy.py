@@ -2530,5 +2530,22 @@ def test_a_subscript_or_any_env_setting_ahead_of_a_command_is_an_assignment(pol,
 
 def test_assign_name_takes_off_a_subscript():
     assert shellwords.assign_name("A[0]+=1") == "A" == shellwords.assign_name("A[k=v]=1")
-    assert policy.is_denied_command(policy.default_policy(), "A[0]=1 git status") is None
+    assert policy.is_denied_command(policy.default_policy(), "A[0]=1 git status")  # fail closed
     assert policy.is_denied_command(policy.default_policy(), "env a.b=1 git status") is None
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "A[x y]=1 git status",  # a word that starts like an array setting is refused, however its brackets close
+        "env -S 'a.b=1 git push --force origin main'",  # env's own rules apply to the words of an -S string
+        "env =1 git push --force origin main",  # env takes a word that starts with = as a setting
+    ],
+)
+def test_round_three_settings_ahead_of_a_command_are_judged(pol, home, cmd):
+    assert policy.is_denied_command(pol, cmd)
+
+
+def test_round_three_ordinary_forms_still_run(pol, home):
+    for cmd in ("env -S 'LC_ALL=C git status'", "env =1 git status", "arr[1]=x; echo done"):
+        assert policy.is_denied_command(pol, cmd) is None, cmd

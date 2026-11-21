@@ -2369,6 +2369,10 @@ def _segment_once(
         cands.append(line)
     cmd = canon[0] if canon else ""
     flags, operands = shellwords.split_args(canon)
+    if toks and shellwords.ARRAY_WORD.match(toks[0]) and (len(toks) > 1 or "=" not in toks[0]):
+        # an array setting ahead of a command (or a word that starts like one): fail closed
+        why = f"the command starts with {toks[0]!r}, an array setting ws does not read; set the array on its own line first"
+        return why, line, []
 
     if cmd in ("popd", "dirs") or (cmd == "pushd" and (flags or not operands or _STACK_ARG.fullmatch(operands[0]))):
         # the directory stack is not followed, so where these leave the shell is not known

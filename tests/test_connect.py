@@ -34,7 +34,9 @@ class FakeTelegram:
         self.calls: list[str] = []
 
     def press_start(self, nonce: str, chat_id: int = 99) -> None:
-        self.updates.append({"update_id": len(self.updates) + 1, "message": {"text": f"/start {nonce}", "chat": {"id": chat_id}}})
+        self.updates.append(
+            {"update_id": len(self.updates) + 1, "message": {"text": f"/start {nonce}", "chat": {"id": chat_id}}}
+        )
 
     def get(self, url: str):
         self.calls.append(url.split("/", 3)[2])  # the host only: never log the url
@@ -156,7 +158,11 @@ def test_a_failed_verify_stores_nothing(env):
         engine.walk(c, FLOW)
     assert e.value.kind == "verify_failed"
     assert "TELEGRAM_BOT_TOKEN" not in store.names()
-    st = json.loads((tmp / "state" / "connect" / "telegram.json").read_text()) if (tmp / "state" / "connect" / "telegram.json").exists() else {}
+    st = (
+        json.loads((tmp / "state" / "connect" / "telegram.json").read_text())
+        if (tmp / "state" / "connect" / "telegram.json").exists()
+        else {}
+    )
     assert "token" not in st.get("steps", {})
     assert make_token("c") not in str(e.value) + e.value.hint + everything(tmp, io)
 
@@ -225,7 +231,9 @@ def test_an_expired_link_gets_a_new_nonce_on_the_next_walk(env):
     first = engine.load_state(c, FLOW)["nonce"]["value"]
     io2 = Script("")
     api.press_start("anything-else")  # a stale or wrong nonce binds nothing
-    io2.pause = lambda text: (api.press_start(engine.load_state(c, FLOW)["nonce"]["value"]) or "") if text.startswith("Not seen") else ""  # type: ignore[method-assign]
+    io2.pause = lambda text: (
+        (api.press_start(engine.load_state(c, FLOW)["nonce"]["value"]) or "") if text.startswith("Not seen") else ""
+    )  # type: ignore[method-assign]
     res = engine.walk(ctx_for(env, api, io2, clock=clock), FLOW)
     assert res["status"] == "done"
     assert any("Open: https://t.me/demo_bot?start=" in s for s in io2.said)
@@ -279,7 +287,11 @@ def test_dry_run_lists_needs_human_steps_then_done(env):
     assert [s["id"] for s in before["steps"]][:3] == ["make-bot", "open-botfather", "token"]
     assert all(s["status"] == "needs_human" for s in before["steps"])
     actions = {s["id"]: s["action"] for s in before["steps"]}
-    assert actions["token"] == "paste_secret" and actions["open-botfather"] == "open_link" and actions["make-bot"] == "read"
+    assert (
+        actions["token"] == "paste_secret"
+        and actions["open-botfather"] == "open_link"
+        and actions["make-bot"] == "read"
+    )
     bind = next(s for s in before["steps"] if s["id"] == "bind-link")
     assert bind["url_template"].endswith("?start={nonce}") and bind["expires_in_s"] == 600
     assert not (tmp / "state").exists()  # reading wrote nothing
@@ -315,7 +327,9 @@ def test_no_output_ever_holds_the_secret(env, capsys):
     token = make_token("m")
     api = FakeTelegram(token)
     c, io, _ = walk_all(env, api, token)
-    blob = json.dumps(engine.dry_run(c, FLOW)) + json.dumps(engine.diagnose(c, FLOW)) + json.dumps(engine.revoke(c, FLOW))
+    blob = (
+        json.dumps(engine.dry_run(c, FLOW)) + json.dumps(engine.diagnose(c, FLOW)) + json.dumps(engine.revoke(c, FLOW))
+    )
     assert token not in blob
     assert token not in everything(tmp, io)
     assert token not in capsys.readouterr().out
@@ -386,7 +400,9 @@ def _mut(fn):
 
 
 BAD = {
-    "a secret sent to a host the flow did not name": lambda r: r["steps"][3]["request"].update(url="https://evil.example/bot{secret}/getMe"),
+    "a secret sent to a host the flow did not name": lambda r: r["steps"][3]["request"].update(
+        url="https://evil.example/bot{secret}/getMe"
+    ),
     "http, not https": lambda r: r["steps"][1].update(url="http://t.me/BotFather"),
     "an unknown step type": lambda r: r["steps"][0].update(type="device"),
     "a secret capture with no verify after it": lambda r: r["steps"].__delitem__(slice(3, None)),
@@ -408,7 +424,9 @@ def test_a_bad_flow_is_refused_by_the_loader(why):
         spec.parse(raw)
 
 
-@pytest.mark.parametrize("why", ["http, not https", "an unknown step type", "an unknown key", "a reserved id", "a nonce link with no expiry"])
+@pytest.mark.parametrize(
+    "why", ["http, not https", "an unknown step type", "an unknown key", "a reserved id", "a nonce link with no expiry"]
+)
 def test_the_json_schema_refuses_what_it_can_say(why):
     errs = list(Draft202012Validator(SCHEMA).iter_errors(_mut(BAD[why])))
     assert errs, why

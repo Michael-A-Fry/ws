@@ -120,8 +120,11 @@ def load_state(ctx: Context, flow: Flow) -> dict:
     except FileNotFoundError:
         d = None
     except (OSError, ValueError) as e:
-        raise ConnectError("state", f"the state of {flow.id} cannot be read ({type(e).__name__})",
-                           f"`ws connect {flow.id} --revoke` clears it") from None
+        raise ConnectError(
+            "state",
+            f"the state of {flow.id} cannot be read ({type(e).__name__})",
+            f"`ws connect {flow.id} --revoke` clears it",
+        ) from None
     if not isinstance(d, dict) or d.get("schema") != STATE_SCHEMA or d.get("flow") != flow.id:
         d = {"schema": STATE_SCHEMA, "flow": flow.id, "status": "pending", "steps": {}, "config": {}, "nonce": None}
     d.setdefault("steps", {})
@@ -194,7 +197,11 @@ def _step_done(flow: Flow, st: dict, i: int, now: float) -> bool:
     if s["type"] == "link" and s.get("nonce") and not _nonce_live(st, now):
         # an expired nonce only matters while the verify that uses it is still to do
         for later in flow.steps[i + 1 :]:
-            if later["type"] == "verify" and "find" in later and st["steps"].get(later["id"], {}).get("status") != "done":
+            if (
+                later["type"] == "verify"
+                and "find" in later
+                and st["steps"].get(later["id"], {}).get("status") != "done"
+            ):
                 return False
     return True
 
@@ -245,7 +252,9 @@ def dry_run(ctx: Context, flow: Flow) -> dict:
                 if _nonce_live(st, now):
                     row["expires_at"] = _iso(float(st["nonce"]["expires_ts"]))
         if s["type"] == "capture":
-            row["fields"] = [{"name": f["name"], "label": f["label"], "secret": bool(f.get("secret"))} for f in s["fields"]]
+            row["fields"] = [
+                {"name": f["name"], "label": f["label"], "secret": bool(f.get("secret"))} for f in s["fields"]
+            ]
         steps.append(row)
     done_all = all(r["status"] == "done" for r in steps) and not blockers
     nxt = next((r["id"] for r in steps if r["status"] != "done"), None)
@@ -335,8 +344,11 @@ def _read_secret(ctx: Context, flow: Flow) -> str:
     try:
         return ctx.store.read(flow.secret_name)
     except (OSError, SecretsError) as e:  # neither carries a value
-        raise ConnectError("secret_missing", f"{flow.secret_name} is not in the secrets store",
-                           f"walk the capture step again: `ws connect {flow.id} --revoke`, then `ws connect {flow.id}`") from e
+        raise ConnectError(
+            "secret_missing",
+            f"{flow.secret_name} is not in the secrets store",
+            f"walk the capture step again: `ws connect {flow.id} --revoke`, then `ws connect {flow.id}`",
+        ) from e
 
 
 def walk(ctx: Context, flow: Flow) -> dict:
@@ -345,8 +357,11 @@ def walk(ctx: Context, flow: Flow) -> dict:
     io = ctx.io
     assert io is not None
     if not _registered(ctx, flow):
-        raise ConnectError("not_registered", f"{flow.secret_name} is not in the secrets registry",
-                           registry_step(ctx, flow) + "\nthen run this again (ws never edits the registry for you)")
+        raise ConnectError(
+            "not_registered",
+            f"{flow.secret_name} is not in the secrets registry",
+            registry_step(ctx, flow) + "\nthen run this again (ws never edits the registry for you)",
+        )
     st = load_state(ctx, flow)
     io.say(flow.title)
     i = 0
@@ -434,7 +449,9 @@ def _verify_find(ctx: Context, flow: Flow, st: dict, s: dict) -> None:
             io.say(f"  {s.get('title', s['id'])}: done")
             return
         if not _nonce_live(st, ctx.now()):
-            raise ConnectError("expired", "the link ran out before it was used", f"run `ws connect {flow.id}` again for a new one")
+            raise ConnectError(
+                "expired", "the link ran out before it was used", f"run `ws connect {flow.id}` again for a new one"
+            )
         if io.pause("Not seen yet. Press Enter to check again, or q then Enter to stop").strip().lower() == "q":
             return
 

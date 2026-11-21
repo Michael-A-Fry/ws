@@ -129,8 +129,11 @@ def parse(raw: dict, path: Path | None = None) -> Flow:
                 _need(f in known, where, f"{{{f}}} is not known here (known: {', '.join(sorted(known))})")
             if s.get("nonce"):
                 e = s.get("expires_s")
-                _need(isinstance(e, int) and not isinstance(e, bool) and NONCE_MIN_S <= e <= NONCE_MAX_S, where,
-                      f"a nonce link needs expires_s between {NONCE_MIN_S} and {NONCE_MAX_S}")
+                _need(
+                    isinstance(e, int) and not isinstance(e, bool) and NONCE_MIN_S <= e <= NONCE_MAX_S,
+                    where,
+                    f"a nonce link needs expires_s between {NONCE_MIN_S} and {NONCE_MAX_S}",
+                )
                 _need("{nonce}" in url, where, "a nonce link carries {nonce} in its url")
             else:
                 _need("expires_s" not in s and "{nonce}" not in url, where, "expires_s and {nonce} need nonce = true")
@@ -143,7 +146,9 @@ def parse(raw: dict, path: Path | None = None) -> Flow:
                 _need(isinstance(f, dict), where, "a field must be a table")
                 _only(f, {"name", "label", "secret", "pattern"}, where)
                 fname = _text(f, "name", where) or ""
-                _need(bool(re.match(r"^[a-z][a-z0-9_]{0,31}$", fname)), where, f"field name {fname!r} is not snake_case")
+                _need(
+                    bool(re.match(r"^[a-z][a-z0-9_]{0,31}$", fname)), where, f"field name {fname!r} is not snake_case"
+                )
                 _need(fname not in {"identity", "secret", "nonce"}, where, f"field name {fname!r} is reserved")
                 _text(f, "label", where)
                 pat = f.get("pattern")
@@ -186,16 +191,25 @@ def parse(raw: dict, path: Path | None = None) -> Flow:
                 _only(f, {"list", "where", "take"}, f"{where} find")
                 _text(f, "list", f"{where} find")
                 w, t = f.get("where"), f.get("take")
-                _need(isinstance(w, dict) and bool(w) and all(isinstance(v, str) for v in w.values()), where,
-                      "find.where maps a path to the text it must equal")
-                _need(isinstance(t, dict) and bool(t) and all(isinstance(v, str) for v in t.values()), where,
-                      "find.take maps a name to the path to keep")
+                _need(
+                    isinstance(w, dict) and bool(w) and all(isinstance(v, str) for v in w.values()),
+                    where,
+                    "find.where maps a path to the text it must equal",
+                )
+                _need(
+                    isinstance(t, dict) and bool(t) and all(isinstance(v, str) for v in t.values()),
+                    where,
+                    "find.take maps a name to the path to keep",
+                )
                 for v in w.values():
                     for ff in _fields(v):
                         _need(ff in known, where, f"{{{ff}}} is not known here")
                 for k in t:
-                    _need(bool(re.match(r"^[a-z][a-z0-9_]{0,31}$", k)) and k not in {"identity", "secret", "nonce"}, where,
-                          f"take name {k!r} is not allowed")
+                    _need(
+                        bool(re.match(r"^[a-z][a-z0-9_]{0,31}$", k)) and k not in {"identity", "secret", "nonce"},
+                        where,
+                        f"take name {k!r} is not allowed",
+                    )
                 known.update(t)
             for ff in fl:
                 _need(ff == "secret" or ff in known, where, f"{{{ff}}} is not known here")

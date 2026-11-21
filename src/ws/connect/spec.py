@@ -1,6 +1,6 @@
 """Load and check a connect flow file: the closed set of step types, with every rule that can be checked before a step runs.
 
-A flow is TOML (`flows/<id>.toml`, schema `ws.connect-flow/1`; docs/reference/connect-flow.schema.json says the same in
+A flow is TOML text (`flows/<id>.py` holds it in `TOML`; outside the package it is `<id>.toml`; schema `ws.connect-flow/1`; docs/reference/connect-flow.schema.json says the same in
 JSON Schema). `load` raises `FlowError` for the first fault, with the file and the step named, never a value. What it
 promises: every URL is https; a `{secret}` is only ever sent to a host the flow's `[secret]` block names; a secret
 capture is followed at once by the verify that proves it (so nothing is kept until a real call passes); every
@@ -9,6 +9,8 @@ capture is followed at once by the verify that proves it (so nothing is kept unt
 
 from __future__ import annotations
 
+import importlib
+import os
 import re
 import string
 import tomllib
@@ -243,26 +245,56 @@ def parse(raw: dict, path: Path | None = None) -> Flow:
 
 def load_file(path: Path) -> Flow:
     try:
-        raw = tomllib.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
         raise FlowError(f"{path.name}: cannot be read ({type(e).__name__})") from e
+    return _from_text(text, path)
+
+
+def _from_text(text: str, path: Path | None) -> Flow:
+    try:
+        raw = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as e:
+        raise FlowError(f"{path.name if path else 'flow'}: not valid TOML ({e})") from e
     return parse(raw, path)
 
 
+def shipped_text(name: str) -> str:
+    """The TOML text of a flow that ships in the package (`telegram`, or `_template`). FlowError when there is none."""
+    mod = name.replace("-", "_")
+    if not re.match(r"^_?[a-z][a-z0-9_]*$", mod):
+        raise FlowError(f"{name!r} is not a flow id")
+    try:
+        return importlib.import_module(f"ws.connect.flows.{mod}").TOML
+    except (ImportError, AttributeError) as e:
+        raise FlowError(f"no flow named {name!r}") from e
+
+
 def load(flow_id: str, folder: Path | None = None) -> Flow:
-    """The flow with this id. FlowError when there is none or the file is not valid."""
+    """The flow with this id: from the package, or from `<folder>/<id>.toml` when a folder is given. FlowError when
+    there is none or it is not valid."""
     if not ID_RE.match(flow_id or "") or flow_id in RESERVED_IDS:
         raise FlowError(f"{flow_id!r} is not a flow id")
-    f = (folder or flows_dir()) / f"{flow_id}.toml"
-    if not f.is_file():
-        raise FlowError(f"no flow named {flow_id!r}")
-    return load_file(f)
+    if folder is not None:
+        f = folder / f"{flow_id}.toml"
+        if not f.is_file():
+            raise FlowError(f"no flow named {flow_id!r}")
+        return load_file(f)
+    flow = _from_text(shipped_text(flow_id), None)
+    if flow.id != flow_id:
+        raise FlowError(f"the flow {flow_id!r} holds the id {flow.id!r}")
+    return flow
 
 
 def ids(folder: Path | None = None) -> list[str]:
-    """The ids of the flows in the folder, `_template` and any `_` file left out."""
-    d = folder or flows_dir()
+    """The ids of the flows, `_template` and any `_` file left out: the package's, or those of a folder of `.toml`."""
+    if folder is not None:
+        try:
+            return sorted(p.stem for p in folder.glob("*.toml") if not p.name.startswith("_"))
+        except OSError:
+            return []
     try:
-        return sorted(p.stem for p in d.glob("*.toml") if not p.name.startswith("_"))
+        names = [e.name[:-3] for e in os.scandir(flows_dir()) if e.name.endswith(".py") and not e.name.startswith("_")]
     except OSError:
         return []
+    return sorted(n.replace("_", "-") for n in names)

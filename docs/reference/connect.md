@@ -10,7 +10,9 @@ and a third party can't add one. It isn't a stable extension point before 1.0.
 
 ## The file
 
-`src/ws/connect/flows/<id>.toml`, named for its `id`. `_template.toml` is the starting point and isn't listed.
+TOML text held in `src/ws/connect/flows/<id>.py` as `TOML = """..."""`, named for its `id` (`telegram.py` holds the
+flow `telegram`; a `-` in an id is `_` in the file name). `_template.py` is the starting point and isn't listed. It's
+Python because the secret wall copies only `.py` files. The same text in a `<id>.toml` outside the package loads too.
 
 | Key | Meaning |
 |---|---|

@@ -20,8 +20,9 @@ end up in a chat or a log. How do these steps stay the same everywhere, and give
 
 ## Decision Outcome
 
-Chosen option: the declarative file and one engine. A flow is `src/ws/connect/flows/<id>.toml` (schema
-`ws.connect-flow/1`, JSON Schema in docs/reference/connect-flow.schema.json) and `ws connect` is the command.
+Chosen option: the declarative file and one engine. A flow is TOML text, held as a string in
+`src/ws/connect/flows/<id>.py` (schema `ws.connect-flow/1`, JSON Schema in docs/reference/connect-flow.schema.json) and
+`ws connect` is the command.
 This is a format, not a plug-in framework: the step types are a closed set, flows are found only in that folder, and a
 third party can't add one. It's not a stable extension point before 1.0, and the core stays standard-library only
 ([0018](0018-core-is-standard-library-only.md)).
@@ -67,8 +68,8 @@ no token is pasted, is the upgrade path for the Telegram flow once ws can hold a
 - Good: a new integration is one file and the same steps each time; an agent builds against one contract.
 - Good: a secret has one path in (the person's terminal, to the store) and no copy in state, logs or JSON.
 - Bad: a flow that needs code (a callback, a device poll) waits for the engine to grow those step types.
-- Bad: the flows are TOML files inside the package, not Python strings; `ws secret wall` copies only `.py` files, and
-  the broker never reads a flow, so nothing there depends on them.
+- Bad: a shipped flow is TOML text inside a Python string, because the secret wall copies only `.py` files and its
+  tree check refuses any other file in the package. A flow outside the package is a plain `.toml` file.
 
 ### Confirmation
 

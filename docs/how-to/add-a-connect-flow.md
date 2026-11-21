@@ -6,7 +6,9 @@ them the same way each time. The format is in [Connect flows](../reference/conne
 
 ## Steps
 
-1. Copy `src/ws/connect/flows/_template.toml` to `src/ws/connect/flows/<id>.toml`. The file is named for the `id`.
+1. Copy `src/ws/connect/flows/_template.py` to `src/ws/connect/flows/<id>.py` (a `-` in the id is `_` in the file
+   name). The TOML sits in `TOML = """..."""`: ws ships flows as Python because the secret wall copies only `.py`
+   files.
 2. Write the steps in the order a person does them, using only `info`, `link`, `capture` and `verify`.
    - Say what to do in one or two plain sentences (`info`), then give the page as a `link`.
    - Ask for a secret with `capture` and `secret = true`, with a `pattern` so a wrong paste is caught before any call.

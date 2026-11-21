@@ -1,3 +1,6 @@
+"""The Telegram flow, as a TOML string (a flow ships as Python data because `ws secret wall` copies only `.py` files)."""
+
+TOML = """\
 # Connect a Telegram bot: make it in BotFather, paste its token (stored, never shown), prove the token works, then bind
 # one chat to it with a one-time link. Managed Bots (no paste) is the upgrade path: docs/decisions/0033.
 schema = "ws.connect-flow/1"
@@ -64,3 +67,4 @@ take = { chat_id = "message.chat.id" }
 [steps.revoke]
 action = "tell"
 text = "In Telegram, open BotFather and send /revoke to make the old token useless (ws deleted its copy). Then delete the bot with /deleteBot if you no longer want it."
+"""

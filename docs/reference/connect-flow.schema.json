@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/Michael-A-Fry/ws/blob/main/docs/reference/connect-flow.schema.json",
   "title": "ws.connect-flow/1",
-  "description": "A connect flow file (src/ws/connect/flows/<id>.toml, read as JSON here). The checks a schema cannot say (every {placeholder} is known, {secret} goes only to a host in [secret].hosts, a secret capture is followed by its verify) are in ws.connect.spec and tested there.",
+  "description": "A connect flow (TOML text in src/ws/connect/flows/<id>.py, or a <id>.toml outside the package; read as JSON here). The checks a schema cannot say (every {placeholder} is known, {secret} goes only to a host in [secret].hosts, a secret capture is followed by its verify) are in ws.connect.spec and tested there.",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema", "id", "title", "unique_key", "steps"],

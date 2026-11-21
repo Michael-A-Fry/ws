@@ -1,4 +1,8 @@
-# Template for a connect flow. Copy it to <id>.toml (the file is named for the id), change every value, then run
+"""The template for a new flow, as a TOML string (a flow ships as Python data because `ws secret wall` copies only `.py` files)."""
+
+TOML = """\
+# Template for a connect flow. Copy this file to <id>.py (shipped flows are Python data, TOML in a string), or the text
+# to <id>.toml for a flow outside the package. Change every value, then run
 #   ws connect <id> --dry-run --json
 # The steps are a closed set: info, link, capture, verify. docs/how-to/add-a-connect-flow.md has the rules.
 schema = "ws.connect-flow/1"
@@ -46,3 +50,4 @@ url = "https://api.example.com/v1/me?token={secret}"
 [steps.revoke]
 action = "tell"
 text = "Say how to make the token useless on the service's side."
+"""

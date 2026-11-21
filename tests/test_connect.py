@@ -398,13 +398,13 @@ def test_mutation_guard_the_search_would_catch_a_secret_in_state(env):
 
 
 def _raw(name: str) -> dict:
-    return tomllib.loads((spec.flows_dir() / name).read_text())
+    return tomllib.loads(spec.shipped_text(name.removesuffix(".toml")))
 
 
 @pytest.mark.parametrize("name", ["telegram.toml", "_template.toml"])
 def test_shipped_flows_pass_the_loader_and_the_json_schema(name):
     Draft202012Validator(SCHEMA).validate(_raw(name))
-    spec.load_file(spec.flows_dir() / name)
+    spec._from_text(spec.shipped_text(name.removesuffix(".toml")), None)
 
 
 def test_the_flow_ids_are_the_file_names_and_list_skips_the_template():
@@ -715,3 +715,13 @@ def test_url_transport_returns_an_http_error_status_and_body(monkeypatch):
 
     _stub_opener(monkeypatch, deny)
     assert engine.UrlTransport().get("https://api.example.com/x") == (401, {"ok": False})
+
+
+def test_the_shipped_flows_are_only_python_files_for_the_wall():
+    files = [p for p in spec.flows_dir().rglob("*") if p.is_file() and "__pycache__" not in p.parts]
+    assert files and all(p.suffix == ".py" for p in files), [p.name for p in files if p.suffix != ".py"]
+
+
+def test_a_flow_outside_the_package_loads_from_a_toml_folder(tmp_path):
+    (tmp_path / "mine.toml").write_text(spec.shipped_text("_template").replace('id = "example"', 'id = "mine"'))
+    assert spec.ids(tmp_path) == ["mine"] and spec.load("mine", tmp_path).id == "mine"

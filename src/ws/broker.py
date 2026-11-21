@@ -1291,8 +1291,8 @@ class Broker:
                 raise _HttpError(403, "expired")
             return g
 
-    def credential(self, g: _Grant, path: str = "/") -> tuple[str, str]:
-        """(header name, header value) for a grant, read fresh so a removed or changed secret takes effect at once."""
+    def credential(self, g: _Grant, path: str = "/") -> tuple[str, str, str]:
+        """(header name, header value, base path) for a grant, read fresh so a removed or changed secret takes effect at once."""
         try:
             entry = self.load_registry().get(g.name)
         except wsecrets.RegistryUntrusted as e:
@@ -1303,6 +1303,10 @@ class Broker:
             raise _HttpError(403, "host_not_allowed")
         if not path_allowed(entry.paths, path):  # the registry as it is now: a tightened list bites open leases too
             raise _HttpError(403, "path_not_allowed")
+        if entry.base_path and (not PLAIN_PATH_RE.match(path) or any(p in (".", "..") for p in path.split("/"))):
+            raise _HttpError(
+                403, "path_not_allowed"
+            )  # a prefix is only safe in front of a path with no way back out of it
         if entry.ttl is not None and self.clock() >= g.issued + entry.ttl:
             raise _HttpError(403, "expired")  # a shortened ttl ends open leases at once
         if (g.elevated or entry.elevated) and not self.elevation_on():
@@ -1328,7 +1332,7 @@ class Broker:
             raise _HttpError(503, "unset") from e
         except wsecrets.SecretsError as e:
             raise _HttpError(503, "store_unreadable") from e
-        return entry.header, entry.format.replace("{value}", value)
+        return entry.header, entry.format.replace("{value}", value), entry.base_path
 
 
 def code_problem() -> str:
@@ -1491,8 +1495,8 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             if not m:
                 raise _HttpError(404, "not_found")
             grant = b.grant_for(m.group(1))
-            header, value = b.credential(grant, m.group(2) or "/")
-            target = (m.group(2) or "/") + (f"?{query}" if query else "")
+            header, value, base_path = b.credential(grant, m.group(2) or "/")
+            target = base_path + (m.group(2) or "/") + (f"?{query}" if query else "")
             body = self._read_body()
             self._deadline.cancel()  # the request is in; the reply may take as long as the model does
             headers = self._clean_headers(header)

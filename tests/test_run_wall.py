@@ -316,7 +316,9 @@ def test_an_opencode_job_runs_bare_when_the_policy_has_the_sandbox_off(ws, start
     opencode_job(ws, f'cwd = "{app}"')
     assert cli.main(["run", "oc"]) == 0
     assert started.argv[0] == str(ws.bin / "opencode") and started.pass_fds == ()
-    assert started.env["XDG_DATA_HOME"].startswith(str(ws.home / "runs"))  # still an empty folder of the run, not the real home
+    assert started.env["XDG_DATA_HOME"].startswith(
+        str(ws.home / "runs")
+    )  # still an empty folder of the run, not the real home
 
 
 def test_an_opencode_job_whose_folder_is_the_home_folder_is_refused_as_a_record(ws, started, tmp_path):

@@ -25,6 +25,7 @@ SHIPPED = [
     ("msg", "msg"),
     ("node", "node"),
     ("queue", "queue"),
+    ("sync", "sync"),
     ("upgrade", "upgrade"),
     ("usage", "usage"),
     ("walls", "walls"),

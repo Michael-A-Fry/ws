@@ -9,7 +9,7 @@ dispatch cannot leave the code root.
 What it promises, each pinned by a test:
 
 - Every flag reaches the runner as its own argument. The window runs the runner's argv directly (`tmux new-window ...
-  -- ARGV`, which tmux 3.0 and later executes without a shell), so `--model M` is two items and the prompt is one,
+  -- ARGV`, which tmux 3.0 and later executes without a shell), so `--model=M` is one item and the prompt is another,
   whatever spaces or quotes it holds. A prompt that starts with `-` is refused: the runner would read it as a flag.
 - `--help` prints the help and does nothing else; `--dry-run` prints what it would run and does nothing else.
 - One window, named from `--name` (lower case, spaces to dashes, at most 40 characters; the repo's name when it is not
@@ -17,7 +17,8 @@ What it promises, each pinned by a test:
   session this command runs in (`$TMUX`), or in `--session S`; outside tmux with no `--session` it is refused.
 - The runner is found on `PATH` before anything starts, and a missing one is refused with its name.
 
-Runners: `claude-code` runs `claude [--model M] PROMPT`; `opencode` runs `opencode [--model M] --prompt PROMPT`.
+Runners: `claude-code` runs `claude [--model=M] PROMPT`; `opencode` runs `opencode [--model=M] --prompt PROMPT`.
+The code root's `~` means your home only when it is `~` alone or starts `~/`.
 Every tmux command goes through `ws.term.tmux`'s injectable runner, so tests never touch a real tmux server.
 Exit codes: 0 started (or shown), 1 something to fix (no repo folder, no runner, no tmux, tmux refused), 2 usage.
 """
@@ -63,8 +64,9 @@ def code_root(arg: str | None = None, env: Mapping[str, str] | None = None) -> P
         if found is not None and not isinstance(found, str):
             raise WsError("bad_config", "[dispatch] code_root must be text", "fix the profile", 1)
         value = found or DEFAULT_CODE_ROOT
-    home = str(paths.home_dir(e)) if value.startswith("~") else ""
-    return Path(home + value[1:] if home else value)
+    if value == "~" or value.startswith("~/"):  # only your own home: `~name/` is left as written
+        return Path(str(paths.home_dir(e)) + value[1:])
+    return Path(value)
 
 
 def window_name(name: str | None, repo: str) -> str:
@@ -83,7 +85,7 @@ def runner_argv(runner: str, prompt: str, model: str | None, which=shutil.which,
     found = which(binary, path=path)
     if not found:
         raise WsError("runner_missing", f"{binary} is not on PATH", f"install {runner}, or pick another --runner", 1)
-    argv = [found, *(["--model", model] if model else [])]
+    argv = [found, *([f"--model={model}"] if model else [])]  # one item, so a model that starts with - is no flag
     return [*argv, prompt] if style == "positional" else [*argv, "--prompt", prompt]
 
 

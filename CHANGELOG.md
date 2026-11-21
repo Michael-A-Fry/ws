@@ -10,6 +10,8 @@ body of the GitHub release.
 
 ### Added
 
+- `ws sync`: fetch every git repository under the code root, 4 at a time, each fetch killed (with its helpers)
+  and named past `--timeout-s` (default 120); exit 1 when any failed or timed out.
 - `ws queue report [--weekly] [--weeks N]`: a row a week of gate blocks, slot stalls and hand-offs, with the runs
   that finished and those killed by their own cap.
 - `ws queue slot` gives each session a share of a lane while another session waits (`--session`, else
@@ -36,6 +38,8 @@ body of the GitHub release.
 
 ### Changed
 
+- `ws dispatch` passes the model as one argument, `--model=M`, so a model name that starts with `-` can't become a
+  flag, and its code root expands `~` only for your own home (`~` or `~/...`).
 - A job timer with an API key or a local provider runs `ws queue tick JOB --slot schedule --run` in place of
   `ws run JOB`. The slot is worked out from the job's own schedule, the latest time at or before the fire, so a late
   catch-up fire gets the slot it was for. A job on a subscription login keeps `ws run JOB`, since the queue never runs

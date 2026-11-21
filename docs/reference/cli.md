@@ -1053,10 +1053,12 @@ never fails the upgrade.
 
 After a swap or a rollback whose hooks step and `--check` both passed, ws asks the broker on your own socket
 (`run/broker.sock`) for its version. A broker running other code than the ws now installed, holding no lease, and run
-by your user (the kernel says so, through `SO_PEERCRED`; Linux only) is stopped and a new one started on the new ws.
-With a lease open, or a process ws can't tell is yours, it's left running and ws prints the command that finishes the
-job. A one-shot broker call (an IMAP operation, a token mint, a signature) that's in flight at that moment fails, and
-its caller asks again. An automatic rollback never touches the broker.
+by your user (the kernel says so, through `SO_PEERCRED`, with a pid above 0; Linux only) is stopped through a pidfd
+opened while it was answering, so the signal can't reach a later process given the same pid, and a new one is started
+on the new ws. With a lease open, or a process ws can't tell is yours, it's left running, ws prints the command that
+finishes the job, and the exit is 1; `--json` says what happened under `broker`. A one-shot broker call (an IMAP
+operation, a token mint, a signature) that's in flight at that moment fails, and so does a lease asked for between the
+status reply and the stop; each caller asks again. An automatic rollback never touches the broker.
 
 ## `ws migrate`
 

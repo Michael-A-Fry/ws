@@ -579,6 +579,7 @@ def test_the_step_line_names_the_python_and_version_it_ran_with(old, capsys):
         ("#!/bin/sh\n'''exec' '/a b/env/bin/python3' \"$0\" \"$@\"\n' '''\n", "/a b/env/bin/python3"),
         ("#!/usr/bin/env bash\necho hi\n", None),
         ("no shebang\n", None),
+        ('#!/opt/env/bin/python "unbalanced\n', None),  # shlex cannot split it: not a script to run, and no error
     ],
 )
 def test_the_python_of_a_console_script_is_read_not_run(tmp_path, text, python):
@@ -1151,8 +1152,11 @@ s.listen(4)
 open(path + ".ready", "w").close()
 while True:
     c, _ = s.accept()
-    c.recv(4096)
-    c.sendall((json.dumps({"ok": True, "version": version, "leases": leases}) + "\\n").encode())
+    try:  # a probe that only connects and closes is not an error
+        c.recv(4096)
+        c.sendall((json.dumps({"ok": True, "version": version, "leases": leases}) + "\\n").encode())
+    except OSError:
+        pass
     c.close()
 """
 
@@ -1227,10 +1231,11 @@ def test_a_broker_with_a_lease_open_is_left_running_and_the_way_to_finish_is_nam
     cutover, old, stub_broker, starts, capsys
 ):
     stub = stub_broker("0.0.1", leases=1)
-    assert cli.main(["upgrade"]) == 0
+    assert cli.main(["upgrade"]) == 1  # the upgrade is done; the broker still needs doing, and the exit says so
     assert stub.poll() is None and starts == []
     out = capsys.readouterr().out
     assert "1 lease(s) open" in out and f"kill {stub.pid}" in out
+    assert "the broker is left running the old code" in out
 
 
 @unix_only
@@ -1239,7 +1244,7 @@ def test_a_broker_whose_process_is_not_this_users_is_left_running(
 ):
     stub = stub_broker("0.0.1")
     monkeypatch.setattr(upgrade, "_peer_cred", lambda conn: (stub.pid, os.getuid() + 1))
-    assert cli.main(["upgrade"]) == 0
+    assert cli.main(["upgrade"]) == 1
     assert stub.poll() is None and starts == []
     assert "cannot tell that its process is yours" in capsys.readouterr().out
 
@@ -1286,3 +1291,58 @@ def test_the_new_broker_is_started_by_the_ws_the_installer_wrote(broker_sock, tm
     finally:
         os.kill(peer.pid, signal.SIGTERM)
         assert upgrade._gone(broker_sock, 20)
+
+
+@unix_only
+def test_a_peer_pid_of_zero_is_never_signalled(cutover, old, stub_broker, starts, capsys, monkeypatch):
+    """SO_PEERCRED says pid 0 for a peer in another pid namespace, and kill(0) would hit this process's own group."""
+    stub = stub_broker("0.0.1")
+    monkeypatch.setattr(upgrade, "_peer_cred", lambda conn: (0, os.getuid()))
+    assert cli.main(["upgrade"]) == 1
+    assert stub.poll() is None and starts == []
+    out = capsys.readouterr().out
+    assert "cannot tell that its process is yours" in out and "kill 0" not in out
+
+
+@unix_only
+def test_without_a_pidfd_the_broker_is_left_running(cutover, old, stub_broker, starts, capsys, monkeypatch):
+    stub = stub_broker("0.0.1")
+    monkeypatch.setattr(upgrade, "_pidfd", lambda pid: None)
+    assert cli.main(["upgrade"]) == 1
+    assert stub.poll() is None and starts == []
+
+
+_STUBBORN_BROKER = _STUB_BROKER.replace(
+    "import json, socket, sys", "import json, signal, socket, sys\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)"
+)
+
+
+@unix_only
+def test_a_broker_that_does_not_stop_is_reported_and_no_second_one_started(
+    cutover, old, broker_sock, starts, capsys, monkeypatch
+):
+    import time
+
+    monkeypatch.setattr(upgrade, "BROKER_STOP_S", 1.0)
+    stub = subprocess.Popen([sys.executable, "-I", "-c", _STUBBORN_BROKER, str(broker_sock), "0.0.1", "0"])
+    try:
+        end = time.monotonic() + 30
+        while not Path(str(broker_sock) + ".ready").exists():
+            assert time.monotonic() < end and stub.poll() is None
+            time.sleep(0.02)
+        assert cli.main(["upgrade", "--json"]) == 1
+        assert stub.poll() is None and starts == []
+        seen = capsys.readouterr()
+        assert "did not stop within 1 seconds" in seen.err
+        assert json.loads(seen.out)["data"]["broker"] == "failed"
+        assert [d["exit"] for d in _log() if d["step"] == "broker"] == [1]
+    finally:
+        stub.kill()
+        stub.wait()
+
+
+@unix_only
+def test_the_result_says_what_happened_to_the_broker(cutover, old, stub_broker, starts, capsys):
+    stub_broker("0.0.1")
+    assert cli.main(["upgrade", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["data"]["broker"] == "restarted"

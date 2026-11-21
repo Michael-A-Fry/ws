@@ -410,12 +410,16 @@ def _script_python(script: Path) -> str | None:
         return None
     if not head or not head[0].startswith("#!"):
         return None
-    words = shlex.split(head[0][2:]) if head[0][2:].strip() else []
-    if words and os.path.basename(words[0]).startswith("python"):
-        return words[0]
-    if len(head) > 1 and head[1].startswith("'''exec'"):
-        rest = shlex.split(head[1][len("'''exec'") :])
-        return rest[0] if rest else None
+    try:
+        words = shlex.split(head[0][2:]) if head[0][2:].strip() else []
+        if words and os.path.basename(words[0]).startswith("python"):
+            return words[0]
+        if len(head) > 1 and head[1].startswith("'''exec'"):
+            rest = shlex.split(head[1][len("'''exec'") :])
+            return rest[0] if rest else None
+    # an unbalanced quote: not a script ws can read, so not one to run (and this runs after the swap: never raise)
+    except ValueError:
+        return None
     return None
 
 
@@ -541,6 +545,7 @@ class Peer(NamedTuple):
     status: dict
     pid: int | None
     uid: int | None
+    pidfd: int | None = None
 
 
 def broker_socket(env: Mapping[str, str]) -> Path:
@@ -560,14 +565,30 @@ def _peer_cred(conn: socket.socket) -> tuple[int | None, int | None]:
     return pid, uid
 
 
-def ask_broker(sock: Path, timeout: float = 3.0) -> Peer:
-    """Ask the broker on `sock` for `status` and read who answered on the same connection. Raises OSError or ValueError
-    when nothing answers or the reply is not a status."""
+def _pidfd(pid: int | None) -> int | None:
+    """A pidfd for `pid` (Linux 5.3 and later), or None. Opened while the connection to that process is still open, so
+    the process it names is the one that answered: a signal sent through it can never reach a later process that was
+    given the same pid."""
+    opener = getattr(os, "pidfd_open", None)
+    if opener is None or not pid or pid <= 0:
+        return None
+    try:
+        return opener(pid)
+    except OSError:
+        return None
+
+
+def ask_broker(sock: Path, timeout: float = 3.0, hold: bool = False) -> Peer:
+    """Ask the broker on `sock` for `status` and read who answered on the same connection. With `hold`, also a pidfd of
+    that process, opened while the connection is open (the caller closes it). Raises OSError or ValueError when nothing
+    answers or the reply is not a status."""
     conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     conn.settimeout(timeout)
+    fd = None
     try:
         conn.connect(str(sock))
         pid, uid = _peer_cred(conn)
+        fd = _pidfd(pid) if hold else None
         conn.sendall(b'{"op": "status"}\n')
         buf = b""
         while b"\n" not in buf and len(buf) < 65536:
@@ -575,12 +596,16 @@ def ask_broker(sock: Path, timeout: float = 3.0) -> Peer:
             if not chunk:
                 break
             buf += chunk
+        reply = json.loads(buf.split(b"\n", 1)[0])
+        if not isinstance(reply, dict) or reply.get("ok") is not True:
+            raise ValueError("the broker's reply is not a status")
+    except BaseException:
+        if fd is not None:
+            os.close(fd)
+        raise
     finally:
         conn.close()
-    reply = json.loads(buf.split(b"\n", 1)[0])
-    if not isinstance(reply, dict) or reply.get("ok") is not True:
-        raise ValueError("the broker's reply is not a status")
-    return Peer(reply, pid, uid)
+    return Peer(reply, pid, uid, fd)
 
 
 def _gone(sock: Path, limit: float) -> bool:
@@ -625,59 +650,78 @@ def start_broker(new: NewWs, sock: Path) -> bool:
     return p.returncode == 0
 
 
-def restart_broker(args: argparse.Namespace, env: Mapping[str, str], new: NewWs) -> int:
+BROKER_DONE = ("not running", "current", "restarted", "would restart")  # the states that leave nothing to do
+
+
+def restart_broker(args: argparse.Namespace, env: Mapping[str, str], new: NewWs) -> str:
     """After a swap whose hooks step and check both passed: a broker still running older code than the ws now installed
     is stopped and a new one started, so no step is left to the person (C651). Only the person's own socket; only when
-    it holds no lease; only a server the kernel says is this user's. Anything else is left running and the command that
-    finishes it is printed. A one-shot call that is in flight when the stop lands fails, and its caller asks again.
-    Returns 0 when nothing is left to do."""
+    it holds no lease; only a server the kernel says is this user's (SO_PEERCRED, a pid above 0), signalled through a
+    pidfd opened while it was answering. Anything else is left running and the command that finishes it is printed.
+
+    Two windows are accepted, each about one status round trip long: a one-shot call (imap, mint, sign) in flight when
+    the stop lands fails, and its caller asks again; and a lease asked for between the status reply (0 leases) and the
+    stop is lost with the broker, so the run that asked for it fails the call and asks again, of the new broker.
+
+    Returns the state, one of `BROKER_DONE` or "left running" / "failed"; it is logged, and the caller reports it."""
     t = time.monotonic()
-    code = _restart_broker(args, env, new)
+    state = _restart_broker(args, env, new)
+    code = 0 if state in BROKER_DONE else EXIT_FAILED
     log_step(args, env, "broker", Ran(code), time.monotonic() - t, new.python, new.version)
-    return code
+    return state
 
 
-def _restart_broker(args: argparse.Namespace, env: Mapping[str, str], new: NewWs) -> int:
+def _restart_broker(args: argparse.Namespace, env: Mapping[str, str], new: NewWs) -> str:
     sock = broker_socket(env)
     try:
-        peer = ask_broker(sock)
+        peer = ask_broker(sock, hold=True)
     except (OSError, ValueError):
-        return 0  # none running: the next `ws run` starts one of the new ws
+        return "not running"  # the next `ws run` starts one of the new ws
+    try:
+        return _stop_and_start(args, sock, peer, new)
+    finally:
+        if peer.pidfd is not None:
+            os.close(peer.pidfd)
+
+
+def _stop_and_start(args: argparse.Namespace, sock: Path, peer: Peer, new: NewWs) -> str:
     running, leases = peer.status.get("version"), peer.status.get("leases")
     if not new.version or running == new.version:
-        return 0
-    finish = f"kill {peer.pid}" if peer.pid else "stop the broker"
+        return "current"
+    ours = bool(peer.pid) and peer.pid > 0  # SO_PEERCRED says 0 across pid namespaces; kill(0) is our own group
+    finish = f"kill {peer.pid}" if ours else "stop the broker"
     finish += "; the next `ws run` starts one of the new ws"
     if leases != 0:
         _say(
             args,
             f"the broker still runs ws {running} with {leases} lease(s) open, so it is left running; when they are done: {finish}",
         )
-        return EXIT_FAILED
+        return "left running"
     getuid = getattr(os, "getuid", None)
-    if peer.pid is None or getuid is None or peer.uid != getuid():
+    send = getattr(signal, "pidfd_send_signal", None)
+    if not ours or getuid is None or peer.uid != getuid() or peer.pidfd is None or send is None:
         _say(
             args,
             f"the broker runs ws {running}, and ws cannot tell that its process is yours, so it is left running: {finish}",
         )
-        return EXIT_FAILED
+        return "left running"
     if args.dry_run:
         _say(args, f"would stop the broker (ws {running}, pid {peer.pid}) and start one of ws {new.version}")
-        return 0
+        return "would restart"
     _say(args, f"the broker runs ws {running}: stopping it (pid {peer.pid}) and starting one of ws {new.version}")
     try:
-        os.kill(peer.pid, signal.SIGTERM)
+        send(peer.pidfd, signal.SIGTERM)
     except OSError as e:
         _say(args, f"could not stop the broker ({type(e).__name__}): {finish}")
-        return EXIT_FAILED
+        return "failed"
     if not _gone(sock, BROKER_STOP_S):
         _say(args, f"the broker did not stop within {BROKER_STOP_S:.0f} seconds: {finish}")
-        return EXIT_FAILED
+        return "failed"
     if not start_broker(new, sock):
         _say(args, "the old broker is stopped; the new one did not answer yet, and the next `ws run` starts it")
-        return EXIT_FAILED
+        return "failed"
     _say(args, f"the broker is restarted on ws {new.version}")
-    return 0
+    return "restarted"
 
 
 # ---- the command ------------------------------------------------------------------------------------------------------------
@@ -812,12 +856,21 @@ def _both(args: argparse.Namespace, env: Mapping[str, str]) -> int:
             why = "the check ran past its time limit" if ran.timed_out else f"the check failed (exit {ran.code})"
             return _auto_rollback(args, env, before, why)
     record(env, "promote", before, new.version)
-    restart_broker(args, env, new)
+    broker_state = restart_broker(args, env, new)
     if args.json:
-        output.result({"from": before, "binary": "swapped", "hooks": "rewritten", "checked": bool(check)})
+        output.result(
+            {"from": before, "binary": "swapped", "hooks": "rewritten", "checked": bool(check), "broker": broker_state}
+        )
     else:
-        print(f"ws: upgraded from {before}; the hooks are rewritten")
-    return 0
+        print(f"ws: upgraded from {before}; the hooks are rewritten" + _broker_note(broker_state))
+    return 0 if broker_state in BROKER_DONE else EXIT_FAILED
+
+
+def _broker_note(state: str) -> str:
+    """The end of the last line: nothing when the broker needs nothing, else that it still runs the old code."""
+    if state in BROKER_DONE:
+        return ""
+    return "; the broker is left running the old code" if state == "left running" else "; the broker restart failed"
 
 
 def _auto_rollback(args: argparse.Namespace, env: Mapping[str, str], before: str, why: str) -> int:
@@ -865,13 +918,12 @@ def _rollback(args: argparse.Namespace, env: Mapping[str, str]) -> int:
         )
         return EXIT_FAILED if ran.timed_out else ran.code
     record(env, "rollback", before, target)
-    if new is not None:
-        restart_broker(args, env, new)
+    broker_state = restart_broker(args, env, new) if new is not None else "not running"
     if args.json:
-        output.result({"from": before, "to": target, "binary": "swapped", "hooks": "rewritten"})
+        output.result({"from": before, "to": target, "binary": "swapped", "hooks": "rewritten", "broker": broker_state})
     else:
-        print(f"ws: rolled back from {before} to {target}; the hooks are rewritten")
-    return 0
+        print(f"ws: rolled back from {before} to {target}; the hooks are rewritten" + _broker_note(broker_state))
+    return 0 if broker_state in BROKER_DONE else EXIT_FAILED
 
 
 def cmd_upgrade(args: argparse.Namespace) -> int:

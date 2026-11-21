@@ -2190,3 +2190,288 @@ def test_an_absolute_home_or_a_folder_above_it_is_refused_whole(home, key):
             policy.loads(f'[gate]\n{key} = [{ok}, "{entry}", "~/fine"]\n')
         assert str(entry) in str(e.value)  # it names the entry
     assert policy.loads(f"[gate]\n{key} = [{ok}]\n").gate  # a folder inside the home is fine
+
+
+# --- ssh: the options that run or load local files ---------------------------------------------------------------
+
+SSH_LOCAL_EXEC = [
+    "ssh -o ProxyCommand='sh -c x' host ls",
+    "ssh -oProxyCommand=bash host ls",
+    "ssh -o proxycommand=bash host ls",
+    "ssh -o 'ProxyCommand bash' host ls",
+    "ssh -vo ProxyCommand=bash host ls",
+    "ssh host -o ProxyCommand=bash ls",
+    "ssh -o LocalCommand='touch /tmp/p' -o PermitLocalCommand=yes host ls",
+    "ssh -o KnownHostsCommand='touch /tmp/p' host ls",
+    "ssh -o Match='exec true' host ls",
+    "ssh -o RemoteCommand=ls host",
+    "ssh -o PKCS11Provider=/tmp/l.so host ls",
+    "ssh -o SecurityKeyProvider=/tmp/l.so host ls",
+    "ssh -o IdentityAgent=/tmp/a host ls",
+    "ssh -o ControlPath=/tmp/c -o ControlMaster=yes host ls",
+    "ssh -o SendEnv=X host ls",
+    "ssh -o SetEnv=X=1 host ls",
+    "ssh -o Include=/tmp/x host ls",
+    "ssh -o XAuthLocation=/tmp/x host ls",
+    "ssh -o NoSuchKeyword=1 host ls",
+    "ssh -F /tmp/evil host ls",
+    "ssh -E ~/.bashrc host ls",
+    "ssh -I /tmp/lib.so host ls",
+    "ssh -o 'IdentityFile ~/.ssh/id_rsa' host ls",
+    "ssh -o IdentityFile=%d/.ssh/id_rsa host ls",
+    "ssh -S ~/.ssh/ctl host ls",
+    "SSH_ASKPASS=/tmp/x ssh host ls",
+    "env SSH_ASKPASS_REQUIRE=force ssh host ls",
+    "sudo SSH_ASKPASS=/tmp/x ssh host ls",
+    "/usr/bin/ssh -oProxyCommand=bash host ls",
+    "command ssh -oProxyCommand=bash host ls",
+    "sudo ssh -oProxyCommand=bash host ls",
+    "timeout 5 ssh -oProxyCommand=bash host ls",
+    "xargs ssh -oProxyCommand=bash host",
+]
+
+
+@pytest.mark.parametrize("cmd", SSH_LOCAL_EXEC)
+def test_ssh_options_that_run_or_load_local_files_are_denied(pol, home, cmd):
+    assert policy.is_denied_command(pol, cmd)
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "ssh host ls",
+        "ssh -v -p 2222 -l me host uptime",
+        "ssh -o Port=2222 -o StrictHostKeyChecking=accept-new host ls",
+        "ssh -o 'ConnectTimeout 5' -o BatchMode=yes host ls",
+        "ssh -F none host ls",
+        "ssh -J jump.example.org host ls",
+        "ssh -L 8080:localhost:80 -N host",
+        "ssh -S /tmp/ctl -O check host",
+        "ssh -o UserKnownHostsFile=/dev/null host ls",
+        "ssh host -- ls -o x",
+    ],
+)
+def test_plain_ssh_options_still_run(pol, home, cmd):
+    assert policy.is_denied_command(pol, cmd) is None
+
+
+def test_ssh_argv_reads_options_before_and_after_the_host():
+    opts, host, remote = policy._ssh_argv(["ssh", "-vp", "22", "-oX=1", "h", "-l", "u", "ls", "-o", "y"])
+    assert opts == [("v", ""), ("p", "22"), ("o", "X=1"), ("l", "u")]
+    assert host == "h" and remote == ["ls", "-o", "y"]
+    assert policy._ssh_argv(["ssh", "--", "h", "-o", "x"])[1:] == ("h", ["-o", "x"])
+
+
+# --- ssh: a single-quoted remote command to a named host is remote -------------------------------------------------
+
+
+@pytest.fixture
+def named(home, monkeypatch):
+    import socket
+
+    monkeypatch.setattr(socket, "gethostname", lambda: "box")
+    pol = policy.default_policy()
+    return dataclasses.replace(
+        pol, gate=dataclasses.replace(pol.gate, allow_hosts=("pve.example.org", "*.lan.example"))
+    )
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "ssh pve.example.org 'ls $X'",
+        "/usr/bin/ssh pve.example.org 'ls $X'",
+        "command ssh pve.example.org 'ls $X'",
+        "sudo ssh pve.example.org 'ls $X'",
+        "timeout 5 ssh pve.example.org 'ls $X'",
+        "ssh -p 22 -l me pve.example.org 'cat $(ls /etc)'",
+        "ssh nas.lan.example 'for f in a b; do cat $f; done'",
+        "ssh pve.example.org 'cat $HOME/x | grep y > /tmp/z'",
+    ],
+)
+def test_a_single_quoted_remote_command_to_a_named_host_is_remote(named, cmd):
+    assert policy.is_denied_command(named, cmd) is None
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "ssh other.example.org 'ls $X'",  # a host the policy does not name
+        "ssh localhost 'ls $X'",
+        "ssh 127.0.0.1 'ls $X'",
+        "ssh 127.1 'ls $X'",
+        "ssh ::1 'ls $X'",
+        "ssh me@localhost 'ls $X'",
+        "ssh ssh://me@127.0.0.1:22 'ls $X'",
+        "ssh box.tail.example 'ls $X'",  # this machine's own name
+        "ssh -o HostName=127.0.0.1 pve.example.org 'ls $X'",
+        "ssh $H 'ls $X'",
+        'ssh pve.example.org "ls $X"',  # double quotes: the local shell expands it
+        'ssh pve.example.org "cat $(cat ~/.ssh/id_LOCAL)"',
+        "ssh pve.example.org $'ls $X'",
+        "ssh pve.example.org x'ls $X'",
+        "ssh pve.example.org 'ls $X' more",
+        "ssh pve.example.org ls $X",
+        "ssh pve.example.org cat ~/.ssh/id_rsa",
+        "xargs ssh pve.example.org 'ls $X'",
+        "ssh -oProxyCommand=bash pve.example.org 'ls $X'",
+        "ssh -F /tmp/evil pve.example.org 'ls $X'",
+        "ssh localhost 'cat ~/.ssh/id_rsa'",  # this machine: judged as the local command it is
+        "ssh 127.0.0.1 cat ~/.ssh/id_rsa",
+    ],
+)
+def test_any_other_remote_command_keeps_the_local_rules(named, cmd):
+    assert policy.is_denied_command(named, cmd)
+
+
+def test_a_host_a_class_names_counts_too(home):
+    pol = policy.loads(
+        '[gate]\ndeny_read = ["~/.ssh/**"]\n'
+        '[classes.lab]\naccess = "full"\nrepos = ["~/code/lab/**"]\nallowed_hosts = ["pve.example.org"]\nowner = "me"\n'
+    )
+    assert policy.is_denied_command(pol, "ssh pve.example.org 'ls $X'") is None
+    assert policy.is_denied_command(policy.default_policy(), "ssh pve.example.org 'ls $X'")
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "ssh pve.example.org '$HOME/.ws/policy.toml' > '$HOME/.ws/policy.toml'",
+        "ssh pve.example.org '$HOME/.ws/policy.toml' >> '$HOME/.ws/policy.toml'",
+        "ssh pve.example.org '$HOME/.ws/policy.toml' 2> '$HOME/.ws/policy.toml'",
+        "ssh pve.example.org 'cat $X' < ~/.ssh/id_rsa",
+        "ssh pve.example.org 'x' <<< 'x'",
+        "ssh pve.example.org > out 'ls $X'",
+        "ssh -o CanonicalizeHostname=yes -o CanonicalDomains=localhost pve.example.org 'ls $X'",
+        "sshpass -p x ssh pve.example.org 'ls $X'",
+        "autossh -M 0 pve.example.org 'ls $X'",
+    ],
+)
+def test_a_redirect_or_a_renamed_host_keeps_the_local_rules(named, home, cmd):
+    assert policy.is_denied_command(named, cmd, protect=(f"{home}/.ws/policy.toml",))
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "sshpass -p x ssh -oProxyCommand=bash host ls",
+        "sshpass -e ssh -o LocalCommand=x -o PermitLocalCommand=yes host ls",
+        "autossh -M 20000 -oProxyCommand=bash host",
+        "autossh -M20000 -F /tmp/evil host",
+        "printf -v SSH_ASKPASS /tmp/x; export SSH_ASKPASS; ssh host ls",
+        "export SSH_ASKPASS=/tmp/x; ssh host ls",
+    ],
+)
+def test_ssh_run_by_another_program_or_after_an_askpass_setting_is_judged(pol, home, cmd):
+    assert policy.is_denied_command(pol, cmd)
+
+
+def test_the_known_hosts_file_is_a_write(pol, home):
+    target = f"{home}/.ws/policy.toml"
+    cmd = f"ssh -o UserKnownHostsFile={target} host ls"
+    assert "protects" in policy.is_denied_command(pol, cmd, protect=(target,))
+    assert policy.is_denied_command(pol, "ssh -o UserKnownHostsFile=/tmp/kh host ls", protect=(target,)) is None
+    assert policy.is_denied_command(pol, "autossh -M 0 host ls") is None
+    assert policy.is_denied_command(pol, "sshpass -e ssh host ls") is None
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "sshpass -vp pw ssh -oProxyCommand=bash h",
+        "sshpass -ppw ssh -oProxyCommand=bash h",
+        "sshpass env ssh -oProxyCommand=bash h",
+        "sshpass env SSH_ASKPASS=/tmp/x ssh h ls",
+        "sshpass command ssh -oProxyCommand=bash h",
+        "sshpass timeout 5 ssh -oProxyCommand=bash h",
+        "sshpass -p pw scp a h:b",  # a program other than ssh: not read
+        "sshpass -p pw",
+        "ssh -o 'UserKnownHostsFile \"/srv/x y/../p/policy.toml\"' h ls",
+        "ssh -o 'UserKnownHostsFile /srv/x\\ y/p' h ls",
+        "read -r SSH_ASKPASS < /tmp/f; export SSH_ASKPASS; ssh h ls",
+        "export $(echo SSH_ASKPASS=/tmp/x); ssh h ls",
+        "export ${A}=/tmp/x; ssh h ls",
+    ],
+)
+def test_ssh_through_sshpass_a_quoted_file_list_or_a_hidden_askpass_is_denied(pol, home, cmd):
+    assert policy.is_denied_command(pol, cmd)
+
+
+def test_sshpass_with_bundled_flags_still_runs_a_plain_ssh(pol, home):
+    assert policy.is_denied_command(pol, "sshpass -vp pw ssh -p 22 h uptime") is None
+    assert policy.is_denied_command(pol, "export X=1; ssh h ls") is None
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "sshpass -p pw env -S 'SSH_ASKPASS=/tmp/x ssh h ls'",
+        "env -S 'SSH_ASKPASS=/tmp/x ssh h ls'",
+        "sshpass -p pw env SSH_ASKPASS_REQUIRE=force ssh h ls",
+        "slogin -oProxyCommand=bash h",
+        "sshpass -p pw slogin -oProxyCommand=bash h",
+        "read -r SSH_ASKPASS_REQUIRE < /tmp/f; export SSH_ASKPASS_REQUIRE; ssh h ls",
+        "export SSH_ASKPASS_REQUIRE=force; ssh h ls",
+    ],
+)
+def test_ssh_by_another_name_or_an_askpass_set_any_way_is_denied(pol, home, cmd):
+    assert policy.is_denied_command(pol, cmd)
+
+
+def test_slogin_and_an_env_string_with_a_plain_ssh_still_run(pol, home):
+    assert policy.is_denied_command(pol, "slogin -p 22 h uptime") is None
+    assert policy.is_denied_command(pol, "env -S 'LC_ALL=C ssh h ls'") is None
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "ssh -J jump.example.org -o \"HostName=x';true;'\" h ls",
+        "ssh -o ProxyJump=jump.example.org -o \"HostName=x';true;'\" h ls",
+        "ssh -J \"j';true;'\" h ls",
+        'ssh -o "ProxyJump=j;true" h ls',
+        "ssh -J jump.example.org \"h';true;'\" ls",
+        "ssh -o 'HostName x$(true)' h ls",
+    ],
+)
+def test_a_host_ssh_puts_in_a_local_command_is_plain_text_or_refused(pol, home, cmd):
+    assert policy.is_denied_command(pol, cmd)
+
+
+def test_plain_jumps_and_host_names_still_run(pol, home):
+    for cmd in (
+        "ssh -J jump.example.org:2222,jump2.example.org h ls",
+        "ssh -o ProxyJump=jump.example.org -o HostName=192.0.2.5 h ls",
+        "ssh -o HostName=[fe80::1%eth0] h ls",
+    ):
+        assert policy.is_denied_command(pol, cmd) is None, cmd
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    ["PATH=/tmp/d:$PATH ssh pve.example.org 'ls $X'", "export PATH=/tmp/d; ssh pve.example.org 'ls $X'"],
+)
+def test_a_path_set_on_the_line_keeps_the_local_rules(named, cmd):
+    assert policy.is_denied_command(named, cmd)
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "ssh -S /tmp/ctl pve.example.org 'ls $X'",
+        "ssh -S /tmp/ctl -p 22 pve.example.org 'for f in a b; do cat $f; done'",
+        "ssh -S /tmp/ctl pve.example.org 'cat ~/.ssh/id_rsa'",
+    ],
+)
+def test_a_control_socket_keeps_the_local_rules_for_the_remote_command(named, cmd):
+    assert policy.is_denied_command(named, cmd)
+
+
+def test_a_control_socket_still_runs_a_plain_remote_command(named):
+    assert policy.is_denied_command(named, "ssh -S /tmp/ctl pve.example.org 'uptime'") is None
+
+
+def test_opening_a_control_socket_is_a_write(pol, home):
+    target = f"{home}/.ws/policy.toml"
+    assert "protects" in policy.is_denied_command(pol, f"ssh -M -S {target} -N host", protect=(target,))
+    assert policy.is_denied_command(pol, "ssh -M -S /tmp/ctl -N host", protect=(target,)) is None

@@ -60,6 +60,11 @@ body of the GitHub release.
 - The pre-push hook refuses a push that carries an unsigned commit (`git log --format='%G?'` shows `N`), before the
   tests run, warns on a signature git can't check, and refuses a bad or revoked one or a push whose commits git can't
   list. It does nothing when `CI` is set (one line goes in the skip log).
+- The gate: ssh options that run or load local files are now judged (an `-o` keyword ws doesn't know runs nothing
+  here is refused, and so are `-F`, `-I`, `-E` and an askpass program), through any wrapper (`sudo`, `timeout`,
+  `command`, a full path). Plain options (`-p`, `-l`, `-J`, `-o Port=...`) run as before.
+- The gate: a remote command written wholly in single quotes to a host the policy names is read as remote: the gate no
+  longer refuses a `$VAR`, loop or `$(...)` in it. A remote command to this machine is judged as a local one.
 - Flaky tests: the two orphan tests (`test_msg.py`, `test_session_registry.py`) write their result file whole, through
   a temporary file and a rename. Before, the test could find the file created but still empty, and fail with `''`.
 - The launchd scheduler switches off only the agents it loaded. Each plist now carries `WsWrittenBy: ws`, and

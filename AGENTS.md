@@ -10,6 +10,11 @@ vendor-neutral `policy.toml` into each runner's own config (adapters for Claude 
 hooks, and runs headless jobs that leave one complete record each. The core is Python 3.11+ and standard library only.
 Apache-2.0, signed commits, one author per commit.
 
+Provider-agnostic is the aim, and it is not there yet. What is proven: the two adapters (Claude Code and OpenCode)
+turn the one policy into each runner's own config; the gate's decisions and the run records are tested on both runners
+against a stub model; and every piece of state is a plain file (TOML, JSON lines, SQLite). What is not: no job has yet
+been proven end to end on a model that isn't Claude. Don't write "works with any model" until one has.
+
 ## Where to look
 
 | Task | Look in |

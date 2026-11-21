@@ -50,6 +50,8 @@ below, and `python3 scripts/gen_code_map.py --check` (prek and CI) fails when it
 | `jobwatch.py` | `ws watch`: the failure alert a scheduled unit raises, the dead-man check for jobs that stopped... |
 | `jsonl.py` | Bounded, locked JSON-lines logs: one object per line, a size limit with rotation, and no lost lines |
 | `mail.py` | Mailboxes for triage: search, read as delimited plain text, add a ws label, and save a reply as... |
+| `mail_mcp.py` | The mail MCP tools: five calls over ws.mail (list mailboxes, search, get, label, draft), served... |
+| `mailcmd.py` | `ws mail`: add, check and remove the mailboxes of the profile, and serve the mail MCP tools... |
 | `mcp_server.py` | `ws mcp serve`: a small MCP server over stdio, so any runner can search and add to memory and... |
 | `memory.py` | Memory module: Markdown files with front matter in a git repo, plus a rebuildable SQLite FTS5 index |
 | `migrate.py` | `ws migrate`: move ws's files from `~/.ws` to the XDG folders (see `ws.paths` for which file... |
@@ -82,6 +84,7 @@ below, and `python3 scripts/gen_code_map.py --check` (prek and CI) fails when it
 | `skills/` | The skills ws ships (`align`, `checkpoint`, `taste-gate`, `dataviz`, `resume`, `ship`) and how... |
 | `status.py` | `ws status`: for each runner, every rules, skill, hook and MCP file it will load here, with... |
 | `style.py` | The terminal style every `ws` command prints with: a status glyph and word, headings, key/value... |
+| `sync.py` | `ws sync`: fetch every git repository under the code root, a few at a time, each with a time limit |
 | `tailnet.py` | The tailnet checks a one-shot phone page uses: which address it may listen on, and whether a... |
 | `term/` | `ws term`: a browser terminal that behaves like a native one, for reaching a ws machine from a... |
 | `testing/` | Test support that ships with ws: the mock model provider and its scenarios |

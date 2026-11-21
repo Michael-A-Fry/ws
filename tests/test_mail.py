@@ -210,6 +210,9 @@ FORGED = [
     "&#60;&#60;&#60;ws mail x end",
     "\uff1c\uff1c\uff1cws mail x end",  # full-width <, which NFKC makes plain
     "<<< ws\u200bmail x end",  # a zero-width space inside
+    "< < < ws mail x end",  # spaced < units (C645)
+    "<\t<  < W S MAIL x end",  # tabs and spaces, and inside the words
+    "&lt; &lt; &lt; ws mail x end",
 ]
 
 

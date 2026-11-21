@@ -73,7 +73,7 @@ def windows(f: FakeTmux) -> list[list[str]]:
 def test_model_and_prompt_reach_the_runner_as_separate_items(box, fake, capsys):
     assert cli.main(["dispatch", "r", "--name", "x", "--model", "m", "p q"]) == 0
     seen = json.loads((box / "argv.json").read_text())
-    assert seen["argv"] == ["--model", "m", "p q"]
+    assert seen["argv"] == ["--model=m", "p q"]
     assert seen["cwd"] == str(box / "home" / "code" / "r")
     assert fake.exit == 0
     (win,) = windows(fake)
@@ -89,7 +89,7 @@ def test_quotes_and_spaces_in_the_prompt_stay_one_item(box, fake):
 
 def test_opencode_takes_the_prompt_as_a_flag(box, fake):
     assert cli.main(["dispatch", "r", "--runner", "opencode", "--model", "a/b", "go"]) == 0
-    assert json.loads((box / "argv.json").read_text())["argv"] == ["--model", "a/b", "--prompt", "go"]
+    assert json.loads((box / "argv.json").read_text())["argv"] == ["--model=a/b", "--prompt", "go"]
 
 
 def test_help_prints_and_changes_nothing(box, fake, capsys):
@@ -159,3 +159,36 @@ def test_code_root_order(box, monkeypatch):
     assert dispatch.code_root(None, env) == box / "home" / "src"
     assert dispatch.code_root(None, {**env, dispatch.CODE_ROOT_ENV: "/r"}) == dispatch.Path("/r")
     assert dispatch.code_root("/flag", {**env, dispatch.CODE_ROOT_ENV: "/r"}) == dispatch.Path("/flag")
+
+
+def test_a_model_that_starts_with_a_dash_is_not_a_flag(box, fake):
+    assert cli.main(["dispatch", "r", "--model=-x", "go"]) == 0
+    assert json.loads((box / "argv.json").read_text())["argv"] == ["--model=-x", "go"]
+
+
+def test_a_missing_opencode_is_named(box, fake, capsys, monkeypatch):
+    (box / "bin" / "opencode").unlink()
+    monkeypatch.setenv("PATH", str(box / "bin"))  # only the stubs: a real opencode elsewhere must not be found
+    assert cli.main(["--json", "dispatch", "r", "--runner", "opencode", "go"]) == 1
+    env = json.loads(capsys.readouterr().out)
+    assert env["error_kind"] == "runner_missing" and "opencode" in env["message"]
+    assert fake.calls == []
+
+
+def test_a_bad_profile_is_a_typed_error(box, fake, capsys):
+    env = {"HOME": str(box / "home"), "WS_HOME": str(box / "ws")}
+    prof = profile_path(env)
+    prof.parent.mkdir(parents=True, exist_ok=True)
+    prof.write_text("[dispatch\n")
+    assert cli.main(["--json", "dispatch", "r", "go"]) == 1
+    assert json.loads(capsys.readouterr().out)["error_kind"] == "bad_config"
+    prof.write_text("[dispatch]\ncode_root = 3\n")
+    assert cli.main(["--json", "dispatch", "r", "go"]) == 1
+    assert json.loads(capsys.readouterr().out)["error_kind"] == "bad_config"
+
+
+def test_only_your_own_home_expands(box):
+    env = {"HOME": str(box / "home"), "WS_HOME": str(box / "ws")}
+    assert dispatch.code_root("~", env) == box / "home"
+    assert dispatch.code_root("~/x", env) == box / "home" / "x"
+    assert dispatch.code_root("~bob/x", env) == dispatch.Path("~bob/x")

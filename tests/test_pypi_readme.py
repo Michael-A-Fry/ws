@@ -85,6 +85,12 @@ def test_code_is_left_alone():
     assert pr.relative_targets(text) == []
 
 
+def test_a_four_part_tag_is_a_release_tag():
+    assert "/blob/v0.1.11.1/" in pr.rewrite("[a](docs/a.md)", "v0.1.11.1")
+    with pytest.raises(ValueError):
+        pr.rewrite(README, "v0.1.11.1.1")
+
+
 def test_a_tag_that_is_not_vxyz_is_refused():
     with pytest.raises(ValueError):
         pr.rewrite(README, "main")

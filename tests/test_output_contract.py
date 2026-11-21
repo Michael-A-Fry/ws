@@ -156,10 +156,13 @@ CASES: dict[str, list[str]] = {
     "ask.get": ["ask", "get", "nope"],
     "ask.answer": ["ask", "answer", "nope", "yes"],
     "ask.wait": ["ask", "wait", "nope"],
+    "cards.drop": ["cards", "drop", "done"],
+    "cards.take": ["cards", "take"],
     "ask.done": ["ask", "done", "nope"],
     "ask.withdraw": ["ask", "withdraw", "nope"],
     "ask.note": ["ask", "note", "nope", "x"],
     "ask.import": ["ask", "import", "{home}/none.jsonl"],
+    "passtest.events": ["passtest", "events"],  # no ledger set up: a typed no_ledger error
     "term": ["term", "--bind", "0.0.0.0"],  # a typed refusal: the real command stays up until stopped
 }
 

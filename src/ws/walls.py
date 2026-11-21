@@ -700,17 +700,27 @@ def _case_allowed_sender(ctx: Ctx) -> Outcome:
             return Outcome(False, "the class store's log does not hold one row for each message, delivered or refused")
         if len(msg.scratch_envelopes(shared)) != 1:
             return Outcome(False, "a refused message left an envelope row")
-        for inbound in ("lead-only", "off"):  # a walled class that names no one takes no one, the lead included
+        # lead-only takes the lead and no one else (DEC-052); off takes no one, the lead included
+        for inbound, lead_in in (("lead-only", True), ("off", False)):
             with _world(ctx, inbound) as v:
                 lead = session.Record(PROBE_SENDER, "walls", cwd=v.sender.cwd, role="lead", class_="open")
-                try:
-                    msg.scratch_delivery(v.root / "shared", v.pol, lead, v.to_alpha, "note", _plant())
-                except WsError as e:
-                    if e.kind != "refused":
-                        return Outcome(False, f"inbound {inbound} failed with {e.kind}, not a refusal")
-                else:
-                    return Outcome(False, f"a lead was let in to a walled class whose inbound is {inbound}")
-    return Outcome(True, "only a session on a walled class's allowlist is let in, and each message leaves one log row")
+                worker = session.Record(PROBE_OTHER, "walls", cwd=v.sender.cwd, class_="open")
+                for who, let_in in ((lead, lead_in), (worker, False)):
+                    try:
+                        msg.scratch_delivery(v.root / "shared", v.pol, who, v.to_alpha, "note", _plant())
+                    except WsError as e:
+                        if e.kind != "refused":
+                            return Outcome(False, f"inbound {inbound} failed with {e.kind}, not a refusal")
+                        if let_in:
+                            return Outcome(False, f"the lead was refused by a walled class whose inbound is {inbound}")
+                    else:
+                        if not let_in:
+                            return Outcome(
+                                False, f"a {who.role} was let in to a walled class whose inbound is {inbound}"
+                            )
+    return Outcome(
+        True, "only the lead (lead-only) or a session on the allowlist is let in, and each message leaves one log row"
+    )
 
 
 def _modes_problem(folder: Path) -> str | None:

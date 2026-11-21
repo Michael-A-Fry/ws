@@ -17,6 +17,7 @@ from ws.output import WsError
 # The commands the installed package itself adds, in module-name order; a planted one comes after them.
 SHIPPED = [
     ("ask", "asks"),
+    ("cards", "cards"),
     ("commit-wall", "commit_wall"),
     ("connect", "connectcmd"),
     ("connector", "connectors"),
@@ -25,6 +26,7 @@ SHIPPED = [
     ("watch", "jobwatch"),
     ("msg", "msg"),
     ("node", "node"),
+    ("passtest", "passtest"),
     ("queue", "queue"),
     ("upgrade", "upgrade"),
     ("usage", "usage"),

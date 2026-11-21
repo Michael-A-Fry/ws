@@ -18,6 +18,7 @@ below, and `python3 scripts/gen_code_map.py --check` (prek and CI) fails when it
 | `brand.py` | The ws look in one place: colour tokens by role, the mark, and the rule for when colour is on |
 | `broker.py` | The secrets broker: a small process that is not an LLM and holds the store, so agents never see... |
 | `canary.py` | `ws canary`: a few small checks that a runner's update did not break what ws relies on |
+| `cards.py` | `ws cards`: a walled class's account leaves a fixed-kind card (`done`, `counts`...) for the... |
 | `cli.py` | The `ws` command |
 | `commit_wall.py` | commit-wall: a commit hook that refuses a commit whose added lines or message hold a pattern you... |
 | `config_cmd.py` | `ws config`: every file ws reads, where its path came from, and the keys it sets |
@@ -59,6 +60,7 @@ below, and `python3 scripts/gen_code_map.py --check` (prek and CI) fails when it
 | `notesdetect.py` | Find notes you already keep: an Obsidian vault (a folder holding `.obsidian/`) or a Logseq graph... |
 | `osinfo.py` | Which machine are we on: macOS, Linux, Windows via WSL2, or native Windows (not supported; use WSL2) |
 | `output.py` | The output contract for every `ws` command: one typed error, one JSON envelope, and the global flags |
+| `passtest.py` | The step-in counter: `ws passtest events` reads a pass-test ledger and prints confirmed step-ins... |
 | `paths.py` | Where ws keeps its files: four folders that follow the XDG base directory rules, or one folder... |
 | `policy.py` | The policy: one vendor-neutral `policy.toml` that says what a session may do |
 | `profile.py` | The profile: one TOML file per person (machine answers, roles, caps) |

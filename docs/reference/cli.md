@@ -1303,6 +1303,48 @@ missing. It proves what ws writes, not that a set-up host holds it: that's `ws w
 ws walls canary [-h]
 ```
 
+## `ws passtest`
+
+The step-in counter: how often a person had to come back and steer an AI tool, week by week. It reads a pass-test
+ledger (an append-only, hash-chained jsonl file that a separate helper writes) and never writes to it.
+
+### `ws passtest events`
+
+Print confirmed step-ins per week by kind and by area, and the trend. The ledger's hash chain is checked first; a
+broken or truncated chain counts nothing and exits 1 with the line number.
+
+```text
+ws passtest events [-h] [--weeks WEEKS] [--config CONFIG]
+```
+
+| Argument | Meaning |
+|---|---|
+| `--weeks WEEKS` | How many weeks (Monday 00:00 UTC), ending with this one (default 4, at most 520). |
+| `--config CONFIG` | The settings file (default: `$WS_PASSTEST_CONFIG`). |
+
+The settings file is TOML with two keys: `ledger` (a path, relative to the file) and `areas` (the areas always shown,
+in order). `$WS_PASSTEST_LEDGER` overrides `ledger`. ws has no built-in ledger path: with neither set, the command exits
+1 (`no_ledger`).
+
+Rules. A proposal counts when a `confirm` names it, or once it has been open 7 days with no `confirm` or `dismiss`; the
+latest decision wins, and it falls in the week of the proposal, not of the confirm. A `failed` or `missed` job run
+is one `not-automatic` step-in per `run_id`, in the week of its `expected_at`. The trend is the least-squares slope of
+the weekly totals: rising above +0.5 a week, falling below −0.5, flat in between. Nothing starts the count over.
+
+### Pass-test ledger lines
+
+Each line is `{"ts", "kind", "data", "prev"}`: `ts` is ISO 8601 UTC, `prev` the sha256 of the previous line's bytes
+(without its newline; 64 zeros on the first line). Anything that writes step-ins writes these `data` keys:
+
+| `kind` | `data` |
+|---|---|
+| `proposal` | `id`, `event_kind` (`dig`, `reframe`, `correct`, `follow-up`, `not-automatic`), `area`, `about` |
+| `confirm`, `dismiss` | `proposal_id` |
+| `job-run` | `job`, `run_id`, `status` (`ok`, `failed`, `missed`), `expected_at`; `area` optional |
+
+Other kinds aren't step-ins and are read past. A line the counter can't use (no id, an unknown `event_kind` or
+`status`) is listed as skipped.
+
 ## `ws rate`
 
 Give a run a thumbs up or down.

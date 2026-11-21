@@ -8,6 +8,19 @@ body of the GitHub release.
 
 ## [Unreleased]
 
+### Changed
+
+- `ws upgrade` runs the hooks step with the ws the installer just wrote, read back from the `ws` command it put in
+  place and that script's Python, and records that ws's version in the history; the step's line names the Python and
+  version it ran with. (C648)
+- `ws upgrade` restarts a broker still running older code once the swap's hooks step and check have passed, when it
+  holds no lease and is your user's process; otherwise it says so and prints the command that finishes it. (C651)
+
+### Added
+
+- `ws upgrade` writes one line per step to `logs/upgrade.jsonl` (verb, step, Python, version, exit, seconds and the
+  last 20 lines of the installer's or hooks step's output); the terminal output is unchanged. (C650)
+
 ## [0.1.11.3] - 2026-11-22
 
 ### Added

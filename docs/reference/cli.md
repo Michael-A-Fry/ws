@@ -1040,6 +1040,24 @@ or not, is refused (exit 3), and so is a run with no terminal. Exit 0 when done,
 failed, 3 when refused, 4 when files couldn't be put back after a failed rewrite (they're named). See
 [Upgrade and uninstall](../how-to/upgrade-and-uninstall.md#upgrade).
 
+The hooks step runs the ws the installer just wrote: ws reads it back from the `ws` command the installer put in its
+folder (`UV_TOOL_BIN_DIR`, `XDG_BIN_HOME`, `PIPX_BIN_DIR` or `~/.local/bin`) and the Python named on that script's `#!`
+line, and the step's line says which Python and version it ran with. The version recorded in `upgrade-history.jsonl`
+is asked of the same ws.
+
+Every run (`--dry-run`, `--rollback` and `--hooks-only` too) appends one line per step to `logs/upgrade.jsonl` in ws's
+state folder: the time, the verb, the step (`installer`, `hooks`, `check`, `plan`, `broker`), the Python and version it
+ran with, the exit code, how long it took, and the last 20 lines of the installer's or the hooks step's output. The
+output still reaches the terminal line by line. The log isn't rotated, and a line that can't be written is reported and
+never fails the upgrade.
+
+After a swap or a rollback whose hooks step and `--check` both passed, ws asks the broker on your own socket
+(`run/broker.sock`) for its version. A broker running other code than the ws now installed, holding no lease, and run
+by your user (the kernel says so, through `SO_PEERCRED`; Linux only) is stopped and a new one started on the new ws.
+With a lease open, or a process ws can't tell is yours, it's left running and ws prints the command that finishes the
+job. A one-shot broker call (an IMAP operation, a token mint, a signature) that's in flight at that moment fails, and
+its caller asks again. An automatic rollback never touches the broker.
+
 ## `ws migrate`
 
 Move ws's files from `~/.ws` to the XDG folders. Nothing is deleted.

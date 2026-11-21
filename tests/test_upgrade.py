@@ -1096,6 +1096,7 @@ def test_a_stub_upgrade_leaves_one_log_line_per_step(old, tmp_path, monkeypatch,
         ("upgrade", "installer", 0),
         ("upgrade", "hooks", 0),
         ("upgrade", "check", 0),
+        ("upgrade", "broker", 0),  # none running here: nothing to do
     ]
     assert log[0]["tail"] == ["installer says hello"] and log[0]["python"] == "bash"
     assert log[1]["python"] == str(new_python) and log[1]["version"] == "9.9.9"
@@ -1137,3 +1138,151 @@ def test_a_log_that_cannot_be_written_is_said_and_never_fails_the_upgrade(old, c
     logs.write_text("not a folder")
     code, _, err = upgrade_hooks(capsys)
     assert code == 0 and "could not write" in err and "the upgrade goes on" in err
+
+
+# --- the broker after a swap (C651) ------------------------------------------------------------------------------------
+
+_STUB_BROKER = """
+import json, socket, sys
+path, version, leases = sys.argv[1], sys.argv[2], int(sys.argv[3])
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind(path)
+s.listen(4)
+open(path + ".ready", "w").close()
+while True:
+    c, _ = s.accept()
+    c.recv(4096)
+    c.sendall((json.dumps({"ok": True, "version": version, "leases": leases}) + "\\n").encode())
+    c.close()
+"""
+
+
+@pytest.fixture
+def broker_sock(monkeypatch):
+    """A short socket path (a Unix socket path has a length limit that a test's tmp_path can pass), as the person's own."""
+    import shutil
+    import tempfile
+
+    folder = Path(tempfile.mkdtemp(prefix="wsb", dir="/tmp" if os.path.isdir("/tmp") else None))
+    sock = folder / "broker.sock"
+    monkeypatch.setattr(upgrade, "broker_socket", lambda env: sock)
+    yield sock
+    shutil.rmtree(folder, ignore_errors=True)
+
+
+@pytest.fixture
+def stub_broker(broker_sock):
+    """Start a stand-in broker process that answers `status` with a version and a lease count; SIGTERM ends it."""
+    import time
+
+    procs: list[subprocess.Popen] = []
+
+    def start(version: str, leases: int = 0) -> subprocess.Popen:
+        p = subprocess.Popen([sys.executable, "-I", "-c", _STUB_BROKER, str(broker_sock), version, str(leases)])
+        procs.append(p)
+        end = time.monotonic() + 30
+        while not Path(str(broker_sock) + ".ready").exists():
+            assert time.monotonic() < end and p.poll() is None, "the stand-in broker did not start"
+            time.sleep(0.02)
+        return p
+
+    yield start
+    for p in procs:
+        if p.poll() is None:
+            p.kill()
+        p.wait()
+
+
+@pytest.fixture
+def starts(monkeypatch):
+    got: list[Path] = []
+    monkeypatch.setattr(upgrade, "start_broker", lambda new, sock: got.append(sock) or True)
+    return got
+
+
+unix_only = pytest.mark.skipif(not hasattr(__import__("socket"), "AF_UNIX"), reason="Unix sockets")
+
+
+@unix_only
+def test_a_broker_on_older_code_is_stopped_and_a_new_one_started(
+    cutover, old, stub_broker, starts, broker_sock, capsys
+):
+    stub = stub_broker("0.0.1")
+    assert cli.main(["upgrade"]) == 0
+    assert stub.wait(timeout=20) == -signal.SIGTERM
+    assert starts == [broker_sock]
+    assert "restarted on ws 9.9.9" in capsys.readouterr().out
+    assert [(d["step"], d["exit"], d["tail"]) for d in _log() if d["step"] == "broker"] == [("broker", 0, [])]
+
+
+@unix_only
+def test_a_broker_on_the_new_version_is_left_alone(cutover, old, stub_broker, starts):
+    stub = stub_broker("9.9.9")
+    assert cli.main(["upgrade"]) == 0
+    assert stub.poll() is None and starts == []
+
+
+@unix_only
+def test_a_broker_with_a_lease_open_is_left_running_and_the_way_to_finish_is_named(
+    cutover, old, stub_broker, starts, capsys
+):
+    stub = stub_broker("0.0.1", leases=1)
+    assert cli.main(["upgrade"]) == 0
+    assert stub.poll() is None and starts == []
+    out = capsys.readouterr().out
+    assert "1 lease(s) open" in out and f"kill {stub.pid}" in out
+
+
+@unix_only
+def test_a_broker_whose_process_is_not_this_users_is_left_running(
+    cutover, old, stub_broker, starts, capsys, monkeypatch
+):
+    stub = stub_broker("0.0.1")
+    monkeypatch.setattr(upgrade, "_peer_cred", lambda conn: (stub.pid, os.getuid() + 1))
+    assert cli.main(["upgrade"]) == 0
+    assert stub.poll() is None and starts == []
+    assert "cannot tell that its process is yours" in capsys.readouterr().out
+
+
+@unix_only
+def test_an_auto_rollback_never_touches_the_broker(cutover, old, stub_broker, starts, monkeypatch):
+    stub = stub_broker("0.0.1")
+    monkeypatch.setattr(
+        upgrade, "_run", lambda argv, capture, timeout=None: upgrade.Ran(1 if argv[0] == "healthprobe" else 0)
+    )
+    assert cli.main(["upgrade", "--check", "healthprobe"]) == 1
+    assert stub.poll() is None and starts == []
+
+
+@unix_only
+def test_a_rollback_restarts_the_broker_too(cutover, old, stub_broker, starts, broker_sock):
+    stub = stub_broker("0.0.1")
+    assert cli.main(["upgrade", "--rollback", "--version", "0.0.1"]) == 0
+    assert stub.wait(timeout=20) == -signal.SIGTERM and starts == [broker_sock]
+
+
+@unix_only
+def test_dry_run_says_what_it_would_do_with_the_broker(cutover, old, stub_broker, starts, capsys):
+    stub = stub_broker("0.0.1")
+    assert cli.main(["upgrade", "--dry-run"]) == 0
+    assert stub.poll() is None and starts == []
+    assert "would stop it and start one of the new ws" in capsys.readouterr().out
+
+
+@unix_only
+def test_no_broker_running_is_nothing_to_do(cutover, old, broker_sock, starts):
+    assert cli.main(["upgrade"]) == 0
+    assert starts == []
+
+
+@unix_only
+def test_the_new_broker_is_started_by_the_ws_the_installer_wrote(broker_sock, tmp_path):
+    """The real start: `ws.run._start_broker` in a process of the given Python, which leaves a broker answering."""
+    new = upgrade.NewWs(selfcmd.argv(), sys.executable, __version__, "this test")
+    assert upgrade.start_broker(new, broker_sock)
+    peer = upgrade.ask_broker(broker_sock)
+    try:
+        assert peer.status["version"] == __version__ and peer.uid == os.getuid() and peer.pid
+    finally:
+        os.kill(peer.pid, signal.SIGTERM)
+        assert upgrade._gone(broker_sock, 20)

@@ -57,6 +57,8 @@ import os
 import shlex
 import shutil
 import signal
+import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -79,6 +81,8 @@ HISTORY_SCHEMA = 1  # of a line in upgrade-history.jsonl
 LOG_SCHEMA = 1  # of a line in logs/upgrade.jsonl
 TAIL_LINES, _TAIL_WIDTH = 20, 500  # of each step's output, kept for the log
 _TAIL_STEPS = ("installer", "hooks")  # the steps whose output the log keeps
+BROKER_STOP_S = 10.0  # how long a stopped broker has to close its socket
+BROKER_START_S = 30.0  # how long the new broker has to answer
 STEP_ENV = "WS_UPGRADE_STEP"  # set for each step the upgrade runs: a hooks rewrite there leaves the log line to it
 INSTALL_TIMEOUT_S, STEP_TIMEOUT_S = 600.0, 120.0  # the watchdog per step: the installer, then the hooks and the check
 INSTALLER_URL = "https://raw.githubusercontent.com/Michael-A-Fry/ws/main/install.sh"
@@ -514,7 +518,7 @@ def _tag(version: str) -> str:
     return version if version.startswith("v") else f"v{version}"
 
 
-def reinstall(args: argparse.Namespace, env: Mapping[str, str], version: str) -> Ran:
+def reinstall(args: argparse.Namespace, env: Mapping[str, str], version: str) -> tuple[Ran, NewWs | None]:
     """Install `version` and rewrite the hooks for it with the ws the installer left: the way back. Code 0 when both
     steps worked."""
     ns = argparse.Namespace(**{**vars(args), "version": _tag(version), "channel": None})
@@ -522,10 +526,158 @@ def reinstall(args: argparse.Namespace, env: Mapping[str, str], version: str) ->
         os.chmod(scratch, 0o700)
         ran = swap(ns, Path(scratch))
     if ran.code != 0:
-        return ran
+        return ran, None
     new = installed_ws(env)
     _using(ns, new)
-    return _step(ns, "hooks", _hooks_argv(new), _step_limit(args), new.version)
+    return _step(ns, "hooks", _hooks_argv(new), _step_limit(args), new.version), new
+
+
+# ---- the broker -------------------------------------------------------------------------------------------------------------
+
+
+class Peer(NamedTuple):
+    """What a broker said about itself on one connection, and who served it (from the kernel, not from the reply)."""
+
+    status: dict
+    pid: int | None
+    uid: int | None
+
+
+def broker_socket(env: Mapping[str, str]) -> Path:
+    """The person's own broker socket: the one `ws run` starts a broker on. No other socket is ever touched."""
+    return paths.state_dir(dict(env)).absolute() / "run" / "broker.sock"
+
+
+def _peer_cred(conn: socket.socket) -> tuple[int | None, int | None]:
+    """(pid, uid) of the process at the other end, from SO_PEERCRED; (None, None) where the kernel does not say."""
+    opt = getattr(socket, "SO_PEERCRED", None)
+    if opt is None:
+        return None, None
+    try:
+        pid, uid, _gid = struct.unpack("3i", conn.getsockopt(socket.SOL_SOCKET, opt, struct.calcsize("3i")))
+    except OSError:
+        return None, None
+    return pid, uid
+
+
+def ask_broker(sock: Path, timeout: float = 3.0) -> Peer:
+    """Ask the broker on `sock` for `status` and read who answered on the same connection. Raises OSError or ValueError
+    when nothing answers or the reply is not a status."""
+    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    conn.settimeout(timeout)
+    try:
+        conn.connect(str(sock))
+        pid, uid = _peer_cred(conn)
+        conn.sendall(b'{"op": "status"}\n')
+        buf = b""
+        while b"\n" not in buf and len(buf) < 65536:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+    finally:
+        conn.close()
+    reply = json.loads(buf.split(b"\n", 1)[0])
+    if not isinstance(reply, dict) or reply.get("ok") is not True:
+        raise ValueError("the broker's reply is not a status")
+    return Peer(reply, pid, uid)
+
+
+def _gone(sock: Path, limit: float) -> bool:
+    """Whether nothing answers on `sock` any more, within `limit` seconds."""
+    end = time.monotonic() + limit
+    while True:
+        try:
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                probe.settimeout(1.0)
+                probe.connect(str(sock))
+            finally:
+                probe.close()
+        except (FileNotFoundError, ConnectionRefusedError):
+            return True
+        except OSError:
+            pass
+        if time.monotonic() >= end:
+            return False
+        time.sleep(0.1)
+
+
+_START = (
+    "import sys\nfrom pathlib import Path\nfrom ws import run\n"
+    "sys.exit(0 if run._start_broker(Path(sys.argv[1])) else 1)\n"
+)
+
+
+def start_broker(new: NewWs, sock: Path) -> bool:
+    """Start a broker of the ws the installer wrote, the way `ws run` does (`ws.run._start_broker`), in a process of
+    that ws so the broker runs its code."""
+    try:
+        p = subprocess.run(
+            [new.python, "-I", "-c", _START, str(sock)],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=BROKER_START_S + 10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return p.returncode == 0
+
+
+def restart_broker(args: argparse.Namespace, env: Mapping[str, str], new: NewWs) -> int:
+    """After a swap whose hooks step and check both passed: a broker still running older code than the ws now installed
+    is stopped and a new one started, so no step is left to the person (C651). Only the person's own socket; only when
+    it holds no lease; only a server the kernel says is this user's. Anything else is left running and the command that
+    finishes it is printed. A one-shot call that is in flight when the stop lands fails, and its caller asks again.
+    Returns 0 when nothing is left to do."""
+    t = time.monotonic()
+    code = _restart_broker(args, env, new)
+    log_step(args, env, "broker", Ran(code), time.monotonic() - t, new.python, new.version)
+    return code
+
+
+def _restart_broker(args: argparse.Namespace, env: Mapping[str, str], new: NewWs) -> int:
+    sock = broker_socket(env)
+    try:
+        peer = ask_broker(sock)
+    except (OSError, ValueError):
+        return 0  # none running: the next `ws run` starts one of the new ws
+    running, leases = peer.status.get("version"), peer.status.get("leases")
+    if not new.version or running == new.version:
+        return 0
+    finish = f"kill {peer.pid}" if peer.pid else "stop the broker"
+    finish += "; the next `ws run` starts one of the new ws"
+    if leases != 0:
+        _say(
+            args,
+            f"the broker still runs ws {running} with {leases} lease(s) open, so it is left running; when they are done: {finish}",
+        )
+        return EXIT_FAILED
+    getuid = getattr(os, "getuid", None)
+    if peer.pid is None or getuid is None or peer.uid != getuid():
+        _say(
+            args,
+            f"the broker runs ws {running}, and ws cannot tell that its process is yours, so it is left running: {finish}",
+        )
+        return EXIT_FAILED
+    if args.dry_run:
+        _say(args, f"would stop the broker (ws {running}, pid {peer.pid}) and start one of ws {new.version}")
+        return 0
+    _say(args, f"the broker runs ws {running}: stopping it (pid {peer.pid}) and starting one of ws {new.version}")
+    try:
+        os.kill(peer.pid, signal.SIGTERM)
+    except OSError as e:
+        _say(args, f"could not stop the broker ({type(e).__name__}): {finish}")
+        return EXIT_FAILED
+    if not _gone(sock, BROKER_STOP_S):
+        _say(args, f"the broker did not stop within {BROKER_STOP_S:.0f} seconds: {finish}")
+        return EXIT_FAILED
+    if not start_broker(new, sock):
+        _say(args, "the old broker is stopped; the new one did not answer yet, and the next `ws run` starts it")
+        return EXIT_FAILED
+    _say(args, f"the broker is restarted on ws {new.version}")
+    return 0
 
 
 # ---- the command ------------------------------------------------------------------------------------------------------------
@@ -607,6 +759,7 @@ def _both(args: argparse.Namespace, env: Mapping[str, str]) -> int:
     before = __version__
     if args.dry_run:
         _say(args, "would run the installer, then `ws upgrade --hooks-only` with the new ws")
+        _say(args, "then, if the broker runs older code and holds no lease, would stop it and start one of the new ws")
         return _hooks_logged(args, env)
     tree = selfcmd.unstable()
     if tree:
@@ -659,6 +812,7 @@ def _both(args: argparse.Namespace, env: Mapping[str, str]) -> int:
             why = "the check ran past its time limit" if ran.timed_out else f"the check failed (exit {ran.code})"
             return _auto_rollback(args, env, before, why)
     record(env, "promote", before, new.version)
+    restart_broker(args, env, new)
     if args.json:
         output.result({"from": before, "binary": "swapped", "hooks": "rewritten", "checked": bool(check)})
     else:
@@ -670,7 +824,7 @@ def _auto_rollback(args: argparse.Namespace, env: Mapping[str, str], before: str
     """A cut-over step went wrong after the swap began: put `before` back at once."""
     _say(args, f"{why}; going back to ws {before}")
     args.log_verb = "auto-rollback"
-    code = reinstall(args, env, before).code
+    code = reinstall(args, env, before)[0].code
     record(env, "auto-rollback", before, before if code == 0 else None)
     if code != 0:
         _say(
@@ -702,7 +856,7 @@ def _rollback(args: argparse.Namespace, env: Mapping[str, str]) -> int:
             "install ws with install.sh first",
             EXIT_REFUSED,
         )
-    ran = reinstall(args, env, target)
+    ran, new = reinstall(args, env, target)
     if ran.code != 0:
         record(env, "rollback", before, None)
         _say(
@@ -711,6 +865,8 @@ def _rollback(args: argparse.Namespace, env: Mapping[str, str]) -> int:
         )
         return EXIT_FAILED if ran.timed_out else ran.code
     record(env, "rollback", before, target)
+    if new is not None:
+        restart_broker(args, env, new)
     if args.json:
         output.result({"from": before, "to": target, "binary": "swapped", "hooks": "rewritten"})
     else:

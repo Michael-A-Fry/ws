@@ -999,7 +999,14 @@ def _runner_wall(
         return argv, child_env, ()
     from ws import sandbox
 
-    lookup = {**os.environ, **child_env}  # where the real home is, and the generated folder the runner is told to read
+    # Where the real home is, and the generated folder the runner is told to read. A job's own HOME and XDG folders
+    # (the adapter's isolation) are not the real ones: the lookup keeps the real values, and the wall binds the job's
+    # data, state and cache folders instead of the persistent private ones.
+    own = ("HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME")
+    lookup = {**os.environ, **{k: v for k, v in child_env.items() if k not in own}}
+    run_homes = {
+        k: child_env[k] for k in ("XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME") if k in child_env
+    } or None
     try:
         wall = walls.enter_context(
             sandbox.walled(
@@ -1013,6 +1020,7 @@ def _runner_wall(
                 protect=sandbox.protected(policy.policy_path().absolute(), job.runner, None, lookup),
                 cls=_job_class(pol, job),
                 cwd=str(cwd),
+                run_homes=run_homes,
             )
         )
     except (sandbox.SandboxError, WsError) as e:  # WsError: `refused` from a launch file or the runner's project check

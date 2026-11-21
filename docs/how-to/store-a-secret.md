@@ -25,10 +25,10 @@ You type the value yourself, in your own terminal. Never paste a key into an AI 
    For a bearer token, use `header = "authorization"` and `format = "Bearer {value}"`. Leave `purposes` out to allow any.
    Keep `hosts` to the one host that needs the key. `paths = ["/v1/messages"]` limits the broker to those request paths
    (a prefix on a folder boundary; anything else gets a 403 and never reaches the host).
-   `base_path = "/api"` puts that path in front of every request path on its way out, for a host that serves its API under a
-   prefix (the tool's `/v1/messages` reaches the host as `/api/v1/messages`). It starts with `/`, uses letters, digits and
-   `._~/-` only, and has no `.` or `..` part, no `//` and no query. `paths` still judges the path the tool sent, before the
-   prefix is added.
+   `base_path = "/api"` puts that path in front of every request path on its way out, for a host that serves its API
+   under a prefix (the tool's `/v1/messages` reaches the host as `/api/v1/messages`). It starts with `/`, uses letters,
+   digits and `._~/-` only, and has no `.` or `..` part, no `//` and no query. `paths` still judges the path the tool
+   sent, before the prefix is added.
    With `paths` set, a request path may hold only letters, digits and `._~/-`, and the list can't be empty. A change to
    `paths` or `ttl` bites open leases too. `ttl = 600` ends this name's
    leases after 600 seconds (an hour is the default, a day the most). To lease it only to runs that declare it, add a

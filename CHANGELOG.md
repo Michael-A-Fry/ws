@@ -11,11 +11,16 @@ body of the GitHub release.
 ### Added
 
 - The message wall: the gate refuses a send-message call from a session in a walled or counts-only class, or in a
-  folder no class names, on
-  every route (this machine or a Remote Control bridge). Such a session talks to others through `ws msg`.
+  folder no class names, on every route (this machine or a Remote Control bridge). Such a session talks to others through `ws msg`.
   `ws walls check` gains `no-message-crossings`, which fails on any such call a class's verdict log shows allowed.
 - `ws gate replay --metrics` gives false blocks per 100 calls and exits 1 when check()'s p95 is over a budget
   (`--p95-budget-ms`, default 50).
+- `ws queue report [--weekly] [--weeks N]`: a row a week of gate blocks, slot stalls and hand-offs, with the runs
+  that finished and those killed by their own cap.
+- `ws queue slot` gives each session a share of a lane while another session waits (`--session`, else
+  `WS_SLOT_SESSION`, else the runner's session id); a session alone still takes every slot.
+- A slot wait past `slot_max_wait_s` (default 30 minutes) is requeued in its place and counted, not failed. The
+  queue store is schema 6 (`session`, `requeues`); an older store gains the columns when it opens.
 - `ws dispatch REPO PROMPT`: start a runner's session in a new tmux window in a repository's folder, with
   `--name`, `--model`, `--runner` and `--dry-run`. Each flag and the prompt reach the runner as separate arguments.
   The code root is `WS_CODE_ROOT`, else `[dispatch] code_root` in the profile, else `~/code`.
@@ -62,6 +67,13 @@ body of the GitHub release.
 
 ### Fixed
 
+- `ws install` and an upgrade no longer write `permissions.disableBypassPermissionsMode` into your own Claude Code
+  `settings.json`: your bypass setting stays as you have it, and `ws install` prints a line saying so. The entry release
+  0.1.11 wrote there comes out on the next `ws install`. The settings `ws gate launch` passes and a class's managed
+  file still hold bypass off.
+- The pre-push hook refuses a push that carries an unsigned commit (`git log --format='%G?'` shows `N`), before the
+  tests run, warns on a signature git can't check, and refuses a bad or revoked one or a push whose commits git can't
+  list. It does nothing when `CI` is set (one line goes in the skip log).
 - The gate: ssh options that run or load local files are now judged (an `-o` keyword ws doesn't know runs nothing
   here is refused, and so are `-F`, `-I`, `-E` and an askpass program), through any wrapper (`sudo`, `timeout`,
   `command`, a full path). Plain options (`-p`, `-l`, `-J`, `-o Port=...`) run as before.

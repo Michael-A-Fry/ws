@@ -15,7 +15,8 @@ from what it used. `src/ws/queue.py` is the code; this page is the contract. The
 | `ws queue run [--max N]` | Run what's queued, one after another. This is what a timer runs. |
 | `ws queue tick JOB [--slot T\|schedule] [--no-coalesce] [--skip-missed S] [--run]` | A schedule's tick: queue the run for slot T at most once (a double tick runs once), not while a run of the job waits or runs, and not when the slot is more than S seconds late. `--slot schedule` is the latest time of the job's schedule at or before now, which is what a timer passes, so a late catch-up fire gets the slot it missed. The job's `coalesce_if_active` and `skip_missed` keys set the defaults, and the flags override them. `--run` then drains the queue: a job timer runs `ws queue tick JOB --slot schedule --run`. |
 | `ws queue reap` | Record and tell, now, each run whose process is gone. The reaper timer runs it every 2 minutes, so a SIGKILL with nothing else starting after it's told within minutes. |
-| `ws queue slot --ram-gb N --lane ui --who join\|writer -- CMD...` | Wait for a slot, run `CMD` in it, give the slot back. Raw: the command's output and exit code are its own. |
+| `ws queue slot --ram-gb N --lane ui --who join\|writer [--session ID] [--max-wait-s S] -- CMD...` | Wait for a slot, run `CMD` in it, give the slot back. Raw: the command's output and exit code are its own. |
+| `ws queue report [--weekly] [--weeks N]` | One row for each seven days back from now: gate blocks, slot stalls, hand-offs, runs and runs killed by a cap. See [The weekly report](#the-weekly-report). |
 | `ws node join\|show\|remove` | The node's footprint ledger. See [Nodes](#nodes). |
 | `ws usage statusline` | The statusline command that stashes the subscription limits. See [Subscription limits](#subscription-limits). |
 
@@ -122,6 +123,31 @@ admitted before any `writer`'s; a `writer`'s only when its memory fits beside `j
 Waiters are ordered by who, then by when they first asked. A request that could never fit on the host (more memory than
 the host has beside the reserve) is refused.
 
+Each slot request counts against a session: `--session ID`, else `WS_SLOT_SESSION`, else the runner's session id
+(`CLAUDE_CODE_SESSION_ID`), else the process that started `ws queue slot` (`ppid:N`), so every request has one.
+While another session waits for the lane, a session that holds its share (the lane's slots over the sessions holding or
+waiting for one, rounded up) waits too, and it doesn't hold the other session's waiters back in the arrival order.
+A session alone in the lane takes every slot. `--max-wait-s` must be above 0.
+
+A wait that passes `slot_max_wait_s` is requeued, not failed: the receipt's `requeues` goes up by one, the waiter keeps
+its place in the arrival order, and it goes on waiting. Only the caller's own `--timeout-s` ends a wait
+(`SlotTimeout`, exit 1). Every receipt, in every lane, keeps `queued_at`, `started_at` and `finished_at`.
+
+## The weekly report
+
+`ws queue report` prints one row for the seven days to now (`--weeks N` for more rows, newest first), from what ws
+records itself:
+
+| Column | Counts |
+|---|---|
+| blocks | the gate's denies: lines in `logs/gate.jsonl` and each class's copy whose `decision` is `deny` |
+| stalls | slot waits, by when they queued, that went past `slot_max_wait_s` (requeued at least once) or were given up |
+| hand-offs | questions a session left for its person: `added` events in the asks store |
+| runs | runs that finished, by when they ended |
+| killed | those runs stopped by their own cap: stop reason `timeout`, `max_turns` or `max_budget` |
+
+The first three are the toil counts; runs and killed are the capacity beside them. `--json` gives the rows as a list.
+
 ## Settings
 
 Defaults are constants in `queue.py`; `[roles.queue]` in the profile overrides them:
@@ -139,6 +165,7 @@ Defaults are constants in `queue.py`; `[roles.queue]` in the profile overrides t
 | `ramp_s` | 60 | how long a new run's declared memory counts on top of MemAvailable |
 | `busy_s` | 5 | how long to wait for the store's lock before refusing |
 | `poll_s` | 5 | seconds between looks while waiting for a slot |
+| `slot_max_wait_s` | 1800 | seconds of waiting for a slot before the waiter is requeued (counted, kept in its place) |
 
 A wrong key or value is an error that names it (exit 2).
 

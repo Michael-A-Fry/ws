@@ -1841,7 +1841,7 @@ def test_a_schema_4_store_gains_the_told_at_column(tmp_path):
     ledger.close()
     again = make(tmp_path, host=host, sink=lambda rec: True, on_stop=lambda job, run_id, why: True)
     cols = {r[1] for r in again.conn().execute("PRAGMA table_info(receipts)")}
-    assert "told_at" in cols and again.conn().execute("PRAGMA user_version").fetchone()[0] == queue.SCHEMA_VERSION == 5
+    assert "told_at" in cols and again.conn().execute("PRAGMA user_version").fetchone()[0] == queue.SCHEMA_VERSION == 6
     assert again.receipt(old_id) is not None
     r = req(owner_pid=4990)
     assert again.admit(r, T0, spend()).kind == "admit"

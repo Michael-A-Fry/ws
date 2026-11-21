@@ -999,7 +999,7 @@ ws install [-h] [--stays-on yes|no] [--server ADDRESS|none] [--notes PATH] [--mo
 | `--gate every-session\|launch` | `every-session`: the runner's own user config carries ws's deny rules and hooks, so every session is gated. `launch`: only a session started with `ws gate launch` is. |
 | `--allow-widened-sandbox` | Keep settings of yours that open the sandbox (an excluded command, say); ws records the choice. |
 | `--class NAME` | Print the commands (`sudo` included), the two root-owned files for a class with an `os_user` (the managed-settings file and the launch file) and the way to take it all out again, and write nothing. ws creates no user and places no file. The launch file goes in a `ws-classes` folder beside the managed-settings one, which `ws gate launch` reads and Claude Code doesn't. See [Set up a class user](../how-to/set-up-a-class-user.md). |
-| `--cap USD` | Your own monthly spend cap. |
+| `--cap USD` | Your own monthly spend cap. With this flag it's an admin command: agent sessions can't set it. |
 | `-y`, `--yes` | No prompts. |
 | `--dry-run` | Show what would change; write nothing. |
 
@@ -1550,16 +1550,17 @@ ws setup [-h] [--web] [--no-open] [-y] [--plugin NAME] [--notes PATH]
 | `--plugin NAME` | Switch a plugin on; repeat for more (ws plugin list). |
 | `--notes PATH` | Your notes folder (default: a vault found, else ~/Notes). |
 | `--runner RUNNER` | The AI tool ws runs jobs with. One of `claude-code`, `opencode`. |
-| `--cap USD` | Your own monthly spend cap. |
+| `--cap USD` | Your own monthly spend cap. With this flag it's an admin command: agent sessions can't set it. |
 | `--region CC` | Your country (two letters); kept in `[machine] region`. |
 
 ## `ws config`
 
 Every file ws reads: where it's, which folder layout it came from, the keys it sets. `ws config fallback` shows, sets and
-clears the program that gets words ws has no command for (see [Your own commands](#your-own-commands)).
+clears the program that gets words ws has no command for (see [Your own commands](#your-own-commands)). `ws config model`
+and `ws config budget` show and set which model a job runs on and the monthly spend cap (see [Profile](profile.md)).
 
 ```text
-ws config [-h] [--clear] [{fallback}] [PATH]
+ws config [-h] [--clear] [--yes] [--dry-run] [{fallback,model,budget}] [VALUE ...]
 ```
 
 | Argument | Meaning |
@@ -1567,6 +1568,10 @@ ws config [-h] [--clear] [{fallback}] [PATH]
 | `fallback` | Show the fallback program. With `PATH`, set it; with `--clear`, remove it. |
 | `PATH` | With `fallback`: the program (absolute, or `~/...`). It has to be an executable file you own that nobody else can write to. |
 | `--clear` | With `fallback`: remove it. |
+| `model` | No value: each job, its purpose, its model and where it came from. `ID`: set `[models].default`. `PURPOSE ID`: set `[models].PURPOSE`. With a value it's an admin command (agent sessions can't run it). |
+| `budget USD` | Set `[roles.budget] monthly_cap_usd`. A positive number. An admin command (agent sessions can't run it). |
+| `--yes` | With `model` or `budget`: write without asking. |
+| `--dry-run` | With `model` or `budget`: print the change, write nothing. |
 
 ## `ws status`
 

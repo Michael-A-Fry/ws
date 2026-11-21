@@ -757,9 +757,6 @@ def _planted(extra: str):
 @pytest.mark.parametrize(
     "extra, check",
     [
-        ('allow_mcp = ["mcp__docs__search"]', "mcp"),
-        ('deny_tools = ["mcp__*__delete_*"]', "mcp"),
-        ('deny_tools = ["mcp__docs"]', "mcp"),  # a whole server has no OpenCode rule: not a silent allow
         ('allow_hosts = ["example.com"]', "allow_hosts"),
     ],
 )
@@ -772,6 +769,16 @@ def test_opencode_refuses_a_policy_that_needs_a_check_it_cannot_do(extra, check)
     assert e.value.exit_code == 3 and e.value.kind == "cannot_check"
     assert "CANNOT_CHECK" in e.value.message and check in e.value.message
     conformance.refuse_cannot_check(_planted(extra), "claude-code")  # the same policy is fine where it can be checked
+
+
+@pytest.mark.parametrize(
+    "extra",
+    ['allow_mcp = ["mcp__docs__search"]', 'deny_tools = ["mcp__*__delete_*"]', 'deny_tools = ["mcp__docs"]'],
+)
+def test_opencode_job_mcp_rules_are_enforced_by_starting_no_server_so_no_refusal(extra):
+    from ws import conformance
+
+    conformance.refuse_cannot_check(_planted(extra), "opencode")
 
 
 def test_opencode_refuses_an_unsupported_guard_that_is_on_and_not_otherwise():
@@ -807,13 +814,38 @@ def _opencode_job(run_ws, policy_text):  # noqa: F811
     )
 
 
-def test_ws_run_refuses_an_opencode_job_whose_policy_allows_an_mcp_tool(run_ws, capsys):  # noqa: F811
+def test_ws_run_no_longer_refuses_an_opencode_job_whose_policy_has_allow_mcp(run_ws):  # noqa: F811
     _opencode_job(run_ws, '[gate]\nallow_mcp = ["mcp__docs__search"]\n')
-    assert cli.main(["run", "daily"]) == 3
-    err = capsys.readouterr().err
-    assert "CANNOT_CHECK" in err and "mcp" in err
-    (rec,) = run_ws.records()
-    assert rec["status"] == "refused" and rec["stop_reason"] == "refused:cannot_check"
+    cli.main(["run", "daily"])
+    assert all(r["stop_reason"] != "refused:cannot_check" for r in run_ws.records())
+
+
+def _job_for(options: str = ""):
+    from ws import jobs
+
+    text = f'runner = "opencode"\nmodel = "openrouter/x:free"\nprompt = "ok"\n{options}\n'
+    return jobs.loads("daily", text, Path("."))
+
+
+def test_an_opencode_job_gets_a_config_with_zero_mcp_servers_and_no_other_config_source(tmp_path):
+    from ws.adapters import opencode
+
+    (tmp_path / "gate").mkdir()
+    cfg = opencode.generate(policy.default_policy(), ["ws"], tmp_path / "gate", tmp_path / "policy.toml")
+    assert json.loads(cfg["opencode.json"])["mcp"] == {}
+    (tmp_path / "gate" / "opencode.json").write_text(cfg["opencode.json"])
+    _argv, env = opencode.build_command(_job_for(), tmp_path, None)
+    assert json.loads(env["OPENCODE_CONFIG_CONTENT"])["mcp"] == {}
+    assert env["OPENCODE_DISABLE_PROJECT_CONFIG"] == "true"
+    assert env["HOME"] == str(tmp_path / "oc-home") and not list((tmp_path / "oc-home" / ".config").rglob("*.json*"))
+
+
+def test_an_opencode_job_that_names_an_mcp_server_is_refused(tmp_path):
+    from ws.adapters import opencode
+
+    for option in ('[runner_options]\nmcp = ["docs"]', '[runner_options.mcp.docs]\ntype = "local"'):
+        with pytest.raises(ValueError, match="mcp"):
+            opencode.build_command(_job_for(option), tmp_path, None)
 
 
 def test_ws_run_does_not_refuse_the_same_policy_for_claude_code(run_ws):  # noqa: F811
@@ -821,3 +853,74 @@ def test_ws_run_does_not_refuse_the_same_policy_for_claude_code(run_ws):  # noqa
     run_ws.job()  # the stock claude-code job
     cli.main(["run", "daily"])
     assert all(r["stop_reason"] != "refused:cannot_check" for r in run_ws.records())
+
+
+def _plant_home(home: Path) -> None:
+    for rel, body in (
+        (".opencode/opencode.json", '{"mcp": {"evil": {"type": "local", "command": ["true"]}}}'),
+        (".opencode/tool/x.js", "export default {}"),
+        (".opencode/plugins/x.js", "export default {}"),
+        (".config/opencode/opencode.json", '{"mcp": {"evil": {"type": "local", "command": ["true"]}}}'),
+        (".local/share/opencode/auth.json", '{"corp": {"type": "wellknown", "key": "k", "token": "t"}}'),
+    ):
+        (home / rel).parent.mkdir(parents=True, exist_ok=True)
+        (home / rel).write_text(body)
+
+
+def test_an_opencode_job_runs_with_a_fresh_empty_home_and_xdg_so_planted_sources_load_nothing(tmp_path, monkeypatch):
+    from ws.adapters import opencode
+
+    home = tmp_path / "home"
+    _plant_home(home)
+    monkeypatch.setenv("HOME", str(home))
+    run_dir = tmp_path / "run"
+    (run_dir / "gate").mkdir(parents=True)
+    _argv, env = opencode.build_command(_job_for(), run_dir, None)
+    fresh = run_dir / "oc-home"
+    assert env["HOME"] == str(fresh)
+    for var in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"):
+        folder = Path(env[var])
+        assert folder.is_dir() and fresh in folder.parents, var
+        assert [f.relative_to(folder).as_posix() for f in folder.rglob("*") if f.is_file()] in (
+            [],
+            ["opencode/.gitignore"],
+        ), var
+    assert not (fresh / ".opencode").exists() and not list(fresh.rglob("auth.json"))
+    assert str(home) not in json.dumps(env)  # nothing of the real home reaches the runner
+
+
+def test_an_opencode_job_is_refused_when_etc_opencode_has_a_config(tmp_path, monkeypatch):
+    from ws.adapters import opencode
+
+    etc = tmp_path / "etc"
+    etc.mkdir()
+    (etc / "opencode.json").write_text('{"mcp": {"evil": {"type": "local", "command": ["true"]}}}')
+    (etc / "opencode.jsonc").write_text('{"mcp": {"evil": {"type": "local", "command": ["true"]}}}')
+    monkeypatch.setattr(opencode, "ETC_OPENCODE", etc)
+    (tmp_path / "run" / "gate").mkdir(parents=True)
+    with pytest.raises(ValueError, match="etc"):
+        opencode.build_command(_job_for(), tmp_path / "run", None)
+
+
+def test_an_opencode_job_with_no_etc_config_is_not_refused(tmp_path, monkeypatch):
+    from ws.adapters import opencode
+
+    monkeypatch.setattr(opencode, "ETC_OPENCODE", tmp_path / "no-etc")
+    (tmp_path / "run" / "gate").mkdir(parents=True)
+    opencode.build_command(_job_for(), tmp_path / "run", None)
+
+
+def test_an_unreadable_etc_opencode_refuses_cleanly(tmp_path, monkeypatch):
+    from ws.adapters import opencode
+
+    etc = tmp_path / "etc"
+    etc.mkdir()
+    (etc / "opencode.json").write_text("{}")
+    monkeypatch.setattr(opencode, "ETC_OPENCODE", etc)
+    etc.chmod(0)
+    try:
+        (tmp_path / "run" / "gate").mkdir(parents=True)
+        with pytest.raises(ValueError, match="cannot be read|exists"):
+            opencode.build_command(_job_for(), tmp_path / "run", None)
+    finally:
+        etc.chmod(0o700)

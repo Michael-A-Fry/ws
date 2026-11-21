@@ -291,12 +291,3 @@ def cmd_config(args: argparse.Namespace) -> int:
     else:
         print(f"fallback: {current}" if current else "fallback: none")
     return 0
-
-
-def register(sub) -> None:
-    """Adds `fallback` to `ws config`: the command takes an optional topic, so `ws config` alone is unchanged."""
-    c = sub.choices["config"]
-    c.add_argument("topic", nargs="?", choices=["fallback"], help="`fallback`: the program that gets words ws lacks")
-    c.add_argument("value", nargs="?", metavar="PATH", help="with `fallback`: the program (absolute, or ~/...)")
-    c.add_argument("--clear", action="store_true", help="with `fallback`: remove it")
-    c.set_defaults(func=cmd_config)

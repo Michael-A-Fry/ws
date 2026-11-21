@@ -71,7 +71,7 @@ def test_prompt_file_is_read_relative_to_the_jobs_folder(tmp_path):
     ("text", "names"),
     [
         ('model = "m"\nprompt = "p"\n', "runner is required"),
-        ('runner = "claude-code"\nprompt = "p"\n', "model is required"),
+        ('runner = "claude-code"\nmodel = ""\nprompt = "p"\n', "model must be a non-empty string"),
         ('runner = "claude-code"\nmodel = "m"\n', "exactly one of prompt and prompt_file"),
         (GOOD + 'prompt_file = "x.md"\n', "exactly one of prompt and prompt_file"),
         (GOOD.replace("claude-code", "nope"), "runner 'nope' is not known"),
@@ -333,3 +333,103 @@ def test_doctor_warns_about_gaps_and_fails_for_a_job_ws_refuses(tmp_path, monkey
     cli.main(["doctor", "--offline", "--json"])
     ws006 = {c["id"]: c for c in json.loads(capsys.readouterr().out)["data"]["checks"]}["WS006"]
     assert ws006["status"] == "fail" and "broken" in ws006["detail"]
+
+
+# ---- the model a job runs on: the job's own, else [models].<purpose>, else [models].default ------------------------
+
+NO_MODEL = 'runner = "claude-code"\nprompt = "p"\n'
+
+
+def home_with(tmp_path, job: str, prof: str | None = None, name: str = "daily") -> dict:
+    home = tmp_path / "wshome"
+    (home / "jobs").mkdir(parents=True, exist_ok=True)
+    home.chmod(0o700)
+    (home / "jobs").chmod(0o700)
+    (home / "jobs" / f"{name}.toml").write_text(job, encoding="utf-8")
+    if prof is not None:
+        (home / "profile.toml").write_text(prof, encoding="utf-8")
+    return {"WS_HOME": str(home), "HOME": str(tmp_path / "userhome")}
+
+
+def test_loads_is_pure_a_job_without_a_model_parses_with_none():
+    assert load(NO_MODEL).model is None
+
+
+def test_no_profile_and_no_model_refuses_with_the_exact_text(tmp_path):
+    env = home_with(tmp_path, NO_MODEL)
+    with pytest.raises(jobs.NoModelError) as e:
+        jobs.load("daily", env)
+    assert str(e.value) == "no model for job daily: set model in the job file, or run: ws config model ID"
+    assert e.value.kind == "no_model"
+
+
+def test_a_profile_without_models_refuses_and_names_the_purpose_form(tmp_path):
+    env = home_with(tmp_path, NO_MODEL + 'purpose = "jobs"\n', "[roles.budget]\nmonthly_cap_usd = 5\n")
+    with pytest.raises(jobs.NoModelError) as e:
+        jobs.load("daily", env)
+    assert str(e.value) == "no model for job daily: set model in the job file, or run: ws config model jobs ID"
+
+
+def test_models_with_no_default_and_no_matching_purpose_refuses(tmp_path):
+    env = home_with(tmp_path, NO_MODEL + 'purpose = "jobs"\n', '[models]\nreview = "m-review"\n')
+    with pytest.raises(jobs.NoModelError):
+        jobs.load("daily", env)
+
+
+def test_a_purpose_entry_wins_over_the_default(tmp_path):
+    env = home_with(tmp_path, NO_MODEL + 'purpose = "jobs"\n', '[models]\ndefault = "m-default"\njobs = "m-jobs"\n')
+    assert jobs.load("daily", env).model == "m-jobs"
+
+
+def test_the_default_fills_a_job_with_no_purpose_or_an_unlisted_one(tmp_path):
+    env = home_with(tmp_path, NO_MODEL, '[models]\ndefault = "m-default"\njobs = "m-jobs"\n')
+    assert jobs.load("daily", env).model == "m-default"
+    env = home_with(tmp_path, NO_MODEL + 'purpose = "other"\n', name="other")
+    assert jobs.load("other", env).model == "m-default"
+
+
+def test_a_job_that_names_its_model_wins_and_never_reads_the_profile(tmp_path):
+    env = home_with(tmp_path, GOOD + 'purpose = "jobs"\n', '[models]\ndefault = "x"\njobs = "y"\n')
+    assert jobs.load("daily", env).model == "claude-haiku-4-5"
+    (tmp_path / "wshome" / "profile.toml").write_text("not = [toml", encoding="utf-8")
+    assert jobs.load("daily", env).model == "claude-haiku-4-5"  # as before [models]: a bad profile is not its problem
+
+
+def test_ids_pass_through_unchanged(tmp_path):
+    env = home_with(tmp_path, NO_MODEL, '[models]\ndefault = "ollama/gemma3:12b"\n')
+    assert jobs.load("daily", env).model == "ollama/gemma3:12b"
+
+
+@pytest.mark.parametrize(
+    ("prof", "names"),
+    [
+        ('models = "x"\n', "[models] must be a table"),
+        ('[models]\ndefault = ""\n', "[models].default must be a non-empty model id"),
+        ("[models]\ndefault = 3\n", "[models].default must be a non-empty model id"),
+        ('[models]\ndefault = "ok"\n"bad key" = "m"\n', "is not a plain name"),
+    ],
+)
+def test_a_bad_models_table_refuses_the_whole_table(tmp_path, prof, names):
+    env = home_with(tmp_path, NO_MODEL, prof)
+    with pytest.raises(jobs.JobError) as e:
+        jobs.load("daily", env)
+    assert names in str(e.value) and not isinstance(e.value, jobs.NoModelError)
+
+
+def test_an_unreadable_profile_refuses_a_job_that_needs_it(tmp_path):
+    env = home_with(tmp_path, NO_MODEL, "not = [toml")
+    with pytest.raises(jobs.JobError, match="names no model and the profile cannot be read"):
+        jobs.load("daily", env)
+
+
+def test_a_job_without_a_model_still_lists_with_no_problem(tmp_path):
+    env = home_with(tmp_path, NO_MODEL)
+    assert jobs.problems(env) == {}
+
+
+def test_resolve_model_says_where_the_model_came_from():
+    j = load(NO_MODEL + 'purpose = "jobs"\n')
+    assert jobs.resolve_model(j, None) == (None, "none")
+    assert jobs.resolve_model(j, {"models": {"default": "d"}}) == ("d", "default")
+    assert jobs.resolve_model(j, {"models": {"default": "d", "jobs": "p"}}) == ("p", "purpose")
+    assert jobs.resolve_model(load(GOOD), {"models": {"default": "d"}}) == ("claude-haiku-4-5", "job")

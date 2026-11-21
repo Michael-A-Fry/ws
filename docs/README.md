@@ -60,6 +60,7 @@ Measure:
 - [CLI](reference/cli.md): every command and flag, the exit codes and the JSON envelope.
 - [Doctor checks](reference/doctor-checks.md): every `WS` ID with its meaning and fix.
 - [Policy](reference/policy.md): every `policy.toml` key.
+- [Profile](reference/profile.md): which model each job runs on, the spend cap, and the `ws config` setters.
 - [Guards](reference/guards.md): the named checks, their events and findings, replay.
 - [Messages](reference/messages.md): the message store, its commands, and how a message reaches a session.
 - [CI](reference/ci.md): each workflow job, its time budget, the test-integrity check and the holdout.

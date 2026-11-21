@@ -23,7 +23,7 @@ end up in a chat or a log. How do these steps stay the same everywhere, and give
 Chosen option: the declarative file and one engine. A flow is `src/ws/connect/flows/<id>.toml` (schema
 `ws.connect-flow/1`, JSON Schema in docs/reference/connect-flow.schema.json) and `ws connect` is the command.
 This is a format, not a plug-in framework: the step types are a closed set, flows are found only in that folder, and a
-third party cannot add one. It is not a stable extension point before 1.0, and the core stays standard-library only
+third party can't add one. It's not a stable extension point before 1.0, and the core stays standard-library only
 ([0018](0018-core-is-standard-library-only.md)).
 
 Each rule and where it comes from:
@@ -44,8 +44,8 @@ arrived (it binds the chat). Revoke deletes the secret and tells the person to s
 Rules that follow from where the secret goes:
 
 - The verify call runs only in the person's own terminal, in the engine's process, never in an agent's. A Telegram token
-  sits in the URL path, which the broker's header injection cannot carry, so the broker is not the route here.
-- The flow declares a `[secret]` block. `ws secret ask` refuses names the registry does not list, and the registry is the
+  sits in the URL path, which the broker's header injection can't carry, so the broker isn't the route here.
+- The flow declares a `[secret]` block. `ws secret ask` refuses names the registry doesn't list, and the registry is the
   person's own, so `ws connect` prints the one registry step for the person and never edits it. A `{secret}` is sent only
   to a host the `[secret]` block names (the loader enforces it), over https, with no redirect followed.
 - The walk and `--revoke` refuse inside an agent session (the check the other person-only commands use,

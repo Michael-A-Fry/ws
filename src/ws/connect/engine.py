@@ -71,7 +71,7 @@ class UrlTransport:
         if urlsplit(url).scheme != "https":
             raise ConnectError("network", "refused a request that is not https")
         opener = urllib.request.build_opener(NoRedirect)
-        req = urllib.request.Request(url, headers={"User-Agent": "ws-connect"})  # noqa: S310 (https only, above)
+        req = urllib.request.Request(url, headers={"User-Agent": "ws-connect"})
         try:
             with opener.open(req, timeout=HTTP_TIMEOUT_S) as r:
                 status, body = r.status, r.read(1 << 20)
@@ -377,10 +377,9 @@ def walk(ctx: Context, flow: Flow) -> dict:
             _mark(ctx, st, s["id"])
         elif s["type"] == "link":
             vals = _values(flow, st)
-            if s.get("nonce"):
-                if not _nonce_live(st, now):
-                    st["nonce"] = {"value": _secrets.token_urlsafe(32)[:64], "expires_ts": now + s["expires_s"]}
-                    vals["nonce"] = st["nonce"]["value"]
+            if s.get("nonce") and not _nonce_live(st, now):
+                st["nonce"] = {"value": _secrets.token_urlsafe(32)[:64], "expires_ts": now + s["expires_s"]}
+                vals["nonce"] = st["nonce"]["value"]
             io.say(f"\n{s.get('title', s['id'])}\n{s.get('text', '')}".rstrip())
             io.say(f"  Open: {fill(s['url'], vals)}")
             if s.get("nonce"):

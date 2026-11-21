@@ -13,7 +13,8 @@ from pathlib import Path
 import pytest
 from jsonschema import Draft202012Validator
 
-from ws import agentsession, cli, secrets as wsecrets
+from ws import agentsession, cli
+from ws import secrets as wsecrets
 from ws.connect import engine, spec
 from ws.connect.engine import ConnectError, Context
 
@@ -113,7 +114,7 @@ GOOD = "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6"
 
 def walk_all(env, api, token, clock=None):
     """info, link, capture, verify, link, verify: the whole Telegram flow, the person pressing Start in between."""
-    tmp, _ = env
+    _tmp, _ = env
     clock = clock or Clock()
     io = Script("", "", token, "")  # read, opened, token, opened the bind link
     c = ctx_for(env, api, io, clock=clock)
@@ -137,7 +138,7 @@ def test_the_whole_telegram_flow_walks_and_keeps_the_secret_out_of_everything(en
     tmp, store = env
     token = make_token()
     api = FakeTelegram(token)
-    c, io, res = walk_all(env, api, token)
+    _c, io, res = walk_all(env, api, token)
     assert res["status"] == "done" and res["identity"] == "demo_bot"
     assert store.read("TELEGRAM_BOT_TOKEN") == token
     st = json.loads((tmp / "state" / "connect" / "telegram.json").read_text())
@@ -168,7 +169,7 @@ def test_a_failed_verify_stores_nothing(env):
 
 
 def test_a_failed_verify_over_an_existing_secret_keeps_the_old_one(env):
-    tmp, store = env
+    _tmp, store = env
     old = make_token("d")
     store.write("TELEGRAM_BOT_TOKEN", old)
     api = FakeTelegram(old)
@@ -197,7 +198,7 @@ def test_an_unregistered_secret_prints_the_registry_step_and_edits_nothing(env):
 
 
 def test_the_walk_stops_when_the_person_does_not_press_start_and_resumes(env):
-    tmp, store = env
+    _tmp, _store = env
     token = make_token("f")
     api = FakeTelegram(token)
     io = Script("", "", token, "", "q")  # ... then q at "Not seen yet"
@@ -243,7 +244,7 @@ def test_an_expired_link_gets_a_new_nonce_on_the_next_walk(env):
 def test_the_nonce_is_a_valid_telegram_start_parameter(env):
     token = make_token("h")
     api = FakeTelegram(token)
-    c, io, _ = walk_all(env, api, token)
+    _c, io, _ = walk_all(env, api, token)
     link = next(s for s in io.said if "t.me/demo_bot?start=" in s)
     nonce = link.split("start=")[1].strip()
     assert 20 <= len(nonce) <= 64 and all(ch.isalnum() or ch in "_-" for ch in nonce)
@@ -256,7 +257,7 @@ def test_revoke_deletes_the_secret_and_tells_what_to_do_in_botfather_and_a_rewal
     tmp, store = env
     token = make_token("i")
     api = FakeTelegram(token)
-    c, io, _ = walk_all(env, api, token)
+    c, _io, _ = walk_all(env, api, token)
     out = engine.revoke(c, FLOW)
     assert "TELEGRAM_BOT_TOKEN" not in store.names()
     assert any("/revoke" in t for t in out["tell"])
@@ -264,7 +265,7 @@ def test_revoke_deletes_the_secret_and_tells_what_to_do_in_botfather_and_a_rewal
     # walk again from clean, with a new token
     token2 = make_token("j")
     api2 = FakeTelegram(token2, bot_id=555, username="second_bot")
-    c2, io2, res = walk_all(env, api2, token2)
+    c2, _io2, res = walk_all(env, api2, token2)
     assert res["status"] == "done" and store.read("TELEGRAM_BOT_TOKEN") == token2
     assert engine.load_state(c2, FLOW)["config"]["bot_id"] == "555"
 
@@ -278,7 +279,7 @@ def test_revoke_with_nothing_to_undo_is_quiet(env):
 
 
 def test_dry_run_lists_needs_human_steps_then_done(env):
-    tmp, store = env
+    tmp, _store = env
     token = make_token("k")
     api = FakeTelegram(token)
     before = engine.dry_run(ctx_for(env, api), FLOW)
@@ -295,7 +296,7 @@ def test_dry_run_lists_needs_human_steps_then_done(env):
     bind = next(s for s in before["steps"] if s["id"] == "bind-link")
     assert bind["url_template"].endswith("?start={nonce}") and bind["expires_in_s"] == 600
     assert not (tmp / "state").exists()  # reading wrote nothing
-    c, io, _ = walk_all(env, api, token)
+    c, _io, _ = walk_all(env, api, token)
     after = engine.dry_run(c, FLOW)
     assert after["status"] == "done" and after["exit_code"] == 0
     assert all(s["status"] == "done" for s in after["steps"]) and "next_step" in after
@@ -303,7 +304,7 @@ def test_dry_run_lists_needs_human_steps_then_done(env):
 
 
 def test_dry_run_gives_the_link_and_its_expiry_once_a_nonce_exists(env):
-    tmp, store = env
+    _tmp, _store = env
     token = make_token("l")
     api = FakeTelegram(token)
     io = Script("", "", token, "", "q")
@@ -323,7 +324,7 @@ def test_dry_run_names_an_unregistered_secret_as_a_blocker(env):
 
 
 def test_no_output_ever_holds_the_secret(env, capsys):
-    tmp, store = env
+    tmp, _store = env
     token = make_token("m")
     api = FakeTelegram(token)
     c, io, _ = walk_all(env, api, token)
@@ -336,7 +337,7 @@ def test_no_output_ever_holds_the_secret(env, capsys):
 
 
 def test_diagnose_redacts_the_nonce_and_says_where_the_secret_stands(env):
-    tmp, store = env
+    _tmp, _store = env
     token = make_token("n")
     api = FakeTelegram(token)
     io = Script("", "", token, "", "q")
@@ -365,10 +366,10 @@ def test_a_damaged_state_file_is_a_typed_error_that_revoke_clears(env):
 
 
 def test_mutation_guard_the_search_would_catch_a_secret_in_state(env):
-    tmp, store = env
+    tmp, _store = env
     token = make_token("o")
     api = FakeTelegram(token)
-    c, io, _ = walk_all(env, api, token)
+    _c, io, _ = walk_all(env, api, token)
     f = tmp / "state" / "connect" / "telegram.json"
     planted = json.loads(f.read_text())
     planted["config"]["token"] = token  # what a broken capture would do
@@ -462,7 +463,7 @@ def test_list_and_dry_run_and_diagnose_work_from_an_agent_session(env, monkeypat
 def test_the_walk_and_revoke_are_refused_inside_an_agent_session(env, monkeypatch, capsys):
     monkeypatch.setenv("WS_GATED_SESSION", "1")
     for argv in (["connect", "telegram"], ["connect", "telegram", "--revoke"]):
-        code, out, err = _run([*argv, "--json"], capsys)
+        code, out, _err = _run([*argv, "--json"], capsys)
         env_ = json.loads(out)
         assert code == 3 and env_["error_kind"] == "refused", argv
         assert "agent session" in env_["message"] or "gated session" in env_["message"]
@@ -483,9 +484,9 @@ def test_an_unknown_flow_is_a_typed_error(env, capsys):
 
 
 def test_the_command_reads_a_registered_secret_from_the_real_registry(env, capsys):
-    tmp, _ = env
+    _tmp, _ = env
     reg = wsecrets.registry_path()
     reg.parent.mkdir(parents=True, exist_ok=True)
     reg.write_text('[TELEGRAM_BOT_TOKEN]\nhosts = ["api.telegram.org"]\n')
-    code, out, _ = _run(["connect", "telegram", "--dry-run", "--json"], capsys)
+    _code, out, _ = _run(["connect", "telegram", "--dry-run", "--json"], capsys)
     assert "blockers" not in json.loads(out)["data"]

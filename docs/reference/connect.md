@@ -28,7 +28,7 @@ Every step has `id` (unique in the flow) and `type`; `title` and `revoke` are op
 | `type` | Keys | What happens |
 |---|---|---|
 | `info` | `text` | Shown; the person confirms they've read it. |
-| `link` | `url` (https), `text`, and for a one-time link `nonce = true` and `expires_s` (60 to 86400) | The URL is shown for the person to open. With `nonce`, `{nonce}` in the URL is a fresh 43-character `A-Za-z0-9_-` value that is kept until `expires_s` runs out; an expired one is replaced on the next walk. |
+| `link` | `url` (https), `text`, and for a one-time link `nonce = true` and `expires_s` (60 to 86400) | The URL is shown for the person to open. With `nonce`, `{nonce}` in the URL is a fresh 43-character `A-Za-z0-9_-` value that's kept until `expires_s` runs out; an expired one is replaced on the next walk. |
 | `capture` | `fields`: each `name`, `label`, optional `secret = true` and `pattern` (a regular expression the whole value must match) | A secret field is read with no echo and held in memory. A capture with a secret field must be followed at once by a `verify` with `identity` and `unique_id`: the secret is stored only when that passes. At most one secret field per flow. |
 | `verify` | `request.url` (https), then either `identity` and `unique_id` (paths into the JSON answer), or `find` | A real call. `identity` and `unique_id` give a label and a stable id. `find` looks in the list at `find.list` for the first item whose `where` paths equal the given texts and keeps the `take` paths (the Telegram flow reads the chat id of the message that carries the nonce). Success is HTTP 200 and no `"ok": false`. |
 
@@ -36,8 +36,9 @@ Placeholders in a URL or a `where` text: `{secret}` (in a `verify` URL only, and
 `{nonce}`, `{identity}`, the `unique_key`, a non-secret field name, and a `take` name. The host part of a URL is fixed
 text. A request is a GET over https and follows no redirect.
 
-`revoke`: `action = "delete_secret"` (needs `[secret]`), `action = "tell"` with `text` (what the person does elsewhere), or
-`action = "forget"` (clears what the flow learned). `--revoke` runs them last step first, then clears the state.
+`revoke`: `action = "delete_secret"` (needs `[secret]`), `action = "tell"` with `text` (what the person does
+elsewhere), or `action = "forget"` (clears what the flow learned). `--revoke` runs them last step first, then clears
+the state.
 
 Not in this phase: `device` (RFC 8628), `callback`, `--reauth`, QR codes. The loader refuses a step type it doesn't know.
 
@@ -64,8 +65,8 @@ frozen at `schema_version` 1. A key may be added; none is removed or changed in 
 | `blockers` | When present, each `kind` and `action`. `secret_not_registered` carries the registry entry for the person to add |
 | `steps[]` | `id`, `type`, `status` (`done` or `needs_human`), and when not done `action` |
 
-A step also carries what its type needs: `title`, `text` (info, link), `url` or `url_template` (link; the template when it
-has a placeholder not yet known), `expires_in_s` and, once a nonce exists, `expires_at` (a nonce link), and `fields`
+A step also carries what its type needs: `title`, `text` (info, link), `url` or `url_template` (link; the template when
+a placeholder isn't known yet), `expires_in_s` and, once a nonce exists, `expires_at` (a nonce link), and `fields`
 (capture: each `name`, `label`, `secret`). `action` is one of `read`, `open_link`, `paste_secret`, `enter_value`,
 `run_verify`. A verify's request URL is never shown.
 

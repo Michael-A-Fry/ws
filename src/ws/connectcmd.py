@@ -16,10 +16,10 @@ import sys
 
 COMMAND = "connect"
 
-from ws import agentsession, output, paths  # noqa: E402
-from ws import secrets as wsecrets  # noqa: E402
-from ws.connect import engine, spec  # noqa: E402
-from ws.output import WsError  # noqa: E402
+from ws import agentsession, output, paths
+from ws import secrets as wsecrets
+from ws.connect import engine, spec
+from ws.output import WsError
 
 
 class Terminal:

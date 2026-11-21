@@ -3,3 +3,5 @@
 ^Signed-off-by: dependabot\[bot\] <support@github\.com>$
 ^\ \ \ \ for\ bad\ in\ \("http://bao\.example\.org:8200",\ "ftp://x",\ "https://u:p@bao\.example\.org",\ "https://"\):$
 ^TAILNET = \(ipaddress\.ip_network\("100\.64\.0\.0/10"\), ipaddress\.ip_network\("fd7a:115c:a1e0::/48"\)\)$
+^        "ssh -J me@jump\.example\.org:2222,jump2\.example\.org h ls",$
+^        "ssh -o ProxyJump=jump\.example\.org -o HostName=10\.0\.0\.5 h ls",$

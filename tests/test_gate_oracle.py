@@ -550,20 +550,11 @@ def test_a_read_is_seen_whatever_its_timing(pol):
         assert run_line(line, {}, tries=30).touched, line  # `timeout` can end `cat` before it opens: only now and then
 
 
-def test_the_ssh_proxy_command_limit_is_seen_to_leak(pol):
-    """The row stays a listed limit: the gate allows it and `ssh` runs the command. `ssh` ends its proxy command with the
-    hang-up signal at about the time that command starts, so the `>&2` spelling of the listed row would open the file
-    only now and then. The harness runs the row with that signal ignored, which makes the read certain, and the row's
-    text stays as it is listed."""
-    if not shutil.which("ssh"):
-        pytest.skip("needs ssh")
-    listed = f"ssh -o ProxyCommand='cat {HOME}/{SSH}/id_rsa >&2' x"
-    assert listed in LIMITS and gate(pol, listed) is None
-    assert run_line(listed, {}, tries=3, ignore_hup=True).touched
-    for command in (f"cat {HOME}/{SSH}/id_rsa", f"cat {HOME}/{SSH}/id_rsa 2>&1"):
-        line = f"ssh -o ProxyCommand='{command}' x"
-        assert gate(pol, line) is None
-        assert run_bash(line, {}).touched, line
+def test_the_ssh_proxy_command_row_is_refused_now(pol):
+    """It was a listed limit: ssh runs its proxy command on this machine. The gate now refuses the ssh options that run
+    or load local files, so the row and its other spellings are denied, and it is off the list of limits."""
+    for command in (f"cat {HOME}/{SSH}/id_rsa >&2", f"cat {HOME}/{SSH}/id_rsa", f"cat {HOME}/{SSH}/id_rsa 2>&1"):
+        assert gate(pol, f"ssh -o ProxyCommand='{command}' x")
 
 
 def test_a_line_that_stops_the_script_and_reads_later_is_an_error_never_clean(pol):
@@ -658,7 +649,7 @@ def test_the_sandbox_is_kept_for_what_a_line_leaves_running(pol):
 
 
 # The lines a real bash does use to read a protected file, through text the gate never reads as shell: a program an
-# interpreter runs (python, awk), an option whose value is a command (ssh ProxyCommand), or a script file the line
+# interpreter runs (python, awk), or a script file the line
 # writes and then runs. They are a limit of what a command
 # gate can see, and the one list of them: a probe that is not here and gets through is a failure. The static gate is not
 # a wall against interpreters; the sandbox (`ws gate launch`) is.
@@ -666,8 +657,6 @@ LIMITS = (
     f"python3 -c \"print(open('{HOME}/{SSH}/id_rsa').read())\"",
     f"awk 'BEGIN{{while((getline l < \"{HOME}/{SSH}/id_rsa\")>0) print l}}'",
     f"echo 'cat ~/{SSH}/id_rsa' > /tmp/x.sh; bash /tmp/x.sh",
-    # an option whose value is a command the tool runs; released main allows it too
-    f"ssh -o ProxyCommand='cat {HOME}/{SSH}/id_rsa >&2' x",
     *sections()["limits"],
 )
 _INTERPRETERS = r"(python3?|perl|node|ruby|php|lua|Rscript)"
@@ -679,15 +668,14 @@ def test_every_cold_review_probe_the_gate_allows_is_one_bash_does_not_use_to_tou
     assert all(limit in lines for limit in LIMITS)
     # The limits are left out on purpose: each is a line the gate allows and bash does use, so this sweep (which must come
     # back empty) can't hold them. They are not run here expecting a leak either, because most need a tool that may not be
-    # installed (an interpreter, awk, ssh) and the leak of the ones that run quoted text is the interpreter's, not the
-    # gate's; `test_the_ssh_proxy_command_limit_is_seen_to_leak` runs the one that is a timing matter.
+    # installed (an interpreter, awk) and the leak of the ones that run quoted text is the interpreter's, not the gate's.
     assert oracle(pol, [line for line in lines if line not in LIMITS]) == []
 
 
 def test_the_limits_are_programs_the_gate_does_not_read_as_shell():
     for line in LIMITS:
         assert re.match(
-            rf"(python3 -c|awk |echo .* > /tmp/x\.sh; bash /tmp/x\.sh|ssh -o ProxyCommand=|{_INTERPRETERS} .*<<)",
+            rf"(python3 -c|awk |echo .* > /tmp/x\.sh; bash /tmp/x\.sh|{_INTERPRETERS} .*<<)",
             line,
         ), line
 

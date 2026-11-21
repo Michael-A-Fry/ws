@@ -2453,3 +2453,25 @@ def test_plain_jumps_and_host_names_still_run(pol, home):
 )
 def test_a_path_set_on_the_line_keeps_the_local_rules(named, cmd):
     assert policy.is_denied_command(named, cmd)
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "ssh -S /tmp/ctl pve.example.org 'ls $X'",
+        "ssh -S /tmp/ctl -p 22 pve.example.org 'for f in a b; do cat $f; done'",
+        "ssh -S /tmp/ctl pve.example.org 'cat ~/.ssh/id_rsa'",
+    ],
+)
+def test_a_control_socket_keeps_the_local_rules_for_the_remote_command(named, cmd):
+    assert policy.is_denied_command(named, cmd)
+
+
+def test_a_control_socket_still_runs_a_plain_remote_command(named):
+    assert policy.is_denied_command(named, "ssh -S /tmp/ctl pve.example.org 'uptime'") is None
+
+
+def test_opening_a_control_socket_is_a_write(pol, home):
+    target = f"{home}/.ws/policy.toml"
+    assert "protects" in policy.is_denied_command(pol, f"ssh -M -S {target} -N host", protect=(target,))
+    assert policy.is_denied_command(pol, "ssh -M -S /tmp/ctl -N host", protect=(target,)) is None

@@ -2756,7 +2756,8 @@ def _ssh_remote(
     if any(_HAS_PART.search(h) for h in hosts):
         return None, False
     names = [_ssh_host_name(h) for h in hosts]
-    if any(_is_this_machine(n) for n in names):
+    # a control socket (-S) reuses a connection opened earlier, to a host the name here doesn't say
+    if any(o == "S" for o, _ in opts) or any(_is_this_machine(n) for n in names):
         return None, bool(remote)
     if (
         strict
@@ -2831,6 +2832,8 @@ def _ssh_refusal(
         if letter in "IE" and not (letter == "E" and value == "/dev/null"):
             what = "loads a PKCS#11 library" if letter == "I" else "writes its log to a local file"
             return f"ssh -{letter} {what}, which ws does not judge{how}"
+        if letter == "S" and any(o == "M" for o, _ in opts) and (hit := _under(ctx.protect, value, ctx.cwd)):
+            return f"command writes to {hit}, which ws protects (policy and generated gate)"  # -M opens the socket
         files = [value] if letter in "iS" else []
         if letter == "o":
             m = _SSH_OPTION.match(value)

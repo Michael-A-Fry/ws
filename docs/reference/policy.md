@@ -177,7 +177,8 @@ A remote command runs on the far host, so `ssh pve.example.org 'ls $X'` isn't re
 the host (`[gate] allow_hosts`, or a class's `allowed_hosts`) and the command is one word wholly in single quotes. The
 local rules still apply to anything else: double quotes or `$'...'` (the local shell expands those), unquoted words,
 a host the policy doesn't name, a host word with `$`, a line with any redirect, here-string or here-document, an
-`-o CanonicalizeHostname` or `CanonicalDomains` (the host can become another), and ssh run by `xargs`, `sshpass` or
+`-o CanonicalizeHostname` or `CanonicalDomains` (the host can become another), `-S` (a control socket
+reuses a connection opened earlier, to a host the line doesn't name), and ssh run by `xargs`, `sshpass` or
 `autossh` (whose ssh options are judged as ssh's own). A remote command to this machine (loopback,
 `localhost` or its own name) runs outside the sandbox, so it's judged as the local command it is. ws doesn't read
 `~/.ssh/config`, so a named alias whose `HostName` is this machine is yours to avoid.

@@ -113,8 +113,8 @@ ws dispatch [-h] [--name NAME] [--model MODEL] [--runner {claude-code,opencode}]
 | `REPO` | The repository's folder name under the code root. A name only: a slash, `.` or `..` is a usage error. |
 | `PROMPT` | What the session should do, as one argument. A prompt that starts with `-` is refused. |
 | `--name NAME` | A few words for the window's name (lower case, dashes for spaces). Default: the repo's name. |
-| `--model MODEL` | The model, passed to the runner as its own `--model MODEL`. |
-| `--runner R` | `claude-code` (default) runs `claude [--model M] PROMPT`; `opencode` runs `opencode [--model M] --prompt PROMPT`. |
+| `--model MODEL` | The model, passed to the runner as one argument, `--model=MODEL`. |
+| `--runner R` | `claude-code` (default) runs `claude [--model=M] PROMPT`; `opencode` runs `opencode [--model=M] --prompt PROMPT`. |
 | `--session S` | The tmux session for the window. Default: the one this runs in; outside tmux, give one. |
 | `--code-root DIR` | Where the repositories are. Default `WS_CODE_ROOT`, else `[dispatch] code_root` in the profile, else `~/code`. |
 | `--dry-run` | Print the folder, the window name and the runner's argv, and start nothing. |
@@ -122,6 +122,25 @@ ws dispatch [-h] [--name NAME] [--model MODEL] [--runner {claude-code,opencode}]
 The window opens in the background and runs the runner's argv directly, with no shell between (tmux 3.0 or later),
 so every flag and the prompt arrive as separate arguments whatever they hold. `--help` changes nothing. If you start
 sessions with a script of your own, this can replace it: point `WS_CODE_ROOT` at your repositories.
+
+## `ws sync`
+
+Fetch every git repository under the code root, a few at a time, each with a time limit.
+
+```text
+ws sync [-h] [--code-root DIR] [--jobs N] [--timeout-s S]
+```
+
+| Argument | Meaning |
+|---|---|
+| `--code-root DIR` | Where the repositories are. Default as for `ws dispatch`: `WS_CODE_ROOT`, else `[dispatch] code_root`, else `~/code`. |
+| `--jobs N` | How many fetches run at once. Default 4. |
+| `--timeout-s S` | A fetch that takes longer is killed with its whole process group, and named. Default 120. |
+
+A repository is a folder directly under the code root that holds `.git`. Each gets `git fetch --all --prune --quiet`
+with no terminal and `GIT_TERMINAL_PROMPT=0`; nothing in a working tree is touched. Exit 0 when every fetch finished
+cleanly, 1 when any failed or timed out, each named with why. If you fetch your repositories with a script of your own,
+this can replace it.
 
 ## `ws doctor`
 

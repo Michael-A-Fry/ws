@@ -8,18 +8,23 @@ body of the GitHub release.
 
 ## [Unreleased]
 
+### Added
+
+- `ws sync`: fetch every git repository under the code root, 4 at a time, each fetch killed (with its helpers)
+  and named past `--timeout-s` (default 120); exit 1 when any failed or timed out.
+- `ws upgrade` writes one line per step to `logs/upgrade.jsonl` (verb, step, Python, version, exit, seconds and the
+  last 20 lines of the installer's or hooks step's output); the terminal output is unchanged. (C650)
+
 ### Changed
 
+- `ws dispatch` passes the model as one argument, `--model=M`, so a model name that starts with `-` can't become a
+  flag, and its code root expands `~` only for your own home (`~` or `~/...`).
 - `ws upgrade` runs the hooks step with the ws the installer just wrote, read back from the `ws` command it put in
   place and that script's Python, and records that ws's version in the history; the step's line names the Python and
   version it ran with. (C648)
 - `ws upgrade` restarts a broker still running older code once the swap's hooks step and check have passed, when it
-  holds no lease and is your user's process; otherwise it says so and prints the command that finishes it. (C651)
-
-### Added
-
-- `ws upgrade` writes one line per step to `logs/upgrade.jsonl` (verb, step, Python, version, exit, seconds and the
-  last 20 lines of the installer's or hooks step's output); the terminal output is unchanged. (C650)
+  holds no lease and is your user's process (Linux: SO_PEERCRED and a pidfd); otherwise it leaves it running, prints
+  the command that finishes it and exits 1 (`--json` status `attention`). (C651)
 
 ## [0.1.11.3] - 2026-11-22
 

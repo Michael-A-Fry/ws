@@ -84,6 +84,7 @@ below, and `python3 scripts/gen_code_map.py --check` (prek and CI) fails when it
 | `skills/` | The skills ws ships (`align`, `checkpoint`, `taste-gate`, `dataviz`, `resume`, `ship`) and how... |
 | `status.py` | `ws status`: for each runner, every rules, skill, hook and MCP file it will load here, with... |
 | `style.py` | The terminal style every `ws` command prints with: a status glyph and word, headings, key/value... |
+| `sync.py` | `ws sync`: fetch every git repository under the code root, a few at a time, each with a time limit |
 | `tailnet.py` | The tailnet checks a one-shot phone page uses: which address it may listen on, and whether a... |
 | `term/` | `ws term`: a browser terminal that behaves like a native one, for reaching a ws machine from a... |
 | `testing/` | Test support that ships with ws: the mock model provider and its scenarios |

@@ -723,6 +723,12 @@ def apply(
             raise InstallError(f"{r} is too broad for ws to manage; pick a folder of its own")
         managed.add(str(r))
 
+    if not dry_run:  # the spend cap and the models: never changed from an agent session, whichever command got here
+        target = Path(os.path.abspath(profile_path(env)))
+        for step in steps:
+            if step.kind == "file" and step.content is not None and Path(os.path.abspath(step.path)) == target:
+                profile.check_session_write(target, tomllib.loads(step.content))
+
     result = Result()
     virtual: set[Path] = set()
     failed = True

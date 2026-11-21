@@ -1,7 +1,9 @@
 """Job files: `jobs/<name>.toml` in ws's config folder, one headless job each, run with `ws run <name>`.
 
     runner = "claude-code"              adapter name (see `ws gate generate --help`)
-    model = "claude-haiku-4-5"          the smallest model that passes
+    model = "claude-haiku-4-5"          optional: the smallest model that passes. Left out, `jobs.load` takes the
+                                        profile's [models].<purpose>, else [models].default (`ws config model`); a run
+                                        with none of the three is refused at start, naming the job
     prompt = "..."                      or prompt_file = "daily.md" (relative to the jobs folder)
     cwd = "~/work/thing"                default: an empty folder made for the run
     timeout_s = 900
@@ -88,7 +90,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from ws import adapters, paths
+from ws import adapters, paths, profile
 from ws.secrets import HOST_RE, NAME_RE
 
 NAME = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -153,7 +155,14 @@ RESOURCE_KEYS = {"ram_gb", "slot"}
 
 
 class JobError(Exception):
-    pass
+    kind = "bad_job"
+
+
+class NoModelError(JobError):
+    """A job names no model and the profile's [models] table gives none for it. Loading for a run raises this; the
+    scans behind `ws job list`, `ws config` and doctor use `loads`, which leaves the model unset and raises nothing."""
+
+    kind = "no_model"
 
 
 @dataclass(frozen=True)
@@ -197,7 +206,7 @@ class Resources:
 class Job:
     name: str
     runner: str
-    model: str
+    model: str | None  # None only from `loads` of a job that names none; `load` fills it or refuses
     prompt: str
     cwd: str | None = None
     timeout_s: float = DEFAULT_TIMEOUT_S
@@ -463,7 +472,8 @@ def command_job(name: str, env: dict | None = None) -> dict:
 
 
 def loads(name: str, text: str, base: Path, where: str | None = None) -> Job:
-    """Parse and check a job file's text. `base` is the folder `prompt_file` is relative to."""
+    """Parse and check a job file's text. `base` is the folder `prompt_file` is relative to. Pure: the profile is not
+    read, so a job that names no model comes back with `model` None (`load` resolves it)."""
     where = where or f"job {name}"
     if not NAME.match(name):
         raise JobError(f"{where}: a job name is letters, digits, - and _")
@@ -481,7 +491,7 @@ def loads(name: str, text: str, base: Path, where: str | None = None) -> Job:
     known = adapters.all_adapters()
     if runner not in known:
         raise JobError(f"{where}: runner {runner!r} is not known (known: {', '.join(known)})")
-    model = _string(d, "model", where, required=True)
+    model = _string(d, "model", where)
     prompt, prompt_file = _string(d, "prompt", where), _string(d, "prompt_file", where)
     if (prompt is None) == (prompt_file is None):
         raise JobError(f"{where}: give exactly one of prompt and prompt_file")
@@ -711,7 +721,54 @@ def load(name: str, env: dict | None = None) -> Job:
     except (OSError, UnicodeDecodeError) as e:
         raise JobError(f"{path}: {e}") from e
     check_pin(folder, name, raw)
-    return loads(name, text, folder, where=str(path))
+    job = loads(name, text, folder, where=str(path))
+    if job.model is not None:
+        return job  # the job names its model: the profile is not read, as before [models] existed
+    try:
+        prof = profile.load(profile.profile_path(env))
+    except profile.ProfileError as e:
+        raise JobError(f"job {name}: names no model and the profile cannot be read: {e}") from e
+    model, _ = resolve_model(job, prof)
+    if model is None:
+        raise NoModelError(no_model_message(job))
+    return replace(job, model=model)
+
+
+MODEL_SOURCES = ("job", "purpose", "default", "none")
+
+
+def models_table(prof: dict | None) -> dict[str, str]:
+    """The profile's [models] table: purpose name (or `default`) -> model id. No profile or no table is empty. A table
+    with any bad entry raises JobError naming the key: it is never used in part."""
+    raw = (prof or {}).get("models")
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise JobError('profile: [models] must be a table of purpose = "model id"')
+    for k, v in raw.items():
+        if not NAME.match(k):
+            raise JobError(f"profile: [models] key {k!r} is not a plain name (letters, digits, - and _)")
+        if not isinstance(v, str) or not v.strip():
+            raise JobError(f"profile: [models].{k} must be a non-empty model id")
+    return dict(raw)
+
+
+def resolve_model(job: Job, prof: dict | None) -> tuple[str | None, str]:
+    """(model id, where it came from): the job's own `model`, else [models].<purpose>, else [models].default, else
+    (None, "none"). Ids pass through unchanged; the run's provider, class and pricing checks judge them after."""
+    if job.model is not None:
+        return job.model, "job"
+    table = models_table(prof)
+    if job.purpose is not None and job.purpose in table:
+        return table[job.purpose], "purpose"
+    if "default" in table:
+        return table["default"], "default"
+    return None, "none"
+
+
+def no_model_message(job: Job) -> str:
+    how = f"ws config model {job.purpose} ID" if job.purpose else "ws config model ID"
+    return f"no model for job {job.name}: set model in the job file, or run: {how}"
 
 
 def _scan(env: dict | None) -> tuple[dict[str, str], dict[str, str]]:

@@ -51,9 +51,9 @@ STALE_S = 300
 KEYS = {"v", "kind", "class", "session", "at"}
 AT_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 REASONS = ("name", "link", "file", "group", "size", "owner", "json", "shape", "kind", "session", "at", "class")
-_NAME = re.compile(r"\d{1,20}-[0-9a-f]{16}\.card")
+_NAME = re.compile(r"\d{1,20}-[0-9a-f]{16}\.card", re.ASCII)  # ASCII: \d would take any script's digits
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
-_AT = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
+_AT = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", re.ASCII)
 
 
 def _refused(message: str, hint: str) -> WsError:

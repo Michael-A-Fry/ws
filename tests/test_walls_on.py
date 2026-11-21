@@ -360,3 +360,12 @@ def test_no_kind_goes_from_one_walled_class_to_the_other(box, tmp_path, kind):
         with pytest.raises(WsError) as e:
             msg.scratch_delivery(tmp_path / "shared", pol, sender, target, kind, None)
         assert e.value.kind == "refused"
+
+
+def test_a_name_or_time_in_non_ascii_digits_is_rejected(spool):
+    from ws import cards
+
+    _plant(spool["folder"], "١-0123456789abcdef.card", GOOD)  # an Arabic-Indic digit in the name
+    _plant(spool["folder"], "5-0123456789abcdef.card", {**GOOD, "at": "２０２６-11-21T00:00:00Z"})  # full-width digits
+    _as_lead(spool)
+    assert cards.take(folder=spool["folder"]) == {"cards": [], "rejected": {"name": 1, "at": 1}}

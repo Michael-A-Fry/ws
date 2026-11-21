@@ -853,3 +853,29 @@ def test_ws_run_does_not_refuse_the_same_policy_for_claude_code(run_ws):  # noqa
     run_ws.job()  # the stock claude-code job
     cli.main(["run", "daily"])
     assert all(r["stop_reason"] != "refused:cannot_check" for r in run_ws.records())
+
+
+@pytest.mark.parametrize(
+    "rel, body",
+    [(".opencode/opencode.json", '{"mcp": {"evil": {"type": "local", "command": ["true"]}}}'), (".opencode/plugins/x.js", "export default {}")],
+)
+def test_an_opencode_job_is_refused_when_the_home_folder_would_start_a_server_or_plugin(tmp_path, monkeypatch, rel, body):
+    from ws.adapters import opencode
+
+    home = tmp_path / "home"
+    (home / rel).parent.mkdir(parents=True)
+    (home / rel).write_text(body)
+    monkeypatch.setenv("HOME", str(home))
+    run_dir = tmp_path / "run"
+    (run_dir / "gate").mkdir(parents=True)
+    with pytest.raises(ValueError, match="holds|starts"):
+        opencode.build_command(_job_for(), run_dir, None)
+
+
+def test_an_opencode_job_with_a_plain_home_folder_is_not_refused(tmp_path, monkeypatch):
+    from ws.adapters import opencode
+
+    (tmp_path / "home").mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "run" / "gate").mkdir(parents=True)
+    opencode.build_command(_job_for(), tmp_path / "run", None)

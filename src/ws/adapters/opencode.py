@@ -115,8 +115,8 @@ def unsupported_guards() -> tuple[str, ...]:
 # The guards the generated shim cannot run. `ws doctor` names them when a policy has one on.
 UNSUPPORTED_GUARDS = unsupported_guards()
 
-# "mcp" is not listed: a `ws run` job starts no MCP server at all (build_command: no global or project config, `mcp` empty,
-# and `mcp` is not a job option), so allow_mcp and the deny_tools MCP globs hold with no hook. `ws gate launch` is a
+# "mcp" is not listed: a `ws run` job starts no MCP server at all (build_command: no global or project config, none in the
+# home folder's .opencode, `mcp` empty, and `mcp` is not a job option), so allow_mcp and the deny_tools MCP globs hold with no hook. `ws gate launch` is a
 # person's own session and is not judged by this list.
 # Checks a policy can ask for that this runner cannot enforce; `ws run` refuses such a job (conformance.refuse_cannot_check).
 # A guard is "guard:NAME" and comes from UNSUPPORTED_GUARDS, so a new guard needs no edit here.
@@ -668,6 +668,10 @@ def build_command(job, run_dir: Path, lease) -> tuple[list[str], dict[str, str]]
     # No MCP server can start in a job: OpenCode merges its global config (XDG_CONFIG_HOME) and the project's own
     # opencode.json into the inline one, and an empty inline `mcp` does not remove a server they name (checked on
     # 1.19.4). So the run gets an empty config folder and the project config is switched off.
+    # HOME stays (provider auth lives under it) and OpenCode still reads $HOME/.opencode/: refuse a run whose home folder
+    # would start a server or load a plugin. project_problem skips the home folder it is given, so it is passed none.
+    if problem := project_problem([str(Path(env.get("HOME") or Path.home()))], Path("/nonexistent")):
+        raise ValueError(f"{problem.message}; {problem.hint}")
     xdg = Path(run_dir) / "xdg"
     if xdg.parent.is_dir():  # the run's folder is there once its gate files are written
         xdg.mkdir(exist_ok=True)

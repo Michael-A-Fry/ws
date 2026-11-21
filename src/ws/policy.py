@@ -1475,6 +1475,7 @@ _OPERAND_CMDS = {"rm", "rmdir", "shred", "unlink", "chmod", "chown", "chgrp", "m
 _ALWAYS_RECURSIVE = {"tar", "find", "zip", "rsync", "tree", "du", "7z", "bsdtar", "cpio"}
 # Commands that write to every operand / only to the last one (or -t DIR).
 _WRITE_ALL = {"tee", "mv", "rm", "rmdir", "truncate", "chmod", "chown", "chgrp", "touch", "shred", "unlink", "patch"}
+_WRITE_ALL.add("sudoedit")  # sudo -e: writes each file it is given
 _WRITE_LAST = {"cp", "install", "ln", "rsync", "scp"}
 _INTERP = re.compile(r"^(python[0-9.]*|perl|ruby|node|php)$")
 # Probes for "can the shell reach the network": a policy that denies all of them closes the shell as a way out.
@@ -2164,7 +2165,7 @@ def _read_values(toks: list[str], redirs: list[shellwords.Redirect]) -> dict[str
     if not names:
         return {"REPLY": here[-1]}
     parts = here[-1].split(None, len(names) - 1)
-    return {n: (parts[k] if k < len(parts) else "") for k, n in enumerate(names) if shellwords.ASSIGN.match(n + "=")}
+    return {n: (parts[k] if k < len(parts) else "") for k, n in enumerate(names) if _NAME.fullmatch(n)}
 
 
 def _loop_words(words: list[str]) -> list[str]:
@@ -2210,7 +2211,8 @@ def _segment(policy: Policy, seg: str, ctx: _Ctx, in_pipe: bool, cands: list[str
     return None, last[0], nested
 
 
-_APPEND = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\+=")
+_APPEND = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)(?:\[[^]]*\]\+?|\+)=")  # X+=, X[k]=, X[k]+=: not followed
+_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _BLOCK_WORDS = ("do", "then", "else", "elif", "{", "(", "!", "time", "if", "while", "until")
 
 
@@ -2238,9 +2240,9 @@ def _mark_unknown(ctx: _Ctx, seg: str, words: list[str]) -> None:
         rest = rest[1:]
     lead = list(itertools.takewhile(shellwords.ASSIGN.match, rest))
     if lead and (len(rest) > len(lead) or len(rest) < len(words)):  # ahead of a command, or inside a block
-        names |= {w.split("=", 1)[0] for w in lead}
+        names |= {shellwords.assign_name(w) for w in lead}
     if words and words[0] in _ENV_WRAPPERS:  # env X=/ cmd, sudo X=/ cmd: set for the command it runs
-        names |= {w.split("=", 1)[0] for w in words[1:] if shellwords.ASSIGN.match(w)}
+        names |= {shellwords.assign_name(w) for w in words[1:] if shellwords.ASSIGN.match(w)}
     if names:
         _mark_names(ctx, names)
 
@@ -2298,8 +2300,13 @@ def _targets(toks: list[str]) -> set[str]:
     if not toks or toks[0] not in _TARGET_SETTERS:
         return set()
     if toks[0] == "let":
-        return {m.group(1) for t in toks[1:] if (m := re.match(r"([A-Za-z_][A-Za-z0-9_]*)\s*[-+*/%&|^<>]*=", t))}
-    names = [t for t in toks[1:] if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", t)]
+        return {
+            m.group(1)
+            for t in toks[1:]
+            if (m := re.match(r"([A-Za-z_][A-Za-z0-9_]*)(?:\[[^]]*\])?\s*[-+*/%&|^<>]*=", t))
+        }
+    # a subscripted name (`A[0]`) sets the array: the name itself is what becomes unknown
+    names = [m.group(1) for t in toks[1:] if (m := re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)(?:\[.*\])?", t, re.DOTALL))]
     return set(names[1:2]) if toks[0] == "getopts" else set(names)
 
 
@@ -2334,7 +2341,8 @@ def _segment_once(
         return None, "", []
     _mark_unknown(ctx, seg, words)
     if words and all(shellwords.ASSIGN.match(w) for w in words):  # X=/ ; later $X
-        _assign(ctx, _settled(ctx, env, dict(w.split("=", 1) for w in words)))
+        # an append (`X+=`) is left out: `_mark_unknown` has made its name unknown
+        _assign(ctx, _settled(ctx, env, dict(w.split("=", 1) for w in words if not _APPEND.match(w))))
     elif len(words) > 3 and words[0] == "for" and words[2] == "in":  # for i in a b; do ... $i
         listed = _loop_words(words[3:])
         ctx.loops = {**(ctx.loops or {}), words[1]: listed}
@@ -2342,16 +2350,24 @@ def _segment_once(
     nested: list[str] = []
     dropped: list[str] = []
     set_env: list[str] = []  # the NAME=value words set for the command: a prefix, `env`, an `env -S` string
+    sudos: list[set[str]] = []  # the options of each sudo the line runs, a nested one's too
     toks, wrappers = shellwords.strip_wrappers(
-        words, set_env, lexenv=env, budget=ctx.budget, dropped=dropped, scripts=nested
+        words, set_env, lexenv=env, budget=ctx.budget, dropped=dropped, scripts=nested, sudo_options=sudos
     )
-    held = _targets(toks) & (set(ctx.vars or {}) | set(ctx.loops or {}) | set(ctx.unknown) | _SSH_ENV)
+    held = _targets(toks) & (set(ctx.vars or {}) | set(ctx.loops or {}) | set(ctx.unknown) | _ASKPASS_ENV)
     if held:  # read X / let X=.. after X held a value (or set ssh's askpass): which value it has now isn't followed
         _mark_names(ctx, held)
+    if toks and toks[0] == "unset":  # unset X: what X holds is no longer the value ws knows
+        if any(_HAS_PART.search(w) for w in toks[1:]):
+            _distrust(ctx, folders=True)  # unset $N: a name ws cannot read, so any variable
+        else:
+            _mark_names(ctx, {m.group(1) for w in toks[1:] if (m := re.match(r"([A-Za-z_][A-Za-z0-9_]*)", w))})
     if toks and toks[0] in _DECLARERS and any(_HAS_PART.search(w) and not shellwords.ASSIGN.match(w) for w in toks[1:]):
         _distrust(ctx, folders=True)  # export ${A}=x ; export $(cat env): a name ws cannot read, so any variable
     elif toks and toks[0] in _DECLARERS:  # export X=/ ; declare -x X=/ ; local X=/
-        _assign(ctx, _settled(ctx, env, dict(w.split("=", 1) for w in toks[1:] if shellwords.ASSIGN.match(w))))
+        sets = [w for w in toks[1:] if shellwords.ASSIGN.match(w)]
+        _mark_names(ctx, {shellwords.assign_name(w) for w in sets if _APPEND.match(w)})  # export X+=: not followed
+        _assign(ctx, _settled(ctx, env, dict(w.split("=", 1) for w in sets if not _APPEND.match(w))))
     elif toks and toks[0] == "read":  # read -r X <<< /
         _assign(ctx, _read_values(toks, redirs))
     if _sets_anything(toks, seg):
@@ -2365,6 +2381,10 @@ def _segment_once(
         cands.append(line)
     cmd = canon[0] if canon else ""
     flags, operands = shellwords.split_args(canon)
+    if toks and shellwords.ARRAY_WORD.match(toks[0]) and (len(toks) > 1 or "=" not in toks[0]):
+        # an array setting ahead of a command (or a word that starts like one): fail closed
+        why = f"the command starts with {toks[0]!r}, an array setting ws does not read; set the array on its own line first"
+        return why, line, []
 
     if cmd in ("popd", "dirs") or (cmd == "pushd" and (flags or not operands or _STACK_ARG.fullmatch(operands[0]))):
         # the directory stack is not followed, so where these leave the shell is not known
@@ -2392,6 +2412,8 @@ def _segment_once(
     if admin:
         return admin, line, []
     local_seg = seg  # the part of the line that runs here
+    if sudos and (why := _sudo_askpass(ctx, set_env, sudos)):
+        return why, line, []
     ssh_toks, ssh_prefix, ssh_why = _ssh_toks(cmd, toks, env, ctx.budget)
     if ssh_why:
         return ssh_why, line, []
@@ -2773,6 +2795,32 @@ def _ssh_remote(
     if not m or m.group(1) != remote[0] or re.search(r"[<>]", seg[: m.start(1)]):
         return None, False
     return (m.start(1) - 1, False) if all(_named_host(policy, n) for n in names) else (None, False)
+
+
+_ASKPASS_ENV = frozenset(_SSH_ENV | {"SUDO_ASKPASS"})  # names an askpass program a command may run
+
+
+def _held_or_set(ctx: _Ctx, set_env: list[str], name: str) -> bool:
+    """Whether the line may give a program `name`: set on it (a prefix, env or sudo setting), held from earlier, or
+    unknown (a part of the line set any variable)."""
+    names = set(ctx.vars or {}) | set(ctx.unknown)
+    return name in names or ctx.distrust or any(w.startswith((name + "=", name + "+=")) for w in set_env)
+
+
+def _sudo_askpass(ctx: _Ctx, set_env: list[str], sudos: list[set[str]]) -> str | None:
+    """A refusal for a sudo that may run a program the line names through its environment: the askpass program
+    SUDO_ASKPASS names (sudo runs it without -A when it has no terminal, as an agent's shell does; -n or -S keeps it
+    from asking), and the shell SHELL names under -s. Every sudo on the line is checked, a nested one's too."""
+    if _held_or_set(ctx, set_env, "SUDO_ASKPASS") and any(
+        not own & {"n", "non-interactive", "S", "stdin"} for own in sudos
+    ):
+        return (
+            "sudo may run the askpass program SUDO_ASKPASS names, which runs on this machine and ws cannot read; "
+            "give sudo -n or -S, or leave SUDO_ASKPASS unset"
+        )
+    if _held_or_set(ctx, set_env, "SHELL") and any(own & {"s", "shell"} for own in sudos):
+        return "sudo -s runs the shell SHELL names, which this line sets or ws cannot read; give the command without -s"
+    return None
 
 
 def _ssh_toks(
@@ -3572,7 +3620,10 @@ def _seg_words(
         if shellwords.has_flag(flags, "c") and operands:
             nested.append(operands[0])
     if not toks:  # `X=/` on its own: later words may use it
-        known.update(w.split("=", 1) for w in env)
+        known.update(w.split("=", 1) for w in env if not _APPEND.match(w))
+        for w in env:
+            if _APPEND.match(w):
+                known.pop(shellwords.assign_name(w), None)  # an append's value isn't followed
     return toks, env, nested
 
 

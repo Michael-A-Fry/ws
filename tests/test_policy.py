@@ -10,7 +10,7 @@ import time
 
 import pytest
 
-from ws import policy
+from ws import policy, shellwords
 from ws.policy import PolicyError
 
 RM = "rm"
@@ -2475,3 +2475,203 @@ def test_opening_a_control_socket_is_a_write(pol, home):
     target = f"{home}/.ws/policy.toml"
     assert "protects" in policy.is_denied_command(pol, f"ssh -M -S {target} -N host", protect=(target,))
     assert policy.is_denied_command(pol, "ssh -M -S /tmp/ctl -N host", protect=(target,)) is None
+
+
+# --- NAME+=value is an assignment, as bash reads it ---------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "A+=1 git push --force origin main",
+        "A+=1 B=2 git push --force origin main",
+        "A=1 B+=2 rm -rf /",
+        "sudo A+=1 git push -f origin main",
+        "env A+=1 git push --force origin main",
+        "A+=1 cat ~/.ssh/id_rsa",
+        "A+=1 bash",
+    ],
+)
+def test_an_append_ahead_of_a_command_is_an_assignment(pol, home, cmd):
+    assert policy.is_denied_command(pol, cmd)
+
+
+def test_an_append_leaves_the_value_unknown(pol, home):
+    assert policy.is_denied_command(pol, "D=/tmp; D+=/../$HOME/.ssh; cat $D/id_rsa")
+    assert policy.is_denied_command(pol, "export D=/tmp; export D+=/../$HOME/.ssh; cat $D/id_rsa")
+    assert policy.is_denied_command(pol, "A+=1 git status") is None
+
+
+def test_assign_name_takes_off_the_plus():
+    assert shellwords.ASSIGN.match("A+=1") and shellwords.ASSIGN.match("A=1")
+    assert not shellwords.ASSIGN.match("+=1") and not shellwords.ASSIGN.match("A++=1")
+    assert shellwords.assign_name("A+=1") == "A" == shellwords.assign_name("A=x=y")
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "A[0]=1 git push --force origin main",
+        "A[0]+=1 git push --force origin main",
+        "A[k]=1 git push --force origin main",
+        "A['k']=1 git push --force origin main",
+        "B=2 A[0]=1 git push --force origin main",
+        "env a.b=1 git push --force origin main",
+        "env a-b=1 git push --force origin main",
+        "env -- A=1 git push --force origin main",
+        "env -- a.b=1 git push --force origin main",
+        "sudo a.b=1 git push --force origin main",
+        "sudo -u root a-b=1 rm -rf /",
+    ],
+)
+def test_a_subscript_or_any_env_setting_ahead_of_a_command_is_an_assignment(pol, home, cmd):
+    assert policy.is_denied_command(pol, cmd)
+
+
+def test_assign_name_takes_off_a_subscript():
+    assert shellwords.assign_name("A[0]+=1") == "A" == shellwords.assign_name("A[k=v]=1")
+    assert policy.is_denied_command(policy.default_policy(), "A[0]=1 git status")  # fail closed
+    assert policy.is_denied_command(policy.default_policy(), "env a.b=1 git status") is None
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "A[x y]=1 git status",  # a word that starts like an array setting is refused, however its brackets close
+        "env -S 'a.b=1 git push --force origin main'",  # env's own rules apply to the words of an -S string
+        "env =1 git push --force origin main",  # env takes a word that starts with = as a setting
+    ],
+)
+def test_round_three_settings_ahead_of_a_command_are_judged(pol, home, cmd):
+    assert policy.is_denied_command(pol, cmd)
+
+
+def test_round_three_ordinary_forms_still_run(pol, home):
+    for cmd in ("env -S 'LC_ALL=C git status'", "env =1 git status", "arr[1]=x; echo done"):
+        assert policy.is_denied_command(pol, cmd) is None, cmd
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "env --chdir /tmp git push --force origin main",  # a long option whose value is the next word
+        "env --ch /tmp git push --force origin main",  # an unambiguous abbreviation of it
+        "env --sp 'git push --force origin main'",  # an abbreviation of --split-string
+        "env - git push --force origin main",  # a bare - is an empty environment, not the command
+        "env -uX git push --force origin main",  # a value glued to its option
+        "sudo -uroot git push --force origin main",
+        "env -S 'git status\\_x'",  # env splits a backslash by its own rules: fail closed
+        "env --i git status",  # ambiguous: fail closed
+        "D=/tmp; read -r D[0] < /tmp/f; cat $D/.ssh/id_rsa",  # a read into an array leaves the name unknown
+    ],
+)
+def test_env_is_read_as_gnu_env_reads_it(pol, home, cmd):
+    assert policy.is_denied_command(pol, cmd)
+
+
+def test_ordinary_env_forms_still_run(pol, home):
+    for cmd in ("env --chdir=/tmp git status", "env -i PATH=/bin ls", "env - LC_ALL=C ls", "sudo -uroot ls"):
+        assert policy.is_denied_command(pol, cmd) is None, cmd
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "xargs -a ~/.ssh/k=v true",  # a file a wrapper reads, with an = in its name, is still judged
+        "env -C ~/.ssh/a=b true",  # env's directory, = or not
+        "sudo -D ~/.ssh/a=b true",  # sudo's directory, = or not
+        "chroot ~/.ssh/a=b true",  # chroot's new root, = or not
+        "env -S '' -- git push --force origin main",  # an empty split string keeps env in front of what follows
+        "env --split-string= git push --force origin main",
+    ],
+)
+def test_a_wrapper_value_with_an_equals_sign_and_an_empty_split_string_are_judged(pol, home, cmd):
+    assert policy.is_denied_command(pol, cmd)
+
+
+# --- sudo's options, and unset ------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "sudo --chdir /tmp git push --force origin main",  # a long option whose value is the next word
+        "sudo --ch /tmp git push --force origin main",  # an unambiguous abbreviation of it
+        "sudo --role r git push --force origin main",
+        "sudo --chroot /srv git push --force origin main",
+        "sudo -r r git push --force origin main",  # a short option with a value
+        "sudo -t t git push --force origin main",
+        "sudo --pr x git status",  # ambiguous: fail closed
+        "H=/tmp; unset H; cat ${H:-$HOME}/.ssh/id_rsa",  # after unset, the name's old value is not known
+    ],
+)
+def test_sudo_is_read_as_sudo_reads_it_and_unset_clears_a_known_name(pol, home, cmd):
+    assert policy.is_denied_command(pol, cmd)
+
+
+def test_ordinary_sudo_and_unset_forms_still_run(pol, home):
+    for cmd in ("sudo -u root ls", "sudo --user=root ls", "sudo -iu root ls", "sudo -E ls", "unset X; ls"):
+        assert policy.is_denied_command(pol, cmd) is None, cmd
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "sudo -A ls",  # runs the askpass program an environment variable names
+        "sudo --askpass ls",
+        "echo 'git push --force origin main' | sudo -s",  # a shell with no command reads its script from the pipe
+        "sudo -i < /tmp/script",
+    ],
+)
+def test_sudo_askpass_and_a_sudo_shell_on_stdin_are_refused(pol, home, cmd):
+    assert policy.is_denied_command(pol, cmd)
+
+
+def test_sudo_edit_writes_its_files(pol, home):
+    target = f"{home}/.ws/policy.toml"
+    for cmd in (f"sudo -e {target}", f"sudo --edit {target}", f"sudoedit {target}"):
+        assert "protects" in (policy.is_denied_command(pol, cmd, protect=(target,)) or ""), cmd
+    assert policy.is_denied_command(pol, "sudo -e /tmp/notes.txt", protect=(target,)) is None
+    assert policy.is_denied_command(pol, "sudo -s ls", protect=(target,)) is None  # a command given: judged as it is
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "sudo -h other git push --force origin main",  # a bare -h before a word may be a host
+        "sudo -lh other git push --force origin main",
+        "SUDO_ASKPASS=/tmp/x sudo ls",  # with no terminal, sudo runs the askpass program without -A
+        "export SUDO_ASKPASS=/tmp/x; sudo ls",
+        "read -r SUDO_ASKPASS < /tmp/f; export SUDO_ASKPASS; sudo ls",
+        "sudo -s cat '$HOME/.ssh/id_rsa'",  # the inner shell expands what the outer one left quoted
+    ],
+)
+def test_sudo_host_askpass_and_inner_shell_forms_are_refused(pol, home, cmd):
+    assert policy.is_denied_command(pol, cmd)
+
+
+def test_sudo_with_n_or_without_askpass_still_runs(pol, home):
+    for cmd in ("SUDO_ASKPASS=/tmp/x sudo -n ls", "sudo -h", "sudo -hother ls", "sudo ls"):
+        assert policy.is_denied_command(pol, cmd) is None, cmd
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "SUDO_ASKPASS=/tmp/x timeout -s sudo 5 sudo ls",
+        "SUDO_ASKPASS=/tmp/x xargs -I sudo -n 1 sudo ls",  # xargs's own -n after a value that reads like sudo  # a wrapper's option value can read like sudo: every sudo is checked
+        "sudo -n SUDO_ASKPASS=/tmp/x sudo ls",  # a nested sudo that the outer one's settings give an askpass to
+        "SHELL=/tmp/x sudo -s ls",  # sudo -s runs the shell SHELL names
+        "export SHELL=/tmp/x; sudo -s ls",
+        "sudo -D /tmp cat notes",  # sudo runs it from a folder ws does not follow
+        "sudo --chroot /srv ls",
+        "sudo -R /srv ls",
+    ],
+)
+def test_every_sudo_and_its_shell_and_folder_are_judged(pol, home, cmd):
+    assert policy.is_denied_command(pol, cmd)
+
+
+def test_sudo_with_n_or_s_and_a_plain_shell_still_runs(pol, home):
+    for cmd in ("SUDO_ASKPASS=/tmp/x sudo -S ls", "SUDO_ASKPASS=/tmp/x sudo -n sudo -n ls", "sudo -s ls", "sudo -i ls"):
+        assert policy.is_denied_command(pol, cmd) is None, cmd

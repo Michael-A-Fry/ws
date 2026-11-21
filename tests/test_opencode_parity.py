@@ -857,9 +857,14 @@ def test_ws_run_does_not_refuse_the_same_policy_for_claude_code(run_ws):  # noqa
 
 @pytest.mark.parametrize(
     "rel, body",
-    [(".opencode/opencode.json", '{"mcp": {"evil": {"type": "local", "command": ["true"]}}}'), (".opencode/plugins/x.js", "export default {}")],
+    [
+        (".opencode/opencode.json", '{"mcp": {"evil": {"type": "local", "command": ["true"]}}}'),
+        (".opencode/plugins/x.js", "export default {}"),
+    ],
 )
-def test_an_opencode_job_is_refused_when_the_home_folder_would_start_a_server_or_plugin(tmp_path, monkeypatch, rel, body):
+def test_an_opencode_job_is_refused_when_the_home_folder_would_start_a_server_or_plugin(
+    tmp_path, monkeypatch, rel, body
+):
     from ws.adapters import opencode
 
     home = tmp_path / "home"

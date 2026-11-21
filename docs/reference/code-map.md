@@ -25,6 +25,7 @@ below, and `python3 scripts/gen_code_map.py --check` (prek and CI) fails when it
 | `connectors.py` | Connectors: plug a zone's MCP server (`[connectors.NAME]` in the policy) into one run or one... |
 | `context_load.py` | Context loader: what a session is told when it starts, and what the first prompt adds, from one... |
 | `devices.py` | `ws device add`: the one line that links a second machine to this one |
+| `dispatch.py` | `ws dispatch`: start a runner's session on a prompt, in a new tmux window, in one repository's... |
 | `doctor.py` | `ws doctor`: one line per check, each with a stable ID |
 | `eval.py` | `ws eval`: your own eval, with TOML tasks, deterministic graders, ten metrics and an exact A/B... |
 | `evalstats.py` | The numbers behind `ws eval`: exact McNemar, intervals, pass^k and pass@k, percentiles and the... |

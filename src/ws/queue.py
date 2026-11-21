@@ -4,11 +4,12 @@
                                                 put a job file's run in the queue (unattended work)
     ws queue list [--all] [--last N]            the receipts: queued, running and finished, newest first
     ws queue show RUN_ID                        one receipt
+    ws queue report [--weekly] [--weeks N]      a row a week: gate blocks, slot stalls, hand-offs, runs, cap kills
     ws queue cancel RUN_ID                      take a queued run out of the queue
     ws queue run [--max N]                      run what is queued, one after another (what a timer runs)
     ws queue tick JOB [--slot T] [--no-coalesce] [--skip-missed S]
                                                 a schedule's tick: queue the job's run for slot T, at most once
-    ws queue slot --ram-gb N --lane ui --who join|writer -- CMD...
+    ws queue slot --ram-gb N --lane ui --who join|writer [--session ID] [--max-wait-s S] -- CMD...
                                                 wait for a slot, run CMD in it, give the slot back
 
 One SQLite database in WAL mode, `<state>/queue/queue.db` (folder 0700, file 0600), holds the queued work (the
@@ -36,7 +37,13 @@ Money that is short is refused, naming the counter, exit 3. A counter with room 
 reservation to what is left, and that sum becomes `--max-budget-usd` (Claude Code), unless the job says `strict`.
 Turns, time, concurrency and memory are not refusals but waits: a direct `ws run` ends as refused, a queued run stays
 queued, and `ws queue slot` waits. A join's `ui` run is admitted before any writer's, and a writer's only when its memory
-fits beside the headroom kept for the join, so a writer waits and is never refused for it. If the store is locked, full
+fits beside the headroom kept for the join, so a writer waits and is never refused for it. Waiters are served in
+arrival order (joins first). A slot request counts against its session (`--session`, else `WS_SLOT_SESSION`, else the
+runner's session id, else the process that started `ws queue slot`): while another session waits for the lane, a session holding its share (the lane's slots over the
+sessions there, rounded up) waits, and does not hold the others back; a session alone takes every slot. A wait that
+passes `slot_max_wait_s` (default 30 minutes) is requeued: counted in the receipt's `requeues`, kept in its place, and
+never failed; only the caller's own `--timeout-s` ends a wait. Every receipt, in every lane, keeps `queued_at`,
+`started_at` and `finished_at`. If the store is locked, full
 or unreadable, the run is refused: it never starts without a reservation.
 
 A run settles once, from what it used, in the path that writes its record (status, cost, tokens, stop reason). Settling
@@ -108,7 +115,7 @@ from ws.output import WsError
 from ws.profile import ProfileError, load, profile_path
 
 COMMAND = "queue"
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 EXIT_FAILED, EXIT_BAD_JOB, EXIT_REFUSED = 1, 2, 3
 STATUSES = ("queued", "running", "ok", "error", "refused", "preempted", "skipped", "interrupted", "expired")
 ACTIVE = ("queued", "running")
@@ -128,6 +135,7 @@ LEASE_SLACK_S = 120.0  # a reservation's lease is the job's timeout plus this
 SLOT_LEASE_S = 6 * 3600.0  # the lease of a slot, which has no timeout of its own
 BUSY_S = 5.0  # how long to wait for the store's lock before refusing
 POLL_S = 5.0  # between looks, while waiting for a slot
+SLOT_MAX_WAIT_S = 1800.0  # a slot waiter past this is requeued (counted, kept in its place), not failed
 ORPHAN_S = 120.0  # a claimed message with no running receipt this long is released
 MESSAGE_LEASE_S = 24 * 3600.0
 MIN_RESERVE_USD = 0.0001
@@ -158,6 +166,7 @@ _LIMIT_KEYS = {
     "busy_s": ("num0", BUSY_S),
     "poll_s": ("num", POLL_S),
     "chain_cap": ("int", CHAIN_CAP),
+    "slot_max_wait_s": ("num", SLOT_MAX_WAIT_S),
 }
 
 _SCHEMA = f"""
@@ -193,6 +202,8 @@ CREATE TABLE IF NOT EXISTS receipts (
     run_key TEXT,
     chain_depth INTEGER,
     told_at INTEGER,
+    session TEXT,
+    requeues INTEGER NOT NULL DEFAULT 0,
     CHECK ((status IN ('queued', 'running')) = (finished_at IS NULL)),
     CHECK (settled = 0 OR finished_at IS NOT NULL)
 );
@@ -254,6 +265,7 @@ class Limits:
     chain_cap: int = CHAIN_CAP
     busy_s: float = BUSY_S
     poll_s: float = POLL_S
+    slot_max_wait_s: float = SLOT_MAX_WAIT_S
 
     @classmethod
     def from_profile(cls, prof: dict | None) -> Limits:
@@ -317,6 +329,7 @@ class Request:
     ram_gb: float = 0.0
     lane: str = "run"
     who: str | None = None  # join | writer, for a slot request
+    session: str | None = None  # the session a slot request comes from, for its share of the lane
     credential: str = "api_key"  # api_key | local | subscription
     deadline: datetime | None = None
     lease_s: float | None = None
@@ -593,6 +606,9 @@ class Ledger:
                         c.execute("ALTER TABLE receipts ADD COLUMN chain_depth INTEGER")  # a store from schema 3
                     if "told_at" not in have:
                         c.execute("ALTER TABLE receipts ADD COLUMN told_at INTEGER")  # a store from schema 4
+                    if "session" not in have:  # a store from schema 5
+                        c.execute("ALTER TABLE receipts ADD COLUMN session TEXT")
+                        c.execute("ALTER TABLE receipts ADD COLUMN requeues INTEGER NOT NULL DEFAULT 0")
                     c.execute("CREATE INDEX IF NOT EXISTS receipts_parent ON receipts(parent_run_id)")
                     c.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         except BaseException:
@@ -782,11 +798,26 @@ class Ledger:
         if req.who is not None:
             mine = c.execute("SELECT queued_at FROM receipts WHERE run_id = ?", (req.run_id,)).fetchone()
             rank = (0 if req.who == "join" else 1, mine["queued_at"] if mine else ns, req.run_id)
-            for o in c.execute(
-                "SELECT who, queued_at, run_id FROM receipts WHERE status = 'queued' AND message_id IS NULL AND who IS NOT NULL "
+            waiting = c.execute(
+                "SELECT who, queued_at, run_id, session FROM receipts WHERE status = 'queued' AND message_id IS NULL AND who IS NOT NULL "
                 "AND lane = ? AND run_id != ? AND lease_expires_at >= ?",
                 (req.lane, req.run_id, ns),
+            ).fetchall()
+            held = self._held_by_session(c, req.lane, req.run_id)
+            share = _share(lane_cap, held, waiting, req.session)
+            if (
+                share is not None
+                and held.get(req.session, 0) >= share
+                and any(o["session"] not in (None, req.session) for o in waiting)
             ):
+                waits.append(
+                    ("session_share",
+                     f"this session holds {held[req.session]} of the {req.lane} lane's {lane_cap}: its share, while another waits",
+                     "wait for the other session's turn")
+                )  # fmt: skip
+            for o in waiting:
+                if share is not None and o["session"] not in (None, req.session) and held.get(o["session"], 0) >= share:
+                    continue  # held back by its own session's share, so it does not hold this one back
                 if (0 if o["who"] == "join" else 1, o["queued_at"], o["run_id"]) < rank:
                     waits.append(
                         (
@@ -826,6 +857,16 @@ class Ledger:
         return Decision("admit", reservation=res, notes=tuple(notes))
 
     @staticmethod
+    def _held_by_session(c: sqlite3.Connection, lane: str, run_id: str) -> dict[str, int]:
+        """How many running slots in `lane` each session holds (slots with no session are not counted)."""
+        rows = c.execute(
+            "SELECT session, COUNT(*) AS n FROM receipts WHERE status = 'running' AND lane = ? AND run_id != ? "
+            "AND session IS NOT NULL GROUP BY session",
+            (lane, run_id),
+        )
+        return {r["session"]: r["n"] for r in rows}
+
+    @staticmethod
     def _fit(name, used, want, limit, unit, refusals, waits) -> None:
         if want > limit:
             refusals.append(
@@ -853,7 +894,7 @@ class Ledger:
                 started_at=ns, reserved_usd=r.usd, reserved_turns=r.turns, reserved_s=r.seconds, ram_gb=r.ram_gb,
                 resized=int(r.resized), lease_expires_at=lease, owner_pid=pid, owner_start_time=start,
                 claim_id=r.claim_id, note="; ".join(r.notes) or None, parent_run_id=req.parent_run_id,
-                deadline=to_ns(req.deadline) if req.deadline else None,
+                deadline=to_ns(req.deadline) if req.deadline else None, session=req.session,
             )  # fmt: skip
             self._upsert(c, req.run_id, ns, cols)
         elif d.kind == "refuse":
@@ -869,7 +910,7 @@ class Ledger:
                 c, req.run_id, ns,
                 dict(  # noqa: C408
                     job=req.job, purpose=req.purpose, lane=req.lane, who=req.who, status="queued", month=month,
-                     lease_expires_at=ns + ttl, ram_gb=req.ram_gb, note=d.reason[:300]),
+                     lease_expires_at=ns + ttl, ram_gb=req.ram_gb, note=d.reason[:300], session=req.session),
             )  # fmt: skip
         return d
 
@@ -886,6 +927,21 @@ class Ledger:
                 f"INSERT INTO receipts ({', '.join(names)}) VALUES ({', '.join('?' for _ in names)})",
                 (run_id, ns, *cols.values()),
             )
+
+    def requeue(self, run_id: str, waited_s: float, now: datetime) -> None:
+        """A slot waiter past the maximum wait: counted (`requeues`) and its ticket renewed, keeping its place in the
+        arrival order, so a long wait is on record and is never turned into a failure."""
+        ns = to_ns(now)
+        ttl = int(max(3 * self.limits.poll_s, 30) * 1e9)
+        try:
+            with _transaction(self.conn()) as c:
+                c.execute(
+                    "UPDATE receipts SET requeues = requeues + 1, lease_expires_at = ?, note = ? "
+                    "WHERE run_id = ? AND status = 'queued'",
+                    (ns + ttl, f"requeued after waiting {waited_s:.0f} s", run_id),
+                )
+        except sqlite3.Error as e:
+            raise store_error(e) from e
 
     # -- settling -----------------------------------------------------------------------------------------------
 
@@ -1365,6 +1421,15 @@ def _version() -> str:
     return __version__
 
 
+def _share(lane_cap: int, held: dict[str, int], waiting, session: str | None) -> int | None:
+    """A session's share of a lane while others want it: the lane's slots over the sessions holding or waiting for
+    one, rounded up. None when the request names no session, or when it is the only session there (it may take all)."""
+    if session is None:
+        return None
+    sessions = {*held, *(o["session"] for o in waiting if o["session"] is not None), session}
+    return None if len(sessions) < 2 else max(1, math.ceil(lane_cap / len(sessions)))
+
+
 def _public(r: sqlite3.Row) -> dict:
     """A receipt as `list` and `show` print it: the claim id never leaves the store."""
     out = {k: r[k] for k in r.keys() if k not in ("claim_id", "owner_start_time", "lease_expires_at")}  # noqa: SIM118
@@ -1755,12 +1820,16 @@ def wait_for_slot(
     req: Request,
     *,
     timeout_s: float | None = None,
+    max_wait_s: float | None = None,
     sleep: Callable[[float], None] = time.sleep,
     notify: Callable[[Decision], None] = lambda d: None,
+    on_requeue: Callable[[float], None] = lambda waited: None,
 ) -> Reservation:
     """Ask for the slot until it is granted. A wait is the normal answer to anything that is merely full; only a request
-    that can never fit (or a store that cannot be used) is refused. The ledger's clock tells the time, so a test moves it."""
-    t0 = ledger.clock()
+    that can never fit (or a store that cannot be used) is refused. The ledger's clock tells the time, so a test moves it.
+    `timeout_s` is the caller's own hard stop (`SlotTimeout`). Each time a wait passes `max_wait_s`, the waiter is
+    requeued (`Ledger.requeue`: counted, its place in the arrival order kept) and goes on waiting."""
+    t0 = mark = ledger.clock()
     told = None
     try:
         while True:
@@ -1774,6 +1843,10 @@ def wait_for_slot(
             if timeout_s is not None and waited >= timeout_s:
                 ledger.stopped(req.job, req.run_id, "wait_timeout")
                 raise SlotTimeout(waited, d)
+            if max_wait_s is not None and (ledger.clock() - mark).total_seconds() >= max_wait_s:
+                mark = ledger.clock()
+                ledger.requeue(req.run_id, waited, mark)
+                on_requeue(waited)
             if d.counter != told:
                 told = d.counter
                 notify(d)
@@ -2033,6 +2106,21 @@ def _preemptible(name: str) -> bool:
         return False
 
 
+SESSION_ENVS = ("WS_SLOT_SESSION", "CLAUDE_CODE_SESSION_ID")  # first set wins: whose share a slot counts against
+
+
+def slot_session(env=None) -> str | None:
+    """The session a slot request counts against: `WS_SLOT_SESSION`, else the runner's session id, else none."""
+    e = os.environ if env is None else env
+    return next((e[k] for k in SESSION_ENVS if e.get(k)), None)
+
+
+def _process_key() -> str:
+    """A slot request that names no session counts against the process that started `ws queue slot` (its parent), so
+    every request has a share and is counted."""
+    return f"ppid:{os.getppid()}"
+
+
 def cmd_slot(args: argparse.Namespace) -> int:
     cmd = list(args.cmd)
     if cmd[:1] == ["--"]:
@@ -2048,13 +2136,15 @@ def cmd_slot(args: argparse.Namespace) -> int:
     run_id = runrecord.new_run_id(now)
     req = Request(
         job=f"slot-{args.lane}-{run_id[-6:]}", run_id=run_id, usd=0.0, ram_gb=args.ram_gb, lane=args.lane, who=args.who,
-        credential="local", lease_s=SLOT_LEASE_S,
+        credential="local", lease_s=SLOT_LEASE_S, session=args.session or slot_session() or _process_key(),
     )  # fmt: skip
     code = EXIT_FAILED
     with run._term_becomes_exit():
         res = wait_for_slot(
             ledger, req, timeout_s=args.timeout_s,
+            max_wait_s=args.max_wait_s if args.max_wait_s is not None else ledger.limits.slot_max_wait_s,
             notify=lambda d: print(f"ws: waiting for a {args.lane} slot: {d.reason}", file=sys.stderr),
+            on_requeue=lambda w: print(f"ws: still waiting after {w:.0f} s; requeued in its place", file=sys.stderr),
         )  # fmt: skip
         status, stop = "interrupted", "interrupted"
         try:
@@ -2073,11 +2163,105 @@ def cmd_slot(args: argparse.Namespace) -> int:
     return 128 - code if code < 0 else code  # a command killed by signal N exits 128+N
 
 
+# The weekly report's counts (`ws queue report`), each from what ws itself records:
+CAP_KILLS = ("timeout", "max_turns", "max_budget")  # a run stopped by its own time, turn or budget cap
+WEEK = timedelta(days=7)
+
+
+def _ts(value) -> datetime | None:
+    """A log line's time: RFC 3339 text, or epoch milliseconds (the asks file's `ts`)."""
+    try:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return datetime.fromtimestamp(value / 1000, UTC)
+        t = datetime.fromisoformat(str(value))
+        return t if t.tzinfo else t.replace(tzinfo=UTC)
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def _lines(files) -> list[dict]:
+    from ws import jsonl
+
+    out: list[dict] = []
+    for f in files:
+        with contextlib.suppress(OSError, ValueError, WsError):
+            out += jsonl.read(f)
+    return out
+
+
+def weekly_report(ledger: Ledger, now: datetime, *, weeks: int = 1, env=None) -> list[dict]:
+    """One row per seven days back from `now`, newest first: the three toil counts and the capacity beside them.
+
+    * blocks: the gate's denies, from `logs/gate.jsonl` and each class's copy (`decision` is `deny`).
+    * stalls: slot waits that went past the maximum wait (requeued at least once) or were given up, by when they queued.
+    * hand-offs: questions a session left for its person (`added` events in the asks store).
+    * runs and killed: runs that finished, and those of them stopped by their own cap (`CAP_KILLS`), by when they ended.
+    """
+    from ws import asks, gate
+
+    state = paths.state_dir(env)
+    gate_files = [state / "logs" / gate.VERDICT_LOG, *paths.class_log_files(gate.VERDICT_LOG, state)]
+    denies = [t for r in _lines(gate_files) if r.get("decision") == "deny" and (t := _ts(r.get("ts")))]
+    handoffs = [t for r in _lines([asks.store_path(env)]) if r.get("event") == "added" and (t := _ts(r.get("ts")))]
+    try:
+        rows = (
+            ledger.conn()
+            .execute(
+                "SELECT who, queued_at, finished_at, stop_reason, requeues FROM receipts WHERE queued_at >= ? OR finished_at >= ?",
+                (to_ns(now - weeks * WEEK),) * 2,
+            )
+            .fetchall()
+        )
+    except sqlite3.Error as e:
+        raise store_error(e) from e
+    out = []
+    for i in range(weeks):
+        hi, lo = now - i * WEEK, now - (i + 1) * WEEK
+
+        def within(t: datetime | None, lo=lo, hi=hi) -> bool:
+            return t is not None and lo <= t < hi
+
+        ended = [r for r in rows if within(from_ns(r["finished_at"]))]
+        out.append({
+            "from": lo.isoformat(timespec="seconds"),
+            "to": hi.isoformat(timespec="seconds"),
+            "blocks": sum(within(t) for t in denies),
+            "stalls": sum(
+                1 for r in rows
+                if r["who"] is not None and within(from_ns(r["queued_at"]))
+                and (r["requeues"] or r["stop_reason"] == "gave_up")
+            ),
+            "handoffs": sum(within(t) for t in handoffs),
+            "runs": len(ended),
+            "killed": sum(1 for r in ended if r["stop_reason"] in CAP_KILLS),
+        })  # fmt: skip
+    return out
+
+
+def cmd_report(args: argparse.Namespace) -> int:
+    ledger = ledger_for_env()
+    rows = weekly_report(ledger, ledger.clock(), weeks=args.weeks)
+    if args.json:
+        output.result(rows)
+        return 0
+    print(f"{'week to':<12}{'blocks':>8}{'stalls':>8}{'hand-offs':>11}{'runs':>7}{'killed':>8}")
+    for r in rows:
+        print(f"{r['to'][:10]:<12}{r['blocks']:>8}{r['stalls']:>8}{r['handoffs']:>11}{r['runs']:>7}{r['killed']:>8}")
+    return 0
+
+
 def _positive_int(text: str) -> int:
     n = int(text)
     if n < 1:
         raise argparse.ArgumentTypeError("must be 1 or more")
     return n
+
+
+def _positive(text: str) -> float:
+    x = float(text)
+    if not math.isfinite(x) or x <= 0:
+        raise argparse.ArgumentTypeError("must be a number above 0")
+    return x
 
 
 def _non_negative(text: str) -> float:
@@ -2110,6 +2294,12 @@ def register(sub) -> None:
     ls.add_argument("--last", type=_positive_int, default=20, metavar="N", help="how many (default 20)")
     ls.set_defaults(func=cmd_list)
 
+    rep = qs.add_parser(
+        "report", help="toil and capacity, a row a week: gate blocks, slot stalls, hand-offs, cap kills"
+    )
+    rep.add_argument("--weekly", action="store_true", help="a row for each seven days (the only report so far)")
+    rep.add_argument("--weeks", type=_positive_int, default=1, metavar="N", help="how many weeks back (default 1)")
+    rep.set_defaults(func=cmd_report)
     sh = qs.add_parser("show", help="one receipt")
     sh.add_argument("run_id")
     sh.set_defaults(func=cmd_show)
@@ -2157,5 +2347,12 @@ def register(sub) -> None:
         "--who", choices=("join", "writer"), default="writer", help="a join goes before any writer (default writer)"
     )
     s.add_argument("--timeout-s", type=_non_negative, default=None, metavar="S", help="give up waiting after S seconds")
+    s.add_argument(
+        "--max-wait-s", type=_positive, default=None, metavar="S",
+        help=f"requeue (count, keep the place) each S seconds of waiting (default slot_max_wait_s, {SLOT_MAX_WAIT_S:g})",
+    )  # fmt: skip
+    s.add_argument(
+        "--session", metavar="ID", help="whose share of the lane this counts against (default WS_SLOT_SESSION)"
+    )
     s.add_argument("cmd", nargs=argparse.REMAINDER, help="-- the command to run")
     s.set_defaults(func=cmd_slot, raw=True)

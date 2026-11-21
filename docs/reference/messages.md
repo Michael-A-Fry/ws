@@ -73,8 +73,8 @@ With `[classes]`:
   read.
 - The receiving class's `inbound` decides who may send to it: `off` (the default for a walled or counts-only class),
   `lead-only` (the default for a full class) or `allowlist` with `inbound_allow` naming sessions. A reply isn't let in
-  because it's a reply. A walled or counts-only class takes a message only with `inbound = "allowlist"` and the sender's
-  session id in `inbound_allow`: `lead-only` is refused for it too, the lead included.
+  because it's a reply. A walled or counts-only class takes a message only from the lead with `inbound = "lead-only"`, or
+  with `inbound = "allowlist"` and the sender's session id in `inbound_allow` (being the lead is no exception there).
 - The one thing the `lead-only` default lets through is a fixed kind (`ack`, `done`, `stop-and-hand-over:done`,
   `ask:pending`, `counts`) sent to a lead in a full class, from any session, a worker or a walled one. It has no text, so
   nothing leaves a class, and it's how a session says it's done. `off` and `allowlist` are obeyed as written, and a fixed

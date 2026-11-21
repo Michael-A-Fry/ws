@@ -1167,6 +1167,45 @@ def other_drop_in_warning(cls: policy.Class, env: Mapping[str, str]) -> str | No
     return wallsettings.drop_in_warning(found, pol, own=cls.name)
 
 
+def host_warnings(cls: policy.Class, env: Mapping[str, str]) -> list[str]:
+    """The warnings `ws install --class NAME` adds about this host, whatever is placed yet: more than one class with an
+    os_user in the policy (the managed-settings files of all of them would be read together, by every account), what the
+    managed-settings file does to your own sessions as well as the class's (it binds every account), and a repo under
+    your own home, which the printed `chmod 700 "$HOME"` closes to the class account. Reads the policy; writes nothing."""
+    try:
+        pol = policy.load(policy.policy_path(dict(env)))
+    except policy.PolicyError:
+        return []
+    out: list[str] = []
+    walled = [c.name for c in wallsettings.class_users(pol)]
+    if len(walled) > 1:
+        out.append(
+            f"{len(walled)} classes with an os_user are in the policy ({', '.join(walled)}); their managed-settings files"
+            " would be read together by every account here, which is not the tested shape (one class per machine)"
+        )
+    hosts = len(cls.allowed_hosts)
+    net = f"only {hosts} host(s)" if hosts else "no host at all"
+    out.append(
+        "the managed-settings file binds every account on this machine, yours included: once it is in place your own"
+        f" sessions need the sandbox, their shell commands reach {net} and can't read your home folder; place it only on"
+        " a machine where every session belongs to this class"
+    )
+    home = (env.get("HOME") or "").rstrip("/")
+    if home:
+        kind = osinfo.detect(env=dict(env)).kind
+        try:
+            roots = wallsettings.class_roots(cls, wallsettings.class_home(cls, kind))
+        except WsError:
+            roots = []
+        inside = [r for r in roots if r == home or r.startswith(home + "/")]
+        if inside:
+            out.append(
+                f"{len(inside)} repo(s) of class {cls.name!r} are under your own home ({', '.join(inside)}), which step 2"
+                " closes to the class account; move them to a folder the account can reach (`/srv/work/...`)"
+            )
+    return out
+
+
 def _cmd_install_class(args: argparse.Namespace) -> int:
     """`ws install --class NAME`: print the commands and the root-owned file for the class's OS user. Nothing is written."""
     given = [f"--{k.replace('_', '-')}" for k in _SETTING_FLAGS if getattr(args, k, None) not in (None, False, [])]
@@ -1176,13 +1215,14 @@ def _cmd_install_class(args: argparse.Namespace) -> int:
         )
     cls, text = class_text(args.class_name, os.environ)
     warning = other_drop_in_warning(cls, os.environ)
+    warnings = ([warning] if warning else []) + host_warnings(cls, os.environ)
     if args.json:
         data = {"class": cls.name, "os_user": cls.os_user, "writes": False, "text": text}
-        output.result({**data, "warnings": [warning]} if warning else data)
+        output.result({**data, "warnings": warnings} if warnings else data)
     else:
         print(text)
-        if warning:
-            print(f"ws: warning: {warning}", file=sys.stderr)
+        for w in warnings:
+            print(f"ws: warning: {w}", file=sys.stderr)
     return 0
 
 

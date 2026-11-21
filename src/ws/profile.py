@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import tomllib
+from datetime import UTC, datetime
 from pathlib import Path
 
 from ws import paths
@@ -110,3 +112,17 @@ def write_if_changed(path: Path, data: dict) -> bool:
     tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, path)
     return True
+
+
+def backup(path: Path, now: datetime | None = None) -> Path | None:
+    """Copy the profile beside itself as `profile.toml.bak-<UTC stamp>` before a rewrite (which drops comments), and
+    return the copy; None when there is no profile yet. A name already taken gets `-1`, `-2`, ... so nothing is lost."""
+    if not path.is_file():
+        return None
+    stamp = (now or datetime.now(UTC)).strftime("%Y%m%dT%H%M%SZ")
+    dest, n = path.with_name(f"{path.name}.bak-{stamp}"), 0
+    while dest.exists():
+        n += 1
+        dest = path.with_name(f"{path.name}.bak-{stamp}-{n}")
+    shutil.copy2(path, dest)
+    return dest

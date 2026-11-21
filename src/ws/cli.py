@@ -376,7 +376,6 @@ def build_parser() -> argparse.ArgumentParser:
     approvals.register(sub)
     setup_ui.register(sub)
     config_cmd.register(sub)
-    extcmd.register(sub)
     status.register(sub)
     ws_eval.register(sub)
     home_cli.register(sub)

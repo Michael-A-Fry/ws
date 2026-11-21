@@ -1551,10 +1551,11 @@ ws setup [-h] [--web] [--no-open] [-y] [--plugin NAME] [--notes PATH]
 ## `ws config`
 
 Every file ws reads: where it's, which folder layout it came from, the keys it sets. `ws config fallback` shows, sets and
-clears the program that gets words ws has no command for (see [Your own commands](#your-own-commands)).
+clears the program that gets words ws has no command for (see [Your own commands](#your-own-commands)). `ws config model`
+and `ws config budget` show and set which model a job runs on and the monthly spend cap (see [Profile](profile.md)).
 
 ```text
-ws config [-h] [--clear] [{fallback}] [PATH]
+ws config [-h] [--clear] [--yes] [--dry-run] [{fallback,model,budget}] [VALUE ...]
 ```
 
 | Argument | Meaning |
@@ -1562,6 +1563,10 @@ ws config [-h] [--clear] [{fallback}] [PATH]
 | `fallback` | Show the fallback program. With `PATH`, set it; with `--clear`, remove it. |
 | `PATH` | With `fallback`: the program (absolute, or `~/...`). It has to be an executable file you own that nobody else can write to. |
 | `--clear` | With `fallback`: remove it. |
+| `model` | No value: each job, its purpose, its model and where it came from. `ID`: set `[models].default`. `PURPOSE ID`: set `[models].PURPOSE`. |
+| `budget USD` | Set `[roles.budget] monthly_cap_usd`. A positive number. An admin command (agent sessions can't run it). |
+| `--yes` | With `model` or `budget`: write without asking. |
+| `--dry-run` | With `model` or `budget`: print the change, write nothing. |
 
 ## `ws status`
 

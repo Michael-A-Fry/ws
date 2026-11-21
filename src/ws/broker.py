@@ -15,10 +15,13 @@ only. Everything fails closed: an unset name, a missing or loose store, an unkno
 refusal, never a request without the credential or to a different host.
 
 Wire format on the socket: one JSON object per line, one reply per request. Ops: request, release, status, elevate,
-and for the minters (ws.minters) mint, sign and ca_public.
+for the minters (ws.minters) mint, sign and ca_public, and imap: for a `kind = "imap"` name the broker itself logs in to
+the mailbox and runs one operation from the fixed table in ws.minters.imap (read, label or draft; never send or delete),
+so the mailbox password, which would also send mail, never leaves this process.
 Refusal codes: unknown_name, unset, host_not_allowed, purpose_not_allowed, caller_refused, store_unreadable, expired,
 run_required, run_refused, not_declared, area_refused, tier_refused, claim_refused, elevation_off, audit_failed,
-wrong_kind, registry_untrusted, upstream_refused, upstream_unreachable, plus bad_request (malformed) and busy (too
+wrong_kind, registry_untrusted, upstream_refused, upstream_unreachable, op_refused, uidvalidity_changed,
+no_drafts_folder, tls_failed, plus bad_request (malformed) and busy (too
 many connections or leases). The registry itself is trusted only when it belongs to the broker's user or root and is
 closed to group and world writes; any other is refused whole (registry_untrusted).
 
@@ -65,7 +68,7 @@ from urllib.parse import urlsplit
 
 from ws import __version__, output, paths
 from ws import secrets as wsecrets
-from ws.minters import github_app, ssh_ca
+from ws.minters import github_app, imap, ssh_ca
 from ws.output import WsError
 
 CODES = (
@@ -90,6 +93,10 @@ CODES = (
     "registry_untrusted",
     "upstream_refused",
     "upstream_unreachable",
+    "op_refused",
+    "uidvalidity_changed",
+    "no_drafts_folder",
+    "tls_failed",
 )
 MINT_REUSE_MARGIN_S = 300  # a cached token with less left than this is minted afresh
 REAP_EVERY_S = 30.0  # how often the broker looks for runs that ended with tokens still live
@@ -414,7 +421,7 @@ class Lease:
 # ---------------------------------------------------------------- client
 
 
-def _client_call(msg: dict, socket_file: str | Path | None, timeout: float = 10.0) -> dict:
+def _client_call(msg: dict, socket_file: str | Path | None, timeout: float = 10.0, max_reply: int = MAX_LINE) -> dict:
     path = str(socket_file) if socket_file else str(wsecrets.socket_path())
     check_socket_path(path)
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -428,7 +435,7 @@ def _client_call(msg: dict, socket_file: str | Path | None, timeout: float = 10.
             if not chunk:
                 break
             buf += chunk
-            if len(buf) > MAX_LINE:
+            if len(buf) > max_reply:
                 raise BrokerUnavailable("the broker's reply was too long")
         reply = json.loads(buf.split(b"\n", 1)[0])
     except (OSError, ValueError) as e:
@@ -459,6 +466,21 @@ def request(
         msg["run"] = run
     r = _client_call(msg, socket)["lease"]
     return Lease(lease=r["lease"], base_url=r["base_url"], header=r["header"], expires_at=r["expires_at"])
+
+
+MAX_IMAP_REPLY = 4 * 1024 * 1024  # one fetched message (1 MiB) as base64, with room
+
+
+def imap_call(
+    name: str, cmd: str, args: dict | None = None, run: str | None = None, socket: str | Path | None = None
+) -> dict:
+    """Run one mailbox operation (ws.minters.imap.OPS) on registry name `name`, under run id `run` when given. The reply
+    is data only, never the password. Raises BrokerRefused(code, reason) or BrokerUnavailable."""
+    msg: dict = {"op": imap.OP, "name": name, "cmd": cmd, "args": args or {}}
+    if run is not None:
+        msg["run"] = run
+    r = _client_call(msg, socket, timeout=imap.CALL_DEADLINE_S + 15, max_reply=MAX_IMAP_REPLY)
+    return {k: v for k, v in r.items() if k != "ok"}
 
 
 def release(lease: Lease | str, socket: str | Path | None = None) -> None:
@@ -644,6 +666,7 @@ class Broker:
         self.max_ttl_s = max_ttl_s
         self.clock = clock
         self.allow_plain_http = allow_plain_http  # tests only: http to 127.0.0.1; the command line has no switch for it
+        self.imap_cafile: str | None = None  # tests only: a test CA for the mail server; None is the system's
         self.own_uid = os.geteuid()
         self._port = port
         self._grants: dict[str, _Grant] = {}  # sha256(token) -> grant
@@ -841,6 +864,8 @@ class Broker:
                 return self._op_sign(msg, uid, pid)
             if op == "ca_public":
                 return self._op_ca_public(msg)
+            if op == imap.OP:
+                return self._op_imap(msg, uid, pid)
         except Exception as e:  # noqa: BLE001 (answer, never crash the thread; the type only, in case a value is near)
             print(f"ws broker: {op} failed ({type(e).__name__})", file=sys.stderr)
             return _refuse("store_unreadable", "the broker could not complete that")
@@ -1125,6 +1150,45 @@ class Broker:
             return {"ok": True, "public_key": ssh_ca.ca_public_key(value, self.work_dir())}
         except ssh_ca.MintError as e:
             return _refuse(e.code, e.reason)
+
+    def _op_imap(self, msg: dict, uid: int, pid: int) -> dict:
+        """One operation from ws.minters.imap.OPS, run by the broker on the name's mailbox. The password stays here."""
+        log = {"name": msg.get("name"), "uid": uid, "pid": pid, "run": msg.get("run"), "host": None}
+        entry, refused = self._minter_entry(msg, "imap", imap.KIND, log)
+        if refused:
+            return refused
+        assert entry is not None and isinstance(entry.options, imap.Options)
+        opts = entry.options
+        log["host"] = opts.host
+        cmd = msg.get("cmd")
+        log["purpose"] = cmd if isinstance(cmd, str) and cmd in imap.OPS else "?"
+        if cmd not in imap.OPS:
+            return self._refuse_logged("imap", log, "op_refused", f"the operations are {', '.join(imap.OPS)}")
+        if imap.OPS[cmd].needs not in opts.allow:
+            return self._refuse_logged("imap", log, "op_refused", f"{entry.name} does not allow {imap.OPS[cmd].needs}")
+        if entry.purposes and cmd not in entry.purposes:
+            return self._refuse_logged("imap", log, "purpose_not_allowed", f"{entry.name} is not allowed for {cmd}")
+        _rec, why = self._scope(entry, msg, uid, log, self.clock(), need_run=False)
+        if why:
+            return self._refuse_logged("imap", log, *why)
+        value, refused = self._stored("imap", log, entry.name)
+        if refused:
+            return refused
+        assert value is not None
+        if not self.audit.write("imap", "begin", **log):  # before the mailbox is touched, so no change goes unlogged
+            return _refuse("audit_failed", "the operation could not be written to the audit log, so it was not run")
+        try:
+            out = imap.run(opts, value, cmd, msg.get("args"), cafile=self.imap_cafile)
+        except imap.ImapError as e:
+            return self._refuse_logged("imap", log, e.code, e.reason)
+        except Exception as e:  # noqa: BLE001 (the "begin" line gets its outcome; the type only, never the text)
+            print(f"ws broker: imap failed ({type(e).__name__})", file=sys.stderr)
+            return self._refuse_logged("imap", log, "store_unreadable", "the broker could not complete that")
+        finally:
+            del value
+        if not self.audit.write("imap", "ok", bytes=len(out.get("raw", "")) or None, **log):
+            return _refuse("audit_failed", "the result could not be written to the audit log, so it is not given")
+        return {"ok": True, **out}
 
     def _take_minted(self, which) -> list[_Minted]:
         """Remove the minted tokens `which(m)` picks from the list and the cache, under the lock, and return them."""

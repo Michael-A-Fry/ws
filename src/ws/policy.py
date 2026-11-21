@@ -568,6 +568,8 @@ write_outside_project = false
 #   presence         records in the session registry whether a session is busy or idle, from the hooks it already runs
 #   pane-close       closes a tmux window or pane by id only when the registry says it is idle (the lead), or it is the
 #                    session's own pane after its hand-over was delivered
+#   pane-keys        denies typing a slash command into a tmux pane (`tmux send-keys '/remote-control x' Enter`, or a pasted
+#                    buffer), which can open a dialog that holds every key until someone presses one; you can approve it once
 #   config-guard     denies an edit of a file or folder you list (`paths`) unless the session is in one of its `owners`
 #                    folders (or you approve it once); does nothing until you name the paths
 #   guard-launch     denies starting a workflow, or an agent that asks for a worktree, from anywhere but the main checkout
@@ -598,6 +600,8 @@ mode = "log"
 # [guards.checkout-pin]
 # paths = ["~/code/app"]   # optional: checkouts to pin even with no linked worktree (absolute or ~/)
 # [guards.pane-close]
+# live_socket = "default"   # the tmux socket whose panes are guarded (a path, or a name under the tmux folder); other servers are left alone
+# [guards.pane-keys]
 # live_socket = "default"   # the tmux socket whose panes are guarded (a path, or a name under the tmux folder); other servers are left alone
 
 # Rule of Two, leg C (a way out): besides a source's outward acts and the web tools above, the SHELL counts as a way

@@ -833,19 +833,98 @@ def _shell_text(w: str, toks: list[str]) -> str | None:
     return None
 
 
-def _env_split(t: str, nxt: str | None) -> tuple[str, int] | None:
-    """(text, words used) when the `env` option `t` is a split string: `-S`, `-Stext`, `-iS`, `--split-string=text`. The
-    text is the glued part or the next word. None for any other option; `-u` and `-C` take a name, which may hold an S."""
-    if t.startswith("--split-string="):
-        return t.split("=", 1)[1], 1
-    if t.startswith("--") or not t.startswith("-"):
-        return None
-    for k, ch in enumerate(t[1:], 1):
-        if ch in "uC":
-            return None
-        if ch == "S":
-            return (t[k + 1 :], 1) if k + 1 < len(t) else (nxt or "", 2)
-    return None
+# GNU env's options (coreutils `env`): the long names, each taking no value, a required value (`=V` or the next
+# word) or an optional one (`=V` only); the short letters with no value and with a value. A long name may be any
+# unambiguous prefix, as getopt_long allows; an ambiguous or unknown option, or one this table doesn't know, fails
+# closed. Options end at the first word that isn't one (env stops there); a bare `-` then means an empty environment,
+# and the NAME=value settings follow.
+_ENV_LONG = {
+    "ignore-environment": "none",
+    "null": "none",
+    "unset": "required",
+    "chdir": "required",
+    "split-string": "required",
+    "argv0": "required",
+    "block-signal": "optional",
+    "default-signal": "optional",
+    "ignore-signal": "optional",
+    "list-signal-handling": "none",
+    "debug": "none",
+    "help": "none",
+    "version": "none",
+}
+_ENV_SHORT_FLAGS = "i0v"
+_ENV_SHORT_VALUES = {"u": "unset", "C": "chdir", "S": "split-string", "a": "argv0"}
+_ENV_SPLIT_UNREAD = re.compile(r"[\\$#]")  # what env's own -S splitting reads differently from the shell's
+
+
+def _env_unsure(why: str) -> ShellError:
+    return ShellError("unsupported", f"env {why}, which ws does not read; write the command without it")
+
+
+def _env_args(toks: list[str]) -> tuple[int, list[str], str | None]:
+    """(index of the command env runs, the NAME=value settings it makes, the text of an -S string or None), read as
+    GNU env reads `toks` (`toks[0]` is env). Raises ShellError when env's reading isn't certain."""
+    i, split = 1, None
+    while i < len(toks) and split is None:
+        t = toks[i]
+        if t == "--":
+            i += 1
+            break
+        if t.startswith("--"):
+            name, eq, value = t[2:].partition("=")
+            found = [name] if name in _ENV_LONG else [o for o in _ENV_LONG if o.startswith(name)]
+            if not name or len(found) != 1:
+                raise _env_unsure(f"is given {t!r}, an option it reads as ambiguous or unknown")
+            kind, i = _ENV_LONG[found[0]], i + 1
+            if kind == "none" and eq:
+                raise _env_unsure(f"is given a value for {t!r}, which takes none")
+            if kind == "required" and not eq:
+                if i >= len(toks):
+                    raise _env_unsure(f"has no value for {t!r}")
+                value, i = toks[i], i + 1
+            if found[0] == "split-string":
+                split = value
+        elif t.startswith("-") and len(t) > 1:
+            i += 1
+            for k, c in enumerate(t[1:], 1):
+                if c in _ENV_SHORT_FLAGS:
+                    continue
+                if c not in _ENV_SHORT_VALUES:
+                    raise _env_unsure(f"is given {t!r}, an option it doesn't have")
+                if k + 1 < len(t):
+                    value = t[k + 1 :]  # glued: -uNAME, -iSTEXT
+                elif i < len(toks):
+                    value, i = toks[i], i + 1
+                else:
+                    raise _env_unsure(f"has no value for {t!r}")
+                if c == "S":
+                    split = value
+                break
+        else:
+            break
+    if split is not None:
+        if _ENV_SPLIT_UNREAD.search(split):
+            raise _env_unsure("is given an -S string with a backslash, `$` or `#`, which it splits by its own rules")
+        return i, [], split
+    if i < len(toks) and toks[i] == "-":
+        i += 1  # an empty environment, as -i
+    settings: list[str] = []
+    while i < len(toks) and "=" in toks[i]:
+        settings.append(toks[i])
+        i += 1
+    if i < len(toks) and toks[i].startswith("-"):
+        raise _env_unsure(f"would run a program named {toks[i]!r}, or read it as an option")
+    return i, settings, None
+
+
+def _short_takes_next(t: str, arg_opts) -> bool:
+    """Whether the short-option word `t` takes the next word as its value: its first value-taking letter is its last
+    (`-u root`, `-iu root`); one with letters after it holds its value glued (`-uroot`)."""
+    for k, c in enumerate(t[1:], 1):
+        if "-" + c in arg_opts:
+            return k == len(t) - 1
+    return False
 
 
 def strip_wrappers(
@@ -889,32 +968,28 @@ def strip_wrappers(
                 toks = []
                 break
         arg_opts, i, resplit, exec_form = _WRAPPERS[w], 1, None, False
-        while i < len(toks):
+        if w == "env":
+            i, sets, resplit = _env_args(toks)
+            if env is not None:
+                env.extend(sets)
+        while w != "env" and i < len(toks):
             t = toks[i]
             if t == "--":
                 i += 1
-                break
-            if w == "env" and t in ("-S", "--split-string"):
-                resplit = toks[i + 1] if i + 1 < len(toks) else ""
-                i += 2
-                break
-            if w == "env" and (got := _env_split(t, toks[i + 1] if i + 1 < len(toks) else None)):
-                resplit = got[0]
-                i += got[1]
                 break
             if t.startswith("--"):
                 exec_form = exec_form or (w == "watch" and t == "--exec")
                 i += 2 if t in _LONG_ARG.get(w, ()) else 1
             elif t.startswith("-") and len(t) > 1:
                 exec_form = exec_form or (w == "watch" and "x" in t[1:])
-                i += 2 if "-" + t[-1] in arg_opts else 1  # `-u root`, and the `u` of `-iu root`
-            elif w in ("env", "sudo") and _env_setting(t, w):
+                i += 2 if _short_takes_next(t, arg_opts) else 1  # `-u root`, `-iu root`; `-uroot` is one word
+            elif w == "sudo" and _env_setting(t, w):
                 if env is not None:
                     env.append(t)
                 i += 1
             else:
                 break
-        if w in ("env", "sudo") and not resplit:  # after `--` too: env still reads X=Y as a setting
+        if w == "sudo":  # after `--` too: sudo still reads X=Y as a setting
             while i < len(toks) and _env_setting(toks[i], w):
                 if env is not None:
                     env.append(toks[i])

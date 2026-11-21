@@ -2549,3 +2549,26 @@ def test_round_three_settings_ahead_of_a_command_are_judged(pol, home, cmd):
 def test_round_three_ordinary_forms_still_run(pol, home):
     for cmd in ("env -S 'LC_ALL=C git status'", "env =1 git status", "arr[1]=x; echo done"):
         assert policy.is_denied_command(pol, cmd) is None, cmd
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "env --chdir /tmp git push --force origin main",  # a long option whose value is the next word
+        "env --ch /tmp git push --force origin main",  # an unambiguous abbreviation of it
+        "env --sp 'git push --force origin main'",  # an abbreviation of --split-string
+        "env - git push --force origin main",  # a bare - is an empty environment, not the command
+        "env -uX git push --force origin main",  # a value glued to its option
+        "sudo -uroot git push --force origin main",
+        "env -S 'git status\\_x'",  # env splits a backslash by its own rules: fail closed
+        "env --i git status",  # ambiguous: fail closed
+        "D=/tmp; read -r D[0] < /tmp/f; cat $D/.ssh/id_rsa",  # a read into an array leaves the name unknown
+    ],
+)
+def test_env_is_read_as_gnu_env_reads_it(pol, home, cmd):
+    assert policy.is_denied_command(pol, cmd)
+
+
+def test_ordinary_env_forms_still_run(pol, home):
+    for cmd in ("env --chdir=/tmp git status", "env -i PATH=/bin ls", "env - LC_ALL=C ls", "sudo -uroot ls"):
+        assert policy.is_denied_command(pol, cmd) is None, cmd

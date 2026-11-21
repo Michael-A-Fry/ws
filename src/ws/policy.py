@@ -2299,8 +2299,13 @@ def _targets(toks: list[str]) -> set[str]:
     if not toks or toks[0] not in _TARGET_SETTERS:
         return set()
     if toks[0] == "let":
-        return {m.group(1) for t in toks[1:] if (m := re.match(r"([A-Za-z_][A-Za-z0-9_]*)\s*[-+*/%&|^<>]*=", t))}
-    names = [t for t in toks[1:] if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", t)]
+        return {
+            m.group(1)
+            for t in toks[1:]
+            if (m := re.match(r"([A-Za-z_][A-Za-z0-9_]*)(?:\[[^]]*\])?\s*[-+*/%&|^<>]*=", t))
+        }
+    # a subscripted name (`A[0]`) sets the array: the name itself is what becomes unknown
+    names = [m.group(1) for t in toks[1:] if (m := re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)(?:\[.*\])?", t, re.DOTALL))]
     return set(names[1:2]) if toks[0] == "getopts" else set(names)
 
 

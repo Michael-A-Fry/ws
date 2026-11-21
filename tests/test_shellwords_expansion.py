@@ -454,7 +454,7 @@ def test_a_for_list_of_more_than_the_limit_is_a_typed_refusal_when_the_body_uses
         (["env", "--split-string", "cat ~/x", "y"], "cat ~/x"),
         (["env", "-iS", "cat ~/x", "y"], "cat ~/x"),
         (["env", "-iScat ~/x", "y"], "cat ~/x"),
-        (["env", "A=1", "-u", "B", "-S", "cat ~/x"], "cat ~/x"),
+        (["env", "-u", "B", "-S", "cat ~/x"], "cat ~/x"),  # options come before settings: env stops at the first one
     ],
 )
 def test_every_spelling_of_an_env_split_string_is_given_back_as_a_command_line(toks, text):
@@ -479,7 +479,7 @@ def test_an_env_option_that_takes_a_name_is_not_a_split_string():
         "env --split-string='cat ~/.ssh/id_rsa'",
         "env --split-string 'cat ~/.ssh/id_rsa'",
         "env -iS 'cat ~/.ssh/id_rsa'",
-        "env A=1 -S'cat ~/.ssh/id_rsa'",
+        "env -u A -S'cat ~/.ssh/id_rsa'",
         "sudo env -S'cat ~/.ssh/id_rsa'",
     ],
 )

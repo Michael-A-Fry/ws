@@ -8,6 +8,35 @@ body of the GitHub release.
 
 ## [Unreleased]
 
+## [0.1.11.3] - 2026-11-22
+
+### Added
+
+- The broker has an `imap` credential kind: it logs in to the registered host only and runs one operation from a fixed
+  table (list, search, fetch, label, draft). Nothing sends, deletes, expunges, moves or copies; a draft goes only to the
+  Drafts folder, and the mailbox password never leaves the broker. (#268)
+- `ws.mail`: search, get, label and draft replies over the broker's `imap` kind. Mail text comes back inside a tagged
+  untrusted block with forged delimiters defused; a draft's recipients and threading come from the original's headers,
+  never from the caller, and a uid is tied to its mailbox. (#271)
+- A job file may leave out `model`: it takes `[models].<purpose>`, else `[models].default`. `ws config model` shows and
+  sets the model table, and `ws config budget` sets the spend cap; an agent session can't change either. (#269)
+
+### Changed
+
+- OpenCode jobs start no MCP server: each run gets its own HOME and XDG folders, project config isn't read, and a
+  global `/etc/opencode` config is refused, so a policy with `allow_mcp` no longer refuses every OpenCode job. A job's
+  per-run folders are used inside the wall too, never the person's persistent ones. (#270)
+- A profile ws can't parse or read is never saved over. (#269)
+
+### Known limits
+
+- Under the new OpenCode isolation, a job's provider block or instructions in the project's `opencode.json` or
+  `AGENTS.md` aren't read. A supported way for a job to name a local model server and a data input comes next.
+
+### Removed
+
+- Nothing.
+
 ## [0.1.11.2] - 2026-11-22
 
 ### Added

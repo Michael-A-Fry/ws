@@ -566,6 +566,25 @@ Serve memory_search, memory_add and note_capture over stdio.
 ws mcp serve [-h]
 ```
 
+## `ws connect`
+
+Connect an integration: the steps only a person can do, from one flow file, walked the same way each time. The format and
+the JSON an agent reads are in [Connect flows](connect.md); to add one, see [Add a connect flow](../how-to/add-a-connect-flow.md).
+
+```text
+ws connect [-h] [--dry-run] [--diagnose] [--revoke] [target]
+```
+
+| Argument | Meaning |
+|---|---|
+| `target` | A flow id, or `list` (the default): the flows there are. |
+| `--dry-run` | Show each step as `done` or `needs_human`. With `--json`, the agent contract. Exit 0 when all done, 3 when a person has something to do. Changes nothing; an agent may run it. |
+| `--diagnose` | Step state and what was learned, with the nonce redacted. Changes nothing. |
+| `--revoke` | Undo the flow: delete its secret, say what to undo on the other side, clear its state. Refused inside an agent session. |
+
+With no flag, `ws connect <id>` walks the flow in your own terminal and refuses inside an agent session. A captured
+secret goes to the secrets store and nowhere else.
+
 ## `ws connector`
 
 Zone MCP servers (`[connectors.NAME]` in the [policy](policy.md#connectorsname)): list them, start a session with one,

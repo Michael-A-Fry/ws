@@ -18,6 +18,7 @@ from ws.output import WsError
 SHIPPED = [
     ("ask", "asks"),
     ("commit-wall", "commit_wall"),
+    ("connect", "connectcmd"),
     ("connector", "connectors"),
     ("dispatch", "dispatch"),
     ("job", "jobcmd"),

@@ -8,6 +8,23 @@ body of the GitHub release.
 
 ## [Unreleased]
 
+## [0.1.11.2] - 2026-11-22
+
+### Added
+
+- `ws connect` (list, walk, `--dry-run --json`, `--revoke`, `--diagnose`): one flow format and engine for the setup
+  steps only a person can do, with a JSON Schema, a reference page, a how-to and ADR 0033. The first flow is Telegram.
+  A secret goes from the person's terminal to the secrets store only, after a real verify, and is in no state file,
+  output or error. The walk and `--revoke` refuse inside an agent session. (#265)
+- A secrets-registry entry may set `base_path` (for example `/api`) for a host that serves its API under a prefix; the
+  broker adds it on the way out, after the `paths` check, and refuses a hostile request path. (#266)
+- `ws passtest events`: a read-only counter of confirmed step-ins per week over a hash-chained pass-test ledger; a
+  broken or truncated chain counts nothing and exits 1. (#257)
+
+### Removed
+
+- Nothing.
+
 ## [0.1.11.1] - 2026-11-21
 
 ### Security

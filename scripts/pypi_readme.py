@@ -29,7 +29,7 @@ from email.parser import Parser
 from pathlib import Path
 
 REPO = "Michael-A-Fry/ws"
-TAG_RE = re.compile(r"^v\d+\.\d+\.\d+$")
+TAG_RE = re.compile(r"^v\d+\.\d+\.\d+(\.\d+)?$")  # vX.Y.Z, or vX.Y.Z.N
 
 # `[text](target)` and `![alt](target)`, with an optional "title"; `[label]: target` reference definitions; HTML
 # `src="..."` and `href="..."`.
@@ -115,7 +115,7 @@ def _sub_prose(line: str, tag: str) -> str:
 def rewrite(text: str, tag: str) -> str:
     """`text` with every relative link, image and reference definition outside code made absolute at `tag`."""
     if not TAG_RE.match(tag):
-        raise ValueError(f"tag {tag!r} is not vX.Y.Z")
+        raise ValueError(f"tag {tag!r} is not vX.Y.Z or vX.Y.Z.N")
     return "".join(_sub_prose(chunk, tag) if prose else chunk for prose, chunk in _prose_segments(text))
 
 
@@ -175,7 +175,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "rewrite":
         if not TAG_RE.match(args.tag):
-            print(f"pypi_readme: tag {args.tag!r} is not vX.Y.Z", file=sys.stderr)
+            print(f"pypi_readme: tag {args.tag!r} is not vX.Y.Z or vX.Y.Z.N", file=sys.stderr)
             return 2
         before = args.readme.read_text(encoding="utf-8")
         after = rewrite(before, args.tag)

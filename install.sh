@@ -286,15 +286,15 @@ tag_from_json() {
     sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | sed 1q
 }
 
-# A stable release tag, vX.Y.Z.
+# A stable release tag, vX.Y.Z, or a fourth-part release of one, vX.Y.Z.N.
 is_stable_tag() {
-    printf '%s\n' "$1" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'
+    printf '%s\n' "$1" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?$'
 }
 
-# A release tag, vX.Y.Z or a release candidate vX.Y.ZrcN: the release workflow only builds those, and the wheel's
-# file name comes from it.
+# A release tag, vX.Y.Z or vX.Y.Z.N, or a release candidate vX.Y.ZrcN: the release workflow only builds those, and
+# the wheel's file name comes from it.
 is_release_tag() {
-    printf '%s\n' "$1" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(rc[0-9]+)?$'
+    printf '%s\n' "$1" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?(rc[0-9]+)?$'
 }
 
 make_workdir() {

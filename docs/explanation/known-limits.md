@@ -232,6 +232,10 @@ apply there, and the shim leaves an MCP tool to OpenCode's own permissions.
 - **What it means.** A `deny_tools` entry for a literal server (`mcp__server__tool`, `mcp__server__*`) is written into
   OpenCode's `permission` block as `server_tool` or `server_*`, and OpenCode enforces it. A glob with a wildcard server
   (`mcp__*__delete_*`) isn't written, because `*_delete_*` would also catch OpenCode's own tools.
+- **In `ws run`.** A job starts no MCP server at all: the run gets an empty config folder, the project's own config is
+  switched off, the generated config has an empty `mcp`, and `mcp` is not a job option. So `allow_mcp` holds there with no
+  hook, and a policy that has it doesn't refuse an OpenCode job. A session you start with `ws gate launch` is your own and
+  keeps the limit above.
 - **Workaround.** Use Claude Code for MCP servers that matter, or set `permission` rules for them in OpenCode's own
   config.
 

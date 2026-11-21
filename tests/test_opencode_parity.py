@@ -757,9 +757,6 @@ def _planted(extra: str):
 @pytest.mark.parametrize(
     "extra, check",
     [
-        ('allow_mcp = ["mcp__docs__search"]', "mcp"),
-        ('deny_tools = ["mcp__*__delete_*"]', "mcp"),
-        ('deny_tools = ["mcp__docs"]', "mcp"),  # a whole server has no OpenCode rule: not a silent allow
         ('allow_hosts = ["example.com"]', "allow_hosts"),
     ],
 )
@@ -772,6 +769,16 @@ def test_opencode_refuses_a_policy_that_needs_a_check_it_cannot_do(extra, check)
     assert e.value.exit_code == 3 and e.value.kind == "cannot_check"
     assert "CANNOT_CHECK" in e.value.message and check in e.value.message
     conformance.refuse_cannot_check(_planted(extra), "claude-code")  # the same policy is fine where it can be checked
+
+
+@pytest.mark.parametrize(
+    "extra",
+    ['allow_mcp = ["mcp__docs__search"]', 'deny_tools = ["mcp__*__delete_*"]', 'deny_tools = ["mcp__docs"]'],
+)
+def test_opencode_job_mcp_rules_are_enforced_by_starting_no_server_so_no_refusal(extra):
+    from ws import conformance
+
+    conformance.refuse_cannot_check(_planted(extra), "opencode")
 
 
 def test_opencode_refuses_an_unsupported_guard_that_is_on_and_not_otherwise():
@@ -807,13 +814,38 @@ def _opencode_job(run_ws, policy_text):  # noqa: F811
     )
 
 
-def test_ws_run_refuses_an_opencode_job_whose_policy_allows_an_mcp_tool(run_ws, capsys):  # noqa: F811
+def test_ws_run_no_longer_refuses_an_opencode_job_whose_policy_has_allow_mcp(run_ws):  # noqa: F811
     _opencode_job(run_ws, '[gate]\nallow_mcp = ["mcp__docs__search"]\n')
-    assert cli.main(["run", "daily"]) == 3
-    err = capsys.readouterr().err
-    assert "CANNOT_CHECK" in err and "mcp" in err
-    (rec,) = run_ws.records()
-    assert rec["status"] == "refused" and rec["stop_reason"] == "refused:cannot_check"
+    cli.main(["run", "daily"])
+    assert all(r["stop_reason"] != "refused:cannot_check" for r in run_ws.records())
+
+
+def _job_for(options: str = ""):
+    from ws import jobs
+
+    text = f'runner = "opencode"\nmodel = "openrouter/x:free"\nprompt = "ok"\n{options}\n'
+    return jobs.loads("daily", text, Path("."))
+
+
+def test_an_opencode_job_gets_a_config_with_zero_mcp_servers_and_no_other_config_source(tmp_path):
+    from ws.adapters import opencode
+
+    (tmp_path / "gate").mkdir()
+    cfg = opencode.generate(policy.default_policy(), ["ws"], tmp_path / "gate", tmp_path / "policy.toml")
+    assert json.loads(cfg["opencode.json"])["mcp"] == {}
+    (tmp_path / "gate" / "opencode.json").write_text(cfg["opencode.json"])
+    _argv, env = opencode.build_command(_job_for(), tmp_path, None)
+    assert json.loads(env["OPENCODE_CONFIG_CONTENT"])["mcp"] == {}
+    assert env["OPENCODE_DISABLE_PROJECT_CONFIG"] == "true"
+    assert env["XDG_CONFIG_HOME"] == str(tmp_path / "xdg") and not any((tmp_path / "xdg").iterdir())
+
+
+def test_an_opencode_job_that_names_an_mcp_server_is_refused(tmp_path):
+    from ws.adapters import opencode
+
+    for option in ('[runner_options]\nmcp = ["docs"]', '[runner_options.mcp.docs]\ntype = "local"'):
+        with pytest.raises(ValueError, match="mcp"):
+            opencode.build_command(_job_for(option), tmp_path, None)
 
 
 def test_ws_run_does_not_refuse_the_same_policy_for_claude_code(run_ws):  # noqa: F811

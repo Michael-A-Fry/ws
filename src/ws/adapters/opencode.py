@@ -115,10 +115,12 @@ def unsupported_guards() -> tuple[str, ...]:
 # The guards the generated shim cannot run. `ws doctor` names them when a policy has one on.
 UNSUPPORTED_GUARDS = unsupported_guards()
 
+# "mcp" is not listed: a `ws run` job starts no MCP server at all (build_command: no global or project config, `mcp` empty,
+# and `mcp` is not a job option), so allow_mcp and the deny_tools MCP globs hold with no hook. `ws gate launch` is a
+# person's own session and is not judged by this list.
 # Checks a policy can ask for that this runner cannot enforce; `ws run` refuses such a job (conformance.refuse_cannot_check).
 # A guard is "guard:NAME" and comes from UNSUPPORTED_GUARDS, so a new guard needs no edit here.
 CANNOT_CHECK = {
-    "mcp": "the hook cannot tell an MCP tool from a built-in one, so allow_mcp and deny_tools globs are not enforced",
     "allow_hosts": "the OpenCode wall does not filter the network by host",
     **{f"guard:{g}": "the generated shim cannot run this guard" for g in UNSUPPORTED_GUARDS},
 }
@@ -296,6 +298,7 @@ def generate(
         "$schema": "https://opencode.ai/config.json",
         "_generated": GENERATED_NOTE,
         "permission": permission,
+        "mcp": {},  # the generated config names no server; build_command also removes the configs that could add one
     }
     if (
         POLICIES_SINCE is not None
@@ -662,6 +665,13 @@ def build_command(job, run_dir: Path, lease) -> tuple[list[str], dict[str, str]]
     argv = [exe, "run", "--model", job.model, "--format", "json"]
     env = jobs.extra_env(job)  # first: what ws sets below always wins
     env.update(OPENCODE_CONFIG_DIR=str(out), OPENCODE_DISABLE_AUTOUPDATE="true")
+    # No MCP server can start in a job: OpenCode merges its global config (XDG_CONFIG_HOME) and the project's own
+    # opencode.json into the inline one, and an empty inline `mcp` does not remove a server they name (checked on
+    # 1.19.4). So the run gets an empty config folder and the project config is switched off.
+    xdg = Path(run_dir) / "xdg"
+    if xdg.parent.is_dir():  # the run's folder is there once its gate files are written
+        xdg.mkdir(exist_ok=True)
+    env.update(XDG_CONFIG_HOME=str(xdg), OPENCODE_DISABLE_PROJECT_CONFIG="true")
     if offline:  # no model-list fetch or language-server download: for a stub or an air-gapped machine
         env.update(OPENCODE_DISABLE_MODELS_FETCH="true", OPENCODE_DISABLE_LSP_DOWNLOAD="true")
     gate_file = out / CONFIG

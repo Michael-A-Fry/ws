@@ -11,7 +11,8 @@ What it promises, each pinned by a test:
 
 - At most `--jobs` fetches at once (default 4).
 - Each fetch has its own time limit (`--timeout-s`, default 120). A fetch past it is killed with its whole process group
-  (git's helpers too), named, and counted as a failure; the others go on and finish.
+  (git's helpers too: TERM, then KILL after a short grace, even if git itself went), named, and counted as a failure;
+  the others go on and finish. Ctrl-C kills every fetch still running the same way.
 - It fetches and nothing else: no merge, no checkout, nothing in a working tree is touched.
 - Exit 0 when every fetch finished cleanly; exit 1 when any failed or timed out, each one named with why.
 """
@@ -23,6 +24,7 @@ import contextlib
 import os
 import signal
 import subprocess
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -47,20 +49,28 @@ def repos(root: Path) -> list[Path]:
     return sorted(found, key=lambda p: p.name)
 
 
-def _kill(proc: subprocess.Popen) -> None:
-    """Stop a fetch and every process it started: its group gets TERM, then KILL after a short grace."""
+_live: set[subprocess.Popen] = set()  # the fetches running now, so an interrupt can stop them all
+_live_lock = threading.Lock()
+
+
+def _signal_group(proc: subprocess.Popen, sig: int) -> None:
     killpg = getattr(os, "killpg", None)
-    for sig in (signal.SIGTERM, getattr(signal, "SIGKILL", signal.SIGTERM)):
-        with contextlib.suppress(OSError):
-            if killpg is not None:
-                killpg(proc.pid, sig)
-            else:
-                proc.kill()
-        try:
-            proc.wait(KILL_GRACE_S)
-            return
-        except subprocess.TimeoutExpired:
-            continue
+    with contextlib.suppress(OSError):  # ProcessLookupError: the group is gone already
+        if killpg is not None:
+            killpg(proc.pid, sig)
+        else:
+            proc.kill()
+
+
+def _kill(proc: subprocess.Popen) -> None:
+    """Stop a fetch and every process it started: its group gets TERM, a short grace, then KILL whatever happened, so
+    a helper that ignores TERM (or outlives git) is not left holding the pipe."""
+    _signal_group(proc, signal.SIGTERM)
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.wait(KILL_GRACE_S)
+    _signal_group(proc, getattr(signal, "SIGKILL", signal.SIGTERM))
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.wait(KILL_GRACE_S)
 
 
 def fetch(repo: Path, timeout_s: float, argv: tuple[str, ...] | None = None) -> dict:
@@ -75,6 +85,8 @@ def fetch(repo: Path, timeout_s: float, argv: tuple[str, ...] | None = None) -> 
         )  # fmt: skip
     except OSError as e:
         return {"repo": repo.name, "status": "failed", "seconds": 0.0, "detail": e.strerror or str(e)}
+    with _live_lock:
+        _live.add(proc)
     try:
         _, err = proc.communicate(timeout=timeout_s)
     except subprocess.TimeoutExpired:
@@ -83,6 +95,9 @@ def fetch(repo: Path, timeout_s: float, argv: tuple[str, ...] | None = None) -> 
             proc.communicate(timeout=KILL_GRACE_S)
         took = round(time.monotonic() - t0, 2)
         return {"repo": repo.name, "status": "timeout", "seconds": took, "detail": f"killed after {timeout_s:g} s"}
+    finally:
+        with _live_lock:
+            _live.discard(proc)
     took = round(time.monotonic() - t0, 2)
     if proc.returncode != 0:
         last = (err or "").strip().splitlines()[-1:] or [f"exit {proc.returncode}"]
@@ -93,12 +108,23 @@ def fetch(repo: Path, timeout_s: float, argv: tuple[str, ...] | None = None) -> 
 def sync(
     root: Path, *, jobs: int = JOBS, timeout_s: float = TIMEOUT_S, argv: tuple[str, ...] | None = None
 ) -> list[dict]:
-    """Fetch every repository under `root`, `jobs` at a time; the results in repository-name order."""
+    """Fetch every repository under `root`, `jobs` at a time; the results in repository-name order. An interrupt
+    (Ctrl-C) kills every fetch still running, with its group, and drops the ones not started."""
     found = repos(root)
     if not found:
         return []
-    with ThreadPoolExecutor(max_workers=jobs) as pool:
+    pool = ThreadPoolExecutor(max_workers=jobs)
+    try:
         return list(pool.map(lambda r: fetch(r, timeout_s, argv), found))
+    except BaseException:
+        pool.shutdown(wait=False, cancel_futures=True)
+        with _live_lock:
+            running = list(_live)
+        for proc in running:
+            _kill(proc)
+        raise
+    finally:
+        pool.shutdown(wait=True)
 
 
 def _positive(kind):

@@ -23,6 +23,7 @@ SHIPPED = [
     ("watch", "jobwatch"),
     ("msg", "msg"),
     ("node", "node"),
+    ("passtest", "passtest"),
     ("queue", "queue"),
     ("upgrade", "upgrade"),
     ("usage", "usage"),

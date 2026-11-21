@@ -10,6 +10,12 @@ body of the GitHub release.
 
 ### Added
 
+- `ws queue report [--weekly] [--weeks N]`: a row a week of gate blocks, slot stalls and hand-offs, with the runs
+  that finished and those killed by their own cap.
+- `ws queue slot` gives each session a share of a lane while another session waits (`--session`, else
+  `WS_SLOT_SESSION`, else the runner's session id); a session alone still takes every slot.
+- A slot wait past `slot_max_wait_s` (default 30 minutes) is requeued in its place and counted, not failed. The
+  queue store is schema 6 (`session`, `requeues`); an older store gains the columns when it opens.
 - `ws queue reap`, run by a new reaper timer every 2 minutes (`ws-queue-reap.timer` on systemd,
   `ws.job.queue-reap` on launchd). ws records and tells a run killed with nothing else starting after
   it within minutes, not at the next run.

@@ -132,6 +132,7 @@ CASES: dict[str, list[str]] = {
     "queue.run": ["queue", "run"],
     "queue.tick": ["queue", "tick", "nojob"],
     "queue.reap": ["queue", "reap"],
+    "queue.report": ["queue", "report"],
     "node.join": ["node", "join"],
     "node.show": ["node", "show"],
     "node.remove": ["node", "remove"],

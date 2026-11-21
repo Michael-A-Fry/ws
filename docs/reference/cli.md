@@ -586,6 +586,11 @@ ws connect [-h] [--dry-run] [--diagnose] [--revoke] [--yes] [target]
 With no flag, `ws connect <id>` walks the flow in your own terminal and refuses inside an agent session. A captured
 secret goes to the secrets store and nowhere else.
 
+## `ws mail`
+
+Mailboxes for triage (`[mail.NAME]` in the profile): `ws mail add NAME --host H --user U [--kind gmail]`, `ws mail
+check`, `ws mail rm NAME`, and `ws mail serve` (the five mail tools over stdio). See [Mail](mail.md).
+
 ## `ws connector`
 
 Zone MCP servers (`[connectors.NAME]` in the [policy](policy.md#connectorsname)): list them, start a session with one,

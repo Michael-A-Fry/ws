@@ -267,10 +267,9 @@ def test_an_opencode_job_gets_private_homes_and_a_private_tmp_in_its_environment
     opencode_job(ws, f'cwd = "{app}"')
     assert cli.main(["run", "oc"]) == 0
     env = started.env
-    base = (ws.home / "wall" / "opencode").resolve()
-    key = sandbox.project_key(str(app.resolve()))
-    assert env["XDG_DATA_HOME"] == f"{base}/data/{key}" and env["XDG_STATE_HOME"] == f"{base}/state"
-    assert env["XDG_CACHE_HOME"] == f"{base}/cache/{key}"
+    runs = (ws.home / "runs").resolve()
+    for var in ("XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "HOME"):  # the run's own, empty
+        assert Path(env[var]).resolve().is_relative_to(runs) and "/wall/opencode" not in env[var], var
     assert "ws-wall-" in env["TMPDIR"] and not Path(env["TMPDIR"]).exists()  # taken down with the wall
     assert (
         env["WS_GATED_SESSION"] == "1" and "OPENCODE_CONFIG_CONTENT" in env
@@ -286,7 +285,9 @@ def test_an_opencode_jobs_transcript_is_found_in_its_private_data_folder(ws, sta
     assert cli.main(["run", "oc"]) == 0
     (rec,) = ws.records()
     assert started.db is not None and rec["transcript_path"] == str(started.db)
-    assert str(started.db).startswith(str((ws.home / "wall").resolve()))
+    assert str(started.db).startswith(
+        str((ws.home / "runs").resolve())
+    )  # the job's own data folder, not the persistent one
 
 
 def test_an_opencode_job_with_no_cwd_may_write_its_default_folder(ws, started):
@@ -315,7 +316,10 @@ def test_an_opencode_job_runs_bare_when_the_policy_has_the_sandbox_off(ws, start
     app = project(tmp_path)
     opencode_job(ws, f'cwd = "{app}"')
     assert cli.main(["run", "oc"]) == 0
-    assert started.argv[0] == str(ws.bin / "opencode") and started.pass_fds == () and "XDG_DATA_HOME" not in started.env
+    assert started.argv[0] == str(ws.bin / "opencode") and started.pass_fds == ()
+    assert started.env["XDG_DATA_HOME"].startswith(
+        str(ws.home / "runs")
+    )  # still an empty folder of the run, not the real home
 
 
 def test_an_opencode_job_whose_folder_is_the_home_folder_is_refused_as_a_record(ws, started, tmp_path):
@@ -479,3 +483,15 @@ def test_a_job_with_the_sandbox_off_still_does_not_wait_on_a_prompt(ws, tmp_path
     ws.job(extra=f'cwd = "{project(tmp_path)}"')
     assert cli.main(["run", "daily"]) == 0
     assert settings_of(ws)["permissions"]["denyInsteadOfPrompting"] is True
+
+
+def test_an_opencode_job_never_touches_the_persistent_private_home(ws, started, tmp_path):
+    app = project(tmp_path)
+    key = sandbox.project_key(str(app.resolve()))
+    private = (ws.home / "wall" / "opencode").resolve() / "data" / key / "opencode"
+    private.mkdir(parents=True)
+    (private / "auth.json").write_text('{"signed": "in"}')
+    opencode_job(ws, f'cwd = "{app}"')
+    assert cli.main(["run", "oc"]) == 0
+    assert (private / "auth.json").read_text() == '{"signed": "in"}'  # not seeded over, not deleted
+    assert sorted(p.name for p in private.iterdir()) == ["auth.json"]  # nothing added

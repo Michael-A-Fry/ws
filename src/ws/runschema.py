@@ -243,8 +243,9 @@ SCHEMA: dict = {
             "description": (
                 "Why the run ended: completed, timeout, preempted, interrupted, runner_error, broker_unavailable, "
                 "not_found, expired, crashed (before outcome_unknown), owner_gone, max_turns, max_budget, skipped, "
-                "nothing_to_do, upstream:<unavailable|rate_limited|invalid>, or refused:<counter> (the counter that "
-                "said no). Null on a record written before schema 3."
+                "nothing_to_do, no_model (the job names no model and the profile's [models] gives none), "
+                "upstream:<unavailable|rate_limited|invalid>, or refused:<counter> (the counter that said no). Null "
+                "on a record written before schema 3."
             ),
         },
         "reservation": {

@@ -22,7 +22,11 @@ body of the GitHub release.
 - `ws dispatch` passes the model as one argument, `--model=M`, so a model name that starts with `-` can't become a
   flag, and its code root expands `~` only for your own home (`~` or `~/...`).
 - A hand-written OpenCode job whose `provider` table names a public or non-literal address, another npm package, or a
-  key outside the allowlist (such as `apiKey` or `headers`) is now refused at `ws run`, with the reason.
+  key outside the allowlist (such as `apiKey` or `headers`) is now refused at `ws run`, with the reason. A leased job
+  whose `provider` table holds only `models` (the lease gives the address) now also needs
+  `npm = "@ai-sdk/openai-compatible"`.
+- A job whose provider is on the local network or a tailnet (a literal private, CGNAT or other loopback address) now
+  counts as a local credential, so the queue and its timer take it; before, only 127.0.0.1, localhost and ::1 did.
 
 ## [0.1.11.3] - 2026-11-22
 

@@ -1753,12 +1753,12 @@ else: each run starts with a fresh home folder and the project's own config swit
 
 ```toml
 runner = "opencode"
-model = "box/qwen3:8b"              # <provider id>/<model id>: the provider id names the table below
+model = "ollama/qwen3:8b"           # <provider id>/<model id>: the provider id names the table below
 prompt_file = "daily.md"
 
 [runner_options.provider]
 npm = "@ai-sdk/openai-compatible"
-name = "Box"
+name = "Ollama"
 options = { baseURL = "http://127.0.0.1:11434/v1", timeout = 600000 }
 [runner_options.provider.models."qwen3:8b"]
 name = "Qwen3 8B"
@@ -1778,9 +1778,15 @@ The table is an allowlist, checked by `ws job add` and again by `ws run` (so a j
   the check and the call; so are link-local addresses, IPv4-mapped IPv6 and decimal, octal or hex spellings.
 - `{env:...}` and `{file:...}` are refused anywhere in the table: OpenCode fills them in after ws has checked it.
 
-A public base URL is refused: a hosted provider goes through a `[[secrets]]` lease and the broker. A run with a data
-class still gets only the network its class allows, so a server on the local network must be in the class's
-`allowed_hosts`; only a loopback server counts as "on this machine" for the class's term check.
+A public base URL is refused: a hosted provider goes through a `[[secrets]]` lease and the broker. The check covers
+the address ws hands OpenCode, not where the server sends you: OpenCode's model client (the AI SDK) follows 3xx
+redirects, so without a data class a server on the local network can bounce the prompt to another host. Point jobs
+only at a server you run.
+
+Under a data class, the provider id (the part of `model` before the slash) must be a local one by name (`local`,
+`ollama`, `lmstudio`, `vllm` or `llamacpp`) for a class that allows only local models, which is why the example uses
+`ollama`. The run still gets only the network its class allows, so a server on the local network must be in the
+class's `allowed_hosts`, and only a loopback server counts as "on this machine" for the class's term check.
 
 To point a job at another server, change `baseURL` (and `model` if the model id differs) and add it again with
 `ws job add --replace`. To move it to Claude Code, set `runner = "claude-code"`, a Claude model, and drop the

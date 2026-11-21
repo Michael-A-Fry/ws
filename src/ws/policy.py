@@ -2355,6 +2355,11 @@ def _segment_once(
     held = _targets(toks) & (set(ctx.vars or {}) | set(ctx.loops or {}) | set(ctx.unknown) | _SSH_ENV)
     if held:  # read X / let X=.. after X held a value (or set ssh's askpass): which value it has now isn't followed
         _mark_names(ctx, held)
+    if toks and toks[0] == "unset":  # unset X: what X holds is no longer the value ws knows
+        if any(_HAS_PART.search(w) for w in toks[1:]):
+            _distrust(ctx, folders=True)  # unset $N: a name ws cannot read, so any variable
+        else:
+            _mark_names(ctx, {m.group(1) for w in toks[1:] if (m := re.match(r"([A-Za-z_][A-Za-z0-9_]*)", w))})
     if toks and toks[0] in _DECLARERS and any(_HAS_PART.search(w) and not shellwords.ASSIGN.match(w) for w in toks[1:]):
         _distrust(ctx, folders=True)  # export ${A}=x ; export $(cat env): a name ws cannot read, so any variable
     elif toks and toks[0] in _DECLARERS:  # export X=/ ; declare -x X=/ ; local X=/

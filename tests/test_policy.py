@@ -2587,3 +2587,28 @@ def test_ordinary_env_forms_still_run(pol, home):
 )
 def test_a_wrapper_value_with_an_equals_sign_and_an_empty_split_string_are_judged(pol, home, cmd):
     assert policy.is_denied_command(pol, cmd)
+
+
+# --- sudo's options, and unset ------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "sudo --chdir /tmp git push --force origin main",  # a long option whose value is the next word
+        "sudo --ch /tmp git push --force origin main",  # an unambiguous abbreviation of it
+        "sudo --role r git push --force origin main",
+        "sudo --chroot /srv git push --force origin main",
+        "sudo -r r git push --force origin main",  # a short option with a value
+        "sudo -t t git push --force origin main",
+        "sudo --pr x git status",  # ambiguous: fail closed
+        "H=/tmp; unset H; cat ${H:-$HOME}/.ssh/id_rsa",  # after unset, the name's old value is not known
+    ],
+)
+def test_sudo_is_read_as_sudo_reads_it_and_unset_clears_a_known_name(pol, home, cmd):
+    assert policy.is_denied_command(pol, cmd)
+
+
+def test_ordinary_sudo_and_unset_forms_still_run(pol, home):
+    for cmd in ("sudo -u root ls", "sudo --user=root ls", "sudo -iu root ls", "sudo -E ls", "unset X; ls"):
+        assert policy.is_denied_command(pol, cmd) is None, cmd

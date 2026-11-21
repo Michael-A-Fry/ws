@@ -918,6 +918,98 @@ def _env_args(toks: list[str]) -> tuple[int, list[str], str | None]:
     return i, settings, None
 
 
+# sudo's options (sudo 1.9): its short letters with a value, the one with an optional value glued on (`-hHOST`; `-h`
+# alone is help), the letters with none, and its long names, each taking no value, a required one (`=V` or the next
+# word) or an optional one (`=V` only), matched exactly or by an unambiguous prefix. Options end at the first word
+# that isn't one; NAME=value settings follow. An ambiguous or unknown option, or a program word that starts with `-`,
+# fails closed.
+_SUDO_SHORT_VALUES = "aCcDgpRrTtUu"
+_SUDO_SHORT_OPTIONAL = "h"
+_SUDO_SHORT_FLAGS = "ABbEeHiKklNnPSsVv"
+_SUDO_LONG = {
+    "askpass": "none",
+    "auth-type": "required",
+    "background": "none",
+    "bell": "none",
+    "close-from": "required",
+    "chdir": "required",
+    "preserve-env": "optional",
+    "edit": "none",
+    "group": "required",
+    "set-home": "none",
+    "help": "none",
+    "host": "required",
+    "login": "none",
+    "remove-timestamp": "none",
+    "reset-timestamp": "none",
+    "login-class": "required",
+    "list": "none",
+    "non-interactive": "none",
+    "preserve-groups": "none",
+    "prompt": "required",
+    "chroot": "required",
+    "role": "required",
+    "stdin": "none",
+    "shell": "none",
+    "type": "required",
+    "command-timeout": "required",
+    "other-user": "required",
+    "user": "required",
+    "version": "none",
+    "validate": "none",
+}
+
+
+def _sudo_unsure(why: str) -> ShellError:
+    return ShellError("unsupported", f"sudo {why}, which ws does not read; write the command without it")
+
+
+def _sudo_args(toks: list[str]) -> tuple[int, list[str]]:
+    """(index of the command sudo runs, the NAME=value settings it makes), read as sudo reads `toks` (`toks[0]` is
+    sudo). Raises ShellError when sudo's reading isn't certain."""
+    i = 1
+    while i < len(toks):
+        t = toks[i]
+        if t == "--":
+            i += 1
+            break
+        if t.startswith("--"):
+            name, eq, _ = t[2:].partition("=")
+            found = [name] if name in _SUDO_LONG else [o for o in _SUDO_LONG if o.startswith(name)]
+            if not name or len(found) != 1:
+                raise _sudo_unsure(f"is given {t!r}, an option it reads as ambiguous or unknown")
+            kind, i = _SUDO_LONG[found[0]], i + 1
+            if kind == "none" and eq:
+                raise _sudo_unsure(f"is given a value for {t!r}, which takes none")
+            if kind == "required" and not eq:
+                if i >= len(toks):
+                    raise _sudo_unsure(f"has no value for {t!r}")
+                i += 1
+        elif t.startswith("-") and len(t) > 1:
+            i += 1
+            for k, c in enumerate(t[1:], 1):
+                if c in _SUDO_SHORT_FLAGS:
+                    continue
+                if c in _SUDO_SHORT_OPTIONAL:
+                    break  # `-hHOST` holds its value; `-h` alone has none
+                if c not in _SUDO_SHORT_VALUES:
+                    raise _sudo_unsure(f"is given {t!r}, an option it doesn't have")
+                if k + 1 == len(t):  # the value is the next word, not glued on
+                    if i >= len(toks):
+                        raise _sudo_unsure(f"has no value for {t!r}")
+                    i += 1
+                break
+        else:
+            break
+    settings: list[str] = []
+    while i < len(toks) and _env_setting(toks[i], "sudo"):
+        settings.append(toks[i])
+        i += 1
+    if i < len(toks) and toks[i].startswith("-"):
+        raise _sudo_unsure(f"would run a program named {toks[i]!r}, or read it as an option")
+    return i, settings
+
+
 def _short_takes_next(t: str, arg_opts) -> bool:
     """Whether the short-option word `t` takes the next word as its value: its first value-taking letter is its last
     (`-u root`, `-iu root`); one with letters after it holds its value glued (`-uroot`)."""
@@ -974,7 +1066,12 @@ def strip_wrappers(
             took = set(range(i - len(sets), i))
             if env is not None:
                 env.extend(sets)
-        while w != "env" and i < len(toks):
+        elif w == "sudo":
+            i, sets = _sudo_args(toks)
+            took = set(range(i - len(sets), i))
+            if env is not None:
+                env.extend(sets)
+        while w not in ("env", "sudo") and i < len(toks):
             t = toks[i]
             if t == "--":
                 i += 1
@@ -985,19 +1082,8 @@ def strip_wrappers(
             elif t.startswith("-") and len(t) > 1:
                 exec_form = exec_form or (w == "watch" and "x" in t[1:])
                 i += 2 if _short_takes_next(t, arg_opts) else 1  # `-u root`, `-iu root`; `-uroot` is one word
-            elif w == "sudo" and _env_setting(t, w):
-                if env is not None:
-                    env.append(t)
-                took.add(i)
-                i += 1
             else:
                 break
-        if w == "sudo":  # after `--` too: sudo still reads X=Y as a setting
-            while i < len(toks) and _env_setting(toks[i], w):
-                if env is not None:
-                    env.append(toks[i])
-                took.add(i)
-                i += 1
         if i < len(toks):
             i += _POSITIONAL.get(w, 0)
         if dropped is not None:

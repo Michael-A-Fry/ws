@@ -47,11 +47,11 @@ user = "someone@example.com"
 Drafts go to the folder the server marks `\Drafts`, else `drafts_folder`. With neither, a draft is refused, never
 guessed.
 
-## Gmail: the one step only you can do
+## The one Gmail step only you can do
 
 1. Turn on 2-Step Verification for the Google account.
 2. Create an app password (Google Account, Security, App passwords) and copy it.
-3. Run `ws mail add work --host imap.gmail.com --user you@gmail.com --kind gmail`. It opens a prompt window
+3. Run `ws mail add work --host imap.gmail.com --user someone@example.com --kind gmail`. It opens a prompt window
    (`ws secret ask`); paste the app password there. ws logs in read-only and lists the folders it found.
 
 Other providers work the same way with their IMAP host and an app password, if they offer one.

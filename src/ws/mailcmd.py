@@ -91,7 +91,9 @@ def cmd_add(args: argparse.Namespace) -> int:
     if entry is not None:
         o = entry.options
         if entry.kind != imap.KIND or not isinstance(o, imap.Options):
-            raise WsError("conflict", f"{secret} is in the registry as kind {entry.kind}, not imap", "pick another NAME", 2)
+            raise WsError(
+                "conflict", f"{secret} is in the registry as kind {entry.kind}, not imap", "pick another NAME", 2
+            )
         if (o.host, o.user, o.port) != (host, user, args.port):
             raise WsError(
                 "conflict",
@@ -127,7 +129,9 @@ def cmd_add(args: argparse.Namespace) -> int:
         if found["drafts"]:
             print(f"drafts go to {found['drafts']}")
         else:
-            print(f"no drafts folder found: drafts are refused until the server marks one, or {secret} sets drafts_folder")
+            print(
+                f"no drafts folder found: drafts are refused until the server marks one, or {secret} sets drafts_folder"
+            )
         if data["connector"]:
             print("To give a session the mail tools, add this to your policy:\n" + data["connector"], end="")
     return 0 if found["drafts"] else 1

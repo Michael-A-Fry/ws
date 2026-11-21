@@ -111,7 +111,9 @@ def _args(name: str, args: dict) -> dict:
     schema = next(t["inputSchema"] for t in TOOLS if t["name"] == name)
     extra = sorted(set(args) - set(schema["properties"]))
     if extra:
-        raise BadArguments(f"{name} takes no {', '.join(extra)} (it takes: {', '.join(schema['properties']) or 'nothing'})")
+        raise BadArguments(
+            f"{name} takes no {', '.join(extra)} (it takes: {', '.join(schema['properties']) or 'nothing'})"
+        )
     for key in schema["required"]:
         if args.get(key) is None:
             raise BadArguments(f"{key} is required")

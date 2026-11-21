@@ -1385,3 +1385,115 @@ def test_tightening_paths_or_ttl_in_the_registry_bites_leases_already_open(env):
     while time.monotonic() < end and not any(a["op"] == "proxy" and a["status"] == "expired" for a in env.audit()):
         time.sleep(0.02)
     assert any(a["op"] == "proxy" and a["status"] == "expired" for a in env.audit())
+
+
+# -- B2: the registry is trusted only if it is the broker's user's (or root's) and closed to group and world writes
+
+
+def _foreign_registry(monkeypatch, registry: Path) -> None:
+    """Make the registry look owned by another uid to the check, without root: only its own fstat is changed."""
+    ident = (registry.stat().st_dev, registry.stat().st_ino)
+    real = os.fstat
+
+    def fstat(fd):
+        st = real(fd)
+        if (st.st_dev, st.st_ino) != ident:
+            return st
+        f = list(st)
+        f[stat.ST_UID] = os.geteuid() + 12345
+        return os.stat_result(f)
+
+    monkeypatch.setattr(wsecrets.os, "fstat", fstat)
+
+
+def test_registry_b2_a_group_writable_registry_is_refused_with_one_audit_line(env):
+    env.registry.chmod(0o664)
+    before = len(env.audit())
+    e = refusal(env.lease)
+    assert e.code == "registry_untrusted"
+    lines = env.audit()[before:]
+    assert [a["status"] for a in lines] == ["registry_untrusted"], lines
+    assert VALUE not in env.log.read_text() + str(e)
+    assert env.broker._grants == {}
+    env.registry.chmod(0o666)
+    assert refusal(env.lease).code == "registry_untrusted", "world writable too"
+    env.registry.chmod(0o644)
+    assert env.call()[0] == 200, "closed again, it is trusted again"
+
+
+def test_registry_b2_a_registry_owned_by_another_user_is_refused_with_one_audit_line(env, monkeypatch):
+    _foreign_registry(monkeypatch, env.registry)
+    before = len(env.audit())
+    assert refusal(env.lease).code == "registry_untrusted"
+    assert [a["status"] for a in env.audit()[before:]] == ["registry_untrusted"]
+    assert any("not the broker's user" in p for p in broker.status(env.sock)["problems"])
+    monkeypatch.undo()
+    assert env.call()[0] == 200
+
+
+def test_registry_b2_an_open_lease_stops_when_the_registry_is_opened_to_others(env):
+    lease = env.lease()
+    assert env.call(lease=lease)[0] == 200
+    seen = len(env.stub.seen)
+    env.registry.chmod(0o664)
+    status, _, body = env.call(lease=lease)
+    assert status == 503 and b"registry_untrusted" in body
+    assert len(env.stub.seen) == seen, "nothing was forwarded"
+    env.registry.chmod(0o644)
+    assert env.call(lease=lease)[0] == 200
+
+
+def test_registry_b2_a_symlinked_registry_or_a_writable_folder_is_refused(env):
+    real = env.base / "elsewhere.toml"
+    env.registry.rename(real)
+    env.registry.symlink_to(real)
+    before = len(env.audit())
+    assert refusal(env.lease).code == "registry_untrusted"
+    assert [a["status"] for a in env.audit()[before:]] == ["registry_untrusted"]
+    env.registry.unlink()
+    real.rename(env.registry)
+    folder = env.registry.parent
+    mode = folder.stat().st_mode & 0o777
+    folder.chmod(mode | 0o020)
+    try:
+        assert refusal(env.lease).code == "registry_untrusted"
+    finally:
+        folder.chmod(mode)
+    assert env.call()[0] == 200
+
+
+def test_registry_b2_minters_refuse_an_untrusted_registry(scoped):
+    scoped.s.registry.chmod(0o664)
+    before = len(scoped.audit())
+    e = refusal(broker._client_call, {"op": "mint", "name": "work", "run": "r1"}, scoped.sock)
+    assert e.code == "registry_untrusted"
+    assert [a["status"] for a in scoped.audit()[before:]] == ["registry_untrusted"]
+
+
+# -- a retry after a failed use-record (audit) write leaves the open leases and their counts as they were
+
+
+def test_run_record_a_retry_after_a_failed_audit_write_leaves_open_leases_and_counts_as_they_were(scoped):
+    scoped.s.record("r1", "home", "worker", ["work"])
+    first = scoped.lease("work", run="r1")
+    open_before = dict(scoped.broker._grants)
+    leases_before = broker.status(scoped.sock)["leases"]
+    scoped.log.rename(scoped.log.with_name("moved.jsonl"))
+    scoped.log.mkdir()  # a folder where the log should be: the next write fails
+    assert refusal(scoped.lease, "work", run="r1").code == "audit_failed"
+    assert scoped.broker._grants == open_before, "the refused grant left nothing behind"
+    assert broker.status(scoped.sock)["leases"] == leases_before
+    scoped.log.rmdir()
+    scoped.log.with_name("moved.jsonl").rename(scoped.log)
+    second = scoped.lease("work", run="r1")
+    assert second.lease != first.lease
+    assert len(scoped.broker._grants) == len(open_before) + 1
+    ok = [a for a in scoped.audit() if a["op"] == "request" and a["status"] == "ok" and a["name"] == "work"]
+    assert [a["leases"] for a in ok] == [1, 2], "the failed attempt is not counted"
+    assert scoped.get(first) == 200 and scoped.get(second) == 200
+
+
+def test_a_minted_tokens_repr_shows_no_token():
+    token = "planted-" + os.urandom(8).hex()
+    m = broker._Minted(name="app", run="r1", elevated=False, token=token, options=None, expires=0.0)
+    assert token not in repr(m) and token not in str(m)

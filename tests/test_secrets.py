@@ -547,7 +547,7 @@ def test_ws104_warns_on_a_same_user_store(home, monkeypatch):
 
 def test_ws104_ok_when_the_store_is_another_users_and_the_broker_answers(home, monkeypatch):
     # the real thing is tests/e2e/test_secret_wall.py; here the permission wall is simulated
-    def walled(reg, store):
+    def walled(reg, store, owner_uid=None):
         raise PermissionError
 
     monkeypatch.setattr(wsecrets, "health", walled)
@@ -717,6 +717,74 @@ def test_health_names_a_store_value_with_no_registry_row(tmp_path):
     problems, _ = wsecrets.health(s.registry, s.store)
     assert problems == ["orphan is in the store but not in the registry"]
     assert wsecrets.unregistered(wsecrets.load_registry(s.registry), s.store) == ["orphan"]
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="POSIX owners and modes")
+def test_registry_b2_owner_and_mode_are_checked_only_when_an_owner_is_given(tmp_path):
+    p = tmp_path / "secrets.toml"
+    p.write_text('[ok]\nhosts = ["a.example.com"]\n')
+    me = os.geteuid()
+    for mode in (0o664, 0o646):
+        p.chmod(mode)
+        with pytest.raises(wsecrets.RegistryUntrusted, match="group or others"):
+            wsecrets.load_registry(p, owner_uid=me)
+        assert "ok" in wsecrets.load_registry(p), "a reader that names no owner reads it as before"
+    p.chmod(0o644)
+    assert "ok" in wsecrets.load_registry(p, owner_uid=me)
+    if me != 0:  # root's own file is trusted by any reader, so as root the file is never foreign
+        with pytest.raises(wsecrets.RegistryUntrusted, match="belongs to uid"):
+            wsecrets.load_registry(p, owner_uid=me + 12345)
+    foreign = os.stat_result((0o100644, 0, 0, 1, 4242, 0, 0, 0, 0, 0))
+    assert "belongs to uid 4242" in (wsecrets.registry_problem(foreign, 4243) or "")
+    assert (
+        issubclass(wsecrets.RegistryUntrusted, wsecrets.SecretsError) and wsecrets.RegistryUntrusted.kind == "untrusted"
+    )
+    assert wsecrets.load_registry(tmp_path / "missing.toml", owner_uid=me) == {}
+    st = os.stat_result((0o100644, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+    assert wsecrets.registry_problem(st, me) is None, "root's file is trusted"
+    p.chmod(0o664)
+    problems, _ = wsecrets.health(p, wsecrets.Store(tmp_path / "store"), owner_uid=me)
+    assert any("group or others" in x for x in problems)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="POSIX symlinks and FIFOs")
+def test_registry_b2_a_symlink_a_fifo_or_a_writable_folder_is_refused_and_never_hangs(tmp_path):
+    me = os.geteuid()
+    real = tmp_path / "real.toml"
+    real.write_text('[ok]\nhosts = ["a.example.com"]\n')
+    d = tmp_path / "cfg"
+    d.mkdir(mode=0o755)
+    link = d / "secrets.toml"
+    link.symlink_to(real)
+    with pytest.raises(wsecrets.RegistryUntrusted, match="symlink"):
+        wsecrets.load_registry(link, owner_uid=me)
+    (d / "dangling.toml").symlink_to(tmp_path / "nothing.toml")
+    with pytest.raises(wsecrets.RegistryUntrusted, match="symlink"):
+        wsecrets.load_registry(d / "dangling.toml", owner_uid=me)
+    fifo = d / "fifo.toml"
+    os.mkfifo(fifo)
+    with pytest.raises(wsecrets.RegistryUntrusted, match="not a regular file"):
+        wsecrets.load_registry(fifo, owner_uid=me)  # returns at once: no writer is waited for
+    plain = d / "plain.toml"
+    plain.write_text('[ok]\nhosts = ["a.example.com"]\n')
+    plain.chmod(0o644)
+    assert "ok" in wsecrets.load_registry(plain, owner_uid=me)
+    d.chmod(0o775)
+    with pytest.raises(wsecrets.RegistryUntrusted, match="folder"):
+        wsecrets.load_registry(plain, owner_uid=me)
+    d.chmod(0o755)
+    assert wsecrets.load_registry(d / "missing.toml", owner_uid=me) == {}
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="POSIX owners and modes")
+def test_ws104_fails_on_a_registry_the_broker_would_not_trust(home, monkeypatch):
+    no_broker(monkeypatch)
+    registry(home, GOOD)
+    (home / "secrets.toml").chmod(0o664)
+    status, detail = ws104(home)
+    assert status == "fail" and "group or others" in detail
+    (home / "secrets.toml").chmod(0o644)
+    assert "group or others" not in ws104(home)[1]
 
 
 def test_the_stub_secrets_helper_plants_fresh_values_and_finds_leaks(tmp_path):

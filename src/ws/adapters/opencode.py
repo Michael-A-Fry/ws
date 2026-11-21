@@ -681,7 +681,7 @@ def build_command(job, run_dir: Path, lease) -> tuple[list[str], dict[str, str]]
 def parse_result(stdout: str, stderr: str, exit_code: int | None) -> dict:
     """The part of a run record that the `--format json` event stream can fill. Never raises. The stream does not
     name the model, so `models_used` has one entry with model None for the caller to fill with the requested model."""
-    session = error = None
+    session = error = reason = None
     steps = 0
     sums = {"input": None, "output": None, "cache_creation": None, "cache_read": None}
     cost = None
@@ -706,6 +706,8 @@ def parse_result(stdout: str, stderr: str, exit_code: int | None) -> dict:
         part = ev.get("part") if isinstance(ev.get("part"), dict) else {}
         if ev.get("type") == "step_finish":
             steps += 1
+            if isinstance(part.get("reason"), str) and part["reason"]:
+                reason = part["reason"][:64]  # the last step's finish reason is how the run stopped
             tok = part.get("tokens") if isinstance(part.get("tokens"), dict) else {}
             cache = tok.get("cache") if isinstance(tok.get("cache"), dict) else {}
             add("input", tok.get("input"))
@@ -728,6 +730,9 @@ def parse_result(stdout: str, stderr: str, exit_code: int | None) -> dict:
         "cost_basis": None if not steps else "unpriced" if unpriced else "runner",
         "num_turns": steps if steps else None,
         "error": error,
+        # opencode's own word for how its last step finished (stop, length, tool-calls, ...), kept as it said it;
+        # `opencode run` has no turn or budget limit of its own, so none of them is one (runrecord.checked)
+        "stop_subtype": reason,
     }
 
 

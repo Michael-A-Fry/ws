@@ -8,9 +8,10 @@ commands.
 The file is loaded whole or refused. An unknown key, a wrong type or a bad value stops the load, and the message names the
 key. The gate then denies every call (it fails closed). The schema is `1`.
 
-The tables `[classes]`, `[budget.purposes]` and `[autonomy]`, and the `owner` and `expires` keys of `[[exceptions]]`, are
-newer than the rest. A policy that leaves them out loads exactly as before. An older ws refuses a policy that uses them,
-because it doesn't know the keys: that's the intended fail-closed behaviour, so update ws before you add them.
+The tables `[classes]`, `[connectors]`, `[budget.purposes]` and `[autonomy]`, and the `owner` and `expires` keys of
+`[[exceptions]]`, are newer than the rest. A policy that leaves them out loads exactly as before. An older ws refuses a
+policy that uses them, because it doesn't know the keys: that's the intended fail-closed behaviour, so update ws before
+you add them.
 
 ## Top-level keys
 
@@ -164,6 +165,24 @@ A here-document or here-string is text for whatever reads it. When that's a shel
 `fish`), `source`, `.`, `eval`, `ssh` or `xargs`, the text runs as code, so the command is refused with the reason
 `stdin-is-code`. Any other body, a commit message included, is read as commands, whatever its quoting.
 
+ssh options that run or load local files are judged. An `-o` keyword runs only when it's one ws knows runs nothing
+here (`Port`, `User`, `ConnectTimeout`, `StrictHostKeyChecking` and the like); a proxy, local or known-hosts command,
+`Match`, a provider library, an agent or control socket, `SendEnv`, `SetEnv`, `Include` and any keyword ws doesn't
+know are refused. So are `-F` (other than `none`), `-I`, `-E` and an askpass program. The files ssh reads for a key,
+a certificate or a known-hosts list go through `deny_read`, and `UserKnownHostsFile`, which ssh writes to, through the
+protected-write check. ssh's escape characters need an interactive terminal,
+which a shell call doesn't have.
+
+A remote command runs on the far host, so `ssh pve.example.org 'ls $X'` isn't refused for `$X` when the policy names
+the host (`[gate] allow_hosts`, or a class's `allowed_hosts`) and the command is one word wholly in single quotes. The
+local rules still apply to anything else: double quotes or `$'...'` (the local shell expands those), unquoted words,
+a host the policy doesn't name, a host word with `$`, a line with any redirect, here-string or here-document, an
+`-o CanonicalizeHostname` or `CanonicalDomains` (the host can become another), `-S` (a control socket
+reuses a connection opened earlier, to a host the line doesn't name), and ssh run by `xargs`, `sshpass` or
+`autossh` (whose ssh options are judged as ssh's own). A remote command to this machine (loopback,
+`localhost` or its own name) runs outside the sandbox, so it's judged as the local command it is. ws doesn't read
+`~/.ssh/config`, so a named alias whose `HostName` is this machine is yours to avoid.
+
 ### The sandbox is the boundary
 
 The sandbox is the boundary, and the static gate is defence in depth. The gate reads the text of a command and refuses
@@ -171,13 +190,13 @@ what it can show is wrong, with a reason a person can act on. The sandbox acts o
 command line says: ws's own files are read-only and the `deny_read` paths read as empty for every program a shell
 command starts. It's on by default (`sandbox = true`), and it's the layer a bypass of the gate meets.
 
-The gate's limits are the kinds of text it can't see into. The first four are the `LIMITS` rows in
+The gate's limits are the kinds of text it can't see into. The first three are the `LIMITS` rows in
 `tests/test_gate_oracle.py`:
 
 - An interpreter, and the program it runs from `-c`, a file or standard input.
 - An `awk` program.
 - A script the line writes and then runs.
-- An option whose value is a command the tool runs (ssh's `ProxyCommand`).
+- An option whose value is a command another tool runs (rsync's `-e`, scp's `-o`). ssh's own are refused (see below).
 - A launcher that starts an interpreter. The gate refuses a launcher that starts a shell, but what an interpreter does
   inside its own program is the same limit as the first.
 
@@ -198,7 +217,7 @@ none.
 
 The static gate reads shell, so it's a check on shell and not a wall against interpreters. A program that `python`,
 `python3`, `perl`, `node`, `ruby`, `php`, `lua` or `Rscript` runs (from `-c`, a file, or standard input), `awk` code,
-an option whose value is a command the tool runs (such as ssh's `ProxyCommand`), and a script the line writes and then
+an option whose value is a command another tool runs (such as rsync's `-e`), and a script the line writes and then
 runs are text the gate can't see into: it's the same for a here-document or here-string given to one of them. These
 are the known limits, and `tests/test_gate_oracle.py` lists each as a `LIMIT` row. The wall is the sandbox:
 `ws gate launch --runner R -- argv` starts the runner inside it, and the files and folders ws protects are out of reach
@@ -295,6 +314,28 @@ Which class is a folder in (`class_of(policy, path)` in `src/ws/policy.py`):
   file's order never matters.
 - If none matches, the folder is `unclassified`: `counts-only`, nothing inbound, readable by nobody, no hosts. A path
   ws can't read as a path is `unclassified` too.
+
+## `[connectors.NAME]`
+
+A zone's MCP server that a job or a session may plug in, the way you'd plug in a third-party app. `NAME` is the MCP
+server name, so its tools reach the runner as `mcp__NAME__TOOL`: letters, digits, `_` and `-`, no `__`, and not `ws`. A
+job names it in `runner_options.connectors`; a person starts a session with it through
+[`ws connector launch`](cli.md#ws-connector-launch). See [Plug in a zone MCP server](../how-to/plug-in-zone-mcp.md).
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `url` | text | none | The server's address, `https://` (or `http://127.0.0.1` for a server on this machine). Streamable HTTP. Give `url` or `command`, not both. |
+| `command` | list of text | none | A stdio server: the program and its arguments. It looks after its own auth. |
+| `class` | text | none | The data class of what it returns, a name from `[classes]`. A session of another class gets it only when that class's `readable_by` names the session's class. With none, any session may have it. |
+| `read_only` | true or false | `true` | Refuses a tool whose name has a word that says it changes something (`create`, `update`, `delete`, `send`, `pay` and the like) and the `*` wildcard. It reads the name only, so it catches slips, not a server that lies: make the server itself read-only too. Setting it to `false` is a reviewed change. |
+| `token` | text | none | The name of the secret that opens the server (`url` only), never a value. The registry entry allows it at the url's host; the runner reaches the server through a [broker](../explanation/broker.md) lease, so it never holds the token. Only over `https`, or to `127.0.0.1`. |
+| `tools` | list of text | required | The allowlist, bare tool names. At least one. |
+| `description` | text | `""` | A line for `ws connector list`. |
+
+The gate allows `mcp__NAME__TOOL` for each listed tool as if [`allow_mcp`](#gate) named it (on top of the shipped
+`mcp__ws__*` names when the policy has no `allow_mcp` of its own); `deny_tools` still wins. Any other tool of the server
+is refused by the connector's own hook, and every call, allowed or refused, is a line in
+[`logs/connector-calls.jsonl`](stores.md#json-lines-logs).
 
 ## `[budget.purposes]`
 

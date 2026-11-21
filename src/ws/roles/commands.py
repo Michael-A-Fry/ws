@@ -5,6 +5,12 @@
     ws notify alert                 hook entry: "<folder> needs you" or "<folder> finished" to your phone
     ws backup init|run|verify       make the restic repository, back up, prove a file restores
     ws schedule list|apply|remove   timers for the job files that have a `schedule`
+    ws schedule script NAME         run a `command = "script"` job's reviewed script (what its timer runs): refused
+                                    unless the script is yours, closed to other writers and hashes to script_sha256;
+                                    the bytes that were hashed are what runs (a private copy under ws's state folder),
+                                    in the script's folder. Only the script is hashed: a file it sources or runs by a
+                                    path of its own is outside the review, so a script should call only what it names
+                                    by absolute path and trusts.
 
 Each reads its adapter's settings from `[roles.<role>]` of the profile. Messages never hold a secret.
 """
@@ -13,9 +19,14 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import os
+import subprocess
 import sys
+import tempfile
+import time
+from pathlib import Path
 
 from ws import install, jobs, osinfo, output, paths
 from ws.output import WsError
@@ -265,6 +276,134 @@ def cmd_schedule_apply(args: argparse.Namespace) -> int:
     return 1 if problems else 0
 
 
+SCRIPT_COPY_MAX_AGE_S = 2 * 86400  # a copy this old was left by a run that was killed (a clean one removes its own)
+
+
+HELD = ".held"  # in each run-* copy folder: flock-held for as long as the run (ws or the script) lives
+
+
+def _hold(folder: Path) -> int | None:
+    """Take the lock that says this copy is in use; the descriptor goes to the script too, so the lock lasts while
+    either lives (the kernel drops it when both are gone). None where there is no flock (the copy is then swept by age
+    alone)."""
+    try:
+        import fcntl
+    except ImportError:
+        return None
+    fd = os.open(folder / HELD, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
+def _in_use(folder: Path) -> bool:
+    """True while a run holds this copy's lock (a live script job with no timeout may run for days)."""
+    try:
+        import fcntl
+    except ImportError:
+        return False
+    try:
+        fd = os.open(folder / HELD, os.O_RDWR)
+    except OSError:
+        return False  # no lock file: a copy from before the lock, or one whose run died before taking it
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return False
+    except OSError:
+        return True
+    finally:
+        os.close(fd)
+
+
+def _sweep(folder: Path, before: float) -> None:
+    """Remove the `run-*` copies older than `before` that a killed run left in `folder`, never one a live run still
+    holds. Never raises."""
+    import shutil
+
+    with contextlib.suppress(OSError):
+        for d in folder.glob("run-*"):
+            with contextlib.suppress(OSError):
+                if d.is_dir() and not d.is_symlink() and d.stat().st_mtime < before and not _in_use(d):
+                    shutil.rmtree(d, ignore_errors=True)
+
+
+SCRIPT_EXIT_TIMEOUT = 124  # as timeout(1): the script ran past the job's timeout_s and was killed
+
+
+def checked_script(name: str, env) -> tuple[Path, bytes, float | None]:
+    """(the script's path, the bytes that hash to the job's script_sha256, the job's timeout_s) of the script job `name`.
+    Raises WsError (refused, exit 3) naming what is wrong: no such job, not a script job, a script someone else could
+    have written, or one that no longer hashes to what was reviewed."""
+
+    def refuse(why: str, hint: str = "") -> WsError:
+        return WsError("refused", why, hint, 3)
+
+    try:
+        d = jobs.command_job(name, env)
+        if d.get("command") != "script":
+            raise refuse(f"job {name} is not a script job (command = {d.get('command')!r})")
+        path, sha = jobs.script_of(d, f"job {name}", env)
+        jobs.check_private(path.parent)
+        jobs.check_private(path)
+        data = path.read_bytes()
+    except FileNotFoundError as e:
+        raise refuse(f"no job {name!r}: expected {e}") from e
+    except jobs.JobError as e:
+        raise refuse(str(e)) from e
+    except OSError as e:
+        raise refuse(f"job {name}: the script cannot be read ({e.strerror or type(e).__name__})") from e
+    if hashlib.sha256(data).hexdigest() != sha:
+        raise refuse(
+            f"job {name}: {path} no longer hashes to script_sha256, so nobody reviewed what it is now",
+            "review it, then put its new `sha256sum` in the job file (and `ws job add --replace` a pinned job)",
+        )
+    timeout = d.get("timeout_s")
+    ok = isinstance(timeout, (int, float)) and not isinstance(timeout, bool) and timeout > 0
+    return path, data, float(timeout) if ok else None
+
+
+def cmd_schedule_script(args: argparse.Namespace) -> int:
+    env = os.environ
+    from ws import approvals
+
+    if env.get(approvals.ENV_MARKER):  # a timer's command: it runs outside any session's wall
+        raise WsError(
+            "refused", f"ws schedule script is not for a gated session ({approvals.ENV_MARKER} is set here)",
+            "run it yourself, in your own terminal, or let its timer run it", 3,
+        )  # fmt: skip
+    path, data, timeout = checked_script(args.job, env)
+    private = paths.state_dir(env) / "scripts"  # ws's own state folder, not a temp folder others share
+    private.mkdir(mode=0o700, parents=True, exist_ok=True)
+    private.chmod(0o700)
+    _sweep(private, time.time() - SCRIPT_COPY_MAX_AGE_S)
+    with tempfile.TemporaryDirectory(prefix="run-", dir=private) as tmp:
+        held = _hold(Path(tmp))  # a sweep by another run leaves this copy alone while it is in use
+        copy = Path(tmp) / path.name  # the reviewed bytes, where nobody else can swap them before they run
+        fd = os.open(copy, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o700)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        try:
+            code = subprocess.run(
+                [str(copy)], cwd=path.parent, env={**env, "WS_SCRIPT_PATH": str(path)}, stdin=subprocess.DEVNULL,
+                timeout=timeout, check=False, pass_fds=() if held is None else (held,),
+            ).returncode  # fmt: skip
+        except subprocess.TimeoutExpired:
+            print(f"ws: {args.job}: the script ran past its {timeout:g} s timeout and was stopped", file=sys.stderr)
+            code = SCRIPT_EXIT_TIMEOUT
+        except OSError as e:
+            raise WsError("failed", f"job {args.job}: cannot start {path}: {e.strerror or type(e).__name__}",
+                          "give it a #! line; a state folder mounted noexec also stops it", 1) from e  # fmt: skip
+        finally:
+            if held is not None:
+                os.close(held)
+    code = 128 - code if code < 0 else code  # killed by signal N: 128+N, as a shell says it
+    if code and env.get("WS_ALERT_ON_EXIT") == "1":  # launchd has no OnFailure=: the failure alert is sent from here
+        from ws import jobwatch
+
+        with contextlib.suppress(Exception):
+            jobwatch.alert_unit(f"ws.job.{args.job}", env, status=lambda _u: ("exit-code", str(code)), job=args.job)
+    return code
+
+
 def cmd_schedule_remove(args: argparse.Namespace) -> int:
     """Stop a job's timer and delete the unit files ws wrote for it (the job file stays)."""
     env = os.environ
@@ -321,3 +460,8 @@ def register(sub) -> None:
     p = ss.add_parser("remove", help="stop one job's timer and delete its unit files")
     p.add_argument("job")
     p.set_defaults(func=cmd_schedule_remove)
+    p = ss.add_parser(
+        "script", help="run a script job's reviewed script now (what its timer runs); its own output and exit code"
+    )
+    p.add_argument("job", help='the job name: jobs/<name>.toml with command = "script"')
+    p.set_defaults(func=cmd_schedule_script, raw=True)

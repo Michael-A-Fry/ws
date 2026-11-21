@@ -31,8 +31,11 @@ RAW = {
     "notify.alert": "a hook entry",
     "setup": "a person at a terminal, or the page (setup --yes is covered below)",
     "queue.slot": "runs the caller's command in a slot: that command's own output and exit code",
+    "schedule.script": "runs the job's reviewed script: the script's own output and exit code",
     "usage.statusline": "a statusline command Claude Code pipes JSON to: one line of its own, no envelope",
     "walls.edit": "opens $EDITOR on a copy of the policy: the terminal is the editor's",
+    "connector.audit": "a hook: the runner reads its stderr and exit code",
+    "connector.launch": "hands the terminal to the runner",
 }
 
 # What to run for each of the others (in a throwaway HOME): enough to get a real answer or a typed error.
@@ -49,6 +52,10 @@ CASES: dict[str, list[str]] = {
     "secret.generate": ["secret", "generate", "nope"],
     "job.add": ["job", "add", "{home}/none.toml"],
     "job.remove": ["job", "remove", "nope"],
+    "commit-wall.check": ["commit-wall", "check", "--repo", "{home}"],
+    "commit-wall.install": ["commit-wall", "install", "--repo", "{home}"],
+    "commit-wall.uninstall": ["commit-wall", "uninstall", "--repo", "{home}"],
+    "commit-wall.status": ["commit-wall", "status"],
     "secret.reveal": ["secret", "reveal", "nope"],
     "secret.import": ["secret", "import", "nope", "--from-env", "missing.env"],
     "secret.wall": ["secret", "wall"],
@@ -72,6 +79,7 @@ CASES: dict[str, list[str]] = {
     "memory.reindex": ["memory", "reindex"],
     "run": ["run", "nojob", "--dry-run"],
     "runs": ["runs"],
+    "connector.list": ["connector", "list"],
     "globals.check": ["globals", "check", "--repo", "{home}"],
     "globals.manifest": ["globals", "manifest"],
     "install": ["install", "--dry-run", "--notes", "{home}/Notes"],
@@ -123,6 +131,7 @@ CASES: dict[str, list[str]] = {
     "queue.cancel": ["queue", "cancel", "nope"],
     "queue.run": ["queue", "run"],
     "queue.tick": ["queue", "tick", "nojob"],
+    "queue.reap": ["queue", "reap"],
     "node.join": ["node", "join"],
     "node.show": ["node", "show"],
     "node.remove": ["node", "remove"],
@@ -146,6 +155,7 @@ CASES: dict[str, list[str]] = {
     "ask.wait": ["ask", "wait", "nope"],
     "ask.done": ["ask", "done", "nope"],
     "ask.withdraw": ["ask", "withdraw", "nope"],
+    "ask.note": ["ask", "note", "nope", "x"],
     "ask.import": ["ask", "import", "{home}/none.jsonl"],
     "term": ["term", "--bind", "0.0.0.0"],  # a typed refusal: the real command stays up until stopped
 }

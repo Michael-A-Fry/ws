@@ -1304,7 +1304,9 @@ class Broker:
         if not path_allowed(entry.paths, path):  # the registry as it is now: a tightened list bites open leases too
             raise _HttpError(403, "path_not_allowed")
         if entry.base_path and (not PLAIN_PATH_RE.match(path) or any(p in (".", "..") for p in path.split("/"))):
-            raise _HttpError(403, "path_not_allowed")  # a prefix is only safe in front of a path with no way back out of it
+            raise _HttpError(
+                403, "path_not_allowed"
+            )  # a prefix is only safe in front of a path with no way back out of it
         if entry.ttl is not None and self.clock() >= g.issued + entry.ttl:
             raise _HttpError(403, "expired")  # a shortened ttl ends open leases at once
         if (g.elevated or entry.elevated) and not self.elevation_on():

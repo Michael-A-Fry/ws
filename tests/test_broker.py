@@ -1422,7 +1422,9 @@ def test_an_absolute_url_as_the_path_stays_under_the_base_path_or_is_refused(env
     assert all(s["headers"]["host"] == env.stub.host for s in forwarded)
 
 
-@pytest.mark.parametrize("bad", ['""', '"api"', '"/a/../b"', '"//api"', '"/api//v1"', '"/api?x=1"', '"/a b"', "5", '"/%2e"'])
+@pytest.mark.parametrize(
+    "bad", ['""', '"api"', '"/a/../b"', '"//api"', '"/api//v1"', '"/api?x=1"', '"/a b"', "5", '"/%2e"']
+)
 def test_a_bad_base_path_refuses_the_whole_registry(env, bad):
     _base_registry(env, f"base_path = {bad}")
     with pytest.raises(wsecrets.SecretsError, match="base_path"):

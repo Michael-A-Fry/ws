@@ -147,7 +147,7 @@ def test_the_fallback_gets_the_whole_original_argument_list(box, started):
     work = box / "work"
     work.mkdir()
     for argv in (
-        ["dispatch", "x"],
+        ["launchpad", "x"],
         ["-n", "repo", "tag"],
         [],
         ["--json", "-C", str(work), "plan", "--", "z"],
@@ -177,7 +177,7 @@ def test_the_loop_guard_stops_a_second_hand_over(box, started, capsys, monkeypat
     fallback_to(box)
     started.clear()
     monkeypatch.setenv(extcmd.FALLBACK_ENV, "1")
-    assert cli.main(["dispatch", "x"]) == 2
+    assert cli.main(["launchpad", "x"]) == 2
     assert "fallback program started this run" in capsys.readouterr().err
     assert cli.main(["--json"]) == 2 and started == []
     assert cli.main(["version"]) == 0  # built-ins run as ever
@@ -431,7 +431,7 @@ def test_an_old_ws_set_as_fallback_gets_the_same_argv_and_the_built_ins_still_ru
         'echo "argc=$#"; for a in "$@"; do echo "arg=$a"; done; echo "guard=$WS_FALLBACK"; exit 5',
     )
     assert ws(box, "config", "fallback", str(old)).returncode == 0
-    for argv in (["dispatch", "x"], ["-n", "a", "b"], []):
+    for argv in (["launchpad", "x"], ["-n", "a", "b"], []):
         r = ws(box, *argv)
         lines = r.stdout.splitlines()
         assert r.returncode == 5, r.stderr

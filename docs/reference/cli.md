@@ -80,6 +80,7 @@ A command that speaks a protocol on standard output (`ws mcp serve`, `ws gate ch
 | `FORCE_COLOR` | Any value except empty, `0` or `false` (any case) keeps colour on when output goes to a pipe or `TERM=dumb`. `NO_COLOR` and `--no-color` win. |
 | `TERM` | `dumb` turns colour off in every command, and makes `ws setup` print each step once, with no cursor-move or erase codes. |
 | `COLORFGBG` | Read by every command that prints colour. The default is the full brand palette in 256 colours; a light background (`0;15`) switches to darker violet and mark colours and your terminal's own green, yellow and red. |
+| `WS_CODE_ROOT` | The folder `ws dispatch` finds repositories in. Beats `[dispatch] code_root` in the profile; default `~/code`. |
 | `XDG_STATE_HOME` | Where the state folder goes, under `ws/`, and run folders for jobs with no `cwd`, under `ws-work`. Default `~/.local/state`. |
 
 ## Commands
@@ -97,6 +98,30 @@ ws help [-h] [topic ...]
 | Argument | Meaning |
 |---|---|
 | `topic ...` | A command, then its subcommand. |
+
+## `ws dispatch`
+
+Start a runner's session on a prompt in a new tmux window, in one repository's folder.
+
+```text
+ws dispatch [-h] [--name NAME] [--model MODEL] [--runner {claude-code,opencode}] [--session SESSION]
+            [--code-root DIR] [--dry-run] REPO PROMPT
+```
+
+| Argument | Meaning |
+|---|---|
+| `REPO` | The repository's folder name under the code root. A name only: a slash, `.` or `..` is a usage error. |
+| `PROMPT` | What the session should do, as one argument. A prompt that starts with `-` is refused. |
+| `--name NAME` | A few words for the window's name (lower case, dashes for spaces). Default: the repo's name. |
+| `--model MODEL` | The model, passed to the runner as its own `--model MODEL`. |
+| `--runner R` | `claude-code` (default) runs `claude [--model M] PROMPT`; `opencode` runs `opencode [--model M] --prompt PROMPT`. |
+| `--session S` | The tmux session for the window. Default: the one this runs in; outside tmux, give one. |
+| `--code-root DIR` | Where the repositories are. Default `WS_CODE_ROOT`, else `[dispatch] code_root` in the profile, else `~/code`. |
+| `--dry-run` | Print the folder, the window name and the runner's argv, and start nothing. |
+
+The window opens in the background and runs the runner's argv directly, with no shell between (tmux 3.0 or later),
+so every flag and the prompt arrive as separate arguments whatever they hold. `--help` changes nothing. If you start
+sessions with a script of your own, this can replace it: point `WS_CODE_ROOT` at your repositories.
 
 ## `ws doctor`
 

@@ -9,6 +9,9 @@ The contract, per module: `KIND` (the registry `kind`), `OP` (the socket op), `p
 (a frozen object), and the op's own function, documented in the module. A minter that can revoke what it issued also
 offers `revoke(...)`, which the broker calls on `ws elevate off`.
 
+One kind here mints nothing: `imap` (ws.minters.imap) keeps the mailbox password in the broker and runs a fixed table of
+mailbox operations for the caller, returning mail data only. It follows the same contract (`KIND`, `OP`, `parse`).
+
 Values a minter handles are short-lived bytes in the broker's process; the credential it returns goes to one caller,
 over the broker's socket, and is never written to the audit log.
 """

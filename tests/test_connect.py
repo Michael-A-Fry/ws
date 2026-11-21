@@ -33,11 +33,11 @@ class FakeTelegram:
         self.token, self.bot_id, self.username = token, bot_id, username
         self.updates: list[dict] = []
         self.calls: list[str] = []
+        self.webhook = False
 
-    def press_start(self, nonce: str, chat_id: int = 99) -> None:
-        self.updates.append(
-            {"update_id": len(self.updates) + 1, "message": {"text": f"/start {nonce}", "chat": {"id": chat_id}}}
-        )
+    def press_start(self, nonce: str, chat_id: int = 99, chat_type: str = "private") -> None:
+        msg = {"text": f"/start {nonce}", "chat": {"id": chat_id, "type": chat_type}}
+        self.updates.append({"update_id": len(self.updates) + 1, "message": msg})
 
     def get(self, url: str):
         self.calls.append(url.split("/", 3)[2])  # the host only: never log the url
@@ -47,7 +47,16 @@ class FakeTelegram:
         method = url[len(prefix) :]
         if method == "getMe":
             return 200, {"ok": True, "result": {"id": self.bot_id, "username": self.username, "is_bot": True}}
+        if method == "deleteWebhook":
+            self.webhook = False
+            return 200, {"ok": True, "result": True}
         if method == "getUpdates":
+            if self.webhook:
+                return 409, {
+                    "ok": False,
+                    "error_code": 409,
+                    "description": "Conflict: can't use getUpdates with webhook",
+                }
             return 200, {"ok": True, "result": self.updates}
         return 404, {"ok": False}
 
@@ -89,7 +98,8 @@ def env(tmp_path, monkeypatch):
 
 def ctx_for(env, transport, io=None, registered=True, clock=None) -> Context:
     tmp, store = env
-    return Context(
+    opened: list[str] = []
+    c = Context(
         state_dir=tmp / "state",
         store=store,
         registered=frozenset({"TELEGRAM_BOT_TOKEN"}) if registered else frozenset(),
@@ -97,7 +107,10 @@ def ctx_for(env, transport, io=None, registered=True, clock=None) -> Context:
         transport=transport,
         io=io,
         now=clock or Clock(),
+        open_url=lambda url: opened.append(url) or True,
     )
+    c.opened = opened  # type: ignore[attr-defined]
+    return c
 
 
 def everything(tmp: Path, io: Script | None = None) -> str:
@@ -237,7 +250,7 @@ def test_an_expired_link_gets_a_new_nonce_on_the_next_walk(env):
     )  # type: ignore[method-assign]
     res = engine.walk(ctx_for(env, api, io2, clock=clock), FLOW)
     assert res["status"] == "done"
-    assert any("Open: https://t.me/demo_bot?start=" in s for s in io2.said)
+    assert any("https://t.me/demo_bot?start=" in s for s in io2.said)
     assert first not in "\n".join(io2.said)
 
 
@@ -314,7 +327,9 @@ def test_dry_run_gives_the_link_and_its_expiry_once_a_nonce_exists(env):
     assert row["status"] == "done"  # opened; the check for the chat is the step still to do
     nxt = engine.dry_run(c, FLOW)
     assert nxt["next_step"] == "chat-bound" and nxt["steps"][-1]["status"] == "needs_human"
-    assert row["url"].startswith("https://t.me/demo_bot?start=") and row["expires_at"].endswith("Z")
+    nonce = engine.load_state(c, FLOW)["nonce"]["value"]
+    assert "url" not in row and row["url_template"].endswith("?start={nonce}")  # an agent never gets the live nonce
+    assert row["expires_at"].endswith("Z") and nonce not in json.dumps(engine.dry_run(c, FLOW))
 
 
 def test_dry_run_names_an_unregistered_secret_as_a_blocker(env):
@@ -490,3 +505,83 @@ def test_the_command_reads_a_registered_secret_from_the_real_registry(env, capsy
     reg.write_text('[TELEGRAM_BOT_TOKEN]\nhosts = ["api.telegram.org"]\n')
     _code, out, _ = _run(["connect", "telegram", "--dry-run", "--json"], capsys)
     assert "blockers" not in json.loads(out)["data"]
+
+
+# ---- review fixes ------------------------------------------------------------------------------------------------
+
+
+def test_links_are_opened_by_the_engine_and_printed_as_the_fallback(env):
+    token = make_token("p")
+    c, io, _ = walk_all(env, FakeTelegram(token), token)
+    assert c.opened[0] == "https://t.me/BotFather" and c.opened[1].startswith("https://t.me/demo_bot?start=")
+    assert any("Opened in your browser" in s and "https://t.me/BotFather" in s for s in io.said)
+
+
+def test_a_secret_gone_from_the_store_makes_capture_and_verify_needs_human_again(env):
+    _tmp, store = env
+    token = make_token("q")
+    c, _io, _ = walk_all(env, FakeTelegram(token), token)
+    store.delete("TELEGRAM_BOT_TOKEN")
+    rows = {s["id"]: s["status"] for s in engine.dry_run(c, FLOW)["steps"]}
+    assert rows["token"] == "needs_human" and rows["who-am-i"] == "needs_human" and rows["make-bot"] == "done"
+    assert engine.dry_run(c, FLOW)["exit_code"] == 3
+
+
+def test_only_a_private_chat_binds(env):
+    token = make_token("r")
+    api = FakeTelegram(token)
+    io = Script("", "", token, "", "q")
+    c = ctx_for(env, api, io)
+    engine.walk(c, FLOW)
+    api.press_start(engine.load_state(c, FLOW)["nonce"]["value"], chat_id=-5, chat_type="group")
+    res = engine.walk(ctx_for(env, api, Script("q"), clock=c.now), FLOW)
+    assert res["status"] == "stopped"
+
+
+def _webhook_walk(env, answer: str):
+    token = make_token("s")
+    api = FakeTelegram(token)
+    api.webhook = True
+    io = Script("", "", token, "")
+    c = ctx_for(env, api, io)
+    orig = io.ask
+
+    def ask(label: str) -> str:
+        if label.startswith("Run the fix"):
+            io.asked.append(label)
+            if answer == "yes":
+                api.press_start(engine.load_state(c, FLOW)["nonce"]["value"])
+            return answer
+        return orig(label)
+
+    io.ask = ask  # type: ignore[method-assign]
+    return api, io, c
+
+
+def test_a_webhook_is_explained_and_removed_only_on_a_yes(env):
+    api, io, c = _webhook_walk(env, "yes")
+    res = engine.walk(c, FLOW)
+    assert res["status"] == "done" and api.webhook is False
+    assert any("webhook" in s for s in io.said)
+
+
+def test_a_no_leaves_the_webhook_alone_and_says_why_it_stopped(env):
+    api, _io, c = _webhook_walk(env, "no")
+    with pytest.raises(ConnectError) as e:
+        engine.walk(c, FLOW)
+    assert e.value.kind == "conflict" and api.webhook is True and "webhook" in e.value.hint
+
+
+def test_a_closed_terminal_stops_the_walk_with_a_message(monkeypatch):
+    from ws import connectcmd
+
+    def eof(*a, **k):
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", eof)
+    monkeypatch.setattr("getpass.getpass", eof)
+    t = connectcmd.Terminal()
+    for call in (lambda: t.ask("x"), lambda: t.ask_secret("x"), lambda: t.pause("x")):
+        with pytest.raises(ConnectError) as e:
+            call()
+        assert e.value.kind == "cancelled"

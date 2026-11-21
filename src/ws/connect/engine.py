@@ -23,6 +23,7 @@ import string
 import time
 import urllib.error
 import urllib.request
+import webbrowser
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -101,6 +102,7 @@ class Context:
     transport: Transport = field(default_factory=UrlTransport)
     io: Io | None = None
     now: Callable[[], float] = time.time
+    open_url: Callable[[str], object] = webbrowser.open
 
 
 def _iso(t: float) -> str:
@@ -190,9 +192,24 @@ def _nonce_live(st: dict, now: float) -> bool:
     return bool(isinstance(n, dict) and n.get("value") and float(n.get("expires_ts") or 0) > now)
 
 
-def _step_done(flow: Flow, st: dict, i: int, now: float) -> bool:
+def _secret_kept(ctx: Context, flow: Flow, s: dict) -> bool:
+    """A step that stored the secret counts as done only while the secret is still in the store (unknown store: yes)."""
+    holds = (s["type"] == "capture" and any(f.get("secret") for f in s["fields"])) or (
+        s["type"] == "verify" and "identity" in s
+    )
+    if not holds or ctx.store is None or flow.secret_name is None:
+        return True
+    try:
+        return flow.secret_name in ctx.store.names()
+    except OSError:
+        return True
+
+
+def _step_done(ctx: Context, flow: Flow, st: dict, i: int, now: float) -> bool:
     s = flow.steps[i]
     if st["steps"].get(s["id"], {}).get("status") != "done":
+        return False
+    if not _secret_kept(ctx, flow, s):
         return False
     if s["type"] == "link" and s.get("nonce") and not _nonce_live(st, now):
         # an expired nonce only matters while the verify that uses it is still to do
@@ -230,7 +247,7 @@ def dry_run(ctx: Context, flow: Flow) -> dict:
     if not _registered(ctx, flow):
         blockers.append({"kind": "secret_not_registered", "name": flow.secret_name, "action": registry_step(ctx, flow)})
     for i, s in enumerate(flow.steps):
-        done = _step_done(flow, st, i, now)
+        done = _step_done(ctx, flow, st, i, now)
         row: dict[str, Any] = {"id": s["id"], "type": s["type"], "status": "done" if done else "needs_human"}
         if not done:
             row["action"] = _ACTION[s["type"]]
@@ -243,10 +260,13 @@ def dry_run(ctx: Context, flow: Flow) -> dict:
         if s["type"] == "link":
             if s.get("text"):
                 row["text"] = s["text"]
-            try:
-                row["url"] = fill(s["url"], vals)
-            except KeyError:
-                row["url_template"] = s["url"]
+            if s.get("nonce"):
+                row["url_template"] = s["url"]  # never the live nonce: an agent must not be able to bind a chat
+            else:
+                try:
+                    row["url"] = fill(s["url"], vals)
+                except KeyError:
+                    row["url_template"] = s["url"]
             if s.get("nonce"):
                 row["expires_in_s"] = s["expires_s"]
                 if _nonce_live(st, now):
@@ -300,7 +320,9 @@ def diagnose(ctx: Context, flow: Flow) -> dict:
 # ---- the walk --------------------------------------------------------------------------------------------------------
 
 
-def _check_http(status: int, body: Any, host: str) -> None:
+def _check_http(status: int, body: Any, host: str, *, conflict: bool = False) -> None:
+    if status == 409 and conflict:
+        raise ConnectError("conflict", f"{host} says another consumer holds this (HTTP 409)")
     if status != 200 or (isinstance(body, dict) and body.get("ok") is False):
         why = ""
         if isinstance(body, dict) and isinstance(body.get("description"), str):
@@ -322,7 +344,7 @@ def _run_find(ctx: Context, flow: Flow, s: dict, st: dict, value: str) -> dict |
     vals = _values(flow, st)
     url = fill(s["request"]["url"], vals, secret=value)
     status, body = ctx.transport.get(url)
-    _check_http(status, body, urlsplit(url).hostname or "the service")
+    _check_http(status, body, urlsplit(url).hostname or "the service", conflict="conflict" in s)
     f = s["find"]
     items = dig(body, f["list"])
     want = {p: _plain(t, vals) for p, t in f["where"].items()}
@@ -368,7 +390,7 @@ def walk(ctx: Context, flow: Flow) -> dict:
     while i < len(flow.steps):
         s = flow.steps[i]
         now = ctx.now()
-        if _step_done(flow, st, i, now):
+        if _step_done(ctx, flow, st, i, now):
             i += 1
             continue
         if s["type"] == "info":
@@ -381,7 +403,12 @@ def walk(ctx: Context, flow: Flow) -> dict:
                 st["nonce"] = {"value": _secrets.token_urlsafe(32)[:64], "expires_ts": now + s["expires_s"]}
                 vals["nonce"] = st["nonce"]["value"]
             io.say(f"\n{s.get('title', s['id'])}\n{s.get('text', '')}".rstrip())
-            io.say(f"  Open: {fill(s['url'], vals)}")
+            url = fill(s["url"], vals)
+            try:
+                opened = bool(ctx.open_url(url))
+            except (OSError, webbrowser.Error):
+                opened = False
+            io.say(f"  {'Opened in your browser. If it did not open, use' if opened else 'Open'}: {url}")
             if s.get("nonce"):
                 io.say(f"  This link works for {s['expires_s'] // 60} minutes.")
             io.pause("Press Enter when you have done it")
@@ -440,7 +467,12 @@ def _verify_find(ctx: Context, flow: Flow, st: dict, s: dict) -> None:
     assert io is not None
     value = _read_secret(ctx, flow)
     while True:
-        got = _run_find(ctx, flow, s, st, value)
+        try:
+            got = _run_find(ctx, flow, s, st, value)
+        except ConnectError as e:
+            if e.kind != "conflict":
+                raise
+            got = _resolve_conflict(ctx, flow, st, s, value, e)
         if got is not None:
             st["config"].update(got)
             st["nonce"] = None
@@ -453,6 +485,22 @@ def _verify_find(ctx: Context, flow: Flow, st: dict, s: dict) -> None:
             )
         if io.pause("Not seen yet. Press Enter to check again, or q then Enter to stop").strip().lower() == "q":
             return
+
+
+def _resolve_conflict(ctx: Context, flow: Flow, st: dict, s: dict, value: str, e: ConnectError) -> dict | None:
+    """The service refused the check because something else is set up on the same bot (Telegram: a webhook). Say what
+    and offer the step that clears it, run only on a yes; then look again."""
+    io = ctx.io
+    assert io is not None
+    c = s["conflict"]
+    io.say(f"  {c['text']}")
+    if io.ask("Run the fix now? (yes/no)").strip().lower() not in ("y", "yes"):
+        raise ConnectError("conflict", e.message, c["text"])
+    url = fill(c["fix_url"], _values(flow, st), secret=value)
+    status, body = ctx.transport.get(url)
+    _check_http(status, body, urlsplit(url).hostname or "the service")
+    io.say("  Done. Checking again.")
+    return _run_find(ctx, flow, s, st, value)
 
 
 # ---- revoke ----------------------------------------------------------------------------------------------------------

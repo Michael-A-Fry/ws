@@ -166,7 +166,7 @@ def parse(raw: dict, path: Path | None = None) -> Flow:
                 _need(sname is not None, where, "a secret field needs a [secret] block")
                 secret_pending = True
         else:  # verify
-            _only(s, base | {"request", "identity", "unique_id", "find"}, where)
+            _only(s, base | {"request", "identity", "unique_id", "find", "conflict"}, where)
             req = s.get("request")
             _need(isinstance(req, dict), where, "request must be a table with a url")
             _only(req, {"url"}, f"{where} request")
@@ -177,6 +177,7 @@ def parse(raw: dict, path: Path | None = None) -> Flow:
                 _need(host in hosts, where, f"host {host!r} is not in [secret] hosts")
             else:
                 _need("secret" not in fl, where, "{secret} needs a [secret] block")
+            _need("conflict" not in s or "find" in s, where, "conflict belongs to a find verify")
             has_id = "identity" in s or "unique_id" in s
             has_find = "find" in s
             _need(has_id != has_find, where, "a verify step has identity and unique_id, or find, not both or neither")
@@ -211,6 +212,15 @@ def parse(raw: dict, path: Path | None = None) -> Flow:
                         f"take name {k!r} is not allowed",
                     )
                 known.update(t)
+                cf = s.get("conflict")
+                if cf is not None:
+                    _need(isinstance(cf, dict), where, "conflict must be a table")
+                    _only(cf, {"text", "fix_url"}, f"{where} conflict")
+                    _text(cf, "text", f"{where} conflict")
+                    fu = _text(cf, "fix_url", f"{where} conflict") or ""
+                    _need(_https(fu, where) in hosts, where, "conflict fix_url host is not in [secret] hosts")
+                    for ff in _fields(fu):
+                        _need(ff == "secret" or ff in known, where, f"{{{ff}}} is not known here")
             for ff in fl:
                 _need(ff == "secret" or ff in known, where, f"{{{ff}}} is not known here")
         rv = s.get("revoke")

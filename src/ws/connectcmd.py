@@ -23,19 +23,31 @@ from ws.output import WsError
 
 
 class Terminal:
-    """The person's terminal. A secret is read with no echo and never printed."""
+    """The person's terminal. A secret is read with no echo and never printed. Input that ends (Ctrl-D, a closed
+    terminal) or is interrupted stops the walk with a message; nothing unverified was stored."""
 
     def say(self, text: str) -> None:
         print(text)
 
+    def _read(self, read, prompt: str) -> str:
+        try:
+            return read(prompt)
+        except (EOFError, KeyboardInterrupt):
+            print()
+            raise engine.ConnectError(
+                "cancelled",
+                "input ended, so the walk stopped",
+                "run `ws connect` again: it carries on where it stopped",
+            ) from None
+
     def ask(self, label: str) -> str:
-        return input(f"{label}: ")
+        return self._read(input, f"{label}: ")
 
     def ask_secret(self, label: str) -> str:
-        return getpass.getpass(f"{label} (not shown): ")
+        return self._read(getpass.getpass, f"{label} (not shown): ")
 
     def pause(self, text: str) -> str:
-        return input(f"{text}: ")
+        return self._read(input, f"{text}: ")
 
 
 def _context(*, with_io: bool = False) -> engine.Context:

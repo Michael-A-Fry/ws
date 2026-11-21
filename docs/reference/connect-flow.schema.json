@@ -124,6 +124,12 @@
             "take": { "type": "object", "minProperties": 1, "additionalProperties": { "type": "string" } }
           }
         },
+        "conflict": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["text", "fix_url"],
+          "properties": { "text": { "type": "string", "minLength": 1 }, "fix_url": { "$ref": "#/$defs/https" } }
+        },
         "revoke": { "$ref": "#/$defs/revoke" }
       },
       "oneOf": [

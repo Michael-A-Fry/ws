@@ -28,9 +28,9 @@ Every step has `id` (unique in the flow) and `type`; `title` and `revoke` are op
 | `type` | Keys | What happens |
 |---|---|---|
 | `info` | `text` | Shown; the person confirms they've read it. |
-| `link` | `url` (https), `text`, and for a one-time link `nonce = true` and `expires_s` (60 to 86400) | The URL is shown for the person to open. With `nonce`, `{nonce}` in the URL is a fresh 43-character `A-Za-z0-9_-` value that's kept until `expires_s` runs out; an expired one is replaced on the next walk. |
+| `link` | `url` (https; the walk opens it in the person's browser and prints it as the fallback), `text`, and for a one-time link `nonce = true` and `expires_s` (60 to 86400) | The URL is shown for the person to open. With `nonce`, `{nonce}` in the URL is a fresh 43-character `A-Za-z0-9_-` value that's kept until `expires_s` runs out; an expired one is replaced on the next walk. |
 | `capture` | `fields`: each `name`, `label`, optional `secret = true` and `pattern` (a regular expression the whole value must match) | A secret field is read with no echo and held in memory. A capture with a secret field must be followed at once by a `verify` with `identity` and `unique_id`: the secret is stored only when that passes. At most one secret field per flow. |
-| `verify` | `request.url` (https), then either `identity` and `unique_id` (paths into the JSON answer), or `find` | A real call. `identity` and `unique_id` give a label and a stable id. `find` looks in the list at `find.list` for the first item whose `where` paths equal the given texts and keeps the `take` paths (the Telegram flow reads the chat id of the message that carries the nonce). Success is HTTP 200 and no `"ok": false`. |
+| `verify` | `request.url` (https), then either `identity` and `unique_id` (paths into the JSON answer), or `find` | A real call. `identity` and `unique_id` give a label and a stable id. `find` looks in the list at `find.list` for the first item whose `where` paths equal the given texts and keeps the `take` paths (the Telegram flow reads the chat id of the message that carries the nonce). Success is HTTP 200 and no `"ok": false`. A `find` verify may declare `[steps.conflict]` (`text`, `fix_url`): on HTTP 409 the engine says `text` and, only on a yes, calls `fix_url` once (Telegram: a webhook blocks `getUpdates`; the fix is `deleteWebhook`) and checks again. |
 
 Placeholders in a URL or a `where` text: `{secret}` (in a `verify` URL only, and only to a host in `[secret].hosts`),
 `{nonce}`, `{identity}`, the `unique_key`, a non-secret field name, and a `take` name. The host part of a URL is fixed
@@ -65,13 +65,16 @@ frozen at `schema_version` 1. A key may be added; none is removed or changed in 
 | `blockers` | When present, each `kind` and `action`. `secret_not_registered` carries the registry entry for the person to add |
 | `steps[]` | `id`, `type`, `status` (`done` or `needs_human`), and when not done `action` |
 
-A step also carries what its type needs: `title`, `text` (info, link), `url` or `url_template` (link; the template when
+A step also carries what its type needs. A nonce link never carries the live nonce (it has `url_template`, never
+`url`, so an agent can't bind a chat. The rest: `title`, `text` (info, link), `url` or `url_template` (link; the template when
 a placeholder isn't known yet), `expires_in_s` and, once a nonce exists, `expires_at` (a nonce link), and `fields`
 (capture: each `name`, `label`, `secret`). `action` is one of `read`, `open_link`, `paste_secret`, `enter_value`,
 `run_verify`. A verify's request URL is never shown.
 
 Exit codes of the command: 0 done, 3 needs a person (or a refusal: the envelope's `error_kind` is `refused`), 1 an error
 (a flow that doesn't exist, a failed verify, a damaged state file), 2 usage.
+
+A capture and its verify count as `done` only while the secret is still in the store.
 
 ## Who may run what
 

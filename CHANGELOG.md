@@ -58,7 +58,8 @@ body of the GitHub release.
   0.1.11 wrote there comes out on the next `ws install`. The settings `ws gate launch` passes and a class's managed
   file still hold bypass off.
 - The pre-push hook refuses a push that carries an unsigned commit (`git log --format='%G?'` shows `N`), before the
-  tests run, and warns on a signature git can't check. It does nothing when `CI` is set.
+  tests run, warns on a signature git can't check, and refuses a bad or revoked one or a push whose commits git can't
+  list. It does nothing when `CI` is set (one line goes in the skip log).
 - Flaky tests: the two orphan tests (`test_msg.py`, `test_session_registry.py`) write their result file whole, through
   a temporary file and a rename. Before, the test could find the file created but still empty, and fail with `''`.
 - The launchd scheduler switches off only the agents it loaded. Each plist now carries `WsWrittenBy: ws`, and

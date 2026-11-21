@@ -447,9 +447,9 @@ def _commit(repo: Path, env: dict[str, str], cfg: list[str], name: str, signed: 
     ).stdout.strip()
 
 
-def _push_to_hook(repo: Path, env: dict[str, str], lines: str, **extra: str):
+def _push_to_hook(repo: Path, env: dict[str, str], lines: str, remote: str = "origin", **extra: str):
     return subprocess.run(
-        [shutil.which("bash"), str(HOOK), "origin", "url"],
+        [shutil.which("bash"), str(HOOK), remote, "url"],
         cwd=repo,
         env={**env, "WS_PREPUSH_WRAP": "", **extra},
         input=lines,
@@ -511,3 +511,91 @@ def test_a_signed_commit_with_no_signers_file_is_a_warning_not_an_unsigned_refus
     done = _push_to_hook(repo, env, f"refs/heads/work {signed} refs/heads/work {ZERO}\n")
     assert done.returncode == 0, done.stderr  # git says N here, but the commit carries a signature
     assert "signed but git cannot check it" in done.stderr
+
+
+# ---- signatures, round 2: forged headers, message text, failed walks, pushes by URL ------------------------------------
+
+
+def _git(repo: Path, env: dict[str, str], *args: str, text: str | None = None) -> str:
+    done = subprocess.run(
+        [shutil.which("git"), "-C", str(repo), *args],
+        env=env,
+        input=text,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return done.stdout.strip()
+
+
+def _forged(repo: Path, env: dict[str, str], parent: str | None) -> str:
+    """A commit whose header carries an ssh-looking `gpgsig` block that no key made."""
+    tree = _git(repo, env, "write-tree")
+    who = "t <noreply> 1700000000 +0000"
+    lines = [f"tree {tree}"] + ([f"parent {parent}"] if parent else []) + [f"author {who}", f"committer {who}"]
+    lines += [
+        "gpgsig -----BEGIN SSH SIGNATURE-----",
+        " bm90IGEgc2lnbmF0dXJl",
+        " -----END SSH SIGNATURE-----",
+        "",
+        "forged",
+    ]
+    return _git(repo, env, "hash-object", "-t", "commit", "-w", "--stdin", text="\n".join(lines) + "\n")
+
+
+def test_gpgsig_in_the_message_body_is_not_a_signature(tmp_path):
+    repo, env, cfg = _signing_repo(tmp_path)
+    (repo / "a").write_text("a", encoding="utf-8")
+    _git(repo, env, "add", "-A")
+    _git(repo, env, *cfg, "commit", "-q", "--no-gpg-sign", "-m", "x\n\ngpgsig looks like a header here")
+    sha = _git(repo, env, "rev-parse", "HEAD")
+    done = _push_to_hook(repo, env, f"refs/heads/work {sha} refs/heads/work {ZERO}\n")
+    assert done.returncode == 1 and "not signed" in done.stderr and sha in done.stderr
+
+
+def test_a_forged_signature_header_is_refused(tmp_path):
+    repo, env, _cfg = _signing_repo(tmp_path)
+    (repo / "a").write_text("a", encoding="utf-8")
+    _git(repo, env, "add", "-A")
+    sha = _forged(repo, env, None)
+    done = _push_to_hook(repo, env, f"refs/heads/work {sha} refs/heads/work {ZERO}\n")
+    assert done.returncode == 1 and "bad or revoked" in done.stderr and sha in done.stderr
+
+
+def test_a_remote_sha_this_clone_does_not_hold_falls_back_and_still_checks(tmp_path):
+    repo, env, cfg = _signing_repo(tmp_path)
+    signed = _commit(repo, env, cfg, "a", True)
+    unknown = "1" * 40
+    done = _push_to_hook(repo, env, f"refs/heads/work {signed} refs/heads/work {unknown}\n")
+    assert done.returncode == 0, done.stderr
+    unsigned = _commit(repo, env, cfg, "b", False)
+    done = _push_to_hook(repo, env, f"refs/heads/work {unsigned} refs/heads/work {unknown}\n")
+    assert done.returncode == 1 and unsigned in done.stderr
+
+
+def test_a_walk_git_cannot_make_refuses_the_push(tmp_path):
+    repo, env, cfg = _signing_repo(tmp_path)
+    _commit(repo, env, cfg, "a", True)
+    done = _push_to_hook(repo, env, f"refs/heads/work {'2' * 40} refs/heads/work {'1' * 40}\n")
+    assert done.returncode == 1 and "could not list" in done.stderr
+
+
+def test_a_push_by_url_checks_only_what_the_remote_tracking_refs_do_not_hold(tmp_path):
+    repo, env, cfg = _signing_repo(tmp_path)
+    old_unsigned = _commit(repo, env, cfg, "a", False)
+    _git(repo, env, "remote", "add", "origin", "https://git.invalid/r.git")
+    _git(repo, env, "update-ref", "refs/remotes/origin/work", old_unsigned)  # what the remote already has
+    new_signed = _commit(repo, env, cfg, "b", True)
+    line = f"refs/heads/other {new_signed} refs/heads/other {ZERO}\n"
+    done = _push_to_hook(repo, env, line, remote="https://example.invalid/r.git")
+    assert done.returncode == 0, done.stderr
+    done = _push_to_hook(repo, env, line, remote="origin")  # a named remote that is configured
+    assert done.returncode == 0, done.stderr
+
+
+def test_a_ci_skip_is_logged_like_a_hook_skip(tmp_path):
+    repo, env, cfg = _signing_repo(tmp_path)
+    unsigned = _commit(repo, env, cfg, "a", False)
+    _push_to_hook(repo, env, f"refs/heads/work {unsigned} refs/heads/work {ZERO}\n", CI="true")
+    log = (repo / ".git" / "ws-prepush-skips.log").read_text(encoding="utf-8")
+    assert "skipped the signature check" in log and "CI is set" in log

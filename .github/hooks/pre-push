@@ -21,7 +21,8 @@
 # they run bare. Set but empty (WS_PREPUSH_WRAP= git push), they always run bare.
 # Signatures: before any test, `git log --format='%H %G?'` over the commits being sent. An unsigned one (N) refuses the
 # push, because the repository takes signed commits only and the pull request would sit blocked; one git cannot check
-# (E), whose key it does not know (U) or that is signed but has no signers file to check against is a warning. Nothing runs when CI is set, and no network call is made. It reads
+# (E), whose key it does not know (U) or that is signed but has no signers file to check against is a warning; a bad (B) or revoked (R) one refuses. A
+# push whose commits git cannot list refuses too. Nothing is checked when CI is set (one line goes in the skip log, as for WS_SKIP_PREPUSH), and no network call is made. It reads
 # the refs git gives a pre-push hook on stdin, so a new branch is checked back to what the remote already has.
 # A skip is never silent: it adds a line to .git/ws-prepush-skips.log (the log of the worktree's git dir).
 set -euo pipefail
@@ -45,29 +46,74 @@ fi
 
 # the refs being pushed arrive on stdin: <local ref> <local sha> <remote ref> <remote sha>
 unsigned=()
-if [[ -z "${CI:-}" && ! -t 0 ]]; then
+refused=()
+empty_signers=""
+
+# The status of one commit that git calls N, checked again with an empty signers file, so an ssh signature gives U or E
+# (real, but unknown here) and a forged one B. N with no `gpgsig` header (in the header only: it ends at the first blank
+# line) is unsigned.
+recheck() {
+  local sha="$1" has
+  has="$(git cat-file commit "$sha" 2>/dev/null | sed '/^$/q' | grep -c '^gpgsig' || true)"
+  if [[ "$has" == 0 ]]; then
+    unsigned+=("$sha")
+    return
+  fi
+  if [[ -z "$empty_signers" ]]; then
+    empty_signers="$(mktemp)"
+    trap 'rm -f "$empty_signers"' EXIT
+  fi
+  case "$(git -c "gpg.ssh.allowedSignersFile=$empty_signers" log -1 --format='%G?' "$sha" 2>/dev/null || true)" in
+    B | R) refused+=("$sha") ;;
+    *) echo "pre-push: warning: ${sha:0:12} is signed but git cannot check it here (no signers file?)" >&2 ;;
+  esac
+}
+
+# Reads `git log --format='%H %G?'` for one range. Returns 1 when git log itself fails, so the caller never takes a
+# failed walk for a clean one.
+check_range() {
+  local out sha status
+  out="$(git log --format='%H %G?' "$@" 2>/dev/null)" || return 1
+  while read -r sha status; do
+    [[ -z "$sha" ]] && continue
+    case "$status" in
+      N) recheck "$sha" ;;
+      B | R) refused+=("$sha") ;;
+      E | U | X | Y) echo "pre-push: warning: ${sha:0:12} has a signature git cannot check (status $status)" >&2 ;;
+    esac
+  done <<<"$out"
+}
+
+failed_walk=0
+if [[ -n "${CI:-}" ]]; then
+  printf '%s skipped the signature check on %s (CI is set)\n' "$stamp" "$branch" >>"$log"
+elif [[ ! -t 0 ]]; then
+  # --remotes=<name> only when $1 is a configured remote: a push by URL gets every remote-tracking ref
+  remote_name="${1:-}"
+  if [[ -z "$remote_name" ]] || ! git remote 2>/dev/null | grep -qxF -- "$remote_name"; then
+    remote_arg="--remotes"
+  else
+    remote_arg="--remotes=$remote_name"
+  fi
   while read -r _ local_sha _ remote_sha; do
     [[ -z "$local_sha" || "$local_sha" =~ ^0+$ ]] && continue # a delete sends no commits
     if [[ "$remote_sha" =~ ^0+$ ]]; then
-      range=("$local_sha" --not "--remotes=${1:-}")
-      [[ -z "${1:-}" ]] && range=("$local_sha" --not --remotes)
+      check_range "$local_sha" --not "$remote_arg" || failed_walk=1
     else
-      range=("${remote_sha}..${local_sha}")
+      # a remote sha this clone does not hold (the remote moved on) makes the range fail: fall back to the new-branch walk
+      check_range "${remote_sha}..${local_sha}" || check_range "$local_sha" --not --remotes || failed_walk=1
     fi
-    while read -r sha status; do
-      case "$status" in
-        N)
-          # git also says N for an ssh signature it has no signers file to check: a signed commit has a gpgsig header
-          if git cat-file commit "$sha" 2>/dev/null | grep -q '^gpgsig'; then
-            echo "pre-push: warning: ${sha:0:12} is signed but git cannot check it (no signers file?)" >&2
-          else
-            unsigned+=("$sha")
-          fi
-          ;;
-        E | U) echo "pre-push: warning: ${sha:0:12} has a signature git cannot check (status $status)" >&2 ;;
-      esac
-    done < <(git log --format='%H %G?' "${range[@]}" 2>/dev/null || true)
   done
+fi
+if [[ "$failed_walk" == 1 ]]; then
+  echo "pre-push: refused: git could not list the commits being pushed, so their signatures are unchecked" >&2
+  echo "pre-push: fetch, then push again; or WS_SKIP_PREPUSH=1 git push (logged)" >&2
+  exit 1
+fi
+if [[ "${#refused[@]}" != 0 ]]; then
+  echo "pre-push: refused: ${#refused[@]} commit(s) being pushed have a bad or revoked signature:" >&2
+  printf '  %s\n' "${refused[@]:0:10}" >&2
+  exit 1
 fi
 if [[ "${#unsigned[@]}" != 0 ]]; then
   echo "pre-push: refused: ${#unsigned[@]} commit(s) being pushed are not signed:" >&2

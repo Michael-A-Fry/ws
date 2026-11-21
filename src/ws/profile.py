@@ -102,11 +102,64 @@ def dumps(data: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+# The keys an agent session may never change, whatever command reaches the write: the spend cap and which models the
+# jobs run on. `ws.agentsession` refuses the commands by name first; this is the check at the write itself.
+GUARDED = ("roles.budget.monthly_cap_usd", "models", "roles.model")
+
+
+def _at(doc: dict | None, dotted: str):
+    here = doc
+    for part in dotted.split("."):
+        if not isinstance(here, dict):
+            return None
+        here = here.get(part)
+    return here
+
+
+def guarded_changes(old: dict | None, new: dict) -> list[str]:
+    """The GUARDED keys whose value differs between `old` and `new` (a key added or removed counts)."""
+    return [k for k in GUARDED if _at(old, k) != _at(new, k)]
+
+
+def _session_refusal() -> str | None:
+    import sys
+
+    from ws import agentsession  # here, not at the top: it is only needed when a guarded key changes
+
+    def tty(stream) -> bool:
+        try:
+            return bool(stream.isatty())
+        except (AttributeError, ValueError, OSError):
+            return False
+
+    return agentsession.refusal(os.environ, tty(sys.stdin), tty(sys.stdout))
+
+
+def check_session_write(path: Path, new: dict, refusal=None) -> None:
+    """Refuse (WsError kind `refused`, exit 3) a write of `new` over the profile at `path` that changes a GUARDED key,
+    when this runs inside an agent session (the same test `ws.agentsession` uses for admin commands). A write that
+    leaves those keys as they are is never refused. An unreadable old profile counts as empty."""
+    try:
+        old = load(path)
+    except ProfileError:
+        old = None
+    changed = guarded_changes(old, new)
+    if not changed:
+        return
+    why = (refusal or _session_refusal)()
+    if why:
+        from ws.output import WsError
+
+        raise WsError("refused", f"the profile's {', '.join(changed)}: {why}", "change it in your own terminal", 3)
+
+
 def write_if_changed(path: Path, data: dict) -> bool:
-    """Write the profile only if its content would change. True if the file was written."""
+    """Write the profile only if its content would change. True if the file was written. A change to a GUARDED key
+    from inside an agent session is refused before anything is written (`check_session_write`)."""
     text = dumps(data)
     if path.is_file() and path.read_text(encoding="utf-8") == text:
         return False
+    check_session_write(path, data)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".toml.tmp")
     tmp.write_text(text, encoding="utf-8")

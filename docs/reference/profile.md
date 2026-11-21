@@ -65,6 +65,9 @@ Each setter prints the one key it changes (`[models] default: (unset) -> "claude
 `--yes` writes without asking; `--dry-run` prints the change and writes nothing. Setting a key to the value it already
 has writes nothing. After a write the setter prints the command that puts the old value back.
 
-The setters are admin commands: an agent session can't run `ws config budget`, `ws config model` with a value, or
-`ws install --cap`, so a session never sets its own cap or picks the models its jobs run on. The bare `ws config model`
-listing stays open to sessions. A run refused for having no model has `stop_reason` `no_model` in its run record.
+An agent session never changes the spend cap (`[roles.budget] monthly_cap_usd`), `[models]` or `[roles.model]`. The
+check sits where the profile is written, so it holds whichever command gets there: `ws config budget`,
+`ws config model` with a value, `ws install --cap` or `--model`, `ws setup --cap` and the setup page. Each is refused
+(exit 3) before anything is written; run it in your own terminal. A write that leaves those keys alone isn't affected,
+and the bare `ws config model` listing stays open to sessions. A run refused for having no model has `stop_reason`
+`no_model` in its run record.

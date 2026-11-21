@@ -837,7 +837,7 @@ def test_an_opencode_job_gets_a_config_with_zero_mcp_servers_and_no_other_config
     _argv, env = opencode.build_command(_job_for(), tmp_path, None)
     assert json.loads(env["OPENCODE_CONFIG_CONTENT"])["mcp"] == {}
     assert env["OPENCODE_DISABLE_PROJECT_CONFIG"] == "true"
-    assert env["XDG_CONFIG_HOME"] == str(tmp_path / "xdg") and not any((tmp_path / "xdg").iterdir())
+    assert env["HOME"] == str(tmp_path / "oc-home") and not any((tmp_path / "oc-home" / ".config").iterdir())
 
 
 def test_an_opencode_job_that_names_an_mcp_server_is_refused(tmp_path):
@@ -855,32 +855,51 @@ def test_ws_run_does_not_refuse_the_same_policy_for_claude_code(run_ws):  # noqa
     assert all(r["stop_reason"] != "refused:cannot_check" for r in run_ws.records())
 
 
-@pytest.mark.parametrize(
-    "rel, body",
-    [
+def _plant_home(home: Path) -> None:
+    for rel, body in (
         (".opencode/opencode.json", '{"mcp": {"evil": {"type": "local", "command": ["true"]}}}'),
+        (".opencode/tool/x.js", "export default {}"),
         (".opencode/plugins/x.js", "export default {}"),
-    ],
-)
-def test_an_opencode_job_is_refused_when_the_home_folder_would_start_a_server_or_plugin(
-    tmp_path, monkeypatch, rel, body
-):
+        (".config/opencode/opencode.json", '{"mcp": {"evil": {"type": "local", "command": ["true"]}}}'),
+        (".local/share/opencode/auth.json", '{"corp": {"type": "wellknown", "key": "k", "token": "t"}}'),
+    ):
+        (home / rel).parent.mkdir(parents=True, exist_ok=True)
+        (home / rel).write_text(body)
+
+
+def test_an_opencode_job_runs_with_a_fresh_empty_home_and_xdg_so_planted_sources_load_nothing(tmp_path, monkeypatch):
     from ws.adapters import opencode
 
     home = tmp_path / "home"
-    (home / rel).parent.mkdir(parents=True)
-    (home / rel).write_text(body)
+    _plant_home(home)
     monkeypatch.setenv("HOME", str(home))
     run_dir = tmp_path / "run"
     (run_dir / "gate").mkdir(parents=True)
-    with pytest.raises(ValueError, match="holds|starts"):
-        opencode.build_command(_job_for(), run_dir, None)
+    _argv, env = opencode.build_command(_job_for(), run_dir, None)
+    fresh = run_dir / "oc-home"
+    assert env["HOME"] == str(fresh)
+    for var in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"):
+        folder = Path(env[var])
+        assert folder.is_dir() and fresh in folder.parents and not any(folder.iterdir()), var
+    assert not (fresh / ".opencode").exists() and not list(fresh.rglob("auth.json"))
+    assert str(home) not in json.dumps(env)  # nothing of the real home reaches the runner
 
 
-def test_an_opencode_job_with_a_plain_home_folder_is_not_refused(tmp_path, monkeypatch):
+def test_an_opencode_job_is_refused_when_etc_opencode_has_a_config(tmp_path, monkeypatch):
     from ws.adapters import opencode
 
-    (tmp_path / "home").mkdir()
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    etc = tmp_path / "etc"
+    etc.mkdir()
+    (etc / "opencode.jsonc").write_text('{"mcp": {"evil": {"type": "local", "command": ["true"]}}}')
+    monkeypatch.setattr(opencode, "ETC_OPENCODE", etc)
+    (tmp_path / "run" / "gate").mkdir(parents=True)
+    with pytest.raises(ValueError, match="etc"):
+        opencode.build_command(_job_for(), tmp_path / "run", None)
+
+
+def test_an_opencode_job_with_no_etc_config_is_not_refused(tmp_path, monkeypatch):
+    from ws.adapters import opencode
+
+    monkeypatch.setattr(opencode, "ETC_OPENCODE", tmp_path / "no-etc")
     (tmp_path / "run" / "gate").mkdir(parents=True)
     opencode.build_command(_job_for(), tmp_path / "run", None)

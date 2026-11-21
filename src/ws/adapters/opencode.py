@@ -116,7 +116,7 @@ def unsupported_guards() -> tuple[str, ...]:
 UNSUPPORTED_GUARDS = unsupported_guards()
 
 # "mcp" is not listed: a `ws run` job starts no MCP server at all (build_command: no global or project config, none in the
-# home folder's .opencode, `mcp` empty, and `mcp` is not a job option), so allow_mcp and the deny_tools MCP globs hold with no hook. `ws gate launch` is a
+# home folder or /etc/opencode, `mcp` empty, and `mcp` is not a job option), so allow_mcp and the deny_tools MCP globs hold with no hook. `ws gate launch` is a
 # person's own session and is not judged by this list.
 # Checks a policy can ask for that this runner cannot enforce; `ws run` refuses such a job (conformance.refuse_cannot_check).
 # A guard is "guard:NAME" and comes from UNSUPPORTED_GUARDS, so a new guard needs no edit here.
@@ -628,6 +628,7 @@ def project_problem(starts, home: Path) -> WsError | None:
 # --- ws run: the command line, and the event stream read back as a run record --------------------------------------
 
 EXE = "opencode"
+ETC_OPENCODE = Path("/etc/opencode")  # OpenCode applies a config here after the inline one
 PLACEHOLDER_KEY = "ws-lease-placeholder"  # the runner holds this; the broker swaps in the real key on the way out
 OPTIONS = {"exe", "env", "provider", "base_path", "offline"}
 PROMPT_VIA_STDIN = True  # `opencode run` reads the message from stdin when none is given (checked on 1.19.4)
@@ -668,14 +669,20 @@ def build_command(job, run_dir: Path, lease) -> tuple[list[str], dict[str, str]]
     # No MCP server can start in a job: OpenCode merges its global config (XDG_CONFIG_HOME) and the project's own
     # opencode.json into the inline one, and an empty inline `mcp` does not remove a server they name (checked on
     # 1.19.4). So the run gets an empty config folder and the project config is switched off.
-    # HOME stays (provider auth lives under it) and OpenCode still reads $HOME/.opencode/: refuse a run whose home folder
-    # would start a server or load a plugin. project_problem skips the home folder it is given, so it is passed none.
-    if problem := project_problem([str(Path(env.get("HOME") or Path.home()))], Path("/nonexistent")):
-        raise ValueError(f"{problem.message}; {problem.hint}")
-    xdg = Path(run_dir) / "xdg"
-    if xdg.parent.is_dir():  # the run's folder is there once its gate files are written
-        xdg.mkdir(exist_ok=True)
-    env.update(XDG_CONFIG_HOME=str(xdg), OPENCODE_DISABLE_PROJECT_CONFIG="true")
+    # Isolate, don't list paths (DEC-093): OpenCode reads MCP servers, plugins, tools and remote config from its home
+    # folder, the five XDG folders, the project and /etc/opencode, and a server named in an empty inline `mcp` is not
+    # removed by it. So the run gets HOME and the XDG folders as fresh empty folders under its run folder, the project
+    # config is off, and /etc/opencode is refused. The provider credential and base URL come only from the lease in
+    # the inline config; no auth.json is copied (a local provider needs none).
+    for name in ("opencode.json", "opencode.jsonc"):
+        if (ETC_OPENCODE / name).exists():
+            raise ValueError(f"{ETC_OPENCODE / name} exists and OpenCode applies it after ws's config: remove it, or run on claude-code")
+    fresh = Path(run_dir) / "oc-home"
+    for var, rel in (("XDG_CONFIG_HOME", ".config"), ("XDG_DATA_HOME", ".local/share"), ("XDG_STATE_HOME", ".local/state"), ("XDG_CACHE_HOME", ".cache")):
+        env[var] = str(fresh / rel)
+        if Path(run_dir).is_dir():  # the run's folder is there once its gate files are written
+            (fresh / rel).mkdir(parents=True, exist_ok=True)
+    env.update(HOME=str(fresh), OPENCODE_DISABLE_PROJECT_CONFIG="true")
     if offline:  # no model-list fetch or language-server download: for a stub or an air-gapped machine
         env.update(OPENCODE_DISABLE_MODELS_FETCH="true", OPENCODE_DISABLE_LSP_DOWNLOAD="true")
     gate_file = out / CONFIG

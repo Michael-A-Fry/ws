@@ -2612,3 +2612,24 @@ def test_sudo_is_read_as_sudo_reads_it_and_unset_clears_a_known_name(pol, home, 
 def test_ordinary_sudo_and_unset_forms_still_run(pol, home):
     for cmd in ("sudo -u root ls", "sudo --user=root ls", "sudo -iu root ls", "sudo -E ls", "unset X; ls"):
         assert policy.is_denied_command(pol, cmd) is None, cmd
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "sudo -A ls",  # runs the askpass program an environment variable names
+        "sudo --askpass ls",
+        "echo 'git push --force origin main' | sudo -s",  # a shell with no command reads its script from the pipe
+        "sudo -i < /tmp/script",
+    ],
+)
+def test_sudo_askpass_and_a_sudo_shell_on_stdin_are_refused(pol, home, cmd):
+    assert policy.is_denied_command(pol, cmd)
+
+
+def test_sudo_edit_writes_its_files(pol, home):
+    target = f"{home}/.ws/policy.toml"
+    for cmd in (f"sudo -e {target}", f"sudo --edit {target}", f"sudoedit {target}"):
+        assert "protects" in (policy.is_denied_command(pol, cmd, protect=(target,)) or ""), cmd
+    assert policy.is_denied_command(pol, "sudo -e /tmp/notes.txt", protect=(target,)) is None
+    assert policy.is_denied_command(pol, "sudo -s ls", protect=(target,)) is None  # a command given: judged as it is

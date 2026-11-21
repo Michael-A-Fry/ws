@@ -964,10 +964,12 @@ def _sudo_unsure(why: str) -> ShellError:
     return ShellError("unsupported", f"sudo {why}, which ws does not read; write the command without it")
 
 
-def _sudo_args(toks: list[str]) -> tuple[int, list[str]]:
-    """(index of the command sudo runs, the NAME=value settings it makes), read as sudo reads `toks` (`toks[0]` is
-    sudo). Raises ShellError when sudo's reading isn't certain."""
-    i = 1
+def _sudo_args(toks: list[str]) -> tuple[int, list[str], str | None]:
+    """(index of the command sudo runs, the NAME=value settings it makes, and "edit" when it edits the files it is
+    given or "shell" when it starts a shell that reads its standard input, else None), read as sudo reads `toks`
+    (`toks[0]` is sudo). Raises ShellError when sudo's reading isn't certain, and for -A: the askpass program it
+    runs is named by SUDO_ASKPASS, which ws does not read."""
+    i, seen = 1, set()
     while i < len(toks):
         t = toks[i]
         if t == "--":
@@ -979,6 +981,7 @@ def _sudo_args(toks: list[str]) -> tuple[int, list[str]]:
             if not name or len(found) != 1:
                 raise _sudo_unsure(f"is given {t!r}, an option it reads as ambiguous or unknown")
             kind, i = _SUDO_LONG[found[0]], i + 1
+            seen.add(found[0])
             if kind == "none" and eq:
                 raise _sudo_unsure(f"is given a value for {t!r}, which takes none")
             if kind == "required" and not eq:
@@ -989,6 +992,7 @@ def _sudo_args(toks: list[str]) -> tuple[int, list[str]]:
             i += 1
             for k, c in enumerate(t[1:], 1):
                 if c in _SUDO_SHORT_FLAGS:
+                    seen.add(c)
                     continue
                 if c in _SUDO_SHORT_OPTIONAL:
                     break  # `-hHOST` holds its value; `-h` alone has none
@@ -1007,7 +1011,13 @@ def _sudo_args(toks: list[str]) -> tuple[int, list[str]]:
         i += 1
     if i < len(toks) and toks[i].startswith("-"):
         raise _sudo_unsure(f"would run a program named {toks[i]!r}, or read it as an option")
-    return i, settings
+    if seen & {"A", "askpass"}:
+        raise _sudo_unsure("-A would run the askpass program SUDO_ASKPASS names")
+    if seen & {"e", "edit"}:
+        return i, settings, "edit"  # the words after are files it writes, not a command
+    if seen & {"s", "i", "shell", "login"} and i >= len(toks):
+        return i, settings, "shell"  # a shell with no command reads its script from standard input
+    return i, settings, None
 
 
 def _short_takes_next(t: str, arg_opts) -> bool:
@@ -1060,6 +1070,7 @@ def strip_wrappers(
                 toks = []
                 break
         arg_opts, i, resplit, exec_form = _WRAPPERS[w], 1, None, False
+        sudo_mode: str | None = None
         took: set[int] = set()  # the places of the words env or sudo took as settings, never an option's value
         if w == "env":
             i, sets, resplit = _env_args(toks)
@@ -1067,7 +1078,7 @@ def strip_wrappers(
             if env is not None:
                 env.extend(sets)
         elif w == "sudo":
-            i, sets = _sudo_args(toks)
+            i, sets, sudo_mode = _sudo_args(toks)
             took = set(range(i - len(sets), i))
             if env is not None:
                 env.extend(sets)
@@ -1098,6 +1109,9 @@ def strip_wrappers(
             toks = []
             break
         # the words of an `env -S` string are env's own arguments: its options and settings come first
+        if sudo_mode:  # sudo -e is sudoedit, which writes its files; sudo -s or -i alone is a shell on stdin
+            toks = ["sudoedit" if sudo_mode == "edit" else "sh", *toks[i:]]
+            break
         toks = (["env", *words_of(resplit, lexenv, budget)] if resplit is not None else []) + toks[i:]
     return toks, seen
 

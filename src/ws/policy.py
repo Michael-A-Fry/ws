@@ -1475,6 +1475,7 @@ _OPERAND_CMDS = {"rm", "rmdir", "shred", "unlink", "chmod", "chown", "chgrp", "m
 _ALWAYS_RECURSIVE = {"tar", "find", "zip", "rsync", "tree", "du", "7z", "bsdtar", "cpio"}
 # Commands that write to every operand / only to the last one (or -t DIR).
 _WRITE_ALL = {"tee", "mv", "rm", "rmdir", "truncate", "chmod", "chown", "chgrp", "touch", "shred", "unlink", "patch"}
+_WRITE_ALL.add("sudoedit")  # sudo -e: writes each file it is given
 _WRITE_LAST = {"cp", "install", "ln", "rsync", "scp"}
 _INTERP = re.compile(r"^(python[0-9.]*|perl|ruby|node|php)$")
 # Probes for "can the shell reach the network": a policy that denies all of them closes the shell as a way out.

@@ -18,7 +18,9 @@ session. `ws upgrade` does both halves from a terminal of the person's own, and 
 - both work: the new binary and the new hooks.
 
 The rewrite runs in a new process of the new binary (`--hooks-only`), never in the process that started the install: the
-files it would import have just been replaced.
+files it would import have just been replaced. Which binary is read back from what the installer left (`installed_ws`:
+the `ws` command in the folder uv or pipx puts it, and the Python its `#!` line names), not assumed to be the Python
+this process runs; the version on record is asked of the same one, and the step says which it ran (C648).
 
 The rewrite is `ws install`'s own gate steps (`ws.install.gate_plan`) and nothing else, bar one file: the profile, the
 modules and the folders are not touched. It never switches on what the person did not have (a config written without the
@@ -53,6 +55,7 @@ import argparse
 import json
 import os
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -295,9 +298,87 @@ def _installer_argv(script: Path, args: argparse.Namespace) -> list[str]:
     return argv
 
 
-def _hooks_argv() -> list[str]:
-    """The new binary's own rewrite: this Python (the tool's environment, which the installer just rebuilt), a new process."""
-    return [*selfcmd.argv(), "upgrade", "--hooks-only"]
+class NewWs(NamedTuple):
+    """The ws the installer just wrote: the argv prefix that runs it, its Python, its version (None when it did not
+    answer), and where ws found it."""
+
+    argv: list[str]
+    python: str
+    version: str | None
+    found: str
+
+
+def _bin_dirs(env: Mapping[str, str]) -> list[Path]:
+    """The folders an installer puts the `ws` command in, in the order uv and then pipx look them up."""
+    home = Path(env.get("HOME") or os.path.expanduser("~"))
+    dirs = [env.get("UV_TOOL_BIN_DIR"), env.get("XDG_BIN_HOME")]
+    if env.get("XDG_DATA_HOME"):
+        dirs.append(str(Path(env["XDG_DATA_HOME"]).parent / "bin"))
+    dirs += [env.get("PIPX_BIN_DIR"), str(home / ".local" / "bin")]
+    return [Path(d) for d in dict.fromkeys(d for d in dirs if d)]
+
+
+def _script_python(script: Path) -> str | None:
+    """The Python a console script runs: its `#!` line, or the `'''exec' PYTHON "$0"` line a long-path script uses. The
+    script is read, never run."""
+    try:
+        with open(script, "rb") as f:
+            head = f.read(4096).decode("utf-8", "replace").splitlines()[:2]
+    except OSError:
+        return None
+    if not head or not head[0].startswith("#!"):
+        return None
+    words = shlex.split(head[0][2:]) if head[0][2:].strip() else []
+    if words and os.path.basename(words[0]).startswith("python"):
+        return words[0]
+    if len(head) > 1 and head[1].startswith("'''exec'"):
+        rest = shlex.split(head[1][len("'''exec'") :])
+        return rest[0] if rest else None
+    return None
+
+
+def _ask_version(prefix: list[str]) -> str | None:
+    """The version a ws answers with, asked of a new process."""
+    try:
+        p = subprocess.run([*prefix, "--version"], capture_output=True, text=True, timeout=30, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    words = p.stdout.split()
+    return words[-1] if p.returncode == 0 and len(words) >= 2 and words[0] == "ws" else None
+
+
+def installed_ws(env: Mapping[str, str]) -> NewWs:
+    """The ws the installer just wrote, read back from the `ws` command it put in place: that script's own Python, which
+    must answer `--version` as ws. The running process is the fallback (and is named as such): it is the same Python
+    whenever the installer rebuilt the environment it runs from, but nothing else says so (C648)."""
+    seen: set[str] = set()
+    which = shutil.which("ws", path=env.get("PATH"))
+    for script in [*(d / "ws" for d in _bin_dirs(env)), *([Path(which)] if which else [])]:
+        py = _script_python(script) if script.is_file() else None
+        if not py or py in seen or not os.path.isabs(py) or not os.access(py, os.X_OK):
+            continue
+        seen.add(py)
+        prefix = [py, "-I", "-m", "ws"]
+        if selfcmd.unstable(prefix):
+            continue
+        version = _ask_version(prefix)
+        if version:
+            return NewWs(prefix, py, version, f"the ws command at {script}")
+    prefix = selfcmd.argv()
+    return NewWs(prefix, prefix[0], _ask_version(prefix), "this process (no installed ws command answered)")
+
+
+def _hooks_argv(new: NewWs | None = None) -> list[str]:
+    """The new binary's own rewrite, in a new process of the ws the installer wrote (this one runs the old code)."""
+    return [*(new.argv if new else selfcmd.argv()), "upgrade", "--hooks-only"]
+
+
+def _using(args: argparse.Namespace, new: NewWs) -> None:
+    """Say which ws the next step runs, so a step that runs the wrong one shows it (C648)."""
+    _say(args, f"rewriting the hooks with ws {new.version or '(no answer)'} at {new.python}, found as {new.found}")
+    asked = getattr(args, "version", None)
+    if asked and new.version and _tag(new.version) != _tag(asked):
+        _say(args, f"note: the installer was asked for {asked}, and the ws it left answers {new.version}")
 
 
 def swap(args: argparse.Namespace, scratch: Path) -> Ran:
@@ -351,29 +432,22 @@ def previous_release(env: Mapping[str, str]) -> str | None:
     return None
 
 
-def _installed_version() -> str | None:
-    """The version of the ws now installed, asked of a new process (this one still runs the old code)."""
-    try:
-        p = subprocess.run([*selfcmd.argv(), "--version"], capture_output=True, text=True, timeout=30, check=False)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    words = p.stdout.split()
-    return words[-1] if p.returncode == 0 and words else None
-
-
 def _tag(version: str) -> str:
     return version if version.startswith("v") else f"v{version}"
 
 
-def reinstall(args: argparse.Namespace, version: str) -> Ran:
-    """Install `version` and rewrite the hooks for it: the way back. Code 0 when both steps worked."""
+def reinstall(args: argparse.Namespace, env: Mapping[str, str], version: str) -> Ran:
+    """Install `version` and rewrite the hooks for it with the ws the installer left: the way back. Code 0 when both
+    steps worked."""
     ns = argparse.Namespace(**{**vars(args), "version": _tag(version), "channel": None})
     with tempfile.TemporaryDirectory(prefix="ws-rollback-") as scratch:
         os.chmod(scratch, 0o700)
         ran = swap(ns, Path(scratch))
     if ran.code != 0:
         return ran
-    return _run(_hooks_argv(), args.json, _step_limit(args))
+    new = installed_ws(env)
+    _using(ns, new)
+    return _run(_hooks_argv(new), args.json, _step_limit(args))
 
 
 # ---- the command ------------------------------------------------------------------------------------------------------------
@@ -413,9 +487,9 @@ def _hooks_only(args: argparse.Namespace, env: Mapping[str, str]) -> int:
         print(f"ws: {verb} {path} (an older OpenCode plugin that ws put there and had withdrawn)")
     verb = "would make" if args.dry_run else "made"
     print(
-        f"ws {__version__}: {verb} {result.summary()}"
+        f"ws {__version__} ({sys.executable}): {verb} {result.summary()}"
         if result.changes
-        else f"ws {__version__}: hooks are current ({result.summary()})"
+        else f"ws {__version__} ({sys.executable}): hooks are current ({result.summary()})"
     )
     for sk in result.skipped:
         print(f"ws: {_skipped_line(sk)}")
@@ -451,8 +525,9 @@ def _both(args: argparse.Namespace, env: Mapping[str, str]) -> int:
     if code != 0:
         _say(args, f"the installer failed (exit {code}); you still have ws {before} and its hooks, unchanged")
         return code or EXIT_FAILED
-    _say(args, "installed; now rewriting the hooks with the new ws")
-    ran = _run(_hooks_argv(), args.json, _step_limit(args))
+    new = installed_ws(env)
+    _using(args, new)
+    ran = _run(_hooks_argv(new), args.json, _step_limit(args))
     if ran.timed_out:
         return _auto_rollback(args, env, before, "the hooks rewrite ran past its time limit")
     code = ran.code
@@ -482,7 +557,7 @@ def _both(args: argparse.Namespace, env: Mapping[str, str]) -> int:
         if ran.code != 0:
             why = "the check ran past its time limit" if ran.timed_out else f"the check failed (exit {ran.code})"
             return _auto_rollback(args, env, before, why)
-    record(env, "promote", before, _installed_version())
+    record(env, "promote", before, new.version)
     if args.json:
         output.result({"from": before, "binary": "swapped", "hooks": "rewritten", "checked": bool(check)})
     else:
@@ -493,7 +568,7 @@ def _both(args: argparse.Namespace, env: Mapping[str, str]) -> int:
 def _auto_rollback(args: argparse.Namespace, env: Mapping[str, str], before: str, why: str) -> int:
     """A cut-over step went wrong after the swap began: put `before` back at once."""
     _say(args, f"{why}; going back to ws {before}")
-    code = reinstall(args, before).code
+    code = reinstall(args, env, before).code
     record(env, "auto-rollback", before, before if code == 0 else None)
     if code != 0:
         _say(
@@ -523,7 +598,7 @@ def _rollback(args: argparse.Namespace, env: Mapping[str, str]) -> int:
             "install ws with install.sh first",
             EXIT_REFUSED,
         )
-    ran = reinstall(args, target)
+    ran = reinstall(args, env, target)
     if ran.code != 0:
         record(env, "rollback", before, None)
         _say(

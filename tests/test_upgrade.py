@@ -41,6 +41,8 @@ def box(tmp_path, monkeypatch):
     monkeypatch.setenv("WS_HOME", str(home / ".ws"))
     monkeypatch.setattr(paths, "account_home", lambda: home.resolve())
     monkeypatch.setenv("WS_GATE_DAEMON", "0")  # a hook decides in its own process, and leaves no daemon behind
+    for var in ("UV_TOOL_BIN_DIR", "XDG_BIN_HOME", "XDG_DATA_HOME", "PIPX_BIN_DIR"):
+        monkeypatch.delenv(var, raising=False)  # where `installed_ws` looks: the tmp HOME only
     for var in SESSION_VARS:
         monkeypatch.delenv(var, raising=False)  # this suite may itself run inside a session
     monkeypatch.chdir(home)
@@ -508,6 +510,81 @@ def test_the_installer_is_given_what_the_person_asked_for(old):
     assert upgrade._hooks_argv()[-2:] == ["upgrade", "--hooks-only"] and upgrade._hooks_argv()[:4] == selfcmd.argv()
 
 
+# --- the ws the installer wrote runs the hooks step (C648) -------------------------------------------------------------
+
+_STUB_WS = """
+import json, os, sys
+with open(os.environ["STUB_WS_OUT"], "a") as f:
+    f.write(json.dumps({"python": sys.executable, "argv": sys.argv[1:]}) + "\\n")
+if sys.argv[1:] == ["--version"]:
+    print("ws 9.9.9")
+"""
+
+
+def _stub_installer(tmp_path: Path, home: Path) -> Path:
+    """An installer that writes what install.sh writes, with a stand-in ws: a new environment of its own (a real venv,
+    under HOME as uv's tool folder is) holding a `ws` package that records each call, and the `ws` command in
+    ~/.local/bin whose `#!` line names that environment's Python. Returns that Python."""
+    env = home / ".local" / "share" / "uv" / "tools" / "ws-aitoolkit"
+    py = env / "bin" / "python"
+    cmd = home / ".local" / "bin" / "ws"
+    builder = tmp_path / "build_env.py"
+    builder.write_text(
+        "import subprocess, sys, sysconfig\n"
+        "from pathlib import Path\n"
+        f"env, py, cmd = Path({str(env)!r}), {str(py)!r}, Path({str(cmd)!r})\n"
+        "subprocess.run([sys.executable, '-m', 'venv', '--without-pip', str(env)], check=True)\n"
+        "site = subprocess.run([py, '-I', '-c', 'import sysconfig; print(sysconfig.get_path(\"purelib\"))'],\n"
+        "                      check=True, capture_output=True, text=True).stdout.strip()\n"
+        "(Path(site) / 'ws').mkdir(parents=True)\n"
+        "(Path(site) / 'ws' / '__init__.py').write_text('')\n"
+        f"(Path(site) / 'ws' / '__main__.py').write_text({_STUB_WS!r})\n"
+        "cmd.parent.mkdir(parents=True, exist_ok=True)\n"
+        "cmd.write_text(f'#!{py}\\nimport sys\\n')\n"
+        "cmd.chmod(0o755)\n",
+        encoding="utf-8",
+    )
+    script = tmp_path / "install.sh"
+    script.write_text(f"#!/usr/bin/env bash\nset -e\n{shlex.quote(sys.executable)} -I {shlex.quote(str(builder))}\n")
+    return py
+
+
+def test_the_hooks_step_and_the_history_use_the_ws_the_installer_wrote(old, tmp_path, monkeypatch, capsys):
+    """The real child path: `_run` starts the hooks step as a process, as in a person's upgrade. The running process is
+    this test's Python; the installer leaves a different environment. The hooks step, the version on record and the
+    line that says which ws runs must all be the new one."""
+    monkeypatch.setattr(selfcmd, "unstable", lambda cmd=None: None)  # the test's own .venv runs the upgrade
+    new_python = _stub_installer(tmp_path, old)
+    calls = tmp_path / "calls.jsonl"
+    monkeypatch.setenv("STUB_WS_OUT", str(calls))
+    assert cli.main(["upgrade", "--installer", str(tmp_path / "install.sh")]) == 0
+    seen = [json.loads(line) for line in calls.read_text().splitlines()]
+    assert {"python": str(new_python), "argv": ["upgrade", "--hooks-only"]} in seen
+    assert all(c["python"] == str(new_python) for c in seen)
+    assert upgrade.history(os.environ)[-1]["to"] == "9.9.9"
+    assert f"with ws 9.9.9 at {new_python}" in capsys.readouterr().out
+
+
+def test_the_step_line_names_the_python_and_version_it_ran_with(old, capsys):
+    code, out, _ = upgrade_hooks(capsys)
+    assert code == 0 and f"ws {__version__} ({sys.executable}): made" in out
+
+
+@pytest.mark.parametrize(
+    ("text", "python"),
+    [
+        ("#!/opt/env/bin/python\nimport sys\n", "/opt/env/bin/python"),
+        ("#!/bin/sh\n'''exec' '/a b/env/bin/python3' \"$0\" \"$@\"\n' '''\n", "/a b/env/bin/python3"),
+        ("#!/usr/bin/env bash\necho hi\n", None),
+        ("no shebang\n", None),
+    ],
+)
+def test_the_python_of_a_console_script_is_read_not_run(tmp_path, text, python):
+    script = tmp_path / "ws"
+    script.write_text(text, encoding="utf-8")
+    assert upgrade._script_python(script) == python
+
+
 def test_what_is_not_the_installer_is_not_run(tmp_path, monkeypatch):
     class Resp(io.BytesIO):
         def __enter__(self):
@@ -774,7 +851,9 @@ def test_under_a_runner_a_terminal_that_is_not_the_runners_own_is_refused(old, c
 @pytest.fixture
 def cutover(swapped, monkeypatch):
     """`swapped`, with the new version known and the version each installer call was asked for recorded in order."""
-    monkeypatch.setattr(upgrade, "_installed_version", lambda: "9.9.9")
+    monkeypatch.setattr(
+        upgrade, "installed_ws", lambda env: upgrade.NewWs(selfcmd.argv(), sys.executable, "9.9.9", "a stand-in")
+    )
     asked: list[str | None] = []
     inner = upgrade.swap
 

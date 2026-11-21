@@ -50,6 +50,8 @@ below, and `python3 scripts/gen_code_map.py --check` (prek and CI) fails when it
 | `jobwatch.py` | `ws watch`: the failure alert a scheduled unit raises, the dead-man check for jobs that stopped... |
 | `jsonl.py` | Bounded, locked JSON-lines logs: one object per line, a size limit with rotation, and no lost lines |
 | `mail.py` | Mailboxes for triage: search, read as delimited plain text, add a ws label, and save a reply as... |
+| `mail_mcp.py` | The mail MCP tools: five calls over ws.mail (list mailboxes, search, get, label, draft), served... |
+| `mailcmd.py` | `ws mail`: add, check and remove the mailboxes of the profile, and serve the mail MCP tools... |
 | `mcp_server.py` | `ws mcp serve`: a small MCP server over stdio, so any runner can search and add to memory and... |
 | `memory.py` | Memory module: Markdown files with front matter in a git repo, plus a rebuildable SQLite FTS5 index |
 | `migrate.py` | `ws migrate`: move ws's files from `~/.ws` to the XDG folders (see `ws.paths` for which file... |

@@ -66,6 +66,7 @@ Measure:
 - [Hooks](reference/hook-parity.md): what a hand-built hook set does, and the ws rule or guard that does the same job.
 - [Code map](reference/code-map.md): what each module in `src/ws/` is for, built from its docstring.
 - [Eval](reference/eval.md): task files, graders and the ten metrics.
+- [Mail](reference/mail.md): mailboxes for triage, the five mail tools, `ws mail` and the Gmail app password step.
 - [Connect flows](reference/connect.md): the flow file format, its state and the JSON an agent reads.
 - [Stores](reference/stores.md): every log and record file ws writes, its fields, schema and retention.
 - [Lab](reference/lab.md): the lab virtual machine cell and how it's protected.

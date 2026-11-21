@@ -219,8 +219,16 @@ def test_rm_takes_the_table_out_and_keeps_the_secret(home, box, capsys):
     assert cli.main(["mail", "rm", "a"]) == 2
 
 
-def test_add_refuses_a_bad_name_host_or_user(home, capsys):
-    for argv in (["A", "--host", HOST, "--user", USER], ["a", "--host", "x:993", "--user", USER],
-                 ["a", "--host", HOST, "--user", "a b"]):  # fmt: skip
-        assert cli.main(["mail", "add", *argv]) == 2
-    assert not Path(profile.profile_path()).exists()
+@pytest.mark.parametrize(
+    "argv,said",
+    [
+        (["A", "--host", HOST, "--user", USER], "not a mailbox name"),
+        (["a", "--host", f"{HOST}:993", "--user", USER], "not an IMAP host name"),
+        (["a", "--host", HOST, "--user", "a b"], "not a mailbox login"),
+    ],
+)
+def test_add_refuses_a_bad_name_host_or_user(home, box, capsys, argv, said):
+    code = cli.main(["mail", "add", *argv, "--json"])
+    env = json.loads(capsys.readouterr().out)
+    assert code == 2 and env["error_kind"] == "usage" and said in env["message"]
+    assert not Path(profile.profile_path()).exists() and box.fake.log == []

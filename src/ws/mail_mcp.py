@@ -115,8 +115,8 @@ def _args(name: str, args: dict) -> dict:
     for key in schema["required"]:
         if args.get(key) is None:
             raise BadArguments(f"{key} is required")
-    for key, v in args.items():
-        want = schema["properties"][key]["type"]
+    for key, spec in schema["properties"].items():
+        v, want = args.get(key), spec["type"]
         if v is not None and not isinstance(v, bool if want == "boolean" else str):
             raise BadArguments(f"{key} must be {'true or false' if want == 'boolean' else 'a string'}")
     return args

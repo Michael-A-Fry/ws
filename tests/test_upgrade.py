@@ -545,7 +545,9 @@ def _stub_installer(tmp_path: Path, home: Path) -> Path:
         encoding="utf-8",
     )
     script = tmp_path / "install.sh"
-    script.write_text(f"#!/usr/bin/env bash\nset -e\n{shlex.quote(sys.executable)} -I {shlex.quote(str(builder))}\n")
+    script.write_text(
+        f"#!/usr/bin/env bash\nset -e\necho installer says hello\n{shlex.quote(sys.executable)} -I {shlex.quote(str(builder))}\n"
+    )
     return py
 
 
@@ -961,13 +963,13 @@ def test_the_watchdog_stops_a_step_that_hangs():
     import time
 
     t = time.monotonic()
-    assert upgrade._run([sys.executable, "-c", "import time; time.sleep(600)"], False, timeout=1) == (
+    assert upgrade._run([sys.executable, "-c", "import time; time.sleep(600)"], False, timeout=1)[:2] == (
         upgrade.EXIT_TIMEOUT,
         True,
     )
     assert time.monotonic() - t < 20  # the step sleeps 600 s: back inside 20 s means the watchdog fired
-    assert upgrade._run([sys.executable, "-c", "raise SystemExit(3)"], False, timeout=30) == (3, False)
-    assert upgrade._run([sys.executable, "-c", "raise SystemExit(124)"], False, timeout=30) == (124, False)
+    assert upgrade._run([sys.executable, "-c", "raise SystemExit(3)"], False, timeout=30)[:2] == (3, False)
+    assert upgrade._run([sys.executable, "-c", "raise SystemExit(124)"], False, timeout=30)[:2] == (124, False)
 
 
 def test_the_installer_gets_its_own_longer_limit(tmp_path, monkeypatch):
@@ -1072,3 +1074,66 @@ def test_a_failed_rollback_does_not_hide_the_release_to_go_back_to(old):
     assert upgrade.previous_release(os.environ) == "1.0.0"
     upgrade.record(os.environ, "rollback", "2.0.0", "1.0.0")
     assert upgrade.previous_release(os.environ) is None
+
+
+# --- the upgrade log (C650) --------------------------------------------------------------------------------------------
+
+
+def _log() -> list[dict]:
+    path = upgrade.log_path(os.environ)
+    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+
+def test_a_stub_upgrade_leaves_one_log_line_per_step(old, tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(selfcmd, "unstable", lambda cmd=None: None)
+    new_python = _stub_installer(tmp_path, old)
+    monkeypatch.setenv("STUB_WS_OUT", str(tmp_path / "calls.jsonl"))
+    assert cli.main(["upgrade", "--installer", str(tmp_path / "install.sh"), "--check", "echo check output"]) == 0
+    out = capsys.readouterr().out
+    assert "installer says hello" in out  # streamed to the terminal as before
+    log = _log()
+    assert [(d["verb"], d["step"], d["exit"]) for d in log] == [
+        ("upgrade", "installer", 0),
+        ("upgrade", "hooks", 0),
+        ("upgrade", "check", 0),
+    ]
+    assert log[0]["tail"] == ["installer says hello"] and log[0]["python"] == "bash"
+    assert log[1]["python"] == str(new_python) and log[1]["version"] == "9.9.9"
+    assert log[2]["tail"] == []  # the check is the person's own command: its output is not kept
+    for d in log:
+        assert d["schema"] == upgrade.LOG_SCHEMA and d["ts"] and isinstance(d["seconds"], float)
+        assert d["dry_run"] is False and d["timed_out"] is False
+
+
+def test_the_tail_keeps_the_last_lines_only(tmp_path):
+    prog = "import sys\nfor i in range(50): print(f'line {i}')\nsys.exit(3)"
+    ran = upgrade._run([sys.executable, "-c", prog], False, timeout=30)
+    assert ran.code == 3 and ran.tail == tuple(f"line {i}" for i in range(30, 50))
+
+
+def test_hooks_only_dry_run_and_rollback_dry_run_each_log_a_line(old, capsys):
+    assert upgrade_hooks(capsys)[0] == 0
+    assert cli.main(["upgrade", "--dry-run"]) == 0
+    assert cli.main(["upgrade", "--rollback", "--version", "0.0.1", "--dry-run"]) == 0
+    got = [(d["verb"], d["step"], d["dry_run"]) for d in _log()]
+    assert got == [("hooks-only", "hooks", False), ("upgrade", "hooks", True), ("rollback", "plan", True)]
+    assert any("): made" in line for line in _log()[0]["tail"])
+    assert _log()[0]["python"] == sys.executable and _log()[0]["version"] == __version__
+
+
+def test_a_hooks_step_under_an_upgrade_leaves_the_line_to_the_parent(old, capsys, monkeypatch):
+    monkeypatch.setenv(upgrade.STEP_ENV, "1")
+    assert upgrade_hooks(capsys)[0] == 0
+    assert _log() == []
+
+
+def test_a_log_that_cannot_be_written_is_said_and_never_fails_the_upgrade(old, capsys):
+    logs = upgrade.log_path(os.environ).parent
+    logs.parent.mkdir(parents=True, exist_ok=True)
+    if logs.is_dir():
+        import shutil
+
+        shutil.rmtree(logs)
+    logs.write_text("not a folder")
+    code, _, err = upgrade_hooks(capsys)
+    assert code == 0 and "could not write" in err and "the upgrade goes on" in err

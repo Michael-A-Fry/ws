@@ -60,7 +60,10 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import urllib.request
+from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -73,6 +76,10 @@ COMMAND = "upgrade"
 EXIT_FAILED, EXIT_REFUSED, EXIT_NOT_RESTORED = 1, 3, 4
 EXIT_TIMEOUT = 124  # a step the watchdog stopped (the shell's own code for a timeout)
 HISTORY_SCHEMA = 1  # of a line in upgrade-history.jsonl
+LOG_SCHEMA = 1  # of a line in logs/upgrade.jsonl
+TAIL_LINES, _TAIL_WIDTH = 20, 500  # of each step's output, kept for the log
+_TAIL_STEPS = ("installer", "hooks")  # the steps whose output the log keeps
+STEP_ENV = "WS_UPGRADE_STEP"  # set for each step the upgrade runs: a hooks rewrite there leaves the log line to it
 INSTALL_TIMEOUT_S, STEP_TIMEOUT_S = 600.0, 120.0  # the watchdog per step: the installer, then the hooks and the check
 INSTALLER_URL = "https://raw.githubusercontent.com/Michael-A-Fry/ws/main/install.sh"
 _DOWNLOAD_LIMIT = 1 << 20  # bytes: install.sh is about 40 KB
@@ -220,10 +227,12 @@ def fetch_installer(dest: Path) -> Path:
 
 
 class Ran(NamedTuple):
-    """How one step ended: its exit code, and whether the watchdog stopped it (then `code` is EXIT_TIMEOUT)."""
+    """How one step ended: its exit code, whether the watchdog stopped it (then `code` is EXIT_TIMEOUT), and the last
+    lines it printed (for the log)."""
 
     code: int
     timed_out: bool = False
+    tail: tuple[str, ...] = ()
 
 
 def _signal_group(p: subprocess.Popen, hard: bool) -> None:
@@ -239,25 +248,25 @@ def _signal_group(p: subprocess.Popen, hard: bool) -> None:
         pass
 
 
-def _stop(p: subprocess.Popen) -> None:
+def _stop(p: subprocess.Popen, drained: bool = False) -> None:
     """Stop a step and everything it started: TERM, a bounded grace, then KILL to the whole group. The KILL is sent even
     when the step itself has gone, because a child that ignores TERM, or that the TERM did not stop, outlives it. A
     process that left the group and still holds the pipe cannot hang this: the pipes are closed and the step is left to
-    the kernel."""
+    the kernel. `drained`: a thread of the caller reads the pipe, so this only waits (reading it here too would race,
+    and closing it under a blocked read would hang)."""
+
+    def settle() -> bool:
+        try:
+            p.wait(timeout=10) if drained else p.communicate(timeout=10)
+            return True
+        except subprocess.TimeoutExpired:
+            return False
+
     _signal_group(p, hard=False)
-    try:
-        p.communicate(timeout=10)
-        reaped = True
-    except subprocess.TimeoutExpired:
-        reaped = False
+    reaped = settle()
     _signal_group(p, hard=True)
-    if reaped:
+    if reaped or settle() or drained:
         return
-    try:
-        p.communicate(timeout=10)
-        return
-    except subprocess.TimeoutExpired:
-        pass
     for f in (p.stdout, p.stderr):
         if f is not None:
             f.close()
@@ -267,22 +276,91 @@ def _stop(p: subprocess.Popen) -> None:
         pass
 
 
-def _run(argv: list[str], capture: bool, timeout: float | None = None) -> Ran:
-    """Run a command with the person's terminal (stdout and stderr captured and passed to stderr under `--json`). A run
-    that is still going after `timeout` seconds is stopped with every process it started: the watchdog of one step."""
-    kw = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE, "text": True} if capture else {}
-    p = subprocess.Popen(argv, start_new_session=True, **kw)  # its own group, so the watchdog can stop all of it
+def _pump(src, dest, tail: deque[str]) -> None:
+    """Pass each line of a step's output on as it arrives, and keep the last few for the log."""
     try:
-        out, err = p.communicate(timeout=timeout)
+        for raw in iter(src.readline, b""):
+            line = raw.decode("utf-8", "replace")
+            tail.append(line.rstrip("\n")[:_TAIL_WIDTH])
+            try:
+                dest.write(line)
+                dest.flush()
+            except (OSError, ValueError):
+                pass
+    except (OSError, ValueError):
+        pass
+
+
+def _run(argv: list[str], capture: bool, timeout: float | None = None) -> Ran:
+    """Run a step: its stdin is the person's terminal, and its output (stdout and stderr, as one stream) is passed on line
+    by line as it comes, to stdout, or to stderr under `--json`; the last `TAIL_LINES` lines come back in `Ran.tail` for
+    the log. A run that is still going after `timeout` seconds is stopped with every process it started: the watchdog of
+    one step. The step is told it runs under the upgrade (`STEP_ENV`), so a hooks rewrite leaves the log line to it."""
+    p = subprocess.Popen(
+        argv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env={**os.environ, STEP_ENV: "1"},
+        start_new_session=True,  # its own group, so the watchdog can stop all of it
+    )
+    tail: deque[str] = deque(maxlen=TAIL_LINES)
+    pump = threading.Thread(target=_pump, args=(p.stdout, sys.stderr if capture else sys.stdout, tail), daemon=True)
+    pump.start()
+    try:
+        p.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
-        _stop(p)
-        return Ran(EXIT_TIMEOUT, timed_out=True)
+        _stop(p, drained=True)
+        pump.join(timeout=2)
+        return Ran(EXIT_TIMEOUT, timed_out=True, tail=tuple(tail))
     except BaseException:  # Ctrl-C reaches ws, not the step's own session: stop the step too
-        _stop(p)
+        _stop(p, drained=True)
         raise
-    if capture:
-        sys.stderr.write((out or "") + (err or ""))
-    return Ran(p.returncode)
+    pump.join(timeout=10)  # a child that left the group may hold the pipe: the step's own exit is what counts
+    return Ran(p.returncode, tail=tuple(tail))
+
+
+def log_path(env: Mapping[str, str]) -> Path:
+    return paths.state_dir(dict(env)) / "logs" / "upgrade.jsonl"
+
+
+def log_step(
+    args: argparse.Namespace,
+    env: Mapping[str, str],
+    step: str,
+    ran: Ran,
+    seconds: float,
+    python: str | None = None,
+    version: str | None = None,
+) -> None:
+    """One line in `<state>/logs/upgrade.jsonl` for one step of one run: what ran, with which Python and ws, how it ended,
+    and the last lines it printed. Not rotated: a few lines per upgrade. A line that cannot be written is said once and
+    never stops the upgrade (C650)."""
+    rec = {
+        "verb": getattr(args, "log_verb", None) or "upgrade",
+        "dry_run": bool(getattr(args, "dry_run", False)),
+        "step": step,
+        "python": python,
+        "version": version,
+        "exit": ran.code,
+        "timed_out": ran.timed_out,
+        "seconds": round(seconds, 3),
+        "tail": list(ran.tail),
+    }
+    try:
+        jsonl.append_plain(log_path(env), jsonl.stamped(rec, LOG_SCHEMA))
+    except (OSError, ValueError) as e:
+        if not getattr(args, "log_warned", False):
+            args.log_warned = True
+            print(f"ws: could not write {log_path(env)} ({type(e).__name__}); the upgrade goes on", file=sys.stderr)
+
+
+def _step(args: argparse.Namespace, step: str, argv: list[str], timeout: float, version: str | None = None) -> Ran:
+    """Run one step under its watchdog and log how it went."""
+    t = time.monotonic()
+    ran = _run(argv, args.json, timeout)
+    kept = ran if step in _TAIL_STEPS else ran._replace(tail=())  # a check is the person's own: its output stays theirs
+    log_step(args, os.environ, step, kept, time.monotonic() - t, argv[0] if argv else None, version)
+    return ran
 
 
 def _step_limit(args: argparse.Namespace) -> float:
@@ -387,7 +465,7 @@ def swap(args: argparse.Namespace, scratch: Path) -> Ran:
     if not script.is_file():
         raise WsError("failed", f"{script} is not a file", "pass --installer with a copy of install.sh")
     limit = getattr(args, "install_timeout", None) or INSTALL_TIMEOUT_S
-    return _run(_installer_argv(script, args), args.json, limit)
+    return _step(args, "installer", _installer_argv(script, args), limit)
 
 
 # ---- history, health check, rollback ----------------------------------------------------------------------------------------
@@ -447,7 +525,7 @@ def reinstall(args: argparse.Namespace, env: Mapping[str, str], version: str) ->
         return ran
     new = installed_ws(env)
     _using(ns, new)
-    return _run(_hooks_argv(new), args.json, _step_limit(args))
+    return _step(ns, "hooks", _hooks_argv(new), _step_limit(args), new.version)
 
 
 # ---- the command ------------------------------------------------------------------------------------------------------------
@@ -462,7 +540,29 @@ def _skipped_line(sk: install.Skipped) -> str:
     return f"{sk.runner}: not rewritten, left as it was: {sk.reason}" + (f". {sk.hint}" if sk.hint else "")
 
 
-def _hooks_only(args: argparse.Namespace, env: Mapping[str, str]) -> int:
+def _hooks_logged(args: argparse.Namespace, env: Mapping[str, str]) -> int:
+    """The hooks rewrite in this process, with its log line; under a parent upgrade (`STEP_ENV`) the parent logs it."""
+    if env.get(STEP_ENV):
+        return _hooks_only(args, env, [])
+    said: list[str] = []
+    t, code = time.monotonic(), EXIT_FAILED
+    try:
+        code = _hooks_only(args, env, said)
+        return code
+    except WsError as e:
+        code = e.exit_code
+        said.append(e.message)
+        raise
+    finally:
+        ran = Ran(code, tail=tuple(line[:_TAIL_WIDTH] for line in said[-TAIL_LINES:]))
+        log_step(args, env, "hooks", ran, time.monotonic() - t, sys.executable, __version__)
+
+
+def _hooks_only(args: argparse.Namespace, env: Mapping[str, str], said: list[str]) -> int:
+    def say(line: str, err: bool = False) -> None:
+        said.append(line)
+        print(line, file=sys.stderr if err else sys.stdout)
+
     try:
         result = rewrite(env, dry_run=args.dry_run)
     except (install.InstallError, OSError) as e:
@@ -481,23 +581,23 @@ def _hooks_only(args: argparse.Namespace, env: Mapping[str, str]) -> int:
         )
         return EXIT_FAILED if left else 0
     for note in result.notes:
-        print(f"ws: {note}")
+        say(f"ws: {note}")
     verb = "would remove" if args.dry_run else "removed"
     for path in result.removed:
-        print(f"ws: {verb} {path} (an older OpenCode plugin that ws put there and had withdrawn)")
+        say(f"ws: {verb} {path} (an older OpenCode plugin that ws put there and had withdrawn)")
     verb = "would make" if args.dry_run else "made"
-    print(
+    say(
         f"ws {__version__} ({sys.executable}): {verb} {result.summary()}"
         if result.changes
         else f"ws {__version__} ({sys.executable}): hooks are current ({result.summary()})"
     )
     for sk in result.skipped:
-        print(f"ws: {_skipped_line(sk)}")
+        say(f"ws: {_skipped_line(sk)}")
     if left:
-        print(
+        say(
             f"ws: the hooks in {', '.join(left)} could not be rewritten this run. Do what is named above, "
             "then run `ws upgrade --hooks-only` again",
-            file=sys.stderr,
+            err=True,
         )
         return EXIT_FAILED
     return 0
@@ -507,7 +607,7 @@ def _both(args: argparse.Namespace, env: Mapping[str, str]) -> int:
     before = __version__
     if args.dry_run:
         _say(args, "would run the installer, then `ws upgrade --hooks-only` with the new ws")
-        return _hooks_only(args, env)
+        return _hooks_logged(args, env)
     tree = selfcmd.unstable()
     if tree:
         raise WsError(
@@ -527,7 +627,7 @@ def _both(args: argparse.Namespace, env: Mapping[str, str]) -> int:
         return code or EXIT_FAILED
     new = installed_ws(env)
     _using(args, new)
-    ran = _run(_hooks_argv(new), args.json, _step_limit(args))
+    ran = _step(args, "hooks", _hooks_argv(new), _step_limit(args), new.version)
     if ran.timed_out:
         return _auto_rollback(args, env, before, "the hooks rewrite ran past its time limit")
     code = ran.code
@@ -550,9 +650,10 @@ def _both(args: argparse.Namespace, env: Mapping[str, str]) -> int:
     if check:
         _say(args, f"checking the new release: {check}")
         try:
-            ran = _run(shlex.split(check), args.json, _step_limit(args))
+            ran = _step(args, "check", shlex.split(check), _step_limit(args))
         except (OSError, ValueError) as e:
             ran = Ran(EXIT_FAILED)
+            log_step(args, env, "check", ran, 0.0)
             _say(args, f"the check could not start ({type(e).__name__})")
         if ran.code != 0:
             why = "the check ran past its time limit" if ran.timed_out else f"the check failed (exit {ran.code})"
@@ -568,6 +669,7 @@ def _both(args: argparse.Namespace, env: Mapping[str, str]) -> int:
 def _auto_rollback(args: argparse.Namespace, env: Mapping[str, str], before: str, why: str) -> int:
     """A cut-over step went wrong after the swap began: put `before` back at once."""
     _say(args, f"{why}; going back to ws {before}")
+    args.log_verb = "auto-rollback"
     code = reinstall(args, env, before).code
     record(env, "auto-rollback", before, before if code == 0 else None)
     if code != 0:
@@ -588,7 +690,9 @@ def _rollback(args: argparse.Namespace, env: Mapping[str, str]) -> int:
         )
     before = __version__
     if args.dry_run:
-        _say(args, f"would reinstall ws {target} (now {before}) and rewrite the hooks for it")
+        line = f"would reinstall ws {target} (now {before}) and rewrite the hooks for it"
+        _say(args, line)
+        log_step(args, env, "plan", Ran(0, tail=(f"ws: {line}",)), 0.0, sys.executable, __version__)
         return 0
     tree = selfcmd.unstable()
     if tree:
@@ -622,9 +726,12 @@ def cmd_upgrade(args: argparse.Namespace) -> int:
     if why:
         raise WsError("refused", why, "run `ws upgrade` yourself, in a terminal of your own", EXIT_REFUSED)
     if args.hooks_only:
-        return _hooks_only(args, env)
+        args.log_verb = "hooks-only"
+        return _hooks_logged(args, env)
     if getattr(args, "rollback", False):
+        args.log_verb = "rollback"
         return _rollback(args, env)
+    args.log_verb = "upgrade"
     return _both(args, env)
 
 

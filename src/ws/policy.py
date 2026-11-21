@@ -2341,11 +2341,16 @@ def _segment_once(
         ctx.vars = {**(ctx.vars or {}), words[1]: words[-1]}  # what the variable holds once the loop is done
     nested: list[str] = []
     dropped: list[str] = []
-    toks, wrappers = shellwords.strip_wrappers(words, lexenv=env, budget=ctx.budget, dropped=dropped, scripts=nested)
-    held = _targets(toks) & (set(ctx.vars or {}) | set(ctx.loops or {}) | set(ctx.unknown))
-    if held:  # read X / let X=.. after X held a value: which value it has now isn't followed
+    set_env: list[str] = []  # the NAME=value words set for the command: a prefix, `env`, an `env -S` string
+    toks, wrappers = shellwords.strip_wrappers(
+        words, set_env, lexenv=env, budget=ctx.budget, dropped=dropped, scripts=nested
+    )
+    held = _targets(toks) & (set(ctx.vars or {}) | set(ctx.loops or {}) | set(ctx.unknown) | _SSH_ENV)
+    if held:  # read X / let X=.. after X held a value (or set ssh's askpass): which value it has now isn't followed
         _mark_names(ctx, held)
-    if toks and toks[0] in _DECLARERS:  # export X=/ ; declare -x X=/ ; local X=/
+    if toks and toks[0] in _DECLARERS and any(_HAS_PART.search(w) and not shellwords.ASSIGN.match(w) for w in toks[1:]):
+        _distrust(ctx, folders=True)  # export ${A}=x ; export $(cat env): a name ws cannot read, so any variable
+    elif toks and toks[0] in _DECLARERS:  # export X=/ ; declare -x X=/ ; local X=/
         _assign(ctx, _settled(ctx, env, dict(w.split("=", 1) for w in toks[1:] if shellwords.ASSIGN.match(w))))
     elif toks and toks[0] == "read":  # read -r X <<< /
         _assign(ctx, _read_values(toks, redirs))
@@ -2386,6 +2391,26 @@ def _segment_once(
         admin = _ws_admin(canon, "xargs" in wrappers) or (_ws_admin(unglued) if unglued else None)
     if admin:
         return admin, line, []
+    local_seg = seg  # the part of the line that runs here
+    ssh_toks, ssh_prefix, ssh_why = _ssh_toks(cmd, toks, env, ctx.budget)
+    if ssh_why:
+        return ssh_why, line, []
+    if ssh_toks is not None:
+        ssh_opts, ssh_host, ssh_remote = _ssh_argv(ssh_toks)
+        if reason := _ssh_refusal(policy, ctx, ssh_opts, [*set_env, *ssh_prefix], ssh_host):
+            return reason, line, []
+        # a PATH set for the line may make `ssh` another program: its remote command is not read as remote
+        path_set = any(_SETS_PATH.match(w) for w in [*set_env, *ssh_prefix]) or "PATH" in (ctx.vars or {})
+        path_set = path_set or "PATH" in ctx.unknown or ctx.distrust
+        cut, here = _ssh_remote(
+            policy, seg, ssh_opts, ssh_host, ssh_remote, wrappers | ({cmd} - {"ssh"}), redirs, strict=path_set
+        )
+        if here:  # a remote command to this machine runs outside the wall: judged as the local command it is
+            nested.append(" ".join(ssh_remote))
+        if cut is not None:  # a single-quoted remote command to a named host: its words are not local file words
+            local_seg, toks = seg[:cut], toks[:-1]
+            lexed = shellwords.lex(local_seg, env, ctx.budget)
+            redirs = lexed.redirs
     nested += _arith_scripts(ctx, cmd, flags, toks, words)
     if cmd == "eval":
         text = " ".join(toks[1:])
@@ -2456,7 +2481,7 @@ def _segment_once(
             ),
         ]
         if env_u is not None:  # the same line with each default left as written
-            checks.append(lambda: _unknown_unread(policy, ctx, seg, env_u))
+            checks.append(lambda: _unknown_unread(policy, ctx, local_seg, env_u))
         for check in checks:
             reason = check()
             if not reason:
@@ -2579,10 +2604,254 @@ _FILE_FLAGS = {  # address commands: the options that name a file (their positio
     "curl": ("TK", ("--upload-file", "--config")),
     "wget": ("i", ("--input-file", "--post-file")),
     "sftp": ("bF", ()),
-    "ssh": ("iF", ()),
+    "ssh": ("iFEIS", ()),
     "ftp": ("", ()),
     "rclone": ("", ("--config", "--files-from", "--filter-from", "--include-from", "--exclude-from")),
 }
+
+
+# --- ssh: the options that run or load local files, and a remote command that is remote ------------------------------
+#
+# ssh runs some of its own options on this machine: a proxy or local command, a known-hosts command, a `Match exec`, a
+# PKCS#11 or security-key library, an askpass program, a config file (which can hold any of those). The gate cannot read
+# what they run, so they are refused (fail closed): an `-o` keyword is allowed only when it is on the list below. The
+# files ssh reads for a key or a known-hosts list are judged as reads. ssh(1) reads options before the host and again
+# right after it, with the value letters `_SSH_VALUE`; what follows is the remote command.
+#
+# The remote command runs on the far host, so a `$VAR`, a loop or a `$(...)` in it is not a local word. It is read as
+# remote only when it is one word written wholly in single quotes (the local shell expands nothing in it), the host is
+# one the policy names (`[gate] allow_hosts`, a class's `allowed_hosts`), the host is not this machine (loopback, its own
+# name), and nothing else on the line is refused. A remote command to this machine is judged as the local command it is.
+# Escape characters (`~C`, `~!`) need an interactive terminal, which an agent's shell call does not have: out of scope.
+_SSH_VALUE = "BbcDEeFIiJLlmOoPpQRSWw"
+_SSH_FILE_KEYS = frozenset(
+    ("identityfile", "certificatefile", "userknownhostsfile", "globalknownhostsfile", "revokedhostkeys")
+)
+_SSH_PLAIN = (  # ssh_config(5) keywords that run nothing on this machine (lower case: ssh ignores case)
+    "addkeystoagent addressfamily batchmode bindaddress bindinterface canonicaldomains canonicalizefallbacklocal "
+    "canonicalizehostname canonicalizemaxdots canonicalizepermittedcnames casignaturealgorithms channeltimeout "
+    "checkhostip ciphers clearallforwardings compression connectionattempts connecttimeout controlpersist "
+    "dynamicforward enableescapecommandline escapechar exitonforwardfailure fingerprinthash "
+    "forkafterauthentication forwardagent forwardx11 forwardx11timeout forwardx11trusted gatewayports "
+    "gssapiauthentication gssapidelegatecredentials hashknownhosts hostbasedacceptedalgorithms "
+    "hostbasedauthentication hostkeyalgorithms hostkeyalias hostname identitiesonly ignoreunknown ipqos "
+    "kbdinteractiveauthentication kbdinteractivedevices kexalgorithms localforward loglevel logverbose macs "
+    "nohostauthenticationforlocalhost numberofpasswordprompts obscurekeystroketiming passwordauthentication "
+    "permitremoteopen port preferredauthentications proxyjump proxyusefdpass pubkeyacceptedalgorithms "
+    "pubkeyauthentication rekeylimit remoteforward requesttty requiredrsasize serveralivecountmax "
+    "serveraliveinterval sessiontype stdinnull streamlocalbindmask streamlocalbindunlink stricthostkeychecking "
+    "syslogfacility tag tcpkeepalive tunnel tunneldevice updatehostkeys user verifyhostkeydns visualhostkey"
+)
+_SSH_KEYS = frozenset((*_SSH_FILE_KEYS, *_SSH_PLAIN.split()))
+_SSH_OPTION = re.compile(r"\s*([A-Za-z0-9]+)\s*(?:=\s*|\s+|\Z)(.*)", re.DOTALL)
+_SSH_PLAIN_HOST = re.compile(r"[A-Za-z0-9._:%\[\]@-]+")  # what a host, user@host or [v6]:port is written with
+_SSH_JUMPS = re.compile(r"[A-Za-z0-9._:%\[\]@,-]+")  # a comma list of them, for -J and ProxyJump
+_SETS_PATH = re.compile(r"PATH(?![A-Za-z0-9_])")
+_SSH_NAMES = frozenset(("ssh", "slogin"))  # slogin is ssh under another name
+_SSH_ENV = frozenset(("SSH_ASKPASS", "SSH_ASKPASS_REQUIRE"))  # an askpass setting: a program ssh runs
+_SSH_ASKPASS = re.compile(r"SSH_ASKPASS")  # any word that sets an askpass name, however it is spelled
+_SSH_HOST = re.compile(r"(?:ssh://)?(?:[^@/]*@)?(\[[^\]]*\]|[^:/]*)")
+_SSH_RENAMES = re.compile(
+    r"\s*canonicali[sz]ehostname|\s*canonicaldomains", re.IGNORECASE
+)  # the host may become another
+_SSH_WRAPPERS = {"autossh": "M", "sshpass": "pfdP"}  # programs that run ssh, and their own options that take a value
+_SINGLE_QUOTED_END = re.compile(r"(?:\A|[ \t])'([^']*)'[ \t]*\Z")  # a last word written wholly in single quotes
+
+
+def _ssh_argv(toks: list[str]) -> tuple[list[tuple[str, str]], str | None, list[str]]:
+    """ssh's options as (letter, value), its host and the words of its remote command, read as ssh(1) reads them."""
+    opts: list[tuple[str, str]] = []
+    host: str | None = None
+    i, n = 1, len(toks)
+    while i < n:
+        t = toks[i]
+        if t == "--":
+            if host is None and i + 1 < n:
+                host, i = toks[i + 1], i + 1
+            i += 1
+            break
+        if t.startswith("-") and len(t) > 1:
+            for k, c in enumerate(t[1:], 1):
+                if c in _SSH_VALUE:
+                    if k + 1 < len(t):
+                        opts.append((c, t[k + 1 :]))
+                    else:
+                        i += 1
+                        opts.append((c, toks[i] if i < n else ""))
+                    break
+                opts.append((c, ""))
+            i += 1
+        elif host is None:
+            host, i = t, i + 1
+        else:
+            break
+    return opts, host, toks[i:]
+
+
+def _ssh_host_name(word: str) -> str:
+    """The host an ssh destination names: `user@host`, `ssh://user@host:port/`, `[::1]`; lower case, no final dot."""
+    url = word.startswith("ssh://")
+    w = word[6:].partition("/")[0] if url else word
+    w = w.rpartition("@")[2]
+    if w.startswith("["):
+        w = w[1:].partition("]")[0]
+    elif url and w.count(":") == 1:
+        w = w.partition(":")[0]
+    return w.rstrip(".").lower()
+
+
+def _is_this_machine(name: str) -> bool:
+    """Whether an ssh host is (or may be) this machine: loopback, the unspecified address, or this machine's own name.
+    A name is compared by its first label, so the full and tailnet names count too. No lookup is made."""
+    import ipaddress
+    import socket
+
+    if not name or name in ("localhost", "ip6-localhost", "ip6-loopback") or name.endswith(".localhost"):
+        return True
+    try:
+        ip = ipaddress.ip_address(name)
+        ip = getattr(ip, "ipv4_mapped", None) or ip
+        return ip.is_loopback or ip.is_unspecified
+    except ValueError:
+        pass
+    if re.fullmatch(r"[0-9a-fx.]+", name):  # what the C library also reads as an address: 127.1, 0x7f.1, 2130706433
+        try:
+            if socket.inet_aton(name)[0] in (0, 127):
+                return True
+        except OSError:
+            pass
+    return name.split(".")[0] == socket.gethostname().lower().rstrip(".").split(".")[0]
+
+
+def _named_host(policy: Policy, name: str) -> bool:
+    """Whether the policy names this host: `[gate] allow_hosts` or a class's `allowed_hosts`, a port aside."""
+    entries = (*policy.gate.allow_hosts, *(h for c in policy.classes.values() for h in c.allowed_hosts))
+    for entry in entries:
+        e = entry.partition(":")[0].lower()
+        if name == e or (e.startswith("*.") and name.endswith(e[1:])):
+            return True
+    return False
+
+
+def _ssh_remote(
+    policy: Policy,
+    seg: str,
+    opts: list[tuple[str, str]],
+    host: str | None,
+    remote: list[str],
+    wrappers: set[str],
+    redirs: list[shellwords.Redirect],
+    strict: bool = False,
+) -> tuple[int | None, bool]:
+    """How an ssh line's remote command is judged: (where the line ends without it, when it is read as remote; whether
+    it runs on this machine, so it is judged as a local command too)."""
+    hosts = [
+        host or "",
+        *(
+            m.group(2).strip()
+            for o, v in opts
+            if o == "o" and (m := _SSH_OPTION.match(v)) and m.group(1).lower() == "hostname"
+        ),
+    ]
+    if any(_HAS_PART.search(h) for h in hosts):
+        return None, False
+    names = [_ssh_host_name(h) for h in hosts]
+    # a control socket (-S) reuses a connection opened earlier, to a host the name here doesn't say
+    if any(o == "S" for o, _ in opts) or any(_is_this_machine(n) for n in names):
+        return None, bool(remote)
+    if (
+        strict
+        or wrappers & {"xargs", *_SSH_WRAPPERS}
+        or len(remote) != 1
+        or redirs
+        or any(_SSH_RENAMES.match(v) for o, v in opts if o == "o")
+    ):
+        return None, False
+    m = _SINGLE_QUOTED_END.search(seg)
+    # with no redirect, here-string or here-document anywhere on the line, the last word of the text is the last word
+    # the lexer gave, which is the remote command: a match of the text alone would also take a redirect's target
+    if not m or m.group(1) != remote[0] or re.search(r"[<>]", seg[: m.start(1)]):
+        return None, False
+    return (m.start(1) - 1, False) if all(_named_host(policy, n) for n in names) else (None, False)
+
+
+def _ssh_toks(
+    cmd: str, toks: list[str], env, budget: shellwords.Budget
+) -> tuple[list[str] | None, list[str], str | None]:
+    """ssh's words when this command runs ssh (ssh itself, `autossh` with its own `-M` taken off, or the ssh `sshpass`
+    runs, wrappers and all), the words a wrapper set ahead of it, and a refusal for an sshpass whose program is not an
+    ssh ws can read. (None, [], None) for any other command."""
+    if cmd in _SSH_NAMES:
+        return toks, [], None
+    if cmd not in _SSH_WRAPPERS:
+        return None, [], None
+    own, i = _SSH_WRAPPERS[cmd], 1
+    out: list[str] = []
+    while i < len(toks) and toks[i].startswith("-") and len(toks[i]) > 1:  # getopt: `-vp pw`, `-ppw`, `-e`
+        t = toks[i]
+        i += 1
+        if t == "--":
+            break
+        k = next((k for k, c in enumerate(t[1:], 1) if c in own), 0)
+        if k and k + 1 == len(t):
+            i += 1  # the value is the next word
+        if cmd == "autossh" and not k:
+            out.append(t)  # an ssh option: autossh passes it on
+    if cmd == "autossh":
+        return ["ssh", *out, *toks[i:]], [], None
+    rest = toks[i:]
+    assigns: list[str] = []  # what a wrapper sets for the program, `env -S` strings included
+    inner = shellwords.strip_wrappers(rest, assigns, lexenv=env, budget=budget, scripts=[])[0] if rest else []
+    if inner and inner[0] in _SSH_NAMES:
+        return inner, [*assigns, *rest[: max(0, len(rest) - len(inner))]], None
+    return None, [], "sshpass runs a program ws does not read here; run ssh under sshpass directly, or use a key"
+
+
+def _ssh_refusal(
+    policy: Policy, ctx: _Ctx, opts: list[tuple[str, str]], prefix: list[str], host: str | None = None
+) -> str | None:
+    """A refusal for an ssh option that runs or loads a local program or file, names a path deny_read covers, or
+    writes to a path ws protects."""
+    how = "; connect without it (put what it is for in a script file and run that)"
+    held = bool(_SSH_ENV & (set(ctx.vars or {}) | set(ctx.unknown))) or ctx.distrust
+    if held or any(_SSH_ASKPASS.match(w) for w in prefix):
+        return f"ssh may be given an askpass program, which runs on this machine and ws cannot read{how}"
+    # ssh writes a jump's host into the proxy command it starts here, so a host it is given is plain text or refused
+    hosts = [("-J", v, True) for o, v in opts if o == "J"]
+    for o, v in opts:
+        if o == "o" and (m := _SSH_OPTION.match(v)) and m.group(1).lower() in ("hostname", "proxyjump"):
+            hosts.append((m.group(1), m.group(2).strip(), m.group(1).lower() == "proxyjump"))
+    if any(jump for _, _, jump in hosts) and host is not None:
+        hosts.append(("the host", host, False))
+    for what, value, jump in hosts:
+        if not (_SSH_JUMPS if jump else _SSH_PLAIN_HOST).fullmatch(value):
+            return f"ssh {what} {value!r} holds characters a host name does not have, and ssh puts it in a local command{how}"
+    for letter, value in opts:
+        if letter == "F" and value not in ("none", "/dev/null"):
+            return f"ssh -F loads a config file, which can run local programs ws cannot read{how}"
+        if letter in "IE" and not (letter == "E" and value == "/dev/null"):
+            what = "loads a PKCS#11 library" if letter == "I" else "writes its log to a local file"
+            return f"ssh -{letter} {what}, which ws does not judge{how}"
+        if letter == "S" and any(o == "M" for o, _ in opts) and (hit := _under(ctx.protect, value, ctx.cwd)):
+            return f"command writes to {hit}, which ws protects (policy and generated gate)"  # -M opens the socket
+        files = [value] if letter in "iS" else []
+        if letter == "o":
+            m = _SSH_OPTION.match(value)
+            key = m.group(1).lower() if m else ""
+            if key not in _SSH_KEYS:
+                return f"ssh option {key or value!r} runs or loads a local program or file, or is not one ws knows{how}"
+            if key in _SSH_FILE_KEYS and re.search(r"[\"'\\]", m.group(2)):
+                return f"ssh is given a file list with quotes or a backslash, which ws does not split; {HOW_TO_SPELL}"
+            files = m.group(2).split() if key in _SSH_FILE_KEYS else []  # a list, for some
+        for f in files:
+            if _HAS_PART.search(f) or "%" in f:
+                return f"ssh is given the file {f!r}, which holds a part ws cannot read; {HOW_TO_SPELL}"
+            if rule := _read_hit(policy, f, ctx.cwd, expand=letter == "o"):
+                return f"command names a path denied by deny_read rule {rule!r}"
+            # ssh adds the host's key to its known-hosts file before it logs in: a write
+            if letter == "o" and key == "userknownhostsfile" and (hit := _under(ctx.protect, f, ctx.cwd)):
+                return f"command writes to {hit}, which ws protects (policy and generated gate)"
+    return None
 
 
 # --- a command the reader doesn't know, given a shell -----------------------------------------------------------------

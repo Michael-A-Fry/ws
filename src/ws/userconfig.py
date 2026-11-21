@@ -6,8 +6,8 @@ The promises, each pinned by a test:
 
 - Yours stays. Your hooks, permissions, env and keys ws does not use are never touched, and their order is kept, with
   one exception (the OpenCode rule order below). ws appends its items; it refuses, and changes nothing, when one of your
-  values would be overridden (an `env` key you set to another value, or `permissions.disableBypassPermissionsMode`
-  set to anything but "disable").
+  values would be overridden (an `env` key you set to another value). Bypass mode is yours: ws never writes
+  `permissions.disableBypassPermissionsMode` into your own file, and takes out the entry an earlier ws wrote there.
 - Before the first write the file's own bytes go to `backups/` in ws's state folder (mode 0600).
 - The manifest records the items ws added, as exact JSON, the items the release asked for (`wanted_ops`, so doctor can
   see a later release stop asking for one), and the hash of ws's last write.
@@ -85,6 +85,7 @@ class Merge:
     cmd: tuple = ()  # the argv that runs ws in the hooks (recorded, so doctor can see it still starts)
     inputs: str = ""  # a hash of the policy these ops were built from (see `policy_digest`)
     widened: tuple = ()  # the wall-widening settings of yours that you chose to keep (recorded as `widened_by_user`)
+    note: str = ""  # one line `apply` hands back when it writes: what ws left as it was
 
 
 @dataclass(frozen=True)
@@ -695,6 +696,9 @@ def plan(
         ops = _claude_ops(
             _tune(adapter.generate(pol, cmd, out, policy_file, protect=protect, user_scope=True, pin=pin), notice)
         )
+        # bypass mode is yours to set in your own file: the launch settings and a class's managed file hold it off, and
+        # an upgrade must not turn it off here (an earlier ws did, and the swap below takes that old entry out again)
+        ops = [op for op in ops if tuple(op["path"]) != ("permissions", wallsettings.BYPASS_KEY)]
         # a switch of yours that ws would set back (the sandbox off) is left as you have it, once you've agreed to keep it
         own = {w.path for w in widened if not w.item}
         ops = [op for op in ops if tuple(op["path"]) not in own]
@@ -704,7 +708,8 @@ def plan(
         ops = _asks_yours_would_override(_opencode_ops(files), where, entry)
         copies[plug] = files[adapter.PLUGIN]
     kept = tuple(sorted({w.label for w in widened}))
-    return GatePlan(files, Merge(runner, where, tuple(ops), backup, tuple(cmd), digest, kept), copies)
+    note = f"{where}: left `permissions.{wallsettings.BYPASS_KEY}` as it was" if runner == "claude-code" else ""
+    return GatePlan(files, Merge(runner, where, tuple(ops), backup, tuple(cmd), digest, kept, note), copies)
 
 
 def withdrawal(runner: str, env: Mapping[str, str]) -> Merge:
@@ -967,7 +972,10 @@ def apply(m: Merge, entry: Mapping | None, env: Mapping[str, str], held: bool = 
         for _ in range(2):
             with contextlib.nullcontext() if held else _locked(m.path):
                 try:
-                    return _merge_once(m, entry, made_dirs, new_dirs)
+                    kept, out = _merge_once(m, entry, made_dirs, new_dirs)
+                    if m.note and kept is not None and not out.note:
+                        out.note = m.note
+                    return kept, out
                 except Changed:
                     continue
         raise WsError(

@@ -125,14 +125,15 @@ def test_install_class_warns_when_another_class_drop_in_is_in_place(box, capsys)
 def test_install_class_is_quiet_when_only_its_own_drop_in_is_in_place(box, capsys):
     put(box, "beta")
     assert cli.main(["install", "--class", "beta"]) == 0
-    assert capsys.readouterr().err == ""
+    err = capsys.readouterr().err
+    assert "class drop-ins for" not in err  # the host warnings (test_walls_on.py) may still be there
 
 
 def test_install_class_json_carries_the_warning(box, capsys):
     put(box, "alpha")
     assert cli.main(["install", "--class", "beta", "--json"]) == 0
     data = json.loads(capsys.readouterr().out)["data"]
-    assert data["writes"] is False and len(data["warnings"]) == 1 and "alpha" in data["warnings"][0]
+    assert data["writes"] is False and "alpha" in data["warnings"][0]  # the drop-in warning first, then the host's
 
 
 def test_the_drop_in_ws_renders_is_the_same_whatever_else_is_in_the_folder(box):

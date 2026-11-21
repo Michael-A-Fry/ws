@@ -9,6 +9,9 @@
     ws gate launch --runner R -- ARGV              start a runner inside the sandbox wall (ws.sandbox)
     ws gate serve                                  the resident gate that answers the hooks (ws.gateserve)
 
+A session in a walled or counts-only class, or in a folder no class names, may not call its runner's send-message tool
+(`message_wall`): it talks to other sessions through `ws msg` alone, on every route.
+
 Every generated hook runs the thin client (ws.gateclient), which asks the resident gate and, when that can't answer,
 runs `check` or `event` itself: `run_hook` is the one decision path they share. The order is fixed: the preflight, the
 policy's rules, the guards that are on (lowest PRIORITY first, see ws.guards), then `ask_commands`; the first refusal
@@ -42,6 +45,7 @@ import contextlib
 import fnmatch
 import hashlib
 import json
+import math
 import os
 import shlex
 import shutil
@@ -354,6 +358,36 @@ def _class_of_cwd(pol: policy.Policy, cwd: str) -> policy.Class | None:
     return policy.class_of(pol, os.path.realpath(cwd)) if cwd else policy.UNCLASSIFIED
 
 
+def message_wall(cls: policy.Class | None, calls: list[Call]) -> str | None:
+    """The message wall: a session in a walled or counts-only class, or in a folder no class names (unclassified, the
+    strictest: a walled repo's worktree outside its globs, or a new repo not yet in the policy), sends to another session
+    only through `ws msg`, so its runner's own send-message call is refused,
+    whatever the target and whatever route the runner would carry it on (a local socket, or a bridge to another machine).
+    The sender's call is the one place ws sees every route; a receiver refuses what reaches it only through its runner's
+    own setting (`crossSessionInbound`, written into a class's launch file). None when the call may go: a full class,
+    or a policy with no classes at all (`cls` None)."""
+    if cls is None or cls.access == "full":
+        return None
+    for call in calls:
+        if call.kind == "message":
+            tool = (call.data.get("tool") if call.data else None) or "the send-message tool"
+            return (
+                f"a session in the {cls.name} class ({cls.access}) sends to other sessions only through `ws msg`: "
+                f"{tool} is refused here, for every target and route"
+            )
+    return None
+
+
+def _message_class(pol: policy.Policy, cls: policy.Class | None) -> policy.Class | None:
+    """The class the message wall judges: the session's (`_class_of_session`), unless the session started in a folder no
+    class names. That start counts as unclassified (the strictest) here, so a session begun in a walled repo's worktree
+    or a new repo can't send by moving its working folder into a full class."""
+    if cls is None:
+        return None
+    start = _class_of_cwd(pol, _start_folder())
+    return start if start is policy.UNCLASSIFIED else cls
+
+
 def _class_of_session(pol: policy.Policy, cwd: str) -> policy.Class | None:
     """The class that decides where a call is logged and whether its payload is kept: the stricter of the class of the
     folder the payload says the call ran in (a model can point that elsewhere: OpenCode's `workdir`) and the class of the
@@ -498,7 +532,11 @@ def _check(
             _mark(layer, f"rule:{reason.kind}" if isinstance(reason, policy.Refusal) else f"rule:{call.kind}")
             return reason
     session, cwd = _text(payload, "session_id"), _text(payload, "cwd")
-    ctx = _context(runner, "pre", payload, clock, home, wall, _class_of_session(pol, cwd))
+    cls = _class_of_session(pol, cwd)
+    if why := message_wall(_message_class(pol, cls), calls):
+        _mark(layer, "rule:message_wall")
+        return why
+    ctx = _context(runner, "pre", payload, clock, home, wall, cls)
     stream = guards.stream(pol, "pre", readable, ctx, verdicts)
     try:
         for name, call, found in stream:
@@ -1048,6 +1086,16 @@ def _replay_lines(path: Path) -> list[str]:
     return lines
 
 
+def _budget_ms(text: str) -> float:
+    try:
+        x = float(text)
+    except ValueError:
+        x = math.nan
+    if not math.isfinite(x) or x <= 0:
+        raise argparse.ArgumentTypeError("must be a number of milliseconds above 0")
+    return x
+
+
 def cmd_replay(args: argparse.Namespace) -> int:
     from ws import gatecorpus
 
@@ -1094,7 +1142,8 @@ def _replay_corpus_cmd(args: argparse.Namespace, files: list[Path]) -> int:
         "now_pass": [r["id"] for r in ratchet],
     }
     if args.metrics:
-        data["metrics"] = gatecorpus.metrics(results)
+        budget = args.p95_budget_ms if args.p95_budget_ms is not None else gatecorpus.P95_BUDGET_MS
+        data["metrics"] = gatecorpus.metrics(results, budget)
     changes, unlisted, stale = None, [], []
     if args.diff:
         changes = gatecorpus.diff(gatecorpus.read_snapshot(Path(args.diff).expanduser(), args.runner), results)
@@ -1110,7 +1159,7 @@ def _replay_corpus_cmd(args: argparse.Namespace, files: list[Path]) -> int:
                 "io", f"cannot write {out} ({type(e).__name__})", "give a file in a folder that exists"
             ) from e
         data["saved"] = str(out)
-    failed = bool(bad or ratchet or unlisted or stale)
+    failed = bool(bad or ratchet or unlisted or stale or (args.metrics and data["metrics"]["over_budget"]))
     if args.json:
         data["results"] = results
         output.result(data, status=output.ATTENTION if failed else output.OK, kind="gate")
@@ -1248,6 +1297,10 @@ def register(sub) -> None:
     )
     common(r)
     r.add_argument("--metrics", action="store_true", help="a corpus: the confusion matrix, error rates and latency")
+    r.add_argument(
+        "--p95-budget-ms", type=_budget_ms, default=None, metavar="MS",
+        help="with --metrics: exit 1 when check()'s p95 is over MS (default gatecorpus.P95_BUDGET_MS, 50)",
+    )  # fmt: skip
     r.add_argument("--save", metavar="OUT.json", help="a corpus: write each row's decision and layer to OUT.json")
     r.add_argument(
         "--diff", metavar="OLD.json", help="a corpus: list each decision that changed since OLD.json was saved"

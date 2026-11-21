@@ -320,7 +320,7 @@ def test_the_words_a_wrapper_takes_for_itself_are_given_back():
 
 def test_assignments_a_wrapper_drops_are_collected():
     env: list[str] = []
-    sw.strip_wrappers(["A=1", "env", "B=2", "-i", "cmd"], env)
+    sw.strip_wrappers(["A=1", "env", "-i", "B=2", "cmd"], env)  # env's options come before its settings
     assert env == ["A=1", "B=2"]
 
 

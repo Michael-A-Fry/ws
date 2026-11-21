@@ -155,6 +155,8 @@ CASES: dict[str, list[str]] = {
     "ask.get": ["ask", "get", "nope"],
     "ask.answer": ["ask", "answer", "nope", "yes"],
     "ask.wait": ["ask", "wait", "nope"],
+    "cards.drop": ["cards", "drop", "done"],
+    "cards.take": ["cards", "take"],
     "ask.done": ["ask", "done", "nope"],
     "ask.withdraw": ["ask", "withdraw", "nope"],
     "ask.note": ["ask", "note", "nope", "x"],

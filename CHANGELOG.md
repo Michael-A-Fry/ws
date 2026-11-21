@@ -8,8 +8,31 @@ body of the GitHub release.
 
 ## [Unreleased]
 
+## [0.1.11.1] - 2026-11-21
+
+### Security
+
+- The gate's command reader reads more variable-setting forms ahead of a command, and env's and sudo's options, as
+  bash and GNU env do. A form it can't read for certain is refused, so the checks on the real command are no longer
+  skipped. (GHSA-w7j3-x774-963c)
+- The gate's command reader reads sudo's options as sudo does, and refuses a sudo form that runs a program named by
+  the environment, starts a shell it can't read, or changes folder. After `unset`, it no longer assumes the variable's
+  earlier value. (GHSA-24rx-q7mr-rr2v)
+
 ### Added
 
+- `ws install --class NAME` warns about the host (stderr, or `warnings` with `--json`): more than one class with an
+  `os_user`, a managed-settings file that binds your own sessions too, or a class repo under your own home. (#262)
+- `ws cards drop KIND` and `ws cards take`: fixed-kind cards go from a walled class's OS account to the lead's account
+  through a spool folder. A card's class comes from the file's OS owner, and any malformed card is refused. (#262)
+- A four-part version tag (`vX.Y.Z.N`) is a release tag in the release workflow, `install.sh` and the PyPI README
+  pin. (#263)
+- The message wall: the gate refuses a send-message call from a session in a walled or counts-only class, or in a
+  folder no class names, on every route (this machine or a Remote Control bridge). Such a session talks to others
+  through `ws msg`. `ws walls check` gains `no-message-crossings`, which fails on any such call a class's verdict
+  log shows allowed.
+- `ws gate replay --metrics` gives false blocks per 100 calls and exits 1 when check()'s p95 is over a budget
+  (`--p95-budget-ms`, default 50).
 - `ws queue report [--weekly] [--weeks N]`: a row a week of gate blocks, slot stalls and hand-offs, with the runs
   that finished and those killed by their own cap.
 - `ws queue slot` gives each session a share of a lane while another session waits (`--session`, else
@@ -36,6 +59,8 @@ body of the GitHub release.
 
 ### Changed
 
+- `inbound = "lead-only"` on a walled class lets the lead in and refuses every other sender; before, it refused the
+  lead as well. (#262)
 - A job timer with an API key or a local provider runs `ws queue tick JOB --slot schedule --run` in place of
   `ws run JOB`. The slot is worked out from the job's own schedule, the latest time at or before the fire, so a late
   catch-up fire gets the slot it was for. A job on a subscription login keeps `ws run JOB`, since the queue never runs
@@ -62,6 +87,13 @@ body of the GitHub release.
 
 ### Fixed
 
+- `ws install` and an upgrade no longer write `permissions.disableBypassPermissionsMode` into your own Claude Code
+  `settings.json`: your bypass setting stays as you have it, and `ws install` prints a line saying so. The entry release
+  0.1.11 wrote there comes out on the next `ws install`. The settings `ws gate launch` passes and a class's managed
+  file still hold bypass off.
+- The pre-push hook refuses a push that carries an unsigned commit (`git log --format='%G?'` shows `N`), before the
+  tests run, warns on a signature git can't check, and refuses a bad or revoked one or a push whose commits git can't
+  list. It does nothing when `CI` is set (one line goes in the skip log).
 - The gate: ssh options that run or load local files are now judged (an `-o` keyword ws doesn't know runs nothing
   here is refused, and so are `-F`, `-I`, `-E` and an askpass program), through any wrapper (`sudo`, `timeout`,
   `command`, a full path). Plain options (`-p`, `-l`, `-J`, `-o Port=...`) run as before.

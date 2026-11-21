@@ -18,6 +18,7 @@ below, and `python3 scripts/gen_code_map.py --check` (prek and CI) fails when it
 | `brand.py` | The ws look in one place: colour tokens by role, the mark, and the rule for when colour is on |
 | `broker.py` | The secrets broker: a small process that is not an LLM and holds the store, so agents never see... |
 | `canary.py` | `ws canary`: a few small checks that a runner's update did not break what ws relies on |
+| `cards.py` | `ws cards`: a walled class's account leaves a fixed-kind card (`done`, `counts`...) for the... |
 | `cli.py` | The `ws` command |
 | `commit_wall.py` | commit-wall: a commit hook that refuses a commit whose added lines or message hold a pattern you... |
 | `config_cmd.py` | `ws config`: every file ws reads, where its path came from, and the keys it sets |

@@ -203,6 +203,18 @@ def test_a_row_with_its_own_payload_belongs_to_its_runner_alone():
         gatecorpus.render(neutral, "some-other-runner", "/h", "/c")
 
 
+def test_false_blocks_per_100_and_the_budget_verdict():
+    m = gatecorpus.metrics(matrix_rows())
+    assert m["false_blocks_per_100"] == 30.0  # 3 of 10 calls that should run
+    rows = [judged("allow", "allow", ms=float(i)) for i in range(1, 101)]
+    assert gatecorpus.metrics(rows, budget_ms=96)["over_budget"] is False
+    over = gatecorpus.metrics(rows, budget_ms=95)
+    assert over["over_budget"] is True and over["latency_ms"]["budget"] == 95
+    text = "\n".join(gatecorpus.report_lines(over))
+    assert "false blocks per 100 calls that should run: 0" in text and "OVER the 95 ms budget" in text
+    assert gatecorpus.metrics([])["over_budget"] is False  # no rows, no latency: nothing is over
+
+
 # --- replay: the exit code, the ratchet, fail closed ------------------------------------------------------------
 
 
@@ -538,3 +550,19 @@ def test_the_live_hook_does_not_load_the_corpus_code():
     code = "import sys, ws.gate; print('ws.gatecorpus' in sys.modules)"
     out = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, check=True).stdout
     assert out.strip() == "False"
+
+
+def test_the_latency_check_exits_1_over_its_budget_and_0_within(home, capsys):
+    f = write(home / "c.jsonl", [row("fine", "ls", "allow"), row("stops", "rm -rf /", "deny")])
+    code, out, _ = run([str(f), "--runner", "claude-code", "--metrics", "--p95-budget-ms", "0.000001"], capsys)
+    assert code == 1 and "OVER the 1e-06 ms budget" in out and "per 100" in out
+    code, out, _ = run([str(f), "--runner", "claude-code", "--metrics", "--p95-budget-ms", "60000", "--json"], capsys)
+    data = json.loads(out)["data"]["metrics"]
+    assert code == 0 and data["over_budget"] is False and data["latency_ms"]["budget"] == 60000
+    assert data["false_blocks_per_100"] == 0
+
+
+@pytest.mark.parametrize("bad", ["0", "-1", "nan", "x"])
+def test_a_budget_must_be_above_0(home, capsys, bad):
+    f = write(home / "c.jsonl", [row("fine", "ls", "allow")])
+    assert run([str(f), "--runner", "claude-code", "--metrics", "--p95-budget-ms", bad], capsys)[0] == 2

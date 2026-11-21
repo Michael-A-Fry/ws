@@ -311,6 +311,14 @@ def test_from_refuses_a_folder_that_is_not_ws_and_clashing_options(box: Box, tmp
     assert not any(c.startswith("uv tool") for c in box.calls())
 
 
+def test_a_four_part_release_is_installed_like_any_other(box: Box):
+    ready(box, "v0.1.11.1")
+    r = box.run("--dry-run")
+    assert r.returncode == 0, r.stderr
+    assert "release: v0.1.11.1" in r.stdout
+    assert f"{box.base_url}/{SLUG}/releases/download/v0.1.11.1/ws_aitoolkit-0.1.11.1-py3-none-any.whl" in r.stdout
+
+
 def test_dry_run_looks_up_the_latest_release_and_changes_nothing(box: Box):
     ready(box, "v0.10.0")
     r = box.run("--dry-run")

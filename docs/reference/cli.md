@@ -250,6 +250,10 @@ ws gate replay [-h] [--policy FILE] --runner {claude-code,opencode} FILE
 Exit 0 when every line with an `expect` matches (or none has one), and 1 when an `expect` differs. With `--json` the
 result is `{results, differ}`, one entry per line. See [Guards](guards.md).
 
+Given a labelled corpus, `--metrics` prints the gate's error rates, false blocks per 100 and the p95 time it adds to a
+tool call, and exits 1 when that p95 is over `--p95-budget-ms MS` (default 50). See
+[Replay a corpus](gate.md#replay-a-corpus).
+
 ### `ws gate launch`
 
 Start a runner inside the sandbox wall (bubblewrap on Linux, sandbox-exec on macOS); fails closed.

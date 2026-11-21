@@ -69,5 +69,6 @@ An agent session never changes the spend cap (`[roles.budget] monthly_cap_usd`),
 check sits where the profile is written, so it holds whichever command gets there: `ws config budget`,
 `ws config model` with a value, `ws install --cap` or `--model`, `ws setup --cap` and the setup page. Each is refused
 (exit 3) before anything is written; run it in your own terminal. A write that leaves those keys alone isn't affected,
-and the bare `ws config model` listing stays open to sessions. A run refused for having no model has `stop_reason`
-`no_model` in its run record.
+and the bare `ws config model` listing stays open to sessions. The gate refuses the same command lines before they
+run. ws also never writes over a profile it can't parse or read: fix or remove the file first, or the rewrite would
+drop the cap. A run refused for having no model has `stop_reason` `no_model` in its run record.

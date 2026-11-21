@@ -2111,6 +2111,23 @@ def _ws_admin(canon: list[str], xargs: bool = False, read_anywhere: bool = False
             return f"ws {sub[0]} {sub[1]} is not for a gated session"
         if sub[:1] == ["install"] and _gate_flag(rest):
             return "ws install --gate launch is not for a gated session: it would take off its own gate"
+        if sub[:1] in (["install"], ["setup"]) and (flag := _cap_or_model_flag(rest)):
+            return f"ws {sub[0]} {flag} is not for a gated session: a session never sets its own cap or models"
+        words = [x for x in rest if not x.startswith("-")]
+        if words[:2] == ["config", "model"] and len(words) > 2:
+            return "ws config model ID is not for a gated session: a session never picks the models its jobs run on"
+    return None
+
+
+def _cap_or_model_flag(rest: list[str]) -> str | None:
+    """`--cap` or `--model` among an install's or setup's words, also as `--cap=20` and as a prefix argparse takes
+    (`--ca 20`, `--mod m`): the spend cap and the model are a person's to set (ws.profile.GUARDED)."""
+    for x in rest:
+        name = x.split("=", 1)[0]
+        if len(name) >= 4 and name.startswith("--"):
+            for flag in ("--cap", "--model"):
+                if flag.startswith(name):
+                    return flag
     return None
 
 

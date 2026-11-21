@@ -148,8 +148,9 @@ Ancestry = Callable[[], "list[str] | None"]
 def admin_name(command: str, args: object) -> str | None:
     """The admin command `command` (the dotted name the parser gave it, `secret.set`, `gate.generate`) is, as it is
     typed, or None. `install` counts only with a `--gate` that is not `every-session`, or with `--cap`. `config model`
-    counts only with a value (the listing is open). These two look at the arguments, so they are not in ADMIN_SUB and
-    the text matcher does not see them; `guard` does. `config fallback` is the command
+    counts only with a value (the listing is open). These two look at the arguments, so they are not in ADMIN_SUB; the
+    text matcher (`policy._ws_admin`) checks the same spellings, and so does the profile write
+    (`profile.check_session_write`). `config fallback` is the command
     `config` with the topic `fallback`, so a topic that is a single word counts as the second."""
     parts = command.split(".")
     topic = getattr(args, "topic", None)

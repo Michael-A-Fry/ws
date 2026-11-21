@@ -138,32 +138,43 @@ def _session_refusal() -> str | None:
 def check_session_write(path: Path, new: dict, refusal=None) -> None:
     """Refuse (WsError kind `refused`, exit 3) a write of `new` over the profile at `path` that changes a GUARDED key,
     when this runs inside an agent session (the same test `ws.agentsession` uses for admin commands). A write that
-    leaves those keys as they are is never refused. An unreadable old profile counts as empty."""
+    leaves those keys as they are is never refused. A profile that does not parse or cannot be read is never written
+    over, in a session or not (WsError `bad_config` or `io`): a rewrite from what ws could not read would drop the cap."""
+    from ws.output import WsError
+
     try:
         old = load(path)
-    except ProfileError:
-        old = None
+    except ProfileError as e:
+        raise WsError(
+            "bad_config", f"ws won't write over a profile it can't parse: {e}", f"fix or remove {path}"
+        ) from e
+    except OSError as e:
+        raise WsError("io", f"{path}: {e.strerror or e}", f"check that you can read {path}") from e
     changed = guarded_changes(old, new)
     if not changed:
         return
     why = (refusal or _session_refusal)()
     if why:
-        from ws.output import WsError
-
         raise WsError("refused", f"the profile's {', '.join(changed)}: {why}", "change it in your own terminal", 3)
 
 
 def write_if_changed(path: Path, data: dict) -> bool:
     """Write the profile only if its content would change. True if the file was written. A change to a GUARDED key
-    from inside an agent session is refused before anything is written (`check_session_write`)."""
+    from inside an agent session, or over a profile that does not parse, is refused before anything is written
+    (`check_session_write`). A file error is a WsError of kind `io`, never a bare OSError."""
+    from ws.output import WsError
+
     text = dumps(data)
-    if path.is_file() and path.read_text(encoding="utf-8") == text:
-        return False
     check_session_write(path, data)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".toml.tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
+    try:
+        if path.is_file() and path.read_text(encoding="utf-8") == text:
+            return False
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".toml.tmp")
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as e:
+        raise WsError("io", f"{path}: {e.strerror or e}", f"check that {path.parent} is writable") from e
     return True
 
 

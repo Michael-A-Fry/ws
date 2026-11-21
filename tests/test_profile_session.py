@@ -5,6 +5,7 @@ A session is planted the way tests/test_admin_in_session.py does: a runner in th
 
 from __future__ import annotations
 
+import os
 import stat
 import tomllib
 from pathlib import Path
@@ -119,3 +120,83 @@ def test_guarded_changes_counts_added_removed_and_changed_keys():
     assert profile.guarded_changes(None, {"models": {"default": "x"}}) == ["models"]
     new = {"roles": {"budget": {"monthly_cap_usd": 6}, "model": {"default": "a"}, "notes": {"path": "x"}}}
     assert profile.guarded_changes(old, new) == ["roles.budget.monthly_cap_usd"]
+
+
+# ---- round 4: the text matcher, a profile ws can't read, and the person at the runner's own terminal ----------------
+
+W = "ws"  # built at run time, so this file's own text is not a command line
+PREFIXES = ["", "setsid -f ", "env -i ", "env -u WS_GATED_SESSION ", "uv run "]
+DENIED = [
+    "config budget 999",
+    "config model x --yes",
+    "config model jobs x",
+    "install --yes --cap 999",
+    "install --cap=999",
+    "install --ca 999",
+    "install --model m",
+    "install --mod m --yes",
+    "setup --yes --cap 999",
+    "setup --yes --model m",
+]
+ALLOWED = ["config model", "config model --json", "config", "install --yes", "setup --yes --region CA", "status"]
+
+
+@pytest.mark.parametrize("prefix", PREFIXES)
+@pytest.mark.parametrize("words", DENIED)
+def test_the_gate_matcher_denies_each_spelling(prefix, words):
+    from ws import policy
+
+    line = f"{prefix}{W} {words}"
+    assert policy.is_denied_command(policy.default_policy(), line), line
+
+
+@pytest.mark.parametrize("words", ALLOWED)
+def test_the_gate_matcher_still_allows_the_reads(words):
+    from ws import policy
+
+    line = f"{W} {words}"
+    assert not policy.is_denied_command(policy.default_policy(), line), line
+
+
+@pytest.mark.parametrize("in_session", [False, True])
+def test_a_save_over_a_profile_that_does_not_parse_is_refused_and_leaves_it(box, monkeypatch, in_session):
+    if in_session:
+        monkeypatch.setattr(agentsession, "read_ancestry", lambda: list(UNDER_CLAUDE))
+    p = profile.profile_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("monthly_cap_usd = [broken\n", encoding="utf-8")
+    with pytest.raises(WsError) as e:
+        profile.write_if_changed(p, {"machine": {"region": "CA"}})  # no guarded key: still refused
+    assert e.value.kind == "bad_config"
+    assert p.read_text(encoding="utf-8") == "monthly_cap_usd = [broken\n"
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root reads any file")
+def test_a_profile_ws_cannot_read_is_a_ws_error_not_an_os_error(box):
+    p = profile.profile_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("[machine]\n", encoding="utf-8")
+    p.chmod(0)
+    try:
+        with pytest.raises(WsError) as e:
+            profile.write_if_changed(p, {"machine": {"region": "CA"}})
+        assert e.value.kind == "io"
+    finally:
+        p.chmod(0o600)
+
+
+def test_a_person_at_the_runners_own_terminal_may_set_them(box, monkeypatch):
+    monkeypatch.setattr(agentsession, "read_ancestry", lambda: list(UNDER_CLAUDE))
+    monkeypatch.setattr(agentsession, "on_runner_terminal", lambda: True)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    assert cli.main(["config", "budget", "30", "--yes"]) == 0
+    assert cli.main(["config", "model", "m", "--yes"]) == 0
+    assert guarded(box)[:2] == [30, {"default": "m"}]
+
+
+def test_install_and_setup_outside_a_session_write_the_cap(box):
+    assert cli.main(["install", "--yes", "--cap", "20", "--model", "m", "--notes", str(box / "Notes")]) == 0
+    assert guarded(box)[0] == 20 and prof_of(box)["roles"]["model"]["default"] == "m"
+    assert cli.main(["setup", "--yes", "--region", "CA", "--cap", "25"]) == 0
+    assert guarded(box)[0] == 25

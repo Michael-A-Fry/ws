@@ -11,8 +11,9 @@ body of the GitHub release.
 ### Added
 
 - The message wall: the gate refuses a send-message call from a session in a walled or counts-only class, or in a
-  folder no class names, on every route (this machine or a Remote Control bridge). Such a session talks to others through `ws msg`.
-  `ws walls check` gains `no-message-crossings`, which fails on any such call a class's verdict log shows allowed.
+  folder no class names, on every route (this machine or a Remote Control bridge). Such a session talks to others
+  through `ws msg`. `ws walls check` gains `no-message-crossings`, which fails on any such call a class's verdict
+  log shows allowed.
 - `ws gate replay --metrics` gives false blocks per 100 calls and exits 1 when check()'s p95 is over a budget
   (`--p95-budget-ms`, default 50).
 - `ws queue report [--weekly] [--weeks N]`: a row a week of gate blocks, slot stalls and hand-offs, with the runs

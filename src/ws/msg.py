@@ -20,9 +20,9 @@ Walled classes. A message to a walled or counts-only session keeps its body only
 `<repo root>/.ws/messages/<class>.db`, created with a `.gitignore` that ignores everything in the folder; the shared
 database gets the envelope, with no body, no hash of a body and no free-text field. A walled or counts-only session sends
 fixed kinds only (`ack`, `done`, `stop-and-hand-over:done`, `ask:pending`, `counts`), no body, no key, no thread name.
-What may come in is a message of kind `note`, `ask` or `stop-and-hand-over` from a session the receiving class's
-`inbound_allow` names, and only when its `inbound` is `allowlist`: a walled class set to off or lead-only takes nothing,
-the lead included. There is no rule that lets a reply in, and no owned-task exception. Every message addressed to a walled
+What may come in is a message of kind `note`, `ask` or `stop-and-hand-over`: from the lead (a session whose role is
+`lead`) when the receiving class's `inbound` is `lead-only`, or from a session its `inbound_allow` names when it is
+`allowlist`. A walled class set to off takes nothing, the lead included. There is no rule that lets a reply in, and no owned-task exception. Every message addressed to a walled
 class, delivered or refused, leaves one row in the class's own store (`inbound_log`: the UTC time, the sender's session
 id, the class, the kind, `delivered` or `refused`, and a refusal's typed kind), never a body, a hash of one, a key or a
 thread name. A delivered message's row is written in the delivery's own transaction (a class store that cannot be written
@@ -736,11 +736,11 @@ def admit(
             f"sessions in class {r_class.name!r} take no messages",
             "the class's `inbound` in policy.toml is off; set lead-only or allowlist if that is wanted",
         )
-    if _walled(r_class) and r_class.inbound != "allowlist":
+    if _walled(r_class) and r_class.inbound not in ("allowlist", "lead-only"):
         raise WsError(
             "refused",
             f"class {r_class.name!r} is walled and names no sessions that may send to it",
-            'set inbound = "allowlist" and name the sessions in inbound_allow under that class in policy.toml',
+            'set inbound = "lead-only", or "allowlist" with the sessions in inbound_allow, under that class in policy.toml',
         )
     # A fixed kind has no text, so it carries nothing out of a class: the default lets it reach a lead, which is how a
     # worker or a walled session says `done` or `ack`. A walled receiver is never reached this way (below).

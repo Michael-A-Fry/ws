@@ -1475,12 +1475,21 @@ def test_a_message_from_a_session_not_on_the_allowlist_is_refused_and_logged(wor
         ("lead1", "secret", "ask", "refused", "refused"),
     ]
     assert world.count() == 0 and world.rows("SELECT COUNT(*) FROM bodies", class_db(world)) == [(0,)]
-    # a walled class that is not on an allowlist takes no one, the lead included, and the row says so
+    # a walled class set to lead-only takes the lead and no one else (DEC-052), and each row says which
     text = (world.root / "wshome" / "policy.toml").read_text()
     world.policy(text.replace('inbound = "allowlist"\ninbound_allow = ["work1"]', 'inbound = "lead-only"', 1))
+    err = world.refused("work1", "wall1")
+    assert "from the lead only" in err.message
+    assert world.send("lead1", "wall1", "note", "from the lead")["class"] == "secret"
+    assert log_rows(world)[-2:] == [
+        ("work1", "secret", "note", "refused", "refused"),
+        ("lead1", "secret", "note", "delivered", None),
+    ]
+    assert world.count() == 1
+    # and off takes no one, the lead included
+    world.policy(text.replace('inbound = "allowlist"\ninbound_allow = ["work1"]', 'inbound = "off"', 1))
     world.refused("lead1", "wall1")
     assert log_rows(world)[-1] == ("lead1", "secret", "note", "refused", "refused")
-    assert world.count() == 0
 
 
 def test_a_message_from_an_allowed_session_is_delivered_and_logged(world):

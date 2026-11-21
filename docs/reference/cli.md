@@ -572,7 +572,7 @@ Connect an integration: the steps only a person can do, from one flow file, walk
 the JSON an agent reads are in [Connect flows](connect.md); to add one, see [Add a connect flow](../how-to/add-a-connect-flow.md).
 
 ```text
-ws connect [-h] [--dry-run] [--diagnose] [--revoke] [target]
+ws connect [-h] [--dry-run] [--diagnose] [--revoke] [--yes] [target]
 ```
 
 | Argument | Meaning |
@@ -580,7 +580,8 @@ ws connect [-h] [--dry-run] [--diagnose] [--revoke] [target]
 | `target` | A flow id, or `list` (the default): the flows there are. |
 | `--dry-run` | Show each step as `done` or `needs_human`. With `--json`, the agent contract. Exit 0 when all done, 3 when a person has something to do. Changes nothing; an agent may run it. |
 | `--diagnose` | Step state and what was learned, with the nonce redacted. Changes nothing. |
-| `--revoke` | Undo the flow: delete its secret, say what to undo on the other side, clear its state. Refused inside an agent session. |
+| `--revoke` | Undo the flow: ask first (default no), delete its secret only if `ws connect` stored it, say what to undo on the other side, clear its state. Refused inside an agent session. |
+| `--yes` | With `--revoke`: don't ask. |
 
 With no flag, `ws connect <id>` walks the flow in your own terminal and refuses inside an agent session. A captured
 secret goes to the secrets store and nowhere else.

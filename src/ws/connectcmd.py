@@ -134,7 +134,9 @@ def cmd_connect(args) -> int:
             return 0
         if args.revoke:
             _person_only("--revoke", flow.id, needs_terminal=False)
-            data = engine.revoke(_context(), flow)
+            if not args.yes and not (sys.stdin.isatty() and sys.stdout.isatty()):
+                raise WsError("usage", "--revoke asks first and there is no terminal", "add --yes", 2)
+            data = engine.revoke(_context(with_io=True), flow, assume_yes=args.yes)
             if args.json:
                 output.result(data)
             else:
@@ -168,4 +170,5 @@ def register(sub) -> None:
     )
     p.add_argument("--diagnose", action="store_true", help="step state and what was learned, with the nonce redacted")
     p.add_argument("--revoke", action="store_true", help="undo the flow: delete its secret, say what to undo elsewhere")
+    p.add_argument("--yes", action="store_true", help="with --revoke: don't ask first")
     p.set_defaults(func=cmd_connect)

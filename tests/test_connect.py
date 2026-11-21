@@ -271,7 +271,7 @@ def test_revoke_deletes_the_secret_and_tells_what_to_do_in_botfather_and_a_rewal
     token = make_token("i")
     api = FakeTelegram(token)
     c, _io, _ = walk_all(env, api, token)
-    out = engine.revoke(c, FLOW)
+    out = engine.revoke(c, FLOW, assume_yes=True)
     assert "TELEGRAM_BOT_TOKEN" not in store.names()
     assert any("/revoke" in t for t in out["tell"])
     assert not (tmp / "state" / "connect" / "telegram.json").exists()
@@ -284,7 +284,7 @@ def test_revoke_deletes_the_secret_and_tells_what_to_do_in_botfather_and_a_rewal
 
 
 def test_revoke_with_nothing_to_undo_is_quiet(env):
-    out = engine.revoke(ctx_for(env, FakeTelegram(make_token())), FLOW)
+    out = engine.revoke(ctx_for(env, FakeTelegram(make_token())), FLOW, assume_yes=True)
     assert out["did"] == [] and out["status"] == "revoked"
 
 
@@ -344,7 +344,9 @@ def test_no_output_ever_holds_the_secret(env, capsys):
     api = FakeTelegram(token)
     c, io, _ = walk_all(env, api, token)
     blob = (
-        json.dumps(engine.dry_run(c, FLOW)) + json.dumps(engine.diagnose(c, FLOW)) + json.dumps(engine.revoke(c, FLOW))
+        json.dumps(engine.dry_run(c, FLOW))
+        + json.dumps(engine.diagnose(c, FLOW))
+        + json.dumps(engine.revoke(c, FLOW, assume_yes=True))
     )
     assert token not in blob
     assert token not in everything(tmp, io)
@@ -585,3 +587,131 @@ def test_a_closed_terminal_stops_the_walk_with_a_message(monkeypatch):
         with pytest.raises(ConnectError) as e:
             call()
         assert e.value.kind == "cancelled"
+
+
+# ---- second review ------------------------------------------------------------------------------------------------
+
+
+def test_a_store_that_cannot_open_refuses_before_asking_for_anything(env):
+    io = Script("", "", make_token())
+    c = ctx_for(env, FakeTelegram(make_token()), io)
+    c.store = None
+    with pytest.raises(ConnectError) as e:
+        engine.walk(c, FLOW)
+    assert e.value.kind == "store" and io.asked == []
+
+
+def test_a_token_for_a_different_bot_resets_the_chat_steps(env):
+    _tmp, store = env
+    token = make_token("t")
+    c, _io, _ = walk_all(env, FakeTelegram(token), token)
+    assert engine.load_state(c, FLOW)["config"]["chat_id"] == "99"
+    store.delete("TELEGRAM_BOT_TOKEN")  # the person lost it and pastes the token of another bot
+    other = make_token("u")
+    io = Script(other, "", "q")  # the info and BotFather steps are done; token, bind link, then stop at the check
+    res = engine.walk(ctx_for(env, FakeTelegram(other, bot_id=777, username="other_bot"), io, clock=c.now), FLOW)
+    st = engine.load_state(c, FLOW)
+    assert res["status"] == "stopped" and st["config"]["bot_id"] == "777" and "chat_id" not in st["config"]
+    assert st["steps"].get("chat-bound") is None and st["steps"]["who-am-i"]["status"] == "done"
+
+
+def test_revoke_asks_first_and_a_no_changes_nothing(env):
+    _tmp, store = env
+    token = make_token("v")
+    c, _io, _ = walk_all(env, FakeTelegram(token), token)
+    c.io = Script("")
+    out = engine.revoke(c, FLOW)
+    assert out["status"] == "cancelled" and store.read("TELEGRAM_BOT_TOKEN") == token
+    assert engine.load_state(c, FLOW)["status"] == "done"
+    c.io = Script("y")
+    assert engine.revoke(c, FLOW)["status"] == "revoked" and "TELEGRAM_BOT_TOKEN" not in store.names()
+
+
+def test_revoke_leaves_a_secret_ws_connect_never_stored(env):
+    _tmp, store = env
+    store.write("TELEGRAM_BOT_TOKEN", make_token("w"))
+    out = engine.revoke(ctx_for(env, FakeTelegram(make_token())), FLOW, assume_yes=True)
+    assert "TELEGRAM_BOT_TOKEN" in store.names()
+    assert any("left TELEGRAM_BOT_TOKEN" in d for d in out["did"])
+
+
+def test_revoke_without_a_terminal_or_yes_is_a_usage_error(env, monkeypatch, capsys):
+    monkeypatch.setattr(agentsession, "refusal", lambda *a, **k: None)
+    code, out, _ = _run(["connect", "telegram", "--revoke", "--json"], capsys)
+    assert code == 2 and json.loads(out)["error_kind"] == "usage"
+    code, _, _ = _run(["connect", "telegram", "--revoke", "--yes"], capsys)
+    assert code == 0
+
+
+# ---- the real transport, with the opener stubbed ----------------------------------------------------------------
+
+
+class _Resp:
+    def __init__(self, status, body):
+        self.status, self._body = status, body
+
+    def read(self, n=-1):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def _stub_opener(monkeypatch, behave):
+    seen = {}
+
+    class Opener:
+        def open(self, req, timeout=None):
+            seen["url"], seen["timeout"] = req.full_url, timeout
+            return behave(req)
+
+    def build(*handlers):
+        seen["handlers"] = handlers
+        return Opener()
+
+    monkeypatch.setattr("urllib.request.build_opener", build)
+    return seen
+
+
+def test_url_transport_refuses_anything_but_https(monkeypatch):
+    seen = _stub_opener(monkeypatch, lambda r: _Resp(200, b"{}"))
+    with pytest.raises(ConnectError) as e:
+        engine.UrlTransport().get("http://api.example.com/x")
+    assert e.value.kind == "network" and "url" not in seen
+
+
+def test_url_transport_follows_no_redirect(monkeypatch):
+    seen = _stub_opener(monkeypatch, lambda r: _Resp(200, b'{"ok": true}'))
+    assert engine.UrlTransport().get("https://api.example.com/x") == (200, {"ok": True})
+    assert seen["handlers"] == (engine.NoRedirect,)
+    assert engine.NoRedirect().redirect_request(None, None, 302, "Found", {}, "https://elsewhere.example/") is None
+
+
+def test_url_transport_errors_name_the_host_only(monkeypatch):
+    import urllib.error
+
+    secret_path = "/bot" + make_token("x") + "/getMe"
+
+    def boom(req):
+        raise urllib.error.URLError("refused")
+
+    _stub_opener(monkeypatch, boom)
+    with pytest.raises(ConnectError) as e:
+        engine.UrlTransport().get("https://api.example.com" + secret_path)
+    assert (
+        "api.example.com" in e.value.message and "bot" not in e.value.message and make_token("x") not in repr(e.value)
+    )
+
+
+def test_url_transport_returns_an_http_error_status_and_body(monkeypatch):
+    import io
+    import urllib.error
+
+    def deny(req):
+        raise urllib.error.HTTPError(req.full_url, 401, "no", {}, io.BytesIO(b'{"ok": false}'))
+
+    _stub_opener(monkeypatch, deny)
+    assert engine.UrlTransport().get("https://api.example.com/x") == (401, {"ok": False})

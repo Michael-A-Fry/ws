@@ -384,6 +384,12 @@ def walk(ctx: Context, flow: Flow) -> dict:
             f"{flow.secret_name} is not in the secrets registry",
             registry_step(ctx, flow) + "\nthen run this again (ws never edits the registry for you)",
         )
+    if flow.secret_name and ctx.store is None:
+        raise ConnectError(
+            "store",
+            "the secrets store can't be opened for writing here",
+            "this profile keeps secrets elsewhere (OpenBao): write the value there; ws connect needs the local store",
+        )
     st = load_state(ctx, flow)
     io.say(flow.title)
     i = 0
@@ -453,6 +459,15 @@ def _capture(ctx: Context, flow: Flow, st: dict, i: int) -> int:
     assert ctx.store is not None and flow.secret_name
     ident, uid = _run_identity(ctx, flow, v, st, secret_value)  # raises ConnectError; nothing has been stored
     ctx.store.write(flow.secret_name, secret_value)
+    st["secret_stored"] = True  # ws connect put it there: only then may --revoke delete it
+    old = st["config"].get(flow.unique_key)
+    if old is not None and old != uid:  # a different account: what was bound to the old one no longer holds
+        for later in flow.steps[i + 2 :]:
+            st["steps"].pop(later["id"], None)
+            for key in (later.get("find") or {}).get("take", {}):
+                st["config"].pop(key, None)
+        st["nonce"] = None
+        io.say(f"  This is a different {flow.unique_key} from before: the later steps run again.")
     st["config"].update(plain)
     st["config"]["identity"] = ident
     st["config"][flow.unique_key] = uid
@@ -506,18 +521,28 @@ def _resolve_conflict(ctx: Context, flow: Flow, st: dict, s: dict, value: str, e
 # ---- revoke ----------------------------------------------------------------------------------------------------------
 
 
-def revoke(ctx: Context, flow: Flow) -> dict:
+def revoke(ctx: Context, flow: Flow, assume_yes: bool = False) -> dict:
     """Undo each step that declares a revoke, last step first: delete the secret, tell the person what to do elsewhere,
-    forget what was learned. Then clear the state, so the flow can be walked again."""
+    forget what was learned. Then clear the state, so the flow can be walked again. Asks first (default no) unless
+    `assume_yes`; deletes the secret only when this flow's own state says ws connect stored it."""
     st = load_state(ctx, flow)
+    mine = bool(st.get("secret_stored"))
+    if not assume_yes:
+        if ctx.io is None:
+            raise ConnectError("confirm", "revoke needs a yes", "run it at a terminal, or add --yes")
+        what = f"delete {flow.secret_name} and " if mine and flow.secret_name else ""
+        if ctx.io.ask(f"Revoke {flow.id}: {what}clear its state? (y/N)").strip().lower() not in ("y", "yes"):
+            return {"flow": flow.id, "did": [], "tell": [], "status": "cancelled"}
     did, told = [], []
     for s in reversed(flow.steps):
         rv = s.get("revoke")
         if not rv:
             continue
         if rv["action"] == "delete_secret" and ctx.store is not None and flow.secret_name:
-            if ctx.store.delete(flow.secret_name):
+            if mine and ctx.store.delete(flow.secret_name):
                 did.append(f"deleted {flow.secret_name} from the secrets store")
+            elif not mine and flow.secret_name in ctx.store.names():
+                did.append(f"left {flow.secret_name} in the store: ws connect did not put it there")
         elif rv["action"] == "tell":
             told.append(rv["text"])
         elif rv["action"] == "forget":

@@ -85,4 +85,5 @@ A capture and its verify count as `done` only while the secret is still in the s
 
 ## Rollback
 
-A verify that fails stores nothing and leaves an existing secret as it was. `--revoke` then a new walk starts clean.
+`--revoke` asks first (default no; `--yes` skips it) and deletes the secret only when this flow's state says `ws connect`
+stored it. A verify that fails stores nothing and leaves an existing secret as it was. `--revoke` then a new walk starts clean.

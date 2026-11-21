@@ -2653,3 +2653,25 @@ def test_sudo_host_askpass_and_inner_shell_forms_are_refused(pol, home, cmd):
 def test_sudo_with_n_or_without_askpass_still_runs(pol, home):
     for cmd in ("SUDO_ASKPASS=/tmp/x sudo -n ls", "sudo -h", "sudo -hother ls", "sudo ls"):
         assert policy.is_denied_command(pol, cmd) is None, cmd
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "SUDO_ASKPASS=/tmp/x timeout -s sudo 5 sudo ls",
+        "SUDO_ASKPASS=/tmp/x xargs -I sudo -n 1 sudo ls",  # xargs's own -n after a value that reads like sudo  # a wrapper's option value can read like sudo: every sudo is checked
+        "sudo -n SUDO_ASKPASS=/tmp/x sudo ls",  # a nested sudo that the outer one's settings give an askpass to
+        "SHELL=/tmp/x sudo -s ls",  # sudo -s runs the shell SHELL names
+        "export SHELL=/tmp/x; sudo -s ls",
+        "sudo -D /tmp cat notes",  # sudo runs it from a folder ws does not follow
+        "sudo --chroot /srv ls",
+        "sudo -R /srv ls",
+    ],
+)
+def test_every_sudo_and_its_shell_and_folder_are_judged(pol, home, cmd):
+    assert policy.is_denied_command(pol, cmd)
+
+
+def test_sudo_with_n_or_s_and_a_plain_shell_still_runs(pol, home):
+    for cmd in ("SUDO_ASKPASS=/tmp/x sudo -S ls", "SUDO_ASKPASS=/tmp/x sudo -n sudo -n ls", "sudo -s ls", "sudo -i ls"):
+        assert policy.is_denied_command(pol, cmd) is None, cmd

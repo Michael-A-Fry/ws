@@ -1000,6 +1000,7 @@ def _sudo_args(toks: list[str]) -> tuple[int, list[str], str | None, set[str]]:
                     break  # `-hHOST` holds its value
                 if c not in _SUDO_SHORT_VALUES:
                     raise _sudo_unsure(f"is given {t!r}, an option it doesn't have")
+                seen.add(c)
                 if k + 1 == len(t):  # the value is the next word, not glued on
                     if i >= len(toks):
                         raise _sudo_unsure(f"has no value for {t!r}")
@@ -1013,6 +1014,8 @@ def _sudo_args(toks: list[str]) -> tuple[int, list[str], str | None, set[str]]:
         i += 1
     if i < len(toks) and toks[i].startswith("-"):
         raise _sudo_unsure(f"would run a program named {toks[i]!r}, or read it as an option")
+    if seen & {"D", "chdir", "R", "chroot"}:  # it runs from a folder ws does not follow
+        raise _sudo_unsure("-D, --chdir, -R or --chroot runs the command from another folder")
     if seen & {"A", "askpass"}:
         raise _sudo_unsure("-A would run the askpass program SUDO_ASKPASS names")
     if seen & {"e", "edit"}:
@@ -1046,13 +1049,15 @@ def strip_wrappers(
     budget: Budget | None = None,
     dropped: list[str] | None = None,
     scripts: list[str] | None = None,
+    sudo_options: list[set[str]] | None = None,
 ) -> tuple[list[str], set[str]]:
     """Drop leading keywords, VAR=value and exec wrappers (sudo, env, timeout, nice, xargs, busybox ...): what is left
     is the command that really runs. Also returns the wrappers it removed. If `env` is given, the VAR=value words it
     drops (a prefix, or the ones `env` sets) are added to it. `dropped` gets the words a wrapper took as its own
     (`-a FILE` of xargs, the user of `sudo -u`), and `scripts` the text a shell runs for the wrapper: an `env -S`
     string, the `-c` text of `su`, `flock` and `script`, and what `watch` is given to run; each is a command line of its
-    own. `lexenv` and `budget` are for reading an `env -S` string (see `lex`)."""
+    own. `lexenv` and `budget` are for reading an `env -S` string (see `lex`); `sudo_options` gets the options of each
+    sudo it takes off, as `sudo_options` reads them."""
     toks, seen = list(words), set()
     while toks:
         tick()
@@ -1087,7 +1092,9 @@ def strip_wrappers(
             if env is not None:
                 env.extend(sets)
         elif w == "sudo":
-            i, sets, sudo_mode, _ = _sudo_args(toks)
+            i, sets, sudo_mode, own = _sudo_args(toks)
+            if sudo_options is not None:
+                sudo_options.append(own)  # each sudo's own options, a nested one's too
             took = set(range(i - len(sets), i))
             if env is not None:
                 env.extend(sets)

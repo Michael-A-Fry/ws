@@ -2350,8 +2350,9 @@ def _segment_once(
     nested: list[str] = []
     dropped: list[str] = []
     set_env: list[str] = []  # the NAME=value words set for the command: a prefix, `env`, an `env -S` string
+    sudos: list[set[str]] = []  # the options of each sudo the line runs, a nested one's too
     toks, wrappers = shellwords.strip_wrappers(
-        words, set_env, lexenv=env, budget=ctx.budget, dropped=dropped, scripts=nested
+        words, set_env, lexenv=env, budget=ctx.budget, dropped=dropped, scripts=nested, sudo_options=sudos
     )
     held = _targets(toks) & (set(ctx.vars or {}) | set(ctx.loops or {}) | set(ctx.unknown) | _ASKPASS_ENV)
     if held:  # read X / let X=.. after X held a value (or set ssh's askpass): which value it has now isn't followed
@@ -2411,7 +2412,7 @@ def _segment_once(
     if admin:
         return admin, line, []
     local_seg = seg  # the part of the line that runs here
-    if "sudo" in wrappers and (why := _sudo_askpass(ctx, set_env, words)):
+    if sudos and (why := _sudo_askpass(ctx, set_env, sudos)):
         return why, line, []
     ssh_toks, ssh_prefix, ssh_why = _ssh_toks(cmd, toks, env, ctx.budget)
     if ssh_why:
@@ -2799,20 +2800,27 @@ def _ssh_remote(
 _ASKPASS_ENV = frozenset(_SSH_ENV | {"SUDO_ASKPASS"})  # names an askpass program a command may run
 
 
-def _sudo_askpass(ctx: _Ctx, set_env: list[str], words: list[str]) -> str | None:
-    """A refusal for a sudo that may run the askpass program SUDO_ASKPASS names: sudo runs it without -A when it has
-    no terminal, as an agent's shell does. Only when SUDO_ASKPASS is set on the line, held from earlier, or may be
-    (a part of the line set any variable), and sudo is not given -n."""
+def _held_or_set(ctx: _Ctx, set_env: list[str], name: str) -> bool:
+    """Whether the line may give a program `name`: set on it (a prefix, env or sudo setting), held from earlier, or
+    unknown (a part of the line set any variable)."""
     names = set(ctx.vars or {}) | set(ctx.unknown)
-    if not ("SUDO_ASKPASS" in names or ctx.distrust or any(w.startswith("SUDO_ASKPASS") for w in set_env)):
-        return None
-    k = next((j for j, w in enumerate(words) if posixpath.basename(w) == "sudo"), None)
-    if k is not None and shellwords.sudo_options(words[k:]) & {"n", "non-interactive"}:
-        return None
-    return (
-        "sudo may run the askpass program SUDO_ASKPASS names, which runs on this machine and ws cannot read; "
-        "give sudo -n, or leave SUDO_ASKPASS unset"
-    )
+    return name in names or ctx.distrust or any(w.startswith((name + "=", name + "+=")) for w in set_env)
+
+
+def _sudo_askpass(ctx: _Ctx, set_env: list[str], sudos: list[set[str]]) -> str | None:
+    """A refusal for a sudo that may run a program the line names through its environment: the askpass program
+    SUDO_ASKPASS names (sudo runs it without -A when it has no terminal, as an agent's shell does; -n or -S keeps it
+    from asking), and the shell SHELL names under -s. Every sudo on the line is checked, a nested one's too."""
+    if _held_or_set(ctx, set_env, "SUDO_ASKPASS") and any(
+        not own & {"n", "non-interactive", "S", "stdin"} for own in sudos
+    ):
+        return (
+            "sudo may run the askpass program SUDO_ASKPASS names, which runs on this machine and ws cannot read; "
+            "give sudo -n or -S, or leave SUDO_ASKPASS unset"
+        )
+    if _held_or_set(ctx, set_env, "SHELL") and any(own & {"s", "shell"} for own in sudos):
+        return "sudo -s runs the shell SHELL names, which this line sets or ws cannot read; give the command without -s"
+    return None
 
 
 def _ssh_toks(

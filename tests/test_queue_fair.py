@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -76,16 +78,15 @@ def test_one_session_cannot_hold_every_light_slot_while_another_waits(tmp_path):
     ledger = make(tmp_path, clock=clock, limits=queue.Limits(max_concurrent=4, poll_s=5))
     a = [slot("A") for _ in range(4)]
     b = [slot("B") for _ in range(4)]
-    assert ledger.admit(a[0], clock(), spend()).kind == "admit"
-    assert ledger.admit(a[1], clock(), spend()).kind == "admit"
+    for r in a[:2] + b[:2]:
+        assert ledger.admit(r, clock(), spend()).kind == "admit"  # the lane is full, 2 and 2
+    assert ledger.admit(b[2], clock(), spend()).kind == "wait"  # B queues for more
+    close(ledger, b[0].run_id, clock())  # a slot is free, and B is still waiting for one
     clock.advance(seconds=1)
-    assert ledger.admit(b[0], clock(), spend()).kind == "admit"  # two sessions: a share is 2 of 4
-    for r in b[1:]:
-        ledger.admit(r, clock(), spend())
-    for r in a[2:]:
-        assert ledger.admit(r, clock(), spend()).kind == "wait"
-    assert held(ledger, "A") == 2 and held(ledger, "B") == 2
-    for r in a[2:] + b[2:]:  # every waiter looks again: neither session goes past its share while the other waits
+    d = ledger.admit(a[2], clock(), spend())
+    assert (d.kind, d.counter) == ("wait", "session_share")  # A holds its share (2 of 4) while B waits
+    assert ledger.admit(b[2], clock(), spend()).kind == "admit"
+    for r in a[2:] + b[3:]:  # every waiter looks again: neither session goes past its share while the other waits
         ledger.admit(r, clock(), spend())
     assert held(ledger, "A") <= 2 and held(ledger, "B") <= 2
 
@@ -110,6 +111,20 @@ def test_a_share_held_back_waiter_does_not_hold_back_another_session(tmp_path):
     close(ledger, b[0].run_id, clock())  # B drops to 1: A is at its share while B waits
     assert ledger.admit(a[2], clock(), spend()).counter == "session_share"
     assert ledger.admit(b[2], clock(), spend()).kind == "admit"  # B is not held behind A's earlier, held-back waiter
+
+
+def test_a_slot_with_no_session_counts_against_its_parent_process(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("WS_HOME", str(tmp_path / "ws"))
+    for k in queue.SESSION_ENVS:
+        monkeypatch.delenv(k, raising=False)
+    assert cli.main(["queue", "slot", "--lane", "light", "--", sys.executable, "-c", "pass"]) == 0
+    (r,) = queue.ledger_for_env().receipts(last=1)
+    assert r["session"] == f"ppid:{os.getppid()}"
+
+
+def test_a_zero_max_wait_is_a_usage_error(capsys):
+    assert cli.main(["queue", "slot", "--max-wait-s", "0", "--", "true"]) == 2
 
 
 def test_slot_session_comes_from_the_environment():

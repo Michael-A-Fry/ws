@@ -124,9 +124,10 @@ Waiters are ordered by who, then by when they first asked. A request that could 
 the host has beside the reserve) is refused.
 
 Each slot request counts against a session: `--session ID`, else `WS_SLOT_SESSION`, else the runner's session id
-(`CLAUDE_CODE_SESSION_ID`). While another session waits for the lane, a session that holds its share (the lane's slots
-over the sessions holding or waiting for one, rounded up) waits too, and it doesn't hold the other session's waiters back
-in the arrival order. A session alone in the lane takes every slot, and a request with no session has no share.
+(`CLAUDE_CODE_SESSION_ID`), else the process that started `ws queue slot` (`ppid:N`), so every request has one.
+While another session waits for the lane, a session that holds its share (the lane's slots over the sessions holding or
+waiting for one, rounded up) waits too, and it doesn't hold the other session's waiters back in the arrival order.
+A session alone in the lane takes every slot. `--max-wait-s` must be above 0.
 
 A wait that passes `slot_max_wait_s` is requeued, not failed: the receipt's `requeues` goes up by one, the waiter keeps
 its place in the arrival order, and it goes on waiting. Only the caller's own `--timeout-s` ends a wait

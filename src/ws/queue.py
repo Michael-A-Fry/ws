@@ -39,7 +39,7 @@ Turns, time, concurrency and memory are not refusals but waits: a direct `ws run
 queued, and `ws queue slot` waits. A join's `ui` run is admitted before any writer's, and a writer's only when its memory
 fits beside the headroom kept for the join, so a writer waits and is never refused for it. Waiters are served in
 arrival order (joins first). A slot request counts against its session (`--session`, else `WS_SLOT_SESSION`, else the
-runner's session id): while another session waits for the lane, a session holding its share (the lane's slots over the
+runner's session id, else the process that started `ws queue slot`): while another session waits for the lane, a session holding its share (the lane's slots over the
 sessions there, rounded up) waits, and does not hold the others back; a session alone takes every slot. A wait that
 passes `slot_max_wait_s` (default 30 minutes) is requeued: counted in the receipt's `requeues`, kept in its place, and
 never failed; only the caller's own `--timeout-s` ends a wait. Every receipt, in every lane, keeps `queued_at`,
@@ -2115,6 +2115,12 @@ def slot_session(env=None) -> str | None:
     return next((e[k] for k in SESSION_ENVS if e.get(k)), None)
 
 
+def _process_key() -> str:
+    """A slot request that names no session counts against the process that started `ws queue slot` (its parent), so
+    every request has a share and is counted."""
+    return f"ppid:{os.getppid()}"
+
+
 def cmd_slot(args: argparse.Namespace) -> int:
     cmd = list(args.cmd)
     if cmd[:1] == ["--"]:
@@ -2130,7 +2136,7 @@ def cmd_slot(args: argparse.Namespace) -> int:
     run_id = runrecord.new_run_id(now)
     req = Request(
         job=f"slot-{args.lane}-{run_id[-6:]}", run_id=run_id, usd=0.0, ram_gb=args.ram_gb, lane=args.lane, who=args.who,
-        credential="local", lease_s=SLOT_LEASE_S, session=args.session or slot_session(),
+        credential="local", lease_s=SLOT_LEASE_S, session=args.session or slot_session() or _process_key(),
     )  # fmt: skip
     code = EXIT_FAILED
     with run._term_becomes_exit():
@@ -2251,6 +2257,13 @@ def _positive_int(text: str) -> int:
     return n
 
 
+def _positive(text: str) -> float:
+    x = float(text)
+    if not math.isfinite(x) or x <= 0:
+        raise argparse.ArgumentTypeError("must be a number above 0")
+    return x
+
+
 def _non_negative(text: str) -> float:
     x = float(text)
     if not math.isfinite(x) or x < 0:
@@ -2335,7 +2348,7 @@ def register(sub) -> None:
     )
     s.add_argument("--timeout-s", type=_non_negative, default=None, metavar="S", help="give up waiting after S seconds")
     s.add_argument(
-        "--max-wait-s", type=_non_negative, default=None, metavar="S",
+        "--max-wait-s", type=_positive, default=None, metavar="S",
         help=f"requeue (count, keep the place) each S seconds of waiting (default slot_max_wait_s, {SLOT_MAX_WAIT_S:g})",
     )  # fmt: skip
     s.add_argument(

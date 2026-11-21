@@ -65,8 +65,8 @@ frozen at `schema_version` 1. A key may be added; none is removed or changed in 
 | `blockers` | When present, each `kind` and `action`. `secret_not_registered` carries the registry entry for the person to add |
 | `steps[]` | `id`, `type`, `status` (`done` or `needs_human`), and when not done `action` |
 
-A step also carries what its type needs: `title`, `text` (info, link), `url` or `url_template` (link; the template when a
-placeholder isn't known yet), `expires_in_s` and, once a nonce exists, `expires_at` (a nonce link), and `fields`
+A step also carries what its type needs: `title`, `text` (info, link), `url` or `url_template` (link; the template when
+a placeholder isn't known yet), `expires_in_s` and, once a nonce exists, `expires_at` (a nonce link), and `fields`
 (capture: each `name`, `label`, `secret`). A nonce link never carries the live nonce: it has `url_template`, never `url`,
 so an agent can't bind a chat. `action` is one of `read`, `open_link`, `paste_secret`, `enter_value`, `run_verify`. A
 verify's request URL is never shown.

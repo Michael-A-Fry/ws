@@ -144,6 +144,7 @@ CASES: dict[str, list[str]] = {
     "msg.export": ["msg", "export", "--out", "{home}/messages.jsonl"],
     "msg.watch": ["msg", "watch", "--position-now"],
     "msg.wait": ["msg", "wait", "--timeout", "1"],
+    "connect": ["connect", "telegram", "--dry-run"],
     "walls.init": ["walls", "init", "alpha"],
     "walls.check": [
         "walls",

@@ -1372,6 +1372,63 @@ def test_a_server_reading_a_path_trick_as_dot_dot_gets_nothing_when_paths_is_set
     assert len(env.stub.seen) == seen
 
 
+def _base_registry(env, extra: str) -> None:
+    env.write_registry(f'[anthropic]\nhosts = ["{env.stub.host}"]\n{extra}\n')
+
+
+def test_a_base_path_goes_in_front_of_the_request_path_and_the_query(env):
+    _base_registry(env, 'base_path = "/api"')
+    assert env.call("/v1/messages?beta=1")[0] == 200
+    assert env.stub.seen[-1]["target"] == "/api/v1/messages?beta=1"
+
+
+def test_a_base_path_with_a_trailing_slash_is_the_same_as_without(env):
+    _base_registry(env, 'base_path = "/api/"')
+    assert env.call("/v1/messages")[0] == 200
+    assert env.stub.seen[-1]["target"] == "/api/v1/messages"
+
+
+def test_without_a_base_path_the_target_is_as_before(env):
+    _base_registry(env, "")
+    assert env.call("/v1/messages")[0] == 200
+    assert env.stub.seen[-1]["target"] == "/v1/messages"
+
+
+def test_paths_judges_the_path_the_tool_sent_not_the_one_with_the_prefix(env):
+    _base_registry(env, 'base_path = "/api"\npaths = ["/v1/messages"]')
+    lease = env.lease()
+    assert env.call("/v1/messages", lease=lease)[0] == 200
+    seen = len(env.stub.seen)
+    assert env.call("/api/v1/messages", lease=lease)[0] == 403  # the prefix is not part of the allowed list
+    assert len(env.stub.seen) == seen
+
+
+@pytest.mark.parametrize("tricky", ["/../admin", "/v1/../../admin", "/v1/%2e%2e/admin", "/v1/a;b", "/v1/a\\b"])
+def test_a_base_path_cannot_be_left_by_a_dot_dot_even_with_no_paths_list(env, tricky):
+    _base_registry(env, 'base_path = "/api"')
+    lease = env.lease()
+    seen = len(env.stub.seen)
+    assert env.call(tricky, lease=lease)[0] == 403
+    assert len(env.stub.seen) == seen
+
+
+def test_an_absolute_url_as_the_path_stays_under_the_base_path_or_is_refused(env):
+    _base_registry(env, 'base_path = "/api"')
+    lease = env.lease()
+    seen = len(env.stub.seen)
+    status = env.call("http://evil.example.com/", lease=lease)[0]
+    forwarded = env.stub.seen[seen:]
+    assert status == 403 or all(s["target"].startswith("/api/") for s in forwarded)
+    assert all(s["headers"]["host"] == env.stub.host for s in forwarded)
+
+
+@pytest.mark.parametrize("bad", ['""', '"api"', '"/a/../b"', '"//api"', '"/api//v1"', '"/api?x=1"', '"/a b"', "5", '"/%2e"'])
+def test_a_bad_base_path_refuses_the_whole_registry(env, bad):
+    _base_registry(env, f"base_path = {bad}")
+    with pytest.raises(wsecrets.SecretsError, match="base_path"):
+        wsecrets.load_registry(env.registry)
+
+
 def test_tightening_paths_or_ttl_in_the_registry_bites_leases_already_open(env):
     lease = env.lease()
     assert env.call("/v1/other", lease=lease)[0] == 200  # no list yet

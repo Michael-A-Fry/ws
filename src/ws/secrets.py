@@ -244,14 +244,14 @@ def _entry(path: Path, name: str, t: dict) -> Entry:
             f"{path}: [{name}] paths is empty: leave the key out to allow any path, or list the prefixes"
         )
     for pre in req_paths:
-        if not PATH_PREFIX_RE.match(pre) or any(seg in (".", "..") for seg in pre.split("/")):
+        if not PATH_PREFIX_RE.fullmatch(pre) or any(seg in (".", "..") for seg in pre.split("/")):
             raise SecretsError(
                 f"{path}: [{name}] {pre!r} is not a path prefix (start with /; letters, digits and ._~/- only; no . or .. part)"
             )
     base_path = t.get("base_path", "")
     if "base_path" in t and (
         not isinstance(base_path, str)
-        or not PATH_PREFIX_RE.match(base_path)
+        or not PATH_PREFIX_RE.fullmatch(base_path)
         or "//" in base_path
         or any(seg in (".", "..") for seg in base_path.split("/"))
     ):

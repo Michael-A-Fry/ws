@@ -1344,7 +1344,7 @@ def test_a_name_without_paths_forwards_any_path(env):
     assert env.call("/anything/at/all")[0] == 200
 
 
-@pytest.mark.parametrize("bad", ["[]", '["v1"]', '["/v1?x=1"]', '["/v1/../x"]', '["/%2e"]', '["/a b"]', '"/v1"'])
+@pytest.mark.parametrize("bad", ["[]", '["v1"]', '["/v1?x=1"]', '["/v1/../x"]', '["/%2e"]', '["/a b"]', '"/v1"', '["/v1\\n"]'])
 def test_a_bad_paths_entry_refuses_the_whole_registry(env, bad):
     _paths_registry(env, bad)
     with pytest.raises(wsecrets.SecretsError, match="paths|path prefix|list"):
@@ -1418,12 +1418,11 @@ def test_an_absolute_url_as_the_path_stays_under_the_base_path_or_is_refused(env
     seen = len(env.stub.seen)
     status = env.call("http://evil.example.com/", lease=lease)[0]
     forwarded = env.stub.seen[seen:]
-    assert status == 403 or all(s["target"].startswith("/api/") for s in forwarded)
-    assert all(s["headers"]["host"] == env.stub.host for s in forwarded)
+    assert status == 404 and forwarded == []  # no lease token in the path: the broker answers itself
 
 
 @pytest.mark.parametrize(
-    "bad", ['""', '"api"', '"/a/../b"', '"//api"', '"/api//v1"', '"/api?x=1"', '"/a b"', "5", '"/%2e"']
+    "bad", ['""', '"api"', '"/a/../b"', '"//api"', '"/api//v1"', '"/api?x=1"', '"/a b"', "5", '"/%2e"', '"/api\\n"']
 )
 def test_a_bad_base_path_refuses_the_whole_registry(env, bad):
     _base_registry(env, f"base_path = {bad}")

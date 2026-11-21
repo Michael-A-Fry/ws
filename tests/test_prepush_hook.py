@@ -99,7 +99,7 @@ def test_a_whole_suite_run_uses_the_full_class_and_spaces_only_counts_as_unset(t
     (tmp_path / "a").mkdir()
     (tmp_path / "b").mkdir()
     full = run_hook(tmp_path / "a", None, with_ws_test=True, full=True)
-    assert full[1] == "ws-test --full --node local -- " + SUITE
+    assert full[1] == "ws-test --full --node auto -- " + SUITE
     spaces = run_hook(tmp_path / "b", "   ", with_ws_test=True)
     assert spaces[1].startswith("ws-test --light --mem 3G --node local -- ")
 
@@ -215,7 +215,7 @@ def test_the_memory_ceiling_follows_the_set(tmp_path):
     _, err = run_selected(tmp_path / "many", many, with_ws_test=True)
     assert "ws-test --light --mem 6G --node local -- " in err
     _, err = run_selected(tmp_path / "full", {"src/ws/c.py": "Y = 2\n"}, {"WS_PREPUSH_FULL": "1"}, with_ws_test=True)
-    assert "ws-test --full --node local -- " in err
+    assert "ws-test --full --node auto -- " in err
     assert "--mem" not in err
 
 

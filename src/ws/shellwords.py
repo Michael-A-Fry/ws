@@ -968,8 +968,10 @@ def strip_wrappers(
                 toks = []
                 break
         arg_opts, i, resplit, exec_form = _WRAPPERS[w], 1, None, False
+        took: set[int] = set()  # the places of the words env or sudo took as settings, never an option's value
         if w == "env":
             i, sets, resplit = _env_args(toks)
+            took = set(range(i - len(sets), i))
             if env is not None:
                 env.extend(sets)
         while w != "env" and i < len(toks):
@@ -986,6 +988,7 @@ def strip_wrappers(
             elif w == "sudo" and _env_setting(t, w):
                 if env is not None:
                     env.append(t)
+                took.add(i)
                 i += 1
             else:
                 break
@@ -993,12 +996,13 @@ def strip_wrappers(
             while i < len(toks) and _env_setting(toks[i], w):
                 if env is not None:
                     env.append(toks[i])
+                took.add(i)
                 i += 1
         if i < len(toks):
             i += _POSITIONAL.get(w, 0)
         if dropped is not None:
             dropped += [
-                t for t in toks[1:i] if not t.startswith("-") and not ASSIGN.match(t) and not _env_setting(t, w)
+                t for k, t in enumerate(toks[1:i], 1) if not t.startswith("-") and not ASSIGN.match(t) and k not in took
             ]
         if resplit and scripts is not None:
             scripts.append(resplit)
@@ -1008,7 +1012,7 @@ def strip_wrappers(
             toks = []
             break
         # the words of an `env -S` string are env's own arguments: its options and settings come first
-        toks = (["env", *words_of(resplit, lexenv, budget)] if resplit else []) + toks[i:]
+        toks = (["env", *words_of(resplit, lexenv, budget)] if resplit is not None else []) + toks[i:]
     return toks, seen
 
 

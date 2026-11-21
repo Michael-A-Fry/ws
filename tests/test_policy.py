@@ -2572,3 +2572,18 @@ def test_env_is_read_as_gnu_env_reads_it(pol, home, cmd):
 def test_ordinary_env_forms_still_run(pol, home):
     for cmd in ("env --chdir=/tmp git status", "env -i PATH=/bin ls", "env - LC_ALL=C ls", "sudo -uroot ls"):
         assert policy.is_denied_command(pol, cmd) is None, cmd
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "xargs -a ~/.ssh/k=v true",  # a file a wrapper reads, with an = in its name, is still judged
+        "env -C ~/.ssh/a=b true",  # env's directory, = or not
+        "sudo -D ~/.ssh/a=b true",  # sudo's directory, = or not
+        "chroot ~/.ssh/a=b true",  # chroot's new root, = or not
+        "env -S '' -- git push --force origin main",  # an empty split string keeps env in front of what follows
+        "env --split-string= git push --force origin main",
+    ],
+)
+def test_a_wrapper_value_with_an_equals_sign_and_an_empty_split_string_are_judged(pol, home, cmd):
+    assert policy.is_denied_command(pol, cmd)

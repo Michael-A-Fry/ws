@@ -109,7 +109,10 @@ def test_a_profile_key_that_is_not_a_table_is_never_overwritten(home):
 
 def test_the_table_lists_each_job_its_model_and_where_it_came_from(home, capsys):
     (home / "profile.toml").write_text('[models]\ndefault = "d"\njobs = "p"\n', encoding="utf-8")
-    write = lambda n, t: (home / "jobs" / f"{n}.toml").write_text(t, encoding="utf-8")  # noqa: E731
+
+    def write(n, t):
+        (home / "jobs" / f"{n}.toml").write_text(t, encoding="utf-8")
+
     write("a", 'runner = "claude-code"\nmodel = "own"\nprompt = "p"\n')
     write("b", 'runner = "claude-code"\npurpose = "jobs"\nprompt = "p"\n')
     write("c", 'runner = "claude-code"\nprompt = "p"\n')

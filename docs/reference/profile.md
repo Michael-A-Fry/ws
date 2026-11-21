@@ -5,7 +5,7 @@ roles, the spend cap and which model each job runs on. `ws config` lists the key
 command changes it, and the rewrite drops comments, so the setters below copy it to `profile.toml.bak-<UTC stamp>`
 first.
 
-## `[models]`: which model a job runs on
+## Which model a job runs on
 
 A job file can leave `model` out. ws then picks the model in this order and stops at the first one it finds:
 
@@ -23,7 +23,7 @@ default = "claude-haiku-4-5"   # any job with no model and no purpose entry
 review = "claude-sonnet-4-5"   # jobs with purpose = "review"
 ```
 
-A model id is passed to the runner as it is: a Claude Code name or alias, a `provider/model` id for OpenCode, or a
+A model id goes to the runner unchanged: a Claude Code name or alias, a `provider/model` id for OpenCode, or a
 local provider's id. The run's own checks then judge the model the job resolved to, as if the job named it: a provider
 the job's data class doesn't allow is refused, and a model the runner can't price needs `allow_unpriced = true` in the
 job file.
@@ -31,7 +31,7 @@ job file.
 A job that names its own `model` doesn't read `[models]` at all, so setting a default never changes it. `ws config model`
 shows which jobs that holds for.
 
-### Example: one purpose on a local model
+### Example with one purpose on a local model
 
 The profile:
 

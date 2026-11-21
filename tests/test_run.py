@@ -629,13 +629,13 @@ def test_a_missing_runner_is_an_error_record(ws, monkeypatch):
 def test_a_bad_job_exits_2_and_leaves_an_error_record(ws, capsys):
     (ws.home / "jobs" / "daily.toml").write_text('runner = "claude-code"\n', encoding="utf-8")
     assert cli.main(["run", "daily"]) == 2
-    assert "model is required" in capsys.readouterr().err
+    assert "exactly one of prompt and prompt_file" in capsys.readouterr().err
     assert cli.main(["run", "nope"]) == 2
     ws.job(extra='cwd = "/does/not/exist"')
     assert cli.main(["run", "daily"]) == 2
     first, second, third = (valid(r) for r in ws.records())
     assert [r["job"] for r in (first, second, third)] == ["daily", "nope", "daily"]
-    assert first["status"] == "error" and "model is required" in first["error"] and first["runner"] is None
+    assert first["status"] == "error" and "exactly one of prompt and prompt_file" in first["error"] and first["runner"] is None
     assert "no job 'nope'" in second["error"] and second["exit_code"] is None
     assert third["runner"] == "claude-code" and "not a folder" in third["error"]
     assert ws.leases.requested == []

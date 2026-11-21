@@ -2633,3 +2633,23 @@ def test_sudo_edit_writes_its_files(pol, home):
         assert "protects" in (policy.is_denied_command(pol, cmd, protect=(target,)) or ""), cmd
     assert policy.is_denied_command(pol, "sudo -e /tmp/notes.txt", protect=(target,)) is None
     assert policy.is_denied_command(pol, "sudo -s ls", protect=(target,)) is None  # a command given: judged as it is
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "sudo -h other git push --force origin main",  # a bare -h before a word may be a host
+        "sudo -lh other git push --force origin main",
+        "SUDO_ASKPASS=/tmp/x sudo ls",  # with no terminal, sudo runs the askpass program without -A
+        "export SUDO_ASKPASS=/tmp/x; sudo ls",
+        "read -r SUDO_ASKPASS < /tmp/f; export SUDO_ASKPASS; sudo ls",
+        "sudo -s cat '$HOME/.ssh/id_rsa'",  # the inner shell expands what the outer one left quoted
+    ],
+)
+def test_sudo_host_askpass_and_inner_shell_forms_are_refused(pol, home, cmd):
+    assert policy.is_denied_command(pol, cmd)
+
+
+def test_sudo_with_n_or_without_askpass_still_runs(pol, home):
+    for cmd in ("SUDO_ASKPASS=/tmp/x sudo -n ls", "sudo -h", "sudo -hother ls", "sudo ls"):
+        assert policy.is_denied_command(pol, cmd) is None, cmd

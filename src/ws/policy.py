@@ -2353,7 +2353,7 @@ def _segment_once(
     toks, wrappers = shellwords.strip_wrappers(
         words, set_env, lexenv=env, budget=ctx.budget, dropped=dropped, scripts=nested
     )
-    held = _targets(toks) & (set(ctx.vars or {}) | set(ctx.loops or {}) | set(ctx.unknown) | _SSH_ENV)
+    held = _targets(toks) & (set(ctx.vars or {}) | set(ctx.loops or {}) | set(ctx.unknown) | _ASKPASS_ENV)
     if held:  # read X / let X=.. after X held a value (or set ssh's askpass): which value it has now isn't followed
         _mark_names(ctx, held)
     if toks and toks[0] == "unset":  # unset X: what X holds is no longer the value ws knows
@@ -2411,6 +2411,8 @@ def _segment_once(
     if admin:
         return admin, line, []
     local_seg = seg  # the part of the line that runs here
+    if "sudo" in wrappers and (why := _sudo_askpass(ctx, set_env, words)):
+        return why, line, []
     ssh_toks, ssh_prefix, ssh_why = _ssh_toks(cmd, toks, env, ctx.budget)
     if ssh_why:
         return ssh_why, line, []
@@ -2792,6 +2794,25 @@ def _ssh_remote(
     if not m or m.group(1) != remote[0] or re.search(r"[<>]", seg[: m.start(1)]):
         return None, False
     return (m.start(1) - 1, False) if all(_named_host(policy, n) for n in names) else (None, False)
+
+
+_ASKPASS_ENV = frozenset(_SSH_ENV | {"SUDO_ASKPASS"})  # names an askpass program a command may run
+
+
+def _sudo_askpass(ctx: _Ctx, set_env: list[str], words: list[str]) -> str | None:
+    """A refusal for a sudo that may run the askpass program SUDO_ASKPASS names: sudo runs it without -A when it has
+    no terminal, as an agent's shell does. Only when SUDO_ASKPASS is set on the line, held from earlier, or may be
+    (a part of the line set any variable), and sudo is not given -n."""
+    names = set(ctx.vars or {}) | set(ctx.unknown)
+    if not ("SUDO_ASKPASS" in names or ctx.distrust or any(w.startswith("SUDO_ASKPASS") for w in set_env)):
+        return None
+    k = next((j for j, w in enumerate(words) if posixpath.basename(w) == "sudo"), None)
+    if k is not None and shellwords.sudo_options(words[k:]) & {"n", "non-interactive"}:
+        return None
+    return (
+        "sudo may run the askpass program SUDO_ASKPASS names, which runs on this machine and ws cannot read; "
+        "give sudo -n, or leave SUDO_ASKPASS unset"
+    )
 
 
 def _ssh_toks(

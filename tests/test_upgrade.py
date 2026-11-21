@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 from helpers.procs import wait_gone
 
-from ws import __version__, approvals, cli, doctor, install, paths, policy, selfcmd, upgrade, userconfig
+from ws import __version__, approvals, cli, doctor, install, output, paths, policy, selfcmd, upgrade, userconfig
 from ws.adapters import claude_code
 from ws.term import bridge
 
@@ -1205,9 +1205,14 @@ def starts(monkeypatch):
 
 
 unix_only = pytest.mark.skipif(not hasattr(__import__("socket"), "AF_UNIX"), reason="Unix sockets")
+# the stop needs the kernel to name the peer (SO_PEERCRED) and a pidfd to signal it through: Linux only, so elsewhere
+# the broker is always left running (macOS has neither)
+linux_only = pytest.mark.skipif(
+    not sys.platform.startswith("linux") or not hasattr(os, "pidfd_open"), reason="SO_PEERCRED and pidfd are Linux"
+)
 
 
-@unix_only
+@linux_only
 def test_a_broker_on_older_code_is_stopped_and_a_new_one_started(
     cutover, old, stub_broker, starts, broker_sock, capsys
 ):
@@ -1226,7 +1231,7 @@ def test_a_broker_on_the_new_version_is_left_alone(cutover, old, stub_broker, st
     assert stub.poll() is None and starts == []
 
 
-@unix_only
+@linux_only
 def test_a_broker_with_a_lease_open_is_left_running_and_the_way_to_finish_is_named(
     cutover, old, stub_broker, starts, capsys
 ):
@@ -1259,7 +1264,7 @@ def test_an_auto_rollback_never_touches_the_broker(cutover, old, stub_broker, st
     assert stub.poll() is None and starts == []
 
 
-@unix_only
+@linux_only
 def test_a_rollback_restarts_the_broker_too(cutover, old, stub_broker, starts, broker_sock):
     stub = stub_broker("0.0.1")
     assert cli.main(["upgrade", "--rollback", "--version", "0.0.1"]) == 0
@@ -1280,7 +1285,7 @@ def test_no_broker_running_is_nothing_to_do(cutover, old, broker_sock, starts):
     assert starts == []
 
 
-@unix_only
+@linux_only
 def test_the_new_broker_is_started_by_the_ws_the_installer_wrote(broker_sock, tmp_path):
     """The real start: `ws.run._start_broker` in a process of the given Python, which leaves a broker answering."""
     new = upgrade.NewWs(selfcmd.argv(), sys.executable, __version__, "this test")
@@ -1295,11 +1300,14 @@ def test_the_new_broker_is_started_by_the_ws_the_installer_wrote(broker_sock, tm
         assert upgrade._gone(broker_sock, 20)
 
 
-@unix_only
+@linux_only
 def test_a_peer_pid_of_zero_is_never_signalled(cutover, old, stub_broker, starts, capsys, monkeypatch):
     """SO_PEERCRED says pid 0 for a peer in another pid namespace, and kill(0) would hit this process's own group."""
     stub = stub_broker("0.0.1")
     monkeypatch.setattr(upgrade, "_peer_cred", lambda conn: (0, os.getuid()))
+    monkeypatch.setattr(
+        upgrade, "_pidfd", lambda pid: os.pidfd_open(stub.pid)
+    )  # a working pidfd: only the guard stops it
     assert cli.main(["upgrade"]) == 1
     assert stub.poll() is None and starts == []
     out = capsys.readouterr().out
@@ -1319,7 +1327,7 @@ _STUBBORN_BROKER = _STUB_BROKER.replace(
 )
 
 
-@unix_only
+@linux_only
 def test_a_broker_that_does_not_stop_is_reported_and_no_second_one_started(
     cutover, old, broker_sock, starts, capsys, monkeypatch
 ):
@@ -1337,14 +1345,16 @@ def test_a_broker_that_does_not_stop_is_reported_and_no_second_one_started(
         seen = capsys.readouterr()
         assert "did not stop within 1 seconds" in seen.err
         assert json.loads(seen.out)["data"]["broker"] == "failed"
+        assert json.loads(seen.out)["status"] == output.ATTENTION
         assert [d["exit"] for d in _log() if d["step"] == "broker"] == [1]
     finally:
         stub.kill()
         stub.wait()
 
 
-@unix_only
+@linux_only
 def test_the_result_says_what_happened_to_the_broker(cutover, old, stub_broker, starts, capsys):
     stub_broker("0.0.1")
     assert cli.main(["upgrade", "--json"]) == 0
-    assert json.loads(capsys.readouterr().out)["data"]["broker"] == "restarted"
+    env = json.loads(capsys.readouterr().out)
+    assert env["data"]["broker"] == "restarted" and env["status"] == output.OK

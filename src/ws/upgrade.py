@@ -859,7 +859,8 @@ def _both(args: argparse.Namespace, env: Mapping[str, str]) -> int:
     broker_state = restart_broker(args, env, new)
     if args.json:
         output.result(
-            {"from": before, "binary": "swapped", "hooks": "rewritten", "checked": bool(check), "broker": broker_state}
+            {"from": before, "binary": "swapped", "hooks": "rewritten", "checked": bool(check), "broker": broker_state},
+            status=output.OK if broker_state in BROKER_DONE else output.ATTENTION,
         )
     else:
         print(f"ws: upgraded from {before}; the hooks are rewritten" + _broker_note(broker_state))
@@ -920,7 +921,10 @@ def _rollback(args: argparse.Namespace, env: Mapping[str, str]) -> int:
     record(env, "rollback", before, target)
     broker_state = restart_broker(args, env, new) if new is not None else "not running"
     if args.json:
-        output.result({"from": before, "to": target, "binary": "swapped", "hooks": "rewritten", "broker": broker_state})
+        output.result(
+            {"from": before, "to": target, "binary": "swapped", "hooks": "rewritten", "broker": broker_state},
+            status=output.OK if broker_state in BROKER_DONE else output.ATTENTION,
+        )
     else:
         print(f"ws: rolled back from {before} to {target}; the hooks are rewritten" + _broker_note(broker_state))
     return 0 if broker_state in BROKER_DONE else EXIT_FAILED

@@ -440,7 +440,7 @@ def installed_ws(env: Mapping[str, str]) -> NewWs:
         if not py or py in seen or not os.path.isabs(py) or not os.access(py, os.X_OK):
             continue
         seen.add(py)
-        prefix = [py, "-I", "-m", "ws"]
+        prefix = [py, *selfcmd.argv()[1:]]  # the same isolated start, with the found Python
         if selfcmd.unstable(prefix):
             continue
         version = _ask_version(prefix)

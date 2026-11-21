@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -64,10 +64,27 @@ def test_a_walled_session_cannot_send_on_any_route(box, sender, to):
     assert "only through `ws msg`" in err and "SendMessage" in err
 
 
-@pytest.mark.parametrize("folder", ["open", "plain"])
-def test_a_full_class_or_no_named_class_may_send(box, folder):
+def test_a_full_class_may_send(box):
     tmp, pol = box
-    assert run(send(tmp / folder, "anyone"), pol)[0] == 0
+    assert run(send(tmp / "open", "anyone"), pol)[0] == 0
+
+
+def test_a_walled_repos_worktree_outside_its_globs_is_unclassified_and_refused(box):
+    tmp, pol = box
+    tree = tmp / "house-wt" / "feature"  # a sibling worktree: no class names it, so it is the strictest case
+    tree.mkdir(parents=True)
+    code, _, err = run(send(tree, "money·x"), pol)
+    assert code == 2 and "unclassified" in err
+    assert run(send(tmp / "plain", "anyone"), pol)[0] == 2  # a new repo not yet in the policy, the same
+
+
+def test_a_policy_with_no_classes_leaves_messages_alone(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("WS_HOME", str(tmp_path / "wshome"))
+    (tmp_path / "wshome").mkdir()
+    pol = tmp_path / "wshome" / "policy.toml"
+    pol.write_text("", encoding="utf-8")
+    assert run(send(tmp_path, "anyone"), str(pol))[0] == 0
 
 
 def test_the_refusal_is_logged_in_the_class_copy_with_its_rule(box):
@@ -81,12 +98,15 @@ def test_the_refusal_is_logged_in_the_class_copy_with_its_rule(box):
 def test_message_wall_judges_only_message_calls():
     walled = policy_mod.Class("w", "walled")
     assert gate.message_wall(walled, []) is None
-    assert gate.message_wall(policy_mod.UNCLASSIFIED, [gate.Call("message", "x")]) is None
+    assert gate.message_wall(policy_mod.UNCLASSIFIED, [gate.Call("message", "x")])
+    assert gate.message_wall(None, [gate.Call("message", "x")]) is None
+    assert gate.message_wall(policy_mod.Class("f", "full"), [gate.Call("message", "x")]) is None
     assert gate.message_wall(walled, [gate.Call("message", "x")])
 
 
-def test_the_walls_case_flags_a_crossing_that_got_through(box):
+def test_the_walls_case_flags_a_crossing_that_got_through(box, monkeypatch):
     tmp, pol_path = box
+    monkeypatch.setattr(walls, "CROSSINGS_SINCE", datetime(2000, 1, 1, tzinfo=UTC))  # the test's own clock is now
     pol = policy_mod.load(Path(pol_path))
     ctx = walls.Ctx(pol=pol, kind="linux", env=dict(os.environ), now=datetime.now(UTC))
     case = next(c for c in walls.CASES if c.name == "no-message-crossings")
@@ -99,3 +119,14 @@ def test_the_walls_case_flags_a_crossing_that_got_through(box):
     jsonl.append(plant, jsonl.stamped({"tool": "SendMessage", "decision": "allow", "session": "s9"}, 1))
     got = case.check(ctx)
     assert not got.ok and "money" in got.detail
+
+
+def test_a_crossing_from_before_the_wall_shipped_is_history(box):
+    _, pol_path = box
+    pol = policy_mod.load(Path(pol_path))
+    ctx = walls.Ctx(pol=pol, kind="linux", env=dict(os.environ), now=datetime.now(UTC))
+    case = next(c for c in walls.CASES if c.name == "no-message-crossings")
+    plant = paths.state_dir() / "logs" / "classes" / "money" / gate.VERDICT_LOG
+    before = (walls.CROSSINGS_SINCE - timedelta(days=1)).timestamp()
+    jsonl.append(plant, jsonl.stamped({"tool": "SendMessage", "decision": "allow", "session": "old"}, 1, before))
+    assert case.check(ctx).ok

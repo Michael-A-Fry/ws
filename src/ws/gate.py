@@ -9,8 +9,8 @@
     ws gate launch --runner R -- ARGV              start a runner inside the sandbox wall (ws.sandbox)
     ws gate serve                                  the resident gate that answers the hooks (ws.gateserve)
 
-A session in a walled or counts-only class may not call its runner's send-message tool (`message_wall`): it talks to
-other sessions through `ws msg` alone, on every route.
+A session in a walled or counts-only class, or in a folder no class names, may not call its runner's send-message tool
+(`message_wall`): it talks to other sessions through `ws msg` alone, on every route.
 
 Every generated hook runs the thin client (ws.gateclient), which asks the resident gate and, when that can't answer,
 runs `check` or `event` itself: `run_hook` is the one decision path they share. The order is fixed: the preflight, the
@@ -359,12 +359,14 @@ def _class_of_cwd(pol: policy.Policy, cwd: str) -> policy.Class | None:
 
 
 def message_wall(cls: policy.Class | None, calls: list[Call]) -> str | None:
-    """The message wall: a session in a walled or counts-only class (one the policy names, not the built-in
-    unclassified one) sends to another session only through `ws msg`, so its runner's own send-message call is refused,
+    """The message wall: a session in a walled or counts-only class, or in a folder no class names (unclassified, the
+    strictest: a walled repo's worktree outside its globs, or a new repo not yet in the policy), sends to another session
+    only through `ws msg`, so its runner's own send-message call is refused,
     whatever the target and whatever route the runner would carry it on (a local socket, or a bridge to another machine).
     The sender's call is the one place ws sees every route; a receiver refuses what reaches it only through its runner's
-    own setting (`crossSessionInbound`, written into a class's launch file). None when the call may go."""
-    if cls is None or cls is policy.UNCLASSIFIED or cls.access == "full":
+    own setting (`crossSessionInbound`, written into a class's launch file). None when the call may go: a full class,
+    or a policy with no classes at all (`cls` None)."""
+    if cls is None or cls.access == "full":
         return None
     for call in calls:
         if call.kind == "message":

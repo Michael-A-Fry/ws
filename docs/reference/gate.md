@@ -52,14 +52,17 @@ An adapter reads a runner's payload as neutral calls, and the policy and the gua
 `skill`, `message`, `mcp` (an MCP tool, with its arguments) and `other`. The policy has rules for `command`, `read`,
 `search`, `write`, `tool` and `mcp`; the rest reach guards only, with one exception: the message wall.
 
-A `message` call (Claude Code's `SendMessage`) from a session in a walled or counts-only class is refused, whatever the
+A `message` call (Claude Code's `SendMessage`) from a session in a walled or counts-only class, or in a folder no class
+names (unclassified, the strictest case: a walled repo's worktree outside its globs, a repo not yet in the policy), is
+refused, whatever the
 target and whatever route the runner would carry it on: a socket on this machine, or a Remote Control bridge to
 another. Such a session talks to other sessions through `ws msg` alone. The rule is `rule:message_wall` in the verdict
-log, and a folder in a full class or in no named class is left alone. ws refuses at the sender because the sender's call
-is the one place it sees every route. A receiver refuses what reaches it only through its runner's own
-`crossSessionInbound` setting, which ws writes into each class's launch file (a class with an `os_user`).
+log. A folder in a full class is left alone, and so is every folder when the policy has no classes at all. ws refuses
+at the sender because the sender's call is the one place it sees every route. A receiver refuses what reaches it only
+through its runner's own `crossSessionInbound` setting, which ws writes into each class's launch file (a class with an
+`os_user`).
 `ws walls check` runs `no-message-crossings`, which fails on any send-message call a walled class's verdict log shows
-as allowed.
+as allowed since `walls.CROSSINGS_SINCE` (when the wall shipped; older lines are history).
 
 A tool no adapter reads is one `other` call, made by the gate from the tool's name (Claude Code's `tool_name`, the
 OpenCode shim's `tool`, cut to 80 characters). It's allowed, because the policy has no rule for it, and it isn't passed

@@ -485,12 +485,23 @@ def _case_owner_review(ctx: Ctx) -> Outcome:
 
 
 MESSAGE_TOOLS = ("SendMessage",)  # a runner's own send-message tool, as the verdict log names it
+# Verdict-log lines before this are from before the message wall shipped: a crossing then is history, not a fault now.
+CROSSINGS_SINCE = datetime(2026, 11, 21, 4, 0, tzinfo=UTC)
+
+
+def _since(ts, start: datetime) -> bool:
+    """Is a log line's `ts` (RFC 3339) at or after `start`? A line with no time it can read counts, so nothing hides."""
+    try:
+        t = datetime.fromisoformat(str(ts))
+    except ValueError:
+        return True
+    return (t if t.tzinfo else t.replace(tzinfo=UTC)) >= start
 
 
 def _case_crossings(ctx: Ctx) -> Outcome:
     """The crossing detector: a send-message call that the gate let through in a walled or counts-only class's own
-    verdict log is a crossing (an older gate, or a class added after the session started), and fails the case; the
-    calls the message wall refused are attempts, counted and passed."""
+    verdict log since `CROSSINGS_SINCE` is a crossing (an older gate, or a class added after the session started), and
+    fails the case; the calls the message wall refused are attempts, counted and passed."""
     from ws import gate, jsonl
     from ws.adapters import Call
 
@@ -505,7 +516,7 @@ def _case_crossings(ctx: Ctx) -> Outcome:
         for f in jsonl.files(state / "logs" / "classes" / name / gate.VERDICT_LOG):
             with contextlib.suppress(OSError, ValueError):
                 for r in jsonl.read(f):
-                    if r.get("tool") not in MESSAGE_TOOLS:
+                    if r.get("tool") not in MESSAGE_TOOLS or not _since(r.get("ts"), CROSSINGS_SINCE):
                         continue
                     if r.get("decision") == "allow":
                         crossed.append(f"{name}: session {r.get('session') or '?'} at {r.get('ts') or '?'}")

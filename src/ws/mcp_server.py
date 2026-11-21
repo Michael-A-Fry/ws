@@ -7,6 +7,9 @@ sessions (ws.msg: the sender is the session this server runs under, so no argume
 `class` argument is ignored). A tool that fails says so in its result (isError); a bad request is a JSON-RPC error.
 Nothing here crashes the server.
 
+The framing is shared: another tool set (ws.mail_mcp) passes its own `Toolset` to `serve`, and gets the same handshake,
+errors and frame limit.
+
 Input is read in bounded pieces: a frame ends at LF, CRLF or CR and may be at most `MAX_FRAME_BYTES` (4 MiB). A longer one
 gets a JSON-RPC error at once, the rest of it is dropped as it arrives, and the server carries on with the next frame.
 """
@@ -18,7 +21,7 @@ import json
 import re
 import sys
 from collections.abc import Iterator
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 
 from ws import __version__, memory, msg, notes
 from ws.notes import WsError
@@ -263,13 +266,29 @@ HANDLERS = {
 }
 
 
+@dataclass(frozen=True)
+class Toolset:
+    """What one MCP server offers: its tools (the tools/list entries), a handler per tool name, who it is and how to use
+    it. A handler takes the arguments and returns (text, structured), or raises BadArguments or a WsError."""
+
+    tools: list
+    handlers: dict
+    info: dict
+    instructions: str
+
+
+def _ws() -> Toolset:
+    return Toolset(TOOLS, HANDLERS, SERVER_INFO, INSTRUCTIONS)  # read at call time, so a test may swap a handler
+
+
 def _result(extra: dict | None = None) -> dict:
     return {"resultType": "complete", **(extra or {})}
 
 
-def tool_call(params: dict) -> dict:
+def tool_call(params: dict, ts: Toolset | None = None) -> dict:
+    ts = ts or _ws()
     name = params.get("name")
-    handler = HANDLERS.get(name) if isinstance(name, str) else None
+    handler = ts.handlers.get(name) if isinstance(name, str) else None
     if handler is None:
         raise RpcError(INVALID_PARAMS, f"unknown tool: {name!r}")
     args = params.get("arguments") or {}
@@ -300,7 +319,8 @@ def _check_version(params: dict) -> None:
         )
 
 
-def dispatch(method: str, params: dict) -> dict:
+def dispatch(method: str, params: dict, ts: Toolset | None = None) -> dict:
+    ts = ts or _ws()
     _check_version(params)
     if method == "initialize":
         asked = params.get("protocolVersion")
@@ -308,8 +328,8 @@ def dispatch(method: str, params: dict) -> dict:
             {
                 "protocolVersion": asked if asked in SUPPORTED else LATEST,
                 "capabilities": {"tools": {"listChanged": False}},
-                "serverInfo": SERVER_INFO,
-                "instructions": INSTRUCTIONS,
+                "serverInfo": ts.info,
+                "instructions": ts.instructions,
             }
         )
     if method == "server/discover":
@@ -317,8 +337,8 @@ def dispatch(method: str, params: dict) -> dict:
             {
                 "supportedVersions": list(SUPPORTED),
                 "capabilities": {"tools": {}},
-                "_meta": {"io.modelcontextprotocol/serverInfo": SERVER_INFO},
-                "instructions": INSTRUCTIONS,
+                "_meta": {"io.modelcontextprotocol/serverInfo": ts.info},
+                "instructions": ts.instructions,
                 "ttlMs": 60000,
                 "cacheScope": "public",
             }
@@ -326,9 +346,9 @@ def dispatch(method: str, params: dict) -> dict:
     if method == "ping":
         return {}
     if method == "tools/list":
-        return _result({"tools": TOOLS})
+        return _result({"tools": ts.tools})
     if method == "tools/call":
-        return tool_call(params)
+        return tool_call(params, ts)
     raise RpcError(METHOD_NOT_FOUND, f"method not found: {method}")
 
 
@@ -339,7 +359,7 @@ def _error(id_, code: int, message: str, data: dict | None = None) -> dict:
     return {"jsonrpc": "2.0", "id": id_, "error": err}
 
 
-def handle_line(line: str) -> dict | None:
+def handle_line(line: str, ts: Toolset | None = None) -> dict | None:
     """One input line in, one response out (None for a notification). Never raises."""
     try:
         msg = json.loads(line)
@@ -362,7 +382,7 @@ def handle_line(line: str) -> dict | None:
             raise RpcError(INVALID_PARAMS, "params must be an object")
         if is_notification:
             return None  # notifications/initialized, cancelled, and the rest: nothing to answer
-        return {"jsonrpc": "2.0", "id": id_, "result": dispatch(msg["method"], params)}
+        return {"jsonrpc": "2.0", "id": id_, "result": dispatch(msg["method"], params, ts)}
     except RpcError as e:
         return None if is_notification else _error(id_, e.code, e.message, e.data)
     except Exception as e:  # noqa: BLE001 (a request must not kill the server; only the type is logged)
@@ -412,17 +432,18 @@ def frames(stream, limit: int = MAX_FRAME_BYTES) -> Iterator[str | None]:
         yield bytes(buf).decode("utf-8", "replace")
 
 
-def serve(stdin=None, stdout=None, max_frame: int = MAX_FRAME_BYTES) -> int:
+def serve(stdin=None, stdout=None, max_frame: int = MAX_FRAME_BYTES, ts: Toolset | None = None) -> int:
     stdin = stdin or sys.stdin
     stdout = stdout or sys.stdout
-    print(f"ws mcp: serving on stdio (ws {__version__})", file=sys.stderr)
+    name = ts.info.get("name", "ws") if ts else "ws"
+    print(f"{name} mcp: serving on stdio (ws {__version__})", file=sys.stderr)
     for line in frames(stdin, max_frame):
         if line is None:
             reply = _error(None, INVALID_REQUEST, "frame too large", {"limit": max_frame})
         elif not line.strip():
             continue
         else:
-            reply = handle_line(line)
+            reply = handle_line(line, ts)
         if reply is not None:
             stdout.write(json.dumps(reply, ensure_ascii=True, separators=(",", ":")) + "\n")
             stdout.flush()

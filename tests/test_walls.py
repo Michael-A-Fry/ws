@@ -45,6 +45,7 @@ NAMES = [
     "memory-notes-refused",
     "walled-card-no-counts",
     "tracer-stays-in-class",
+    "no-message-crossings",
 ]
 FLOW_NAMES = NAMES[17:]  # the cases about what leaves a walled class through ws's own stores: tests/test_walls_flows.py
 

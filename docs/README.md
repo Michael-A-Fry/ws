@@ -31,6 +31,7 @@ Apply the safety rules:
 - [Use the wall](how-to/use-the-wall.md): start a session in a sandbox.
 - [Approve a command](how-to/approve-a-command.md): let a command run once, with your yes.
 - [Store a secret](how-to/store-a-secret.md): keep a key where an agent can't read it.
+- [Add a connect flow](how-to/add-a-connect-flow.md): describe the steps only a person can do, once, for an integration.
 - [Plug in a zone MCP server](how-to/plug-in-zone-mcp.md): give one agent a service's tools, read-only and logged.
 - [Apply the Rule of Two](how-to/apply-the-rule-of-two.md): refuse a job that could leak private data.
 - [Set up a class user](how-to/set-up-a-class-user.md): give a data class its own operating-system account.
@@ -59,12 +60,15 @@ Measure:
 - [CLI](reference/cli.md): every command and flag, the exit codes and the JSON envelope.
 - [Doctor checks](reference/doctor-checks.md): every `WS` ID with its meaning and fix.
 - [Policy](reference/policy.md): every `policy.toml` key.
+- [Profile](reference/profile.md): which model each job runs on, the spend cap, and the `ws config` setters.
 - [Guards](reference/guards.md): the named checks, their events and findings, replay.
 - [Messages](reference/messages.md): the message store, its commands, and how a message reaches a session.
 - [CI](reference/ci.md): each workflow job, its time budget, the test-integrity check and the holdout.
 - [Hooks](reference/hook-parity.md): what a hand-built hook set does, and the ws rule or guard that does the same job.
 - [Code map](reference/code-map.md): what each module in `src/ws/` is for, built from its docstring.
 - [Eval](reference/eval.md): task files, graders and the ten metrics.
+- [Mail](reference/mail.md): mailboxes for triage, the five mail tools, `ws mail` and the Gmail app password step.
+- [Connect flows](reference/connect.md): the flow file format, its state and the JSON an agent reads.
 - [Stores](reference/stores.md): every log and record file ws writes, its fields, schema and retention.
 - [Lab](reference/lab.md): the lab virtual machine cell and how it's protected.
 - [`ws version --json`](reference/version-json.md): the build and install fields.

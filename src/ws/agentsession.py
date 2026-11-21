@@ -5,7 +5,7 @@ it. Text cannot cover every spelling (a launcher, a path, a wrapper that has not
 for itself. `ws.cli.main` calls `guard` once a command is parsed, before it runs, so a new admin command cannot forget
 it. The admin commands are the one table here, which the matcher reads too: secrets and the broker, `approve`,
 `uninstall`, and the ones that rewrite or mint what gates a session (`gate init|generate`, `install --gate`,
-`skills adopt|restore`, `config fallback`, `session prepare`, `connector launch`). `session start` is in the table for the matcher but not
+`skills adopt|restore`, `config fallback|budget`, `session prepare`, `connector launch`). `session start` is in the table for the matcher but not
 for `guard`: the runner's own SessionStart hook runs it inside the session, with no terminal, so refusing it here would
 stop the registry being written. `broker serve` is the same: `ws run` starts it for a job's secrets, with no terminal,
 from a session when jobs are dispatched from one (the matcher still denies it typed; the other broker commands are
@@ -65,6 +65,7 @@ ADMIN_SUB = frozenset(
         ("skills", "adopt"),
         ("skills", "restore"),
         ("config", "fallback"),
+        ("config", "budget"),  # the monthly spend cap: a session never raises its own
         ("session", "prepare"),  # mints the role a launcher gives a session
         ("msg", "person-token"),  # mints the proof of a person's own send
         ("session", "start"),  # writes a session's registry record, role included
@@ -146,7 +147,10 @@ Ancestry = Callable[[], "list[str] | None"]
 
 def admin_name(command: str, args: object) -> str | None:
     """The admin command `command` (the dotted name the parser gave it, `secret.set`, `gate.generate`) is, as it is
-    typed, or None. `install` counts only with a `--gate` that is not `every-session`. `config fallback` is the command
+    typed, or None. `install` counts only with a `--gate` that is not `every-session`, or with `--cap`. `config model`
+    counts only with a value (the listing is open). These two look at the arguments, so they are not in ADMIN_SUB; the
+    text matcher (`policy._ws_admin`) checks the same spellings, and so does the profile write
+    (`profile.check_session_write`). `config fallback` is the command
     `config` with the topic `fallback`, so a topic that is a single word counts as the second."""
     parts = command.split(".")
     topic = getattr(args, "topic", None)
@@ -160,6 +164,10 @@ def admin_name(command: str, args: object) -> str | None:
         return " ".join(parts[:2])
     if parts[0] == "install" and getattr(args, "gate", None) not in (None, "every-session"):
         return "install --gate"
+    if parts[0] == "install" and getattr(args, "cap", None) is not None:
+        return "install --cap"  # the monthly spend cap, as `config budget`: a session never sets its own
+    if tuple(parts[:2]) == ("config", "model") and getattr(args, "words", None):
+        return "config model"  # setting which model jobs run on; the bare listing stays open
     return None
 
 

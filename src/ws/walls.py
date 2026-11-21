@@ -484,6 +484,51 @@ def _case_owner_review(ctx: Ctx) -> Outcome:
     return Outcome(not bad, "; ".join(bad) or f"owner and review date set and not due for {len(classes)} class(es)")
 
 
+MESSAGE_TOOLS = ("SendMessage",)  # a runner's own send-message tool, as the verdict log names it
+# Verdict-log lines before this are from before the message wall shipped: a crossing then is history, not a fault now.
+CROSSINGS_SINCE = datetime(2026, 11, 21, 4, 0, tzinfo=UTC)
+
+
+def _since(ts, start: datetime) -> bool:
+    """Is a log line's `ts` (RFC 3339) at or after `start`? A line with no time it can read counts, so nothing hides."""
+    try:
+        t = datetime.fromisoformat(str(ts))
+    except ValueError:
+        return True
+    return (t if t.tzinfo else t.replace(tzinfo=UTC)) >= start
+
+
+def _case_crossings(ctx: Ctx) -> Outcome:
+    """The crossing detector: a send-message call that the gate let through in a walled or counts-only class's own
+    verdict log since `CROSSINGS_SINCE` is a crossing (an older gate, or a class added after the session started), and
+    fails the case; the calls the message wall refused are attempts, counted and passed."""
+    from ws import gate, jsonl
+    from ws.adapters import Call
+
+    probe = policy.Class(PROBE_SENDER, "walled")
+    if gate.message_wall(probe, [Call("message", PROBE_SENDER)]) is None:
+        return Outcome(False, "the gate lets a walled session's send-message call through")
+    state = paths.state_dir(ctx.env or None)
+    crossed, refused = [], 0
+    for name, cls in sorted(ctx.pol.classes.items()):
+        if cls.access == "full":
+            continue
+        for f in jsonl.files(state / "logs" / "classes" / name / gate.VERDICT_LOG):
+            with contextlib.suppress(OSError, ValueError):
+                for r in jsonl.read(f):
+                    if r.get("tool") not in MESSAGE_TOOLS or not _since(r.get("ts"), CROSSINGS_SINCE):
+                        continue
+                    if r.get("decision") == "allow":
+                        crossed.append(f"{name}: session {r.get('session') or '?'} at {r.get('ts') or '?'}")
+                    else:
+                        refused += 1
+    if crossed:
+        return Outcome(
+            False, f"{len(crossed)} send-message call(s) went out of a walled class: " + "; ".join(crossed[:5])
+        )
+    return Outcome(True, f"no send-message call went out of a walled class ({refused} refused)")
+
+
 def _case_messaging(ctx: Ctx) -> Outcome:
     def test(cls: policy.Class, doc: dict) -> str | None:
         lacks = [t for t in wallsettings.MESSAGING_DENY if t not in _deny(doc)]
@@ -655,17 +700,27 @@ def _case_allowed_sender(ctx: Ctx) -> Outcome:
             return Outcome(False, "the class store's log does not hold one row for each message, delivered or refused")
         if len(msg.scratch_envelopes(shared)) != 1:
             return Outcome(False, "a refused message left an envelope row")
-        for inbound in ("lead-only", "off"):  # a walled class that names no one takes no one, the lead included
+        # lead-only takes the lead and no one else (DEC-052); off takes no one, the lead included
+        for inbound, lead_in in (("lead-only", True), ("off", False)):
             with _world(ctx, inbound) as v:
                 lead = session.Record(PROBE_SENDER, "walls", cwd=v.sender.cwd, role="lead", class_="open")
-                try:
-                    msg.scratch_delivery(v.root / "shared", v.pol, lead, v.to_alpha, "note", _plant())
-                except WsError as e:
-                    if e.kind != "refused":
-                        return Outcome(False, f"inbound {inbound} failed with {e.kind}, not a refusal")
-                else:
-                    return Outcome(False, f"a lead was let in to a walled class whose inbound is {inbound}")
-    return Outcome(True, "only a session on a walled class's allowlist is let in, and each message leaves one log row")
+                worker = session.Record(PROBE_OTHER, "walls", cwd=v.sender.cwd, class_="open")
+                for who, let_in in ((lead, lead_in), (worker, False)):
+                    try:
+                        msg.scratch_delivery(v.root / "shared", v.pol, who, v.to_alpha, "note", _plant())
+                    except WsError as e:
+                        if e.kind != "refused":
+                            return Outcome(False, f"inbound {inbound} failed with {e.kind}, not a refusal")
+                        if let_in:
+                            return Outcome(False, f"the lead was refused by a walled class whose inbound is {inbound}")
+                    else:
+                        if not let_in:
+                            return Outcome(
+                                False, f"a {who.role} was let in to a walled class whose inbound is {inbound}"
+                            )
+    return Outcome(
+        True, "only the lead (lead-only) or a session on the allowlist is let in, and each message leaves one log row"
+    )
 
 
 def _modes_problem(folder: Path) -> str | None:
@@ -1124,6 +1179,7 @@ CASES: list[Case] = [
         "msg's class store, the shared store's envelope, and the memory and notes refusals",
         host=False,
     ),
+    Case("no-message-crossings", _case_crossings, "the gate's message wall, and the class's verdict log", host=False),
 ]
 
 

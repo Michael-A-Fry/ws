@@ -88,6 +88,7 @@ class Entry:
     area: str | None = None
     kind: str = "header"  # header: the broker adds it to requests; else a minter in ws.minters makes a credential
     paths: tuple[str, ...] = ()  # request paths the broker forwards for this name (prefixes); empty: any path
+    base_path: str = ""  # a path the broker puts in front of the request path on its way out (the client's path is still checked by `paths`)
     ttl: float | None = None  # longest lease of this name, seconds; None: the broker's own limit (one hour by default)
     options: object = None  # the minter's own keys, parsed by it
     source: str = "paste"  # paste: a person brings the value; generate: `ws secret generate` makes it
@@ -210,9 +211,9 @@ def _str_list(path: Path, name: str, key: str, v: object) -> tuple[str, ...]:
 
 
 def _minters() -> dict:
-    from ws.minters import github_app, ssh_ca
+    from ws.minters import github_app, imap, ssh_ca
 
-    return {m.KIND: m for m in (github_app, ssh_ca)}
+    return {m.KIND: m for m in (github_app, imap, ssh_ca)}
 
 
 def _entry(path: Path, name: str, t: dict) -> Entry:
@@ -243,10 +244,21 @@ def _entry(path: Path, name: str, t: dict) -> Entry:
             f"{path}: [{name}] paths is empty: leave the key out to allow any path, or list the prefixes"
         )
     for pre in req_paths:
-        if not PATH_PREFIX_RE.match(pre) or any(seg in (".", "..") for seg in pre.split("/")):
+        if not PATH_PREFIX_RE.fullmatch(pre) or any(seg in (".", "..") for seg in pre.split("/")):
             raise SecretsError(
                 f"{path}: [{name}] {pre!r} is not a path prefix (start with /; letters, digits and ._~/- only; no . or .. part)"
             )
+    base_path = t.get("base_path", "")
+    if "base_path" in t and (
+        not isinstance(base_path, str)
+        or not PATH_PREFIX_RE.fullmatch(base_path)
+        or "//" in base_path
+        or any(seg in (".", "..") for seg in base_path.split("/"))
+    ):
+        raise SecretsError(
+            f"{path}: [{name}] base_path must start with / and use letters, digits and ._~/- only: no . or .. part, no //, no query"
+        )
+    base_path = base_path.rstrip("/")
     ttl = t.get("ttl")
     if ttl is not None and (isinstance(ttl, bool) or not isinstance(ttl, (int, float)) or not 0 < ttl <= MAX_TTL_S):
         raise SecretsError(f"{path}: [{name}] ttl must be a number of seconds above 0 and at most {MAX_TTL_S}")
@@ -255,7 +267,7 @@ def _entry(path: Path, name: str, t: dict) -> Entry:
         raise SecretsError(f"{path}: [{name}] source must be paste or generate")
     if source == "generate" and kind != "header":
         raise SecretsError(f"{path}: [{name}] a {kind} credential is brought by a person; source must be paste")
-    allowed = {"hosts", "header", "format", "purposes", "tier", "area", "kind", "source", "ttl", "paths"}
+    allowed = {"hosts", "header", "format", "purposes", "tier", "area", "kind", "source", "ttl", "paths", "base_path"}
     options = None
     if kind != "header":
         allowed = {"tier", "area", "kind", "purposes", "source"} | minters[kind].EXTRA_KEYS
@@ -274,6 +286,7 @@ def _entry(path: Path, name: str, t: dict) -> Entry:
         area=area,
         kind=kind,
         paths=req_paths,
+        base_path=base_path,
         ttl=float(ttl) if ttl is not None else None,
         options=options,
         source=source,

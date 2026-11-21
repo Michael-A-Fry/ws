@@ -1,0 +1,141 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Michael-A-Fry/ws/blob/main/docs/reference/connect-flow.schema.json",
+  "title": "ws.connect-flow/1",
+  "description": "A connect flow (TOML text in src/ws/connect/flows/<id>.py, or a <id>.toml outside the package; read as JSON here). The checks a schema cannot say (every {placeholder} is known, {secret} goes only to a host in [secret].hosts, a secret capture is followed by its verify) are in ws.connect.spec and tested there.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "id", "title", "unique_key", "steps"],
+  "properties": {
+    "schema": { "const": "ws.connect-flow/1" },
+    "id": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,31}$", "not": { "const": "list" } },
+    "title": { "type": "string", "minLength": 1 },
+    "unique_key": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,31}$", "not": { "enum": ["identity", "secret", "nonce"] } },
+    "secret": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "hosts"],
+      "properties": {
+        "name": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,63}$" },
+        "hosts": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } }
+      }
+    },
+    "steps": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "oneOf": [
+          { "$ref": "#/$defs/info" },
+          { "$ref": "#/$defs/link" },
+          { "$ref": "#/$defs/capture" },
+          { "$ref": "#/$defs/verify" }
+        ]
+      }
+    }
+  },
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,31}$" },
+    "https": { "type": "string", "pattern": "^https://[^/ ]+" },
+    "path": { "type": "string", "minLength": 1 },
+    "snake": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,31}$" },
+    "revoke": {
+      "oneOf": [
+        { "type": "object", "additionalProperties": false, "required": ["action"], "properties": { "action": { "enum": ["delete_secret", "forget"] } } },
+        { "type": "object", "additionalProperties": false, "required": ["action", "text"], "properties": { "action": { "const": "tell" }, "text": { "type": "string", "minLength": 1 } } }
+      ]
+    },
+    "info": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "type", "text"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "type": { "const": "info" },
+        "title": { "type": "string" },
+        "text": { "type": "string", "minLength": 1 },
+        "revoke": { "$ref": "#/$defs/revoke" }
+      }
+    },
+    "link": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "type", "url"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "type": { "const": "link" },
+        "title": { "type": "string" },
+        "text": { "type": "string" },
+        "url": { "$ref": "#/$defs/https" },
+        "nonce": { "type": "boolean" },
+        "expires_s": { "type": "integer", "minimum": 60, "maximum": 86400 },
+        "revoke": { "$ref": "#/$defs/revoke" }
+      },
+      "dependentRequired": { "nonce": ["expires_s"], "expires_s": ["nonce"] }
+    },
+    "capture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "type", "fields"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "type": { "const": "capture" },
+        "title": { "type": "string" },
+        "fields": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "label"],
+            "properties": {
+              "name": { "$ref": "#/$defs/snake" },
+              "label": { "type": "string", "minLength": 1 },
+              "secret": { "type": "boolean" },
+              "pattern": { "type": "string" }
+            }
+          }
+        },
+        "revoke": { "$ref": "#/$defs/revoke" }
+      }
+    },
+    "verify": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "type", "request"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "type": { "const": "verify" },
+        "title": { "type": "string" },
+        "request": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["url"],
+          "properties": { "url": { "$ref": "#/$defs/https" } }
+        },
+        "identity": { "$ref": "#/$defs/path" },
+        "unique_id": { "$ref": "#/$defs/path" },
+        "find": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["list", "where", "take"],
+          "properties": {
+            "list": { "$ref": "#/$defs/path" },
+            "where": { "type": "object", "minProperties": 1, "additionalProperties": { "type": "string" } },
+            "take": { "type": "object", "minProperties": 1, "additionalProperties": { "type": "string" } }
+          }
+        },
+        "conflict": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["text", "fix_url"],
+          "properties": { "text": { "type": "string", "minLength": 1 }, "fix_url": { "$ref": "#/$defs/https" } }
+        },
+        "revoke": { "$ref": "#/$defs/revoke" }
+      },
+      "oneOf": [
+        { "required": ["identity", "unique_id"], "not": { "required": ["find"] } },
+        { "required": ["find"], "not": { "anyOf": [{ "required": ["identity"] }, { "required": ["unique_id"] }] } }
+      ]
+    }
+  }
+}

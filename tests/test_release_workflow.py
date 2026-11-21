@@ -43,11 +43,11 @@ def run_bash(script: str, cwd: Path, env: dict[str, str]) -> subprocess.Complete
 
 
 def tag_check(tag: str, tmp_path: Path) -> subprocess.CompletedProcess[str]:
-    script = step_script("the tag is vX.Y.Z or vX.Y.ZrcN")
+    script = step_script("the tag is vX.Y.Z, vX.Y.Z.N or vX.Y.ZrcN")
     return run_bash(script, tmp_path, {"TAG": tag, "GITHUB_EVENT_NAME": "push"})
 
 
-@pytest.mark.parametrize("tag", ["v0.1.8", "v10.20.30", "v0.2.0rc1", "v0.2.0rc12"])
+@pytest.mark.parametrize("tag", ["v0.1.8", "v10.20.30", "v0.2.0rc1", "v0.2.0rc12", "v0.1.11.1", "v0.1.11.12"])
 def test_stable_and_release_candidate_tags_are_accepted(tag: str, tmp_path: Path):
     assert tag_check(tag, tmp_path).returncode == 0
 
@@ -64,13 +64,15 @@ def test_stable_and_release_candidate_tags_are_accepted(tag: str, tmp_path: Path
         "v0.2.0.dev1",
         "v0.2.0rc1.post1",
         "v0.2.0+local",
+        "v0.1.11.1.1",
+        "v0.1.11.",
         "",
     ],
 )
 def test_other_tags_are_refused(tag: str, tmp_path: Path):
     r = tag_check(tag, tmp_path)
     assert r.returncode == 1
-    assert "is not vX.Y.Z or vX.Y.ZrcN" in r.stdout
+    assert "is not vX.Y.Z, vX.Y.Z.N or vX.Y.ZrcN" in r.stdout
 
 
 CHANGELOG = """# Changelog

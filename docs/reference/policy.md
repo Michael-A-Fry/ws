@@ -302,6 +302,7 @@ so removing that setting makes that case fail.
 | `memory-notes-refused` | a walled session can't add memory or capture a note, and a search hides another class's files unless `readable_by` allows | no |
 | `walled-card-no-counts` | a walled message's envelope row (what `ws msg watch` and the viewer show) has no count field | no |
 | `tracer-stays-in-class` | a value planted in a walled class reaches no shared message store, memory or notes | no |
+| `no-message-crossings` | the gate's message wall refuses a walled session's send-message call, and no class's verdict log shows one allowed | no |
 
 Which class is a folder in (`class_of(policy, path)` in `src/ws/policy.py`):
 

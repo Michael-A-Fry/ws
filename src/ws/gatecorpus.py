@@ -19,6 +19,9 @@ is the shell's own and is left alone.)
 
 The numbers are a plain classifier's: a confusion matrix, the false-block rate (a call that should run, stopped or held),
 the miss rate (a call that should stop, allowed), how often a deny came back as an ask, each with a Wilson 95% interval.
+The cost of the gate is the p95 of check() over the rows, in milliseconds added per tool call, against a budget
+(`P95_BUDGET_MS` unless `--p95-budget-ms` says otherwise): over it, `ws gate replay --metrics` exits 1. False blocks are
+also given per 100 calls that should run.
 Standard library only; the gate does the judging (`ws.gate.replay_corpus`) and passes the results here.
 """
 
@@ -35,6 +38,9 @@ from ws.output import WsError
 
 SCHEMA = "ws.gate-corpus/1"
 SNAPSHOT_SCHEMA = "ws.gate-decisions/1"
+P95_BUDGET_MS = (
+    50.0  # p95 check() milliseconds a tool call may gain from the gate; about 14x the corpus p95 in Nov 2026
+)
 DECISIONS = ("allow", "deny", "ask")
 SOURCES = ("oracle", "parity", "regression", "control", "recorded")
 KINDS = ("command", "read", "write", "search")
@@ -235,9 +241,9 @@ def _errors(m: dict[str, dict[str, int]]) -> dict[str, dict]:
     }
 
 
-def metrics(rows: list[dict]) -> dict:
-    """The report: the confusion matrix, false-block, miss and softened rates, each source's row, and check() latency.
-    A row is {id, source, expect, result, known, differs, ms}."""
+def metrics(rows: list[dict], budget_ms: float = P95_BUDGET_MS) -> dict:
+    """The report: the confusion matrix, false-block, miss and softened rates, each source's row, check() latency and
+    whether its p95 is over `budget_ms`. A row is {id, source, expect, result, known, differs, ms}."""
     m = confusion(rows)
     by_source = {}
     for s in sorted({r["source"] for r in rows}):
@@ -251,13 +257,18 @@ def metrics(rows: list[dict]) -> dict:
             "miss": e["miss"],
         }
     ms = [r["ms"] for r in rows]
+    errors = _errors(m)
+    p95 = percentile(ms, 95)
+    fb = errors["false_block"]
     return {
         "rows": len(rows),
         "confusion": m,
-        **_errors(m),
+        **errors,
+        "false_blocks_per_100": None if fb["rate"] is None else round(100 * fb["rate"], 2),
         "known": sum(r["known"] for r in rows),
         "by_source": by_source,
-        "latency_ms": {"n": len(ms), "p50": percentile(ms, 50), "p95": percentile(ms, 95)},
+        "latency_ms": {"n": len(ms), "p50": percentile(ms, 50), "p95": p95, "budget": budget_ms},
+        "over_budget": p95 is not None and p95 > budget_ms,
     }
 
 
@@ -284,7 +295,10 @@ def report_lines(mt: dict) -> list[str]:
     out = [f"{mt['rows']} rows ({mt['known']} known)", "", "confusion (rows: expected; columns: judged)"]
     out.append(f"{'':<8}" + "".join(f"{d:>7}" for d in DECISIONS))
     out += [f"{e:<8}" + "".join(f"{m[e][d]:>7}" for d in DECISIONS) for e in DECISIONS]
+    per100 = mt.get("false_blocks_per_100")
     out += ["", _line("false blocks", mt["false_block"]), _line("misses", mt["miss"])]
+    if per100 is not None:
+        out.append(f"false blocks per 100 calls that should run: {per100:g}")
     out.append(_line("softened", mt["softened"]) + "  (deny came back as ask)")
     out += ["", f"{'source':<11}{'rows':>6}{'differ':>8}{'known':>7}{'false blocks':>14}{'misses':>9}"]
     for s, v in mt["by_source"].items():
@@ -296,6 +310,9 @@ def report_lines(mt: dict) -> list[str]:
     lat = mt["latency_ms"]
     if lat["p50"] is not None:
         out += ["", f"check() latency: p50 {lat['p50']:.2f} ms, p95 {lat['p95']:.2f} ms over {lat['n']} rows"]
+        if "budget" in lat:
+            verdict = "OVER" if mt.get("over_budget") else "within"
+            out.append(f"p95 added per tool call: {lat['p95']:.2f} ms, {verdict} the {lat['budget']:g} ms budget")
     return out
 
 

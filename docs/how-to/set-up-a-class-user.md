@@ -39,6 +39,11 @@ A walled class is optional. It needs Linux, WSL2 or macOS and a second account o
 
    An unknown class, or a class with no `os_user`, is a usage error (exit 2) that says what to add.
 
+   It also warns, on standard error (or in `warnings` with `--json`), about the host: when more than one class in the
+   policy has an `os_user` (their managed-settings files would be read together), that the managed-settings file binds
+   your own sessions too (the sandbox, the class's hosts only, your home hidden from shell commands), and when a repo of
+   the class is under your own home, which step 3 closes to the account.
+
 2. Read what it printed: two files.
 
    The managed-settings file goes in Claude Code's managed-settings folder, which Claude Code reads for every account on

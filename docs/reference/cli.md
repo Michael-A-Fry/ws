@@ -269,6 +269,10 @@ ws gate replay [-h] [--policy FILE] --runner {claude-code,opencode} FILE
 Exit 0 when every line with an `expect` matches (or none has one), and 1 when an `expect` differs. With `--json` the
 result is `{results, differ}`, one entry per line. See [Guards](guards.md).
 
+Given a labelled corpus, `--metrics` prints the gate's error rates, false blocks per 100 and the p95 time it adds to a
+tool call, and exits 1 when that p95 is over `--p95-budget-ms MS` (default 50). See
+[Replay a corpus](gate.md#replay-a-corpus).
+
 ### `ws gate launch`
 
 Start a runner inside the sandbox wall (bubblewrap on Linux, sandbox-exec on macOS); fails closed.
@@ -580,6 +584,31 @@ Serve memory_search, memory_add and note_capture over stdio.
 ```text
 ws mcp serve [-h]
 ```
+
+## `ws connect`
+
+Connect an integration: the steps only a person can do, from one flow file, walked the same way each time. The format and
+the JSON an agent reads are in [Connect flows](connect.md); to add one, see [Add a connect flow](../how-to/add-a-connect-flow.md).
+
+```text
+ws connect [-h] [--dry-run] [--diagnose] [--revoke] [--yes] [target]
+```
+
+| Argument | Meaning |
+|---|---|
+| `target` | A flow id, or `list` (the default): the flows there are. |
+| `--dry-run` | Show each step as `done` or `needs_human`. With `--json`, the agent contract. Exit 0 when all done, 3 when a person has something to do. Changes nothing; an agent may run it. |
+| `--diagnose` | Step state and what was learned, with the nonce redacted. Changes nothing. |
+| `--revoke` | Undo the flow: ask first (default no), delete its secret only if `ws connect` stored it, say what to undo on the other side, clear its state. Refused inside an agent session. |
+| `--yes` | With `--revoke`: don't ask. |
+
+With no flag, `ws connect <id>` walks the flow in your own terminal and refuses inside an agent session. A captured
+secret goes to the secrets store and nowhere else.
+
+## `ws mail`
+
+Mailboxes for triage (`[mail.NAME]` in the profile): `ws mail add NAME --host H --user U [--kind gmail]`, `ws mail
+check`, `ws mail rm NAME`, and `ws mail serve` (the five mail tools over stdio). See [Mail](mail.md).
 
 ## `ws connector`
 
@@ -989,7 +1018,7 @@ ws install [-h] [--stays-on yes|no] [--server ADDRESS|none] [--notes PATH] [--mo
 | `--gate every-session\|launch` | `every-session`: the runner's own user config carries ws's deny rules and hooks, so every session is gated. `launch`: only a session started with `ws gate launch` is. |
 | `--allow-widened-sandbox` | Keep settings of yours that open the sandbox (an excluded command, say); ws records the choice. |
 | `--class NAME` | Print the commands (`sudo` included), the two root-owned files for a class with an `os_user` (the managed-settings file and the launch file) and the way to take it all out again, and write nothing. ws creates no user and places no file. The launch file goes in a `ws-classes` folder beside the managed-settings one, which `ws gate launch` reads and Claude Code doesn't. See [Set up a class user](../how-to/set-up-a-class-user.md). |
-| `--cap USD` | Your own monthly spend cap. |
+| `--cap USD` | Your own monthly spend cap. With this flag it's an admin command: agent sessions can't set it. |
 | `-y`, `--yes` | No prompts. |
 | `--dry-run` | Show what would change; write nothing. |
 
@@ -1298,6 +1327,48 @@ missing. It proves what ws writes, not that a set-up host holds it: that's `ws w
 ws walls canary [-h]
 ```
 
+## `ws passtest`
+
+The step-in counter: how often a person had to come back and steer an AI tool, week by week. It reads a pass-test
+ledger (an append-only, hash-chained jsonl file that a separate helper writes) and never writes to it.
+
+### `ws passtest events`
+
+Print confirmed step-ins per week by kind and by area, and the trend. The ledger's hash chain is checked first; a
+broken or truncated chain counts nothing and exits 1 with the line number.
+
+```text
+ws passtest events [-h] [--weeks WEEKS] [--config CONFIG]
+```
+
+| Argument | Meaning |
+|---|---|
+| `--weeks WEEKS` | How many weeks (Monday 00:00 UTC), ending with this one (default 4, at most 520). |
+| `--config CONFIG` | The settings file (default: `$WS_PASSTEST_CONFIG`). |
+
+The settings file is TOML with two keys: `ledger` (a path, relative to the file) and `areas` (the areas always shown,
+in order). `$WS_PASSTEST_LEDGER` overrides `ledger`. ws has no built-in ledger path: with neither set, the command exits
+1 (`no_ledger`).
+
+Rules. A proposal counts when a `confirm` names it, or once it has been open 7 days with no `confirm` or `dismiss`; the
+latest decision wins, and it falls in the week of the proposal, not of the confirm. A `failed` or `missed` job run
+is one `not-automatic` step-in per `run_id`, in the week of its `expected_at`. The trend is the least-squares slope of
+the weekly totals: rising above +0.5 a week, falling below −0.5, flat in between. Nothing starts the count over.
+
+### Pass-test ledger lines
+
+Each line is `{"ts", "kind", "data", "prev"}`: `ts` is ISO 8601 UTC, `prev` the sha256 of the previous line's bytes
+(without its newline; 64 zeros on the first line). Anything that writes step-ins writes these `data` keys:
+
+| `kind` | `data` |
+|---|---|
+| `proposal` | `id`, `event_kind` (`dig`, `reframe`, `correct`, `follow-up`, `not-automatic`), `area`, `about` |
+| `confirm`, `dismiss` | `proposal_id` |
+| `job-run` | `job`, `run_id`, `status` (`ok`, `failed`, `missed`), `expected_at`; `area` optional |
+
+Other kinds aren't step-ins and are read past. A line the counter can't use (no id, an unknown `event_kind` or
+`status`) is listed as skipped.
+
 ## `ws rate`
 
 Give a run a thumbs up or down.
@@ -1498,16 +1569,17 @@ ws setup [-h] [--web] [--no-open] [-y] [--plugin NAME] [--notes PATH]
 | `--plugin NAME` | Switch a plugin on; repeat for more (ws plugin list). |
 | `--notes PATH` | Your notes folder (default: a vault found, else ~/Notes). |
 | `--runner RUNNER` | The AI tool ws runs jobs with. One of `claude-code`, `opencode`. |
-| `--cap USD` | Your own monthly spend cap. |
+| `--cap USD` | Your own monthly spend cap. With this flag it's an admin command: agent sessions can't set it. |
 | `--region CC` | Your country (two letters); kept in `[machine] region`. |
 
 ## `ws config`
 
 Every file ws reads: where it's, which folder layout it came from, the keys it sets. `ws config fallback` shows, sets and
-clears the program that gets words ws has no command for (see [Your own commands](#your-own-commands)).
+clears the program that gets words ws has no command for (see [Your own commands](#your-own-commands)). `ws config model`
+and `ws config budget` show and set which model a job runs on and the monthly spend cap (see [Profile](profile.md)).
 
 ```text
-ws config [-h] [--clear] [{fallback}] [PATH]
+ws config [-h] [--clear] [--yes] [--dry-run] [{fallback,model,budget}] [VALUE ...]
 ```
 
 | Argument | Meaning |
@@ -1515,6 +1587,10 @@ ws config [-h] [--clear] [{fallback}] [PATH]
 | `fallback` | Show the fallback program. With `PATH`, set it; with `--clear`, remove it. |
 | `PATH` | With `fallback`: the program (absolute, or `~/...`). It has to be an executable file you own that nobody else can write to. |
 | `--clear` | With `fallback`: remove it. |
+| `model` | No value: each job, its purpose, its model and where it came from. `ID`: set `[models].default`. `PURPOSE ID`: set `[models].PURPOSE`. With a value it's an admin command (agent sessions can't run it). |
+| `budget USD` | Set `[roles.budget] monthly_cap_usd`. A positive number. An admin command (agent sessions can't run it). |
+| `--yes` | With `model` or `budget`: write without asking. |
+| `--dry-run` | With `model` or `budget`: print the change, write nothing. |
 
 ## `ws status`
 

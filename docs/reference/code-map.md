@@ -18,10 +18,13 @@ below, and `python3 scripts/gen_code_map.py --check` (prek and CI) fails when it
 | `brand.py` | The ws look in one place: colour tokens by role, the mark, and the rule for when colour is on |
 | `broker.py` | The secrets broker: a small process that is not an LLM and holds the store, so agents never see... |
 | `canary.py` | `ws canary`: a few small checks that a runner's update did not break what ws relies on |
+| `cards.py` | `ws cards`: a walled class's account leaves a fixed-kind card (`done`, `counts`...) for the... |
 | `cli.py` | The `ws` command |
 | `commit_wall.py` | commit-wall: a commit hook that refuses a commit whose added lines or message hold a pattern you... |
 | `config_cmd.py` | `ws config`: every file ws reads, where its path came from, and the keys it sets |
 | `conformance.py` | The runner conformance kit: what every runner adapter must do the same way, as data and a few... |
+| `connect/` | Connect flows: the one format for the steps only a person can do, and the engine that walks them |
+| `connectcmd.py` | `ws connect`: walk the steps only a person can do to connect an integration, or show them to an... |
 | `connectors.py` | Connectors: plug a zone's MCP server (`[connectors.NAME]` in the policy) into one run or one... |
 | `context_load.py` | Context loader: what a session is told when it starts, and what the first prompt adds, from one... |
 | `devices.py` | `ws device add`: the one line that links a second machine to this one |
@@ -46,6 +49,9 @@ below, and `python3 scripts/gen_code_map.py --check` (prek and CI) fails when it
 | `jobs.py` | Job files: `jobs/<name>.toml` in ws's config folder, one headless job each, run with `ws run <name>` |
 | `jobwatch.py` | `ws watch`: the failure alert a scheduled unit raises, the dead-man check for jobs that stopped... |
 | `jsonl.py` | Bounded, locked JSON-lines logs: one object per line, a size limit with rotation, and no lost lines |
+| `mail.py` | Mailboxes for triage: search, read as delimited plain text, add a ws label, and save a reply as... |
+| `mail_mcp.py` | The mail MCP tools: five calls over ws.mail (list mailboxes, search, get, label, draft), served... |
+| `mailcmd.py` | `ws mail`: add, check and remove the mailboxes of the profile, and serve the mail MCP tools... |
 | `mcp_server.py` | `ws mcp serve`: a small MCP server over stdio, so any runner can search and add to memory and... |
 | `memory.py` | Memory module: Markdown files with front matter in a git repo, plus a rebuildable SQLite FTS5 index |
 | `migrate.py` | `ws migrate`: move ws's files from `~/.ws` to the XDG folders (see `ws.paths` for which file... |
@@ -57,6 +63,7 @@ below, and `python3 scripts/gen_code_map.py --check` (prek and CI) fails when it
 | `notesdetect.py` | Find notes you already keep: an Obsidian vault (a folder holding `.obsidian/`) or a Logseq graph... |
 | `osinfo.py` | Which machine are we on: macOS, Linux, Windows via WSL2, or native Windows (not supported; use WSL2) |
 | `output.py` | The output contract for every `ws` command: one typed error, one JSON envelope, and the global flags |
+| `passtest.py` | The step-in counter: `ws passtest events` reads a pass-test ledger and prints confirmed step-ins... |
 | `paths.py` | Where ws keeps its files: four folders that follow the XDG base directory rules, or one folder... |
 | `policy.py` | The policy: one vendor-neutral `policy.toml` that says what a session may do |
 | `profile.py` | The profile: one TOML file per person (machine answers, roles, caps) |

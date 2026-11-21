@@ -24,6 +24,7 @@ RAW = {
     "gate.launch": "hands the terminal to the runner",
     "gate.serve": "stays up until stopped",
     "mcp.serve": "stdout is the MCP protocol",
+    "mail.serve": "stdout is the MCP protocol",
     "broker.serve": "stays up until stopped",
     "session.start": "a hook entry",
     "session.nudge": "a hook entry",
@@ -82,6 +83,9 @@ CASES: dict[str, list[str]] = {
     "run": ["run", "nojob", "--dry-run"],
     "runs": ["runs"],
     "connector.list": ["connector", "list"],
+    "mail.add": ["mail", "add", "x", "--host", "imap.example.com", "--user", "someone@example.com"],
+    "mail.check": ["mail", "check"],
+    "mail.rm": ["mail", "rm", "x"],
     "globals.check": ["globals", "check", "--repo", "{home}"],
     "globals.manifest": ["globals", "manifest"],
     "install": ["install", "--dry-run", "--notes", "{home}/Notes"],
@@ -145,6 +149,7 @@ CASES: dict[str, list[str]] = {
     "msg.export": ["msg", "export", "--out", "{home}/messages.jsonl"],
     "msg.watch": ["msg", "watch", "--position-now"],
     "msg.wait": ["msg", "wait", "--timeout", "1"],
+    "connect": ["connect", "telegram", "--dry-run"],
     "walls.init": ["walls", "init", "alpha"],
     "walls.check": [
         "walls",
@@ -156,10 +161,13 @@ CASES: dict[str, list[str]] = {
     "ask.get": ["ask", "get", "nope"],
     "ask.answer": ["ask", "answer", "nope", "yes"],
     "ask.wait": ["ask", "wait", "nope"],
+    "cards.drop": ["cards", "drop", "done"],
+    "cards.take": ["cards", "take"],
     "ask.done": ["ask", "done", "nope"],
     "ask.withdraw": ["ask", "withdraw", "nope"],
     "ask.note": ["ask", "note", "nope", "x"],
     "ask.import": ["ask", "import", "{home}/none.jsonl"],
+    "passtest.events": ["passtest", "events"],  # no ledger set up: a typed no_ledger error
     "term": ["term", "--bind", "0.0.0.0"],  # a typed refusal: the real command stays up until stopped
 }
 

@@ -4,3 +4,4 @@ extend-exclude = ["src/ws/term/assets.py"]  # base64 blobs of the vendored termi
 [default.extend-words]
 edn = "edn"  # the Logseq config file extension
 xdescribe = "xdescribe"  # the Jasmine and Jest skipped-suite function
+THRID = "THRID"  # Gmail's IMAP thread id, X-GM-THRID

@@ -56,6 +56,7 @@ below, and `python3 scripts/gen_code_map.py --check` (prek and CI) fails when it
 | `notesdetect.py` | Find notes you already keep: an Obsidian vault (a folder holding `.obsidian/`) or a Logseq graph... |
 | `osinfo.py` | Which machine are we on: macOS, Linux, Windows via WSL2, or native Windows (not supported; use WSL2) |
 | `output.py` | The output contract for every `ws` command: one typed error, one JSON envelope, and the global flags |
+| `passtest.py` | The step-in counter: `ws passtest events` reads a pass-test ledger and prints confirmed step-ins... |
 | `paths.py` | Where ws keeps its files: four folders that follow the XDG base directory rules, or one folder... |
 | `policy.py` | The policy: one vendor-neutral `policy.toml` that says what a session may do |
 | `profile.py` | The profile: one TOML file per person (machine answers, roles, caps) |

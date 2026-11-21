@@ -39,7 +39,7 @@ call or changes how a session works:
 | `inbox` | It needs `ws msg` messages between sessions. |
 | `presence` | It writes the session registry on every hook; only the lead and `pane-close` read it. |
 | `pane-close` | It only matters to a lead that closes other sessions' panes. |
-| `pane-keys` | It reads every shell command that names tmux, and only matters where sessions drive tmux panes. Turn it on there: it is what stops a session typing a slash command that opens a dialog nobody answers. |
+| `pane-keys` | It reads every shell command that names tmux, and only matters where sessions drive tmux panes. Turn it on there: it's what stops a session typing a slash command that opens a dialog nobody answers. |
 | `record-calls` | It writes every call's payload to a log on disk. Keep it off in a walled class. |
 
 `ws doctor` warns (WS020) when the policy names no data class, since then no class limit applies.
@@ -458,11 +458,11 @@ it once) when what it types has a line that starts with `/` after key names are 
 `-l` literal text, text split across words (`'/re' 'name'`), key names (`Enter`, `C-m`, `Space`, `KP/`, `0x2f`, `-H`
 hex), `BSpace`, `C-u` and `C-w`, and a cursor key beside a `/` are all read. A line that starts with a word the shell
 never settled (`"$BODY"`) is refused too, since it may be a slash command. `set-buffer` or `load-buffer` text (a plain
-file, or `echo`/`printf` piped into `load-buffer -`) followed by `paste-buffer` is judged on the text the buffer holds; a
-paste of a buffer the line did not fill is judged on what `tmux show-buffer` says the live server holds. What can't be read
-(a heredoc, a file the same line makes) is allowed: the guard reads text, it doesn't guess. Which server, and the text
-that is run (a shell's `-c` text, `eval`, `$(...)`, `run-shell`, `bind-key`, `source-file`, and so on) are read as for
-[pane-close](#pane-close). Without `tmux` it says nothing, and it never sends a key.
+file, or `echo`/`printf` piped into `load-buffer -`) followed by `paste-buffer` is judged on the text the buffer
+holds; a paste of a buffer the line didn't fill is judged on what `tmux show-buffer` says the live server holds. What
+can't be read (a heredoc, a file the same line makes) is allowed: the guard reads text, it doesn't guess. Which server,
+and the text that's run (a shell's `-c` text, `eval`, `$(...)`, `run-shell`, `bind-key`, `source-file` and the like)
+are read as for [pane-close](#pane-close). Without `tmux` it says nothing, and it never sends a key.
 
 ## The order guards run in
 

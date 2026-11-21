@@ -12,9 +12,20 @@ body of the GitHub release.
 
 - `ws sync`: fetch every git repository under the code root, 4 at a time, each fetch killed (with its helpers)
   and named past `--timeout-s` (default 120); exit 1 when any failed or timed out.
+- The `pane-keys` guard: a `tmux send-keys` (or a `paste-buffer`) aimed at the live tmux server that types a line
+  starting with `/` is an approvable deny, because a slash command can open a dialog that holds every later key and
+  message until someone presses one (#276). The reason says to start sessions with `--name X --remote-control X` and to
+  use `ws msg send`. Off until you name it in `[guards] on`.
+- `ws watch panes`: pushes once when a tmux pane has sat on a dialog for 10 minutes (`[watch.panes]` in the profile
+  sets that and more footer patterns). It presses `Escape` on the Remote Control status box after a minute and on no
+  other dialog. `ws-watch-panes.timer` (systemd) and `ws.job.watch-panes` (launchd) run it every minute (#276).
 
 ### Changed
 
+- `ws dispatch` starts a Claude session with `--name LABEL` and `--remote-control=LABEL` (LABEL is the window's name),
+  so nobody types `/rename` or `/remote-control` into its pane. Remote control is left off for a repo whose class isn't
+  `access = "full"`, or when the policy can't be read (#276).
+- `ws msg` wake never types text with a line that starts with `/` into a pane (reason `slash_text`) (#276).
 - `ws dispatch` passes the model as one argument, `--model=M`, so a model name that starts with `-` can't become a
   flag, and its code root expands `~` only for your own home (`~` or `~/...`).
 

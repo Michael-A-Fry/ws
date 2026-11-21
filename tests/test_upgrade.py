@@ -1288,8 +1288,10 @@ def test_the_new_broker_is_started_by_the_ws_the_installer_wrote(broker_sock, tm
     peer = upgrade.ask_broker(broker_sock)
     try:
         assert peer.status["version"] == __version__ and peer.uid == os.getuid() and peer.pid
-    finally:
+    finally:  # this test is the start; the stop is the stub tests'. Once (22 Nov, a loaded pre-push) TERM took over 20 s
         os.kill(peer.pid, signal.SIGTERM)
+        if not upgrade._gone(broker_sock, 20):
+            os.kill(peer.pid, signal.SIGKILL)
         assert upgrade._gone(broker_sock, 20)
 
 

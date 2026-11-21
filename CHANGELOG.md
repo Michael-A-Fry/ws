@@ -8,6 +8,17 @@ body of the GitHub release.
 
 ## [Unreleased]
 
+## [0.1.11.1] - 2026-11-21
+
+### Security
+
+- The gate's command reader reads more variable-setting forms ahead of a command, and env's and sudo's options, as
+  bash and GNU env do. A form it can't read for certain is refused, so the checks on the real command are no longer
+  skipped. (GHSA-w7j3-x774-963c)
+- The gate's command reader reads sudo's options as sudo does, and refuses a sudo form that runs a program named by
+  the environment, starts a shell it can't read, or changes folder. After `unset`, it no longer assumes the variable's
+  earlier value. (GHSA-24rx-q7mr-rr2v)
+
 ### Added
 
 - The message wall: the gate refuses a send-message call from a session in a walled or counts-only class, or in a

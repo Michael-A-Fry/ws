@@ -101,17 +101,17 @@ def cmd_add(args: argparse.Namespace) -> int:
                 f"edit {wsecrets.registry_path()}, or pick another NAME",
                 2,
             )
-    written = _write_profile(name, args.kind)
-    data: dict = {"mailbox": name, "secret": secret, "kind": args.kind, "profile_written": written}
-    if entry is None:
+    data: dict = {"mailbox": name, "secret": secret, "kind": args.kind, "profile_written": False}
+    if entry is None:  # nothing is written until the registry has the entry, so no table points at nothing
         block = registry_block(name, host, user, args.port)
         data.update(registered=False, registry=str(wsecrets.registry_path()), add=block)
         if args.json:
             output.result(data, status=output.ATTENTION)
         else:
-            print(f"ws: [mail.{name}] is in the profile. Add this to {wsecrets.registry_path()}, then run this again:")
+            print(f"ws: nothing written yet. Add this to {wsecrets.registry_path()}, then run this again:")
             print(block, end="")
         return 1
+    data["profile_written"] = _write_profile(name, args.kind)
     client = mail.Mail.from_profile()
     try:
         found = client.folders(name)
@@ -166,10 +166,11 @@ def cmd_rm(args: argparse.Namespace) -> int:
         doc = profile.load(path) or {}
     except profile.ProfileError as e:
         raise WsError("bad_config", str(e), f"fix {path}") from None
-    boxes = doc.get("mail")
-    if not isinstance(boxes, dict) or args.name not in boxes:
+    known = mail.parse_mailboxes(doc, str(path))  # the whole [mail] table validates, or nothing is changed
+    if args.name not in known:
         raise WsError("not_found", f"no mailbox {args.name!r} in {path}", "`ws mail check` lists them", 2)
-    secret = boxes.pop(args.name).get("secret") if isinstance(boxes[args.name], dict) else None
+    boxes = doc["mail"]
+    secret = boxes.pop(args.name)["secret"]
     if not boxes:
         doc.pop("mail")
     profile.write_if_changed(path, doc)
@@ -177,7 +178,7 @@ def cmd_rm(args: argparse.Namespace) -> int:
     if args.json:
         output.result({"mailbox": args.name, "removed": True, "secret": secret})
     else:
-        print(f"ws: removed [mail.{args.name}]; {left}" if secret else f"ws: removed [mail.{args.name}]")
+        print(f"ws: removed [mail.{args.name}]; {left}")
     return 0
 
 

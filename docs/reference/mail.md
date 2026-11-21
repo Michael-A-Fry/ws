@@ -60,7 +60,7 @@ Other providers work the same way with their IMAP host and an app password, if t
 
 | Command | What it does |
 |---|---|
-| `ws mail add NAME --host H --user U [--kind gmail] [--port P]` | Writes `[mail.NAME]` (secret `mail-NAME`). If the registry lacks that entry it prints the block to add and exits 1. Refuses an entry for another host, user or port (exit 2). Asks for the password when the store has none, then logs in read-only and prints the folders and the drafts folder (exit 1 when none is found). Prints the `[connectors.mail]` table when the policy lacks it. |
+| `ws mail add NAME --host H --user U [--kind gmail] [--port P]` | Checks the registry has `mail-NAME` as an `imap` entry. If not, it prints the block to add, writes nothing and exits 1. Then writes `[mail.NAME]`. Refuses an entry for another host, user or port (exit 2). Asks for the password when the store has none, then logs in read-only and prints the folders and the drafts folder (exit 1 when none is found). Prints the `[connectors.mail]` table when the policy lacks it. |
 | `ws mail check` | Logs in read-only to every mailbox: ok, or the refusal code. Exit 1 when any fails or there are none. |
 | `ws mail rm NAME` | Takes `[mail.NAME]` out of the profile. The registry entry and the stored password stay; it prints how to remove them. |
 | `ws mail serve` | The five tools over stdio (MCP). A runner starts it through the connector. |
@@ -72,7 +72,7 @@ Plug them into a session with this policy table (`ws mail add` prints it), then 
 ```toml
 [connectors.mail]
 command = ["ws", "mail", "serve"]
-read_only = false
+read_only = true
 tools = ["mail_list_mailboxes", "mail_search", "mail_get", "mail_label", "mail_draft"]
 ```
 
@@ -85,7 +85,7 @@ Add `class = "..."` to keep mail away from sessions whose class may not read it 
 | `mail_search` | `mailbox`, optional `query`, `since` (YYYY-MM-DD), `unseen` | INBOX uids, newest first, at most 50, and the total. |
 | `mail_get` | `mailbox`, `uid` | The message as delimited plain text: From, To, Subject, Date, Message-ID, then the body (capped). Reading doesn't mark it seen. |
 | `mail_label` | `mailbox`, `uid`, `label` | Adds one of `ws/needs-reply`, `ws/fyi`, `ws/waiting`, `ws/low`. Nothing is removed or moved. |
-| `mail_draft` | `mailbox`, `reply_to_uid`, `body` | Saves a reply in the drafts folder. Its first line is `[draft by ws: review before sending]`. |
+| `mail_draft` | `mailbox`, `reply_to_uid`, `body` | Saves a reply in the drafts folder. Its first line is `[draft by ws: review before sending]`. The result names the folder and the uid; the To, Subject and In-Reply-To it took from the original come back inside a marked block, as untrusted data. |
 
 A uid carries its mailbox and the folder's UIDVALIDITY (`work:7-42`). Another mailbox's uid is refused, and so is one
 from before the folder was rebuilt. A failure is a tool result with `isError`, holding the reason and a hint, never

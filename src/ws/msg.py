@@ -20,9 +20,9 @@ Walled classes. A message to a walled or counts-only session keeps its body only
 `<repo root>/.ws/messages/<class>.db`, created with a `.gitignore` that ignores everything in the folder; the shared
 database gets the envelope, with no body, no hash of a body and no free-text field. A walled or counts-only session sends
 fixed kinds only (`ack`, `done`, `stop-and-hand-over:done`, `ask:pending`, `counts`), no body, no key, no thread name.
-What may come in is a message of kind `note`, `ask` or `stop-and-hand-over` from a session the receiving class's
-`inbound_allow` names, and only when its `inbound` is `allowlist`: a walled class set to off or lead-only takes nothing,
-the lead included. There is no rule that lets a reply in, and no owned-task exception. Every message addressed to a walled
+What may come in is a message of kind `note`, `ask` or `stop-and-hand-over`: from a lead session (one whose role is
+`lead`, set by a launch token; the person's own send is not one) when the receiving class's `inbound` is `lead-only`, or from a session its `inbound_allow` names when it is
+`allowlist`. A walled class set to off takes nothing, the lead included. There is no rule that lets a reply in, and no owned-task exception. Every message addressed to a walled
 class, delivered or refused, leaves one row in the class's own store (`inbound_log`: the UTC time, the sender's session
 id, the class, the kind, `delivered` or `refused`, and a refusal's typed kind), never a body, a hash of one, a key or a
 thread name. A delivered message's row is written in the delivery's own transaction (a class store that cannot be written
@@ -635,7 +635,7 @@ def person_record(pol: policy.Policy) -> session.Record:
     policy, not macOS (its Seatbelt profile has not been run for this) and not the resident gate, and the per-boot token readable and matching. No
     runner ancestor is not proof: an orphaned or double-forked agent process has none. Anything less is the `refused`
     error a caller-less send always gave. Its role is `lead` (above one, since it is the person) and it has no class;
-    a walled receiver still takes it only when `inbound_allow` names it."""
+    a walled receiver still takes it only when `inbound_allow` names it (lead-only lets in a lead session, not this)."""
     try:
         user = session.account_user()
         proven = pol.msg.person_send and pol.gate.sandbox and sys.platform != "darwin"
@@ -736,17 +736,23 @@ def admit(
             f"sessions in class {r_class.name!r} take no messages",
             "the class's `inbound` in policy.toml is off; set lead-only or allowlist if that is wanted",
         )
-    if _walled(r_class) and r_class.inbound != "allowlist":
+    if _walled(r_class) and r_class.inbound not in ("allowlist", "lead-only"):
         raise WsError(
             "refused",
             f"class {r_class.name!r} is walled and names no sessions that may send to it",
-            'set inbound = "allowlist" and name the sessions in inbound_allow under that class in policy.toml',
+            'set inbound = "lead-only", or "allowlist" with the sessions in inbound_allow, under that class in policy.toml',
         )
     # A fixed kind has no text, so it carries nothing out of a class: the default lets it reach a lead, which is how a
     # worker or a walled session says `done` or `ack`. A walled receiver is never reached this way (below).
     to_lead = target.role == "lead" and kind in FIXED_KINDS and not _walled(r_class)
     if r_class.inbound == "lead-only" and sender.role != "lead" and not to_lead:
         raise WsError("refused", f"class {r_class.name!r} takes messages from the lead only", "ask the lead to send it")
+    if r_class.inbound == "lead-only" and _walled(r_class) and sender.session_id.startswith(session.PERSON):
+        raise WsError(  # a lead session (role from a launch token) only: the person works in the class's own sessions
+            "refused",
+            f"class {r_class.name!r} is walled and takes messages from a lead session only, not the person's own send",
+            "open a session in the class",
+        )
     if r_class.inbound == "allowlist" and sender.session_id not in r_class.inbound_allow:
         raise WsError("refused", f"class {r_class.name!r} takes messages from named sessions only", "this is not one")
     if _walled(r_class):

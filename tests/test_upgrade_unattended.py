@@ -80,9 +80,7 @@ def svc(tmp_path, monkeypatch):
     # these test variables and the allow-list's names, nothing else
     monkeypatch.setattr(upgradeproof, "tool_dirs", lambda: [str(tools), "/usr/bin", "/bin"])
     monkeypatch.setattr(upgradeproof, "ENV_KEEP", (*upgradeproof.ENV_KEEP, "INSTALL_LOG", "INSTALL_ENV", "STUB_STATE"))
-    monkeypatch.setattr(
-        upgrade, "_own_cgroup", lambda: "0::/user.slice/user@1000.service/app.slice/ws-upgrade.service\n"
-    )
+    monkeypatch.setattr(upgrade, "_own_cgroup", lambda: "0::/user.slice/user-1000.slice/app.slice/ws-upgrade.service\n")
     for name, value in {
         "INSTALL_LOG": tmp_path / "install.log",
         "INSTALL_ENV": tmp_path / "install.env",

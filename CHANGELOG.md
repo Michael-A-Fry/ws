@@ -23,9 +23,9 @@ body of the GitHub release.
   installer's and wheel's hashes and cosign bundles, green checks, no high or critical advisory in the lock), refuses a
   tag at or below the installed version, waits for nothing to be running, installs with no mirror or skip-the-checks
   variable, runs acceptance checks through the installed gate hook (the version, a hooks rewrite, a must-allow and
-  must-deny probe, and no fewer deny rules or stopped probes than before) and rolls back on any failure. Each outcome is a
-  row in `<state>/release-log.csv`. A person's `ws upgrade` now downloads the release's own `install.sh` (or the file at
-  that tag), never the `main` branch.
+  must-deny probe, and no fewer deny rules or stopped probes than before) and rolls back on any failure. Each outcome
+  is a row in `<state>/release-log.csv`. A person's `ws upgrade` now downloads the release's own `install.sh` (or the
+  file at that tag), never the `main` branch.
 - The release publishes `install.sh` as an asset of its own, with a `.sha256`, a build provenance attestation and a
   cosign bundle, signed by the same workflow as the wheel. The build stamp now carries a trust root (the release
   workflow's cosign identity and the allowed signers for a release tag, from `.github/release_signers`), which

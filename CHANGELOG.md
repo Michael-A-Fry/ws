@@ -14,7 +14,10 @@ body of the GitHub release.
   back to a release that rejected the new guard name, and the gate failed closed for every session. The swap now holds the
   policy, the install record and the runner configs it may change; an automatic rollback restores them before the old
   hooks step, and a manual rollback restores the policy from the copy in `upgrade-backups/` while it's still as the
-  upgrade left it.
+  upgrade left it. A policy edited since keeps the edits and loses only the guards the upgrade added (or the rollback is
+  refused before anything is swapped, saying what to change). A `swap-start` line in the history names the way back
+  before the installer runs, so a process that dies mid-swap still leaves it; the copies a promote or an unfinished swap
+  names are never pruned, and a swap whose installer failed leaves none.
 
 ### Added
 

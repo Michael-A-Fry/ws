@@ -1137,8 +1137,8 @@ are stopped than before. Any failure is the automatic rollback. `--session-check
 `rollback` goes to the release before the last promote and nowhere else.
 
 `--rescue` runs every ten minutes from the rescue timer: it probes the gate the same way, and after two failures in a row
-goes back one release, once; if it still fails, it logs that and leaves it to you. Each outcome (promote, auto-rollback,
-rollback, a refused or dropped request, a rescue strike) is one row of `release-log.csv` in ws's state folder: `at`, `verb`,
+goes back one release, once; if it still fails, it logs that and leaves it to you. Each outcome (promote, automatic
+rollback, rollback, a refused or dropped request, a rescue strike) is one row of `release-log.csv` in ws's state folder: `at`, `verb`,
 `from`, `to`, `duration_s`, `result`, `reason`.
 
 The `upgrade-service` [guard](guards.md#upgrade-service) and the protected paths of the user-scope hook (the four unit files and

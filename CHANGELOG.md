@@ -19,7 +19,8 @@ body of the GitHub release.
 - `ws watch panes`: pushes once when a tmux pane has sat on a dialog for 10 minutes (`[watch.panes]` in the profile
   sets that and more footer patterns). It presses `Escape` on the Remote Control status box after a minute and on no
   other dialog. A footer counts only at the foot of the screen, and the dialog's text is quoted in the push only
-  for a pane in a `full` data class. `ws-watch-panes.timer` (systemd) and `ws.job.watch-panes` (launchd) run it every minute (#276).
+  for a pane in a `full` data class. `ws-watch-panes.timer` (systemd) and `ws.job.watch-panes` (launchd) run it
+  every minute (#276).
 
 ### Changed
 

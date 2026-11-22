@@ -19,9 +19,10 @@ files = ["STATE.md", ".state/STATE.md", "HANDOFF.md", "TODO.md"]   # the default
 ```
 
 A policy file with no `[guards]` table has no guards on, so an upgrade changes nothing until you add the table.
-`ws gate init` writes `on = ["syntax-check", "session-context", "dev-server", "pane-keys"]` and lists the other guards as comments. A
-name in `on` that ws doesn't know stops the load and the message names it. So does a key in `[guards]` that isn't `on`
-or a guard name, and a key in a guard's table that guard doesn't read (`mode` is read by ws for every guard, below).
+`ws gate init` writes `on = ["syntax-check", "session-context", "dev-server", "pane-keys"]` and lists the other
+guards as comments. A name in `on` that ws doesn't know stops the load and the message names it. So does a key in
+`[guards]` that isn't `on` or a guard name, and a key in a guard's table that guard doesn't read (`mode` is read by ws
+for every guard, below).
 
 ### Off by default, and why
 

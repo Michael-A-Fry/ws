@@ -765,6 +765,7 @@ def reinstall(
         ran = swap(ns, Path(scratch))
     if ran.code != 0:
         return ran, None
+    failed: list[Path] = []
     if held is not None:
         failed = held.restore()
         if failed:
@@ -773,7 +774,10 @@ def reinstall(
             _say(args, "the policy and the hooks are back as they were before the upgrade")
     new = installed_ws(env)
     _using(ns, new)
-    return _step(ns, "hooks", _hooks_argv(new), _step_limit(args), new.version), new
+    ran = _step(ns, "hooks", _hooks_argv(new), _step_limit(args), new.version)
+    if failed and ran.code == 0:  # the old ws is back but files were not: never a clean way back (B5)
+        ran = ran._replace(code=EXIT_NOT_RESTORED)
+    return ran, new
 
 
 # ---- the broker -------------------------------------------------------------------------------------------------------------
@@ -1438,7 +1442,13 @@ def _unattended_upgrade(args, env, tag: str, t0: float, source, sleep) -> int:
         code = _both(args, env)
     last = history(env)[-1] if len(history(env)) > mark else {}
     verb = last.get("verb") or "promote"
-    _log(args, env, t0, verb, tag, "ok" if code == 0 else "failed" if verb == "promote" else "rolled-back", "")
+    if code == 0:
+        result = "ok"
+    elif verb == "promote":
+        result = "failed"
+    else:
+        result = "not-restored" if code == EXIT_NOT_RESTORED else "rolled-back"
+    _log(args, env, t0, verb, tag, result, "")
     return code
 
 

@@ -60,7 +60,7 @@ def _registry() -> dict:
         raise WsError("bad_config", str(e), f"fix {wsecrets.registry_path()}") from None
 
 
-def _write_profile(name: str, kind: str) -> bool:
+def write_profile(name: str, kind: str) -> bool:
     path = profile.profile_path()
     try:
         doc = profile.load(path) or {}
@@ -127,7 +127,7 @@ def cmd_add(args: argparse.Namespace) -> int:
             print(f"ws: nothing written yet. Add this to {wsecrets.registry_path()}, then run this again:")
             print(block, end="")
         return 1
-    data["profile_written"] = _write_profile(name, args.kind)
+    data["profile_written"] = write_profile(name, args.kind)
     client = mail.Mail.from_profile()
     try:
         found = client.folders(name)

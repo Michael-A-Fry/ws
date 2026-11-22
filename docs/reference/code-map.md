@@ -52,6 +52,7 @@ below, and `python3 scripts/gen_code_map.py --check` (prek and CI) fails when it
 | `mail.py` | Mailboxes for triage: search, read as delimited plain text, add a ws label, and save a reply as... |
 | `mail_mcp.py` | The mail MCP tools: five calls over ws.mail (list mailboxes, search, get, label, draft), served... |
 | `mailcmd.py` | `ws mail`: add, check and remove the mailboxes of the profile, and serve the mail MCP tools... |
+| `mailconnect.py` | Connect a mailbox from a page: one call that checks an app password, then stores it and adds the... |
 | `mcp_server.py` | `ws mcp serve`: a small MCP server over stdio, so any runner can search and add to memory and... |
 | `memory.py` | Memory module: Markdown files with front matter in a git repo, plus a rebuildable SQLite FTS5 index |
 | `migrate.py` | `ws migrate`: move ws's files from `~/.ws` to the XDG folders (see `ws.paths` for which file... |

@@ -311,7 +311,7 @@ class Mail:
         box = self._box(mailbox)
         args: dict = {"folder": FOLDER, "unseen": bool(unseen)}
         if after_uid is not None:
-            args["after_uid"] = int(after_uid)
+            args["after_uid"] = after_uid  # as given: the broker refuses a bool, a string or a fraction
         if query is not None:
             args["query"] = query
         if since is not None:

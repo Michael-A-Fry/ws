@@ -50,6 +50,12 @@ materials (SBOM) in CycloneDX form lists what went in.
 Step 1 prints `OK`. Step 2 prints `Loaded digest` and `Verification succeeded`. Step 3 prints `Verified OK`. A failure at
 any step exits with a non-zero code. Don't install the file.
 
+## The installer is a release asset too
+
+`install.sh` is published with each release as `install.sh`, `install.sh.sha256` and `install.sh.sigstore.json`, signed
+by the same workflow as the wheel. Steps 1 to 3 work on it the same way. Take the installer from the release you are
+installing, never from the `main` branch: only the release copy is signed.
+
 ## What the installer checks for you
 
 `install.sh` with no `--version` option does step 1 itself, and step 3 when `cosign` is on your `PATH`. It refuses to

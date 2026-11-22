@@ -228,3 +228,48 @@ def test_collect_reports_the_channel_of_this_install(monkeypatch):
     assert (data["channel"], data["install_source"]) == ("rc", "release")
     monkeypatch.setattr(version, "install_source", lambda *a: "checkout")
     assert version.collect()["channel"] == "edge"
+
+
+STAMPED_ROOT = {
+    "release_identity": {
+        "repo": "owner/ws",
+        "identity": "https://github.com/owner/ws/.github/workflows/release.yml@refs/tags/{tag}",
+        "issuer": "https://token.actions.githubusercontent.com",
+    },
+    "tag_signers": 'ws-release namespaces="git" ssh-ed25519 AAAA\n',
+}
+
+
+def test_the_trust_root_is_what_the_stamp_holds(monkeypatch):
+    monkeypatch.setitem(sys.modules, "ws._build", types.SimpleNamespace(**STAMPED_ROOT))
+    root = version.trust_root()
+    assert root == {**STAMPED_ROOT["release_identity"], "tag_signers": STAMPED_ROOT["tag_signers"]}
+
+
+def test_no_stamp_or_an_old_one_has_no_trust_root(monkeypatch):
+    monkeypatch.setitem(sys.modules, "ws._build", None)
+    assert version.trust_root() is None
+    old_stamp = types.SimpleNamespace(git_sha="a" * 40, dirty=False)  # a 0.1.11.x stamp
+    monkeypatch.setitem(sys.modules, "ws._build", old_stamp)
+    assert version.trust_root() is None
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"tag_signers": ""},
+        {"tag_signers": 7},
+        {"release_identity": "owner/ws"},
+        {"release_identity": {**STAMPED_ROOT["release_identity"], "issuer": ""}},
+        {"release_identity": {**STAMPED_ROOT["release_identity"], "identity": "https://example.com/no-placeholder"}},
+        {"release_identity": {"repo": "owner/ws"}},
+    ],
+)
+def test_a_stamp_with_a_field_missing_or_malformed_has_no_trust_root(monkeypatch, change):
+    monkeypatch.setitem(sys.modules, "ws._build", types.SimpleNamespace(**{**STAMPED_ROOT, **change}))
+    assert version.trust_root() is None
+
+
+def test_the_trust_root_is_not_part_of_ws_version_output(monkeypatch):
+    monkeypatch.setitem(sys.modules, "ws._build", types.SimpleNamespace(git_sha="a" * 40, dirty=False, **STAMPED_ROOT))
+    assert set(version.collect()) == FIELDS

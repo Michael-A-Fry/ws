@@ -9,10 +9,14 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import textwrap
+import types
 from pathlib import Path
 
 import pytest
+
+from ws import version
 
 ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
@@ -162,3 +166,111 @@ def test_the_pypi_job_uploads_a_candidate_like_any_release():
     assert "if: github.event_name == 'push'" in pypi
     assert "prerelease" not in pypi  # PyPI reads the pre-release from the rcN version itself
     assert "environment: pypi" in pypi
+
+
+# ---- the stamp's trust root and the installer as a release asset (what `ws upgrade --unattended` verifies) ------------------
+
+SIGNERS = ROOT / ".github" / "release_signers"
+GIT = shutil.which("git")
+KEYGEN = shutil.which("ssh-keygen")
+PYTHON3 = shutil.which("python3")
+
+
+def stamped_repo(tmp_path: Path, signers: str | None = None) -> Path:
+    """A throwaway git repo holding the signers file, with the workflow's stamp step run in it as `owner/ws`."""
+    repo = tmp_path / "repo"
+    (repo / ".github").mkdir(parents=True)
+    (repo / "src" / "ws").mkdir(parents=True)
+    (repo / ".github" / "release_signers").write_text(
+        SIGNERS.read_text(encoding="utf-8") if signers is None else signers, encoding="utf-8"
+    )
+    env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com", "GIT_COMMITTER_NAME": "t"}
+    env |= {"GIT_COMMITTER_EMAIL": "t@example.com", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull}
+    for argv in (["init", "-q"], ["add", "."], ["commit", "-q", "-m", "x"]):
+        subprocess.run([GIT, *argv], cwd=repo, env={**os.environ, **env}, check=True, capture_output=True)
+    return repo
+
+
+def run_stamp(repo: Path) -> subprocess.CompletedProcess[str]:
+    env = {"GITHUB_REPOSITORY": "owner/ws", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull}
+    return run_bash(step_script("stamp the build"), repo, env)
+
+
+needs_stamp_tools = pytest.mark.skipif(GIT is None or PYTHON3 is None, reason="needs git and python3")
+
+
+@needs_stamp_tools
+def test_the_stamp_carries_the_trust_root_and_the_version_module_reads_it(tmp_path: Path, monkeypatch):
+    repo = stamped_repo(tmp_path)
+    r = run_stamp(repo)
+    assert r.returncode == 0, r.stdout + r.stderr
+    stamp = types.ModuleType("ws._build")
+    exec((repo / "src" / "ws" / "_build.py").read_text(encoding="utf-8"), stamp.__dict__)  # noqa: S102  # our own output
+    assert stamp.source == "release" and stamp.dirty is False and len(stamp.git_sha) == 40
+    monkeypatch.setitem(sys.modules, "ws._build", stamp)
+    root = version.trust_root()
+    assert root is not None
+    assert root["repo"] == "owner/ws"
+    assert root["issuer"] == "https://token.actions.githubusercontent.com"
+    assert root["identity"].format(tag="v1.2.3") == (
+        "https://github.com/owner/ws/.github/workflows/release.yml@refs/tags/v1.2.3"
+    )
+    assert root["tag_signers"] == SIGNERS.read_text(encoding="utf-8")
+
+
+@needs_stamp_tools
+def test_a_release_with_no_signer_key_is_not_stamped(tmp_path: Path):
+    repo = stamped_repo(tmp_path, signers="# the file with no key line\n")
+    r = run_stamp(repo)
+    assert r.returncode != 0
+    assert "no key line" in r.stdout + r.stderr
+    assert not (repo / "src" / "ws" / "_build.py").exists()
+
+
+def test_the_committed_signers_file_names_a_public_key_and_nothing_private():
+    text = SIGNERS.read_text(encoding="utf-8")
+    keys = [ln for ln in text.splitlines() if ln and not ln.startswith("#")]
+    assert len(keys) >= 1
+    for line in keys:
+        _principal, namespaces, kind, blob, *comment = line.split()
+        assert namespaces == 'namespaces="git"' and kind == "ssh-ed25519" and re.fullmatch(r"[A-Za-z0-9+/=]+", blob)
+        assert not comment, "a key comment is usually an e-mail address"
+    assert "PRIVATE KEY" not in text
+
+
+@pytest.mark.skipif(GIT is None or KEYGEN is None, reason="needs git and ssh-keygen")
+def test_the_signers_line_format_verifies_a_signed_tag_with_git(tmp_path: Path):
+    """The file's own format (principal, namespaces, key) is what `git tag -v` accepts; a throwaway key stands in."""
+    key = tmp_path / "k"
+    subprocess.run([KEYGEN, "-q", "-t", "ed25519", "-N", "", "-f", str(key), "-C", ""], check=True)
+    blob = key.with_suffix(".pub").read_text(encoding="utf-8").split()[1]
+    allowed = tmp_path / "allowed"
+    allowed.write_text(f'ws-release namespaces="git" ssh-ed25519 {blob}\n', encoding="utf-8")
+    repo = tmp_path / "r"
+    repo.mkdir()
+    env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull}
+    env |= {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com", "GIT_COMMITTER_NAME": "t"}
+    env["GIT_COMMITTER_EMAIL"] = "t@example.com"
+    sign = ["-c", "gpg.format=ssh", "-c", f"user.signingkey={key}"]
+    for argv in (["init", "-q"], ["commit", "-q", "--allow-empty", "-m", "x"], [*sign, "tag", "-s", "-m", "v1", "v1"]):
+        subprocess.run([GIT, *argv], cwd=repo, env=env, check=True, capture_output=True)
+    verify = [GIT, "-c", "gpg.format=ssh", "-c", f"gpg.ssh.allowedSignersFile={allowed}", "tag", "-v", "v1"]
+    assert subprocess.run(verify, cwd=repo, env=env, capture_output=True, check=False).returncode == 0
+    allowed.write_text(allowed.read_text(encoding="utf-8").replace(blob[-8:-4], "AAAA"), encoding="utf-8")
+    assert subprocess.run(verify, cwd=repo, env=env, capture_output=True, check=False).returncode != 0
+
+
+def test_the_installer_is_a_signed_release_asset_with_its_hash_and_attestation():
+    """install.sh is copied into dist, hashed, attested, signed (each bundle verified) and published like the wheel."""
+    assert "cp ../install.sh install.sh" in WORKFLOW
+    assert "for f in *.whl *.tar.gz *.cdx.json install.sh; do sha256sum" in WORKFLOW
+    attest = WORKFLOW[WORKFLOW.index("attest-build-provenance@") : WORKFLOW.index("sigstore/cosign-installer@")]
+    assert "dist/install.sh" in attest
+    sign = WORKFLOW[WORKFLOW.index("cosign sign-blob, keyless") : WORKFLOW.index("  release:")]
+    assert "for f in *.whl *.tar.gz *.cdx.json install.sh; do" in sign and "cosign verify-blob" in sign
+    files = WORKFLOW[WORKFLOW.index("fail_on_unmatched_files") : WORKFLOW.index("  pypi:")]
+    assert "dist/install.sh\n" in files and "dist/*.sha256" in files and "dist/*.sigstore.json" in files
+
+
+def test_the_wheel_is_checked_for_its_trust_root_before_it_is_published():
+    assert "assert version.trust_root()" in WORKFLOW

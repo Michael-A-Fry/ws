@@ -1,0 +1,4 @@
+# The keys whose signed tags a release is trusted from (`git -c gpg.ssh.allowedSignersFile=... tag -v`).
+# The release workflow copies this file into the build stamp (src/ws/_build.py, `ws.version.trust_root`).
+# Public keys only. One line per key: principal, the git namespace, then the key.
+ws-release namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDDtCWNlE1kvFwU88KjXdZqsEqn4M3epVNf0gDh4rEt5

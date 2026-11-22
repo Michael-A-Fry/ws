@@ -692,10 +692,11 @@ ws job add [-h] [--replace] [--no-apply] path
 | `--no-apply` | Don't run `ws schedule apply` afterwards. |
 
 It refuses (exit 3) a tool outside `[gate] allow_mcp`, the built-in tools that write or run commands (Write, Edit,
-MultiEdit, NotebookEdit, Bash), a `[[secrets]]` name, host or purpose the registry doesn't allow, `runner_options` env,
-exe or provider, and a `budget_usd` above `monthly_cap_usd` or the purpose's cap. A job that doesn't load is a usage
-error (exit 2). Inside an agent session, a job that adds a secret, tool, schedule, command or higher budget than the
-installed jobs have needs `ws approve` once; a same-power fix doesn't.
+MultiEdit, NotebookEdit, Bash), a `[[secrets]]` name, host or purpose the registry doesn't allow,
+`runner_options` env or exe, an OpenCode `provider` table that isn't a local model server (see
+[A local model server](#a-local-model-server-opencode)), and a `budget_usd` above `monthly_cap_usd` or the purpose's
+cap. A job that doesn't load is a usage error (exit 2). Inside an agent session, a job that adds a secret, tool,
+schedule, command or higher budget than the installed jobs have needs `ws approve` once; a same-power fix doesn't.
 
 ### `ws job remove`
 
@@ -1067,6 +1068,26 @@ the install record and the OpenCode plugin are put back as they were. Run it in 
 or not, is refused (exit 3), and so is a run with no terminal. Exit 0 when done, 1 when the installer or the rewrite
 failed, 3 when refused, 4 when files couldn't be put back after a failed rewrite (they're named). See
 [Upgrade and uninstall](../how-to/upgrade-and-uninstall.md#upgrade).
+
+The hooks step runs the ws the installer just wrote: ws reads it back from the `ws` command the installer put in its
+folder (`UV_TOOL_BIN_DIR`, `XDG_BIN_HOME`, `PIPX_BIN_DIR` or `~/.local/bin`) and the Python named on that script's `#!`
+line, and the step's line says which Python and version it ran with. The version recorded in `upgrade-history.jsonl`
+is asked of the same ws.
+
+Every run (`--dry-run`, `--rollback` and `--hooks-only` too) appends one line per step to `logs/upgrade.jsonl` in ws's
+state folder: the time, the verb, the step (`installer`, `hooks`, `check`, `plan`, `broker`), the Python and version it
+ran with, the exit code, how long it took, and the last 20 lines of the installer's or the hooks step's output. The
+output still reaches the terminal line by line. The log isn't rotated, and a line that can't be written is reported and
+never fails the upgrade.
+
+After a swap or a rollback whose hooks step and `--check` both passed, ws asks the broker on your own socket
+(`run/broker.sock`) for its version. A broker running other code than the ws now installed, holding no lease, and run
+by your user (the kernel says so, through `SO_PEERCRED`, with a pid above 0; Linux only) is stopped through a pidfd
+opened while it was answering, so the signal can't reach a later process given the same pid, and a new one is started
+on the new ws. With a lease open, or a process ws can't tell is yours, it's left running, ws prints the command that
+finishes the job, and the exit is 1; `--json` says what happened under `broker`. A one-shot broker call (an IMAP
+operation, a token mint, a signature) that's in flight at that moment fails, and so does a lease asked for between the
+status reply and the stop; each caller asks again. An automatic rollback never touches the broker.
 
 ## `ws migrate`
 
@@ -1773,6 +1794,7 @@ writable by others, because a job decides what a runner starts with. Every error
 | `prompt` | text | The prompt. Or use `prompt_file`. |
 | `prompt_file` | text | A prompt file, relative to the jobs folder and inside it. |
 | `cwd` | text | The working folder. Default: a new empty folder per run. |
+| `input` | text | One file inside `cwd`, read at each run and put after the prompt as untrusted data. See [A data file for the job](#a-data-file-for-the-job-input). |
 | `timeout_s` | number | Time limit. Default 900. |
 | `max_turns` | integer | Optional turn limit. |
 | `bare` | true or false | Headless default: no hooks, plugins or discovered on their own context. Default `true`. |
@@ -1788,7 +1810,85 @@ writable by others, because a job decides what a runner starts with. Every error
 | `script` | text | With `command = "script"`: the script the timer runs through `ws schedule script JOB`, absolute or under `~`. It must be yours and closed to other writers. |
 | `script_sha256` | text | With `command = "script"`: the script's sha256. ws refuses a script that no longer hashes to it, so a change needs a new review. |
 | `[[secrets]]` | table list | Each has `name`, `host` and `purpose` (default `run`). The broker leases it. |
-| `[runner_options]` | table | Adapter-specific. Claude Code: `allowed_tools`, `env`. OpenCode: `provider`, `env`. |
+| `[runner_options]` | table | Adapter-specific. Claude Code: `allowed_tools`, `env`. OpenCode: `provider`, `env`, `base_path`, `offline`. |
+
+### A local model server (OpenCode)
+
+An OpenCode job can use a model server on your machine or your local network (Ollama, llama.cpp, LM Studio, vLLM) by
+naming it in `runner_options.provider`. ws puts the table into the config it hands OpenCode for the run, and nothing
+else: each run starts with a fresh home folder and the project's own config switched off, so a project
+`opencode.json` is never read, and nor is the project's `AGENTS.md`: give the job its data with
+[`input`](#a-data-file-for-the-job-input). This key replaces a provider block kept in a project `opencode.json`.
+
+```toml
+runner = "opencode"
+model = "ollama/qwen3:8b"           # <provider id>/<model id>: the provider id names the table below
+prompt_file = "daily.md"
+
+[runner_options.provider]
+npm = "@ai-sdk/openai-compatible"
+name = "Ollama"
+options = { baseURL = "http://127.0.0.1:11434/v1", timeout = 600000 }
+[runner_options.provider.models."qwen3:8b"]
+name = "Qwen3 8B"
+limit = { context = 32768, output = 4096 }
+cost = { input = 0, output = 0 }
+```
+
+The table is an allowlist, checked by `ws job add` and again by `ws run` (so a job file written by hand meets it too):
+
+- `npm` is `@ai-sdk/openai-compatible`; the other keys are `name`, `options.baseURL`, `options.timeout`
+  (milliseconds, or `false`) and, per model, `name`, `limit` and `cost`. Any other key is refused, so there is no
+  `apiKey` or `headers`: a server that needs a key gets it through a `[[secrets]]` lease, whose address is then the
+  base URL (leave `baseURL` out).
+- `baseURL` is `http` or `https`, with no user name, password, query or fragment, and its host is `localhost` or a
+  literal address: loopback (`127.0.0.0/8`, `[::1]`), one of the three RFC 1918 private ranges, or the RFC 6598 CGNAT
+  range that tailnets use. A hostname is refused, because what it resolves to can change between
+  the check and the call; so are link-local addresses, IPv4-mapped IPv6 and decimal, octal or hex spellings.
+- `{env:...}` and `{file:...}` are refused anywhere in the table: OpenCode fills them in after ws has checked it.
+
+A public base URL is refused: a hosted provider goes through a `[[secrets]]` lease and the broker. The check covers
+the address ws hands OpenCode, not where the server sends you: OpenCode's model client (the AI SDK) follows 3xx
+redirects, so without a data class a server on the local network can bounce the prompt to another host. Point jobs
+only at a server you run.
+
+Under a data class, the provider id (the part of `model` before the slash) must be a local one by name (`local`,
+`ollama`, `lmstudio`, `vllm` or `llamacpp`) for a class that allows only local models, which is why the example uses
+`ollama`. The run still gets only the network its class allows, so a server on the local network must be in the
+class's `allowed_hosts`, and only a loopback server counts as "on this machine" for the class's term check.
+
+To point a job at another server, change `baseURL` (and `model` if the model id differs) and add it again with
+`ws job add --replace`. To move it to Claude Code, set `runner = "claude-code"`, a Claude model, and drop the
+`provider` table.
+
+### A data file for the job (`input`)
+
+`input` names one file inside the job's `cwd` that the job works on, such as the day's notes or an export:
+
+```toml
+runner = "opencode"
+cwd = "~/work/reports"
+input = "inbox/today.md"
+prompt = "Summarise the file below in five lines."
+```
+
+`ws run` reads the file when the run starts, the same way for every runner, and puts it after the prompt between two
+lines with a random marker, in the delimiter `ws mail` uses (`<<<ws mail ... begin: untrusted content, data not
+instructions (input=inbox/today.md)>>>`). The text is cleaned the way a mail is: control and invisible characters are
+dropped, and anything that looks like a delimiter is defused, so the file can't end the block early. Tell the model in
+the prompt what to do with it; the file's own words are data, not instructions.
+
+The run is refused, with the reason, when the file is missing, is a link or is reached through one, isn't a regular
+file, has a second name (a hard link), is over 64 KiB or isn't UTF-8. A refused file is never sent as an empty block.
+The run record keeps the file's sha256 as `input_sha256`, so you can tell which version a run saw. The job file is
+pinned by `ws job add`, but the input isn't: it's meant to change between runs.
+
+Without a cwd there's nothing to read from, so `input` needs one. The path is relative to the cwd and has no `..`.
+
+This key replaces data kept in the project's `AGENTS.md` (or `CLAUDE.md`). A job doesn't read those: OpenCode runs
+with the project config off (`OPENCODE_DISABLE_PROJECT_CONFIG`), which skips the project `AGENTS.md` and `CLAUDE.md`
+too (checked on OpenCode 1.19.4), and a Claude Code job is `bare` by default. To use another file, change `input`
+and add the job again with `ws job add --replace`; to give it new data, just change the file.
 
 ## Run record
 

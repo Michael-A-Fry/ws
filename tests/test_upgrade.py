@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 from helpers.procs import wait_gone
 
-from ws import __version__, approvals, cli, doctor, install, paths, policy, selfcmd, upgrade, userconfig
+from ws import __version__, approvals, cli, doctor, install, output, paths, policy, selfcmd, upgrade, userconfig
 from ws.adapters import claude_code
 from ws.term import bridge
 
@@ -41,6 +41,8 @@ def box(tmp_path, monkeypatch):
     monkeypatch.setenv("WS_HOME", str(home / ".ws"))
     monkeypatch.setattr(paths, "account_home", lambda: home.resolve())
     monkeypatch.setenv("WS_GATE_DAEMON", "0")  # a hook decides in its own process, and leaves no daemon behind
+    for var in ("UV_TOOL_BIN_DIR", "XDG_BIN_HOME", "XDG_DATA_HOME", "PIPX_BIN_DIR"):
+        monkeypatch.delenv(var, raising=False)  # where `installed_ws` looks: the tmp HOME only
     for var in SESSION_VARS:
         monkeypatch.delenv(var, raising=False)  # this suite may itself run inside a session
     monkeypatch.chdir(home)
@@ -508,6 +510,84 @@ def test_the_installer_is_given_what_the_person_asked_for(old):
     assert upgrade._hooks_argv()[-2:] == ["upgrade", "--hooks-only"] and upgrade._hooks_argv()[:4] == selfcmd.argv()
 
 
+# --- the ws the installer wrote runs the hooks step (C648) -------------------------------------------------------------
+
+_STUB_WS = """
+import json, os, sys
+with open(os.environ["STUB_WS_OUT"], "a") as f:
+    f.write(json.dumps({"python": sys.executable, "argv": sys.argv[1:]}) + "\\n")
+if sys.argv[1:] == ["--version"]:
+    print("ws 9.9.9")
+"""
+
+
+def _stub_installer(tmp_path: Path, home: Path) -> Path:
+    """An installer that writes what install.sh writes, with a stand-in ws: a new environment of its own (a real venv,
+    under HOME as uv's tool folder is) holding a `ws` package that records each call, and the `ws` command in
+    ~/.local/bin whose `#!` line names that environment's Python. Returns that Python."""
+    env = home / ".local" / "share" / "uv" / "tools" / "ws-aitoolkit"
+    py = env / "bin" / "python"
+    cmd = home / ".local" / "bin" / "ws"
+    builder = tmp_path / "build_env.py"
+    builder.write_text(
+        "import subprocess, sys, sysconfig\n"
+        "from pathlib import Path\n"
+        f"env, py, cmd = Path({str(env)!r}), {str(py)!r}, Path({str(cmd)!r})\n"
+        "subprocess.run([sys.executable, '-m', 'venv', '--without-pip', str(env)], check=True)\n"
+        "site = subprocess.run([py, '-I', '-c', 'import sysconfig; print(sysconfig.get_path(\"purelib\"))'],\n"
+        "                      check=True, capture_output=True, text=True).stdout.strip()\n"
+        "(Path(site) / 'ws').mkdir(parents=True)\n"
+        "(Path(site) / 'ws' / '__init__.py').write_text('')\n"
+        f"(Path(site) / 'ws' / '__main__.py').write_text({_STUB_WS!r})\n"
+        "cmd.parent.mkdir(parents=True, exist_ok=True)\n"
+        "cmd.write_text(f'#!{py}\\nimport sys\\n')\n"
+        "cmd.chmod(0o755)\n",
+        encoding="utf-8",
+    )
+    script = tmp_path / "install.sh"
+    script.write_text(
+        f"#!/usr/bin/env bash\nset -e\necho installer says hello\n{shlex.quote(sys.executable)} -I {shlex.quote(str(builder))}\n"
+    )
+    return py
+
+
+def test_the_hooks_step_and_the_history_use_the_ws_the_installer_wrote(old, tmp_path, monkeypatch, capsys):
+    """The real child path: `_run` starts the hooks step as a process, as in a person's upgrade. The running process is
+    this test's Python; the installer leaves a different environment. The hooks step, the version on record and the
+    line that says which ws runs must all be the new one."""
+    monkeypatch.setattr(selfcmd, "unstable", lambda cmd=None: None)  # the test's own .venv runs the upgrade
+    new_python = _stub_installer(tmp_path, old)
+    calls = tmp_path / "calls.jsonl"
+    monkeypatch.setenv("STUB_WS_OUT", str(calls))
+    assert cli.main(["upgrade", "--installer", str(tmp_path / "install.sh")]) == 0
+    seen = [json.loads(line) for line in calls.read_text().splitlines()]
+    assert {"python": str(new_python), "argv": ["upgrade", "--hooks-only"]} in seen
+    assert all(c["python"] == str(new_python) for c in seen)
+    assert upgrade.history(os.environ)[-1]["to"] == "9.9.9"
+    assert f"with ws 9.9.9 at {new_python}" in capsys.readouterr().out
+
+
+def test_the_step_line_names_the_python_and_version_it_ran_with(old, capsys):
+    code, out, _ = upgrade_hooks(capsys)
+    assert code == 0 and f"ws {__version__} ({sys.executable}): made" in out
+
+
+@pytest.mark.parametrize(
+    ("text", "python"),
+    [
+        ("#!/opt/env/bin/python\nimport sys\n", "/opt/env/bin/python"),
+        ("#!/bin/sh\n'''exec' '/a b/env/bin/python3' \"$0\" \"$@\"\n' '''\n", "/a b/env/bin/python3"),
+        ("#!/usr/bin/env bash\necho hi\n", None),
+        ("no shebang\n", None),
+        ('#!/opt/env/bin/python "unbalanced\n', None),  # shlex cannot split it: not a script to run, and no error
+    ],
+)
+def test_the_python_of_a_console_script_is_read_not_run(tmp_path, text, python):
+    script = tmp_path / "ws"
+    script.write_text(text, encoding="utf-8")
+    assert upgrade._script_python(script) == python
+
+
 def test_what_is_not_the_installer_is_not_run(tmp_path, monkeypatch):
     class Resp(io.BytesIO):
         def __enter__(self):
@@ -774,7 +854,9 @@ def test_under_a_runner_a_terminal_that_is_not_the_runners_own_is_refused(old, c
 @pytest.fixture
 def cutover(swapped, monkeypatch):
     """`swapped`, with the new version known and the version each installer call was asked for recorded in order."""
-    monkeypatch.setattr(upgrade, "_installed_version", lambda: "9.9.9")
+    monkeypatch.setattr(
+        upgrade, "installed_ws", lambda env: upgrade.NewWs(selfcmd.argv(), sys.executable, "9.9.9", "a stand-in")
+    )
     asked: list[str | None] = []
     inner = upgrade.swap
 
@@ -882,13 +964,13 @@ def test_the_watchdog_stops_a_step_that_hangs():
     import time
 
     t = time.monotonic()
-    assert upgrade._run([sys.executable, "-c", "import time; time.sleep(600)"], False, timeout=1) == (
+    assert upgrade._run([sys.executable, "-c", "import time; time.sleep(600)"], False, timeout=1)[:2] == (
         upgrade.EXIT_TIMEOUT,
         True,
     )
     assert time.monotonic() - t < 20  # the step sleeps 600 s: back inside 20 s means the watchdog fired
-    assert upgrade._run([sys.executable, "-c", "raise SystemExit(3)"], False, timeout=30) == (3, False)
-    assert upgrade._run([sys.executable, "-c", "raise SystemExit(124)"], False, timeout=30) == (124, False)
+    assert upgrade._run([sys.executable, "-c", "raise SystemExit(3)"], False, timeout=30)[:2] == (3, False)
+    assert upgrade._run([sys.executable, "-c", "raise SystemExit(124)"], False, timeout=30)[:2] == (124, False)
 
 
 def test_the_installer_gets_its_own_longer_limit(tmp_path, monkeypatch):
@@ -993,3 +1075,286 @@ def test_a_failed_rollback_does_not_hide_the_release_to_go_back_to(old):
     assert upgrade.previous_release(os.environ) == "1.0.0"
     upgrade.record(os.environ, "rollback", "2.0.0", "1.0.0")
     assert upgrade.previous_release(os.environ) is None
+
+
+# --- the upgrade log (C650) --------------------------------------------------------------------------------------------
+
+
+def _log() -> list[dict]:
+    path = upgrade.log_path(os.environ)
+    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+
+def test_a_stub_upgrade_leaves_one_log_line_per_step(old, tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(selfcmd, "unstable", lambda cmd=None: None)
+    new_python = _stub_installer(tmp_path, old)
+    monkeypatch.setenv("STUB_WS_OUT", str(tmp_path / "calls.jsonl"))
+    assert cli.main(["upgrade", "--installer", str(tmp_path / "install.sh"), "--check", "echo check output"]) == 0
+    out = capsys.readouterr().out
+    assert "installer says hello" in out  # streamed to the terminal as before
+    log = _log()
+    assert [(d["verb"], d["step"], d["exit"]) for d in log] == [
+        ("upgrade", "installer", 0),
+        ("upgrade", "hooks", 0),
+        ("upgrade", "check", 0),
+        ("upgrade", "broker", 0),  # none running here: nothing to do
+    ]
+    assert log[0]["tail"] == ["installer says hello"] and log[0]["python"] == "bash"
+    assert log[1]["python"] == str(new_python) and log[1]["version"] == "9.9.9"
+    assert log[2]["tail"] == []  # the check is the person's own command: its output is not kept
+    for d in log:
+        assert d["schema"] == upgrade.LOG_SCHEMA and d["ts"] and isinstance(d["seconds"], float)
+        assert d["dry_run"] is False and d["timed_out"] is False
+
+
+def test_the_tail_keeps_the_last_lines_only(tmp_path):
+    prog = "import sys\nfor i in range(50): print(f'line {i}')\nsys.exit(3)"
+    ran = upgrade._run([sys.executable, "-c", prog], False, timeout=30)
+    assert ran.code == 3 and ran.tail == tuple(f"line {i}" for i in range(30, 50))
+
+
+def test_hooks_only_dry_run_and_rollback_dry_run_each_log_a_line(old, capsys):
+    assert upgrade_hooks(capsys)[0] == 0
+    assert cli.main(["upgrade", "--dry-run"]) == 0
+    assert cli.main(["upgrade", "--rollback", "--version", "0.0.1", "--dry-run"]) == 0
+    got = [(d["verb"], d["step"], d["dry_run"]) for d in _log()]
+    assert got == [("hooks-only", "hooks", False), ("upgrade", "hooks", True), ("rollback", "plan", True)]
+    assert any("): made" in line for line in _log()[0]["tail"])
+    assert _log()[0]["python"] == sys.executable and _log()[0]["version"] == __version__
+
+
+def test_a_hooks_step_under_an_upgrade_leaves_the_line_to_the_parent(old, capsys, monkeypatch):
+    monkeypatch.setenv(upgrade.STEP_ENV, "1")
+    assert upgrade_hooks(capsys)[0] == 0
+    assert _log() == []
+
+
+def test_a_log_that_cannot_be_written_is_said_and_never_fails_the_upgrade(old, capsys):
+    logs = upgrade.log_path(os.environ).parent
+    logs.parent.mkdir(parents=True, exist_ok=True)
+    if logs.is_dir():
+        import shutil
+
+        shutil.rmtree(logs)
+    logs.write_text("not a folder")
+    code, _, err = upgrade_hooks(capsys)
+    assert code == 0 and "could not write" in err and "the upgrade goes on" in err
+
+
+# --- the broker after a swap (C651) ------------------------------------------------------------------------------------
+
+_STUB_BROKER = """
+import json, socket, sys
+path, version, leases = sys.argv[1], sys.argv[2], int(sys.argv[3])
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind(path)
+s.listen(4)
+open(path + ".ready", "w").close()
+while True:
+    c, _ = s.accept()
+    try:  # a probe that only connects and closes is not an error
+        c.recv(4096)
+        c.sendall((json.dumps({"ok": True, "version": version, "leases": leases}) + "\\n").encode())
+    except OSError:
+        pass
+    c.close()
+"""
+
+
+@pytest.fixture
+def broker_sock(monkeypatch):
+    """A short socket path (a Unix socket path has a length limit that a test's tmp_path can pass), as the person's own."""
+    import shutil
+    import tempfile
+
+    folder = Path(tempfile.mkdtemp(prefix="wsb", dir="/tmp" if os.path.isdir("/tmp") else None))
+    sock = folder / "broker.sock"
+    monkeypatch.setattr(upgrade, "broker_socket", lambda env: sock)
+    yield sock
+    shutil.rmtree(folder, ignore_errors=True)
+
+
+@pytest.fixture
+def stub_broker(broker_sock):
+    """Start a stand-in broker process that answers `status` with a version and a lease count; SIGTERM ends it."""
+    import time
+
+    procs: list[subprocess.Popen] = []
+
+    def start(version: str, leases: int = 0) -> subprocess.Popen:
+        p = subprocess.Popen([sys.executable, "-I", "-c", _STUB_BROKER, str(broker_sock), version, str(leases)])
+        procs.append(p)
+        end = time.monotonic() + 30
+        while not Path(str(broker_sock) + ".ready").exists():
+            assert time.monotonic() < end and p.poll() is None, "the stand-in broker did not start"
+            time.sleep(0.02)
+        return p
+
+    yield start
+    for p in procs:
+        if p.poll() is None:
+            p.kill()
+        p.wait()
+
+
+@pytest.fixture
+def starts(monkeypatch):
+    got: list[Path] = []
+    monkeypatch.setattr(upgrade, "start_broker", lambda new, sock: got.append(sock) or True)
+    return got
+
+
+unix_only = pytest.mark.skipif(not hasattr(__import__("socket"), "AF_UNIX"), reason="Unix sockets")
+# the stop needs the kernel to name the peer (SO_PEERCRED) and a pidfd to signal it through: Linux only, so elsewhere
+# the broker is always left running (macOS has neither)
+linux_only = pytest.mark.skipif(
+    not sys.platform.startswith("linux") or not hasattr(os, "pidfd_open"), reason="SO_PEERCRED and pidfd are Linux"
+)
+
+
+@linux_only
+def test_a_broker_on_older_code_is_stopped_and_a_new_one_started(
+    cutover, old, stub_broker, starts, broker_sock, capsys
+):
+    stub = stub_broker("0.0.1")
+    assert cli.main(["upgrade"]) == 0
+    assert stub.wait(timeout=20) == -signal.SIGTERM
+    assert starts == [broker_sock]
+    assert "restarted on ws 9.9.9" in capsys.readouterr().out
+    assert [(d["step"], d["exit"], d["tail"]) for d in _log() if d["step"] == "broker"] == [("broker", 0, [])]
+
+
+@unix_only
+def test_a_broker_on_the_new_version_is_left_alone(cutover, old, stub_broker, starts):
+    stub = stub_broker("9.9.9")
+    assert cli.main(["upgrade"]) == 0
+    assert stub.poll() is None and starts == []
+
+
+@linux_only
+def test_a_broker_with_a_lease_open_is_left_running_and_the_way_to_finish_is_named(
+    cutover, old, stub_broker, starts, capsys
+):
+    stub = stub_broker("0.0.1", leases=1)
+    assert cli.main(["upgrade"]) == 1  # the upgrade is done; the broker still needs doing, and the exit says so
+    assert stub.poll() is None and starts == []
+    out = capsys.readouterr().out
+    assert "1 lease(s) open" in out and f"kill {stub.pid}" in out
+    assert "the broker is left running the old code" in out
+
+
+@unix_only
+def test_a_broker_whose_process_is_not_this_users_is_left_running(
+    cutover, old, stub_broker, starts, capsys, monkeypatch
+):
+    stub = stub_broker("0.0.1")
+    monkeypatch.setattr(upgrade, "_peer_cred", lambda conn: (stub.pid, os.getuid() + 1))
+    assert cli.main(["upgrade"]) == 1
+    assert stub.poll() is None and starts == []
+    assert "cannot tell that its process is yours" in capsys.readouterr().out
+
+
+@unix_only
+def test_an_auto_rollback_never_touches_the_broker(cutover, old, stub_broker, starts, monkeypatch):
+    stub = stub_broker("0.0.1")
+    monkeypatch.setattr(
+        upgrade, "_run", lambda argv, capture, timeout=None: upgrade.Ran(1 if argv[0] == "healthprobe" else 0)
+    )
+    assert cli.main(["upgrade", "--check", "healthprobe"]) == 1
+    assert stub.poll() is None and starts == []
+
+
+@linux_only
+def test_a_rollback_restarts_the_broker_too(cutover, old, stub_broker, starts, broker_sock):
+    stub = stub_broker("0.0.1")
+    assert cli.main(["upgrade", "--rollback", "--version", "0.0.1"]) == 0
+    assert stub.wait(timeout=20) == -signal.SIGTERM and starts == [broker_sock]
+
+
+@unix_only
+def test_dry_run_says_what_it_would_do_with_the_broker(cutover, old, stub_broker, starts, capsys):
+    stub = stub_broker("0.0.1")
+    assert cli.main(["upgrade", "--dry-run"]) == 0
+    assert stub.poll() is None and starts == []
+    assert "would stop it and start one of the new ws" in capsys.readouterr().out
+
+
+@unix_only
+def test_no_broker_running_is_nothing_to_do(cutover, old, broker_sock, starts):
+    assert cli.main(["upgrade"]) == 0
+    assert starts == []
+
+
+@linux_only
+def test_the_new_broker_is_started_by_the_ws_the_installer_wrote(broker_sock, tmp_path):
+    """The real start: `ws.run._start_broker` in a process of the given Python, which leaves a broker answering."""
+    new = upgrade.NewWs(selfcmd.argv(), sys.executable, __version__, "this test")
+    assert upgrade.start_broker(new, broker_sock)
+    peer = upgrade.ask_broker(broker_sock)
+    try:
+        assert peer.status["version"] == __version__ and peer.uid == os.getuid() and peer.pid
+    finally:  # this test is the start; the stop is the stub tests'. Once (22 Nov, a loaded pre-push) TERM took over 20 s
+        os.kill(peer.pid, signal.SIGTERM)
+        if not upgrade._gone(broker_sock, 20):
+            os.kill(peer.pid, signal.SIGKILL)
+        assert upgrade._gone(broker_sock, 20)
+
+
+@linux_only
+def test_a_peer_pid_of_zero_is_never_signalled(cutover, old, stub_broker, starts, capsys, monkeypatch):
+    """SO_PEERCRED says pid 0 for a peer in another pid namespace, and kill(0) would hit this process's own group."""
+    stub = stub_broker("0.0.1")
+    monkeypatch.setattr(upgrade, "_peer_cred", lambda conn: (0, os.getuid()))
+    monkeypatch.setattr(
+        upgrade, "_pidfd", lambda pid: os.pidfd_open(stub.pid)
+    )  # a working pidfd: only the guard stops it
+    assert cli.main(["upgrade"]) == 1
+    assert stub.poll() is None and starts == []
+    out = capsys.readouterr().out
+    assert "cannot tell that its process is yours" in out and "kill 0" not in out
+
+
+@unix_only
+def test_without_a_pidfd_the_broker_is_left_running(cutover, old, stub_broker, starts, capsys, monkeypatch):
+    stub = stub_broker("0.0.1")
+    monkeypatch.setattr(upgrade, "_pidfd", lambda pid: None)
+    assert cli.main(["upgrade"]) == 1
+    assert stub.poll() is None and starts == []
+
+
+_STUBBORN_BROKER = _STUB_BROKER.replace(
+    "import json, socket, sys", "import json, signal, socket, sys\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)"
+)
+
+
+@linux_only
+def test_a_broker_that_does_not_stop_is_reported_and_no_second_one_started(
+    cutover, old, broker_sock, starts, capsys, monkeypatch
+):
+    import time
+
+    monkeypatch.setattr(upgrade, "BROKER_STOP_S", 1.0)
+    stub = subprocess.Popen([sys.executable, "-I", "-c", _STUBBORN_BROKER, str(broker_sock), "0.0.1", "0"])
+    try:
+        end = time.monotonic() + 30
+        while not Path(str(broker_sock) + ".ready").exists():
+            assert time.monotonic() < end and stub.poll() is None
+            time.sleep(0.02)
+        assert cli.main(["upgrade", "--json"]) == 1
+        assert stub.poll() is None and starts == []
+        seen = capsys.readouterr()
+        assert "did not stop within 1 seconds" in seen.err
+        assert json.loads(seen.out)["data"]["broker"] == "failed"
+        assert json.loads(seen.out)["status"] == output.ATTENTION
+        assert [d["exit"] for d in _log() if d["step"] == "broker"] == [1]
+    finally:
+        stub.kill()
+        stub.wait()
+
+
+@linux_only
+def test_the_result_says_what_happened_to_the_broker(cutover, old, stub_broker, starts, capsys):
+    stub_broker("0.0.1")
+    assert cli.main(["upgrade", "--json"]) == 0
+    env = json.loads(capsys.readouterr().out)
+    assert env["data"]["broker"] == "restarted" and env["status"] == output.OK

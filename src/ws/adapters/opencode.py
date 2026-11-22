@@ -634,6 +634,143 @@ OPTIONS = {"exe", "env", "provider", "base_path", "offline"}
 PROMPT_VIA_STDIN = True  # `opencode run` reads the message from stdin when none is given (checked on 1.19.4)
 
 
+# runner_options.provider: a model server on this machine or the local network, for a job ws runs (DEC-051, DEC-093).
+# The block is an allowlist: these keys and nothing else, so no apiKey, headers or fetch options (a key comes through
+# a broker lease). A base URL names a literal address in one of these ranges, or exactly `localhost`: a hostname is
+# never trusted, because what it resolves to can change between the check and the call (DNS rebinding).
+LOCAL_NPM = "@ai-sdk/openai-compatible"
+_BLOCK_KEYS = frozenset({"npm", "name", "options", "models"})
+_OPTION_KEYS = frozenset({"baseURL", "timeout"})
+_MODEL_KEYS = frozenset({"name", "limit", "cost"})
+_LIMIT_KEYS = frozenset({"context", "input", "output"})
+_COST_KEYS = frozenset({"input", "output", "cache_read", "cache_write"})
+_MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$")
+_DOTTED_QUAD = re.compile(
+    r"^(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])$"
+)
+# loopback, the three RFC 1918 private ranges, and CGNAT (RFC 6598), which tailnets use
+LOCAL_NETS = ("127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10")
+
+
+def base_url_problem(url: object) -> str | None:
+    """Why `url` may not be a job's local provider base URL, or None. http or https; no user or password; a literal
+    IPv4 address in LOCAL_NETS written as four plain decimal numbers, `[::1]`, or exactly `localhost`; no query or
+    fragment. Never resolves a name."""
+    import ipaddress
+    import urllib.parse
+
+    if not isinstance(url, str) or not url:
+        return "must be a URL string"
+    if any(c.isspace() or ord(c) < 0x20 or c in "\\{}" for c in url):
+        return "has a space, a control character, a backslash or a brace"
+    try:
+        parts = urllib.parse.urlsplit(url)
+        port = parts.port  # noqa: F841 - a bad port raises here
+    except ValueError:
+        return "is not a URL"
+    if parts.scheme not in ("http", "https"):
+        return "must start with http:// or https://"
+    if "@" in parts.netloc:
+        return "may not carry a user name or password"
+    if parts.query or parts.fragment or url.endswith(("?", "#")):
+        return "may not have a query or a fragment"
+    host = parts.hostname or ""
+    if host == "localhost":
+        return None
+    if parts.netloc.startswith("["):  # IPv6: only ::1, never a mapped or zoned form
+        if "%" in host or "." in host:
+            return "names an IPv6 address other than ::1"
+        try:
+            ip6 = ipaddress.IPv6Address(host)
+        except ValueError:
+            return "names an IPv6 address other than ::1"
+        return None if ip6 == ipaddress.IPv6Address("::1") else "names an IPv6 address other than ::1"
+    if not _DOTTED_QUAD.match(host):
+        return (
+            f"names the host {host!r}: write a literal IPv4 address (four decimal numbers) or localhost, because a "
+            "name can resolve somewhere else"
+        )
+    ip = ipaddress.IPv4Address(host)
+    if not any(ip in ipaddress.IPv4Network(n) for n in LOCAL_NETS):
+        return f"names {host}, which is not a loopback, private (RFC 1918) or CGNAT address"
+    return None
+
+
+def _number(v: object) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v >= 0
+
+
+def provider_problems(block: object, *, leased: bool) -> list[str]:
+    """Every reason runner_options.provider may not be used, each naming its key; empty when it may. `leased` is whether
+    the job takes a [[secrets]] lease, whose address becomes the base URL (the block then names none). The one check,
+    called by `ws job add` and again by `ws run` (build_command), so a hand-written job file meets it too."""
+    k = "runner_options.provider"
+    if not isinstance(block, dict):
+        return [f"{k} must be a table"]
+    if not block:
+        return []
+    out = [
+        f"{k}.{x}: not an allowed key (allowed: {', '.join(sorted(_BLOCK_KEYS))})"
+        for x in sorted(set(block) - _BLOCK_KEYS)
+    ]
+    if any(s in json.dumps(block, default=str) for s in ("{env:", "{file:")):
+        out.append(f"{k}: uses {{env:...}} or {{file:...}}, which OpenCode fills in after ws checks it")
+    if block.get("npm") != LOCAL_NPM:
+        out.append(f"{k}.npm must be {LOCAL_NPM!r}")
+    if "name" in block and not isinstance(block["name"], str):
+        out.append(f"{k}.name must be a string")
+    opts = block.get("options", {})
+    if not isinstance(opts, dict):
+        out.append(f"{k}.options must be a table")
+        opts = {}
+    out += [
+        f"{k}.options.{x}: not an allowed key (allowed: baseURL, timeout; a key comes through a [[secrets]] lease)"
+        for x in sorted(set(opts) - _OPTION_KEYS)
+    ]
+    if "timeout" in opts and not (
+        opts["timeout"] is False
+        or isinstance(opts["timeout"], int)
+        and _number(opts["timeout"])
+        and opts["timeout"] > 0
+    ):
+        out.append(f"{k}.options.timeout must be a positive whole number of milliseconds, or false")
+    if "baseURL" in opts:
+        if leased:
+            out.append(
+                f"{k}.options.baseURL: the job takes a [[secrets]] lease, whose address is the base URL; drop one"
+            )
+        elif why := base_url_problem(opts["baseURL"]):
+            out.append(f"{k}.options.baseURL {why}")
+    elif not leased:
+        out.append(f"{k}.options.baseURL: name the model server's address (a literal local address or localhost)")
+    models = block.get("models", {})
+    if not isinstance(models, dict):
+        return [*out, f"{k}.models must be a table"]
+    for mid, m in models.items():
+        where = f"{k}.models.{mid}"
+        if not isinstance(mid, str) or not _MODEL_ID.match(mid):
+            out.append(f"{k}.models: {mid!r} is not a model id (letters, digits and . _ : / @ + -)")
+            continue
+        if not isinstance(m, dict):
+            out.append(f"{where} must be a table")
+            continue
+        out += [f"{where}.{x}: not an allowed key (allowed: cost, limit, name)" for x in sorted(set(m) - _MODEL_KEYS)]
+        if "name" in m and not isinstance(m["name"], str):
+            out.append(f"{where}.name must be a string")
+        for sub, keys in (("limit", _LIMIT_KEYS), ("cost", _COST_KEYS)):
+            if sub not in m:
+                continue
+            t = m[sub]
+            if not isinstance(t, dict) or set(t) - keys or not all(_number(v) for v in t.values()):
+                out.append(f"{where}.{sub} must be a table of numbers with keys from {', '.join(sorted(keys))}")
+    return out
+
+
+def option_problems(options: dict, *, leased: bool) -> list[str]:
+    """The `ws job add` checks of this runner's runner_options (ws.jobcmd calls it when an adapter has one)."""
+    return provider_problems(options["provider"], leased=leased) if "provider" in options else []
+
+
 def priced(job) -> bool:
     """Can OpenCode price this job's model? Its built-in providers come with prices; a provider block in the job
     does only if every model in it carries a `cost`. Otherwise OpenCode reports 0, which is not free."""
@@ -651,7 +788,8 @@ def build_command(job, run_dir: Path, lease) -> tuple[list[str], dict[str, str]]
     config (OPENCODE_CONFIG_CONTENT, which beats a project's own opencode.json) with OPENCODE_CONFIG_DIR as the plugin
     folder. The lease (if any) becomes the provider's baseURL plus runner_options.base_path (default /v1), with a
     placeholder key, added to that inline config. runner_options.provider is merged into the provider block, for a
-    provider OpenCode does not know (npm, name, models). Raises ValueError naming the key that is wrong."""
+    model server OpenCode does not know, once it passes provider_problems (the same check `ws job add` runs); no
+    project opencode.json is read. Raises ValueError naming the key that is wrong."""
     jobs.check_options(job, OPTIONS)
     exe = jobs.option(job, "exe", str, EXE)
     provider_id, slash, _ = job.model.partition("/")
@@ -707,11 +845,11 @@ def build_command(job, run_dir: Path, lease) -> tuple[list[str], dict[str, str]]
         env.update(OPENCODE_DISABLE_MODELS_FETCH="true", OPENCODE_DISABLE_LSP_DOWNLOAD="true")
     gate_file = out / CONFIG
     config = json.loads(gate_file.read_text(encoding="utf-8")) if gate_file.is_file() else {}
+    if why := provider_problems(job.runner_options.get("provider", {}), leased=lease is not None):
+        raise ValueError("; ".join(why))
     if lease is not None or extra:
         block = json.loads(json.dumps(extra))  # a copy: the job's own table is not touched
         options = block.setdefault("options", {})
-        if not isinstance(options, dict):
-            raise ValueError("runner_options.provider.options must be a table")
         if lease is not None:
             options.update(baseURL=lease.base_url + base_path, apiKey=PLACEHOLDER_KEY)
         config["provider"] = {**(config.get("provider") or {}), provider_id: block}

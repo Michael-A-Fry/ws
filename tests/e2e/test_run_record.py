@@ -110,7 +110,7 @@ def host_of(stub) -> str:
 
 # Fields a plain run that went well leaves null: no fault, no provider wait, no run key (a direct run has no trigger) and
 # no chain. Its stop subtype (the runner's own word) and its approval switch (the policy dial) are always set.
-NULL_UNLESS_SET = {"fault", "retry_after_s", "run_key", "chain_depth"}
+NULL_UNLESS_SET = {"fault", "retry_after_s", "run_key", "chain_depth", "input_sha256"}
 
 
 def check_complete(rec: dict, may_be_null: set[str]) -> None:

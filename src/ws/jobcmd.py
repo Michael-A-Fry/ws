@@ -11,8 +11,10 @@ job must load as `ws run` loads it (ws.jobs.loads) and pass the install checks h
   that cannot write or run commands (Write, Edit, MultiEdit, NotebookEdit and Bash are refused, with or without a
   scope such as `Bash(git *)`);
 - every [[secrets]] name is in the secrets registry, at one of its hosts and for one of its purposes;
-- runner_options has no env, exe or provider (each can point the runner at other code or another endpoint; a job that
-  needs one is written by hand);
+- runner_options has no env or exe (each can point the runner at other code; a job that needs one is written by hand);
+- the runner's own option checks pass, when its adapter has them (`option_problems`): for OpenCode, a `provider`
+  block is an allowlist that names a model server at a literal local address (ws.adapters.opencode.provider_problems,
+  which `ws run` checks again);
 - a `command =` job names one of the commands ws.jobs.COMMANDS allows;
 - budget_usd is at most the profile's monthly_cap_usd, and the purpose's cap when it names a purpose; with no
   monthly cap set, a runner job is refused (as `ws run` would refuse it).
@@ -51,7 +53,7 @@ from ws.output import WsError
 COMMAND = "job"
 
 WRITE_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"})
-REFUSED_OPTIONS = ("env", "exe", "provider")
+REFUSED_OPTIONS = ("env", "exe")
 LOG_NAME = "jobs-installed.jsonl"
 LOG_SCHEMA = 1  # the `schema` of a line in logs/jobs-installed.jsonl
 _TOOL_BASE = re.compile(r"^([A-Za-z0-9_.*-]+)")
@@ -138,9 +140,12 @@ def problems(d: dict, pol: policy.Policy, reg: dict[str, wsecrets.Entry], monthl
     if isinstance(d.get("runner"), str):
         from ws import adapters
 
-        known = getattr(adapters.all_adapters().get(d["runner"]), "OPTIONS", None)
+        adapter = adapters.all_adapters().get(d["runner"])
+        known = getattr(adapter, "OPTIONS", None)
         for k in sorted(set(opts) - set(known)) if known is not None else ():
             out.append(f"runner_options.{k} is not an option of {d['runner']} (known: {', '.join(sorted(known))})")
+        if check := getattr(adapter, "option_problems", None):
+            out += check(opts, leased=bool(d.get("secrets")))
     for k in REFUSED_OPTIONS:
         if k in opts:
             out.append(f"runner_options.{k}: a job added with `ws job add` may not set it (write such a job by hand)")

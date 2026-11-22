@@ -213,9 +213,11 @@ fi
 if [[ "$auto_wrap" == 1 ]]; then
   # --light for a selected or capped set: the e2e files in it would be guessed as UI (refused in a worktree, never sent
   # to a node). --full for the whole suite, which needs the full class's memory and lock, or light's cap would OOM it.
-  # --node local keeps the run here, where the working folder is, not a bundle of tracked files elsewhere.
+  # The whole suite uses --node auto: a machine with a spare node runs it there, so a push does not queue behind
+  # another full run here (a 45-minute wait was seen). auto never moves a tree with untracked files and falls back to
+  # this machine when no node is ready. A selected or capped set stays --node local: it tests the working folder.
   if [[ "$kind" == FULL ]]; then
-    wrap=(ws-test --full --node local --)
+    wrap=(ws-test --full --node auto --)
   else
     # memory scales with the set: 3G for a small one; 6G with e2e runners in it or past 40 files (103 files with the
     # runners hit 3G and were OOM-killed); never more than 8G

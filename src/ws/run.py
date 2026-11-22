@@ -409,15 +409,18 @@ def _base_record(job: jobs.Job, run_id: str, started: datetime, pol: policy.Poli
     )
 
 
-def _job_class(pol: policy.Policy, job: jobs.Job) -> policy.Class | None:
-    """The data class a job works in: that of the real path of its own `cwd`; a job with none runs in a fresh default
-    folder that is in no class (`policy.UNCLASSIFIED`, the strictest). None when the policy has no classes."""
+def _job_class(pol: policy.Policy, job: jobs.Job, real_cwd: str | None = None) -> policy.Class | None:
+    """The data class a job works in: that of the real path of its own `cwd` (`real_cwd` when the caller resolved it
+    already, so the class and the input file come from one resolution); a job with none runs in a fresh default folder
+    that is in no class (`policy.UNCLASSIFIED`, the strictest). None when the policy has no classes."""
     if not pol.classes:
         return None
-    return policy.class_of(pol, os.path.realpath(Path(job.cwd).expanduser())) if job.cwd else policy.UNCLASSIFIED
+    if not job.cwd:
+        return policy.UNCLASSIFIED
+    return policy.class_of(pol, real_cwd or os.path.realpath(Path(job.cwd).expanduser()))
 
 
-def _wall_problem(pol: policy.Policy, job: jobs.Job, adapter, cwd: Path) -> str | None:
+def _wall_problem(pol: policy.Policy, job: jobs.Job, adapter, cwd: Path, real_cwd: str | None = None) -> str | None:
     """Words for why the wall can not be put round a job, or None: the checks a `ws gate launch` makes before it starts a
     runner, made for the job's `cwd` and not this process's. The account must fit the job's class (a class account runs
     jobs in its class's folders only, and the default folder is in none); and with the sandbox on, the folder must be a
@@ -426,7 +429,7 @@ def _wall_problem(pol: policy.Policy, job: jobs.Job, adapter, cwd: Path) -> str 
     puts in its own wall, OpenCode: the adapter's `project_problem`). Static, so `--dry-run` lists it as a refusal."""
     from ws import sandbox, wallsettings
 
-    cls = _job_class(pol, job)
+    cls = _job_class(pol, job, real_cwd)
     try:
         refusal = sandbox.class_user_refusal(pol, cls)
         if refusal is None and pol.gate.sandbox and job.cwd:
@@ -515,7 +518,7 @@ def _job_is_local(job: jobs.Job, provider: str) -> bool:
     return True
 
 
-def _term_leak(pol: policy.Policy, job: jobs.Job) -> str | None:
+def _term_leak(pol: policy.Policy, job: jobs.Job, real_cwd: str | None = None) -> str | None:
     """rr-r4-68: a job's prompt bound for a hosted model may not carry a walled class's term or a canary token
     (`policy.term_problem`, words that name the class only). A model on this machine gets the prompt as it is. The second
     net (`policy.name_spots`) is counted on stderr, never refused and never written down."""
@@ -523,7 +526,7 @@ def _term_leak(pol: policy.Policy, job: jobs.Job) -> str | None:
 
     if not pol.classes or _job_is_local(job, sandbox.job_provider(job.runner, job.model, job.runner_options)):
         return None
-    why = policy.term_problem(pol, _job_class(pol, job), job.prompt or "")
+    why = policy.term_problem(pol, _job_class(pol, job, real_cwd), job.prompt or "")
     if why is None and (n := len(policy.name_spots(job.prompt or ""))):
         print(
             f"ws: note: the prompt has {n} name-like word pair(s); `terms` under [classes] refuses the ones you name",
@@ -821,6 +824,16 @@ def _run(
         return _bad_job(job.name, f"job {job.name}: {e}", log, job, record)
     if job.cwd and not cwd.is_dir():
         return _bad_job(job.name, f"job {job.name}: cwd {str(cwd)!r} is not a folder", log, job, record)
+    real_cwd = os.path.realpath(cwd) if job.cwd else None  # once: the input, the class and the wall use this one
+    input_sha = None
+    if job.input:  # before the prompt is used anywhere, so the term check and every runner see the same text
+        from ws import jobs_input  # late: only a job with an input reads one
+
+        try:
+            text, input_sha = jobs_input.read(Path(real_cwd), job.input)
+        except jobs.JobError as e:
+            return _bad_job(job.name, f"job {job.name}: {e}", log, job, record)
+        job = dataclasses.replace(job, prompt=jobs_input.with_input(job.prompt, job.input, text))
     stdin = bool(getattr(adapter, "PROMPT_VIA_STDIN", False))
     if not stdin:
         argv = [*argv, "--", job.prompt]
@@ -841,12 +854,12 @@ def _run(
     if static is None and why_not:
         static = ("egress", why_not)
     if static is None:
-        leaks = _term_leak(pol, job)
+        leaks = _term_leak(pol, job, real_cwd)
         static = ("term", leaks) if leaks else None
     if static is None:
         static = _cannot_check(pol, job)
     if static is None:
-        walled = _wall_problem(pol, job, adapter, cwd)
+        walled = _wall_problem(pol, job, adapter, cwd, real_cwd)
         static = ("wall", walled) if walled else None
     req = queue.request_for(
         job, run_id, cap_usd=cap, unknown_run_usd=unknown_run_usd,
@@ -854,6 +867,7 @@ def _run(
     )  # fmt: skip
     rec = _base_record(job, run_id, started, pol, verdict)
     rec.update(fields or {})
+    rec["input_sha256"] = input_sha
     if queued is not None:
         rec.update(run_key=queued.run_key, chain_depth=queued.chain_depth)
         extra = {**extra, **queue.chain_env(queued.run_id, queued.chain_depth)}

@@ -10,6 +10,19 @@ body of the GitHub release.
 
 ### Added
 
+- A job file's `input` names one file inside the job's `cwd`. `ws run` reads it at each run, for every runner, without
+  following a link, at most 64 KiB of UTF-8, and puts it after the prompt as untrusted data in the delimited,
+  defused block `ws mail` uses. A missing or unfit file refuses the run. The run record gains `input_sha256`. It
+  replaces data kept in a project `AGENTS.md` or `CLAUDE.md`, which an OpenCode job doesn't read (checked on
+  OpenCode 1.19.4).
+
+## [0.1.11.4] - 2026-11-22
+
+### Added
+
+- `ws mail`: `add`, `check`, `rm` and `serve` for IMAP mailboxes registered in the secrets registry, and five MCP
+  tools (list mailboxes, search, get, label, draft) behind a read-only-by-default connector. Drafts only: nothing is
+  sent. (C626)
 - `ws sync`: fetch every git repository under the code root, 4 at a time, each fetch killed (with its helpers)
   and named past `--timeout-s` (default 120); exit 1 when any failed or timed out.
 - The `pane-keys` guard: a `tmux send-keys` (or a `paste-buffer`) aimed at the live tmux server that types a line
@@ -21,6 +34,12 @@ body of the GitHub release.
   other dialog. A footer counts only at the foot of the screen, and the dialog's text is quoted in the push only
   for a pane in a `full` data class. `ws-watch-panes.timer` (systemd) and `ws.job.watch-panes` (launchd) run it
   every minute (#276).
+- `ws upgrade` writes one line per step to `logs/upgrade.jsonl` (verb, step, Python, version, exit, seconds and the
+  last 20 lines of the installer's or hooks step's output); the terminal output is unchanged. (C650)
+- An OpenCode job can name a model server on this machine or the local network in `runner_options.provider`, and
+  `ws job add` takes it: an allowlisted `@ai-sdk/openai-compatible` table whose `baseURL` is `localhost` or a literal
+  loopback, private or CGNAT address. It replaces a provider block in a project `opencode.json`, which a job no longer
+  reads.
 
 ### Changed
 
@@ -33,6 +52,18 @@ body of the GitHub release.
 - `ws msg` wake never types text with a line that starts with `/` into a pane (reason `slash_text`) (#276).
 - `ws dispatch` passes the model as one argument, `--model=M`, so a model name that starts with `-` can't become a
   flag, and its code root expands `~` only for your own home (`~` or `~/...`).
+- `ws upgrade` runs the hooks step with the ws the installer just wrote, read back from the `ws` command it put in
+  place and that script's Python, and records that ws's version in the history; the step's line names the Python and
+  version it ran with. (C648)
+- `ws upgrade` restarts a broker still running older code once the swap's hooks step and check have passed, when it
+  holds no lease and is your user's process (Linux: SO_PEERCRED and a pidfd); otherwise it leaves it running, prints
+  the command that finishes it and exits 1 (`--json` status `attention`). (C651)
+- A hand-written OpenCode job whose `provider` table names a public or non-literal address, another npm package, or a
+  key outside the allowlist (such as `apiKey` or `headers`) is now refused at `ws run`, with the reason. A leased job
+  whose `provider` table holds only `models` (the lease gives the address) now also needs
+  `npm = "@ai-sdk/openai-compatible"`.
+- A job whose provider is on the local network or a tailnet (a literal private, CGNAT or other loopback address) now
+  counts as a local credential, so the queue and its timer take it; before, only 127.0.0.1, localhost and ::1 did.
 
 ## [0.1.11.3] - 2026-11-22
 

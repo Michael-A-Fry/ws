@@ -160,6 +160,18 @@ def test_search_gives_uids_that_carry_uidvalidity(box):
     assert ("EXAMINE", '"INBOX"') in box.fake.log  # INBOX, read-only
 
 
+def test_a_search_after_a_uid_is_the_oldest_above_it_and_a_bad_one_is_refused_by_the_broker(box):
+    ms = [box.fake.add(ORIGINAL) for _ in range(3)]
+    got = box.mail.search("work", after_uid=ms[0].uid)
+    assert got["uids"] == [f"work:7-{m.uid}" for m in ms[1:]] and got["total"] == 2
+    n = len(box.fake.log)
+    for bad in (True, "3", 3.9):
+        with pytest.raises(mail.MailError) as e:
+            box.mail.search("work", after_uid=bad)
+        assert e.value.kind == "bad_request"
+    assert len(box.fake.log) == n  # refused before the mailbox was dialled
+
+
 def test_an_unknown_mailbox_or_a_bad_uid_is_refused_before_dialling(box):
     assert box.refused(box.mail.search, "home").kind == "unknown_mailbox"
     for bad in ("42", "7-42", "work:7:42", "work:0-1", "work:7-0", "work:7-42 ", 42, None, "work:99999999999-1"):

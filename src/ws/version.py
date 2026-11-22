@@ -87,12 +87,16 @@ def trust_root() -> dict[str, str] | None:
         from ws import _build  # type: ignore[attr-defined]  # written by the release workflow only
     except ImportError:
         return None
+    if getattr(_build, "source", None) != "release" or getattr(_build, "dirty", None) is not False:
+        return None  # only a clean release build vouches for the next one
     ident, signers = getattr(_build, "release_identity", None), getattr(_build, "tag_signers", None)
     if not isinstance(ident, dict) or not isinstance(signers, str) or not signers.strip():
         return None
     root = {key: ident.get(key) for key in ("repo", "identity", "issuer")}
     if not all(isinstance(v, str) and v for v in root.values()) or "{tag}" not in str(root["identity"]):
         return None
+    if "{" in str(root["identity"]).replace("{tag}", "") or "}" in str(root["identity"]).replace("{tag}", ""):
+        return None  # `identity.format(tag=...)` must not meet any other brace field
     return {**{k: str(v) for k, v in root.items()}, "tag_signers": signers}
 
 

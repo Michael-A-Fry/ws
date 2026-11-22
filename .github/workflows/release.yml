@@ -87,6 +87,13 @@ jobs:
           if [ "$GITHUB_EVENT_NAME" = "push" ] && [ "$(git rev-parse HEAD)" != "$GITHUB_SHA" ]; then
             echo "::error::refs/tags/$TAG is not the commit this run started from ($GITHUB_SHA); the tag moved"; exit 1
           fi
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            # the tag must be signed by a key .github/release_signers lists: the file the build stamps in as the trust root
+            # is then tied to the key that really signs tags, not just to a file nobody checked
+            if ! git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=.github/release_signers tag -v "$TAG"; then
+              echo "::error::$TAG is not signed by a key listed in .github/release_signers"; exit 1
+            fi
+          fi
           if ! git merge-base --is-ancestor HEAD origin/main; then
             if [ "$GITHUB_EVENT_NAME" = "push" ]; then
               echo "::error::$TAG is not on main; releases are cut from main"; exit 1
@@ -216,7 +223,7 @@ jobs:
     if: github.event_name == 'push'
     needs: build
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 20  # room for one attest retry and the cosign retries
     permissions:
       id-token: write
       attestations: write
@@ -228,7 +235,22 @@ jobs:
       - name: the files are the ones the build wrote
         working-directory: dist
         run: sha256sum -c ./*.sha256
-      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+      # Sigstore's transparency log sometimes answers 404 or 500 just after a write ("error fetching tlog entry",
+      # 22 Nov 2026: v0.1.11.7 failed here twice with the build green). One retry after a pause; a second failure
+      # still fails the release, so nothing ships unattested.
+      - id: attest1
+        continue-on-error: true
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.whl
+            dist/*.tar.gz
+            dist/*.cdx.json
+      - name: pause before the one retry of the attestation
+        if: steps.attest1.outcome == 'failure'
+        run: sleep 60
+      - if: steps.attest1.outcome == 'failure'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
             dist/*.whl
@@ -244,7 +266,12 @@ jobs:
           TAG: ${{ needs.build.outputs.tag }}
         run: |
           for f in *.whl *.tar.gz *.cdx.json install.sh; do
-            cosign sign-blob --yes --bundle "$f.sigstore.json" "$f"
+            # the same transparency log: up to 3 tries, 30 s apart, then the step fails
+            for try in 1 2 3; do
+              cosign sign-blob --yes --bundle "$f.sigstore.json" "$f" && break
+              [ "$try" = 3 ] && exit 1
+              sleep 30
+            done
             cosign verify-blob --bundle "$f.sigstore.json" \
               --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/$TAG" \
               --certificate-oidc-issuer https://token.actions.githubusercontent.com "$f"

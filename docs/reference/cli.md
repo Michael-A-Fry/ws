@@ -1786,14 +1786,19 @@ options = { baseURL = "http://127.0.0.1:11434/v1", timeout = 600000 }
 name = "Qwen3 8B"
 limit = { context = 32768, output = 4096 }
 cost = { input = 0, output = 0 }
+tool_call = false                        # optional: turn this model's tools off
+options = { reasoningEffort = "none" }   # optional: turn its reasoning down
 ```
 
 The table is an allowlist, checked by `ws job add` and again by `ws run` (so a job file written by hand meets it too):
 
 - `npm` is `@ai-sdk/openai-compatible`; the other keys are `name`, `options.baseURL`, `options.timeout`
-  (milliseconds, or `false`) and, per model, `name`, `limit` and `cost`. Any other key is refused, so there is no
-  `apiKey` or `headers`: a server that needs a key gets it through a `[[secrets]]` lease, whose address is then the
-  base URL (leave `baseURL` out).
+  (milliseconds, or `false`) and, per model, `name`, `limit`, `cost`, `tool_call` and `options.reasoningEffort`. Two
+  of those only narrow a model: `tool_call` may only be `false`, and `reasoningEffort` may only be `none`, `minimal`
+  or `low`. `true` and the higher efforts (`medium`, `high`, `xhigh`, `max`) are refused, because they widen what the model
+  may do. A small local model that loops on tools or reasons for thousands of tokens is the reason to set them. Any
+  other key is refused, so there is no `apiKey` or `headers`: a server that needs a key gets it
+  through a `[[secrets]]` lease, whose address is then the base URL (leave `baseURL` out).
 - `baseURL` is `http` or `https`, with no user name, password, query or fragment, and its host is `localhost` or a
   literal address: loopback (`127.0.0.0/8`, `[::1]`), one of the three RFC 1918 private ranges, or the RFC 6598 CGNAT
   range that tailnets use. A hostname is refused, because what it resolves to can change between

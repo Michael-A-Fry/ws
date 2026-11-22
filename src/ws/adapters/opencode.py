@@ -641,7 +641,12 @@ PROMPT_VIA_STDIN = True  # `opencode run` reads the message from stdin when none
 LOCAL_NPM = "@ai-sdk/openai-compatible"
 _BLOCK_KEYS = frozenset({"npm", "name", "options", "models"})
 _OPTION_KEYS = frozenset({"baseURL", "timeout"})
-_MODEL_KEYS = frozenset({"name", "limit", "cost"})
+_MODEL_KEYS = frozenset({"name", "limit", "cost", "tool_call", "options"})
+# Per model, two keys only ever narrow what the model may do: `tool_call = false` turns its tools off, and
+# `options.reasoningEffort` may name only the lowest of OpenCode's documented efforts (none, minimal, low, medium,
+# high, xhigh). `tool_call = true` and the higher efforts widen, so they are refused (DEC-100, least agency).
+_MODEL_OPTION_KEYS = frozenset({"reasoningEffort"})
+_LOW_EFFORTS = ("none", "minimal", "low")
 _LIMIT_KEYS = frozenset({"context", "input", "output"})
 _COST_KEYS = frozenset({"input", "output", "cache_read", "cache_write"})
 _MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$")
@@ -754,7 +759,10 @@ def provider_problems(block: object, *, leased: bool) -> list[str]:
         if not isinstance(m, dict):
             out.append(f"{where} must be a table")
             continue
-        out += [f"{where}.{x}: not an allowed key (allowed: cost, limit, name)" for x in sorted(set(m) - _MODEL_KEYS)]
+        out += [
+            f"{where}.{x}: not an allowed key (allowed: cost, limit, name, options, tool_call)"
+            for x in sorted(set(m) - _MODEL_KEYS)
+        ]
         if "name" in m and not isinstance(m["name"], str):
             out.append(f"{where}.name must be a string")
         for sub, keys in (("limit", _LIMIT_KEYS), ("cost", _COST_KEYS)):
@@ -763,6 +771,19 @@ def provider_problems(block: object, *, leased: bool) -> list[str]:
             t = m[sub]
             if not isinstance(t, dict) or set(t) - keys or not all(_number(v) for v in t.values()):
                 out.append(f"{where}.{sub} must be a table of numbers with keys from {', '.join(sorted(keys))}")
+        if "tool_call" in m and m["tool_call"] is not False:
+            out.append(f"{where}.tool_call may only be false (it turns the model's tools off; true would widen)")
+        if "options" in m:
+            mo = m["options"]
+            if not isinstance(mo, dict):
+                out.append(f"{where}.options must be a table")
+                continue
+            out += [
+                f"{where}.options.{x}: not an allowed key (allowed: reasoningEffort)"
+                for x in sorted(set(mo) - _MODEL_OPTION_KEYS)
+            ]
+            if "reasoningEffort" in mo and mo["reasoningEffort"] not in _LOW_EFFORTS:
+                out.append(f"{where}.options.reasoningEffort must be one of {', '.join(_LOW_EFFORTS)} (higher widens)")
     return out
 
 

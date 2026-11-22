@@ -843,3 +843,45 @@ def test_a_second_write_of_the_same_value_changes_nothing_and_a_second_delete_is
     assert first == second and first[1] == 0o600 and first[2] == ["anthropic"]  # no stray temp file either
     assert s.delete("anthropic") is True and s.delete("anthropic") is False
     assert s.names() == []
+
+
+GMAIL = """
+[mail-g]
+kind = "imap"
+host = "imap.gmail.com"
+user = "someone@example.com"
+
+[mail-o]
+kind = "imap"
+host = "imap.example.net"
+user = "someone@example.net"
+"""
+
+
+def _app_password() -> str:
+    import secrets as _r
+    import string
+
+    return "".join(_r.choice(string.ascii_lowercase) for _ in range(16))
+
+
+def test_set_strips_the_spaces_google_shows_in_a_gmail_app_password(home, capsys, monkeypatch):
+    registry(home, GMAIL)
+    pw = _app_password()
+    groups = [pw[i : i + 4] for i in range(0, 16, 4)]
+    shown = " ".join(groups).replace(" ", " ", 1)  # a phone's copy may carry a no-break space
+    code, out, err = run(capsys, "secret", "set", "mail-g", stdin=shown + "\n", monkeypatch=monkeypatch)
+    assert code == 0 and pw not in out + err
+    assert wsecrets.Store(home / "secrets").read("mail-g") == pw
+
+
+def test_set_refuses_a_gmail_value_that_is_not_an_app_password_and_keeps_other_hosts_as_typed(
+    home, capsys, monkeypatch
+):
+    registry(home, GMAIL)
+    code, out, err = run(capsys, "secret", "set", "mail-g", stdin=VALUE, monkeypatch=monkeypatch)
+    assert code == 1 and "16 letters" in err and VALUE not in out + err
+    assert "mail-g" not in wsecrets.Store(home / "secrets").names()
+    spaced = "a b " + VALUE
+    code, _, _ = run(capsys, "secret", "set", "mail-o", stdin=spaced, monkeypatch=monkeypatch)
+    assert code == 0 and wsecrets.Store(home / "secrets").read("mail-o") == spaced  # another host: as typed

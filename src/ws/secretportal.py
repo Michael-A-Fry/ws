@@ -176,7 +176,8 @@ def _prompt(args) -> int:
     name = args.name
     _marker(name)
     try:
-        if name not in wsecrets.load_registry(wsecrets.registry_path()):
+        entry = wsecrets.load_registry(wsecrets.registry_path()).get(name)
+        if entry is None:
             raise wsecrets.SecretsError(f"{name!r} is not registered")
         # the store is the one the account's own profile names (`[roles.secrets] store`, in the gate-protected config
         # folder: the person's choice) or the default one; never a session's variable, which `_trusted` ignores
@@ -187,7 +188,7 @@ def _prompt(args) -> int:
             _write_marker(name, "cancelled")
             print("cancelled")
             return 1
-        wsecrets.local_store().write(name, wsecrets.check_value(value))
+        wsecrets.local_store().write(name, wsecrets.clean_value(entry, wsecrets.check_value(value)))
     except (wsecrets.SecretsError, OSError) as e:
         _write_marker(name, "failed", why=str(e)[:200])
         print(f"not stored: {e}", file=sys.stderr)

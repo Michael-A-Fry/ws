@@ -216,6 +216,15 @@ def _minters() -> dict:
     return {m.KIND: m for m in (github_app, imap, ssh_ca)}
 
 
+def clean_value(entry: Entry, value: str) -> str:
+    """A value as its kind wants it stored: a minter with a `clean_value(options, value)` tidies or refuses it (an
+    imap entry for Gmail drops the spaces Google shows in an app password); any other kind is unchanged. Raises
+    SecretsError, whose text never holds the value."""
+    m = _minters().get(entry.kind)
+    fn = getattr(m, "clean_value", None)
+    return value if fn is None else fn(entry.options, value)
+
+
 def _entry(path: Path, name: str, t: dict) -> Entry:
     kind = t.get("kind", "header")
     minters = _minters()
@@ -511,7 +520,7 @@ def cmd_set(args: argparse.Namespace) -> int:
                 f'add it with its hosts first, e.g.\n    [{args.name}]\n    hosts = ["api.example.com"]\n    header = "x-api-key"',
                 2,
             )
-        value = check_value(_read_value(args.name))
+        value = clean_value(reg[args.name], check_value(_read_value(args.name)))
         local_store().write(args.name, value)
     except (SecretsError, EOFError) as e:
         raise WsError("failed", str(e) or "no value given", "see `ws help secret`") from e

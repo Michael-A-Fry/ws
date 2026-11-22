@@ -93,6 +93,7 @@ class FakeImap(socketserver.ThreadingTCPServer):
         self.ctx.load_cert_chain(str(cert), str(key))
         self.password = password
         self.gmail = gmail
+        self.refusal: str | None = None  # set: every LOGIN gets `NO <refusal>` (a server's own wording)
         self.log: list[tuple[str, str]] = []
         self.dialled: list[tuple[str, int]] = []
         self.lock = threading.Lock()
@@ -182,6 +183,8 @@ class _Handler(socketserver.StreamRequestHandler):
         if name == "NOOP":
             return self.send(f"{tag} OK done")
         if name == "LOGIN":
+            if srv.refusal is not None:
+                return self.send(f"{tag} NO {srv.refusal}")
             if len(args) == 2 and _unquote(args[0]) == USER and _unquote(args[1]) == srv.password:
                 return self.send(f"{tag} OK logged in")
             return self.send(f"{tag} NO [AUTHENTICATIONFAILED] Invalid credentials {_unquote(args[-1])}")

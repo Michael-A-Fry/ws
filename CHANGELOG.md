@@ -20,6 +20,15 @@ body of the GitHub release.
   replaces data kept in a project `AGENTS.md` or `CLAUDE.md`, which an OpenCode job doesn't read (checked on
   OpenCode 1.19.4).
 
+### Fixed
+
+- `ws mail add` asks for the password in place when it runs on a terminal, so a plain ssh login with no tmux works;
+  a password it just stored that the server then refuses is taken out again (a network or broker failure keeps it).
+  A refused mailbox login now has its own broker code, `login_refused`, apart from `upstream_refused`. (C666)
+- A Gmail app password pasted with the spaces Google shows ("abcd efgh ijkl mnop") is stored as the 16 letters Gmail's
+  IMAP login wants, by `ws mail add`, `ws secret set` and `ws secret ask`; a Gmail value that isn't 16 letters is
+  refused before it's stored. Other hosts keep the value as typed. (C666)
+
 ## [0.1.11.4] - 2026-11-22
 
 ### Added

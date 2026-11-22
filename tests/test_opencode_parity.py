@@ -184,6 +184,10 @@ def rows(tmp: Path, sha: str = "abc1234def") -> dict[tuple[str, str], list[tuple
         ("inbox", "stop"): [("", [S("stop", last="done")], [0], work)],
         ("pane-close", "pre"): [("", [S("pre", "command", command="ls")], ["allow"], work)],
         ("pane-keys", "pre"): [("", [S("pre", "command", command="ls")], ["allow"], work)],
+        ("upgrade-service", "pre"): [
+            ("", [S("pre", "command", command="systemctl --user start ws-upgrade.service"), S("pre", "command", command="ls")],
+             ["deny", "allow"], work)
+        ],
         ("presence", "pre"): [("", [S("pre", "command", command="ls")], ["allow"], work)],
         ("presence", "post"): [("", [S("post", "command", command="ls")], [0], work)],
         ("presence", "start"): [("", [S("start")], [0], work)],

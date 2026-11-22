@@ -14,6 +14,10 @@ body of the GitHub release.
   and named past `--timeout-s` (default 120); exit 1 when any failed or timed out.
 - `ws upgrade` writes one line per step to `logs/upgrade.jsonl` (verb, step, Python, version, exit, seconds and the
   last 20 lines of the installer's or hooks step's output); the terminal output is unchanged. (C650)
+- An OpenCode job can name a model server on this machine or the local network in `runner_options.provider`, and
+  `ws job add` takes it: an allowlisted `@ai-sdk/openai-compatible` table whose `baseURL` is `localhost` or a literal
+  loopback, private or CGNAT address. It replaces a provider block in a project `opencode.json`, which a job no longer
+  reads.
 
 ### Changed
 
@@ -25,6 +29,12 @@ body of the GitHub release.
 - `ws upgrade` restarts a broker still running older code once the swap's hooks step and check have passed, when it
   holds no lease and is your user's process (Linux: SO_PEERCRED and a pidfd); otherwise it leaves it running, prints
   the command that finishes it and exits 1 (`--json` status `attention`). (C651)
+- A hand-written OpenCode job whose `provider` table names a public or non-literal address, another npm package, or a
+  key outside the allowlist (such as `apiKey` or `headers`) is now refused at `ws run`, with the reason. A leased job
+  whose `provider` table holds only `models` (the lease gives the address) now also needs
+  `npm = "@ai-sdk/openai-compatible"`.
+- A job whose provider is on the local network or a tailnet (a literal private, CGNAT or other loopback address) now
+  counts as a local credential, so the queue and its timer take it; before, only 127.0.0.1, localhost and ::1 did.
 
 ## [0.1.11.3] - 2026-11-22
 

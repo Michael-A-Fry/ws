@@ -317,14 +317,29 @@ def test_a_full_zone_folder_whose_main_checkout_is_walled_is_refused(box):
     assert inside.exists() and "idle" in registered(walled)
 
 
+def ROOT_NS(path):
+    return {"/proc/1/comm": "systemd\n", "/proc/self/uid_map": "         0          0 4294967295\n"}.get(path)
+
+
+def test_a_caller_in_its_own_pid_or_user_namespace_is_blind(monkeypatch):
+    me = os.getpid()
+    tree = {me: 1}  # inside a sandbox the chain stops at its own pid 1
+    bwrap = {"/proc/1/comm": "bwrap\n", "/proc/self/uid_map": "0 0 4294967295\n"}.get
+    unshared = {"/proc/1/comm": "systemd\n", "/proc/self/uid_map": "0 1000 1\n"}.get
+    assert not worktrees.sees_own_parents(tree, me, read=bwrap)
+    assert not worktrees.sees_own_parents(tree, me, read=unshared)
+    assert worktrees.sees_own_parents(tree, me, read=ROOT_NS)
+    assert worktrees.in_root_namespaces({"/proc/1/comm": "init\n"}.get)  # no uid_map file: allowed
+
+
 @needs_git
 def test_a_process_list_that_hides_the_callers_parents_keeps_every_worktree(repo, monkeypatch):
     wt = add(repo, "idle")
     me = os.getpid()
-    assert worktrees.sees_own_parents({me: 4242, 4242: 1}, me)
-    assert worktrees.sees_own_parents({me: 1}, me)
-    assert not worktrees.sees_own_parents({me: 4242}, me)  # the parent is not listed
-    assert not worktrees.sees_own_parents({}, me)
+    assert worktrees.sees_own_parents({me: 4242, 4242: 1}, me, read=ROOT_NS)
+    assert worktrees.sees_own_parents({me: 1}, me, read=ROOT_NS)
+    assert not worktrees.sees_own_parents({me: 4242}, me, read=ROOT_NS)  # the parent is not listed
+    assert not worktrees.sees_own_parents({}, me, read=ROOT_NS)
     with monkeypatch.context() as m:
         m.setattr(worktrees, "_ppids", lambda: {me: 4242})  # a PID namespace or `hidepid`: part of the tree only
         assert reasons(prune(repo)) == {"idle": "busy-unknown"} and wt.exists()

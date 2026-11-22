@@ -26,8 +26,8 @@ release changed the policy in a way the old one rejects (the 22 November lockout
 Chosen option: the service. Four units (`ws upgrade --print-units`, written by `--write` from a person's terminal):
 
 - `ws-upgrade.path` watches `<state>/ws-upgrade/request.json`, which holds one line: a release tag or the word
-  `rollback`. It is outside every protected folder on purpose. It is a wish, not trust: the service reads it as data,
-  checks the shape, takes it (the file is removed) and does not accept a path, a URL, a hash or a command from it.
+  `rollback`. It's outside every protected folder on purpose. It's a wish, not trust: the service reads it as data,
+  checks the shape, takes it (the file is removed) and doesn't accept a path, a URL, a hash or a command from it.
 - `ws-upgrade.service` runs `ws upgrade --unattended`, which is refused unless it runs under systemd with no session
   sign. It refuses a tag at or below the installed version and a second upgrade within an hour (`rollback` goes to the
   release before the last promote in the history, never to a tag the request names), proves the release, waits up to
@@ -48,16 +48,16 @@ severity, or with no severity, in the tag's lock (`uv audit`).
 Checks after the swap (`ws.upgradecheck`): the new ws answers the tag, `ws upgrade --hooks-only` exits 0, and the gate
 hook written in the runner's settings, fed a Bash payload, lets `ls -la` run and stops a private-key read and a read in
 the secrets folder; the deny rules in the settings, and the must-deny probes the hook stops, are no fewer than before the
-swap. A session is not started (a subscription run per upgrade would also blur "no session runs the upgrade");
+swap. A session isn't started (a subscription run per upgrade would also blur "no session runs the upgrade");
 `--session-check COMMAND` adds one of the person's own.
 
 A way back restores the files the new release changed (C706): the swap first holds the policy, the install record and the
 runner configs, and an automatic rollback puts them back before the old hooks step. A manual `--rollback` restores the
-policy from the copy kept in `<state>/upgrade-backups/` while it is still as the upgrade left it.
+policy from the copy kept in `<state>/upgrade-backups/` while it's still as the upgrade left it.
 
 What stops a session: the `upgrade-service` guard refuses `systemctl` start, stop, restart, enable, disable, edit, kill
-and the like on `ws-upgrade*` or `ws-rescue*`, `systemd-run` naming them, and `ws upgrade --unattended` or `--rescue`. It
-is a guard and not a policy entry because a guard ships in the binary (an existing install's policy file is never
+and the like on `ws-upgrade*` or `ws-rescue*`, `systemd-run` naming them, and `ws upgrade --unattended` or `--rescue`. It's
+a guard and not a policy entry because a guard ships in the binary (an existing install's policy file is never
 rewritten); `DEFAULT_GUARDS` and the upgrade's policy migration put it in an existing policy once. The four unit files
 and the tool folder the units run from are protected paths of the hook (`ws.userconfig._claude_protect`), so a session
 write there is refused. The units' `ExecStart` is the `ws` command inside the installed tool's folder, never a path
@@ -75,7 +75,7 @@ Every outcome is a row in `<state>/release-log.csv` (at, verb, from, to, duratio
 - Bad: the acceptance probes are a short fixed list, not the gate corpus (the corpus lives in the source tree and isn't
   shipped), and the installer for a rollback is fetched by tag, not proved, because releases before this one have no signed
   installer.
-- The offline attestation check of the release's provenance is not done: the release publishes the cosign bundle, which
+- The offline attestation check of the release's provenance isn't done: the release publishes the cosign bundle, which
   proves the same workflow identity, and not the attestation file.
 
 ### Swap notes

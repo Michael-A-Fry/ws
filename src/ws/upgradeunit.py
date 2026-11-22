@@ -74,7 +74,7 @@ def units(ws: Path) -> dict[str, str]:
     person's home, which a session can write), and `UnsetEnvironment=` for what the manager's own environment could add.
     On macOS there is no systemd: `ws upgrade --print-units` there prints these for a Linux user manager only, and the
     unattended upgrade is refused until a launchd form is built."""
-    run = f"{ws.with_name('python')} -I -m ws upgrade"
+    run = " ".join([str(ws.with_name("python")), *selfcmd.argv()[1:], "upgrade"])  # the isolated flags are selfcmd's
     env = f"Environment=PATH={paths.tool_path()}\nUnsetEnvironment={UNSET}\n"
     return {
         "ws-upgrade.path": (

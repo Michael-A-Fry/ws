@@ -292,7 +292,12 @@ def meta_repo(tmp_path: Path, signed_by: str | None) -> tuple[Path, dict[str, st
     quiet = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull}
     env = {**os.environ, **quiet, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com"}
     env |= {"GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com"}
-    steps = [["init", "-q"], ["add", "."], ["commit", "-q", "-m", "x"], ["update-ref", "refs/remotes/origin/main", "HEAD"]]
+    steps = [
+        ["init", "-q"],
+        ["add", "."],
+        ["commit", "-q", "-m", "x"],
+        ["update-ref", "refs/remotes/origin/main", "HEAD"],
+    ]
     if signed_by:
         sign = ["-c", "gpg.format=ssh", "-c", f"user.signingkey={tmp_path / signed_by}"]
         steps.append([*sign, "tag", "-s", "-m", "v", "v0.0.1"])
@@ -309,7 +314,9 @@ def meta_repo(tmp_path: Path, signed_by: str | None) -> tuple[Path, dict[str, st
 
 @pytest.mark.skipif(GIT is None or KEYGEN is None, reason="needs git and ssh-keygen")
 @pytest.mark.parametrize(
-    ("signed_by", "ok"), [("listed", True), ("other", False), (None, False)], ids=["listed-key", "unlisted-key", "unsigned"]
+    ("signed_by", "ok"),
+    [("listed", True), ("other", False), (None, False)],
+    ids=["listed-key", "unlisted-key", "unsigned"],
 )
 def test_a_pushed_tag_must_be_signed_by_a_key_in_the_signers_file(tmp_path: Path, signed_by, ok):
     repo, env = meta_repo(tmp_path, signed_by)

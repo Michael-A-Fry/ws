@@ -51,8 +51,10 @@ guessed.
 
 1. Turn on 2-Step Verification for the Google account.
 2. Create an app password (Google Account, Security, App passwords) and copy it.
-3. Run `ws mail add work --host imap.gmail.com --user someone@example.com --kind gmail`. It opens a prompt window
-   (`ws secret ask`); paste the app password there. ws logs in read-only and lists the folders it found.
+3. Run `ws mail add work --host imap.gmail.com --user someone@example.com --kind gmail`. On a terminal it asks for
+   the app password right there, with no echo; with no terminal it opens a prompt window (`ws secret ask`). Paste it
+   as Google shows it: ws drops the spaces (Gmail wants the 16 letters alone). ws logs in read-only and lists the
+   folders it found; a password that just failed to log in isn't kept.
 
 Other providers work the same way with their IMAP host and an app password, if they offer one.
 
@@ -60,7 +62,7 @@ Other providers work the same way with their IMAP host and an app password, if t
 
 | Command | What it does |
 |---|---|
-| `ws mail add NAME --host H --user U [--kind gmail] [--port P]` | Checks the registry has `mail-NAME` as an `imap` entry. If not, it prints the block to add, writes nothing and exits 1. Then writes `[mail.NAME]`. Refuses an entry for another host, user or port (exit 2). Asks for the password when the store has none, then logs in read-only and prints the folders and the drafts folder (exit 1 when none is found). Prints the `[connectors.mail]` table when the policy lacks it. |
+| `ws mail add NAME --host H --user U [--kind gmail] [--port P]` | Checks the registry has `mail-NAME` as an `imap` entry. If not, it prints the block to add, writes nothing and exits 1. Then writes `[mail.NAME]`. Refuses an entry for another host, user or port (exit 2). Asks for the password when the store has none (in place on a terminal, else a prompt window), drops a Gmail app password's spaces, takes a just-typed password out again when it fails, then logs in read-only and prints the folders and the drafts folder (exit 1 when none is found). Prints the `[connectors.mail]` table when the policy lacks it. |
 | `ws mail check` | Logs in read-only to every mailbox: ok, or the refusal code. Exit 1 when any fails or there are none. |
 | `ws mail rm NAME` | Takes `[mail.NAME]` out of the profile. The registry entry and the stored password stay; it prints how to remove them. |
 | `ws mail serve` | The five tools over stdio (MCP). A runner starts it through the connector. |

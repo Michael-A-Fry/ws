@@ -3,18 +3,21 @@
 `ws mail add NAME --host H --user U [--kind gmail]` writes `[mail.NAME]` (secret `mail-NAME`) to the profile, checks
 the secrets registry has that name as an `imap` entry for the same host and user (if not, it prints the block to add
 and stops: the registry is the person's file, ws never writes it), asks for the password with the existing `ws secret
-ask` / `wait` flow when the store has none, then logs in read-only through the broker and prints the folders found and
-the drafts folder. A missing drafts folder is said out loud: drafts are refused until there is one.
+ask` / `wait` flow when the store has none (or, on a terminal, a no-echo prompt right there, so a plain ssh login with
+no tmux works), then logs in read-only through the broker and prints the folders found and the drafts folder. The value
+is tidied for its host first (a Gmail app password loses the spaces Google shows), and a value that was just stored and
+does not log in is taken out again. A missing drafts folder is said out loud: drafts are refused until there is one.
 
 `ws mail check` logs in read-only (LIST) to every mailbox and says ok or why not; exit 1 when any fails. `ws mail rm
 NAME` takes the profile table out; the registry entry and the stored password stay, and it prints how to remove them.
-No command here prints or takes a password: the value goes from the person's prompt window to the store.
+No command here prints a password or takes one as an argument: the value goes from the person's prompt to the store.
 """
 
 from __future__ import annotations
 
 import argparse
 import contextlib
+import getpass
 import sys
 
 from ws import mail, mail_mcp, output, policy, profile, secretportal
@@ -69,9 +72,22 @@ def _write_profile(name: str, kind: str) -> bool:
     return profile.write_if_changed(path, doc)
 
 
+def _prompt_here(entry: wsecrets.Entry) -> None:
+    """On a terminal: a no-echo prompt right here, the value tidied for its host (wsecrets.clean_value: Gmail's spaces
+    go), then stored. Nothing is stored for an empty or refused value."""
+    try:
+        value = getpass.getpass(f"App password for {entry.options.user} (not shown; Enter stores it): ")
+    except (EOFError, KeyboardInterrupt):
+        raise WsError("failed", "no password given; nothing stored", "run `ws mail add` again") from None
+    try:
+        wsecrets.local_store().write(entry.name, wsecrets.clean_value(entry, wsecrets.check_value(value)))
+    except wsecrets.SecretsError as e:
+        raise WsError("bad_value", f"not stored: {e}", "copy the password again and run `ws mail add` again") from None
+
+
 def _ask(secret: str, timeout: float) -> None:
-    """The existing person-only flow: a no-echo prompt window, then a wait until it has stored the value. Its own lines
-    go to stderr, so `--json` keeps one envelope on stdout."""
+    """With no terminal: the person-only prompt window (`ws secret ask`), then a wait until it has stored the value.
+    Its own lines go to stderr, so `--json` keeps one envelope on stdout."""
     with contextlib.redirect_stdout(sys.stderr):
         secretportal.cmd_ask(argparse.Namespace(name=secret, json=False))
         secretportal.cmd_wait(argparse.Namespace(name=secret, json=False, timeout=timeout))
@@ -118,8 +134,16 @@ def cmd_add(args: argparse.Namespace) -> int:
     except mail.MailError as e:
         if e.kind != "unset":
             raise
-        _ask(secret, args.timeout)
-        found = client.folders(name)
+        if sys.stdin.isatty():
+            _prompt_here(entry)
+        else:
+            _ask(secret, args.timeout)
+        try:
+            found = client.folders(name)
+        except mail.MailError:  # the value just stored did not log in: keep nothing new
+            with contextlib.suppress(OSError, wsecrets.SecretsError):
+                wsecrets.local_store().delete(secret)
+            raise
     data.update(registered=True, **{k: found[k] for k in ("folders", "gmail", "drafts")})
     data["connector"] = mail_mcp.CONNECTOR_TOML if _connector_missing() else None
     if args.json:

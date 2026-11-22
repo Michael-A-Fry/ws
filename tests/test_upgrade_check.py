@@ -43,7 +43,7 @@ def settings(home: Path) -> dict:
 def test_the_snapshot_counts_the_deny_rules_and_the_probes_the_hook_stops(home):
     snap = upgradecheck.snapshot(os.environ)
     assert snap["deny"] == len(settings(home)["permissions"]["deny"]) > 1
-    assert snap["denied"] == len(upgradecheck.DENY_PROBES)  # a fresh install stops every one of them
+    assert snap["denied"] == len(upgradecheck.deny_probes(os.environ))  # a fresh install stops every one of them
 
 
 def test_an_installed_ws_passes_every_check(home, new_ws):

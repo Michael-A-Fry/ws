@@ -34,13 +34,13 @@ LOG_COLUMNS = ("at", "verb", "from", "to", "duration_s", "result", "reason")
 PROBE_TIMEOUT_S = 20.0
 STEP_ENV = "WS_UPGRADE_STEP"  # the same name as ws.upgrade.STEP_ENV (a test holds the two together)
 ALLOW_PROBE = "ls -la"
-# commands the gate must stop; HOME is the person's home, so no path here is a real one
-DENY_PROBES = (
-    "cat {HOME}/.ssh/id_rsa",
-    "cat {HOME}/.ws/secrets/probe",
-    "git push --force origin main",
-    "rm -rf /",
-)
+
+
+def deny_probes(env: Mapping[str, str]) -> tuple[str, ...]:
+    """Commands the gate must stop, for this person's home and secrets store (so no path here is a real one): a private
+    key read, a read in the secrets folder, a forced push to main and a delete of the root."""
+    home, secrets = env.get("HOME", ""), paths.data_dir(dict(env)) / "secrets"
+    return (f"cat {home}/.ssh/id_rsa", f"cat {secrets}/probe", "git push --force origin main", "rm -rf /")
 
 
 def log_path(env: Mapping[str, str]) -> Path:
@@ -128,8 +128,7 @@ def snapshot(env: Mapping[str, str]) -> dict[str, int]:
     perms = _settings(env).get("permissions", {})
     perms = perms if isinstance(perms, dict) else {}
     hook = hook_command(env)
-    home = env.get("HOME", "")
-    denied = 0 if hook is None else sum(probe(hook, c.format(HOME=home), env) == 2 for c in DENY_PROBES)
+    denied = 0 if hook is None else sum(probe(hook, c, env) == 2 for c in deny_probes(env))
     return {
         "deny": len(perms.get("deny", [])) if isinstance(perms.get("deny"), list) else 0,
         "denied": denied,
@@ -166,9 +165,9 @@ def acceptance(
     else:
         if probe(hook, ALLOW_PROBE, env) != 0:
             problems.append(f"the gate stopped `{ALLOW_PROBE}`")
-        for cmd in DENY_PROBES[:2]:
-            if probe(hook, cmd.format(HOME=home), env) != 2:
-                problems.append(f"the gate let `{cmd.replace('{HOME}', '~')}` through")
+        for cmd in deny_probes(env)[:2]:
+            if probe(hook, cmd, env) != 2:
+                problems.append(f"the gate let `{cmd.replace(home, '~')}` through")
     now = snapshot(env)
     for key, what in (("deny", "deny rules"), ("denied", "must-deny probes stopped")):
         if now[key] < before.get(key, 0):

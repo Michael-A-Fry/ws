@@ -136,7 +136,7 @@ plain line: control and bidi characters, markdown links, web addresses, brackets
 Lines are added across the day's runs and a thread is one line, the newest. A line is never dropped because a later run
 had nothing to say about it. It moves to "Done" when a later run reads a message from the mailbox's own address in the
 same thread (an answer). Archiving isn't seen: ws reads new mail only. The day's state keeps 100 lines; when it's full,
-answered lines make room, oldest first, and any thread beyond the 100 is counted in a last line, "And N more".
+answered lines make room, oldest first, and any thread beyond the 100 is counted in a last line (`And N more`).
 
 `--dry-run` prints the summary it would write to standard output and writes nothing.
 

@@ -38,8 +38,9 @@ it gets one, a mail flow can call `connect` as its verify step.
 - **Say why, in ws's words.** A refused login is a typed reason (`bad_credentials`, `app_password_required`,
   `imap_off`, `web_login_required`) taken from the server's refusal inside the minter. A page shows ws's own sentence
   for each reason; the server's text never leaves the minter.
-- **Stop before a lockout.** Three refused logins for one mailbox in 15 minutes stop the next try before it dials.
-  The count is a list of times in a state file, pruned by age under a lock, so it can't go stale.
+- **Stop before a lockout.** Three refused logins for one account (host and login, whatever the mailbox is named)
+  in 15 minutes stop the next try before it dials. The check and this try's mark are one locked step, so parallel
+  posts can't all pass. The count is a list of times in a state file, pruned by age, so it can't go stale.
 
 ### Consequences
 

@@ -65,7 +65,7 @@ closes after 10 idle minutes or on Close). A page of your own can do the same: i
 address, the provider and the app password to
 `ws.mailconnect.connect`. That call tries the password with one read-only login before it writes anything. A refusal
 stores nothing and says why in plain words: wrong password, an account password where an app password is needed,
-IMAP off, or the provider wanting a web sign-in first. After three refusals for one mailbox in 15 minutes it stops
+IMAP off, or the provider wanting a web sign-in first. After three refusals for one account in 15 minutes it stops
 before it dials, so the provider doesn't lock the account. If the login works, it adds the `mail-NAME` registry entry
 for Gmail, Outlook or iCloud when it's missing (ws only ever adds an entry, never edits one), stores the password and
 writes `[mail.NAME]`. `ws.mailconnect.known()` lists the mailboxes a page can offer, and when each last logged in.

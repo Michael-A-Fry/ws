@@ -200,3 +200,63 @@ def test_disconnect_forgets_the_password_and_keeps_the_registry_entry(box):
     with pytest.raises(mailconnect.ConnectError) as e:
         mailconnect.disconnect("nope")
     assert e.value.kind == "not_found"
+
+
+def _test_provider(monkeypatch):
+    test = mailconnect.Provider("test", "Test mail", HOST, "imap", "https://example.com", "", ("example.com",))
+    monkeypatch.setitem(mailconnect.PROVIDERS, "test", test)
+    monkeypatch.setitem(mailconnect.HOSTS, HOST, test)
+
+
+def test_a_fresh_name_for_the_same_address_is_still_rate_limited(box, monkeypatch):
+    _test_provider(monkeypatch)
+    t0 = 1_800_000_000.0
+    for i in range(mailconnect.MAX_FAILS):
+        assert refused(box, "a", USER, "wrong", now=t0 + i).kind == "bad_credentials"
+    dialled = len(box.fake.dialled)
+    assert refused(box, "b", USER.upper(), box.password, "test", now=t0 + 10).kind == "rate_limited"
+    assert len(box.fake.dialled) == dialled
+
+
+def test_parallel_posts_cannot_all_pass_the_limit(box, monkeypatch):
+    import threading
+    import time as _time
+
+    real = mailconnect.imap.run
+
+    def slow(*a, **k):
+        _time.sleep(0.3)  # every try is in flight at once
+        return real(*a, **k)
+
+    monkeypatch.setattr(mailconnect.imap, "run", slow)
+    kinds, lock = [], threading.Lock()
+
+    def one():
+        try:
+            mailconnect.connect("a", USER, "wrong", cafile=box.cafile)
+        except mailconnect.ConnectError as e:
+            with lock:
+                kinds.append(e.kind)
+
+    threads = [threading.Thread(target=one) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(30)
+    logins = [v for v in box.fake.verbs() if v == "LOGIN"]
+    assert len(logins) <= mailconnect.MAX_FAILS
+    assert kinds.count("rate_limited") >= 6 - mailconnect.MAX_FAILS
+
+
+def test_a_write_that_fails_after_a_good_login_keeps_nothing_half_done(box, monkeypatch):
+    _test_provider(monkeypatch)
+    before = box.s.registry.read_text()
+
+    def broken(*a, **k):
+        raise mailconnect.WsError("io", "the profile can't be written", "check the disk")
+
+    monkeypatch.setattr(mailconnect.mailcmd, "write_profile", broken)
+    e = refused(box, "b", USER, box.password, "test")
+    assert e.kind == "save_failed" and "nothing was kept" in e.message and "profile" in e.message
+    assert box.s.registry.read_text() == before and "mail-b" not in box.s.store.names() and boxes() == {}
+    assert box.s.store.read("mail-a") == box.password  # another mailbox's value is untouched

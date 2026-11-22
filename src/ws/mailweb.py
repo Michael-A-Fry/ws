@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 
 from ws import mailconnect
+from ws.output import WsError
 from ws.ui import components, css
 from ws.ui.server import BadRequest, LoopbackServer
 
@@ -46,7 +47,12 @@ history.replaceState(null, "", location.pathname);
 const help = JSON.parse(document.getElementById("help").textContent);
 const f = document.getElementById("f"), out = document.getElementById("out"), go = document.getElementById("go");
 const sel = f.elements.provider, tip = document.getElementById("tip"), link = document.getElementById("link");
-function showHelp() { const h = help[sel.value] || help.gmail; tip.textContent = h[1] + " "; link.href = h[0]; }
+function guess() {
+  const d = (f.elements.address.value.split("@")[1] || "").toLowerCase();
+  return Object.keys(help).find((k) => (help[k][2] || []).includes(d)) || "gmail";
+}
+function showHelp() { const h = help[sel.value || guess()]; tip.textContent = h[1] + " "; link.href = h[0]; }
+f.elements.address.addEventListener("input", showHelp);
 sel.addEventListener("change", showHelp); showHelp();
 function say(cls, text, hint) {
   out.className = "out st " + cls; out.textContent = text;
@@ -93,9 +99,13 @@ def page_html(nonce: str, known: list[dict]) -> str:
         )
     listing = components.panel("Mailboxes", "".join(rows)) if rows else ""
     names = "".join(f'<option value="{_e(b["name"])}">' for b in known)
-    opts = "".join(f'<option value="{_e(p.key)}">{_e(p.label)}</option>' for p in mailconnect.PROVIDERS.values())
+    opts = '<option value="" selected>From the address</option>' + "".join(
+        f'<option value="{_e(p.key)}">{_e(p.label)}</option>' for p in mailconnect.PROVIDERS.values()
+    )
     # raw JSON in a data block (its text is never entity-decoded); "<" escaped so it can't close the tag
-    help_json = json.dumps({p.key: [p.app_passwords, p.help] for p in mailconnect.PROVIDERS.values()}).replace("<", "\\u003c")
+    help_json = json.dumps(
+        {p.key: [p.app_passwords, p.help, list(p.domains)] for p in mailconnect.PROVIDERS.values()}
+    ).replace("<", "\\u003c")
     form = (
         '<form id="f" autocomplete="off">'
         '<label>Mailbox name<input name="name" list="names" required maxlength="40" pattern="[a-z0-9][a-z0-9_\\-]*" '
@@ -145,8 +155,15 @@ def build_server(env: dict | None = None, **kw) -> LoopbackServer:
         password = f.pop("password")
         try:
             r = mailconnect.connect(f["name"], f["address"], password, f["provider"] or None, env, cafile=cafile)
-        except mailconnect.ConnectError as e:
+        except WsError as e:  # a ConnectError, or a profile or store error with its own words
             return 200, {"ok": False, "kind": e.kind, "message": e.message, "hint": e.hint}
+        except Exception as e:  # noqa: BLE001 - never a bare 500 with a half-done write: say so plainly
+            return 200, {
+                "ok": False,
+                "kind": "failed",
+                "message": f"ws stopped ({type(e).__name__}).",
+                "hint": "Try again.",
+            }
         finally:
             del password
         return 200, {"ok": True, **r}

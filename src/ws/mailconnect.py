@@ -3,22 +3,25 @@
 `connect(name, address, password, provider)` is what a "Connect mail" card calls (`ws mail connect --web`, or any
 page of the person's own that imports it). In order:
 
-1. The name, address and provider are checked; a name that has failed MAX_FAILS logins in the last WINDOW_S seconds
-   is refused before anything is dialled (`rate_limited`), because a provider locks an account out after a few bad
-   tries. The count is a list of failure times in one state file, read and written under a lock and pruned by age on
-   every call, so it can never go stale: an old failure simply falls out of the window.
+1. The name, address and provider are checked.
 2. The registry entry `mail-<name>` is read. One that is there must be for the same host and login (`conflict`). One
    that is missing is added only for a host in PROVIDERS (Gmail, Outlook, iCloud); for any other host nothing is
    written and the block to add is returned (`needs_registry`). ws only ever appends a new entry; it never edits or
    removes one.
 3. The password is tidied for its host (`ws.secrets.clean_value`: a Gmail app password loses Google's spaces and must
    be 16 letters).
-4. One read-only login and LIST, made here with the typed value, before anything is stored. A refusal is a typed
+4. The limit: an account (host and login, whatever the mailbox is named) with MAX_FAILS tries in the last WINDOW_S
+   seconds is refused before anything is dialled (`rate_limited`), because a provider locks an account out after a few
+   bad tries. In one locked section the count is checked and this try is written; a refusal keeps it, a login that
+   worked clears the account, and no answer takes it out. The tries are times in one state file, pruned by age, so
+   the count can't go stale.
+5. One read-only login and LIST, made here with the typed value, before anything is stored. A refusal is a typed
    ConnectError (`bad_credentials`, `app_password_required`, `imap_off`, `web_login_required`, `unreachable`, ...)
    whose words say what to fix; it counts towards the limit, and nothing is written, so a stored value that works is
    never replaced by one that doesn't.
-5. Only then: the registry entry (if new), the value in the local store, and `[mail.<name>]` in the profile. A last
-   LIST through the broker proves the broker sees it (`broker_ok`).
+6. Only then, all or nothing: the registry entry (if new), the value in the local store, and `[mail.<name>]` in the
+   profile (`save_failed` puts back what was there). A last LIST through the broker proves the broker sees it
+   (`broker_ok`).
 
 `set_on(name, on)` switches a mailbox off (its profile table out, its password kept) or back on; `disconnect(name)`
 takes the table and the stored password out. Neither touches the registry entry.
@@ -33,6 +36,7 @@ import contextlib
 import json
 import os
 import re
+import secrets
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -179,55 +183,75 @@ def _locked(path: Path):
         os.close(fd)  # closing releases the lock
 
 
-def _recent(path: Path, now: float) -> dict[str, list[float]]:
+def _account(host: str, address: str) -> str:
+    """What the limit counts by: the provider's account (host and login), never the mailbox name, which is free to change."""
+    return f"{host.lower()}|{address.lower()}"
+
+
+def _tries(path: Path, now: float) -> dict[str, list[dict]]:
+    """The tries still inside the window, per account: {"t": time, "id": token}. A try is written before its login and
+    taken out again only when the login could not count (no answer from the server, or a success)."""
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
-    out: dict[str, list[float]] = {}
+    out: dict[str, list[dict]] = {}
     for k, v in raw.items() if isinstance(raw, dict) else ():
         if isinstance(k, str) and isinstance(v, list):
-            ts = [float(t) for t in v if isinstance(t, (int, float)) and now - WINDOW_S < t <= now]
-            if ts:
-                out[k] = ts
+            keep = [
+                {"t": float(x["t"]), "id": str(x.get("id", ""))}
+                for x in v
+                if isinstance(x, dict)
+                and isinstance(x.get("t"), (int, float))
+                and now - WINDOW_S
+                < x["t"]
+                <= now + WINDOW_S  # a newer try (another thread's clock read later) still counts
+            ]
+            if keep:
+                out[k] = keep
     return out
 
 
-def _write_recent(path: Path, doc: dict[str, list[float]]) -> None:
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+def _write_recent(path: Path, doc: dict) -> None:
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
     tmp.write_text(json.dumps(doc), encoding="utf-8")
     os.replace(tmp, path)
 
 
-def _check_limit(name: str, env: dict | None, now: float) -> None:
+def _reserve(account: str, name: str, env: dict | None, now: float) -> str:
+    """In one locked section: refuse when the account already has MAX_FAILS tries in the window (a try still logging
+    in counts), else write this try and return its id. Parallel posts can't all pass, and a try whose process dies
+    stays counted until it ages out."""
     path = _limit_file(env)
     with _locked(path):
-        fails = _recent(path, now).get(name, [])
-    if len(fails) >= MAX_FAILS:
-        wait = max(1, int((min(fails) + WINDOW_S - now + 59) // 60))
-        raise ConnectError(
-            "rate_limited",
-            f"{MAX_FAILS} logins for {name} failed in the last {WINDOW_S // 60} minutes; ws stops here so the "
-            "provider does not lock the account.",
-            f"Try again in {wait} minute{'s' if wait != 1 else ''}.",
-            details={"retry_minutes": wait},
-        )
-
-
-def _count_failure(name: str, env: dict | None, now: float) -> None:
-    path = _limit_file(env)
-    with _locked(path):
-        doc = _recent(path, now)
-        doc.setdefault(name, []).append(now)
+        doc = _tries(path, now)
+        held = doc.get(account, [])
+        if len(held) >= MAX_FAILS:
+            wait = max(1, int((min(x["t"] for x in held) + WINDOW_S - now + 59) // 60))
+            raise ConnectError(
+                "rate_limited",
+                f"{MAX_FAILS} logins for {name} failed in the last {WINDOW_S // 60} minutes; ws stops here so the "
+                "provider does not lock the account.",
+                f"Try again in {wait} minute{'s' if wait != 1 else ''}.",
+                details={"retry_minutes": wait},
+            )
+        token = secrets.token_hex(8)
+        doc.setdefault(account, []).append({"t": now, "id": token})
         _write_recent(path, doc)
+    return token
 
 
-def _clear_failures(name: str, env: dict | None, now: float) -> None:
+def _release(account: str, token: str, env: dict | None, now: float, *, all_of_them: bool = False) -> None:
+    """Take this try out (the server never answered), or every try of the account (a login that worked)."""
     path = _limit_file(env)
     with _locked(path):
-        doc = _recent(path, now)
-        if doc.pop(name, None) is not None:
-            _write_recent(path, doc)
+        doc = _tries(path, now)
+        left = [] if all_of_them else [x for x in doc.get(account, []) if x["id"] != token]
+        if left:
+            doc[account] = left
+        else:
+            doc.pop(account, None)
+        _write_recent(path, doc)
 
 
 def _checked_file(env: dict | None) -> Path:
@@ -284,6 +308,47 @@ def _append_entry(path: Path, block: str) -> None:
 # ---------------------------------------------------------------- connect
 
 
+def _save(name: str, kind: str, secret: str, value: str, reg_path: Path, block: str | None, env: dict | None) -> bool:
+    """Write the registry entry (if new), the stored value and the profile table, or put back what was there and raise
+    ConnectError: a good login never leaves a stored value with no table, or a table with no value."""
+    store = wsecrets.local_store(env)
+    try:
+        old_reg = reg_path.read_text(encoding="utf-8") if block is not None and reg_path.exists() else None
+        old_value = store.read(secret) if secret in store.names() else None
+    except (OSError, PermissionError, wsecrets.SecretsError) as e:
+        raise ConnectError("store_refused", "The password checked out, but ws can't read its store.", str(e)) from None
+    profile_path = mailcmd.profile.profile_path(env)
+    old_profile = profile_path.read_bytes() if profile_path.exists() else None
+    step = "registry"
+    try:
+        if block is not None:
+            _append_entry(reg_path, block)
+        step = "store"
+        store.write(secret, value)
+        step = "profile"
+        return mailcmd.write_profile(name, kind, env)
+    except (OSError, PermissionError, WsError, wsecrets.SecretsError) as e:
+        with contextlib.suppress(OSError, wsecrets.SecretsError):
+            if block is not None:
+                if old_reg is None:
+                    reg_path.unlink(missing_ok=True)
+                else:
+                    reg_path.write_text(old_reg, encoding="utf-8")
+            if old_value is None:
+                store.delete(secret)
+            else:
+                store.write(secret, old_value)
+            if old_profile is None:
+                profile_path.unlink(missing_ok=True)
+            else:
+                profile_path.write_bytes(old_profile)
+        where = {"registry": "the secrets registry", "store": "the password store", "profile": "the profile"}[step]
+        why = e.message if isinstance(e, WsError) else str(e)
+        raise ConnectError(
+            "save_failed", f"The password checked out, but ws couldn't write {where}, so nothing was kept.", why
+        ) from None
+
+
 def _fail(kind: str) -> ConnectError:
     message, hint = SAY[kind]
     return ConnectError(kind, message, hint)
@@ -316,7 +381,6 @@ def connect(
         raise ConnectError("bad_host", "That isn't a mail server name.", "e.g. imap.example.com, with no port.")
     if not password:
         raise ConnectError("no_password", "No app password was given.", "Paste the app password.")
-    _check_limit(name, env, now)
 
     secret = mailcmd.secret_name(name)
     reg_path = wsecrets.registry_path(env)
@@ -356,25 +420,24 @@ def connect(
     except wsecrets.SecretsError as e:
         raise ConnectError("not_app_password", str(e), "Copy the app password again and paste it.") from None
 
+    account = _account(opts.host, address)
+    token = _reserve(account, name, env, now)
     try:
         found = imap.run(opts, value, "list", {}, cafile=cafile)
     except imap.ImapError as e:
-        if e.code == "login_refused":
-            _count_failure(name, env, now)
+        if e.code == "login_refused":  # the server said no: the try stays counted
             raise _fail(e.login if e.login in SAY else "refused") from None
+        _release(account, token, env, now)  # no answer to count
         if e.code in ("upstream_unreachable", "tls_failed"):
             raise _fail("unreachable" if e.code == "upstream_unreachable" else "tls_failed") from None
         raise ConnectError("failed", "The test login did not finish.", "Try again.") from None
-    _clear_failures(name, env, now)
+    except BaseException:
+        _release(account, token, env, now)
+        raise
+    _release(account, token, env, now, all_of_them=True)
 
-    # The login worked: now, and only now, write.
-    if block is not None:
-        _append_entry(reg_path, block)
-    try:
-        wsecrets.local_store(env).write(secret, value)
-    except wsecrets.SecretsError as e:
-        raise ConnectError("store_refused", f"The password checked out but wasn't stored: {e}", "") from None
-    written = mailcmd.write_profile(name, kind)
+    # The login worked: now, and only now, write; all of it or none of it.
+    written = _save(name, kind, secret, value, reg_path, block, env)
     _mark_checked(name, env, now)
     broker_ok = True
     try:
@@ -414,9 +477,9 @@ def set_on(name: str, on: bool, env: dict | None = None) -> dict:
         if name not in _checked(env) or entry.name not in wsecrets.local_store(env).names():
             raise ConnectError("needs_login", f"{name} has no password that has logged in yet.", "Fix its login first.")
         p = HOSTS.get(entry.options.host)
-        mailcmd.write_profile(name, p.kind if p else "imap")
+        mailcmd.write_profile(name, p.kind if p else "imap", env)
     else:
-        mailcmd.remove_profile(name)
+        mailcmd.remove_profile(name, env)
     return {"mailbox": name, "on": on}
 
 
@@ -424,7 +487,7 @@ def disconnect(name: str, env: dict | None = None) -> dict:
     """Take the mailbox out of ws: its profile table, its stored password and its checked mark go. The registry entry
     stays (ws never removes one); connecting again re-uses it."""
     entry = _entry_for(name, env)
-    mailcmd.remove_profile(name)
+    mailcmd.remove_profile(name, env)
     forgot = wsecrets.local_store(env).delete(entry.name)
     path = _checked_file(env)
     with _locked(path):

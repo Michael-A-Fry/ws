@@ -93,3 +93,28 @@ def test_a_field_that_is_not_text_is_a_400(page):
 def test_connect_without_web_is_a_usage_error(capsys):
     assert cli.main(["mail", "connect"]) == 2
     assert "--web" in capsys.readouterr().err
+
+
+def test_the_provider_defaults_to_the_address_so_an_outlook_address_never_tries_gmail(page, box):  # noqa: F811
+    text = call(page, "GET", "/?t=tok")[2]
+    assert '<option value="" selected>From the address</option>' in text
+    body = {"name": "work", "address": "someone@outlook.com", "provider": "", "password": "x" * 16}
+    r = json.loads(call(page, "POST", "/connect", body)[2])
+    assert r["ok"] is False and r["kind"] == "unreachable"  # the test allows only the fake host: proof of where it went
+    assert ("outlook.office365.com", 993) in box.fake.dialled and ("imap.gmail.com", 993) not in box.fake.dialled
+
+
+def test_any_other_ws_error_comes_back_in_plain_words_not_a_500(page, monkeypatch):
+    from ws.output import WsError
+
+    def boom(*a, **k):
+        raise WsError("io", "The profile can't be written.", "Check the disk.")
+
+    monkeypatch.setattr(mailconnect, "connect", boom)
+    status, _, text = call(page, "POST", "/connect", {"name": "a", "address": USER, "provider": "", "password": "x"})
+    assert status == 200 and json.loads(text) == {
+        "ok": False,
+        "kind": "io",
+        "message": "The profile can't be written.",
+        "hint": "Check the disk.",
+    }

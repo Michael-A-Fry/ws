@@ -62,8 +62,8 @@ def _registry() -> dict:
         raise WsError("bad_config", str(e), f"fix {wsecrets.registry_path()}") from None
 
 
-def write_profile(name: str, kind: str) -> bool:
-    path = profile.profile_path()
+def write_profile(name: str, kind: str, env: dict | None = None) -> bool:
+    path = profile.profile_path(env)
     try:
         doc = profile.load(path) or {}
     except profile.ProfileError as e:
@@ -187,9 +187,9 @@ def cmd_check(args: argparse.Namespace) -> int:
     return 1 if bad else 0
 
 
-def remove_profile(name: str) -> str | None:
+def remove_profile(name: str, env: dict | None = None) -> str | None:
     """Take `[mail.NAME]` out of the profile; returns its secret name, or None when there was no such table."""
-    path = profile.profile_path()
+    path = profile.profile_path(env)
     try:
         doc = profile.load(path) or {}
     except profile.ProfileError as e:

@@ -13,6 +13,8 @@ that give a unit ws does not own the same hook.
                                so a job that runs a ws command rotates too, not only `ws run`).
     ws watch dropin UNIT... --out DIR
                                write `DIR/UNIT.service.d/10-ws-alert.conf` (OnFailure= only) for units ws did not write.
+    ws watch panes             push once when a tmux pane has sat on a dialog for minutes; press Esc only on the Remote
+                               Control status box (ws.panewatch). Run every minute by `ws-watch-panes.timer`.
 
 An overdue job raises one alert for its last run; the next one comes only after the job has run again and gone overdue
 again, so a job that stays red is one alert, not a flood (a failed run is one alert from `alert`, per run).
@@ -92,7 +94,7 @@ def _notify_cfg(env) -> dict | None:
     return cfg if isinstance(cfg, dict) and cfg.get("adapter") == ntfy.NAME else None
 
 
-def push(env, text: str, plain: str, sender=None) -> bool | None:
+def push(env, text: str, plain: str, sender=None, title: str = "ws job") -> bool | None:
     """One ntfy line through the notify role (`plain` when alert_text is "plain"). True when sent, False when the send
     failed, None when there is no notify role. Never raises, because an alert must not fail a unit."""
     try:
@@ -101,7 +103,7 @@ def push(env, text: str, plain: str, sender=None) -> bool | None:
         cfg = _notify_cfg(env)
         if cfg is None:
             return None
-        ntfy.send(cfg, env, plain if cfg.get("alert_text") == "plain" else text, "ws job", "alert", None, sender)
+        ntfy.send(cfg, env, plain if cfg.get("alert_text") == "plain" else text, title, "alert", None, sender)
         return True
     except Exception:  # noqa: BLE001  NotifyError and CapReached land here: the not-automatic line already says it
         return False
@@ -342,3 +344,6 @@ def register(sub) -> None:
     p.add_argument("units", nargs="+")
     p.add_argument("--out", required=True, metavar="DIR")
     p.set_defaults(func=cmd_dropin)
+    from ws import panewatch  # here, not at the top: panewatch pushes through this module
+
+    panewatch.register(ws)

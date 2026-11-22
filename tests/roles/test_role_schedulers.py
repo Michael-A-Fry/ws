@@ -25,6 +25,7 @@ AI_JOB = (
 LINKED_DAILY = [  # what `systemctl link` gets for one job: its units, the shared slice, the alert and dead-man units
     "ws-alert@.service", "ws-daily.service", "ws-daily.timer", "ws-jobs.slice",
     "ws-queue-reap.service", "ws-queue-reap.timer", "ws-watch-deadman.service", "ws-watch-deadman.timer",
+    "ws-watch-panes.service", "ws-watch-panes.timer",
 ]  # fmt: skip
 BACKUP_JOB = 'command = "backup"\nschedule = "weekly mon 09:05"\n' + CONTRACT
 
@@ -205,6 +206,8 @@ def test_systemd_steps_install_and_uninstall(box, write_job, env, linux):
         "ws-queue-reap.timer",
         "ws-watch-deadman.service",
         "ws-watch-deadman.timer",
+        "ws-watch-panes.service",
+        "ws-watch-panes.timer",
     ]
     assert all(s.path.parent == box / ".ws" / "jobs" / "units" for s in steps if s.path.name != "logs")
     r = install.apply(steps, env)
@@ -213,7 +216,7 @@ def test_systemd_steps_install_and_uninstall(box, write_job, env, linux):
     fake = Fake()
     removed = install.uninstall(env, deactivate=lambda paths, e: roles.deactivate_units(paths, e, fake))
     assert not list((box / ".ws" / "jobs" / "units").glob("ws-*"))
-    assert len([p for p in removed.removed if p.name.startswith("ws-")]) == 10
+    assert len([p for p in removed.removed if p.name.startswith("ws-")]) == 12
     # the links systemctl made outside $WS_HOME are undone before the files go
     assert fake.calls[0] == [
         "systemctl",
@@ -228,6 +231,8 @@ def test_systemd_steps_install_and_uninstall(box, write_job, env, linux):
         "ws-queue-reap.service",
         "ws-watch-deadman.timer",
         "ws-watch-deadman.service",
+        "ws-watch-panes.timer",
+        "ws-watch-panes.service",
     ]
     assert removed.problems == []
 
@@ -265,7 +270,16 @@ def test_systemd_activate_argv(box, write_job, env):
     assert fake.calls == [
         ["systemctl", "--user", "link", *(str(units / n) for n in LINKED_DAILY)],
         ["systemctl", "--user", "daemon-reload"],
-        ["systemctl", "--user", "enable", "--now", "ws-daily.timer", "ws-queue-reap.timer", "ws-watch-deadman.timer"],
+        [
+            "systemctl",
+            "--user",
+            "enable",
+            "--now",
+            "ws-daily.timer",
+            "ws-queue-reap.timer",
+            "ws-watch-deadman.timer",
+            "ws-watch-panes.timer",
+        ],
     ]
 
 
@@ -307,6 +321,8 @@ def test_systemd_activate_links_nothing_over_a_unit_it_did_not_write(box, write_
         str(units / "ws-queue-reap.timer"),
         str(units / "ws-watch-deadman.service"),
         str(units / "ws-watch-deadman.timer"),
+        str(units / "ws-watch-panes.service"),
+        str(units / "ws-watch-panes.timer"),
         str(units / "ws-weekly.service"),
         str(units / "ws-weekly.timer"),
     ]
@@ -437,11 +453,16 @@ def test_launchd_interval(when, want):
 def test_launchd_steps_install_and_activate(box, write_job, env):
     write_job("daily", AI_JOB)
     steps = launchd.steps({}, install.Answers(), env)
-    assert [s.path.name for s in steps if s.kind == "file"] == ["ws.job.daily.plist", "ws.job.queue-reap.plist"]
+    assert [s.path.name for s in steps if s.kind == "file"] == [
+        "ws.job.daily.plist",
+        "ws.job.queue-reap.plist",
+        "ws.job.watch-panes.plist",
+    ]
     assert install.apply(steps, env).changes >= 1
     assert install.apply(steps, env).changes == 0
     plist = box / ".ws" / "jobs" / "units" / "ws.job.daily.plist"
     reaper = plist.with_name("ws.job.queue-reap.plist")
+    panes = plist.with_name("ws.job.watch-panes.plist")
     assert plistlib.loads(plist.read_bytes())["WsWrittenBy"] == "ws"
     assert plistlib.loads(reaper.read_bytes())["WsWrittenBy"] == "ws"
     fake = Launchctl()  # not loaded yet: nothing to boot out
@@ -451,6 +472,8 @@ def test_launchd_steps_install_and_activate(box, write_job, env):
         ["launchctl", "bootstrap", "gui/501", str(plist)],
         ["launchctl", "print", "gui/501/ws.job.queue-reap"],
         ["launchctl", "bootstrap", "gui/501", str(reaper)],
+        ["launchctl", "print", "gui/501/ws.job.watch-panes"],
+        ["launchctl", "bootstrap", "gui/501", str(panes)],
     ]
     fake = Launchctl({"ws.job.daily": str(plist)})  # loaded from ws's own plist: booted out, then loaded again
     assert launchd.activate(env, fake, uid=501) == []
@@ -459,6 +482,8 @@ def test_launchd_steps_install_and_activate(box, write_job, env):
         ["launchctl", "bootstrap", "gui/501", str(plist)],
         ["launchctl", "print", "gui/501/ws.job.queue-reap"],
         ["launchctl", "bootstrap", "gui/501", str(reaper)],
+        ["launchctl", "print", "gui/501/ws.job.watch-panes"],
+        ["launchctl", "bootstrap", "gui/501", str(panes)],
     ]
     fake = Launchctl({"ws.job.daily": str(plist)})
     assert launchd.deactivate(["daily"], env, fake, uid=501) == [] and fake.calls == [
@@ -487,7 +512,13 @@ def test_launchd_leaves_a_label_it_did_not_load_alone(box, write_job, env):
     fake = Launchctl({"ws.job.daily": str(stranger)})  # a stranger holds ws's label: activate neither boots nor loads
     problems = launchd.activate(env, fake, uid=501)
     assert len(problems) == 1 and "ws.job.daily" in problems[0]
-    assert [c[1] for c in fake.calls] == ["print", "print", "bootstrap"]  # the reaper, not held by anyone, loads
+    assert [c[1] for c in fake.calls] == [
+        "print",
+        "print",
+        "bootstrap",
+        "print",
+        "bootstrap",
+    ]  # the others, not held by anyone, load
 
 
 def test_launchd_owns_an_agent_loaded_from_a_home_that_moved(box, write_job, env):
@@ -507,7 +538,7 @@ def test_launchd_warns_about_an_agent_with_no_schedule(box, write_job, env, mac)
     write_job("daily", AI_JOB.replace('schedule = "daily 03:30"\n', ""))
     status, detail = launchd.check({}, mac, env, False)
     assert status == "warn" and "daily" in detail
-    assert launchd.orphans(env) == ["daily", "queue-reap"]  # the reaper goes with the last job
+    assert launchd.orphans(env) == ["daily", "queue-reap", "watch-panes"]  # the watchers go with the last job
 
 
 def test_launchd_with_no_jobs_writes_nothing(box, env):
@@ -533,7 +564,7 @@ def test_launchd_print_failing_for_another_reason_is_a_problem_not_a_skip(box, w
     fake = Fake(code=1, out="Operation not permitted")
     for problems in (launchd.deactivate(["daily"], env, fake, uid=1), launchd.activate(env, fake, uid=1)):
         assert "ws.job.daily" in problems[0] and "Operation not permitted" in problems[0]
-        assert all("ws.job.daily" in x or "ws.job.queue-reap" in x for x in problems)  # the reaper agent too
+        assert all(any(j in x for j in ("daily", "queue-reap", "watch-panes")) for x in problems)  # the watchers too
     assert all(c[1] == "print" for c in fake.calls)
 
 
@@ -568,7 +599,7 @@ def test_cli_list_dry_run_apply_remove(box, write_job, env, linux, capsys, monke
     assert not (box / ".ws" / "jobs" / "units").exists()
 
     code, out, _ = run(capsys, "schedule", "apply")
-    assert code == 0 and "9 unit file(s)" in out and len(fake.calls) == 3
+    assert code == 0 and "11 unit file(s)" in out and len(fake.calls) == 3
     assert fake.calls[0][:3] == ["systemctl", "--user", "link"]
     code, out, _ = run(capsys, "schedule", "apply")
     assert code == 0 and "0 changes" in out
@@ -671,12 +702,17 @@ def test_the_alert_template_and_the_deadman_units(env):
     files = systemd.render_watch(env, WS)
     assert set(files) == {
         "ws-alert@.service", "ws-watch-deadman.service", "ws-watch-deadman.timer", "ws-queue-reap.service",
-        "ws-queue-reap.timer",
+        "ws-queue-reap.timer", "ws-watch-panes.service", "ws-watch-panes.timer",
     }  # fmt: skip
     alert, dead = files["ws-alert@.service"], files["ws-watch-deadman.service"]
     assert 'ExecStart="/opt/ws/bin/ws" "watch" "alert" "%i"' in alert and "OnFailure" not in alert  # no loop
     assert 'ExecStart="/opt/ws/bin/ws" "watch" "deadman"' in dead and "SuccessExitStatus=3" in dead
     assert "OnFailure=ws-alert@%n.service" in dead and "Persistent=true" in files["ws-watch-deadman.timer"]
+    pane = files["ws-watch-panes.service"]
+    assert (
+        'ExecStart="/opt/ws/bin/ws" "watch" "panes"' in pane and "OnFailure=" not in pane
+    )  # a failing watcher must not alert every minute
+    assert "OnCalendar=*-*-* *:*:00" in files["ws-watch-panes.timer"]  # every minute
 
 
 def test_the_watch_units_come_with_the_first_job_and_are_not_orphans(box, write_job, env, linux):

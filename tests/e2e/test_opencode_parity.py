@@ -38,7 +38,9 @@ def write_policy(tmp_path, *, ask: bool = False, guards: str | None = None) -> P
         text = text.replace("ask_commands = []", ASK)
         assert ASK in text
     if guards is not None:
-        text = text.replace('on = ["syntax-check", "session-context", "dev-server"]', f"on = {json.dumps(guards)}")
+        text = text.replace(
+            'on = ["syntax-check", "session-context", "dev-server", "pane-keys"]', f"on = {json.dumps(guards)}"
+        )
         assert json.dumps(guards) in text
     path = tmp_path / "wshome" / "policy.toml"
     path.parent.mkdir(parents=True, exist_ok=True)

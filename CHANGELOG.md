@@ -16,23 +16,57 @@ body of the GitHub release.
   `web_login_required`) with ws's own words. Three refusals for one account (host and login) in 15 minutes stop the
   next try before it dials. `known()` lists the mailboxes and when each last logged in; `set_on()` and `disconnect()`
   switch one off or take it out. (C666)
+
 - `ws mail connect --web`: the Connect mail page on this machine's loopback, over `ws.mailconnect`. The page lists
   the mailboxes, takes a name, address, provider and app password, and says in place whether it connected. (C666)
+
+## [0.1.11.5] - 2026-11-22
+
+### Added
+
+- The `pane-keys` guard: a `tmux send-keys` (or a `paste-buffer`) aimed at the live tmux server that types a line
+  starting with `/` is an approvable deny, because a slash command can open a dialog that holds every later key and
+  message until someone presses one (#276). The reason says to start sessions with `--name X --remote-control X` and to
+  use `ws msg send`. It reads key names in any case (`M-/` is a slash), and refuses `tmux -C` control mode and
+  `tmux pipe-pane -I` (which types a command's output into the pane) on the live server.
+
+- `ws watch panes`: pushes once when a tmux pane has sat on a dialog for 10 minutes (`[watch.panes]` in the profile
+  sets that and more footer patterns). It presses `Escape` on the Remote Control status box after a minute and on no
+  other dialog. A footer counts only at the foot of the screen, and the dialog's text is quoted in the push only
+  for a pane in a `full` data class. `ws-watch-panes.timer` (systemd) and `ws.job.watch-panes` (launchd) run it
+  every minute (#276).
+
 - A local provider's models (`runner_options.provider.models.<id>`) may set `tool_call = false` and
   `options.reasoningEffort` of `none`, `minimal` or `low`, so a small model can run a job without tools and with
   little reasoning. `tool_call = true` and the higher efforts are refused (they widen), as is every other new key.
   Checked at `ws job add` and again at `ws run`. (C635)
+
 - A job file's `input` names one file inside the job's `cwd`. `ws run` reads it at each run, for every runner, without
   following a link, at most 64 KiB of UTF-8, and puts it after the prompt as untrusted data in the delimited,
   defused block `ws mail` uses. A missing or unfit file refuses the run. The run record gains `input_sha256`. It
   replaces data kept in a project `AGENTS.md` or `CLAUDE.md`, which an OpenCode job doesn't read (checked on
   OpenCode 1.19.4).
 
+### Changed
+
+- `pane-keys` is on by default: `ws gate init` and the built-in policy now write
+  `on = ["syntax-check", "session-context", "dev-server", "pane-keys"]`. An existing policy keeps its own list; add
+  `pane-keys` to it (#276). The upgrade does it for you: it adds `pane-keys` to the end of an existing `[guards] on`
+  list once, as a text insert that keeps your comments and order, and prints one line saying so; a policy with no
+  `[guards]` table or `on` list, or that already names it, isn't touched (#276).
+
+- `ws dispatch` starts a Claude session with `--name LABEL` and `--remote-control=LABEL` (LABEL is the window's name),
+  so nobody types `/rename` or `/remote-control` into its pane. Remote control is left off for a repo whose class isn't
+  `access = "full"`, or when the policy can't be read (#276).
+
+- `ws msg` wake never types text with a line that starts with `/` into a pane (reason `slash_text`) (#276).
+
 ### Fixed
 
 - `ws mail add` asks for the password in place when it runs on a terminal, so a plain ssh login with no tmux works;
   a password it just stored that the server then refuses is taken out again (a network or broker failure keeps it).
   A refused mailbox login now has its own broker code, `login_refused`, apart from `upstream_refused`. (C666)
+
 - A Gmail app password pasted with the spaces Google shows ("abcd efgh ijkl mnop") is stored as the 16 letters Gmail's
   IMAP login wants, by `ws mail add`, `ws secret set` and `ws secret ask`; a Gmail value that isn't 16 letters is
   refused before it's stored. Other hosts keep the value as typed. (C666)

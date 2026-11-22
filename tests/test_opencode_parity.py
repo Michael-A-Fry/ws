@@ -183,6 +183,7 @@ def rows(tmp: Path, sha: str = "abc1234def") -> dict[tuple[str, str], list[tuple
         ("inbox", "post"): [("", [S("post", "command", command="ls")], [0], work)],
         ("inbox", "stop"): [("", [S("stop", last="done")], [0], work)],
         ("pane-close", "pre"): [("", [S("pre", "command", command="ls")], ["allow"], work)],
+        ("pane-keys", "pre"): [("", [S("pre", "command", command="ls")], ["allow"], work)],
         ("presence", "pre"): [("", [S("pre", "command", command="ls")], ["allow"], work)],
         ("presence", "post"): [("", [S("post", "command", command="ls")], [0], work)],
         ("presence", "start"): [("", [S("start")], [0], work)],

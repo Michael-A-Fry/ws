@@ -1486,12 +1486,12 @@ def test_a_manual_rollback_keeps_what_the_person_edited_since_and_leaves_a_gate_
     out, the edit stays, and the release going back loads the policy."""
     path, _ = two_releases
     assert cli.main(["upgrade"]) == 0
-    assert upgrade.history(os.environ)[-1]["added_guards"] == ["pane-keys"]
+    assert upgrade.history(os.environ)[-1]["added_guards"] == list(upgrade.DEFAULT_GUARDS)
     path.write_text(path.read_text(encoding="utf-8") + "# mine, written after the upgrade\n", encoding="utf-8")
     capsys.readouterr()
     assert cli.main(["upgrade", "--rollback"]) == 0
     assert a_loads(path) and "# mine, written after the upgrade" in path.read_text(encoding="utf-8")
-    assert '"pane-keys"' not in path.read_text(encoding="utf-8")
+    assert not any(f'"{g}"' in path.read_text(encoding="utf-8") for g in upgrade.DEFAULT_GUARDS)
     assert "your edits stay" in capsys.readouterr().out
 
 

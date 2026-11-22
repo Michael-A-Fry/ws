@@ -8,6 +8,16 @@ body of the GitHub release.
 
 ## [Unreleased]
 
+### Added
+
+- `ws worktrees prune`: removes agent worktrees under `<repo>/.claude/worktrees` that nothing needs. It keeps one
+  that's locked, has a change to a tracked file, changed in the last 12 hours, has a process inside it, or has a
+  detached HEAD that no branch, remote or tag holds; the rest are removed with `git worktree remove` (no `--force`),
+  branches and commits stay, and each removal is logged. `--dry-run` prints the same line without changing anything.
+  `--only PATH` is for a session that has just finished. A repo is pruned only from inside its own zone.
+  `ws-worktrees-prune.timer` (`ws.job.worktrees-prune` on launchd) checks the disk every 30 minutes, prunes every 6
+  hours or at once at 85% and tells the lead. Thresholds are `[worktrees]` settings.
+
 ## [0.1.11.7] - 2026-11-22
 
 ### Added

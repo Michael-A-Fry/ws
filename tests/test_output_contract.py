@@ -99,6 +99,7 @@ CASES: dict[str, list[str]] = {
     "watch.rotate": ["watch", "rotate", "nojob"],
     "watch.dropin": ["watch", "dropin", "svc", "--out", "{home}/dropins"],
     "watch.panes": ["watch", "panes"],
+    "worktrees.prune": ["worktrees", "prune", "--dry-run"],
     "plugin.list": ["plugin", "list"],
     "plugin.add": ["plugin", "add", "nope"],
     "plugin.remove": ["plugin", "remove", "nope"],

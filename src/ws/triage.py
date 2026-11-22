@@ -13,7 +13,8 @@ programmatic checks, where the steps are known) and the model gets one narrow st
      state folder). Nothing new is exit 0 with no model call.
   2. Rules, no model. A plain TOML file maps a sender, a domain, bulk-mail headers (List-Unsubscribe, List-Id,
      Precedence, Auto-Submitted) and subject patterns to one of `ws.mail.LABELS` or to `ask-model`, which is a state and
-     never a label. The first rule that matches wins and its id is logged. A rule only labels: it never drafts.
+     never a label. The first rule that matches wins and its id is logged. A rule only labels: it never drafts. A rule
+     may also say `check`: the thread is labelled ws/fyi and listed in the summary as worth a check, with no model call.
   3. Model, for `ask-model` threads only: one call per thread, no tools, the thread trimmed to the newest messages
      inside a token cap, plus the person's voice notes. The answer must parse to `{needs_reply, reason, draft}`; two
      retries for a bad answer, then the thread is flagged, not drafted. The model is config: the `claude-code` runner
@@ -25,11 +26,13 @@ programmatic checks, where the steps are known) and the model gets one narrow st
      flagged with the reason. A thread that asks for a time is drafted without one and flagged "scheduling: check your
      calendar" (ws has no calendar source yet).
   5. Output, through `ws.mail`: the label and the draft (his Drafts folder). One line per run in `logs/triage.jsonl`
-     (counts, tokens, cost, rule ids: never mail text) and, when `summary_dir` is set, `summary-DATE.md` for the day.
+     (counts, tokens, cost, rule ids: never mail text) and, when `summary_dir` is set, `summary-DATE.md` for the day:
+     counts, then one line for each thread that needs a reply or is worth a check (sender, subject, why, draft or not;
+     never body text), kept across the day's runs. Tokens and money are in the run log, not the summary.
 
 Nothing is sent, moved or deleted: this module calls only `ws.mail`'s search, fetch, label and draft. `--dry-run` makes
-no label or draft call, saves no state and writes no summary (it still makes the model calls, so it measures what a
-real run costs). A mailbox whose `class` names a data class that is not `full` access in the policy is refused before
+no label or draft call, saves no state and writes no summary but prints the summary it would write (it still makes the
+model calls, so it measures what a real run costs). A mailbox whose `class` names a data class that is not `full` access in the policy is refused before
 any mail is read (a walled area's mail is not this job's). Mail is untrusted input: the model's answer is data, parsed
 and checked, never acted on beyond the label and the draft.
 
@@ -45,6 +48,7 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import copy
 import io
 import json
 import os
@@ -73,13 +77,17 @@ from ws.secrets import HOST_RE, NAME_RE
 COMMAND = "triage"
 SCHEMA_VERSION = 1  # of a line in logs/triage.jsonl and of the state file
 ASK_MODEL = "ask-model"  # a rule's answer that is a state, never a label
-RULE_LABELS = (*mail.LABELS, ASK_MODEL)
+CHECK = "check"  # a rule's answer: label ws/fyi and list the thread in the summary as worth a check; no model call
+RULE_LABELS = (*mail.LABELS, ASK_MODEL, CHECK)
 LABEL_REPLY, LABEL_FYI = "ws/needs-reply", "ws/fyi"
 SCHEDULING_FLAG = "scheduling: check your calendar"
 MAX_RETRIES = 2  # for a bad answer
 MAX_DECISIONS = 200  # decision lines kept in one run's record
 MAX_PENDING = 100  # uids held for the next run when a cap stopped the model
-MAX_FLAGS = 25  # flagged threads kept in a day's summary
+MAX_ITEMS = 100  # thread lines kept in a day's summary; past that the oldest stay and the rest are counted
+SUBJECT_MAX = 80  # characters of a subject, and of a sender's name (NAME_MAX), written in the summary
+NAME_MAX = 30
+SHOWN_REASON_MAX = 120
 REASON_MAX = 200
 VOICE_MAX = 3000  # characters of the person's voice notes sent with each call
 CHARS_PER_TOKEN = 4  # the cap on a thread is counted this way: a cap is a bound, not a bill
@@ -324,7 +332,7 @@ def _strings(v, key: str, where: str) -> tuple[str, ...]:
 
 def parse_rules(text: str, where: str = "rules") -> Rules:
     """A rules file: `default = "ask-model"` and `[[rule]]` tables (id, label, and one or more of sender, domain, bulk,
-    subject, mailbox). Whole file or an error naming the rule."""
+    subject, mailbox). A label is a mailbox label, `ask-model` or `check`. Whole file or an error naming the rule."""
     try:
         doc = tomllib.loads(text)
     except tomllib.TOMLDecodeError as e:
@@ -950,27 +958,73 @@ def _short(text: str, n: int = 60) -> str:
     return t if len(t) <= n else t[: n - 1].rstrip() + "…"
 
 
+_MD_LINK = re.compile(
+    r"!?\[([^\]]*)\]\([^)]*\)|!?\[([^\]]*)\]\[[^\]]*\]|<(?:https?|mailto|ftp):[^>\s]*>", re.IGNORECASE
+)
+_URL = re.compile(r"\b(?:https?|ftp)://\S+|\bwww\.\S+", re.IGNORECASE)
+_DEFANG = str.maketrans({"[": "(", "]": ")", "<": None, ">": None, "`": None, "|": "/"})
+
+
+def _plain(text, n: int) -> str:
+    """Untrusted text (a subject, a sender's name, the model's reason) as one safe line of at most `n` characters: no
+    control or bidi character, no markdown link or web address, no brackets or backticks a later reader could act on."""
+    t = mail.neutral(mail.clean(text if isinstance(text, str) else "", keep_newlines=False))
+    t = _MD_LINK.sub(lambda m: m.group(1) or m.group(2) or "", t)
+    t = _URL.sub("", t).translate(_DEFANG)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t if len(t) <= n else t[: n - 1].rstrip() + "…"
+
+
+def _key(mailbox: str, thread: str) -> str:
+    """The thread's key in a day's lines: one line for a thread, however many messages or runs it takes."""
+    return f"{mailbox}|{thread}"[:200]
+
+
+def ws_label(rule_label: str) -> str:
+    """The mailbox label a rule's answer adds: `check` is ws/fyi (the check is a line in the summary, not a label)."""
+    return mail.LABELS[1] if rule_label == CHECK else rule_label
+
+
+def _item_line(it: dict) -> str:
+    """One thread's line: mailbox, sender, subject, why, and for a reply whether a draft was made. Every field is made
+    safe again here, so a state file written by hand or by an older run is read the same way."""
+    if isinstance(it.get("text"), str):  # a line an older run kept as plain text
+        return f"- {_plain(it['text'], 160)}"
+    who = _plain(it.get("who"), NAME_MAX) or "unknown sender"
+    why = _plain(it.get("why"), SHOWN_REASON_MAX).rstrip(".") or "no reason given"
+    head = f"- {_plain(it.get('mailbox'), 30)}: {who}, “{_plain(it.get('subject'), SUBJECT_MAX)}”: {why}."
+    if it.get("kind") == "reply":
+        head += " Draft saved." if it.get("draft") else " No draft."
+    note = _plain(it.get("note"), SHOWN_REASON_MAX)
+    return f"{head} ({note})" if note else head
+
+
 def summary_text(day: dict, when: datetime) -> str:
-    """The day's summary in the shape the morning note reads: counts, `Drafts created: N`, and "should check" lines."""
+    """The day's summary, for the person: counts, `Drafts created: N`, then one line for each thread that needs a reply
+    or is worth a check (and, last, those since answered). Counts of tokens, money and runs are in the run log, not
+    here. The first line and the headings are what the morning note and the digest read."""
     labels = day.get("labels", {})
-    parts = ", ".join(f"{k} {labels.get(k, 0)}" for k in ("ws/needs-reply", "ws/fyi", "ws/low", "ws/waiting"))
-    cost = f"{day.get('cost_usd', 0.0):.4f}"
+    names = (("ws/needs-reply", "need a reply"), ("ws/fyi", "for your information"), ("ws/low", "low priority"),
+             ("ws/waiting", "waiting on others"))  # fmt: skip
+    parts = ", ".join(f"{labels.get(k, 0)} {w}" for k, w in names)
     lines = [
         (
             f"Inbox triage {when.astimezone():%Y-%m-%d %H:%M}: {day.get('threads', 0)} threads. "
-            f"Labels applied: {parts}. Drafts created: {day.get('drafts', 0)}."
-        ),
-        (
-            f"Model calls today: {day.get('model_calls', 0)}, {day.get('tokens_in', 0)} tokens in and "
-            f"{day.get('tokens_out', 0)} out, cost US$ {cost}. Rules decided {day.get('by_rule', 0)} threads."
+            f"Sorted: {parts}. Drafts created: {day.get('drafts', 0)}."
         ),
     ]
     if not day.get("threads"):
         lines.insert(0, "No new mail.")
-    flags = day.get("flags", [])
-    if flags:
-        lines.append("Worth a look:")
-        lines += [f"- {f}" for f in flags[-MAX_FLAGS:]]
+    items = [i for i in day.get("items", []) if isinstance(i, dict)]
+    for heading, rows in (
+        ("Needs a reply:", [i for i in items if i.get("kind") == "reply" and not i.get("done")]),
+        ("Worth a look:", [i for i in items if i.get("kind") != "reply" and not i.get("done")]),
+        ("Done:", [i for i in items if i.get("done")]),
+    ):
+        if rows:
+            lines += ["", heading, *(_item_line(i) for i in rows)]
+    if isinstance(day.get("more"), int) and day["more"] > 0:
+        lines += ["", f"And {day['more']} more not listed here."]
     return "\n".join(lines) + "\n"
 
 
@@ -1012,6 +1066,8 @@ class Totals:
     drafts: int = 0
     refused: list = field(default_factory=list)
     flagged: list = field(default_factory=list)
+    items: dict = field(default_factory=dict)  # mailbox|thread -> the thread's line for the summary, newest wins
+    answered: dict = field(default_factory=dict)  # mailbox|thread -> the newest uid the mailbox's owner sent in it
     errors: list = field(default_factory=list)
     notes: list = field(default_factory=list)  # what happened that needs no action (so it doesn't fail the run)
     decisions: list = field(default_factory=list)
@@ -1194,17 +1250,22 @@ class Run:
             )
             if len(self.t.decisions) < MAX_DECISIONS:
                 self.t.decisions.append({"mailbox": name, "uid": uid, "rule": rule, "label": label or "none"})
+            if label is None:
+                key = _key(name, msg.thread)  # the owner's own message: an earlier line for this thread may be answered
+                self.t.answered[key] = max(uid, self.t.answered.get(key, 0))
             if label == ASK_MODEL:
                 asks.setdefault(msg.thread, []).append(msg)
                 waiting.add(uid)
             elif label:
                 self.t.by_rule += 1
                 try:
-                    self.apply(route, msg.ref, label)
+                    self.apply(route, msg.ref, ws_label(label))
                 except mail.MailError as e:
                     self.fail(name, e)
                     self.t.seen -= 1
                     break
+                if label == CHECK:
+                    self.item(name, msg, "check", f"matched rule {rule}")
             done = max(done, uid)
             if label and label != ASK_MODEL:
                 progress([])
@@ -1224,6 +1285,15 @@ class Run:
         who = f"{_short(m.name or m.sender, 30)}, “{_short(m.subject, 40)}”"
         self.t.flagged.append({"mailbox": name, "uid": m.uid, "why": why, "who": who, "show": show})
 
+    def item(self, name: str, m: Message, kind: str, why: str, draft: bool = False, note: str = "") -> None:
+        """The thread's line for the day's summary: sender, subject and a reason, never a word of the mail's body.
+        Everything from the mail or the model is made safe here, as it is written down."""
+        self.t.items[_key(name, m.thread)] = {
+            "key": _key(name, m.thread), "mailbox": name, "kind": kind, "uid": m.uid, "draft": draft,
+            "who": _plain(m.name or m.sender, NAME_MAX), "subject": _plain(m.subject, SUBJECT_MAX),
+            "why": _plain(why, SHOWN_REASON_MAX), "note": _plain(note, SHOWN_REASON_MAX), "done": False,
+        }  # fmt: skip
+
     def fail(self, name: str, e: mail.MailError) -> None:
         self.t.errors.append({"mailbox": name, "kind": e.kind})
 
@@ -1237,6 +1307,7 @@ class Run:
         if verdict is None:
             if why == "bad_answer":
                 self.flag(name, newest, "the model's answer did not parse")
+                self.item(name, newest, "check", "could not be sorted automatically, so look at it yourself")
                 return []
             self.t.deferred += 1  # a cap or a failed runner: the thread waits for the next run
             self.flag(name, newest, f"held for the next run: {why}", show=False)
@@ -1248,25 +1319,34 @@ class Run:
             return [m.uid for m in msgs]
         if not verdict.needs_reply:
             return []
+        notes = []
         if asks_for_time(data):
             self.flag(name, newest, SCHEDULING_FLAG)
+            notes.append(SCHEDULING_FLAG)
+
+        def listed(draft: bool, why_not: str = "") -> list[int]:
+            self.item(
+                name, newest, "reply", verdict.reason, draft, "; ".join([*notes, *([why_not] if why_not else [])])
+            )
+            return []
+
         if self.t.drafts >= self.cfg.max_drafts:
             self.flag(name, newest, "needs a reply; the draft limit for the run was reached")
-            return []
+            return listed(False, "the limit on drafts for one run was reached")
         refusal = check_draft(verdict.draft or "", data)
         if refusal:
             self.t.refused.append({"mailbox": name, "uid": newest.uid, "reason": refusal})
             self.flag(name, newest, f"needs a reply; draft refused ({refusal})")
-            return []
+            return listed(False, f"the draft was not kept: {refusal}")
         if not self.dry:
             try:
                 route.draft(newest.ref, verdict.draft or "")
             except mail.MailError as e:
                 self.fail(name, e)
                 self.flag(name, newest, f"needs a reply; the draft was not saved ({e.kind})")
-                return []
+                return listed(False, "the draft could not be saved")
         self.t.drafts += 1
-        return []
+        return listed(True)
 
     def keep(self, name: str, uv: int, last: int, held: list[int], since: date | None = None) -> None:
         if self.dry:
@@ -1282,23 +1362,60 @@ class Run:
         self.state["mailboxes"][name] = entry
 
     def day_totals(self) -> dict:
-        """Today's running totals, kept in the state file so each run of the day adds to the summary."""
+        """Today's running totals, kept in the state file so each run of the day adds to the summary. The thread lines
+        add up too: a line an earlier run wrote stays (marked done once the owner has answered in the thread), and a
+        thread seen again is one line, the newest."""
         date = f"{self.now.astimezone():%Y-%m-%d}"
         day = self.state.get("day") or {}
-        if day.get("date") != date:
-            day = {"date": date, "threads": 0, "by_rule": 0, "labels": {}, "drafts": 0, "model_calls": 0,
-                   "tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0, "flags": []}  # fmt: skip
+        if not isinstance(day, dict) or day.get("date") != date:
+            day = {"date": date, "threads": 0, "labels": {}, "drafts": 0, "items": [], "more": 0}
+        for k, zero in (("threads", 0), ("drafts", 0), ("more", 0)):
+            if not isinstance(day.get(k), int):
+                day[k] = zero
+        if not isinstance(day.get("labels"), dict):
+            day["labels"] = {}
         t = self.t
         day["threads"] += t.seen
-        day["by_rule"] += t.by_rule
+        day["drafts"] += t.drafts
         for k, v in t.labelled.items():
             day["labels"][k] = day["labels"].get(k, 0) + v
-        day["drafts"] += t.drafts
-        day["model_calls"] += t.calls
-        day["tokens_in"] += t.tokens_in
-        day["tokens_out"] += t.tokens_out
-        day["cost_usd"] = round(day["cost_usd"] + t.cost_usd, 6)
-        day["flags"] = [*day["flags"], *(f"{f['who']}: {f['why']}" for f in t.flagged if f["show"])][-MAX_FLAGS:]
+        # An older run's day kept its lines as text under "flags" (and its token and cost counts, now in the run log).
+        flags = day.pop("flags", [])
+        items = day.get("items")
+        old = [
+            {"key": f"text|{f}"[:200], "kind": "check", "text": f}
+            for f in (flags if isinstance(flags, list) else [])
+            if isinstance(f, str)
+        ]
+        kept = {
+            i["key"]: i
+            for i in [*old, *(items if isinstance(items, list) else [])]
+            if isinstance(i, dict) and isinstance(i.get("key"), str)
+        }
+        over = day.get("more_keys")
+        over = [k for k in over if isinstance(k, str)] if isinstance(over, list) else []
+        for key, it in t.items.items():
+            if key in kept:
+                kept[key] = it  # the newest message of a thread is the line, and it needs him again
+            elif len(kept) < MAX_ITEMS:
+                kept[key] = it
+            else:  # full: lines already answered make room, oldest first; if none, the oldest stay and this is counted
+                done = next((k for k, i in kept.items() if i.get("done")), None)
+                if done is None:
+                    if key not in over:  # count each thread once, however many runs see it again
+                        over.append(key)
+                    continue
+                del kept[done]
+                kept[key] = it
+        for key, uid in t.answered.items():  # the owner wrote in the thread after the line's newest message
+            it = kept.get(key)
+            if it is not None and isinstance(it.get("uid"), int) and uid > it["uid"]:
+                it["done"] = True
+        day["items"] = list(kept.values())
+        day["more_keys"] = [k for k in over if k not in kept][-1000:]
+        day["more"] = len(day["more_keys"])
+        for k in ("by_rule", "model_calls", "tokens_in", "tokens_out", "cost_usd"):
+            day.pop(k, None)
         return day
 
 
@@ -1370,7 +1487,7 @@ def execute(
     dry_run: bool = False,
 ) -> dict:
     """One run: the pipeline, then the state, the record and the day's summary (a dry run writes none of the three
-    files). Returns the record."""
+    files; its record carries the summary it would have written, as `summary`). Returns the record."""
     started = now or datetime.now(UTC)
     state = load_state(state_file)
 
@@ -1382,7 +1499,10 @@ def execute(
     totals = run.run()
     ended = datetime.now(UTC) if now is None else started
     rec = record_of(cfg, run, started, ended, runrecord.new_run_id(started))
-    if not dry_run:
+    if dry_run:
+        run.state = copy.deepcopy(state)  # the day as it would be saved, worked out on a copy
+        rec["summary"] = summary_text(run.day_totals(), started)
+    else:
         state["schema"] = SCHEMA_VERSION
         day = run.day_totals()
         state["day"] = day
@@ -1455,6 +1575,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     if getattr(args, "json", False):
         output.result(rec)
     else:
+        if args.dry_run:
+            print(rec.pop("summary"), end="")
         say(rec)
     return EXIT_FAILED if rec["errors"] else 0
 

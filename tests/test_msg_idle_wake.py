@@ -397,3 +397,22 @@ def test_a_wake_that_raises_is_reported_not_raised(world, monkeypatch):  # noqa:
     assert calls == ["rx"]  # the wake was tried
     assert got is not None and got["woke"] is False and got["reason"].startswith("error:WsError")
     assert msg._wake_after_send("nobody") is None  # nobody to wake: nothing to report
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["/remote-control x", "  /rename y", "hello\n/model", "hello\r/model", "hello /model", "a\n\n   /config"],
+)
+def test_a_line_that_starts_with_a_slash_is_never_typed_into_a_pane(text):
+    fake = FakeTmux(os.getpid())
+    got = msg.wake_pane(target(), text=text, run=fake.run, sleep=fake.sleep, started=lambda: True)
+    assert got == {"woke": False, "reason": "slash_text", "enters": 0}
+    assert fake.calls == []  # not even the pane probe: no key and no buffer reaches tmux
+
+
+def test_a_slash_inside_a_line_is_ordinary_text():
+    assert not msg.starts_slash_line("ws: run `ws msg list --unread` (see /tmp/x)")
+    assert not msg.starts_slash_line(msg.WAKE_TEXT)
+    fake = FakeTmux(os.getpid())
+    got = msg.wake_pane(target(), text="see a/b", run=fake.run, sleep=fake.sleep, started=lambda: True)
+    assert got["woke"] is True

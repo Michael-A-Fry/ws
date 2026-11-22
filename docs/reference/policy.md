@@ -229,7 +229,7 @@ Named checks that run beside the `[gate]` rules. The [guards reference](guards.m
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `on` | list of text | `[]` | The guards that run, in order. A name ws doesn't know stops the load. `ws gate init` writes `["syntax-check", "session-context", "dev-server"]`. |
+| `on` | list of text | `[]` | The guards that run, in order. A name ws doesn't know stops the load. `ws gate init` writes `["syntax-check", "session-context", "dev-server", "pane-keys"]`; the upgrade adds `pane-keys` to an existing list once. |
 | `[guards.NAME]` `mode` | text | `"enforce"` | `enforce` (refuse as always) or `log` (a refusal becomes a count in the verdict log, only where the OS wall is proven for the call; elsewhere it still refuses). Any other value stops the load. See [the guards reference](guards.md). |
 | `[guards.syntax-check]` `extra` | table of extension to command | `{}` | A checker for an extension, such as `{ yaml = ["yamllint", "-d", "relaxed"] }`. The file path is added as the last argument. |
 | `[guards.session-context]` `files` | list of text | `["STATE.md", ".state/STATE.md", "HANDOFF.md", "TODO.md"]` | Project-relative files to list at session start, when they exist. |

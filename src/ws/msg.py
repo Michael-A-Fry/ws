@@ -1688,6 +1688,12 @@ def _tmux(args: list[str], stdin: str | None = None) -> subprocess.CompletedProc
     return subprocess.run(["tmux", *args], input=stdin, capture_output=True, text=True, timeout=5, check=False)
 
 
+def starts_slash_line(text: str) -> bool:
+    """True when a line of `text` starts with `/` (blanks first don't hide it): typed into a pane, it would run as a slash
+    command. A line break, however written, ends a line."""
+    return any(line.lstrip().startswith("/") for line in re.split(r"[\r\n\v\f\x1c-\x1e\x85\u2028\u2029]", text))
+
+
 def wake_pane(
     target: session.Record,
     *,
@@ -1702,11 +1708,14 @@ def wake_pane(
     that pane's process, or nothing is typed (pane ids repeat across tmux servers). Short text goes by `send-keys -l`,
     longer by a paste buffer (bracketed); Enter is sent on its own after `WAKE_KEY_DELAY_S`, because text and Enter sent
     together have been left unsubmitted in Claude's input box. A turn that did not start (`started()`, by default the
-    registry saying busy since the wake) gets Enter once more; a second miss is reported, not trusted. Returns
-    `{woke, reason, enters}`."""
+    registry saying busy since the wake) gets Enter once more; a second miss is reported, not trusted. Text with a line
+    that starts with `/` is never typed (`slash_text`): in a Claude Code pane it would run as a slash command, and some of
+    those open a dialog that holds every key until someone presses one. Returns `{woke, reason, enters}`."""
     pane = target.pane
     if not pane or target.runner_pid is None:
         return {"woke": False, "reason": "no_pane", "enters": 0}
+    if starts_slash_line(text):
+        return {"woke": False, "reason": "slash_text", "enters": 0}
     began = jsonl.iso_utc(time.time())
     probe = run(["display-message", "-p", "-t", pane, "#{pane_pid}"])
     try:

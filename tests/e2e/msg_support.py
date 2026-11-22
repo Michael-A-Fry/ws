@@ -27,7 +27,7 @@ def policy_text() -> str:
     from ws import policy
 
     text = policy.default_toml()
-    old = 'on = ["syntax-check", "session-context", "dev-server"]'
+    old = 'on = ["syntax-check", "session-context", "dev-server", "pane-keys"]'
     assert old in text
     return text.replace(old, 'on = ["inbox", "presence", "dev-server"]')
 

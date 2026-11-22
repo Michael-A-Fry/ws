@@ -8,7 +8,7 @@ off at the time does not catch up: launchd has no setting for it, and RunAtLoad 
 The plist carries `ProcessType=Background` (launchd's share for scheduled work). Swap note: to replace launchd, add a scheduler
 adapter beside this one.
 A job with a runner runs `ws queue tick <name> --slot schedule --run` (queue the slot it fired for, then drain); one
-that would use a subscription login keeps `ws run <name>`. `ws.job.queue-reap` runs `ws queue reap` every two minutes.
+that would use a subscription login keeps `ws run <name>`. `ws.job.queue-reap` runs `ws queue reap` every two minutes, and `ws.job.watch-panes` runs `ws watch panes` every minute.
 `activate` bootstraps the agents into the user's GUI domain through an injectable runner; tests check the argv.
 Every plist carries `WsWrittenBy: ws`. `activate` and `deactivate` boot out a loaded `ws.job.*` label only when
 `launchctl print` shows it was loaded from a plist ws wrote (one under `jobs/units/`, or one carrying that key); a label
@@ -85,6 +85,24 @@ def render_reaper(env, ws_cmd: list[str]) -> str:
     return plistlib.dumps(plist, sort_keys=True).decode("utf-8")
 
 
+PANES = "watch-panes"  # ws.job.watch-panes: `ws watch panes` every minute (a reserved job name)
+PANES_EVERY_S = 60
+
+
+def render_panes(env, ws_cmd: list[str]) -> str:
+    """The pane watch's agent: `ws watch panes` every minute, so a session sitting on a dialog is pushed to the person."""
+    environment = paths.env_for(env)
+    if path := _schedule.path_value(env):
+        environment["PATH"] = path
+    log = str(_schedule.logs_dir(env) / f"{PANES}.log")
+    plist = {
+        "Label": label(PANES), "ProgramArguments": [*ws_cmd, "watch", "panes"], "EnvironmentVariables": environment,
+        "StartInterval": PANES_EVERY_S, "ProcessType": "Background", "StandardOutPath": log, "StandardErrorPath": log,
+        WRITTEN_BY: "ws",
+    }  # fmt: skip
+    return plistlib.dumps(plist, sort_keys=True).decode("utf-8")
+
+
 def files_for(env, name: str) -> list[Path]:
     return [_schedule.units_dir(env) / f"{label(name)}.plist"]
 
@@ -94,6 +112,7 @@ def _want(env) -> dict[Path, str]:
     out = {_schedule.units_dir(env) / f"{label(j.name)}.plist": render(j, env, cmd) for j in _schedule.scheduled(env)}
     if out:  # the reaper goes with the jobs: with none scheduled it is an orphan, switched off and removed like one
         out[_schedule.units_dir(env) / f"{label(REAPER)}.plist"] = render_reaper(env, cmd)
+        out[_schedule.units_dir(env) / f"{label(PANES)}.plist"] = render_panes(env, cmd)
     return out
 
 
@@ -115,7 +134,7 @@ def check(cfg, osi, env, network):
         return WARN, f"{NAME}: agents for {', '.join(gone)}, which no longer have a schedule: run `ws schedule apply`"
     if not want:
         return OK, NAME
-    n = sum(p.stem != label(REAPER) for p in want)
+    n = sum(p.stem not in (label(REAPER), label(PANES)) for p in want)
     jobs_ = f"{n} scheduled job{'' if n == 1 else 's'}"
     old = _schedule.stale(want)
     if old:

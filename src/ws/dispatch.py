@@ -16,8 +16,19 @@ What it promises, each pinned by a test:
   given), opened in the background (`-d`), so the person's own window keeps the focus. The window goes in the tmux
   session this command runs in (`$TMUX`), or in `--session S`; outside tmux with no `--session` it is refused.
 - The runner is found on `PATH` before anything starts, and a missing one is refused with its name.
+- A Claude session is always started with a name and, unless the repo's data class forbids it, with remote control on, so
+  nobody has to type `/rename` or `/remote-control` into its pane afterwards (the second one opens a modal status dialog
+  that holds every queued message until a key is pressed). The label for both is exactly the window's name, the slug
+  above, so the session list, the phone and tmux all show one string: `--name Fix The Login` gives `fix-the-login`, and a
+  `·` or any other character outside `a-z 0-9 _` becomes a dash (it does not survive). `--name` is two argv items
+  (`--name`, LABEL). `--remote-control` takes an optional value, so it is ONE item, `--remote-control=LABEL`, and can
+  never read the prompt that follows as its value; the prompt stays the last item.
+- Remote control sends the session's transcript through the vendor's servers, beyond this machine. It is left off, with
+  one line on stderr, for a repo whose class in the policy is not `access = "full"` (walled or counts-only, and a repo in
+  no class once any class exists), and when the policy cannot be read (fail closed). `--name` is still passed.
 
-Runners: `claude-code` runs `claude [--model=M] PROMPT`; `opencode` runs `opencode [--model=M] --prompt PROMPT`.
+Runners: `claude-code` runs `claude --name LABEL [--remote-control=LABEL] [--model=M] PROMPT`; `opencode` runs
+`opencode [--model=M] --prompt PROMPT` (no name flags).
 The code root's `~` means your home only when it is `~` alone or starts `~/`.
 Every tmux command goes through `ws.term.tmux`'s injectable runner, so tests never touch a real tmux server.
 Exit codes: 0 started (or shown), 1 something to fix (no repo folder, no runner, no tmux, tmux refused), 2 usage.
@@ -29,10 +40,11 @@ import argparse
 import os
 import re
 import shutil
+import sys
 from collections.abc import Mapping
 from pathlib import Path
 
-from ws import output, paths
+from ws import output, paths, policy
 from ws.output import WsError
 from ws.profile import ProfileError, load, profile_path
 from ws.term import tmux
@@ -75,8 +87,33 @@ def window_name(name: str | None, repo: str) -> str:
     return slug or repo
 
 
-def runner_argv(runner: str, prompt: str, model: str | None, which=shutil.which, path: str | None = None) -> list[str]:
-    """The runner's argv, each flag its own item and the prompt one item."""
+def remote_control_off(folder: Path, env: Mapping[str, str] | None = None) -> str:
+    """Why remote control must not be switched on for a session in `folder`, or "" when it may be. The policy's data
+    class decides: only `access = "full"` (or no classes at all) may leave the machine. A policy that cannot be read is
+    a refusal too, never a guess."""
+    e = os.environ if env is None else env
+    try:
+        pol = policy.load(policy.policy_path(dict(e)))
+    except policy.PolicyError:
+        return "the policy could not be read"
+    cls = policy.class_of(pol, folder)
+    if cls is None or cls.access == "full":
+        return ""
+    return f"its data class is {cls.name} ({cls.access})"
+
+
+def runner_argv(
+    runner: str,
+    prompt: str,
+    model: str | None,
+    which=shutil.which,
+    path: str | None = None,
+    label: str | None = None,
+    remote_control: bool = False,
+) -> list[str]:
+    """The runner's argv, each flag its own item and the prompt one item (always the last). For claude-code a `label`
+    adds `--name LABEL` and, with `remote_control`, `--remote-control=LABEL` (one item: its value is optional, so the
+    prompt must never follow it as a separate word). Other runners ignore both."""
     if prompt.startswith("-"):
         raise WsError("bad_prompt", "the prompt starts with '-', so the runner would read it as a flag", "reword it", 2)
     if not prompt.strip():
@@ -85,7 +122,10 @@ def runner_argv(runner: str, prompt: str, model: str | None, which=shutil.which,
     found = which(binary, path=path)
     if not found:
         raise WsError("runner_missing", f"{binary} is not on PATH", f"install {runner}, or pick another --runner", 1)
-    argv = [found, *([f"--model={model}"] if model else [])]  # one item, so a model that starts with - is no flag
+    argv = [found]
+    if label and runner == "claude-code":
+        argv += ["--name", label, *([f"--remote-control={label}"] if remote_control else [])]
+    argv += [f"--model={model}"] if model else []  # one item, so a model that starts with - is no flag
     return [*argv, prompt] if style == "positional" else [*argv, "--prompt", prompt]
 
 
@@ -103,13 +143,18 @@ def plan(args: argparse.Namespace, env: Mapping[str, str] | None = None) -> dict
         raise WsError("no_tmux", "not inside tmux, and no --session given", "run it inside tmux, or pass --session", 1)
     if args.session is not None and not tmux.NAME_RE.fullmatch(args.session):
         raise WsError("bad_session", f"{args.session!r} is not a tmux session name", "letters, digits, - and _", 2)
+    window = window_name(args.name, repo)
+    why_not = remote_control_off(folder, e) if args.runner == "claude-code" else ""
     return {
         "repo": repo,
         "cwd": str(folder),
-        "window": window_name(args.name, repo),
+        "window": window,
         "session": args.session,
         "runner": args.runner,
-        "argv": runner_argv(args.runner, args.prompt, args.model, path=e.get("PATH")),
+        "remote_control_off": why_not,
+        "argv": runner_argv(
+            args.runner, args.prompt, args.model, path=e.get("PATH"), label=window, remote_control=not why_not
+        ),
     }
 
 
@@ -130,6 +175,8 @@ def start(p: dict, run: tmux.Run = tmux.run_tmux) -> str:
 
 def cmd_dispatch(args: argparse.Namespace) -> int:
     p = plan(args)
+    if p["remote_control_off"]:
+        print(f"ws dispatch: remote control left off ({p['remote_control_off']})", file=sys.stderr)
     if not args.dry_run:
         p["window_id"] = start(p, tmux.run_tmux)  # looked up now, so a test can swap it
     if args.json:

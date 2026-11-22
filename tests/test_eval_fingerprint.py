@@ -265,7 +265,7 @@ def test_the_policy_and_the_guards_each_change_their_own_hash(box):
     path = policy.policy_path()
     text = policy.default_toml()
     path.write_text(
-        text.replace('on = ["syntax-check", "session-context", "dev-server"]', 'on = ["syntax-check"]'),
+        text.replace('on = ["syntax-check", "session-context", "dev-server", "pane-keys"]', 'on = ["syntax-check"]'),
         encoding="utf-8",
     )
     fewer_guards = ws_eval.fingerprint(make_job(), None)

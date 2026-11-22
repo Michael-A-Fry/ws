@@ -1358,3 +1358,49 @@ def test_the_result_says_what_happened_to_the_broker(cutover, old, stub_broker, 
     assert cli.main(["upgrade", "--json"]) == 0
     env = json.loads(capsys.readouterr().out)
     assert env["data"]["broker"] == "restarted" and env["status"] == output.OK
+
+
+# --- the policy: a guard that became a default is added to an existing `[guards] on` list, once -------------------------
+
+POLICY_OLD = '# my policy\n[guards]\non = [\n  "syntax-check",  # mine\n  "dev-server",\n]\n\n[guards.syntax-check]\nmode = "log"\n'
+
+
+def put_policy(text: str) -> Path:
+    path = policy.policy_path(dict(os.environ))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_migrate_policy_adds_pane_keys_to_an_existing_guards_list_once(box):
+    path = put_policy(POLICY_OLD)
+    notes = upgrade.migrate_policy(os.environ)
+    assert len(notes) == 1 and notes[0].startswith("added pane-keys to [guards] on")
+    assert path.read_text(encoding="utf-8") == POLICY_OLD.replace('"dev-server",\n', '"dev-server",\n  "pane-keys",\n')
+    assert upgrade.migrate_policy(os.environ) == []  # a second run changes nothing
+    assert path.read_text(encoding="utf-8").count("pane-keys") == 1
+
+
+def test_migrate_policy_leaves_a_policy_with_no_guards_table_or_with_pane_keys(box):
+    for text in ("[rules]\nx = 1\n", POLICY_OLD.replace('"dev-server",', '"pane-keys",')):
+        path = put_policy(text)
+        assert upgrade.migrate_policy(os.environ) == []
+        assert path.read_text(encoding="utf-8") == text
+
+
+def test_migrate_policy_dry_run_says_what_it_would_add_and_writes_nothing(box):
+    path = put_policy(POLICY_OLD)
+    assert upgrade.migrate_policy(os.environ, dry_run=True)[0].startswith("would add pane-keys")
+    assert path.read_text(encoding="utf-8") == POLICY_OLD
+    assert upgrade.migrate_policy({**os.environ, "WS_HOME": str(box / "nowhere")}) == []  # no policy: nothing
+
+
+def test_the_hooks_rewrite_migrates_the_policy_and_prints_one_line(old, box, capsys):
+    path = put_policy(POLICY_OLD)
+    capsys.readouterr()
+    assert cli.main(["upgrade", "--hooks-only"]) == 0
+    out = capsys.readouterr().out
+    assert sum("pane-keys" in line for line in out.splitlines()) == 1
+    assert '"pane-keys"' in path.read_text(encoding="utf-8")
+    cli.main(["upgrade", "--hooks-only"])
+    assert capsys.readouterr().out.count("pane-keys") == 0 and path.read_text(encoding="utf-8").count("pane-keys") == 1

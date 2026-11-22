@@ -73,7 +73,7 @@ def windows(f: FakeTmux) -> list[list[str]]:
 def test_model_and_prompt_reach_the_runner_as_separate_items(box, fake, capsys):
     assert cli.main(["dispatch", "r", "--name", "x", "--model", "m", "p q"]) == 0
     seen = json.loads((box / "argv.json").read_text())
-    assert seen["argv"] == ["--model=m", "p q"]
+    assert seen["argv"] == ["--name", "x", "--remote-control=x", "--model=m", "p q"]
     assert seen["cwd"] == str(box / "home" / "code" / "r")
     assert fake.exit == 0
     (win,) = windows(fake)
@@ -84,7 +84,7 @@ def test_model_and_prompt_reach_the_runner_as_separate_items(box, fake, capsys):
 def test_quotes_and_spaces_in_the_prompt_stay_one_item(box, fake):
     prompt = 'fix it; don\'t "quote" --model this  twice'
     assert cli.main(["dispatch", "r", prompt]) == 0
-    assert json.loads((box / "argv.json").read_text())["argv"] == [prompt]
+    assert json.loads((box / "argv.json").read_text())["argv"][-1] == prompt
 
 
 def test_opencode_takes_the_prompt_as_a_flag(box, fake):
@@ -103,7 +103,11 @@ def test_help_prints_and_changes_nothing(box, fake, capsys):
 def test_dry_run_starts_nothing(box, fake, capsys):
     assert cli.main(["--json", "dispatch", "r", "--name", "Fix The Login", "--dry-run", "go"]) == 0
     data = json.loads(capsys.readouterr().out)["data"]
-    assert data["window"] == "fix-the-login" and data["started"] is False and data["argv"][1:] == ["go"]
+    assert (
+        data["window"] == "fix-the-login"
+        and data["started"] is False
+        and data["argv"][1:] == ["--name", "fix-the-login", "--remote-control=fix-the-login", "go"]
+    )
     assert fake.calls == []
 
 
@@ -163,7 +167,7 @@ def test_code_root_order(box, monkeypatch):
 
 def test_a_model_that_starts_with_a_dash_is_not_a_flag(box, fake):
     assert cli.main(["dispatch", "r", "--model=-x", "go"]) == 0
-    assert json.loads((box / "argv.json").read_text())["argv"] == ["--model=-x", "go"]
+    assert json.loads((box / "argv.json").read_text())["argv"][-2:] == ["--model=-x", "go"]
 
 
 def test_a_missing_opencode_is_named(box, fake, capsys, monkeypatch):
@@ -192,3 +196,77 @@ def test_only_your_own_home_expands(box):
     assert dispatch.code_root("~", env) == box / "home"
     assert dispatch.code_root("~/x", env) == box / "home" / "x"
     assert dispatch.code_root("~bob/x", env) == dispatch.Path("~bob/x")
+
+
+def write_policy(box, body: str) -> None:
+    path = box / "ws" / "policy.toml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body)
+
+
+def argv_of(box) -> list[str]:
+    return json.loads((box / "argv.json").read_text())["argv"]
+
+
+def test_claude_gets_the_window_name_twice_and_the_prompt_stays_last(box, fake):
+    assert cli.main(["dispatch", "r", "--name", "Fix The Login", "--model", "m", "go"]) == 0
+    assert argv_of(box) == ["--name", "fix-the-login", "--remote-control=fix-the-login", "--model=m", "go"]
+    (win,) = windows(fake)
+    assert win[win.index("-n") + 1] == "fix-the-login"
+
+
+def test_the_label_is_the_window_slug_and_a_middle_dot_does_not_survive(box, fake):
+    assert cli.main(["dispatch", "r", "--name", "ws\u00b7lead 22nov", "go"]) == 0
+    (win,) = windows(fake)
+    label = win[win.index("-n") + 1]
+    assert label == "ws-lead-22nov" and "\u00b7" not in label
+    assert argv_of(box)[:3] == ["--name", label, f"--remote-control={label}"]
+
+
+def test_remote_control_is_one_item_so_the_prompt_is_never_its_value(box, fake):
+    assert cli.main(["dispatch", "r", "go on"]) == 0
+    argv = argv_of(box)
+    assert "--remote-control" not in argv and "--remote-control=r" in argv
+    assert argv[-1] == "go on" and argv.count("go on") == 1
+    assert argv.index("--remote-control=r") == len(argv) - 2
+
+
+def test_opencode_gets_no_name_flags(box, fake):
+    assert cli.main(["dispatch", "r", "--runner", "opencode", "--name", "x", "go"]) == 0
+    assert argv_of(box) == ["--prompt", "go"]
+
+
+def test_a_full_class_or_no_class_keeps_remote_control(box, fake, capsys):
+    write_policy(box, f'[classes.open]\naccess = "full"\nrepos = ["{box}/home/code/r"]\n')
+    assert cli.main(["dispatch", "r", "go"]) == 0
+    assert "--remote-control=r" in argv_of(box)
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize("access", ["walled", "counts-only"])
+def test_a_class_that_is_not_full_drops_remote_control_but_keeps_the_name(box, fake, capsys, access):
+    extra = 'os_user = "svc"\n' if access == "walled" else ""
+    write_policy(box, f'[classes.sealed]\naccess = "{access}"\n{extra}repos = ["{box}/home/code/r"]\n')
+    assert cli.main(["dispatch", "r", "--name", "w", "go"]) == 0
+    assert argv_of(box) == ["--name", "w", "go"]
+    assert "remote control left off" in capsys.readouterr().err
+
+
+def test_a_repo_in_no_class_is_counts_only_once_classes_exist(box, fake, capsys):
+    write_policy(box, f'[classes.open]\naccess = "full"\nrepos = ["{box}/elsewhere"]\n')
+    assert cli.main(["dispatch", "r", "go"]) == 0
+    assert argv_of(box) == ["--name", "r", "go"]
+    assert "remote control left off" in capsys.readouterr().err
+
+
+def test_an_unreadable_policy_drops_remote_control(box, fake, capsys):
+    write_policy(box, "[classes\n")
+    assert cli.main(["dispatch", "r", "go"]) == 0
+    assert argv_of(box) == ["--name", "r", "go"]
+    assert "policy could not be read" in capsys.readouterr().err
+
+
+def test_dry_run_shows_the_flags(box, fake, capsys):
+    assert cli.main(["dispatch", "r", "--name", "check", "--dry-run", "hello"]) == 0
+    out = capsys.readouterr().out
+    assert "'--name', 'check', '--remote-control=check', 'hello'" in out

@@ -211,7 +211,9 @@ def test_compare_refuses_an_arm_after_the_policy_changes_under_it(rig, capsys):
     ws(capsys, *run, "--arm", "other")
     code, out, _ = ws(capsys, "eval", "compare", "base", "other")
     assert code == 0 and "bare mode" in out and "base ran in bare mode" in out  # the job's default is bare
-    text = policy.default_toml().replace('on = ["syntax-check", "session-context", "dev-server"]', "on = []")
+    text = policy.default_toml().replace(
+        'on = ["syntax-check", "session-context", "dev-server", "pane-keys"]', "on = []"
+    )
     policy.policy_path().write_text(text, encoding="utf-8")
     ws(capsys, *run, "--arm", "base")  # same job, same task, a different set of guards
     code, _, err = ws(capsys, "eval", "compare", "base", "other")

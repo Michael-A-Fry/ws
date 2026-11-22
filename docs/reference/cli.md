@@ -112,9 +112,9 @@ ws dispatch [-h] [--name NAME] [--model MODEL] [--runner {claude-code,opencode}]
 |---|---|
 | `REPO` | The repository's folder name under the code root. A name only: a slash, `.` or `..` is a usage error. |
 | `PROMPT` | What the session should do, as one argument. A prompt that starts with `-` is refused. |
-| `--name NAME` | A few words for the window's name (lower case, dashes for spaces). Default: the repo's name. |
+| `--name NAME` | A few words for the window's name (lower case, dashes for spaces). Default: the repo's name. A `claude-code` session is also started with this label as its name. |
 | `--model MODEL` | The model, passed to the runner as one argument, `--model=MODEL`. |
-| `--runner R` | `claude-code` (default) runs `claude [--model=M] PROMPT`; `opencode` runs `opencode [--model=M] --prompt PROMPT`. |
+| `--runner R` | `claude-code` (default) runs `claude --name LABEL [--remote-control=LABEL] [--model=M] PROMPT`; `opencode` runs `opencode [--model=M] --prompt PROMPT`. |
 | `--session S` | The tmux session for the window. Default: the one this runs in; outside tmux, give one. |
 | `--code-root DIR` | Where the repositories are. Default `WS_CODE_ROOT`, else `[dispatch] code_root` in the profile, else `~/code`. |
 | `--dry-run` | Print the folder, the window name and the runner's argv, and start nothing. |
@@ -122,6 +122,15 @@ ws dispatch [-h] [--name NAME] [--model MODEL] [--runner {claude-code,opencode}]
 The window opens in the background and runs the runner's argv directly, with no shell between (tmux 3.0 or later),
 so every flag and the prompt arrive as separate arguments whatever they hold. `--help` changes nothing. If you start
 sessions with a script of your own, this can replace it: point `WS_CODE_ROOT` at your repositories.
+
+A Claude session is started named and, where allowed, with remote control on, so nobody types `/rename` or
+`/remote-control` into its pane afterwards (the second opens a dialog that holds every queued message until a key is
+pressed; the [pane-keys guard](guards.md#pane-keys) refuses such typing). The label is the window's name exactly, so
+`--name "Fix the login"` names the window and the session `fix-the-login`; a `·` or any other character outside
+`a-z 0-9 _` becomes a dash. `--remote-control=LABEL` is one argument, so it can never take the prompt as its value.
+Remote control sends the session's transcript through the vendor's servers, so it's left off (with one line on
+stderr, and `--name` still passed) for a repo whose class in `policy.toml` isn't `access = "full"`: walled,
+counts-only, or in no class once any class exists. A policy that can't be read leaves it off too.
 
 ## `ws sync`
 
@@ -1054,7 +1063,10 @@ ws upgrade [-h] [--version TAG] [--channel {stable,rc,edge}] [--installer FILE] 
 
 It runs the installer, then rewrites ws's hooks with the new ws in a new process (`--hooks-only`). The rewrite touches the
 gate only: each runner whose config already holds ws's entries gets them refreshed. It switches nothing on and takes
-nothing out, and a config written without the sandbox block stays without it. If the rewrite fails, the runner's config,
+nothing out, and a config written without the sandbox block stays without it. The one edit to your policy: a guard that
+became a default since you wrote it (`pane-keys`) is added to the end of an existing `[guards] on` list, once, as a text
+insert that keeps your comments and order, and one line says so. A policy with no `[guards]` table or `on` list, or that
+already names it, isn't touched. If the rewrite fails, the runner's config,
 the install record and the OpenCode plugin are put back as they were. Run it in a terminal of your own: a session, gated
 or not, is refused (exit 3), and so is a run with no terminal. Exit 0 when done, 1 when the installer or the rewrite
 failed, 3 when refused, 4 when files couldn't be put back after a failed rewrite (they're named). See
@@ -1558,6 +1570,44 @@ ws schedule remove [-h] job
 | Argument | Meaning |
 |---|---|
 | `job` | The job whose timer to remove. |
+
+## `ws watch`
+
+What watches a machine from outside the sessions. The scheduler role runs these from timers (`ws schedule apply`), so
+you rarely type them.
+
+```text
+ws watch alert UNIT          what a failed unit's OnFailure= runs: one line in logs/alerts.jsonl and one push
+ws watch deadman             one alert for each job with no run record in twice its expected rate
+ws watch rotate JOB          rotate the job's log file when it is over the cap
+ws watch dropin UNIT... --out DIR   OnFailure= drop-ins for units ws did not write
+ws watch panes [--after-minutes N]  push when a tmux pane has sat on a dialog; Esc only on the Remote Control box
+```
+
+### `ws watch panes`
+
+A Claude Code dialog (a question, a permission, the Remote Control status box) holds every key and queued message until
+someone presses one, and a session behind one looks idle. Each run reads the last 20 lines of every pane on the live tmux
+server and looks for a dialog's footer: `Enter to select`, `Esc to cancel`, `Esc to continue`, `Enter to confirm`,
+`Do you want to proceed?`. A dialog that has stayed the same for `after_minutes` (default 10) gets one push for that
+episode through the notify role (the alert cap applies), naming the window, its `@id`, how long it has been up and the
+dialog's first line. The episode ends when the dialog goes.
+
+The only key it ever sends is `Escape`, to a pane showing the Remote Control status box (it holds Remote Control,
+Disconnect this session and Esc to continue) once it has been up a minute; it logs that to `logs/alerts.jsonl` and
+pushes once. It never presses anything on any other dialog: a question is yours to answer. `ws-watch-panes.timer` runs it
+every minute (systemd, or `ws.job.watch-panes` on launchd) once any job is scheduled; with no scheduled job, run
+`ws watch panes` from your own timer or cron. It does nothing without tmux or a running server. State is
+`logs/panes-watch.json`.
+
+An optional `[watch.panes]` table in the profile:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `after_minutes` | `10` | Whole minutes (1 to 1440) on one dialog before the push. `--after-minutes` beats it for one run. |
+| `patterns` | `[]` | More footer text to count as a dialog, added to the five above (case ignored). |
+| `live_socket` | the policy's | The tmux socket to watch (a path, or a name under the tmux folder). Left out, the `live_socket` of the `pane-keys` or `pane-close` guard, else this user's default socket. |
+| `show_text` | `true` | `false` leaves the dialog's text out of the push (the window name and `@id` stay), for a machine where a question must not leave the box. Whatever this says, a pane in a walled or counts-only class (judged by its folder), or a policy that can't be read, never has its text quoted. |
 
 ## `ws approve`
 

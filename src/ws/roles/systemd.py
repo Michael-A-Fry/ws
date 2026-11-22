@@ -5,7 +5,7 @@
 The service of a job with a runner runs `ws queue tick <name> --slot schedule --run`: it queues the slot the timer
 fired for (the latest time of the schedule at or before now, since systemd does not pass the time) and drains the
 queue. A job that would use a subscription login, which the queue never runs, keeps `ws run <name>`. A job with a
-`command` runs that (for example `ws backup run`). `ws-queue-reap.timer` runs `ws queue reap` every two minutes. Every timer gets
+`command` runs that (for example `ws backup run`). `ws-queue-reap.timer` runs `ws queue reap` every two minutes, and `ws-watch-panes.timer` runs `ws watch panes` every minute. Every timer gets
 `Persistent=true`, so a run missed while the machine was off happens at the next start; on a machine that stays on it
 never fires, so the "stays on?" answer is not needed here.
 
@@ -42,7 +42,11 @@ ALERT_TEMPLATE = "ws-alert@.service"
 DEADMAN = "ws-watch-deadman"  # the dead-man check: a timer outside the jobs it watches
 REAPER = "ws-queue-reap"  # `ws queue reap` every 2 minutes: a killed run is told within minutes, not at the next run
 REAP_EVERY_MIN = 2
+PANES = (
+    "ws-watch-panes"  # `ws watch panes` every minute: a session on a dialog is pushed to the person, never left unseen
+)
 OWN = {SLICE, ALERT_TEMPLATE, f"{DEADMAN}.service", f"{DEADMAN}.timer", f"{REAPER}.service", f"{REAPER}.timer"}
+OWN |= {f"{PANES}.service", f"{PANES}.timer"}
 CPU_WEIGHT, MEMORY_HIGH = 50, "75%"  # the share scheduled jobs get: below the default CPUWeight of 100, soft memory cap
 TIMEOUT_MARGIN_S = 30  # TimeoutStartSec= is the job's limit plus this, so `ws run` ends its own run first
 
@@ -117,6 +121,7 @@ def render_watch(env, ws_cmd: list[str]) -> dict[str, str]:
     alert = " ".join(_quote(w, expand=True) for w in [*ws_cmd, "watch", "alert"]) + ' "%i"'  # %i is the specifier
     dead = " ".join(_quote(w, expand=True) for w in [*ws_cmd, "watch", "deadman"])
     reap = " ".join(_quote(w, expand=True) for w in [*ws_cmd, "queue", "reap"])
+    panes = " ".join(_quote(w, expand=True) for w in [*ws_cmd, "watch", "panes"])
     return {
         ALERT_TEMPLATE: _header("ws's scheduler role")
         + f"[Unit]\nDescription=ws failure alert for %i\n\n[Service]\nType=oneshot\nSlice={SLICE}\n{env_text}\n"
@@ -135,6 +140,14 @@ def render_watch(env, ws_cmd: list[str]) -> dict[str, str]:
         + f"[Unit]\nDescription=ws queue reaper (every {REAP_EVERY_MIN} minutes)\n\n"
         + f"[Timer]\nOnCalendar=*-*-* *:00/{REAP_EVERY_MIN}:00\nAccuracySec=15s\n"
         + f"Unit={REAPER}.service\n\n[Install]\nWantedBy=timers.target\n",
+        f"{PANES}.service": _header("ws's scheduler role")
+        # no OnFailure=: a watcher that fails would alert every minute; it is inert without tmux, and `ws doctor` shows it
+        + "[Unit]\nDescription=ws pane watch: push when a tmux pane sits on a dialog\n\n"
+        + f"[Service]\nType=oneshot\nSlice={SLICE}\n{env_text}\nExecStart={panes}\nTimeoutStartSec=60\n",
+        f"{PANES}.timer": _header("ws's scheduler role")
+        + "[Unit]\nDescription=ws pane watch (every minute)\n\n"
+        + "[Timer]\nOnCalendar=*-*-* *:*:00\nAccuracySec=5s\n"
+        + f"Unit={PANES}.service\n\n[Install]\nWantedBy=timers.target\n",
     }
 
 

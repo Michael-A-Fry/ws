@@ -38,6 +38,16 @@ body of the GitHub release.
   sent. (C626)
 - `ws sync`: fetch every git repository under the code root, 4 at a time, each fetch killed (with its helpers)
   and named past `--timeout-s` (default 120); exit 1 when any failed or timed out.
+- The `pane-keys` guard: a `tmux send-keys` (or a `paste-buffer`) aimed at the live tmux server that types a line
+  starting with `/` is an approvable deny, because a slash command can open a dialog that holds every later key and
+  message until someone presses one (#276). The reason says to start sessions with `--name X --remote-control X` and to
+  use `ws msg send`. It reads key names in any case (`M-/` is a slash), and refuses `tmux -C` control mode and
+  `tmux pipe-pane -I` (which types a command's output into the pane) on the live server.
+- `ws watch panes`: pushes once when a tmux pane has sat on a dialog for 10 minutes (`[watch.panes]` in the profile
+  sets that and more footer patterns). It presses `Escape` on the Remote Control status box after a minute and on no
+  other dialog. A footer counts only at the foot of the screen, and the dialog's text is quoted in the push only
+  for a pane in a `full` data class. `ws-watch-panes.timer` (systemd) and `ws.job.watch-panes` (launchd) run it
+  every minute (#276).
 - `ws upgrade` writes one line per step to `logs/upgrade.jsonl` (verb, step, Python, version, exit, seconds and the
   last 20 lines of the installer's or hooks step's output); the terminal output is unchanged. (C650)
 - An OpenCode job can name a model server on this machine or the local network in `runner_options.provider`, and
@@ -47,6 +57,15 @@ body of the GitHub release.
 
 ### Changed
 
+- `pane-keys` is on by default: `ws gate init` and the built-in policy now write
+  `on = ["syntax-check", "session-context", "dev-server", "pane-keys"]`. An existing policy keeps its own list; add
+  `pane-keys` to it (#276). The upgrade does it for you: it adds `pane-keys` to the end of an existing `[guards] on`
+  list once, as a text insert that keeps your comments and order, and prints one line saying so; a policy with no
+  `[guards]` table or `on` list, or that already names it, isn't touched (#276).
+- `ws dispatch` starts a Claude session with `--name LABEL` and `--remote-control=LABEL` (LABEL is the window's name),
+  so nobody types `/rename` or `/remote-control` into its pane. Remote control is left off for a repo whose class isn't
+  `access = "full"`, or when the policy can't be read (#276).
+- `ws msg` wake never types text with a line that starts with `/` into a pane (reason `slash_text`) (#276).
 - `ws dispatch` passes the model as one argument, `--model=M`, so a model name that starts with `-` can't become a
   flag, and its code root expands `~` only for your own home (`~` or `~/...`).
 - `ws upgrade` runs the hooks step with the ws the installer just wrote, read back from the `ws` command it put in

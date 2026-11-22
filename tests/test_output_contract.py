@@ -96,6 +96,7 @@ CASES: dict[str, list[str]] = {
     "watch.deadman": ["watch", "deadman"],
     "watch.rotate": ["watch", "rotate", "nojob"],
     "watch.dropin": ["watch", "dropin", "svc", "--out", "{home}/dropins"],
+    "watch.panes": ["watch", "panes"],
     "plugin.list": ["plugin", "list"],
     "plugin.add": ["plugin", "add", "nope"],
     "plugin.remove": ["plugin", "remove", "nope"],

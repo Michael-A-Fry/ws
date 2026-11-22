@@ -888,21 +888,19 @@ def scheduled(env: dict | None = None) -> list[Scheduled]:
 
 
 def credential_kind(job: Job) -> str:
-    """`api_key` when the job leases a key through `[[secrets]]`, `local` when its provider is on this machine, else
-    `subscription`: the runner would use whatever login it is signed in with."""
+    """`api_key` when the job leases a key through `[[secrets]]`, `local` when its provider's base URL is a local model
+    server (the same check `ws job add` and `ws run` make: ws.adapters.opencode.base_url_problem, so this machine, the
+    local network or a tailnet), else `subscription`: the runner would use whatever login it is signed in with."""
     if job.secrets:
         return "api_key"
     provider = job.runner_options.get("provider") if isinstance(job.runner_options.get("provider"), dict) else {}
     options = provider.get("options") if isinstance(provider.get("options"), dict) else {}
-    base = options.get("baseURL") or options.get("base_url")
+    base = options.get("baseURL")
     if isinstance(base, str):
-        from urllib.parse import urlsplit
+        from ws.adapters import opencode  # late: the adapter imports this module
 
-        try:
-            if (urlsplit(base).hostname or "").lower() in ("127.0.0.1", "localhost", "::1"):
-                return "local"
-        except ValueError:
-            pass
+        if opencode.base_url_problem(base) is None:
+            return "local"
     return "subscription"
 
 

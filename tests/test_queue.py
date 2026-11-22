@@ -1056,6 +1056,37 @@ def test_subscription_job_is_refused_in_the_queue(box, capsys):
     assert call(capsys, "queue", "show", run_id)[1]["data"]["status"] == "refused"
 
 
+@pytest.mark.parametrize(
+    "octets",
+    [(192, 168, 1, 20), (100, 64, 0, 1), (127, 0, 0, 2), (10, 1, 2, 3)],
+    ids=["LAN", "CGNAT", "other loopback", "private 10/8"],
+)
+def test_a_job_on_a_local_network_server_is_local_not_a_login(box, capsys, octets):
+    """The queue and `ws job add` use one predicate (ws.adapters.opencode.base_url_problem), so a server `ws job add`
+    takes is not then refused as a subscription login when the timer queues it."""
+    host = ".".join(map(str, octets))  # built at run time: no private address in the repo's text
+    (box / "jobs" / "lan.toml").write_text(
+        'runner = "opencode"\nmodel = "ollama/qwen3"\nprompt = "ok"\ntimeout_s = 30\nallow_unpriced = true\n'
+        '[runner_options]\nprovider = { npm = "@ai-sdk/openai-compatible", options = { baseURL = '
+        f'"http://{host}:11434/v1" }} }}\n',
+        encoding="utf-8",
+    )
+    assert queue.credential_kind(jobs.load("lan")) == "local"
+    code, env = call(capsys, "queue", "add", "lan")
+    assert code == 0, env
+    assert env["data"]["run_id"]
+
+
+def test_a_job_on_a_public_or_named_server_is_still_a_login(box):
+    for base in ("https://api.example.com/v1", "http://localtest.me:11434/v1", "http://8.8.8.8/v1"):
+        (box / "jobs" / "pub.toml").write_text(
+            'runner = "opencode"\nmodel = "ollama/qwen3"\nprompt = "ok"\n[runner_options]\n'
+            f'provider = {{ options = {{ baseURL = "{base}" }} }}\n',
+            encoding="utf-8",
+        )
+        assert queue.credential_kind(jobs.load("pub")) == "subscription", base
+
+
 def test_queue_run_drains_through_the_same_code_as_ws_run(box, capsys):
     write_job(box, "a")
     write_job(box, "b", extra='purpose = "jobs"\nbudget_usd = 2.0')

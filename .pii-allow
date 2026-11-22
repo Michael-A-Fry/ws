@@ -6,3 +6,4 @@
 ^        "ssh -J me@jump\.example\.org:2222,jump2\.example\.org h ls",$
 ^        "ssh -o ProxyJump=jump\.example\.org -o HostName=10\.0\.0\.5 h ls",$
 ^3\.\ Run\ `ws\ mail\ add\ work\ \-\-host\ imap\.gmail\.com\ \-\-user\ you@gmail\.com\ \-\-kind\ gmail`\.\ It\ opens\ a\ prompt\ window$
+^LOCAL_NETS = \("127\.0\.0\.0/8", "10\.0\.0\.0/8", "172\.16\.0\.0/12", "192\.168\.0\.0/16", "100\.64\.0\.0/10"\)$

@@ -12,11 +12,21 @@ body of the GitHub release.
 
 - `ws sync`: fetch every git repository under the code root, 4 at a time, each fetch killed (with its helpers)
   and named past `--timeout-s` (default 120); exit 1 when any failed or timed out.
+- An OpenCode job can name a model server on this machine or the local network in `runner_options.provider`, and
+  `ws job add` takes it: an allowlisted `@ai-sdk/openai-compatible` table whose `baseURL` is `localhost` or a literal
+  loopback, private or CGNAT address. It replaces a provider block in a project `opencode.json`, which a job no longer
+  reads.
 
 ### Changed
 
 - `ws dispatch` passes the model as one argument, `--model=M`, so a model name that starts with `-` can't become a
   flag, and its code root expands `~` only for your own home (`~` or `~/...`).
+- A hand-written OpenCode job whose `provider` table names a public or non-literal address, another npm package, or a
+  key outside the allowlist (such as `apiKey` or `headers`) is now refused at `ws run`, with the reason. A leased job
+  whose `provider` table holds only `models` (the lease gives the address) now also needs
+  `npm = "@ai-sdk/openai-compatible"`.
+- A job whose provider is on the local network or a tailnet (a literal private, CGNAT or other loopback address) now
+  counts as a local credential, so the queue and its timer take it; before, only 127.0.0.1, localhost and ::1 did.
 
 ## [0.1.11.3] - 2026-11-22
 

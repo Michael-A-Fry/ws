@@ -396,8 +396,8 @@ def test_a_real_run_writes_state_a_record_and_the_summary_the_morning_note_reads
     assert "Sam" not in json.dumps(line) and "catch up" not in json.dumps(line).lower()  # ids and counts, no text
     day = f"{NOW.astimezone():%Y-%m-%d}"
     text = (tmp_path / "ctx" / f"summary-{day}.md").read_text()
-    assert "2 threads" in text and "Drafts created: 1" in text and "ws/low 1" in text and "ws/needs-reply 1" in text
-    assert "Worth a look:" in text and triage.SCHEDULING_FLAG in text
+    assert "2 threads" in text and "Drafts created: 1" in text and "1 low priority" in text and "1 need a reply" in text
+    assert "Needs a reply:" in text and triage.SCHEDULING_FLAG in text and "Draft saved." in text
 
 
 def test_the_days_summary_adds_up_across_runs_and_starts_again_on_a_new_day(tmp_path):
@@ -407,7 +407,7 @@ def test_the_days_summary_adds_up_across_runs_and_starts_again_on_a_new_day(tmp_
     r.add(2, raw(subject="Two"))
     go(tmp_path, r, m, now=NOW.replace(hour=6))
     text = (tmp_path / "ctx" / f"summary-{NOW.astimezone():%Y-%m-%d}.md").read_text()
-    assert "2 threads" in text and "ws/fyi 2" in text and "Model calls today: 2" in text
+    assert "2 threads" in text and "2 for your information" in text and "token" not in text
     go(tmp_path, r, m, now=NOW.replace(day=24))  # nothing new, next day: a fresh summary that says so
     nxt = (tmp_path / "ctx" / f"summary-{NOW.replace(day=24).astimezone():%Y-%m-%d}.md").read_text()
     assert nxt.startswith("No new mail.") and "0 threads" in nxt
@@ -829,3 +829,130 @@ def test_a_mailbox_with_no_class_is_refused_once_the_policy_has_classes():
     assert e.value.exit_code == triage.EXIT_REFUSED and "'b'" in e.value.message
     triage.refuse_walled(_replace(cfg, classes={"a": "home", "b": "home"}), pol)
     triage.refuse_walled(_replace(cfg, classes={}), policy.default_policy())  # no classes table: as before
+
+
+# ---------------------------------------------------------------- the summary names the threads that matter (C701)
+
+ASK = "Kia ora Sam,\nThanks, I will look at it. Cheers, Alex"
+CHECK_RULES = triage.parse_rules(
+    '[[rule]]\nid = "security"\nlabel = "check"\nsubject = "security alert"\n'
+    '[[rule]]\nid = "bulk"\nlabel = "ws/low"\nbulk = true\n'
+)
+
+
+def summary(tmp_path, now=NOW) -> str:
+    return (tmp_path / "ctx" / f"summary-{now.astimezone():%Y-%m-%d}.md").read_text()
+
+
+def test_the_second_run_of_a_day_keeps_the_first_runs_needs_reply_line(tmp_path):
+    r = Route()
+    r.add(1, raw(sender="Sam T <sam@example.org>", subject="Quote for the deck", mid="<q1@example.org>"))
+    go(tmp_path, r, Model(reply(True, "asks for a quote by Friday", ASK)))
+    r.add(2, raw(sender="Kim <kim@example.org>", subject="Photos", mid="<p1@example.org>"))
+    go(tmp_path, r, Model(reply(False)), now=NOW.replace(hour=6))
+    text = summary(tmp_path, NOW.replace(hour=6))
+    assert "Needs a reply:\n- a: Sam T, “Quote for the deck”: asks for a quote by Friday. Draft saved.\n" in text
+    assert "2 threads" in text and "Drafts created: 1" in text
+
+
+def test_a_thread_seen_again_is_one_line_and_one_the_owner_answered_is_marked_done(tmp_path):
+    r = Route()
+    r.add(1, raw(subject="Quote", mid="<q1@example.org>"))
+    go(tmp_path, r, Model(reply(True, "asks for a quote", ASK)))
+    r.add(
+        2, raw(sender="Me <me@example.com>", subject="Re: Quote", mid="<q2@example.org>", References="<q1@example.org>")
+    )
+    go(tmp_path, r, Model(), now=NOW.replace(hour=6))
+    text = summary(tmp_path, NOW.replace(hour=6))
+    assert "Needs a reply:" not in text and text.count("Quote") == 1
+    assert "\nDone:\n- a: Sam T, “Quote”: asks for a quote. Draft saved." in text
+    r.add(3, raw(subject="Re: Quote", mid="<q3@example.org>", References="<q1@example.org>"))  # he writes back again
+    go(tmp_path, r, Model(reply(True, "now asks for a price", ASK)), now=NOW.replace(hour=7))
+    text = summary(tmp_path, NOW.replace(hour=7))
+    assert "Done:" not in text and text.count("Quote") == 1 and "now asks for a price" in text
+
+
+def test_a_check_rule_gives_a_summary_line_adds_fyi_and_makes_no_model_call(tmp_path):
+    r = Route()
+    r.add(1, raw(sender="Google <no-reply@accounts.google.com>", subject="Security alert", mid="<s1@example.org>"))
+    m = Model()
+    rec = go(tmp_path, r, m, rules=CHECK_RULES)
+    assert m.calls == [] and rec["model_calls"] == 0 and r.labels == [("a:7-1", "ws/fyi")] and r.drafts == []
+    assert rec["labels"] == {"ws/fyi": 1} and rec["decisions"][0]["rule"] == "security"
+    assert "Worth a look:\n- a: Google, “Security alert”: matched rule security.\n" in summary(tmp_path)
+
+
+def test_the_summary_has_no_tokens_or_money_and_the_run_log_keeps_them(tmp_path):
+    r = Route()
+    r.add(1, raw())
+    go(tmp_path, r, Model(reply(True, "asks", ASK)))
+    text = summary(tmp_path)
+    assert not any(w in text.lower() for w in ("token", "us$", "cost", "model", "ws/", "rules decided"))
+    (line,) = [json.loads(x) for x in (tmp_path / "logs" / "triage.jsonl").read_text().splitlines()]
+    assert line["tokens_in"] == 100 and line["cost_usd"] == 0.001 and line["model_calls"] == 1
+    day = json.loads((tmp_path / "state" / "inbox.json").read_text())["day"]
+    assert not {"tokens_in", "tokens_out", "cost_usd", "model_calls"} & set(day)
+
+
+def test_a_subject_or_reason_with_a_link_or_a_control_character_is_written_cleanly(tmp_path):
+    r = Route()
+    evil = (
+        "Invoice [click here](https://evil.example/x) <https://evil.example/y> \u202eexe.pdf\u0007 www.evil.example/z"
+    )
+    r.add(1, raw(sender="Pat \u202eX <pat@example.org>", subject=evil, mid="<e1@example.org>"))
+    r.add(2, raw(subject="x" * 300, mid="<e2@example.org>"))
+    reason = "see [the plan](http://evil.example)\u200b and `run it` ![i](http://evil.example/i.png) " + "y" * 200
+    go(tmp_path, r, Model(reply(True, "okay", ASK), reply(True, reason[:200], ASK)))
+    text = summary(tmp_path)
+    assert "evil.example" not in text and "](" not in text and "http" not in text
+    assert not any(ch in text for ch in "\u202e\u0007\u200b`<>")
+    assert "Invoice click here" in text and "see the plan" in text
+    lines = [x for x in text.splitlines() if x.startswith("- ")]
+    assert len(lines) == 2 and all(len(x) < 300 for x in lines)
+    assert "x" * 81 not in text and "…" in text  # a subject is cut to about 80 characters
+
+
+def test_no_body_text_reaches_the_summary(tmp_path):
+    r = Route()
+    r.add(1, raw(subject="Plans", body="The secret passphrase is plum-orchard-42.", mid="<b1@example.org>"))
+    go(tmp_path, r, Model(reply(True, "asks about plans", ASK)))
+    assert "plum-orchard" not in summary(tmp_path)
+
+
+def test_a_dry_run_carries_the_summary_it_would_write_and_writes_nothing(tmp_path):
+    r = Route()
+    r.add(1, raw(sender="Google <no-reply@accounts.google.com>", subject="Security alert", mid="<s1@example.org>"))
+    rec = go(tmp_path, r, Model(), rules=CHECK_RULES, dry=True)
+    assert rec["summary"].startswith("Inbox triage ") and "matched rule security" in rec["summary"]
+    assert not (tmp_path / "ctx").exists() and not (tmp_path / "state").exists()
+
+
+def test_the_days_lines_are_read_tolerantly_deduped_and_capped_keeping_the_oldest(tmp_path, monkeypatch):
+    monkeypatch.setattr(triage, "MAX_ITEMS", 20)
+    f = tmp_path / "state" / "inbox.json"
+    f.parent.mkdir()
+    day = f"{NOW.astimezone():%Y-%m-%d}"
+    old = {"key": "a|t0", "mailbox": "a", "kind": "check", "uid": 0, "who": "Old", "subject": "Kept", "why": "w"}
+    f.write_text(json.dumps({"schema": 1, "mailboxes": {}, "day": {
+        "date": day, "threads": 3, "labels": "junk", "drafts": "x", "flags": ["Sam, “Quote”: scheduling", 7],
+        "items": [old, old, "junk", {"no": "key"}, {"key": 5}]}}))  # fmt: skip
+    r = Route()
+    for i in range(1, 31):
+        r.add(i, raw(subject=f"S{i}", mid=f"<t{i}@example.org>"))
+    cfg = _replace(config(tmp_path), max_drafts=500, model={"max_calls": 500, "run_tokens": 10**9, "budget_usd": 100.0})
+    go(tmp_path, r, Model(*[reply(True, "r", ASK)] * 200), cfg=cfg)
+    st = json.loads(f.read_text())["day"]
+    keys = [i["key"] for i in st["items"]]
+    assert len(keys) == len(set(keys)) == triage.MAX_ITEMS and keys[0] == "text|Sam, “Quote”: scheduling"
+    assert (
+        "a|t0" in keys
+        and st["more"] > 0
+        and "S1" in summary(tmp_path)
+        and f"And {st['more']} more" in summary(tmp_path)
+    )
+
+
+def test_the_rules_file_accepts_check_and_the_default_may_be_check():
+    assert triage.parse_rules('[[rule]]\nid = "x"\nlabel = "check"\nsubject = "a"\n').rules[0].label == "check"
+    assert triage.parse_rules('default = "check"\n').default == "check"
+    assert triage.ws_label("check") == "ws/fyi" and triage.ws_label("ws/low") == "ws/low"

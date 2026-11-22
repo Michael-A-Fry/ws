@@ -16,8 +16,9 @@ model costs less and needs more guard rails and checks that aren't a model, whic
 1. **Fetch, no model.** For each mailbox, the messages newer than the last uid seen. Nothing new is a run with no model
    call.
 2. **Rules, no model.** A plain TOML file maps a sender, a domain, bulk-mail headers and subject patterns to one of
-   `ws/needs-reply`, `ws/fyi`, `ws/waiting`, `ws/low` or to `ask-model`, which is a state, never a label. The first match
-   wins and its id is logged with the decision. A rule only labels; it never drafts.
+   `ws/needs-reply`, `ws/fyi`, `ws/waiting`, `ws/low`, `check` or to `ask-model`, which is a state, never a label. The
+   first match wins and its id is logged with the decision. A rule only labels; it never drafts. `check` means "worth
+   a look": the thread gets `ws/fyi` and a line in the summary, with no model call.
 3. **Model, `ask-model` threads only.** One call per thread: no tools, one turn, the thread cut to the newest messages
    inside a token cap, plus your voice notes. It answers `{"needs_reply": bool, "reason": str, "draft": str | null}`
    and nothing else. A bad answer is retried twice, then the thread is flagged and nothing is drafted.
@@ -26,7 +27,7 @@ model costs less and needs more guard rails and checks that aren't a model, whic
    carry, opens with "Dear" or isn't 2 to 6 sentences. A thread that asks for a time is drafted without one and flagged
    `scheduling: check your calendar`, because ws has no calendar source yet.
 5. **Output.** The label and the draft go in through `ws mail`. Each run adds one line to `logs/triage.jsonl` and, when
-   `summary_dir` is set, the day's `summary-DATE.md` is rewritten (it adds up across the day's runs).
+   `summary_dir` is set, the day's `summary-DATE.md` is rewritten (it adds up across the day's runs; see below).
 
 A thread the model says needs no reply gets `ws/fyi`. A thread it says needs one gets `ws/needs-reply`, with a draft
 when the checks pass.
@@ -95,8 +96,49 @@ domain = "bank.example"           # the domain and every sub-domain
 # also: sender = "a@example.org" (or a list), subject = "^receipt\\b" (a case-insensitive pattern), mailbox = ["personal"]
 ```
 
+```toml
+[[rule]]
+id = "account-security"              # a generic example: sign-in and security alerts are worth a look, not a reply
+label = "check"
+subject = "(security alert|new (device|sign-?in|login)|suspicious (activity|sign-?in)|password (was )?changed)"
+```
+
+`check` is not a mailbox label: the thread is labelled `ws/fyi` (so nothing new is added to the mailbox) and listed
+under "Worth a look" in the day's summary.
+
 Every condition in one rule must hold. A message from the mailbox's own address is left alone (`builtin:self`). Rules see
 the headers only, never the body.
+
+## The summary
+
+`summary-DATE.md` is written for the person who reads it, so it holds no tokens, money or run counts (those are in
+`logs/triage.jsonl`). The first line has the thread count and `Drafts created: N`, then one line for each thread that
+needs a reply or is worth a check:
+
+```
+Inbox triage 2026-11-23 10:00: 12 threads. Sorted: 2 need a reply, 5 for your information, 5 low priority, 0 waiting on others. Drafts created: 2.
+
+Needs a reply:
+- personal: Sam T, “Quote for the deck”: asks for a quote by Friday. Draft saved.
+
+Worth a look:
+- personal: Google, “Security alert”: matched rule account-security.
+
+Done:
+- business: Kim, “Invoice 114”: asks when it will be paid. Draft saved.
+```
+
+A line is the mailbox, the sender's name, the subject (cut to about 80 characters) and why: the model's reason, or the
+rule id for a `check` rule. For a reply it says whether a draft was saved, and why not when one was refused or couldn't
+be saved. There is never any body text. A subject, a name and the model's reason come from mail, so each is written as one
+plain line: control and bidi characters, markdown links, web addresses, brackets and backticks are removed.
+
+Lines are added across the day's runs and a thread is one line, the newest. A line is never dropped because a later run
+had nothing to say about it. It moves to "Done" when a later run reads a message from the mailbox's own address in the
+same thread (an answer). Archiving isn't seen: ws reads new mail only. The day's state keeps 100 lines; when it is full,
+answered lines make room, oldest first, and any thread past that is counted in a last line ("And N more").
+
+`--dry-run` prints the summary it would write to standard output and writes nothing.
 
 ## What it costs
 

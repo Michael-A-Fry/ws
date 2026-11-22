@@ -87,6 +87,13 @@ jobs:
           if [ "$GITHUB_EVENT_NAME" = "push" ] && [ "$(git rev-parse HEAD)" != "$GITHUB_SHA" ]; then
             echo "::error::refs/tags/$TAG is not the commit this run started from ($GITHUB_SHA); the tag moved"; exit 1
           fi
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            # the tag must be signed by a key .github/release_signers lists: the file the build stamps in as the trust root
+            # is then tied to the key that really signs tags, not just to a file nobody checked
+            if ! git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=.github/release_signers tag -v "$TAG"; then
+              echo "::error::$TAG is not signed by a key listed in .github/release_signers"; exit 1
+            fi
+          fi
           if ! git merge-base --is-ancestor HEAD origin/main; then
             if [ "$GITHUB_EVENT_NAME" = "push" ]; then
               echo "::error::$TAG is not on main; releases are cut from main"; exit 1

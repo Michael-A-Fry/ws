@@ -274,3 +274,53 @@ def test_the_installer_is_a_signed_release_asset_with_its_hash_and_attestation()
 
 def test_the_wheel_is_checked_for_its_trust_root_before_it_is_published():
     assert "assert version.trust_root()" in WORKFLOW
+
+
+def meta_repo(tmp_path: Path, signed_by: str | None) -> tuple[Path, dict[str, str]]:
+    """A repo at a v0.0.1 tag (signed with a throwaway key, or unsigned) with a signers file listing one key."""
+    assert GIT and KEYGEN
+    blobs: dict[str, str] = {}
+    for name in ("listed", "other"):
+        subprocess.run([KEYGEN, "-q", "-t", "ed25519", "-N", "", "-f", str(tmp_path / name), "-C", ""], check=True)
+        blobs[name] = (tmp_path / f"{name}.pub").read_text(encoding="utf-8").split()[1]
+    repo = tmp_path / "meta"
+    (repo / ".github").mkdir(parents=True)
+    (repo / "pyproject.toml").write_text('[project]\nname = "x"\nversion = "0.0.1"\n', encoding="utf-8")
+    (repo / ".github" / "release_signers").write_text(
+        f'ws-release namespaces="git" ssh-ed25519 {blobs["listed"]}\n', encoding="utf-8"
+    )
+    quiet = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull}
+    env = {**os.environ, **quiet, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com"}
+    env |= {"GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com"}
+    steps = [["init", "-q"], ["add", "."], ["commit", "-q", "-m", "x"], ["update-ref", "refs/remotes/origin/main", "HEAD"]]
+    if signed_by:
+        sign = ["-c", "gpg.format=ssh", "-c", f"user.signingkey={tmp_path / signed_by}"]
+        steps.append([*sign, "tag", "-s", "-m", "v", "v0.0.1"])
+    else:
+        steps.append(["tag", "-a", "-m", "v", "v0.0.1"])
+    for argv in steps:
+        subprocess.run([GIT, *argv], cwd=repo, env=env, check=True, capture_output=True)
+    sha = subprocess.run([GIT, "rev-parse", "HEAD"], cwd=repo, env=env, capture_output=True, text=True, check=True)
+    out = tmp_path / "out"
+    out.write_text("", encoding="utf-8")
+    run_env = {"TAG": "v0.0.1", "GITHUB_EVENT_NAME": "push", "GITHUB_SHA": sha.stdout.strip()}
+    return repo, {**run_env, **quiet, "GITHUB_OUTPUT": str(out), "GITHUB_ENV": str(out)}
+
+
+@pytest.mark.skipif(GIT is None or KEYGEN is None, reason="needs git and ssh-keygen")
+@pytest.mark.parametrize(
+    ("signed_by", "ok"), [("listed", True), ("other", False), (None, False)], ids=["listed-key", "unlisted-key", "unsigned"]
+)
+def test_a_pushed_tag_must_be_signed_by_a_key_in_the_signers_file(tmp_path: Path, signed_by, ok):
+    repo, env = meta_repo(tmp_path, signed_by)
+    r = run_bash(step_script("the tag equals v + the version"), repo, env)
+    assert (r.returncode == 0) is ok, r.stdout + r.stderr
+    if not ok:
+        assert "is not signed by a key listed in .github/release_signers" in r.stdout + r.stderr
+
+
+@pytest.mark.skipif(GIT is None or KEYGEN is None, reason="needs git and ssh-keygen")
+def test_a_dry_run_is_not_asked_for_a_tag_signature(tmp_path: Path):
+    repo, env = meta_repo(tmp_path, None)
+    r = run_bash(step_script("the tag equals v + the version"), repo, {**env, "GITHUB_EVENT_NAME": "workflow_dispatch"})
+    assert r.returncode == 0, r.stdout + r.stderr

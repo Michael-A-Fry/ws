@@ -187,20 +187,30 @@ def cmd_check(args: argparse.Namespace) -> int:
     return 1 if bad else 0
 
 
-def cmd_rm(args: argparse.Namespace) -> int:
+def remove_profile(name: str) -> str | None:
+    """Take `[mail.NAME]` out of the profile; returns its secret name, or None when there was no such table."""
     path = profile.profile_path()
     try:
         doc = profile.load(path) or {}
     except profile.ProfileError as e:
         raise WsError("bad_config", str(e), f"fix {path}") from None
     known = mail.parse_mailboxes(doc, str(path))  # the whole [mail] table validates, or nothing is changed
-    if args.name not in known:
-        raise WsError("not_found", f"no mailbox {args.name!r} in {path}", "`ws mail check` lists them", 2)
+    if name not in known:
+        return None
     boxes = doc["mail"]
-    secret = boxes.pop(args.name)["secret"]
+    secret = boxes.pop(name)["secret"]
     if not boxes:
         doc.pop("mail")
     profile.write_if_changed(path, doc)
+    return secret
+
+
+def cmd_rm(args: argparse.Namespace) -> int:
+    secret = remove_profile(args.name)
+    if secret is None:
+        raise WsError(
+            "not_found", f"no mailbox {args.name!r} in {profile.profile_path()}", "`ws mail check` lists them", 2
+        )
     left = f"the registry entry [{secret}] and its stored value are kept: `ws secret rm {secret}` and edit the registry"
     if args.json:
         output.result({"mailbox": args.name, "removed": True, "secret": secret})

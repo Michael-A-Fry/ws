@@ -177,3 +177,26 @@ def test_known_lists_the_mail_entries_without_values(box):
     rows = mailconnect.known()
     assert rows == [{**row, "in_profile": True, "checked_at": 1_800_000_000.0}]
     assert box.password not in str(rows)
+
+
+def test_off_keeps_the_password_and_on_needs_one_that_logged_in(box):
+    with pytest.raises(mailconnect.ConnectError) as no:
+        mailconnect.set_on("a", True)
+    assert no.value.kind == "needs_login"  # stored another way: never proven
+    mailconnect.connect("a", USER, box.password, cafile=box.cafile)
+    assert mailconnect.set_on("a", False) == {"mailbox": "a", "on": False}
+    assert boxes() == {} and box.s.store.read("mail-a") == box.password
+    assert mailconnect.set_on("a", True) == {"mailbox": "a", "on": True}
+    assert boxes() == {"a": {"secret": "mail-a", "kind": "imap"}}
+
+
+def test_disconnect_forgets_the_password_and_keeps_the_registry_entry(box):
+    mailconnect.connect("a", USER, box.password, cafile=box.cafile)
+    before = box.s.registry.read_text()
+    r = mailconnect.disconnect("a")
+    assert r == {"mailbox": "a", "disconnected": True, "password_forgotten": True, "registry_entry_kept": "mail-a"}
+    assert boxes() == {} and "mail-a" not in box.s.store.names() and box.s.registry.read_text() == before
+    assert mailconnect.known()[0]["checked_at"] is None
+    with pytest.raises(mailconnect.ConnectError) as e:
+        mailconnect.disconnect("nope")
+    assert e.value.kind == "not_found"

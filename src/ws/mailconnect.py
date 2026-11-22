@@ -20,6 +20,9 @@ page of the person's own that imports it). In order:
 5. Only then: the registry entry (if new), the value in the local store, and `[mail.<name>]` in the profile. A last
    LIST through the broker proves the broker sees it (`broker_ok`).
 
+`set_on(name, on)` switches a mailbox off (its profile table out, its password kept) or back on; `disconnect(name)`
+takes the table and the stored password out. Neither touches the registry entry.
+
 The value lives only in this call's memory and the store: it is never in a log, a state file, a result or an error
 text, and no error carries the server's own words. Drafts only: nothing here changes what the mail connector may do.
 """
@@ -389,3 +392,43 @@ def connect(
         "profile_written": written,
         "broker_ok": broker_ok,
     }
+
+
+# ---------------------------------------------------------------- on, off and disconnect
+
+
+def _entry_for(name: str, env: dict | None) -> wsecrets.Entry:
+    if not mail.MAILBOX_RE.match(name or ""):
+        raise ConnectError("bad_name", f"{name!r} can't be a mailbox name.", "Use lower-case letters, digits, - or _.")
+    entry = wsecrets.load_registry(wsecrets.registry_path(env)).get(mailcmd.secret_name(name))
+    if entry is None or entry.kind != imap.KIND or not isinstance(entry.options, imap.Options):
+        raise ConnectError("not_found", f"There is no mailbox {name}.", "Connect it first.")
+    return entry
+
+
+def set_on(name: str, on: bool, env: dict | None = None) -> dict:
+    """Switch a mailbox on (its `[mail.NAME]` table back in the profile) or off (the table out; its stored password and
+    registry entry stay, so on again needs no password). On needs a password that a connect has proven."""
+    entry = _entry_for(name, env)
+    if on:
+        if name not in _checked(env) or entry.name not in wsecrets.local_store(env).names():
+            raise ConnectError("needs_login", f"{name} has no password that has logged in yet.", "Fix its login first.")
+        p = HOSTS.get(entry.options.host)
+        mailcmd.write_profile(name, p.kind if p else "imap")
+    else:
+        mailcmd.remove_profile(name)
+    return {"mailbox": name, "on": on}
+
+
+def disconnect(name: str, env: dict | None = None) -> dict:
+    """Take the mailbox out of ws: its profile table, its stored password and its checked mark go. The registry entry
+    stays (ws never removes one); connecting again re-uses it."""
+    entry = _entry_for(name, env)
+    mailcmd.remove_profile(name)
+    forgot = wsecrets.local_store(env).delete(entry.name)
+    path = _checked_file(env)
+    with _locked(path):
+        doc = _checked(env)
+        if doc.pop(name, None) is not None:
+            _write_recent(path, doc)  # type: ignore[arg-type]
+    return {"mailbox": name, "disconnected": True, "password_forgotten": forgot, "registry_entry_kept": entry.name}

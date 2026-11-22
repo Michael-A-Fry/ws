@@ -95,6 +95,7 @@ SCHEMA: dict = {
         "approval",
         "run_key",
         "chain_depth",
+        "input_sha256",
     ],
     "properties": {
         "schema": {
@@ -301,6 +302,11 @@ SCHEMA: dict = {
             "type": ["integer", "null"],
             "minimum": 0,
             "description": "How many jobs started this one: 0 for a person's or a timer's run; a chain stops at its cap.",
+        },
+        "input_sha256": {
+            "type": ["string", "null"],
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "The sha256 of the job's input file as it was read; null for a job with no input.",
         },
     },
 }

@@ -15,8 +15,8 @@ Schema 3 later gained, without a new number (a record only gains fields): the st
 that held the run was gone before it finished: SIGKILL, OOM, power loss; what it did is not known), `stop_subtype`
 (the runner's own word for how it stopped, kept as it said it), `fault` (`provider` when the model's service failed:
 unavailable, rate-limited or refused the request as invalid), `retry_after_s`, `approval` (the switch setting and the
-words of the permission a run acted under), `run_key` (one net effect per job and trigger) and `chain_depth` (how many
-jobs started this one). Two rules hold at `append`, the one door every record goes through: a turn or budget stop is
+words of the permission a run acted under), `run_key` (one net effect per job and trigger), `chain_depth` (how many
+jobs started this one) and `input_sha256` (the sha256 of the job's `input` file as it was read). Two rules hold at `append`, the one door every record goes through: a turn or budget stop is
 never `ok`, and an `ok` names no fault.
 """
 
@@ -74,6 +74,7 @@ KEYS = (
     "approval",
     "run_key",
     "chain_depth",
+    "input_sha256",
 )
 GREEN_LEVELS = ("targeted", "package", "full", "merge_ready")
 TOKEN_KEYS = ("input", "output", "cache_creation", "cache_read")

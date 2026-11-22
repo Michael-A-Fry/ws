@@ -18,6 +18,15 @@ body of the GitHub release.
   switch one off or take it out. (C666)
 - `ws mail connect --web`: the Connect mail page on this machine's loopback, over `ws.mailconnect`. The page lists
   the mailboxes, takes a name, address, provider and app password, and says in place whether it connected. (C666)
+- A local provider's models (`runner_options.provider.models.<id>`) may set `tool_call = false` and
+  `options.reasoningEffort` of `none`, `minimal` or `low`, so a small model can run a job without tools and with
+  little reasoning. `tool_call = true` and the higher efforts are refused (they widen), as is every other new key.
+  Checked at `ws job add` and again at `ws run`. (C635)
+- A job file's `input` names one file inside the job's `cwd`. `ws run` reads it at each run, for every runner, without
+  following a link, at most 64 KiB of UTF-8, and puts it after the prompt as untrusted data in the delimited,
+  defused block `ws mail` uses. A missing or unfit file refuses the run. The run record gains `input_sha256`. It
+  replaces data kept in a project `AGENTS.md` or `CLAUDE.md`, which an OpenCode job doesn't read (checked on
+  OpenCode 1.19.4).
 
 ### Fixed
 

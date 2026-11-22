@@ -26,8 +26,10 @@ body of the GitHub release.
   service, and a rescue timer and service) that run the `ws` command in the installed tool's folder. `--rescue` probes the
   gate every ten minutes and goes back one release, once, after two failures in a row. The new `upgrade-service` guard
   stops a session starting, stopping or changing the units or running the `--unattended` and `--rescue` entries (the
-  upgrade adds it to an existing policy's `[guards] on` list, as it did `pane-keys`), and the four unit files are
-  protected paths of the user-scope hook.
+  upgrade adds it to an existing policy's `[guards] on` list, as it did `pane-keys`), and the four unit files, every
+  drop-in folder that could change them and the `user.control` copies are protected paths of the user-scope hook. The
+  guard also refuses globs and braces in a unit name, units fed in by `xargs`, the bus calls that do the same as
+  `systemctl`, and `daemon-reload` and the environment verbs.
 - `ws upgrade --unattended`, the entry of a systemd user service: it takes a request
   file (a release tag or `rollback`), proves the release itself from the installed wheel's trust root (a signed tag, the
   installer's and wheel's hashes and cosign bundles, green checks, no high or critical advisory in the lock), refuses a

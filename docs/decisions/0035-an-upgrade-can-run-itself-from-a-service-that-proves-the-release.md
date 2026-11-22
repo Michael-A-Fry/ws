@@ -45,6 +45,12 @@ matching their `.sha256`, each cosign bundle verifying as made by the workflow's
 on the tag's commit finished and none failed (the public API, no token), and no vulnerability of high or critical
 severity, or with no severity, in the tag's lock (`uv audit`).
 
+What a tag signature proves, and what it doesn't. The signing key is the project's own, held by the people who tag, so a
+valid tag signature shows that someone with that key tagged a commit on the main branch, not that a person reviewed and
+approved the release. The protection is the combination: the commit is on main, every check on it passed, and the
+release's files were built by the release workflow itself (the cosign identity). A leaked tag key alone doesn't pass,
+and neither does a compromised workflow alone.
+
 Checks after the swap (`ws.upgradecheck`): the new ws answers the tag, `ws upgrade --hooks-only` exits 0, and the gate
 hook written in the runner's settings, fed a Bash payload, lets `ls -la` run and stops a private-key read and a read in
 the secrets folder; the deny rules in the settings, and the must-deny probes the hook stops, are no fewer than before the

@@ -14,3 +14,4 @@
 ^.*sender="(?:x|alerts)@bank\.example".*$
 ^        upgrade, "_own_cgroup", lambda: "0::/user\.slice/user@1000\.service/app\.slice/ws-upgrade\.service\\n"$
 ^        "systemctl --user start ws-upgrade@x\.service",$
+^        "systemctl --user start foo@bar\.service",$

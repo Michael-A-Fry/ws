@@ -153,7 +153,7 @@ def test_every_route_round_the_unit_names_is_refused_for_its_own_reason(command,
         "systemctl --user restart foo.service",
         "systemctl --user stop some-other.timer",
         "systemctl --user enable --now my-backup.timer",
-        "systemctl --user start foo@bar.service",
+        "systemctl --user start foo@bar",
         "systemctl --user kill --signal=HUP foo.service",
         "systemctl --user status 'ws-*'",  # reading takes a glob
         "systemctl --user list-units 'ws-*'",

@@ -1077,7 +1077,8 @@ ws upgrade [-h] [--version TAG] [--channel {stable,rc,edge}] [--installer FILE] 
 It runs the installer, then rewrites ws's hooks with the new ws in a new process (`--hooks-only`). The rewrite touches the
 gate only: each runner whose config already holds ws's entries gets them refreshed. It switches nothing on and takes
 nothing out, and a config written without the sandbox block stays without it. The one edit to your policy: a guard that
-became a default since you wrote it (`pane-keys`, `upgrade-service`) is added to the end of an existing `[guards] on` list, once, as a text
+became a default since you wrote it (`pane-keys`, `upgrade-service`) is added to the end of an existing
+`[guards] on` list, once, as a text
 insert that keeps your comments and order, and one line says so. A policy with no `[guards]` table or `on` list, or that
 already names it, isn't touched. If the rewrite fails, the runner's config,
 the install record and the OpenCode plugin are put back as they were. Run it in a terminal of your own: a session, gated
@@ -1115,34 +1116,35 @@ finishes the job, and the exit is 1; `--json` says what happened under `broker`.
 operation, a token mint, a signature) that's in flight at that moment fails, and so does a lease asked for between the
 status reply and the stop; each caller asks again. An automatic rollback never touches the broker.
 
-
 ### Unattended upgrade
 
-`ws upgrade --unattended` and `ws upgrade --rescue` are the entries of two systemd user timers' units, never for a person
-or a session (exit 3 with any sign of a session, with no `INVOCATION_ID`, or when the parent isn't the user manager). Make
-the units with `ws upgrade --print-units [--write]` from an installed ws; their `ExecStart` is the `ws` command in the
-installed tool's folder. The design and what it proves are in
-[ADR 0035](../decisions/0035-an-upgrade-can-run-itself-from-a-service-that-proves-the-release.md).
+`ws upgrade --unattended` and `ws upgrade --rescue` are the entries of two systemd user timers' units, never for a
+person or a session (exit 3 with any sign of a session, with no `INVOCATION_ID`, or when the parent isn't the user
+manager). Make the units with `ws upgrade --print-units [--write]` from an installed ws; their `ExecStart` is the `ws`
+command in the installed tool's folder. The design and what it proves are in [ADR
+0035](../decisions/0035-an-upgrade-can-run-itself-from-a-service-that-proves-the-release.md).
 
-The request is one line in `ws-upgrade/request.json` under your state folder (`$XDG_STATE_HOME`, else `~/.local/state`): a
-release tag (`v0.1.11.8`) or the word `rollback`. Anything else is dropped and logged. The service takes the file, refuses a
-tag at or below the installed version or a second upgrade within an hour, and proves the release from the trust root of the
-installed wheel: the tag is signed by an allowed signer, `install.sh` and the wheel match their `.sha256` and each cosign
-bundle verifies as made by the release workflow, every check run on the tag's commit passed, and the tag's lock has no
-high or critical vulnerability (`uv audit`; it needs `git`, `cosign` and `uv` on the unit's PATH). It waits up to 30
-minutes for no queued or running job and no broker lease, installs with no mirror or skip-the-checks variable in the
-installer's environment, then checks the new ws answers the tag, `ws upgrade --hooks-only` exits 0, the installed gate hook
-lets `ls -la` run and stops a private-key read and a secrets-folder read, and no fewer deny rules and must-deny probes
-are stopped than before. Any failure is the automatic rollback. `--session-check COMMAND` adds a check of your own.
-`rollback` goes to the release before the last promote and nowhere else.
+The request is one line in `ws-upgrade/request.json` under your state folder (`$XDG_STATE_HOME`, else
+`~/.local/state`): a release tag (`v0.1.11.8`) or the word `rollback`. Anything else is dropped and logged. The
+service takes the file, refuses a tag at or below the installed version or a second upgrade within an hour, and proves
+the release from the trust root of the installed wheel: the tag is signed by an allowed signer, `install.sh` and the
+wheel match their `.sha256` and each cosign bundle verifies as made by the release workflow, every check run on the
+tag's commit passed, and the tag's lock has no high or critical vulnerability (`uv audit`; it needs `git`, `cosign`
+and `uv` on the unit's PATH). It waits up to 30 minutes for no queued or running job and no broker lease, installs
+with no mirror or skip-the-checks variable in the installer's environment, then checks the new ws answers the tag, `ws
+upgrade --hooks-only` exits 0, the installed gate hook lets `ls -la` run and stops a private-key read and a
+secrets-folder read, and no fewer deny rules and must-deny probes are stopped than before. Any failure is the
+automatic rollback. `--session-check COMMAND` adds a check of your own. `rollback` goes to the release before the last
+promote and nowhere else.
 
-`--rescue` runs every ten minutes from the rescue timer: it probes the gate the same way, and after two failures in a row
-goes back one release, once; if it still fails, it logs that and leaves it to you. Each outcome (promote, automatic
-rollback, rollback, a refused or dropped request, a rescue strike) is one row of `release-log.csv` in ws's state folder: `at`, `verb`,
-`from`, `to`, `duration_s`, `result`, `reason`.
+`--rescue` runs every ten minutes from the rescue timer: it probes the gate the same way, and after two failures in a
+row goes back one release, once; if it still fails, it logs that and leaves it to you. Each outcome (promote,
+automatic rollback, rollback, a refused or dropped request, a rescue strike) is one row of `release-log.csv` in ws's
+state folder: `at`, `verb`, `from`, `to`, `duration_s`, `result`, `reason`.
 
-The `upgrade-service` [guard](guards.md#upgrade-service) and the protected paths of the user-scope hook (the four unit files and
-the tool folder) keep a session from starting, stopping or changing any of it; the request file stays writable.
+The `upgrade-service` [guard](guards.md#upgrade-service) and the protected paths of the user-scope hook (the four unit
+files and the tool folder) keep a session from starting, stopping or changing any of it; the request file stays
+writable.
 
 ## `ws migrate`
 

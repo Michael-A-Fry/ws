@@ -821,6 +821,15 @@ def _run(
         return _bad_job(job.name, f"job {job.name}: {e}", log, job, record)
     if job.cwd and not cwd.is_dir():
         return _bad_job(job.name, f"job {job.name}: cwd {str(cwd)!r} is not a folder", log, job, record)
+    input_sha = None
+    if job.input:  # before the prompt is used anywhere, so the term check and every runner see the same text
+        from ws import jobs_input  # late: only a job with an input reads one
+
+        try:
+            text, input_sha = jobs_input.read(cwd.resolve(), job.input)
+        except jobs.JobError as e:
+            return _bad_job(job.name, f"job {job.name}: {e}", log, job, record)
+        job = dataclasses.replace(job, prompt=jobs_input.with_input(job.prompt, job.input, text))
     stdin = bool(getattr(adapter, "PROMPT_VIA_STDIN", False))
     if not stdin:
         argv = [*argv, "--", job.prompt]
@@ -854,6 +863,7 @@ def _run(
     )  # fmt: skip
     rec = _base_record(job, run_id, started, pol, verdict)
     rec.update(fields or {})
+    rec["input_sha256"] = input_sha
     if queued is not None:
         rec.update(run_key=queued.run_key, chain_depth=queued.chain_depth)
         extra = {**extra, **queue.chain_env(queued.run_id, queued.chain_depth)}

@@ -16,6 +16,10 @@ body of the GitHub release.
   `ws job add` takes it: an allowlisted `@ai-sdk/openai-compatible` table whose `baseURL` is `localhost` or a literal
   loopback, private or CGNAT address. It replaces a provider block in a project `opencode.json`, which a job no longer
   reads.
+- A job file's `input` names one file inside the job's `cwd`. `ws run` reads it at each run, for every runner, without
+  following a link, at most 64 KiB of UTF-8, and puts it after the prompt as untrusted data in the delimited,
+  defused block `ws mail` uses. A missing or unfit file refuses the run. The run record gains `input_sha256`. It
+  replaces data kept in a project `AGENTS.md`, which an OpenCode job doesn't read (checked on OpenCode 1.19.4).
 
 ### Changed
 

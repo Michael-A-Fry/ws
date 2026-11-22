@@ -7,6 +7,7 @@ import hashlib
 import json
 import shlex
 import subprocess
+import sys
 import tomllib
 from pathlib import Path
 
@@ -773,3 +774,31 @@ def test_install_class_gives_the_account_its_own_ws_policy_and_login(box, capsys
     step = out.split("5. ", 1)[1].split("6. ", 1)[0]
     assert "sudo -u ws-work -i" in step and "install.sh" in step and "ws setup" in step
     assert "[classes.work]" in step and "claude" in step and "sign in" in step
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="the tmpfiles rule is written on Linux with systemd")
+def test_uninstall_removes_the_tmpfiles_rule_and_its_folder_and_notes_the_systems_timer(xdg_box, capsys, monkeypatch):
+    from ws import tmpclean
+    from ws.roles import _schedule
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        osinfo, "detect", lambda *a, **k: osinfo.OSInfo("linux", "debian 13", "x86_64", "systemd", True)
+    )
+    monkeypatch.setattr(
+        tmpclean, "_real_home", lambda env: True
+    )  # the stand-in home is the account's, for the timer calls
+    monkeypatch.setattr(_schedule, "run_cmd", lambda argv: (calls.append(argv), (0, ""))[1])
+    pre = snapshot(xdg_box)
+    assert run(capsys, "install", *FULL, "--notes", str(xdg_box / "Notes"))[0] == 0
+    rule = xdg_box / ".config" / "user-tmpfiles.d" / "ws-pytest.conf"
+    entries = {e["path"]: e for e in json.loads(install.manifest_path().read_text(encoding="utf-8"))["entries"]}
+    assert entries[str(rule)]["kind"] == "file" and entries[str(rule)]["created_by_ws"] is True
+    assert entries[str(rule.parent)]["kind"] == "dir"  # the folder ws made for it is recorded too
+    assert ["systemctl", "--user", "enable", "--now", "systemd-tmpfiles-clean.timer"] in calls
+
+    code, out, _ = run(capsys, "uninstall", "--yes")
+    assert code == 0 and "left 0" in out
+    assert not rule.parent.exists() and snapshot(xdg_box) == pre
+    assert "left systemd-tmpfiles-clean.timer enabled: it is the system's" in out
+    assert not any("disable" in argv for argv in calls)  # noted, never switched off

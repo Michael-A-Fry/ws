@@ -1673,7 +1673,9 @@ An optional `[worktrees]` table in the profile:
 The test temp folder isn't pruned by ws. pytest's own `tmp_path_retention_count` and `tmp_path_retention_policy`
 are set in `pyproject.toml`, and on Linux with systemd `ws install` writes
 `~/.config/user-tmpfiles.d/ws-pytest.conf` (one `e` line) and switches on the user's `systemd-tmpfiles-clean.timer`,
-which runs it. macOS isn't handled; `ws doctor` says so (WS021).
+which runs it. macOS isn't handled; `ws doctor` says so (WS021). The rule is in the install manifest, so
+`ws uninstall` removes it and its folder once empty; the timer is the system's, so uninstall says it's left enabled and
+doesn't switch it off.
 
 ## `ws approve`
 

@@ -153,6 +153,7 @@ class Removal:
     problems: list[str] = field(default_factory=list)
     restored: list[Path] = field(default_factory=list)  # a runner's user config put back exactly as it was
     kept_edits: list[Path] = field(default_factory=list)  # a user config you changed: only ws's items came out
+    notes: list[str] = field(default_factory=list)  # what ws left running because it isn't ws's
 
 
 # ---- paths -----------------------------------------------------------------------------------------------------------
@@ -984,6 +985,8 @@ def uninstall(
     deactivate: Callable[[list[Path], Mapping[str, str]], list[str]] | None = None,
 ) -> Removal:
     """Remove what the manifest says ws created, inside the folders ws manages and nowhere else."""
+    from ws import tmpclean
+
     if not keep_data:
         raise InstallError("deleting your notes and memory is not built: ws only removes what it made")
     env = os.environ if env is None else env
@@ -1065,6 +1068,19 @@ def uninstall(
             except OSError as e:
                 removal.problems.append(f"could not remove {manifest}: {e.strerror}")
         gone.add(manifest)
+
+    for own in sorted(_ws_dirs(env), key=lambda p: -len(p.parts)):
+        # ws's own folder that `ws migrate` made without a record, and now empty, would keep a folder ws made alive
+        if (
+            own not in gone
+            and any(d in own.parents for d, _ in dirs)
+            and not own.is_symlink()
+            and own.is_dir()
+            and _owned(own)
+            and not any(own.iterdir())
+        ):
+            _rmdir(own, removal, gone, dry_run)
+    removal.notes += tmpclean.uninstall_notes(env, removal.removed)
 
     for path, _entry in sorted(dirs, key=lambda pe: (-len(pe[0].parts), str(pe[0]))):
         if path.is_symlink() or not path.is_dir():
@@ -1345,6 +1361,7 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
                 "kept_edits": [str(p) for p in r.kept_edits],
                 "left": [str(p) for p in left],
                 "problems": r.problems,
+                "notes": r.notes,
             }
         )
         return 0
@@ -1360,6 +1377,8 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
         print(f"{'would restore' if args.dry_run else 'restored'} {p} (your settings, exactly as they were)")
     for p in r.kept_edits:
         print(f"you changed it since, so ws kept your edits and took out only its own entries: {p}")
+    for note in r.notes:
+        print(f"ws: {note}")
     for problem in r.problems:
         print(f"ws: {problem}", file=sys.stderr)
     print(f"ws: {'would remove' if args.dry_run else 'removed'} {len(r.removed)}; left {len(left)}")

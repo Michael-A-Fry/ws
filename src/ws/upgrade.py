@@ -52,6 +52,18 @@ five swaps), and the promote's history line names the folder and the policy's ha
 `--rollback` of that promote restores the policy from the copy only while the policy still has that hash: a policy the
 person has edited since is theirs, so it is left and the copy is named.
 
+Unattended. `ws upgrade --unattended` is the entry of a systemd user service, never of a person or a session: it is refused
+with any sign of a session, without `INVOCATION_ID`, or when its parent is not the user manager (`unattended_refusal`), and
+that replaces the terminal test on this path only. It takes the one request in `request_path` (a tag or `rollback`, read as
+data and consumed; `ws.upgradeproof.parse_request`), refuses a tag at or below the installed version and a second upgrade
+within an hour, proves the release itself from the installed wheel's trust root (`ws.upgradeproof.verify_release`: signed
+tag, hashes and cosign bundles, green checks, no high advisory), waits up to 30 minutes for nothing to be running
+(`idle_reason`; a job is never stopped), installs the installer it proved with no mirror or skip-the-checks variable in its
+environment (`MIRROR_VARS`), and runs the acceptance checks of `ws.upgradecheck` as the check step: any problem is the
+automatic rollback above. `rollback` goes to the release before the last promote and nowhere else. Every outcome is a row
+in the release log. The installer a person's `ws upgrade` downloads is the release's own `install.sh` asset (or the file
+at that tag), never a branch (`installer_urls`).
+
 Swap note: the release is whatever the installer installs; to promote from somewhere else (a package manager, a release
 tree), pass `--installer` with your own script that takes `--version TAG`, and keep the history and the watchdog.
 
@@ -71,6 +83,7 @@ import shlex
 import shutil
 import signal
 import socket
+import sqlite3
 import struct
 import subprocess
 import sys
@@ -84,7 +97,21 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
 
-from ws import __version__, agentsession, approvals, install, jsonl, output, paths, policy, selfcmd, userconfig
+from ws import (
+    __version__,
+    agentsession,
+    approvals,
+    install,
+    jsonl,
+    output,
+    paths,
+    policy,
+    selfcmd,
+    upgradecheck,
+    upgradeproof,
+    userconfig,
+)
+from ws import version as wsversion
 from ws.output import WsError
 
 COMMAND = "upgrade"
@@ -102,7 +129,24 @@ DEFAULT_GUARDS = (
 STEP_ENV = "WS_UPGRADE_STEP"  # set for each step the upgrade runs: a hooks rewrite there leaves the log line to it
 INSTALL_TIMEOUT_S, STEP_TIMEOUT_S = 600.0, 120.0  # the watchdog per step: the installer, then the hooks and the check
 BACKUPS_DIR, BACKUPS_KEPT = "upgrade-backups", 5  # what a swap keeps of the files it may change, and how many swaps
-INSTALLER_URL = "https://raw.githubusercontent.com/Michael-A-Fry/ws/main/install.sh"
+REQUEST_WINDOW_S = 3600  # an unattended upgrade is taken at most once in this time (a rollback is not counted)
+IDLE_WAIT_S, IDLE_EVERY_S = (
+    1800.0,
+    30.0,
+)  # how long an unattended upgrade waits for nothing to run, and how often it looks
+# what an installer reads to change where a release comes from or whether it is checked; an unattended swap runs it without
+MIRROR_VARS = (
+    "WS_RELEASE_BASE_URL",
+    "WS_SKIP_VERIFY",
+    "UV_INDEX_URL",
+    "UV_DEFAULT_INDEX",
+    "UV_EXTRA_INDEX_URL",
+    "UV_FIND_LINKS",
+    "PIP_INDEX_URL",
+    "PIP_EXTRA_INDEX_URL",
+    "PIP_FIND_LINKS",
+)
+DEFAULT_REPO = "Michael-A-Fry/ws"  # where releases come from when the installed wheel carries no trust root
 _DOWNLOAD_LIMIT = 1 << 20  # bytes: install.sh is about 40 KB
 
 
@@ -302,20 +346,38 @@ def rewrite(env: Mapping[str, str], dry_run: bool = False) -> install.Result:
 # ---- swapping the binary ----------------------------------------------------------------------------------------------------
 
 
-def fetch_installer(dest: Path) -> Path:
+def installer_urls(version: str | None) -> list[str]:
+    """Where the installer for `version` is read from, best first: the release's own `install.sh` asset (the newest release
+    when no version is named), then the file at that tag in the repository. Never a branch: a branch moves, a tag does not.
+    The repository is the one the installed wheel's stamp names (`ws.version.trust_root`), else `DEFAULT_REPO`."""
+    root = wsversion.trust_root()
+    base = f"https://github.com/{root['repo'] if root else DEFAULT_REPO}"
+    if not version:
+        return [f"{base}/releases/latest/download/install.sh"]
+    tag = _tag(version)
+    return [
+        f"{base}/releases/download/{tag}/install.sh",
+        f"{base.replace('//github.com', '//raw.githubusercontent.com')}/{tag}/install.sh",
+    ]
+
+
+def fetch_installer(dest: Path, version: str | None = None) -> Path:
     """Download install.sh into `dest` (a folder of its own) and return the file. https only; a file that does not look like
-    the installer is not kept."""
-    if not INSTALLER_URL.startswith("https://"):
-        raise WsError("failed", "the installer address is not https", "use --installer with a copy you have checked")
-    try:
-        with urllib.request.urlopen(INSTALLER_URL, timeout=30) as resp:
-            data = resp.read(_DOWNLOAD_LIMIT + 1)
-    except OSError as e:
+    the installer is not kept. The unattended service never comes here: it installs the file it has proved."""
+    data, error = b"", None
+    for url in installer_urls(version):
+        try:
+            with urllib.request.urlopen(url, timeout=30) as resp:
+                data = resp.read(_DOWNLOAD_LIMIT + 1)
+            break
+        except OSError as e:
+            error = e
+    else:
         raise WsError(
             "failed",
-            f"could not download the installer ({type(e).__name__})",
+            f"could not download the installer ({type(error).__name__})",
             "check the network, or pass --installer with a copy of install.sh (docs/how-to/install.md)",
-        ) from e
+        ) from error
     if len(data) > _DOWNLOAD_LIMIT or not data.startswith(b"#!/usr/bin/env bash"):
         raise WsError(
             "failed", "what came back is not the ws installer", "pass --installer with a copy you have checked"
@@ -468,6 +530,8 @@ def _step_limit(args: argparse.Namespace) -> float:
 
 def _installer_argv(script: Path, args: argparse.Namespace) -> list[str]:
     argv = ["bash", str(script), "--skip-smoke-test"]
+    if getattr(args, "unattended", False):  # the installer runs without any way to move its source or skip its checks
+        argv = ["env", *(w for name in MIRROR_VARS for w in ("-u", name)), *argv]
     if args.version:
         argv += ["--version", args.version]
     if args.channel:
@@ -564,7 +628,7 @@ def _using(args: argparse.Namespace, new: NewWs) -> None:
 
 def swap(args: argparse.Namespace, scratch: Path) -> Ran:
     """Run the installer under its watchdog."""
-    script = Path(args.installer).expanduser() if args.installer else fetch_installer(scratch)
+    script = Path(args.installer).expanduser() if args.installer else fetch_installer(scratch, args.version)
     if not script.is_file():
         raise WsError("failed", f"{script} is not a file", "pass --installer with a copy of install.sh")
     limit = getattr(args, "install_timeout", None) or INSTALL_TIMEOUT_S
@@ -951,6 +1015,16 @@ def _both(args: argparse.Namespace, env: Mapping[str, str]) -> int:
             f"to go back to ws {before}, run the installer with --version v{before}",
         )
         return EXIT_FAILED
+    check_fn = getattr(args, "check_fn", None)
+    if check_fn:  # the unattended service's own checks (`ws.upgradecheck.acceptance`), run in this process
+        t = time.monotonic()
+        problems = check_fn(new)
+        tail = tuple(problems[:TAIL_LINES])
+        log_step(args, env, "check", Ran(1 if problems else 0, tail=tail), time.monotonic() - t)
+        for line in problems:
+            _say(args, f"check: {line}")
+        if problems:
+            return _auto_rollback(args, env, before, f"the check found {len(problems)} problem(s)", held)
     check = getattr(args, "check", None)
     if check:
         _say(args, f"checking the new release: {check}")
@@ -1064,10 +1138,157 @@ def _rollback(args: argparse.Namespace, env: Mapping[str, str]) -> int:
     return 0 if broker_state in BROKER_DONE else EXIT_FAILED
 
 
+# ---- unattended: the service's own upgrade ----------------------------------------------------------------------------------
+
+
+def request_path(env: Mapping[str, str]) -> Path:
+    """Where the one-line request file is dropped: outside every protected root on purpose (the request is a wish)."""
+    base = env.get("XDG_STATE_HOME") or str(Path(env.get("HOME") or os.path.expanduser("~")) / ".local" / "state")
+    return Path(base) / "ws-upgrade" / "request.json"
+
+
+def _parent_comm(pid: int) -> str | None:
+    try:
+        return Path(f"/proc/{pid}/comm").read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+
+
+def unattended_refusal(env: Mapping[str, str], parent_comm: str | None = None) -> str | None:
+    """Why `--unattended` is refused, or None: no sign of a session, a systemd invocation (`INVOCATION_ID`), and the user
+    manager as the parent. It replaces the terminal test on this path only; everything else still fails towards refusing."""
+    signs = session_signs(env)
+    if signs:
+        return f"ws upgrade --unattended is for the service, not for a session ({signs[0]} is set here)"
+    if not env.get("INVOCATION_ID"):
+        return "ws upgrade --unattended runs only from its systemd unit (no INVOCATION_ID here)"
+    comm = parent_comm if parent_comm is not None else _parent_comm(os.getppid())
+    if comm != "systemd":
+        return f"ws upgrade --unattended runs only from its systemd unit (the parent here is {comm or 'unknown'})"
+    return None
+
+
+def idle_reason(env: Mapping[str, str]) -> str | None:
+    """Why a swap can't start now, or None when nothing is running: a queued or running job (`queue.Ledger.receipts`) or a
+    broker with a lease out. A job is never stopped to make room, and what can't be read counts as busy."""
+    from ws import queue
+
+    try:
+        active = queue.Ledger(paths.state_dir(dict(env))).receipts(active_only=True)
+    except (queue.StoreError, OSError, sqlite3.Error) as e:  # a store that cannot be read is no evidence of idle
+        return f"the queue could not be read ({type(e).__name__})"
+    if active:
+        return f"{len(active)} queued or running job(s)"
+    try:
+        leases = ask_broker(broker_socket(env)).status.get("leases")
+    except (OSError, ValueError):
+        return None  # no broker answering: nothing holds a lease
+    return None if leases == 0 else f"the broker has {leases} lease(s) open"
+
+
+def wait_idle(env: Mapping[str, str], sleep=time.sleep, now=time.monotonic) -> None:
+    """Poll `idle_reason` every `IDLE_EVERY_S` seconds for up to `IDLE_WAIT_S`; raise `Refused` with the last reason."""
+    end = now() + IDLE_WAIT_S
+    while (why := idle_reason(env)) is not None:
+        if now() >= end:
+            raise upgradeproof.Refused(f"still busy after {IDLE_WAIT_S / 60:.0f} minutes ({why}); nothing was changed")
+        sleep(IDLE_EVERY_S)
+
+
+def _recent_promote(env: Mapping[str, str], now: float) -> bool:
+    """Did the service swap (and keep the result, or roll it back) within `REQUEST_WINDOW_S` of `now`? A refused request
+    changed nothing and is not counted."""
+    from datetime import datetime
+
+    for row in reversed(upgradecheck.last_rows(env)):
+        if row["verb"] in ("promote", "auto-rollback") and row["result"] in ("ok", "rolled-back"):
+            try:
+                return now - datetime.fromisoformat(row["at"]).timestamp() < REQUEST_WINDOW_S
+            except ValueError:
+                return False
+    return False
+
+
+def _log(args: argparse.Namespace, env: Mapping[str, str], t0: float, verb: str, to: str | None, result: str, why: str):
+    upgradecheck.log_row(env, verb, __version__, to, time.monotonic() - t0, result, why)
+    _say(args, " ".join(w for w in (verb, to or "", f"{result}:" if why else result, why) if w))
+
+
+def cmd_unattended(args: argparse.Namespace, env: Mapping[str, str], source=None, sleep=time.sleep) -> int:
+    """`ws upgrade --unattended`: take the one request in `request_path`, prove it, wait for idle, swap, check, and roll
+    back on any failure. The request is read as data and consumed; every outcome is a row in the release log."""
+    why = unattended_refusal(env) or agentsession.refusal(env, False, False)
+    if why:
+        raise WsError("refused", why, "it is started by `ws-upgrade.service`, not by hand", EXIT_REFUSED)
+    args.log_verb = "unattended"
+    t0 = time.monotonic()
+    req = request_path(env)
+    try:
+        text = req.read_text(encoding="utf-8", errors="replace")
+        req.unlink(missing_ok=True)  # taken: the unit's path watch must not fire for it again
+    except OSError:
+        _say(args, "no request to act on")
+        return 0
+    want = upgradeproof.parse_request(text)
+    if want is None:
+        _log(args, env, t0, "request", None, "dropped", "not a release tag or the word rollback")
+        return 0
+    rolling = want == upgradeproof.ROLLBACK
+    try:
+        return (
+            _unattended_rollback(args, env, t0) if rolling else _unattended_upgrade(args, env, want, t0, source, sleep)
+        )
+    except upgradeproof.Refused as r:
+        _log(args, env, t0, "rollback" if rolling else "promote", None if rolling else want, "refused", str(r))
+        return EXIT_REFUSED
+
+
+def _unattended_upgrade(args, env, tag: str, t0: float, source, sleep) -> int:
+    upgradeproof.refuse_old(tag, __version__)
+    if _recent_promote(env, time.time()):
+        raise upgradeproof.Refused(f"an upgrade was done in the last {REQUEST_WINDOW_S // 60} minutes; one at a time")
+    root = wsversion.trust_root()
+    if root is None:
+        raise upgradeproof.Refused(
+            "this ws carries no trust root (it was built before the release workflow stamped one)"
+        )
+    wait_idle(env, sleep)
+    src = source or upgradeproof.GitHub(root["repo"])
+    with tempfile.TemporaryDirectory(prefix="ws-upgrade-") as scratch:
+        os.chmod(scratch, 0o700)
+        installer = upgradeproof.verify_release(tag, root, src, Path(scratch), env)
+        before = upgradecheck.snapshot(env)
+        args.installer, args.version, args.channel, args.log_verb = str(installer), tag, None, "upgrade"
+        session_check = getattr(args, "session_check", None)
+        args.check_fn = lambda new: upgradecheck.acceptance(env, tag, new.argv, before, session_check)
+        mark = len(history(env))
+        code = _both(args, env)
+    last = history(env)[-1] if len(history(env)) > mark else {}
+    verb = last.get("verb") or "promote"
+    _log(args, env, t0, verb, tag, "ok" if code == 0 else "failed" if verb == "promote" else "rolled-back", "")
+    return code
+
+
+def _unattended_rollback(args, env, t0: float) -> int:
+    """`rollback` goes to the release before the last promote and nowhere else; a request never names a tag."""
+    target = previous_release(env)
+    if target is None:
+        raise upgradeproof.Refused("there is no earlier release on record to go back to")
+    args.version, args.rollback, args.log_verb = None, True, "rollback"
+    code = _rollback(args, env)
+    problems = upgradecheck.acceptance(env, target, installed_ws(env).argv, {}) if code == 0 else []
+    _log(args, env, t0, "rollback", target, "ok" if code == 0 and not problems else "failed", "; ".join(problems))
+    return code or (EXIT_FAILED if problems else 0)
+
+
 def cmd_upgrade(args: argparse.Namespace) -> int:
     env = os.environ
-    why = refusal(env, sys.stdin.isatty() or args.dry_run) or agentsession.refusal(
-        env, sys.stdin.isatty(), sys.stdout.isatty()
+    if getattr(args, "unattended", False):
+        return cmd_unattended(args, env)
+    # the hooks step of an unattended swap is this command in a child of the service: no terminal, the service's invocation
+    child = bool(args.hooks_only and env.get(STEP_ENV) and env.get("INVOCATION_ID"))
+    why = refusal(env, sys.stdin.isatty() or args.dry_run or child) or agentsession.refusal(
+        env, sys.stdin.isatty() or child, sys.stdout.isatty() or child
     )
     if why:
         raise WsError("refused", why, "run `ws upgrade` yourself, in a terminal of your own", EXIT_REFUSED)
@@ -1092,6 +1313,12 @@ def register(sub) -> None:
     u.add_argument("--hooks-only", action="store_true", help="rewrite the hooks only; a newer ws is already installed")
     u.add_argument("--dry-run", action="store_true", help="show what would change and change nothing")
     u.add_argument("--rollback", action="store_true", help="put the previous release back (or --version TAG)")
+    u.add_argument(
+        "--unattended", action="store_true", help=argparse.SUPPRESS
+    )  # the systemd unit's entry (ws.upgradeproof)
+    u.add_argument(
+        "--session-check", metavar="COMMAND", help="after an unattended swap, run this as well; non-zero rolls it back"
+    )
     u.add_argument("--check", metavar="COMMAND", help="run this after the swap; a non-zero exit rolls the swap back")
     u.add_argument("--step-timeout", type=float, metavar="SECONDS", help="limit for the hooks step and the check (120)")
     u.add_argument("--install-timeout", type=float, metavar="SECONDS", help="limit for the installer (600)")

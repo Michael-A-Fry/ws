@@ -175,17 +175,66 @@ def served():
     srv = LoopbackServer(get, post, server_version="ws-test", idle_seconds=30)
     out: dict = {}
     t = threading.Thread(target=lambda: out.update(result=srv.serve()), daemon=True)
+    srv._the = t  # DIAG
     t.start()
     yield srv, out, seen
     srv.close()
     t.join(5)
 
 
+def _diag(srv, exc):  # DIAG
+    import os, subprocess, time  # noqa
+
+    now = time.monotonic()
+    lines = [
+        f"DIAG refused: {exc!r}",
+        f"done={srv._done.is_set()} since_last={now - srv._last:.3f}s idle_seconds={srv.idle_seconds}",
+    ]
+    lines.append(
+        f"exit_reason={getattr(srv, 'exit_reason', None)} exited_ago={now - getattr(srv, 'exit_at', now):.3f}s"
+    )
+    lines.append(
+        f"sockfd={srv.httpd.socket.fileno()} port={srv.port} pid={os.getpid()} threads={threading.active_count()}"
+    )
+    t = getattr(srv, "_the", None)
+    lines.append(f"serve thread alive={t.is_alive() if t else None}")
+    lines.append(f"max loop gap in sampler: {_GAP}")
+    for cmd in (["netstat", "-an", "-p", "tcp"], ["lsof", "-nP", "-iTCP", "-a", "-p", str(os.getpid())]):
+        try:
+            out = subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=20).stdout.splitlines()
+            keep = [x for x in out if str(srv.port) in x or x.startswith("COMMAND")]
+            lines.append(f"{cmd[0]}: " + " | ".join(keep[:12]) + f" (total {len(out)} lines)")
+        except Exception as e:  # noqa
+            lines.append(f"{cmd[0]} failed {e!r}")
+    return "\n".join(lines)
+
+
+_GAP = [0.0, 0.0]  # DIAG
+
+
+def _sampler():  # DIAG
+    import time
+
+    last = time.monotonic()
+    while True:
+        time.sleep(0.1)
+        now = time.monotonic()
+        if now - last > _GAP[0]:
+            _GAP[:] = [now - last, now]
+        last = now
+
+
+threading.Thread(target=_sampler, daemon=True).start()  # DIAG
+
+
 def _req(srv, method, path, body=None, headers=None):
     conn = http.client.HTTPConnection("127.0.0.1", srv.port, timeout=5)
     h = {"Host": f"127.0.0.1:{srv.port}", **(headers or {})}
     try:
-        conn.request(method, path, body=body, headers=h)
+        try:
+            conn.request(method, path, body=body, headers=h)
+        except ConnectionRefusedError as e:  # DIAG
+            raise AssertionError(_diag(srv, e)) from e
         r = conn.getresponse()
         return r.status, r.read(), dict(r.getheaders())
     finally:

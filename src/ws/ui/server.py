@@ -249,15 +249,23 @@ class LoopbackServer:
     def serve(self) -> Any:
         self.httpd.timeout = 0.2
         try:
+            self.exit_reason = "loop"  # DIAG
             while not self._done.is_set():
                 self.httpd.handle_request()
                 if self.hold is not None and self.hold():
                     self._last = time.monotonic()
                 if time.monotonic() - self._last > self.idle_seconds:
+                    self.exit_reason = f"idle gap={time.monotonic() - self._last:.2f}"  # DIAG
                     break
+            else:
+                self.exit_reason = "done"  # DIAG
             if self._done.is_set():
                 time.sleep(0.4)  # let the reply reach the page before the socket goes
+        except BaseException as e:  # DIAG
+            self.exit_reason = f"raised {e!r}"  # DIAG
+            raise  # DIAG
         finally:
+            self.exit_at = time.monotonic()  # DIAG
             self.httpd.server_close()
         return self.result
 

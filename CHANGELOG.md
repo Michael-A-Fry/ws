@@ -24,7 +24,7 @@ body of the GitHub release.
   `ws.version.trust_root()` reads from the installed wheel and nowhere else. A release with no signer key isn't
   published. `ws version` is unchanged. This is the base for an upgrade that proves a release itself.
 
-## [0.1.11.6] - 2026-11-22
+## [0.1.11.7] - 2026-11-22
 
 ### Added
 
@@ -44,6 +44,20 @@ body of the GitHub release.
 - Jobs: `command = "triage"` schedules `ws triage run --job NAME` from a `[triage]` table in the job file, and a schedule
   may carry a window, `every 30m 05:00-22:00` (whole hours, both ends included; two `OnCalendar=` lines on systemd, one
   calendar entry per run on launchd).
+
+### Fixed
+
+- The loopback page server counted idle time from when it was built, and building it asked DNS for the host name (a
+  reverse lookup that can stall for tens of seconds on a macOS runner), so it could close before its first request and
+  `tests/test_ui.py` failed with `ConnectionRefusedError` about half the runs there. Idle time now counts from the start
+  of `serve()`, and the constructor no longer looks the name up.
+
+- `ws mail`: `Mail.search` passes `after_uid` through as given, so the broker refuses a bool, a string or a fraction
+  instead of quietly turning it into a number.
+
+## [0.1.11.6] - 2026-11-22
+
+### Added
 
 - `ws.mailconnect`: connect a mailbox from a page. It tries the app password with one read-only login before it
   writes anything, then stores it, adds `[mail.NAME]` and, for Gmail, Outlook or iCloud, appends a missing registry

@@ -94,7 +94,9 @@ def test_in_the_xdg_layout_each_file_lands_in_its_folder_and_uninstall_leaves_no
 def test_in_the_old_layout_install_keeps_using_the_old_folder(xdg_box, capsys):
     (xdg_box / ".ws").mkdir()
     assert run(capsys, "install", *FULL, "--notes", str(xdg_box / "Notes"))[0] == 0
-    assert (xdg_box / ".ws" / "policy.toml").is_file() and not (xdg_box / ".config").exists()
+    assert (xdg_box / ".ws" / "policy.toml").is_file()
+    # the only thing under ~/.config is systemd's own folder for the pytest temp age rule, never a ws folder
+    assert {p.name for p in (xdg_box / ".config").glob("*")} <= {"user-tmpfiles.d"}
 
 
 def test_uninstall_removes_empty_run_folders_in_the_work_folder_and_keeps_what_a_job_wrote(xdg_box, capsys):

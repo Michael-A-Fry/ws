@@ -6,6 +6,8 @@
                                         with none of the three is refused at start, naming the job
     prompt = "..."                      or prompt_file = "daily.md" (relative to the jobs folder)
     cwd = "~/work/thing"                default: an empty folder made for the run
+    input = "inbox/today.md"            optional, needs a cwd: one file inside it, read at run time (no link, at most
+                                        64 KiB of UTF-8) and put after the prompt as untrusted data (ws.jobs_input)
     timeout_s = 900
     max_turns = 12                      optional
     bare = true                         headless default: no hooks, plugins or auto-discovered context
@@ -102,6 +104,7 @@ KEYS = {
     "prompt",
     "prompt_file",
     "cwd",
+    "input",
     "timeout_s",
     "max_turns",
     "bare",
@@ -209,6 +212,7 @@ class Job:
     model: str | None  # None only from `loads` of a job that names none; `load` fills it or refuses
     prompt: str
     cwd: str | None = None
+    input: str | None = None  # a file inside cwd, read at run time (ws.jobs_input)
     timeout_s: float = DEFAULT_TIMEOUT_S
     max_turns: int | None = None
     bare: bool = True
@@ -564,6 +568,7 @@ def loads(name: str, text: str, base: Path, where: str | None = None) -> Job:
         model=model,
         prompt=prompt,
         cwd=_string(d, "cwd", where),
+        input=_input(d, where),
         timeout_s=_number(d, "timeout_s", where, DEFAULT_TIMEOUT_S),
         max_turns=_number(d, "max_turns", where, None, integer=True),
         bare=bare,
@@ -615,6 +620,20 @@ def _checkpoint(d: dict, where: str) -> str | None:
     if c is not None and (os.path.isabs(c) or ".." in Path(c).parts):
         raise JobError(f"{where}: checkpoint must be a file name inside the job's cwd, not {c!r}")
     return c
+
+
+def _input(d: dict, where: str) -> str | None:
+    """The `input` key: a relative path with no `..`, inside a job that has a cwd. Whether the file is there, is a
+    regular file and fits is checked when the job runs (ws.jobs_input), because the data is meant to change."""
+    i = _string(d, "input", where)
+    if i is None:
+        return None
+    if d.get("cwd") is None:
+        raise JobError(f"{where}: input names a file inside the job's cwd, so give the job a cwd")
+    parts = Path(i).parts
+    if not i.strip() or os.path.isabs(i) or i.startswith("~") or ".." in parts or "\0" in i or "\\" in i:
+        raise JobError(f"{where}: input must be a file path relative to the job's cwd, with no '..', not {i!r}")
+    return i
 
 
 def parse_deadline(v, where: str) -> datetime | None:

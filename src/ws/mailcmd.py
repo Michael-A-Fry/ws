@@ -8,6 +8,8 @@ no tmux works), then logs in read-only through the broker and prints the folders
 is tidied for its host first (a Gmail app password loses the spaces Google shows), and a value that was just stored and
 the server refuses (`login_refused`) is taken out again; any other failure keeps it. A missing drafts folder is said out loud: drafts are refused until there is one.
 
+`ws mail connect --web` serves the same as one local page (ws.mailweb over ws.mailconnect).
+
 `ws mail check` logs in read-only (LIST) to every mailbox and says ok or why not; exit 1 when any fails. `ws mail rm
 NAME` takes the profile table out; the registry entry and the stored password stay, and it prints how to remove them.
 No command here prints a password or takes one as an argument: the value goes from the person's prompt to the store.
@@ -60,8 +62,8 @@ def _registry() -> dict:
         raise WsError("bad_config", str(e), f"fix {wsecrets.registry_path()}") from None
 
 
-def _write_profile(name: str, kind: str) -> bool:
-    path = profile.profile_path()
+def write_profile(name: str, kind: str, env: dict | None = None) -> bool:
+    path = profile.profile_path(env)
     try:
         doc = profile.load(path) or {}
     except profile.ProfileError as e:
@@ -127,7 +129,7 @@ def cmd_add(args: argparse.Namespace) -> int:
             print(f"ws: nothing written yet. Add this to {wsecrets.registry_path()}, then run this again:")
             print(block, end="")
         return 1
-    data["profile_written"] = _write_profile(name, args.kind)
+    data["profile_written"] = write_profile(name, args.kind)
     client = mail.Mail.from_profile()
     try:
         found = client.folders(name)
@@ -185,25 +187,53 @@ def cmd_check(args: argparse.Namespace) -> int:
     return 1 if bad else 0
 
 
-def cmd_rm(args: argparse.Namespace) -> int:
-    path = profile.profile_path()
+def remove_profile(name: str, env: dict | None = None) -> str | None:
+    """Take `[mail.NAME]` out of the profile; returns its secret name, or None when there was no such table."""
+    path = profile.profile_path(env)
     try:
         doc = profile.load(path) or {}
     except profile.ProfileError as e:
         raise WsError("bad_config", str(e), f"fix {path}") from None
     known = mail.parse_mailboxes(doc, str(path))  # the whole [mail] table validates, or nothing is changed
-    if args.name not in known:
-        raise WsError("not_found", f"no mailbox {args.name!r} in {path}", "`ws mail check` lists them", 2)
+    if name not in known:
+        return None
     boxes = doc["mail"]
-    secret = boxes.pop(args.name)["secret"]
+    secret = boxes.pop(name)["secret"]
     if not boxes:
         doc.pop("mail")
     profile.write_if_changed(path, doc)
+    return secret
+
+
+def cmd_rm(args: argparse.Namespace) -> int:
+    secret = remove_profile(args.name)
+    if secret is None:
+        raise WsError(
+            "not_found", f"no mailbox {args.name!r} in {profile.profile_path()}", "`ws mail check` lists them", 2
+        )
     left = f"the registry entry [{secret}] and its stored value are kept: `ws secret rm {secret}` and edit the registry"
     if args.json:
         output.result({"mailbox": args.name, "removed": True, "secret": secret})
     else:
         print(f"ws: removed [mail.{args.name}]; {left}")
+    return 0
+
+
+def cmd_connect(args: argparse.Namespace) -> int:
+    if not args.web:
+        raise WsError(
+            "usage", "`ws mail connect` is the page: add --web", "on a terminal, `ws mail add` does the same", 2
+        )
+    from ws import mailweb
+
+    server = mailweb.build_server()
+    print(f"ws: Connect mail is open at {server.url}")
+    print("It listens on this machine only and closes after 10 idle minutes or on Close.")
+    if args.open:
+        import webbrowser
+
+        webbrowser.open(server.url)
+    server.serve()
     return 0
 
 
@@ -226,6 +256,10 @@ def register(sub) -> None:
     a.add_argument("--port", type=int, default=993, help="IMAP over TLS (default 993)")
     a.add_argument("--timeout", type=float, default=secretportal.DEFAULT_WAIT_S, help="seconds to wait for the paste")
     a.set_defaults(func=cmd_add)
+    w = ms.add_parser("connect", help="the Connect mail page: check an app password, then store it and add the mailbox")
+    w.add_argument("--web", action="store_true", help="serve the page on this machine's loopback (required)")
+    w.add_argument("--open", action="store_true", help="open it in this machine's browser")
+    w.set_defaults(func=cmd_connect)
     c = ms.add_parser("check", help="log in read-only to every mailbox: ok or why not")
     c.set_defaults(func=cmd_check)
     r = ms.add_parser("rm", help="take a mailbox out of the profile (its registry entry and password stay)")

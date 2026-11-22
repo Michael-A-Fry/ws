@@ -37,5 +37,6 @@ decisions weren't about the engine.
 | [0031](0031-an-upgrade-keeps-a-way-back-and-a-watchdog-per-step.md) | An upgrade keeps a way back and a watchdog on each step | accepted | 2026-11-14 |
 | [0032](0032-lead-only-reaches-a-walled-class-and-cards-cross-the-account-wall.md) | Lead-only lets the lead into a walled class, and fixed-kind cards cross the account wall by a spool | accepted | 2026-11-21 |
 | [0033](0033-a-setup-step-is-data-walked-by-one-engine.md) | A setup step only a person can do is data, walked by one engine | accepted | 2026-11-21 |
+| [0034](0034-a-mailbox-is-connected-from-a-page-and-ws-may-append-its-registry-entry.md) | A mailbox is connected from a page, and ws may append its registry entry for a known provider | accepted | 2026-11-22 |
 
 To add one, copy the newest record, take the next number and add a row here.

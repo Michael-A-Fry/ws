@@ -8,6 +8,18 @@ body of the GitHub release.
 
 ## [Unreleased]
 
+### Added
+
+- `ws.mailconnect`: connect a mailbox from a page. It tries the app password with one read-only login before it
+  writes anything, then stores it, adds `[mail.NAME]` and, for Gmail, Outlook or iCloud, appends a missing registry
+  entry. A refusal stores nothing and is typed (`bad_credentials`, `app_password_required`, `imap_off`,
+  `web_login_required`) with ws's own words. Three refusals for one account (host and login) in 15 minutes stop the
+  next try before it dials. `known()` lists the mailboxes and when each last logged in; `set_on()` and `disconnect()`
+  switch one off or take it out. (C666)
+
+- `ws mail connect --web`: the Connect mail page on this machine's loopback, over `ws.mailconnect`. The page lists
+  the mailboxes, takes a name, address, provider and app password, and says in place whether it connected. (C666)
+
 ## [0.1.11.5] - 2026-11-22
 
 ### Added

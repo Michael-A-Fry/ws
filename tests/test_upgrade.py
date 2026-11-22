@@ -14,6 +14,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -1404,3 +1405,84 @@ def test_the_hooks_rewrite_migrates_the_policy_and_prints_one_line(old, box, cap
     assert '"pane-keys"' in path.read_text(encoding="utf-8")
     cli.main(["upgrade", "--hooks-only"])
     assert capsys.readouterr().out.count("pane-keys") == 0 and path.read_text(encoding="utf-8").count("pane-keys") == 1
+
+
+# --- C706: a way back puts the policy back too, so the release it returns to can still load it -----------------------------
+
+A_GUARDS = {"syntax-check", "session-context", "dev-server"}  # what the release being left knows; pane-keys is new in B
+
+
+def a_policy() -> Path:
+    """The tmp policy as release A wrote it: no `pane-keys` in `[guards] on` (B adds it, as `DEFAULT_GUARDS` says)."""
+    path = policy.policy_path(dict(os.environ))
+    text = path.read_text(encoding="utf-8")
+    assert ', "pane-keys"' in text
+    path.write_text(text.replace(', "pane-keys"', ""), encoding="utf-8")
+    return path
+
+
+def a_loads(path: Path) -> bool:
+    """Release A's loader fails closed on a guard name it does not know (the 22 Nov incident)."""
+    on = tomllib.loads(path.read_text(encoding="utf-8"))["guards"]["on"]
+    return set(on) <= A_GUARDS
+
+
+@pytest.fixture
+def two_releases(cutover, old, monkeypatch):
+    """B's hooks step is the real rewrite (it adds the guard); A's, after the way back, loads the policy as A would."""
+    path = a_policy()
+    seen: dict = {"policy_at_check": None}
+
+    def run(argv, capture, timeout=None):
+        if argv[0] == "healthprobe":
+            seen["policy_at_check"] = path.read_text(encoding="utf-8")
+            return upgrade.Ran(1)
+        if len(cutover) >= 2:  # the installer has been asked for A again: this hooks step is A's
+            return upgrade.Ran(0 if a_loads(path) else 1)
+        return upgrade.Ran(cli.main(argv[len(selfcmd.argv()) :]))
+
+    monkeypatch.setattr(upgrade, "_run", run)
+    return path, seen
+
+
+def test_a_failed_check_puts_the_policy_back_and_the_old_release_still_loads_it(two_releases, capsys):
+    path, seen = two_releases
+    before = path.read_bytes()
+    assert cli.main(["upgrade", "--check", "healthprobe"]) == 1  # rolled back: 1, never 4 (not restored)
+    assert '"pane-keys"' in seen["policy_at_check"]  # B really had added the guard when the check failed
+    assert path.read_bytes() == before and a_loads(path)
+    assert _history() == [("auto-rollback", __version__, __version__)]
+    out = capsys.readouterr().out
+    assert "back as they were before the upgrade" in out and "rolled back" in out
+
+
+def test_a_manual_rollback_puts_the_policy_back_when_it_is_still_the_one_the_upgrade_left(two_releases, capsys):
+    path, _ = two_releases
+    before = path.read_bytes()
+    assert cli.main(["upgrade"]) == 0
+    assert b'"pane-keys"' in path.read_bytes()
+    last = upgrade.history(os.environ)[-1]
+    assert last["verb"] == "promote" and Path(last["backup"], "index.json").is_file() and last["policy_sha"]
+    assert cli.main(["upgrade", "--rollback"]) == 0
+    assert path.read_bytes() == before and a_loads(path)
+
+
+def test_a_manual_rollback_leaves_a_policy_the_person_edited_since_and_says_so(two_releases, capsys):
+    path, _ = two_releases
+    assert cli.main(["upgrade"]) == 0
+    path.write_text(path.read_text(encoding="utf-8") + "# mine, written after the upgrade\n", encoding="utf-8")
+    edited = path.read_bytes()
+    capsys.readouterr()
+    assert cli.main(["upgrade", "--rollback"]) == 1  # A's loader still refuses the guard: the person is told how
+    assert path.read_bytes() == edited
+    assert "changed after the upgrade, so it is left" in capsys.readouterr().out
+
+
+def test_the_swap_keeps_only_the_newest_backups(old, monkeypatch):
+    monkeypatch.setattr(upgrade, "BACKUPS_KEPT", 2)
+    root = paths.state_dir() / upgrade.BACKUPS_DIR
+    for name in ("20260101T000000", "20260102T000000", "20260103T000000"):
+        (root / name).mkdir(parents=True)
+    kept = upgrade.held_now(os.environ).keep(os.environ)
+    assert kept is not None and max(p.name for p in root.iterdir()) == kept.name
+    assert len(list(root.iterdir())) == 2

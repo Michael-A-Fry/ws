@@ -8,6 +8,8 @@ no tmux works), then logs in read-only through the broker and prints the folders
 is tidied for its host first (a Gmail app password loses the spaces Google shows), and a value that was just stored and
 the server refuses (`login_refused`) is taken out again; any other failure keeps it. A missing drafts folder is said out loud: drafts are refused until there is one.
 
+`ws mail connect --web` serves the same as one local page (ws.mailweb over ws.mailconnect).
+
 `ws mail check` logs in read-only (LIST) to every mailbox and says ok or why not; exit 1 when any fails. `ws mail rm
 NAME` takes the profile table out; the registry entry and the stored password stay, and it prints how to remove them.
 No command here prints a password or takes one as an argument: the value goes from the person's prompt to the store.
@@ -207,6 +209,24 @@ def cmd_rm(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_connect(args: argparse.Namespace) -> int:
+    if not args.web:
+        raise WsError(
+            "usage", "`ws mail connect` is the page: add --web", "on a terminal, `ws mail add` does the same", 2
+        )
+    from ws import mailweb
+
+    server = mailweb.build_server()
+    print(f"ws: Connect mail is open at {server.url}")
+    print("It listens on this machine only and closes after 10 idle minutes or on Close.")
+    if args.open:
+        import webbrowser
+
+        webbrowser.open(server.url)
+    server.serve()
+    return 0
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     sys.stdin.reconfigure(encoding="utf-8", errors="replace")
     try:
@@ -226,6 +246,10 @@ def register(sub) -> None:
     a.add_argument("--port", type=int, default=993, help="IMAP over TLS (default 993)")
     a.add_argument("--timeout", type=float, default=secretportal.DEFAULT_WAIT_S, help="seconds to wait for the paste")
     a.set_defaults(func=cmd_add)
+    w = ms.add_parser("connect", help="the Connect mail page: check an app password, then store it and add the mailbox")
+    w.add_argument("--web", action="store_true", help="serve the page on this machine's loopback (required)")
+    w.add_argument("--open", action="store_true", help="open it in this machine's browser")
+    w.set_defaults(func=cmd_connect)
     c = ms.add_parser("check", help="log in read-only to every mailbox: ok or why not")
     c.set_defaults(func=cmd_check)
     r = ms.add_parser("rm", help="take a mailbox out of the profile (its registry entry and password stay)")

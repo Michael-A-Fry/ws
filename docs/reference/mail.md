@@ -60,7 +60,9 @@ Other providers work the same way with their IMAP host and an app password, if t
 
 ### From a page
 
-A page can do the same with no shell: it posts the mailbox name, the address, the provider and the app password to
+`ws mail connect --web` serves that page on this machine's loopback (a random port and a token in the address; it
+closes after 10 idle minutes or on Close). A page of your own can do the same: it posts the mailbox name, the
+address, the provider and the app password to
 `ws.mailconnect.connect`. That call tries the password with one read-only login before it writes anything. A refusal
 stores nothing and says why in plain words: wrong password, an account password where an app password is needed,
 IMAP off, or the provider wanting a web sign-in first. After three refusals for one mailbox in 15 minutes it stops
@@ -74,6 +76,7 @@ Why it's built this way: [decision 0034](../decisions/0034-a-mailbox-is-connecte
 | Command | What it does |
 |---|---|
 | `ws mail add NAME --host H --user U [--kind gmail] [--port P]` | Checks the registry has `mail-NAME` as an `imap` entry. If not, it prints the block to add, writes nothing and exits 1. Then writes `[mail.NAME]`. Refuses an entry for another host, user or port (exit 2). Asks for the password when the store has none (in place on a terminal, else a prompt window), drops a Gmail app password's spaces, takes a just-typed password out again when the server refuses it (`login_refused`), then logs in read-only and prints the folders and the drafts folder (exit 1 when none is found). Prints the `[connectors.mail]` table when the policy lacks it. |
+| `ws mail connect --web` | Serves the Connect mail page on 127.0.0.1 with a token in its address: it checks an app password with one read-only login, then stores it and adds the mailbox. Closes after 10 idle minutes. Without `--web`: exit 2. |
 | `ws mail check` | Logs in read-only to every mailbox: ok, or the refusal code. Exit 1 when any fails or there are none. |
 | `ws mail rm NAME` | Takes `[mail.NAME]` out of the profile. The registry entry and the stored password stay; it prints how to remove them. |
 | `ws mail serve` | The five tools over stdio (MCP). A runner starts it through the connector. |

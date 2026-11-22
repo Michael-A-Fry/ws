@@ -86,6 +86,7 @@ CASES: dict[str, list[str]] = {
     "mail.add": ["mail", "add", "x", "--host", "imap.example.com", "--user", "someone@example.com"],
     "mail.check": ["mail", "check"],
     "mail.rm": ["mail", "rm", "x"],
+    "mail.connect": ["mail", "connect"],
     "globals.check": ["globals", "check", "--repo", "{home}"],
     "globals.manifest": ["globals", "manifest"],
     "install": ["install", "--dry-run", "--notes", "{home}/Notes"],

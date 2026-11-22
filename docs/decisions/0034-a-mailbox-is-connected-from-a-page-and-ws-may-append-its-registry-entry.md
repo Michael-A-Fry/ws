@@ -32,7 +32,7 @@ it gets one, a mail flow can call `connect` as its verify step.
   a missing `mail-NAME` entry is appended after the login works. ws never edits or removes an entry, and for any other
   host it returns the block for the person to add. This replaces "ws never writes the registry" for this one case:
   a step ws can do itself, it does.
-- **Tidy the value for its host.** A minter may refuse or tidy a value before it is stored (`clean_value`). For a
+- **Tidy the value for its host.** A minter may refuse or tidy a value before it's stored (`clean_value`). For a
   Gmail host every whitespace character is dropped and the rest must be 16 letters. Other hosts keep the value as
   typed.
 - **Say why, in ws's words.** A refused login is a typed reason (`bad_credentials`, `app_password_required`,
@@ -49,3 +49,11 @@ it gets one, a mail flow can call `connect` as its verify step.
 - Bad: the process serving the page holds the value for the length of one test login. That process doesn't read
   mail: everything that reads mail still goes through the broker, which alone holds the stored value.
 - Neutral: providers outside `PROVIDERS` still need the person to add the registry block.
+
+### Confirmation
+
+`tests/test_mailconnect.py` connects through a real broker to a fake TLS IMAP server and checks: a refused password
+stores nothing and keeps the value that works; each refusal has its own words and never the server's text; the
+fourth try inside 15 minutes is stopped before it dials; an entry is added only for a known provider's host; and the
+password is in no file outside the store. `tests/test_mailweb.py` checks the page refuses a post without its token or
+from another Origin, and that no reply or printed line carries the password.

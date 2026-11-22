@@ -15,6 +15,8 @@ body of the GitHub release.
   entry. A refusal stores nothing and is typed (`bad_credentials`, `app_password_required`, `imap_off`,
   `web_login_required`) with ws's own words. Three refusals for one mailbox in 15 minutes stop the next try before it
   dials. `known()` lists the mailboxes and when each last logged in. (C666)
+- `ws mail connect --web`: the Connect mail page on this machine's loopback, over `ws.mailconnect`. The page lists
+  the mailboxes, takes a name, address, provider and app password, and says in place whether it connected. (C666)
 
 ### Fixed
 

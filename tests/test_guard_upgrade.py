@@ -31,7 +31,7 @@ def ask(command: str):
         "systemctl --user kill ws-upgrade",
         "systemctl --user mask ws-upgrade.service",
         "systemctl --user -T start WS-Upgrade.service",
-        "systemctl --user start ws-upgrade@x.service",
+        "systemctl --user start ws-upgrade@x",
         "systemctl --user start $UNIT",
         "systemctl --user start `cat unit`",
         "U=ws-upgrade.service; systemctl --user start $U",

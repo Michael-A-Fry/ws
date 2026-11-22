@@ -7,7 +7,9 @@ import hashlib
 import http.client
 import json
 import re
+import socket
 import threading
+import time
 
 import pytest
 
@@ -333,8 +335,6 @@ def test_a_route_can_stop_the_server_after_its_reply_and_serve_returns_the_resul
 
 
 def test_only_a_request_with_the_token_keeps_the_server_alive():
-    import time
-
     get, post, _ = _routes()
     srv = LoopbackServer(get, post, idle_seconds=0.6)
     done = threading.Event()
@@ -347,6 +347,38 @@ def test_only_a_request_with_the_token_keeps_the_server_alive():
             break
         time.sleep(0.1)
     assert done.wait(3)
+
+
+def test_building_the_server_never_asks_dns_for_the_host_name(monkeypatch):
+    """`HTTPServer.server_bind` calls `socket.getfqdn`, a reverse lookup that stalled for tens of seconds on the macOS
+    runners (C708); nothing in ws reads the name, so the constructor must not make that call."""
+
+    def refuse(*a, **k):
+        raise AssertionError("socket.getfqdn was called")
+
+    monkeypatch.setattr(socket, "getfqdn", refuse)
+    srv = LoopbackServer({"/": lambda n: ""})
+    try:
+        assert srv.httpd.server_name == "127.0.0.1" and srv.httpd.server_port == srv.port
+    finally:
+        srv.httpd.server_close()
+
+
+def test_time_spent_before_serve_starts_is_not_idle_time():
+    """The idle clock starts in `serve()`: a constructor that took longer than `idle_seconds` (a slow name lookup, a
+    stalled runner) must not close the server before its first request, which is how C708 showed up on macOS."""
+    get, post, _ = _routes()
+    srv = LoopbackServer(get, post, idle_seconds=30)
+    srv._last -= 60  # as if building it had taken a minute
+    t = threading.Thread(target=srv.serve, daemon=True)
+    t.start()
+    try:
+        time.sleep(0.6)  # the loop goes round every 0.2 s: a clock counted from the constructor closes the socket here
+        assert t.is_alive()
+        assert _req(srv, "GET", f"/?t={srv.token}")[0] == 200
+    finally:
+        srv.close()
+        t.join(5)
 
 
 def test_an_idle_server_closes_and_returns_nothing():

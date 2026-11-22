@@ -937,7 +937,9 @@ def test_a_hand_edited_day_with_null_items_and_string_flags_still_runs(tmp_path)
     r.add(1, raw(subject="S1", mid="<t1@example.org>"))
     go(tmp_path, r, Model(reply(True, "r", ASK)))
     st = json.loads(f.read_text())["day"]
-    assert all(isinstance(i, dict) for i in st["items"]) and not any(i.get("text") in ("a", "b", "c") for i in st["items"])
+    assert all(isinstance(i, dict) for i in st["items"]) and not any(
+        i.get("text") in ("a", "b", "c") for i in st["items"]
+    )
     assert st["more"] == len(st["more_keys"]) == 0
 
 

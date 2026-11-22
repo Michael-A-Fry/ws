@@ -23,7 +23,7 @@ import os
 from collections.abc import Mapping
 from pathlib import Path
 
-from ws import selfcmd
+from ws import paths, selfcmd
 from ws.output import WsError
 
 UNITS = ("ws-upgrade.path", "ws-upgrade.service", "ws-rescue.service", "ws-rescue.timer")
@@ -57,9 +57,25 @@ def ws_command() -> Path:
     return cmd
 
 
+# what the user manager may hold from `systemctl --user set-environment` or `import-environment` that would change what a
+# program loads: a unit never sees any of it
+UNSET = (
+    "PYTHONPATH PYTHONHOME PYTHONSTARTUP PYTHONUSERBASE PYTHONSAFEPATH PYTHONBREAKPOINT PYTHONINSPECT PYTHONEXECUTABLE "
+    "LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT BASH_ENV ENV GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_CONFIG_COUNT GIT_SSH_COMMAND "
+    "GIT_EXEC_PATH SSL_CERT_FILE SSL_CERT_DIR HTTPS_PROXY HTTP_PROXY ALL_PROXY NO_PROXY WS_RELEASE_BASE_URL WS_SKIP_VERIFY"
+)
+
+
 def units(ws: Path) -> dict[str, str]:
-    """The text of each unit, for `ws` (an absolute path) as the command. Nothing here is a host, a user or a secret."""
-    run = f"{ws} upgrade"
+    """The text of each unit, for `ws` (an absolute path) as the command. Nothing here is a host, a user or a secret.
+
+    The service runs the installed tool's own Python in isolated mode (`-I -m ws`: no `PYTHON*` variable, no user site, no
+    working-folder import), with the system folders as its PATH, fixed here when the unit is written (never a folder in the
+    person's home, which a session can write), and `UnsetEnvironment=` for what the manager's own environment could add.
+    On macOS there is no systemd: `ws upgrade --print-units` there prints these for a Linux user manager only, and the
+    unattended upgrade is refused until a launchd form is built."""
+    run = f"{ws.with_name('python')} -I -m ws upgrade"
+    env = f"Environment=PATH={paths.tool_path()}\nUnsetEnvironment={UNSET}\n"
     return {
         "ws-upgrade.path": (
             "[Unit]\nDescription=ws: watch for an upgrade request\n\n"
@@ -68,12 +84,12 @@ def units(ws: Path) -> dict[str, str]:
         "ws-upgrade.service": (
             "[Unit]\nDescription=ws: unattended upgrade (one request, proved, checked, rolled back on any failure)\n\n"
             f"[Service]\nType=oneshot\nExecStart={run} --unattended\nTimeoutStartSec={UPGRADE_TIMEOUT_S}\n"
-            "NoNewPrivileges=yes\nEnvironment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin\n"
+            f"NoNewPrivileges=yes\n{env}"
         ),
         "ws-rescue.service": (
             "[Unit]\nDescription=ws: probe the gate, go back a release after two failures in a row\n\n"
             f"[Service]\nType=oneshot\nExecStart={run} --rescue\nTimeoutStartSec=1800\nNoNewPrivileges=yes\n"
-            "Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin\n"
+            f"{env}"
         ),
         "ws-rescue.timer": (
             "[Unit]\nDescription=ws: gate probe every ten minutes\n\n"

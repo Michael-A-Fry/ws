@@ -8,7 +8,7 @@ body of the GitHub release.
 
 ## [Unreleased]
 
-## [0.1.11.6] - 2026-11-22
+## [0.1.11.7] - 2026-11-22
 
 ### Added
 
@@ -28,6 +28,10 @@ body of the GitHub release.
 - Jobs: `command = "triage"` schedules `ws triage run --job NAME` from a `[triage]` table in the job file, and a schedule
   may carry a window, `every 30m 05:00-22:00` (whole hours, both ends included; two `OnCalendar=` lines on systemd, one
   calendar entry per run on launchd).
+
+## [0.1.11.6] - 2026-11-22
+
+### Added
 
 - `ws.mailconnect`: connect a mailbox from a page. It tries the app password with one read-only login before it
   writes anything, then stores it, adds `[mail.NAME]` and, for Gmail, Outlook or iCloud, appends a missing registry

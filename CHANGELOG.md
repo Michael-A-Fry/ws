@@ -8,6 +8,14 @@ body of the GitHub release.
 
 ## [Unreleased]
 
+### Added
+
+- `ws.mailconnect`: connect a mailbox from a page. It tries the app password with one read-only login before it
+  writes anything, then stores it, adds `[mail.NAME]` and, for Gmail, Outlook or iCloud, appends a missing registry
+  entry. A refusal stores nothing and is typed (`bad_credentials`, `app_password_required`, `imap_off`,
+  `web_login_required`) with ws's own words. Three refusals for one mailbox in 15 minutes stop the next try before it
+  dials. `known()` lists the mailboxes and when each last logged in. (C666)
+
 ### Fixed
 
 - `ws mail add` asks for the password in place when it runs on a terminal, so a plain ssh login with no tmux works;

@@ -84,8 +84,10 @@ HOSTS = {p.host: p for p in PROVIDERS.values()}
 SAY = {
     "bad_credentials": (
         "The mail server refused the password.",
-        "Use an app password, not your account password. 2-Step Verification must be on; for a work account, "
-        "the admin must allow app passwords.",
+        (
+            "Use an app password, not your account password. 2-Step Verification must be on; for a work account, "
+            "the admin must allow app passwords."
+        ),
     ),
     "app_password_required": (
         "That is your account password; this needs an app password.",
@@ -235,7 +237,11 @@ def _checked(env: dict | None) -> dict[str, float]:
         raw = json.loads(_checked_file(env).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
-    return {k: float(v) for k, v in raw.items() if isinstance(k, str) and isinstance(v, (int, float))} if isinstance(raw, dict) else {}
+    return (
+        {k: float(v) for k, v in raw.items() if isinstance(k, str) and isinstance(v, (int, float))}
+        if isinstance(raw, dict)
+        else {}
+    )
 
 
 def _mark_checked(name: str, env: dict | None, now: float) -> None:
@@ -300,7 +306,7 @@ def connect(
     if not mail.MAILBOX_RE.match(name):
         raise ConnectError("bad_name", f"{name!r} can't be a mailbox name.", "Use lower-case letters, digits, - or _.")
     if not ADDRESS_RE.match(address):
-        raise ConnectError("bad_address", "That isn't an e-mail address.", "Type the whole address, e.g. you@gmail.com.")
+        raise ConnectError("bad_address", "That isn't an e-mail address.", "Type the whole address.")
     if provider and provider not in PROVIDERS:
         raise ConnectError("bad_provider", "ws doesn't know that provider.", f"Pick one of: {', '.join(PROVIDERS)}.")
     if host and not (wsecrets.HOST_RE.match(host.lower()) and ":" not in host):

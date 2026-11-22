@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import socket
+from pathlib import Path
 
 import pytest
 from helpers.fake_imap import HOST, USER
@@ -53,7 +54,7 @@ def everything_written(box, tmp_path) -> str:
                 if "secrets" in p.split(os.sep):  # the store itself: the one place the value belongs
                     continue
                 try:
-                    out.append(open(p, "rb").read().decode("utf-8", "replace"))
+                    out.append(Path(p).read_bytes().decode("utf-8", "replace"))
                 except OSError:
                     pass
     return "\n".join(out)
@@ -84,7 +85,10 @@ def test_a_refused_password_stores_nothing_and_keeps_the_one_that_works(box, tmp
     "said, kind",
     [
         ("[ALERT] Your account is not enabled for IMAP use.", "imap_off"),
-        ("[ALERT] Application-specific password required: https://support.google.com/x (Failure)", "app_password_required"),
+        (
+            "[ALERT] Application-specific password required: https://support.google.com/x (Failure)",
+            "app_password_required",
+        ),
         ("[ALERT] Please log in via your web browser: https://support.google.com/x (Failure)", "web_login_required"),
     ],
 )
@@ -146,7 +150,7 @@ def test_a_refused_login_for_a_new_mailbox_adds_no_registry_entry(box, monkeypat
 
 def test_a_gmail_value_that_is_not_an_app_password_is_refused_before_anything(box):
     before = box.s.registry.read_text()
-    e = refused(box, "g", "someone@gmail.com", "not an app password at all")
+    e = refused(box, "g", "someone@example.net", "not an app password at all", "gmail")
     assert e.kind == "not_app_password" and "16 letters" in e.message
     assert box.s.registry.read_text() == before and box.fake.dialled == []
 
@@ -157,7 +161,7 @@ def test_a_gmail_value_that_is_not_an_app_password_is_refused_before_anything(bo
         (("Bad Name", USER, "x"), "bad_name"),
         (("a", "not-an-address", "x"), "bad_address"),
         (("a", USER, ""), "no_password"),
-        (("c", "me@custom-domain.example", "x"), "pick_provider"),
+        (("c", "me@example.net", "x"), "pick_provider"),
         (("a", "other@example.com", "x"), "conflict"),
     ],
 )

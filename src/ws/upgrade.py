@@ -78,6 +78,7 @@ run without a terminal on stdin is refused too (a session's shell has none), as 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -151,6 +152,8 @@ MIRROR_VARS = (
     "PIP_EXTRA_INDEX_URL",
     "PIP_FIND_LINKS",
 )
+LOCK_FILE = "upgrade.lock"  # in ws's own state folder: one flock shared by every way of changing the installed ws
+LOCK_WAIT_HAND_S, LOCK_WAIT_UNATTENDED_S = 30.0, 300.0  # how long a hand-run upgrade and the service wait for it
 DEFAULT_REPO = "Michael-A-Fry/ws"  # where releases come from when the installed wheel carries no trust root
 _DOWNLOAD_LIMIT = 1 << 20  # bytes: install.sh is about 40 KB
 
@@ -1304,6 +1307,50 @@ def _rollback(args: argparse.Namespace, env: Mapping[str, str]) -> int:
 # ---- unattended: the service's own upgrade ----------------------------------------------------------------------------------
 
 
+class Busy(WsError):
+    """Another upgrade, rescue or rollback holds the lock."""
+
+
+@contextlib.contextmanager
+def upgrade_lock(env: Mapping[str, str], wait_s: float):
+    """One lock for everything that changes the installed ws: the upgrade service, the rescue timer and a hand-run upgrade,
+    rollback or hooks rewrite (N17). An exclusive `flock` on `<state>/upgrade.lock`: the kernel drops it when the holder
+    dies, however it dies, so a crash never leaves it held. A second one polls for up to `wait_s` seconds (0 means try
+    once) and then raises `Busy`; it never waits for ever. The descriptor isn't inherited, so no child (the installer, a
+    broker it starts) keeps the lock past its holder. Where `fcntl` is missing (native Windows) there is no lock."""
+    try:
+        import fcntl
+    except ImportError:
+        yield
+        return
+    path = paths.state_dir(dict(env)) / LOCK_FILE
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as e:
+        raise WsError(
+            "failed", f"can't open the upgrade lock {path} ({e})", "check that ws's state folder is writable"
+        ) from e
+    try:
+        deadline = time.monotonic() + wait_s
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except (BlockingIOError, PermissionError):
+                if time.monotonic() >= deadline:
+                    raise Busy(
+                        "conflict",
+                        "another ws upgrade, rollback or rescue is running (it holds the upgrade lock)",
+                        "wait for it to finish, then run this again",
+                        EXIT_REFUSED,
+                    ) from None
+                time.sleep(0.05)
+        yield
+    finally:
+        os.close(fd)
+
+
 def request_path(env: Mapping[str, str]) -> Path:
     """Where the one-line request file is dropped: outside every protected root on purpose (the request is a wish)."""
     base = env.get("XDG_STATE_HOME") or str(Path(env.get("HOME") or os.path.expanduser("~")) / ".local" / "state")
@@ -1399,6 +1446,16 @@ def cmd_unattended(args: argparse.Namespace, env: Mapping[str, str], source=None
         raise WsError("refused", why, "it is started by `ws-upgrade.service`, not by hand", EXIT_REFUSED)
     args.log_verb = "unattended"
     t0 = time.monotonic()
+    try:
+        # taken before the request is read, so a request that finds the lock held stays in place for the next run of the unit
+        with upgrade_lock(env, LOCK_WAIT_UNATTENDED_S):
+            return _unattended(args, env, t0, source, sleep)
+    except Busy as e:
+        _log(args, env, t0, "unattended", None, "busy", e.message)
+        return 0
+
+
+def _unattended(args: argparse.Namespace, env: Mapping[str, str], t0: float, source, sleep) -> int:
     req = request_path(env)
     try:
         text = req.read_text(encoding="utf-8", errors="replace")
@@ -1491,6 +1548,17 @@ def cmd_rescue(args: argparse.Namespace, env: Mapping[str, str]) -> int:
         raise WsError("refused", why, "it is started by `ws-rescue.timer`, not by hand", EXIT_REFUSED)
     args.log_verb = "rescue"
     t0 = time.monotonic()
+    try:
+        with upgrade_lock(
+            env, 0
+        ):  # an upgrade in progress has the gate half changed: probing it now would be a false strike
+            return _rescue(args, env, t0)
+    except Busy as e:
+        _log(args, env, t0, "rescue", None, "busy", e.message)
+        return 0
+
+
+def _rescue(args: argparse.Namespace, env: Mapping[str, str], t0: float) -> int:
     problems = upgradecheck.gate_problems(env)
     file = _rescue_file(env)
     try:
@@ -1553,6 +1621,14 @@ def cmd_upgrade(args: argparse.Namespace) -> int:
         raise WsError("refused", why, "run `ws upgrade` yourself, in a terminal of your own", EXIT_REFUSED)
     if getattr(args, "print_units", False):
         return cmd_print_units(args, env)
+    in_step = bool(args.hooks_only and env.get(STEP_ENV))  # the hooks step of a swap: its parent holds the lock
+    if args.dry_run or in_step:  # a dry run changes nothing
+        return _by_hand(args, env)
+    with upgrade_lock(env, LOCK_WAIT_HAND_S):
+        return _by_hand(args, env)
+
+
+def _by_hand(args: argparse.Namespace, env: Mapping[str, str]) -> int:
     if args.hooks_only:
         args.log_verb = "hooks-only"
         return _hooks_logged(args, env)

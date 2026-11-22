@@ -9,10 +9,14 @@ GitHub; the request is a file in a tmp state folder.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
+import io
 import json
 import os
 import stat
 import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -62,6 +66,11 @@ if [ "$v" = "0.1.11.8" ] && [ -f "$STUB_STATE/drop_deny" ]; then
 fi
 echo "$v" > "$STUB_STATE/version"
 """
+
+
+class Tty(io.StringIO):
+    def isatty(self) -> bool:
+        return True
 
 
 def make_release(root: Path, key: Path, **kw) -> release_fakes.Release:
@@ -665,3 +674,55 @@ def test_the_units_start_python_in_isolated_mode_and_unset_what_the_manager_coul
             "HTTPS_PROXY",
         ):
             assert var in unset
+
+
+# ---- N17: one lock between the service, the rescue timer and a hand-run upgrade -----------------------------------------------
+
+
+@contextlib.contextmanager
+def hold_lock():
+    """Another holder of the lock: its own open file, so `flock` sees a second owner (see tests/test_upgrade_lock.py)."""
+    path = paths.state_dir(dict(os.environ)) / upgrade.LOCK_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        yield
+    finally:
+        os.close(fd)
+
+
+def test_the_rescue_skips_a_tick_while_an_upgrade_holds_the_lock_and_counts_no_strike(way_back, monkeypatch):
+    break_gate(way_back)  # a probe now would fail: an upgrade has the gate half changed
+    monkeypatch.setattr(upgradecheck, "gate_problems", lambda env: pytest.fail("probed while an upgrade held the lock"))
+    with hold_lock():
+        assert rescue() == 0
+    assert [r["result"] for r in rows()] == ["busy"]
+    assert "holds the upgrade lock" in rows()[-1]["reason"]
+    assert not upgrade._rescue_file(os.environ).exists()  # no strike, no state
+    assert installs() == []
+
+
+def test_the_service_waits_its_time_leaves_the_request_in_place_and_exits(svc, monkeypatch):
+    monkeypatch.setattr(upgrade, "LOCK_WAIT_UNATTENDED_S", 0.3)
+    path = request(svc, TAG)
+    with hold_lock():
+        t = time.monotonic()
+        assert upgrade.cmd_unattended(args(), os.environ, source=svc.release(), sleep=lambda s: None) == 0
+        assert time.monotonic() - t < 5
+    assert path.read_text(encoding="utf-8") == TAG  # not taken: the next run of the unit does it
+    assert [(r["verb"], r["result"]) for r in rows()] == [("unattended", "busy")]
+    assert installed(svc) == OLD and not Path(os.environ["INSTALL_LOG"]).exists()
+    assert serve(svc) == 0 and installed(svc) == NEW  # and once the lock is free it goes through
+
+
+def test_a_hand_run_does_not_run_beside_the_service_it_waits_its_time_and_refuses(svc, monkeypatch, capsys):
+    monkeypatch.setattr(upgrade, "LOCK_WAIT_HAND_S", 0.3)
+    monkeypatch.delenv("INVOCATION_ID")  # a person's terminal, not the unit
+    monkeypatch.setattr(sys, "stdin", Tty())
+    with hold_lock():
+        t = time.monotonic()
+        assert cli.main(["upgrade", "--rollback"]) == upgrade.EXIT_REFUSED
+        assert time.monotonic() - t < 5
+    assert "holds the upgrade lock" in capsys.readouterr().err
+    assert installs() == []

@@ -29,6 +29,11 @@ body of the GitHub release.
   may carry a window, `every 30m 05:00-22:00` (whole hours, both ends included; two `OnCalendar=` lines on systemd, one
   calendar entry per run on launchd).
 
+### Fixed
+
+- `ws mail`: `Mail.search` passes `after_uid` through as given, so the broker refuses a bool, a string or a fraction
+  instead of quietly turning it into a number.
+
 ## [0.1.11.6] - 2026-11-22
 
 ### Added

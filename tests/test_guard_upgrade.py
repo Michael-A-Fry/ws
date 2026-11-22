@@ -68,7 +68,6 @@ def test_the_service_is_not_for_a_session(command):
         "systemctl --user show ws-rescue.timer",
         "systemctl --user start ws-other.service",
         "systemctl --user restart some.service",
-        "systemctl --user daemon-reload",
         "systemctl restart $svc",  # a system unit by a variable: not this guard's business
         "systemd-run --user sleep 1",
         "ws upgrade --dry-run",
@@ -83,6 +82,122 @@ def test_the_service_is_not_for_a_session(command):
 )
 def test_reading_the_units_and_every_other_command_goes_through(command):
     assert ask(command) is None, command
+
+
+# ---- B9: the routes round the unit names, one planted each, each refused for its own reason ------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("command", "why"),
+    [
+        ("systemctl --user stop 'ws-r*.timer'", "a glob or a brace"),
+        ("systemctl --user stop ws-?escue.timer", "a glob or a brace"),
+        ("systemctl --user stop 'ws-[r]escue.timer'", "a glob or a brace"),
+        ("systemctl --user restart '*.timer'", "a glob or a brace"),
+        ("systemctl --user stop -- 'ws-*'", "a glob or a brace"),
+        ("systemctl --global disable 'ws-*'", "a glob or a brace"),
+        ("systemctl -M 1000@.host stop 'ws-r*'", "a glob or a brace"),
+        (
+            "systemctl --user stop ws-{upgrade,rescue}.timer",
+            "on the upgrade or rescue unit",
+        ),  # the reader expands braces
+        ("echo ws-rescue.timer | xargs systemctl --user stop", "fed in by xargs"),
+        ("xargs -a units systemctl --user disable", "fed in by xargs"),
+        ("cat units | parallel systemctl --user stop", "fed in by xargs or parallel"),
+        ("echo ws-rescue.timer | xargs -I{} systemctl --user stop {}", "a glob or a brace"),
+        ("find . -exec systemctl --user stop ws-rescue.timer ';'", "on the upgrade or rescue unit"),
+        ("watch systemctl --user restart ws-upgrade.path", "on the upgrade or rescue unit"),
+        ("systemctl --user daemon-reload", "systemctl daemon-reload"),
+        ("systemctl daemon-reexec", "systemctl daemon-reexec"),
+        ("systemctl --user set-environment PYTHONPATH=/tmp/x", "systemctl set-environment"),
+        ("systemctl --user import-environment PYTHONPATH", "systemctl import-environment"),
+        ("systemctl --user unset-environment PATH", "systemctl unset-environment"),
+        ("sudo systemctl --user daemon-reload", "systemctl daemon-reload"),
+        ("dbus-update-activation-environment --systemd PYTHONPATH=/tmp/x", "dbus-update-activation-environment"),
+        (
+            (
+                "busctl --user call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager "
+                "StopUnit ss ws-rescue.timer replace"
+            ),
+            "busctl calling the systemd user manager",
+        ),
+        (
+            (
+                "busctl --user set-property org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager "
+                "Environment as 1 PYTHONPATH=/tmp/x"
+            ),
+            "busctl calling the systemd user manager",
+        ),
+        (
+            (
+                "gdbus call --session --dest org.freedesktop.systemd1 --object-path /org/freedesktop/systemd1 "
+                "--method org.freedesktop.systemd1.Manager.StopUnit ws-rescue.timer replace"
+            ),
+            "gdbus calling the systemd user manager",
+        ),
+        (
+            (
+                "dbus-send --session --dest=org.freedesktop.systemd1 /org/freedesktop/systemd1 "
+                "org.freedesktop.systemd1.Manager.Reload"
+            ),
+            "dbus-send calling the systemd user manager",
+        ),
+    ],
+)
+def test_every_route_round_the_unit_names_is_refused_for_its_own_reason(command, why):
+    found = ask(command)
+    assert found is not None and found.action == "deny", command
+    assert why in found.reason, (command, found.reason)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "systemctl --user restart foo.service",
+        "systemctl --user stop some-other.timer",
+        "systemctl --user enable --now my-backup.timer",
+        "systemctl --user start foo@bar.service",
+        "systemctl --user kill --signal=HUP foo.service",
+        "systemctl --user status 'ws-*'",  # reading takes a glob
+        "systemctl --user list-units 'ws-*'",
+        "systemctl --user show -p Environment ws-upgrade.service",
+        "systemctl --user show-environment",
+        "systemctl --user is-active foo.service | xargs echo",
+        "systemctl stop 'nginx*'",  # the system manager: not this guard's business
+        "systemctl --no-pager list-timers",
+        "busctl --user tree org.freedesktop.systemd1",
+        "busctl --user get-property org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager Version",
+        "busctl --user call org.freedesktop.portal.Desktop /org/freedesktop/portal/desktop org.freedesktop.DBus.Peer Ping",
+        (
+            "gdbus call --session --dest org.freedesktop.Notifications --object-path /org/freedesktop/Notifications "
+            "--method org.freedesktop.Notifications.GetServerInformation"
+        ),
+        (
+            "dbus-send --session --dest=org.freedesktop.Notifications /org/freedesktop/Notifications "
+            "org.freedesktop.Notifications.GetServerInformation"
+        ),
+        "dbus-update-activation-environment DISPLAY",  # without --systemd it only reaches the bus's own activation
+        "find . -name '*.service' -exec grep -l ws-upgrade {} +",
+        "grep -r systemctl docs",
+        "man systemctl",
+    ],
+)
+def test_ordinary_systemctl_and_bus_use_on_other_units_still_goes_through(command):
+    assert ask(command) is None, command
+
+
+def test_the_unattended_flag_is_matched_whole_and_in_any_spelling_the_parser_takes():
+    for command in (
+        "ws upgrade --unattended",
+        "ws --unattended upgrade",
+        "ws upgrade --rescue=1",
+        "ws upgrade --version v1 --unattended",
+        "ws -- upgrade --unattended",
+    ):
+        found = ask(command)
+        assert found is not None and "ws upgrade --unattended or --rescue" in found.reason, command
+    for command in ("ws upgrade --unattended-not-a-flag-ws-has", "ws upgrade --u", "ws upgrade --r"):
+        assert ask(command) is None, command  # no flag of ws's, and the parser takes none of them (allow_abbrev=False)
 
 
 def test_the_guard_takes_no_options_and_is_a_default_guard():
@@ -133,6 +248,52 @@ def test_the_live_hook_refuses_what_the_guard_and_the_protected_paths_say(box):
     )  # the request path stays writable
     assert exit_code("ls -la") == 0
     assert exit_code(f"touch {units}/ws-other.service") == 0  # only the four units are named, not the folder
+
+
+@pytest.mark.parametrize(
+    "where",
+    [
+        ".config/systemd/user/ws-upgrade.service.d/override.conf",  # a blank ExecStart= plus its own command
+        ".config/systemd/user/ws-upgrade.path.d/override.conf",
+        ".config/systemd/user/ws-rescue.service.d/override.conf",
+        ".config/systemd/user/ws-rescue.timer.d/override.conf",
+        ".config/systemd/user/ws-.service.d/override.conf",  # the shared-prefix drop-in reaches both services
+        ".config/systemd/user/service.d/override.conf",  # and the type's reaches every service
+        ".config/systemd/user/timer.d/override.conf",
+        ".config/systemd/user.control/ws-upgrade.service",  # what `systemctl edit` writes: read before the user folder
+        ".config/systemd/user.control/ws-rescue.timer.d/override.conf",
+        ".config/systemd/user.control/anything-else.conf",
+        ".local/share/systemd/user/ws-upgrade.service.d/override.conf",
+        ".local/share/systemd/user/ws-rescue.timer",
+    ],
+)
+def test_no_drop_in_or_control_copy_of_a_unit_can_be_written(box, where):
+    home, _tool = box
+    assert exit_code(f"touch {home}/{where}") == 2, where
+    assert exit_code(f"echo x >> {home}/{where}") == 2, where
+
+
+def test_other_units_and_their_folders_stay_writable(box):
+    home, _tool = box
+    for where in (
+        ".config/systemd/user/ws-other.service",
+        ".config/systemd/user/ws-other.service.d/override.conf",
+        ".config/systemd/user/my-backup.timer",
+        ".local/share/systemd/user/my-backup.service",
+    ):
+        assert exit_code(f"touch {home}/{where}") == 0, where
+
+
+def test_protected_paths_follow_xdg_and_the_runtime_folder(box, monkeypatch, tmp_path):
+    cfg, data, run = tmp_path / "c", tmp_path / "d", tmp_path / "r"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(cfg))
+    monkeypatch.setenv("XDG_DATA_HOME", str(data))
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(run))
+    got = {str(p) for p in upgradeunit.protected_paths(os.environ)}
+    assert f"{cfg}/systemd/user/ws-upgrade.service.d" in got and f"{cfg}/systemd/user.control" in got
+    assert f"{data}/systemd/user/ws-rescue.timer.d" in got and f"{run}/systemd/transient" in got
+    monkeypatch.setenv("XDG_CONFIG_HOME", "relative/path")  # a relative value is ignored, as the specification says
+    assert all(Path(p).is_absolute() for p in upgradeunit.protected_paths(os.environ))
 
 
 def test_the_protected_paths_are_the_four_units_and_the_tool_folder(box):

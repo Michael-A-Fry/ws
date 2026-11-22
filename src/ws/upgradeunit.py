@@ -1,7 +1,8 @@
 """The systemd user units of the unattended upgrade, as text made from the installed ws: `ws upgrade --print-units`.
 
 Four units, made here and written by `--write` into the person's systemd user folder (never by a session: the folder's
-four files are protected paths of the gate, see `ws.userconfig`):
+four files, their drop-in folders and the `user.control` copies are protected paths of the gate, see
+`ws.userconfig` and `protected_paths` here):
 
 - `ws-upgrade.path` watches one request file (`ws-upgrade/request.json` under the user's state folder) and starts
 - `ws-upgrade.service`, which runs `ws upgrade --unattended` once and exits;
@@ -32,14 +33,40 @@ RESCUE_EVERY = "10min"
 UPGRADE_TIMEOUT_S = 3600  # a 30 minute wait for idle, the installer's 10 minutes, the checks and a way back
 
 
+def _xdg(env: Mapping[str, str], var: str, default: str) -> Path:
+    value = env.get(var)
+    return Path(value) if value and os.path.isabs(value) else Path(env.get("HOME") or os.path.expanduser("~")) / default
+
+
 def unit_dir(env: Mapping[str, str]) -> Path:
-    base = env.get("XDG_CONFIG_HOME") or str(Path(env.get("HOME") or os.path.expanduser("~")) / ".config")
-    return Path(base) / "systemd" / "user"
+    return _xdg(env, "XDG_CONFIG_HOME", ".config") / "systemd" / "user"
 
 
 def unit_paths(env: Mapping[str, str]) -> tuple[Path, ...]:
     """The four files `--write` makes: what the gate protects from a session (`ws.userconfig._claude_protect`)."""
     return tuple(unit_dir(env) / name for name in UNITS)
+
+
+def protected_paths(env: Mapping[str, str]) -> tuple[Path, ...]:
+    """Every place a session could write to change what the four units run, for the gate's protected paths.
+
+    systemd builds a unit from its file, a drop-in folder for it (`<unit>.d`, and the shared `ws-.service.d`, `service.d`
+    and the like) and a copy of the unit in a folder it reads first (`user.control`, the one `systemctl edit` writes). So
+    besides the four files these are named, whether or not they exist yet: the drop-in folders of each unit, of the
+    shared prefix and of the type, in the user folder and in the data folder's `systemd/user`; the four files again in
+    that data folder; the whole of `user.control` (its only writer is `systemctl edit`); and the runtime copies under
+    the runtime folder's `systemd`. Other units' own files in the user folder stay writable: nothing else is named."""
+    config = _xdg(env, "XDG_CONFIG_HOME", ".config") / "systemd"
+    data = _xdg(env, "XDG_DATA_HOME", ".local/share") / "systemd" / "user"
+    kinds = sorted({name.rsplit(".", 1)[1] for name in UNITS})
+    drop_ins = [f"{name}.d" for name in UNITS] + [f"ws-.{kind}.d" for kind in kinds] + [f"{kind}.d" for kind in kinds]
+    runtime = env.get("XDG_RUNTIME_DIR")
+    out = [*unit_paths(env), *(unit_dir(env) / d for d in drop_ins)]
+    out += [data / name for name in (*UNITS, *drop_ins)]
+    out.append(config / "user.control")
+    if runtime and os.path.isabs(runtime):
+        out += [Path(runtime) / "systemd" / folder for folder in ("user", "user.control", "transient", "generator")]
+    return tuple(dict.fromkeys(out))
 
 
 def ws_command() -> Path:

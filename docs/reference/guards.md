@@ -452,11 +452,17 @@ been delivered. Without `tmux` installed it says nothing.
 It's on by default for an existing policy (the upgrade adds it): it only narrows. A session may not start, stop, change
 or imitate the unattended upgrade ([ADR 0035](../decisions/0035-an-upgrade-can-run-itself-from-a-service-that-proves-the-release.md)).
 It refuses `systemctl` with a verb that changes something (start, stop, restart, enable, disable, edit, kill, mask and
-the like) on a unit named `ws-upgrade*` or `ws-rescue*`, and the same with a variable or substitution for the unit under
-`--user`; `systemd-run` naming such a unit; and any command with the words `upgrade` and `--unattended` or `--rescue`
-(or a prefix of either that the option parser still reads), however ws is started. Reading a unit (`status`, `show`, `cat`,
-`list-timers`) is allowed. Because it reads the words of a command line, a plain `echo ws upgrade --rescue` is refused too.
-The unit files themselves are protected paths of the user-scope hook, so a session write to them is refused with no guard.
+the like) on a unit named `ws-upgrade*` or `ws-rescue*`, and the same under `--user`, `--global` or `-M` when the unit is
+a variable or substitution, has a glob or a brace in its name (`'ws-r*.timer'`, `ws-?escue.timer`), or is fed in by
+`xargs` or `parallel`; `systemctl daemon-reload`, `daemon-reexec`, `set-environment`, `import-environment` and
+`unset-environment`, and `dbus-update-activation-environment --systemd`, whatever the unit (a reload is what makes a
+drop-in take effect, and the environment verbs reach every unit the manager starts); `busctl call` or `set-property`,
+`gdbus call`, `dbus-send` and `qdbus` naming `org.freedesktop.systemd1`; `systemd-run` naming such a unit; and any command
+with the words `upgrade` and `--unattended` or `--rescue` (or a prefix of either that the option parser still reads),
+however ws is started. Reading a unit (`status`, `show`, `cat`, `list-timers`, a glob in a read) is allowed. Because it
+reads the words of a command line, a plain `echo ws upgrade --rescue` is refused too. The unit files, their drop-in
+folders and the `user.control` copies are protected paths of the user-scope hook, so a session write to them is refused
+with no guard; other units in the same folder stay writable.
 
 ### pane-keys
 

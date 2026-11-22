@@ -1629,3 +1629,21 @@ def test_a_job_with_no_input_records_a_null_hash(ws):
     ws.job()
     cli.main(["run", "daily"])
     assert valid(ws.records()[0])["input_sha256"] is None
+
+
+def test_a_walled_class_term_in_the_input_file_is_refused_before_the_runner_starts(ws, tmp_path):
+    """The input joins the prompt before the term check, so a hosted model never gets a walled class's term through it."""
+    for name in ("open", "alpha"):
+        (tmp_path / name).mkdir()
+    (ws.home / "policy.toml").write_text(
+        f'[classes.open]\naccess = "full"\nrepos = ["{tmp_path}/open/**"]\n'
+        f'[classes.alpha]\naccess = "walled"\nrepos = ["{tmp_path}/alpha/**"]\nallowed_providers = ["anthropic"]\n'
+        'terms = ["Kestrel Ridge"]\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "open" / "today.md").write_text("notes on the kestrel ridge site\n", encoding="utf-8")
+    ws.job(prompt="Summarise the file.", extra=f'cwd = "{tmp_path / "open"}"\ninput = "today.md"')
+    assert cli.main(["run", "daily"]) == 3
+    (rec,) = ws.records()
+    assert rec["status"] == "refused" and rec["stop_reason"] == "refused:term"
+    assert not (ws.home / "fake-saw.json").exists()  # the runner never started

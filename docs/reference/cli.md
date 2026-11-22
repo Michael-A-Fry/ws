@@ -1839,9 +1839,9 @@ pinned by `ws job add`, but the input isn't: it's meant to change between runs.
 Without a cwd there's nothing to read from, so `input` needs one. The path is relative to the cwd and has no `..`.
 
 This key replaces data kept in the project's `AGENTS.md` (or `CLAUDE.md`). A job doesn't read those: OpenCode runs
-with the project config off (`OPENCODE_DISABLE_PROJECT_CONFIG`), which skips the project `AGENTS.md` too (checked on
-OpenCode 1.19.4), and a Claude Code job is `bare` by default. To use another file, change `input` and add the job
-again with `ws job add --replace`; to give it new data, just change the file.
+with the project config off (`OPENCODE_DISABLE_PROJECT_CONFIG`), which skips the project `AGENTS.md` and `CLAUDE.md`
+too (checked on OpenCode 1.19.4), and a Claude Code job is `bare` by default. To use another file, change `input`
+and add the job again with `ws job add --replace`; to give it new data, just change the file.
 
 ## Run record
 

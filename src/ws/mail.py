@@ -297,12 +297,21 @@ class Mail:
         return {"mailbox": box.name, "folders": names, "gmail": bool(r.get("gmail")), "drafts": r.get("drafts")}
 
     def search(
-        self, mailbox: str, query: str | None = None, since: str | _dt.date | None = None, unseen: bool = False
+        self,
+        mailbox: str,
+        query: str | None = None,
+        since: str | _dt.date | None = None,
+        unseen: bool = False,
+        after_uid: int | None = None,
     ) -> dict:
         """INBOX uids, newest first: {"mailbox", "uids": ["work:7-42", ...], "total"}. `query` is printable ASCII; Gmail
-        search syntax for a gmail mailbox, plain text otherwise. `since` is a date (YYYY-MM-DD)."""
+        search syntax for a gmail mailbox, plain text otherwise. `since` is a date (YYYY-MM-DD). `after_uid` (the bare
+        uid of one this search found before) asks instead for the uids above it, oldest first, so a caller can read a
+        folder page by page; `total` then counts those above it."""
         box = self._box(mailbox)
         args: dict = {"folder": FOLDER, "unseen": bool(unseen)}
+        if after_uid is not None:
+            args["after_uid"] = int(after_uid)
         if query is not None:
             args["query"] = query
         if since is not None:

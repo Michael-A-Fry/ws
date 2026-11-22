@@ -53,6 +53,7 @@ CASES: dict[str, list[str]] = {
     "secret.generate": ["secret", "generate", "nope"],
     "job.add": ["job", "add", "{home}/none.toml"],
     "job.remove": ["job", "remove", "nope"],
+    "triage.run": ["triage", "run", "--config", "{home}/none.toml"],
     "commit-wall.check": ["commit-wall", "check", "--repo", "{home}"],
     "commit-wall.install": ["commit-wall", "install", "--repo", "{home}"],
     "commit-wall.uninstall": ["commit-wall", "uninstall", "--repo", "{home}"],

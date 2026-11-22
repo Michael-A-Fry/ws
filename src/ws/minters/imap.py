@@ -69,8 +69,9 @@ FOLDER_RE = re.compile(r"^[^\x00-\x1f\x7f\"\\]{1,200}$")
 QUERY_RE = re.compile(r"^[ !#-\[\]-~]{1,200}$")  # printable ASCII without \" and \\
 DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
 SEARCH_RE = re.compile(
-    r'^(ALL|SINCE \d{1,2}-[A-Z][a-z]{2}-\d{4})( UNSEEN)?( (?:X-GM-RAW|TEXT) "[ !#-\[\]-~]{1,200}")?$'
+    r'^(ALL|SINCE \d{1,2}-[A-Z][a-z]{2}-\d{4})( UNSEEN)?( UID [1-9]\d{0,9}:\*)?( (?:X-GM-RAW|TEXT) "[ !#-\[\]-~]{1,200}")?$'
 )
+MAX_UID = 2**32 - 1
 LOGIN_CODES = frozenset({
     "AUTHENTICATIONFAILED", "AUTHORIZATIONFAILED", "UNAVAILABLE", "ALERT", "CONTACTADMIN", "PRIVACYREQUIRED",
     "LIMIT", "EXPIRED",
@@ -227,7 +228,7 @@ def _check(sess: _Session, name: str, args: list[str]) -> None:
         sub, rest = args[0].upper(), args[1:]
         if sub == "SEARCH":
             if not SEARCH_RE.match(" ".join(rest)):
-                no("search criteria outside SINCE, UNSEEN, TEXT and X-GM-RAW")
+                no("search criteria outside SINCE, UNSEEN, UID n:*, TEXT and X-GM-RAW")
         elif sub == "FETCH":
             if len(rest) != 2 or not rest[0].isdigit() or rest[1] not in FETCH_ITEMS:
                 no("one uid, BODY.PEEK only")
@@ -323,7 +324,12 @@ def _check_search(opts: Options, args: dict) -> dict:
         crit.append("UNSEEN")
     if query is not None and not (isinstance(query, str) and QUERY_RE.match(query)):
         raise ImapError("bad_request", 'query must be printable ASCII without " or \\, at most 200 characters')
-    return {"folder": folder, "crit": crit, "query": query}
+    after = args.get("after_uid")
+    if after is not None:
+        if isinstance(after, bool) or not isinstance(after, int) or not 0 <= after < MAX_UID:
+            raise ImapError("bad_request", "after_uid must be a whole number from a search")
+        crit.append(f"UID {after + 1}:*")
+    return {"folder": folder, "crit": crit, "query": query, "after": after}
 
 
 def _op_search(sess: _Session, opts: Options, a: dict) -> dict:
@@ -334,6 +340,10 @@ def _op_search(sess: _Session, opts: Options, a: dict) -> dict:
     typ, dat = sess.uid("SEARCH", " ".join(crit))
     _ok(typ, "the search")
     uids = sorted((int(x) for x in (dat[0] or b"").split() if x.isdigit()), reverse=True)
+    if (
+        a.get("after") is not None
+    ):  # the oldest above it, oldest first ("n:*" also matches the top uid when none is above)
+        uids = sorted(u for u in uids if u > a["after"])
     return {"folder": a["folder"], "uidvalidity": uv, "uids": uids[:MAX_RESULTS], "total": len(uids)}
 
 

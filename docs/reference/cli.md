@@ -620,6 +620,14 @@ Mailboxes for triage (`[mail.NAME]` in the profile): `ws mail add NAME --host H 
 `ws mail connect --web` (the same as a local page), `ws mail check`, `ws mail rm NAME`, and `ws mail serve` (the five
 mail tools over stdio). See [Mail](mail.md).
 
+## `ws triage`
+
+The inbox job: `ws triage run --job NAME` (the settings are the `[triage]` table of `jobs/NAME.toml`, a job with
+`command = "triage"` that a `schedule` runs) or `ws triage run --config FILE`. It sorts the new mail of the listed
+mailboxes by rules, calls one small model per thread that may need a reply, checks each draft in code and saves it
+through `ws mail`. `--dry-run` makes no label or draft call, saves no state and writes no summary; the model is still
+called, so it measures a real run. Exit 0 ran, 1 a mailbox failed, 2 settings, 3 refused. See [Inbox triage](triage.md).
+
 ## `ws connector`
 
 Zone MCP servers (`[connectors.NAME]` in the [policy](policy.md#connectorsname)): list them, start a session with one,

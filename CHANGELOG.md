@@ -8,8 +8,13 @@ body of the GitHub release.
 
 ## [Unreleased]
 
+## [0.1.11.4] - 2026-11-22
+
 ### Added
 
+- `ws mail`: `add`, `check`, `rm` and `serve` for IMAP mailboxes registered in the secrets registry, and five MCP
+  tools (list mailboxes, search, get, label, draft) behind a read-only-by-default connector. Drafts only: nothing is
+  sent. (C626)
 - `ws sync`: fetch every git repository under the code root, 4 at a time, each fetch killed (with its helpers)
   and named past `--timeout-s` (default 120); exit 1 when any failed or timed out.
 - `ws upgrade` writes one line per step to `logs/upgrade.jsonl` (verb, step, Python, version, exit, seconds and the

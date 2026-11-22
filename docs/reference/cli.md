@@ -1666,7 +1666,14 @@ An optional `[worktrees]` table in the profile:
 | `idle_hours` | `12` | Hours with no change before a worktree may go. |
 | `interval_hours` | `6` | Hours between the timer's prunes. |
 | `disk_pct` | `85` | Disk use at which the timer prunes at once and tells the lead. |
+| `temp_age_hours` | `6` | Age after which systemd-tmpfiles removes the contents of `/tmp/pytest-of-<user>`. |
+| `temp_warn_gb` | `10` | The doctor's WS021 warns when your files in `/tmp` pass this. |
 | `repos` | `[]` | More repos for `--auto`. |
+
+The test temp folder is not pruned by ws. pytest's own `tmp_path_retention_count` and `tmp_path_retention_policy`
+are set in `pyproject.toml`, and on Linux with systemd `ws install` writes
+`~/.config/user-tmpfiles.d/ws-pytest.conf` (one `e` line) and switches on the user's `systemd-tmpfiles-clean.timer`,
+which runs it. macOS isn't handled; `ws doctor` says so (WS021).
 
 ## `ws approve`
 

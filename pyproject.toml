@@ -58,3 +58,7 @@ pythonpath = ["tests/plugins"]
 addopts = "-p ws_harness -n auto --dist loadgroup"
 # Dump every thread's stack when a test is stuck for two minutes (noise only; the size limits do the killing).
 faulthandler_timeout = 120
+# Keep only the last run's temp folders, and only those of tests that failed. The count is text: the pinned pytest (below
+# 9.2) reads this key as a string and refuses a TOML integer (tests/test_worktrees.py pins it).
+tmp_path_retention_count = "1"
+tmp_path_retention_policy = "failed"

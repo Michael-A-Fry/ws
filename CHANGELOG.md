@@ -18,6 +18,10 @@ body of the GitHub release.
   `--only PATH` is for a session that has just finished. A repo is pruned only from inside its own zone.
   `ws-worktrees-prune.timer` (`ws.job.worktrees-prune` on launchd) checks the disk every 30 minutes, prunes every 6
   hours or at once at 85% and tells the lead. Thresholds are `[worktrees]` settings.
+- Test temp: `tmp_path_retention_count` and `tmp_path_retention_policy` in the pytest config, and `ws install`
+  writes a systemd-tmpfiles age rule for `/tmp/pytest-of-<user>` and switches on the user's
+  `systemd-tmpfiles-clean.timer` (Linux with systemd; macOS isn't handled). New doctor check WS021 warns when your
+  files in `/tmp` pass 10 GB.
 
 ## [0.1.11.7] - 2026-11-22
 

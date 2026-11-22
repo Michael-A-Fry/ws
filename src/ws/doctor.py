@@ -611,6 +611,13 @@ def run_checks(osi: OSInfo, profile_file: Path, env: dict | None = None, network
     except Exception as e:  # noqa: BLE001 (a broken check must report, not crash the whole doctor)
         checks.append(Check("WS010", "layout", FAIL, f"check crashed ({type(e).__name__})"))
     try:
+        from ws import tmpclean, worktrees
+
+        status, detail, fix = tmpclean.check(env, osi, worktrees.load_settings(env))
+        checks.append(Check("WS021", "temp", status, detail, fix))
+    except Exception as e:  # noqa: BLE001 (a broken check must report, not crash the whole doctor)
+        checks.append(Check("WS021", "temp", FAIL, f"check crashed ({type(e).__name__})"))
+    try:
         checks += _hooks_check(prof, env)
     except Exception as e:  # noqa: BLE001 (a broken check must report, not crash the whole doctor)
         checks.append(Check("WS011", "hooks", FAIL, f"check crashed ({type(e).__name__})"))

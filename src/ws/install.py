@@ -366,7 +366,7 @@ def _role_steps(composed: dict, answers: Answers, env: Mapping[str, str], taken:
 
 def plan(answers: Answers, env: Mapping[str, str] | None = None, osi=None) -> list[Step]:
     """The steps these answers call for, in order. Reads the machine; writes nothing."""
-    from ws import modules
+    from ws import modules, tmpclean, worktrees
 
     env = os.environ if env is None else env
     osi = osinfo.detect(env=dict(env)) if osi is None else osi
@@ -389,6 +389,8 @@ def plan(answers: Answers, env: Mapping[str, str] | None = None, osi=None) -> li
 
     taken = {(s.path, s.kind) for s in steps}
     steps += _role_steps(composed, answers, env, taken)
+    if temp := tmpclean.step(env, osi, worktrees.load_settings(env)):  # an age rule for pytest's temp folder
+        steps.append(temp)
 
     return steps + _gate_steps(answers, prof, parsed, policy_step.path.resolve(), entries, env)
 
@@ -894,10 +896,11 @@ def _record_file(step: Step, action: str, entries: dict[str, dict], result: Resu
 
 def current_roots(env: Mapping[str, str] | None = None) -> list[Path]:
     """The folders uninstall may act in, worked out now from the profile and never from the manifest."""
-    from ws import skills
+    from ws import skills, tmpclean
 
     env = os.environ if env is None else env
     found = _ws_dirs(env)
+    found.append(tmpclean.rule_path(env).parent)  # the one file `ws install` puts outside ws's own folders
     try:
         rls = _sub(profile.load(profile_path(env)) or {}, "roles")
     except (profile.ProfileError, OSError):
@@ -1233,6 +1236,8 @@ def _cmd_install_class(args: argparse.Namespace) -> int:
 
 
 def cmd_install(args: argparse.Namespace) -> int:
+    from ws import tmpclean
+
     env = os.environ
     if getattr(args, "class_name", None):
         return _cmd_install_class(args)
@@ -1252,6 +1257,8 @@ def cmd_install(args: argparse.Namespace) -> int:
                     print("ws: nothing changed")
                     return 1
             result = apply(steps, env)
+            if tmpclean.rule_path(env) in {*result.created, *result.changed}:
+                result.notes += tmpclean.enable_timer(env, osinfo.detect(env=dict(env)))
             if "skills" in answers.modules:
                 from ws import skills
 

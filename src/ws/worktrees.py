@@ -228,9 +228,37 @@ def _ppids() -> dict[int, int]:
     return out
 
 
-def sees_own_parents(ppid: dict[int, int], me: int | None = None) -> bool:
+INIT_NAMES = {"systemd", "init", "launchd"}
+
+
+def _read(path: str) -> str | None:
+    try:
+        return Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def in_root_namespaces(read=_read) -> bool:
+    """Is this process in the machine's own PID and user namespaces? A sandbox (bwrap, `unshare --pid`) gives its own
+    pid 1 and a short /proc, so every process outside it is invisible. On Linux: pid 1 must be init (systemd or init)
+    and the uid map, when there is one, must be the full identity map. Where there is no /proc (macOS), say yes:
+    `ps` there lists every process."""
+    comm = read("/proc/1/comm")
+    if comm is None:
+        return not Path("/proc/self").exists()
+    if comm.strip() not in INIT_NAMES:
+        return False
+    uid_map = read("/proc/self/uid_map")
+    if uid_map is not None and uid_map.split() != ["0", "0", "4294967295"]:
+        return False
+    return True
+
+
+def sees_own_parents(ppid: dict[int, int], me: int | None = None, read=_read) -> bool:
     """Does the process list show this process and every parent above it, up to init? A caller in its own PID namespace,
     or on a /proc mounted `hidepid`, sees only part of the tree, and then "nothing is using this folder" can't be said."""
+    if not in_root_namespaces(read):
+        return False
     cur = os.getpid() if me is None else me
     while cur in ppid:
         cur = ppid[cur]

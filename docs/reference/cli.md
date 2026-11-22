@@ -1143,10 +1143,11 @@ automatic rollback, rollback, a refused or dropped request, a rescue strike) is 
 state folder: `at`, `verb`, `from`, `to`, `duration_s`, `result`, `reason`.
 
 The service, the rescue timer and a hand-run `ws upgrade` (a swap, `--rollback` or `--hooks-only`) share one lock, an
-`flock` on `upgrade.lock` in ws's state folder, so no two of them change ws at once. The kernel drops it with its holder,
-so a crash never leaves it held. A hand-run upgrade waits up to 30 seconds for it and then exits 3; the service waits up to
-5 minutes, then logs `busy`, leaves the request file in place and exits 0 for the next run; a rescue tick that finds it
-held logs `busy` and counts no strike (a probe in the middle of a swap would be a false one). `--dry-run` takes no lock.
+`flock` on `upgrade.lock` in ws's state folder, so no two of them change ws at once. The kernel drops it with its
+holder, so a crash never leaves it held. A hand-run upgrade waits up to 30 seconds for it and then exits 3; the service
+waits up to 5 minutes, then logs `busy`, leaves the request file in place and exits 0 for the next run; a rescue tick
+that finds it held logs `busy` and counts no strike (a probe in the middle of a swap would be a false one). `--dry-run`
+takes no lock.
 
 The `upgrade-service` [guard](guards.md#upgrade-service) and the protected paths of the user-scope hook (the four unit
 files, every drop-in folder that could change them, the `user.control` copies and the tool folder) keep a session from

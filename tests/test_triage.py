@@ -956,3 +956,14 @@ def test_the_rules_file_accepts_check_and_the_default_may_be_check():
     assert triage.parse_rules('[[rule]]\nid = "x"\nlabel = "check"\nsubject = "a"\n').rules[0].label == "check"
     assert triage.parse_rules('default = "check"\n').default == "check"
     assert triage.ws_label("check") == "ws/fyi" and triage.ws_label("ws/low") == "ws/low"
+
+
+def test_a_reply_with_no_draft_says_why(tmp_path):
+    r = Route()
+    r.add(1, raw(subject="Quote", mid="<q1@example.org>"))
+    go(
+        tmp_path,
+        r,
+        Model(reply(True, "asks for a quote", "Kia ora Sam,\nSure, Friday 18 December works. Cheers, Alex")),
+    )
+    assert "“Quote”: asks for a quote. No draft. (the draft was not kept: names a date" in summary(tmp_path)

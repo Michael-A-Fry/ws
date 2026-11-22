@@ -996,7 +996,7 @@ def _item_line(it: dict) -> str:
     if it.get("kind") == "reply":
         head += " Draft saved." if it.get("draft") else " No draft."
     note = _plain(it.get("note"), SHOWN_REASON_MAX)
-    return f"{head} {note}" if note else head
+    return f"{head} ({note})" if note else head
 
 
 def summary_text(day: dict, when: datetime) -> str:

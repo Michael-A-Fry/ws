@@ -170,6 +170,7 @@ def test_the_whitelist_takes_what_the_ops_send():
         ("UID", ["STORE", "4", "+FLAGS", "(ws/low)"]),
         ("UID", ["FETCH", "4", imap._fetch_items(True, "full")]),
         ("UID", ["SEARCH", 'SINCE 1-Nov-2026 UNSEEN X-GM-RAW "from:sender"']),
+        ("UID", ["SEARCH", 'SINCE 1-Nov-2026 UID 5:* X-GM-RAW "from:sender"']),
         ("APPEND", ['"Drafts"', imap.DRAFT_FLAGS]),
         ("EXAMINE", ['"INBOX"']),
         ("LIST", ['""', '"*"']),
@@ -268,12 +269,24 @@ def test_a_draft_that_is_not_plain_ours_and_marked_is_refused_before_dialling(bo
     assert statuses == ["begin", "bad_request"]  # the begin line always gets its outcome
 
 
+def test_a_search_after_a_uid_is_the_oldest_page_above_it(box):
+    ms = [box.fake.add(ORIGINAL) for _ in range(imap.MAX_RESULTS + 5)]
+    got = box.call("search", since="2026-11-01", after_uid=ms[2].uid)
+    want = [m.uid for m in ms[3:]]
+    assert got["uids"] == want[: imap.MAX_RESULTS] and got["total"] == len(want)
+    assert ("UID", f"SEARCH SINCE 1-Nov-2026 UID {ms[2].uid + 1}:*") in box.fake.log
+    assert box.call("search", after_uid=ms[-1].uid)["uids"] == []  # "n:*" names the top uid too: it is left out
+
+
 @pytest.mark.parametrize(
     "cmd,args",
     [
         ("search", {"since": "22/11/2026"}),
         ("search", {"query": 'a" OR ALL'}),
         ("search", {"folder": 'IN"BOX'}),
+        ("search", {"after_uid": "3"}),
+        ("search", {"after_uid": -1}),
+        ("search", {"after_uid": True}),
         ("fetch", {"uid": "1", "uidvalidity": 7}),
         ("fetch", {"uid": 1, "uidvalidity": 7, "part": "BODY[]"}),
         ("label", {"uid": 1, "uidvalidity": 7, "label": "\\Trash"}),

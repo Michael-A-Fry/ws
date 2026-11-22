@@ -63,6 +63,21 @@ def _quote(word: str, expand: bool = False) -> str:
 
 
 def on_calendar(when: When) -> str:
+    """The OnCalendar= value. A window needs two lines: both come back, the second after a newline and its own
+    `OnCalendar=` (see `on_calendars`)."""
+    return "\nOnCalendar=".join(on_calendars(when))
+
+
+def on_calendars(when: When) -> list[str]:
+    """One OnCalendar= value per line. `every Nm 05:00-22:00` is the runs of the first hour up to the one before the
+    last, and the last hour's own :00 (both ends are runs)."""
+    if when.kind == "every" and when.window:
+        first, last = when.window
+        return [f"*-*-* {first:02d}..{last - 1:02d}:00/{when.every}:00", f"*-*-* {last:02d}:00:00"]
+    return [_on_calendar(when)]
+
+
+def _on_calendar(when: When) -> str:
     if when.kind == "hourly":
         return "*-*-* *:00:00"
     if when.kind == "every":

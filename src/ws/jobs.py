@@ -16,7 +16,9 @@
                                         merge_ready); written to the run record as `green`
     sources = ["notes"]                 policy sources the job reads (the Rule of Two looks at these)
     schedule = "daily 03:30"            optional: hourly | daily HH:MM | weekly DAY HH:MM | monthly D HH:MM (D from 1
-                                        to 28) | every Nm (N from 5 to 30), in local time. `ws schedule apply` turns it
+                                        to 28) | every Nm (N from 5 to 30) | every Nm HH:00-HH:00 (the same, only from
+                                        the first whole hour to the second, both ends included), in local time.
+                                        `ws schedule apply` turns it
                                         into a systemd timer or a launchd agent. The timer queues the slot and drains the
                                         queue (`ws queue tick NAME --slot schedule --run`): the slot is the latest time
                                         of the schedule at or before the fire, so a late catch-up fire gets its own slot.
@@ -25,8 +27,10 @@
     skip_missed = 3600                  optional: a tick more than this many seconds after its slot is skipped, not run
                                         (default: never skipped; `ws queue tick --skip-missed S` overrides it)
     command = "backup"                  instead of runner, model and prompt: a ws command the schedule runs
-                                        (`ws backup run`, `ws queue run`, or `script`). Only `ws schedule` runs these;
-                                        `ws run` refuses them.
+                                        (`ws backup run`, `ws queue run`, `script`, or `triage`). Only `ws schedule` runs
+                                        these; `ws run` refuses them.
+    [triage]                            with command = "triage": the inbox job's own settings (ws.triage); the timer runs
+                                        `ws triage run --job NAME`, which reads this table
     extra_sources = ["~/.ws"]           with command = "backup": more folders or files the backup takes, beside the
                                         memory, notes and profile (absolute, or under ~)
     script = "~/bin/upkeep.sh"          with command = "script": the reviewed script the timer runs (`ws schedule
@@ -134,6 +138,7 @@ KEYS = {
     "extra_sources",
     "script",
     "script_sha256",
+    "triage",
 }
 CONTRACT_KEYS = ("timeout_s", "on_failure", "log", "uninstall", "expected_rate", "data_class")  # the six lines
 ON_FAILURE = ("alert",)
@@ -145,13 +150,20 @@ COMMANDS = {
     "backup": ("backup", "run"),
     "queue": ("queue", "run"),
     "script": ("schedule", "script"),  # the job's name follows: `ws schedule script NAME`
+    "triage": ("triage", "run"),  # `--job NAME` follows: the settings are the file's [triage] table (ws.triage)
 }  # the ws commands a job file may schedule in place of a runner
-COMMAND_ONLY = {"extra_sources": "backup", "script": "script", "script_sha256": "script"}  # key -> the command it needs
+COMMAND_ONLY = {
+    "extra_sources": "backup",
+    "script": "script",
+    "script_sha256": "script",
+    "triage": "triage",
+}  # key -> the command it needs
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 _DAY_NAMES = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
 _CLOCK = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 _EVERY = re.compile(r"^(\d{1,2})m$")
+_WINDOW = re.compile(r"^(\d{1,2}):([0-5]\d)-(\d{1,2}):([0-5]\d)$")
 MONTH_DAY_MAX = 28  # `monthly D`: a day every month has
 EVERY_MIN, EVERY_MAX = 5, 30  # `every Nm`: minutes between runs
 RESOURCE_KEYS = {"ram_gb", "slot"}
@@ -178,12 +190,14 @@ class When:
     weekday: int = 0
     every: int = 0  # minutes between runs; only `every` uses it
     day: int = 0  # day of the month, 1 to 28; only `monthly` uses it
+    window: tuple[int, int] | None = None  # `every` only: the first and last whole hour it runs in, both ends included
 
     def __str__(self) -> str:
         if self.kind == "hourly":
             return "hourly"
         if self.kind == "every":
-            return f"every {self.every}m"
+            span = f" {self.window[0]:02d}:00-{self.window[1]:02d}:00" if self.window else ""
+            return f"every {self.every}m{span}"
         at = f"{self.hour:02d}:{self.minute:02d}"
         if self.kind == "monthly":
             return f"monthly {self.day} {at}"
@@ -286,11 +300,21 @@ def _number(d: dict, key: str, where: str, default, integer: bool = False):
 
 
 def parse_schedule(text: str, where: str) -> When:
-    """`hourly`, `daily HH:MM`, `weekly DAY HH:MM`, `monthly D HH:MM` (D from 1 to 28) or `every Nm` (N from 5 to 30).
-    Raises JobError naming the key."""
+    """`hourly`, `daily HH:MM`, `weekly DAY HH:MM`, `monthly D HH:MM` (D from 1 to 28), `every Nm` (N from 5 to 30) or
+    `every Nm HH:00-HH:00` (the same times, only from the first whole hour to the second, both ends included; the
+    window does not cross midnight). Raises JobError naming the key."""
     words = text.lower().split()
     if words == ["hourly"]:
         return When("hourly")
+    if len(words) == 3 and words[0] == "every":
+        when = parse_schedule(f"every {words[1]}", where)
+        w = _WINDOW.match(words[2])
+        if not w or w[2] != "00" or w[4] != "00" or not 0 <= int(w[1]) < int(w[3]) <= 23:
+            raise JobError(
+                f"{where}: the window of an every schedule is two whole hours, the first before the second and on "
+                "the same day, as in every 30m 05:00-22:00"
+            )
+        return replace(when, window=(int(w[1]), int(w[3])))
     if len(words) == 2 and words[0] == "every":
         m = _EVERY.match(words[1])
         if not m or not EVERY_MIN <= int(m[1]) <= EVERY_MAX:
@@ -310,8 +334,8 @@ def parse_schedule(text: str, where: str) -> When:
             )
         return When("monthly", int(clock[1]), int(clock[2]), day=int(words[1]))
     raise JobError(
-        f"{where}: schedule must be hourly, daily HH:MM, weekly DAY HH:MM, monthly D HH:MM or every Nm "
-        "(for example weekly mon 09:00)"
+        f"{where}: schedule must be hourly, daily HH:MM, weekly DAY HH:MM, monthly D HH:MM, every Nm or "
+        "every Nm HH:00-HH:00 (for example weekly mon 09:00)"
     )
 
 
@@ -327,6 +351,15 @@ def latest_slot(when: When, now: datetime, tz=None) -> datetime:
     if when.kind in ("hourly", "every"):
         wall = local.replace(second=0, microsecond=0)
         wall = wall.replace(minute=0 if when.kind == "hourly" else wall.minute - wall.minute % when.every)
+        if when.window and not when.window[0] * 60 <= wall.hour * 60 + wall.minute <= when.window[1] * 60:
+            # outside the window the slot is its last run: today's if it has passed, else the day before's
+            last = wall.replace(hour=when.window[1], minute=0)
+            for _ in range(3):
+                first = _first_instant(last, tz)
+                if first is not None and first <= now:
+                    return first
+                last -= timedelta(days=1)
+            return min(_instants(last, tz))  # not reached for a real zone
         ok = [t for t in _instants(wall, tz) if t <= now and _shows(t, wall, tz)]
         return max(ok) if ok else min(_instants(wall, tz))
     wall = local.replace(hour=when.hour, minute=when.minute, second=0, microsecond=0)
@@ -886,6 +919,10 @@ def scheduled(env: dict | None = None) -> list[Scheduled]:
             command = (*command, path.stem)
         elif command == COMMANDS["backup"]:
             extra_sources(d, where, env)
+        elif command == COMMANDS["triage"]:
+            if not isinstance(d.get("triage"), dict):
+                raise JobError(f"{where}: triage is required for a job with command = 'triage' (a [triage] table)")
+            command = (*command, "--job", path.stem)
         when = parse_schedule(_string(d, "schedule", where) or "", f"{where}: schedule")
         timeout_s, rate_s = _contract_values(d, where)
         out.append(

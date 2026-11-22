@@ -30,6 +30,7 @@ SHIPPED = [
     ("passtest", "passtest"),
     ("queue", "queue"),
     ("sync", "sync"),
+    ("triage", "triage"),
     ("upgrade", "upgrade"),
     ("usage", "usage"),
     ("walls", "walls"),

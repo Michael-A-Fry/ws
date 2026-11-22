@@ -31,6 +31,11 @@ body of the GitHub release.
 
 ### Fixed
 
+- The loopback page server counted idle time from when it was built, and building it asked DNS for the host name (a
+  reverse lookup that can stall for tens of seconds on a macOS runner), so it could close before its first request and
+  `tests/test_ui.py` failed with `ConnectionRefusedError` about half the runs there. Idle time now counts from the start
+  of `serve()`, and the constructor no longer looks the name up.
+
 - `ws mail`: `Mail.search` passes `after_uid` through as given, so the broker refuses a bool, a string or a fraction
   instead of quietly turning it into a number.
 

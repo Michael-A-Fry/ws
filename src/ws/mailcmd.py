@@ -6,7 +6,7 @@ and stops: the registry is the person's file, ws never writes it), asks for the 
 ask` / `wait` flow when the store has none (or, on a terminal, a no-echo prompt right there, so a plain ssh login with
 no tmux works), then logs in read-only through the broker and prints the folders found and the drafts folder. The value
 is tidied for its host first (a Gmail app password loses the spaces Google shows), and a value that was just stored and
-does not log in is taken out again. A missing drafts folder is said out loud: drafts are refused until there is one.
+the server refuses (`login_refused`) is taken out again; any other failure keeps it. A missing drafts folder is said out loud: drafts are refused until there is one.
 
 `ws mail check` logs in read-only (LIST) to every mailbox and says ok or why not; exit 1 when any fails. `ws mail rm
 NAME` takes the profile table out; the registry entry and the stored password stay, and it prints how to remove them.
@@ -140,9 +140,10 @@ def cmd_add(args: argparse.Namespace) -> int:
             _ask(secret, args.timeout)
         try:
             found = client.folders(name)
-        except mail.MailError:  # the value just stored did not log in: keep nothing new
-            with contextlib.suppress(OSError, wsecrets.SecretsError):
-                wsecrets.local_store().delete(secret)
+        except mail.MailError as e:
+            if e.kind == "login_refused":  # the server said no to the value just stored: keep nothing new. Anything
+                with contextlib.suppress(OSError, wsecrets.SecretsError):  # else (a network blip, no broker) keeps
+                    wsecrets.local_store().delete(secret)  # it: a provider shows an app password only once
             raise
     data.update(registered=True, **{k: found[k] for k in ("folders", "gmail", "drafts")})
     data["connector"] = mail_mcp.CONNECTOR_TOML if _connector_missing() else None

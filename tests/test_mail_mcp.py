@@ -318,3 +318,21 @@ def test_add_keeps_nothing_new_when_the_typed_password_fails(home, box, capsys, 
     out = capsys.readouterr()
     assert code != 0 and "refused the login" in out.err and wrong not in out.out + out.err
     assert "mail-a" not in box.s.store.names()  # the value that failed was taken out again
+
+
+def test_add_keeps_the_typed_password_when_the_broker_cannot_be_reached(home, box, capsys, monkeypatch):
+    box.s.store.delete("mail-a")
+    monkeypatch.setattr("sys.stdin", _Tty())
+    monkeypatch.setattr("getpass.getpass", lambda prompt: box.password)
+    monkeypatch.setattr(wsecrets, "local_store", lambda env=None: box.s.store)
+    real, calls = mail.Mail.folders, []
+
+    def folders(self, name):
+        calls.append(name)
+        if len(calls) == 1:
+            return real(self, name)  # unset: the prompt runs
+        raise mail.MailError("broker_unavailable", "the secrets broker is not reachable")
+
+    monkeypatch.setattr(mail.Mail, "folders", folders)
+    assert cli.main(["mail", "add", "a", "--host", HOST, "--user", USER]) != 0
+    assert box.s.store.read("mail-a") == box.password  # a provider shows an app password once: a blip keeps it

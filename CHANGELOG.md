@@ -11,7 +11,8 @@ body of the GitHub release.
 ### Fixed
 
 - `ws mail add` asks for the password in place when it runs on a terminal, so a plain ssh login with no tmux works;
-  a password it just stored that then fails to log in is taken out again. (C666)
+  a password it just stored that the server then refuses is taken out again (a network or broker failure keeps it).
+  A refused mailbox login now has its own broker code, `login_refused`, apart from `upstream_refused`. (C666)
 - A Gmail app password pasted with the spaces Google shows ("abcd efgh ijkl mnop") is stored as the 16 letters Gmail's
   IMAP login wants, by `ws mail add`, `ws secret set` and `ws secret ask`; a Gmail value that isn't 16 letters is
   refused before it's stored. Other hosts keep the value as typed. (C666)

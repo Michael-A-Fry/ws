@@ -8,6 +8,13 @@ body of the GitHub release.
 
 ## [Unreleased]
 
+### Fixed
+
+- The loopback page server counted idle time from when it was built, and building it asked DNS for the host name (a
+  reverse lookup that can stall for tens of seconds on a macOS runner), so it could close before its first request and
+  `tests/test_ui.py` failed with `ConnectionRefusedError` about half the runs there. Idle time now counts from the start
+  of `serve()`, and the constructor no longer looks the name up.
+
 ## [0.1.11.6] - 2026-11-22
 
 ### Added

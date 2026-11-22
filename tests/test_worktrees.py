@@ -277,3 +277,101 @@ def test_the_launchd_agent_runs_the_auto_prune_every_half_hour(box):
 
     plist = launchd.render_worktrees(dict(os.environ), ["/opt/ws"])
     assert ">worktrees<" in plist and ">--auto<" in plist and "<integer>1800</integer>" in plist
+
+
+def stat_mode(path: Path) -> int:
+    return os.lstat(path).st_mode & 0o777
+
+
+@needs_git
+def test_a_worktree_outside_the_folder_keeps_its_record_even_when_its_folder_moved(repo, box):
+    add(repo, "idle")
+    elsewhere = box / "elsewhere"
+    git(repo, "worktree", "add", "-q", "-b", "b-away", str(elsewhere))
+    (elsewhere / "staged").write_text("s")
+    git(elsewhere, "add", "staged")  # staged work lives in git's admin folder for that worktree
+    elsewhere.rename(box / "moved")  # git can't find the folder now, so a `git worktree prune` would drop the record
+    assert reasons(prune(repo)) == {"idle": "removed"}
+    assert "elsewhere" in registered(repo)
+    assert (repo / ".git" / "worktrees" / "elsewhere" / "index").exists()
+
+
+@needs_git
+def test_a_full_zone_folder_whose_main_checkout_is_walled_is_refused(box):
+    full, walled = box / "open", box / "walled"
+    full.mkdir()
+    walled.mkdir()
+    git(walled, "init", "-q", "-b", "main")
+    (walled / "f").write_text("f")
+    git(walled, "add", "f")
+    git(walled, "commit", "-q", "-m", "first")
+    inside = add(walled, "idle")  # a worktree the walled zone owns, idle and clean
+    linked = full / "linked"
+    git(walled, "worktree", "add", "-q", "-b", "b-linked", str(linked))  # in the full zone, but of a walled repo
+    pol = paths.config_dir(os.environ) / "policy.toml"
+    pol.parent.mkdir(parents=True, exist_ok=True)
+    pol.write_text(f'[classes.open]\naccess = "full"\nrepos = ["{full}/**"]\n[classes.w]\naccess = "walled"\nos_user = "svc"\nrepos = ["{walled}/**"]\n')  # fmt: skip
+    report = worktrees.run_prune(os.environ, [linked], worktrees.Settings(), time.time(), False, caller=str(full))
+    assert report.items == [] and report.refused and "w zone" in report.refused[0][1]
+    assert inside.exists() and "idle" in registered(walled)
+
+
+@needs_git
+def test_a_process_list_that_hides_the_callers_parents_keeps_every_worktree(repo, monkeypatch):
+    wt = add(repo, "idle")
+    me = os.getpid()
+    assert worktrees.sees_own_parents({me: 4242, 4242: 1}, me)
+    assert worktrees.sees_own_parents({me: 1}, me)
+    assert not worktrees.sees_own_parents({me: 4242}, me)  # the parent is not listed
+    assert not worktrees.sees_own_parents({}, me)
+    with monkeypatch.context() as m:
+        m.setattr(worktrees, "_ppids", lambda: {me: 4242})  # a PID namespace or `hidepid`: part of the tree only
+        assert reasons(prune(repo)) == {"idle": "busy-unknown"} and wt.exists()
+        assert reasons(prune(repo, dry_run=True)) == {"idle": "busy-unknown"}
+    assert reasons(prune(repo)) == {"idle": "removed"}
+
+
+@needs_git
+def test_a_worktree_git_refuses_keeps_its_modes(repo):
+    wt = add(repo, "untracked")
+    cache = wt / "cache"
+    cache.mkdir()
+    for f in (wt / "notes.txt", cache / "x"):  # one untracked and not ignored, so git refuses; one ignored
+        f.write_text("x")
+        os.chmod(f, 0o444)
+    os.chmod(cache, 0o555)
+    age(wt)
+    try:
+        assert {Path(i.path).name: i.action for i in prune(repo).items} == {"untracked": "failed"}
+        assert [stat_mode(p) for p in (wt / "notes.txt", cache / "x", cache)] == [0o444, 0o444, 0o555]
+    finally:
+        os.chmod(cache, 0o755)
+
+
+@needs_git
+def test_files_with_two_names_and_links_pointing_out_are_not_changed(repo, box):
+    shared, target = box / "shared", box / "target"
+    for f in (shared, target):
+        f.write_text("x")
+        os.chmod(f, 0o444)
+    wt = add(repo, "cache")
+    (wt / "cache").mkdir()
+    os.link(shared, wt / "cache" / "shared")  # uv's cache hard-links files into every virtualenv
+    os.symlink(target, wt / "cache" / "link")
+    age(wt)
+    assert reasons(prune(repo)) == {"cache": "removed"} and not wt.exists()
+    assert (stat_mode(shared), stat_mode(target)) == (0o444, 0o444) and shared.exists() and target.exists()
+
+
+def test_make_writable_leaves_a_link_for_its_root_alone(box):
+    real, link = box / "real", box / "link"
+    real.mkdir()
+    os.chmod(real, 0o555)
+    os.symlink(real, link)
+    try:
+        worktrees.make_writable(link)
+        assert stat_mode(real) == 0o555
+        worktrees.make_writable(real)
+        assert stat_mode(real) == 0o755
+    finally:
+        os.chmod(real, 0o755)

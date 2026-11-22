@@ -1628,10 +1628,13 @@ ws worktrees prune [--repo R]... [--only PATH] [--min-idle HOURS] [--dry-run] [-
 
 A worktree is kept, and the reason counted, when it's `locked`, `dirty` (a tracked file has a change), `fresh` (a
 file in it changed in the last `idle_hours`, default 12), `in-use` (a process has its working folder or an open file
-inside it: `/proc` on Linux, `lsof` on macOS; a process of another account can't be seen), or `unreachable` (HEAD is
-detached and no branch, remote or tag holds it). Everything else is made writable and removed with
-`git worktree remove`, never `--force`: git still refuses a folder with untracked files, and that's reported as
-`failed` and left registered. Branches and commits stay; the main checkout and worktrees elsewhere are never touched;
+inside it: `/proc` on Linux, `lsof` on macOS; a process of another account can't be seen), `busy-unknown` (the process
+list doesn't show the caller's own parents, as in a PID namespace or with `hidepid`, so use can't be ruled out and every
+worktree stays), or `unreachable` (HEAD is detached and no branch, remote or tag holds it). Everything else is removed
+with `git worktree remove`, never `--force`: git still refuses a folder with untracked files, and that's reported as
+`failed` and left registered. Only a folder where `git status` shows nothing to lose is first made writable, and a file
+with more than one hard link keeps its mode. Nothing runs `git worktree prune`, so other registered worktrees are left
+alone. Branches and commits stay; the main checkout and worktrees elsewhere are never touched;
 ignored files (virtualenvs, caches) go with the folder. Each removal is one line in `<state>/worktree-prune.log`. The
 run prints `checked N, removed M, kept K (reasons), X GB freed`; `--dry-run` changes nothing and prints the same,
 saying would remove. Exit 1 when a removal failed.

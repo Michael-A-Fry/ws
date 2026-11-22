@@ -11,7 +11,8 @@ body of the GitHub release.
 ### Added
 
 - `ws worktrees prune`: removes agent worktrees under `<repo>/.claude/worktrees` that nothing needs. It keeps one
-  that's locked, has a change to a tracked file, changed in the last 12 hours, has a process inside it, or has a
+  that's locked, has a change to a tracked file, changed in the last 12 hours, has a process inside it (or the process
+  list doesn't show the caller's own parents, so use can't be ruled out), or has a
   detached HEAD that no branch, remote or tag holds; the rest are removed with `git worktree remove` (no `--force`),
   branches and commits stay, and each removal is logged. `--dry-run` prints the same line without changing anything.
   `--only PATH` is for a session that has just finished. A repo is pruned only from inside its own zone.

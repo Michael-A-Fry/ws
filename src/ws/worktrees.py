@@ -8,15 +8,20 @@ Built, because git can list, check and remove a worktree but no maintained tool 
 time and the live processes together.
 
 A worktree under `<repo>/.claude/worktrees/` (never the main checkout or one elsewhere) is kept, with a reason, when it
-is `locked`, `dirty` (a tracked file has a change), `fresh` (a file in it changed in the last
-`idle_hours`, 12), `in-use` (a process has its working folder or an open file inside it: /proc on Linux, one `lsof`
-on macOS; another account's processes can't be seen), or `unreachable` (HEAD detached and no branch, remote or tag holds
-it). `--only` (the close-out path) also needs its head on a remote ref (`unpushed`) and counts the caller's own parents
-as not using it; every run ignores itself and its own children. The rest are made writable (`chmod -R u+w`) and removed
-with `git worktree remove`, never `--force`, so git still refuses a folder with untracked files: that is `failed`, the
-worktree stays registered and the run goes on. Branches and commits stay. Ignored files (virtualenvs, caches) go with
-the folder, by design. Each removal adds a line (time, path, branch, head) to `<state>/worktree-prune.log`. The run prints
-one line, `checked N, removed M, kept K (by reason), X GB freed`; `--dry-run` prints the same and changes nothing.
+is `locked`, `dirty` (a tracked file has a change), `fresh` (a file in it changed in the last `idle_hours`, 12),
+`in-use` (a process has its working folder or an open file inside it: /proc on Linux, one `lsof` on macOS; another
+account's processes can't be seen), `busy-unknown` (the process list does not show the caller's own parents, as in a
+PID namespace or with `hidepid`, so use can't be ruled out and every worktree stays), or `unreachable` (HEAD detached
+and no branch, remote or tag holds it). `--only` (the close-out path) also needs its head on a remote ref (`unpushed`)
+and counts the caller's own parents as not using it; every run ignores itself and its own children. The rest are
+removed with `git worktree remove`, never `--force`, so git still refuses a folder with untracked files: that is
+`failed`, the worktree stays registered and the run goes on. Only a folder where `git status` shows nothing to lose
+(untracked files included, ignored ones not) is first made writable (`chmod -R u+w`), and a file with more than one
+hard link is left as it is, so a refused worktree keeps its modes and uv's shared cache is not touched. Only these
+worktrees are removed: nothing runs `git worktree prune`, which would also drop other registered worktrees whose folder
+has moved. Branches and commits stay. Ignored files (virtualenvs, caches) go with the folder, by design. Each removal
+adds a line (time, path, branch, head) to `<state>/worktree-prune.log`. The run prints one line, `checked N, removed M,
+kept K (by reason), X GB freed`; `--dry-run` prints the same and changes nothing.
 
 Zones. A repo is pruned only from inside its own zone: a caller in a data class may prune that class's repos, and
 another `full` class if it is `full` itself; a caller in no class (a timer, run from the home folder) may prune `full`
@@ -170,13 +175,28 @@ def tree_bytes(root: str | Path) -> int:
 
 
 def make_writable(root: str | Path) -> None:
-    """`chmod -R u+w`, links not followed: a read-only folder (Go's module cache) blocks its own removal."""
+    """`chmod -R u+w`, links not followed: a read-only folder (Go's module cache) blocks its own removal. A root that is
+    a link or not a folder is left alone, and so is a file with more than one name (uv's cache hard-links its files into
+    every virtualenv: changing the mode here would change it for the other names too)."""
+    try:
+        st = os.lstat(root)
+    except OSError:
+        return
+    if not stat.S_ISDIR(st.st_mode):
+        return
     with contextlib.suppress(OSError):
-        os.chmod(root, os.lstat(root).st_mode | 0o700)
+        os.chmod(root, st.st_mode | 0o700)
     for path, st in walk(root):
-        if not stat.S_ISLNK(st.st_mode):
-            with contextlib.suppress(OSError):
-                os.chmod(path, st.st_mode | (0o700 if stat.S_ISDIR(st.st_mode) else 0o200))
+        if stat.S_ISLNK(st.st_mode) or (not stat.S_ISDIR(st.st_mode) and st.st_nlink > 1):
+            continue
+        with contextlib.suppress(OSError):
+            os.chmod(path, st.st_mode | (0o700 if stat.S_ISDIR(st.st_mode) else 0o200))
+
+
+def untouched(path: str | Path) -> bool:
+    """Does git see nothing to lose in `path`: no change, and no untracked file (ignored files do not count)?"""
+    code, out = _git(path, "status", "--porcelain")
+    return code == 0 and not out.strip()
 
 
 def _reaches(path: str, head: str, *namespaces: str) -> bool:
@@ -208,10 +228,22 @@ def _ppids() -> dict[int, int]:
     return out
 
 
-def own_tree(parents: bool, me: int | None = None) -> set[int]:
+def sees_own_parents(ppid: dict[int, int], me: int | None = None) -> bool:
+    """Does the process list show this process and every parent above it, up to init? A caller in its own PID namespace,
+    or on a /proc mounted `hidepid`, sees only part of the tree, and then "nothing is using this folder" can't be said."""
+    cur = os.getpid() if me is None else me
+    while cur in ppid:
+        cur = ppid[cur]
+        if cur <= 1:
+            return True
+    return False
+
+
+def own_tree(parents: bool, me: int | None = None, ppid: dict[int, int] | None = None) -> set[int]:
     """This process and everything it started; with `parents`, the processes that started it as well."""
     me = os.getpid() if me is None else me
-    ppid, tree, grew = _ppids(), {me}, True
+    ppid = _ppids() if ppid is None else ppid
+    tree, grew = {me}, True
     while grew:
         more = {pid for pid, parent in ppid.items() if parent in tree} - tree
         tree |= more
@@ -319,10 +351,13 @@ class Report:
         }
 
 
-def judge(wt: Worktree, idle_s: float, now: float, busy: dict[str, list[int]], require_pushed: bool) -> str:
-    """Why this worktree must stay, or "" when it can go. The cheap checks come first."""
+def judge(wt: Worktree, idle_s: float, now: float, busy: dict[str, list[int]], require_pushed: bool, blind: bool = False) -> str:  # fmt: skip
+    """Why this worktree must stay, or "" when it can go. The cheap checks come first. `blind` is a process list that
+    does not show the caller's own parents: use can't be ruled out, so every worktree stays."""
     if wt.locked:
         return "locked"
+    if blind:
+        return "busy-unknown"
     if busy.get(wt.path):
         return "in-use"
     code, out = _git(wt.path, "status", "--porcelain", "--untracked-files=no")
@@ -338,7 +373,7 @@ def judge(wt: Worktree, idle_s: float, now: float, busy: dict[str, list[int]], r
 
 
 def prune_repo(
-    repo: Path, idle_s: float, now: float, dry_run: bool, only: str | None, ignore: set[int], log
+    repo: Path, idle_s: float, now: float, dry_run: bool, only: str | None, ignore: set[int], log, blind: bool = False
 ) -> list[Item]:
     """Check each worktree under `<repo>/.claude/worktrees` and remove the ones nothing needs. `only` limits it to one
     and also asks for its head to be pushed."""
@@ -356,12 +391,13 @@ def prune_repo(
     items = []
     for wt in wts:
         item = Item(str(repo), wt.path, wt.branch, wt.head[:12])
-        item.reason = judge(wt, idle_s, now, busy, only is not None)
+        item.reason = judge(wt, idle_s, now, busy, only is not None, blind)
         if not item.reason:
             item.bytes = tree_bytes(wt.path)
             item.action = "would-remove" if dry_run else "removed"
             if not dry_run:
-                make_writable(wt.path)
+                if untouched(wt.path):  # git decides first: a worktree it will refuse keeps its modes
+                    make_writable(wt.path)
                 code, out = _git(repo, "worktree", "remove", wt.path)
                 if code != 0:
                     item.action, item.bytes = "failed", 0
@@ -369,9 +405,7 @@ def prune_repo(
                 else:
                     log(item)
         items.append(item)
-    if not dry_run:
-        _git(repo, "worktree", "prune")
-    return items
+    return items  # no closing `git worktree prune`: it would act on every registered worktree, not just these
 
 
 # --- zones -----------------------------------------------------------------------------------------------------------
@@ -488,14 +522,20 @@ def run_prune(env, folders: list[Path], settings: Settings, now: float, dry_run:
     """Prune the repo each folder is in, when the caller's zone allows it; refuse the others without running git there."""
     report, pol, caller = Report(dry_run=dry_run), _policy(env), caller or os.getcwd()
     idle_s = (settings.idle_hours if min_idle is None else min_idle) * 3600
-    ignore = own_tree(parents=only is not None)
+    ppid = _ppids()
+    ignore, blind = own_tree(parents=only is not None, ppid=ppid), not sees_own_parents(ppid)
     for folder in folders:
         why = zone_refusal(pol, caller, folder)  # judged on the path alone, before git reads anything there
         if why:
             report.refused.append((str(folder), why))
             continue
+        main = main_checkout(folder)
+        why = zone_refusal(pol, caller, main)  # a folder in one zone can belong to a repo in another
+        if why:
+            report.refused.append((str(main), why))
+            continue
         log = _log_removal(env, now)
-        report.items += prune_repo(main_checkout(folder), idle_s, now, dry_run, only, ignore, log)
+        report.items += prune_repo(main, idle_s, now, dry_run, only, ignore, log, blind)
     return report
 
 

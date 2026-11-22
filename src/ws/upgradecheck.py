@@ -136,6 +136,20 @@ def snapshot(env: Mapping[str, str]) -> dict[str, int]:
     }
 
 
+def gate_problems(env: Mapping[str, str]) -> list[str]:
+    """What is wrong with the gate right now, by the watchdog's probes: the hook must be there, let `ls -la` run and stop a
+    private-key read and a read in the secrets folder. Empty when the gate is as it should be."""
+    hook = hook_command(env)
+    if hook is None:
+        return ["no gate hook in the runner's settings"]
+    home = env.get("HOME", "")
+    problems = [f"the gate stopped `{ALLOW_PROBE}`"] if probe(hook, ALLOW_PROBE, env) != 0 else []
+    for cmd in deny_probes(env)[:2]:
+        if probe(hook, cmd, env) != 2:
+            problems.append(f"the gate let `{cmd.replace(home, '~')}` through")
+    return problems
+
+
 def acceptance(
     env: Mapping[str, str], tag: str, ws_argv: list[str], before: Mapping[str, int], session_check: str | None = None
 ) -> list[str]:
@@ -158,16 +172,7 @@ def acceptance(
     hooks = ws("upgrade", "--hooks-only")
     if hooks is None or hooks.returncode != 0:
         problems.append(f"`ws upgrade --hooks-only` exits {hooks.returncode if hooks else 'without running'}")
-    hook = hook_command(env)
-    home = env.get("HOME", "")
-    if hook is None:
-        problems.append("no gate hook in the runner's settings after the swap")
-    else:
-        if probe(hook, ALLOW_PROBE, env) != 0:
-            problems.append(f"the gate stopped `{ALLOW_PROBE}`")
-        for cmd in deny_probes(env)[:2]:
-            if probe(hook, cmd, env) != 2:
-                problems.append(f"the gate let `{cmd.replace(home, '~')}` through")
+    problems += gate_problems(env)
     now = snapshot(env)
     for key, what in (("deny", "deny rules"), ("denied", "must-deny probes stopped")):
         if now[key] < before.get(key, 0):

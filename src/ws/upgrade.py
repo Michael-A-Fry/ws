@@ -109,6 +109,7 @@ from ws import (
     selfcmd,
     upgradecheck,
     upgradeproof,
+    upgradeunit,
     userconfig,
 )
 from ws import version as wsversion
@@ -125,6 +126,7 @@ BROKER_STOP_S = 10.0  # how long a stopped broker has to close its socket
 BROKER_START_S = 30.0  # how long the new broker has to answer
 DEFAULT_GUARDS = (
     "pane-keys",
+    "upgrade-service",
 )  # guards added to a policy's `[guards] on` list by the rewrite, once, when it is missing
 STEP_ENV = "WS_UPGRADE_STEP"  # set for each step the upgrade runs: a hooks rewrite there leaves the log line to it
 INSTALL_TIMEOUT_S, STEP_TIMEOUT_S = 600.0, 120.0  # the watchdog per step: the installer, then the hooks and the check
@@ -1281,10 +1283,75 @@ def _unattended_rollback(args, env, t0: float) -> int:
     return code or (EXIT_FAILED if problems else 0)
 
 
+RESCUE_STRIKES = 2  # failed probes in a row before the rescue goes back a release
+
+
+def _rescue_file(env: Mapping[str, str]) -> Path:
+    return paths.state_dir(dict(env)) / "rescue.json"  # in ws's own state: a session cannot reset the count
+
+
+def cmd_rescue(args: argparse.Namespace, env: Mapping[str, str]) -> int:
+    """`ws upgrade --rescue`, the rescue timer's entry (same entry rule as `--unattended`): probe the gate as a watchdog
+    would; two failures in a row go back to the release before the last upgrade (the policy and hooks with it, C706), once.
+    A gate that still fails after that is logged and left to a person. 0 when the gate is right, else 1."""
+    why = unattended_refusal(env) or agentsession.refusal(env, False, False)
+    if why:
+        raise WsError("refused", why, "it is started by `ws-rescue.timer`, not by hand", EXIT_REFUSED)
+    args.log_verb = "rescue"
+    t0 = time.monotonic()
+    problems = upgradecheck.gate_problems(env)
+    file = _rescue_file(env)
+    try:
+        state = json.loads(file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        state = {}
+    strikes = int(state.get("strikes", 0)) + 1 if problems else 0
+    went_back = bool(state.get("rolled_back"))
+    state = {"strikes": strikes, "rolled_back": went_back and bool(problems)}
+    reason = "; ".join(problems)[:300]
+    code = EXIT_FAILED if problems else 0
+    if problems and went_back:  # it has gone back once already: what is left is for a person
+        _log(args, env, t0, "rescue", None, "still-failing", reason)
+    elif problems and strikes >= RESCUE_STRIKES:
+        target = previous_release(env)
+        if target is None:
+            _log(args, env, t0, "rescue", None, "no-way-back", f"{reason}; there is no earlier release on record")
+        else:
+            args.version, args.rollback, args.log_verb = None, True, "rollback"
+            code = _rollback(args, env)
+            state = {"strikes": 0, "rolled_back": code == 0}
+            _log(args, env, t0, "rollback", target, "ok" if code == 0 else "failed", f"rescue: {reason}")
+    elif problems:
+        _log(args, env, t0, "rescue", None, f"strike-{strikes}", reason)
+    try:
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text(json.dumps(state), encoding="utf-8")
+    except OSError:
+        pass
+    return code
+
+
+def cmd_print_units(args: argparse.Namespace, env: Mapping[str, str]) -> int:
+    """`ws upgrade --print-units [--write]`: the four systemd units for this ws (see `ws.upgradeunit`), printed or written."""
+    ws = upgradeunit.ws_command()
+    if args.write:
+        for path in upgradeunit.write(env, ws):
+            print(f"ws: wrote {path}")
+        print(
+            "ws: next: systemctl --user daemon-reload, then systemctl --user enable --now ws-upgrade.path ws-rescue.timer"
+        )
+        return 0
+    for name, text in upgradeunit.units(ws).items():
+        print(f"# {name}\n{text}")
+    return 0
+
+
 def cmd_upgrade(args: argparse.Namespace) -> int:
     env = os.environ
     if getattr(args, "unattended", False):
         return cmd_unattended(args, env)
+    if getattr(args, "rescue", False):
+        return cmd_rescue(args, env)
     # the hooks step of an unattended swap is this command in a child of the service: no terminal, the service's invocation
     child = bool(args.hooks_only and env.get(STEP_ENV) and env.get("INVOCATION_ID"))
     why = refusal(env, sys.stdin.isatty() or args.dry_run or child) or agentsession.refusal(
@@ -1292,6 +1359,8 @@ def cmd_upgrade(args: argparse.Namespace) -> int:
     )
     if why:
         raise WsError("refused", why, "run `ws upgrade` yourself, in a terminal of your own", EXIT_REFUSED)
+    if getattr(args, "print_units", False):
+        return cmd_print_units(args, env)
     if args.hooks_only:
         args.log_verb = "hooks-only"
         return _hooks_logged(args, env)
@@ -1316,6 +1385,9 @@ def register(sub) -> None:
     u.add_argument(
         "--unattended", action="store_true", help=argparse.SUPPRESS
     )  # the systemd unit's entry (ws.upgradeproof)
+    u.add_argument("--rescue", action="store_true", help=argparse.SUPPRESS)  # the rescue timer's entry (ws.upgradeunit)
+    u.add_argument("--print-units", action="store_true", help="print the systemd units of the unattended upgrade")
+    u.add_argument("--write", action="store_true", help="with --print-units: write them to the systemd user folder")
     u.add_argument(
         "--session-check", metavar="COMMAND", help="after an unattended swap, run this as well; non-zero rolls it back"
     )

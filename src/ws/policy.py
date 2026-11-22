@@ -648,6 +648,9 @@ write_outside_project = false
 #   config-guard     denies an edit of a file or folder you list (`paths`) unless the session is in one of its `owners`
 #                    folders (or you approve it once); does nothing until you name the paths
 #   guard-launch     denies starting a workflow, or an agent that asks for a worktree, from anywhere but the main checkout
+#   upgrade-service  denies a session starting, stopping or changing the unattended-upgrade units
+#                    (`systemctl --user start ws-upgrade.service`) or running the upgrade's `--unattended` entry; the
+#                    upgrade adds it to an existing `on` list below, once
 [guards]
 on = ["syntax-check", "session-context", "dev-server", "pane-keys"]
 # Any guard takes `mode = "enforce"` (the default) or `mode = "log"`. In log, a call the guard would refuse is allowed and

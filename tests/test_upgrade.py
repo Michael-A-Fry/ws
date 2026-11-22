@@ -1376,14 +1376,15 @@ def put_policy(text: str) -> Path:
 def test_migrate_policy_adds_pane_keys_to_an_existing_guards_list_once(box):
     path = put_policy(POLICY_OLD)
     notes = upgrade.migrate_policy(os.environ)
-    assert len(notes) == 1 and notes[0].startswith("added pane-keys to [guards] on")
-    assert path.read_text(encoding="utf-8") == POLICY_OLD.replace('"dev-server",\n', '"dev-server",\n  "pane-keys",\n')
+    assert len(notes) == 1 and notes[0].startswith("added pane-keys, upgrade-service to [guards] on")
+    both = '"dev-server",\n  "pane-keys",\n  "upgrade-service",\n'
+    assert path.read_text(encoding="utf-8") == POLICY_OLD.replace('"dev-server",\n', both)
     assert upgrade.migrate_policy(os.environ) == []  # a second run changes nothing
     assert path.read_text(encoding="utf-8").count("pane-keys") == 1
 
 
-def test_migrate_policy_leaves_a_policy_with_no_guards_table_or_with_pane_keys(box):
-    for text in ("[rules]\nx = 1\n", POLICY_OLD.replace('"dev-server",', '"pane-keys",')):
+def test_migrate_policy_leaves_a_policy_with_no_guards_table_or_with_the_default_guards(box):
+    for text in ("[rules]\nx = 1\n", POLICY_OLD.replace('"dev-server",', '"pane-keys", "upgrade-service",')):
         path = put_policy(text)
         assert upgrade.migrate_policy(os.environ) == []
         assert path.read_text(encoding="utf-8") == text

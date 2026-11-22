@@ -18,7 +18,14 @@ body of the GitHub release.
 
 ### Added
 
-- `ws upgrade --unattended`, the entry of a systemd user service (the unit comes with the next change): it takes a request
+- The unattended upgrade's units and rescue ([ADR 0035](docs/decisions/0035-an-upgrade-can-run-itself-from-a-service-that-proves-the-release.md)):
+  `ws upgrade --print-units [--write]` makes four systemd user units (a path unit watching the request file, the upgrade
+  service, and a rescue timer and service) that run the `ws` command in the installed tool's folder. `--rescue` probes the
+  gate every ten minutes and goes back one release, once, after two failures in a row. The new `upgrade-service` guard
+  stops a session starting, stopping or changing the units or running the `--unattended` and `--rescue` entries (the
+  upgrade adds it to an existing policy's `[guards] on` list, as it did `pane-keys`), and the four unit files are
+  protected paths of the user-scope hook.
+- `ws upgrade --unattended`, the entry of a systemd user service: it takes a request
   file (a release tag or `rollback`), proves the release itself from the installed wheel's trust root (a signed tag, the
   installer's and wheel's hashes and cosign bundles, green checks, no high or critical advisory in the lock), refuses a
   tag at or below the installed version, waits for nothing to be running, installs with no mirror or skip-the-checks

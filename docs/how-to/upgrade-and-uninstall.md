@@ -76,6 +76,26 @@ didn't write itself. Only the `launch` gate setting or an uninstall takes the en
 A session that was already running keeps the rules it loaded at start. When a newer release is installed, the session
 gets one line about it, once. Start a new session to use the new release.
 
+### Let ws upgrade itself
+
+Once, from a terminal of your own, install a release that carries the service, then make and start its units:
+
+```sh
+ws upgrade --print-units --write
+systemctl --user daemon-reload
+systemctl --user enable --now ws-upgrade.path ws-rescue.timer
+systemctl --user list-timers ws-rescue.timer
+```
+
+After that, an upgrade is a request: write the tag on one line to `ws-upgrade/request.json` under your state folder
+(`~/.local/state` by default). The service proves the release, waits until nothing is running, swaps, checks the gate and
+rolls back on any failure. A request `rollback` goes back to the release before the last upgrade. Read the result in
+`release-log.csv` in ws's state folder. `git`, `cosign` and `uv` must be on the PATH the units set (it includes
+`~/.local/bin`). The rescue timer probes the gate every ten minutes and goes back one release after two failures in a
+row. To stop it, run `systemctl --user disable --now ws-upgrade.path ws-rescue.timer`; to swap it for cron or another
+scheduler, see the swap note in [ADR 0035](../decisions/0035-an-upgrade-can-run-itself-from-a-service-that-proves-the-release.md).
+A session can't start, stop or change the units: the gate refuses it.
+
 ### Runner updates
 
 ws never updates your AI tool. When `ws doctor` sees that a runner or the default model changed, it runs `ws canary` and

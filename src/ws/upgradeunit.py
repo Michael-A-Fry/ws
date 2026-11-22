@@ -1,0 +1,100 @@
+"""The systemd user units of the unattended upgrade, as text made from the installed ws: `ws upgrade --print-units`.
+
+Four units, made here and written by `--write` into the person's systemd user folder (never by a session: the folder's
+four files are protected paths of the gate, see `ws.userconfig`):
+
+- `ws-upgrade.path` watches one request file (`ws-upgrade/request.json` under the user's state folder) and starts
+- `ws-upgrade.service`, which runs `ws upgrade --unattended` once and exits;
+- `ws-rescue.timer` starts `ws-rescue.service` every ten minutes, which runs `ws upgrade --rescue`: it probes the gate the
+  way a watchdog would, and after two failures in a row goes back to the release before the last upgrade.
+
+`ExecStart` names the ws command inside the installed tool's own folder (`<tool folder>/bin/ws`), a folder the gate
+already protects from a session. It is never a path in a checkout, a repository or `~/.local/bin`, so nothing a session
+can edit runs as the service. A ws that does not run from an installed tool folder makes no units.
+
+Swap note: the units are plain systemd; to use cron, a launchd agent or anything else, run `ws upgrade --unattended`
+under it (it needs `INVOCATION_ID` and a systemd parent today: `ws.upgrade.unattended_refusal` is the one place to
+widen) and `ws upgrade --rescue` every ten minutes.
+"""
+
+from __future__ import annotations
+
+import os
+from collections.abc import Mapping
+from pathlib import Path
+
+from ws import selfcmd
+from ws.output import WsError
+
+UNITS = ("ws-upgrade.path", "ws-upgrade.service", "ws-rescue.service", "ws-rescue.timer")
+REQUEST = "ws-upgrade/request.json"  # under the user's state folder (`%S` in a user unit), outside every protected root
+RESCUE_EVERY = "10min"
+UPGRADE_TIMEOUT_S = 3600  # a 30 minute wait for idle, the installer's 10 minutes, the checks and a way back
+
+
+def unit_dir(env: Mapping[str, str]) -> Path:
+    base = env.get("XDG_CONFIG_HOME") or str(Path(env.get("HOME") or os.path.expanduser("~")) / ".config")
+    return Path(base) / "systemd" / "user"
+
+
+def unit_paths(env: Mapping[str, str]) -> tuple[Path, ...]:
+    """The four files `--write` makes: what the gate protects from a session (`ws.userconfig._claude_protect`)."""
+    return tuple(unit_dir(env) / name for name in UNITS)
+
+
+def ws_command() -> Path:
+    """The `ws` command in the installed tool's folder, or a refusal: units made from anything else would run code a
+    session can edit."""
+    tree = selfcmd.tree()
+    cmd = tree / "bin" / "ws" if tree else None
+    why = selfcmd.unstable()
+    if cmd is None or not cmd.is_file() or why:
+        raise WsError(
+            "refused",
+            f"there is no installed ws command to run as a service ({why or 'this ws is not in a tool folder'})",
+            "install ws with install.sh, then run this from that copy",
+        )
+    return cmd
+
+
+def units(ws: Path) -> dict[str, str]:
+    """The text of each unit, for `ws` (an absolute path) as the command. Nothing here is a host, a user or a secret."""
+    run = f"{ws} upgrade"
+    return {
+        "ws-upgrade.path": (
+            "[Unit]\nDescription=ws: watch for an upgrade request\n\n"
+            f"[Path]\nPathExists=%S/{REQUEST}\nUnit=ws-upgrade.service\n\n[Install]\nWantedBy=default.target\n"
+        ),
+        "ws-upgrade.service": (
+            "[Unit]\nDescription=ws: unattended upgrade (one request, proved, checked, rolled back on any failure)\n\n"
+            f"[Service]\nType=oneshot\nExecStart={run} --unattended\nTimeoutStartSec={UPGRADE_TIMEOUT_S}\n"
+            "NoNewPrivileges=yes\nEnvironment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin\n"
+        ),
+        "ws-rescue.service": (
+            "[Unit]\nDescription=ws: probe the gate, go back a release after two failures in a row\n\n"
+            f"[Service]\nType=oneshot\nExecStart={run} --rescue\nTimeoutStartSec=1800\nNoNewPrivileges=yes\n"
+            "Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin\n"
+        ),
+        "ws-rescue.timer": (
+            "[Unit]\nDescription=ws: gate probe every ten minutes\n\n"
+            f"[Timer]\nOnBootSec=5min\nOnUnitActiveSec={RESCUE_EVERY}\nUnit=ws-rescue.service\n\n"
+            "[Install]\nWantedBy=timers.target\n"
+        ),
+    }
+
+
+def write(env: Mapping[str, str], ws: Path) -> list[Path]:
+    """Write the units into the systemd user folder (it is made if needed) and make the request folder, private to the
+    person. An existing file is replaced; the folder's other files are not touched."""
+    made = []
+    folder = unit_dir(env)
+    folder.mkdir(parents=True, exist_ok=True)
+    for name, text in units(ws).items():
+        path = folder / name
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+        made.append(path)
+    state = env.get("XDG_STATE_HOME") or str(Path(env.get("HOME") or os.path.expanduser("~")) / ".local" / "state")
+    (Path(state) / "ws-upgrade").mkdir(parents=True, mode=0o700, exist_ok=True)
+    return made

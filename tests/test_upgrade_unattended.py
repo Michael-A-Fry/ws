@@ -21,7 +21,19 @@ from pathlib import Path
 
 import pytest
 
-from ws import agentsession, approvals, cli, paths, queue, selfcmd, upgrade, upgradecheck, upgradeproof, version
+from ws import (
+    agentsession,
+    approvals,
+    cli,
+    paths,
+    queue,
+    selfcmd,
+    upgrade,
+    upgradecheck,
+    upgradeproof,
+    upgradeunit,
+    version,
+)
 from ws.term import bridge
 
 GIT, KEYGEN = shutil.which("git"), shutil.which("ssh-keygen")
@@ -481,3 +493,122 @@ def test_versions_sort_by_part_and_a_candidate_sorts_below_its_release():
     assert key("v0.1.11.8") > key("0.1.11.6") > key("0.1.11") > key("0.1.10.9")
     assert key("v0.2.0rc1") < key("v0.2.0") and key("v0.2.0rc1") > key("v0.1.99")
     assert key("0.1.9.dev0") is None and key("") is None
+
+
+# ---- the rescue timer's entry and the units -------------------------------------------------------------------------------------
+
+
+def rescue(svc=None) -> int:
+    return upgrade.cmd_rescue(args(unattended=False, rescue=True), os.environ)
+
+
+def break_gate(svc) -> None:
+    path = svc.home / ".claude" / "settings.json"
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    doc["hooks"] = {}
+    path.write_text(json.dumps(doc), encoding="utf-8")
+
+
+def installs() -> list[str]:
+    log = Path(os.environ["INSTALL_LOG"])
+    return log.read_text().splitlines() if log.exists() else []
+
+
+@pytest.fixture
+def way_back(svc, monkeypatch):
+    """A promote on record (so there is a release to go back to) and an installer to fetch for it."""
+
+    def fetch(dest, version=None):
+        (dest / "install.sh").write_text(INSTALLER, encoding="utf-8")
+        return dest / "install.sh"
+
+    monkeypatch.setattr(upgrade, "fetch_installer", fetch)
+    upgrade.record(os.environ, "promote", "0.1.11.4", OLD)
+    return svc
+
+
+def test_a_healthy_gate_resets_the_count_and_does_nothing(svc):
+    assert rescue() == 0
+    assert json.loads(upgrade._rescue_file(os.environ).read_text()) == {"strikes": 0, "rolled_back": False}
+    assert installs() == [] and rows() == []
+
+
+def test_two_failures_in_a_row_go_back_a_release_once(way_back):
+    break_gate(way_back)
+    assert rescue() == 1  # the first failure is a strike and nothing more
+    assert installs() == [] and rows()[-1]["result"] == "strike-1"
+    assert rescue() == 0  # the second goes back, and the way back worked
+    assert installed(way_back) == "0.1.11.4" and installs()[-1].split()[-2:] == ["--version", "v0.1.11.4"]
+    assert (rows()[-1]["verb"], rows()[-1]["to"], rows()[-1]["result"]) == ("rollback", "0.1.11.4", "ok")
+    assert rows()[-1]["reason"].startswith("rescue: no gate hook")
+    before = len(installs())
+    assert rescue() == 1 and rescue() == 1  # still broken: it logs, and never goes back a second time
+    assert len(installs()) == before and rows()[-1]["result"] == "still-failing"
+
+
+def test_one_failure_then_a_good_probe_is_forgotten(way_back):
+    path = way_back.home / ".claude" / "settings.json"
+    good = path.read_text(encoding="utf-8")
+    break_gate(way_back)
+    assert rescue() == 1
+    path.write_text(good, encoding="utf-8")
+    assert rescue() == 0
+    break_gate(way_back)
+    assert rescue() == 1 and installs() == []  # the count started again
+
+
+def test_a_gate_that_fails_with_no_release_to_go_back_to_is_logged(svc):
+    break_gate(svc)
+    assert rescue() == 1 and rescue() == 1
+    assert rows()[-1]["result"] == "no-way-back" and installs() == []
+
+
+def test_rescue_is_for_its_unit_only(svc, monkeypatch):
+    monkeypatch.delenv("INVOCATION_ID")
+    with pytest.raises(upgrade.WsError) as caught:
+        rescue()
+    assert "INVOCATION_ID" in caught.value.message and caught.value.exit_code == upgrade.EXIT_REFUSED
+
+
+@pytest.fixture
+def tool(svc, monkeypatch):
+    folder = svc.home / ".local" / "share" / "uv" / "tools" / "ws-aitoolkit"
+    (folder / "bin").mkdir(parents=True)
+    (folder / "bin" / "ws").write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr(selfcmd, "tree", lambda: folder)
+    return folder / "bin" / "ws"
+
+
+def test_the_units_run_the_installed_command_and_name_no_host_or_person(svc, tool, capsys):
+    assert upgrade.cmd_print_units(args(print_units=True, write=False), os.environ) == 0
+    out = capsys.readouterr().out
+    text = upgradeunit.units(tool)
+    assert set(text) == set(upgradeunit.UNITS) and all(f"# {name}\n" in out for name in text)
+    assert f"ExecStart={tool} upgrade --unattended" in text["ws-upgrade.service"]
+    assert f"ExecStart={tool} upgrade --rescue" in text["ws-rescue.service"]
+    assert (
+        "PathExists=%S/ws-upgrade/request.json" in text["ws-upgrade.path"]
+        and "Unit=ws-upgrade.service" in text["ws-upgrade.path"]
+    )
+    assert "OnUnitActiveSec=10min" in text["ws-rescue.timer"]
+    bare = out.replace(str(tool), "")
+    assert (
+        str(svc.home) not in bare and "/home/" not in bare and "~/" not in bare
+    )  # no personal path, no checkout, no repo
+
+
+def test_write_puts_the_four_units_in_the_user_folder_and_makes_the_request_folder(svc, tool, capsys):
+    assert upgrade.cmd_print_units(args(print_units=True, write=True), os.environ) == 0
+    folder = svc.home / ".config" / "systemd" / "user"
+    assert sorted(p.name for p in folder.iterdir()) == sorted(upgradeunit.UNITS)
+    assert upgradeunit.unit_paths(os.environ) == tuple(folder / n for n in upgradeunit.UNITS)
+    request_dir = upgrade.request_path(os.environ).parent
+    assert request_dir.is_dir() and stat.S_IMODE(request_dir.stat().st_mode) == 0o700
+    assert "daemon-reload" in capsys.readouterr().out
+
+
+def test_no_units_are_made_from_a_ws_that_is_not_in_a_tool_folder(svc, monkeypatch):
+    monkeypatch.setattr(selfcmd, "tree", lambda: None)
+    with pytest.raises(upgrade.WsError) as caught:
+        upgrade.cmd_print_units(args(print_units=True, write=False), os.environ)
+    assert "no installed ws command" in caught.value.message

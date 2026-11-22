@@ -10,11 +10,24 @@ body of the GitHub release.
 
 ### Added
 
+- A local provider's models (`runner_options.provider.models.<id>`) may set `tool_call = false` and
+  `options.reasoningEffort` of `none`, `minimal` or `low`, so a small model can run a job without tools and with
+  little reasoning. `tool_call = true` and the higher efforts are refused (they widen), as is every other new key.
+  Checked at `ws job add` and again at `ws run`. (C635)
 - A job file's `input` names one file inside the job's `cwd`. `ws run` reads it at each run, for every runner, without
   following a link, at most 64 KiB of UTF-8, and puts it after the prompt as untrusted data in the delimited,
   defused block `ws mail` uses. A missing or unfit file refuses the run. The run record gains `input_sha256`. It
   replaces data kept in a project `AGENTS.md` or `CLAUDE.md`, which an OpenCode job doesn't read (checked on
   OpenCode 1.19.4).
+
+### Fixed
+
+- `ws mail add` asks for the password in place when it runs on a terminal, so a plain ssh login with no tmux works;
+  a password it just stored that the server then refuses is taken out again (a network or broker failure keeps it).
+  A refused mailbox login now has its own broker code, `login_refused`, apart from `upstream_refused`. (C666)
+- A Gmail app password pasted with the spaces Google shows ("abcd efgh ijkl mnop") is stored as the 16 letters Gmail's
+  IMAP login wants, by `ws mail add`, `ws secret set` and `ws secret ask`; a Gmail value that isn't 16 letters is
+  refused before it's stored. Other hosts keep the value as typed. (C666)
 
 ## [0.1.11.4] - 2026-11-22
 

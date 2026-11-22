@@ -335,12 +335,12 @@ def test_the_password_is_in_no_reply_log_or_error(base, certs, monkeypatch, caps
         assert b.password.encode() not in base64.b64decode(got["raw"])
         b.fake.password = "something-else"  # the server now refuses and echoes the password it was sent
         e = b.refused("list")
-        assert e.code == "upstream_refused" and "AUTHENTICATIONFAILED" in e.reason
+        assert e.code == "login_refused" and "AUTHENTICATIONFAILED" in e.reason
         text = json.dumps(got) + str(e) + e.reason + b.raw_log() + "".join(capsys.readouterr())
         assert b.password not in text
         lines = [json.loads(x) for x in b.raw_log().splitlines()]
         assert {x["op"] for x in lines} == {"imap"} and all(x["host"] == HOST for x in lines)
-        assert [x["status"] for x in lines] == ["begin", "ok", "begin", "upstream_refused"]
+        assert [x["status"] for x in lines] == ["begin", "ok", "begin", "login_refused"]
     finally:
         b.close()
 
@@ -372,3 +372,20 @@ def test_modified_utf7_round_trips():
     for s in ("INBOX", "Entwürfe", "Brouillons & co", "下書き", "&"):
         assert imap.decode_mutf7(imap.encode_mutf7(s)) == s
     assert imap.encode_mutf7("Entwürfe") == "Entw&APw-rfe"
+
+
+@pytest.mark.parametrize(
+    "said, token",
+    [
+        ("[AUTHENTICATIONFAILED] Invalid credentials (Failure)", "bad_credentials"),
+        (
+            "[ALERT] Application-specific password required: https://support.google.com/x (Failure)",
+            "app_password_required",
+        ),
+        ("[ALERT] Your account is not enabled for IMAP use.", "imap_off"),
+        ("[ALERT] Please log in via your web browser: https://support.google.com/x (Failure)", "web_login_required"),
+        ("[UNAVAILABLE] try later", "refused"),
+    ],
+)
+def test_a_refused_login_names_why_as_a_fixed_token(said, token):
+    assert imap.login_reason(Exception(said)) == token

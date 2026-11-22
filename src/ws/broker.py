@@ -20,7 +20,7 @@ the mailbox and runs one operation from the fixed table in ws.minters.imap (read
 so the mailbox password, which would also send mail, never leaves this process.
 Refusal codes: unknown_name, unset, host_not_allowed, purpose_not_allowed, caller_refused, store_unreadable, expired,
 run_required, run_refused, not_declared, area_refused, tier_refused, claim_refused, elevation_off, audit_failed,
-wrong_kind, registry_untrusted, upstream_refused, upstream_unreachable, op_refused, uidvalidity_changed,
+wrong_kind, registry_untrusted, upstream_refused, login_refused (a mailbox login), upstream_unreachable, op_refused, uidvalidity_changed,
 no_drafts_folder, tls_failed, plus bad_request (malformed) and busy (too
 many connections or leases). The registry itself is trusted only when it belongs to the broker's user or root and is
 closed to group and world writes; any other is refused whole (registry_untrusted).
@@ -92,6 +92,7 @@ CODES = (
     "wrong_kind",
     "registry_untrusted",
     "upstream_refused",
+    "login_refused",
     "upstream_unreachable",
     "op_refused",
     "uidvalidity_changed",

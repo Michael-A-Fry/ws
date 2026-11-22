@@ -75,6 +75,8 @@ LOGIN_CODES = frozenset({
     "AUTHENTICATIONFAILED", "AUTHORIZATIONFAILED", "UNAVAILABLE", "ALERT", "CONTACTADMIN", "PRIVACYREQUIRED",
     "LIMIT", "EXPIRED",
 })  # fmt: skip
+GMAIL_HOSTS = frozenset({"imap.gmail.com", "imap.googlemail.com"})
+APP_PASSWORD_RE = re.compile(r"^[A-Za-z]{16}$")
 MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 
 
@@ -92,10 +94,11 @@ FETCH_ITEMS = frozenset(_fetch_items(g, p) for g in (True, False) for p in ("ful
 class ImapError(Exception):
     """Never carries the password or server text. `code` is a broker refusal code."""
 
-    def __init__(self, code: str, reason: str):
+    def __init__(self, code: str, reason: str, login: str = ""):
         super().__init__(f"{code}: {reason}")
         self.code = code
         self.reason = reason
+        self.login = login  # a refused login: one of LOGIN_REASONS' tokens, "bad_credentials" or "refused"
 
 
 @dataclass(frozen=True)
@@ -482,6 +485,42 @@ OPS: dict[str, Op] = {
 }
 
 
+def clean_value(opts: Options, value: str) -> str:
+    """The password as the server wants it, or a SecretsError. Google shows a Gmail app password in four
+    groups ("abcd efgh ijkl mnop") and its IMAP login wants the 16 letters alone, so for a Gmail host every whitespace
+    character goes (a phone's copy may carry no-break spaces too) and what is left must be 16 letters. Any other host
+    gets the value as typed: a password there may hold a space. The error never carries the value."""
+    from ws.secrets import SecretsError
+
+    if opts.host.lower() not in GMAIL_HOSTS:
+        return value
+    v = "".join(value.split())
+    if not APP_PASSWORD_RE.match(v):
+        raise SecretsError(
+            "a Gmail app password is 16 letters (Google shows it as four groups of four); this is not one",
+        )
+    return v
+
+
+# Why a server refused a login, as a fixed token, from its refusal (the wording Gmail uses). The text itself never
+# leaves this module: only the token does, so a page can say what to fix in its own words.
+LOGIN_REASONS = (
+    ("app_password_required", re.compile(r"application-specific password required", re.IGNORECASE)),
+    ("imap_off", re.compile(r"not enabled for IMAP", re.IGNORECASE)),
+    ("web_login_required", re.compile(r"\[WEBALERT|log ?in via your web browser", re.IGNORECASE)),
+)
+
+
+def login_reason(e: BaseException) -> str:
+    """The token for a refused login: a LOGIN_REASONS match, else "bad_credentials" for AUTHENTICATIONFAILED, else
+    "refused"."""
+    text = str(e)
+    for token, pattern in LOGIN_REASONS:
+        if pattern.search(text):
+            return token
+    return "bad_credentials" if "AUTHENTICATIONFAILED" in text else "refused"
+
+
 def _login_code(e: BaseException) -> str:
     """A known RFC 5530 response code from the server's refusal, never its text."""
     m = re.search(r"\[([A-Z-]+)", str(e))
@@ -514,7 +553,9 @@ def run(opts: Options, password: str, cmd: str, args: object, cafile: str | None
         try:
             sess.login(opts.user, password)
         except imaplib.IMAP4.error as e:
-            raise ImapError("upstream_refused", f"the mail server refused the login{_login_code(e)}") from None
+            raise ImapError(
+                "login_refused", f"the mail server refused the login{_login_code(e)}", login_reason(e)
+            ) from None
         out = op.handler(sess, opts, checked)
         if "raw" in out and password.encode() in base64.b64decode(out["raw"]):  # a server never should; still
             out["raw"] = base64.b64encode(

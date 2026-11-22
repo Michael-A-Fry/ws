@@ -8,6 +8,14 @@ body of the GitHub release.
 
 ## [Unreleased]
 
+### Added
+
+- A job file's `input` names one file inside the job's `cwd`. `ws run` reads it at each run, for every runner, without
+  following a link, at most 64 KiB of UTF-8, and puts it after the prompt as untrusted data in the delimited,
+  defused block `ws mail` uses. A missing or unfit file refuses the run. The run record gains `input_sha256`. It
+  replaces data kept in a project `AGENTS.md` or `CLAUDE.md`, which an OpenCode job doesn't read (checked on
+  OpenCode 1.19.4).
+
 ### Fixed
 
 - `ws mail add` asks for the password in place when it runs on a terminal, so a plain ssh login with no tmux works;

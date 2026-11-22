@@ -47,6 +47,7 @@ below, and `python3 scripts/gen_code_map.py --check` (prek and CI) fails when it
 | `joblock.py` | A job's run lock: an advisory `flock` on a file the job owns, and a fence number in the file |
 | `joblog.py` | A job's log file, kept small: at most `KEEP` files of `MAX_BYTES`, and nothing below INFO in the... |
 | `jobs.py` | Job files: `jobs/<name>.toml` in ws's config folder, one headless job each, run with `ws run <name>` |
+| `jobs_input.py` | A job's `input` file: read from inside its project without following a link, and put after the... |
 | `jobwatch.py` | `ws watch`: the failure alert a scheduled unit raises, the dead-man check for jobs that stopped... |
 | `jsonl.py` | Bounded, locked JSON-lines logs: one object per line, a size limit with rotation, and no lost lines |
 | `mail.py` | Mailboxes for triage: search, read as delimited plain text, add a ws label, and save a reply as... |

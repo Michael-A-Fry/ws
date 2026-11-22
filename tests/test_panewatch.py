@@ -72,20 +72,22 @@ class Tmux:
 
     def __init__(self):
         self.screens: dict[str, str] = {}
+        self.paths: dict[str, str] = {}
         self.windows: dict[str, tuple[str, str]] = {}  # pane -> (window id, window name)
         self.calls: list[list[str]] = []
         self.up = True
 
-    def add(self, pane: str, window_id: str, name: str, screen: str = PLAIN) -> None:
+    def add(self, pane: str, window_id: str, name: str, screen: str = PLAIN, path: str = "/w") -> None:
         self.screens[pane] = screen
         self.windows[pane] = (window_id, name)
+        self.paths[pane] = path
 
     def __call__(self, argv: list[str]) -> tuple[int, str]:
         self.calls.append(argv)
         if not self.up:
             return 1, "no server running"
         if argv[0] == "list-panes":
-            rows = [f"{p}\t{w}\t0\t{n}" for p, (w, n) in self.windows.items()]
+            rows = [f"{p}\t{w}\t0\t{self.paths[p]}\t{n}" for p, (w, n) in self.windows.items()]
             return 0, "\n".join(rows) + "\n"
         if argv[0] == "capture-pane":
             return 0, self.screens.get(argv[argv.index("-t") + 1], "")
@@ -410,8 +412,8 @@ def test_a_pane_that_is_gone_leaves_the_state(env):
 def test_a_dead_pane_is_skipped():
     t = Tmux()
     t.add("%3", "@7", "w", ASK)
-    rows = "%3\t@7\t1\tw\n%4\t@8\t0\tlive\n"
-    assert panewatch.list_panes(lambda argv: (0, rows)) == [panewatch.PaneInfo("%4", "@8", "live")]
+    rows = "%3\t@7\t1\t/a\tw\n%4\t@8\t0\t/b\tlive\n"
+    assert panewatch.list_panes(lambda argv: (0, rows)) == [panewatch.PaneInfo("%4", "@8", "live", "/b")]
     assert panewatch.list_panes(lambda argv: (1, "")) is None
 
 
@@ -450,3 +452,81 @@ def test_inert_without_tmux(env, monkeypatch, capsys):
     monkeypatch.setattr(panewatch.shutil, "which", lambda *a, **k: None)
     assert cli.main(["watch", "panes"]) == 0
     assert capsys.readouterr().out == ""
+
+
+# --- a pane that only shows the words, and a class that may not leave the box -----------------------------------------
+
+
+def test_the_footer_counts_only_at_the_foot_of_the_screen():
+    quoted = ASK + "some output\nmore output\n❯ \n──────────────────────\n  ? for shortcuts\n"
+    assert panewatch.find_dialog(quoted.splitlines()) is None
+    assert panewatch.find_dialog(ASK.splitlines()) is not None
+    assert panewatch.find_dialog([""] * 3 + ASK.splitlines() + ["", "  "]) is not None  # blank lines don't count
+
+
+def test_remote_control_words_in_scrollback_get_no_escape(env):
+    profile(env)
+    t, s = Tmux(), Sender()
+    t.add("%5", "@9", "w", REMOTE + "\nsome output\nmore output\n❯ \n──────────────────────\n  ? for shortcuts\n")
+    for minutes in (0, 1, 2, 30):
+        watch(env, t, minutes * MIN, s)
+    assert t.keys() == [] and s.sent == []
+
+
+def test_the_remote_control_words_must_sit_in_the_box_above_the_footer():
+    only_in_the_text_above = "Remote Control\nDisconnect this session\n" + ASK
+    d = panewatch.find_dialog(only_in_the_text_above.splitlines())
+    assert d is not None and not d.remote_control  # a rule separates the quoted words from the real dialog
+    no_rule = "\n".join(line for line in REMOTE.splitlines() if "────" not in line)
+    assert panewatch.find_dialog(no_rule.splitlines()).remote_control
+
+
+def class_policy(env, tmp_path, access: str) -> None:
+    extra = 'os_user = "svc"\n' if access == "walled" else ""
+    (tmp_path / "ws" / "policy.toml").write_text(
+        f'[classes.c]\naccess = "{access}"\n{extra}repos = ["{tmp_path}/c/**"]\n'
+    )
+
+
+@pytest.mark.parametrize(
+    ("access", "path", "quoted"),
+    [("full", "c/x", True), ("walled", "c/x", False), ("counts-only", "c/x", False), ("full", "other", False)],
+)
+def test_dialog_text_leaves_the_box_only_for_a_full_class(env, tmp_path, access, path, quoted):
+    profile(env)
+    class_policy(env, tmp_path, access)
+    t, s = Tmux(), Sender()
+    t.add("%3", "@7", "w", ASK, path=str(tmp_path / path))
+    watch(env, t, 0.0, s)
+    watch(env, t, 11 * MIN, s)
+    assert len(s.sent) == 1 and "@7" in s.sent[0] and "11 min" in s.sent[0]
+    assert ("Which approach" in s.sent[0]) is quoted
+
+
+def test_with_no_classes_the_text_goes(env):
+    profile(env)
+    t, s = Tmux(), Sender()
+    t.add("%3", "@7", "w", ASK)
+    watch(env, t, 0.0, s)
+    watch(env, t, 11 * MIN, s)
+    assert "Which approach" in s.sent[0]
+
+
+def test_an_unreadable_policy_sends_no_text(env, tmp_path):
+    profile(env)
+    (tmp_path / "ws" / "policy.toml").write_text("[classes\n")
+    t, s = Tmux(), Sender()
+    t.add("%3", "@7", "w", ASK)
+    watch(env, t, 0.0, s)
+    watch(env, t, 11 * MIN, s)
+    assert len(s.sent) == 1 and "Which approach" not in s.sent[0] and "@7" in s.sent[0]
+
+
+def test_a_full_class_still_honours_show_text_false(env, tmp_path):
+    profile(env, panes={"show_text": False})
+    class_policy(env, tmp_path, "full")
+    t, s = Tmux(), Sender()
+    t.add("%3", "@7", "w", ASK, path=str(tmp_path / "c/x"))
+    watch(env, t, 0.0, s)
+    watch(env, t, 11 * MIN, s)
+    assert len(s.sent) == 1 and "Which approach" not in s.sent[0]

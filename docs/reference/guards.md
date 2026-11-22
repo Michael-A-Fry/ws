@@ -9,7 +9,7 @@ session or a subagent stops. For the idea, read [The gate](../explanation/gate.m
 
 ```toml
 [guards]
-on = ["syntax-check", "session-context", "dev-server"]     # the guards that run, in this order
+on = ["syntax-check", "session-context", "dev-server", "pane-keys"]     # the guards that run, in this order
 
 [guards.syntax-check]
 extra = { yaml = ["yamllint", "-d", "relaxed"] }
@@ -19,13 +19,13 @@ files = ["STATE.md", ".state/STATE.md", "HANDOFF.md", "TODO.md"]   # the default
 ```
 
 A policy file with no `[guards]` table has no guards on, so an upgrade changes nothing until you add the table.
-`ws gate init` writes `on = ["syntax-check", "session-context", "dev-server"]` and lists the other guards as comments. A
+`ws gate init` writes `on = ["syntax-check", "session-context", "dev-server", "pane-keys"]` and lists the other guards as comments. A
 name in `on` that ws doesn't know stops the load and the message names it. So does a key in `[guards]` that isn't `on`
 or a guard name, and a key in a guard's table that guard doesn't read (`mode` is read by ws for every guard, below).
 
 ### Off by default, and why
 
-Every guard but the three `ws gate init` turns on is off until you name it, because each one costs something on every
+Every guard but the four `ws gate init` turns on is off until you name it, because each one costs something on every
 call or changes how a session works:
 
 | Guard | Why it's off by default |
@@ -39,7 +39,6 @@ call or changes how a session works:
 | `inbox` | It needs `ws msg` messages between sessions. |
 | `presence` | It writes the session registry on every hook; only the lead and `pane-close` read it. |
 | `pane-close` | It only matters to a lead that closes other sessions' panes. |
-| `pane-keys` | It reads every shell command that names tmux, and only matters where sessions drive tmux panes. Turn it on there: it's what stops a session typing a slash command that opens a dialog nobody answers. |
 | `record-calls` | It writes every call's payload to a log on disk. Keep it off in a walled class. |
 
 `ws doctor` warns (WS020) when the policy names no data class, since then no class limit applies.
@@ -105,7 +104,7 @@ ships `syntax-check` in `log`, and the commented tables for `claims` and `test-w
 | `inbox` | when a prompt is sent, after a call, and when Claude Code stops | none | Hands the session the messages left for it, as text marked untrusted, at its own turn: a prompt's output, a warning after a tool call, and (for an `urgent` message) a `{"decision":"block"}` that keeps a stopping Claude Code session going, at most three stops in a row and never for an `info` message. A body is cut to 4000 characters, cleaned for a terminal and flagged when it reads like an instruction; the flags only mark. A walled receiver, a caller that can't be shown to be the session, and a store the wall leaves read-only get a body-free "N unread" line instead (after a call, at most once in two minutes). A message grants no permission: the gate judges every later call as before. Off until you name it. |
 | `presence` | before and after a call, at session start, on a prompt and on a stop | none | Records `busy` or `idle` in the session registry from those hooks, newest report winning, and the latest message the session sent that was delivered. A hook of a sub-agent is skipped. It never says anything and never fails a hook. |
 | `pane-close` | before a call | shell commands | Allows `tmux kill-window` or `kill-pane` on the live tmux server only as one plain command with an `@N` or `%N` target, when the registry says every session in it's idle and the caller is the lead, or it's the caller's own pane after its hand-over was delivered. See [pane-close](#pane-close). |
-| `pane-keys` | before a call | shell commands | Denies `tmux send-keys` aimed at the live tmux server (or one that can't be known) when what it types has a line that starts with `/` once key names are decoded, and a `paste-buffer` of text that has one. A slash command can open a dialog that holds every later key and message until someone presses one. The reason says to start sessions with `--name X --remote-control X` and to message another session with `ws msg send` or the runner's own cross-session messaging. The person can approve the command once. See [pane-keys](#pane-keys). Off until you name it. |
+| `pane-keys` | before a call | shell commands | Denies `tmux send-keys` aimed at the live tmux server (or one that can't be known) when what it types has a line that starts with `/` once key names are decoded, and a `paste-buffer` of text that has one. A slash command can open a dialog that holds every later key and message until someone presses one. The reason says to start sessions with `--name X --remote-control X` and to message another session with `ws msg send` or the runner's own cross-session messaging. The person can approve the command once. See [pane-keys](#pane-keys). On by default in the policy `ws gate init` writes. |
 | `record-calls` | before a call | every kind | Appends `{schema, ts, at, runner, payload}` (`ts` is the time; `at` is its legacy spelling, kept beside it) to `~/.local/state/ws/logs/gate-calls.jsonl`, one line for each hook run. A file write keeps its path and records the text as `{"bytes", "sha256"}`. `ws gate replay` reads that file. |
 
 `bulk-staging`, `guard-launch`, `record-calls`, `inbox` and `presence` take no table. The other guards take one.
@@ -447,6 +446,8 @@ been delivered. Without `tmux` installed it says nothing.
 live_socket = "default"   # optional: the tmux socket whose panes are guarded (a path, or a name under the tmux folder)
 ```
 
+It's on by default: it only narrows, and its absence is what let a session sit behind a dialog for hours.
+
 Why: a slash command typed into a Claude Code pane runs, and some open a dialog (`/remote-control` on a connected
 session shows its status; `/config` and `/model` show pickers) that holds every later key and queued message until a key
 is pressed. A session that typed one has ended its turn, so the pane can sit unseen for hours. `ws dispatch` now starts
@@ -455,14 +456,17 @@ under this guard.
 
 The rule: `tmux send-keys` aimed at the live server, or at one that can't be known, is refused (the person can approve
 it once) when what it types has a line that starts with `/` after key names are decoded. Blanks in front don't hide it.
-`-l` literal text, text split across words (`'/re' 'name'`), key names (`Enter`, `C-m`, `Space`, `KP/`, `0x2f`, `-H`
-hex), `BSpace`, `C-u` and `C-w`, and a cursor key beside a `/` are all read. A line that starts with a word the shell
+`-l` literal text, text split across words (`'/re' 'name'`), key names in any case, as tmux reads them (`Enter`,
+`enter`, `C-m`, `c-M`, `^M`, `Space`, `KP/`, `kp/`, `0x2f`, `-H` hex), `BSpace`, `C-u` and `C-w`, and a cursor key
+beside a `/` are all read. A line that starts with a word the shell
 never settled (`"$BODY"`) is refused too, since it may be a slash command. `set-buffer` or `load-buffer` text (a plain
 file, or `echo`/`printf` piped into `load-buffer -`) followed by `paste-buffer` is judged on the text the buffer
 holds; a paste of a buffer the line didn't fill is judged on what `tmux show-buffer` says the live server holds. What
 can't be read (a heredoc, a file the same line makes) is allowed: the guard reads text, it doesn't guess. Which server,
 and the text that's run (a shell's `-c` text, `eval`, `$(...)`, `run-shell`, `bind-key`, `source-file` and the like)
-are read as for [pane-close](#pane-close). Without `tmux` it says nothing, and it never sends a key.
+are read as for [pane-close](#pane-close). `tmux -C` and `-CC` (control mode) on the live server, or one that can't be
+known, are refused outright: they take tmux commands from their input, which the guard can't see, and nothing in a
+session's shell needs them. Without `tmux` it says nothing, and it never sends a key.
 
 ## The order guards run in
 

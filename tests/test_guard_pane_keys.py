@@ -112,6 +112,26 @@ def test_a_clearly_different_test_socket_is_left_alone():
         "'hello' C-u '/rename'",  # the line cleared, then a slash
         "'/' C-a 'x'",  # the cursor moved: the slash may end up first
         "'rename' Home '/'",
+        # tmux reads key names without regard to case, and `^M` is `C-m`
+        "kp/ rename enter",
+        "x c-m '/y'",
+        "x C-M '/y'",
+        "x c-j '/y'",
+        "x ENTER '/y'",
+        "x eNtEr '/y'",
+        "x ^M '/y'",
+        "x ^j '/y'",
+        "KP/ rename",
+        "Kp/ rename",
+        "hello c-U '/rename'",
+        "hello c-u '/rename'",
+        "x bspace '/y'",
+        "x BSPACE '/y'",
+        "rename HOME '/'",
+        "rename c-A '/'",
+        "x kpenter '/y'",
+        "a SPACE b Enter '/y'",
+        "0X2f rename",
     ],
 )
 def test_a_line_that_starts_with_a_slash_is_refused(keys):
@@ -311,3 +331,43 @@ def test_the_config_names_one_key_and_loads_through_the_policy():
     reason = gate.check("claude-code", raw, pol)
     assert reason and reason.startswith("pane-keys: typing a slash command into a tmux pane is refused")
     assert gate.check("claude-code", raw.replace("/rename x", "ls"), pol) is None
+
+
+def test_the_two_commands_a_review_found_are_refused():
+    refused("tmux send-keys kp/ rename enter", cfg=pane_keys.Config())
+    refused("tmux send-keys x c-m '/y'", cfg=pane_keys.Config())
+    refused("tmux -L live send-keys kp/ rename enter")
+    refused("tmux -L live send-keys x c-m '/y'")
+
+
+def test_key_names_in_any_case_that_type_no_slash_are_left_alone():
+    allowed("tmux -L live send-keys 'ls' ENTER")
+    allowed("tmux -L live send-keys 'echo hi' c-m 'echo /x' C-M")
+    allowed("tmux -L live send-keys kp1 kp2 Enter")
+    allowed("tmux -L live send-keys c-c")
+    allowed("tmux -L live send-keys ESCAPE")
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo \"send-keys -t %3 '/x' Enter\" | tmux -L live -C attach",
+        "echo \"send-keys -t %3 '/x' Enter\" | tmux -L live -CC attach",
+        "tmux -L live -C attach <<EOF\nsend-keys -t %3 '/x' Enter\nEOF",
+        "tmux -L live -C attach < /tmp/cmds",
+        "tmux -C attach",
+        "tmux -uC -L live attach",
+        "tmux -L live -C",
+        "printf 'send-keys -t %3 /x Enter\\n' | tmux -S /tmp/other.sock -C attach; true",  # a list: the socket can't be known
+        'bash -c "echo x | tmux -L test -C attach"',  # inside a shell's text: the server can't be known
+    ],
+)
+def test_control_mode_on_the_live_or_an_unknown_server_is_refused(command):
+    refused(command, "control mode", cfg=pane_keys.Config() if command.startswith("tmux -C") else CFG)
+
+
+def test_control_mode_on_a_test_server_and_ordinary_flags_are_left_alone():
+    allowed("tmux -L test -CC attach")
+    allowed("tmux -L live -u list-sessions")
+    allowed("tmux -L live -f /tmp/conf list-sessions")
+    allowed("tmux -L live -c 'echo -C' list-sessions")

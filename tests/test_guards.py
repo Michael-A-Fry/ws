@@ -82,7 +82,7 @@ def test_the_default_policy_text_names_every_guard():
     text = policy.default_toml()
     for name in guards.names():
         assert name in text, name
-    assert policy.default_policy().guards.on == ("syntax-check", "session-context", "dev-server")
+    assert policy.default_policy().guards.on == ("syntax-check", "session-context", "dev-server", "pane-keys")
 
 
 # --- Call.data from each Claude Code tool ------------------------------------------------------------------------

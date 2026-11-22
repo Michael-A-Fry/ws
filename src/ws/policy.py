@@ -574,7 +574,7 @@ write_outside_project = false
 #                    folders (or you approve it once); does nothing until you name the paths
 #   guard-launch     denies starting a workflow, or an agent that asks for a worktree, from anywhere but the main checkout
 [guards]
-on = ["syntax-check", "session-context", "dev-server"]
+on = ["syntax-check", "session-context", "dev-server", "pane-keys"]
 # Any guard takes `mode = "enforce"` (the default) or `mode = "log"`. In log, a call the guard would refuse is allowed and
 # logged (counts only, to logs/gate.jsonl) when the sandbox wall is proven for that call; anywhere else it is refused as in
 # enforce, and `ws doctor` (WS018) says when this machine can't give the wall. The prose guards ship in log.

@@ -1583,7 +1583,7 @@ An optional `[watch.panes]` table in the profile:
 | `after_minutes` | `10` | Whole minutes (1 to 1440) on one dialog before the push. `--after-minutes` beats it for one run. |
 | `patterns` | `[]` | More footer text to count as a dialog, added to the five above (case ignored). |
 | `live_socket` | the policy's | The tmux socket to watch (a path, or a name under the tmux folder). Left out, the `live_socket` of the `pane-keys` or `pane-close` guard, else this user's default socket. |
-| `show_text` | `true` | `false` leaves the dialog's text out of the push (the window name and `@id` stay), for a machine where a question must not leave the box. |
+| `show_text` | `true` | `false` leaves the dialog's text out of the push (the window name and `@id` stay), for a machine where a question must not leave the box. Whatever this says, a pane in a walled or counts-only class (judged by its folder), or a policy that can't be read, never has its text quoted. |
 
 ## `ws approve`
 

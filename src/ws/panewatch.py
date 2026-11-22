@@ -11,7 +11,9 @@ on the live tmux server and looks for a dialog's footer (`DIALOG_PATTERNS`: "Ent
 continue", "Enter to confirm", "Do you want to proceed?", case ignored). The profile's `[watch.panes]` table can add
 patterns (`patterns = [...]`), set `after_minutes` (default 10), name the tmux socket (`live_socket`, else the one the
 policy gives pane-keys or pane-close, else this user's default) and turn the dialog's text out of the push
-(`show_text = false`). A small state file, `<state>/logs/panes-watch.json`, holds when each pane's dialog was first seen and a
+(`show_text = false`). The text is quoted only for a pane whose folder is in a `full` data class (or the policy has none): a
+walled or counts-only pane's push holds the window name, `@id` and minutes alone, as does any pane when the policy can't
+be read. A small state file, `<state>/logs/panes-watch.json`, holds when each pane's dialog was first seen and a
 fingerprint of it (its footer and first meaningful line), written whole or not at all. A dialog that changes is a new one.
 
 What it does about one, in full.
@@ -62,6 +64,8 @@ MAX_AFTER_MINUTES = 1440
 ESCAPE_AFTER_S = 60  # the Remote Control box stays this long before Escape is pressed
 SLACK_S = 5  # a timer fires a little early or late, so "a minute" is a minute less this
 LINE_MAX = 100
+FOOTER_LINES = 4  # a footer counts only among the last this many lines with text
+RC_LINES = 12  # the Remote Control box is no taller than this when no rule marks its top
 _RULE = re.compile(r"^[\s─━═\-_=]{10,}$")  # a horizontal rule: where a dialog's box begins
 _DECOR = str.maketrans("", "", "│┃║╭╮╰╯┌┐└┘├┤─━═❯›")  # box lines and the marker before a choice
 
@@ -71,6 +75,7 @@ class PaneInfo:
     pane_id: str
     window_id: str
     window: str
+    path: str = ""  # the pane's working folder, which says what data class its dialog may leave the box as
 
 
 @dataclass(frozen=True)
@@ -163,14 +168,15 @@ def socket_path(cfg: Config, env) -> Path:
 
 def list_panes(run: tmux.Run) -> list[PaneInfo] | None:
     """Every live pane on the server, or None when the server doesn't answer."""
-    code, out = run(["list-panes", "-a", "-F", "#{pane_id}\t#{window_id}\t#{pane_dead}\t#{window_name}"])
+    fmt = "#{pane_id}\t#{window_id}\t#{pane_dead}\t#{pane_current_path}\t#{window_name}"
+    code, out = run(["list-panes", "-a", "-F", fmt])
     if code != 0:
         return None
     found = []
     for line in out.splitlines():
-        parts = line.split("\t", 3)
-        if len(parts) == 4 and parts[0].startswith("%") and parts[1].startswith("@") and parts[2] != "1":
-            found.append(PaneInfo(parts[0], parts[1], parts[3]))
+        parts = line.split("\t", 4)
+        if len(parts) == 5 and parts[0].startswith("%") and parts[1].startswith("@") and parts[2] != "1":
+            found.append(PaneInfo(parts[0], parts[1], parts[4], parts[3]))
     return found
 
 
@@ -186,23 +192,27 @@ def tail(run: tmux.Run, pane_id: str) -> list[str] | None:
 
 
 def find_dialog(lines: list[str], patterns: tuple[str, ...] = DIALOG_PATTERNS) -> Dialog | None:
-    """The dialog the lines end in, or None. It is the last line that holds a footer pattern; its text runs from the
-    rule above it (else the eight lines before) down to that footer, and the first line of that with a word in it, once
-    box and marker characters are taken out, is what the push quotes."""
+    """The dialog the lines end in, or None. A dialog's footer is among the last `FOOTER_LINES` lines with text on the
+    screen (output that merely quotes one, higher up or above a prompt, is not a dialog); the dialog's text runs from the
+    rule above the footer (else the lines just before) down to it. The first line of that with a word in it, once box and
+    marker characters are taken out, is what the push quotes. The Remote Control box is that text holding all of
+    `REMOTE_CONTROL_PARTS`, and only that text: the same words elsewhere on the screen don't make one."""
     low = [p.lower() for p in patterns]
-    at = next((i for i in range(len(lines) - 1, -1, -1) if any(p in lines[i].lower() for p in low)), None)
+    texted = [i for i, ln in enumerate(lines) if ln.strip()]
+    at = next((i for i in reversed(texted[-FOOTER_LINES:]) if any(p in lines[i].lower() for p in low)), None)
     if at is None:
         return None
     pattern = next(p for p, lp in zip(patterns, low, strict=True) if lp in lines[at].lower())
-    start = next((i + 1 for i in range(at - 1, -1, -1) if _RULE.match(lines[i])), max(0, at - 8))
+    rule = next((i + 1 for i in range(at - 1, -1, -1) if _RULE.match(lines[i])), None)
+    start = max(0, at - 8) if rule is None else rule
     first = ""
     for line in lines[start : at + 1]:
         text = line.translate(_DECOR).strip()
         if text and re.search(r"\w", text):
             first = text
             break
-    whole = "\n".join(lines).lower()
-    rc = all(part.lower() in whole for part in REMOTE_CONTROL_PARTS)
+    box = "\n".join(lines[(max(0, at - RC_LINES) if rule is None else rule) : at + 1]).lower()
+    rc = all(part.lower() in box for part in REMOTE_CONTROL_PARTS)
     return Dialog(pattern, first[:LINE_MAX], rc)
 
 
@@ -237,6 +247,32 @@ def _log(env, rec: dict) -> None:
 
 
 # --- one run ---------------------------------------------------------------------------------------------------------
+
+
+def policy_of(env):
+    """The policy, or None when it can't be read (then no dialog text leaves the box)."""
+    from ws import policy
+
+    try:
+        return policy.load(policy.policy_path(dict(env)))
+    except policy.PolicyError:
+        return None
+
+
+def text_allowed(pol, path: str) -> bool:
+    """May the text of a dialog in a pane working in `path` go in a push? Only when its data class is `full` (or the policy
+    has no classes). A walled or counts-only pane, a folder in no class once classes exist, a pane with no folder
+    to judge by and a policy that can't be read all say no: the line is often a command or a path from that class."""
+    from ws import policy
+
+    if pol is None:
+        return False
+    if not pol.classes:
+        return True
+    if not path:
+        return False
+    cls = policy.class_of(pol, path)
+    return cls is None or cls.access == "full"
 
 
 def _minutes(seconds: float) -> int:
@@ -278,6 +314,7 @@ def run_once(
         age = now - entry["first_seen"]
         after[pane.pane_id] = entry
         label = f"{pane.window} ({pane.window_id})"
+        quotable = cfg.show_text and text_allowed(policy_of(e), pane.path)
         shown = {"pane": pane.pane_id, "window": pane.window, "window_id": pane.window_id, "minutes": _minutes(age)}
         report.dialogs.append({**shown, "remote_control": dialog.remote_control, "first": dialog.first})
 
@@ -296,7 +333,7 @@ def run_once(
                 )
                 _log(e, {"event": "escape-sent", **shown, "pushed": sent is True})
         if age >= cfg.after_minutes * 60 - SLACK_S and not entry.get("pushed"):
-            quote = f": {dialog.first}" if cfg.show_text and dialog.first else ""
+            quote = f": {dialog.first}" if quotable and dialog.first else ""
             text = f"{label} has been on a dialog for {_minutes(age)} min{quote}"
             sent = jobwatch.push(e, text, "a session has been on a dialog for a while", sender, title="ws panes")
             _log(e, {"event": "dialog-stuck", **shown, "pushed": sent is True})

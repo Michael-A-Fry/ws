@@ -15,12 +15,15 @@ runner's own cross-session messaging, never as typed text.
 
 What is read.
   * `send-keys` text. Its options come first (`-t`, `-N` and `-c` take a value; `-l` is literal text, where `Enter` is just
-    the word; `-H` is hex bytes; `-X` and `-M` type nothing). Without `-l` a word that is a key name is decoded (`Enter`,
+    the word; `-H` is hex bytes; `-X` and `-M` type nothing). Without `-l` a word that is a key name is decoded, in any case as tmux reads it (`enter`, `c-M` and `^M` too; `Enter`,
     `C-m`, `C-j` and `KPEnter` end a line, `Space` and `Tab` are blanks, `KP/` is a slash, `0x2f` is a code point) and any
     other word is the text it spells, so `'/re' 'name'` is one line. Text split across words and across `;`-joined
     commands is put together. `BSpace`, `C-u` and `C-w` are applied as well as ignored, and both readings are judged. A key
     that moves the cursor (`C-a`, `Home`, the arrows) beside a `/` in the text is refused, since the text may land in
     front of what is there.
+  * Control mode. `tmux -C` and `-CC` read tmux commands from their input, which this guard can't see (a pipe, a here
+    document, a file), and `send-keys` typed there is the same thing. So on the live server, or one that can't be known,
+    control mode is refused outright; it has no use in a session's shell, where nothing is attached to its input.
   * A word the shell has not settled (`$NAME` that is unset, a command substitution's result) at the start of a line could
     be anything, so it is refused as well: the reason says so.
   * Buffers. A `set-buffer` or `load-buffer` of a plain file (or a `printf`/`echo` piped into `load-buffer -`) in the same
@@ -68,15 +71,18 @@ _VALUE_OPTS = {
     "load-buffer": "bt",
     "paste-buffer": "bst",
 }
-_ENTER = frozenset({"Enter", "C-m", "C-j", "KPEnter"})
-_BLANKS = {"Space": " ", "Tab": "\t", "C-i": "\t"}
-_KEYPAD = {"KP/": "/", "KP*": "*", "KP-": "-", "KP+": "+", "KP.": ".", **{f"KP{n}": str(n) for n in range(10)}}
-_ERASE = frozenset({"BSpace", "C-h"})
+# tmux reads a key name without regard to case (`enter`, `KP/`, `c-m` and `C-M` are the keys `Enter`, `kp/` and `C-m`), and
+# `^M` is `C-m`, so every table below is in lower case and a word is lowered before it is looked up
+_ENTER = frozenset({"enter", "c-m", "c-j", "kpenter"})
+_BLANKS = {"space": " ", "tab": "\t", "c-i": "\t"}
+_KEYPAD = {"kp/": "/", "kp*": "*", "kp-": "-", "kp+": "+", "kp.": ".", **{f"kp{n}": str(n) for n in range(10)}}
+_ERASE = frozenset({"bspace", "c-h"})
 _MOVERS = frozenset(
-    {"C-a", "C-e", "C-b", "C-f", "C-p", "C-n", "Home", "End", "Left", "Right", "Up", "Down", "M-b", "M-f", "C-k"}
+    {"c-a", "c-e", "c-b", "c-f", "c-p", "c-n", "home", "end", "left", "right", "up", "down", "m-b", "m-f", "c-k"}
 )
-_HEX_KEY = re.compile(r"^0x([0-9a-fA-F]{1,6})$")
-_KEY_LIKE = re.compile(r"^(?:[CMS]-)+\S+$")  # C-x, M-x, C-M-x: a key, whatever it is, and not text
+_QUIET = frozenset({"escape", "pageup", "pagedown", "ic", "dc", "btab", "npage", "ppage"})  # keys that type nothing
+_HEX_KEY = re.compile(r"^0x([0-9a-f]{1,6})$")
+_KEY_LIKE = re.compile(r"^(?:[cms]-)+\S+$")  # c-x, m-x, c-m-x: a key, whatever it is, and not text
 _DYNAMIC = ("$", "`")  # what the shell would still have changed: the text isn't the text it appears to be
 
 _REASON = (
@@ -131,29 +137,30 @@ def _options(args: list[str], name: str) -> tuple[dict[str, str], set[str], list
 def _unkey(word: str) -> tuple[str, str | None]:
     """(text, edit) one `send-keys` word stands for when it is not literal: the text it types, and "erase", "kill-line",
     "kill-word", "move" or None for what it does to the line being typed."""
-    if word in _ENTER:
+    key = word.lower()
+    if len(key) == 2 and key[0] == "^":
+        key = f"c-{key[1]}"
+    if key in _ENTER:
         return "\n", None
-    if word in _BLANKS:
-        return _BLANKS[word], None
-    if word in _KEYPAD:
-        return _KEYPAD[word], None
-    if word in _ERASE:
+    if key in _BLANKS:
+        return _BLANKS[key], None
+    if key in _KEYPAD:
+        return _KEYPAD[key], None
+    if key in _ERASE:
         return "", "erase"
-    if word == "C-u":
+    if key == "c-u":
         return "", "kill-line"
-    if word == "C-w":
+    if key == "c-w":
         return "", "kill-word"
-    if word in _MOVERS:
+    if key in _MOVERS:
         return "", "move"
-    m = _HEX_KEY.match(word)
+    m = _HEX_KEY.match(key)
     if m:
         try:
             return chr(int(m.group(1), 16)), None
         except (ValueError, OverflowError):
             return "", None
-    if _KEY_LIKE.match(word) or word in ("Escape", "PageUp", "PageDown", "IC", "DC", "BTab", "NPage", "PPage"):
-        return "", None
-    if re.fullmatch(r"F[0-9]{1,2}", word):
+    if _KEY_LIKE.match(key) or key in _QUIET or re.fullmatch(r"f[0-9]{1,2}", key):
         return "", None
     return word, None
 
@@ -308,6 +315,20 @@ class _Buffers:
 # --- the decision ----------------------------------------------------------------------------------------------------
 
 
+def _control_mode(words: list[str]) -> bool:
+    """True when tmux's own leading options (before the command word) hold `-C` or `-CC`, as a word of its own or in a
+    cluster (`-uC`). The values of `-L`, `-S`, `-c`, `-f` and `-T` are skipped."""
+    i = 0
+    while i < len(words) and words[i].startswith("-") and words[i] != "--":
+        if words[i] in ("-L", "-S", "-c", "-f", "-T"):
+            i += 2
+            continue
+        if re.fullmatch(r"-[A-Za-z0-9]*C[A-Za-z0-9]*", words[i]):
+            return True
+        i += 1
+    return False
+
+
 def _refuse(why: str) -> Finding:
     return Finding("deny", _REASON.format(why=why), approvable=True)
 
@@ -345,6 +366,8 @@ def _judge_one(inv: Invocation, queue: list[Invocation], live: Path, listy: bool
     except pane_close._Unsure as e:
         if on_live:  # on a test server a file that can't be read is not our concern
             return _refuse(e.reason)
+    if on_live and _control_mode(inv.words):
+        return _refuse("tmux control mode (`-C`) takes its commands from its input, which can't be read here")
     if not sub or not on_live:
         return _GO_ON
     if any(c in sub for c in _DYNAMIC):

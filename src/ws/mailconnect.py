@@ -48,6 +48,7 @@ from ws.output import WsError
 
 MAX_FAILS = 3
 WINDOW_S = 15 * 60
+FUTURE_S = 5.0  # how far past `now` a try's time may be and still count
 ADDRESS_RE = re.compile(r"^[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,189}\.[A-Za-z]{2,24}$")
 
 
@@ -205,7 +206,7 @@ def _tries(path: Path, now: float) -> dict[str, list[dict]]:
                 and isinstance(x.get("t"), (int, float))
                 and now - WINDOW_S
                 < x["t"]
-                <= now + WINDOW_S  # a newer try (another thread's clock read later) still counts
+                <= now + FUTURE_S  # another thread read its clock a moment later: its try still counts
             ]
             if keep:
                 out[k] = keep
@@ -310,34 +311,53 @@ def _append_entry(path: Path, block: str) -> None:
 
 def _save(name: str, kind: str, secret: str, value: str, reg_path: Path, block: str | None, env: dict | None) -> bool:
     """Write the registry entry (if new), the stored value and the profile table, or put back what was there and raise
-    ConnectError: a good login never leaves a stored value with no table, or a table with no value."""
+    ConnectError: a good login never leaves a stored value with no table, or a table with no value. Saves run one at a
+    time (a lock), and a restore takes out only what this save wrote."""
+    with _locked(paths.state_dir(env) / "mail-connect" / "save"):  # one save at a time: a restore can't undo another's
+        return _save_locked(name, kind, secret, value, reg_path, block, env)
+
+
+def _unappend(reg_path: Path, block: str) -> None:
+    """Take out exactly the block this save appended (the last copy), keeping anything else written meanwhile."""
+    text = reg_path.read_text(encoding="utf-8")
+    at = text.rfind(block)
+    if at < 0:
+        return
+    rest = (text[:at].rstrip("\n") + "\n" if text[:at].strip() else "") + text[at + len(block) :]
+    if rest.strip():
+        reg_path.write_text(rest, encoding="utf-8")
+    else:
+        reg_path.unlink(missing_ok=True)
+
+
+def _save_locked(name, kind, secret, value, reg_path: Path, block: str | None, env: dict | None) -> bool:
     store = wsecrets.local_store(env)
     try:
-        old_reg = reg_path.read_text(encoding="utf-8") if block is not None and reg_path.exists() else None
         old_value = store.read(secret) if secret in store.names() else None
     except (OSError, PermissionError, wsecrets.SecretsError) as e:
         raise ConnectError("store_refused", "The password checked out, but ws can't read its store.", str(e)) from None
     profile_path = mailcmd.profile.profile_path(env)
     old_profile = profile_path.read_bytes() if profile_path.exists() else None
-    step = "registry"
+    step, appended = "registry", False
     try:
         if block is not None:
             _append_entry(reg_path, block)
+            appended = True
         step = "store"
         store.write(secret, value)
         step = "profile"
         return mailcmd.write_profile(name, kind, env)
     except (OSError, PermissionError, WsError, wsecrets.SecretsError) as e:
+        # Each restore stands alone: one that fails never stops the next.
+        if appended:
+            with contextlib.suppress(OSError):
+                _unappend(reg_path, block or "")
         with contextlib.suppress(OSError, wsecrets.SecretsError):
-            if block is not None:
-                if old_reg is None:
-                    reg_path.unlink(missing_ok=True)
-                else:
-                    reg_path.write_text(old_reg, encoding="utf-8")
             if old_value is None:
                 store.delete(secret)
             else:
                 store.write(secret, old_value)
+        with contextlib.suppress(OSError):
             if old_profile is None:
                 profile_path.unlink(missing_ok=True)
             else:
@@ -484,11 +504,14 @@ def set_on(name: str, on: bool, env: dict | None = None) -> dict:
 
 
 def disconnect(name: str, env: dict | None = None) -> dict:
-    """Take the mailbox out of ws: its profile table, its stored password and its checked mark go. The registry entry
-    stays (ws never removes one); connecting again re-uses it."""
+    """Take the mailbox out of ws: its profile table and its checked mark go, and its stored password too when that
+    table named this mailbox's own secret and no other `[mail.*]` table still uses it. The registry entry stays (ws
+    never removes one); connecting again re-uses it."""
     entry = _entry_for(name, env)
-    mailcmd.remove_profile(name, env)
-    forgot = wsecrets.local_store(env).delete(entry.name)
+    removed = mailcmd.remove_profile(name, env)
+    # Forget the value only when the table that went pointed at this mailbox's own secret and no other table still does.
+    others = {b.secret for b in mail.load_mailboxes(env).values()}
+    forgot = removed == entry.name and entry.name not in others and wsecrets.local_store(env).delete(entry.name)
     path = _checked_file(env)
     with _locked(path):
         doc = _checked(env)

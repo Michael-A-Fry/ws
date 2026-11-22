@@ -118,3 +118,14 @@ def test_any_other_ws_error_comes_back_in_plain_words_not_a_500(page, monkeypatc
         "message": "The profile can't be written.",
         "hint": "Check the disk.",
     }
+
+
+def test_an_error_that_is_not_ws_own_is_still_plain_words_not_a_500(page, monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("something internal " + "x" * 10)
+
+    monkeypatch.setattr(mailconnect, "connect", boom)
+    status, _, text = call(page, "POST", "/connect", {"name": "a", "address": USER, "provider": "", "password": "x"})
+    r = json.loads(text)
+    assert status == 200 and r["ok"] is False and r["kind"] == "failed" and "RuntimeError" in r["message"]
+    assert "something internal" not in text  # the error's own text never reaches the page

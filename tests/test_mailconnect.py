@@ -260,3 +260,36 @@ def test_a_write_that_fails_after_a_good_login_keeps_nothing_half_done(box, monk
     assert e.kind == "save_failed" and "nothing was kept" in e.message and "profile" in e.message
     assert box.s.registry.read_text() == before and "mail-b" not in box.s.store.names() and boxes() == {}
     assert box.s.store.read("mail-a") == box.password  # another mailbox's value is untouched
+
+
+def test_disconnect_keeps_a_password_another_table_still_uses_or_that_the_table_did_not_name(box):
+    mailconnect.connect("a", USER, box.password, cafile=box.cafile)
+    path = profile.profile_path()
+    path.write_text(path.read_text() + '\n[mail.twin]\nsecret = "mail-a"\n', encoding="utf-8")
+    assert mailconnect.disconnect("a")["password_forgotten"] is False  # [mail.twin] still reads it
+    assert box.s.store.read("mail-a") == box.password
+    path.write_text('[mail.a]\nsecret = "mail-other"\n', encoding="utf-8")  # a table for "a" that names another secret
+    assert mailconnect.disconnect("a")["password_forgotten"] is False
+    assert box.s.store.read("mail-a") == box.password
+
+
+def test_a_failed_save_puts_back_the_value_that_was_stored_before(box, monkeypatch):
+    old = "old-" + os.urandom(8).hex()
+    box.s.store.write("mail-a", old)
+
+    def broken(*a, **k):
+        raise mailconnect.WsError("io", "the profile can't be written", "")
+
+    monkeypatch.setattr(mailconnect.mailcmd, "write_profile", broken)
+    assert refused(box, "a", USER, box.password).kind == "save_failed"
+    assert box.s.store.read("mail-a") == old
+
+
+def test_a_registry_restore_takes_out_only_its_own_block(tmp_path):
+    reg = tmp_path / "secrets.toml"
+    mine = '[mail-b]\nkind = "imap"\nhost = "imap.gmail.com"\nuser = "b@example.com"\n'
+    other = '[mail-c]\nkind = "imap"\nhost = "imap.gmail.com"\nuser = "c@example.com"\n'
+    reg.write_text('[mail-a]\nkind = "imap"\nhost = "imap.gmail.com"\nuser = "a@example.com"\n\n' + mine + "\n" + other)
+    mailconnect._unappend(reg, mine)
+    text = reg.read_text()
+    assert "[mail-b]" not in text and "[mail-a]" in text and "[mail-c]" in text

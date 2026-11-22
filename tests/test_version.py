@@ -231,6 +231,8 @@ def test_collect_reports_the_channel_of_this_install(monkeypatch):
 
 
 STAMPED_ROOT = {
+    "source": "release",
+    "dirty": False,
     "release_identity": {
         "repo": "owner/ws",
         "identity": "https://github.com/owner/ws/.github/workflows/release.yml@refs/tags/{tag}",
@@ -263,6 +265,14 @@ def test_no_stamp_or_an_old_one_has_no_trust_root(monkeypatch):
         {"release_identity": {**STAMPED_ROOT["release_identity"], "issuer": ""}},
         {"release_identity": {**STAMPED_ROOT["release_identity"], "identity": "https://example.com/no-placeholder"}},
         {"release_identity": {"repo": "owner/ws"}},
+        # any brace but {tag} would make identity.format(tag=...) raise in the caller
+        {"release_identity": {**STAMPED_ROOT["release_identity"], "identity": "https://x/{tag}/{0}"}},
+        {"release_identity": {**STAMPED_ROOT["release_identity"], "identity": "https://x/{tag}/{owner.__class__}"}},
+        {"release_identity": {**STAMPED_ROOT["release_identity"], "identity": "https://x/{tag}}"}},
+        # only a clean release build vouches for the next one
+        {"source": "checkout"},
+        {"dirty": True},
+        {"dirty": "False"},
     ],
 )
 def test_a_stamp_with_a_field_missing_or_malformed_has_no_trust_root(monkeypatch, change):
@@ -271,5 +281,5 @@ def test_a_stamp_with_a_field_missing_or_malformed_has_no_trust_root(monkeypatch
 
 
 def test_the_trust_root_is_not_part_of_ws_version_output(monkeypatch):
-    monkeypatch.setitem(sys.modules, "ws._build", types.SimpleNamespace(git_sha="a" * 40, dirty=False, **STAMPED_ROOT))
+    monkeypatch.setitem(sys.modules, "ws._build", types.SimpleNamespace(git_sha="a" * 40, **STAMPED_ROOT))
     assert set(version.collect()) == FIELDS

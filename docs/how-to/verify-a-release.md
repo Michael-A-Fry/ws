@@ -56,6 +56,15 @@ any step exits with a non-zero code. Don't install the file.
 by the same workflow as the wheel. Steps 1 to 3 work on it the same way. Take the installer from the release you are
 installing, never from the `main` branch: only the release copy is signed.
 
+## What a signed tag shows
+
+The release workflow also checks that the tag is signed by a key listed in `.github/release_signers`, the same list the
+build stamps into the wheel as its trust root. That key belongs to the project's own release process, and the maintainers'
+sessions use it to tag a commit on `main`. So a valid tag signature shows that the project's release key signed a commit
+that's on `main`; it doesn't show that one particular person approved the release. What protects a release is the
+three checks together: the commit is on `main`, CI is green on it, and the cosign certificate names this workflow at
+this tag.
+
 ## What the installer checks for you
 
 `install.sh` with no `--version` option does step 1 itself, and step 3 when `cosign` is on your `PATH`. It refuses to

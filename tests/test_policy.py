@@ -7,6 +7,7 @@ from __future__ import annotations
 import dataclasses
 import shlex
 import time
+import tomllib
 
 import pytest
 
@@ -2727,3 +2728,49 @@ def test_add_to_guards_on_leaves_the_rest_alone(text):
 def test_add_to_guards_on_does_not_touch_an_on_key_of_another_table():
     text = '[guards]\non = ["a"]\n\n[watch]\non = ["z"]\n'
     assert policy.add_to_guards_on(text, "pane-keys") == '[guards]\non = ["a", "pane-keys"]\n\n[watch]\non = ["z"]\n'
+
+
+# --- remove_from_guards_on: the reverse, so a way back can take out just the guards an upgrade added -------------------
+
+
+@pytest.mark.parametrize(
+    ("text", "want"),
+    [
+        ('[guards]\non = ["a", "pane-keys"]  # kept\nx = 1\n', '[guards]\non = ["a"]  # kept\nx = 1\n'),
+        ('[guards]\non = ["pane-keys", "a"]\n', '[guards]\non = ["a"]\n'),
+        ('[guards]\non = ["a", "pane-keys", "b"]\n', '[guards]\non = ["a", "b"]\n'),
+        ('[guards]\non = ["pane-keys"]\n', "[guards]\non = []\n"),
+        (
+            '[guards]\non = [\n  "a",  # first\n  "pane-keys",\n  # tail\n]\n',
+            '[guards]\non = [\n  "a",  # first\n  # tail\n]\n',
+        ),
+        ("[guards]\non = ['a', 'pane-keys',]\n", "[guards]\non = ['a', ]\n"),
+    ],
+)
+def test_remove_from_guards_on_takes_out_one_guard_and_keeps_the_rest_as_written(text, want):
+    got = policy.remove_from_guards_on(text, "pane-keys")
+    assert got == want
+    assert "pane-keys" not in tomllib.loads(got)["guards"]["on"]
+
+
+def test_remove_from_guards_on_undoes_add_to_guards_on():
+    text = '# mine\n[guards]\non = [\n  "syntax-check",  # first\n  "dev-server"\n]\n\n[guards.syntax-check]\nmode = "log"\n'
+    added = policy.add_to_guards_on(text, "pane-keys")
+    assert added is not None and tomllib.loads(policy.remove_from_guards_on(added, "pane-keys"))["guards"]["on"] == [
+        "syntax-check",
+        "dev-server",
+    ]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '[guards]\non = ["a"]\n',  # not in the list
+        '# [guards]\n# on = ["pane-keys"]\n',  # only a comment
+        '[guards]\non = ["a"]  # "pane-keys" is not on\n',  # named only in a comment
+        "[guards]\nx = 1\n",  # no list
+        "[guards\non = [",  # not TOML
+    ],
+)
+def test_remove_from_guards_on_returns_none_when_there_is_nothing_to_take_out(text):
+    assert policy.remove_from_guards_on(text, "pane-keys") is None

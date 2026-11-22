@@ -140,6 +140,12 @@ def test_a_model_may_turn_tools_off_and_reasoning_down(effort):
     assert opencode.provider_problems(block(models={"qwen3:8b": m}), leased=False) == []
 
 
+@pytest.mark.parametrize("effort", ["medium", "high", "xhigh", "max"])
+def test_a_reasoning_effort_that_widens_is_refused(effort):
+    got = opencode.provider_problems(block(models={"m": {"options": {"reasoningEffort": effort}}}), leased=False)
+    assert any("reasoningEffort must be one of" in g for g in got), got
+
+
 def test_a_leased_block_may_name_no_base_url():
     assert opencode.provider_problems({"npm": opencode.LOCAL_NPM, "models": {"m": {"name": "m"}}}, leased=True) == []
 

@@ -30,6 +30,8 @@ body of the GitHub release.
   drop-in folder that could change them and the `user.control` copies are protected paths of the user-scope hook. The
   guard also refuses globs and braces in a unit name, units fed in by `xargs`, the bus calls that do the same as
   `systemctl`, and `daemon-reload` and the environment verbs.
+- The upgrade service, the rescue timer and a hand-run upgrade share one lock, so no two of them change ws at once. A
+  rescue tick that finds it held skips the probe and counts no strike.
 - `ws upgrade --unattended`, the entry of a systemd user service: it takes a request
   file (a release tag or `rollback`), proves the release itself from the installed wheel's trust root (a signed tag, the
   installer's and wheel's hashes and cosign bundles, green checks, no high or critical advisory in the lock), refuses a

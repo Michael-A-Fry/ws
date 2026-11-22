@@ -70,8 +70,11 @@ f.addEventListener("submit", async (e) => {
   go.disabled = true; say("st-info", "Logging in once, read-only...");
   try {
     const r = await post("/connect", body);
-    if (r.ok) say("st-ok", "Connected: " + r.folders + " folders; " +
-      (r.drafts ? "drafts go to " + r.drafts + "." : "no drafts folder found, so drafts are refused until there is one."));
+    if (r.ok && r.broker_ok === false) say("st-warn", "Saved, but ws can't use it yet: " + r.broker_reason,
+      "The password checked out. Run `ws doctor` to see why ws can't reach it.");
+    else if (r.ok) say("st-ok", "Connected: " + r.folders + " folders; " +
+      (r.drafts ? "drafts go to " + r.drafts + "." : "no drafts folder found, so drafts are refused until there is one.") +
+      (r.checked === false ? " (ws couldn't record the check, so it shows as not checked yet.)" : ""));
     else say("st-warn", r.message, r.hint);
   } catch (err) { say("st-error", "ws stopped answering.", "Run the command again."); }
   go.disabled = false;
@@ -164,8 +167,6 @@ def build_server(env: dict | None = None, **kw) -> LoopbackServer:
                 "message": f"ws stopped ({type(e).__name__}).",
                 "hint": "Try again.",
             }
-        finally:
-            del password
         return 200, {"ok": True, **r}
 
     def post_close(data: dict):

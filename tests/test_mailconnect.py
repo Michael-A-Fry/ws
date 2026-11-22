@@ -65,7 +65,7 @@ def test_a_good_password_is_stored_and_the_mailbox_added(box):
     r = mailconnect.connect("a", USER, box.password, cafile=box.cafile)
     assert r == {
         "mailbox": "a", "address": USER, "host": HOST, "folders": 4, "drafts": "[Gmail]/Drafts",
-        "registry_added": False, "profile_written": True, "broker_ok": True,
+        "registry_added": False, "profile_written": True, "checked": True, "broker_ok": True, "broker_reason": "",
     }  # fmt: skip
     assert box.s.store.read("mail-a") == box.password
     assert boxes() == {"a": {"secret": "mail-a", "kind": "imap"}}
@@ -293,3 +293,29 @@ def test_a_registry_restore_takes_out_only_its_own_block(tmp_path):
     mailconnect._unappend(reg, mine)
     text = reg.read_text()
     assert "[mail-b]" not in text and "[mail-a]" in text and "[mail-c]" in text
+
+
+def test_disconnect_after_switching_off_still_forgets_the_password(box):
+    mailconnect.connect("a", USER, box.password, cafile=box.cafile)
+    mailconnect.set_on("a", False)  # the profile table is gone now
+    assert mailconnect.disconnect("a")["password_forgotten"] is True
+    assert "mail-a" not in box.s.store.names()
+
+
+def test_a_broker_that_cant_use_it_yet_is_said_with_its_reason(box, monkeypatch):
+    def no_broker(self, name):
+        raise mail.MailError("broker_unavailable", "the secrets broker is not reachable")
+
+    monkeypatch.setattr(mail.Mail, "folders", no_broker)
+    r = mailconnect.connect("a", USER, box.password, cafile=box.cafile)
+    assert r["broker_ok"] is False and r["broker_reason"] == "the secrets broker is not reachable"
+    assert box.s.store.read("mail-a") == box.password  # saved: the password checked out
+
+
+def test_a_check_mark_that_cant_be_written_is_reported_as_saved(box, monkeypatch):
+    def full_disk(*a, **k):
+        raise OSError("no space")
+
+    monkeypatch.setattr(mailconnect, "_mark_checked", full_disk)
+    r = mailconnect.connect("a", USER, box.password, cafile=box.cafile)
+    assert r["checked"] is False and r["folders"] == 4 and box.s.store.read("mail-a") == box.password

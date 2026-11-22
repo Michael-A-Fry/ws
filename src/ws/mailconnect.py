@@ -458,12 +458,16 @@ def connect(
 
     # The login worked: now, and only now, write; all of it or none of it.
     written = _save(name, kind, secret, value, reg_path, block, env)
-    _mark_checked(name, env, now)
-    broker_ok = True
+    try:
+        _mark_checked(name, env, now)
+        checked = True
+    except OSError:  # saved and working; only the "last checked" mark couldn't be written
+        checked = False
+    broker_ok, broker_reason = True, ""
     try:
         mail.Mail.from_profile(env).folders(name)
-    except mail.MailError:
-        broker_ok = False
+    except mail.MailError as e:  # saved, but the broker can't use it yet: say why (its words never hold the value)
+        broker_ok, broker_reason = False, e.message
     folders = [f["name"] for f in found.get("folders", [])]
     return {
         "mailbox": name,
@@ -473,7 +477,9 @@ def connect(
         "drafts": found.get("drafts"),
         "registry_added": block is not None,
         "profile_written": written,
+        "checked": checked,
         "broker_ok": broker_ok,
+        "broker_reason": broker_reason,
     }
 
 
@@ -504,17 +510,21 @@ def set_on(name: str, on: bool, env: dict | None = None) -> dict:
 
 
 def disconnect(name: str, env: dict | None = None) -> dict:
-    """Take the mailbox out of ws: its profile table and its checked mark go, and its stored password too when that
-    table named this mailbox's own secret and no other `[mail.*]` table still uses it. The registry entry stays (ws
+    """Take the mailbox out of ws: its profile table and its checked mark go, and its stored password too unless the
+    table named another secret or another `[mail.*]` table still uses it (a mailbox switched off first, with no
+    table left, is forgotten too). It runs under the save lock, so it never interleaves with a connect. The registry entry stays (ws
     never removes one); connecting again re-uses it."""
     entry = _entry_for(name, env)
-    removed = mailcmd.remove_profile(name, env)
-    # Forget the value only when the table that went pointed at this mailbox's own secret and no other table still does.
-    others = {b.secret for b in mail.load_mailboxes(env).values()}
-    forgot = removed == entry.name and entry.name not in others and wsecrets.local_store(env).delete(entry.name)
-    path = _checked_file(env)
-    with _locked(path):
-        doc = _checked(env)
-        if doc.pop(name, None) is not None:
-            _write_recent(path, doc)  # type: ignore[arg-type]
+    with _locked(paths.state_dir(env) / "mail-connect" / "save"):  # never in the middle of a connect's save
+        removed = mailcmd.remove_profile(name, env)
+        # Forget the value unless the table that went named another secret, or another table still uses this one. No
+        # table at all (switched off first) still forgets it: the mailbox is being taken out.
+        others = {b.secret for b in mail.load_mailboxes(env).values()}
+        mine = removed in (None, entry.name)
+        forgot = mine and entry.name not in others and wsecrets.local_store(env).delete(entry.name)
+        path = _checked_file(env)
+        with _locked(path):
+            doc = _checked(env)
+            if doc.pop(name, None) is not None:
+                _write_recent(path, doc)  # type: ignore[arg-type]
     return {"mailbox": name, "disconnected": True, "password_forgotten": forgot, "registry_entry_kept": entry.name}

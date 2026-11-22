@@ -129,3 +129,23 @@ def test_an_error_that_is_not_ws_own_is_still_plain_words_not_a_500(page, monkey
     r = json.loads(text)
     assert status == 200 and r["ok"] is False and r["kind"] == "failed" and "RuntimeError" in r["message"]
     assert "something internal" not in text  # the error's own text never reaches the page
+
+
+def test_the_page_says_saved_but_not_usable_when_the_broker_cant_use_it(page, box, monkeypatch):  # noqa: F811
+    monkeypatch.setattr(
+        mailconnect,
+        "connect",
+        lambda *a, **k: {
+            "mailbox": "a",
+            "folders": 4,
+            "drafts": "[Gmail]/Drafts",
+            "broker_ok": False,
+            "broker_reason": "the secrets broker is not reachable",
+            "checked": True,
+        },
+    )
+    r = json.loads(call(page, "POST", "/connect", {"name": "a", "address": USER, "provider": "", "password": "x"})[2])
+    assert r["ok"] is True and r["broker_ok"] is False
+    text = call(page, "GET", "/?t=tok")[2]
+    assert "Saved, but ws can't use it yet: " in text  # the page's script branches on broker_ok before "Connected"
+    assert text.index("r.broker_ok === false") < text.index('"Connected: "')

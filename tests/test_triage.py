@@ -143,10 +143,10 @@ def go(tmp_path, route, model, rules=RULES, cfg=None, dry=False, now=NOW, routes
 
 
 def test_the_first_rule_that_matches_wins_and_its_id_is_the_answer():
-    f = lambda **k: triage.Facts(**{"mailbox": "a", "sender": "x@y.org", "subject": "hi", "bulk": False, **k})
+    f = lambda **k: triage.Facts(**{"mailbox": "a", "sender": "x@example.org", "subject": "hi", "bulk": False, **k})
     assert triage.decide(RULES, f(bulk=True, sender="x@bank.example.nz")) == ("ws/low", "bulk")  # bulk comes first
     assert triage.decide(RULES, f(sender="noreply@mail.bank.example.nz")) == ("ws/fyi", "bank")  # a sub-domain
-    assert triage.decide(RULES, f(sender="evilbank.example.nz@y.org")) == (triage.ASK_MODEL, "default")
+    assert triage.decide(RULES, f(sender="evilbank.example.nz@example.org")) == (triage.ASK_MODEL, "default")
     assert triage.decide(RULES, f(subject="Receipt for your order")) == ("ws/fyi", "sub-receipt")
     assert triage.decide(triage.Rules((), "ws/low"), f()) == ("ws/low", "default")
 
@@ -228,7 +228,7 @@ def test_a_plain_draft_that_repeats_the_threads_own_facts_passes():
         ("Kia ora Sam,\nThanks. I'll pay the $1,250 tomorrow.", "payment"),
         ("Kia ora Sam,\nThanks. The payment has been sent.", "payment"),
         ("Kia ora Sam,\nThanks. See https://evil.example.net/x for more.", "link"),
-        ("Kia ora Sam,\nThanks. Email me at sam@other.example.net please.", "link"),
+        ("Kia ora Sam,\nThanks. Email me at sam@example.net please.", "link"),
         ("Dear Sam,\nThanks for the quote. It looks good.", "Dear"),
         ("Thanks.", "length"),
         ("One. Two. Three. Four. Five. Six. Seven.", "length"),
@@ -240,7 +240,7 @@ def test_a_draft_that_invents_or_promises_is_refused_with_its_reason(draft, why)
 
 
 def test_a_header_date_is_not_an_offer_of_that_date():
-    thread = "Date: Sun, 22 Nov 2026 08:15:00 +1300\nMessage-ID: <a@b.example>\n\nCan we talk?"
+    thread = "Date: Sun, 22 Nov 2026 08:15:00 +1300\nMessage-ID: <a@example.org>\n\nCan we talk?"
     assert triage.check_draft("Hi Sam. Sure thing. 8:15 is fine.", thread) is not None
 
 
@@ -266,7 +266,7 @@ def test_nothing_new_is_no_model_call_and_the_next_run_after_a_run_is_the_same(t
 
 def test_rules_label_the_bulk_and_the_model_sees_only_the_rest(tmp_path):
     r = Route()
-    r.add(1, raw(sender="deals@shop.example.org", List_Unsubscribe="<u>"))
+    r.add(1, raw(sender="deals@example.org", List_Unsubscribe="<u>"))
     r.add(2, raw(sender="alerts@bank.example.nz", subject="Statement"))
     r.add(3, raw(sender="Sam T <sam@example.org>", subject="Report", body="Can you send the report by Friday?"))
     r.add(4, raw(sender="Kim <kim@example.org>", subject="Photos", body="Here are the photos from the weekend."))
@@ -300,9 +300,14 @@ def test_what_the_model_sees_is_the_instructions_the_voice_and_the_thread_as_dat
 
 def test_a_thread_is_one_call_for_its_newest_message(tmp_path):
     r, m = Route(), Model(reply(True, "r", "Kia ora Sam,\nThanks, got it. Cheers, Alex"))
-    r.add(1, raw(subject="Plan", body="First point.", mid="<a@x.org>"))
-    r.add(2, raw(subject="Re: Plan", body="Second point.", mid="<b@x.org>", References="<a@x.org>"))
-    r.add(3, raw(subject="Re: Plan", body="Third point.", mid="<c@x.org>", References="<a@x.org> <b@x.org>"))
+    r.add(1, raw(subject="Plan", body="First point.", mid="<a@example.org>"))
+    r.add(2, raw(subject="Re: Plan", body="Second point.", mid="<b@example.org>", References="<a@example.org>"))
+    r.add(
+        3,
+        raw(
+            subject="Re: Plan", body="Third point.", mid="<c@example.org>", References="<a@example.org> <b@example.org>"
+        ),
+    )
     rec = go(tmp_path, r, m)
     assert rec["threads_seen"] == 3 and rec["threads_asked"] == 1 and len(m.calls) == 1
     data = m.calls[0][1]
@@ -313,7 +318,8 @@ def test_a_thread_is_one_call_for_its_newest_message(tmp_path):
 def test_a_long_thread_is_cut_to_the_newest_messages_inside_the_cap(tmp_path):
     big = "word " * 400
     msgs = [
-        triage.Message(i, f"a:7-{i}", "s@x.org", "S", "Re: T", False, "t", f"<<<m{i}>>> {big}") for i in (1, 2, 3, 4)
+        triage.Message(i, f"a:7-{i}", "s@example.org", "S", "Re: T", False, "t", f"<<<m{i}>>> {big}")
+        for i in (1, 2, 3, 4)
     ]
     out = triage.thread_data(msgs, 600)  # 600 tokens is 2400 characters: one message of about 2000 fits, not two
     assert "<<<m4>>>" in out and "<<<m3>>>" not in out
@@ -451,7 +457,7 @@ def test_a_search_query_reaches_the_mailbox_so_what_is_not_ours_is_never_opened(
 def test_a_cap_holds_the_rest_for_the_next_run_and_nothing_is_called_twice(tmp_path):
     r = Route()
     for i in (1, 2, 3):
-        r.add(i, raw(subject=f"Subject {i}", body=f"Body {i}?", mid=f"<{i}@x.org>"))
+        r.add(i, raw(subject=f"Subject {i}", body=f"Body {i}?", mid=f"<{i}@example.org>"))
     m = Model(reply(False), reply(False), reply(False))
     cfg = _replace(config(tmp_path), model={"max_calls": 2})
     rec = go(tmp_path, r, m, cfg=cfg)
@@ -468,8 +474,8 @@ def test_a_cap_holds_the_rest_for_the_next_run_and_nothing_is_called_twice(tmp_p
 )
 def test_each_cap_of_a_run_stops_further_calls(tmp_path, model, why):
     r = Route()
-    r.add(1, raw(subject="One", mid="<1@x.org>"))
-    r.add(2, raw(subject="Two", mid="<2@x.org>"))
+    r.add(1, raw(subject="One", mid="<1@example.org>"))
+    r.add(2, raw(subject="Two", mid="<2@example.org>"))
     m = Model(reply(False), reply(False))
     rec = go(tmp_path, r, m, cfg=_replace(config(tmp_path), model=model))
     assert len(m.calls) == 1 and rec["deferred_threads"] == 1
@@ -477,8 +483,8 @@ def test_each_cap_of_a_run_stops_further_calls(tmp_path, model, why):
 
 def test_a_failed_runner_stops_the_calls_and_holds_the_threads(tmp_path):
     r, m = Route(), Model(ok=False)
-    r.add(1, raw(subject="One", mid="<1@x.org>"))
-    r.add(2, raw(subject="Two", mid="<2@x.org>"))
+    r.add(1, raw(subject="One", mid="<1@example.org>"))
+    r.add(2, raw(subject="Two", mid="<2@example.org>"))
     rec = go(tmp_path, r, m)
     assert len(m.calls) == 1 and rec["deferred_threads"] == 2 and r.labels == [] and r.drafts == []
     assert json.loads((tmp_path / "state" / "inbox.json").read_text())["mailboxes"]["a"]["pending"] == [1, 2]
@@ -507,7 +513,7 @@ def test_more_mail_than_one_search_page_is_reported_not_hidden(tmp_path):
 def test_the_draft_limit_of_a_run_flags_the_rest(tmp_path):
     r = Route()
     for i in (1, 2, 3):
-        r.add(i, raw(subject=f"S{i}", mid=f"<{i}@x.org>"))
+        r.add(i, raw(subject=f"S{i}", mid=f"<{i}@example.org>"))
     m = Model(*[reply(True, "r", "Kia ora,\nThanks for this. I will look. Cheers, Alex")] * 3)
     rec = go(tmp_path, r, m, cfg=_replace(config(tmp_path), max_drafts=2))
     assert rec["drafts"] == 2 and any("draft limit" in f["why"] for f in rec["flagged"])

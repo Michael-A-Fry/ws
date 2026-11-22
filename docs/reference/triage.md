@@ -92,10 +92,10 @@ bulk = true                          # List-Unsubscribe, List-Id, Precedence bul
 id = "bank"
 label = "ws/fyi"
 domain = "bank.example.nz"           # the domain and every sub-domain
-# also: sender = "a@b.org" (or a list), subject = "^receipt\\b" (a case-insensitive pattern), mailbox = ["personal"]
+# also: sender = "a@example.org" (or a list), subject = "^receipt\\b" (a case-insensitive pattern), mailbox = ["personal"]
 ```
 
-Conditions in one rule are ANDed. A message from the mailbox's own address is left alone (`builtin:self`). Rules see
+Every condition in one rule must hold. A message from the mailbox's own address is left alone (`builtin:self`). Rules see
 the headers only, never the body.
 
 ## What it costs

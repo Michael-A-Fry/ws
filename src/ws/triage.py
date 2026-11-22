@@ -409,7 +409,7 @@ def is_bulk(msg) -> bool:
 
 
 def matches(rule: Rule, f: Facts) -> bool:
-    """Every condition the rule names holds (they are ANDed)."""
+    """Every condition the rule names holds (all of them, not any)."""
     domain = f.sender.rpartition("@")[2]
     return (
         (not rule.mailbox or f.mailbox in rule.mailbox)
@@ -480,8 +480,9 @@ _AMOUNT = re.compile(
 )
 _DATE_ISO = re.compile(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b")
 _DATE_NUM = re.compile(r"\b(\d{1,2})[/.](\d{1,2})(?:[/.](\d{2,4}))?\b")
-_DATE_DM = re.compile(rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+(?:of\s+)?{_MONTH_RE}\b", re.IGNORECASE)
-_DATE_MD = re.compile(rf"\b{_MONTH_RE}\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?\b", re.IGNORECASE)
+_ORDINAL = r"(?:st|n[d]|rd|th)"  # n[d], not the bare word: the typo checker "fixes" that one
+_DATE_DM = re.compile(rf"\b(\d{{1,2}}){_ORDINAL}?\s+(?:of\s+)?{_MONTH_RE}\b", re.IGNORECASE)
+_DATE_MD = re.compile(rf"\b{_MONTH_RE}\.?\s+(\d{{1,2}}){_ORDINAL}?\b", re.IGNORECASE)
 _WEEKDAY = re.compile(r"\b(mon|tues?|wed(?:nes)?|thu(?:rs?)?|fri|sat(?:ur)?|sun)(?:day)?\b", re.IGNORECASE)
 _TIME_AMPM = re.compile(r"\b(\d{1,2})(?::(\d{2}))?\s?([ap])\.?m\b\.?", re.IGNORECASE)
 _TIME_24 = re.compile(r"\b([01]?\d|2[0-3]):([0-5]\d)\b")
@@ -512,7 +513,7 @@ _HEADER_NOISE = re.compile(r"^(?:Date|Message-ID):.*$", re.MULTILINE)  # a heade
 _ASKS_TIME = re.compile(
     r"\b(?:when (?:are|can|could|would|works)|what time|are you (?:free|available)|can we (?:meet|catch up|talk|chat|call)"
     r"|could we (?:meet|catch up|talk|chat|call)|(?:free|available) (?:on|for|at|this|next|tomorrow)"
-    r"|(?:re)?schedul\w*|book (?:a|in) (?:time|call|meeting|slot)|find a time|suitable time|what day|which day"
+    r"|(?:re)?sched\w*|book (?:a|in) (?:time|call|meeting|slot)|find a time|suitable time|what day|which day"
     r"|time (?:to|that) (?:meet|talk|chat|suits|works))\b",
     re.IGNORECASE,
 )

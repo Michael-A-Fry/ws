@@ -11,3 +11,4 @@
 ^        raise ConnectError\("bad_address", "That isn't an e-mail address\.", "Type the whole address, e\.g\. you@gmail\.com\."\)$
 ^    e = refused\(box, "g", "someone@gmail\.com", "not an app password at all"\)$
 ^        \(\("c", "me@custom-domain\.example", "x"\), "pick_provider"\),$
+^.*sender="(?:x|alerts)@bank\.example\.nz".*$

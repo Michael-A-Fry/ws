@@ -342,6 +342,15 @@ KINDS: dict[str, Kind] = dict(
             _state("logs", "broker"),
             ("t", "op", "name", "purpose", "status", "bytes"),
         ),
+        # counts, tokens, cost and rule ids: a run line carries no sender, subject or mail text, and these keys keep it so
+        _logrow(
+            "triage-run",
+            "triage",
+            "Triage runs",
+            _state("logs", "triage"),
+            ("schema", "ts", "type", "run_id", "job", "dry_run", "threads_seen", "model_calls", "drafts", "cost_usd"),
+        ),
+        _row("triage-state", "triage", "Triage state", _SID, "single writer", _files(_state("triage"), ("schema",))),
         _row("session", "session", "Session", _SID, "single writer", _sessions),
         _row(
             "identity",
@@ -395,7 +404,9 @@ LINK_SPEC: dict[str, tuple[tuple[str, str, str], ...]] = {
             "upgrade-log",
         )
     },
-    **{k: () for k in ("broker", "session", "approval", "versions", "limits", "view")},  # points at nothing, said
+    **{
+        k: () for k in ("broker", "session", "approval", "versions", "limits", "view", "triage-run", "triage-state")
+    },  # points at nothing, said
 }
 
 

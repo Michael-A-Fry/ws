@@ -41,6 +41,8 @@ gate call has no payload, an approval has no bound command, an OpenCode ask has 
 | `footprint` | `node` | Node footprint | `h[0-9a-f]{12}` | truth | append-only |
 | `ask` | `adapters.opencode` | Asks | `\S+` | truth | append-only |
 | `broker` | `broker` | Broker audit | `h[0-9a-f]{12}` | truth | append-only |
+| `triage-run` | `triage` | Triage runs | `h[0-9a-f]{12}` | truth | append-only |
+| `triage-state` | `triage` | Triage state | `[0-9A-Za-z_-]+` | truth | single writer |
 | `session` | `session` | Session | `[0-9A-Za-z_-]+` | truth | single writer |
 | `identity` | `session` | Session identity | `[0-9A-Za-z_-]+` | truth | single writer |
 | `guard-record` | `guards` | Guard record | `[0-9A-Za-z_.-]+` | truth | single writer |

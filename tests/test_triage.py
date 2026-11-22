@@ -874,12 +874,12 @@ def test_a_thread_seen_again_is_one_line_and_one_the_owner_answered_is_marked_do
 
 def test_a_check_rule_gives_a_summary_line_adds_fyi_and_makes_no_model_call(tmp_path):
     r = Route()
-    r.add(1, raw(sender="Google <no-reply@accounts.google.com>", subject="Security alert", mid="<s1@example.org>"))
+    r.add(1, raw(sender="Gina <gina@example.org>", subject="Security alert", mid="<s1@example.org>"))
     m = Model()
     rec = go(tmp_path, r, m, rules=CHECK_RULES)
     assert m.calls == [] and rec["model_calls"] == 0 and r.labels == [("a:7-1", "ws/fyi")] and r.drafts == []
     assert rec["labels"] == {"ws/fyi": 1} and rec["decisions"][0]["rule"] == "security"
-    assert "Worth a look:\n- a: Google, “Security alert”: matched rule security.\n" in summary(tmp_path)
+    assert "Worth a look:\n- a: Gina, “Security alert”: matched rule security.\n" in summary(tmp_path)
 
 
 def test_the_summary_has_no_tokens_or_money_and_the_run_log_keeps_them(tmp_path):
@@ -921,7 +921,7 @@ def test_no_body_text_reaches_the_summary(tmp_path):
 
 def test_a_dry_run_carries_the_summary_it_would_write_and_writes_nothing(tmp_path):
     r = Route()
-    r.add(1, raw(sender="Google <no-reply@accounts.google.com>", subject="Security alert", mid="<s1@example.org>"))
+    r.add(1, raw(sender="Gina <gina@example.org>", subject="Security alert", mid="<s1@example.org>"))
     rec = go(tmp_path, r, Model(), rules=CHECK_RULES, dry=True)
     assert rec["summary"].startswith("Inbox triage ") and "matched rule security" in rec["summary"]
     assert not (tmp_path / "ctx").exists() and not (tmp_path / "state").exists()

@@ -114,7 +114,7 @@ call; the run records show which is which.
 ## The model
 
 The model is one setting, `[triage.model] runner`. The default is the `claude-code` runner and a small model (your
-subscription login, no extra money), which is the fallback because it needs no key; it is also the dearest in tokens,
+subscription login, no extra money), which is the fallback because it needs no key; it's also the dearest in tokens,
 since Claude Code sends its own context with every call. Change `[triage.model]` to use something else:
 
 | You have | Set |
@@ -126,10 +126,10 @@ since Claude Code sends its own context with every call. Change `[triage.model]`
 `anthropic-api` calls the Messages API directly: the prompt and voice are the `system` text, the thread (marked untrusted
 data) is the one user message, and there are no tools. The key never reaches ws: the broker leases a loopback address that
 forwards to the host and adds the key, ws sends a placeholder, and the lease is released after each call. Cost is counted
-from the reply's usage at your prices; `allow_unpriced = true` skips the prices and leaves only the token caps. It does
-not go through `ws run`, so the call is not in `ws runs` or the monthly cap; the run's `budget_usd`, `run_tokens` and
-`max_calls` hold, and a call whose worst case (the thread plus `max_tokens`) would pass what is left of `budget_usd` is
-not made. Counted by characters (4 to a token), one call is about 700 tokens in for a short thread and about 2,100 for
+from the reply's usage at your prices; `allow_unpriced = true` skips the prices and leaves only the token caps. It
+skips `ws run`, so the call isn't in `ws runs` or the monthly cap; the run's `budget_usd`, `run_tokens` and
+`max_calls` hold, and a call whose worst case (the thread plus `max_tokens`) would pass what's left of `budget_usd` isn't
+made. Counted by characters (4 to a token), one call is about 700 tokens in for a short thread and about 2,100 for
 one at its cap, with a 1,500-character prompt, the voice and the 1,500-token thread cap; the API's own count is in the
 run record.
 

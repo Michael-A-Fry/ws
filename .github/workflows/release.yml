@@ -186,7 +186,7 @@ jobs:
     if: github.event_name == 'push'
     needs: build
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 20  # room for one attest retry and the cosign retries
     permissions:
       id-token: write
       attestations: write
@@ -198,7 +198,22 @@ jobs:
       - name: the files are the ones the build wrote
         working-directory: dist
         run: sha256sum -c ./*.sha256
-      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+      # Sigstore's transparency log sometimes answers 404 or 500 just after a write ("error fetching tlog entry",
+      # 22 Nov 2026: v0.1.11.7 failed here twice with the build green). One retry after a pause; a second failure
+      # still fails the release, so nothing ships unattested.
+      - id: attest1
+        continue-on-error: true
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.whl
+            dist/*.tar.gz
+            dist/*.cdx.json
+      - name: pause before the one retry of the attestation
+        if: steps.attest1.outcome == 'failure'
+        run: sleep 60
+      - if: steps.attest1.outcome == 'failure'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
             dist/*.whl
@@ -213,7 +228,12 @@ jobs:
           TAG: ${{ needs.build.outputs.tag }}
         run: |
           for f in *.whl *.tar.gz *.cdx.json; do
-            cosign sign-blob --yes --bundle "$f.sigstore.json" "$f"
+            # the same transparency log: up to 3 tries, 30 s apart, then the step fails
+            for try in 1 2 3; do
+              cosign sign-blob --yes --bundle "$f.sigstore.json" "$f" && break
+              [ "$try" = 3 ] && exit 1
+              sleep 30
+            done
             cosign verify-blob --bundle "$f.sigstore.json" \
               --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/$TAG" \
               --certificate-oidc-issuer https://token.actions.githubusercontent.com "$f"

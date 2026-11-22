@@ -8,6 +8,8 @@ body of the GitHub release.
 
 ## [Unreleased]
 
+## [0.1.11.6] - 2026-11-22
+
 ### Added
 
 - `ws.mailconnect`: connect a mailbox from a page. It tries the app password with one read-only login before it

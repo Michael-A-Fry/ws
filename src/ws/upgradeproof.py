@@ -13,8 +13,10 @@ through the one already there. `verify_release` refuses, with a reason, unless a
 4. the tag's lock has no vulnerability of high or critical severity (`uv audit`; a vulnerability with no severity, or
    output that can't be read, counts as high, because a gate that can't tell fails closed).
 
-Every network read goes through one `Source` (GitHub over https; a test hands over a fake tree), and every tool is found on
-the PATH given, never from the request. `no downgrade`: a tag at or below the installed version is refused (`version_key`
+Every network read goes through one `Source` (GitHub over https; a test hands over a fake tree). Every tool is run from a
+system folder (`tool`, never the caller's PATH), with a home of its own and an environment of a few names (`proof_env`,
+`clean_env`): a program or a `~/.gitconfig` a session planted can't stand in for git, cosign or uv, and a proxy or
+certificate variable can't reach the network reads (`opener`). `no downgrade`: a tag at or below the installed version is refused (`version_key`
 reads four-part versions such as 0.1.11.8 and release candidates, which sort below their release).
 
 Swap note: cosign and `uv audit` are the two tools this leans on, each in one function (`_cosign`, `_audit`); a different
@@ -27,12 +29,14 @@ import hashlib
 import json
 import os
 import re
-import shutil
+import ssl
 import subprocess
 import urllib.request
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Protocol
+
+from ws import paths
 
 ROLLBACK = "rollback"
 _TAG = re.compile(r"v[0-9]+(?:\.[0-9]+){1,3}(?:rc[0-9]+)?")
@@ -41,6 +45,9 @@ ASSET_LIMIT = 100 << 20  # bytes of one release file
 TOOL_TIMEOUT_S = 120
 BAD_SEVERITIES = frozenset({"high", "critical"})
 SAFE_RUNS = frozenset({"success", "skipped", "neutral"})  # a check run that ended without failing
+ENV_KEEP = ("LANG", "LC_ALL")  # the only names of the caller's environment a tool may see (HOME is set per tool)
+SSH_SIGNATURE = "-----BEGIN SSH SIGNATURE-----"
+_CA_FILES = ("/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt", "/etc/ssl/cert.pem")
 
 
 class Refused(Exception):
@@ -96,7 +103,7 @@ class GitHub:
 
     def _get(self, url: str, limit: int) -> bytes:
         try:
-            with urllib.request.urlopen(url, timeout=30) as resp:  # https, checked in __init__
+            with opener().open(url, timeout=30) as resp:  # https, checked in __init__
                 data = resp.read(limit + 1)
         except OSError as e:
             raise Refused(f"could not read {url.rsplit('/', 1)[-1]} ({type(e).__name__})") from e
@@ -114,8 +121,9 @@ class GitHub:
             ["-C", str(dest), "fetch", "-q", "--depth", "1", url, f"refs/tags/{tag}:refs/tags/{tag}"],
             ["-C", str(dest), "checkout", "-q", "--detach", tag],
         ]
+        env = proof_env(dest.parent)
         for argv in steps:
-            _run(["git", *argv], clean_env(os.environ))
+            _run([tool("git"), *argv], env)
 
     def check_runs(self, sha: str) -> list[dict]:
         body = json.loads(self._get(f"{self.api}/repos/{self.repo}/commits/{sha}/check-runs?per_page=100", 4 << 20))
@@ -126,11 +134,69 @@ class GitHub:
 
 
 def clean_env(env: Mapping[str, str]) -> dict[str, str]:
-    """What a tool the service starts may see: the PATH, the home and the locale, and nothing else. A mirror address, a
-    skip-the-checks switch or a token set for some other purpose never reaches the installer or a verifier."""
+    """What a program the service starts may see: the system folders as its PATH, the caller's home (an installer installs
+    into it) and the locale (`ENV_KEEP`), and nothing else. A mirror address, a skip-the-checks switch, a proxy, a library
+    path or a token set for some other purpose never reaches the installer."""
+    out = {k: env[k] for k in ("HOME", *ENV_KEEP) if k in env}
+    out["PATH"] = os.pathsep.join(tool_dirs())
+    return out
+
+
+def proof_env(scratch: Path) -> dict[str, str]:
+    """What git, cosign and uv see while a release is proved: a home that is an empty folder of this run (so no
+    `~/.gitconfig`, `~/.sigstore` cache or `~/.config/uv` of the person's is read), no system git config, and the system
+    folders for PATH."""
+    home = scratch / "proof-home"
+    home.mkdir(exist_ok=True)
     return {
-        k: env[k] for k in ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "XDG_STATE_HOME", "XDG_DATA_HOME") if k in env
+        "PATH": os.pathsep.join(tool_dirs()),
+        "HOME": str(home),
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        **{k: os.environ[k] for k in ENV_KEEP if k in os.environ},
     }
+
+
+def tool_dirs() -> list[str]:
+    """The folders a tool may be run from: the system's, never a folder a session or a user can write by default."""
+    return [d for d in paths.tool_path().split(os.pathsep) if d]
+
+
+def tool(name: str) -> str:
+    """The absolute path of `name` in a system folder. Never the caller's PATH: a program a session put in
+    `~/.local/bin` is not found."""
+    for folder in tool_dirs():
+        found = os.path.join(folder, name)
+        if os.path.isfile(found) and os.access(found, os.X_OK):
+            return found
+    raise Refused(
+        f"{name} is not in a system folder ({', '.join(tool_dirs())}), so a release can't be proved; install it there"
+    )
+
+
+def ca_context() -> ssl.SSLContext:
+    """TLS with the system's certificate authorities, read from where the platform keeps them. `SSL_CERT_FILE` and
+    `SSL_CERT_DIR` are not read: a variable must not decide whom a download is trusted from."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.verify_mode, ctx.check_hostname = ssl.CERT_REQUIRED, True
+    known = ssl.get_default_verify_paths()
+    for cafile in (known.openssl_cafile, *_CA_FILES):
+        if cafile and os.path.isfile(cafile):
+            ctx.load_verify_locations(cafile=cafile)
+            return ctx
+    if known.openssl_capath and os.path.isdir(known.openssl_capath):
+        ctx.load_verify_locations(capath=known.openssl_capath)
+        return ctx
+    raise Refused("no system certificate bundle was found, so a release can't be read over https")
+
+
+def opener() -> urllib.request.OpenerDirector:
+    """An https opener that ignores `HTTPS_PROXY` and friends (an empty proxy map) and the certificate variables."""
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=ca_context())
+    )
 
 
 def _run(argv: list[str], env: Mapping[str, str], cwd: Path | None = None) -> str:
@@ -153,29 +219,37 @@ def _run(argv: list[str], env: Mapping[str, str], cwd: Path | None = None) -> st
     return p.stdout
 
 
-def _tool(name: str, env: Mapping[str, str]) -> str:
-    found = shutil.which(name, path=env.get("PATH"))
-    if not found:
-        raise Refused(f"{name} is not installed on this machine's PATH, so a release can't be proved; install it")
-    return found
-
-
 def _tag_signature(repo: Path, tag: str, root: Mapping[str, str], scratch: Path, env: Mapping[str, str]) -> str:
-    """Check the tag is signed by an allowed signer and return the commit it names."""
+    """Check the tag is signed (an SSH signature, never a gpg one) by an allowed signer and return the commit it names."""
     signers = scratch / "allowed_signers"
     signers.write_text(root["tag_signers"], encoding="utf-8")
-    git = _tool("git", env)
+    git = tool("git")
     kind = _run([git, "-C", str(repo), "cat-file", "-t", f"refs/tags/{tag}"], env).strip()
     if kind != "tag":
         raise Refused(f"{tag} is not a signed (annotated) tag")
-    cfg = ["-c", "gpg.format=ssh", "-c", f"gpg.ssh.allowedSignersFile={signers}"]
-    _run([git, "-C", str(repo), *cfg, "tag", "-v", tag], env)
+    if SSH_SIGNATURE not in _run([git, "-C", str(repo), "cat-file", "tag", f"refs/tags/{tag}"], env):
+        raise Refused(f"{tag} carries no SSH signature")
+    cfg = [
+        "-c",
+        "gpg.format=ssh",
+        "-c",
+        f"gpg.ssh.program={tool('ssh-keygen')}",
+        "-c",
+        f"gpg.ssh.allowedSignersFile={signers}",
+    ]
+    try:
+        _run([git, "-C", str(repo), *cfg, "tag", "-v", tag], env)
+    except Refused as e:
+        raise Refused(f"{tag} is not signed by a key in the trust root ({e})") from e
     return _run([git, "-C", str(repo), "rev-parse", f"{tag}^{{commit}}"], env).strip()
 
 
 def _cosign(blob: Path, bundle: Path, identity: str, issuer: str, env: Mapping[str, str]) -> None:
-    cmd = [_tool("cosign", env), "verify-blob", "--bundle", str(bundle)]
-    _run([*cmd, "--certificate-identity", identity, "--certificate-oidc-issuer", issuer, str(blob)], env)
+    cmd = [tool("cosign"), "verify-blob", "--bundle", str(bundle)]
+    try:
+        _run([*cmd, "--certificate-identity", identity, "--certificate-oidc-issuer", issuer, str(blob)], env)
+    except Refused as e:
+        raise Refused(f"{blob.name}'s signature does not verify as made by the release workflow ({e})") from e
 
 
 def _asset(src: Source, tag: str, name: str, scratch: Path, identity: str, issuer: str, env: Mapping[str, str]) -> Path:
@@ -193,7 +267,7 @@ def _asset(src: Source, tag: str, name: str, scratch: Path, identity: str, issue
 
 def _audit(repo: Path, env: Mapping[str, str]) -> None:
     """Refuse when the tag's lock has a vulnerability of high or critical severity, or none can be told apart."""
-    uv = _tool("uv", env)
+    uv = tool("uv")
     out = _run([uv, "audit", "--frozen", "--output-format", "json"], env, cwd=repo)
     try:
         report = json.loads(out)
@@ -227,8 +301,11 @@ def verify_release(tag: str, root: Mapping[str, str], src: Source, scratch: Path
     with the reason at the first thing that doesn't hold; nothing is installed by this function."""
     if not _TAG.fullmatch(tag):
         raise Refused(f"{tag!r} is not a release tag")
-    env = clean_env(env)
-    identity, issuer = root["identity"].format(tag=tag), root["issuer"]
+    env = proof_env(scratch)
+    try:
+        identity, issuer = root["identity"].format(tag=tag), root["issuer"]
+    except (KeyError, IndexError, ValueError, AttributeError) as e:  # a stamp with another brace field in the identity
+        raise Refused("the trust root's certificate identity is not a pattern with one {tag}") from e
     repo = scratch / "tag"
     src.checkout(tag, repo)
     sha = _tag_signature(repo, tag, root, scratch, env)

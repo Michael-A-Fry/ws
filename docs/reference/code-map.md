@@ -92,6 +92,7 @@ below, and `python3 scripts/gen_code_map.py --check` (prek and CI) fails when it
 | `tailnet.py` | The tailnet checks a one-shot phone page uses: which address it may listen on, and whether a... |
 | `term/` | `ws term`: a browser terminal that behaves like a native one, for reaching a ws machine from a... |
 | `testing/` | Test support that ships with ws: the mock model provider and its scenarios |
+| `triage.py` | `ws triage run`: the inbox job, rules first, one small model call per thread, drafts only |
 | `ui/` | The shared page toolkit: the ws look as CSS, small HTML components, and the loopback server that... |
 | `unknownpath.py` | A command word with a part the reader cannot resolve, tested against the paths ws protects |
 | `upgrade.py` | `ws upgrade`: swap the ws binary for a newer release and rewrite the runner's hooks in the same step |

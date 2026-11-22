@@ -36,9 +36,14 @@ def label(name: str) -> str:
 
 def interval(when: When) -> dict[str, int] | list[dict[str, int]]:
     """StartCalendarInterval for a repeat time (launchd's Weekday: 0 is Sunday, 1 is Monday). `every Nm` is a list of
-    minutes, 0, N, 2N and on to the hour: the same times systemd's `*:00/N` gives."""
+    minutes, 0, N, 2N and on to the hour: the same times systemd's `*:00/N` gives; with a window, each of them in
+    each hour of it, and the last hour's :00."""
     if when.kind == "hourly":
         return {"Minute": 0}
+    if when.kind == "every" and when.window:
+        first, last = when.window
+        runs = [{"Hour": h, "Minute": m} for h in range(first, last) for m in range(0, 60, when.every)]
+        return [*runs, {"Hour": last, "Minute": 0}]
     if when.kind == "every":
         return [{"Minute": m} for m in range(0, 60, when.every)]
     d = {"Hour": when.hour, "Minute": when.minute}

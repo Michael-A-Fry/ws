@@ -68,6 +68,7 @@ Measure:
 - [Code map](reference/code-map.md): what each module in `src/ws/` is for, built from its docstring.
 - [Eval](reference/eval.md): task files, graders and the ten metrics.
 - [Mail](reference/mail.md): mailboxes for triage, the five mail tools, `ws mail` and the Gmail app password step.
+- [Inbox triage](reference/triage.md): `ws triage run`: rules first, one small model call per thread, checked drafts, never a send.
 - [Connect flows](reference/connect.md): the flow file format, its state and the JSON an agent reads.
 - [Stores](reference/stores.md): every log and record file ws writes, its fields, schema and retention.
 - [Lab](reference/lab.md): the lab virtual machine cell and how it's protected.

@@ -10,6 +10,22 @@ body of the GitHub release.
 
 ### Added
 
+- `ws triage run`: the inbox job, deterministic first. New mail is sorted by a plain TOML rules file (sender, domain,
+  bulk-mail headers, subject; each decision logs its rule id) and only a thread that may need a reply goes to a model:
+  one call, no tools, the thread cut to a token cap, an answer that must parse to `{needs_reply, reason, draft}` (two
+  retries, then the thread is flagged). A draft that names an amount, a date or a time the thread doesn't carry,
+  promises a payment, holds a link the thread doesn't carry, opens with "Dear" or isn't 2 to 6 sentences is refused
+  and flagged. Labels and drafts go through `ws mail`; nothing is sent, moved or deleted. The model is `[triage.model]`
+  (the `claude-code` runner with a small model by default; `anthropic-api`, a direct Messages API call with the key
+  leased through the broker and about 2k tokens in a call instead of 31k; or OpenCode) with a per-run cap in
+  calls, tokens and money. Each run adds a line to `logs/triage.jsonl` (counts, tokens, cost, rule ids, never mail text),
+  the uid state is `triage/NAME.json`, and `summary_dir` gets a `summary-DATE.md` that adds up across the day.
+  `--dry-run` labels and drafts nothing. A mailbox whose data class isn't full access is refused. See
+  [Inbox triage](docs/reference/triage.md).
+- Jobs: `command = "triage"` schedules `ws triage run --job NAME` from a `[triage]` table in the job file, and a schedule
+  may carry a window, `every 30m 05:00-22:00` (whole hours, both ends included; two `OnCalendar=` lines on systemd, one
+  calendar entry per run on launchd).
+
 - `ws.mailconnect`: connect a mailbox from a page. It tries the app password with one read-only login before it
   writes anything, then stores it, adds `[mail.NAME]` and, for Gmail, Outlook or iCloud, appends a missing registry
   entry. A refusal stores nothing and is typed (`bad_credentials`, `app_password_required`, `imap_off`,

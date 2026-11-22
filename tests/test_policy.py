@@ -2675,3 +2675,55 @@ def test_every_sudo_and_its_shell_and_folder_are_judged(pol, home, cmd):
 def test_sudo_with_n_or_s_and_a_plain_shell_still_runs(pol, home):
     for cmd in ("SUDO_ASKPASS=/tmp/x sudo -S ls", "SUDO_ASKPASS=/tmp/x sudo -n sudo -n ls", "sudo -s ls", "sudo -i ls"):
         assert policy.is_denied_command(pol, cmd) is None, cmd
+
+
+# --- add_to_guards_on: a guard added to an existing policy's `on` list, as a textual insert ---------------------------
+
+
+def test_add_to_guards_on_adds_to_a_one_line_array_and_keeps_everything_else():
+    text = '# mine\n[guards]\non = ["syntax-check", "dev-server"]  # kept\n\n[guards.syntax-check]\n'
+    got = policy.add_to_guards_on(text, "pane-keys")
+    assert (
+        got == '# mine\n[guards]\non = ["syntax-check", "dev-server", "pane-keys"]  # kept\n\n[guards.syntax-check]\n'
+    )
+    assert policy.loads(got).guards.on[-1] == "pane-keys"
+
+
+def test_add_to_guards_on_adds_to_a_multi_line_array_with_comments():
+    text = '[guards]\non = [\n  "syntax-check",  # first\n  "dev-server"  # last, no comma\n  # tail\n]\nx = 1\n'
+    got = policy.add_to_guards_on(text, "pane-keys")
+    assert got == (
+        '[guards]\non = [\n  "syntax-check",  # first\n  "dev-server",  # last, no comma\n  "pane-keys",\n  # tail\n]\nx = 1\n'
+    )
+
+
+def test_add_to_guards_on_handles_a_trailing_comma_an_empty_array_and_a_bracket_in_a_string():
+    assert policy.add_to_guards_on('[guards]\non = ["a",]\n', "pane-keys") == '[guards]\non = ["a", "pane-keys",]\n'
+    assert policy.add_to_guards_on("[guards]\non = []\n", "pane-keys") == '[guards]\non = ["pane-keys"]\n'
+    assert policy.add_to_guards_on("[guards]\non = ['a]', \"b#\"]\n", "pane-keys") == (
+        '[guards]\non = [\'a]\', "b#", "pane-keys"]\n'
+    )
+
+
+def test_add_to_guards_on_is_idempotent():
+    once = policy.add_to_guards_on('[guards]\non = [\n  "syntax-check",\n]\n', "pane-keys")
+    assert once is not None
+    assert policy.add_to_guards_on(once, "pane-keys") is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '[rules]\nx = 1\n# [guards]\n# on = ["a"]\n',  # no [guards] table
+        '[guards]\n[guards.syntax-check]\nmode = "log"\n',  # a table with no `on` list
+        '[guards]\non = ["syntax-check", "pane-keys"]\n',  # already there
+        "[guards\non = [",  # not TOML
+    ],
+)
+def test_add_to_guards_on_leaves_the_rest_alone(text):
+    assert policy.add_to_guards_on(text, "pane-keys") is None
+
+
+def test_add_to_guards_on_does_not_touch_an_on_key_of_another_table():
+    text = '[guards]\non = ["a"]\n\n[watch]\non = ["z"]\n'
+    assert policy.add_to_guards_on(text, "pane-keys") == '[guards]\non = ["a", "pane-keys"]\n\n[watch]\non = ["z"]\n'

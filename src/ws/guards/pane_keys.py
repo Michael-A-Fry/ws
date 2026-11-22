@@ -26,6 +26,9 @@ What is read.
     control mode is refused outright; it has no use in a session's shell, where nothing is attached to its input.
   * A word the shell has not settled (`$NAME` that is unset, a command substitution's result) at the start of a line could
     be anything, so it is refused as well: the reason says so.
+  * `pipe-pane -I` (alone or in a cluster, `-IO`) feeds a command's output to the pane as typed keys, which this guard
+    can't see, so it is refused on the live server, or one that can't be known, like control mode. `pipe-pane -O` (the
+    default) only reads the pane and is left alone.
   * Buffers. A `set-buffer` or `load-buffer` of a plain file (or a `printf`/`echo` piped into `load-buffer -`) in the same
     command, then a `paste-buffer`, is judged on the text the buffer holds. A `paste-buffer` of a buffer this command did
     not fill is judged on what `show-buffer` says the live server holds. Text that can't be read (a heredoc, a file made
@@ -63,13 +66,20 @@ PRIORITY = 10  # protects the machine
 
 QUERY_TIMEOUT_S = 3
 _MAX_BUFFER = 65536  # bytes of a buffer file that are read
-_TARGETS = ("send-keys", "set-buffer", "load-buffer", "paste-buffer")
-_ALIASES = {"send": "send-keys", "setb": "set-buffer", "loadb": "load-buffer", "pasteb": "paste-buffer"}
+_TARGETS = ("send-keys", "set-buffer", "load-buffer", "paste-buffer", "pipe-pane")
+_ALIASES = {
+    "send": "send-keys",
+    "setb": "set-buffer",
+    "loadb": "load-buffer",
+    "pasteb": "paste-buffer",
+    "pipep": "pipe-pane",
+}
 _VALUE_OPTS = {
     "send-keys": "tNc",
     "set-buffer": "bnt",  # -t is a client
     "load-buffer": "bt",
     "paste-buffer": "bst",
+    "pipe-pane": "t",
 }
 # tmux reads a key name without regard to case (`enter`, `KP/`, `c-m` and `C-M` are the keys `Enter`, `kp/` and `C-m`), and
 # `^M` is `C-m`, so every table below is in lower case and a word is lowered before it is looked up
@@ -146,6 +156,8 @@ def _unkey(word: str) -> tuple[str, str | None]:
         return _BLANKS[key], None
     if key in _KEYPAD:
         return _KEYPAD[key], None
+    if key == "m-/":  # Escape, then `/`: the slash is typed
+        return "/", None
     if key in _ERASE:
         return "", "erase"
     if key == "c-u":
@@ -379,6 +391,10 @@ def _judge_one(inv: Invocation, queue: list[Invocation], live: Path, listy: bool
             line = _slash_line(text)
             if line is not None:
                 return _refuse(_why(line))
+    elif name == "pipe-pane":
+        _, pflags, _ = _options(rest, "pipe-pane")
+        if "I" in pflags:
+            return _refuse("`pipe-pane -I` types its command's output into the pane, which can't be read here")
     elif name == "set-buffer":
         bufs.set(rest)
     elif name == "load-buffer":

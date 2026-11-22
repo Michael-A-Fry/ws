@@ -447,6 +447,81 @@ def default_deny_commands() -> list[str]:
     return out
 
 
+def _array_end(text: str, start: int) -> tuple[int, int | None] | None:
+    """(index of the `]` that closes the array whose `[` is at `start`, index just past its last string), or None when
+    it can't be found. Strings (basic and literal) and comments are skipped; the arrays this reads hold strings only."""
+    i, last = start + 1, None
+    while i < len(text):
+        ch = text[i]
+        if ch == "#":
+            i = text.find("\n", i)
+            if i < 0:
+                return None
+        elif ch in "\"'":
+            j = i + 1
+            while j < len(text) and text[j] != ch and text[j] != "\n":
+                j += 2 if ch == '"' and text[j] == "\\" else 1
+            if j >= len(text) or text[j] != ch:
+                return None
+            i, last = j + 1, j + 1
+            continue
+        elif ch == "]":
+            return i, last
+        elif ch == "[":
+            return None
+        i += 1
+    return None
+
+
+def add_to_guards_on(text: str, name: str) -> str | None:
+    """`text` (a policy) with guard `name` added to the end of its `[guards] on` array, or None when there is nothing to
+    add: no `[guards]` table, no `on` list in it, `name` already in it, or a file this can't edit safely. It is a textual
+    insert into that one array, so every comment, blank line and other key stays as written; the result is parsed again
+    and must differ from the original in that one list only, or None is returned."""
+    try:
+        before = tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        return None
+    table = before.get("guards")
+    on = table.get("on") if isinstance(table, dict) else None
+    if not isinstance(on, list) or name in on or not all(isinstance(x, str) for x in on):
+        return None
+    header = re.search(r"^[ \t]*\[guards\][ \t]*(?:#[^\n]*)?$", text, re.MULTILINE)
+    if header is None:
+        return None
+    nxt = re.search(r"^[ \t]*\[", text[header.end() :], re.MULTILINE)
+    stop = header.end() + nxt.start() if nxt else len(text)
+    key = re.search(r"^[ \t]*on[ \t]*=[ \t]*\[", text[header.end() : stop], re.MULTILINE)
+    if key is None:
+        return None
+    opened = header.end() + key.end() - 1
+    found = _array_end(text, opened)
+    if found is None:
+        return None
+    close, last = found
+    item = f'"{name}"'
+    if last is None:  # an empty array
+        new = text[: opened + 1] + item + text[opened + 1 :]
+    else:
+        comma = re.match(r"\s*,", text[last:])
+        if "\n" not in text[last:close]:  # all on one line: `["a", "b"]`
+            if comma is None:
+                new = text[:last] + f", {item}" + text[last:]
+            else:
+                at = last + comma.end()
+                new = text[:at] + f" {item}," + text[at:]
+        else:  # an item to a line: a new line after the last item's line (and its comment), at the same indent
+            line_start = text.rfind("\n", 0, last) + 1
+            indent = re.match(r"[ \t]*", text[line_start:]).group()
+            eol = text.find("\n", last)
+            new = text[:last] + ("" if comma else ",") + text[last:eol] + f"\n{indent}{item}," + text[eol:]
+    try:
+        after = tomllib.loads(new)
+    except tomllib.TOMLDecodeError:
+        return None
+    return new if after == {**before, "guards": {**table, "on": [*on, name]}} else None
+
+
 def default_toml() -> str:
     """The commented policy `ws gate init` writes. Missing policy file = this text, parsed."""
 

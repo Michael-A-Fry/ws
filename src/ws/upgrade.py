@@ -26,7 +26,11 @@ The rewrite is `ws install`'s own gate steps (`ws.install.gate_plan`) and nothin
 modules and the folders are not touched. It never switches on what the person did not have (a config written without the
 sandbox block stays without it, see `ws.userconfig.keeps_sandbox_off`), and never takes ws out of a config (that is
 `ws install --gate launch`). The one file is an older OpenCode plugin that ws put there and has since withdrawn from
-(`ws.userconfig.withdrawn_plugin`): it is still loaded, so it is taken out, and said so.
+(`ws.userconfig.withdrawn_plugin`): it is still loaded, so it is taken out, and said so. The other is the policy: a
+guard that became a default since the person's policy was written (`DEFAULT_GUARDS`, today `pane-keys`) is added to the
+end of an existing `[guards] on` list, once, as a textual insert that leaves every comment and other key as written. A
+policy with no `[guards]` table or no `on` list, or one that already names the guard, is not touched; one line says what
+was added.
 
 A runner ws gated whose config it can't merge into now (a link, JSONC, a value of the person's in the way) is left as it
 is, named with the reason and the way on, and the exit code is 1: the other runners are rewritten, and the person is
@@ -71,7 +75,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
 
-from ws import __version__, agentsession, approvals, install, jsonl, output, paths, selfcmd, userconfig
+from ws import __version__, agentsession, approvals, install, jsonl, output, paths, policy, selfcmd, userconfig
 from ws.output import WsError
 
 COMMAND = "upgrade"
@@ -83,6 +87,9 @@ TAIL_LINES, _TAIL_WIDTH = 20, 500  # of each step's output, kept for the log
 _TAIL_STEPS = ("installer", "hooks")  # the steps whose output the log keeps
 BROKER_STOP_S = 10.0  # how long a stopped broker has to close its socket
 BROKER_START_S = 30.0  # how long the new broker has to answer
+DEFAULT_GUARDS = (
+    "pane-keys",
+)  # guards added to a policy's `[guards] on` list by the rewrite, once, when it is missing
 STEP_ENV = "WS_UPGRADE_STEP"  # set for each step the upgrade runs: a hooks rewrite there leaves the log line to it
 INSTALL_TIMEOUT_S, STEP_TIMEOUT_S = 600.0, 120.0  # the watchdog per step: the installer, then the hooks and the check
 INSTALLER_URL = "https://raw.githubusercontent.com/Michael-A-Fry/ws/main/install.sh"
@@ -168,6 +175,31 @@ def _put_back(held: _Held, error: BaseException) -> WsError:
     )
 
 
+def migrate_policy(env: Mapping[str, str], dry_run: bool = False) -> list[str]:
+    """Add each of `DEFAULT_GUARDS` that the person's `[guards] on` list lacks (`policy.add_to_guards_on`), and return a
+    note for each one added (or, on a dry run, that would be). A policy that is missing, unreadable, without that list, or
+    that already names the guard is left exactly as it is, so a second run changes nothing."""
+    path = Path(os.path.realpath(policy.policy_path(dict(env))))
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return []
+    done: list[str] = []
+    for name in DEFAULT_GUARDS:
+        more = policy.add_to_guards_on(text, name)
+        if more is not None:
+            text, done = more, [*done, name]
+    if not done:
+        return []
+    if not dry_run:
+        tmp = path.with_name(path.name + ".ws-upgrade")
+        tmp.write_text(text, encoding="utf-8")
+        os.chmod(tmp, path.stat().st_mode & 0o777)
+        os.replace(tmp, path)
+    verb = "would add" if dry_run else "added"
+    return [f"{verb} {', '.join(done)} to [guards] on in {path}, which lacked it (a guard that is now on by default)"]
+
+
 def rewrite(env: Mapping[str, str], dry_run: bool = False) -> install.Result:
     """Rewrite the runner's hooks (and the generated gate files) with this ws. On any failure the runner's config, the
     install record and the OpenCode plugin are put back as they were, and the error is raised; if any could not be put
@@ -177,18 +209,22 @@ def rewrite(env: Mapping[str, str], dry_run: bool = False) -> install.Result:
     plug = userconfig.withdrawn_plugin(env)
     if dry_run:
         result = install.apply(steps, env, dry_run=True)
+        result.notes += migrate_policy(env, dry_run=True)
         result.skipped = skipped
         result.removed += [plug] if plug else []
         return result
     held = _Held.of(
         [
             install.manifest_path(env),
+            Path(os.path.realpath(policy.policy_path(dict(env)))),
             *(s.path for s in steps if s.kind == "merge" or s.path.suffix == ".js"),
             *([plug] if plug else []),
         ]
     )
     try:
+        notes = migrate_policy(env)
         result = install.apply(steps, env)
+        result.notes += notes
         result.skipped = skipped
         rewritten = {s.merge.runner for s in steps if s.kind == "merge" and s.merge is not None and s.merge.ops}
         if plug:

@@ -19,6 +19,7 @@ files = ["STATE.md", ".state/STATE.md", "HANDOFF.md", "TODO.md"]   # the default
 ```
 
 A policy file with no `[guards]` table has no guards on, so an upgrade changes nothing until you add the table.
+A policy that has an `on` list gets `pane-keys` added to it by the upgrade, once (see [`ws upgrade`](cli.md#ws-upgrade)).
 `ws gate init` writes `on = ["syntax-check", "session-context", "dev-server", "pane-keys"]` and lists the other
 guards as comments. A name in `on` that ws doesn't know stops the load and the message names it. So does a key in
 `[guards]` that isn't `on` or a guard name, and a key in a guard's table that guard doesn't read (`mode` is read by ws
@@ -467,7 +468,9 @@ can't be read (a heredoc, a file the same line makes) is allowed: the guard read
 and the text that's run (a shell's `-c` text, `eval`, `$(...)`, `run-shell`, `bind-key`, `source-file` and the like)
 are read as for [pane-close](#pane-close). `tmux -C` and `-CC` (control mode) on the live server, or one that can't be
 known, are refused outright: they take tmux commands from their input, which the guard can't see, and nothing in a
-session's shell needs them. Without `tmux` it says nothing, and it never sends a key.
+session's shell needs them. `pipe-pane -I` (alone or in a cluster, `-IO`) feeds a command's output into the pane as typed
+keys, so it's refused on the same servers; `pipe-pane -O`, the default, only reads the pane. `M-/` (Escape, then `/`, in
+any case) is a slash. Without `tmux` it says nothing, and it never sends a key.
 
 ## The order guards run in
 

@@ -371,3 +371,41 @@ def test_control_mode_on_a_test_server_and_ordinary_flags_are_left_alone():
     allowed("tmux -L live -u list-sessions")
     allowed("tmux -L live -f /tmp/conf list-sessions")
     allowed("tmux -L live -c 'echo -C' list-sessions")
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "tmux -L live pipe-pane -I 'echo /remote-control'",
+        "tmux -L live pipe-pane -t %3 -I 'cat /tmp/keys'",
+        "tmux -L live pipe-pane -IO -t %3 'cat /tmp/keys'",
+        "tmux -L live pipe-pane -OI 'cat /tmp/keys'",
+        "tmux -L live pipe-pane -oI 'cat /tmp/keys'",
+        "tmux -L live pipep -I 'cat /tmp/keys'",
+        "tmux -L live pipe -I 'cat /tmp/keys'",
+        "tmux -L live pipe-pane -t%3 -I cat",
+        "true; tmux pipe-pane -I 'cat /tmp/keys'",  # a list: the server can't be known
+    ],
+)
+def test_pipe_pane_that_types_into_the_pane_is_refused(command):
+    refused(command, "pipe-pane -I")
+
+
+def test_pipe_pane_that_only_reads_the_pane_or_aims_at_a_test_server_is_left_alone():
+    allowed("tmux -L live pipe-pane -O 'cat >> /tmp/log'")
+    allowed("tmux -L live pipe-pane -o 'cat >> /tmp/log'")
+    allowed("tmux -L live pipe-pane -t %3 'cat >> /tmp/log'")
+    allowed("tmux -L live pipe-pane")  # no command: closes the pipe
+    allowed("tmux -L test pipe-pane -I 'cat /tmp/keys'")
+
+
+@pytest.mark.parametrize("key", ["M-/", "m-/"])
+def test_escape_then_slash_is_a_slash(key):
+    refused(f"tmux -L live send-keys {key} rename Enter")
+    refused(f"tmux -L live send-keys ls Enter {key} rename")
+
+
+def test_escape_then_another_key_is_left_alone():
+    allowed("tmux -L live send-keys M-b")
+    allowed("tmux -L live send-keys M-x ls Enter")
+    allowed("tmux -L live send-keys 'echo M-/' Enter")

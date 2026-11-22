@@ -1063,7 +1063,10 @@ ws upgrade [-h] [--version TAG] [--channel {stable,rc,edge}] [--installer FILE] 
 
 It runs the installer, then rewrites ws's hooks with the new ws in a new process (`--hooks-only`). The rewrite touches the
 gate only: each runner whose config already holds ws's entries gets them refreshed. It switches nothing on and takes
-nothing out, and a config written without the sandbox block stays without it. If the rewrite fails, the runner's config,
+nothing out, and a config written without the sandbox block stays without it. The one edit to your policy: a guard that
+became a default since you wrote it (`pane-keys`) is added to the end of an existing `[guards] on` list, once, as a text
+insert that keeps your comments and order, and one line says so. A policy with no `[guards]` table or `on` list, or that
+already names it, isn't touched. If the rewrite fails, the runner's config,
 the install record and the OpenCode plugin are put back as they were. Run it in a terminal of your own: a session, gated
 or not, is refused (exit 3), and so is a run with no terminal. Exit 0 when done, 1 when the installer or the rewrite
 failed, 3 when refused, 4 when files couldn't be put back after a failed rewrite (they're named). See

@@ -28,7 +28,8 @@ body of the GitHub release.
 - The `pane-keys` guard: a `tmux send-keys` (or a `paste-buffer`) aimed at the live tmux server that types a line
   starting with `/` is an approvable deny, because a slash command can open a dialog that holds every later key and
   message until someone presses one (#276). The reason says to start sessions with `--name X --remote-control X` and to
-  use `ws msg send`. It reads key names in any case, and refuses `tmux -C` control mode on the live server.
+  use `ws msg send`. It reads key names in any case (`M-/` is a slash), and refuses `tmux -C` control mode and
+  `tmux pipe-pane -I` (which types a command's output into the pane) on the live server.
 - `ws watch panes`: pushes once when a tmux pane has sat on a dialog for 10 minutes (`[watch.panes]` in the profile
   sets that and more footer patterns). It presses `Escape` on the Remote Control status box after a minute and on no
   other dialog. A footer counts only at the foot of the screen, and the dialog's text is quoted in the push only
@@ -45,7 +46,9 @@ body of the GitHub release.
 
 - `pane-keys` is on by default: `ws gate init` and the built-in policy now write
   `on = ["syntax-check", "session-context", "dev-server", "pane-keys"]`. An existing policy keeps its own list; add
-  `pane-keys` to it (#276).
+  `pane-keys` to it (#276). The upgrade does it for you: it adds `pane-keys` to the end of an existing `[guards] on`
+  list once, as a text insert that keeps your comments and order, and prints one line saying so; a policy with no
+  `[guards]` table or `on` list, or that already names it, isn't touched (#276).
 - `ws dispatch` starts a Claude session with `--name LABEL` and `--remote-control=LABEL` (LABEL is the window's name),
   so nobody types `/rename` or `/remote-control` into its pane. Remote control is left off for a repo whose class isn't
   `access = "full"`, or when the policy can't be read (#276).

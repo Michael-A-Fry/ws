@@ -21,7 +21,8 @@ body of the GitHub release.
 - Test temp: `tmp_path_retention_count` and `tmp_path_retention_policy` in the pytest config, and `ws install`
   writes a systemd-tmpfiles age rule for `/tmp/pytest-of-<user>` and switches on the user's
   `systemd-tmpfiles-clean.timer` (Linux with systemd; macOS isn't handled). New doctor check WS021 warns when your
-  files in `/tmp` pass 10 GB.
+  files in `/tmp` pass 10 GB. `ws uninstall` removes the rule and its folder, and says the timer is left enabled (it's
+  the system's, so uninstall doesn't switch it off).
 
 ## [0.1.11.8] - 2026-11-23
 

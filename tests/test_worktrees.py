@@ -473,3 +473,20 @@ def test_the_doctor_line_for_temp(box):
     assert status == "warn" and "your files in /tmp hold" in detail
     ids = [c.id for c in doctor.run_checks(LINUX, box / "p.toml", env=env, network=False)]
     assert "WS021" in ids
+
+
+def test_the_uninstall_note_names_the_timer_only_when_it_is_enabled_and_the_rule_went(box, monkeypatch):
+    env = dict(os.environ)
+    rule, calls = tmpclean.rule_path(env), []
+
+    def enabled(code):
+        return lambda argv: (calls.append(argv), (code, ""))[1]
+
+    monkeypatch.setattr(tmpclean, "_real_home", lambda e: True)
+    assert "left systemd-tmpfiles-clean.timer enabled" in tmpclean.uninstall_notes(env, [rule], LINUX, enabled(0))[0]
+    assert calls == [["systemctl", "--user", "is-enabled", "systemd-tmpfiles-clean.timer"]]  # asked, never changed
+    assert tmpclean.uninstall_notes(env, [rule], LINUX, enabled(1)) == []  # not enabled: nothing to say
+    assert tmpclean.uninstall_notes(env, [box / "other"], LINUX, enabled(0)) == []  # the rule was not removed
+    assert tmpclean.uninstall_notes(env, [rule], MAC, enabled(0)) == []
+    monkeypatch.setattr(tmpclean, "_real_home", lambda e: False)
+    assert tmpclean.uninstall_notes(env, [rule], LINUX, enabled(0)) == []  # a stand-in home: not the user's manager

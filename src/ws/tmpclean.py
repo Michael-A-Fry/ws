@@ -7,7 +7,9 @@ has no pruner to maintain. On Linux with systemd, `ws install` writes `<config>/
 written it, runs `systemctl --user enable --now systemd-tmpfiles-clean.timer`, which runs the rule. That call acts on the
 account's own systemd manager, so it runs only when HOME is the account's real home. macOS and Linux without systemd are
 not handled, and WS021 says so. WS021 also warns when the rule is missing or your files in `/tmp` pass `temp_warn_gb`
-(the count stops at the limit or after two seconds). Swap note: delete the file and the call in `ws install`.
+(the count stops at the limit or after two seconds). The rule is in the install manifest like any file `ws install`
+writes, so the uninstall removes it and its folder once empty; the timer is the system's, so the uninstall only says it
+is left enabled. Swap note: delete the file and the call in `ws install`.
 """
 
 from __future__ import annotations
@@ -64,6 +66,20 @@ def enable_timer(env, osi: osinfo.OSInfo, runner=None) -> list[str]:
         return []
     code, out = (runner or _schedule.run_cmd)(["systemctl", "--user", "enable", "--now", TIMER])
     return [f"`systemctl --user enable --now {TIMER}` failed: {out[:200] or code}"] if code else []
+
+
+def uninstall_notes(env, removed, osi: osinfo.OSInfo | None = None, runner=None) -> list[str]:
+    """What the uninstall says about the clean-up timer: it is left as it is, because the timer is the system's, and one
+    that is enabled is noted, not switched off. Nothing when the rule is not among what was removed."""
+    if rule_path(env) not in removed:
+        return []
+    osi = osinfo.detect(env=dict(env)) if osi is None else osi
+    if not (handled(osi) and _real_home(env)):
+        return []
+    code, _ = (runner or _schedule.run_cmd)(["systemctl", "--user", "is-enabled", TIMER])
+    if code:
+        return []
+    return [f"left {TIMER} enabled: it is the system's (`systemctl --user disable --now {TIMER}` turns it off)"]
 
 
 def temp_bytes(root: str, limit: int, budget_s: float = COUNT_BUDGET_S) -> tuple[int, bool]:

@@ -22,6 +22,7 @@ body of the GitHub release.
   the uid state is `triage/NAME.json`, and `summary_dir` gets a `summary-DATE.md` that adds up across the day.
   `--dry-run` labels and drafts nothing. A mailbox whose data class isn't full access is refused. See
   [Inbox triage](docs/reference/triage.md).
+
 - Jobs: `command = "triage"` schedules `ws triage run --job NAME` from a `[triage]` table in the job file, and a schedule
   may carry a window, `every 30m 05:00-22:00` (whole hours, both ends included; two `OnCalendar=` lines on systemd, one
   calendar entry per run on launchd).

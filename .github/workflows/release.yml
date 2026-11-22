@@ -186,7 +186,7 @@ jobs:
     if: github.event_name == 'push'
     needs: build
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 20  # room for one attest retry and the cosign retries
     permissions:
       id-token: write
       attestations: write

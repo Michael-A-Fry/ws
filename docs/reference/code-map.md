@@ -96,6 +96,7 @@ below, and `python3 scripts/gen_code_map.py --check` (prek and CI) fails when it
 | `ui/` | The shared page toolkit: the ws look as CSS, small HTML components, and the loopback server that... |
 | `unknownpath.py` | A command word with a part the reader cannot resolve, tested against the paths ws protects |
 | `upgrade.py` | `ws upgrade`: swap the ws binary for a newer release and rewrite the runner's hooks in the same step |
+| `upgradecheck.py` | The acceptance checks `ws upgrade --unattended` runs after a swap, the snapshot they are... |
 | `usage.py` | Usage signals: the provider's usage report, the subscription limits a statusline gives ws, spend... |
 | `userconfig.py` | The gate in the runner's own user config: ws's deny rules and hooks added beside yours... |
 | `version.py` | `ws version`: which build is this, where did it come from, and where is it installed |

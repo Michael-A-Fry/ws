@@ -1380,12 +1380,20 @@ class Run:
         for k, v in t.labelled.items():
             day["labels"][k] = day["labels"].get(k, 0) + v
         # An older run's day kept its lines as text under "flags" (and its token and cost counts, now in the run log).
+        flags = day.pop("flags", [])
+        items = day.get("items")
         old = [
-            {"key": f"text|{f}"[:200], "kind": "check", "text": f} for f in day.pop("flags", []) if isinstance(f, str)
+            {"key": f"text|{f}"[:200], "kind": "check", "text": f}
+            for f in (flags if isinstance(flags, list) else [])
+            if isinstance(f, str)
         ]
         kept = {
-            i["key"]: i for i in [*old, *day.get("items", [])] if isinstance(i, dict) and isinstance(i.get("key"), str)
+            i["key"]: i
+            for i in [*old, *(items if isinstance(items, list) else [])]
+            if isinstance(i, dict) and isinstance(i.get("key"), str)
         }
+        over = day.get("more_keys")
+        over = [k for k in over if isinstance(k, str)] if isinstance(over, list) else []
         for key, it in t.items.items():
             if key in kept:
                 kept[key] = it  # the newest message of a thread is the line, and it needs him again
@@ -1394,7 +1402,8 @@ class Run:
             else:  # full: lines already answered make room, oldest first; if none, the oldest stay and this is counted
                 done = next((k for k, i in kept.items() if i.get("done")), None)
                 if done is None:
-                    day["more"] += 1
+                    if key not in over:  # count each thread once, however many runs see it again
+                        over.append(key)
                     continue
                 del kept[done]
                 kept[key] = it
@@ -1403,6 +1412,8 @@ class Run:
             if it is not None and isinstance(it.get("uid"), int) and uid > it["uid"]:
                 it["done"] = True
         day["items"] = list(kept.values())
+        day["more_keys"] = [k for k in over if k not in kept][-1000:]
+        day["more"] = len(day["more_keys"])
         for k in ("by_rule", "model_calls", "tokens_in", "tokens_out", "cost_usd"):
             day.pop(k, None)
         return day

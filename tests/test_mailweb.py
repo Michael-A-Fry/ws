@@ -43,16 +43,16 @@ def call(server, method: str, path: str, body: dict | None = None, *, token: str
     return r.status, dict(r.getheaders()), data
 
 
-def test_the_page_lists_mailboxes_and_its_help_data_parses(page, box):
+def test_the_page_lists_mailboxes_and_its_help_data_parses(page, box):  # noqa: F811
     status, headers, text = call(page, "GET", "/?t=tok")
     assert status == 200 and headers["Cache-Control"] == "no-store"
     assert "Connect mail" in text and USER in text and 'type="password"' in text
-    raw = re.search(r'<script type="application/json" id="help">(.*?)</script>', text, re.S).group(1)
+    raw = re.search(r'<script type="application/json" id="help">(.*?)</script>', text, re.DOTALL).group(1)
     assert json.loads(raw)["gmail"][0] == "https://myaccount.google.com/apppasswords"
     assert box.password not in text
 
 
-def test_a_post_without_the_token_or_from_another_origin_calls_nothing(page, box, monkeypatch):
+def test_a_post_without_the_token_or_from_another_origin_calls_nothing(page, box, monkeypatch):  # noqa: F811
     calls = []
     monkeypatch.setattr(mailconnect, "connect", lambda *a, **k: calls.append(a) or {})
     body = {"name": "a", "address": USER, "provider": "", "password": box.password}
@@ -62,9 +62,11 @@ def test_a_post_without_the_token_or_from_another_origin_calls_nothing(page, box
     assert calls == []
 
 
-def test_a_refused_password_answers_why_and_never_carries_it(page, box, capsys):
+def test_a_refused_password_answers_why_and_never_carries_it(page, box, capsys):  # noqa: F811
     wrong = "wrong-" + os.urandom(8).hex()
-    status, headers, text = call(page, "POST", "/connect", {"name": "a", "address": USER, "provider": "", "password": wrong})
+    status, headers, text = call(
+        page, "POST", "/connect", {"name": "a", "address": USER, "provider": "", "password": wrong}
+    )
     r = json.loads(text)
     assert status == 200 and r["ok"] is False and r["kind"] == "bad_credentials" and "app password" in r["hint"]
     assert headers["Cache-Control"] == "no-store"
@@ -73,9 +75,11 @@ def test_a_refused_password_answers_why_and_never_carries_it(page, box, capsys):
     assert box.s.store.read("mail-a") == box.password  # the value that works is kept
 
 
-def test_a_good_password_connects_and_the_reply_has_no_password(page, box, capsys):
+def test_a_good_password_connects_and_the_reply_has_no_password(page, box, capsys):  # noqa: F811
     box.s.store.delete("mail-a")
-    status, _, text = call(page, "POST", "/connect", {"name": "a", "address": USER, "provider": "", "password": box.password})
+    status, _, text = call(
+        page, "POST", "/connect", {"name": "a", "address": USER, "provider": "", "password": box.password}
+    )
     r = json.loads(text)
     assert status == 200 and r["ok"] is True and r["folders"] == 4 and r["drafts"] == "[Gmail]/Drafts"
     assert box.password not in text + "".join(capsys.readouterr())

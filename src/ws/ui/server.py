@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import secrets
+import socketserver
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
@@ -79,6 +80,14 @@ def csp(nonce: str | None = None) -> str:
         f"default-src 'none'; style-src 'nonce-{nonce}'; script-src 'nonce-{nonce}'; connect-src 'self'; "
         "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
     )
+
+
+class _Httpd(ThreadingHTTPServer):
+    def server_bind(self) -> None:
+        # HTTPServer.server_bind asks DNS for the host's full name (socket.getfqdn): on a macOS runner that stalled the
+        # constructor for 30 s and more. Nothing here reads `server_name`, and a loopback page has no name to look up.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[0], self.server_address[1]
 
 
 class LoopbackServer:
@@ -228,7 +237,7 @@ class LoopbackServer:
                     owner._done.set()
 
         Handler.server_version = server_version
-        self.httpd = ThreadingHTTPServer((bind, port), Handler)
+        self.httpd = _Httpd((bind, port), Handler)
         self.httpd.daemon_threads = True
         self.bind, self.port = bind, self.httpd.server_address[1]
         # The names a request may use for this server. Loopback also answers to `localhost`; any other bind answers
@@ -248,24 +257,18 @@ class LoopbackServer:
 
     def serve(self) -> Any:
         self.httpd.timeout = 0.2
+        # idle is counted from here, not from the constructor: a slow start is not idle time
+        self._last = time.monotonic()
         try:
-            self.exit_reason = "loop"  # DIAG
             while not self._done.is_set():
                 self.httpd.handle_request()
                 if self.hold is not None and self.hold():
                     self._last = time.monotonic()
                 if time.monotonic() - self._last > self.idle_seconds:
-                    self.exit_reason = f"idle gap={time.monotonic() - self._last:.2f}"  # DIAG
                     break
-            else:
-                self.exit_reason = "done"  # DIAG
             if self._done.is_set():
                 time.sleep(0.4)  # let the reply reach the page before the socket goes
-        except BaseException as e:  # DIAG
-            self.exit_reason = f"raised {e!r}"  # DIAG
-            raise  # DIAG
         finally:
-            self.exit_at = time.monotonic()  # DIAG
             self.httpd.server_close()
         return self.result
 

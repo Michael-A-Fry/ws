@@ -6,6 +6,31 @@ on:
     branches: [c708-test-ui-macos]  # dispatch needs the file on main; a push whose message says [repro] runs it
 permissions: read-all
 jobs:
+  measure:
+    name: old code, measure the constructor (macos-26)
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[repro]')
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: a65b4c7e4e7d420d3f606a0a206548148dc83b57
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: "0.13.1"
+          enable-cache: true
+      - name: time getfqdn and the unchanged LoopbackServer constructor
+        run: |
+          hostname; scutil --dns | head -20
+          uv run --locked python - <<'PY'
+          import socket, time
+          from ws.ui.server import LoopbackServer
+          for i in range(25):
+              t = time.monotonic(); socket.getfqdn("127.0.0.1"); a = time.monotonic() - t
+              t = time.monotonic(); s = LoopbackServer({"/": lambda n: ""}); b = time.monotonic() - t; s.httpd.server_close()
+              print(f"C708-MEASURE {i} getfqdn={a:.2f}s construct={b:.2f}s", flush=True)
+          PY
   ui30:
     name: test_ui x30 (macos-26)
     if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[repro]')

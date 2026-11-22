@@ -7,7 +7,9 @@ import hashlib
 import http.client
 import json
 import re
+import socket
 import threading
+import time
 
 import pytest
 
@@ -175,66 +177,17 @@ def served():
     srv = LoopbackServer(get, post, server_version="ws-test", idle_seconds=30)
     out: dict = {}
     t = threading.Thread(target=lambda: out.update(result=srv.serve()), daemon=True)
-    srv._the = t  # DIAG
     t.start()
     yield srv, out, seen
     srv.close()
     t.join(5)
 
 
-def _diag(srv, exc):  # DIAG
-    import os, subprocess, time  # noqa
-
-    now = time.monotonic()
-    lines = [
-        f"DIAG refused: {exc!r}",
-        f"done={srv._done.is_set()} since_last={now - srv._last:.3f}s idle_seconds={srv.idle_seconds}",
-    ]
-    lines.append(
-        f"exit_reason={getattr(srv, 'exit_reason', None)} exited_ago={now - getattr(srv, 'exit_at', now):.3f}s"
-    )
-    lines.append(
-        f"sockfd={srv.httpd.socket.fileno()} port={srv.port} pid={os.getpid()} threads={threading.active_count()}"
-    )
-    t = getattr(srv, "_the", None)
-    lines.append(f"serve thread alive={t.is_alive() if t else None}")
-    lines.append(f"max loop gap in sampler: {_GAP}")
-    for cmd in (["netstat", "-an", "-p", "tcp"], ["lsof", "-nP", "-iTCP", "-a", "-p", str(os.getpid())]):
-        try:
-            out = subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=20).stdout.splitlines()
-            keep = [x for x in out if str(srv.port) in x or x.startswith("COMMAND")]
-            lines.append(f"{cmd[0]}: " + " | ".join(keep[:12]) + f" (total {len(out)} lines)")
-        except Exception as e:  # noqa
-            lines.append(f"{cmd[0]} failed {e!r}")
-    return "\n".join(lines)
-
-
-_GAP = [0.0, 0.0]  # DIAG
-
-
-def _sampler():  # DIAG
-    import time
-
-    last = time.monotonic()
-    while True:
-        time.sleep(0.1)
-        now = time.monotonic()
-        if now - last > _GAP[0]:
-            _GAP[:] = [now - last, now]
-        last = now
-
-
-threading.Thread(target=_sampler, daemon=True).start()  # DIAG
-
-
 def _req(srv, method, path, body=None, headers=None):
     conn = http.client.HTTPConnection("127.0.0.1", srv.port, timeout=5)
     h = {"Host": f"127.0.0.1:{srv.port}", **(headers or {})}
     try:
-        try:
-            conn.request(method, path, body=body, headers=h)
-        except ConnectionRefusedError as e:  # DIAG
-            raise AssertionError(_diag(srv, e)) from e
+        conn.request(method, path, body=body, headers=h)
         r = conn.getresponse()
         return r.status, r.read(), dict(r.getheaders())
     finally:
@@ -382,8 +335,6 @@ def test_a_route_can_stop_the_server_after_its_reply_and_serve_returns_the_resul
 
 
 def test_only_a_request_with_the_token_keeps_the_server_alive():
-    import time
-
     get, post, _ = _routes()
     srv = LoopbackServer(get, post, idle_seconds=0.6)
     done = threading.Event()
@@ -396,6 +347,38 @@ def test_only_a_request_with_the_token_keeps_the_server_alive():
             break
         time.sleep(0.1)
     assert done.wait(3)
+
+
+def test_building_the_server_never_asks_dns_for_the_host_name(monkeypatch):
+    """`HTTPServer.server_bind` calls `socket.getfqdn`, a reverse lookup that stalled for tens of seconds on the macOS
+    runners (C708); nothing in ws reads the name, so the constructor must not make that call."""
+
+    def refuse(*a, **k):
+        raise AssertionError("socket.getfqdn was called")
+
+    monkeypatch.setattr(socket, "getfqdn", refuse)
+    srv = LoopbackServer({"/": lambda n: ""})
+    try:
+        assert srv.httpd.server_name == "127.0.0.1" and srv.httpd.server_port == srv.port
+    finally:
+        srv.httpd.server_close()
+
+
+def test_time_spent_before_serve_starts_is_not_idle_time():
+    """The idle clock starts in `serve()`: a constructor that took longer than `idle_seconds` (a slow name lookup, a
+    stalled runner) must not close the server before its first request, which is how C708 showed up on macOS."""
+    get, post, _ = _routes()
+    srv = LoopbackServer(get, post, idle_seconds=30)
+    srv._last -= 60  # as if building it had taken a minute
+    t = threading.Thread(target=srv.serve, daemon=True)
+    t.start()
+    try:
+        time.sleep(0.6)  # the loop goes round every 0.2 s: a clock counted from the constructor closes the socket here
+        assert t.is_alive()
+        assert _req(srv, "GET", f"/?t={srv.token}")[0] == 200
+    finally:
+        srv.close()
+        t.join(5)
 
 
 def test_an_idle_server_closes_and_returns_nothing():

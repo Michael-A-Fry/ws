@@ -13,7 +13,7 @@ body of the GitHub release.
 - A way back puts the policy back too (C706). An upgrade that added a guard to the policy and then failed its check rolled
   back to a release that rejected the new guard name, and the gate failed closed for every session. The swap now holds the
   policy, the install record and the runner configs it may change; an automatic rollback restores them before the old
-  hooks step, and a manual rollback restores the policy from the copy in `upgrade-backups/` while it is still as the
+  hooks step, and a manual rollback restores the policy from the copy in `upgrade-backups/` while it's still as the
   upgrade left it.
 
 ### Added

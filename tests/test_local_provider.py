@@ -113,7 +113,13 @@ def test_a_local_block_passes():
         (block(options={"baseURL": "{env:BASE}"}), False, "{env:...}"),
         (block(models={"{file:~/m}": {"name": "m"}}), False, "{env:...} or {file:...}"),
         (block(models={"m": {"name": "m", "headers": {"x": "y"}}}), False, "models.m.headers: not an allowed key"),
-        (block(models={"m": {"options": {"apiKey": "k"}}}), False, "models.m.options: not an allowed key"),
+        (block(models={"m": {"options": {"apiKey": "k"}}}), False, "models.m.options.apiKey: not an allowed key"),
+        (block(models={"m": {"tool_call": True}}), False, "models.m.tool_call may only be false"),
+        (block(models={"m": {"tool_call": "no"}}), False, "models.m.tool_call may only be false"),
+        (block(models={"m": {"options": {"reasoningEffort": "high"}}}), False, "reasoningEffort must be one of"),
+        (block(models={"m": {"options": {"reasoningEffort": "bogus"}}}), False, "reasoningEffort must be one of"),
+        (block(models={"m": {"options": "low"}}), False, "models.m.options must be a table"),
+        (block(models={"m": {"reasoning": True}}), False, "models.m.reasoning: not an allowed key"),
         (block(models={"m": {"cost": {"input": "free"}}}), False, "models.m.cost must be a table of numbers"),
         (block(models={"m": {"limit": {"context": 1, "x": 2}}}), False, "models.m.limit must be"),
         (block(models={"bad id": {}}), False, "is not a model id"),
@@ -126,6 +132,18 @@ def test_a_local_block_passes():
 def test_a_block_that_is_not_local_or_carries_more_is_refused(b, leased, why):
     got = opencode.provider_problems(b, leased=leased)
     assert any(why in g for g in got), got
+
+
+@pytest.mark.parametrize("effort", ["none", "minimal", "low"])
+def test_a_model_may_turn_tools_off_and_reasoning_down(effort):
+    m = {"tool_call": False, "options": {"reasoningEffort": effort}}
+    assert opencode.provider_problems(block(models={"qwen3:8b": m}), leased=False) == []
+
+
+@pytest.mark.parametrize("effort", ["medium", "high", "xhigh", "max"])
+def test_a_reasoning_effort_that_widens_is_refused(effort):
+    got = opencode.provider_problems(block(models={"m": {"options": {"reasoningEffort": effort}}}), leased=False)
+    assert any("reasoningEffort must be one of" in g for g in got), got
 
 
 def test_a_leased_block_may_name_no_base_url():
@@ -219,6 +237,16 @@ def test_the_block_reaches_the_inline_config_and_a_project_config_is_still_off(t
     assert "mcp" not in content and "sk-planted" not in env["OPENCODE_CONFIG_CONTENT"]
     assert env["OPENCODE_DISABLE_PROJECT_CONFIG"] == "true"  # the #270 guarantee: the planted file is never read
     assert env["HOME"] == str(run_dir / "oc-home") and env["XDG_CONFIG_HOME"].startswith(str(run_dir / "oc-home"))
+
+
+def test_the_model_limits_reach_the_inline_config(tmp_path):
+    tool = "tool_call = false, options = { reasoningEffort = 'none' }"
+    local = LOCAL[:-2] + ', models = { "qwen3:8b" = { ' + tool + " } } }"
+    _, run_env = opencode.build_command(job_with(local), tmp_path, None)
+    got = json.loads(run_env.get("OPENCODE_CONFIG_CONTENT"))["provider"]["box"]["models"]["qwen3:8b"]
+    assert got == {"tool_call": False, "options": {"reasoningEffort": "none"}}
+    with pytest.raises(ValueError, match="tool_call may only be false"):
+        opencode.build_command(job_with(local.replace("false", "true")), tmp_path, None)
 
 
 def test_the_documented_example_passes_the_check():

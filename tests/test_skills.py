@@ -163,11 +163,12 @@ def test_xdg_config_home_moves_opencodes_folder(box, capsys, monkeypatch):
 
 def test_with_no_runner_chosen_ws_uses_the_ones_found_and_none_otherwise(box, capsys):
     assert install(capsys, box)[0] == 0
-    assert not (box / ".claude").exists() and not (box / ".config").exists()
+    # systemd's own ~/.config/user-tmpfiles.d (the pytest temp age rule) may be there; a runner's folder must not be
+    assert not (box / ".claude").exists() and not (box / ".config" / "opencode").exists()
     (box / ".claude").mkdir()
     code, _out, _ = install(capsys, box)
     assert code == 0 and (box / ".claude" / "skills" / "align" / "SKILL.md").is_file()
-    assert not (box / ".config").exists()
+    assert not (box / ".config" / "opencode").exists()
 
 
 def test_a_skill_you_already_have_is_never_overwritten(box, capsys):

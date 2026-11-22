@@ -2,10 +2,13 @@
 name: c708-repro
 on:
   workflow_dispatch:
+  push:
+    branches: [c708-test-ui-macos]  # dispatch needs the file on main; a push whose message says [repro] runs it
 permissions: read-all
 jobs:
   ui30:
     name: test_ui x30 (macos-26)
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[repro]')
     runs-on: macos-26
     timeout-minutes: 30
     steps:
@@ -28,6 +31,7 @@ jobs:
           [ "$fails" -eq 0 ]
   full:
     name: full suite ${{ matrix.n }} (macos-26)
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[repro]')
     runs-on: macos-26
     timeout-minutes: 40
     strategy:

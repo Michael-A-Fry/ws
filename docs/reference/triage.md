@@ -103,7 +103,7 @@ label = "check"
 subject = "(security alert|new (device|sign-?in|login)|suspicious (activity|sign-?in)|password (was )?changed)"
 ```
 
-`check` is not a mailbox label: the thread is labelled `ws/fyi` (so nothing new is added to the mailbox) and listed
+`check` isn't a mailbox label: the thread is labelled `ws/fyi` (so nothing new is added to the mailbox) and listed
 under "Worth a look" in the day's summary.
 
 Every condition in one rule must hold. A message from the mailbox's own address is left alone (`builtin:self`). Rules see
@@ -115,8 +115,8 @@ the headers only, never the body.
 `logs/triage.jsonl`). The first line has the thread count and `Drafts created: N`, then one line for each thread that
 needs a reply or is worth a check:
 
-```
-Inbox triage 2026-11-23 10:00: 12 threads. Sorted: 2 need a reply, 5 for your information, 5 low priority, 0 waiting on others. Drafts created: 2.
+```text
+Inbox triage 2026-11-23 10:00: 12 threads. Sorted: 2 need a reply, 5 for your information, ... Drafts created: 2.
 
 Needs a reply:
 - personal: Sam T, “Quote for the deck”: asks for a quote by Friday. Draft saved.
@@ -135,8 +135,8 @@ plain line: control and bidi characters, markdown links, web addresses, brackets
 
 Lines are added across the day's runs and a thread is one line, the newest. A line is never dropped because a later run
 had nothing to say about it. It moves to "Done" when a later run reads a message from the mailbox's own address in the
-same thread (an answer). Archiving isn't seen: ws reads new mail only. The day's state keeps 100 lines; when it is full,
-answered lines make room, oldest first, and any thread past that is counted in a last line ("And N more").
+same thread (an answer). Archiving isn't seen: ws reads new mail only. The day's state keeps 100 lines; when it's full,
+answered lines make room, oldest first, and any thread beyond the 100 is counted in a last line, "And N more".
 
 `--dry-run` prints the summary it would write to standard output and writes nothing.
 

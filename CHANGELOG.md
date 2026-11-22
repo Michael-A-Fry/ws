@@ -12,11 +12,11 @@ body of the GitHub release.
 
 - `ws triage`: the day's summary now names the threads that matter. It keeps, across the day's runs, one line for each
   thread that needs a reply or is worth a check (mailbox, sender, subject cut to about 80 characters, why, and whether
-  a draft was saved); a thread the mailbox's owner later answers stays, under "Done". No mail body text is written, and a
-  subject, name or reason has its control and bidi characters, markdown links and web addresses removed. Token, cost and
-  run counts are no longer in the summary (they are in `logs/triage.jsonl`), and the label counts are in plain words.
-  The first line, `Drafts created: N` and the "Worth a look" heading are as before. The day's state keeps up to 100
-  lines and reads an older day's `flags` list.
+  a draft was saved); a thread the mailbox's owner later answers stays, moved to a Done list. No mail body text is
+  written, and a subject, name or reason has its control and bidi characters, markdown links and web addresses
+  removed. Token, cost and run counts are no longer in the summary (they're in `logs/triage.jsonl`), and the label
+  counts are in plain words. The first line, `Drafts created: N` and the "Worth a look" heading are as before. The
+  day's state keeps up to 100 lines and reads an older day's `flags` list.
 - `ws triage run --dry-run` prints the summary it would write.
 
 ### Added

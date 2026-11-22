@@ -249,9 +249,7 @@ def in_root_namespaces(read=_read) -> bool:
     if comm.strip() not in INIT_NAMES:
         return False
     uid_map = read("/proc/self/uid_map")
-    if uid_map is not None and uid_map.split() != ["0", "0", "4294967295"]:
-        return False
-    return True
+    return uid_map is None or uid_map.split() == ["0", "0", "4294967295"]
 
 
 def sees_own_parents(ppid: dict[int, int], me: int | None = None, read=_read) -> bool:

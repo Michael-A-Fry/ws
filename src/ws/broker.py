@@ -1732,10 +1732,17 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         self, grant: _Grant, target: str, body: bytes | None, headers: dict[str, str], secret: str = ""
     ) -> tuple[int | str, int]:
         """Send the request upstream and stream the reply back. With `secret` (a value the broker put in the path), the
-        tool must never see it: a 3xx is refused (its Location would name the path), a reply header holding it is
-        dropped, and a body holding it is cut off there. http.client never follows a redirect itself, so the value is
-        sent to the one allowed host only."""
+        tool must never see it, whole or in a piece of SECRET_WINDOW characters: the reply is asked for uncompressed
+        and whole (no Range), a compressed one or a redirect is refused (a Location would name the path; 304 is not a
+        redirect), the status line gets the standard phrase, a reply header holding it is dropped, and a body holding
+        it is cut off there. To see a piece split across two reads, the last SECRET_WINDOW - 1 bytes of each read wait
+        for the next one, so a stream through such an entry runs a few bytes behind. http.client never follows a
+        redirect itself, so the value is sent to the one allowed host only."""
         needles = _path_secret_forms(secret)
+        if needles:
+            for k in [k for k in headers if k.lower() in ("accept-encoding", "range", "if-range")]:
+                del headers[k]
+            headers["Accept-Encoding"] = "identity"
         hostname, _, port = grant.host.partition(":")
         plain = self.server.broker.allow_plain_http and hostname == "127.0.0.1"
         if plain:
@@ -1752,10 +1759,12 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                 resp = conn.getresponse()
             except (OSError, ValueError, http.client.HTTPException) as e:
                 raise _HttpError(502, "upstream_unreachable") from e
-            if needles and 300 <= resp.status < 400:
+            if needles and 300 <= resp.status < 400 and resp.status != 304:
                 raise _HttpError(502, "redirect_refused")  # nothing sent yet: the tool gets the broker's own 502
+            if needles and (resp.getheader("Content-Encoding") or "identity").strip().lower() != "identity":
+                raise _HttpError(502, "encoded_reply_refused")  # compressed bytes can't be searched for the value
             bodyless = self.command == "HEAD" or resp.status in (204, 304) or resp.status < 200
-            self.send_response_only(resp.status, resp.reason)
+            self.send_response_only(resp.status, None if needles else resp.reason)
             for k, v in resp.msg.items():
                 if k.lower() not in HOP_BY_HOP and not _holds(needles, k + ":" + v):
                     self.send_header(k, v)
@@ -1810,12 +1819,22 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             self.wfile.write(data)
 
 
+SECRET_WINDOW = 16  # a reply holding this many characters of a path value in a row is held to leak it
+
+
 def _path_secret_forms(secret: str) -> tuple[bytes, ...]:
-    """The forms a path value could come back in: as sent, and with its colon percent-encoded (PATH_VALUE_RE leaves
-    no other character that a server would encode)."""
+    """Every SECRET_WINDOW-character piece of a path value, in the forms it could come back in: as sent, and with its
+    colon percent-encoded (PATH_VALUE_RE leaves no other character a server would encode). A value no longer than the
+    window is its own one piece. A Telegram token is `<bot id>:<35 characters>`; the bot id alone (about 10 digits,
+    and in every getMe reply) is shorter than a window, so it still gets through."""
     if not secret:
         return ()
-    return tuple({f.encode() for f in (secret, secret.replace(":", "%3A"), secret.replace(":", "%3a"))})
+    out: set[bytes] = set()
+    for form in {secret, secret.replace(":", "%3A"), secret.replace(":", "%3a")}:
+        b = form.encode()
+        n = min(SECRET_WINDOW, len(b))
+        out.update(b[i : i + n] for i in range(len(b) - n + 1))
+    return tuple(out)
 
 
 def _holds(needles: tuple[bytes, ...], text: str) -> bool:

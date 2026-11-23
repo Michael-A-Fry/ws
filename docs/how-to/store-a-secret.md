@@ -32,7 +32,8 @@ You type the value yourself, in your own terminal. Never paste a key into an AI 
    (Telegram: `base_path = "/bot{value}"`, and the tool's `/sendMessage` reaches the host as
    `/bot<token>/sendMessage`). Then no header carries the value (leave `header` and `format` out; the lease's
    `header` is empty), the value may hold only letters, digits and `_:-`, a redirect from the host is refused, and a
-   reply header or body that holds the value is dropped or cut off, so the tool never sees it.
+   reply header or body that holds the value (or 16 characters of it in a row) is dropped or cut off, so the tool
+   never sees it. The reply is asked for uncompressed, and a compressed one is refused.
    With `paths` set, a request path may hold only letters, digits and `._~/-`, and the list can't be empty. A change to
    `paths` or `ttl` bites open leases too. `ttl = 600` ends this name's
    leases after 600 seconds (an hour is the default, a day the most). To lease it only to runs that declare it, add a

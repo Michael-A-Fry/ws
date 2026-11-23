@@ -77,7 +77,7 @@ class StubHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         body = self._record()
-        if self.path.startswith("/sse"):
+        if "/sse" in self.path:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Transfer-Encoding", "chunked")
@@ -111,7 +111,44 @@ class StubHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(out)
             return
-        if self.path.startswith("/noreply"):
+        if "/echo-split" in self.path:  # the path in two chunks, sent apart, so the broker reads it in two pieces
+            half = len(self.path) // 2
+            self.send_response(200)
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            self._chunk(b'{"p": "' + self.path[:half].encode())
+            time.sleep(0.2)
+            self._chunk(self.path[half:].encode() + b'"}')
+            self.wfile.write(b"0\r\n\r\n")
+            return
+        if "/echo-part" in self.path:  # all but the last 3 characters of the path: a truncating error message
+            out = self.path[:-3].encode()
+            self.send_response(404)
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+            return
+        if "/echo-reason" in self.path:
+            out = b"{}"
+            self.send_response(404, "No route " + self.path)
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+            return
+        if "/gzip" in self.path:
+            out = b"\x1f\x8b" + b"z" * 20
+            self.send_response(200)
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+            return
+        if "/notmod" in self.path:
+            self.send_response(304)
+            self.send_header("ETag", '"1"')
+            self.end_headers()
+            return
+        if "/noreply" in self.path:
             self.send_response(204)
             self.end_headers()
             return
@@ -1588,7 +1625,10 @@ PATH_VALUE = "123456:AAH-x_y"
 
 
 def _token_registry(env, extra: str = "") -> None:
-    env.write_registry(f'[tg]\nhosts = ["{env.stub.host}"]\nbase_path = "/bot{{value}}"\n{extra}\n')
+    env.write_registry(
+        f'[anthropic]\nhosts = ["{env.stub.host}"]\n\n'
+        f'[tg]\nhosts = ["{env.stub.host}"]\nbase_path = "/bot{{value}}"\n{extra}\n'
+    )
     env.store.write("tg", PATH_VALUE)
 
 
@@ -1708,3 +1748,79 @@ def test_a_path_token_may_follow_a_folder(env):
     env.write_registry(f'[tg]\nhosts = ["{env.stub.host}"]\nbase_path = "/api/{{value}}"\n')
     entry = wsecrets.load_registry(env.registry)["tg"]
     assert entry.token_in_path and entry.header == "" and entry.base_path == "/api/{value}"
+
+
+def test_a_clean_path_token_reply_arrives_byte_for_byte(env):
+    _token_registry(env)
+    status, _, data = env.call("/getMe", lease=env.lease(name="tg"))
+    assert status == 200 and json.loads(data) == {"ok": True, "len": 0}
+    status, _, data = env.call("/getMe", method="HEAD", lease=env.lease(name="tg"))
+    assert status == 200 and data == b""
+    assert env.call("/noreply", lease=env.lease(name="tg"))[0] == 204
+    status, headers, _ = env.call("/notmod", lease=env.lease(name="tg"))
+    assert status == 304 and headers.get("ETag") == '"1"'  # 304 is not a redirect
+
+
+def test_a_path_token_request_asks_for_an_uncompressed_whole_reply(env):
+    _token_registry(env)
+    hdrs = {"Accept-Encoding": "gzip, br", "Range": "bytes=0-10", "If-Range": "x"}
+    assert env.call("/getMe", headers=hdrs, lease=env.lease(name="tg"))[0] == 200
+    seen = env.stub.seen[-1]["headers"]
+    assert seen["accept-encoding"] == "identity" and "range" not in seen and "if-range" not in seen
+    status, _, data = env.call("/gzip", lease=env.lease(name="tg"))
+    assert status == 502 and json.loads(data) == {"error": "encoded_reply_refused"}
+    env.call("/getMe", headers=hdrs)  # a header entry passes them on as before
+    assert env.stub.seen[-1]["headers"]["range"] == "bytes=0-10"
+
+
+def _raw_get(lease, path):
+    hostport, _, prefix = lease.base_url.removeprefix("http://").partition("/")
+    c = http.client.HTTPConnection(hostport, timeout=10)
+    c.request("GET", "/" + prefix + path)
+    r = c.getresponse()
+    try:
+        got = r.read()
+    except http.client.IncompleteRead as e:
+        got = e.partial
+    c.close()
+    return r, got
+
+
+@pytest.mark.parametrize("route", ["/echo-split", "/echo-part"])
+def test_a_value_split_across_reads_or_cut_short_is_still_caught(env, route):
+    _token_registry(env)
+    _r, got = _raw_get(env.lease(name="tg"), route)
+    assert PATH_VALUE[: broker.SECRET_WINDOW].encode() not in got
+    assert PATH_VALUE[-broker.SECRET_WINDOW :].encode() not in got or len(PATH_VALUE) <= broker.SECRET_WINDOW
+    assert _audit_has(env, "secret_in_reply")
+
+
+def test_a_long_value_is_caught_by_any_window_of_it(env):
+    long_value = "1234567890:" + "AbC-dEf_GhI" * 3
+    _token_registry(env)
+    env.store.write("tg", long_value)
+    _r, got = _raw_get(env.lease(name="tg"), "/echo-part")
+    assert long_value[5:21].encode() not in got
+    assert _audit_has(env, "secret_in_reply")
+    status, _, data = env.call("/getMe", lease=env.lease(name="tg"))
+    assert status == 200 and json.loads(data) == {"ok": True, "len": 0}  # a clean reply still flows
+
+
+def test_the_status_phrase_of_a_path_token_reply_is_the_standard_one(env):
+    _token_registry(env)
+    r, _ = _raw_get(env.lease(name="tg"), "/echo-reason")
+    assert r.status == 404 and r.reason == "Not Found"
+    r, _ = _raw_get(env.lease(), "/echo-reason")
+    assert r.reason.startswith("No route")  # a header entry keeps the upstream's phrase
+
+
+def test_a_stream_through_a_path_token_lease_arrives_whole(env):
+    _token_registry(env)
+    lease = env.lease(name="tg")
+    hostport, _, prefix = lease.base_url.removeprefix("http://").partition("/")
+    c = http.client.HTTPConnection(hostport, timeout=10)
+    c.request("GET", "/" + prefix + "/sse")
+    r = c.getresponse()
+    env.stub.go.set()  # the last bytes of each read wait for the next one, so the stream ends before it is read whole
+    assert r.read() == b"data: one\n\ndata: two\n\n"
+    c.close()

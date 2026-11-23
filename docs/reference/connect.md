@@ -20,7 +20,7 @@ Python because the secret wall copies only `.py` files. The same text in a `<id>
 | `id` | Lower-case letters, digits and `-`, at most 32. `list` is reserved. |
 | `title` | What the person sees first. |
 | `unique_key` | The name the stable id from the verify is kept under (`bot_id`). Never a host, address or display name. |
-| `[secret]` | `name` (the registry name) and `hosts` (where a `{secret}` may be sent). Left out when the flow stores no secret. |
+| `[secret]` | `name` (the registry name) and `hosts` (where a `{secret}` may be sent); optional `purposes`, `base_path` and `paths`, as in the registry. Left out when the flow stores no secret. |
 | `[[steps]]` | The steps, in order. |
 
 ## Steps
@@ -47,7 +47,8 @@ Not in this phase: `device` (RFC 8628), `callback`, `--reauth`, QR codes. The lo
 ## State
 
 `<state>/connect/<id>.json`, 0600 in a 0700 folder, schema `ws.connect-state/1`: see [Stores](stores.md#record-files).
-It holds step status, the learned identity, unique id and bound chat id, and the current nonce. It never holds a secret:
+It holds step status, the learned identity, unique id and bound chat id (Telegram: `config.chat_id` and the sender's
+`config.from_id`), and the current nonce. It never holds a secret:
 a captured secret goes from the prompt to the secrets store only. `--diagnose` shows it with the nonce redacted.
 
 ## The agent contract
@@ -64,14 +65,25 @@ frozen at `schema_version` 1. A key may be added; none is removed or changed in 
 | `exit_code` | `0` for `done`, `3` for `needs_human`; the process exits with it |
 | `next_step` | The id of the first step not done, or `null` |
 | `run` | The command the person runs: `ws connect <id>` |
-| `blockers` | When present, each `kind` and `action`. `secret_not_registered` carries the registry entry for the person to add |
+| `blockers` | When present, each `kind` and `action`. `secret_registered_differently`: the name is in the registry with other settings; `action` lists what differs |
 | `steps[]` | `id`, `type`, `status` (`done` or `needs_human`), and when not done `action` |
 
 A step also carries what its type needs: `title`, `text` (info, link), `url` or `url_template` (link; the template when
 a placeholder isn't known yet), `expires_in_s` and, once a nonce exists, `expires_at` (a nonce link), and `fields`
 (capture: each `name`, `label`, `secret`). A nonce link never carries the live nonce: it has `url_template`, never `url`,
-so an agent can't bind a chat. `action` is one of `read`, `open_link`, `paste_secret`, `enter_value`, `run_verify`. A
-verify's request URL is never shown.
+so an agent can't bind a chat. `action` is one of `read`, `open_link`, `paste_secret`, `enter_value`, `run_verify`,
+`confirm_register`. A verify's request URL is never shown. A consumer treats a `type` or `action` it doesn't know as
+`needs_human`: the status and the exit code already say so.
+
+When the flow's secret name isn't in the registry yet, the first row is `{"id": "register-secret", "type": "register",
+"status": "needs_human", "action": "confirm_register"}`, with `title`, `text` (the exact block ws will add) and `walled`.
+The walk shows the block and appends it as text on the person's yes (ADR 0034): comments and layout kept, the old file
+backed up to `secrets.toml.bak`, nothing written if the file changed meanwhile. Under a walled broker (its registry in
+`/var/lib/ws-broker` or its socket in `/run/ws-broker`) ws writes nothing: `text` holds the block and the
+`sudo install` line that copies the registry to the broker. `--revoke` takes the block out again only if this flow added
+it and nobody changed it since. Adding the row needed no new `schema_version`: no key was removed or changed in
+meaning. One blocker `kind` went: `secret_not_registered` (this row replaces it). A consumer written for it still sees
+`needs_human`, exit 3 and `next_step` = `register-secret`. A flow can't use the id `register-secret` for a step of its own.
 
 Exit codes of the command: 0 done, 3 needs a person (or a refusal: the envelope's `error_kind` is `refused`), 1 an error
 (a flow that doesn't exist, a failed verify, a damaged state file), 2 usage.

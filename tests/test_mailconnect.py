@@ -290,7 +290,7 @@ def test_a_registry_restore_takes_out_only_its_own_block(tmp_path):
     mine = '[mail-b]\nkind = "imap"\nhost = "imap.gmail.com"\nuser = "b@example.com"\n'
     other = '[mail-c]\nkind = "imap"\nhost = "imap.gmail.com"\nuser = "c@example.com"\n'
     reg.write_text('[mail-a]\nkind = "imap"\nhost = "imap.gmail.com"\nuser = "a@example.com"\n\n' + mine + "\n" + other)
-    mailconnect._unappend(reg, mine)
+    wsecrets.remove_block(reg, mine)
     text = reg.read_text()
     assert "[mail-b]" not in text and "[mail-a]" in text and "[mail-c]" in text
 

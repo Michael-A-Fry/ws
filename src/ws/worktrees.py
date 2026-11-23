@@ -233,34 +233,32 @@ def _ppids() -> dict[int, int]:
     return out
 
 
-INIT_NAMES = {"systemd", "init", "launchd"}
+# The kernel's fixed inode numbers for the first (the machine's own) PID and user namespaces (PROC_PID_INIT_INO,
+# PROC_USER_INIT_INO in include/linux/proc_ns.h). Any sandbox or container has other numbers.
+ROOT_PID_NS, ROOT_USER_NS = "pid:[4026531836]", "user:[4026531837]"
 
 
-def _read(path: str) -> str | None:
+def _readlink(path: str) -> str | None:
     try:
-        return Path(path).read_text(encoding="utf-8", errors="replace")
+        return os.readlink(path)
     except OSError:
         return None
 
 
-def in_root_namespaces(read=_read) -> bool:
-    """Is this process in the machine's own PID and user namespaces? A sandbox (bwrap, `unshare --pid`) gives its own
-    pid 1 and a short /proc, so every process outside it is invisible. On Linux: pid 1 must be init (systemd or init)
-    and the uid map, when there is one, must be the full identity map. Where there is no /proc (macOS), say yes:
-    `ps` there lists every process."""
-    comm = read("/proc/1/comm")
-    if comm is None:
-        return not Path("/proc/self").exists()
-    if comm.strip() not in INIT_NAMES:
-        return False
-    uid_map = read("/proc/self/uid_map")
-    return uid_map is None or uid_map.split() == ["0", "0", "4294967295"]
+def in_root_namespaces(readlink=_readlink) -> bool:
+    """Is this process in the machine's own PID and user namespaces? A sandbox or container (bwrap, `unshare --pid`,
+    nspawn, LXC, Docker) has its own pid 1 and a short /proc, so every process outside it is invisible. On Linux both
+    namespace links must name the kernel's first namespaces. Where there is no /proc (macOS), say yes: `ps` there lists
+    every process."""
+    if not Path("/proc/self").exists():
+        return True
+    return readlink("/proc/self/ns/pid") == ROOT_PID_NS and readlink("/proc/self/ns/user") == ROOT_USER_NS
 
 
-def sees_own_parents(ppid: dict[int, int], me: int | None = None, read=_read) -> bool:
+def sees_own_parents(ppid: dict[int, int], me: int | None = None, readlink=_readlink) -> bool:
     """Does the process list show this process and every parent above it, up to init? A caller in its own PID namespace,
     or on a /proc mounted `hidepid`, sees only part of the tree, and then "nothing is using this folder" can't be said."""
-    if not in_root_namespaces(read):
+    if not in_root_namespaces(readlink):
         return False
     cur = os.getpid() if me is None else me
     while cur in ppid:

@@ -1,0 +1,27 @@
+# The freeze check. Old ws takes only fixes to what runs today, security fixes and machine housekeeping while its
+# replacement is built; every other change goes to the replacement. A pull request to main says which it is with one
+# line in its body:   freeze: fix|security|housekeeping <why, at least three words>
+# It reads the body only: no checkout, no code from the pull request, so `pull_request_target` is safe here.
+name: freeze
+on:
+  pull_request_target: # zizmor: ignore[dangerous-triggers] no checkout and no code from the pull request run here
+    types: [opened, synchronize, reopened, edited]
+    branches: [main]
+permissions: {}
+jobs:
+  freeze:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: the pull request names an allowed kind of change
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          if printf '%s\n' "$PR_BODY" | grep -Eiq '^[[:space:]]*freeze:[[:space:]]*(fix|security|housekeeping)[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+'; then
+            echo "freeze: allowed"
+          else
+            echo "::error::ws is frozen to fixes, security and housekeeping. Add a line to the body:"
+            echo "::error::  freeze: fix|security|housekeeping <why, at least three words>"
+            echo "::error::Anything else goes to the replacement."
+            exit 1
+          fi

@@ -29,6 +29,10 @@ Linux and macOS, the WSL2 leg, the e2e jobs, the secret wall) skip when it isn't
 fails if any job failed or was cancelled and passes when jobs were skipped, so it's the one check to require for the
 macOS and WSL2 legs.
 
+`freeze.yml` runs on every pull request to `main` and reads only its body: it passes when one line says
+`freeze: fix|security|housekeeping <why>`, and fails otherwise. ws takes only those three kinds of change while its
+replacement is built. It checks out nothing, so no code from the pull request runs.
+
 ## The time budget
 
 Each job's first step writes the time it started into `$RUNNER_TEMP/job-start`. Its last step (`if: always()`) runs

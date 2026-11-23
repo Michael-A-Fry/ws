@@ -58,6 +58,11 @@ WALL_LIB = "/opt/ws/lib"
 SAFE_PATH = re.compile(r"^[A-Za-z0-9_./+-]+$")
 PATH_PREFIX_RE = re.compile(r"^/[A-Za-z0-9._~/-]*$")
 AREA_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
+# A `base_path` may end in PATH_TOKEN, once: the broker puts the value there instead of in a header, for an API that
+# takes its key in the path (Telegram: `/bot<token>/sendMessage`). Such a value must match PATH_VALUE_RE (no / . % ? #
+# or space), so it can never change which path the request reaches.
+PATH_TOKEN = "{value}"
+PATH_VALUE_RE = re.compile(r"^[A-Za-z0-9_:-]{1,256}$")
 # The tiers, lowest first. A run's tier reaches the names of the tiers in REACH; `walled` reaches only walled names, and
 # nothing reaches up into it, so a walled class's keys never leave its own runs.
 TIERS = ("walled", "worker", "lead", "lead-elevated")
@@ -92,6 +97,11 @@ class Entry:
     ttl: float | None = None  # longest lease of this name, seconds; None: the broker's own limit (one hour by default)
     options: object = None  # the minter's own keys, parsed by it
     source: str = "paste"  # paste: a person brings the value; generate: `ws secret generate` makes it
+
+    @property
+    def token_in_path(self) -> bool:
+        """True when the value goes into the request path (base_path ends in {value}) and no header carries it."""
+        return self.base_path.endswith(PATH_TOKEN)
 
     @property
     def scoped(self) -> bool:
@@ -234,8 +244,14 @@ def _entry(path: Path, name: str, t: dict) -> Entry:
     for h in hosts:
         if not HOST_RE.match(h):
             raise SecretsError(f"{path}: [{name}] {h!r} is not a host name (no scheme, no path)")
-    header = t.get("header", "x-api-key")
-    if not isinstance(header, str) or not HEADER_RE.match(header.lower()):
+    raw_base = t.get("base_path", "")
+    token_in_path = isinstance(raw_base, str) and raw_base.endswith(PATH_TOKEN)
+    if token_in_path and ("header" in t or "format" in t):
+        raise SecretsError(
+            f"{path}: [{name}] a base_path holding {{value}} sends no header: leave header and format out"
+        )
+    header = t.get("header", "" if token_in_path else "x-api-key")
+    if not token_in_path and (not isinstance(header, str) or not HEADER_RE.match(header.lower())):
         raise SecretsError(f'{path}: [{name}] header must be a header name such as "x-api-key"')
     header = header.lower()
     fmt = t.get("format", "Bearer {value}" if header == "authorization" else "{value}")
@@ -257,7 +273,7 @@ def _entry(path: Path, name: str, t: dict) -> Entry:
             raise SecretsError(
                 f"{path}: [{name}] {pre!r} is not a path prefix (start with /; letters, digits and ._~/- only; no . or .. part)"
             )
-    base_path = t.get("base_path", "")
+    base_path = raw_base[: -len(PATH_TOKEN)] if token_in_path else raw_base  # {value} only once, only at the end
     if "base_path" in t and (
         not isinstance(base_path, str)
         or not PATH_PREFIX_RE.fullmatch(base_path)
@@ -265,9 +281,10 @@ def _entry(path: Path, name: str, t: dict) -> Entry:
         or any(seg in (".", "..") for seg in base_path.split("/"))
     ):
         raise SecretsError(
-            f"{path}: [{name}] base_path must start with / and use letters, digits and ._~/- only: no . or .. part, no //, no query"
+            f"{path}: [{name}] base_path must start with / and use letters, digits and ._~/- only: no . or .. part,"
+            " no //, no query; {value} may stand once, at the end"
         )
-    base_path = base_path.rstrip("/")
+    base_path = base_path + PATH_TOKEN if token_in_path else base_path.rstrip("/")
     ttl = t.get("ttl")
     if ttl is not None and (isinstance(ttl, bool) or not isinstance(ttl, (int, float)) or not 0 < ttl <= MAX_TTL_S):
         raise SecretsError(f"{path}: [{name}] ttl must be a number of seconds above 0 and at most {MAX_TTL_S}")

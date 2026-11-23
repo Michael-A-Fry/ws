@@ -8,6 +8,16 @@ body of the GitHub release.
 
 ## [Unreleased]
 
+### Added
+
+- The broker can put a secret in the request path, for an API that takes its key there (Telegram's
+  `/bot<token>/sendMessage`, C805): a registry entry's `base_path` may end in `{value}`, once. No credential header is
+  sent, the value must match `^[A-Za-z0-9_:-]{1,256}$` (else `value_refused`), and the tool never sees the value or any
+  16-character piece of it: the reply is asked for uncompressed and whole, a redirect or a compressed reply is refused
+  (`redirect_refused`, `encoded_reply_refused`), the status phrase is the standard one, a reply header holding the value
+  is dropped and a reply body holding the value is cut off there (`secret_in_reply` in the audit log). `paths` still
+  judges the tool's own path.
+
 ## [0.1.11.9] - 2026-11-24
 
 ### Added

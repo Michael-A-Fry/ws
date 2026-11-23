@@ -8,7 +8,9 @@ How a secret reaches a tool without the tool reading it:
 2. The runner points the tool's base URL at the lease (Claude Code and OpenCode both honour one).
 3. The lease proxy strips any auth header the tool sent, adds the real one, and forwards only to https://<host> for
    that lease. Responses stream back as they arrive. A lease is for one host, expires (1 h by default) and can be
-   released.
+   released. An entry whose `base_path` ends in `{value}` (an API that takes its key in the path, such as Telegram's
+   `/bot<token>`) gets the value in the path instead, with no credential header (the lease's `header` is ""); the
+   broker then refuses a redirect and keeps the value out of the reply's headers and body.
 
 No TLS interception and no CA: the tool talks plain HTTP to 127.0.0.1 and the broker talks TLS to the real host. Stdlib
 only. Everything fails closed: an unset name, a missing or loose store, an unknown host or an expired lease gives a
@@ -1421,8 +1423,11 @@ class Broker:
                 raise _HttpError(403, "expired")
             return g
 
-    def credential(self, g: _Grant, path: str = "/") -> tuple[str, str, str]:
-        """(header name, header value, base path) for a grant, read fresh so a removed or changed secret takes effect at once."""
+    def credential(self, g: _Grant, path: str = "/") -> tuple[str, str, str, str]:
+        """(header name, header value, base path, path secret) for a grant, read fresh so a removed or changed secret
+        takes effect at once. For an entry whose base_path ends in {value} the header name and value are "" (no header
+        carries it), the value is in the base path, and the path secret is the value, so the reply can be kept clean of
+        it; otherwise the path secret is ""."""
         try:
             entry = self.load_registry().get(g.name)
         except wsecrets.RegistryUntrusted as e:
@@ -1462,7 +1467,11 @@ class Broker:
             raise _HttpError(503, "unset") from e
         except wsecrets.SecretsError as e:
             raise _HttpError(503, "store_unreadable") from e
-        return entry.header, entry.format.replace("{value}", value), entry.base_path
+        if entry.token_in_path:
+            if not wsecrets.PATH_VALUE_RE.fullmatch(value):
+                raise _HttpError(503, "value_refused")  # a / . % ? # or space could move the request to another path
+            return "", "", entry.base_path[: -len(wsecrets.PATH_TOKEN)] + value, value
+        return entry.header, entry.format.replace("{value}", value), entry.base_path, ""
 
 
 def code_problem() -> str:
@@ -1627,15 +1636,16 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                 raise _HttpError(404, "not_found")
             grant = b.grant_for(m.group(1))
             self._check_peer(grant)
-            header, value, base_path = b.credential(grant, m.group(2) or "/")
+            header, value, base_path, secret = b.credential(grant, m.group(2) or "/")
             target = base_path + (m.group(2) or "/") + (f"?{query}" if query else "")
             body = self._read_body()
             self._deadline.cancel()  # the request is in; the reply may take as long as the model does
             headers = self._clean_headers(header)
-            headers[header] = value
+            if header:  # a path-token entry sends no credential header at all
+                headers[header] = value
             headers["Host"] = grant.host
             headers["Connection"] = "close"
-            status_code, sent = self._relay(grant, target, body, headers)
+            status_code, sent = self._relay(grant, target, body, headers, secret)
         except _HttpError as e:
             status_code = e.code
             self._fail(e.status, e.code)
@@ -1673,7 +1683,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
 
     def _clean_headers(self, injected: str) -> dict[str, str]:
         out: dict[str, str] = {}
-        drop = STRIP_REQUEST | HOP_BY_HOP | {injected}
+        drop = STRIP_REQUEST | HOP_BY_HOP | ({injected} if injected else set())
         for k, v in self.headers.items():
             if k.lower() not in drop:
                 out[k] = v
@@ -1718,7 +1728,21 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             raise _HttpError(400, "bad_request")
         return data
 
-    def _relay(self, grant: _Grant, target: str, body: bytes | None, headers: dict[str, str]) -> tuple[int, int]:
+    def _relay(
+        self, grant: _Grant, target: str, body: bytes | None, headers: dict[str, str], secret: str = ""
+    ) -> tuple[int | str, int]:
+        """Send the request upstream and stream the reply back. With `secret` (a value the broker put in the path), the
+        tool must never see it, whole or in a piece of SECRET_WINDOW characters: the reply is asked for uncompressed
+        and whole (no Range), a compressed one or a redirect is refused (a Location would name the path; 304 is not a
+        redirect), the status line gets the standard phrase, a reply header holding it is dropped, and a body holding
+        it is cut off there. To see a piece split across two reads, the last SECRET_WINDOW - 1 bytes of each read wait
+        for the next one, so a stream through such an entry runs a few bytes behind. http.client never follows a
+        redirect itself, so the value is sent to the one allowed host only."""
+        needles = _path_secret_forms(secret)
+        if needles:
+            for k in [k for k in headers if k.lower() in ("accept-encoding", "range", "if-range")]:
+                del headers[k]
+            headers["Accept-Encoding"] = "identity"
         hostname, _, port = grant.host.partition(":")
         plain = self.server.broker.allow_plain_http and hostname == "127.0.0.1"
         if plain:
@@ -1735,10 +1759,14 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                 resp = conn.getresponse()
             except (OSError, ValueError, http.client.HTTPException) as e:
                 raise _HttpError(502, "upstream_unreachable") from e
+            if needles and 300 <= resp.status < 400 and resp.status != 304:
+                raise _HttpError(502, "redirect_refused")  # nothing sent yet: the tool gets the broker's own 502
+            if needles and (resp.getheader("Content-Encoding") or "identity").strip().lower() != "identity":
+                raise _HttpError(502, "encoded_reply_refused")  # compressed bytes can't be searched for the value
             bodyless = self.command == "HEAD" or resp.status in (204, 304) or resp.status < 200
-            self.send_response_only(resp.status, resp.reason)
+            self.send_response_only(resp.status, None if needles else resp.reason)
             for k, v in resp.msg.items():
-                if k.lower() not in HOP_BY_HOP:
+                if k.lower() not in HOP_BY_HOP and not _holds(needles, k + ":" + v):
                     self.send_header(k, v)
             if bodyless:
                 if resp.getheader("Content-Length") is not None:
@@ -1750,17 +1778,31 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                 self.close_connection = True
             self.end_headers()
             sent = 0
+            keep = max((len(n) for n in needles), default=1) - 1  # bytes held back: a value may span two chunks
+            tail = b""
             while not bodyless:
                 try:
                     chunk = resp.read1(65536)
                 except (OSError, http.client.HTTPException):
                     self.close_connection = True
+                    tail = b""
                     break
                 if not chunk:
                     break
-                self.wfile.write(chunk)
+                buf = tail + chunk
+                if needles and any(n in buf for n in needles):
+                    self.close_connection = True  # the tool sees a short body, never the value
+                    return "secret_in_reply", sent
+                cut = len(buf) - keep if needles else len(buf)
+                out, tail = buf[: max(cut, 0)], buf[max(cut, 0) :]
+                if out:
+                    self.wfile.write(out)
+                    self.wfile.flush()
+                    sent += len(out)
+            if tail:
+                self.wfile.write(tail)
                 self.wfile.flush()
-                sent += len(chunk)
+                sent += len(tail)
             return resp.status, sent
         finally:
             conn.close()
@@ -1775,6 +1817,29 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(data)
+
+
+SECRET_WINDOW = 16  # a reply holding this many characters of a path value in a row is held to leak it
+
+
+def _path_secret_forms(secret: str) -> tuple[bytes, ...]:
+    """Every SECRET_WINDOW-character piece of a path value, in the forms it could come back in: as sent, and with its
+    colon percent-encoded (PATH_VALUE_RE leaves no other character a server would encode). A value no longer than the
+    window is its own one piece. A Telegram token is `<bot id>:<35 characters>`; the bot id alone (about 10 digits,
+    and in every getMe reply) is shorter than a window, so it still gets through."""
+    if not secret:
+        return ()
+    out: set[bytes] = set()
+    for form in {secret, secret.replace(":", "%3A"), secret.replace(":", "%3a")}:
+        b = form.encode()
+        n = min(SECRET_WINDOW, len(b))
+        out.update(b[i : i + n] for i in range(len(b) - n + 1))
+    return tuple(out)
+
+
+def _holds(needles: tuple[bytes, ...], text: str) -> bool:
+    raw = text.encode("latin-1", "replace")
+    return any(n in raw for n in needles)
 
 
 # ---------------------------------------------------------------- the command

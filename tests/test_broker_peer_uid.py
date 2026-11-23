@@ -75,6 +75,13 @@ def test_a_peer_with_no_row_is_refused(env):
     assert refusals(env)[-1]["uid"] is None
 
 
+def test_a_missing_table_on_linux_is_refused_not_served(env):
+    env.broker.proc_net_tcp = (str(env.base / "no-such-table"),)
+    seen = len(env.stub.seen)
+    status, _, _ = env.call()
+    assert status == 403 and len(env.stub.seen) == seen  # fails closed: no check, no call
+
+
 def test_the_row_is_matched_by_both_ports_and_its_uid_is_read(tmp_path):
     t = tmp_path / "tcp"
     t.write_text(
@@ -102,8 +109,20 @@ def test_ipv6_and_ipv4_mapped_loopback_rows_match_and_other_addresses_do_not(tmp
         encoding="ascii",
     )
     assert broker.loopback_peer_uid(0xC350, 0x1F90, (str(t),)) == 11
-    assert broker.loopback_peer_uid(0xC351, 0x1F90, (str(t),)) == 12
+    assert broker.loopback_peer_uid(0xC351, 0x1F90, (str(t),)) is None  # ::1: the proxy listens on 127.0.0.1 only
     assert broker.loopback_peer_uid(0xC352, 0x1F90, (str(t),)) is None
+
+
+def test_a_decoy_row_on_another_loopback_address_is_not_the_peer(tmp_path):
+    t = tmp_path / "tcp"
+    row = "   {n}: {a}:C350 {b}:1F90 01 00000000:00000000 00:00000000 00000000  {uid}        0 1 1 0 0 0\n"
+    t.write_text(
+        HEADER
+        + row.format(n=0, a="0200007F", b="0100007F", uid=66)
+        + row.format(n=1, a="0100007F", b="0100007F", uid=4242),
+        encoding="ascii",
+    )
+    assert broker.loopback_peer_uid(0xC350, 0x1F90, (str(t),)) == 4242  # 127.0.0.2 decoy ignored, no -1
 
 
 def test_the_lookup_gives_up_at_its_budget_and_says_no_row(tmp_path):

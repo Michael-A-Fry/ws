@@ -623,6 +623,13 @@ def _loopback_hex(addr: str) -> bool:
     return False
 
 
+def _client_loopback(addr: str) -> bool:
+    """The proxy binds 127.0.0.1 and clients reach it there: only 127.0.0.1 (or its IPv4-mapped form) matches, so a
+    decoy row on 127.0.0.2 with the same ports can't be confused with the real one."""
+    a = addr.upper()
+    return a == "0100007F" or a == "0000000000000000FFFF00000100007F"
+
+
 def loopback_peer_uid(
     local_port: int,
     remote_port: int,
@@ -657,7 +664,7 @@ def loopback_peer_uid(
                 lport, rport, uid = int(lp, 16), int(rp, 16), int(cols[7])
             except ValueError:
                 continue
-            if lport == local_port and rport == remote_port and _loopback_hex(laddr) and _loopback_hex(raddr):
+            if lport == local_port and rport == remote_port and _client_loopback(laddr) and _client_loopback(raddr):
                 if found is not None and found != uid:
                     return -1  # two rows disagree: no uid will match it
                 found = uid
@@ -1657,7 +1664,9 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         try:
             peer = loopback_peer_uid(self.client_address[1], self.connection.getsockname()[1], b.proc_net_tcp)
         except NotImplementedError:
-            return  # no /proc/net/tcp on this OS: the token alone is the credential, as before
+            if sys.platform != "linux":
+                return  # no /proc/net/tcp on this OS: the token alone is the credential (docs: known-limits)
+            raise _HttpError(403, "peer_refused") from None  # on Linux a missing table fails closed
         self._peer_uid = peer  # the audit row (written in _forward) carries it, refused or served
         if peer is None or peer != grant.uid:
             raise _HttpError(403, "peer_refused")

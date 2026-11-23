@@ -15,6 +15,10 @@ def box(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("WS_HOME", str(home / ".ws"))
+    # the caller's own session must not leak in: under `claude -p` (CLAUDE_CODE_ENTRYPOINT=sdk-*) or a `ws run` job
+    # (WS_RUN_ID), ntfy.is_headless() treats the process as having nobody to call and sends no alert (C789)
+    monkeypatch.delenv("CLAUDE_CODE_ENTRYPOINT", raising=False)
+    monkeypatch.delenv("WS_RUN_ID", raising=False)
     monkeypatch.chdir(home)
     (home / ".ws").mkdir(mode=0o755)
     return home

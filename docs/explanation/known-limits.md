@@ -113,7 +113,7 @@ it after 24 hours.
 - **Workaround.** None needed to use ws. See the [lab reference](../reference/lab.md).
 
 ### A broker lease is bound to its uid only on Linux
-The lease proxy refuses a connection whose peer uid (read from `/proc/net/tcp` and `tcp6`) is not the lease's uid; on
+The lease proxy refuses a connection whose peer uid (read from `/proc/net/tcp` and `tcp6`) isn't the lease's uid; on
 Linux a missing or unreadable table is a refusal. macOS has no `/proc/net/tcp`, so there the lease token in the URL is
 the only credential: any local process that learns the URL can use the lease until it ends (row C782).
 

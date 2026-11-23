@@ -48,6 +48,7 @@ def box(tmp_path, monkeypatch):
     for k, v in e.items():
         monkeypatch.setenv(k, v)
     monkeypatch.chdir(home)
+    monkeypatch.setattr(worktrees, "_readlink", ROOT_NS)  # the runner may itself be in a sandbox or container
     return tmp_path
 
 
@@ -317,28 +318,41 @@ def test_a_full_zone_folder_whose_main_checkout_is_walled_is_refused(box):
 
 
 def ROOT_NS(path):
-    return {"/proc/1/comm": "systemd\n", "/proc/self/uid_map": "         0          0 4294967295\n"}.get(path)
+    return {"/proc/self/ns/pid": "pid:[4026531836]", "/proc/self/ns/user": "user:[4026531837]"}.get(path)
 
 
-def test_a_caller_in_its_own_pid_or_user_namespace_is_blind(monkeypatch):
+def test_a_caller_in_its_own_pid_or_user_namespace_is_blind():
     me = os.getpid()
     tree = {me: 1}  # inside a sandbox the chain stops at its own pid 1
-    bwrap = {"/proc/1/comm": "bwrap\n", "/proc/self/uid_map": "0 0 4294967295\n"}.get
-    unshared = {"/proc/1/comm": "systemd\n", "/proc/self/uid_map": "0 1000 1\n"}.get
-    assert not worktrees.sees_own_parents(tree, me, read=bwrap)
-    assert not worktrees.sees_own_parents(tree, me, read=unshared)
-    assert worktrees.sees_own_parents(tree, me, read=ROOT_NS)
-    assert worktrees.in_root_namespaces({"/proc/1/comm": "init\n"}.get)  # no uid_map file: allowed
+    pid_ns = {"/proc/self/ns/pid": "pid:[4026532001]", "/proc/self/ns/user": "user:[4026531837]"}.get
+    user_ns = {"/proc/self/ns/pid": "pid:[4026531836]", "/proc/self/ns/user": "user:[4026532002]"}.get
+    unreadable = {}.get
+    if Path("/proc/self").exists():
+        assert not worktrees.sees_own_parents(tree, me, readlink=pid_ns)
+        assert not worktrees.sees_own_parents(tree, me, readlink=user_ns)
+        assert not worktrees.sees_own_parents(tree, me, readlink=unreadable)
+    assert worktrees.sees_own_parents(tree, me, readlink=ROOT_NS)
+
+
+@pytest.mark.skipif(not Path("/proc/self/ns/pid").exists(), reason="Linux namespaces only")
+def test_the_real_namespace_links_are_read():
+    import os as _os
+
+    real = (
+        _os.readlink("/proc/self/ns/pid") == "pid:[4026531836]"
+        and _os.readlink("/proc/self/ns/user") == "user:[4026531837]"
+    )
+    assert worktrees.in_root_namespaces() is real
 
 
 @needs_git
 def test_a_process_list_that_hides_the_callers_parents_keeps_every_worktree(repo, monkeypatch):
     wt = add(repo, "idle")
     me = os.getpid()
-    assert worktrees.sees_own_parents({me: 4242, 4242: 1}, me, read=ROOT_NS)
-    assert worktrees.sees_own_parents({me: 1}, me, read=ROOT_NS)
-    assert not worktrees.sees_own_parents({me: 4242}, me, read=ROOT_NS)  # the parent is not listed
-    assert not worktrees.sees_own_parents({}, me, read=ROOT_NS)
+    assert worktrees.sees_own_parents({me: 4242, 4242: 1}, me, readlink=ROOT_NS)
+    assert worktrees.sees_own_parents({me: 1}, me, readlink=ROOT_NS)
+    assert not worktrees.sees_own_parents({me: 4242}, me, readlink=ROOT_NS)  # the parent is not listed
+    assert not worktrees.sees_own_parents({}, me, readlink=ROOT_NS)
     with monkeypatch.context() as m:
         m.setattr(worktrees, "_ppids", lambda: {me: 4242})  # a PID namespace or `hidepid`: part of the tree only
         assert reasons(prune(repo)) == {"idle": "busy-unknown"} and wt.exists()

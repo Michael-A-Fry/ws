@@ -12,3 +12,4 @@
 ^    e = refused\(box, "g", "someone@gmail\.com", "not an app password at all"\)$
 ^        \(\("c", "me@custom-domain\.example", "x"\), "pick_provider"\),$
 ^.*sender="(?:x|alerts)@bank\.example".*$
+^    r\.add\(1, raw\(sender="Google <no-reply@accounts\.google\.com>", subject="Security alert", mid="<s1@example\.org>"\)\)$

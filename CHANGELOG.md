@@ -19,6 +19,37 @@ body of the GitHub release.
   `ws-worktrees-prune.timer` (`ws.job.worktrees-prune` on launchd) checks the disk every 30 minutes, prunes every 6
   hours or at once at 85% and tells the lead. Thresholds are `[worktrees]` settings.
 
+## [0.1.11.8] - 2026-11-23
+
+### Fixed
+
+- `ws triage` no longer drafts the same thread again and again (C720). A run that found nothing new above the last uid
+  took the folder's UIDVALIDITY to be 0, saved it, and the next run saw a changed UIDVALIDITY and read the whole window
+  again, asking the model about, and drafting, each thread once more. The UIDVALIDITY now comes from the search itself
+  (`ws.mail.Mail.search` returns it as `uidvalidity`), and a saved 0 is read as unknown, not as a change. A true
+  change still reads the window again, safely: each mailbox's state now keeps `handled`, the newest Message-ID of each
+  thread already handled (the last 2000), and a thread handled at that Message-ID isn't asked about or drafted again
+  whatever its uids are. Before a draft is made, the drafts folder (the last 14 days, newest 25) and Sent (newest 25) are
+  read once a run: a thread with a draft already there, or whose newest message he already answered, gets no new draft
+  and is logged as `already_drafted`. An old draft is never changed or removed; a new message from the other person
+  gets a fresh draft only once the old one is gone. The state file gains a field the older code ignores (schema stays 1).
+
+### Changed
+
+- `ws triage`: the day's summary now names the threads that matter. It keeps, across the day's runs, one line for each
+  thread that needs a reply or is worth a check (mailbox, sender, subject cut to about 80 characters, why, and whether
+  a draft was saved); a thread the mailbox's owner later answers stays, moved to a Done list. No mail body text is
+  written, and a subject, name or reason has its control and bidi characters, markdown links and web addresses
+  removed. Token, cost and run counts are no longer in the summary (they're in `logs/triage.jsonl`), and the label
+  counts are in plain words. The first line, `Drafts created: N` and the "Worth a look" heading are as before. The
+  day's state keeps up to 100 lines and reads an older day's `flags` list.
+- `ws triage run --dry-run` prints the summary it would write.
+
+### Added
+
+- A rules file label, `check`: the thread is labelled `ws/fyi` and listed in the summary as worth a check, with no model
+  call (for example account-security mail). It adds no mailbox label.
+
 ## [0.1.11.7] - 2026-11-22
 
 ### Added

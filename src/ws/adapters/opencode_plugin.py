@@ -6,6 +6,8 @@ Kept as a Python string, not a .js file, because the secret wall copies the ws p
 same client's argv for `ws gate event` (the guards on OpenCode's other events); `/*__WS__*/ []` with the argv that runs ws;
 `/*__PIN__*/ []` with the `--pin` arguments that go on the commands that are not a check (the layout ws install resolved),
 `/*__GATE_ENV__*/ {}` with that layout's environment (`paths.Pin.environ`), which every ws child this shim starts gets.
+So under OpenCode the pin check never refuses: a ws child always resolves to the install layout, whatever the run's own
+environment says. Claude Code's hooks run with the session's environment and refuse when it points elsewhere (C792).
 `/*__GOVERNED__*/ []` and `/*__POST_TOOLS__*/ []` name the tools a call is checked before and after, `/*__ADVICE__*/ []` the
 ws events (start, prompt, post, stop, subagent-stop) a guard that is on wants, `/*__ASK__*/ []` the `ask_commands` patterns
 written as OpenCode's own `ask`, `/*__ASKS__*/ ""` the file its permission asks are appended to (ws home reads it) and

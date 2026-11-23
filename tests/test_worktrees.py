@@ -364,10 +364,14 @@ def test_a_process_list_that_hides_the_callers_parents_keeps_every_worktree(repo
 def test_a_caller_in_a_sandbox_keeps_every_worktree(repo, monkeypatch):
     wt = add(repo, "idle")
     sandbox = {"/proc/self/ns/pid": "pid:[4026532999]", "/proc/self/ns/user": "user:[4026531837]"}.get
+    # Namespaces are a Linux idea: with no /proc (macOS) the links are never read and `ps` lists every process, so
+    # prune goes ahead there (in_root_namespaces' docstring); the sandbox case is Linux's.
+    sandboxed = "busy-unknown" if os.path.isdir("/proc/self") else "removed"
     with monkeypatch.context() as m:
         m.setattr(worktrees, "_readlink", sandbox)  # the module's reader, as prune uses it
-        assert reasons(prune(repo)) == {"idle": "busy-unknown"} and wt.exists()
-    assert reasons(prune(repo)) == {"idle": "removed"}
+        assert reasons(prune(repo)) == {"idle": sandboxed} and wt.exists() == (sandboxed == "busy-unknown")
+    if sandboxed == "busy-unknown":
+        assert reasons(prune(repo)) == {"idle": "removed"}
 
 
 @needs_git

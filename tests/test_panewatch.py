@@ -600,6 +600,10 @@ def test_a_new_error_after_the_old_one_went_is_a_new_episode(env):
         idle("  The docs say the text API Error: 500 appears when the server fails."),
         # no input prompt: not an idle Claude Code pane
         "\n".join([API_ERRORS["server"], "$ "]),
+        # a shell with a `❯` prompt (starship, pure) under a command's error line: no Claude Code box around the prompt
+        "$ curl x\nAPI Error: bad token\n\n~/code/x  main\n❯ \n",
+        # a rule above the prompt but none below it
+        "  " + API_ERRORS["server"].strip() + "\n" + "─" * 80 + "\n❯ \n",
         # the prompt is a numbered choice, not the input box
         "\n".join([API_ERRORS["server"], "  ❯ 1. Yes", "    2. No"]),
     ],

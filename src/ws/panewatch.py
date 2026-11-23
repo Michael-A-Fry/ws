@@ -249,9 +249,14 @@ def find_dialog(lines: list[str], patterns: tuple[str, ...] = DIALOG_PATTERNS) -
     return Dialog(pattern, first[:LINE_MAX], rc)
 
 
+def _is_rule(line: str) -> bool:
+    """A horizontal rule, possibly with a label in it: the line starts with ten or more box-drawing dashes."""
+    return bool(re.match(r"^\s*[─━═]{10,}", line))
+
+
 def find_api_error(lines: list[str]) -> ApiError | None:
-    """The API error a session is stopped on, or None. Stopped means: a prompt line (`❯`, not a numbered choice) is
-    among the last few lines with text, one of `API_ERROR_PATTERNS` begins a line among the `API_ERROR_LINES` lines with
+    """The API error a session is stopped on, or None. Stopped means: Claude Code's idle input box (a prompt line `❯`, not
+    a numbered choice, with a rule line straight above it and one straight below) is among the last few lines with text, one of `API_ERROR_PATTERNS` begins a line among the `API_ERROR_LINES` lines with
     text above the prompt's box (rules skipped), and nothing from there down says the session is working: no "esc to
     interrupt", no retry countdown, no spinner line. A pattern in the middle of a line is prose about an error, not one."""
     texted = [i for i, ln in enumerate(lines) if ln.strip()]
@@ -261,6 +266,9 @@ def find_api_error(lines: list[str]) -> ApiError | None:
     )
     if prompt is None:
         return None
+    k = texted.index(prompt)  # Claude Code's input box: a rule line straight above the prompt and one straight below
+    if k == 0 or k + 1 >= len(texted) or not all(_is_rule(lines[i]) for i in (texted[k - 1], texted[k + 1])):
+        return None  # a shell with a `❯` prompt is not Claude Code
     above = [i for i in texted if i < prompt and not lines[i].lstrip().startswith(("─", "━", "═"))]
     window = above[-API_ERROR_LINES:]
     if not window:

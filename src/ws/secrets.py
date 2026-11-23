@@ -430,50 +430,75 @@ def _fsync_dir(folder: Path) -> None:
             os.close(fd)
 
 
-def _rewrite(path: Path, change) -> bool:
-    """Replace the registry with `change(old_text)` (None: leave it). Backs the old file up, checks the new one loads,
-    and renames it in only if the file is still the one read (same inode and bytes). Raises RegistryWriteError."""
+@contextlib.contextmanager
+def _registry_lock(path: Path):
+    """An exclusive lock on `<registry>.lock`, held by every ws writer of the registry (no lock where there is no flock)."""
+    fd = os.open(path.with_name(path.name + ".lock"), os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        try:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except ImportError:
+            pass
+        yield
+    finally:
+        os.close(fd)  # closing releases the lock
+
+
+def _rewrite(path: Path, change, *, backup: bool = False) -> tuple[bool, bool]:
+    """Replace the registry with `change(old_text)` (None: leave it), under the registry lock. With `backup`, the old
+    file is copied to `<registry>.bak` first. The new text must load, and it is renamed in only if the file is still the
+    one read (same inode and bytes). Returns (changed, backed up). Raises RegistryWriteError."""
     try:
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        old, ident = _open_registry(path)
-        try:
-            new_text = change(old.decode("utf-8"))
-        except UnicodeDecodeError as e:
-            raise RegistryWriteError(f"{path}: it is not UTF-8 text") from e
-        if new_text is None:
-            return False
-        mode = ident[2] if ident else 0o600
-        if ident is not None:
-            bak = _write_beside(path, old, 0o600)
-            os.replace(bak, path.with_name(path.name + BACKUP_SUFFIX))
-        tmp = _write_beside(path, new_text.encode("utf-8"), mode)
-        try:
-            load_registry(tmp)  # the whole new file loads, or nothing changes
-            now, now_ident = _open_registry(path)
-            same_file = (now_ident[:2] if now_ident else None) == (ident[:2] if ident else None)
-            if not same_file or hashlib.sha256(now).digest() != hashlib.sha256(old).digest():
-                raise RegistryWriteError(f"{path}: it changed while ws was writing it; nothing was changed, try again")
-            os.rename(tmp, path)
-        except BaseException:
-            with contextlib.suppress(OSError):
-                tmp.unlink()
-            raise
-        _fsync_dir(path.parent)
-        return True
+        _open_registry(path)  # refuse a symlink or a loose folder before a lock file is made there
+        with _registry_lock(path):
+            return _rewrite_locked(path, change, backup)
     except RegistryWriteError:
         raise
     except (OSError, SecretsError) as e:
         raise RegistryWriteError(f"{path}: {e}") from e
 
 
-def append_entry(path: Path, block: str) -> None:
-    """Add one new entry, as text, at the end of the registry (comments and layout kept). Raises RegistryWriteError."""
+def _rewrite_locked(path: Path, change, backup: bool) -> tuple[bool, bool]:
+    old, ident = _open_registry(path)
+    try:
+        new_text = change(old.decode("utf-8"))
+    except UnicodeDecodeError as e:
+        raise RegistryWriteError(f"{path}: it is not UTF-8 text") from e
+    if new_text is None:
+        return False, False
+    mode = ident[2] if ident else 0o600
+    backed_up = backup and ident is not None
+    if backed_up:
+        bak = _write_beside(path, old, 0o600)
+        os.replace(bak, path.with_name(path.name + BACKUP_SUFFIX))
+    tmp = _write_beside(path, new_text.encode("utf-8"), mode)
+    try:
+        load_registry(tmp)  # the whole new file loads, or nothing changes
+        now, now_ident = _open_registry(path)
+        same_file = (now_ident[:2] if now_ident else None) == (ident[:2] if ident else None)
+        if not same_file or hashlib.sha256(now).digest() != hashlib.sha256(old).digest():
+            raise RegistryWriteError(f"{path}: it changed while ws was writing it; nothing was changed, try again")
+        os.rename(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
+    _fsync_dir(path.parent)
+    return True, backed_up
+
+
+def append_entry(path: Path, block: str) -> bool:
+    """Add one new entry, as text, at the end of the registry (comments and layout kept), backing the old file up to
+    `<registry>.bak`. Returns whether there was an old file to back up. Raises RegistryWriteError."""
 
     def change(old: str) -> str:
         sep = "" if not old or old.endswith("\n\n") else "\n" if old.endswith("\n") else "\n\n"
         return old + sep + block
 
-    _rewrite(path, change)
+    return _rewrite(path, change, backup=True)[1]
 
 
 def remove_block(path: Path, block: str) -> bool:
@@ -483,9 +508,13 @@ def remove_block(path: Path, block: str) -> bool:
         at = old.rfind(block)
         if at < 0:
             return None
-        return (old[:at].rstrip("\n") + "\n" if old[:at].strip() else "") + old[at + len(block) :]
+        rest = old[at + len(block) :]
+        nxt = next((ln.strip() for ln in rest.splitlines() if ln.strip()), "")
+        if nxt and not nxt.startswith(("[", "#")):
+            return None  # a key was added under the block: it belongs to the entry, so the entry was changed
+        return (old[:at].rstrip("\n") + "\n" if old[:at].strip() else "") + rest
 
-    return _rewrite(path, change)
+    return _rewrite(path, change)[0]
 
 
 def check_value(value: str) -> str:

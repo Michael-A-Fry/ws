@@ -13,7 +13,6 @@ from __future__ import annotations
 import getpass
 import os
 import sys
-from pathlib import Path
 
 COMMAND = "connect"
 
@@ -71,8 +70,10 @@ def _context(*, with_io: bool = False) -> engine.Context:
 
 
 def walled() -> bool:
-    """A walled broker is set up here (its root-owned registry or its socket exists): only root can add a name."""
-    return Path(wsecrets.WALL_HOME, "secrets.toml").exists() or Path(wsecrets.WALL_SOCKET).exists()
+    """A walled broker is set up here: its home or its socket's folder exists. Only root can add a name then. The
+    folders are checked, not the files in them: they are closed to a normal user (0700, 0750), where a check of the file
+    would fail or always say no."""
+    return any(os.path.lexists(p) for p in (wsecrets.WALL_HOME, os.path.dirname(wsecrets.WALL_SOCKET)))
 
 
 def _flow(flow_id: str) -> spec.Flow:

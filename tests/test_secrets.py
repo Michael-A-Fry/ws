@@ -907,7 +907,7 @@ def test_append_keeps_the_old_text_backs_it_up_and_keeps_the_mode(tmp_path):
     assert (reg.parent / "secrets.toml.bak").read_text().startswith("# mine")
     assert stat.S_IMODE(reg.stat().st_mode) == 0o640
     assert stat.S_IMODE((reg.parent / "secrets.toml.bak").stat().st_mode) == 0o600
-    assert sorted(p.name for p in reg.parent.iterdir()) == ["secrets.toml", "secrets.toml.bak"]  # no temp left
+    assert sorted(p.name for p in reg.parent.iterdir()) == ["secrets.toml", "secrets.toml.bak", "secrets.toml.lock"]
 
 
 def test_append_makes_a_new_registry_0600(tmp_path):
@@ -976,6 +976,34 @@ def test_remove_block_takes_out_exactly_the_block_or_nothing(tmp_path):
     assert wsecrets.remove_block(reg, BLOCK) is True
     assert reg.read_text() == '[a]\nhosts = ["x.example.com"]\n'
     assert wsecrets.remove_block(reg, BLOCK) is False
+    assert (
+        reg.parent / "secrets.toml.bak"
+    ).read_text() == '[a]\nhosts = ["x.example.com"]\n'  # only an append backs up
+
+
+def test_remove_block_leaves_a_block_that_gained_a_key_below_it(tmp_path):
+    reg = _folder(tmp_path)
+    reg.write_text('[a]\nhosts = ["x.example.com"]\n')
+    wsecrets.append_entry(reg, BLOCK)
+    reg.write_text(reg.read_text() + 'tier = "lead-elevated"\n')  # the person scoped it by hand
+    before = reg.read_text()
+    assert wsecrets.remove_block(reg, BLOCK) is False
+    assert reg.read_text() == before and wsecrets.load_registry(reg)["a"].tier is None
+    reg.write_text(before.replace('tier = "lead-elevated"\n', '\n# a note\n[b]\nhosts = ["y.example.com"]\n'))
+    assert wsecrets.remove_block(reg, BLOCK) is True  # a new table or comment after it is not part of it
+    assert set(wsecrets.load_registry(reg)) == {"a", "b"}
+
+
+def test_every_writer_holds_the_registry_lock(tmp_path, monkeypatch):
+    import fcntl
+
+    reg = _folder(tmp_path)
+    held = []
+    real = fcntl.flock
+    monkeypatch.setattr(fcntl, "flock", lambda fd, op: held.append(op) or real(fd, op))
+    wsecrets.append_entry(reg, BLOCK)
+    wsecrets.remove_block(reg, BLOCK)
+    assert held.count(fcntl.LOCK_EX) == 2
 
 
 def test_entry_block_uses_the_brokers_rules_and_refuses_quotes():

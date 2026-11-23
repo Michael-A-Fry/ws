@@ -522,6 +522,7 @@ BAD = {
     "a [secret] host with a path": lambda r: r["secret"].update(hosts=["api.telegram.org/x"]),
     "a [secret] key the registry does not know": lambda r: r["secret"].update(tier="lead"),
     "an empty [secret] paths": lambda r: r["secret"].update(paths=[]),
+    "a step that takes the engine's register-secret id": lambda r: r["steps"][0].update(id="register-secret"),
 }
 
 
@@ -874,3 +875,49 @@ def test_the_shipped_flows_are_only_python_files_for_the_wall():
 def test_a_flow_outside_the_package_loads_from_a_toml_folder(tmp_path):
     (tmp_path / "mine.toml").write_text(spec.shipped_text("_template").replace('id = "example"', 'id = "mine"'))
     assert spec.ids(tmp_path) == ["mine"] and spec.load("mine", tmp_path).id == "mine"
+
+
+def test_walled_is_read_from_the_folders_even_when_they_are_closed(tmp_path, monkeypatch):
+    from ws import connectcmd
+
+    home, run = tmp_path / "ws-broker", tmp_path / "run-ws-broker"
+    monkeypatch.setattr(wsecrets, "WALL_HOME", str(home))
+    monkeypatch.setattr(wsecrets, "WALL_SOCKET", str(run / "broker.sock"))
+    assert connectcmd.walled() is False
+    home.mkdir()
+    (home / "secrets.toml").write_text("")
+    home.chmod(0o000)  # as the setup leaves it for anyone but ws-broker
+    try:
+        assert connectcmd.walled() is True
+    finally:
+        home.chmod(0o700)
+    home.joinpath("secrets.toml").unlink()
+    home.rmdir()
+    run.mkdir(mode=0o750)
+    assert connectcmd.walled() is True
+
+
+def test_a_state_that_cant_be_saved_takes_the_added_entry_out_again(env, monkeypatch):
+    tmp, _store = env
+    reg = tmp / "secrets.toml"
+    reg.write_text('[anthropic]\nhosts = ["api.anthropic.com"]\n')
+    before = reg.read_text()
+    c = ctx_for(env, FakeTelegram(make_token()), Script("yes"), registered=False)
+
+    def full(*a, **k):
+        raise OSError(28, "no space")
+
+    monkeypatch.setattr(engine, "save_state", full)
+    with pytest.raises(ConnectError) as e:
+        engine.walk(c, FLOW)
+    assert e.value.kind == "state" and "taken out again" in e.value.hint
+    assert reg.read_text() == before
+
+
+def test_a_new_registry_says_nothing_about_a_backup(env):
+    tmp, _store = env
+    io = Script("yes")
+    c = ctx_for(env, FakeTelegram(make_token()), io, registered=False)
+    engine._register(c, FLOW, engine.load_state(c, FLOW))
+    assert not (tmp / "secrets.toml.bak").exists()
+    assert not any(".bak" in x for x in io.said)

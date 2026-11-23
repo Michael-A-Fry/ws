@@ -23,6 +23,7 @@ from ws import secrets as wsecrets
 SCHEMA = "ws.connect-flow/1"
 ID_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 RESERVED_IDS = frozenset({"list"})
+RESERVED_STEP_IDS = frozenset({"register-secret"})  # the engine's own first row when the secret is not registered
 STEP_TYPES = ("info", "link", "capture", "verify")
 REVOKE_ACTIONS = ("delete_secret", "tell", "forget")
 NONCE_MAX_S = 86400
@@ -137,6 +138,7 @@ def parse(raw: dict, path: Path | None = None) -> Flow:
         sid = _text(s, "id", f"{name} step {i + 1}") or ""
         where = f"{name} step {sid!r}"
         _need(bool(ID_RE.match(sid)) and sid not in seen, where, "id must be unique, lower-case letters, digits and -")
+        _need(sid not in RESERVED_STEP_IDS, where, f"{sid!r} is the engine's own step id")
         seen.add(sid)
         typ = s.get("type")
         _need(typ in STEP_TYPES, where, f"type must be one of {', '.join(STEP_TYPES)}")

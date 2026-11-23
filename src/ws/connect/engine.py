@@ -493,15 +493,25 @@ def _register(ctx: Context, flow: Flow, st: dict) -> None:
             "nothing was changed; run this again to add it",
         )
     try:
-        wsecrets.append_entry(reg, block)
+        backed_up = wsecrets.append_entry(reg, block)
     except SecretsError as e:
         raise ConnectError(
             "registry", f"ws couldn't add {flow.secret_name} to the registry: {e}", "nothing was changed"
         ) from None
     st["registry_added"] = block  # provenance, as secret_stored: --revoke takes out exactly this block
-    save_state(ctx, flow, st)
+    try:
+        save_state(ctx, flow, st)
+    except OSError as e:  # no record means --revoke could never take it out again: undo the append
+        st.pop("registry_added", None)
+        try:
+            wsecrets.remove_block(reg, block)
+            hint = "the entry was taken out again, so nothing changed"
+        except SecretsError:
+            hint = f"remove [{flow.secret_name}] from {reg} by hand"
+        raise ConnectError("state", f"the state of {flow.id} can't be written ({type(e).__name__})", hint) from None
     ctx.registry = {**ctx.registry, flow.secret_name: wsecrets.load_registry(reg)[flow.secret_name]}
-    io.say(f"  Added {flow.secret_name} (a copy of the old registry is in {reg.name}{wsecrets.BACKUP_SUFFIX}).")
+    copy = f" (the old registry is copied to {reg.name}{wsecrets.BACKUP_SUFFIX})" if backed_up else ""
+    io.say(f"  Added {flow.secret_name}{copy}.")
 
 
 def _capture(ctx: Context, flow: Flow, st: dict, i: int) -> int:

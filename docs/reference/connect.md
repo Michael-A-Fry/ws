@@ -80,7 +80,9 @@ The walk shows the block and appends it as text on the person's yes (ADR 0034): 
 backed up to `secrets.toml.bak`, nothing written if the file changed meanwhile. Under a walled broker (its registry in
 `/var/lib/ws-broker` or its socket in `/run/ws-broker`) ws writes nothing: `text` holds the block and the
 `sudo install` line that copies the registry to the broker. `--revoke` takes the block out again only if this flow added
-it and nobody changed it since. Adding the row needed no new `schema_version`: no key was removed or changed in meaning.
+it and nobody changed it since. Adding the row needed no new `schema_version`: no key was removed or changed in meaning. One blocker `kind`
+went: `secret_not_registered` (this row replaces it). A consumer written for it still sees `needs_human`, exit 3 and
+`next_step` = `register-secret`. A flow can't use the id `register-secret` for a step of its own.
 
 Exit codes of the command: 0 done, 3 needs a person (or a refusal: the envelope's `error_kind` is `refused`), 1 an error
 (a flow that doesn't exist, a failed verify, a damaged state file), 2 usage.

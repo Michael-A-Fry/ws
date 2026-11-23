@@ -155,9 +155,15 @@ def test_since_takes_a_date_or_a_datetime(box):
 def test_search_gives_uids_that_carry_uidvalidity(box):
     a, b = box.fake.add(ORIGINAL), box.fake.add(ORIGINAL)
     got = box.mail.search("work", query="from:sender", since="2026-11-01")
-    assert got == {"mailbox": "work", "uids": [f"work:7-{b.uid}", f"work:7-{a.uid}"], "total": 2}
+    assert got == {"mailbox": "work", "uidvalidity": 7, "uids": [f"work:7-{b.uid}", f"work:7-{a.uid}"], "total": 2}
     assert ("UID", 'SEARCH SINCE 1-Nov-2026 X-GM-RAW "from:sender"') in box.fake.log
     assert ("EXAMINE", '"INBOX"') in box.fake.log  # INBOX, read-only
+
+
+def test_a_search_that_finds_nothing_still_reports_the_uidvalidity(box):
+    m = box.fake.add(ORIGINAL)
+    got = box.mail.search("work", after_uid=m.uid)  # nothing above the newest uid
+    assert got == {"mailbox": "work", "uidvalidity": 7, "uids": [], "total": 0}
 
 
 def test_a_search_after_a_uid_is_the_oldest_above_it_and_a_bad_one_is_refused_by_the_broker(box):
@@ -312,6 +318,22 @@ def test_a_draft_replies_to_reply_to_and_never_doubles_re_or_the_marker(box):
     body = parsed(box.fake.folders["[Gmail]/Drafts"].messages[0].raw).get_content()
     assert body.count(imap.DRAFT_MARKER) == 1
     assert parsed(box.fake.folders["[Gmail]/Drafts"].messages[0].raw)["References"] == "<r1@example.com>"
+
+
+def test_reply_ids_name_what_drafts_and_sent_mail_already_answer(box):
+    m = box.fake.add(ORIGINAL)
+    assert box.mail.reply_ids("work", "2026-11-01") == {"drafts": [], "sent": []}
+    box.mail.draft("work", f"work:7-{m.uid}", "Yes, Friday works.")
+    sent = ORIGINAL.replace(b"Message-ID: <m2@example.com>", b"Message-ID: <s1@example.com>").replace(
+        b"In-Reply-To: <m1@example.com>", b"In-Reply-To: <m2@example.com>"
+    )
+    box.fake.add(sent, folder="Sent")
+    got = box.mail.reply_ids("work", "2026-11-01")
+    assert got["sent"] == ["<m2@example.com>"]  # the sent message answers m2
+    assert {"<m0@example.com>", "<m1@example.com>", "<m2@example.com>"} <= set(
+        got["drafts"]
+    )  # In-Reply-To and References
+    assert len(box.fake.folders["[Gmail]/Drafts"].messages) == 1  # read only: nothing added, changed or removed
 
 
 def test_a_plain_imap_draft_goes_to_the_drafts_folder_or_is_refused(base, cert, monkeypatch):

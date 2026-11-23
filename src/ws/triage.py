@@ -84,6 +84,8 @@ SCHEDULING_FLAG = "scheduling: check your calendar"
 MAX_RETRIES = 2  # for a bad answer
 MAX_DECISIONS = 200  # decision lines kept in one run's record
 MAX_PENDING = 100  # uids held for the next run when a cap stopped the model
+MAX_HANDLED = 2000  # threads (the newest Message-ID of each) a mailbox's state remembers as handled
+REPLY_DAYS = 14  # how far back the drafts folder and Sent are read for a reply to a thread before a draft is made
 MAX_ITEMS = 100  # thread lines kept in a day's summary; past that the oldest stay and the rest are counted
 SUBJECT_MAX = 80  # characters of a subject, and of a sender's name (NAME_MAX), written in the summary
 NAME_MAX = 30
@@ -876,6 +878,7 @@ class Route(Protocol):
     def user(self) -> str: ...
     def label(self, ref: str, label: str) -> None: ...
     def draft(self, ref: str, body: str) -> None: ...
+    def reply_ids(self, since: date) -> tuple[set[str], set[str]]: ...
 
 
 class MailAdapter:
@@ -890,12 +893,9 @@ class MailAdapter:
     def search(self, since: date, query: str | None, after: int | None) -> tuple[int, list[int], int]:
         """(uidvalidity, uids, how many match). `after` None: the newest page; a uid: the oldest page above it."""
         r = self.m.search(self.name, query=query, since=since, after_uid=after)
-        uvs, uids = set(), []
-        for ref in r["uids"]:
-            uv, uid = mail.split_uid(ref, self.name)
-            uvs.add(uv)
-            uids.append(uid)
-        return (next(iter(uvs)) if uvs else 0), uids, r["total"]
+        # The folder's own UIDVALIDITY, from the search itself: a search that finds nothing new still reports it, and
+        # reading it off the uids gave 0 then, which the next run took for a rebuilt folder (C720).
+        return r["uidvalidity"], [mail.split_uid(ref, self.name)[1] for ref in r["uids"]], r["total"]
 
     def ref(self, uidvalidity: int, uid: int) -> str:
         return mail.make_uid(self.name, uidvalidity, uid)
@@ -912,6 +912,11 @@ class MailAdapter:
 
     def draft(self, ref: str, body: str) -> None:
         self.m.draft(self.name, ref, body)
+
+    def reply_ids(self, since: date) -> tuple[set[str], set[str]]:
+        """(Message-IDs the drafts folder's newest messages name, Message-IDs the newest sent messages answer)."""
+        r = self.m.reply_ids(self.name, since)
+        return set(r["drafts"]), set(r["sent"])
 
 
 # ---------------------------------------------------------------- state, record, summary
@@ -1051,6 +1056,8 @@ class Message:
     bulk: bool
     thread: str
     text: str  # the message as ws.mail's delimited plain text
+    mid: str = ""  # its Message-ID ("" when it has none)
+    chain: tuple[str, ...] = ()  # the Message-IDs of the messages before it in the thread (References, In-Reply-To)
 
 
 @dataclass
@@ -1102,6 +1109,8 @@ def read_message(mailbox: str, raw: Raw, uid: int) -> Message:
         bulk=is_bulk(msg),
         thread=thread,
         text=mail.as_text(raw.raw, mailbox, raw.ref, raw.thread, raw.truncated),
+        mid=(mail.MSGID_RE.findall(_h(msg, "Message-ID")) or [""])[0],
+        chain=(*refs, *mail.MSGID_RE.findall(_h(msg, "In-Reply-To"))),
     )
 
 
@@ -1137,6 +1146,33 @@ class Run:
         self.state, self.now, self.dry, self.save = state, now, dry_run, save  # save: write the state file now
         self.t = Totals()
         self.model_down = False  # a runner failure stops further calls this run (the cause would repeat)
+        self.handled: dict[str, list[str]] = {}  # mailbox -> the newest Message-ID of each thread already handled
+        self.replies: dict[str, tuple[set[str], set[str]]] = {}  # mailbox -> (ids in Drafts, ids answered in Sent)
+
+    # -- the threads already handled: the idempotency key, whatever the uids do
+
+    def handled_of(self, name: str) -> list[str]:
+        if name not in self.handled:
+            h = (self.state["mailboxes"].get(name) or {}).get("handled")
+            self.handled[name] = [x for x in h if isinstance(x, str)] if isinstance(h, list) else []
+        return self.handled[name]
+
+    def mark_handled(self, name: str, m: Message) -> None:
+        h = self.handled_of(name)
+        if m.mid and m.mid not in h:
+            h.append(m.mid)
+            del h[:-MAX_HANDLED]
+
+    def reply_ids(self, name: str, route: Route) -> tuple[set[str], set[str]]:
+        """What the mailbox already holds as replies, read once a run and only when a draft is about to be made. If it
+        cannot be read the answer is empty and the run says so: the handled key above still stands."""
+        if name not in self.replies:
+            try:
+                self.replies[name] = route.reply_ids(self.now.astimezone().date() - timedelta(days=REPLY_DAYS))
+            except mail.MailError as e:
+                self.t.notes.append({"mailbox": name, "kind": "reply_check_failed", "why": e.kind})
+                self.replies[name] = (set(), set())
+        return self.replies[name]
 
     # -- the caps on the model
 
@@ -1209,7 +1245,8 @@ class Run:
         now_only = self.cfg.first_run_days == 0  # "start from now": remember where the mailbox is, read nothing
         last = int(st.get("last_uid", 0)) if st else 0
         uv, found, total = route.search(since, query, None if st is None and now_only else last)
-        fresh = st is None or st.get("uidvalidity") != uv
+        # A real UIDVALIDITY is never 0: a 0 saved by an older run is "not known", not a value to differ from.
+        fresh = st is None or (st.get("uidvalidity") not in (0, None) and st.get("uidvalidity") != uv)
         if fresh and st is not None:  # the folder was rebuilt: its uids start again
             self.t.notes.append({"mailbox": name, "kind": "uidvalidity_changed"})
             last = 0
@@ -1270,10 +1307,20 @@ class Run:
             if label and label != ASK_MODEL:
                 progress([])
         held: list[int] = []
+        skipped = 0
         for msgs in asks.values():
-            held += self.thread(name, route, msgs)
+            newest = max(msgs, key=lambda m: m.uid)
+            if newest.mid and newest.mid in self.handled_of(name):  # asked and answered before, whatever its uid is now
+                skipped += 1
+            else:
+                left = self.thread(name, route, msgs)
+                held += left
+                if not left:
+                    self.mark_handled(name, newest)
             waiting.difference_update(m.uid for m in msgs)
             progress(held)
+        if skipped:
+            self.t.notes.append({"mailbox": name, "kind": "already_handled", "threads": skipped})
         self.keep(name, uv, done, held, cursor)
 
     def apply(self, route: Route, ref: str, label: str) -> None:
@@ -1338,6 +1385,10 @@ class Run:
             self.t.refused.append({"mailbox": name, "uid": newest.uid, "reason": refusal})
             self.flag(name, newest, f"needs a reply; draft refused ({refusal})")
             return listed(False, f"the draft was not kept: {refusal}")
+        drafted, answered = self.reply_ids(name, route)
+        if newest.mid in answered or {newest.mid, *newest.chain} & drafted:  # never changed or removed: his to delete
+            self.t.notes.append({"mailbox": name, "kind": "already_drafted"})
+            return listed(True, "a reply to this thread is already in your drafts or sent mail")
         if not self.dry:
             try:
                 route.draft(newest.ref, verdict.draft or "")
@@ -1357,6 +1408,8 @@ class Run:
             "pending": sorted(set(held))[-MAX_PENDING:],
             "updated": self.now.astimezone(UTC).isoformat(timespec="seconds"),
         }
+        if self.handled_of(name):
+            entry["handled"] = self.handled_of(name)[-MAX_HANDLED:]
         if since is not None:
             entry["since"] = since.isoformat()
         self.state["mailboxes"][name] = entry

@@ -8,8 +8,14 @@ body of the GitHub release.
 
 ## [Unreleased]
 
+## [0.1.11.9] - 2026-11-24
+
 ### Added
 
+- `ws watch panes` also spots a Claude Code session left idle at its prompt after an API error (`API Error:`, `Unable to
+  connect to API`, `Connection dropped`, `Request timed out`): one push after `after_minutes`, an `api-error-stuck`
+  line in `logs/alerts.jsonl`, nothing typed into the pane. A session still working or retrying isn't reported. Set
+  `CLAUDE_CODE_RETRY_WATCHDOG=1` for unattended sessions so Claude Code retries before it stops.
 - `ws worktrees prune`: removes agent worktrees under `<repo>/.claude/worktrees` that nothing needs. It keeps one
   that's locked, has a change to a tracked file, changed in the last 12 hours, has a process inside it (or the process
   list doesn't show the caller's own parents, so use can't be ruled out), or has a
@@ -18,6 +24,13 @@ body of the GitHub release.
   `--only PATH` is for a session that has just finished. A repo is pruned only from inside its own zone.
   `ws-worktrees-prune.timer` (`ws.job.worktrees-prune` on launchd) checks the disk every 30 minutes, prunes every 6
   hours or at once at 85% and tells the lead. Thresholds are `[worktrees]` settings.
+
+### Fixed
+
+- The gate hook no longer crashes inside the ws sandbox (C765). The sandbox's seccomp filter refuses `socket(AF_UNIX)`,
+  and the client raised before its fallback, so every tool of a sandboxed OpenCode run was blocked. A socket the system
+  refuses now counts as no daemon, and the hook decides in-process, as it already did with no daemon up; a tool the gate
+  denies is still denied.
 
 ## [0.1.11.8] - 2026-11-23
 

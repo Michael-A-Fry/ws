@@ -5,6 +5,8 @@
 Why. A Claude Code dialog (a question to answer, a permission to give, the Remote Control status box) holds every key and
 every queued message until someone presses one. A session behind one looks idle from outside, and two sat that way for
 hours. `pane-keys` stops a session opening one by typing a slash command; this is the net under it for the rest.
+The same net catches the other way a session sits unseen: Claude Code gave up on a transient API error (overloaded,
+500, dropped connection, timeout) and stopped at its prompt.
 
 Each run (a timer fires it every minute; see ws.roles.systemd and ws.roles.launchd) reads the last 20 lines of every pane
 on the live tmux server and looks for a dialog's footer (`DIALOG_PATTERNS`: "Enter to select", "Esc to cancel", "Esc to
@@ -20,6 +22,12 @@ What it does about one, in full.
   * After `after_minutes` on the same dialog it sends ONE push for that episode through the notify role (the alert cap
     applies; a push that failed is tried again next run), naming the window, its `@id`, how long it has been up and the
     dialog's first meaningful line. The episode ends when the dialog goes, and the next one is a new push.
+  * A session idle at its input prompt with an API error just above it (`API_ERROR_PATTERNS`, the texts Claude Code prints
+    when it stops) for `after_minutes` gets ONE push for that episode the same way, and an `api-error-stuck` line in the
+    alerts log. Nothing is typed into it: a retry is Claude Code's own (set `CLAUDE_CODE_RETRY_WATCHDOG=1` for
+    unattended sessions), and this only tells the person about the one still stopped after that. A pane that shows a
+    spinner, "esc to interrupt" or a retry countdown is working, not stopped, and a dialog in the same pane is reported
+    as the dialog.
   * The only key it ever sends is `Escape`, and only to a pane that shows the Remote Control status dialog (all of "Remote
     Control", "Disconnect this session" and "Esc to continue" present), once the dialog has been up a minute and is read
     again just before. Esc there only closes the box. It logs that (a line in `<state>/logs/alerts.jsonl`) and pushes once. It never
@@ -57,6 +65,20 @@ DIALOG_PATTERNS = (
     "Enter to confirm",
     "Do you want to proceed?",
 )
+# What Claude Code prints when it stops on a transient API error, from its error reference
+# (https://code.claude.com/docs/en/errors): "API Error: Repeated 529 Overloaded errors ...", "API Error: 500 Internal
+# server error ...", "Unable to connect to API ...", "Connection dropped (ECONNRESET)", "Request timed out ...". These
+# describe Claude Code only; the dialog patterns are the ones a profile can extend.
+API_ERROR_PATTERNS = (
+    "API Error:",
+    "Unable to connect to API",
+    "Connection dropped",
+    "Request timed out",
+)
+API_ERROR_LINES = 6  # the error is among this many lines with text just above the input box
+PROMPT_LINES = 6  # the input prompt is among the last this many lines with text (rule, status lines follow)
+WORKING_MARKERS = ("esc to interrupt", "retrying in")  # a session still working or still retrying is not stopped
+_SPINNER = re.compile(r"^[✻✢✳✶✽·*]\s.*…")  # a status line mid-turn: a glyph, text, an ellipsis
 REMOTE_CONTROL_PARTS = ("Remote Control", "Disconnect this session", "Esc to continue")
 TAIL_LINES = 20
 DEFAULT_AFTER_MINUTES = 10
@@ -90,6 +112,16 @@ class Dialog:
 
 
 @dataclass(frozen=True)
+class ApiError:
+    pattern: str  # the pattern of `API_ERROR_PATTERNS` that matched
+    first: str  # the error's line
+
+    @property
+    def fingerprint(self) -> str:
+        return hashlib.sha256(f"api\n{self.pattern}\n{self.first}".encode()).hexdigest()[:16]
+
+
+@dataclass(frozen=True)
 class Config:
     after_minutes: int = DEFAULT_AFTER_MINUTES
     patterns: tuple[str, ...] = DIALOG_PATTERNS
@@ -102,6 +134,7 @@ class Report:
     """What one run saw: each pane on a dialog, and what was done about it."""
 
     dialogs: list[dict] = field(default_factory=list)
+    api_errors: list[dict] = field(default_factory=list)
     pressed: list[str] = field(default_factory=list)
     pushed: list[str] = field(default_factory=list)
 
@@ -216,6 +249,41 @@ def find_dialog(lines: list[str], patterns: tuple[str, ...] = DIALOG_PATTERNS) -
     return Dialog(pattern, first[:LINE_MAX], rc)
 
 
+def _is_rule(line: str) -> bool:
+    """A horizontal rule, possibly with a label in it: the line starts with ten or more box-drawing dashes."""
+    return bool(re.match(r"^\s*[─━═]{10,}", line))
+
+
+def find_api_error(lines: list[str]) -> ApiError | None:
+    """The API error a session is stopped on, or None. Stopped means: Claude Code's idle input box (a prompt line `❯`, not
+    a numbered choice, with a rule line straight above it and one straight below) is among the last few lines with text, one of `API_ERROR_PATTERNS` begins a line among the `API_ERROR_LINES` lines with
+    text above the prompt's box (rules skipped), and nothing from there down says the session is working: no "esc to
+    interrupt", no retry countdown, no spinner line. A pattern in the middle of a line is prose about an error, not one."""
+    texted = [i for i, ln in enumerate(lines) if ln.strip()]
+    prompt = next(
+        (i for i in reversed(texted[-PROMPT_LINES:]) if re.match(r"^\s*[❯›](?!\s*\d+\.)", lines[i])),
+        None,
+    )
+    if prompt is None:
+        return None
+    k = texted.index(prompt)  # Claude Code's input box: a rule line straight above the prompt and one straight below
+    if k == 0 or k + 1 >= len(texted) or not all(_is_rule(lines[i]) for i in (texted[k - 1], texted[k + 1])):
+        return None  # a shell with a `❯` prompt is not Claude Code
+    above = [i for i in texted if i < prompt and not lines[i].lstrip().startswith(("─", "━", "═"))]
+    window = above[-API_ERROR_LINES:]
+    if not window:
+        return None
+    near = [lines[i].strip() for i in texted if i >= window[0]]
+    if any(m in ln.lower() for ln in near for m in WORKING_MARKERS) or any(_SPINNER.match(ln) for ln in near):
+        return None
+    for i in reversed(window):
+        text = re.sub(r"^[\W_]+", "", lines[i]).strip()
+        for pattern in API_ERROR_PATTERNS:
+            if text.lower().startswith(pattern.lower()):
+                return ApiError(pattern, text[:LINE_MAX])
+    return None
+
+
 def press_escape(run: tmux.Run, pane_id: str) -> bool:
     """Press Escape in one pane. The only key this module ever sends, and the only call that sends one."""
     code, _ = run(["send-keys", "-t", pane_id, "Escape"])
@@ -305,20 +373,30 @@ def run_once(
     for pane in panes:
         lines = tail(run, pane.pane_id)
         dialog = find_dialog(lines, cfg.patterns) if lines else None
-        if dialog is None:
+        stuck = find_api_error(lines) if lines and dialog is None else None  # a dialog is reported as the dialog
+        if dialog is None and stuck is None:
             continue
+        fp = dialog.fingerprint if dialog is not None else stuck.fingerprint
         old = before.get(pane.pane_id, {})
-        same = old.get("fp") == dialog.fingerprint and isinstance(old.get("first_seen"), (int, float))
-        entry = {**old} if same else {"first_seen": now, "fp": dialog.fingerprint}
+        same = old.get("fp") == fp and isinstance(old.get("first_seen"), (int, float))
+        entry = {**old} if same else {"first_seen": now, "fp": fp}
         entry.update(window=pane.window, window_id=pane.window_id)
         age = now - entry["first_seen"]
         after[pane.pane_id] = entry
         label = f"{pane.window} ({pane.window_id})"
         quotable = cfg.show_text and text_allowed(policy_of(e), pane.path)
         shown = {"pane": pane.pane_id, "window": pane.window, "window_id": pane.window_id, "minutes": _minutes(age)}
-        report.dialogs.append({**shown, "remote_control": dialog.remote_control, "first": dialog.first})
+        if dialog is not None:
+            report.dialogs.append({**shown, "remote_control": dialog.remote_control, "first": dialog.first})
+        else:
+            report.api_errors.append({**shown, "first": stuck.first})
 
-        if dialog.remote_control and not entry.get("escaped") and age >= ESCAPE_AFTER_S - SLACK_S:
+        if (
+            dialog is not None
+            and dialog.remote_control
+            and not entry.get("escaped")
+            and age >= ESCAPE_AFTER_S - SLACK_S
+        ):
             again = tail(run, pane.pane_id)
             still = find_dialog(again, cfg.patterns) if again else None
             if still is not None and still.remote_control and press_escape(run, pane.pane_id):
@@ -333,10 +411,15 @@ def run_once(
                 )
                 _log(e, {"event": "escape-sent", **shown, "pushed": sent is True})
         if age >= cfg.after_minutes * 60 - SLACK_S and not entry.get("pushed"):
-            quote = f": {dialog.first}" if quotable and dialog.first else ""
-            text = f"{label} has been on a dialog for {_minutes(age)} min{quote}"
-            sent = jobwatch.push(e, text, "a session has been on a dialog for a while", sender, title="ws panes")
-            _log(e, {"event": "dialog-stuck", **shown, "pushed": sent is True})
+            if dialog is not None:
+                quote = f": {dialog.first}" if quotable and dialog.first else ""
+                text = f"{label} has been on a dialog for {_minutes(age)} min{quote}"
+                summary, event = "a session has been on a dialog for a while", "dialog-stuck"
+            else:
+                text = f"{label} stopped on an API error for {_minutes(age)} min"
+                summary, event = "a session stopped on an API error", "api-error-stuck"
+            sent = jobwatch.push(e, text, summary, sender, title="ws panes")
+            _log(e, {"event": event, **shown, "pushed": sent is True})
             if sent is not False:  # a failed send is tried again next run; no notify role is not retried
                 entry["pushed"] = True
                 report.pushed.append(pane.pane_id)
@@ -360,15 +443,26 @@ def cmd_panes(args: argparse.Namespace) -> int:
     for d in report.dialogs:
         did = " (Esc pressed)" if d["pane"] in report.pressed else " (pushed)" if d["pane"] in report.pushed else ""
         print(f"ws: {d['window']} ({d['window_id']}) on a dialog for {d['minutes']} min{did}")
+    for d in report.api_errors:
+        did = " (pushed)" if d["pane"] in report.pushed else ""
+        print(f"ws: {d['window']} ({d['window_id']}) stopped on an API error for {d['minutes']} min{did}")
     if getattr(args, "json", False):
-        output.result({"dialogs": report.dialogs, "pressed": report.pressed, "pushed": report.pushed})
+        output.result(
+            {
+                "dialogs": report.dialogs,
+                "api_errors": report.api_errors,
+                "pressed": report.pressed,
+                "pushed": report.pushed,
+            }
+        )
     return 0
 
 
 def register(ws: argparse._SubParsersAction) -> None:
     """The `panes` sub-command of `ws watch` (jobwatch.register calls this)."""
     p = ws.add_parser(
-        "panes", help="push when a tmux pane has sat on a dialog for minutes; press Esc only on the Remote Control box"
+        "panes",
+        help="push when a tmux pane sat on a dialog or stopped on an API error for minutes; Esc only on the Remote Control box",
     )
     p.add_argument(
         "--after-minutes",

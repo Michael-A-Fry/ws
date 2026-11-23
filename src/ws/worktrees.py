@@ -240,17 +240,20 @@ def _readlink(path: str) -> str | None:
         return None
 
 
-def in_root_namespaces(readlink=_readlink) -> bool:
+def in_root_namespaces(readlink=None) -> bool:
     """Is this process in the machine's own PID and user namespaces? A sandbox or container (bwrap, `unshare --pid`,
     nspawn, LXC, Docker) has its own pid 1 and a short /proc, so every process outside it is invisible. On Linux both
     namespace links must name the kernel's first namespaces. Where there is no /proc (macOS), say yes: `ps` there lists
-    every process."""
+    every process. Known limits: under WSL2 each distro runs in its own PID namespace, so prune keeps everything there;
+    a container sharing the host's PID and user namespaces but not its mounts isn't detected (pid 1's links can't be
+    read by a normal user)."""
+    readlink = readlink or _readlink  # looked up now, not at definition, so a test can patch the module's reader
     if not Path("/proc/self").exists():
         return True
     return readlink("/proc/self/ns/pid") == ROOT_PID_NS and readlink("/proc/self/ns/user") == ROOT_USER_NS
 
 
-def sees_own_parents(ppid: dict[int, int], me: int | None = None, readlink=_readlink) -> bool:
+def sees_own_parents(ppid: dict[int, int], me: int | None = None, readlink=None) -> bool:
     """Does the process list show this process and every parent above it, up to init? A caller in its own PID namespace,
     or on a /proc mounted `hidepid`, sees only part of the tree, and then "nothing is using this folder" can't be said."""
     if not in_root_namespaces(readlink):

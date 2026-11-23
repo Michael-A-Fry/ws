@@ -361,6 +361,16 @@ def test_a_process_list_that_hides_the_callers_parents_keeps_every_worktree(repo
 
 
 @needs_git
+def test_a_caller_in_a_sandbox_keeps_every_worktree(repo, monkeypatch):
+    wt = add(repo, "idle")
+    sandbox = {"/proc/self/ns/pid": "pid:[4026532999]", "/proc/self/ns/user": "user:[4026531837]"}.get
+    with monkeypatch.context() as m:
+        m.setattr(worktrees, "_readlink", sandbox)  # the module's reader, as prune uses it
+        assert reasons(prune(repo)) == {"idle": "busy-unknown"} and wt.exists()
+    assert reasons(prune(repo)) == {"idle": "removed"}
+
+
+@needs_git
 def test_a_worktree_git_refuses_keeps_its_modes(repo):
     wt = add(repo, "untracked")
     cache = wt / "cache"

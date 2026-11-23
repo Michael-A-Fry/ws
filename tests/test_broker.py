@@ -121,8 +121,8 @@ class StubHandler(BaseHTTPRequestHandler):
             self._chunk(self.path[half:].encode() + b'"}')
             self.wfile.write(b"0\r\n\r\n")
             return
-        if "/echo-part" in self.path:  # all but the last 3 characters of the path: a truncating error message
-            out = self.path[:-3].encode()
+        if "/echo-part" in self.path:  # "/bot" and 20 characters of what follows: an error message that truncates
+            out = self.path[:24].encode()
             self.send_response(404)
             self.send_header("Content-Length", str(len(out)))
             self.end_headers()
@@ -1799,8 +1799,8 @@ def test_a_long_value_is_caught_by_any_window_of_it(env):
     long_value = "1234567890:" + "AbC-dEf_GhI" * 3
     _token_registry(env)
     env.store.write("tg", long_value)
-    _r, got = _raw_get(env.lease(name="tg"), "/echo-part")
-    assert long_value[5:21].encode() not in got
+    _r, got = _raw_get(env.lease(name="tg"), "/echo-part")  # echoes 20 of its 44 characters, never the whole value
+    assert got == b""  # the 24-byte reply holds a 16-character piece, so none of it is sent
     assert _audit_has(env, "secret_in_reply")
     status, _, data = env.call("/getMe", lease=env.lease(name="tg"))
     assert status == 200 and json.loads(data) == {"ok": True, "len": 0}  # a clean reply still flows

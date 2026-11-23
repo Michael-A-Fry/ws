@@ -93,6 +93,8 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setenv("WS_HOME", str(tmp_path / "wshome"))
     monkeypatch.delenv("WS_GATED_SESSION", raising=False)
+    monkeypatch.setattr(wsecrets, "WALL_HOME", str(tmp_path / "no-wall"))  # a walled host must not change these tests
+    monkeypatch.setattr(wsecrets, "WALL_SOCKET", str(tmp_path / "no-wall-run" / "broker.sock"))
     store = wsecrets.Store(tmp_path / "secrets")
     return tmp_path, store
 
@@ -277,7 +279,7 @@ def test_the_wall_case_writes_nothing_and_prints_the_block_and_the_install_line(
         got = tomllib.loads(FLOW.registry_block())["TELEGRAM_BOT_TOKEN"][key]
         assert got == list(want) if isinstance(want, tuple) else got == want
     assert (
-        f"sudo install -o root -g root -m 0644 {tmp / 'secrets.toml'} /var/lib/ws-broker/secrets.toml" in e.value.hint
+        f"sudo install -o root -g root -m 0644 {tmp / 'secrets.toml'} {wsecrets.WALL_HOME}/secrets.toml" in e.value.hint
     )
     assert not (tmp / "secrets.toml").exists() and store.names() == []
     assert not (tmp / "state" / "connect").exists()

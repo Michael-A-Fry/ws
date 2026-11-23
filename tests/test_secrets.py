@@ -985,10 +985,14 @@ def test_remove_block_leaves_a_block_that_gained_a_key_below_it(tmp_path):
     reg = _folder(tmp_path)
     reg.write_text('[a]\nhosts = ["x.example.com"]\n')
     wsecrets.append_entry(reg, BLOCK)
-    reg.write_text(reg.read_text() + 'tier = "lead-elevated"\n')  # the person scoped it by hand
+    base = reg.read_text()
+    for added in ('tier = "lead-elevated"\n', '\n# scoped by hand\ntier = "lead-elevated"\n'):
+        reg.write_text(base + added)  # the person scoped it by hand
+        before = reg.read_text()
+        assert wsecrets.remove_block(reg, BLOCK) is False, added
+        assert reg.read_text() == before and wsecrets.load_registry(reg)["a"].tier is None
+    reg.write_text(base + 'tier = "lead-elevated"\n')
     before = reg.read_text()
-    assert wsecrets.remove_block(reg, BLOCK) is False
-    assert reg.read_text() == before and wsecrets.load_registry(reg)["a"].tier is None
     reg.write_text(before.replace('tier = "lead-elevated"\n', '\n# a note\n[b]\nhosts = ["y.example.com"]\n'))
     assert wsecrets.remove_block(reg, BLOCK) is True  # a new table or comment after it is not part of it
     assert set(wsecrets.load_registry(reg)) == {"a", "b"}

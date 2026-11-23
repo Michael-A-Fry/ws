@@ -509,8 +509,8 @@ def remove_block(path: Path, block: str) -> bool:
         if at < 0:
             return None
         rest = old[at + len(block) :]
-        nxt = next((ln.strip() for ln in rest.splitlines() if ln.strip()), "")
-        if nxt and not nxt.startswith(("[", "#")):
+        nxt = next((ln.strip() for ln in rest.splitlines() if ln.strip() and not ln.strip().startswith("#")), "")
+        if nxt and not nxt.startswith("["):
             return None  # a key was added under the block: it belongs to the entry, so the entry was changed
         return (old[:at].rstrip("\n") + "\n" if old[:at].strip() else "") + rest
 

@@ -227,3 +227,10 @@ def test_the_lease_never_goes_through_a_proxy_from_the_environment(tmp_path, api
         [sys.executable, "-c", code, api.base], check=False, env=env, capture_output=True, text=True, timeout=30
     )
     assert out.returncode == 0 and out.stdout.strip() == "200" and len(api.requests) == 1
+
+
+def test_a_lease_with_no_header_name_sends_nothing(tmp_path, api):
+    """C828: a path-token lease (Telegram's) has header ""; triage must not build a request with an empty header."""
+    m, _, released = direct(tmp_path, api, lease=lambda s: triage.broker.Lease("L1", api.base, "", ""))
+    got = m("i", "d", 0.05)
+    assert not got.ok and "no header name" in got.error and api.requests == [] and len(released) == 1

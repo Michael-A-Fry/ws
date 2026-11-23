@@ -530,3 +530,134 @@ def test_a_full_class_still_honours_show_text_false(env, tmp_path):
     watch(env, t, 0.0, s)
     watch(env, t, 11 * MIN, s)
     assert len(s.sent) == 1 and "Which approach" not in s.sent[0]
+
+
+# --- a session stopped on an API error ---------------------------------------------------------------------------------
+
+
+def idle(*above: str, prompt: str = "❯ ") -> str:
+    """An idle Claude Code screen: text, the box's top rule (labelled), the empty prompt, the rule, two status lines. The
+    layout is a captured real pane with every word replaced by a placeholder."""
+    rule = "─" * 70 + " name ─"
+    status = ["  model · ctx 10% · cost 1", "  ⏵⏵ mode on (shift+tab to cycle)"]
+    return "\n".join([*above, rule, prompt, "─" * 80, *status, ""])
+
+
+API_ERRORS = {
+    "overloaded": "  ⎿  API Error: Repeated 529 Overloaded errors. The API is at capacity.",
+    "server": "  ⎿  API Error: 500 Internal server error. This is a server-side issue.",
+    "connect": "  ⎿  Unable to connect to API. Check your internet connection",
+    "dropped": "  ⎿  Connection dropped (ECONNRESET)",
+    "timeout": "  ⎿  Request timed out. Check your internet connection and proxy settings",
+}
+
+
+@pytest.mark.parametrize("form", API_ERRORS)
+def test_an_idle_pane_on_an_api_error_gets_one_push_after_ten_minutes_and_no_key(env, form):
+    profile(env)
+    t, s = Tmux(), Sender()
+    t.add("%3", "@7", "ws-work", idle("  some output", API_ERRORS[form], "✻ Worked for 1m 2s", ""))
+    start = 2_000_000.0
+    for minutes in (0, 1, 5, 9):
+        assert watch(env, t, start + minutes * MIN, s).pushed == []
+    assert s.sent == []
+    report = watch(env, t, start + 10 * MIN, s)
+    assert report.pushed == ["%3"] and report.dialogs == [] and len(report.api_errors) == 1
+    assert len(s.sent) == 1 and "ws-work" in s.sent[0] and "stopped on an API error for 10 min" in s.sent[0]
+    for minutes in (11, 60):  # still there: no second push
+        watch(env, t, start + minutes * MIN, s)
+    assert len(s.sent) == 1 and t.keys() == []
+    event = json.loads(jobwatch.alerts_path(env).read_text().splitlines()[0])
+    assert event["event"] == "api-error-stuck" and event["pane"] == "%3" and event["pushed"] is True
+
+
+def test_a_new_error_after_the_old_one_went_is_a_new_episode(env):
+    profile(env)
+    t, s = Tmux(), Sender()
+    t.add("%3", "@7", "ws-work", idle(API_ERRORS["server"]))
+    start = 3_000_000.0
+    watch(env, t, start, s)
+    watch(env, t, start + 10 * MIN, s)
+    t.screens["%3"] = idle("  all fine now")
+    watch(env, t, start + 11 * MIN, s)
+    assert panewatch.read_state(env) == {}
+    t.screens["%3"] = idle(API_ERRORS["overloaded"])
+    watch(env, t, start + 12 * MIN, s)
+    watch(env, t, start + 22 * MIN, s)
+    assert len(s.sent) == 2
+
+
+@pytest.mark.parametrize(
+    "screen",
+    [
+        # printed the error, then carried on: a spinner, "esc to interrupt", a retry countdown
+        idle(API_ERRORS["server"], "✻ Cooking… (12s · esc to interrupt)"),
+        idle(API_ERRORS["server"], "✢ Cooking… (3s)"),
+        idle(API_ERRORS["server"], "  Retrying in 5 seconds… (attempt 2/10)"),
+        # the error is far above the prompt, under later output
+        idle(API_ERRORS["server"], *[f"  line {n}" for n in range(8)]),
+        # the words in the middle of a sentence are prose, not an error
+        idle("  The docs say the text API Error: 500 appears when the server fails."),
+        # no input prompt: not an idle Claude Code pane
+        "\n".join([API_ERRORS["server"], "$ "]),
+        # the prompt is a numbered choice, not the input box
+        "\n".join([API_ERRORS["server"], "  ❯ 1. Yes", "    2. No"]),
+    ],
+)
+def test_a_pane_that_is_still_working_or_only_quotes_an_error_is_not_reported(env, screen):
+    profile(env)
+    t, s = Tmux(), Sender()
+    t.add("%3", "@7", "ws-work", screen)
+    start = 4_000_000.0
+    for minutes in (0, 10, 60):
+        report = watch(env, t, start + minutes * MIN, s)
+        assert report.api_errors == [] and report.pushed == []
+    assert s.sent == [] and t.keys() == [] and panewatch.read_state(env) == {}
+
+
+def test_a_dialog_and_an_api_error_in_one_tail_report_once_as_the_dialog(env):
+    profile(env)
+    t, s = Tmux(), Sender()
+    t.add("%3", "@7", "ws-work", API_ERRORS["server"] + "\n" + ASK)
+    start = 5_000_000.0
+    watch(env, t, start, s)
+    report = watch(env, t, start + 10 * MIN, s)
+    assert report.api_errors == [] and len(report.dialogs) == 1 and len(s.sent) == 1
+    assert "on a dialog" in s.sent[0] and "API" not in s.sent[0]
+    assert t.keys() == []
+
+
+def test_a_dialog_replacing_an_api_error_is_a_new_episode(env):
+    profile(env)
+    t, s = Tmux(), Sender()
+    t.add("%3", "@7", "ws-work", idle(API_ERRORS["server"]))
+    start = 6_000_000.0
+    watch(env, t, start, s)
+    t.screens["%3"] = ASK
+    watch(env, t, start + 5 * MIN, s)
+    assert watch(env, t, start + 12 * MIN, s).pushed == []  # the dialog's clock began at minute 5
+    assert len(watch(env, t, start + 15 * MIN, s).pushed) == 1
+
+
+def test_a_failed_send_for_an_api_error_is_tried_again(env):
+    profile(env)
+    t, s = Tmux(), Sender(status=500)
+    t.add("%3", "@7", "ws-work", idle(API_ERRORS["dropped"]))
+    start = 7_500_000.0
+    watch(env, t, start, s)
+    assert watch(env, t, start + 10 * MIN, s).pushed == []
+    s.status = 200
+    (paths.state_dir(env) / ntfy.LAST_FILE).unlink()  # ntfy pauses alerts for 5 minutes after a failed send
+    assert watch(env, t, start + 11 * MIN, s).pushed == ["%3"]
+
+
+def test_the_command_reports_an_api_error_and_exits_zero(env, monkeypatch, capsys):
+    profile(env)
+    t = Tmux()
+    t.add("%3", "@7", "ws-work", idle(API_ERRORS["timeout"]))
+    monkeypatch.setattr(panewatch.shutil, "which", lambda name, *a, **k: "/usr/bin/tmux")
+    monkeypatch.setattr(panewatch.tmux, "runner", lambda prefix=None, env=None: t)
+    assert cli.main(["watch", "panes"]) == 0
+    assert "ws-work (@7) stopped on an API error for 1 min" in capsys.readouterr().out
+    assert cli.main(["--json", "watch", "panes"]) == 0
+    assert json.loads(capsys.readouterr().out)["data"]["api_errors"][0]["window"] == "ws-work"

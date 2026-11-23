@@ -1590,7 +1590,7 @@ ws watch alert UNIT          what a failed unit's OnFailure= runs: one line in l
 ws watch deadman             one alert for each job with no run record in twice its expected rate
 ws watch rotate JOB          rotate the job's log file when it is over the cap
 ws watch dropin UNIT... --out DIR   OnFailure= drop-ins for units ws did not write
-ws watch panes [--after-minutes N]  push when a tmux pane has sat on a dialog; Esc only on the Remote Control box
+ws watch panes [--after-minutes N]  push when a pane sat on a dialog or stopped on an API error; Esc only on Remote Control
 ```
 
 ### `ws watch panes`
@@ -1601,6 +1601,14 @@ server and looks for a dialog's footer: `Enter to select`, `Esc to cancel`, `Esc
 `Do you want to proceed?`. A dialog that has stayed the same for `after_minutes` (default 10) gets one push for that
 episode through the notify role (the alert cap applies), naming the window, its `@id`, how long it has been up and the
 dialog's first line. The episode ends when the dialog goes.
+
+It also catches a Claude Code session that stopped at its input prompt after an API error it gave up on (a line
+beginning `API Error:`, `Unable to connect to API`, `Connection dropped` or `Request timed out`, the texts on Claude Code's
+[error reference](https://code.claude.com/docs/en/errors), within a few lines above the prompt). One that shows a spinner,
+`esc to interrupt` or a retry countdown is still working and isn't reported. After `after_minutes` on the same error it
+gets one push (`<window> stopped on an API error for N min`) and an `api-error-stuck` line in `logs/alerts.jsonl`. It
+types nothing into the pane. The retry is Claude Code's own: for sessions nobody is watching, set
+`CLAUDE_CODE_RETRY_WATCHDOG=1` so it keeps retrying overloaded and transient errors before it ever stops.
 
 The only key it ever sends is `Escape`, to a pane showing the Remote Control status box (it holds Remote Control,
 Disconnect this session and Esc to continue) once it has been up a minute; it logs that to `logs/alerts.jsonl` and

@@ -1824,3 +1824,26 @@ def test_a_stream_through_a_path_token_lease_arrives_whole(env):
     env.stub.go.set()  # the last bytes of each read wait for the next one, so the stream ends before it is read whole
     assert r.read() == b"data: one\n\ndata: two\n\n"
     c.close()
+
+
+def test_a_lease_reaches_only_the_paths_bound_to_its_purpose(env):
+    """C828: a notify lease can't press the bridge's card buttons."""
+    _token_registry(
+        env,
+        'purposes = ["notify", "bridge"]\npaths = ["/getMe", "/sendMessage", "/answerCallbackQuery"]\n'
+        'purpose_paths = ["notify:/sendMessage", "bridge:/sendMessage", "bridge:/answerCallbackQuery"]',
+    )
+    notify, bridge = env.lease(name="tg", purpose="notify"), env.lease(name="tg", purpose="bridge")
+    seen = len(env.stub.seen)
+    assert env.call("/answerCallbackQuery", lease=notify)[0] == 403
+    assert env.call("/getMe", lease=notify)[0] == 403  # in paths, but not bound to notify
+    assert len(env.stub.seen) == seen
+    assert env.call("/sendMessage", lease=notify)[0] == 200
+    assert env.call("/answerCallbackQuery", lease=bridge)[0] == 200
+
+
+def test_a_purpose_with_no_bound_paths_reaches_nothing(env):
+    _token_registry(env, 'purposes = ["notify", "bridge", "other"]\npurpose_paths = ["notify:/sendMessage"]')
+    seen = len(env.stub.seen)
+    assert env.call("/sendMessage", lease=env.lease(name="tg", purpose="other"))[0] == 403
+    assert len(env.stub.seen) == seen

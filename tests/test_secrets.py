@@ -1016,3 +1016,11 @@ def test_entry_block_uses_the_brokers_rules_and_refuses_quotes():
     for bad in ({"hosts": ['a"b']}, {"hosts": ["a/b"]}, {"hosts": ["x.com"], "base_path": "/a{value}/b"}, {"hosts": 5}):
         with pytest.raises(wsecrets.SecretsError):
             wsecrets.entry_block("tg", bad)
+
+
+@pytest.mark.parametrize("rows", ['["spy:/getMe"]', '["notify:getMe"]', '["notify:/a/../b"]', "[]", '["/getMe"]'])
+def test_purpose_paths_rows_must_name_a_purpose_and_a_path_prefix(tmp_path, rows):
+    f = tmp_path / "secrets.toml"
+    f.write_text(f'[tg]\nhosts = ["api.telegram.org"]\npurposes = ["notify"]\npurpose_paths = {rows}\n')
+    with pytest.raises(wsecrets.SecretsError, match="purpose_paths"):
+        wsecrets.load_registry(f)

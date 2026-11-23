@@ -821,6 +821,8 @@ class DirectModel:
         u = urllib.parse.urlsplit(lease.base_url)
         if u.scheme != "http" or u.hostname not in _LOOPBACK:
             return Reply(ok=False, error="the broker's lease was not a loopback address, so nothing was sent")
+        if not lease.header:  # a path-token lease (base_path ends in {value}) carries no header name (C828)
+            return Reply(ok=False, error="the broker's lease has no header name, so nothing was sent")
         req = urllib.request.Request(
             lease.base_url.rstrip("/") + "/v1/messages", data=body, method="POST",
             headers={lease.header: claude_code.PLACEHOLDER_KEY, "anthropic-version": API_VERSION,

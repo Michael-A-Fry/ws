@@ -1132,3 +1132,34 @@ def test_a_reply_with_no_draft_says_why(tmp_path):
         Model(reply(True, "asks for a quote", "Kia ora Sam,\nSure, Friday 18 December works. Cheers, Alex")),
     )
     assert "“Quote”: asks for a quote. No draft. (the draft was not kept: names a date" in summary(tmp_path)
+
+
+def test_a_uidvalidity_that_flaps_between_runs_keeps_handled_and_never_drafts_a_thread_twice(tmp_path):
+    """C832: live, one thread got a draft on 6 runs; each run logged uidvalidity_changed and he deleted the drafts."""
+    r, m = Route(), Model(*[DRAFTING] * 8)
+    r.add(1, thread_msg(1, "<t1@example.org>"))
+    go(tmp_path, r, m)
+    for i in range(6):
+        r.uv = 8 if i % 2 == 0 else 7  # flaps every run
+        r.in_drafts.clear()  # he deleted the draft; headers cannot show it either
+        rec = go(tmp_path, r, m, now=NOW.replace(hour=6 + i))
+        assert {"mailbox": "a", "kind": "uidvalidity_changed"} in rec["notes"]
+    assert len(r.drafts) == 1 and len(m.calls) == 1
+    state = json.loads((tmp_path / "state" / "inbox.json").read_text())
+    assert "<t1@example.org>" in state["mailboxes"]["a"]["handled"]
+    assert state["mailboxes"]["a"]["drafted"] == ["<t1@example.org>|<t1@example.org>"]
+
+
+def test_a_deleted_draft_is_not_made_again_even_when_the_handled_key_is_gone(tmp_path):
+    """C832: `drafted` is the thread's own memory, apart from `handled` (a changed newest message or a lost list)."""
+    r, m = Route(), Model(DRAFTING, DRAFTING)
+    r.add(1, thread_msg(1, "<t1@example.org>"))
+    go(tmp_path, r, m)
+    f = tmp_path / "state" / "inbox.json"
+    s = json.loads(f.read_text())
+    del s["mailboxes"]["a"]["handled"]
+    s["mailboxes"]["a"]["uidvalidity"] = 99  # flapped
+    f.write_text(json.dumps(s))
+    r.in_drafts.clear()  # he deleted it
+    rec = go(tmp_path, r, m, now=NOW.replace(hour=6))
+    assert len(r.drafts) == 1 and {"mailbox": "a", "kind": "already_drafted_before"} in rec["notes"]

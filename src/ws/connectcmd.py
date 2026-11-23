@@ -62,10 +62,18 @@ def _context(*, with_io: bool = False) -> engine.Context:
     return engine.Context(
         state_dir=paths.state_dir(),
         store=store,
-        registered=frozenset(reg),
+        registry=reg,
         registry_path=str(wsecrets.registry_path()),
+        walled=walled(),
         io=Terminal() if with_io else None,
     )
+
+
+def walled() -> bool:
+    """A walled broker is set up here: its home or its socket's folder exists. Only root can add a name then. The
+    folders are checked, not the files in them: they are closed to a normal user (0700, 0750), where a check of the file
+    would fail or always say no."""
+    return any(os.path.lexists(p) for p in (wsecrets.WALL_HOME, os.path.dirname(wsecrets.WALL_SOCKET)))
 
 
 def _flow(flow_id: str) -> spec.Flow:
@@ -121,6 +129,8 @@ def cmd_connect(args) -> int:
             else:
                 for r in data["steps"]:
                     print(f"{r['status']:<12} {r['id']:<16} {r.get('action', '')}")
+                    if r["type"] == "register":
+                        print(r["text"])
                 for b in data.get("blockers", []):
                     print(f"blocked: {b['kind']}\n{b['action']}")
             return data["exit_code"]

@@ -11,6 +11,12 @@ Who runs what. `walk` and `revoke` run only in the person's own terminal (the co
 the agent contract (`SCHEMA_VERSION`, frozen): each step is `done` or `needs_human` with an `action`; the process exit is 0
 when every step is done and 3 when a person has something to do. Not built in this phase: device-code polling (RFC 8628),
 a server-side callback, re-authorising an existing connection, and QR codes.
+
+The registry. A flow's `[secret]` block is the only source of its registry entry. When the name isn't registered, the
+walk shows the entry and ws adds it on the person's yes (ADR 0034; `ws.secrets.append_entry`, the one registry writer),
+and the state records that it did (`registry_added`), so `--revoke` takes out that block and no other. A name already
+registered with other hosts or scope is refused with what differs. Under a walled broker ws writes nothing and prints
+the block and the `sudo install` line.
 """
 
 from __future__ import annotations
@@ -24,13 +30,14 @@ import time
 import urllib.error
 import urllib.request
 import webbrowser
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import quote, urlsplit
 
+from ws import secrets as wsecrets
 from ws.connect.spec import Flow
 from ws.secrets import SecretsError
 
@@ -97,8 +104,9 @@ class StoreLike(Protocol):
 class Context:
     state_dir: Path
     store: StoreLike | None = None
-    registered: frozenset[str] = frozenset()
+    registry: Mapping[str, wsecrets.Entry] = field(default_factory=dict)  # the entries, not just the names
     registry_path: str = ""
+    walled: bool = False  # a walled broker reads a root-owned registry: ws writes nothing and prints the steps
     transport: Transport = field(default_factory=UrlTransport)
     io: Io | None = None
     now: Callable[[], float] = time.time
@@ -224,12 +232,31 @@ def _step_done(ctx: Context, flow: Flow, st: dict, i: int, now: float) -> bool:
 
 
 def _registered(ctx: Context, flow: Flow) -> bool:
-    return flow.secret_name is None or flow.secret_name in ctx.registered
+    return flow.secret_name is None or flow.secret_name in ctx.registry
 
 
-def registry_step(ctx: Context, flow: Flow) -> str:
-    hosts = ", ".join(f'"{h}"' for h in flow.secret_hosts)
-    return f"add this to {ctx.registry_path or 'your secrets registry'}:\n[{flow.secret_name}]\nhosts = [{hosts}]"
+def registry_differences(ctx: Context, flow: Flow) -> list[str]:
+    """How the entry already under the flow's secret name differs from the flow's own (empty: none, or no entry)."""
+    entry = ctx.registry.get(flow.secret_name or "")
+    return [] if entry is None else wsecrets.entry_differences(entry, flow.registry_block())
+
+
+def wall_steps(ctx: Context, flow: Flow) -> str:
+    """What the person does by hand when a walled broker reads a root-owned copy of the registry."""
+    reg = ctx.registry_path or str(wsecrets.registry_path())
+    return (
+        f"add this to {reg}:\n{flow.registry_block()}\nthen copy it to the walled broker:\n"
+        f"sudo install -o root -g root -m 0644 {reg} {wsecrets.WALL_HOME}/secrets.toml"
+    )
+
+
+def _differs_error(ctx: Context, flow: Flow, diffs: list[str]) -> ConnectError:
+    return ConnectError(
+        "registered_differently",
+        f"{flow.secret_name} is already in the secrets registry with other settings, so ws leaves it alone",
+        "\n".join(diffs)
+        + f"\nchange or remove [{flow.secret_name}] in {ctx.registry_path or 'the registry'}, then run this again",
+    )
 
 
 # ---- the agent contract ----------------------------------------------------------------------------------------------
@@ -243,9 +270,22 @@ def dry_run(ctx: Context, flow: Flow) -> dict:
     st = load_state(ctx, flow)
     now = ctx.now()
     vals = _values(flow, st)
-    steps, blockers = [], []
-    if not _registered(ctx, flow):
-        blockers.append({"kind": "secret_not_registered", "name": flow.secret_name, "action": registry_step(ctx, flow)})
+    steps: list[dict[str, Any]] = []
+    blockers: list[dict[str, Any]] = []
+    if not _registered(ctx, flow):  # ws adds the entry on the person's yes (ADR 0034): a step, not a blocker
+        steps.append(
+            {
+                "id": "register-secret",
+                "type": "register",
+                "status": "needs_human",
+                "action": "confirm_register",
+                "title": f"Let ws add {flow.secret_name} to the secrets registry",
+                "text": wall_steps(ctx, flow) if ctx.walled else flow.registry_block(),
+                "walled": ctx.walled,
+            }
+        )
+    elif diffs := registry_differences(ctx, flow):
+        blockers.append({"kind": "secret_registered_differently", "name": flow.secret_name, "action": "\n".join(diffs)})
     for i, s in enumerate(flow.steps):
         done = _step_done(ctx, flow, st, i, now)
         row: dict[str, Any] = {"id": s["id"], "type": s["type"], "status": "done" if done else "needs_human"}
@@ -378,19 +418,17 @@ def walk(ctx: Context, flow: Flow) -> dict:
     Raises ConnectError for a secret that is not registered, a verify that fails (nothing stored) or a bad value."""
     io = ctx.io
     assert io is not None
-    if not _registered(ctx, flow):
-        raise ConnectError(
-            "not_registered",
-            f"{flow.secret_name} is not in the secrets registry",
-            registry_step(ctx, flow) + "\nthen run this again (ws never edits the registry for you)",
-        )
     if flow.secret_name and ctx.store is None:
         raise ConnectError(
             "store",
             "the secrets store can't be opened for writing here",
             "this profile keeps secrets elsewhere (OpenBao): write the value there; ws connect needs the local store",
         )
+    if diffs := registry_differences(ctx, flow):
+        raise _differs_error(ctx, flow, diffs)
     st = load_state(ctx, flow)
+    if not _registered(ctx, flow):
+        _register(ctx, flow, st)
     io.say(flow.title)
     i = 0
     while i < len(flow.steps):
@@ -432,6 +470,48 @@ def walk(ctx: Context, flow: Flow) -> dict:
     save_state(ctx, flow, st)
     io.say(f"\nConnected: {st['config'].get('identity', flow.id)}")
     return {"status": "done", "flow": flow.id, "identity": st["config"].get("identity")}
+
+
+def _register(ctx: Context, flow: Flow, st: dict) -> None:
+    """Add the flow's own entry to the registry on the person's yes, and record that ws added it, so `--revoke` takes
+    out that entry and no other. Walled: write nothing, print the steps and stop."""
+    io = ctx.io
+    assert io is not None and flow.secret_name
+    if ctx.walled:
+        raise ConnectError(
+            "walled",
+            f"{flow.secret_name} is not in the walled broker's registry, and only root can add it",
+            wall_steps(ctx, flow),
+        )
+    block = flow.registry_block()
+    reg = Path(ctx.registry_path) if ctx.registry_path else wsecrets.registry_path()
+    io.say(f"\n{flow.secret_name} is not in the secrets registry yet. ws will add this to {reg}:\n\n{block}")
+    if io.ask("Add it? (y/N)").strip().lower() not in ("y", "yes"):
+        raise ConnectError(
+            "not_registered",
+            f"{flow.secret_name} is not in the secrets registry",
+            "nothing was changed; run this again to add it",
+        )
+    try:
+        backed_up = wsecrets.append_entry(reg, block)
+    except SecretsError as e:
+        raise ConnectError(
+            "registry", f"ws couldn't add {flow.secret_name} to the registry: {e}", "nothing was changed"
+        ) from None
+    st["registry_added"] = block  # provenance, as secret_stored: --revoke takes out exactly this block
+    try:
+        save_state(ctx, flow, st)
+    except OSError as e:  # no record means --revoke could never take it out again: undo the append
+        st.pop("registry_added", None)
+        try:
+            wsecrets.remove_block(reg, block)
+            hint = "the entry was taken out again, so nothing changed"
+        except SecretsError:
+            hint = f"remove [{flow.secret_name}] from {reg} by hand"
+        raise ConnectError("state", f"the state of {flow.id} can't be written ({type(e).__name__})", hint) from None
+    ctx.registry = {**ctx.registry, flow.secret_name: wsecrets.load_registry(reg)[flow.secret_name]}
+    copy = f" (the old registry is copied to {reg.name}{wsecrets.BACKUP_SUFFIX})" if backed_up else ""
+    io.say(f"  Added {flow.secret_name}{copy}.")
 
 
 def _capture(ctx: Context, flow: Flow, st: dict, i: int) -> int:
@@ -524,13 +604,16 @@ def _resolve_conflict(ctx: Context, flow: Flow, st: dict, s: dict, value: str, e
 def revoke(ctx: Context, flow: Flow, assume_yes: bool = False) -> dict:
     """Undo each step that declares a revoke, last step first: delete the secret, tell the person what to do elsewhere,
     forget what was learned. Then clear the state, so the flow can be walked again. Asks first (default no) unless
-    `assume_yes`; deletes the secret only when this flow's own state says ws connect stored it."""
+    `assume_yes`; deletes the secret, and takes out the registry entry, only when this flow's own state says ws connect
+    put it there."""
     st = load_state(ctx, flow)
     mine = bool(st.get("secret_stored"))
     if not assume_yes:
         if ctx.io is None:
             raise ConnectError("confirm", "revoke needs a yes", "run it at a terminal, or add --yes")
         what = f"delete {flow.secret_name} and " if mine and flow.secret_name else ""
+        if st.get("registry_added"):
+            what += "its registry entry and "
         if ctx.io.ask(f"Revoke {flow.id}: {what}clear its state? (y/N)").strip().lower() not in ("y", "yes"):
             return {"flow": flow.id, "did": [], "tell": [], "status": "cancelled"}
     did, told = [], []
@@ -548,6 +631,16 @@ def revoke(ctx: Context, flow: Flow, assume_yes: bool = False) -> dict:
         elif rv["action"] == "forget":
             st["config"].clear()
             did.append("forgot what the flow had learned")
+    block = st.get("registry_added")
+    if isinstance(block, str) and block and flow.secret_name:
+        reg = Path(ctx.registry_path) if ctx.registry_path else wsecrets.registry_path()
+        try:
+            if wsecrets.remove_block(reg, block):
+                did.append(f"removed {flow.secret_name} from the secrets registry")
+            else:
+                did.append(f"left [{flow.secret_name}] in the registry: it changed since ws connect added it")
+        except SecretsError as e:
+            told.append(f"ws couldn't take {flow.secret_name} out of the registry ({e}); remove it by hand")
     try:
         state_path(ctx, flow.id).unlink()
         did.append("cleared the flow's state")

@@ -30,7 +30,9 @@ them the same way each time. The format is in [Connect flows](../reference/conne
 
 - A secret never goes in a chat, a prompt, a log, the state file or the JSON. The engine reads it with no echo and puts
   it in the secrets store; keep it that way.
-- The person adds the registry entry (`ws connect <id>` prints the lines to add); a flow never edits the registry.
+- The registry entry comes from the flow's `[secret]` block only. `ws connect <id>` shows it and adds it on the
+  person's yes (ADR 0034); a name already registered with other settings is refused with what differs, and under a
+  walled broker it prints the block and the `sudo install` line instead.
 - An agent runs `ws connect <id> --dry-run --json` and passes the `needs_human` steps (link, expiry) to the person. It
   doesn't run the walk or `--revoke`: they refuse inside an agent session.
 - Keep a flow generic. Anything one person needs belongs in their own config, not in a flow that ships with ws.

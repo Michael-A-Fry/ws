@@ -283,27 +283,7 @@ def _mark_checked(name: str, env: dict | None, now: float) -> None:
 # ---------------------------------------------------------------- the registry
 
 
-def _append_entry(path: Path, block: str) -> None:
-    """Add one new entry at the end of the registry. The new whole file must load before it replaces the old one, and
-    the file keeps its mode (0600 for a new one)."""
-    try:
-        old = path.read_text(encoding="utf-8")
-        mode = path.stat().st_mode & 0o777
-    except FileNotFoundError:
-        old, mode = "", 0o600
-    text = old + ("" if not old or old.endswith("\n\n") else "\n" if old.endswith("\n") else "\n\n") + block
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(text)
-        wsecrets.load_registry(tmp)  # the whole file validates, or nothing changes
-        os.replace(tmp, path)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            tmp.unlink()
-        raise
+# ws.secrets.append_entry and remove_block are the one registry writer (ADR 0034).
 
 
 # ---------------------------------------------------------------- connect
@@ -317,19 +297,6 @@ def _save(name: str, kind: str, secret: str, value: str, reg_path: Path, block: 
         return _save_locked(name, kind, secret, value, reg_path, block, env)
 
 
-def _unappend(reg_path: Path, block: str) -> None:
-    """Take out exactly the block this save appended (the last copy), keeping anything else written meanwhile."""
-    text = reg_path.read_text(encoding="utf-8")
-    at = text.rfind(block)
-    if at < 0:
-        return
-    rest = (text[:at].rstrip("\n") + "\n" if text[:at].strip() else "") + text[at + len(block) :]
-    if rest.strip():
-        reg_path.write_text(rest, encoding="utf-8")
-    else:
-        reg_path.unlink(missing_ok=True)
-
-
 def _save_locked(name, kind, secret, value, reg_path: Path, block: str | None, env: dict | None) -> bool:
     store = wsecrets.local_store(env)
     try:
@@ -341,7 +308,7 @@ def _save_locked(name, kind, secret, value, reg_path: Path, block: str | None, e
     step, appended = "registry", False
     try:
         if block is not None:
-            _append_entry(reg_path, block)
+            wsecrets.append_entry(reg_path, block)
             appended = True
         step = "store"
         store.write(secret, value)
@@ -350,8 +317,8 @@ def _save_locked(name, kind, secret, value, reg_path: Path, block: str | None, e
     except (OSError, PermissionError, WsError, wsecrets.SecretsError) as e:
         # Each restore stands alone: one that fails never stops the next.
         if appended:
-            with contextlib.suppress(OSError):
-                _unappend(reg_path, block or "")
+            with contextlib.suppress(OSError, wsecrets.SecretsError):
+                wsecrets.remove_block(reg_path, block or "")
         with contextlib.suppress(OSError, wsecrets.SecretsError):
             if old_value is None:
                 store.delete(secret)

@@ -1074,3 +1074,77 @@ def test_a_socket_the_system_refuses_is_no_connection(box, fake, monkeypatch):
         assert gateclient.connect(fd) is None
     finally:
         os.close(fd)
+
+
+# --- OpenCode's own folders (C792) -------------------------------------------------------------------------------
+
+NODE = shutil.which("node")
+OC_DRIVER = """
+import { pathToFileURL } from "node:url"
+const mod = await import(pathToFileURL(process.argv[2]).href)
+const hooks = await mod.WsGate({ client: { permission: { reply: async () => {} } }, directory: process.argv[3] })
+const out = []
+for (const command of JSON.parse(process.argv[4])) {
+  try {
+    await hooks["tool.execute.before"]({ tool: "bash", callID: "c", sessionID: "s" }, { args: { command } })
+    out.push("allowed")
+  } catch (e) {
+    out.push("blocked")
+  }
+}
+console.log(JSON.stringify(out))
+"""
+
+
+def _opencode_shim_answers(box, agent_env: dict, commands: list[str]) -> list[str]:
+    files = opencode.generate(
+        policy.load(box.policy_file), [PY, "-I", "-m", "ws"], box.out, box.policy_file, pin=box.pin
+    )
+    plugin = box.root / "ws-gate.mjs"
+    plugin.write_text(files[opencode.PLUGIN], encoding="utf-8")
+    driver = box.root / "driver.mjs"
+    driver.write_text(OC_DRIVER, encoding="utf-8")
+    done = subprocess.run(
+        [NODE, str(driver), str(plugin), str(box.root), json.dumps(commands)],
+        env=agent_env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    return json.loads(done.stdout)
+
+
+@pytest.mark.skipif(NODE is None, reason="needs node")
+def test_opencode_in_its_own_folders_still_gets_the_pinned_gate(box):
+    """C792: ws runs OpenCode with HOME and XDG_* pointing at the run's own folder. The shim's gate client must still
+    see the pinned layout (it decides in-process when the daemon can't be reached, as under ws's sandbox), so an
+    allowed call runs and a denied one stays denied; a WS_HOME the agent sets in its own environment changes nothing."""
+    oc = box.root / "oc-home"
+    forged = box.root / "forged-ws"
+    forged.mkdir()
+    (forged / "policy.toml").write_text("")  # an empty policy: if this were read, the secret read would be allowed
+    agent_env = {
+        "PATH": box.env["PATH"],
+        "LANG": "C.UTF-8",
+        "HOME": str(oc),
+        "XDG_CONFIG_HOME": str(oc / ".config"),
+        "XDG_DATA_HOME": str(oc / ".local/share"),
+        "XDG_STATE_HOME": str(oc / ".local/state"),
+        "XDG_CACHE_HOME": str(oc / ".cache"),
+        "WS_HOME": str(forged),
+        "WS_GATE_DAEMON": "0",  # no daemon: the in-process check, the only path inside ws's sandbox
+    }
+    assert _opencode_shim_answers(box, agent_env, [BENIGN, SECRET_READ]) == ["allowed", "blocked"]
+
+
+def test_the_opencode_shim_carries_the_pinned_environment_for_ws_children_only(box):
+    files = opencode.generate(
+        policy.load(box.policy_file), [PY, "-I", "-m", "ws"], box.out, box.policy_file, pin=box.pin
+    )
+    shim = files[opencode.PLUGIN]
+    gate_env = json.loads(shim.split("const GATE_ENV = ")[1].split("\n")[0])
+    assert gate_env == box.pin.environ()
+    assert shim.count("env: childEnv()") == 4  # the check, the events, the session notes, the message wait
+    assert "delete e.WS_HOME" in shim

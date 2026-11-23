@@ -312,6 +312,9 @@ def generate(
     event = client_argv("event", event_argv(ws_cmd, NAME, policy_file, pin), pin)
     plugin = SOURCE.replace("/*__CHECK__*/ []", json.dumps(check)).replace("/*__EVENT__*/ []", json.dumps(event))
     plugin = plugin.replace("/*__WS__*/ []", json.dumps(ws_cmd)).replace("/*__PIN__*/ []", json.dumps(pin.args()))
+    plugin = plugin.replace(
+        "/*__GATE_ENV__*/ {}", json.dumps(pin.environ())
+    )  # C792: ws's children see the pinned layout
     plugin = plugin.replace("/*__GOVERNED__*/ []", json.dumps(_tools_of(pre_kinds)))
     plugin = plugin.replace("/*__POST_TOOLS__*/ []", json.dumps(_tools_of(post_kinds)))
     plugin = plugin.replace("/*__ADVICE__*/ []", json.dumps([e for e in events if e != "post" or post_kinds]))

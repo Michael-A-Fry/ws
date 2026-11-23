@@ -18,7 +18,7 @@ from ws import broker
 from ws import secrets as wsecrets
 from ws.minters import gcal
 
-CAL = "abc123ws@group.calendar.google.com"
+CAL = "c-abc123ws.calendar.test"
 EVENT = {"summary": "Dentist", "start": {"dateTime": "2026-11-26T09:00:00+13:00"},
          "end": {"dateTime": "2026-11-26T09:30:00+13:00"}, "description": "from a mail"}  # fmt: skip
 RANGE = {"time_min": "2026-11-25T00:00:00+13:00", "time_max": "2026-11-26T00:00:00+13:00"}
@@ -190,7 +190,7 @@ def test_bad_ranges_are_refused_before_google(box):
     b = box()
     assert b.refused("list", time_min="yesterday", time_max=RANGE["time_max"]).code == "bad_request"
     assert b.refused("list", time_min=RANGE["time_max"], time_max=RANGE["time_min"]).code == "bad_request"
-    assert b.refused("list", calendar="someone-else@gmail.com", **RANGE).code == "bad_request"
+    assert b.refused("list", calendar="someone-else", **RANGE).code == "bad_request"
     assert b.fake.calls == []
 
 
@@ -207,7 +207,7 @@ def test_a_read_only_entry_refuses_writes(box):
                                    "guestsCanInviteOthers", "organizer"])  # fmt: skip
 def test_fields_outside_the_whitelist_are_refused(box, field):
     b = box(switches=ON)
-    ev = {**EVENT, field: [{"email": "x@example.com"}] if field == "attendees" else "x"}
+    ev = {**EVENT, field: [{"email": "guest"}] if field == "attendees" else "x"}
     assert b.refused("insert", ws_id="mail:2", event=ev).code == "field_refused"
     assert b.fake.writes() == []
 
@@ -229,7 +229,7 @@ def test_every_write_sends_updates_none_and_the_marker(box):
 
 def test_event_ids_are_base32hex_and_stable():
     a = gcal.event_id("mail:abc")
-    assert a == gcal.event_id("mail:abc") != gcal.event_id("mail:abd")
+    assert a == gcal.event_id("mail:abc") != gcal.event_id("mail:abz")
     assert gcal.EVENT_ID_RE.match(a)
 
 
@@ -482,18 +482,18 @@ def test_ensure_calendar_keeps_the_old_one_or_makes_ws(monkeypatch):
         if host == gcal.TOKEN_HOST:
             return 200, b'{"access_token":"t0kenvalue","expires_in":3600}'
         if method == "GET":
-            return (200, json.dumps({"id": "old@group"}).encode()) if "old%40group" in path else (404, b"{}")
-        return 200, b'{"id":"new@group.calendar.google.com"}'
+            return (200, json.dumps({"id": "old.group"}).encode()) if "old.group" in path else (404, b"{}")
+        return 200, b'{"id":"new.group.calendar.test"}'
 
     monkeypatch.setattr(gcal, "_https", fake)
     gcal.forget_tokens()
     assert (
-        gcal.ensure_calendar("1-x.apps.googleusercontent.com", "s" * 12, "r" * 12, "Pacific/Auckland", "old@group")
-        == "old@group"
+        gcal.ensure_calendar("1-x.apps.googleusercontent.com", "s" * 12, "r" * 12, "Pacific/Auckland", "old.group")
+        == "old.group"
     )
     assert (
-        gcal.ensure_calendar("1-x.apps.googleusercontent.com", "s" * 12, "r" * 12, "Pacific/Auckland", "gone@group")
-        == "new@group.calendar.google.com"
+        gcal.ensure_calendar("1-x.apps.googleusercontent.com", "s" * 12, "r" * 12, "Pacific/Auckland", "gone.group")
+        == "new.group.calendar.test"
     )
     made = [s for s in seen if s[0] == "POST" and s[1] == "/calendar/v3/calendars"]
     assert made[0][2]["summary"] == "ws"

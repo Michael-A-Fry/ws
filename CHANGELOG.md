@@ -10,6 +10,10 @@ body of the GitHub release.
 
 ### Added
 
+- `ws watch panes` also spots a Claude Code session left idle at its prompt after an API error (`API Error:`, `Unable to
+  connect to API`, `Connection dropped`, `Request timed out`): one push after `after_minutes`, an `api-error-stuck`
+  line in `logs/alerts.jsonl`, nothing typed into the pane. A session still working or retrying isn't reported. Set
+  `CLAUDE_CODE_RETRY_WATCHDOG=1` for unattended sessions so Claude Code retries before it stops.
 - `ws worktrees prune`: removes agent worktrees under `<repo>/.claude/worktrees` that nothing needs. It keeps one
   that's locked, has a change to a tracked file, changed in the last 12 hours, has a process inside it (or the process
   list doesn't show the caller's own parents, so use can't be ruled out), or has a

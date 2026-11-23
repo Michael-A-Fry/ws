@@ -959,3 +959,118 @@ def test_the_hook_commands_carry_on_failure_block_where_a_failure_must_block(box
         for group in hooks[name]:
             assert all("onFailure" not in h for h in group["hooks"]), name  # advice: never blocks a prompt
     assert client_argv("check", ["ws", "gate", "check"], box.pin)[:3] == [PY, "-I", "-S"]
+
+
+# --- inside ws's own sandbox (C765) ------------------------------------------------------------------------------
+
+
+def _under_ws_seccomp(box, command: str, payload) -> subprocess.CompletedProcess:
+    """The hook run the way a sandboxed runner runs it: under bwrap with ws.sandbox's seccomp filter, which makes
+    socket(AF_UNIX) fail with EPERM. The rest of the file system is the host's, so the policy and state are found."""
+    from ws import sandbox
+
+    rfd, wfd = os.pipe()
+    os.write(wfd, sandbox.seccomp_program())
+    os.close(wfd)
+    argv = [
+        "bwrap",
+        "--bind",
+        "/",
+        "/",
+        "--dev-bind",
+        "/dev",
+        "/dev",
+        "--proc",
+        "/proc",
+        "--seccomp",
+        str(rfd),
+        "sh",
+        "-c",
+        command,
+    ]
+    try:
+        return subprocess.run(
+            argv,
+            input=json.dumps(payload),
+            text=True,
+            env=box.env,
+            capture_output=True,
+            cwd=box.root,
+            timeout=60,
+            check=False,
+            pass_fds=(rfd,),
+        )
+    finally:
+        os.close(rfd)
+
+
+def _bwrap_with_seccomp_starts() -> bool:
+    if not shutil.which("bwrap"):
+        return False
+    from ws import sandbox
+
+    try:
+        prog = sandbox.seccomp_program()
+    except sandbox.SandboxError:
+        return False
+    rfd, wfd = os.pipe()
+    os.write(wfd, prog)
+    os.close(wfd)
+    try:
+        p = subprocess.run(
+            [
+                "bwrap",
+                "--bind",
+                "/",
+                "/",
+                "--dev-bind",
+                "/dev",
+                "/dev",
+                "--proc",
+                "/proc",
+                "--seccomp",
+                str(rfd),
+                PY,
+                "-c",
+                "import socket; socket.socket(socket.AF_UNIX)",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            pass_fds=(rfd,),
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    finally:
+        os.close(rfd)
+    return p.returncode != 0 and "PermissionError" in p.stderr  # the filter is really there and really denies
+
+
+@pytest.mark.skipif(not _bwrap_with_seccomp_starts(), reason="bwrap with a seccomp filter cannot run here")
+def test_inside_ws_sandbox_the_client_decides_in_process_and_still_denies(box):
+    """C765: the sandbox denies socket(AF_UNIX); the client must fall back to its in-process check, not crash (a crash
+    blocked every tool of every sandboxed OpenCode run), and the fallback must not fail open."""
+    hook = box.claude_hook()
+    box.start_daemon()  # a live daemon socket: the client reaches the socket() call, which the filter refuses
+    allowed = _under_ws_seccomp(box, hook, claude_payload("Bash", command=BENIGN))
+    assert allowed.returncode == 0, allowed.stderr
+    assert "Traceback" not in allowed.stderr
+    denied = _under_ws_seccomp(box, hook, claude_payload("Bash", command=SECRET_READ))
+    assert denied.returncode == 2, denied.stderr
+    assert "Traceback" not in denied.stderr
+    assert [r["via"] for r in box.log][-2:] == ["direct", "direct"]
+
+
+def test_a_socket_the_system_refuses_is_no_connection(box, fake, monkeypatch):
+    fake()
+    fd = gateclient.open_run_dir(str(box.state))
+
+    def refused(*a, **k):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(gateclient.socket, "socket", refused)
+    try:
+        assert gateclient.connect(fd) is None
+    finally:
+        os.close(fd)

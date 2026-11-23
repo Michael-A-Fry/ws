@@ -59,6 +59,7 @@ MAX_HEADER = 300  # characters of one header value
 MAX_BODY = 16 * 1024  # bytes (UTF-8) of a draft's body, before the marker
 MAX_RECIPIENTS = 10
 MAX_REFERENCES = 20
+REPLY_SCAN = 25  # the newest messages of the drafts folder and of Sent that `reply_ids` reads (one fetch each)
 MAILBOX_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
 UID_RE = re.compile(r"^([a-z0-9][a-z0-9_-]{0,39}):([1-9][0-9]{0,9})-([1-9][0-9]{0,9})$")
 # Anything that could pass for one of as_text's own lines: <<< (also as HTML entities), then "ws mail", any case, with
@@ -304,7 +305,8 @@ class Mail:
         unseen: bool = False,
         after_uid: int | None = None,
     ) -> dict:
-        """INBOX uids, newest first: {"mailbox", "uids": ["work:7-42", ...], "total"}. `query` is printable ASCII; Gmail
+        """INBOX uids, newest first: {"mailbox", "uidvalidity", "uids": ["work:7-42", ...], "total"}. UIDVALIDITY is the
+        folder's own, so it is there when no uid is (a caller must not read "no uids" as a rebuilt folder). `query` is printable ASCII; Gmail
         search syntax for a gmail mailbox, plain text otherwise. `since` is a date (YYYY-MM-DD). `after_uid` (the bare
         uid of one this search found before) asks instead for the uids above it, oldest first, so a caller can read a
         folder page by page; `total` then counts those above it."""
@@ -320,7 +322,38 @@ class Mail:
             args["since"] = since.isoformat() if isinstance(since, _dt.date) else since
         r = self._call(box, "search", args)
         uv = r["uidvalidity"]
-        return {"mailbox": box.name, "uids": [make_uid(box.name, uv, u) for u in r["uids"]], "total": r["total"]}
+        return {
+            "mailbox": box.name,
+            "uidvalidity": uv,
+            "uids": [make_uid(box.name, uv, u) for u in r["uids"]],
+            "total": r["total"],
+        }
+
+    def reply_ids(self, mailbox: str, since: str | _dt.date) -> dict:
+        """What the mailbox already holds as replies: {"drafts": [ids], "sent": [ids]}. `drafts` is every Message-ID named
+        by the In-Reply-To or References of the newest REPLY_SCAN drafts since `since`; `sent` is the In-Reply-To of the
+        newest REPLY_SCAN sent messages. Read only. The cost is one list, one search for each of the two folders and one
+        headers fetch for each message read, so a caller asks once per run, and only when it is about to make a draft. A
+        folder the server does not name (no drafts folder, no Sent) is left out."""
+        box = self._box(mailbox)
+        r = self._call(box, "list", {})
+        sent = next((f["name"] for f in r.get("folders", []) if "\\Sent" in f.get("flags", [])), None)
+        out: dict = {"drafts": set(), "sent": set()}
+        day = since.isoformat() if isinstance(since, _dt.date) else since
+        for key, folder in (("drafts", r.get("drafts")), ("sent", sent)):
+            if not isinstance(folder, str) or not folder:
+                continue
+            found = self._call(box, "search", {"folder": folder, "unseen": False, "since": day})
+            for uid in found["uids"][:REPLY_SCAN]:
+                args = {"folder": folder, "uid": uid, "uidvalidity": found["uidvalidity"], "part": "headers"}
+                msg = BytesParser(policy=_policy.default).parsebytes(
+                    base64.b64decode(self._call(box, "fetch", args)["raw"])
+                )
+                ids = MSGID_RE.findall(_header(msg, "In-Reply-To"))
+                if key == "drafts":
+                    ids += MSGID_RE.findall(_header_raw(msg, "References"))
+                out[key].update(ids)
+        return {k: sorted(v) for k, v in out.items()}
 
     def _fetch(self, box: Mailbox, ref: object, part: str) -> tuple[str, dict]:
         uv, uid = split_uid(ref, box.name)

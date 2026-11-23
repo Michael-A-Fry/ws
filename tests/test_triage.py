@@ -9,7 +9,9 @@ import dataclasses
 import json
 import os
 from datetime import UTC, date, datetime, timedelta
+from email import policy as email_policy
 from email.message import EmailMessage
+from email.parser import BytesParser
 from pathlib import Path
 
 import pytest
@@ -63,6 +65,10 @@ class Route:
         self.searches: list[tuple[date, str | None]] = []
         self.total_extra = 0
         self.fail_label = False
+        self.in_drafts: set[str] = set()  # Message-IDs the drafts folder names (its In-Reply-To and References)
+        self.in_sent: set[str] = set()  # Message-IDs the sent mail answers
+        self.reply_reads = 0
+        self.fail_reply_ids = False
 
     def add(self, uid: int, data: bytes) -> int:
         self.msgs[uid] = data
@@ -94,6 +100,19 @@ class Route:
 
     def draft(self, ref, body):
         self.drafts.append((ref, body))
+        sent_to = BytesParser(policy=email_policy.default).parsebytes(self.fetch(ref).raw)
+        for h in (
+            "Message-ID",
+            "References",
+            "In-Reply-To",
+        ):  # as ws.mail's reply: In-Reply-To the message, References its chain
+            self.in_drafts |= set(mail.MSGID_RE.findall(str(sent_to.get(h) or "")))
+
+    def reply_ids(self, since):
+        self.reply_reads += 1
+        if self.fail_reply_ids:
+            raise mail.MailError("broker_unavailable", "down")
+        return set(self.in_drafts), set(self.in_sent)
 
 
 class Model:
@@ -436,6 +455,134 @@ def test_only_mail_after_the_last_uid_is_read_and_a_changed_uidvalidity_starts_a
     assert rec["errors"] == []  # a rebuilt folder is a note, not a failed run
 
 
+def thread_msg(uid, mid, refs="", subject="Quote for the deck", body="Can you confirm the price for the deck?"):
+    extra = {"References": refs, "In_Reply_To": refs.split()[-1]} if refs else {}
+    return raw(sender="Tradie <t@example.org>", subject=subject, body=body, mid=mid, **extra)
+
+
+DRAFTING = reply(True, "asks for a price", "Kia ora Tradie,\nI will confirm the price soon. Cheers, Alex")
+
+
+def test_a_thread_handled_once_is_not_asked_or_drafted_again_when_the_uidvalidity_changes(tmp_path):
+    """C720: runs that read from uid 0 again (a uidvalidity change) asked about the same thread and drafted it each time."""
+    r, m = Route(), Model(DRAFTING, DRAFTING, DRAFTING)
+    r.add(1, thread_msg(1, "<t1@example.org>"))
+    go(tmp_path, r, m)
+    assert len(m.calls) == 1 and len(r.drafts) == 1
+    r.uv = 8  # the folder was rebuilt: the same mail again, under new uids
+    r.msgs = {u + 10: b for u, b in r.msgs.items()}
+    r.add(30, raw(subject="Other", mid="<o1@example.org>"))  # and a message that is new
+    rec = go(tmp_path, r, m, now=NOW.replace(hour=6))
+    assert {"mailbox": "a", "kind": "uidvalidity_changed"} in rec["notes"]
+    assert {"mailbox": "a", "kind": "already_handled", "threads": 1} in rec["notes"]
+    assert len(m.calls) == 2 and len(r.drafts) == 2  # only the new thread was asked about and drafted
+    rec = go(tmp_path, r, m, now=NOW.replace(hour=7))  # and the next run reads nothing again
+    assert len(m.calls) == 2 and rec["notes"] == []
+    state = json.loads((tmp_path / "state" / "inbox.json").read_text())
+    assert state["mailboxes"]["a"]["handled"] == ["<t1@example.org>", "<o1@example.org>"]
+
+
+def test_a_search_that_finds_nothing_new_does_not_look_like_a_changed_uidvalidity(tmp_path):
+    a = triage.MailAdapter(FakeMail(), "a")
+    cfg = config(tmp_path)
+    m = Model(reply(False), reply(False))
+    for hour in (5, 6, 7):  # the first run reads uids 4 and 9; the next two find nothing above 9
+        rec = go(tmp_path, a, m, cfg=cfg, now=NOW.replace(hour=hour))
+        assert rec["notes"] == []
+    assert len(m.calls) == 1  # the one thread (both messages are in thread T1), asked about once, in the first run
+
+
+def test_a_saved_uidvalidity_of_zero_is_not_known_so_it_is_not_a_change(tmp_path):
+    r, m = Route(), Model(reply(False))
+    r.add(1, raw())
+    go(tmp_path, r, m)
+    path = tmp_path / "state" / "inbox.json"
+    state = json.loads(path.read_text())
+    state["mailboxes"]["a"]["uidvalidity"] = 0  # what an older run saved after a search that found nothing
+    path.write_text(json.dumps(state))
+    rec = go(tmp_path, r, m, now=NOW.replace(hour=6))
+    assert rec["notes"] == [] and rec["threads_seen"] == 0
+    assert json.loads(path.read_text())["mailboxes"]["a"]["uidvalidity"] == 7
+
+
+def test_a_draft_already_in_the_drafts_folder_is_never_made_again_nor_touched(tmp_path):
+    """The state was lost (a run stopped before it saved): the thread is asked about, but the draft on it stands alone."""
+    r, m = Route(), Model(DRAFTING, DRAFTING)
+    r.add(1, thread_msg(1, "<t1@example.org>"))
+    go(tmp_path, r, m)
+    (tmp_path / "state" / "inbox.json").unlink()
+    rec = go(tmp_path, r, m, now=NOW.replace(hour=6))
+    assert len(r.drafts) == 1 and rec["drafts"] == 0
+    assert {"mailbox": "a", "kind": "already_drafted"} in rec["notes"] and r.reply_reads == 2
+    assert "already in your drafts" in (tmp_path / "ctx" / f"summary-{NOW.astimezone():%Y-%m-%d}.md").read_text()
+
+
+def test_a_new_message_after_a_ws_draft_is_drafted_only_once_the_old_draft_is_gone(tmp_path):
+    r, m = Route(), Model(DRAFTING, DRAFTING, DRAFTING, DRAFTING)
+    r.add(1, thread_msg(1, "<t1@example.org>"))
+    go(tmp_path, r, m)
+    r.add(2, thread_msg(2, "<t2@example.org>", refs="<t1@example.org>", body="Also, can you confirm the date?"))
+    rec = go(tmp_path, r, m, now=NOW.replace(hour=6))  # the first draft is still there: he has not dealt with it
+    assert len(r.drafts) == 1 and {"mailbox": "a", "kind": "already_drafted"} in rec["notes"]
+    r.in_drafts.clear()  # he deleted it
+    r.add(3, thread_msg(3, "<t3@example.org>", refs="<t1@example.org> <t2@example.org>", body="Any news on the price?"))
+    go(tmp_path, r, m, now=NOW.replace(hour=7))
+    assert len(r.drafts) == 2 and r.drafts[-1][0] == "a:7-3"  # the reply goes against the newest message
+
+
+def test_a_thread_he_has_answered_from_sent_gets_no_draft_and_a_later_message_does(tmp_path):
+    r, m = Route(), Model(DRAFTING, DRAFTING)
+    r.add(1, thread_msg(1, "<t1@example.org>"))
+    r.in_sent = {"<t1@example.org>"}  # he answered it himself, and the state was lost
+    rec = go(tmp_path, r, m)
+    assert r.drafts == [] and {"mailbox": "a", "kind": "already_drafted"} in rec["notes"]
+    r.add(2, thread_msg(2, "<t2@example.org>", refs="<t1@example.org>", body="One more thing: the colour?"))
+    go(tmp_path, r, m, now=NOW.replace(hour=6))  # his reply answered t1, not this
+    assert len(r.drafts) == 1 and r.drafts[0][0] == "a:7-2"
+
+
+def test_a_run_stopped_after_the_draft_and_started_again_makes_one_draft(tmp_path):
+    r, m = Route(), Model(DRAFTING, DRAFTING)
+    r.add(1, thread_msg(1, "<t1@example.org>"))
+    saves = {"n": 0}
+    real = triage.save_state
+
+    def stop_after_the_draft(p, state):  # the run is killed at the first save after the draft was made
+        if r.drafts and saves["n"] == 0:
+            saves["n"] += 1
+            raise KeyboardInterrupt
+        real(p, state)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(triage, "save_state", stop_after_the_draft)
+        with pytest.raises(KeyboardInterrupt):
+            go(tmp_path, r, m)
+    assert len(r.drafts) == 1
+    go(tmp_path, r, m, now=NOW.replace(hour=6))
+    assert len(r.drafts) == 1
+
+
+def test_a_failed_look_at_drafts_is_noted_and_the_handled_key_still_stops_a_second_draft(tmp_path):
+    r, m = Route(), Model(DRAFTING, DRAFTING)
+    r.fail_reply_ids = True
+    r.add(1, thread_msg(1, "<t1@example.org>"))
+    rec = go(tmp_path, r, m)
+    note = {"mailbox": "a", "kind": "reply_check_failed", "why": "broker_unavailable"}
+    assert len(r.drafts) == 1 and note in rec["notes"]
+    go(tmp_path, r, m, now=NOW.replace(hour=6))
+    assert len(r.drafts) == 1 and len(m.calls) == 1
+
+
+def test_the_handled_list_is_capped_and_a_message_without_an_id_is_not_remembered(tmp_path):
+    run = triage.Run(config(tmp_path), RULES, {}, Model(), {"mailboxes": {}, "day": {}}, NOW)
+    mk = lambda mid: triage.Message(1, "a:7-1", "s@example.org", "S", "x", False, "t", "", mid)
+    for i in range(triage.MAX_HANDLED + 5):
+        run.mark_handled("a", mk(f"<{i}@example.org>"))
+    run.mark_handled("a", mk(""))
+    h = run.handled_of("a")
+    assert len(h) == triage.MAX_HANDLED and h[-1] == f"<{triage.MAX_HANDLED + 4}@example.org>" and "" not in h
+
+
 def test_the_search_goes_back_a_day_from_the_last_run_and_the_first_run_by_the_window(tmp_path):
     r, m = Route(), Model()
     go(tmp_path, r, m)
@@ -665,7 +812,8 @@ class FakeMail(mail.Mail):
     def _call(self, box, cmd, args):
         self.sent.append((cmd, args))
         if cmd == "search":
-            return {"uidvalidity": 7, "uids": [9, 4], "total": 2}
+            above = [u for u in (9, 4) if u > args.get("after_uid", 0)]
+            return {"uidvalidity": 7, "uids": above, "total": len(above)}
         if cmd == "fetch":
             return {"uidvalidity": 7, "uid": args["uid"], "raw": base64.b64encode(raw()).decode(), "thread": "T1"}
         return {}
@@ -681,6 +829,7 @@ def test_the_mail_adapter_calls_ws_mail_and_reads_the_whole_message(monkeypatch)
     assert fm.sent[0][1] == {"folder": "INBOX", "unseen": False, "query": "-label:x", "since": "2026-11-22"}
     a.search(date(2026, 11, 22), None, 3)
     assert fm.sent[1][1] == {"folder": "INBOX", "unseen": False, "after_uid": 3, "since": "2026-11-22"}
+    assert a.search(date(2026, 11, 22), None, 9) == (7, [], 0)  # nothing new still reports the UIDVALIDITY (C720)
     got = a.fetch(a.ref(7, 9))
     assert got.ref == "a:7-9" and got.thread == "T1" and b"Subject: Hello" in got.raw and a.user() == USER
     a.label("a:7-9", "ws/low")

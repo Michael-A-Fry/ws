@@ -8,6 +8,8 @@ body of the GitHub release.
 
 ## [Unreleased]
 
+## [0.1.11.8] - 2026-11-23
+
 ### Fixed
 
 - `ws triage` no longer drafts the same thread again and again (C720). A run that found nothing new above the last uid

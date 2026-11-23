@@ -88,6 +88,29 @@ class StubHandler(BaseHTTPRequestHandler):
             self._chunk(b"data: two\n\n")
             self.wfile.write(b"0\r\n\r\n")
             return
+        if "/echo-loc" in self.path:  # a server that names the path it was asked for, as a redirect would
+            self.send_response(302)
+            self.send_header("Location", "https://elsewhere.example.com" + self.path)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if "/echo-head" in self.path:
+            out = b"{}"
+            self.send_response(200)
+            self.send_header("Content-Location", self.path)
+            self.send_header("X-Echo-Encoded", self.path.replace(":", "%3A"))
+            self.send_header("X-Upstream", "yes")
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+            return
+        if "/echo-body" in self.path:
+            out = b"x" * 70000 + b'{"you_asked": "' + self.path.encode() + b'"}'
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+            return
         if self.path.startswith("/noreply"):
             self.send_response(204)
             self.end_headers()
@@ -1557,3 +1580,131 @@ def test_a_minted_tokens_repr_shows_no_token():
     token = "planted-" + os.urandom(8).hex()
     m = broker._Minted(name="app", run="r1", elevated=False, token=token, options=None, expires=0.0)
     assert token not in repr(m) and token not in str(m)
+
+
+# ---------------------------------------------------------------- a token in the path (Telegram's /bot<token>)
+
+PATH_VALUE = "123456:AAH-x_y"
+
+
+def _token_registry(env, extra: str = "") -> None:
+    env.write_registry(f'[tg]\nhosts = ["{env.stub.host}"]\nbase_path = "/bot{{value}}"\n{extra}\n')
+    env.store.write("tg", PATH_VALUE)
+
+
+def _audit_has(env, status: str) -> bool:
+    end = time.monotonic() + 5
+    while time.monotonic() < end:
+        if any(a["op"] == "proxy" and a["status"] == status for a in env.audit()):
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def test_a_path_token_entry_puts_the_value_in_the_path_and_in_no_header(env):
+    _token_registry(env)
+    lease = env.lease(name="tg")
+    assert lease.header == ""
+    status, _, _ = env.call("/sendMessage?chat_id=1", lease=lease, headers={"x-api-key": "placeholder"})
+    assert status == 200
+    seen = env.stub.seen[-1]
+    assert seen["target"] == f"/bot{PATH_VALUE}/sendMessage?chat_id=1"
+    assert not any(PATH_VALUE in v for v in seen["headers"].values())
+    assert "x-api-key" not in seen["headers"]  # the tool's placeholder is still stripped
+
+
+def test_paths_judges_the_client_path_of_a_path_token_entry(env):
+    _token_registry(env, 'paths = ["/getMe", "/sendMessage"]')
+    lease = env.lease(name="tg")
+    assert env.call("/getMe", lease=lease)[0] == 200
+    seen = len(env.stub.seen)
+    assert env.call("/deleteWebhook", lease=lease)[0] == 403
+    assert env.call(f"/bot{PATH_VALUE}/getMe", lease=lease)[0] == 403
+    assert len(env.stub.seen) == seen
+
+
+@pytest.mark.parametrize("bad", ["12/../x", "a.b", "a%2fb", "a?b", "a#b", "a b", "x" * 257])
+def test_a_path_value_that_could_move_the_request_is_refused(env, bad):
+    _token_registry(env)
+    env.store.write("tg", bad)
+    lease = env.lease(name="tg")
+    seen = len(env.stub.seen)
+    status, _, data = env.call("/getMe", lease=lease)
+    assert status == 503 and json.loads(data) == {"error": "value_refused"}
+    assert len(env.stub.seen) == seen
+    assert _audit_has(env, "value_refused")
+    assert bad not in env.log.read_text()
+
+
+def test_a_redirect_from_a_path_token_host_is_refused_and_names_nothing(env):
+    _token_registry(env)
+    status, headers, data = env.call("/echo-loc", lease=env.lease(name="tg"))
+    assert status == 502 and json.loads(data) == {"error": "redirect_refused"}
+    assert not any(PATH_VALUE in v for v in headers.values())
+    assert PATH_VALUE.encode() not in data
+
+
+def test_reply_headers_holding_the_path_value_are_dropped(env):
+    _token_registry(env)
+    status, headers, _ = env.call("/echo-head", lease=env.lease(name="tg"))
+    assert status == 200 and headers.get("X-Upstream") == "yes"
+    low = {k.lower() for k in headers}
+    assert "content-location" not in low and "x-echo-encoded" not in low
+    assert not any(PATH_VALUE in v or PATH_VALUE.replace(":", "%3A") in v for v in headers.values())
+
+
+def test_a_reply_body_holding_the_path_value_is_cut_before_it(env):
+    _token_registry(env)
+    lease = env.lease(name="tg")
+    hostport, _, prefix = lease.base_url.removeprefix("http://").partition("/")
+    c = http.client.HTTPConnection(hostport, timeout=10)
+    c.request("GET", "/" + prefix + "/echo-body")
+    r = c.getresponse()
+    try:
+        got = r.read()
+    except http.client.IncompleteRead as e:
+        got = e.partial
+    c.close()
+    assert PATH_VALUE.encode() not in got
+    assert _audit_has(env, "secret_in_reply")
+
+
+def test_the_path_value_never_reaches_the_audit_log(env):
+    _token_registry(env)
+    lease = env.lease(name="tg")
+    for p in ("/getMe", "/echo-loc", "/echo-head", "/../x"):
+        env.call(p, lease=lease)
+    assert _audit_has(env, "redirect_refused")
+    assert PATH_VALUE not in env.log.read_text()
+
+
+def test_a_header_entry_still_relays_reply_headers_and_bodies_untouched(env):
+    status, headers, _ = env.call("/echo-head")
+    assert status == 200 and "Content-Location" in headers
+    status, _, data = env.call("/echo-body")
+    assert status == 200 and data.endswith(b'"}') and len(data) > 70000
+    status, _, _ = env.call("/echo-loc")
+    assert status == 302  # only a path-token entry refuses a redirect
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        'base_path = "/bot{value}/x"',
+        'base_path = "/{value}{value}"',
+        'base_path = "{value}"',
+        'base_path = "/bot{val}"',
+        'base_path = "/bot{value}"\nheader = "authorization"',
+        'base_path = "/bot{value}"\nformat = "{value}"',
+    ],
+)
+def test_a_misplaced_path_token_refuses_the_whole_registry(env, bad):
+    env.write_registry(f'[tg]\nhosts = ["{env.stub.host}"]\n{bad}\n')
+    with pytest.raises(wsecrets.SecretsError, match="base_path"):
+        wsecrets.load_registry(env.registry)
+
+
+def test_a_path_token_may_follow_a_folder(env):
+    env.write_registry(f'[tg]\nhosts = ["{env.stub.host}"]\nbase_path = "/api/{{value}}"\n')
+    entry = wsecrets.load_registry(env.registry)["tg"]
+    assert entry.token_in_path and entry.header == "" and entry.base_path == "/api/{value}"

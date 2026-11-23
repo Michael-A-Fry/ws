@@ -8,7 +8,9 @@ How a secret reaches a tool without the tool reading it:
 2. The runner points the tool's base URL at the lease (Claude Code and OpenCode both honour one).
 3. The lease proxy strips any auth header the tool sent, adds the real one, and forwards only to https://<host> for
    that lease. Responses stream back as they arrive. A lease is for one host, expires (1 h by default) and can be
-   released.
+   released. An entry whose `base_path` ends in `{value}` (an API that takes its key in the path, such as Telegram's
+   `/bot<token>`) gets the value in the path instead, with no credential header (the lease's `header` is ""); the
+   broker then refuses a redirect and keeps the value out of the reply's headers and body.
 
 No TLS interception and no CA: the tool talks plain HTTP to 127.0.0.1 and the broker talks TLS to the real host. Stdlib
 only. Everything fails closed: an unset name, a missing or loose store, an unknown host or an expired lease gives a
@@ -1421,8 +1423,11 @@ class Broker:
                 raise _HttpError(403, "expired")
             return g
 
-    def credential(self, g: _Grant, path: str = "/") -> tuple[str, str, str]:
-        """(header name, header value, base path) for a grant, read fresh so a removed or changed secret takes effect at once."""
+    def credential(self, g: _Grant, path: str = "/") -> tuple[str, str, str, str]:
+        """(header name, header value, base path, path secret) for a grant, read fresh so a removed or changed secret
+        takes effect at once. For an entry whose base_path ends in {value} the header name and value are "" (no header
+        carries it), the value is in the base path, and the path secret is the value, so the reply can be kept clean of
+        it; otherwise the path secret is ""."""
         try:
             entry = self.load_registry().get(g.name)
         except wsecrets.RegistryUntrusted as e:
@@ -1462,7 +1467,11 @@ class Broker:
             raise _HttpError(503, "unset") from e
         except wsecrets.SecretsError as e:
             raise _HttpError(503, "store_unreadable") from e
-        return entry.header, entry.format.replace("{value}", value), entry.base_path
+        if entry.token_in_path:
+            if not wsecrets.PATH_VALUE_RE.fullmatch(value):
+                raise _HttpError(503, "value_refused")  # a / . % ? # or space could move the request to another path
+            return "", "", entry.base_path[: -len(wsecrets.PATH_TOKEN)] + value, value
+        return entry.header, entry.format.replace("{value}", value), entry.base_path, ""
 
 
 def code_problem() -> str:
@@ -1627,15 +1636,16 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                 raise _HttpError(404, "not_found")
             grant = b.grant_for(m.group(1))
             self._check_peer(grant)
-            header, value, base_path = b.credential(grant, m.group(2) or "/")
+            header, value, base_path, secret = b.credential(grant, m.group(2) or "/")
             target = base_path + (m.group(2) or "/") + (f"?{query}" if query else "")
             body = self._read_body()
             self._deadline.cancel()  # the request is in; the reply may take as long as the model does
             headers = self._clean_headers(header)
-            headers[header] = value
+            if header:  # a path-token entry sends no credential header at all
+                headers[header] = value
             headers["Host"] = grant.host
             headers["Connection"] = "close"
-            status_code, sent = self._relay(grant, target, body, headers)
+            status_code, sent = self._relay(grant, target, body, headers, secret)
         except _HttpError as e:
             status_code = e.code
             self._fail(e.status, e.code)
@@ -1673,7 +1683,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
 
     def _clean_headers(self, injected: str) -> dict[str, str]:
         out: dict[str, str] = {}
-        drop = STRIP_REQUEST | HOP_BY_HOP | {injected}
+        drop = STRIP_REQUEST | HOP_BY_HOP | ({injected} if injected else set())
         for k, v in self.headers.items():
             if k.lower() not in drop:
                 out[k] = v
@@ -1718,7 +1728,14 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             raise _HttpError(400, "bad_request")
         return data
 
-    def _relay(self, grant: _Grant, target: str, body: bytes | None, headers: dict[str, str]) -> tuple[int, int]:
+    def _relay(
+        self, grant: _Grant, target: str, body: bytes | None, headers: dict[str, str], secret: str = ""
+    ) -> tuple[int | str, int]:
+        """Send the request upstream and stream the reply back. With `secret` (a value the broker put in the path), the
+        tool must never see it: a 3xx is refused (its Location would name the path), a reply header holding it is
+        dropped, and a body holding it is cut off there. http.client never follows a redirect itself, so the value is
+        sent to the one allowed host only."""
+        needles = _path_secret_forms(secret)
         hostname, _, port = grant.host.partition(":")
         plain = self.server.broker.allow_plain_http and hostname == "127.0.0.1"
         if plain:
@@ -1735,10 +1752,12 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                 resp = conn.getresponse()
             except (OSError, ValueError, http.client.HTTPException) as e:
                 raise _HttpError(502, "upstream_unreachable") from e
+            if needles and 300 <= resp.status < 400:
+                raise _HttpError(502, "redirect_refused")  # nothing sent yet: the tool gets the broker's own 502
             bodyless = self.command == "HEAD" or resp.status in (204, 304) or resp.status < 200
             self.send_response_only(resp.status, resp.reason)
             for k, v in resp.msg.items():
-                if k.lower() not in HOP_BY_HOP:
+                if k.lower() not in HOP_BY_HOP and not _holds(needles, k + ":" + v):
                     self.send_header(k, v)
             if bodyless:
                 if resp.getheader("Content-Length") is not None:
@@ -1750,17 +1769,31 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                 self.close_connection = True
             self.end_headers()
             sent = 0
+            keep = max((len(n) for n in needles), default=1) - 1  # bytes held back: a value may span two chunks
+            tail = b""
             while not bodyless:
                 try:
                     chunk = resp.read1(65536)
                 except (OSError, http.client.HTTPException):
                     self.close_connection = True
+                    tail = b""
                     break
                 if not chunk:
                     break
-                self.wfile.write(chunk)
+                buf = tail + chunk
+                if needles and any(n in buf for n in needles):
+                    self.close_connection = True  # the tool sees a short body, never the value
+                    return "secret_in_reply", sent
+                cut = len(buf) - keep if needles else len(buf)
+                out, tail = buf[: max(cut, 0)], buf[max(cut, 0) :]
+                if out:
+                    self.wfile.write(out)
+                    self.wfile.flush()
+                    sent += len(out)
+            if tail:
+                self.wfile.write(tail)
                 self.wfile.flush()
-                sent += len(chunk)
+                sent += len(tail)
             return resp.status, sent
         finally:
             conn.close()
@@ -1775,6 +1808,19 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(data)
+
+
+def _path_secret_forms(secret: str) -> tuple[bytes, ...]:
+    """The forms a path value could come back in: as sent, and with its colon percent-encoded (PATH_VALUE_RE leaves
+    no other character that a server would encode)."""
+    if not secret:
+        return ()
+    return tuple({f.encode() for f in (secret, secret.replace(":", "%3A"), secret.replace(":", "%3a"))})
+
+
+def _holds(needles: tuple[bytes, ...], text: str) -> bool:
+    raw = text.encode("latin-1", "replace")
+    return any(n in raw for n in needles)
 
 
 # ---------------------------------------------------------------- the command

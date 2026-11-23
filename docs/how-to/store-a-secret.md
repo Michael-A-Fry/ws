@@ -28,7 +28,11 @@ You type the value yourself, in your own terminal. Never paste a key into an AI 
    `base_path = "/api"` puts that path in front of every request path on its way out, for a host that serves its API
    under a prefix (the tool's `/v1/messages` reaches the host as `/api/v1/messages`). It starts with `/`, uses letters,
    digits and `._~/-` only, and has no `.` or `..` part, no `//` and no query. `paths` still judges the path the tool
-   sent, before the prefix is added.
+   sent, before the prefix is added. For an API that takes its key in the path, end `base_path` in `{value}`
+   (Telegram: `base_path = "/bot{value}"`, and the tool's `/sendMessage` reaches the host as
+   `/bot<token>/sendMessage`). Then no header carries the value (leave `header` and `format` out; the lease's
+   `header` is empty), the value may hold only letters, digits and `_:-`, a redirect from the host is refused, and a
+   reply header or body that holds the value is dropped or cut off, so the tool never sees it.
    With `paths` set, a request path may hold only letters, digits and `._~/-`, and the list can't be empty. A change to
    `paths` or `ttl` bites open leases too. `ttl = 600` ends this name's
    leases after 600 seconds (an hour is the default, a day the most). To lease it only to runs that declare it, add a

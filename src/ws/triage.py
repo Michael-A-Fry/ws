@@ -85,6 +85,7 @@ MAX_RETRIES = 2  # for a bad answer
 MAX_DECISIONS = 200  # decision lines kept in one run's record
 MAX_PENDING = 100  # uids held for the next run when a cap stopped the model
 MAX_HANDLED = 2000  # threads (the newest Message-ID of each) a mailbox's state remembers as handled
+MAX_DRAFTED = 2000  # thread keys a mailbox's state remembers a draft was made for (never reset by a UIDVALIDITY change)
 REPLY_DAYS = 14  # how far back the drafts folder and Sent are read for a reply to a thread before a draft is made
 MAX_ITEMS = 100  # thread lines kept in a day's summary; past that the oldest stay and the rest are counted
 SUBJECT_MAX = 80  # characters of a subject, and of a sender's name (NAME_MAX), written in the summary
@@ -980,6 +981,12 @@ def _plain(text, n: int) -> str:
     return t if len(t) <= n else t[: n - 1].rstrip() + "…"
 
 
+def drafted_key(m: Message) -> str:
+    """What a draft answered: the thread (the provider's id, never a uid) and its newest message, so a new message in
+    the thread is drafted for and a deleted draft is not made again."""
+    return f"{m.thread}|{m.mid}"
+
+
 def _key(mailbox: str, thread: str) -> str:
     """The thread's key in a day's lines: one line for a thread, however many messages or runs it takes."""
     return f"{mailbox}|{thread}"[:200]
@@ -1147,6 +1154,7 @@ class Run:
         self.t = Totals()
         self.model_down = False  # a runner failure stops further calls this run (the cause would repeat)
         self.handled: dict[str, list[str]] = {}  # mailbox -> the newest Message-ID of each thread already handled
+        self.drafted: dict[str, list[str]] = {}  # mailbox -> the thread keys a draft was made for (C832)
         self.replies: dict[str, tuple[set[str], set[str]]] = {}  # mailbox -> (ids in Drafts, ids answered in Sent)
 
     # -- the threads already handled: the idempotency key, whatever the uids do
@@ -1162,6 +1170,21 @@ class Run:
         if m.mid and m.mid not in h:
             h.append(m.mid)
             del h[:-MAX_HANDLED]
+
+    def drafted_of(self, name: str) -> list[str]:
+        """Thread keys (the provider's thread id, not a uid) a draft was ever made for: a draft he deleted leaves no trace
+        in the mailbox, so this is the only memory of it. Apart from `handled`, and kept whatever the uids do."""
+        if name not in self.drafted:
+            d = (self.state["mailboxes"].get(name) or {}).get("drafted")
+            self.drafted[name] = [x for x in d if isinstance(x, str)] if isinstance(d, list) else []
+        return self.drafted[name]
+
+    def mark_drafted(self, name: str, m: Message) -> None:
+        d = self.drafted_of(name)
+        k = drafted_key(m)
+        if m.thread and m.mid and k not in d:  # no Message-ID: nothing stable to key on
+            d.append(k)
+            del d[:-MAX_DRAFTED]
 
     def reply_ids(self, name: str, route: Route) -> tuple[set[str], set[str]]:
         """What the mailbox already holds as replies, read once a run and only when a draft is about to be made. If it
@@ -1388,7 +1411,13 @@ class Run:
         drafted, answered = self.reply_ids(name, route)
         if newest.mid in answered or {newest.mid, *newest.chain} & drafted:  # never changed or removed: his to delete
             self.t.notes.append({"mailbox": name, "kind": "already_drafted"})
+            self.mark_drafted(name, newest)  # a draft made before `drafted` existed: remembered from now
             return listed(True, "a reply to this thread is already in your drafts or sent mail")
+        if drafted_key(newest) in self.drafted_of(
+            name
+        ):  # made once for this message, and he may have deleted it: not made again
+            self.t.notes.append({"mailbox": name, "kind": "already_drafted_before"})
+            return listed(False, "a draft was made for this thread before; not made again")
         if not self.dry:
             try:
                 route.draft(newest.ref, verdict.draft or "")
@@ -1397,6 +1426,7 @@ class Run:
                 self.flag(name, newest, f"needs a reply; the draft was not saved ({e.kind})")
                 return listed(False, "the draft could not be saved")
         self.t.drafts += 1
+        self.mark_drafted(name, newest)
         return listed(True)
 
     def keep(self, name: str, uv: int, last: int, held: list[int], since: date | None = None) -> None:
@@ -1410,6 +1440,8 @@ class Run:
         }
         if self.handled_of(name):
             entry["handled"] = self.handled_of(name)[-MAX_HANDLED:]
+        if self.drafted_of(name):
+            entry["drafted"] = self.drafted_of(name)[-MAX_DRAFTED:]
         if since is not None:
             entry["since"] = since.isoformat()
         self.state["mailboxes"][name] = entry

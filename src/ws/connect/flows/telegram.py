@@ -11,6 +11,9 @@ unique_key = "bot_id"
 [secret]
 name = "TELEGRAM_BOT_TOKEN"
 hosts = ["api.telegram.org"]
+purposes = ["notify"]
+base_path = "/bot{value}"
+paths = ["/getMe", "/getUpdates", "/sendMessage"]
 
 [[steps]]
 id = "make-bot"

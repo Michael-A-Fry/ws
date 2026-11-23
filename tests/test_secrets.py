@@ -885,3 +885,102 @@ def test_set_refuses_a_gmail_value_that_is_not_an_app_password_and_keeps_other_h
     spaced = "a b " + VALUE
     code, _, _ = run(capsys, "secret", "set", "mail-o", stdin=spaced, monkeypatch=monkeypatch)
     assert code == 0 and wsecrets.Store(home / "secrets").read("mail-o") == spaced  # another host: as typed
+
+
+# ---------------------------------------------------------------- the one registry writer (ADR 0034, C805)
+
+BLOCK = '[tg]\nhosts = ["api.telegram.org"]\nbase_path = "/bot{value}"\n'
+
+
+def _folder(tmp_path):
+    d = tmp_path / "cfg"
+    d.mkdir(mode=0o700)
+    return d / "secrets.toml"
+
+
+def test_append_keeps_the_old_text_backs_it_up_and_keeps_the_mode(tmp_path):
+    reg = _folder(tmp_path)
+    reg.write_text('# mine\n[a]\nhosts = ["x.example.com"]  # note\n')
+    reg.chmod(0o640)
+    wsecrets.append_entry(reg, BLOCK)
+    assert reg.read_text() == '# mine\n[a]\nhosts = ["x.example.com"]  # note\n\n' + BLOCK
+    assert (reg.parent / "secrets.toml.bak").read_text().startswith("# mine")
+    assert stat.S_IMODE(reg.stat().st_mode) == 0o640
+    assert stat.S_IMODE((reg.parent / "secrets.toml.bak").stat().st_mode) == 0o600
+    assert sorted(p.name for p in reg.parent.iterdir()) == ["secrets.toml", "secrets.toml.bak"]  # no temp left
+
+
+def test_append_makes_a_new_registry_0600(tmp_path):
+    reg = _folder(tmp_path)
+    wsecrets.append_entry(reg, BLOCK)
+    assert reg.read_text() == BLOCK and stat.S_IMODE(reg.stat().st_mode) == 0o600
+    assert not (reg.parent / "secrets.toml.bak").exists()
+
+
+def test_append_refuses_a_symlink_and_a_folder_others_can_write(tmp_path):
+    reg = _folder(tmp_path)
+    real = tmp_path / "elsewhere.toml"
+    real.write_text("")
+    reg.symlink_to(real)
+    with pytest.raises(wsecrets.RegistryWriteError, match="symlink"):
+        wsecrets.append_entry(reg, BLOCK)
+    assert real.read_text() == ""
+    reg.unlink()
+    reg.parent.chmod(0o777)
+    with pytest.raises(wsecrets.RegistryWriteError, match="group or others"):
+        wsecrets.append_entry(reg, BLOCK)
+    assert not reg.exists()
+
+
+def test_append_refuses_a_registry_others_can_write(tmp_path):
+    reg = _folder(tmp_path)
+    reg.write_text("")
+    reg.chmod(0o666)
+    with pytest.raises(wsecrets.RegistryWriteError, match="group or others"):
+        wsecrets.append_entry(reg, BLOCK)
+    assert reg.read_text() == ""
+
+
+def test_append_refuses_when_the_file_changes_while_it_is_written(tmp_path, monkeypatch):
+    reg = _folder(tmp_path)
+    reg.write_text('[a]\nhosts = ["x.example.com"]\n')
+    real = wsecrets.load_registry
+
+    def meddle(path, owner_uid=None):
+        out = real(path, owner_uid)
+        if path != reg:
+            with reg.open("a") as f:
+                f.write('[b]\nhosts = ["y.example.com"]\n')  # someone else edits it meanwhile
+        return out
+
+    monkeypatch.setattr(wsecrets, "load_registry", meddle)
+    with pytest.raises(wsecrets.RegistryWriteError, match="changed while"):
+        wsecrets.append_entry(reg, BLOCK)
+    assert "[tg]" not in reg.read_text() and "[b]" in reg.read_text()
+    assert not [p for p in reg.parent.iterdir() if p.name.endswith(".tmp")]
+
+
+def test_a_block_that_does_not_load_changes_nothing(tmp_path):
+    reg = _folder(tmp_path)
+    reg.write_text('[a]\nhosts = ["x.example.com"]\n')
+    with pytest.raises(wsecrets.RegistryWriteError):
+        wsecrets.append_entry(reg, '[a]\nhosts = ["dup.example.com"]\n')  # a second [a]: not valid TOML
+    assert reg.read_text() == '[a]\nhosts = ["x.example.com"]\n'
+    assert not [p for p in reg.parent.iterdir() if p.name.endswith(".tmp")]
+
+
+def test_remove_block_takes_out_exactly_the_block_or_nothing(tmp_path):
+    reg = _folder(tmp_path)
+    reg.write_text('[a]\nhosts = ["x.example.com"]\n')
+    wsecrets.append_entry(reg, BLOCK)
+    assert wsecrets.remove_block(reg, BLOCK) is True
+    assert reg.read_text() == '[a]\nhosts = ["x.example.com"]\n'
+    assert wsecrets.remove_block(reg, BLOCK) is False
+
+
+def test_entry_block_uses_the_brokers_rules_and_refuses_quotes():
+    text = wsecrets.entry_block("tg", {"hosts": ["api.telegram.org"], "paths": ["/getMe"]}, comment="hi")
+    assert text == '# hi\n[tg]\nhosts = ["api.telegram.org"]\npaths = ["/getMe"]\n'
+    for bad in ({"hosts": ['a"b']}, {"hosts": ["a/b"]}, {"hosts": ["x.com"], "base_path": "/a{value}/b"}, {"hosts": 5}):
+        with pytest.raises(wsecrets.SecretsError):
+            wsecrets.entry_block("tg", bad)

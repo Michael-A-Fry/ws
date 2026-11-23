@@ -319,6 +319,175 @@ def _entry(path: Path, name: str, t: dict) -> Entry:
     )
 
 
+# ---------------------------------------------------------------- the one registry writer (ADR 0034)
+#
+# ws appends an entry only on the person's yes (`ws mail connect`, `ws connect <flow>`) and takes out only a block it
+# added. The file is never re-serialised, so comments and layout stay; the old file is backed up first; the new one is
+# written to a temp file in the same folder and renamed over the old only if the old is still the file that was read.
+
+
+class RegistryWriteError(SecretsError):
+    """The registry could not be changed safely; nothing was changed. Never carries a value (the registry has none)."""
+
+
+BACKUP_SUFFIX = ".bak"
+
+
+def entry_block(name: str, table: dict, comment: str = "") -> str:
+    """The TOML text of one header entry, from plain keys (lists of strings and strings only), checked by the same
+    rules the broker loads it by. Raises SecretsError."""
+    if not NAME_RE.match(name):
+        raise SecretsError(f"{name!r} is not a valid name (letters, digits, - and _; starts with a letter)")
+    lines = [f"# {comment}"] if comment else []
+    lines.append(f"[{name}]")
+    for k, v in table.items():
+        if isinstance(v, str):
+            lines.append(f"{k} = {_toml_str(v)}")
+        elif isinstance(v, (list, tuple)) and all(isinstance(x, str) for x in v):
+            lines.append(f"{k} = [{', '.join(_toml_str(x) for x in v)}]")
+        else:
+            raise SecretsError(f"[{name}] {k} must be a string or a list of strings")
+    text = "\n".join(lines) + "\n"
+    try:
+        raw = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as e:
+        raise SecretsError(f"[{name}] does not make valid TOML ({e})") from e
+    _entry(Path("the new entry"), name, raw[name])
+    return text
+
+
+def _toml_str(v: str) -> str:
+    if re.search(r'[\x00-\x1f\x7f"\\]', v):
+        raise SecretsError("a registry string may not hold a quote, a backslash or a control character")
+    return f'"{v}"'
+
+
+def entry_differences(entry: Entry, block: str) -> list[str]:
+    """What differs between an entry already in the registry and the one `block` would add (empty: the same)."""
+    want = _entry(Path("the new entry"), entry.name, tomllib.loads(block)[entry.name])
+    out = []
+    for key in ("kind", "hosts", "header", "format", "purposes", "paths", "base_path", "tier", "area", "ttl", "source"):
+        a, b = getattr(entry, key), getattr(want, key)
+        if isinstance(a, tuple):
+            a, b = sorted(a), sorted(b)
+        if a != b:
+            out.append(f"{key}: the registry has {a!r}, this would add {b!r}")
+    return out
+
+
+def _open_registry(path: Path) -> tuple[bytes, tuple[int, int, int] | None]:
+    """The registry's bytes and (device, inode, mode), or (b"", None) when there is none; refused as `_read_trusted`
+    refuses: a symlink, not a regular file, another user's, or a file or folder group or others can write."""
+    try:
+        pst = os.stat(path.parent)
+    except FileNotFoundError:
+        return b"", None
+    if pst.st_mode & 0o022:
+        raise RegistryWriteError(
+            f"{path.parent}: its folder can be written by group or others, so ws won't write there"
+        )
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    except FileNotFoundError:
+        return b"", None
+    except OSError as e:
+        if e.errno == errno.ELOOP:
+            raise RegistryWriteError(f"{path}: it is a symlink; ws won't write through it") from e
+        raise
+    with os.fdopen(fd, "rb") as f:
+        st = os.fstat(f.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            raise RegistryWriteError(f"{path}: it is not a regular file")
+        why = registry_problem(st, os.geteuid())
+        if why:
+            raise RegistryWriteError(f"{path}: {why}")
+        return f.read(), (st.st_dev, st.st_ino, st.st_mode & 0o777)
+
+
+def _write_beside(path: Path, data: bytes, mode: int) -> Path:
+    """`data` in a new temp file next to `path` (O_EXCL, 0600, fsynced, then `mode`). Returns its path."""
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{os.urandom(4).hex()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+            os.fchmod(fh.fileno(), mode)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
+    return tmp
+
+
+def _fsync_dir(folder: Path) -> None:
+    with contextlib.suppress(OSError):
+        fd = os.open(folder, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
+def _rewrite(path: Path, change) -> bool:
+    """Replace the registry with `change(old_text)` (None: leave it). Backs the old file up, checks the new one loads,
+    and renames it in only if the file is still the one read (same inode and bytes). Raises RegistryWriteError."""
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        old, ident = _open_registry(path)
+        try:
+            new_text = change(old.decode("utf-8"))
+        except UnicodeDecodeError as e:
+            raise RegistryWriteError(f"{path}: it is not UTF-8 text") from e
+        if new_text is None:
+            return False
+        mode = ident[2] if ident else 0o600
+        if ident is not None:
+            bak = _write_beside(path, old, 0o600)
+            os.replace(bak, path.with_name(path.name + BACKUP_SUFFIX))
+        tmp = _write_beside(path, new_text.encode("utf-8"), mode)
+        try:
+            load_registry(tmp)  # the whole new file loads, or nothing changes
+            now, now_ident = _open_registry(path)
+            same_file = (now_ident[:2] if now_ident else None) == (ident[:2] if ident else None)
+            if not same_file or hashlib.sha256(now).digest() != hashlib.sha256(old).digest():
+                raise RegistryWriteError(f"{path}: it changed while ws was writing it; nothing was changed, try again")
+            os.rename(tmp, path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+            raise
+        _fsync_dir(path.parent)
+        return True
+    except RegistryWriteError:
+        raise
+    except (OSError, SecretsError) as e:
+        raise RegistryWriteError(f"{path}: {e}") from e
+
+
+def append_entry(path: Path, block: str) -> None:
+    """Add one new entry, as text, at the end of the registry (comments and layout kept). Raises RegistryWriteError."""
+
+    def change(old: str) -> str:
+        sep = "" if not old or old.endswith("\n\n") else "\n" if old.endswith("\n") else "\n\n"
+        return old + sep + block
+
+    _rewrite(path, change)
+
+
+def remove_block(path: Path, block: str) -> bool:
+    """Take out exactly `block` (the last copy), keeping everything else. False when it is not there unchanged."""
+
+    def change(old: str) -> str | None:
+        at = old.rfind(block)
+        if at < 0:
+            return None
+        return (old[:at].rstrip("\n") + "\n" if old[:at].strip() else "") + old[at + len(block) :]
+
+    return _rewrite(path, change)
+
+
 def check_value(value: str) -> str:
     """The value as stored. Raises SecretsError (without the value) if it could not be a header value."""
     if not value:

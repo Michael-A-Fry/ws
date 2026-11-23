@@ -13,6 +13,7 @@ from __future__ import annotations
 import getpass
 import os
 import sys
+from pathlib import Path
 
 COMMAND = "connect"
 
@@ -62,10 +63,16 @@ def _context(*, with_io: bool = False) -> engine.Context:
     return engine.Context(
         state_dir=paths.state_dir(),
         store=store,
-        registered=frozenset(reg),
+        registry=reg,
         registry_path=str(wsecrets.registry_path()),
+        walled=walled(),
         io=Terminal() if with_io else None,
     )
+
+
+def walled() -> bool:
+    """A walled broker is set up here (its root-owned registry or its socket exists): only root can add a name."""
+    return Path(wsecrets.WALL_HOME, "secrets.toml").exists() or Path(wsecrets.WALL_SOCKET).exists()
 
 
 def _flow(flow_id: str) -> spec.Flow:
@@ -121,6 +128,8 @@ def cmd_connect(args) -> int:
             else:
                 for r in data["steps"]:
                     print(f"{r['status']:<12} {r['id']:<16} {r.get('action', '')}")
+                    if r["type"] == "register":
+                        print(r["text"])
                 for b in data.get("blockers", []):
                     print(f"blocked: {b['kind']}\n{b['action']}")
             return data["exit_code"]

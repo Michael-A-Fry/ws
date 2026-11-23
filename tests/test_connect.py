@@ -7,6 +7,7 @@ built at run time, and every output the engine makes (state file, say(), --json,
 from __future__ import annotations
 
 import json
+import os
 import tomllib
 from pathlib import Path
 
@@ -96,13 +97,20 @@ def env(tmp_path, monkeypatch):
     return tmp_path, store
 
 
-def ctx_for(env, transport, io=None, registered=True, clock=None) -> Context:
+def flow_entry() -> wsecrets.Entry:
+    """The registry entry the Telegram flow declares, as the broker loads it."""
+    block = spec.load("telegram").registry_block()
+    return wsecrets._entry(Path("t"), "TELEGRAM_BOT_TOKEN", tomllib.loads(block)["TELEGRAM_BOT_TOKEN"])
+
+
+def ctx_for(env, transport, io=None, registered=True, clock=None, walled=False) -> Context:
     tmp, store = env
     opened: list[str] = []
     c = Context(
         state_dir=tmp / "state",
         store=store,
-        registered=frozenset({"TELEGRAM_BOT_TOKEN"}) if registered else frozenset(),
+        registry={"TELEGRAM_BOT_TOKEN": flow_entry()} if registered else {},
+        walled=walled,
         registry_path=str(tmp / "secrets.toml"),
         transport=transport,
         io=io,
@@ -200,14 +208,81 @@ def test_a_bad_shape_is_refused_before_any_call(env):
     assert e.value.kind == "bad_value" and api.calls == []
 
 
-def test_an_unregistered_secret_prints_the_registry_step_and_edits_nothing(env):
+def test_an_unregistered_secret_is_added_only_on_a_yes_and_no_edits_nothing(env):
+    # C805: the old secret_not_registered stop is gone by design (ADR 0034): ws adds the flow's own entry on a yes
     tmp, store = env
-    c = ctx_for(env, FakeTelegram(make_token()), Script(), registered=False)
+    io = Script("no")
+    c = ctx_for(env, FakeTelegram(make_token()), io, registered=False)
     with pytest.raises(ConnectError) as e:
         engine.walk(c, FLOW)
-    assert e.value.kind == "not_registered"
-    assert "[TELEGRAM_BOT_TOKEN]" in e.value.hint and 'hosts = ["api.telegram.org"]' in e.value.hint
+    assert e.value.kind == "not_registered" and "nothing was changed" in e.value.hint
+    assert FLOW.registry_block() in "\n".join(io.said)  # the person saw exactly what would be added
     assert not (tmp / "secrets.toml").exists() and store.names() == []
+
+
+def test_a_yes_appends_the_flows_entry_as_text_and_the_walk_carries_on(env):
+    tmp, _store = env
+    reg = tmp / "secrets.toml"
+    reg.write_text('# my own notes\n[anthropic]\nhosts = ["api.anthropic.com"]  # keep\n')
+    token = make_token("r")
+    api = FakeTelegram(token)
+    io = Script("yes", "", "", token, "")
+    c = ctx_for(env, api, io, registered=False)
+    orig = io.pause
+
+    def pause(text: str) -> str:
+        if text.startswith("Not seen yet"):
+            api.press_start(engine.load_state(c, FLOW)["nonce"]["value"])
+            return ""
+        return orig(text)
+
+    io.pause = pause  # type: ignore[method-assign]
+    assert engine.walk(c, FLOW)["status"] == "done"
+    text = reg.read_text()
+    assert text.startswith('# my own notes\n[anthropic]\nhosts = ["api.anthropic.com"]  # keep\n')
+    assert text.endswith(FLOW.registry_block())
+    assert (tmp / "secrets.toml.bak").read_text().startswith("# my own notes")
+    loaded = wsecrets.load_registry(reg, os.geteuid())["TELEGRAM_BOT_TOKEN"]
+    assert loaded.token_in_path and loaded.purposes == ("notify",)
+    assert loaded.paths == ("/getMe", "/getUpdates", "/sendMessage")
+    assert engine.load_state(c, FLOW)["registry_added"] == FLOW.registry_block()
+    assert token not in text and token not in everything(tmp, io)
+
+
+def test_a_name_registered_with_other_settings_is_refused_and_the_differences_shown(env):
+    tmp, store = env
+    reg = tmp / "secrets.toml"
+    reg.write_text('[TELEGRAM_BOT_TOKEN]\nhosts = ["api.telegram.org", "evil.example.com"]\n')
+    c = ctx_for(env, FakeTelegram(make_token()), Script("yes"))
+    c.registry = wsecrets.load_registry(reg)
+    before = reg.read_text()
+    with pytest.raises(ConnectError) as e:
+        engine.walk(c, FLOW)
+    assert e.value.kind == "registered_differently"
+    assert "hosts" in e.value.hint and "base_path" in e.value.hint and "purposes" in e.value.hint
+    assert reg.read_text() == before and store.names() == []
+    out = engine.dry_run(c, FLOW)
+    assert out["blockers"][0]["kind"] == "secret_registered_differently" and out["exit_code"] == 3
+    assert all(r["id"] != "register-secret" for r in out["steps"])
+
+
+def test_the_wall_case_writes_nothing_and_prints_the_block_and_the_install_line(env):
+    tmp, store = env
+    c = ctx_for(env, FakeTelegram(make_token()), Script("yes"), registered=False, walled=True)
+    with pytest.raises(ConnectError) as e:
+        engine.walk(c, FLOW)
+    assert e.value.kind == "walled"
+    assert FLOW.registry_block() in e.value.hint
+    for key, want in dict(FLOW.secret_entry).items():
+        got = tomllib.loads(FLOW.registry_block())["TELEGRAM_BOT_TOKEN"][key]
+        assert got == list(want) if isinstance(want, tuple) else got == want
+    assert (
+        f"sudo install -o root -g root -m 0644 {tmp / 'secrets.toml'} /var/lib/ws-broker/secrets.toml" in e.value.hint
+    )
+    assert not (tmp / "secrets.toml").exists() and store.names() == []
+    assert not (tmp / "state" / "connect").exists()
+    row = engine.dry_run(c, FLOW)["steps"][0]
+    assert row["walled"] is True and "sudo install" in row["text"]
 
 
 def test_the_walk_stops_when_the_person_does_not_press_start_and_resumes(env):
@@ -332,10 +407,21 @@ def test_dry_run_gives_the_link_and_its_expiry_once_a_nonce_exists(env):
     assert row["expires_at"].endswith("Z") and nonce not in json.dumps(engine.dry_run(c, FLOW))
 
 
-def test_dry_run_names_an_unregistered_secret_as_a_blocker(env):
+def test_dry_run_shows_an_unregistered_secret_as_a_first_register_step_not_a_blocker(env):
+    # C805: rewritten on purpose; the secret_not_registered blocker is replaced by the register-secret step (ADR 0034)
     out = engine.dry_run(ctx_for(env, FakeTelegram(make_token()), registered=False), FLOW)
-    assert out["blockers"][0]["kind"] == "secret_not_registered"
+    assert "blockers" not in out
+    row = out["steps"][0]
+    assert {k: row[k] for k in ("id", "type", "status", "action")} == {
+        "id": "register-secret",
+        "type": "register",
+        "status": "needs_human",
+        "action": "confirm_register",
+    }
+    assert row["text"] == FLOW.registry_block() and row["walled"] is False
+    assert out["next_step"] == "register-secret"
     assert out["exit_code"] == 3 and out["status"] == "needs_human"
+    assert all(r["id"] != "register-secret" for r in engine.dry_run(ctx_for(env, None), FLOW)["steps"])
 
 
 def test_no_output_ever_holds_the_secret(env, capsys):
@@ -432,6 +518,10 @@ BAD = {
     "a placeholder in the host": lambda r: r["steps"][5]["request"].update(url="https://{identity}.example/x"),
     "delete_secret with no [secret]": lambda r: r.pop("secret"),
     "a verify with both identity and find": lambda r: r["steps"][5].update(identity="a", unique_id="b"),
+    "a [secret] base_path the broker refuses": lambda r: r["secret"].update(base_path="/bot{value}/x"),
+    "a [secret] host with a path": lambda r: r["secret"].update(hosts=["api.telegram.org/x"]),
+    "a [secret] key the registry does not know": lambda r: r["secret"].update(tier="lead"),
+    "an empty [secret] paths": lambda r: r["secret"].update(paths=[]),
 }
 
 
@@ -472,7 +562,8 @@ def test_list_and_dry_run_and_diagnose_work_from_an_agent_session(env, monkeypat
     assert code == 0 and json.loads(out)["data"]["flows"][0]["id"] == "telegram"
     code, out, _ = _run(["connect", "telegram", "--dry-run", "--json"], capsys)
     data = json.loads(out)["data"]
-    assert code == 3 and data["status"] == "needs_human" and data["blockers"][0]["kind"] == "secret_not_registered"
+    assert code == 3 and data["status"] == "needs_human" and "blockers" not in data  # C805: a step, not a blocker
+    assert data["steps"][0]["id"] == "register-secret" and data["steps"][0]["status"] == "needs_human"
     code, out, _ = _run(["connect", "telegram", "--diagnose", "--json"], capsys)
     assert code == 0 and json.loads(out)["data"]["flow"] == "telegram"
 
@@ -504,9 +595,67 @@ def test_the_command_reads_a_registered_secret_from_the_real_registry(env, capsy
     _tmp, _ = env
     reg = wsecrets.registry_path()
     reg.parent.mkdir(parents=True, exist_ok=True)
-    reg.write_text('[TELEGRAM_BOT_TOKEN]\nhosts = ["api.telegram.org"]\n')
+    reg.write_text(spec.load("telegram").registry_block())
     _code, out, _ = _run(["connect", "telegram", "--dry-run", "--json"], capsys)
-    assert "blockers" not in json.loads(out)["data"]
+    data = json.loads(out)["data"]
+    assert "blockers" not in data and data["steps"][0]["id"] != "register-secret"
+
+
+def test_the_plain_dry_run_shows_the_register_row_and_the_block_and_no_blocked_line(env, capsys):
+    code, out, _ = _run(["connect", "telegram", "--dry-run"], capsys)
+    assert code == 3 and "blocked:" not in out
+    assert out.splitlines()[0].split() == ["needs_human", "register-secret", "confirm_register"]
+    assert spec.load("telegram").registry_block() in out
+
+
+def test_revoke_takes_out_only_the_entry_it_added(env):
+    tmp, _store = env
+    reg = tmp / "secrets.toml"
+    reg.write_text('[anthropic]\nhosts = ["api.anthropic.com"]\n')
+    token = make_token("s")
+    api = FakeTelegram(token)
+    io = Script("yes", "", "", token, "")
+    c = ctx_for(env, api, io, registered=False)
+    orig = io.pause
+
+    def pause(text: str) -> str:
+        if text.startswith("Not seen yet"):
+            api.press_start(engine.load_state(c, FLOW)["nonce"]["value"])
+            return ""
+        return orig(text)
+
+    io.pause = pause  # type: ignore[method-assign]
+    engine.walk(c, FLOW)
+    with reg.open("a") as f:
+        f.write('\n[later]\nhosts = ["x.example.com"]\n')  # written after ws connect: stays
+    out = engine.revoke(c, FLOW, assume_yes=True)
+    assert "removed TELEGRAM_BOT_TOKEN from the secrets registry" in out["did"]
+    names = set(wsecrets.load_registry(reg))
+    assert names == {"anthropic", "later"}
+
+
+def test_revoke_leaves_an_entry_ws_connect_did_not_add(env):
+    tmp, _store = env
+    reg = tmp / "secrets.toml"
+    reg.write_text(FLOW.registry_block())  # the person wrote it by hand
+    token = make_token("t")
+    c, _io, _ = walk_all(env, FakeTelegram(token), token)
+    engine.revoke(c, FLOW, assume_yes=True)
+    assert "TELEGRAM_BOT_TOKEN" in wsecrets.load_registry(reg)
+
+
+def test_revoke_leaves_an_added_entry_that_was_edited_since(env):
+    tmp, _store = env
+    reg = tmp / "secrets.toml"
+    c = ctx_for(env, FakeTelegram(make_token()), Script("yes"), registered=False)
+    c.store = None  # stop right after the register step: the walk needs the store
+    st = engine.load_state(c, FLOW)
+    c.io = Script("yes")
+    engine._register(c, FLOW, st)
+    reg.write_text(reg.read_text().replace('purposes = ["notify"]', 'purposes = ["notify", "run"]'))
+    out = engine.revoke(c, FLOW, assume_yes=True)
+    assert any("changed since ws connect added it" in d for d in out["did"])
+    assert "TELEGRAM_BOT_TOKEN" in wsecrets.load_registry(reg)
 
 
 # ---- review fixes ------------------------------------------------------------------------------------------------

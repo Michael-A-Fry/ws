@@ -10,6 +10,17 @@ body of the GitHub release.
 
 ### Added
 
+- `ws connect <flow>` adds its flow's own registry entry on the person's yes (C603, ADR 0034), instead of stopping at
+  `secret_not_registered`. The entry comes from the flow's `[secret]` block only (which gains `purposes`, `base_path`
+  and `paths`); `--dry-run` shows it as a first `register-secret` step (`confirm_register`); a name already registered
+  with other settings is refused with what differs; `--revoke` takes out only an entry this command added; under a
+  walled broker nothing is written and the block and the `sudo install` line are printed. The Telegram flow registers
+  `TELEGRAM_BOT_TOKEN` for `notify` with `base_path = "/bot{value}"` and the paths `/getMe`, `/getUpdates`,
+  `/sendMessage`.
+- One registry writer, `ws.secrets.append_entry` and `remove_block`, used by `ws mail connect` and `ws connect`: it
+  appends text (comments kept), backs the old file up to `secrets.toml.bak`, refuses a symlink or a folder or file
+  others can write, writes a temp file in the same folder and renames it in only if the registry didn't change
+  meanwhile.
 - The broker can put a secret in the request path, for an API that takes its key there (Telegram's
   `/bot<token>/sendMessage`, C805): a registry entry's `base_path` may end in `{value}`, once. No credential header is
   sent, the value must match `^[A-Za-z0-9_:-]{1,256}$` (else `value_refused`), and the tool never sees the value or any

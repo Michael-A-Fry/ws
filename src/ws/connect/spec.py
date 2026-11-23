@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from ws import secrets as wsecrets
+
 SCHEMA = "ws.connect-flow/1"
 ID_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 RESERVED_IDS = frozenset({"list"})
@@ -40,6 +42,16 @@ class Flow:
     secret_hosts: tuple[str, ...]
     steps: tuple[dict, ...]
     path: Path | None = None
+    secret_entry: tuple[
+        tuple[str, object], ...
+    ] = ()  # the registry keys of [secret] (hosts, base_path, purposes, paths)
+
+    def registry_block(self) -> str:
+        """The registry entry `ws connect` adds for this flow, on the person's yes (ADR 0034)."""
+        assert self.secret_name
+        return wsecrets.entry_block(
+            self.secret_name, dict(self.secret_entry), comment=f"added by ws connect {self.id}, on your yes (ADR 0034)"
+        )
 
 
 def flows_dir() -> Path:
@@ -96,15 +108,25 @@ def parse(raw: dict, path: Path | None = None) -> Flow:
     _need(bool(re.match(r"^[a-z][a-z0-9_]{0,31}$", ukey)), name, "unique_key must be a short snake_case name")
     _need(ukey not in {"identity", "secret", "nonce"}, name, "unique_key may not be identity, secret or nonce")
     sec = raw.get("secret")
-    sname, hosts = None, ()
+    sname, hosts, secret_entry = None, (), ()
     if sec is not None:
         _need(isinstance(sec, dict), name, "[secret] must be a table")
-        _only(sec, {"name", "hosts"}, f"{name} [secret]")
+        _only(sec, {"name", "hosts", "purposes", "base_path", "paths"}, f"{name} [secret]")
         sname = _text(sec, "name", f"{name} [secret]")
-        _need(bool(re.match(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$", sname or "")), name, "[secret] name is not a valid name")
+        _need(bool(wsecrets.NAME_RE.match(sname or "")), name, "[secret] name is not a valid name")
         h = sec.get("hosts")
         _need(isinstance(h, list) and bool(h) and all(isinstance(x, str) for x in h), name, "[secret] hosts is a list")
         hosts = tuple(x.lower() for x in h)
+        _need(all(wsecrets.HOST_RE.match(x) for x in hosts), name, "[secret] hosts are plain host names")
+        entry: dict[str, object] = {"hosts": list(hosts)}
+        for key in ("base_path", "purposes", "paths"):
+            if key in sec:
+                entry[key] = sec[key]
+        try:
+            wsecrets.entry_block(sname or "", entry)  # the broker's own rules for an entry
+        except wsecrets.SecretsError as e:
+            raise FlowError(f"{name} [secret]: {e}") from None
+        secret_entry = tuple((k, tuple(v) if isinstance(v, list) else v) for k, v in entry.items())
     steps = raw.get("steps")
     _need(isinstance(steps, list) and bool(steps), name, "steps must be a non-empty list")
     seen: set[str] = set()
@@ -240,7 +262,7 @@ def parse(raw: dict, path: Path | None = None) -> Flow:
         if typ == "verify" and "identity" in s:
             known.add("identity")
     _need(not secret_pending, name, "a secret capture must be followed by its verify step")
-    return Flow(fid, title, ukey, sname, hosts, tuple(steps), path)
+    return Flow(fid, title, ukey, sname, hosts, tuple(steps), path, secret_entry)
 
 
 def load_file(path: Path) -> Flow:

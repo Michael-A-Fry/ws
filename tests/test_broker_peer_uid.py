@@ -1,0 +1,82 @@
+"""C782: the lease proxy serves a connection only when its peer's uid (read from /proc/net/tcp) is the uid the lease
+was given to. A wrong uid, or a peer with no row, gets 403 and a logged refusal that holds the uid and never the token."""
+
+from __future__ import annotations
+
+import os
+import shutil
+import tempfile
+import threading
+from pathlib import Path
+
+import pytest
+from test_broker import VALUE, Env, Stub
+
+from ws import broker
+
+HEADER = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+
+pytestmark = pytest.mark.skipif(not os.path.exists("/proc/net/tcp"), reason="needs /proc/net/tcp (Linux)")
+
+
+@pytest.fixture
+def env():
+    d = Path(tempfile.mkdtemp(prefix="wsp"))
+    s = Stub()
+    threading.Thread(target=s.serve_forever, args=(0.05,), daemon=True).start()
+    e = Env(d, s)
+    e.write_registry()
+    e.store.write("anthropic", VALUE)
+    e.start()
+    yield e
+    e.broker.stop()
+    s.go.set()
+    s.shutdown()
+    s.server_close()
+    shutil.rmtree(d, ignore_errors=True)
+
+
+def refusals(env) -> list[dict]:
+    return [x for x in env.audit() if x["op"] == "proxy" and x["status"] == "peer_refused"]
+
+
+def test_right_uid_gets_through_to_the_upstream(env):
+    status, _, data = env.call()
+    assert status == 200 and b'"ok"' in data
+    assert env.stub.seen[-1]["headers"]["x-api-key"] == VALUE
+
+
+def test_a_lease_for_another_uid_is_refused_with_403_and_never_reaches_upstream(env):
+    lease = env.lease()
+    for g in env.broker._grants.values():
+        g.uid = os.geteuid() + 1  # the run record's uid, as the grant holds it, is not this peer's
+    seen = len(env.stub.seen)
+    status, _, data = env.call(lease=lease)
+    assert status == 403 and b"peer_refused" in data
+    assert len(env.stub.seen) == seen
+    assert refusals(env)[-1]["uid"] == os.geteuid()
+    token = lease.base_url.rsplit("/l/", 1)[1].split("/")[0]
+    assert token not in env.log.read_text()
+
+
+def test_a_peer_with_no_row_is_refused(env):
+    table = env.base / "tcp"
+    table.write_text(HEADER, encoding="ascii")
+    env.broker.proc_net_tcp = (str(table),)
+    status, _, _ = env.call()
+    assert status == 403
+    assert refusals(env)[-1]["uid"] is None
+
+
+def test_the_row_is_matched_by_both_ports_and_its_uid_is_read(tmp_path):
+    t = tmp_path / "tcp"
+    t.write_text(
+        HEADER
+        + "   0: 0100007F:C350 0100007F:1F90 01 00000000:00000000 00:00000000 00000000  4242        0 1 1 0 0 0\n"
+        + "   1: 0100007F:C351 0100007F:1F90 01 00000000:00000000 00:00000000 00000000  7        0 2 1 0 0 0\n",
+        encoding="ascii",
+    )
+    assert broker.loopback_peer_uid(0xC350, 0x1F90, (str(t),)) == 4242
+    assert broker.loopback_peer_uid(0xC350, 0x1F91, (str(t),)) is None
+    with pytest.raises(NotImplementedError):
+        broker.loopback_peer_uid(1, 2, (str(tmp_path / "missing"),))

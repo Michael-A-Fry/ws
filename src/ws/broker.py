@@ -606,6 +606,40 @@ class _Grant:
 
 PLAIN_PATH_RE = re.compile(r"^/[A-Za-z0-9._~/-]*$")
 
+PROC_NET_TCP = ("/proc/net/tcp", "/proc/net/tcp6")
+
+
+def loopback_peer_uid(local_port: int, remote_port: int, tables: tuple[str, ...] = PROC_NET_TCP) -> int | None:
+    """The uid that owns the TCP socket whose local port is `local_port` and remote port is `remote_port`, read from
+    /proc/net/tcp and tcp6. None when no row matches or a table cannot be read. Raises NotImplementedError when the
+    first table does not exist at all (an OS without /proc/net/tcp), so the caller can tell "cannot say" from "no row"."""
+    found: int | None = None
+    for i, table in enumerate(tables):
+        try:
+            with open(table, encoding="ascii", errors="replace") as f:
+                lines = f.readlines()[1:]
+        except FileNotFoundError:
+            if i == 0:
+                raise NotImplementedError(table) from None
+            continue
+        except OSError:
+            continue
+        for line in lines:
+            cols = line.split()
+            if len(cols) < 8:
+                continue
+            try:
+                lport = int(cols[1].rpartition(":")[2], 16)
+                rport = int(cols[2].rpartition(":")[2], 16)
+                uid = int(cols[7])
+            except ValueError:
+                continue
+            if lport == local_port and rport == remote_port:
+                if found is not None and found != uid:
+                    return -1  # two rows disagree: no uid will match it
+                found = uid
+    return found
+
 
 def path_allowed(prefixes: tuple[str, ...], path: str) -> bool:
     """True when the proxy may forward `path` for a name that lists `prefixes` (none listed: any path). With a list, the
@@ -669,6 +703,7 @@ class Broker:
         self.allow_plain_http = allow_plain_http  # tests only: http to 127.0.0.1; the command line has no switch for it
         self.imap_cafile: str | None = None  # tests only: a test CA for the mail server; None is the system's
         self.own_uid = os.geteuid()
+        self.proc_net_tcp: tuple[str, ...] = PROC_NET_TCP  # tests only: a planted table
         self._port = port
         self._grants: dict[str, _Grant] = {}  # sha256(token) -> grant
         self._lock = threading.Lock()
@@ -1552,6 +1587,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
     def _forward(self) -> None:
         b = self.server.broker
         grant: _Grant | None = None
+        self._peer_uid: int | None = None
         sent = 0
         status_code: int | str = 0
         try:
@@ -1560,6 +1596,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             if not m:
                 raise _HttpError(404, "not_found")
             grant = b.grant_for(m.group(1))
+            self._check_peer(grant)
             header, value, base_path = b.credential(grant, m.group(2) or "/")
             target = base_path + (m.group(2) or "/") + (f"?{query}" if query else "")
             body = self._read_body()
@@ -1586,8 +1623,21 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                 run=grant.run if grant else None,
                 area=grant.area if grant else None,
                 tier=grant.tier if grant else None,
+                uid=self._peer_uid,
                 bytes=sent,
             )
+
+    def _check_peer(self, grant: _Grant) -> None:
+        """The connection must come from the uid the lease was given to (the run record's uid when it names one: the
+        lease was refused to any other). A peer that cannot be found is refused. Logs the uid, never the token."""
+        b = self.server.broker
+        try:
+            peer = loopback_peer_uid(self.client_address[1], self.connection.getsockname()[1], b.proc_net_tcp)
+        except NotImplementedError:
+            return  # no /proc/net/tcp on this OS: the token alone is the credential, as before
+        if peer is None or peer != grant.uid:
+            self._peer_uid = peer  # the refusal's audit row (written in _forward) carries it
+            raise _HttpError(403, "peer_refused")
 
     def _clean_headers(self, injected: str) -> dict[str, str]:
         out: dict[str, str] = {}

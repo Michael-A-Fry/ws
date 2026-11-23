@@ -1438,6 +1438,9 @@ class Broker:
             raise _HttpError(403, "host_not_allowed")
         if not path_allowed(entry.paths, path):  # the registry as it is now: a tightened list bites open leases too
             raise _HttpError(403, "path_not_allowed")
+        bound = entry.paths_for(g.purpose)  # C828: a notify lease can't reach the bridge's paths
+        if bound is not None and (not bound or not path_allowed(bound, path)):
+            raise _HttpError(403, "path_not_allowed")
         if entry.base_path and (not PLAIN_PATH_RE.match(path) or any(p in (".", "..") for p in path.split("/"))):
             raise _HttpError(
                 403, "path_not_allowed"

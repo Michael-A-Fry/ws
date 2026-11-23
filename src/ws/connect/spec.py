@@ -112,7 +112,7 @@ def parse(raw: dict, path: Path | None = None) -> Flow:
     sname, hosts, secret_entry = None, (), ()
     if sec is not None:
         _need(isinstance(sec, dict), name, "[secret] must be a table")
-        _only(sec, {"name", "hosts", "purposes", "base_path", "paths"}, f"{name} [secret]")
+        _only(sec, {"name", "hosts", "purposes", "base_path", "paths", "purpose_paths"}, f"{name} [secret]")
         sname = _text(sec, "name", f"{name} [secret]")
         _need(bool(wsecrets.NAME_RE.match(sname or "")), name, "[secret] name is not a valid name")
         h = sec.get("hosts")
@@ -120,7 +120,7 @@ def parse(raw: dict, path: Path | None = None) -> Flow:
         hosts = tuple(x.lower() for x in h)
         _need(all(wsecrets.HOST_RE.match(x) for x in hosts), name, "[secret] hosts are plain host names")
         entry: dict[str, object] = {"hosts": list(hosts)}
-        for key in ("base_path", "purposes", "paths"):
+        for key in ("base_path", "purposes", "paths", "purpose_paths"):
             if key in sec:
                 entry[key] = sec[key]
         try:

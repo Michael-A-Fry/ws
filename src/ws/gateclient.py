@@ -145,7 +145,12 @@ def connect(dir_fd: int, ws_cmd: list[str] | None = None) -> socket.socket | Non
         return None
     if not stat.S_ISSOCK(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o077:
         return None
-    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        # ws's own sandbox denies socket(AF_UNIX) with EPERM (ws.sandbox's seccomp filter): no daemon, so the caller
+        # checks in-process instead (C765: the escaped PermissionError blocked every tool of a sandboxed runner)
+        conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    except OSError:
+        return None
     conn.settimeout(CONNECT_TIMEOUT)
     try:
         here = os.open(".", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))

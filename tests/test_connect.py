@@ -36,8 +36,11 @@ class FakeTelegram:
         self.calls: list[str] = []
         self.webhook = False
 
-    def press_start(self, nonce: str, chat_id: int = 99, chat_type: str = "private") -> None:
-        msg = {"text": f"/start {nonce}", "chat": {"id": chat_id, "type": chat_type}}
+    def press_start(
+        self, nonce: str, chat_id: int = 99, chat_type: str = "private", from_id: int | None = None
+    ) -> None:
+        sender = {"id": chat_id if from_id is None else from_id, "is_bot": False}
+        msg = {"text": f"/start {nonce}", "chat": {"id": chat_id, "type": chat_type}, "from": sender}
         self.updates.append({"update_id": len(self.updates) + 1, "message": msg})
 
     def get(self, url: str):
@@ -166,7 +169,7 @@ def test_the_whole_telegram_flow_walks_and_keeps_the_secret_out_of_everything(en
     assert store.read("TELEGRAM_BOT_TOKEN") == token
     st = json.loads((tmp / "state" / "connect" / "telegram.json").read_text())
     assert st["status"] == "done"
-    assert st["config"] == {"identity": "demo_bot", "bot_id": "424242", "chat_id": "99"}
+    assert st["config"] == {"identity": "demo_bot", "bot_id": "424242", "chat_id": "99", "from_id": "99"}
     assert st["nonce"] is None
     assert token not in everything(tmp, io)
     assert (tmp / "state" / "connect" / "telegram.json").stat().st_mode & 0o777 == 0o600
@@ -245,8 +248,7 @@ def test_a_yes_appends_the_flows_entry_as_text_and_the_walk_carries_on(env):
     assert text.endswith(FLOW.registry_block())
     assert (tmp / "secrets.toml.bak").read_text().startswith("# my own notes")
     loaded = wsecrets.load_registry(reg, os.geteuid())["TELEGRAM_BOT_TOKEN"]
-    assert loaded.token_in_path and loaded.purposes == ("notify",)
-    assert loaded.paths == ("/getMe", "/getUpdates", "/sendMessage")
+    assert loaded.token_in_path and loaded == flow_entry()
     assert engine.load_state(c, FLOW)["registry_added"] == FLOW.registry_block()
     assert token not in text and token not in everything(tmp, io)
 
@@ -655,7 +657,7 @@ def test_revoke_leaves_an_added_entry_that_was_edited_since(env):
     st = engine.load_state(c, FLOW)
     c.io = Script("yes")
     engine._register(c, FLOW, st)
-    reg.write_text(reg.read_text().replace('purposes = ["notify"]', 'purposes = ["notify", "run"]'))
+    reg.write_text(reg.read_text().replace('purposes = ["notify", "bridge"]', 'purposes = ["notify", "run"]'))
     out = engine.revoke(c, FLOW, assume_yes=True)
     assert any("changed since ws connect added it" in d for d in out["did"])
     assert "TELEGRAM_BOT_TOKEN" in wsecrets.load_registry(reg)
@@ -923,3 +925,29 @@ def test_a_new_registry_says_nothing_about_a_backup(env):
     engine._register(c, FLOW, engine.load_state(c, FLOW))
     assert not (tmp / "secrets.toml.bak").exists()
     assert not any(".bak" in x for x in io.said)
+
+
+def test_the_bind_keeps_the_senders_id_for_the_bridge(env):
+    # C731: the bridge checks from.id on every update, so the bind stores it beside chat_id
+    token = make_token("u")
+    api = FakeTelegram(token)
+    io = Script("", "", token, "")
+    c = ctx_for(env, api, io)
+    orig = io.pause
+
+    def pause(text: str) -> str:
+        if text.startswith("Not seen yet"):
+            api.press_start(engine.load_state(c, FLOW)["nonce"]["value"], chat_id=99, from_id=4242)
+            return ""
+        return orig(text)
+
+    io.pause = pause  # type: ignore[method-assign]
+    assert engine.walk(c, FLOW)["status"] == "done"
+    cfg = json.loads((env[0] / "state" / "connect" / "telegram.json").read_text())["config"]
+    assert cfg["chat_id"] == "99" and cfg["from_id"] == "4242"
+
+
+def test_the_telegram_entry_allows_the_bridge(env):
+    e = flow_entry()
+    assert e.purposes == ("notify", "bridge")
+    assert set(e.paths) == {"/getMe", "/getUpdates", "/sendMessage", "/editMessageReplyMarkup", "/answerCallbackQuery"}

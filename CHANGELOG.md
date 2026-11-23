@@ -16,8 +16,9 @@ body of the GitHub release.
   with other settings is refused with what differs; `--revoke` takes out only an entry this command added and nobody
   changed since; the `secret_not_registered` blocker kind is retired (`schema_version` stays 1); under a
   walled broker nothing is written and the block and the `sudo install` line are printed. The Telegram flow registers
-  `TELEGRAM_BOT_TOKEN` for `notify` with `base_path = "/bot{value}"` and the paths `/getMe`, `/getUpdates`,
-  `/sendMessage`.
+  `TELEGRAM_BOT_TOKEN` for `notify` and `bridge` with `base_path = "/bot{value}"` and the paths `/getMe`,
+  `/getUpdates`, `/sendMessage`, `/editMessageReplyMarkup`, `/answerCallbackQuery`, and its bind step keeps the
+  sender's `from_id` beside `chat_id` in the connect state (`config.from_id`), for the bridge to check (C731).
 - One registry writer, `ws.secrets.append_entry` and `remove_block`, used by `ws mail connect` and `ws connect`: it
   appends text (comments kept), backs the old file up to `secrets.toml.bak`, refuses a symlink or a folder or file
   others can write, writes a temp file in the same folder and renames it in only if the registry didn't change

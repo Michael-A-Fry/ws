@@ -11,9 +11,9 @@ unique_key = "bot_id"
 [secret]
 name = "TELEGRAM_BOT_TOKEN"
 hosts = ["api.telegram.org"]
-purposes = ["notify"]
+purposes = ["notify", "bridge"]
 base_path = "/bot{value}"
-paths = ["/getMe", "/getUpdates", "/sendMessage"]
+paths = ["/getMe", "/getUpdates", "/sendMessage", "/editMessageReplyMarkup", "/answerCallbackQuery"]
 
 [[steps]]
 id = "make-bot"
@@ -66,7 +66,7 @@ fix_url = "https://api.telegram.org/bot{secret}/deleteWebhook"
 [steps.find]
 list = "result"
 where = { "message.text" = "/start {nonce}", "message.chat.type" = "private" }
-take = { chat_id = "message.chat.id" }
+take = { chat_id = "message.chat.id", from_id = "message.from.id" }
 [steps.revoke]
 action = "tell"
 text = "In Telegram, open BotFather and send /revoke to make the old token useless (ws deleted its copy). Then delete the bot with /deleteBot if you no longer want it."

@@ -47,7 +47,8 @@ Not in this phase: `device` (RFC 8628), `callback`, `--reauth`, QR codes. The lo
 ## State
 
 `<state>/connect/<id>.json`, 0600 in a 0700 folder, schema `ws.connect-state/1`: see [Stores](stores.md#record-files).
-It holds step status, the learned identity, unique id and bound chat id, and the current nonce. It never holds a secret:
+It holds step status, the learned identity, unique id and bound chat id (Telegram: `config.chat_id` and the sender's
+`config.from_id`), and the current nonce. It never holds a secret:
 a captured secret goes from the prompt to the secrets store only. `--diagnose` shows it with the nonce redacted.
 
 ## The agent contract

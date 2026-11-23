@@ -87,3 +87,32 @@ def test_the_row_is_matched_by_both_ports_and_its_uid_is_read(tmp_path):
     assert broker.loopback_peer_uid(0xC350, 0x1F91, (str(t),)) is None
     with pytest.raises(NotImplementedError):
         broker.loopback_peer_uid(1, 2, (str(tmp_path / "missing"),))
+
+
+def test_ipv6_and_ipv4_mapped_loopback_rows_match_and_other_addresses_do_not(tmp_path):
+    mapped = "0000000000000000FFFF00000100007F"
+    v6 = "00000000000000000000000001000000"
+    t = tmp_path / "tcp6"
+    row = "   {n}: {a}:{lp} {b}:{rp} 01 00000000:00000000 00:00000000 00000000  {uid}        0 1 1 0 0 0\n"
+    t.write_text(
+        HEADER
+        + row.format(n=0, a=mapped, lp="C350", b=mapped, rp="1F90", uid=11)
+        + row.format(n=1, a=v6, lp="C351", b=v6, rp="1F90", uid=12)
+        + row.format(n=2, a="0000000000000000FFFF00000A00000A", lp="C352", b=mapped, rp="1F90", uid=13),
+        encoding="ascii",
+    )
+    assert broker.loopback_peer_uid(0xC350, 0x1F90, (str(t),)) == 11
+    assert broker.loopback_peer_uid(0xC351, 0x1F90, (str(t),)) == 12
+    assert broker.loopback_peer_uid(0xC352, 0x1F90, (str(t),)) is None
+
+
+def test_the_lookup_gives_up_at_its_budget_and_says_no_row(tmp_path):
+    t = tmp_path / "tcp"
+    t.write_text(HEADER + "x\n" * 10, encoding="ascii")
+    assert broker.loopback_peer_uid(1, 2, (str(t),), budget_s=-1) is None
+
+
+def test_an_unreadable_second_table_is_skipped(tmp_path):
+    t = tmp_path / "tcp"
+    t.write_text(HEADER, encoding="ascii")
+    assert broker.loopback_peer_uid(1, 2, (str(t), str(tmp_path / "no-tcp6"))) is None

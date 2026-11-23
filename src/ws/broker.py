@@ -609,10 +609,31 @@ PLAIN_PATH_RE = re.compile(r"^/[A-Za-z0-9._~/-]*$")
 PROC_NET_TCP = ("/proc/net/tcp", "/proc/net/tcp6")
 
 
-def loopback_peer_uid(local_port: int, remote_port: int, tables: tuple[str, ...] = PROC_NET_TCP) -> int | None:
-    """The uid that owns the TCP socket whose local port is `local_port` and remote port is `remote_port`, read from
-    /proc/net/tcp and tcp6. None when no row matches or a table cannot be read. Raises NotImplementedError when the
-    first table does not exist at all (an OS without /proc/net/tcp), so the caller can tell "cannot say" from "no row"."""
+def _loopback_hex(addr: str) -> bool:
+    """True when a /proc/net/tcp(6) address column is 127.x.x.x, ::1 or the IPv4-mapped ::ffff:127.x.x.x."""
+    if len(addr) == 8:
+        return addr[-2:].upper() == "7F"
+    if len(addr) == 32:
+        words = [addr[i : i + 8] for i in range(0, 32, 8)]
+        if words[:2] != ["00000000", "00000000"]:
+            return False
+        if words[2:] == ["00000000", "01000000"]:
+            return True  # ::1
+        return words[2].upper() == "FFFF0000" and words[3][-2:].upper() == "7F"
+    return False
+
+
+def loopback_peer_uid(
+    local_port: int,
+    remote_port: int,
+    tables: tuple[str, ...] = PROC_NET_TCP,
+    budget_s: float = 2.0,
+) -> int | None:
+    """The uid that owns the TCP socket whose local port is `local_port` and remote port is `remote_port` (loopback
+    addresses only, IPv4, IPv6 or IPv4-mapped), read once from /proc/net/tcp and tcp6. Total and bounded: None when no
+    row matches, a table cannot be read or `budget_s` runs out. Raises NotImplementedError when the first table does
+    not exist at all (an OS without /proc/net/tcp), so the caller can tell "cannot say" from "no row"."""
+    deadline = time.monotonic() + budget_s
     found: int | None = None
     for i, table in enumerate(tables):
         try:
@@ -625,16 +646,18 @@ def loopback_peer_uid(local_port: int, remote_port: int, tables: tuple[str, ...]
         except OSError:
             continue
         for line in lines:
+            if time.monotonic() > deadline:
+                return None
             cols = line.split()
             if len(cols) < 8:
                 continue
             try:
-                lport = int(cols[1].rpartition(":")[2], 16)
-                rport = int(cols[2].rpartition(":")[2], 16)
-                uid = int(cols[7])
+                laddr, _, lp = cols[1].rpartition(":")
+                raddr, _, rp = cols[2].rpartition(":")
+                lport, rport, uid = int(lp, 16), int(rp, 16), int(cols[7])
             except ValueError:
                 continue
-            if lport == local_port and rport == remote_port:
+            if lport == local_port and rport == remote_port and _loopback_hex(laddr) and _loopback_hex(raddr):
                 if found is not None and found != uid:
                     return -1  # two rows disagree: no uid will match it
                 found = uid
@@ -1635,8 +1658,8 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             peer = loopback_peer_uid(self.client_address[1], self.connection.getsockname()[1], b.proc_net_tcp)
         except NotImplementedError:
             return  # no /proc/net/tcp on this OS: the token alone is the credential, as before
+        self._peer_uid = peer  # the audit row (written in _forward) carries it, refused or served
         if peer is None or peer != grant.uid:
-            self._peer_uid = peer  # the refusal's audit row (written in _forward) carries it
             raise _HttpError(403, "peer_refused")
 
     def _clean_headers(self, injected: str) -> dict[str, str]:

@@ -806,6 +806,7 @@ def test_control_paths_are_ws_homes_files_and_folders(tmp_path):
         "approvals",
         "install-manifest.json",
         "ratings.jsonl",
+        "gcal-switches.json",
     } == set(policy.CONTROL_NAMES)
     p = policy.loads("")
     for name in policy.CONTROL_NAMES:

@@ -74,11 +74,8 @@ ADMIN_SUB = frozenset(
         ("queue", "add"),  # queues unattended runs, which spend without a person watching
         ("queue", "cancel"),
         ("queue", "run"),
-        ("connector", "launch"),
-        (
-            "gcal",
-            "connect",
-        ),  # writes a calendar token to the store: a person pastes the client secret  # plugs a zone's MCP server into a session: a person's choice, never a session's own
+        ("connector", "launch"),  # plugs a zone's MCP server into a session: a person's choice, never a session's own
+        ("gcal", "connect"),  # writes a calendar token to the store: a person pastes the client secret
     }
 )
 # in the table for the text matcher, but run by the runner's own hook inside the session, so `guard` lets it through

@@ -22,8 +22,10 @@ the mailbox and runs one operation from the fixed table in ws.minters.imap (read
 so the mailbox password, which would also send mail, never leaves this process. gcal: for a `kind = "gcal"` name the
 broker refreshes the Google token itself and runs one operation from the fixed table in ws.minters.gcal (list, freebusy,
 get, insert, patch; never delete). Each write type has a switch, default off (`gcal_switch`, kept in
-`<state>/gcal-switches.json`): off is anyone's to set, on only the broker's own user's, from a process that holds a
-terminal, and every flip is an audit line.
+`<state>/gcal-switches.json`, a control path the gate and the wall keep sessions from writing): off is anyone's to set;
+on only the broker's own user's, from a process that holds a terminal, with the switch PIN a person stored (a session
+cannot read the store); every flip is an audit line. The switch is read when a write arrives: an "off" that lands while
+a write is already running stops the next one, not that one.
 Refusal codes: unknown_name, unset, host_not_allowed, purpose_not_allowed, caller_refused, store_unreadable, expired,
 run_required, run_refused, not_declared, area_refused, tier_refused, claim_refused, elevation_off, audit_failed,
 wrong_kind, registry_untrusted, upstream_refused, login_refused (a mailbox login), upstream_unreachable, op_refused, uidvalidity_changed,
@@ -54,6 +56,7 @@ import argparse
 import base64
 import contextlib
 import hashlib
+import hmac
 import http.client
 import json
 import os
@@ -545,11 +548,14 @@ def gcal_call(
     return {k: v for k, v in r.items() if k != "ok"}
 
 
-def gcal_switch(write: str | None, state: str | None, socket: str | Path | None = None) -> dict:
-    """Set one gcal write switch (`state` on or off), or read them all (`write` None): {"switches": {insert: bool, ...}}."""
+def gcal_switch(write: str | None, state: str | None, socket: str | Path | None = None, pin: str | None = None) -> dict:
+    """Set one gcal write switch (`state` on or off; on needs the switch `pin`), or read them all (`write` None):
+    {"switches": {insert: bool, ...}}."""
     msg: dict = {"op": gcal.SWITCH_OP}
     if write is not None:
         msg.update(write=write, state=state)
+    if pin is not None:
+        msg["pin"] = pin
     r = _client_call(msg, socket)
     return {k: v for k, v in r.items() if k != "ok"}
 
@@ -816,6 +822,7 @@ class Broker:
         self.imap_cafile: str | None = None  # tests only: a test CA for the mail server; None is the system's
         self.gcal_switch_file: Path | None = None  # the gcal write switches; None: every write type stays off
         self.peer_has_terminal = peer_has_terminal  # tests only: a planted answer
+        self._gcal_pin_misses = 0  # wrong switch PINs since start; PIN_TRIES of them lock switching on
         self.own_uid = os.geteuid()
         self.proc_net_tcp: tuple[str, ...] = PROC_NET_TCP  # tests only: a planted table
         self._port = port
@@ -1395,7 +1402,9 @@ class Broker:
 
     def _op_gcal_switch(self, msg: dict, uid: int, pid: int) -> dict:
         """Read or set a gcal write switch. Off: anyone served. On: the broker's own user, from a process with a
-        terminal (an agent's tool shell has none). Every flip, and every refused flip, is an audit line."""
+        terminal, AND the switch PIN (gcal.SWITCH_PIN_NAME in the store, which a session cannot read; a person pastes
+        it once with `ws secret ask`). A session can fake a terminal, never the PIN. PIN_TRIES misses lock turning on
+        until the broker restarts. Every flip, and every refused flip, is an audit line; the PIN never is."""
         write, state = msg.get("write"), msg.get("state")
         if write is None and state is None:
             return {"ok": True, "switches": read_gcal_switches(self.gcal_switch_file, self.own_uid)}
@@ -1410,6 +1419,10 @@ class Broker:
             return self._refuse_logged(
                 "gcal_switch", log, "caller_refused", "a write is turned on by a person at a terminal, not by a job"
             )
+        if state == "on":
+            refused = self._gcal_pin_ok(msg.get("pin"), log)
+            if refused:
+                return refused
         if self.gcal_switch_file is None:
             return self._refuse_logged("gcal_switch", log, "store_unreadable", "this broker has no switch file")
         with self._lock:
@@ -1424,6 +1437,35 @@ class Broker:
                 self.audit.write("gcal_switch", "store_unreadable", **log)
                 return _refuse("store_unreadable", "the switch file cannot be written")
         return {"ok": True, "switches": cur, "changed": was != cur[write]}
+
+    def _gcal_pin_ok(self, pin: object, log: dict) -> dict | None:
+        """None when `pin` is the stored switch PIN; else the logged refusal. The PIN is compared in constant time and
+        never logged; after PIN_TRIES misses every switch-on is refused until the broker restarts."""
+        with self._lock:
+            if self._gcal_pin_misses >= gcal.PIN_TRIES:
+                locked = True
+            else:
+                locked = False
+        if locked:
+            return self._refuse_logged("gcal_switch", log, "caller_refused", "too many wrong PINs: restart the broker")
+        try:
+            want = self.store.read(gcal.SWITCH_PIN_NAME)
+        except FileNotFoundError:
+            return self._refuse_logged(
+                "gcal_switch",
+                log,
+                "unset",
+                f"no switch PIN: a person sets it with `ws secret ask {gcal.SWITCH_PIN_NAME}`",
+            )
+        except wsecrets.SecretsError:
+            return self._refuse_logged("gcal_switch", log, "store_unreadable", "the switch PIN cannot be read")
+        ok = isinstance(pin, str) and len(want) >= gcal.PIN_MIN and hmac.compare_digest(pin.encode(), want.encode())
+        del want
+        if ok:
+            return None
+        with self._lock:
+            self._gcal_pin_misses += 1
+        return self._refuse_logged("gcal_switch", log, "caller_refused", "that is not the switch PIN")
 
     def _take_minted(self, which) -> list[_Minted]:
         """Remove the minted tokens `which(m)` picks from the list and the cache, under the lock, and return them."""

@@ -6,8 +6,9 @@
   address, takes back the address the browser ends on, swaps the code for a refresh token (PKCE), makes or finds the
   "ws" calendar and stores all of it as NAME's value. The token is never printed.
 - `ws gcal switch [insert|patch on|off]`: shows the switches, or moves one. Off is anyone's; on is a person's, at their
-  own terminal (ws.agentsession), and the broker checks again that the caller holds a terminal. Each flip is a line in
-  the broker's audit log.
+  own terminal (ws.agentsession), and needs the switch PIN (gcal-switch-pin in the store, pasted once with
+  `ws secret ask gcal-switch-pin`); the broker checks the PIN and that the caller holds a terminal. Each flip is a line
+  in the broker's audit log.
 
 The redirect is http://127.0.0.1:<port>/ on the person's own machine (Google's loopback flow for a Desktop client).
 Nothing listens there: the browser shows "can't connect", and the address bar holds the code, which is what is pasted
@@ -134,17 +135,18 @@ def cmd_switch(args) -> int:
         return 0
     if args.state is None:
         raise WsError("bad_input", "say on or off", f"`ws gcal switch {args.write} off`", 2)
+    pin = None
     if args.state == "on":
         why = agentsession.refusal(os.environ, sys.stdin.isatty(), sys.stdout.isatty())
         if why:
             raise WsError("refused", f"ws gcal switch {args.write} on: {why}", "run it in your own terminal", 3)
-        word = pysecrets.choice(["kauri", "tui", "kea", "rata", "nikau", "weka"])
-        typed = input(f"Turn calendar {args.write} ON: ws may then {args.write} events on its 'ws' calendar by itself.\n"
-                      f"Type {word} to confirm: ").strip()  # fmt: skip
-        if typed != word:
-            raise WsError("refused", "not confirmed; the switch did not move", "", 1)
+        print(f"Turn calendar {args.write} ON: ws may then {args.write} events on its 'ws' calendar by itself.")
+        try:
+            pin = getpass.getpass(f"Switch PIN (the one stored as {gcal.SWITCH_PIN_NAME}; not shown): ")
+        except (EOFError, KeyboardInterrupt):
+            raise WsError("refused", "not confirmed; the switch did not move", "", 1) from None
     try:
-        out = broker.gcal_switch(args.write, args.state, args.socket)
+        out = broker.gcal_switch(args.write, args.state, args.socket, pin=pin)
     except broker.BrokerRefused as e:
         raise WsError("refused", str(e)) from e
     except broker.BrokerUnavailable as e:

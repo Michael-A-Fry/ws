@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import urllib.parse
 from pathlib import Path
 
@@ -36,6 +37,7 @@ class FakeGoogle:
                         {"id": "his2", "summary": "Gone", "status": "cancelled"}]  # fmt: skip
         self.expire_once = False
         self.leak = False  # an answer that holds the access token
+        self.access_ok = True  # False: every API call is a 401, the fresh token's too
 
     def __call__(self, host, method, path, headers, body, timeout):
         u = urllib.parse.urlsplit(path)
@@ -49,7 +51,7 @@ class FakeGoogle:
         assert host == gcal.API_HOST
         data = json.loads(body) if body else None
         self.calls.append((host, method, u.path, q, data))
-        if headers.get("Authorization") != f"Bearer {self.access}":
+        if not self.access_ok or headers.get("Authorization") != f"Bearer {self.access}":
             return 401, b'{"error":{"message":"bad token"}}'
         if self.expire_once:
             self.expire_once = False
@@ -94,6 +96,8 @@ class Box:
         self.s.registry.write_text(f'[gcal]\nkind = "gcal"\n{entry_extra}', encoding="utf-8")
         held = gcal.Held("123456-abcdefghijkl.apps.googleusercontent.com", self.secret, self.refresh, CAL)
         self.s.store.write("gcal", gcal.dump_held(held))
+        self.pin = "pin-" + os.urandom(4).hex()
+        self.s.store.write(gcal.SWITCH_PIN_NAME, self.pin)
         self.fake = FakeGoogle(self.refresh, self.secret)
         monkeypatch.setattr(gcal, "_https", self.fake)
         self.log = base / "logs" / "broker.jsonl"
@@ -117,7 +121,10 @@ class Box:
         return [json.loads(x) for x in self.log.read_text().splitlines()] if self.log.exists() else []
 
     def needles(self) -> list[str]:
-        return [self.secret, self.refresh, self.fake.access]
+        return [self.secret, self.refresh, self.fake.access, self.pin]
+
+    def flip(self, write: str, state: str, pin: str | None = None) -> dict:
+        return broker.gcal_switch(write, state, self.sock, pin=self.pin if pin is None and state == "on" else pin)
 
     def close(self):
         self.broker.stop()
@@ -281,10 +288,10 @@ def test_one_switch_does_not_open_the_other(box):
 
 def test_a_flip_writes_an_audit_line_and_moves_the_switch(box):
     b = box()
-    out = broker.gcal_switch("insert", "on", b.sock)
+    out = b.flip("insert", "on")
     assert out["switches"]["insert"] is True and out["changed"] is True
     assert b.call("insert", ws_id="mail:9", event=EVENT)["existing"] is False
-    broker.gcal_switch("insert", "off", b.sock)
+    b.flip("insert", "off")
     assert b.refused("insert", ws_id="mail:10", event=EVENT).code == "switch_off"
     flips = [x for x in b.lines() if x["op"] == "gcal_switch"]
     assert [(x["purpose"], x["status"]) for x in flips] == [("insert:on", "on"), ("insert:off", "off")]
@@ -294,9 +301,9 @@ def test_a_flip_writes_an_audit_line_and_moves_the_switch(box):
 def test_on_needs_a_terminal_off_does_not(box):
     b = box(terminal=False)
     with pytest.raises(broker.BrokerRefused) as e:
-        broker.gcal_switch("insert", "on", b.sock)
+        b.flip("insert", "on")
     assert e.value.code == "caller_refused"
-    assert broker.gcal_switch("insert", "off", b.sock)["switches"]["insert"] is False
+    assert b.flip("insert", "off")["switches"]["insert"] is False
     refused = [x for x in b.lines() if x["op"] == "gcal_switch" and x["status"] == "caller_refused"]
     assert len(refused) == 1  # a refused flip is a line too
     assert b.refused("insert", ws_id="mail:11", event=EVENT).code == "switch_off"
@@ -314,9 +321,79 @@ def test_a_switch_file_another_user_could_write_counts_as_off(tmp_path):
     assert broker.read_gcal_switches(None, os.geteuid())["insert"] is False
 
 
-def test_this_shell_has_no_terminal_so_the_real_check_refuses():
-    assert isinstance(broker.peer_has_terminal(os.getpid()), bool)
-    assert broker.peer_has_terminal(2**31 - 1) is False
+def test_the_terminal_check_reads_the_controlling_terminal():
+    import subprocess
+    import sys
+
+    sleep = "import time; time.sleep(30)"
+    take = "import fcntl, termios; fcntl.ioctl(0, termios.TIOCSCTTY, 0); " + sleep  # the pty becomes its terminal
+    loose = subprocess.Popen([sys.executable, "-c", sleep], start_new_session=True, stdin=subprocess.DEVNULL)
+    main, sub = os.openpty()
+    held = subprocess.Popen([sys.executable, "-c", take], start_new_session=True, stdin=sub)
+    try:
+        deadline = time.monotonic() + 10
+        while not broker.peer_has_terminal(held.pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert broker.peer_has_terminal(held.pid) is True  # a session can make itself one: the PIN is the lock
+        assert broker.peer_has_terminal(loose.pid) is False  # a new session with no terminal: an agent's tool shell
+        assert broker.peer_has_terminal(2**31 - 1) is False
+    finally:
+        for c in (loose, held):
+            c.kill()
+            c.wait()
+        os.close(main)
+        os.close(sub)
+
+
+def test_a_faked_terminal_without_the_pin_cannot_turn_a_write_on(box):
+    b = box()  # the terminal check passes here, as it would for a session that made itself a pty
+    for pin in (None, "", "wrong-pin-123"):
+        with pytest.raises(broker.BrokerRefused) as e:
+            broker.gcal_switch("insert", "on", b.sock, pin=pin)
+        assert e.value.code == "caller_refused"
+    with pytest.raises(broker.BrokerRefused) as e:  # three misses lock it, the right PIN included
+        b.flip("insert", "on")
+    assert "restart" in str(e.value)
+    assert broker.gcal_switch(None, None, b.sock)["switches"]["insert"] is False
+    refused = [x for x in b.lines() if x["op"] == "gcal_switch" and x["status"] == "caller_refused"]
+    assert len(refused) == 4 and b.pin not in b.log.read_text()
+
+
+def test_no_pin_stored_means_no_switch_on(box):
+    b = box()
+    (b.s.store.path / gcal.SWITCH_PIN_NAME).unlink()
+    with pytest.raises(broker.BrokerRefused) as e:
+        b.flip("insert", "on", pin="anything-at-all")
+    assert e.value.code == "unset"
+
+
+def test_another_uid_cannot_turn_a_write_on(box):
+    b = box()
+    b.broker.own_uid = os.geteuid() + 1  # the broker runs as another user (the wall); this caller is not it
+    with pytest.raises(broker.BrokerRefused) as e:
+        b.flip("insert", "on")
+    assert e.value.code == "caller_refused"
+
+
+def test_two_401s_are_refused_without_a_token(box):
+    b = box()
+    b.fake.access_ok = False
+    e = b.refused("list", **RANGE)
+    assert e.code == "upstream_refused"
+    assert not any(n in str(e) for n in b.needles())
+
+
+def test_a_409_on_an_event_he_deleted_is_not_a_success(box):
+    b = box(switches=ON)
+    eid = gcal.event_id("mail:15")
+    b.fake.events[eid] = {"id": eid, "status": "cancelled", "extendedProperties": {"private": {"ws_id": "mail:15"}}}
+    assert b.refused("insert", ws_id="mail:15", event=EVENT).code == "deleted"
+
+
+def test_get_refuses_dot_ids(box):
+    b = box()
+    for eid in (".", "..", "../x"):
+        assert b.refused("get", calendar="primary", event_id=eid).code == "bad_request"
 
 
 # ---------------------------------------------------------------- credentials

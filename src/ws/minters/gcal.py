@@ -54,6 +54,9 @@ SWITCH_OP = "gcal_switch"
 EXTRA_KEYS = frozenset({"allow", "timezone"})
 NEEDS = ("read", "write")
 WRITES = ("insert", "patch")  # one switch each, default off
+SWITCH_PIN_NAME = "gcal-switch-pin"  # the store name of the PIN that turns a switch on (a person pastes it once)
+PIN_MIN = 6
+PIN_TRIES = 3
 SCOPES = (
     "https://www.googleapis.com/auth/calendar.app.created",
     "https://www.googleapis.com/auth/calendar.events.owned.readonly",
@@ -75,7 +78,9 @@ REFUSED_FIELDS = frozenset({"attendees", "conferenceData", "status", "id", "recu
 EVENT_OUT = ("id", "summary", "location", "start", "end", "status", "transparency", "updated", "htmlLink")
 WS_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 EVENT_ID_RE = re.compile(r"^[a-v0-9]{5,1024}$")  # Google's rule for a client-chosen id (base32hex)
-GOOGLE_ID_RE = re.compile(r"^[A-Za-z0-9_@.-]{1,1024}$")  # ids Google made (a read of his own calendar)
+GOOGLE_ID_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9_@.-]{0,1023}$"
+)  # a leading letter or digit: never "." or ".."  # ids Google made (a read of his own calendar)
 CAL_ID_RE = re.compile(r"^[A-Za-z0-9_.@-]{1,300}$")
 RFC3339_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,6})?)?(Z|[+-]\d{2}:\d{2})$")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -476,6 +481,8 @@ def _op_insert(api: _Api, h: Held, opts: Options, a: dict) -> dict:
         ev = _get(api, h, "ws", eid)
         if _marker(ev) != a["ws_id"]:
             raise GcalError("conflict", "an event with this id exists and is not this ws id's")
+        if ev.get("status") == "cancelled":  # he deleted it by hand: that is his answer, not a success to report
+            raise GcalError("deleted", "this ws id's event was deleted by hand; ws does not make it again")
         return {"event": _out(ev), "existing": True}
     raise _status_error(status, "insert")
 

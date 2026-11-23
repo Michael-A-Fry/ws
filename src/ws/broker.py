@@ -606,6 +606,70 @@ class _Grant:
 
 PLAIN_PATH_RE = re.compile(r"^/[A-Za-z0-9._~/-]*$")
 
+PROC_NET_TCP = ("/proc/net/tcp", "/proc/net/tcp6")
+
+
+def _loopback_hex(addr: str) -> bool:
+    """True when a /proc/net/tcp(6) address column is 127.x.x.x, ::1 or the IPv4-mapped ::ffff:127.x.x.x."""
+    if len(addr) == 8:
+        return addr[-2:].upper() == "7F"
+    if len(addr) == 32:
+        words = [addr[i : i + 8] for i in range(0, 32, 8)]
+        if words[:2] != ["00000000", "00000000"]:
+            return False
+        if words[2:] == ["00000000", "01000000"]:
+            return True  # ::1
+        return words[2].upper() == "FFFF0000" and words[3][-2:].upper() == "7F"
+    return False
+
+
+def _client_loopback(addr: str) -> bool:
+    """The proxy binds 127.0.0.1 and clients reach it there: only 127.0.0.1 (or its IPv4-mapped form) matches, so a
+    decoy row on 127.0.0.2 with the same ports can't be confused with the real one."""
+    a = addr.upper()
+    return a == "0100007F" or a == "0000000000000000FFFF00000100007F"
+
+
+def loopback_peer_uid(
+    local_port: int,
+    remote_port: int,
+    tables: tuple[str, ...] = PROC_NET_TCP,
+    budget_s: float = 2.0,
+) -> int | None:
+    """The uid that owns the TCP socket whose local port is `local_port` and remote port is `remote_port` (loopback
+    addresses only, IPv4, IPv6 or IPv4-mapped), read once from /proc/net/tcp and tcp6. Total and bounded: None when no
+    row matches, a table cannot be read or `budget_s` runs out. Raises NotImplementedError when the first table does
+    not exist at all (an OS without /proc/net/tcp), so the caller can tell "cannot say" from "no row"."""
+    deadline = time.monotonic() + budget_s
+    found: int | None = None
+    for i, table in enumerate(tables):
+        try:
+            with open(table, encoding="ascii", errors="replace") as f:
+                lines = f.readlines()[1:]
+        except FileNotFoundError:
+            if i == 0:
+                raise NotImplementedError(table) from None
+            continue
+        except OSError:
+            continue
+        for line in lines:
+            if time.monotonic() > deadline:
+                return None
+            cols = line.split()
+            if len(cols) < 8:
+                continue
+            try:
+                laddr, _, lp = cols[1].rpartition(":")
+                raddr, _, rp = cols[2].rpartition(":")
+                lport, rport, uid = int(lp, 16), int(rp, 16), int(cols[7])
+            except ValueError:
+                continue
+            if lport == local_port and rport == remote_port and _client_loopback(laddr) and _client_loopback(raddr):
+                if found is not None and found != uid:
+                    return -1  # two rows disagree: no uid will match it
+                found = uid
+    return found
+
 
 def path_allowed(prefixes: tuple[str, ...], path: str) -> bool:
     """True when the proxy may forward `path` for a name that lists `prefixes` (none listed: any path). With a list, the
@@ -669,6 +733,7 @@ class Broker:
         self.allow_plain_http = allow_plain_http  # tests only: http to 127.0.0.1; the command line has no switch for it
         self.imap_cafile: str | None = None  # tests only: a test CA for the mail server; None is the system's
         self.own_uid = os.geteuid()
+        self.proc_net_tcp: tuple[str, ...] = PROC_NET_TCP  # tests only: a planted table
         self._port = port
         self._grants: dict[str, _Grant] = {}  # sha256(token) -> grant
         self._lock = threading.Lock()
@@ -1552,6 +1617,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
     def _forward(self) -> None:
         b = self.server.broker
         grant: _Grant | None = None
+        self._peer_uid: int | None = None
         sent = 0
         status_code: int | str = 0
         try:
@@ -1560,6 +1626,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             if not m:
                 raise _HttpError(404, "not_found")
             grant = b.grant_for(m.group(1))
+            self._check_peer(grant)
             header, value, base_path = b.credential(grant, m.group(2) or "/")
             target = base_path + (m.group(2) or "/") + (f"?{query}" if query else "")
             body = self._read_body()
@@ -1586,8 +1653,23 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                 run=grant.run if grant else None,
                 area=grant.area if grant else None,
                 tier=grant.tier if grant else None,
+                uid=self._peer_uid,
                 bytes=sent,
             )
+
+    def _check_peer(self, grant: _Grant) -> None:
+        """The connection must come from the uid the lease was given to (the run record's uid when it names one: the
+        lease was refused to any other). A peer that cannot be found is refused. Logs the uid, never the token."""
+        b = self.server.broker
+        try:
+            peer = loopback_peer_uid(self.client_address[1], self.connection.getsockname()[1], b.proc_net_tcp)
+        except NotImplementedError:
+            if sys.platform != "linux":
+                return  # no /proc/net/tcp on this OS: the token alone is the credential (docs: known-limits)
+            raise _HttpError(403, "peer_refused") from None  # on Linux a missing table fails closed
+        self._peer_uid = peer  # the audit row (written in _forward) carries it, refused or served
+        if peer is None or peer != grant.uid:
+            raise _HttpError(403, "peer_refused")
 
     def _clean_headers(self, injected: str) -> dict[str, str]:
         out: dict[str, str] = {}

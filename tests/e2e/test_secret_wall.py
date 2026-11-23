@@ -170,6 +170,25 @@ def ws_as_dev(wall, *args, **kw):
     return as_user(DEV_USER, WALL_BIN, *args, home=wall["dev"], **kw)
 
 
+_PROXY_CALL = (
+    "import http.client,sys;"
+    "c=http.client.HTTPConnection(sys.argv[1],timeout=10);"
+    "c.request('POST',sys.argv[2],body=b'{}',headers={'x-api-key':'placeholder'});"
+    "print(c.getresponse().status)"
+)
+
+
+def proxy_status(user: str | None, hostport: str, path: str) -> int:
+    """The HTTP status of one proxied call, made as `user` (the lease's uid) or, with None, by this test process."""
+    if user is None:
+        c = http.client.HTTPConnection(hostport, timeout=10)
+        c.request("POST", path, body=b"{}", headers={"x-api-key": "placeholder"})
+        return c.getresponse().status
+    r = as_user(user, "/usr/bin/python3", "-c", _PROXY_CALL, hostport, path)
+    assert r.returncode == 0, r.stderr
+    return int(r.stdout.strip())
+
+
 def test_the_wall_is_built_the_way_the_command_says(wall):
     store = WALL_HOME / "secrets"
     assert sudo("stat", "-c", "%U %a", str(store)).stdout.strip() == f"{BROKER_USER} 700"
@@ -242,10 +261,14 @@ def test_the_agent_user_gets_a_lease_and_the_upstream_sees_the_injected_header(w
     assert VALUE not in r.stdout + r.stderr
     lease = broker.Lease(**json.loads(r.stdout))
     hostport, _, prefix = lease.base_url.removeprefix("http://").partition("/")
-    c = http.client.HTTPConnection(hostport, timeout=10)  # the agent's tool, holding only a placeholder
-    c.request("POST", f"/{prefix}/v1/messages", body=b"{}", headers={"x-api-key": "placeholder"})
-    assert c.getresponse().status == 200
+    url = f"/{prefix}/v1/messages"
+    # the agent's tool (as the lease's uid), holding only a placeholder
+    assert proxy_status(DEV_USER, hostport, url) == 200
     assert wall["stub"].seen[-1]["x-api-key"] == VALUE
+    # a lease is usable only by its uid: this process is another uid, so the same URL is refused and goes nowhere
+    seen = len(wall["stub"].seen)
+    assert proxy_status(None, hostport, url) == 403
+    assert len(wall["stub"].seen) == seen
     for refused in (
         ["--host", "other.example.com", "--purpose", "run"],
         ["--host", wall["host"], "--purpose", "wander"],
@@ -264,9 +287,7 @@ def test_the_service_itself_never_speaks_plain_http(wall):
     assert r.returncode == 0, r.stderr
     lease = broker.Lease(**json.loads(r.stdout))
     hostport, _, prefix = lease.base_url.removeprefix("http://").partition("/")
-    c = http.client.HTTPConnection(hostport, timeout=10)
-    c.request("POST", f"/{prefix}/v1/messages", body=b"{}")
-    assert c.getresponse().status == 502
+    assert proxy_status(DEV_USER, hostport, f"/{prefix}/v1/messages") == 502
     assert len(wall["stub"].seen) == seen
 
 

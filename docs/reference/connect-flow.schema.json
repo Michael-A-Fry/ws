@@ -17,7 +17,10 @@
       "required": ["name", "hosts"],
       "properties": {
         "name": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,63}$" },
-        "hosts": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } }
+        "hosts": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
+        "purposes": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "base_path": { "type": "string", "pattern": "^/" },
+        "paths": { "type": "array", "minItems": 1, "items": { "type": "string", "pattern": "^/" } }
       }
     },
     "steps": {

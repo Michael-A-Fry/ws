@@ -58,6 +58,11 @@ WALL_LIB = "/opt/ws/lib"
 SAFE_PATH = re.compile(r"^[A-Za-z0-9_./+-]+$")
 PATH_PREFIX_RE = re.compile(r"^/[A-Za-z0-9._~/-]*$")
 AREA_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
+# A `base_path` may end in PATH_TOKEN, once: the broker puts the value there instead of in a header, for an API that
+# takes its key in the path (Telegram: `/bot<token>/sendMessage`). Such a value must match PATH_VALUE_RE (no / . % ? #
+# or space), so it can never change which path the request reaches.
+PATH_TOKEN = "{value}"
+PATH_VALUE_RE = re.compile(r"^[A-Za-z0-9_:-]{1,256}$")
 # The tiers, lowest first. A run's tier reaches the names of the tiers in REACH; `walled` reaches only walled names, and
 # nothing reaches up into it, so a walled class's keys never leave its own runs.
 TIERS = ("walled", "worker", "lead", "lead-elevated")
@@ -92,6 +97,11 @@ class Entry:
     ttl: float | None = None  # longest lease of this name, seconds; None: the broker's own limit (one hour by default)
     options: object = None  # the minter's own keys, parsed by it
     source: str = "paste"  # paste: a person brings the value; generate: `ws secret generate` makes it
+
+    @property
+    def token_in_path(self) -> bool:
+        """True when the value goes into the request path (base_path ends in {value}) and no header carries it."""
+        return self.base_path.endswith(PATH_TOKEN)
 
     @property
     def scoped(self) -> bool:
@@ -234,8 +244,14 @@ def _entry(path: Path, name: str, t: dict) -> Entry:
     for h in hosts:
         if not HOST_RE.match(h):
             raise SecretsError(f"{path}: [{name}] {h!r} is not a host name (no scheme, no path)")
-    header = t.get("header", "x-api-key")
-    if not isinstance(header, str) or not HEADER_RE.match(header.lower()):
+    raw_base = t.get("base_path", "")
+    token_in_path = isinstance(raw_base, str) and raw_base.endswith(PATH_TOKEN)
+    if token_in_path and ("header" in t or "format" in t):
+        raise SecretsError(
+            f"{path}: [{name}] a base_path holding {{value}} sends no header: leave header and format out"
+        )
+    header = t.get("header", "" if token_in_path else "x-api-key")
+    if not token_in_path and (not isinstance(header, str) or not HEADER_RE.match(header.lower())):
         raise SecretsError(f'{path}: [{name}] header must be a header name such as "x-api-key"')
     header = header.lower()
     fmt = t.get("format", "Bearer {value}" if header == "authorization" else "{value}")
@@ -257,7 +273,7 @@ def _entry(path: Path, name: str, t: dict) -> Entry:
             raise SecretsError(
                 f"{path}: [{name}] {pre!r} is not a path prefix (start with /; letters, digits and ._~/- only; no . or .. part)"
             )
-    base_path = t.get("base_path", "")
+    base_path = raw_base[: -len(PATH_TOKEN)] if token_in_path else raw_base  # {value} only once, only at the end
     if "base_path" in t and (
         not isinstance(base_path, str)
         or not PATH_PREFIX_RE.fullmatch(base_path)
@@ -265,9 +281,10 @@ def _entry(path: Path, name: str, t: dict) -> Entry:
         or any(seg in (".", "..") for seg in base_path.split("/"))
     ):
         raise SecretsError(
-            f"{path}: [{name}] base_path must start with / and use letters, digits and ._~/- only: no . or .. part, no //, no query"
+            f"{path}: [{name}] base_path must start with / and use letters, digits and ._~/- only: no . or .. part,"
+            " no //, no query; {value} may stand once, at the end"
         )
-    base_path = base_path.rstrip("/")
+    base_path = base_path + PATH_TOKEN if token_in_path else base_path.rstrip("/")
     ttl = t.get("ttl")
     if ttl is not None and (isinstance(ttl, bool) or not isinstance(ttl, (int, float)) or not 0 < ttl <= MAX_TTL_S):
         raise SecretsError(f"{path}: [{name}] ttl must be a number of seconds above 0 and at most {MAX_TTL_S}")
@@ -300,6 +317,204 @@ def _entry(path: Path, name: str, t: dict) -> Entry:
         options=options,
         source=source,
     )
+
+
+# ---------------------------------------------------------------- the one registry writer (ADR 0034)
+#
+# ws appends an entry only on the person's yes (`ws mail connect`, `ws connect <flow>`) and takes out only a block it
+# added. The file is never re-serialised, so comments and layout stay; the old file is backed up first; the new one is
+# written to a temp file in the same folder and renamed over the old only if the old is still the file that was read.
+
+
+class RegistryWriteError(SecretsError):
+    """The registry could not be changed safely; nothing was changed. Never carries a value (the registry has none)."""
+
+
+BACKUP_SUFFIX = ".bak"
+
+
+def entry_block(name: str, table: dict, comment: str = "") -> str:
+    """The TOML text of one header entry, from plain keys (lists of strings and strings only), checked by the same
+    rules the broker loads it by. Raises SecretsError."""
+    if not NAME_RE.match(name):
+        raise SecretsError(f"{name!r} is not a valid name (letters, digits, - and _; starts with a letter)")
+    lines = [f"# {comment}"] if comment else []
+    lines.append(f"[{name}]")
+    for k, v in table.items():
+        if isinstance(v, str):
+            lines.append(f"{k} = {_toml_str(v)}")
+        elif isinstance(v, (list, tuple)) and all(isinstance(x, str) for x in v):
+            lines.append(f"{k} = [{', '.join(_toml_str(x) for x in v)}]")
+        else:
+            raise SecretsError(f"[{name}] {k} must be a string or a list of strings")
+    text = "\n".join(lines) + "\n"
+    try:
+        raw = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as e:
+        raise SecretsError(f"[{name}] does not make valid TOML ({e})") from e
+    _entry(Path("the new entry"), name, raw[name])
+    return text
+
+
+def _toml_str(v: str) -> str:
+    if re.search(r'[\x00-\x1f\x7f"\\]', v):
+        raise SecretsError("a registry string may not hold a quote, a backslash or a control character")
+    return f'"{v}"'
+
+
+def entry_differences(entry: Entry, block: str) -> list[str]:
+    """What differs between an entry already in the registry and the one `block` would add (empty: the same)."""
+    want = _entry(Path("the new entry"), entry.name, tomllib.loads(block)[entry.name])
+    out = []
+    for key in ("kind", "hosts", "header", "format", "purposes", "paths", "base_path", "tier", "area", "ttl", "source"):
+        a, b = getattr(entry, key), getattr(want, key)
+        if isinstance(a, tuple):
+            a, b = sorted(a), sorted(b)
+        if a != b:
+            out.append(f"{key}: the registry has {a!r}, this would add {b!r}")
+    return out
+
+
+def _open_registry(path: Path) -> tuple[bytes, tuple[int, int, int] | None]:
+    """The registry's bytes and (device, inode, mode), or (b"", None) when there is none; refused as `_read_trusted`
+    refuses: a symlink, not a regular file, another user's, or a file or folder group or others can write."""
+    try:
+        pst = os.stat(path.parent)
+    except FileNotFoundError:
+        return b"", None
+    if pst.st_mode & 0o022:
+        raise RegistryWriteError(
+            f"{path.parent}: its folder can be written by group or others, so ws won't write there"
+        )
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    except FileNotFoundError:
+        return b"", None
+    except OSError as e:
+        if e.errno == errno.ELOOP:
+            raise RegistryWriteError(f"{path}: it is a symlink; ws won't write through it") from e
+        raise
+    with os.fdopen(fd, "rb") as f:
+        st = os.fstat(f.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            raise RegistryWriteError(f"{path}: it is not a regular file")
+        why = registry_problem(st, os.geteuid())
+        if why:
+            raise RegistryWriteError(f"{path}: {why}")
+        return f.read(), (st.st_dev, st.st_ino, st.st_mode & 0o777)
+
+
+def _write_beside(path: Path, data: bytes, mode: int) -> Path:
+    """`data` in a new temp file next to `path` (O_EXCL, 0600, fsynced, then `mode`). Returns its path."""
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{os.urandom(4).hex()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+            os.fchmod(fh.fileno(), mode)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
+    return tmp
+
+
+def _fsync_dir(folder: Path) -> None:
+    with contextlib.suppress(OSError):
+        fd = os.open(folder, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
+@contextlib.contextmanager
+def _registry_lock(path: Path):
+    """An exclusive lock on `<registry>.lock`, held by every ws writer of the registry (no lock where there is no flock)."""
+    fd = os.open(path.with_name(path.name + ".lock"), os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        try:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except ImportError:
+            pass
+        yield
+    finally:
+        os.close(fd)  # closing releases the lock
+
+
+def _rewrite(path: Path, change, *, backup: bool = False) -> tuple[bool, bool]:
+    """Replace the registry with `change(old_text)` (None: leave it), under the registry lock. With `backup`, the old
+    file is copied to `<registry>.bak` first. The new text must load, and it is renamed in only if the file is still the
+    one read (same inode and bytes). Returns (changed, backed up). Raises RegistryWriteError."""
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _open_registry(path)  # refuse a symlink or a loose folder before a lock file is made there
+        with _registry_lock(path):
+            return _rewrite_locked(path, change, backup)
+    except RegistryWriteError:
+        raise
+    except (OSError, SecretsError) as e:
+        raise RegistryWriteError(f"{path}: {e}") from e
+
+
+def _rewrite_locked(path: Path, change, backup: bool) -> tuple[bool, bool]:
+    old, ident = _open_registry(path)
+    try:
+        new_text = change(old.decode("utf-8"))
+    except UnicodeDecodeError as e:
+        raise RegistryWriteError(f"{path}: it is not UTF-8 text") from e
+    if new_text is None:
+        return False, False
+    mode = ident[2] if ident else 0o600
+    backed_up = backup and ident is not None
+    if backed_up:
+        bak = _write_beside(path, old, 0o600)
+        os.replace(bak, path.with_name(path.name + BACKUP_SUFFIX))
+    tmp = _write_beside(path, new_text.encode("utf-8"), mode)
+    try:
+        load_registry(tmp)  # the whole new file loads, or nothing changes
+        now, now_ident = _open_registry(path)
+        same_file = (now_ident[:2] if now_ident else None) == (ident[:2] if ident else None)
+        if not same_file or hashlib.sha256(now).digest() != hashlib.sha256(old).digest():
+            raise RegistryWriteError(f"{path}: it changed while ws was writing it; nothing was changed, try again")
+        os.rename(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
+    _fsync_dir(path.parent)
+    return True, backed_up
+
+
+def append_entry(path: Path, block: str) -> bool:
+    """Add one new entry, as text, at the end of the registry (comments and layout kept), backing the old file up to
+    `<registry>.bak`. Returns whether there was an old file to back up. Raises RegistryWriteError."""
+
+    def change(old: str) -> str:
+        sep = "" if not old or old.endswith("\n\n") else "\n" if old.endswith("\n") else "\n\n"
+        return old + sep + block
+
+    return _rewrite(path, change, backup=True)[1]
+
+
+def remove_block(path: Path, block: str) -> bool:
+    """Take out exactly `block` (the last copy), keeping everything else. False when it is not there unchanged."""
+
+    def change(old: str) -> str | None:
+        at = old.rfind(block)
+        if at < 0:
+            return None
+        rest = old[at + len(block) :]
+        nxt = next((ln.strip() for ln in rest.splitlines() if ln.strip() and not ln.strip().startswith("#")), "")
+        if nxt and not nxt.startswith("["):
+            return None  # a key was added under the block: it belongs to the entry, so the entry was changed
+        return (old[:at].rstrip("\n") + "\n" if old[:at].strip() else "") + rest
+
+    return _rewrite(path, change)[0]
 
 
 def check_value(value: str) -> str:

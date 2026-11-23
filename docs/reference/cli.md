@@ -1618,6 +1618,56 @@ An optional `[watch.panes]` table in the profile:
 | `live_socket` | the policy's | The tmux socket to watch (a path, or a name under the tmux folder). Left out, the `live_socket` of the `pane-keys` or `pane-close` guard, else this user's default socket. |
 | `show_text` | `true` | `false` leaves the dialog's text out of the push (the window name and `@id` stay), for a machine where a question must not leave the box. Whatever this says, a pane in a walled or counts-only class (judged by its folder), or a policy that can't be read, never has its text quoted. |
 
+## `ws worktrees`
+
+Removes the git worktrees agent sessions leave under `<repo>/.claude/worktrees/`.
+
+```text
+ws worktrees prune [--repo R]... [--only PATH] [--min-idle HOURS] [--dry-run] [--auto]
+```
+
+A worktree is kept, and the reason counted, when it's `locked`, `dirty` (a tracked file has a change), `fresh` (a
+file in it changed in the last `idle_hours`, default 12), `in-use` (a process has its working folder or an open file
+inside it: `/proc` on Linux, `lsof` on macOS; a process of another account can't be seen), `busy-unknown` (the process
+list doesn't show the caller's own parents, as in a PID namespace or with `hidepid`, so use can't be ruled out and every
+worktree stays), or `unreachable` (HEAD is detached and no branch, remote or tag holds it). Everything else is removed
+with `git worktree remove`, never `--force`: git still refuses a folder with untracked files, and that's reported as
+`failed` and left registered. Only a folder where `git status` shows nothing to lose is first made writable, and a file
+with more than one hard link keeps its mode. Nothing runs `git worktree prune`, so other registered worktrees are left
+alone. Branches and commits stay; the main checkout and worktrees elsewhere are never touched;
+ignored files (virtualenvs, caches) go with the folder. Each removal is one line in `<state>/worktree-prune.log`. The
+run prints `checked N, removed M, kept K (reasons), X GB freed`; `--dry-run` changes nothing and prints the same,
+saying would remove. Exit 1 when a removal failed.
+
+| Option | Meaning |
+|---|---|
+| `--repo R` | A repo to prune, repeatable. Default: the repo the current folder is in. |
+| `--only PATH` | One worktree, for a session that has just finished. Its head must also be on a remote ref (`unpushed` otherwise), and the caller's own parents aren't counted as users. |
+| `--min-idle HOURS` | Idle hours before a worktree may go (default `idle_hours`). `0` skips the idle check. |
+| `--auto` | The timer's run, below. Takes no other option. |
+
+A repo is pruned only from inside its own zone: a caller in a data class may prune that class's repos, and another
+class of `full` access when it's `full` itself; a caller in no class (a timer) may prune `full` classes. Any other repo
+is refused (exit 3) before git runs in it, and a policy that can't be read refuses all. With no classes in the policy
+nothing is refused.
+
+`ws-worktrees-prune.timer` (`ws.job.worktrees-prune` on launchd, written by `ws schedule apply`) runs
+`ws worktrees prune --auto` every 30 minutes. It reads the disk (`/`) and prunes when `interval_hours` (6) have passed or
+the disk is at `disk_pct` (85) or more. On that pressure it also tells the lead once per interval, with the numbers before
+and after: a `ws msg` when the registry lets it send, always a line in `logs/alerts.jsonl` and a push through the notify
+role. The repos are those the policy's classes name (a literal folder or a `*` glob of one), `[worktrees] repos`, or
+`~/code/*` when there are no classes. `<state>/worktree-prune.json` holds the last run's `worktrees_pruned`, `gb_freed`
+and `disk_pct`.
+
+An optional `[worktrees]` table in the profile:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `idle_hours` | `12` | Hours with no change before a worktree may go. |
+| `interval_hours` | `6` | Hours between the timer's prunes. |
+| `disk_pct` | `85` | Disk use at which the timer prunes at once and tells the lead. |
+| `repos` | `[]` | More repos for `--auto`. |
+
 ## `ws approve`
 
 A person approves one pending call the gate refused (single use, 10 minutes).

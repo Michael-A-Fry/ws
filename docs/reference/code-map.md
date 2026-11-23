@@ -101,6 +101,7 @@ below, and `python3 scripts/gen_code_map.py --check` (prek and CI) fails when it
 | `version.py` | `ws version`: which build is this, where did it come from, and where is it installed |
 | `walls.py` | `ws walls`: set up a walled data class as an operating-system boundary, and check that it is in... |
 | `wallsettings.py` | What the sandbox settings Claude Code reads say about the wall: the keys that widen it, and `ws... |
+| `worktrees.py` | `ws worktrees prune`: remove finished agent worktrees, and keep the disk from filling with them |
 
 <!-- vale on -->
 

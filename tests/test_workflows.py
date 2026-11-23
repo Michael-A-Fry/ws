@@ -75,7 +75,9 @@ def test_no_other_workflow_uses_the_lab_runner():
 def test_every_action_is_pinned_by_commit(workflow: str):
     text = (WORKFLOWS / workflow).read_text(encoding="utf-8")
     uses = re.findall(r"^\s*(?:- )?uses:\s*(\S+)", text, re.MULTILINE)
-    assert uses
+    assert (
+        uses or "uses:" not in text
+    )  # a workflow of run steps only (freeze.yml) has nothing to pin; a missed match fails
     for u in uses:
         assert "@" in u and SHA.match(u.split("@", 1)[1]), f"{workflow}: {u} is not pinned by commit"
 

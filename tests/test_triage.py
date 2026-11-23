@@ -1163,3 +1163,23 @@ def test_a_deleted_draft_is_not_made_again_even_when_the_handled_key_is_gone(tmp
     r.in_drafts.clear()  # he deleted it
     rec = go(tmp_path, r, m, now=NOW.replace(hour=6))
     assert len(r.drafts) == 1 and {"mailbox": "a", "kind": "already_drafted_before"} in rec["notes"]
+
+
+def test_drafted_is_not_kept_by_a_dry_run_or_a_failed_draft_and_a_new_message_is_still_drafted(tmp_path):
+    r, m = Route(), Model(DRAFTING, DRAFTING, DRAFTING)
+    r.add(1, thread_msg(1, "<t1@example.org>"))
+    go(tmp_path, r, m, dry=True)
+    assert not (tmp_path / "state" / "inbox.json").exists()
+
+    def boom(ref, body):
+        raise mail.MailError("broker_unavailable", "down")
+
+    r.draft, real = boom, r.draft
+    go(tmp_path, r, m)
+    s = json.loads((tmp_path / "state" / "inbox.json").read_text())
+    assert "drafted" not in s["mailboxes"]["a"]
+    r.draft = real
+    r.add(2, thread_msg(2, "<t2@example.org>", refs="<t1@example.org>"))
+    r.in_drafts.clear()
+    go(tmp_path, r, m, now=NOW.replace(hour=7))
+    assert [d[0] for d in r.drafts] == ["a:7-2"]  # the failed draft was not remembered; the new message is drafted

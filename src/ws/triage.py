@@ -1182,7 +1182,7 @@ class Run:
     def mark_drafted(self, name: str, m: Message) -> None:
         d = self.drafted_of(name)
         k = drafted_key(m)
-        if m.thread and k not in d:
+        if m.thread and m.mid and k not in d:  # no Message-ID: nothing stable to key on
             d.append(k)
             del d[:-MAX_DRAFTED]
 
@@ -1411,6 +1411,7 @@ class Run:
         drafted, answered = self.reply_ids(name, route)
         if newest.mid in answered or {newest.mid, *newest.chain} & drafted:  # never changed or removed: his to delete
             self.t.notes.append({"mailbox": name, "kind": "already_drafted"})
+            self.mark_drafted(name, newest)  # a draft made before `drafted` existed: remembered from now
             return listed(True, "a reply to this thread is already in your drafts or sent mail")
         if drafted_key(newest) in self.drafted_of(
             name

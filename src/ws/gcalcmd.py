@@ -126,7 +126,10 @@ def cmd_switch(args) -> int:
     from ws import agentsession
 
     if args.write is None:
-        out = broker.gcal_switch(None, None, args.socket)
+        try:
+            out = broker.gcal_switch(None, None, args.socket)
+        except broker.BrokerError as e:
+            raise WsError("unavailable", str(e), "start the broker: the switches are its own") from e
         if args.json:
             output.result(out)
         else:

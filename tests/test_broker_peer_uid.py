@@ -7,6 +7,7 @@ import os
 import shutil
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -37,7 +38,13 @@ def env():
 
 
 def refusals(env) -> list[dict]:
-    return [x for x in env.audit() if x["op"] == "proxy" and x["status"] == "peer_refused"]
+    """The refusal rows. The reply goes out before the audit line is written, so wait a moment for it."""
+    deadline = time.monotonic() + 5
+    while True:
+        rows = [x for x in env.audit() if x["op"] == "proxy" and x["status"] == "peer_refused"]
+        if rows or time.monotonic() > deadline:
+            return rows
+        time.sleep(0.02)
 
 
 def test_right_uid_gets_through_to_the_upstream(env):

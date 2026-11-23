@@ -1412,7 +1412,9 @@ class Run:
         if newest.mid in answered or {newest.mid, *newest.chain} & drafted:  # never changed or removed: his to delete
             self.t.notes.append({"mailbox": name, "kind": "already_drafted"})
             return listed(True, "a reply to this thread is already in your drafts or sent mail")
-        if drafted_key(newest) in self.drafted_of(name):  # made once for this message, and he may have deleted it: not made again
+        if drafted_key(newest) in self.drafted_of(
+            name
+        ):  # made once for this message, and he may have deleted it: not made again
             self.t.notes.append({"mailbox": name, "kind": "already_drafted_before"})
             return listed(False, "a draft was made for this thread before; not made again")
         if not self.dry:

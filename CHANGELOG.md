@@ -11,7 +11,7 @@ body of the GitHub release.
 ### Added
 
 - `ws triage` remembers, per mailbox, the thread and newest message each draft answered (`drafted` in the state file,
-  apart from `handled`, never reset by a UIDVALIDITY change), so a draft he deleted is not made again (C832).
+  apart from `handled`, never reset by a UIDVALIDITY change), so a draft he deleted isn't made again (C832).
 - `ws connect <flow>` adds its flow's own registry entry on the person's yes (C603, ADR 0034), instead of stopping at
   `secret_not_registered`. The entry comes from the flow's `[secret]` block only (which gains `purposes`, `base_path`
   and `paths`); `--dry-run` shows it as a first `register-secret` step (`confirm_register`); a name already registered

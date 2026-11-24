@@ -8,6 +8,8 @@ body of the GitHub release.
 
 ## [Unreleased]
 
+## [0.1.11.11] - 2026-11-24
+
 ### Fixed
 
 - The broker's proxy gives each resolved upstream address 10 s to connect, then tries the next one, in resolver

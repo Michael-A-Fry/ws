@@ -94,6 +94,7 @@ class Entry:
     kind: str = "header"  # header: the broker adds it to requests; else a minter in ws.minters makes a credential
     paths: tuple[str, ...] = ()  # request paths the broker forwards for this name (prefixes); empty: any path
     base_path: str = ""  # a path the broker puts in front of the request path on its way out (the client's path is still checked by `paths`)
+    purpose_paths: tuple[str, ...] = ()  # "purpose:/prefix" rows; when any, a lease reaches only its purpose's prefixes
     ttl: float | None = None  # longest lease of this name, seconds; None: the broker's own limit (one hour by default)
     options: object = None  # the minter's own keys, parsed by it
     source: str = "paste"  # paste: a person brings the value; generate: `ws secret generate` makes it
@@ -102,6 +103,13 @@ class Entry:
     def token_in_path(self) -> bool:
         """True when the value goes into the request path (base_path ends in {value}) and no header carries it."""
         return self.base_path.endswith(PATH_TOKEN)
+
+    def paths_for(self, purpose: str) -> tuple[str, ...] | None:
+        """The prefixes a lease of this purpose may reach: None when the entry binds no paths to purposes, () when it
+        binds some but none to this purpose (so nothing is reachable)."""
+        if not self.purpose_paths:
+            return None
+        return tuple(r.split(":", 1)[1] for r in self.purpose_paths if r.split(":", 1)[0] == purpose)
 
     @property
     def scoped(self) -> bool:
@@ -273,6 +281,15 @@ def _entry(path: Path, name: str, t: dict) -> Entry:
             raise SecretsError(
                 f"{path}: [{name}] {pre!r} is not a path prefix (start with /; letters, digits and ._~/- only; no . or .. part)"
             )
+    purpose_paths = _str_list(path, name, "purpose_paths", t.get("purpose_paths", []))
+    if "purpose_paths" in t and not purpose_paths:
+        raise SecretsError(f"{path}: [{name}] purpose_paths is empty: leave the key out, or list purpose:/prefix rows")
+    for row in purpose_paths:
+        who, _, pre = row.partition(":")
+        if who not in purposes:
+            raise SecretsError(f"{path}: [{name}] purpose_paths row {row!r}: {who!r} is not one of its purposes")
+        if not PATH_PREFIX_RE.fullmatch(pre) or any(seg in (".", "..") for seg in pre.split("/")):
+            raise SecretsError(f"{path}: [{name}] purpose_paths row {row!r}: {pre!r} is not a path prefix")
     base_path = raw_base[: -len(PATH_TOKEN)] if token_in_path else raw_base  # {value} only once, only at the end
     if "base_path" in t and (
         not isinstance(base_path, str)
@@ -293,7 +310,20 @@ def _entry(path: Path, name: str, t: dict) -> Entry:
         raise SecretsError(f"{path}: [{name}] source must be paste or generate")
     if source == "generate" and kind != "header":
         raise SecretsError(f"{path}: [{name}] a {kind} credential is brought by a person; source must be paste")
-    allowed = {"hosts", "header", "format", "purposes", "tier", "area", "kind", "source", "ttl", "paths", "base_path"}
+    allowed = {
+        "hosts",
+        "header",
+        "format",
+        "purposes",
+        "tier",
+        "area",
+        "kind",
+        "source",
+        "ttl",
+        "paths",
+        "base_path",
+        "purpose_paths",
+    }
     options = None
     if kind != "header":
         allowed = {"tier", "area", "kind", "purposes", "source"} | minters[kind].EXTRA_KEYS
@@ -313,6 +343,7 @@ def _entry(path: Path, name: str, t: dict) -> Entry:
         kind=kind,
         paths=req_paths,
         base_path=base_path,
+        purpose_paths=purpose_paths,
         ttl=float(ttl) if ttl is not None else None,
         options=options,
         source=source,
@@ -366,7 +397,20 @@ def entry_differences(entry: Entry, block: str) -> list[str]:
     """What differs between an entry already in the registry and the one `block` would add (empty: the same)."""
     want = _entry(Path("the new entry"), entry.name, tomllib.loads(block)[entry.name])
     out = []
-    for key in ("kind", "hosts", "header", "format", "purposes", "paths", "base_path", "tier", "area", "ttl", "source"):
+    for key in (
+        "kind",
+        "hosts",
+        "header",
+        "format",
+        "purposes",
+        "paths",
+        "base_path",
+        "purpose_paths",
+        "tier",
+        "area",
+        "ttl",
+        "source",
+    ):
         a, b = getattr(entry, key), getattr(want, key)
         if isinstance(a, tuple):
             a, b = sorted(a), sorted(b)

@@ -4,7 +4,10 @@ Kept as a Python string, not a .js file, because the secret wall copies the ws p
 `/*__CHECK__*/ []` is replaced with the argv of the thin gate client (ws.gateclient), which asks the resident gate and runs
 `ws gate check` itself when it can't answer, so OpenCode and Claude Code get the same decision; `/*__EVENT__*/ []` with the
 same client's argv for `ws gate event` (the guards on OpenCode's other events); `/*__WS__*/ []` with the argv that runs ws;
-`/*__PIN__*/ []` with the `--pin` arguments that go on the commands that are not a check (the layout ws install resolved).
+`/*__PIN__*/ []` with the `--pin` arguments that go on the commands that are not a check (the layout ws install resolved),
+`/*__GATE_ENV__*/ {}` with that layout's environment (`paths.Pin.environ`), which every ws child this shim starts gets.
+So under OpenCode the pin check never refuses: a ws child always resolves to the install layout, whatever the run's own
+environment says. Claude Code's hooks run with the session's environment and refuse when it points elsewhere (C792).
 `/*__GOVERNED__*/ []` and `/*__POST_TOOLS__*/ []` name the tools a call is checked before and after, `/*__ADVICE__*/ []` the
 ws events (start, prompt, post, stop, subagent-stop) a guard that is on wants, `/*__ASK__*/ []` the `ask_commands` patterns
 written as OpenCode's own `ask`, `/*__ASKS__*/ ""` the file its permission asks are appended to (ws home reads it) and
@@ -27,6 +30,16 @@ const CHECK = /*__CHECK__*/ []
 const EVENT = /*__EVENT__*/ []
 const WS = /*__WS__*/ []
 const PIN = /*__PIN__*/ []
+// The pinned layout's environment, fixed when ws wrote this file (C792). OpenCode runs under ws with HOME and XDG_* set
+// to the run's own folder, so a ws child that inherited them would see ws's folders "moved" and its pin check would
+// refuse every call. Only ws's own children get these; the agent's process keeps its run folder. WS_HOME is dropped
+// because it would name ws's folders outright, over these.
+const GATE_ENV = /*__GATE_ENV__*/ {}
+const childEnv = () => {
+  const e = { ...process.env, ...GATE_ENV }
+  delete e.WS_HOME
+  return e
+}
 const GOVERNED = /*__GOVERNED__*/ []
 const POST_TOOLS = /*__POST_TOOLS__*/ []
 const ADVICE = /*__ADVICE__*/ []
@@ -46,6 +59,7 @@ const ws = (sub, id) =>
     encoding: "utf8",
     timeout: 3000,
     stdio: ["ignore", "pipe", "ignore"],
+    env: childEnv(),
   })
 
 // The guards on OpenCode's other events: `ws gate event` through the thin client, with a short bound. The answer is
@@ -65,7 +79,7 @@ const advice = (event, body) =>
       done(code === null ? null : { code, out, err })
     }
     try {
-      const child = spawn(EVENT[0], EVENT.slice(1), { stdio: ["pipe", "pipe", "pipe"] })
+      const child = spawn(EVENT[0], EVENT.slice(1), { stdio: ["pipe", "pipe", "pipe"], env: childEnv() })
       timer = setTimeout(() => {
         try {
           child.kill("SIGKILL")
@@ -255,6 +269,7 @@ export const WsGate = async ({ client, directory } = {}) => {
     try {
       child = spawn(WS[0], [...WS.slice(1), "msg", "wait", "--session-hook", "--session-id", id, ...PIN], {
         stdio: ["ignore", "ignore", "pipe"],
+        env: childEnv(),
       })
     } catch {
       return
@@ -402,6 +417,7 @@ export const WsGate = async ({ client, directory } = {}) => {
           cwd: resolve(directory ?? process.cwd(), input.tool === "bash" ? (output.args?.workdir ?? ".") : "."), // only bash runs in args.workdir
         }),
         encoding: "utf8",
+        env: childEnv(),
         timeout: 30000, // ms: more than the client's worst case (ws.gateclient.WORST_CASE_S); a timed-out check is r.error, so blocked
       })
       if (r.status === 4 && !r.error) {

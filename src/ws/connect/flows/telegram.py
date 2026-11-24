@@ -14,6 +14,9 @@ hosts = ["api.telegram.org"]
 purposes = ["notify", "bridge"]
 base_path = "/bot{value}"
 paths = ["/getMe", "/getUpdates", "/sendMessage", "/editMessageReplyMarkup", "/answerCallbackQuery"]
+# notify only sends; the bridge (ws-next's poller) reads updates and resolves cards (C828)
+purpose_paths = ["notify:/getMe", "notify:/sendMessage", "bridge:/getMe", "bridge:/getUpdates", "bridge:/sendMessage",
+                 "bridge:/editMessageReplyMarkup", "bridge:/answerCallbackQuery"]
 
 [[steps]]
 id = "make-bot"

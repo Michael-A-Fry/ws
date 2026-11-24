@@ -657,7 +657,7 @@ def test_revoke_leaves_an_added_entry_that_was_edited_since(env):
     st = engine.load_state(c, FLOW)
     c.io = Script("yes")
     engine._register(c, FLOW, st)
-    reg.write_text(reg.read_text().replace('purposes = ["notify", "bridge"]', 'purposes = ["notify", "run"]'))
+    reg.write_text(reg.read_text().replace('purposes = ["notify", "bridge"]', 'purposes = ["notify", "bridge", "run"]'))
     out = engine.revoke(c, FLOW, assume_yes=True)
     assert any("changed since ws connect added it" in d for d in out["did"])
     assert "TELEGRAM_BOT_TOKEN" in wsecrets.load_registry(reg)
@@ -951,3 +951,9 @@ def test_the_telegram_entry_allows_the_bridge(env):
     e = flow_entry()
     assert e.purposes == ("notify", "bridge")
     assert set(e.paths) == {"/getMe", "/getUpdates", "/sendMessage", "/editMessageReplyMarkup", "/answerCallbackQuery"}
+
+
+def test_the_telegram_flow_registers_notify_as_send_only():
+    e = flow_entry()
+    assert e.paths_for("notify") == ("/getMe", "/sendMessage")
+    assert "/answerCallbackQuery" in e.paths_for("bridge") and "/getUpdates" in e.paths_for("bridge")

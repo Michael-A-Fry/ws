@@ -8,6 +8,12 @@ body of the GitHub release.
 
 ## [Unreleased]
 
+### Fixed
+
+- The broker's proxy gives each resolved upstream address 10 s to connect, then tries the next one, in resolver
+  order (C844). Before, one stalled IPv6 route (resolved first) held a request for up to the 300 s upstream timeout
+  before IPv4 was tried: Telegram replies from ws timed out on ws's own IPv6 path. The reply wait stays 300 s.
+
 ## [0.1.11.10] - 2026-11-24
 
 ### Added

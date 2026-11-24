@@ -113,6 +113,8 @@ CONN_DEADLINE_S = 30.0
 MAX_LINE = 65536
 MAX_BODY = 64 * 1024 * 1024
 UPSTREAM_TIMEOUT_S = 300
+CONNECT_TIMEOUT_S = 10.0  # per resolved address, then the next one: a stalled IPv6 route falls back to IPv4 (C844)
+CONNECT_DEADLINE_S = 30.0  # all addresses together
 MAX_PROXY_CONNECTIONS = 64
 REQUEST_DEADLINE_S = 120.0  # headers and body of one proxied request, however slowly they trickle in
 MAX_REJECTING = 32
@@ -1477,6 +1479,55 @@ class Broker:
         return entry.header, entry.format.replace("{value}", value), entry.base_path, ""
 
 
+def _addresses(host: str, port: int) -> list[tuple]:
+    return socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+
+
+def _dial(family: int, kind: int, proto: int, addr: tuple, timeout: float) -> socket.socket:
+    s = socket.socket(family, kind, proto)
+    try:
+        s.settimeout(timeout)
+        s.connect(addr)
+    except BaseException:
+        s.close()
+        raise
+    return s
+
+
+def _connect(host: str, port: int) -> socket.socket:
+    """Connect to the first resolved address that answers within CONNECT_TIMEOUT_S, in resolver order; the socket
+    then waits up to UPSTREAM_TIMEOUT_S for the reply. socket.create_connection gives every address the whole
+    timeout, so one stalled IPv6 route (resolved first) held a request for minutes before IPv4 was tried (C844)."""
+    last: OSError = OSError(f"no address for {host}")
+    end = time.monotonic() + CONNECT_DEADLINE_S
+    for family, kind, proto, _, addr in _addresses(host, port):
+        left = end - time.monotonic()
+        if left <= 0:
+            raise TimeoutError(f"no address of {host} connected within {CONNECT_DEADLINE_S:g} s")
+        try:
+            s = _dial(family, kind, proto, addr, min(CONNECT_TIMEOUT_S, left))
+        except OSError as e:
+            last = e
+            continue
+        s.settimeout(UPSTREAM_TIMEOUT_S)
+        with contextlib.suppress(OSError):
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)  # as http.client's own connect does
+        return s
+    raise last
+
+
+class _Upstream(http.client.HTTPConnection):
+    def connect(self) -> None:
+        sys.audit("http.client.connect", self, self.host, self.port)
+        self.sock = _connect(self.host, self.port)
+
+
+class _UpstreamTLS(http.client.HTTPSConnection):
+    def connect(self) -> None:
+        sys.audit("http.client.connect", self, self.host, self.port)
+        self.sock = self._context.wrap_socket(_connect(self.host, self.port), server_hostname=self.host)
+
+
 def code_problem() -> str:
     """Why the code this broker runs could be edited by a non-root user ("" if it cannot). Walled brokers must be clean."""
     pkg = Path(__file__).resolve().parent
@@ -1749,11 +1800,9 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         hostname, _, port = grant.host.partition(":")
         plain = self.server.broker.allow_plain_http and hostname == "127.0.0.1"
         if plain:
-            conn: http.client.HTTPConnection = http.client.HTTPConnection(
-                hostname, int(port or 80), timeout=UPSTREAM_TIMEOUT_S
-            )
+            conn: http.client.HTTPConnection = _Upstream(hostname, int(port or 80), timeout=UPSTREAM_TIMEOUT_S)
         else:
-            conn = http.client.HTTPSConnection(
+            conn = _UpstreamTLS(
                 hostname, int(port or 443), timeout=UPSTREAM_TIMEOUT_S, context=ssl.create_default_context()
             )
         try:

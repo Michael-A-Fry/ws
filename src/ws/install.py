@@ -153,6 +153,7 @@ class Removal:
     problems: list[str] = field(default_factory=list)
     restored: list[Path] = field(default_factory=list)  # a runner's user config put back exactly as it was
     kept_edits: list[Path] = field(default_factory=list)  # a user config you changed: only ws's items came out
+    notes: list[str] = field(default_factory=list)  # what ws left running because it isn't ws's
 
 
 # ---- paths -----------------------------------------------------------------------------------------------------------
@@ -366,7 +367,7 @@ def _role_steps(composed: dict, answers: Answers, env: Mapping[str, str], taken:
 
 def plan(answers: Answers, env: Mapping[str, str] | None = None, osi=None) -> list[Step]:
     """The steps these answers call for, in order. Reads the machine; writes nothing."""
-    from ws import modules
+    from ws import modules, tmpclean, worktrees
 
     env = os.environ if env is None else env
     osi = osinfo.detect(env=dict(env)) if osi is None else osi
@@ -389,6 +390,8 @@ def plan(answers: Answers, env: Mapping[str, str] | None = None, osi=None) -> li
 
     taken = {(s.path, s.kind) for s in steps}
     steps += _role_steps(composed, answers, env, taken)
+    if temp := tmpclean.step(env, osi, worktrees.load_settings(env)):  # an age rule for pytest's temp folder
+        steps.append(temp)
 
     return steps + _gate_steps(answers, prof, parsed, policy_step.path.resolve(), entries, env)
 
@@ -894,10 +897,11 @@ def _record_file(step: Step, action: str, entries: dict[str, dict], result: Resu
 
 def current_roots(env: Mapping[str, str] | None = None) -> list[Path]:
     """The folders uninstall may act in, worked out now from the profile and never from the manifest."""
-    from ws import skills
+    from ws import skills, tmpclean
 
     env = os.environ if env is None else env
     found = _ws_dirs(env)
+    found.append(tmpclean.rule_path(env).parent)  # the one file `ws install` puts outside ws's own folders
     try:
         rls = _sub(profile.load(profile_path(env)) or {}, "roles")
     except (profile.ProfileError, OSError):
@@ -981,6 +985,8 @@ def uninstall(
     deactivate: Callable[[list[Path], Mapping[str, str]], list[str]] | None = None,
 ) -> Removal:
     """Remove what the manifest says ws created, inside the folders ws manages and nowhere else."""
+    from ws import tmpclean
+
     if not keep_data:
         raise InstallError("deleting your notes and memory is not built: ws only removes what it made")
     env = os.environ if env is None else env
@@ -1062,6 +1068,19 @@ def uninstall(
             except OSError as e:
                 removal.problems.append(f"could not remove {manifest}: {e.strerror}")
         gone.add(manifest)
+
+    for own in sorted(_ws_dirs(env), key=lambda p: -len(p.parts)):
+        # ws's own folder that `ws migrate` made without a record, and now empty, would keep a folder ws made alive
+        if (
+            own not in gone
+            and any(d in own.parents for d, _ in dirs)
+            and not own.is_symlink()
+            and own.is_dir()
+            and _owned(own)
+            and not any(own.iterdir())
+        ):
+            _rmdir(own, removal, gone, dry_run)
+    removal.notes += tmpclean.uninstall_notes(env, removal.removed)
 
     for path, _entry in sorted(dirs, key=lambda pe: (-len(pe[0].parts), str(pe[0]))):
         if path.is_symlink() or not path.is_dir():
@@ -1233,6 +1252,8 @@ def _cmd_install_class(args: argparse.Namespace) -> int:
 
 
 def cmd_install(args: argparse.Namespace) -> int:
+    from ws import tmpclean
+
     env = os.environ
     if getattr(args, "class_name", None):
         return _cmd_install_class(args)
@@ -1252,6 +1273,8 @@ def cmd_install(args: argparse.Namespace) -> int:
                     print("ws: nothing changed")
                     return 1
             result = apply(steps, env)
+            if tmpclean.rule_path(env) in {*result.created, *result.changed}:
+                result.notes += tmpclean.enable_timer(env, osinfo.detect(env=dict(env)))
             if "skills" in answers.modules:
                 from ws import skills
 
@@ -1338,6 +1361,7 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
                 "kept_edits": [str(p) for p in r.kept_edits],
                 "left": [str(p) for p in left],
                 "problems": r.problems,
+                "notes": r.notes,
             }
         )
         return 0
@@ -1353,6 +1377,8 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
         print(f"{'would restore' if args.dry_run else 'restored'} {p} (your settings, exactly as they were)")
     for p in r.kept_edits:
         print(f"you changed it since, so ws kept your edits and took out only its own entries: {p}")
+    for note in r.notes:
+        print(f"ws: {note}")
     for problem in r.problems:
         print(f"ws: {problem}", file=sys.stderr)
     print(f"ws: {'would remove' if args.dry_run else 'removed'} {len(r.removed)}; left {len(left)}")

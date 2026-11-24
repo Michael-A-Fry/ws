@@ -10,11 +10,12 @@ import os
 import shutil
 import subprocess
 import time
+import tomllib
 from pathlib import Path
 
 import pytest
 
-from ws import cli, paths, policy, worktrees
+from ws import cli, doctor, install, osinfo, paths, policy, tmpclean, worktrees
 from ws.output import WsError
 from ws.profile import dumps, profile_path
 
@@ -418,3 +419,74 @@ def test_make_writable_leaves_a_link_for_its_root_alone(box):
         assert stat_mode(real) == 0o755
     finally:
         os.chmod(real, 0o755)
+
+
+# --- the test-temp clean-up -------------------------------------------------------------------------------------------
+
+LINUX = osinfo.OSInfo("linux", "debian 13", "x86_64", "systemd", True)
+MAC = osinfo.OSInfo("macos", "26.0", "arm64", "launchd", True)
+
+
+def test_pytest_keeps_only_the_last_runs_failed_folders():
+    cfg = tomllib.loads((Path(__file__).parent.parent / "pyproject.toml").read_text(encoding="utf-8"))
+    ini = cfg["tool"]["pytest"]["ini_options"]
+    assert ini["tmp_path_retention_policy"] == "failed"
+    assert ini["tmp_path_retention_count"] == "1"  # text: the pinned pytest reads a TOML integer here as an error
+
+
+def test_the_tmpfiles_rule_is_installed_on_systemd_and_not_elsewhere(box):
+    env = dict(os.environ)
+    step = tmpclean.step(env, LINUX, worktrees.Settings(temp_age_hours=3))
+    assert step.path == box / "home" / ".config" / "user-tmpfiles.d" / "ws-pytest.conf"
+    assert step.content == "e /tmp/pytest-of-%u - - - 3h\n"
+    assert tmpclean.step(env, MAC, worktrees.Settings()) is None
+    assert any(s.path == step.path for s in install.plan(install.Answers(), env, osi=LINUX))
+
+
+def test_the_clean_up_timer_is_enabled_only_on_the_accounts_own_home(box, monkeypatch):
+    calls: list[list[str]] = []
+    env = dict(os.environ)
+    assert tmpclean.enable_timer(env, LINUX, lambda argv: (calls.append(argv), (0, ""))[1]) == []
+    assert calls == []  # HOME here is a stand-in: the user's real manager is not touched
+    monkeypatch.setattr(tmpclean, "_real_home", lambda e: True)
+    assert tmpclean.enable_timer(env, LINUX, lambda argv: (calls.append(argv), (0, ""))[1]) == []
+    assert calls == [["systemctl", "--user", "enable", "--now", "systemd-tmpfiles-clean.timer"]]
+    assert tmpclean.enable_timer(env, MAC, lambda argv: pytest.fail("macOS has no such timer")) == []
+    assert "failed" in tmpclean.enable_timer(env, LINUX, lambda argv: (1, "no bus"))[0]
+
+
+def test_the_doctor_line_for_temp(box):
+    env = dict(os.environ)
+    assert tmpclean.check(env, MAC, worktrees.Settings())[0] == "ok"
+    assert "not handled" in tmpclean.check(env, MAC, worktrees.Settings())[1]
+    status, detail, fix = tmpclean.check(env, LINUX, worktrees.Settings())
+    assert status == "warn" and "ws install" in fix  # no rule yet
+    rule = tmpclean.rule_path(env)
+    rule.parent.mkdir(parents=True)
+    rule.write_text(tmpclean.rule(worktrees.Settings()))
+    big = box / "tmp"
+    big.mkdir()
+    (big / "blob").write_bytes(b"x" * 2_000_000)
+    env["TMPDIR"] = str(big)
+    assert tmpclean.check(env, LINUX, worktrees.Settings())[0] == "ok"
+    status, detail, _ = tmpclean.check(env, LINUX, worktrees.Settings(temp_warn_gb=0.001))
+    assert status == "warn" and "your files in /tmp hold" in detail
+    ids = [c.id for c in doctor.run_checks(LINUX, box / "p.toml", env=env, network=False)]
+    assert "WS021" in ids
+
+
+def test_the_uninstall_note_names_the_timer_only_when_it_is_enabled_and_the_rule_went(box, monkeypatch):
+    env = dict(os.environ)
+    rule, calls = tmpclean.rule_path(env), []
+
+    def enabled(code):
+        return lambda argv: (calls.append(argv), (code, ""))[1]
+
+    monkeypatch.setattr(tmpclean, "_real_home", lambda e: True)
+    assert "left systemd-tmpfiles-clean.timer enabled" in tmpclean.uninstall_notes(env, [rule], LINUX, enabled(0))[0]
+    assert calls == [["systemctl", "--user", "is-enabled", "systemd-tmpfiles-clean.timer"]]  # asked, never changed
+    assert tmpclean.uninstall_notes(env, [rule], LINUX, enabled(1)) == []  # not enabled: nothing to say
+    assert tmpclean.uninstall_notes(env, [box / "other"], LINUX, enabled(0)) == []  # the rule was not removed
+    assert tmpclean.uninstall_notes(env, [rule], MAC, enabled(0)) == []
+    monkeypatch.setattr(tmpclean, "_real_home", lambda e: False)
+    assert tmpclean.uninstall_notes(env, [rule], LINUX, enabled(0)) == []  # a stand-in home: not the user's manager

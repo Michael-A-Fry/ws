@@ -32,7 +32,8 @@ nothing is refused. A walled class is pruned by a job running inside it.
 `interval_hours` (6) have passed or at once at `disk_pct` (85), and then tells the lead once per interval (a `ws msg` when
 the registry lets it send, an alerts line and a push). The repos are those the policy's classes name, `[worktrees] repos`,
 or `~/code/*` with no classes. `<state>/worktree-prune.json` holds `worktrees_pruned`, `gb_freed` and `disk_pct`, the
-counts card a conductor reads. Settings (`[worktrees]`, profile): `idle_hours`, `interval_hours`, `disk_pct` and `repos`.
+counts card a conductor reads. Settings (`[worktrees]`, profile): `idle_hours`, `interval_hours`, `disk_pct`,
+`temp_age_hours` 6, `temp_warn_gb` 10 (both for `ws.tmpclean`) and `repos`.
 
 Swap note: the removal is plain `git worktree remove`; delete the call to use another tool.
 """
@@ -64,6 +65,8 @@ LIMITS = {
     "idle_hours": (12, 0, 24 * 365),
     "interval_hours": (6, 0.5, 24 * 30),
     "disk_pct": (85, 1, 100),
+    "temp_age_hours": (6, 1, 24 * 30),
+    "temp_warn_gb": (10, 0.1, 100_000),
 }
 
 
@@ -72,6 +75,8 @@ class Settings:
     idle_hours: float = 12
     interval_hours: float = 6
     disk_pct: float = 85
+    temp_age_hours: int = 6
+    temp_warn_gb: float = 10
     repos: tuple[str, ...] = ()
 
 

@@ -19,11 +19,17 @@ refusal, never a request without the credential or to a different host.
 Wire format on the socket: one JSON object per line, one reply per request. Ops: request, release, status, elevate,
 for the minters (ws.minters) mint, sign and ca_public, and imap: for a `kind = "imap"` name the broker itself logs in to
 the mailbox and runs one operation from the fixed table in ws.minters.imap (read, label or draft; never send or delete),
-so the mailbox password, which would also send mail, never leaves this process.
+so the mailbox password, which would also send mail, never leaves this process. gcal: for a `kind = "gcal"` name the
+broker refreshes the Google token itself and runs one operation from the fixed table in ws.minters.gcal (list, freebusy,
+get, insert, patch; never delete). Each write type has a switch, default off (`gcal_switch`, kept in
+`<state>/gcal-switches.json`, a control path the gate and the wall keep sessions from writing): off is anyone's to set;
+on only the broker's own user's, from a process that holds a terminal, with the switch PIN a person stored (a session
+cannot read the store); every flip is an audit line. The switch is read when a write arrives: an "off" that lands while
+a write is already running stops the next one, not that one.
 Refusal codes: unknown_name, unset, host_not_allowed, purpose_not_allowed, caller_refused, store_unreadable, expired,
 run_required, run_refused, not_declared, area_refused, tier_refused, claim_refused, elevation_off, audit_failed,
 wrong_kind, registry_untrusted, upstream_refused, login_refused (a mailbox login), upstream_unreachable, op_refused, uidvalidity_changed,
-no_drafts_folder, tls_failed, plus bad_request (malformed) and busy (too
+no_drafts_folder, tls_failed, switch_off, field_refused, not_ws_event, not_found, conflict, plus bad_request (malformed) and busy (too
 many connections or leases). The registry itself is trusted only when it belongs to the broker's user or root and is
 closed to group and world writes; any other is refused whole (registry_untrusted).
 
@@ -50,6 +56,7 @@ import argparse
 import base64
 import contextlib
 import hashlib
+import hmac
 import http.client
 import json
 import os
@@ -70,7 +77,7 @@ from urllib.parse import urlsplit
 
 from ws import __version__, output, paths
 from ws import secrets as wsecrets
-from ws.minters import github_app, imap, ssh_ca
+from ws.minters import gcal, github_app, imap, ssh_ca
 from ws.output import WsError
 
 CODES = (
@@ -371,6 +378,60 @@ def remove_run_record(folder: Path, run_id: str) -> bool:
 # ---------------------------------------------------------------- the kill switch
 
 
+def gcal_switch_path(env: dict | None = None) -> Path:
+    return paths.state_dir(env) / "gcal-switches.json"
+
+
+def read_gcal_switches(path: Path | None, own_uid: int) -> dict[str, bool]:
+    """Which gcal write types are on. No file, an unreadable one, or one another user could have written: all off."""
+    off = {w: False for w in gcal.WRITES}
+    if path is None:
+        return off
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return off
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid not in (own_uid, 0) or st.st_mode & 0o022:
+            return off
+        data = os.read(fd, 4096)
+    finally:
+        os.close(fd)
+    try:
+        raw = json.loads(data)
+    except ValueError:
+        return off
+    if not isinstance(raw, dict):
+        return off
+    return {w: raw.get(w) == "on" for w in gcal.WRITES}
+
+
+def write_gcal_switches(path: Path, state: dict[str, bool]) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{os.urandom(6).hex()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({**{w: "on" if state.get(w) else "off" for w in gcal.WRITES}, "t": _iso(time.time())}, fh)
+            fh.write("\n")
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
+
+
+def peer_has_terminal(pid: int) -> bool:
+    """True when process `pid` has a controlling terminal (Linux: /proc/<pid>/stat tty_nr). An agent's tool shell has
+    none. Anywhere this cannot be read, False: a switch is turned on only where it can be told."""
+    try:
+        raw = Path(f"/proc/{int(pid)}/stat").read_text()
+        return int(raw[raw.rindex(")") + 2 :].split()[4]) != 0
+    except (OSError, ValueError, IndexError):
+        return False
+
+
 def elevate_path(env: dict | None = None) -> Path:
     return paths.state_dir(env) / "elevate.json"
 
@@ -472,6 +533,31 @@ def request(
 
 
 MAX_IMAP_REPLY = 4 * 1024 * 1024  # one fetched message (1 MiB) as base64, with room
+MAX_GCAL_REPLY = 4 * 1024 * 1024
+
+
+def gcal_call(
+    name: str, cmd: str, args: dict | None = None, run: str | None = None, socket: str | Path | None = None
+) -> dict:
+    """Run one calendar operation (ws.minters.gcal.OPS) on registry name `name`. The reply is data only. Raises
+    BrokerRefused(code, reason) (switch_off when that write type is off) or BrokerUnavailable."""
+    msg: dict = {"op": gcal.OP, "name": name, "cmd": cmd, "args": args or {}}
+    if run is not None:
+        msg["run"] = run
+    r = _client_call(msg, socket, timeout=gcal.CALL_DEADLINE_S + 15, max_reply=MAX_GCAL_REPLY)
+    return {k: v for k, v in r.items() if k != "ok"}
+
+
+def gcal_switch(write: str | None, state: str | None, socket: str | Path | None = None, pin: str | None = None) -> dict:
+    """Set one gcal write switch (`state` on or off; on needs the switch `pin`), or read them all (`write` None):
+    {"switches": {insert: bool, ...}}."""
+    msg: dict = {"op": gcal.SWITCH_OP}
+    if write is not None:
+        msg.update(write=write, state=state)
+    if pin is not None:
+        msg["pin"] = pin
+    r = _client_call(msg, socket)
+    return {k: v for k, v in r.items() if k != "ok"}
 
 
 def imap_call(
@@ -734,6 +820,9 @@ class Broker:
         self.clock = clock
         self.allow_plain_http = allow_plain_http  # tests only: http to 127.0.0.1; the command line has no switch for it
         self.imap_cafile: str | None = None  # tests only: a test CA for the mail server; None is the system's
+        self.gcal_switch_file: Path | None = None  # the gcal write switches; None: every write type stays off
+        self.peer_has_terminal = peer_has_terminal  # tests only: a planted answer
+        self._gcal_pin_misses = 0  # wrong switch PINs since start; PIN_TRIES of them lock switching on
         self.own_uid = os.geteuid()
         self.proc_net_tcp: tuple[str, ...] = PROC_NET_TCP  # tests only: a planted table
         self._port = port
@@ -779,7 +868,11 @@ class Broker:
             records=records_dir(env),
             elevate_file=elevate_path(env),
             require_run=require_run,
-        )
+        )._with_gcal(gcal_switch_path(env))
+
+    def _with_gcal(self, path: Path) -> Broker:
+        self.gcal_switch_file = path
+        return self
 
     # -- lifecycle
 
@@ -934,6 +1027,10 @@ class Broker:
                 return self._op_ca_public(msg)
             if op == imap.OP:
                 return self._op_imap(msg, uid, pid)
+            if op == gcal.OP:
+                return self._op_gcal(msg, uid, pid)
+            if op == gcal.SWITCH_OP:
+                return self._op_gcal_switch(msg, uid, pid)
         except Exception as e:  # noqa: BLE001 (answer, never crash the thread; the type only, in case a value is near)
             print(f"ws broker: {op} failed ({type(e).__name__})", file=sys.stderr)
             return _refuse("store_unreadable", "the broker could not complete that")
@@ -1257,6 +1354,118 @@ class Broker:
         if not self.audit.write("imap", "ok", bytes=len(out.get("raw", "")) or None, **log):
             return _refuse("audit_failed", "the result could not be written to the audit log, so it is not given")
         return {"ok": True, **out}
+
+    def _op_gcal(self, msg: dict, uid: int, pid: int) -> dict:
+        """One operation from ws.minters.gcal.OPS on the name's Google Calendar. The refresh token stays here; a write
+        runs only while its switch is on."""
+        log = {"name": msg.get("name"), "uid": uid, "pid": pid, "run": msg.get("run"), "host": gcal.API_HOST}
+        entry, refused = self._minter_entry(msg, "gcal", gcal.KIND, log)
+        if refused:
+            return refused
+        assert entry is not None and isinstance(entry.options, gcal.Options)
+        cmd = msg.get("cmd")
+        log["purpose"] = cmd if isinstance(cmd, str) and cmd in gcal.OPS else "?"
+        try:
+            op, _checked = gcal.check(entry.options, cmd, msg.get("args"))
+        except gcal.GcalError as e:
+            return self._refuse_logged("gcal", log, e.code, e.reason)
+        if entry.purposes and cmd not in entry.purposes:
+            return self._refuse_logged("gcal", log, "purpose_not_allowed", f"{entry.name} is not allowed for {cmd}")
+        _rec, why = self._scope(entry, msg, uid, log, self.clock(), need_run=False)
+        if why:
+            return self._refuse_logged("gcal", log, *why)
+        if op.write and not read_gcal_switches(self.gcal_switch_file, self.own_uid).get(cmd):
+            return self._refuse_logged(
+                "gcal", log, "switch_off", f"calendar {cmd} is switched off: write a proposal instead"
+            )
+        value, refused = self._stored("gcal", log, entry.name)
+        if refused:
+            return refused
+        assert value is not None
+        if not self.audit.write("gcal", "begin", **log):  # before the calendar is touched, so no change goes unlogged
+            return _refuse("audit_failed", "the operation could not be written to the audit log, so it was not run")
+        try:
+            out = gcal.run(entry.options, value, cmd, msg.get("args"))
+        except gcal.GcalError as e:
+            return self._refuse_logged("gcal", log, e.code, e.reason)
+        except Exception as e:  # noqa: BLE001 (the "begin" line gets its outcome; the type only, never the text)
+            print(f"ws broker: gcal failed ({type(e).__name__})", file=sys.stderr)
+            return self._refuse_logged("gcal", log, "store_unreadable", "the broker could not complete that")
+        finally:
+            del value
+        ev = out.get("event") if isinstance(out.get("event"), dict) else None
+        if op.write and ev is not None and isinstance(ev.get("id"), str):
+            log["purpose"] = f"{cmd}:{ev['id'][:60]}" + (":existing" if out.get("existing") else "")
+        if not self.audit.write("gcal", "ok", **log):
+            return _refuse("audit_failed", "the result could not be written to the audit log, so it is not given")
+        return {"ok": True, **out}
+
+    def _op_gcal_switch(self, msg: dict, uid: int, pid: int) -> dict:
+        """Read or set a gcal write switch. Off: anyone served. On: the broker's own user, from a process with a
+        terminal, AND the switch PIN (gcal.SWITCH_PIN_NAME in the store, which a session cannot read; a person pastes
+        it once with `ws secret ask`). A session can fake a terminal, never the PIN. PIN_TRIES misses lock turning on
+        until the broker restarts. Every flip, and every refused flip, is an audit line; the PIN never is."""
+        write, state = msg.get("write"), msg.get("state")
+        if write is None and state is None:
+            return {"ok": True, "switches": read_gcal_switches(self.gcal_switch_file, self.own_uid)}
+        if write not in gcal.WRITES or state not in ("on", "off"):
+            return _refuse("bad_request", f"write is one of {', '.join(gcal.WRITES)}; state is on or off")
+        log = {"uid": uid, "pid": pid, "purpose": f"{write}:{state}"}
+        if state == "on" and uid != self.own_uid:
+            return self._refuse_logged(
+                "gcal_switch", log, "caller_refused", "only the broker's own user turns a write on"
+            )
+        if state == "on" and not self.peer_has_terminal(pid):
+            return self._refuse_logged(
+                "gcal_switch", log, "caller_refused", "a write is turned on by a person at a terminal, not by a job"
+            )
+        if state == "on":
+            refused = self._gcal_pin_ok(msg.get("pin"), log)
+            if refused:
+                return refused
+        if self.gcal_switch_file is None:
+            return self._refuse_logged("gcal_switch", log, "store_unreadable", "this broker has no switch file")
+        with self._lock:
+            cur = read_gcal_switches(self.gcal_switch_file, self.own_uid)
+            was = cur[write]
+            cur[write] = state == "on"
+            if not self.audit.write("gcal_switch", "on" if cur[write] else "off", **log):
+                return _refuse("audit_failed", "the audit line could not be written, so the switch did not move")
+            try:
+                write_gcal_switches(self.gcal_switch_file, cur)
+            except OSError:
+                self.audit.write("gcal_switch", "store_unreadable", **log)
+                return _refuse("store_unreadable", "the switch file cannot be written")
+        return {"ok": True, "switches": cur, "changed": was != cur[write]}
+
+    def _gcal_pin_ok(self, pin: object, log: dict) -> dict | None:
+        """None when `pin` is the stored switch PIN; else the logged refusal. The PIN is compared in constant time and
+        never logged; after PIN_TRIES misses every switch-on is refused until the broker restarts."""
+        with self._lock:
+            if self._gcal_pin_misses >= gcal.PIN_TRIES:
+                locked = True
+            else:
+                locked = False
+        if locked:
+            return self._refuse_logged("gcal_switch", log, "caller_refused", "too many wrong PINs: restart the broker")
+        try:
+            want = self.store.read(gcal.SWITCH_PIN_NAME)
+        except FileNotFoundError:
+            return self._refuse_logged(
+                "gcal_switch",
+                log,
+                "unset",
+                f"no switch PIN: a person sets it with `ws secret ask {gcal.SWITCH_PIN_NAME}`",
+            )
+        except wsecrets.SecretsError:
+            return self._refuse_logged("gcal_switch", log, "store_unreadable", "the switch PIN cannot be read")
+        ok = isinstance(pin, str) and len(want) >= gcal.PIN_MIN and hmac.compare_digest(pin.encode(), want.encode())
+        del want
+        if ok:
+            return None
+        with self._lock:
+            self._gcal_pin_misses += 1
+        return self._refuse_logged("gcal_switch", log, "caller_refused", "that is not the switch PIN")
 
     def _take_minted(self, which) -> list[_Minted]:
         """Remove the minted tokens `which(m)` picks from the list and the cache, under the lock, and return them."""

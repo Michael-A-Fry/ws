@@ -37,6 +37,7 @@ RAW = {
     "walls.edit": "opens $EDITOR on a copy of the policy: the terminal is the editor's",
     "connector.audit": "a hook: the runner reads its stderr and exit code",
     "connector.launch": "hands the terminal to the runner",
+    "gcal.connect": "a person at a terminal: the client secret and Google's consent address are typed there",
 }
 
 # What to run for each of the others (in a throwaway HOME): enough to get a real answer or a typed error.
@@ -76,6 +77,8 @@ CASES: dict[str, list[str]] = {
     "broker.run-record.rm": ["broker", "run-record", "rm", "r1", "--dir", "{home}/records"],
     "broker.audit-copy": ["broker", "audit-copy"],
     "elevate": ["elevate", "status", "--socket", "{home}/none.sock"],
+    "gcal.ask": ["gcal", "ask", "nope"],
+    "gcal.switch": ["gcal", "switch", "--socket", "{home}/none.sock"],
     "note": ["note", "hello"],
     "memory.init": ["memory", "init"],
     "memory.add": ["memory", "add", "a fact"],

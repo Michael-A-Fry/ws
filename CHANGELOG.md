@@ -8,6 +8,8 @@ body of the GitHub release.
 
 ## [Unreleased]
 
+## [0.1.11.10] - 2026-11-24
+
 ### Added
 
 - `ws triage` remembers, per mailbox, the thread and newest message each draft answered (`drafted` in the state file,
@@ -33,6 +35,22 @@ body of the GitHub release.
   (`redirect_refused`, `encoded_reply_refused`), the status phrase is the standard one, a reply header holding the value
   is dropped and a reply body holding the value is cut off there (`secret_in_reply` in the audit log). `paths` still
   judges the tool's own path.
+
+### Fixed
+
+- OpenCode runs under `ws run` can use their tools again (C792). ws gives OpenCode a home folder of its own for each
+  run, and the gate check it started inherited that folder, so its pin check saw ws's folders as moved and refused every
+  call. The OpenCode shim now starts ws's own children (the gate check, the guard events, the session notes, the message
+  wait) with the folders ws install pinned, fixed when the shim is written; `WS_HOME` is dropped from their environment
+  and the agent's own process keeps its run folder. Under OpenCode the pin check therefore never refuses, unlike Claude
+  Code's hooks, which still refuse when the session's environment points elsewhere.
+
+### Security
+
+- Registry paths are bound to purposes (C828): an entry's `paths` can be limited per purpose, so a `notify` lease of a
+  Telegram bot token can no longer reach the bridge's own endpoints (`/answerCallbackQuery`,
+  `/editMessageReplyMarkup`). `ws triage` refuses a lease that puts the token in the request path, instead of building a
+  header with an empty name.
 
 ## [0.1.11.9] - 2026-11-24
 

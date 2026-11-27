@@ -965,6 +965,25 @@ def credential_kind(job: Job) -> str:
     return "subscription"
 
 
+def free_local(job: Job) -> bool:
+    """A run that costs no money (C848, DEC-200): an OpenCode job on a local model server (`credential_kind` "local")
+    whose provider block gives no model a nonzero cost. A LAN proxy with priced models (LiteLLM in front of a paid API)
+    is a paid route, so it is not free."""
+    if job.runner != "opencode" or credential_kind(job) != "local":
+        return False
+    provider = job.runner_options.get("provider") if isinstance(job.runner_options.get("provider"), dict) else {}
+    models = provider.get("models") if isinstance(provider.get("models"), dict) else {}
+    for m in models.values():
+        cost = m.get("cost") if isinstance(m, dict) else None
+        if isinstance(cost, dict) and any(
+            isinstance(v, (int, float)) and not isinstance(v, bool) and v != 0 for v in cost.values()
+        ):
+            return False
+        if cost is not None and not isinstance(cost, dict):
+            return False
+    return True
+
+
 def _tick(name: str) -> tuple[str, ...]:  # what a runner job's timer runs
     return ("queue", "tick", name, "--slot", "schedule", "--run")
 

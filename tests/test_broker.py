@@ -1847,3 +1847,65 @@ def test_a_purpose_with_no_bound_paths_reaches_nothing(env):
     seen = len(env.stub.seen)
     assert env.call("/sendMessage", lease=env.lease(name="tg", purpose="other"))[0] == 403
     assert len(env.stub.seen) == seen
+
+
+def test_a_stalled_first_address_falls_back_to_the_next_one_in_seconds(env, monkeypatch):
+    """C844: the resolver gives a stalled IPv6 address first; the broker tries it for CONNECT_TIMEOUT_S, not for the
+    whole upstream timeout, then the next address (the stub) answers."""
+    real_addresses, real_dial, tried = broker._addresses, broker._dial, []
+    monkeypatch.setattr(broker, "UPSTREAM_TIMEOUT_S", 6)
+    monkeypatch.setattr(broker, "CONNECT_TIMEOUT_S", 0.3)
+
+    def addresses(host, port):
+        return [(socket.AF_INET6, socket.SOCK_STREAM, 0, "", ("2001:db8::1", port, 0, 0)), *real_addresses(host, port)]
+
+    def dial(family, kind, proto, addr, timeout):
+        tried.append(addr[0])
+        if addr[0] == "2001:db8::1":  # never answers: the connect waits out the timeout it is given
+            time.sleep(timeout)
+            raise TimeoutError("timed out")
+        return real_dial(family, kind, proto, addr, timeout)
+
+    monkeypatch.setattr(broker, "_addresses", addresses)
+    monkeypatch.setattr(broker, "_dial", dial)
+    start = time.monotonic()
+    status, _, _ = env.call("/v1/x")
+    assert status == 200 and time.monotonic() - start < 3
+    assert tried[0] == "2001:db8::1" and len(tried) == 2
+
+
+def test_every_address_failing_is_upstream_unreachable(env, monkeypatch):
+    monkeypatch.setattr(broker, "_addresses", lambda host, port: [])
+    status, _, data = env.call("/v1/x")
+    assert status == 502 and json.loads(data) == {"error": "upstream_unreachable"}
+
+
+def test_every_address_failing_in_turn_is_upstream_unreachable(env, monkeypatch):
+    errors = iter([TimeoutError("timed out"), ConnectionRefusedError("refused")])
+    addrs = [
+        (socket.AF_INET6, socket.SOCK_STREAM, 0, "", ("2001:db8::1", 1, 0, 0)),
+        (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("192.0.2.1", 1)),
+    ]
+    monkeypatch.setattr(broker, "_addresses", lambda host, port: addrs)
+
+    def dial(*a):
+        raise next(errors)
+
+    monkeypatch.setattr(broker, "_dial", dial)
+    seen = len(env.stub.seen)
+    status, _, data = env.call("/v1/x")
+    assert status == 502 and json.loads(data) == {"error": "upstream_unreachable"} and len(env.stub.seen) == seen
+
+
+def test_tls_upstream_checks_the_host_name_never_the_address(monkeypatch):
+    """The fallback dials an IP; TLS must still verify the certificate for the host name."""
+    got = {}
+
+    class Ctx:
+        def wrap_socket(self, sock, server_hostname=None):
+            got.update(sock=sock, server_hostname=server_hostname)
+            return sock
+
+    monkeypatch.setattr(broker, "_connect", lambda host, port: "dialled 149.154.166.110")
+    broker._UpstreamTLS("api.telegram.org", 443, timeout=5, context=Ctx()).connect()
+    assert got == {"sock": "dialled 149.154.166.110", "server_hostname": "api.telegram.org"}

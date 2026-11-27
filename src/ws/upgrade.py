@@ -644,6 +644,19 @@ def ask_broker(sock: Path, timeout: float = 3.0, hold: bool = False) -> Peer:
     return Peer(reply, pid, uid, fd)
 
 
+def _runs_version(sock: Path, version: str | None, limit: float) -> bool:
+    """Whether a broker of `version` answers on `sock` within `limit` seconds (the old one may answer for a moment)."""
+    end = time.monotonic() + limit
+    while time.monotonic() < end:
+        try:
+            if ask_broker(sock, timeout=1.0).status.get("version") == version:
+                return True
+        except (OSError, ValueError):
+            pass
+        time.sleep(0.2)
+    return False
+
+
 def _gone(sock: Path, limit: float) -> bool:
     """Whether nothing answers on `sock` any more, within `limit` seconds."""
     end = time.monotonic() + limit
@@ -744,6 +757,18 @@ def _stop_and_start(args: argparse.Namespace, sock: Path, peer: Peer, new: NewWs
     if args.dry_run:
         _say(args, f"would stop the broker (ws {running}, pid {peer.pid}) and start one of ws {new.version}")
         return "would restart"
+    from ws import brokerunit  # late: only an upgrade that finds an old broker asks
+
+    if brokerunit.installed():  # C848: systemd restarts the service on the new code; no signal, no bare start
+        _say(args, f"the broker runs ws {running}: restarting {brokerunit.UNIT} on ws {new.version}")
+        if not brokerunit.restart():
+            _say(args, f"systemctl --user restart {brokerunit.UNIT} failed; run it by hand")
+            return "failed"
+        if not _runs_version(sock, new.version, BROKER_START_S):
+            _say(args, f"{brokerunit.UNIT} was restarted but its broker did not answer yet; systemd keeps trying")
+            return "failed"
+        _say(args, f"the broker is restarted on ws {new.version}")
+        return "restarted"
     _say(args, f"the broker runs ws {running}: stopping it (pid {peer.pid}) and starting one of ws {new.version}")
     try:
         send(peer.pidfd, signal.SIGTERM)

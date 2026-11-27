@@ -1404,3 +1404,29 @@ def test_the_hooks_rewrite_migrates_the_policy_and_prints_one_line(old, box, cap
     assert '"pane-keys"' in path.read_text(encoding="utf-8")
     cli.main(["upgrade", "--hooks-only"])
     assert capsys.readouterr().out.count("pane-keys") == 0 and path.read_text(encoding="utf-8").count("pane-keys") == 1
+
+
+@linux_only
+def test_with_the_unit_installed_the_upgrade_restarts_the_service_not_the_process(
+    cutover, old, stub_broker, starts, broker_sock, capsys, monkeypatch
+):
+    """C848: systemd owns the broker; ws upgrade asks it to restart and waits for the new version to answer."""
+    from ws import brokerunit
+
+    stub = stub_broker("0.0.1")
+    asked: list[str] = []
+
+    def restart(run=None):
+        asked.append("restart")
+        stub.kill()
+        stub.wait()
+        broker_sock.unlink()
+        Path(str(broker_sock) + ".ready").unlink()
+        stub_broker("9.9.9")  # what systemd's restart brings up: the installed ws
+        return True
+
+    monkeypatch.setattr(brokerunit, "installed", lambda env=None: True)
+    monkeypatch.setattr(brokerunit, "restart", restart)
+    assert cli.main(["upgrade"]) == 0
+    assert asked == ["restart"] and starts == []  # no bare start beside the service
+    assert "restarting ws-broker.service" in capsys.readouterr().out

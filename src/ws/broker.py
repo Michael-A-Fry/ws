@@ -2134,6 +2134,12 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_unit(args: argparse.Namespace) -> int:
+    from ws import brokerunit  # late: brokerunit is not needed to serve
+
+    return brokerunit.cmd_unit(args)
+
+
 def cmd_request(args: argparse.Namespace) -> int:
     try:
         lease = request(args.name, args.purpose, args.host, socket=args.socket, ttl_s=args.ttl, run=args.run)
@@ -2395,6 +2401,13 @@ def register(sub) -> None:
     p.add_argument("--run", metavar="RUN_ID", help="the run the lease is for (its run record says what it may have)")
     p.add_argument("--socket", metavar="PATH")
     p.set_defaults(func=cmd_request)
+    p = bsub.add_parser(
+        "unit", help="the broker as a systemd user service (Restart=always): print, --apply or --remove"
+    )
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--apply", action="store_true", help="write the unit, enable and start it")
+    g.add_argument("--remove", action="store_true", help="stop, disable and delete the unit")
+    p.set_defaults(func=_cmd_unit)
     p = bsub.add_parser("status", help="ask a running broker how it is")
     p.add_argument("--socket", metavar="PATH")
     p.set_defaults(func=cmd_status)

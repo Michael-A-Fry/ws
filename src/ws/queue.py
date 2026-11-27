@@ -1480,8 +1480,10 @@ def request_for(
     purpose_cap_usd: float | None,
     limits: Limits,
 ) -> Request:
+    local = credential_kind(job) == "local"  # DEC-200: a local run reserves no money, so no cap can refuse it
+    usd = 0.0 if local else float(job.budget_usd or unknown_run_usd or runrecord.UNKNOWN_RUN_USD)
     return Request(
-        job=job.name, run_id=run_id, purpose=job.purpose, usd=float(job.budget_usd or unknown_run_usd or runrecord.UNKNOWN_RUN_USD),
+        job=job.name, run_id=run_id, purpose=job.purpose, usd=usd,
         explicit_usd=job.budget_usd is not None, strict=job.strict, cap_usd=cap_usd, purpose_cap_usd=purpose_cap_usd,
         turns=int(job.max_turns or limits.default_turns), seconds=float(job.timeout_s), ram_gb=job.resources.ram_gb,
         lane=job.resources.slot, credential=credential_kind(job), deadline=job.deadline, parent_run_id=job.parent_run,

@@ -2250,3 +2250,20 @@ def test_opening_a_second_ledger_never_closes_a_descriptor_of_the_open_database(
     assert closed_db == []
     monkeypatch.undo()
     assert first.receipts(last=5) and second.receipts(last=5)
+
+
+def test_a_local_job_reserves_no_money_and_is_admitted_over_the_cap(box, tmp_path):
+    """DEC-200 (Michael, 24 Nov): "Local should NEVER BE blocked". 28 Nov: the daily local list was refused at the cap."""
+    write_job(box, "local", secrets=False,
+              extra='[runner_options]\nprovider = {options = {baseURL = "http://127.0.0.1:11434/v1"}}')  # fmt: skip
+    write_job(box, "paid")
+    lim = queue.Limits()
+    local = queue.request_for(jobs.load("local"), "20261128T000000Z-00000a", cap_usd=50.0, unknown_run_usd=None,
+                              purpose_cap_usd=None, limits=lim)  # fmt: skip
+    paid = queue.request_for(jobs.load("paid"), "20261128T000000Z-00000b", cap_usd=50.0, unknown_run_usd=None,
+                             purpose_cap_usd=None, limits=lim)  # fmt: skip
+    assert local.credential == "local" and local.usd == 0.0
+    ledger = make(tmp_path)
+    assert ledger.admit(local, T0, spend(50.69), dry=True).kind == "admit"
+    d = ledger.admit(paid, T0, spend(50.69), dry=True)  # planted: a paid job at the same meter is still refused
+    assert d.kind == "refuse" and d.counter == "profile_cap"

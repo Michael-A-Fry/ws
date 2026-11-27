@@ -1308,11 +1308,14 @@ def write_opencode_job(ws, top="", options=""):
     )
 
 
+HOSTED_UNPRICED = (
+    'provider = { npm = "@ai-sdk/openai-compatible", models = { m = { name = "m" } } }\n'
+    '[[secrets]]\nname = "stub"\nhost = "api.stub.example"'
+)
+
+
 def test_a_runner_that_cannot_price_the_model_is_refused_unless_the_job_allows_it(ws, capsys):
-    write_opencode_job(
-        ws,
-        options='provider = { npm = "@ai-sdk/openai-compatible", options = { baseURL = "http://127.0.0.1:8080/v1" }, models = { m = { name = "m" } } }',
-    )
+    write_opencode_job(ws, options=HOSTED_UNPRICED)  # a leased key: money, so a price is needed
     assert cli.main(["run", "oc"]) == 3
     assert "allow_unpriced" in capsys.readouterr().err
     (rec,) = ws.records()
@@ -1324,6 +1327,19 @@ def test_a_runner_that_cannot_price_the_model_is_refused_unless_the_job_allows_i
         options='provider = { npm = "@ai-sdk/openai-compatible", options = { baseURL = "http://127.0.0.1:8080/v1" }, models = { m = { name = "m" } } }',
     )
     assert cli.main(["run", "oc", "--dry-run"]) == 0
+
+
+def test_a_local_model_needs_no_price_and_is_recorded_at_zero(ws, capsys):
+    """DEC-200: a model on a local server costs no money, so no price, no allow_unpriced and no cap stands in its way."""
+    write_opencode_job(
+        ws,
+        options='exe = "/bin/false"\nprovider = { npm = "@ai-sdk/openai-compatible", options = { baseURL = "http://127.0.0.1:8080/v1" }, models = { m = { name = "m" } } }',
+    )
+    assert cli.main(["run", "oc", "--dry-run"]) == 0
+    cli.main(["run", "oc"])  # the runner fails at once: a local run that reported nothing still costs nothing
+    (rec,) = ws.records()
+    assert rec["cost_usd"] == 0.0 and rec["cost_basis"] == "local"
+    assert valid(rec)
 
 
 def test_a_provider_block_whose_models_carry_a_cost_is_priced(ws):

@@ -288,15 +288,35 @@ def _started(rec: dict) -> bool:
     )
 
 
+# Records written before ws 0.1.11.12 have no cost_basis "local": a local run left cost_usd null and was charged the
+# fallback. Such a record is known by its model on OpenCode's `ollama/` provider with tokens counted and no price.
+LEGACY_LOCAL_PREFIXES = ("ollama/",)
+
+
+def _legacy_local(rec: dict) -> bool:
+    model = rec.get("model_requested")
+    return (rec.get("runner") == "opencode" and isinstance(model, str) and model.startswith(LEGACY_LOCAL_PREFIXES)
+            and rec.get("cost_basis") in ("unpriced", None))  # fmt: skip
+
+
 def record_cost(rec: dict, unknown_run_usd: float | None = None, fallback_usd_per_mtok: float | None = None) -> float:
     """What a record counts against the cap: its cost when the runner reported one. Otherwise its tokens at
     `fallback_usd_per_mtok` if that is set, else a flat `unknown_run_usd` (default UNKNOWN_RUN_USD) for a run that started.
     Both are conservative figures the person sets; ws does not know any prices."""
     if _finite(rec.get("cost_usd")):
         return float(rec["cost_usd"])
-    if not _started(rec):
+    if not _started(rec) or _legacy_local(rec):
         return 0.0
     tokens = _token_count(rec)
+    if tokens == 0:
+        return 0.0  # the runner counted tokens and there were none: the provider failed before any work, nothing spent
+    if (
+        rec.get("runner") == "opencode"
+        and rec.get("status") == "error"
+        and not rec.get("models_used")
+        and tokens is None
+    ):
+        return 0.0  # OpenCode ends every billed model step with a step_finish; an error with none billed no step
     if fallback_usd_per_mtok and tokens is not None:
         return tokens / 1_000_000 * float(fallback_usd_per_mtok)
     return float(unknown_run_usd or UNKNOWN_RUN_USD)

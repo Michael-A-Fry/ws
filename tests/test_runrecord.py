@@ -188,3 +188,37 @@ def test_a_lone_outcome_unknown_record_is_read_and_a_real_one_wins_over_it(tmp_p
     runrecord.append(log, rec(run_id=other, status="ok", stop_reason="completed", cost_usd=0.5))
     got = {(r["run_id"], r["status"]) for r in runrecord.read(log)}
     assert got == {(RID, "outcome_unknown"), (other, "ok")}
+
+
+# ---- what a run costs when it reported no figure (28 Nov: the meter read US$50.69 against US$22.69 of real costs) ------
+
+
+def test_a_local_run_costs_nothing_new_shape_and_old():
+    new = rec(status="ok", runner="opencode", model_requested="ollama/m", cost_usd=0.0, cost_basis="local")
+    assert runrecord.record_cost(new, 2.0) == 0.0
+    tokens = dict(runrecord.blank_tokens(), input=4098, output=41)
+    for status in ("ok", "timeout"):  # written before cost_basis "local": a null cost, tokens counted, no price
+        old = rec(status=status, runner="opencode", model_requested="ollama/qwen", cost_usd=None, cost_basis="unpriced",
+                  tokens=tokens, exit_code=0)  # fmt: skip
+        assert runrecord.record_cost(old, 2.0) == 0.0
+    hosted = rec(status="ok", runner="opencode", model_requested="openrouter/x", cost_usd=None, cost_basis="unpriced",
+                 tokens=tokens, exit_code=0)  # fmt: skip
+    assert runrecord.record_cost(hosted, 2.0) == 2.0  # planted: an unpriced hosted model still counts at the fallback
+
+
+def test_a_run_that_counted_no_tokens_or_billed_no_step_costs_nothing():
+    zero = rec(
+        status="error",
+        runner="claude-code",
+        exit_code=1,
+        cost_usd=None,
+        tokens=dict(runrecord.blank_tokens(), input=0, output=0),
+    )
+    assert runrecord.record_cost(zero, 2.0) == 0.0
+    no_step = rec(status="error", runner="opencode", exit_code=1, cost_usd=None, models_used=[],
+                  tokens=runrecord.blank_tokens(), error="Unexpected server error")  # fmt: skip
+    assert runrecord.record_cost(no_step, 2.0) == 0.0
+    # planted: a run killed with nothing reported is unknown, so it keeps the cautious figure
+    killed = rec(status="timeout", runner="claude-code", exit_code=None, cost_usd=None, tokens=runrecord.blank_tokens())
+    assert runrecord.record_cost(killed, 2.0) == 2.0
+    assert runrecord.record_cost(dict(no_step, runner="claude-code"), 2.0) == 2.0

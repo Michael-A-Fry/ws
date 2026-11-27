@@ -31,6 +31,11 @@ Runners: `claude-code` runs `claude --name LABEL [--remote-control=LABEL] [--mod
 `opencode [--model=M] --prompt PROMPT` (no name flags).
 The code root's `~` means your home only when it is `~` alone or starts `~/`.
 Every tmux command goes through `ws.term.tmux`'s injectable runner, so tests never touch a real tmux server.
+- A usage reserve (C840) keeps the end of the weekly plan for the lead. Before a window opens, dispatch runs
+  `wsn usage gate` (ws-next owns the rule and the figure). Its exit 75 refuses the dispatch with its own line: the plan
+  is in the reserve and the caller is not the lead. The lead is told apart by its process ancestry, never by a flag.
+  No `wsn` on PATH, or any other exit, lets the dispatch go with one line on stderr: the reserve is a guard for the
+  lead, so it fails open.
 Exit codes: 0 started (or shown), 1 something to fix (no repo folder, no runner, no tmux, tmux refused), 2 usage.
 """
 
@@ -40,6 +45,7 @@ import argparse
 import os
 import re
 import shutil
+import subprocess
 import sys
 from collections.abc import Mapping
 from pathlib import Path
@@ -173,8 +179,31 @@ def start(p: dict, run: tmux.Run = tmux.run_tmux) -> str:
     return out.strip()
 
 
+RESERVE_GATE = ("wsn", "usage", "gate")
+RESERVE_HELD = 75
+
+
+def reserve_gate(run=subprocess.run) -> None:
+    """Refuse when ws-next's usage reserve holds new sessions for the lead (C840); fail open otherwise."""
+    if not shutil.which(RESERVE_GATE[0]):
+        print("ws dispatch: usage reserve not checked (wsn is not on PATH)", file=sys.stderr)
+        return
+    try:
+        r = run(list(RESERVE_GATE), capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"ws dispatch: usage reserve not checked ({type(e).__name__})", file=sys.stderr)
+        return
+    if r.returncode == RESERVE_HELD:
+        why = (r.stderr or "").strip().splitlines()[-1:] or ["the weekly plan is in the reserve kept for the lead"]
+        raise WsError("usage_reserve", why[0], "wait for the reset, or ask the lead to start it", 1)
+    if r.returncode != 0:
+        print(f"ws dispatch: usage reserve not checked (wsn usage gate exited {r.returncode})", file=sys.stderr)
+
+
 def cmd_dispatch(args: argparse.Namespace) -> int:
     p = plan(args)
+    if not args.dry_run:
+        reserve_gate()
     if p["remote_control_off"]:
         print(f"ws dispatch: remote control left off ({p['remote_control_off']})", file=sys.stderr)
     if not args.dry_run:

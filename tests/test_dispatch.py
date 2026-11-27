@@ -19,6 +19,14 @@ with open(os.environ["STUB_OUT"], "w") as f:
     json.dump({{"argv": sys.argv[1:], "cwd": os.getcwd()}}, f)
 """
 
+GATE = """#!{python}
+import os, sys
+rc = int(os.environ.get("STUB_GATE_RC", "0"))
+if rc == 75:
+    print("ws usage reserve: the 7-day plan is at 95% (reserve 10%); new sessions are held for the lead", file=sys.stderr)
+sys.exit(rc)
+"""
+
 
 @pytest.fixture
 def box(tmp_path, monkeypatch):
@@ -30,6 +38,10 @@ def box(tmp_path, monkeypatch):
         stub = bin_dir / name
         stub.write_text(STUB.format(python=sys.executable))
         stub.chmod(0o755)
+    gate = bin_dir / "wsn"  # the usage reserve gate (C840): never the real one in a test
+    gate.write_text(GATE.format(python=sys.executable))
+    gate.chmod(0o755)
+    monkeypatch.setenv("STUB_GATE_RC", "0")
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("WS_HOME", str(tmp_path / "ws"))
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
@@ -270,3 +282,30 @@ def test_dry_run_shows_the_flags(box, fake, capsys):
     assert cli.main(["dispatch", "r", "--name", "check", "--dry-run", "hello"]) == 0
     out = capsys.readouterr().out
     assert "'--name', 'check', '--remote-control=check', 'hello'" in out
+
+
+def test_a_held_reserve_refuses_and_opens_no_window(box, fake, capsys, monkeypatch):
+    monkeypatch.setenv("STUB_GATE_RC", "75")
+    assert cli.main(["--json", "dispatch", "r", "go"]) == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["error_kind"] == "usage_reserve" and "95%" in out["message"]
+    assert windows(fake) == [] and not (box / "argv.json").exists()
+
+
+@pytest.mark.parametrize("rc", ["0", "1", "2"])
+def test_any_other_gate_answer_lets_the_dispatch_go(box, fake, monkeypatch, rc):
+    monkeypatch.setenv("STUB_GATE_RC", rc)
+    assert cli.main(["dispatch", "r", "go"]) == 0
+    assert len(windows(fake)) == 1
+
+
+def test_no_wsn_on_path_fails_open_with_a_line(box, fake, capsys, monkeypatch):
+    (box / "bin" / "wsn").unlink()
+    monkeypatch.setenv("PATH", str(box / "bin"))
+    assert cli.main(["dispatch", "r", "go"]) == 0
+    assert "usage reserve not checked" in capsys.readouterr().err
+
+
+def test_dry_run_does_not_ask_the_gate(box, fake, monkeypatch):
+    monkeypatch.setenv("STUB_GATE_RC", "75")
+    assert cli.main(["dispatch", "r", "--dry-run", "go"]) == 0

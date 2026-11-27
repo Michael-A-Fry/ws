@@ -22,6 +22,7 @@ from ws import (
     doctor,
     extcmd,
     gate,
+    gcalcmd,
     install,
     mcp_server,
     memory,
@@ -359,6 +360,7 @@ def build_parser() -> argparse.ArgumentParser:
     secrets.register(sub)
     broker.register(sub)
     broker.register_elevate(sub)
+    gcalcmd.register(sub)
     notes.register(sub)
     memory.register(sub)
     mcp_server.register(sub)

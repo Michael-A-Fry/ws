@@ -958,7 +958,12 @@ def test_opencode_parse_prices_a_priced_model_and_reads_errors():
     assert p["cost_usd"] == 1.0 and p["cost_basis"] == "runner" and p["tokens"]["cache_read"] == 6
     err = opencode.parse_result((FIXTURES / "opencode-events-error.jsonl").read_text(encoding="utf-8"), "", 1)
     assert "Cannot connect" in err["error"] and err["session_id"].startswith("ses_")
-    assert err["tokens"] == {"input": None, "output": None, "cache_creation": None, "cache_read": None}
+    assert err["tokens"] == {
+        "input": 0,
+        "output": 0,
+        "cache_creation": 0,
+        "cache_read": 0,
+    }  # refused before any content: nothing billed (C848)
     assert err["models_used"] == [] and err["cost_usd"] is None
     for junk in ("", "[]", "{", '{"type": "step_finish", "part": 1}'):
         assert isinstance(opencode.parse_result(junk, "", 1), dict)
@@ -1663,3 +1668,16 @@ def test_a_walled_class_term_in_the_input_file_is_refused_before_the_runner_star
     (rec,) = ws.records()
     assert rec["status"] == "refused" and rec["stop_reason"] == "refused:term"
     assert not (ws.home / "fake-saw.json").exists()  # the runner never started
+
+
+def test_an_opencode_error_before_any_content_counts_zero_tokens_but_not_after_content():
+    """C848: a provider that refused before the model produced anything billed nothing; once a text, reasoning or tool
+    part streamed, the step may have been billed, so the tokens stay unknown and the run counts at the fallback."""
+    err = {"type": "error", "error": {"name": "APIError", "data": {"message": "User not found."}}}
+    p = opencode.parse_result(json.dumps({"type": "step_start"}) + "\n" + json.dumps(err) + "\n", "", 1)
+    assert p["tokens"] == dict.fromkeys(p["tokens"], 0) and p["error"] == "User not found."
+    for part in ({"type": "text", "part": {"type": "text", "text": "Hel"}}, {"type": "tool_use", "part": {}}):
+        q = opencode.parse_result(json.dumps(part) + "\n" + json.dumps(err) + "\n", "", 1)
+        assert all(v is None for v in q["tokens"].values())
+    ok = opencode.parse_result(json.dumps({"type": "step_start"}) + "\n", "", 1)  # no error: nothing to say
+    assert all(v is None for v in ok["tokens"].values())

@@ -1480,8 +1480,8 @@ def request_for(
     purpose_cap_usd: float | None,
     limits: Limits,
 ) -> Request:
-    local = credential_kind(job) == "local"  # DEC-200: a local run reserves no money, so no cap can refuse it
-    usd = 0.0 if local else float(job.budget_usd or unknown_run_usd or runrecord.UNKNOWN_RUN_USD)
+    free = jobs.free_local(job)  # DEC-200: a free local run reserves no money, so no cap can refuse it
+    usd = 0.0 if free else float(job.budget_usd or unknown_run_usd or runrecord.UNKNOWN_RUN_USD)
     return Request(
         job=job.name, run_id=run_id, purpose=job.purpose, usd=usd,
         explicit_usd=job.budget_usd is not None, strict=job.strict, cap_usd=cap_usd, purpose_cap_usd=purpose_cap_usd,

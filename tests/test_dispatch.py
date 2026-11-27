@@ -21,10 +21,15 @@ with open(os.environ["STUB_OUT"], "w") as f:
 
 GATE = """#!{python}
 import os, sys
-rc = int(os.environ.get("STUB_GATE_RC", "0"))
-if rc == 75:
-    print("ws usage reserve: the 7-day plan is at 95% (reserve 10%); new sessions are held for the lead", file=sys.stderr)
-sys.exit(rc)
+args = sys.argv[1:]
+if args == ["usage", "gate"]:
+    rc = int(os.environ.get("STUB_GATE_RC", "0"))
+    if rc == 75:
+        print("ws usage reserve: the 7-day plan is at 95% (reserve 10%); new sessions are held for the lead", file=sys.stderr)
+    sys.exit(rc)
+if len(args) == 3 and args[:2] == ["usage", "lead-name"]:
+    sys.exit(int(os.environ.get("STUB_NAME_RC", "0")))
+sys.exit(99)  # any other call is a bug in dispatch
 """
 
 
@@ -42,6 +47,7 @@ def box(tmp_path, monkeypatch):
     gate.write_text(GATE.format(python=sys.executable))
     gate.chmod(0o755)
     monkeypatch.setenv("STUB_GATE_RC", "0")
+    monkeypatch.setenv("STUB_NAME_RC", "0")
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("WS_HOME", str(tmp_path / "ws"))
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
@@ -292,11 +298,30 @@ def test_a_held_reserve_refuses_and_opens_no_window(box, fake, capsys, monkeypat
     assert windows(fake) == [] and not (box / "argv.json").exists()
 
 
-@pytest.mark.parametrize("rc", ["0", "1", "2"])
-def test_any_other_gate_answer_lets_the_dispatch_go(box, fake, monkeypatch, rc):
+def test_a_lead_like_name_from_a_non_lead_is_refused(box, fake, capsys, monkeypatch):
+    monkeypatch.setenv("STUB_NAME_RC", "1")
+    assert cli.main(["--json", "dispatch", "r", "--name", "lead-29nov", "go"]) == 1
+    assert json.loads(capsys.readouterr().out)["error_kind"] == "lead_name"
+    assert windows(fake) == []
+
+
+@pytest.mark.parametrize("rc", ["1", "2", "99"])
+def test_any_other_gate_answer_goes_on_and_is_said_and_logged(box, fake, capsys, monkeypatch, rc):
     monkeypatch.setenv("STUB_GATE_RC", rc)
     assert cli.main(["dispatch", "r", "go"]) == 0
     assert len(windows(fake)) == 1
+    assert f"usage reserve not checked (wsn usage gate exited {rc})" in capsys.readouterr().err
+    log = (box / "home" / ".local" / "state" / "ws-lead" / "dispatch.log").read_text()
+    assert f"exited {rc}" in log and log[:4].isdigit()
+
+
+def test_a_gate_that_hangs_times_out_and_goes_on(box, fake, capsys, monkeypatch):
+    def hang(argv, **kw):
+        raise subprocess.TimeoutExpired(argv, kw.get("timeout"))
+
+    dispatch.lead_guard("x", run=hang)
+    err = capsys.readouterr().err
+    assert "lead name not checked (TimeoutExpired)" in err and "usage reserve not checked (TimeoutExpired)" in err
 
 
 def test_no_wsn_on_path_fails_open_with_a_line(box, fake, capsys, monkeypatch):
@@ -308,4 +333,5 @@ def test_no_wsn_on_path_fails_open_with_a_line(box, fake, capsys, monkeypatch):
 
 def test_dry_run_does_not_ask_the_gate(box, fake, monkeypatch):
     monkeypatch.setenv("STUB_GATE_RC", "75")
-    assert cli.main(["dispatch", "r", "--dry-run", "go"]) == 0
+    monkeypatch.setenv("STUB_NAME_RC", "1")
+    assert cli.main(["dispatch", "r", "--name", "lead-29nov", "--dry-run", "go"]) == 0

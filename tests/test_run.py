@@ -1676,7 +1676,7 @@ def test_an_opencode_error_before_any_content_counts_zero_tokens_but_not_after_c
     err = {"type": "error", "error": {"name": "APIError", "data": {"message": "User not found."}}}
     p = opencode.parse_result(json.dumps({"type": "step_start"}) + "\n" + json.dumps(err) + "\n", "", 1)
     assert p["tokens"] == dict.fromkeys(p["tokens"], 0) and p["error"] == "User not found."
-    for part in ({"type": "text", "part": {"type": "text", "text": "Hel"}}, {"type": "tool_use", "part": {}}):
+    for part in ({"type": "text", "part": {"type": "text", "text": "Hello"}}, {"type": "tool_use", "part": {}}):
         q = opencode.parse_result(json.dumps(part) + "\n" + json.dumps(err) + "\n", "", 1)
         assert all(v is None for v in q["tokens"].values())
     ok = opencode.parse_result(json.dumps({"type": "step_start"}) + "\n", "", 1)  # no error: nothing to say

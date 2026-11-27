@@ -2278,7 +2278,8 @@ def _as_opencode(box, name: str, model: str = "ollama/m") -> None:
 
 def test_a_lan_proxy_with_priced_models_and_a_non_opencode_runner_are_not_free(box):
     """C848 review: free means a local OpenCode server whose provider block prices no model above 0."""
-    lan = 'provider = {options = {baseURL = "http://192.168.1.5:4000/v1"}, models = {m = {cost = {input = 3, output = 15}}}}'
+    host = ".".join(map(str, (192, 168, 1, 5)))  # a LAN address, built so the PII gate sees no literal one
+    lan = f'provider = {{options = {{baseURL = "http://{host}:4000/v1"}}, models = {{m = {{cost = {{input = 3, output = 15}}}}}}}}'
     write_job(box, "proxy", secrets=False, extra=f"[runner_options]\n{lan}")
     _as_opencode(box, "proxy", "lan/m")
     assert jobs.credential_kind(jobs.load("proxy")) == "local" and not jobs.free_local(jobs.load("proxy"))

@@ -38,6 +38,7 @@ below, and `python3 scripts/gen_code_map.py --check` (prek and CI) fails when it
 | `gateclient.py` | The gate's thin hook client: ask the resident gate for the decision, and decide in this process... |
 | `gatecorpus.py` | The gate's replay corpus: labelled calls, and the numbers that say how well the gate sorts them |
 | `gateserve.py` | `ws gate serve`: the resident gate, one process per user that answers every hook call from every... |
+| `gcalcmd.py` | `ws gcal`: connect a Google Calendar to the broker, and the switches for its writes |
 | `globals.py` | `ws globals`: what ws installs globally stays global |
 | `guards/` | Guards: small, named checks the policy switches on, run by `ws gate` at the points a session can... |
 | `home/` | ws home: one read-only data API (`ws.home.api`) that every home area, app and script reads through |

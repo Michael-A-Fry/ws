@@ -26,6 +26,7 @@ RAW = {
     "mcp.serve": "stdout is the MCP protocol",
     "mail.serve": "stdout is the MCP protocol",
     "broker.serve": "stays up until stopped",
+    "broker.unit": "prints a systemd unit file for systemctl, or one line after --apply or --remove (C848)",
     "session.start": "a hook entry",
     "session.nudge": "a hook entry",
     "session.load": "a hook entry",

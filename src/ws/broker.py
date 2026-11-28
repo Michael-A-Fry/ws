@@ -2407,7 +2407,7 @@ def register(sub) -> None:
     g = p.add_mutually_exclusive_group()
     g.add_argument("--apply", action="store_true", help="write the unit, enable and start it")
     g.add_argument("--remove", action="store_true", help="stop, disable and delete the unit")
-    p.set_defaults(func=_cmd_unit)
+    p.set_defaults(func=_cmd_unit, raw=True)  # prints a systemd unit file, or one line
     p = bsub.add_parser("status", help="ask a running broker how it is")
     p.add_argument("--socket", metavar="PATH")
     p.set_defaults(func=cmd_status)

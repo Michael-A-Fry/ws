@@ -31,6 +31,7 @@ import os
 import re
 import ssl
 import subprocess
+import sys
 import urllib.request
 from collections.abc import Mapping
 from pathlib import Path
@@ -141,9 +142,15 @@ class GitHub:
         return runs
 
 
-# what the installer's uv or pip would otherwise read from the home a session can write: config files (an index URL in
-# `~/.config/uv/uv.toml`, a `pip.conf`) and a Python download; none of it is read
-NO_CONFIG = {"UV_NO_CONFIG": "1", "UV_PYTHON_DOWNLOADS": "never", "PIP_CONFIG_FILE": os.devnull}
+# what the installer's uv or pip would otherwise read from the home: config files (an index URL in `~/.config/uv/uv.toml`,
+# a `pip.conf`), uv's cache, and a Python download or another Python found by search; none of it is used
+NO_CONFIG = {
+    "UV_NO_CONFIG": "1",
+    "UV_NO_CACHE": "1",
+    "UV_PYTHON_DOWNLOADS": "never",
+    "UV_PYTHON_PREFERENCE": "only-system",
+    "PIP_CONFIG_FILE": os.devnull,
+}
 
 
 def clean_env(env: Mapping[str, str], constraints: Path | None = None) -> dict[str, str]:
@@ -154,9 +161,19 @@ def clean_env(env: Mapping[str, str], constraints: Path | None = None) -> dict[s
     out = {k: env[k] for k in ("HOME", *ENV_KEEP) if k in env}
     out["PATH"] = os.pathsep.join(tool_dirs())
     out.update(NO_CONFIG)
+    out["UV_PYTHON"] = (
+        interpreter()
+    )  # the new tool gets the Python this ws runs on, by its resolved path, never a search
     if constraints is not None:
         out["UV_CONSTRAINT"] = out["PIP_CONSTRAINT"] = str(constraints)
     return out
+
+
+def interpreter() -> str:
+    """The resolved file of the Python this ws runs on (through the venv's links): what the installer installs onto. A
+    path, not a version, so a Python someone put where uv searches is never picked; uv takes an explicit path even with
+    `only-system` (measured, uv 0.13.1)."""
+    return os.path.realpath(sys.executable)
 
 
 def proof_env(scratch: Path) -> dict[str, str]:

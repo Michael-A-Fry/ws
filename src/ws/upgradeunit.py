@@ -156,6 +156,11 @@ def write(env: Mapping[str, str], ws: Path) -> list[Path]:
     return made
 
 
+def control_group(run: Runner = subprocess.run) -> str:
+    """The cgroup path systemd gives the service (`ControlGroup`), or "" when it can't say (which matches nothing)."""
+    return show(SERVICE, ("ControlGroup",), run).get("ControlGroup", "").strip()
+
+
 def switch_path(env: Mapping[str, str]) -> Path:
     return paths.config_dir(dict(env)) / SWITCH
 

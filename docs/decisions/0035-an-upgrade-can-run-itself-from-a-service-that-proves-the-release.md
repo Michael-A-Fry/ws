@@ -97,6 +97,16 @@ from are protected paths of the hook (`ws.userconfig._claude_protect`), so a ses
 session can't switch the timer on with a link either. The service runs outside the gate, in its own cgroup, which is how
 it may rewrite the hooks that sessions can't.
 
+What the upgrader guarantees, and what it doesn't. It guarantees three things: only a genuine signed release is
+installed, never a downgrade, and a way back that works with no network. It doesn't resist code that already runs as
+the same Unix user. Such code can already do anything the upgrader can: set `WS_HOME` through `environment.d`, write
+and start a user unit of its own, write the switch, backdate a timer stamp. It gains no privilege by doing so, and the
+release signature still decides what gets installed. The start check and the protected paths narrow what a gated
+session can do. They're not a wall against a same-uid process, and the gate escape through a session's own user unit
+is tracked apart (C867). The installer gets the resolved path of the Python this ws runs on (`UV_PYTHON`, with
+`UV_PYTHON_PREFERENCE=only-system`), so a Python planted where uv searches is never picked, and uv's cache isn't read
+(`UV_NO_CACHE=1`). The cgroup test compares the whole path systemd gives the unit (`ControlGroup`), not its last name.
+
 Threat model. A tag signature guards against a tampered GitHub asset, not against an agent with release rights
 (DEC-088): an agent that can tag and publish a release can ship what this service installs. That's accepted and logged
 for C839. A session that writes a new unit of its own with `Wants=ws-upgrade.service` and starts it would start one run

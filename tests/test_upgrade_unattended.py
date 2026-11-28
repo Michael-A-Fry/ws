@@ -103,7 +103,16 @@ def svc(tmp_path, monkeypatch):
     # these test variables and the allow-list's names, nothing else
     monkeypatch.setattr(upgradeproof, "tool_dirs", lambda: [str(tools), "/usr/bin", "/bin"])
     monkeypatch.setattr(upgradeproof, "ENV_KEEP", (*upgradeproof.ENV_KEEP, "INSTALL_LOG", "INSTALL_ENV", "STUB_STATE"))
-    monkeypatch.setattr(upgrade, "_own_cgroup", lambda: "0::/user.slice/user-1000.slice/app.slice/ws-upgrade.service\n")
+    monkeypatch.setattr(
+        upgrade,
+        "_own_cgroup",
+        lambda: "0::/user.slice/user-1000.slice/user@1000.service/app.slice/ws-upgrade.service\n",
+    )
+    monkeypatch.setattr(
+        upgradeunit,
+        "control_group",
+        lambda run=None: "/user.slice/user-1000.slice/user@1000.service/app.slice/ws-upgrade.service",
+    )
     for name, value in {
         "INSTALL_LOG": tmp_path / "install.log",
         "INSTALL_ENV": tmp_path / "install.env",
@@ -288,7 +297,7 @@ def test_mirror_env_ignored(svc, monkeypatch):
     assert serve(svc) == 0 and installed(svc) == NEW
     seen = dict(line.split("=", 1) for line in Path(os.environ["INSTALL_ENV"]).read_text().splitlines() if "=" in line)
     assert not planted & seen.keys()
-    allowed = {*upgradeproof.ENV_KEEP, *upgradeproof.NO_CONFIG, "UV_CONSTRAINT", "PIP_CONSTRAINT"}
+    allowed = {*upgradeproof.ENV_KEEP, *upgradeproof.NO_CONFIG, "UV_PYTHON", "UV_CONSTRAINT", "PIP_CONSTRAINT"}
     allowed |= {"HOME", "PATH", "PWD", "SHLVL", "OLDPWD", "_", "WS_UPGRADE_STEP"}
     assert set(seen) <= allowed, set(seen) - allowed
     assert seen["PATH"] == os.pathsep.join(upgradeproof.tool_dirs()) and seen["HOME"] == os.environ["HOME"]
@@ -581,10 +590,18 @@ def test_a_crash_mid_swap_leaves_a_way_back_that_goes_one_release_not_two(svc, m
         ({"parent_comm": "bash"}, "the parent here is bash"),
         ({"cgroup": "0::/user.slice/session-3.scope\n"}, "inside ws-upgrade.service"),
         ({"cgroup": ""}, "inside ws-upgrade.service"),
+        (
+            {"cgroup": "0::/user.slice/user-1000.slice/user@1000.service/app.slice/evil.slice/ws-upgrade.service\n"},
+            "inside ws-upgrade.service",
+        ),  # a name at the end is not the unit's cgroup (S5)
     ],
 )
 def test_unattended_needs_the_user_manager_as_parent_and_the_units_own_cgroup(svc, kw, why):
-    base = {"parent_comm": "systemd", "ppid": 4242, "cgroup": "0::/a/b/ws-upgrade.service\n"}
+    base = {
+        "parent_comm": "systemd",
+        "ppid": 4242,
+        "cgroup": "0::/user.slice/user-1000.slice/user@1000.service/app.slice/ws-upgrade.service\n",
+    }
     assert upgrade.unattended_refusal(os.environ, **base) is None
     assert why in upgrade.unattended_refusal(os.environ, **{**base, **kw})
 
@@ -895,3 +912,21 @@ def test_auto_on_is_refused_from_a_session(svc, monkeypatch):
     monkeypatch.setenv(approvals.ENV_MARKER, "1")
     assert cli.main(["upgrade", "--auto", "on"]) == upgrade.EXIT_REFUSED
     assert not upgradeunit.switch_path(os.environ).exists()
+
+
+def test_systemd_that_cannot_say_the_units_cgroup_matches_nothing(svc, monkeypatch):
+    monkeypatch.setattr(upgradeunit, "control_group", lambda run=None: "")
+    assert not upgrade.in_unit_cgroup("0::/user.slice/user-1000.slice/user@1000.service/app.slice/ws-upgrade.service\n")
+
+
+def test_the_new_tool_gets_this_ws_python_by_path_never_a_planted_one(svc):
+    """B3: a Python planted where uv looks (~/.local/share/uv/python) is never picked: UV_PYTHON names the resolved file
+    of the interpreter this ws runs on, uv searches for no other, and its cache is not read."""
+    planted = svc.home / ".local" / "share" / "uv" / "python" / "cpython-3.99-linux" / "bin" / "python3"
+    planted.parent.mkdir(parents=True)
+    planted.write_text("#!/bin/sh\n", encoding="utf-8")
+    planted.chmod(0o755)
+    assert serve(svc) == 0
+    seen = dict(line.split("=", 1) for line in Path(os.environ["INSTALL_ENV"]).read_text().splitlines() if "=" in line)
+    assert seen["UV_PYTHON"] == os.path.realpath(sys.executable) and str(planted) not in seen["UV_PYTHON"]
+    assert seen["UV_PYTHON_PREFERENCE"] == "only-system" and seen["UV_NO_CACHE"] == "1"

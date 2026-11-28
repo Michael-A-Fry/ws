@@ -1482,11 +1482,15 @@ def unattended_refusal(
     return None
 
 
-def in_unit_cgroup(cgroup: str | None = None) -> bool:
-    """Whether the kernel puts this process in `ws-upgrade.service`'s cgroup: a session's shell, and a unit of a session's
-    own, never are (its children are, which is how the swap's hooks step is told apart)."""
-    units = [line.rsplit("/", 1)[-1] for line in (_own_cgroup() if cgroup is None else cgroup).splitlines()]
-    return "ws-upgrade.service" in units
+def in_unit_cgroup(cgroup: str | None = None, expected: str | None = None) -> bool:
+    """Whether the kernel puts this process in `ws-upgrade.service`'s cgroup: the whole path, compared with the one systemd
+    gives the unit (`ControlGroup`), not a name at the end that any unit could also end in. A session's shell, and a unit
+    of a session's own, never match; the service's children do, which is how the swap's hooks step is told apart."""
+    own = next(
+        (line[3:] for line in (_own_cgroup() if cgroup is None else cgroup).splitlines() if line.startswith("0::")), ""
+    )
+    want = upgradeunit.control_group() if expected is None else expected
+    return bool(want) and own.strip() == want
 
 
 def idle_reason(env: Mapping[str, str]) -> str | None:

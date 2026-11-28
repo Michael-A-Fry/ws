@@ -36,7 +36,10 @@ body of the GitHub release.
   switch file as well as enabling the timer. At start the service checks with systemd that the timer started it, and
   that nothing else pulls the units in or changes them; a run started any other way refuses and alerts. The installer
   reads no uv or pip config and gets the tag's lock as constraints. A way back killed midway is finished by the
-  unit. Three busy runs in a row alert. The guard no longer refuses `systemctl daemon-reload`.
+  unit. Three busy runs in a row alert. The guard no longer refuses `systemctl daemon-reload`. The installer gets this
+  ws's own Python by its resolved path and no uv cache, and the cgroup test compares the unit's whole cgroup path.
+  ADR 0035 states what the upgrader guarantees: signed releases only, no downgrade, an offline way back; not
+  resistance to code already running as the same user.
 - `ws upgrade --unattended`, the entry of a systemd user service (the unit comes with the next change). It asks GitHub
   for the newest release itself (no request file) and does nothing when that's installed or older. It proves the
   release from the installed wheel's trust root (a signed tag, the installer's and wheel's hashes and cosign bundles,

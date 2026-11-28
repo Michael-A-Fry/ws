@@ -23,12 +23,11 @@ release changed the policy in a way the old one rejects (the 22 November lockout
 
 ## Decision Outcome
 
-Chosen option: the timer and its service. Two units (`ws upgrade --print-units`, written by `--write` from a person's
-terminal):
+Chosen option: the timer and its service. Two units, written by `ws upgrade --auto on` from a person's terminal:
 
 - `ws-upgrade.timer` fires daily at a random minute of the hour (`Persistent=true`, so a day missed while the machine
-  was off runs ten minutes after boot). The switch (DEC-131) is enabling it: writing the units starts nothing, and only
-  the person enables it. No request file and no path unit: nothing a session writes names what gets installed.
+  was off runs ten minutes after boot). No request file and no path unit: nothing a session writes names what gets
+  installed.
 - `ws-upgrade.service` runs `ws upgrade --unattended`, which is refused unless it runs under systemd, inside this unit's
   cgroup, with no session sign. It asks GitHub for the newest release (`releases/latest`, one tag read as data). It does
   nothing when that's the installed version, and skips a tag that has rolled back here before. Otherwise it proves the
@@ -39,6 +38,27 @@ terminal):
   place, never a fresh download, which the network fault that broke the check would break too. A refusal or a rollback
   exits non-zero, and `OnFailure=ws-alert@%n.service` turns that into the ntfy alert every ws job has. A machine that
   stays busy exits 0 and is tried on the next run.
+
+The switch (DEC-131) is `auto-upgrade.on` in ws's config folder, a protected root like the policy beside it: only
+`ws upgrade --auto on` writes it, and it also writes the units and enables the timer. Enabling the timer alone isn't
+enough, because a session can reach the user manager in more ways than a guard can list (its own timer with `Unit=`,
+`Also=`, `Wants=` or `OnFailure=` in its own unit, a `timers.target.d` drop-in, a `.service.wants` link, `preset-all`).
+So the service checks its own start with systemd (`upgradeunit.self_check`): the switch is on; `TriggeredBy` is the
+timer alone and the timer fired just before this run; nothing else pulls either unit in (`WantedBy` beyond
+`timers.target`, `RequiredBy`, `UpheldBy`, `OnFailureOf` and the like); no drop-in; no reload pending; and the unit files
+are the text ws writes. Any of it failing is a refusal and an alert. That's also why `daemon-reload` is no longer
+refused: a reload can only make the service refuse.
+
+The installer runs with `UV_NO_CONFIG=1`, `UV_PYTHON_DOWNLOADS=never` and `PIP_CONFIG_FILE=/dev/null`, so a
+`uv.toml` or `pip.conf` a session wrote isn't read, and with the tag's own lock as constraints (`uv export --frozen`,
+pinned versions). Hashes aren't checked there: uv 0.13 ignores hashes in a constraints file for `uv tool install`
+(measured, 28 Nov), so a pinned version is trusted to be the file PyPI serves for it. ws has no runtime dependencies
+today, so the pin list is empty and the proved wheel is all that's installed.
+
+A way back copies the kept tool folder beside the installed one first, then swaps them with two renames; a kill
+between them leaves both beside it, and the unit's `ExecStopPost=` (shell, no Python) puts one back. The release is
+proved before the idle wait, and the wait ends early enough that the install, its checks and a way back still fit in
+the unit's hour. Busy runs exit 0, but three in a row alert, so a job or a lock held for days is seen.
 
 There is no rescue timer. The checks inside the swap already roll back, and a second automatic action would need its
 own switch (DEC-131). A rollback after the swap has been kept is the person's, from his terminal (`ws upgrade
@@ -77,6 +97,16 @@ from are protected paths of the hook (`ws.userconfig._claude_protect`), so a ses
 session can't switch the timer on with a link either. The service runs outside the gate, in its own cgroup, which is how
 it may rewrite the hooks that sessions can't.
 
+What the upgrader guarantees, and what it doesn't. It guarantees three things: only a genuine signed release is
+installed, never a downgrade, and a way back that works with no network. It doesn't resist code that already runs as
+the same Unix user. Such code can already do anything the upgrader can: set `WS_HOME` through `environment.d`, write
+and start a user unit of its own, write the switch, backdate a timer stamp. It gains no privilege by doing so, and the
+release signature still decides what gets installed. The start check and the protected paths narrow what a gated
+session can do. They're not a wall against a same-uid process, and the gate escape through a session's own user unit
+is tracked apart (C867). The installer gets the resolved path of the Python this ws runs on (`UV_PYTHON`, with
+`UV_PYTHON_PREFERENCE=only-system`), so a Python planted where uv searches is never picked, and uv's cache isn't read
+(`UV_NO_CACHE=1`). The cgroup test compares the whole path systemd gives the unit (`ControlGroup`), not its last name.
+
 Threat model. A tag signature guards against a tampered GitHub asset, not against an agent with release rights
 (DEC-088): an agent that can tag and publish a release can ship what this service installs. That's accepted and logged
 for C839. A session that writes a new unit of its own with `Wants=ws-upgrade.service` and starts it would start one run
@@ -88,6 +118,10 @@ in a checkout or `~/.local/bin`.
 Every run is a row in `<state>/release-log.csv` (at, verb, from, to, duration_s, result, reason): `current`, `ok`,
 `rolled-back`, `not-restored`, `refused`, `busy` or `skipped`. That's the evidence that ws runs the newest release
 within a day, or the last one if the newest failed.
+
+Not done, with the reason: waiting for no live interactive session. On this machine about 40 sessions are open,
+most idle for days, so the upgrade would never run. A session keeps the rules it loaded, and the hook binary is
+replaced by one install step.
 
 ### Consequences
 

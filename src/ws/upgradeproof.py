@@ -31,6 +31,7 @@ import os
 import re
 import ssl
 import subprocess
+import sys
 import urllib.request
 from collections.abc import Mapping
 from pathlib import Path
@@ -141,13 +142,38 @@ class GitHub:
         return runs
 
 
-def clean_env(env: Mapping[str, str]) -> dict[str, str]:
+# what the installer's uv or pip would otherwise read from the home: config files (an index URL in `~/.config/uv/uv.toml`,
+# a `pip.conf`), uv's cache, and a Python download or another Python found by search; none of it is used
+NO_CONFIG = {
+    "UV_NO_CONFIG": "1",
+    "UV_NO_CACHE": "1",
+    "UV_PYTHON_DOWNLOADS": "never",
+    "UV_PYTHON_PREFERENCE": "only-system",
+    "PIP_CONFIG_FILE": os.devnull,
+}
+
+
+def clean_env(env: Mapping[str, str], constraints: Path | None = None) -> dict[str, str]:
     """What a program the service starts may see: the system folders as its PATH, the caller's home (an installer installs
-    into it) and the locale (`ENV_KEEP`), and nothing else. A mirror address, a skip-the-checks switch, a proxy, a library
-    path or a token set for some other purpose never reaches the installer."""
+    into it) and the locale (`ENV_KEEP`), `NO_CONFIG`, and the release's own pins (`constraints`, from `export_pins`) for
+    uv and pip, and nothing else. A mirror address, a skip-the-checks switch, a proxy, a library path, a config file in the
+    home or a token set for some other purpose never reaches the installer."""
     out = {k: env[k] for k in ("HOME", *ENV_KEEP) if k in env}
     out["PATH"] = os.pathsep.join(tool_dirs())
+    out.update(NO_CONFIG)
+    out["UV_PYTHON"] = (
+        interpreter()
+    )  # the new tool gets the Python this ws runs on, by its resolved path, never a search
+    if constraints is not None:
+        out["UV_CONSTRAINT"] = out["PIP_CONSTRAINT"] = str(constraints)
     return out
+
+
+def interpreter() -> str:
+    """The resolved file of the Python this ws runs on (through the venv's links): what the installer installs onto. A
+    path, not a version, so a Python someone put where uv searches is never picked; uv takes an explicit path even with
+    `only-system` (measured, uv 0.13.1)."""
+    return os.path.realpath(sys.executable)
 
 
 def proof_env(scratch: Path) -> dict[str, str]:
@@ -235,7 +261,11 @@ def _tag_signature(repo: Path, tag: str, root: Mapping[str, str], scratch: Path,
     kind = _run([git, "-C", str(repo), "cat-file", "-t", f"refs/tags/{tag}"], env).strip()
     if kind != "tag":
         raise Refused(f"{tag} is not a signed (annotated) tag")
-    if SSH_SIGNATURE not in _run([git, "-C", str(repo), "cat-file", "tag", f"refs/tags/{tag}"], env):
+    body = _run([git, "-C", str(repo), "cat-file", "tag", f"refs/tags/{tag}"], env)
+    named = next((line[4:] for line in body.splitlines() if line.startswith("tag ")), None)
+    if named != tag:  # a signed tag object of another release, under this name, is a replay
+        raise Refused(f"the tag object under {tag} names {named or 'no tag'}")
+    if SSH_SIGNATURE not in body:
         raise Refused(f"{tag} carries no SSH signature")
     cfg = [
         "-c",
@@ -270,6 +300,35 @@ def _asset(src: Source, tag: str, name: str, scratch: Path, identity: str, issue
     bundle = scratch / f"{name}.sigstore.json"
     bundle.write_bytes(src.asset(tag, f"{name}.sigstore.json"))
     _cosign(path, bundle, identity, issuer, env)
+    return path
+
+
+CONSTRAINTS = "constraints.txt"  # in the proof's scratch folder: every dependency pinned as the tag's lock pins it
+
+
+def export_pins(repo: Path, scratch: Path, env: Mapping[str, str]) -> Path:
+    """Write the tag's own lock as a constraints file (`uv export --frozen`), so the installer resolves nothing fresh.
+    No hashes: uv 0.13 does not check hashes in a constraints file for `uv tool install` (measured 28 Nov), and pip
+    refuses them there; the versions are pinned, and the wheel itself is proved by its bundle."""
+    out = _run(
+        [
+            tool("uv"),
+            "export",
+            "--frozen",
+            "--no-dev",
+            "--no-emit-project",
+            "--no-hashes",
+            "--format",
+            "requirements-txt",
+        ],
+        env,
+        cwd=repo,
+    )
+    pins = [line for line in out.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+    if not all("==" in line for line in pins):  # none at all is fine: ws has no runtime dependencies today
+        raise Refused("the release's lock could not be read as pinned versions")
+    path = scratch / CONSTRAINTS
+    path.write_text("".join(f"{line}\n" for line in pins), encoding="utf-8")
     return path
 
 
@@ -325,4 +384,5 @@ def verify_release(tag: str, root: Mapping[str, str], src: Source, scratch: Path
     if not runs or bad:
         raise Refused(f"the checks on {tag}'s commit are not all green ({', '.join(map(str, bad[:3])) or 'none ran'})")
     _audit(repo, env)
+    export_pins(repo, scratch, env)
     return installer

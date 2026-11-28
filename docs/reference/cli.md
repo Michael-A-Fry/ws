@@ -1060,7 +1060,7 @@ Swap ws for a newer release and rewrite the runner's hooks in the same step.
 
 ```text
 ws upgrade [-h] [--version TAG] [--channel {stable,rc,edge}] [--installer FILE] [--hooks-only] [--dry-run]
-            [--rollback] [--check COMMAND] [--print-units [--write]] [--session-check COMMAND]
+            [--rollback] [--check COMMAND] [--print-units [--write]] [--auto {on,off}] [--session-check COMMAND]
 ```
 
 | Argument | Meaning |
@@ -1073,6 +1073,7 @@ ws upgrade [-h] [--version TAG] [--channel {stable,rc,edge}] [--installer FILE] 
 | `--rollback` | Put the previous release back (or `--version TAG`), with the policy as it was if you haven't edited it since. |
 | `--check COMMAND` | Run this after the swap; a non-zero exit rolls the swap back. |
 | `--print-units` | Print the two systemd units of the [unattended upgrade](#unattended-upgrade); with `--write`, write them to `~/.config/systemd/user/` (nothing is enabled). |
+| `--auto on\|off` | Turn the [unattended upgrade](#unattended-upgrade) on (write the units, enable the timer, write the switch) or off. From a terminal of your own. |
 
 It runs the installer, then rewrites ws's hooks with the new ws in a new process (`--hooks-only`). The rewrite touches the
 gate only: each runner whose config already holds ws's entries gets them refreshed. It switches nothing on and takes
@@ -1120,9 +1121,13 @@ status reply and the stop; each caller asks again. An automatic rollback never t
 
 `ws upgrade --unattended` is the entry of the `ws-upgrade.service` user unit, which the daily `ws-upgrade.timer`
 starts. It's never for a person or a session: exit 3 with any sign of a session, with no `INVOCATION_ID`, when the
-parent isn't the user manager, or outside the unit's cgroup. Make the units with `ws upgrade --print-units [--write]`
-from an installed ws; their `ExecStart` is the `ws` command in the installed tool's folder. Enabling the timer is the
-switch, and it's yours (`systemctl --user enable --now ws-upgrade.timer`). The design and what it proves are in [ADR
+parent isn't the user manager, or outside the unit's cgroup. The switch is yours: `ws upgrade --auto on` (from a
+terminal of your own) writes the units, enables the timer and writes `auto-upgrade.on` in ws's config folder, which a
+session can't write; `--auto off` undoes it. Their `ExecStart` is the `ws` command in the installed tool's folder.
+
+At start the service checks with systemd that this run is the timer firing just now, with the switch on, nothing else
+pulling either unit in, no drop-in, no reload pending, and the unit files as ws wrote them. Anything else is a refusal
+and an alert. The design and what it proves are in [ADR
 0035](../decisions/0035-an-upgrade-can-run-itself-from-a-service-that-proves-the-release.md).
 
 The service asks GitHub for the newest release. When that's the installed version or older, it logs `current` and

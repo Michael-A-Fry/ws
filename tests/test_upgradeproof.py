@@ -241,8 +241,9 @@ def test_the_installer_gets_an_allow_list_and_never_the_callers_environment(worl
         monkeypatch.setenv(name, "https://evil.example/")
     env = upgradeproof.clean_env(os.environ)
     assert not planted & env.keys()
-    assert set(env) <= {"HOME", "PATH", *upgradeproof.ENV_KEEP}
+    assert set(env) <= {"HOME", "PATH", "UV_PYTHON", *upgradeproof.ENV_KEEP, *upgradeproof.NO_CONFIG}
     assert env["PATH"] == os.pathsep.join(upgradeproof.tool_dirs()) and env["HOME"] == os.environ["HOME"]
+    assert {k: env[k] for k in upgradeproof.NO_CONFIG} == upgradeproof.NO_CONFIG  # no uv or pip config is ever read
 
 
 def test_downloads_ignore_a_proxy_and_a_certificate_variable(monkeypatch, tmp_path):

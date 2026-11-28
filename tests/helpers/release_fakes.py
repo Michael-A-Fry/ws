@@ -38,8 +38,13 @@ sys.exit(0 if ok else 1)
 """
 UV = """#!{py}
 import os, sys
-sys.stdout.write(open(os.path.join(os.path.dirname(__file__), "audit.json")).read())
+here = os.path.dirname(__file__)
+if "export" in sys.argv[1:]:
+    sys.stdout.write(open(os.path.join(here, "pins.txt")).read())
+else:
+    sys.stdout.write(open(os.path.join(here, "audit.json")).read())
 """
+PINS = "# made by uv export\nidna==3.10\nrequests==2.32.3\n"
 
 
 def sha(data: bytes) -> str:
@@ -110,6 +115,7 @@ def stub_tools(folder: Path) -> Path:
         tool.write_text(text.format(py=sys.executable), encoding="utf-8")
         tool.chmod(0o755)
     (folder / "audit.json").write_text(json.dumps({"vulnerabilities": []}), encoding="utf-8")
+    (folder / "pins.txt").write_text(PINS, encoding="utf-8")
     return folder
 
 

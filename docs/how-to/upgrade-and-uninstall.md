@@ -78,13 +78,12 @@ gets one line about it, once. Start a new session to use the new release.
 
 ### Let ws upgrade itself
 
-Once, from a terminal of your own, install a release that carries the service, then write its units and turn on
-the switch (the timer; it's off until you enable it):
+Once, from a terminal of your own, install a release that carries the service, then turn on the switch (it's off
+until you do). It writes the units, enables the timer and writes the switch file in ws's config folder, which a session
+can't write:
 
 ```sh
-ws upgrade --print-units --write
-systemctl --user daemon-reload
-systemctl --user enable --now ws-upgrade.timer
+ws upgrade --auto on
 systemctl --user list-timers ws-upgrade.timer
 ```
 
@@ -92,9 +91,10 @@ After that, the timer looks for a new release once a day (and ten minutes after 
 proves the release, waits until nothing is running, keeps a copy of the installed ws, swaps, restarts the broker, checks
 the gate and, on any failure, puts the copy back with no download and sends an ntfy alert. A release that rolled back
 isn't tried again. Read the result in `release-log.csv` in ws's state folder. `git`, `cosign` and `uv` must be on the
-PATH the units set. To turn it off, run `systemctl --user disable --now ws-upgrade.timer`; to swap it for cron or another
+PATH the units set. To turn it off, run `ws upgrade --auto off`; to swap it for cron or another
 scheduler, see the swap note in [ADR 0035](../decisions/0035-an-upgrade-can-run-itself-from-a-service-that-proves-the-release.md).
-A session can't start, stop, enable or change the units: the gate refuses it.
+A session can't start, stop, enable or change the units: the gate refuses it, and a run that a session found
+another way to start refuses itself (and alerts). Three busy runs in a row alert too.
 
 ### Runner updates
 

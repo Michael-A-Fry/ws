@@ -13,9 +13,11 @@ What is refused, for every runner:
   is refused too when the unit it names can't be read here: a variable or substitution, a glob or a brace in the name
   (`'ws-u*.timer'`, `ws-?pgrade.timer`: the manager expands it, this check does not), or a unit list fed in by `xargs` or
   `parallel`; `systemctl` is found wherever it stands in the words (`find -exec`, `systemd-run`);
-- `systemctl daemon-reload`, `daemon-reexec`, `set-environment`, `import-environment` and `unset-environment`, whatever
-  the unit: a reload is how a drop-in or a copy in `user.control` takes effect, and the environment verbs put variables
-  (`PYTHONPATH`) into every unit the manager starts. `dbus-update-activation-environment --systemd` is the same verb;
+- `systemctl --user set-environment`, `import-environment` and `unset-environment` (and under `--global` or `-M`): they
+  put variables (`PYTHONPATH`) into every unit the user manager starts. `dbus-update-activation-environment --systemd` is
+  the same verb. `daemon-reload` is allowed (a session installs timers of its own): a reload can only make the upgrade
+  refuse, because the service checks at start that systemd loaded it from the text ws wrote, with no drop-in and no
+  reload pending (`ws.upgradeunit.self_check`);
 - the bus routes to the same manager: `busctl call` or `set-property`, `gdbus call`, `dbus-send` and `qdbus` that name
   `org.freedesktop.systemd1` (reading it, as `busctl tree` or `get-property` does, is allowed);
 - `systemd-run` naming such a unit, and any command that has the words `upgrade` and `--unattended` (or a prefix of it
@@ -49,7 +51,6 @@ _VERBS = frozenset(
     | {"enable", "disable", "reenable", "mask", "unmask", "edit", "revert", "link", "set-property", "isolate"}
     | {"reset-failed", "clean", "freeze", "thaw", "preset", "add-wants", "add-requires"}
 )
-_RELOAD_VERBS = frozenset({"daemon-reload", "daemon-reexec"})
 _ENV_VERBS = frozenset({"set-environment", "import-environment", "unset-environment"})
 _FLAGS = ("--unattended",)
 _DYNAMIC = ("$", "`")
@@ -87,8 +88,8 @@ def _user_manager(rest: list[str]) -> bool:
 def _systemctl(rest: list[str], fed: bool) -> Finding | None:
     """The words after `systemctl`: the upgrade units named, the verbs that change the manager itself, and the unit names
     this check can't read."""
-    verb = next((w for w in rest if w in _RELOAD_VERBS | _ENV_VERBS), None)
-    if verb:
+    verb = next((w for w in rest if w in _ENV_VERBS), None)
+    if verb and _user_manager(rest):
         return Finding("deny", _WHY.format(what=f"systemctl {verb}"))
     verbs = {w for w in rest if w in _VERBS}
     if not verbs:

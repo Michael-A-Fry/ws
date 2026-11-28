@@ -64,6 +64,11 @@ def test_the_service_is_not_for_a_session(command):
         "systemctl --user start ws-other.service",
         "systemctl --user restart some.service",
         "systemctl restart $svc",  # a system unit by a variable: not this guard's business
+        "systemctl --user daemon-reload",  # a session installs timers of its own; the service checks what got loaded
+        "systemctl daemon-reexec",
+        "sudo systemctl --user daemon-reload",
+        "systemctl set-environment LANG=C",  # the system manager's environment: not the user units'
+        "systemctl --user enable --now my-backup.timer",
         "systemd-run --user sleep 1",
         "ws upgrade --dry-run",
         "ws upgrade --version v1.2.3 --check true",
@@ -102,12 +107,9 @@ def test_reading_the_units_and_every_other_command_goes_through(command):
         ("echo ws-upgrade.timer | xargs -I{} systemctl --user stop {}", "a glob or a brace"),
         ("find . -exec systemctl --user stop ws-upgrade.timer ';'", "on the upgrade unit"),
         ("watch systemctl --user restart ws-upgrade.timer", "on the upgrade unit"),
-        ("systemctl --user daemon-reload", "systemctl daemon-reload"),
-        ("systemctl daemon-reexec", "systemctl daemon-reexec"),
         ("systemctl --user set-environment PYTHONPATH=/tmp/x", "systemctl set-environment"),
         ("systemctl --user import-environment PYTHONPATH", "systemctl import-environment"),
         ("systemctl --user unset-environment PATH", "systemctl unset-environment"),
-        ("sudo systemctl --user daemon-reload", "systemctl daemon-reload"),
         ("dbus-update-activation-environment --systemd PYTHONPATH=/tmp/x", "dbus-update-activation-environment"),
         (
             (

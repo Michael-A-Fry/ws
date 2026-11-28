@@ -138,6 +138,8 @@ DEFAULT_GUARDS = (
 STEP_ENV = "WS_UPGRADE_STEP"  # set for each step the upgrade runs: a hooks rewrite there leaves the log line to it
 INSTALL_TIMEOUT_S, STEP_TIMEOUT_S = 600.0, 120.0  # the watchdog per step: the installer, then the hooks and the check
 BACKUPS_DIR, BACKUPS_KEPT = "upgrade-backups", 5  # what a swap keeps of the files it may change, and how many swaps
+BUSY_ALERT_AFTER = 3  # busy runs in a row (a job, a lease, a held lock) before the run alerts
+SWAP_BUDGET_S = INSTALL_TIMEOUT_S + 4 * STEP_TIMEOUT_S + 300  # the install, its checks and a way back, at worst
 TOOL_COPY = "tool"  # the installed tool folder, kept in an unattended swap's backup folder for an offline way back
 IDLE_WAIT_S, IDLE_EVERY_S = (
     1800.0,
@@ -691,7 +693,10 @@ def swap(args: argparse.Namespace, scratch: Path) -> Ran:
     if not script.is_file():
         raise WsError("failed", f"{script} is not a file", "pass --installer with a copy of install.sh")
     limit = getattr(args, "install_timeout", None) or INSTALL_TIMEOUT_S
-    env = upgradeproof.clean_env(os.environ) if getattr(args, "unattended", False) else None
+    pins = getattr(args, "constraints", None)
+    env = (
+        upgradeproof.clean_env(os.environ, Path(pins) if pins else None) if getattr(args, "unattended", False) else None
+    )
     return _step(args, "installer", _installer_argv(script, args), limit, env=env)
 
 
@@ -780,17 +785,24 @@ def keep_tool(env: Mapping[str, str], kept: Path | None) -> Path:
 
 
 def restore_tool(copy: Path, tree: Path) -> bool:
-    """Put the tool folder `copy` back at `tree`, with no network: the failed release is moved aside, the copy goes in
-    its place, and if that fails the failed release is put back where it was (a ws that runs beats none)."""
-    aside = tree.with_name(tree.name + ".ws-failed")
-    shutil.rmtree(aside, ignore_errors=True)
+    """Put the tool folder `copy` back at `tree`, with no network. The copy is made beside it first (`.ws-restore`), then
+    two renames swap it in, so a kill at any point leaves either the failed release or the restored one at `tree`, or,
+    between the renames, both beside it, which the unit's `ExecStopPost=` puts back with no Python. A failure before the
+    renames leaves the failed release where it is (a ws that runs beats none)."""
+    aside, ready = tree.with_name(tree.name + ".ws-failed"), tree.with_name(tree.name + ".ws-restore")
+    for leftover in (aside, ready):
+        shutil.rmtree(leftover, ignore_errors=True)
+    try:
+        shutil.copytree(copy, ready, symlinks=True)
+    except OSError:
+        shutil.rmtree(ready, ignore_errors=True)
+        return False
     try:
         if tree.exists():
             os.rename(tree, aside)
-        shutil.copytree(copy, tree, symlinks=True)
+        os.rename(ready, tree)
     except OSError:
-        if aside.exists():
-            shutil.rmtree(tree, ignore_errors=True)
+        if not tree.exists() and aside.exists():
             os.rename(aside, tree)
         return False
     shutil.rmtree(aside, ignore_errors=True)
@@ -1465,11 +1477,20 @@ def unattended_refusal(
     comm = parent_comm if parent_comm is not None else _parent_comm(parent)
     if comm != "systemd" or parent == 1:  # PID 1 is the system manager's name too, and not this user's
         return f"ws upgrade --unattended runs only from its systemd unit (the parent here is {comm or 'unknown'}, pid {parent})"
-    # the kernel says which unit this process belongs to; a session's own shell is never in `ws-upgrade.service`
-    units = [line.rsplit("/", 1)[-1] for line in (_own_cgroup() if cgroup is None else cgroup).splitlines()]
-    if "ws-upgrade.service" not in units:
+    if not in_unit_cgroup(cgroup):
         return "ws upgrade --unattended runs only inside ws-upgrade.service (its cgroup is not that unit)"
     return None
+
+
+def in_unit_cgroup(cgroup: str | None = None, expected: str | None = None) -> bool:
+    """Whether the kernel puts this process in `ws-upgrade.service`'s cgroup: the whole path, compared with the one systemd
+    gives the unit (`ControlGroup`), not a name at the end that any unit could also end in. A session's shell, and a unit
+    of a session's own, never match; the service's children do, which is how the swap's hooks step is told apart."""
+    own = next(
+        (line[3:] for line in (_own_cgroup() if cgroup is None else cgroup).splitlines() if line.startswith("0::")), ""
+    )
+    want = upgradeunit.control_group() if expected is None else expected
+    return bool(want) and own.strip() == want
 
 
 def idle_reason(env: Mapping[str, str]) -> str | None:
@@ -1494,13 +1515,16 @@ class Busy(upgradeproof.Refused):
     """Something stayed running for the whole wait: nothing was changed, and the next run tries again."""
 
 
-def wait_idle(env: Mapping[str, str], sleep=time.sleep, now=time.monotonic) -> None:
-    """Poll `idle_reason` every `IDLE_EVERY_S` seconds for up to `IDLE_WAIT_S`; raise `Busy` with the last reason."""
-    end = now() + IDLE_WAIT_S
+def wait_idle(env: Mapping[str, str], sleep=time.sleep, now=time.monotonic, deadline: float | None = None) -> None:
+    """Poll `idle_reason` every `IDLE_EVERY_S` seconds for up to `IDLE_WAIT_S`, and never past `deadline` (a monotonic
+    time); raise `Busy` with the last reason. Past the deadline it raises even when idle: the swap would not fit."""
+    end = now() + IDLE_WAIT_S if deadline is None else min(now() + IDLE_WAIT_S, deadline)
     while (why := idle_reason(env)) is not None:
         if now() >= end:
-            raise Busy(f"still busy after {IDLE_WAIT_S / 60:.0f} minutes ({why}); nothing was changed")
+            raise Busy(f"still busy after {IDLE_WAIT_S / 60:.0f} minutes at most ({why}); nothing was changed")
         sleep(IDLE_EVERY_S)
+    if deadline is not None and now() > deadline:
+        raise Busy("too little of the unit's time is left for the swap and a way back; nothing was changed")
 
 
 def _rolled_back_before(env: Mapping[str, str], tag: str) -> bool:
@@ -1513,6 +1537,14 @@ def _log(args: argparse.Namespace, env: Mapping[str, str], t0: float, verb: str,
     _say(args, " ".join(w for w in (verb, to or "", f"{result}:" if why else result, why) if w))
 
 
+def _busy(args: argparse.Namespace, env: Mapping[str, str], t0: float, verb: str, to: str | None, why: str) -> int:
+    """Log a busy run. 0 (the next run tries again) until `BUSY_ALERT_AFTER` runs in a row were busy: then non-zero, so
+    the unit's alert says that something (a job, a lease, a held lock) has kept ws from upgrading for days."""
+    _log(args, env, t0, verb, to, "busy", why)
+    rows = upgradecheck.last_rows(env)[-BUSY_ALERT_AFTER:]
+    return EXIT_FAILED if len(rows) == BUSY_ALERT_AFTER and all(r["result"] == "busy" for r in rows) else 0
+
+
 def cmd_unattended(args: argparse.Namespace, env: Mapping[str, str], source=None, sleep=time.sleep) -> int:
     """`ws upgrade --unattended`: find the newest release, and if it is newer than this ws, prove it, wait for idle,
     swap, check, and roll back offline on any failure. Every outcome is a row in the release log."""
@@ -1521,14 +1553,17 @@ def cmd_unattended(args: argparse.Namespace, env: Mapping[str, str], source=None
         raise WsError("refused", why, "it is started by `ws-upgrade.service`, not by hand", EXIT_REFUSED)
     args.log_verb = "unattended"
     t0 = time.monotonic()
+    problems = upgradeunit.self_check(env, upgradeunit.ws_command())  # the person's timer firing, and nothing else
+    if problems:
+        _log(args, env, t0, "unattended", None, "refused", "; ".join(problems))
+        return EXIT_REFUSED
     try:
         with upgrade_lock(
             env, LOCK_WAIT_UNATTENDED_S
         ):  # a run that finds it held is logged; the next timer run tries again
             return _unattended(args, env, t0, source, sleep)
     except Locked as e:
-        _log(args, env, t0, "unattended", None, "busy", e.message)
-        return 0
+        return _busy(args, env, t0, "unattended", None, e.message)
 
 
 def _unattended(args: argparse.Namespace, env: Mapping[str, str], t0: float, source, sleep) -> int:
@@ -1543,7 +1578,8 @@ def _unattended(args: argparse.Namespace, env: Mapping[str, str], t0: float, sou
         tag = src.latest()
         new, have = upgradeproof.version_key(tag), upgradeproof.version_key(__version__)
         if new is not None and have is not None and new <= have:
-            _log(args, env, t0, "check", tag, "current", "")
+            older = f"the newest release is older than the installed ws {__version__}" if new < have else ""
+            _log(args, env, t0, "check", tag, "older" if older else "current", older)
             return 0
         upgradeproof.refuse_old(tag, __version__)  # a version that can't be compared is refused
         if _rolled_back_before(env, tag):
@@ -1551,20 +1587,22 @@ def _unattended(args: argparse.Namespace, env: Mapping[str, str], t0: float, sou
             return 0
         return _unattended_upgrade(args, env, tag, root, src, t0, sleep)
     except Busy as b:
-        _log(args, env, t0, "promote", tag, "busy", str(b))
-        return 0
+        return _busy(args, env, t0, "promote", tag, str(b))
     except upgradeproof.Refused as r:
         _log(args, env, t0, "promote", tag, "refused", str(r))
         return EXIT_REFUSED
 
 
 def _unattended_upgrade(args, env, tag: str, root, src, t0: float, sleep) -> int:
-    wait_idle(env, sleep)
     with tempfile.TemporaryDirectory(prefix="ws-upgrade-") as scratch:
         os.chmod(scratch, 0o700)
-        installer = upgradeproof.verify_release(tag, root, src, Path(scratch), env)
+        installer = upgradeproof.verify_release(
+            tag, root, src, Path(scratch), env
+        )  # before the wait: then swap at once
+        wait_idle(env, sleep, deadline=t0 + upgradeunit.UPGRADE_TIMEOUT_S - SWAP_BUDGET_S)
         before = upgradecheck.snapshot(env)
         args.installer, args.version, args.channel, args.log_verb = str(installer), tag, None, "upgrade"
+        args.constraints = str(Path(scratch) / upgradeproof.CONSTRAINTS)
         session_check = getattr(args, "session_check", None)
         args.check_fn = lambda new: upgradecheck.acceptance(env, tag, new.argv, before, session_check)
         mark = len(history(env))
@@ -1598,12 +1636,23 @@ def cmd_print_units(args: argparse.Namespace, env: Mapping[str, str]) -> int:
     return 0
 
 
+def cmd_auto(args: argparse.Namespace, env: Mapping[str, str]) -> int:
+    """`ws upgrade --auto on|off`: the switch (DEC-131), from a terminal of the person's own only (the refusal above runs
+    first). On writes the units, enables the timer and then the protected switch file; off undoes it."""
+    on = args.auto == "on"
+    failed = upgradeunit.switch(env, upgradeunit.ws_command(), on)
+    if failed:
+        raise WsError("failed", "; ".join(failed), f"look at `systemctl --user status {upgradeunit.TIMER}`")
+    print(f"ws: the unattended upgrade is {'on: ' + upgradeunit.TIMER + ' looks once a day' if on else 'off'}")
+    return 0
+
+
 def cmd_upgrade(args: argparse.Namespace) -> int:
     env = os.environ
     if getattr(args, "unattended", False):
         return cmd_unattended(args, env)
     # the hooks step of an unattended swap is this command in a child of the service: no terminal, the service's invocation
-    child = bool(args.hooks_only and env.get(STEP_ENV) and env.get("INVOCATION_ID"))
+    child = bool(args.hooks_only and env.get(STEP_ENV) and in_unit_cgroup())
     why = refusal(env, sys.stdin.isatty() or args.dry_run or child) or agentsession.refusal(
         env, sys.stdin.isatty() or child, sys.stdout.isatty() or child
     )
@@ -1611,6 +1660,8 @@ def cmd_upgrade(args: argparse.Namespace) -> int:
         raise WsError("refused", why, "run `ws upgrade` yourself, in a terminal of your own", EXIT_REFUSED)
     if getattr(args, "print_units", False):
         return cmd_print_units(args, env)
+    if getattr(args, "auto", None):
+        return cmd_auto(args, env)
     in_step = bool(args.hooks_only and env.get(STEP_ENV))  # the hooks step of a swap: its parent holds the lock
     if args.dry_run or in_step:  # a dry run changes nothing
         return _by_hand(args, env)
@@ -1645,6 +1696,7 @@ def register(sub) -> None:
         "--unattended", action="store_true", help=argparse.SUPPRESS
     )  # the systemd unit's entry (ws.upgradeproof)
     u.add_argument("--print-units", action="store_true", help="print the systemd units of the unattended upgrade")
+    u.add_argument("--auto", choices=("on", "off"), help="turn the unattended upgrade on or off (the switch)")
     u.add_argument("--write", action="store_true", help="with --print-units: write them to the systemd user folder")
     u.add_argument(
         "--session-check", metavar="COMMAND", help="after an unattended swap, run this as well; non-zero rolls it back"

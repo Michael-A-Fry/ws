@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tomllib
 from pathlib import Path
+from unittest import mock
 
 import pytest
 from helpers.procs import wait_gone
@@ -456,6 +457,13 @@ def test_a_rewrite_that_leaves_a_hook_unpinned_is_put_back(old, capsys, monkeypa
 # --- the whole command: the installer, then the rewrite in a new process --------------------------------------------------
 
 
+def as_a_step(argv: list[str]) -> int:
+    """A stand-in for the new process of a step: the same ws, run here, with the step marker `upgrade._run` gives a child.
+    The parent holds the upgrade lock while its steps run, and a step is how the hooks rewrite knows to skip it."""
+    with mock.patch.dict(os.environ, {upgrade.STEP_ENV: "1"}):
+        return cli.main(argv[len(selfcmd.argv()) :])
+
+
 @pytest.fixture
 def swapped(old, monkeypatch):
     """The installer and the new binary's rewrite are stand-ins; the rewrite is the real one, run in this process."""
@@ -465,7 +473,7 @@ def swapped(old, monkeypatch):
 
     def run(argv, capture, timeout=None):
         calls.append(["hooks"])
-        return upgrade.Ran(cli.main(argv[len(selfcmd.argv()) :]))
+        return upgrade.Ran(as_a_step(argv))
 
     monkeypatch.setattr(upgrade, "_run", run)
     return calls
@@ -914,7 +922,7 @@ def test_a_failing_health_check_rolls_the_swap_back(cutover, old, capsys, monkey
 
     def run(argv, capture, timeout=None):
         seen.append(argv)
-        return upgrade.Ran(1 if argv[0] == "healthprobe" else cli.main(argv[len(selfcmd.argv()) :]))
+        return upgrade.Ran(1 if argv[0] == "healthprobe" else as_a_step(argv))
 
     monkeypatch.setattr(upgrade, "_run", run)
     assert cli.main(["upgrade", "--check", "healthprobe --now"]) == 1
@@ -1552,7 +1560,7 @@ def two_releases(cutover, old, monkeypatch):
             return upgrade.Ran(1)
         if cutover and cutover[-1] is not None:  # the installer was last asked for A by tag: this hooks step is A's
             return upgrade.Ran(0 if a_loads(path) else 1)
-        return upgrade.Ran(cli.main(argv[len(selfcmd.argv()) :]))
+        return upgrade.Ran(as_a_step(argv))
 
     monkeypatch.setattr(upgrade, "_run", run)
     return path, seen

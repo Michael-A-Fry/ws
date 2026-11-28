@@ -31,6 +31,7 @@ body of the GitHub release.
   are protected paths of the user-scope hook, so a session can't enable the timer with a symlink either. The guard also
   refuses globs and braces in a unit name, units fed in by `xargs`, the bus calls that do the same as `systemctl`, and
   `daemon-reload` and the environment verbs.
+- The upgrade service and a hand-run upgrade share one lock, so no two of them change ws at once.
 - `ws upgrade --unattended`, the entry of a systemd user service (the unit comes with the next change). It asks GitHub
   for the newest release itself (no request file) and does nothing when that's installed or older. It proves the
   release from the installed wheel's trust root (a signed tag, the installer's and wheel's hashes and cosign bundles,

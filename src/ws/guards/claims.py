@@ -80,7 +80,23 @@ MAX_TEXT = 20000  # a message is read to this length
 
 def claim_words(branch: str) -> tuple[str, ...]:
     """The claim phrases for a default branch."""
-    return (f"on {branch}", f"merged into {branch}", f"merged to {branch}", f"pushed to {branch}")
+    return (
+        f"on {branch}",
+        f"merged into {branch}",
+        f"merged to {branch}",
+        f"pushed to {branch}",
+        # C862: phrasings that said the same thing and went unchecked
+        f"merged and on {branch}",
+        f"landed on {branch}",
+        f"landed in {branch}",
+        f"shipped to {branch}",
+        f"shipped into {branch}",
+        f"pushed into {branch}",
+        f"is in {branch}",
+        f"its in {branch}",
+        f"it's in {branch}",
+        f"{branch} has",
+    )
 
 
 DEFAULT_WORDS = claim_words(FALLBACK_BRANCH)
@@ -792,8 +808,8 @@ def judge(call, cfg: Config, ctx) -> Finding | None:
 LATE_ADVICE = (
     "The gate denies a claim it can't check. Send it again once `git status` answers here, or without the claim."
 )
-# the word after "on", "into" or "to" in a claim phrase, when the default branch isn't known
-_BRANCH_AFTER = re.compile(r"\b(?:on|into|to)\s+(?:the\s+)?(?:origin/)?([\w][\w./-]*)", re.IGNORECASE)
+# the word after "on", "in", "into" or "to" in a claim phrase, when the default branch isn't known
+_BRANCH_AFTER = re.compile(r"\b(?:on|in|into|to)\s+(?:the\s+)?(?:origin/)?([\w][\w./-]*)", re.IGNORECASE)
 _NOT_A_BRANCH = frozenset(
     {"a", "an", "the", "my", "your", "our", "his", "her", "their", "this", "that", "it", "me", "you"}
 )

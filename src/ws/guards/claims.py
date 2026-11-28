@@ -207,10 +207,11 @@ class Config:
         str, ...
     ] = ()  # other repositories a claim may be about, besides the session's and those named in the text
     local_repos: tuple[str, ...] = ()  # repositories kept local by choice (no remote): their own default branch vouches
+    require_evidence: bool = False  # True: a claim with a verb and a branch ("merged into main") must name a commit
 
 
 def config(table: dict, where: str) -> Config:
-    known_keys(table, where, ("words", "ref", "release_dir", "release_tags", "repos", "local_repos"))
+    known_keys(table, where, ("words", "ref", "release_dir", "release_tags", "repos", "local_repos", "require_evidence"))
     words = text_list(table, "words", where)
     if "words" in table and not words:
         raise PolicyError(f"{where}: words must name at least one claim word")
@@ -225,7 +226,10 @@ def config(table: dict, where: str) -> Config:
     for r in local_repos:
         if not (r.startswith(("/", "~/")) or r == "~") or "\n" in r or "\0" in r:
             raise PolicyError(f"{where}: local_repos must be absolute paths or start with ~/")
-    return Config(words, ref, _release_dir(table, where), _release_tags(table, where), repos, local_repos)
+    evidence = table.get("require_evidence", False)
+    if not isinstance(evidence, bool):
+        raise PolicyError(f"{where}: require_evidence must be true or false")
+    return Config(words, ref, _release_dir(table, where), _release_tags(table, where), repos, local_repos, evidence)
 
 
 def _ref_ok(ref: object) -> bool:
@@ -426,6 +430,27 @@ def find_claims(
                 pair = (span[0], token.group(0))
                 if pair not in found and _binds(sentence, span, token):
                     found.append(pair)
+    return found
+
+
+_VERBS = ("merged", "pushed", "landed", "shipped")
+_CLAIMISH = re.compile(r"\b(?:merged|pushed|landed|shipped)\b", re.IGNORECASE)
+
+
+def unevidenced(text: str, words: tuple[str, ...], ref: str = DEFAULT_REF, branch: str = FALLBACK_BRANCH) -> list[str]:
+    """The claim phrases in `text` that no commit-like token in their sentence is about, for the phrases that start with a
+    verb (`merged into main`, `pushed to main`, `landed on main`, `shipped to main`). Plain phrases (`on main`, `is in main`,
+    `main has`) are never asked for evidence: they are ordinary words. Quotes, negation, the future and sentences that name
+    another branch are read as `find_claims` reads them. Used only when the policy sets `require_evidence`."""
+    verby = tuple(w for w in words if w.split()[0].lower() in _VERBS)
+    found: list[str] = []
+    for sentence in _SENTENCE.split(text[:MAX_TEXT]):
+        if _names_other_branch(sentence, ref, branch):
+            continue
+        tokens = [m for m in _HEX.finditer(sentence) if _commit_like(m.group(0))]
+        for span in _claim_spans(sentence, verby):
+            if not any(_binds(sentence, span, t) for t in tokens) and span[0] not in found:
+                found.append(span[0])
     return found
 
 
@@ -791,6 +816,13 @@ def judge(call, cfg: Config, ctx) -> Finding | None:
         return Finding("deny", f"{reason} Also: {release}" if release else reason)
     if release:
         return Finding("deny", release)
+    bare = _missing_evidence(text, cfg, ctx.cwd, budget)
+    if bare:
+        return Finding(
+            "deny",
+            f"the message says {', '.join(bare)} but names no commit. Name the commit sha (on {ref or cfg.ref or DEFAULT_REF}), "
+            "or leave the claim out.",
+        )
     if unchecked:
         return Finding(
             "deny",
@@ -842,6 +874,16 @@ def _claims_in(text: str, cfg: Config, cwd: str, budget: Budget) -> tuple[str, l
     ref = cfg.ref or target.ref
     words = cfg.words or claim_words(target.branch)
     return ref, find_claims(text, words, ref, target.branch)
+
+
+def _missing_evidence(text: str, cfg: Config, cwd: str, budget: Budget) -> list[str]:
+    """The verb-and-branch claims in `text` that name no commit, when the policy asks for evidence (else none). A cheap word
+    check first: a message with none of the claim verbs never asks git."""
+    if not cfg.require_evidence or not isinstance(text, str) or not _CLAIMISH.search(text[:MAX_TEXT]):
+        return []
+    own = _top(cwd, budget) if cwd and Path(cwd).is_dir() else None
+    target = default_target(cwd, budget, local=bool(own) and os.path.realpath(own) in local_tops(cfg, budget))
+    return unevidenced(text, cfg.words or claim_words(target.branch), cfg.ref or target.ref, target.branch)
 
 
 def _log(cfg: Config, ctx) -> Finding | None:

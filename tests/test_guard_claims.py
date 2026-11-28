@@ -1005,3 +1005,60 @@ def test_c862_the_wider_phrases_keep_the_negation_future_and_plain_wording_rules
 )
 def test_c862_a_claim_with_a_question_mark_or_a_yes_is_still_a_claim(text):
     assert cl.find_claims(text, cl.claim_words("main")) != []
+
+
+# --- require_evidence: a done-claim names its commit (the lead's ruling after C820) ------------------------------------
+
+
+def need_evidence():
+    return cl.config({"require_evidence": True}, "w")
+
+
+@needs_git
+@pytest.mark.parametrize(
+    "text",
+    [
+        "merged into main",
+        "The fix was merged into main by the lead.",
+        "pushed to main",
+        "shipped to main",
+        "landed on main",
+        "merged into main, see the notes",  # the commit named nowhere
+    ],
+)
+def test_require_evidence_refuses_a_verb_and_branch_claim_with_no_commit(repo, text):
+    d, _, _ = repo
+    f = judge(text, d, need_evidence())
+    assert f is not None and f.action == "deny" and "names no commit" in f.reason
+
+
+@needs_git
+@pytest.mark.parametrize(
+    "text",
+    [
+        "tell me before they go to main",
+        "tell me before merge",
+        "work on main later",
+        "main has a bug in the parser",
+        "it is not merged into main yet",
+        "once it is merged into main we ship",
+        'the phrase "merged into main" is what the guard reads',
+        "merged into the release branch",  # a branch other than the default
+    ],
+)
+def test_require_evidence_lets_plain_words_and_non_claims_through(repo, text):
+    d, _, _ = repo
+    assert judge(text, d, need_evidence()) is None
+
+
+@needs_git
+def test_require_evidence_is_off_by_default_and_a_named_commit_still_passes(repo):
+    d, on, off = repo
+    assert judge("merged into main", d) is None  # default: strangers see no change
+    assert judge(f"merged {on} into main", d, need_evidence()) is None
+    assert judge(f"merged {off} into main", d, need_evidence()).action == "deny"  # a wrong commit is still the old refusal
+
+
+def test_require_evidence_must_be_a_boolean():
+    with pytest.raises(Exception, match="require_evidence"):
+        cl.config({"require_evidence": "yes"}, "w")

@@ -211,7 +211,9 @@ class Config:
 
 
 def config(table: dict, where: str) -> Config:
-    known_keys(table, where, ("words", "ref", "release_dir", "release_tags", "repos", "local_repos", "require_evidence"))
+    known_keys(
+        table, where, ("words", "ref", "release_dir", "release_tags", "repos", "local_repos", "require_evidence")
+    )
     words = text_list(table, "words", where)
     if "words" in table and not words:
         raise PolicyError(f"{where}: words must name at least one claim word")

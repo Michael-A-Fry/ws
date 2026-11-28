@@ -1056,7 +1056,9 @@ def test_require_evidence_is_off_by_default_and_a_named_commit_still_passes(repo
     d, on, off = repo
     assert judge("merged into main", d) is None  # default: strangers see no change
     assert judge(f"merged {on} into main", d, need_evidence()) is None
-    assert judge(f"merged {off} into main", d, need_evidence()).action == "deny"  # a wrong commit is still the old refusal
+    assert (
+        judge(f"merged {off} into main", d, need_evidence()).action == "deny"
+    )  # a wrong commit is still the old refusal
 
 
 def test_require_evidence_must_be_a_boolean():

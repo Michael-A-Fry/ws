@@ -31,6 +31,7 @@ SHIPPED = [
     ("queue", "queue"),
     ("sync", "sync"),
     ("triage", "triage"),
+    ("unit", "units"),
     ("upgrade", "upgrade"),
     ("usage", "usage"),
     ("walls", "walls"),

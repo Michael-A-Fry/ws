@@ -546,11 +546,12 @@ def _term_leak(pol: policy.Policy, job: jobs.Job, real_cwd: str | None = None) -
 def _refusal(prof: dict, verdict: policy.Verdict, job: jobs.Job, adapter) -> tuple[str, str] | None:
     """(counter, reason) for the refusals that need no look at the money: no cap set, the Rule of Two, a model the runner
     cannot price. What the cap and the purpose cap say is admission's (`queue.Ledger.admit`)."""
-    if _budget(prof)[0] is None:
+    local = jobs.free_local(job)  # DEC-200: a free local run is never blocked by any cap, set or not
+    if _budget(prof)[0] is None and not local:
         return "profile_cap", "no monthly budget cap (WS103): set monthly_cap_usd in [roles.budget] of the profile"
     if not verdict.ok:
         return "rule_of_two", verdict.reason
-    if not job.allow_unpriced and not getattr(adapter, "priced", lambda _job: True)(job):
+    if not local and not job.allow_unpriced and not getattr(adapter, "priced", lambda _job: True)(job):
         return "unpriced", (
             f"{job.runner} cannot say what {job.model} costs, so the cap could not be kept; set allow_unpriced = true "
             "in the job to run it anyway (it then counts at your fallback price)"
@@ -1143,6 +1144,9 @@ def _execute(
                 broker.release(lease, socket=sock)
         rec["ended_at"] = rec["ended_at"] or runrecord.iso(datetime.now(UTC))
         rec["duration_ms"] = int((time.monotonic() - t0) * 1000)
+        if rec["cost_usd"] is None and jobs.free_local(job):
+            # DEC-200: a model on a local server costs no money, whatever the runner could price; never a fallback figure
+            rec.update(cost_usd=0.0, cost_basis="local")
         if rec["status"] is None:  # Ctrl-C, SIGTERM or another exit that is not an Exception
             sigterm = isinstance(signalled, SystemExit) and signalled.code == 128 + signal.SIGTERM
             rec.update(

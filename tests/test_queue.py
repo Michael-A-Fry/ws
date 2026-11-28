@@ -2250,3 +2250,42 @@ def test_opening_a_second_ledger_never_closes_a_descriptor_of_the_open_database(
     assert closed_db == []
     monkeypatch.undo()
     assert first.receipts(last=5) and second.receipts(last=5)
+
+
+def test_a_local_job_reserves_no_money_and_is_admitted_over_the_cap(box, tmp_path):
+    """DEC-200 (Michael, 24 Nov): "Local should NEVER BE blocked". 28 Nov: the daily local list was refused at the cap."""
+    write_job(box, "local", secrets=False,
+              extra='[runner_options]\nprovider = {options = {baseURL = "http://127.0.0.1:11434/v1"}}')  # fmt: skip
+    _as_opencode(box, "local")
+    write_job(box, "paid")
+    lim = queue.Limits()
+    local = queue.request_for(jobs.load("local"), "20261128T000000Z-00000a", cap_usd=50.0, unknown_run_usd=None,
+                              purpose_cap_usd=None, limits=lim)  # fmt: skip
+    paid = queue.request_for(jobs.load("paid"), "20261128T000000Z-00000b", cap_usd=50.0, unknown_run_usd=None,
+                             purpose_cap_usd=None, limits=lim)  # fmt: skip
+    assert local.credential == "local" and local.usd == 0.0
+    ledger = make(tmp_path)
+    assert ledger.admit(local, T0, spend(50.69), dry=True).kind == "admit"
+    d = ledger.admit(paid, T0, spend(50.69), dry=True)  # planted: a paid job at the same meter is still refused
+    assert d.kind == "refuse" and d.counter == "profile_cap"
+
+
+def _as_opencode(box, name: str, model: str = "ollama/m") -> None:
+    f = box / "jobs" / f"{name}.toml"
+    text = f.read_text().replace('runner = "claude-code"', 'runner = "opencode"')
+    f.write_text(text.replace('model = "claude-haiku-4-5"', f'model = "{model}"'), encoding="utf-8")
+
+
+def test_a_lan_proxy_with_priced_models_and_a_non_opencode_runner_are_not_free(box):
+    """C848 review: free means a local OpenCode server whose provider block prices no model above 0."""
+    host = ".".join(map(str, (192, 168, 1, 5)))  # a LAN address, built so the PII gate sees no literal one
+    lan = f'provider = {{options = {{baseURL = "http://{host}:4000/v1"}}, models = {{m = {{cost = {{input = 3, output = 15}}}}}}}}'
+    write_job(box, "proxy", secrets=False, extra=f"[runner_options]\n{lan}")
+    _as_opencode(box, "proxy", "lan/m")
+    assert jobs.credential_kind(jobs.load("proxy")) == "local" and not jobs.free_local(jobs.load("proxy"))
+    free = 'provider = {options = {baseURL = "http://127.0.0.1:11434/v1"}, models = {m = {cost = {input = 0, output = 0}}}}'
+    write_job(box, "free", secrets=False, extra=f"[runner_options]\n{free}")
+    _as_opencode(box, "free")
+    assert jobs.free_local(jobs.load("free"))
+    write_job(box, "cc", secrets=False, extra=f"[runner_options]\n{free}")
+    assert not jobs.free_local(jobs.load("cc"))  # claude-code: never free local, whatever its options say

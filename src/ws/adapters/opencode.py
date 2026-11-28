@@ -888,6 +888,7 @@ def parse_result(stdout: str, stderr: str, exit_code: int | None) -> dict:
     steps = 0
     sums = {"input": None, "output": None, "cache_creation": None, "cache_read": None}
     cost = None
+    content = False
 
     def add(key: str, v) -> None:
         if isinstance(v, int) and not isinstance(v, bool) and v >= 0:
@@ -902,6 +903,8 @@ def parse_result(stdout: str, stderr: str, exit_code: int | None) -> dict:
             continue
         if session is None and isinstance(ev.get("sessionID"), str):
             session = ev["sessionID"]
+        if ev.get("type") not in ("error", "step_start"):
+            content = True  # text, reasoning, a tool or anything unknown: the model may have been billed
         if ev.get("type") == "error":
             e = ev.get("error") if isinstance(ev.get("error"), dict) else {}
             data = e.get("data") if isinstance(e.get("data"), dict) else {}
@@ -925,6 +928,10 @@ def parse_result(stdout: str, stderr: str, exit_code: int | None) -> dict:
     unpriced = counted and not cost
     if not steps:
         cost = None
+    if error and not steps and not content:
+        # the provider refused before the model produced anything (no text, reasoning or tool part): no tokens, no
+        # money, said as counted zeros so the meter counts it at US$0 (C848)
+        sums = dict.fromkeys(sums, 0)
     return {
         "session_id": session,
         "models_used": [{"model": None, **sums, "cost_usd": None if unpriced else cost}] if steps else [],

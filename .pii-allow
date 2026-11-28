@@ -13,3 +13,6 @@
 ^        \(\("c", "me@custom-domain\.example", "x"\), "pick_provider"\),$
 ^.*sender="(?:x|alerts)@bank\.example".*$
 ^    r\.add\(1, raw\(sender="Google <no-reply@accounts\.google\.com>", subject="Security alert", mid="<s1@example\.org>"\)\)$
+
+
+^        upgrade, "_own_cgroup", lambda: "0::/user\.slice/user@1000\.service/app\.slice/ws-upgrade\.service\\n"$

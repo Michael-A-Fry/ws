@@ -81,6 +81,9 @@ class Release:
         bundle = {"digest": sha(data), "identity": IDENTITY.format(tag=self.tag), "issuer": ISSUER}
         self.assets[f"{name}.sigstore.json"] = json.dumps(bundle).encode()
 
+    def latest(self) -> str:
+        return self.tag
+
     def asset(self, tag: str, name: str) -> bytes:
         if name not in self.assets:
             raise upgradeproof.Refused(f"could not read {name} (HTTPError)")

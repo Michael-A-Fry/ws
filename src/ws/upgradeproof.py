@@ -1,9 +1,9 @@
-"""What `ws upgrade --unattended` proves about a release before it installs it, and how it reads a request.
+"""What `ws upgrade --unattended` proves about a release before it installs it, and how it finds the newest one.
 
-The request is a wish, never trust: one line, a release tag or the word `rollback`, read as data (`parse_request`), and
-anything else is dropped. The proof is the service's own and starts from the trust root of the ws that is installed
+The service asks GitHub for the newest release itself (`Source.latest`, one tag, read as data); nothing a session writes
+names what it installs. The proof is the service's own and starts from the trust root of the ws that is installed
 (`ws.version.trust_root`: the release workflow's identity and the allowed signers of a release tag), never from the
-request, an environment variable or the release it is about to install, because a newer release can only be trusted
+answer, an environment variable or the release it is about to install, because a newer release can only be trusted
 through the one already there. `verify_release` refuses, with a reason, unless all of these hold for the tag:
 
 1. the tag is signed by one of the stamp's signers (`git tag -v` against an allowed-signers file made from the stamp);
@@ -38,7 +38,6 @@ from typing import Protocol
 
 from ws import paths
 
-ROLLBACK = "rollback"
 _TAG = re.compile(r"v[0-9]+(?:\.[0-9]+){1,3}(?:rc[0-9]+)?")
 _VERSION = re.compile(r"v?([0-9]+(?:\.[0-9]+)*)(?:(rc)([0-9]+))?")
 ASSET_LIMIT = 100 << 20  # bytes of one release file
@@ -51,15 +50,12 @@ _CA_FILES = ("/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle
 
 
 class Refused(Exception):
-    """A release or a request that is not taken, with the reason line the log and the notice carry."""
+    """A release that is not taken, with the reason line the log and the notice carry."""
 
 
-def parse_request(text: str) -> str | None:
-    """The tag (`v0.1.11.8`, `v0.2.0rc1`) or `rollback` a request file holds, else None: one line, nothing else."""
-    word = text.strip()
-    if "\n" in word or len(word) > 40:
-        return None
-    return word if word == ROLLBACK or _TAG.fullmatch(word) else None
+def is_tag(text: object) -> bool:
+    """Whether `text` is a release tag (`v0.1.11.8`, `v0.2.0rc1`) and nothing else."""
+    return isinstance(text, str) and _TAG.fullmatch(text) is not None
 
 
 def version_key(version: str) -> tuple[int, ...] | None:
@@ -84,6 +80,9 @@ def refuse_old(tag: str, installed: str) -> None:
 
 class Source(Protocol):
     """Where a release is read from. `GitHub` is the real one; a test hands over a tree it made."""
+
+    def latest(self) -> str:
+        """The tag of the newest release (not a draft or a pre-release), or `Refused`."""
 
     def asset(self, tag: str, name: str) -> bytes: ...
     def checkout(self, tag: str, dest: Path) -> None:
@@ -110,6 +109,15 @@ class GitHub:
         if len(data) > limit:
             raise Refused(f"{url.rsplit('/', 1)[-1]} is larger than {limit} bytes")
         return data
+
+    def latest(self) -> str:
+        try:
+            tag = json.loads(self._get(f"{self.api}/repos/{self.repo}/releases/latest", 1 << 20)).get("tag_name")
+        except (ValueError, AttributeError) as e:
+            raise Refused("the newest release could not be read") from e
+        if not is_tag(tag):
+            raise Refused("the newest release has no tag ws can read")
+        return tag
 
     def asset(self, tag: str, name: str) -> bytes:
         return self._get(f"{self.web}/{self.repo}/releases/download/{tag}/{name}", ASSET_LIMIT)

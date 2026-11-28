@@ -1286,8 +1286,9 @@ ws commit-wall status [-h]
 
 ## `ws unit`
 
-Install a committed systemd user unit. This is the only way one reaches `~/.config/systemd/user`; the gate refuses a
-session's own write to that folder, and `systemctl --user enable` or `start` for a unit that isn't the committed source.
+Install a committed systemd user unit. This is the only way one reaches the user manager. It's a person's command, like
+`ws secret`: a gated session can't run it. The gate refuses a session's own write to `~/.config/systemd` and
+`~/.local/share/systemd`, and `systemctl --user enable` or `start` for a unit that isn't the committed source.
 
 ```text
 ws unit install NAME
@@ -1295,7 +1296,7 @@ ws unit install NAME
 
 | Argument | Meaning |
 |---|---|
-| `NAME` | The unit file name, for example `ws-lead-heartbeat.timer`. It's copied, with its drop-ins, from the first folder in `[gate] unit_sources` that holds it. The file has to be tracked by git and unchanged. Run it from your own session: inside the wall the folder is read-only. |
+| `NAME` | The unit file name, for example `ws-lead-heartbeat.timer`. It's copied, with its drop-ins, from the first folder in `[gate] unit_sources` that holds it. The bytes come from git's `main` branch of the main checkout that holds the folder, never from the working tree. The folder can't be a symlink, hold a nested repository, or sit in a worktree. Everything is checked before anything is written. |
 
 ## `ws canary`
 

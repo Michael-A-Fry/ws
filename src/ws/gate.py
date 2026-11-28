@@ -202,6 +202,10 @@ def evaluate(pol: policy.Policy, call: Call, protect: tuple[str, ...] = (), *, w
     not name comes back as an `Ask`. A command refused for a reason the wall makes redundant comes back as a
     `policy.Refusal`; with `wall=True` (the wall is proven) the whole line is read past it, see policy.is_denied_command.
     A call of kind "other" (a tool no adapter reads) has no rule: it is allowed."""
+    protect = (
+        *protect,
+        *units.source_paths(pol),
+    )  # C867: what a unit is installed from is protected like the folders it goes to
     if call.kind == "command":
         return policy.is_denied_command(pol, call.value, protect=protect, wall=wall)
     if call.kind == "read":

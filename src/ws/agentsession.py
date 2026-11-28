@@ -71,6 +71,7 @@ ADMIN_SUB = frozenset(
         ("session", "start"),  # writes a session's registry record, role included
         ("node", "join"),  # changes the machine's own files
         ("node", "remove"),
+        ("unit", "install"),  # puts a unit where the user manager runs it, outside every hook (C867)
         ("queue", "add"),  # queues unattended runs, which spend without a person watching
         ("queue", "cancel"),
         ("queue", "run"),

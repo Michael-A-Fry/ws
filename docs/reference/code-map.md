@@ -96,7 +96,7 @@ below, and `python3 scripts/gen_code_map.py --check` (prek and CI) fails when it
 | `testing/` | Test support that ships with ws: the mock model provider and its scenarios |
 | `triage.py` | `ws triage run`: the inbox job, rules first, one small model call per thread, drafts only |
 | `ui/` | The shared page toolkit: the ws look as CSS, small HTML components, and the loopback server that... |
-| `units.py` | `ws unit`: the one way a systemd user unit reaches `~/.config/systemd/user`, and the gate's... |
+| `units.py` | `ws unit`: the one way a systemd user unit reaches the user manager, and the gate's rules about... |
 | `unknownpath.py` | A command word with a part the reader cannot resolve, tested against the paths ws protects |
 | `upgrade.py` | `ws upgrade`: swap the ws binary for a newer release and rewrite the runner's hooks in the same step |
 | `usage.py` | Usage signals: the provider's usage report, the subscription limits a statusline gives ws, spend... |

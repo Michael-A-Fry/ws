@@ -8,6 +8,8 @@ body of the GitHub release.
 
 ## [Unreleased]
 
+## [0.1.11.12] - 2026-11-28
+
 ### Added
 
 - A `kind = "gcal"` broker entry (C821, DEC-122): the broker holds the Google Calendar OAuth client and refresh token,

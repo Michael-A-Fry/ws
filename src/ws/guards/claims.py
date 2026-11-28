@@ -418,8 +418,8 @@ def find_claims(
     found: list[tuple[str, str]] = []
     for sentence in _SENTENCE.split(text[:MAX_TEXT]):
         tokens = [m for m in _HEX.finditer(sentence) if _commit_like(m.group(0))]
-        if not tokens or _names_other_branch(sentence, ref, branch):
-            continue
+        if not tokens or sentence.rstrip().endswith("?") or _names_other_branch(sentence, ref, branch):
+            continue  # a question ("is abc1234 in main?") asks; it doesn't claim (C862)
         for span in _claim_spans(sentence, words):
             for token in tokens:
                 pair = (span[0], token.group(0))

@@ -32,6 +32,11 @@ body of the GitHub release.
   refuses globs and braces in a unit name, units fed in by `xargs`, the bus calls that do the same as `systemctl`, and
   `daemon-reload` and the environment verbs.
 - The upgrade service and a hand-run upgrade share one lock, so no two of them change ws at once.
+- The unattended upgrade's switch is `ws upgrade --auto on|off`, from a terminal of your own; it writes a protected
+  switch file as well as enabling the timer. At start the service checks with systemd that the timer started it, and
+  that nothing else pulls the units in or changes them; a run started any other way refuses and alerts. The installer
+  reads no uv or pip config and gets the tag's lock as constraints. A way back killed midway is finished by the
+  unit. Three busy runs in a row alert. The guard no longer refuses `systemctl daemon-reload`.
 - `ws upgrade --unattended`, the entry of a systemd user service (the unit comes with the next change). It asks GitHub
   for the newest release itself (no request file) and does nothing when that's installed or older. It proves the
   release from the installed wheel's trust root (a signed tag, the installer's and wheel's hashes and cosign bundles,

@@ -454,12 +454,14 @@ or imitate the unattended upgrade ([ADR 0035](../decisions/0035-an-upgrade-can-r
 It refuses `systemctl` with a verb that changes something (start, stop, restart, enable, disable, edit, kill, mask and
 the like) on a unit named `ws-upgrade*`, and the same under `--user`, `--global` or `-M` when the unit is
 a variable or substitution, has a glob or a brace in its name (`'ws-u*.timer'`, `ws-?pgrade.timer`), or is fed in by
-`xargs` or `parallel`; `systemctl daemon-reload`, `daemon-reexec`, `set-environment`, `import-environment` and
-`unset-environment`, and `dbus-update-activation-environment --systemd`, whatever the unit (a reload is what makes a
-drop-in take effect, and the environment verbs reach every unit the manager starts); `busctl call` or `set-property`,
+`xargs` or `parallel`; `systemctl --user set-environment`, `import-environment` and `unset-environment`, and
+`dbus-update-activation-environment --systemd` (they reach every unit the user manager starts); `busctl call` or
+`set-property`,
 `gdbus call`, `dbus-send` and `qdbus` naming `org.freedesktop.systemd1`; `systemd-run` naming such a unit; and any command
 with the words `upgrade` and `--unattended` (or a prefix of it that the option parser still reads),
-however ws is started. Reading a unit (`status`, `show`, `cat`, `list-timers`, a glob in a read) is allowed. Because it
+however ws is started. Reading a unit (`status`, `show`, `cat`, `list-timers`, a glob in a read) is allowed, and
+so is `daemon-reload`: a session installs timers of its own, and a reload can only make the upgrade refuse, because the
+service checks at start what systemd loaded. Because it
 reads the words of a command line, a plain `echo ws upgrade --unattended` is refused too. The unit files, their drop-in
 folders, the `user.control` copies and the `*.target.wants/` folders (an enable is a symlink there) are protected
 paths of the user-scope hook, so a session write to them is refused

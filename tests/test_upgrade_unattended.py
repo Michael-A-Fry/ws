@@ -42,6 +42,7 @@ from ws.term import bridge
 pytestmark = pytest.mark.skipif(GIT is None or KEYGEN is None, reason=NEEDS)
 
 OLD, NEW = "0.1.11.6", "0.1.11.8"
+REAL_CHECK, REAL_WS_COMMAND = upgradeunit.self_check, upgradeunit.ws_command  # before the fixture stubs them
 
 STUB_WS = """import os, sys
 state = os.environ["STUB_STATE"]
@@ -121,6 +122,8 @@ def svc(tmp_path, monkeypatch):
     monkeypatch.setattr(paths, "account_home", lambda: home.resolve())
     monkeypatch.setattr(agentsession, "read_ancestry", list)  # no runner above this test
     monkeypatch.setattr(upgrade, "_parent_comm", lambda pid: "systemd")
+    monkeypatch.setattr(upgradeunit, "ws_command", lambda: state / "bin" / "ws")
+    monkeypatch.setattr(upgradeunit, "self_check", lambda env, ws, run=None: [])  # its own tests are below
     monkeypatch.setattr(upgrade, "__version__", OLD)
     monkeypatch.setattr(selfcmd, "unstable", lambda cmd=None: None)
     monkeypatch.setattr(selfcmd, "tree", lambda: state)  # never the test's own venv: the way back replaces this folder
@@ -285,7 +288,8 @@ def test_mirror_env_ignored(svc, monkeypatch):
     assert serve(svc) == 0 and installed(svc) == NEW
     seen = dict(line.split("=", 1) for line in Path(os.environ["INSTALL_ENV"]).read_text().splitlines() if "=" in line)
     assert not planted & seen.keys()
-    allowed = {*upgradeproof.ENV_KEEP, "HOME", "PATH", "PWD", "SHLVL", "OLDPWD", "_", "WS_UPGRADE_STEP"}
+    allowed = {*upgradeproof.ENV_KEEP, *upgradeproof.NO_CONFIG, "UV_CONSTRAINT", "PIP_CONSTRAINT"}
+    allowed |= {"HOME", "PATH", "PWD", "SHLVL", "OLDPWD", "_", "WS_UPGRADE_STEP"}
     assert set(seen) <= allowed, set(seen) - allowed
     assert seen["PATH"] == os.pathsep.join(upgradeproof.tool_dirs()) and seen["HOME"] == os.environ["HOME"]
 
@@ -323,7 +327,7 @@ def test_a_job_that_never_ends_is_waited_out_and_nothing_is_changed(svc, monkeyp
 
 
 def test_a_machine_that_stays_busy_is_tried_again_next_run_with_no_alert(svc, monkeypatch):
-    def busy(env, sleep=None):
+    def busy(env, sleep=None, **kw):
         raise upgrade.Busy("still busy after 30 minutes (1 queued or running job(s)); nothing was changed")
 
     monkeypatch.setattr(upgrade, "wait_idle", busy)
@@ -366,7 +370,7 @@ def test_the_installed_release_or_an_older_one_changes_nothing(svc):
     for tag in ("v0.1.11.6", "v0.1.11.5", "v0.1.10", "v0.0.1", "v0.1.11.6rc1"):
         assert serve(svc, svc.release(tag=tag)) == 0
         assert installed(svc) == OLD and not Path(os.environ["INSTALL_LOG"]).exists()
-        assert (rows()[-1]["to"], rows()[-1]["result"]) == (tag, "current")
+        assert (rows()[-1]["to"], rows()[-1]["result"]) == (tag, "current" if tag == "v0.1.11.6" else "older")
 
 
 def test_the_newest_release_is_asked_for_never_read_from_a_file(svc):
@@ -494,6 +498,7 @@ def test_write_puts_the_two_units_in_the_user_folder_and_enables_nothing(svc, to
 
 
 def test_no_units_are_made_from_a_ws_that_is_not_in_a_tool_folder(svc, monkeypatch):
+    monkeypatch.setattr(upgradeunit, "ws_command", REAL_WS_COMMAND)
     monkeypatch.setattr(selfcmd, "tree", lambda: None)
     with pytest.raises(upgrade.WsError) as caught:
         upgrade.cmd_print_units(args(print_units=True, write=False), os.environ)
@@ -660,3 +665,233 @@ def test_a_hand_run_does_not_run_beside_the_service_it_waits_its_time_and_refuse
         assert time.monotonic() - t < 5
     assert "holds the upgrade lock" in capsys.readouterr().err
     assert not Path(os.environ["INSTALL_LOG"]).exists()
+
+
+# ---- second review (C796): the switch and the start check, pins, a kill-proof way back, time, busy runs ------------------
+
+
+def test_a_planted_uv_config_is_never_read_and_the_dependencies_are_the_tags_pins(svc):
+    """B2: a session can write ~/.config/uv/uv.toml (an index of its own); the installer runs with no config, no Python
+    download and the tag's lock as constraints."""
+    planted = svc.home / ".config" / "uv" / "uv.toml"
+    planted.parent.mkdir(parents=True)
+    planted.write_text('index-url = "https://evil.example/simple"\n', encoding="utf-8")
+    assert serve(svc) == 0 and installed(svc) == NEW
+    seen = dict(line.split("=", 1) for line in Path(os.environ["INSTALL_ENV"]).read_text().splitlines() if "=" in line)
+    assert (
+        seen["UV_NO_CONFIG"] == "1" and seen["UV_PYTHON_DOWNLOADS"] == "never" and seen["PIP_CONFIG_FILE"] == os.devnull
+    )
+    assert seen["UV_CONSTRAINT"] == seen["PIP_CONSTRAINT"] and seen["UV_CONSTRAINT"].endswith(upgradeproof.CONSTRAINTS)
+    assert "evil" not in " ".join(seen.values())
+
+
+def test_pins_that_are_not_pinned_refuse_the_release(svc):
+    (svc.tools / "pins.txt").write_text("requests>=2\n", encoding="utf-8")
+    assert serve(svc) == upgrade.EXIT_REFUSED and installed(svc) == OLD
+    assert "pinned versions" in rows()[-1]["reason"]
+
+
+def test_a_tag_object_of_another_release_under_this_name_is_refused(svc, monkeypatch):
+    real = upgradeproof._run
+
+    def run(argv, env, cwd=None):
+        out = real(argv, env, cwd)
+        return out.replace(f"tag {TAG}\n", "tag v0.1.11.7\n") if "cat-file" in argv and "tag" == argv[-2] else out
+
+    monkeypatch.setattr(upgradeproof, "_run", run)
+    assert serve(svc) == upgrade.EXIT_REFUSED and "names v0.1.11.7" in rows()[-1]["reason"]
+
+
+def test_an_older_newest_release_is_said_so(svc):
+    assert serve(svc, svc.release(tag="v0.1.11.5")) == 0
+    assert rows()[-1]["result"] == "older"
+    assert "older than the installed ws" in rows()[-1]["reason"]
+
+
+def test_three_busy_runs_in_a_row_alert(svc, monkeypatch):
+    def busy(env, sleep=None, now=None, deadline=None):
+        raise upgrade.Busy("still busy (1 queued or running job(s)); nothing was changed")
+
+    monkeypatch.setattr(upgrade, "wait_idle", busy)
+    assert [serve(svc) for _ in range(3)] == [0, 0, upgrade.EXIT_FAILED]
+
+
+def test_the_idle_wait_stops_where_the_swap_would_no_longer_fit(svc, monkeypatch):
+    monkeypatch.setattr(upgrade, "idle_reason", lambda env: "1 queued or running job(s)")
+    clock = {"t": 0.0}
+
+    def nap(seconds: float) -> None:
+        clock["t"] += seconds
+
+    with pytest.raises(upgrade.Busy):
+        upgrade.wait_idle(os.environ, nap, lambda: clock["t"], deadline=90.0)
+    assert clock["t"] <= 90.0 + upgrade.IDLE_EVERY_S
+    monkeypatch.setattr(upgrade, "idle_reason", lambda env: None)
+    with pytest.raises(upgrade.Busy, match="too little of the unit's time"):
+        upgrade.wait_idle(os.environ, nap, lambda: 100.0, deadline=90.0)
+    assert upgrade.SWAP_BUDGET_S < upgradeunit.UPGRADE_TIMEOUT_S - upgrade.LOCK_WAIT_UNATTENDED_S
+
+
+def test_the_release_is_proved_before_the_idle_wait(svc, monkeypatch):
+    order: list[str] = []
+    real = upgradeproof.verify_release
+    monkeypatch.setattr(upgradeproof, "verify_release", lambda *a: order.append("proof") or real(*a))
+    monkeypatch.setattr(upgrade, "wait_idle", lambda *a, **k: order.append("idle"))
+    assert serve(svc) == 0 and order == ["proof", "idle"]
+
+
+@pytest.mark.parametrize("killed_after", ["copy", "aside"])
+def test_a_way_back_killed_midway_leaves_a_folder_the_unit_puts_back(tmp_path, monkeypatch, killed_after):
+    """S1: the copy is made beside the tool folder, then two renames. Killed after the first rename, the folder is gone and
+    the copy is complete; the unit's ExecStopPost line (run here by sh) puts it in place."""
+    import subprocess
+
+    tree, copy = tmp_path / "ws-aitoolkit", tmp_path / "copy"
+    (tree / "bin").mkdir(parents=True)
+    (tree / "bin" / "ws").write_text("new", encoding="utf-8")
+    (copy / "bin").mkdir(parents=True)
+    (copy / "bin" / "ws").write_text("old", encoding="utf-8")
+    renames = []
+    real = os.rename
+
+    def rename(a, b):
+        renames.append(b)
+        if killed_after == "aside" and len(renames) == 2:
+            raise SystemExit("killed")  # between the renames
+        real(a, b)
+
+    monkeypatch.setattr(upgrade.os, "rename", rename)
+    if killed_after == "aside":
+        with pytest.raises(SystemExit):
+            upgrade.restore_tool(copy, tree)
+        assert not tree.exists() and (tmp_path / "ws-aitoolkit.ws-restore" / "bin" / "ws").read_text() == "old"
+    else:
+        assert upgrade.restore_tool(copy, tree) and (tree / "bin" / "ws").read_text() == "old"
+    monkeypatch.undo()
+    line = next(
+        x
+        for x in upgradeunit.units(tree / "bin" / "ws")[upgradeunit.SERVICE].splitlines()
+        if x.startswith("ExecStopPost=")
+    )
+    subprocess.run(["/bin/sh", "-c", line.split("/bin/sh -c ", 1)[1].strip("'")], check=False)
+    assert (tree / "bin" / "ws").read_text() == "old"
+
+
+def test_the_hooks_step_exception_needs_the_units_cgroup_not_its_variables(svc, monkeypatch):
+    """S3: STEP_ENV and INVOCATION_ID are set in any unit's child; only the service's cgroup lets the hooks step through."""
+    with Path(os.devnull).open() as devnull:
+        monkeypatch.setattr(sys, "stdin", devnull)
+        monkeypatch.setenv(upgrade.STEP_ENV, "1")
+        monkeypatch.setattr(upgrade, "_own_cgroup", lambda: "0::/user.slice/user-1000.slice/app.slice/evil.service\n")
+        assert cli.main(["upgrade", "--hooks-only"]) == upgrade.EXIT_REFUSED
+
+
+# the start check reads systemd; these stand in for `systemctl show`
+
+GOOD_SVC = {"TriggeredBy": "ws-upgrade.timer", "InvocationID": "abc", "NeedDaemonReload": "no", "DropInPaths": "",
+            "InactiveExitTimestampMonotonic": "5000000"}  # fmt: skip
+GOOD_TIM = {
+    "WantedBy": "timers.target",
+    "NeedDaemonReload": "no",
+    "DropInPaths": "",
+    "LastTriggerUSecMonotonic": "4000000",
+}
+
+
+@pytest.fixture
+def started(svc, monkeypatch):
+    """Written units, the switch on, and a `systemctl show` that answers from two dicts a test may change."""
+    tool = svc.home / ".local" / "share" / "uv" / "tools" / "ws-aitoolkit" / "bin" / "ws"
+    tool.parent.mkdir(parents=True)
+    tool.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr(selfcmd, "tree", lambda: tool.parent.parent)
+    upgradeunit.write(os.environ, tool)
+    upgradeunit.switch_path(os.environ).parent.mkdir(parents=True, exist_ok=True)
+    upgradeunit.switch_path(os.environ).write_text("on\n", encoding="utf-8")
+    folder = upgradeunit.unit_dir(os.environ)
+    props = {
+        upgradeunit.SERVICE: {**GOOD_SVC, "FragmentPath": str(folder / upgradeunit.SERVICE)},
+        upgradeunit.TIMER: {**GOOD_TIM, "FragmentPath": str(folder / upgradeunit.TIMER)},
+    }
+    monkeypatch.setattr(upgradeunit, "show", lambda unit, keys, run=None: dict(props[unit]))
+    return argparse.Namespace(tool=tool, props=props, folder=folder)
+
+
+def check(started) -> list[str]:
+    return REAL_CHECK(os.environ, started.tool)
+
+
+def test_the_timer_firing_with_the_switch_on_passes_the_start_check(started):
+    assert check(started) == []
+
+
+@pytest.mark.parametrize(
+    ("unit", "change", "why"),
+    [
+        ("ws-upgrade.service", {"TriggeredBy": "ws-upgrade.timer evil.timer"}, "triggered by"),  # its own timer, Unit=
+        ("ws-upgrade.service", {"WantedBy": "evil.service"}, "WantedBy=evil.service"),  # Wants=, a .service.wants link
+        ("ws-upgrade.service", {"WantedBy": "timers.target"}, "WantedBy=timers.target"),  # timers.target.d Wants=
+        ("ws-upgrade.service", {"OnFailureOf": "evil.service"}, "OnFailureOf"),  # OnFailure=
+        ("ws-upgrade.service", {"UpheldBy": "evil.target"}, "UpheldBy"),
+        ("ws-upgrade.timer", {"WantedBy": "timers.target default.target"}, "WantedBy=timers.target default.target"),
+        ("ws-upgrade.timer", {"RequiredBy": "evil.service"}, "RequiredBy"),
+        ("ws-upgrade.service", {"DropInPaths": "/x/ws-.service.d/10.conf"}, "drop-in"),
+        ("ws-upgrade.timer", {"NeedDaemonReload": "yes"}, "changed on disk"),
+        ("ws-upgrade.service", {"InvocationID": "other"}, "not the service's current run"),
+        ("ws-upgrade.service", {"InactiveExitTimestampMonotonic": "900000000"}, "not started by ws-upgrade.timer"),
+        ("ws-upgrade.service", {"FragmentPath": "/etc/x/ws-upgrade.service"}, "is loaded from"),
+    ],
+)
+def test_each_way_a_session_could_start_the_service_is_refused_at_start(started, unit, change, why):
+    started.props[unit].update(change)
+    assert any(why in p for p in check(started)), check(started)
+
+
+def test_a_started_service_with_nothing_triggering_it_is_refused(started):
+    """Started by hand or through a dependency: the timer did not fire for this run."""
+    started.props[upgradeunit.TIMER]["LastTriggerUSecMonotonic"] = "0"
+    assert any("not started by" in p for p in check(started))
+
+
+def test_a_unit_file_that_is_not_the_text_ws_writes_is_refused(started):
+    path = started.folder / upgradeunit.SERVICE
+    path.write_text(path.read_text(encoding="utf-8") + "ExecStartPre=/tmp/x\n", encoding="utf-8")
+    assert any("not the text ws writes" in p for p in check(started))
+
+
+def test_with_the_switch_off_the_service_refuses(started):
+    upgradeunit.switch_path(os.environ).unlink()
+    assert any("the switch is off" in p for p in check(started))
+
+
+def test_the_unattended_run_stops_at_a_failed_start_check(svc, monkeypatch):
+    monkeypatch.setattr(upgradeunit, "self_check", lambda env, ws, run=None: ["the switch is off"])
+    assert serve(svc) == upgrade.EXIT_REFUSED and installed(svc) == OLD
+    assert rows()[-1]["result"] == "refused" and "switch is off" in rows()[-1]["reason"]
+
+
+def test_the_switch_is_a_protected_file_only_auto_on_writes(svc, monkeypatch, capsys):
+    calls: list[list[str]] = []
+
+    def run(argv, **kw):
+        calls.append(argv)
+        return __import__("subprocess").CompletedProcess(argv, 0, "", "")
+
+    tool = svc.home / ".local" / "share" / "uv" / "tools" / "ws-aitoolkit" / "bin" / "ws"
+    tool.parent.mkdir(parents=True)
+    tool.write_text("#!/bin/sh\n", encoding="utf-8")
+    assert upgradeunit.switch(os.environ, tool, True, run=run) == []
+    assert upgradeunit.switch_path(os.environ).is_file()
+    assert ["systemctl", "--user", "enable", "--now", "ws-upgrade.timer"] in calls
+    assert str(upgradeunit.switch_path(os.environ)).startswith(str(paths.config_dir(dict(os.environ))))
+    assert (
+        upgradeunit.switch(os.environ, tool, False, run=run) == [] and not upgradeunit.switch_path(os.environ).exists()
+    )
+    failing = lambda argv, **kw: __import__("subprocess").CompletedProcess(argv, 1, "", "")
+    assert upgradeunit.switch(os.environ, tool, True, run=failing) and not upgradeunit.switch_path(os.environ).exists()
+
+
+def test_auto_on_is_refused_from_a_session(svc, monkeypatch):
+    monkeypatch.setenv(approvals.ENV_MARKER, "1")
+    assert cli.main(["upgrade", "--auto", "on"]) == upgrade.EXIT_REFUSED
+    assert not upgradeunit.switch_path(os.environ).exists()

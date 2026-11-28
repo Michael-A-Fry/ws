@@ -10,9 +10,13 @@ gate, see `ws.userconfig` and `protected_paths` here):
   does nothing when that is installed. A failed or refused run starts `ws-alert@` (`OnFailure=`), the ntfy alert every
   ws job has.
 
-The switch (DEC-131) is the timer: writing the units starts nothing, and the timer runs only once the person enables it
-(`systemctl --user enable --now ws-upgrade.timer`, from a terminal of his own; the upgrade-service guard refuses it from a
-session). Turning it off is `systemctl --user disable --now ws-upgrade.timer`.
+The switch (DEC-131) is a file in ws's config folder, `auto-upgrade.on` (`switch_path`), which the gate protects
+like the policy beside it: only `ws upgrade --auto on`, from a terminal of the person's own, writes it, and that also
+writes the units and enables the timer; `--auto off` disables the timer and removes it. A timer some session found a way to
+enable or start (its own unit with `Unit=`, `Also=`, `Wants=`, a drop-in, a `.wants` link, a preset) meets the service's
+own start check (`self_check`): the switch must be on, the start must come from this timer just now, nothing else may pull
+the units in, no drop-in may change them, and the unit files must be the text written here. Any of those failing is a
+refusal, and an alert.
 
 `ExecStart` names the ws command inside the installed tool's own folder (`<tool folder>/bin/ws`), a folder the gate
 already protects from a session. It is never a path in a checkout, a repository or `~/.local/bin`, so nothing a session
@@ -26,17 +30,22 @@ widen) once a day.
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping
+import subprocess
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 from ws import paths, selfcmd
 from ws.output import WsError
+
+Runner = Callable[..., subprocess.CompletedProcess]
 
 SERVICE, TIMER = "ws-upgrade.service", "ws-upgrade.timer"
 UNITS = (SERVICE, TIMER)
 # where `enable` links a unit, for each target a user manager reaches at start: a link there is the switch turned on
 TARGETS = ("default", "basic", "timers", "sockets", "paths")
 LINK_DIRS = tuple(f"{t}.target.{kind}" for t in TARGETS for kind in ("wants", "requires", "upholds"))
+SWITCH = "auto-upgrade.on"  # in ws's config folder: protected, so the switch is the person's
+TRIGGER_SLACK_US = 120_000_000  # the timer fired at most this long before the service left inactive
 UPGRADE_TIMEOUT_S = 3600  # a 30 minute wait for idle, the installer's 10 minutes, the checks and a way back
 
 
@@ -112,12 +121,17 @@ def units(ws: Path) -> dict[str, str]:
     upgrade is refused until a launchd form is built."""
     run = " ".join([str(ws.with_name("python")), *selfcmd.argv()[1:], "upgrade"])  # the isolated flags are selfcmd's
     env = f"Environment=PATH={paths.tool_path()}\nUnsetEnvironment={UNSET}\n"
+    tree = ws.parent.parent  # a way back killed between its two renames leaves the copy beside it: finish it, no Python
+    recover = (
+        f'ExecStopPost=/bin/sh -c \'test -d "{tree}" || mv "{tree}.ws-restore" "{tree}" 2>/dev/null'
+        f' || mv "{tree}.ws-failed" "{tree}"\'\n'
+    )
     return {
         SERVICE: (
             "[Unit]\nDescription=ws: unattended upgrade (newest release, proved, checked, rolled back offline on any failure)\n"
             "OnFailure=ws-alert@%n.service\n\n"
             f"[Service]\nType=oneshot\nExecStart={run} --unattended\nTimeoutStartSec={UPGRADE_TIMEOUT_S}\n"
-            f"NoNewPrivileges=yes\n{env}"
+            f"NoNewPrivileges=yes\n{env}{recover}"
         ),
         TIMER: (
             "[Unit]\nDescription=ws: look for a new ws release once a day\n\n"
@@ -140,3 +154,103 @@ def write(env: Mapping[str, str], ws: Path) -> list[Path]:
         os.replace(tmp, path)
         made.append(path)
     return made
+
+
+def switch_path(env: Mapping[str, str]) -> Path:
+    return paths.config_dir(dict(env)) / SWITCH
+
+
+def show(unit: str, props: tuple[str, ...], run: Runner = subprocess.run) -> dict[str, str]:
+    """`systemctl --user show UNIT -p ...` as a dict; empty when systemctl can't say (which the check counts as a failure)."""
+    try:
+        r = run(
+            ["systemctl", "--user", "show", unit, "-p", ",".join(props)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if r.returncode != 0:
+        return {}
+    return dict(line.split("=", 1) for line in r.stdout.splitlines() if "=" in line)
+
+
+PULLS = ("WantedBy", "RequiredBy", "RequisiteOf", "BoundBy", "UpheldBy", "OnFailureOf", "OnSuccessOf", "PartOf")
+_PROPS = ("TriggeredBy", "DropInPaths", "FragmentPath", "NeedDaemonReload", "InvocationID", *PULLS)
+_TIME = ("InactiveExitTimestampMonotonic", "LastTriggerUSecMonotonic")
+
+
+def self_check(env: Mapping[str, str], ws: Path, run: Runner = subprocess.run) -> list[str]:
+    """Why this start of the service is not the person's timer firing, or nothing. Read from systemd itself, never from a
+    file a session wrote: the switch, who triggered this start and when, what else pulls either unit in, drop-ins, a
+    pending reload, and the unit files' text."""
+    if not switch_path(env).is_file():
+        return ["the switch is off (`ws upgrade --auto on` turns it on, from a terminal of your own)"]
+    svc, tim = show(SERVICE, (*_PROPS, *_TIME), run), show(TIMER, (*_PROPS, *_TIME), run)
+    if not svc or not tim:
+        return ["systemd could not say how this run was started"]
+    out = []
+    if svc.get("TriggeredBy", "").split() != [TIMER]:
+        out.append(f"{SERVICE} is triggered by {svc.get('TriggeredBy') or 'nothing'}, not {TIMER} alone")
+    if svc.get("InvocationID") != env.get("INVOCATION_ID"):
+        out.append("this process is not the service's current run")
+    try:
+        fired, began = (
+            int(tim.get("LastTriggerUSecMonotonic", "0")),
+            int(svc.get("InactiveExitTimestampMonotonic", "0")),
+        )
+    except ValueError:
+        fired, began = 0, 0
+    if not fired or not 0 <= began - fired <= TRIGGER_SLACK_US:
+        out.append(f"this run was not started by {TIMER} firing just now")
+    want = {SERVICE: "", TIMER: "timers.target"}
+    texts = units(ws)
+    for name, props in ((SERVICE, svc), (TIMER, tim)):
+        for key in PULLS:
+            got = props.get(key, "").split()
+            if got and got != ([want[name]] if key == "WantedBy" and want[name] else []):
+                out.append(f"{name} is pulled in by {key}={' '.join(got)}")
+        if props.get("DropInPaths", "").strip():
+            out.append(f"{name} has a drop-in ({props['DropInPaths'].split()[0]})")
+        if props.get("NeedDaemonReload", "no") != "no":
+            out.append(f"{name} changed on disk since systemd loaded it")
+        frag = unit_dir(env) / name
+        if props.get("FragmentPath") != str(frag):
+            out.append(f"{name} is loaded from {props.get('FragmentPath') or 'nowhere'}, not {frag}")
+        else:
+            try:
+                same = frag.read_text(encoding="utf-8") == texts[name]
+            except OSError:
+                same = False
+            if not same:
+                out.append(f"{frag} is not the text ws writes")
+    return out
+
+
+def switch(env: Mapping[str, str], ws: Path, on: bool, run: Runner = subprocess.run) -> list[str]:
+    """Turn the unattended upgrade on (write the units, reload, enable and start the timer, then the switch file) or off
+    (stop and disable the timer, remove the switch). Returns what failed; the switch file is written only when all of it
+    worked, so a half-done `on` stays off."""
+
+    def ctl(*args: str) -> bool:
+        try:
+            return (
+                run(["systemctl", "--user", *args], capture_output=True, text=True, timeout=60, check=False).returncode
+                == 0
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+
+    path = switch_path(env)
+    if not on:
+        path.unlink(missing_ok=True)
+        return [] if ctl("disable", "--now", TIMER) else [f"systemctl --user disable --now {TIMER} failed"]
+    write(env, ws)
+    for args in (("daemon-reload",), ("enable", "--now", TIMER)):
+        if not ctl(*args):
+            return [f"systemctl --user {' '.join(args)} failed"]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("on: the unattended upgrade (ws upgrade --auto off turns it off)\n", encoding="utf-8")
+    return []

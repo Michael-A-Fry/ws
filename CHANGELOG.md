@@ -8,6 +8,11 @@ body of the GitHub release.
 
 ## [Unreleased]
 
+### Changed
+
+- The Telegram flow's broker entry lets the bridge call `createForumTopic`, so ws-next can open a topic per area
+  in the private chat (Bot API 10.5, C841). `setMySettings` stays out: it runs once at setup under its own purpose.
+
 ## [0.1.11.12] - 2026-11-28
 
 ### Added

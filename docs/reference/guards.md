@@ -168,17 +168,17 @@ release_dir = "~/releases"                 # optional: release claims are off wi
 release_tags = ["v[0-9]+[.][0-9]+([.][0-9]+)*"]   # optional: the shapes of a release name
 repos = ["~/code/other-repo"]              # optional: other repositories whose default branch can vouch for a commit
 local_repos = ["~/code/kept-local"]        # optional: repositories kept local by choice (no remote): their own default branch vouches
-require_evidence = true                    # optional, default false: a claim with a verb and a branch must name a commit
+require_evidence = true                    # optional, default false: a verb-and-branch claim must name a commit
 ```
 
-`local_repos` names a repository that has no remote and no remote-tracking ref on purpose. Only an entry that is the
+`local_repos` names a repository with no remote and no remote-tracking ref, on purpose. Only an entry that's the
 repository itself counts (not a subfolder, a symlink into another repository or a folder with the same first letters), and
-the session's own repository falls back to its local default branch only when it is listed here. Any other repository
+the session's own repository falls back to its local default branch only when it's listed here. Any other repository
 with no `origin/<branch>` is denied as not checked.
 
 `require_evidence = true` refuses a claim that starts with a verb and names the default branch (`merged into main`,
 `pushed to main`, `landed on main`, `shipped to main`) when no commit is named with it. Plain phrases (`on main`,
-`is in main`), negations, the future, quotes and sentences about another branch are not asked for evidence.
+`is in main`), negations, the future, quotes and sentences about another branch don't need evidence.
 
 A commit that isn't on the ref in the session's own repository is looked for in the repositories in `repos` (never in
 a folder the message names). A listed repository vouches only when its `origin` is a URL, its `origin/HEAD` names the

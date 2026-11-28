@@ -13,10 +13,11 @@ name = "TELEGRAM_BOT_TOKEN"
 hosts = ["api.telegram.org"]
 purposes = ["notify", "bridge"]
 base_path = "/bot{value}"
-paths = ["/getMe", "/getUpdates", "/sendMessage", "/editMessageReplyMarkup", "/answerCallbackQuery"]
-# notify only sends; the bridge (ws-next's poller) reads updates and resolves cards (C828)
+paths = ["/getMe", "/getUpdates", "/sendMessage", "/editMessageReplyMarkup", "/answerCallbackQuery", "/createForumTopic"]
+# notify only sends; the bridge (ws-next's poller) reads updates, resolves cards (C828) and opens a topic per area in
+# the private chat (C841). setMySettings is never here: it runs once at setup, under its own one-off purpose.
 purpose_paths = ["notify:/getMe", "notify:/sendMessage", "bridge:/getMe", "bridge:/getUpdates", "bridge:/sendMessage",
-                 "bridge:/editMessageReplyMarkup", "bridge:/answerCallbackQuery"]
+                 "bridge:/editMessageReplyMarkup", "bridge:/answerCallbackQuery", "bridge:/createForumTopic"]
 
 [[steps]]
 id = "make-bot"

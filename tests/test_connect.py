@@ -16,6 +16,7 @@ from jsonschema import Draft202012Validator
 
 from ws import agentsession, cli
 from ws import secrets as wsecrets
+from ws.broker import path_allowed
 from ws.connect import engine, spec
 from ws.connect.engine import ConnectError, Context
 
@@ -950,7 +951,21 @@ def test_the_bind_keeps_the_senders_id_for_the_bridge(env):
 def test_the_telegram_entry_allows_the_bridge(env):
     e = flow_entry()
     assert e.purposes == ("notify", "bridge")
-    assert set(e.paths) == {"/getMe", "/getUpdates", "/sendMessage", "/editMessageReplyMarkup", "/answerCallbackQuery"}
+    assert set(e.paths) == {
+        "/getMe",
+        "/getUpdates",
+        "/sendMessage",
+        "/editMessageReplyMarkup",
+        "/answerCallbackQuery",
+        "/createForumTopic",
+    }
+
+
+def test_the_telegram_bridge_opens_topics_but_never_changes_bot_settings():
+    e = flow_entry()
+    assert "/createForumTopic" in e.paths_for("bridge") and "/createForumTopic" not in e.paths_for("notify")
+    assert not path_allowed(e.paths_for("bridge"), "/setMySettings")
+    assert not path_allowed(e.paths_for("notify"), "/setMySettings")
 
 
 def test_the_telegram_flow_registers_notify_as_send_only():

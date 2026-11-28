@@ -8,6 +8,14 @@ body of the GitHub release.
 
 ## [Unreleased]
 
+### Changed
+
+- The Telegram flow's broker entry lets the bridge call `createForumTopic`, so ws-next can open a topic per area
+  in the private chat (Bot API 10.5, C841). `setMySettings` stays out: it runs once at setup under its own purpose.
+  An existing install keeps its old `[TELEGRAM_BOT_TOKEN]` entry, so its next `ws connect telegram` reports
+  `registered_differently` until the entry gains `"/createForumTopic"` in `paths` and `"bridge:/createForumTopic"`
+  in `purpose_paths` (order doesn't matter). ws-private's `lead/tools/setup_topics.sh` makes exactly that edit.
+
 ## [0.1.11.12] - 2026-11-28
 
 ### Added

@@ -162,6 +162,7 @@ _FILLER = frozenset(
 )
 _LEAD = frozenset(
     [
+        "yes",
         "in",
         "at",
         "of",
@@ -418,8 +419,8 @@ def find_claims(
     found: list[tuple[str, str]] = []
     for sentence in _SENTENCE.split(text[:MAX_TEXT]):
         tokens = [m for m in _HEX.finditer(sentence) if _commit_like(m.group(0))]
-        if not tokens or sentence.rstrip().endswith("?") or _names_other_branch(sentence, ref, branch):
-            continue  # a question ("is abc1234 in main?") asks; it doesn't claim (C862)
+        if not tokens or _names_other_branch(sentence, ref, branch):
+            continue
         for span in _claim_spans(sentence, words):
             for token in tokens:
                 pair = (span[0], token.group(0))
@@ -818,7 +819,7 @@ MAX_GUESSES = 6
 
 def blind_claims(text: str, cfg: Config) -> list[tuple[str, str]]:
     """The claims in `text` when git ran out of time before it could name the default branch: the claim phrases for each
-    word that follows `on`, `into` or `to` (the first few), unless the policy names its own `words`. Used only to decide
+    word that follows `on`, `in`, `into` or `to` (the first few), unless the policy names its own `words`. Used only to decide
     that something is a claim that can't be checked, never to say it is true or false."""
     if cfg.words:
         return []

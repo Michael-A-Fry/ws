@@ -996,12 +996,12 @@ def test_c862_the_wider_phrases_keep_the_negation_future_and_plain_wording_rules
 
 @pytest.mark.parametrize(
     "text",
-    ["is abc1234 in main?", "has abc1234 landed on main?", "did it get shipped to main, abc1234?", "main has abc1234?"],
+    [
+        "abc1234 is in main, right?",  # a claim with a question tacked on (DEC-202: no question rule)
+        "abc1234 is in main??",
+        "Yes: abc1234 is in main",
+        "is abc1234 in main? it landed on main",
+    ],
 )
-def test_c862_a_question_is_not_a_claim(text):
-    assert cl.find_claims(text, cl.claim_words("main")) == []
-
-
-def test_c862_the_same_words_as_a_statement_are_still_a_claim():
-    assert cl.find_claims("abc1234 is in main", cl.claim_words("main")) != []
-    assert cl.find_claims("is it done? abc1234 is in main", cl.claim_words("main")) != []
+def test_c862_a_claim_with_a_question_mark_or_a_yes_is_still_a_claim(text):
+    assert cl.find_claims(text, cl.claim_words("main")) != []

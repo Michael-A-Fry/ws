@@ -257,23 +257,47 @@ def test_downloads_ignore_a_proxy_and_a_certificate_variable(monkeypatch, tmp_pa
     assert ctx.verify_mode.name == "CERT_REQUIRED" and ctx.check_hostname
 
 
-# ---- reading a request and comparing versions ------------------------------------------------------------------------
+# ---- the newest release and comparing versions ------------------------------------------------------------------------
+
+
+class _Resp:
+    def __init__(self, body: bytes) -> None:
+        self.body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def read(self, n: int) -> bytes:
+        return self.body[:n]
 
 
 @pytest.mark.parametrize(
-    ("text", "want"),
-    [("v0.1.11.8\n", "v0.1.11.8"), (" rollback ", "rollback"), ("v0.2.0rc1", "v0.2.0rc1")],
+    ("body", "want"),
+    [
+        (b'{"tag_name": "v0.1.11.13"}', "v0.1.11.13"),
+        (b'{"tag_name": "v0.1.11.13; rm -rf ~"}', None),
+        (b'{"tag_name": "../../etc/passwd"}', None),
+        (b'{"tag_name": 7}', None),
+        (b"[]", None),
+        (b"not json", None),
+    ],
 )
-def test_a_request_is_a_tag_or_rollback(text, want):
-    assert upgradeproof.parse_request(text) == want
+def test_the_newest_release_is_one_tag_read_as_data(monkeypatch, body, want):
+    class Opener:
+        def open(self, url, timeout):
+            assert url == "https://api.github.com/repos/o/ws/releases/latest"
+            return _Resp(body)
 
-
-@pytest.mark.parametrize(
-    "text",
-    ["rollback to v0.0.1", "v0.1.11.8; rm -rf ~", "../../etc/passwd", "https://x/y", "", "v1\nv2", "v" + "1" * 50],
-)
-def test_a_request_that_is_neither_is_dropped(text):
-    assert upgradeproof.parse_request(text) is None
+    monkeypatch.setattr(upgradeproof, "opener", Opener)
+    gh = upgradeproof.GitHub("o/ws")
+    if want:
+        assert gh.latest() == want
+    else:
+        with pytest.raises(Refused, match="newest release"):
+            gh.latest()
 
 
 def test_versions_sort_by_part_and_a_candidate_sorts_below_its_release():

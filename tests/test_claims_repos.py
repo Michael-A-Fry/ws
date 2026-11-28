@@ -208,3 +208,29 @@ def test_c820_removing_a_hosted_repos_remote_does_not_make_its_unpushed_main_vou
         pytest.skip("this id isn't one the guard reads as a commit")
     git(other, "remote", "remove", "origin")
     assert judge(f"merged {unpushed} into main", here, listed(other)).action == "deny"
+
+
+@needs_git
+def test_c820_local_repos_entries_count_only_when_they_are_the_repository_itself(two, tmp_path, monkeypatch):
+    """Third review: a symlink to the repo, `~/`, a prefix sibling and a subfolder."""
+    here, other, theirs = two
+    link = tmp_path / "link"
+    link.symlink_to(other)
+    sub = other / "sub"
+    sub.mkdir()
+    sibling = tmp_path / (other.name + "2")  # starts with the same letters
+    sibling.mkdir()
+    budget = cl.Budget()
+
+    def tops(*entries):
+        return cl.local_tops(cl.config({"local_repos": [str(e) for e in entries]}, "w"), budget)
+
+    real = str(other.resolve())
+    assert tops(other) == {real}
+    assert tops(link) == {real}  # a symlink to the repository itself is the repository
+    assert tops(sub) == set()  # a subfolder is not the repository
+    assert tops(sibling) == set()  # a folder with a shared prefix, that is not a repository
+    monkeypatch.setenv("HOME", str(other.parent))
+    assert cl.local_tops(cl.config({"local_repos": [f"~/{other.name}"]}, "w"), budget) == {real}
+    # the planted bad case through the guard: a subfolder entry never vouches
+    assert judge(f"merged {theirs} into main", here, cl.config({"local_repos": [str(sub)]}, "w")).action == "deny"

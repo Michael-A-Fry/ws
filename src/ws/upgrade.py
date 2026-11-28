@@ -44,6 +44,16 @@ limit (`--install-timeout`, 600 seconds, and `--step-timeout`, 120), and a step 
 whose installer or hooks step times out, or whose health check fails or times out, is rolled back at once and recorded
 as `auto-rollback`; a swap whose installer simply fails changed nothing and is not rolled back.
 
+A way back puts the policy back too (C706). A release can change the policy (`DEFAULT_GUARDS`), and the release it is rolled
+back to may not know what was added: it would refuse the policy, and the gate fails closed for every session. So the swap
+first holds the policy, the install record and each runner config the rewrite may change; an automatic rollback puts them
+back between the old installer and the old hooks step. The same files are copied to `<state>/upgrade-backups/` before the
+installer runs, and a `swap-start` history line names the folder and the policy's hash before the upgrade, so a process
+that dies mid-swap still leaves the way back (`previous_release` reads that line too). A folder a promote or an unfinished
+swap names is never pruned; a swap whose installer failed removes its own. A manual `--rollback` puts the policy back from
+the copy while the policy is still as the upgrade left it; one the person has edited since keeps their edits and loses only
+the guards the upgrade added; and if even that can't be done safely the rollback is refused before anything is swapped.
+
 Swap note: the release is whatever the installer installs; to promote from somewhere else (a package manager, a release
 tree), pass `--installer` with your own script that takes `--version TAG`, and keep the history and the watchdog.
 
@@ -56,6 +66,7 @@ run without a terminal on stdin is refused too (a session's shell has none), as 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shlex
@@ -68,6 +79,7 @@ import sys
 import tempfile
 import threading
 import time
+import tomllib
 import urllib.request
 from collections import deque
 from collections.abc import Mapping
@@ -92,6 +104,7 @@ DEFAULT_GUARDS = (
 )  # guards added to a policy's `[guards] on` list by the rewrite, once, when it is missing
 STEP_ENV = "WS_UPGRADE_STEP"  # set for each step the upgrade runs: a hooks rewrite there leaves the log line to it
 INSTALL_TIMEOUT_S, STEP_TIMEOUT_S = 600.0, 120.0  # the watchdog per step: the installer, then the hooks and the check
+BACKUPS_DIR, BACKUPS_KEPT = "upgrade-backups", 5  # what a swap keeps of the files it may change, and how many swaps
 INSTALLER_URL = "https://raw.githubusercontent.com/Michael-A-Fry/ws/main/install.sh"
 _DOWNLOAD_LIMIT = 1 << 20  # bytes: install.sh is about 40 KB
 
@@ -122,6 +135,34 @@ def refusal(env: Mapping[str, str], stdin_is_tty: bool) -> str | None:
 # ---- the rewrite ------------------------------------------------------------------------------------------------------------
 
 
+def _backup_root(env: Mapping[str, str]) -> Path:
+    return paths.state_dir(dict(env)) / BACKUPS_DIR
+
+
+def _is_backup(folder: Path) -> bool:
+    return folder.name.isdigit() and folder.is_dir() and not folder.is_symlink()
+
+
+def _age(folder: Path) -> int:
+    return int(folder.name)
+
+
+def _named_backups(env: Mapping[str, str]) -> set[str]:
+    """The folder names a history line that still matters names: every promote's, and the unfinished swap's."""
+    last = _last_swap(env)
+    lines = [d for d in history(env) if d.get("verb") == "promote"] + ([last] if last else [])
+    return {Path(str(d["backup"])).name for d in lines if d.get("backup")}
+
+
+def _backup_dir(env: Mapping[str, str], named: object) -> Path | None:
+    """The folder a history line names, when it is one `keep` made: a number for a name, straight under
+    `<state>/upgrade-backups/`, not a link. Anything else in a history line is not trusted as a place to read from."""
+    if not isinstance(named, str) or not named:
+        return None
+    folder = Path(named)
+    return folder if folder.parent == _backup_root(env) and _is_backup(folder) else None
+
+
 @dataclass
 class _Held:
     """The bytes of the files a rewrite can change, to put back if it fails."""
@@ -137,6 +178,45 @@ class _Held:
             except OSError:
                 held[p] = None
         return cls(held)
+
+    def keep(self, env: Mapping[str, str]) -> Path | None:
+        """Copy these files into a folder of their own under `<state>/upgrade-backups/` (a number for a name), with an
+        `index.json` saying which copy is which file, and return the folder. A manual rollback days later reads the policy
+        back from it (`_rollback`). Older folders beyond the newest five go, except any the history still names: a promote's,
+        and the one a swap that never finished (a crash) left. None when it could not be written: the in-memory copy
+        still serves the automatic rollback."""
+        root = _backup_root(env)
+        folder = root / str(time.time_ns())
+        try:
+            root.mkdir(parents=True, mode=0o700, exist_ok=True)
+            folder.mkdir(mode=0o700)
+            index = {}
+            for n, (p, data) in enumerate(self.files.items()):
+                index[str(p)] = None if data is None else str(n)
+                if data is not None:
+                    (folder / str(n)).write_bytes(data)
+            (folder / "index.json").write_text(json.dumps(index), encoding="utf-8")
+            named = _named_backups(env)
+            old = sorted((d for d in root.iterdir() if _is_backup(d) and d != folder and d.name not in named), key=_age)
+            for d in old[:-BACKUPS_KEPT]:
+                shutil.rmtree(d, ignore_errors=True)
+        except OSError:
+            shutil.rmtree(folder, ignore_errors=True)
+            return None
+        return folder
+
+    @classmethod
+    def from_backup(cls, folder: Path, only: Path, sha256: object) -> _Held | None:
+        """What `keep` wrote for the one file `only`, or None when the folder has no copy of it or the copy is not the one
+        the history recorded (`sha256`: the hash of the file as it was before the upgrade)."""
+        try:
+            name = json.loads((folder / "index.json").read_text(encoding="utf-8")).get(str(only))
+            if not isinstance(name, str) or not name.isdigit():
+                return None
+            data = (folder / name).read_bytes()
+        except (OSError, ValueError, AttributeError):
+            return None
+        return cls({only: data}) if isinstance(sha256, str) and hashlib.sha256(data).hexdigest() == sha256 else None
 
     def restore(self) -> list[Path]:
         """Write back what changed, and return the files that could not be written back (none, when all went well). A file
@@ -179,7 +259,7 @@ def migrate_policy(env: Mapping[str, str], dry_run: bool = False) -> list[str]:
     """Add each of `DEFAULT_GUARDS` that the person's `[guards] on` list lacks (`policy.add_to_guards_on`), and return a
     note for each one added (or, on a dry run, that would be). A policy that is missing, unreadable, without that list, or
     that already names the guard is left exactly as it is, so a second run changes nothing."""
-    path = Path(os.path.realpath(policy.policy_path(dict(env))))
+    path = _policy_file(env)
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
@@ -200,6 +280,32 @@ def migrate_policy(env: Mapping[str, str], dry_run: bool = False) -> list[str]:
     return [f"{verb} {', '.join(done)} to [guards] on in {path}, which lacked it (a guard that is now on by default)"]
 
 
+def _policy_file(env: Mapping[str, str]) -> Path:
+    return Path(os.path.realpath(policy.policy_path(dict(env))))
+
+
+def _rewrite_paths(env: Mapping[str, str], steps: list, plug: Path | None) -> list[Path]:
+    """The files a rewrite can change: the install record, the policy, each runner config and plugin it merges into."""
+    return [
+        install.manifest_path(env),
+        _policy_file(env),
+        *(s.path for s in steps if s.kind == "merge" or s.path.suffix == ".js"),
+        *([plug] if plug else []),
+    ]
+
+
+def held_now(env: Mapping[str, str]) -> _Held:
+    """The files the new ws's rewrite may change, as they are now: what an automatic rollback puts back (C706: a release
+    that adds a guard to the policy must not leave it there for the release it is rolled back to, which may reject the
+    name and so fail the gate closed for every session). Always the policy and the install record, even when the plan
+    for the rest cannot be made."""
+    try:
+        steps, _ = install.gate_plan(env)
+        return _Held.of(_rewrite_paths(env, steps, userconfig.withdrawn_plugin(env)))
+    except (install.InstallError, OSError, WsError):
+        return _Held.of([install.manifest_path(env), _policy_file(env)])
+
+
 def rewrite(env: Mapping[str, str], dry_run: bool = False) -> install.Result:
     """Rewrite the runner's hooks (and the generated gate files) with this ws. On any failure the runner's config, the
     install record and the OpenCode plugin are put back as they were, and the error is raised; if any could not be put
@@ -213,14 +319,7 @@ def rewrite(env: Mapping[str, str], dry_run: bool = False) -> install.Result:
         result.skipped = skipped
         result.removed += [plug] if plug else []
         return result
-    held = _Held.of(
-        [
-            install.manifest_path(env),
-            Path(os.path.realpath(policy.policy_path(dict(env)))),
-            *(s.path for s in steps if s.kind == "merge" or s.path.suffix == ".js"),
-            *([plug] if plug else []),
-        ]
-    )
+    held = _Held.of(_rewrite_paths(env, steps, plug))
     try:
         notes = migrate_policy(env)
         result = install.apply(steps, env)
@@ -519,11 +618,14 @@ def history_path(env: Mapping[str, str]) -> Path:
     return paths.state_dir(dict(env)) / "upgrade-history.jsonl"
 
 
-def record(env: Mapping[str, str], verb: str, frm: str, to: str | None) -> None:
-    """One line of history, in one file that is never rotated (the way back must stay on record). A history that
-    cannot be written never stops an upgrade."""
+def record(env: Mapping[str, str], verb: str, frm: str, to: str | None, **extra: object) -> None:
+    """One line of history, in one file that is never rotated (the way back must stay on record). `extra` is a swap's
+    `backup` (the folder `_Held.keep` wrote) and `policy_before_sha`; a promote adds `policy_sha` (the policy as the
+    upgrade left it) and `added_guards` (what the rewrite put in `[guards] on`). A history that cannot be written never
+    stops an upgrade."""
     try:
-        jsonl.append_plain(history_path(env), jsonl.stamped({"verb": verb, "from": frm, "to": to}, HISTORY_SCHEMA))
+        line = jsonl.stamped({"verb": verb, "from": frm, "to": to, **extra}, HISTORY_SCHEMA)
+        jsonl.append_plain(history_path(env), line)
     except OSError:
         pass
 
@@ -544,29 +646,55 @@ def history(env: Mapping[str, str]) -> list[dict]:
     return out
 
 
-def previous_release(env: Mapping[str, str]) -> str | None:
-    """The release the last promote came from, unless a rollback has put it back since."""
+def _last_swap(env: Mapping[str, str]) -> dict | None:
+    """The newest line that says a release was put in and nothing has put the old one back: a promote, or a `swap-start`
+    that nothing closed (the process died between the installer and the promote, so the installed release is unknown and
+    the one it left is the way back). A swap that was abandoned (its installer failed, nothing changed), an automatic
+    rollback or a rollback that worked closes the swap before it; one that failed put nothing back."""
+    skip = False
     for d in reversed(history(env)):
-        if d.get("verb") == "promote":
-            return d.get("from")
-        if d.get("verb") in ("rollback", "auto-rollback") and d.get("to"):  # one that failed put nothing back
+        verb = d.get("verb")
+        if verb == "promote":
+            return d
+        if verb == "swap-abandoned":
+            skip = True
+        elif verb == "swap-start":
+            if not skip:
+                return d
+            skip = False
+        elif verb in ("rollback", "auto-rollback") and d.get("to"):
             return None
     return None
+
+
+def previous_release(env: Mapping[str, str]) -> str | None:
+    """The release the last swap came from (see `_last_swap`), unless a rollback has put it back since."""
+    last = _last_swap(env)
+    return last.get("from") if last else None
 
 
 def _tag(version: str) -> str:
     return version if version.startswith("v") else f"v{version}"
 
 
-def reinstall(args: argparse.Namespace, env: Mapping[str, str], version: str) -> tuple[Ran, NewWs | None]:
+def reinstall(
+    args: argparse.Namespace, env: Mapping[str, str], version: str, held: _Held | None = None
+) -> tuple[Ran, NewWs | None]:
     """Install `version` and rewrite the hooks for it with the ws the installer left: the way back. Code 0 when both
-    steps worked."""
+    steps worked. `held` (files as they were before the release being left changed them) is put back between the two:
+    the old ws must not read a policy the new one wrote (C706)."""
     ns = argparse.Namespace(**{**vars(args), "version": _tag(version), "channel": None})
     with tempfile.TemporaryDirectory(prefix="ws-rollback-") as scratch:
         os.chmod(scratch, 0o700)
         ran = swap(ns, Path(scratch))
     if ran.code != 0:
         return ran, None
+    if held is not None:
+        failed = held.restore()
+        if failed:
+            _say(args, "could not put these back as they were: " + ", ".join(str(p) for p in failed))
+        else:
+            _say(args, "the policy and the hooks are back as they were before the upgrade")
     new = installed_ws(env)
     _using(ns, new)
     return _step(ns, "hooks", _hooks_argv(new), _step_limit(args), new.version), new
@@ -884,20 +1012,36 @@ def _both(args: argparse.Namespace, env: Mapping[str, str]) -> int:
             "use `ws upgrade --hooks-only` here, or install ws with install.sh first",
             EXIT_REFUSED,
         )
+    held = held_now(env)  # before the swap: what an automatic rollback puts back (C706)
+    kept = held.keep(env)
+    policy_before = held.files.get(_policy_file(env))
+    # the way back is on record before the installer runs: a process that dies after it still has a line that names the
+    # release it left and the copy of the policy from before, and `previous_release` and a rollback read it
+    record(
+        env,
+        "swap-start",
+        before,
+        _tag(args.version) if args.version else None,
+        backup=str(kept or ""),
+        policy_before_sha=_sha256_of(policy_before),
+    )
     with tempfile.TemporaryDirectory(prefix="ws-upgrade-") as scratch:
         os.chmod(scratch, 0o700)
         ran = swap(args, Path(scratch))
     if ran.timed_out:
-        return _auto_rollback(args, env, before, "the installer ran past its time limit")
+        return _auto_rollback(args, env, before, "the installer ran past its time limit", held)
     code = ran.code
     if code != 0:
         _say(args, f"the installer failed (exit {code}); you still have ws {before} and its hooks, unchanged")
+        if kept:  # nothing changed: the copy is of no use, and a run of failed tries must not push out a promote's
+            shutil.rmtree(kept, ignore_errors=True)
+        record(env, "swap-abandoned", before, None)
         return code or EXIT_FAILED
     new = installed_ws(env)
     _using(args, new)
     ran = _step(args, "hooks", _hooks_argv(new), _step_limit(args), new.version)
     if ran.timed_out:
-        return _auto_rollback(args, env, before, "the hooks rewrite ran past its time limit")
+        return _auto_rollback(args, env, before, "the hooks rewrite ran past its time limit", held)
     code = ran.code
     if code == EXIT_NOT_RESTORED:
         _say(
@@ -925,8 +1069,13 @@ def _both(args: argparse.Namespace, env: Mapping[str, str]) -> int:
             _say(args, f"the check could not start ({type(e).__name__})")
         if ran.code != 0:
             why = "the check ran past its time limit" if ran.timed_out else f"the check failed (exit {ran.code})"
-            return _auto_rollback(args, env, before, why)
-    record(env, "promote", before, new.version)
+            return _auto_rollback(args, env, before, why, held)
+    now = _policy_file(env)
+    added = [
+        g for g in DEFAULT_GUARDS if g in (_guards_on(_read(now)) or []) and g not in (_guards_on(policy_before) or [])
+    ]
+    saved = {"backup": str(kept), "policy_before_sha": _sha256_of(policy_before)} if kept else {}
+    record(env, "promote", before, new.version, **saved, policy_sha=_sha256(now), added_guards=added)
     broker_state = restart_broker(args, env, new)
     if args.json:
         output.result(
@@ -945,11 +1094,37 @@ def _broker_note(state: str) -> str:
     return "; the broker is left running the old code" if state == "left running" else "; the broker restart failed"
 
 
-def _auto_rollback(args: argparse.Namespace, env: Mapping[str, str], before: str, why: str) -> int:
-    """A cut-over step went wrong after the swap began: put `before` back at once."""
+def _read(path: Path) -> bytes | None:
+    try:
+        return path.read_bytes()
+    except OSError:
+        return None
+
+
+def _sha256_of(data: bytes | None) -> str:
+    return "" if data is None else hashlib.sha256(data).hexdigest()
+
+
+def _sha256(path: Path) -> str:
+    return _sha256_of(_read(path))
+
+
+def _guards_on(raw: bytes | None) -> list[str] | None:
+    """The `[guards] on` list of a policy's bytes, or None when it is missing, unreadable or not a list of names."""
+    try:
+        guards = tomllib.loads((raw or b"").decode("utf-8")).get("guards")
+    except ValueError:  # bad TOML and bad UTF-8 both
+        return None
+    on = guards.get("on") if isinstance(guards, dict) else None
+    return on if isinstance(on, list) and all(isinstance(x, str) for x in on) else None
+
+
+def _auto_rollback(args: argparse.Namespace, env: Mapping[str, str], before: str, why: str, held: _Held) -> int:
+    """A cut-over step went wrong after the swap began: put `before` back at once, with the policy, hooks and install
+    record as they were (`held`)."""
     _say(args, f"{why}; going back to ws {before}")
     args.log_verb = "auto-rollback"
-    code = reinstall(args, env, before)[0].code
+    code = reinstall(args, env, before, held)[0].code
     record(env, "auto-rollback", before, before if code == 0 else None)
     if code != 0:
         _say(
@@ -959,6 +1134,67 @@ def _auto_rollback(args: argparse.Namespace, env: Mapping[str, str], before: str
         return EXIT_NOT_RESTORED
     _say(args, f"rolled back: ws {before} and its hooks are back")
     return EXIT_FAILED
+
+
+def _policy_for_rollback(args: argparse.Namespace, env: Mapping[str, str], target: str) -> _Held | None:
+    """The policy the release this rollback returns to can load, or None when nothing needs to change (no swap on record
+    from `target`, or the policy lacks nothing the upgrade added).
+
+    - The policy is as the upgrade left it (or as it was): the copy from before goes back, byte for byte.
+    - The person edited it since, or the upgrade died before its promote line: their edits stay and only the guards the
+      upgrade added are taken out of `[guards] on` (the release going back may not know them, and would refuse the whole
+      policy: the gate then fails closed for every session, C706).
+    - The guards can't be taken out safely (or the copy is missing and the history does not say what was added): the
+      rollback is refused before anything is swapped, and says what to change by hand.
+    A copy that is missing, not under the backups folder, or not the one the history recorded is said so, loudly."""
+    last = _last_swap(env)
+    if not last or _tag(str(last.get("from"))) != _tag(target):
+        return None
+    path = _policy_file(env)
+    folder = _backup_dir(env, last.get("backup"))
+    copy = _Held.from_backup(folder, path, last.get("policy_before_sha")) if folder else None
+    if copy is None and last.get("policy_before_sha"):
+        _say(
+            args,
+            f"WARNING: the copy of the policy from before the upgrade is missing or is not the one that was recorded "
+            f"({last.get('backup') or 'no folder named'}); ws can only take out what the upgrade added",
+        )
+    if copy is not None and _sha256(path) in (last.get("policy_sha"), last.get("policy_before_sha")):
+        return copy
+    added = last.get("added_guards")
+    if not isinstance(added, list):  # no promote line (the upgrade died): what the copy lacked is what was added
+        was = _guards_on(copy.files[path]) if copy is not None else None
+        added = [g for g in DEFAULT_GUARDS if g not in was] if was is not None else None
+    if added is None:
+        raise WsError(
+            "refused",
+            f"the policy at {path} may list guards the release you are going back to does not know, and ws has no copy of "
+            "the policy from before the upgrade to put back",
+            f"take what the upgrade added ({', '.join(DEFAULT_GUARDS)}) out of [guards] on in that file, then run this again",
+            EXIT_REFUSED,
+        )
+    text, took = (_read(path) or b"").decode("utf-8", "replace"), []
+    for name in added:
+        if name not in (_guards_on(text.encode()) or []):
+            continue
+        more = policy.remove_from_guards_on(text, str(name))
+        if more is None:
+            raise WsError(
+                "refused",
+                f"the policy at {path} was changed after the upgrade and lists {name}, which the release you are going "
+                "back to may not know; ws could not take it out safely",
+                f"take {name} out of [guards] on in that file, then run this again",
+                EXIT_REFUSED,
+            )
+        text, took = more, [*took, str(name)]
+    if not took:
+        return None
+    _say(
+        args,
+        f"the policy at {path} changed after the upgrade: your edits stay, and only {', '.join(took)} (added by the "
+        "upgrade) is taken out of [guards] on",
+    )
+    return _Held({path: text.encode("utf-8")})
 
 
 def _rollback(args: argparse.Namespace, env: Mapping[str, str]) -> int:
@@ -981,7 +1217,7 @@ def _rollback(args: argparse.Namespace, env: Mapping[str, str]) -> int:
             "install ws with install.sh first",
             EXIT_REFUSED,
         )
-    ran, new = reinstall(args, env, target)
+    ran, new = reinstall(args, env, target, _policy_for_rollback(args, env, target))
     if ran.code != 0:
         record(env, "rollback", before, None)
         _say(

@@ -14,6 +14,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -868,8 +869,16 @@ def cutover(swapped, monkeypatch):
     return asked
 
 
+BOOKKEEPING = ("swap-start", "swap-abandoned")  # lines that mark a swap's start and a failed installer, not its outcome
+
+
 def _history():
-    return [(d["verb"], d["from"], d["to"]) for d in upgrade.history(os.environ)]
+    """The outcome lines (promote, rollback, auto-rollback); `_marks()` has the markers of how a swap began and ended."""
+    return [(d["verb"], d["from"], d["to"]) for d in upgrade.history(os.environ) if d["verb"] not in BOOKKEEPING]
+
+
+def _marks():
+    return [d["verb"] for d in upgrade.history(os.environ) if d["verb"] in BOOKKEEPING]
 
 
 def test_a_promote_is_recorded_with_where_it_came_from(cutover, old, capsys):
@@ -1508,3 +1517,279 @@ def test_after_a_takeover_a_service_that_does_not_answer_is_restarted_once(
     monkeypatch.setattr(upgrade, "BROKER_START_S", 2.0)
     assert cli.main(["upgrade"]) == 0
     assert asked == ["start", "restart"] and "restarted on ws 9.9.9" in capsys.readouterr().out
+
+
+# --- C706: a way back puts the policy back too, so the release it returns to can still load it -----------------------------
+
+A_GUARDS = {"syntax-check", "session-context", "dev-server"}  # what the release being left knows; pane-keys is new in B
+
+
+def a_policy() -> Path:
+    """The tmp policy as release A wrote it: no `pane-keys` in `[guards] on` (B adds it, as `DEFAULT_GUARDS` says)."""
+    path = policy.policy_path(dict(os.environ))
+    text = path.read_text(encoding="utf-8")
+    assert ', "pane-keys"' in text
+    path.write_text(text.replace(', "pane-keys"', ""), encoding="utf-8")
+    return path
+
+
+def a_loads(path: Path) -> bool:
+    """Release A's loader fails closed on a guard name it does not know (the 22 Nov incident)."""
+    on = tomllib.loads(path.read_text(encoding="utf-8"))["guards"]["on"]
+    return set(on) <= A_GUARDS
+
+
+@pytest.fixture
+def two_releases(cutover, old, monkeypatch):
+    """B's hooks step is the real rewrite (it adds the guard); A's, after the way back, loads the policy as A would."""
+    path = a_policy()
+    seen: dict = {"policy_at_check": None}
+
+    def run(argv, capture, timeout=None):
+        if argv[0] == "healthprobe":
+            seen["policy_at_check"] = path.read_text(encoding="utf-8")
+            return upgrade.Ran(1)
+        if cutover and cutover[-1] is not None:  # the installer was last asked for A by tag: this hooks step is A's
+            return upgrade.Ran(0 if a_loads(path) else 1)
+        return upgrade.Ran(cli.main(argv[len(selfcmd.argv()) :]))
+
+    monkeypatch.setattr(upgrade, "_run", run)
+    return path, seen
+
+
+def test_a_failed_check_puts_the_policy_back_and_the_old_release_still_loads_it(two_releases, old, capsys):
+    path, seen = two_releases
+    before = path.read_bytes()
+    others = (settings_file(old).read_bytes(), manifest_bytes(old))
+    assert cli.main(["upgrade", "--check", "healthprobe"]) == 1  # rolled back: 1, never 4 (not restored)
+    assert '"pane-keys"' in seen["policy_at_check"]  # B really had added the guard when the check failed
+    assert path.read_bytes() == before and a_loads(path)
+    assert (
+        settings_file(old).read_bytes(),
+        manifest_bytes(old),
+    ) == others  # N5: settings.json and the install record too
+    assert _history() == [("auto-rollback", __version__, __version__)]
+    out = capsys.readouterr().out
+    assert "back as they were before the upgrade" in out and "rolled back" in out
+
+
+def test_a_manual_rollback_puts_the_policy_back_when_it_is_still_the_one_the_upgrade_left(two_releases, capsys):
+    path, _ = two_releases
+    before = path.read_bytes()
+    assert cli.main(["upgrade"]) == 0
+    assert b'"pane-keys"' in path.read_bytes()
+    last = upgrade.history(os.environ)[-1]
+    assert last["verb"] == "promote" and Path(last["backup"], "index.json").is_file() and last["policy_sha"]
+    assert cli.main(["upgrade", "--rollback"]) == 0
+    assert path.read_bytes() == before and a_loads(path)
+
+
+def test_a_manual_rollback_keeps_what_the_person_edited_since_and_leaves_a_gate_that_loads(two_releases, capsys):
+    """B2: the policy was edited after the upgrade, so the copy can't go back; only the guard the upgrade added is taken
+    out, the edit stays, and the release going back loads the policy."""
+    path, _ = two_releases
+    assert cli.main(["upgrade"]) == 0
+    assert upgrade.history(os.environ)[-1]["added_guards"] == ["pane-keys"]
+    path.write_text(path.read_text(encoding="utf-8") + "# mine, written after the upgrade\n", encoding="utf-8")
+    capsys.readouterr()
+    assert cli.main(["upgrade", "--rollback"]) == 0
+    assert a_loads(path) and "# mine, written after the upgrade" in path.read_text(encoding="utf-8")
+    assert '"pane-keys"' not in path.read_text(encoding="utf-8")
+    assert "your edits stay" in capsys.readouterr().out
+
+
+def test_a_manual_rollback_that_cannot_take_the_guard_out_is_refused_before_anything_is_swapped(
+    two_releases, cutover, capsys
+):
+    path, _ = two_releases
+    assert cli.main(["upgrade"]) == 0
+    path.write_text(path.read_text(encoding="utf-8").replace("[guards]", "[ guards ]"), encoding="utf-8")  # valid TOML
+    edited = path.read_bytes()
+    cutover.clear()
+    capsys.readouterr()
+    assert cli.main(["upgrade", "--rollback"]) == upgrade.EXIT_REFUSED
+    assert cutover == [] and path.read_bytes() == edited  # the installer was never asked: B is still the whole state
+    assert "take pane-keys out of [guards] on" in capsys.readouterr().err
+    assert [d["verb"] for d in upgrade.history(os.environ)][-1] == "promote"
+
+
+def test_a_crash_between_the_installer_and_the_promote_still_names_the_way_back(two_releases, cutover, monkeypatch):
+    """B3: the process dies after B's hooks step ran. The history holds a swap-start line, `previous_release` is the
+    release that was left (not two back), and the rollback leaves a policy A loads."""
+
+    class Crash(BaseException):
+        pass
+
+    path, _ = two_releases
+    before = path.read_bytes()
+    real = upgrade._run
+
+    def die_after_b_hooks(argv, capture, timeout=None):
+        real(argv, capture, timeout)
+        raise Crash
+
+    monkeypatch.setattr(upgrade, "_run", die_after_b_hooks)
+    with pytest.raises(Crash):
+        cli.main(["upgrade"])
+    assert b"pane-keys" in path.read_bytes() and not a_loads(path)  # B's policy, and nothing promoted
+    assert _history() == [] and _marks() == ["swap-start"]
+    assert upgrade.previous_release(os.environ) == __version__
+    monkeypatch.setattr(upgrade, "_run", real)
+    assert cli.main(["upgrade", "--rollback"]) == 0
+    assert a_loads(path) and path.read_bytes() == before
+
+
+def test_a_crash_after_an_earlier_promote_does_not_send_the_rollback_two_releases_back(two_releases, monkeypatch):
+    upgrade.record(os.environ, "promote", "0.0.1", __version__)  # an older upgrade, A came from 0.0.1
+    real = upgrade._run
+
+    def die(argv, capture, timeout=None):
+        raise SystemExit(9)
+
+    monkeypatch.setattr(upgrade, "_run", die)
+    with pytest.raises(SystemExit):
+        cli.main(["upgrade"])
+    assert upgrade.previous_release(os.environ) == __version__  # the unfinished swap's `from`, not 0.0.1
+    monkeypatch.setattr(upgrade, "_run", real)
+
+
+def test_a_failed_installer_leaves_no_copy_and_closes_its_start_line(two_releases, cutover, monkeypatch):
+    monkeypatch.setattr(upgrade, "swap", lambda args, scratch: cutover.append(args.version) or upgrade.Ran(7))
+    root = paths.state_dir() / upgrade.BACKUPS_DIR
+    assert cli.main(["upgrade"]) == 7
+    assert _marks() == ["swap-start", "swap-abandoned"] and list(root.iterdir()) == []
+    assert upgrade.previous_release(os.environ) is None  # nothing was swapped: nothing to go back to
+
+
+def test_failed_tries_after_a_promote_do_not_push_out_the_copy_the_rollback_needs(two_releases, cutover, monkeypatch):
+    """B1: with the old code the newest five folders were kept, failed tries included, so enough of them deleted the
+    folder the last promote names and a rollback then restored B's policy to A."""
+    path, _ = two_releases
+    before = path.read_bytes()
+    monkeypatch.setattr(upgrade, "BACKUPS_KEPT", 2)
+    assert cli.main(["upgrade"]) == 0
+    promote = upgrade.history(os.environ)[-1]
+    inner = upgrade.swap
+    monkeypatch.setattr(upgrade, "swap", lambda args, scratch: cutover.append(args.version) or upgrade.Ran(7))
+    for _ in range(upgrade.BACKUPS_KEPT + 4):
+        assert cli.main(["upgrade"]) == 7
+    monkeypatch.setattr(upgrade, "swap", inner)
+    assert Path(promote["backup"]).is_dir()
+    assert cli.main(["upgrade", "--rollback"]) == 0
+    assert path.read_bytes() == before and a_loads(path)
+
+
+def test_older_unnamed_folders_go_but_a_promotes_and_an_unfinished_swaps_stay(old, monkeypatch):
+    monkeypatch.setattr(upgrade, "BACKUPS_KEPT", 2)
+    root = paths.state_dir() / upgrade.BACKUPS_DIR
+    for name in ("101", "102", "103", "104"):
+        (root / name).mkdir(parents=True)
+    (root / "not-a-number").mkdir()
+    upgrade.record(os.environ, "promote", "1.0.0", "2.0.0", backup=str(root / "101"))
+    kept = upgrade.held_now(os.environ).keep(os.environ)
+    assert kept is not None
+    assert sorted(p.name for p in root.iterdir() if p != kept) == ["101", "103", "104", "not-a-number"]  # 102 went
+    upgrade.record(os.environ, "swap-start", "2.0.0", None, backup=str(root / "103"))  # unfinished: its copy stays
+    assert upgrade.held_now(os.environ).keep(os.environ) is not None
+    assert upgrade.held_now(os.environ).keep(os.environ) is not None
+    assert (root / "103").is_dir() and (root / "101").is_dir()
+    assert not (root / "104").exists()  # the oldest of the unnamed ones, now past the newest two
+
+
+def test_a_second_apply_and_rollback_still_returns_the_policy_of_the_release_before(two_releases, capsys):
+    path, _ = two_releases
+    before = path.read_bytes()
+    for _ in range(2):  # upgrade, roll back, upgrade again, roll back again: each rollback names its own copy
+        assert cli.main(["upgrade"]) == 0
+        assert b"pane-keys" in path.read_bytes()
+        assert cli.main(["upgrade", "--rollback"]) == 0
+        assert path.read_bytes() == before and a_loads(path)
+
+
+def test_a_failed_rollback_can_be_retried_and_still_returns_the_old_policy(two_releases, cutover, monkeypatch, capsys):
+    path, _ = two_releases
+    before = path.read_bytes()
+    assert cli.main(["upgrade"]) == 0
+    inner = upgrade.swap
+    monkeypatch.setattr(upgrade, "swap", lambda args, scratch: cutover.append(args.version) or upgrade.Ran(7))
+    assert cli.main(["upgrade", "--rollback"]) != 0  # the installer failed: nothing was put back
+    assert b"pane-keys" in path.read_bytes()
+    assert upgrade.previous_release(os.environ) == __version__
+    monkeypatch.setattr(upgrade, "swap", inner)
+    assert cli.main(["upgrade", "--rollback"]) == 0
+    assert path.read_bytes() == before and a_loads(path)
+
+
+def test_a_failed_arm_after_a_failed_check_rolls_back_and_a_later_promote_still_rolls_back_clean(
+    two_releases, cutover, capsys
+):
+    """The check fails (rolled back, the old policy returns), then the next try passes and its rollback is clean too."""
+    path, _ = two_releases
+    before = path.read_bytes()
+    assert cli.main(["upgrade", "--check", "healthprobe"]) == 1
+    assert path.read_bytes() == before
+    assert cli.main(["upgrade"]) == 0
+    assert cli.main(["upgrade", "--rollback"]) == 0
+    assert path.read_bytes() == before and a_loads(path)
+
+
+def promoted_with_backup(two_releases):
+    path, _ = two_releases
+    assert cli.main(["upgrade"]) == 0
+    return path, Path(upgrade.history(os.environ)[-1]["backup"])
+
+
+def test_a_missing_copy_is_said_loudly_and_only_the_added_guard_comes_out(two_releases, capsys):
+    path, folder = promoted_with_backup(two_releases)
+    import shutil
+
+    shutil.rmtree(folder)
+    capsys.readouterr()
+    assert cli.main(["upgrade", "--rollback"]) == 0
+    out = capsys.readouterr().out
+    assert "WARNING" in out and "missing" in out and a_loads(path)
+
+
+def test_a_copy_that_is_not_the_one_recorded_is_not_used(two_releases, capsys):
+    path, folder = promoted_with_backup(two_releases)
+    for copy in folder.iterdir():
+        if copy.name != "index.json":
+            copy.write_text('[guards]\non = ["syntax-check", "something-else"]\n', encoding="utf-8")
+    capsys.readouterr()
+    assert cli.main(["upgrade", "--rollback"]) == 0
+    assert "WARNING" in capsys.readouterr().out
+    assert a_loads(path) and "something-else" not in path.read_text(encoding="utf-8")
+
+
+def test_a_history_line_that_names_a_folder_outside_the_backups_is_not_trusted(two_releases, tmp_path, capsys):
+    """N4: a folder elsewhere, or one under the backups with a name that is not a number, is never read from, even when
+    its copy has the right hash."""
+    import shutil
+
+    path, folder = promoted_with_backup(two_releases)
+    for elsewhere in (tmp_path / "elsewhere", folder.parent / "not-a-number"):
+        shutil.copytree(folder, elsewhere)
+        lines = upgrade.history_path(os.environ).read_text(encoding="utf-8").splitlines()
+        lines[-1] = lines[-1].replace(str(folder), str(elsewhere))
+        upgrade.history_path(os.environ).write_text("\n".join(lines) + "\n", encoding="utf-8")
+        assert upgrade._backup_dir(os.environ, str(elsewhere)) is None
+        folder = elsewhere
+    capsys.readouterr()
+    assert cli.main(["upgrade", "--rollback"]) == 0
+    assert "WARNING" in capsys.readouterr().out and a_loads(path)
+
+
+def test_the_copy_of_a_file_is_read_only_by_a_numeric_name_and_its_recorded_hash(tmp_path):
+    import hashlib
+
+    f = tmp_path / "policy.toml"
+    folder = tmp_path / "1"
+    folder.mkdir()
+    (folder / "0").write_bytes(b"x = 1\n")
+    (folder / "evil").write_bytes(b"x = 2\n")
+    sha = hashlib.sha256(b"x = 1\n").hexdigest()
+    (folder / "index.json").write_text(json.dumps({str(f): "0"}), encoding="utf-8")
+    assert upgrade._Held.from_backup(folder, f, sha).files == {f: b"x = 1\n"}
+    assert upgrade._Held.from_backup(folder, f, "0" * 64) is None and upgrade._Held.from_backup(folder, f, None) is None
+    (folder / "index.json").write_text(json.dumps({str(f): "evil"}), encoding="utf-8")
+    assert upgrade._Held.from_backup(folder, f, hashlib.sha256(b"x = 2\n").hexdigest()) is None

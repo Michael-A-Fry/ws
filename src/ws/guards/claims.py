@@ -792,7 +792,7 @@ def judge(call, cfg: Config, ctx) -> Finding | None:
 LATE_ADVICE = (
     "The gate denies a claim it can't check. Send it again once `git status` answers here, or without the claim."
 )
-# the word after "on", "in", "into" or "to" in a claim phrase, when the default branch isn't known
+# the word after "on", "into" or "to" in a claim phrase, when the default branch isn't known
 _BRANCH_AFTER = re.compile(r"\b(?:on|into|to)\s+(?:the\s+)?(?:origin/)?([\w][\w./-]*)", re.IGNORECASE)
 _NOT_A_BRANCH = frozenset(
     {"a", "an", "the", "my", "your", "our", "his", "her", "their", "this", "that", "it", "me", "you"}
@@ -802,7 +802,7 @@ MAX_GUESSES = 6
 
 def blind_claims(text: str, cfg: Config) -> list[tuple[str, str]]:
     """The claims in `text` when git ran out of time before it could name the default branch: the claim phrases for each
-    word that follows `on`, `in`, `into` or `to` (the first few), unless the policy names its own `words`. Used only to decide
+    word that follows `on`, `into` or `to` (the first few), unless the policy names its own `words`. Used only to decide
     that something is a claim that can't be checked, never to say it is true or false."""
     if cfg.words:
         return []

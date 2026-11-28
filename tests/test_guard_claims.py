@@ -702,10 +702,13 @@ def test_a_repo_whose_default_is_trunk_does_not_claim_about_main(home):
 @needs_git
 def test_with_no_origin_head_the_local_default_branch_is_used(home):
     d, on, off = default_repo(home, "t", "trunk", configured="trunk")
-    assert cl.default_target(str(d), cl.Budget()) == cl.Target("trunk", "trunk")
-    assert judge(f"pushed {on} to trunk", d) is None
-    denied = judge(f"pushed {off} to trunk", d)
+    assert cl.default_target(str(d), cl.Budget(), local=True) == cl.Target("trunk", "trunk")
+    mine = cl.config({"local_repos": [str(d)]}, "w")  # C820: the local branch is the record only for a named repository
+    assert judge(f"pushed {on} to trunk", d, mine) is None
+    denied = judge(f"pushed {off} to trunk", d, mine)
     assert denied.action == "deny" and "isn't on trunk here" in denied.reason
+    unnamed = judge(f"pushed {on} to trunk", d)  # not named: removing the origin must not make the local branch vouch
+    assert unnamed.action == "deny" and "can't be checked" in unnamed.reason
 
 
 @needs_git
@@ -719,9 +722,10 @@ def test_with_no_origin_head_the_remote_tracking_branch_is_used_when_it_exists(h
 @needs_git
 def test_with_nothing_to_go_on_the_default_branch_is_main(home):
     d, on, off = default_repo(home, "m", "main")
-    assert cl.default_target(str(d), cl.Budget()) == cl.Target("main", "main")
-    assert judge(f"merged {on} into main", d) is None
-    assert judge(f"merged {off} into main", d).action == "deny"
+    mine = cl.config({"local_repos": [str(d)]}, "w")
+    assert cl.default_target(str(d), cl.Budget(), local=True) == cl.Target("main", "main")
+    assert judge(f"merged {on} into main", d, mine) is None
+    assert judge(f"merged {off} into main", d, mine).action == "deny"
 
 
 @needs_git
@@ -774,7 +778,8 @@ def test_the_stop_log_names_the_ref_it_checked(home):
 def test_a_folder_that_is_not_a_repository_falls_back_to_main(home):
     d = home / "plain"
     d.mkdir()
-    assert cl.default_target(str(d), cl.Budget()) == cl.Target("main", "main")
+    assert cl.default_target(str(d), cl.Budget(), local=True) == cl.Target("main", "main")
+    assert cl.default_target(str(d), cl.Budget()) == cl.Target("origin/main", "main")  # C820: local only when named
     assert cl.default_target("", cl.Budget()) == cl.Target("origin/main", "main")
     assert cl.default_target(str(home / "nowhere"), cl.Budget()) == cl.Target("origin/main", "main")
 
@@ -788,7 +793,7 @@ def test_a_default_branch_that_git_prints_oddly_is_not_trusted(home, monkeypatch
         return subprocess.CompletedProcess(argv, 0 if out else 1, out, b"")
 
     monkeypatch.setattr(cl.subprocess, "run", run)
-    assert cl.default_target(str(d), cl.Budget()) == cl.Target("main", "main")
+    assert cl.default_target(str(d), cl.Budget(), local=True) == cl.Target("main", "main")
 
 
 def test_git_time_spent_finding_the_default_branch_comes_out_of_the_same_budget(home, monkeypatch):
@@ -931,3 +936,72 @@ def test_a_short_sha_next_to_a_claim_word_it_does_not_belong_to_is_allowed(repo)
 )
 def test_live_in_plain_prose_is_not_a_release_claim(text, expect):
     assert cl.release_claims(text, cl.DEFAULT_TAGS) == expect
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "abc1234 on main",
+        "abc1234 on main: done",
+        "abc1234 is on main",
+        "abc1234 on main after review",  # past-tense claims that a skip list of after/first/before/once let through
+        "abc1234 on main first",
+        "abc1234 on main after the rebase",
+        "abc1234 on main before lunch",
+        "abc1234 on main once the tests ran",
+        "abc1234 on main later",  # DEC-202: no skip words; the sender rewords instead
+        "abc1234 was on main soon after review",
+    ],
+)
+def test_c820_a_sha_then_on_main_without_trailing_plan_words_is_still_a_claim(text):
+    assert cl.find_claims(text, W) != []
+
+
+# --- C862: phrasings that said the same as "merged into main" and went unchecked (cold review of PR 335) ----------------
+
+C862_PHRASES = [
+    "shipped {sha} to main",
+    "its in main: {sha}",
+    "it's in main: {sha}",
+    "main has {sha}",
+    "{sha} landed on main",
+    "{sha} has landed in main",
+    "{sha} is merged and on main",
+    "{sha} is in main",
+    "{sha} shipped to main",
+]
+
+
+@needs_git
+@pytest.mark.parametrize("phrase", C862_PHRASES)
+def test_c862_each_phrasing_is_denied_for_a_commit_not_on_main_and_passes_for_one_on_it(repo, phrase):
+    d, on, off = repo
+    denied = judge(phrase.format(sha=off), d)
+    assert denied is not None and denied.action == "deny" and off in denied.reason
+    assert judge(phrase.format(sha=on), d) is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "it is not in main yet: abc1234",
+        "abc1234 will be shipped to main after review",
+        "main has a bug, see abc1234",
+        "once abc1234 has landed on main we tell him",
+    ],
+)
+def test_c862_the_wider_phrases_keep_the_negation_future_and_plain_wording_rules(text):
+    assert cl.find_claims(text, cl.claim_words("main")) == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "abc1234 is in main, right?",  # a claim with a question tacked on (DEC-202: no question rule)
+        "abc1234 is in main??",
+        "Yes: abc1234 is in main",
+        "is abc1234 in main? it landed on main",
+    ],
+)
+def test_c862_a_claim_with_a_question_mark_or_a_yes_is_still_a_claim(text):
+    assert cl.find_claims(text, cl.claim_words("main")) != []

@@ -26,6 +26,11 @@ def argv() -> list[str]:
 _TEMP_ROOTS = ("/tmp", "/var/tmp", "/private/tmp", "/private/var/folders", "/dev/shm")
 
 
+def argv_for(python: str) -> list[str]:
+    """The same isolated prefix for another ws's Python (an upgrade's new install)."""
+    return [python, "-I", "-m", "ws"]
+
+
 def tree() -> Path | None:
     """The environment folder this Python lives in (a pipx, uv tool or venv folder), or None for a system Python. The
     gate hook runs code from here, so a gated session must not edit it."""

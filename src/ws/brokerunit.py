@@ -79,7 +79,7 @@ def refresh(python: str, run: Runner | None = None) -> bool:
     """On an upgrade: point ExecStart at the ws now installed (`python -I -m ws`) and reload, when it changed. True
     when the file is current afterwards."""
     path = unit_path()
-    text = render(socket_of(), [python, "-I", "-m", "ws"])
+    text = render(socket_of(), selfcmd.argv_for(python))
     try:
         if path.is_file() and path.read_text(encoding="utf-8") == text:
             return True

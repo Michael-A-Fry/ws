@@ -153,3 +153,38 @@ def test_the_six_repo_cap_counts_after_the_sessions_own_repo_and_repeats(two):
 def test_repos_must_be_absolute_paths():
     with pytest.raises(Exception, match="repos"):
         cl.config({"repos": ["relative/dir"]}, "w")
+
+
+# --- C820 (cold review of PR 335): a listed repository kept local by choice ---------------------------------------------
+
+
+@needs_git
+def test_c820_a_listed_repo_with_no_remote_vouches_for_its_own_default_branch(two):
+    """house has no remote by choice: a commit on its own main passes, one only on a work branch is refused."""
+    here, other, theirs = two
+    assert judge(f"merged {theirs} into main", here, listed(other)) is None
+    git(other, "checkout", "-q", "-b", "work")
+    (other / "f").write_text("later")
+    git(other, "add", "f")
+    git(other, "commit", "-q", "-m", "later")
+    later = git(other, "rev-parse", "HEAD")[:10]
+    if not readable(later):
+        pytest.skip("this id isn't one the guard reads as a commit")
+    assert judge(f"merged {later} into main", here, listed(other)).action == "deny"
+
+
+@needs_git
+def test_c820_a_remote_renamed_or_removed_does_not_let_a_work_branch_commit_pass(two):
+    here, other, _ = two
+    with_real_remote(other)
+    git(other, "checkout", "-q", "-b", "work")
+    (other / "f").write_text("later")
+    git(other, "add", "f")
+    git(other, "commit", "-q", "-m", "later")
+    later = git(other, "rev-parse", "HEAD")[:10]
+    if not readable(later):
+        pytest.skip("this id isn't one the guard reads as a commit")
+    git(other, "remote", "rename", "origin", "up")
+    assert judge(f"merged {later} into main", here, listed(other)).action == "deny"
+    git(other, "remote", "remove", "up")
+    assert judge(f"merged {later} into main", here, listed(other)).action == "deny"

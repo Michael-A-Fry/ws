@@ -162,7 +162,7 @@ SCHEMA: dict = {
             "type": ["string", "null"],
             "description": (
                 "Where cost_usd came from: list (an estimate at list price), runner (the runner's own figure), "
-                "mixed, or unpriced (tokens were counted but no price was known, so cost is null)."
+                "mixed, unpriced (tokens were counted but no price was known, so cost is null), or local (a model on a local server: no money, cost 0)."
             ),
         },
         "num_turns": {"type": ["integer", "null"], "minimum": 0, "description": "Model turns in the run."},

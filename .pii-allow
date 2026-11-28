@@ -19,3 +19,4 @@
 ^        "systemctl --user start ws-upgrade@x\.service",$
 ^        "systemctl --user start foo@bar\.service",$
 ^.*/user\.slice/user-1000\.slice/user@1000\.service/app\.slice/.*$
+^pii-allow: the service's cgroup path in the tests \(user@1000\.service is a unit, not an e-mail\)$

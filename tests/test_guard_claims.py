@@ -955,3 +955,40 @@ def test_live_in_plain_prose_is_not_a_release_claim(text, expect):
 )
 def test_c820_a_sha_then_on_main_without_trailing_plan_words_is_still_a_claim(text):
     assert cl.find_claims(text, W) != []
+
+
+# --- C862: phrasings that said the same as "merged into main" and went unchecked (cold review of PR 335) ----------------
+
+C862_PHRASES = [
+    "shipped {sha} to main",
+    "its in main: {sha}",
+    "it's in main: {sha}",
+    "main has {sha}",
+    "{sha} landed on main",
+    "{sha} has landed in main",
+    "{sha} is merged and on main",
+    "{sha} is in main",
+    "{sha} shipped to main",
+]
+
+
+@needs_git
+@pytest.mark.parametrize("phrase", C862_PHRASES)
+def test_c862_each_phrasing_is_denied_for_a_commit_not_on_main_and_passes_for_one_on_it(repo, phrase):
+    d, on, off = repo
+    denied = judge(phrase.format(sha=off), d)
+    assert denied is not None and denied.action == "deny" and off in denied.reason
+    assert judge(phrase.format(sha=on), d) is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "it is not in main yet: abc1234",
+        "abc1234 will be shipped to main after review",
+        "main has a bug, see abc1234",
+        "once abc1234 has landed on main we tell him",
+    ],
+)
+def test_c862_the_wider_phrases_keep_the_negation_future_and_plain_wording_rules(text):
+    assert cl.find_claims(text, cl.claim_words("main")) == []

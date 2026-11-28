@@ -31,17 +31,25 @@ Runners: `claude-code` runs `claude --name LABEL [--remote-control=LABEL] [--mod
 `opencode [--model=M] --prompt PROMPT` (no name flags).
 The code root's `~` means your home only when it is `~` alone or starts `~/`.
 Every tmux command goes through `ws.term.tmux`'s injectable runner, so tests never touch a real tmux server.
+- The lead stays reachable (C840). Before a window opens, dispatch asks ws-next, which tells the lead by its process
+  ancestry and never by a flag: `wsn usage lead-name WINDOW` exits 1 for a lead-like name from a caller that is not
+  the lead (the lead pointer follows such windows), and `wsn usage gate` exits 75 when the weekly plan is in the
+  reserve kept for the lead. Either refuses. No `wsn`, a timeout or any other exit lets the dispatch go, with a line
+  on stderr and in ~/.local/state/ws-lead/dispatch.log: both are guards for the lead, so they fail open.
 Exit codes: 0 started (or shown), 1 something to fix (no repo folder, no runner, no tmux, tmux refused), 2 usage.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import re
 import shutil
+import subprocess
 import sys
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 
 from ws import output, paths, policy
@@ -173,8 +181,58 @@ def start(p: dict, run: tmux.Run = tmux.run_tmux) -> str:
     return out.strip()
 
 
+WSN = "wsn"
+RESERVE_HELD = 75
+GATE_TIMEOUT_S = 30
+FAIL_OPEN_LOG = Path("~/.local/state/ws-lead/dispatch.log")  # every check that could not be made, dated
+
+
+def _not_checked(what: str, why: str) -> None:
+    line = f"ws dispatch: {what} not checked ({why})"
+    print(line, file=sys.stderr)
+    with contextlib.suppress(OSError):
+        log = FAIL_OPEN_LOG.expanduser()
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with log.open("a", encoding="utf-8") as f:
+            f.write(f"{datetime.now(UTC).isoformat(timespec='seconds')} {line}\n")
+
+
+def _wsn(what: str, args: list[str], run) -> subprocess.CompletedProcess | None:
+    """One ws-next check, or None when it could not be made (said on stderr and logged): the caller fails open."""
+    if not shutil.which(WSN):
+        _not_checked(what, "wsn is not on PATH")
+        return None
+    try:
+        return run([WSN, *args], capture_output=True, text=True, timeout=GATE_TIMEOUT_S)
+    except (OSError, subprocess.SubprocessError) as e:
+        _not_checked(what, type(e).__name__)
+        return None
+
+
+def lead_guard(window: str, run=subprocess.run) -> None:
+    """C840. Two checks ws-next owns, both told by process ancestry (never a flag): a window named like a lead
+    (`lead-<digits><mon>`, which the lead pointer follows) is started only by the lead; and when the weekly plan is in
+    the reserve kept for the lead, only the lead starts a session. A check that cannot be made fails open."""
+    r = _wsn("lead name", ["usage", "lead-name", window], run)
+    if r is not None and r.returncode == 1:
+        raise WsError("lead_name", f"{window!r} is named like a lead window, and only the lead may start one",
+                      "give the window another --name", 1)  # fmt: skip
+    if r is not None and r.returncode != 0:
+        _not_checked("lead name", f"wsn usage lead-name exited {r.returncode}")
+    r = _wsn("usage reserve", ["usage", "gate"], run)
+    if r is None:
+        return
+    if r.returncode == RESERVE_HELD:
+        why = (r.stderr or "").strip().splitlines()[-1:] or ["the weekly plan is in the reserve kept for the lead"]
+        raise WsError("usage_reserve", why[0], "wait for the reset, or ask the lead to start it", 1)
+    if r.returncode != 0:
+        _not_checked("usage reserve", f"wsn usage gate exited {r.returncode}")
+
+
 def cmd_dispatch(args: argparse.Namespace) -> int:
     p = plan(args)
+    if not args.dry_run:
+        lead_guard(p["window"])
     if p["remote_control_off"]:
         print(f"ws dispatch: remote control left off ({p['remote_control_off']})", file=sys.stderr)
     if not args.dry_run:

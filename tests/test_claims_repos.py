@@ -53,6 +53,10 @@ def two(tmp_path, monkeypatch):
     return here, other, theirs
 
 
+def local(other):
+    return cl.config({"local_repos": [str(other)]}, "w")
+
+
 def listed(other):
     return cl.config({"repos": [str(other)]}, "w")
 
@@ -92,8 +96,8 @@ def test_a_clone_vouches_for_nothing(two, tmp_path):
 
 
 @needs_git
-def test_a_repo_with_no_remote_vouches_for_nothing(two):
-    """A scratch repo whose local `main` holds the commit (or a hand-made remote-tracking ref) is not a record."""
+def test_a_repo_with_a_hand_made_remote_ref_vouches_for_nothing(two):
+    """A scratch repo whose local `main` holds the commit and a hand-made remote-tracking ref is not a record."""
     here, other, theirs = two
     git(other, "update-ref", "refs/remotes/origin/main", "HEAD")  # a ref with no remote behind it
     assert judge(f"merged {theirs} into main", here, listed(other)).action == "deny"
@@ -162,7 +166,8 @@ def test_repos_must_be_absolute_paths():
 def test_c820_a_listed_repo_with_no_remote_vouches_for_its_own_default_branch(two):
     """house has no remote by choice: a commit on its own main passes, one only on a work branch is refused."""
     here, other, theirs = two
-    assert judge(f"merged {theirs} into main", here, listed(other)) is None
+    assert judge(f"merged {theirs} into main", here, local(other)) is None
+    assert judge(f"merged {theirs} into main", here, listed(other)).action == "deny"  # not named in local_repos: never
     git(other, "checkout", "-q", "-b", "work")
     (other / "f").write_text("later")
     git(other, "add", "f")
@@ -170,7 +175,7 @@ def test_c820_a_listed_repo_with_no_remote_vouches_for_its_own_default_branch(tw
     later = git(other, "rev-parse", "HEAD")[:10]
     if not readable(later):
         pytest.skip("this id isn't one the guard reads as a commit")
-    assert judge(f"merged {later} into main", here, listed(other)).action == "deny"
+    assert judge(f"merged {later} into main", here, local(other)).action == "deny"
 
 
 @needs_git
@@ -188,3 +193,18 @@ def test_c820_a_remote_renamed_or_removed_does_not_let_a_work_branch_commit_pass
     assert judge(f"merged {later} into main", here, listed(other)).action == "deny"
     git(other, "remote", "remove", "up")
     assert judge(f"merged {later} into main", here, listed(other)).action == "deny"
+
+
+@needs_git
+def test_c820_removing_a_hosted_repos_remote_does_not_make_its_unpushed_main_vouch(two):
+    """Second review: an unpushed local default-branch commit, then `git remote remove`, must be denied."""
+    here, other, _ = two
+    with_real_remote(other)
+    (other / "f").write_text("unpushed")
+    git(other, "add", "f")
+    git(other, "commit", "-q", "-m", "unpushed")
+    unpushed = git(other, "rev-parse", "HEAD")[:10]
+    if not readable(unpushed):
+        pytest.skip("this id isn't one the guard reads as a commit")
+    git(other, "remote", "remove", "origin")
+    assert judge(f"merged {unpushed} into main", here, listed(other)).action == "deny"

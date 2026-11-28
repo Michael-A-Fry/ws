@@ -18,9 +18,9 @@ A commit that isn't on REF in the session's repository is looked for in the poli
 denied (never in a folder the message names: anyone who can write a message can make a folder that vouches for a
 commit). A listed repository vouches only when its `origin` is a URL (not a folder on this machine), its
 `refs/remotes/origin/HEAD` names the branch the message claims, and the commit is an ancestor of that remote-tracking
-branch. A listed repository with no remote and no remote-tracking ref (kept local by choice; C820) vouches when the commit
-is an ancestor of its own default branch. A clone of a clone, one with a hand-made remote-tracking ref, one that has only
-a local branch while having a remote, and one whose default branch has another name never vouch, and neither does one
+branch. A repository named in `local_repos` (kept local by choice; C820) with no remote and no remote-tracking ref vouches when
+the commit is an ancestor of its own default branch; one with no remote that isn't named there never does, since a
+removed remote deletes its refs. A clone of a clone, one with a hand-made remote-tracking ref, and one whose default branch has another name never vouch, and neither does one
 git can't answer for in time. A commit none has still denies the message.
 
 Not a claim: a claim word in quotes or backticks, one with a negation or a future form in the four words before it
@@ -188,10 +188,11 @@ class Config:
     repos: tuple[
         str, ...
     ] = ()  # other repositories a claim may be about, besides the session's and those named in the text
+    local_repos: tuple[str, ...] = ()  # repositories kept local by choice (no remote): their own default branch vouches
 
 
 def config(table: dict, where: str) -> Config:
-    known_keys(table, where, ("words", "ref", "release_dir", "release_tags", "repos"))
+    known_keys(table, where, ("words", "ref", "release_dir", "release_tags", "repos", "local_repos"))
     words = text_list(table, "words", where)
     if "words" in table and not words:
         raise PolicyError(f"{where}: words must name at least one claim word")
@@ -202,7 +203,11 @@ def config(table: dict, where: str) -> Config:
     for r in repos:
         if not (r.startswith(("/", "~/")) or r == "~") or "\n" in r or "\0" in r:
             raise PolicyError(f"{where}: repos must be absolute paths or start with ~/")
-    return Config(words, ref, _release_dir(table, where), _release_tags(table, where), repos)
+    local_repos = text_list(table, "local_repos", where)
+    for r in local_repos:
+        if not (r.startswith(("/", "~/")) or r == "~") or "\n" in r or "\0" in r:
+            raise PolicyError(f"{where}: local_repos must be absolute paths or start with ~/")
+    return Config(words, ref, _release_dir(table, where), _release_tags(table, where), repos, local_repos)
 
 
 def _ref_ok(ref: object) -> bool:
@@ -331,7 +336,7 @@ def _names_other_branch(sentence: str, ref: str, branch: str = FALLBACK_BRANCH) 
     return any(n.rstrip(".").lower() not in own for n in named)
 
 
-_LATER = re.compile(r"\s+(?:later|before|after|tomorrow|soon|next|first|once)\b", re.IGNORECASE)
+_LATER = re.compile(r"\s+(?:later|tomorrow|soon)\b", re.IGNORECASE)
 
 
 def _claim_spans(sentence: str, words: tuple[str, ...]) -> list[tuple[str, int, int]]:
@@ -357,7 +362,7 @@ def _claim_spans(sentence: str, words: tuple[str, ...]) -> list[tuple[str, int, 
             if any(w in _NEGATION | _FUTURE or w.endswith(("n't", "'ll")) for w in previous):
                 continue  # "not merged", "isn't pushed", "will be merged", "it'll be on main"
             if word.lower().startswith("on ") and _LATER.match(after):
-                continue  # C820: `abc1234 on main later`, `... on main before lunch` is a plan, not a claim
+                continue  # C820: `abc1234 on main later`, `... on main tomorrow` is a plan, not a claim
             written = " ".join(m.groups())  # as written, without a commit or a plain word inside it
             found.append((written, m.start(), m.end()))
     return sorted(found, key=lambda f: f[1])
@@ -544,14 +549,14 @@ _LOCAL_URL = ("/", ".", "~", "file:")
 
 
 def other_repos(cfg: Config, cwd: str, budget: Budget) -> list[str]:
-    """The top folders of the policy's `repos`, without the session's own repository and each once, at most six. Only the
+    """The top folders of the policy's `repos` and `local_repos`, without the session's own repository and each once, at most six. Only the
     policy names a repository here: a path in a message never does, because anyone who can write the message can make a
     folder of their own that vouches for a commit. A folder that isn't a repository, or that git can't answer for in
     time, is left out."""
     home = os.path.expanduser("~")
     seen = {_top(cwd, budget)} if cwd else set()
     found: list[str] = []
-    for raw in cfg.repos:
+    for raw in (*cfg.repos, *cfg.local_repos):
         if budget.left() <= 0 or len(found) >= MAX_OTHER_REPOS:
             break
         top = _top(raw.replace("~", home, 1) if raw.startswith("~") else raw, budget)
@@ -593,13 +598,17 @@ def _local_only(repo: str, budget: Budget) -> bool:
 def elsewhere(result, sha: str, ref: str, cfg: Config, cwd: str, budget: Budget):
     """`result` (what `on_ref` said for the session's repository), unless a repository in the policy's `repos` has the
     commit on the branch the message claims. That repository's own default branch (from its `origin`, a URL) has to be
-    the claimed one, and its remote-tracking ref has to exist: a repository with no remote, one whose `origin` is a
-    folder here, or one whose default branch is another one never vouches. The reason `result` gave stays when none does."""
+    the claimed one, and its remote-tracking ref has to exist: one whose `origin` is a folder here, or one whose default
+    branch is another one never vouches. The one exception is a repository the policy names in `local_repos` (kept local by
+    choice, C820) that still has no remote and no remote-tracking ref: its own default branch vouches. A repository with no
+    remote that the policy doesn't name there never does, so removing a remote can't make a local branch count. The reason
+    `result` gave stays when none does."""
     if result is True or budget.spent():
         return result
     claimed = ref.removeprefix(f"{REMOTE}/")
+    local_tops = {_top(os.path.expanduser(r), budget) for r in cfg.local_repos}
     for repo in other_repos(cfg, cwd, budget):
-        if _local_only(repo, budget):  # C820: a repository kept local by choice: its own default branch is the record
+        if repo in local_tops and _local_only(repo, budget):  # C820: a repository kept local by choice: its own default branch is the record
             local = default_target(repo, budget)
             if local.branch == claimed and on_ref(repo, sha, local.ref, budget) is True:
                 return True

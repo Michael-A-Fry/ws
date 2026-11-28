@@ -933,12 +933,24 @@ def test_live_in_plain_prose_is_not_a_release_claim(text, expect):
     assert cl.release_claims(text, cl.DEFAULT_TAGS) == expect
 
 
-@pytest.mark.parametrize("text", ["abc1234 on main later", "the fix abc1234 on main before lunch"])
+@pytest.mark.parametrize("text", ["abc1234 on main later", "the fix abc1234 on main tomorrow", "abc1234 on main soon"])
 def test_c820_a_plan_with_a_sha_before_on_main_is_not_a_claim(text):
     """These two are claims on the code before C820."""
     assert cl.find_claims(text, W) == []
 
 
-@pytest.mark.parametrize("text", ["abc1234 on main", "abc1234 on main: done", "abc1234 is on main"])
+@pytest.mark.parametrize(
+    "text",
+    [
+        "abc1234 on main",
+        "abc1234 on main: done",
+        "abc1234 is on main",
+        "abc1234 on main after review",  # past-tense claims that a skip list of after/first/before/once let through
+        "abc1234 on main first",
+        "abc1234 on main after the rebase",
+        "abc1234 on main before lunch",
+        "abc1234 on main once the tests ran",
+    ],
+)
 def test_c820_a_sha_then_on_main_without_trailing_plan_words_is_still_a_claim(text):
     assert cl.find_claims(text, W) != []

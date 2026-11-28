@@ -167,7 +167,7 @@ ref = "origin/trunk"                       # optional
 release_dir = "~/releases"                 # optional: release claims are off without it
 release_tags = ["v[0-9]+[.][0-9]+([.][0-9]+)*"]   # optional: the shapes of a release name
 repos = ["~/code/other-repo"]              # optional: other repositories whose default branch can vouch for a commit
-local_repos = ["~/code/kept-local"]        # optional: repositories kept local by choice (no remote): their own default branch vouches
+local_repos = ["~/code/kept-local"]        # optional: no-remote repositories whose own default branch vouches
 require_evidence = true                    # optional, default false: a verb-and-branch claim must name a commit
 ```
 

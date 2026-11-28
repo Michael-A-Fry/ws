@@ -38,5 +38,6 @@ decisions weren't about the engine.
 | [0032](0032-lead-only-reaches-a-walled-class-and-cards-cross-the-account-wall.md) | Lead-only lets the lead into a walled class, and fixed-kind cards cross the account wall by a spool | accepted | 2026-11-21 |
 | [0033](0033-a-setup-step-is-data-walked-by-one-engine.md) | A setup step only a person can do is data, walked by one engine | accepted | 2026-11-21 |
 | [0034](0034-a-mailbox-is-connected-from-a-page-and-ws-may-append-its-registry-entry.md) | A mailbox is connected from a page, and ws may append its registry entry for a known provider | accepted | 2026-11-22 |
+| [0035](0035-an-upgrade-can-run-itself-from-a-service-that-proves-the-release.md) | An upgrade can run itself from a service that proves the release, checks it and rolls back by itself | accepted | 2026-11-23 |
 
 To add one, copy the newest record, take the next number and add a row here.

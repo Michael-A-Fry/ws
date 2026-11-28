@@ -81,6 +81,7 @@ run without a terminal on stdin is refused too (a session's shell has none), as 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -115,6 +116,7 @@ from ws import (
     selfcmd,
     upgradecheck,
     upgradeproof,
+    upgradeunit,
     userconfig,
 )
 from ws import version as wsversion
@@ -131,6 +133,7 @@ BROKER_STOP_S = 10.0  # how long a stopped broker has to close its socket
 BROKER_START_S = 30.0  # how long the new broker has to answer
 DEFAULT_GUARDS = (
     "pane-keys",
+    "upgrade-service",
 )  # guards added to a policy's `[guards] on` list by the rewrite, once, when it is missing
 STEP_ENV = "WS_UPGRADE_STEP"  # set for each step the upgrade runs: a hooks rewrite there leaves the log line to it
 INSTALL_TIMEOUT_S, STEP_TIMEOUT_S = 600.0, 120.0  # the watchdog per step: the installer, then the hooks and the check
@@ -152,6 +155,8 @@ MIRROR_VARS = (
     "PIP_EXTRA_INDEX_URL",
     "PIP_FIND_LINKS",
 )
+LOCK_FILE = "upgrade.lock"  # in ws's own state folder: one flock shared by every way of changing the installed ws
+LOCK_WAIT_HAND_S, LOCK_WAIT_UNATTENDED_S = 30.0, 300.0  # how long a hand-run upgrade and the service wait for it
 DEFAULT_REPO = "Michael-A-Fry/ws"  # where releases come from when the installed wheel carries no trust root
 _DOWNLOAD_LIMIT = 1 << 20  # bytes: install.sh is about 40 KB
 
@@ -1388,6 +1393,50 @@ def _rollback(args: argparse.Namespace, env: Mapping[str, str]) -> int:
 # ---- unattended: the service's own upgrade ----------------------------------------------------------------------------------
 
 
+class Locked(WsError):
+    """Another upgrade or rollback holds the lock."""
+
+
+@contextlib.contextmanager
+def upgrade_lock(env: Mapping[str, str], wait_s: float):
+    """One lock for everything that changes the installed ws: the upgrade service and a hand-run upgrade, rollback or
+    hooks rewrite (N17). An exclusive `flock` on `<state>/upgrade.lock`: the kernel drops it when the holder
+    dies, however it dies, so a crash never leaves it held. A second one polls for up to `wait_s` seconds (0 means try
+    once) and then raises `Locked`; it never waits for ever. The descriptor isn't inherited, so no child (the installer, a
+    broker it starts) keeps the lock past its holder. Where `fcntl` is missing (native Windows) there is no lock."""
+    try:
+        import fcntl
+    except ImportError:
+        yield
+        return
+    path = paths.state_dir(dict(env)) / LOCK_FILE
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as e:
+        raise WsError(
+            "failed", f"can't open the upgrade lock {path} ({e})", "check that ws's state folder is writable"
+        ) from e
+    try:
+        deadline = time.monotonic() + wait_s
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except (BlockingIOError, PermissionError):
+                if time.monotonic() >= deadline:
+                    raise Locked(
+                        "conflict",
+                        "another ws upgrade or rollback is running (it holds the upgrade lock)",
+                        "wait for it to finish, then run this again",
+                        EXIT_REFUSED,
+                    ) from None
+                time.sleep(0.05)
+        yield
+    finally:
+        os.close(fd)
+
+
 def _parent_comm(pid: int) -> str | None:
     try:
         return Path(f"/proc/{pid}/comm").read_text(encoding="utf-8").strip()
@@ -1472,6 +1521,17 @@ def cmd_unattended(args: argparse.Namespace, env: Mapping[str, str], source=None
         raise WsError("refused", why, "it is started by `ws-upgrade.service`, not by hand", EXIT_REFUSED)
     args.log_verb = "unattended"
     t0 = time.monotonic()
+    try:
+        with upgrade_lock(
+            env, LOCK_WAIT_UNATTENDED_S
+        ):  # a run that finds it held is logged; the next timer run tries again
+            return _unattended(args, env, t0, source, sleep)
+    except Locked as e:
+        _log(args, env, t0, "unattended", None, "busy", e.message)
+        return 0
+
+
+def _unattended(args: argparse.Namespace, env: Mapping[str, str], t0: float, source, sleep) -> int:
     tag = None
     try:
         root = wsversion.trust_root()
@@ -1521,6 +1581,23 @@ def _unattended_upgrade(args, env, tag: str, root, src, t0: float, sleep) -> int
     return code
 
 
+def cmd_print_units(args: argparse.Namespace, env: Mapping[str, str]) -> int:
+    """`ws upgrade --print-units [--write]`: the two systemd units for this ws (see `ws.upgradeunit`), printed or written.
+    Writing them changes nothing that runs: the timer is the switch (DEC-131), and only the person enables it."""
+    ws = upgradeunit.ws_command()
+    if args.write:
+        for path in upgradeunit.write(env, ws):
+            print(f"ws: wrote {path}")
+        print(
+            "ws: the switch, yours to turn on: systemctl --user daemon-reload && "
+            f"systemctl --user enable --now {upgradeunit.TIMER}"
+        )
+        return 0
+    for name, text in upgradeunit.units(ws).items():
+        print(f"# {name}\n{text}")
+    return 0
+
+
 def cmd_upgrade(args: argparse.Namespace) -> int:
     env = os.environ
     if getattr(args, "unattended", False):
@@ -1532,6 +1609,16 @@ def cmd_upgrade(args: argparse.Namespace) -> int:
     )
     if why:
         raise WsError("refused", why, "run `ws upgrade` yourself, in a terminal of your own", EXIT_REFUSED)
+    if getattr(args, "print_units", False):
+        return cmd_print_units(args, env)
+    in_step = bool(args.hooks_only and env.get(STEP_ENV))  # the hooks step of a swap: its parent holds the lock
+    if args.dry_run or in_step:  # a dry run changes nothing
+        return _by_hand(args, env)
+    with upgrade_lock(env, LOCK_WAIT_HAND_S):
+        return _by_hand(args, env)
+
+
+def _by_hand(args: argparse.Namespace, env: Mapping[str, str]) -> int:
     if args.hooks_only:
         args.log_verb = "hooks-only"
         return _hooks_logged(args, env)
@@ -1557,6 +1644,8 @@ def register(sub) -> None:
     u.add_argument(
         "--unattended", action="store_true", help=argparse.SUPPRESS
     )  # the systemd unit's entry (ws.upgradeproof)
+    u.add_argument("--print-units", action="store_true", help="print the systemd units of the unattended upgrade")
+    u.add_argument("--write", action="store_true", help="with --print-units: write them to the systemd user folder")
     u.add_argument(
         "--session-check", metavar="COMMAND", help="after an unattended swap, run this as well; non-zero rolls it back"
     )

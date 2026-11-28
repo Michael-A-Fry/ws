@@ -473,6 +473,63 @@ def _array_end(text: str, start: int) -> tuple[int, int | None] | None:
     return None
 
 
+def _guards_array(text: str) -> tuple[int, int, int | None] | None:
+    """Where the `[guards]` table's `on = [...]` array sits in `text`: (index of its `[`, of the `]` that closes it, just
+    past its last string), or None when it can't be found."""
+    header = re.search(r"^[ \t]*\[guards\][ \t]*(?:#[^\n]*)?$", text, re.MULTILINE)
+    if header is None:
+        return None
+    nxt = re.search(r"^[ \t]*\[", text[header.end() :], re.MULTILINE)
+    stop = header.end() + nxt.start() if nxt else len(text)
+    key = re.search(r"^[ \t]*on[ \t]*=[ \t]*\[", text[header.end() : stop], re.MULTILINE)
+    if key is None:
+        return None
+    opened = header.end() + key.end() - 1
+    found = _array_end(text, opened)
+    return None if found is None else (opened, *found)
+
+
+def remove_from_guards_on(text: str, name: str) -> str | None:
+    """`text` (a policy) with guard `name` taken out of its `[guards] on` array, or None when there is nothing to take out
+    (no such list, `name` not in it) or a file this can't edit safely. The reverse of `add_to_guards_on`: a textual edit
+    of that one array, so every comment, blank line and other key stays as written; the result is parsed again and must
+    differ from the original in that one list only, or None is returned."""
+    try:
+        before = tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        return None
+    table = before.get("guards")
+    on = table.get("on") if isinstance(table, dict) else None
+    if not isinstance(on, list) or name not in on or not all(isinstance(x, str) for x in on):
+        return None
+    found = _guards_array(text)
+    if found is None:
+        return None
+    opened, close, _ = found
+    want = {**before, "guards": {**table, "on": [x for x in on if x != name]}}
+    for hit in re.finditer(r"([\"'])" + re.escape(name) + r"\1", text[opened:close]):
+        start, end = opened + hit.start(), opened + hit.end()
+        if "#" in text[text.rfind("\n", 0, start) + 1 : start]:
+            continue  # that is in a comment, not an item
+        after_item = re.match(r"[ \t]*,(?:[ \t]+(?=[^\s#]))?", text[end:close])
+        before_item = re.search(r",[ \t]*$", text[opened:start]) if after_item is None else None
+        if after_item:
+            end += after_item.end()
+        elif before_item:  # the last item, with no comma after it: the comma before it goes instead
+            start -= len(before_item.group())
+        new = text[:start] + text[end:]
+        line = new.rfind("\n", 0, start) + 1
+        blank = re.match(r"[ \t]*\n", new[line:])
+        if blank and not new[line:start].strip():
+            new = new[:line] + new[line + blank.end() :]  # the item was alone on its line
+        try:
+            if tomllib.loads(new) == want:
+                return new
+        except tomllib.TOMLDecodeError:
+            continue
+    return None
+
+
 def add_to_guards_on(text: str, name: str) -> str | None:
     """`text` (a policy) with guard `name` added to the end of its `[guards] on` array, or None when there is nothing to
     add: no `[guards]` table, no `on` list in it, `name` already in it, or a file this can't edit safely. It is a textual
@@ -486,19 +543,10 @@ def add_to_guards_on(text: str, name: str) -> str | None:
     on = table.get("on") if isinstance(table, dict) else None
     if not isinstance(on, list) or name in on or not all(isinstance(x, str) for x in on):
         return None
-    header = re.search(r"^[ \t]*\[guards\][ \t]*(?:#[^\n]*)?$", text, re.MULTILINE)
-    if header is None:
-        return None
-    nxt = re.search(r"^[ \t]*\[", text[header.end() :], re.MULTILINE)
-    stop = header.end() + nxt.start() if nxt else len(text)
-    key = re.search(r"^[ \t]*on[ \t]*=[ \t]*\[", text[header.end() : stop], re.MULTILINE)
-    if key is None:
-        return None
-    opened = header.end() + key.end() - 1
-    found = _array_end(text, opened)
+    found = _guards_array(text)
     if found is None:
         return None
-    close, last = found
+    opened, close, last = found
     item = f'"{name}"'
     if last is None:  # an empty array
         new = text[: opened + 1] + item + text[opened + 1 :]

@@ -608,7 +608,9 @@ def elsewhere(result, sha: str, ref: str, cfg: Config, cwd: str, budget: Budget)
     claimed = ref.removeprefix(f"{REMOTE}/")
     local_tops = {_top(os.path.expanduser(r), budget) for r in cfg.local_repos}
     for repo in other_repos(cfg, cwd, budget):
-        if repo in local_tops and _local_only(repo, budget):  # C820: a repository kept local by choice: its own default branch is the record
+        if repo in local_tops and _local_only(
+            repo, budget
+        ):  # C820: a repository kept local by choice: its own default branch is the record
             local = default_target(repo, budget)
             if local.branch == claimed and on_ref(repo, sha, local.ref, budget) is True:
                 return True

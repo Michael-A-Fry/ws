@@ -223,6 +223,7 @@ class Gate:
     read_outside_project: bool = False  # false = Claude Code's file tools refuse reads outside the working folders
     allow_read: tuple[str, ...] = ()  # folders or files besides the project a launched Claude Code shell may read
     write_outside_project: bool = False  # false = Claude Code's Write, Edit and NotebookEdit refuse paths outside them
+    unit_sources: tuple[str, ...] = ()  # folders of committed systemd units `ws unit install` copies from (C867)
 
 
 @dataclass(frozen=True)
@@ -901,6 +902,7 @@ def loads(text: str) -> Policy:
             "read_outside_project",
             "allow_read",
             "write_outside_project",
+            "unit_sources",
         },
     )
     deny_read = _strings(g, "deny_read", "[gate] ")
@@ -916,6 +918,7 @@ def loads(text: str) -> Policy:
         _get(g, "read_outside_project", bool, "[gate] ", False),
         _strings(g, "allow_read", "[gate] "),
         _get(g, "write_outside_project", bool, "[gate] ", False),
+        _strings(g, "unit_sources", "[gate] "),
     )
     for h in gate.allow_hosts:
         check_host(h, "[gate] allow_hosts")
@@ -2555,6 +2558,10 @@ def _segment_once(
         admin = _ws_admin(canon, "xargs" in wrappers) or (_ws_admin(unglued) if unglued else None)
     if admin:
         return admin, line, []
+    from ws import units  # here, not at the top: ws.units reads ws.paths and ws.output
+
+    if why := units.refusal(canon, policy.gate.unit_sources):  # C867: a unit the session did not install from a source
+        return why, line, []
     local_seg = seg  # the part of the line that runs here
     if sudos and (why := _sudo_askpass(ctx, set_env, sudos)):
         return why, line, []

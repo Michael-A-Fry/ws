@@ -57,7 +57,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import unquote, urlsplit
 
-from ws import adapters, approvals, guards, jsonl, output, paths, policy, sandbox, selfcmd, shellwords
+from ws import adapters, approvals, guards, jsonl, output, paths, policy, sandbox, selfcmd, shellwords, units
 
 if TYPE_CHECKING:
     from ws import gatecorpus
@@ -683,6 +683,7 @@ def _protect(policy_file: Path, extra: list[str] | None = None) -> tuple[str, ..
         *paths.control_paths_in(policy_file.parent),
         *paths.control_paths(),
         *map(str, paths.protected_roots()),
+        *units.unit_dirs(),  # C867: a unit written there runs outside every hook
         *(str(Path(p).expanduser().absolute()) for p in extra or []),
     )
 

@@ -1284,6 +1284,19 @@ no longer points at the wall is listed as not on, and the command exits 1.
 ws commit-wall status [-h]
 ```
 
+## `ws unit`
+
+Install a committed systemd user unit. This is the only way one reaches `~/.config/systemd/user`; the gate refuses a
+session's own write to that folder, and `systemctl --user enable` or `start` for a unit that isn't the committed source.
+
+```text
+ws unit install NAME
+```
+
+| Argument | Meaning |
+|---|---|
+| `NAME` | The unit file name, for example `ws-lead-heartbeat.timer`. It's copied, with its drop-ins, from the first folder in `[gate] unit_sources` that holds it. The file has to be tracked by git and unchanged. Run it from your own session: inside the wall the folder is read-only. |
+
 ## `ws canary`
 
 Check a runner still works with ws after an update (no model is called).

@@ -171,7 +171,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import NamedTuple
 
-from ws import adapters, approvals, jsonl, paths, policy
+from ws import adapters, approvals, jsonl, paths, policy, units
 from ws.approvals import ENV_MARKER, FD_ENV, approvals_dir
 from ws.output import WsError
 
@@ -669,6 +669,7 @@ def protected(policy_file: Path, runner: str, extra: list[str] | None = None, en
         *policy.control_paths(policy_file.parent),
         *paths.control_paths(env),
         *map(str, _wall_roots(env)),
+        *units.unit_dirs(),  # C867: user units, environment.d and autostart: read-only inside the wall
     ]
     out += [str(Path(p).expanduser().absolute()) for p in extra or []]
     config_dir = env.get(getattr(adapters.get(runner), "CONFIG_DIR_ENV", ""), "")

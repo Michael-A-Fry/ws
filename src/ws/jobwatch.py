@@ -8,7 +8,10 @@ that give a unit ws does not own the same hook.
                                its kill cut off queued runs, the queue's notice, which names them, is the one push.
     ws watch deadman           for each scheduled job with an `expected_rate`, raise one alert when no run record is
                                newer than twice that rate. Exit 1 while any job is overdue. Run hourly by
-                               `ws-watch-deadman.timer`, a unit outside the jobs it watches.
+                               `ws-watch-deadman.timer`, a unit outside the jobs it watches. It also checks each
+                               heartbeat file in the profile's `[roles.watch.heartbeats]` (a service that is not a
+                               job, like the Telegram bridge, touches its file while well): one alert when it is older
+                               than its max_age_s (C848).
     ws watch rotate JOB        rotate the job's log file if it is over the cap (`ExecStopPost=` of a job's service runs it,
                                so a job that runs a ws command rotates too, not only `ws run`).
     ws watch dropin UNIT... --out DIR
@@ -229,11 +232,38 @@ def _state_path(env) -> Path:
     return paths.state_dir(env) / "logs" / "deadman.json"
 
 
+def heartbeats(env, now: datetime) -> list[dict]:
+    """Each heartbeat file named in the profile's `[roles.watch.heartbeats]` (NAME = { file = "...", max_age_s = N })
+    whose last touch is older than max_age_s: a long-running service that is not a job (the Telegram bridge) touches its
+    file while it is well, so a hung or stopped one is found (C848). A missing file is stale since never."""
+    from ws.profile import load, profile_path
+
+    roles = (load(profile_path(env)) or {}).get("roles")
+    watch = roles.get("watch") if isinstance(roles, dict) else None
+    table = watch.get("heartbeats") if isinstance(watch, dict) else None
+    found = []
+    for name, hb in (table or {}).items() if isinstance(table, dict) else ():
+        f, limit = (hb.get("file"), hb.get("max_age_s")) if isinstance(hb, dict) else (None, None)
+        if not isinstance(f, str) or not isinstance(limit, (int, float)) or isinstance(limit, bool) or limit <= 0:
+            continue  # a bad entry checks nothing; `ws doctor` is where a profile is judged
+        try:
+            since = datetime.fromtimestamp(Path(f).expanduser().stat().st_mtime, UTC)
+        except OSError:
+            since = None
+        age = (now - since).total_seconds() if since else None
+        if age is None or age > limit:
+            found.append(
+                {"job": f"heartbeat:{name}", "last_run": since and runrecord.iso(since),
+                 "hours_since": round(age / 3600, 2) if age is not None else None, "limit_hours": round(limit / 3600, 2)}
+            )  # fmt: skip
+    return found
+
+
 def deadman(env=None, now: datetime | None = None, sender=None) -> list[dict]:
     """Check every job; one alert per overdue job per last run (not one per check). Returns the overdue jobs."""
     env = os.environ if env is None else env
     now = now or datetime.now(UTC)
-    misses = overdue(env, now)
+    misses = overdue(env, now) + heartbeats(env, now)
     try:
         told = json.loads(_state_path(env).read_text(encoding="utf-8"))
         told = told if isinstance(told, dict) else {}
@@ -245,7 +275,11 @@ def deadman(env=None, now: datetime | None = None, sender=None) -> list[dict]:
         if told.get(m["job"]) == key:
             nowtold[m["job"]] = key
             continue  # already raised for this last run
-        text = f"{m['job']} has not run in {m['hours_since']} h (limit {m['limit_hours']} h)"
+        if m["job"].startswith("heartbeat:"):
+            ago = "never" if m["hours_since"] is None else f"{m['hours_since']} h ago"
+            text = f"{m['job'][10:]} is not answering: its last heartbeat was {ago} (limit {m['limit_hours']} h)"
+        else:
+            text = f"{m['job']} has not run in {m['hours_since']} h (limit {m['limit_hours']} h)"
         sent = push(env, text, "a job has not run", sender)
         _write_line(env, {"event": "no-run", "job": m["job"], "hours_since": m["hours_since"], "pushed": sent is True})
         if sent is not False:  # a failed send is tried again at the next check; no role at all is not retried

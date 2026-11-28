@@ -415,3 +415,42 @@ def test_a_reaped_run_whose_notice_did_not_go_leaves_the_drains_push_in_place(en
     ledger = queue.ledger_for_env(env)
     assert ledger.reaped_of(pid, datetime.now(UTC) - timedelta(hours=1)) == []  # a later alert finds nothing told
     ledger.close()
+
+
+# ---- heartbeats: a service that is not a job (C848: the Telegram bridge) -------------------------------------------------
+
+
+def heartbeat_profile(env, file, max_age_s=600):
+    p = profile_path(env)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    roles = {"notify": {"adapter": "ntfy", "url": "https://ntfy.example.org/t", "alert_text": "title"},
+             "watch": {"heartbeats": {"telegram": {"file": str(file), "max_age_s": max_age_s}}}}  # fmt: skip
+    p.write_text(dumps({"roles": roles}), encoding="utf-8")
+
+
+def test_a_stale_heartbeat_alerts_once_and_a_fresh_one_does_not(env, tmp_path):
+    hb = tmp_path / "heartbeat"
+    hb.write_text("x")
+    heartbeat_profile(env, hb)
+    touched = datetime.fromtimestamp(hb.stat().st_mtime, UTC)
+    s = Sender()
+    assert jobwatch.deadman(env, touched + timedelta(seconds=60), s) == [] and s.sent == []
+    later = touched + timedelta(seconds=900)
+    (miss,) = jobwatch.deadman(env, later, s)
+    assert miss["job"] == "heartbeat:telegram" and len(s.sent) == 1 and "telegram is not answering" in s.sent[0]
+    assert jobwatch.deadman(env, later + timedelta(hours=1), s) and len(s.sent) == 1  # once per stale episode
+
+
+def test_a_missing_heartbeat_file_is_stale_since_never(env, tmp_path):
+    heartbeat_profile(env, tmp_path / "gone")
+    s = Sender()
+    (miss,) = jobwatch.deadman(env, datetime(2026, 11, 28, tzinfo=UTC), s)
+    assert miss["last_run"] is None and "never" in s.sent[0]
+
+
+@pytest.mark.parametrize("bad", [{"file": 3, "max_age_s": 600}, {"file": "/x", "max_age_s": 0}, "nope"])
+def test_a_bad_heartbeat_entry_checks_nothing(env, bad):
+    p = profile_path(env)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(dumps({"roles": {"watch": {"heartbeats": {"t": bad}}}}), encoding="utf-8")
+    assert jobwatch.heartbeats(env, datetime(2026, 11, 28, tzinfo=UTC)) == []

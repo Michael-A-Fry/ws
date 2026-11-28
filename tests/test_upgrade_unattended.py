@@ -20,7 +20,19 @@ import pytest
 from helpers import release_fakes
 from helpers.release_fakes import GIT, IDENTITY, ISSUER, KEYGEN, NEEDS, TAG, keygen, sha, stub_tools, trust_root
 
-from ws import agentsession, approvals, cli, paths, queue, selfcmd, upgrade, upgradecheck, upgradeproof, version
+from ws import (
+    agentsession,
+    approvals,
+    cli,
+    paths,
+    queue,
+    selfcmd,
+    upgrade,
+    upgradecheck,
+    upgradeproof,
+    upgradeunit,
+    version,
+)
 from ws.term import bridge
 
 pytestmark = pytest.mark.skipif(GIT is None or KEYGEN is None, reason=NEEDS)
@@ -422,6 +434,63 @@ def test_the_hooks_step_of_an_unattended_swap_runs_without_a_terminal(svc, monke
         assert cli.main(["upgrade", "--hooks-only"]) == upgrade.EXIT_REFUSED
 
 
+# ---- the units ------------------------------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def tool(svc, monkeypatch):
+    folder = svc.home / ".local" / "share" / "uv" / "tools" / "ws-aitoolkit"
+    (folder / "bin").mkdir(parents=True)
+    (folder / "bin" / "ws").write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr(selfcmd, "tree", lambda: folder)
+    return folder / "bin" / "ws"
+
+
+def test_the_units_run_the_installed_command_and_name_no_host_or_person(svc, tool, capsys):
+    assert upgrade.cmd_print_units(args(print_units=True, write=False), os.environ) == 0
+    out = capsys.readouterr().out
+    text = upgradeunit.units(tool)
+    assert set(text) == {"ws-upgrade.service", "ws-upgrade.timer"} and all(f"# {name}\n" in out for name in text)
+    python = tool.with_name("python")
+    assert f"ExecStart={python} -I -m ws upgrade --unattended" in text["ws-upgrade.service"]
+    bare = out.replace(str(tool), "").replace(str(python), "")
+    assert (
+        str(svc.home) not in bare and "/home/" not in bare and "~/" not in bare
+    )  # no personal path, no checkout, no repo
+
+
+def test_the_timer_is_daily_and_catches_up_after_boot(svc, tool):
+    timer = upgradeunit.units(tool)["ws-upgrade.timer"]
+    for line in (
+        "OnCalendar=daily",
+        "Persistent=true",
+        "OnBootSec=10min",
+        "Unit=ws-upgrade.service",
+        "WantedBy=timers.target",
+    ):
+        assert line in timer.splitlines(), line
+
+
+def test_a_failed_run_raises_the_ntfy_alert(svc, tool):
+    """A refusal or a rollback exits non-zero; `OnFailure=` starts the alert unit every ws job has (ws.jobwatch)."""
+    assert "OnFailure=ws-alert@%n.service" in upgradeunit.units(tool)["ws-upgrade.service"].splitlines()
+
+
+def test_write_puts_the_two_units_in_the_user_folder_and_enables_nothing(svc, tool, capsys):
+    assert upgrade.cmd_print_units(args(print_units=True, write=True), os.environ) == 0
+    folder = svc.home / ".config" / "systemd" / "user"
+    assert sorted(p.name for p in folder.iterdir()) == sorted(upgradeunit.UNITS)  # no .wants link: the switch is off
+    assert upgradeunit.unit_paths(os.environ) == tuple(folder / n for n in upgradeunit.UNITS)
+    assert "enable --now ws-upgrade.timer" in capsys.readouterr().out
+
+
+def test_no_units_are_made_from_a_ws_that_is_not_in_a_tool_folder(svc, monkeypatch):
+    monkeypatch.setattr(selfcmd, "tree", lambda: None)
+    with pytest.raises(upgrade.WsError) as caught:
+        upgrade.cmd_print_units(args(print_units=True, write=False), os.environ)
+    assert "no installed ws command" in caught.value.message
+
+
 # ---- B4: the proof runs system tools with a home and an environment of its own ----------------------------------------------
 
 
@@ -510,3 +579,32 @@ def test_the_unattended_flag_is_not_accepted_abbreviated(svc, capsys):
     for flag in ("--unatt", "--unattend", "--u"):
         assert cli.main(["upgrade", flag]) == 2  # a usage error, never the unit's entry
     assert capsys.readouterr().err.count("unrecognized arguments") == 3
+
+
+# ---- B7 and the unit half of B9: system PATH fixed at write time, isolated Python, nothing from the manager's environment ----
+
+
+def test_the_units_put_no_folder_of_the_home_on_the_path_and_fix_the_system_ones_when_written(svc, tool):
+    for name in ("ws-upgrade.service",):
+        text = upgradeunit.units(tool)[name]
+        line = next(ln for ln in text.splitlines() if ln.startswith("Environment=PATH="))
+        assert line == f"Environment=PATH={paths.tool_path()}"
+        assert "%h" not in line and ".local" not in line and "~" not in line
+
+
+def test_the_units_start_python_in_isolated_mode_and_unset_what_the_manager_could_add(svc, tool):
+    for name in ("ws-upgrade.service",):
+        text = upgradeunit.units(tool)[name]
+        exec_line = next(ln for ln in text.splitlines() if ln.startswith("ExecStart="))
+        assert exec_line.startswith(f"ExecStart={tool.with_name('python')} -I -m ws upgrade ")
+        unset = next(ln for ln in text.splitlines() if ln.startswith("UnsetEnvironment=")).split("=", 1)[1].split()
+        for var in (
+            "PYTHONPATH",
+            "PYTHONHOME",
+            "PYTHONSTARTUP",
+            "LD_PRELOAD",
+            "BASH_ENV",
+            "GIT_CONFIG_GLOBAL",
+            "HTTPS_PROXY",
+        ):
+            assert var in unset

@@ -581,8 +581,15 @@ def require_stable_interpreter(cmd) -> None:
 
 
 def _claude_protect(where: Path) -> tuple[str, ...]:
+    """What the user-scope hook protects from a session besides the policy folder: the settings file, the installed
+    tool's folder (the gate runs code from it) and the two systemd units of the unattended upgrade, which run that code
+    with no one watching, with every drop-in folder and `user.control` copy that could change them and the `.wants`
+    folders an enable links into (`ws.upgradeunit.protected_paths`). They are named whether or not they exist yet."""
+    from ws import upgradeunit
+
     tree = selfcmd.tree()
-    return (str(where), *([str(tree)] if tree else []))
+    units = upgradeunit.protected_paths(os.environ)
+    return (str(where), *([str(tree)] if tree else []), *map(str, units))
 
 
 def expected_sandbox(pol: policy.Policy, policy_file: Path, env: Mapping[str, str]) -> dict:

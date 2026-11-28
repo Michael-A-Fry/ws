@@ -21,15 +21,26 @@ body of the GitHub release.
 
 ### Added
 
-- `ws upgrade --unattended`, the entry of a systemd user service (the unit comes with the next change): it asks GitHub
-  for the newest release itself (no request file), does nothing when that's installed, proves the release itself from the installed wheel's trust root (a signed tag, the
-  installer's and wheel's hashes and cosign bundles, green checks, no high or critical advisory in the lock), refuses a
-  tag at or below the installed version, waits for nothing to be running, installs with no mirror or skip-the-checks
-  variable, runs acceptance checks through the installed gate hook (the version, a hooks rewrite, a must-allow and
-  must-deny probe, and no fewer deny rules or stopped probes than before) and rolls back on any failure, offline, from
-  a copy of the installed tool folder kept before the swap. A release that rolled back isn't tried again; a machine
-  that stays busy is tried on the next run. Each outcome is a row in `<state>/release-log.csv`. A person's `ws upgrade` now downloads the release's own `install.sh` (or the
-  file at that tag), never the `main` branch.
+- The unattended upgrade's units ([ADR 0035](docs/decisions/0035-an-upgrade-can-run-itself-from-a-service-that-proves-the-release.md)):
+  `ws upgrade --print-units [--write]` makes two systemd user units, a daily timer (and ten minutes after boot) and the
+  upgrade service, which run the `ws` command in the installed tool's folder. A failed or refused run raises the ntfy
+  alert through `OnFailure=ws-alert@%n.service`. Enabling the timer is the switch, off until the person turns it on. The
+  new `upgrade-service` guard stops a session starting, stopping, enabling or changing the units or running the
+  `--unattended` entry (the upgrade adds it to an existing policy's `[guards] on` list, as it did `pane-keys`), and the
+  unit files, every drop-in folder that could change them, the `user.control` copies and the `*.target.wants/` folders
+  are protected paths of the user-scope hook, so a session can't enable the timer with a symlink either. The guard also
+  refuses globs and braces in a unit name, units fed in by `xargs`, the bus calls that do the same as `systemctl`, and
+  `daemon-reload` and the environment verbs.
+- `ws upgrade --unattended`, the entry of a systemd user service (the unit comes with the next change). It asks GitHub
+  for the newest release itself (no request file) and does nothing when that's installed or older. It proves the
+  release from the installed wheel's trust root (a signed tag, the installer's and wheel's hashes and cosign bundles,
+  green checks, no high or critical advisory in the lock), waits for nothing to be running, and installs with no mirror
+  or skip-the-checks variable. It then runs acceptance checks through the installed gate hook (the version, a hooks
+  rewrite, a must-allow and must-deny probe, and no fewer deny rules or stopped probes than before) and rolls back on
+  any failure, offline, from a copy of the installed tool folder kept before the swap. A release that rolled back isn't
+  tried again; a machine that stays busy is tried on the next run. Each outcome is a row in `<state>/release-log.csv`.
+  A person's `ws upgrade` now downloads the release's own `install.sh` (or the file at that tag), never the `main`
+  branch.
 - The release publishes `install.sh` as an asset of its own, with a `.sha256`, a build provenance attestation and a
   cosign bundle, signed by the same workflow as the wheel. The build stamp now carries a trust root (the release
   workflow's cosign identity and the allowed signers for a release tag, from `.github/release_signers`), which

@@ -115,6 +115,7 @@ from ws import (
     selfcmd,
     upgradecheck,
     upgradeproof,
+    upgradeunit,
     userconfig,
 )
 from ws import version as wsversion
@@ -131,6 +132,7 @@ BROKER_STOP_S = 10.0  # how long a stopped broker has to close its socket
 BROKER_START_S = 30.0  # how long the new broker has to answer
 DEFAULT_GUARDS = (
     "pane-keys",
+    "upgrade-service",
 )  # guards added to a policy's `[guards] on` list by the rewrite, once, when it is missing
 STEP_ENV = "WS_UPGRADE_STEP"  # set for each step the upgrade runs: a hooks rewrite there leaves the log line to it
 INSTALL_TIMEOUT_S, STEP_TIMEOUT_S = 600.0, 120.0  # the watchdog per step: the installer, then the hooks and the check
@@ -1521,6 +1523,23 @@ def _unattended_upgrade(args, env, tag: str, root, src, t0: float, sleep) -> int
     return code
 
 
+def cmd_print_units(args: argparse.Namespace, env: Mapping[str, str]) -> int:
+    """`ws upgrade --print-units [--write]`: the two systemd units for this ws (see `ws.upgradeunit`), printed or written.
+    Writing them changes nothing that runs: the timer is the switch (DEC-131), and only the person enables it."""
+    ws = upgradeunit.ws_command()
+    if args.write:
+        for path in upgradeunit.write(env, ws):
+            print(f"ws: wrote {path}")
+        print(
+            "ws: the switch, yours to turn on: systemctl --user daemon-reload && "
+            f"systemctl --user enable --now {upgradeunit.TIMER}"
+        )
+        return 0
+    for name, text in upgradeunit.units(ws).items():
+        print(f"# {name}\n{text}")
+    return 0
+
+
 def cmd_upgrade(args: argparse.Namespace) -> int:
     env = os.environ
     if getattr(args, "unattended", False):
@@ -1532,6 +1551,8 @@ def cmd_upgrade(args: argparse.Namespace) -> int:
     )
     if why:
         raise WsError("refused", why, "run `ws upgrade` yourself, in a terminal of your own", EXIT_REFUSED)
+    if getattr(args, "print_units", False):
+        return cmd_print_units(args, env)
     if args.hooks_only:
         args.log_verb = "hooks-only"
         return _hooks_logged(args, env)
@@ -1557,6 +1578,8 @@ def register(sub) -> None:
     u.add_argument(
         "--unattended", action="store_true", help=argparse.SUPPRESS
     )  # the systemd unit's entry (ws.upgradeproof)
+    u.add_argument("--print-units", action="store_true", help="print the systemd units of the unattended upgrade")
+    u.add_argument("--write", action="store_true", help="with --print-units: write them to the systemd user folder")
     u.add_argument(
         "--session-check", metavar="COMMAND", help="after an unattended swap, run this as well; non-zero rolls it back"
     )

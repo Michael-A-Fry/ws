@@ -100,6 +100,7 @@ below, and `python3 scripts/gen_code_map.py --check` (prek and CI) fails when it
 | `upgrade.py` | `ws upgrade`: swap the ws binary for a newer release and rewrite the runner's hooks in the same step |
 | `upgradecheck.py` | The acceptance checks `ws upgrade --unattended` runs after a swap, the snapshot they are... |
 | `upgradeproof.py` | What `ws upgrade --unattended` proves about a release before it installs it, and how it finds... |
+| `upgradeunit.py` | The systemd user units of the unattended upgrade, as text made from the installed ws: `ws... |
 | `usage.py` | Usage signals: the provider's usage report, the subscription limits a statusline gives ws, spend... |
 | `userconfig.py` | The gate in the runner's own user config: ws's deny rules and hooks added beside yours... |
 | `version.py` | `ws version`: which build is this, where did it come from, and where is it installed |

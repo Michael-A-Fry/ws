@@ -76,6 +76,26 @@ didn't write itself. Only the `launch` gate setting or an uninstall takes the en
 A session that was already running keeps the rules it loaded at start. When a newer release is installed, the session
 gets one line about it, once. Start a new session to use the new release.
 
+### Let ws upgrade itself
+
+Once, from a terminal of your own, install a release that carries the service, then write its units and turn on
+the switch (the timer; it's off until you enable it):
+
+```sh
+ws upgrade --print-units --write
+systemctl --user daemon-reload
+systemctl --user enable --now ws-upgrade.timer
+systemctl --user list-timers ws-upgrade.timer
+```
+
+After that, the timer looks for a new release once a day (and ten minutes after boot if a day was missed). The service
+proves the release, waits until nothing is running, keeps a copy of the installed ws, swaps, restarts the broker, checks
+the gate and, on any failure, puts the copy back with no download and sends an ntfy alert. A release that rolled back
+isn't tried again. Read the result in `release-log.csv` in ws's state folder. `git`, `cosign` and `uv` must be on the
+PATH the units set. To turn it off, run `systemctl --user disable --now ws-upgrade.timer`; to swap it for cron or another
+scheduler, see the swap note in [ADR 0035](../decisions/0035-an-upgrade-can-run-itself-from-a-service-that-proves-the-release.md).
+A session can't start, stop, enable or change the units: the gate refuses it.
+
 ### Runner updates
 
 ws never updates your AI tool. When `ws doctor` sees that a runner or the default model changed, it runs `ws canary` and

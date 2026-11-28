@@ -644,6 +644,19 @@ def ask_broker(sock: Path, timeout: float = 3.0, hold: bool = False) -> Peer:
     return Peer(reply, pid, uid, fd)
 
 
+def _runs_version(sock: Path, version: str | None, limit: float) -> bool:
+    """Whether a broker of `version` answers on `sock` within `limit` seconds (the old one may answer for a moment)."""
+    end = time.monotonic() + limit
+    while time.monotonic() < end:
+        try:
+            if ask_broker(sock, timeout=1.0).status.get("version") == version:
+                return True
+        except (OSError, ValueError):
+            pass
+        time.sleep(0.2)
+    return False
+
+
 def _gone(sock: Path, limit: float) -> bool:
     """Whether nothing answers on `sock` any more, within `limit` seconds."""
     end = time.monotonic() + limit
@@ -744,17 +757,39 @@ def _stop_and_start(args: argparse.Namespace, sock: Path, peer: Peer, new: NewWs
     if args.dry_run:
         _say(args, f"would stop the broker (ws {running}, pid {peer.pid}) and start one of ws {new.version}")
         return "would restart"
-    _say(args, f"the broker runs ws {running}: stopping it (pid {peer.pid}) and starting one of ws {new.version}")
-    try:
-        send(peer.pidfd, signal.SIGTERM)
-    except OSError as e:
-        _say(args, f"could not stop the broker ({type(e).__name__}): {finish}")
+    from ws import brokerunit  # late: only an upgrade that finds an old broker asks
+
+    unit = brokerunit.installed()
+    if unit and not brokerunit.refresh(new.python):  # ExecStart names the ws now installed
+        _say(args, f"{brokerunit.UNIT} could not be pointed at ws {new.version}: {brokerunit.HINT}")
         return "failed"
-    if not _gone(sock, BROKER_STOP_S):
-        _say(args, f"the broker did not stop within {BROKER_STOP_S:.0f} seconds: {finish}")
-        return "failed"
-    if not start_broker(new, sock):
-        _say(args, "the old broker is stopped; the new one did not answer yet, and the next `ws run` starts it")
+    # C848: the service's own broker (its MainPID) is restarted by systemd on the new code
+    if unit and brokerunit.main_pid() == peer.pid:
+        _say(args, f"the broker runs ws {running}: restarting {brokerunit.UNIT} on ws {new.version}")
+        if not brokerunit.restart():
+            _say(args, f"systemctl --user restart {brokerunit.UNIT} failed: {brokerunit.HINT}")
+            return "failed"
+    else:  # a bare broker (with the unit installed too: the service is in its retry loop and takes the socket after)
+        _say(args, f"the broker runs ws {running}: stopping it (pid {peer.pid}) and starting one of ws {new.version}")
+        try:
+            send(peer.pidfd, signal.SIGTERM)
+        except OSError as e:
+            _say(args, f"could not stop the broker ({type(e).__name__}): {finish}")
+            return "failed"
+        if not _gone(sock, BROKER_STOP_S):
+            _say(args, f"the broker did not stop within {BROKER_STOP_S:.0f} seconds: {finish}")
+            return "failed"
+        if not (brokerunit.start() if unit else start_broker(new, sock)):
+            _say(args, "the old broker is stopped; the new one did not answer yet, and the next `ws run` starts it")
+            return "failed"
+    # if it does not answer, once more: a bare broker from before this release unlinks the path as it stops, which can
+    # strand the service's fresh socket; a restart binds it again
+    if (
+        unit
+        and not _runs_version(sock, new.version, BROKER_START_S)
+        and not (brokerunit.restart() and _runs_version(sock, new.version, BROKER_START_S))
+    ):
+        _say(args, f"{brokerunit.UNIT} did not answer on ws {new.version} in time: {brokerunit.HINT}")
         return "failed"
     _say(args, f"the broker is restarted on ws {new.version}")
     return "restarted"

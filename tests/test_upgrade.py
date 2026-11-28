@@ -1404,3 +1404,107 @@ def test_the_hooks_rewrite_migrates_the_policy_and_prints_one_line(old, box, cap
     assert '"pane-keys"' in path.read_text(encoding="utf-8")
     cli.main(["upgrade", "--hooks-only"])
     assert capsys.readouterr().out.count("pane-keys") == 0 and path.read_text(encoding="utf-8").count("pane-keys") == 1
+
+
+@linux_only
+def test_with_the_unit_installed_the_upgrade_restarts_the_service_not_the_process(
+    cutover, old, stub_broker, starts, broker_sock, capsys, monkeypatch
+):
+    """C848: the socket is the service's own broker (MainPID): systemd restarts it; the upgrade waits for the version."""
+    from ws import brokerunit
+
+    stub = stub_broker("0.0.1")
+    asked: list[str] = []
+
+    def restart(run=None):
+        asked.append("restart")
+        stub.kill()
+        stub.wait()
+        broker_sock.unlink()
+        Path(str(broker_sock) + ".ready").unlink()
+        stub_broker("9.9.9")  # what systemd's restart brings up: the installed ws
+        return True
+
+    monkeypatch.setattr(brokerunit, "installed", lambda env=None: True)
+    monkeypatch.setattr(brokerunit, "refresh", lambda python, run=None: True)
+    monkeypatch.setattr(brokerunit, "main_pid", lambda run=None: stub.pid)
+    monkeypatch.setattr(brokerunit, "restart", restart)
+    assert cli.main(["upgrade"]) == 0
+    assert asked == ["restart"] and starts == []  # no bare start beside the service
+    assert "restarting ws-broker.service" in capsys.readouterr().out
+
+
+@linux_only
+def test_with_the_unit_installed_a_bare_broker_is_stopped_and_the_service_takes_over(
+    cutover, old, stub_broker, starts, broker_sock, capsys, monkeypatch
+):
+    """C848 review: a restart of the service alone would leave the bare broker serving old code until a reboot."""
+    from ws import brokerunit
+
+    bare = stub_broker("0.0.1")
+    asked: list[str] = []
+
+    def start(run=None):
+        asked.append("start")
+        broker_sock.unlink(missing_ok=True)  # the real broker clears a stale socket file itself
+        Path(str(broker_sock) + ".ready").unlink(missing_ok=True)
+        stub_broker("9.9.9")  # the service's retry binds the freed socket
+        return True
+
+    monkeypatch.setattr(brokerunit, "installed", lambda env=None: True)
+    monkeypatch.setattr(brokerunit, "refresh", lambda python, run=None: True)
+    monkeypatch.setattr(brokerunit, "main_pid", lambda run=None: None)  # the service holds no broker: it is retrying
+    monkeypatch.setattr(brokerunit, "restart", lambda run=None: asked.append("restart") or True)
+    monkeypatch.setattr(brokerunit, "start", start)
+    assert cli.main(["upgrade"]) == 0
+    assert bare.wait(timeout=20) == -signal.SIGTERM  # planted: the old code only restarted the service
+    assert asked == ["start"] and starts == []
+
+
+@linux_only
+def test_with_the_unit_installed_a_service_that_never_answers_fails(
+    cutover, old, stub_broker, starts, broker_sock, capsys, monkeypatch
+):
+    from ws import brokerunit
+
+    stub = stub_broker("0.0.1")
+    monkeypatch.setattr(brokerunit, "installed", lambda env=None: True)
+    monkeypatch.setattr(brokerunit, "refresh", lambda python, run=None: True)
+    monkeypatch.setattr(brokerunit, "main_pid", lambda run=None: stub.pid)
+    monkeypatch.setattr(brokerunit, "restart", lambda run=None: True)  # the old one keeps answering 0.0.1
+    monkeypatch.setattr(upgrade, "BROKER_START_S", 1.0)
+    cli.main(["upgrade"])
+    assert [d["exit"] for d in _log() if d["step"] == "broker"] != [0]
+    assert "journalctl --user -u ws-broker.service" in capsys.readouterr().out
+
+
+@linux_only
+def test_after_a_takeover_a_service_that_does_not_answer_is_restarted_once(
+    cutover, old, stub_broker, starts, broker_sock, capsys, monkeypatch
+):
+    """C848 re-check: a pre-release bare broker unlinks the path as it stops, stranding the service's socket."""
+    from ws import brokerunit
+
+    stub_broker("0.0.1")
+    asked: list[str] = []
+
+    def restart(run=None):
+        asked.append("restart")
+        broker_sock.unlink(missing_ok=True)
+        Path(str(broker_sock) + ".ready").unlink(missing_ok=True)
+        stub_broker("9.9.9")
+        return True
+
+    def start(run=None):  # the service started, but its socket was stranded: nothing answers
+        asked.append("start")
+        broker_sock.unlink(missing_ok=True)
+        return True
+
+    monkeypatch.setattr(brokerunit, "installed", lambda env=None: True)
+    monkeypatch.setattr(brokerunit, "refresh", lambda python, run=None: True)
+    monkeypatch.setattr(brokerunit, "main_pid", lambda run=None: None)
+    monkeypatch.setattr(brokerunit, "start", start)
+    monkeypatch.setattr(brokerunit, "restart", restart)
+    monkeypatch.setattr(upgrade, "BROKER_START_S", 2.0)
+    assert cli.main(["upgrade"]) == 0
+    assert asked == ["start", "restart"] and "restarted on ws 9.9.9" in capsys.readouterr().out

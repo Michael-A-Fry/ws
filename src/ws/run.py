@@ -135,6 +135,10 @@ def _start_broker(sock: Path) -> bool:
     project folder's `ws/`. It is left running on purpose, so the next run finds it, in its own session; its stderr goes
     to `logs/broker-start.log`. Started from a systemd oneshot unit (a timer's job), the unit's kill mode ends it with
     the unit; that is fine, the next run starts it again."""
+    from ws import brokerunit  # late: only a run that needs a broker asks
+
+    if brokerunit.installed():  # C848: the service owns the broker; ws never starts a second, bare one beside it
+        return brokerunit.start() and _broker_answers(sock)
     home = paths.state_dir().absolute()
     try:
         logs = home / "logs"
@@ -150,6 +154,10 @@ def _start_broker(sock: Path) -> bool:
             os.close(err_fd)
     except OSError:
         return False
+    return _broker_answers(sock)
+
+
+def _broker_answers(sock: Path) -> bool:
     deadline = time.monotonic() + BROKER_START_S
     while time.monotonic() < deadline:
         try:

@@ -1909,3 +1909,27 @@ def test_tls_upstream_checks_the_host_name_never_the_address(monkeypatch):
     monkeypatch.setattr(broker, "_connect", lambda host, port: "dialled 149.154.166.110")
     broker._UpstreamTLS("api.telegram.org", 443, timeout=5, context=Ctx()).connect()
     assert got == {"sock": "dialled 149.154.166.110", "server_hostname": "api.telegram.org"}
+
+
+def test_stop_leaves_a_successors_socket_alone(base, stub):
+    """C848: a supervised broker that binds the path while this one stops keeps its socket."""
+    e = Env(base, stub)
+    e.write_registry()
+    e.start()
+    e.sock.unlink()  # what a successor does: the path now names a new socket, not this broker's
+    succ = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        succ.bind(str(e.sock))
+        e.broker.stop()
+        assert e.sock.exists()  # planted: the old stop() deleted it
+    finally:
+        succ.close()
+        e.sock.unlink(missing_ok=True)
+
+
+def test_stop_removes_its_own_socket(base, stub):
+    e = Env(base, stub)
+    e.write_registry()
+    e.start()
+    e.broker.stop()
+    assert not e.sock.exists()

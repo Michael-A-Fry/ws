@@ -904,9 +904,15 @@ class Broker:
         for srv in (self._unix, self._http):
             if srv is not None:
                 srv.shutdown()
-                srv.server_close()
+        # C848: unlink while the listening socket is still open, so a successor retrying now still sees "already
+        # running" and cannot bind in the gap; and only the socket this broker bound, never a successor's.
         with contextlib.suppress(OSError):
-            self.socket_path.unlink()
+            st = self.socket_path.lstat()
+            if (st.st_dev, st.st_ino) == getattr(self, "_socket_id", None):
+                self.socket_path.unlink()
+        for srv in (self._unix, self._http):
+            if srv is not None:
+                srv.server_close()
         self._unix = self._http = None
         self._stopped.set()
 
@@ -951,6 +957,8 @@ class Broker:
         finally:
             os.umask(old)
         self.socket_path.chmod(0o660 if self.group else 0o600)
+        st = self.socket_path.lstat()
+        self._socket_id = (st.st_dev, st.st_ino)  # what stop() may delete: this socket, never a successor's
         if gid is not None:
             try:
                 os.chown(self.socket_path, -1, gid)
@@ -2134,6 +2142,12 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_unit(args: argparse.Namespace) -> int:
+    from ws import brokerunit  # late: brokerunit is not needed to serve
+
+    return brokerunit.cmd_unit(args)
+
+
 def cmd_request(args: argparse.Namespace) -> int:
     try:
         lease = request(args.name, args.purpose, args.host, socket=args.socket, ttl_s=args.ttl, run=args.run)
@@ -2395,6 +2409,13 @@ def register(sub) -> None:
     p.add_argument("--run", metavar="RUN_ID", help="the run the lease is for (its run record says what it may have)")
     p.add_argument("--socket", metavar="PATH")
     p.set_defaults(func=cmd_request)
+    p = bsub.add_parser(
+        "unit", help="the broker as a systemd user service (Restart=always): print, --apply or --remove"
+    )
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--apply", action="store_true", help="write the unit, enable and start it")
+    g.add_argument("--remove", action="store_true", help="stop, disable and delete the unit")
+    p.set_defaults(func=_cmd_unit, raw=True)  # prints a systemd unit file, or one line
     p = bsub.add_parser("status", help="ask a running broker how it is")
     p.add_argument("--socket", metavar="PATH")
     p.set_defaults(func=cmd_status)

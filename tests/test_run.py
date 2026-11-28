@@ -1334,11 +1334,15 @@ def test_a_runner_that_cannot_price_the_model_is_refused_unless_the_job_allows_i
     assert cli.main(["run", "oc", "--dry-run"]) == 0
 
 
-def test_a_local_model_needs_no_price_and_is_recorded_at_zero(ws, capsys):
+def test_a_local_model_needs_no_price_and_is_recorded_at_zero(ws, capsys, tmp_path):
     """DEC-200: a model on a local server costs no money, so no price, no allow_unpriced and no cap stands in its way."""
+    fails = tmp_path / "fails"  # a runner that starts and exits 1 at once, on every OS (macOS has no /bin/false)
+    fails.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    fails.chmod(0o755)
     write_opencode_job(
         ws,
-        options='exe = "/bin/false"\nprovider = { npm = "@ai-sdk/openai-compatible", options = { baseURL = "http://127.0.0.1:8080/v1" }, models = { m = { name = "m" } } }',
+        options=f'exe = "{fails}"\n'
+        + 'provider = { npm = "@ai-sdk/openai-compatible", options = { baseURL = "http://127.0.0.1:8080/v1" }, models = { m = { name = "m" } } }',
     )
     assert cli.main(["run", "oc", "--dry-run"]) == 0
     cli.main(["run", "oc"])  # the runner fails at once: a local run that reported nothing still costs nothing

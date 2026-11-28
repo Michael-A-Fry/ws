@@ -19,7 +19,8 @@ files = ["STATE.md", ".state/STATE.md", "HANDOFF.md", "TODO.md"]   # the default
 ```
 
 A policy file with no `[guards]` table has no guards on, so an upgrade changes nothing until you add the table.
-A policy that has an `on` list gets `pane-keys` added to it by the upgrade, once (see [`ws upgrade`](cli.md#ws-upgrade)).
+A policy that has an `on` list gets `pane-keys` and `upgrade-service` added to it by the upgrade, once (see
+[`ws upgrade`](cli.md#ws-upgrade)).
 `ws gate init` writes `on = ["syntax-check", "session-context", "dev-server", "pane-keys"]` and lists the other
 guards as comments. A name in `on` that ws doesn't know stops the load and the message names it. So does a key in
 `[guards]` that isn't `on` or a guard name, and a key in a guard's table that guard doesn't read (`mode` is read by ws
@@ -106,6 +107,7 @@ ships `syntax-check` in `log`, and the commented tables for `claims` and `test-w
 | `inbox` | when a prompt is sent, after a call, and when Claude Code stops | none | Hands the session the messages left for it, as text marked untrusted, at its own turn: a prompt's output, a warning after a tool call, and (for an `urgent` message) a `{"decision":"block"}` that keeps a stopping Claude Code session going, at most three stops in a row and never for an `info` message. A body is cut to 4000 characters, cleaned for a terminal and flagged when it reads like an instruction; the flags only mark. A walled receiver, a caller that can't be shown to be the session, and a store the wall leaves read-only get a body-free "N unread" line instead (after a call, at most once in two minutes). A message grants no permission: the gate judges every later call as before. Off until you name it. |
 | `presence` | before and after a call, at session start, on a prompt and on a stop | none | Records `busy` or `idle` in the session registry from those hooks, newest report winning, and the latest message the session sent that was delivered. A hook of a sub-agent is skipped. It never says anything and never fails a hook. |
 | `pane-close` | before a call | shell commands | Allows `tmux kill-window` or `kill-pane` on the live tmux server only as one plain command with an `@N` or `%N` target, when the registry says every session in it's idle and the caller is the lead, or it's the caller's own pane after its hand-over was delivered. See [pane-close](#pane-close). |
+| `upgrade-service` | before a call | shell commands | Denies a session starting, stopping or changing ws's unattended-upgrade units (`systemctl` start, stop, restart, enable, disable, edit, kill and the like on `ws-upgrade*`), `systemd-run` naming them, and `ws upgrade --unattended`. Reading the units is allowed. See [upgrade-service](#upgrade-service). Added to an existing policy by the upgrade. |
 | `pane-keys` | before a call | shell commands | Denies `tmux send-keys` aimed at the live tmux server (or one that can't be known) when what it types has a line that starts with `/` once key names are decoded, and a `paste-buffer` of text that has one. A slash command can open a dialog that holds every later key and message until someone presses one. The reason says to start sessions with `--name X --remote-control X` and to message another session with `ws msg send` or the runner's own cross-session messaging. The person can approve the command once. See [pane-keys](#pane-keys). On by default in the policy `ws gate init` writes. |
 | `record-calls` | before a call | every kind | Appends `{schema, ts, at, runner, payload}` (`ts` is the time; `at` is its legacy spelling, kept beside it) to `~/.local/state/ws/logs/gate-calls.jsonl`, one line for each hook run. A file write keeps its path and records the text as `{"bytes", "sha256"}`. `ws gate replay` reads that file. |
 
@@ -441,6 +443,28 @@ folder's role; a window's name, a tmux option, `TMUX_PANE`, the environment and 
 decide nothing. A session closes only its own pane, and only once a `done` or `stop-and-hand-over:done` it sent has
 been delivered. Without `tmux` installed it says nothing.
 
+### upgrade-service
+
+```toml
+[guards.upgrade-service]    # no keys
+```
+
+It's on by default for an existing policy (the upgrade adds it): it only narrows. A session may not start, stop, change
+or imitate the unattended upgrade ([ADR 0035](../decisions/0035-an-upgrade-can-run-itself-from-a-service-that-proves-the-release.md)).
+It refuses `systemctl` with a verb that changes something (start, stop, restart, enable, disable, edit, kill, mask and
+the like) on a unit named `ws-upgrade*`, and the same under `--user`, `--global` or `-M` when the unit is
+a variable or substitution, has a glob or a brace in its name (`'ws-u*.timer'`, `ws-?pgrade.timer`), or is fed in by
+`xargs` or `parallel`; `systemctl daemon-reload`, `daemon-reexec`, `set-environment`, `import-environment` and
+`unset-environment`, and `dbus-update-activation-environment --systemd`, whatever the unit (a reload is what makes a
+drop-in take effect, and the environment verbs reach every unit the manager starts); `busctl call` or `set-property`,
+`gdbus call`, `dbus-send` and `qdbus` naming `org.freedesktop.systemd1`; `systemd-run` naming such a unit; and any command
+with the words `upgrade` and `--unattended` (or a prefix of it that the option parser still reads),
+however ws is started. Reading a unit (`status`, `show`, `cat`, `list-timers`, a glob in a read) is allowed. Because it
+reads the words of a command line, a plain `echo ws upgrade --unattended` is refused too. The unit files, their drop-in
+folders, the `user.control` copies and the `*.target.wants/` folders (an enable is a symlink there) are protected
+paths of the user-scope hook, so a session write to them is refused
+with no guard; other units in the same folder stay writable.
+
 ### pane-keys
 
 ```toml
@@ -488,7 +512,7 @@ The first refusal ends it. Each guard declares a `PRIORITY`:
 | Priority | For | Guards |
 |---|---|---|
 | 0 | A guard that only records, so a call a later guard refuses is on record too | `presence`, `record-calls` |
-| 10 | A guard that protects the machine or the repository | `bulk-staging`, `checkout-pin`, `config-guard`, `dev-server`, `guard-launch`, `pane-close`, `pane-keys`, `test-weakening` |
+| 10 | A guard that protects the machine or the repository | `bulk-staging`, `checkout-pin`, `config-guard`, `dev-server`, `guard-launch`, `pane-close`, `pane-keys`, `test-weakening`, `upgrade-service` |
 | 20 | A guard that keeps a session honest about its own work | `skill-gate`, `spawn-cap` |
 | 30 | A guard that checks what a message says | `claims` |
 | 90 | Advice after the fact | `inbox`, `session-context`, `syntax-check` |
@@ -552,6 +576,7 @@ hook stays: what it judges depends on something a pattern on the call can't see.
 | `dev-server` | no rule: it reads the flags and the address |
 | `pane-close` | no rule: it reads the session registry |
 | `pane-keys` | no rule: it reads the text a command types |
+| `upgrade-service` | no rule: it reads the words of a command |
 | `spawn-cap` | no rule: it counts the agents running; `Agent(NAME)` can deny a named agent, not a count |
 | `skill-gate` | no rule: it waits for a skill run in the session |
 | `test-weakening` | no rule: it compares a test file before and after |

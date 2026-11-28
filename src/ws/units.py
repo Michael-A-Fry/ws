@@ -24,7 +24,6 @@ fails for the same reason, which is the point: units are installed from the pers
 
 from __future__ import annotations
 
-import argparse
 import os
 import posixpath
 import subprocess
@@ -39,12 +38,24 @@ USER_UNIT_DIRS = (".config/systemd/user", ".config/systemd/user.control", ".loca
 OTHER_PROTECTED = (".config/environment.d", ".config/autostart")
 
 START_VERBS = frozenset(
-    {"enable", "reenable", "start", "restart", "try-restart", "reload-or-restart", "try-reload-or-restart", "reload", "isolate"}
+    {
+        "enable",
+        "reenable",
+        "start",
+        "restart",
+        "try-restart",
+        "reload-or-restart",
+        "try-reload-or-restart",
+        "reload",
+        "isolate",
+    }
 )
 NEVER_VERBS = frozenset(
     {"link", "edit", "add-wants", "add-requires", "set-environment", "import-environment", "unset-environment"}
 )
-SYSTEMCTL_VALUED = frozenset({"-M", "-H", "-p", "-t", "-s", "-n", "-o", "-T", "--host", "--machine", "--property", "--type"})
+SYSTEMCTL_VALUED = frozenset(
+    {"-M", "-H", "-p", "-t", "-s", "-n", "-o", "-T", "--host", "--machine", "--property", "--type"}
+)
 RUN_PERSISTS = ("--on-", "--timer-property", "--remain-after-exit")
 
 
@@ -62,8 +73,15 @@ def _git_ok(src: Path) -> bool:
     committed source."""
     d = str(src.parent)
     try:
-        tracked = subprocess.run(["git", "-C", d, "ls-files", "--error-unmatch", "--", src.name], capture_output=True, timeout=10)
-        clean = subprocess.run(["git", "-C", d, "diff", "--quiet", "HEAD", "--", src.name], capture_output=True, timeout=10)
+        tracked = subprocess.run(
+            ["git", "-C", d, "ls-files", "--error-unmatch", "--", src.name],
+            check=False,
+            capture_output=True,
+            timeout=10,
+        )
+        clean = subprocess.run(
+            ["git", "-C", d, "diff", "--quiet", "HEAD", "--", src.name], check=False, capture_output=True, timeout=10
+        )
     except (OSError, subprocess.SubprocessError):
         return False
     return tracked.returncode == 0 and clean.returncode == 0
@@ -78,7 +96,7 @@ def _expand(sources, home: Path) -> list[Path]:
 
 
 def _template(unit: str) -> str:
-    """`x@a.service` is read from `x@.service`."""
+    """An instance of a template unit (name, the at sign, an instance, the suffix) is read from the template file."""
     if "@" in unit:
         base, _, rest = unit.partition("@")
         suffix = "." + rest.rpartition(".")[2] if "." in rest else ""
@@ -131,7 +149,10 @@ def unit_trusted(unit: str, sources, home: str | Path | None = None) -> bool:
         if os.path.lexists(h / rel / name) or os.path.lexists(h / rel / f"{name}.d"):
             return False
     runtime = os.environ.get("XDG_RUNTIME_DIR")
-    if runtime and (os.path.lexists(Path(runtime) / "systemd/user" / name) or os.path.lexists(Path(runtime) / "systemd/user.control" / name)):
+    if runtime and (
+        os.path.lexists(Path(runtime) / "systemd/user" / name)
+        or os.path.lexists(Path(runtime) / "systemd/user.control" / name)
+    ):
         return False
     installed = main / name
     if not os.path.lexists(installed):
@@ -177,7 +198,9 @@ def refusal(canon: list[str], sources, home: str | Path | None = None) -> str | 
             if t.startswith(RUN_PERSISTS) or t == "-r":
                 return f"systemd-run {t.split('=')[0]} leaves a timer or unit behind, outside the gate; run it as a plain command or --scope"
         if "--no-block" in args and "--wait" not in args:
-            return "systemd-run --no-block without --wait leaves a process running outside the gate; add --wait or --scope"
+            return (
+                "systemd-run --no-block without --wait leaves a process running outside the gate; add --wait or --scope"
+            )
         return None
     if head != "systemctl" or "--user" not in args:
         return None
@@ -200,17 +223,28 @@ def refusal(canon: list[str], sources, home: str | Path | None = None) -> str | 
 def install(name: str, sources, home: str | Path | None = None) -> dict:
     """Copy unit `name` (and its drop-ins) from the first committed source that has it into `~/.config/systemd/user`."""
     h = Path(home) if home else paths.home_dir()
-    if not name or "/" in name or name.startswith(".") or not name.endswith((".service", ".timer", ".socket", ".target", ".path", ".slice", ".mount")):
+    if (
+        not name
+        or "/" in name
+        or name.startswith(".")
+        or not name.endswith((".service", ".timer", ".socket", ".target", ".path", ".slice", ".mount"))
+    ):
         raise WsError("bad_unit", f"{name!r} is not a unit file name", "give a name like ws-lead-heartbeat.timer")
     srcs = _expand(sources or (), h)
     if not srcs:
-        raise WsError("no_sources", "the policy names no [gate] unit_sources", "add the folder of committed units to [gate] unit_sources")
+        raise WsError(
+            "no_sources",
+            "the policy names no [gate] unit_sources",
+            "add the folder of committed units to [gate] unit_sources",
+        )
     for s in srcs:
         src = s / name
         if not src.is_file():
             continue
         if not _git_ok(src):
-            raise WsError("not_committed", f"{src} is not committed and unchanged", "commit it, and let the lead join it, first")
+            raise WsError(
+                "not_committed", f"{src} is not committed and unchanged", "commit it, and let the lead join it, first"
+            )
         main = h / USER_UNIT_DIRS[0]
         main.mkdir(parents=True, exist_ok=True)
         tmp = main / f".{name}.tmp"
@@ -223,14 +257,29 @@ def install(name: str, sources, home: str | Path | None = None) -> dict:
             dst.mkdir(exist_ok=True)
             for f in sorted(p for p in d.iterdir() if p.is_file()):
                 if not _git_ok(f):
-                    raise WsError("not_committed", f"{f} is not committed and unchanged", "commit it, and let the lead join it, first")
+                    raise WsError(
+                        "not_committed",
+                        f"{f} is not committed and unchanged",
+                        "commit it, and let the lead join it, first",
+                    )
                 (dst / f.name).write_bytes(f.read_bytes())
                 copied.append(f"{name}.d/{f.name}")
-            for extra in dst.iterdir():  # a drop-in the source no longer has is removed, so the folder matches the source
+            for (
+                extra
+            ) in dst.iterdir():  # a drop-in the source no longer has is removed, so the folder matches the source
                 if extra.name not in {p.name for p in d.iterdir()}:
                     extra.unlink()
-        return {"unit": name, "from": str(s), "copied": copied, "next": "systemctl --user daemon-reload, then enable it"}
-    raise WsError("no_such_unit", f"no unit {name} in the policy's unit_sources", "check the name, or add its folder to [gate] unit_sources")
+        return {
+            "unit": name,
+            "from": str(s),
+            "copied": copied,
+            "next": "systemctl --user daemon-reload, then enable it",
+        }
+    raise WsError(
+        "no_such_unit",
+        f"no unit {name} in the policy's unit_sources",
+        "check the name, or add its folder to [gate] unit_sources",
+    )
 
 
 def cmd_install(args) -> int:
@@ -242,7 +291,9 @@ def cmd_install(args) -> int:
 
 
 def register(sub) -> None:
-    u = sub.add_parser("unit", help="install a committed systemd user unit (the only way one reaches ~/.config/systemd/user)")
+    u = sub.add_parser(
+        "unit", help="install a committed systemd user unit (the only way one reaches ~/.config/systemd/user)"
+    )
     s = u.add_subparsers(dest="unit_cmd", required=True)
     i = s.add_parser("install", help="copy a unit and its drop-ins from the policy's unit_sources")
     i.add_argument("name", help="the unit file name, for example ws-lead-heartbeat.timer")

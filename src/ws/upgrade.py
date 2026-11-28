@@ -759,27 +759,31 @@ def _stop_and_start(args: argparse.Namespace, sock: Path, peer: Peer, new: NewWs
         return "would restart"
     from ws import brokerunit  # late: only an upgrade that finds an old broker asks
 
-    if brokerunit.installed():  # C848: systemd restarts the service on the new code; no signal, no bare start
+    unit = brokerunit.installed()
+    if unit and not brokerunit.refresh(new.python):  # ExecStart names the ws now installed
+        _say(args, f"{brokerunit.UNIT} could not be pointed at ws {new.version}: {brokerunit.HINT}")
+        return "failed"
+    # C848: the service's own broker (its MainPID) is restarted by systemd on the new code
+    if unit and brokerunit.main_pid() == peer.pid:
         _say(args, f"the broker runs ws {running}: restarting {brokerunit.UNIT} on ws {new.version}")
         if not brokerunit.restart():
-            _say(args, f"systemctl --user restart {brokerunit.UNIT} failed; run it by hand")
+            _say(args, f"systemctl --user restart {brokerunit.UNIT} failed: {brokerunit.HINT}")
             return "failed"
-        if not _runs_version(sock, new.version, BROKER_START_S):
-            _say(args, f"{brokerunit.UNIT} was restarted but its broker did not answer yet; systemd keeps trying")
+    else:  # a bare broker (with the unit installed too: the service is in its retry loop and takes the socket after)
+        _say(args, f"the broker runs ws {running}: stopping it (pid {peer.pid}) and starting one of ws {new.version}")
+        try:
+            send(peer.pidfd, signal.SIGTERM)
+        except OSError as e:
+            _say(args, f"could not stop the broker ({type(e).__name__}): {finish}")
             return "failed"
-        _say(args, f"the broker is restarted on ws {new.version}")
-        return "restarted"
-    _say(args, f"the broker runs ws {running}: stopping it (pid {peer.pid}) and starting one of ws {new.version}")
-    try:
-        send(peer.pidfd, signal.SIGTERM)
-    except OSError as e:
-        _say(args, f"could not stop the broker ({type(e).__name__}): {finish}")
-        return "failed"
-    if not _gone(sock, BROKER_STOP_S):
-        _say(args, f"the broker did not stop within {BROKER_STOP_S:.0f} seconds: {finish}")
-        return "failed"
-    if not start_broker(new, sock):
-        _say(args, "the old broker is stopped; the new one did not answer yet, and the next `ws run` starts it")
+        if not _gone(sock, BROKER_STOP_S):
+            _say(args, f"the broker did not stop within {BROKER_STOP_S:.0f} seconds: {finish}")
+            return "failed"
+        if not (brokerunit.start() if unit else start_broker(new, sock)):
+            _say(args, "the old broker is stopped; the new one did not answer yet, and the next `ws run` starts it")
+            return "failed"
+    if unit and not _runs_version(sock, new.version, BROKER_START_S):
+        _say(args, f"{brokerunit.UNIT} did not answer on ws {new.version} in time: {brokerunit.HINT}")
         return "failed"
     _say(args, f"the broker is restarted on ws {new.version}")
     return "restarted"

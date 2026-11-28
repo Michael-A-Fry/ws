@@ -906,7 +906,11 @@ class Broker:
                 srv.shutdown()
                 srv.server_close()
         with contextlib.suppress(OSError):
-            self.socket_path.unlink()
+            st = self.socket_path.lstat()
+            # C848: only the socket this broker bound. Another broker (a supervised one retrying while this one
+            # stops) may have bound the path already; deleting its socket would leave it serving nobody.
+            if (st.st_dev, st.st_ino) == getattr(self, "_socket_id", None):
+                self.socket_path.unlink()
         self._unix = self._http = None
         self._stopped.set()
 
@@ -951,6 +955,8 @@ class Broker:
         finally:
             os.umask(old)
         self.socket_path.chmod(0o660 if self.group else 0o600)
+        st = self.socket_path.lstat()
+        self._socket_id = (st.st_dev, st.st_ino)  # what stop() may delete: this socket, never a successor's
         if gid is not None:
             try:
                 os.chown(self.socket_path, -1, gid)

@@ -28,6 +28,8 @@ from pathlib import Path
 from ws import paths, selfcmd
 from ws.output import WsError
 
+Runner = Callable[..., subprocess.CompletedProcess]
+
 UNIT = "ws-broker.service"
 RESTART_S = 3
 
@@ -47,9 +49,13 @@ def socket_of(env: Mapping[str, str] | None = None) -> Path:
     return paths.state_dir(dict(os.environ if env is None else env)).absolute() / "run" / "broker.sock"
 
 
-def render(sock: Path, argv: list[str] | None = None, path_env: str | None = None) -> str:
+def render(sock: Path, argv: list[str] | None = None, env: Mapping[str, str] | None = None) -> str:
+    """The unit. Its environment is the one a timer unit of ws gets (`roles.systemd._env_lines`: the layout pinned, a
+    scrubbed PATH), so the service's broker reads the same folders as one `ws run` starts."""
+    from ws.roles import systemd as _units  # late: the roles package is not needed to serve
+
     cmd = " ".join(_quote(a) for a in [*(argv or selfcmd.argv()), "broker", "serve", "--socket", str(sock)])
-    path_env = path_env if path_env is not None else os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")
+    env_lines = "".join(line + "\n" for line in _units._env_lines(os.environ if env is None else env))
     return (
         "# Written by `ws broker unit --apply` (C848). Remove with `ws broker unit --remove`.\n"
         "[Unit]\n"
@@ -60,7 +66,7 @@ def render(sock: Path, argv: list[str] | None = None, path_env: str | None = Non
         "Type=simple\n"
         f"ExecStart={cmd}\n"
         f"WorkingDirectory={sock.parent.parent}\n"
-        f"Environment={_quote('PATH=' + path_env)}\n"
+        f"{env_lines}"
         "Restart=always\n"
         f"RestartSec={RESTART_S}\n"
         "\n"
@@ -69,14 +75,32 @@ def render(sock: Path, argv: list[str] | None = None, path_env: str | None = Non
     )
 
 
+def refresh(python: str, run: Runner | None = None) -> bool:
+    """On an upgrade: point ExecStart at the ws now installed (`python -I -m ws`) and reload, when it changed. True
+    when the file is current afterwards."""
+    path = unit_path()
+    text = render(socket_of(), [python, "-I", "-m", "ws"])
+    try:
+        if path.is_file() and path.read_text(encoding="utf-8") == text:
+            return True
+        _write(path, text)
+    except OSError:
+        return False
+    return systemctl("daemon-reload", run=run or subprocess.run) == 0
+
+
+def _write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+
+
 def _quote(a: str) -> str:
     """systemd's own quoting: double quotes around a word with a space, a quote or a backslash in it."""
     if a and not any(c in a for c in " \t\"\\'"):
         return a
     return '"' + a.replace("\\", "\\\\").replace('"', '\\"') + '"'
-
-
-Runner = Callable[..., subprocess.CompletedProcess]
 
 
 def systemctl(*args: str, run: Runner = subprocess.run) -> int:
@@ -91,34 +115,55 @@ def start(run: Runner = subprocess.run) -> bool:
     return systemctl("start", "--no-block", UNIT, run=run) == 0
 
 
+HINT = f"look at `systemctl --user status {UNIT}` and `journalctl --user -u {UNIT} -n 50`"
+
+
+def main_pid(run: Runner = subprocess.run) -> int | None:
+    """The pid systemd runs the service's broker as, or None (not running, or systemctl cannot say)."""
+    try:
+        r = run(["systemctl", "--user", "show", "-p", "MainPID", "--value", UNIT], capture_output=True, text=True,
+                timeout=30, check=False)  # fmt: skip
+    except (OSError, subprocess.SubprocessError):
+        return None
+    v = (r.stdout or "").strip()
+    return int(v) if r.returncode == 0 and v.isdigit() and int(v) > 0 else None
+
+
 def restart(run: Runner = subprocess.run) -> bool:
     return systemctl("restart", "--no-block", UNIT, run=run) == 0
 
 
-def cmd_unit(args: argparse.Namespace, run: Runner = subprocess.run) -> int:
+def cmd_unit(args: argparse.Namespace, run: Runner = subprocess.run, start_bare=None) -> int:
     path = unit_path()
+    if args.apply or args.remove:
+        from ws import agentsession
+
+        why = agentsession.refusal(os.environ, sys.stdin.isatty(), sys.stdout.isatty())
+        if why:
+            raise WsError("agent_session", f"ws broker unit changes a systemd service: {why}", "run it yourself", 1)
     if args.remove:
-        systemctl("disable", "--now", UNIT, run=run)
+        if systemctl("disable", "--now", UNIT, run=run) != 0 and installed():
+            raise WsError("systemd", f"systemctl --user disable --now {UNIT} failed", HINT, 1)
         path.unlink(missing_ok=True)
         systemctl("daemon-reload", run=run)
-        print(f"ws broker unit: removed {path}; the next `ws run` starts a bare broker again")
+        from ws import run as _run  # late: run imports this module
+
+        ok = (start_bare or _run._start_broker)(socket_of())  # never leave the person with no broker at all
+        print(f"ws broker unit: removed {path}; " + ("a bare broker answers" if ok else "the next `ws run` starts one"))
         return 0
     text = render(socket_of())
     if not args.apply:
         sys.stdout.write(text)
         return 0
+    if why := selfcmd.unstable():
+        raise WsError("unstable", f"this ws would not last as a service's ExecStart: {why}", "run the installed ws", 1)
     if not shutil.which("systemctl"):
         raise WsError(
             "no_systemd", "systemctl is not on PATH", "run the broker by hand, or under your own supervisor", 1
         )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    tmp.replace(path)
+    _write(path, text)
     for step in (("daemon-reload",), ("enable", "--now", UNIT)):
         if systemctl(*step, run=run) != 0:
-            raise WsError(
-                "systemd", f"systemctl --user {' '.join(step)} failed", f"look at systemctl --user status {UNIT}", 1
-            )
+            raise WsError("systemd", f"systemctl --user {' '.join(step)} failed", HINT, 1)
     print(f"ws broker unit: {path} written and started; a broker already running keeps the socket until it stops")
     return 0

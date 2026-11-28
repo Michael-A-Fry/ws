@@ -782,7 +782,13 @@ def _stop_and_start(args: argparse.Namespace, sock: Path, peer: Peer, new: NewWs
         if not (brokerunit.start() if unit else start_broker(new, sock)):
             _say(args, "the old broker is stopped; the new one did not answer yet, and the next `ws run` starts it")
             return "failed"
-    if unit and not _runs_version(sock, new.version, BROKER_START_S):
+    # if it does not answer, once more: a bare broker from before this release unlinks the path as it stops, which can
+    # strand the service's fresh socket; a restart binds it again
+    if (
+        unit
+        and not _runs_version(sock, new.version, BROKER_START_S)
+        and not (brokerunit.restart() and _runs_version(sock, new.version, BROKER_START_S))
+    ):
         _say(args, f"{brokerunit.UNIT} did not answer on ws {new.version} in time: {brokerunit.HINT}")
         return "failed"
     _say(args, f"the broker is restarted on ws {new.version}")

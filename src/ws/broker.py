@@ -904,13 +904,15 @@ class Broker:
         for srv in (self._unix, self._http):
             if srv is not None:
                 srv.shutdown()
-                srv.server_close()
+        # C848: unlink while the listening socket is still open, so a successor retrying now still sees "already
+        # running" and cannot bind in the gap; and only the socket this broker bound, never a successor's.
         with contextlib.suppress(OSError):
             st = self.socket_path.lstat()
-            # C848: only the socket this broker bound. Another broker (a supervised one retrying while this one
-            # stops) may have bound the path already; deleting its socket would leave it serving nobody.
             if (st.st_dev, st.st_ino) == getattr(self, "_socket_id", None):
                 self.socket_path.unlink()
+        for srv in (self._unix, self._http):
+            if srv is not None:
+                srv.server_close()
         self._unix = self._http = None
         self._stopped.set()
 

@@ -450,7 +450,7 @@ been delivered. Without `tmux` installed it says nothing.
 ```
 
 It's on by default for an existing policy (the upgrade adds it): it only narrows. A session may not start, stop, change
-or imitate the unattended upgrade ([ADR 0035](../decisions/0035-an-upgrade-can-run-itself-from-a-service-that-proves-the-release.md)).
+or imitate the unattended upgrade (ADR 0035, which comes with the units).
 It refuses `systemctl` with a verb that changes something (start, stop, restart, enable, disable, edit, kill, mask and
 the like) on a unit named `ws-upgrade*`, and the same under `--user`, `--global` or `-M` when the unit is
 a variable or substitution, has a glob or a brace in its name (`'ws-u*.timer'`, `ws-?pgrade.timer`), or is fed in by

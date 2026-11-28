@@ -704,7 +704,8 @@ def test_with_no_origin_head_the_local_default_branch_is_used(home):
     d, on, off = default_repo(home, "t", "trunk", configured="trunk")
     assert cl.default_target(str(d), cl.Budget()) == cl.Target("trunk", "trunk")
     assert judge(f"pushed {on} to trunk", d) is None
-    denied = judge(f"pushed {off} to trunk", d)
+    assert judge(f"pushed {off} to trunk", d) is None  # C820: no origin at all, so a local commit is all there is to check
+    denied = judge("pushed 0123abc4567 to trunk", d)  # a commit this repository doesn't have is still denied
     assert denied.action == "deny" and "isn't on trunk here" in denied.reason
 
 
@@ -721,7 +722,8 @@ def test_with_nothing_to_go_on_the_default_branch_is_main(home):
     d, on, off = default_repo(home, "m", "main")
     assert cl.default_target(str(d), cl.Budget()) == cl.Target("main", "main")
     assert judge(f"merged {on} into main", d) is None
-    assert judge(f"merged {off} into main", d).action == "deny"
+    assert judge(f"merged {off} into main", d) is None  # C820: no origin at all, a local commit passes
+    assert judge("merged 0123abc4567 into main", d).action == "deny"
 
 
 @needs_git
@@ -931,3 +933,52 @@ def test_a_short_sha_next_to_a_claim_word_it_does_not_belong_to_is_allowed(repo)
 )
 def test_live_in_plain_prose_is_not_a_release_claim(text, expect):
     assert cl.release_claims(text, cl.DEFAULT_TAGS) == expect
+
+
+# --- C820: a repository with no remote, and plain wording -----------------------------------------------------------
+
+
+@needs_git
+def test_c820_a_local_commit_in_a_repo_with_no_origin_passes(home):
+    """A repository kept local by choice has no REF to be on; a commit `git cat-file -e` finds is accepted."""
+    d = home / "local"
+    d.mkdir()
+    git(d, "init", "-q", "-b", "main")
+    (d / "a").write_text("1")
+    git(d, "add", "a")
+    git(d, "commit", "-q", "-m", "first")
+    git(d, "checkout", "-q", "-b", "work")
+    (d / "a").write_text("2")
+    git(d, "commit", "-q", "-am", "second")  # on `work`, not on main
+    sha = git(d, "rev-parse", "HEAD")[:10]
+    if not (re.search(r"\d", sha) and re.search(r"[a-f]", sha)):
+        pytest.skip("this id isn't one the guard reads as a commit")
+    assert judge(f"merged {sha} into main", d) is None
+    # planted: a sha that is not a commit there is still refused
+    assert judge("merged 0123abc4567 into main", d).action == "deny"
+
+
+@needs_git
+def test_c820_a_repo_with_an_origin_never_gets_the_local_pass(repo):
+    d, _, off = repo
+    git(d, "remote", "add", "origin", "https://example.invalid/x.git")
+    assert judge(f"merged {off} into main", d).action == "deny"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "see abc1234, then do the rest of the work on main later",
+        "abc1234 is a draft; tell me before they go on main",
+    ],
+)
+def test_c820_plain_wording_with_a_sha_nearby_is_not_a_claim(text):
+    assert cl.find_claims(text, W) == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["abc1234 is on main", "abc1234 is now on main", "abc1234 on main", "merged abc1234 into main"],
+)
+def test_c820_a_claim_verb_with_a_branch_target_still_binds(text):
+    assert cl.find_claims(text, W) != []

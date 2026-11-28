@@ -14,6 +14,10 @@ branch. REF is the policy's `ref`, else the default branch on `origin`. B and th
 an ancestor of REF, or isn't a commit in this repository, denies the message and the reason names it; the reason says to
 `git fetch` first when REF may be out of date.
 
+A repository with no `origin` remote and no remote-tracking ref (kept local by choice) has no REF to be on: a commit `git cat-file -e`
+finds there passes, and one it doesn't find is still denied (C820). A bare `on B` is a claim only after `is`, `now`, `already`,
+`landed`... or directly after the commit (`work on main later` is not).
+
 A commit that isn't on REF in the session's repository is looked for in the policy's `repos` before the message is
 denied (never in a folder the message names: anyone who can write a message can make a folder that vouches for a
 commit). A listed repository vouches only when its `origin` is a URL (not a folder on this machine), its
@@ -330,6 +334,10 @@ def _names_other_branch(sentence: str, ref: str, branch: str = FALLBACK_BRANCH) 
     return any(n.rstrip(".").lower() not in own for n in named)
 
 
+# the word before a bare `on B` that makes it a claim: `abc1234 is on main`, `landed on main`, `already on main`
+_ON_VERB = re.compile(r"\b(?:is|are|was|were|now|already|landed|lives|sits|stays|got|been|has|have)(?:\s+(?:now|already|just))?\s*$", re.IGNORECASE)
+
+
 def _claim_spans(sentence: str, words: tuple[str, ...]) -> list[tuple[str, int, int]]:
     """[(claim word as written, start, end)] for each place in the sentence a claim word is a claim: not quoted, not
     negated and not in the future."""
@@ -352,6 +360,8 @@ def _claim_spans(sentence: str, words: tuple[str, ...]) -> list[tuple[str, int, 
             previous = _FOUR.findall(_HEX.sub(" ", before.lower()))[-4:]  # a commit id's letters are not words
             if any(w in _NEGATION | _FUTURE or w.endswith(("n't", "'ll")) for w in previous):
                 continue  # "not merged", "isn't pushed", "will be merged", "it'll be on main"
+            if word.lower().startswith("on ") and not (_ON_VERB.search(before) or re.search(r"(?<![\w-])[0-9a-f]{7,40}\s*$", before)):
+                continue  # `on main` alone is a place ("work on main later"); a claim needs `is`, `now`, `landed`... before it
             written = " ".join(m.groups())  # as written, without a commit or a plain word inside it
             found.append((written, m.start(), m.end()))
     return sorted(found, key=lambda f: f[1])
@@ -573,6 +583,23 @@ def _remote_default(repo: str, budget: Budget) -> str | None:
     return None
 
 
+def no_origin_has(cwd: str, sha: str, budget: Budget) -> bool:
+    """True when the session's repository has no `origin` remote at all (a repository kept local by choice) and `sha` is a
+    commit in it (`git cat-file -e`). With no remote there is no REF to be on, so the local object is all there is to check;
+    a repository that has an `origin` never gets this."""
+    if not cwd or budget.left() <= 0:
+        return False
+    done = _git_run(cwd, "remote", budget=budget)  # empty output is the answer here, so not _git_text
+    if done is None or done.returncode != 0 or not isinstance(done.stdout, bytes):
+        return False
+    if REMOTE in done.stdout.decode("utf-8", "replace").split():
+        return False
+    refs = _git_run(cwd, "for-each-ref", "--count=1", f"refs/remotes/{REMOTE}", budget=budget)  # a remote-tracking ref is a record too
+    if refs is None or refs.returncode != 0 or refs.stdout.strip():
+        return False
+    return _git(cwd, "cat-file", "-e", f"{sha}^{{commit}}", budget=budget) == 0
+
+
 def elsewhere(result, sha: str, ref: str, cfg: Config, cwd: str, budget: Budget):
     """`result` (what `on_ref` said for the session's repository), unless a repository in the policy's `repos` has the
     commit on the branch the message claims. That repository's own default branch (from its `origin`, a URL) has to be
@@ -707,6 +734,8 @@ def judge(call, cfg: Config, ctx) -> Finding | None:
     for word, sha in claims:
         result = _out_of_time(budget) if budget.spent() else on_ref(ctx.cwd, sha, ref, budget)
         result = elsewhere(result, sha, ref, cfg, ctx.cwd, budget)
+        if result is not True and not budget.spent() and no_origin_has(ctx.cwd, sha, budget):
+            result = True
         if result is True:
             continue
         if result is False:

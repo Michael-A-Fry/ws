@@ -8,6 +8,14 @@ body of the GitHub release.
 
 ## [Unreleased]
 
+### Added
+
+- The release publishes `install.sh` as an asset of its own, with a `.sha256`, a build provenance attestation and a
+  cosign bundle, signed by the same workflow as the wheel. The build stamp now carries a trust root (the release
+  workflow's cosign identity and the allowed signers for a release tag, from `.github/release_signers`), which
+  `ws.version.trust_root()` reads from the installed wheel and nowhere else. A release with no signer key isn't
+  published. `ws version` is unchanged. This is the base for an upgrade that proves a release itself.
+
 ## [0.1.11.12] - 2026-11-28
 
 ### Added

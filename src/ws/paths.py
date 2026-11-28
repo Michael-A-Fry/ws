@@ -64,6 +64,7 @@ NAMES: dict[str, tuple[str, ...]] = {
         "home",
         "install-manifest.json",
         "ratings.jsonl",
+        "gcal-switches.json",
         "versions.json",
         "migrate-manifest.json",
     ),
@@ -85,6 +86,7 @@ CONTROL_NAMES = (
     "approvals",
     "install-manifest.json",
     "ratings.jsonl",
+    "gcal-switches.json",  # the calendar write switches: a session never turns one on by writing the file
 )
 ENV_DIRS = {"config": "WS_CONFIG_DIR", "state": "WS_STATE_DIR", "data": "WS_DATA_DIR", "cache": "WS_CACHE_DIR"}
 _XDG = {  # kind -> (variable, default below HOME)

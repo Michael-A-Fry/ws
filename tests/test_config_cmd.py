@@ -237,7 +237,8 @@ def test_a_resolved_model_is_held_to_the_class_provider_list(ws, tmp_path):
 
 def test_an_unpriced_resolved_model_still_needs_allow_unpriced(ws, capsys):
     profile_of(ws, {"default": "stub/m"})
-    block = 'provider = { npm = "@ai-sdk/openai-compatible", options = { baseURL = "http://127.0.0.1:8080/v1" }, models = { m = { name = "m" } } }'
+    # a leased hosted provider: a local one needs no price (DEC-200), so it would not be refused
+    block = 'provider = { npm = "@ai-sdk/openai-compatible", models = { m = { name = "m" } } }\n[[secrets]]\nname = "stub"\nhost = "api.stub.example"'
     (ws.home / "jobs" / "oc.toml").write_text(
         f'runner = "opencode"\nprompt = "p"\n\n[runner_options]\n{block}\n', encoding="utf-8"
     )

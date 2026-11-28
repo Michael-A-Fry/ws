@@ -8,6 +8,19 @@ body of the GitHub release.
 
 ## [Unreleased]
 
+## [0.1.11.12] - 2026-11-28
+
+### Added
+
+- A `kind = "gcal"` broker entry (C821, DEC-122): the broker holds the Google Calendar OAuth client and refresh token,
+  refreshes the access token itself, and runs a fixed table of Calendar API operations (list, freebusy, get, insert,
+  patch; never delete, move, import or quickAdd). Writes go only to the "ws" calendar the consent makes
+  (`calendar.app.created`); `attendees`, `conferenceData` and `status` are refused and `sendUpdates=none` is forced; an
+  insert's id comes from the ws id, so a retry is a 409 that returns the first event; a patch needs ws's private
+  `ws_id` marker. Each write type has a switch, default off, in `<state>/gcal-switches.json` (a control path): off is
+  anyone's, on needs the broker's user, a terminal and the switch PIN a person stored (`ws secret ask gcal-switch-pin`);
+  every flip is an audit line. New commands: `ws gcal connect|ask|switch`.
+
 ## [0.1.11.11] - 2026-11-24
 
 ### Fixed

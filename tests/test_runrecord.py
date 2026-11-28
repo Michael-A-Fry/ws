@@ -188,3 +188,46 @@ def test_a_lone_outcome_unknown_record_is_read_and_a_real_one_wins_over_it(tmp_p
     runrecord.append(log, rec(run_id=other, status="ok", stop_reason="completed", cost_usd=0.5))
     got = {(r["run_id"], r["status"]) for r in runrecord.read(log)}
     assert got == {(RID, "outcome_unknown"), (other, "ok")}
+
+
+# ---- what a run costs when it reported no figure (28 Nov: the meter read US$50.69 against US$22.69 of real costs) ------
+
+
+def _old_local(**kw) -> dict:
+    tokens = {**runrecord.blank_tokens(), "input": 4098, "output": 41}
+    base = {"status": "ok", "runner": "opencode", "model_requested": "ollama/qwen", "cost_usd": None,
+            "cost_basis": "unpriced", "tokens": tokens, "exit_code": 0, "ws_version": "0.1.11.11"}  # fmt: skip
+    return rec(**{**base, **kw})
+
+
+def test_a_local_run_costs_nothing_new_shape_and_old():
+    new = rec(status="ok", runner="opencode", model_requested="ollama/m", cost_usd=0.0, cost_basis="local")
+    assert runrecord.record_cost(new, 2.0) == 0.0
+    for status in ("ok", "timeout"):  # written before cost_basis "local": a null cost, tokens counted, no price
+        assert runrecord.record_cost(_old_local(status=status), 2.0) == 0.0
+
+
+@pytest.mark.parametrize(
+    "planted",
+    [
+        {"model_requested": "openrouter/x"},  # a hosted model
+        {"secrets_used": [{"name": "openrouter", "host": "openrouter.ai"}]},  # a leased key: paid, whatever the name
+        {"ws_version": "0.1.11.12"},  # a newer ws says "local" itself; an unpriced ollama/ run from it is not local
+        {"ws_version": "dev"},
+    ],
+)
+def test_the_legacy_local_rule_never_frees_a_paid_or_new_record(planted):
+    assert runrecord.record_cost(_old_local(**planted), 2.0) == 2.0
+
+
+def test_a_run_that_counted_zero_tokens_costs_nothing_and_a_killed_one_keeps_the_fallback():
+    zero = rec(
+        status="error", runner="opencode", exit_code=1, cost_usd=None, tokens=dict.fromkeys(runrecord.TOKEN_KEYS, 0)
+    )
+    assert runrecord.record_cost(zero, 2.0) == 0.0
+    killed = rec(status="timeout", runner="claude-code", exit_code=None, cost_usd=None, tokens=runrecord.blank_tokens())
+    assert runrecord.record_cost(killed, 2.0) == 2.0  # planted: nothing reported is unknown, never free
+    no_step = rec(
+        status="error", runner="opencode", exit_code=1, cost_usd=None, models_used=[], tokens=runrecord.blank_tokens()
+    )
+    assert runrecord.record_cost(no_step, 2.0) == 2.0  # an old error record cannot show it billed nothing

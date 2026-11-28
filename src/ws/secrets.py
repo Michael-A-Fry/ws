@@ -229,9 +229,9 @@ def _str_list(path: Path, name: str, key: str, v: object) -> tuple[str, ...]:
 
 
 def _minters() -> dict:
-    from ws.minters import github_app, imap, ssh_ca
+    from ws.minters import gcal, github_app, imap, ssh_ca
 
-    return {m.KIND: m for m in (github_app, imap, ssh_ca)}
+    return {m.KIND: m for m in (gcal, github_app, imap, ssh_ca)}
 
 
 def clean_value(entry: Entry, value: str) -> str:

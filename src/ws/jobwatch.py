@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import subprocess
@@ -232,30 +233,52 @@ def _state_path(env) -> Path:
     return paths.state_dir(env) / "logs" / "deadman.json"
 
 
+HEARTBEAT = "heartbeat:"
+EPISODE = "stale"  # one key for a whole stale episode: missing, stale or bad alike, so it alerts once until it recovers
+
+
+def _hb_miss(name: str, text: str, since: datetime | None = None, age: float | None = None, limit=None) -> dict:
+    return {"job": f"{HEARTBEAT}{name}", "last_run": since and runrecord.iso(since), "key": EPISODE, "text": text,
+            "hours_since": round(age / 3600, 2) if age is not None else None,
+            "limit_hours": round(limit / 3600, 2) if limit else None}  # fmt: skip
+
+
 def heartbeats(env, now: datetime) -> list[dict]:
     """Each heartbeat file named in the profile's `[roles.watch.heartbeats]` (NAME = { file = "...", max_age_s = N })
     whose last touch is older than max_age_s: a long-running service that is not a job (the Telegram bridge) touches its
-    file while it is well, so a hung or stopped one is found (C848). A missing file is stale since never."""
+    file while it is well, so a hung or stopped one is found (C848). A missing file, a bad entry, a touch further in the
+    future than max_age_s (a clock step) and a profile that cannot be read are misses too: a watch that cannot watch
+    says so. Never raises."""
     from ws.profile import load, profile_path
 
-    roles = (load(profile_path(env)) or {}).get("roles")
+    try:
+        roles = (load(profile_path(env)) or {}).get("roles")
+    except Exception as e:  # noqa: BLE001  ProfileError, a TOML error, OSError: the job checks must still run
+        return [_hb_miss("config", f"the heartbeat watch cannot read the profile ({type(e).__name__})")]
     watch = roles.get("watch") if isinstance(roles, dict) else None
     table = watch.get("heartbeats") if isinstance(watch, dict) else None
+    if table is not None and not isinstance(table, dict):
+        return [_hb_miss("config", "[roles.watch.heartbeats] is not a table")]
     found = []
-    for name, hb in (table or {}).items() if isinstance(table, dict) else ():
+    for name, hb in (table or {}).items():
         f, limit = (hb.get("file"), hb.get("max_age_s")) if isinstance(hb, dict) else (None, None)
-        if not isinstance(f, str) or not isinstance(limit, (int, float)) or isinstance(limit, bool) or limit <= 0:
-            continue  # a bad entry checks nothing; `ws doctor` is where a profile is judged
+        good = isinstance(limit, (int, float)) and not isinstance(limit, bool) and math.isfinite(limit) and limit > 0
         try:
-            since = datetime.fromtimestamp(Path(f).expanduser().stat().st_mtime, UTC)
-        except OSError:
-            since = None
-        age = (now - since).total_seconds() if since else None
-        if age is None or age > limit:
-            found.append(
-                {"job": f"heartbeat:{name}", "last_run": since and runrecord.iso(since),
-                 "hours_since": round(age / 3600, 2) if age is not None else None, "limit_hours": round(limit / 3600, 2)}
-            )  # fmt: skip
+            path = Path(f).expanduser() if isinstance(f, str) and f else None
+        except RuntimeError:  # ~user with no such user
+            path = None
+        if path is None or not good:
+            found.append(_hb_miss(name, f"heartbeat {name} is set up wrong (file and max_age_s > 0 are needed)"))
+            continue
+        try:
+            since = datetime.fromtimestamp(path.stat().st_mtime, UTC)
+        except (OSError, OverflowError, ValueError):
+            found.append(_hb_miss(name, f"{name} is not answering: no heartbeat file", limit=limit))
+            continue
+        age = (now - since).total_seconds()
+        if age > limit or age < -limit:
+            found.append(_hb_miss(name, f"{name} is not answering: its last heartbeat was {round(age / 3600, 2)} h ago "
+                                        f"(limit {round(limit / 3600, 2)} h)", since, age, limit))  # fmt: skip
     return found
 
 
@@ -263,7 +286,7 @@ def deadman(env=None, now: datetime | None = None, sender=None) -> list[dict]:
     """Check every job; one alert per overdue job per last run (not one per check). Returns the overdue jobs."""
     env = os.environ if env is None else env
     now = now or datetime.now(UTC)
-    misses = overdue(env, now) + heartbeats(env, now)
+    misses = overdue(env, now) + heartbeats(env, now)  # heartbeats never raises: the job checks always run
     try:
         told = json.loads(_state_path(env).read_text(encoding="utf-8"))
         told = told if isinstance(told, dict) else {}
@@ -271,19 +294,22 @@ def deadman(env=None, now: datetime | None = None, sender=None) -> list[dict]:
         told = {}
     nowtold = {}
     for m in misses:
-        key = m["last_run"] or "never"
+        key = m.get("key") or m["last_run"] or "never"
         if told.get(m["job"]) == key:
             nowtold[m["job"]] = key
-            continue  # already raised for this last run
-        if m["job"].startswith("heartbeat:"):
-            ago = "never" if m["hours_since"] is None else f"{m['hours_since']} h ago"
-            text = f"{m['job'][10:]} is not answering: its last heartbeat was {ago} (limit {m['limit_hours']} h)"
-        else:
-            text = f"{m['job']} has not run in {m['hours_since']} h (limit {m['limit_hours']} h)"
+            continue  # already raised for this last run, or this stale episode
+        text = m.get("text") or f"{m['job']} has not run in {m['hours_since']} h (limit {m['limit_hours']} h)"
         sent = push(env, text, "a job has not run", sender)
         _write_line(env, {"event": "no-run", "job": m["job"], "hours_since": m["hours_since"], "pushed": sent is True})
         if sent is not False:  # a failed send is tried again at the next check; no role at all is not retried
             nowtold[m["job"]] = key
+    missed = {m["job"] for m in misses}
+    for job in sorted(k for k in told if k.startswith(HEARTBEAT) and k not in missed):  # a stale episode has ended
+        name = job[len(HEARTBEAT) :]
+        sent = push(env, f"{name} is answering again", "a service is back", sender)
+        _write_line(env, {"event": "recovered", "job": job, "pushed": sent is True})
+        if sent is False:
+            nowtold[job] = told[job]  # say it at the next check instead
     state = _state_path(env)
     state.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     state.write_text(
@@ -335,7 +361,9 @@ def cmd_deadman(args: argparse.Namespace) -> int:
     except jobs.JobError as e:
         raise WsError("failed", str(e)) from e
     for m in misses:
-        print(f"ws: {m['job']} has not run in {m['hours_since']} h (limit {m['limit_hours']} h)")
+        print(
+            "ws: " + (m.get("text") or f"{m['job']} has not run in {m['hours_since']} h (limit {m['limit_hours']} h)")
+        )
     if getattr(args, "json", False):
         output.result({"overdue": misses})
     return EXIT_OVERDUE if misses else 0

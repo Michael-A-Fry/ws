@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import subprocess
@@ -445,12 +446,69 @@ def test_a_missing_heartbeat_file_is_stale_since_never(env, tmp_path):
     heartbeat_profile(env, tmp_path / "gone")
     s = Sender()
     (miss,) = jobwatch.deadman(env, datetime(2026, 11, 28, tzinfo=UTC), s)
-    assert miss["last_run"] is None and "never" in s.sent[0]
+    assert miss["last_run"] is None and "no heartbeat file" in s.sent[0]
 
 
-@pytest.mark.parametrize("bad", [{"file": 3, "max_age_s": 600}, {"file": "/x", "max_age_s": 0}, "nope"])
-def test_a_bad_heartbeat_entry_checks_nothing(env, bad):
+@pytest.mark.parametrize(
+    "bad",
+    [{"file": 3, "max_age_s": 600}, {"file": "/x", "max_age_s": 0}, {"file": "/x", "max_age_s": True},
+     {"file": "/x", "max_age_s": float("nan")}, {"file": "~no-such-user-c848/hb", "max_age_s": 60}, "nope"],
+)  # fmt: skip
+def test_a_bad_heartbeat_entry_is_a_miss_not_silence(env, bad):
     p = profile_path(env)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(dumps({"roles": {"watch": {"heartbeats": {"t": bad}}}}), encoding="utf-8")
-    assert jobwatch.heartbeats(env, datetime(2026, 11, 28, tzinfo=UTC)) == []
+    (miss,) = jobwatch.heartbeats(env, datetime(2026, 11, 28, tzinfo=UTC))
+    assert miss["job"] == "heartbeat:t" and "set up wrong" in miss["text"]
+
+
+def test_a_garbage_profile_still_alerts_an_overdue_job(env):
+    job(env)
+    now = datetime(2026, 11, 14, 12, tzinfo=UTC)
+    record(env, "stub", now - timedelta(hours=3))
+    p = profile_path(env)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("this is [not toml", encoding="utf-8")
+    misses = jobwatch.deadman(env, now, Sender())
+    assert {m["job"] for m in misses} == {"stub", "heartbeat:config"}
+
+
+def test_recovery_is_told_and_a_new_episode_alerts_again(env, tmp_path):
+    hb = tmp_path / "heartbeat"
+    hb.write_text("x")
+    heartbeat_profile(env, hb)
+    t0 = datetime.fromtimestamp(hb.stat().st_mtime, UTC)
+    s = Sender()
+    assert jobwatch.deadman(env, t0 + timedelta(seconds=900), s) and len(s.sent) == 1
+    os.utime(hb, (t0.timestamp() + 1000, t0.timestamp() + 1000))
+    assert jobwatch.deadman(env, t0 + timedelta(seconds=1100), s) == []
+    assert "telegram is answering again" in s.sent[1]
+    assert jobwatch.deadman(env, t0 + timedelta(seconds=2000), s) and len(s.sent) == 3  # a new episode
+
+
+def test_a_file_deleted_mid_episode_does_not_alert_twice(env, tmp_path):
+    hb = tmp_path / "heartbeat"
+    hb.write_text("x")
+    heartbeat_profile(env, hb)
+    t0 = datetime.fromtimestamp(hb.stat().st_mtime, UTC)
+    s = Sender()
+    jobwatch.deadman(env, t0 + timedelta(seconds=900), s)
+    hb.unlink()
+    jobwatch.deadman(env, t0 + timedelta(seconds=1900), s)
+    assert len(s.sent) == 1
+
+
+def test_a_heartbeat_far_in_the_future_is_stale(env, tmp_path):
+    hb = tmp_path / "heartbeat"
+    hb.write_text("x")
+    heartbeat_profile(env, hb)
+    t0 = datetime.fromtimestamp(hb.stat().st_mtime, UTC)
+    assert jobwatch.heartbeats(env, t0 - timedelta(seconds=700))  # the clock stepped back past max_age_s
+    assert jobwatch.heartbeats(env, t0 - timedelta(seconds=60)) == []
+
+
+def test_the_cli_says_a_heartbeat_miss_in_its_own_words(env, tmp_path, capsys):
+    heartbeat_profile(env, tmp_path / "gone")
+    jobwatch.cmd_deadman(argparse.Namespace(json=False))
+    out = capsys.readouterr().out
+    assert "telegram is not answering: no heartbeat file" in out and "None h" not in out

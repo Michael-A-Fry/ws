@@ -10,7 +10,8 @@ sentence as `on main` (`abc1234 is a draft and the fix is on main`) is not check
 `pushed`, is matched the same way, so `pushed work abc1234` (a branch name between) is not a claim about the default
 branch. REF is the policy's `ref`, else the default branch on `origin`. B and that REF come from
 `git symbolic-ref refs/remotes/origin/HEAD`; with no `origin/HEAD` they come from the local default branch
-(`init.defaultBranch`, else `main`), taking `origin/B` when that exists and B itself when it doesn't. A commit that isn't
+(`init.defaultBranch`, else `main`), taking `origin/B` when that exists, and B itself only when the repository is named in `local_repos` (C820); any other
+repository without `origin/B` is denied as unchecked. A commit that isn't
 an ancestor of REF, or isn't a commit in this repository, denies the message and the reason names it; the reason says to
 `git fetch` first when REF may be out of date.
 
@@ -18,9 +19,10 @@ A commit that isn't on REF in the session's repository is looked for in the poli
 denied (never in a folder the message names: anyone who can write a message can make a folder that vouches for a
 commit). A listed repository vouches only when its `origin` is a URL (not a folder on this machine), its
 `refs/remotes/origin/HEAD` names the branch the message claims, and the commit is an ancestor of that remote-tracking
-branch. A clone of a clone, a repository with no remote, one that has only a local branch, and one whose default branch
-has another name never vouch, and neither does one git can't answer for in time. A commit none has still denies the
-message.
+branch. A repository named in `local_repos` (kept local by choice; C820) with no remote and no remote-tracking ref vouches when
+the commit is an ancestor of its own default branch; one with no remote that isn't named there never does, since a
+removed remote deletes its refs. A clone of a clone, one with a hand-made remote-tracking ref, and one whose default branch has another name never vouch, and neither does one
+git can't answer for in time. A commit none has still denies the message.
 
 Not a claim: a claim word in quotes or backticks, one with a negation or a future form in the four words before it
 (`not merged`, `will be pushed`, `once it's merged`), and any sentence that names another branch (`origin/work`, or
@@ -187,10 +189,11 @@ class Config:
     repos: tuple[
         str, ...
     ] = ()  # other repositories a claim may be about, besides the session's and those named in the text
+    local_repos: tuple[str, ...] = ()  # repositories kept local by choice (no remote): their own default branch vouches
 
 
 def config(table: dict, where: str) -> Config:
-    known_keys(table, where, ("words", "ref", "release_dir", "release_tags", "repos"))
+    known_keys(table, where, ("words", "ref", "release_dir", "release_tags", "repos", "local_repos"))
     words = text_list(table, "words", where)
     if "words" in table and not words:
         raise PolicyError(f"{where}: words must name at least one claim word")
@@ -201,7 +204,11 @@ def config(table: dict, where: str) -> Config:
     for r in repos:
         if not (r.startswith(("/", "~/")) or r == "~") or "\n" in r or "\0" in r:
             raise PolicyError(f"{where}: repos must be absolute paths or start with ~/")
-    return Config(words, ref, _release_dir(table, where), _release_tags(table, where), repos)
+    local_repos = text_list(table, "local_repos", where)
+    for r in local_repos:
+        if not (r.startswith(("/", "~/")) or r == "~") or "\n" in r or "\0" in r:
+            raise PolicyError(f"{where}: local_repos must be absolute paths or start with ~/")
+    return Config(words, ref, _release_dir(table, where), _release_tags(table, where), repos, local_repos)
 
 
 def _ref_ok(ref: object) -> bool:
@@ -424,6 +431,11 @@ class Budget:
         return self.failed or self.left() <= 0
 
 
+class NoRef(str):
+    """The note `on_ref` gives when the ref to check against isn't in the repository (a repository with no `origin`, that
+    isn't named in `local_repos`). The guard denies it: a claim that can't be checked isn't let through (C820)."""
+
+
 class OutOfTime(str):
     """The note `on_ref` gives when git was there and didn't answer (out of time, or it wouldn't run). The guard denies
     it rather than let a claim through unchecked."""
@@ -478,12 +490,13 @@ class Target:
     branch: str  # the repository's default branch: the one the claim words are about
 
 
-def default_target(cwd: str, budget: Budget) -> Target:
+def default_target(cwd: str, budget: Budget, local: bool = False) -> Target:
     """The default branch and the ref to check against, for the repository at `cwd`.
 
     From `origin/HEAD` when the repository has one (`git symbolic-ref refs/remotes/origin/HEAD`). Otherwise the local
     default branch: `init.defaultBranch`, else `main`; its remote-tracking `origin/B` is the ref when that exists, and B
-    itself when it doesn't. A folder that isn't a repository, no git or no time left gives `main` and `origin/main`, and
+    itself only when `local` (the repository is in the policy's `local_repos`; C820): any other repository without that
+    remote-tracking ref gets `origin/B`, which isn't there, and the check says so. A folder that isn't a repository, no git or no time left gives `main` and `origin/main`, and
     the check that follows says why it can't go on."""
     fallback = Target(DEFAULT_REF, FALLBACK_BRANCH)
     if not cwd or not Path(cwd).is_dir():
@@ -499,7 +512,7 @@ def default_target(cwd: str, budget: Budget) -> Target:
     remote = f"{prefix}{branch}"
     if _git(cwd, "rev-parse", "--verify", "--quiet", f"{remote}^{{commit}}", budget=budget) == 0:
         return Target(remote, branch)
-    return Target(branch, branch)
+    return Target(branch, branch) if local else Target(remote, branch)
 
 
 def _out_of_time(budget: Budget) -> OutOfTime:
@@ -526,7 +539,7 @@ def on_ref(cwd: str, sha: str, ref: str, budget: Budget | None = None) -> bool |
     if have is None:
         return _out_of_time(budget)
     if have != 0:
-        return f"{ref} doesn't exist in this repository"
+        return NoRef(f"{ref} doesn't exist in this repository")
     found = ask("merge-base", "--is-ancestor", sha, ref)
     if found is None:
         return _out_of_time(budget)
@@ -538,14 +551,14 @@ _LOCAL_URL = ("/", ".", "~", "file:")
 
 
 def other_repos(cfg: Config, cwd: str, budget: Budget) -> list[str]:
-    """The top folders of the policy's `repos`, without the session's own repository and each once, at most six. Only the
+    """The top folders of the policy's `repos` and `local_repos`, without the session's own repository and each once, at most six. Only the
     policy names a repository here: a path in a message never does, because anyone who can write the message can make a
     folder of their own that vouches for a commit. A folder that isn't a repository, or that git can't answer for in
     time, is left out."""
     home = os.path.expanduser("~")
     seen = {_top(cwd, budget)} if cwd else set()
     found: list[str] = []
-    for raw in cfg.repos:
+    for raw in (*cfg.repos, *cfg.local_repos):
         if budget.left() <= 0 or len(found) >= MAX_OTHER_REPOS:
             break
         top = _top(raw.replace("~", home, 1) if raw.startswith("~") else raw, budget)
@@ -573,15 +586,50 @@ def _remote_default(repo: str, budget: Budget) -> str | None:
     return None
 
 
+def local_tops(cfg: Config, budget: Budget) -> set[str]:
+    """The top folders of the policy's `local_repos`, each kept only when the entry is that folder itself (its real path
+    equals the repository's top level): a subfolder, a symlink into another repository or a folder that merely starts
+    with the same letters never counts."""
+    found: set[str] = set()
+    for raw in cfg.local_repos:
+        real = os.path.realpath(os.path.expanduser(raw))
+        top = _top(real, budget)
+        if top and os.path.realpath(top) == real:
+            found.add(os.path.realpath(top))
+    return found
+
+
+def _local_only(repo: str, budget: Budget) -> bool:
+    """True when the repository has no remote at all and no ref under `refs/remotes/` (not a hand-made one either), so
+    its own default branch is all there is to check against. Anything else is a repository with a remote, which
+    `_remote_default` judges."""
+    remotes = _git_run(repo, "remote", budget=budget)  # empty output is the answer, so not _git_text
+    if remotes is None or remotes.returncode != 0 or remotes.stdout.strip():
+        return False
+    refs = _git_run(repo, "for-each-ref", "--count=1", "refs/remotes", budget=budget)
+    return refs is not None and refs.returncode == 0 and not refs.stdout.strip()
+
+
 def elsewhere(result, sha: str, ref: str, cfg: Config, cwd: str, budget: Budget):
     """`result` (what `on_ref` said for the session's repository), unless a repository in the policy's `repos` has the
     commit on the branch the message claims. That repository's own default branch (from its `origin`, a URL) has to be
-    the claimed one, and its remote-tracking ref has to exist: a repository with no remote, one whose `origin` is a
-    folder here, or one whose default branch is another one never vouches. The reason `result` gave stays when none does."""
+    the claimed one, and its remote-tracking ref has to exist: one whose `origin` is a folder here, or one whose default
+    branch is another one never vouches. The one exception is a repository the policy names in `local_repos` (kept local by
+    choice, C820) that still has no remote and no remote-tracking ref: its own default branch vouches. A repository with no
+    remote that the policy doesn't name there never does, so removing a remote can't make a local branch count. The reason
+    `result` gave stays when none does."""
     if result is True or budget.spent():
         return result
     claimed = ref.removeprefix(f"{REMOTE}/")
+    tops = local_tops(cfg, budget)
     for repo in other_repos(cfg, cwd, budget):
+        if os.path.realpath(repo) in tops and _local_only(
+            repo, budget
+        ):  # C820: a repository kept local by choice: its own default branch is the record
+            local = default_target(repo, budget, local=True)
+            if local.branch == claimed and on_ref(repo, sha, local.ref, budget) is True:
+                return True
+            continue
         if _remote_default(repo, budget) == claimed and on_ref(repo, sha, f"{REMOTE}/{claimed}", budget) is True:
             return True
     return result
@@ -702,7 +750,7 @@ def judge(call, cfg: Config, ctx) -> Finding | None:
         ref, claims = _claims_in(text, cfg, ctx.cwd, budget)
         if budget.spent():  # git didn't answer before the default branch was known: more phrases may be claims
             claims += [c for c in blind_claims(text, cfg) if c not in claims]
-    wrong, late, notes = [], [], []
+    wrong, late, notes, unchecked = [], [], [], []
     release = check_releases(text, cfg) if isinstance(text, str) else None
     for word, sha in claims:
         result = _out_of_time(budget) if budget.spent() else on_ref(ctx.cwd, sha, ref, budget)
@@ -713,6 +761,8 @@ def judge(call, cfg: Config, ctx) -> Finding | None:
             wrong.append(f"{sha} ({word})")
         elif isinstance(result, OutOfTime):
             late.append(f"{sha} ({word})")
+        elif isinstance(result, NoRef) and not cfg.ref:  # a ref the policy names that isn't here stays a note
+            unchecked.append(f"{sha} ({word})")
         elif result not in notes:
             notes.append(result)
     if wrong:
@@ -724,6 +774,13 @@ def judge(call, cfg: Config, ctx) -> Finding | None:
         return Finding("deny", f"{reason} Also: {release}" if release else reason)
     if release:
         return Finding("deny", release)
+    if unchecked:
+        return Finding(
+            "deny",
+            f"claims not checked: {ref} doesn't exist in this repository, so {', '.join(unchecked)} can't be checked. "
+            "Name the repository's origin, list it in the policy's `local_repos` if it is kept local by choice, or "
+            "send the message without the claim.",
+        )
     if late:
         named = ", ".join(late)
         return Finding("deny", f"claims not checked: {_out_of_time(budget)}. The message says {named}. {LATE_ADVICE}")
@@ -763,7 +820,8 @@ def blind_claims(text: str, cfg: Config) -> list[tuple[str, str]]:
 def _claims_in(text: str, cfg: Config, cwd: str, budget: Budget) -> tuple[str, list[tuple[str, str]]]:
     """(the ref to check against, the claims in `text`). The policy's `words` and `ref` win; what they leave out comes
     from the repository's default branch."""
-    target = default_target(cwd, budget)
+    own = _top(cwd, budget) if cwd and Path(cwd).is_dir() else None
+    target = default_target(cwd, budget, local=bool(own) and os.path.realpath(own) in local_tops(cfg, budget))
     ref = cfg.ref or target.ref
     words = cfg.words or claim_words(target.branch)
     return ref, find_claims(text, words, ref, target.branch)
